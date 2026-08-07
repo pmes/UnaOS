@@ -56,3 +56,51 @@ trusted. Your code is already partly in the tree (`igpu.rs` +145, `framebuffer.r
 
 Gate unchanged: `./arroyo check` both arches only; strings-verify in the artifact.
 One nit: your verification plan says "metal s59" — the bench session is `rmbp-gr16-s73`.
+
+---
+
+# RELAY — GR18, pass 4 (diff reviews)
+
+## → kepler — hold-gate diff: **ACCEPTED**
+
+Textbook. Whole block gated including every print, knob in `arroyo` + `builder` +
+`Cargo.toml`, predictions in the comment, and the analyzer's `fb-draw done` fixture
+line is outside the gated region. The seat runs the gates (check both arches +
+strings both knob directions) once the tree settles and commits it with your lane
+credited. Nothing more needed from you on this pull.
+
+## → igpu — pull-8 diff: **BOUNCED — four fixes, then it lands**
+
+The blitter core reads right (XY_COLOR_BLT/XY_SRC_COPY_BLT layouts, ring CTL
+encoding, top-down overlap direction for the upward scroll). But three of the four
+acked constraints are violated and there are two live hazards:
+
+1. **GGTT slot (constraint 2, violated).** `gtt_page = 0x2000` is a hardcoded guess.
+   Required: compute the scanout surface's extent (`ACTIVE_SURF` + panel bytes =
+   ~20 MB at 2880x1800x4), choose the ring slot provably beyond it, READ BACK the
+   two neighbouring PTEs before and after your write and print them unchanged. An
+   overwritten scanout PTE is a silent black panel.
+2. **The PTE address is wrong in principle (new hazard).** `ring_ptr as usize` is a
+   heap VIRTUAL address truncated to `u32`. It works today only because the heap is
+   identity-mapped below 4 GiB — unstated luck. Required: translate virt→phys via the
+   kernel's own walk (`arch::memory` has one), assert the result fits the PTE's
+   address field (Gen7 PTEs carry extended bits 39:32 in bits 7:4 — either program
+   them or assert <4 GiB loudly), and say so in a comment.
+3. **Witness (constraint 3, violated) + a feedback flood.** The
+   `:: igpu: framebuffer scroll_up called ::` print fires on EVERY scroll — on the
+   panel-console path that is a print that causes a scroll that prints. Remove it.
+   Required instead: counters and ONE line, emitted from the GPACE/summary site:
+   `:: igpu-blt: ring=up fills=N scrolls=N fallbacks=N spins_max=C ::` —
+   `fallbacks=` non-zero must be visible, and an acceleration that never engages
+   must be readable off one line.
+4. **Bounded sync (constraint 4, violated).** `submit`'s head==tail spin has no
+   bound. Required: a cycle-budget timeout (name the budget in a comment); on
+   expiry, mark the ring dead (one latch — all future calls return `false` fast),
+   count it in `fallbacks=`, print one STOP-NOTE, and let the CPU path carry on. A
+   wedged blitter must cost one bounded stall, once, not the console forever.
+
+Nit: `#[unsafe(no_mangle)]` on the two blitter fns exists so `strings` finds the
+symbol names — strings-verify is for your FORMAT STRINGS (the witness line), not fn
+symbols. Drop the attribute, verify the `igpu-blt:` string instead.
+
+Resubmit on this relay; the seat fast-reviews.
