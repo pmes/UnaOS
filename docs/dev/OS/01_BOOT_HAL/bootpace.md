@@ -2683,3 +2683,278 @@ As in §10o, this slice does **not** carry the late `CFU2-WGATE` battery — not
 boot.
 
 Read this capture with `awk '/pattern/'` — **not** `grep`.
+
+## §10q — GR20 Boot AG: the battery that had been vanishing silently, and the card that became a filesystem (2026-08-07)
+
+Tip `30354af6`, `gui=2542ms`, `hz=2693807506`, slice
+`~/unaos-bench/scratch/gr20/bootAG-slice.log` (capture `rmbp-gr16-s73`). Two passengers, and
+each validated a different fix on its first flight: `30354af6`, a bounded storage wait at the
+file-lifecycle gate; and SDHC-4b (`1d47b97a`), the internal SD card registered as a block
+backend. **The first of the two closes a gap this document opened itself** — §10o and §10p
+each recorded that their slice did not carry `CFU2-WGATE`, and that observation turns out to
+have been the symptom of a live defect rather than a property of those captures.
+
+### The late-mount race, and why it was never a Boot AE/AF problem
+
+The `U9x → U10 → U10c → U10d → U11x → CFU/CFU2-WGATE → U11m2` battery chains synchronously
+off the storage-RELAXED U7x/U8x demo, so it can reach its storage gate before the block device
+has mounted. The gate was an **instant one-shot skip** — `if block::info().is_none() { return; }`
+— which cannot tell *"no block device (headless: skip cleanly)"* from *"not mounted YET
+(metal: must wait)"*, and `DONE` was already swapped by the time it fired, so there was no
+retry. On this machine the chain reaches that gate at **≈12.55 s** and `block::info()` settles
+a few hundred milliseconds later; the census and recon knobs of Boots AE/AF (§10o, §10p) added
+roughly 660 ms of upstream work and that was enough to flip the order. **The race was
+pre-existing and latent, not introduced by those arcs** — several earlier boots had already
+lost the whole late battery, `CFU2-WGATE` included, with nothing in the log to say so. Boot AD
+merely won it. `30354af6` replaces the instant skip in `u9x_launcher` and `u11m2_launcher`
+with a bounded wait resolved *before* the one-shot `DONE` swap, so the skip decision is taken
+against a settled storage state and the one-shot is never burned on a "not ready yet"; a
+genuinely device-less run still expires the bound and skips cleanly.
+
+**On metal the wait was taken, and the battery it had been dropping ran:**
+
+```
+[  12550ms] :: U9x: block device not ready at the file-lifecycle gate — waiting (bounded 5000 ms) for storage ::
+[  13111ms] :: U9x: storage arrived during the bounded wait — file-lifecycle battery (U9x..CFU2-WGATE..U11m2) proceeding ::
+```
+
+**561 ms** of a 5000 ms bound. That is the interval that had been silently discarding the
+entire late userspace battery. `CFU2-WGATE` then ran, at the same timestamp, all five arms:
+
+```
+[  13111ms] :: CFU2-WGATE: kernel->user write validated against LIVE leaf W — RO+X page (U3 ELF shape, the VUG/PULSE bypass) REFUSED -EFAULT, RW page ACCEPTED, RW->RO straddle REFUSED while its in-page head is accepted, RO page still readable -> PASS ::
+```
+
+This is the **second** metal attestation of the CFU-2 write gate (the first was Boot Z, §10j),
+and the first one that is not an accident of scheduling. `FS: FAT mounted: FAT32` follows at
+13118 ms and `FR: UNAOS.LOG reserved` at 13124 ms — storage was 7 ms behind the wait's
+release, which is how narrow the margin had been.
+
+**The instrument value here is the negative case, and it is worth naming.** Both §10o and §10p
+were careful to record `CFU2-WGATE` as *"not attested on this boot"* rather than as a pass, on
+the strength of counting `:: U…` lines. That caution was correct and it is what made the
+defect visible: a section that had written "the gate rode merged and presumably passed" would
+have papered over a race that had already been eating the witness for several boots.
+
+### SDHC-4b: the internal card is a mountable filesystem
+
+The second passenger registers the internal SD card as a **third** block handle, read-only,
+leaving the global `BLOCK_DEVICE` selector alone — §10.2 of
+[`sdhc.md`](../07_USB_STORAGE/sdhc.md)'s selection policy, which exists so that x86 keeps
+exactly one FAT writer. Metal, in order:
+
+```
+[   2528ms] :: SDHCBLK: registered internal SD card as block handle Sdhc — blocks=60800 (29 MiB) addressing=byte (global BLOCK_DEVICE untouched) ::
+[   2549ms] :: PART: mbr handle=sdhc slot=1 type=0x06 boot=0x00 start=63 count=60732 end=60795 ACCEPT ::
+[   2549ms] :: PART: mbr census handle=sdhc protective=0 accepted=1 rejected=0 ::
+[   2551ms] :: SDHCBLK: FAT mounted READ-ONLY on the internal SD card (29 MiB): FAT16 vol@LBA63 volsec=60732 bps=512 spc=4 nfat=2 fatsz=60sec reserved=1 fat@LBA64 data@LBA216 clusters=15144 rootdir@LBA184 (32sec) ::
+[   2552ms] :: SDHCBLK: sdhc root directory (10 entries) ::
+```
+
+Every geometry figure §10.6 of [`sdhc.md`](../07_USB_STORAGE/sdhc.md) predicted from Boot AC's
+reading came back to the number — `blocks=60800`, `start=63`, `count=60732`, `end=60795` — and
+the mount, which that section named as "the real prediction" and which was allowed to fail
+honestly as `no FAT volume … (NotFat)`, succeeded. **The ten entries are the point**: this is
+not a sector dump, it is a directory listed by name and size (`HELLO.BIN 72`, `STAT.ELF 8472`,
+`VUG.ELF 12568`, `PULSE.ELF 12568`, `hello.txt 109`, `readme.txt 59`, `SCRATCH.BIN 1024`,
+`GROW.BIN 512`, `S8W.BIN 64`, `BLOCK.TXT 197`), read off an eighteen-year-old card through a
+controller this kernel first identified two boots ago.
+
+**Both must-not-appear conditions held**, and they are the half of the prediction that could
+have convicted the arc:
+
+* **Zero `:: SDHCBLK: FAT write REFUSED …` lines** in the whole slice. Nothing in this build
+  writes through the FAT layer to that card, so a single such line would have meant a caller
+  the design analysis missed.
+* **The boot volume's own witnesses are unchanged** — `FS: FAT mounted: FAT32 vol@LBA2048
+  volsec=124733440 …` and `FR: UNAOS.LOG reserved 262656 bytes @cluster 3 reused=true
+  stamped=true — flushes are write-in-place only (single FAT writer preserved)`. The single-FAT-writer
+  invariant the selection policy exists to protect is intact and says so on its own line.
+
+The `global` handle's MBR census prints separately and independently
+(`PART: mbr handle=global … type=0x0b … ACCEPT`), so the two volumes are visibly distinct in
+the log rather than inferred to be.
+
+### Cost
+
+`gui` is **unchanged at 2542** from Boot AF, and the GPACE lanes are identical except one:
+`detect=5 igpu=1 kepler=396 sdhc=325 nic=0`, with `resid` 3 → 2. ACMD41 ran **399 polls**
+against Boot AF's 397. **The SDHCBLK work is not inside any lane the witness measures**: the
+GPACE span closes at 2528 ms and the registration, MBR parse, mount and listing run from 2528
+to 2552 ms, after the ledger stamp — the wall-clock cost shows only as the first `BPACE` line
+moving 2548 → 2552 ms (+4). Saying "the block backend cost nothing" would be wrong in the same
+way §10o warned about; saying it cost about 4 ms of wall clock outside the measured window is
+what the capture supports. The bounded wait costs nothing at all when storage is already
+settled, which is the QEMU case, and 561 ms of *waiting* — not of work — when it is not.
+
+### Regression floor
+
+mbench **33/33 required, 0 forbidden**; `serial-analyzer --wxn` **exit 0** (both re-run against
+this slice by the recording seat: mbench PASS 33/33 over 1763 lines, analyzer exit 0).
+
+**The spec was hardened this round, so 33/33 is not 28/28 renumbered.** `f5ec5689` added five
+REQUIRE directives to `unaos/scripts/specs/x86-witness.spec` — `WXAUDIT-CORES`, `video: edid`,
+the `sdhc: card` summary, `[sdhc] … CARD IDENTIFIED`, and the `sdhc: w1` self-test verdict.
+All five had landed and flown on metal while the count stood at 28, meaning each could have
+stopped firing without the gate noticing. The comparison across §10m–§10p is 28 of 28 against
+a weaker spec; this boot is 33 of 33 against a stricter one.
+
+- `kern_WX=319 == keep_x=319 == xpages+1 (318+1)` — the identity intact, so the rise from Boot
+  AF's 315 is **code growth with total coverage**. The arithmetic closes on the wider reading
+  too: `leaves=67069`, `tables=1030`, `l3=1536`, and `nx_4k=1217 + keep_x=319 = 1536`.
+- `WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=8 wp_mask=0xFF -> PASS`;
+  `WXAUDIT-CORES: n=8 cr0=[0x80010013,0x80010011 ×7] wp=0xFF nxe=0xFF` — §10l's `CR0.MP`
+  divergence unchanged and still BSP-only.
+- `WXPROBE cpu: cr0=0x0000000080010013 wp=1 … smep=1 nxe=1`; `WXN-x86 … wp=1 -> SWEPT`
+  (`residue_leaves=1535`); `WXAUDIT-SLOT: ring-3 window W^X verified (slot 0, leaves=4, wx=0,
+  nxe=1)`.
+- `SCHED-X86 PLACE-CHECK: actual=c1 arg=c1 published=c1 pool=5 collide=0 tier=exclusive
+  verdict=PASS`.
+- `[sdhc] bdf 3:0.1 CARD IDENTIFIED — 60800 blocks, byte-addressed, csd v1`, and the armed
+  write self-test passed a fourth time, line-identical to §10n's.
+- `video: edid present=0 hdr=- sum=- native=- len=0`; `igpu-blt: ring=absent
+  why=no-active-surface` — both unchanged.
+
+Read this capture with `awk '/pattern/'` — **not** `grep`.
+
+## §10r — GR20 Boot AH: an operator can launch a program by typing its name, and then cannot get the keyboard back (2026-08-07)
+
+Tip `8d76eb71`, `gui=2532ms`, `hz=2693861014`, slice
+`~/unaos-bench/scratch/gr20/bootAH-slice.log` (capture `rmbp-gr16-s73`). One passenger vs
+Boot AG: the shell's program-launch verbs. **This is the boot on which an operator could, for
+the first time on x86, start a ring-3 program by typing its name at the console.** It is also
+the boot that produced this round's top open defect, and the two are the same event.
+
+### The gate was incidental, and the kernel half had been proven for weeks
+
+`run`, `bg`, `jobs` and `kill` were all behind `#[cfg(feature = "baremetal")]` — the Pi-4
+feature — so on x86 they never reached `dispatch_command` and fell through to
+`Unknown command`. **There was no operator-facing way to start a userspace program on the rMBP
+at all.** The kernel half was never the obstacle: `arch/x86_64/syscall.rs` has carried
+`run_user_image`, `spawn_user_image_bg`, `bg_poll` and `bg_kill` un-`cfg`'d since WINX-2, and
+every one of them is exercised on metal on every boot through the WINX launcher chain — this
+very slice carries `WINX-1`, `WINX-2`, `WINX-3`, `WINX-7`, `WINX-8` and `PULSE-W`, all PASS,
+all through those functions. Only the shell half was switched off.
+
+**There is no `/fat` mount on x86, and that is why the launch takes bare names.** Both
+mountable `VfsBackend` implementations — `FatBackend` and `NativeBackend` in `fs/vfs.rs` — are
+`#[cfg(target_arch = "aarch64")]` (the third, `MockBackend`, is `#[doc(hidden)]` and backs no
+volume), which is why `vfs_cmd` already refused on x86. The x86 twin therefore resolves
+through the FAT-direct path the `cat` verb uses (`fs::fat::mount()` + cwd + `resolve_path`),
+whose walk matches components with `eq_ignore_ascii_case` — so a lowercase token finds an
+uppercase FAT short name with no special case. `/fat/NAME` is accepted only as an **alias** for
+the one volume x86 mounts, because it is the form the packaging text tells the operator to
+type. **The bare or relative name is the authoritative form on this architecture**; anyone
+reading `/fat/…` in x86 operator text should read it as a courtesy spelling, not a path.
+
+**On metal** — note that both lines fall **beyond this section's slice**, which ends at
+83763 ms; they are quoted from the full capture
+`~/unaos-bench/capture/rmbp-gr16-s73/ttyUSB0.log`:
+
+```
+[ 124409ms] :: BAREXEC: /VUG.ELF (typed 'vug.elf') — loaded 12568 bytes, entry 0x10000000000, pid=59 slot=0 DETACHED, left RUNNING ::
+[ 135197ms] :: UVUG: interactive takeover at frame 5097 ::
+```
+
+Five thousand and ninety-seven frames in the 10.8 s between those two stamps — about 472
+frames per second, from a program launched by typing four characters and a dot.
+
+### THE FOCUS TRAP — OPEN DEFECT, and the top item the next round inherits
+
+After `UVUG: interactive takeover` the vug held keyboard focus, the console could not be
+reached, and the machine was reported as "locked up".
+
+**It is not a lockup.** The kernel ran healthily for **339 seconds** after the takeover — the
+capture ends at 474563 ms, 339366 ms past the takeover at 135197 ms, and every liveness
+instrument in it is still emitting at the last line:
+
+```
+[ 474469ms] [wc-h] rollup win=3 scope=window emit=182 … torn=0 declines=0 … -> TEAR-FREE
+[ 474563ms] [wcn] rollup scope=live wins=3 att=2700 comp=2700 hid=0 bel=0 stale=0 passes=2700 aborted=0 att_rate=539.8/s comp_rate=539.8/s span=5001ms -> LIVE
+[ 474563ms] [comp2] rollup passes=2700 pass_us=1841 max_us=1880 … rate=539.8/s span=5001ms
+[ 473937ms] [schedx86] depth sent=2536 recv=2536 inflight=0 (render core 1)
+[ 473796ms] :: PWR: window_ms=10000 state=unplugged (discharging) samples=10 unknown=0 … == rollup ::
+```
+
+The `[wc-h]` emit counter increments **every 2 s without a gap** from `emit=13` at 136414 ms —
+the first rollup after takeover — through `emit=148` at 406458 ms to `emit=182` at 474469 ms;
+489 rollups in the capture. **Compositor LIVE, tear-free, scheduler dispatching with
+`inflight=0`, power sampling — only the keyboard was captured.**
+
+**The mechanism is on the wire, and it is an unpaired focus grant.** The capture contains
+**165** `wc-x86: input focus -> slot` lines and **164** `wc-x86: input focus revoked` lines.
+The last revoke is at 25243 ms, at the end of the WINX battery. The last *grant* is:
+
+```
+[ 124411ms] :: wc-x86: input focus -> slot 0 (first window, shell was idle) ::
+```
+
+two milliseconds after `BAREXEC`, with no revoke ever following it. `user_input_revoke_slot`
+(`arch/x86_64/syscall.rs`) is the only path that returns focus to the shell, and it runs on
+**slot teardown**. `BAREXEC` launches through `spawn_user_image_bg` and leaves the job
+`DETACHED, left RUNNING` — so there is no teardown, so there is no revoke, and focus stays on
+slot 0 for as long as the program lives. The x86 grant is a
+`compare_exchange(0, slot+1, …)`: it can never *steal* focus, which is the property it was
+written to guarantee, but it has no counterpart for *giving it back* while the holder is
+healthy.
+
+**The fix is a global focus-the-console binding**, and the source already names it — the
+comment above that `compare_exchange` reads that "a real focus RING — click-to-focus, a
+reserved cycling key — is the follow-on arc, and it will replace this rule rather than build
+on it." aarch64 has already built exactly that: `wc_shell_focus_key` (`arch/aarch64/syscall.rs`)
+plus the WC-TAB entry points in `main.rs` carry the shell as **a position in the focus
+rotation rather than an absence**, precisely so that "an operator who tabs into a window can
+never get the keyboard back" cannot happen. **There is no x86 twin of that function.** Until
+there is, every windowed program launched from the x86 console is a one-way trip.
+
+**`kill <pid>` is now ungated on x86 and cannot be reached.** The same commit that made `run`
+available made `kill` available, and it is the obvious escape — but it must be typed at the
+console, which is the thing focus is no longer on. The two arrived together and the second is
+inert without the first's fix.
+
+**The QEMU proving run had already flagged this leg as the one thing it did not demonstrate.**
+`8d76eb71`'s own account of `./arroyo test-fat` with keystrokes injected over QMP records that
+"the launched vug held its window at ~2150 presents/s to the end of the capture, never
+killed" — the run showed the launch and never showed a return to the console. Metal confirmed
+it, on the first attended boot, with an operator at the keyboard. **This is the top open item
+for the next round.**
+
+### Cost
+
+`gui` 2542 → **2532** (−10). The lanes: `sdhc` 325 → 320 (−5, ACMD41 **389 polls** against Boot
+AG's 399 — ten fewer on the same eighteen-year-old card), `kepler=396`, `detect=5`, `igpu=1`,
+`resid=2` all unchanged. The first `BPACE` line moves 2552 → 2541 ms (−11), consistent. **The
+shell change is not a pace passenger** — it adds dispatch-table text and nothing to the boot
+path — and the whole −10 is the card's power-up polling, which §10m already named as the only
+thing worth attacking in this lane.
+
+### Regression floor
+
+mbench **33/33 required, 0 forbidden** (re-run by the recording seat against this slice:
+PASS, 1753 lines scanned); `serial-analyzer --wxn` **exit 0**.
+
+- `[sdhc] bdf 3:0.1 CARD IDENTIFIED — 60800 blocks, byte-addressed, csd v1`; `SDHCBLK:
+  registered internal SD card as block handle Sdhc — blocks=60800 (29 MiB) addressing=byte
+  (global BLOCK_DEVICE untouched)` and the FAT16 mount at 2540 ms with the same ten-entry root
+  — SDHC-4b reproduces across boots.
+- `sdhc: w1 armed=1 lba=60799 … verify=IDENTICAL restore=IDENTICAL reason=none -> PASS` — the
+  armed write self-test's fifth flight.
+- `WINX-8: VUG.ELF end-to-end — loaded (entry 0x10000000000) + windowed + 3 presents with 2
+  ring-3 thread(s), killed + reaped, teardown clean -> PASS`, and `WINX-1/2/3/7` and `PULSE-W`
+  alongside it. The teardown leg passes here — it is the *detached* launch that never tears
+  down.
+- `WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=8 wp_mask=0xFF -> PASS`;
+  `WXAUDIT-CORES: n=8 cr0=[0x80010013,0x80010011 ×7] wp=0xFF nxe=0xFF` — `CR0.MP` still
+  BSP-only; `WXPROBE cpu: cr0=0x0000000080010013 wp=1 … smep=1 nxe=1`;
+  `WXN-x86 … wp=1 -> SWEPT` (`residue_leaves=1535`).
+- `CFU2-WGATE … -> PASS`, all five arms, at 12892 ms — the **second consecutive** boot to
+  attest it, after Boot AG's bounded wait fired again (`U9x` gate at 12541 ms, storage arrived
+  at 12892 ms, a 351 ms wait). The fix is reproducible, not a single lucky flight.
+- `kern_WX=337 == keep_x=337 == xpages+1 (336+1)` — the identity intact, so the rise from Boot
+  AG's 319 is **code growth with total coverage**: 312 net new lines in `shell.rs` are 18 new
+  pages inside the non-writable `PT_LOAD` union. `leaves=67069`, `tables=1030`, `l3=1536`, and
+  `nx_4k=1199 + keep_x=337 = 1536` — the same 1536 4 KiB leaves as Boot AG, redistributed.
+- `SCHED-X86 PLACE-CHECK … verdict=PASS`; `video: edid present=0`; `igpu-blt: ring=absent
+  why=no-active-surface`.
+
+Read this capture with `awk '/pattern/'` — **not** `grep`.

@@ -1679,3 +1679,55 @@ missed.
 The boot volume's own lines (`FS: FAT mounted: FAT32 …`, the `FR: UNAOS.LOG reserved …`
 witness) must be unchanged from the previous boot. Any change there is the regression this
 section's selection policy exists to prevent.
+
+### 10.7 ✅ METAL-CONFIRMED — Boot AG, bench rMBP, 2026-08-07 (first flight)
+
+Tip `30354af6` (SDHC-4b rides at `1d47b97a`), capture `rmbp-gr16-s73`, slice
+`~/unaos-bench/scratch/gr20/bootAG-slice.log`, pace record
+[`bootpace.md §10q`](../01_BOOT_HAL/bootpace.md). Gates: mbench **33/33 required, 0
+forbidden**; `serial-analyzer --wxn` **exit 0**. Read the capture with `awk`, not `grep`.
+Boot AH (`8d76eb71`) reproduced the whole of it the same day.
+
+**The internal card is a mountable filesystem.** §10.6's prediction was published before the
+flight and came back to the number — `blocks=60800`, `start=63`, `count=60732`, `end=60795`,
+all of them Boot AC's readings and none of them estimates:
+
+```
+[   2528ms] :: SDHCBLK: registered internal SD card as block handle Sdhc — blocks=60800 (29 MiB) addressing=byte (global BLOCK_DEVICE untouched) ::
+[   2549ms] :: PART: mbr handle=sdhc slot=1 type=0x06 boot=0x00 start=63 count=60732 end=60795 ACCEPT ::
+[   2549ms] :: PART: mbr census handle=sdhc protective=0 accepted=1 rejected=0 ::
+[   2551ms] :: SDHCBLK: FAT mounted READ-ONLY on the internal SD card (29 MiB): FAT16 vol@LBA63 volsec=60732 bps=512 spc=4 nfat=2 fatsz=60sec reserved=1 fat@LBA64 data@LBA216 clusters=15144 rootdir@LBA184 (32sec) ::
+[   2552ms] :: SDHCBLK: sdhc root directory (10 entries) ::
+```
+
+The mount was §10.6's real prediction and it was allowed to fail honestly as
+`no FAT volume … (NotFat)`. It did not. **Ten root entries were listed by name and size** —
+`HELLO.BIN 72`, `STAT.ELF 8472`, `VUG.ELF 12568`, `PULSE.ELF 12568`, `hello.txt 109`,
+`readme.txt 59`, `SCRATCH.BIN 1024`, `GROW.BIN 512`, `S8W.BIN 64`, `BLOCK.TXT 197` — which is
+a filesystem read, not a sector dump.
+
+**Both must-not-appear conditions held, and they are the half that could have convicted the
+arc.** Zero `:: SDHCBLK: FAT write REFUSED …` lines anywhere in the slice — a single one would
+have meant a caller writing through the FAT layer to this card that §10.3's analysis missed.
+And the boot volume's own witnesses are unchanged:
+
+```
+[  13118ms] FS: FAT mounted: FAT32 vol@LBA2048 volsec=124733440 bps=512 spc=64 nfat=2 fatsz=15223sec reserved=32 fat@LBA2080 data@LBA32526 clusters=1948483 rootclus=2
+[  13124ms] :: FR: UNAOS.LOG reserved 262656 bytes @cluster 3 reused=true stamped=true — flushes are write-in-place only (single FAT writer preserved) ::
+```
+
+**The SINGLE FAT WRITER invariant of §10.3 is intact and says so on its own line.** The two
+volumes are visibly distinct in the log rather than inferred to be: the `global` handle prints
+its own independent MBR census (`PART: mbr handle=global … type=0x0b … start=2048
+count=124733440 … ACCEPT`) alongside the `sdhc` one.
+
+**Cost — outside the measured window, not zero.** The GPACE span closes at 2528 ms and the
+registration, MBR parse, mount and listing all run between 2528 and 2552 ms, so **no pace lane
+contains this work**: `gui` is unchanged at 2542 ms from the previous boot and `sdhc=325ms` is
+identical. The wall-clock cost appears only as the first `BPACE` line moving 2548 → 2552 ms.
+About 4 ms, and "it cost nothing" would be the wrong reading of an unmoved total.
+
+**What this does and does not close.** §10.3's scope is unchanged — this handle is **read-only
+by construction** and the arc adds no write path to it, so nothing here bears on 4c. The
+identification path (§9) and the armed write self-test (§8) both ran on this boot unchanged
+and passed, so the block backend does not disturb the layers underneath it.
