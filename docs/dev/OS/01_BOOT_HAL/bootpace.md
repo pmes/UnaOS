@@ -2234,3 +2234,41 @@ reaches serial/FTDI but is no longer painted on the panel. It was never durable 
 under the old ordering the clear preceded it, under the new one the clear follows it.
 
 Read this capture with `awk '/pattern/'` — **not** `grep`.
+
+## §10k — GR20 Boot AA: M3a on metal — WP armed on all eight cores at zero pace cost (2026-08-07)
+
+One kernel change rode vs Boot Z: **WXN M3a** (`37fc0f3c`), a single CR0 RMW in the per-core
+`syscall::init()` seat plus the widened `WXAUDIT-NXE` PASS condition. Every prediction made
+before the flight held, arm for arm:
+
+- `:: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=8 wp_mask=0xFF -> PASS ::` at 171 ms —
+  all eight cores armed on the first flight (Boot Z read `wp=0 wp_mask=0x0`).
+- `:: WXPROBE cpu: cr0=0x0000000080010013 wp=1 ... ::` — Boot Z's `0x80000013` plus **bit 16
+  and nothing else**; any other changed bit would have falsified the RMW.
+- **No new serial line.** The kdisp phase inventory is line-for-line identical to Boot Z's
+  ten (the §10j "five phases" narrative tracked only the takeover five; `mirror_passes`
+  through `scanout_handover` were aboard then too).
+- **Zero pace cost:** `gui=2217` for the third consecutive boot, `ehci-hid-done d=1286`
+  (±1 ms), `sched` PLACE-CHECK PASS, `CFU2-WGATE -> PASS` all five arms,
+  `kern_WX == keep_x == xpages+1` = 319 intact, `WXN-x86 ... wp=1 -> SWEPT`.
+- Gates: mbench **28/28 required, 0 forbidden**; `serial-analyzer --wxn` exit 0.
+  Slice: `~/unaos-bench/scratch/gr20/bootAA-slice.log` (capture `rmbp-gr16-s73`,
+  `hz=2693846865`, from line 31358).
+
+The kernel half of W^X now enforces NX everywhere and RO *bindingly* — the first W=0
+kernel leaf is M3b's to create, and when it lands WP is already waiting for it.
+
+**Separately, §10j's `kdisp_takeover=328` decomposed under adversarial replay**
+(`scratch/gr20/verify-kdisp-gaps.md`, Boots Y and Z, both reconciling to the millisecond):
+blit **50 ms**, `panel_console_resume` **15 ms**, `wcx::activate` **259–260 ms** — and
+~190 ms of the 260 (73%) is **witness instrumentation reading the framebuffer back** at
+the uncached-read rate (~1.7–2.3 µs/read vs 2.7–6.8 ns/px for writes; four independent
+instruments agree on the ratio). The next pace target in this window is the probe
+count/cadence (`wcg::PAYGO_LATTICE_N`, `wc-d` verify coverage), not compositing. Caveat
+discovered en route: the `phase!`/`d=` ledger reads `arch::ms()` (APIC-tick ISR count)
+while the `[NNNNNNms]` prefix reads the invariant TSC, and the ledger under-reports the
+takeover span by a systematic **13 ms** on both boots (342/344 ms wall vs 329/331 ledger)
+— the "sum exactly 331" agreement of §10i/§10j was two readings of the same lossy clock
+agreeing with each other, not a wall-time validation.
+
+Read this capture with `awk '/pattern/'` — **not** `grep`.
