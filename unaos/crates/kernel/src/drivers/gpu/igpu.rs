@@ -282,7 +282,7 @@ unsafe fn gmux_inb(port: u16) -> u8 {
 }
 
 /// Wait for the gmux to be ready to accept an index byte. Bounded twice over: an iteration
-/// count that cannot depend on any clock, and a TSC deadline. Returns false on timeout —
+/// count that cannot depend on any clock. Returns false on timeout —
 /// and no caller here swallows a timeout silently.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 unsafe fn gmux_wait_ready() -> bool {
@@ -463,8 +463,6 @@ pub fn init(gpu: &GpuInfo) {
                 serial_println!(":: igpu: Raw SW_DDC : Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[4], gmux3[4]);
                 serial_println!(":: igpu: Raw POWER  : Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[5], gmux3[5]);
             } else {
-                #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-                PROTOCOL_PROVEN.store(true, Ordering::SeqCst);
                 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
                 PROTOCOL_PROVEN.store(true, Ordering::SeqCst);
                 serial_println!(":: igpu: PROTOCOL PROVEN (version plausible)");
@@ -923,8 +921,7 @@ unsafe fn dp_aux_transfer(bar0: usize, clock_divider: u32, cmd: u32, addr: u32, 
             }
         }
 
-        let ctl = DP_AUX_CH_CTL_SEND_BUSY | DP_AUX_CH_CTL_DONE | DP_AUX_CH_CTL_TIME_OUT_ERROR | DP_AUX_CH_CTL_RECEIVE_ERROR
-                  | (send_bytes << 20) | (clock_divider & 0x7FF);
+        let ctl = DP_AUX_CH_CTL_SEND_BUSY | DP_AUX_CH_CTL_DONE | DP_AUX_CH_CTL_TIME_OUT_ERROR | DP_AUX_CH_CTL_RECEIVE_ERROR | DP_AUX_CH_CTL_TIME_OUT_1600US | (send_bytes << 20) | (clock_divider & 0x7FF);
         core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_CTL) as *mut u32, ctl);
 
         let mut status;
@@ -957,6 +954,10 @@ unsafe fn dp_aux_transfer(bar0: usize, clock_divider: u32, cmd: u32, addr: u32, 
 
         let is_i2c = (cmd & 0x8) == 0;
         let reply_status = if is_i2c { i2c_reply } else { native_reply };
+
+        if reply_status == 3 {
+            return Err("aux-reserved-reply");
+        }
 
         if reply_status == 3 {
             return Err("aux-reserved-reply");
@@ -1013,7 +1014,8 @@ pub unsafe fn gmux_igd_switch() {
     let mut unwind = DisplayUnwind::new(0);
 
     // Will be captured dynamically based on live pre-image
-    let mut pre_ddc = 0x02;
+    let mut pre_ddc: Option<u32> = None;
+    let mut mux_touched = false;
 
     let mut execute_harness = || -> Result<(), &'static str> {
         if !PROTOCOL_PROVEN.load(Ordering::SeqCst) { return Err("protocol-unproven"); }
@@ -1021,15 +1023,16 @@ pub unsafe fn gmux_igd_switch() {
         if bar0 == 0 { return Err("bar0-unmapped"); }
         unwind.bar0 = bar0;
 
-        pre_ddc = gmux_index_read(GMUX_SWITCH_DDC);
+        let p_ddc = gmux_index_read(GMUX_SWITCH_DDC);
         let disp = gmux_index_read(GMUX_READ_DISPLAY);
         let ext = gmux_index_read(GMUX_READ_EXTERNAL);
-        serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", pre_ddc, disp, ext);
+        serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", p_ddc, disp, ext);
 
-        if pre_ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32 || ext != GMUX_EXTERNAL_DIS as u32 {
-            serial_println!(":: igpu: [GMUX] REFUSED: pre-switch state is not fully DIS (DDC={}, DISP={}, EXT={}) — no known safe state to return to ::", pre_ddc, disp, ext);
+        if p_ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32 || ext != GMUX_EXTERNAL_DIS as u32 {
+            serial_println!(":: igpu: [GMUX] REFUSED: pre-switch state is not fully DIS (DDC={}, DISP={}, EXT={}) — no known safe state to return to ::", p_ddc, disp, ext);
             return Err("pre-switch-not-dis");
         }
+        pre_ddc = Some(p_ddc);
 
         rung_name = "census";
         let ggc = crate::arch::pci::read_config_32(0, 0, 0, 0x50);
@@ -1058,7 +1061,7 @@ pub unsafe fn gmux_igd_switch() {
         unwind.push_mmio(regs::DPA_AUX_CH_DATA1, test_val);
         core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *mut u32, !test_val);
 
-        unwind.push_gmux(GMUX_SWITCH_DDC, pre_ddc as u8);
+        unwind.push_gmux(GMUX_SWITCH_DDC, pre_ddc.unwrap() as u8);
 
         let _ = unwind.execute();
 
@@ -1074,6 +1077,7 @@ pub unsafe fn gmux_igd_switch() {
         unwind.push_gmux(GMUX_SWITCH_DDC, ddc_live as u8);
 
         serial_println!(":: igpu: [GMUX] switching DDC to IGD (0x{:02X}) — panel should REMAIN ON since DISPLAY is not moved ::", GMUX_DDC_IGD);
+        mux_touched = true;
         gmux_index_write(GMUX_SWITCH_DDC, GMUX_DDC_IGD);
         let read_ddc = gmux_index_read(GMUX_SWITCH_DDC);
         if read_ddc != GMUX_DDC_IGD as u32 {
@@ -1132,25 +1136,35 @@ pub unsafe fn gmux_igd_switch() {
             ok_flag = 1;
         }
         Err(e) => {
+            serial_println!(":: igpu: [GMUX] REFUSED: {} ::", e);
             why_str = e;
         }
     }
 
     let unwound_count = unwind.len;
-    let _ = unwind.execute();
+    let revert_ok = unwind.execute();
 
     // Read back to decide gmux= verdict. Only DDC is proven, others are TBV.
-    let post_ddc = gmux_index_read(GMUX_SWITCH_DDC);
-    let post_disp = gmux_index_read(GMUX_READ_DISPLAY);
-    let post_ext = gmux_index_read(GMUX_READ_EXTERNAL);
-
-    let gmux_verdict = if post_ddc == pre_ddc {
-        "MATCH"
+    let gmux_verdict = if let Some(intent_ddc) = pre_ddc {
+        if mux_touched {
+            let post_ddc = gmux_index_read(GMUX_SWITCH_DDC);
+            let post_disp = gmux_index_read(GMUX_READ_DISPLAY);
+            let post_ext = gmux_index_read(GMUX_READ_EXTERNAL);
+            
+            let verdict = if post_ddc == intent_ddc && revert_ok {
+                "MATCH"
+            } else {
+                "FAILED"
+            };
+            
+            serial_println!(":: igpu: [GMUX] revert read-back: DDC=0x{:02X} DISP=0x{:02X} (TBV) EXT=0x{:02X} (TBV) ::", post_ddc, post_disp, post_ext);
+            verdict
+        } else {
+            "UNTOUCHED"
+        }
     } else {
-        "FAILED"
+        "UNTOUCHED"
     };
-
-    serial_println!(":: igpu: [GMUX] revert read-back: DDC=0x{:02X} DISP=0x{:02X} (TBV) EXT=0x{:02X} (TBV) ::", post_ddc, post_disp, post_ext);
 
     serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name={} ok={} unwound={} gmux={} why={} elapsed_ms={} ::",
         highest, rung_name, ok_flag, unwound_count, gmux_verdict, why_str, get_elapsed_ms());
