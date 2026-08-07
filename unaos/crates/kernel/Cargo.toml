@@ -568,6 +568,29 @@ pcicensus = []
 # wired only in arroyo ships disabled (the s42/INSTGUI and WXN-M3b lesson).
 bcmarecon = []
 
+# BCMA-S1 (GR20): `UNAOS_BCMAS1=1` arms the WiFi path's FIRST WRITE — a single PCI config write to
+# `0x80` (`BCMA_PCI_BAR0_WIN`) that points the BAR0 backplane window at ChipCommon (`0x18000000`),
+# reads the chip identity + the EROM core list (moving the window once more to the EROM base), then
+# RESTORES the window to the pre-image it recorded. It rides ON TOP of the read-only recon, so this
+# knob IMPLIES `bcmarecon`: S0 runs first (its `REFUSED … window-elsewhere` line is its own
+# deliverable), then S1's `bcma-s1:` block. Implying `bcmarecon` is also what lets S1 reuse the
+# module's device-find and BAR-map helpers and share the existing x86-only module gate + call site
+# WITHOUT a second gate in `arch/x86_64/pci.rs`.
+#
+# The write is issued ONLY against a Broadcom 4331 (vendor 0x14e4 AND device 0x4331 must read back),
+# and the unwind is PROVEN before the state-changing write (a no-op self-test that writes the
+# pre-image to itself and reads it back). The RESTORE pushes the value it READ — never the assumed
+# enumeration base 0x18000000 — and witnesses MATCH/FAILED against that stored pre-image (Boot AF:
+# firmware left 0x18001000, not 0x18000000, so a "restore to 0x18000000" would silently move the
+# radio's window and look clean in the logs). QEMU models no BCM4331, so there S1 stops at
+# `no-device` and issues no write.
+#
+# Default OFF => no S1 code and no S1 witness strings; media byte-identical. x86_64 only (via the
+# `bcmarecon` module gate), stripped from aarch64 by arroyo's `arm_features`. Kept in sync with
+# `unaos/arroyo` AND `unaos/builder/src/main.rs` — the builder rebuilds the x86 kernel from its own
+# env list, so a knob wired only in arroyo ships disabled (the s42/INSTGUI and WXN-M3b lesson).
+bcmaS1 = ["bcmarecon"]
+
 # AARCH64-VNET: the `UNAOS_VNET=1` virtio-net-mmio driver on the QEMU `virt` machine + smoltcp bind
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. NET-4's
 # driver is `tegra`-gated (QEMU models no Tegra234 RC), so it is only ever COMPILE-tested off metal; this

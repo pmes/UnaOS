@@ -184,6 +184,16 @@ fn main() {
     // only; no config write, no register write, no BAR sizing. Default OFF => module + call site
     // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_BCMARECON").is_ok() { feats.push("bcmarecon"); }
+    // BCMA-S1 (GR20): UNAOS_BCMAS1=1 arms the WiFi path's FIRST WRITE — one PCI config write to
+    // cfg:0x80 (BCMA_PCI_BAR0_WIN) pointing the BAR0 window at ChipCommon, reading chip id + EROM,
+    // then RESTORING the recorded pre-image (never the assumed enumeration base). It rides on top of
+    // the recon: the `bcmaS1` cargo feature implies `bcmarecon`, so pushing `bcmaS1` alone here pulls
+    // in S0 and the x86-only module gate + call site. THIS list is what reaches the kernel binary for
+    // MEDIA builds, so a knob wired into arroyo alone would ship the write DISABLED while the banner
+    // claims it is on (the s42/INSTGUI and WXN-M3b failure) — as exposed as the census was and in the
+    // same direction. Default OFF => module + call site unlinked, media byte-identical. Kept in sync
+    // with arroyo's mapping.
+    if std::env::var("UNAOS_BCMAS1").is_ok() { feats.push("bcmaS1"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature

@@ -648,8 +648,23 @@ fn walk_erom<F: Fn(u32) -> u32>(read: F) -> u32 {
 
 // ── The probe ───────────────────────────────────────────────────────────────────────────────────
 
-/// BCMA-RECON. Read-only; called once from `arch::x86_64::pci::init` under the `bcmarecon` feature.
+/// Entry point, called once from `arch::x86_64::pci::init` under the `bcmarecon` feature.
+///
+/// Runs the read-only reconnaissance ([`recon_readonly`]) unconditionally, then — only when the
+/// `bcmaS1` knob is armed on top of it — the S1 window stage ([`s1_window_walk`]), which is the WiFi
+/// path's FIRST config-space WRITE. S1 rides on recon: it reuses this module's device-find and
+/// BAR-map helpers, and it does not exist in the binary unless `bcmaS1` is set (which itself pulls in
+/// `bcmarecon`, so the module and this call site are always present when S1 is). The read-only pass
+/// is never removed or skipped — S0's `REFUSED … window-elsewhere` line is its own deliverable, and
+/// S1 prints a second, clearly-prefixed (`bcma-s1:`) block after it.
 pub fn recon() {
+    recon_readonly();
+    #[cfg(feature = "bcmaS1")]
+    s1_window_walk();
+}
+
+/// BCMA-RECON. Read-only; the S0 reconnaissance pass. Writes nothing.
+fn recon_readonly() {
     let dl = Deadline::new();
     serial_println!(
         ":: bcma: begin — READ-ONLY recon of PCI class 0x02/sub 0x80 (config reads + BAR0 reads; no config write, no register write, no BAR sizing) ::"
@@ -1047,5 +1062,263 @@ pub fn recon() {
     serial_println!(
         ":: bcma: end ok=1 stage=chipcommon chip={:#06x} rev={} ncores={} erom={:#010x} sprom={} otp_words={} elapsed={}{} — one config write (cfg:0x80) separates this from the full backplane inventory ::",
         cc_id, cc_rev, cc_ncores, erom, sprom_present as u8, otp_words, ev, eu
+    );
+}
+
+// ── S1: point cfg:0x80 at ChipCommon, read identity + EROM, then RESTORE ──────────────────────────
+//
+// `UNAOS_BCMAS1=1`. This is the WiFi path's FIRST WRITE, and it is exactly one register: PCI config
+// `0x80` (`BCMA_PCI_BAR0_WIN`), the backplane-window selector. On a BCMA part behind PCIe, BAR0+0
+// decodes to whatever backplane address sits in cfg:0x80; firmware on the 2012 rMBP parked it at
+// `0x18001000` (core index 1, the d11 radio — Boot AF), so ChipCommon and the EROM are unreachable
+// read-only. S1 writes cfg:0x80 to `0x18000000` (ChipCommon / `BCMA_ADDR_BASE`) — Linux's
+// `bcma_scan_switch_core(bus, BCMA_ADDR_BASE)`, issued unconditionally before its first `CC_ID` read
+// — reads the chip identity and the EROM core list (moving the window once more to the EROM base),
+// and RESTORES the window to the pre-image it recorded.
+//
+// The restore discipline is the whole safety case, and Boot AF is why it is not a formality: the
+// pre-image on THIS machine is `0x18001000`, **not** the enumeration base `0x18000000`. A stage that
+// "restored" to `0x18000000` because that is what it assumed firmware left would silently move the
+// radio's window for every later boot stage AND look clean in every log line. The restore pushes the
+// value it READ and witnesses MATCH/FAILED against that stored value — never against `0x18000000`,
+// which appears nowhere as a restore target.
+//
+// The unwind is PROVEN before the state-changing write (igpu discipline: a self-test, not a bare
+// write). Every read/write is bounded; the EROM walk carries the same structural + TSC bounds as
+// S0's. Guarded so the write is issued ONLY against a Broadcom 4331 — QEMU models no such part, so
+// there the block stops at `no-device` and no write is ever issued.
+#[cfg(feature = "bcmaS1")]
+fn s1_window_walk() {
+    // BCM4331 PCI device id. Inlined (not a module const) so no unused-const warning exists when the
+    // `bcmaS1` knob is off; the guard below is the ONLY gate on the first write, so it is spelled out
+    // where it is used.
+    const DEVID_BCM4331: u16 = 0x4331;
+
+    let dl = Deadline::new();
+    serial_println!(
+        ":: bcma-s1: begin — the WiFi path's FIRST WRITE: move cfg:0x80 to ChipCommon (0x18000000), read chip id + EROM, then RESTORE the recorded pre-image (never 0x18000000) ::"
+    );
+
+    // Reuse S0's device-find. QEMU models no BCM4331 -> None -> not one config write is issued.
+    let (found, matches) = find_wifi();
+    let (bus, dev, func) = match found {
+        Some(b) => b,
+        None => {
+            serial_println!(
+                ":: bcma-s1: no-device — no class 0x02/sub 0x80 function on this machine; no window write issued (expected under QEMU, which models no BCM4331) ::"
+            );
+            let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+            serial_println!(
+                ":: bcma-s1: end ok=0 stage=find reason=no-device wrote-cfg80=0 matches={} elapsed={}{} ::",
+                matches, ev, eu
+            );
+            return;
+        }
+    };
+
+    // GUARD — the single gate on the first write. cfg:0x80 is a 4331-specific backplane selector;
+    // moving it on any other part is exactly the wedge this path exists to avoid, so the write is
+    // refused unless BOTH the Broadcom vendor id AND the 4331 device id read back. This is what keeps
+    // a stray class-0x02/sub-0x80 function in some other machine (or a future QEMU model) from taking
+    // the write.
+    let vend = unsafe { read_config_16(bus, dev, func, 0x00) };
+    let devid = unsafe { read_config_16(bus, dev, func, 0x02) };
+    if vend != VENDOR_BROADCOM || devid != DEVID_BCM4331 {
+        serial_println!(
+            ":: bcma-s1: REFUSED stage=identity reason=not-4331 vendor={:#06x} device={:#06x} — the cfg:0x80 selector is 4331-specific; NO window write issued ::",
+            vend, devid
+        );
+        let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+        serial_println!(
+            ":: bcma-s1: end ok=0 stage=identity wrote-cfg80=0 elapsed={}{} ::",
+            ev, eu
+        );
+        return;
+    }
+
+    // S1 writes ONLY cfg:0x80. It does NOT wake the function (a PMCSR write) or enable memory decode
+    // (a COMMAND write) — those are OTHER writes S0 refuses and S1 must not make either. Re-check
+    // both read-only; if either does not already hold, the window write below would be pointless (a
+    // moved window that BAR0 will not answer), so refuse without writing.
+    let pm = {
+        let p = unsafe { find_cap(bus, dev, func, CAP_ID_PM) };
+        if p <= 0xF8 { p } else { 0 }
+    };
+    let pstate = if pm != 0 {
+        (unsafe { read_config_32(bus, dev, func, pm + 4) } & 0x3) as u8
+    } else {
+        0
+    };
+    let command = (unsafe { read_config_32(bus, dev, func, CFG_CMD_STS) } & 0xFFFF) as u16;
+    if pstate != 0 || (command & 0x0002) == 0 {
+        serial_println!(
+            ":: bcma-s1: REFUSED stage=precond reason={} d={} cmd={:#06x} — S1 writes only cfg:0x80; waking (PMCSR) / enabling decode (COMMAND) are OTHER writes, not this arc's; NO window write issued ::",
+            if pstate != 0 { "not-d0" } else { "mem-decode-off" }, pstate, command
+        );
+        let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+        serial_println!(":: bcma-s1: end ok=0 stage=precond wrote-cfg80=0 elapsed={}{} ::", ev, eu);
+        return;
+    }
+
+    // Map BAR0 (a page-table edit; the device sees nothing) so the ChipCommon/EROM reads below land.
+    let bar0_raw = unsafe { read_config_32(bus, dev, func, CFG_BAR0) };
+    if bar0_raw == 0 || (bar0_raw & 1) != 0 {
+        serial_println!(
+            ":: bcma-s1: REFUSED stage=bar0 reason={} bar0={:#010x} — no memory BAR0 to read the window through; NO window write issued ::",
+            if bar0_raw == 0 { "bar0-unassigned" } else { "bar0-is-io" }, bar0_raw
+        );
+        let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+        serial_println!(":: bcma-s1: end ok=0 stage=bar0 wrote-cfg80=0 elapsed={}{} ::", ev, eu);
+        return;
+    }
+    let is64 = (bar0_raw & 0x6) == 0x4;
+    let bar0: u64 = if is64 {
+        let hi = unsafe { read_config_32(bus, dev, func, CFG_BAR1) } as u64;
+        ((bar0_raw & 0xFFFF_FFF0) as u64) | (hi << 32)
+    } else {
+        (bar0_raw & 0xFFFF_FFF0) as u64
+    };
+    crate::arch::memory::map_mmio_window(bar0, BAR0_MAP_LEN);
+    if crate::arch::memory::translate(bar0).is_none() {
+        serial_println!(
+            ":: bcma-s1: REFUSED stage=map reason=bar0-unmapped bar0={:#x} — window not present after map_mmio_window; NO config write issued ::",
+            bar0
+        );
+        let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+        serial_println!(":: bcma-s1: end ok=0 stage=map wrote-cfg80=0 elapsed={}{} ::", ev, eu);
+        return;
+    }
+
+    // ── Step 1: record the PRE-IMAGE. This value — whatever firmware actually left — is the ONE
+    // restore target. 0x18000000 is never used as a restore value anywhere below. ────────────────
+    let pre_win = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let pre_win2 = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN2) };
+    serial_println!(
+        ":: bcma-s1: pre-image cfg:0x80={:#010x} cfg:0xac={:#010x} — the 0x80 value here is the RESTORE TARGET (on this machine 0x18001000, NOT the enumeration base 0x18000000) ::",
+        pre_win, pre_win2
+    );
+
+    // ── Step 1b: prove the UNWIND before moving the window. Write the pre-image BACK to itself — a
+    // no-op, since it is the value cfg:0x80 already holds, so the window does not move and the device
+    // sees no state change — and read it back. This exercises the exact write+readback path the final
+    // restore depends on. If it does not round-trip, the config-write path is untrustworthy and the
+    // window is left exactly where firmware put it. (igpu discipline: a self-test, not a bare write.)
+    unsafe { crate::arch::pci::write_config_32(bus, dev, func, CFG_BAR0_WIN, pre_win) };
+    let selftest = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    if selftest != pre_win {
+        serial_println!(
+            ":: bcma-s1: REFUSED stage=unwind-selftest reason=readback-mismatch wrote={:#010x} readback={:#010x} — the restore path does NOT round-trip; the window has NOT been moved off the firmware pre-image ::",
+            pre_win, selftest
+        );
+        let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+        serial_println!(
+            ":: bcma-s1: end ok=0 stage=unwind-selftest wrote-cfg80=1(no-op, in-place) restore=N/A elapsed={}{} ::",
+            ev, eu
+        );
+        return;
+    }
+    serial_println!(
+        ":: bcma-s1: unwind-selftest PASS — wrote the pre-image to itself, read back {:#010x} (window unmoved); the restore path round-trips ::",
+        selftest
+    );
+
+    // From HERE the window WILL move. There are NO early returns between the move and the restore at
+    // the end — every path below falls through to Step 4.
+
+    // ── Step 2: THE WRITE. cfg:0x80 <- 0x18000000 (ChipCommon / BCMA_ADDR_BASE). ──────────────────
+    unsafe { crate::arch::pci::write_config_32(bus, dev, func, CFG_BAR0_WIN, BCMA_ADDR_BASE) };
+    let win_now = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    serial_println!(
+        ":: bcma-s1: WROTE cfg:0x80 old={:#010x} new={:#010x} readback={:#010x} took={} (Linux bcma_scan_switch_core(BCMA_ADDR_BASE)) ::",
+        pre_win, BCMA_ADDR_BASE, win_now, (win_now == BCMA_ADDR_BASE) as u8
+    );
+
+    // ── Step 3: read ChipCommon through BAR0+0, now that the window points at it. ──────────────────
+    let chipid = unsafe { r32(bar0, CC_ID) };
+    let cc_id = (chipid & 0xFFFF) as u16;
+    let window_confirmed;
+    if chipid == 0xFFFF_FFFF {
+        // The window is on the enumeration base and ChipCommon STILL reads all-ones. This REFUTES the
+        // window hypothesis — moving cfg:0x80 was not the blocker — and is a finding, not a silent
+        // pass. Blame moves upstream (PCIe link, or 0:28.1 not forwarding 0xc1900000). Say so, then
+        // fall through to the restore.
+        window_confirmed = false;
+        serial_println!(
+            ":: bcma-s1: REFUTED window-hypothesis — cfg:0x80 readback={:#010x} (ChipCommon base) yet BAR0+0 reads 0xffffffff. Moving the window was NOT the blocker; the fault is upstream (link, or the bridge above not forwarding this address). Restoring and reporting. ::",
+            win_now
+        );
+    } else {
+        window_confirmed = true;
+        let cc_rev = (chipid >> 16) & 0xF;
+        let cc_pkg = (chipid >> 20) & 0xF;
+        let cc_ncores = (chipid >> 24) & 0xF;
+        let cc_type = (chipid >> 28) & 0xF;
+        let cap = unsafe { r32(bar0, CC_CAP) };
+        let cap_ext = unsafe { r32(bar0, CC_CAP_EXT) };
+        let chipst = unsafe { r32(bar0, CC_CHIPSTATUS) };
+        let erom = unsafe { r32(bar0, CC_EROM) };
+        // RAW first, decode second — a decode bug must not hide the evidence it came from.
+        serial_println!(
+            ":: bcma-s1: cc-raw chipid={:#010x} cap={:#010x} cap_ext={:#010x} chipstatus={:#010x} erom={:#010x} ::",
+            chipid, cap, cap_ext, chipst, erom
+        );
+        serial_println!(
+            ":: bcma-s1: chip id={:#06x} rev={} pkg={} ncores={} type={} ({}) pmu={} is-4331={} ::",
+            cc_id, cc_rev, cc_pkg, cc_ncores, cc_type,
+            match cc_type { 0 => "ssb/sb", 1 => "bcma/erom", 2 => "bcma-single", _ => "?" },
+            (cap & CC_CAP_PMU != 0) as u8, (cc_id == DEVID_BCM4331) as u8
+        );
+
+        // ── Step 3b: the EROM. It sits on the backplane at `erom`, outside the ChipCommon window,
+        // so reaching it needs cfg:0x80 pointed at it — another window write, restored with the rest
+        // at Step 4. The window register is 4 KiB-granular (its low 12 bits are ignored by hardware),
+        // and the EROM base is page-aligned, so writing `erom` directly and reading from BAR0+0 is
+        // exactly Linux's `bcma_scan_switch_core(erombase)`. The recon's walker is reused verbatim.
+        if erom != 0 && erom != ER_BAD {
+            let erom_base = erom & 0xFFFF_F000;
+            let erom_off = (erom & 0x0000_0FFF) as u64;
+            unsafe { crate::arch::pci::write_config_32(bus, dev, func, CFG_BAR0_WIN, erom_base) };
+            let ew = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+            serial_println!(
+                ":: bcma-s1: WROTE cfg:0x80 old={:#010x} new={:#010x} readback={:#010x} — window now on the EROM; walking read-only ::",
+                BCMA_ADDR_BASE, erom_base, ew
+            );
+            let cores = walk_erom(|i| unsafe { r32(bar0, erom_off + (i as u64) * 4) });
+            serial_println!(
+                ":: bcma-s1: erom-cross-check walk-cores={} chipcommon-ncores={} match={} — a mismatch convicts the walk or the window, NOT the machine ::",
+                cores, cc_ncores, (cores == cc_ncores) as u8
+            );
+        } else {
+            serial_println!(
+                ":: bcma-s1: erom pointer={:#010x} — ChipCommon reports no usable EROM; core inventory not walked (chip type={}) ::",
+                erom, cc_type
+            );
+        }
+    }
+
+    // ── Step 4: RESTORE. Push the value READ at Step 1 (pre_win), never 0x18000000. Witness
+    // MATCH/FAILED by comparing the read-back to the STORED pre-image. A failed restore leaves the
+    // radio's window moved for every later boot stage to misread — this comparison is the safety
+    // case, and it is against `pre_win`, not against any assumed enumeration base. ────────────────
+    unsafe { crate::arch::pci::write_config_32(bus, dev, func, CFG_BAR0_WIN, pre_win) };
+    let restored = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let restore_ok = restored == pre_win;
+    serial_println!(
+        ":: bcma-s1: RESTORE cfg:0x80 <- pre-image {:#010x} readback={:#010x} restored={} (compared to the STORED pre-image, NOT to 0x18000000) ::",
+        pre_win, restored, if restore_ok { "MATCH" } else { "FAILED" }
+    );
+    if !restore_ok {
+        serial_println!(
+            ":: bcma-s1: !! RESTORE FAILED — cfg:0x80 is {:#010x}, not the firmware pre-image {:#010x}; the next stage will misread the backplane. Hard finding. ::",
+            restored, pre_win
+        );
+    }
+
+    let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+    serial_println!(
+        ":: bcma-s1: end ok={} stage=window chip={:#06x} window-hypothesis={} restore={} wrote-cfg80=1 elapsed={}{} ::",
+        (window_confirmed && restore_ok) as u8, cc_id,
+        if window_confirmed { "CONFIRMED" } else { "REFUTED" },
+        if restore_ok { "MATCH" } else { "FAILED" }, ev, eu
     );
 }
