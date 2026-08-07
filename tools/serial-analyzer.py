@@ -2127,14 +2127,149 @@ def wxn_verdicts(w):
     return clean, msgs
 
 
+# --- what a kern_WX RISE actually means ------------------------------------
+#
+# Until WXN M3b clears W from the executable extent, every kernel code page is
+# both writable and executable, so `kern_WX` is not "how much coverage was lost"
+# — it is "how many code pages exist".  A boot that ADDS CODE therefore raises
+# `kern_WX` by exactly the pages it added, with W^X coverage of the map
+# unchanged and total.  Boot Z did precisely that: 304 -> 318 `xpages` and
+# 305 -> 319 `kern_WX`, +14 on both wires.
+#
+# The discriminator is an identity the reader ALREADY prints three ways and then
+# used to ignore:
+#
+#     kern_WX == keep_x == xpages + 1
+#
+# `xpages` is the ELF-derived executable extent, +1 is the AP trampoline page,
+# `keep_x` is the splitter's own count of the leaves it left executable, and
+# `kern_WX` is the audit walk's independent recount.  When all three agree,
+# EVERY W^X leaf is an executable page — no DATA page is W^X, coverage is total,
+# and a rise can only be code growth.  When `kern_WX` exceeds `xpages + 1`,
+# there are W^X leaves the executable extent does not account for: pages that
+# are writable AND executable without being kernel code.  That is the fault the
+# WARN was written for, and it is a different finding from code growth.
+#
+# The two must therefore read differently — and the third case, a boot that
+# cannot supply all three terms, must read differently again: it is not evidence
+# of health, so it keeps the conservative WARN.  Never downgrade on absence.
+WXN_CODEGROWTH_TAG = 'CODE GROWTH'
+
+
+def _pages_bytes(pages):
+    """Page count as a bytes-equivalent, for a reader who thinks in KiB."""
+    total = pages * 4096
+    if total >= (1 << 20):
+        text = f"{total / float(1 << 20):.1f}"
+        return f"{text[:-2] if text.endswith('.0') else text} MiB"
+    return f"{total // 1024} KiB"
+
+
+def wxn_extent(w):
+    """Evaluate `kern_WX == keep_x == xpages + 1` on ONE boot.
+
+    Returns a dict carrying the three terms, `holds` (True / False / None), and
+    `why` — the sentence the report uses.  `holds is None` means the identity
+    could not be evaluated at all, which is a THIRD answer and never a pass:
+    a boot missing any term cannot testify that its coverage is total, and it
+    cannot testify that it is not."""
+    c, m2 = w['census'], w['m2']
+    kern_wx = _num(c['fields'].get('kern_WX')) if c else None
+    keep_x = _num(m2['fields'].get('keep_x')) if m2 else None
+    xpages = _num(m2['fields'].get('xpages')) if m2 else None
+    out = {'number': w['number'], 'kern_wx': kern_wx, 'keep_x': keep_x,
+           'xpages': xpages, 'holds': None, 'why': None, 'unaccounted': None}
+    missing = []
+    if kern_wx is None:
+        missing.append('its WXAUDIT census carries no readable kern_WX')
+    if m2 is None:
+        # NOT `WXN_ABSENT`: that string names the 32724cb4 histogram/FBWC era.
+        # The M2 wire arrived later, at e8b11513, and mis-naming the era is how
+        # a reader talks a reader out of looking.
+        missing.append('it carries no WXN-M2 line at all — the executable '
+                       'extent was never printed on this boot (WXN-M2 wire '
+                       'absent, pre-e8b11513 build)')
+    else:
+        if xpages is None:
+            missing.append('its WXN-M2 line carries no readable xpages')
+        if keep_x is None:
+            missing.append('its WXN-M2 line carries no readable keep_x')
+    if missing:
+        out['why'] = (f"boot {w['number']} cannot be tested against "
+                      f"kern_WX == keep_x == xpages+1 because "
+                      f"{' and '.join(missing)}")
+        return out
+    predicted = xpages + 1
+    out['unaccounted'] = kern_wx - predicted
+    out['holds'] = (kern_wx == keep_x == predicted)
+    if out['holds']:
+        out['why'] = (f"boot {w['number']}: kern_WX={kern_wx} == "
+                      f"keep_x={keep_x} == xpages+1 = {predicted}")
+    else:
+        out['why'] = (f"boot {w['number']}: kern_WX={kern_wx} vs "
+                      f"keep_x={keep_x} vs xpages+1 = {predicted} — the three "
+                      f"walkers do not agree")
+    return out
+
+
+def wxn_classify_rise(prev_w, cur_w, pk, ck):
+    """Classify a kern_WX rise.  Returns (kind, text).
+
+    `kind` is 'codegrowth' (informational, NOT a finding), 'coverage' (the
+    strengthened WARN) or 'undecidable' (the conservative WARN kept intact)."""
+    pe, ce = wxn_extent(prev_w), wxn_extent(cur_w)
+    head = (f"kern_WX {pk} -> {ck} across boots {prev_w['number']} -> "
+            f"{cur_w['number']} (+{ck - pk})")
+    warn = (f"WARN WXN-KERNWX-ROSE: {head}. W^X coverage of the kernel map "
+            f"SHRANK between these two boots and every line still printed "
+            f"clean")
+    # The genuine alarm first: unaccounted leaves convict regardless of what the
+    # earlier boot could or could not say.
+    if ce['holds'] is False and ce['unaccounted'] > 0:
+        return 'coverage', (
+            f"{warn}. {ce['unaccounted']} W^X leaf/leaves on boot "
+            f"{cur_w['number']} are NOT accounted for by the executable "
+            f"extent — kern_WX={ce['kern_wx']} exceeds xpages+1 = "
+            f"{ce['xpages'] + 1} (keep_x={ce['keep_x']}) by "
+            f"{ce['unaccounted']}. That many leaves are writable AND "
+            f"executable without being kernel code: coverage LOST, not code "
+            f"added")
+    if pe['holds'] and ce['holds']:
+        grew = ce['xpages'] - pe['xpages']
+        return 'codegrowth', (
+            f"{WXN_CODEGROWTH_TAG}: {head} — and the identity "
+            f"kern_WX == keep_x == xpages+1 holds on BOTH boots ({pe['why']}; "
+            f"{ce['why']}), so every W^X leaf is an executable page: no DATA "
+            f"page is W^X and coverage of the kernel map is still TOTAL. The "
+            f"rise is CODE GROWTH — the executable extent grew by {grew} "
+            f"page(s) (~{_pages_bytes(grew)}) — which is expected until WXN "
+            f"M3b clears W from the executable extent. NOT a finding")
+    # Everything else: the discrimination did not happen.  Say so, and keep the
+    # conservative reading — an unevaluable identity is not evidence of health.
+    if ce['holds'] is None or pe['holds'] is None:
+        reason = "; ".join(e['why'] for e in (pe, ce) if e['holds'] is None)
+    else:
+        reason = "; ".join(e['why'] for e in (pe, ce) if not e['holds'])
+    return 'undecidable', (
+        f"{warn}. The code-growth discrimination was NOT POSSIBLE on this "
+        f"pair: {reason}. A rise this reader cannot attribute to the "
+        f"executable extent is reported at its conservative reading, never "
+        f"downgraded on missing evidence")
+
+
 def wxn_trend(blocks):
     """The cross-boot table and its two verdicts.
 
     Returns (rows, findings, notes).  `rows` is one tuple per boot; a field the
-    boot did not carry is None and prints as the absence string, never as 0."""
+    boot did not carry is None and prints as the absence string, never as 0.
+
+    `xpages` and `keep_x` ride in the row so that CODE GROWTH is DATA the reader
+    can see, not an inference from a sentence underneath the table.  They are
+    APPENDED rather than inserted: the row is positional, and the selftest reads
+    `kern_WX` and `nx_set` off fixed indices."""
     rows = []
     for w in blocks:
-        c, s = w['census'], w['sweep']
+        c, s, m2 = w['census'], w['sweep'], w['m2']
         rows.append((
             w['number'],
             _num(c['fields'].get('kern_WX')) if c else None,
@@ -2142,9 +2277,12 @@ def wxn_trend(blocks):
             _num(s['fields'].get('nx_set')) if s else None,
             _num(c['fields'].get('walk')) if c else None,
             w['era'],
+            _num(m2['fields'].get('xpages')) if m2 else None,
+            _num(m2['fields'].get('keep_x')) if m2 else None,
         ))
     findings, notes = [], []
-    for prev, cur in zip(rows, rows[1:]):
+    for i, (prev, cur) in enumerate(zip(rows, rows[1:])):
+        prev_w, cur_w = blocks[i], blocks[i + 1]
         pk, ck = prev[1], cur[1]
         if pk is None or ck is None:
             notes.append(f"boots {prev[0]} -> {cur[0]}: no kern_WX on "
@@ -2152,11 +2290,8 @@ def wxn_trend(blocks):
                          f" — no comparison possible, which is not a pass")
             continue
         if ck > pk:
-            findings.append(
-                f"WARN WXN-KERNWX-ROSE: kern_WX {pk} -> {ck} across boots "
-                f"{prev[0]} -> {cur[0]} (+{ck - pk}). W^X coverage of the "
-                f"kernel map SHRANK between these two boots and every line "
-                f"still printed clean")
+            kind, text = wxn_classify_rise(prev_w, cur_w, pk, ck)
+            (notes if kind == 'codegrowth' else findings).append(text)
         elif ck < pk:
             notes.append(f"MILESTONE: kern_WX {pk} -> {ck} across boots "
                          f"{prev[0]} -> {cur[0]} (-{pk - ck}) — the sweep "
@@ -2166,22 +2301,34 @@ def wxn_trend(blocks):
 
 
 def print_wxn_trend(rows, findings, notes):
-    print("--- cross-boot TREND (kern_WX / residue_leaves / nx_set / walk) ---")
-    print(f"  {'boot':>5}  {'kern_WX':>9}  {'residue':>9}  {'nx_set':>7}  "
-          f"{'walk':>10}   era")
-    for num, kern_wx, residue, nx_set, walk, era in rows:
+    print("--- cross-boot TREND (kern_WX / xpages / keep_x / residue_leaves / "
+          "nx_set / walk) ---")
+    print(f"  {'boot':>5}  {'kern_WX':>9}  {'xpages':>7}  {'keep_x':>7}  "
+          f"{'residue':>9}  {'nx_set':>7}  {'walk':>10}   era")
+    for num, kern_wx, residue, nx_set, walk, era, xpages, keep_x in rows:
         def cell(v, width, unit=''):
             return (f"{v}{unit}".rjust(width) if v is not None
                     else '-'.rjust(width))
-        print(f"  {str(num):>5}  {cell(kern_wx, 9)}  {cell(residue, 9)}  "
+        print(f"  {str(num):>5}  {cell(kern_wx, 9)}  {cell(xpages, 7)}  "
+              f"{cell(keep_x, 7)}  {cell(residue, 9)}  "
               f"{cell(nx_set, 7)}  {cell(walk, 10, 'kcyc')}   {era}")
     for note in notes:
         print(f"  note {note}")
     for finding in findings:
         print(f"  !! {finding}")
     if not findings and len(rows) > 1:
-        print(f"  ok   kern_WX never rose across {len(rows) - 1} consecutive "
-              f"pair(s)")
+        # 'never rose' would be FALSE on a capture that rose by code growth, and
+        # a footer that contradicts the note above it is the instrument lying in
+        # its own summary line.  Count them and say which claim is being made.
+        grew = sum(1 for n in notes if n.startswith(WXN_CODEGROWTH_TAG))
+        if grew:
+            print(f"  ok   no UNACCOUNTED kern_WX rise across "
+                  f"{len(rows) - 1} consecutive pair(s) — {grew} of them rose "
+                  f"with kern_WX == keep_x == xpages+1 intact on both sides "
+                  f"(code growth, noted above), which is not coverage loss")
+        else:
+            print(f"  ok   kern_WX never rose across {len(rows) - 1} "
+                  f"consecutive pair(s)")
     if len(rows) < 2:
         print("  only one boot carries the WXN wires in this capture — NO "
               "TREND POSSIBLE. The kern_WX-rise signature needs two boots to "
@@ -4226,6 +4373,61 @@ WXN_FIXTURE_M2_ALARMS = WXN_FIXTURE_BOOTY + """\
 """
 
 
+# --- the three readings of a kern_WX RISE ----------------------------------
+#
+# Boot Z, the second boot below, is REAL: quoted byte-for-byte out of
+# ~/unaos-bench/scratch/gr19/bootYZ-pair.log, the metal capture whose +14 the old
+# reader called coverage loss.  It follows the real Boot Y, so this fixture IS
+# the pair that provoked the refinement.
+#
+#   kern_WX 305 -> 319, and on BOTH boots kern_WX == keep_x == xpages+1
+#   (305 == 305 == 304+1, 319 == 319 == 318+1).  Every W^X leaf is an executable
+#   page, so no DATA page is W^X: coverage is total on both sides and the rise is
+#   the 14 code pages Boot Z added.  Informational — and it must NOT set the
+#   finding exit code, which is what the report-path leg below holds it to.
+WXN_FIXTURE_CODEGROWTH = WXN_FIXTURE_BOOTY + """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B1FB000 img=[0x7B1FB000,0x7B8D2000) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B1FB000,0x7B339000) xsegs=2 xpages=318 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=2 pool_used=2/16 nx_pdpt=0 nx_2m=1021 nx_pt=0 nx_4k=1217 keep_x=319 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=319 (1 MiB) tables=1030 nxe=1 walk=1729kcyc l1=0 l2=65533 l3=1536 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+"""
+
+# THE ALARM ARM, and the reason it is worth its own fixture: this boot is a
+# COHERENT boot, not a corrupted line.  Boot Z's splitter retires 81 fewer 4-KiB
+# leaves (`nx_4k` 1217 -> 1136), so it keeps 81 more executable — `keep_x` 319 ->
+# 400 — and the audit walk independently recounts the same 400.  Every in-boot
+# self-check therefore PASSES: the closed form still closes
+# (1535 + 511*2 - 1021 - 1136 - 0 = 400 == kern_WX) and keep_x still equals the
+# audit.  Only two readers see it: the M2/ELF derivation, which notes that
+# keep_x is 81 above xpages+1, and the trend, which must convict.  That makes
+# this the exact shape the WARN exists for — 81 leaves writable AND executable
+# that are not kernel code — and it proves the trend arm carries the exit code
+# on its own, with no other WARN in the capture to hide behind.
+WXN_FIXTURE_XLOSS = WXN_FIXTURE_BOOTY + """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B1FB000 img=[0x7B1FB000,0x7B8D2000) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B1FB000,0x7B339000) xsegs=2 xpages=318 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=2 pool_used=2/16 nx_pdpt=0 nx_2m=1021 nx_pt=0 nx_4k=1136 keep_x=400 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=400 (1 MiB) tables=1030 nxe=1 walk=1729kcyc l1=0 l2=65533 l3=1536 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+"""
+
+# THE THIRD ANSWER: the same +14 rise onto the same real Boot Z, but the EARLIER
+# boot is Boot Y with its `WXN-M2` line deleted — a pre-e8b11513 build, which is
+# the only thing every capture before tonight was.  The identity cannot be
+# evaluated on that side, so the reader must say the discrimination did not
+# happen and keep the conservative WARN.  This is the leg that stops the benign
+# arm from becoming a way to explain any rise away: silence about the executable
+# extent is not evidence that the extent grew.
+WXN_FIXTURE_XBLIND = "".join(
+    line + "\n" for line in WXN_FIXTURE_CODEGROWTH.split("\n")[:-1]
+    if 'WXN-M2:' not in line or 'xpages=318' in line)
+
+
 # --- the M3a era fixture ---------------------------------------------------
 #
 # THE CONDITION THIS EXISTS FOR (M3 review, C3).  `WXN_WP_TARGET = 0xFF` made
@@ -4431,6 +4633,124 @@ def wxn_m2_alarms_expect(result):
     ]
 
 
+def wxn_codegrowth_expect(result):
+    """The real Boot Y -> Boot Z pair: a rise that is CODE GROWTH, not loss."""
+    blocks = [wxn_boot(b) for b in result['boots']]
+    rows, findings, notes = wxn_trend(blocks)
+    joined = "\n".join(notes)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_wxn_trend(rows, findings, notes)
+    page = buf.getvalue()
+    return [
+        ('boots parsed', len(result['boots']), 2),
+        # the identity, evaluated per boot
+        ('boot 1 identity holds', wxn_extent(blocks[0])['holds'], True),
+        ('boot 2 identity holds', wxn_extent(blocks[1])['holds'], True),
+        ('boot 2 has no unaccounted leaves',
+         wxn_extent(blocks[1])['unaccounted'], 0),
+        # THE REFINEMENT.  A rise with the identity intact is not a finding.
+        ('the rise raises NO finding', findings, []),
+        ('the rise is classified as code growth',
+         wxn_classify_rise(blocks[0], blocks[1], 305, 319)[0], 'codegrowth'),
+        ('the note names the growth in pages AND bytes',
+         'grew by 14 page(s) (~56 KiB)' in joined, True),
+        ('the note states coverage is still total',
+         'coverage of the kernel map is still TOTAL' in joined, True),
+        ('the note names the milestone that ends it',
+         'expected until WXN M3b clears W' in joined, True),
+        ('the note shows the identity on BOTH boots, not just one',
+         ('boot 1: kern_WX=305 == keep_x=305 == xpages+1 = 305' in joined,
+          'boot 2: kern_WX=319 == keep_x=319 == xpages+1 = 319' in joined),
+         (True, True)),
+        ('the WARN wording is NOT used', 'WXN-KERNWX-ROSE' in joined, False),
+        # xpages reaches the table as DATA, so the reader sees code growth
+        # without having to trust the sentence underneath it
+        ('trend xpages column', [r[6] for r in rows], [304, 318]),
+        ('trend keep_x column', [r[7] for r in rows], [305, 319]),
+        ('the table header names the new columns',
+         'xpages' in page and 'keep_x' in page, True),
+        # the footer must not claim a rise never happened
+        ('the footer does not claim kern_WX never rose',
+         'never rose' in page, False),
+        ('the footer claims exactly what was checked',
+         'no UNACCOUNTED kern_WX rise across 1 consecutive pair(s)' in page,
+         True),
+        # and the per-boot readers are unmoved: this is a healthy capture
+        ('both boots clean', [wxn_verdicts(w)[0] and wxn_selfchecks(w)[0]
+                              for w in blocks], [True, True]),
+    ]
+
+
+def wxn_xloss_expect(result):
+    """The genuine coverage loss: 81 W^X leaves the code cannot account for."""
+    blocks = [wxn_boot(b) for b in result['boots']]
+    rows, findings, notes = wxn_trend(blocks)
+    ext = wxn_extent(blocks[1])
+    joined = "\n".join(findings)
+    return [
+        ('boots parsed', len(result['boots']), 2),
+        ('boot 2 identity BROKEN', ext['holds'], False),
+        ('boot 2 unaccounted leaves', ext['unaccounted'], 81),
+        ('the rise IS a finding', len(findings), 1),
+        ('classified as coverage loss',
+         wxn_classify_rise(blocks[0], blocks[1], 305, 400)[0], 'coverage'),
+        ('the WARN keeps its name and its old sentence',
+         (joined.startswith('WARN WXN-KERNWX-ROSE'),
+          'W^X coverage of the kernel map SHRANK' in joined), (True, True)),
+        ('the WARN says exactly how many leaves are unaccounted for',
+         '81 W^X leaf/leaves on boot 2 are NOT accounted for' in joined, True),
+        ('the WARN shows the derivation it convicted on',
+         'kern_WX=400 exceeds xpages+1 = 319 (keep_x=400) by 81' in joined,
+         True),
+        ('the WARN refuses the code-growth excuse in words',
+         'coverage LOST, not code added' in joined, True),
+        ('no CODE GROWTH note is emitted beside it',
+         any(n.startswith(WXN_CODEGROWTH_TAG) for n in notes), False),
+        # THE POINT OF THE FIXTURE.  This boot is internally consistent: the
+        # closed form closes and the two walkers agree.  If the trend arm did
+        # not convict, NOTHING would.
+        ('the boot\'s own self-checks are clean — only the trend convicts',
+         (wxn_verdicts(blocks[1])[0], wxn_selfchecks(blocks[1])[0]),
+         (True, True)),
+        ('the ELF derivation still notes the 81, without warning on it',
+         any('keep_x=400 vs xpages+1 = 319' in m
+             for m in wxn_selfchecks(blocks[1])[1]), True),
+    ]
+
+
+def wxn_xblind_expect(result):
+    """A rise the reader CANNOT attribute: the conservative WARN stands."""
+    blocks = [wxn_boot(b) for b in result['boots']]
+    rows, findings, notes = wxn_trend(blocks)
+    joined = "\n".join(findings)
+    return [
+        ('boots parsed', len(result['boots']), 2),
+        ('boot 1 carries no WXN-M2 line', blocks[0]['m2'], None),
+        ('boot 1 identity is UNEVALUABLE, not False',
+         wxn_extent(blocks[0])['holds'], None),
+        ('boot 2 identity holds on its own', wxn_extent(blocks[1])['holds'],
+         True),
+        ('an unevaluable identity does NOT downgrade the rise', len(findings),
+         1),
+        ('classified as undecidable',
+         wxn_classify_rise(blocks[0], blocks[1], 305, 319)[0], 'undecidable'),
+        ('the WARN keeps its name', joined.startswith('WARN WXN-KERNWX-ROSE'),
+         True),
+        ('the WARN says the discrimination did not happen',
+         'code-growth discrimination was NOT POSSIBLE' in joined, True),
+        ('it names the missing evidence and the right era',
+         ('carries no WXN-M2 line at all' in joined,
+          'pre-e8b11513 build' in joined), (True, True)),
+        ('it refuses to downgrade on absence',
+         'never downgraded on missing evidence' in joined, True),
+        ('no CODE GROWTH note is emitted',
+         any(n.startswith(WXN_CODEGROWTH_TAG) for n in notes), False),
+        ('the trend table renders the missing extent as absence, not zero',
+         [r[6] for r in rows], [None, 318]),
+    ]
+
+
 def wxn_bootw_expect(result):
     """Boot W, the real 32724cb4 lines, read end to end.
 
@@ -4594,6 +4914,18 @@ def selftest_wxn():
         ('WXN: the three CR0.WP eras — a real pre-M3a six-core boot, the real '
          'post-M3a one, and a post-M3a boot one core short',
          WXN_FIXTURE_M3A, wxn_m3a_expect),
+        # One fixture per ARM of the kern_WX-rise classifier.  An arm with no
+        # fixture is an arm nobody re-tests, and the benign arm is the one that
+        # could quietly learn to explain away a real regression.
+        ('WXN: the real Boot Y -> Boot Z rise — code growth with the identity '
+         'kern_WX == keep_x == xpages+1 intact on both boots',
+         WXN_FIXTURE_CODEGROWTH, wxn_codegrowth_expect),
+        ('WXN: a rise with 81 W^X leaves the executable extent cannot account '
+         'for — genuine coverage loss, and the only WARN in the capture',
+         WXN_FIXTURE_XLOSS, wxn_xloss_expect),
+        ('WXN: the same rise onto a boot with no WXN-M2 line — the '
+         'discrimination is impossible and the conservative WARN stands',
+         WXN_FIXTURE_XBLIND, wxn_xblind_expect),
     ):
         print(f"=== selftest: {name} ===")
         result = parse_content(f'<{name}>', text)
@@ -4632,6 +4964,15 @@ def selftest_wxn():
          WXN_FIXTURE_M3A_CLEAN, EXIT_OK),
         ('--wxn on a post-M3a boot one core short exits FINDING',
          WXN_FIXTURE_M3A, EXIT_FINDING),
+        # THE EXIT-CODE CLAIM the refinement rests on: a code-growth rise must
+        # not set the finding code, and neither of the other two arms may lose
+        # it.  Asserted through the real report path, not through wxn_trend.
+        ('--wxn on the real Boot Y -> Boot Z code-growth rise exits OK',
+         WXN_FIXTURE_CODEGROWTH, EXIT_OK),
+        ('--wxn on a rise with unaccounted W^X leaves exits FINDING',
+         WXN_FIXTURE_XLOSS, EXIT_FINDING),
+        ('--wxn on a rise that cannot be discriminated exits FINDING',
+         WXN_FIXTURE_XBLIND, EXIT_FINDING),
     ):
         result = parse_content(f'<{label}>', fixture)
         buf = io.StringIO()
@@ -5051,7 +5392,9 @@ def main():
                              "and its leaf histogram, WXAUDIT-NXE and "
                              "WXN-FBWC: per-boot block with cross-field "
                              "self-checks, the cross-boot kern_WX trend (a "
-                             "RISE is coverage silently lost), and the "
+                             "RISE is coverage silently lost unless "
+                             "kern_WX == keep_x == xpages+1 holds on both "
+                             "boots, which makes it code growth), and the "
                              "WXN-FBWC leaf DIFF")
     parser.add_argument("--slowxfer", action="store_true",
                         help="read EPACE-TRIM M8 SLOW-XFER: per-boot table with "
