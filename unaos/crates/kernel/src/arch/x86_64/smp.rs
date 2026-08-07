@@ -443,12 +443,23 @@ ap_pm_entry:
     # WXN-x86 M1 — NXE here is a PREREQUISITE, not a hardening. With EFER.NXE clear, bit 63 of a
     # paging-structure entry is not "ignored", it is RESERVED: any translation through an entry that
     # carries it raises a reserved-bit #PF — for data reads and stack writes just as much as for
-    # instruction fetches. The AP's very first act after CR0.PG below is to read its parameter block
-    # and set rsp, and this core has no IDT yet, so such a fault escalates straight to a triple
-    # fault: the AP dies silently or the machine resets. The moment `memory::wxn_pdpt_sweep` puts an
-    # NX bit anywhere in the shared identity map, an AP that entered paging with NXE=0 is dead. Its
-    # own `syscall::init()` sets NXE, but that runs deep inside `ap_entry`, long AFTER paging is on —
-    # this closes exactly that window.
+    # instruction fetches. The moment `memory::wxn_pdpt_sweep` puts an NX bit anywhere in the shared
+    # identity map, an AP that entered paging with NXE=0 dies at its first access through an NX'd
+    # parent. Its own `syscall::init()` sets NXE, but that runs deep inside `ap_entry`, long AFTER
+    # paging is on — this closes exactly that window.
+    #
+    # WHERE it would actually die, named precisely, because the first version of this comment named
+    # the wrong place and a wrong model of "which accesses are at risk" is worth more than the fix is:
+    # the AP's first acts after CR0.PG are reading its parameter block at 0x8000+off and setting rsp
+    # to &AP_STACKS[i] — but 0x8000 is in GiB 0 and AP_STACKS is a `.bss` `static mut` inside the
+    # kernel image, and the sweep SPARES both of those GiBs, so neither walks an NX'd entry at all.
+    # The first NX'd parent an AP touches is `apic::init()`'s LAPIC store at 0xFEE00000 — GiB 3,
+    # which the sweep does NX (Boot V: `at=lapic lvl=2M`, so GiB 3 is a present, unspared table).
+    # By then `interrupts::init_idt()` has run, so with NXE=0 that store is a reserved-bit #PF that
+    # lands in the kernel's #PF handler: a page-fault panic on an AP, not a silent triple fault.
+    # The conclusion is unchanged and the fix is still mandatory — an AP that dies at apic::init is
+    # just as dead, any EARLIER access through an NX'd entry would fault pre-IDT and triple, and the
+    # walk is only correct with NXE set regardless. Only the mechanism was misdescribed.
     #
     # Unconditionally safe: `syscall::init()` hard-STOPs the BSP if CPUID.80000001h:EDX[20] (NX) is
     # clear, and that runs from `arch::init` long before `start_aps`, so by the time any AP executes

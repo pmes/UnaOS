@@ -878,6 +878,20 @@ pub struct WxAudit {
     pub kern_wx_bytes: u64,
     /// Page-table pages read during the walk (the walk's cost, made visible rather than assumed).
     pub tables: u32,
+    /// **O1 — the leaf-level histogram.** Present leaves by the level they terminate at: 1 GiB, 2 MiB,
+    /// 4 KiB. `l1g + l2m + l4k == leaves` by construction (every `record` call increments exactly one
+    /// of them and `leaves`), and `wx_audit_report` asserts it — a live structural check, not a
+    /// decorative one: it is what catches a future `record` call site that forgets its level.
+    ///
+    /// WHY IT EXISTS. The aggregate `leaves`/`tables`/byte total does **not** determine the leaf mix.
+    /// The metal map (`leaves=66047`, `131072 MiB`, `tables=1028`) is satisfied by the whole family
+    /// `n1 = k, n4 = 512(k+1), n2 = 65536 − 512k − (k+1)` for k = 0, 1, 2, … — every member matches all
+    /// three printed numbers exactly. Only a direct count of the levels can say which one is real, and
+    /// the answer decides whether the M2 splitter needs a 1 GiB→2 MiB demotion (and therefore a PD in
+    /// its static pool) or only 2 MiB→4 KiB.
+    pub l1g: u32,
+    pub l2m: u32,
+    pub l4k: u32,
     /// True if the table budget was exhausted — the counts are then a LOWER BOUND and the audit
     /// must not be read as a clean bill of health.
     pub truncated: bool,
@@ -920,6 +934,13 @@ impl WxAudit {
     /// Classify one present leaf of `size` bytes under the folded permission `acc`.
     fn record(&mut self, acc: (bool, bool, bool), size: u64, nxe: bool) {
         self.leaves += 1;
+        // O1: the level histogram. `size` is the only thing that distinguishes the three call sites,
+        // and it is a literal at each of them, so this cannot drift out of step with the walk.
+        match size {
+            s if s == 1 << 30 => self.l1g += 1,
+            s if s == 1 << 21 => self.l2m += 1,
+            _ => self.l4k += 1,
+        }
         if acc.0 {
             self.user_leaves += 1;
         }
@@ -1125,8 +1146,11 @@ pub fn wx_audit_report() {
     let t0 = super::now_cycles();
     let a = wx_audit_root(cr3_table() as u64);
     let cycles = super::now_cycles().wrapping_sub(t0);
+    // O1 — the leaf histogram, APPENDED (never inserted): every existing `awk` pattern that matched
+    // this line before still matches it. `l1/l2/l3` are the 1 GiB / 2 MiB / 4 KiB leaf counts over the
+    // WHOLE map, which is what the spared-GiB census in the WXN line structurally cannot see.
     serial_println!(
-        ":: WXAUDIT x86: leaves={} user={} user_WX={} kern_WX={} ({} MiB) tables={} nxe={} walk={}kcyc{} ::",
+        ":: WXAUDIT x86: leaves={} user={} user_WX={} kern_WX={} ({} MiB) tables={} nxe={} walk={}kcyc l1={} l2={} l3={}{} ::",
         a.leaves,
         a.user_leaves,
         a.user_wx,
@@ -1135,7 +1159,20 @@ pub fn wx_audit_report() {
         a.tables,
         a.nxe as u8,
         cycles / 1000,
+        a.l1g,
+        a.l2m,
+        a.l4k,
         if a.truncated { " TRUNCATED" } else { "" }
+    );
+    // The histogram's own self-check. Every `record` increments `leaves` and exactly one level
+    // bucket, so this is an identity — but it is an identity over three separate call sites in the
+    // walk, which is precisely the kind of thing a later edit breaks silently. Unlike the three
+    // asserts F5 retired from the sweep, this one CAN fire: add a leaf size the `match` does not
+    // name, or a `record` that bypasses the histogram, and the boot stops here.
+    assert!(
+        a.l1g + a.l2m + a.l4k == a.leaves,
+        "WXAUDIT: leaf histogram does not sum to the leaf count — l1={} + l2={} + l3={} != leaves={}",
+        a.l1g, a.l2m, a.l4k, a.leaves
     );
     assert!(
         a.user_wx == 0,
@@ -1415,11 +1452,21 @@ pub fn wx_probe_report() {
 // whole PML4→PDPT→PD→PT path, and `wx_fold` (the census's classifier, `:891-897`) folds it the same
 // way — so ONE bit on a PDPT entry retires 512 (or 262144) leaves at once, in silicon and in the
 // count. On the rMBP that is ~1022 entry writes instead of 66047. The decisive secondary benefit is
-// not the arithmetic, it is the blast radius: **this sweep never writes a leaf.** The framebuffer's
-// WC typing, every MMIO aperture's PAT/PCD/PWT, the Global bits the firmware chose — none of it is
-// on a PDPT entry, so none of it can be disturbed. GR15 (a whole-PTE rewrite that silently dropped
-// the panel's PAT bit and cost 8.7–9.1× on the blit path) is avoided structurally here, not by
+// not the arithmetic, it is the blast radius. GR15 (a whole-PTE rewrite that silently dropped the
+// panel's PAT bit and cost 8.7–9.1× on the blit path) is avoided structurally here, not by
 // discipline. Every write below is a read-modify-write that sets exactly one bit and nothing else.
+//
+// THE ONE EXCEPTION, and why the invariant is stated carefully (F1). "This sweep never writes a leaf"
+// is FALSE in general: a PDPT entry with `PTE_HUGE` set **is** a 1 GiB leaf, and on a firmware whose
+// identity map uses 1 GiB leaves the sweep writes them. That write is still correct — marking a 1 GiB
+// leaf non-executable is exactly the intent, and it is still a permission-only RMW of bit 63, so no
+// memory-type bit and no address bit moves — but it is a LEAF write, and the honest form of the
+// invariant is therefore: **this sweep writes bit 63 and nothing else, at whatever level the entry
+// terminates.** The loop counts those writes separately as `huge_leaf_nx=` so a capture says whether
+// any happened, and the FBWC interlock below is scoped to match: an fb whose leaf IS that 1 GiB entry
+// legitimately differs by exactly `PTE_NX` afterwards, and that case is reported, not panicked on.
+// Neither known platform reaches it (Boot V: `fb lvl=2M`, `lapic lvl=2M`; OVMF likewise), which is
+// why it is a latent defect and not a fire — and why `huge_leaf_nx=0` is the expected reading on both.
 //
 // WHERE IT RUNS, and why that is not negotiable. `arch::init`, between `syscall::init()` and
 // `wx_audit_report()`:
@@ -1553,6 +1600,17 @@ fn wxn_image_bounds() -> Option<(u64, u64)> {
 /// separate walks of the same tables. A sweep that missed entries disagrees with itself, on one
 /// screen, without anyone having to hold a baseline in their head.
 ///
+/// **The metal prediction, stated with its actual precision.** Boot V's baseline
+/// (`leaves=66047`, `131072 MiB`, `tables=1028`, and `kern_WX == leaves`, i.e. no RO/NX residue) does
+/// **not** pin the leaf mix: the whole family `n1 = k, n4 = 512(k+1), n2 = 65536 − 512k − (k+1)`
+/// satisfies all three numbers for every k ≥ 0, because the byte total is degenerate in k. So the
+/// residue this census will print is **1535 or 2046** — 1535 under k = 0 (the natural reading:
+/// `GiB0 = 511×2M + 512×4K`, `GiB1 = 512×2M`), 2046 if a second page table also lies inside the
+/// spared GiBs, as k = 1 permits. Which one lands is decided ON THE BOOT, by two things this arc now
+/// prints rather than assumes: `(1g= 2m= 4k= pt=)` here, and the whole-map `l1=/l2=/l3=` histogram on
+/// the WXAUDIT line (O1). `pdpt_seen=1024`, `nx_set=1022` and `skip_spare=2` are invariant across the
+/// family and stay hard predictions.
+///
 /// Returns `(leaves, 1G leaves, 2M leaves, 4K leaves, page tables descended, capped)`.
 fn wxn_spare_census(spare: &WxnSpare) -> (u32, u32, u32, u32, u32, bool) {
     let (mut l1g, mut l2m, mut l4k, mut pts) = (0u32, 0u32, 0u32, 0u32);
@@ -1648,35 +1706,45 @@ pub fn wxn_pdpt_sweep() {
         fits &= spare.add(g);
         g += 1;
     }
-    assert!(
-        fits,
-        "WXN-x86: the kernel image spans more 1 GiB regions than WXN_MAX_SPARE ({}) — img=[{:#x},{:#x}); \
-         raising the cap is safe, sweeping with an under-spared set is not",
-        WXN_MAX_SPARE, img_lo, img_hi
-    );
 
-    // Leg 3 — the self-check that wrong bounds cannot survive. `wxn_pdpt_sweep` is itself a `.text`
-    // address, so it must lie inside the derived image span AND inside a spared GiB. If the phdr
-    // walk latched onto the wrong header, or the GiB arithmetic is off, this fires here — before a
-    // single entry is written — instead of as a dead machine one instruction after the flush.
+    // Leg 2b — fail closed on spare-set overflow. This is a REFUSAL, not an assert, and it is not a
+    // claim of coverage: with a ~6.7 MiB image the spare set is {tramp} ∪ {at most 2 image GiBs}, so
+    // `n ≤ 3 < WXN_MAX_SPARE = 4` and `fits` cannot be false short of a ≥ 2 GiB kernel. It is kept
+    // because an under-spared set is the one failure that makes the running kernel non-executable,
+    // and because the checks below are only implied by the bounds check *given* that the loop
+    // inserted every index in the range — which is exactly what `fits` states. Refusing (no entry
+    // written, one loud line) is strictly better than a panic: the boot survives, unprotected and
+    // visibly so.
+    if !fits {
+        serial_println!(
+            ":: WXN-x86: img=[0x{:X},0x{:X}) spare_cap={} -> REFUSED (image spans more 1 GiB regions \
+             than WXN_MAX_SPARE; no entry written) ::",
+            img_lo, img_hi, WXN_MAX_SPARE
+        );
+        return;
+    }
+
+    // Leg 3 — the self-check that wrong bounds cannot survive, and THE one load-bearing assert in
+    // this function. `wxn_pdpt_sweep` is itself a `.text` address, so it must lie inside the derived
+    // image span. If the phdr walk latched onto the wrong ELF header (an `include_bytes!` ring-3 blob
+    // in `.rodata`, a truncated walk), this fires here — before a single entry is written — instead
+    // of as a dead machine one instruction after the flush.
+    //
+    // F5 — two asserts that used to stand here have been REMOVED rather than left as false coverage:
+    //   * `spare.contains(here >> 30)` could not fail once this assert passed. `img_lo ≤ here < img_hi`
+    //     puts `here >> 30` inside the closed range `[img_lo >> 30, (img_hi − 1) >> 30]`, and the
+    //     `while` loop above inserted EVERY index in that range (with `fits` already established).
+    //   * `spare.contains(tramp_gib)` was a tautology: `spare.add(tramp_gib)` is the first insertion
+    //     into an empty fixed-capacity set, so it always succeeds and `contains` always returns true.
+    // Both read as coverage of a hazard nothing could produce. The hazards are real; the checks were
+    // not checking them. What actually protects the trampoline GiB is that it is inserted first and
+    // unconditionally; what actually protects `.text` is the bounds assert immediately below.
     let here = wxn_pdpt_sweep as *const () as u64;
     assert!(
         here >= img_lo && here < img_hi,
         "WXN-x86: derived image bounds [{:#x},{:#x}) do not contain this function ({:#x}) — the phdr \
          walk found the wrong ELF header",
         img_lo, img_hi, here
-    );
-    assert!(
-        spare.contains(here >> 30),
-        "WXN-x86: the GiB holding kernel .text ({:#x}) is not in the spare set — sweeping would make \
-         the running kernel non-executable",
-        here >> 30
-    );
-    assert!(
-        spare.contains(tramp_gib),
-        "WXN-x86: the GiB holding the AP trampoline ({:#x}) is not in the spare set — sweeping would \
-         triple-fault every AP at its first post-paging fetch",
-        tramp_gib
     );
 
     // The residue prediction, computed BEFORE the sweep (the sweep changes no PD/PT contents, so the
@@ -1691,11 +1759,33 @@ pub fn wxn_pdpt_sweep() {
     // change. A boot-breaking panic naming the two values is strictly better than a silently
     // un-typed panel, which costs 8.7–9.1× on the blit path and is invisible to every permission
     // instrument in the tree, WXAUDIT included.
-    let fb = crate::video::WRITER.try_lock().map(|w| w.base() as u64).unwrap_or(0);
+    //
+    // F2 — the three ways this interlock can silently not happen, each counted on the WXN line so a
+    // capture without a `WXN-FBWC:` line is never indistinguishable from a build without the
+    // interlock: `try_lock` contention (`skip_fb_lock`), a firmware that gave us no framebuffer
+    // (`skip_fb_base`), and an fb address the walk cannot resolve (`skip_fb_walk`). `try_lock`, not
+    // `lock`: a diagnostic must not be able to wedge the boot, and the guard is dropped before any
+    // `serial_println!` below (the fbcon mirror takes the same lock).
+    //
+    // And the honest scope, so no later reader over-reads a green line: with respect to the GR15
+    // hazard it names this check is vacuously green BY CONSTRUCTION whenever `huge_leaf_nx == 0` —
+    // no leaf was written, so no leaf value can have changed. What it genuinely discriminates is a
+    // LEVEL CONFUSION: a loop that wrote PD entries instead of PDPT entries would hit the fb's own PD
+    // and fire. Keep it as that interlock; it is not a safety leg.
+    let (fb, skip_fb_lock) = match crate::video::WRITER.try_lock() {
+        Some(w) => (w.base() as u64, 0u32),
+        None => (0u64, 1u32),
+    };
+    let skip_fb_base = u32::from(skip_fb_lock == 0 && fb == 0);
     let fb_before = if fb != 0 { wx_probe_leaf(fb).map(|(e, l, _)| (e, l)) } else { None };
+    let skip_fb_walk = u32::from(fb != 0 && fb_before.is_none());
 
     let (mut pdpt_seen, mut nx_set, mut skip_spare) = (0u32, 0u32, 0u32);
     let (mut skip_user, mut skip_pml4_user, mut already_nx, mut skip_selfmap) = (0u32, 0u32, 0u32, 0u32);
+    // F1 — PDPT entries that are themselves 1 GiB LEAVES and got bit 63. Counted apart from
+    // `nx_set` (which stays the total number of entries written, so its prediction is unchanged)
+    // because these, and only these, are leaf writes.
+    let mut huge_leaf_nx = 0u32;
 
     let root = cr3_table();
     let root_pa = root as u64;
@@ -1752,6 +1842,16 @@ pub fn wxn_pdpt_sweep() {
                         already_nx += 1;
                         continue;
                     }
+                    // F1 — a PDPT entry with PTE_HUGE IS a 1 GiB leaf. Setting NX on it is right
+                    // (that is exactly the region we mean to make non-executable) and the store is
+                    // the same permission-only RMW as any other — bit 63 and nothing else, so no
+                    // memory-type bit, no address bit and no Global bit moves, and GR15's law holds.
+                    // But it is a LEAF write, so it is counted apart: `huge_leaf_nx > 0` is what
+                    // tells a reader that the "no leaf was written" reading of the FBWC interlock
+                    // below does not apply on this platform.
+                    if e3 & PTE_HUGE != 0 {
+                        huge_leaf_nx += 1;
+                    }
                     core::ptr::write_volatile(p, e3 | PTE_NX);
                     nx_set += 1;
                 }
@@ -1790,10 +1890,26 @@ pub fn wxn_pdpt_sweep() {
         }
     }
 
+    // F6 — the verdict. Every other WXN instrument in this arc carries one; without it a sweep that
+    // wrote NOTHING prints a line that reads entirely normal. The concrete way that happens: if the
+    // firmware set U/S on its identity PML4 entries, every descent takes the `skip_pml4_user` branch,
+    // `pdpt_seen` stays 0 and no entry is touched — the milestone is completely vacuous and only a
+    // reader who cross-reads the NEXT line's `kern_WX` would notice. So: `nx_set == 0` while the map
+    // does have PDPT entries that are not all spared is VACUOUS, on the wire, in one greppable token.
+    // (The failure is fail-safe — the sweep under-protects, it can never over-protect — which is why
+    // this is an honesty gap and not a correctness one.)
+    // `pdpt_seen == 0` is the U/S case above (the sweep never reached a PDPT entry at all);
+    // `spare_n < pdpt_seen` is the case where entries existed beyond the ones we deliberately spared
+    // and still none was written. Either way this sweep wrote nothing. (`already_nx == pdpt_seen`
+    // would also land here — a map the firmware had already NX'd. That map is protected, just not by
+    // us, and `already_nx=` on this same line says which of the two it was.)
+    let vacuous = nx_set == 0 && (pdpt_seen == 0 || (spare.n as u32) < pdpt_seen);
+    let verdict = if vacuous { "-> VACUOUS" } else { "-> SWEPT" };
     serial_println!(
         ":: WXN-x86: ehdr=0x{:X} img=[0x{:X},0x{:X}) gib_img={} gib_tramp={} spare_n={} pdpt_seen={} nx_set={} \
-         skip_spare={} skip_user={} skip_pml4_user={} skip_selfmap={} already_nx={} residue_leaves={} \
-         (1g={} 2m={} 4k={} pt={}{}) pge={} flush={} wp={} ::",
+         huge_leaf_nx={} skip_spare={} skip_user={} skip_pml4_user={} skip_selfmap={} already_nx={} \
+         skip_fb_lock={} skip_fb_base={} skip_fb_walk={} residue_leaves={} \
+         (1g={} 2m={} 4k={} pt={}{}) pge={} flush={} wp={} {} ::",
         &raw const __ehdr_start as u64,
         img_lo,
         img_hi,
@@ -1802,11 +1918,15 @@ pub fn wxn_pdpt_sweep() {
         spare.n,
         pdpt_seen,
         nx_set,
+        huge_leaf_nx,
         skip_spare,
         skip_user,
         skip_pml4_user,
         skip_selfmap,
         already_nx,
+        skip_fb_lock,
+        skip_fb_base,
+        skip_fb_walk,
         sp_leaves,
         sp_1g,
         sp_2m,
@@ -1816,6 +1936,7 @@ pub fn wxn_pdpt_sweep() {
         pge as u8,
         if pge { "pge-toggle" } else { "cr3-reload" },
         wp,
+        verdict,
     );
 
     // The GR15 belt, cashed. `residue_leaves` above is what the WXAUDIT line on the next screen must
@@ -1825,17 +1946,40 @@ pub fn wxn_pdpt_sweep() {
     if let Some((e_before, l_before)) = fb_before {
         match wx_probe_leaf(fb) {
             Some((e_after, l_after, acc)) => {
+                // The level must never move: this sweep creates and destroys no table, so the fb's
+                // walk must terminate at the same level it did before, whatever that level is.
                 assert!(
-                    e_after == e_before && l_after == l_before,
-                    "WXN-x86: the framebuffer LEAF changed across a sweep that writes only PARENT \
-                     entries — before=0x{:016X}/lvl{} after=0x{:016X}/lvl{}. This is the GR15 defect \
-                     (a dropped PAT bit silently re-UCs the panel, 8.7-9.1x on the blit path) and it \
-                     is invisible to every permission instrument, so the boot stops here.",
+                    l_after == l_before,
+                    "WXN-x86: the framebuffer walk terminated at a DIFFERENT LEVEL across the sweep \
+                     — before=0x{:016X}/lvl{} after=0x{:016X}/lvl{}. The sweep creates no table and \
+                     destroys none, so the map changed shape underneath it.",
                     e_before, l_before, e_after, l_after
+                );
+                // F1 — the entry compare, scoped to what the sweep can legitimately have done at the
+                // level the walk ACTUALLY terminated at. Two outcomes are correct, and they are not
+                // the same claim:
+                //   * `delta == 0` — the fb leaf is below the PDPT (lvl 1 or 2, both known
+                //     platforms), the sweep wrote only parents, and nothing about the leaf moved.
+                //   * `delta == PTE_NX` at lvl 3 — the fb IS a 1 GiB leaf and this sweep set bit 63
+                //     on it. That is the sweep working as designed on such a firmware, not a GR15
+                //     event, and the old unconditional compare would have PANICKED THE BOOT here with
+                //     a message blaming a defect that had not occurred.
+                // Anything else — any other bit, or a bit-63 change at a level this sweep never
+                // writes — is the GR15 class (a dropped PAT bit silently re-UCs the panel, 8.7-9.1x
+                // on the blit path, invisible to every permission instrument) and stops the boot.
+                let delta = e_after ^ e_before;
+                let huge_leaf_sweep = l_after == 3 && delta == PTE_NX && e_after & PTE_NX != 0;
+                assert!(
+                    delta == 0 || huge_leaf_sweep,
+                    "WXN-x86: the framebuffer LEAF changed in bits other than PTE_NX — \
+                     before=0x{:016X} after=0x{:016X} delta=0x{:016X} lvl={}. This is the GR15 defect \
+                     (a dropped PAT/PCD/PWT bit silently re-UCs the panel, 8.7-9.1x on the blit path) \
+                     and it is invisible to every permission instrument, so the boot stops here.",
+                    e_before, e_after, delta, l_after
                 );
                 let pat = pat_bit_for_level(l_after);
                 serial_println!(
-                    ":: WXN-FBWC: fb=0x{:X} lvl={} e=0x{:016X} pat={} pcd={} pwt={} w={} fx={} -> LEAF BIT-IDENTICAL ::",
+                    ":: WXN-FBWC: fb=0x{:X} lvl={} e=0x{:016X} pat={} pcd={} pwt={} w={} fx={} {} ::",
                     fb,
                     l_after,
                     e_after,
@@ -1844,6 +1988,11 @@ pub fn wxn_pdpt_sweep() {
                     (e_after & PTE_PWT != 0) as u8,
                     (e_after & PTE_WRITABLE != 0) as u8,
                     (!acc.2) as u8,
+                    if delta == 0 {
+                        "-> LEAF BIT-IDENTICAL"
+                    } else {
+                        "-> LEAF NX-ONLY (fb is a 1G leaf this sweep NX'd; expected)"
+                    },
                 );
             }
             None => panic!(
@@ -1852,6 +2001,14 @@ pub fn wxn_pdpt_sweep() {
                 fb, e_before
             ),
         }
+    } else {
+        // F2 — the interlock did not run, and says so. Without this line a capture with no
+        // `WXN-FBWC:` in it is indistinguishable from a build that never had the tripwire; the
+        // `skip_fb_*` fields on the WXN line above name which of the three paths it took.
+        serial_println!(
+            ":: WXN-FBWC: fb=0x{:X} skip_lock={} skip_base={} skip_walk={} -> SKIPPED ::",
+            fb, skip_fb_lock, skip_fb_base, skip_fb_walk
+        );
     }
 }
 
