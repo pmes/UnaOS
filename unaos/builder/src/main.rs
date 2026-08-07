@@ -146,6 +146,16 @@ fn main() {
     // wire) would have looked like a card that refused. The `armed=` field exists for exactly this,
     // and it is what caught the same omission in WXN-M3b. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_SDW").is_ok() { feats.push("sdw"); }
+    // PCI-CENSUS (GR20): UNAOS_PCICENSUS=1 arms the complete READ-ONLY PCI enumeration witness
+    // (arch/x86_64/pci.rs::full_census) — one `[PCI-CENSUS]` line per function present, plus a
+    // capability dump per network-class function. THIS list is what reaches the kernel binary for
+    // MEDIA builds: the builder re-derives the x86 feature set from env, so a knob wired into
+    // arroyo alone ships the census DISABLED while the `⚡ kernel features:` banner claims it is on
+    // — the s42/INSTGUI and WXN-M3b failure, and the one this arc is most exposed to, because a
+    // census that silently did not run is indistinguishable on the wire from a machine with
+    // nothing on its buses. Config reads only, no BAR sizing, bounded sweep. Default OFF =>
+    // function + call site unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_PCICENSUS").is_ok() { feats.push("pcicensus"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature

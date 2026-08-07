@@ -478,6 +478,30 @@ install_target = ["sdmmc_arm"]
 # x86_64 only; aarch64 media are byte-identical. See docs/dev/OS/07_USB_STORAGE/sdhc.md §SDHC-4a.
 sdw = []
 
+# PCI-CENSUS (GR20, x86): the `UNAOS_PCICENSUS=1` complete READ-ONLY PCI enumeration witness
+# (arch/x86_64/pci.rs::full_census). Every other PCI walk in this kernel is TARGETED — xHCI by class
+# triple, storage by class 0x01/0x08, display by class 0x03, and `find_device(0x02, 0x00)` which
+# returns the FIRST Ethernet-subclass function and stops — so no capture this project has ever taken
+# enumerates the machine. This pass prints one line per function present (bdf, vendor:device,
+# class/subclass/progif, revision, header type + MF bit, COMMAND/STATUS, subsystem id, IRQ line/pin,
+# and every non-zero BAR with its low-bit type decode; bridges print their primary/secondary/
+# subordinate bus numbers instead of a subsystem id), then dumps the capability list of every
+# network-class function via the existing `[PCI-PROBE]` diagnostic.
+#
+# READ-ONLY is a property of the code: the block contains no `write_config_*` call, and BARs are NOT
+# sized — sizing needs the write-all-ones/read/restore dance, which transiently moves a live device's
+# decode window mid-boot, so raw firmware-assigned values are printed instead and the header line
+# says so. Bounded: the same 256x32 sweep the two existing passes already run, MF-gated on the
+# function-0 header type, with a 128-line print cap that reports `truncated=1` when it is hit.
+#
+# Default OFF => the function, its helpers and its call site do not exist and media are
+# byte-identical. x86_64 only (the module is `arch/x86_64`), and stripped from aarch64 builds by
+# arroyo's `arm_features` so aarch64 media stay byte-identical whichever way this knob points.
+# Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs` — the builder rebuilds the x86
+# kernel from its own env list, so a knob wired only in arroyo ships disabled (the s42/INSTGUI and
+# WXN-M3b lesson).
+pcicensus = []
+
 # AARCH64-VNET: the `UNAOS_VNET=1` virtio-net-mmio driver on the QEMU `virt` machine + smoltcp bind
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. NET-4's
 # driver is `tegra`-gated (QEMU models no Tegra234 RC), so it is only ever COMPILE-tested off metal; this

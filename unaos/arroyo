@@ -215,6 +215,22 @@ _feats=""
 # Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
 # disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
 [ -n "${UNAOS_SDW:-}" ] && _feats="${_feats}sdw,"
+# PCI-CENSUS (GR20): UNAOS_PCICENSUS=1 arms the complete READ-ONLY PCI enumeration witness
+# (arch/x86_64/pci.rs::full_census) — one `[PCI-CENSUS]` line per function present on the machine,
+# plus a capability dump for every network-class function. Every other PCI walk in this kernel is
+# TARGETED (xHCI class triple, storage classes 0x01/0x08, display class 0x03, and a
+# `find_device(0x02, 0x00)` that returns the FIRST Ethernet-subclass function and stops), so until
+# this knob existed no capture enumerated the machine at all — which is why the question "what WiFi
+# part is in the 2012 rMBP" could not be answered from our own kernel. Config-space READS only: no
+# `write_config_*` anywhere in the block and no BAR sizing (that needs a write/restore dance on a
+# live decode window), so BARs are printed exactly as firmware assigned them. Bounded: the same
+# 256x32 MF-gated sweep the existing passes run, with a 128-line print cap that self-reports
+# `truncated=1`. Runs BEFORE the GPACE anchor, so the GPACE tiling is untouched and the census
+# reports its own `elapsed=`. x86_64 only; stripped from aarch64 builds by `arm_features` below.
+# Default OFF => function + call site unlinked, media byte-identical.
+# Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
+# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_PCICENSUS:-}" ] && _feats="${_feats}pcicensus,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -441,6 +457,12 @@ arm_features() {
     # points, which is the property that lets the x86 track arm a card-write knob without touching the
     # Pi or Jetson media at all.
     f="${f//,sdw,/,}"
+    # PCI-CENSUS (GR20) rides the same strip, for the same reason: `full_census` lives in
+    # `arch/x86_64/pci.rs`, so `pcicensus` emits not one byte of aarch64 CODE — but an enabled
+    # feature is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in would shift every
+    # aarch64 media hash between a default build and a `UNAOS_PCICENSUS=1` one for zero observable
+    # change. Stripped => the x86 track can arm a bus census without touching Pi or Jetson media.
+    f="${f//,pcicensus,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -1080,7 +1102,7 @@ check_user_arch() {
 }
 
 # GATE-CFG: the DEFAULT feature set is a tiny fraction of this kernel. `[features]` in
-# crates/kernel/Cargo.toml carries 77 knobs plus `default = []`, so the two legs below compile only
+# crates/kernel/Cargo.toml carries 78 knobs plus `default = []`, so the two legs below compile only
 # what survives with every knob off — and `$KERNEL_FEATURES` (the UNAOS_* → cargo-feature mapping at
 # the top of this script) adds knobs only when the OPERATOR sets them, which nobody does before a
 # commit. Everything behind a `#[cfg(feature = ...)]` was therefore NEVER type-checked by the gate.
@@ -1107,7 +1129,7 @@ check_user_arch() {
 #     arm legs would buy zero coverage and cost a compile, so they are excluded ON EVIDENCE.
 #
 # COVERAGE ARGUMENT (why 3 legs + the 2 default legs are enough). The union of the three feature lists
-# below is EXACTLY the `[features]` table minus `default` — 77 of 77, no more and no less, so a knob
+# below is EXACTLY the `[features]` table minus `default` — 78 of 78, no more and no less, so a knob
 # added to Cargo.toml without a leg here is a one-line diff to spot. And the DEFAULT legs already
 # compile the all-off state for both arches — so for every feature BOTH polarities of its `#[cfg]` are
 # type-checked, which is what makes the 61
@@ -1139,8 +1161,12 @@ KERNEL_CFG_MATRIX=(
   # enables it the entire CMD24 ladder would be type-checked by nothing — the exact blind spot the
   # coverage argument above exists to close. The default legs cover the disarmed polarity.
   # `pfwire_selftest` (the forced fatal-#PF self-test) rides the same argument: its
-  # `#[cfg]` is type-checked by this leg alone.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw"
+  # `#[cfg]` is type-checked by this leg alone. PCI-CENSUS (GR20) is APPENDED at the end for the
+  # same reason and by the same rule: `pcicensus` gates `full_census` + its two helpers + the call
+  # site in `arch/x86_64/pci.rs`, all x86-only, so this leg is the only one that type-checks them.
+  # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
+  # replacing the list instead of extending it.
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
