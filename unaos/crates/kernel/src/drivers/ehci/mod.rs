@@ -3890,6 +3890,11 @@ pub fn init() {
     unsafe { parser_selftest() };
     let selftest_cy = crate::arch::now_cycles().wrapping_sub(init_t0);
     let mut ctrls: Vec<Controller> = Vec::new();
+    // BUY-1 (GR18): the port walk moved out of this loop into a second pass, so each woken
+    // function's handle (op base + port count, the only two things the walk needs from it) has to
+    // outlive the scan. Paired 1:1 with `ctrls`, pushed on the same line — index `i` of one is
+    // index `i` of the other, which is what lets phase 2 zip them.
+    let mut handles: Vec<(EhciFnHandle, u64)> = Vec::new();
     // Probe-13 (b), Peter-approved 2026-07-17: the RCBA CG (clock gating) base + a one-shot
     // flag — the clear fires only if the live-port smoke actually HSEs.
     let rcba = unsafe { (read_config_32(0, 31, 0, 0xF0) as u64) & !0x3FFF };
@@ -3924,16 +3929,18 @@ pub fn init() {
                         continue;
                     };
                     let wake_cy = crate::arch::now_cycles().wrapping_sub(wake_t0);
-                    // EPACE-TRIM M1: latch the birth mode BEFORE construction, so a same-
-                    // controller HSE flip can never be mistaken for an inherited verdict.
-                    let born_overlay =
-                        CHAIN_HSE_SEEN.load(core::sync::atomic::Ordering::Relaxed);
-                    if born_overlay {
-                        serial_println!(
-                            ":: EHCI-HID: [{}] chain-HSE verdict CARRIED from an earlier controller — OVERLAY-DIRECT from birth (probe + re-init skipped; inference, not a measurement on this function) ::",
-                            idx
-                        );
-                    }
+                    // EPACE-TRIM M1 + BUY-1: the chain-HSE verdict is NOT read here any more.
+                    // The probe that SETS the latch lives in the port walk, and BUY-1 moved the
+                    // port walk out of this loop — so a verdict read at construction time would be
+                    // read before ANY controller had probed, and controller [1] would run its own
+                    // 2 s probe plus the wedged-controller re-init the s58 split priced at ~2.6 s.
+                    // That is ~17x the whole BUY-1 saving, in the wrong direction.
+                    //
+                    // So the read moves to the point of USE — immediately before this controller's
+                    // own probe, in phase 2 — where it keeps M1's actual property: it is still read
+                    // before THIS controller has probed anything, so a same-controller HSE flip can
+                    // never be mistaken for an inherited verdict. The "verdict CARRIED" witness
+                    // moves with the read, so a capture still distinguishes measured from inherited.
                     if h.addr64 != 0 {
                         serial_println!(
                             ":: EHCI-HID: [{}] note: controller advertises 64-bit addressing; CTRLDSSEGMENT pinned to 0 (all DMA < 4 GiB) ::",
@@ -3998,9 +4005,9 @@ pub fn init() {
                         frame_list_phys: fl_phys,
                         int_next: 0,
                         periodic_on: false,
-                        // EPACE-TRIM M1: born overlay-direct when an earlier controller
-                        // already proved the chain-HSE on this die (see CHAIN_HSE_SEEN).
-                        overlay_mode: born_overlay,
+                        // EPACE-TRIM M1 + BUY-1: constructed in chain mode; phase 2 sets this
+                        // from CHAIN_HSE_SEEN just before the probe it gates (see above).
+                        overlay_mode: false,
                         next_addr: 1,
                         int_eps: Vec::new(),
                         pace: {
@@ -4134,95 +4141,171 @@ pub fn init() {
                         }
                     }
                     c.pace.add(EP_SMOKE, smoke_t0);
-                    // EPACE-TRIM M4 follow-up (GR18 review finding 1). The FIRST look at a root
-                    // port is this scan, not `reset_root_port` — this `if` decides whether that
-                    // function is ever called. M4 shortened `wake_route`'s pre-look settle on the
-                    // strength of the caller paying T_ATTDB, and the caller that pays it is
-                    // downstream of a gate that had already sampled CCS. CF 0->1 is a real edge on
-                    // this path (the firmware-stale HCRESET drops CONFIGFLAG, and the first PORTSC
-                    // read comes back 0x00001803 with CSC latched), so sampling CCS ~49 ms after
-                    // it — inside the 100 ms the debounce is for — would let a port whose CCS has
-                    // not re-asserted fall through `continue` with no line, no EPACE class and no
-                    // annotation: a boot that reads FASTER than predicted precisely because the
-                    // internal keyboard went missing. So the debounce is paid HERE, ahead of the
-                    // gate, and dropped from `reset_root_port` for this path: the same 100 ms, at
-                    // the point that actually needs it, and `rootrst=` keeps its old total.
+                    // BUY-1 (GR18) — the T_ATTDB clock starts HERE; the spin is paid in phase 2.
+                    // The debounce is owed from the port-power / CF edge this bring-up just
+                    // applied, so the clock must start at this point and not later. What phase 2
+                    // does is pay whatever is LEFT of it once the other controllers' bring-ups (and,
+                    // for every controller after the first, the earlier controllers' whole port
+                    // walks) have run — never less than zero remaining, and loud when the overlap
+                    // covered part of it. See the phase-2 header for the whole argument.
                     let attdb_t0 = crate::arch::now_cycles();
-                    settle_ms(100); // USB 2.0 §7.1.7.3 T_ATTDB, ahead of the first CCS sample
-                    c.pace.add(EP_ROOTRST, attdb_t0);
-                    for port in 0..h.n_ports {
-                        let portsc = mmio_read32(h.op + OP_PORTSC0 + 4 * port as u64).unwrap_or(0);
-                        if portsc & PORT_CCS == 0 || portsc & PORT_OWNER != 0 {
-                            // Loud, because this is the branch a too-short debounce would take.
+                    ctrls.push(c);
+                    handles.push((h, attdb_t0));
+                }
+            }
+        }
+    }
+
+    // ── BUY-1 (GR18): phase 2, the port walks ───────────────────────────────────────────────────
+    // The enum46 verdict (§5, BUY-1) named the serialization: on the s73 baseline controller [0]
+    // finishes enumerating at [977ms] and controller [1]'s bring-up begins on that same
+    // millisecond. Everything in this driver is a synchronous busy-spin — `settle_ms` and
+    // `wait_bounded` both spin on the TSC — so there is no way to run two controllers' work at the
+    // same time without a concurrency framework this kernel does not have at boot, and the verdict
+    // was right that restructuring the recursive enumeration into interleavable state machines is
+    // an arc, not an edit.
+    //
+    // What IS available for the price of a loop split is the one wait that is pure dead time and
+    // owed to a clock rather than to a device: T_ATTDB. It does not have to be *spun*; it has to
+    // have *elapsed*. So the scan above now stops at the point where each controller's debounce
+    // clock starts, and this loop pays only the remainder:
+    //
+    //   before: [0] bring-up, [0] T_ATTDB 100 ms, [0] port walk, [1] bring-up, [1] T_ATTDB 100 ms, …
+    //   after:  [0] bring-up, [1] bring-up, [0] T_ATTDB remainder, [0] port walk, [1] T_ATTDB …
+    //
+    // [0]'s debounce now runs under [1]'s bring-up (~52 ms of hcrst + smoke on the s73 baseline),
+    // and [1]'s runs under the whole of [0]'s port walk (~550 ms) — which is exactly where the
+    // `05ac:8510`'s device-floor NAK sits. That NAK is untouched and stays untouched (bootpace.md
+    // §8h): this buys back the SERIALIZATION around it, not the device's own answer latency, and
+    // the ceiling on the buy is therefore the deferred dead time (100 ms per controller after the
+    // first, plus whatever of the first controller's own 100 ms the later bring-ups cover), not
+    // the NAK. Predicted: `BPACE: ehci-hid-done d=` ~1444 -> ~1290 ms, `EPACE: [0] rootrst=`
+    // 320 -> ~270 ms and `[1] rootrst=` 160 -> ~60 ms, with `[0] enum=`, `{act=}` and the M8
+    // `wlen=18` line all unchanged. On a single-controller machine (QEMU: one ich9-usb-ehci1)
+    // nothing at all changes — there is no earlier controller to elapse under, `elapsed_ms` is 0,
+    // the full 100 ms is spun exactly as before, and the witness line below stays silent.
+    //
+    // The M4 follow-up's reasoning is why this is a deadline and not a trim, and it survives
+    // verbatim: the FIRST look at a root port is the CCS scan below, not `reset_root_port` — this
+    // `if` decides whether that function is ever called. M4 shortened `wake_route`'s pre-look
+    // settle on the strength of the caller paying T_ATTDB, and the caller that pays it is
+    // downstream of a gate that had already sampled CCS. CF 0->1 is a real edge on this path (the
+    // firmware-stale HCRESET drops CONFIGFLAG, and the first PORTSC read comes back 0x00001803
+    // with CSC latched), so sampling CCS before the debounce has run — inside the 100 ms the
+    // debounce is for — would let a port whose CCS has not re-asserted fall through `continue` with
+    // no line, no EPACE class and no annotation: a boot that reads FASTER than predicted precisely
+    // because the internal keyboard went missing. So the full 100 ms is still paid before the gate,
+    // to the millisecond; BUY-1 changes only WHERE the clock ran, never how long it ran for.
+    for (c, (h, attdb_t0)) in ctrls.iter_mut().zip(handles.iter()) {
+        unsafe {
+            let idx = c.idx;
+            // USB 2.0 §7.1.7.3 T_ATTDB, the connect debounce owed ahead of the first CCS sample.
+            const T_ATTDB_MS: u64 = 100;
+            // `None` from `epace_ms` means the TSC rate is not calibrated yet and elapsed time is
+            // unknowable — take 0, i.e. pay the whole debounce. The conservative branch is the one
+            // that waits longer, never the one that samples early.
+            let elapsed_ms = epace_ms(crate::arch::now_cycles().wrapping_sub(*attdb_t0))
+                .unwrap_or(0)
+                .min(T_ATTDB_MS);
+            let owed_ms = T_ATTDB_MS - elapsed_ms;
+            let attdb_wait_t0 = crate::arch::now_cycles();
+            settle_ms(owed_ms); // the remainder, ahead of the first CCS sample — same guarantee
+            c.pace.add(EP_ROOTRST, attdb_wait_t0);
+            // The BUY-1 instrument, and the only line this change adds. Silent when the overlap
+            // bought nothing (`elapsed_ms == 0`) — which is every single-controller machine,
+            // including QEMU, where the pre-BUY-1 log is itself the witness that the full 100 ms
+            // was spun. When it does fire it is the arithmetic in full: owed, covered, and paid,
+            // so a reader can check that owed == covered + paid rather than take the trim on
+            // trust. `rootrst=` in the EPACE line counts only what was PAID, so the two
+            // instruments cross-check: the drop in `rootrst=` must equal the ms named here.
+            if elapsed_ms > 0 {
+                serial_println!(
+                    ":: EHCI-HID: [{}] BUY-1 T_ATTDB overlap: {} ms owed, {} ms already elapsed under the earlier controllers' bring-up/port walk, {} ms spun here == witness ::",
+                    idx, T_ATTDB_MS, elapsed_ms, owed_ms
+                );
+            }
+            // EPACE-TRIM M1, read at the point of use (see the construction site). Set before the
+            // probe below, and before this controller has run a single transfer, so an inherited
+            // verdict and a self-measured one can never be confused.
+            if !c.overlay_mode && CHAIN_HSE_SEEN.load(core::sync::atomic::Ordering::Relaxed) {
+                c.overlay_mode = true;
+                serial_println!(
+                    ":: EHCI-HID: [{}] chain-HSE verdict CARRIED from an earlier controller — OVERLAY-DIRECT for this port walk (probe + re-init skipped; inference, not a measurement on this function) ::",
+                    idx
+                );
+            }
+            for port in 0..h.n_ports {
+                let portsc = mmio_read32(h.op + OP_PORTSC0 + 4 * port as u64).unwrap_or(0);
+                if portsc & PORT_CCS == 0 || portsc & PORT_OWNER != 0 {
+                    // Loud, because this is the branch a too-short debounce would take.
+                    serial_println!(
+                        ":: EHCI-HID: [{}] port {} not walked: PORTSC={:#010x} CCS={} owner={} (post-T_ATTDB sample){} ::",
+                        idx, port, portsc, portsc & PORT_CCS,
+                        if portsc & PORT_OWNER != 0 { "companion" } else { "EHCI" },
+                        if portsc & PORT_CCS == 0 { m4_note() } else { "" }
+                    );
+                    continue;
+                }
+                let rootrst_t0 = crate::arch::now_cycles();
+                let root_ok = c.reset_root_port(port, false);
+                c.pace.add(EP_ROOTRST, rootrst_t0);
+                if root_ok {
+                    // Transport probe (probe-14): one bare chain-mode GET_DESCRIPTOR(8)
+                    // to addr 0. An HSE means this silicon aborts the qTD-fetch burst
+                    // write — flip to OVERLAY-DIRECT and FULLY re-init (an HSE'd
+                    // controller is wedged; HCRESET, bases, RS, CF, port — all redone).
+                    // EPACE-TRIM M1: a controller that inherited the verdict a few lines
+                    // up (witnessed there) skips the probe AND the wedged-controller
+                    // re-init; the s58 split priced that pair at ~2.6 s.
+                    if !c.overlay_mode {
+                        let probe_t = Target {
+                            addr: 0, mps0: 64, eps: QH_EPS_HIGH, hub_addr: 0, hub_port: 0,
+                        };
+                        let hseprobe_t0 = crate::arch::now_cycles();
+                        let probe_res = c.control(&probe_t, 0x80, 6, 0x0100, 0, 8, true);
+                        c.pace.add(EP_HSEPROBE, hseprobe_t0);
+                        if let Err("hse") = probe_res {
+                            c.overlay_mode = true;
+                            CHAIN_HSE_SEEN
+                                .store(true, core::sync::atomic::Ordering::Relaxed);
                             serial_println!(
-                                ":: EHCI-HID: [{}] port {} not walked: PORTSC={:#010x} CCS={} owner={} (post-T_ATTDB sample){} ::",
-                                idx, port, portsc, portsc & PORT_CCS,
-                                if portsc & PORT_OWNER != 0 { "companion" } else { "EHCI" },
-                                if portsc & PORT_CCS == 0 { m4_note() } else { "" }
+                                ":: EHCI-HID: [{}] qTD-fetch HSE — OVERLAY-DIRECT mode + full HCRESET re-init (probe-14 silicon finding) ::",
+                                idx
                             );
-                            continue;
-                        }
-                        let rootrst_t0 = crate::arch::now_cycles();
-                        let root_ok = c.reset_root_port(port, false);
-                        c.pace.add(EP_ROOTRST, rootrst_t0);
-                        if root_ok {
-                            // Transport probe (probe-14): one bare chain-mode GET_DESCRIPTOR(8)
-                            // to addr 0. An HSE means this silicon aborts the qTD-fetch burst
-                            // write — flip to OVERLAY-DIRECT and FULLY re-init (an HSE'd
-                            // controller is wedged; HCRESET, bases, RS, CF, port — all redone).
-                            // EPACE-TRIM M1: a controller born overlay-direct (verdict carried
-                            // from an earlier function on this die — witnessed at construction)
-                            // skips the probe AND the wedged-controller re-init; the s58 split
-                            // priced that pair at ~2.6 s.
-                            if !c.overlay_mode {
-                                let probe_t = Target {
-                                    addr: 0, mps0: 64, eps: QH_EPS_HIGH, hub_addr: 0, hub_port: 0,
-                                };
-                                let hseprobe_t0 = crate::arch::now_cycles();
-                                let probe_res = c.control(&probe_t, 0x80, 6, 0x0100, 0, 8, true);
-                                c.pace.add(EP_HSEPROBE, hseprobe_t0);
-                                if let Err("hse") = probe_res {
-                                    c.overlay_mode = true;
-                                    CHAIN_HSE_SEEN
-                                        .store(true, core::sync::atomic::Ordering::Relaxed);
-                                    serial_println!(
-                                        ":: EHCI-HID: [{}] qTD-fetch HSE — OVERLAY-DIRECT mode + full HCRESET re-init (probe-14 silicon finding) ::",
-                                        idx
-                                    );
-                                    let hcrst2_t0 = crate::arch::now_cycles();
-                                    let _ = c.quiesce_if_firmware_stale(); // HSE latched -> resets
-                                    c.init_schedules();
-                                    let cmd = mmio_read32(h.op + OP_USBCMD).unwrap_or(0);
-                                    let _ = mmio_write32(h.op + OP_USBCMD, cmd | CMD_RS);
-                                    let _ = wait_bounded(|| {
-                                        mmio_read32(h.op + OP_USBSTS).unwrap_or(STS_HCHALTED)
-                                            & STS_HCHALTED == 0
-                                    });
-                                    ehci_scout::wake_route(&h, idx);
-                                    if let Some(sts) = mmio_read32(h.op + OP_USBSTS) {
-                                        if sts & STS_RW1C != 0 {
-                                            let _ = mmio_write32(h.op + OP_USBSTS, sts & STS_RW1C);
-                                        }
-                                    }
-                                    c.pace.add(EP_HCRST, hcrst2_t0);
-                                    let rootrst2_t0 = crate::arch::now_cycles();
-                                    // `true`: this path re-routed CONFIGFLAG a few lines up and
-                                    // returns straight to the port without passing the CCS gate,
-                                    // so it owns its own T_ATTDB. Unchanged by the M4 follow-up.
-                                    let root2_ok = c.reset_root_port(port, true);
-                                    c.pace.add(EP_ROOTRST, rootrst2_t0);
-                                    if !root2_ok {
-                                        continue;
-                                    }
+                            let hcrst2_t0 = crate::arch::now_cycles();
+                            let _ = c.quiesce_if_firmware_stale(); // HSE latched -> resets
+                            c.init_schedules();
+                            let cmd = mmio_read32(h.op + OP_USBCMD).unwrap_or(0);
+                            let _ = mmio_write32(h.op + OP_USBCMD, cmd | CMD_RS);
+                            let _ = wait_bounded(|| {
+                                mmio_read32(h.op + OP_USBSTS).unwrap_or(STS_HCHALTED)
+                                    & STS_HCHALTED == 0
+                            });
+                            ehci_scout::wake_route(h, idx);
+                            if let Some(sts) = mmio_read32(h.op + OP_USBSTS) {
+                                if sts & STS_RW1C != 0 {
+                                    let _ = mmio_write32(h.op + OP_USBSTS, sts & STS_RW1C);
                                 }
                             }
-                            let _ = (&cg_cleared, rcba); // probe-13 levers retired (smokes all passed)
-                            let enum_t0 = crate::arch::now_cycles();
-                            c.enumerate_at_zero(QH_EPS_HIGH, 0, 0, 0);
-                            c.pace.add(EP_ENUM, enum_t0);
+                            c.pace.add(EP_HCRST, hcrst2_t0);
+                            let rootrst2_t0 = crate::arch::now_cycles();
+                            // `true`: this path re-routed CONFIGFLAG a few lines up and
+                            // returns straight to the port without passing the CCS gate,
+                            // so it owns its own T_ATTDB. Unchanged by the M4 follow-up,
+                            // and deliberately NOT overlapped by BUY-1 — the edge it
+                            // debounces is the one this branch just applied, so there is
+                            // no earlier work for it to have elapsed under.
+                            let root2_ok = c.reset_root_port(port, true);
+                            c.pace.add(EP_ROOTRST, rootrst2_t0);
+                            if !root2_ok {
+                                continue;
+                            }
                         }
                     }
-                    ctrls.push(c);
+                    let _ = (&cg_cleared, rcba); // probe-13 levers retired (smokes all passed)
+                    let enum_t0 = crate::arch::now_cycles();
+                    c.enumerate_at_zero(QH_EPS_HIGH, 0, 0, 0);
+                    c.pace.add(EP_ENUM, enum_t0);
                 }
             }
         }
