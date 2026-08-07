@@ -351,6 +351,15 @@ pub fn init(gpu: &GpuInfo) {
 
 
     unsafe {
+        let mut t_last = crate::arch::ms();
+        macro_rules! phase {
+            ($name:expr) => {
+                let t_now = crate::arch::ms();
+                serial_println!(":: kdisp: bring-up phase={} d={} ::", $name, t_now.wrapping_sub(t_last));
+                t_last = t_now;
+            }
+        }
+
         // 2. Read NV_PMC_BOOT_0 to identify chip
         let boot_0 = mmio_read(bar0, regs::NV_PMC_BOOT_0);
         let chipset = (boot_0 >> 20) & 0xFF;
@@ -747,6 +756,7 @@ pub fn init(gpu: &GpuInfo) {
                                         }
                                         rows_pass1 += 1;
                                     }
+                                    phase!("mmio_bringup");
                                     serial_println!(":: kepler: mirror-hdr pass1 done rows={} ::", rows_pass1);
                                     if beacons_seen == 0 {
                                         serial_println!(":: kepler: beacon none-seen ::");
@@ -771,6 +781,7 @@ pub fn init(gpu: &GpuInfo) {
                                     let evo_core = fecs_read(bar0, disp_base + 0x490);
                                     let evo_userd_ptr = fecs_read(bar0, disp_base + 0x494);
                                     serial_println!(":: kepler: disp-userd-recon pdisplay_0={:08X} +40={:08X} evo_0x490={:08X} evo_0x494={:08X} ::", pdisplay_0, pdisplay_1, evo_core, evo_userd_ptr);
+                                    phase!("mirror_passes");
 
                                     // Milestone 2: PGRAPH Falcon Reconnaissance (Pull 18 + Pull 19)
                                     let pmc_en_pre = mmio_read(bar0, regs::NV_PMC_ENABLE);
@@ -1037,6 +1048,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                             if phase == phase_bound as u32 {
                                                 serial_println!(":: kepler: ctx-echo EXIT-BY-BOUND h2h3={} iters={} — command never observed ::",
                                                     h2h3_label, ucode::ECHO_BOUND);
+                                                serial_println!(":: kepler: H3/H4 arm=Instrument-did-not-run (ECHO_BOUND) ::");
                                             }
                                             if ack == 1 {
                                                 serial_println!(":: kepler: ucode-echo SUCCESS h2h3={} ::", h2h3_label);
@@ -1093,6 +1105,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     let pre_wit_mb1 = fecs_read(bar0, 0x409000 + 0x044);
                                     let pre_wit_cpu = fecs_read(bar0, 0x409000 + 0x100);
                                     serial_println!(":: kepler: hb pre-witness mb1={:08X} cpuctl={:08X} ::", pre_wit_mb1, pre_wit_cpu);
+                                    phase!("ucode_echo");
 
                                     // --- Restore USERD and the pushbuffer, before the channel goes live ---
                                     //
@@ -1139,6 +1152,12 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     let stat = mmio_read(bar0, 0x263c);
                                     let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
                                     serial_println!(":: kepler: sched-status post-init err={:08X} ({}) stat={:08X} ::", err, err_str, stat);
+
+                                    if err == 0 {
+                                        serial_println!(":: kepler: H3/H4 arm=Worked ::");
+                                    } else if err == 2 {
+                                        serial_println!(":: kepler: H3/H4 arm=Did-not-work ::");
+                                    }
 
                                     let ch_1_0_pre = mmio_read(bar0, 0x800000 + (1 * 8));
                                     let ch_1_4_pre = mmio_read(bar0, 0x800004 + (1 * 8));
@@ -1202,7 +1221,13 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     let ch_id = (inst_off as u32) >> 12;
                                     serial_println!(":: kepler: bind-pre CHAN_CUR={:08X} CHAN_NEXT={:08X} ENGINE_STATUS={:08X} ::",
                                         fecs_read(bar0, 0x409B00), fecs_read(bar0, 0x409B04), fecs_read(bar0, 0x409C00));
+                                    phase!("recon_and_witnesses");
                                     
+                                    // H4: DMACTL REQUIRE_CTX interacting with CHAN_CUR
+                                    let dmactl_bind_pre = fecs_read(bar0, 0x40910C);
+                                    fecs_write(bar0, 0x40910C, dmactl_bind_pre | 1);
+                                    serial_println!(":: kepler: H4 DMACTL REQUIRE_CTX set pre={:08X} post={:08X} ::", dmactl_bind_pre, fecs_read(bar0, 0x40910C));
+
                                     // Write CHAN_CUR and verify
                                     fecs_write(bar0, 0x409B00, ch_id);
                                     let c_cur = fecs_read(bar0, 0x409B00);
@@ -1232,6 +1257,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                             serial_println!(":: kepler: witness post-bind PFIFO_CHAN[1]={:08X} ::", witness_post);
                                         }
                                     }
+                                    phase!("ctx_bind");
                                     
                                     serial_println!(":: kepler: recon-post cpuctl={:08X} ::", fecs_read(bar0, 0x409000 + 0x100));
 
@@ -1550,6 +1576,7 @@ serial_println!(":: kepler: terminal-poke 0x409504 wr=0 (post: no further FECS r
                                             count, first, FECS_504_READ_TOUCHED.load(Ordering::SeqCst), r_idx_str,
                                             FECS_504_WRITE_TOUCHED.load(Ordering::SeqCst), w_idx_str);
                                     }
+    phase!("scanout_handover");
     serial_println!("[NVIDIA] Initialization complete (Phases 1-4)");
 }
 
