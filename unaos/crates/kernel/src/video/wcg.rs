@@ -1863,6 +1863,59 @@ static PAYGO_LASTROLL: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 static PAYGO_LASTCENSUS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 
+/// PAYGO-TERM — per-id: this TENANT's battery has spoken its closing line, so the wire is shut.
+///
+/// **What "terminal" has to mean.** A terminal that fires and then keeps talking is the shape this
+/// module keeps convicting, and the first cut of pay-at-close had it: [`paygo_flush`]'s census
+/// re-emission is gated on `PAYGO_SAID != 0 && TAKEN < SAMPLES && the census moved`, and a
+/// `state=closed … -> UNSPENT` moves none of those. So the wire read `closed emit=6` and then
+/// `waiting emit=7` behind it — and under this module's own reader rule (for any `win=`, the greatest
+/// `emit=` supersedes) the terminal was superseded by the line that came after it and effectively
+/// disappeared. This cell is the state that makes the rule true: set BEFORE the terminal is printed,
+/// so the terminal's `emit=` is the greatest this tenant will ever carry, and read by
+/// [`paygo_flush`] so nothing is printed after it.
+///
+/// **Per TENANT, not per slot, and it is the only paygo cell that is.** `TAKEN` and `PAYGO_SAID`
+/// survive a recycle by design (that is this module's standing behaviour and not this arc's to
+/// change), and `PAYGO_EMIT`/`PAYGO_DEFERRED` must survive it or `emit=` stops being monotone per id
+/// and the reader's supersession rule breaks across the recycle. But "has this battery said its last
+/// word" is a fact about the WINDOW, and a slot's second tenant is a different window: leaving this
+/// set would deny every later tenant of a recycling slot its own terminal — the silent close the
+/// terminal exists to remove, reintroduced for 6 of the 7 windows slot 3 hosts in the s73 capture.
+/// [`paygo_recycle`] clears it, from `wm::create_inner`, beside the wc-d latches that re-arm there
+/// for the same reason.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_CLOSED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// PAYGO-TERM — a new tenant landed on this slot: re-arm the terminal. See [`PAYGO_CLOSED`].
+///
+/// Only that cell. The battery (`TAKEN`, `PAYGO_SAID`) and the census (`PAYGO_EMIT`,
+/// `PAYGO_DEFERRED`) are deliberately left alone — the first because it is per-slot by design, the
+/// second because `emit=` has to stay monotone per id across a recycle.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+pub(super) fn paygo_recycle(i: usize) {
+    if i < IDS {
+        PAYGO_CLOSED[i].store(0, Ordering::Relaxed);
+    }
+}
+
+/// PAYGO-TERM — shut the wire without printing: this tenant's battery closed on the ORDINARY path
+/// (`state=complete … -> PAID`, emitted by [`paygo_complete`] from the pay-at-close composites), so
+/// the terminal has already been spoken and the census must not re-open behind it.
+///
+/// Today `paygo_flush`'s own `TAKEN >= SAMPLES` gate already silences a paid battery, so this is
+/// belt-and-braces — but the two facts are different ("the budget is spent" vs "the window said its
+/// last word"), and the one the terminal rests on is this one.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+pub(super) fn paygo_seal_closed(i: usize) {
+    if i < IDS {
+        PAYGO_CLOSED[i].store(1, Ordering::Release);
+        // The deferred waiting line this window had queued is superseded by its terminal. Left set,
+        // it would fire on the next tenant's first flush and read as that tenant's opening line.
+        PAYGO_PEND[i].store(0, Ordering::Relaxed);
+    }
+}
+
 /// PAYGO — may this window open a sample now, and on what terms?
 ///
 /// Sample 1 always opens, immediately, and opens LATTICE-SAMPLED. Samples 2..[`SAMPLES`] open at
@@ -2106,6 +2159,14 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str) {
 /// one core print when two flush the same window at once.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 fn paygo_flush(id: u32, i: usize) {
+    // THE TERMINAL IS THE LAST WORD, and this is the check that makes that true. Everything below —
+    // the RACE-PRESENT pend, the delta gate, the cadence gate — describes a battery that is still
+    // waiting for something, and a closed one is not. Without it a `state=closed … -> UNSPENT` is
+    // followed by `state=waiting … -> DEFERRED` at a higher `emit=`, and the module's own reader rule
+    // (greatest `emit=` supersedes) then reads the terminal as superseded. See [`PAYGO_CLOSED`].
+    if PAYGO_CLOSED[i].load(Ordering::Acquire) != 0 {
+        return;
+    }
     if PAYGO_PEND[i].swap(0, Ordering::AcqRel) != 0 {
         paygo_note(id, i, "waiting", "DEFERRED");
         return;
@@ -2161,9 +2222,23 @@ fn paygo_complete(id: u32, i: usize) {
 /// the budget was never spent and no verdict was owed — the designed steady state of a short-lived
 /// window — and it matches no directive in any spec, which is correct: there is nothing here to
 /// require and nothing to forbid.
+///
+/// **The latch is taken BEFORE the print, and that ordering is the whole of §3c's fix.** `emit=` is
+/// stamped inside [`paygo_note`], so shutting the wire first means every lane that reaches
+/// [`paygo_flush`]'s gate from this instant on declines to emit and the terminal carries the greatest
+/// `emit=` this tenant will ever produce — which is exactly what the reader's supersession rule needs
+/// to read `closed` as the final state. The `swap` also makes the line idempotent: a second closer of
+/// the same tenant (there is none today; the row is freed under the caller) prints nothing.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
-#[inline]
 pub(super) fn paygo_closed(id: u32, i: usize) {
+    if i >= IDS {
+        return;
+    }
+    // The queued RACE-PRESENT line is superseded too: it says "waiting", and this window is not.
+    PAYGO_PEND[i].store(0, Ordering::Relaxed);
+    if PAYGO_CLOSED[i].swap(1, Ordering::AcqRel) != 0 {
+        return;
+    }
     paygo_note(id, i, "closed", "UNSPENT");
 }
 
