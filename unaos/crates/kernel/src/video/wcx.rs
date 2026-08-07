@@ -66,13 +66,139 @@
 //! no framebuffer write of its own and reads the front buffer never — `wm` owns the panel writes
 //! and does them through its staged path. There is no direct-front-buffer fallback in this file.
 //!
-//! The one exception, and its exact scope: [`activate`] clears the whole panel to `wm::DESKTOP_BG`
-//! once, BEFORE the first window exists (see the DESKTOP-CLEAR comment there). At that instant the
-//! compositor owns no pixels and no pass can be in flight, so the fill has no second writer to tear
-//! against. From the moment the console window is created onward, this file writes the framebuffer
-//! zero times.
+//! The one exception, and its exact scope: [`activate_on`] clears the whole panel to
+//! `wm::DESKTOP_BG` once, BEFORE the first window exists (see the DESKTOP-CLEAR comment there). At
+//! that instant the compositor owns no pixels and no pass can be in flight, so the fill has no
+//! second writer to tear against. From the moment the console window is created onward, this file
+//! writes the framebuffer zero times.
+//!
+//! ### SECOND-IGNITION (M-a) — one body, the surface named rather than assumed
+//!
+//! [`activate`] used to BE the activation. It is now a shim over [`activate_on`], which takes a
+//! [`SurfaceDesc`] naming the scanout it is being asked to own. Nothing about the activation itself
+//! moved: `activate_on` holds the former body verbatim, and `activate()` passes the descriptor for
+//! the surface `WRITER` already carries — which on the Kepler path is, by identity, the surface the
+//! takeover repointed the scan-out at (`kepler_display` locates the GOP framebuffer via
+//! `fbcon::current_base()` and draws at that same address; it never re-seeds `WRITER`).
+//!
+//! The parameterisation is what a SECOND ignition point needs, and it needs nothing else: `wm`
+//! re-reads `WRITER` live on every path it has and caches panel geometry nowhere, so "make `WRITER`
+//! tell the truth before the call" is the whole of the surface question. M-a does not add that
+//! second caller — there is still exactly one, in `kepler_display::takeover_display` — and it does
+//! not implement the adoption of a foreign surface either: a descriptor that does not match the live
+//! `WRITER` is DECLINED, fail-closed, because adopting one honestly also means re-pointing fbcon's
+//! own handle and WC-typing the new aperture, and neither of those is in this milestone.
 
 use super::wm;
+use unaos_boot_info::FrameBufferInfo;
+
+/// SECOND-IGNITION — who is asking the compositor to take a surface.
+///
+/// The vocabulary is fixed here rather than at the call site so the refusal line reads the same
+/// whichever origin wins the latch. M-a constructs only `KeplerTakeover`.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// The Kepler takeover seam — the one caller that exists today.
+    KeplerTakeover,
+    /// The iGPU scan-out, after a gmux switch. M-b's caller; named now so the latch's `owner=` /
+    /// `requested=` witness has both words from the first boot that can print them.
+    #[allow(dead_code)] // constructed by the M-b caller (drivers/gpu/igpu.rs), not by M-a.
+    IgpuScanout,
+}
+
+/// [`ACTIVATED`]'s alphabet. Kept as plain `u32` constants rather than a `repr` on [`Origin`] so the
+/// "nobody has activated yet" state is a value in the same space, not a second flag that can
+/// disagree with the first.
+const ORIGIN_NONE: u32 = 0;
+const ORIGIN_KEPLER: u32 = 1;
+const ORIGIN_IGPU: u32 = 2;
+
+impl Origin {
+    const fn code(self) -> u32 {
+        match self {
+            Origin::KeplerTakeover => ORIGIN_KEPLER,
+            Origin::IgpuScanout => ORIGIN_IGPU,
+        }
+    }
+    const fn name(self) -> &'static str {
+        origin_name(self.code())
+    }
+}
+
+const fn origin_name(code: u32) -> &'static str {
+    match code {
+        ORIGIN_KEPLER => "kepler",
+        ORIGIN_IGPU => "igpu",
+        _ => "none",
+    }
+}
+
+/// SECOND-IGNITION — the scan-out the compositor is being asked to own.
+///
+/// Every field is a fact about the SURFACE, never about the GPU that owns it: `wm` composites
+/// through the generic [`super::FrameBuffer`] and asks nothing else. `origin` is carried only so the
+/// witness lines can name who claimed the compositor.
+pub struct SurfaceDesc {
+    /// CPU-visible (identity-mapped) base of the scan-out.
+    pub base: usize,
+    /// Byte length of the scan-out aperture.
+    pub len: usize,
+    /// Width/height/stride(px)/bpp/format, as [`super::FrameBuffer`] addresses them.
+    pub info: FrameBufferInfo,
+    /// Who is asking.
+    pub origin: Origin,
+}
+
+impl SurfaceDesc {
+    /// The surface [`super::WRITER`] already describes.
+    ///
+    /// A SNAPSHOT: it reads the handle and re-initialises nothing, so `activate()` built on it is a
+    /// pure no-op wrapper around the body that has always run. This is the whole reason the Kepler
+    /// path is unchanged by M-a.
+    pub fn from_writer(origin: Origin) -> Self {
+        let fb = *super::WRITER.lock();
+        Self { base: fb.base(), len: fb.len(), info: fb.info(), origin }
+    }
+
+    /// Is this descriptor the surface `WRITER` is live on right now?
+    ///
+    /// Compared field by field rather than by base alone: a same-base surface with a different
+    /// stride or bpp is a different surface for every purpose `wm` has, and the stride unit is
+    /// exactly the class of mistake this comparison exists to catch.
+    fn is_live(&self) -> bool {
+        let fb = *super::WRITER.lock();
+        let i = fb.info();
+        fb.base() == self.base
+            && fb.len() == self.len
+            && i.width == self.info.width
+            && i.height == self.info.height
+            && i.stride == self.info.stride
+            && i.bytes_per_pixel == self.info.bytes_per_pixel
+    }
+}
+
+/// ACTIVATE-ONCE — the origin that owns the compositor, or [`ORIGIN_NONE`].
+///
+/// This REPLACES `DEMO_WIN` as the re-entry guard, and the replacement is the point. `DEMO_WIN` is
+/// stored LATE — after the desktop clear, the console window and the demo window — so every DECLINE
+/// path returned with it still clear. With one caller that was harmless; with two it is a hole a
+/// second entry walks straight through, running a second full-panel `fill_screen` over a live
+/// compositor (the exact "second writer" this module's front-buffer law forbids) and then finding
+/// `panel_console_window_open` hand back the EXISTING console window against the new geometry.
+///
+/// So the latch is claimed at the TOP and RELEASED on every decline: a genuinely-failed first
+/// attempt must not permanently kill the compositor for the other origin, while a SUCCESSFUL first
+/// attempt is final and the second caller is refused with one line.
+///
+/// ⚠ RESIDUAL, named rather than hidden: the last two decline paths (`geometry-unavailable`,
+/// `create-failed`) are reached AFTER the desktop clear and AFTER the console window exists, so the
+/// release hands the next origin an entry that would clear the panel underneath a live console
+/// window. That is the lesser of the two evils only because those two declines mean the window table
+/// itself refused, and a compositor that cannot open a window has nothing to protect. A second
+/// caller must not retry past a post-console decline; the `latch=released` on the line is what tells
+/// it which decline it was.
+static ACTIVATED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(ORIGIN_NONE);
 
 /// The demo surface's source dimensions, in pixels. Small on purpose: the compositor's own scale
 /// rule magnifies it to the panel (4x on a ≤1799-row panel), so a small source is what exercises the
@@ -91,8 +217,12 @@ const DEMO_H: usize = 64;
 struct DemoSurface([u32; DEMO_W * DEMO_H]);
 static mut DEMO_SURF: DemoSurface = DemoSurface([0; DEMO_W * DEMO_H]);
 
-/// The window id [`activate`] opened, or [`wm::WIN_NONE`] if it has not run or declined. Read only
-/// by the witness lines below.
+/// The window id [`activate_on`] opened, or [`wm::WIN_NONE`] if it has not run or declined.
+///
+/// NO LONGER THE GUARD — see [`ACTIVATED`], which is claimed at the top of `activate_on` where this
+/// one was stored at the bottom. This stays for the witness lines and for anything that wants to ask
+/// "did the demo window actually open", which is a different question from "has the compositor been
+/// claimed".
 static DEMO_WIN: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(wm::WIN_NONE);
 
@@ -145,14 +275,55 @@ fn paint_demo() {
     }
 }
 
-/// WC-X86 — activate the compositor on the x86 panel. Idempotent: a second call is a no-op.
+/// WC-X86 — activate the compositor on the x86 panel, on whatever surface [`super::WRITER`] already
+/// describes. Unchanged signature, unchanged meaning; idempotent, a second call is a no-op.
+///
+/// This is the Kepler-takeover call site's entry point and it is a SHIM: the descriptor it builds is
+/// a snapshot of the live `WRITER`, so the reconciliation step inside [`activate_on`] can only take
+/// its already-live branch and the body that runs is the body that has always run.
+pub fn activate() {
+    activate_on(SurfaceDesc::from_writer(Origin::KeplerTakeover));
+}
+
+/// WC-X86 — THE activation body, on a NAMED surface. One per boot, first origin wins.
 ///
 /// Fail-closed at every step. A panel that is not ready, a console that will not yield its band, a
 /// window table that will not take a row — each returns after saying which one it was, and each
 /// leaves the panel exactly as the takeover left it. There is no path here that half-activates.
-pub fn activate() {
+///
+/// ### FALSIFIABLE PREDICTION (M-a, written before the boot that tests it)
+///
+/// M-a is a refactor with a witness, and its claim is that it changes NOTHING on a Kepler boot. On
+/// `UNAOS_WC=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1`, the `[wc-x]` block of the serial log is
+/// line-for-line identical to the pre-change boot **except for exactly one added line**,
+/// `[wc-x] surface adopt SKIP (already live)`, printed directly before `[wc-x] desktop-clear`.
+/// No `REFUSE` line appears — there is still exactly one caller, so nothing can lose the latch — and
+/// no `DECLINE … latch=released` line appears either. `kepler=` in the GPACE line moves by < 5 ms;
+/// the prologue is two atomics and two `WRITER` reads and must not be measurable above that.
+///
+/// Any other diff falsifies M-a: a reordered line, a second `desktop-clear`, a changed
+/// `console-window` geometry, a `REFUSE` (something double-calls), or a `DECLINE
+/// reason=surface-adopt-not-implemented` (the snapshot and the live handle disagreed, which for a
+/// shim over the same lock would mean `WRITER` is being re-seeded under us between the two reads).
+pub fn activate_on(desc: SurfaceDesc) {
     use core::sync::atomic::Ordering;
-    if DEMO_WIN.load(Ordering::Relaxed) != wm::WIN_NONE {
+
+    // ACTIVATE-ONCE — claim the compositor BEFORE touching anything, release it on every decline.
+    // The claim has to be first: everything below this line is a step that a second entrant would
+    // repeat, and the first of them (the desktop clear) is a full-panel front-buffer write.
+    if let Err(owner) = ACTIVATED.compare_exchange(
+        ORIGIN_NONE,
+        desc.origin.code(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        serial_println!(
+            "[wc-x] activate REFUSE reason=already-active owner={} requested={} panel={}x{}",
+            origin_name(owner),
+            desc.origin.name(),
+            desc.info.width,
+            desc.info.height
+        );
         return;
     }
 
@@ -161,12 +332,46 @@ pub fn activate() {
     let (pw, ph) = {
         let fb = *super::WRITER.lock();
         if !fb.is_ready() {
-            serial_println!("[wc-x] activate DECLINE reason=fb-not-ready");
+            ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
+            serial_println!("[wc-x] activate DECLINE reason=fb-not-ready latch=released");
             return;
         }
         let i = fb.info();
         (i.width, i.height)
     };
+
+    // SURFACE RECONCILIATION — the ONE place a surface swap would happen, and in M-a it does not.
+    //
+    // `wm` reads `WRITER` live everywhere and caches panel geometry nowhere, so the entire surface
+    // question is "does `WRITER` already tell the truth about the scan-out we were handed". On the
+    // Kepler path it does, by identity: the takeover locates the GOP framebuffer, draws its
+    // calibration pattern at that same address and keeps the scan-out there, and `WRITER` was seeded
+    // from that same `BootInfo` triple — so the answer is yes on every boot, and this says so.
+    //
+    // The other branch is a REFUSAL, not a swap, and deliberately: adopting a foreign surface
+    // honestly means re-pointing fbcon's own handle too (`panel_console_window_open` reads
+    // `c.fb.info()`, a second and independent geometry source) and WC-typing the new aperture (the
+    // framebuffer WC latch is a consumed one-shot — a new aperture comes up UNCACHED, which is the
+    // GR15 defect by construction, 8.7–9.1x on the present path). Neither belongs to this milestone,
+    // and a swap that skipped them would be the kind of half-activation the rest of this function
+    // refuses to perform.
+    if desc.is_live() {
+        serial_println!("[wc-x] surface adopt SKIP (already live)");
+    } else {
+        ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
+        serial_println!(
+            "[wc-x] activate DECLINE reason=surface-adopt-not-implemented origin={} want=base={:#x} len={} {}x{} stride={} bpp={} latch=released",
+            desc.origin.name(),
+            desc.base,
+            desc.len,
+            desc.info.width,
+            desc.info.height,
+            desc.info.stride,
+            desc.info.bytes_per_pixel
+        );
+        return;
+    }
+
     // WC-X DESKTOP-CLEAR — paint the whole panel to the desktop colour ONCE, here.
     //
     // Observed on the metal (s40 rMBP photo): everything painted to the panel BEFORE activation
@@ -228,7 +433,8 @@ pub fn activate() {
     // Its own witness lines (`[wc-x] console-window …`) report the geometry and the panic fallback.
     let cwin = super::fbcon::panel_console_window_open();
     if cwin == wm::WIN_NONE {
-        serial_println!("[wc-x] activate DECLINE reason=console-window-declined");
+        ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
+        serial_println!("[wc-x] activate DECLINE reason=console-window-declined latch=released");
         return;
     }
     serial_println!("[wc-x] activate panel={}x{} console_win={}", pw, ph, cwin);
@@ -251,7 +457,8 @@ pub fn activate() {
     let (_scale, ow, oh) = match wm::spawn_geometry(DEMO_W, DEMO_H) {
         Some(g) => g,
         None => {
-            serial_println!("[wc-x] activate DECLINE reason=geometry-unavailable");
+            ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
+            serial_println!("[wc-x] activate DECLINE reason=geometry-unavailable latch=released");
             return;
         }
     };
@@ -278,7 +485,8 @@ pub fn activate() {
         oy + wm::TITLE_H + wm::BORDER,
     );
     if id == wm::WIN_NONE {
-        serial_println!("[wc-x] activate DECLINE reason=create-failed");
+        ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
+        serial_println!("[wc-x] activate DECLINE reason=create-failed latch=released");
         return;
     }
     serial_println!(

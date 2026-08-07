@@ -1659,8 +1659,23 @@ pub fn attach_shadow() {
 ///
 /// Returns the number of text rows painted by the replay. Gated to the Kepler-takeover call site,
 /// so no other boot path changes behaviour.
+///
+/// ### SECOND-IGNITION guard (M-a)
+///
+/// Steps 1 and 3 above write `c.full_fb()` — the PANEL handle — unconditionally. Once the console is
+/// a compositor window its glyphs belong in `c.win_fb`, and a second resume would clear the glass and
+/// re-home the grid underneath a live compositor. The `wcx` activation latch cannot reach that: it
+/// refuses the second ACTIVATION, and this function runs BEFORE the activation, from its own call
+/// site. So the skip lives here. On the Kepler path `CONSOLE_WIN` is still `wm::WIN_NONE` when this
+/// runs (resume, then activate — that is the seam's ordering law), so this guard cannot fire on any
+/// boot that exists today and the Kepler wire is unchanged.
 #[cfg(target_arch = "x86_64")]
 pub fn panel_console_resume() -> usize {
+    #[cfg(feature = "wc")]
+    if CONSOLE_WIN.load(Ordering::Relaxed) != wm::WIN_NONE {
+        serial_println!(":: fbcon: glyphs-active SKIP console-already-windowed ::");
+        return 0;
+    }
     let mut base = 0u64;
     let mut pitch = 0usize;
     let mut cell = (0usize, 0usize);
