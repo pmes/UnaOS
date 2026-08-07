@@ -822,6 +822,40 @@ WC_PAT_ENTRY = {
 WC_LEAF = 'fb'
 
 
+def _wc_typing(fields):
+    """Decode a leaf's PAT/PCD/PWT triple against the WC expectation.
+
+    Shared by --wxprobe's 'at=fb' row and --wxn's WXN-FBWC line: the two wires
+    read the same three bits off the same leaf at two different moments of the
+    boot, and a disagreement between them is itself a finding — which cannot be
+    seen at all if each section carries its own copy of this table.
+    Returns (ok, got_triple, pat_entry_name)."""
+    got = tuple(fields.get(k, '-') for k in WC_EXPECT)
+    return (got == tuple(WC_EXPECT.values()), got,
+            WC_PAT_ENTRY.get(got, 'not a PAT combination this reader knows'))
+
+
+def _leaf_entry_change(section, at, prev_e, cur_e, prev_n, cur_n):
+    """The consecutive-boot compare on a RAW leaf entry, shared by --wxprobe
+    and --wxn.
+
+    The raw 'e=' word is the subject, not the decoded flags: every flag either
+    section prints is derived from it, so an entry that changed while the
+    decoded columns did not is still a changed mapping.  A changed fb entry is
+    the GR15 regression signature and gets its own loud class in both sections;
+    `section` only names which wire saw it.
+    Returns a finding string, or None when the entry did not move."""
+    if prev_e == cur_e:
+        return None
+    is_fb = (at == WC_LEAF)
+    cls = (f"WARN {section}-FB-ENTRY-CHANGED" if is_fb
+           else f"WARN {section}-ENTRY-CHANGED")
+    tail = (" — this is the GR15 regression signature: the framebuffer "
+            "leaf was retyped between boots" if is_fb else "")
+    return (f"{cls}: leaf '{at}' entry {prev_e} -> {cur_e} across "
+            f"boots {prev_n} -> {cur_n}{tail}")
+
+
 def wxprobe_boot(boot):
     """Pull one boot's WXPROBE block apart, or None if the boot carries none."""
     cpu, elf, maps, n = None, None, OrderedDict(), 0
@@ -909,10 +943,9 @@ def wxprobe_fb_typing(wx):
     msgs, ok = [], True
     for e in entries:
         f = e['fields']
-        got = tuple(f.get(k, '-') for k in WC_EXPECT)
+        good, got, entry = _wc_typing(f)
         want = tuple(WC_EXPECT.values())
-        entry = WC_PAT_ENTRY.get(got, 'not a PAT combination this reader knows')
-        if got == want:
+        if good:
             msgs.append(f"ok   boot {wx['number']} fb: pat={got[0]} "
                         f"pcd={got[1]} pwt={got[2]} -> {entry}")
         else:
@@ -942,13 +975,10 @@ def wxprobe_diff(prev, cur):
                          f"{prev['number'] if p else cur['number']} only")
             continue
         pe, ce = p[-1]['fields'].get('e'), c[-1]['fields'].get('e')
-        if pe != ce:
-            cls = ('WARN WXPROBE-FB-ENTRY-CHANGED'
-                   if at == WC_LEAF else 'WARN WXPROBE-ENTRY-CHANGED')
-            tail = (" — this is the GR15 regression signature: the framebuffer "
-                    "leaf was retyped between boots" if at == WC_LEAF else "")
-            findings.append(f"{cls}: leaf '{at}' entry {pe} -> {ce} across "
-                            f"boots {prev['number']} -> {cur['number']}{tail}")
+        finding = _leaf_entry_change('WXPROBE', at, pe, ce,
+                                     prev['number'], cur['number'])
+        if finding:
+            findings.append(finding)
     # The cpu line is per-boot state the split is designed from; a change there
     # is reported, never alarmed — a different EFER/CR4 is a different build or
     # a different firmware handoff, both legitimate, both worth seeing.
@@ -1380,6 +1410,564 @@ def smc_mode(result):
         return EXIT_NO_DATA
     if not clean:
         print(f"WARNING: {result['path']}: --smc reported at least one finding "
+              f"(see WARN lines above).", file=sys.stderr)
+        return EXIT_FINDING
+    return EXIT_OK
+
+
+# --- WXN-x86 M1 sweep + WXAUDIT census (--wxn) -----------------------------
+#
+# THE DIVISION OF LABOUR, stated because it is the whole reason this section
+# exists.  `unaos/scripts/specs/x86-witness.spec` pins the PRESENCE and the
+# SHAPE of the four lines below, and deliberately pins no value on any of them:
+# `pdpt_seen` / `nx_set` / `residue_leaves` / `kern_WX` are functions of the
+# firmware's map, and a spec that fixed them would be firmware-specific for no
+# gain (its own comment says so).  A line-at-a-time regex file also structurally
+# cannot state an ORDERING claim or an AGGREGATE one.  Those are this section's:
+#
+#   * l1 + l2 + l3 == leaves — an identity over three separate call sites in the
+#     walk.  The kernel asserts it too (memory.rs, right under the census line);
+#     this is the belt to that brace, and it is the half that survives a build
+#     with the assert compiled out.
+#   * kern_WX vs residue_leaves — two INDEPENDENT counts of the same set, taken
+#     by two different walkers at two different moments.  The sweep publishes
+#     `residue_leaves`; the audit re-derives it as `kern_WX`.  They should agree
+#     up to the leaves the firmware left read-only, which is platform-dependent
+#     and therefore REPORTED as a delta, never asserted.
+#   * kern_WX across boots — the one that matters most.  `kern_WX` counts the
+#     kernel leaves that are both writable and executable, and every milestone
+#     in the WXN arc drives it down (66047 before the sweep existed -> 1535 at
+#     M1 -> ~253 at M2 -> 0 at M3).  A RISE between two consecutive boots is
+#     coverage lost, and it is lost QUIETLY: every line still prints, every spec
+#     rule still matches, and the verdict is still `SWEPT`.  Nothing else in the
+#     tree would say a word.
+#
+# ABSENCE, and why it is not zero.  This capture family spans three build eras
+# and the sections must not average across them: boots that predate `a0a2d163`
+# carry a WXAUDIT census and nothing else, boots that predate `32724cb4` carry
+# no leaf histogram and no `WXN-FBWC`, and boots that predate both carry none of
+# it.  A missing wire is rendered as such and never as 0 — a `nx_set` of zero is
+# a VACUOUS sweep, which is a fault, and a build that never had the sweep is
+# not.
+
+WXN_SWEEP_RE = re.compile(
+    r'^\s*::\s*WXN-x86:\s*(.*?)\s*->\s*(SWEPT|VACUOUS|REFUSED)\b\s*(.*?)'
+    r'\s*::\s*$')
+WXN_CENSUS_RE = re.compile(r'^\s*::\s*WXAUDIT\s+x86:\s*(.*?)\s*::\s*$')
+WXN_NXE_RE = re.compile(
+    r'^\s*::\s*WXAUDIT-NXE:\s*(.*?)\s*->\s*(\S+)\s*::\s*$')
+WXN_FBWC_RE = re.compile(r'^\s*::\s*WXN-FBWC:\s*(.*?)\s*->\s*(.*?)\s*::\s*$')
+# `residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1)` — its own reader, because the
+# breakdown's keys start with a DIGIT and the generic _kv() scanner (whose names
+# must start with a letter) would silently read '1g=0' as 'g=0'.  A parenthetical
+# is also why the bodies are stripped of parens before _kv() runs: 'pt=1)' would
+# otherwise arrive with the bracket attached.
+WXN_RESIDUE_RE = re.compile(r'residue_leaves=(\d+)\s*\(([^)]*)\)')
+WXN_BREAKDOWN_RE = re.compile(r'(\d*[a-z]+)=(\d+)')
+WXN_MIB_RE = re.compile(r'kern_WX=\d+\s*\((\d+)\s*MiB\)')
+WXN_PARENS_RE = re.compile(r'\([^)]*\)')
+# What a missing wire prints.  One string, so a reader who greps the output for
+# it finds every instance.
+WXN_ABSENT = 'wire absent (pre-32724cb4 build)'
+# CR0.WP on every core is M3's, not M1's: the rMBP firmware leaves WP=0 (QEMU
+# leaves it 1) and NX enforcement does not depend on it, so a wp_mask below the
+# target is the documented state of this milestone and is a NOTE, never a WARN.
+WXN_WP_TARGET = 0xFF
+
+
+def _wxn_hexmask(text):
+    """Parse '0xFF' / '0x0'.  None when it is not a hex literal — a mask this
+    reader did not actually read must not be compared against the M3 target."""
+    if text is None:
+        return None
+    try:
+        return int(text, 16)
+    except ValueError:
+        return None
+
+
+def wxn_boot(boot):
+    """Pull one boot's WXN/WXAUDIT block apart, or None if it carries none.
+
+    Every one of the four wires is optional and each records its own absence,
+    because the eras above mean 'not in this boot' is three different facts."""
+    sweep = census = nxe = fbwc = None
+    dups = Counter()
+    for line, probe_line in zip(boot['lines'], boot['probe']):
+        m = WXN_SWEEP_RE.match(probe_line)
+        if m:
+            body, verdict, tail = m.group(1), m.group(2), m.group(3)
+            fields = _kv(WXN_PARENS_RE.sub(' ', body))
+            res = WXN_RESIDUE_RE.search(body)
+            breakdown = OrderedDict(WXN_BREAKDOWN_RE.findall(res.group(2))) \
+                if res else OrderedDict()
+            dups['sweep'] += 1
+            sweep = {'fields': fields, 'verdict': verdict, 'tail': tail,
+                     'residue': _num(res.group(1)) if res else None,
+                     'breakdown': breakdown,
+                     'capped': bool(res) and 'CAPPED' in res.group(2),
+                     'line': line}
+            continue
+        m = WXN_CENSUS_RE.match(probe_line)
+        if m:
+            body = m.group(1)
+            fields = _kv(WXN_PARENS_RE.sub(' ', body))
+            mib = WXN_MIB_RE.search(body)
+            dups['census'] += 1
+            census = {'fields': fields,
+                      'mib': _num(mib.group(1)) if mib else None,
+                      # The histogram is `32724cb4`'s APPEND; its absence is an
+                      # era, not a zero.
+                      'hist': all(k in fields for k in ('l1', 'l2', 'l3')),
+                      'truncated': 'TRUNCATED' in body,
+                      'line': line}
+            continue
+        m = WXN_NXE_RE.match(probe_line)
+        if m:
+            dups['nxe'] += 1
+            nxe = {'fields': _kv(m.group(1)), 'verdict': m.group(2),
+                   'line': line}
+            continue
+        m = WXN_FBWC_RE.match(probe_line)
+        if m:
+            dups['fbwc'] += 1
+            fbwc = {'fields': _kv(m.group(1)), 'verdict': m.group(2),
+                    'line': line}
+    if not any((sweep, census, nxe, fbwc)):
+        return None
+    # The build era, read off the wires themselves rather than off a version
+    # string the capture does not carry.
+    if (census and census['hist']) or fbwc:
+        era = '32724cb4+ (verdict, histogram, FBWC)'
+    elif sweep or nxe:
+        era = 'a0a2d163 (sweep + NXE, no histogram/FBWC)'
+    else:
+        era = 'pre-a0a2d163 (WXAUDIT census only)'
+    return {'number': boot['number'], 'sweep': sweep, 'census': census,
+            'nxe': nxe, 'fbwc': fbwc, 'era': era, 'dups': dups,
+            'modern': (census and census['hist']) or bool(fbwc)}
+
+
+def wxn_selfchecks(w):
+    """The three cross-field checks.  Returns (clean, [message]).
+
+    Only the histogram identity is a WARN; the other two are reports whose
+    correct value is platform- or milestone-dependent, and a WARN on either
+    would be a rule that fires on a healthy bench."""
+    msgs, clean = [], True
+    census, sweep, nxe = w['census'], w['sweep'], w['nxe']
+
+    # 1. l1 + l2 + l3 == leaves.
+    if census and census['hist']:
+        f = census['fields']
+        l1, l2, l3 = (_num(f.get('l1')), _num(f.get('l2')), _num(f.get('l3')))
+        leaves = _num(f.get('leaves'))
+        if None in (l1, l2, l3, leaves):
+            clean = False
+            msgs.append(f"WARN WXN-HIST-UNREAD: boot {w['number']} census "
+                        f"carries a histogram this reader could not parse "
+                        f"(l1={f.get('l1')} l2={f.get('l2')} l3={f.get('l3')} "
+                        f"leaves={f.get('leaves')})")
+        elif l1 + l2 + l3 == leaves:
+            msgs.append(f"ok   histogram sums: {l1} + {l2} + {l3} = "
+                        f"{l1 + l2 + l3} == leaves={leaves}")
+        else:
+            clean = False
+            msgs.append(
+                f"WARN WXN-HIST-MISMATCH: boot {w['number']} l1+l2+l3 = "
+                f"{l1 + l2 + l3} but leaves={leaves} (off by "
+                f"{l1 + l2 + l3 - leaves}). Every `record` increments `leaves` "
+                f"and exactly one bucket, so this is an identity — a walk that "
+                f"breaks it is counting leaves it is not classifying")
+    elif census:
+        msgs.append(f"note histogram: {WXN_ABSENT} — l1/l2/l3 are "
+                    f"`32724cb4`'s append and this census predates it; the "
+                    f"sum check could not run, which is not the same as "
+                    f"passing")
+    else:
+        msgs.append(f"note histogram: no WXAUDIT census on this boot — "
+                    f"{WXN_ABSENT}")
+
+    # 2. kern_WX vs residue_leaves.
+    if census and sweep and sweep['residue'] is not None:
+        kern_wx = _num(census['fields'].get('kern_WX'))
+        residue = sweep['residue']
+        if kern_wx is None:
+            clean = False
+            msgs.append(f"WARN WXN-KERNWX-UNREAD: boot {w['number']} census "
+                        f"has no readable kern_WX")
+        else:
+            delta = residue - kern_wx
+            if delta >= 0:
+                msgs.append(
+                    f"ok   residue/kern_WX: sweep residue_leaves={residue}, "
+                    f"audit kern_WX={kern_wx}, delta={delta} — the audit's "
+                    f"count is the sweep's less the leaf/leaves the firmware "
+                    f"already left read-only (platform-dependent; reported, "
+                    f"not asserted)")
+            else:
+                # The one direction read-only firmware leaves cannot explain:
+                # the audit found MORE W^X kernel leaves than the sweep left
+                # behind, so one of the two walkers is wrong about the map.
+                clean = False
+                msgs.append(
+                    f"WARN WXN-KERNWX-EXCEEDS-RESIDUE: boot {w['number']} "
+                    f"kern_WX={kern_wx} > residue_leaves={residue} (by "
+                    f"{-delta}). Read-only firmware leaves can only make the "
+                    f"audit's count SMALLER; the two walkers disagree about "
+                    f"the map")
+    elif census and not sweep:
+        msgs.append(f"note residue/kern_WX: no WXN-x86 sweep line on this "
+                    f"boot — {WXN_ABSENT}; kern_WX="
+                    f"{census['fields'].get('kern_WX', '-')} stands alone "
+                    f"with nothing to cross-check it against")
+
+    # 3. wp_mask vs nxe_mask, against the M3 target.
+    if nxe:
+        f = nxe['fields']
+        wp_mask = _wxn_hexmask(f.get('wp_mask'))
+        nxe_mask = _wxn_hexmask(f.get('nxe_mask'))
+        cores, armed = _num(f.get('cores')), _num(f.get('nxe'))
+        if wp_mask == WXN_WP_TARGET:
+            msgs.append(f"ok   wp_mask={f.get('wp_mask')} nxe_mask="
+                        f"{f.get('nxe_mask')} — M3 target met (CR0.WP set on "
+                        f"every core)")
+        else:
+            msgs.append(
+                f"note wp_mask={f.get('wp_mask')} ({_num(f.get('wp'))} of "
+                f"{cores} core(s)) vs nxe_mask={f.get('nxe_mask')} ({armed} of "
+                f"{cores}) — M3 pending (the target is wp_mask="
+                f"0x{WXN_WP_TARGET:X}; M1 does not set WP and the rMBP "
+                f"firmware leaves it clear, so this is the documented state of "
+                f"this milestone, not a fault)")
+        if nxe_mask is not None and cores is not None and armed != cores:
+            clean = False
+            msgs.append(f"WARN WXN-NXE-SHORT: boot {w['number']} {armed} of "
+                        f"{cores} core(s) proved EFER.NXE — every AP runs on "
+                        f"the BSP's CR3, so a core without NXE ignores every "
+                        f"bit the sweep wrote")
+    else:
+        msgs.append(f"note per-core NXE: {WXN_ABSENT}")
+    return clean, msgs
+
+
+def print_wxn_boot(w):
+    print(f"Boot {w['number']}  WXN   (build era: {w['era']})")
+    for kind, label in (('sweep', 'sweep'), ('census', 'census'),
+                        ('nxe', 'nxe'), ('fbwc', 'fbwc')):
+        if w['dups'][kind] > 1:
+            print(f"  !! {label}: {w['dups'][kind]} lines in one boot — the "
+                  f"block prints one per boot, so the readings are not "
+                  f"interchangeable; the LAST is reported below")
+
+    if w['sweep']:
+        s, f = w['sweep'], w['sweep']['fields']
+        print(f"  sweep : -> {s['verdict']}"
+              f"{(' ' + s['tail']) if s['tail'] else ''}")
+        print(f"          ehdr={f.get('ehdr', '-')} img={f.get('img', '-')} "
+              f"gib_img={f.get('gib_img', '-')} "
+              f"gib_tramp={f.get('gib_tramp', '-')} "
+              f"spare_n={f.get('spare_n', '-')}")
+        print(f"          pdpt_seen={f.get('pdpt_seen', '-')} "
+              f"nx_set={f.get('nx_set', '-')} "
+              f"huge_leaf_nx={f.get('huge_leaf_nx', '-')} "
+              f"already_nx={f.get('already_nx', '-')}")
+        print("          skips  " + " ".join(
+            f"{k}={f.get('skip_' + k, '-')}" for k in
+            ('spare', 'user', 'pml4_user', 'selfmap', 'fb_lock', 'fb_base',
+             'fb_walk')))
+        if s['residue'] is not None:
+            bd = " ".join(f"{k}={v}" for k, v in s['breakdown'].items())
+            print(f"          residue_leaves={s['residue']} ({bd})"
+                  f"{'  CAPPED' if s['capped'] else ''}  "
+                  f"pge={f.get('pge', '-')} flush={f.get('flush', '-')} "
+                  f"wp={f.get('wp', '-')}")
+    else:
+        print(f"  sweep : {WXN_ABSENT}")
+
+    if w['census']:
+        c, f = w['census'], w['census']['fields']
+        print(f"  census: leaves={f.get('leaves', '-')} "
+              f"user={f.get('user', '-')} user_WX={f.get('user_WX', '-')} "
+              f"kern_WX={f.get('kern_WX', '-')} ({c['mib']} MiB) "
+              f"tables={f.get('tables', '-')} nxe={f.get('nxe', '-')} "
+              f"walk={f.get('walk', '-')}")
+        if c['hist']:
+            print(f"          histogram l1={f.get('l1')} (1G) "
+                  f"l2={f.get('l2')} (2M) l3={f.get('l3')} (4K)")
+        else:
+            print(f"          histogram {WXN_ABSENT}")
+    else:
+        print(f"  census: {WXN_ABSENT}")
+
+    if w['nxe']:
+        f = w['nxe']['fields']
+        print(f"  nxe   : cores={f.get('cores', '-')} nxe={f.get('nxe', '-')} "
+              f"nxe_mask={f.get('nxe_mask', '-')} wp={f.get('wp', '-')} "
+              f"wp_mask={f.get('wp_mask', '-')} -> {w['nxe']['verdict']}")
+    else:
+        print(f"  nxe   : {WXN_ABSENT}")
+
+    if w['fbwc']:
+        f = w['fbwc']['fields']
+        print(f"  fbwc  : fb={f.get('fb', '-')} lvl={f.get('lvl', '-')} "
+              f"e={f.get('e', '-')} pat={f.get('pat', '-')} "
+              f"pcd={f.get('pcd', '-')} pwt={f.get('pwt', '-')} "
+              f"w={f.get('w', '-')} fx={f.get('fx', '-')} "
+              f"-> {w['fbwc']['verdict']}")
+    elif w['sweep'] and w['sweep']['verdict'] == 'REFUSED':
+        print("  fbwc  : not emitted — the sweep REFUSED and returned before "
+              "the interlock, which is the correct behaviour for that arm")
+    else:
+        print(f"  fbwc  : {WXN_ABSENT}")
+    print("")
+
+
+def wxn_verdicts(w):
+    """The terminal words, which are the whole assertion in three of the four
+    wires.  Returns (clean, [message])."""
+    msgs, clean = [], True
+    s = w['sweep']
+    if s and s['verdict'] == 'VACUOUS':
+        clean = False
+        msgs.append(
+            f"WARN WXN-VACUOUS: boot {w['number']} sweep wrote NOTHING "
+            f"(nx_set={s['fields'].get('nx_set', '-')} "
+            f"pdpt_seen={s['fields'].get('pdpt_seen', '-')} "
+            f"skip_pml4_user={s['fields'].get('skip_pml4_user', '-')}). The "
+            f"milestone is a no-op that logs like a success; the failure is "
+            f"fail-SAFE, which is exactly why nothing else notices it")
+    elif s and s['verdict'] == 'REFUSED':
+        clean = False
+        msgs.append(f"WARN WXN-REFUSED: boot {w['number']} sweep refused "
+                    f"{s['tail']} — no entry was written and the kernel map is "
+                    f"unprotected on this boot")
+    if w['census'] and w['census']['truncated']:
+        clean = False
+        msgs.append(
+            f"WARN WXAUDIT-TRUNCATED: boot {w['number']} the audit walk ran "
+            f"out of budget, so every number on the census line is an "
+            f"UNDERESTIMATE — including user_WX=0, which is the audit's whole "
+            f"point")
+    if w['nxe'] and w['nxe']['verdict'] != 'PASS':
+        clean = False
+        msgs.append(f"WARN WXN-NXE-{w['nxe']['verdict']}: boot {w['number']} "
+                    f"per-core NXE rollup did not pass")
+    fb = w['fbwc']
+    if fb and fb['verdict'] == 'SKIPPED':
+        clean = False
+        msgs.append(
+            f"WARN WXN-FBWC-SKIPPED: boot {w['number']} the GR15 tripwire DID "
+            f"NOT RUN (skip_lock={fb['fields'].get('skip_lock', '-')} "
+            f"skip_base={fb['fields'].get('skip_base', '-')} "
+            f"skip_walk={fb['fields'].get('skip_walk', '-')}) — the sweep's "
+            f"effect on the panel mapping was never checked on this boot")
+    elif fb:
+        good, got, entry = _wc_typing(fb['fields'])
+        if good:
+            msgs.append(f"ok   boot {w['number']} fb: pat={got[0]} "
+                        f"pcd={got[1]} pwt={got[2]} -> {entry}")
+        else:
+            clean = False
+            want = tuple(WC_EXPECT.values())
+            msgs.append(
+                f"WARN WXN-FBWC-TYPING: boot {w['number']} fb is pat={got[0]} "
+                f"pcd={got[1]} pwt={got[2]} -> {entry}; WC needs pat={want[0]} "
+                f"pcd={want[1]} pwt={want[2]} (PA4). The panel is not "
+                f"write-combining after the sweep on this boot")
+    return clean, msgs
+
+
+def wxn_trend(blocks):
+    """The cross-boot table and its two verdicts.
+
+    Returns (rows, findings, notes).  `rows` is one tuple per boot; a field the
+    boot did not carry is None and prints as the absence string, never as 0."""
+    rows = []
+    for w in blocks:
+        c, s = w['census'], w['sweep']
+        rows.append((
+            w['number'],
+            _num(c['fields'].get('kern_WX')) if c else None,
+            s['residue'] if s else None,
+            _num(s['fields'].get('nx_set')) if s else None,
+            _num(c['fields'].get('walk')) if c else None,
+            w['era'],
+        ))
+    findings, notes = [], []
+    for prev, cur in zip(rows, rows[1:]):
+        pk, ck = prev[1], cur[1]
+        if pk is None or ck is None:
+            notes.append(f"boots {prev[0]} -> {cur[0]}: no kern_WX on "
+                         f"{'both' if pk is None and ck is None else (prev[0] if pk is None else cur[0])}"
+                         f" — no comparison possible, which is not a pass")
+            continue
+        if ck > pk:
+            findings.append(
+                f"WARN WXN-KERNWX-ROSE: kern_WX {pk} -> {ck} across boots "
+                f"{prev[0]} -> {cur[0]} (+{ck - pk}). W^X coverage of the "
+                f"kernel map SHRANK between these two boots and every line "
+                f"still printed clean")
+        elif ck < pk:
+            notes.append(f"MILESTONE: kern_WX {pk} -> {ck} across boots "
+                         f"{prev[0]} -> {cur[0]} (-{pk - ck}) — the sweep "
+                         f"covers more of the map than it did on the previous "
+                         f"boot")
+    return rows, findings, notes
+
+
+def print_wxn_trend(rows, findings, notes):
+    print("--- cross-boot TREND (kern_WX / residue_leaves / nx_set / walk) ---")
+    print(f"  {'boot':>5}  {'kern_WX':>9}  {'residue':>9}  {'nx_set':>7}  "
+          f"{'walk':>10}   era")
+    for num, kern_wx, residue, nx_set, walk, era in rows:
+        def cell(v, width, unit=''):
+            return (f"{v}{unit}".rjust(width) if v is not None
+                    else '-'.rjust(width))
+        print(f"  {str(num):>5}  {cell(kern_wx, 9)}  {cell(residue, 9)}  "
+              f"{cell(nx_set, 7)}  {cell(walk, 10, 'kcyc')}   {era}")
+    for note in notes:
+        print(f"  note {note}")
+    for finding in findings:
+        print(f"  !! {finding}")
+    if not findings and len(rows) > 1:
+        print(f"  ok   kern_WX never rose across {len(rows) - 1} consecutive "
+              f"pair(s)")
+    if len(rows) < 2:
+        print("  only one boot carries the WXN wires in this capture — NO "
+              "TREND POSSIBLE. The kern_WX-rise signature needs two boots to "
+              "be visible; this section has not cleared it, it has not tested "
+              "it.")
+    print("")
+
+
+def wxn_fbwc_comparable(prev, cur):
+    """Can this pair of boots actually be diffed?
+
+    Its own predicate because the report's SUMMARY must count comparisons that
+    happened, not pairs it walked past: 'N pair(s) compared: nothing changed'
+    over a run where the leaf was never read twice is the exact shape of an
+    instrument that reports its own silence as a pass."""
+    return all(w['fbwc'] and w['fbwc']['fields'].get('e') is not None
+               for w in (prev, cur))
+
+
+def wxn_fbwc_diff(prev, cur):
+    """DIFF the WXN-FBWC leaf across two consecutive boots.
+
+    Same subject and same shared helper as --wxprobe's leaf DIFF, one wire over:
+    WXPROBE reads the fb leaf as reconnaissance BEFORE the split stage, and
+    WXN-FBWC reads it across the sweep's own edit window.  Reported as its own
+    section rather than folded into --wxprobe because a leaf that moved between
+    the two READS inside one boot is a different fault from one that moved
+    between boots."""
+    findings, notes = [], []
+    if not prev['fbwc'] or not cur['fbwc']:
+        which = [w['number'] for w in (prev, cur) if not w['fbwc']]
+        notes.append(f"boots {prev['number']} -> {cur['number']}: no WXN-FBWC "
+                     f"line on boot(s) {', '.join(str(n) for n in which)} — "
+                     f"{WXN_ABSENT}; no comparison possible")
+        return findings, notes
+    pe = prev['fbwc']['fields'].get('e')
+    ce = cur['fbwc']['fields'].get('e')
+    # A SKIPPED line has no `e=` at all — the interlock never read the leaf.
+    # Diffing a real entry against a missing one would report the GR15
+    # signature on a boot where the leaf was never looked at, which is the
+    # loudest possible way to say nothing.
+    if pe is None or ce is None:
+        which = [w['number'] for w in (prev, cur)
+                 if w['fbwc']['fields'].get('e') is None]
+        notes.append(
+            f"boots {prev['number']} -> {cur['number']}: no leaf entry on "
+            f"boot(s) {', '.join(str(n) for n in which)} — the interlock did "
+            f"not read the leaf there (see the WXN-FBWC-SKIPPED warn), so "
+            f"there is nothing to diff; this pair is UNTESTED, not clean")
+        return findings, notes
+    finding = _leaf_entry_change('WXN-FBWC', WC_LEAF, pe, ce,
+                                 prev['number'], cur['number'])
+    if finding:
+        findings.append(finding)
+    for k in ('fb', 'lvl'):
+        pv, cv = (prev['fbwc']['fields'].get(k), cur['fbwc']['fields'].get(k))
+        if pv != cv:
+            notes.append(f"fbwc {k}: {pv} -> {cv} across boots "
+                         f"{prev['number']} -> {cur['number']}")
+    if prev['fbwc']['verdict'] != cur['fbwc']['verdict']:
+        notes.append(f"fbwc verdict: {prev['fbwc']['verdict']} -> "
+                     f"{cur['fbwc']['verdict']} across boots "
+                     f"{prev['number']} -> {cur['number']}")
+    return findings, notes
+
+
+def wxn_report(result):
+    """Return (parsed_anything, clean)."""
+    blocks = [w for w in (wxn_boot(b) for b in result['boots']) if w]
+    print(f"=== WXN — {result['path']} ===")
+    if not blocks:
+        print(f"  no WXN-x86 / WXAUDIT lines in {len(result['boots'])} boot(s)")
+        return False, True
+    silent = len(result['boots']) - len(blocks)
+    print(f"  {len(blocks)} of {len(result['boots'])} boot(s) carry a WXN "
+          f"block; {silent} carry none at all — {WXN_ABSENT}\n")
+
+    clean = True
+    for w in blocks:
+        print_wxn_boot(w)
+        vclean, vmsgs = wxn_verdicts(w)
+        sclean, smsgs = wxn_selfchecks(w)
+        if not (vclean and sclean):
+            clean = False
+        print("  self-checks:")
+        for msg in vmsgs + smsgs:
+            print(f"    {msg}")
+        print("")
+
+    rows, findings, notes = wxn_trend(blocks)
+    if findings:
+        clean = False
+    print_wxn_trend(rows, findings, notes)
+
+    print("--- WXN-FBWC consecutive-boot DIFF (raw leaf entry) ---")
+    if len(blocks) < 2:
+        print(f"  only {len(blocks)} boot carries a WXN block in this capture "
+              f"— NO DIFF POSSIBLE. The fb-entry regression signature needs two "
+              f"boots to be visible; this section has not cleared it, it has "
+              f"not tested it.")
+    else:
+        any_finding, compared = False, 0
+        for prev, cur in zip(blocks, blocks[1:]):
+            if wxn_fbwc_comparable(prev, cur):
+                compared += 1
+            fnd, nts = wxn_fbwc_diff(prev, cur)
+            for note in nts:
+                print(f"  note {note}")
+            for f in fnd:
+                any_finding = True
+                clean = False
+                print(f"  !! {f}")
+        if compared == 0:
+            print(f"  NO PAIR COMPARED. {len(blocks) - 1} consecutive pair(s) "
+                  f"were walked and not one of them had a readable leaf entry "
+                  f"on both sides; this section has not cleared the fb-entry "
+                  f"regression signature, it has not tested it.")
+        elif not any_finding:
+            print(f"  {compared} of {len(blocks) - 1} consecutive pair(s) "
+                  f"comparable: no WXN-FBWC leaf entry changed across them "
+                  f"(the rest are the notes above, and are untested rather "
+                  f"than clean)")
+    print("")
+    return True, clean
+
+
+def wxn_mode(result):
+    parsed, clean = wxn_report(result)
+    if not parsed:
+        print(f"ERROR: {result['path']}: --wxn parsed 0 WXN-x86/WXAUDIT lines. "
+              f"Either the capture predates the sweep or the wire moved.",
+              file=sys.stderr)
+        return EXIT_NO_DATA
+    if not clean:
+        print(f"WARNING: {result['path']}: --wxn reported at least one finding "
               f"(see WARN lines above).", file=sys.stderr)
         return EXIT_FINDING
     return EXIT_OK
@@ -3051,6 +3639,284 @@ SELFTEST_NO_GR18_WIRE = """\
 """
 
 
+# --- --wxn fixtures --------------------------------------------------------
+#
+# THE HAPPY PATH IS REAL, quoted byte-for-byte out of the bench capture
+# (~/unaos-bench/scratch/bootW.log, the 32724cb4 build).  The alarm boots that
+# follow are SYNTHESIZED, and every one of them is a reading metal has not
+# produced — which is exactly why they are here.  A section whose alarm paths
+# have never executed is a section whose alarm paths are a hypothesis.
+#
+# The epoch anchor (':: x86 fb-wc:') opens every fixture boot because the sweep
+# and the census both print BEFORE ':: X86_64 Memory Init ::' — that is where
+# they sit in the real capture, and a fixture that put them after the marker
+# would be testing a boot shape the bench does not produce.
+WXN_FIXTURE_BOOTW = """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B233000 img=[0x7B233000,0x7B8E6DEA) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXAUDIT-0: classifier fires on W+X, clears RO-X, honours parent NX, voids on NXE=0 -> PASS ::
+[      ?ms] :: WXAUDIT x86: leaves=66047 user=0 user_WX=0 kern_WX=1535 (2048 MiB) tables=1028 nxe=1 walk=1720kcyc l1=0 l2=65535 l3=512 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+[    176ms] :: WXAUDIT-SLOT: ring-3 window W^X verified (slot 0, leaves=4, wx=0, nxe=1) ::
+"""
+
+# Four alarm boots on top of the real one.  Each mutation is named where it
+# appears; none of them is a shape this reader invented, they are all generated
+# from the emitters' own format strings.
+#
+#   boot 2 — the U/S case, coherent end to end: firmware set U/S on its identity
+#     PML4 entries, so every descent took `skip_pml4_user`, `nx_set` is 0 and the
+#     sweep wrote nothing (-> VACUOUS).  Its `residue_leaves` is therefore the
+#     whole map, the audit independently re-derives it as `kern_WX=66047` (a RISE
+#     from boot 1's 1535 — coverage lost), and the fb interlock never ran because
+#     the pre-sweep walk failed (-> SKIPPED).  Four alarms from one real failure.
+#   boot 3 — the histogram identity broken (l3=511, one leaf counted and not
+#     classified) and the walk TRUNCATED, on an otherwise healthy SWEPT boot.
+#   boot 4 — the NXE refusal leg: no entry written, no FBWC line at all (the
+#     sweep returns before the interlock, which this reader must NOT read as the
+#     tripwire being skipped), and a per-core rollup that FAILs to match.
+#   boot 5 — a pre-a0a2d163 build: a WXAUDIT census and nothing else, which is
+#     the exact shape of boots 12-15 in ~/unaos-bench/capture/rmbp-gr16-s73.
+#     Every missing wire must print the absence string, never a zero.
+WXN_FIXTURE_ALARMS = WXN_FIXTURE_BOOTW + """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B233000 img=[0x7B233000,0x7B8E6DEA) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=0 nx_set=0 huge_leaf_nx=0 skip_spare=0 skip_user=0 skip_pml4_user=1024 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=1 residue_leaves=66047 (1g=0 2m=65535 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> VACUOUS ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 skip_lock=0 skip_base=0 skip_walk=1 -> SKIPPED ::
+[      ?ms] :: WXAUDIT-0: classifier fires on W+X, clears RO-X, honours parent NX, voids on NXE=0 -> PASS ::
+[      ?ms] :: WXAUDIT x86: leaves=66047 user=0 user_WX=0 kern_WX=66047 (131072 MiB) tables=1028 nxe=1 walk=1693kcyc l1=0 l2=65535 l3=512 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B233000 img=[0x7B233000,0x7B8E6DEA) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXAUDIT x86: leaves=66047 user=0 user_WX=0 kern_WX=1535 (2048 MiB) tables=1028 nxe=1 walk=1721kcyc l1=0 l2=65535 l3=511 TRUNCATED ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: nxe=0 -> REFUSED (bit 63 is RESERVED with EFER.NXE clear; no entry written) ::
+[      ?ms] :: WXAUDIT x86: leaves=66047 user=0 user_WX=0 kern_WX=66047 (131072 MiB) tables=1028 nxe=0 walk=1690kcyc l1=0 l2=65535 l3=512 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=0 nxe_mask=0x0 wp=0 wp_mask=0x0 -> FAIL ::
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXAUDIT-0: classifier fires on W+X, clears RO-X, honours parent NX, voids on NXE=0 -> PASS ::
+[      ?ms] :: WXAUDIT x86: leaves=66047 user=0 user_WX=0 kern_WX=66047 (131072 MiB) tables=1028 nxe=1 walk=1693kcyc ::
+[      ?ms] :: X86_64 Memory Init ::
+[    175ms] :: WXAUDIT-SLOT: ring-3 window W^X verified (slot 0, leaves=4, wx=0, nxe=1) ::
+"""
+
+
+def wxn_bootw_expect(result):
+    """Boot W, the real 32724cb4 lines, read end to end.
+
+    The M3 line is asserted as a NOTE and not as a failure on purpose: this
+    bench's firmware leaves CR0.WP clear and M1 does not set it, so a reader
+    that WARNed here would be red on every healthy boot until M3 lands."""
+    w = wxn_boot(result['boots'][0])
+    vclean, vmsgs = wxn_verdicts(w)
+    sclean, smsgs = wxn_selfchecks(w)
+    joined = "\n".join(vmsgs + smsgs)
+    return [
+        ('boots parsed', len(result['boots']), 1),
+        ('sweep verdict', w['sweep']['verdict'], 'SWEPT'),
+        ('sweep pdpt_seen/nx_set', (w['sweep']['fields']['pdpt_seen'],
+                                    w['sweep']['fields']['nx_set']),
+         ('1024', '1022')),
+        ('sweep img bounds survive the bracket',
+         w['sweep']['fields']['img'], '[0x7B233000,0x7B8E6DEA)'),
+        ('residue_leaves', w['sweep']['residue'], 1535),
+        ('residue breakdown reads the digit-leading keys',
+         list(w['sweep']['breakdown'].items()),
+         [('1g', '0'), ('2m', '1023'), ('4k', '512'), ('pt', '1')]),
+        ('residue not CAPPED', w['sweep']['capped'], False),
+        ('census kern_WX', w['census']['fields']['kern_WX'], '1535'),
+        ('census MiB', w['census']['mib'], 2048),
+        ('census walk kcyc', _num(w['census']['fields']['walk']), 1720),
+        ('census histogram present', w['census']['hist'], True),
+        ('census not truncated', w['census']['truncated'], False),
+        ('nxe verdict', w['nxe']['verdict'], 'PASS'),
+        ('nxe cores/armed', (w['nxe']['fields']['cores'],
+                             w['nxe']['fields']['nxe']), ('8', '8')),
+        ('fbwc verdict', w['fbwc']['verdict'], 'LEAF BIT-IDENTICAL'),
+        ('fbwc raw entry', w['fbwc']['fields']['e'], '0x00000000900010E3'),
+        ('build era read off the wires', w['era'],
+         '32724cb4+ (verdict, histogram, FBWC)'),
+        ('verdicts clean', vclean, True),
+        ('self-checks clean', sclean, True),
+        ('histogram identity asserted, not assumed',
+         'histogram sums: 0 + 65535 + 512 = 66047 == leaves=66047' in joined,
+         True),
+        ('residue/kern_WX delta reported',
+         'residue_leaves=1535, audit kern_WX=1535, delta=0' in joined, True),
+        ('fb typing decoded through the shared WC table',
+         'pat=1 pcd=0 pwt=0 -> PA4 (write-combining)' in joined, True),
+        ('M3 named while wp_mask is not the target',
+         'M3 pending (the target is wp_mask=0xFF' in joined, True),
+        ('one boot means the trend is REFUSED, not passed',
+         wxn_trend([w])[1:], ([], [])),
+    ]
+
+
+def wxn_alarms_expect(result):
+    """The four alarm boots.  Every WARN this section can raise is proven
+    fireable here, and the absence renderings are proven not to be zeros."""
+    blocks = [wxn_boot(b) for b in result['boots']]
+    b1, b2, b3, b4, b5 = blocks
+    v2, m2 = wxn_verdicts(b2)
+    s3, n3 = wxn_selfchecks(b3)
+    v3, w3 = wxn_verdicts(b3)
+    v4, m4 = wxn_verdicts(b4)
+    s5, n5 = wxn_selfchecks(b5)
+    rows, findings, notes = wxn_trend(blocks)
+    fb_findings, fb_notes = wxn_fbwc_diff(b1, b2)
+    joined2 = "\n".join(m2)
+    return [
+        ('boots parsed', len(result['boots']), 5),
+        # boot 2 — VACUOUS, FBWC SKIPPED
+        ('boot 2 verdict', b2['sweep']['verdict'], 'VACUOUS'),
+        ('boot 2 verdicts NOT clean', v2, False),
+        ('the VACUOUS warn names the U/S cause',
+         'WARN WXN-VACUOUS' in joined2 and 'skip_pml4_user=1024' in joined2,
+         True),
+        ('boot 2 fbwc verdict', b2['fbwc']['verdict'], 'SKIPPED'),
+        ('the SKIPPED warn says the tripwire did not run',
+         'WARN WXN-FBWC-SKIPPED' in joined2 and 'DID NOT RUN' in joined2, True),
+        # boot 3 — histogram mismatch + TRUNCATED
+        ('boot 3 self-checks NOT clean', s3, False),
+        ('the histogram warn states the identity and the miss',
+         any(m.startswith('WARN WXN-HIST-MISMATCH') and 'off by -1' in m
+             for m in n3), True),
+        ('boot 3 census truncated', b3['census']['truncated'], True),
+        ('the truncation warn calls the numbers underestimates',
+         any(m.startswith('WARN WXAUDIT-TRUNCATED') and 'UNDERESTIMATE' in m
+             for m in w3), True),
+        ('boot 3 verdicts NOT clean', v3, False),
+        # boot 4 — REFUSED, no FBWC, NXE FAIL
+        ('boot 4 verdict', b4['sweep']['verdict'], 'REFUSED'),
+        ('boot 4 keeps the refusal reason',
+         b4['sweep']['tail'],
+         '(bit 63 is RESERVED with EFER.NXE clear; no entry written)'),
+        ('a REFUSED sweep has no fbwc line', b4['fbwc'], None),
+        ('boot 4 nxe verdict', b4['nxe']['verdict'], 'FAIL'),
+        ('the refusal and the NXE failure both warn',
+         (any(m.startswith('WARN WXN-REFUSED') for m in m4),
+          any(m.startswith('WARN WXN-NXE-FAIL') for m in m4)), (True, True)),
+        # boot 5 — pre-a0a2d163: absence, never zero
+        ('boot 5 era', b5['era'], 'pre-a0a2d163 (WXAUDIT census only)'),
+        ('boot 5 has no sweep', b5['sweep'], None),
+        ('boot 5 has no nxe wire', b5['nxe'], None),
+        ('boot 5 has no fbwc wire', b5['fbwc'], None),
+        ('boot 5 histogram absent, not zero', b5['census']['hist'], False),
+        ('boot 5 says wire absent rather than reporting a value',
+         all(WXN_ABSENT in m for m in n5
+             if m.startswith('note histogram') or
+             m.startswith('note residue/kern_WX') or
+             m.startswith('note per-core NXE')), True),
+        ('boot 5 raises no WARN of its own — an old build is not a fault',
+         s5, True),
+        # the trend
+        ('trend rows', len(rows), 5),
+        ('trend kern_WX column', [r[1] for r in rows],
+         [1535, 66047, 1535, 66047, 66047]),
+        ('trend nx_set column keeps absence as None', [r[3] for r in rows],
+         [1022, 0, 1022, None, None]),
+        ('kern_WX rises caught', len(findings), 2),
+        ('the rise warn names coverage lost',
+         findings[0].startswith('WARN WXN-KERNWX-ROSE') and
+         'kern_WX 1535 -> 66047 across boots 1 -> 2' in findings[0], True),
+        ('the fall is a milestone note, not a warn',
+         any(n.startswith('MILESTONE: kern_WX 66047 -> 1535') for n in notes),
+         True),
+        # the FBWC diff
+        # The regression this fixture caught on its first run: a SKIPPED line
+        # carries no `e=`, and the diff reported 'leaf retyped ... -> None' —
+        # the GR15 signature, raised on a boot where the leaf was never read.
+        ('a SKIPPED leaf is UNTESTED, not a retyped leaf',
+         (fb_findings, len(fb_notes),
+          'UNTESTED, not clean' in fb_notes[0]), ([], 1, True)),
+        ('boot 1 -> boot 3 fbwc entries are identical',
+         wxn_fbwc_diff(b1, b3), ([], [])),
+        ('comparability is per pair, not per boot',
+         [wxn_fbwc_comparable(p, c) for p, c in zip(blocks, blocks[1:])],
+         [False, False, False, False]),
+    ]
+
+
+def selftest_wxn():
+    """Drive --wxn through parse_content and through its own report path."""
+    ok = True
+    for name, text, checker in (
+        ('WXN: Boot W, real 32724cb4 lines', WXN_FIXTURE_BOOTW,
+         wxn_bootw_expect),
+        ('WXN: four alarm boots — VACUOUS, histogram mismatch + TRUNCATED, '
+         'REFUSED + NXE FAIL, pre-a0a2d163 absence',
+         WXN_FIXTURE_ALARMS, wxn_alarms_expect),
+    ):
+        print(f"=== selftest: {name} ===")
+        result = parse_content(f'<{name}>', text)
+        case_ok = True
+        if not result['boots']:
+            print("    BAD fixture parsed 0 boots")
+            case_ok = False
+        else:
+            for label, actual, want in checker(result):
+                good = actual == want
+                if not good:
+                    case_ok = False
+                print(f"    {'ok ' if good else 'BAD'} {label}: "
+                      f"got {actual!r}, want {want!r}")
+        if not case_ok:
+            ok = False
+        print(f"=== selftest: {name}: {'PASS' if case_ok else 'FAIL'}\n")
+
+    print("=== selftest: WXN: report path and exit codes ===")
+    wired = []
+    for label, fixture, want in (
+        ('--wxn on Boot W exits OK', WXN_FIXTURE_BOOTW, EXIT_OK),
+        ('--wxn on the alarm capture exits FINDING', WXN_FIXTURE_ALARMS,
+         EXIT_FINDING),
+        ('--wxn on a capture with no WXN/WXAUDIT lines exits NO_DATA',
+         SELFTEST_NO_GR18_WIRE, EXIT_NO_DATA),
+    ):
+        result = parse_content(f'<{label}>', fixture)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = wxn_mode(result)
+        out = buf.getvalue()
+        wired.append((label, (got, bool(out.strip())), (want, True)))
+    # The absence rendering is a claim about what reaches the PAGE, so it is
+    # asserted against the report's own output rather than against a helper.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        wxn_mode(parse_content('<alarms>', WXN_FIXTURE_ALARMS))
+    page = buf.getvalue()
+    wired.append(("the page says 'wire absent' for the pre-a0a2d163 boot",
+                  WXN_ABSENT in page, True))
+    wired.append(("the page never prints a fabricated nx_set=0 for an absent "
+                  "sweep", page.count('sweep : ' + WXN_ABSENT), 1))
+    wired.append(("the trend table reaches the page",
+                  'cross-boot TREND' in page and 'WXN-KERNWX-ROSE' in page,
+                  True))
+    # No pair in the alarm capture has a readable leaf on both sides, so the
+    # DIFF must say it tested nothing rather than count the pairs it walked.
+    wired.append(("a run with no comparable pair refuses instead of "
+                  "reporting 'nothing changed'",
+                  ('NO PAIR COMPARED' in page,
+                   'pair(s) comparable' in page), (True, False)))
+    wired_ok = True
+    for label, actual, want in wired:
+        good = actual == want
+        if not good:
+            wired_ok = False
+            ok = False
+        print(f"    {'ok ' if good else 'BAD'} {label}: got {actual!r}, "
+              f"want {want!r}")
+    print(f"=== selftest: WXN: report path: "
+          f"{'PASS' if wired_ok else 'FAIL'}\n")
+    return ok
+
+
 def selftest_timing(top):
     """Fixtures for both timing modes.
 
@@ -3330,13 +4196,15 @@ def selftest(top):
     while the merged file was broken would be a tool nobody has actually tested.
     """
     results = []
-    print("########## self-test 1/3: logts stripping law ##########\n")
+    print("########## self-test 1/4: logts stripping law ##########\n")
     results.append(('logts stripping law', selftest_logts()))
-    print("########## self-test 2/3: timing modes (--gaps, --wcg, paygo) ##########\n")
+    print("########## self-test 2/4: timing modes (--gaps, --wcg, paygo) ##########\n")
     results.append(('timing modes (--gaps / --wcg / paygo)', selftest_timing(top)))
-    print("########## self-test 3/3: census + GR18 sections ##########\n")
+    print("########## self-test 3/4: census + GR18 sections ##########\n")
     results.append(('census + GR18 sections (--wxprobe / --slowxfer / --smc)',
                     selftest_gr18()))
+    print("########## self-test 4/4: WXN-x86 sweep + WXAUDIT census (--wxn) ##########\n")
+    results.append(('WXN sweep + audit (--wxn)', selftest_wxn()))
     print("########## self-test summary ##########")
     for label, good in results:
         print(f"  {'PASS' if good else 'FAIL'}  {label}")
@@ -3367,6 +4235,13 @@ def main():
                         help="read the 8-line WXPROBE block: per-boot table, "
                              "consecutive-boot DIFF on the raw leaf entry, and "
                              "the fb write-combining cross-check")
+    parser.add_argument("--wxn", action="store_true",
+                        help="read the WXN-x86 M1 sweep, the WXAUDIT census "
+                             "and its leaf histogram, WXAUDIT-NXE and "
+                             "WXN-FBWC: per-boot block with cross-field "
+                             "self-checks, the cross-boot kern_WX trend (a "
+                             "RISE is coverage silently lost), and the "
+                             "WXN-FBWC leaf DIFF")
     parser.add_argument("--slowxfer", action="store_true",
                         help="read EPACE-TRIM M8 SLOW-XFER: per-boot table with "
                              "the control request decoded, the controller-[1] "
@@ -3418,8 +4293,8 @@ def main():
     # uses, so they share parse_log and are selected here rather than each
     # re-walking the file.
     sections = [(flag, fn) for flag, fn in
-                (('--wxprobe', wxprobe_mode), ('--slowxfer', slowxfer_mode),
-                 ('--smc', smc_mode))
+                (('--wxprobe', wxprobe_mode), ('--wxn', wxn_mode),
+                 ('--slowxfer', slowxfer_mode), ('--smc', smc_mode))
                 if getattr(args, flag.lstrip('-').replace('-', '_'))]
     if sections:
         worst = EXIT_OK
