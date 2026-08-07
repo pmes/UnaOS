@@ -1487,21 +1487,101 @@ WXN_PARENS_RE = re.compile(r'\([^)]*\)')
 # What a missing wire prints.  One string, so a reader who greps the output for
 # it finds every instance.
 WXN_ABSENT = 'wire absent (pre-32724cb4 build)'
-# CR0.WP on every core is M3's, not M1's: the rMBP firmware leaves WP=0 (QEMU
-# leaves it 1) and NX enforcement does not depend on it, so a wp_mask below the
-# target is the documented state of this milestone and is a NOTE, never a WARN.
-WXN_WP_TARGET = 0xFF
+# CR0.WP is M3a's, and NEITHER HALF OF THE OLD RULE WAS A CONSTANT.
+#
+# THE TARGET.  `wp_mask` is a per-core bitmask over the cores THIS boot brought
+# online, so the full mask is `(1 << cores) - 1` read off the boot's own
+# `cores=` field.  The literal 0xFF that used to live here was an 8-core rMBP
+# assumption: it reads every healthy 6-core QEMU boot (`wp_mask=0x3F`, every core
+# armed) as short, i.e. it could not tell a satisfied milestone from a failed one
+# on the very captures the milestone is developed against.
+#
+# THE EXCUSE.  Before M3a nothing in this kernel set WP — the rMBP firmware
+# leaves it clear on all eight cores, QEMU sets it on the BSP only — so a short
+# mask was the documented state of the milestone and a NOTE.  From M3a
+# (`syscall::init` arms CR0.WP on every core) a short mask is a FINDING: WP is
+# what makes PTE.W bind ring 0 at all, so a core without it is a core on which
+# every read-only page M3b/M3c create is advisory.  Which of the two eras a
+# capture belongs to is DECIDED FROM THE CAPTURE — `wxn_m3a_era` below — and
+# never from a constant, because the sentence that excuses a short mask must be
+# unprintable on a boot that carries the arm.
+WXN_M3A_PRE = 'pre-M3a'
+WXN_M3A_POST = 'M3a+'
+WXN_M3A_UNKNOWN = 'undecidable'
 
 
 def _wxn_hexmask(text):
     """Parse '0xFF' / '0x0'.  None when it is not a hex literal — a mask this
-    reader did not actually read must not be compared against the M3 target."""
+    reader did not actually read must not be compared against the M3a target."""
     if text is None:
         return None
     try:
         return int(text, 16)
     except ValueError:
         return None
+
+
+def _wxn_wp_target(cores):
+    """The full per-core WP mask for a boot with `cores` cores online: the low
+    `cores` bits.  None when the boot did not say how many cores it had, or said
+    something this reader cannot use as a shift count — a target the TOOL
+    invented is a target that cannot convict anyone."""
+    if cores is None or cores <= 0 or cores > 64:
+        return None
+    return (1 << cores) - 1
+
+
+def wxn_m3a_era(w):
+    """Does the kernel that printed THIS boot carry WXN-x86 M3a (CR0.WP armed
+    per core)?  Returns (era, evidence).
+
+    Decided from the capture.  M3a adds no new serial line — it changes the
+    VALUE of `wp=`/`wp_mask=` and widens the rollup's PASS condition — so the
+    evidence is the coherence between the verdict and the masks on the wire:
+
+      * M3a+    — a non-PASS verdict on a boot whose `nxe_mask` is COMPLETE.
+        Only M3a's widened condition (`nxe == cores && wp == cores`, smp.rs
+        `wxn_nxe_report`) can fail a boot that proved NXE on every core; the
+        pre-M3a rollup fails on NXE alone.
+      * pre-M3a — a PASS verdict with a COMPLETE `nxe_mask` and a SHORT
+        `wp_mask`.  A kernel whose PASS required `wp == cores` could not have
+        emitted that line.
+      * pre-M3a (fallback) — no such verdict/mask combination, but the BSP's own
+        CR0.WP reads 0 on the `WXN-x86:` sweep line.  `wxn_pdpt_sweep` runs ten
+        lines AFTER `syscall::init` on the BSP (arch/x86_64/mod.rs), which is
+        where M3a arms WP.  Weaker than the two above, and deliberately LAST:
+        a post-M3a kernel whose arm FAILED on core 0 reads exactly the same way,
+        so this must never outrank the verdict evidence.
+
+    Anything else is undecidable and says so — an era this reader could not read
+    is not an era it may assume."""
+    nxe, sweep = w['nxe'], w['sweep']
+    if nxe:
+        f = nxe['fields']
+        cores, armed = _num(f.get('cores')), _num(f.get('nxe'))
+        complete = cores is not None and armed is not None and armed == cores
+        wp_mask = _wxn_hexmask(f.get('wp_mask'))
+        target = _wxn_wp_target(cores)
+        if complete and nxe['verdict'] != 'PASS':
+            return (WXN_M3A_POST,
+                    f"the rollup printed -> {nxe['verdict']} on a boot whose "
+                    f"nxe_mask={f.get('nxe_mask')} is COMPLETE ({armed} of "
+                    f"{cores}), and only M3a's widened PASS condition "
+                    f"(nxe == cores AND wp == cores) can fail such a boot")
+        if (complete and nxe['verdict'] == 'PASS' and target is not None
+                and wp_mask is not None and wp_mask != target):
+            return (WXN_M3A_PRE,
+                    f"the rollup printed -> PASS with wp_mask="
+                    f"{f.get('wp_mask')} short of 0x{target:X}, and a kernel "
+                    f"whose PASS required wp == cores could not have emitted "
+                    f"that line")
+    if sweep and _num(sweep['fields'].get('wp')) == 0:
+        return (WXN_M3A_PRE,
+                "the BSP's own CR0.WP reads 0 on the WXN-x86 sweep line, and "
+                "wxn_pdpt_sweep runs after syscall::init — where M3a arms it")
+    return (WXN_M3A_UNKNOWN,
+            "no verdict/mask combination on this boot separates the two eras, "
+            "and the sweep line does not show a clear BSP CR0.WP")
 
 
 def wxn_boot(boot):
@@ -1813,24 +1893,57 @@ def wxn_selfchecks(w):
                     f"{census['fields'].get('kern_WX', '-')} stands alone "
                     f"with nothing to cross-check it against")
 
-    # 3. wp_mask vs nxe_mask, against the M3 target.
+    # 3. wp_mask vs nxe_mask, against the M3a target THIS BOOT IMPLIES, and read
+    #    against the era THIS BOOT PROVES.  Four outcomes, and only one of them
+    #    is the old note: satisfied, a pre-M3a milestone note, a post-M3a
+    #    FINDING, and an era this reader could not decide (which is neither
+    #    excused nor convicted — it is stated as unjudged).
     if nxe:
         f = nxe['fields']
         wp_mask = _wxn_hexmask(f.get('wp_mask'))
         nxe_mask = _wxn_hexmask(f.get('nxe_mask'))
         cores, armed = _num(f.get('cores')), _num(f.get('nxe'))
-        if wp_mask == WXN_WP_TARGET:
-            msgs.append(f"ok   wp_mask={f.get('wp_mask')} nxe_mask="
-                        f"{f.get('nxe_mask')} — M3 target met (CR0.WP set on "
-                        f"every core)")
+        target = _wxn_wp_target(cores)
+        era, why = wxn_m3a_era(w)
+        if wp_mask is None or target is None:
+            msgs.append(
+                f"note wp_mask={f.get('wp_mask')} cores={f.get('cores')} — the "
+                f"target is (1 << cores) - 1 and this boot gave this reader "
+                f"neither a readable mask nor a usable core count, so the WP "
+                f"half was NOT checked here, which is not the same as passing")
+        elif wp_mask == target:
+            msgs.append(
+                f"ok   wp_mask={f.get('wp_mask')} == 0x{target:X} = "
+                f"(1 << {cores}) - 1 — M3a target met (CR0.WP armed on every "
+                f"one of THIS boot's {cores} core(s)); nxe_mask="
+                f"{f.get('nxe_mask')}")
+        elif era == WXN_M3A_POST:
+            clean = False
+            msgs.append(
+                f"WARN WXN-WP-SHORT: boot {w['number']} wp_mask="
+                f"{f.get('wp_mask')} ({f.get('wp', '-')} of {cores} core(s)) is "
+                f"short of the 0x{target:X} this boot's own cores= implies, and "
+                f"this boot CARRIES M3a — {why}. CR0.WP is what makes PTE.W "
+                f"bind ring 0, so on the core(s) missing it every read-only "
+                f"kernel page is advisory and M3b/M3c are vacuous there. This "
+                f"is a FAULT, not the milestone note that preceded it")
+        elif era == WXN_M3A_PRE:
+            msgs.append(
+                f"note wp_mask={f.get('wp_mask')} ({f.get('wp', '-')} of "
+                f"{cores} core(s)) vs nxe_mask={f.get('nxe_mask')} ({armed} of "
+                f"{cores}) — the target is 0x{target:X} = (1 << {cores}) - 1, "
+                f"and this boot PREDATES M3a ({why}), so CR0.WP was nobody's "
+                f"job on it: the documented state of that milestone, not a "
+                f"fault. The SAME reading on a boot that carries M3a is a "
+                f"FINDING, not this note")
         else:
             msgs.append(
-                f"note wp_mask={f.get('wp_mask')} ({_num(f.get('wp'))} of "
-                f"{cores} core(s)) vs nxe_mask={f.get('nxe_mask')} ({armed} of "
-                f"{cores}) — M3 pending (the target is wp_mask="
-                f"0x{WXN_WP_TARGET:X}; M1 does not set WP and the rMBP "
-                f"firmware leaves it clear, so this is the documented state of "
-                f"this milestone, not a fault)")
+                f"note wp_mask={f.get('wp_mask')} ({f.get('wp', '-')} of "
+                f"{cores} core(s)) is short of 0x{target:X}, and this reader "
+                f"could NOT decide from the capture whether the boot carries "
+                f"M3a ({why}) — so the shortfall is UNJUDGED here rather than "
+                f"excused; whatever else this boot reports above is what "
+                f"stands")
         if nxe_mask is not None and cores is not None and armed != cores:
             clean = False
             msgs.append(f"WARN WXN-NXE-SHORT: boot {w['number']} {armed} of "
@@ -4113,6 +4226,116 @@ WXN_FIXTURE_M2_ALARMS = WXN_FIXTURE_BOOTY + """\
 """
 
 
+# --- the M3a era fixture ---------------------------------------------------
+#
+# THE CONDITION THIS EXISTS FOR (M3 review, C3).  `WXN_WP_TARGET = 0xFF` made
+# the reader unable to say anything true about CR0.WP on a machine that is not
+# an 8-core rMBP, and its note ("M1 does not set WP ... the documented state of
+# this milestone, not a fault") is a sentence that becomes FALSE the moment M3a
+# lands — printed, in the old reader, on the very capture that proves it landed.
+#
+# Boots 1 and 2 are REAL, quoted byte-for-byte out of the controlled six-core
+# QEMU pair the M3 review built at `c6442b49`
+# (~/unaos-bench/scratch/gr19/m3-review/serial-pre.log and serial-post.log,
+# clean tree vs. both patches applied).  Boot 3 is the falsifier: boot 2's own
+# line with the WP arm failing on one core, which is the reading that MUST be a
+# FINDING and that no capture has yet produced.
+#
+#   boot 1 — pre-M3a, six cores, `wp=1 wp_mask=0x1` (QEMU's firmware arms the
+#     BSP only) with `-> PASS`.  A benign NOTE: the old reader called this
+#     "M3 pending, the target is wp_mask=0xFF", which was wrong about the target
+#     (0x3F here) and right about the era by accident.
+#   boot 2 — post-M3a, `wp=6 wp_mask=0x3F -> PASS`.  SATISFIED, and this is the
+#     boot the old constant read as a shortfall on a machine where every core
+#     it has is armed.
+#   boot 3 — post-M3a with a genuinely short mask: `nxe_mask=0x3F` COMPLETE and
+#     `wp=5 wp_mask=0x1F -> FAIL`.  Only M3a's widened PASS condition can fail a
+#     boot whose NXE is complete, so the era is decided BY THE CAPTURE and the
+#     shortfall is a FINDING — under its own name, not the NXE name the review
+#     objected to.
+WXN_FIXTURE_M3A_CLEAN = """\
+[      ?ms] :: x86 fb-wc: retyped 2 leaf(s) WC (PAT PA4) over 0x80000000..0x803e8000 ::
+[      ?ms] :: WXN-x86: ehdr=0x3D61E000 img=[0x3D61E000,0x3DCC4E58) gib_img=0 gib_tramp=0 spare_n=1 pdpt_seen=1024 nx_set=1023 huge_leaf_nx=0 skip_spare=1 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=4089 (1g=0 2m=505 4k=3584 pt=7) pge=0 flush=cr3-reload wp=1 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x80000000 lvl=2 e=0x00000000800010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXAUDIT x86: leaves=528887 user=0 user_WX=0 kern_WX=278 (1 MiB) tables=1036 nxe=1 walk=9782kcyc l1=0 l2=524279 l3=4608 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=6 nxe=6 nxe_mask=0x3F wp=1 wp_mask=0x1 -> PASS ::
+[      ?ms] :: x86 fb-wc: retyped 2 leaf(s) WC (PAT PA4) over 0x80000000..0x803e8000 ::
+[      ?ms] :: WXN-x86: ehdr=0x3D620000 img=[0x3D620000,0x3DCC4E58) gib_img=0 gib_tramp=0 spare_n=1 pdpt_seen=1024 nx_set=1023 huge_leaf_nx=0 skip_spare=1 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=4089 (1g=0 2m=505 4k=3584 pt=7) pge=0 flush=cr3-reload wp=1 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x80000000 lvl=2 e=0x00000000800010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXAUDIT x86: leaves=528887 user=0 user_WX=0 kern_WX=278 (1 MiB) tables=1036 nxe=1 walk=10842kcyc l1=0 l2=524279 l3=4608 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=6 nxe=6 nxe_mask=0x3F wp=6 wp_mask=0x3F -> PASS ::
+"""
+
+# The falsifier, on top of the two real boots: post-M3a, one core short.
+WXN_FIXTURE_M3A = WXN_FIXTURE_M3A_CLEAN + """\
+[      ?ms] :: x86 fb-wc: retyped 2 leaf(s) WC (PAT PA4) over 0x80000000..0x803e8000 ::
+[      ?ms] :: WXN-x86: ehdr=0x3D620000 img=[0x3D620000,0x3DCC4E58) gib_img=0 gib_tramp=0 spare_n=1 pdpt_seen=1024 nx_set=1023 huge_leaf_nx=0 skip_spare=1 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=4089 (1g=0 2m=505 4k=3584 pt=7) pge=0 flush=cr3-reload wp=1 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x80000000 lvl=2 e=0x00000000800010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXAUDIT x86: leaves=528887 user=0 user_WX=0 kern_WX=278 (1 MiB) tables=1036 nxe=1 walk=10842kcyc l1=0 l2=524279 l3=4608 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=6 nxe=6 nxe_mask=0x3F wp=5 wp_mask=0x1F -> FAIL ::
+"""
+
+
+def wxn_m3a_expect(result):
+    """The three eras of CR0.WP, read off the wire and not off a constant."""
+    blocks = [wxn_boot(b) for b in result['boots']]
+    b1, b2, b3 = blocks
+    s1, n1 = wxn_selfchecks(b1)
+    s2, n2 = wxn_selfchecks(b2)
+    s3, n3 = wxn_selfchecks(b3)
+    v3, m3 = wxn_verdicts(b3)
+    j1, j2, j3 = ("\n".join(x) for x in (n1, n2, n3))
+    return [
+        ('boots parsed', len(result['boots']), 3),
+        # THE TARGET IS DERIVED, NOT DECLARED.
+        ('a six-core boot targets 0x3F, not 0xFF',
+         (_wxn_wp_target(6), _wxn_wp_target(8), _wxn_wp_target(1)),
+         (0x3F, 0xFF, 0x1)),
+        ('a boot that did not say how many cores it had gets no target',
+         (_wxn_wp_target(None), _wxn_wp_target(0), _wxn_wp_target(99)),
+         (None, None, None)),
+        # boot 1 — pre-M3a, short mask, benign.
+        ('boot 1 era decided from the capture', wxn_m3a_era(b1)[0],
+         WXN_M3A_PRE),
+        ('boot 1 era cites the verdict/mask coherence, not a version',
+         'printed -> PASS with wp_mask=0x1 short of 0x3F' in
+         wxn_m3a_era(b1)[1], True),
+        ('boot 1 self-checks clean — an old build is not a fault', s1, True),
+        ('boot 1 names the DERIVED target', 'the target is 0x3F = (1 << 6) - 1'
+         in j1, True),
+        ('boot 1 excuses the era it PROVED, not one it assumed',
+         'PREDATES M3a' in j1 and 'not a fault' in j1, True),
+        ('the excuse now carries its own expiry',
+         'The SAME reading on a boot that carries M3a is a FINDING' in j1,
+         True),
+        # boot 2 — post-M3a, satisfied.  The regression the old constant caused.
+        ('boot 2 wp_mask=0x3F reads as SATISFIED, not as a shortfall',
+         'ok   wp_mask=0x3F == 0x3F = (1 << 6) - 1' in j2, True),
+        ('boot 2 raises nothing', s2, True),
+        ('the milestone-pending note is UNPRINTABLE on a satisfied boot',
+         ('M3 pending' in j2, 'PREDATES M3a' in j2), (False, False)),
+        # boot 3 — post-M3a, short mask: the falsifier.
+        ('boot 3 era decided from the capture', wxn_m3a_era(b3)[0],
+         WXN_M3A_POST),
+        ('boot 3 era cites the widened PASS condition',
+         'only M3a\'s widened PASS condition' in wxn_m3a_era(b3)[1], True),
+        ('boot 3 is a FINDING, not a note', s3, False),
+        ('the finding has its OWN name, not the NXE name',
+         (any(m.startswith('WARN WXN-WP-SHORT') for m in n3),
+          any(m.startswith('WARN WXN-NXE-SHORT') for m in n3)), (True, False)),
+        ('the finding names the mask, the target and the cores',
+         'wp_mask=0x1F (5 of 6 core(s)) is short of the 0x3F' in j3, True),
+        ('the finding refuses the milestone excuse',
+         ('CARRIES M3a' in j3, 'not a fault' in j3), (True, False)),
+        ('the rollup verdict still convicts on its own',
+         any(m.startswith('WARN WXN-NXE-FAIL') for m in m3), True),
+        ('boot 3 verdicts NOT clean', v3, False),
+    ]
+
+
 def wxn_booty_expect(result):
     """Boot Y read end to end — the M2 wire, and the delta it owns."""
     w = wxn_boot(result['boots'][0])
@@ -4211,9 +4434,14 @@ def wxn_m2_alarms_expect(result):
 def wxn_bootw_expect(result):
     """Boot W, the real 32724cb4 lines, read end to end.
 
-    The M3 line is asserted as a NOTE and not as a failure on purpose: this
-    bench's firmware leaves CR0.WP clear and M1 does not set it, so a reader
-    that WARNed here would be red on every healthy boot until M3 lands."""
+    The CR0.WP line is asserted as a NOTE and not as a failure on purpose, and
+    the boot must EARN that: this eight-core bench's firmware leaves WP clear on
+    every core and the image predates M3a, which the capture itself proves
+    (`-> PASS` with `wp_mask=0x0` short of the 0xFF its own `cores=8` implies —
+    a kernel whose PASS required `wp == cores` could not have printed it).  A
+    reader that WARNed here would be red on every healthy boot of that era; a
+    reader that printed this note on a POST-M3a boot would be excusing a
+    fault, which is what `wxn_m3a_expect` holds it to."""
     w = wxn_boot(result['boots'][0])
     vclean, vmsgs = wxn_verdicts(w)
     sclean, smsgs = wxn_selfchecks(w)
@@ -4252,8 +4480,12 @@ def wxn_bootw_expect(result):
          'residue_leaves=1535, audit kern_WX=1535, delta=0' in joined, True),
         ('fb typing decoded through the shared WC table',
          'pat=1 pcd=0 pwt=0 -> PA4 (write-combining)' in joined, True),
-        ('M3 named while wp_mask is not the target',
-         'M3 pending (the target is wp_mask=0xFF' in joined, True),
+        ('the 8-core target is DERIVED from this boot, not declared',
+         'the target is 0xFF = (1 << 8) - 1' in joined, True),
+        ('the excuse is conditioned on the era this boot PROVES',
+         ('PREDATES M3a' in joined,
+          'printed -> PASS with wp_mask=0x0 short of 0xFF' in joined),
+         (True, True)),
         ('one boot means the trend is REFUSED, not passed',
          wxn_trend([w])[1:], ([], [])),
     ]
@@ -4359,6 +4591,9 @@ def selftest_wxn():
         ('WXN: five M2 alarm boots — REFUSED, arithmetic unreconciled, a '
          'subtree retirement, keep_x exceeded, VACUOUS',
          WXN_FIXTURE_M2_ALARMS, wxn_m2_alarms_expect),
+        ('WXN: the three CR0.WP eras — a real pre-M3a six-core boot, the real '
+         'post-M3a one, and a post-M3a boot one core short',
+         WXN_FIXTURE_M3A, wxn_m3a_expect),
     ):
         print(f"=== selftest: {name} ===")
         result = parse_content(f'<{name}>', text)
@@ -4389,6 +4624,14 @@ def selftest_wxn():
          WXN_FIXTURE_BOOTY, EXIT_OK),
         ('--wxn on the M2 alarm capture exits FINDING', WXN_FIXTURE_M2_ALARMS,
          EXIT_FINDING),
+        # THE FALSE-ALARM LEG, and the reason C3 was raised: a real six-core
+        # QEMU pair — one boot before M3a and one after, both healthy — must
+        # exit OK.  Under `WXN_WP_TARGET = 0xFF` the second of them read as a
+        # shortfall on a machine where every core it has is armed.
+        ('--wxn on the real pre-M3a + post-M3a six-core pair exits OK',
+         WXN_FIXTURE_M3A_CLEAN, EXIT_OK),
+        ('--wxn on a post-M3a boot one core short exits FINDING',
+         WXN_FIXTURE_M3A, EXIT_FINDING),
     ):
         result = parse_content(f'<{label}>', fixture)
         buf = io.StringIO()

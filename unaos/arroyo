@@ -495,6 +495,67 @@ fi
 
 # --- Build Functions ---
 
+# WXN-x86 SECTION GATE (x86_64 ONLY): no GLOBAL CODE symbol may live in `.rodata`.
+#
+# WHAT IT CATCHES. `global_asm!` blocks are concatenated per CODEGEN UNIT, not per file, so a block
+# that opens `.section .rodata` and never restores it leaves the section changed for whatever the
+# partitioner happens to append next — which may be another file's code entirely. That is exactly
+# how `switch_context` (sched.rs) came to be ASSEMBLED INTO `.rodata` behind smp.rs's AP trampoline:
+# `nm` typed it `R`, not `T`, and the kernel executed it out of a segment whose LOAD is `R` with no
+# `E`. Nothing in the tree said a word — it compiled, it linked, it booted, and every existing
+# witness stayed green.
+#
+# WHY A GATE AND NOT A BELT. A `.text` directive at the top of the victim block shields that one
+# block. This shields the CLASS: any file, any feature set, any future `global_asm!`. It also has to
+# exist before M3b can clear `X` from `.rodata` — the milestone is unsafe while code can land there.
+#
+# THE RULE. In the linked x86 kernel ELF, a GLOBAL symbol in `.rodata*` whose type is FUNC or NOTYPE
+# (i.e. code, or an assembler label that is not typed data) is a FAULT, unless it is one of the AP
+# trampoline's own labels — `ap_trampoline_*` / `ap_param_*` — which live in `.rodata` DELIBERATELY
+# (they are the 0xd8 blob `start_aps` copies to 0x8000 and the parameter cells beside it, and the
+# sweep's `gib_tramp=` accounting depends on where they are). GLOBAL `OBJECT` symbols are read-only
+# DATA and are none of this gate's business: `core`'s WHITESPACE_MAP is one and always has been.
+#
+# SCOPE: x86_64 only, by construction — this function is called from the x86 build path and from
+# `esp-x86`, never from the aarch64 or Pi ones. The aarch64 leaks the M3 review found
+# (`main.rs:33` `.text.boot`, `exceptions.rs:116` `.text.exception_vectors`) are the same class but
+# NOT the same rule: they leak into TEXT sections a linker script orders, so the assertion that
+# would catch them is about which symbol comes FIRST in `.text.boot`, not about `.rodata`. Out of
+# this lane; see docs and the pi track's brief.
+gate_x86_rodata_no_code() {
+    local elf="$1"
+    [ -f "$elf" ] || { echo -e "${COLOR_RED}ERROR: .rodata gate: ${elf} missing — the x86 kernel link produced no ELF${COLOR_RESET}"; exit 1; }
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local NM="$TOOLBIN/llvm-nm"
+    [ -x "$NM" ] || NM="$(command -v llvm-nm 2>/dev/null || true)"
+    # No silent downgrade: a gate that cannot read the ELF must fail the build, not wave it through.
+    [ -n "$NM" ] && [ -x "$NM" ] || { echo -e "${COLOR_RED}ERROR: .rodata gate: no llvm-nm (looked in ${TOOLBIN} and on PATH) — the gate could not run${COLOR_RESET}"; exit 1; }
+    # `nm --format=sysv` is the one format that prints the SECTION NAME beside the class, so the rule
+    # can be about `.rodata` itself rather than about nm's `R` letter (which covers every read-only
+    # section). Uppercase class = GLOBAL. Fields: Name|Value|Class|Type|Size|Line|Section.
+    local offenders
+    offenders="$("$NM" --defined-only --format=sysv "$elf" 2>/dev/null | awk -F'|' '
+        {
+            name = $1; class = $3; type = $4; sect = $7
+            gsub(/[ \t]/, "", class); gsub(/[ \t]/, "", type)
+            gsub(/^[ \t]+|[ \t]+$/, "", name); gsub(/^[ \t]+|[ \t]+$/, "", sect)
+            if (class != "R") next                       # GLOBAL read-only data symbols only
+            if (sect !~ /^\.rodata(\.|$)/) next
+            if (type != "FUNC" && type != "NOTYPE") next  # OBJECT = genuine read-only data
+            if (name ~ /^ap_trampoline_/ || name ~ /^ap_param_/) next
+            print name "  (" type ", " sect ")"
+        }' | sort -u)"
+    if [ -n "$offenders" ]; then
+        echo -e "${COLOR_RED}ERROR: .rodata gate: GLOBAL code symbol(s) assembled into .rodata in ${elf}:${COLOR_RESET}"
+        echo "$offenders" | sed 's/^/       /'
+        echo -e "${COLOR_RED}       A global_asm! block changed the section and did not change it back, so the${COLOR_RESET}"
+        echo -e "${COLOR_RED}       codegen unit appended the symbol(s) above into .rodata. Wrap the offending block${COLOR_RESET}"
+        echo -e "${COLOR_RED}       in .pushsection/.popsection (see arch/x86_64/smp.rs, the AP trampoline).${COLOR_RESET}"
+        exit 1
+    fi
+    echo -e "${COLOR_GREEN}✅ .rodata gate: no GLOBAL code symbol in .rodata (only the AP trampoline's own labels)${COLOR_RESET}"
+}
+
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -502,6 +563,7 @@ build_kernel_x86_64() {
       --target ../../x86_64-unaos.json \
       $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
+    gate_x86_rodata_no_code "${WORKSPACE_DIR}/target/x86_64-unaos/release/unaos-kernel"
     echo -e "${COLOR_GREEN}✅ x86_64 Kernel Built.${COLOR_RESET}"
 }
 
@@ -1221,6 +1283,10 @@ esp_x86() {
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
+    # The media path does NOT go through build_kernel_x86_64 (the builder compiles the kernel
+    # itself), so the .rodata gate runs here too — on the STAGED image, which is the ELF the
+    # firmware actually loads. A gate that only covers the QEMU path is not a gate on the boot media.
+    gate_x86_rodata_no_code "${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf"
     pack_source_along "${WORKSPACE_DIR}/target/x86_64_esp"
     echo -e "${COLOR_GREEN}✅ x86 ESP: ${WORKSPACE_DIR}/target/x86_64_esp/ (incl. HELLO.BIN for the U2 loader)${COLOR_RESET}"
     local _kelf="${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf"
