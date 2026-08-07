@@ -2327,3 +2327,142 @@ igpu Flight 1a rode merged but **not armed** (`gmux_igd` off) — this was regre
 not a display flight, and `igpu-blt: ring=absent` is unchanged.
 
 Read this capture with `awk '/pattern/'` — **not** `grep`.
+
+## §10m — GR20 Boot AC: the card in the internal slot identified, read, and cross-checked against the host — first flight (2026-08-07)
+
+Boot AC settled the question §8.10 of [`sdhc.md`](../07_USB_STORAGE/sdhc.md) had left open
+since that milestone was written: **there is now a capture in which SD identification
+succeeded.** Tip `f94e280c`, `gui=2498ms`, `hz=2693862631`, slice
+`~/unaos-bench/scratch/gr20/bootAC-slice.log` (capture `rmbp-gr16-s73`). The passengers vs
+Boot AB are the pre-v2.00 identification fork (`f94e280c`) riding on SDHC-4a's four-gate write
+ladder (`b2f4a090`). Nothing else in the kernel moved.
+
+**The whole pace rise is work the previous boot never did.** `gui` went 2218 → 2498 (+280 ms),
+and the witness attributes every millisecond of it to one lane:
+
+```
+Boot AB: GPACE: … detect=5 igpu=1 kepler=396 sdhc=12  nic=0 resid=2
+Boot AC: GPACE: … detect=5 igpu=1 kepler=396 sdhc=293 nic=0 resid=2
+```
+
+`sdhc` 12 → 293 (+281) with every other lane identical and `ehci-hid-done d=1286` unchanged.
+Boot AB spent 12 ms because it *stopped* — `cmd8 send-if-cond FAILED int=0x00018000
+(cmd-timeout) — card is pre-v2.00 or absent` — and returned from `identify()`. Boot AC spent
+293 ms because it went on to identify the card, read it, and verify it. The split inside the
+lane names the cost precisely, and it is not driver overhead: **235 ms of the 293 is ACMD41
+power-up polling** (`cmd8` at 2202 ms, `acmd41 … after 400 polls` at 2437 ms) on an
+eighteen-year-old card. Identification through `CARD IDENTIFIED` costs 3 ms; the entire
+read/verify/A-B battery costs 43 ms (2440 → 2483 ms). If this lane is ever trimmed, the poll
+cadence is the target and the card is the reason.
+
+**The fix worked on the first flight, and the classifier stated its own grounds:**
+
+```
+[sdhc] cmd8 send-if-cond BARE-TIMEOUT int=0x00018000 (cmd-timeout) — error half is bit 16
+       alone, no crc/index/end-bit alongside it … Continuing on the v1.x branch with acmd41 HCS=0
+[sdhc] acmd41 arg=0x00ff8000 hcs=0 ocr=0x80ff8000 powered-up=1 ccs=0 (byte-addressed) after 400 polls
+```
+
+`int=0x00018000` is the *same register word* Boot AB refused on. The hardware did not change;
+the predicate did. No `CONTRADICTION` line and no CCS↔CSD `MISMATCH` line followed, so both
+cross-checks that could have stopped the ladder were live and silent.
+
+**The cross-check that makes this more than a self-report.** The same card was read on the
+**host** through sysfs before the flight, by a stack sharing no code with ours. The kernel
+negotiated its own CID, CSD and RCA from the card, and the two descriptions agree item for
+item:
+
+| fact | host (sysfs) | kernel (Boot AC) |
+| :-- | :-- | :-- |
+| manufacturer id | `0x000001` | `mid=0x01` |
+| product name | `S032B` | `pnm=S032B` |
+| serial | `0x02465bbc` | `psn=0x02465bbc` |
+| manufacture date | `04/2008` | `mdt=2008-04` |
+| RCA | `0x5bbc` | `rca=0x5bbc` (CMD3 `resp0=0x5bbc0520`) |
+| CSD structure | `csd 005d0132…` ⇒ `CSD_STRUCTURE=0b00` | `csd v1` |
+| spec version | `scr 00a5000033f00008` ⇒ `SD_SPEC=0` | pre-v2.00 (CMD8 unanswered) |
+| capacity | `29.7 MB` | `c_size=1899 c_size_mult=3 read_bl_len=9 → blocks=60800`, 29 MiB |
+
+**The RCA row is the load-bearing one**: it is not a property stamped on the card, it is a
+number the host *assigned* during its own initialisation and the kernel *re-negotiated*
+during ours. The raw registers reconcile too — the controller drops the CRC byte from the
+136-bit responses, so the kernel's `cmd9 csd raw=[0xff164000,0xdaf6d9cf,0x32135981,0x00005d01]`
+is exactly the host's `005d0132135981daf6d9cfff16400000` shifted right by eight bits. Two
+independent stacks describing the same card identically is the strongest evidence this driver
+has ever carried for a decode; the CSD v1.0 arithmetic in particular had been an argument on
+paper until this boot.
+
+```
+:: sdhc: card v1.x SDSC byte-addressed blocks=60800 size=29 MiB rca=0x5bbc ::
+[sdhc] bdf 3:0.1 CARD IDENTIFIED — 60800 blocks, byte-addressed, csd v1
+```
+
+**Then the card was read, and the reads were checked four ways.** `read lba0 ok`;
+`verify repeat lba0 fnv match=1` (no FIFO residue, no desynchronised drain);
+`verify lba1 … differs-from-lba0=1` (the address argument reaches the card);
+`verify mbr p0 type=0x06 start=63 count=60732 end=60795 fits-capacity=1` with
+`partition extents vs CSD capacity 60800 blocks -> all-fit=1` — an independently-authored
+description of this card, written by whoever partitioned it in 2008, agreeing with our CSD
+parse *and* our addressing mode. And ADMA2 was compared against the PIO control byte-for-byte
+at three points across the medium:
+
+```
+[sdhc-ab] window lba=0     blocks=8 match=1 first-diff=none
+[sdhc-ab] window lba=30400 blocks=8 match=1 first-diff=none
+[sdhc-ab] window lba=60792 blocks=8 match=1 first-diff=none
+[sdhc-ab] verdict windows=3 match=3/3 — adma2 agrees with the pio control byte-for-byte
+```
+
+The last window ends at LBA 60799, the final block of the card, so byte addressing was proved
+at the top of the range and not only near zero.
+
+**The write self-test ran unarmed, by decision — and the unarmed line is the useful part:**
+
+```
+:: sdhc: w1 armed=0 lba=60799 wp_sw=1 csd_perm=0 csd_tmp=0 class=MBR blank=1
+   verify=DRYRUN restore=SKIPPED reason=would-write -> DRYRUN ::
+```
+
+This is §8.5's design paying off: the disarmed line reports the LBA it *would* have written
+together with every gate's measured value, so "would arming this build write, and where" is
+answered by a boot that wrote nothing. Read as a pre-flight for arming — gate 2 `wp_sw=1`
+(Present State bit 19, inverted: the slider says write-**enabled**); gate 3 `csd_perm=0
+csd_tmp=0` (the card declares itself writable); gate 4 `blank=1` (the scratch sector was read
+and is empty); and the `inside-partition-N` rung passed, because partition 0 ends at 60795
+while the scratch LBA is 60799 — four blocks of slack past the table. **`reason=would-write`
+is therefore the only thing between this build and a live CMD24: gate 1, the `sdw` compile-time
+feature.** An armed boot on this card would run the ladder to completion. That is now a
+decision that can be taken on measured evidence, which §8.10 explicitly said an unarmed
+reconnaissance boot could not supply — because until this boot, identification never reached
+far enough to print the line at all.
+
+**Gates and the regression floor.** mbench **28/28 required, 0 forbidden**;
+`serial-analyzer --wxn` **exit 0**. Nothing in the W^X or scheduler floor moved except by the
+one mechanism the analyzer was taught to distinguish:
+
+- `WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=8 wp_mask=0xFF -> PASS`.
+- `WXAUDIT-CORES: n=8 cr0=[0x80010013,0x80010011 ×7] wp=0xFF nxe=0xFF` — §10l's `CR0.MP`
+  divergence, unchanged and still BSP-only.
+- `WXPROBE cpu: cr0=0x0000000080010013 wp=1 … smep=1 nxe=1`; `WXN-x86 … wp=1 -> SWEPT`.
+- `kern_WX=311 == keep_x=311 == xpages+1 (310+1)` — the identity intact, so the rise from
+  Boot AB's 306 is **code growth with total coverage** (the write ladder and the v1.x fork are
+  new text), not lost coverage. This is the first boot to exercise `601477d3`'s discriminator
+  in the *growth* direction; §10l exercised the shrink direction.
+- `CFU2-WGATE … -> PASS`, all five arms.
+- `SCHED-X86 PLACE-CHECK: actual=c1 arg=c1 published=c1 pool=5 collide=0 tier=exclusive
+  verdict=PASS`.
+- `video: edid present=0 hdr=- sum=- native=- len=0` — §10l's finding stands as the recorded
+  metal truth of this machine; rung 3 of the iGPU ladder remains the only available source of
+  panel timings. `igpu-blt: ring=absent why=no-active-surface` unchanged (igpu rode merged,
+  not armed).
+
+**Instrument hygiene — a seat-caused false critical, worth recording.** The bench waker's
+`A_CRIT` pattern carried the bare token `TIMEOUT `, and the *new* witness text
+`BARE-TIMEOUT int=` matched it — so a completely healthy boot tripped a critical wake. The
+instrument was not wrong about its own rule; the rule was written before a healthy line could
+contain that word. The pattern is now `[^E-]TIMEOUT ` and was verified in **both** directions:
+`BARE-TIMEOUT` no longer fires, and a genuine `xhci: TIMEOUT` still does. The failure mode
+generalises — **every new witness string is a change to the bench's alerting surface**, and a
+CRIT regex that has only ever been tested against real faults has only been tested one way.
+
+Read this capture with `awk '/pattern/'` — **not** `grep`.

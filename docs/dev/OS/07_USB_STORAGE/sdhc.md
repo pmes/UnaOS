@@ -961,6 +961,17 @@ These are gaps in the *gates*, not open questions about the code. Each one is a 
 
 ### 8.10 What a metal boot on the bench rMBP actually prints today
 
+> **SUPERSEDED IN PART by Boot AC (2026-08-07) — see §9.11.** The first and last bullets
+> below were written while CMD8 still refused this card. §9 fixed that, and on Boot AC the
+> card **was** identified and the `w1` line **did** print (`armed=0 lba=60799 wp_sw=1
+> csd_perm=0 csd_tmp=0 class=MBR blank=1 … reason=would-write -> DRYRUN`). Concretely: the
+> "no capture in which identification succeeded" claim is now false, the internal-slot card
+> is no longer uncharacterised, and it is no longer protected by the CMD8 failure — the
+> `sdw` build gate is the whole of its protection. The unarmed reconnaissance boot the
+> first bullet called *uninformative* turned out to be the most informative boot this
+> driver has had, once identification could reach it. The middle two bullets — about the
+> boot medium and the boot card's MBR — stand unchanged.
+
 Recorded because the first draft of this milestone assumed the opposite, and the
 assumption was falsified by captures that already existed.
 
@@ -1191,7 +1202,8 @@ QEMU **cannot present a pre-v2.00 card.** `qemu-system-x86_64` 10.2.2's `sd-card
 accepts `spec_version` 2 and 3 only; 0, 1 and 4 are rejected outright with
 `Invalid SD card Spec version`. Both accepted versions answer CMD8, so **the CMD8-timeout
 arm and the HCS=0 argument are metal-only.** Both arms are present in the linked kernel
-ELF (`strings`), which proves compiled-and-linked, not reached-at-runtime.
+ELF (`strings`), which proves compiled-and-linked, not reached-at-runtime — **and both were
+then reached at runtime on metal, on the first flight: see §9.11.**
 
 §9.10's contradiction check is narrower still: **no card can provoke it**, in QEMU or on the
 bench, because it requires the classifier rather than the medium to be wrong. It was fired
@@ -1295,3 +1307,105 @@ blocks=8388608 size=4096 MiB ::`, then `w1 … -> DRYRUN`), so the check discrim
 misclassification and nothing else.
 
 In the shipped build this is a guard whose value is that it is never printed.
+
+### 9.11 ✅ METAL-CONFIRMED — Boot AC, bench rMBP, 2026-08-07 (first flight)
+
+Tip `f94e280c`, capture `rmbp-gr16-s73`, slice
+`~/unaos-bench/scratch/gr20/bootAC-slice.log`, pace record
+[`bootpace.md §10m`](../01_BOOT_HAL/bootpace.md). Gates: mbench **28/28 required, 0
+forbidden**; `serial-analyzer --wxn` **exit 0**. Read the capture with `awk`, not `grep`.
+
+**The fork was taken, on the first flight, on the register word the previous boot refused
+on.** Boot AB (the immediately preceding metal boot, same machine, same card) printed
+`cmd8 send-if-cond FAILED int=0x00018000 (cmd-timeout) — card is pre-v2.00 or absent` and
+returned from `identify()`. Boot AC printed:
+
+```
+[sdhc] cmd8 send-if-cond BARE-TIMEOUT int=0x00018000 (cmd-timeout) — error half is bit 16
+       alone, no crc/index/end-bit alongside it … Continuing on the v1.x branch with acmd41 HCS=0
+[sdhc] acmd41 arg=0x00ff8000 hcs=0 ocr=0x80ff8000 powered-up=1 ccs=0 (byte-addressed) after 400 polls
+[sdhc] cid mid=0x01 oid=PA pnm=S032B prv=4.5 psn=0x02465bbc mdt=2008-04
+[sdhc] cmd3 resp0=0x5bbc0520 rca=0x5bbc
+[sdhc] csd v1 c_size=1899 c_size_mult=3 read_bl_len=9 (512 B) read_bl_partial=1 -> blocks=… = 60800
+:: sdhc: card v1.x SDSC byte-addressed blocks=60800 size=29 MiB rca=0x5bbc ::
+[sdhc] bdf 3:0.1 CARD IDENTIFIED — 60800 blocks, byte-addressed, csd v1
+```
+
+`int=0x00018000` is byte-identical between the two boots. The hardware did not change; §9.3's
+predicate did. **No `CONTRADICTION` line (§9.10) and no CCS↔CSD `MISMATCH` line (§6.4)
+followed** — both cross-checks were live and both stayed silent, which is the outcome §9.10
+predicted for a genuinely consistent card.
+
+**The decode is corroborated by a second, independent stack.** Before the flight the same
+card was read on the **host** through sysfs. The kernel negotiated its own CID/CSD/RCA from
+the card during its own initialisation, and the two agree item for item:
+
+| fact | host (sysfs) | kernel (Boot AC) |
+| :-- | :-- | :-- |
+| `manfid` | `0x000001` | `mid=0x01` |
+| `name` | `S032B` | `pnm=S032B` |
+| `serial` | `0x02465bbc` | `psn=0x02465bbc` |
+| `date` | `04/2008` | `mdt=2008-04` |
+| `rca` | `0x5bbc` | `rca=0x5bbc` |
+| `csd` → `CSD_STRUCTURE` | `005d0132…` ⇒ `0b00` | `csd v1` |
+| `scr` → `SD_SPEC` | `00a5000033f00008` ⇒ `0` | pre-v2.00 (CMD8 unanswered) |
+| size | `29.7 MB` | `blocks=60800` ⇒ 29 MiB |
+
+Two rows carry more weight than the rest. **The RCA is not a property of the card** — it is a
+value assigned during initialisation, and the host and the kernel each assigned their own,
+independently, and got the same one. And the **raw CSD reconciles bit-exactly** once the
+controller's dropped CRC byte is accounted for: the kernel's
+`cmd9 csd raw=[0xff164000,0xdaf6d9cf,0x32135981,0x00005d01]` is precisely the host's
+`005d0132135981daf6d9cfff16400000` shifted right eight bits. §9.7's CSD v1.0 arithmetic —
+until this boot an argument made on paper against a spec table — now has an independent
+witness for its answer.
+
+**The card was read and the reads were checked four ways, then ADMA2 against PIO at three
+points including the last block:**
+
+```
+[sdhc] read lba0 ok (512 bytes)
+[sdhc] verify repeat lba0 fnv=0x9c40b663cd963722 match=1
+[sdhc] verify lba1 fnv=0x7da144b97d054b25 differs-from-lba0=1
+[sdhc] verify mbr p0 type=0x06 start=63 count=60732 end=60795 fits-capacity=1
+[sdhc] verify mbr … partition extents vs CSD capacity 60800 blocks -> all-fit=1
+[sdhc-ab] window lba=0 / 30400 / 60792  blocks=8  match=1  first-diff=none
+[sdhc-ab] verdict windows=3 match=3/3 — adma2 agrees with the pio control byte-for-byte
+```
+
+The `all-fit=1` line is a third-party check the driver did not author: a partition table
+written in 2008 by software that is not running now agrees with our CSD capacity *and* our
+addressing mode. And the last A/B window ends at LBA 60799, the final block — so §9.6's byte
+addressing is proved at the top of the address range, not only near zero.
+
+**The §8 write ladder ran unarmed, and its line is the pre-flight for arming it:**
+
+```
+:: sdhc: w1 armed=0 lba=60799 wp_sw=1 csd_perm=0 csd_tmp=0 class=MBR blank=1
+   verify=DRYRUN restore=SKIPPED reason=would-write -> DRYRUN ::
+```
+
+Every field is measured on this boot, which is what §8.5 built the unconditional half for.
+Against §8.3's gate table: gate 2 `wp_sw=1` (Present State bit 19, inverted — the slider says
+write-**enabled**), gate 3 `csd_perm=0 csd_tmp=0` (`csd write-protect perm=0 tmp=0
+wp-grp-enable=0 -> card-declares-writable`), gate 4 `blank=1` (the scratch sector was read and
+is empty). §8.4's `inside-partition-N` rung also passed: partition 0 ends at 60795 and the
+scratch LBA is 60799 — four blocks of slack past the table's own end. **`reason=would-write`
+means gate 1 is the only refusal, so the `sdw` compile-time feature is now the entirety of
+this card's protection**, and an armed boot would run the ladder through a live CMD24 to a
+verified restore. That decision is now takeable on measured evidence rather than assumption,
+which is exactly what §8.10 said was unavailable while CMD8 refused the card.
+
+**Cost.** `GPACE … sdhc=293ms` against Boot AB's `sdhc=12ms`, with every other pace lane
+identical — the +281 ms is the work Boot AB never performed, not a regression. **235 ms of it
+is ACMD41 power-up polling** (`after 400 polls`); identification through `CARD IDENTIFIED`
+costs 3 ms and the whole read/verify/A-B battery costs 43 ms. The poll cadence, not the
+ladder, is what a future pace arc would attack here.
+
+**One instrument note that belongs with this section.** `BARE-TIMEOUT` is a new witness
+string, and the bench waker's critical-alert pattern contained the bare token `TIMEOUT ` — so
+this healthy boot tripped a critical wake. The pattern is now `[^E-]TIMEOUT `, verified in
+both directions (`BARE-TIMEOUT` no longer fires; a genuine `xhci: TIMEOUT` still does).
+Recorded here because the cause is this section's text: **adding a witness string changes the
+bench's alerting surface**, and a witness that reads like a fault to a regex is a witness that
+needs the regex checked.
