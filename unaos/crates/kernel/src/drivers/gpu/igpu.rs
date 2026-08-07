@@ -959,10 +959,6 @@ unsafe fn dp_aux_transfer(bar0: usize, clock_divider: u32, cmd: u32, addr: u32, 
             return Err("aux-reserved-reply");
         }
 
-        if reply_status == 3 {
-            return Err("aux-reserved-reply");
-        }
-
         if reply_status == 2 {
             retry_count += 1;
             continue;
@@ -1041,8 +1037,6 @@ pub unsafe fn gmux_igd_switch() {
         let ggtt1 = mmio_read(bar0, regs::GTT_BASE + 4);
         let aux_ctl = mmio_read(bar0, regs::DPA_AUX_CH_CTL);
         let frmcnt = mmio_read(bar0, 0x70040);
-        serial_println!(":: igpu-dpy: rung=00 name=census ok=1 bdsm=0x{:08X} ggc=0x{:08X} ggtt0=0x{:08X} ggtt1=0x{:08X} aux_ctl=0x{:08X} frmcnt=0x{:08X} ::",
-            bdsm, ggc, ggtt0, ggtt1, aux_ctl, frmcnt);
 
         if (aux_ctl & DP_AUX_CH_CTL_SEND_BUSY) != 0 {
             serial_println!(":: igpu: [AUX] REFUSED: aux_ctl=0x{:08X} SEND_BUSY is set at boot ::", aux_ctl);
@@ -1055,6 +1049,12 @@ pub unsafe fn gmux_igd_switch() {
             return Err("aux-divider-unusable");
         }
 
+        serial_println!(":: igpu-dpy: rung=00 name=census ok=1 bdsm=0x{:08X} ggc=0x{:08X} ggtt0=0x{:08X} ggtt1=0x{:08X} aux_ctl=0x{:08X} frmcnt=0x{:08X} ::",
+            bdsm, ggc, ggtt0, ggtt1, aux_ctl, frmcnt);
+
+        highest = 1;
+        rung_name = "selftest";
+        // Note: the MMIO self-test can pass vacuously if the register is Read-As-Zero (RAZ).
         serial_println!(":: igpu: [GMUX] running Unwind stack self-test ::");
 
         let test_val = core::ptr::read_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *const u32);
@@ -1073,9 +1073,10 @@ pub unsafe fn gmux_igd_switch() {
         serial_println!(":: igpu: [GMUX] Unwind stack MMIO self-test passed ::");
         serial_println!(":: igpu: [GMUX] Unwind stack gmux-dispatch=REACHED (Gmux restore path executed without faulting, not implying restore verified) ::");
 
-        let ddc_live = gmux_index_read(GMUX_SWITCH_DDC);
-        unwind.push_gmux(GMUX_SWITCH_DDC, ddc_live as u8);
+        unwind.push_gmux(GMUX_SWITCH_DDC, pre_ddc.unwrap() as u8);
 
+        highest = 2;
+        rung_name = "switch";
         serial_println!(":: igpu: [GMUX] switching DDC to IGD (0x{:02X}) — panel should REMAIN ON since DISPLAY is not moved ::", GMUX_DDC_IGD);
         mux_touched = true;
         gmux_index_write(GMUX_SWITCH_DDC, GMUX_DDC_IGD);
@@ -1084,6 +1085,8 @@ pub unsafe fn gmux_igd_switch() {
             return Err("mux-ddc-switch-failed");
         }
 
+        highest = 3;
+        rung_name = "dpcd";
         let mut dpcd_rev = [0u8; 1];
         if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_NATIVE_READ, 0x00000, 1, &[], &mut dpcd_rev) {
             serial_println!(":: igpu: [AUX] DPCD Read Failed: {} ::", e);
@@ -1091,6 +1094,8 @@ pub unsafe fn gmux_igd_switch() {
         }
         serial_println!(":: igpu: [AUX] DPCD REV: 0x{:02X} ::", dpcd_rev[0]);
 
+        highest = 4;
+        rung_name = "edid";
         if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_I2C_WRITE | DP_AUX_I2C_MOT, 0x50, 1, &[0x00], &mut []) {
             serial_println!(":: igpu: [AUX] EDID Address Set NACKed/Failed: {} ::", e);
             return Err("edid-address-nack");
@@ -1126,8 +1131,8 @@ pub unsafe fn gmux_igd_switch() {
             serial_println!("::");
         }
 
-        rung_name = "edid";
-        highest = 3;
+        highest = 5;
+        rung_name = "end";
         Ok(())
     };
 
@@ -1150,13 +1155,13 @@ pub unsafe fn gmux_igd_switch() {
             let post_ddc = gmux_index_read(GMUX_SWITCH_DDC);
             let post_disp = gmux_index_read(GMUX_READ_DISPLAY);
             let post_ext = gmux_index_read(GMUX_READ_EXTERNAL);
-            
+
             let verdict = if post_ddc == intent_ddc && revert_ok {
                 "MATCH"
             } else {
                 "FAILED"
             };
-            
+
             serial_println!(":: igpu: [GMUX] revert read-back: DDC=0x{:02X} DISP=0x{:02X} (TBV) EXT=0x{:02X} (TBV) ::", post_ddc, post_disp, post_ext);
             verdict
         } else {
