@@ -1909,6 +1909,10 @@ def paygo_stats(chunk, tag='wc-g'):
         # "open" below, and the two can no longer be confused in a table or in a grep.
         w['sealed'] = [p for p in w['paygo']
                        if p['state'] == 'sealed' or p['verdict'] == 'UNPAID']
+        # GR18 close terminal (45ebbd3d): `state=closed` at the greatest `emit=` means the tenant
+        # said its last word; distinct from `sealed` (teardown-abort) and judged at the PEAK line
+        # per the census rule, so a stale `closed` from an earlier tenant cannot shadow a live one.
+        w['closed'] = bool(peak and peak['state'] == 'closed')
         w['taken'] = paid[0]['taken'] if paid else (
             max((p['taken'] for p in w['paygo']), default=0))
         w['budget'] = w['paygo'][0]['budget'] if w['paygo'] else 0
@@ -1952,6 +1956,10 @@ def print_paygo_stats(pg, tag='wc-g'):
             status = 'SEALED -> UNPAID (kernel verdict)'
         elif w['paid']:
             status = 'PAID'
+        elif w['closed']:
+            # GR18 close terminal: `state=closed -> UNSPENT` is the tenant's last word — the
+            # battery is TERMINATED, not open. (A close-paid battery reports PAID above.)
+            status = 'CLOSED -> UNSPENT (terminal)'
         elif w['paygo']:
             status = 'open at capture end'
         else:
