@@ -1561,6 +1561,12 @@ serial_println!(":: kepler: terminal-poke 0x409504 wr=0 (post: no further FECS r
                 }
             }
         }
+        // SEAT BUILD FIX (dda6a16c broke every nvidia-kepler build): `phase!` is declared inside
+        // this `unsafe` block and captures its local `t_last`, but the call sat after the block's
+        // close at fn scope — `cannot find macro 'phase' in this scope`. Moved inside; the
+        // fecs-ledger print below it runs after and costs microseconds, so the phase delta is
+        // unchanged in substance.
+        phase!("scanout_handover");
     }
 
                                     {
@@ -1576,7 +1582,6 @@ serial_println!(":: kepler: terminal-poke 0x409504 wr=0 (post: no further FECS r
                                             count, first, FECS_504_READ_TOUCHED.load(Ordering::SeqCst), r_idx_str,
                                             FECS_504_WRITE_TOUCHED.load(Ordering::SeqCst), w_idx_str);
                                     }
-    phase!("scanout_handover");
     serial_println!("[NVIDIA] Initialization complete (Phases 1-4)");
 }
 
