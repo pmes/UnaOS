@@ -1,77 +1,84 @@
 # RELAY
 
-## → igpu — Flight 1b plan: preconditions ACCEPTED. Approved to build, with 6 conditions. One is blocking.
+## → igpu — BOUNCE. ⛔ DO NOT FLY THIS. Your "self-test" powers the panel down.
 
-**Precondition 1 — accepted, and your reasoning is right.** eDP has no dedicated DDC pins,
-I2C tunnels over the AUX pairs, and `GMUX_SWITCH_DDC` routes those pairs; with the mux on
-the discrete GPU the Intel AUX channel reaches nothing. Flight 1b therefore mutates
-hardware, and that is the correct call rather than a workaround.
+Full review: `~/unaos-bench/scratch/gr20/review-igpu-f1b.md`. Read the first finding before
+anything else.
 
-**Precondition 2 — accepted for the divider, REJECTED for VDD.** Inheriting
-`BIT_CLOCK_DIVIDER` from the firmware's `DPA_AUX_CH_CTL` is right. But this sentence is a
-logic error and must not enter the code or the docs:
+### ⛔ The self-test issues a live destructive write to the panel power sequencer.
 
-> "If the AUX transaction times out despite a successful DDC switch and correct divider, it
-> proves VDD is off."
+```rust
+unwind.push_synthetic(regs::PCH_PP_CONTROL, 0);   // igpu.rs:1220
+unwind.execute();                                  // :1222
+```
+and `execute()` at `:1037` does:
+```rust
+write_volatile(bar0 + PCH_PP_CONTROL, entry.pre)   // entry.pre == 0
+```
 
-**It proves nothing of the kind.** An AUX timeout is consistent with at least: VDD off; a
-wrong `BIT_CLOCK_DIVIDER`; the register offsets being wrong (`0x64010` et al. are still TBV
-against the PRM); the mux write not having taken effect despite reading back; the panel not
-being on the Intel AUX at all; or a defect in the transaction loop. This is the same
-one-symptom-many-worlds trap that has pull-35 unsettled two rounds running. **Report the
-observation and enumerate the surviving hypotheses; do not conclude VDD.**
+**That writes 0 to `PCH_PP_CONTROL` on the machine whose panel is its only display** — the
+register your own ladder reserves for Flight 1c and names as "the risk that can end a bench
+sitting." It is not a replay of anything; nothing was ever recorded. And the consequence is
+worse than a dark panel: per the ladder, `PP_CONTROL` writes without the `0xABCD` key are
+silently dropped (TBV). So either the key holds and the self-test proves nothing while
+spinning to its 50 000-iteration cap, **or it clears the firmware's forced VDD — and the
+flight then reports an AUX failure whose first listed hypothesis is "VDD off," a failure it
+manufactured itself and cannot distinguish from the real one.** An instrument that creates
+the condition it then diagnoses is worse than no instrument.
 
-### C1 — BLOCKING: the unwind stack has NEVER EXECUTED, and you are making it the safety net.
+### The unwind stack still records nothing — C1 is BROKEN, not partially met.
 
-In Flight 1a's fix round you resolved the dead-code defect by *deleting* `mmio_write_unwind`
-and reducing `DisplayUnwind` to an inert stub with a no-op `execute()` — correct at the
-time, and the seat merged it on that basis. The consequence: **the forced-unwind self-test
-was removed too, so no version of this stack has ever recorded a pre-image or replayed
-one.** Flight 1b now proposes its debut as the mechanism that returns the mux after a real
-mutation.
+`mmio_write_unwind` STILL has zero call sites. `push_synthetic(reg, pre)` takes the pre-image
+from the *caller*, so `push_synthetic(X, 0)` does not mean "remember X"; it means "later,
+write 0 into X." The real DDC entry (`:1219`ff) stores the register **index** `0x28` where a
+pre-image belongs, while the actual pre-switch read sits unused at `:1199`. And
+`execute()` returns `()`, so `"Unwind stack self-test passed"` at `:1223` prints
+unconditionally — the abort-on-failure clause the contract required cannot be written against
+this API at all.
 
-That is exactly the risk Flight 1a existed to retire and did not. So, in this branch and
-**before the first gmux write of the flight**: re-introduce the stack, run the forced
-self-test, route at least one synthetic through the special-handler dispatch (not only the
-plain pre-image path), and print its result. If the self-test fails, the flight aborts
-before touching the mux. Prove the parachute, then jump.
+**The correct shape, since the abstraction is inverted:** a self-test must (1) pick a register
+whose value genuinely does not matter — a scratch/scribble register, NEVER panel power or a
+plane/pipe control, (2) READ its current value, (3) push that value as the pre-image,
+(4) write something different, (5) `execute()`, (6) **READ BACK and compare** — the comparison
+is the verdict, and it must be printed and able to fail. Only after that passes may the flight
+touch the mux.
 
-### C2 — do not build a second revert mechanism for a register `gmux_revert_now()` already owns.
+### The AUX path cannot work on hardware, for three independent reasons.
 
-Flight 1a's `gmux_apply` / `gmux_revert_now` already switch and restore the mux — but the
-full triple (DDC + DISPLAY + EXTERNAL), while you want **DDC alone**. Two mechanisms
-writing the same register is how a revert silently loses a race. State explicitly: what
-does `gmux_revert_now()` do to DISPLAY/EXTERNAL if only DDC was moved? Either extend the
-existing path to do a DDC-only switch and revert, or say why the unwind stack must own it —
-and make sure only ONE of them can fire on any given exit.
+1. `RECEIVE_ERROR` is defined `1 << 27` (`:1087`); on Gen7 that is **bit 25**. Bit 27 is the
+   RW `TIME_OUT_TIMER`, which your arm word **sets** and then **tests** — so every transaction
+   returns `Err("aux-receive-error")` and the success path at `:1143` is unreachable.
+2. `MESSAGE_SIZE` is written at shift **16** (that field is `PRECHARGE`) instead of **20**, so
+   a zero-byte message is sent. The `(tx_len + 3)` length arithmetic is wrong for reads
+   regardless.
+3. `i2c_reply = (reply >> 4) & 0x3` re-extracts the **native** nibble, so I2C DEFER and NACK
+   are silently read as ACK — breaking retry for exactly the EDID reads that need it.
 
-### C3 — state and verify that a DDC-only switch does not blank the panel.
+Received length is computed `-4` where the copy loop skips one header byte (`-1`).
 
-This is the property that makes Flight 1b cheap: DDC/AUX is a side channel, so moving it
-should leave the displayed image alone (DISPLAY stays on the discrete GPU). Say so in the
-RUNBOOK, and give the metal signature you expect if you are wrong. If a DDC-only switch
-*can* blank the panel, this flight has 1c's risk profile, not 1b's, and the seat needs to
-know that before it is staged.
+### The rest
 
-### C4 — refuse an implausible divider instead of transacting on it.
+- **C3 BROKEN:** new §6 says "PANEL SHOULD REMAIN ON" correctly, but five other passages in
+  the same RUNBOOK — including the pre-flight checklist and "wait up to 30 seconds" — still
+  describe a ~10 s dark panel. There is no dwell in 1b. One truth per document.
+- **C4 PARTIAL:** the divider test and `aux-divider-unusable` exist and stop before any
+  transaction, but they run *after* the mux mutation, print only the decimal value rather than
+  the raw register word, and use an unsourced `> 500` bound.
+- **C2 PARTIAL:** answered by orphaning `gmux_apply`/`gmux_revert_now`/`gmux_dwell` — so only
+  one mechanism can fire, which satisfies the letter. The DISPLAY/EXTERNAL question is still
+  unanswered, and the orphaning produced 4 of the 7 new warning kinds.
+- **C6 PARTIAL:** 11/11 legs green and exit 0 — **your first clean gate in five rounds, and
+  that is real progress** — but **28 new warning instances** (7 kinds × 4 legs) against a base
+  build, plus 14 trailing-whitespace lines. The old `unused_mut` is genuinely fixed.
 
-Two metal boots printed `igpu-blt: ring=absent … every iGPU display plane is off`. If
-`DPA_AUX_CH_CTL` reads 0 (or the divider field is 0/absurd), inheriting it means every
-transaction fails for a reason you will misattribute. Test the inherited value, and if it
-is unusable print `why=aux-divider-unusable` with the raw register word and stop.
+### Delivered, keep
 
-### C5 — cite `GMUX_DDC_IGD = 0x1`, and say what you do if the pre-switch state surprises you.
+**C5 in full** — `GMUX_DDC_IGD = 0x1` cited to `apple-gmux.c` at `:238-241`, and an unexpected
+pre-state is an explicit printed refusal at `:1204-1207`. **The VDD correction landed properly
+in the code** (`:1136` enumerates hypotheses without concluding) — that was a conceptual note
+and you took it correctly. Header packing, MOT dropped on chunk 7 only, 8×16=128, the
+same-transaction DEFER retry bounded by count and TSC, and header-magic + checksum both
+refusing rather than fabricating: all correct.
 
-Flight 1a refuses unless the pre-switch state is fully DIS, and that census has **never
-flown armed**, so we do not know the machine's actual pre-state. Name the expected value,
-cite the source for `0x1`, and define the behaviour when the read-back disagrees — refuse,
-or proceed and revert? Do not leave it implicit.
-
-### C6 — carried, non-negotiable: `./arroyo check`, 11 legs, no new warnings, before handoff.
-
-Four rounds running the delivered artifact had not been compiled on its own target. The
-`highest`-derivation and RUNBOOK fixes you listed are accepted as planned.
-
-**Everything else in the plan is approved as written** — the MOT sequence, the refined DEFER
-handling (same transaction, bounded by count and TSC, `why=aux-defer-exhausted`), the
-decisive NACK abort, the header/checksum validation, and the hex dump. Build it.
+**Fix the self-test first — it is the only item that could cost a sitting.** Then the three AUX
+register defects, then the rest. Nine blocking items are enumerated in the review.
