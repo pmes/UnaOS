@@ -1482,6 +1482,20 @@ WXN_NXE_RE = re.compile(
 # WXN_NXE_RE's shape.
 WXN_CORES_RE = re.compile(r'^\s*::\s*WXAUDIT-CORES:\s*(.*?)\s*::\s*$')
 WXN_FBWC_RE = re.compile(r'^\s*::\s*WXN-FBWC:\s*(.*?)\s*->\s*(.*?)\s*::\s*$')
+# M3b — the W-clear (`ee0c5628`, GR20).  TWO wires, a PAIR: the read-only
+# pre-pass census (`WXN-M3B-PRE ... -> CENSUS`, printed BEFORE any write) and
+# the clear+post-verify result (`WXN-M3B ... -> RO`).  The PRE line's verdict is
+# CENSUS, or REFUSED on the fail-closed arm (memory.rs `wxn_ro_stage` step 3);
+# the result line's is RO / DRYRUN / VACUOUS / UNVERIFIED / REFUSED / CENSUS,
+# none of which matches arroyo's FAULT_PATTERNS.  `WXN-M3B:` is NOT a prefix of
+# `WXN-M3B-PRE:` (the colon differs), so the two regexes cannot cross-match and
+# order does not matter — the PRE reader is tried first only for readability.
+WXN_M3B_PRE_RE = re.compile(
+    r'^\s*::\s*WXN-M3B-PRE:\s*(.*?)\s*->\s*(CENSUS|REFUSED)\b\s*(.*?)'
+    r'\s*::\s*$')
+WXN_M3B_RE = re.compile(
+    r'^\s*::\s*WXN-M3B:\s*(.*?)\s*->\s*'
+    r'(RO|DRYRUN|VACUOUS|UNVERIFIED|REFUSED|CENSUS)\b\s*(.*?)\s*::\s*$')
 # `residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1)` — its own reader, because the
 # breakdown's keys start with a DIGIT and the generic _kv() scanner (whose names
 # must start with a letter) would silently read '1g=0' as 'g=0'.  A parenthetical
@@ -1515,6 +1529,26 @@ WXN_ABSENT = 'wire absent (pre-32724cb4 build)'
 WXN_M3A_PRE = 'pre-M3a'
 WXN_M3A_POST = 'M3a+'
 WXN_M3A_UNKNOWN = 'undecidable'
+
+# M3b's four eras, decided from the capture the same way M3a's are (below).
+# M3b DOES add a new serial line — the WXN-M3B pair — so unlike M3a the era is
+# read off PRESENCE and the result verdict, not off a value shift:
+#   pre-M3b     — no WXN-M3B line at all; the W-clear is not in this build. The
+#                 whole M3b path is skipped and every pre-M3b verdict is byte-
+#                 for-byte what it was before this arc.
+#   M3b-disarmed— WXN-M3B -> DRYRUN: the wire is compiled in but `cfg!(wxnro)`
+#                 folded false, so nothing was cleared and kern_WX is unchanged.
+#                 A true analyzer no-op — the pre-M3b identities still hold.
+#   M3b-armed   — WXN-M3B present and NOT DRYRUN (the clear ran). kern_WX stops
+#                 tracking image size and becomes the residue; the pre-M3b
+#                 residue/keep_x-vs-kern_WX cross-checks no longer hold, and the
+#                 M3b identity `kern_WX == keep_x - already_ro - cleared` governs.
+#   M3b-undec.  — a WXN-M3B line this reader could not classify; UNJUDGED, never
+#                 assumed either way.
+WXN_M3B_PRE_ERA = 'pre-M3b'
+WXN_M3B_DISARMED = 'M3b-disarmed'
+WXN_M3B_ARMED = 'M3b-armed'
+WXN_M3B_UNKNOWN = 'M3b-undecidable'
 
 
 def _wxn_hexmask(text):
@@ -1614,6 +1648,47 @@ def wxn_m3a_era(w):
             "and the sweep line does not show a clear BSP CR0.WP")
 
 
+def wxn_m3b_era(w):
+    """Does the kernel that printed THIS boot carry WXN-x86 M3b ARMED (W cleared
+    from the executable extent)?  Returns (era, evidence).
+
+    Decided from the capture, mirroring wxn_m3a_era's structure — but M3b DOES
+    add a line, so the signal is the WXN-M3B result wire's presence and verdict
+    rather than a value shift:
+
+      * M3b-armed    — a WXN-M3B line whose verdict is NOT DRYRUN (the W-clear
+        window ran).  `armed=1` on the line corroborates it; the verdict is the
+        primary signal because the disarmed build's whole edit is `if armed`.
+      * M3b-disarmed — WXN-M3B -> DRYRUN.  The wire is compiled in but folded to
+        a no-op; kern_WX is unchanged and the pre-M3b identities still stand.
+      * pre-M3b      — no WXN-M3B line: the W-clear is not in this build at all.
+      * undecidable  — a WXN-M3B line this reader could not classify.
+
+    Only the armed era takes the new M3b path (identity check, false-cause
+    suppression, short-clear WARN); the other three leave every pre-M3b verdict
+    exactly as it was."""
+    m3b = w.get('m3b')
+    if not m3b:
+        return (WXN_M3B_PRE_ERA,
+                "no WXN-M3B line on this boot — the W-clear (M3b) is not in "
+                "this build")
+    verdict = m3b['verdict']
+    armed = _num(m3b['fields'].get('armed'))
+    if verdict == 'DRYRUN':
+        return (WXN_M3B_DISARMED,
+                f"WXN-M3B printed -> DRYRUN (armed={m3b['fields'].get('armed', '-')}), "
+                f"the disarmed build's no-op — cfg!(wxnro) folded false and the "
+                f"clear window never opened")
+    if verdict in ('RO', 'VACUOUS', 'UNVERIFIED', 'REFUSED', 'CENSUS'):
+        return (WXN_M3B_ARMED,
+                f"WXN-M3B printed -> {verdict} "
+                f"(armed={m3b['fields'].get('armed', '-')}), a non-DRYRUN "
+                f"verdict — the W-clear ran on this boot")
+    return (WXN_M3B_UNKNOWN,
+            f"WXN-M3B carries a verdict this reader does not classify "
+            f"(-> {verdict}); the era is UNJUDGED, not assumed")
+
+
 # The three places ONE x86 boot states the BSP's own CR0.WP, and the reason
 # they are comparable at all — cited from the emitters, because a cross-check
 # between two readings that are not of the same register on the same core is
@@ -1674,8 +1749,26 @@ def wxn_boot(boot):
     Every one of the four wires is optional and each records its own absence,
     because the eras above mean 'not in this boot' is three different facts."""
     sweep = census = nxe = fbwc = m2 = probe_cpu = cores_line = None
+    m3b = m3b_pre = None
     dups = Counter()
     for line, probe_line in zip(boot['lines'], boot['probe']):
+        # M3b's PAIR, tried before every other WXN wire.  The PRE reader must run
+        # before the result reader only for clarity; the colon already keeps the
+        # two apart (see the regex comment).  Both bodies carry `xseg=[..,..)` /
+        # `wseg=[..,..)` arrays whose square brackets hold no spaces, so _kv's
+        # `\S+` reads each array whole and the parens-strip is a no-op on them.
+        m = WXN_M3B_PRE_RE.match(probe_line)
+        if m:
+            dups['m3b_pre'] += 1
+            m3b_pre = {'fields': _kv(WXN_PARENS_RE.sub(' ', m.group(1))),
+                       'verdict': m.group(2), 'tail': m.group(3), 'line': line}
+            continue
+        m = WXN_M3B_RE.match(probe_line)
+        if m:
+            dups['m3b'] += 1
+            m3b = {'fields': _kv(WXN_PARENS_RE.sub(' ', m.group(1))),
+                   'verdict': m.group(2), 'tail': m.group(3), 'line': line}
+            continue
         mm = WXN_M2_RE.match(probe_line)
         if mm:
             body, verdict, tail = mm.group(1), mm.group(2), mm.group(3)
@@ -1743,7 +1836,7 @@ def wxn_boot(boot):
     # `probe_cpu` is deliberately NOT in this tuple: a WXPROBE `cpu:` line is a
     # corroborating witness, not a WXN wire, so a boot carrying it and nothing
     # else is still a boot with no WXN block — unchanged from before.
-    if not any((sweep, census, nxe, fbwc, m2, cores_line)):
+    if not any((sweep, census, nxe, fbwc, m2, cores_line, m3b, m3b_pre)):
         return None
     # The build era, read off the wires themselves rather than off a version
     # string the capture does not carry.
@@ -1757,7 +1850,8 @@ def wxn_boot(boot):
         era = 'pre-a0a2d163 (WXAUDIT census only)'
     return {'number': boot['number'], 'sweep': sweep, 'census': census,
             'nxe': nxe, 'fbwc': fbwc, 'm2': m2, 'probe_cpu': probe_cpu,
-            'cores_line': cores_line, 'era': era, 'dups': dups,
+            'cores_line': cores_line, 'm3b': m3b, 'm3b_pre': m3b_pre,
+            'era': era, 'dups': dups,
             'modern': (census and census['hist']) or bool(fbwc)}
 
 
@@ -1827,6 +1921,43 @@ def wxn_m2_reconcile(w, residue, kern_wx):
 
     clean, msgs = True, []
     f = m2['fields']
+
+    # M3b changes what kern_WX MEANS.  Once the W-clear has run, kern_WX is no
+    # longer M2's executable residue — it is the leaves that stayed writable AND
+    # executable AFTER the clear (the AP trampoline, plus any wskip hole).  So on
+    # an armed-M3b boot the residue closed form and the keep_x-vs-kern_WX
+    # cross-check below are pre-M3b invariants that CANNOT hold, and the old
+    # `kern_wx < keep_x` arm would print the factually wrong "firmware left
+    # READ-ONLY" note — those pages are M3b's clears, not firmware's.  Suppress
+    # that whole comparison here and let wxn_m3b_checks carry the real check
+    # (kern_WX == keep_x - already_ro - cleared).  The M2/ELF derivation
+    # (keep_x == xpages+1) is UNAFFECTED — M3b does not touch M2's counts — so it
+    # still runs.  A pre-M3b or disarmed boot never enters this branch, so its
+    # output is byte-for-byte unchanged.
+    m3b_era, m3b_why = wxn_m3b_era(w)
+    if m3b_era == WXN_M3B_ARMED:
+        keep_x, xpages = _num(f.get('keep_x')), _num(f.get('xpages'))
+        msgs = [
+            f"note residue/kern_WX: sweep {head} — this boot carries M3b ARMED "
+            f"({m3b_why}). M3b clears W from the executable extent AFTER M2 runs, "
+            f"so kern_WX={kern_wx} is the post-clear residue, NOT M2's "
+            f"executable count, and the pre-M3b residue/keep_x cross-checks do "
+            f"not hold here. The post-clear check is "
+            f"kern_WX == keep_x - already_ro - cleared, asserted against the "
+            f"WXN-M3B pair below (NOT firmware read-only leaves)"]
+        if keep_x is not None and xpages is not None:
+            if keep_x == xpages + 1:
+                msgs.append(f"ok   M2/ELF: keep_x={keep_x} == xpages+1 = "
+                            f"{xpages + 1} (the executable extent plus the AP "
+                            f"trampoline page) — M3b does not touch M2's counts, "
+                            f"so this third derivation still holds")
+            else:
+                msgs.append(f"note M2/ELF: keep_x={keep_x} vs xpages+1 = "
+                            f"{xpages + 1} — differ by {keep_x - xpages - 1}; "
+                            f"reported, not asserted (the +1 is the trampoline "
+                            f"page, which need not lie outside the extent)")
+        return True, msgs
+
     if m2['verdict'] != 'SPLIT':
         # M2 ran and wrote nothing.  The delta is NOT M2's, and the milestone
         # not happening is the finding — `wxn_verdicts` raises it; here the job
@@ -1935,6 +2066,215 @@ def wxn_m2_reconcile(w, residue, kern_wx):
                         f"edit's own count differ by {keep_x - xpages - 1}; "
                         f"reported, not asserted (the +1 is the trampoline "
                         f"page, which need not lie outside the extent)")
+    return clean, msgs
+
+
+def wxn_m3b_checks(w):
+    """M3b — the W-clear.  Verify an ARMED boot cleared W from the WHOLE
+    executable extent, and CONVICT a partial clear.  Returns (clean, [message]).
+
+    THE POINT OF THIS CHECK, and the defect it exists against.  M3b is the most
+    brick-capable change in the WXN arc: it clears W from `.text` so a stray
+    CPL-0 store faults.  A FULL clear is safe; a HALF clear is the brick-adjacent
+    state — some code pages read-only, a store into one of the rest still silently
+    corrupts.  Before this arc an armed capture printed a factually wrong note
+    ("firmware left READ-ONLY") for the very pages M3b had cleared, and because
+    `<` was its "explicable" direction a half-cleared extent printed the same
+    shape and NO warning.  This is the reader that says otherwise.
+
+    Empty and clean on a boot with no WXN-M3B line (pre-M3b), and a report-only
+    no-op on a disarmed one — so neither era's verdict moves."""
+    m3b = w.get('m3b')
+    if not m3b:
+        return True, []
+    era, why = wxn_m3b_era(w)
+    f = m3b['fields']
+    pre = w.get('m3b_pre')
+    pf = pre['fields'] if pre else {}
+    msgs, clean = [], True
+
+    if era == WXN_M3B_DISARMED:
+        msgs.append(
+            f"note M3b: WXN-M3B -> DRYRUN — the disarmed build carries the wire "
+            f"but clears nothing ({why}); kern_WX is unchanged and the pre-M3b "
+            f"identities above stand. A true analyzer no-op")
+        return True, msgs
+    if era != WXN_M3B_ARMED:
+        msgs.append(
+            f"note M3b: {why}. The W-clear is UNJUDGED on this boot — not "
+            f"passed, not convicted")
+        return True, msgs
+
+    # ARMED.  Read the three lines the identity spans, plus M3b's own counts.
+    census, m2 = w['census'], w['m2']
+    kern_wx = _num(census['fields'].get('kern_WX')) if census else None
+    keep_x = _num(m2['fields'].get('keep_x')) if m2 else None
+    cleared = _num(f.get('cleared'))
+    already_ro = _num(f.get('already_ro'))
+    would = _num(f.get('would'))
+    verify_w = _num(f.get('verify_w'))
+    expect_w = _num(f.get('expect_w'))
+    wskip = _num(f.get('wskip'))
+    fb_chk = _num(f.get('fb_chk'))
+    fb_delta = _wxn_hexmask(f.get('fb_delta'))
+
+    # 0. Verdict.  A clear that ran but did not reach RO did not apply, and on an
+    #    armed flight that is a finding — a REFUSED leaves the map unmodified
+    #    (fail-safe), but the milestone did not happen and must not read as done.
+    if m3b['verdict'] != 'RO':
+        clean = False
+        msgs.append(
+            f"WARN WXN-M3B-{m3b['verdict']}: boot {w['number']} the W-clear ran "
+            f"armed but printed -> {m3b['verdict']}{(' ' + m3b['tail']) if m3b['tail'] else ''}"
+            f" — the executable extent was NOT made read-only on this boot. "
+            f"Whatever the cause, `.text` stays writable and M3b's protection is "
+            f"absent here")
+
+    # 1. THE IDENTITY: kern_WX == keep_x - already_ro - cleared.  keep_x is the
+    #    executable leaves M2 kept, `cleared`/`already_ro` are the leaves M3b
+    #    made (or found) read-only, and the remainder is what the audit must
+    #    still count as W^X (the AP trampoline, plus any wskip hole).  When the
+    #    three agree, the whole extent that could be cleared WAS.
+    if None in (kern_wx, keep_x, already_ro, cleared):
+        msgs.append(
+            f"note M3b identity: boot {w['number']} cannot be tested against "
+            f"kern_WX == keep_x - already_ro - cleared — one term is unreadable "
+            f"(kern_WX={census['fields'].get('kern_WX') if census else None} "
+            f"keep_x={m2['fields'].get('keep_x') if m2 else None} "
+            f"already_ro={f.get('already_ro')} cleared={f.get('cleared')}). "
+            f"UNJUDGED, not passed")
+    else:
+        predicted = keep_x - already_ro - cleared
+        if kern_wx == predicted:
+            msgs.append(
+                f"ok   M3b identity: kern_WX={kern_wx} == keep_x={keep_x} - "
+                f"already_ro={already_ro} - cleared={cleared} = {predicted} — "
+                f"every executable leaf M2 kept is now read-only except the "
+                f"{predicted} residue (the AP trampoline; tramp_w={f.get('tramp_w', '-')})")
+        else:
+            clean = False
+            msgs.append(
+                f"WARN WXN-M3B-IDENTITY: boot {w['number']} kern_WX={kern_wx} "
+                f"but keep_x - already_ro - cleared = {keep_x} - {already_ro} - "
+                f"{cleared} = {predicted} (off by {kern_wx - predicted}). The "
+                f"audit found a DIFFERENT number of writable-executable kernel "
+                f"leaves than M3b's own count says it left. A half-applied clear "
+                f"reads exactly this way — some `.text` pages read-only, the rest "
+                f"still writable — which is the brick-adjacent state this milestone "
+                f"must never fly in")
+
+    # 2. cleared == would: the pre-pass predicted `would` clears, the result
+    #    reports `cleared`.  A short clear (cleared < would) is the literal
+    #    partial application; cleared > would is an anomaly the same way.
+    if cleared is None or would is None:
+        msgs.append(
+            f"note M3b clears: boot {w['number']} cleared={f.get('cleared')} "
+            f"vs would={f.get('would')} — one is unreadable, so the "
+            f"pre-pass-vs-result closure was NOT checked (not the same as passing)")
+    elif cleared == would:
+        msgs.append(
+            f"ok   M3b clears: cleared={cleared} == would={would} — the pre-pass "
+            f"census and the result agree; the clear reached every page it named")
+    else:
+        clean = False
+        short = would - cleared
+        msgs.append(
+            f"WARN WXN-M3B-SHORT: boot {w['number']} cleared={cleared} but the "
+            f"pre-pass said would={would} ({'short by ' + str(short) if short > 0 else 'OVER by ' + str(-short)}). "
+            f"M3b {'cleared FEWER pages than it censused' if short > 0 else 'cleared MORE pages than it censused'} "
+            f"— the extent is only PARTIALLY read-only, the exact partial-apply "
+            f"the milestone's safety case forbids")
+
+    # 3. verify_w: the post-write fold recount.  0 means no writable-executable
+    #    leaf survived the clear; anything else is W still set where it should not
+    #    be.  expect_w is M3b's own prediction of that recount — they must match.
+    if verify_w is None:
+        msgs.append(
+            f"note M3b verify: boot {w['number']} verify_w={f.get('verify_w')} "
+            f"is unreadable, so the post-write recount was NOT checked")
+    elif verify_w != 0:
+        clean = False
+        msgs.append(
+            f"WARN WXN-M3B-VERIFY: boot {w['number']} verify_w={verify_w} — M3b's "
+            f"OWN post-write fold still found {verify_w} writable-executable "
+            f"leaf/leaves after the clear. W is set where the extent should be "
+            f"read-only; the clear did not close")
+    elif expect_w is not None and verify_w != expect_w:
+        clean = False
+        msgs.append(
+            f"WARN WXN-M3B-VERIFY: boot {w['number']} verify_w={verify_w} but "
+            f"expect_w={expect_w} — the post-write recount and M3b's own "
+            f"prediction of it disagree; the clear's accounting does not close")
+    else:
+        msgs.append(
+            f"ok   M3b verify: verify_w={verify_w} == expect_w="
+            f"{expect_w if expect_w is not None else '-'} — no writable-executable "
+            f"leaf survived the clear")
+
+    # 4. wskip (C8 / C5): a writable PT_LOAD page that fell INSIDE the executable
+    #    extent.  That page is W AND X — the exact W^X hole this milestone exists
+    #    to close — and M3b will not clear it (it is legitimately writable data),
+    #    so it must not sit inside the "explicable" direction of any check. A
+    #    finding in its own right, on the PRE census and on the result line both.
+    ws_pre = _num(pf.get('wskip'))
+    if wskip is None and ws_pre is None:
+        pass  # neither line carried a readable wskip; nothing to say
+    else:
+        seen = wskip if wskip is not None else ws_pre
+        if seen > 0:
+            clean = False
+            msgs.append(
+                f"WARN WXN-M3B-WSKIP: boot {w['number']} wskip={seen} — {seen} "
+                f"writable PT_LOAD page(s) lie INSIDE the executable extent. Each "
+                f"is writable AND executable — the W^X hole M3b exists to close — "
+                f"and M3b skips clearing it because it is legitimately writable "
+                f"data mapped executable. This is a real defect in the LINK, not "
+                f"a clear failure, and it must be resolved before M3b can make "
+                f"the extent read-only")
+        else:
+            msgs.append(
+                f"ok   M3b wskip: wskip={seen} — no writable page fell inside "
+                f"the executable extent")
+
+    # 5. THE GR15 BELT (C4): fb_chk=1 means the panel-leaf interlock actually
+    #    ran; fb_delta must then be 0 (the clear did not disturb the framebuffer
+    #    mapping).  A skipped interlock is a note; a non-zero delta is the GR15
+    #    signature and a finding.
+    if fb_chk is None:
+        pass
+    elif fb_chk == 0:
+        msgs.append(
+            f"note M3b fb-belt: boot {w['number']} fb_chk=0 — the GR15 panel "
+            f"interlock did not run on this boot, so the clear's effect on the "
+            f"framebuffer mapping was not checked here")
+    elif fb_delta is not None and fb_delta != 0:
+        clean = False
+        msgs.append(
+            f"WARN WXN-M3B-FBDELTA: boot {w['number']} fb_delta="
+            f"{f.get('fb_delta')} with fb_chk=1 — the panel leaf MOVED across "
+            f"M3b's clear window (GR15 signature). The W-clear disturbed the "
+            f"framebuffer mapping")
+    else:
+        msgs.append(
+            f"ok   M3b fb-belt: fb_chk=1 fb_delta={f.get('fb_delta', '-')} — the "
+            f"GR15 interlock ran and the panel leaf did not move across the clear")
+
+    # 6. PRE/result consistency: the pre-pass `would` and the result's `would`
+    #    are one census read twice; they must agree, or the pair was corrupted.
+    w_pre, w_res = _num(pf.get('would')), would
+    if w_pre is not None and w_res is not None and w_pre != w_res:
+        clean = False
+        msgs.append(
+            f"WARN WXN-M3B-PAIR: boot {w['number']} WXN-M3B-PRE says would="
+            f"{w_pre} but WXN-M3B says would={w_res} — the pre-pass and the "
+            f"result disagree on the census they both print; one line was "
+            f"corrupted in transit")
+    elif pre is None:
+        msgs.append(
+            f"note M3b: boot {w['number']} carries a WXN-M3B result line but no "
+            f"WXN-M3B-PRE pre-pass line — the read-only census that must precede "
+            f"the write window is absent from this capture (reported, not passed)")
+
     return clean, msgs
 
 
@@ -2321,13 +2661,23 @@ def wxn_selfchecks(w):
                         f"was corrupted in transit; the per-core cross-check "
                         f"rests on WXAUDIT-CORES's copy of wp, so it cannot be "
                         f"trusted on this boot")
+
+    # 7. M3b — the W-clear (GR20).  Empty on a pre-M3b boot (no WXN-M3B line), so
+    #    every pre-M3b and disarmed capture is byte-for-byte what it was; only an
+    #    armed-M3b boot adds the identity/short-clear/wskip findings.  Appended
+    #    last, alongside — it changes no check above.
+    m3b_clean, m3b_msgs = wxn_m3b_checks(w)
+    if not m3b_clean:
+        clean = False
+    msgs.extend(m3b_msgs)
     return clean, msgs
 
 
 def print_wxn_boot(w):
     print(f"Boot {w['number']}  WXN   (build era: {w['era']})")
-    for kind, label in (('sweep', 'sweep'), ('m2', 'm2'), ('census', 'census'),
-                        ('nxe', 'nxe'), ('fbwc', 'fbwc')):
+    for kind, label in (('sweep', 'sweep'), ('m2', 'm2'),
+                        ('m3b_pre', 'm3b-pre'), ('m3b', 'm3b'),
+                        ('census', 'census'), ('nxe', 'nxe'), ('fbwc', 'fbwc')):
         if w['dups'][kind] > 1:
             print(f"  !! {label}: {w['dups'][kind]} lines in one boot — the "
                   f"block prints one per boot, so the readings are not "
@@ -2382,6 +2732,29 @@ def print_wxn_boot(w):
     else:
         print(f"  m2    : no WXN-M2 line on this boot — the splitter "
               f"(`e8b11513`) is not in this build")
+
+    # M3b — printed ONLY when the wire is present, so a pre-M3b boot's output is
+    # byte-for-byte unchanged (no "absent" line, unlike the wires above).
+    if w.get('m3b_pre'):
+        f = w['m3b_pre']['fields']
+        print(f"  m3b-pre: -> {w['m3b_pre']['verdict']}"
+              f"{(' ' + w['m3b_pre']['tail']) if w['m3b_pre']['tail'] else ''}")
+        print(f"          armed={f.get('armed', '-')} would={f.get('would', '-')} "
+              f"already_ro={f.get('already_ro', '-')} wskip={f.get('wskip', '-')} "
+              f"absent={f.get('absent', '-')} huge_leaves={f.get('huge_leaves', '-')} "
+              f"huge_pages={f.get('huge_pages', '-')} "
+              f"pre_w={f.get('pre_w', '-')} would_w={f.get('would_w', '-')}")
+    if w.get('m3b'):
+        f = w['m3b']['fields']
+        print(f"  m3b   : -> {w['m3b']['verdict']}"
+              f"{(' ' + w['m3b']['tail']) if w['m3b']['tail'] else ''}")
+        print(f"          armed={f.get('armed', '-')} cleared={f.get('cleared', '-')} "
+              f"would={f.get('would', '-')} already_ro={f.get('already_ro', '-')} "
+              f"wskip={f.get('wskip', '-')} verify_w={f.get('verify_w', '-')} "
+              f"expect_w={f.get('expect_w', '-')}")
+        print(f"          fb={f.get('fb', '-')} fb_delta={f.get('fb_delta', '-')} "
+              f"fb_chk={f.get('fb_chk', '-')} tramp_w={f.get('tramp_w', '-')} "
+              f"flush={f.get('flush', '-')}")
 
     if w['census']:
         c, f = w['census'], w['census']['fields']
@@ -4805,6 +5178,190 @@ WXN_FIXTURE_XBLIND = "".join(
     if 'WXN-M2:' not in line or 'xpages=318' in line)
 
 
+# --- the M3b W-clear fixtures (GR20) ---------------------------------------
+#
+# THE DEFECT THESE EXIST AGAINST.  M3b clears W from the executable extent — the
+# most brick-capable change in the WXN arc.  A FULL clear is safe; a HALF clear
+# leaves some `.text` read-only and the rest writable, and before this arc the
+# armed capture printed a factually wrong "firmware left READ-ONLY" note for the
+# very pages M3b had cleared, with NO warning on a short clear because `<` was its
+# "explicable" direction.  A check that cannot fire on a partial clear is the
+# exact defect M3b's whole safety case rests on NOT having, so the fixtures come
+# in BOTH polarities: a healthy armed clear that stays clean, and a short clear
+# that MUST convict.
+#
+# Every line below is M3b's own wire shape (impl report §8 / metal prediction):
+# the pre-pass census `WXN-M3B-PRE ... -> CENSUS`, the clear+verify result
+# `WXN-M3B ... -> RO`, and a WXAUDIT census whose kern_WX has dropped to the
+# residue.  keep_x=317, xpages=316: the identity is kern_WX == 317 - already_ro
+# - cleared, and a full clear (cleared=316, already_ro=0) leaves kern_WX=1 (the
+# AP trampoline).
+#
+# HEALTHY: cleared==would==316, verify_w=0, wskip=0, kern_WX=1 — every check
+# passes and the false "firmware left READ-ONLY" note is SUPPRESSED.
+WXN_FIXTURE_M3B_HEALTHY = """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B1FB000 img=[0x7B1FB000,0x7B8D2000) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=1 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B1FB000,0x7B339000) xsegs=2 xpages=316 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=2 pool_used=2/16 nx_pdpt=0 nx_2m=1021 nx_pt=0 nx_4k=1219 keep_x=317 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXN-M3B-PRE: xseg=[0x7B1FB000,0x7B339000) xpages=316 wseg=[0x7B339000,0x7B8D2000) armed=1 would=316 already_ro=0 wskip=0 absent=0 huge_leaves=0 huge_pages=0 pre_w=316 would_w=316 tramp=0x8000 -> CENSUS ::
+[      ?ms] :: WXN-M3B: xseg=[0x7B1FB000,0x7B339000) armed=1 cleared=316 would=316 already_ro=0 wskip=0 absent=0 huge_leaves=0 huge_pages=0 verify_w=0 expect_w=0 pre_w=316 would_w=316 fb=0x80000000 fb_delta=0x0 fb_chk=1 tramp=0x8000 tramp_w=1 pge=0 flush=cr3-reload -> RO ::
+[      ?ms] :: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=1 (0 MiB) tables=1030 nxe=1 walk=1729kcyc l1=0 l2=65533 l3=1536 ::
+[      ?ms] :: WXPROBE cpu: cr0=0x80010033 wp=1 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=8 wp_mask=0xFF -> PASS ::
+"""
+
+# SHORT clear: the HEALTHY boot with `cleared` one below `would` (315 vs 316) and
+# the census still reading kern_WX=1.  The identity 317 - 0 - 315 = 2 no longer
+# equals 1 (BROKEN) and cleared != would — the exact half-applied state, and it
+# MUST convict (WXN-M3B-IDENTITY + WXN-M3B-SHORT), non-zero exit.  The false
+# "firmware left READ-ONLY" note must be suppressed here too.
+WXN_FIXTURE_M3B_SHORT = WXN_FIXTURE_M3B_HEALTHY.replace(
+    'armed=1 cleared=316 would=316', 'armed=1 cleared=315 would=316')
+
+# WSKIP hole (C8/C5): a writable PT_LOAD page inside the executable extent.
+# cleared==would==315 and the identity holds (317 - 0 - 315 = 2 == kern_WX=2, the
+# trampoline plus the skipped page), so ONLY the wskip WARN fires — an isolated
+# demonstration that wskip>0 is a finding in its own right, not an "explicable"
+# shortfall.
+WXN_FIXTURE_M3B_WSKIP = """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B1FB000 img=[0x7B1FB000,0x7B8D2000) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=1 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B1FB000,0x7B339000) xsegs=2 xpages=316 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=2 pool_used=2/16 nx_pdpt=0 nx_2m=1021 nx_pt=0 nx_4k=1219 keep_x=317 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXN-M3B-PRE: xseg=[0x7B1FB000,0x7B339000) xpages=316 wseg=[0x7B339000,0x7B8D2000) armed=1 would=315 already_ro=0 wskip=1 absent=0 huge_leaves=0 huge_pages=0 pre_w=315 would_w=315 tramp=0x8000 -> CENSUS ::
+[      ?ms] :: WXN-M3B: xseg=[0x7B1FB000,0x7B339000) armed=1 cleared=315 would=315 already_ro=0 wskip=1 absent=0 huge_leaves=0 huge_pages=0 verify_w=0 expect_w=0 pre_w=315 would_w=315 fb=0x80000000 fb_delta=0x0 fb_chk=1 tramp=0x8000 tramp_w=1 pge=0 flush=cr3-reload -> RO ::
+[      ?ms] :: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=2 (0 MiB) tables=1030 nxe=1 walk=1729kcyc l1=0 l2=65533 l3=1536 ::
+[      ?ms] :: WXPROBE cpu: cr0=0x80010033 wp=1 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=8 wp_mask=0xFF -> PASS ::
+"""
+
+# DISARMED: WXN-M3B -> DRYRUN, kern_WX unchanged at 319 (== keep_x == xpages+1).
+# The armed M3b path is NOT taken: the pre-M3b residue closed form, keep_x-vs-
+# kern_WX cross-check and M2/ELF derivation all run and reconcile exactly as they
+# did before this arc, and M3b is a reported no-op — proving a disarmed capture
+# keeps its existing verdict and exits OK.
+WXN_FIXTURE_M3B_DISARMED = """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B1FB000 img=[0x7B1FB000,0x7B8D2000) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=1 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B1FB000,0x7B339000) xsegs=2 xpages=318 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=2 pool_used=2/16 nx_pdpt=0 nx_2m=1021 nx_pt=0 nx_4k=1217 keep_x=319 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXN-M3B-PRE: xseg=[0x7B1FB000,0x7B339000) xpages=318 wseg=[0x7B339000,0x7B8D2000) armed=0 would=319 already_ro=0 wskip=0 absent=0 huge_leaves=0 huge_pages=0 pre_w=319 would_w=319 tramp=0x8000 -> CENSUS ::
+[      ?ms] :: WXN-M3B: xseg=[0x7B1FB000,0x7B339000) armed=0 cleared=0 would=319 already_ro=0 wskip=0 absent=0 huge_leaves=0 huge_pages=0 verify_w=319 expect_w=319 pre_w=319 would_w=319 fb=0x80000000 fb_delta=0x0 fb_chk=1 tramp=0x8000 tramp_w=1 pge=0 flush=cr3-reload -> DRYRUN ::
+[      ?ms] :: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=319 (1 MiB) tables=1030 nxe=1 walk=1729kcyc l1=0 l2=65533 l3=1536 ::
+[      ?ms] :: WXPROBE cpu: cr0=0x80010033 wp=1 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=8 wp_mask=0xFF -> PASS ::
+"""
+
+
+def _wxn_m3b_msgs(result):
+    """Joined self-check messages for the single boot in an M3b fixture."""
+    block = wxn_boot(result['boots'][0])
+    _vclean, vmsgs = wxn_verdicts(block)
+    sclean, smsgs = wxn_selfchecks(block)
+    return block, sclean, "\n".join(vmsgs + smsgs)
+
+
+def wxn_m3b_healthy_expect(result):
+    """A full, healthy armed clear: clean, and the false cause suppressed."""
+    block, sclean, joined = _wxn_m3b_msgs(result)
+    mclean, _ = wxn_m3b_checks(block)
+    return [
+        ('boots parsed', len(result['boots']), 1),
+        ('era decided ARMED from the capture',
+         wxn_m3b_era(block)[0], WXN_M3B_ARMED),
+        ('the WXN-M3B pair parsed',
+         (block['m3b'] is not None, block['m3b_pre'] is not None), (True, True)),
+        ('M3b checks are clean', mclean, True),
+        ('the whole self-check is clean', sclean, True),
+        ('the identity holds and is stated',
+         'ok   M3b identity: kern_WX=1 == keep_x=317 - already_ro=0 - cleared=316 = 1'
+         in joined, True),
+        ('cleared == would is stated', 'cleared=316 == would=316' in joined, True),
+        # THE SUPPRESSION: the factually wrong firmware note must be GONE, replaced
+        # by the M3b-aware explanation of the same shortfall.
+        ('the false "firmware left READ-ONLY" cause is SUPPRESSED',
+         'firmware left READ-ONLY' in joined, False),
+        ('the M3b-aware note names the real cause',
+         'this boot carries M3b ARMED' in joined
+         and 'NOT firmware read-only leaves' in joined, True),
+    ]
+
+
+def wxn_m3b_short_expect(result):
+    """cleared one below would: identity broken — MUST convict, false cause still
+    suppressed."""
+    block, sclean, joined = _wxn_m3b_msgs(result)
+    mclean, _ = wxn_m3b_checks(block)
+    return [
+        ('boots parsed', len(result['boots']), 1),
+        ('era decided ARMED', wxn_m3b_era(block)[0], WXN_M3B_ARMED),
+        ('M3b checks are NOT clean', mclean, False),
+        ('the whole self-check is NOT clean', sclean, False),
+        ('the identity WARN fires',
+         'WARN WXN-M3B-IDENTITY' in joined, True),
+        ('the WARN shows the broken identity',
+         'keep_x - already_ro - cleared = 317 - 0 - 315 = 2 (off by -1)' in joined,
+         True),
+        ('the short-clear WARN fires',
+         'WARN WXN-M3B-SHORT' in joined, True),
+        ('the short-clear WARN names the shortfall',
+         'cleared=315 but the pre-pass said would=316 (short by 1)' in joined,
+         True),
+        # even on a short clear, the old false cause must not reappear
+        ('the false "firmware left READ-ONLY" cause is still suppressed',
+         'firmware left READ-ONLY' in joined, False),
+    ]
+
+
+def wxn_m3b_wskip_expect(result):
+    """A writable page inside the extent: C8 fires in isolation."""
+    block, sclean, joined = _wxn_m3b_msgs(result)
+    mclean, _ = wxn_m3b_checks(block)
+    return [
+        ('boots parsed', len(result['boots']), 1),
+        ('era decided ARMED', wxn_m3b_era(block)[0], WXN_M3B_ARMED),
+        ('M3b checks are NOT clean', mclean, False),
+        ('the wskip WARN fires', 'WARN WXN-M3B-WSKIP' in joined, True),
+        ('the wskip WARN names the W^X hole',
+         'writable PT_LOAD page(s) lie INSIDE the executable extent' in joined,
+         True),
+        # C8 is isolated: the clear itself closed, so those legs stay ok
+        ('the identity still holds (wskip is isolated)',
+         'ok   M3b identity: kern_WX=2 == keep_x=317 - already_ro=0 - cleared=315 = 2'
+         in joined, True),
+        ('cleared == would still holds', 'cleared=315 == would=315' in joined, True),
+        ('no short-clear WARN (wskip is the only finding)',
+         'WXN-M3B-SHORT' in joined, False),
+    ]
+
+
+def wxn_m3b_disarmed_expect(result):
+    """DRYRUN: the pre-M3b path runs unchanged and M3b is a reported no-op."""
+    block, sclean, joined = _wxn_m3b_msgs(result)
+    mclean, _ = wxn_m3b_checks(block)
+    return [
+        ('boots parsed', len(result['boots']), 1),
+        ('era decided DISARMED', wxn_m3b_era(block)[0], WXN_M3B_DISARMED),
+        ('M3b checks are clean (no-op)', mclean, True),
+        ('the whole self-check is clean', sclean, True),
+        ('M3b is reported as a DRYRUN no-op',
+         'WXN-M3B -> DRYRUN' in joined
+         and 'A true analyzer no-op' in joined, True),
+        # the pre-M3b invariants still run and reconcile on a disarmed boot
+        ('the pre-M3b residue closed form still closes',
+         '319 == kern_WX' in joined, True),
+        ('the pre-M3b keep_x vs kern_WX still agrees',
+         'ok   M2/kern_WX: keep_x=319 == audit kern_WX=319' in joined, True),
+        ('no M3b armed WARN on a disarmed boot',
+         'WXN-M3B-IDENTITY' in joined or 'WXN-M3B-SHORT' in joined
+         or 'WXN-M3B-WSKIP' in joined, False),
+    ]
+
+
 # --- the M3a era fixture ---------------------------------------------------
 #
 # THE CONDITION THIS EXISTS FOR (M3 review, C3).  `WXN_WP_TARGET = 0xFF` made
@@ -5622,6 +6179,23 @@ def selftest_wxn():
         ('WXN: the same rise onto a boot with no WXN-M2 line — the '
          'discrimination is impossible and the conservative WARN stands',
          WXN_FIXTURE_XBLIND, wxn_xblind_expect),
+        # M3b — the W-clear, in BOTH polarities.  The healthy clear must stay
+        # clean with the false "firmware left READ-ONLY" cause suppressed; the
+        # short clear (cleared one below would, identity broken) must convict —
+        # a check that cannot fire on a partial clear is the defect M3b's whole
+        # safety case rests on NOT having.
+        ('WXN: M3b a full, HEALTHY armed W-clear — every check passes and the '
+         'false firmware-read-only cause is suppressed',
+         WXN_FIXTURE_M3B_HEALTHY, wxn_m3b_healthy_expect),
+        ('WXN: M3b a SHORT clear (cleared one below would, identity broken) — '
+         'the brick-adjacent partial apply, which MUST convict',
+         WXN_FIXTURE_M3B_SHORT, wxn_m3b_short_expect),
+        ('WXN: M3b a wskip hole (C8) — a writable page inside the executable '
+         'extent, a W^X hole that is a finding in isolation',
+         WXN_FIXTURE_M3B_WSKIP, wxn_m3b_wskip_expect),
+        ('WXN: M3b DISARMED (-> DRYRUN) — the pre-M3b path runs unchanged and '
+         'the clear is a reported no-op',
+         WXN_FIXTURE_M3B_DISARMED, wxn_m3b_disarmed_expect),
     ):
         print(f"=== selftest: {name} ===")
         result = parse_content(f'<{name}>', text)
@@ -5691,6 +6265,17 @@ def selftest_wxn():
          WXN_FIXTURE_XLOSS, EXIT_FINDING),
         ('--wxn on a rise that cannot be discriminated exits FINDING',
          WXN_FIXTURE_XBLIND, EXIT_FINDING),
+        # M3b through the real report path.  The healthy clear and the disarmed
+        # no-op must exit OK; the short clear and the wskip hole must reach the
+        # finding code — the instrument-can-fail proof M3b's safety case needs.
+        ('--wxn on a full, healthy M3b armed W-clear exits OK',
+         WXN_FIXTURE_M3B_HEALTHY, EXIT_OK),
+        ('--wxn on a SHORT M3b clear (identity broken) exits FINDING',
+         WXN_FIXTURE_M3B_SHORT, EXIT_FINDING),
+        ('--wxn on an M3b wskip hole (C8) exits FINDING',
+         WXN_FIXTURE_M3B_WSKIP, EXIT_FINDING),
+        ('--wxn on a DISARMED M3b (-> DRYRUN) no-op exits OK',
+         WXN_FIXTURE_M3B_DISARMED, EXIT_OK),
     ):
         result = parse_content(f'<{label}>', fixture)
         buf = io.StringIO()
