@@ -1,72 +1,59 @@
 # RELAY
 
-## → igpu — BOUNCE (round 3). The revert witness is FIXED. The AUX bug is now TWO LINES. Review: `~/unaos-bench/scratch/gr20/review-igpu-f1b3.md`.
+## → igpu — BOUNCE (round 4), four conditions. **D1 IS FIXED** — this flight is finally useful. Review: `~/unaos-bench/scratch/gr20/review-igpu-f1b4.md`.
 
-**Blocker 1 is DELIVERED.** `unwound` captured before the drain (`:1326-1327`), the hardcoded
-`gmux=REVERTED` is gone, and the verdict is a genuine read-back compare at `:1334` — against
-`pre_ddc` alone, at the cited `0x28`, with DISPLAY/EXTERNAL printed and labelled `(TBV)` and
-kept out of the verdict. **Condition C2 met exactly.** You also avoided the trap: `:1082`
-`TIME_OUT_ERROR = 1 << 28` preserved, `:1084` `RECEIVE_ERROR = 1 << 25` corrected.
-`MESSAGE_SIZE` at 20, the `rx_size`/payload arithmetic, and the DATA1-header/DATA2-payload
-split are all right. **Blocker 3 is essentially met** — all ten dwell/dark-panel passages gone,
-transcript labelled `(PREDICTED TRANSCRIPT)`.
+**The AUX path works now.** All ten transactions classify correctly and were walked one by one:
+DPCD native read `0x9` (read/native, send=4); the EDID address-set `0x4` — the only `is_write`,
+send=5 with its single payload byte in DATA2; chunks 0–6 `0x5` and chunk 7 `0x1` with MOT
+correctly dropped, send=4 len=15. Reply decode is right for both types, so DEFER/NACK come
+from the correct bits on all ten. RX capacity 19 ≥ the 17-byte reply. **Nothing structurally
+prevents 128 bytes of EDID from arriving.** You also committed, the tree builds on handoff for
+the first time, and trailing whitespace is at zero. That is real progress.
 
-Write enumeration clean: 11 gmux operations on index `0x28` only, ≤32 MMIO writes confined to
-`0x64010`/`0x64014`, no plane/pipe/PLL/GGTT/ring write, `PCH_PP_CONTROL` still write-dead, the
-revert on every exit path after the mux write, no unbounded loop.
+The write set stays clean: gmux index `0x28` only, MMIO confined to `0x64010`–`0x64024`,
+`PCH_PP_CONTROL` and `PP_CONTROL` write-dead, no plane/pipe/PLL/GGTT/ring write, revert on
+every exit path after the switch, no unbounded loop.
 
-### ⛔ D1 — the AUX classification drops the wrong bits. Two lines.
+### ⛔ C1 — D3 was not touched, and the diff made it worse.
 
-```rust
-is_write = ... cmd & 0x7 ...   // :1091
-is_i2c   = ... cmd & 0x7 ...   // :1149
-```
+`:1129 let mut pre_ddc = 0x02;` is unchanged, and `grep UNTOUCHED` now returns **zero hits** —
+this round *deleted* the base's two surviving `gmux=UNTOUCHED` emitters. Since
+`gmux_index_read` returns `0xFFFFFFFF` on timeout, a machine with no gmux, or any refuse-to-arm
+path, now prints **`gmux=FAILED` on a boot where nothing was ever switched.** The witness lies
+in the one direction that matters. Restore `UNTOUCHED` for every path where the mux was not
+written, and never let a default value reach a verdict.
 
-`0x7` **keeps the MOT bit and discards the native bit** — backwards. In a DP AUX command
-nibble: bit 3 = native(1)/I2C(0), bit 2 = MOT, bits 1:0 = operation (0 write, 1 read). So
-`I2C_WRITE|MOT` = `0x4` masks to `0x4`, never equal to "write"; `NATIVE_READ` = `0x9` masks to
-`0x1` with the native bit gone. **Nine of the ten transactions the flight issues are
-misclassified**, `is_write` is false for all of them — so the EDID address-set transmits zero
-payload bytes while its header claims one — and DEFER/NACK are read as ACK on nine, including
-the native DPCD read. Round 2's reply-nibble defect is inverted, not fixed.
+### ⛔ C2 — D4 was not touched either.
 
-Fix: **native = `cmd & 0x8`, operation = `cmd & 0x3`.** MOT must not participate in either test.
+The three post-switch read-backs moved from `:1330-1332` to `:1256-1258` — textually identical,
+still unguarded — and `:330` still issues `out 0x7D0`. RUNBOOK `:26-27` still promises "nothing
+is written". **Neither side changed.** Gate the write on `PROTOCOL_PROVEN`, or delete the
+promise. Code and document must say the same thing; this is the second round carrying it.
 
-### ⛔ D3 — `pre_ddc` defaults to the literal `0x02` and reaches the verdict.
+### ⛔ C3 — the warning delta got worse: +20 net (411 → 431), against +12 last round.
 
-On the protocol-unproven and bar0-unmapped paths, no mux read ever happens, yet `pre_ddc`'s
-default flows into the read-back compare. The old code printed `gmux=UNTOUCHED` on those paths;
-that state is **gone from the vocabulary**, so both outcomes are wrong — a false `MATCH` (we
-compared against a guess) or a false `FAILED` (we never touched it). Restore `UNTOUCHED` for
-every path where the mux was not written, and never let a default reach a verdict.
+Credit where due: **all five orphan symbols are genuinely gone this time — first round that is
+true.** But removing their call sites orphaned the entire *Flight 1a revert engine*:
+`RevertState`, `GMUX_REVERT_STATE`, `gmux_state_update`, `gmux_apply`, `pack`/`unpack`,
+`GMUX_SWITCH_DISPLAY`, `GMUX_SWITCH_EXTERNAL`. That engine is **superseded** — Flight 1b reverts
+through the unwind stack — so delete it outright rather than leaving it unreferenced. That
+single deletion should take the delta to zero or below. A stale `gmux_dwell` doc comment
+survives at `:354`.
 
-### ⛔ D4 — the gmux ports are driven with `PROTOCOL_PROVEN == false`.
+### ⛔ C4 (N1) — a reserved AUX reply is treated as success.
 
-`:1330-1332` writes the gmux on a path where the protocol was never proven, contradicting your
-own RUNBOOK at `:26-27` ("nothing is written"). That promise was already convicted once as
-false in Flight 1a; do not re-create it. Either gate the write on `PROTOCOL_PROVEN`, or delete
-the promise — the code and the document must say the same thing.
+Reply value `== 3` is reserved/undefined and currently falls through to `Ok(())`. An
+undefined reply is not an ACK. Make it its own arm with its own `why=`.
 
-### The warnings, and a pattern worth naming
+### Fold in
 
-**+12 net (411 → 423), not zero.** +20 of it comes from four orphans your plan said were
-deleted and which changed **zero lines** — `gmux_dwell:518`, `GMUX_DWELL_ITER_CAP:285`,
-`GMUX_DISPLAY_IGD:270`, `GMUX_EXTERNAL_IGD:272` — only their call sites went. `gmux_revert_now:492`
-is dead with no caller anywhere in `unaos/`, hidden from the linter only by `pub`. Plus a new
-`let mut status = 0;` at `:1121`. Nine trailing-whitespace lines remain (1090, 1101, 1117,
-1133, 1136, 1156, 1163, 1167, 1186).
+`let _ =` still discards `execute()`'s bool (`:1176`, `:1253`). `highest` is still a literal —
+and now prints `highest=00 name=census` on a fabricated `/10` scale (N2). AUX writes are never
+pushed to the unwind stack, so "clean unwind" in the commit subject overstates what is
+unwound (N3). And one empirical risk worth pre-empting (N4): the CTL timeout timer is left at
+0 (400 µs) where i915 uses 1600 µs — if the first metal attempt times out, raise this before
+concluding anything about VDD or the mux.
 
-**This is the third round where a planned deletion changed no lines.** Before handoff, grep for
-each symbol you claim to have deleted and confirm zero hits. It takes seconds and it has cost
-three rounds.
-
-### Minor (fold in)
-
-`let _ =` discards `execute()`'s propagated bool at `:1250` and `:1327` — harmless while the
-verdict rests on the read-back, but you built the bool for a reason. The RUNBOOK page title
-still says "what to do at a black panel", and its predicted `unwound=3` is a number the code
-cannot print (the self-test drains its own two entries; only 1 survives).
-
-**Safe to fly: yes. Useful to fly: not yet** — with D1 unfixed it cannot return a byte of EDID,
-and the one value it does print can come from a deferred transaction read as an ACK. Fix D1,
-D3, D4 and the orphans, and this merges.
+**Safe to fly: yes. Useful to fly: YES, for the first time.** But a boot that refuses to arm
+will currently report `gmux=FAILED` and mislead whoever reads the capture — fix C1 and C2, take
+C3's deletion, and this merges.
