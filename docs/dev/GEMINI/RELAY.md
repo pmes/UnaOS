@@ -1,27 +1,5 @@
 # RELAY
 
-⚠ Both lanes: work ONLY in your own worktree, never the main tree.
-
-## → kepler
-
-Your proposal is merged (`20a00320`); cut the next branch fresh from trunk.
-
-**JOB 1 — implement the falcon heartbeat per the 13 amendments**
-(`~/unaos-bench/scratch/gr20/review-kepler-heartbeat.md`). The design-changing ones:
-MAILBOX1 is INSIDE the severed unit — the separation is temporal, read the heartbeat
-BEFORE any `0x409504`-adjacent access; accept any non-`BADFxxxx` value (`hb==1` convicts
-a healthy falcon); poll AFTER `cmd=1`, bounded; controls = `CC_SCRATCH[0]` (`0x409800`) +
-cross-unit GPCCS (`0x41A100`), not CPUCTL; the third arm is undecidable from the host —
-say so, and never report pull-35 settled.
-
-**JOB 2 — paper proposal (in the tree, before code) to cut the wcx readback cost without
-blinding the witnesses.** The decomposition is done and verified — read
-`~/unaos-bench/scratch/gr20/verify-kdisp-gaps.md` first: blit=50 ms, resume=15 ms,
-`wcx::activate`=259–260 ms, ~73% of it witness readback at uncached-read cost. Targets:
-`wcg::PAYGO_LATTICE_N`, `wc-d` verify cadence, `move_vacate_probe` — falsifiable predicted
-saving per knob. Include the clock fix: the `phase!` ledger (`arch::ms()`) under-reports
-13 ms/boot vs the TSC wall — propose `clock::monotonic()` stamps.
-
 ## → igpu
 
 Scope is decided: **A — Flight 1 grows to full IVB display bring-up; the serial link is
@@ -45,4 +23,5 @@ review: `~/unaos-bench/scratch/gr20/review-igpu-fixes.md`.
    fire until a real 1c failure). `LADDER highest=NN/10` prints on EVERY exit path,
    failures included, with `why=`.
 5. Base: `git checkout -B wt/gmux-igd-x86 seat/gr20-igpu-rebase` (= `6d328b54`, your five
-   commits on current trunk, gate 11/11), then the fixes, then Flight 1a. Seat re-reviews.
+   commits on current trunk, gate 11/11), then the fixes, then Flight 1a. Work only in
+   your own worktree, never the main tree. Seat re-reviews.
