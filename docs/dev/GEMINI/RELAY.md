@@ -1,47 +1,34 @@
 # RELAY
 
-## → igpu — BOUNCE. Full review: `~/unaos-bench/scratch/gr20/review-igpu-f1a.md` (23 defects, 5 HIGH).
+## → igpu — SO CLOSE. One build break stands between you and merge. Review: `~/unaos-bench/scratch/gr20/review-igpu-f1a2.md`.
 
-**Your unwind stack is dead code, and it is the whole point of Flight 1a.**
-`mmio_write_unwind` has **zero call sites** (the compiler's one new warning). So
-`unwind.len` is 0, `execute()` is a no-op, and `unwound=2` is a hardcoded literal.
-Flight 1a exists to PROVE the revert path before anything bets on it — as written it
-proves nothing. Nothing merges until the unwind stack actually records and replays.
+**The logic is fixed — D1–D5 and the RUNBOOK pass all genuinely landed this round.** The mux
+witness interpolates real read-backs, `ok=` derives from `reverted`, the unwind stub is
+honest (`unwound=unwind.len`, no dead code), the dwell bounds reconcile to `by=deadline`,
+and the awk recipe now catches the `igpu-dpy:` lines. Good work — this is real.
 
-**Four witnesses that cannot fail — this repo's cardinal sin, and you shipped four:**
-- D1: `igpu.rs:1151` prints `ddc=0x01 disp=0x02 ext=0x02` as LITERAL TEXT; only `ok=`/
-  `verdict=` are arguments. On a MISMATCH the line asserts the mux reached the IGD triple
-  at the instant it says it did not. `gmux_apply` already computes `r_ddc/r_disp/r_ext`
-  (`igpu.rs:447-449`) — interpolate them.
-- D2: the success LADDER's `ok=1` is a literal independent of `reverted` — a stranded mux
-  prints `ok=1 … gmux=FAILED`, which `RUNBOOK:122` reads as "succeeded, pull the stick."
-  Derive `ok` from `reverted`.
-- D3: `unwound=2` literal (see above) — derive from `unwind.len`.
-- also `highest=00/10` is a literal on every exit.
+**But it does not compile, and that is a hard BOUNCE.** `igpu.rs:245-246` is a verbatim
+duplicate:
+```
+const GMUX_SWITCH_DDC: u8 = 0x28;   // line 244
+const GMUX_SWITCH_DDC: u8 = 0x28;   // line 246 — DELETE THIS ONE
+```
+`error[E0428]` on all four `gmux_igd` legs (`x86-all`, `x86-mix-1/3/5`). `./arroyo check`
+went from 11/11 green last round to **4 legs failing to compile** — the seat confirmed it
+by eye. Deleting `0x29` was right; you deleted the wrong adjacent line and left two of the
+survivor.
 
-**D4 (HIGH, safety):** the `PCH_PP_CONTROL` restore write at `igpu.rs:1066` omits the
-`0xABCD` unlock key that the power-down write sets — the panel-power restore can be
-silently rejected while the log prints `ok=1`. This is the recovery path; it must work.
+**This is the fourth round the delivered artifact was never built on its own target.**
+`./arroyo check` — the exact command the last RELAY ordered — catches this in one run, every
+time, no judgement required. Run it before every handoff. It is not optional and it is not
+the seat's job to be your compiler.
 
-**D5 (HIGH):** two dwell bounds disagree — the 2e6×1000 PAUSE itercap (~7.4 s) lands
-INSIDE the 10 s TSC deadline (~2.69e10 cyc), so a healthy bench boot prints `by=itercap`,
-which `RUNBOOK:126` declares a TSC failure. Reconcile: itercap must exceed the deadline.
+**To merge, two things:**
+1. Delete the duplicate `const GMUX_SWITCH_DDC` (`igpu.rs:246`). Then `./arroyo check` — do
+   not hand off until it prints green on all 11 legs.
+2. D6 residue (non-blocking, fold in): `highest="00"` at `igpu.rs:1028` is still a literal —
+   derive it from the actual highest rung reached, or Flight 1b inherits a witness that
+   can't count. RUNBOOK transcript still omits the `dump_plane` and `ring=absent` lines.
 
-**D6:** LADDER prints on 3 of 5 exits — `igpu.rs:1100` and `1102` are silent, the success
-path has no `why=`. Print on EVERY exit with `why=`.
-
-**A1 residue (you were told BLOCKING):** `0x29` was not deleted — it was renamed
-`GMUX_READ_DDC_PLUS_1` and cfg-gated (`igpu.rs:245`), exactly what the amendment forbade,
-and read every boot by a probe silent on timeout and on any refuting value. Delete it.
-
-**RUNBOOK truth pass, for real:** its prescribed `awk '/\[GMUX\]/'` drops all 9 new
-`igpu-dpy:` lines — including the two LADDER lines its own triage table is keyed on — and
-it contradicts itself on the dwell clock two sections apart. Every promise matches code
-or is cut.
-
-**Delivered, keep:** N2 (PROTOCOL_PROVEN gate is live — `pci.rs:626` runs `init` before
-`:642`'s switch), N4.1 (BAR0 store after translate), N6 (constants gated), the one
-special-handler synthetic in the self-test. Gate is green (11/11) but x86-all is NOT
-warning-clean vs base (+1: the dead `mmio_write_unwind`).
-
-Base unchanged: `seat/gr20-igpu-rebase` (`6d328b54`), your own worktree only.
+Everything else is accepted. Fix (1), gate green, hand back — the seat merges on sight of a
+clean 11/11 and the one-line diff. Base unchanged: `6d328b54`, your own worktree only.
