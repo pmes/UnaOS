@@ -31,15 +31,27 @@ This ensures the ledger survives a wedged boot.
 *Clarification on Ledger Mechanism*: The wrappers detect a violation and make it visible in every capture. They do not prevent a developer from bypassing them by calling `mmio_read` directly, but they guarantee that compliant calls will be strictly ordered and recorded. GPCCS (`0x41A000`) is explicitly out of scope for the FECS ledger, and `0x409500` will continue to be read independently.
 
 ### Ledger Output on Healthy vs Poisoned Boot
-*(Amended after the ECHO/POKE split — `wt/kepler-poke-x86` moved the `0x409504` read into the
-terminal POKE image, so the read now legitimately occurs once, at the end, on every boot.)*
-- **Healthy Boot**: `504_read_touched=true` with `504_read_idx` at the **terminal** index (the
-  POKE image's single `iord`). `504_write_touched=true`, `504_write_idx=N` (the terminal poke).
-  A healthy boot is identified by the read being terminal, not by its absence.
-- **Poisoned Boot**: `504_read_idx=M` with M **earlier than the terminal index** — an illegal
-  read occurred earlier in the boot — explaining any subsequent `BADF1000` faults.
-- Note both pokes (the lane's falcon POKE and trunk's terminal host poke) touch `0x409504` in
-  one boot; a hang after the write is attributable to either until read separately.
+*(Amended twice. The first amendment, written before the instrument flew, said a healthy boot
+shows `504_read_idx` at the terminal index. **Boot Z proved that wrong**, and the correct
+reading is below — the two fields have different sources and only one of them can see the
+falcon.)*
+
+**The two fields are not two views of one event.** `FECS_504_READ_INDEX` is set only inside
+`fecs_read`, so it records **host** reads exclusively. `FECS_504_READ_TOUCHED` is additionally
+stored by hand at `kepler.rs:1935`, immediately before the falcon core is armed, precisely
+because a falcon `iord` is invisible to the host-side wrapper. So:
+
+- **Healthy Boot (post-split): `504_read_touched=true` with `504_read_idx=none`.** That pair
+  means "the falcon touched `0x409504`, and no host read did" — which is exactly what the
+  ECHO/POKE split was built to achieve. Boot Z (metal, 2026-08-06) read
+  `accesses=528 first_offset=00002390 504_read_touched=true 504_read_idx=none
+  504_write_touched=true 504_write_idx=527`.
+- **Poisoned Boot: ANY numeric `504_read_idx`.** A number means a *host* read of `0x409504`
+  occurred at that access index — the defect pull-35 exists to catch. The index is not a
+  healthy value at any position, terminal or otherwise.
+- `504_write_idx=527` is the terminal host poke, and `accesses=528` places it last. Both the
+  falcon POKE and the terminal host poke touch `0x409504` in one boot, so a hang after the
+  write is attributable to either until they are read separately.
 
 ### Falcon-Side Read Outcome Table
 By seeding `CC_SCRATCH[1]` with a non-zero sentinel (`0xA5A50000`), the `host-ack` reading (`ack=...`) distinguishes four distinct states:
