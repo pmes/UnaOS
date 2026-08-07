@@ -31,8 +31,15 @@ This ensures the ledger survives a wedged boot.
 *Clarification on Ledger Mechanism*: The wrappers detect a violation and make it visible in every capture. They do not prevent a developer from bypassing them by calling `mmio_read` directly, but they guarantee that compliant calls will be strictly ordered and recorded. GPCCS (`0x41A000`) is explicitly out of scope for the FECS ledger, and `0x409500` will continue to be read independently.
 
 ### Ledger Output on Healthy vs Poisoned Boot
-- **Healthy Boot**: `504_read_touched=false`, `504_read_idx=none`. `504_write_touched=true`, `504_write_idx=N` (where N is the very last index, representing the terminal poke).
-- **Poisoned Boot**: `504_read_touched=true`, `504_read_idx=M` (where M < N, indicating an illegal read occurred earlier in the boot), explaining any subsequent `BADF1000` faults.
+*(Amended after the ECHO/POKE split — `wt/kepler-poke-x86` moved the `0x409504` read into the
+terminal POKE image, so the read now legitimately occurs once, at the end, on every boot.)*
+- **Healthy Boot**: `504_read_touched=true` with `504_read_idx` at the **terminal** index (the
+  POKE image's single `iord`). `504_write_touched=true`, `504_write_idx=N` (the terminal poke).
+  A healthy boot is identified by the read being terminal, not by its absence.
+- **Poisoned Boot**: `504_read_idx=M` with M **earlier than the terminal index** — an illegal
+  read occurred earlier in the boot — explaining any subsequent `BADF1000` faults.
+- Note both pokes (the lane's falcon POKE and trunk's terminal host poke) touch `0x409504` in
+  one boot; a hang after the write is attributable to either until read separately.
 
 ### Falcon-Side Read Outcome Table
 By seeding `CC_SCRATCH[1]` with a non-zero sentinel (`0xA5A50000`), the `host-ack` reading (`ack=...`) distinguishes four distinct states:
