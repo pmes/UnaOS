@@ -94,7 +94,7 @@ A successful run reads roughly (PREDICTED TRANSCRIPT):
 ```
 :: igpu: PROTOCOL PROVEN (version plausible)
 :: igpu-dpy: pre-switch state DDC=0x02 DISP=0x03 EXT=0x03
-:: igpu-dpy: rung=00 name=census ok=0 bdsm=... ggc=... ggtt0=... ggtt1=... aux_ctl=... frmcnt=...
+:: igpu-dpy: rung=00 name=census ok=1 bdsm=... ggc=... ggtt0=... ggtt1=... aux_ctl=... frmcnt=...
 :: igpu: [GMUX] running Unwind stack self-test
 :: igpu: [GMUX] Unwind stack MMIO self-test passed
 :: igpu: [GMUX] Unwind stack gmux-dispatch=REACHED (Gmux restore path executed without faulting, not implying restore verified)
@@ -104,15 +104,15 @@ A successful run reads roughly (PREDICTED TRANSCRIPT):
 :: igpu: [AUX] 00: 00 FF FF FF FF FF FF 00 ...
 ...
 :: igpu: [GMUX] revert read-back: DDC=0x02 DISP=0x03 (TBV) EXT=0x03 (TBV)
-:: igpu-dpy: LADDER highest=05/10 name=edid ok=1 unwound=2 gmux=MATCH why=none elapsed_ms=...
+:: igpu-dpy: LADDER highest=05/10 name=end ok=1 unwound=1 gmux=MATCH why=none elapsed_ms=...
 ```
 
 | Line you see | What it means | What to do |
 |---|---|---|
-| `LADDER highest=05/10 name=edid ok=1` | The whole experiment succeeded. The mux write lands; EDID was read. | Nothing. Pull the stick. |
+| `LADDER highest=05/10 name=end ok=1` | The whole experiment succeeded. The mux write lands; EDID was read. | Nothing. Pull the stick. |
 | `REFUSED: pre-switch state is not fully DIS` | The gmux was not in the expected discrete state. **No write was issued**. | Safe. Power cycle and try again. |
 | `LADDER ... gmux=FAILED` | The mux was **not proven** back. | Power cycle. Report the whole `[GMUX]` block. |
-| `LADDER ... gmux=UNTOUCHED` | The harness aborted before switching, touching no registers and attempting no revert. | Safe. Power cycle if needed or pull stick. |
+| `LADDER ... gmux=UNTOUCHED` | The harness aborted before switching the mux; the DDC channel was never moved to the IGD. | Safe. Power cycle if needed or pull stick. |
 | No `[GMUX]` lines at all on an armed build | The probe never reached the arm, or the build was not actually armed. | Check the boot banner really ends `...,unaos_ivb,gmux_igd`. |
 
 ---
