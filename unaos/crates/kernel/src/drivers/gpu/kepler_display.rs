@@ -40,6 +40,17 @@ pub unsafe fn takeover_display(
 ) -> Option<usize> {
     serial_println!(":: kdisp: begin-trace ::");
 
+    // Note: Five early return paths exist in this function. If an early return
+    // fires, the inner phase sum will not match the outer kdisp_takeover delta.
+    let mut t_last = crate::arch::ms();
+    macro_rules! kdisp_phase {
+        ($name:expr) => {
+            let t_now = crate::arch::ms();
+            serial_println!(":: kdisp: inner phase={} d={} ::", $name, t_now.wrapping_sub(t_last));
+            t_last = t_now;
+        }
+    }
+
     // ── PDISPLAY CAPS (0x610000) — version/class sanity check ──────────
     let caps = mmio_read(bar0, regs::NV_PDISPLAY_BASE + 0x0000);
     let version = caps & 0xFFFF;
@@ -195,6 +206,7 @@ pub unsafe fn takeover_display(
             for _ in 0..2_000_000 { core::hint::spin_loop(); }
         }
     }
+    kdisp_phase!("evo_core_passes");
 
     // Milestone 2: Known-value scan
     let mut hits = 0;
@@ -223,6 +235,7 @@ pub unsafe fn takeover_display(
     }
     let capped = if hits > 64 { "true" } else { "false" };
     serial_println!(":: kdisp: evo-scan done range=610000-613FFC hits={} capped={} ::", hits, capped);
+    kdisp_phase!("evo_scan");
 
     // ── Phase 2: Assembly Write + UPDATE Latch (Pull 11) ────────────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
@@ -324,6 +337,9 @@ pub unsafe fn takeover_display(
     let total_bytes = expected_height * pitch_bytes;
 
     // Step 1: Prepare surf2 (linear fill, placement-model probe)
+
+    kdisp_phase!("pre_blit_recon");
+
     for y in 0..expected_height {
         let band_idx = y / 16;
         // Band 0 gets a colour no other band uses, so "our row 0" is
@@ -380,6 +396,8 @@ pub unsafe fn takeover_display(
             core::ptr::write_volatile(target_ptr, final_color);
         }
     }
+    kdisp_phase!("blit");
+
     serial_println!(":: kdisp: fb-draw base={:08X} pitch={} rows={} bytes={:08X} ::", gop_vram_offset, pitch_bytes, expected_height, total_bytes);
 
     // Overlap check (intentional for fb-draw)
@@ -425,6 +443,14 @@ pub unsafe fn takeover_display(
         serial_println!(":: kdisp: fb-draw hold end ::");
     }
 
+    #[cfg(feature = "nvidia-kepler-kdisp-hold")]
+    let hold_state = "ON";
+    #[cfg(not(feature = "nvidia-kepler-kdisp-hold"))]
+    let hold_state = "OFF";
+
+    kdisp_phase!("nvidia_kepler_kdisp_hold");
+    serial_println!(":: kdisp: inner phase kdisp_hold cfg_hold={} ::", hold_state);
+
     // Pull 20: Draw console-like glyph blocks using the true 16384 pitch
     for y in 64..72 {
         let row_base = y * pitch_bytes;
@@ -439,6 +465,7 @@ pub unsafe fn takeover_display(
     serial_println!(":: kdisp: fbcon-probe drawn rows=8 ::");
 
     serial_println!(":: kdisp: fb-draw done ::");
+    kdisp_phase!("glyph_draw");
 
     // CONSOLE-ON-PANEL seam. The calibration pattern above has been drawn, held for its 5 s photo
     // window and probed; the surface is now free. Hand it to the kernel console: fbcon clears the
@@ -447,6 +474,7 @@ pub unsafe fn takeover_display(
     // this line — the draw, the hold, the register dumps — is untouched.
     let repainted = crate::video::fbcon::panel_console_resume();
     serial_println!(":: kdisp: console-repaint rows={} ::", repainted);
+    kdisp_phase!("panel_console_resume");
 
     // WC-X86 seam. Strictly AFTER the console resume above, and for the same reason the console
     // resume is strictly after the calibration draw: this is the first line at which the panel is
@@ -457,6 +485,15 @@ pub unsafe fn takeover_display(
     #[cfg(feature = "wc")]
     crate::video::wcx::activate();
 
+    #[cfg(feature = "wc")]
+    let wcx_state = "ON";
+    #[cfg(not(feature = "wc"))]
+    let wcx_state = "OFF";
+
+    kdisp_phase!("wcx_activate");
+    serial_println!(":: kdisp: inner phase wcx_activate cfg_wc={} ::", wcx_state);
+
+    let _ = t_last;
     // Completed fb-draw cycle: return the gop pointer so the late recap
     // (kepler.rs, printed inside the FTDI-ring window) can prove this leg ran.
     Some(gop_vram_offset)
