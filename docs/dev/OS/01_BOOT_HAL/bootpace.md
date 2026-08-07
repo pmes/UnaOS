@@ -2272,3 +2272,58 @@ takeover span by a systematic **13 ms** on both boots (342/344 ms wall vs 329/33
 agreeing with each other, not a wall-time validation.
 
 Read this capture with `awk '/pattern/'` — **not** `grep`.
+
+## §10l — GR20 Boot AB: two predictions refuted, and both refutations were worth more than the confirmations (2026-08-07)
+
+Four passengers, four predictions written before the flight. Two held, two were refuted —
+and the instruments earned their keep by saying NO. `gui=2218` (+1 ms, noise; third
+consecutive 2217±1), `hz=2693854380`, slice `~/unaos-bench/scratch/gr20/bootAB-slice.log`.
+Gates: mbench **28/28, 0 forbidden**; `serial-analyzer --wxn` **exit 0**.
+
+**REFUTED 1 — the APs' CR0 is not the BSP's.** Predicted eight identical `0x80010013`.
+Metal:
+
+```
+:: WXAUDIT-CORES: n=8 cr0=[0x80010013,0x80010011,0x80010011,0x80010011,
+                           0x80010011,0x80010011,0x80010011,0x80010011] wp=0xFF nxe=0xFF ::
+```
+
+Every AP is `0x80010011` — **bit 1 (`CR0.MP`, Monitor Coprocessor) is set on the BSP and
+clear on all seven APs.** The BSP inherits its CR0 from firmware; the APs build theirs in
+the trampoline, and MP was never part of it. WP (bit 16) and NXE are correct on all eight,
+so M3a is unaffected and `wp_mask=0xFF` is honest — but this is a real control-register
+divergence that no instrument could see before this line existed, found on its first
+flight. Whether MP matters depends on whether anything relies on `WAIT`/`FWAIT` trapping
+under `TS`; it belongs to whoever next touches AP bring-up. **RESIDUAL-1 is closed on
+metal:** the analyzer now confirms CR0.WP from each core's own register, AP bits included.
+
+**REFUTED 2 — the panel's EDID is NOT reachable through the bootloader on this machine.**
+Predicted `present=1 hdr=OK sum=OK native=2880x1800`. Metal printed:
+
+```
+:: video: edid present=0 hdr=- sum=- native=- len=0 ::
+```
+
+The carry-through is implemented correctly; there is simply nothing to carry. The rMBP's
+UEFI does **not** publish `EFI_EDID_ACTIVE_PROTOCOL` / `EFI_EDID_DISCOVERED_PROTOCOL` on
+the GOP handle — the same absence OVMF shows, so QEMU was not the unrepresentative case
+here, it was the accurate one. **Consequence for the iGPU display ladder: rung 3
+(DPA AUX → DPCD → EDID) is now MANDATORY and is the only available source of panel
+timings and link rate.** Flight 1c cannot be built on a bootloader-supplied EDID. The
+firmware's own buffer dies at `exit_boot_services`, so no later path exists either.
+
+**HELD 1 — the fatal-fault serial wire is silent when nothing faults.** No new line, as
+predicted; the boot is byte-identical to Boot AA in that respect. Its value is proven in
+QEMU A/B (with the wire a contended fatal `#PF` reaches serial; without it the log ends
+silent and the scan reads the boot as clean), and metal confirms it costs a healthy boot
+nothing.
+
+**HELD 2 — the W^X floor.** `kern_WX=306 == keep_x=306 == xpages+1 (305+1)` — the identity
+intact, so the drop from Boot AA's 319 is code *shrink* with total coverage, exactly the
+discriminator `601477d3` taught the analyzer. `CFU2-WGATE -> PASS` five arms,
+`cr0=0x0000000080010013 wp=1`, `WXAUDIT-NXE ... wp=8 wp_mask=0xFF -> PASS`.
+
+igpu Flight 1a rode merged but **not armed** (`gmux_igd` off) — this was regression media,
+not a display flight, and `igpu-blt: ring=absent` is unchanged.
+
+Read this capture with `awk '/pattern/'` — **not** `grep`.
