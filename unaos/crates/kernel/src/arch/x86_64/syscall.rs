@@ -15891,6 +15891,18 @@ fn u9x_read16(fc: u32, size: u32, off: u32) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// Bounded storage-readiness wait for the file-lifecycle battery (U9x -> U10 -> U10c -> U10d -> U11x ->
+/// CFU/CFU2-WGATE -> U11m2). The battery is chained SYNCHRONOUSLY off the storage-RELAXED U7x/U8x demo, so it
+/// can reach its storage gate BEFORE the FAT/block device has mounted: on metal the SDHC device is enumerated
+/// ~2.2 s but `block::info()` (the mounted device) settles ~12.6 s — within ~100 ms of the point the demo
+/// chain hits the gate. The old instant `is_none() -> return` could not tell "no block device (headless — skip
+/// cleanly)" from "not mounted YET (metal — must wait)" and silently dropped the whole battery, CFU2-WGATE
+/// included, on any late mount. This bound matches `u10x_run`'s primary `ticks()+5000` witness-wait idiom
+/// (1 calibrated tick == 1 ms); storage arrives ~100 ms after the gate so it is pure margin. On a genuinely
+/// device-less run the bound EXPIRES and the launcher skips cleanly — no hang, no panic — preserving the
+/// storage-independent control path, now WITH a witness rather than a silent drop.
+const FLC_STORAGE_WAIT_MS: u64 = 5000;
+
 /// U9x launcher + verdict (M2 — real disk write-back) — chained off `u8x_launcher` in program order. Flow:
 /// one-shot; skip silently with no block device (the control-path discipline). PRE-FLIGHT (gated on
 /// `HELLO_STAGED`, the BSP's FAT-present signal) captures SCRATCH.BIN's chain head + size + the pre-image bytes
@@ -15910,12 +15922,40 @@ fn u9x_read16(fc: u32, size: u32, off: u32) -> Option<[u8; 16]> {
 /// is the FIRST concurrent AP-side xHCI BOT I/O in the tree; the pump is BOUNDED (a 2000-iter timeout -> `Io`),
 /// so a failure is a LOUD verdict FAIL (`flushed=false`), never a hang — `test-fat sf` is its empirical proof.
 fn u9x_launcher(demo_cpu: usize) {
-    // One-shot (reached once via the U8x chain; guard defensively anyway).
     static DONE: AtomicBool = AtomicBool::new(false);
+    // Storage-readiness BOUNDED WAIT — resolved BEFORE the one-shot DONE swap below AND before the u10x
+    // chain-on (fall-through at the end of this fn), so the skip decision is made against a SETTLED storage
+    // state and the one-shot is never burned on a "not ready YET." (See `FLC_STORAGE_WAIT_MS` for the race.)
+    // Engages only when storage is absent at entry; when `block::info()` is already `Some` (the common metal /
+    // QEMU case) the whole block is skipped and the log is byte-for-byte unchanged. Reuses `u10x_run`'s
+    // `ticks()+N` witness-wait idiom.
+    if crate::drivers::block::info().is_none() {
+        serial_println!(
+            ":: U9x: block device not ready at the file-lifecycle gate — waiting (bounded {} ms) for storage ::",
+            FLC_STORAGE_WAIT_MS
+        );
+        let deadline = crate::arch::ticks() + FLC_STORAGE_WAIT_MS;
+        while crate::drivers::block::info().is_none() && crate::arch::ticks() < deadline {
+            crate::arch::sched::yield_now();
+        }
+        if crate::drivers::block::info().is_some() {
+            serial_println!(
+                ":: U9x: storage arrived during the bounded wait — file-lifecycle battery (U9x..CFU2-WGATE..U11m2) proceeding ::"
+            );
+        } else {
+            serial_println!(
+                ":: U9x: storage bound expired ({} ms) — no block device, file-lifecycle battery skipped cleanly (device-less control path) ::",
+                FLC_STORAGE_WAIT_MS
+            );
+        }
+    }
+    // One-shot (reached once via the U8x chain; guard defensively anyway).
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    // No block device -> keep the no-storage control path free of demo lines (mirrors every prior gate).
+    // Settled decision: still no block device -> keep the no-storage control path free of demo lines (mirrors
+    // every prior gate). The bounded wait above already gave storage its chance to appear, so on a device-less
+    // run we return here WITHOUT chaining u10x (exactly as before) — the storage-independent control path.
     if crate::drivers::block::info().is_none() {
         return;
     }
@@ -17616,6 +17656,31 @@ fn s6_witness_launcher(demo_cpu: usize) {
 /// returning, so no held op or pending name can strand for the boot.
 fn u11m2_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
+    // Storage-readiness BOUNDED WAIT (the `u9x_launcher` shape) — resolved BEFORE the DONE swap. Defence in
+    // depth: in the normal chain u11m2 is reached AFTER u9x_launcher's own wait has already settled storage, so
+    // `block::info()` is already `Some` here and this whole block is skipped (log unchanged). It engages only if
+    // u11m2 is ever reached with storage still absent, and — like u9x — never burns the one-shot on a "not
+    // ready YET." This guards CFU2-WGATE (the CFU-2 W^X write-validation witness at cfu2_wgate_witness()).
+    if crate::drivers::block::info().is_none() {
+        serial_println!(
+            ":: U11m2: block device not ready at the CFU/unlink gate — waiting (bounded {} ms) for storage ::",
+            FLC_STORAGE_WAIT_MS
+        );
+        let deadline = crate::arch::ticks() + FLC_STORAGE_WAIT_MS;
+        while crate::drivers::block::info().is_none() && crate::arch::ticks() < deadline {
+            crate::arch::sched::yield_now();
+        }
+        if crate::drivers::block::info().is_some() {
+            serial_println!(
+                ":: U11m2: storage arrived during the bounded wait — CFU2-WGATE + cross-process unlink battery proceeding ::"
+            );
+        } else {
+            serial_println!(
+                ":: U11m2: storage bound expired ({} ms) — no block device, CFU/unlink battery skipped cleanly (device-less control path) ::",
+                FLC_STORAGE_WAIT_MS
+            );
+        }
+    }
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
