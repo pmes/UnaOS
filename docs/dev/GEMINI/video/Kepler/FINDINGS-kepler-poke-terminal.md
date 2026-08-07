@@ -6,9 +6,11 @@ out of scope.
 
 ---
 
-## 1. The runlist is submitted with beacon words in it — OUT OF SCOPE, named in the brief
+## 1. The runlist is submitted with beacon words in it — RESOLVED ON TRUNK
 
 **Severity: high. This one invalidates the runlist leg.**
+
+*Fixed on trunk by a470ba16 (write_runlist() + the 8-word runlist-rebuild scan) before the branch merged.*
 
 `kepler.rs` builds three runlist entries:
 

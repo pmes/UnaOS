@@ -767,6 +767,7 @@ pub fn init(gpu: &GpuInfo) {
             if MIRROR_HDR_DENSE { serial_println!(":: kepler: mirror-hdr pre off={:03X} val={:08X} ::", offset, val); }
         }
         serial_println!(":: kepler: mirror-hdr pre done rows=256 ::");
+        phase!("pmc_vram_init");
 
         let fb_offset = crate::drivers::gpu::kepler_display::takeover_display(
             gpu, bar0, &mut vram_allocator, &mut kdisp_trace,
@@ -774,6 +775,7 @@ pub fn init(gpu: &GpuInfo) {
         serial_println!(":: kdisp: landed trace [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] ::",
             kdisp_trace[0], kdisp_trace[1], kdisp_trace[2], kdisp_trace[3],
             kdisp_trace[4], kdisp_trace[5], kdisp_trace[6]);
+        phase!("kdisp_takeover");
 
         // 7. PGRAPH 2D/3D Engine Init (Placeholder)
         // Kepler requires Falcon microcode to fully initialize PGRAPH.
@@ -826,6 +828,7 @@ pub fn init(gpu: &GpuInfo) {
                                             core::ptr::write_volatile((bar1 + fence_off + i * 4) as *mut u32, 0);
                                         }
                                     }
+                                    phase!("pfifo_alloc_zero");
 
                                     let chan_id = 1;
 
@@ -934,6 +937,7 @@ pub fn init(gpu: &GpuInfo) {
                                     if !diff_found {
                                         serial_println!(":: kepler: latch-delta none ::");
                                     }
+                                    phase!("runlist_and_pass0");
 
                                     // Plant Beacons
                                     let pattern = [
@@ -1111,7 +1115,7 @@ pub fn init(gpu: &GpuInfo) {
                                         }
                                         rows_pass1 += 1;
                                     }
-                                    phase!("mmio_bringup");
+                                    phase!("plant_and_pass1");
                                     serial_println!(":: kepler: mirror-hdr pass1 done rows={} ::", rows_pass1);
                                     if beacons_seen == 0 {
                                         serial_println!(":: kepler: beacon none-seen ::");
