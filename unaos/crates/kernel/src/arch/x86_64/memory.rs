@@ -1859,36 +1859,10 @@ pub fn wxn_pdpt_sweep() {
         }
     });
 
-    // D6 — the flush, and the branch on the wire. A PDPT-entry change invalidates a whole GiB of
-    // translations, so `invlpg` at 4 KiB stride is not viable (262144 instructions per GiB). A CR3
-    // reload flushes everything EXCEPT global entries, and `memory.rs` records that the firmware's
-    // huge identity leaves may carry the Global bit — so if PGE is set we clear-and-restore CR4.PGE,
-    // which does evict globals. We never *set* PGE: on a machine where firmware left it clear (the
-    // rMBP — Boot V, `pge=0`) no global entry can exist, a CR3 reload is a complete flush, and
-    // setting PGE would be a semantic change masquerading as one.
-    //
-    // Worth stating because it bounds the whole risk: every write above is a RESTRICTION with an
-    // unchanged output address. A missed flush can therefore only leave the protection vacuous on a
-    // stale entry — it can never fault and can never mistranslate.
-    if pge {
-        // SAFETY: clearing then restoring CR4.PGE flushes the entire TLB including global entries;
-        // CR4 ends bit-identical to how we found it. Interrupts are still masked (pre-`sti`).
-        unsafe {
-            Cr4::write_raw(cr4 & !CR4_PGE);
-            Cr4::write_raw(cr4);
-        }
-    } else {
-        // SAFETY: reloading CR3 with its own value is architecturally a full non-global TLB flush;
-        // with PGE clear there are no global entries to miss.
-        unsafe {
-            core::arch::asm!(
-                "mov {t}, cr3",
-                "mov cr3, {t}",
-                t = out(reg) _,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
+    // D6 — the flush, and the branch on the wire. See `wxn_flush_tlb`: the body moved there verbatim
+    // when M2 needed the identical branch, so both milestones flush the same way and the `flush=`
+    // token on both lines names one implementation.
+    wxn_flush_tlb(pge, cr4);
 
     // F6 — the verdict. Every other WXN instrument in this arc carries one; without it a sweep that
     // wrote NOTHING prints a line that reads entirely normal. The concrete way that happens: if the
@@ -2010,6 +1984,711 @@ pub fn wxn_pdpt_sweep() {
             fb, skip_fb_lock, skip_fb_base, skip_fb_walk
         );
     }
+
+    // M2 — the splitter. Runs LAST, after the M1 verdict line and after the FBWC interlock has been
+    // cashed, so every M1 instrument above measures exactly the M1 sweep and nothing else: the
+    // interlock's "the sweep creates no table and destroys none" level assert stays literally true of
+    // the window it brackets. M2 carries its own fb interlock (`fb_delta=` on its own line) and its
+    // own `leaf_is_fb_wc` refusal, and `wx_probe_report` — which runs after BOTH — is the post-M2
+    // leaf readback for every named address.
+    wxn_split_stage(&spare, img_lo, img_hi, pge, cr4);
+}
+
+// =================================================================================================
+// WXN-x86 M2 — the huge-leaf splitter, the static page-table pool, and NX inside the spared GiBs.
+// -------------------------------------------------------------------------------------------------
+// WHAT M1 LEFT. The PDPT sweep retired every 1 GiB region except the one or two it had to spare: the
+// kernel image's, and the low GiB holding the AP trampoline. Those spared GiBs are still RWX in full
+// — 1535 leaves on metal (Boot W: GiB0 = 511x2M + 512x4K, GiB1 = 512x2M), 4089 on QEMU (all of GiB0).
+// M2 shrinks that residue to the pages that genuinely need X.
+//
+// WHAT "NEEDS X", and why the obvious answer is WRONG on this kernel. Three readings were available:
+//   (A) the whole image extent `[img_lo, img_hi)` — simplest, leaves `.data`/`.bss` executable;
+//   (B) the union of the image's `PF_X` `PT_LOAD` segments — `.text` and nothing else; or
+//   (C) the union of the image's NON-WRITABLE `PT_LOAD` segments — `.rodata` and `.text`.
+// (B) is what the design's M2 row assumes (`kern_WX` = `.text` pages + 1 ~ 253) and it is what this
+// code shipped first. **It was falsified on the first boot**, and the falsification is the most
+// valuable thing this milestone produced:
+//
+//     EXCEPTION: PAGE FAULT  err=PROTECTION_VIOLATION|INSTRUCTION_FETCH  rip=0x3D646C68
+//
+// — image offset 0x27C68, which `readelf -sW` names **`switch_context`**, sitting inside `.rodata`.
+// The cause is one missing directive: `smp.rs`'s `global_asm!` opens `.section .rodata` for the AP
+// trampoline bytes and never returns to `.text`. Rust concatenates every `global_asm!` in a crate into
+// ONE assembly unit, so the section state leaks — `switch_context`, assembled after it, lands in
+// `.rodata` and is EXECUTED IN PLACE at ring 0 on every task switch. `readelf` confirms the two are
+// adjacent: `ap_trampoline_end` and `switch_context` share the address 0x27C68.
+//
+// So `PF_X` is not the bit that tells the truth about this image; `PF_W` is. **This code implements
+// (C)**: X is kept exactly where the image declares the pages NOT writable. That is:
+//   * correct by measurement rather than by assumption — it covers `.rodata`, which this boot proved
+//     holds live ring-0 code, and it would cover any future `.section` leak of the same shape;
+//   * still a real confinement — the `.data`/`.bss`/`.got` LOADs (5.9 MiB, the bulk of the image, and
+//     the only part of it that is genuinely writable) go NX, along with all 126 other GiBs from M1; and
+//   * honest about W^X: a page the ELF itself marks writable can never legitimately hold code we
+//     execute in place, so `PF_W` is exactly the discriminator the property is about.
+// It is NOT the end state. The `.rodata` leak is a real defect and `switch_context` belongs in
+// `.text`; fixing it lives in `smp.rs`, outside this arc's file. Until it is fixed, M3 cannot make
+// `.text` read-only-executable and call the job done — it would have to do the same for `.rodata`,
+// which is the wrong shape. **Flagged for the next arc, with the symbol named.**
+//
+// The genuinely risky flip — clearing W on `.text`, where a single runtime writer to a `.text` data
+// symbol turns into a `#PF` — is untouched and stays M3's, alone in its own commit, exactly as the
+// design requires for a clean bisect. M2 changes X only. `.text` is still writable here.
+// The one new failure mode this introduces is a wrong extent marking the running `.text` NX. That is
+// closed the same way M1 closed wrong image bounds: an assert that this very function's address lies
+// inside the derived extent, evaluated BEFORE a single entry is written.
+//
+// THE POOL, and why there is one. M2 runs where M1 runs — `arch::init`, before `sti`, ~60 lines
+// before `kernel_main` creates the heap — so `alloc_page_frame` does not exist yet. The frames come
+// from `.bss` through the same identity trick the ring-3 slot tables use (`table_pa`: an identity-
+// mapped `.bss` page's address IS its physical address). Sizing, derived rather than guessed:
+//   * spared GiBs <= `WXN_MAX_SPARE` = 4 (M1 refuses above that), so at most 4 of them can be 1 GiB
+//     leaves needing a PD to demote into                                              => <= 4 PDs
+//   * PTs are needed only for the 2 MiB leaves that STRADDLE the keep set — a leaf wholly inside it
+//     keeps X untouched and a leaf wholly outside it takes one NX bit at the PD level. The keep set
+//     is two intervals, so at most 2 leaves straddle per interval boundary: the `PF_X` extent
+//     contributes `ceil(|.text| / 2 MiB) + 1` and the trampoline page contributes 1. With a 1 MiB
+//     `.text` that is 2 + 1 = 3; budgeting for a 16 MiB `.text` gives 9 + 1  => <= 10 PTs
+//   * total <= 14. `WXN_POOL_CAP` = 16 is that bound plus slack, and costs 64 KiB of `.bss` —
+//     1.5% of what `SLOT_BACKING` already spends.
+// Exhaustion is FAIL-CLOSED and it is decided BEFORE the edit window opens: a read-only pre-pass
+// counts the exact number of tables the edit will consume, and if that exceeds the pool M2 prints one
+// REFUSED line and writes nothing at all. There is no partially-split map to reason about. (The
+// `take()` inside the window therefore cannot fail; if it ever did it would mean the pre-pass and the
+// edit disagree about the map, which is a panic, not a refusal.)
+//
+// THE BIT-CARRY, i.e. the GR15 trap. Splitting is the one operation in this file that writes WHOLE
+// entry values, so it is the one place the panel's PAT bit can be dropped. Two facts make it a trap:
+//   * the PAT bit MOVES with the level — bit 12 on a 2 MiB/1 GiB leaf, bit 7 on a 4 KiB PTE — so a
+//     copy that preserves "all the low bits" moves PAT into PS and PS into PAT; and
+//   * `PTE_ADDR` (bits 51:12) is NOT the address field of a huge leaf. A 2 MiB leaf's base is bits
+//     51:21 and a 1 GiB leaf's is 51:30; masking with `PTE_ADDR` would fold the PAT bit into the
+//     address.
+// So the carry is explicit and enumerated (`WXN_LEAF_CARRY`), the huge-leaf address masks are their
+// own constants, and the PAT bit is translated by hand at the one place the level changes. On top of
+// that: the splitter REFUSES (named panic) to split any leaf `leaf_is_fb_wc` recognises, and M2 reads
+// the fb leaf back across its own edit window and panics on any delta other than `PTE_NX`.
+//
+// THE ORDER OF WRITES, and why it is not the design's. The design's M2 says "populate the new table ->
+// store over the old leaf -> invlpg -> only then edit individual entries". This code populates the new
+// table with its FINAL values (NX already set on every page outside the keep set) before the store,
+// which is strictly stronger: the 2 MiB region is never observable in a half-restricted state, and the
+// only stale translation the TLB can serve between the store and the flush is the OLD, MORE PERMISSIVE
+// huge entry — a vacuity, never a fault. The per-split `invlpg` stride sweep is kept as a belt; the
+// CR3-reload / PGE-toggle at the end (`wxn_flush_tlb`, shared with M1) is what actually guarantees it.
+//
+// AP SAFETY. On Apple EFI 0x8000 is already a 4 KiB leaf (Boot W: GiB0 carries a 512-entry PT), so the
+// trampoline's PD entry is a table pointer and M2 edits its 512 PTEs in place — 511 NX, and 0x8000
+// left executable. On OVMF 0x8000 sits in an unsplit 2 MiB leaf, so that leaf IS split and the same
+// end state is reached through the pool. Either way exactly one 4 KiB page below 2 MiB stays
+// executable, which is the whole page the trampoline occupies (`start_aps` proves `[0x8000, 0x9000)`
+// usable before copying into it, and `ap_trampoline_end - ap_trampoline_start` is far under 4 KiB).
+// The AP arms EFER.NXE in the trampoline itself (M1's `orl $0x900`) before it turns paging on, so it
+// honours these bits from its first paged instruction.
+// =================================================================================================
+
+/// Physical-address field of a 2 MiB leaf (bits 51:21). **Not** `PTE_ADDR` — bit 12 of a huge leaf is
+/// the PAT selector, not address, and folding it into the base is exactly the GR15 defect.
+const PTE_ADDR_2M: u64 = 0x000F_FFFF_FFE0_0000;
+/// Physical-address field of a 1 GiB leaf (bits 51:30). Same warning as `PTE_ADDR_2M`.
+const PTE_ADDR_1G: u64 = 0x000F_FFFF_C000_0000;
+
+/// Every bit of a leaf entry that a split must carry through UNCHANGED, enumerated rather than
+/// inferred: P, W, U/S, PWT, PCD, A, D, G, the two AVL fields and NX. It deliberately EXCLUDES bit 7
+/// and bit 12 — the two whose meaning depends on the level — and the address field. Those three are
+/// handled by hand at each call site, which is the only way the PAT translation can be made visible.
+const WXN_LEAF_CARRY: u64 = PTE_PRESENT
+    | PTE_WRITABLE
+    | PTE_USER
+    | PTE_PWT
+    | PTE_PCD
+    | (1 << 5)      // Accessed
+    | (1 << 6)      // Dirty (leaf-only; ignored on the parents we build)
+    | PTE_GLOBAL    // bit 8 — same position at every level
+    | (0x7 << 9)    // AVL 11:9
+    | (0xF << 59)   // AVL / protection key 62:59
+    | PTE_NX;       // bit 63
+
+/// Tables M2 may consume. See the section header for the arithmetic: <= 4 PDs + <= 10 PTs = 14, and
+/// 16 is that bound plus slack. 64 KiB of `.bss`.
+const WXN_POOL_CAP: usize = 16;
+
+/// The split's frame source. `.bss`, 4 KiB-aligned, identity-mapped — so a page's address IS its
+/// physical address (`table_pa`), which is the whole reason M2 can run before the heap exists. Every
+/// page taken becomes a live page-table frame for the life of the kernel and is never returned.
+static mut WXN_POOL: [PageTable; WXN_POOL_CAP] = [const { PageTable::zeroed() }; WXN_POOL_CAP];
+
+/// One-shot latch. The pool cursor is monotone and its pages become live tables, so a second run
+/// would hand out frames that are already wired into the map. M2 is called from `arch::init` on the
+/// BSP only; this makes that a checked fact rather than a call-graph argument.
+static WXN_M2_DONE: AtomicBool = AtomicBool::new(false);
+
+/// D6 — the flush, and the branch on the wire, extracted from M1's sweep so both milestones take one
+/// branch and print one token for it. A parent-entry change invalidates a whole GiB of translations,
+/// so `invlpg` at 4 KiB stride is not viable there (262144 instructions per GiB). A CR3 reload flushes
+/// everything EXCEPT global entries, and this file records that the firmware's huge identity leaves
+/// may carry the Global bit — so if PGE is set we clear-and-restore CR4.PGE, which does evict globals.
+/// We never *set* PGE: on a machine where firmware left it clear (the rMBP — Boot V/W, `pge=0`; OVMF
+/// likewise) no global entry can exist, a CR3 reload is a complete flush, and setting PGE would be a
+/// semantic change masquerading as one.
+///
+/// Worth stating because it bounds the whole risk of both milestones: every entry write they make is
+/// a RESTRICTION (bit 63 set) or a REFINEMENT (one leaf replaced by 512 that reproduce it) with an
+/// unchanged output address. A missed flush can therefore only leave the protection vacuous on a
+/// stale entry — it can never fault and can never mistranslate.
+///
+/// `cr4` is the value read before the edit; on return CR4 is bit-identical to it.
+fn wxn_flush_tlb(pge: bool, cr4: u64) {
+    use x86_64::registers::control::Cr4;
+    const CR4_PGE: u64 = 1 << 7;
+    if pge {
+        // SAFETY: clearing then restoring CR4.PGE flushes the entire TLB including global entries;
+        // CR4 ends bit-identical to how we found it. Interrupts are still masked (pre-`sti`).
+        unsafe {
+            Cr4::write_raw(cr4 & !CR4_PGE);
+            Cr4::write_raw(cr4);
+        }
+    } else {
+        // SAFETY: reloading CR3 with its own value is architecturally a full non-global TLB flush;
+        // with PGE clear there are no global entries to miss.
+        unsafe {
+            core::arch::asm!(
+                "mov {t}, cr3",
+                "mov cr3, {t}",
+                t = out(reg) _,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+}
+
+/// Bump allocator over `WXN_POOL`. `None` is exhaustion — which the pre-pass has already ruled out
+/// before the edit window opens, so a `None` at edit time means the pre-pass and the edit disagree.
+struct WxnPool {
+    next: usize,
+}
+
+impl WxnPool {
+    const fn new() -> Self {
+        WxnPool { next: 0 }
+    }
+    fn take(&mut self) -> Option<*mut u64> {
+        if self.next >= WXN_POOL_CAP {
+            return None;
+        }
+        // SAFETY: `WXN_POOL` is a `.bss` array of 4 KiB-aligned tables; each index is handed out at
+        // most once (the cursor only advances) and M2 runs at most once (`WXN_M2_DONE`).
+        let p = unsafe { (&raw mut WXN_POOL[self.next]).cast::<u64>() };
+        self.next += 1;
+        Some(p)
+    }
+}
+
+/// The set of virtual addresses M2 leaves EXECUTABLE: the kernel's `PF_X` `PT_LOAD` extent rounded
+/// out to page boundaries, plus the single 4 KiB page holding the AP trampoline. Everything else in
+/// the spared GiBs gets NX, at the coarsest level that expresses it.
+#[derive(Clone, Copy)]
+struct WxnKeep {
+    x_lo: u64,
+    x_hi: u64,
+    t_lo: u64,
+    t_hi: u64,
+}
+
+impl WxnKeep {
+    /// Is the page at `va` one of the ones that stays executable?
+    #[inline]
+    fn holds(&self, va: u64) -> bool {
+        (va >= self.x_lo && va < self.x_hi) || (va >= self.t_lo && va < self.t_hi)
+    }
+    /// Does `[lo, hi)` contain ANY executable page? False ⇒ the whole region can take one NX bit at
+    /// its parent, which is how 1023 of the 1024 spared PD entries are retired on metal.
+    #[inline]
+    fn overlaps(&self, lo: u64, hi: u64) -> bool {
+        (lo < self.x_hi && self.x_lo < hi) || (lo < self.t_hi && self.t_lo < hi)
+    }
+    /// Is EVERY page of `[lo, hi)` executable? True ⇒ leave the leaf exactly as it is; no split, no
+    /// table, no write. (A 2 MiB-or-larger `.text` reaches this; today's ~1 MiB `.text` does not.)
+    #[inline]
+    fn covers(&self, lo: u64, hi: u64) -> bool {
+        (lo >= self.x_lo && hi <= self.x_hi) || (lo >= self.t_lo && hi <= self.t_hi)
+    }
+}
+
+/// Runtime `[start, end)` of the union of the image's NON-WRITABLE `PT_LOAD` segments, rounded OUT to
+/// 4 KiB boundaries, plus the count of segments unioned. `None` if the ELF header is unreadable or
+/// every LOAD is writable, in which case M2 refuses rather than guess.
+///
+/// **`PF_W`, not `PF_X`** — see the section header. `switch_context` is live ring-0 code that the
+/// linker put in `.rodata` (a `PF_X=0` LOAD) because of a leaked `.section .rodata` in `smp.rs`, and
+/// a `PF_X`-based extent page-faults on the first task switch. The read-only LOADs are the ones that
+/// can legitimately hold executed code; the writable ones never can.
+///
+/// Rounding OUT is the fail-safe direction: sub-page granularity does not exist, so a page shared
+/// between a read-only and a writable segment keeps X. On this image exactly one page is shared
+/// (`.text`'s tail and `.data.rel.ro`'s head), and it is read-only in the ELF's own view anyway.
+///
+/// Same PIE reasoning as `wxn_image_bounds`: `min_vaddr == 0`, so a segment's runtime address is
+/// `ehdr + p_vaddr` exactly.
+fn wxn_exec_extent() -> Option<(u64, u64, u32)> {
+    const PT_LOAD: u32 = 1;
+    const PF_W: u32 = 2;
+    let ehdr = &raw const __ehdr_start as u64;
+    // SAFETY: reads only, through a pointer the linker resolved to the loaded image base. The magic /
+    // class / phentsize checks are what make the phdr reads below safe to perform at all.
+    let ok = unsafe {
+        let p = ehdr as *const u8;
+        core::ptr::read_unaligned(p.cast::<u32>()) == 0x464C_457F // "\x7fELF"
+            && *p.add(4) == 2 // ELFCLASS64
+            && core::ptr::read_unaligned(p.add(54).cast::<u16>()) == 56 // e_phentsize
+    };
+    if !ok {
+        return None;
+    }
+    let (phoff, phnum) = unsafe {
+        let p = ehdr as *const u8;
+        (
+            core::ptr::read_unaligned(p.add(32).cast::<u64>()),
+            core::ptr::read_unaligned(p.add(56).cast::<u16>()) as usize,
+        )
+    };
+    let (mut lo, mut hi, mut segs) = (u64::MAX, 0u64, 0u32);
+    for i in 0..phnum.min(64) {
+        // SAFETY: `phoff`/`phnum` come from the header validated above; each phdr is 56 bytes inside
+        // the first PT_LOAD, which the bootloader copied into RAM along with the header.
+        let (ptype, flags, vaddr, memsz) = unsafe {
+            let ph = (ehdr + phoff + (i as u64) * 56) as *const u8;
+            (
+                core::ptr::read_unaligned(ph.cast::<u32>()),
+                core::ptr::read_unaligned(ph.add(4).cast::<u32>()),
+                core::ptr::read_unaligned(ph.add(16).cast::<u64>()),
+                core::ptr::read_unaligned(ph.add(40).cast::<u64>()),
+            )
+        };
+        if ptype != PT_LOAD || flags & PF_W != 0 || memsz == 0 {
+            continue;
+        }
+        segs += 1;
+        lo = lo.min((ehdr + vaddr) & !(PAGE_4K - 1));
+        hi = hi.max((ehdr + vaddr + memsz + PAGE_4K - 1) & !(PAGE_4K - 1));
+    }
+    if hi <= lo { None } else { Some((lo, hi, segs)) }
+}
+
+/// Build the 512 4 KiB PTEs that reproduce the 2 MiB leaf `e` exactly — same physical pages, same
+/// memory type, same W/U/G/A/D — and mark NX every one whose VA is outside `keep`. The table is
+/// written with its FINAL values; the caller installs it with a single store afterwards.
+///
+/// The PAT translation lives here and nowhere else: a 2 MiB leaf selects its PAT index with bit 12, a
+/// 4 KiB PTE with bit 7. `WXN_LEAF_CARRY` excludes both, so neither can survive by accident.
+///
+/// Returns `(entries minted non-executable, entries left executable)`.
+unsafe fn wxn_fill_pt_from_2m(pt: *mut u64, e: u64, va_base: u64, keep: &WxnKeep) -> (u32, u32) {
+    let pa = e & PTE_ADDR_2M;
+    let carry = (e & WXN_LEAF_CARRY) | if e & PTE_PAT_HUGE != 0 { PTE_PAT_4K } else { 0 };
+    let (mut nx, mut kx) = (0u32, 0u32);
+    for i in 0..512u64 {
+        let mut v = (pa + (i << 12)) | carry;
+        if !keep.holds(va_base + (i << 12)) {
+            v |= PTE_NX;
+        }
+        if v & PTE_NX != 0 {
+            nx += 1;
+        } else {
+            kx += 1;
+        }
+        // SAFETY: `pt` is a fresh, exclusively-owned 4 KiB pool page; `i < 512`.
+        unsafe { core::ptr::write_volatile(pt.add(i as usize), v) };
+    }
+    (nx, kx)
+}
+
+/// Build the 512 2 MiB leaves that reproduce the 1 GiB leaf `e` exactly. The PAT bit does NOT move
+/// here (bit 12 at both levels) and `PTE_HUGE` stays set — the demotion changes granularity only.
+/// Permissions are refined afterwards by the PD loop, exactly as if the firmware had mapped it this
+/// way. Neither known platform reaches this path (`l1=0` on both); it exists so a firmware that DOES
+/// use 1 GiB leaves for the image's GiB is handled rather than silently left RWX.
+unsafe fn wxn_fill_pd_from_1g(pd: *mut u64, e: u64) {
+    let pa = e & PTE_ADDR_1G;
+    let carry = (e & WXN_LEAF_CARRY) | (e & PTE_PAT_HUGE) | PTE_HUGE;
+    for i in 0..512u64 {
+        // SAFETY: `pd` is a fresh, exclusively-owned 4 KiB pool page; `i < 512`.
+        unsafe { core::ptr::write_volatile(pd.add(i as usize), (pa + (i << 21)) | carry) };
+    }
+}
+
+/// The non-leaf entry that replaces leaf `e` and points at the freshly built table at `child_pa`.
+///
+/// Bits are chosen, not copied: at a non-leaf, bit 7 is PS (must be 0), bit 12 is address, bit 6 is
+/// ignored, and bit 8 is ignored — so a blind copy would be wrong in four places. What IS carried is
+/// exactly the set whose meaning is the same at both levels and whose fold decides the effective
+/// permission: W, U/S and NX (hardware ANDs W and U/S down the path and ORs NX). Because the 512
+/// children carry the same three bits from the same `e`, the effective permission of every byte in
+/// the region is bit-identical to what `e` gave it. PWT/PCD are carried too — at a parent they type
+/// the page-table WALK, not the pages, so this is cosmetic, but carrying them keeps a UC region's
+/// walk UC as the firmware had it.
+#[inline]
+fn wxn_parent_from_leaf(e: u64, child_pa: u64) -> u64 {
+    (child_pa & PTE_ADDR)
+        | PTE_PRESENT
+        | (e & (PTE_WRITABLE | PTE_USER | PTE_PWT | PTE_PCD | PTE_NX))
+}
+
+/// **The splitter.** Called once, at the end of `wxn_pdpt_sweep`, with the spare set M1 computed.
+///
+/// Refuses (loudly, writing nothing) if the image declares no executable segment, if the derived
+/// extent is not inside the image bounds M1 already validated, or if the split would need more tables
+/// than the static pool holds. Panics if its own address is not inside the extent it is about to
+/// spare, if a leaf it is about to split is not identity-mapped, if that leaf is the framebuffer's,
+/// or if the framebuffer leaf changes in anything but `PTE_NX` across the window.
+fn wxn_split_stage(spare: &WxnSpare, img_lo: u64, img_hi: u64, pge: bool, cr4: u64) {
+    if WXN_M2_DONE.swap(true, Ordering::AcqRel) {
+        serial_println!(":: WXN-M2: -> REFUSED (already run; the pool's pages are live tables) ::");
+        return;
+    }
+
+    // Leg 1 — fail closed on the executable extent. Without it M2 cannot know which pages must keep
+    // X, and a guess makes the running kernel non-executable.
+    let Some((x_lo, x_hi, x_segs)) = wxn_exec_extent() else {
+        serial_println!(
+            ":: WXN-M2: ehdr=0x{:X} xseg=none -> REFUSED (no read-only PT_LOAD; no entry written) ::",
+            &raw const __ehdr_start as u64
+        );
+        return;
+    };
+    // Leg 1b — the extent must live inside the bounds M1 already proved contain this code. A phdr
+    // walk that produced an extent outside the image is a walk that read the wrong header.
+    if x_lo < img_lo || x_hi > img_hi {
+        serial_println!(
+            ":: WXN-M2: xseg=[0x{:X},0x{:X}) img=[0x{:X},0x{:X}) -> REFUSED (executable extent \
+             outside the image; no entry written) ::",
+            x_lo, x_hi, img_lo, img_hi
+        );
+        return;
+    }
+    let tramp = super::smp::TRAMPOLINE_ADDR as u64;
+    let keep = WxnKeep { x_lo, x_hi, t_lo: tramp, t_hi: tramp + PAGE_4K };
+
+    // Leg 2 — THE load-bearing assert, the M2 twin of M1's Leg 3 and for the same reason: this
+    // function is itself a `.text` address, so it must be inside the extent M2 is about to spare. If
+    // the `PF_X` walk latched onto the wrong segment, this fires here — before a single entry is
+    // written — instead of as a dead machine one instruction after the flush.
+    let here = wxn_split_stage as *const () as u64;
+    assert!(
+        keep.holds(here),
+        "WXN-M2: the derived executable extent [{:#x},{:#x}) does not contain this function \
+         ({:#x}) — the read-only-LOAD phdr walk found the wrong segment",
+        x_lo, x_hi, here
+    );
+
+    // -----------------------------------------------------------------------------------------
+    // Pre-pass: count the tables the edit will consume, WITHOUT writing anything. This is what
+    // makes pool exhaustion a refusal rather than a half-split map — the decision is taken while
+    // the map is still untouched.
+    // -----------------------------------------------------------------------------------------
+    let (mut need_pd, mut need_pt) = (0usize, 0usize);
+    for s in 0..spare.n {
+        let gva = spare.gib[s] << 30;
+        // SAFETY: every page-table frame is identity-mapped and directly readable at ring 0. Reads
+        // only — this pass must not perturb the map it is measuring.
+        unsafe {
+            let e4 = *cr3_table().add(pml4_index(gva));
+            if e4 & PTE_PRESENT == 0 || e4 & PTE_USER != 0 {
+                continue;
+            }
+            let e3 = *((e4 & PTE_ADDR) as *const u64).add(pdpt_index(gva));
+            if e3 & PTE_PRESENT == 0 || e3 & PTE_USER != 0 {
+                continue;
+            }
+            if !keep.overlaps(gva, gva + (1 << 30)) {
+                continue; // one NX bit on the PDPT entry retires the whole GiB — no table needed
+            }
+            let pd = if e3 & PTE_HUGE != 0 {
+                need_pd += 1;
+                core::ptr::null::<u64>() // demoted: all 512 children will be 2 MiB leaves
+            } else {
+                (e3 & PTE_ADDR) as *const u64
+            };
+            for k in 0..512u64 {
+                let (rlo, rhi) = (gva + (k << 21), gva + (k << 21) + (1 << 21));
+                if !keep.overlaps(rlo, rhi) || keep.covers(rlo, rhi) {
+                    continue;
+                }
+                if pd.is_null() {
+                    need_pt += 1; // a demoted GiB's children are all 2 MiB leaves
+                    continue;
+                }
+                let e2 = *pd.add(k as usize);
+                if e2 & PTE_PRESENT == 0 || e2 & PTE_USER != 0 {
+                    continue;
+                }
+                if e2 & PTE_HUGE != 0 {
+                    need_pt += 1; // already 4 KiB-granular ⇒ edited in place, no table needed
+                }
+            }
+        }
+    }
+    let need = need_pd + need_pt;
+    if need > WXN_POOL_CAP {
+        serial_println!(
+            ":: WXN-M2: xseg=[0x{:X},0x{:X}) need_pd={} need_pt={} pool_cap={} -> REFUSED (static \
+             pool exhausted; no entry written) ::",
+            x_lo, x_hi, need_pd, need_pt, WXN_POOL_CAP
+        );
+        return;
+    }
+
+    // R2 / GR15, M2's own belt. M1's interlock has already been cashed above and bracketed only M1;
+    // this one brackets only M2. M2 CAN legitimately change the fb leaf — if the panel happened to
+    // live inside a spared GiB its leaf takes an NX bit like any other — so `PTE_NX` is the one
+    // permitted delta and anything else stops the boot. Splitting it is not permitted at all: the
+    // `leaf_is_fb_wc` refusal below fires first.
+    let fb = crate::video::WRITER.try_lock().map(|w| w.base() as u64).unwrap_or(0);
+    let fb_before = if fb != 0 { wx_probe_leaf(fb).map(|(e, l, _)| (e, l)) } else { None };
+
+    // -----------------------------------------------------------------------------------------
+    // The edit.
+    // -----------------------------------------------------------------------------------------
+    let mut pool = WxnPool::new();
+    let (mut demote_1g, mut split_2m) = (0u32, 0u32);
+    let (mut nx_pdpt, mut nx_2m, mut nx_pt, mut nx_4k) = (0u32, 0u32, 0u32, 0u32);
+    let (mut keep_x, mut already_nx, mut skip_user) = (0u32, 0u32, 0u32);
+
+    with_page_tables_writable(|| {
+        // SAFETY: every page-table frame is identity-mapped and directly addressable at ring 0, and
+        // CR0.WP is clear for this window so the firmware's read-only table pages accept the stores.
+        // Interrupts are masked by the wrapper. Every write is either `e | PTE_NX` (a permission-only
+        // RMW that moves bit 63 and nothing else) or a table install whose 512 children were fully
+        // populated first, so no intermediate state is ever reachable.
+        unsafe {
+            for s in 0..spare.n {
+                let gva = spare.gib[s] << 30;
+                let e4 = core::ptr::read_volatile(cr3_table().add(pml4_index(gva)));
+                if e4 & PTE_PRESENT == 0 {
+                    continue;
+                }
+                if e4 & PTE_USER != 0 {
+                    skip_user += 1;
+                    continue;
+                }
+                let p3 = ((e4 & PTE_ADDR) as *mut u64).add(pdpt_index(gva));
+                let e3 = core::ptr::read_volatile(p3);
+                if e3 & PTE_PRESENT == 0 {
+                    continue;
+                }
+                if e3 & PTE_USER != 0 {
+                    skip_user += 1;
+                    continue;
+                }
+
+                // A spared GiB with nothing executable in it — the image's SECOND GiB when `.text`
+                // lands entirely in the first, say. One write retires 512 (or 262144) leaves.
+                if !keep.overlaps(gva, gva + (1 << 30)) {
+                    if e3 & PTE_NX == 0 {
+                        core::ptr::write_volatile(p3, e3 | PTE_NX);
+                        nx_pdpt += 1;
+                    } else {
+                        already_nx += 1;
+                    }
+                    continue;
+                }
+
+                let pd: *mut u64 = if e3 & PTE_HUGE != 0 {
+                    // A 1 GiB LEAF holding executable code. Demote it to 512 x 2 MiB so the PD loop
+                    // below can work at 2 MiB granularity like everywhere else.
+                    assert!(
+                        !leaf_is_fb_wc(e3, gva, 1 << 30, PTE_PAT_HUGE),
+                        "WXN-M2: refusing to split the framebuffer's WC 1 GiB leaf at {:#x} \
+                         (e=0x{:016X}) — this is the GR15 hazard and the splitter will not take it",
+                        gva, e3
+                    );
+                    assert!(
+                        e3 & PTE_ADDR_1G == gva,
+                        "WXN-M2: the spared 1 GiB leaf at VA {:#x} maps PA {:#x} — the map is not \
+                         identity there, so a VA-derived keep set cannot be applied to it",
+                        gva,
+                        e3 & PTE_ADDR_1G
+                    );
+                    let nt = pool.take().unwrap_or_else(|| {
+                        panic!("WXN-M2: pool exhausted mid-edit — the pre-pass under-counted")
+                    });
+                    wxn_fill_pd_from_1g(nt, e3);
+                    core::ptr::write_volatile(p3, wxn_parent_from_leaf(e3, table_pa(nt)));
+                    for i in 0..512u64 {
+                        invlpg(gva + (i << 21)); // 2 MiB stride: 4 KiB would be 262144 instructions
+                    }
+                    demote_1g += 1;
+                    nt
+                } else {
+                    (e3 & PTE_ADDR) as *mut u64
+                };
+
+                for k in 0..512usize {
+                    let p2 = pd.add(k);
+                    let e2 = core::ptr::read_volatile(p2);
+                    if e2 & PTE_PRESENT == 0 {
+                        continue;
+                    }
+                    if e2 & PTE_USER != 0 {
+                        skip_user += 1;
+                        continue;
+                    }
+                    let rlo = gva + ((k as u64) << 21);
+                    let rhi = rlo + (1 << 21);
+
+                    // (a) nothing executable in this 2 MiB — one NX bit at the PD level, whether the
+                    // entry is a leaf or a table pointer. This is where 1023 of metal's 1024 spared
+                    // PD entries go.
+                    if !keep.overlaps(rlo, rhi) {
+                        if e2 & PTE_NX == 0 {
+                            core::ptr::write_volatile(p2, e2 | PTE_NX);
+                            if e2 & PTE_HUGE != 0 {
+                                nx_2m += 1;
+                            } else {
+                                nx_pt += 1;
+                            }
+                        } else {
+                            already_nx += 1;
+                        }
+                        continue;
+                    }
+
+                    if e2 & PTE_HUGE != 0 {
+                        // (b) a 2 MiB leaf entirely inside the keep set — leave it exactly as it is.
+                        if keep.covers(rlo, rhi) {
+                            keep_x += 1;
+                            continue;
+                        }
+                        // (c) a 2 MiB leaf STRADDLING the keep set — the only case that needs a table.
+                        assert!(
+                            !leaf_is_fb_wc(e2, rlo, 1 << 21, PTE_PAT_HUGE),
+                            "WXN-M2: refusing to split the framebuffer's WC 2 MiB leaf at {:#x} \
+                             (e=0x{:016X}) — this is the GR15 hazard and the splitter will not take it",
+                            rlo, e2
+                        );
+                        assert!(
+                            e2 & PTE_ADDR_2M == rlo,
+                            "WXN-M2: the 2 MiB leaf at VA {:#x} maps PA {:#x} — the map is not \
+                             identity there, so a VA-derived keep set cannot be applied to it",
+                            rlo,
+                            e2 & PTE_ADDR_2M
+                        );
+                        let nt = pool.take().unwrap_or_else(|| {
+                            panic!("WXN-M2: pool exhausted mid-edit — the pre-pass under-counted")
+                        });
+                        let (nx, kx) = wxn_fill_pt_from_2m(nt, e2, rlo, &keep);
+                        nx_4k += nx;
+                        keep_x += kx;
+                        core::ptr::write_volatile(p2, wxn_parent_from_leaf(e2, table_pa(nt)));
+                        for i in 0..512u64 {
+                            invlpg(rlo + (i << 12));
+                        }
+                        split_2m += 1;
+                    } else {
+                        // (d) already 4 KiB-granular (Apple EFI's low GiB, and the firmware's other
+                        // PTs) — refine in place, no table, no pool page.
+                        let pt = (e2 & PTE_ADDR) as *mut u64;
+                        for l in 0..512usize {
+                            let p1 = pt.add(l);
+                            let e1 = core::ptr::read_volatile(p1);
+                            if e1 & PTE_PRESENT == 0 {
+                                continue;
+                            }
+                            if e1 & PTE_USER != 0 {
+                                skip_user += 1;
+                                continue;
+                            }
+                            let va = rlo + ((l as u64) << 12);
+                            if keep.holds(va) {
+                                if e1 & PTE_NX == 0 {
+                                    keep_x += 1;
+                                }
+                                continue;
+                            }
+                            if e1 & PTE_NX != 0 {
+                                already_nx += 1;
+                                continue;
+                            }
+                            core::ptr::write_volatile(p1, e1 | PTE_NX);
+                            invlpg(va);
+                            nx_4k += 1;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    wxn_flush_tlb(pge, cr4);
+
+    // The GR15 belt, cashed for M2's own window.
+    let fb_delta = match (fb_before, if fb != 0 { wx_probe_leaf(fb) } else { None }) {
+        (Some((e_before, l_before)), Some((e_after, l_after, _))) => {
+            assert!(
+                l_after == l_before,
+                "WXN-M2: the framebuffer walk terminated at a DIFFERENT LEVEL across the split — \
+                 before=0x{:016X}/lvl{} after=0x{:016X}/lvl{}. M2 splits only leaves that hold \
+                 executable code and refuses fb leaves outright, so the fb's level cannot move.",
+                e_before, l_before, e_after, l_after
+            );
+            let delta = e_after ^ e_before;
+            assert!(
+                delta == 0 || delta == PTE_NX,
+                "WXN-M2: the framebuffer LEAF changed in bits other than PTE_NX — \
+                 before=0x{:016X} after=0x{:016X} delta=0x{:016X} lvl={}. This is the GR15 defect \
+                 (a dropped PAT/PCD/PWT bit silently re-UCs the panel, 8.7-9.1x on the blit path) \
+                 and it is invisible to every permission instrument, so the boot stops here.",
+                e_before, e_after, delta, l_after
+            );
+            delta
+        }
+        (Some((e_before, _)), None) => panic!(
+            "WXN-M2: the framebuffer mapping at {:#x} is gone after the split — it was present \
+             (leaf 0x{:016X}) before it",
+            fb, e_before
+        ),
+        _ => 0,
+    };
+
+    // The verdict. Same shape and same reason as M1's: a stage that wrote NOTHING must not print a
+    // line that reads normal. `spare.n > 0` is guaranteed by M1 (the trampoline GiB is always
+    // inserted), so zero writes means every descent bailed on a `skip_` branch.
+    let wrote = demote_1g + split_2m + nx_pdpt + nx_2m + nx_pt + nx_4k;
+    let verdict = if wrote == 0 { "-> VACUOUS" } else { "-> SPLIT" };
+    serial_println!(
+        ":: WXN-M2: xseg=[0x{:X},0x{:X}) xsegs={} xpages={} tramp=0x{:X} spare_n={} demote_1g={} split_2m={} \
+         pool_used={}/{} nx_pdpt={} nx_2m={} nx_pt={} nx_4k={} keep_x={} already_nx={} skip_user={} \
+         fb=0x{:X} fb_delta=0x{:X} pge={} flush={} {} ::",
+        x_lo,
+        x_hi,
+        x_segs,
+        (x_hi - x_lo) / PAGE_4K,
+        tramp,
+        spare.n,
+        demote_1g,
+        split_2m,
+        pool.next,
+        WXN_POOL_CAP,
+        nx_pdpt,
+        nx_2m,
+        nx_pt,
+        nx_4k,
+        keep_x,
+        already_nx,
+        skip_user,
+        fb,
+        fb_delta,
+        pge as u8,
+        if pge { "pge-toggle" } else { "cr3-reload" },
+        verdict,
+    );
+    // M2's self-prediction, the twin of M1's `residue_leaves`. `keep_x` is counted during the edit;
+    // `kern_WX` on the WXAUDIT line one screen down is counted by a completely separate walk of the
+    // same tables. They must agree (less any executable leaf the firmware left read-only, of which
+    // there are none in `.text` — the kernel writes its own `.data`), and `keep_x` must in turn equal
+    // `xpages + 1` above, which is derived from the ELF header alone. Three independent derivations
+    // of one number, on two adjacent lines.
 }
 
 // =================================================================================================
