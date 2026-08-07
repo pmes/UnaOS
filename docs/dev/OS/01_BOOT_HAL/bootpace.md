@@ -523,6 +523,12 @@ this silicon.
 minima. Cutting either buys a second and violates the spec; they are named here so the
 next reader does not have to re-derive that they are floors.
 
+**Refined, not overturned (Boot Y, §10i).** That paragraph is still true of the *minima* and
+BUY-1 cut none of them. What it missed is that a debounce is owed as **elapsed time**, not as
+executed spin: 159 ms of `rootrst` was being spun while a wall clock that had already started
+was free to pay it. `rootrst=` reads **261 / 60 ms** from Boot Y on, with `n=3` / `n=2` and the
+post-T_ATTDB CCS samples byte-identical. The floor stands; what fell was the spin in front of it.
+
 ### 8d. Where the armed-minus-off second lives outside the kepler window (GR18)
 
 `gui=6242ms` (witness + kepler) against `gui=4094ms` (witness-OFF, kepler, boot 2) is a
@@ -908,7 +914,9 @@ loses a device makes every `ms` reading above look *better*, so these gate the a
 SET_ADDRESS recovery (16 ms) are **1156 ms of USB 2.0 minima** across §8c and this section. The
 46 ms transfer anomaly is undecomposed and therefore untouched by law; M7 is what earns the
 right to trim it. **M7's successor M8 did earn it — see §8h, where the request is named and the
-trim taken.**
+trim taken.** **And the arithmetic of the minima themselves is re-read in §10i: BUY-1 cuts none
+of them, but pays the T_ATTDB share of `rootrst` off an elapsed wall clock instead of a spin,
+which is worth 159 ms.**
 
 ### 8h. M8 named the request, and BUY-2 was taken (GR18, 2026-08-06)
 
@@ -1734,8 +1742,8 @@ here refutes the original observation. What is closed is the false alarm: from n
 `sched=WALKED` + keys pressed + **no** `SILENCE-BROKE` (device/TT/toggle, host side excluded) or
 `sched=NOT-WALKED` (host side, convicted with no keypress needed).
 
-**§10h addendum — Boot W (2026-08-06, kernel `7748d22c` @ `68370d6f`) is the current whole-boot
-headline.**
+**§10h addendum — Boot W (2026-08-06, kernel `7748d22c` @ `68370d6f`) was the whole-boot
+headline until Boot Y (§10i).**
 
 ```
 [   2380ms] :: BPACE: total gui=2376ms ftdi=none n=27 dropped=0 hz=2693808214 result=LEDGER ::
@@ -1762,6 +1770,127 @@ SMC `#KEY` index walk printing 493 per-name lines onto the same serial link the 
 through. `UNAOS_SMCWALK` is back to default-off (walk-quiet), the walk still completes in full,
 and `wait=209 ftdi=177` is what the tail actually costs. Recorded in
 `09_PLATFORM/smc_battery.md` under Boot W. `mbench` x86-witness **16/16**.
+
+## §10i — GR19: five arcs in one flight, and the wait that was owed to a clock (Boot Y, 2026-08-06)
+
+**Boot Y (2026-08-06 ~20:57 MDT, capture `rmbp-gr16-s73` boot 18, media built at `776fb13c`) is
+the current whole-boot headline** and the first metal flight of five arcs at once: EHCI BUY-1,
+WXN-x86 M2, the kepler phase decomposition, wcx M-a, and the iGPU census arm.
+
+```
+[   2223ms] :: BPACE: total gui=2217ms ftdi=none n=27 dropped=0 hz=2693860140 result=LEDGER ::
+[   2203ms] :: GPACE: xtail=0ms(n=1) bench=0ms(n=0) detect=5ms(n=1) igpu=1ms(n=1) kepler=396ms(n=1)
+   sdhc=12ms(n=1) nic=0ms(n=1) resid=3ms == witness ::
+```
+
+**`gui=2217ms`** — from Boot W's 2376 and Boot X's 2378. **The whole 159–161 ms is BUY-1, and the
+ledger says so twice.** `ehci-hid-done d=1285ms` against 1444 (W) / 1446 (X) is the same
+159 / 161 ms, and no other class moved: `sched d=67`, `pci-scan d=106`, `xhci-settle d=100`,
+`pci-usb d=417`, `kepler=396` against 397. A whole-boot delta that lands entirely inside one
+block, with that block's own instrument reporting the identical figure, is the cleanest shape a
+trim can have.
+
+### BUY-1 — pay T_ATTDB by the clock, not by the spin
+
+§8c and §8f both close with "not trimmed, and why": `rootrst` is 480 ms of USB 2.0 minima and
+cutting it violates the spec. **BUY-1 cuts none of it.** USB 2.0 §7.1.7.3 requires the 100 ms
+attach debounce to have **elapsed** before a port is sampled — it does not require the CPU to be
+spinning while it does. `ehci::init` now runs as bring-up followed by a separate walk phase, with
+the debounce clock started at exactly the edge it always was, and the walk pays only
+`owed = T_ATTDB_MS − elapsed`, floored at zero, so it always over-pays rather than under-pays;
+before TSC calibration it pays the full 100. Zero timing constants changed — the literal `100`
+became `T_ATTDB_MS`. (`CHAIN_HSE_SEEN` moved from construction to point-of-use in the same change:
+the naive split would have re-run the chain-mode HSE probe and cost ~2.6 s, the s58 shape, priced
+and dodged before the boot rather than discovered on it.)
+
+The saving exists because the controllers are enumerated by a single nested scan — `[1]` waits for
+all of `[0]` — so by the time `[1]`'s port walk asks for its debounce, `[0]`'s entire bring-up has
+already elapsed against it. That is why the two controllers pay differently, and the instrument
+says which is which:
+
+```
+[    448ms] :: EHCI-HID: [0] BUY-1 T_ATTDB overlap: 100 ms owed, 59 ms already elapsed under the
+   earlier controllers' bring-up/port walk, 41 ms spun here == witness ::
+[    974ms] :: EHCI-HID: [1] BUY-1 T_ATTDB overlap: 100 ms owed, 100 ms already elapsed under the
+   earlier controllers' bring-up/port walk, 0 ms spun here == witness ::
+```
+
+`[1]`'s debounce is now **entirely** covered by work that had to happen anyway. The line is silent
+unless overlap actually covered time, so a boot in which the mechanism does nothing says nothing.
+
+| reading | Boot W / X | predicted | **Boot Y (metal)** |
+|---|---|---|---|
+| `EPACE: [0] rootrst=` | 320 ms | ~270 ms | **261 ms** |
+| `EPACE: [1] rootrst=` | 160 ms | ~60 ms | **60 ms** |
+| `BPACE: ehci-hid-done d=` | 1444 / 1446 ms | ~1290 ms | **1285 ms** |
+| `BPACE: total gui=` | 2376 / 2378 ms | — | **2217 ms** |
+| `M8 SLOW-XFER … wlen=18` on [0] | present, `xfer=47ms` | unchanged — device floor | **present, `xfer=47ms act=47ms ass=0ms`** |
+| `EPACE: [0] {xfer=…}` | `55–57ms(n=26)` | unchanged | **`55ms(n=26) ass=0ms act=54ms`** |
+| `EPACE: [0] rootrst n=` / `[1] rootrst n=` | 3 / 2 | 3 / 2 | **3 / 2** |
+| `EHCI-HID: [1] M2 armed keyboard addr=6 ep=IN3 mps=10 interval=8` | present | present, identical | **present, identical** |
+| `port 1 not walked … PORTSC=0x00001000 CCS=0` on [0] and [1] | present, two lines | present, unchanged | **present, two lines, same PORTSC** |
+
+The prediction was ~152 ms; the delivery is 159 / 161 ms, and the mechanism is the one that was
+named rather than a different one that happened to pay. **The last two rows are the ones that
+gate the arc.** Paying a debounce by elapsed time instead of by spin is exactly the change that
+could sample CCS early — the §8c hazard, where a port whose CCS had not re-asserted takes a silent
+`continue` and the boot reads *faster* because a device went missing. It did not happen: the same
+two empty root ports report the same `PORTSC=0x00001000`, the internal keyboard arms on the same
+address and endpoint, and `n=` is unmoved on both controllers.
+
+### `kepler=396ms` decomposed for the first time
+
+§10h left `kepler=397ms` as the whole-boot GPU cost with nothing inside it. Six `phase!` stamps
+now split it on the wire (`:: kdisp: bring-up phase=<name> d=<ms> ::`, each stamp charging the
+interval since the previous one):
+
+| phase | `d=` | share | what it covers |
+|---|---|---|---|
+| `mmio_bringup` | **331 ms** | **84 %** | probe entry through POST/BAR checks to the end of the pass-1 mirror-window scan |
+| `mirror_passes` | 13 ms | 3 % | pass-2 volatility re-read + the disp-era USERD recon |
+| `ucode_echo` | 28 ms | 7 % | the Falcon ECHO leg to the pre-witness mailbox read |
+| `recon_and_witnesses` | 5 ms | 1 % | PGRAPH recon and the bind-pre register reads |
+| `ctx_bind` | 0 ms | 0 % | the context-bind experiment |
+| `scanout_handover` | 2 ms | 1 % | handover to the panel |
+| Σ | 379 ms | | against `kepler=396ms(n=1)` — **~17 ms residue**, outside any stamped phase |
+
+**`mmio_bringup` is the standing block and the named next target** — 331 of 396 ms in one phase —
+and nothing inside it is a deliberate wait: the span contains no spin loop at all. It is MMIO
+traffic plus serial cost. Roughly 120 `kepler`/`kdisp` lines are emitted inside the window, which
+at §10g's witness-off rate of ~0.69 ms/line (the per-print tax was retired in GR17, §10h) is
+~80 ms; three 256-row mirror-header scans and the PFIFO/instance-block/runlist setup carry the
+rest. **Which of those two terms dominates is not decomposed here** — that is the next reading,
+and it is stated as an open question rather than assumed. The ~17 ms residue is the head and tail
+of the measured span outside the first and last stamps, likewise undecomposed, recorded so the
+next reading is taken against a known gap rather than a surprise.
+
+### The other three arcs, all first-flight, all clean
+
+* **WXN-x86 M2 — the huge-leaf splitter, metal-proven.** `kern_WX` **1535 → 305** (`2048 MiB` →
+  `1 MiB`); `leaves=66558 tables=1029 l1=0 l2=65534 l3=1024`, every prediction exact
+  (`leaves = 66047 + 511 × split_2m`, `tables = 1028 + 1`, `keep_x = xpages + 1 = kern_WX = 305`).
+  The identity map is ~99.5 % supervisor-NX. `walk=1721kcyc` against 1717 the boot before — the
+  extra 511 leaves cost ~4 kcyc, inside the noise. Ledgered in `docs/SECURITY.md`.
+* **wcx M-a — the convergent activation body held on its first flight.** Exactly one
+  `[wc-x] surface adopt SKIP (already live)`, **zero REFUSE, zero DECLINE** — which is the
+  designed reading: a REFUSE would mean something double-calls `activate()` and the one-caller
+  fact the arc is built on is wrong. Console routing, panic fallback and the desktop clear all
+  arm as before.
+* **The iGPU census's outermost refusal arm fired, and said why.**
+  `:: igpu-blt: ring=absent why=no-active-surface — every iGPU display plane is off (gmux routes
+  the panel elsewhere); CPU path carries the console ::` — the census now states the negative
+  case in words instead of leaving an absent ring to be inferred from silence. It is the correct
+  answer for this machine (`igpu=1ms(n=1)` in GPACE), and it is the line that will change if a
+  plane is ever live.
+
+### Gates
+
+`mbench` x86-witness **22/22 REQUIRE, 0 FORBID** on the Boot Y slice; `serial-analyzer --wxn`
+**MILESTONE** on `kern_WX` 1535 → 305 with the count never rising; regression floor held
+(`sched d=67ms`, `WXN-FBWC … -> LEAF BIT-IDENTICAL pat=1`). No `EPACE-TRIM` tripwire, no
+`BUY-2 FALSIFIED`/`suspect`, no `[wc-x]` REFUSE or DECLINE anywhere in the slice; the only
+`FAILED` line in it is the standing `[sdhc] cmd8 send-if-cond` with no card in the reader, which
+Boot X carries identically.
 
 ## 11. The boot head: `heap d=253ms` and the `sched` residue (GR20, 2026-08-06)
 
