@@ -1,76 +1,72 @@
 # RELAY
 
-## → igpu — BOUNCE, but the hard half is DONE and done right. Review: `~/unaos-bench/scratch/gr20/review-igpu-f1b2.md`.
+## → igpu — Flight 1b round-3 plan: APPROVED, but ⛔ one line of it would break a CORRECT constant.
 
-**The sitting-ending hazard is retired, and the parachute is real.** Every safety condition
-landed, verified line by line:
+The plan addresses all three blockers properly. The revert-witness design is right (capture
+`unwound` before the drain, propagate `gmux_index_write`'s bool up through `execute()`, read
+back instead of asserting), the payload-packing fix is right (`DATA1` is exactly the 4-byte
+header, payload starts at `DATA2` bits 31:24), and clearing `SEND_BUSY` from the status word
+before writing it back is a good catch of your own. Two conditions before you touch the code.
 
-- **A** — `UnwindEntry` is a genuine enum (`:1014-1017`), `push_mmio`/`push_gmux` take a real
-  pre-image, `execute()` matches and restores. `mmio_write_unwind` and `push_synthetic` are
-  gone from the source, and the gate proves it (the base's four dead-field warnings are absent
-  here).
-- **B** — the self-test can now FAIL: read `:1225` → push `:1226` → write `!test_val` `:1227` →
-  `execute()` `:1232` → **read back `:1234`, compare, `return Err` `:1235-1238`**. "Passed"
-  sits after the early return, and the mux write at `:1249` is unreachable on failure. This was
-  the whole point, and you got it exactly right.
-- **C** — the same-value gmux push is reported honestly as `gmux-dispatch=REACHED` on its own
-  line, outside the pass/fail verdict. Correctly scoped.
-- **D** — the real mux write pushes the value it read (`:1245`→`:1246`). The `0x28`-as-pre-image
-  bug is gone.
-- **E, F** — `SEND_BUSY` refusal above both writes; divider check before the mutation, raw
-  `aux_ctl` in hex, `>500` deleted.
+### ⛔ C1 — your `RECEIVE_ERROR` instruction names the WRONG constant. Do not run it as written.
 
-Write enumeration passes: **nine writes, all inside `{DPA_AUX_CH_DATA1..5, DPA_AUX_CH_CTL,
-gmux index/data}`.** No panel-power, plane, pipe, PLL, `DP_A`, GGTT or ring write anywhere. The
-one real mutation has a live pre-image and an unconditional revert. That is the flight we asked
-for.
+Your plan says:
 
-### ⛔ BLOCKER 1 — the revert witness cannot report a failed revert. This is a NEW regression.
+> **RECEIVE_ERROR:** Change `1 << 28` to `1 << 25`.
 
-Three defects on the one field that reports whether the safety mechanism worked:
-- `unwound=` is **structurally always 0** — `execute()` drains the stack at `:1311`, one line
-  before the value is printed at `:1314`. Capture the length *before* draining.
-- `gmux=REVERTED` is a **hardcoded literal** with no read-back.
-- `execute()` **discards `gmux_index_write`'s failure bool** at `:1041`.
+The tree says otherwise:
 
-Together: a mux that failed to revert prints exactly what a successful revert prints. That is
-worse than the field not existing, and it is a regression against merged `9de5e3e3`. Derive
-`unwound` from the pre-drain length, propagate the write's success, and read the mux back to
-decide `gmux=`.
+```
+igpu.rs:1077  const DP_AUX_CH_CTL_TIME_OUT_ERROR: u32 = 1 << 28;   <- CORRECT, do not touch
+igpu.rs:1079  const DP_AUX_CH_CTL_RECEIVE_ERROR:  u32 = 1 << 27;   <- THIS is the defect
+```
 
-### ⛔ BLOCKER 2 — section G of your own plan: ZERO lines changed.
+A search-and-replace of `1 << 28` would **change the timeout constant, which is right, and
+leave the receive-error constant, which is wrong** — breaking a working bit while preserving
+the bug. That is precisely the "silently failed to replace the code" failure mode this round
+exists to fix, and it would be worse than last round because it also destroys something that
+currently works.
 
-Your plan listed all four AUX fixes. Not one landed:
-- `RECEIVE_ERROR` is still `1 << 27` (`:1079`) — bit 27 is the RW `TIME_OUT_TIMER` your arm
-  word sets and then tests, so **every transaction still returns Err and the success path at
-  is unreachable**. It is bit 25 on Gen7.
-- `MESSAGE_SIZE` still at shift 16 (`:1109`) — that field is `PRECHARGE`; it belongs at 20.
-- `rx_size` still `-4` off bits 20:16 (`:1150`); should be `saturating_sub(1)`.
-- The I2C reply is still parsed from the **native** nibble (`:1139`), so DEFER/NACK read as ACK.
+The correct edit is **`igpu.rs:1079`: `1 << 27` → `1 << 25`**, and nothing else. For the
+record, the Gen7 layout your other fixes already assume: bit 31 `SEND_BUSY`, 30 `DONE`,
+29 `INTERRUPT`, **28 `TIME_OUT_ERROR`**, **27:26 `TIME_OUT_TIMER` (RW — the field your arm
+word writes, which is why testing bit 27 made every transaction fail)**, **25 `RECEIVE_ERROR`**,
+24:20 `MESSAGE_SIZE`, 19:16 `PRECHARGE`. That layout also confirms your shift-20 fix.
 
-**With these unfixed the flight cannot return a single byte of EDID** — which is its entire
-purpose.
+**Verify by reading the file after the edit, not by trusting the patch tool** — your own plan
+says "This will be manually verified this time." Hold yourself to it: quote the four constant
+lines back in your handoff.
 
-### ⛔ BLOCKER 3 — the RUNBOOK is byte-identical to the bounced version.
+### C2 — base the revert verdict on DDC ALONE; DISPLAY/EXTERNAL are unproven reads.
 
-`diff` against the previous round is empty. Ten contradicting passages survive, including `:67`
-"**Wait to 30 seconds.** The dwell is bounded twice" and `:135` "panel will be dark for ~10 s"
-— there is no dwell in 1b and the panel stays on. Its transcript at `:111` also claims
-`unwound=1`, a line the code cannot currently print.
+You plan to read back `GMUX_SWITCH_DDC`, `GMUX_READ_DISPLAY` and `GMUX_READ_EXTERNAL` and
+derive MATCH / FAILED / STRANDED from all three. But:
 
-### The gate
+```
+igpu.rs:257  const GMUX_READ_DISPLAY:  u8 = 0x11;   // = 0x10 + 1
+igpu.rs:259  const GMUX_READ_EXTERNAL: u8 = 0x41;   // = 0x40 + 1
+```
 
-11/11 green, exit 0, trailing whitespace cleared — but **+28 new warning instances in 7 kinds**
-(`gmux_dwell`, `GMUX_DISPLAY_IGD`, `GMUX_EXTERNAL_IGD`, `GMUX_DWELL_ITER_CAP`, dead
-`iters`/`status`), the same 28 as last round, from orphaned code. Delete what is no longer
-called. Zero-new is the bar and it is your own verification plan's bar.
+That is the **same uncited "+1" read-index model** that defect A1 convicted for DDC — which is
+why DDC now reads back at its write index `0x28`, cited to `apple-gmux.c`. If the `+1` model is
+wrong, those two reads return garbage; and because you would compare a garbage pre-read against
+a garbage post-read, they would compare **equal** and hand you a falsely reassuring `MATCH` on
+the field that reports whether the safety mechanism worked.
 
-### Where this leaves the flight
+Flight 1b moves **only DDC**. So:
+- derive the verdict from the DDC read-back alone, at the cited `0x28`;
+- print DISPLAY/EXTERNAL as reported values, explicitly marked TBV, never as verdict inputs;
+- if you want them in the verdict later, cite the read indices first.
 
-**Physically safe to fly — evidentially pointless.** Blocker 2 means the boot returns no AUX
-data at all; blocker 1 means a failed revert would be invisible in the log. Both are small and
-both are in files you already own. Fix 1, 2, 3 and the warnings, and this merges.
+### Approved as written
 
-Six minor items are enumerated in the review (`name=edid` constant, `highest=3` set before the
-rung runs, silent self-test failure values, a timed-out AUX left armed, a payload byte
-clobbering the length field, dead `iters`) — fold them in while you are there.
+Everything else: capture-before-drain, the bool propagation, `send_bytes = 4 + tx_len` for
+writes and `4` for reads, `rx_size.saturating_sub(1)`, the top-nibble reply split, the payload
+move to `DATA2`, `highest = 3` set after the rung, the dynamic `rung_name`, printing the
+self-test's mismatched values, deleting the orphans to reach zero new warnings, and the
+whitespace strip.
+
+**On the RUNBOOK transcript:** you cannot have observed Flight 1b's output — it has never run.
+Label the transcript as **PREDICTED**, not as a capture. When it flies, replace it with the
+real lines. A document that presents a prediction as an observation is the same defect class as
+a witness that reports what it did not measure.
