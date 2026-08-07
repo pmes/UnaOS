@@ -2367,8 +2367,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
             console.println("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
             // BGRUN-1: background user-mode runs — the concurrent-apps line (windows coexist; TAB cycles).
-            #[cfg(feature = "baremetal")]
+            #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
             console.println("PROC:     run <path> (foreground), bg <path> (background), jobs (list+reap), kill <pid>");
+            // BARE-EXEC: the shortest way to start a program, so it is listed where an operator
+            // looks. Named after the verbs above because it is the fallthrough BEHIND them.
+            #[cfg(target_arch = "x86_64")]
+            console.println("          <name.elf>  (just type it: vug.elf runs VUG.ELF in a window, prompt returns)");
             // STORM-HEADROOM: the verb existed since P77 but was never listed, so the one command an
             // attended bench uses to load the scheduler was discoverable only from the source. The
             // cap is stated here because it is the first thing a `storm 8` reading needs.
@@ -2862,7 +2866,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // foreign volume-level path from the same surface. `vfs <op> <path>`.
             vfs_cmd(console, &args);
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
         "run" => {
             // EXEC-1: load an ELF64 user program off the VFS namespace and execute it in user mode, reporting its
             // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
@@ -2870,6 +2874,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // fixture. The bytes are read here (kernel mode/ASID 0) and handed to the kernel loader
             // (`run_user_image`), which maps them into a fresh per-task slot with per-segment W^X pages and
             // runs them under user mode + the fault-kill net. `run <path>`.
+            //
+            // X86RUN (GR20): also on x86, where the read side differs (there is no VFS namespace on
+            // this arch) but nothing else does — see `read_el0_image`'s x86 twin for the path rules.
+            // `run /fat/VUG.ELF` and `run VUG.ELF` both reach the DATA volume's root there.
             match args.first() {
                 None => console.println("usage: run <path>   (load + execute an ELF64 user program)"),
                 Some(&path) => run_program(console, path),
@@ -3370,7 +3378,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
              crate::hlt_loop();
              crate::hlt_loop();
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
         "bg" => {
             // BGRUN-1: run a user program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
@@ -3498,13 +3506,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 console.println("storm: fat writer armed — watch :: STORM: fatw lines on serial");
             }
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
         "jobs" => {
             // BGRUN-1: list background programs and REAP the exited ones (this verb is the reaper — a
             // PEXITED row stays claimed until it is polled here, and the table is bounded). `jobs`.
             bg_jobs(console);
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
         "kill" => {
             // BGRUN-1: kill a background program by pid (SKILL-1 underneath — ASID-scoped, so ELF-2
             // sibling threads die with it; unconfirmed kills park the row PORPHANED and settle at the
@@ -3516,7 +3524,18 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         "" => {}, // Ignore empty enter
         _ => {
-            console.println("Unknown command. Type 'help' for assistance.");
+            // BARE-EXEC (GR20, x86): the typed word is not a verb — before refusing, try it as a
+            // PROGRAM. `vug.elf` at the prompt launches `VUG.ELF` off the FAT volume in the
+            // background, window open, prompt back. See `bare_exec` for the precedence rule (verbs
+            // always win, and this arm is reached only after every verb has been tried) and for the
+            // four distinct refusals it can give instead of a silent nothing.
+            #[cfg(target_arch = "x86_64")]
+            let handled = bare_exec(console, command);
+            #[cfg(not(target_arch = "x86_64"))]
+            let handled = false;
+            if !handled {
+                console.println("Unknown command. Type 'help' for assistance.");
+            }
         }
     }
 
@@ -3616,7 +3635,37 @@ fn parse_num(s: &str) -> Option<u64> {
 /// EXEC-1/BGRUN-1: the shared read-and-precheck front of `run` and `bg` — stat + bound + read off the
 /// VFS, then the friendly ELF64/aarch64 pre-check (the kernel loader is the real gate; a flat blob
 /// passes through to the position-independent flat path). `verb` names the caller in every message.
-#[cfg(feature = "baremetal")]
+///
+/// # X86RUN (GR20) — why this is `baremetal`-OR-x86 rather than `baremetal`
+///
+/// `run`/`bg`/`jobs`/`kill` were written during the Pi arcs and their whole family — verbs, helpers,
+/// job table — carried `#[cfg(feature = "baremetal")]`, the **Pi-4 bare-metal** feature. On an x86
+/// build they were therefore absent from `dispatch_command`'s match and fell through to "Unknown
+/// command", so there was no operator-facing way to start a ring-3 program on the rMBP at all.
+///
+/// Nothing about that gate was load-bearing. The x86 kernel half was BUILT for these verbs and has
+/// been shipping for arcs: `arch::x86_64::syscall` carries `run_user_image`, `spawn_user_image_bg`,
+/// `bg_poll` and `bg_kill` (the WINX-2 twins of the aarch64 entries), whose own doc comments name
+/// "the synchronous shell `run <path>` entry", "the shell's `bg <path>` entry" and "run `jobs` to
+/// reap exited jobs". `arroyo` and `scripts/make-fat-img.sh` stage `STAT.ELF` / `VUG.ELF` /
+/// `PULSE.ELF` onto the x86 DATA volume with the comment "for `run`/`bg`", and the `esp-x86`
+/// operator text already warns that a mis-staged stick makes ``bg /fat/VUG.ELF`` report `-ENOENT`.
+/// The gate was an oversight of provenance, not a dependency.
+///
+/// TWO things genuinely differ on x86, and both are handled by the twin below rather than by
+/// forcing the aarch64 body to compile:
+///
+/// * **There is no VFS namespace.** `impl VfsBackend for FatBackend` and `NativeBackend` are
+///   `#[cfg(target_arch = "aarch64")]` (see `fs/vfs.rs`), which is why `vfs_cmd` already refuses on
+///   x86. So the x86 twin reads through the FAT-direct path the `cat` verb uses
+///   (`fs::fat::mount()` + `resolve_path` + the JD4 cwd), which is the path Peter's `cat hello.txt`
+///   demonstrably exercises. `/fat/NAME` is accepted as an alias for that volume's root, because it
+///   is the form the packaging text tells the operator to type and the only FAT volume x86 mounts
+///   IS the DATA volume.
+/// * **The machine check.** The aarch64 body pre-checks `e_machine == 183`; x86 wants
+///   `EM_X86_64 = 62`. The kernel loader (`arch::x86_64::elf::validate_elf`) re-checks from scratch
+///   either way — this pre-check only sharpens the operator's error text.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
 fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::vfs::NodeKind;
     // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
@@ -3672,7 +3721,108 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
     Some(bytes)
 }
 
-#[cfg(feature = "baremetal")]
+/// X86RUN (GR20): the x86 twin of `read_el0_image` — same contract, same message shapes, same
+/// "every check can say NO" discipline, over the only file surface this arch has.
+///
+/// x86 has no VFS namespace (`fs/vfs.rs` gates both backend impls to aarch64, which is why `vfs_cmd`
+/// refuses here), so this reads through the FAT-direct path `cat` uses: `fs::fat::mount()` — which on
+/// x86 is ALWAYS the USB mass-storage DATA volume, never the UEFI boot volume the kernel cannot
+/// reach — resolved through the JD4 cwd exactly like every other file verb.
+///
+/// **`/fat` is accepted as an alias for that volume's root.** It is the form the packaging text tells
+/// the operator to type (`esp-x86` prints "…or `bg /fat/VUG.ELF` reports -ENOENT"), the form
+/// `scripts/make-fat-img.sh` documents for the staged `STAT.ELF`/`VUG.ELF`, and it costs nothing to
+/// honour because x86 mounts exactly one FAT volume. Both `run /fat/VUG.ELF` and `run VUG.ELF` (or
+/// `run /VUG.ELF`) therefore reach the same file, and the witness reports the CANONICAL on-disk path
+/// so a capture never has to guess which spelling was typed.
+#[cfg(target_arch = "x86_64")]
+fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
+    // Cap = the ring-3 window the loader will map into; a file at or under it may still be rejected by
+    // the loader, but this is the hard read ceiling — we never read past it.
+    let cap = crate::arch::syscall::user_window_size();
+    // `/fat/NAME` -> `/NAME` (see the doc note). Case-insensitive, because FAT short names are.
+    let rel = {
+        let p = path;
+        if p.len() >= 4 && p[..4].eq_ignore_ascii_case("/fat") {
+            match p.as_bytes().get(4) {
+                None => "/",              // a bare `/fat` IS the volume root
+                Some(b'/') => &p[4..],    // `/fat/VUG.ELF` -> `/VUG.ELF`
+                Some(_) => p,             // `/fatty.bin` is a real name, not the alias
+            }
+        } else {
+            p
+        }
+    };
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => {
+            console.println(&alloc::format!("{}: no FAT filesystem ({:?})", verb, e));
+            return None;
+        }
+    };
+    let de = match resolve_path(&fs, &normalize_path(&cwd_path(), rel)) {
+        Ok(Resolved::Root) => {
+            console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, path));
+            return None;
+        }
+        Ok(Resolved::Entry(de, _canon)) => de,
+        Err(msg) => {
+            console.println(&alloc::format!("{}: {}", verb, msg));
+            return None;
+        }
+    };
+    if de.is_dir {
+        console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, path));
+        return None;
+    }
+    if de.size == 0 {
+        console.println(&alloc::format!("{}: {}: empty file", verb, path));
+        return None;
+    }
+    if de.size as usize > cap {
+        console.println(&alloc::format!(
+            "{}: {}: {} bytes exceeds the {}-byte user window (-E2BIG)",
+            verb, path, de.size, cap
+        ));
+        return None;
+    }
+    let mut bytes = alloc::vec::Vec::new();
+    if let Err(e) = fs.read_file(&de, &mut bytes, cap) {
+        console.println(&alloc::format!("{}: {}: read failed ({:?}, -EIO)", verb, path, e));
+        return None;
+    }
+    if bytes.len() != de.size as usize {
+        // FATREAD-1 was exactly this class of silent mismatch (a doubled read that pushed
+        // STAT.ELF/VUG.ELF past the window). Say NO out loud rather than hand the loader a short or
+        // long image and let it report an unrelated reason.
+        console.println(&alloc::format!(
+            "{}: {}: short read — {} of {} bytes (-EIO)", verb, path, bytes.len(), de.size
+        ));
+        return None;
+    }
+    if bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F'] {
+        if bytes[4] != 2 {
+            console.println(&alloc::format!("{}: {}: not an ELF64 image (EI_CLASS != 2)", verb, path));
+            return None;
+        }
+        if bytes[5] != 1 {
+            console.println(&alloc::format!("{}: {}: not little-endian (EI_DATA != 1)", verb, path));
+            return None;
+        }
+        let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+        if machine != 62 {
+            // 62 = EM_X86_64. An aarch64 image (183) staged on x86 media lands here with a reason an
+            // operator can act on, instead of the loader's bare "not EM_X86_64".
+            console.println(&alloc::format!(
+                "{}: {}: not an x86-64 image (e_machine {} != 62)", verb, path, machine
+            ));
+            return None;
+        }
+    }
+    Some(bytes)
+}
+
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn run_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
@@ -3680,7 +3830,13 @@ fn run_program(console: &mut Console, path: &str) {
     // Hand the bytes to the kernel loader: map into a fresh user slot, run co-located, wait (bounded 5 s) for
     // the program to exit or fault. The image length + entry are reported for the witness.
     let n = bytes.len();
+    // The two `run_user_image`s take the SAME 5-second bound in different units, deliberately and
+    // documented on both sides: aarch64's twin takes a CNTPCT span (`timer::cntfrq()` = 1 s), x86's
+    // takes plain milliseconds ("the arch-neutral unit the shell now passes").
+    #[cfg(target_arch = "aarch64")]
     let deadline = 5 * crate::arch::aarch64::timer::cntfrq();
+    #[cfg(target_arch = "x86_64")]
+    let deadline: u64 = 5_000;
     match crate::arch::syscall::run_user_image("shell-run", &bytes, deadline) {
         Ok((outcome, entry)) => {
             use crate::arch::syscall::RunOutcome;
@@ -3701,6 +3857,9 @@ fn run_program(console: &mut Console, path: &str) {
                         path, n, entry
                     );
                 }
+                // CLOSE-CLEAN exists only on aarch64: the x86 `RunOutcome` (WINX-2) has three
+                // variants, with no window-close arm, so this one is arch-gated rather than faked.
+                #[cfg(target_arch = "aarch64")]
                 RunOutcome::Closed => {
                     // CLOSE-CLEAN: the operator closed the window; the program's exit is clean.
                     console.println(&alloc::format!("run: {}: closed (window close box)", path));
@@ -3727,7 +3886,7 @@ fn run_program(console: &mut Console, path: &str) {
 
 /// BGRUN-1: one shell-side background job. The PATH is copied (bounded) so `jobs` can name it — the
 /// kernel row carries only the fixed task name. The pid is the durable key; asid rides for `kill`.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 struct BgJob {
     pid: u64,
@@ -3744,7 +3903,7 @@ struct BgJob {
 /// table's 8 and under the compositor's 8 windows, so the full arm remains unreachable — kept anyway,
 /// because it is what makes an untrackable job impossible rather than merely unlikely.
 /// Shell access is single-task, but the Mutex keeps the invariant explicit rather than relying on it.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);
 
 /// STORM-FATW: the bounded USB-traffic writer `storm [n] fat` arms — the driver-claim half of the
@@ -3894,7 +4053,7 @@ fn storm_fat_writer(_: usize) {
 
 /// BGRUN-1: `bg <path>` — read the image, spawn it detached, record the job. The shell prompt is
 /// back the moment this returns; the program (and its window, if it creates one) keeps running.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_program(console: &mut Console, path: &str) -> bool {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
         return false;
@@ -3935,7 +4094,7 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
 
 /// BGRUN-1: `jobs` — list background jobs and reap the exited ones. This is the SOLE reaper for
 /// bg rows: an exited job's kernel row stays claimed (PEXITED) until it is polled here.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_jobs(console: &mut Console) {
     use crate::arch::syscall::BgPoll;
     let mut jobs = BG_JOBS.lock();
@@ -3967,6 +4126,9 @@ fn bg_jobs(console: &mut Console) {
                 serial_println!(":: BGRUN: jobs — pid={} exit=FAULT reaped ::", job.pid);
                 *slot = None;
             }
+            // CLOSE-CLEAN is an aarch64-only `BgPoll` variant (the x86 WINX-2 enum has four:
+            // Running / Exited / Faulted / Gone), so this arm is arch-gated rather than invented.
+            #[cfg(target_arch = "aarch64")]
             BgPoll::Closed => {
                 // CLOSE-CLEAN: the operator clicked the window's close box — a clean, asked-for
                 // exit. Reads like a normal completed job, never like a fault.
@@ -3987,20 +4149,30 @@ fn bg_jobs(console: &mut Console) {
     if !any {
         console.println("jobs: none");
     }
+    // The per-job lines above are panel-only except when they REAP (those already carry a witness).
+    // This one line makes the verb itself visible in a headless capture — otherwise a `jobs` with
+    // nothing to reap is indistinguishable on the wire from a keystroke that never arrived. Counted
+    // off the guard already held: `BG_JOBS` is a plain spinlock and re-locking here would deadlock.
+    let remaining = jobs.iter().flatten().count();
+    drop(jobs);
+    serial_println!(":: BGRUN: jobs — {} tracked job(s) after the sweep ::", remaining);
 }
 
 /// BGRUN-1: `kill <pid>` — kill a recorded background job (SKILL-1 underneath). The row is reaped by
 /// the next `jobs`; the table entry stays until then so the operator sees the outcome there.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_kill_cmd(console: &mut Console, pid: u64) {
     let jobs = BG_JOBS.lock();
     let Some(job) = jobs.iter().flatten().find(|j| j.pid == pid).copied() else {
         console.println(&alloc::format!("kill: no background job with pid {} (see `jobs`)", pid));
+        // Mirrored so a headless capture can tell a REFUSED kill from a keystroke that never landed.
+        serial_println!(":: BGRUN: kill pid={} — no such background job ::", pid);
         return;
     };
     drop(jobs); // bg_kill yields while confirming; never hold the table lock across that.
     let verdict = crate::arch::syscall::bg_kill(job.pid, job.asid);
     console.println(&alloc::format!("kill: pid {}: {}", pid, verdict));
+    serial_println!(":: BGRUN: kill pid={} — {} ::", pid, verdict);
     // Lens should-fix (c): a CONFIRMED kill reaps the row in place, so a later `jobs` could only say
     // "gone" — drop the table entry here instead, so the operator's record of the outcome is THIS
     // line ("killed — row reaped") rather than an uninformative gone.
@@ -4010,6 +4182,133 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
             if matches!(slot, Some(j) if j.pid == pid) {
                 *slot = None;
             }
+        }
+    }
+}
+
+/// BARE-EXEC (GR20): record a job in the shell's table under an arbitrary display name.
+///
+/// `bg_program` records the path it was handed; `bare_exec` records the CANONICAL on-disk path it
+/// resolved (so `jobs` shows `/VUG.ELF` after the operator typed `vug.elf`), which is why the table
+/// insert lives here rather than inline in one of them.
+///
+/// Returns false if the table is full; the caller must then say so rather than imply a live handle —
+/// an untracked job is one `jobs` could never reap and `kill` could never name.
+///
+/// Note what this does NOT change: the kernel `Proc` row and its `KillSwitch` are registered by
+/// `spawn_user_image_bg` itself, so `bg_kill`/`bg_poll` can always reach the pid. Only the shell's
+/// NAME for it comes from here.
+#[cfg(target_arch = "x86_64")]
+fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
+    let mut jobs = BG_JOBS.lock();
+    let Some(free) = jobs.iter_mut().find(|s| s.is_none()) else {
+        return false;
+    };
+    let mut buf = [0u8; 32];
+    let nlen = name.len().min(32);
+    buf[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
+    *free = Some(BgJob { pid, asid: slot, name: buf, nlen: nlen as u8 });
+    true
+}
+
+/// BARE-EXEC (GR20, x86): run a program by TYPING ITS NAME — `vug.elf` at the prompt starts
+/// `VUG.ELF` off the FAT volume, in a window, with the prompt back immediately.
+///
+/// Called from the ONE place a shell can safely do this: `dispatch_command`'s final fallthrough arm,
+/// after every verb has been tried. **Precedence is therefore absolute and needs no tie-break rule —
+/// a known verb always wins.** A file called `LS` on the volume is unreachable this way and that is
+/// correct; `run ./LS` names it explicitly.
+///
+/// # Resolution
+///
+/// The SAME resolution `cat` uses, verbatim: `fs::fat::mount()` (on x86 always the USB mass-storage
+/// DATA volume) + `normalize_path` against the JD4 cwd + `resolve_path`. That walk matches components
+/// with `eq_ignore_ascii_case`, so **`vug.elf` finds `VUG.ELF`** with no special-casing — FAT short
+/// names are stored uppercase and the existing walk was already case-insensitive. `cd DOCS` then a
+/// bare name works for the same reason, since the cwd is applied first.
+///
+/// # Why background, and how the operator stops it
+///
+/// Launched through `spawn_user_image_bg` — the same call `winx8_launcher` makes — so a windowed
+/// program's window STAYS OPEN and the prompt returns. Unlike that witness, nothing kills it: a
+/// user-typed launch runs until it exits or the operator stops it with `kill <pid>`. The pid is
+/// printed on the launch line and the job is recorded in the shell's table, so `jobs` lists it and
+/// `kill` can reach it.
+///
+/// # Silence vs. refusal — where the boundary is
+///
+/// Returns `false` ONLY while the token has not been shown to name a file: no volume, no such path, a
+/// directory. Those fall through to the caller's "Unknown command", which is the right answer for a
+/// typo. The moment the token resolves to a real FILE this function OWNS the reply and every exit
+/// says why — not found is the caller's, but not-an-ELF, wrong-arch, too-big, unreadable and
+/// spawn-rejected are all named here. Nothing may end in silence.
+///
+/// The loader is untouched: the bytes go to `spawn_user_image_bg` exactly as `bg` sends them, so the
+/// per-segment W^X mapping, the ring-3 window bound and the fault-kill net are the same ones CFU-2's
+/// write gate is built on. This adds a way to CALL the loader, never a way to relax it.
+#[cfg(target_arch = "x86_64")]
+fn bare_exec(console: &mut Console, token: &str) -> bool {
+    // --- quiet gate: is this token even a file? -------------------------------------------------
+    let Ok(fs) = crate::fs::fat::mount() else {
+        return false; // no volume — an unknown word is just an unknown word
+    };
+    let canon = match resolve_path(&fs, &normalize_path(&cwd_path(), token)) {
+        Ok(Resolved::Entry(de, canon)) if !de.is_dir => canon,
+        _ => return false, // no such path, or a directory — not a program name
+    };
+    // --- loud from here: the token named a real file, so we owe an outcome ----------------------
+    // Every refusal below is mirrored to serial as well as the panel. The panel line is what the
+    // operator reads; the serial line is what a headless capture reads, and without it a bench log
+    // could not tell "refused, and here is why" from "the keystroke never arrived".
+    let Some(bytes) = read_el0_image(console, token, token) else {
+        // read_el0_image named the reason on the panel (size / arch / read error).
+        serial_println!(":: BAREXEC: {} — REFUSED at the image read/pre-check (see the panel line) ::", canon);
+        return true;
+    };
+    if !(bytes.len() >= 4 && bytes[0..4] == [0x7F, b'E', b'L', b'F']) {
+        // The loader would otherwise take this down its FLAT-blob path and try to execute a text
+        // file as code. Contained (ring 3, fault-kill net) but useless and confusing, so refuse
+        // here: a bare name launches ELF programs, nothing else. `run <path>` still reaches the flat
+        // path for anyone who means it.
+        console.println(&alloc::format!(
+            "{}: not an executable (no ELF64 magic) — a bare name runs ELF programs only", token
+        ));
+        serial_println!(
+            ":: BAREXEC: {} (typed '{}') — REFUSED: not an ELF64 image (no magic); {} bytes read ::",
+            canon, token, bytes.len()
+        );
+        return true;
+    }
+    // The ELF64 / little-endian / EM_X86_64 pre-checks already ran inside `read_el0_image`, which
+    // named any of them; the kernel loader re-validates from scratch regardless.
+    let n = bytes.len();
+    match crate::arch::syscall::spawn_user_image_bg(&bytes) {
+        Ok((pid, slot, entry)) => {
+            if !adopt_bg_job(pid, slot, &canon) {
+                // Spawned but untrackable — kill it rather than leave a job `jobs` could never reap
+                // and `kill` could never name. Same rule `bg` follows, same reason.
+                let why = crate::arch::syscall::bg_kill(pid, slot);
+                console.println(&alloc::format!(
+                    "{}: job table full — spawned pid {} was killed ({})", token, pid, why
+                ));
+                serial_println!(
+                    ":: BAREXEC: {} — job table full, pid={} killed ({}) ::", canon, pid, why
+                );
+                return true;
+            }
+            console.println(&alloc::format!(
+                "{}: started — pid {} (`jobs` lists it, `kill {}` stops it)", canon, pid, pid
+            ));
+            serial_println!(
+                ":: BAREXEC: {} (typed '{}') — loaded {} bytes, entry {:#x}, pid={} slot={} DETACHED, left RUNNING ::",
+                canon, token, n, entry, pid, slot
+            );
+            true
+        }
+        Err(why) => {
+            console.println(&alloc::format!("{}: {}", token, why));
+            serial_println!(":: BAREXEC: {} — rejected ({}) ::", canon, why);
+            true
         }
     }
 }
