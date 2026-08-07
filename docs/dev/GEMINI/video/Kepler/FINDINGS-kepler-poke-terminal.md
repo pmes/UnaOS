@@ -10,7 +10,7 @@ out of scope.
 
 **Severity: high. This one invalidates the runlist leg.**
 
-*Fixed on trunk by a470ba16 (write_runlist() + the 8-word runlist-rebuild scan) before the branch merged.*
+*Fixed on trunk before the branch merged, by two commits: `ae5136d1` (submit the runlist we built — `write_runlist()` before the submit, and poll for what we submitted) and `d5d4684f` (widen the runlist restore to the plant — where the 8-word rebuild scan came from). The sha `a470ba16` cited earlier is not in trunk history; it lives only on the unmerged `wt/runlist-x86`.*
 
 `kepler.rs` builds three runlist entries:
 

@@ -1855,6 +1855,15 @@ interval since the previous one):
 | Σ | 379 ms | | against `kepler=396ms(n=1)` — **~17 ms residue**, outside any stamped phase |
 
 **`mmio_bringup` is the standing block and the named next target** — 331 of 396 ms in one phase —
+(**wire note:** `mmio_bringup` is a Boot Y name and no longer exists on the wire. The kepler
+lane's decomposition instrument, merged in `505a129e`, replaced that single phase with five —
+`pmc_vram_init`, `kdisp_takeover`, `pfifo_alloc_zero`, `runlist_write_and_pass0`,
+`plant_and_pass1` — which partition the same span exactly, since `phase!` is a running-delta
+macro and cannot leave a silent remainder. Boot Z reads those five, not this one. **Note before
+quoting them:** `kdisp_takeover` spans more than the calibration blit — `panel_console_resume`
+does a second full-surface pass over the same framebuffer, and `wcx::activate()`, a 2 M-iteration
+`spin_loop`, and 4096 uncached BAR0 reads are all inside it — so that number alone cannot
+attribute the cost to the blit. Inner bounds are assigned.)
 and nothing inside it is a deliberate wait: the span contains no spin loop at all. It is MMIO
 traffic plus serial cost. Roughly 120 `kepler`/`kdisp` lines are emitted inside the window, which
 at §10g's witness-off rate of ~0.69 ms/line (the per-print tax was retired in GR17, §10h) is

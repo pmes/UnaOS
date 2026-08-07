@@ -937,7 +937,7 @@ pub fn init(gpu: &GpuInfo) {
                                     if !diff_found {
                                         serial_println!(":: kepler: latch-delta none ::");
                                     }
-                                    phase!("runlist_and_pass0");
+                                    phase!("runlist_write_and_pass0");
 
                                     // Plant Beacons
                                     let pattern = [
