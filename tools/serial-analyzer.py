@@ -1584,12 +1584,66 @@ def wxn_m3a_era(w):
             "and the sweep line does not show a clear BSP CR0.WP")
 
 
+# The three places ONE x86 boot states the BSP's own CR0.WP, and the reason
+# they are comparable at all — cited from the emitters, because a cross-check
+# between two readings that are not of the same register on the same core is
+# not a check, it is a coincidence detector.
+#
+#   * `WXAUDIT-NXE ... wp_mask=0x..`  bit 0.  `wxn_nxe_report` opens with
+#     `wxn_record_core(0)` (smp.rs:124) and that function reads `Cr0::read_raw()`
+#     on the core executing it (smp.rs:99-101), ORing bit `idx`.  `idx` here is
+#     the literal 0 and `start_aps` runs on the BSP, so BIT 0 IS THE BSP and
+#     nothing else sets it (the only other caller is `ap_entry`, smp.rs:615,
+#     whose `index` starts at 1 — smp.rs:712 "logical CPU 0 is the BSP").
+#   * `WXPROBE cpu: cr0=0x.. wp=N`.  `wx_probe_report` reads the BSP's live CR0
+#     (memory.rs:1481) and prints bit 16 as `wp=` (memory.rs:1489); the raw
+#     `cr0=` word carries the same bit, so the line states it twice.
+#   * `WXN-x86: ... wp=N -> SWEPT`.  `wxn_pdpt_sweep` reads the BSP's live CR0
+#     and takes bit 16 (memory.rs:1754-1756).
+#
+# ORDER, which is what makes disagreement a fault rather than an era: on the
+# BSP `arch::init` runs `syscall::init` (mod.rs:36) — where M3a arms CR0.WP,
+# syscall.rs:5753 — then the sweep (mod.rs:46), then WXPROBE (mod.rs:57); the
+# WXAUDIT-NXE rollup comes later still, from `start_aps`.  All three readings
+# are therefore taken AFTER the arm, in both eras (pre-M3a they all read the
+# firmware's value, post-M3a they all read 1).  Nothing between them leaves WP
+# changed: `with_page_tables_writable` clears it inside `without_interrupts`
+# and restores it before returning (memory.rs:313-327).  A healthy boot cannot
+# print two different values for this bit.
+#
+# BITS 1.. ARE NOT COVERED and this reader never pretends otherwise: they name
+# APs, and no other line in the capture reads an AP's CR0.  The BSP bit is the
+# one bit the wire states three times, so it is the one bit a corrupted mask
+# cannot lose quietly.
+def wxn_bsp_wp_witnesses(w):
+    """Every reading of the BSP's CR0.WP this boot carries OTHER than the
+    WXAUDIT-NXE mask itself.  Returns [(source, value, raw), ...] — empty when
+    the boot carries none, which is a boot this cross-check must not judge."""
+    out = []
+    probe = w.get('probe_cpu')
+    if probe:
+        f = probe['fields']
+        wp = _num(f.get('wp'))
+        if wp is not None:
+            out.append(('WXPROBE cpu wp=', wp, f.get('wp')))
+        cr0 = _wxn_hexmask(f.get('cr0'))
+        if cr0 is not None:
+            out.append(('WXPROBE cpu cr0= bit 16', (cr0 >> 16) & 1,
+                        f.get('cr0')))
+    sweep = w.get('sweep')
+    if sweep:
+        wp = _num(sweep['fields'].get('wp'))
+        if wp is not None:
+            out.append(('WXN-x86 sweep wp=', wp, sweep['fields'].get('wp')))
+    return out
+
+
 def wxn_boot(boot):
     """Pull one boot's WXN/WXAUDIT block apart, or None if it carries none.
 
     Every one of the four wires is optional and each records its own absence,
     because the eras above mean 'not in this boot' is three different facts."""
-    sweep = census = nxe = fbwc = m2 = None
+    sweep = census = nxe = fbwc = m2 = probe_cpu = None
     dups = Counter()
     for line, probe_line in zip(boot['lines'], boot['probe']):
         mm = WXN_M2_RE.match(probe_line)
@@ -1638,6 +1692,19 @@ def wxn_boot(boot):
             dups['fbwc'] += 1
             fbwc = {'fields': _kv(m.group(1)), 'verdict': m.group(2),
                     'line': line}
+            continue
+        # The BSP's OTHER statement of CR0.WP.  Read HERE, inside this boot's
+        # own loop, rather than borrowed from `wxprobe_boot`: the cross-check
+        # below is sound only between lines the SAME boot printed, and scoping
+        # it by construction is cheaper than remembering to.  Last one wins,
+        # like every other wire in this block.
+        m = WXPROBE_RE.match(probe_line)
+        if m and m.group(1) == 'cpu':
+            dups['probe_cpu'] += 1
+            probe_cpu = {'fields': _kv(m.group(2)), 'line': line}
+    # `probe_cpu` is deliberately NOT in this tuple: a WXPROBE `cpu:` line is a
+    # corroborating witness, not a WXN wire, so a boot carrying it and nothing
+    # else is still a boot with no WXN block — unchanged from before.
     if not any((sweep, census, nxe, fbwc, m2)):
         return None
     # The build era, read off the wires themselves rather than off a version
@@ -1651,7 +1718,8 @@ def wxn_boot(boot):
     else:
         era = 'pre-a0a2d163 (WXAUDIT census only)'
     return {'number': boot['number'], 'sweep': sweep, 'census': census,
-            'nxe': nxe, 'fbwc': fbwc, 'm2': m2, 'era': era, 'dups': dups,
+            'nxe': nxe, 'fbwc': fbwc, 'm2': m2, 'probe_cpu': probe_cpu,
+            'era': era, 'dups': dups,
             'modern': (census and census['hist']) or bool(fbwc)}
 
 
@@ -1952,6 +2020,72 @@ def wxn_selfchecks(w):
                         f"bit the sweep wrote")
     else:
         msgs.append(f"note per-core NXE: {WXN_ABSENT}")
+
+    # 4. THE BSP's CR0.WP, cross-read across every line of THIS boot that
+    #    states it (`wxn_bsp_wp_witnesses` above carries the emitter citations).
+    #
+    #    WHY THIS EXISTS (GR20 gate pre-verification, RESIDUAL-2).  Check 3
+    #    reads the era off the `-> PASS` token and the mask on ONE line, and
+    #    branch 2 of `wxn_m3a_era` excuses a short mask that kept its PASS as a
+    #    pre-M3a kernel.  That inference is sound about a KERNEL and says
+    #    nothing about a WIRE: a healthy post-M3a boot whose `wp_mask` loses a
+    #    bit in transit, with the verdict token surviving, reads as exactly the
+    #    same line — and was excused, silently, exit 0.  Nothing in this file
+    #    checked that mask against the two other places the same boot prints
+    #    the same register.  Now something does.
+    #
+    #    SCOPE, stated so the check cannot be read as more than it is: only bit
+    #    0 has a second witness.  Agreement here confirms the mask's BSP bit,
+    #    NOT the whole mask — a mask that drops an AP bit is still invisible to
+    #    this reader, and check 3's era branch still governs it.
+    #
+    #    The era logic is untouched: this adds a finding, it changes no verdict
+    #    path.  A boot with the mask and no other witness, or with witnesses
+    #    and no readable mask, is REPORTED as unchecked and never convicted.
+    if nxe:
+        f = nxe['fields']
+        wp_mask = _wxn_hexmask(f.get('wp_mask'))
+        wits = wxn_bsp_wp_witnesses(w)
+        if wp_mask is None:
+            pass  # check 3 already said the mask was unreadable; once is enough
+        elif not wits:
+            msgs.append(
+                f"note BSP CR0.WP: wp_mask={f.get('wp_mask')} is the only "
+                f"reading of that register on this boot (no WXPROBE cpu line, "
+                f"no readable wp= on the WXN-x86 sweep), so it stands "
+                f"un-cross-checked — which is not the same as confirmed")
+        else:
+            bsp = wp_mask & 1
+            disagree = [t for t in wits if t[1] != bsp]
+            shown = ", ".join(f"{src} {raw}" for src, _v, raw in wits)
+            if not disagree:
+                msgs.append(
+                    f"ok   BSP CR0.WP agrees across {len(wits) + 1} reading(s) "
+                    f"on this boot: wp_mask={f.get('wp_mask')} bit 0 = {bsp}, "
+                    f"{shown}. Only bit 0 is cross-checkable — bits 1.. name "
+                    f"APs and no other line reads an AP's CR0 — so this "
+                    f"confirms the mask's BSP bit, not the whole mask")
+            else:
+                clean = False
+                bad = ", ".join(f"{src} {raw} (reads {v})"
+                                for src, v, raw in disagree)
+                msgs.append(
+                    f"WARN WXN-WP-XCHECK: boot {w['number']} wp_mask="
+                    f"{f.get('wp_mask')} puts the BSP's CR0.WP at {bsp}, and "
+                    f"this boot's other reading(s) of the SAME bit of the SAME "
+                    f"register on the SAME core disagree: {bad}. All of them "
+                    f"are the BSP's own live CR0 (wxn_record_core(0) from "
+                    f"wxn_nxe_report, smp.rs:124/99-101; wx_probe_report, "
+                    f"memory.rs:1481+1489; wxn_pdpt_sweep, memory.rs:1754-1756) "
+                    f"and all are taken after M3a's arm (syscall.rs:5753, "
+                    f"ordered by mod.rs:36 -> :46 -> :57), with the only "
+                    f"clearer restoring the bit before it returns "
+                    f"(memory.rs:313-327) — so a healthy boot cannot print two "
+                    f"values. Either wp_mask lost the bit on the wire, in which "
+                    f"case the era read off this line above (and any pre-M3a "
+                    f"excuse resting on it) is worthless, or the arm did not "
+                    f"hold on the BSP. Do not use wp_mask as evidence on this "
+                    f"boot")
     return clean, msgs
 
 
@@ -4538,6 +4672,116 @@ def wxn_m3a_expect(result):
     ]
 
 
+# --- the BSP CR0.WP cross-check fixture ------------------------------------
+#
+# THE CONDITION THIS EXISTS FOR (GR20 gate pre-verification, RESIDUAL-2).  The
+# era decision above is sound about a KERNEL and silent about a WIRE.  A
+# healthy post-M3a boot whose `wp_mask` loses a bit in transit while the
+# `-> PASS` token survives is byte-for-byte the shape branch 2 of
+# `wxn_m3a_era` excuses as a pre-M3a build — and until this check it was
+# excused, with no WARN and exit 0.  The mitigation was a human reading the
+# mask by eye on every capture, which is not an instrument.
+#
+# Boot 1 is REAL, quoted byte-for-byte out of Boot AA
+# (~/unaos-bench/scratch/gr20/bootAA-slice.log lines 7/13/14/15/17/18/26/63 —
+# the first metal capture carrying M3a).  Lines between the quoted ones were
+# dropped; nothing was edited.  Its three readings of the BSP's CR0.WP agree
+# (`wp_mask=0xFF` bit 0, `WXPROBE cpu wp=1` / `cr0=0x...80010013` bit 16, and
+# the sweep's `wp=1`), so it must stay clean and exit OK.
+#
+# Boot 2 is boot 1 with ONE line changed and the change made COHERENTLY, which
+# is what makes it the falsifier rather than a straw man: `wp=8 wp_mask=0xFF`
+# becomes `wp=7 wp_mask=0xFE` — the count still equals the mask's popcount, so
+# nothing WITHIN the line is inconsistent, and the verdict token is left at
+# `-> PASS`.  Every other wire, including the WXPROBE and sweep readings of the
+# same register, is untouched.  Read by the era logic alone that boot is a
+# clean pre-M3a kernel; read across its own three witnesses the BSP bit is 0 on
+# one line and 1 on three others, which no boot can honestly print.
+WXN_FIXTURE_WPX_CLEAN = """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B1FC000 img=[0x7B1FC000,0x7B8D3000) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=1 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B1FC000,0x7B33A000) xsegs=2 xpages=318 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=2 pool_used=2/16 nx_pdpt=0 nx_2m=1021 nx_pt=0 nx_4k=1217 keep_x=319 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=319 (1 MiB) tables=1030 nxe=1 walk=1724kcyc l1=0 l2=65533 l3=1536 ::
+[      ?ms] :: WXPROBE cpu: cr0=0x0000000080010013 wp=1 cr4=0x0000000000100668 pge=0 smep=1 smap=0 la57=0 efer=0x0000000000000D01 nxe=1 lme=1 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=8 wp_mask=0xFF -> PASS ::
+"""
+
+# The falsifier, on top of the real boot: the same capture with the rollup's
+# mask short by its BSP bit and the PASS token intact.
+WXN_FIXTURE_WPX = WXN_FIXTURE_WPX_CLEAN + """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B1FC000 img=[0x7B1FC000,0x7B8D3000) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=1 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B1FC000,0x7B33A000) xsegs=2 xpages=318 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=2 pool_used=2/16 nx_pdpt=0 nx_2m=1021 nx_pt=0 nx_4k=1217 keep_x=319 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=319 (1 MiB) tables=1030 nxe=1 walk=1724kcyc l1=0 l2=65533 l3=1536 ::
+[      ?ms] :: WXPROBE cpu: cr0=0x0000000080010013 wp=1 cr4=0x0000000000100668 pge=0 smep=1 smap=0 la57=0 efer=0x0000000000000D01 nxe=1 lme=1 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFE wp=7 wp_mask=0xFE -> PASS ::
+"""
+
+
+def wxn_wpx_expect(result):
+    """The BSP's CR0.WP, read three ways on one boot — agreeing and not."""
+    b1, b2 = (wxn_boot(b) for b in result['boots'])
+    s1, n1 = wxn_selfchecks(b1)
+    s2, n2 = wxn_selfchecks(b2)
+    v2, _m2msgs = wxn_verdicts(b2)
+    j1, j2 = ("\n".join(x) for x in (n1, n2))
+    # The missing-witness leg, built by taking the two corroborating wires away
+    # from the SAME boot: a mask with nothing to check it against must be
+    # reported as unchecked, never convicted.
+    lone = dict(b2)
+    lone['probe_cpu'], lone['sweep'] = None, None
+    lclean, lmsgs = wxn_selfchecks(lone)
+    return [
+        ('boots parsed', len(result['boots']), 2),
+        # THE WIRE IS ACTUALLY READ.  A cross-check whose second witness never
+        # parses is a cross-check that can only ever agree with itself.
+        ('the WXPROBE cpu line is captured per boot, not borrowed',
+         (b1['probe_cpu'] is not None, b1['probe_cpu']['fields']['wp']),
+         (True, '1')),
+        ('all three readings of the BSP bit are found on boot 1',
+         [(src, v) for src, v, _raw in wxn_bsp_wp_witnesses(b1)],
+         [('WXPROBE cpu wp=', 1), ('WXPROBE cpu cr0= bit 16', 1),
+          ('WXN-x86 sweep wp=', 1)]),
+        # boot 1 — the real Boot AA: agreement, and no new noise.
+        ('boot 1 self-checks clean', s1, True),
+        ('boot 1 states the agreement', 'ok   BSP CR0.WP agrees across 4 '
+         'reading(s)' in j1, True),
+        ('the agreement refuses to overclaim the AP bits',
+         'confirms the mask\'s BSP bit, not the whole mask' in j1, True),
+        ('boot 1 raises no cross-check finding',
+         any(m.startswith('WARN WXN-WP-XCHECK') for m in n1), False),
+        # boot 2 — THE RESIDUAL: the era logic is untouched and still excuses
+        # it, so the conviction can only be coming from the new check.
+        ('the era logic is UNCHANGED and still reads boot 2 as pre-M3a',
+         wxn_m3a_era(b2)[0], WXN_M3A_PRE),
+        ('check 3 still prints the pre-M3a excuse on boot 2',
+         ('PREDATES M3a' in j2, 'not a fault' in j2), (True, True)),
+        ('boot 2 is a FINDING all the same', s2, False),
+        ('the finding is the cross-check, and it is the ONLY one on the boot',
+         [m.split(':')[0] for m in n2 if m.startswith('WARN')],
+         ['WARN WXN-WP-XCHECK']),
+        ('the verdict path is untouched — every token still PASSes', v2, True),
+        ('the finding names the mask, the bit and the witnesses that differ',
+         ('wp_mask=0xFE puts the BSP\'s CR0.WP at 0' in j2,
+          'WXPROBE cpu wp= 1 (reads 1)' in j2,
+          'WXN-x86 sweep wp= 1 (reads 1)' in j2), (True, True, True)),
+        ('the finding says the era read off that line is worthless',
+         'excuse resting on it) is worthless' in j2, True),
+        # the missing-witness leg.
+        ('a boot with the mask and no second witness has no witnesses',
+         wxn_bsp_wp_witnesses(lone), []),
+        ('and it must NOT fire',
+         (any(m.startswith('WARN WXN-WP-XCHECK') for m in lmsgs), lclean),
+         (False, True)),
+        ('it is reported as unchecked rather than confirmed',
+         'stands un-cross-checked' in "\n".join(lmsgs), True),
+    ]
+
+
 def wxn_booty_expect(result):
     """Boot Y read end to end — the M2 wire, and the delta it owns."""
     w = wxn_boot(result['boots'][0])
@@ -4914,6 +5158,9 @@ def selftest_wxn():
         ('WXN: the three CR0.WP eras — a real pre-M3a six-core boot, the real '
          'post-M3a one, and a post-M3a boot one core short',
          WXN_FIXTURE_M3A, wxn_m3a_expect),
+        ('WXN: the BSP CR0.WP cross-check — the real Boot AA, and the same '
+         'boot with its wp_mask short by the BSP bit and PASS intact',
+         WXN_FIXTURE_WPX, wxn_wpx_expect),
         # One fixture per ARM of the kern_WX-rise classifier.  An arm with no
         # fixture is an arm nobody re-tests, and the benign arm is the one that
         # could quietly learn to explain away a real regression.
@@ -4964,6 +5211,14 @@ def selftest_wxn():
          WXN_FIXTURE_M3A_CLEAN, EXIT_OK),
         ('--wxn on a post-M3a boot one core short exits FINDING',
          WXN_FIXTURE_M3A, EXIT_FINDING),
+        # RESIDUAL-2, both ways, through the real report path: the metal Boot AA
+        # whose three CR0.WP readings agree must stay OK, and the same boot with
+        # its mask short by the BSP bit — the reading the era logic excuses —
+        # must reach the finding code.
+        ('--wxn on the real Boot AA (three CR0.WP readings agreeing) exits OK',
+         WXN_FIXTURE_WPX_CLEAN, EXIT_OK),
+        ('--wxn on a boot whose wp_mask contradicts its own WXPROBE/sweep '
+         'exits FINDING', WXN_FIXTURE_WPX, EXIT_FINDING),
         # THE EXIT-CODE CLAIM the refinement rests on: a code-growth rise must
         # not set the finding code, and neither of the other two arms may lose
         # it.  Asserted through the real report path, not through wxn_trend.
