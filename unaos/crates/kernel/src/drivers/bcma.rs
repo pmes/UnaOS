@@ -33,10 +33,51 @@
 //!
 //! The consequence, stated up front because it is the arc's main finding: **a BCMA part on a PCIe
 //! host exposes exactly ONE backplane core through BAR0 at a time**, selected by a PCI *config*
-//! register, and firmware leaves that selector at the ChipCommon enumeration base. So ChipCommon is
-//! readable and everything else — the enumeration ROM, the 802.11 core, the PHY version register —
-//! is behind one 32-bit config write this arc refuses to make. Each of those is reported as an
-//! explicit `REFUSED` witness naming the register, not as a missing line.
+//! register. Everything not currently in that window — the enumeration ROM, the 802.11 core, the
+//! PHY version register — is behind one 32-bit config write this arc refuses to make. Each of those
+//! is reported as an explicit `REFUSED` witness naming the register, not as a missing line.
+//!
+//! ## What Boot AF changed
+//!
+//! The first metal reading falsified this file's central assumption. It had assumed firmware leaves
+//! `BCMA_PCI_BAR0_WIN` (cfg:0x80) parked at the ChipCommon enumeration base, so that ChipCommon at
+//! least would be free. On the 2012 rMBP it does not:
+//!
+//! ```text
+//! bar0_win(cfg:0x80)=0x18001000 bar0_win2(cfg:0xac)=0x18101000
+//! ```
+//!
+//! `0x18001000` is `BCMA_ADDR_BASE + 1*BCMA_CORE_SIZE` and `0x18101000` is
+//! `BCMA_WRAP_BASE + 1*BCMA_CORE_SIZE` — the (`core->addr`, `core->wrap`) pair Linux's
+//! `bcma_host_pci_switch_core()` writes for **core index 1**, which on a BCM4331 is the D11 802.11
+//! core. Apple's firmware left the window on the radio core, not on ChipCommon. So BAR0+0 was never
+//! ChipCommon on this machine, and the `0xffffffff` at BAR0+0 is the reading of an off-window core,
+//! not a verdict about the function.
+//!
+//! That reading was also **misreported**, by this file: stage 5 tested "all-ones" BEFORE it tested
+//! "is the window even on ChipCommon", so the `window-elsewhere` refusal — which was present and
+//! correct — could never fire whenever the off-window core happened to be unreadable. The order is
+//! now window-first, which is the only order in which either refusal means what it says.
+//!
+//! Boot AF also settled that this is NOT a mapping fault of ours. The map wire line
+//! (`:: x86 mmio-map: 0xc1900000..0xc1902000 uc=1 (PAT PA3) wc-kept=0 ::`) retypes the same 2 MiB
+//! leaf that `sdhc`'s BAR at `0xc1820000` sits in, and `sdhc` reads its registers successfully in
+//! the same boot through that same leaf. Identical VA, identical PAT typing, one works.
+//!
+//! ## Stage 4b: the wrapper window is the discriminator
+//!
+//! BAR0's SECOND 4 KiB is a separate window onto the selected core's AXI/OOB **wrapper**, selected
+//! by cfg:0xAC (Linux `bcma_host_pci_aread32` reads `mmio + 1*BCMA_CORE_SIZE + offset`). The wrapper
+//! is exactly the block that stays alive while its core is held in reset — it is how a driver takes
+//! the core OUT of reset. Reading `IOCTL`/`RESET_CTL` there is read-only and splits the two live
+//! explanations of an all-ones core window:
+//!
+//! * wrapper answers, `RESET_CTL.reset=1` or `IOCTL.clk=0` -> the core in the window is in reset /
+//!   clock-gated. The function decodes fine; we were pointed at a dark core.
+//! * wrapper ALSO reads all-ones -> the function is not answering at all, and the blame moves
+//!   upstream to the link or the bridge window, not to a core's reset state.
+//!
+//! Whichever it is, it is a fact about this machine that the next boot prints.
 //!
 //! ## Witness contract
 //!
@@ -48,8 +89,9 @@
 //! * the function parked in D1/D2/D3                      -> `REFUSED reason=power-state`;
 //! * memory decode off in COMMAND                         -> `REFUSED reg=cfg:0x04.bit1`;
 //! * BAR0 unassigned, or not identity-mapped after the map -> `REFUSED reason=bar0-*`;
-//! * ChipCommon reading all-ones                          -> `REFUSED reason=not-decoding`;
-//! * the BAR0 window not parked at the enumeration base   -> `REFUSED reason=window-elsewhere`;
+//! * the BAR0 window not parked at the enumeration base   -> `REFUSED reason=window-elsewhere`
+//!   (tested FIRST, because it is a fact about cfg:0x80 and needs no MMIO read to be true);
+//! * ChipCommon reading all-ones with the window correct  -> `REFUSED reason=not-decoding`;
 //! * EROM outside the live window                         -> `REFUSED reg=cfg:0x80` + the address;
 //! * no SPROM advertised and no OTP subregion programmed  -> `sprom=absent otp=absent`.
 //!
@@ -108,15 +150,51 @@ const CFG_BAR0_WIN2: u8 = 0xAC;
 /// registers at BAR0+0 are NOT ChipCommon and this file refuses to decode them.
 const BCMA_ADDR_BASE: u32 = 0x1800_0000;
 
+/// `BCMA_WRAP_BASE` — the backplane base of the core-WRAPPER address space. On the parts this file
+/// targets, core *i*'s registers sit at `BCMA_ADDR_BASE + i*BCMA_CORE_SIZE` and its wrapper at
+/// `BCMA_WRAP_BASE + i*BCMA_CORE_SIZE`, which is why a (cfg:0x80, cfg:0xAC) pair of
+/// `(0x18001000, 0x18101000)` is readable as "core index 1, wrapper index 1" and not as noise. The
+/// EROM is authoritative for both addresses; this grid is used ONLY to render an index for the
+/// reader, and every line that uses it says so.
+const BCMA_WRAP_BASE: u32 = 0x1810_0000;
+
 /// One backplane core's register window. Also the size of the BAR0 core window, which is what makes
 /// "is the EROM reachable" a simple containment test.
 const BCMA_CORE_SIZE: u32 = 0x1000;
 
-/// How much of BAR0 is mapped. 0x2000 = the core window (0x0000) plus the wrapper window (0x1000),
-/// which is the smallest BAR0 any BCMA PCIe part presents. Nothing at or past 0x1000 is READ — the
-/// BAR's true size is unknowable without a sizing write and this arc does not size BARs — so the
-/// second page is mapped only so a future stage does not have to re-map.
+/// Ceiling on the core index this file will render from a raw window address. `BCMA_MAX_NR_CORES`
+/// in Linux is 16; a window past that is off the grid and is printed as unindexed rather than as a
+/// large index that would look like a decode.
+const BCMA_MAX_NR_CORES: u32 = 16;
+
+/// How much of BAR0 is mapped, and it is NOT a guess: on a BCMA PCIe host BAR0 is exactly two 4 KiB
+/// apertures, and Linux's own accessors say which is which — `bcma_host_pci_read32` reads
+/// `mmio + offset` (the core window, selected by cfg:0x80) and `bcma_host_pci_aread32` reads
+/// `mmio + 1*BCMA_CORE_SIZE + offset` (the wrapper window, selected by cfg:0xAC). No bcma accessor
+/// in Linux ever indexes past `2*BCMA_CORE_SIZE`, so 0x2000 is the whole architecturally-defined
+/// extent of BAR0 for this driver model, whatever the BAR's physical size turns out to be.
+///
+/// The physical size is a separate question and remains UNKNOWN: reading it needs the write-all-ones
+/// / read-mask / restore sizing dance, and this arc does not write. The relationship is one-sided
+/// and safe in the direction that matters — the true size is >= 0x2000 (both windows exist and are
+/// used), so mapping 0x2000 cannot map past the BAR.
 const BAR0_MAP_LEN: usize = 0x2000;
+
+/// Byte offset of the wrapper aperture inside BAR0. See [`BAR0_MAP_LEN`].
+const BAR0_WRAP_OFF: u64 = 0x1000;
+
+// AXI/OOB core-wrapper registers (Linux `include/linux/bcma/bcma.h`). These live in the WRAPPER
+// window, not the core window, and they are readable while the core itself is held in reset — which
+// is the whole reason stage 4b can tell "core is dark" from "function is dead".
+const WRAP_IOCTL: u64 = 0x0408; // BCMA_IOCTL
+const WRAP_IOST: u64 = 0x0500; // BCMA_IOST
+const WRAP_RESET_CTL: u64 = 0x0800; // BCMA_RESET_CTL
+const WRAP_RESET_ST: u64 = 0x0804; // BCMA_RESET_ST
+
+const IOCTL_CLK: u32 = 0x0001; // BCMA_IOCTL_CLK
+const IOCTL_FGC: u32 = 0x0002; // BCMA_IOCTL_FGC
+const IOST_GATED_CLK: u32 = 0x2000_0000; // BCMA_IOST_GATED_CLK
+const RESET_CTL_RESET: u32 = 0x0001; // BCMA_RESET_CTL_RESET
 
 // ChipCommon core register offsets (Linux `bcma_driver_chipcommon.h`).
 const CC_ID: u64 = 0x0000; // chip id / rev / package / #cores / chip type
@@ -320,22 +398,90 @@ fn find_wifi() -> (Option<(u8, u8, u8)>, u32) {
 
 /// Well-known BCMA core ids, for the reader. `?` is an honest "we do not name this id" — the
 /// numeric id is on the line already and is the deliverable.
+///
+/// Transcribed from Linux `include/linux/bcma/bcma.h`. The previous table in this file was wrong on
+/// nearly every entry past ChipCommon — it named 0x812 "mips-33" and 0x820 "d11(802.11)" when
+/// `BCMA_CORE_80211` is **0x812** and `BCMA_CORE_PCIE` is **0x820**. Nothing had run the EROM walk
+/// yet, so no capture could catch it; it would have mislabelled every core on the first successful
+/// walk and, worse, sent a bring-up stage at the PCIe core while calling it the radio.
 fn core_name(id: u16) -> &'static str {
     match id {
         0x800 => "chipcommon",
-        0x801 => "ilinelt",
-        0x807 => "pcie-g1",
-        0x80C => "sdio-dev",
-        0x812 => "mips-33",
-        0x81B => "usb20-host",
-        0x81C => "usb20-dev",
-        0x820 => "d11(802.11)",
-        0x829 => "pcie-g2",
-        0x82C => "gmac-cmn",
-        0x82D => "gmac",
-        0x835 => "pmu",
-        0x83E => "ns-pcie2",
+        0x801 => "iline20",
+        0x802 => "sram",
+        0x803 => "sdram",
+        0x804 => "pci",
+        0x805 => "mips",
+        0x806 => "ethernet",
+        0x807 => "v90",
+        0x808 => "usb11-hostdev",
+        0x80B => "ipsec",
+        0x80D => "pcmcia",
+        0x80E => "internal-mem",
+        0x80F => "memc-sdram",
+        0x810 => "ofdm",
+        0x811 => "extif",
+        0x812 => "d11(802.11)",
+        0x813 => "phy-a",
+        0x814 => "phy-b",
+        0x815 => "phy-g",
+        0x816 => "mips-3302",
+        0x817 => "usb11-host",
+        0x818 => "usb11-dev",
+        0x819 => "usb20-host",
+        0x81A => "usb20-dev",
+        0x81B => "sdio-host",
+        0x81C => "roboswitch",
+        0x81E => "sata-xordma",
+        0x81F => "ethernet-gbit",
+        0x820 => "pcie",
+        0x821 => "phy-n",
+        0x822 => "sram-ctl",
+        0x824 => "arm-1176",
+        0x825 => "arm-7tdmi",
+        0x826 => "phy-lp",
+        0x827 => "pmu",
+        0x828 => "phy-ssn",
+        0x829 => "sdio-dev",
+        0x82A => "arm-cm3",
+        0x82B => "phy-ht",
+        0x82C => "mips-74k",
+        0x82D => "mac-gbit",
+        0x82E => "ddr12-mem-ctl",
+        0x82F => "pcie-rc",
+        0x830 => "ocp-ocp-bridge",
+        0x831 => "shared-common",
+        0x832 => "ocp-ahb-bridge",
+        0x833 => "spi-host",
+        0x834 => "i2s",
+        0x835 => "sdr-ddr1-mem-ctl",
+        0x836 => "shim",
+        0x83B => "phy-ac",
+        0x83C => "pcie2",
+        0x83D => "usb30-host",
+        0x83E => "arm-ca9",
         _ => "?",
+    }
+}
+
+/// Render a raw backplane window address as a core (or wrapper) index on the standard grid.
+///
+/// Returns `None` when the address is not on the grid at all, which is itself information: a window
+/// pointing somewhere off-grid is not a core selection this file can name, and it says so instead of
+/// dividing anyway and printing a plausible index.
+fn grid_index(addr: u32, base: u32) -> Option<u32> {
+    if addr < base {
+        return None;
+    }
+    let off = addr - base;
+    if (off & (BCMA_CORE_SIZE - 1)) != 0 {
+        return None;
+    }
+    let idx = off / BCMA_CORE_SIZE;
+    if idx < BCMA_MAX_NR_CORES {
+        Some(idx)
+    } else {
+        None
     }
 }
 
@@ -569,9 +715,16 @@ pub fn recon() {
     let pstate = if pm != 0 {
         let pmcsr = unsafe { read_config_32(bus, dev, func, pm + 4) };
         let d = (pmcsr & 0x3) as u8;
+        // FULL decode, because "state=D0" alone leaves a reader unable to check the claim. PCI PM
+        // 1.2 PMCSR: [1:0] PowerState, [3] NoSoftReset, [8] PME_En, [12:9] Data_Select,
+        // [14:13] Data_Scale, [15] PME_Status. Boot AF read 0x4008 = D0, NoSoftReset=1, PME_En=0,
+        // PME_Status=0, Data_Scale=2 — i.e. the function is awake and has no pending wake event,
+        // which is why "parked in D3" is NOT the explanation for the all-ones BAR0 reads.
         serial_println!(
-            ":: bcma: power cap@{:#04x} pmcsr={:#06x} state=D{} ::",
-            pm, (pmcsr & 0xFFFF) as u16, d
+            ":: bcma: power cap@{:#04x} pmcsr={:#06x} state=D{} no-soft-reset={} pme_en={} pme_status={} data_sel={} data_scale={} ::",
+            pm, (pmcsr & 0xFFFF) as u16, d,
+            (pmcsr >> 3) & 1, (pmcsr >> 8) & 1, (pmcsr >> 15) & 1,
+            (pmcsr >> 9) & 0xF, (pmcsr >> 13) & 0x3
         );
         d
     } else {
@@ -619,11 +772,44 @@ pub fn recon() {
     } else {
         (bar0_raw & 0xFFFF_FFF0) as u64
     };
+    let bar1_raw = if is64 { unsafe { read_config_32(bus, dev, func, CFG_BAR1) } } else { 0 };
     let win = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
     let win2 = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN2) };
+    // Which core the two windows are pointed at, rendered as an index on the standard grid. This is
+    // the line Boot AF needed and did not have: `0x18001000` looks like "ChipCommon, off by a page"
+    // to a reader who does not have the grid in their head, and it is nothing of the sort — it is a
+    // different core entirely.
+    let win_idx = grid_index(win, BCMA_ADDR_BASE);
+    let win2_idx = grid_index(win2, BCMA_WRAP_BASE);
     serial_println!(
-        ":: bcma: bar0={:#x} raw={:#010x} type={} prefetch={} maplen={:#x} bar0_win(cfg:0x80)={:#010x} bar0_win2(cfg:0xac)={:#010x} ::",
-        bar0, bar0_raw, if is64 { "mem64" } else { "mem32" }, pf, BAR0_MAP_LEN, win, win2
+        ":: bcma: bar0={:#x} raw={:#010x} bar1_raw={:#010x} type={} prefetch={} maplen={:#x} (core-win bar0+0x0, wrap-win bar0+{:#x}) bar0_win(cfg:0x80)={:#010x} bar0_win2(cfg:0xac)={:#010x} ::",
+        bar0, bar0_raw, bar1_raw, if is64 { "mem64" } else { "mem32" }, pf, BAR0_MAP_LEN,
+        BAR0_WRAP_OFF, win, win2
+    );
+    serial_print!(":: bcma: window-decode core-index=");
+    match win_idx {
+        Some(a) => {
+            serial_print!("{}", a);
+        }
+        None => {
+            serial_print!("off-grid");
+        }
+    }
+    serial_print!(" wrap-index=");
+    match win2_idx {
+        Some(b) => {
+            serial_print!("{}", b);
+        }
+        None => {
+            serial_print!("off-grid");
+        }
+    }
+    serial_println!(
+        " paired={} on-enum-base={} grid(core {:#010x}+i*{:#x}, wrap {:#010x}+i*{:#x}) — BAR0+0 decodes to backplane {:#010x}, BAR0+{:#x} to {:#010x} ::",
+        (win_idx.is_some() && win_idx == win2_idx) as u8,
+        (win == BCMA_ADDR_BASE) as u8,
+        BCMA_ADDR_BASE, BCMA_CORE_SIZE, BCMA_WRAP_BASE, BCMA_CORE_SIZE,
+        win, BAR0_WRAP_OFF, win2
     );
 
     // Identity-map the register block uncacheable. This is a page-table edit; the device sees
@@ -639,22 +825,65 @@ pub fn recon() {
         return;
     }
 
-    // ── Stage 5: ChipCommon — the one core reachable without moving the window ──────────────────
-    let chipid = unsafe { r32(bar0, CC_ID) };
-    if chipid == 0xFFFF_FFFF {
+    // ── Stage 4b: the WRAPPER window — read-only, and the discriminator for an all-ones core ────
+    //
+    // BAR0's second 4 KiB is the AXI/OOB wrapper of whatever core cfg:0xAC selects. The wrapper is
+    // powered and readable while its core is held in reset (that is its job — it is where the reset
+    // is released from), so it separates "the window points at a dark core" from "the function is
+    // not answering". Every offset read here is a status/control register with no read side effect.
+    let wr_ioctl = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_IOCTL) };
+    let wr_iost = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_IOST) };
+    let wr_rstc = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_RESET_CTL) };
+    let wr_rsts = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_RESET_ST) };
+    let wrap_dead = wr_ioctl == 0xFFFF_FFFF
+        && wr_iost == 0xFFFF_FFFF
+        && wr_rstc == 0xFFFF_FFFF
+        && wr_rsts == 0xFFFF_FFFF;
+    // Linux `bcma_core_is_enabled()`: clocked (CLK set, FGC clear) AND not in reset.
+    let clk = (wr_ioctl & IOCTL_CLK) != 0;
+    let fgc = (wr_ioctl & IOCTL_FGC) != 0;
+    let in_reset = (wr_rstc & RESET_CTL_RESET) != 0;
+    let gated = (wr_iost & IOST_GATED_CLK) != 0;
+    let core_enabled = !wrap_dead && clk && !fgc && !in_reset;
+    serial_println!(
+        ":: bcma: wrapper win2={:#010x} at bar0+{:#x}: ioctl={:#010x} iost={:#010x} resetctl={:#010x} resetst={:#010x} ::",
+        win2, BAR0_WRAP_OFF, wr_ioctl, wr_iost, wr_rstc, wr_rsts
+    );
+    if wrap_dead {
+        // Both apertures silent. The core's reset state cannot be the explanation, because the
+        // block that survives reset is silent too. Blame is upstream of the function.
         serial_println!(
-            ":: bcma: REFUSED stage=chipcommon reason=not-decoding chipid=0xffffffff — BAR0 reads all-ones (function not decoding, or the window is dead) ::"
+            ":: bcma: wrapper-verdict all-ones — the WRAPPER aperture is silent as well, so a core held in reset does NOT explain this; the function or the path to it (link down, or the bridge above not forwarding this address) is the remaining explanation ::"
+        );
+    } else {
+        serial_println!(
+            ":: bcma: wrapper-verdict answering clk={} fgc={} gated-clk={} in-reset={} core-enabled={} (Linux bcma_core_is_enabled) — the function DOES decode; whatever the core window reads is a property of the selected core, not of the function ::",
+            clk as u8, fgc as u8, gated as u8, in_reset as u8, core_enabled as u8
+        );
+    }
+
+    // ── Stage 5: ChipCommon — the one core reachable without moving the window ──────────────────
+    //
+    // ORDER MATTERS, and Boot AF is why. The window test comes FIRST: it is a statement about
+    // cfg:0x80 that is true or false without reading a single MMIO byte, whereas "all-ones" is only
+    // meaningful once BAR0+0 is known to be ChipCommon at all. With the tests the other way round,
+    // an off-window core that happens to be in reset reads all-ones and gets reported as
+    // `not-decoding` — a verdict about the FUNCTION drawn from evidence about a core we never meant
+    // to be looking at. That is exactly what this file printed on Boot AF.
+    let raw_at_bar0 = unsafe { r32(bar0, CC_ID) };
+    if win != BCMA_ADDR_BASE {
+        serial_println!(
+            ":: bcma: REFUSED stage=chipcommon reason=window-elsewhere bar0_win={:#010x} expected={:#010x} raw@bar0+0={:#010x} — BAR0+0 is NOT ChipCommon on this reading; reaching it needs ONE 32-bit config WRITE of {:#010x} to cfg:0x80 (Linux bcma_scan_switch_core does exactly this, unconditionally, at scan start), which this arc does not make ::",
+            win, BCMA_ADDR_BASE, raw_at_bar0, BCMA_ADDR_BASE
         );
         let (ev, eu) = fmt_dur(dl.elapsed_cycles());
         serial_println!(":: bcma: end ok=0 stage=chipcommon elapsed={}{} ::", ev, eu);
         return;
     }
-    // Is BAR0+0 actually ChipCommon? Only if firmware left the window at the enumeration base.
-    // Anything else and the registers below are some other core's, so they are NOT decoded.
-    if win != BCMA_ADDR_BASE {
+    let chipid = raw_at_bar0;
+    if chipid == 0xFFFF_FFFF {
         serial_println!(
-            ":: bcma: REFUSED stage=chipcommon reason=window-elsewhere bar0_win={:#010x} expected={:#010x} raw@bar0+0={:#010x} — BAR0+0 is NOT ChipCommon on this reading; moving the window is a WRITE to cfg:0x80, not in this arc ::",
-            win, BCMA_ADDR_BASE, chipid
+            ":: bcma: REFUSED stage=chipcommon reason=not-decoding chipid=0xffffffff — the window IS on the enumeration base and ChipCommon still reads all-ones (function not decoding, or the window is dead) ::"
         );
         let (ev, eu) = fmt_dur(dl.elapsed_cycles());
         serial_println!(":: bcma: end ok=0 stage=chipcommon elapsed={}{} ::", ev, eu);

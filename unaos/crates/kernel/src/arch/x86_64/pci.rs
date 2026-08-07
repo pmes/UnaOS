@@ -223,7 +223,10 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
 //   * NO BRIDGE RECURSION. None is needed and none is performed: the brute-force bus sweep visits
 //     every bus number a bridge could have been programmed with, so it is a superset of what
 //     following secondary-bus registers would reach. Bridges are printed (header type 1) with their
-//     primary/secondary/subordinate numbers so the topology is readable from the lines alone.
+//     primary/secondary/subordinate numbers AND their three forwarding windows (I/O, memory,
+//     prefetchable memory — see `census_print_bridge_windows`), so the topology is readable from the
+//     lines alone in BOTH senses: which bus numbers a bridge claims, and which addresses it lets
+//     through. The second was missing until GR20's Boot AF needed it and could not get it.
 //
 //   * KNOB-GATED, DEFAULT OFF (`UNAOS_PCICENSUS=1` -> feature `pcicensus`). Knob off, this function
 //     and its helpers do not exist and no call site is emitted, so default media are byte-identical.
@@ -341,6 +344,85 @@ fn census_print_bars(bus: u8, dev: u8, func: u8, n_bars: u8) {
     }
 }
 
+/// Append a header-type-1 bridge's three FORWARDING WINDOWS to the census line already in progress.
+///
+/// WHY. A bridge's `pri/sec/sub` triple says which BUS NUMBERS it claims; it says nothing about
+/// which ADDRESSES it forwards downstream. Those are three separate window registers, and a device
+/// on the far side of a bridge whose memory window does not contain that device's BAR is a device
+/// whose registers read all-ones no matter how correctly the driver maps them. GR20's Boot AF hit
+/// exactly that question — `14e4:4331`'s BAR0 at `0xc1900000` sits behind `0:28.1`, and the census
+/// could not say whether `0:28.1` forwards `0xc1900000` — and could not answer it, because these
+/// registers were never printed. They are printed now.
+///
+/// Layout (PCI-to-PCI Bridge Architecture 1.2, header type 1):
+///
+/// * 0x1C byte 0/1 — I/O base/limit, granularity 4 KiB, address in bits 7:4. Bits 3:0 == 1 means
+///   32-bit I/O addressing and the UPPER 16 bits of each live at 0x30 (base lo16, limit hi16).
+/// * 0x20 — memory base (lo16) / limit (hi16), granularity 1 MiB, address in bits 15:4.
+/// * 0x24 — prefetchable memory base/limit, same shape; bits 3:0 == 1 means 64-bit, and the upper
+///   32 bits of base and limit live at 0x28 and 0x2C.
+///
+/// In every window the LIMIT is inclusive and carries an implicit all-ones tail (0xFFF for I/O,
+/// 0xFFFFF for memory). `base > limit` is the architecturally-defined encoding for "this window is
+/// CLOSED" — firmware writes base=0xFFF0/limit=0x0000 for a bridge that forwards nothing — so it is
+/// rendered as `closed` rather than as an inverted range a reader would have to decode themselves.
+///
+/// Read-only: three config reads for the windows plus two more only when the 64-bit prefetch or
+/// 32-bit I/O encodings say those registers are implemented.
+#[cfg(feature = "pcicensus")]
+fn census_print_bridge_windows(bus: u8, dev: u8, func: u8) {
+    // ── I/O window (0x1C low half; the high half of that dword is SECONDARY STATUS) ─────────────
+    let io_reg = unsafe { read_config_32(bus, dev, func, 0x1C) };
+    let io_b = (io_reg & 0xFF) as u32;
+    let io_l = ((io_reg >> 8) & 0xFF) as u32;
+    let sec_sts = ((io_reg >> 16) & 0xFFFF) as u16;
+    let mut io_base = (io_b & 0xF0) << 8;
+    let mut io_limit = ((io_l & 0xF0) << 8) | 0xFFF;
+    let io32 = (io_b & 0x0F) == 0x01;
+    if io32 {
+        let up = unsafe { read_config_32(bus, dev, func, 0x30) };
+        io_base |= (up & 0xFFFF) << 16;
+        io_limit |= (up & 0xFFFF_0000) as u32;
+    }
+    if io_base > io_limit {
+        serial_print!(" io=closed");
+    } else {
+        serial_print!(" io=[{:#x},{:#x}]{}", io_base, io_limit, if io32 { "/32" } else { "/16" });
+    }
+
+    // ── Non-prefetchable memory window (0x20) — the one a plain BAR is forwarded through ────────
+    let m = unsafe { read_config_32(bus, dev, func, 0x20) };
+    let m_base = ((m & 0xFFF0) as u32) << 16;
+    let m_limit = ((((m >> 16) & 0xFFF0) as u32) << 16) | 0xF_FFFF;
+    if m_base > m_limit {
+        serial_print!(" mem=closed");
+    } else {
+        serial_print!(" mem=[{:#x},{:#x}]", m_base, m_limit);
+    }
+
+    // ── Prefetchable memory window (0x24, + 0x28/0x2C when 64-bit) ──────────────────────────────
+    let p = unsafe { read_config_32(bus, dev, func, 0x24) };
+    let mut p_base = (((p & 0xFFF0) as u32) << 16) as u64;
+    let mut p_limit = (((((p >> 16) & 0xFFF0) as u32) << 16) as u64) | 0xF_FFFF;
+    let p64 = (p & 0x000F) == 0x0001;
+    if p64 {
+        p_base |= (unsafe { read_config_32(bus, dev, func, 0x28) } as u64) << 32;
+        p_limit |= (unsafe { read_config_32(bus, dev, func, 0x2C) } as u64) << 32;
+    }
+    if p_base > p_limit {
+        serial_print!(" pref=closed");
+    } else {
+        serial_print!(" pref=[{:#x},{:#x}]{}", p_base, p_limit, if p64 { "/64" } else { "/32" });
+    }
+
+    // Secondary status is free (it came in the same dword as the I/O window) and it is the bridge's
+    // own error ledger: bit 13 signalled target-abort, bit 12 received target-abort, bit 11 received
+    // master-abort. A downstream read that ended in all-ones because nothing claimed it leaves a
+    // mark here, which is the difference between "the device answered 0xffffffff" and "nobody
+    // answered at all".
+    serial_print!(" secsts={:#06x}", sec_sts);
+}
+
 /// The full census. One line per function present, plus a capability dump for every network-class
 /// function (the reason this arc exists) and a self-reporting summary.
 ///
@@ -445,6 +527,10 @@ pub fn full_census() {
                             (bn & 0xFF) as u8, ((bn >> 8) & 0xFF) as u8, ((bn >> 16) & 0xFF) as u8
                         );
                         census_print_bars(bus as u8, dev, func, 2);
+                        // ...and the three FORWARDING windows. The bus triple says which bus numbers
+                        // this bridge claims; these say which ADDRESSES it lets through, which is
+                        // the half of the topology a driver whose BAR reads all-ones actually needs.
+                        census_print_bridge_windows(bus as u8, dev, func);
                     }
                     _ => {
                         // CardBus (0x02) or an unknown header layout: everything past the common
