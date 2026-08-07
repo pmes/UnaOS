@@ -243,8 +243,6 @@ const GMUX_SWITCH_DISPLAY: u8 = 0x10;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_SWITCH_DDC: u8 = 0x28;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_SWITCH_DDC: u8 = 0x28;
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_SWITCH_EXTERNAL: u8 = 0x40;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_READ_DISPLAY: u8 = 0x11;
@@ -1025,14 +1023,14 @@ pub unsafe fn gmux_igd_switch() {
     // hw_wait_budget() is 2 seconds (2000 ms), so cycles per ms is hw_wait_budget() / 2000
     let get_elapsed_ms = || (crate::arch::now_cycles().wrapping_sub(ladder_start)) / (crate::arch::hw_wait_budget() / 2000);
 
-    let highest = "00";
+    let mut highest = 0;
     if !PROTOCOL_PROVEN.load(Ordering::SeqCst) { 
-        serial_println!(":: igpu-dpy: LADDER highest={}/10 name=harness ok=0 why=protocol-unproven unwound=0 gmux=UNTOUCHED elapsed_ms={} ::", highest, get_elapsed_ms());
+        serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name=harness ok=0 why=protocol-unproven unwound=0 gmux=UNTOUCHED elapsed_ms={} ::", highest, get_elapsed_ms());
         return; 
     }
     let bar0 = IGPU_BAR0.load(Ordering::SeqCst);
     if bar0 == 0 { 
-        serial_println!(":: igpu-dpy: LADDER highest={}/10 name=harness ok=0 why=bar0-unmapped unwound=0 gmux=UNTOUCHED elapsed_ms={} ::", highest, get_elapsed_ms());
+        serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name=harness ok=0 why=bar0-unmapped unwound=0 gmux=UNTOUCHED elapsed_ms={} ::", highest, get_elapsed_ms());
         return; 
     }
 
@@ -1043,7 +1041,7 @@ pub unsafe fn gmux_igd_switch() {
 
     if ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32 || ext != GMUX_EXTERNAL_DIS as u32 {
         serial_println!(":: igpu: [GMUX] REFUSED: pre-switch state is not fully DIS (DDC={}, DISP={}, EXT={}) — no known safe state to return to ::", ddc, disp, ext);
-        serial_println!(":: igpu-dpy: LADDER highest={}/10 name=harness ok=0 why=pre-switch-not-dis unwound=0 gmux=FAILED elapsed_ms={} ::", highest, get_elapsed_ms());
+        serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name=harness ok=0 why=pre-switch-not-dis unwound=0 gmux=FAILED elapsed_ms={} ::", highest, get_elapsed_ms());
         return;
     }
 
@@ -1074,7 +1072,7 @@ pub unsafe fn gmux_igd_switch() {
 
     if !switched {
         gmux_revert_now();
-        serial_println!(":: igpu-dpy: LADDER highest={}/10 name=harness ok=0 why=mux-switch-failed unwound={} gmux=FAILED elapsed_ms={} ::", highest, unwind.len, get_elapsed_ms());
+        serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name=harness ok=0 why=mux-switch-failed unwound={} gmux=FAILED elapsed_ms={} ::", highest, unwind.len, get_elapsed_ms());
         return;
     }
 
@@ -1097,6 +1095,6 @@ pub unsafe fn gmux_igd_switch() {
     let reverted = gmux_revert_now();
     serial_println!(":: igpu: [GMUX] success-path dwell finished, reverted={} ::", reverted);
 
-    serial_println!(":: igpu-dpy: LADDER highest={}/10 name=harness ok={} unwound={} gmux={} why={} elapsed_ms={} ::",
+    serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name=harness ok={} unwound={} gmux={} why={} elapsed_ms={} ::",
         highest, if reverted { 1 } else { 0 }, unwind.len, if reverted { "MATCH" } else { "FAILED" }, if reverted { "none" } else { "revert-failed" }, get_elapsed_ms());
 }

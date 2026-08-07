@@ -110,6 +110,8 @@ A successful run reads roughly:
 :: igpu: [GMUX] switch verdict: MATCH (all three registers read back as written)
 :: igpu-dpy: rung=00 name=mux ok=1 ddc=0x01 disp=0x02 ext=0x02 verdict=MATCH
 :: igpu: [GMUX] switch successful (10s dwell expected)
+:: igpu: FOX CROSS-CHECK - If Plane A is enabled here but panel goes black, handoff/bootchain is the cause, not hardware!
+:: igpu-blt: ring=absent why=no-active-surface
 :: igpu: [GMUX] beginning success-path dwell
 :: igpu: [GMUX] dwell ended by=deadline elapsed_ms=10001 iters=...
 :: igpu: [GMUX] reverting to pre-switch state DDC=0x02 DISP=0x03 EXT=0x03
