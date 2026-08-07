@@ -195,35 +195,112 @@ fn cr3_table() -> *mut u64 {
     x86_64::registers::control::Cr3::read().0.start_address().as_u64() as *mut u64
 }
 
-/// Walk the live CR3 tables and return the physical address `va` maps to, or `None` if any level
-/// on the path is not present. Honors 1 GiB / 2 MiB huge pages. Read-only — used to prove the user
-/// window is unmapped before we create it (so USER_BASE can never silently alias kernel memory).
-pub fn translate(va: u64) -> Option<u64> {
+/// Walk the live CR3 tables for `va` and return BOTH the physical address it maps to AND the FOLDED
+/// `(user, writable, nx)` permission triple the hardware itself computes for it — or `None` if any
+/// level on the path is not present. Honors 1 GiB / 2 MiB huge pages. Read-only.
+///
+/// THE FOLD IS THE POINT. A leaf's effective permission on x86-64 is not its own entry, it is the
+/// accumulation over PML4→PDPT→PD→PT: ring-3 reachability is the AND of U/S, writability is the AND
+/// of W, executability is NOT the OR of NX. That accumulation is `wx_fold` — the SAME pure function
+/// the WXAUDIT census, `wx_check_slot` and the WXAUDIT-0 negative control are built on, reused here
+/// rather than re-derived, so there is exactly one permission model in this file and one place a
+/// mistake in it can live. `translate` is the address half of this walk and nothing else.
+fn live_leaf(va: u64) -> Option<(u64, (bool, bool, bool))> {
     unsafe {
         let pml4e = *cr3_table().add(pml4_index(va));
         if pml4e & PTE_PRESENT == 0 {
             return None;
         }
+        let acc4 = wx_fold(WX_TOP, pml4e);
         let pdpte = *((pml4e & PTE_ADDR) as *const u64).add(pdpt_index(va));
         if pdpte & PTE_PRESENT == 0 {
             return None;
         }
+        let acc3 = wx_fold(acc4, pdpte);
         if pdpte & PTE_HUGE != 0 {
-            return Some((pdpte & PTE_ADDR) | (va & 0x3FFF_FFFF));
+            return Some(((pdpte & PTE_ADDR) | (va & 0x3FFF_FFFF), acc3));
         }
         let pde = *((pdpte & PTE_ADDR) as *const u64).add(pd_index(va));
         if pde & PTE_PRESENT == 0 {
             return None;
         }
+        let acc2 = wx_fold(acc3, pde);
         if pde & PTE_HUGE != 0 {
-            return Some((pde & PTE_ADDR) | (va & 0x1F_FFFF));
+            return Some(((pde & PTE_ADDR) | (va & 0x1F_FFFF), acc2));
         }
         let pte = *((pde & PTE_ADDR) as *const u64).add(pt_index(va));
         if pte & PTE_PRESENT == 0 {
             return None;
         }
-        Some((pte & PTE_ADDR) | (va & 0xFFF))
+        Some(((pte & PTE_ADDR) | (va & 0xFFF), wx_fold(acc2, pte)))
     }
+}
+
+/// Walk the live CR3 tables and return the physical address `va` maps to, or `None` if any level
+/// on the path is not present. Honors 1 GiB / 2 MiB huge pages. Read-only — used to prove the user
+/// window is unmapped before we create it (so USER_BASE can never silently alias kernel memory).
+pub fn translate(va: u64) -> Option<u64> {
+    live_leaf(va).map(|(pa, _)| pa)
+}
+
+/// **CFU-2 — the authoritative kernel/user access gate.** True iff EVERY 4 KiB page `[va, va + len)`
+/// touches is, in the LIVE CR3, a present leaf that ring 3 can reach (`user`) and — when `need_write`
+/// — one the CPU will let a store land on (`writable`, folded over the whole path, which is exactly
+/// what CR0.WP=1 enforces for a CPL-0 store).
+///
+/// WHY THIS EXISTS. `syscall::user_range_ok` used to decide "is this a legal kernel→user write
+/// destination?" from BOUNDS ALONE, excluding exactly one page (`USER_BASE + PAGE_SIZE`). That
+/// encodes the FLAT/U2 window layout, where page 0 is the only code page. The U3 ELF loader does not
+/// obey it: `protect_user_slot_range` clears `PTE_WRITABLE` on EVERY page a non-`PF_W` segment
+/// covers, so a program whose first `R E` LOAD is larger than one page (`VUG-X86.ELF`, memsz 0x1fe5;
+/// `PULSE-X86.ELF`, memsz 0x13ec — both already on the boot media) has page 1 read-only AND
+/// executable. `USER_BASE + 0x1000` was the FIRST address the old bound admitted, so a ring-3
+/// `sys_read`/`sys_recvfrom` aimed there made the kernel itself store into a ring-3 RX page: code
+/// injection with the kernel as the writer (silent while CR0.WP is clear; a fatal CPL-0 #PF once it
+/// is armed). Bounds cannot answer that question — only the live leaf can, so the leaf decides.
+///
+/// PER PAGE, ACROSS THE WHOLE RANGE. A range may straddle a writable leaf and a non-writable one
+/// (page 2 RW → page 3 RO is a shape `protect_user_slot_range` can produce), so a first-page check
+/// would still admit the tail. Every page in the range is walked. `len == 0` validates the page
+/// containing `va`, matching the historical "a zero-length range is legal iff its pointer is" rule.
+///
+/// Cost is bounded by the caller's own bounds pre-filter: a validated range never exceeds the 4-page
+/// ring-3 window, so this is at most five 4-level walks (≈20 dependent loads) per syscall.
+pub fn user_range_leaf_ok(va: u64, len: u64, need_write: bool) -> bool {
+    // Overflow-safe last byte. `len == 0` -> the page holding `va` itself.
+    let last = if len == 0 {
+        va
+    } else {
+        match va.checked_add(len - 1) {
+            Some(v) => v,
+            None => return false, // wraps past u64::MAX — the bounds pre-filter rejects this too
+        }
+    };
+    let stop = last & !(PAGE_4K - 1);
+    let mut p = va & !(PAGE_4K - 1);
+    loop {
+        match live_leaf(p) {
+            // `acc.0` = ring-3 reachable (U/S folded), `acc.1` = writable (W folded). NX is not
+            // consulted: this gate governs data access, not execution.
+            Some((_, acc)) => {
+                if !acc.0 || (need_write && !acc.1) {
+                    return false;
+                }
+            }
+            None => return false, // not present anywhere on the path
+        }
+        if p == stop {
+            return true;
+        }
+        p += PAGE_4K;
+    }
+}
+
+/// The LIVE CR3 base as a raw value. Used by the CFU-2 self-probe to save and restore the address
+/// space around a deliberate switch into a scratch slot; `kernel_cr3()` is NOT a substitute (it
+/// returns the captured kernel PML4, which is not necessarily what is installed right now).
+pub fn current_cr3() -> u64 {
+    cr3_table() as u64
 }
 
 /// Run `f` with CR0.WP momentarily cleared, so supervisor writes to the firmware's read-only

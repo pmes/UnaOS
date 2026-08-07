@@ -2910,36 +2910,69 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 // goes through the identity-mapped window exactly as before (see docs/SECURITY.md CFU-1).
 // =============================================================================
 
-/// The access direction a ring-3 range is validated for. `Read` admits the WHOLE window including the
-/// read-only code page (page 0 is ring3-RX — a legal read source, e.g. a fixture's RO pattern constant
-/// or the DNS/console send buffer). `Write` requires the range to start PAST the code page
-/// (`USER_BASE + PAGE_SIZE`): page 0 is RO, so a kernel store there would fault under CR0.WP or corrupt
-/// W^X-protected code. This is the exact `sys_write`/`sys_sendto` (read) vs `sys_read`/`sys_recvfrom`
-/// (write) lower-bound split, unified.
+/// The access direction a ring-3 range is validated for. `Read` needs the range's pages to be present
+/// and ring-3-reachable (page 0 is ring3-RX — a legal read source, e.g. a fixture's RO pattern constant
+/// or the DNS/console send buffer). `Write` needs them to be present, ring-3-reachable AND actually
+/// WRITABLE in the live page tables, because a kernel store into a read-only ring-3 page either
+/// corrupts W^X-protected code (CR0.WP clear) or takes a fatal CPL-0 #PF (CR0.WP set). This is the
+/// `sys_write`/`sys_sendto` (read) vs `sys_read`/`sys_recvfrom` (write) split, unified.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum UserAccess {
     Read,
     Write,
 }
 
-/// The SINGLE ring-3 window predicate. Validate that `[ptr, ptr + len)` lies wholly inside the caller's
-/// user window (overflow-safe) and — for `Write` — past the read-only code page. Returns `Ok(())` or
-/// `Err(EFAULT)`. This is the exact predicate every site open-coded: `end = ptr.wrapping_add(len)`;
-/// `end < ptr` IS the wrap check (a range that wraps past u64::MAX has `end < ptr`); `ptr < LO` and
-/// `end > window_end` are the bounds. A `len == 0` range is in-bounds iff `ptr` itself is — matching the
-/// historical per-site behavior (the zero-length callers that must no-op — `sys_send`/`sys_sock_recv` —
-/// already `return 0` BEFORE reaching the check; the ones that don't — `sys_write` — validated a 0-len
-/// range against the window exactly like this, so a 0-len write with a below-window pointer is `-EFAULT`
-/// as before). `#[must_use]` so a caller cannot silently ignore the verdict.
+/// The SINGLE ring-3 access predicate. Validate that `[ptr, ptr + len)` lies wholly inside the caller's
+/// user window (overflow-safe) **and** that every page it touches really carries the permission this
+/// access direction needs, in the LIVE page tables. Returns `Ok(())` or `Err(EFAULT)`.
+///
+/// TWO STAGES, AND ONLY THE SECOND IS AUTHORITATIVE.
+///
+/// 1. **Bounds — the cheap pre-filter.** `end = ptr.wrapping_add(len)`; `end < ptr` IS the wrap check
+///    (a range that wraps past u64::MAX has `end < ptr`); `ptr < LO` and `end > window_end` are the
+///    window bounds. A `len == 0` range is in-bounds iff `ptr` itself is — matching the historical
+///    per-site behavior (the zero-length callers that must no-op — `sys_send`/`sys_sock_recv` — already
+///    `return 0` BEFORE reaching the check; the ones that don't — `sys_write` — validated a 0-len range
+///    against the window exactly like this, so a 0-len write with a below-window pointer is `-EFAULT` as
+///    before). The `Write` lower bound of `USER_BASE + PAGE_SIZE` is kept, but ONLY as a fast reject:
+///    page 0 is read-only in every layout `build_slot` produces, so skipping the walk for it costs
+///    nothing and changes no verdict. It is **not** a security claim, and it never was one.
+///
+/// 2. **Leaf permission — the gate.** `memory::user_range_leaf_ok` walks the live CR3 per page and
+///    folds U/W over the whole PML4→PT path. This is what decides.
+///
+/// **CFU-2 — why stage 2 had to be added.** Stage 1 alone excluded exactly ONE page from the write
+/// destination, which is the FLAT/U2 layout's assumption: one code page at the window base. The U3 ELF
+/// loader does not obey it. `elf.rs` applies permissions PER SEGMENT and
+/// `memory::protect_user_slot_range` clears `PTE_WRITABLE` on every page a non-`PF_W` segment covers,
+/// anywhere in the window. Two of the three x86 ring-3 programs already on the boot media have a first
+/// `R E` LOAD longer than a page — `VUG-X86.ELF` (memsz 0x1fe5) and `PULSE-X86.ELF` (memsz 0x13ec) — so
+/// for those slots `USER_BASE + 0x1000`, the FIRST address the old `Write` bound admitted, is a
+/// read-only EXECUTABLE ring-3 page. A ring-3 `sys_read`/`sys_recvfrom`/`sys_sock_recv`/`sys_read_file`
+/// with that buffer passed validation and `copy_to_user` stored into it: a ring-3-driven code-injection
+/// primitive with the kernel as the writer, silent wherever CR0.WP is clear (the rMBP firmware leaves it
+/// clear) and a ring-3-triggerable fatal CPL-0 #PF wherever it is set. SMAP would have caught it; this
+/// kernel deliberately does not enable SMAP (Ivy Bridge lacks it). Nothing in the fixture set exercised
+/// it, which is not the same thing as its being excluded by construction.
+///
+/// The walk is per page across the WHOLE range, not just the first: a range may straddle a writable
+/// leaf and a non-writable one, and a first-page check would still admit the tail.
+///
+/// `#[must_use]` so a caller cannot silently ignore the verdict.
 #[must_use]
 fn user_range_ok(ptr: u64, len: u64, access: UserAccess) -> Result<(), i64> {
     let lo = match access {
         UserAccess::Read => USER_BASE,                 // the RO code page is a legal read source
-        UserAccess::Write => USER_BASE + PAGE_SIZE,    // past page 0 — a kernel store must hit writable RW pages
+        UserAccess::Write => USER_BASE + PAGE_SIZE,    // fast reject only — page 0 is RO in every layout
     };
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let end = ptr.wrapping_add(len);
     if end < ptr || ptr < lo || end > window_end {
+        return Err(EFAULT);
+    }
+    // CFU-2: the authoritative gate. In-window is necessary, never sufficient — the live leaf decides.
+    let need_write = access == UserAccess::Write;
+    if !crate::arch::x86_64::memory::user_range_leaf_ok(ptr, len, need_write) {
         return Err(EFAULT);
     }
     Ok(())
@@ -16997,6 +17030,76 @@ fn cfu_efault_witness() {
     }
 }
 
+/// **CFU-2 self-probe — the kernel→user WRITE gate, proved live and proved able to REFUSE.**
+///
+/// A protection nobody can see armed is a protection nobody can trust, and an instrument that can only
+/// print success proves nothing: a gate hard-wired to `Ok` and a gate hard-wired to `Err` would each
+/// satisfy half of this line, so the line reports BOTH halves and passes only on the conjunction.
+///
+/// WHAT IT BUILDS. A scratch address-space slot, reshaped into exactly the layout the old bounds-only
+/// validator could not see — the U3 ELF shape, not the FLAT/U2 one:
+///   * **page 1 → read-only + EXECUTABLE.** This is the tail of `VUG-X86.ELF`'s / `PULSE-X86.ELF`'s
+///     first `R E` LOAD (memsz 0x1fe5 / 0x13ec), produced here by the REAL loader primitive
+///     (`memory::protect_user_slot_range`), not by hand-writing a PTE. `USER_BASE + 0x1000` is the
+///     first address the old `UserAccess::Write` bound admitted, so this page IS the bypass.
+///   * **page 3 → read-only + NX**, so page 2 (RW) → page 3 (RO) is a straddle across a permission
+///     boundary inside the window.
+///
+/// WHAT IT ASSERTS, all five through the REAL `user_range_ok` seam, under the scratch slot's OWN CR3
+/// (installed IRQ-masked and restored in the same critical section, so nothing else observes it — the
+/// kernel half is shared into every slot PML4, so ring 0 keeps running normally under it):
+///   1. `ro_refused`    — a WRITE aimed at the RO+X page 1 is `-EFAULT`. **The defect, closed.**
+///   2. `rw_accepted`   — a WRITE aimed at the RW page 2 is accepted. The gate is not an always-fail.
+///   3. `head_ok`       — 8 bytes wholly inside page 2 are accepted…
+///   4. `straddle_ref`  — …but 16 bytes from the same start, crossing into RO page 3, are refused.
+///      (3)+(4) together are what a FIRST-PAGE-ONLY check cannot satisfy: same pointer, same direction,
+///      verdict decided by a page the pointer does not lie in.
+///   5. `ro_read_ok`    — a READ of the RO+X page 1 is still accepted. Proof the write gate did not
+///      over-tighten into the read direction, where a read-only page is a legal source.
+///
+/// The slot is released through the real teardown funnel; a later `alloc_user_space` re-runs
+/// `build_slot`, which rewrites all four leaves, so the reshape cannot outlive the probe. Uncounted by
+/// nothing — it prints the project's `-> PASS` / `-> FAIL ::` verdict idiom, so a regression trips
+/// `arroyo`'s FAULT_PATTERNS scan on its own.
+fn cfu2_wgate_witness() {
+    let Some(r) = crate::arch::memory::alloc_user_space() else {
+        serial_println!(":: CFU2-WGATE: no scratch address space — write-gate probe SKIPPED ::");
+        return;
+    };
+    // Reshape through the REAL ELF-loader primitive: page 1 RO+X (the VUG/PULSE first-LOAD tail),
+    // page 3 RO+NX (the far side of a straddle). W^X holds — neither is writable.
+    unsafe {
+        crate::arch::memory::protect_user_slot_range(r, 0x1000, 0x10, false, true);
+        crate::arch::memory::protect_user_slot_range(r, 0x3000, 0x10, false, false);
+    }
+    let probe_cr3 = crate::arch::memory::slot_cr3(r);
+    let saved_cr3 = crate::arch::memory::current_cr3();
+    // IRQ-masked: no preemption may observe (or be resumed under) the probe's CR3, and the scheduler's
+    // own dispatch-time CR3 install must not race the restore.
+    let (ro_refused, rw_accepted, head_ok, straddle_ref, ro_read_ok) =
+        crate::arch::without_interrupts(|| {
+            unsafe { crate::arch::memory::load_cr3(probe_cr3) };
+            let a = user_range_ok(USER_BASE + 0x1000, 8, UserAccess::Write).is_err();
+            let b = user_range_ok(USER_BASE + 0x2000, 8, UserAccess::Write).is_ok();
+            let c = user_range_ok(USER_BASE + 0x2FF8, 8, UserAccess::Write).is_ok();
+            let d = user_range_ok(USER_BASE + 0x2FF8, 16, UserAccess::Write).is_err();
+            let e = user_range_ok(USER_BASE + 0x1000, 8, UserAccess::Read).is_ok();
+            unsafe { crate::arch::memory::load_cr3(saved_cr3) };
+            (a, b, c, d, e)
+        });
+    crate::arch::memory::free_user_space_by_cr3(probe_cr3);
+    if ro_refused && rw_accepted && head_ok && straddle_ref && ro_read_ok {
+        serial_println!(
+            ":: CFU2-WGATE: kernel->user write validated against LIVE leaf W — RO+X page (U3 ELF shape, the VUG/PULSE bypass) REFUSED -EFAULT, RW page ACCEPTED, RW->RO straddle REFUSED while its in-page head is accepted, RO page still readable -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: CFU2-WGATE FAIL — ro_refused={} rw_accepted={} head_ok={} straddle_refused={} ro_read_ok={} (want all true) -> FAIL ::",
+            ro_refused, rw_accepted, head_ok, straddle_ref, ro_read_ok
+        );
+    }
+}
+
 #[cfg(feature = "irqstorage")]
 fn mf2_witness() {
     if !s4_sync_storage() {
@@ -17473,6 +17576,10 @@ fn u11m2_launcher(demo_cpu: usize) {
     // CFU-1: negative witness for the unified kernel/user copy seam — three out-of-window SYS_OPEN name
     // ranges each -EFAULT through the REAL dispatcher, no side effect (uncounted; knob-on AND knob-off).
     cfu_efault_witness();
+    // CFU-2: positive+negative witness for the LIVE-LEAF write gate — a scratch slot reshaped into the
+    // U3 ELF layout (RO+X page 1) proves the seam refuses the VUG/PULSE bypass and still accepts a real
+    // writable destination, per page across a straddle. Uncounted-free: it carries its own PASS/FAIL.
+    cfu2_wgate_witness();
     // STOR-1 S5: prove cross-process created-file reads serve LIVE shared backing (knob-on + FAT only). Runs
     // FIRST — DEFER.BIN and all wstage slots are free; it reuses DEFER.BIN and cleans up fully before phase 1
     // (idempotent self-heal + a post-cleanup OPENF/DYN_DELETED_G assert). SILENT skip off the knob-on FAT path.
