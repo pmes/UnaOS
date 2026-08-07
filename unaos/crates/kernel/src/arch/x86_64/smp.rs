@@ -400,9 +400,36 @@ pub fn confirm_render_core(arg: usize) {
 // The real-mode -> long-mode trampoline. AT&T syntax; see the module comment for the design.
 // Every absolute reference is `TRAMP + (label - ap_trampoline_start)` so the assembled bytes
 // carry no relocations and are valid only after being copied to TRAMP (0x8000).
+//
+// `.pushsection`/`.popsection`, NOT `.section` — and the pair is a CORRECTNESS fix, not style.
+// rustc lowers every module-level `global_asm!` of a codegen unit into ONE assembly stream, in
+// item order, so the assembler's *current section* is state that LEAKS from one block to the
+// next. This block used a bare `.section .rodata` and never returned; the very next `global_asm!`
+// the x86 lane emits is `sched.rs`'s `switch_context`, which (correctly) declares no section of
+// its own and so was assembled into `.rodata`. It was then EXECUTED IN PLACE at ring 0 on every
+// task switch. WXN-x86 M2 convicted it on the first boot that marked non-executable everything
+// the ELF did not declare `PF_X`:
+//
+//     EXCEPTION: PAGE FAULT  err=PROTECTION_VIOLATION|INSTRUCTION_FETCH  rip=0x3D646C68
+//
+// — image offset 0x27C68, where `readelf -sW` shows `ap_trampoline_end` and `switch_context`
+// sharing one address. `memory.rs`'s M2 block carries the full account and flagged the fix here.
+//
+// The invariant this restores, and which every other `global_asm!` in the crate silently assumes:
+// **a block that changes the section must change it back.** `.popsection` restores whatever was
+// current on entry rather than asserting `.text`, so the block composes correctly wherever the
+// CGU partitioner places it — and the partitioning is not stable, which is exactly why the bug
+// caught only `sched.rs` in this build and could catch a different block in the next one.
+// `.code64` is restored explicitly for the same reason: the `.code16`/`.code32`/`.code64` mode is
+// GLOBAL assembler state that `.popsection` does not save. It already ends at `.code64` here (set
+// at `ap_lm_entry`), so the directive emits nothing today; it makes the block's exit state total
+// instead of accidental.
+//
+// The trampoline bytes themselves stay in `.rodata`, which is correct: they are never executed in
+// place — `start_aps` copies them to 0x8000 and the APs execute them there.
 core::arch::global_asm!(
     r#"
-.section .rodata
+.pushsection .rodata
 .balign 16
 .code16
 .global ap_trampoline_start
@@ -515,6 +542,10 @@ ap_param_stack:  .quad 0
 ap_param_index:  .quad 0
 .global ap_trampoline_end
 ap_trampoline_end:
+# Restore the assembler state this block found: section (see the comment above — `switch_context`
+# is assembled immediately after this in the same stream) and code-size mode.
+.code64
+.popsection
 "#,
     options(att_syntax)
 );
