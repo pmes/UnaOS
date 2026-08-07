@@ -75,9 +75,41 @@ pub mod regs {
 
     // GTT Window (starts at 2MB offset in BAR0)
     pub const GTT_BASE: usize = 0x200000;
+
+    // BLT Ring
+    pub const BLT_RING_TAIL: usize = 0x22030;
+    pub const BLT_RING_HEAD: usize = 0x22034;
+    pub const BLT_RING_START: usize = 0x22038;
+    pub const BLT_RING_CTL: usize = 0x2203C;
 }
 
+#[cfg(target_arch = "x86_64")]
+use alloc::alloc::{alloc_zeroed, Layout};
+#[cfg(target_arch = "x86_64")]
+use spin::Mutex;
+
 use core::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(target_arch = "x86_64")]
+struct BltRing {
+    bar0: usize,
+    ring_ptr: *mut u8,
+    gtt_offset: u32,
+    tail: u32,
+    fills: u32,
+    scrolls: u32,
+    fallbacks: u32,
+    spins_max: u32,
+    dead: bool,
+}
+#[cfg(target_arch = "x86_64")]
+unsafe impl Send for BltRing {}
+
+#[cfg(target_arch = "x86_64")]
+static BLT_RING: Mutex<Option<BltRing>> = Mutex::new(None);
+
+use core::sync::atomic::AtomicU32;
+pub static ACTIVE_SURF: AtomicU32 = AtomicU32::new(0);
 
 static PROBED: AtomicBool = AtomicBool::new(false);
 static mut TRACE_0: [u32; 11] = [0; 11];
@@ -317,7 +349,10 @@ pub fn init(gpu: &GpuInfo) {
         let surf_b = dump_plane(bar0, 'B', regs::DSPBCNTR, regs::DSPBSURF, regs::DSPBSTRIDE, regs::DSPBLINOFF, regs::DSPBTILEOFF);
         let surf_c = dump_plane(bar0, 'C', regs::DSPCCNTR, regs::DSPCSURF, regs::DSPCSTRIDE, regs::DSPCLINOFF, regs::DSPCTILEOFF);
 
+        let mut active_surf = None;
         if let Some(surf) = surf_a.or(surf_b).or(surf_c) {
+            active_surf = Some(surf);
+            ACTIVE_SURF.store(surf, Ordering::SeqCst);
             // Read GGTT entries around the surface base
             let page_number = (surf >> 12) as usize;
             let gtt_offset = regs::GTT_BASE + (page_number * 4);
@@ -330,6 +365,91 @@ pub fn init(gpu: &GpuInfo) {
             }
         }
         
+        // BLT ring bring-up. SEAT FIXUP (review round 2): an ACCELERATOR must degrade, never kill
+        // the boot — every refusal below breaks out of this block, the ring simply never comes up,
+        // `blitter_*` return false, and the CPU path carries the console exactly as before this
+        // module existed. Each refusal names itself on an `igpu-blt: ring=absent` line.
+        'ring: {
+        if let Some(surf) = active_surf {
+            let layout = Layout::from_size_align(4096, 4096).unwrap();
+            let ring_ptr = alloc_zeroed(layout);
+
+            // Translate the ring's heap VIRTUAL address to physical via the kernel's own walk —
+            // the first cut programmed the virtual address into the PTE and worked only by
+            // identity-map luck.
+            let Some(phys_addr64) = crate::arch::memory::translate(ring_ptr as u64) else {
+                serial_println!(":: igpu-blt: ring=absent why=ring-virt-unmapped va=0x{:X} — CPU path carries the console ::", ring_ptr as usize);
+                break 'ring;
+            };
+            let phys_addr = phys_addr64 as usize;
+            // Gen7 GGTT PTEs carry extended address bits 39:32 in PTE bits 7:4, which this
+            // bring-up does not program — refuse (not panic) anything above 4 GiB.
+            if phys_addr >= 0x1_0000_0000 {
+                serial_println!(":: igpu-blt: ring=absent why=phys-above-4g phys=0x{:X} — extended PTE bits not programmed; CPU path carries the console ::", phys_addr);
+                break 'ring;
+            }
+
+            // SEAT FIXUP: the scanout extent comes from the live panel info, not a hardcoded
+            // 2880x1800 — a different panel (UNAOS_FBW/FBH override, another machine) would
+            // otherwise put the ring PTE INSIDE the scanout and black the panel silently. If the
+            // WRITER lock is contended at init time, refuse: a guess here is exactly the defect
+            // the review bounced.
+            let fb_bytes = match crate::video::WRITER.try_lock().map(|w| {
+                let i = w.info();
+                (i.height * i.stride * i.bytes_per_pixel) as u32
+            }) {
+                Some(b) => b,
+                None => {
+                    serial_println!(":: igpu-blt: ring=absent why=writer-locked — cannot prove scanout extent; CPU path carries the console ::");
+                    break 'ring;
+                }
+            };
+            let extent = surf + fb_bytes;
+            let gtt_page = ((extent + 4095) / 4096) as u32; // provably beyond the scanout surface
+
+            let ring_gtt_addr = gtt_page * 4096;
+            let gtt_offset = regs::GTT_BASE + (gtt_page as usize * 4);
+            let pte = (phys_addr as u32) | 1; // Valid bit
+
+            // Neighbouring PTEs read BEFORE the write; re-read and compared AFTER it below — a
+            // store that smears past its slot is a silent black panel, so "unchanged" is verified,
+            // not asserted in prose.
+            let pte_prev = mmio_read(bar0, gtt_offset - 4);
+            let pte_next = mmio_read(bar0, gtt_offset + 4);
+            serial_println!(":: igpu: GGTT slot constraint - writing ring PTE at 0x{:X} (slot offset 0x{:X}, scanout extent 0x{:X}) ::", ring_gtt_addr, gtt_offset, extent);
+
+            core::ptr::write_volatile((bar0 + gtt_offset) as *mut u32, pte);
+            let pte_prev_after = mmio_read(bar0, gtt_offset - 4);
+            let pte_next_after = mmio_read(bar0, gtt_offset + 4);
+            if pte_prev_after != pte_prev || pte_next_after != pte_next {
+                serial_println!(":: igpu-blt: ring=absent why=neighbour-pte-changed prev 0x{:08X}->0x{:08X} next 0x{:08X}->0x{:08X} — PTE write smeared; ring NOT enabled ::",
+                    pte_prev, pte_prev_after, pte_next, pte_next_after);
+                core::ptr::write_volatile((bar0 + gtt_offset) as *mut u32, 0);
+                break 'ring;
+            }
+            serial_println!(":: igpu: GGTT PTE prev: 0x{:08X}, PTE next: 0x{:08X} (verified unchanged after write) ::", pte_prev, pte_next);
+            
+            core::ptr::write_volatile((bar0 + regs::BLT_RING_CTL) as *mut u32, 0);
+            core::ptr::write_volatile((bar0 + regs::BLT_RING_START) as *mut u32, ring_gtt_addr);
+            core::ptr::write_volatile((bar0 + regs::BLT_RING_HEAD) as *mut u32, 0);
+            core::ptr::write_volatile((bar0 + regs::BLT_RING_TAIL) as *mut u32, 0);
+            core::ptr::write_volatile((bar0 + regs::BLT_RING_CTL) as *mut u32, 1); // 4KB length, enable
+            
+            *BLT_RING.lock() = Some(BltRing {
+                bar0,
+                ring_ptr,
+                gtt_offset: ring_gtt_addr,
+                tail: 0,
+                fills: 0,
+                scrolls: 0,
+                fallbacks: 0,
+                spins_max: 0,
+                dead: false,
+            });
+            serial_println!(":: igpu: BLT Ring initialized at GGTT 0x{:08X} (Phys 0x{:08X}) ::", ring_gtt_addr, phys_addr);
+        }
+        } // 'ring
+
         serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers] On Ivy Bridge (Gen7 / Panther Point 7-Series PCH), the Display Engine is split.");
         serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers, Section 1.1.2] eDP on Port A (DP_A) is CPU-attached (North Display Engine).");
         serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, South Display Engine Registers] GMBUS and Panel Power Sequencer (PPS) are PCH-attached (South Display Engine).");
@@ -394,4 +514,127 @@ unsafe fn dump_plane(bar0: usize, name: char, cntr_reg: usize, surf_reg: usize, 
 
 unsafe fn mmio_read(base: usize, offset: usize) -> u32 {
     core::ptr::read_volatile((base + offset) as *const u32)
+}
+
+#[cfg(target_arch = "x86_64")]
+impl BltRing {
+    fn submit(&mut self, dwords: &[u32]) -> bool {
+        if self.dead {
+            return false;
+        }
+
+        let mut tail = self.tail;
+        
+        for &dw in dwords {
+            unsafe {
+                core::ptr::write_volatile(
+                    (self.ring_ptr as *mut u32).add(tail as usize / 4),
+                    dw
+                );
+            }
+            tail += 4;
+            if tail >= 4096 {
+                tail = 0;
+            }
+        }
+        
+        if (tail / 4) % 2 != 0 {
+            unsafe {
+                core::ptr::write_volatile(
+                    (self.ring_ptr as *mut u32).add(tail as usize / 4),
+                    0
+                );
+            }
+            tail += 4;
+            if tail >= 4096 {
+                tail = 0;
+            }
+        }
+        
+        self.tail = tail;
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        
+        unsafe {
+            core::ptr::write_volatile((self.bar0 + regs::BLT_RING_TAIL) as *mut u32, tail);
+        }
+        
+        let mut spins = 0;
+        let max_spins = 1_000_000; // bounded cycle budget timeout (approx 1M pause cycles)
+        
+        loop {
+            let current_head = unsafe { core::ptr::read_volatile((self.bar0 + regs::BLT_RING_HEAD) as *const u32) } & 0x1FFFFC;
+            if current_head == tail {
+                break;
+            }
+            core::hint::spin_loop();
+            spins += 1;
+            if spins > max_spins {
+                self.dead = true;
+                self.fallbacks += 1;
+                serial_println!(":: igpu: STOP-NOTE blitter wedged, ring marked dead ::");
+                return false; // Return and let the CPU fallback path take over
+            }
+        }
+        
+        if spins > self.spins_max {
+            self.spins_max = spins;
+        }
+        
+        true
+    }
+}
+
+pub fn blitter_fill_rect(dst_gtt: u32, x: u16, y: u16, w: u16, h: u16, color: u32, pitch: u32) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut ring_lock = BLT_RING.lock();
+        if let Some(ring) = ring_lock.as_mut() {
+            let dw0 = (0x50 << 22) | 4;
+            let dw1 = (3 << 24) | (0xF0 << 16) | pitch;
+            let dw2 = (y as u32) << 16 | (x as u32);
+            let dw3 = ((y + h) as u32) << 16 | ((x + w) as u32);
+            let dw4 = dst_gtt;
+            let dw5 = color;
+            
+            if ring.submit(&[dw0, dw1, dw2, dw3, dw4, dw5]) {
+                ring.fills += 1;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn blitter_copy_rect(dst_gtt: u32, src_gtt: u32, dst_x: u16, dst_y: u16, src_x: u16, src_y: u16, w: u16, h: u16, pitch: u32) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut ring_lock = BLT_RING.lock();
+        if let Some(ring) = ring_lock.as_mut() {
+            let dw0 = (0x53 << 22) | 6;
+            let dw1 = (3 << 24) | (0xCC << 16) | pitch;
+            let dw2 = (dst_y as u32) << 16 | (dst_x as u32);
+            let dw3 = ((dst_y + h) as u32) << 16 | ((dst_x + w) as u32);
+            let dw4 = dst_gtt;
+            let dw5 = (src_y as u32) << 16 | (src_x as u32);
+            let dw6 = pitch;
+            let dw7 = src_gtt;
+            
+            if ring.submit(&[dw0, dw1, dw2, dw3, dw4, dw5, dw6, dw7]) {
+                ring.scrolls += 1;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn print_blt_stats() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(ring) = BLT_RING.lock().as_ref() {
+            serial_println!(":: igpu-blt: ring={} fills={} scrolls={} fallbacks={} spins_max={} ::", 
+                if ring.dead { "dead" } else { "up" },
+                ring.fills, ring.scrolls, ring.fallbacks, ring.spins_max);
+        }
+    }
 }

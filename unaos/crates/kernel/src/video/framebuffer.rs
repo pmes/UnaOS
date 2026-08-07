@@ -341,6 +341,25 @@ impl FrameBuffer {
     /// Fill pixel rows `[y0, y1)` (clamped to the frame) with a colour.
     pub fn fill_rows(&self, y0: usize, y1: usize, color: u32) {
         let y_end = y1.min(self.info.height);
+        
+        #[cfg(all(target_arch = "x86_64", feature = "intel-ivb"))]
+        {
+            let gtt = crate::drivers::gpu::igpu::ACTIVE_SURF.load(core::sync::atomic::Ordering::Relaxed);
+            if gtt != 0 {
+                if crate::drivers::gpu::igpu::blitter_fill_rect(
+                    gtt,
+                    0,
+                    y0 as u16,
+                    self.info.width as u16,
+                    (y_end - y0) as u16,
+                    color,
+                    (self.info.stride * self.info.bytes_per_pixel) as u32
+                ) {
+                    return;
+                }
+            }
+        }
+
         // VPERF M4 (x86 only): word-wide band fill for full-4-byte-pixel formats — the format
         // decode and bounds checks hoisted to once per row instead of once per pixel. Writes
         // only the visible width (the stride gap stays untouched, like `put_pixel`).
@@ -539,6 +558,29 @@ impl FrameBuffer {
         let total = (self.info.height * row_bytes).min(self.len);
         if shift >= total {
             return;
+        }
+        
+        let cleared_from = self.info.height.saturating_sub(dy);
+        
+        #[cfg(all(target_arch = "x86_64", feature = "intel-ivb"))]
+        {
+            let gtt = crate::drivers::gpu::igpu::ACTIVE_SURF.load(core::sync::atomic::Ordering::Relaxed);
+            if gtt != 0 {
+                if crate::drivers::gpu::igpu::blitter_copy_rect(
+                    gtt,
+                    gtt,
+                    0,
+                    0,
+                    0,
+                    dy as u16,
+                    self.info.width as u16,
+                    cleared_from as u16,
+                    row_bytes as u32
+                ) {
+                    self.fill_rows(cleared_from, self.info.height, fill);
+                    return;
+                }
+            }
         }
         // VPERF (bench builds only): count the memmove payload, attributing the source read to
         // VRAM when this surface IS the real framebuffer (the uncached-PCIe read being measured).

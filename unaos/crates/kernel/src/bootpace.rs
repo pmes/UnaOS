@@ -374,4 +374,9 @@ pub fn service_dump() {
         DROPPED.load(Ordering::Relaxed),
         hz
     );
+    // IGPU-BLT census rides the ledger emission (SEAT FIXUP, igpu pull-8 review round 2: the
+    // witness fn existed with no caller — the classic instrument that cannot fire). The ledger
+    // re-emits a few times per sit, so the counters arrive as a small time series for free.
+    #[cfg(all(target_arch = "x86_64", feature = "intel-ivb"))]
+    crate::drivers::gpu::igpu::print_blt_stats();
 }
