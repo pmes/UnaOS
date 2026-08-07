@@ -59,6 +59,15 @@ pub mod regs {
     pub const FPA0: usize = 0x06040;
     pub const FPA1: usize = 0x06044;
 
+
+    // DPA AUX Channel
+    pub const DPA_AUX_CH_CTL: usize = 0x64010;
+    pub const DPA_AUX_CH_DATA1: usize = 0x64014;
+    pub const DPA_AUX_CH_DATA2: usize = 0x64018;
+    pub const DPA_AUX_CH_DATA3: usize = 0x6401C;
+    pub const DPA_AUX_CH_DATA4: usize = 0x64020;
+    pub const DPA_AUX_CH_DATA5: usize = 0x64024;
+
     // PCH-based Panel Power Sequencer (South Display Engine)
     pub const PCH_PP_STATUS: usize = 0xC7200;
     pub const PCH_PP_CONTROL: usize = 0xC7204;
@@ -239,11 +248,7 @@ const GMUX_PORT_READ: u16 = 0x7D0;
 const GMUX_PORT_WRITE: u16 = 0x7D4;
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_SWITCH_DISPLAY: u8 = 0x10;
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_SWITCH_DDC: u8 = 0x28;
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_SWITCH_EXTERNAL: u8 = 0x40;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_READ_DISPLAY: u8 = 0x11;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
@@ -257,10 +262,6 @@ const GMUX_EXTERNAL_DIS: u8 = 0x03;
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_DDC_IGD: u8 = 0x01;
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_DISPLAY_IGD: u8 = 0x02;
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_EXTERNAL_IGD: u8 = 0x02;
 
 /// Baseline's iteration bound, kept UNCONDITIONALLY alongside the TSC deadline.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
@@ -268,13 +269,6 @@ const GMUX_WAIT_ITERS: u32 = 5000;
 /// How long the mux stays on IGD before the revert fires.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_DWELL_MS: u64 = 10_000;
-/// Backstop bound on the dwell for the case where `arch::ms()` has stopped advancing. Its
-/// wall-clock length is NOT known a priori — that is exactly why the dwell reports `iters=`
-/// and which bound ended it, so one metal boot makes the relationship measurable instead of
-/// assumed.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_DWELL_ITER_CAP: u64 = 10_000_000;
-
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 unsafe fn gmux_outb(port: u16, val: u8) {
     unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags)); }
@@ -288,7 +282,7 @@ unsafe fn gmux_inb(port: u16) -> u8 {
 }
 
 /// Wait for the gmux to be ready to accept an index byte. Bounded twice over: an iteration
-/// count that cannot depend on any clock, and a TSC deadline. Returns false on timeout —
+/// count that cannot depend on any clock. Returns false on timeout —
 /// and no caller here swallows a timeout silently.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 unsafe fn gmux_wait_ready() -> bool {
@@ -349,186 +343,6 @@ unsafe fn gmux_index_write(reg: u8, val: u8) -> bool {
     unsafe { gmux_wait_complete() }
 }
 
-/// The pre-switch mux state, plus whether a revert is owed and when.
-///
-/// ONE encode point and ONE decode point. Every mutation of the saved bytes routes through
-/// `pack`/`unpack`; this is what stopped a saved byte being lost to a mask in an earlier
-/// round, and it is why `gmux_dwell()` reads `deadline_ms` back out of the packed word rather
-/// than keeping a second local copy of it.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-#[derive(Clone, Copy)]
-struct RevertState {
-    armed: bool,
-    due: bool,
-    ddc: u8,
-    disp: u8,
-    ext: u8,
-    /// Absolute `arch::ms()` value at which the revert comes due. Saturated into 32 bits
-    /// (~49 days of uptime); the switch is a boot-time one-shot, so that is not reachable.
-    deadline_ms: u32,
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-impl RevertState {
-    fn pack(&self) -> u64 {
-        let mut v = 0u64;
-        if self.armed { v |= 1 << 0; }
-        if self.due { v |= 1 << 1; }
-        v |= (self.ddc as u64) << 8;
-        v |= (self.disp as u64) << 16;
-        v |= (self.ext as u64) << 24;
-        v |= (self.deadline_ms as u64) << 32;
-        v
-    }
-
-    fn unpack(v: u64) -> Self {
-        Self {
-            armed: (v & (1 << 0)) != 0,
-            due: (v & (1 << 1)) != 0,
-            ddc: ((v >> 8) & 0xFF) as u8,
-            disp: ((v >> 16) & 0xFF) as u8,
-            ext: ((v >> 24) & 0xFF) as u8,
-            deadline_ms: ((v >> 32) & 0xFFFF_FFFF) as u32,
-        }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-static GMUX_REVERT_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Atomically transform the packed revert state.
-///
-/// `SeqCst` on an independent load and an independent store does NOT make the pair atomic —
-/// two contexts can both observe `armed` and both run the port sequence. This compare-exchange
-/// loop makes the read-modify-write indivisible. `f` returns `None` to abandon the update; on
-/// success the PRE-IMAGE is returned, which is how `gmux_revert_now()` obtains the saved bytes
-/// and the exclusive right to use them in one indivisible step.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-fn gmux_state_update<F>(mut f: F) -> Option<RevertState>
-where
-    F: FnMut(RevertState) -> Option<RevertState>,
-{
-    let mut cur = GMUX_REVERT_STATE.load(Ordering::SeqCst);
-    loop {
-        let old = RevertState::unpack(cur);
-        let new = f(old)?;
-        match GMUX_REVERT_STATE.compare_exchange_weak(
-            cur,
-            new.pack(),
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => return Some(old),
-            Err(actual) => cur = actual,
-        }
-    }
-}
-
-/// Write the DDC/DISPLAY/EXTERNAL triple, read all three back, and compare the read-back
-/// against what was intended.
-///
-/// The verdict is decided by the READ-BACK, never by the write helpers returning `true`. A
-/// timed-out DDC write with a landed DISPLAY write leaves the panel on IGD with DDC on
-/// discrete; an earlier version logged that and printed `Revert Complete` anyway, so a black
-/// screen could not be distinguished from a write that never happened. The `w_*` flags are
-/// still printed — they say WHERE it broke — but they do not decide anything.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-unsafe fn gmux_apply(phase: &str, ddc: u8, disp: u8, ext: u8) -> (bool, u8, u8, u8) {
-    let w_ddc = unsafe { gmux_index_write(GMUX_SWITCH_DDC, ddc) };
-    let w_disp = unsafe { gmux_index_write(GMUX_SWITCH_DISPLAY, disp) };
-    let w_ext = unsafe { gmux_index_write(GMUX_SWITCH_EXTERNAL, ext) };
-    let ok = |b: bool| if b { "ok" } else { "TIMEOUT" };
-    serial_println!(
-        ":: igpu: [GMUX] {} write: ddc={} disp={} ext={} (intent DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X}) ::",
-        phase, ok(w_ddc), ok(w_disp), ok(w_ext), ddc, disp, ext);
-
-    let r_ddc = unsafe { gmux_index_read(GMUX_SWITCH_DDC) };
-    let r_disp = unsafe { gmux_index_read(GMUX_READ_DISPLAY) };
-    let r_ext = unsafe { gmux_index_read(GMUX_READ_EXTERNAL) };
-    serial_println!(
-        ":: igpu: [GMUX] {} read-back: DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::",
-        phase, r_ddc, r_disp, r_ext);
-
-    let m_ddc = r_ddc == ddc as u32;
-    let m_disp = r_disp == disp as u32;
-    let m_ext = r_ext == ext as u32;
-    if m_ddc && m_disp && m_ext {
-        serial_println!(":: igpu: [GMUX] {} verdict: MATCH (all three registers read back as written) ::", phase);
-        (true, r_ddc as u8, r_disp as u8, r_ext as u8)
-    } else {
-        if !m_ddc { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_DDC: wrote 0x{:02X}, read 0x{:02X} ::", phase, ddc, r_ddc); }
-        if !m_disp { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_DISPLAY: wrote 0x{:02X}, read 0x{:02X} ::", phase, disp, r_disp); }
-        if !m_ext { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_EXTERNAL: wrote 0x{:02X}, read 0x{:02X} ::", phase, ext, r_ext); }
-        serial_println!(":: igpu: [GMUX] {} verdict: MISMATCH ::", phase);
-        (false, r_ddc as u8, r_disp as u8, r_ext as u8)
-    }
-}
-
-/// Perform the whole revert, here and now, and report truthfully whether it landed.
-///
-/// This function does the port writes ITSELF. An earlier version set `due = true` and
-/// returned, with every port write living in a task tick — so on exactly the paths where the
-/// automatic revert was already dead, the operator would see a success message and nothing
-/// would move. A recovery path that reports success while doing nothing is the worst failure
-/// mode available here: it gets typed blind at a black panel by someone who then believes it
-/// worked.
-///
-/// The armed state is CLAIMED with a compare-exchange, so this is idempotent and safe from any
-/// number of contexts: exactly one caller wins and issues the sequence.
-///
-/// `pub` because a one-line seam in `shell.rs` would make a working `gmux-revert` verb out of
-/// it. THAT SEAM IS NOT PRESENT IN THIS BUILD — `shell.rs` is outside this lane. No claim is
-/// made anywhere here that such a verb exists.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-pub fn gmux_revert_now() -> bool {
-    let claimed = gmux_state_update(|s| {
-        if s.armed {
-            Some(RevertState { armed: false, due: false, ..s })
-        } else {
-            None
-        }
-    });
-    let Some(s) = claimed else {
-        serial_println!(":: igpu: [GMUX] revert requested but NOT ARMED — no write issued ::");
-        return false;
-    };
-    serial_println!(":: igpu: [GMUX] reverting to pre-switch state DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", s.ddc, s.disp, s.ext);
-    let (ok, _, _, _) = unsafe { gmux_apply("revert", s.ddc, s.disp, s.ext) };
-    ok
-}
-
-/// Hold the mux on IGD for the armed deadline, then return.
-///
-/// Bounded twice: the `ms()` deadline out of the packed state, and an iteration cap that
-/// depends on no clock. `arch::ms()` only advances while the BSP timer ISR runs, so a dwell
-/// bounded by it alone could become a permanent stall with the panel dark. Which bound ended
-/// the dwell is printed, along with the iteration count — an instrument's silence is evidence
-/// ONLY if the instrument can execute in the state it reports on, so this one reports the
-/// state it ran in rather than assuming the clock was alive.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-fn gmux_dwell() {
-    // hw_wait_budget() returns budget for 2 seconds. GMUX_DWELL_MS is 10,000 (10s), so multiply by 5.
-    let deadline = crate::arch::now_cycles() + (crate::arch::hw_wait_budget() * 5);
-    let start = crate::arch::ms();
-    let mut iters: u64 = 0;
-    let ended_by;
-    loop {
-        if crate::arch::now_cycles() >= deadline {
-            ended_by = "deadline";
-            break;
-        }
-        if iters >= GMUX_DWELL_ITER_CAP {
-            ended_by = "itercap";
-            break;
-        }
-        iters += 1;
-        for _ in 0..1000 { core::hint::spin_loop(); }
-    }
-    serial_println!(
-        ":: igpu: [GMUX] dwell ended by={} elapsed_ms={} iters={} (cap={}) ::",
-        ended_by, crate::arch::ms().wrapping_sub(start), iters, GMUX_DWELL_ITER_CAP);
-}
-
 pub fn init(gpu: &GpuInfo) {
     if PROBED.swap(true, Ordering::SeqCst) {
         return;
@@ -540,7 +354,7 @@ pub fn init(gpu: &GpuInfo) {
         // Reachability check via PCI config space
         let vid_did = unsafe { crate::arch::pci::read_config_32(gpu.bus, gpu.slot, gpu.func, 0x00) };
         let cmd = unsafe { crate::arch::pci::read_config_16(gpu.bus, gpu.slot, gpu.func, 0x04) };
-        
+
         let cap_ptr = unsafe { crate::arch::pci::read_config_32(gpu.bus, gpu.slot, gpu.func, 0x34) } & 0xFF;
         let mut d_state = "Unknown";
         if cap_ptr != 0 && cap_ptr != 0xFF {
@@ -567,10 +381,10 @@ pub fn init(gpu: &GpuInfo) {
                 ptr = ((cap >> 8) & 0xFF) as u8;
             }
         }
-        
+
         serial_println!(":: igpu: REACHABILITY CENSUS (PCI Config Space) ::");
         serial_println!(":: igpu: RAW: VID:DID=0x{:08X}, CMD=0x{:04X}, D-State={} ::", vid_did, cmd, d_state);
-        
+
         if vid_did == 0xFFFFFFFF {
             serial_println!(":: igpu: VERDICT: Device not present (Vendor/Device ID read 0xFFFFFFFF)");
         } else {
@@ -598,7 +412,7 @@ pub fn init(gpu: &GpuInfo) {
         }
         IGPU_BAR0.store(bar0, Ordering::SeqCst);
     }
-    
+
     #[cfg(target_arch = "aarch64")]
     {
         serial_println!("[Intel iGPU] Error: BAR0 mapping unimplemented on aarch64. Probe aborted.");
@@ -628,11 +442,11 @@ pub fn init(gpu: &GpuInfo) {
             ];
             let names = ["PIPEACONF", "PIPEBCONF", "PIPECCONF", "DSPACNTR", "DSPBCNTR", "DSPCCNTR", "DSPASURF", "DP_A", "PP_STATUS", "PP_CTRL", "DPLL_A"];
             for i in 0..11 {
-                serial_println!(":: igpu: {:<12} | 0x{:08X}        | 0x{:08X}        | 0x{:08X}        | 0x{:08X} ::", 
+                serial_println!(":: igpu: {:<12} | 0x{:08X}        | 0x{:08X}        | 0x{:08X}        | 0x{:08X} ::",
                     names[i], TRACE_0[i], TRACE_1[i], TRACE_2[i], trace3[i]);
             }
             serial_println!(":: igpu: GMUX TRACE ::");
-            
+
             let boot_ver_ok = !(GMUX_0[0] == 0x00 && GMUX_0[1] == 0x00 && GMUX_0[2] == 0x00) &&
                               !(GMUX_0[0] == 0xFF && GMUX_0[1] == 0xFF && GMUX_0[2] == 0xFF) &&
                               !(GMUX_0[0] == GMUX_0[1] && GMUX_0[1] == GMUX_0[2]);
@@ -642,7 +456,7 @@ pub fn init(gpu: &GpuInfo) {
 
             if !boot_ver_ok || !kern_ver_ok {
                 serial_println!(":: igpu: PROTOCOL UNPROVEN (implausible version tuples)");
-                serial_println!(":: igpu: Boot Version: {}.{}.{} | Kernel Version: {}.{}.{}", 
+                serial_println!(":: igpu: Boot Version: {}.{}.{} | Kernel Version: {}.{}.{}",
                     GMUX_0[0], GMUX_0[1], GMUX_0[2], gmux3[0], gmux3[1], gmux3[2]);
                 serial_println!(":: igpu: Boot MAX_BRT: 0x{:08X} | Kernel MAX_BRT: 0x{:08X}", GMUX_0[6], gmux3[6]);
                 serial_println!(":: igpu: Raw SW_DISP: Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[3], gmux3[3]);
@@ -652,18 +466,18 @@ pub fn init(gpu: &GpuInfo) {
                 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
                 PROTOCOL_PROVEN.store(true, Ordering::SeqCst);
                 serial_println!(":: igpu: PROTOCOL PROVEN (version plausible)");
-                serial_println!(":: igpu: Version (Maj,Min,Rel) | {}.{}.{}             |                   |                   | {}.{}.{} ::", 
+                serial_println!(":: igpu: Version (Maj,Min,Rel) | {}.{}.{}             |                   |                   | {}.{}.{} ::",
                     GMUX_0[0], GMUX_0[1], GMUX_0[2], gmux3[0], gmux3[1], gmux3[2]);
-                serial_println!(":: igpu: MAX_BRIGHTNESS        | 0x{:08X}        |                   |                   | 0x{:08X} ::", 
+                serial_println!(":: igpu: MAX_BRIGHTNESS        | 0x{:08X}        |                   |                   | 0x{:08X} ::",
                     GMUX_0[6], gmux3[6]);
-                
+
                 let decode_disp = |val: u32| match val { 2 => "IGD", 3 => "DIS", _ => "???" };
                 let decode_ddc = |val: u32| match val { 1 => "IGD", 2 => "DIS", _ => "???" };
                 let decode_pwr = |val: u32| if val != 0 { "ON " } else { "OFF" };
 
-                serial_println!(":: igpu: SW_DISPLAY            | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::", 
+                serial_println!(":: igpu: SW_DISPLAY            | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::",
                     GMUX_0[3], decode_disp(GMUX_0[3]), gmux3[3], decode_disp(gmux3[3]));
-                serial_println!(":: igpu: SW_DDC                | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::", 
+                serial_println!(":: igpu: SW_DDC                | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::",
                     GMUX_0[4], decode_ddc(GMUX_0[4]), gmux3[4], decode_ddc(gmux3[4]));
                 serial_println!(":: igpu: DISC_POWER            | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::",
                     GMUX_0[5], decode_pwr(GMUX_0[5]), gmux3[5], decode_pwr(gmux3[5]));
@@ -674,7 +488,7 @@ pub fn init(gpu: &GpuInfo) {
                 // answered the handshake but reported an implausible version tuple passed the
                 // 0xFFFFFFFF sentinel and got its display mux written anyway. The version check
                 // is only a gate if something is actually gated on it.
-                
+
             }
             serial_println!(":: igpu: TRACE END ::");
         }
@@ -699,7 +513,7 @@ pub fn init(gpu: &GpuInfo) {
             // Read GGTT entries around the surface base
             let page_number = (surf >> 12) as usize;
             let gtt_offset = regs::GTT_BASE + (page_number * 4);
-            
+
             serial_println!("[Intel iGPU] GGTT Inspection for surface at 0x{:X}:", surf);
             for i in 0..4 {
                 let pte_offset = gtt_offset + (i * 4);
@@ -707,12 +521,12 @@ pub fn init(gpu: &GpuInfo) {
                 serial_println!("[Intel iGPU] GGTT PTE[{}] (offset 0x{:X}): 0x{:08X}", page_number + i, pte_offset, pte);
             }
         }
-        
+
         // BLT ring bring-up. SEAT FIXUP (review round 2): an ACCELERATOR must degrade, never kill
         // the boot — every refusal below breaks out of this block, the ring simply never comes up,
         // `blitter_*` return false, and the CPU path carries the console exactly as before this
         // module existed. Each refusal names itself on an `igpu-blt: ring=absent` line.
-        
+
         bring_up_blt_ring(bar0, active_surf);
 
         serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers] On Ivy Bridge (Gen7 / Panther Point 7-Series PCH), the Display Engine is split.");
@@ -731,7 +545,7 @@ pub fn init(gpu: &GpuInfo) {
         serial_println!(":: igpu: FDI_TXA_CTL: 0x{:08X}", mmio_read(bar0, regs::FDI_TXA_CTL));
         serial_println!(":: igpu: FPA0: 0x{:08X}", mmio_read(bar0, regs::FPA0));
         serial_println!(":: igpu: FPA1: 0x{:08X}", mmio_read(bar0, regs::FPA1));
-        
+
         serial_println!(":: igpu: PCH_PP_ON_DELAYS: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_ON_DELAYS));
         serial_println!(":: igpu: PCH_PP_OFF_DELAYS: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_OFF_DELAYS));
         serial_println!(":: igpu: PCH_PP_DIVISOR: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_DIVISOR));
@@ -743,7 +557,7 @@ pub fn init(gpu: &GpuInfo) {
         serial_println!(":: igpu: PCH_GMBUS4: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS4));
         serial_println!(":: igpu: --- END CENSUS --- ::");
     }
-    
+
     serial_println!(":: igpu: probe-complete ::");
 }
 
@@ -751,7 +565,7 @@ unsafe fn dump_pipe(bar0: usize, name: char, conf_reg: usize, src_reg: usize) {
     let conf = mmio_read(bar0, conf_reg);
     let src = mmio_read(bar0, src_reg);
     let enabled = (conf & (1 << 31)) != 0;
-    
+
     serial_println!("[Intel iGPU] Pipe {}: CONF=0x{:08X} (Enabled: {}), SRC=0x{:08X}", name, conf, enabled, src);
 }
 
@@ -766,9 +580,9 @@ unsafe fn dump_plane(bar0: usize, name: char, cntr_reg: usize, surf_reg: usize, 
     let tileoff = mmio_read(bar0, tileoff_reg);
 
     serial_println!("[Intel iGPU] Plane {}: CNTR=0x{:08X} (Enabled: {}, Format: 0x{:X}, Tiled: {})", name, cntr, enabled, format, tiled);
-    serial_println!("[Intel iGPU] Plane {}: SURF=0x{:08X}, STRIDE=0x{:08X}, LINOFF=0x{:08X}, TILEOFF=0x{:08X}", 
+    serial_println!("[Intel iGPU] Plane {}: SURF=0x{:08X}, STRIDE=0x{:08X}, LINOFF=0x{:08X}, TILEOFF=0x{:08X}",
         name, surf, stride, linoff, tileoff);
-    
+
     if enabled {
         serial_println!(":: igpu: FOX CROSS-CHECK - If Plane {} is enabled here but panel goes black, handoff/bootchain is the cause, not hardware! ::", name);
         Some(surf)
@@ -789,7 +603,7 @@ impl BltRing {
         }
 
         let mut tail = self.tail;
-        
+
         for &dw in dwords {
             unsafe {
                 core::ptr::write_volatile(
@@ -802,7 +616,7 @@ impl BltRing {
                 tail = 0;
             }
         }
-        
+
         if (tail / 4) % 2 != 0 {
             unsafe {
                 core::ptr::write_volatile(
@@ -815,17 +629,17 @@ impl BltRing {
                 tail = 0;
             }
         }
-        
+
         self.tail = tail;
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
-        
+
         unsafe {
             core::ptr::write_volatile((self.bar0 + regs::BLT_RING_TAIL) as *mut u32, tail);
         }
-        
+
         let mut spins = 0;
         let max_spins = 1_000_000; // bounded cycle budget timeout (approx 1M pause cycles)
-        
+
         loop {
             let current_head = unsafe { core::ptr::read_volatile((self.bar0 + regs::BLT_RING_HEAD) as *const u32) } & 0x1FFFFC;
             if current_head == tail {
@@ -840,11 +654,11 @@ impl BltRing {
                 return false; // Return and let the CPU fallback path take over
             }
         }
-        
+
         if spins > self.spins_max {
             self.spins_max = spins;
         }
-        
+
         true
     }
 }
@@ -860,7 +674,7 @@ pub fn blitter_fill_rect(dst_gtt: u32, x: u16, y: u16, w: u16, h: u16, color: u3
             let dw3 = ((y + h) as u32) << 16 | ((x + w) as u32);
             let dw4 = dst_gtt;
             let dw5 = color;
-            
+
             if ring.submit(&[dw0, dw1, dw2, dw3, dw4, dw5]) {
                 ring.fills += 1;
                 return true;
@@ -883,7 +697,7 @@ pub fn blitter_copy_rect(dst_gtt: u32, src_gtt: u32, dst_x: u16, dst_y: u16, src
             let dw5 = (src_y as u32) << 16 | (src_x as u32);
             let dw6 = pitch;
             let dw7 = src_gtt;
-            
+
             if ring.submit(&[dw0, dw1, dw2, dw3, dw4, dw5, dw6, dw7]) {
                 ring.scrolls += 1;
                 return true;
@@ -897,7 +711,7 @@ pub fn print_blt_stats() {
     #[cfg(target_arch = "x86_64")]
     {
         if let Some(ring) = BLT_RING.lock().as_ref() {
-            serial_println!(":: igpu-blt: ring={} fills={} scrolls={} fallbacks={} spins_max={} ::", 
+            serial_println!(":: igpu-blt: ring={} fills={} scrolls={} fallbacks={} spins_max={} ::",
                 if ring.dead { "dead" } else { "up" },
                 ring.fills, ring.scrolls, ring.fallbacks, ring.spins_max);
         }
@@ -977,13 +791,13 @@ unsafe fn bring_up_blt_ring(bar0: usize, active_surf: Option<u32>) {
                 break 'ring;
             }
             serial_println!(":: igpu: GGTT PTE prev: 0x{:08X}, PTE next: 0x{:08X} (verified unchanged after write) ::", pte_prev, pte_next);
-            
+
             core::ptr::write_volatile((bar0 + regs::BLT_RING_CTL) as *mut u32, 0);
             core::ptr::write_volatile((bar0 + regs::BLT_RING_START) as *mut u32, ring_gtt_addr);
             core::ptr::write_volatile((bar0 + regs::BLT_RING_HEAD) as *mut u32, 0);
             core::ptr::write_volatile((bar0 + regs::BLT_RING_TAIL) as *mut u32, 0);
             core::ptr::write_volatile((bar0 + regs::BLT_RING_CTL) as *mut u32, 1); // 4KB length, enable
-            
+
             *BLT_RING.lock() = Some(BltRing {
                 bar0,
                 ring_ptr,
@@ -1001,100 +815,362 @@ unsafe fn bring_up_blt_ring(bar0: usize, active_surf: Option<u32>) {
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+#[derive(Clone, Copy)]
+enum UnwindEntry {
+    Mmio { off: u32, pre: u32 },
+    Gmux { reg: u8, pre: u8 },
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 struct DisplayUnwind {
     bar0: usize,
+    entries: [UnwindEntry; 32],
     len: usize,
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 impl DisplayUnwind {
     fn new(bar0: usize) -> Self {
-        Self { bar0, len: 0 }
+        Self { bar0, entries: [UnwindEntry::Mmio { off: 0, pre: 0 }; 32], len: 0 }
     }
 
-    unsafe fn execute(&mut self) {
-        self.len = 0;
+    unsafe fn execute(&mut self) -> bool {
+        let mut all_ok = true;
+        while self.len > 0 {
+            self.len -= 1;
+            let entry = &self.entries[self.len];
+            match entry {
+                UnwindEntry::Mmio { off, pre } => {
+                    core::ptr::write_volatile((self.bar0 + *off as usize) as *mut u32, *pre);
+                }
+                UnwindEntry::Gmux { reg, pre } => {
+                    let ok = gmux_index_write(*reg, *pre);
+                    if !ok {
+                        all_ok = false;
+                    }
+                }
+            }
+        }
+        all_ok
+    }
+
+    unsafe fn push_mmio(&mut self, off: usize, pre: u32) {
+        if self.len < 32 {
+            self.entries[self.len] = UnwindEntry::Mmio { off: off as u32, pre };
+            self.len += 1;
+        }
+    }
+
+    unsafe fn push_gmux(&mut self, reg: u8, pre: u8) {
+        if self.len < 32 {
+            self.entries[self.len] = UnwindEntry::Gmux { reg, pre };
+            self.len += 1;
+        }
+    }
+}
+
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DP_AUX_NATIVE_READ: u32 = 0x9;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DP_AUX_I2C_WRITE: u32 = 0x0;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DP_AUX_I2C_READ: u32 = 0x1;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DP_AUX_I2C_MOT: u32 = 0x4;
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DP_AUX_CH_CTL_SEND_BUSY: u32 = 1 << 31;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DP_AUX_CH_CTL_DONE: u32 = 1 << 30;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DP_AUX_CH_CTL_TIME_OUT_ERROR: u32 = 1 << 28;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DP_AUX_CH_CTL_TIME_OUT_1600US: u32 = 3 << 26;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DP_AUX_CH_CTL_RECEIVE_ERROR: u32 = 1 << 25;
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+unsafe fn dp_aux_transfer(bar0: usize, clock_divider: u32, cmd: u32, addr: u32, tx_len: u32, tx_data: &[u8], rx_data: &mut [u8]) -> Result<(), &'static str> {
+    let mut retry_count = 0;
+    let deadline = crate::arch::now_cycles() + (crate::arch::hw_wait_budget() * 2);
+
+    let is_write = (cmd & 0x3) == 0;
+    let send_bytes = if is_write { 4 + tx_len } else { 4 };
+
+    loop {
+        if crate::arch::now_cycles() >= deadline || retry_count >= 7 {
+            return Err("aux-defer-exhausted");
+        }
+
+        let data1 = (cmd << 28) | ((addr & 0xFFFFF) << 8) | (tx_len.saturating_sub(1));
+        core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *mut u32, data1);
+
+        if is_write {
+            let mut idx = 0;
+            let data_regs = [regs::DPA_AUX_CH_DATA2, regs::DPA_AUX_CH_DATA3, regs::DPA_AUX_CH_DATA4, regs::DPA_AUX_CH_DATA5];
+            for reg_offset in &data_regs {
+                let mut val = 0u32;
+                for b in 0..4 {
+                    if idx < tx_data.len() {
+                        val |= (tx_data[idx] as u32) << (24 - (b * 8));
+                        idx += 1;
+                    }
+                }
+                core::ptr::write_volatile((bar0 + *reg_offset) as *mut u32, val);
+            }
+        }
+
+        let ctl = DP_AUX_CH_CTL_SEND_BUSY | DP_AUX_CH_CTL_DONE | DP_AUX_CH_CTL_TIME_OUT_ERROR | DP_AUX_CH_CTL_RECEIVE_ERROR | DP_AUX_CH_CTL_TIME_OUT_1600US | (send_bytes << 20) | (clock_divider & 0x7FF);
+        core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_CTL) as *mut u32, ctl);
+
+        let mut status;
+        let wait_deadline = crate::arch::now_cycles() + (crate::arch::hw_wait_budget() / 100);
+        loop {
+            status = core::ptr::read_volatile((bar0 + regs::DPA_AUX_CH_CTL) as *const u32);
+            if (status & DP_AUX_CH_CTL_SEND_BUSY) == 0 { break; }
+            if crate::arch::now_cycles() >= wait_deadline { break; }
+            core::hint::spin_loop();
+        }
+
+        if (status & DP_AUX_CH_CTL_SEND_BUSY) != 0 {
+            return Err("aux-timeout-busy");
+        }
+
+        let status_clean = status & !DP_AUX_CH_CTL_SEND_BUSY;
+        core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_CTL) as *mut u32, status_clean | DP_AUX_CH_CTL_DONE | DP_AUX_CH_CTL_TIME_OUT_ERROR | DP_AUX_CH_CTL_RECEIVE_ERROR);
+
+        if (status & DP_AUX_CH_CTL_TIME_OUT_ERROR) != 0 {
+            return Err("aux-timeout-error (Hypotheses: VDD off, wrong divider, bad offsets, mux write failed, panel not on AUX)");
+        }
+        if (status & DP_AUX_CH_CTL_RECEIVE_ERROR) != 0 {
+            return Err("aux-receive-error");
+        }
+
+        let rx_data1 = core::ptr::read_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *const u32);
+        let reply_nibble = (rx_data1 >> 28) & 0xF;
+        let native_reply = reply_nibble & 0x3;
+        let i2c_reply = (reply_nibble >> 2) & 0x3;
+
+        let is_i2c = (cmd & 0x8) == 0;
+        let reply_status = if is_i2c { i2c_reply } else { native_reply };
+
+        if reply_status == 3 {
+            return Err("aux-reserved-reply");
+        }
+
+        if reply_status == 2 {
+            retry_count += 1;
+            continue;
+        }
+
+        if reply_status == 1 {
+            return Err("aux-nack");
+        }
+
+        let total_rx = (status >> 20) & 0x1F;
+        let payload_rx = total_rx.saturating_sub(1) as usize;
+
+        if payload_rx > 0 && !is_write {
+            let to_copy = core::cmp::min(payload_rx, rx_data.len());
+            let mut r_idx = 0;
+
+            for b in 1..4 {
+                if r_idx < to_copy {
+                    rx_data[r_idx] = ((rx_data1 >> (24 - (b * 8))) & 0xFF) as u8;
+                    r_idx += 1;
+                }
+            }
+            let data_regs = [regs::DPA_AUX_CH_DATA2, regs::DPA_AUX_CH_DATA3, regs::DPA_AUX_CH_DATA4, regs::DPA_AUX_CH_DATA5];
+            for reg_offset in &data_regs {
+                if r_idx >= to_copy { break; }
+                let val = core::ptr::read_volatile((bar0 + *reg_offset) as *const u32);
+                for b in 0..4 {
+                    if r_idx < to_copy {
+                        rx_data[r_idx] = ((val >> (24 - (b * 8))) & 0xFF) as u8;
+                        r_idx += 1;
+                    }
+                }
+            }
+        }
+
+        return Ok(());
     }
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 pub unsafe fn gmux_igd_switch() {
     let ladder_start = crate::arch::now_cycles();
-    // hw_wait_budget() is 2 seconds (2000 ms), so cycles per ms is hw_wait_budget() / 2000
     let get_elapsed_ms = || (crate::arch::now_cycles().wrapping_sub(ladder_start)) / (crate::arch::hw_wait_budget() / 2000);
 
     let mut highest = 0;
-    if !PROTOCOL_PROVEN.load(Ordering::SeqCst) { 
-        serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name=harness ok=0 why=protocol-unproven unwound=0 gmux=UNTOUCHED elapsed_ms={} ::", highest, get_elapsed_ms());
-        return; 
+    let mut ok_flag = 0;
+    let mut why_str = "none";
+    let mut rung_name = "harness";
+    let mut unwind = DisplayUnwind::new(0);
+
+    // Will be captured dynamically based on live pre-image
+    let mut pre_ddc: Option<u32> = None;
+    let mut mux_touched = false;
+
+    let mut execute_harness = || -> Result<(), &'static str> {
+        if !PROTOCOL_PROVEN.load(Ordering::SeqCst) { return Err("protocol-unproven"); }
+        let bar0 = IGPU_BAR0.load(Ordering::SeqCst);
+        if bar0 == 0 { return Err("bar0-unmapped"); }
+        unwind.bar0 = bar0;
+
+        let p_ddc = gmux_index_read(GMUX_SWITCH_DDC);
+        let disp = gmux_index_read(GMUX_READ_DISPLAY);
+        let ext = gmux_index_read(GMUX_READ_EXTERNAL);
+        serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", p_ddc, disp, ext);
+
+        if p_ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32 || ext != GMUX_EXTERNAL_DIS as u32 {
+            serial_println!(":: igpu: [GMUX] REFUSED: pre-switch state is not fully DIS (DDC={}, DISP={}, EXT={}) — no known safe state to return to ::", p_ddc, disp, ext);
+            return Err("pre-switch-not-dis");
+        }
+        pre_ddc = Some(p_ddc);
+
+        rung_name = "census";
+        let ggc = crate::arch::pci::read_config_32(0, 0, 0, 0x50);
+        let bdsm = crate::arch::pci::read_config_32(0, 0, 0, 0xB0);
+        let ggtt0 = mmio_read(bar0, regs::GTT_BASE);
+        let ggtt1 = mmio_read(bar0, regs::GTT_BASE + 4);
+        let aux_ctl = mmio_read(bar0, regs::DPA_AUX_CH_CTL);
+        let frmcnt = mmio_read(bar0, 0x70040);
+
+        if (aux_ctl & DP_AUX_CH_CTL_SEND_BUSY) != 0 {
+            serial_println!(":: igpu: [AUX] REFUSED: aux_ctl=0x{:08X} SEND_BUSY is set at boot ::", aux_ctl);
+            return Err("aux-busy-at-boot");
+        }
+
+        let clock_divider = aux_ctl & 0x7FF;
+        if clock_divider == 0 {
+            serial_println!(":: igpu: [AUX] REFUSED: aux_ctl=0x{:08X} clock divider is 0 ::", aux_ctl);
+            return Err("aux-divider-unusable");
+        }
+
+        serial_println!(":: igpu-dpy: rung=00 name=census ok=1 bdsm=0x{:08X} ggc=0x{:08X} ggtt0=0x{:08X} ggtt1=0x{:08X} aux_ctl=0x{:08X} frmcnt=0x{:08X} ::",
+            bdsm, ggc, ggtt0, ggtt1, aux_ctl, frmcnt);
+
+        highest = 1;
+        rung_name = "selftest";
+        // Note: the MMIO self-test can pass vacuously if the register is Read-As-Zero (RAZ).
+        serial_println!(":: igpu: [GMUX] running Unwind stack self-test ::");
+
+        let test_val = core::ptr::read_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *const u32);
+        unwind.push_mmio(regs::DPA_AUX_CH_DATA1, test_val);
+        core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *mut u32, !test_val);
+
+        unwind.push_gmux(GMUX_SWITCH_DDC, pre_ddc.unwrap() as u8);
+
+        let _ = unwind.execute();
+
+        let test_val_after = core::ptr::read_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *const u32);
+        if test_val_after != test_val {
+            serial_println!(":: igpu: [GMUX] Unwind stack MMIO self-test FAILED (expected 0x{:08X}, got 0x{:08X}) ::", test_val, test_val_after);
+            return Err("unwind-mmio-failed");
+        }
+        serial_println!(":: igpu: [GMUX] Unwind stack MMIO self-test passed ::");
+        serial_println!(":: igpu: [GMUX] Unwind stack gmux-dispatch=REACHED (Gmux restore path executed without faulting, not implying restore verified) ::");
+
+        unwind.push_gmux(GMUX_SWITCH_DDC, pre_ddc.unwrap() as u8);
+
+        highest = 2;
+        rung_name = "switch";
+        serial_println!(":: igpu: [GMUX] switching DDC to IGD (0x{:02X}) — panel should REMAIN ON since DISPLAY is not moved ::", GMUX_DDC_IGD);
+        mux_touched = true;
+        gmux_index_write(GMUX_SWITCH_DDC, GMUX_DDC_IGD);
+        let read_ddc = gmux_index_read(GMUX_SWITCH_DDC);
+        if read_ddc != GMUX_DDC_IGD as u32 {
+            return Err("mux-ddc-switch-failed");
+        }
+
+        highest = 3;
+        rung_name = "dpcd";
+        let mut dpcd_rev = [0u8; 1];
+        if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_NATIVE_READ, 0x00000, 1, &[], &mut dpcd_rev) {
+            serial_println!(":: igpu: [AUX] DPCD Read Failed: {} ::", e);
+            return Err(e);
+        }
+        serial_println!(":: igpu: [AUX] DPCD REV: 0x{:02X} ::", dpcd_rev[0]);
+
+        highest = 4;
+        rung_name = "edid";
+        if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_I2C_WRITE | DP_AUX_I2C_MOT, 0x50, 1, &[0x00], &mut []) {
+            serial_println!(":: igpu: [AUX] EDID Address Set NACKed/Failed: {} ::", e);
+            return Err("edid-address-nack");
+        }
+
+        let mut edid = [0u8; 128];
+        for chunk in 0..8 {
+            let offset = chunk * 16;
+            let cmd = if chunk == 7 { DP_AUX_I2C_READ } else { DP_AUX_I2C_READ | DP_AUX_I2C_MOT };
+            if let Err(e) = dp_aux_transfer(bar0, clock_divider, cmd, 0x50, 16, &[], &mut edid[offset..offset + 16]) {
+                serial_println!(":: igpu: [AUX] EDID chunk {} failed: {} ::", chunk, e);
+                return Err("edid-chunk-read-failed");
+            }
+        }
+
+        let header: [u8; 8] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+        if &edid[0..8] != &header {
+            serial_println!(":: igpu: [AUX] EDID Header corrupt: {:02X?} ::", &edid[0..8]);
+            return Err("edid-corrupt");
+        }
+
+        let checksum: u8 = edid.iter().fold(0, |acc, &x| acc.wrapping_add(x));
+        if checksum != 0 {
+            serial_println!(":: igpu: [AUX] EDID Checksum failed: {} ::", checksum);
+            return Err("edid-corrupt");
+        }
+
+        serial_println!(":: igpu: [AUX] EDID Dump ::");
+        for i in 0..8 {
+            let row = &edid[(i*16)..((i+1)*16)];
+            serial_print!(":: igpu: [AUX] {:02X}0: ", i);
+            for b in row { serial_print!("{:02X} ", b); }
+            serial_println!("::");
+        }
+
+        highest = 5;
+        rung_name = "end";
+        Ok(())
+    };
+
+    match execute_harness() {
+        Ok(_) => {
+            ok_flag = 1;
+        }
+        Err(e) => {
+            serial_println!(":: igpu: [GMUX] REFUSED: {} ::", e);
+            why_str = e;
+        }
     }
-    let bar0 = IGPU_BAR0.load(Ordering::SeqCst);
-    if bar0 == 0 { 
-        serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name=harness ok=0 why=bar0-unmapped unwound=0 gmux=UNTOUCHED elapsed_ms={} ::", highest, get_elapsed_ms());
-        return; 
-    }
 
-    let ddc = gmux_index_read(GMUX_SWITCH_DDC);
-    let disp = gmux_index_read(GMUX_READ_DISPLAY);
-    let ext = gmux_index_read(GMUX_READ_EXTERNAL);
-    serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", ddc, disp, ext);
+    let unwound_count = unwind.len;
+    let revert_ok = unwind.execute();
 
-    if ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32 || ext != GMUX_EXTERNAL_DIS as u32 {
-        serial_println!(":: igpu: [GMUX] REFUSED: pre-switch state is not fully DIS (DDC={}, DISP={}, EXT={}) — no known safe state to return to ::", ddc, disp, ext);
-        serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name=harness ok=0 why=pre-switch-not-dis unwound=0 gmux=FAILED elapsed_ms={} ::", highest, get_elapsed_ms());
-        return;
-    }
+    // Read back to decide gmux= verdict. Only DDC is proven, others are TBV.
+    let gmux_verdict = if let Some(intent_ddc) = pre_ddc {
+        if mux_touched {
+            let post_ddc = gmux_index_read(GMUX_SWITCH_DDC);
+            let post_disp = gmux_index_read(GMUX_READ_DISPLAY);
+            let post_ext = gmux_index_read(GMUX_READ_EXTERNAL);
 
-    let ggc = crate::arch::pci::read_config_32(0, 0, 0, 0x50);
-    let bdsm = crate::arch::pci::read_config_32(0, 0, 0, 0xB0);
-    let ggtt0 = mmio_read(bar0, regs::GTT_BASE);
-    let ggtt1 = mmio_read(bar0, regs::GTT_BASE + 4);
-    let aux_ctl = mmio_read(bar0, 0x64010);
-    let frmcnt = mmio_read(bar0, 0x70040);
-    serial_println!(":: igpu-dpy: rung=00 name=census ok=1 bdsm=0x{:08X} ggc=0x{:08X} ggtt0=0x{:08X} ggtt1=0x{:08X} aux_ctl=0x{:08X} frmcnt=0x{:08X} ::",
-        bdsm, ggc, ggtt0, ggtt1, aux_ctl, frmcnt);
+            let verdict = if post_ddc == intent_ddc && revert_ok {
+                "MATCH"
+            } else {
+                "FAILED"
+            };
 
-    let mut unwind = DisplayUnwind::new(bar0);
+            serial_println!(":: igpu: [GMUX] revert read-back: DDC=0x{:02X} DISP=0x{:02X} (TBV) EXT=0x{:02X} (TBV) ::", post_ddc, post_disp, post_ext);
+            verdict
+        } else {
+            "UNTOUCHED"
+        }
+    } else {
+        "UNTOUCHED"
+    };
 
-    gmux_state_update(|_| Some(RevertState {
-        armed: true,
-        due: false,
-        ddc: ddc as u8,
-        disp: disp as u8,
-        ext: ext as u8,
-        deadline_ms: 0,
-    }));
-
-    serial_println!(":: igpu: [GMUX] the panel is EXPECTED to go black now — switching to IGD ::");
-    let (switched, r_ddc, r_disp, r_ext) = gmux_apply("switch", GMUX_DDC_IGD, GMUX_DISPLAY_IGD, GMUX_EXTERNAL_IGD);
-    serial_println!(":: igpu-dpy: rung=00 name=mux ok={} ddc=0x{:02X} disp=0x{:02X} ext=0x{:02X} verdict={} ::",
-        if switched { 1 } else { 0 }, r_ddc, r_disp, r_ext, if switched { "MATCH" } else { "MISMATCH" });
-
-    if !switched {
-        gmux_revert_now();
-        serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name=harness ok=0 why=mux-switch-failed unwound={} gmux=FAILED elapsed_ms={} ::", highest, unwind.len, get_elapsed_ms());
-        return;
-    }
-
-    serial_println!(":: igpu: [GMUX] switch successful (10s dwell expected) ::");
-
-    let surf_a = dump_plane(bar0, 'A', regs::DSPACNTR, regs::DSPASURF, regs::DSPASTRIDE, regs::DSPALINOFF, regs::DSPATILEOFF);
-    let surf_b = dump_plane(bar0, 'B', regs::DSPBCNTR, regs::DSPBSURF, regs::DSPBSTRIDE, regs::DSPBLINOFF, regs::DSPBTILEOFF);
-    let surf_c = dump_plane(bar0, 'C', regs::DSPCCNTR, regs::DSPCSURF, regs::DSPCSTRIDE, regs::DSPCLINOFF, regs::DSPCTILEOFF);
-
-    let mut active_surf = None;
-    if let Some(surf) = surf_a.or(surf_b).or(surf_c) {
-        active_surf = Some(surf);
-        ACTIVE_SURF.store(surf, Ordering::SeqCst);
-    }
-    bring_up_blt_ring(bar0, active_surf);
-
-    serial_println!(":: igpu: [GMUX] beginning success-path dwell ::");
-    gmux_dwell();
-    unwind.execute();
-    let reverted = gmux_revert_now();
-    serial_println!(":: igpu: [GMUX] success-path dwell finished, reverted={} ::", reverted);
-
-    serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name=harness ok={} unwound={} gmux={} why={} elapsed_ms={} ::",
-        highest, if reverted { 1 } else { 0 }, unwind.len, if reverted { "MATCH" } else { "FAILED" }, if reverted { "none" } else { "revert-failed" }, get_elapsed_ms());
+    serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name={} ok={} unwound={} gmux={} why={} elapsed_ms={} ::",
+        highest, rung_name, ok_flag, unwound_count, gmux_verdict, why_str, get_elapsed_ms());
 }
