@@ -460,6 +460,24 @@ sdmmc_arm = ["sdmmc"]
 # §ORIN-INSTALL-1 and scripts/orin-sdmmc1-bench.md.
 install_target = ["sdmmc_arm"]
 
+# SDHC-4a (x86): the `UNAOS_SDW=1` write ARM for the 2012 rMBP's BUILT-IN PCIe SD reader
+# (drivers/sdhc.rs). Milestones 1-3 wrote only the CONTROLLER — the card was untouched end to end and
+# `arch/x86_64/pci.rs` calls the probe "the read-only SDHC census". This arm compiles in ONE primitive,
+# `write_block_512`: a polled single-block CMD24 mirroring the metal-proven `drivers::emmc2` ladder
+# (CMD24 -> R1 -> Buffer-Write-Ready -> 128 words -> Transfer-Complete -> DAT0 programming-busy ->
+# CMD13 verdict). PIO, never the ADMA2 engine: the file's DMA law ("DMA lands only in driver-owned
+# memory") protects HOST memory, and reversing the direction points a straggling descriptor at the
+# CARD, where no bounce buffer can help.
+#
+# Knob-OFF is byte-identical ON THE CARD, not merely in behaviour: `write_block_512` is `#[cfg]`-gated,
+# so no CMD24 command word exists anywhere in a default image. What the DEFAULT build DOES gain is the
+# self-test's read-only half — the scratch picker, its five refusals and a one-line `:: sdhc: w1 ...
+# -> DRYRUN ::` verdict naming the LBA an armed build would write. That is deliberate (the M3b lesson):
+# the `armed=` field on the wire is what catches a knob wired into `arroyo` but not into
+# `builder/src/main.rs`, and a dry run answers "would arming this write, and where" without writing.
+# x86_64 only; aarch64 media are byte-identical. See docs/dev/OS/07_USB_STORAGE/sdhc.md §SDHC-4a.
+sdw = []
+
 # AARCH64-VNET: the `UNAOS_VNET=1` virtio-net-mmio driver on the QEMU `virt` machine + smoltcp bind
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. NET-4's
 # driver is `tegra`-gated (QEMU models no Tegra234 RC), so it is only ever COMPILE-tested off metal; this

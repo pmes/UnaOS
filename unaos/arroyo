@@ -202,6 +202,19 @@ _feats=""
 # Does NOT imply smc — without it the module is unlinked and this feature is inert. Default OFF.
 # Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_SMCWALK:-}" ] && _feats="${_feats}smcwalk,"
+# SDHC-4a: UNAOS_SDW=1 arms the WRITE path on the 2012 rMBP's BUILT-IN PCIe SD reader
+# (drivers/sdhc.rs) — one primitive, `write_block_512`, a polled single-block CMD24 mirroring the
+# metal-proven `drivers::emmc2` ladder. Milestones 1-3 wrote only the CONTROLLER; this is the first
+# build of this kernel in which a byte can reach the CARD, and `write_block_512` is `#[cfg]`-gated so
+# a default image contains no CMD24 command word at all. The boot self-test writes ONE sector it has
+# PROVEN is empty (five refusals: wp-switch / csd-perm-wp / csd-tmp-wp / gpt / inside-partition-N /
+# nonblank), verifies it, restores the original and verifies the restore. DISARMED it still runs the
+# read-only half and prints `:: sdhc: w1 armed=0 ... -> DRYRUN ::` naming the LBA it would have
+# written — so the question "would arming this build write, and where" is answered by a boot that
+# writes nothing. x86_64 only; aarch64 media byte-identical. Default OFF.
+# Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
+# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_SDW:-}" ] && _feats="${_feats}sdw,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -421,6 +434,13 @@ arm_features() {
     # every aarch64 media hash between a default build and a `UNAOS_NOKBDWIT=1` one for zero
     # observable change. Stripped => aarch64 media are byte-identical either way.
     f="${f//,kbdwit,/,}"
+    # SDHC-4a rides the same strip, for the same reason: `drivers/sdhc.rs` is reached only from
+    # `arch/x86_64/pci.rs`, so `sdw` emits not one byte of aarch64 CODE — but leaving it enabled would
+    # shift every aarch64 media hash between a default build and a `UNAOS_SDW=1` one for zero
+    # observable change. Stripped => aarch64 media are byte-identical whichever way the x86 write arm
+    # points, which is the property that lets the x86 track arm a card-write knob without touching the
+    # Pi or Jetson media at all.
+    f="${f//,sdw,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -1114,7 +1134,13 @@ KERNEL_CFG_MATRIX=(
   # CONSOLE-WINDOW route (wc), instgui, the Kepler trio, IVB/GMUX, VPERF (videobench/videocap), the
   # EHCI family + KBDWIT, MTRAW + its inject sub-knob, STOR-1 (irqstorage), the BOT fault/ring
   # experiments, BENCH-RIDE (therm/pcilink/vrom), SMC, the rasterizer and the installer engine.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest"
+  # SDHC-4a: `sdw` is carried HERE and only here. Its gate is a real `#[cfg(feature = "sdw")]` on
+  # `drivers::sdhc::write_block_512` and on the armed half of the self-test, so without a leg that
+  # enables it the entire CMD24 ladder would be type-checked by nothing — the exact blind spot the
+  # coverage argument above exists to close. The default legs cover the disarmed polarity.
+  # `pfwire_selftest` (the forced fatal-#PF self-test) rides the same argument: its
+  # `#[cfg]` is type-checked by this leg alone.
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the

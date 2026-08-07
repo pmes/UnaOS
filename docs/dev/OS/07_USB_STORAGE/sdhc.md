@@ -669,3 +669,323 @@ path still has no backend selector, so a card published into the global
 stops at `read_blocks_512` as a module-public API, exactly as milestone 2 stopped at
 `read_block_512`. A faster read path is not a reason to claim a global another driver
 is already using; that is its own arc.
+
+---
+
+## 8. Milestone 4a (SDHC-4a) — the first write to a CARD
+
+Milestones 1–3 wrote only the **controller**: memory decode, a reset, bus power, the
+clock divider, Host Control 1, Bus Master, and the command/transfer-mode registers.
+The medium was untouched end to end, which is why `arch/x86_64/pci.rs:638` still calls
+the probe "the read-only SDHC census". Milestone 4a is the first build of this kernel
+in which a byte can reach the card.
+
+It adds exactly **one primitive** — `write_block_512`, a polled single-block CMD24 —
+plus a boot self-test that exercises it against a sector the driver has *proven* is
+empty. Multi-block CMD25, block-layer registration and any filesystem write are 4b/4c.
+
+### 8.1 PIO, not the ADMA2 engine that is already sitting there
+
+Milestone 3 left a working, A/B-verified ADMA2 engine in this driver, and 4a does not
+use it. Four reasons, in the order that decides it:
+
+1. **The file's own DMA law does not hold in the write direction.** `sdhc.rs`'s scope
+   limits say DMA "lands only in driver-owned memory … a DMA write that straggles in
+   after a transfer was declared timed out therefore lands somewhere harmless,
+   forever." That protection is a property of the **bounce buffer**, and the bounce
+   buffer protects **host memory**. Reverse the direction and the engine no longer
+   writes host memory — it reads host memory and writes **the card**. A descriptor the
+   engine is still walking when the driver declares a timeout lands on the medium, and
+   no bounce buffer can make that harmless, because the medium is the thing being
+   protected. The one DMA law this driver has is silent exactly where a write needs it.
+2. **An armed engine cannot be recalled; a PIO write can.** Nothing is committed until
+   the controller has taken all 128 words and raised Transfer Complete, so every
+   failure before that point is a write that never happened.
+3. **Layering — the argument §7 already made and won.** Milestone 3a added CMD18
+   "still on PIO, so new COMMAND semantics are proved … with no new risk surface at
+   all". CMD24 is new command semantics *and* a new direction, and `verify_adma_ab`
+   has only ever proved the engine in the **read** direction. Putting the first card
+   write on an unproved DMA direction would leave "write semantics" and "DMA write
+   direction" jointly suspect.
+4. **There is nothing to win.** One block is 128 uncached word writes — tens of
+   microseconds — against a card programming time in milliseconds (why
+   `PROG_BUSY_TIMEOUT_MS` is 500). A single-block write is programming-bound, not
+   bus-bound. CMD25 is where DMA starts to pay; that is 4b's argument to make, with a
+   proved CMD24 underneath it.
+
+### 8.2 The ladder
+
+`drivers::emmc2::write_block_512` (emmc2.rs:706-786), the ladder the Pi has already
+run on real silicon, mirrored step for step:
+
+| step | what | bound |
+| :-- | :-- | :-- |
+| W1C status, Block Size 512, Block Count 1, Transfer Mode | `TM_BLOCK_COUNT_EN` only — **`TM_DIR_READ` omitted** is what makes it a write; there is no positive "write" bit | — |
+| CMD24 WRITE_SINGLE_BLOCK | R1, CRC + index check, data present | `CMD_TIMEOUT_MS` x2 |
+| `r1_check` **before a byte is pushed** | the card's own verdict (WP_VIOLATION, OUT_OF_RANGE, CARD_IS_LOCKED) — a card that rejected CMD24 never accepts the FIFO words | — |
+| Buffer **Write** Ready (bit 4, not the read path's bit 5) | then push exactly 128 little-endian words; short buffers zero-padded | `DATA_TIMEOUT_MS` |
+| Transfer Complete | the block is off the FIFO | `DATA_TIMEOUT_MS` |
+| **programming busy** — wait for Command Inhibit (DAT) to clear | the card holds DAT0 low while it burns flash; `send_command`'s own 100 ms entry wait is too short for a legal 250 ms busy | `PROG_BUSY_TIMEOUT_MS` (500) |
+| CMD13 SEND_STATUS | programming-phase failures (CARD_ECC_FAILED, generic ERROR, WP_ERASE_SKIP) are reported by **no** controller interrupt — only by a later SEND_STATUS | `CMD_TIMEOUT_MS` x2 |
+
+Two deltas from the emmc2 twin, both this file's own established discipline:
+
+* **failed data phases close the CARD's side** with `abort_data_transfer` (CMD12 +
+  `reset_cmd_dat`), not just the host's. A write aborted mid-FIFO leaves the card in
+  `rcv`, and the next command issued to a card in `rcv` is rejected for a reason that
+  has nothing to do with that command. emmc2 returns without it.
+* **the CMD13 verdict checks CURRENT_STATE**, not only `R1_ERROR_MASK`. `prg` is not
+  an error bit: a card still programming answers CMD13 with a clean R1 whose state
+  field reads `prg`, and a check that only masks for errors reads that as success.
+
+### 8.3 Four gates, outermost first
+
+| # | gate | refuses when | witness |
+| :-- | :-- | :-- | :-- |
+| 1 | **build** — `#[cfg(feature = "sdw")]` on `write_block_512` | always, unless `UNAOS_SDW=1` | `armed=0` on the `w1` line |
+| 2 | **physical switch** — Present State bit 19, *inverted* (1 = write ENABLED), re-read at the write | the slider says LOCKED | `reason=wp-switch` |
+| 3 | **the card's CSD** — `PERM_WRITE_PROTECT` (CSD[13]), `TMP_WRITE_PROTECT` (CSD[12]) | the card declares itself read-only | `reason=csd-perm-wp` / `csd-tmp-wp` |
+| 4 | **blank-sector proof** — the scratch sector is read first | it is neither all-zero nor already carrying this driver's marker | `reason=nonblank` |
+
+Gate 1 is compile-time rather than a runtime branch precisely so the claim is
+checkable from the artifact: a default build contains **no** `[sdhc-w]` string and no
+CMD24 command word (verified — 0 occurrences disarmed, 13 armed).
+
+`WP_GRP_ENABLE` (CSD[31]) is decoded and printed but **not** gated on: it governs
+CMD28/CMD29 group protection, and this milestone sends neither. A bit that governs
+commands nobody sends cannot refuse anything.
+
+### 8.4 The self-test, and why it is safe under a power cut
+
+The shape is `arch::aarch64::sdmmc_tegra`'s ORIN-SDMMC-2 paranoia ladder
+(sdmmc_tegra.rs:740-845) — pick a scratch sector, stash it, write a stamped pattern,
+verify, restore, verify the restore — plus **two checks that precedent does not make**:
+
+* **`inside-partition-N`.** ORIN-SDMMC-2 picks the card's last LBA and refuses only
+  when sector 0 is GPT (because the backup GPT header lives there). It never checks
+  whether that last LBA falls inside a declared **MBR** partition — which on any card
+  partitioned "use the rest of the disk", the default of every partitioning tool, it
+  does. 4a refuses.
+* **`nonblank`.** Every other check reasons from a **table**, and a partition table is
+  a claim about the disk written by software that is not running now: it can be stale,
+  damaged, or a lie. This one reasons from the sector itself. Whatever the table says,
+  512 zero bytes are 512 zero bytes.
+
+Gate 4 is what makes the stash/restore window harmless. The ladder is exposed between
+the pattern write and the verified restore, and a power cut in that window strands the
+pattern on the card — but the sector was **proven empty first**, so the only thing a
+cut can strand is this driver's own labelled pattern where zeros used to be. The
+pattern carries `UNAOS-SDHC4A-SCRATCH`, so a stranded sector is self-identifying, and
+`sdw_blank` accepts "already ours" as writable — one interrupted test does not
+permanently disqualify the sector.
+
+A consequence worth stating: because the stash is provably 512 zeros or the driver's
+own marker, there is **nothing worth dumping** if a restore fails. ORIN-SDMMC-2 dumps
+its stash as 32 lines of hex precisely because its stash may hold real data; 4a omits
+the dump, and that omission is a *consequence* of gate 4, not a shortcut around it.
+
+The restore is also a **second write with different content, verified** — a ladder that
+wrote once could have been lucky; one that writes twice and verifies both has shown
+the path is repeatable.
+
+### 8.5 The witness
+
+Exactly one line per boot on which a card was identified, whatever happens:
+
+```
+:: sdhc: w1 armed={0|1} lba={n|NONE} wp_sw={0|1} csd_perm={0|1} csd_tmp={0|1}
+   class={?|GPT|MBR|MBR-empty|unpartitioned} blank={?|0|1}
+   verify={IDENTICAL|MISMATCH|DRYRUN|FAILED|UNREADABLE|SKIPPED}
+   restore={IDENTICAL|MISMATCH|REWRITTEN|REWRITE-FAILED|FAILED|UNREADABLE|SKIPPED}
+   reason={...} -> {PASS|REFUSED|DRYRUN|FAIL} ::
+```
+
+`verify=`/`restore=` read `SKIPPED` on every path that did not reach them — never
+silently omitted — so the line's **absence** means one thing only: the ladder never ran
+(no controller, no card, or bring-up stopped earlier).
+
+**No field reports a value the boot did not measure.** Two of them earn that the hard
+way, and both were caught by adversarial review of the first draft:
+
+* **`blank=` is `?`, not `0`, on every path that returns before the scratch sector is
+  read** — rungs 1–6. It was a `u8` and those rungs passed a literal `0`, so a
+  `reason=inside-partition-0` refusal asserted *"this sector holds bytes we did not put
+  there"* about a sector nobody had read. `blank=0` now appears on exactly one line, the
+  `nonblank` refusal, where it is a measurement taken by `sdw_blank`. `blank=1` appears
+  only after that same call returned true.
+* **`restore=IDENTICAL` means byte-compared equal, and nothing else.** The happy path
+  reads the restored sector back and runs `first_difference`; the three armed FAIL paths
+  re-write the stash and return without reading anything, and they now say **`REWRITTEN`**
+  (the write call returned `Ok`) or **`REWRITE-FAILED`**. The same token used to carry
+  both meanings, and it did so precisely on the paths where the card's state is most in
+  doubt. The FAIL paths deliberately do **not** read back: a card that has just failed a
+  data phase is the worst place to spend two more commands, so the ladder reports what it
+  knows and names the difference instead of manufacturing a comparison.
+
+`class=?` likewise means sector 0 was never read (rungs 1–3), not "no partition table".
+
+**Everything except the write itself is unconditional.** The picker, all five refusals,
+the stash read and this line compile and run on every boot, armed or not. A disarmed
+boot prints `armed=0 ... -> DRYRUN` *together with the LBA it would have written*, so
+"would arming this build write, and where" is answered by a boot that writes nothing.
+That is also why `armed=` is on the wire: it is the field that catches a knob wired
+into `arroyo` but not into `builder/src/main.rs` — the x86 ESP carries the **builder's**
+kernel, and WXN-M3b lost a bench boot to exactly that omission.
+
+The unconditional half costs two CMD17s on a boot that already issues thirty-odd
+through `verify_read` / `verify_multiblock` / `verify_adma_ab`.
+
+### 8.6 QEMU coverage — real, and better than expected
+
+`builder/src/main.rs:702-721` already attaches `sdhci-pci` + a **blank 16 MiB
+`sd-card`** by default (`UNAOS_NOSDHCI=1` opts out), so unlike the aarch64 SDMMC arc —
+which has no QEMU model at all and prints a compiled-present-only line — 4a's write
+path **executes in the regression suite**. The emulated card is unpartitioned and
+blank, so every gate passes and the ladder runs end to end.
+
+Three runs, `./arroyo test 60`, all RC=0, no `EXCEPTION`, no `panicked at`, no `-> FAIL`:
+
+| run | knobs | `w1` verdict | `PASS` lines |
+| :-- | :-- | :-- | :-- |
+| dry run | — | `armed=0 lba=32767 wp_sw=1 csd_perm=0 csd_tmp=0 class=unpartitioned blank=1 verify=DRYRUN restore=SKIPPED reason=would-write -> DRYRUN` | 36 |
+| armed | `UNAOS_SDW=1` | `armed=1 lba=32767 ... class=unpartitioned blank=1 verify=IDENTICAL restore=IDENTICAL reason=none -> PASS` | 37 (36 + the `w1` PASS) |
+| armed, poisoned scratch | `UNAOS_SDW=1` | `armed=1 lba=32767 ... class=unpartitioned blank=0 verify=SKIPPED restore=SKIPPED reason=nonblank -> REFUSED` | 36 |
+
+(`PASS` counted as `awk '/-> PASS|result=PASS/'` over the serial log. The absolute
+number depends on the predicate; the load-bearing part is the **delta of exactly +1**
+between the disarmed and armed runs, which is the `w1` line itself.)
+
+The third run is the instrument-can-fail control: four bytes (`DE AD BE EF`) were
+written into the last sector of `target/sdcard.img` **on the host**, and the ladder
+refused. Host-side `sha256sum` of the card image was byte-identical across the armed
+PASS run (`080acf35…643e`), and the poison bytes survived the refusal untouched
+(`df14e0aa…49f4`). *Honest limit:* an unchanged hash across the PASS run is consistent
+with both "written and correctly restored" and "never persisted to the backing file" —
+the restore puts the sector back to zeros either way. The guest's own
+`verify=IDENTICAL`, taken through a fresh CMD17, is the evidence that the pattern
+reached the card model.
+
+Two further controls synthesise a partition table into sector 0 of the same 16 MiB
+image, and are the runs that exercise the refusals the blank default cannot reach:
+
+| control | card shape | `w1` verdict |
+| :-- | :-- | :-- |
+| MBR, whole-disk | one `0x0c` entry `start=2048 count=30720`, `end == num_blocks` — the bench card's exact shape | `class=MBR blank=? verify=SKIPPED restore=SKIPPED reason=inside-partition-0 -> REFUSED` |
+| protective MBR + backup header | one `0xEE` entry, `EFI PART` written at LBA 32767 | `lba=NONE class=GPT blank=? … reason=gpt -> REFUSED`, backup header byte-intact afterwards |
+
+Both are also the demonstration that `blank=?` is real: each of these paths returns
+before the scratch sector is read, and each used to print `blank=0` — a measurement
+that had not been taken. On the first control's card, LBA 32767 is 512 zero bytes, so
+`blank=0` was not merely unmeasured but wrong.
+
+What QEMU cannot reach: silicon timing (Buffer-Write-Ready latency, real DAT0
+programming-busy — QEMU deasserts busy instantly, so `PROG_BUSY_TIMEOUT_MS` and the
+CMD13 `prg` check are never exercised there), the write-protect **switch** (the
+emulated card reports write-enabled), and both CSD write-protect bits (both read 0).
+Gates 2 and 3 are therefore **metal-only** and currently unfired.
+
+### 8.7 Knobs
+
+`UNAOS_SDW=1` -> cargo feature `sdw`. Wired in **both** `arroyo` and
+`builder/src/main.rs` — the x86 ESP carries the builder's kernel, so a knob mapped in
+only one of them ships the feature disabled while the operator believes it is armed.
+For a *write* arm that is the most consequential version of that bug in the tree.
+
+`sdw` rides `arm_features`'s strip list alongside `smolnet` and `kbdwit`:
+`drivers/sdhc.rs` is reached only from `arch/x86_64/pci.rs`, so the feature emits no
+aarch64 code, and stripping it keeps every aarch64 media hash byte-identical whichever
+way the x86 write arm points. It is also carried on the `x86-all` check leg — its gate
+is a real `#[cfg]`, so without a leg that enables it the entire CMD24 ladder would be
+type-checked by nothing.
+
+### 8.8 What 4b/4c still need
+
+* **Block-layer registration.** `drivers::block`'s `BACKEND` selector
+  (block.rs:27-33) is compiled `all(target_arch = "aarch64", feature = "baremetal")`,
+  so x86 has no selector to register with; `publish_usb_geometry` claims the global
+  `BLOCK_DEVICE` unconditionally there (block.rs:317-320). Giving x86 the selector is
+  4b's content — named here, not designed here.
+* **The FAT single-writer hazard.** `flight_recorder.rs:39` documents SINGLE FAT
+  WRITER — the flush reserves `/UNAOS.LOG` once and then writes **in place**. A second
+  writable backend appearing on x86 interacts with that reservation, and the
+  interaction must be settled before any filesystem write is routed to the card.
+* **A GPT-aware scratch picker.** A GPT header declares `FirstUsableLBA`, and the gap
+  below it is unallocated by the disk's own account — which would give a GPT card a
+  provably-safe scratch region instead of 4a's blanket refusal.
+* **Multi-block CMD25**, at which point the ADMA2 write direction becomes worth its
+  risk — with a proved CMD24 underneath it.
+
+### 8.9 Named gaps in 4a's protection, carried into 4b
+
+These are gaps in the *gates*, not open questions about the code. Each one is a thing
+4a does not protect against, stated here so 4b inherits a list rather than a surprise.
+
+* **GPT is a heuristic, not a reading.** `sector0_survey` sets `class=GPT` from one
+  fact: a partition entry of type `0xEE`. The GPT header at LBA 1 is never read. A GPT
+  disk with a **hybrid MBR** — an Apple idiom, and the bench machine is a 2012 rMBP —
+  or with a rewritten or damaged protective MBR classifies as `MBR` or `Unpartitioned`,
+  and its last LBA (the **backup GPT header**) becomes a scratch candidate. Gate 4
+  backstops it by content and was proven to do so in QEMU (a hybrid-MBR card with a
+  real `EFI PART` at the last LBA refused with `reason=nonblank`, header byte-intact) —
+  but the gate that fires is not the gate that was designed to fire. **4b: one extra
+  CMD17 reading the `EFI PART` signature at LBA 1 makes rung 4 mean what it says.**
+* **A picker that moves off the last LBA loses that backstop.** The backup GPT *entry
+  array* occupies the 32 LBAs below the last, and on a sparse table those sectors are
+  largely **zero** — so `sdw_blank` would wave them through. Any 4b picker that walks
+  down from the end of the disk must read the GPT header first; the `nonblank` content
+  check will not catch it a second time.
+* **`Unpartitioned` includes a live superfloppy.** `Sector0Class`'s own doc comment
+  concedes it: no `0x55AA` signature means "unpartitioned, **or a filesystem starting
+  at LBA 0**". A superfloppy card gets **zero** table-based protection — `sector0_survey`
+  finds no signature and no extents, and rung 5 has nothing to refuse with. Gate 4 is
+  the only thing between the ladder and the last sector of a live filesystem. This is
+  also the *only* class the QEMU PASS run exercises (the blank 16 MiB image is
+  `class=unpartitioned`), so the one path the suite proves is the path with the least
+  table-based protection. **4b: probe for a filesystem at LBA 0 (FAT BPB, ext superblock
+  at 1024) before treating "no partition table" as "no owner".**
+* **The only two classes that can ever write** are, therefore: MBR/MBR-empty where the
+  last LBA falls outside all four extents (a card whose partitioning tool left
+  end-of-disk alignment slack — genuinely unallocated on MBR), and `Unpartitioned`.
+  Every other class refuses.
+* **A systematic wrong-LBA write is ungated.** The pattern write, the verify read, the
+  restore write and the restore read all share the `lba_arg` computation, so an
+  addressing error that is *consistent* is invisible to the verify: every step agrees
+  with every other step and the line reports `verify=IDENTICAL restore=IDENTICAL ->
+  PASS` while the bytes sit at an address nobody looked at. The stamped LBA at pattern
+  bytes 32..40 catches a one-off slip, not a systematic one. `lba_arg` mirrors
+  `read_block_512`'s logic, which is metal-proven on the Pi's eMMC and in QEMU — but
+  this driver's read path has never identified a card on x86 metal (§8.10), so on
+  `sdhc.rs` the computation is unproven. **This is why the write arm must not fly on the
+  same boot as the CMD8 fix:** identification must land first and the card must be
+  characterised, so that an armed flight has something to disagree with it.
+
+### 8.10 What a metal boot on the bench rMBP actually prints today
+
+Recorded because the first draft of this milestone assumed the opposite, and the
+assumption was falsified by captures that already existed.
+
+* **The `w1` line will not appear at all.** `bring_up` returns at the
+  `let Some(mut card) = identify(...) else { return false }` guard, before
+  `write_selftest(num_blocks)` is ever called. `identify()` dies at CMD8 —
+  `cmd8 send-if-cond FAILED int=0x00018000 (cmd-timeout)` — in **every** rMBP metal
+  capture in which the internal slot held a card (GR11, GR12, GR13, s61, s62, s66, and
+  the two most recent GR20 boots). There is no capture in which identification
+  succeeded. `CARD` stays `None`, `card_csd_write_protect()` returns `None`, and even a
+  reached `write_selftest` would return without printing. An unarmed reconnaissance
+  boot is *possible* and *uninformative*: it costs nothing and reports nothing.
+* **The boot medium is not on this driver's bus.** The `UNAOS-X86` card reaches the
+  kernel as `xHCI: Disk 'Generic-' 'USB3.0 CRW   -SD'` — a USB card reader on the
+  xHCI/BOT stack. `sdhc.rs` drives PCI function `3:0.1 14e4:16bc` only. It is
+  architecturally incapable of writing the boot medium, armed or not.
+* **The boot card is MBR, and its last LBA is inside partition 0.** The same boot
+  prints `PART: mbr ... type=0x0b start=2048 count=124733440 end=124735488 ACCEPT` with
+  `protective=0` and `dev_blocks=124735488`. `end == dev_blocks`, so `num_blocks-1`
+  falls inside the extent and rung 5 would refuse with `inside-partition-0` — before the
+  stash read and before any CMD24. (Reproduced in QEMU on a synthesised card of exactly
+  that shape.) The card is **not** GPT; the GPT refusal was never the operative risk.
+* **The residual risk is the card in the internal SDXC slot.** `card-inserted=1
+  cd-pin=1` on every recent boot; its contents and layout are unknown to anyone, and it
+  is the only medium `sdhc.rs` can ever reach. Today it is protected solely by the CMD8
+  failure. When a future arc fixes CMD8, this ladder runs against an uncharacterised
+  card with gates 4 and 5 as the only defence — which is the second half of the
+  argument in §8.9's last bullet.

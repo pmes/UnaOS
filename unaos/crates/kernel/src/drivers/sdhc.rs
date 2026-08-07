@@ -21,11 +21,19 @@
 //!   the SD clock, runs the card identification ladder, and reads one block. Milestone 1's witness
 //!   lines are all still emitted, in the same order, before anything is programmed — so a boot log
 //!   from this build is still directly comparable with a milestone-1 log up to the `claim` line.
-//! * **Milestone 3 (SDHC-3, this file)** — multi-block and ADMA2, layered so a failure can be
+//! * **Milestone 3 (SDHC-3, shipped)** — multi-block and ADMA2, layered so a failure can be
 //!   attributed. 3a adds CMD18 READ_MULTIPLE_BLOCK still on PIO, so new COMMAND semantics are
 //!   proved against milestone 2's single-block path with no new risk surface at all; only then do
 //!   3b/3c grant Bus Master and put a DMA engine underneath the same command. Milestone 2's
 //!   witness lines are unchanged and still emitted first.
+//! * **Milestone 4a (SDHC-4a, this file)** — the FIRST write this driver has ever made to a CARD.
+//!   Everything before this milestone wrote only the CONTROLLER; the medium was untouched end to
+//!   end, and `probe` was "the read-only SDHC census". 4a adds exactly one primitive —
+//!   [`write_block_512`], a polled single-block CMD24 mirroring `drivers::emmc2::write_block_512`
+//!   (emmc2.rs:706-786), the ladder the Pi has already proved on metal — plus a boot-time
+//!   self-test that exercises it against a scratch sector the driver has PROVEN is empty.
+//!   Multi-block CMD25, block-layer registration and any filesystem write are 4b/4c and are not
+//!   here. See §"The write gates" below for why nothing writes a card by default.
 //!
 //! ## Witness discipline (the rule this project pays for six times over)
 //!
@@ -65,7 +73,36 @@
 //!   [`card_num_blocks`] / [`read_block_512`] / [`read_blocks_512`] instead, and wiring it into the
 //!   block layer waits for the arc that gives x86 a real backend selector. Milestone 3 holds this
 //!   line exactly where milestone 2 drew it: a faster read path is not a reason to claim a global
-//!   another driver is already using.
+//!   another driver is already using. **Milestone 4a holds it too** — a driver that can write is
+//!   not thereby a block backend, and `drivers::block`'s `BACKEND` selector is compiled
+//!   `all(target_arch = "aarch64", feature = "baremetal")` (block.rs:27-33), so x86 has no selector
+//!   to register with yet. That is SDHC-4b's whole content.
+//!
+//! ## The write gates (SDHC-4a) — why an existing card cannot be written by this build
+//!
+//! Four independent gates stand between this driver and a byte of card media, and each one names
+//! itself on serial when it refuses. They are layered so that the OUTERMOST is a compile-time
+//! decision and the innermost is evidence read off the card in this boot:
+//!
+//! 1. **The build gate.** [`write_block_512`] is `#[cfg(feature = "sdw")]` (`UNAOS_SDW=1`). Without
+//!    it the function does not exist, no CMD24 word is assembled anywhere in the image, and every
+//!    existing build — every media anyone has ever booted — is byte-identical on the card side.
+//! 2. **The physical switch.** Present State bit 19 ([`PS_WRITE_PROTECT`], *inverted* sense:
+//!    1 = write ENABLED), re-read at the moment of the write rather than trusted from bring-up.
+//! 3. **The card's own CSD.** `PERM_WRITE_PROTECT` (CSD[13]) and `TMP_WRITE_PROTECT` (CSD[12]),
+//!    decoded at identification from the CMD9 response this driver already reads.
+//! 4. **The blank-sector proof.** The self-test's scratch sector is not merely *believed* unused —
+//!    it is READ FIRST, and the ladder refuses unless the sector is all-zero or already carries
+//!    this driver's own scratch marker. That is what makes the write's power-cut window harmless:
+//!    the only content a cut can strand on the card is a pattern where zeros were.
+//!
+//! Gate 4 is the one the in-tree precedent lacks. `arch::aarch64::sdmmc_tegra`'s ORIN-SDMMC-2
+//! ladder (sdmmc_tegra.rs:740-845) picks the card's LAST LBA, refuses when sector 0 is GPT (the
+//! backup GPT header lives there), stashes, writes, verifies and restores — but it never checks
+//! whether that last LBA falls INSIDE a declared MBR partition, which on any card partitioned
+//! "use the rest of the disk" it does. This milestone keeps that ladder's shape and adds the two
+//! checks that make its stash/restore window provably harmless: the MBR-extent test and the
+//! blank-content test.
 
 #![allow(dead_code)]
 
@@ -211,6 +248,15 @@ const CMD_TIMEOUT_MS: u64 = 100;
 const ACMD41_TIMEOUT_MS: u64 = 1000;
 /// One block's data phase. The SD read-access-time ceiling is 100 ms; doubled for margin.
 const DATA_TIMEOUT_MS: u64 = 200;
+/// SDHC-4a — post-write programming-busy bound. Once the last FIFO word is accepted the transfer is
+/// over at the LINK layer, but the card is still burning the block into flash and holds DAT0 low.
+/// The SD Physical Layer spec (§4.6.2.2) caps a single-block write's busy window at 250 ms; doubled
+/// for margin. It has to be its OWN budget and not [`CMD_TIMEOUT_MS`]: `send_command`'s entry wait
+/// for Command Inhibit (DAT) is 100 ms, so a perfectly healthy card taking a legal 250 ms to program
+/// would be convicted of a timeout by the very next command. This is `drivers::emmc2`'s
+/// `PROG_BUSY_TIMEOUT_MS` (emmc2.rs:103-106) and its reasoning, unchanged, because it is the same
+/// card-side spec bound whatever host controller is driving it.
+const PROG_BUSY_TIMEOUT_MS: u64 = 500;
 
 /// Identification clock: the SD Physical Layer spec requires the card be clocked at 100–400 kHz
 /// until it leaves identification state.
@@ -701,6 +747,35 @@ const TM_MULTI_BLOCK: u16 = 1 << 5;
 /// rejecting it here; without this check that rejection is silently swallowed.
 const R1_ERROR_MASK: u32 = 0xFFF9_8008;
 
+/// R1 READY_FOR_DATA (bit 8): the card's buffer is free — i.e. it is no longer programming.
+const R1_READY_FOR_DATA: u32 = 1 << 8;
+/// R1 CURRENT_STATE, bits [12:9]. The state the card says it is in, which is the ONLY thing that
+/// separates "the write completed and the card returned to transfer state" from "the card is still
+/// in `prg` and the host merely stopped looking". `R1_ERROR_MASK` cannot see this: `prg` is not an
+/// error, it is an unfinished write.
+#[inline]
+const fn r1_state(r1: u32) -> u32 {
+    (r1 >> 9) & 0xF
+}
+/// `tran` — the transfer state a card is in when it is idle and addressed. 7 = `prg`, 6 = `rcv`.
+const R1_STATE_TRAN: u32 = 4;
+
+/// Name an R1 CURRENT_STATE, so a post-write CMD13 line says which state instead of a number.
+fn r1_state_name(state: u32) -> &'static str {
+    match state {
+        0 => "idle",
+        1 => "ready",
+        2 => "ident",
+        3 => "stby",
+        4 => "tran",
+        5 => "data",
+        6 => "rcv",
+        7 => "prg",
+        8 => "dis",
+        _ => "reserved",
+    }
+}
+
 /// One command's outcome. The error carries the RAW Interrupt Status word that convicted it, so a
 /// failure line reports the evidence rather than a summary of it.
 type CmdResult = Result<(), u32>;
@@ -865,6 +940,12 @@ pub struct SdCard {
     /// CMD3's relative card address, already shifted into bits 31:16 for use as a command argument.
     rca_arg: u32,
     csd_structure: u8,
+    /// SDHC-4a — CSD[13] PERM_WRITE_PROTECT: the card declares itself permanently read-only. Set at
+    /// manufacture or by a one-way CMD27 PROGRAM_CSD; it can never be cleared. Decoded from the CMD9
+    /// response `identify` already reads, so this costs no extra command.
+    csd_perm_wp: bool,
+    /// SDHC-4a — CSD[12] TMP_WRITE_PROTECT: the card is read-only until someone clears the bit.
+    csd_tmp_wp: bool,
     /// ADMA2 engine state — `Unavailable` until [`adma2_init`] has run.
     adma: Adma2State,
     /// Physical address of the one-page ADMA2 descriptor table, or 0. Held as an address rather
@@ -890,6 +971,28 @@ pub fn card_num_blocks() -> Option<u64> {
 /// Whether the identified card is block-addressed (SDHC/SDXC) rather than byte-addressed (SDSC).
 pub fn card_block_addressed() -> Option<bool> {
     CARD.lock().as_ref().map(|c| c.block_addressing)
+}
+
+/// SDHC-4a — whether the identified card declares itself write-protected in its own CSD:
+/// `(PERM_WRITE_PROTECT, TMP_WRITE_PROTECT)`. Either being true is a refusal for every write path.
+pub fn card_csd_write_protect() -> Option<(bool, bool)> {
+    CARD.lock().as_ref().map(|c| (c.csd_perm_wp, c.csd_tmp_wp))
+}
+
+/// SDHC-4a — the WRITE PROTECT SWITCH on the card's shell, read live from Present State bit 19.
+///
+/// **The sense is inverted and this function is where that inversion lives**: the register bit reads
+/// 1 when writing is ENABLED (`PS_WRITE_PROTECT`), so this returns `true` for "the slider says
+/// LOCKED". Every caller asks the question in the direction it means, and the polarity is decoded
+/// exactly once *for a gating decision* — the two witness prints at `sdhc.rs:508`
+/// (`write-protected=`) and `sdhc.rs:696` (`wp-switch=`) still inline the mask test in their own
+/// polarity, each correct for its own label. Nothing but this function is allowed to decide.
+/// Read fresh on every call rather than cached from bring-up: a slider is a physical
+/// thing and the only reading that can justify a write is the one taken next to it.
+pub fn card_write_protected() -> Option<bool> {
+    CARD.lock()
+        .as_ref()
+        .map(|c| r32(c.base, REG_PRESENT_STATE) & PS_WRITE_PROTECT == 0)
 }
 
 // ===================================================================================
@@ -1074,6 +1177,22 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         return None;
     }
 
+    // SDHC-4a — the CARD's own write-protect declaration, decoded from the SAME CMD9 response above.
+    // These two bits sit at fixed positions in BOTH CSD versions, so no version branch is needed.
+    // `WP_GRP_ENABLE` (CSD[31], v1 only; hardwired 0 in v2) is decoded and printed alongside them
+    // because it says whether CMD28/CMD29 group protection is even implemented on this card — it is
+    // NOT gated on, because this milestone issues no group-protect command and a bit that governs
+    // commands nobody sends cannot refuse anything. Printed so the boot log carries the evidence for
+    // the milestone that will send them.
+    let csd_perm_wp = r2_bits(&csd, 13, 13) != 0;
+    let csd_tmp_wp = r2_bits(&csd, 12, 12) != 0;
+    let wp_grp_enable = r2_bits(&csd, 31, 31) != 0;
+    serial_println!(
+        "[sdhc] csd write-protect perm={} tmp={} wp-grp-enable={} -> card-declares-{}",
+        csd_perm_wp as u8, csd_tmp_wp as u8, wp_grp_enable as u8,
+        if csd_perm_wp || csd_tmp_wp { "READ-ONLY" } else { "writable" }
+    );
+
     // CROSS-CHECK. CCS (from ACMD41) and the CSD structure version are set by the card from the same
     // fact — a high-capacity card reports CCS=1 and CSD v2, a standard-capacity card CCS=0 and v1.
     // If they disagree, one of the two reads is wrong, and since CCS decides whether every later LBA
@@ -1137,6 +1256,8 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         num_blocks,
         rca_arg,
         csd_structure,
+        csd_perm_wp,
+        csd_tmp_wp,
         // The engine starts refused and is only granted by `adma2_init`. A default of "ready"
         // would make a forgotten init call read as a working DMA path.
         adma: Adma2State::Unavailable("engine init has not run"),
@@ -2325,6 +2446,634 @@ pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, 
 }
 
 // ===================================================================================
+// Step 8 — the single-block WRITE (CMD24), PIO (SDHC-4a)
+//
+// The first card write in this driver's history. Everything above this line writes only the
+// CONTROLLER; from here on a byte can reach the medium, and every line below is written on that
+// assumption.
+//
+// WHY PIO AND NOT THE ADMA2 ENGINE THAT IS ALREADY SITTING HERE. Four reasons, in the order that
+// decides it:
+//
+// 1. THE DMA LAW AT THE TOP OF THIS FILE DOES NOT HOLD IN THE WRITE DIRECTION. §"Scope limits" says
+//    "DMA lands only in driver-owned memory ... a DMA write that straggles in after a transfer was
+//    declared timed out therefore lands somewhere harmless, forever." That protection is a property
+//    of the BOUNCE BUFFER, and the bounce buffer protects HOST MEMORY. Reverse the direction and the
+//    engine no longer writes host memory — it reads host memory and writes THE CARD. A descriptor
+//    the engine is still walking when this code declares a timeout lands on the medium, and there is
+//    no bounce buffer that can make that harmless, because the medium is the thing being protected.
+//    The one law this driver has about DMA is silent exactly where a write would need it.
+// 2. AN ARMED ENGINE CANNOT BE RECALLED; A PIO WRITE CAN. Nothing is committed to the card until the
+//    controller has taken all 128 words and raised Transfer Complete, so every failure before that
+//    point is a write that never happened. A DMA transfer is handed to the engine in one register
+//    write and runs to completion on its own schedule.
+// 3. LAYERING — the argument this driver already made and won. §"Milestones" 3a added CMD18 "still
+//    on PIO, so new COMMAND semantics are proved against milestone 2's single-block path with no new
+//    risk surface at all". CMD24 is new command semantics AND a new direction. `verify_adma_ab` has
+//    only ever proved the engine in the READ direction; putting the first card write on top of an
+//    unproved DMA direction would leave "write semantics" and "DMA write direction" jointly suspect,
+//    which is the diagnosis failure this whole file is organised against.
+// 4. THERE IS NOTHING TO WIN. One block is 128 uncached word writes — tens of microseconds — against
+//    a card programming time measured in milliseconds (the reason `PROG_BUSY_TIMEOUT_MS` is 500).
+//    A single-block write is programming-bound, not bus-bound, so ADMA2 would buy an unmeasurable
+//    fraction of a transfer while spending every risk above. Multi-block CMD25 is where the DMA
+//    engine starts to pay, and that is SDHC-4b's argument to make, with a proved CMD24 underneath.
+//
+// The ladder itself is `drivers::emmc2::write_block_512` (emmc2.rs:706-786), mirrored step for step,
+// because that is the write ladder this project has already run on real silicon.
+// ===================================================================================
+
+/// SDHC-4a — write one 512-byte block at `lba` from `buf` via a polled single-block CMD24.
+///
+/// **Compiled only under `feature = "sdw"` (`UNAOS_SDW=1`).** Without the knob this function does
+/// not exist, no CMD24 command word is assembled anywhere in the image, and every build that has
+/// ever been made of this kernel is byte-identical on the card side. That is gate 1 of the four in
+/// the module header, and it is a compile-time gate rather than a runtime branch precisely so the
+/// claim is checkable from the artifact (`strings`/disassembly) and not only from the source.
+///
+/// Gates 2 and 3 — the physical write-protect switch and the card's own CSD bits — are enforced HERE,
+/// on every call, because a compiled-in write path must still refuse a card that says no. They are
+/// not the self-test's gates; they belong to the primitive, so a 4b block-layer caller inherits them
+/// without having to remember to.
+///
+/// The ladder, mirroring `drivers::emmc2::write_block_512` (emmc2.rs:720-786) step for step:
+/// CMD24 (R1, data present, host->card — [`TM_DIR_READ`] OMITTED) → the card's own R1 verdict BEFORE
+/// a byte is pushed → Buffer Write Ready → 128 little-endian words → Transfer Complete → the DAT0
+/// **programming-busy** wait under [`PROG_BUSY_TIMEOUT_MS`] → CMD13 SEND_STATUS for the card's
+/// post-programming verdict. `buf` shorter than 512 is zero-padded: the controller demands exactly
+/// 128 words or it stalls, so a full sector is always pushed.
+///
+/// Two deltas from the emmc2 twin, both of them this file's own established discipline rather than
+/// new invention:
+/// * **failed data phases close the CARD's side with [`abort_data_transfer`]**, not just the host's.
+///   A write aborted mid-FIFO leaves the card in `rcv`, and the next command issued to a card in
+///   `rcv` is rejected for a reason that has nothing to do with that command — the cascade
+///   `abort_data_transfer`'s own doc comment exists to prevent. emmc2 returns without it.
+/// * **the CMD13 verdict checks CURRENT_STATE, not only the error mask.** `prg` is not an error bit;
+///   a card still programming answers CMD13 with a clean R1 whose state field says `prg`, and a
+///   check that only masks for errors reads that as success.
+#[cfg(feature = "sdw")]
+pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let guard = CARD.lock();
+    let card = guard.as_ref().ok_or(BlockError::NotReady)?;
+    if lba >= card.num_blocks {
+        return Err(BlockError::BadLba);
+    }
+    let base = card.base;
+
+    // --- Gate 2: the physical switch, read NOW. Inverted sense: bit 19 set = write ENABLED.
+    let present = r32(base, REG_PRESENT_STATE);
+    if present & PS_WRITE_PROTECT == 0 {
+        serial_println!(
+            "[sdhc-w] REFUSED lba={} present={:#010x} wp-switch=LOCKED — the slider on the card says \
+             read-only (Present State bit 19 clear); no CMD24 issued",
+            lba, present
+        );
+        return Err(BlockError::Io);
+    }
+    // --- Gate 3: the card's own CSD declaration, decoded at identification.
+    if card.csd_perm_wp || card.csd_tmp_wp {
+        serial_println!(
+            "[sdhc-w] REFUSED lba={} csd perm-wp={} tmp-wp={} — the CARD declares itself read-only; \
+             no CMD24 issued",
+            lba, card.csd_perm_wp as u8, card.csd_tmp_wp as u8
+        );
+        return Err(BlockError::Io);
+    }
+
+    let arg = lba_arg(card, lba)?;
+
+    w32(base, REG_INT_STATUS, 0xFFFF_FFFF); // W1C stale status
+    w16(base, REG_BLOCK_SIZE, 512);
+    w16(base, REG_BLOCK_COUNT, 1);
+    // Single block, HOST -> CARD. `TM_DIR_READ` is the direction bit and its ABSENCE is what makes
+    // this a write; there is no positive "write" bit to set, which is why it is called out.
+    w16(base, REG_TRANSFER_MODE, TM_BLOCK_COUNT_EN);
+
+    if let Err(int) = send_command(
+        base,
+        cmd_word(24, RSP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT),
+        arg,
+        true,
+    ) {
+        serial_println!(
+            "[sdhc-w] cmd24 lba={} FAILED int={:#010x} ({})",
+            lba, int, int_error_name(int)
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+    // The card answered on the wire; now its own verdict, BEFORE pushing a byte. A card that rejected
+    // CMD24 — WP_VIOLATION, OUT_OF_RANGE, CARD_IS_LOCKED — will never accept the FIFO words, and
+    // pushing them anyway desynchronises the controller for every later transfer.
+    if let Err(r1) = r1_check(base, "cmd24 write") {
+        serial_println!("[sdhc-w] cmd24 lba={} rejected by the CARD r1={:#010x}", lba, r1);
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+
+    // Buffer Write Ready: the controller has room for a full block. It reads 0 both for a healthy
+    // controller that has not staged the buffer yet and for one that never will, so only the bounded
+    // wait separates them — and the error half is tested in the same predicate, because a failing
+    // transfer sets an error bit INSTEAD of, not before, the ready bit.
+    if !wait_ms(DATA_TIMEOUT_MS, || {
+        r32(base, REG_INT_STATUS) & (INT_BUF_WRITE_READY | INT_ERR_ANY) != 0
+    }) {
+        let int = r32(base, REG_INT_STATUS);
+        serial_println!(
+            "[sdhc-w] cmd24 lba={} buffer-write-ready TIMEOUT after {}ms int={:#010x} ({})",
+            lba, DATA_TIMEOUT_MS, int, int_error_name(int)
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+    let int = r32(base, REG_INT_STATUS);
+    if int & INT_ERR_ANY != 0 {
+        serial_println!(
+            "[sdhc-w] cmd24 lba={} ERROR before data int={:#010x} ({})",
+            lba, int, int_error_name(int)
+        );
+        w32(base, REG_INT_STATUS, int);
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+    w32(base, REG_INT_STATUS, INT_BUF_WRITE_READY);
+
+    // Push exactly 128 little-endian words. Bytes past a short `buf` are zero — the block-layer
+    // convention the emmc2 twin already follows — because a short push leaves the controller waiting
+    // and corrupts the block either way; a full sector is the only thing that is ever written.
+    let n = buf.len().min(512);
+    for i in 0..128usize {
+        let off = i * 4;
+        let mut word = [0u8; 4];
+        for (k, b) in word.iter_mut().enumerate() {
+            if off + k < n {
+                *b = buf[off + k];
+            }
+        }
+        w32(base, REG_BUFFER_DATA, u32::from_le_bytes(word));
+    }
+
+    if !wait_ms(DATA_TIMEOUT_MS, || {
+        r32(base, REG_INT_STATUS) & (INT_XFER_COMPLETE | INT_ERR_ANY) != 0
+    }) {
+        let int = r32(base, REG_INT_STATUS);
+        serial_println!(
+            "[sdhc-w] cmd24 lba={} transfer-complete TIMEOUT after {}ms int={:#010x} ({})",
+            lba, DATA_TIMEOUT_MS, int, int_error_name(int)
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+    let int = r32(base, REG_INT_STATUS);
+    w32(base, REG_INT_STATUS, int); // W1C everything we saw
+    if int & INT_ERR_ANY != 0 {
+        serial_println!(
+            "[sdhc-w] cmd24 lba={} data ERROR int={:#010x} ({})",
+            lba, int, int_error_name(int)
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+
+    // --- Programming busy. The block is off the FIFO but not yet in flash: the card holds DAT0 low
+    // while it programs, and programming-PHASE failures (CARD_ECC_FAILED, the generic ERROR bit,
+    // WP_ERASE_SKIP) are reported by NO controller interrupt — only by a later SEND_STATUS. Without
+    // this wait and the CMD13 below, a write the card ultimately discarded returns `Ok`.
+    if !wait_ms(PROG_BUSY_TIMEOUT_MS, || {
+        r32(base, REG_PRESENT_STATE) & PS_DAT_INHIBIT == 0
+    }) {
+        let ps = r32(base, REG_PRESENT_STATE);
+        serial_println!(
+            "[sdhc-w] cmd24 lba={} programming-busy TIMEOUT after {}ms present={:#010x} — the card \
+             never released DAT0; the block's fate is UNKNOWN",
+            lba, PROG_BUSY_TIMEOUT_MS, ps
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+
+    // --- CMD13 SEND_STATUS: the card's post-programming verdict, and the only place it is available.
+    if let Err(int) = send_command(
+        base,
+        cmd_word(13, RSP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK),
+        card.rca_arg,
+        false,
+    ) {
+        serial_println!(
+            "[sdhc-w] cmd13 after lba={} FAILED int={:#010x} ({}) — the write has NO verdict",
+            lba, int, int_error_name(int)
+        );
+        return Err(BlockError::Io);
+    }
+    let r1 = r32(base, REG_RESPONSE0);
+    if r1 & R1_ERROR_MASK != 0 {
+        serial_println!(
+            "[sdhc-w] cmd13 after lba={} r1={:#010x} state={} — the card reports the WRITE failed",
+            lba, r1, r1_state_name(r1_state(r1))
+        );
+        return Err(BlockError::Io);
+    }
+    // `prg` carries no error bit. A card still programming answers with a clean R1, and treating that
+    // as success is how a write gets reported durable before it is.
+    if r1_state(r1) != R1_STATE_TRAN || r1 & R1_READY_FOR_DATA == 0 {
+        serial_println!(
+            "[sdhc-w] cmd13 after lba={} r1={:#010x} state={} ready-for-data={} — the card has NOT \
+             returned to tran; the write is not durable",
+            lba, r1, r1_state_name(r1_state(r1)), (r1 & R1_READY_FOR_DATA != 0) as u8
+        );
+        return Err(BlockError::Io);
+    }
+    Ok(())
+}
+
+// ===================================================================================
+// Step 8b — the write self-test (SDHC-4a)
+//
+// One boot-time single-block write, against a scratch sector this driver has PROVEN is empty, with
+// the original stashed and restored and every step verified. The shape is
+// `arch::aarch64::sdmmc_tegra`'s ORIN-SDMMC-2 paranoia ladder (sdmmc_tegra.rs:740-845), plus the two
+// checks that precedent is missing — see the module header, §"The write gates".
+//
+// EVERYTHING IN THIS SECTION EXCEPT THE WRITE ITSELF IS UNCONDITIONAL. The scratch picker, all five
+// refusals, the stash read and the witness line compile and run on every boot, armed or not. That is
+// deliberate and it is the M3b lesson repaid: a disarmed boot prints `armed=0 ... -> DRYRUN` together
+// with the LBA it WOULD have written and the verdict of every gate, so the question "would arming
+// this build write, and where" is answered by a boot that writes nothing. It also means the `armed=`
+// field is on the wire — which is the field that caught a knob wired into `arroyo` but not into
+// `builder/src/main.rs`, a build the operator had armed and the media had not.
+//
+// The read cost of the unconditional half is two CMD17s (sector 0 and the scratch sector) on a boot
+// that already issues thirty-odd through `verify_read` / `verify_multiblock` / `verify_adma_ab`.
+// ===================================================================================
+
+/// The marker the scratch pattern carries. Two jobs: it makes a stranded sector SELF-IDENTIFYING (a
+/// power cut between the write and the restore leaves a sector that says what put it there and why),
+/// and it is what lets a later boot accept that same sector as scratch again — [`sdw_blank`] treats
+/// "already ours" as writable, so one interrupted test does not permanently disqualify the sector.
+const SDW_MARK: &[u8] = b"UNAOS-SDHC4A-SCRATCH";
+
+/// The stashed original contents of the scratch sector.
+static SDW_STASH: Mutex<[u8; 512]> = Mutex::new([0u8; 512]);
+/// The stamped pattern written to the scratch sector.
+static SDW_PATTERN: Mutex<[u8; 512]> = Mutex::new([0u8; 512]);
+/// The read-back buffer, used for both the write verify and the restore verify.
+static SDW_READBACK: Mutex<[u8; 512]> = Mutex::new([0u8; 512]);
+
+/// What sector 0 says the card's layout is. Only the GPT arm is load-bearing; the rest are printed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sector0Class {
+    /// A protective MBR — a partition entry of type 0xEE. The BACKUP GPT header and table occupy the
+    /// last 33 LBAs, which is exactly where the scratch sector is picked.
+    Gpt,
+    /// A 0x55AA signature with at least one non-0xEE partition entry.
+    Mbr,
+    /// A 0x55AA signature and an empty partition table.
+    MbrEmpty,
+    /// No boot signature at all: unpartitioned, or a superfloppy (a filesystem starting at LBA 0).
+    Unpartitioned,
+}
+
+impl Sector0Class {
+    fn name(&self) -> &'static str {
+        match self {
+            Sector0Class::Gpt => "GPT",
+            Sector0Class::Mbr => "MBR",
+            Sector0Class::MbrEmpty => "MBR-empty",
+            Sector0Class::Unpartitioned => "unpartitioned",
+        }
+    }
+}
+
+/// What sector 0 declares: its class, and the four partition extents as (start, end-exclusive).
+struct Sector0 {
+    class: Sector0Class,
+    /// (start, end-exclusive) for each non-empty entry; `None` for empty ones.
+    extents: [Option<(u64, u64)>; 4],
+}
+
+/// Classify sector 0 and extract its partition extents.
+///
+/// Deliberately a SECOND parse rather than a refactor of `verify_read`'s. That function is the
+/// milestone-2/3 read witness every metal baseline was taken against, and its partition snapshot
+/// exists to cross-check the CSD capacity; this one exists to decide whether a sector may be
+/// written. Sharing them would couple a read instrument's output format to a write refusal — and the
+/// same argument `lba_arg`'s doc comment already makes about not refactoring `read_block_512`.
+fn sector0_survey(buf: &[u8; 512]) -> Sector0 {
+    let mut extents = [None; 4];
+    let mut any = false;
+    let mut gpt = false;
+    for (i, e) in extents.iter_mut().enumerate() {
+        let o = 446 + i * 16;
+        let ptype = buf[o + 4];
+        let start = u32::from_le_bytes([buf[o + 8], buf[o + 9], buf[o + 10], buf[o + 11]]) as u64;
+        let count = u32::from_le_bytes([buf[o + 12], buf[o + 13], buf[o + 14], buf[o + 15]]) as u64;
+        if ptype == 0xEE {
+            gpt = true;
+        }
+        if ptype != 0 && count != 0 {
+            any = true;
+            *e = Some((start, start + count));
+        }
+    }
+    let sig = buf[510] == 0x55 && buf[511] == 0xAA;
+    let class = if gpt {
+        // A protective MBR is recognised by the 0xEE entry whether or not the 0x55AA signature
+        // survived — a disk with a GPT and a damaged signature is still a disk whose last 33 LBAs
+        // hold a backup GPT, and that is the only fact this classification is used for.
+        Sector0Class::Gpt
+    } else if !sig {
+        Sector0Class::Unpartitioned
+    } else if any {
+        Sector0Class::Mbr
+    } else {
+        Sector0Class::MbrEmpty
+    };
+    Sector0 { class, extents }
+}
+
+/// Whether `lba` falls inside any declared partition extent, and which.
+fn sdw_inside_partition(s0: &Sector0, lba: u64) -> Option<usize> {
+    for (i, e) in s0.extents.iter().enumerate() {
+        if let Some((start, end)) = *e {
+            if lba >= start && lba < end {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Whether a sector holds nothing worth keeping: all zero, or already carrying [`SDW_MARK`].
+///
+/// This is gate 4, and it is the gate that makes the stash/restore window harmless. Every other
+/// check in the ladder reasons from a TABLE — a partition table is a claim about the disk written by
+/// software that is not running now, and a claim can be stale, damaged or a lie. This one reasons
+/// from the sector itself: whatever the table says, 512 zero bytes are 512 zero bytes. A power cut
+/// anywhere between the pattern write and the verified restore can therefore strand exactly one
+/// thing on the card — this driver's own labelled pattern where zeros used to be.
+fn sdw_blank(buf: &[u8; 512]) -> bool {
+    if buf.iter().all(|&b| b == 0) {
+        return true;
+    }
+    buf.starts_with(SDW_MARK)
+}
+
+/// Build the stamped scratch pattern: the marker, the target LBA, then a byte-position sweep.
+///
+/// The sweep is `(i ^ 0x5A)`, so every byte of the sector differs from its neighbours and from its
+/// own offset. A stuck bit, a block that landed at the wrong LBA, a half-written sector and a FIFO
+/// that repeated a word all fail the byte-compare at a NAMED offset instead of passing a checksum.
+/// Mirrors `sdmmc_tegra::make_pattern` (sdmmc_tegra.rs:846-855) with this milestone's own marker.
+fn sdw_make_pattern(buf: &mut [u8; 512], lba: u64) {
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0x5A;
+    }
+    buf[..SDW_MARK.len()].copy_from_slice(SDW_MARK);
+    buf[32..40].copy_from_slice(&lba.to_le_bytes());
+}
+
+/// The one-line self-test verdict. Printed EXACTLY ONCE per boot on which a card was identified,
+/// whatever happens — refusal, dry run, pass or failure — so that the line's ABSENCE means only one
+/// thing: the ladder never ran at all (no controller, no card, or bring-up stopped earlier).
+///
+/// `lba=NONE` when no scratch sector could be picked; `verify=`/`restore=` are `SKIPPED` on every
+/// path that did not reach them, never silently omitted.
+///
+/// EVERY field is a `&str` so that "not measured" has a token of its own and cannot be spelled as a
+/// number. `blank=` in particular: it was a `u8`, and every refusal that returns BEFORE the scratch
+/// sector is read used to pass a literal `0` — i.e. the line asserted "this sector holds bytes we
+/// did not put there" about a sector nobody had read. `blank=?` is now the only thing those paths
+/// can say. `blank=0` and `blank=1` are measurements taken by [`sdw_blank`] and nothing else.
+///
+/// `restore=` distinguishes the two different things it used to conflate:
+///
+/// | token | means |
+/// | :-- | :-- |
+/// | `IDENTICAL` | the stash was written back AND read back AND byte-compared equal |
+/// | `MISMATCH` | written back, read back, and the compare found a difference |
+/// | `REWRITTEN` | the stash write returned `Ok` — NOT read back, NOT compared |
+/// | `REWRITE-FAILED` | the stash write itself returned `Err` |
+/// | `FAILED` / `UNREADABLE` | the restore write / its read-back failed on the happy path |
+/// | `SKIPPED` | no restore was attempted |
+///
+/// The distinction matters exactly where it used to be lost: the FAIL paths re-write the stash and
+/// then return, and those are the paths on which the card is in the most doubtful state.
+fn sdw_verdict(
+    armed: bool,
+    lba: Option<u64>,
+    wp_sw: u8,
+    perm: u8,
+    tmp: u8,
+    class: &str,
+    blank: &str,
+    verify: &str,
+    restore: &str,
+    reason: &str,
+    verdict: &str,
+) {
+    match lba {
+        Some(l) => serial_println!(
+            ":: sdhc: w1 armed={} lba={} wp_sw={} csd_perm={} csd_tmp={} class={} blank={} \
+             verify={} restore={} reason={} -> {} ::",
+            armed as u8, l, wp_sw, perm, tmp, class, blank, verify, restore, reason, verdict
+        ),
+        None => serial_println!(
+            ":: sdhc: w1 armed={} lba=NONE wp_sw={} csd_perm={} csd_tmp={} class={} blank={} \
+             verify={} restore={} reason={} -> {} ::",
+            armed as u8, wp_sw, perm, tmp, class, blank, verify, restore, reason, verdict
+        ),
+    }
+}
+
+/// SDHC-4a's boot witness: pick a provably-empty scratch sector, and — only when armed — write it,
+/// verify it, restore it and verify the restore.
+///
+/// The seven rungs, and what each one refuses on:
+///
+/// | rung | refusal `reason=` | why |
+/// | :-- | :-- | :-- |
+/// | 1 | `wp-switch` | the slider on the card says LOCKED (Present State bit 19 clear) |
+/// | 2 | `csd-perm-wp` / `csd-tmp-wp` | the CARD declares itself read-only in its own CSD |
+/// | 3 | `sector0-unreadable` | no layout evidence, so no sector can be shown to be safe |
+/// | 4 | `gpt` | the backup GPT header lives in the last LBA — where the scratch sector is |
+/// | 5 | `card-too-small` / `inside-partition-N` | the scratch sector belongs to a filesystem |
+/// | 6 | `scratch-unreadable` | nothing to stash, so nothing to restore from |
+/// | 7 | `nonblank` | the sector holds bytes this driver did not put there |
+///
+/// Rung 5's `inside-partition-N` is the check the ORIN-SDMMC-2 precedent does not make. Rung 7 is
+/// the one that makes the whole thing safe under a power cut — see [`sdw_blank`].
+///
+/// WHAT THIS LADDER CANNOT CATCH, named so it is not mistaken for covered: a SYSTEMATIC wrong-LBA
+/// write. The pattern write, the verify read, the restore write and the restore read all go through
+/// the same [`lba_arg`] computation, so if that computation (or the controller) puts the block at
+/// the wrong address, every step agrees with every other step and the ladder reports
+/// `verify=IDENTICAL restore=IDENTICAL -> PASS` while the bytes sit somewhere nobody looked. The
+/// embedded LBA at pattern bytes 32..40 catches a per-call address slip, not a systematic one.
+/// `lba_arg` mirrors `read_block_512`'s logic, which is metal-proven on the Pi's eMMC and in QEMU —
+/// but `sdhc.rs`'s own read path has never identified a card on x86 metal, so on THIS driver the
+/// computation is unproven. That is why the write arm must not fly on the same boot as a fix to the
+/// CMD8 identification failure: a first armed flight against a card nobody has characterised, with
+/// an address computation nobody has exercised, has no independent witness to disagree with it.
+fn write_selftest(num_blocks: u64) {
+    let armed = cfg!(feature = "sdw");
+
+    // Card identity and the two static gates, copied out from under the lock so the ladder below
+    // holds nothing while it issues bounded commands.
+    let Some((perm_wp, tmp_wp)) = card_csd_write_protect() else {
+        return; // no card was identified — bring_up never got here, and there is nothing to say
+    };
+    let wp_locked = card_write_protected().unwrap_or(true);
+    let wp_sw = (!wp_locked) as u8;
+    let (perm, tmp) = (perm_wp as u8, tmp_wp as u8);
+
+    // --- Rung 1: the physical switch.
+    if wp_locked {
+        sdw_verdict(armed, None, wp_sw, perm, tmp, "?", "?", "SKIPPED", "SKIPPED", "wp-switch", "REFUSED");
+        return;
+    }
+    // --- Rung 2: the card's own CSD.
+    if perm_wp || tmp_wp {
+        let why = if perm_wp { "csd-perm-wp" } else { "csd-tmp-wp" };
+        sdw_verdict(armed, None, wp_sw, perm, tmp, "?", "?", "SKIPPED", "SKIPPED", why, "REFUSED");
+        return;
+    }
+
+    // --- Rung 3: read sector 0 through the PUBLIC read path, so the layout evidence is exactly what
+    // any other caller would get.
+    let mut stash = SDW_STASH.lock();
+    if read_block_512(0, &mut stash[..]).is_err() {
+        sdw_verdict(armed, None, wp_sw, perm, tmp, "?", "?", "SKIPPED", "SKIPPED", "sector0-unreadable", "REFUSED");
+        return;
+    }
+    let s0 = sector0_survey(&stash);
+    let class = s0.class.name();
+
+    // --- Rung 4: the GPT refusal. Inherited verbatim from ORIN-SDMMC-2 (sdmmc_tegra.rs:760-768):
+    // a GPT disk keeps a BACKUP header in its final LBA and the partition-entry array in the 32 LBAs
+    // below it, which is precisely the region rung 5 picks from. Reading the GPT properly — its
+    // header declares FirstUsableLBA/LastUsableLBA, and the gap below FirstUsableLBA is genuinely
+    // unallocated by the disk's own account — would give a GPT card a safe scratch region, and that
+    // is SDHC-4b's to add. This milestone refuses rather than guesses.
+    if s0.class == Sector0Class::Gpt {
+        sdw_verdict(armed, None, wp_sw, perm, tmp, class, "?", "SKIPPED", "SKIPPED", "gpt", "REFUSED");
+        return;
+    }
+
+    // --- Rung 5: pick the scratch sector, and prove it belongs to no declared partition.
+    if num_blocks < 2 {
+        sdw_verdict(armed, None, wp_sw, perm, tmp, class, "?", "SKIPPED", "SKIPPED", "card-too-small", "REFUSED");
+        return;
+    }
+    let scratch = num_blocks - 1;
+    if let Some(i) = sdw_inside_partition(&s0, scratch) {
+        // The check the precedent is missing. A card partitioned "use the rest of the disk" — which
+        // is what every partitioning tool does by default — puts a live filesystem block exactly
+        // here, and a stash/restore over it is a live filesystem block that a power cut can strand.
+        let why = match i {
+            0 => "inside-partition-0",
+            1 => "inside-partition-1",
+            2 => "inside-partition-2",
+            _ => "inside-partition-3",
+        };
+        sdw_verdict(armed, Some(scratch), wp_sw, perm, tmp, class, "?", "SKIPPED", "SKIPPED", why, "REFUSED");
+        return;
+    }
+
+    // --- Rung 6: stash the scratch sector's current contents.
+    if read_block_512(scratch, &mut stash[..]).is_err() {
+        sdw_verdict(armed, Some(scratch), wp_sw, perm, tmp, class, "?", "SKIPPED", "SKIPPED", "scratch-unreadable", "REFUSED");
+        return;
+    }
+
+    // --- Rung 7: the blank proof. Note what does NOT follow from it: because the sector is proven
+    // empty, there is nothing in the stash worth dumping if a restore fails. ORIN-SDMMC-2 dumps its
+    // stash as 32 lines of hex on a failed restore precisely because its stash may hold real data;
+    // this ladder's stash is 512 zeros or its own marker by construction, so the dump is omitted and
+    // that omission is a consequence of gate 4, not a shortcut around it.
+    let blank = sdw_blank(&stash);
+    if !blank {
+        sdw_verdict(armed, Some(scratch), wp_sw, perm, tmp, class, "0", "SKIPPED", "SKIPPED", "nonblank", "REFUSED");
+        return;
+    }
+
+    // Every gate passed. A disarmed build stops HERE and says so — including the LBA it would have
+    // written, which is what makes a dry-run boot a genuine prediction rather than a placeholder.
+    if !armed {
+        sdw_verdict(armed, Some(scratch), wp_sw, perm, tmp, class, "1", "DRYRUN", "SKIPPED", "would-write", "DRYRUN");
+        return;
+    }
+
+    #[cfg(feature = "sdw")]
+    {
+        let mut pattern = SDW_PATTERN.lock();
+        let mut readback = SDW_READBACK.lock();
+        sdw_make_pattern(&mut pattern, scratch);
+
+        // --- The write.
+        if write_block_512(scratch, &pattern[..]).is_err() {
+            // The block may have partially landed. Put the original back and say whether that worked.
+            // `REWRITTEN`, not `IDENTICAL`: the write call returned Ok and NOTHING was read back or
+            // compared. A read-back here would issue two more commands to a card that just failed a
+            // data phase — the state in which extra commands are least likely to mean anything — so
+            // the ladder reports what it actually knows and names the difference in the token.
+            let restored = write_block_512(scratch, &stash[..]).is_ok();
+            sdw_verdict(
+                armed, Some(scratch), wp_sw, perm, tmp, class, "1", "FAILED",
+                if restored { "REWRITTEN" } else { "REWRITE-FAILED" },
+                "cmd24-failed", "FAIL",
+            );
+            return;
+        }
+
+        // --- The write verify: read the sector back and compare byte for byte against the pattern.
+        if read_block_512(scratch, &mut readback[..]).is_err() {
+            let restored = write_block_512(scratch, &stash[..]).is_ok();
+            sdw_verdict(
+                armed, Some(scratch), wp_sw, perm, tmp, class, "1", "UNREADABLE",
+                if restored { "REWRITTEN" } else { "REWRITE-FAILED" },
+                "verify-read-failed", "FAIL",
+            );
+            return;
+        }
+        if let Some((_, off)) = first_difference(&pattern[..], &readback[..]) {
+            // The EVIDENCE, not a summary: the offset says whether the block landed short, landed at
+            // the wrong LBA (the marker and the embedded LBA differ from byte 0), or lost a word.
+            serial_println!(
+                "[sdhc-w] verify lba={} first-diff off={} wrote={:#04x} read={:#04x}",
+                scratch, off, pattern[off], readback[off]
+            );
+            let restored = write_block_512(scratch, &stash[..]).is_ok();
+            sdw_verdict(
+                armed, Some(scratch), wp_sw, perm, tmp, class, "1", "MISMATCH",
+                if restored { "REWRITTEN" } else { "REWRITE-FAILED" },
+                "readback-differs", "FAIL",
+            );
+            return;
+        }
+
+        // --- The restore, and its own verify. This is a SECOND write through the same path: a
+        // ladder that wrote once could have got lucky, and a ladder that writes twice with different
+        // content and verifies both has shown the path is repeatable rather than a one-shot.
+        if write_block_512(scratch, &stash[..]).is_err() {
+            sdw_verdict(armed, Some(scratch), wp_sw, perm, tmp, class, "1", "IDENTICAL", "FAILED", "restore-write-failed", "FAIL");
+            return;
+        }
+        if read_block_512(scratch, &mut readback[..]).is_err() {
+            sdw_verdict(armed, Some(scratch), wp_sw, perm, tmp, class, "1", "IDENTICAL", "UNREADABLE", "restore-read-failed", "FAIL");
+            return;
+        }
+        let restore_ok = first_difference(&stash[..], &readback[..]).is_none();
+        sdw_verdict(
+            armed, Some(scratch), wp_sw, perm, tmp, class, "1", "IDENTICAL",
+            if restore_ok { "IDENTICAL" } else { "MISMATCH" },
+            if restore_ok { "none" } else { "restore-differs" },
+            if restore_ok { "PASS" } else { "FAIL" },
+        );
+    }
+}
+
+// ===================================================================================
 // Bring-up
 // ===================================================================================
 
@@ -2387,6 +3136,13 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
     adma2_smoke(num_blocks);
     // ...and SDHC-3c: whether what it moved is what the card holds, at three places on the card.
     verify_adma_ab(num_blocks);
+
+    // SDHC-4a: the write self-test, LAST. Every read instrument above has already spoken, so if the
+    // ladder below reports a bad read-back there is a boot's worth of evidence that the READ path was
+    // healthy a moment earlier — which is what makes a mismatch indict the write rather than leaving
+    // both directions suspect. Disarmed (the default, and every existing build) it issues no CMD24:
+    // it runs its gates, prints its verdict as `-> DRYRUN`, and the card is untouched.
+    write_selftest(num_blocks);
     true
 }
 

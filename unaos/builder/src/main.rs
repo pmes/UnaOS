@@ -138,6 +138,14 @@ fn main() {
     // it. Kept in sync with arroyo's mapping; a knob mapped there and missing HERE ships the feature
     // disabled while the banner claims it is on.
     if std::env::var("UNAOS_SMCWALK").is_ok() { feats.push("smcwalk"); }
+    // SDHC-4a: UNAOS_SDW=1 arms the CMD24 single-block WRITE path on the built-in PCIe SD reader
+    // (drivers/sdhc.rs). THIS list is what reaches the kernel binary for MEDIA builds — a knob mapped
+    // in arroyo but missing here ships the feature DISABLED while the operator believes it is armed,
+    // which for a WRITE arm is the most consequential version of that bug in the tree: the boot would
+    // print `armed=0 ... -> DRYRUN` on a run the operator armed, and (had the field not been on the
+    // wire) would have looked like a card that refused. The `armed=` field exists for exactly this,
+    // and it is what caught the same omission in WXN-M3b. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_SDW").is_ok() { feats.push("sdw"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature
