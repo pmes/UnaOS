@@ -1236,3 +1236,56 @@ What the review narrowed, and what this change does about it:
 full ~208 µs window). That would mean the name phase genuinely stalls longer than the budget rather
 than tripping over a short poll, and the suspicion returns to `GET_KEY_INFO`/pacing — the door
 `7814d258` named and Boot U left shut.
+
+## Boot W: the steady state, measured over a long sit (s73, 2026-08-06, kernel `7748d22c` @ `68370d6f`)
+
+The first capture that carries a *sit* behind the GR18 fix rather than a boot alone: five sweep
+witnesses across ~12 minutes of uptime. The predictions above are answered, and the answers are
+dull in the way a fixed driver should be.
+
+**The walk ran, and it ran quiet.** `#KEY count=493` enumerates in full, at a cost of ~99 ms:
+
+```
+[   1743ms] :: SMC-SCOUT: #KEY count=493 — walking index list ::
+[   1842ms] :: SMC-SCOUT: index walk done (493 of 493 names) ::
+[   1842ms] :: SMC-SCOUT: end (present=Y probed=19 found=17) == witness ::
+```
+
+`UNAOS_SMCWALK` is back to its default-off (WALK-QUIET), so the 493 per-name lines are not
+emitted. That is not cosmetic: those lines are serial bytes on the same link the boot's tail is
+measured through, and Boot V paid `SPACE … wait=1553ms … ftdi=1519ms` for them. Boot W reads
+`wait=209ms … tur=994ms … ftdi=177ms` — Boot U's shape restored. **The walk is not the cost;
+printing it was.** The knob is there for when the names are wanted.
+
+**The sit: `gap` climbs, and nothing else moves.**
+
+```
+[   1843ms] :: SMC-BATT: … retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=976  busy=30 late=0 == witness ::
+[ 198939ms] :: SMC-BATT: … retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=2312 busy=49 late=0 == witness ::
+[ 578899ms] :: SMC-BATT: … retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=4163 busy=49 late=0 == witness ::
+[ 702886ms] :: SMC-BATT: … retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=4773 busy=49 late=0 == witness ::
+```
+
+`gap` rises monotonically — 2312 → 4163 over ~10 minutes, 4773 by the last witness line — which
+is `gap_wait` doing steady work: every sweep recovers bytes the pre-fix drain would have dropped
+on the floor. Prediction 4 called exactly that shape, a boot-time step followed by a slow
+sweep-driven climb, and this is the first capture long enough to show the climb rather than the
+step.
+
+**`busy=49` is STABLE across the whole sit — and that is worth stating as a finding.** The
+boot-time line reads `busy=30` at 1843 ms; the counter reaches 49 during the rest of bring-up and
+then does not increment once in the following ~11.5 minutes. **All 49 `ST_BUSY` sightings are
+boot-time. A steady-state sweep never sees BUSY at all** — BUSY on this SMC appears only under
+boot-time load, which is consistent with Boot U's `busy=0` (a boot short enough not to reach it)
+and refines prediction 5 rather than contradicting it.
+
+**`late=0 short=0 st0=0 rfail=0 unc=0 retries=0/0` on every line, boot and sit.** `late` and
+`unc` are the two arms the GR18 round built to partition `Gap::StillOpen`, so `late=0 unc=0`
+sustained across the full capture is the measured statement that **every read ended where the SMC
+said it ended** — not a fallthrough zero, since `gap` is simultaneously non-zero and climbing,
+which proves the drain-loop body those counters live in ran thousands of times. `rok=0`
+throughout is the other half: the open-transaction leak the review found in `read_key_by_index`
+(Boot U's single `rok=1`) does not recur, so `close_transaction` is covering every exit.
+
+**The sibling fix's steady state is clean.** Nothing in this capture is a falsifier, and the
+walk-wedge falsifier above did not fire: the walk completed 493 of 493.

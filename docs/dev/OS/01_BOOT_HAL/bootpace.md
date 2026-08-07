@@ -982,6 +982,53 @@ confirms QEMU's HS device honours §5.5.3. Metal remains the gate for the ms.
 The M8 instrument stays armed precisely so the moved-vs-bought question answers itself on the
 next boot. Both outcomes are findings; only one of them is a saving.
 
+**Metal verdict — THE FALSIFIER FIRED (Boot W, 2026-08-06, kernel `7748d22c` @ `68370d6f`).**
+The ~50 ms did not vanish. Row 6 of the table above is the row that landed: the M8 line
+reappeared on [0], one line, at the new first request.
+
+```
+[    966ms] :: EHCI-HID: [0] EPACE-TRIM M8 SLOW-XFER addr=2 hub=0.0 spd=HS bmreq=0x80 breq=0x06
+   wval=0x0100 widx=0x0000 wlen=18 stg=3 xfer=47ms act=47ms ass=0ms seq=1/8 == witness ::
+```
+
+`wlen=18`, `addr=2` — `GET_DESCRIPTOR(18)`, the 18-byte device descriptor, which BUY-2 promoted
+into the slot immediately after SET_ADDRESS. **The NAK belongs to the device's FIRST-REQUEST
+SLOT, not to `GET_DESCRIPTOR(8)`.** The 50 ms was moved, not bought.
+
+| reading | predicted after | **Boot W (metal)** |
+|---|---|---|
+| `M8 SLOW-XFER … wlen=8` on [0] | absent | **absent** — the pre-read is gone |
+| `M8 SLOW-XFER … wlen=18` on [0] | **absent** (the falsifier) | **PRESENT**, `xfer=47ms act=47ms ass=0ms` |
+| `EPACE: [0] enum=` | ~235 ms | **281 ms** |
+| `EPACE: [0] {xfer= n=}` | `n=27`, ~9 ms | **`n=26`, 56 ms** |
+| `EPACE: [0] act=` | ~7 ms | **54 ms** |
+| `BPACE: ehci-hid-done d=` | ~1400 ms | **1444 ms** (Boot V: ~1450) |
+| `BUY-2 FALSIFIED` / `BUY-2 suspect` | absent | **absent — zero of either** |
+| `M1 … addr=2 05ac:8510` on [0], `M2 armed keyboard addr=6 ep=IN3` on [1] | present, identical | **present, identical** |
+| M8 lines on [1] | zero | **zero** |
+
+(`n=` fell 28 → 26 rather than the predicted 27; the transfer BUY-2 removes is certainly gone
+from the count, the second removal is not decomposed here.)
+
+**What this settles, and what BUY-2 is now worth.** `ehci-hid-done d=1444ms` against Boot V's
+~1450 is noise at this instrument's resolution: **BUY-2's saving is ~0 ms.** The `05ac:8510`
+pays ~47–50 ms on *whatever control request arrives first after SET_ADDRESS*, whichever request
+that happens to be. §8f's `enum` verdict concluded the block was a FLOOR — USB 2.0 minima plus
+the device's own answer latency — and that conclusion now extends to the slot itself: **the
+block is the device's, full stop**, and no reordering of our requests reaches it.
+
+**BUY-2 stays, and this is not a failed trim.** It removes a transfer from the bus, the
+USB 2.0 §5.5.3 assumption held on real silicon (**zero `BUY-2 FALSIFIED` and zero `BUY-2
+suspect` lines** — both self-policing arms silent, as designed), and nothing was lost: the same
+two devices enumerate identically. What changes is only the claim attached to it — one fewer
+transfer, **zero milliseconds** — and that is now measured rather than assumed. This is the
+honest outcome the M8 instrument was built to decide, and it decided it in one boot.
+
+**The new standing shape.** On [0], a single `M8 SLOW-XFER … breq=0x06 wlen=18 addr=2` line at
+~47 ms is the EXPECTED reading from here on — not an anomaly, and not a regression to chase.
+Zero M8 lines on [1] continues to hold; the asymmetry that made the original attribution
+possible is intact.
+
 ## 9. GPACE — the inside of `pci-usb` (GR13)
 
 Once EPACE took `ehci-hid-done` down, the s60 capture's largest remaining block
@@ -1686,6 +1733,35 @@ here refutes the original observation. What is closed is the false alarm: from n
 `sched=WALKED reports=0` with no keypress is the baseline, and the recurrence signature is
 `sched=WALKED` + keys pressed + **no** `SILENCE-BROKE` (device/TT/toggle, host side excluded) or
 `sched=NOT-WALKED` (host side, convicted with no keypress needed).
+
+**§10h addendum — Boot W (2026-08-06, kernel `7748d22c` @ `68370d6f`) is the current whole-boot
+headline.**
+
+```
+[   2380ms] :: BPACE: total gui=2376ms ftdi=none n=27 dropped=0 hz=2693808214 result=LEDGER ::
+[   2362ms] :: GPACE: xtail=0ms(n=1) bench=0ms(n=0) detect=5ms(n=1) igpu=1ms(n=1) kepler=397ms(n=1)
+   sdhc=12ms(n=1) nic=0ms(n=1) resid=2ms == witness ::
+```
+
+**`gui=2376ms`** — from Boot R's 3767, and from the morning's 20 727: **8.7×**. The move is one
+gate: `68370d6f` puts the 1.12 s fb-draw hold behind `UNAOS_KDISP_HOLD`, default off, and
+**`kepler=397ms(n=1)`** against Boot R's 1521 is what that gate is worth. `sched d=67ms` (from
+155 — §11b's event-count trim, landed). `ehci-hid-done d=1444ms` (§8h — the BUY-2 falsifier
+fired; the number is Boot V's, unmoved).
+
+The storage tail is back to Boot U's shape, and the reason is a knob rather than a trim:
+
+```
+[  11369ms] :: SPACE: [wait=209ms(n=1) setcfg=1ms(n=1) tur=994ms(n=2) sense=0ms(n=1) inq=1ms(n=1)
+   rdcap=0ms(n=1) pub=0ms(n=1) resid=4ms] {cbw=0ms(n=5) data=3ms(n=3) csw=994ms(n=5) peak=994ms@csw}
+   ftdi=177ms(n=4) total=1209ms sum=1205ms per_ms=2693808 result=SPACE ::
+```
+
+Boot V had read `wait=1553` / `ftdi=1519` on the same terms. That was not storage: it was the
+SMC `#KEY` index walk printing 493 per-name lines onto the same serial link the tail is measured
+through. `UNAOS_SMCWALK` is back to default-off (walk-quiet), the walk still completes in full,
+and `wait=209 ftdi=177` is what the tail actually costs. Recorded in
+`09_PLATFORM/smc_battery.md` under Boot W. `mbench` x86-witness **16/16**.
 
 ## 11. The boot head: `heap d=253ms` and the `sched` residue (GR20, 2026-08-06)
 
