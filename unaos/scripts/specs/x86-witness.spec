@@ -55,6 +55,30 @@
 # block at the end of this file has NO generation floor — the boot-pace ledger is ungated
 # (bootpace.rs says so in as many words) and predates every capture in the bench archive.
 #
+# A THIRD SET OF FLOORS, GR20 (2026-08-07), and they are listed per-directive rather than as one sha
+# because unlike the GR18 block these wires landed in four unrelated arcs and their blocks are spread
+# through this file:
+#   `8c8eb802`  `:: WXAUDIT-CORES:` — the per-core CR0 witness (M3a). Boot AA carries WXAUDIT-NXE and
+#               NOT this line: that is the pre-floor capture, and it is what the floor means.
+#   `1d0d93c6`  `:: video: edid` — the EDID carry-through. Also absent from Boot AA.
+#   `f94e280c`  `:: sdhc: card v1.x …` + `CARD IDENTIFIED` on THIS bench's card. The emitters are far
+#               older, but a pre-v2.00 card could not be identified at all before this commit, so on
+#               the bench's 29 MiB v1.x card the practical floor is here. BOOT AB IS THE PROOF and it
+#               is a better one than a claim: its capture reads `card-inserted=1`, `bus ready …
+#               card present`, then `cmd8 send-if-cond FAILED … card is pre-v2.00 or absent` and the
+#               identification stops. Card in the slot, healthy controller, no witness — the exact
+#               shape of a pre-floor red, and NOT a media problem.
+#   `b2f4a090`  `:: sdhc: w1 …` — the SDHC-4a write self-test's verdict line.
+#
+# A CARD-PRESENCE SCOPE AXIS, third alongside the knob set and the generation floors, and it belongs
+# to the three `sdhc:` REQUIREs only. Those lines print once per boot ON WHICH A CARD WAS IDENTIFIED;
+# the bench's boot volume is the 59 GiB USB stick, so the SD reader's card is scratch media that a
+# sitting could in principle run without. A capture taken with an empty reader prints
+# `[sdhc] bdf 3:0.1 bus is up (powered, clocked) but NO CARD is inserted — nothing to identify`
+# and reds those three directives. That line is named here so the reader diagnosing such a red can
+# tell "wrong capture for this spec" from "the wire died", which is the whole distinction the
+# generation-floor paragraphs above exist to preserve. Boots AC/AD/AE/AF all carry a card.
+#
 # WHY THIS FILE EXISTS. Through GR17 the pi4 gate (pi4-regression.spec) was the ONLY automated
 # reader of any `[wc-g]`/`[wc-d]`/`[wc-h]`/`[wc-k]` line anywhere in the tree. Every x86 witness
 # finding — the 17.1 s kepler block, its four-phase decomposition, the paygo deferral that took
@@ -649,6 +673,38 @@ FORBID :: WXAUDIT x86: .* TRUNCATED ::
 #   :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
 REQUIRE :: WXAUDIT-NXE: cores=[0-9]+ nxe=[0-9]+ nxe_mask=0x[0-9A-F]+ wp=[0-9]+ wp_mask=0x[0-9A-F]+ -> PASS ::
 
+# --- WXAUDIT-CORES: THE MASKS' OWN EVIDENCE, PER CORE ------------------------------------------
+# `8c8eb802` (GR20) added the line the census above cannot be checked without. WXAUDIT-NXE publishes
+# two BITMASKS — `nxe_mask` and `wp_mask` — and its `-> PASS` is a popcount identity over them. What
+# nothing witnessed until this line was the MSR/CR0 readings those bits were derived from: a mask is
+# a claim about eight cores made in one word, and a publication-ordering bug that left a slot unread
+# would still popcount to whatever the other cores set. `wxn_cores_report` (smp.rs:189) prints each
+# core's live CR0 verbatim, BSP-emitted from the array the APs filled, immediately after the census
+# it cross-checks — so `wp_mask` bit i can be reconciled against bit 16 of core i's real CR0 by an
+# analyzer instead of being believed.
+# The wire is exactly as gated as WXAUDIT-NXE — same function, unconditional call at smp.rs:162 — so
+# this REQUIRE adds no scope axis, only a floor (`8c8eb802`, see the header).
+# NOTHING IS PINNED BY VALUE. `n=` is the core census (8 on this bench, 1 on a UP host), the CR0
+# values are firmware state, and `wp=`/`nxe=` are masks whose width follows `n`. What IS pinned is
+# that the array is NON-EMPTY and comma-separated hex: `cr0=[]` beside `n=8` is a witness reporting
+# nothing while looking like a report, and that is the one shape the pattern refuses.
+# Capture line (Boot AF @ 171 ms; AC/AD/AE byte-identical):
+#   :: WXAUDIT-CORES: n=8 cr0=[0x80010013,0x80010011,0x80010011,0x80010011,0x80010011,0x80010011,0x80010011,0x80010011] wp=0xFF nxe=0xFF ::
+REQUIRE :: WXAUDIT-CORES: n=[0-9]+ cr0=\[0x[0-9A-F]+(,0x[0-9A-F]+)*\] wp=0x[0-9A-F]+ nxe=0x[0-9A-F]+ ::
+# THE UNFILLED SLOT, forbidden. `CORE_CR0` is `.bss`-resident and zero-init (smp.rs:93), and the
+# emitter's own contract is that the first `n` slots are ones the BSP has already observed — the same
+# publication ordering that makes `wp_mask`'s bits valid. A slot reading `0x0` is therefore not a
+# strange CR0, it is A CORE THAT NEVER STORED ONE: no live x86 core in long mode can hold CR0=0 (PE
+# and PG alone are 0x80000001), so the value is unambiguous. It would mean the ordering broke and the
+# masks beside it are a claim about a core nobody read — which is precisely the hazard this witness
+# was added to close, silently reintroduced. The REQUIRE above cannot see it: an array of zeros is
+# still `0x0,0x0,…`, non-empty and well-formed.
+# Scoped INSIDE the brackets (`[^]]*`) on purpose, so `wp=0x0` / `nxe=0x0` — legal readings on a host
+# whose firmware leaves CR0.WP clear, which the WXAUDIT-NXE block above documents for this very
+# bench — cannot satisfy it. REACHABLE: matched against Boot AF's own line with one slot rewritten to
+# `0x0`, which it catches; zero hits on AC, AD, AE and AF as they stand.
+FORBID :: WXAUDIT-CORES: .*cr0=\[[^]]*0x0[,\]]
+
 # --- WXN-FBWC: THE GR15 TRIPWIRE THE SWEEP CARRIES ---------------------------------------------
 # GR15's defect — `map_mmio_window` silently un-typing the framebuffer from WC back to UC, 8.7-9.1x
 # on the blit path, invisible to every permission instrument for two weeks — is why the NX sweep
@@ -684,6 +740,36 @@ REQUIRE :: WXN-FBWC: fb=0x[0-9A-F]+ lvl=[0-9]+ e=0x[0-9A-F]{16} pat=[0-9]+ pcd=[
 # and they appear on NO other line.
 # REACHABLE: matched against the format string with `skip_lock=1` substituted, which it catches.
 FORBID :: WXN-FBWC: .*-> SKIPPED ::
+
+# --- EDID: THE FIRMWARE'S VIEW OF THE PANEL, CARRIED ACROSS THE HANDOFF -----------------------
+# `1d0d93c6` (GR20) carries the panel's raw EDID base block from the bootloader into the kernel and
+# witnesses it in one line from `kernel_main` — before `arch::memory::init` consumes `BootInfo`, on
+# both arches and in EVERY build (video/mod.rs:205). It is the only independent statement of what
+# the firmware knew about the panel, and the iGPU display lane's mode-set will read its bytes.
+#
+# THE LINE, NOT THE VALUE, and on this bench that distinction is the whole directive. Metal reads
+# `present=0`: the rMBP's gmux routes the panel to the Kepler and the firmware's GOP handle publishes
+# no EDID protocol, so nothing is carried and `present=0 hdr=- sum=- native=- len=0` is the CORRECT
+# reading, documented as such at the emitter. A REQUIRE pinning `present=1` would be red on every
+# capture this bench has ever produced; a REQUIRE pinning `present=0` would go red on the commit that
+# finally lands the AUX read and starts carrying a block — the gate-red-when-it-works disease the
+# EPACE-TRIM M8 block refuses at length. So the pattern spans both arms and asserts what is
+# invariant: THE WITNESS SPOKE, with its field list intact and its tokens from the emitter's own
+# vocabulary (`-`/`OK`/`BAD`, `-`/`WxH`).
+# What it catches is the failure this witness has: the handoff silently dropping the block — a
+# `BootInfo` field lost across a bootloader change, `init_edid` no longer called from `kernel_main` —
+# which produces NO line at all, since `present=0` is itself an emission and absence is not.
+# The `.*` between `native=` and `len=` spans the `pclk_khz=`/`ext=` pair that only the `present=1`
+# arm prints; both arms end `len=N ::`.
+# Capture line (Boot AF; AC/AD/AE byte-identical):
+#   :: video: edid present=0 hdr=- sum=- native=- len=0 ::
+# The other arm, generated from the emitter's format string at video/mod.rs:235:
+#   :: video: edid present=1 hdr=OK sum=OK native=2880x1800 pclk_khz=337750 ext=1 len=256 ::
+REQUIRE :: video: edid present=[01] hdr=(-|OK|BAD) sum=(-|OK|BAD) native=(-|[0-9]+x[0-9]+) .*len=[0-9]+ ::
+# NO FORBID ON `hdr=BAD` / `sum=BAD`, stated rather than omitted. Both are honest readings of a real
+# panel's corrupt block, and the emitter is fail-closed around them (`edid_block()` returns None, so
+# nothing can be programmed from a block that failed its own checks). They are a finding about the
+# HARDWARE, not a fault in the kernel, and this file forbids verdicts the kernel owns.
 
 # --- EPACE-TRIM M8: THE 8510's NAK, AND THE FALSIFIER THAT MUST STAY SILENT --------------------
 # M8 (`7498436f`) names WHICH control request eats the ~52 ms the `05ac:8510` spends NAKing through
@@ -808,6 +894,69 @@ REQUIRE :: SMC-SCOUT: index walk done \([0-9]+ of [0-9]+ names\) ::
 # catches. Zero hits on Boot V, W and X.
 FORBID :: SMC-SCOUT: index enumeration STOP-NOTE at idx [0-9]+
 
+# --- SDHC: THE CARD THAT COULD NOT BE IDENTIFIED, AND THE WRITE THAT PROVES ITSELF ------------
+# Three directives, one subject: the SD stack's identification and its write self-test. All three
+# carry the CARD-PRESENCE scope axis stated in the header — they print once per boot ON WHICH A CARD
+# WAS IDENTIFIED — and the `f94e280c` / `b2f4a090` floors.
+#
+# WHY THIS IS A REGRESSION FLOOR RATHER THAN A NEW WITNESS. `f94e280c` is a fix whose failure mode is
+# SILENCE: before it, CMD8 timing out was treated as an error and the whole identification aborted,
+# so a healthy pre-v2.00 card in a healthy reader produced a bring-up that stopped mid-ladder and
+# said nothing further. Boot AB is that capture, quoted in the header. A revert — or any future
+# refactor that lets an expected timeout end the ladder again — restores exactly that silence, and
+# silence is what these REQUIREs convert into a red.
+#
+# --- 1. THE IDENTIFICATION WITNESS. Every field on it was measured on this boot: the spec version
+# from whether CMD8 was answered, the class and addressing from ACMD41's CCS (cross-checked against
+# the CSD structure), the block count from the CSD arithmetic, the RCA from CMD3.
+# THE CARD IS NOT PINNED — this is the field the pattern most invites pinning and most must not.
+# `v1.x SDSC byte-addressed` describes THE MEDIA IN THE SLOT, not the kernel: the emitter is
+# deliberately one parameterised statement rather than two branch-printed ones, so the same line
+# reads `v2.00+ SDHC block-addressed` for a modern card. Pinning `v1.x` would red the sitting that
+# swapped the scratch card, which is a statement about Peter's desk and not about this OS. What IS
+# pinned is the emitter's VOCABULARY, alternation by alternation: a rewrite that dropped the class
+# word, the addressing word or the `size=… MiB` term reds here. `blocks=` and `rca=` are shaped and
+# never valued (`rca` is assigned by the card at CMD3 and legitimately differs per insertion).
+# Emitter: drivers/sdhc.rs:1459.
+# Capture line (Boot AF @ 2452 ms; AC/AD/AE the same but for the millisecond stamp):
+#   :: sdhc: card v1.x SDSC byte-addressed blocks=60800 size=29 MiB rca=0x5bbc ::
+REQUIRE :: sdhc: card (v1\.x|v2\.00\+) (SDSC|SDHC|SDXC) (byte|block)-addressed blocks=[0-9]+ size=[0-9]+ MiB rca=0x[0-9a-f]+ ::
+# --- 2. THE LADDER REACHED THE END. The line above is printed inside `identify`; this one is printed
+# by its CALLER, after `identify` returned a card and before the card is published (sdhc.rs:3359). The
+# two are not redundant: an identification that produced a witness and then failed on CMD7 SELECT or
+# on the ADMA2 hand-off would print the first and not the second, and the card would never reach
+# `CARD.lock()` — a stack that describes a card it cannot serve. Requiring both is what separates
+# "identified" from "identified and published".
+# `bdf` is shaped, not pinned: the reader is 3:0.1 on this bench and that is a slot, not a fact
+# about the driver.
+# Capture line (Boot AF @ 2452 ms):
+#   [sdhc] bdf 3:0.1 CARD IDENTIFIED — 60800 blocks, byte-addressed, csd v1
+REQUIRE \[sdhc\] bdf [0-9]+:[0-9]+\.[0-9]+ CARD IDENTIFIED — [0-9]+ blocks, (byte|block)-addressed, csd v[0-9]+
+# --- 3. THE WRITE SELF-TEST'S VERDICT LINE, AND WHY THE VERDICT IS NOT IN THE PATTERN.
+# SDHC-4a's `write_block_512` is `#[cfg(feature = "sdw")]` — OFF by default — but the four-gate
+# ladder, the stash read and THIS LINE compile and run on every boot, armed or not (sdhc.rs:2943-2948
+# says so in as many words, and `let armed = cfg!(feature = "sdw")` at :3163 is the whole difference).
+# That is what makes a REQUIRE legitimate here where it is not legitimate for `pcicensus` or
+# `bcmarecon`: the wire is unconditional, only its VERDICT moves with the knob. So the verdict is
+# what the pattern refuses to name.
+# BOTH CONFIGURATIONS ARE IN THE BENCH ARCHIVE, which makes this a measurement rather than a claim:
+#   Boot AC (default build):   `armed=0 … verify=DRYRUN restore=SKIPPED reason=would-write -> DRYRUN`
+#   Boots AD/AE/AF (UNAOS_SDW=1): `armed=1 … verify=IDENTICAL restore=IDENTICAL reason=none -> PASS`
+# One pattern matches all four. A REQUIRE naming `-> PASS` would red every default boot; one naming
+# `-> DRYRUN` would red every armed one. The refusal arms (`-> REFUSED`, `lba=NONE`, `class=?`,
+# `blank=?`) are matched too, and deliberately: a write-protect slider, a GPT card or a non-blank
+# scratch sector is the ladder REFUSING CORRECTLY, which is media state and not a kernel fault.
+# `-> FAIL` is also matched by this pattern and is NOT thereby condoned — the default FORBID set
+# (`FAIL ::`) reds it, which is the division of labour this file uses everywhere: the REQUIRE asserts
+# the instrument ran, the FORBIDs own the verdicts.
+# Emitter: `sdw_verdict`, drivers/sdhc.rs:3106. Every field is a `&str` there so "not measured" has a
+# token of its own, which is why `\S+` is the right shape for the five word fields and `[0-9]+` would
+# be wrong.
+# Capture lines:
+#   :: sdhc: w1 armed=0 lba=60799 wp_sw=1 csd_perm=0 csd_tmp=0 class=MBR blank=1 verify=DRYRUN restore=SKIPPED reason=would-write -> DRYRUN ::
+#   :: sdhc: w1 armed=1 lba=60799 wp_sw=1 csd_perm=0 csd_tmp=0 class=MBR blank=1 verify=IDENTICAL restore=IDENTICAL reason=none -> PASS ::
+REQUIRE :: sdhc: w1 armed=[01] lba=(NONE|[0-9]+) wp_sw=[0-9]+ csd_perm=[0-9]+ csd_tmp=[0-9]+ class=\S+ blank=\S+ verify=\S+ restore=\S+ reason=\S+ -> [A-Z]+ ::
+
 # --- BPACE / GPACE: THE BOOT-PACE LEDGER, WHICH HAD NO GATE AT ALL ----------------------------
 # THE FINDING THAT PUT THIS BLOCK HERE, stated first because it is the argument. A GR19 falsification
 # round deleted all 134 `BPACE:` and `GPACE:` lines from a known-good boot slice — every `gui=`,
@@ -873,6 +1022,71 @@ REQUIRE :: BPACE: sched t=[0-9]+ms d=[0-9]+ms ::
 # Capture line (Boot Y @ 2203 ms):
 #   :: GPACE: xtail=0ms(n=1) bench=0ms(n=0) detect=5ms(n=1) igpu=1ms(n=1) kepler=396ms(n=1) sdhc=12ms(n=1) nic=0ms(n=1) resid=3ms == witness ::
 REQUIRE :: GPACE: xtail=[0-9]+ms\(n=[0-9]+\) .*kepler=[0-9]+ms\(n=[0-9]+\) .*== witness ::
+
+# --- THE KNOB-GATED WITNESSES, AND THE DIRECTIVE THIS GRAMMAR DOES NOT HAVE -------------------
+# GR20 landed two more load-bearing wires that this file DELIBERATELY DOES NOT REQUIRE, and the
+# reason is a hole in the grammar rather than a judgement about the wires:
+#   `[PCI-CENSUS] … done: … net-class=…`   `#[cfg(feature = "pcicensus")]`  (`UNAOS_PCICENSUS=1`)
+#   `:: bcma: begin …` / `:: bcma: end …`  `#[cfg(feature = "bcmarecon")]`  (`UNAOS_BCMARECON=1`)
+# Both features are DEFAULT OFF. A REQUIRE for either would go red on every boot of the build
+# configuration this spec's own header scopes it to — a directive that fails on CONFIGURATION rather
+# than on health, which is the same defect as a REQUIRE that cannot match a real boot, wearing the
+# other mask. Measured, not assumed: Boots AC and AD carry no `[PCI-CENSUS]` line at all, and only
+# Boot AF carries `:: bcma:`. Requiring them would have red three of the four GR20 captures.
+#
+# THE MECHANISM DOES NOT EXIST. mbench has five kinds (mbench.py:258) and none of them is
+# conditional presence:
+#   REQUIRE   unconditional; a miss is a FAIL.
+#   COUNT     the same, with a threshold.
+#   FORBID    already conditional BY CONSTRUCTION — a negative rule over a wire that was never
+#             emitted simply scores 0 hits, so FORBIDs on knob-gated lines are free and sound. This
+#             is worth stating because it means only the POSITIVE half of the problem is open.
+#   OPTIONAL  reported, never fails. Honest, and NOT coverage — see below.
+#   PENDING   "a witness whose code is ahead of its bench"; never fails, and prints "consider
+#             promoting to REQUIRE" when it matches. That advice is WRONG here in the same way it is
+#             wrong for a fault path (the wc-d teardown block makes the identical argument): promoting
+#             a knob-gated line reds every default boot. PENDING is therefore the wrong label even
+#             though its pass/fail behaviour is what is wanted.
+#
+# WHAT A CONDITIONAL REQUIRE WOULD HAVE TO BE, written down here rather than invented in this arc,
+# because adding a sixth directive kind is a change to the gate every spec in the tree runs through
+# and belongs to an arc that owns mbench.py:
+#
+#   WHEN <guard-regex> REQUIRE <regex>
+#
+#     Semantics: if any line in the capture matches <guard-regex>, the REQUIRE is live and a miss is
+#     a FAIL exactly as today; if no line matches the guard, the directive is reported as
+#     `not-applicable` and is counted in NEITHER the numerator nor the denominator of the N/N tally.
+#     Everything else follows from that: `satisfied()` returns True when the guard is absent,
+#     `failed()` returns False, and `verdict_table` needs one more row state.
+#
+#     The guard MUST be a line the same knob emits and that no other configuration can produce —
+#     `[PCI-CENSUS] full enumeration:` for the census, `:: bcma: begin` for the recon. A guard chosen
+#     from an UNGATED line would make the conditional unconditional again; a guard identical to the
+#     required line would make the rule vacuous (it can only fire when it is already satisfied),
+#     which is the trap that must be documented at the directive rather than rediscovered per spec.
+#     The census case shows the shape working: guard on the census's opening line, require its
+#     `done:` summary, and a run in which the census STARTS and never finishes is a red — which is a
+#     real failure mode (a truncated enumeration wedged mid-bus) that nothing catches today.
+#
+#     The arithmetic consequence must be stated in the record when it lands: every prior x86 record
+#     quotes an N/N total, and a directive that leaves the denominator alone when dormant is the only
+#     variant that keeps those numbers comparable across captures with different knob sets.
+#
+# UNTIL THEN, both are OPTIONAL — visible in the table, never a gate. THE COST IS REAL AND IS STATED:
+# an OPTIONAL proves NOTHING. If either emitter is deleted, these two rules go from ✅ to ◦ on an
+# armed capture and mbench still exits 0. They are here so a reader replaying an armed boot can see
+# at a glance that the wire spoke, and they are NOT to be mistaken for the coverage the WHEN clause
+# above would buy. Same idiom, and the same honest accounting, as the EPACE-TRIM M8 OPTIONAL.
+# Capture line (Boot AE @ 1692 ms, Boot AF @ 1691 ms):
+#   [PCI-CENSUS] done: devices=20 functions=27 printed=27 truncated=0 net-class=0x02:2 (caps dumped 2) elapsed=6ms
+OPTIONAL \[PCI-CENSUS\] done: devices=[0-9]+ functions=[0-9]+ printed=[0-9]+ truncated=[0-9]+ net-class=0x[0-9a-f]+:[0-9]+
+# Capture lines (Boot AF @ 1691 / 1697 ms). The pair is deliberately two rules: `begin` without `end`
+# is the recon wedging inside a BAR0 read, which one spanning rule could not tell from a clean run.
+#   :: bcma: begin — READ-ONLY recon of PCI class 0x02/sub 0x80 (config reads + BAR0 reads; …) ::
+#   :: bcma: end ok=0 stage=chipcommon elapsed=5ms ::
+OPTIONAL :: bcma: begin — READ-ONLY recon of PCI class 0x02/sub 0x80
+OPTIONAL :: bcma: end ok=[01] stage=\S+ elapsed=[0-9]+ms ::
 
 # --- WHAT IS DELIBERATELY NOT PINNED, stated rather than omitted -----------------------------
 #   * `kepler=2564ms`. It is the headline GR17 number and it is NOT a directive, because it is a
