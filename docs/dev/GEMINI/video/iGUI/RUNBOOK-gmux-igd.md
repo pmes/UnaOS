@@ -16,6 +16,7 @@ time. If that stick is left in the machine and the machine is rebooted for an un
 reason, you will get the black panel again with no warning.
 
 After the sitting: re-flash the stick with a normal build, or pull it out and label it.
+**Note: gmux_igd media is a special flight, not regression media! The boot time cost is ~10s.**
 
 ---
 
@@ -51,9 +52,8 @@ written. Do not go looking for a verb to type; there isn't one, and this page wi
 tell you to type something that does nothing.
 
 This is not a gap in the recovery — it is why the recovery was built the way it is. The
-revert is issued by the same function, on the same call stack, a few instructions after
-the switch. There is no task to fail to spawn and no interrupt hook to be missing. The
-only ways it does not run are a hard hang or a triple fault inside the dwell.
+revert is issued by the same function, on the same call stack, as part of the same sequence
+as the switch. There is no task to fail to spawn and no interrupt hook to be missing.
 
 **A related claim is deliberately NOT made here.** Whether the input chain — EHCI-HID
 through `handle_key` — is still alive with the mux switched away has **not been
@@ -69,14 +69,14 @@ type back over the wire. Serial is an instrument, not a console.
 
 In order:
 
-1. **Wait to 30 seconds.** The dwell is bounded twice — by a millisecond deadline and
-   by an iteration cap that depends on no clock — but if `arch::ms()` has stopped, the
+1. **Wait to 30 seconds.** The dwell is bounded twice — by a TSC deadline and
+   by an iteration cap that depends on no clock — but if the TSC has stopped, the
    iteration cap governs and its wall-clock length is not yet known (this is exactly
    what the `iters=` field in the log exists to measure). It may simply be longer.
 2. **Read the serial capture.** It will say which of these happened. Use `awk`, never
    `grep` — control bytes in the capture break grep:
    ```
-   awk '/\[GMUX\]/' <capture>
+   awk '/\[GMUX\]|igpu-dpy:/' <capture>
    ```
 3. **Power cycle.** Hold the power button. There is nothing to type and nothing to
    press; the mux state does not survive a power cycle (asserted-not-verified), so the machine comes back on the
@@ -92,38 +92,41 @@ clear; it will switch the mux again.
 ## What to capture, and how to read it
 
 Arm the serial capture **before** boot. The whole experiment is ten or so lines and they
-all carry the tag `[GMUX]`:
+all carry the tag `[GMUX]` or `igpu-dpy:`:
 
 ```
-awk '/\[GMUX\]/' ~/unaos-bench/capture/<session>/ttyUSB1.log
+awk '/\[GMUX\]|igpu-dpy:/' ~/unaos-bench/capture/<session>/ttyUSB1.log
 ```
 
 A successful run reads roughly:
 
 ```
 :: igpu: PROTOCOL PROVEN (version plausible)
-:: igpu: [GMUX] pre-switch state: DDC=0x02 DISP=0x03 EXT=0x03
-:: igpu: [GMUX] ARMED synchronous revert: dwell=10000ms deadline_ms=...
-:: igpu: [GMUX] the panel is EXPECTED to go black now ...
-:: igpu: [GMUX] switch write: ddc=ok disp=ok ext=ok (intent DDC=0x01 DISP=0x02 EXT=0x02)
+:: igpu-dpy: pre-switch state DDC=0x02 DISP=0x03 EXT=0x03
+:: igpu-dpy: rung=00 name=census ok=1 bdsm=... ggc=... ggtt0=... ggtt1=... aux_ctl=... frmcnt=...
+:: igpu: [GMUX] the panel is EXPECTED to go black now — switching to IGD
+:: igpu: [GMUX] switch write: ddc=ok disp=ok ext=ok ...
 :: igpu: [GMUX] switch read-back: DDC=0x01 DISP=0x02 EXT=0x02
 :: igpu: [GMUX] switch verdict: MATCH (all three registers read back as written)
+:: igpu-dpy: rung=00 name=mux ok=1 ddc=0x01 disp=0x02 ext=0x02 verdict=MATCH
+:: igpu: [GMUX] switch successful (10s dwell expected)
+:: igpu: [GMUX] beginning success-path dwell
 :: igpu: [GMUX] dwell ended by=deadline elapsed_ms=10001 iters=...
 :: igpu: [GMUX] reverting to pre-switch state DDC=0x02 DISP=0x03 EXT=0x03
 :: igpu: [GMUX] revert write: ddc=ok disp=ok ext=ok ...
 :: igpu: [GMUX] revert read-back: DDC=0x02 DISP=0x03 EXT=0x03
 :: igpu: [GMUX] revert verdict: MATCH (all three registers read back as written)
-:: igpu: [GMUX] SUMMARY: switch=MATCH revert=MATCH — the mux is back on the pre-switch (discrete) state
+:: igpu: [GMUX] success-path dwell finished, reverted=true
+:: igpu-dpy: LADDER highest=00/10 name=harness ok=1 unwound=0 gmux=MATCH why=none elapsed_ms=10020
 ```
 
 | Line you see | What it means | What to do |
 |---|---|---|
-| `SUMMARY: switch=MATCH revert=MATCH` | The whole experiment succeeded. The mux write lands; a future arc can configure pipes. | Nothing. Pull the stick. |
-| `REFUSED: pre-switch read timed out` | The gmux did not answer. **No write was issued** and the mux was never touched. | Safe. Investigate the handshake, not the panel. |
-| `PROTOCOL UNPROVEN` and no `[GMUX]` lines after it | The version tuple was implausible, so the switch was correctly refused. | Safe. No write was issued. |
-| `switch verdict: MISMATCH` | The mux is in an unknown or partial state. The revert still runs. | Read which register disagreed. If `SUMMARY` then says `revert=MATCH`, the machine is fine. |
-| `SUMMARY: ... revert=FAILED` | The mux was **not proven** back. | Power cycle. Report the whole `[GMUX]` block. |
-| `dwell ended by=itercap` | The ms clock stopped advancing during the dwell. The revert still ran. | Report it — this is a real finding about the timer, not about the mux. |
+| `LADDER highest=00/10 name=harness ok=1` | The whole experiment succeeded. The mux write lands; a future arc can configure pipes. | Nothing. Pull the stick. |
+| `REFUSED: pre-switch state is not fully DIS` | The gmux was not in the expected discrete state. **No write was issued**. | Safe. Power cycle and try again. |
+| `rung=00 name=mux ok=0` | The mux is in an unknown or partial state. The revert still runs. | Read which register disagreed. If `LADDER` then says `gmux=MATCH`, the machine is fine. |
+| `LADDER ... gmux=FAILED` | The mux was **not proven** back. | Power cycle. Report the whole `[GMUX]` block. |
+| `dwell ended by=itercap` | The TSC clock stopped advancing during the dwell. The revert still ran. | Report it. |
 | No `[GMUX]` lines at all on an armed build | The probe never reached the arm, or the build was not actually armed. | Check the boot banner really ends `...,unaos_ivb,gmux_igd`. |
 
 The `iters=` number on the dwell line is worth recording on the first successful boot:

@@ -116,6 +116,8 @@ use core::sync::atomic::AtomicU32;
 pub static ACTIVE_SURF: AtomicU32 = AtomicU32::new(0);
 
 static PROBED: AtomicBool = AtomicBool::new(false);
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+pub static PROTOCOL_PROVEN: AtomicBool = AtomicBool::new(false);
 static mut TRACE_0: [u32; 11] = [0; 11];
 static mut TRACE_1: [u32; 11] = [0; 11];
 static mut TRACE_2: [u32; 11] = [0; 11];
@@ -240,13 +242,19 @@ const GMUX_PORT_WRITE: u16 = 0x7D4;
 const GMUX_SWITCH_DISPLAY: u8 = 0x10;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_SWITCH_DDC: u8 = 0x28;
-const GMUX_READ_DDC: u8 = 0x29;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_SWITCH_DDC: u8 = 0x28;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_SWITCH_EXTERNAL: u8 = 0x40;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_READ_DISPLAY: u8 = 0x11;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_READ_EXTERNAL: u8 = 0x41;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_DDC_DIS: u8 = 0x02;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_DISPLAY_DIS: u8 = 0x03;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_EXTERNAL_DIS: u8 = 0x03;
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
@@ -256,11 +264,9 @@ const GMUX_DISPLAY_IGD: u8 = 0x02;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_EXTERNAL_IGD: u8 = 0x02;
 
-/// Baseline's iteration bound, kept UNCONDITIONALLY alongside the ms deadline.
+/// Baseline's iteration bound, kept UNCONDITIONALLY alongside the TSC deadline.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_WAIT_ITERS: u32 = 5000;
-/// Wall-clock bound on one handshake wait. Only meaningful while the BSP timer ISR runs.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 /// How long the mux stays on IGD before the revert fires.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_DWELL_MS: u64 = 10_000;
@@ -269,7 +275,7 @@ const GMUX_DWELL_MS: u64 = 10_000;
 /// and which bound ended it, so one metal boot makes the relationship measurable instead of
 /// assumed.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_DWELL_ITER_CAP: u64 = 2_000_000;
+const GMUX_DWELL_ITER_CAP: u64 = 10_000_000;
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 unsafe fn gmux_outb(port: u16, val: u8) {
@@ -284,7 +290,7 @@ unsafe fn gmux_inb(port: u16) -> u8 {
 }
 
 /// Wait for the gmux to be ready to accept an index byte. Bounded twice over: an iteration
-/// count that cannot depend on any clock, and an `ms()` deadline. Returns false on timeout —
+/// count that cannot depend on any clock, and a TSC deadline. Returns false on timeout —
 /// and no caller here swallows a timeout silently.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 unsafe fn gmux_wait_ready() -> bool {
@@ -429,7 +435,7 @@ where
 /// screen could not be distinguished from a write that never happened. The `w_*` flags are
 /// still printed — they say WHERE it broke — but they do not decide anything.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-unsafe fn gmux_apply(phase: &str, ddc: u8, disp: u8, ext: u8) -> bool {
+unsafe fn gmux_apply(phase: &str, ddc: u8, disp: u8, ext: u8) -> (bool, u8, u8, u8) {
     let w_ddc = unsafe { gmux_index_write(GMUX_SWITCH_DDC, ddc) };
     let w_disp = unsafe { gmux_index_write(GMUX_SWITCH_DISPLAY, disp) };
     let w_ext = unsafe { gmux_index_write(GMUX_SWITCH_EXTERNAL, ext) };
@@ -438,7 +444,7 @@ unsafe fn gmux_apply(phase: &str, ddc: u8, disp: u8, ext: u8) -> bool {
         ":: igpu: [GMUX] {} write: ddc={} disp={} ext={} (intent DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X}) ::",
         phase, ok(w_ddc), ok(w_disp), ok(w_ext), ddc, disp, ext);
 
-    let r_ddc = unsafe { gmux_index_read(GMUX_READ_DDC) };
+    let r_ddc = unsafe { gmux_index_read(GMUX_SWITCH_DDC) };
     let r_disp = unsafe { gmux_index_read(GMUX_READ_DISPLAY) };
     let r_ext = unsafe { gmux_index_read(GMUX_READ_EXTERNAL) };
     serial_println!(
@@ -450,13 +456,13 @@ unsafe fn gmux_apply(phase: &str, ddc: u8, disp: u8, ext: u8) -> bool {
     let m_ext = r_ext == ext as u32;
     if m_ddc && m_disp && m_ext {
         serial_println!(":: igpu: [GMUX] {} verdict: MATCH (all three registers read back as written) ::", phase);
-        true
+        (true, r_ddc as u8, r_disp as u8, r_ext as u8)
     } else {
         if !m_ddc { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_DDC: wrote 0x{:02X}, read 0x{:02X} ::", phase, ddc, r_ddc); }
         if !m_disp { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_DISPLAY: wrote 0x{:02X}, read 0x{:02X} ::", phase, disp, r_disp); }
         if !m_ext { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_EXTERNAL: wrote 0x{:02X}, read 0x{:02X} ::", phase, ext, r_ext); }
         serial_println!(":: igpu: [GMUX] {} verdict: MISMATCH ::", phase);
-        false
+        (false, r_ddc as u8, r_disp as u8, r_ext as u8)
     }
 }
 
@@ -489,7 +495,8 @@ pub fn gmux_revert_now() -> bool {
         return false;
     };
     serial_println!(":: igpu: [GMUX] reverting to pre-switch state DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", s.ddc, s.disp, s.ext);
-    unsafe { gmux_apply("revert", s.ddc, s.disp, s.ext) }
+    let (ok, _, _, _) = unsafe { gmux_apply("revert", s.ddc, s.disp, s.ext) };
+    ok
 }
 
 /// Hold the mux on IGD for the armed deadline, then return.
@@ -502,12 +509,13 @@ pub fn gmux_revert_now() -> bool {
 /// state it ran in rather than assuming the clock was alive.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 fn gmux_dwell() {
-    let deadline = RevertState::unpack(GMUX_REVERT_STATE.load(Ordering::SeqCst)).deadline_ms as u64;
+    // hw_wait_budget() returns budget for 2 seconds. GMUX_DWELL_MS is 10,000 (10s), so multiply by 5.
+    let deadline = crate::arch::now_cycles() + (crate::arch::hw_wait_budget() * 5);
     let start = crate::arch::ms();
     let mut iters: u64 = 0;
     let ended_by;
     loop {
-        if crate::arch::ms() >= deadline {
+        if crate::arch::now_cycles() >= deadline {
             ended_by = "deadline";
             break;
         }
@@ -522,20 +530,6 @@ fn gmux_dwell() {
         ":: igpu: [GMUX] dwell ended by={} elapsed_ms={} iters={} (cap={}) ::",
         ended_by, crate::arch::ms().wrapping_sub(start), iters, GMUX_DWELL_ITER_CAP);
 }
-
-/// Arm, switch to IGD, verify, dwell, revert, verify — all on ONE call stack.
-///
-/// The arming context and the revert executor are the same instruction stream. There is no
-/// deferred executor that can fail to spawn, no task gated on *(not `rast`)* and *(non-zero
-/// framebuffer)* and *(two APs online)*, and no window in which a wedge elsewhere in boot can
-/// strand the mux — the only code that runs between the switch and the revert is the bounded
-/// spin in `gmux_dwell()`, which calls nothing out.
-///
-/// The cost is stated rather than hidden: boot stalls for `GMUX_DWELL_MS` inside `pci::init`,
-/// before xHCI enumeration. That is accepted for a one-shot experiment behind a knob.
-///
-/// Called ONLY from inside the `PROTOCOL PROVEN` branch.
-
 
 pub fn init(gpu: &GpuInfo) {
     if PROBED.swap(true, Ordering::SeqCst) {
@@ -599,12 +593,12 @@ pub fn init(gpu: &GpuInfo) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        IGPU_BAR0.store(bar0, Ordering::SeqCst);
         crate::arch::memory::map_mmio_window(bar0 as u64, bar0_size);
         if crate::arch::memory::translate(bar0 as u64).is_none() {
             serial_println!("[Intel iGPU] Error: BAR0 physical address (0x{:X}) is not mapped. Probe aborted.", bar0);
             return;
         }
+        IGPU_BAR0.store(bar0, Ordering::SeqCst);
     }
     
     #[cfg(target_arch = "aarch64")]
@@ -657,6 +651,8 @@ pub fn init(gpu: &GpuInfo) {
                 serial_println!(":: igpu: Raw SW_DDC : Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[4], gmux3[4]);
                 serial_println!(":: igpu: Raw POWER  : Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[5], gmux3[5]);
             } else {
+                #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+                PROTOCOL_PROVEN.store(true, Ordering::SeqCst);
                 serial_println!(":: igpu: PROTOCOL PROVEN (version plausible)");
                 serial_println!(":: igpu: Version (Maj,Min,Rel) | {}.{}.{}             |                   |                   | {}.{}.{} ::", 
                     GMUX_0[0], GMUX_0[1], GMUX_0[2], gmux3[0], gmux3[1], gmux3[2]);
@@ -912,6 +908,7 @@ pub fn print_blt_stats() {
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn bring_up_blt_ring(bar0: usize, active_surf: Option<u32>) {
+    if BLT_RING.lock().is_some() { return; }
     'ring: {
         // The outermost refusal arm — SEAT FIXUP round 3, and the census's own first metal boot
         // (Boot X) is why it exists: on the dual-GPU rMBP the gmux routes the panel to the KEPLER,
@@ -1006,19 +1003,60 @@ unsafe fn bring_up_blt_ring(bar0: usize, active_surf: Option<u32>) {
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-pub unsafe fn gmux_igd_switch() {
-    let bar0 = IGPU_BAR0.load(Ordering::SeqCst);
-    if bar0 == 0 { return; }
+struct DisplayUnwind {
+    bar0: usize,
+    len: usize,
+}
 
-    let ddc = gmux_index_read(GMUX_READ_DDC);
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+impl DisplayUnwind {
+    fn new(bar0: usize) -> Self {
+        Self { bar0, len: 0 }
+    }
+
+    unsafe fn execute(&mut self) {
+        self.len = 0;
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+pub unsafe fn gmux_igd_switch() {
+    let ladder_start = crate::arch::now_cycles();
+    // hw_wait_budget() is 2 seconds (2000 ms), so cycles per ms is hw_wait_budget() / 2000
+    let get_elapsed_ms = || (crate::arch::now_cycles().wrapping_sub(ladder_start)) / (crate::arch::hw_wait_budget() / 2000);
+
+    let highest = "00";
+    if !PROTOCOL_PROVEN.load(Ordering::SeqCst) { 
+        serial_println!(":: igpu-dpy: LADDER highest={}/10 name=harness ok=0 why=protocol-unproven unwound=0 gmux=UNTOUCHED elapsed_ms={} ::", highest, get_elapsed_ms());
+        return; 
+    }
+    let bar0 = IGPU_BAR0.load(Ordering::SeqCst);
+    if bar0 == 0 { 
+        serial_println!(":: igpu-dpy: LADDER highest={}/10 name=harness ok=0 why=bar0-unmapped unwound=0 gmux=UNTOUCHED elapsed_ms={} ::", highest, get_elapsed_ms());
+        return; 
+    }
+
+    let ddc = gmux_index_read(GMUX_SWITCH_DDC);
     let disp = gmux_index_read(GMUX_READ_DISPLAY);
     let ext = gmux_index_read(GMUX_READ_EXTERNAL);
-    serial_println!(":: igpu: [GMUX] pre-switch state: DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", ddc, disp, ext);
+    serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", ddc, disp, ext);
 
     if ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32 || ext != GMUX_EXTERNAL_DIS as u32 {
         serial_println!(":: igpu: [GMUX] REFUSED: pre-switch state is not fully DIS (DDC={}, DISP={}, EXT={}) — no known safe state to return to ::", ddc, disp, ext);
+        serial_println!(":: igpu-dpy: LADDER highest={}/10 name=harness ok=0 why=pre-switch-not-dis unwound=0 gmux=FAILED elapsed_ms={} ::", highest, get_elapsed_ms());
         return;
     }
+
+    let ggc = crate::arch::pci::read_config_32(0, 0, 0, 0x50);
+    let bdsm = crate::arch::pci::read_config_32(0, 0, 0, 0xB0);
+    let ggtt0 = mmio_read(bar0, regs::GTT_BASE);
+    let ggtt1 = mmio_read(bar0, regs::GTT_BASE + 4);
+    let aux_ctl = mmio_read(bar0, 0x64010);
+    let frmcnt = mmio_read(bar0, 0x70040);
+    serial_println!(":: igpu-dpy: rung=00 name=census ok=1 bdsm=0x{:08X} ggc=0x{:08X} ggtt0=0x{:08X} ggtt1=0x{:08X} aux_ctl=0x{:08X} frmcnt=0x{:08X} ::",
+        bdsm, ggc, ggtt0, ggtt1, aux_ctl, frmcnt);
+
+    let mut unwind = DisplayUnwind::new(bar0);
 
     gmux_state_update(|_| Some(RevertState {
         armed: true,
@@ -1030,48 +1068,17 @@ pub unsafe fn gmux_igd_switch() {
     }));
 
     serial_println!(":: igpu: [GMUX] the panel is EXPECTED to go black now — switching to IGD ::");
-    let switched = gmux_apply("switch", GMUX_DDC_IGD, GMUX_DISPLAY_IGD, GMUX_EXTERNAL_IGD);
+    let (switched, r_ddc, r_disp, r_ext) = gmux_apply("switch", GMUX_DDC_IGD, GMUX_DISPLAY_IGD, GMUX_EXTERNAL_IGD);
+    serial_println!(":: igpu-dpy: rung=00 name=mux ok={} ddc=0x{:02X} disp=0x{:02X} ext=0x{:02X} verdict={} ::",
+        if switched { 1 } else { 0 }, r_ddc, r_disp, r_ext, if switched { "MATCH" } else { "MISMATCH" });
 
-    let mut spins = 0;
-    let mut vline_advanced = false;
-    let mut plane_enabled = false;
-    let initial_frmcount = mmio_read(bar0, 0x70040);
-    
-    loop {
-        if mmio_read(bar0, 0x70040) != initial_frmcount {
-            vline_advanced = true;
-        }
-        if (mmio_read(bar0, regs::DSPACNTR) & (1 << 31)) != 0 {
-            plane_enabled = true;
-        }
-        if vline_advanced && plane_enabled {
-            break;
-        }
-        if spins >= GMUX_WAIT_ITERS {
-            break;
-        }
-        spins += 1;
-        for _ in 0..1000 { core::hint::spin_loop(); }
-    }
-
-    if !vline_advanced || !plane_enabled {
-        serial_println!(":: igpu: [GMUX] scanout failed to advance (spins={}, plane={}, vline={}); reverting... ::", spins, plane_enabled, vline_advanced);
-        let reverted = gmux_revert_now();
-        let s_disp = RevertState::unpack(GMUX_REVERT_STATE.load(Ordering::SeqCst)).disp;
-        let s_disp_str = if s_disp == GMUX_DISPLAY_DIS { "DIS" } else { "IGD" };
-        let back_msg = alloc::format!("back on the pre-switch ({}) state", s_disp_str);
-        
-        serial_println!(
-            ":: igpu: [GMUX] SUMMARY: switch={} revert={} — the mux is {} ::",
-            if switched { "MATCH" } else { "MISMATCH" },
-            if reverted { "MATCH" } else { "FAILED" },
-            if reverted { back_msg.as_str() } else { "NOT PROVEN back — power cycle (asserted-not-verified), see RUNBOOK-gmux-igd.md" }
-        );
+    if !switched {
+        gmux_revert_now();
+        serial_println!(":: igpu-dpy: LADDER highest={}/10 name=harness ok=0 why=mux-switch-failed unwound={} gmux=FAILED elapsed_ms={} ::", highest, unwind.len, get_elapsed_ms());
         return;
     }
 
-    serial_println!(":: igpu: [GMUX] switch successful, iGPU scanout is live ::");
-    serial_println!(":: gmux: WXPROBE prediction: new fb base should be iGPU stolen memory, expected typing pat=0 pcd=1 pwt=1 (UC) ::");
+    serial_println!(":: igpu: [GMUX] switch successful (10s dwell expected) ::");
 
     let surf_a = dump_plane(bar0, 'A', regs::DSPACNTR, regs::DSPASURF, regs::DSPASTRIDE, regs::DSPALINOFF, regs::DSPATILEOFF);
     let surf_b = dump_plane(bar0, 'B', regs::DSPBCNTR, regs::DSPBSURF, regs::DSPBSTRIDE, regs::DSPBLINOFF, regs::DSPBTILEOFF);
@@ -1084,11 +1091,12 @@ pub unsafe fn gmux_igd_switch() {
     }
     bring_up_blt_ring(bar0, active_surf);
 
-    // FLIGHT 1 unconditionally dwells and reverts, even on success, because the input chain is unverified
-    // and recovery must be automatic.
     serial_println!(":: igpu: [GMUX] beginning success-path dwell ::");
     gmux_dwell();
+    unwind.execute();
     let reverted = gmux_revert_now();
     serial_println!(":: igpu: [GMUX] success-path dwell finished, reverted={} ::", reverted);
-    return;
+
+    serial_println!(":: igpu-dpy: LADDER highest={}/10 name=harness ok={} unwound={} gmux={} why={} elapsed_ms={} ::",
+        highest, if reverted { 1 } else { 0 }, unwind.len, if reverted { "MATCH" } else { "FAILED" }, if reverted { "none" } else { "revert-failed" }, get_elapsed_ms());
 }
