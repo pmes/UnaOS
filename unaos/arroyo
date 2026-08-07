@@ -8,8 +8,10 @@
 #   ./arroyo arm           Build & boot aarch64
 #   ./arroyo test [secs]   Headless x86_64 run; serial captured to target/serial.log
 #   ./arroyo test-arm [s]  Headless aarch64 run; serial -> target/serial-arm.log
-#   ./arroyo check         Syntax check: kernel (both targets, default + cfg-gated feature legs)
+#   ./arroyo check         Syntax check: kernel (both targets, default + cfg-gated feature legs,
+#                          including the x86 pairwise-mix legs — see GATE-CFG-MIX below)
 #                          + the ring-3 user-* crates
+#                          UNAOS_CFG_SWEEP=1 adds the per-feature x86 sweep (+78 legs, ~220 s)
 #   ./arroyo build         Build both targets (no QEMU)
 #   ./arroyo clean         Purge all build artifacts
 
@@ -1121,6 +1123,161 @@ KERNEL_CFG_MATRIX=(
   "arm-tegra   ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet"
 )
 
+# ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
+#
+# THE BLIND SPOT this closes. KERNEL_CFG_MATRIX above and the two DEFAULT legs in check_both between
+# them exercise exactly two points of the x86 feature cube: everything OFF (the default legs) and
+# everything ON (`x86-all`). Every configuration anyone actually boots is in the MIDDLE, and the
+# middle was never compiled. That is not theoretical either. The igpu lane's Flight 1 shipped a stray
+# `#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]` that bound to `pub fn init` in
+# `drivers/gpu/igpu.rs`, gating the entire iGPU probe entry point behind `gmux_igd`. The call site,
+# `arch/x86_64/pci.rs`, is gated on `intel-ivb`. So:
+#   * all features OFF  -> neither the definition nor the call site is compiled. GREEN.
+#   * all features ON   -> both are compiled, the call resolves. GREEN.
+#   * intel-ivb ON, gmux_igd OFF (the NORMAL rMBP build, and what the bench media carries)
+#                       -> E0425 `cannot find function 'init'`. RED — and nothing ran it.
+# Both required gates passed a branch that could not build the machine it was written for.
+#
+# THE DEFECT CLASS, stated precisely: a symbol that exists only under feature X is referenced from
+# code that is compiled under feature Y (or under no gate at all). Detecting it needs one compile in
+# which Y is ON and X is OFF. The ungated case (Y = nothing) is already covered — the DEFAULT legs
+# compile the all-off state. What was missing is the feature-vs-feature case.
+#
+# THE LEG-SELECTION RULE (why this many legs and not more). The full powerset is 2^39 and absurd.
+# Per-feature sweeps (each ON alone; each dropped from the full set) are linear — 2N = 78 legs, ~220 s
+# measured — which is too slow to sit in `check` on every edit. But complete coverage of the defect
+# class does not need N legs at all, it needs an ORDERED-PAIR covering array, and that is LOGARITHMIC:
+#
+#   Give feature i a distinct n-bit mask M_i, all masks of the SAME popcount n/2 (an antichain), and
+#   define leg j = { feature i : bit j of M_i is set }. For any two distinct features X != Y, M_X and
+#   M_Y are distinct sets of equal size, so neither contains the other, so some bit j is set in M_Y
+#   and clear in M_X. Leg j therefore has Y ON and X OFF. Every ordered pair is covered, by
+#   construction, with n legs — and n is the smallest integer with C(n, n/2) >= N, i.e. the PROVABLY
+#   MINIMAL number of legs for which such a family of masks exists at all. For today's N = 39 x86
+#   features that is n = 8. Verified empirically at authoring time: 0 uncovered ordered pairs of 1482.
+#
+# So the default gate pays 8 compiles (~23 s cold, measured) for complete pairwise cfg coverage of
+# the x86 feature cube. The `gmux_igd`/`intel-ivb` pair above is covered several times over.
+#
+# WHAT THIS DOES NOT COVER, stated honestly. Strength 2. A symbol under X referenced from code gated
+# on `all(feature = "Y", feature = "Z")` needs a leg with Y and Z on and X off; the covering array
+# guarantees that only for pairs, not triples. The `x86-drop-<feat>` sweep legs behind
+# UNAOS_CFG_SWEEP=1 close exactly that direction — each drops ONE feature with all 38 others ON, so
+# every conjunction of other features is compiled — at the cost of 39 more compiles.
+#
+# UNAOS_CFG_SWEEP=1 adds, on top of the 8 default mix legs:
+#   * `x86-only-<feat>`  — that feature ALONE (39 legs). Answers "does this feature stand up by
+#                          itself", and localizes: the mix legs prove a defect EXISTS but name a leg
+#                          carrying ~20 features; this names one.
+#   * `x86-drop-<feat>`  — the full x86 set MINUS that feature (39 legs). The strength-unbounded
+#                          direction described above.
+# Measured on the clean tree at authoring time: on-alone 39/39 green, leave-one-out 39/39 green,
+# ~220 s for the pair.
+#
+# THE FEATURE LIST IS DERIVED, NOT COPIED. A second hardcoded list would drift out of `[features]` —
+# and already had: `nvidia-kepler-kdisp-hold` is declared in crates/kernel/Cargo.toml and appears in
+# NO leg of KERNEL_CFG_MATRIX, so it had never been type-checked at all. So the universe is computed
+# every run as
+#       (every feature in crates/kernel/Cargo.toml's [features] table, minus `default`)
+#     - (the aarch64-only features, = what the arm-* legs above name and `x86-all` does not)
+# which makes Cargo.toml the single source of truth and puts a NEW feature under coverage the moment
+# it is declared. Corollary, and the rule for anyone adding a knob: a new feature is treated as x86
+# unless it is named on an arm-* leg. Declare an aarch64-only feature without adding it to arm-pi or
+# arm-tegra and these legs will try to compile it on x86 and the gate will go red naming it — which
+# is the intended forcing function, not a bug.
+
+# Emit the kernel's feature names, one per line, `default` excluded — read straight out of the
+# `[features]` table. Every entry in that table is a single `name = [...]` line; the guard in
+# x86_cfg_universe fails loudly if this parse ever returns an implausible count.
+kernel_feature_table() {
+    awk '
+        /^\[features\]/ { inf = 1; next }
+        /^\[/           { inf = 0 }
+        inf && /^[A-Za-z0-9_-]+[ \t]*=[ \t]*\[/ {
+            sub(/[ \t]*=.*/, "", $0)
+            if ($0 != "default") print $0
+        }
+    ' "$WORKSPACE_DIR/crates/kernel/Cargo.toml"
+}
+
+# The x86 sweep universe: the whole feature table minus the features the matrix marks aarch64-only.
+# Prints one feature per line. Returns 1 (and says why) if the Cargo.toml parse looks broken, so a
+# silently-empty universe can never masquerade as a green gate.
+x86_cfg_universe() {
+    local _all _armonly _x86all _f _n _row _leg _tgt _feats
+    _all="$(kernel_feature_table)"
+    _n=$(printf '%s\n' "$_all" | grep -c . || true)
+    if [ "$_n" -lt 40 ]; then
+        echo -e "${COLOR_RED}❌ kernel cfg coverage: parsed only ${_n} features from crates/kernel/Cargo.toml — [features] parse is broken${COLOR_RESET}" >&2
+        return 1
+    fi
+    # arm-only = named by an arm-* leg and NOT by x86-all.
+    _x86all=""; _armonly=""
+    for _row in "${KERNEL_CFG_MATRIX[@]}"; do
+        read -r _leg _tgt _feats <<< "$_row"
+        case "$_leg" in
+            x86-*) _x86all="${_x86all},${_feats}" ;;
+            arm-*) _armonly="${_armonly},${_feats}" ;;
+        esac
+    done
+    # `|| true` on every grep: a filter that removes the last line returns 1, and `set -e` would turn
+    # that into a silent abort of the whole gate instead of a verdict.
+    for _f in $(printf '%s\n' "$_armonly" | tr ',' '\n' | grep -v '^$' | sort -u); do
+        case ",${_x86all}," in *",${_f},"*) ;; *) _all="$(printf '%s\n' "$_all" | grep -vx "$_f" || true)" ;; esac
+    done
+    printf '%s\n' "$_all" | grep -v '^$' || true
+}
+
+# Fill KERNEL_CFG_MIX (always) and KERNEL_CFG_SWEEP (only under UNAOS_CFG_SWEEP=1) with rows in the
+# exact 3-field shape KERNEL_CFG_MATRIX uses: "label  target-json  comma,separated,features".
+KERNEL_CFG_MIX=()
+KERNEL_CFG_SWEEP=()
+build_cfg_legs() {
+    local _uni _N _n _c _m _bit _feats _i _f _full
+    local -a _U=() _MASK=()
+    _uni="$(x86_cfg_universe)" || return 1
+    while read -r _f; do [ -n "$_f" ] && _U+=("$_f"); done <<< "$_uni"
+    _N=${#_U[@]}
+
+    # Smallest n with C(n, n/2) >= N, found by counting the popcount-n/2 masks directly (n <= 10 here,
+    # so this is a few hundred iterations of integer arithmetic — free next to one cargo invocation).
+    _n=1
+    while :; do
+        _c=0
+        for ((_m = 0; _m < (1 << _n); _m++)); do
+            _bit=$_m; _i=0
+            while [ "$_bit" -ne 0 ]; do _i=$((_i + (_bit & 1))); _bit=$((_bit >> 1)); done
+            [ "$_i" -eq $((_n / 2)) ] && _c=$((_c + 1))
+        done
+        [ "$_c" -ge "$_N" ] && break
+        _n=$((_n + 1))
+    done
+    # The masks themselves, in increasing integer order, first N of them.
+    for ((_m = 0; _m < (1 << _n) && ${#_MASK[@]} < _N; _m++)); do
+        _bit=$_m; _i=0
+        while [ "$_bit" -ne 0 ]; do _i=$((_i + (_bit & 1))); _bit=$((_bit >> 1)); done
+        [ "$_i" -eq $((_n / 2)) ] && _MASK+=("$_m")
+    done
+
+    for ((_bit = 0; _bit < _n; _bit++)); do
+        _feats=""
+        for ((_i = 0; _i < _N; _i++)); do
+            (( (_MASK[_i] >> _bit) & 1 )) && _feats="${_feats},${_U[_i]}"
+        done
+        KERNEL_CFG_MIX+=("x86-mix-${_bit} ../../x86_64-unaos.json ${_feats#,}")
+    done
+
+    [ "${UNAOS_CFG_SWEEP:-0}" = "1" ] || return 0
+    _full="$(printf '%s,' "${_U[@]}")"; _full="${_full%,}"
+    for ((_i = 0; _i < _N; _i++)); do
+        KERNEL_CFG_SWEEP+=("x86-only-${_U[_i]} ../../x86_64-unaos.json ${_U[_i]}")
+    done
+    for ((_i = 0; _i < _N; _i++)); do
+        _feats="$(printf '%s\n' "$_full" | tr ',' '\n' | { grep -vx "${_U[_i]}" || true; } | tr '\n' ',')"
+        KERNEL_CFG_SWEEP+=("x86-drop-${_U[_i]} ../../x86_64-unaos.json ${_feats%,}")
+    done
+}
+
 # Type-check every KERNEL_CFG_MATRIX leg and print one summary line per leg, in the same shape as the
 # kernel and userspace legs above.
 #
@@ -1133,12 +1290,23 @@ KERNEL_CFG_MATRIX=(
 # if an operator's UNAOS_* environment could add to them, the gate would mean something different for
 # every operator, and "check green" would stop being a shared fact. The operator's own knob set is
 # already what the two default legs compile.
+#
+# The board matrix runs FIRST and the derived GATE-CFG-MIX legs behind it: the board legs are the ones
+# an edit is most likely to break, so their diagnostics stay at the top of the scrollback. A red mix
+# leg names the leg AND its exact `--features` string, because the label alone ("x86-mix-3") does not
+# tell you which configuration broke and the whole point of these legs is to name the configuration.
 check_kernel_cfg() {
     local _rc=0 _n=0 _failed=""
     local _row _leg _tgt _feats
-    echo -e "${COLOR_YELLOW}⚡ Syntax Check: kernel cfg-gated coverage (${#KERNEL_CFG_MATRIX[@]} legs)...${COLOR_RESET}"
+    local -a _rows=()
+    build_cfg_legs || return 1
+    _rows=("${KERNEL_CFG_MATRIX[@]}" "${KERNEL_CFG_MIX[@]}" "${KERNEL_CFG_SWEEP[@]}")
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: kernel cfg-gated coverage (${#_rows[@]} legs)...${COLOR_RESET}"
+    if [ "${UNAOS_CFG_SWEEP:-0}" != "1" ]; then
+        echo -e "${COLOR_CYAN}  (${#KERNEL_CFG_MATRIX[@]} board + ${#KERNEL_CFG_MIX[@]} x86 pairwise-mix; UNAOS_CFG_SWEEP=1 adds the per-feature sweep)${COLOR_RESET}"
+    fi
     cd "$WORKSPACE_DIR/crates/kernel"
-    for _row in "${KERNEL_CFG_MATRIX[@]}"; do
+    for _row in "${_rows[@]}"; do
         read -r _leg _tgt _feats <<< "$_row"
         _n=$((_n + 1))
         echo -e "${COLOR_CYAN}  → ${_leg}${COLOR_RESET}"
@@ -1147,6 +1315,10 @@ check_kernel_cfg() {
             echo -e "${COLOR_GREEN}  ✅ ${_leg}${COLOR_RESET}"
         else
             echo -e "${COLOR_RED}  ❌ ${_leg} — unaos-kernel FAILED to compile${COLOR_RESET}"
+            # Name the CONFIGURATION, not just the leg. For the board legs the label already implies
+            # it; for a derived mix/sweep leg the feature string IS the finding — it is the thing the
+            # author has to reproduce, and reconstructing it from a label costs a round-trip.
+            echo -e "${COLOR_RED}     configuration: --target ${_tgt} --features ${_feats}${COLOR_RESET}"
             _failed="${_failed} ${_leg}"
             _rc=1
         fi
