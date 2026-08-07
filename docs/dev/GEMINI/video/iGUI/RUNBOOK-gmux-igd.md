@@ -1,4 +1,4 @@
-# RUNBOOK — GMUX to IGD, and what to do at a black panel
+# RUNBOOK — GMUX to IGD, and what to expect
 
 Operator procedure for a boot of the `UNAOS_GMUX_IGD=1` build on the 2012 Retina
 MacBookPro bench machine. Read the whole page before inserting the stick.
@@ -10,13 +10,12 @@ MacBookPro bench machine. Read the whole page before inserting the stick.
 Nothing in the kernel guards this knob across boots. The in-boot guard (`PROBED`) only
 stops the probe running twice **within one boot**. It is not persistent state.
 
-**Every subsequent boot from an armed stick switches the display mux again**, and stalls
-for another 10 seconds with the panel dark, whether or not you wanted an experiment that
+**Every subsequent boot from an armed stick switches the display mux again**, whether or not you wanted an experiment that
 time. If that stick is left in the machine and the machine is rebooted for an unrelated
-reason, you will get the black panel again with no warning.
+reason, you will get the experiment running again with no warning.
 
 After the sitting: re-flash the stick with a normal build, or pull it out and label it.
-**Note: gmux_igd media is a special flight, not regression media! The boot time cost is ~10s.**
+**Note: gmux_igd media is a special flight, not regression media!**
 
 ---
 
@@ -27,20 +26,15 @@ After the sitting: re-flash the stick with a normal build, or pull it out and la
 2. The gmux protocol check runs. If it reports `PROTOCOL UNPROVEN`, **nothing is
    written** and the boot continues — that is a valid, safe outcome.
 3. On `PROTOCOL PROVEN`, the pre-switch mux state is read and saved.
-4. The mux is switched to the integrated GPU.
-5. **THE PANEL GOES BLACK. THIS IS THE EXPECTED RESULT.** It is not a crash and it is
-   not the experiment failing. Every iGPU pipe, plane and PLL on this machine reads
-   zero, so nothing on the integrated side is driving the panel — pointing the mux at
-   IGD points it at an unconfigured display engine. A later arc configures pipes; this
-   one only proves the mux write lands.
-6. **The machine sits with a dark panel for about 10 seconds.** Boot is genuinely
-   stalled during this window — that is by design, because the code holding the mux on
-   IGD is the same code that will put it back. Do not touch anything.
-7. The mux is reverted to the saved pre-switch state.
-8. **The panel comes back**, and boot continues into xHCI enumeration and the GUI.
+4. **Flight 1b Specific:** We run the Unwind Stack self-test. If it fails, we abort.
+5. The mux is switched to the integrated GPU **for DDC ONLY** (`GMUX_SWITCH_DDC = 0x1`).
+6. **THE PANEL SHOULD REMAIN ON.** Since we are only switching the DDC/AUX channel and leaving the DISPLAY channel on the discrete GPU, the screen should not go black. If the panel *does* blank, it proves our assumption about DDC-only switching is wrong, and this flight has 1c's risk profile.
+7. We inherit the AUX clock divider, read DPCD, and read the 128-byte EDID over the I2C-over-AUX protocol.
+8. The EDID hex dump is printed to serial.
+9. The `DisplayUnwind` stack forcefully reverts the DDC switch back to the saved pre-switch state.
+10. Boot continues into xHCI enumeration and the GUI.
 
-Total added time: ~10 s. If the panel is dark for **substantially longer than 15
-seconds**, treat it as the failure case below.
+Total added time: minimal. If the panel goes dark and stays dark, treat it as the failure case below.
 
 ---
 
@@ -65,14 +59,11 @@ type back over the wire. Serial is an instrument, not a console.
 
 ---
 
-## If the panel does not come back
+## If the panel goes black and does not come back
 
 In order:
 
-1. **Wait to 30 seconds.** The dwell is bounded twice — by a TSC deadline and
-   by an iteration cap that depends on no clock — but if the TSC has stopped, the
-   iteration cap governs and its wall-clock length is not yet known (this is exactly
-   what the `iters=` field in the log exists to measure). It may simply be longer.
+1. **Wait briefly.** The experiment should be nearly instantaneous. If the panel blanks and stays blank, the hardware assumption was wrong or the parachute failed.
 2. **Read the serial capture.** It will say which of these happened. Use `awk`, never
    `grep` — control bytes in the capture break grep:
    ```
@@ -98,42 +89,30 @@ all carry the tag `[GMUX]` or `igpu-dpy:`:
 awk '/\[GMUX\]|igpu-dpy:/' ~/unaos-bench/capture/<session>/ttyUSB1.log
 ```
 
-A successful run reads roughly:
+A successful run reads roughly (PREDICTED TRANSCRIPT):
 
 ```
 :: igpu: PROTOCOL PROVEN (version plausible)
 :: igpu-dpy: pre-switch state DDC=0x02 DISP=0x03 EXT=0x03
 :: igpu-dpy: rung=00 name=census ok=1 bdsm=... ggc=... ggtt0=... ggtt1=... aux_ctl=... frmcnt=...
-:: igpu: [GMUX] the panel is EXPECTED to go black now — switching to IGD
-:: igpu: [GMUX] switch write: ddc=ok disp=ok ext=ok ...
-:: igpu: [GMUX] switch read-back: DDC=0x01 DISP=0x02 EXT=0x02
-:: igpu: [GMUX] switch verdict: MATCH (all three registers read back as written)
-:: igpu-dpy: rung=00 name=mux ok=1 ddc=0x01 disp=0x02 ext=0x02 verdict=MATCH
-:: igpu: [GMUX] switch successful (10s dwell expected)
-:: igpu: FOX CROSS-CHECK - If Plane A is enabled here but panel goes black, handoff/bootchain is the cause, not hardware!
-:: igpu-blt: ring=absent why=no-active-surface
-:: igpu: [GMUX] beginning success-path dwell
-:: igpu: [GMUX] dwell ended by=deadline elapsed_ms=10001 iters=...
-:: igpu: [GMUX] reverting to pre-switch state DDC=0x02 DISP=0x03 EXT=0x03
-:: igpu: [GMUX] revert write: ddc=ok disp=ok ext=ok ...
-:: igpu: [GMUX] revert read-back: DDC=0x02 DISP=0x03 EXT=0x03
-:: igpu: [GMUX] revert verdict: MATCH (all three registers read back as written)
-:: igpu: [GMUX] success-path dwell finished, reverted=true
-:: igpu-dpy: LADDER highest=00/10 name=harness ok=1 unwound=0 gmux=MATCH why=none elapsed_ms=10020
+:: igpu: [GMUX] running Unwind stack self-test
+:: igpu: [GMUX] Unwind stack MMIO self-test passed
+:: igpu: [GMUX] Unwind stack gmux-dispatch=REACHED (Gmux restore path executed without faulting, not implying restore verified)
+:: igpu: [GMUX] switching DDC to IGD (0x01) — panel should REMAIN ON since DISPLAY is not moved
+:: igpu: [AUX] DPCD REV: 0x11
+:: igpu: [AUX] EDID Dump
+:: igpu: [AUX] 00: 00 FF FF FF FF FF FF 00 ...
+...
+:: igpu: [GMUX] revert read-back: DDC=0x02 DISP=0x03 (TBV) EXT=0x03 (TBV)
+:: igpu-dpy: LADDER highest=03/10 name=edid ok=1 unwound=1 gmux=MATCH why=none elapsed_ms=...
 ```
 
 | Line you see | What it means | What to do |
 |---|---|---|
-| `LADDER highest=00/10 name=harness ok=1` | The whole experiment succeeded. The mux write lands; a future arc can configure pipes. | Nothing. Pull the stick. |
+| `LADDER highest=03/10 name=edid ok=1` | The whole experiment succeeded. The mux write lands; EDID was read. | Nothing. Pull the stick. |
 | `REFUSED: pre-switch state is not fully DIS` | The gmux was not in the expected discrete state. **No write was issued**. | Safe. Power cycle and try again. |
-| `rung=00 name=mux ok=0` | The mux is in an unknown or partial state. The revert still runs. | Read which register disagreed. If `LADDER` then says `gmux=MATCH`, the machine is fine. |
 | `LADDER ... gmux=FAILED` | The mux was **not proven** back. | Power cycle. Report the whole `[GMUX]` block. |
-| `dwell ended by=itercap` | The TSC clock stopped advancing during the dwell. The revert still ran. | Report it. |
 | No `[GMUX]` lines at all on an armed build | The probe never reached the arm, or the build was not actually armed. | Check the boot banner really ends `...,unaos_ivb,gmux_igd`. |
-
-The `iters=` number on the dwell line is worth recording on the first successful boot:
-it is the only thing that will ever tell us how long the iteration-cap backstop actually
-runs in wall-clock terms.
 
 ---
 
@@ -143,4 +122,4 @@ runs in wall-clock terms.
       watcher is alive).
 - [ ] The stick you are about to boot is the armed one, and you know which it is.
 - [ ] You accept that this stick must be re-flashed or removed afterwards.
-- [ ] You know the panel will be dark for ~10 s and that this is the expected result.
+- [ ] You know the panel should remain on, and there is no 10-second dwell.
