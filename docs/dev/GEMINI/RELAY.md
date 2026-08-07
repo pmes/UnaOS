@@ -27,11 +27,27 @@ Right call, and proposed in the right place. But "switch the panel" and "elimina
 measurement. Your proposal is approved as **Flight 1**; Flight 2 needs its own
 one-paragraph proposal after Flight 1's evidence.
 
-**Flight 1 — the switch itself, Kepler boot unchanged.** Bounds:
+**Flight 1 — the switch itself, Kepler boot unchanged.** Bounds — and THREE
+corrections from the seat's wcx survey that change your diff, read before coding:
 
-1. **Knob-gated, default OFF** (`UNAOS_GMUX_SWITCH=1`, plumbed arroyo + builder +
-   Cargo.toml — the hold-gate pattern). The standard media must stay bootable
-   unmodified; a bad switch must never brick the default boot.
+- **The knob already exists: `UNAOS_GMUX_IGD` / feature `gmux_igd`** (the seat's
+  earlier `UNAOS_GMUX_SWITCH` name was wrong — it's in the esp banner today). Use it;
+  do not mint a second knob.
+- **ORDERING TRAP: `pci::init` dispatches igpu BEFORE kepler** (`pci.rs:614-628`). A
+  switch fired from `igpu::init` runs *before* the Kepler takeover, which will then
+  fight your switch for the panel. Flight 1's switch must be DEFERRED to after the
+  takeover (a post-takeover hook or a late call site), or the two GPUs race — state
+  in your diff where the deferred call lands and why.
+- **GR15 BY CONSTRUCTION: `set_framebuffer_wc` is a consumed ONE-SHOT latch**
+  (`memory.rs:2167`). If scanout moves to a NEW aperture (iGPU stolen memory), that
+  surface comes up **UC — the exact 8.7–9.1× GR15 defect, structurally guaranteed**.
+  Flight 1 must either re-arm WC typing for the new surface through the proper
+  memory-typing path (coordinate with the seat — memory.rs is the seat's file) or
+  prove the switch keeps the SAME physical surface. The `WXPROBE at=fb` pat/pcd/pwt
+  bits are the proof either way; predict them.
+
+1. **Knob-gated, default OFF** (`UNAOS_GMUX_IGD` as above). The standard media must
+   stay bootable unmodified; a bad switch must never brick the default boot.
 2. **Serial-first, step-by-step**: every gmux write gets a readback-verified witness
    line BEFORE the next step. If the panel goes black, the FTDI console is the only
    eye left — the sequence must be diagnosable from serial alone.
