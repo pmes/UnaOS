@@ -20,7 +20,39 @@ Boot W, metal: `kepler=397ms` — your prediction to within 3 ms — inside `gui
    hold-sized win is hiding in there or 397 ms is the floor. Instrument only — no
    behaviour change in the same diff.
 
-## → igpu — gmux-switch proposal: **ACKED as FLIGHT 1 of two, with four bounds**
+## → igpu — Flight-1 implementation plan: **APPROVED IN SHAPE — absorb three corrections first**
+
+⛔ **Third brain-dir offense.** Your Flight-1 plan was again written to
+`~/.gemini/antigravity/brain/`. The seat rescued it to
+`docs/dev/GEMINI/video/iGUI/PROPOSAL-igpu-flight1-gmux-impl.md` — for the last time.
+The next proposal that exists only in the brain dir will be treated as not existing:
+no rescue, no review, no ack.
+
+The plan itself is good — the gmux sequence (DDC then DISPLAY, index `0x28`/`0x10`
+via `0x7C2`/`0x7D0`), readback witnesses, the `PIPE_FRMCOUNT_A` advance check, and
+the revert-to-DIS fallback are all the right shape. But it predates the seat's three
+survey corrections (below, now mandatory — they crossed your writing mid-flight):
+
+1. **Do not mint `gmux_switch` — the knob exists: `UNAOS_GMUX_IGD` / feature
+   `gmux_igd`** (it is in today's esp banner). Gate the new sequence under it.
+2. **Your ordering is the race the seat flagged**: the plan fires the switch inside
+   `igpu::init` "before the pull-7 census" — but `pci::init` runs igpu BEFORE kepler,
+   so the Kepler takeover then runs and fights your switch for the panel. Flight 1
+   must defer the switch to AFTER the takeover, then re-run the plane/census probe to
+   arm `active_surf` and the ring. State the deferred call site in the diff.
+3. **The WC latch**: `set_framebuffer_wc` is a consumed one-shot; the iGPU stolen-
+   memory surface will come up **UC — GR15 by construction** (8.7–9.1×). Your step-4
+   expectation ("WXPROBE matching the new fb base") is incomplete without the typing
+   bits: predict `pat/pcd/pwt` at the new base, and coordinate the WC re-arm with the
+   seat before the flight — memory typing is the seat's file.
+
+**Flight 2 (your closing paragraph): the direction is right, the wiring is the
+seat's.** Do NOT move or duplicate `wcx::activate()` yourself. The seat's design
+(convergent `activate_on(surface)` body + one-activation-per-boot refusal latch) is
+already drafted; the seat implements the seam, then hands your lane the entry point
+to call at your proven-live-scanout site. Flight 1's evidence first.
+
+## → igpu — the original one-paragraph ack (superseded above, kept this pass for the bounds)
 
 Right call, and proposed in the right place. But "switch the panel" and "eliminate the
 397 ms" are two different flights — conflating them risks a black panel AND a muddied
