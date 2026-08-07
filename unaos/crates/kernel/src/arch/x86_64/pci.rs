@@ -633,6 +633,13 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         if !kepler_found {
             serial_println!(":: kepler: no-device ::");
         }
+
+        // DEFERRED CALL SITE FOR FLIGHT 1 GMUX SWITCH:
+        // Here, Kepler has finished its takeover. If we switch GMUX to IGD now,
+        // it overrides Kepler's routing. We then rerun the iGPU plane census
+        // and arm the blitter ring.
+        #[cfg(all(feature = "gmux_igd", feature = "intel-ivb"))]
+        unsafe { crate::drivers::gpu::igpu::gmux_igd_switch() };
     }
 
     // SDHC-1 (milestone 1): storage-class PCI census + the read-only SD Host Controller

@@ -108,6 +108,10 @@ unsafe impl Send for BltRing {}
 #[cfg(target_arch = "x86_64")]
 static BLT_RING: Mutex<Option<BltRing>> = Mutex::new(None);
 
+#[cfg(target_arch = "x86_64")]
+static IGPU_BAR0: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+
 use core::sync::atomic::AtomicU32;
 pub static ACTIVE_SURF: AtomicU32 = AtomicU32::new(0);
 
@@ -238,6 +242,11 @@ const GMUX_SWITCH_DISPLAY: u8 = 0x10;
 const GMUX_SWITCH_DDC: u8 = 0x28;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_SWITCH_EXTERNAL: u8 = 0x40;
+const GMUX_READ_DISPLAY: u8 = 0x11;
+const GMUX_READ_EXTERNAL: u8 = 0x41;
+const GMUX_DDC_DIS: u8 = 0x02;
+const GMUX_DISPLAY_DIS: u8 = 0x03;
+const GMUX_EXTERNAL_DIS: u8 = 0x03;
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_DDC_IGD: u8 = 0x01;
@@ -248,10 +257,9 @@ const GMUX_EXTERNAL_IGD: u8 = 0x02;
 
 /// Baseline's iteration bound, kept UNCONDITIONALLY alongside the ms deadline.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_WAIT_ITERS: u32 = 200;
+const GMUX_WAIT_ITERS: u32 = 5000;
 /// Wall-clock bound on one handshake wait. Only meaningful while the BSP timer ISR runs.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_WAIT_MS: u64 = 20;
 /// How long the mux stays on IGD before the revert fires.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_DWELL_MS: u64 = 10_000;
@@ -287,7 +295,7 @@ unsafe fn gmux_wait_ready() -> bool {
         }
         // apple-gmux.c drains the stale reply byte here before retrying.
         let _ = unsafe { gmux_inb(GMUX_PORT_READ) };
-        if iters == 0 || crate::arch::ms().wrapping_sub(start) > GMUX_WAIT_MS {
+        if iters == 0 {
             return false;
         }
         iters -= 1;
@@ -305,7 +313,7 @@ unsafe fn gmux_wait_complete() -> bool {
             let _ = unsafe { gmux_inb(GMUX_PORT_READ) };
             return true;
         }
-        if iters == 0 || crate::arch::ms().wrapping_sub(start) > GMUX_WAIT_MS {
+        if iters == 0 {
             return false;
         }
         iters -= 1;
@@ -432,8 +440,8 @@ unsafe fn gmux_apply(phase: &str, ddc: u8, disp: u8, ext: u8) -> bool {
         phase, ok(w_ddc), ok(w_disp), ok(w_ext), ddc, disp, ext);
 
     let r_ddc = unsafe { gmux_index_read(GMUX_SWITCH_DDC) };
-    let r_disp = unsafe { gmux_index_read(GMUX_SWITCH_DISPLAY) };
-    let r_ext = unsafe { gmux_index_read(GMUX_SWITCH_EXTERNAL) };
+    let r_disp = unsafe { gmux_index_read(GMUX_READ_DISPLAY) };
+    let r_ext = unsafe { gmux_index_read(GMUX_READ_EXTERNAL) };
     serial_println!(
         ":: igpu: [GMUX] {} read-back: DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::",
         phase, r_ddc, r_disp, r_ext);
@@ -529,48 +537,7 @@ fn gmux_dwell() {
 ///
 /// Called ONLY from inside the `PROTOCOL PROVEN` branch.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-unsafe fn gmux_arm_switch_and_revert() {
-    // Read the pre-switch state through the ARMED helpers rather than reusing the trace
-    // values: the trace's closures cannot report a timeout at all, and a value that cannot be
-    // distinguished from a timeout is not a state we may promise to return to.
-    let ddc = unsafe { gmux_index_read(GMUX_SWITCH_DDC) };
-    let disp = unsafe { gmux_index_read(GMUX_SWITCH_DISPLAY) };
-    let ext = unsafe { gmux_index_read(GMUX_SWITCH_EXTERNAL) };
-    serial_println!(":: igpu: [GMUX] pre-switch state: DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", ddc, disp, ext);
 
-    if ddc == 0xFFFFFFFF || disp == 0xFFFFFFFF || ext == 0xFFFFFFFF {
-        // The refuse-to-arm sentinel. A pre-switch read that timed out means there is no known
-        // state to return to, so there is nothing safe to switch away from.
-        serial_println!(":: igpu: [GMUX] REFUSED: pre-switch read timed out (0xFFFFFFFF) — no known state to return to, no write issued ::");
-        return;
-    }
-
-    let deadline = crate::arch::ms().saturating_add(GMUX_DWELL_MS).min(u32::MAX as u64) as u32;
-    gmux_state_update(|_| Some(RevertState {
-        armed: true,
-        due: false,
-        ddc: ddc as u8,
-        disp: disp as u8,
-        ext: ext as u8,
-        deadline_ms: deadline,
-    }));
-    serial_println!(":: igpu: [GMUX] ARMED synchronous revert: dwell={}ms deadline_ms={} ::", GMUX_DWELL_MS, deadline);
-    serial_println!(":: igpu: [GMUX] the panel is EXPECTED to go black now — nothing on the integrated side is driving it (every pipe/plane/PLL reads zero). The read-back below is the result. ::");
-
-    let switched = unsafe { gmux_apply("switch", GMUX_DDC_IGD, GMUX_DISPLAY_IGD, GMUX_EXTERNAL_IGD) };
-
-    // Dwell and revert UNCONDITIONALLY, including after a MISMATCH: a partially-landed switch
-    // is precisely the state that most needs putting back.
-    gmux_dwell();
-    let reverted = gmux_revert_now();
-
-    serial_println!(
-        ":: igpu: [GMUX] SUMMARY: switch={} revert={} — the mux is {} ::",
-        if switched { "MATCH" } else { "MISMATCH" },
-        if reverted { "MATCH" } else { "FAILED" },
-        if reverted { "back on the pre-switch (discrete) state" } else { "NOT PROVEN back — power cycle, see RUNBOOK-gmux-igd.md" });
-    serial_println!(":: igpu: [GMUX] NOTE: nothing guards this knob across boots. EVERY boot from this stick switches the mux again. Re-flash it after the sitting. ::");
-}
 
 pub fn init(gpu: &GpuInfo) {
     if PROBED.swap(true, Ordering::SeqCst) {
@@ -634,6 +601,7 @@ pub fn init(gpu: &GpuInfo) {
 
     #[cfg(target_arch = "x86_64")]
     {
+        IGPU_BAR0.store(bar0, Ordering::SeqCst);
         crate::arch::memory::map_mmio_window(bar0 as u64, bar0_size);
         if crate::arch::memory::translate(bar0 as u64).is_none() {
             serial_println!("[Intel iGPU] Error: BAR0 physical address (0x{:X}) is not mapped. Probe aborted.", bar0);
@@ -714,8 +682,7 @@ pub fn init(gpu: &GpuInfo) {
                 // answered the handshake but reported an implausible version tuple passed the
                 // 0xFFFFFFFF sentinel and got its display mux written anyway. The version check
                 // is only a gate if something is actually gated on it.
-                #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-                gmux_arm_switch_and_revert();
+                
             }
             serial_println!(":: igpu: TRACE END ::");
         }
@@ -753,97 +720,7 @@ pub fn init(gpu: &GpuInfo) {
         // the boot — every refusal below breaks out of this block, the ring simply never comes up,
         // `blitter_*` return false, and the CPU path carries the console exactly as before this
         // module existed. Each refusal names itself on an `igpu-blt: ring=absent` line.
-        'ring: {
-        // The outermost refusal arm — SEAT FIXUP round 3, and the census's own first metal boot
-        // (Boot X) is why it exists: on the dual-GPU rMBP the gmux routes the panel to the KEPLER,
-        // every iGPU plane reads zero, `active_surf` is None — and the census printed NOTHING,
-        // the one outcome the playbook called worst. The fb the console draws into is Kepler
-        // VRAM, which this blitter cannot reach through the iGPU GGTT: the acceleration is
-        // structurally confined to boots where the iGPU owns a scanout (gmux switched, or
-        // iGPU-only machines). This line makes that fact one awk away instead of an absence.
-        let Some(surf) = active_surf else {
-            serial_println!(":: igpu-blt: ring=absent why=no-active-surface — every iGPU display plane is off (gmux routes the panel elsewhere); CPU path carries the console ::");
-            break 'ring;
-        };
-        {
-            let layout = Layout::from_size_align(4096, 4096).unwrap();
-            let ring_ptr = alloc_zeroed(layout);
-
-            // Translate the ring's heap VIRTUAL address to physical via the kernel's own walk —
-            // the first cut programmed the virtual address into the PTE and worked only by
-            // identity-map luck.
-            let Some(phys_addr64) = crate::arch::memory::translate(ring_ptr as u64) else {
-                serial_println!(":: igpu-blt: ring=absent why=ring-virt-unmapped va=0x{:X} — CPU path carries the console ::", ring_ptr as usize);
-                break 'ring;
-            };
-            let phys_addr = phys_addr64 as usize;
-            // Gen7 GGTT PTEs carry extended address bits 39:32 in PTE bits 7:4, which this
-            // bring-up does not program — refuse (not panic) anything above 4 GiB.
-            if phys_addr >= 0x1_0000_0000 {
-                serial_println!(":: igpu-blt: ring=absent why=phys-above-4g phys=0x{:X} — extended PTE bits not programmed; CPU path carries the console ::", phys_addr);
-                break 'ring;
-            }
-
-            // SEAT FIXUP: the scanout extent comes from the live panel info, not a hardcoded
-            // 2880x1800 — a different panel (UNAOS_FBW/FBH override, another machine) would
-            // otherwise put the ring PTE INSIDE the scanout and black the panel silently. If the
-            // WRITER lock is contended at init time, refuse: a guess here is exactly the defect
-            // the review bounced.
-            let fb_bytes = match crate::video::WRITER.try_lock().map(|w| {
-                let i = w.info();
-                (i.height * i.stride * i.bytes_per_pixel) as u32
-            }) {
-                Some(b) => b,
-                None => {
-                    serial_println!(":: igpu-blt: ring=absent why=writer-locked — cannot prove scanout extent; CPU path carries the console ::");
-                    break 'ring;
-                }
-            };
-            let extent = surf + fb_bytes;
-            let gtt_page = ((extent + 4095) / 4096) as u32; // provably beyond the scanout surface
-
-            let ring_gtt_addr = gtt_page * 4096;
-            let gtt_offset = regs::GTT_BASE + (gtt_page as usize * 4);
-            let pte = (phys_addr as u32) | 1; // Valid bit
-
-            // Neighbouring PTEs read BEFORE the write; re-read and compared AFTER it below — a
-            // store that smears past its slot is a silent black panel, so "unchanged" is verified,
-            // not asserted in prose.
-            let pte_prev = mmio_read(bar0, gtt_offset - 4);
-            let pte_next = mmio_read(bar0, gtt_offset + 4);
-            serial_println!(":: igpu: GGTT slot constraint - writing ring PTE at 0x{:X} (slot offset 0x{:X}, scanout extent 0x{:X}) ::", ring_gtt_addr, gtt_offset, extent);
-
-            core::ptr::write_volatile((bar0 + gtt_offset) as *mut u32, pte);
-            let pte_prev_after = mmio_read(bar0, gtt_offset - 4);
-            let pte_next_after = mmio_read(bar0, gtt_offset + 4);
-            if pte_prev_after != pte_prev || pte_next_after != pte_next {
-                serial_println!(":: igpu-blt: ring=absent why=neighbour-pte-changed prev 0x{:08X}->0x{:08X} next 0x{:08X}->0x{:08X} — PTE write smeared; ring NOT enabled ::",
-                    pte_prev, pte_prev_after, pte_next, pte_next_after);
-                core::ptr::write_volatile((bar0 + gtt_offset) as *mut u32, 0);
-                break 'ring;
-            }
-            serial_println!(":: igpu: GGTT PTE prev: 0x{:08X}, PTE next: 0x{:08X} (verified unchanged after write) ::", pte_prev, pte_next);
-            
-            core::ptr::write_volatile((bar0 + regs::BLT_RING_CTL) as *mut u32, 0);
-            core::ptr::write_volatile((bar0 + regs::BLT_RING_START) as *mut u32, ring_gtt_addr);
-            core::ptr::write_volatile((bar0 + regs::BLT_RING_HEAD) as *mut u32, 0);
-            core::ptr::write_volatile((bar0 + regs::BLT_RING_TAIL) as *mut u32, 0);
-            core::ptr::write_volatile((bar0 + regs::BLT_RING_CTL) as *mut u32, 1); // 4KB length, enable
-            
-            *BLT_RING.lock() = Some(BltRing {
-                bar0,
-                ring_ptr,
-                gtt_offset: ring_gtt_addr,
-                tail: 0,
-                fills: 0,
-                scrolls: 0,
-                fallbacks: 0,
-                spins_max: 0,
-                dead: false,
-            });
-            serial_println!(":: igpu: BLT Ring initialized at GGTT 0x{:08X} (Phys 0x{:08X}) ::", ring_gtt_addr, phys_addr);
-        }
-        } // 'ring
+        
 
         serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers] On Ivy Bridge (Gen7 / Panther Point 7-Series PCH), the Display Engine is split.");
         serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers, Section 1.1.2] eDP on Port A (DP_A) is CPU-attached (North Display Engine).");
@@ -1032,4 +909,179 @@ pub fn print_blt_stats() {
                 ring.fills, ring.scrolls, ring.fallbacks, ring.spins_max);
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn bring_up_blt_ring(bar0: usize, active_surf: Option<u32>) {
+    'ring: {
+        // The outermost refusal arm — SEAT FIXUP round 3, and the census's own first metal boot
+        // (Boot X) is why it exists: on the dual-GPU rMBP the gmux routes the panel to the KEPLER,
+        // every iGPU plane reads zero, `active_surf` is None — and the census printed NOTHING,
+        // the one outcome the playbook called worst. The fb the console draws into is Kepler
+        // VRAM, which this blitter cannot reach through the iGPU GGTT: the acceleration is
+        // structurally confined to boots where the iGPU owns a scanout (gmux switched, or
+        // iGPU-only machines). This line makes that fact one awk away instead of an absence.
+        let Some(surf) = active_surf else {
+            serial_println!(":: igpu-blt: ring=absent why=no-active-surface — every iGPU display plane is off (gmux routes the panel elsewhere); CPU path carries the console ::");
+            break 'ring;
+        };
+        {
+            let layout = Layout::from_size_align(4096, 4096).unwrap();
+            let ring_ptr = alloc_zeroed(layout);
+
+            // Translate the ring's heap VIRTUAL address to physical via the kernel's own walk —
+            // the first cut programmed the virtual address into the PTE and worked only by
+            // identity-map luck.
+            let Some(phys_addr64) = crate::arch::memory::translate(ring_ptr as u64) else {
+                serial_println!(":: igpu-blt: ring=absent why=ring-virt-unmapped va=0x{:X} — CPU path carries the console ::", ring_ptr as usize);
+                break 'ring;
+            };
+            let phys_addr = phys_addr64 as usize;
+            // Gen7 GGTT PTEs carry extended address bits 39:32 in PTE bits 7:4, which this
+            // bring-up does not program — refuse (not panic) anything above 4 GiB.
+            if phys_addr >= 0x1_0000_0000 {
+                serial_println!(":: igpu-blt: ring=absent why=phys-above-4g phys=0x{:X} — extended PTE bits not programmed; CPU path carries the console ::", phys_addr);
+                break 'ring;
+            }
+
+            // SEAT FIXUP: the scanout extent comes from the live panel info, not a hardcoded
+            // 2880x1800 — a different panel (UNAOS_FBW/FBH override, another machine) would
+            // otherwise put the ring PTE INSIDE the scanout and black the panel silently. If the
+            // WRITER lock is contended at init time, refuse: a guess here is exactly the defect
+            // the review bounced.
+            let fb_bytes = match crate::video::WRITER.try_lock().map(|w| {
+                let i = w.info();
+                (i.height * i.stride * i.bytes_per_pixel) as u32
+            }) {
+                Some(b) => b,
+                None => {
+                    serial_println!(":: igpu-blt: ring=absent why=writer-locked — cannot prove scanout extent; CPU path carries the console ::");
+                    break 'ring;
+                }
+            };
+            let extent = surf + fb_bytes;
+            let gtt_page = ((extent + 4095) / 4096) as u32; // provably beyond the scanout surface
+
+            let ring_gtt_addr = gtt_page * 4096;
+            let gtt_offset = regs::GTT_BASE + (gtt_page as usize * 4);
+            let pte = (phys_addr as u32) | 1; // Valid bit
+
+            // Neighbouring PTEs read BEFORE the write; re-read and compared AFTER it below — a
+            // store that smears past its slot is a silent black panel, so "unchanged" is verified,
+            // not asserted in prose.
+            let pte_prev = mmio_read(bar0, gtt_offset - 4);
+            let pte_next = mmio_read(bar0, gtt_offset + 4);
+            serial_println!(":: igpu: GGTT slot constraint - writing ring PTE at 0x{:X} (slot offset 0x{:X}, scanout extent 0x{:X}) ::", ring_gtt_addr, gtt_offset, extent);
+
+            core::ptr::write_volatile((bar0 + gtt_offset) as *mut u32, pte);
+            let pte_prev_after = mmio_read(bar0, gtt_offset - 4);
+            let pte_next_after = mmio_read(bar0, gtt_offset + 4);
+            if pte_prev_after != pte_prev || pte_next_after != pte_next {
+                serial_println!(":: igpu-blt: ring=absent why=neighbour-pte-changed prev 0x{:08X}->0x{:08X} next 0x{:08X}->0x{:08X} — PTE write smeared; ring NOT enabled ::",
+                    pte_prev, pte_prev_after, pte_next, pte_next_after);
+                core::ptr::write_volatile((bar0 + gtt_offset) as *mut u32, 0);
+                break 'ring;
+            }
+            serial_println!(":: igpu: GGTT PTE prev: 0x{:08X}, PTE next: 0x{:08X} (verified unchanged after write) ::", pte_prev, pte_next);
+            
+            core::ptr::write_volatile((bar0 + regs::BLT_RING_CTL) as *mut u32, 0);
+            core::ptr::write_volatile((bar0 + regs::BLT_RING_START) as *mut u32, ring_gtt_addr);
+            core::ptr::write_volatile((bar0 + regs::BLT_RING_HEAD) as *mut u32, 0);
+            core::ptr::write_volatile((bar0 + regs::BLT_RING_TAIL) as *mut u32, 0);
+            core::ptr::write_volatile((bar0 + regs::BLT_RING_CTL) as *mut u32, 1); // 4KB length, enable
+            
+            *BLT_RING.lock() = Some(BltRing {
+                bar0,
+                ring_ptr,
+                gtt_offset: ring_gtt_addr,
+                tail: 0,
+                fills: 0,
+                scrolls: 0,
+                fallbacks: 0,
+                spins_max: 0,
+                dead: false,
+            });
+            serial_println!(":: igpu: BLT Ring initialized at GGTT 0x{:08X} (Phys 0x{:08X}) ::", ring_gtt_addr, phys_addr);
+        }
+        } // 'ring
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+pub unsafe fn gmux_igd_switch() {
+    let bar0 = IGPU_BAR0.load(Ordering::SeqCst);
+    if bar0 == 0 { return; }
+
+    let ddc = gmux_index_read(GMUX_SWITCH_DDC);
+    let disp = gmux_index_read(GMUX_READ_DISPLAY);
+    let ext = gmux_index_read(GMUX_READ_EXTERNAL);
+    serial_println!(":: igpu: [GMUX] pre-switch state: DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", ddc, disp, ext);
+
+    if ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32 || ext != GMUX_EXTERNAL_DIS as u32 {
+        serial_println!(":: igpu: [GMUX] REFUSED: pre-switch state is not fully DIS (DDC={}, DISP={}, EXT={}) — no known safe state to return to ::", ddc, disp, ext);
+        return;
+    }
+
+    gmux_state_update(|_| Some(RevertState {
+        armed: true,
+        due: false,
+        ddc: ddc as u8,
+        disp: disp as u8,
+        ext: ext as u8,
+        deadline_ms: 0,
+    }));
+
+    serial_println!(":: igpu: [GMUX] the panel is EXPECTED to go black now — switching to IGD ::");
+    let switched = gmux_apply("switch", GMUX_DDC_IGD, GMUX_DISPLAY_IGD, GMUX_EXTERNAL_IGD);
+
+    let mut spins = 0;
+    let mut vline_advanced = false;
+    let mut plane_enabled = false;
+    let initial_frmcount = mmio_read(bar0, 0x70040);
+    
+    loop {
+        if mmio_read(bar0, 0x70040) != initial_frmcount {
+            vline_advanced = true;
+        }
+        if (mmio_read(bar0, regs::DSPACNTR) & (1 << 31)) != 0 {
+            plane_enabled = true;
+        }
+        if vline_advanced && plane_enabled {
+            break;
+        }
+        if spins >= GMUX_WAIT_ITERS {
+            break;
+        }
+        spins += 1;
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+
+    if !vline_advanced || !plane_enabled {
+        serial_println!(":: igpu: [GMUX] scanout failed to advance (spins={}, plane={}, vline={}); reverting... ::", spins, plane_enabled, vline_advanced);
+        let reverted = gmux_revert_now();
+        let s_disp = RevertState::unpack(GMUX_REVERT_STATE.load(Ordering::SeqCst)).disp;
+        let s_disp_str = if s_disp == GMUX_DISPLAY_DIS { "DIS" } else { "IGD" };
+        let back_msg = alloc::format!("back on the pre-switch ({}) state", s_disp_str);
+        
+        serial_println!(
+            ":: igpu: [GMUX] SUMMARY: switch={} revert={} — the mux is {} ::",
+            if switched { "MATCH" } else { "MISMATCH" },
+            if reverted { "MATCH" } else { "FAILED" },
+            if reverted { back_msg.as_str() } else { "NOT PROVEN back — power cycle (asserted-not-verified), see RUNBOOK-gmux-igd.md" }
+        );
+        return;
+    }
+
+    serial_println!(":: igpu: [GMUX] switch successful, iGPU scanout is live ::");
+    serial_println!(":: gmux: WXPROBE prediction: new fb base should be iGPU stolen memory, expected typing pat=0 pcd=1 pwt=1 (UC) ::");
+
+    let surf_a = dump_plane(bar0, 'A', regs::DSPACNTR, regs::DSPASURF, regs::DSPASTRIDE, regs::DSPALINOFF, regs::DSPATILEOFF);
+    let surf_b = dump_plane(bar0, 'B', regs::DSPBCNTR, regs::DSPBSURF, regs::DSPBSTRIDE, regs::DSPBLINOFF, regs::DSPBTILEOFF);
+    let surf_c = dump_plane(bar0, 'C', regs::DSPCCNTR, regs::DSPCSURF, regs::DSPCSTRIDE, regs::DSPCLINOFF, regs::DSPCTILEOFF);
+
+    let mut active_surf = None;
+    if let Some(surf) = surf_a.or(surf_b).or(surf_c) {
+        active_surf = Some(surf);
+        ACTIVE_SURF.store(surf, Ordering::SeqCst);
+    }
+    bring_up_blt_ring(bar0, active_surf);
 }

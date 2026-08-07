@@ -79,7 +79,7 @@ In order:
    awk '/\[GMUX\]/' <capture>
    ```
 3. **Power cycle.** Hold the power button. There is nothing to type and nothing to
-   press; the mux state does not survive a power cycle, so the machine comes back on the
+   press; the mux state does not survive a power cycle (asserted-not-verified), so the machine comes back on the
    discrete GPU regardless of what the kernel did.
 4. **Pull the stick before the next boot**, or the next boot repeats the whole thing
    (see the single-use warning above).
