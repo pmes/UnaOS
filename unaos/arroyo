@@ -136,6 +136,10 @@ _feats=""
 # path: REQUEST SENSE (sense rewritten to UNIT ATTENTION) + the single sense-driven retry.
 # Both fire exactly once. Test-only; never on boot media.
 [ -n "${UNAOS_BOTFAULT:-}" ] && _feats="${_feats}botfaultinject,"
+# PFWIRE: force a fatal CPL-0 #PF from arch::init to prove the fault handlers drain diagnostics to the
+# wire (review §5/C2). BRICKS THE BOOT by design — test-only, never on media. Wired in builder/src/main.rs
+# too: this witness is exercised by the QEMU `test` path, whose kernel the builder re-derives from env.
+[ -n "${UNAOS_PFWIRE_SELFTEST:-}" ] && _feats="${_feats}pfwire_selftest,"
 # ONSET-2 (M3): UNAOS_BOTRING64=1 grows the storage slot's two BULK transfer rings 16 -> 64 TRBs
 # (wrap frequency and wrap positions change; nothing else does). Default-off so a normal boot is
 # byte-identical. It is a DIAGNOSTIC, not a fix — the metal evidence never convicted ring length —
@@ -1110,7 +1114,7 @@ KERNEL_CFG_MATRIX=(
   # CONSOLE-WINDOW route (wc), instgui, the Kepler trio, IVB/GMUX, VPERF (videobench/videocap), the
   # EHCI family + KBDWIT, MTRAW + its inject sub-knob, STOR-1 (irqstorage), the BOT fault/ring
   # experiments, BENCH-RIDE (therm/pcilink/vrom), SMC, the rasterizer and the installer engine.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the

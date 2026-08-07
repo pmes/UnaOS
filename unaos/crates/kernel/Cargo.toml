@@ -72,6 +72,13 @@ bootlog = []
 # unchanged. DEFAULT OFF => module + prefix path vanish and serial is byte-identical (witness/mbench
 # specs parse serial lines and must be unaffected). Enable via `UNAOS_LOGTS=1`.
 logts = []
+# PFWIRE self-test — proves the CPL-0 fault handlers put their diagnostics on the wire. It DELIBERATELY
+# provokes a fatal page fault and HALTS the boot (a witness for the `enter_panic_mode` fix, review §5/C2),
+# so it is a debug knob only: never on boot media, never in the regression battery. DEFAULT OFF => the
+# self-test and its `arch::init` call site vanish and every artifact is byte-identical. x86_64 only.
+# Enable via `UNAOS_PFWIRE_SELFTEST=1` (headless QEMU serial capture proves the faulting-address line
+# reaches serial even when this core dies holding SERIAL1). See arch/x86_64/serial.rs::pfwire_selftest.
+pfwire_selftest = []
 # Raspberry Pi 4 build: the BCM2711 PL011 is not at the QEMU `virt` MMIO address the aarch64 serial
 # hardcodes, so don't touch that UART (it would be RAM on the Pi) — rely on fbcon for on-screen
 # output, like the Mac. Enable via `UNAOS_PI=1`.

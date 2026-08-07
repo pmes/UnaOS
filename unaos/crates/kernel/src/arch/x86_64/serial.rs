@@ -289,3 +289,39 @@ pub fn raw_write_str(s: &str) {
 pub fn wedge2_raw_byte(byte: u8) {
     raw_byte(byte);
 }
+
+/// PFWIRE self-test — feature `pfwire_selftest`, armed by `UNAOS_PFWIRE_SELFTEST=1`.
+///
+/// **BRICKS THE BOOT BY DESIGN.** It deliberately provokes a fatal CPL-0 page fault to prove the
+/// `#PF` handler puts its diagnostics on the wire, so it is compiled out by default and must NEVER
+/// ride boot media or the regression battery (both leave the knob unset). Called from `arch::init`
+/// with IF=0, after `init_idt()` (the handler is installed) and after `wxn_pdpt_sweep()` — the exact
+/// interrupt-masked, kernel-context window an M3b wild write would fault in.
+///
+/// It forces the CONTENDED case, the only one that discriminates the fix. An *uncontended* CPL-0 #PF
+/// prints its address fine with or without `enter_panic_mode` — the handler's `serial_println!` wins
+/// `SERIAL1.try_lock()` and drains normally — so it cannot tell the two apart. Here we take `SERIAL1`
+/// and leak the guard, then fault while holding it. WITHOUT the fix the handler's four lines lose the
+/// `try_lock`, `try_stage` into a ring nobody will drain (this core is about to `hlt` with IF=0), and
+/// the machine is silent on serial. WITH the fix `enter_panic_mode()` has already switched `_print`
+/// to `RawUart`'s lock-free synchronous writes, so `EXCEPTION: PAGE FAULT` / `Accessed Address:` reach
+/// the wire regardless of the leaked lock. The wild store targets a canonical higher-half address the
+/// identity-mapped kernel never maps, so it is a not-present #PF (not a #GP), independent of the WXN map.
+#[cfg(feature = "pfwire_selftest")]
+pub fn pfwire_selftest() -> ! {
+    // Announced on the FREE lock, BEFORE we take it — this line lands in both the armed build and the
+    // fix-reverted comparison build, so the A/B reads it as the "we reached the test" marker.
+    serial_println!("PFWIRE-SELFTEST: forcing a CONTENDED CPL-0 #PF (SERIAL1 held); boot will halt");
+    // Take SERIAL1 and abandon the guard so the fault handler's `try_lock` is guaranteed to lose.
+    if let Some(g) = SERIAL1.try_lock() {
+        core::mem::forget(g);
+    }
+    // Canonical higher-half address the identity-mapped kernel never maps -> a clean not-present #PF.
+    const PFWIRE_WILD: u64 = 0xFFFF_DEAD_0000_0000;
+    unsafe {
+        core::ptr::write_volatile(PFWIRE_WILD as *mut u64, 0xB00B);
+    }
+    // Unreachable: the store above faults into `page_fault_handler`, which never returns. Kept so the
+    // `-> !` signature holds even if the optimizer cannot prove the store faults.
+    crate::hlt_loop()
+}

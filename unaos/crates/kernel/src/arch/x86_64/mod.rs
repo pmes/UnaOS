@@ -55,6 +55,14 @@ pub fn init() {
     // is not yet created, interrupts are still masked) and directly after it so the census and the
     // specific addresses land adjacent in one capture. Writes nothing.
     memory::wx_probe_report();
+    // PFWIRE self-test (feature `pfwire_selftest`, `UNAOS_PFWIRE_SELFTEST=1`) — proves the CPL-0
+    // fault handlers drain their diagnostics to serial. It deliberately faults and HALTS the boot, so
+    // it fires here, still IF=0 with the IDT installed (the M3b fault window), and default-off it
+    // vanishes entirely. It diverges, so `sti` below is cfg'd out under it (never reached, no
+    // unreachable-code warning). See `serial::pfwire_selftest`.
+    #[cfg(feature = "pfwire_selftest")]
+    serial::pfwire_selftest();
+    #[cfg(not(feature = "pfwire_selftest"))]
     x86_64::instructions::interrupts::enable();
 }
 

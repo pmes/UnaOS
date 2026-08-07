@@ -66,6 +66,11 @@ fn main() {
     // UNAOS_BOTFAULT=1 injects ONE synthetic BOT failure (first WRITE(10), CSW stage) so the headless
     // suite exercises the xHCI BOT Reset Recovery path. Test-only; never on boot media.
     if std::env::var("UNAOS_BOTFAULT").is_ok() { feats.push("botfaultinject"); }
+    // UNAOS_PFWIRE_SELFTEST=1 forces a fatal CPL-0 #PF from arch::init to prove the fault handlers put
+    // their diagnostics on the wire (review §5/C2). BRICKS THE BOOT by design — test-only, never on
+    // media. Mapped here as well as in `arroyo` so the QEMU `test` kernel (re-derived from env here)
+    // actually compiles the witness in; a knob wired in arroyo alone would never reach it.
+    if std::env::var("UNAOS_PFWIRE_SELFTEST").is_ok() { feats.push("pfwire_selftest"); }
     // ONSET-2 (M3): UNAOS_BOTRING64=1 grows the storage slot's two BULK transfer rings 16 -> 64 TRBs
     // (the one-variable wrap/Link discriminator). Default OFF => byte-identical media. It remains a
     // knob because it is a diagnostic, not a fix. MAPPED HERE AS WELL AS IN `arroyo` ON PURPOSE: a

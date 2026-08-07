@@ -157,6 +157,11 @@ unsafe fn ring3_fault_kill(vec: u8, err: u64, rip: u64, cr2: u64) -> ! {
     // `current` is null it is a kernel bug on the user path, not a user fault — treat it as fatal
     // rather than silently "killing" nothing.
     let Some(name) = crate::arch::sched::current_name() else {
+        // PFWIRE: this is the FATAL branch (a kernel bug on the user path) — it ends in `hlt_loop`
+        // with IF=0, so drain the diagnostic to serial the same way the CPL-0 handlers do. The
+        // RECOVERABLE kill below (task killed, kernel continues) is deliberately NOT armed: it must
+        // leave the serial path on its normal Mutex. See page_fault_handler / review §5.
+        crate::serial_ring::enter_panic_mode();
         serial_println!(
             ":: RING-3 FAULT from CPL3 with NO current task — vec={} err={:#x} rip={:#x} cr2={:#x} (kernel bug) ::",
             vec, err, rip, cr2
@@ -190,7 +195,17 @@ extern "x86-interrupt" fn page_fault_handler(
             );
         }
     }
-    // CPL-0 page fault: a kernel bug — fatal, unchanged.
+    // CPL-0 page fault: a kernel bug — fatal.
+    // PFWIRE: this core is about to `hlt` forever with IF=0 (interrupt gate), so it can never be
+    // the next `SERIAL1` holder to drain the staging ring. If the fault was taken while this core
+    // held `SERIAL1` — anywhere inside a `serial_println!` emit region — the four diagnostic lines
+    // below would be `try_stage`d into a ring nobody drains and lost: a brick with no serial line.
+    // `enter_panic_mode()` takes the serial path off the Mutex onto `RawUart`'s lock-free
+    // synchronous byte writes (the same escape hatch `#[panic_handler]` arms at main.rs), so the
+    // faulting address reaches the wire regardless of who holds the lock. It is a single relaxed
+    // atomic store — no lock, never cleared, idempotent — so it is safe from this context and
+    // re-entrant (a fault inside the drain re-enters it harmlessly). See review-m3b-draft.md §5/C2.
+    crate::serial_ring::enter_panic_mode();
     // FBCON-PACE F1: un-route the console BEFORE printing. These terminals never panic, so
     // neither of panic's two mirrors fires, and a routed console would HOLD every line after
     // the first (pace gate) on a machine about to hlt forever — fault name on the glass,
@@ -214,6 +229,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
             ring3_fault_kill(VEC_GP, error_code, stack_frame.instruction_pointer.as_u64(), 0);
         }
     }
+    crate::serial_ring::enter_panic_mode(); // PFWIRE — drain the fault to serial; see page_fault_handler.
     crate::video::fbcon::panic_screen(); // FBCON-PACE F1 — see page_fault_handler.
     serial_println!("EXCEPTION: GENERAL PROTECTION FAULT");
     serial_println!("Error Code: {:?}", error_code);
@@ -224,6 +240,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 /// Emit the CPL-0 (fatal) diagnostic for a non-#PF fault vector, then halt. Factored out so each
 /// error-code / no-error-code handler below stays a two-line dispatcher.
 fn fatal_fault(what: &str, vec: u8, err: u64, stack_frame: &InterruptStackFrame) -> ! {
+    crate::serial_ring::enter_panic_mode(); // PFWIRE — drain the fault to serial; see page_fault_handler.
     crate::video::fbcon::panic_screen(); // FBCON-PACE F1 — see page_fault_handler.
     serial_println!("EXCEPTION: {} (vec={}, err={:#x})", what, vec, err);
     serial_println!("{:#?}", stack_frame);
@@ -341,6 +358,9 @@ extern "x86-interrupt" fn debug_handler(mut stack_frame: InterruptStackFrame) {
 /// it only prints (no GS-relative access) and halts; the IST stack guarantees it never triple-faults
 /// even if the check lands in the pre-`swapgs`/pre-stack-switch syscall-entry window.
 extern "x86-interrupt" fn machine_check_handler(stack_frame: InterruptStackFrame) -> ! {
+    // PFWIRE (see page_fault_handler). GS-free contract preserved: `enter_panic_mode` is a relaxed
+    // store to a global AtomicBool (RIP-relative, no GS-relative access).
+    crate::serial_ring::enter_panic_mode();
     // FBCON-PACE F1 (see page_fault_handler). GS-free contract preserved: panic_screen touches
     // only fbcon statics, no GS-relative access.
     crate::video::fbcon::panic_screen();
