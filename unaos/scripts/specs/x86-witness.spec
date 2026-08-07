@@ -42,8 +42,18 @@
 # it is exactly the distinction the header's ORDERING paragraph hands to `--wcg` rather than to this
 # grammar. Recorded so that nobody replaying Boot V reads eight reds and attributes them to one cause.
 # Use `git log` to date a capture, and check it sat past 15 s, before reading any red here.
-# One wire from that round is NOT yet in force — `igpu-blt`, which ships PENDING; its block below
-# carries the promotion sha (`f11e1fc0`) and the reason.
+# Every wire from that round is now in force. `igpu-blt` was the last one still PENDING; Boot Y
+# (2026-08-07 metal, image built at `776fb13c`, i.e. past its promotion sha `f11e1fc0`) matched it —
+# mbench reported "pending 1/1 matched", flagged "consider promoting to REQUIRE" — and its block
+# below carries the promotion and the capture line that earned it.
+#
+# A SECOND MINIMUM-GENERATION FLOOR, kept separate from the one above because it is a different sha
+# and a different arc: the WXN-M2 directives below need an image at or after `e8b11513` (x86/wxn: M2
+# — the huge-leaf splitter), the first build that can print a `:: WXN-M2:` line at all. On any
+# capture older than that the M2 REQUIRE is red because the wire did not exist, exactly as the
+# `32724cb4` block is red on Boot V; Boot Y is the first capture that carries it. The BPACE/GPACE
+# block at the end of this file has NO generation floor — the boot-pace ledger is ungated
+# (bootpace.rs says so in as many words) and predates every capture in the bench archive.
 #
 # WHY THIS FILE EXISTS. Through GR17 the pi4 gate (pi4-regression.spec) was the ONLY automated
 # reader of any `[wc-g]`/`[wc-d]`/`[wc-h]`/`[wc-k]` line anywhere in the tree. Every x86 witness
@@ -539,6 +549,55 @@ FORBID :: WXN-x86: .*-> VACUOUS ::
 # REACHABLE: matched against all three format strings, generated with this bench's field values.
 FORBID :: WXN-x86: .*-> REFUSED
 
+# --- WXN-x86 M2: THE HUGE-LEAF SPLITTER, AND THE REFUSAL NOTHING WAS WATCHING -----------------
+# `e8b11513` is the milestone that takes `kern_WX` from M1's 1535 to 305 on this bench: inside the
+# GiBs M1 had to spare whole, M2 NX's every 2 MiB leaf with no executable code in it, splits the ONE
+# leaf that straddles `.text`, and leaves executable exactly `xpages + 1` pages (the ELF's executable
+# extent plus the AP trampoline page). It had NO reader anywhere in the tree when it flew — zero
+# references in any `.spec`, zero in tools/serial-analyzer.py — which is the finding this block
+# closes, and it is a sharper one than the usual "an emitter stopped printing":
+#
+#   THE MILESTONE FAILING TO HAPPEN LOOKED EXACTLY LIKE THE MILESTONE HAPPENING. If M2 refuses,
+#   `kern_WX` simply stays at M1's 1535, every other directive in this file still passes, and
+#   `--wxn` reports "ok kern_WX never rose" — a true sentence that reads as success. mbench would
+#   have printed a full PASS on a boot where the splitter refused outright.
+#
+# THE POSITIVE WITNESS. Named-and-shaped, never valued, for this file's standing reason: `nx_2m`
+# and `nx_4k` are functions of the firmware's map and `xpages` of the image's size, so pinning any
+# of them would make this spec bench-specific. What the pattern DOES pin is that every arm of the
+# report is present and in the emitter's order — `xseg=`/`xpages=` (the ELF-derived keep set),
+# `demote_1g=`/`split_2m=`/`pool_used=` (the structural edits and the static pool they came from),
+# `nx_pdpt=`/`nx_2m=`/`nx_pt=`/`nx_4k=` (the four retirement levels, which is the field group
+# `--wxn` reconciles the sweep against the audit with) and `keep_x=` (what survives executable).
+# A field that went away, or an insertion that reordered them, reds HERE rather than silently
+# breaking the analyzer's arithmetic one screen over.
+# `pool_used=N/M` is pinned as a PAIR on purpose: the denominator is `WXN_POOL_CAP`, and a pool
+# resized without the pre-pass being resized with it is the one condition that reaches
+# `panic!("WXN-M2: pool exhausted mid-edit")` — which the default PANIC FORBID would then catch, but
+# only after the boot has died. Seeing the ratio on every boot is what makes it predictable instead.
+# Capture line (Boot Y, 2026-08-07 metal — the FIRST capture carrying this wire):
+#   :: WXN-M2: xseg=[0x7B21C000,0x7B34C000) xsegs=2 xpages=304 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=1 pool_used=1/16 nx_pdpt=0 nx_2m=1022 nx_pt=0 nx_4k=719 keep_x=305 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+REQUIRE :: WXN-M2: xseg=\[0x[0-9A-F]+,0x[0-9A-F]+\) xsegs=[0-9]+ xpages=[0-9]+ .*demote_1g=[0-9]+ split_2m=[0-9]+ pool_used=[0-9]+/[0-9]+ nx_pdpt=[0-9]+ nx_2m=[0-9]+ nx_pt=[0-9]+ nx_4k=[0-9]+ keep_x=[0-9]+ .*-> SPLIT ::
+# `-> REFUSED`, and this is the rule the milestone actually needed. The existing
+# `FORBID :: WXN-x86: .*-> REFUSED` is scoped to the M1 tag and CANNOT match an M2 line — a fact
+# worth stating because the two rules look interchangeable and are not. M2 has four refusal arms
+# (memory.rs `wxn_split_stage`: already run and the pool's pages are live tables; no
+# read-only PT_LOAD, so no executable extent; an executable extent outside the image; and a static
+# pool too small for the pre-pass's `need_pd`/`need_pt`), and the LAST of those is the falsifier the
+# Boot Y playbook committed to in writing — "a REFUSED arm ⇒ pool sizing wrong". Every arm returns
+# before a single entry is written, so the kernel map keeps M1's whole 1535-leaf residue.
+# REACHABLE: matched against all four format strings, generated with Boot Y's field values. The
+# first arm carries no fields at all (`:: WXN-M2: -> REFUSED (already run; …) ::`), which is why the
+# `.*` is allowed to span nothing.
+FORBID :: WXN-M2: .*-> REFUSED
+# `-> VACUOUS` — the F6 verdict M1 carries, adopted by M2 for the identical reason: `wrote == 0`
+# after a descent that did not refuse, i.e. every entry took a `skip_user` branch and the pass is a
+# no-op that logs like a success. Exclusive with the REQUIRE above, and here for the diagnosis the
+# REQUIRE cannot give: mbench prints the offending line for a FORBID hit and only a pattern for a
+# missing REQUIRE, so this rule hands the reader `skip_user=1024 keep_x=0` instead of "witness
+# missing". Emitter: the `wrote == 0` terminal at the tail of `wxn_split_stage`.
+FORBID :: WXN-M2: .*-> VACUOUS ::
+
 # --- WXAUDIT: THE MAP CENSUS, AND THE HISTOGRAM APPENDED UNDER IT -----------------------------
 # The audit walk `wx_audit_report` (memory.rs:1152) publishes after `syscall::init` has armed
 # EFER.NXE and CR4.SMEP, so its numbers describe an actually-enforcing kernel. There was NO reader
@@ -661,9 +720,19 @@ OPTIONAL :: EHCI-HID: \[0\] EPACE-TRIM M8 SLOW-XFER addr=[0-9]+ .*wlen=[0-9]+ st
 # REACHABLE: matched against Boot W's own line with `[0]` replaced by `[1]`, which it catches.
 FORBID :: EHCI-HID: \[1\] EPACE-TRIM M8 SLOW-XFER
 
-# --- IGPU-BLT: THE CENSUS THAT DOES NOT FLY YET (PENDING) --------------------------------------
-# PENDING, with the promotion condition named — the idiom this file already uses twice above, and
-# the honest label for a witness whose code is ahead of every capture in existence.
+# --- IGPU-BLT: THE CENSUS THAT NOW FLIES (PROMOTED PENDING → REQUIRE) --------------------------
+# PROMOTED PENDING → REQUIRE, 2026-08-07 (GR19), on the capture the block below named in advance.
+# It shipped PENDING because no capture then in existence carried the line, and the promotion
+# condition it stated — "the first x86 metal capture from an image at or after `f11e1fc0`" — was met
+# by BOOT Y (metal, s73 capture, image built at `776fb13c`): mbench replay reported
+# "pending 1/1 matched", the directive flagged "MATCHED: consider promoting to REQUIRE". From that
+# boot forward, a build that stops printing the census goes RED instead of going unnoticed, which is
+# the whole point of the idiom — Boot X is the capture that proved silence was the failure mode.
+# Capture line (Boot Y @ 1793 ms), the `absent` arm as predicted for this dual-GPU bench:
+#   :: igpu-blt: ring=absent why=no-active-surface — every iGPU display plane is off (gmux routes the panel elsewhere); CPU path carries the console ::
+#
+# The history below is kept verbatim, because it is the record of why a REQUIRE would have been the
+# wrong directive for two rounds and is the right one now:
 #
 # `6283dde3` brought up an IVB BLT ring for console fill/scroll, refusing rather than panicking down
 # every path an accelerator can fail on. On THIS bench the gmux routes the panel to the Kepler, so
@@ -692,8 +761,9 @@ FORBID :: EHCI-HID: \[1\] EPACE-TRIM M8 SLOW-XFER
 #   igpu.rs:381  ":: igpu-blt: ring=absent why=no-active-surface — every iGPU display plane is off (gmux routes the panel elsewhere); CPU path carries the console ::"
 #   igpu.rs:646  ":: igpu-blt: ring={} fills={} scrolls={} fallbacks={} spins_max={} ::"  ->
 #                ":: igpu-blt: ring=up fills=1204 scrolls=88 fallbacks=0 spins_max=17 ::"
-# It catches both. Zero hits on Boot V, W and X, as expected.
-PENDING :: igpu-blt: ring=
+# It catches both. Zero hits on Boot V, W and X, as expected; one hit on Boot Y, which is what
+# promoted it.
+REQUIRE :: igpu-blt: ring=
 
 # --- SMC: THE TRUNCATION COUNTER AND THE WALK THAT MUST NOT RE-WEDGE ---------------------------
 # `late=` (`bdfb3b4c`) is the counter that made "every key whole" a MEASUREMENT instead of an
@@ -738,6 +808,72 @@ REQUIRE :: SMC-SCOUT: index walk done \([0-9]+ of [0-9]+ names\) ::
 # catches. Zero hits on Boot V, W and X.
 FORBID :: SMC-SCOUT: index enumeration STOP-NOTE at idx [0-9]+
 
+# --- BPACE / GPACE: THE BOOT-PACE LEDGER, WHICH HAD NO GATE AT ALL ----------------------------
+# THE FINDING THAT PUT THIS BLOCK HERE, stated first because it is the argument. A GR19 falsification
+# round deleted all 134 `BPACE:` and `GPACE:` lines from a known-good boot slice — every `gui=`,
+# `kepler=`, `sched d=`, `ehci-hid-done d=`, `xtail=`, `igpu=`, `sdhc=` reading the bench has — and
+# this spec still printed a full PASS. A second probe corrupted `BPACE: total gui=` and nothing
+# anywhere objected. The numbers the metal boots EXIST TO MEASURE were the numbers with no automated
+# reader: `gui 2376 -> 2217`, `ehci-hid-done 1444/1446 -> 1285` and `kepler 397 -> 396` are what one
+# arc bought, and a gate that passes identically whether they improved or regressed is not reading
+# them. This block is not a performance gate — see the SHAPE note below — it is the assertion that
+# the ledger is still on the wire and still parses.
+#
+# SHAPE, NEVER VALUE, and here the reason is not stylistic but structural. A directive pinning
+# `gui=2217ms` would go RED ON THE COMMIT THAT BUYS THE NEXT 150 MS — the mirror image of the
+# vacuous-instrument disease, and the same argument the EPACE-TRIM M8 block makes for staying
+# OPTIONAL. Millisecond figures move between arcs BY DESIGN. What does not move is the ledger's
+# grammar: the phase tags, the `t=`/`d=` pair, the `dropped=` counter and the `result=LEDGER`
+# terminal. Those are what is pinned. The values' home is the analyzer's tables, bootpace.md, and
+# the per-arc prediction table in the playbook — all read by humans, which is correct for a
+# measurement and useless for a tripwire.
+#
+# NO GENERATION FLOOR. `bootpace::service_dump` is deliberately ungated — no Cargo feature, no env
+# knob, stated in its own doc comment because "a ledger that only exists in the builds nobody boots
+# on hardware is not an instrument" — so these directives are the only ones in this file that hold
+# on EVERY x86 capture in the archive, including Boot V. Verified: they match Boot W, Boot X and
+# Boot Y.
+#
+# The rollup, and `dropped=0` pinned BY VALUE, which is the one exception to the paragraph above and
+# earns it: `DROPPED` counts ledger stamps that never made it into the ring (`CAP` exceeded), and a
+# nonzero reading means the block below it is INCOMPLETE — phases silently missing from a report
+# whose whole value is that it accounts for the boot. That is a shape fact, not a speed fact.
+# `ftdi=(none|[0-9]+ms)` spans both honest readings: `none` before the FTDI console arms (the ledger
+# re-emits on growth, so the first emission legitimately has no `ftdi-up` stamp yet) and a figure
+# once it has. `Dur` prints `none` for an unrecorded phase, so `gui=[0-9]+ms` is exactly the
+# assertion that the GUI phase WAS recorded — an unrecorded one reads `gui=none` and reds here.
+# Capture line (Boot Y @ 2223 ms; Boot W @ 2380 ms and Boot X @ 2383 ms are the same shape):
+#   :: BPACE: total gui=2217ms ftdi=none n=27 dropped=0 hz=2693860140 result=LEDGER ::
+REQUIRE :: BPACE: total gui=[0-9]+ms ftdi=(none|[0-9]+ms) n=[0-9]+ dropped=0 hz=[0-9]+ result=LEDGER ::
+# The same counter, forbidden explicitly rather than left to the REQUIRE's `dropped=0`. NOT
+# redundant: the REQUIRE is satisfied by ANY emission carrying `dropped=0`, and the ledger re-emits
+# several times per sit — so a boot whose first rollup is clean and whose later ones drop stamps
+# passes the REQUIRE and is caught only here. Emitter: `DROPPED` in bootpace.rs, incremented when a
+# stamp arrives with the ring full.
+FORBID :: BPACE: .*dropped=[1-9]
+# THE TWO PHASE STAMPS THIS TRACK ACTUALLY SPENDS ITS ARCS ON. `d=` is the phase's own cost and `t=`
+# its offset from kernel entry; both are shaped, neither is valued. `ehci-hid-done` is BUY-1's
+# subject (1444 ms on Boot W and 1446 on Boot X — a PAIR, not the single 1444 the older playbooks
+# quote — and 1285 on Boot Y once BUY-1 was paid); `sched` is SCHED-X86's, and has sat at d=67 ms
+# across W, X and Y. Requiring the LINES means the next arc that moves either number is still
+# measured; requiring the numbers would red the arc that moved them.
+# Capture lines (Boot Y):
+#   :: BPACE: ehci-hid-done t=1579ms d=1285ms ::
+#   :: BPACE: sched t=243ms d=67ms ::
+REQUIRE :: BPACE: ehci-hid-done t=[0-9]+ms d=[0-9]+ms ::
+REQUIRE :: BPACE: sched t=[0-9]+ms d=[0-9]+ms ::
+# THE GPACE CENSUS — the per-device split of the PCI/USB enumeration block, and the line that holds
+# `kepler=`, the single largest number this track has spent three rounds driving down (17 077 ->
+# 2 564 -> 397 -> 396 ms). `xtail=` anchors the head of the field list and `kepler=` is named
+# explicitly rather than spanned, because a census that kept printing while losing that one field is
+# precisely the silent-regression shape the whole file is written against. `(n=N)` is required
+# beside each: it is the sample count, and a reading with no `n=` is a mean over an unknown
+# denominator. `== witness ::` is the uncounted-witness terminal, pinned so a verdict-bearing rewrite
+# of this line cannot pass unnoticed.
+# Capture line (Boot Y @ 2203 ms):
+#   :: GPACE: xtail=0ms(n=1) bench=0ms(n=0) detect=5ms(n=1) igpu=1ms(n=1) kepler=396ms(n=1) sdhc=12ms(n=1) nic=0ms(n=1) resid=3ms == witness ::
+REQUIRE :: GPACE: xtail=[0-9]+ms\(n=[0-9]+\) .*kepler=[0-9]+ms\(n=[0-9]+\) .*== witness ::
+
 # --- WHAT IS DELIBERATELY NOT PINNED, stated rather than omitted -----------------------------
 #   * `kepler=2564ms`. It is the headline GR17 number and it is NOT a directive, because it is a
 #     MEASUREMENT on a specific machine: the 2012 rMBP's PCIe latency sets the read-back cost,
@@ -767,3 +903,16 @@ FORBID :: SMC-SCOUT: index enumeration STOP-NOTE at idx [0-9]+
 #   * `[wc-h]` / `[wc-k]` / `[cursor*]`. Real witnesses, thoroughly pinned by the pi4 gate, and
 #     out of this spec's subject. Adding half-considered copies here would grow the file without
 #     growing the evidence.
+#   * The SECOND `GPACE:` line — `span=417ms anchor=enum:p1 since-entry=2203ms hz=… build=kepler+
+#     takeover+fifo+ivb+wc+smc+ == the pci-usb d= split ::`. Tempting, because `build=` names the
+#     knob set this whole spec is scoped to. Not pinned, and the reason is that pinning it either
+#     spans the field (asserting nothing) or fixes the knob string (making the spec red on the next
+#     knob added, i.e. a directive that fails on configuration rather than on health). The knob set
+#     is asserted where it is actually load-bearing — by the paygo and logts REQUIREs at the top,
+#     which are red on a build without the knobs — and READ, per boot, by the analyzer. Recorded so
+#     the next reader does not add it thinking it was overlooked.
+#   * `WXN-M2`'s field VALUES — `nx_2m=1022`, `nx_4k=719`, `keep_x=305`. The shape is REQUIREd
+#     above; the arithmetic that ties them to `kern_WX` (`keep_x == kern_WX`, and
+#     `residue + 511*(split_2m + demote_1g) - nx_2m - nx_4k == kern_WX`) is a CROSS-LINE identity,
+#     which this grammar cannot state at all. It lives in `tools/serial-analyzer.py --wxn`, which
+#     reconciles the two walkers per boot and exits FINDING when they disagree.

@@ -42,7 +42,16 @@ The TIMING modes split differently and deliberately so.  --gaps and --wcg cut on
 the per-boot 'hz=' token (segment_by_hz) because they need the boot's own
 timestamp origin, not its witness inventory, and an hz cut is refined to the
 visible stamp RESET.  Two splitters, two questions; both are exercised by
---selftest.
+--selftest.  Since GR19 the two are also CROSS-CHECKED: when the marker table
+finds a different boot count from the hz cut, the timing modes say so and exit
+EXIT_FINDING instead of printing a per-boot table that blends two boots.
+
+EXIT CODES: 0 clean; 1 refused (no measurement was possible — an unstamped
+capture, a --boot out of range, no kepler window); 2 no boots parsed; 3 no
+witnesses; 4 the section's wire is absent from the capture; 5 the run found the
+thing it exists to catch.  ALL SIX modes carry the 5 channel — --gaps and --wcg
+were report-only until GR19, which meant a caller reading $? from them was
+reading a constant.
 
 Witness extraction is an EXPLICIT FAMILY TABLE (WITNESS_FAMILIES), not a shape
 heuristic.  The predicate this replaced was `::.*witness.*::`, which captured
@@ -1453,6 +1462,15 @@ def smc_mode(result):
 WXN_SWEEP_RE = re.compile(
     r'^\s*::\s*WXN-x86:\s*(.*?)\s*->\s*(SWEPT|VACUOUS|REFUSED)\b\s*(.*?)'
     r'\s*::\s*$')
+# M2 — the huge-leaf splitter (`e8b11513`), and the wire whose absence from this
+# file made the check below narrate a cause it had no reader for.  Same
+# three-terminal shape as M1's sweep, deliberately: one line per boot, one
+# verdict per line.  The `already run` refusal arm carries NO fields at all
+# (':: WXN-M2: -> REFUSED (already run; …) ::'), which is why the body group is
+# allowed to match empty.
+WXN_M2_RE = re.compile(
+    r'^\s*::\s*WXN-M2:\s*(.*?)\s*->\s*(SPLIT|VACUOUS|REFUSED)\b\s*(.*?)'
+    r'\s*::\s*$')
 WXN_CENSUS_RE = re.compile(r'^\s*::\s*WXAUDIT\s+x86:\s*(.*?)\s*::\s*$')
 WXN_NXE_RE = re.compile(
     r'^\s*::\s*WXAUDIT-NXE:\s*(.*?)\s*->\s*(\S+)\s*::\s*$')
@@ -1491,9 +1509,16 @@ def wxn_boot(boot):
 
     Every one of the four wires is optional and each records its own absence,
     because the eras above mean 'not in this boot' is three different facts."""
-    sweep = census = nxe = fbwc = None
+    sweep = census = nxe = fbwc = m2 = None
     dups = Counter()
     for line, probe_line in zip(boot['lines'], boot['probe']):
+        mm = WXN_M2_RE.match(probe_line)
+        if mm:
+            body, verdict, tail = mm.group(1), mm.group(2), mm.group(3)
+            dups['m2'] += 1
+            m2 = {'fields': _kv(WXN_PARENS_RE.sub(' ', body)),
+                  'verdict': verdict, 'tail': tail, 'line': line}
+            continue
         m = WXN_SWEEP_RE.match(probe_line)
         if m:
             body, verdict, tail = m.group(1), m.group(2), m.group(3)
@@ -1533,19 +1558,198 @@ def wxn_boot(boot):
             dups['fbwc'] += 1
             fbwc = {'fields': _kv(m.group(1)), 'verdict': m.group(2),
                     'line': line}
-    if not any((sweep, census, nxe, fbwc)):
+    if not any((sweep, census, nxe, fbwc, m2)):
         return None
     # The build era, read off the wires themselves rather than off a version
     # string the capture does not carry.
-    if (census and census['hist']) or fbwc:
+    if m2:
+        era = 'e8b11513+ (M1 sweep + M2 splitter)'
+    elif (census and census['hist']) or fbwc:
         era = '32724cb4+ (verdict, histogram, FBWC)'
     elif sweep or nxe:
         era = 'a0a2d163 (sweep + NXE, no histogram/FBWC)'
     else:
         era = 'pre-a0a2d163 (WXAUDIT census only)'
     return {'number': boot['number'], 'sweep': sweep, 'census': census,
-            'nxe': nxe, 'fbwc': fbwc, 'era': era, 'dups': dups,
+            'nxe': nxe, 'fbwc': fbwc, 'm2': m2, 'era': era, 'dups': dups,
             'modern': (census and census['hist']) or bool(fbwc)}
+
+
+# Splitting one huge leaf replaces it with 512 children: the map gains 511
+# leaves.  True at both levels M2 edits — a 1 GiB leaf demoted to 512 x 2 MiB
+# (`demote_1g`) and a 2 MiB leaf split to 512 x 4 KiB (`split_2m`) — and it is
+# the term that made Boot Y's `leaves=` go 66047 -> 66558 for one `split_2m=1`.
+WXN_SPLIT_GAIN = 511
+
+
+def wxn_m2_reconcile(w, residue, kern_wx):
+    """Attribute the sweep/audit delta to the stage that actually owns it.
+
+    THE DEFECT THIS EXISTS TO FIX, recorded because the shape of it matters more
+    than the arithmetic.  Through Boot X this reader printed, for delta=0:
+
+        the audit's count is the sweep's less the leaf/leaves the firmware
+        already left read-only (platform-dependent; reported, not asserted)
+
+    On Boot Y the delta was 1230 and that sentence was FALSE: the 1230 leaves
+    are M2's splitter retiring them, and `WXN-M2` appeared nowhere in this file,
+    so the tool had no wire for the cause it was naming.  Nothing went red —
+    the sentence is hedged — which is precisely the failure mode this tree keeps
+    convicting: an instrument narrating a cause it cannot see.  Left alone it
+    would have explained away a REAL walker disagreement as firmware on the next
+    boot.
+
+    THE CLOSED FORM, derived from the emitter rather than fitted to one boot
+    (memory.rs `wxn_split_stage`).  M1 leaves `residue` present leaves inside the
+    spared GiBs; M2 then walks exactly those, so
+
+        kern_WX == residue
+                   + 511 * (split_2m + demote_1g)   leaves the splits ADD
+                   - nx_2m - nx_4k                  leaves retired one at a time
+                   - already_nx                     leaves the firmware had NX'd
+
+    Boot Y: 1535 + 511*(1+0) - 1022 - 719 - 0 = 305 == kern_WX, exactly.
+
+    IT IS NOT ALWAYS EVALUABLE, and this reader says so rather than guessing.
+    `nx_pdpt` and `nx_pt` retire a whole SUBTREE with one write (512 or 262144
+    leaves), and the count under it is not on the wire; `skip_user` abandons a
+    subtree the same way.  When any of those is nonzero the closed form is
+    unavailable — reported as such, never approximated — and `keep_x` vs
+    `kern_WX` carries the check instead.  That one holds unconditionally: it is
+    the kernel's own stated cross-check (two independent walks of the same
+    tables, `keep_x` counted during the edit and `kern_WX` by the audit walk),
+    and the emitter's comment names it in as many words."""
+    m2 = w.get('m2')
+    delta = residue - kern_wx
+    head = (f"residue_leaves={residue}, audit kern_WX={kern_wx}, "
+            f"delta={delta}")
+    if not m2:
+        # UNCHANGED wording for the no-M2 case, with its precondition now said
+        # out loud.  Through Boot X this was the whole truth; it is still the
+        # truth on any boot whose build predates the splitter.
+        if delta >= 0:
+            return True, [f"ok   residue/kern_WX: sweep {head} — no WXN-M2 "
+                          f"line on this boot, so the audit's count is the "
+                          f"sweep's less the leaf/leaves the firmware already "
+                          f"left read-only (platform-dependent; reported, not "
+                          f"asserted)"]
+        return False, [
+            f"WARN WXN-KERNWX-EXCEEDS-RESIDUE: boot {w['number']} "
+            f"kern_WX={kern_wx} > residue_leaves={residue} (by {-delta}). "
+            f"Read-only firmware leaves can only make the audit's count "
+            f"SMALLER; the two walkers disagree about the map"]
+
+    clean, msgs = True, []
+    f = m2['fields']
+    if m2['verdict'] != 'SPLIT':
+        # M2 ran and wrote nothing.  The delta is NOT M2's, and the milestone
+        # not happening is the finding — `wxn_verdicts` raises it; here the job
+        # is only to stop attributing the delta to a stage that made no edit.
+        return True, [
+            f"note residue/kern_WX: sweep {head} — WXN-M2 is present but "
+            f"-> {m2['verdict']}, so it wrote no entry and this delta is NOT "
+            f"its doing (see the WXN-M2 warn above)"]
+
+    def g(name):
+        return _num(f.get(name))
+
+    split_2m, demote_1g = g('split_2m'), g('demote_1g')
+    nx_2m, nx_4k = g('nx_2m'), g('nx_4k')
+    nx_pdpt, nx_pt = g('nx_pdpt'), g('nx_pt')
+    already_nx, skip_user = g('already_nx'), g('skip_user')
+    keep_x, xpages = g('keep_x'), g('xpages')
+
+    terms = (split_2m, demote_1g, nx_2m, nx_4k, nx_pdpt, nx_pt, already_nx)
+    if None in terms:
+        clean = False
+        msgs.append(
+            f"WARN WXN-M2-UNREAD: boot {w['number']} the WXN-M2 line is "
+            f"present but this reader could not parse its retirement fields "
+            f"(demote_1g={f.get('demote_1g')} split_2m={f.get('split_2m')} "
+            f"nx_pdpt={f.get('nx_pdpt')} nx_2m={f.get('nx_2m')} "
+            f"nx_pt={f.get('nx_pt')} nx_4k={f.get('nx_4k')}). The delta cannot "
+            f"be attributed and MUST NOT be read as firmware read-only leaves")
+        return clean, msgs
+
+    subtree = [(n, v) for n, v in (('nx_pdpt', nx_pdpt), ('nx_pt', nx_pt),
+                                   ('skip_user', skip_user)) if v]
+    if subtree:
+        detail = ', '.join(f"{n}={v}" for n, v in subtree)
+        msgs.append(
+            f"note residue/kern_WX: sweep {head} — this delta is WXN-M2's "
+            f"splitter, not firmware read-only leaves. The closed form cannot "
+            f"be evaluated on this boot ({detail}): each of those retires or "
+            f"abandons a whole SUBTREE with one write and the wire does not "
+            f"count the leaves under it. keep_x vs kern_WX below is the check "
+            f"that still holds")
+    else:
+        expect = (residue + WXN_SPLIT_GAIN * (split_2m + demote_1g)
+                  - nx_2m - nx_4k - already_nx)
+        form = (f"{residue} + {WXN_SPLIT_GAIN}*({split_2m} split_2m + "
+                f"{demote_1g} demote_1g) - {nx_2m} nx_2m - {nx_4k} nx_4k "
+                f"- {already_nx} already_nx = {expect}")
+        if expect == kern_wx:
+            msgs.append(
+                f"ok   residue/kern_WX: sweep {head} — this delta is WXN-M2's "
+                f"SPLITTER, not firmware read-only leaves, and it closes "
+                f"exactly: {form} == kern_WX")
+        else:
+            clean = False
+            msgs.append(
+                f"WARN WXN-M2-UNRECONCILED: boot {w['number']} the WXN-M2 "
+                f"arithmetic does not close — {form}, but the audit reports "
+                f"kern_WX={kern_wx} (off by {kern_wx - expect}). M1's residue, "
+                f"M2's own retirement counts and the audit walk are three "
+                f"derivations of one number; when they disagree at least one "
+                f"walker is wrong about the map, and the delta must NOT be "
+                f"read as firmware read-only leaves")
+
+    # The kernel's own cross-check, and the one that needs no guard.
+    if keep_x is None:
+        clean = False
+        msgs.append(f"WARN WXN-M2-UNREAD: boot {w['number']} the WXN-M2 line "
+                    f"carries no readable keep_x, so the splitter's own count "
+                    f"cannot be checked against the audit walk")
+    elif keep_x == kern_wx:
+        msgs.append(f"ok   M2/kern_WX: keep_x={keep_x} == audit "
+                    f"kern_WX={kern_wx} — the splitter's count and the audit "
+                    f"walk are two independent walks of the same tables and "
+                    f"they agree")
+    elif kern_wx < keep_x:
+        msgs.append(f"note M2/kern_WX: keep_x={keep_x} vs audit "
+                    f"kern_WX={kern_wx} (short by {keep_x - kern_wx}) — the "
+                    f"audit counts W^X leaves, so an executable leaf the "
+                    f"firmware left READ-ONLY is kept by M2 and not counted by "
+                    f"the audit. That direction is explicable; reported, not "
+                    f"asserted")
+    else:
+        clean = False
+        msgs.append(
+            f"WARN WXN-M2-KEEPX-EXCEEDED: boot {w['number']} audit "
+            f"kern_WX={kern_wx} > keep_x={keep_x} (by {kern_wx - keep_x}). M2 "
+            f"kept {keep_x} leaf/leaves executable and the audit found MORE "
+            f"writable-executable kernel leaves than that — read-only firmware "
+            f"leaves can only make the audit's count SMALLER, so the two "
+            f"walkers disagree about the map")
+
+    # The third derivation, from the ELF header alone.  A NOTE and never a WARN:
+    # `xpages + 1` is the executable extent plus the AP trampoline page, and a
+    # host whose trampoline landed inside the extent would legitimately read
+    # `keep_x == xpages`.  Reported so a drift is visible without being a red on
+    # a machine nobody has booted.
+    if keep_x is not None and xpages is not None:
+        if keep_x == xpages + 1:
+            msgs.append(f"ok   M2/ELF: keep_x={keep_x} == xpages+1 = "
+                        f"{xpages + 1} (the executable extent plus the AP "
+                        f"trampoline page) — a third derivation of the same "
+                        f"number, from the ELF header alone")
+        else:
+            msgs.append(f"note M2/ELF: keep_x={keep_x} vs xpages+1 = "
+                        f"{xpages + 1} — the ELF-derived prediction and the "
+                        f"edit's own count differ by {keep_x - xpages - 1}; "
+                        f"reported, not asserted (the +1 is the trampoline "
+                        f"page, which need not lie outside the extent)")
+    return clean, msgs
 
 
 def wxn_selfchecks(w):
@@ -1597,25 +1801,12 @@ def wxn_selfchecks(w):
             msgs.append(f"WARN WXN-KERNWX-UNREAD: boot {w['number']} census "
                         f"has no readable kern_WX")
         else:
-            delta = residue - kern_wx
-            if delta >= 0:
-                msgs.append(
-                    f"ok   residue/kern_WX: sweep residue_leaves={residue}, "
-                    f"audit kern_WX={kern_wx}, delta={delta} — the audit's "
-                    f"count is the sweep's less the leaf/leaves the firmware "
-                    f"already left read-only (platform-dependent; reported, "
-                    f"not asserted)")
-            else:
-                # The one direction read-only firmware leaves cannot explain:
-                # the audit found MORE W^X kernel leaves than the sweep left
-                # behind, so one of the two walkers is wrong about the map.
+            # WHICH STAGE OWNS THE DELTA is the whole question, and it is not
+            # answerable from these two lines alone — see wxn_m2_reconcile.
+            m2clean, m2msgs = wxn_m2_reconcile(w, residue, kern_wx)
+            if not m2clean:
                 clean = False
-                msgs.append(
-                    f"WARN WXN-KERNWX-EXCEEDS-RESIDUE: boot {w['number']} "
-                    f"kern_WX={kern_wx} > residue_leaves={residue} (by "
-                    f"{-delta}). Read-only firmware leaves can only make the "
-                    f"audit's count SMALLER; the two walkers disagree about "
-                    f"the map")
+            msgs.extend(m2msgs)
     elif census and not sweep:
         msgs.append(f"note residue/kern_WX: no WXN-x86 sweep line on this "
                     f"boot — {WXN_ABSENT}; kern_WX="
@@ -1653,7 +1844,7 @@ def wxn_selfchecks(w):
 
 def print_wxn_boot(w):
     print(f"Boot {w['number']}  WXN   (build era: {w['era']})")
-    for kind, label in (('sweep', 'sweep'), ('census', 'census'),
+    for kind, label in (('sweep', 'sweep'), ('m2', 'm2'), ('census', 'census'),
                         ('nxe', 'nxe'), ('fbwc', 'fbwc')):
         if w['dups'][kind] > 1:
             print(f"  !! {label}: {w['dups'][kind]} lines in one boot — the "
@@ -1684,6 +1875,31 @@ def print_wxn_boot(w):
                   f"wp={f.get('wp', '-')}")
     else:
         print(f"  sweep : {WXN_ABSENT}")
+
+    if w.get('m2'):
+        m, f = w['m2'], w['m2']['fields']
+        print(f"  m2    : -> {m['verdict']}"
+              f"{(' ' + m['tail']) if m['tail'] else ''}")
+        if f:
+            print(f"          xseg={f.get('xseg', '-')} "
+                  f"xsegs={f.get('xsegs', '-')} xpages={f.get('xpages', '-')} "
+                  f"tramp={f.get('tramp', '-')} "
+                  f"spare_n={f.get('spare_n', '-')}")
+            print(f"          demote_1g={f.get('demote_1g', '-')} "
+                  f"split_2m={f.get('split_2m', '-')} "
+                  f"pool_used={f.get('pool_used', '-')}")
+            print(f"          retired  nx_pdpt={f.get('nx_pdpt', '-')} "
+                  f"nx_2m={f.get('nx_2m', '-')} nx_pt={f.get('nx_pt', '-')} "
+                  f"nx_4k={f.get('nx_4k', '-')}   "
+                  f"keep_x={f.get('keep_x', '-')} "
+                  f"already_nx={f.get('already_nx', '-')} "
+                  f"skip_user={f.get('skip_user', '-')}")
+            print(f"          fb={f.get('fb', '-')} "
+                  f"fb_delta={f.get('fb_delta', '-')} "
+                  f"pge={f.get('pge', '-')} flush={f.get('flush', '-')}")
+    else:
+        print(f"  m2    : no WXN-M2 line on this boot — the splitter "
+              f"(`e8b11513`) is not in this build")
 
     if w['census']:
         c, f = w['census'], w['census']['fields']
@@ -1742,6 +1958,26 @@ def wxn_verdicts(w):
         msgs.append(f"WARN WXN-REFUSED: boot {w['number']} sweep refused "
                     f"{s['tail']} — no entry was written and the kernel map is "
                     f"unprotected on this boot")
+    # M2, and the reason its terminals get their own warns rather than leaning
+    # on the kern_WX trend: a REFUSED or VACUOUS M2 leaves `kern_WX` at M1's
+    # value, so the trend reports "kern_WX never rose" — a TRUE sentence that
+    # reads as success.  The milestone failing to happen is otherwise
+    # indistinguishable from the milestone happening.
+    m2 = w.get('m2')
+    if m2 and m2['verdict'] == 'VACUOUS':
+        clean = False
+        msgs.append(
+            f"WARN WXN-M2-VACUOUS: boot {w['number']} the splitter wrote "
+            f"NOTHING (keep_x={m2['fields'].get('keep_x', '-')} "
+            f"skip_user={m2['fields'].get('skip_user', '-')}). kern_WX keeps "
+            f"M1's whole residue and every other line still reads normal")
+    elif m2 and m2['verdict'] == 'REFUSED':
+        clean = False
+        msgs.append(
+            f"WARN WXN-M2-REFUSED: boot {w['number']} the splitter refused "
+            f"{m2['tail']} — no entry was written, so the kernel map keeps "
+            f"M1's whole residue on this boot. A pool too small for the "
+            f"pre-pass is the arm the M2 playbook named as its falsifier")
     if w['census'] and w['census']['truncated']:
         clean = False
         msgs.append(
@@ -2215,6 +2451,69 @@ def find_kepler_window(chunk):
     return (start, end)
 
 
+# --- THE TIMING MODES' EXIT-CODE CHANNEL ----------------------------------
+#
+# WHY THIS EXISTS.  Four modes (--wxprobe / --slowxfer / --smc / --wxn) return
+# EXIT_FINDING=5 when they find the thing they exist to catch.  --gaps and --wcg
+# were report-only and ALWAYS exited 0 — so a GR19 probe that flipped a wc-d
+# window to `state=sealed -> UNPAID` made --wcg print
+#
+#     WARN [wc-d] win=3: coverage was never bought
+#
+# and still exit 0.  Anyone who scripts these two modes and reads `$?` is reading
+# a constant, and a warn nobody can gate on is a warn that gets scrolled past.
+# Both modes now return an exit code, and the REFUSAL path keeps the 1 it always
+# had so a caller can still tell "could not measure" (1) from "measured, and
+# here is a finding" (5).
+#
+# WHAT COUNTS AS A FINDING is deliberately narrow.  These modes report
+# MEASUREMENTS, and a slow boot is not a fault — nothing here keys on a duration.
+# Exactly two conditions qualify:
+#
+#   * the paygo honesty check firing (--wcg): a window the kernel SEALED, or one
+#     still presenting past the deferral horizon with no full-coverage pass.
+#     That is coverage that was never bought — a fault about the instrument, not
+#     a reading about the clock;
+#   * the two splitters DISAGREEING about how many boots the capture holds.
+#     --gaps/--wcg cut on `hz=`; the census half cuts on the boot-start marker.
+#     Two independent splitters converging is a cross-check these modes have
+#     always had available and never made; when they diverge, every per-boot
+#     table below is a blend of two boots and the numbers in it are measurements
+#     of nothing.  Claimed ONLY when markers were actually found, so a capture
+#     with no marker at all (a fixture, a partial log) is never accused of a
+#     disagreement it cannot have.
+
+
+def boot_marker_count(rows):
+    """How many boot-start markers the CENSUS splitter would see in these rows.
+
+    Returns 0 when the capture carries no marker at all — which is 'no claim',
+    not 'zero boots'.  Matched against the prefix-stripped body, exactly as
+    _find_markers does, so the two splitters are compared on equal terms."""
+    n = 0
+    for r in rows:
+        for spec in BOOT_MARKERS:
+            if spec['marker'].search(r['body']):
+                if spec['number_re'] and not spec['number_re'].search(r['body']):
+                    continue
+                n += 1
+                break
+    return n
+
+
+def segmentation_findings(label, rows, segments):
+    """The splitter cross-check.  Returns [message]; prints nothing."""
+    markers = boot_marker_count(rows)
+    if not markers or markers == len(segments):
+        return []
+    return [f"WARN SEGMENTATION-DISAGREES: {label}: the hz= splitter these "
+            f"timing modes cut on found {len(segments)} boot(s), while the "
+            f"boot-start marker the census half cuts on appears {markers} "
+            f"time(s). One of the two is wrong, and every per-boot table above "
+            f"is scoped by the hz= answer — a merged pair reads as one long "
+            f"boot with an invented gap where the reset was."]
+
+
 def gaps_mode(filepath, top):
     return gaps_report(filepath, read_capture(filepath), top)
 
@@ -2222,10 +2521,11 @@ def gaps_mode(filepath, top):
 def gaps_report(label, content, top):
     rows = load_rows(content)
     if not refuse_unless_logts(label, rows, '--gaps'):
-        return False
+        return EXIT_USAGE
 
     print(f"--- gaps {label} ---")
-    for n, (hz, chunk) in enumerate(segment_by_hz(rows), 1):
+    segments = segment_by_hz(rows)
+    for n, (hz, chunk) in enumerate(segments, 1):
         boot_label = f"boot {n} (hz={hz})" if hz else f"boot {n} (hz unknown)"
         print(f"{boot_label}")
         print_gap_table("whole boot", chunk, top)
@@ -2236,7 +2536,10 @@ def gaps_report(label, content, top):
         else:
             start, end = window
             print_gap_table("kepler window", chunk[start:end + 1], top)
-    return True
+    findings = segmentation_findings(label, rows, segments)
+    for f in findings:
+        print(f"  {f}")
+    return EXIT_FINDING if findings else EXIT_OK
 
 
 # --- witness-cost decomposition (--wcg) ---------------------------------
@@ -2846,18 +3149,34 @@ def wcg_mode(filepath, boot_sel):
     return wcg_report(filepath, read_capture(filepath), boot_sel)
 
 
+def wcg_paygo_findings(pg, tag, boot_n):
+    """The paygo honesty check, as findings rather than as printed prose.
+
+    Reads the SAME `warn` flag print_paygo_stats renders, so the exit code and
+    the page can never disagree — a warn on the page with a green exit is the
+    exact defect this was added to close, and computing it twice is how that
+    comes back."""
+    if pg is None:
+        return []
+    return [f"WARN [{tag}] boot {boot_n} win={w['id']}: coverage was never "
+            f"bought ({'kernel SEALED the window' if w['sealed'] else 'still '
+            'presenting past the deferral horizon with no full-coverage pass'})"
+            for w in pg['wins'] if w['warn']]
+
+
 def wcg_report(label, content, boot_sel):
     rows = load_rows(content)
     if not refuse_unless_logts(label, rows, '--wcg'):
-        return False
+        return EXIT_USAGE
 
     print(f"--- wcg {label} ---")
     segments = segment_by_hz(rows)
     if boot_sel is not None and not (1 <= boot_sel <= len(segments)):
         print(f"  --boot {boot_sel}: capture has {len(segments)} boot(s)")
-        return False
+        return EXIT_USAGE
 
     windows = 0
+    findings = []
     for n, (hz, chunk) in enumerate(segments, 1):
         if boot_sel is not None and n != boot_sel:
             continue
@@ -2869,18 +3188,25 @@ def wcg_report(label, content, boot_sel):
             # The paygo census is still worth printing: it is whole-boot scoped, so a boot
             # whose kepler anchors never appeared can still have a complete deferral story.
             for _tag in PAYGO_TAGS:
-                print_paygo_stats(paygo_stats(chunk, _tag), _tag)
+                pg = paygo_stats(chunk, _tag)
+                print_paygo_stats(pg, _tag)
+                findings += wcg_paygo_findings(pg, _tag, n)
             continue
         start, end = window
         windows += 1
         print_wcg_stats(wcg_stats(chunk[start:end + 1]))
         for _tag in PAYGO_TAGS:
-            print_paygo_stats(paygo_stats(chunk, _tag), _tag)
+            pg = paygo_stats(chunk, _tag)
+            print_paygo_stats(pg, _tag)
+            findings += wcg_paygo_findings(pg, _tag, n)
 
+    findings += segmentation_findings(label, rows, segments)
     if not windows:
         print(f"{label}: no kepler window in any boot; nothing to decompose")
-        return False
-    return True
+        return EXIT_USAGE
+    for f in findings:
+        print(f"  {f}")
+    return EXIT_FINDING if findings else EXIT_OK
 
 
 
@@ -3707,6 +4033,181 @@ WXN_FIXTURE_ALARMS = WXN_FIXTURE_BOOTW + """\
 """
 
 
+# --- --wxn: Boot Y, the FIRST capture carrying WXN-M2 ----------------------
+#
+# Real lines, quoted byte-for-byte out of the 2026-08-07 metal capture
+# (~/unaos-bench/scratch/gr19/liveness/bootY.slice.log; image built at
+# `776fb13c`).  This fixture exists because the delta between the sweep and the
+# audit stopped being zero on this boot — 1535 vs 305 — and the reader was
+# explaining that gap as firmware read-only leaves while the real cause,
+# `WXN-M2`, appeared nowhere in this file.  The arithmetic is asserted here so
+# the explanation can never drift back to a cause the tool cannot see.
+WXN_FIXTURE_BOOTY = """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B21C000 img=[0x7B21C000,0x7B8E1F00) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B21C000,0x7B34C000) xsegs=2 xpages=304 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=1 pool_used=1/16 nx_pdpt=0 nx_2m=1022 nx_pt=0 nx_4k=719 keep_x=305 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXAUDIT-0: classifier fires on W+X, clears RO-X, honours parent NX, voids on NXE=0 -> PASS ::
+[      ?ms] :: WXAUDIT x86: leaves=66558 user=0 user_WX=0 kern_WX=305 (1 MiB) tables=1029 nxe=1 walk=1721kcyc l1=0 l2=65534 l3=1024 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+"""
+
+# Five M2 alarm boots on top of the real one.  None of these is a shape this
+# reader invented: every M2 line below is Boot Y's own, with exactly one field
+# or one terminal changed, and every terminal comes from `wxn_split_stage`'s own
+# format strings.
+#
+#   boot 2 — M2 REFUSED on the pool-sizing arm, which is the falsifier the M2
+#     playbook committed to in writing.  kern_WX stays at M1's 1535, so the
+#     sweep/audit delta is ZERO and the kern_WX trend reports no rise: the
+#     milestone failing to happen looks EXACTLY like the milestone happening,
+#     and the M2 warn is the only thing that says otherwise.
+#   boot 3 — SPLIT, but nx_4k reads 700 where the map says 719.  keep_x still
+#     equals kern_WX, so this boot proves the two checks are independent: the
+#     arithmetic convicts while the cross-walk agrees.
+#   boot 4 — SPLIT with nx_pt=2: a PD-level retirement covers a whole page
+#     TABLE, and the wire does not count the leaves under it.  The closed form
+#     must report itself UNAVAILABLE rather than produce a number.
+#   boot 5 — SPLIT whose keep_x (290) is BELOW the audit's kern_WX (305).
+#     Read-only firmware leaves can only push the audit's count down, so this
+#     direction means the two walkers disagree about the map.
+#   boot 6 — VACUOUS: every descent took skip_user, the pass wrote nothing, and
+#     the line still reads like a report.
+WXN_FIXTURE_M2_ALARMS = WXN_FIXTURE_BOOTY + """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B21C000 img=[0x7B21C000,0x7B8E1F00) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B21C000,0x7B34C000) need_pd=1 need_pt=33 pool_cap=16 -> REFUSED (static pool too small; no entry written) ::
+[      ?ms] :: WXAUDIT x86: leaves=66047 user=0 user_WX=0 kern_WX=1535 (2048 MiB) tables=1028 nxe=1 walk=1720kcyc l1=0 l2=65535 l3=512 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B21C000 img=[0x7B21C000,0x7B8E1F00) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B21C000,0x7B34C000) xsegs=2 xpages=304 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=1 pool_used=1/16 nx_pdpt=0 nx_2m=1022 nx_pt=0 nx_4k=700 keep_x=305 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXAUDIT x86: leaves=66558 user=0 user_WX=0 kern_WX=305 (1 MiB) tables=1029 nxe=1 walk=1721kcyc l1=0 l2=65534 l3=1024 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B21C000 img=[0x7B21C000,0x7B8E1F00) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B21C000,0x7B34C000) xsegs=2 xpages=304 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=1 pool_used=1/16 nx_pdpt=0 nx_2m=510 nx_pt=2 nx_4k=719 keep_x=305 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXAUDIT x86: leaves=66558 user=0 user_WX=0 kern_WX=305 (1 MiB) tables=1029 nxe=1 walk=1721kcyc l1=0 l2=65534 l3=1024 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B21C000 img=[0x7B21C000,0x7B8E1F00) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B21C000,0x7B34C000) xsegs=2 xpages=304 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=1 pool_used=1/16 nx_pdpt=0 nx_2m=1022 nx_pt=0 nx_4k=734 keep_x=290 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXAUDIT x86: leaves=66558 user=0 user_WX=0 kern_WX=305 (1 MiB) tables=1029 nxe=1 walk=1721kcyc l1=0 l2=65534 l3=1024 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B21C000 img=[0x7B21C000,0x7B8E1F00) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B21C000,0x7B34C000) xsegs=2 xpages=304 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=0 pool_used=0/16 nx_pdpt=0 nx_2m=0 nx_pt=0 nx_4k=0 keep_x=0 already_nx=0 skip_user=1024 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> VACUOUS ::
+[      ?ms] :: WXAUDIT x86: leaves=66047 user=0 user_WX=0 kern_WX=1535 (2048 MiB) tables=1028 nxe=1 walk=1720kcyc l1=0 l2=65535 l3=512 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+"""
+
+
+def wxn_booty_expect(result):
+    """Boot Y read end to end — the M2 wire, and the delta it owns."""
+    w = wxn_boot(result['boots'][0])
+    vclean, vmsgs = wxn_verdicts(w)
+    sclean, smsgs = wxn_selfchecks(w)
+    joined = "\n".join(vmsgs + smsgs)
+    return [
+        ('boots parsed', len(result['boots']), 1),
+        ('M2 verdict', w['m2']['verdict'], 'SPLIT'),
+        ('M2 keep_x', w['m2']['fields']['keep_x'], '305'),
+        ('M2 pool_used survives as a ratio, not a number',
+         w['m2']['fields']['pool_used'], '1/16'),
+        ('M2 xseg survives the bracket',
+         w['m2']['fields']['xseg'], '[0x7B21C000,0x7B34C000)'),
+        ('build era names the splitter', w['era'],
+         'e8b11513+ (M1 sweep + M2 splitter)'),
+        ('verdicts clean', vclean, True),
+        ('self-checks clean', sclean, True),
+        # THE REGRESSION THIS FIXTURE EXISTS FOR.  Both halves are asserted: the
+        # delta must be attributed to M2, and the firmware sentence must be gone.
+        ('the delta is attributed to the SPLITTER',
+         'delta=1230 — this delta is WXN-M2\'s SPLITTER' in joined, True),
+        ('the closed form is printed with its terms',
+         '1535 + 511*(1 split_2m + 0 demote_1g) - 1022 nx_2m - 719 nx_4k '
+         '- 0 already_nx = 305 == kern_WX' in joined, True),
+        ('the firmware read-only sentence is NOT used on an M2 boot',
+         'firmware already left read-only' in joined, False),
+        ('keep_x is cross-walked against the audit',
+         'keep_x=305 == audit kern_WX=305' in joined, True),
+        ('the ELF derivation is the third opinion',
+         'keep_x=305 == xpages+1 = 305' in joined, True),
+        ('the histogram identity still holds after the split',
+         'histogram sums: 0 + 65534 + 1024 = 66558 == leaves=66558' in joined,
+         True),
+    ]
+
+
+def wxn_m2_alarms_expect(result):
+    """Every M2 warn proven fireable, on boots metal has not produced."""
+    blocks = [wxn_boot(b) for b in result['boots']]
+    b1, b2, b3, b4, b5, b6 = blocks
+    v2, m2msgs = wxn_verdicts(b2)
+    s2, n2 = wxn_selfchecks(b2)
+    s3, n3 = wxn_selfchecks(b3)
+    s4, n4 = wxn_selfchecks(b4)
+    s5, n5 = wxn_selfchecks(b5)
+    v6, m6 = wxn_verdicts(b6)
+    j2, j3, j4, j5 = ("\n".join(x) for x in (n2, n3, n4, n5))
+    return [
+        ('boots parsed', len(result['boots']), 6),
+        # boot 2 — REFUSED, and the trend that would call it healthy
+        ('boot 2 M2 verdict', b2['m2']['verdict'], 'REFUSED'),
+        ('boot 2 keeps the refusal reason', b2['m2']['tail'],
+         '(static pool too small; no entry written)'),
+        ('boot 2 verdicts NOT clean', v2, False),
+        ('the refusal warn names the pool arm',
+         any(m.startswith('WARN WXN-M2-REFUSED') and 'pool too small' in m
+             for m in m2msgs), True),
+        ('a refused M2 leaves kern_WX at M1\'s residue — delta 0, which the '
+         'kern_WX trend reads as healthy',
+         (b2['sweep']['residue'], _num(b2['census']['fields']['kern_WX'])),
+         (1535, 1535)),
+        ('a refused M2 is NOT credited with the delta',
+         'is NOT its doing' in j2, True),
+        # boot 3 — the arithmetic convicts while the cross-walk agrees
+        ('boot 3 self-checks NOT clean', s3, False),
+        ('the unreconciled warn shows the sum and the miss',
+         any(m.startswith('WARN WXN-M2-UNRECONCILED') and 'off by -19' in m
+             and '- 700 nx_4k' in m for m in n3), True),
+        ('the two checks are independent: keep_x still agrees on boot 3',
+         'keep_x=305 == audit kern_WX=305' in j3, True),
+        # boot 4 — a subtree retirement makes the closed form unavailable
+        ('boot 4 says the closed form cannot be evaluated',
+         'closed form cannot be evaluated' in j4 and 'nx_pt=2' in j4, True),
+        ('boot 4 still attributes the delta to M2 rather than to firmware',
+         ("this delta is WXN-M2's splitter" in j4,
+          'firmware already left read-only' in j4), (True, False)),
+        ('an unavailable closed form is not a WARN on its own', s4, True),
+        # boot 5 — the audit outcounts the splitter
+        ('boot 5 self-checks NOT clean', s5, False),
+        ('the keep_x warn says the walkers disagree',
+         any(m.startswith('WARN WXN-M2-KEEPX-EXCEEDED') and
+             'walkers disagree' in m for m in n5), True),
+        # boot 6 — VACUOUS
+        ('boot 6 M2 verdict', b6['m2']['verdict'], 'VACUOUS'),
+        ('boot 6 verdicts NOT clean', v6, False),
+        ('the vacuous warn names the skip that caused it',
+         any(m.startswith('WARN WXN-M2-VACUOUS') and 'skip_user=1024' in m
+             for m in m6), True),
+        # and the boot that is fine stays fine
+        ('boot 1 is still clean beside five alarm boots',
+         (wxn_verdicts(b1)[0], wxn_selfchecks(b1)[0]), (True, True)),
+    ]
+
+
 def wxn_bootw_expect(result):
     """Boot W, the real 32724cb4 lines, read end to end.
 
@@ -3852,6 +4353,12 @@ def selftest_wxn():
         ('WXN: four alarm boots — VACUOUS, histogram mismatch + TRUNCATED, '
          'REFUSED + NXE FAIL, pre-a0a2d163 absence',
          WXN_FIXTURE_ALARMS, wxn_alarms_expect),
+        ('WXN: Boot Y, the first capture carrying WXN-M2 (the delta the '
+         'reader used to blame on firmware)', WXN_FIXTURE_BOOTY,
+         wxn_booty_expect),
+        ('WXN: five M2 alarm boots — REFUSED, arithmetic unreconciled, a '
+         'subtree retirement, keep_x exceeded, VACUOUS',
+         WXN_FIXTURE_M2_ALARMS, wxn_m2_alarms_expect),
     ):
         print(f"=== selftest: {name} ===")
         result = parse_content(f'<{name}>', text)
@@ -3878,6 +4385,10 @@ def selftest_wxn():
          EXIT_FINDING),
         ('--wxn on a capture with no WXN/WXAUDIT lines exits NO_DATA',
          SELFTEST_NO_GR18_WIRE, EXIT_NO_DATA),
+        ('--wxn on Boot Y (WXN-M2 present, everything reconciles) exits OK',
+         WXN_FIXTURE_BOOTY, EXIT_OK),
+        ('--wxn on the M2 alarm capture exits FINDING', WXN_FIXTURE_M2_ALARMS,
+         EXIT_FINDING),
     ):
         result = parse_content(f'<{label}>', fixture)
         buf = io.StringIO()
@@ -3917,6 +4428,29 @@ def selftest_wxn():
     return ok
 
 
+# --- --gaps: the two-splitter cross-check ----------------------------------
+#
+# Two boots, each carrying BOTH splitters' evidence: an `hz=` token (what the
+# timing modes cut on) and a ':: X86_64 Memory Init ::' marker (what the census
+# half cuts on).  The stamp resets between them, which is the reset the hz cut is
+# refined to.
+GAPS_FIXTURE_TWO_BOOTS = """\
+[      1ms] :: X86_64 Memory Init ::
+[    100ms] Initializing Kepler
+[    200ms] :: GPACE: span=100ms anchor=enum:p1 since-entry=200ms hz=111 == the pci-usb d= split ::
+[    300ms] :: BPACE: total gui=300ms ftdi=none n=3 dropped=0 hz=111 result=LEDGER ::
+[      1ms] :: X86_64 Memory Init ::
+[    100ms] Initializing Kepler
+[    200ms] :: GPACE: span=100ms anchor=enum:p1 since-entry=200ms hz=222 == the pci-usb d= split ::
+[    300ms] :: BPACE: total gui=300ms ftdi=none n=3 dropped=0 hz=222 result=LEDGER ::
+"""
+
+# The same capture with every `hz=` token destroyed.  The timing modes then see
+# ONE boot with an impossible gap in the middle of it and a 'boot 1 (hz unknown)'
+# label; the marker table still sees two.  Before GR19 this printed at exit 0.
+GAPS_FIXTURE_HZ_LOST = GAPS_FIXTURE_TWO_BOOTS.replace('hz=', 'hz#')
+
+
 def selftest_timing(top):
     """Fixtures for both timing modes.
 
@@ -3934,32 +4468,45 @@ def selftest_timing(top):
     the coverage WARN."""
     ok = True
 
-    for name, text, expect_ok in (
-        ('gaps: mixed (numeric + ?ms + deferred)', SELFTEST_MIXED, True),
-        ('gaps: all-?ms (counter never calibrated)', SELFTEST_ALL_UNKNOWN, False),
+    # EXIT CODES, not booleans: GR19 gave both timing modes the EXIT_FINDING
+    # channel the four section modes already had, so every case here names the
+    # code it expects.  EXIT_USAGE is the refusal these two always had.
+    for name, text, want in (
+        ('gaps: mixed (numeric + ?ms + deferred)', SELFTEST_MIXED, EXIT_OK),
+        ('gaps: all-?ms (counter never calibrated)', SELFTEST_ALL_UNKNOWN,
+         EXIT_USAGE),
+        ('gaps: two boots whose hz tokens were destroyed — the splitters '
+         'disagree and it must NOT exit clean', GAPS_FIXTURE_HZ_LOST,
+         EXIT_FINDING),
+        ('gaps: the same two boots intact — the splitters agree',
+         GAPS_FIXTURE_TWO_BOOTS, EXIT_OK),
     ):
         print(f"=== selftest: {name} ===")
         got = gaps_report(f'<{name}>', text, top)
-        verdict = 'PASS' if got == expect_ok else 'FAIL'
-        if got != expect_ok:
+        verdict = 'PASS' if got == want else 'FAIL'
+        if got != want:
             ok = False
         print(f"=== selftest: {name}: {verdict} "
-              f"(expected {'ok' if expect_ok else 'failure'}, got "
-              f"{'ok' if got else 'failure'})\n")
+              f"(expected exit {want}, got exit {got})\n")
 
-    for name, text, expect_ok, checker in (
+    for name, text, want_rc, checker in (
         ('wcg: real s73 kepler window (witness-armed, no prof lines)',
-         WCG_FIXTURE_S73, True, wcg_expect),
+         WCG_FIXTURE_S73, EXIT_OK, wcg_expect),
         ('wcg: synthetic window WITH [wc-g] prof lines',
-         WCG_FIXTURE_PROF, True, wcg_prof_expect),
+         WCG_FIXTURE_PROF, EXIT_OK, wcg_prof_expect),
         ('wcg: real GR17 boot-7 paygo wire (lattice pass 1, deferred full passes)',
-         WCG_FIXTURE_PAYGO, True, wcg_paygo_expect),
-        ('wcg: no logts prefixes (must refuse)', WCG_FIXTURE_NO_LOGTS, False, None),
-        ('wcg: no kepler window (must refuse)', WCG_FIXTURE_NO_WINDOW, False, None),
+         WCG_FIXTURE_PAYGO, EXIT_OK, wcg_paygo_expect),
+        ('wcg: a deferral that NEVER PAID — the coverage warn must reach the '
+         'EXIT CODE and not only the page',
+         WCG_FIXTURE_PAYGO_WARN, EXIT_FINDING, None),
+        ('wcg: no logts prefixes (must refuse)', WCG_FIXTURE_NO_LOGTS,
+         EXIT_USAGE, None),
+        ('wcg: no kepler window (must refuse)', WCG_FIXTURE_NO_WINDOW,
+         EXIT_USAGE, None),
     ):
         print(f"=== selftest: {name} ===")
         got = wcg_report(f'<{name}>', text, None)
-        case_ok = got == expect_ok
+        case_ok = got == want_rc
         if case_ok and checker:
             st = wcg_window_stats(text)
             if st is None:
@@ -3975,8 +4522,7 @@ def selftest_timing(top):
         if not case_ok:
             ok = False
         print(f"=== selftest: {name}: {'PASS' if case_ok else 'FAIL'} "
-              f"(expected {'ok' if expect_ok else 'refusal'}, got "
-              f"{'ok' if got else 'refusal'})\n")
+              f"(expected exit {want_rc}, got exit {got})\n")
 
     # The paygo census is WHOLE-BOOT scoped, so it is asserted through its own entry point
     # rather than through the kepler-window helper above. Doing it any other way is the very
@@ -4052,6 +4598,28 @@ def selftest_timing(top):
     for label, good in wired:
         print(f"    {'ok ' if good else 'BAD'} {label}: got {good!r}, want True")
     print(f"=== selftest: paygo: report wiring: {'PASS' if wired_ok else 'FAIL'}\n")
+
+    # The sealed window in that same fixture must reach the EXIT CODE, not only
+    # the page.  Asserted through the report function a `--wcg` run actually
+    # calls, for the reason the wiring case above exists.
+    print("=== selftest: paygo: a sealed window reaches the EXIT CODE ===")
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        _rc = wcg_report('<sealed exit-code fixture>', WCD_FIXTURE_ABORT, None)
+    sealed = [
+        ("--wcg exits FINDING on a capture whose window was SEALED",
+         _rc, EXIT_FINDING),
+        ("the warn is on the page as well as in the code",
+         'coverage was never bought' in _buf.getvalue(), True),
+    ]
+    sealed_ok = all(a == b for _, a, b in sealed)
+    if not sealed_ok:
+        ok = False
+    for label, actual, want in sealed:
+        print(f"    {'ok ' if actual == want else 'BAD'} {label}: "
+              f"got {actual!r}, want {want!r}")
+    print(f"=== selftest: paygo: sealed exit code: "
+          f"{'PASS' if sealed_ok else 'FAIL'}\n")
 
     print("=== selftest: paygo: instruments that emitted nothing must report ABSENCE ===")
     absent = [
@@ -4273,21 +4841,20 @@ def main():
 
     # The TIMING modes cut the capture on 'hz=' rather than on the boot-marker
     # table (see the module docstring), so they run off their own file read and
-    # are selected first.  Their exit is 0/1 as it always was: these two answer a
-    # measurement question, and 'refused' is their only failure.
+    # are selected first.  Their exits are EXIT_OK / EXIT_USAGE (refused: the
+    # measurement could not be taken) / EXIT_FINDING (measured, and the report
+    # carries a finding) — worst across the files, as the section modes do it.
     if args.wcg:
-        ok = True
+        worst = EXIT_OK
         for log_file in args.logs:
-            if not wcg_mode(log_file, args.boot):
-                ok = False
-        sys.exit(EXIT_OK if ok else 1)
+            worst = max(worst, wcg_mode(log_file, args.boot))
+        sys.exit(worst)
 
     if args.gaps:
-        ok = True
+        worst = EXIT_OK
         for log_file in args.logs:
-            if not gaps_mode(log_file, args.top):
-                ok = False
-        sys.exit(EXIT_OK if ok else 1)
+            worst = max(worst, gaps_mode(log_file, args.top))
+        sys.exit(worst)
 
     # The GR18 sections are per-boot readers over the same parse the census
     # uses, so they share parse_log and are selected here rather than each
