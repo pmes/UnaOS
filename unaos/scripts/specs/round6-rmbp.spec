@@ -117,3 +117,49 @@ REQUIRE S5: cross-process read serves LIVE shared backing
 # The service-task boot line gained ", PRIO_HIGH" — the existing REQUIRE prefix still matches.
 # u6gx's unchanged PASS line is now ALSO the deadlock-closure witness knob-on-FAT (a u6gx
 # hang/FAIL here = the S5 scheduler fix or the service core's LVT timer, NOT plain ACL).
+
+# --- GR18 WXN-x86 / WXAUDIT: the kernel map's NX sweep and its census ---------------------------
+# --- REQUIRE, not PENDING, and this file's own rule is what decides it: PENDING means "landed but
+# --- never captured on metal". These four lines HAVE been captured on metal — 2026-08-06, attended
+# --- rMBP, boots W and X, both clean — so they are promoted on arrival exactly as S8-write and
+# --- S9-grow were after their first attended capture. Metal evidence, quoted rather than claimed:
+# ---   :: WXN-x86: ehdr=0x7B233000 … pdpt_seen=1024 nx_set=1022 … residue_leaves=1535 … -> SWEPT ::
+# ---   :: WXAUDIT x86: leaves=66047 user=0 user_WX=0 kern_WX=1535 (2048 MiB) … l1=0 l2=65535 l3=512 ::
+# ---   :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+# ---   :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+# --- `wp=0` on this bench is the rMBP firmware leaving CR0.WP clear (QEMU leaves it 1); M1 does not
+# --- set it and NX enforcement does not depend on it, so the pattern shapes `wp=`/`wp_mask=` rather
+# --- than pinning them. `kern_WX=1535` is the sweep's own `residue_leaves` re-counted by an
+# --- independent walk — an asserted zero only at M3, so it is not pinned by value here either.
+# --- THE VPERF NEIGHBOUR, worth one line because this bench is where it was decided: WXN-FBWC is
+# --- the GR15 tripwire on the very framebuffer leaf the `vperf: fbmem … pat=WC eff=WC` REQUIRE
+# --- above asserts. `-> LEAF BIT-IDENTICAL` says the NX sweep did not disturb it; `pat=1` in that
+# --- line is the same WC typing, read at PTE level. The two now cover the leaf from both sides.
+# ---
+# --- KNOB-INDEPENDENT, which is why the block is duplicated into this bench file at all: unlike
+# --- every other GR18 wire (SMC needs UNAOS_SMC, paygo needs UNAOS_WCG_PAYGO, M8/igpu-blt need
+# --- their own), these fire on ANY x86 build. `wxn_pdpt_sweep`/`wx_audit_report` are called with no
+# --- `#[cfg]` from `arch::init` (arch/x86_64/mod.rs:46, :50) and `wxn_nxe_report` (smp.rs:108) from
+# --- `start_aps` on every exit path — so this knob-ON VIDEOBENCH+USBDEBUG build carries them just
+# --- as the default and witness builds do.
+# --- x86-witness.spec IS THE MASTER COPY of these eight patterns and of the full reasoning for each
+# --- (the two WXN terminals are structurally exclusive with the SWEPT REQUIRE and earn their lines
+# --- as DIAGNOSIS — mbench prints the offending line for a FORBID hit and only a pattern for a
+# --- missing REQUIRE; the WXAUDIT REQUIRE pins the pre-existing fields in ORIGINAL ORDER and stops
+# --- at `l3=` so the appended-optional ` TRUNCATED` token needs its own rule; WXAUDIT-NXE gets NO
+# --- FORBID because its FAIL arm ends `-> FAIL ::` and the defaults already catch it; the correct
+# --- `-> LEAF NX-ONLY` FBWC arm is deliberately NOT accepted until a 1 GiB-fb capture exists).
+# --- EDITS MUST BE PAIRED — the same eight lines are byte-identical in x86-witness.spec,
+# --- x86-fat.spec and rmbp-boot.spec.
+# --- SCOPE, MINIMUM BUILD GENERATION `32724cb4` (2026-08-06): a second axis on this file, separate
+# --- from its knob-ON build. The 2026-07-11 Boot-1 capture this spec was written against predates
+# --- the sweep and reds all four REQUIREs — its kernel could not print them. Date a capture before
+# --- reading a red here.
+REQUIRE :: WXN-x86: ehdr=0x[0-9A-F]+ img=\[0x[0-9A-F]+,0x[0-9A-F]+\) .*pdpt_seen=[0-9]+ nx_set=[0-9]+ .*residue_leaves=[0-9]+ .*wp=[0-9]+ -> SWEPT ::
+FORBID :: WXN-x86: .*-> VACUOUS ::
+FORBID :: WXN-x86: .*-> REFUSED
+REQUIRE :: WXAUDIT x86: leaves=[0-9]+ user=[0-9]+ user_WX=[0-9]+ kern_WX=[0-9]+ \([0-9]+ MiB\) tables=[0-9]+ nxe=[0-9]+ walk=[0-9]+kcyc l1=[0-9]+ l2=[0-9]+ l3=[0-9]+
+FORBID :: WXAUDIT x86: .* TRUNCATED ::
+REQUIRE :: WXAUDIT-NXE: cores=[0-9]+ nxe=[0-9]+ nxe_mask=0x[0-9A-F]+ wp=[0-9]+ wp_mask=0x[0-9A-F]+ -> PASS ::
+REQUIRE :: WXN-FBWC: fb=0x[0-9A-F]+ lvl=[0-9]+ e=0x[0-9A-F]{16} pat=[0-9]+ pcd=[0-9]+ pwt=[0-9]+ w=[0-9]+ fx=[0-9]+ -> LEAF BIT-IDENTICAL ::
+FORBID :: WXN-FBWC: .*-> SKIPPED ::
