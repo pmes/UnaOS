@@ -1198,7 +1198,13 @@ What the review narrowed, and what this change does about it:
   `Absent`, every `Err` — now returns through `close_transaction()`. (The pre-command
   `settle_before_command()` stays outside that wrapper: if it fails, no command of ours was written
   and there is no transaction of ours to close.) The equivalent gap on `read_key_inner`'s own error
-  paths remains open and is not in this change's scope.
+  paths is **now closed too**, by the same split the sibling fix used: the READ conversation moved
+  into `value_txn`, `read_key_inner` calls it and then `close_transaction()` unconditionally, and
+  `settle_before_command()` stays outside the wrapper on the identical argument. Every exit of a
+  value read — `Ok`, `Absent`, `Stuck(0..=3)` — now drains its own transaction; before this, only
+  the `Ok` path did, so any wedged or absent key leaked its residue to whichever key came next.
+  Prediction: `rok=` should stay 0 across long sits now that no path can leak (Boot U's `rok=1` was
+  the walk's fingerprint, Boot W's `rok=0` was clean but incidental).
 * **`Gap::StillOpen` was unmeasured.** `close_transaction` reported only when it *failed* to close.
   If the delayed byte arrived a moment after `gap_wait` gave up, the drain read it, discarded it,
   reached `CMD_DONE` and incremented nothing — so `unc=0` did **not** mean "no truncation", and

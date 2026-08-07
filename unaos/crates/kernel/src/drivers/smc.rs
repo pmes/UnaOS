@@ -574,9 +574,32 @@ fn read_key_inner(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
     // 0) settle any residue from a prior (interrupted) transaction so step-0 starts clean (M2
     //    idle-guard). No-op on an idle SMC — byte-identical on QEMU. Now FALLIBLE: if the residue
     //    cannot be cleared, the command is not issued into it and the caller gets `Stuck(4)` naming
-    //    that, rather than a `Stuck(0)` 109 ms later that blames the wrong step.
+    //    that, rather than a `Stuck(0)` 109 ms later that blames the wrong step. Outside the
+    //    close-wrapper deliberately, for the same reason as `read_key_by_index`: if the settle
+    //    fails, no command of OURS has been written, there is no transaction of ours to close, and
+    //    the settle has already drained for its own budget. Charging an `unc` here would blame this
+    //    call for the previous one's mess.
     settle_before_command()?;
+    // Everything past the command write is wrapped so that no exit path can leave the transaction
+    // open. Until GR18 only the `Ok` path closed: a `Stuck(0)`/`Stuck(1)`/`Stuck(2)`/`Stuck(3)` or a
+    // clean `Absent` returned with the conversation wide open and handed its residue to the next
+    // key — the residue-charged-to-the-next-key defect `close_transaction` exists to end. The
+    // sibling fix (`read_key_by_index`'s `index_txn` split) closed exactly this class on the
+    // enumeration path and left this one flagged as the remainder; this is that remainder.
+    //
+    // PREDICTION: `rok=` (settles that started dirty and were rescued) should trend to 0 across long
+    // sits once no path can leak. Boot U's `rok=1` was the walk's leak fingerprint; Boot W's `rok=0`
+    // already reads clean, but only because the *reads* happened not to fail — with both siblings
+    // wrapped, `rok=0` becomes structural rather than lucky, and a non-zero `rok` from here on means
+    // residue arriving from outside our own transactions.
+    let r = value_txn(key, out);
+    close_transaction();
+    r
+}
 
+/// The READ conversation proper. Split out so `read_key_inner` can close the transaction on every
+/// return without duplicating the call at each `?` — the same shape as `index_txn`.
+fn value_txn(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
     // 1) command byte -> expect NEW_CMD|ACK.
     //
     // STEP0-PRE (s73, 2026-08-06): latch the status the instant BEFORE the command write. The
@@ -659,9 +682,9 @@ fn read_key_inner(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
     // CLOSE OUR OWN TRANSACTION (s73). Whatever `n` came out, the SMC may still be mid-value — we
     // may have hit `out.len()`, or given up in a gap. Leaving it open is what hands the next key a
     // DATA_READY residue, which is the whole B0AV wedge: BRSC truncates, B0AV inherits it. Closing
-    // here is bounded, read-only (data reads are the protocol's own cursor-advance) and cannot
-    // change `n` — the caller's value is already in hand.
-    close_transaction();
+    // is bounded, read-only (data reads are the protocol's own cursor-advance) and cannot change
+    // `n` — the caller's value is already in hand. It now happens in `read_key_inner`, on this
+    // return and on every error return alongside it.
     Ok(n)
 }
 
