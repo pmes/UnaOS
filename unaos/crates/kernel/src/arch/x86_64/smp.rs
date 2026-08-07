@@ -82,8 +82,20 @@ pub fn online_aps() -> Vec<usize> {
 static NXE_MASK: AtomicU64 = AtomicU64::new(0);
 static WP_MASK: AtomicU64 = AtomicU64::new(0);
 
+// WXN-x86 M3a: the per-core CR0 WITNESS. `WP_MASK` records a single BIT per core (bit `idx` set iff
+// that core's CR0.WP was 1); this records the WHOLE CR0 register the bit was read from, at that
+// core's own index. The masks alone let an analyzer count how many cores armed WP, but they carry
+// no reading it can cross-check a mask bit AGAINST: `wp_mask=0xFF` asserts eight cores armed, and
+// nothing on the wire lets a reader confirm bit 7 belongs to a core whose real CR0.WP is 1. Bit 0
+// (the BSP) is stated a second time by WXPROBE and the sweep, so it is cross-checkable; bits 1..7
+// (the APs) were not, because NO OTHER LINE reads an AP's CR0. This array is that missing reading —
+// each AP fills its own slot as it records (below), and the BSP publishes the whole array in ONE
+// line (`wxn_cores_report`) once every AP is up. `MAX_CPUS` entries, `.bss`-resident, zero-init.
+static CORE_CR0: [AtomicU64; gdt::MAX_CPUS] = [const { AtomicU64::new(0) }; gdt::MAX_CPUS];
+
 /// OR this core's `EFER.NXE` and `CR0.WP` into the witness masks, at bit `idx` (the logical CPU
-/// index). Reads two live registers on the core that calls it — never a cached or inherited value.
+/// index), and store its FULL live CR0 into `CORE_CR0[idx]`. Reads two live registers on the core
+/// that calls it — never a cached or inherited value.
 fn wxn_record_core(idx: usize) {
     const IA32_EFER: u32 = 0xC000_0080;
     const EFER_NXE: u64 = 1 << 11;
@@ -96,8 +108,19 @@ fn wxn_record_core(idx: usize) {
     if efer & EFER_NXE != 0 {
         NXE_MASK.fetch_or(1u64 << idx, Ordering::SeqCst);
     }
-    if x86_64::registers::control::Cr0::read_raw() & CR0_WP != 0 {
+    // Read CR0 ONCE and use it for both the mask bit and the witness store, so the bit and the
+    // register it is cross-checked against can never come from two different reads.
+    let cr0 = x86_64::registers::control::Cr0::read_raw();
+    if cr0 & CR0_WP != 0 {
         WP_MASK.fetch_or(1u64 << idx, Ordering::SeqCst);
+    }
+    // The per-core CR0 witness. Stored at `idx` (guarded to the array's length; the shift guard
+    // above is over 64, this is over MAX_CPUS) and BEFORE `ap_entry`'s `AP_ONLINE.fetch_add` — the
+    // SAME publication point that makes this core's WP_MASK bit visible to the BSP — so a bit the
+    // BSP can see set is a bit whose witness the BSP can also read. SeqCst pairs with the BSP's
+    // SeqCst `AP_ONLINE` load in `start_aps`, exactly as `WP_MASK` already does.
+    if idx < gdt::MAX_CPUS {
+        CORE_CR0[idx].store(cr0, Ordering::SeqCst);
     }
 }
 
@@ -134,6 +157,51 @@ fn wxn_nxe_report(cores: u32) {
         wp_armed,
         wp,
         if armed == cores && wp_armed == cores { "PASS" } else { "FAIL" }
+    );
+    // The per-core CR0 witness line, right after the census it cross-checks. One line, BSP-emitted.
+    wxn_cores_report(cores);
+}
+
+/// A `core::fmt::Write` sink over a fixed stack buffer — no heap, so the witness line costs nothing
+/// but the buffer's stack frame on the BSP. Writes past the end are silently dropped (the buffer is
+/// sized for MAX_CPUS 16-digit values with room to spare, so this cannot happen for a real CR0).
+struct CoreBuf {
+    buf: [u8; 320],
+    len: usize,
+}
+
+impl core::fmt::Write for CoreBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        let end = core::cmp::min(self.len + b.len(), self.buf.len());
+        self.buf[self.len..end].copy_from_slice(&b[..end - self.len]);
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// Publish the per-core CR0 witness in ONE serial line, BSP-emitted, from the array the APs filled.
+/// `cores` is the census's core count (BSP + online APs); the first `cores` slots of `CORE_CR0` are
+/// the ones those cores stored — the same publication ordering that makes `WP_MASK`'s bits valid,
+/// so every slot printed here is one the BSP has already observed. The line lets an analyzer
+/// cross-check each bit of `wp_mask` against bit 16 (CR0.WP) of the SAME core's real CR0 — closing
+/// the AP-bit gap the census masks could assert but not witness. It changes no state and no verdict.
+fn wxn_cores_report(cores: u32) {
+    use core::fmt::Write as _;
+    let n = core::cmp::min(cores as usize, gdt::MAX_CPUS);
+    let mut cb = CoreBuf { buf: [0u8; 320], len: 0 };
+    for i in 0..n {
+        let cr0 = CORE_CR0[i].load(Ordering::SeqCst);
+        // Comma-separated, no leading comma. Writing into a fixed buffer cannot fail meaningfully.
+        let _ = write!(cb, "{}0x{:X}", if i == 0 { "" } else { "," }, cr0);
+    }
+    let arr = core::str::from_utf8(&cb.buf[..cb.len]).unwrap_or("<utf8>");
+    serial_println!(
+        ":: WXAUDIT-CORES: n={} cr0=[{}] wp=0x{:X} nxe=0x{:X} ::",
+        n,
+        arr,
+        WP_MASK.load(Ordering::SeqCst),
+        NXE_MASK.load(Ordering::SeqCst),
     );
 }
 
