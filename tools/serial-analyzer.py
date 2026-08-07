@@ -1474,6 +1474,13 @@ WXN_M2_RE = re.compile(
 WXN_CENSUS_RE = re.compile(r'^\s*::\s*WXAUDIT\s+x86:\s*(.*?)\s*::\s*$')
 WXN_NXE_RE = re.compile(
     r'^\s*::\s*WXAUDIT-NXE:\s*(.*?)\s*->\s*(\S+)\s*::\s*$')
+# GR20 — the per-core CR0 WITNESS line (`wxn_cores_report`, smp.rs).  It carries
+# `n=`, a bracketed `cr0=[0x..,0x..,..]` array with NO spaces inside the brackets
+# (so _kv()'s `\S+` reads the whole array as one value), and `wp=`/`nxe=` re-prints
+# of the two census masks.  It has NO `-> VERDICT` tail — the verdict is the
+# analyzer's to compute, not the kernel's to assert — so it does not go through
+# WXN_NXE_RE's shape.
+WXN_CORES_RE = re.compile(r'^\s*::\s*WXAUDIT-CORES:\s*(.*?)\s*::\s*$')
 WXN_FBWC_RE = re.compile(r'^\s*::\s*WXN-FBWC:\s*(.*?)\s*->\s*(.*?)\s*::\s*$')
 # `residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1)` — its own reader, because the
 # breakdown's keys start with a DIGIT and the generic _kv() scanner (whose names
@@ -1519,6 +1526,29 @@ def _wxn_hexmask(text):
         return int(text, 16)
     except ValueError:
         return None
+
+
+def _wxn_cr0_list(text):
+    """Parse `[0x..,0x..,..]` (the WXAUDIT-CORES `cr0=` array) into a list of
+    ints.  None when the field is absent or not a bracketed hex list, and None
+    (not a partial list) when ANY element fails to parse — a per-core witness
+    this reader could only half-read must be reported unchecked, never
+    cross-checked against a guess.  `[]` is the empty array, distinct from None."""
+    if text is None:
+        return None
+    t = text.strip()
+    if not (t.startswith('[') and t.endswith(']')):
+        return None
+    inner = t[1:-1].strip()
+    if not inner:
+        return []
+    out = []
+    for tok in inner.split(','):
+        v = _wxn_hexmask(tok.strip())
+        if v is None:
+            return None
+        out.append(v)
+    return out
 
 
 def _wxn_wp_target(cores):
@@ -1643,7 +1673,7 @@ def wxn_boot(boot):
 
     Every one of the four wires is optional and each records its own absence,
     because the eras above mean 'not in this boot' is three different facts."""
-    sweep = census = nxe = fbwc = m2 = probe_cpu = None
+    sweep = census = nxe = fbwc = m2 = probe_cpu = cores_line = None
     dups = Counter()
     for line, probe_line in zip(boot['lines'], boot['probe']):
         mm = WXN_M2_RE.match(probe_line)
@@ -1693,6 +1723,14 @@ def wxn_boot(boot):
             fbwc = {'fields': _kv(m.group(1)), 'verdict': m.group(2),
                     'line': line}
             continue
+        # GR20 — the per-core CR0 witness.  Parsed with the generic _kv scanner:
+        # the `cr0=[..]` array has no spaces inside its brackets, so `\S+` reads
+        # it whole and `_wxn_cr0_list` splits it below.  Last one wins.
+        m = WXN_CORES_RE.match(probe_line)
+        if m:
+            dups['cores'] += 1
+            cores_line = {'fields': _kv(m.group(1)), 'line': line}
+            continue
         # The BSP's OTHER statement of CR0.WP.  Read HERE, inside this boot's
         # own loop, rather than borrowed from `wxprobe_boot`: the cross-check
         # below is sound only between lines the SAME boot printed, and scoping
@@ -1705,7 +1743,7 @@ def wxn_boot(boot):
     # `probe_cpu` is deliberately NOT in this tuple: a WXPROBE `cpu:` line is a
     # corroborating witness, not a WXN wire, so a boot carrying it and nothing
     # else is still a boot with no WXN block — unchanged from before.
-    if not any((sweep, census, nxe, fbwc, m2)):
+    if not any((sweep, census, nxe, fbwc, m2, cores_line)):
         return None
     # The build era, read off the wires themselves rather than off a version
     # string the capture does not carry.
@@ -1719,7 +1757,7 @@ def wxn_boot(boot):
         era = 'pre-a0a2d163 (WXAUDIT census only)'
     return {'number': boot['number'], 'sweep': sweep, 'census': census,
             'nxe': nxe, 'fbwc': fbwc, 'm2': m2, 'probe_cpu': probe_cpu,
-            'era': era, 'dups': dups,
+            'cores_line': cores_line, 'era': era, 'dups': dups,
             'modern': (census and census['hist']) or bool(fbwc)}
 
 
@@ -2157,6 +2195,132 @@ def wxn_selfchecks(w):
                 f"note WXAUDIT-NXE line arithmetic: {'; '.join(unread)} — this "
                 f"reader could not read one of the pair, so that count/mask "
                 f"identity was NOT checked, which is not the same as passing")
+
+    # 6. THE PER-CORE CR0 WITNESS (GR20, RESIDUAL-1).  Checks 4 and 5 were the
+    #    most this file could do while the ONLY reading of an AP's CR0.WP was the
+    #    mask bit itself: check 4 corroborates bit 0 (the BSP states it three
+    #    times), check 5 holds each count against its own mask (a lost bit, any
+    #    position).  Neither reaches what RESIDUAL-1 named — a mask bit set to 1
+    #    on a core whose REAL CR0.WP is 0, honestly counted, with no second
+    #    reading of that core's register to contradict it.  Bits 1..7 name APs
+    #    and no line read an AP's CR0.
+    #
+    #    The WXAUDIT-CORES line is that reading.  `wxn_cores_report` (smp.rs)
+    #    publishes `CORE_CR0[i]` — the FULL CR0 core i read at the instant it set
+    #    its own `wp_mask` bit — for every core the census counted.  So bit 16 of
+    #    cr0[i] and bit i of `wp` are two statements of ONE register on ONE core,
+    #    taken from ONE read (`wxn_record_core` reads CR0 once and both sets the
+    #    mask bit and stores the witness from it), and they cannot honestly
+    #    differ.  THIS SUPERSEDES THE BY-EYE AP MITIGATION: the AP bits check 4
+    #    could only leave "un-cross-checked" now have a witness, for every core
+    #    the line carries.
+    #
+    #    NXE is deliberately NOT witnessed per core here.  The line carries CR0
+    #    only (the M3a target is CR0.WP), and NXE is an EFER bit CR0 does not
+    #    hold; a per-core EFER array was not added because per-core NXE is already
+    #    covered three ways — check 5's popcount reaches every `nxe_mask` bit,
+    #    check 3 holds `nxe` against `cores`, and an AP that reached `ap_entry`
+    #    with EFER.NXE clear dies at its first NX'd access (smp.rs's own note), so
+    #    a booted AP is a witness that its NXE is set.  What check 6 DOES cross
+    #    the NXE mask for is CONSISTENCY: WXAUDIT-CORES re-prints `nxe=` from the
+    #    same static WXAUDIT-NXE prints as `nxe_mask=`, and the two must agree.
+    #
+    #    ERA-SAFE: a boot with no WXAUDIT-CORES line (every boot before this arc,
+    #    Boot AA included) is NOTED as carrying no per-core witness and never
+    #    convicted — the AP-bit gap simply stands as check 4 left it, exactly as
+    #    before.  Checks 1-5 above are untouched; this is added alongside.
+    cores_line = w.get('cores_line')
+    if not cores_line:
+        if nxe or w['sweep'] or w['census']:
+            msgs.append(
+                f"note per-core CR0 witness: no WXAUDIT-CORES line on this boot "
+                f"— the kernel that printed it predates the per-core CR0 array "
+                f"(GR20), so wp_mask's AP bits stand as check 4 left them (bit 0 "
+                f"corroborated, bits 1.. by count only). Absent, not confirmed")
+    else:
+        cf = cores_line['fields']
+        n = _num(cf.get('n'))
+        cr0s = _wxn_cr0_list(cf.get('cr0'))
+        cwp = _wxn_hexmask(cf.get('wp'))
+        cnxe = _wxn_hexmask(cf.get('nxe'))
+        if cr0s is None or n is None:
+            msgs.append(
+                f"note per-core CR0 witness: boot {w['number']} carries a "
+                f"WXAUDIT-CORES line this reader could not fully parse "
+                f"(n={cf.get('n')} cr0={cf.get('cr0')}), so the per-core "
+                f"cross-check did NOT run — not the same as passing")
+        else:
+            # (a) the line's own array against its own count.
+            if len(cr0s) != n:
+                clean = False
+                msgs.append(
+                    f"WARN WXN-CORE-XCHECK: boot {w['number']} WXAUDIT-CORES says "
+                    f"n={n} but carries {len(cr0s)} cr0 value(s) "
+                    f"(cr0={cf.get('cr0')}). The array and its own count are one "
+                    f"line from one loop, so a disagreement is corruption in "
+                    f"transit or decode; the per-core witness cannot be trusted "
+                    f"on this boot")
+            # (b) THE RESIDUAL-1 CLOSER: bit i of wp == bit 16 of cr0[i], for
+            #     every core the line witnesses — the AP bits included.
+            if cwp is None:
+                msgs.append(
+                    f"note per-core CR0 witness: boot {w['number']} WXAUDIT-CORES "
+                    f"carries no readable wp mask (wp={cf.get('wp')}), so its cr0 "
+                    f"array could not be cross-checked against it")
+            else:
+                bad = []
+                for i in range(min(len(cr0s), 64)):
+                    mask_bit = (cwp >> i) & 1
+                    cr0_wp = (cr0s[i] >> 16) & 1
+                    if mask_bit != cr0_wp:
+                        bad.append((i, mask_bit, cr0s[i], cr0_wp))
+                if bad:
+                    clean = False
+                    detail = "; ".join(
+                        f"core {i}: wp bit {i}={mb} but cr0[{i}]=0x{c:X} "
+                        f"bit 16={cb}" for i, mb, c, cb in bad)
+                    msgs.append(
+                        f"WARN WXN-CORE-XCHECK: boot {w['number']} the per-core "
+                        f"CR0 witness contradicts wp=0x{cwp:X} at {len(bad)} "
+                        f"core(s): {detail}. Each cr0[i] is the FULL CR0 core i "
+                        f"read when it set its own wp bit (wxn_record_core reads "
+                        f"CR0 once for both), so bit 16 of cr0[i] and bit i of wp "
+                        f"are two statements of ONE register on ONE core and "
+                        f"cannot honestly differ. This is the AP-bit check "
+                        f"RESIDUAL-1 named — a mask bit set to 1 on a core whose "
+                        f"real CR0.WP is 0, or the reverse — no longer invisible. "
+                        f"It SUPERSEDES the by-eye AP mitigation for every core "
+                        f"this line witnesses")
+                elif cr0s:
+                    msgs.append(
+                        f"ok   per-core CR0 witness: wp=0x{cwp:X} agrees with bit "
+                        f"16 of every one of the {len(cr0s)} cr0 value(s) on this "
+                        f"boot — CR0.WP confirmed from each core's OWN CR0, the "
+                        f"AP bits check 4 could not reach included (RESIDUAL-1 "
+                        f"closed for this boot)")
+            # (c) cross-line: the masks WXAUDIT-CORES re-prints must equal the
+            #     ones WXAUDIT-NXE published (both read the same statics), or the
+            #     mask (b) rests on cannot be trusted.
+            if nxe:
+                nf = nxe['fields']
+                nwp = _wxn_hexmask(nf.get('wp_mask'))
+                nnxe = _wxn_hexmask(nf.get('nxe_mask'))
+                cross = []
+                if cwp is not None and nwp is not None and cwp != nwp:
+                    cross.append(f"WXAUDIT-CORES wp=0x{cwp:X} vs WXAUDIT-NXE "
+                                 f"wp_mask={nf.get('wp_mask')}")
+                if cnxe is not None and nnxe is not None and cnxe != nnxe:
+                    cross.append(f"WXAUDIT-CORES nxe=0x{cnxe:X} vs WXAUDIT-NXE "
+                                 f"nxe_mask={nf.get('nxe_mask')}")
+                if cross:
+                    clean = False
+                    msgs.append(
+                        f"WARN WXN-CORE-XCHECK: boot {w['number']} the two audit "
+                        f"lines disagree on a mask they both re-print from the "
+                        f"same static: {'; '.join(cross)}. One of the two lines "
+                        f"was corrupted in transit; the per-core cross-check "
+                        f"rests on WXAUDIT-CORES's copy of wp, so it cannot be "
+                        f"trusted on this boot")
     return clean, msgs
 
 
@@ -2241,6 +2405,14 @@ def print_wxn_boot(w):
               f"wp_mask={f.get('wp_mask', '-')} -> {w['nxe']['verdict']}")
     else:
         print(f"  nxe   : {WXN_ABSENT}")
+
+    if w.get('cores_line'):
+        f = w['cores_line']['fields']
+        print(f"  cores : n={f.get('n', '-')} cr0={f.get('cr0', '-')} "
+              f"wp={f.get('wp', '-')} nxe={f.get('nxe', '-')}")
+    else:
+        print("  cores : no WXAUDIT-CORES line — the per-core CR0 array (GR20) "
+              "is not in this build")
 
     if w['fbwc']:
         f = w['fbwc']['fields']
@@ -4966,6 +5138,92 @@ def wxn_popcnt_expect(result):
     ]
 
 
+# --- the per-core CR0 witness fixture (GR20, RESIDUAL-1) -------------------
+#
+# THE CONDITION THIS EXISTS FOR, and why neither check 4 nor check 5 reaches it.
+# RESIDUAL-1 is a mask bit set to 1 on a core whose REAL CR0.WP is 0, counted
+# HONESTLY (the count matches the mask, so check 5 is silent) on a bit that is
+# NOT the BSP (so check 4, which only has a second witness for bit 0, is silent
+# too).  Before the WXAUDIT-CORES line no wire read an AP's CR0, so that state
+# was invisible: `wp_mask=0xFF -> PASS` with an AP unarmed read exactly like a
+# healthy boot.  The per-core CR0 array is the missing reading.
+#
+# Boot 1 is the real Boot AA (WXN_FIXTURE_WPX_CLEAN, byte-for-byte) with the
+# WXAUDIT-CORES line this arc PREDICTS for Boot AB appended: n=8, eight
+# 0x80010013 (PG|WP|ET|MP|PE — CR0.WP is bit 16), wp=0xFF nxe=0xFF.  Every one
+# of its eight cr0 values carries bit 16, so it agrees with wp=0xFF and stays
+# clean.  It is simultaneously the regression fixture and the Boot AB oracle.
+WXN_FIXTURE_CORES_CLEAN = WXN_FIXTURE_WPX_CLEAN + """\
+[    171ms] :: WXAUDIT-CORES: n=8 cr0=[0x80010013,0x80010013,0x80010013,0x80010013,0x80010013,0x80010013,0x80010013,0x80010013] wp=0xFF nxe=0xFF ::
+"""
+
+# The falsifier: boot 1 is the clean prediction; boot 2 is the same healthy
+# post-M3a boot (WXN_FIXTURE_WPX_CLEAN) with a WXAUDIT-CORES line whose LAST cr0
+# lost bit 16 (0x80010013 -> 0x80000013 — CR0.WP clear) while wp stays 0xFF, so
+# core 7's mask bit claims armed on a core whose own CR0 says otherwise.  The
+# WXAUDIT-NXE line is untouched and coherent (wp=8 wp_mask=0xFF -> PASS), so
+# checks 3/4/5 all read boot 2 healthy; ONLY the per-core witness convicts.
+WXN_FIXTURE_CORES = WXN_FIXTURE_CORES_CLEAN + WXN_FIXTURE_WPX_CLEAN + """\
+[    171ms] :: WXAUDIT-CORES: n=8 cr0=[0x80010013,0x80010013,0x80010013,0x80010013,0x80010013,0x80010013,0x80010013,0x80000013] wp=0xFF nxe=0xFF ::
+"""
+
+
+def wxn_cores_expect(result):
+    """The per-core CR0 witness — eight cores agreeing, and one AP whose CR0
+    lost bit 16 while its wp bit stayed 1 (RESIDUAL-1 verbatim).  The absent-line
+    leg is proven on the real Boot AA, which carries no WXAUDIT-CORES line."""
+    b1, b2 = (wxn_boot(b) for b in result['boots'])
+    s1, n1 = wxn_selfchecks(b1)
+    s2, n2 = wxn_selfchecks(b2)
+    v2, _ = wxn_verdicts(b2)
+    j1, j2 = ("\n".join(x) for x in (n1, n2))
+    # The absent-line leg: the real Boot AA has no per-core witness at all.
+    ba = wxn_boot(parse_content('<boot-aa>', WXN_FIXTURE_WPX_CLEAN)['boots'][0])
+    sa, na = wxn_selfchecks(ba)
+    ja = "\n".join(na)
+
+    def warns(msgs):
+        return [m.split(':')[0] for m in msgs if m.startswith('WARN')]
+
+    return [
+        ('boots parsed', len(result['boots']), 2),
+        # THE WIRE IS ACTUALLY READ — the array parses to eight CR0 values.
+        ('the WXAUDIT-CORES array is captured and parsed per boot',
+         (b1['cores_line'] is not None,
+          _wxn_cr0_list(b1['cores_line']['fields']['cr0'])),
+         (True, [0x80010013] * 8)),
+        # boot 1 — the real Boot AB prediction: agreement, and no new noise.
+        ('boot 1 self-checks clean', s1, True),
+        ('boot 1 states the per-core agreement and claims RESIDUAL-1 closed',
+         ('ok   per-core CR0 witness: wp=0xFF agrees with bit 16 of every one '
+          'of the 8 cr0 value(s)' in j1,
+          'RESIDUAL-1 closed for this boot' in j1), (True, True)),
+        ('boot 1 raises no core cross-check finding',
+         any(m.startswith('WARN WXN-CORE-XCHECK') for m in n1), False),
+        # boot 2 — RESIDUAL-1: an AP's mask bit set on a core whose real CR0.WP
+        # is 0.  Every OTHER check reads it healthy, so the conviction can only
+        # be coming from the new leg.
+        ('boot 2 is a FINDING', s2, False),
+        ('the per-core cross-check is the ONLY thing that convicts boot 2',
+         warns(n2), ['WARN WXN-CORE-XCHECK']),
+        ('every OTHER check reads boot 2 healthy',
+         ('ok   wp_mask=0xFF == 0xFF' in j2,
+          'ok   BSP CR0.WP agrees' in j2,
+          'wp=8 == popcount(wp_mask=0xFF)' in j2), (True, True, True)),
+        ('the verdict path is untouched — the token is still PASS', v2, True),
+        ('the finding names the core, the bit and the register it read',
+         ('core 7: wp bit 7=1 but cr0[7]=0x80000013 bit 16=0' in j2,
+          'SUPERSEDES the by-eye AP mitigation' in j2), (True, True)),
+        # the absent-line leg — Boot AA predates the wire and must NOT convict.
+        ('the real Boot AA carries no WXAUDIT-CORES line', ba['cores_line'],
+         None),
+        ('and check 6 notes its absence without convicting',
+         (sa, 'note per-core CR0 witness: no WXAUDIT-CORES line' in ja,
+          any(m.startswith('WARN WXN-CORE-XCHECK') for m in na)),
+         (True, True, False)),
+    ]
+
+
 def wxn_booty_expect(result):
     """Boot Y read end to end — the M2 wire, and the delta it owns."""
     w = wxn_boot(result['boots'][0])
@@ -5348,6 +5606,10 @@ def selftest_wxn():
         ('WXN: the popcount wire-integrity leg — the real Boot AA, then three '
          'single-token corruptions no other check in this file can see',
          WXN_FIXTURE_POPCNT, wxn_popcnt_expect),
+        ('WXN: the per-core CR0 witness — the real Boot AB prediction with all '
+         'eight cores agreeing, then one AP whose CR0 lost bit 16 while its wp '
+         'bit stayed 1 (RESIDUAL-1), invisible to every other leg',
+         WXN_FIXTURE_CORES, wxn_cores_expect),
         # One fixture per ARM of the kern_WX-rise classifier.  An arm with no
         # fixture is an arm nobody re-tests, and the benign arm is the one that
         # could quietly learn to explain away a real regression.
@@ -5412,6 +5674,14 @@ def selftest_wxn():
         # tokens.
         ('--wxn on single-token corruptions of the rollup line exits FINDING',
          WXN_FIXTURE_POPCNT, EXIT_FINDING),
+        # The per-core CR0 witness through the report path.  The clean side is
+        # the real Boot AB prediction (all eight cr0 carry bit 16); the finding
+        # side is the same boot with one AP's CR0 short bit 16 while its wp bit
+        # stays 1 — RESIDUAL-1, which no other leg in this file can see.
+        ('--wxn on the real Boot AB per-core prediction (all cores agree) '
+         'exits OK', WXN_FIXTURE_CORES_CLEAN, EXIT_OK),
+        ('--wxn on a per-core witness with one AP CR0 short bit 16 exits '
+         'FINDING', WXN_FIXTURE_CORES, EXIT_FINDING),
         # THE EXIT-CODE CLAIM the refinement rests on: a code-growth rise must
         # not set the finding code, and neither of the other two arms may lose
         # it.  Asserted through the real report path, not through wxn_trend.
