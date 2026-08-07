@@ -248,11 +248,7 @@ const GMUX_PORT_READ: u16 = 0x7D0;
 const GMUX_PORT_WRITE: u16 = 0x7D4;
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_SWITCH_DISPLAY: u8 = 0x10;
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_SWITCH_DDC: u8 = 0x28;
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_SWITCH_EXTERNAL: u8 = 0x40;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_READ_DISPLAY: u8 = 0x11;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
@@ -345,121 +341,6 @@ unsafe fn gmux_index_write(reg: u8, val: u8) -> bool {
     if !unsafe { gmux_wait_ready() } { return false; }
     unsafe { gmux_outb(GMUX_PORT_WRITE, reg) };
     unsafe { gmux_wait_complete() }
-}
-
-/// The pre-switch mux state, plus whether a revert is owed and when.
-///
-/// ONE encode point and ONE decode point. Every mutation of the saved bytes routes through
-/// `pack`/`unpack`; this is what stopped a saved byte being lost to a mask in an earlier
-/// round, and it is why `gmux_dwell()` reads `deadline_ms` back out of the packed word rather
-/// than keeping a second local copy of it.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-#[derive(Clone, Copy)]
-struct RevertState {
-    armed: bool,
-    due: bool,
-    ddc: u8,
-    disp: u8,
-    ext: u8,
-    /// Absolute `arch::ms()` value at which the revert comes due. Saturated into 32 bits
-    /// (~49 days of uptime); the switch is a boot-time one-shot, so that is not reachable.
-    deadline_ms: u32,
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-impl RevertState {
-    fn pack(&self) -> u64 {
-        let mut v = 0u64;
-        if self.armed { v |= 1 << 0; }
-        if self.due { v |= 1 << 1; }
-        v |= (self.ddc as u64) << 8;
-        v |= (self.disp as u64) << 16;
-        v |= (self.ext as u64) << 24;
-        v |= (self.deadline_ms as u64) << 32;
-        v
-    }
-
-    fn unpack(v: u64) -> Self {
-        Self {
-            armed: (v & (1 << 0)) != 0,
-            due: (v & (1 << 1)) != 0,
-            ddc: ((v >> 8) & 0xFF) as u8,
-            disp: ((v >> 16) & 0xFF) as u8,
-            ext: ((v >> 24) & 0xFF) as u8,
-            deadline_ms: ((v >> 32) & 0xFFFF_FFFF) as u32,
-        }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-static GMUX_REVERT_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Atomically transform the packed revert state.
-///
-/// `SeqCst` on an independent load and an independent store does NOT make the pair atomic —
-/// two contexts can both observe `armed` and both run the port sequence. This compare-exchange
-/// loop makes the read-modify-write indivisible. `f` returns `None` to abandon the update; on
-/// success the PRE-IMAGE is returned.
-/// and the exclusive right to use them in one indivisible step.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-fn gmux_state_update<F>(mut f: F) -> Option<RevertState>
-where
-    F: FnMut(RevertState) -> Option<RevertState>,
-{
-    let mut cur = GMUX_REVERT_STATE.load(Ordering::SeqCst);
-    loop {
-        let old = RevertState::unpack(cur);
-        let new = f(old)?;
-        match GMUX_REVERT_STATE.compare_exchange_weak(
-            cur,
-            new.pack(),
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => return Some(old),
-            Err(actual) => cur = actual,
-        }
-    }
-}
-
-/// Write the DDC/DISPLAY/EXTERNAL triple, read all three back, and compare the read-back
-/// against what was intended.
-///
-/// The verdict is decided by the READ-BACK, never by the write helpers returning `true`. A
-/// timed-out DDC write with a landed DISPLAY write leaves the panel on IGD with DDC on
-/// discrete; an earlier version logged that and printed `Revert Complete` anyway, so a black
-/// screen could not be distinguished from a write that never happened. The `w_*` flags are
-/// still printed — they say WHERE it broke — but they do not decide anything.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-unsafe fn gmux_apply(phase: &str, ddc: u8, disp: u8, ext: u8) -> (bool, u8, u8, u8) {
-    let w_ddc = unsafe { gmux_index_write(GMUX_SWITCH_DDC, ddc) };
-    let w_disp = unsafe { gmux_index_write(GMUX_SWITCH_DISPLAY, disp) };
-    let w_ext = unsafe { gmux_index_write(GMUX_SWITCH_EXTERNAL, ext) };
-    let ok = |b: bool| if b { "ok" } else { "TIMEOUT" };
-    serial_println!(
-        ":: igpu: [GMUX] {} write: ddc={} disp={} ext={} (intent DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X}) ::",
-        phase, ok(w_ddc), ok(w_disp), ok(w_ext), ddc, disp, ext);
-
-    let r_ddc = unsafe { gmux_index_read(GMUX_SWITCH_DDC) };
-    let r_disp = unsafe { gmux_index_read(GMUX_READ_DISPLAY) };
-    let r_ext = unsafe { gmux_index_read(GMUX_READ_EXTERNAL) };
-    serial_println!(
-        ":: igpu: [GMUX] {} read-back: DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::",
-        phase, r_ddc, r_disp, r_ext);
-
-    let m_ddc = r_ddc == ddc as u32;
-    let m_disp = r_disp == disp as u32;
-    let m_ext = r_ext == ext as u32;
-    if m_ddc && m_disp && m_ext {
-        serial_println!(":: igpu: [GMUX] {} verdict: MATCH (all three registers read back as written) ::", phase);
-        (true, r_ddc as u8, r_disp as u8, r_ext as u8)
-    } else {
-        if !m_ddc { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_DDC: wrote 0x{:02X}, read 0x{:02X} ::", phase, ddc, r_ddc); }
-        if !m_disp { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_DISPLAY: wrote 0x{:02X}, read 0x{:02X} ::", phase, disp, r_disp); }
-        if !m_ext { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_EXTERNAL: wrote 0x{:02X}, read 0x{:02X} ::", phase, ext, r_ext); }
-        serial_println!(":: igpu: [GMUX] {} verdict: MISMATCH ::", phase);
-        (false, r_ddc as u8, r_disp as u8, r_ext as u8)
-    }
 }
 
 pub fn init(gpu: &GpuInfo) {
@@ -1007,6 +888,8 @@ const DP_AUX_CH_CTL_DONE: u32 = 1 << 30;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const DP_AUX_CH_CTL_TIME_OUT_ERROR: u32 = 1 << 28;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DP_AUX_CH_CTL_TIME_OUT_1600US: u32 = 3 << 26;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const DP_AUX_CH_CTL_RECEIVE_ERROR: u32 = 1 << 25;
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
@@ -1074,6 +957,10 @@ unsafe fn dp_aux_transfer(bar0: usize, clock_divider: u32, cmd: u32, addr: u32, 
 
         let is_i2c = (cmd & 0x8) == 0;
         let reply_status = if is_i2c { i2c_reply } else { native_reply };
+
+        if reply_status == 3 {
+            return Err("aux-reserved-reply");
+        }
 
         if reply_status == 2 {
             retry_count += 1;
