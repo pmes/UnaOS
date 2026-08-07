@@ -34,6 +34,17 @@
 //!   self-test that exercises it against a scratch sector the driver has PROVEN is empty.
 //!   Multi-block CMD25, block-layer registration and any filesystem write are 4b/4c and are not
 //!   here. See §"The write gates" below for why nothing writes a card by default.
+//! * **SDHC-v1x (this file, independent of 4a)** — identification for **pre-v2.00 (v1.0/v1.01)
+//!   cards**. CMD8
+//!   SEND_IF_COND was introduced by SD Physical Layer spec 2.00, so a v1.x card is *defined* not to
+//!   answer it and the spec's own identification flow uses that silence to conclude "v1.x" and
+//!   continue with ACMD41 HCS=0. This driver had been treating the timeout as terminal, which made
+//!   every pre-v2.00 card unidentifiable. Only the CMD8 arm and ACMD41's HCS bit differ between the
+//!   two generations; the rest of the ladder, the CSD decode, the addressing cross-check and every
+//!   witness are shared, so a v2.00+ boot log is unchanged. The CMD8 conclusion is itself
+//!   cross-checked against the CSD structure version — CSD v2 arrived with the same spec that
+//!   introduced CMD8, so a card that did not answer CMD8 cannot hold one — and a card that
+//!   contradicts itself there is refused rather than published.
 //!
 //! ## Witness discipline (the rule this project pays for six times over)
 //!
@@ -737,6 +748,18 @@ const TM_AUTO_CMD12: u16 = 1 << 2;
 const TM_DIR_READ: u16 = 1 << 4; // 1 = card -> host
 const TM_MULTI_BLOCK: u16 = 1 << 5;
 
+/// ACMD41's OCR voltage window: bits 23:15 = 2.7–3.6 V, the range this driver's `set_power` can
+/// actually supply. A card whose own OCR shares no bit with this window refuses to power up, which
+/// the bounded poll below reports as a timeout with the raw OCR beside it.
+const ACMD41_OCR_WINDOW: u32 = 0x00FF_8000;
+/// ACMD41 argument bit 30 — HCS, "host supports high capacity".
+///
+/// **Only ever set for a card that answered CMD8.** SD Physical Layer §4.2.2 requires HCS=0 when
+/// CMD8 went unanswered: CMD8 and high capacity arrived together in spec 2.00, so a card that does
+/// not implement the one is not required to tolerate the other, and a card that rejects the bit
+/// never leaves idle state.
+const ACMD41_HCS: u32 = 1 << 30;
+
 /// R1 card-status error bits (SD Physical Layer §4.10.1): OUT_OF_RANGE(31), ADDRESS_ERROR(30),
 /// BLOCK_LEN_ERROR(29), ERASE_SEQ_ERROR(28), ERASE_PARAM(27), WP_VIOLATION(26), CARD_IS_LOCKED(25),
 /// LOCK_UNLOCK_FAILED(24), COM_CRC_ERROR(23), ILLEGAL_COMMAND(22), CARD_ECC_FAILED(21),
@@ -936,6 +959,11 @@ pub struct SdCard {
     /// From ACMD41 bit 30 (CCS). **This — not the capacity — is what governs addressing:**
     /// true = block-addressed (SDHC/SDXC), false = byte-addressed (SDSC).
     block_addressing: bool,
+    /// Whether the card answered CMD8, i.e. whether it implements SD Physical Layer 2.00 or later.
+    /// False means the card is pre-v2.00 and was identified through the v1.x branch (ACMD41 HCS=0).
+    /// Recorded rather than derived from `block_addressing`, because the two are NOT the same fact:
+    /// a v2.00+ standard-capacity card is byte-addressed as well.
+    spec_v2: bool,
     num_blocks: u64,
     /// CMD3's relative card address, already shifted into bits 31:16 for use as a command argument.
     rca_arg: u32,
@@ -971,6 +999,12 @@ pub fn card_num_blocks() -> Option<u64> {
 /// Whether the identified card is block-addressed (SDHC/SDXC) rather than byte-addressed (SDSC).
 pub fn card_block_addressed() -> Option<bool> {
     CARD.lock().as_ref().map(|c| c.block_addressing)
+}
+
+/// Whether the identified card implements SD Physical Layer 2.00 or later (it answered CMD8).
+/// `Some(false)` is a pre-v2.00 card identified through the v1.x branch — not a failure.
+pub fn card_spec_v2() -> Option<bool> {
+    CARD.lock().as_ref().map(|c| c.spec_v2)
 }
 
 /// SDHC-4a — whether the identified card declares itself write-protected in its own CSD:
@@ -1014,6 +1048,12 @@ fn ascii_field(buf: &mut [u8], val: u64, chars: usize) -> usize {
 /// CMD0 → CMD8 → (CMD55 + ACMD41)* → CMD2 → CMD3 → CMD9 → CMD7 → CMD16, then raise the clock from
 /// the identification rate to default speed. Each step logs its own outcome; the first failure
 /// stops the ladder and returns `None`.
+///
+/// **Both SD generations run this one ladder.** CMD8 is the only fork: a card that answers it is
+/// v2.00+ and gets ACMD41 with HCS=1; a card that lets CMD8 time out is, by the spec's own
+/// definition, pre-v2.00 and gets ACMD41 with HCS=0. Nothing else diverges — CMD2/3/9/7/16, the
+/// CSD decode, the CCS↔CSD cross-check and the clock step are literally the same code for both, so
+/// a v1.x card is exercised by every witness a v2.00+ card is.
 fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
     // --- CMD0 GO_IDLE_STATE. No response, so there is nothing to check but the absence of a
     // controller-level error; a card that is present but wedged still accepts it silently.
@@ -1024,36 +1064,104 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
     serial_println!("[sdhc] cmd0 go-idle ok");
 
     // --- CMD8 SEND_IF_COND (R7). Argument 0x1AA = supply-voltage class 1 (2.7–3.6 V) plus the
-    // check pattern 0xAA. The card must ECHO both back; that echo is the discriminator between a
-    // v2.00+ card and a v1.x card / no card at all, and it is the first proof that data flows in
-    // BOTH directions on this bus.
-    if let Err(int) = send_command(base, cmd_word(8, RSP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK), 0x1AA, false) {
-        serial_println!(
-            "[sdhc] cmd8 send-if-cond FAILED int={:#010x} ({}) — card is pre-v2.00 or absent; \
-             this milestone identifies v2.00+ cards only",
-            int, int_error_name(int)
-        );
-        return None;
-    }
-    let r7 = r32(base, REG_RESPONSE0);
-    if r7 & 0xFFF != 0x1AA {
-        serial_println!(
-            "[sdhc] cmd8 echo MISMATCH: sent 0x1aa, resp0={:#010x} (echo={:#05x}) — the bus is not \
-             carrying the card's answer intact; stopping",
-            r7, r7 & 0xFFF
-        );
-        return None;
-    }
-    serial_println!("[sdhc] cmd8 send-if-cond resp0={:#010x} echo=0x1aa ok (v2.00+ card)", r7);
+    // check pattern 0xAA. The card must ECHO both back; that echo is the first proof that data flows
+    // in BOTH directions on this bus.
+    //
+    // THREE outcomes, and collapsing them is what this driver did wrong until now:
+    //
+    // * **A bare command TIMEOUT** — the card drove nothing at all. The predicate is exactly
+    //   `int & (INT_ERR_ANY & !INT_ERROR_SUMMARY) == INT_ERR_CMD_TIMEOUT`: the ERROR HALF of the
+    //   Interrupt Status word (bits 31:16; the summary bit 15 is masked out because it is set for
+    //   any error at all and so discriminates nothing) equal to the Command Timeout bit ALONE.
+    //   "Timeout bit set, among possibly others" is a DIFFERENT test and must not be used here:
+    //   **SDHCI 3.00 §2.2.17 defines Command Timeout Error = 1 together with Command CRC Error = 1
+    //   as CMD Line Conflict** — the host and the card drove the CMD line at once. That is a bus
+    //   fault, and it says nothing whatever about the card's generation.
+    //   CMD8 was INTRODUCED by SD Physical Layer spec **2.00**; a v1.0/v1.01 card does not implement
+    //   it and is *defined* not to answer. The spec's own card-initialisation flow (Physical Layer
+    //   §4.2.2, "Card Initialization and Identification Process") uses exactly that silence to
+    //   CONCLUDE "Ver1.X SD Memory Card" and continue — with ACMD41's HCS bit forced to 0. Treating
+    //   it as terminal makes every pre-v2.00 card unreachable, which is the bug this branch fixes;
+    //   treating a line conflict as one would make the witness print `v1.x` about a generation that
+    //   was never determined.
+    // * **Any other error-half word** — CRC, index or end-bit alone, a CMD line that never went idle
+    //   (`Err(0)`), or a timeout accompanied by ANY other error bit, the SDHCI §2.2.17 CMD Line
+    //   Conflict included. The card DID answer and the answer did not survive the bus, the command
+    //   was never issued, or the bus faulted outright. None of those is the v1.x signature and none
+    //   is turned into one: identification stops, as before, with the raw `int` word printed so a
+    //   capture distinguishes a line conflict from a bare timeout even though `int_error_name` tests
+    //   the timeout bit first and names both `cmd-timeout`.
+    // * **A response whose echo does not match** — unchanged, and still terminal. The card answered
+    //   CMD8, so it IS v2.00+, and a v2.00+ card that garbles its own echo has a bus problem; there
+    //   is no version conclusion to draw from it and guessing one would corrupt every later read.
+    //
+    // `send_command` has already issued the spec-required CMD/DAT reset on every error path, so the
+    // CMD line is in a defined state for the CMD55 below regardless of which arm was taken.
+    let v2_card = match send_command(
+        base,
+        cmd_word(8, RSP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK),
+        0x1AA,
+        false,
+    ) {
+        Ok(()) => {
+            let r7 = r32(base, REG_RESPONSE0);
+            if r7 & 0xFFF != 0x1AA {
+                serial_println!(
+                    "[sdhc] cmd8 echo MISMATCH: sent 0x1aa, resp0={:#010x} (echo={:#05x}) — the bus is not \
+                     carrying the card's answer intact; stopping",
+                    r7, r7 & 0xFFF
+                );
+                return None;
+            }
+            serial_println!("[sdhc] cmd8 send-if-cond resp0={:#010x} echo=0x1aa ok (v2.00+ card)", r7);
+            true
+        }
+        // BARE timeout only: the error half equal to the command-timeout bit, every other error bit
+        // clear. See the comment above — a timeout with CRC alongside it is SDHCI 3.00 §2.2.17 CMD
+        // Line Conflict and belongs to the arm below.
+        Err(int) if int & (INT_ERR_ANY & !INT_ERROR_SUMMARY) == INT_ERR_CMD_TIMEOUT => {
+            serial_println!(
+                "[sdhc] cmd8 send-if-cond BARE-TIMEOUT int={:#010x} ({}) — error half is bit 16 \
+                 alone, no crc/index/end-bit alongside it. CMD8 was introduced in SD Physical Layer \
+                 2.00, so a card that drives nothing at all is BY DEFINITION pre-v2.00; this is the \
+                 spec's own v1.x detection, not a failure. Continuing on the v1.x branch with \
+                 acmd41 HCS=0",
+                int, int_error_name(int)
+            );
+            false
+        }
+        Err(int) => {
+            serial_println!(
+                "[sdhc] cmd8 send-if-cond FAILED int={:#010x} ({}) — this is NOT the pre-v2.00 \
+                 signature (that is error-half bit 16 ALONE): the card answered and the answer did \
+                 not survive the bus, the command never went out, or — with bit 17 set alongside \
+                 bit 16 — this is SDHCI 3.00 §2.2.17 CMD Line Conflict, a bus fault that says \
+                 nothing about the card's generation; stopping",
+                int, int_error_name(int)
+            );
+            return None;
+        }
+    };
 
     // --- ACMD41 SD_SEND_OP_COND, bounded. Each iteration is CMD55 (APP_CMD, R1, argument 0 because
     // the card has no RCA yet) then ACMD41 (R3). R3 carries the OCR, which has NO CRC and NO command
     // index — so CRC and index checking must be OFF for it, or a healthy card is convicted of a link
-    // error. Argument 0x40FF8000 = HCS (host supports high capacity) plus the 2.7–3.6 V window.
+    // error.
+    //
+    // **HCS is set from the CMD8 outcome, not unconditionally.** The spec requires a host that got no
+    // answer to CMD8 to send ACMD41 with HCS=0: a v1.x card predates high capacity, is not required
+    // to tolerate the bit, and a card that rejects it never leaves idle. HCS=1 is sent only to a card
+    // that proved itself v2.00+ by echoing CMD8.
+    //
+    // NOTE for anyone adding an `r1_check` to the CMD55 below: on the v1.x path the FIRST CMD55's R1
+    // legitimately carries ILLEGAL_COMMAND (bit 22), because the SD spec reports an unrecognised
+    // command in the status of the *next* command — and CMD8 was, by construction, unrecognised.
+    // Checking it there would convict every v1.x card of the very thing that identified it.
     //
     // Bit 31 is "power-up complete" and reads 0 for as long as the card is still initialising; that
     // 0 is a legitimate in-progress answer, not a failure, and only the elapsed-time bound can tell
     // the two apart.
+    let acmd41_arg = if v2_card { ACMD41_HCS | ACMD41_OCR_WINDOW } else { ACMD41_OCR_WINDOW };
     let start = crate::arch::now_cycles();
     let budget = cycles_ms(ACMD41_TIMEOUT_MS);
     let mut polls: u32 = 0;
@@ -1063,8 +1171,11 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
             serial_println!("[sdhc] cmd55 app-cmd FAILED int={:#010x} ({})", int, int_error_name(int));
             return None;
         }
-        if let Err(int) = send_command(base, cmd_word(41, RSP_48), 0x40FF_8000, false) {
-            serial_println!("[sdhc] acmd41 FAILED int={:#010x} ({})", int, int_error_name(int));
+        if let Err(int) = send_command(base, cmd_word(41, RSP_48), acmd41_arg, false) {
+            serial_println!(
+                "[sdhc] acmd41 arg={:#010x} (hcs={}) FAILED int={:#010x} ({})",
+                acmd41_arg, (acmd41_arg & ACMD41_HCS != 0) as u8, int, int_error_name(int)
+            );
             return None;
         }
         let ocr = r32(base, REG_RESPONSE0);
@@ -1073,18 +1184,21 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         }
         if crate::arch::now_cycles().wrapping_sub(start) >= budget {
             serial_println!(
-                "[sdhc] acmd41 still busy after {}ms and {} polls (ocr={:#010x}) — card never \
-                 finished power-up; stopping",
-                ACMD41_TIMEOUT_MS, polls, ocr
+                "[sdhc] acmd41 arg={:#010x} (hcs={}) still busy after {}ms and {} polls \
+                 (ocr={:#010x}) — card never finished power-up; stopping",
+                acmd41_arg, (acmd41_arg & ACMD41_HCS != 0) as u8, ACMD41_TIMEOUT_MS, polls, ocr
             );
             return None;
         }
         core::hint::spin_loop();
     };
+    // CCS is OCR bit 30. On a v1.x card the bit is RESERVED and reads 0, which is the same reading a
+    // v2.00+ standard-capacity card gives — and both mean byte-addressed, so no version-dependent
+    // interpretation is needed here. The CSD cross-check below is what makes either reading evidence.
     let ccs = ocr & (1 << 30) != 0;
     serial_println!(
-        "[sdhc] acmd41 ocr={:#010x} powered-up=1 ccs={} ({}-addressed) after {} polls",
-        ocr, ccs as u8,
+        "[sdhc] acmd41 arg={:#010x} hcs={} ocr={:#010x} powered-up=1 ccs={} ({}-addressed) after {} polls",
+        acmd41_arg, (acmd41_arg & ACMD41_HCS != 0) as u8, ocr, ccs as u8,
         if ccs { "block" } else { "byte" },
         polls
     );
@@ -1156,15 +1270,60 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         serial_println!("[sdhc] csd v2 c_size={} -> blocks=(c_size+1)*1024", c_size);
         (c_size + 1) * 1024
     } else if csd_structure == 0 {
-        // CSD v1 (SDSC): blocks = (C_SIZE+1) · 2^(C_SIZE_MULT+2) · 2^READ_BL_LEN / 512.
+        // CSD v1 (SDSC): capacity is THREE fields multiplied, not v2's single C_SIZE —
+        //   blocks = (C_SIZE+1) · 2^(C_SIZE_MULT+2) · 2^READ_BL_LEN / 512
+        // with C_SIZE at CSD[73:62] (12 bits), C_SIZE_MULT at [49:47] (3), READ_BL_LEN at [83:80]
+        // (4). Reading it with v2's layout yields a capacity wrong by orders of magnitude, which is
+        // why the structure field is read first and dispatched on.
+        //
+        // Every shift here is bounded by the field widths: READ_BL_LEN ≤ 15, C_SIZE_MULT ≤ 7,
+        // C_SIZE ≤ 4095, so the product cannot overflow u64.
         let read_bl_len = r2_bits(&csd, 83, 80) as u32;
+        let read_bl_partial = r2_bits(&csd, 79, 79);
         let c_size = r2_bits(&csd, 73, 62);
         let c_size_mult = r2_bits(&csd, 49, 47) as u32;
+        let blocks = ((c_size + 1) << (c_size_mult + 2)) * (1u64 << read_bl_len) / 512;
         serial_println!(
-            "[sdhc] csd v1 c_size={} c_size_mult={} read_bl_len={}",
-            c_size, c_size_mult, read_bl_len
+            "[sdhc] csd v1 c_size={} c_size_mult={} read_bl_len={} ({} B) read_bl_partial={} \
+             -> blocks=(c_size+1)<<(c_size_mult+2) * 2^read_bl_len / 512 = {}",
+            c_size, c_size_mult, read_bl_len, 1u32 << read_bl_len, read_bl_partial, blocks
         );
-        ((c_size + 1) << (c_size_mult + 2)) * (1u64 << read_bl_len) / 512
+        // The spec permits READ_BL_LEN of 9, 10 or 11 only. Anything else means the 136-bit response
+        // is not being unpacked where this code thinks it is, and the capacity above is then
+        // fiction. It is NAMED rather than silently used — and named is ALL it is. The downstream
+        // CMD16 SET_BLOCKLEN 512 is a backstop for only two of the three cases, so read this before
+        // relying on it:
+        //
+        // * READ_BL_LEN < 9 — 512 exceeds the card's maximum read block length, so CMD16 is
+        //   rejected whatever READ_BL_PARTIAL says, and `r1_check` stops the ladder there.
+        // * READ_BL_LEN > 9 with READ_BL_PARTIAL = 0 — the card accepts only its own block length,
+        //   rejects 512 with BLOCK_LEN_ERROR, and `r1_check` stops the ladder there.
+        // * READ_BL_LEN > 9 with READ_BL_PARTIAL = 1 — 512 is a legal PARTIAL block, CMD16
+        //   SUCCEEDS, and nothing downstream refuses the card: the inflated `num_blocks` is
+        //   published to `card_num_blocks()` with only this warning behind it. That is the live
+        //   case, not the hypothetical one — the bench card reads READ_BL_PARTIAL = 1.
+        //
+        // The print says which of the two worlds the card is in rather than implying the
+        // enforcement it only sometimes has. The write ladder is protected either way for a
+        // different reason: its scratch LBA is `num_blocks - 1`, so an inflated count puts it past
+        // the end of the card and rung 6 refuses it as `scratch-unreadable`.
+        if !(9..=11).contains(&read_bl_len) {
+            serial_println!(
+                "[sdhc] csd v1 read_bl_len={} is outside the spec's 9..=11 — the CSD unpack is \
+                 SUSPECT and the capacity above should not be believed. read_bl_partial={}: {}",
+                read_bl_len,
+                read_bl_partial,
+                if read_bl_len > 9 && read_bl_partial != 0 {
+                    "512 is a legal partial block, so cmd16 set-blocklen 512 will be ACCEPTED and \
+                     nothing downstream refuses this card — the capacity is published with only \
+                     this warning behind it"
+                } else {
+                    "cmd16 set-blocklen 512 is the backstop — the card rejects it with \
+                     BLOCK_LEN_ERROR and r1_check stops the ladder there"
+                }
+            );
+        }
+        blocks
     } else {
         serial_println!(
             "[sdhc] csd structure {} is not 0 (v1) or 1 (v2) — capacity cannot be derived; stopping",
@@ -1208,19 +1367,103 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         return None;
     }
 
+    // CROSS-CHECK, second of two — this one on the CMD8 conclusion itself.
+    //
+    // The check above validates CCS against the CSD structure. Nothing validated `v2_card`: it was
+    // the one field on the witness below that no second register could contradict. It can be, for
+    // free, out of evidence already decoded and printed above. **CSD version 2 was introduced by the
+    // SAME spec revision — SD Physical Layer 2.00 — that introduced CMD8.** A card that did not
+    // answer CMD8 therefore cannot hold a v2 CSD, and `!v2_card && csd_structure == 1` is a
+    // self-contradiction.
+    //
+    // It is NOT subsumed by the check above, which PASSES in exactly this case: CCS and the CSD
+    // structure agree with each other (both say high capacity) and it is the CMD8 conclusion that
+    // disagrees with both of them. Without this line the witness could print
+    // `card v1.x SDHC block-addressed` — contradicting itself on its own line — off a cross-check
+    // that raised nothing. With it, `v1.x` on that line implies `csd_structure == 0`, which implies
+    // `expected_ccs == false`, which the check above has already forced `ccs` to equal: `v1.x` can
+    // now only ever be followed by `SDSC byte-addressed`.
+    //
+    // WHY IT REFUSES the card rather than overriding `v2_card` with the CSD's verdict and carrying
+    // on. Both are defensible reads of "which evidence is stronger"; refusal is the one that keeps
+    // the driver honest:
+    //
+    // 1. The contradiction proves one of two reads is wrong and does NOT say which. Either CMD8's
+    //    silence was spurious (a bus fault, or an answer lost on the wire, on a genuine v2.00+
+    //    card) or this 136-bit response is not being unpacked where this code thinks it is — and in
+    //    that second case `csd_structure`, `num_blocks` and the write-protect bits above are all
+    //    fiction, decoded from the same register read. Overriding names a winner by assumption,
+    //    which is the move this whole arc exists to stop making.
+    // 2. The initialisation already ran down the losing branch: ACMD41 went out with HCS=0, which
+    //    the spec does not permit for a high-capacity card. A card that completed power-up anyway
+    //    did something the spec does not describe, and nothing later in this ladder re-establishes
+    //    what state it is actually in.
+    // 3. `bring_up` calls `write_selftest` on EVERY `identify()` that returns `Some`. Proceeding
+    //    would hand the write ladder — a live CMD24 once `UNAOS_SDW=1` arms it — a card whose
+    //    generation the driver has just proved it could not determine. A refused card costs one
+    //    boot without SD storage; a wrongly published one costs a sector of somebody's card.
+    // 4. Every other unresolved identification in this function stops: the CCS↔CSD mismatch above, a
+    //    CSD structure that is neither 0 nor 1, a zero-block capacity, a garbled CMD8 echo.
+    //    Overriding here would make this the one place where the driver publishes a card it has just
+    //    contradicted itself about.
+    //
+    // The raw evidence goes on the line so a capture shows which reads disagreed. `ccs` is
+    // necessarily 1 by the time this runs — the check above stopped the case where it is not — and
+    // is printed anyway because it is what the witness's addressing claim is made of.
+    if !v2_card && csd_structure == 1 {
+        serial_println!(
+            "[sdhc] CONTRADICTION: cmd8 concluded pre-v2.00 but the csd is structure=1 (v2), and \
+             csd v2 arrived with the SAME spec (2.00) that introduced cmd8 — a card that did not \
+             answer cmd8 cannot hold a v2 csd. Evidence: v2_card={} ccs={} csd_structure={}. One of \
+             those two reads is wrong and this line cannot say which, so the generation is \
+             UNDETERMINED; the card is not published (the write self-test runs on every published \
+             card); stopping",
+            v2_card as u8, ccs as u8, csd_structure
+        );
+        return None;
+    }
+
     let mib = num_blocks * 512 / (1024 * 1024);
-    let class = if !ccs {
-        "SDSC (standard capacity)"
+    let class_short = if !ccs {
+        "SDSC"
     } else if mib <= 32 * 1024 {
         "SDHC"
     } else {
         "SDXC"
     };
+    let class = if ccs { class_short } else { "SDSC (standard capacity)" };
     serial_println!(
         "[sdhc] card {} blocks x512 = {}MiB class={} addressing={} (ccs governs, csd v{} agrees)",
         num_blocks, mib, class,
         if ccs { "block" } else { "byte" },
         if csd_structure == 1 { 2 } else { 1 }
+    );
+
+    // --- The identification witness. Every field on it was MEASURED on this boot and nothing else
+    // is on it: the spec version from whether CMD8 was answered, the class and the addressing mode
+    // from ACMD41's CCS (cross-checked against the CSD structure above), the block count from the
+    // CSD arithmetic, the RCA from CMD3. It is deliberately parameterised rather than branch-printed
+    // — the SAME statement prints `v1.x SDSC byte-addressed` for a pre-2.00 card and
+    // `v2.00+ SDHC block-addressed` for a modern one, so the line can say the other thing and a log
+    // that shows one is evidence against the other.
+    //
+    // The two cross-checks above make one combination of those words UNPRINTABLE: `v1.x` requires
+    // `!v2_card`, which the contradiction check pairs with `csd_structure == 0`, which the CCS↔CSD
+    // check pairs with `ccs == false`, which forces `class_short` to `SDSC` and the addressing word
+    // to `byte`. A line reading `v1.x SDHC block-addressed` or `v1.x SDXC block-addressed` cannot be
+    // produced by this statement; if a capture ever shows one, the reader is not looking at this
+    // build.
+    //
+    // `size` is floor(blocks·512 / 1 MiB) and is a MiB figure, not the decimal MB a host tool
+    // prints; a 60800-block card reads 29 MiB here and 31.1 MB there, and neither is wrong.
+    serial_println!(
+        ":: sdhc: card {} {} {}-addressed blocks={} size={} MiB rca={:#06x} ::",
+        if v2_card { "v2.00+" } else { "v1.x" },
+        class_short,
+        if ccs { "block" } else { "byte" },
+        num_blocks,
+        mib,
+        rca
     );
 
     // --- CMD7 SELECT_CARD (R1b) → transfer state. R1b means the card asserts busy on DAT0 after the
@@ -1253,6 +1496,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         base,
         bdf,
         block_addressing: ccs,
+        spec_v2: v2_card,
         num_blocks,
         rca_arg,
         csd_structure,

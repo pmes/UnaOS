@@ -989,3 +989,309 @@ assumption was falsified by captures that already existed.
   failure. When a future arc fixes CMD8, this ladder runs against an uncharacterised
   card with gates 4 and 5 as the only defence — which is the second half of the
   argument in §8.9's last bullet.
+
+---
+
+## 9. Pre-v2.00 (v1.x) card identification
+
+### 9.1 The defect
+
+Until this change the driver could not identify a **pre-v2.00 SD card at all**, on any
+machine, on every boot. `identify` issued CMD8 SEND_IF_COND and treated *any* failure —
+including a bare command timeout — as terminal:
+
+```
+[sdhc] cmd8 send-if-cond FAILED int=0x00018000 (cmd-timeout) — card is pre-v2.00 or
+       absent; this milestone identifies v2.00+ cards only
+```
+
+That is the exact line the bench rMBP printed, and the card in its internal slot is a
+genuine v1.x part: Panasonic `S032B`, manufactured 04/2008, SCR `00a5000033f00008`
+(SD_SPEC = 0 ⇒ Physical Layer v1.0–1.01), CSD `005d0132135981daf6d9cfff16400000`
+(CSD_STRUCTURE = 0b00 ⇒ v1.0, Standard Capacity), OCR `0x00300000` (CCS clear).
+
+### 9.2 Why the timeout is the answer, not the failure
+
+**CMD8 was introduced by SD Physical Layer specification 2.00.** A v1.0/v1.01 card does
+not implement it and is *defined* not to respond. The spec's own card-initialisation
+flow (§4.2.2) uses that silence as the discriminator: no response to CMD8 ⇒ "Ver1.X SD
+Memory Card" ⇒ continue with ACMD41 and **HCS = 0**. The hardware was fine, the card was
+fine, and the driver was throwing away the spec's detection method as if it were an error.
+
+### 9.3 The three CMD8 outcomes, kept distinct
+
+| Outcome | Meaning | Action |
+|---|---|---|
+| **Bare** command timeout — error half (bits 31:16) equal to bit 16 **alone** | The card drove nothing. By definition pre-v2.00. | Continue on the v1.x branch, ACMD41 HCS=0 |
+| Any **other** error-half word — CRC, index or end-bit alone, a CMD line that never went idle, **or** a timeout with any other error bit set alongside it | The card answered and the answer did not survive the bus, the command never went out, or the bus faulted. | Stop — this is *not* the v1.x signature and is not made into one |
+| Response with a **mismatched echo** | The card is v2.00+ (it answered) but garbled its own echo. | Stop, unchanged from before |
+
+The predicate for the first arm is written out, because "the timeout bit is set" and "the
+timeout bit is the only error bit set" are **different tests** and only the second one means
+what this section claims:
+
+```rust
+Err(int) if int & (INT_ERR_ANY & !INT_ERROR_SUMMARY) == INT_ERR_CMD_TIMEOUT => …
+```
+
+`INT_ERR_ANY = INT_ERROR_SUMMARY | 0xFFFF_0000`, so masking the summary bit out leaves exactly
+the error half; the summary bit is excluded because it is set for *any* error and therefore
+discriminates nothing. The stricter test is required, not cosmetic: **SDHCI 3.00 §2.2.17
+defines Command Timeout Error = 1 together with Command CRC Error = 1 as CMD Line Conflict** —
+the host and the card drove the CMD line simultaneously. That is a bus fault and carries no
+information about the card's generation, so `int = 0x00038000` (summary | timeout | CRC) must
+take the *second* row, not the first. An earlier revision of this arm tested only
+`int & INT_ERR_CMD_TIMEOUT != 0`, which would have classified a line conflict as a v1.x card
+and made the §9.8 witness print `v1.x` about a generation it never determined.
+
+Only the first arm is new. Nothing weakens: a corrupt bus still stops the ladder, and the two
+worlds print different lines naming different evidence — both lines carry the raw `int` word,
+which matters here because `int_error_name` tests the timeout bit first and so names a line
+conflict `cmd-timeout` as well. The classification is made on the word, not on the name.
+
+The bench card's captured `int = 0x00018000` decodes against this file's own constants as
+`INT_ERROR_SUMMARY` (bit 15, the read-only "some error bit is set" summary) `| INT_ERR_CMD_TIMEOUT`
+(bit 16). Its error half is `0x0001_0000` — bit 16 alone — so it **is** bare and still classifies
+v1.x under the stricter predicate.
+
+### 9.4 HCS is chosen, not assumed
+
+ACMD41's argument was hard-coded `0x40FF8000` — HCS=1 plus the 2.7–3.6 V window. It is
+now `ACMD41_OCR_WINDOW` with `ACMD41_HCS` added **only for a card that answered CMD8**.
+The spec requires HCS=0 when CMD8 went unanswered: CMD8 and high capacity arrived
+together in 2.00, so a card that implements neither is not required to tolerate the bit,
+and a card that rejects it never leaves idle state. The chosen argument and the resulting
+HCS are both printed on the ACMD41 line, so the log says which was sent.
+
+One consequence worth knowing before anyone tightens the loop: on the v1.x path the
+**first CMD55's R1 legitimately carries ILLEGAL_COMMAND (bit 22)**, because the SD spec
+reports an unrecognised command in the status of the *next* command — and CMD8 was, by
+construction, unrecognised. The driver does not `r1_check` CMD55; adding one there would
+convict every v1.x card of the very thing that identified it. The comment in `identify`
+says so at the call site.
+
+### 9.5 Everything after the fork is shared
+
+CMD2, CMD3, CMD9, CMD7, CMD16, the CSD decode, the CCS↔CSD cross-check (§6.4) and the
+clock step are literally the same code for both generations — the divergence is the CMD8
+arm and one argument bit. A v1.x card is therefore exercised by every witness a v2.00+
+card is, including §6.5's three claims and §7.3's A/B verdict.
+
+### 9.6 Byte addressing — already correct, now proven
+
+SDSC is **byte-addressed**: CMD17/CMD18 take a byte offset, so an LBA must be multiplied
+by 512. Getting this wrong reads the wrong sectors *silently*. The driver already did it
+correctly — `read_block_512` and `lba_arg` (which serves the multi-block PIO path and the
+ADMA2 path) both multiply for `block_addressing == false` and bound the result against
+the 32-bit Argument register instead of truncating. **No change was needed, and none was
+made.**
+
+What was missing was proof. The gate's QEMU card is blank, so `verify lba1
+differs-from-lba0` read 0 and no MBR cross-check was available — a byte/block mix-up
+would have been invisible. Re-running against a **patterned** 16 MiB card (every sector
+stamped with its own LBA, plus a real MBR) with the fingerprints computed independently
+on the host:
+
+| Witness | Predicted on the host | Printed by the driver |
+|---|---|---|
+| `lba0 fnv` | `0x687c435c3b908694` | `0x687c435c3b908694` |
+| `lba1 fnv` | `0x6469225a013f72a5` | `0x6469225a013f72a5` |
+| 8-block window fnv | `0xc7a291cdf6c836fa` | `0xc7a291cdf6c836fa` |
+| MBR p0 `start=2048 count=30720 end=32768` vs capacity 32768 | fits | `fits-capacity=1` |
+
+All three read paths (CMD17 PIO, CMD18 PIO, ADMA2) land on the addressed sector of a
+byte-addressed card. That is ground truth, not two runs of the same code agreeing.
+
+**There is a fourth caller of `lba_arg`, and it is a write.** On the trunk this arc now sits
+on, SDHC-4a's `write_block_512` computes its argument through the *same* helper (`let arg =
+lba_arg(card, lba)?`), so the ×512 above is the multiply an SDSC write uses as well — the
+write path did not grow its own addressing. §8 owns that primitive; what belongs here is that
+the byte-addressed argument is proven for it too, and that the proof needed a different
+fixture than the one above.
+
+The read fixtures cannot falsify the *write*: the self-test verifies by reading back through
+`lba_arg`, so a systematic addressing error would be invisible — both halves would agree on
+the same wrong sector. On the blank QEMU card it is worse, because every sector is identical
+and any offset looks correct. The fixture that breaks the symmetry is
+**patterned-except-last**: a 16 MiB card in which every sector is uniquely stamped from its own
+LBA *except* the last, which is all zeros, so the card has exactly one blank sector (LBA
+32767). The self-test's own rung 7 then becomes the discriminator, with no new instrument —
+if the multiply is present it reads LBA 32767, finds it blank and proceeds to `PASS`; if the
+multiply were missing, argument 32767 would land on byte offset 32767 = sector 63, which is
+patterned, and the ladder would refuse with `blank=0 reason=nonblank`. QEMU printed
+`blank=1 … verify=IDENTICAL restore=IDENTICAL reason=none -> PASS`, and the card image was
+byte-identical afterward, so the write landed on the one sector the read had proven it was
+addressing and touched none of the other 32 767 identifiable sectors. QEMU's card is CCS=0,
+so the branch that executed is `lba_arg`'s `else` — the multiply itself.
+
+### 9.7 Capacity from CSD v1.0
+
+CSD v1.0 computes capacity from **three** fields, not v2.0's single `C_SIZE`:
+
+```
+blocks = (C_SIZE + 1) · 2^(C_SIZE_MULT + 2) · 2^READ_BL_LEN / 512
+         C_SIZE      = CSD[73:62]   (12 bits)
+         C_SIZE_MULT = CSD[49:47]   (3 bits)
+         READ_BL_LEN = CSD[83:80]   (4 bits)
+```
+
+This code existed but was **unreachable on any v1.x card**, because CMD8 stopped the
+ladder before CMD9. It is reached now. For the bench card's
+`005d0132135981daf6d9cfff16400000`: `C_SIZE = 1899`, `C_SIZE_MULT = 3`,
+`READ_BL_LEN = 9` ⇒ `1900 · 32 · 512 = 31 129 600` bytes = **60 800 blocks = 29 MiB**
+(29.7 MiB / 31.1 MB — the same number the host reports).
+
+The decode line now prints the fields, the derived block length and the formula, and
+names a `READ_BL_LEN` outside the spec's legal 9–11 as a **suspect unpack** rather than
+using it silently.
+
+That warning is a warning, not an enforcement, and the earlier wording of this paragraph
+implied otherwise. The downstream CMD16 SET_BLOCKLEN 512 backs it up in only two of the three
+cases:
+
+| `READ_BL_LEN` | `READ_BL_PARTIAL` | CMD16 SET_BLOCKLEN 512 | Effect |
+|---|---|---|---|
+| < 9 | either | rejected — 512 exceeds the card's maximum block length | `r1_check` stops the ladder |
+| > 9 | 0 | rejected with BLOCK_LEN_ERROR | `r1_check` stops the ladder |
+| > 9 | **1** | **accepted** — 512 is a legal *partial* block | **nothing refuses the card**; the inflated `num_blocks` is published to `card_num_blocks()` with only the SUSPECT line behind it |
+
+The third row is the live case, not the hypothetical one: the bench card reads
+`READ_BL_PARTIAL = 1`. The SUSPECT line therefore prints `read_bl_partial=` and says which of
+the two worlds the card is in — whether CMD16 is about to stop the ladder, or whether the
+capacity is being published on a warning alone. The write ladder is protected in the third row
+for an unrelated reason: its scratch LBA is `num_blocks - 1`, so an inflated count puts it past
+the end of the card and §8's rung 6 refuses it as `scratch-unreadable`.
+
+### 9.8 The witness
+
+One parameterised line, so it can say the other thing:
+
+```
+:: sdhc: card v1.x SDSC byte-addressed blocks=60800 size=29 MiB rca=0xNNNN ::
+:: sdhc: card v2.00+ SDHC block-addressed blocks=NNNNNNN size=NNNNN MiB rca=0xNNNN ::
+```
+
+Every field is measured on that boot: the version from whether CMD8 was answered, the
+class and addressing from ACMD41's CCS (cross-checked against the CSD structure), the
+block count from the CSD arithmetic, the RCA from CMD3. `size` is floor(blocks·512 /
+1 MiB) — a MiB figure, not the decimal MB a host tool prints.
+
+The version field is cross-checked too, against the CSD structure — see §9.10. One
+consequence of that check belongs here: **this statement can no longer print `v1.x SDHC
+block-addressed`.** `v1.x` implies `csd_structure == 0`, which implies `ccs == false`, which
+forces `SDSC` and `byte`. A line that contradicts itself about the card's generation is not
+merely unlikely, it is unreachable.
+
+`card_spec_v2()` joins `card_block_addressed()` in the module API. The two are **not**
+the same fact: a v2.00+ standard-capacity card is byte-addressed as well.
+
+### 9.9 What QEMU can and cannot test
+
+QEMU **cannot present a pre-v2.00 card.** `qemu-system-x86_64` 10.2.2's `sd-card`
+accepts `spec_version` 2 and 3 only; 0, 1 and 4 are rejected outright with
+`Invalid SD card Spec version`. Both accepted versions answer CMD8, so **the CMD8-timeout
+arm and the HCS=0 argument are metal-only.** Both arms are present in the linked kernel
+ELF (`strings`), which proves compiled-and-linked, not reached-at-runtime.
+
+§9.10's contradiction check is narrower still: **no card can provoke it**, in QEMU or on the
+bench, because it requires the classifier rather than the medium to be wrong. It was fired
+under a throwaway forcing build, which §9.10 records in full.
+
+What QEMU *does* cover is everything downstream of the fork, and more than before: its
+card is 16 MiB, so it is itself CSD v1.0 / CCS=0 / **byte-addressed**, and the regression
+run exercises the shared ladder, the CSD v1.0 arithmetic (`c_size=63 c_size_mult=7
+read_bl_len=9 → 32768 blocks = 16 MiB`, matching the image size) and — with the patterned
+card of §9.6 — the byte-offset argument on all three read paths. It also prints
+`card v2.00+ SDSC byte-addressed`, which is the instrument demonstrating it can say the
+other thing.
+
+### 9.10 The CMD8 conclusion is cross-checked against the CSD
+
+§6.4's cross-check validates ACMD41's CCS against the CSD structure version. Until this
+change **nothing validated the CMD8 conclusion itself** — `v2_card` was the one field on
+§9.8's witness that no second register could contradict, which is exactly the shape of claim
+this project treats as unearned.
+
+A second register does contradict it, for free, out of evidence the ladder has already
+decoded and printed: **CSD version 2 was introduced by the same spec revision — SD Physical
+Layer 2.00 — that introduced CMD8.** A card that did not answer CMD8 cannot hold a v2 CSD, so
+
+```
+!v2_card && csd_structure == 1
+```
+
+is a self-contradiction, and the driver now says so and stops:
+
+```
+[sdhc] CONTRADICTION: cmd8 concluded pre-v2.00 but the csd is structure=1 (v2), and csd v2
+       arrived with the SAME spec (2.00) that introduced cmd8 — a card that did not answer
+       cmd8 cannot hold a v2 csd. Evidence: v2_card=0 ccs=1 csd_structure=1. One of those two
+       reads is wrong and this line cannot say which, so the generation is UNDETERMINED; the
+       card is not published (the write self-test runs on every published card); stopping
+```
+
+**It is not subsumed by §6.4's check, which passes in precisely this case.** CCS and the CSD
+structure agree with each other — both say high capacity — and it is the CMD8 conclusion that
+disagrees with both. The witness would then have printed `card v1.x SDHC block-addressed`,
+contradicting itself on its own line, behind a cross-check that raised nothing. The realistic
+route into that state is a CMD8 answer lost on the bus of a genuine SDHC card; §9.3's
+bare-timeout predicate closes the specific SDHCI §2.2.17 CMD Line Conflict word, and this
+check is the backstop for every other way the answer could go missing.
+
+**Why it refuses the card instead of overriding `v2_card` with the CSD's verdict.** Both are
+defensible readings of which evidence is stronger — the CSD is a CRC-checked positive
+measurement, CMD8's silence is an absence — and refusal is the one that keeps the driver
+honest:
+
+1. The contradiction proves one of two reads is wrong and does not say **which**. Either
+   CMD8's silence was spurious, or the 136-bit CMD9 response is not being unpacked where the
+   code thinks it is — and in that second case `csd_structure`, `num_blocks` and the §8
+   write-protect bits are all fiction, decoded from the same register read. Overriding names a
+   winner by assumption, which is the move this arc exists to stop making.
+2. The initialisation already ran down the losing branch: ACMD41 went out with **HCS=0**,
+   which the spec does not permit for a high-capacity card. A card that completed power-up
+   anyway did something the spec does not describe, and nothing later in the ladder
+   re-establishes what state it is in.
+3. `bring_up` calls `write_selftest` on **every** `identify()` that returns `Some`. Proceeding
+   would hand the write ladder — a live CMD24 once `UNAOS_SDW=1` arms it — a card whose
+   generation the driver has just proved it could not determine. A refused card costs one boot
+   without SD storage; a wrongly published one costs a sector of somebody's card.
+4. Every other unresolved identification in `identify()` stops: the CCS↔CSD mismatch, a CSD
+   structure that is neither 0 nor 1, a zero-block capacity, a garbled CMD8 echo. Overriding
+   here would make this the single place where the driver publishes a card it has just
+   contradicted itself about.
+
+The cost is stated rather than hidden: a genuine v2.00+ card whose CMD8 answer is lost to a
+one-off bus event is now refused where the old code would have proceeded with byte addressing
+that CCS happens to make correct. That is a card lost to a boot, not data lost to a guess, and
+it is a bus that has already misbehaved once on this boot.
+
+**It cannot be provoked by any card, on QEMU or on the bench.** `qemu-system-x86_64`'s
+`sd-card` accepts `spec_version` 2 and 3 only and both answer CMD8, so `v2_card` is true in
+every QEMU configuration and the contradiction cannot arise from the media; on metal the bench
+card is v1.x **and** CSD v1.0, which is the consistent case. Reaching it needs the *classifier*
+to be wrong, not the card.
+
+So it was provoked that way, and the line above is transcribed from the run rather than
+composed. A throwaway build — one added statement forcing `v2_card = false` after a good CMD8
+answer, never committed — against a **4 GiB** QEMU card (CSD v2, CCS=1):
+
+```
+[sdhc] cmd8 send-if-cond resp0=0x000001aa echo=0x1aa ok (v2.00+ card)
+[sdhc] FIXTURE-NOT-FOR-COMMIT: forcing v2_card=0 to provoke the contradiction check
+[sdhc] acmd41 arg=0x00ff8000 hcs=0 ocr=0xc0ffff00 powered-up=1 ccs=1 (block-addressed) after 1 polls
+[sdhc] csd v2 c_size=8191 -> blocks=(c_size+1)*1024
+[sdhc] CONTRADICTION: … Evidence: v2_card=0 ccs=1 csd_structure=1 … stopping
+```
+
+Three things that run establishes. **The §6.4 cross-check is silent** — no `MISMATCH` line —
+because CCS and the CSD structure agree with each other and only the CMD8 conclusion dissents,
+which is the blind spot this section exists to cover. **The card is not published**: no
+`:: sdhc: card … ::` witness and no `w1` self-test line follow, so `bring_up` took the
+`identify() == None` path and the write ladder never ran. And the run is a fixture, not a card
+defect — the **same 4 GiB card under the unmodified build** identifies normally
+(`acmd41 arg=0x40ff8000 hcs=1 … ccs=1`, `:: sdhc: card v2.00+ SDHC block-addressed
+blocks=8388608 size=4096 MiB ::`, then `w1 … -> DRYRUN`), so the check discriminates the forced
+misclassification and nothing else.
+
+In the shipped build this is a guard whose value is that it is never printed.
