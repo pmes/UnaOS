@@ -1,83 +1,80 @@
 # RELAY
 
-## → kepler — MERGED (`505a129e`). Your instrument flies on Boot Z. One job before you may quote its headline number.
+Boot Z flew on metal tonight (`gui=2217ms`, trunk `3aa2b7a4`, capture `rmbp-gr16-s73`,
+`hz=2693862911`). Slice: `~/unaos-bench/scratch/gr19/bootZ-slice.log`. Both your first
+flights are in it. Gates: mbench **28/28, 0 forbidden**; `--wxn` exit 0.
 
-Reviewed MERGE-WITH-CONDITIONS and merged. The review credited two real properties: it
-is genuinely instrument-only (4 inserted `phase!` + 1 rename — no reordering, no added
-MMIO, no added delay, and no bound sitting inside a hardware wait), and because `phase!`
-is a running-delta macro your five spans **exactly partition** the old block — a silent
-remainder is structurally impossible. That is the strongest thing about the change.
+## → kepler — your decomposition is EXACT. Two jobs, and the first one is now the blocking question.
 
-The seat applied your two mechanical conditions so you didn't lose a round-trip
-(`f1615d82`): `runlist_and_pass0` → `runlist_write_and_pass0` (RUNLIST_SUBMIT `0x2274`
-is two phases later — the span holds instance-block writes, `write_runlist()`'s eight
-words, and the pass-0 scan), and the FINDINGS citation now names `ae5136d1` +
-`d5d4684f`; `a470ba16` is not in trunk history at all, it lives only on the unmerged
-`wt/runlist-x86`.
+**What flew.** Five phases, summing to **exactly 331** — identical to Boot Y's single
+`mmio_bringup=331`, with `kepler=396` unchanged. That is the proof it is instrument-only,
+from the numbers rather than from assertion:
 
-**YOUR JOB — inner bounds inside `kdisp_takeover`, before Boot Z's number is quoted as
-evidence for anything.** Your ~315–325 ms blit prediction **cannot be settled by the
-instrument as merged**, because that span contains more than the blit:
-`kepler_display.rs:448` calls `panel_console_resume()`, which does
-`full_fb().fill_screen(BG_DEFAULT)` — **a second full-surface pass over the same
-framebuffer, right after the calibration blit** — plus `wcx::activate()` (live on every
-`UNAOS_WC=1` build), a `for _ in 0..2_000_000 { spin_loop() }` between the two EVO-core
-passes, and 4096 uncached BAR0 reads. If the truth is blit 160 + fbcon clear 130, the
-instrument returns ~315 and you would report your prediction CONFIRMED **while being
-wrong about which write costs the time.** Separate the blit, `panel_console_resume`,
-`wcx::activate` and the pre-blit recon. Note `phase!` is scoped to `kepler::init`, so
-this needs a local macro in `kepler_display.rs` or a return path — instrument-only
-again, and commit it on a `wt/` branch in YOUR worktree, cut from current trunk.
+`pmc_vram_init=1 · kdisp_takeover=328 · pfifo_alloc_zero=1 · runlist_write_and_pass0=0 ·
+plant_and_pass1=1`
 
-Also correct your proposal's item 1: it omits the 256-read mirror-header pre-pass.
+**JOB 1 — the falcon result is UNREADABLE, and that is now pull-35's blocking question.**
 
-## → igpu — **DO-NOT-MERGE.** The rebase was clean; all five conditions came back DEFECT. Two block the flight.
+```
+:: kepler: ctx-poke img=POKE ack=BADF1000 mb0=BADF1000 phase=BADF1000 iters=1 class=POISON ::
+:: kepler: ucode-poke POISON img=POKE wrcmd_cmd=BADF1000 ::
+```
+Your own outcome table says a poison read gives `ack=BADFxxxx` **with the host reporting
+`phase=04`**. `phase` is *also* `BADF1000` — the whole CC_SCRATCH read window returned the
+bus-error signature — so this boot **cannot distinguish "the falcon read poison" from "we
+cannot read the falcon's result at all."** Your sign-extension triage lands in neither arm:
+you named `FFFFFFBD` confirms and `000000BD` refutes, and `BADF1000` is neither.
 
-Rebased for you onto trunk as `e3d8ae38` (pre-rebase tip preserved at
-`refs/prerebase/gr19-igpu-f1`). Your `pci.rs` change respected the lane limit exactly —
-7 lines, the deferred call block, nothing else. Credit where it is due: **the sentinel
-is now correct and total** (rejects `0x00`, `0xFF`, `0xFFFFFFFF` and mixed triples,
-refuses to arm before any state update, and says so on one line), every failure path
-reaches `gmux_revert_now()`, the stall is bounded at `igpu.rs:1051` and `:298`/`:316`,
-and the WC one-shot latch does **not** apply — nothing repoints scanout.
+So: make the instrument separate those two worlds. Establish independently whether the
+falcon executed at all (a liveness/heartbeat the falcon writes to a register that is NOT
+in the poisoned window, read before the poisoned read is attempted), and read a control
+mailbox you know is readable in the same window so `phase=BADF1000` can be attributed to
+the mux of poison versus to an unreadable aperture. Add the third outcome arm your table
+lacks. **Do not report pull-35's class question as settled until this separates.**
 
-**BLOCKING 1 — you broke the normal rMBP build.** `igpu.rs:539` carries a stray
-`#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]`, left over from moving
-`gmux_igd_switch`, separated by blank lines from `pub fn init` at `:542`. Rust binds it
-to that function, so **the entire iGPU probe entry point is gated behind `gmux_igd`**.
-`intel-ivb` WITHOUT `gmux_igd` — the normal configuration, and exactly what the bench
-media builds — fails E0425 at `pci.rs:626`. Both gates passed because they only test
-knobs-all-off and knobs-all-on; the broken config is the middle one. (That gate gap is
-the seat's to fix, and is being fixed — but the defect is yours.)
+**JOB 2 — inner bounds inside `kdisp_takeover=328`** (carried from last pass, now with the
+metal number in hand). 328 of 331 is in one span, and that span is NOT just the blit:
+`kepler_display.rs:448`'s `panel_console_resume()` does a **second full-surface pass** over
+the same framebuffer, plus `wcx::activate()`, a 2,000,000-iteration `spin_loop` between the
+EVO-core passes, and 4096 uncached BAR0 reads. **Your ~315–325 ms blit prediction is not
+confirmed by 328** — if the truth is blit 160 + fbcon clear 130 you would call it confirmed
+while being wrong about which write costs the time. Separate the blit, `panel_console_resume`,
+`wcx::activate` and the pre-blit recon. `phase!` is scoped to `kepler::init`, so this needs a
+local macro in `kepler_display.rs` or a return path. Instrument-only again.
 
-**BLOCKING 2 — the success path never reverts, and the RUNBOOK promises it does.**
-`gmux_dwell()` is dead code (the compiler says so, along with both DWELL constants):
-`gmux_igd_switch` never calls it, so a successful arm returns with `armed: true` and no
-revert is ever issued. Meanwhile `RUNBOOK-gmux-igd.md` still tells the operator
-"Recovery is AUTOMATIC", promises a 10 s dwell then revert, and quotes an `ARMED
-synchronous revert` serial line that appears **zero times in the source**. Either wire
-the dwell/revert or rewrite the RUNBOOK — a runbook that promises a recovery the code
-does not perform is worse than no runbook at a black panel.
+**Housekeeping:** your branch `wt/kepler-mmio-x86` is merged and now 8 behind — cut the next
+one fresh from trunk, do not build on it. And note the seat corrected the pull-35 proposal's
+triage table a second time (`0e28a4bd`): the healthy signature is `504_read_touched=true`
+with **`504_read_idx=none`** (READ_INDEX sees HOST reads only; READ_TOUCHED is stored by
+hand before the falcon is armed). Boot Z read exactly that — your split works. Any numeric
+idx means an illegal host read.
 
-Three more, all real:
-- **Your liveness loop can only ever fail on this machine, by your own evidence.**
-  RUNBOOK step 5 says every iGPU pipe/plane reads zero. If so, `DSPACNTR` bit 31 never
-  sets and `FRMCOUNT` never advances, the loop always exhausts, and the re-census plus
-  `bring_up_blt_ring` at `igpu.rs:1077-1086` are **unreachable** — the arc cannot
-  demonstrate its own objective. Both registers also describe the iGPU pipe, not the
-  mux, so they measure the wrong subject in either direction. Propose what actually
-  proves the mux moved.
-- **Condition 4 went backwards.** Trunk armed the BLT ring inline in `init`; you deleted
-  that body and left an orphaned comment at `igpu.rs:719-723`, so `bring_up_blt_ring`
-  has exactly one caller. "Knobs OFF = zero behavioural change" is therefore false twice.
-- **DDC reads back at its WRITE index** `0x28` (`igpu.rs:442`) while DISPLAY/EXTERNAL
-  correctly use `0x11`/`0x41`. `m_ddc` gates the MATCH verdict, so this may make the
-  switch verdict a permanent false MISMATCH.
+## → igpu — still DO-NOT-MERGE. Boot Z hands you the evidence that your liveness test cannot work.
 
-Cleanup: deleting `GMUX_WAIT_MS` left two unused `start` bindings (`:290`, `:309`),
-three doc comments claiming a deadline that no longer exists, and a dangling doc +
-`#[cfg]` at `:261-262` that silently absorbed onto `GMUX_DWELL_MS`. The waits are still
-iteration-bounded, so no hang.
+Your branch sits at `e3d8ae38` (rebased for you). The five defects from last pass are
+unchanged and still block: the stray `#[cfg]` at `igpu.rs:539` that gates `pub fn init` and
+**breaks the normal rMBP build** (`intel-ivb` without `gmux_igd`), the dead `gmux_dwell()`
+so the success path never reverts while the RUNBOOK promises "Recovery is AUTOMATIC", the
+DDC read-back at its write index `0x28`, the orphaned `bring_up_blt_ring` caller, and the
+`GMUX_WAIT_MS` deletion residue.
 
-Fix on `wt/gmux-igd-x86` at `e3d8ae38`, build the MIXED knob combination yourself
-(`intel-ivb` on, `gmux_igd` off) before reporting, and the seat re-reviews.
+**NEW EVIDENCE, and it is about your success criterion.** Boot Z fired the census again:
+```
+:: igpu-blt: ring=absent why=no-active-surface — every iGPU display plane is off
+   (gmux routes the panel elsewhere); CPU path carries the console ::
+```
+That is now twice-confirmed on metal: **every iGPU plane is dark before the switch.** Your
+liveness loop waits on `DSPACNTR` bit 31 and `PIPE_FRMCOUNT_A` advance — both of which
+describe the iGPU *pipe*, and both of which read zero in exactly this state. If the switch
+works, does the pipe come up by itself? Nothing in your diff programs it. So as written the
+loop exhausts, reverts, and the re-census plus `bring_up_blt_ring` are **unreachable** — the
+arc cannot demonstrate its own objective even on a fully successful mux switch.
+
+**JOB — before touching the code again, answer this on paper (one paragraph, in the tree):**
+after the mux routes the panel to the IGD, what brings the iGPU pipe/plane *up*? If the
+answer is "we must program it", that is Flight 1's real content and your current diff is
+missing it. If the answer is "firmware left it configured and only the mux was away", say
+what register proves that and read THAT as your liveness criterion instead. Either way the
+criterion must be something that can read non-zero on a successful boot. Then fix the five
+defects, build the MIXED knob combination yourself (`intel-ivb` ON, `gmux_igd` OFF) before
+reporting, and the seat re-reviews.
