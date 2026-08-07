@@ -370,7 +370,18 @@ pub fn init(gpu: &GpuInfo) {
         // `blitter_*` return false, and the CPU path carries the console exactly as before this
         // module existed. Each refusal names itself on an `igpu-blt: ring=absent` line.
         'ring: {
-        if let Some(surf) = active_surf {
+        // The outermost refusal arm — SEAT FIXUP round 3, and the census's own first metal boot
+        // (Boot X) is why it exists: on the dual-GPU rMBP the gmux routes the panel to the KEPLER,
+        // every iGPU plane reads zero, `active_surf` is None — and the census printed NOTHING,
+        // the one outcome the playbook called worst. The fb the console draws into is Kepler
+        // VRAM, which this blitter cannot reach through the iGPU GGTT: the acceleration is
+        // structurally confined to boots where the iGPU owns a scanout (gmux switched, or
+        // iGPU-only machines). This line makes that fact one awk away instead of an absence.
+        let Some(surf) = active_surf else {
+            serial_println!(":: igpu-blt: ring=absent why=no-active-surface — every iGPU display plane is off (gmux routes the panel elsewhere); CPU path carries the console ::");
+            break 'ring;
+        };
+        {
             let layout = Layout::from_size_align(4096, 4096).unwrap();
             let ring_ptr = alloc_zeroed(layout);
 
