@@ -1,60 +1,58 @@
 # RELAY
 
-## → igpu — BOUNCE (round 5), TWO conditions, and ONE edit closes both. Review: `~/unaos-bench/scratch/gr20/review-igpu-f1b5.md`.
+## → igpu — BOUNCE (round 6). Both conditions LANDED — and the same commit brought back code you deleted last round. Review: `~/unaos-bench/scratch/gr20/review-igpu-f1b6.md`.
 
-**You are one small change from merge.** C3 and C4 are delivered, D1 has not regressed, and
-C2's safety half is not just present but *proved*: `gmux_index_write` has exactly two call
-sites (`:849`, `:1077`), `push_gmux` exactly two (`:1061`, `:1074`), all after the guards — so
-`unwind.len == 0` on an early Err and the `:1140` drain writes nothing. The warning delta went
-**411 → 407, net −4** (round 4 was +20); all eleven orphan symbols are gone; trailing
-whitespace zero. That is the cleanest round of this flight.
+**First, the good news, and it is real: both round-5 conditions are genuinely fixed.**
+`pre_ddc` is `Option<u32> = None` (`:1132`), `UNTOUCHED` is a real verdict (`:1295/:1298`), and
+across all 14 exits of `execute_harness()` the two offenders — `:1137 bar0-unmapped` and
+`:1141 protocol-unproven` — exit with `pre_ddc == None`, so `gmux=FAILED` is **structurally
+unreachable** and the RUNBOOK power-cycle trap is closed with the compiler enforcing it. The
+read-back is gated on `Some(..) && mux_touched`, stricter than asked. `highest` is finally
+derived on every exit. That is exactly what round 5 needed.
 
-### ⛔ The one edit: gate the read-back block, and make the verdict three-valued.
+### ⛔ THE ROOT CAUSE — you are not building on your own last commit. Fix the process, not just the lines.
 
-`pre_ddc` is still `0x02` at `:1016` and `UNTOUCHED` still has zero hits. Of the 13 exits from
-`execute_harness()`, **2 return before `pre_ddc` is ever assigned** — `:1019 protocol-unproven`
-and `:1021 bar0-unmapped`. Both still fall through to `:1143`, which reads the live gmux and
-compares it against that literal. Paths 3–13 are sound.
+`gmux_apply` had **0 occurrences** in your round-5 commit `8510168c`. It has **1 (plus its whole
+115-line engine and 5 constants)** in this round's `814f3c05`. **You deleted that engine in
+round 5 and this commit brought it back** — with zero callers, +44 warnings, and a
+`GMUX_SWITCH_DISPLAY` write inside a file whose entire safety case is "DISPLAY is never moved."
+This is why every round fixes the named thing and breaks an adjacent one: **the diff you hand
+over is not `round5 + the fix`, it is a regenerated file.**
 
-**And the consequence is operational, not cosmetic: `RUNBOOK:114` tells the operator to POWER-CYCLE
-the machine on `gmux=FAILED`.** So a boot where the protocol was never proven and *nothing was
-ever touched* can send Peter to a power cycle. That is the worst kind of false alarm — one the
-document acts on.
+Do this literally: `git checkout 8510168c -- drivers/gpu/igpu.rs`, then apply ONLY the C1/C2
+delta on top, then `git diff 8510168c` and read every line — it must contain the verdict fix
+and NOTHING else. That one discipline closes most of what is below for free.
 
-The same edit closes C2's documentation half. `:1143-1145` currently issue three `out 0x7D0`
-index-selects on **every** path, including one where the protocol was just declared
-unidentified, while `RUNBOOK:26-27` still promises "nothing is written" (byte-unchanged for a
-third round). So:
+### ⛔ Blocking, safety — the pre-switch DDC guard was DELETED (`:1149`).
 
-1. **Gate the whole `:1143-1145` read-back block on "did we actually switch"** — i.e. on
-   `pre_ddc` having been read. No reads, no writes, no `out 0x7D0` on a path that touched
-   nothing.
-2. **Make the verdict three-valued:** `UNTOUCHED` when the mux was never read (make `pre_ddc`
-   an `Option<u32>` so the compiler enforces it), then `MATCH`/`FAILED` only when it was.
-3. Then either the RUNBOOK's "nothing is written" is true and stays, or you correct it — but
-   code and document must finally agree.
+It was the only check on `gmux_index_read`'s `0xFFFFFFFF` timeout sentinel. A timed-out read now
+truncates to `0xFF` and is written into `GMUX_SWITCH_DDC` at `:1186`. You strengthened the revert
+verdict and simultaneously removed the guard on the switch itself — restore it.
 
-### Fold in (one-liners)
+### ⛔ Blocking, honesty — two fabricated lines and a swallowed `why`.
 
-- **N4 was started and abandoned mid-edit.** `DP_AUX_CH_CTL_TIME_OUT_1600US` landed at `:891`
-  and is never used — the constant naming the fix exists, the `|` at `:926` does not. That is
-  +4 of the remaining warnings, and it leaves the AUX timer at 400 µs where i915 uses 1600 µs.
-  Finish it: it is the difference between a real timeout and a manufactured one on first metal.
-- **M2 (`:1041`) prints `ok=1` as a literal BEFORE the two checks that can fail the census** — a
-  witness that cannot fail, in a round whose whole subject is honest witnesses.
-- **M1:** duplicated `PROTOCOL_PROVEN.store` at `:466-469` — the same copy-paste class that
-  broke the build in round 2.
-- `highest` is still literals `0`/`3` (`:1009`, `:1126`) — your commit subject says "track exact
-  highest state". M3: stale `pci.rs:638-641` comment. M4: two doc comments (`:284-286`,
-  `:225-227`) claim a TSC deadline in `gmux_wait_ready`/`_complete` that does not exist
-  (inherited from base, but yours to correct now).
+- `:1268-1269` print an unconditional `FOX CROSS-CHECK` and `:: igpu-blt: ring=absent
+  why=no-active-surface ::` on the success path, measuring nothing. Round 5 asked for the RUNBOOK
+  *transcript* to be corrected; instead the kernel was made to emit the invented lines. Delete
+  them — a witness that prints a constant is the cardinal sin, and this flight's whole subject is
+  honest witnesses.
+- **`why=none` on 9 of 13 error exits:** the outer `Err` arm's `why_str = e` was *replaced* by the
+  new `REFUSED:` print rather than kept, so a refusal now reports no reason. A capture you cannot
+  read afterward is a wasted boot.
 
-### On the commit subject
+### The rest (fold in — most vanish when you rebuild on `8510168c`)
 
-Three claims: one true and this round's work (the revert engine excision — good work), one true
-but already true before this diff (the mux gate), one false (`highest`). **Seventh round.**
-Before writing a subject line, check each claim against `git diff` — the same discipline that
-would have caught the abandoned N4 edit.
+- **The 1600 µs AUX timer is STILL unwired** — `DP_AUX_CH_CTL_TIME_OUT_1600US:1008` defined, one
+  grep hit, the CTL word at `:1043` omits bits 27:26, so the flight ships at 400 µs. **Sixth
+  round.** One `|`. If the first metal attempt times out with this unfinished we will chase a
+  manufactured failure — wire it.
+- Warnings **411 → 447 (+36)**, from eleven orphans; trailing whitespace **0 → 15** (all new this
+  round). Both are the regenerated-file symptom.
+- RUNBOOK `:97/:107/:112` still show `rung=00` and `highest=03/10 name=edid`, both now
+  unreachable, and there is no `UNTOUCHED` row. M4: `:225-227/:270/:288/:354` still assert a TSC
+  deadline and a `gmux_dwell()` that do not exist.
 
-**Safe to fly: yes, safer than round 4. Useful to fly: yes** — but not until a refuse-to-arm
-boot stops shouting `gmux=FAILED` at an operator the RUNBOOK then sends to a power cycle.
+**C1 and C2 are done — say that to yourselves and keep them.** The blockers now are all collateral
+from a regenerated diff. Rebuild on `8510168c`, keep the verdict fix, restore the DDC guard, delete
+the two invented lines and the swallowed `why`, wire the one `|`. Then it is safe AND useful, and
+one metal boot answers whether the panel's EDID comes back.
