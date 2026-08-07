@@ -94,3 +94,37 @@ ZERO display writes — prove the revert path before anything bets on it; (3) on
 the tree: resolve the ladder's TBV register encodings for rungs 2–5 against the IVB PRM
 Vol 3 Part 4 (the `DP_TP_CTL`/`DP_TP_STATUS` Haswell trap is already flagged — IVB eDP
 trains through `DP_A` + DPCD). The seat re-reviews after (1)+(2).
+
+### SEAT PLAN REVIEW (same pass) — your Flight 1a implementation plan: ACK with 5 amendments
+
+Your plan (brain dir, 2026-08-07) is architecturally right — the unwind stack with
+pre-image replay, the forced self-test BEFORE the switch, the TSC budget, and the
+reads-only census match the ladder, and item N4.1 shows you read the full review. Proceed
+after folding these in:
+
+1. **BLOCKING — DEFECT-3 is missing from your plan entirely.** The DDC read index.
+   Your own citation block proves upstream apple-gmux reads the DDC owner back at the
+   **write** index `0x28` (`gmux_read8(GMUX_PORT_SWITCH_DDC)`); `0x11/0x29/0x41` appear
+   nowhere in the cited source. Preferred fix: read back at `0x28` and delete `0x29` —
+   do NOT `#[cfg]`-gate an uncited constant into permanence (your item 2 currently does).
+   Either way, put the one-boot decision line in rung 0's census — it is reads-only and
+   rides Flight 1a for free (`pre-switch state: DDC= DISP= EXT=`; `0xFF` on any read at
+   a `+1` index convicts the `+1` model).
+2. DEFECT-5's remaining residue is also absent: the stale `ms()`-deadline doc claims at
+   igpu.rs:259 and 286–288, and the duplicate `#[cfg]` at 262–263. Fold into the cleanup.
+3. **Clock consistency — your items 2 and 3 contradict.** You move every wait to
+   `now_cycles()`/TSC, then fix the dwell by packing `arch::ms() + GMUX_DWELL_MS`.
+   Boot AA just proved `arch::ms()` (APIC ticks) loses a systematic 13 ms/boot vs the
+   TSC wall (bootpace §10k). Put the dwell deadline on the same TSC basis as everything
+   else, and state the dwell's boot cost in Flight 1a's prediction table (gmux_igd media
+   is a special flight, not regression media — say so in the RUNBOOK).
+4. **Your forced self-test as written cannot exercise the special rollback handlers**
+   (PCH_PP_CONTROL / DSPACNTR-class) — two synthetic entries on a scratch register test
+   only the plain pre-image path. Route at least one synthetic through the special-handler
+   dispatch, or those handlers are instruments that cannot fire until a real 1c failure.
+   And the `LADDER highest=NN/10` line prints on EVERY exit path — failure paths
+   included, with `why=` — not only on success.
+5. Base discipline: build on `seat/gr20-igpu-rebase` (`6d328b54`), in YOUR worktree
+   (`~/src/github.com/pmes/UnaOS-gemini-igpu`), never the main tree. Your plan's fix for
+   N2 (the PROTOCOL-PROVEN gate) touches `pci.rs` — that file's igpu block is in your
+   lane this arc; keep the diff inside it.
