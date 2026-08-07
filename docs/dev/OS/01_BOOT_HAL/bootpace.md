@@ -1774,8 +1774,10 @@ and `wait=209 ftdi=177` is what the tail actually costs. Recorded in
 ## §10i — GR19: five arcs in one flight, and the wait that was owed to a clock (Boot Y, 2026-08-06)
 
 **Boot Y (2026-08-06 ~20:57 MDT, capture `rmbp-gr16-s73` boot 18, media built at `776fb13c`) is
-the current whole-boot headline** and the first metal flight of five arcs at once: EHCI BUY-1,
-WXN-x86 M2, the kepler phase decomposition, wcx M-a, and the iGPU census arm.
+the boot that set the current whole-boot figure** and the first metal flight of five arcs at once:
+EHCI BUY-1, WXN-x86 M2, the kepler phase decomposition, wcx M-a, and the iGPU census arm.
+§10j's Boot Z holds `gui` at the same 2217 ms with three further instruments aboard, so the
+figures below are still the standing ones.
 
 ```
 [   2223ms] :: BPACE: total gui=2217ms ftdi=none n=27 dropped=0 hz=2693860140 result=LEDGER ::
@@ -1854,13 +1856,14 @@ interval since the previous one):
 | `scanout_handover` | 2 ms | 1 % | handover to the panel |
 | Σ | 379 ms | | against `kepler=396ms(n=1)` — **~17 ms residue**, outside any stamped phase |
 
-**`mmio_bringup` is the standing block and the named next target** — 331 of 396 ms in one phase —
+**`mmio_bringup` was the standing block and the named next target** — 331 of 396 ms in one phase —
 (**wire note:** `mmio_bringup` is a Boot Y name and no longer exists on the wire. The kepler
 lane's decomposition instrument, merged in `505a129e`, replaced that single phase with five —
 `pmc_vram_init`, `kdisp_takeover`, `pfifo_alloc_zero`, `runlist_write_and_pass0`,
 `plant_and_pass1` — which partition the same span exactly, since `phase!` is a running-delta
-macro and cannot leave a silent remainder. Boot Z reads those five, not this one. **Note before
-quoting them:** `kdisp_takeover` spans more than the calibration blit — `panel_console_resume`
+macro and cannot leave a silent remainder. Boot Z reads those five, not this one; §10j gives
+them, and `kdisp_takeover` inherits 328 of the 331. **Note before quoting them:**
+`kdisp_takeover` spans more than the calibration blit — `panel_console_resume`
 does a second full-surface pass over the same framebuffer, and `wcx::activate()`, a 2 M-iteration
 `spin_loop`, and 4096 uncached BAR0 reads are all inside it — so that number alone cannot
 attribute the cost to the blit. Inner bounds are assigned.)
@@ -1900,6 +1903,154 @@ next reading is taken against a known gap rather than a surprise.
 `BUY-2 FALSIFIED`/`suspect`, no `[wc-x]` REFUSE or DECLINE anywhere in the slice; the only
 `FAILED` line in it is the standing `[sdhc] cmd8 send-if-cond` with no card in the reader, which
 Boot X carries identically.
+
+## §10j — GR19 Boot Z: the kernel→user write gate on metal, and kepler's inner five (2026-08-06)
+
+**Boot Z (2026-08-06 ~22:5x MDT, capture `rmbp-gr16-s73`, media built at trunk `3aa2b7a4`) is the
+second GR19 metal flight**, and the first reading of three instruments that had never run on real
+silicon: the CFU-2 live-leaf write gate, the kepler five-phase split of what Boot Y called
+`mmio_bringup`, and the pull-35 FECS access ledger.
+
+```
+[   2222ms] :: BPACE: total gui=2217ms ftdi=none n=27 dropped=0 hz=2693862911 result=LEDGER ::
+[   2203ms] :: GPACE: xtail=0ms(n=1) bench=0ms(n=0) detect=5ms(n=1) igpu=1ms(n=1) kepler=396ms(n=1)
+   sdhc=12ms(n=1) nic=0ms(n=1) resid=3ms == witness ::
+```
+
+**`gui=2217ms` — identical to Boot Y to the millisecond, and flat is the result this boot wanted.**
+CFU-2 adds a per-4 KiB-page walk of the live page tables to every validated user range, on hardware
+where a page walk is real memory traffic rather than TCG bookkeeping; that was a live cost risk, not
+a formality. The whole-boot figure says it cost nothing measurable, and the block ledger agrees term
+by term — `ehci-hid-done d=1285`, `sched d=67`, `pci-scan d=105`, `xhci-settle d=100`,
+`pci-usb d=417`, `kepler=396`. Boot Z is a same-figure boot with three new instruments inside it.
+
+### CFU-2 — the W^X write gate passed on metal, first flight, all five arms
+
+`docs/SECURITY.md` carried CFU-2 as QEMU-verified and falsification-proven but **metal-pending**.
+Boot Z closes it:
+
+```
+[  11497ms] :: CFU2-WGATE: kernel->user write validated against LIVE leaf W — RO+X page (U3 ELF
+   shape, the VUG/PULSE bypass) REFUSED -EFAULT, RW page ACCEPTED, RW->RO straddle REFUSED while
+   its in-page head is accepted, RO page still readable -> PASS ::
+[  11497ms] :: CFU: SYS_OPEN wrap/below/above ranges each -EFAULT, no side effect, in-window
+   accepted, write-bound rejects the RO code page — witness OK ::
+```
+
+The straddle arm is the one worth naming twice: same pointer, same direction, verdict decided by a
+page the pointer is not in — a first-page-only check cannot produce that answer, so it is the arm
+that separates the new walker from the one-page bound it replaced. CFU-1's own negative witness
+prints on the same boot, so the cheap pre-filter and the live-leaf walk are each demonstrably live
+on silicon rather than one standing in for the other. Ledgered in `docs/SECURITY.md`.
+
+### `kepler=396ms`: the inner five, and what `kdisp_takeover=328` does not settle
+
+§10i's decomposition stopped at `mmio_bringup=331ms` with nothing inside it. Boot Z splits that
+phase five ways, and the split partitions it **exactly** — `phase!` is a running-delta macro, so it
+cannot leave a silent remainder:
+
+| phase | `d=` | share of 331 | what it covers |
+|---|---|---|---|
+| `pmc_vram_init` | 1 ms | 0 % | probe entry, POST/BAR checks, the VRAM allocator, and the 256-row pre-takeover mirror-header dump |
+| `kdisp_takeover` | **328 ms** | **99 %** | the whole `kepler_display::takeover_display()` call |
+| `pfifo_alloc_zero` | 1 ms | 0 % | PFIFO instance / GPFIFO / USERD / runlist / fence allocation and their zeroing |
+| `runlist_write_and_pass0` | 0 ms | 0 % | the channel instance block, the runlist write, and the pass-0 mirror-header re-scan with its latch-delta compare |
+| `plant_and_pass1` | 1 ms | 0 % | the beacon plant and the 256-row pass-1 scan |
+| Σ | **331 ms** | | **identical to Boot Y's single `mmio_bringup=331`** |
+
+The outer phases are unchanged too — `mirror_passes=13`, `ucode_echo=28`, `recon_and_witnesses=4`,
+`ctx_bind=1`, `scanout_handover=2` — with the same total stamped Σ = 379 against the same
+`kepler=396ms(n=1)`, so the same ~17 ms of unstamped head and tail. A refinement that raises the
+resolution and moves no measured figure is the shape a decomposition should have. `mmio_bringup` no
+longer appears on the wire.
+
+**`kdisp_takeover=328` does NOT settle the kepler lane's ~315–325 ms blit claim, and must not be
+quoted as though it did.** The stamp charges everything between the pre-takeover mirror dump and the
+return from `takeover_display()`, and besides the calibration blit that span contains
+`panel_console_resume()`'s **second** full-surface pass over the same framebuffer
+(`kepler_display.rs:448`), `wcx::activate()` (`:458`), a 2,000,000-iteration `spin_loop` between the
+two EVO-core passes (`:195`), and 4096 uncached BAR0 reads. Any of those can carry tens of
+milliseconds on this panel and this bus. **328 is an upper bound on the blit and nothing more until
+the inner bounds land** — they are assigned to the kepler lane, and the number is not evidence for
+the blit claim before they do.
+
+### `kern_WX` 305 → 319 — code growth, and the identity that says so
+
+```
+:: WXN-M2: xseg=[0x7B1FB000,0x7B339000) xsegs=2 xpages=318 tramp=0x8000 spare_n=2 demote_1g=0
+   split_2m=2 pool_used=2/16 nx_pdpt=0 nx_2m=1021 nx_pt=0 nx_4k=1217 keep_x=319 already_nx=0
+   skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+:: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=319 (1 MiB) tables=1030 nxe=1 walk=1729kcyc
+   l1=0 l2=65533 l3=1536 ::
+```
+
+The count went **up**, and on this media that is the reading of a bigger kernel, not of weaker
+coverage. `xpages` 304 → 318 is the 14 pages of new code Boot Z carries (CFU-2's
+`user_range_leaf_ok` and its witness, plus the kepler decomposition instrument); the wider extent
+now straddles two 2 MiB boundaries, so `split_2m` goes 1 → 2 and `pool_used` 1/16 → 2/16 — the
+splitter handling growth as designed, with `leaves = 66047 + 511 × 2 = 67069` and
+`tables = 1028 + 2 = 1030` still closing on the arithmetic. **The discriminator is the three-way
+identity, and it holds: `keep_x = xpages + 1 = kern_WX = 319`.** Coverage loss breaks that identity;
+code growth moves all three terms together. Until WXN M3b clears `W` from `.text` every code page is
+W∧X by construction, so `kern_WX` is a measure of **code size**, and the invariant to watch across
+boots is the identity rather than the count.
+
+The bench analyzer disagreed, and was half right: `serial-analyzer --wxn` exits 0 on the Z slice
+alone but raises `WXN-KERNWX-ROSE` on the Boot Y+Z pair. Firing was correct — a rise in that counter
+is exactly what an instrument should refuse to absorb — but the diagnosis said coverage had
+*shrunk*, which the identity refutes. The rule is being refined to test the identity instead of the
+sign of the delta. The rest of the W^X arms are unchanged: `WXAUDIT-NXE cores=8 nxe=8
+nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS` (M3a is not aboard this media, by design — CFU-2 had to land
+before WP was armed) and `WXN-FBWC … pat=1 -> LEAF BIT-IDENTICAL` with `fb_delta=0x0`.
+
+### pull-35's first flight: the ledger reads healthy, the falcon reads unreadable
+
+The FECS access ledger flew for the first time and reports the signature the ECHO/POKE split was
+built to produce:
+
+```
+[   2190ms] :: kepler: fecs-ledger accesses=528 first_offset=00002390 504_read_touched=true
+   504_read_idx=none 504_write_touched=true 504_write_idx=527 ::
+```
+
+`touched=true` with `idx=none` is the **healthy post-split** pair rather than a contradiction:
+`READ_INDEX` is set only inside `fecs_read`, so it records HOST reads exclusively, while
+`READ_TOUCHED` is stored by hand immediately before the falcon core is armed, precisely because a
+falcon `iord` is invisible to the host-side wrapper. The pair therefore reads: the falcon touched
+`0x409504`, and no host read did — exactly what the split was built for. `504_write_idx=527`
+against `accesses=528` places the terminal host poke last.
+
+**The falcon's own result, however, is unreadable, and the class question pull-35 exists to answer
+is UNSETTLED by this boot:**
+
+```
+[   2189ms] :: kepler: ctx-poke img=POKE ack=BADF1000 mb0=BADF1000 phase=BADF1000 iters=1
+   class=POISON ::
+[   2189ms] :: kepler: ucode-poke POISON img=POKE wrcmd_cmd=BADF1000 ::
+```
+
+The lane's own outcome table (`docs/dev/GEMINI/video/Kepler/PROPOSAL-kepler-fence-pull35.md` §3)
+predicts that a poison read gives `ack=BADFxxxx` **with the host reporting `phase=04`**. Here
+`phase` is `BADF1000` as well — the whole `CC_SCRATCH` read window returned the bus-error signature
+— so "the falcon read poison" and "we cannot read the falcon's result at all" are not
+distinguishable from this reading, and `class=POISON` is a label the instrument printed rather than
+a fact it established. The lane's sign-extension triage does not rescue it either: that separates
+`FFFFFFBD` (exit by bound — the command never reached the falcon) from `000000BD`, and `BADF1000`
+is **neither arm**. What would settle it is a result path that does not run through the window under
+suspicion — a host read of `CC_SCRATCH` taken *before* the falcon is armed, establishing whether
+the window was readable at all on this boot, plus an ack landed in a register outside it. Until one
+of those flies, pull-35's class question stands open.
+
+### Gates
+
+`mbench` x86-witness **28/28 REQUIRE, 0 FORBID** on the Boot Z slice — the first flight of the
+widened spec, which now requires `CFU2-WGATE`, the five kepler phases and the FECS ledger.
+`serial-analyzer --wxn` exits 0 on the Z slice; on the Y+Z pair it emits the single
+`WXN-KERNWX-ROSE` WARN discussed above. The regression floor held on every term that has one:
+`gui=2217`, `ehci-hid-done d=1285`, `sched d=67`, `WXN-FBWC … -> LEAF BIT-IDENTICAL pat=1`, and one
+`[wc-x] surface adopt SKIP (already live)` with zero REFUSE and zero DECLINE. No `PANIC`, no
+`EXCEPTION`; the only `FAILED` line in the slice is the standing `[sdhc] cmd8 send-if-cond` with no
+card in the reader, which Boots X and Y carry identically.
 
 ## 11. The boot head: `heap d=253ms` and the `sched` residue (GR20, 2026-08-06)
 
