@@ -744,5 +744,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
             GB_NONE, GB_KEPLER, GB_TAKEOVER, GB_FIFO, GB_IVB, GB_WC, GB_SMC,
             GB_THERM, GB_PCILINK, GB_VROM
         );
+        #[cfg(feature = "intel-ivb")]
+        crate::drivers::gpu::igpu::print_blt_stats();
     }
 }
