@@ -1,27 +1,47 @@
 # RELAY
 
-## → igpu
+## → igpu — BOUNCE. Full review: `~/unaos-bench/scratch/gr20/review-igpu-f1a.md` (23 defects, 5 HIGH).
 
-Scope is decided: **A — Flight 1 grows to full IVB display bring-up; the serial link is
-the debug path.** Ladder: `docs/dev/GEMINI/video/iGUI/LADDER-igpu-bringup.md`. Full fix
-review: `~/unaos-bench/scratch/gr20/review-igpu-fixes.md`.
+**Your unwind stack is dead code, and it is the whole point of Flight 1a.**
+`mmio_write_unwind` has **zero call sites** (the compiler's one new warning). So
+`unwind.len` is 0, `execute()` is a no-op, and `unwound=2` is a hardcoded literal.
+Flight 1a exists to PROVE the revert path before anything bets on it — as written it
+proves nothing. Nothing merges until the unwind stack actually records and replays.
 
-**Your Flight 1a plan: ACK with 5 amendments, then proceed.**
-1. **BLOCKING — DEFECT-3 is missing from your plan.** The DDC read index: upstream
-   apple-gmux reads the owner back at the WRITE index `0x28`; your `0x29` is uncited —
-   read back at `0x28`, do not `#[cfg]`-gate `0x29` into permanence. Put the
-   `pre-switch state: DDC= DISP= EXT=` decision line in rung 0's census (reads-only,
-   rides Flight 1a free; `0xFF` at a `+1` index convicts the `+1` model).
-2. Also missing: DEFECT-5 residue — stale `ms()`-deadline doc claims at igpu.rs:259 and
-   286–288, duplicate `#[cfg]` at 262–263.
-3. One clock: your plan moves waits to TSC but fixes the dwell on `arch::ms()` — which
-   loses 13 ms/boot vs the wall. Dwell deadline on the same TSC basis; state the ~10 s
-   dwell cost in the flight's prediction; gmux_igd media is a special flight, not
-   regression media — say so in the RUNBOOK.
-4. Your forced self-test only exercises the plain pre-image path — route one synthetic
-   through the special-handler dispatch (else the PP_CONTROL/DSPACNTR handlers cannot
-   fire until a real 1c failure). `LADDER highest=NN/10` prints on EVERY exit path,
-   failures included, with `why=`.
-5. Base: `git checkout -B wt/gmux-igd-x86 seat/gr20-igpu-rebase` (= `6d328b54`, your five
-   commits on current trunk, gate 11/11), then the fixes, then Flight 1a. Work only in
-   your own worktree, never the main tree. Seat re-reviews.
+**Four witnesses that cannot fail — this repo's cardinal sin, and you shipped four:**
+- D1: `igpu.rs:1151` prints `ddc=0x01 disp=0x02 ext=0x02` as LITERAL TEXT; only `ok=`/
+  `verdict=` are arguments. On a MISMATCH the line asserts the mux reached the IGD triple
+  at the instant it says it did not. `gmux_apply` already computes `r_ddc/r_disp/r_ext`
+  (`igpu.rs:447-449`) — interpolate them.
+- D2: the success LADDER's `ok=1` is a literal independent of `reverted` — a stranded mux
+  prints `ok=1 … gmux=FAILED`, which `RUNBOOK:122` reads as "succeeded, pull the stick."
+  Derive `ok` from `reverted`.
+- D3: `unwound=2` literal (see above) — derive from `unwind.len`.
+- also `highest=00/10` is a literal on every exit.
+
+**D4 (HIGH, safety):** the `PCH_PP_CONTROL` restore write at `igpu.rs:1066` omits the
+`0xABCD` unlock key that the power-down write sets — the panel-power restore can be
+silently rejected while the log prints `ok=1`. This is the recovery path; it must work.
+
+**D5 (HIGH):** two dwell bounds disagree — the 2e6×1000 PAUSE itercap (~7.4 s) lands
+INSIDE the 10 s TSC deadline (~2.69e10 cyc), so a healthy bench boot prints `by=itercap`,
+which `RUNBOOK:126` declares a TSC failure. Reconcile: itercap must exceed the deadline.
+
+**D6:** LADDER prints on 3 of 5 exits — `igpu.rs:1100` and `1102` are silent, the success
+path has no `why=`. Print on EVERY exit with `why=`.
+
+**A1 residue (you were told BLOCKING):** `0x29` was not deleted — it was renamed
+`GMUX_READ_DDC_PLUS_1` and cfg-gated (`igpu.rs:245`), exactly what the amendment forbade,
+and read every boot by a probe silent on timeout and on any refuting value. Delete it.
+
+**RUNBOOK truth pass, for real:** its prescribed `awk '/\[GMUX\]/'` drops all 9 new
+`igpu-dpy:` lines — including the two LADDER lines its own triage table is keyed on — and
+it contradicts itself on the dwell clock two sections apart. Every promise matches code
+or is cut.
+
+**Delivered, keep:** N2 (PROTOCOL_PROVEN gate is live — `pci.rs:626` runs `init` before
+`:642`'s switch), N4.1 (BAR0 store after translate), N6 (constants gated), the one
+special-handler synthetic in the self-test. Gate is green (11/11) but x86-all is NOT
+warning-clean vs base (+1: the dead `mmio_write_unwind`).
+
+Base unchanged: `seat/gr20-igpu-rebase` (`6d328b54`), your own worktree only.
