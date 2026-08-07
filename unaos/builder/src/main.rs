@@ -156,6 +156,17 @@ fn main() {
     // nothing on its buses. Config reads only, no BAR sizing, bounded sweep. Default OFF =>
     // function + call site unlinked, media byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_PCICENSUS").is_ok() { feats.push("pcicensus"); }
+    // BCMA-RECON (GR20): UNAOS_BCMARECON=1 arms drivers/bcma.rs — STRICTLY READ-ONLY recon of the
+    // Broadcom WiFi radio (class 0x02 / subclass 0x80), the first arc of the native-BCM4331 path.
+    // THIS list is what reaches the kernel binary for MEDIA builds: the builder re-derives the x86
+    // feature set from env, so a knob wired into arroyo alone ships the probe DISABLED while the
+    // `⚡ kernel features:` banner claims it is on (the s42/INSTGUI and WXN-M3b failure). This arc is
+    // as exposed to that bug as the census was, and in the same direction: a recon that silently did
+    // not run is indistinguishable on the wire from a machine with no radio in it — which is exactly
+    // the conclusion the whole path-A decision would then be built on. Config reads + BAR0 reads
+    // only; no config write, no register write, no BAR sizing. Default OFF => module + call site
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_BCMARECON").is_ok() { feats.push("bcmarecon"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature

@@ -775,6 +775,19 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     #[cfg(feature = "pcicensus")]
     full_census();
 
+    // BCMA-RECON (GR20, UNAOS_BCMARECON=1): STRICTLY READ-ONLY reconnaissance of the Broadcom WiFi
+    // radio — class 0x02 SUBCLASS 0x80, the subclass `find_device(0x02, 0x00)` below structurally
+    // cannot match, which is why the line this function has printed on every rMBP boot ("Found
+    // network controller … 0x14e4 at 3:0.0") names the BCM57765 Ethernet MAC and not the radio.
+    // Placed HERE, immediately after the census and BEFORE the GPACE anchor, for the census's own
+    // three reasons: upstream of every wedge-prone bring-up below, outside the GPACE tiling by
+    // construction, and self-reporting its own `elapsed=`. Config reads + BAR0 reads only; it maps
+    // BAR0 (a page-table edit, not a device access) and issues no config or register WRITE — every
+    // fact that needs one is printed as a `REFUSED reg=…` line instead. Knob OFF => this call and
+    // the module do not exist.
+    #[cfg(feature = "bcmarecon")]
+    crate::drivers::bcma::recon();
+
     // BPACE (M4): the xHCI bus scan. Split from the `if let` so the stamp lands whether or not a
     // controller was found — on a machine with no xHCI the tag is still present and `pci-usb`
     // follows it directly, which is how the ledger distinguishes "no controller" from "the scan

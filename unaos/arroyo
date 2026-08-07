@@ -231,6 +231,29 @@ _feats=""
 # Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
 # disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
 [ -n "${UNAOS_PCICENSUS:-}" ] && _feats="${_feats}pcicensus,"
+# BCMA-RECON (GR20): UNAOS_BCMARECON=1 arms drivers/bcma.rs — STRICTLY READ-ONLY reconnaissance of
+# the Broadcom WiFi radio, the first arc of the native-BCM4331 path. It looks for PCI class 0x02
+# SUBCLASS 0x80 (the census established that the class-0x02 device this kernel has named on every
+# boot is the BCM57765 Ethernet MAC at subclass 0x00, and that `find_device(0x02, 0x00)` returns on
+# its first hit, so the radio has never been examined), maps BAR0, and reads the ChipCommon window:
+# chip id/rev/package/#cores/type, capabilities, the EROM backplane pointer, OTP status + which
+# subregions are programmed, and — when an SPROM is advertised — a 220-word shadow dump with a
+# plausibility verdict (unicast MAC + supported revision; the CRC-8 is deliberately NOT computed and
+# the line says so).
+#
+# It WRITES NOTHING. On a BCMA part behind PCIe, BAR0 shows exactly ONE backplane core at a time and
+# the selector is PCI config register 0x80 (BCMA_PCI_BAR0_WIN, what Linux's bcma_scan_switch_core
+# writes). Firmware parks it at the ChipCommon enumeration base, so the EROM, every other core, and
+# the PHY version register are all behind that one write — and each is emitted as an explicit
+# `REFUSED reg=cfg:0x80 …` witness naming the register and the address, never as a missing line.
+# Same for the 4331 SPROM ext-PA mux and the OTP read command (OTPP). Mapping BAR0 is a page-table
+# edit, not a device access. Bounded twice over (structural entry cap + a TSC deadline via
+# now_cycles/hw_wait_budget — never arch::ms(), whose APIC tick does not advance with interrupts
+# masked). x86_64 only; stripped from aarch64 builds by `arm_features` below.
+# Default OFF => module + call site unlinked, media byte-identical.
+# Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
+# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_BCMARECON:-}" ] && _feats="${_feats}bcmarecon,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -463,6 +486,13 @@ arm_features() {
     # aarch64 media hash between a default build and a `UNAOS_PCICENSUS=1` one for zero observable
     # change. Stripped => the x86 track can arm a bus census without touching Pi or Jetson media.
     f="${f//,pcicensus,/,}"
+    # BCMA-RECON (GR20) rides the same strip, for the same reason: `drivers/bcma.rs` is declared
+    # `#[cfg(all(target_arch = "x86_64", feature = "bcmarecon"))]` and is reached only from
+    # `arch/x86_64/pci.rs`, so `bcmarecon` emits not one byte of aarch64 CODE — but an enabled
+    # feature is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in would shift every
+    # aarch64 media hash between a default build and a `UNAOS_BCMARECON=1` one for zero observable
+    # change. Stripped => the x86 track can recon a radio without touching Pi or Jetson media.
+    f="${f//,bcmarecon,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -1102,7 +1132,10 @@ check_user_arch() {
 }
 
 # GATE-CFG: the DEFAULT feature set is a tiny fraction of this kernel. `[features]` in
-# crates/kernel/Cargo.toml carries 78 knobs plus `default = []`, so the two legs below compile only
+# crates/kernel/Cargo.toml carries 83 knobs plus `default = []`, so the two legs below compile only
+# (this count was stale at 78 when GR20's `bcmarecon` was added — the real count was already 82,
+# four other-lane knobs having landed without it being bumped; counted, not incremented, with
+# `awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+ *=/{print $1}' Cargo.toml`)
 # what survives with every knob off — and `$KERNEL_FEATURES` (the UNAOS_* → cargo-feature mapping at
 # the top of this script) adds knobs only when the OPERATOR sets them, which nobody does before a
 # commit. Everything behind a `#[cfg(feature = ...)]` was therefore NEVER type-checked by the gate.
@@ -1166,7 +1199,7 @@ KERNEL_CFG_MATRIX=(
   # site in `arch/x86_64/pci.rs`, all x86-only, so this leg is the only one that type-checks them.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the

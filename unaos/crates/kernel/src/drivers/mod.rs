@@ -12,6 +12,12 @@ pub mod ehci;
 // x86_64-only; knob off => the module is unlinked and media byte-identical.
 #[cfg(all(target_arch = "x86_64", feature = "smc"))]
 pub mod smc;
+// BCMA-RECON (GR20): read-only reconnaissance of the Broadcom WiFi radio (UNAOS_BCMARECON=1) —
+// PCI class 0x02 SUBCLASS 0x80, the subclass every targeted walk in this kernel structurally cannot
+// match, which is why the radio in the 2012 rMBP has never been looked at. Config reads + BAR0
+// reads only. x86_64-only; knob off => the module is unlinked and media byte-identical.
+#[cfg(all(target_arch = "x86_64", feature = "bcmarecon"))]
+pub mod bcma;
 pub mod block;
 pub mod e1000;
 // SDHC (milestone 2): the SD Host Controller driver on x86 — the 2012 rMBP's built-in PCIe card

@@ -502,6 +502,26 @@ sdw = []
 # WXN-M3b lesson).
 pcicensus = []
 
+# BCMA-RECON (GR20): `UNAOS_BCMARECON=1` arms `drivers/bcma.rs` — STRICTLY READ-ONLY reconnaissance
+# of the Broadcom WiFi radio in the 2012 rMBP, and the first arc of the native-BCM4331 path. It
+# writes nothing: PCI config-space READS (class 0x02 / **subclass 0x80** — the subclass
+# `find_device(0x02, 0x00)` structurally cannot match, which is how a radio sat unexamined in this
+# machine for the life of the project) plus MMIO READS through BAR0's ChipCommon window. Reports
+# chip id/rev/#cores, the EROM backplane pointer, SPROM presence + shadow dump with a plausibility
+# verdict, OTP status/programmed-subregions, and an explicit `REFUSED reg=…` line for every fact
+# that is behind a WRITE — the BAR0 backplane window (PCI cfg 0x80) gates the enumeration ROM, every
+# non-ChipCommon core, and the PHY version register, so one register is the whole boundary and the
+# witness names it rather than leaving a hole. Mapping BAR0 is a page-table edit, not a device
+# access (same seam as `sdhc::probe`). Bounded twice over: a structural entry cap on the EROM walk
+# and a TSC (`now_cycles`/`hw_wait_budget`) deadline, never `arch::ms()` — the APIC tick does not
+# advance with interrupts masked, and this probe runs inside `pci::init`.
+#
+# Default OFF => the module and its call site do not exist and media are byte-identical. x86_64 only,
+# and stripped from aarch64 builds by arroyo's `arm_features`. Kept in sync with `unaos/arroyo` AND
+# `unaos/builder/src/main.rs` — the builder rebuilds the x86 kernel from its own env list, so a knob
+# wired only in arroyo ships disabled (the s42/INSTGUI and WXN-M3b lesson).
+bcmarecon = []
+
 # AARCH64-VNET: the `UNAOS_VNET=1` virtio-net-mmio driver on the QEMU `virt` machine + smoltcp bind
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. NET-4's
 # driver is `tegra`-gated (QEMU models no Tegra234 RC), so it is only ever COMPILE-tested off metal; this
