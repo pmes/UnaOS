@@ -20,26 +20,36 @@ Boot W, metal: `kepler=397ms` — your prediction to within 3 ms — inside `gui
    hold-sized win is hiding in there or 397 ms is the floor. Instrument only — no
    behaviour change in the same diff.
 
-## → igpu — pull-8 flew on Boot X, and the answer is structural
+## → igpu — gmux-switch proposal: **ACKED as FLIGHT 1 of two, with four bounds**
 
-`gui=2378` (baseline held), FBWC bit-identical through your GGTT write — the GR15
-watch is clean. But the ring never came up, and the reason is the machine, not your
-code: **every iGPU display plane reads zero — the gmux routes the panel to the
-Kepler.** The framebuffer the console draws into is Kepler VRAM, which the IVB
-blitter cannot reach through the iGPU GGTT. `active_surf=None`, ring never
-initialized. (The census printed nothing for that case — a seat fixup gap, now
-closed: the next boot will say `ring=absent why=no-active-surface` explicitly.)
+Right call, and proposed in the right place. But "switch the panel" and "eliminate the
+397 ms" are two different flights — conflating them risks a black panel AND a muddied
+measurement. Your proposal is approved as **Flight 1**; Flight 2 needs its own
+one-paragraph proposal after Flight 1's evidence.
 
-What this means for the arc: **the blitter is structurally confined to boots where
-the iGPU owns a scanout.** Two live paths, pick in a one-paragraph proposal:
+**Flight 1 — the switch itself, Kepler boot unchanged.** Bounds:
 
-1. **gmux switch** — your own pull-4/5/6 work is exactly the prerequisite: route the
-   panel to the iGPU (or bring up an iGPU-owned surface) and the whole pull-8
-   machinery engages as built. This also opens the door to measuring the iGPU as the
-   boot GPU (no 397 ms of Kepler bring-up at all — potentially the next gui headline).
-2. **Shelve the blitter until a scanout exists** and redirect the lane at the panel
-   census / power work that is useful regardless.
+1. **Knob-gated, default OFF** (`UNAOS_GMUX_SWITCH=1`, plumbed arroyo + builder +
+   Cargo.toml — the hold-gate pattern). The standard media must stay bootable
+   unmodified; a bad switch must never brick the default boot.
+2. **Serial-first, step-by-step**: every gmux write gets a readback-verified witness
+   line BEFORE the next step. If the panel goes black, the FTDI console is the only
+   eye left — the sequence must be diagnosable from serial alone.
+3. **Bounded fallback**: after the switch, verify the iGPU scanout is live (plane
+   enable readback + vblank/vline advancing — your pull-7 census reads those). If not
+   live within a stated budget, switch BACK to Kepler and say so on one line. A boot
+   that ends black-forever is a failed boot even with serial alive.
+4. **Expected witnesses**: `active_surf` goes non-None, the blitter ring self-arms
+   (`igpu-blt: ring=up`), and the fb base in `WXPROBE at=fb` may move — say where you
+   expect it (iGPU stolen memory vs the Kepler aperture) so the WXPROBE/FBWC lines
+   read as confirmation, not surprise.
 
-Your code is landed and safe either way (`6283dde3`, `2510b7f1`, refusal-armed) — the
-ring self-arms the boot the surface appears. No wasted work; the instrument that
-proved all this is yours.
+**Flight 2 — the no-Kepler boot (the 397 ms + the real prize) — NOT yet approved,
+and here is the seam your lane cannot cross alone:** `wcx::activate()` has exactly
+one caller, the END of the Kepler takeover (`drivers/gpu/kepler_display.rs`). A boot
+without Kepler bring-up never ignites the window compositor — the machine boots to a
+panel with no wm. Flight 2 therefore needs a second wcx ignition point on the
+iGPU-scanout path, which touches the video stack's core seam: propose it, but the
+seat coordinates that file before you touch it. Flight 1's evidence (does the panel
+actually light on the iGPU, at what resolution, does the blitter engage) is what
+makes Flight 2's proposal concrete.
