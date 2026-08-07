@@ -46,6 +46,14 @@ fn main() {
     // U2/U4x..U6bx storage chain that cascades U7x..U6gx). Default OFF => a default boot reaches the shell with
     // the boot-honesty lines only. arroyo auto-sets + EXPORTS it for the battery commands; kept in sync with arroyo.
     if std::env::var("UNAOS_WITNESS").is_ok() { feats.push("witness"); }
+    // WXN-x86 M3b: UNAOS_WXNRO=1 arms `wxnro` — the W-clear on the kernel's executable pages. This
+    // line is not optional bookkeeping: the ESP the x86 boot paths actually carry is THIS build, not
+    // `arroyo`'s `build_kernel_x86_64` one, so a knob wired only in arroyo produces a media whose
+    // `:: WXN-M3B: … ::` line honestly reads `armed=0` on a run the operator armed. (That is exactly
+    // what the draft's first `UNAOS_WXNRO=1 ./arroyo test 60` printed, before this line existed — the
+    // `armed=` field on the wire is what caught it, and it stays on the line for that reason.) Kept
+    // in sync with arroyo.
+    if std::env::var("UNAOS_WXNRO").is_ok() { feats.push("wxnro"); }
     if std::env::var("UNAOS_SKIP_XHCI").is_ok() { feats.push("skip_xhci"); }
     if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
     // CLOCK-2: UNAOS_LOGTS=1 arms `logts` — a compact per-line timestamp prefix (monotonic ms → UTC

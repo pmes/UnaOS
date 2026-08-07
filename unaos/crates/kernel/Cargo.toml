@@ -45,6 +45,17 @@ gmux_igd = []
 # so witness coverage is unchanged-green; the boot/media builds (`x86`/`arm`/`esp-*`/`kernel8`) leave it
 # off. Gates CALL SITES only — never the fixture bodies. See review/unaos-default-quiet-LANDING.md.
 witness = []
+# WXN-x86 M3b (THE ARM): PERFORM the W-clear on the kernel's executable pages, rather than only
+# measuring it. x86_64 only. DEFAULT OFF is load-bearing and not a convenience: with the knob off,
+# `memory::wxn_ro_stage` runs the identical extent derivation and the identical read-only census,
+# prints `:: WXN-M3B-PRE: ... -> CENSUS ::` and then `would=` where an armed boot prints `cleared=`,
+# and writes NOTHING — it does not even open a `CR0.WP` window. The store itself is gated with
+# `cfg!(feature = ...)`, NOT `#[cfg]`, so it is COMPILED and type-checked in every leg of
+# `./arroyo check` whichever way the knob is set (GR19 paid for that lesson with a gate blind to
+# mixed knobs), and the `x86-all` cfg-matrix leg carries `wxnro` so the ARMED polarity is
+# type-checked too. Enable via `UNAOS_WXNRO=1` — in BOTH arroyo and builder, since the x86 ESP
+# carries the BUILDER's kernel. See arch/x86_64/memory.rs §WXN-x86 M3b and docs/SECURITY.md.
+wxnro = []
 # WC-G/M3 (PAYGO): reshape the `witness` build's `[wc-g]` glass battery so a boot does not pay for
 # all four passes at once. x86_64 only, and it changes only the READ-BACK: pass 1 becomes
 # lattice-sampled (every 16th source pixel per row, phase rotating one column per row) and marks

@@ -93,6 +93,14 @@ _feats=""
 # ZERO `uvug7` strings and the witness cannot fire. Every boot now states its own witness build state on
 # the `:: AARCH64 build: witness=... ::` line, so absence is never mistaken for failure again.
 [ -n "${UNAOS_WITNESS:-}" ] && _feats="${_feats}witness,"
+# WXN-x86 M3b: UNAOS_WXNRO=1 arms the `wxnro` feature — the W-clear on the kernel's executable pages
+# (x86_64 only). OFF is not "the stage absent": `memory::wxn_ro_stage` runs either way and prints its
+# read-only census (`:: WXN-M3B-PRE: ... -> CENSUS ::`) plus a `would=`/`-> DRYRUN` result line; ON
+# turns that `would=` into `cleared=` and the kernel's `.text` read-only under the CR0.WP M3a armed.
+# Default OFF, so every existing build path (`test`, `x86`, `esp-x86`, the media builds) keeps today's
+# writable-.text map and gains two measuring lines. MUST be wired in builder/src/main.rs too — the x86
+# ESP carries the BUILDER's kernel, not this one. Pair it with nothing; it needs no other knob.
+[ -n "${UNAOS_WXNRO:-}" ] && _feats="${_feats}wxnro,"
 # WC-G/M3 (PAYGO): UNAOS_WCG_PAYGO=1 arms the `wcg-paygo` feature — the pay-as-you-go reshape of the
 # `[wc-g]` glass battery (x86_64 only). Pass 1 becomes lattice-sampled and says so on the wire
 # (`coverage=lattice16`); passes 2..4 keep FULL coverage but wait for 15 s of uptime, so the ~11.5 s
@@ -1197,9 +1205,13 @@ KERNEL_CFG_MATRIX=(
   # `#[cfg]` is type-checked by this leg alone. PCI-CENSUS (GR20) is APPENDED at the end for the
   # same reason and by the same rule: `pcicensus` gates `full_census` + its two helpers + the call
   # site in `arch/x86_64/pci.rs`, all x86-only, so this leg is the only one that type-checks them.
+  # WXN-x86 M3b (GR20) is APPENDED at the end for a slightly different reason: `wxnro` gates a
+  # `cfg!(...)` expression, not a `#[cfg]` item, so the DISARMED polarity of `wxn_ro_stage` is already
+  # type-checked by every leg. What this leg adds is the ARMED polarity — the constant folds the other
+  # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,wxnro"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the

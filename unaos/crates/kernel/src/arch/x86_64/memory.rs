@@ -2069,6 +2069,15 @@ pub fn wxn_pdpt_sweep() {
     // own `leaf_is_fb_wc` refusal, and `wx_probe_report` — which runs after BOTH — is the post-M2
     // leaf readback for every named address.
     wxn_split_stage(&spare, img_lo, img_hi, pge, cr4);
+
+    // M3b — the W-clear. AFTER M2, because it needs the 4 KiB granularity M2 created (a 2 MiB leaf
+    // straddling the extent would otherwise force it to refuse), and after M2's fb interlock has been
+    // cashed so each stage brackets its own window. Still inside `arch::init`: interrupts masked,
+    // pre-`sti`, and — the property that costs nothing and buys the most — before `smp::start_aps`,
+    // so no AP can ever have cached a writable translation of a page this clears. `wx_probe_report`,
+    // which runs after all three, is the post-M3b leaf readback: `at=ktext` is the address whose
+    // `w=`/`fw=` fields this stage is expected to move from 1 to 0.
+    wxn_ro_stage(pge, cr4);
 }
 
 // =================================================================================================
@@ -2303,12 +2312,31 @@ impl WxnKeep {
 /// can legitimately hold executed code; the writable ones never can.
 ///
 /// Rounding OUT is the fail-safe direction: sub-page granularity does not exist, so a page shared
-/// between a read-only and a writable segment keeps X. On this image exactly one page is shared
-/// (`.text`'s tail and `.data.rel.ro`'s head), and it is read-only in the ELF's own view anyway.
+/// between a read-only and a writable segment keeps X. Whether any page IS shared on a given link is
+/// a `rust-lld` layout fact, not a property of this kernel, so it is MEASURED rather than asserted
+/// here: M3b subtracts `wxn_wdata_span()` from this extent page by page and prints the count as
+/// `wskip=` on its own line. (An earlier version of this comment claimed "on this image exactly one
+/// page is shared — `.text`'s tail and `.data.rel.ro`'s head". That was stale: on every link measured
+/// since, the two segments land on distinct pages and `wskip=0`. The number on the wire is the
+/// record; a comment is not. — review-m3b-draft.md C10.)
 ///
 /// Same PIE reasoning as `wxn_image_bounds`: `min_vaddr == 0`, so a segment's runtime address is
 /// `ehdr + p_vaddr` exactly.
 fn wxn_exec_extent() -> Option<(u64, u64, u32)> {
+    wxn_load_union(false)
+}
+
+/// The page-rounded-OUT union of the image's `PT_LOAD` segments whose `PF_W` bit equals
+/// `want_writable`, plus the count of segments unioned. `wxn_exec_extent` is the `false` arm (the
+/// executable extent M2 spares); M3b's `wxn_wdata_span` is the `true` arm (the pages the image itself
+/// declares mutable, which M3b must never make read-only).
+///
+/// ONE phdr WALK, TWO QUESTIONS — deliberately, per the CFU-2 precedent: M2's keep set and M3b's
+/// exclusion set have to come from the same header read by the same code, or a disagreement between
+/// two hand-rolled walks becomes a page that is executable under one rule and writable under the
+/// other. Splitting the predicate out is the whole change; the `false` arm is behaviour-identical to
+/// the walk M2 has run since `e8b11513`.
+fn wxn_load_union(want_writable: bool) -> Option<(u64, u64, u32)> {
     const PT_LOAD: u32 = 1;
     const PF_W: u32 = 2;
     let ehdr = &raw const __ehdr_start as u64;
@@ -2343,7 +2371,7 @@ fn wxn_exec_extent() -> Option<(u64, u64, u32)> {
                 core::ptr::read_unaligned(ph.add(40).cast::<u64>()),
             )
         };
-        if ptype != PT_LOAD || flags & PF_W != 0 || memsz == 0 {
+        if ptype != PT_LOAD || (flags & PF_W != 0) != want_writable || memsz == 0 {
             continue;
         }
         segs += 1;
@@ -2766,6 +2794,511 @@ fn wxn_split_stage(spare: &WxnSpare, img_lo: u64, img_hi: u64, pge: bool, cr4: u
     // there are none in `.text` — the kernel writes its own `.data`), and `keep_x` must in turn equal
     // `xpages + 1` above, which is derived from the ELF header alone. Three independent derivations
     // of one number, on two adjacent lines.
+}
+
+// =================================================================================================
+// WXN-x86 M3b — clearing W from the kernel's executable pages. THE FIRST READ-ONLY KERNEL PAGE.
+// -------------------------------------------------------------------------------------------------
+// WHAT M1/M2/M3a LEFT. M1 put NX on 126 of 128 GiB; M2 shrank the executable residue to exactly the
+// image's non-writable `PT_LOAD` union plus the AP trampoline page; M3a armed `CR0.WP` on every core
+// so that a leaf's W bit binds a CPL-0 store at all (metal Boot AB: `wp=8 wp_mask=0xFF -> PASS`,
+// `cr0=0x0000000080010013`). Every page in that residue is still WRITABLE — every `WXPROBE map:
+// at=ktext` in the record reads `w=1 fw=1 fx=1`. The map so far constrains what may EXECUTE; it does
+// not constrain what may be WRITTEN. M3b closes the W column.
+//
+// THE POPULATION, and it is not M2's keep set:
+//
+//   * THE TRAMPOLINE PAGE STAYS WRITABLE — a lifecycle fact, cited not assumed. `arch::init` (where
+//     M1, M2 and this stage run) executes at `main.rs -> lib.rs`, and `smp::start_aps()` strictly
+//     AFTER it. `start_aps` writes the trampoline page wholesale once
+//     (`smp.rs`, `copy_nonoverlapping(ap_trampoline_start, TRAMPOLINE_ADDR, len)`) and then once PER
+//     AP (`patch_param(ap_param_stack/ap_param_index)`, inside the per-AP loop, because the handoff
+//     slot is shared and reused for every core). With `CR0.WP` armed a read-only `0x8000` turns the
+//     first of those stores into a fatal CPL-0 `#PF` before a single AP starts. So M3b leaves it
+//     alone and SAYS SO on the wire (`tramp_w=`). **`kern_WX` floors at 1, not 0, and the residue IS
+//     the trampoline.** Anyone predicting 0 is predicting a boot with no APs. Making it RX needs a
+//     lifecycle — clear W after the LAST AP reports online, inside `start_aps` — which is a separate
+//     change in a separate file and is named M3c here rather than smuggled in.
+//
+//   * THE EXTENT IS ROUNDED *IN*, NOT OUT. `wxn_exec_extent` rounds OUT because for X the fail-safe
+//     direction is "keep it executable". For W it is the OPPOSITE: a page any `PF_W` LOAD touches,
+//     even by one byte, must keep W or a legitimate write to `.data.rel.ro`/`.got`/`.data` becomes a
+//     `#PF`. M3b therefore subtracts the page-rounded-OUT union of the WRITABLE LOADs
+//     (`wxn_wdata_span`) per page and counts it as `wskip=`. On the links measured to date the two do
+//     not overlap — but that is a `rust-lld` default, not a property of this kernel, so it is
+//     SUBTRACTED AT RUNTIME. `wskip=0` on the wire is evidence that it held on the boot you are
+//     reading; it is not a claim that it always will. A non-zero `wskip` is a W^X HOLE (a page in the
+//     exec extent that keeps W *and* keeps X) and a finding to chase, not a benign count.
+//
+// WHAT MAY WRITE INTO THE RANGE — from artefacts, not from confidence:
+//   * RELOCATIONS. The image is PIE and carries ~1.5k entries, all `R_X86_64_RELATIVE`, every target
+//     inside LOAD 03 (`RW`) and ZERO below it — i.e. none inside the extent. They are applied by the
+//     BOOTLOADER before it ever jumps to `_start`, so they are complete before the kernel's first
+//     instruction.
+//   * SELF-PATCHING. None: no `&raw const ... as *mut`, no `addr_of!(..) as *mut`, no
+//     `.as_ptr() as *mut`, no `.cast_mut()` anywhere under `crates/kernel/src`. The `.text`/`.rodata`
+//     addresses the kernel does take are READ sources — `ap_trampoline_start` (a memcpy source), the
+//     `unaos_user_*_blob_start` symbols (copy sources for the ring-3 window) and `__ehdr_start`.
+//   * NO MUTABLE DATA IN `.text`. `readelf -sW` finds zero `OBJECT` symbols in `.text`; a
+//     disassembly-wide sweep of every RIP-relative STORE-shaped instruction in the image resolves
+//     zero targets below the extent's top.
+//   * `.section` LEAKS. Closed at the source (`smp.rs`'s `.pushsection`/`.popsection`, `eb6cd7c2`)
+//     and held closed by a post-link gate (`gate_x86_rodata_no_code`, which fails the x86 kernel link
+//     on any GLOBAL `FUNC`/`NOTYPE` symbol in `.rodata` other than the trampoline's own labels). It
+//     says nothing about a page a `PF_W` segment shares — that is `wskip`'s job, not the gate's.
+//   * STACKS / DESCRIPTOR TABLES. AP stacks, IST stacks, percpu and the GDT are all `.bss` (LOAD 04
+//     `RW`) — which also closes a class worth naming: the CPU's own GDT ACCESSED-BIT write would
+//     fault on a read-only descriptor table, and the GDT is not in the extent.
+//   * HEAP. Does not exist yet when M3b runs, and M3b allocates nothing.
+//   * WHAT IS GENUINELY UNCOVERED, and it should be said: a store through a pointer whose value comes
+//     from firmware/`BootInfo`/a device BAR, and DMA. DMA is not paging-checked (no IOMMU), so M3b
+//     adds NO brick risk there — a DMA scribble into `.text` stays exactly as silent post-M3b as it
+//     is today.
+//
+// ORDERING, and the property it buys for free. M3b runs where M1 and M2 run — inside `arch::init`,
+// interrupts masked, before `sti`, immediately after `wxn_split_stage` (it needs the 4 KiB
+// granularity M2 created) and well before `start_aps`. Because NO AP HAS BEEN STARTED YET, no core
+// other than the BSP can ever have cached a writable translation of these pages — the same argument
+// U1b B4 makes for the ring-3 code page, and the reason this needs no cross-core shootdown. The slot
+// page tables are not a second copy: `build_slot` COPIES THE KERNEL PML4 ENTRIES, which point at the
+// same lower tables, so a leaf edited here is the same leaf every process CR3 walks.
+//
+// WHAT BINDS IT, per core. `CR0.WP` is per-core state. The BSP armed it in `syscall::init` before
+// `wxn_pdpt_sweep`, so the RO binds on the BSP from the instant M3b writes it. Each AP arms its own
+// in `syscall::init` inside `ap_entry`; between its first paged instruction and that call an AP runs
+// with WP=0. Nothing in that window writes `.text` — it is APIC/GDT/percpu setup — but the honest
+// statement is that the RO regime is complete only once `wp_mask` is full, and the witness for that
+// is the EXISTING `WXAUDIT-NXE: ... wp=8 wp_mask=0xFF -> PASS` line, not a new one.
+//
+// THE ARM, AND WHY IT IS NOT A CONVENIENCE. This is the change most able to brick a boot since WXN
+// began: M1 and M2 only ever restricted EXECUTION of pages nothing executes, and a missed flush there
+// "can only leave the protection vacuous ... it can never fault". M3b restricts WRITES on the pages
+// the kernel is running from. One missed writer is a fatal CPL-0 `#PF`. So the WRITE is behind
+// `feature = "wxnro"` (`UNAOS_WXNRO=1`) and the WALK is not: DISARMED — the default, and every
+// existing build path — this stage takes the identical census, writes NOTHING, and prints `would=`
+// where an armed boot prints `cleared=`. Recovery from a bricked armed boot is one media rebuild with
+// the knob unset, not a revert.
+//
+// `cfg!(feature = ...)`, NOT `#[cfg]`: the store is COMPILED and type-checked in every leg of
+// `./arroyo check` whichever way the knob is set, so no cfg-matrix leg can be green on code the armed
+// build never saw. (GR19 paid for that lesson with a gate blind to mixed knobs.)
+//
+// CENSUS FIRST, THEN WRITE — and it is why this needs only ONE armed boot. M2, the strictly LESS
+// dangerous stage, takes its full census before writing anything. M3b does the same: a read-only
+// pre-pass walks the extent, counts `would`/`wskip`/`huge_*`/`absent`/`already_ro`, and PRINTS
+// `:: WXN-M3B-PRE: ... -> CENSUS ::` BEFORE the write window opens. Three things follow. (1) An armed
+// boot is self-predicting — it carries its own prediction and its own result, and the closure between
+// them is checkable inside one capture. (2) A boot that dies anywhere in the write window still
+// carries its census, which is the case a separate dry-run flight could never have helped with.
+// (3) A DRY RUN CANNOT PREDICT THE BRICK MODE ANYWAY: every finding a disarmed boot can make
+// (`wskip`, `huge_leaves`, `absent`, a `would` that misses expectation, the extent assert, the
+// `wseg=none` refusal) either degrades the armed boot gracefully or fires IDENTICALLY in both arms.
+// The one condition that can brick — an unknown runtime writer inside the extent — writes nothing
+// during a dry run and is invisible to it by construction. A dry run reduces CENSUS risk, not BRICK
+// risk, and must not be sold as the latter.
+//
+// FAIL-CLOSED, AND IT CAN SAY NO. The pre-pass is what makes refusal possible at all, because the
+// decision is taken while the map is still untouched. M3b writes only if the extent is EXACTLY what
+// it models: every page a present 4 KiB leaf, and every non-`wskip` page currently writable. A huge
+// leaf, an absent page or an `already_ro` page means the map is not what this stage modelled, so it
+// REFUSES with the census on the wire and an UNMODIFIED map rather than half-applying a rule it does
+// not understand. And because that refusal guarantees `already_ro == 0`, the cleared population is
+// exactly the `would` population — which is what makes the ROLLBACK below exact.
+//
+// THE VERIFY PASS IS A SECOND, INDEPENDENT COUNT — taken after the flush, through the FOLD rather
+// than the leaf bit. `live_leaf` is the walker `translate`, WXAUDIT and CFU-2's `user_range_leaf_ok`
+// are all built on, so what is checked is the writability the HARDWARE computes for the page, not the
+// one bit this stage happened to touch: a parent that still folds W=1 over a leaf that folds W=0 is
+// not a state the fold can hide. If it does not close, M3b RESTORES W on exactly the pages it cleared
+// and refuses — the map ends where it began, which is the state this kernel has booted in every day
+// of its life. Never half-applied.
+//
+// WHAT IS *NOT* PROVEN BY ANY OF THIS. `verify_w=0` and `WXPROBE map: at=ktext ... w=0` are both
+// PAGE-TABLE readbacks — they prove the bits, not the hardware's honouring of them. The only true
+// falsifier would be a CPL-0 store into the extent that is EXPECTED to fault and recovered from, a
+// ring-0 twin of the `u1b-code-write` fixture, which this kernel has no `#PF`-resume path for. That
+// gap is named here rather than papered over, and it is the natural M3d.
+//
+// THE FALSIFIERS ARE INTRA-BOOT, on M3b's own two lines — deliberately NOT a cross-boot comparison
+// against a disarmed flight, because `cfg!(feature = "wxnro")` folds to a constant and the two arms
+// are DIFFERENT BINARIES with different `.text` sizes. That is not a theoretical worry: the two QEMU
+// arms of this very commit link to `xpages=285` disarmed and `xpages=286` armed — a one-page
+// difference on a perfectly healthy pair, which is exactly the shape that would have failed a
+// cross-boot `cleared == the other boot's would` check. The sound closures are all INSIDE one boot:
+//
+//     would + already_ro + wskip + absent + huge_pages == xpages   — the census line closes on itself
+//     cleared == would                                   (armed)   — prediction vs result, ONE binary
+//     verify_w == expect_w                                         — the fold agrees with the leaf bit
+//     kern_WX == keep_x - already_ro - cleared                     — replaces `kern_WX == keep_x`
+//
+// NOTE that `would` is a CENSUS field and is populated in BOTH arms — it is what this stage WOULD
+// clear, counted before any write, not "the clears that did not happen". So it does NOT appear in the
+// page closure alongside `cleared`; the two are a prediction and its result, and `cleared == would`
+// is the check that binds them. Disarmed, `cleared == 0` and the audit identity degenerates to the
+// pre-M3b `kern_WX == keep_x`, which is what makes a disarmed boot a true no-op on the analyzer.
+// =================================================================================================
+
+/// One-shot latch. M3b is idempotent in principle (clearing a clear bit is a no-op) but it is called
+/// from `arch::init` on the BSP only, and a second run would mean something re-entered the sweep —
+/// a fact worth printing rather than absorbing.
+static WXN_M3B_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The page-rounded-OUT union of the image's WRITABLE `PT_LOAD` segments — the pages M3b must leave
+/// writable no matter what the executable extent says, because the ELF itself declares them mutable.
+/// `None` means the image has no writable LOAD, which for this kernel means the header did not parse;
+/// M3b treats that as a refusal, not as an empty exclusion set.
+#[inline]
+fn wxn_wdata_span() -> Option<(u64, u64)> {
+    wxn_load_union(true).map(|(lo, hi, _)| (lo, hi))
+}
+
+/// **The W-clear.** Called once, immediately after `wxn_split_stage`, with the same flush parameters
+/// M1 and M2 used. See the section header for the population, the writer inventory and the staging.
+///
+/// Refuses — loudly, with the census on the wire and NOTHING written — if it has already run, if the
+/// executable extent is unreadable, if the image declares no writable LOAD, if the extent is not the
+/// all-4-KiB-present-writable map this stage models, or if the post-write verify does not close (in
+/// which case the pages it cleared are restored first). Panics only if its own address is outside the
+/// extent it is about to make read-only (the M3b twin of M1's Leg 3 and M2's Leg 2, evaluated before
+/// any write) or if the framebuffer leaf moves across its window.
+fn wxn_ro_stage(pge: bool, cr4: u64) {
+    if WXN_M3B_DONE.swap(true, Ordering::AcqRel) {
+        serial_println!(":: WXN-M3B: -> REFUSED (already run; nothing written) ::");
+        return;
+    }
+
+    // Leg 1 — the same extent M2 spared, from the same walk. Not recomputed differently: if these two
+    // ever disagreed, a page would be executable under one rule and read-only under the other.
+    let Some((x_lo, x_hi, _)) = wxn_exec_extent() else {
+        serial_println!(
+            ":: WXN-M3B: ehdr=0x{:X} xseg=none -> REFUSED (no read-only PT_LOAD; no entry written) ::",
+            &raw const __ehdr_start as u64
+        );
+        return;
+    };
+    // Leg 2 — the writable span. Its ABSENCE is a refusal and not an empty set: an image with no
+    // `PF_W` LOAD is an image whose header this walk did not understand, and guessing "then nothing
+    // is writable" is exactly the shape of assumption this milestone exists to stop making.
+    let Some((w_lo, w_hi)) = wxn_wdata_span() else {
+        serial_println!(
+            ":: WXN-M3B: xseg=[0x{:X},0x{:X}) wseg=none -> REFUSED (image declares no writable \
+             PT_LOAD; no entry written) ::",
+            x_lo, x_hi
+        );
+        return;
+    };
+    // Leg 3 — THE load-bearing assert, before a single entry is written. This function is a `.text`
+    // address inside the extent it is about to restrict; if the phdr walk latched onto the wrong
+    // segment it fires here rather than as a dead machine some instructions later.
+    let here = wxn_ro_stage as *const () as u64;
+    assert!(
+        here >= x_lo && here < x_hi,
+        "WXN-M3B: the derived executable extent [{:#x},{:#x}) does not contain this function \
+         ({:#x}) — the read-only-LOAD phdr walk found the wrong segment",
+        x_lo,
+        x_hi,
+        here
+    );
+
+    // The arm. `cfg!`, not `#[cfg]` — see the section header: the store below is compiled in every
+    // `./arroyo check` leg whether or not this boot will execute it.
+    let armed = cfg!(feature = "wxnro");
+    let xpages = ((x_hi - x_lo) / PAGE_4K) as u32;
+    let tramp = super::smp::TRAMPOLINE_ADDR as u64;
+
+    // ---------------------------------------------------------------------------------------------
+    // PRE-PASS — the census, read-only, before the write window exists. `leaf_entry_ptr` only reads
+    // here; page tables are readable at ring 0 without touching `CR0.WP`.
+    // ---------------------------------------------------------------------------------------------
+    let (mut would, mut already_ro, mut wskip, mut absent) = (0u32, 0u32, 0u32, 0u32);
+    let (mut huge_leaves, mut huge_pages) = (0u32, 0u32);
+    // `pre_w` / `would_w` are folded-writability counts taken through `live_leaf`, so `expect_w`
+    // below is MEASURED rather than assumed. A leaf whose W bit is set but whose parent folds W=0
+    // contributes to `would` and not to `pre_w`, and clearing it moves nothing — without these two
+    // counters `expect_w` would be wrong for exactly that page.
+    let (mut pre_w, mut would_w) = (0u32, 0u32);
+    let mut va = x_lo;
+    while va < x_hi {
+        let folds_w = live_leaf(va).map(|(_, acc)| acc.1).unwrap_or(false);
+        if folds_w {
+            pre_w += 1;
+        }
+        // (a) a page the image itself declares writable — leave it exactly as it is. This is the
+        // round-IN the section header describes, and `wskip` is its witness.
+        if va >= w_lo && va < w_hi {
+            wskip += 1;
+            va += PAGE_4K;
+            continue;
+        }
+        // ONE WALKER: `leaf_entry_ptr` is the descent `set_framebuffer_wc` already uses, reused
+        // rather than re-derived, so this file keeps one way of finding a leaf.
+        match leaf_entry_ptr(va) {
+            // (b) a huge leaf still covering part of the extent. M2 leaves a 2 MiB leaf whole when
+            // the keep set covers all 512 of its pages, and such a leaf can extend past the W-clear
+            // extent. Counted, and then refused below — clearing W across pages this stage never
+            // examined is precisely the half-application it must not perform.
+            Some((_, lvl)) if lvl != 1 => {
+                let size = if lvl == 3 { 1u64 << 30 } else { 1u64 << 21 };
+                let end = (va & !(size - 1)) + size;
+                huge_leaves += 1;
+                huge_pages += ((end.min(x_hi) - va) / PAGE_4K) as u32;
+                va = end;
+                continue;
+            }
+            Some((p, _)) => {
+                // SAFETY: `p` is a live 4 KiB PTE inside the identity-mapped tables; read only.
+                let e = unsafe { core::ptr::read_volatile(p) };
+                if e & PTE_WRITABLE == 0 {
+                    already_ro += 1;
+                } else {
+                    would += 1;
+                    if folds_w {
+                        would_w += 1;
+                    }
+                }
+            }
+            // (c) not mapped. Cannot happen for an image page — it is running — but a count is
+            // cheaper than an argument.
+            None => absent += 1,
+        }
+        va += PAGE_4K;
+    }
+
+    // The census, on the wire BEFORE anything is written. Everything a separate dry-run flight was
+    // going to prove is on this line, and it survives a death anywhere below it.
+    serial_println!(
+        ":: WXN-M3B-PRE: xseg=[0x{:X},0x{:X}) xpages={} wseg=[0x{:X},0x{:X}) armed={} would={} \
+         already_ro={} wskip={} absent={} huge_leaves={} huge_pages={} pre_w={} would_w={} \
+         tramp=0x{:X} -> CENSUS ::",
+        x_lo,
+        x_hi,
+        xpages,
+        w_lo,
+        w_hi,
+        armed as u8,
+        would,
+        already_ro,
+        wskip,
+        absent,
+        huge_leaves,
+        huge_pages,
+        pre_w,
+        would_w,
+        tramp,
+    );
+
+    // FAIL-CLOSED. The map must be exactly what the census models — all present 4 KiB leaves, every
+    // non-`wskip` page writable — or M3b writes nothing at all. This is also what guarantees
+    // `already_ro == 0`, and therefore that the rollback below restores exactly the set it cleared.
+    if huge_leaves != 0 || absent != 0 || already_ro != 0 {
+        serial_println!(
+            ":: WXN-M3B: xseg=[0x{:X},0x{:X}) xpages={} armed={} huge_leaves={} absent={} \
+             already_ro={} -> REFUSED (the executable extent is not the all-4K-present-writable map \
+             this stage models; no entry written, map unmodified) ::",
+            x_lo, x_hi, xpages, armed as u8, huge_leaves, absent, already_ro
+        );
+        return;
+    }
+
+    // The GR15 belt, M3b's own window. Unlike M2, M3b has NO legitimate reason to change the fb leaf:
+    // the panel is device MMIO and the extent is the kernel image, asserted above to contain this
+    // function. Any delta at all stops the boot. `fb=`/`fb_delta=`/`fb_chk=` go on the wire exactly as
+    // M2 does it — without them a silently-skipped interlock (no panel, or `WRITER` contended) is
+    // indistinguishable from a pass, which is the instrument-that-cannot-fire class this track has
+    // paid for in GR13, GR15, GR18 and GR19. `fb_chk=1` means the comparison actually ran.
+    let fb = crate::video::WRITER.try_lock().map(|w| w.base() as u64).unwrap_or(0);
+    let fb_before = if fb != 0 { wx_probe_leaf(fb).map(|(e, l, _)| (e, l)) } else { None };
+
+    // ---------------------------------------------------------------------------------------------
+    // The edit. DISARMED, none of this runs: no `CR0.WP` window is opened and no second CR3 reload is
+    // paid, because a dry run must not disarm the very protection it is a dry run for.
+    // ---------------------------------------------------------------------------------------------
+    let mut cleared = 0u32;
+    if armed {
+        with_page_tables_writable(|| {
+            let mut va = x_lo;
+            while va < x_hi {
+                if va >= w_lo && va < w_hi {
+                    va += PAGE_4K;
+                    continue;
+                }
+                if let Some((p, 1)) = leaf_entry_ptr(va) {
+                    // SAFETY: `p` is a live 4 KiB PTE inside the identity-mapped tables; CR0.WP is
+                    // clear for this window so the firmware's read-only table pages accept the store;
+                    // interrupts are masked by the wrapper. The write is `e & !PTE_WRITABLE` — a
+                    // permission-only RMW that moves bit 1 and nothing else, so no address field, no
+                    // PAT selector and no NX bit can be disturbed by it (the GR15 hazard needs a
+                    // whole-entry write, which this is not).
+                    unsafe {
+                        let e = core::ptr::read_volatile(p);
+                        if e & PTE_WRITABLE != 0 {
+                            core::ptr::write_volatile(p, e & !PTE_WRITABLE);
+                            invlpg(va);
+                            cleared += 1;
+                        }
+                    }
+                }
+                va += PAGE_4K;
+            }
+        });
+        wxn_flush_tlb(pge, cr4);
+    }
+
+    // The verify pass — a SECOND, INDEPENDENT count over the same set, through the FOLD. Runs in both
+    // arms: disarmed it confirms the census's own model of the map, armed it confirms the flip.
+    let mut verify_w = 0u32;
+    {
+        let mut va = x_lo;
+        while va < x_hi {
+            if let Some((_, acc)) = live_leaf(va)
+                && acc.1
+            {
+                verify_w += 1;
+            }
+            va += PAGE_4K;
+        }
+    }
+    // Measured, not assumed: armed, every page whose fold was writable stays writable except the
+    // `would_w` subset this stage cleared; disarmed, nothing moved at all.
+    let expect_w = if armed { pre_w - would_w } else { pre_w };
+
+    // The GR15 belt, cashed. `delta == 0` is the only acceptable reading here (see above).
+    let mut fb_chk = 0u8;
+    let fb_delta = match (fb_before, if fb != 0 { wx_probe_leaf(fb) } else { None }) {
+        (Some((e_before, l_before)), Some((e_after, l_after, _))) => {
+            fb_chk = 1;
+            assert!(
+                l_after == l_before && e_after == e_before,
+                "WXN-M3B: the framebuffer leaf changed across the W-clear — before=0x{:016X}/lvl{} \
+                 after=0x{:016X}/lvl{}. M3b writes only inside the kernel image's own executable \
+                 extent and clears only bit 1, so the panel's leaf cannot move; if it did, the extent \
+                 or the walker is wrong about the map and this is the GR15 defect's shape.",
+                e_before, l_before, e_after, l_after
+            );
+            e_after ^ e_before
+        }
+        (Some((e_before, _)), None) => panic!(
+            "WXN-M3B: the framebuffer mapping at {:#x} is gone after the W-clear — it was present \
+             (leaf 0x{:016X}) before it",
+            fb, e_before
+        ),
+        _ => 0,
+    };
+
+    // ROLLBACK. The verify is the one check M3b can only make AFTER writing, so it is the one place
+    // "refuse" has to mean "put it back". The restored set is exactly the cleared set: `wskip` pages
+    // were never touched and `already_ro` is guaranteed 0 by the fail-closed refusal above, so every
+    // non-`wskip` 4 KiB leaf in the extent was writable before this stage ran and must be writable
+    // after it rolls back. Setting W is strictly permissive — it cannot fault — and it returns the
+    // map to the state this kernel has booted in every day of its life.
+    // `cleared != would` is the second trigger and it is a different failure than the verify: the
+    // census and the write walk are two passes over the same set, taken with interrupts masked, on
+    // one core, with nothing allocated in between — so they CANNOT legitimately disagree. If they do,
+    // the map moved underneath this stage and nothing further it believes is worth acting on.
+    if armed && (verify_w != expect_w || cleared != would) {
+        let mut restored = 0u32;
+        with_page_tables_writable(|| {
+            let mut va = x_lo;
+            while va < x_hi {
+                if va >= w_lo && va < w_hi {
+                    va += PAGE_4K;
+                    continue;
+                }
+                if let Some((p, 1)) = leaf_entry_ptr(va) {
+                    // SAFETY: as the clear above; `e | PTE_WRITABLE` moves bit 1 and nothing else.
+                    unsafe {
+                        let e = core::ptr::read_volatile(p);
+                        if e & PTE_WRITABLE == 0 {
+                            core::ptr::write_volatile(p, e | PTE_WRITABLE);
+                            invlpg(va);
+                            restored += 1;
+                        }
+                    }
+                }
+                va += PAGE_4K;
+            }
+        });
+        wxn_flush_tlb(pge, cr4);
+        serial_println!(
+            ":: WXN-M3B: xseg=[0x{:X},0x{:X}) xpages={} armed=1 cleared={} would={} restored={} \
+             verify_w={} expect_w={} pre_w={} would_w={} wskip={} fb=0x{:X} fb_delta=0x{:X} \
+             fb_chk={} tramp=0x{:X} pge={} flush={} -> REFUSED (the post-write check did not close; \
+             the W bits this stage cleared have been restored and the map is back where it started) ::",
+            x_lo,
+            x_hi,
+            xpages,
+            cleared,
+            would,
+            restored,
+            verify_w,
+            expect_w,
+            pre_w,
+            would_w,
+            wskip,
+            fb,
+            fb_delta,
+            fb_chk,
+            tramp,
+            pge as u8,
+            if pge { "pge-toggle" } else { "cr3-reload" },
+        );
+        return;
+    }
+
+    // The verdict. `DRYRUN` is not a softer `RO`: it is the honest name for a boot that measured the
+    // flip and did not perform it, and it must never be mistaken for one that did.
+    let tramp_w = live_leaf(tramp).map(|(_, acc)| acc.1 as u8).unwrap_or(0);
+    let verdict = if !armed {
+        if verify_w != expect_w { "-> UNVERIFIED" } else { "-> DRYRUN" }
+    } else if cleared == 0 {
+        "-> VACUOUS"
+    } else {
+        "-> RO"
+    };
+    serial_println!(
+        ":: WXN-M3B: xseg=[0x{:X},0x{:X}) xpages={} wseg=[0x{:X},0x{:X}) armed={} cleared={} would={} \
+         already_ro={} wskip={} absent={} huge_leaves={} huge_pages={} verify_w={} expect_w={} \
+         pre_w={} would_w={} fb=0x{:X} fb_delta=0x{:X} fb_chk={} tramp=0x{:X} tramp_w={} pge={} \
+         flush={} {} ::",
+        x_lo,
+        x_hi,
+        xpages,
+        w_lo,
+        w_hi,
+        armed as u8,
+        cleared,
+        would,
+        already_ro,
+        wskip,
+        absent,
+        huge_leaves,
+        huge_pages,
+        verify_w,
+        expect_w,
+        pre_w,
+        would_w,
+        fb,
+        fb_delta,
+        fb_chk,
+        tramp,
+        tramp_w,
+        pge as u8,
+        if pge { "pge-toggle" } else { "cr3-reload" },
+        verdict,
+    );
+    // M3b's self-prediction, the twin of M1's `residue_leaves` and M2's `keep_x`. Every identity is
+    // INTRA-boot (see the section header on why a cross-boot comparison against a disarmed flight is
+    // unsound — the two arms are different binaries and this commit's own QEMU pair differs by a page):
+    //   * the census closure, internal to the WXN-M3B-PRE line:
+    //       would + already_ro + wskip + absent + huge_pages == xpages
+    //   * prediction vs result, across this stage's own two lines, same binary:
+    //       cleared == would          (armed; enforced above — a mismatch rolls back and refuses)
+    //   * the audit identity, which REPLACES `kern_WX == keep_x` from M3b onward:
+    //       kern_WX == keep_x - already_ro - cleared
+    //     Disarmed, `cleared == 0` and it degenerates to the pre-M3b identity, which is what makes a
+    //     disarmed boot a true no-op on the analyzer as well as on the map.
+    // `keep_x` is counted by M2 during its edit, `would` by this stage's census walk, `cleared` by its
+    // write walk, and `kern_WX` by the WXAUDIT walk one screen down — four walkers, one number.
 }
 
 // =================================================================================================
