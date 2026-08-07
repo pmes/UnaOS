@@ -2086,6 +2086,77 @@ def wxn_selfchecks(w):
                     f"excuse resting on it) is worthless, or the arm did not "
                     f"hold on the BSP. Do not use wp_mask as evidence on this "
                     f"boot")
+
+    # 5. THE LINE'S OWN ARITHMETIC — each count against the mask printed beside
+    #    it.  This is a WIRE check, not a kernel check, and the distinction is
+    #    the whole reason it can convict:
+    #
+    #      let nxe = NXE_MASK.load(..);  let wp = WP_MASK.load(..);
+    #      let armed = nxe.count_ones(); let wp_armed = wp.count_ones();
+    #      serial_println!("... nxe={} nxe_mask=0x{:X} wp={} wp_mask=0x{:X} ...",
+    #                      armed, nxe, wp_armed, wp);
+    #
+    #    (smp.rs:125-135.)  Each count IS `count_ones()` of the mask it is
+    #    printed next to, taken from one load of one atomic in one statement, so
+    #    THE KERNEL CANNOT EMIT A DISAGREEING PAIR.  A disagreement is therefore
+    #    corruption in transit or in decode — one of the two tokens is not what
+    #    the kernel wrote — and it is the last thing left that could quietly
+    #    make everything above wrong.
+    #
+    #    THIS IS THE LEG THAT REACHES THE AP BITS.  Check 4 can only corroborate
+    #    bit 0, because bit 0 is the only bit a second line states.  This one
+    #    needs no second line: it holds the mask against its own count, so a
+    #    single corrupted token is caught at ANY bit position — which is the
+    #    shape RESIDUAL-2 actually described (a healthy mask losing a bit on the
+    #    wire while the rest of the line survives).  It cannot catch a
+    #    corruption that rewrites BOTH tokens consistently; nothing on this wire
+    #    can, and this reader does not pretend otherwise.
+    #
+    #    Both pairs are checked because they are the identical construction on
+    #    the identical line, and neither can legitimately diverge.
+    if nxe:
+        f = nxe['fields']
+        good, bad, unread = [], [], []
+        for count_key, mask_key, cls, what, fn in (
+                ('nxe', 'nxe_mask', 'WXN-NXE-COUNT', 'EFER.NXE', 'armed'),
+                ('wp', 'wp_mask', 'WXN-WP-COUNT', 'CR0.WP', 'wp_armed')):
+            count = _num(f.get(count_key))
+            mask = _wxn_hexmask(f.get(mask_key))
+            if count is None or mask is None or mask < 0:
+                unread.append(f"{count_key}={f.get(count_key)} "
+                              f"{mask_key}={f.get(mask_key)}")
+                continue
+            pop = bin(mask).count('1')
+            (good if pop == count else bad).append(
+                (cls, count_key, mask_key, count, mask, pop, what, fn))
+        for cls, ck, mk, count, mask, pop, what, fn in bad:
+            clean = False
+            msgs.append(
+                f"WARN {cls}: boot {w['number']} {ck}={count} but "
+                f"{mk}={f.get(mk)} has {pop} bit(s) set. These are two tokens "
+                f"of ONE line derived from ONE value — `wxn_nxe_report` prints "
+                f"`{fn} = mask.count_ones()` beside the very mask it counted, "
+                f"from a single load, in a single statement (smp.rs:125-135) — "
+                f"so the kernel cannot emit a pair that disagrees. This is "
+                f"CORRUPTION IN TRANSIT OR IN DECODE, not a kernel regression: "
+                f"one of these two tokens is not what the kernel wrote. "
+                f"Everything this reader said above about {what} on this boot "
+                f"(the target, the era, the cross-check) was read off this "
+                f"line, so none of it stands. Re-capture before acting on it")
+        if good:
+            detail = ", ".join(
+                f"{ck}={count} == popcount({mk}={f.get(mk)})"
+                for _cls, ck, mk, count, _m, _p, _w, _fn in good)
+            msgs.append(
+                f"ok   WXAUDIT-NXE line arithmetic closes: {detail} — each "
+                f"count is the kernel's own count_ones() of the mask beside it "
+                f"(smp.rs:127-128), so this holds for EVERY bit, the AP bits "
+                f"that check 4 cannot corroborate included")
+        if unread:
+            msgs.append(
+                f"note WXAUDIT-NXE line arithmetic: {'; '.join(unread)} — this "
+                f"reader could not read one of the pair, so that count/mask "
+                f"identity was NOT checked, which is not the same as passing")
     return clean, msgs
 
 
@@ -4718,7 +4789,7 @@ WXN_FIXTURE_WPX = WXN_FIXTURE_WPX_CLEAN + """\
 [      ?ms] :: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=319 (1 MiB) tables=1030 nxe=1 walk=1724kcyc l1=0 l2=65533 l3=1536 ::
 [      ?ms] :: WXPROBE cpu: cr0=0x0000000080010013 wp=1 cr4=0x0000000000100668 pge=0 smep=1 smap=0 la57=0 efer=0x0000000000000D01 nxe=1 lme=1 ::
 [      ?ms] :: X86_64 Memory Init ::
-[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFE wp=7 wp_mask=0xFE -> PASS ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=7 wp_mask=0xFE -> PASS ::
 """
 
 
@@ -4779,6 +4850,119 @@ def wxn_wpx_expect(result):
          (False, True)),
         ('it is reported as unchecked rather than confirmed',
          'stands un-cross-checked' in "\n".join(lmsgs), True),
+    ]
+
+
+# --- the popcount wire-integrity fixture -----------------------------------
+#
+# THE CONDITION THIS EXISTS FOR, and why it is not the same condition as the
+# fixture above.  Check 4 corroborates ONE bit, because bit 0 is the only bit
+# the capture states twice.  RESIDUAL-2 described a mask losing a bit ANYWHERE
+# on the wire, and seven of the eight bit positions had no witness at all.
+# They do now: each count on the WXAUDIT-NXE line is `count_ones()` of the mask
+# printed beside it, from one load in one statement (smp.rs:125-135), so the
+# pair is an identity the KERNEL cannot break and only the WIRE can.
+#
+# Boot 1 is the real Boot AA (WXN_FIXTURE_WPX_CLEAN, quoted byte-for-byte).
+# Boots 2-4 each corrupt EXACTLY ONE TOKEN of the rollup line and change
+# nothing else, so each has exactly one cause and the fixture cannot pass by
+# accident.  All three are invisible to every other check in this file:
+#
+#   boot 2 — `wp=8 wp_mask=0x7F`: the mask lost bit 7 (an AP) in transit, the
+#     count survived.  THIS IS THE RESIDUAL-2 SHAPE VERBATIM.  Read without
+#     this leg it is a short mask with its PASS intact, which era branch 2
+#     excuses as a pre-M3a kernel (exit 0), and check 4 stays silent because
+#     0x7F still carries bit 0 — the BSP agrees with WXPROBE and the sweep.
+#     Only the count/mask identity convicts it.
+#   boot 3 — `nxe=8 nxe_mask=0x7F`: the same corruption on the NXE pair.
+#     `WXN-NXE-SHORT` cannot see it (that check reads `nxe` against `cores`,
+#     both 8) and the verdict is a coherent PASS.
+#   boot 4 — `wp=9 wp_mask=0xFF`: the corruption in the OTHER token, the count.
+#     The mask equals the M3a target, so check 3 reports the milestone MET and
+#     check 4 finds the BSP bit agreeing — a boot that reads healthy twice
+#     while stating that nine of eight cores are armed.
+WXN_FIXTURE_POPCNT = WXN_FIXTURE_WPX_CLEAN + """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B1FC000 img=[0x7B1FC000,0x7B8D3000) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=1 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B1FC000,0x7B33A000) xsegs=2 xpages=318 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=2 pool_used=2/16 nx_pdpt=0 nx_2m=1021 nx_pt=0 nx_4k=1217 keep_x=319 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=319 (1 MiB) tables=1030 nxe=1 walk=1724kcyc l1=0 l2=65533 l3=1536 ::
+[      ?ms] :: WXPROBE cpu: cr0=0x0000000080010013 wp=1 cr4=0x0000000000100668 pge=0 smep=1 smap=0 la57=0 efer=0x0000000000000D01 nxe=1 lme=1 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=8 wp_mask=0x7F -> PASS ::
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B1FC000 img=[0x7B1FC000,0x7B8D3000) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=1 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B1FC000,0x7B33A000) xsegs=2 xpages=318 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=2 pool_used=2/16 nx_pdpt=0 nx_2m=1021 nx_pt=0 nx_4k=1217 keep_x=319 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=319 (1 MiB) tables=1030 nxe=1 walk=1724kcyc l1=0 l2=65533 l3=1536 ::
+[      ?ms] :: WXPROBE cpu: cr0=0x0000000080010013 wp=1 cr4=0x0000000000100668 pge=0 smep=1 smap=0 la57=0 efer=0x0000000000000D01 nxe=1 lme=1 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0x7F wp=8 wp_mask=0xFF -> PASS ::
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXN-x86: ehdr=0x7B1FC000 img=[0x7B1FC000,0x7B8D3000) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=1 -> SWEPT ::
+[      ?ms] :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+[      ?ms] :: WXN-M2: xseg=[0x7B1FC000,0x7B33A000) xsegs=2 xpages=318 tramp=0x8000 spare_n=2 demote_1g=0 split_2m=2 pool_used=2/16 nx_pdpt=0 nx_2m=1021 nx_pt=0 nx_4k=1217 keep_x=319 already_nx=0 skip_user=0 fb=0x90020000 fb_delta=0x0 pge=0 flush=cr3-reload -> SPLIT ::
+[      ?ms] :: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=319 (1 MiB) tables=1030 nxe=1 walk=1724kcyc l1=0 l2=65533 l3=1536 ::
+[      ?ms] :: WXPROBE cpu: cr0=0x0000000080010013 wp=1 cr4=0x0000000000100668 pge=0 smep=1 smap=0 la57=0 efer=0x0000000000000D01 nxe=1 lme=1 ::
+[      ?ms] :: X86_64 Memory Init ::
+[    171ms] :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=9 wp_mask=0xFF -> PASS ::
+"""
+
+
+def wxn_popcnt_expect(result):
+    """Each count against the mask beside it — the leg that reaches every bit."""
+    b1, b2, b3, b4 = (wxn_boot(b) for b in result['boots'])
+    s1, n1 = wxn_selfchecks(b1)
+    s2, n2 = wxn_selfchecks(b2)
+    s3, n3 = wxn_selfchecks(b3)
+    s4, n4 = wxn_selfchecks(b4)
+    v2, _ = wxn_verdicts(b2)
+    j1, j2, j3, j4 = ("\n".join(x) for x in (n1, n2, n3, n4))
+
+    def warns(msgs):
+        return [m.split(':')[0] for m in msgs if m.startswith('WARN')]
+
+    return [
+        ('boots parsed', len(result['boots']), 4),
+        # boot 1 — the real Boot AA: a coherent line, and no new noise.
+        ('boot 1 self-checks clean', s1, True),
+        ('boot 1 states the identity for BOTH pairs',
+         ('nxe=8 == popcount(nxe_mask=0xFF)' in j1,
+          'wp=8 == popcount(wp_mask=0xFF)' in j1), (True, True)),
+        ('and claims the coverage check 4 could not',
+         'EVERY bit, the AP bits that check 4 cannot corroborate included'
+         in j1, True),
+        # boot 2 — RESIDUAL-2 verbatim: a lost AP bit, count intact.
+        ('boot 2 is a FINDING', s2, False),
+        ('the WP count/mask identity is the ONLY thing that convicts boot 2',
+         warns(n2), ['WARN WXN-WP-COUNT']),
+        ('the era logic still excuses boot 2 on its own',
+         (wxn_m3a_era(b2)[0], 'PREDATES M3a' in j2), (WXN_M3A_PRE, True)),
+        ('check 4 is silent on boot 2 — 0x7F still carries the BSP bit',
+         ('WARN WXN-WP-XCHECK' in j2, 'wp_mask=0x7F bit 0 = 1' in j2),
+         (False, True)),
+        ('the verdict path is untouched — the token is still PASS', v2, True),
+        ('the finding names the tokens and calls it wire corruption',
+         ('wp=8 but wp_mask=0x7F has 7 bit(s) set' in j2,
+          'CORRUPTION IN TRANSIT OR IN DECODE, not a kernel regression'
+          in j2), (True, True)),
+        ('and it withdraws what the checks above claimed',
+         'so none of it stands' in j2, True),
+        # boot 3 — the same corruption on the NXE pair.
+        ('boot 3 is a FINDING', s3, False),
+        ('the NXE count/mask identity is the only thing that convicts boot 3',
+         warns(n3), ['WARN WXN-NXE-COUNT']),
+        ('WXN-NXE-SHORT cannot see it — nxe and cores both read 8',
+         'WARN WXN-NXE-SHORT' in j3, False),
+        # boot 4 — the corruption in the COUNT token instead of the mask.
+        ('boot 4 is a FINDING', s4, False),
+        ('a corrupted COUNT convicts just as a corrupted mask does',
+         warns(n4), ['WARN WXN-WP-COUNT']),
+        ('boot 4 reads healthy to every other check',
+         ('ok   wp_mask=0xFF == 0xFF' in j4,
+          'ok   BSP CR0.WP agrees' in j4), (True, True)),
+        ('the finding names nine of eight',
+         'wp=9 but wp_mask=0xFF has 8 bit(s) set' in j4, True),
     ]
 
 
@@ -5161,6 +5345,9 @@ def selftest_wxn():
         ('WXN: the BSP CR0.WP cross-check — the real Boot AA, and the same '
          'boot with its wp_mask short by the BSP bit and PASS intact',
          WXN_FIXTURE_WPX, wxn_wpx_expect),
+        ('WXN: the popcount wire-integrity leg — the real Boot AA, then three '
+         'single-token corruptions no other check in this file can see',
+         WXN_FIXTURE_POPCNT, wxn_popcnt_expect),
         # One fixture per ARM of the kern_WX-rise classifier.  An arm with no
         # fixture is an arm nobody re-tests, and the benign arm is the one that
         # could quietly learn to explain away a real regression.
@@ -5219,6 +5406,12 @@ def selftest_wxn():
          WXN_FIXTURE_WPX_CLEAN, EXIT_OK),
         ('--wxn on a boot whose wp_mask contradicts its own WXPROBE/sweep '
          'exits FINDING', WXN_FIXTURE_WPX, EXIT_FINDING),
+        # The popcount leg through the report path.  The clean side is the real
+        # Boot AA above (WXN_FIXTURE_WPX_CLEAN, already asserted EXIT_OK); this
+        # is the corrupted side, at three different bit positions and in both
+        # tokens.
+        ('--wxn on single-token corruptions of the rollup line exits FINDING',
+         WXN_FIXTURE_POPCNT, EXIT_FINDING),
         # THE EXIT-CODE CLAIM the refinement rests on: a code-growth rise must
         # not set the finding code, and neither of the other two arms may lose
         # it.  Asserted through the real report path, not through wxn_trend.
