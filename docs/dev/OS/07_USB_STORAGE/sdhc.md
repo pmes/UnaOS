@@ -684,6 +684,9 @@ It adds exactly **one primitive** — `write_block_512`, a polled single-block C
 plus a boot self-test that exercises it against a sector the driver has *proven* is
 empty. Multi-block CMD25, block-layer registration and any filesystem write are 4b/4c.
 
+> **✅ The healthy path is METAL-CONFIRMED as of Boot AD, 2026-08-07 — see §8.11.** Every
+> error leg remains QEMU-only or unexercised, and §8.9's named gaps are unchanged.
+
 ### 8.1 PIO, not the ADMA2 engine that is already sitting there
 
 Milestone 3 left a working, A/B-verified ADMA2 engine in this driver, and 4a does not
@@ -970,7 +973,8 @@ These are gaps in the *gates*, not open questions about the code. Each one is a 
 > `sdw` build gate is the whole of its protection. The unarmed reconnaissance boot the
 > first bullet called *uninformative* turned out to be the most informative boot this
 > driver has had, once identification could reach it. The middle two bullets — about the
-> boot medium and the boot card's MBR — stand unchanged.
+> boot medium and the boot card's MBR — stand unchanged. **The last bullet was then taken
+> deliberately: Boot AD armed `sdw` and the ladder ran to a verified restore — see §8.11.**
 
 Recorded because the first draft of this milestone assumed the opposite, and the
 assumption was falsified by captures that already existed.
@@ -1000,6 +1004,61 @@ assumption was falsified by captures that already existed.
   failure. When a future arc fixes CMD8, this ladder runs against an uncharacterised
   card with gates 4 and 5 as the only defence — which is the second half of the
   argument in §8.9's last bullet.
+
+### 8.11 ✅ METAL-CONFIRMED — Boot AD, bench rMBP, 2026-08-07 (first armed flight)
+
+Tip `3f8f60c5`, capture `rmbp-gr16-s73`, slice
+`~/unaos-bench/scratch/gr20/bootAD-slice.log`, pace record
+[`bootpace.md §10n`](../01_BOOT_HAL/bootpace.md). Gates: mbench **28/28 required, 0
+forbidden**; `serial-analyzer --wxn` **exit 0**. Read the capture with `awk`, not `grep`.
+
+**A byte from this kernel has now reached a card.** The single passenger vs Boot AC (§9.11)
+is gate 1 — the `sdw` build feature — armed. The kernel is otherwise Boot AC's build, so the
+ladder ran against a card that had already been characterised by a boot that wrote nothing:
+
+```
+:: sdhc: w1 armed=1 lba=60799 wp_sw=1 csd_perm=0 csd_tmp=0 class=MBR blank=1
+   verify=IDENTICAL restore=IDENTICAL reason=none -> PASS ::
+```
+
+Every gate reads the same measured value Boot AC's dry run reported (`wp_sw=1`,
+`csd_perm=0 csd_tmp=0`, `class=MBR`, `blank=1`, LBA 60799 four blocks past partition 0's
+`end=60795`); only `reason=would-write` is gone, which is exactly the one field that named
+gate 1. §8.5's design goal — that a disarmed boot answers "would arming this build write, and
+where" — is what made this an evidence-based decision rather than an experiment.
+
+**Both `IDENTICAL`s are byte-compares, in §8.5's strict sense.** `verify=IDENTICAL` is the
+stamped `UNAOS-SDHC4A-SCRATCH` pattern read back off the medium and run through
+`first_difference`; `restore=IDENTICAL` is the stash written back and *re-read and compared*,
+not the `REWRITTEN` token the armed FAIL paths use for a re-write nobody read back. So §8.4's
+"the restore is a second write with different content, verified" held: the path wrote twice
+and verified both, and the card is provably in the state it was found in.
+
+**The card is unchanged where identification can see it.** Boots AE and AF re-ran the whole
+of §9 against the same card after the write, and the raw registers are identical to the word
+across all four boots (AC, AD, AE, AF) — three of them post-write:
+
+```
+[sdhc] cid mid=0x01 oid=PA pnm=S032B prv=4.5 psn=0x02465bbc mdt=2008-04
+[sdhc] cmd9 csd raw=[0xff164000,0xdaf6d9cf,0x32135981,0x00005d01]
+```
+
+The self-test also passed line-identically on Boots AE and AF, so the armed ladder has now
+flown three times. It is a regression floor item, not a milestone.
+
+**Cost.** `GPACE … sdhc=327ms` against Boot AC's 293, `gui` 2498 → 2533, every other pace
+lane unchanged. The lane delta is +34 ms, and the wall gap between the last pre-write line
+(`[sdhc-ab] verdict`, 2482 ms) and the `w1` line (2518 ms) is 36 ms with nothing printed in
+between; ACMD41 ran 397 polls here against Boot AC's 400, which is the ~2 ms of noise between
+the two readings. **The whole stash/write/verify/restore/verify ladder costs 34–36 ms.**
+
+**What this does and does not close.** §8.9's named gaps are unchanged — they are properties
+of the design, not of this flight. What is now metal-proven is the healthy path: CMD24,
+`r1_check` before the FIFO, Buffer Write Ready, Transfer Complete, the programming-busy wait
+on Command Inhibit (DAT), and CMD13 with the CURRENT_STATE check, end to end against a real
+card on a real controller. **Every error leg remains QEMU-only or unexercised** (§8.6's
+coverage stands), and the fact that this ladder passes says nothing about how it fails.
+4b/4c (§8.8) are untouched.
 
 ---
 
@@ -1409,3 +1468,13 @@ both directions (`BARE-TIMEOUT` no longer fires; a genuine `xhci: TIMEOUT` still
 Recorded here because the cause is this section's text: **adding a witness string changes the
 bench's alerting surface**, and a witness that reads like a fault to a regex is a witness that
 needs the regex checked.
+
+**Reproduced on three later boots, one of them against a differently-valued CMD8 register.**
+Boots AD, AE and AF (§8.11, [`bootpace.md §10n/§10o/§10p`](../01_BOOT_HAL/bootpace.md)) each
+identified the same card, with `cid` and `cmd9 csd raw` **byte-identical to Boot AC's** on all
+four boots — so the fork is reproducible, not a one-off, and it is unaffected by the §8 write
+ladder having run on the three later ones. Boot AE additionally read `int=0x00018100` rather
+than `0x00018000`: bit 8 is set in the **normal** interrupt half. The classifier still took
+the v1.x branch and still gave its grounds as "error half is bit 16 alone", which is what
+§9.3's predicate actually tests. The discriminator has now been exercised against two
+different register words, not one.

@@ -2466,3 +2466,220 @@ generalises — **every new witness string is a change to the bench's alerting s
 CRIT regex that has only ever been tested against real faults has only been tested one way.
 
 Read this capture with `awk '/pattern/'` — **not** `grep`.
+
+## §10n — GR20 Boot AD: the first byte this OS has ever written to an SD card (2026-08-07)
+
+Tip `3f8f60c5`, `gui=2533ms`, `hz=2693812420`, slice
+`~/unaos-bench/scratch/gr20/bootAD-slice.log` (capture `rmbp-gr16-s73`). One passenger vs
+Boot AC: gate 1 — the `sdw` compile-time feature — was armed. Everything else in the kernel
+is Boot AC's build. The line the previous boot printed as a dry run printed as a verdict:
+
+```
+:: sdhc: w1 armed=1 lba=60799 wp_sw=1 csd_perm=0 csd_tmp=0 class=MBR blank=1
+   verify=IDENTICAL restore=IDENTICAL reason=none -> PASS ::
+```
+
+**Both `IDENTICAL`s are byte-compares, and that is what makes the card provably as it was.**
+Per §8.5 of [`sdhc.md`](../07_USB_STORAGE/sdhc.md), `verify=IDENTICAL` means the stamped
+pattern was read back off the medium and compared with `first_difference`, and
+`restore=IDENTICAL` means the stashed original was written back and *re-read and compared* —
+it is not the token the armed FAIL paths use for a re-write that was never read back (those
+say `REWRITTEN`). So the ladder wrote twice, with two different contents, and verified both.
+The self-test did what §8.4 designed it to do, on its first armed flight, on a card this
+kernel had never written.
+
+**The arming was justified in advance, on measured evidence, by a boot that wrote nothing.**
+Every gate value in the line above was already known from Boot AC's `armed=0` reading (§10m):
+target LBA 60799 four blocks past the end of partition 0 (`end=60795`), `wp_sw=1`,
+`csd_perm=0 csd_tmp=0`, `blank=1`. `reason=would-write` on Boot AC named gate 1 as the only
+refusal left; Boot AD removed exactly that gate and nothing else.
+
+**Identification is reproducible across boots, not a one-off.** The v1.x fork produced the
+same card description as Boot AC — `blocks=60800`, `rca=0x5bbc`, `csd v1`, byte addressing —
+and the raw registers are identical to the word on all four boots that have now read this
+card (AC, AD, AE, AF):
+
+```
+[sdhc] cid mid=0x01 oid=PA pnm=S032B prv=4.5 psn=0x02465bbc mdt=2008-04
+[sdhc] cmd9 csd raw=[0xff164000,0xdaf6d9cf,0x32135981,0x00005d01]
+```
+
+Three of those four readings are *after* the card was written. The write left nothing behind
+that the identification path can see.
+
+**Cost, and how much of it is really the write.** `sdhc` 293 → 327 ms in the GPACE witness,
+`gui` 2498 → 2533 (+35), every other lane unchanged (`detect=5 igpu=1 kepler=397 nic=0
+resid=2`). The lane delta is **+34 ms**, but two readings pin it tighter: the wall gap between
+the last pre-write line (`[sdhc-ab] verdict` at 2482 ms) and the `w1` line at 2518 ms is
+**36 ms** with no intermediate line, while ACMD41 ran **397 polls** on this boot against Boot
+AC's 400 — roughly 2 ms *less* power-up polling. So the stash/write/verify/restore/verify
+ladder costs **34–36 ms**, the wall gap is the tighter reading, and the poll count is the
+noise term. §10m's conclusion is unchanged: the poll cadence, not the ladder, is what a pace
+arc would attack in this lane.
+
+**Regression floor.** mbench **28/28 required, 0 forbidden**; `serial-analyzer --wxn`
+**exit 0** (re-run against this slice by the recording seat: exit 0).
+
+- `kern_WX=312 == keep_x=312 == xpages+1 (311+1)` — the identity intact, so the rise from
+  Boot AC's 311 is **code growth with total coverage**, the second boot to exercise
+  `601477d3`'s discriminator in the growth direction.
+- `WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=8 wp_mask=0xFF -> PASS`;
+  `WXAUDIT-CORES: n=8 cr0=[0x80010013,0x80010011 ×7] wp=0xFF nxe=0xFF` — §10l's `CR0.MP`
+  divergence unchanged and still BSP-only.
+- `WXPROBE cpu: cr0=0x0000000080010013 wp=1 … smep=1 nxe=1`; `WXN-x86 … wp=1 -> SWEPT`
+  with `residue_leaves=1535`.
+- `CFU2-WGATE … -> PASS`, all five arms, at 12081 ms.
+- `SCHED-X86 PLACE-CHECK: actual=c1 arg=c1 published=c1 pool=5 collide=0 tier=exclusive
+  verdict=PASS`.
+- `video: edid present=0 hdr=- sum=- native=- len=0`; `igpu-blt: ring=absent
+  why=no-active-surface` — both unchanged.
+
+Read this capture with `awk '/pattern/'` — **not** `grep`.
+
+## §10o — GR20 Boot AE: the full PCI census, and the network controller this OS had been misidentifying every boot (2026-08-07)
+
+Tip `3b96d27a`, `gui=2533ms` (unchanged from Boot AD), `hz=2693859294`, slice
+`~/unaos-bench/scratch/gr20/bootAE-slice.log`. The passenger is a read-only enumeration of
+every PCI function on the machine — config reads only, no BAR sizing, no config writes — and
+it found a device this kernel had never looked at:
+
+```
+[PCI-CENSUS] bdf 4:0.0 14e4:4331 class=02 sub=80 progif=00 (net:other) rev=02 hdr=0x00(t=0,mf=0)
+             cmd=0x0006 sts=0x0010 ssid=106b:00ef irq=0 pin=A bar0=mem64@0xc1900000
+[PCI-CENSUS] bdf 3:0.0 14e4:16a3 class=02 sub=00 progif=00 (net:ethernet) rev=10 hdr=0x80(t=0,mf=1)
+             cmd=0x0000 sts=0x0010 ssid=14e4:16b4 irq=0 pin=A bar0=mem64p@0xc1800000 bar2=mem64p@0xc1810000
+[PCI-CENSUS] done: devices=20 functions=27 printed=27 truncated=0 net-class=0x02:2 (caps dumped 2) elapsed=6ms
+```
+
+**The finding that matters is a misidentification this OS has been printing on every boot.**
+`PciScanner::find_device(0x02, 0x00)` (`drivers/pci.rs:140-157`) walks bus then slot in
+ascending order, reads **function 0 only**, and returns on the first function whose class
+*and* subclass both match. Target subclass `0x00` is Ethernet. Bus 3 slot 0 function 0 is the
+Broadcom GbE MAC, subclass `0x00` — it matches first and the scan stops. So the line
+
+```
+:: x86_64 PCI: Found network controller (class 0x02) vendor 0x14e4 at 3:0.0 ::
+:: x86_64 PCI: non-Intel NIC (0x14e4) — no e1000 driver, skipping ::
+```
+
+has always named the **Ethernet MAC**, not the WiFi radio. It is function 0 of the same
+multi-function device whose function 1 is our SDXC controller
+(`3:0.1 14e4:16bc … (sys:sdhci)`) — the one §10n just wrote a card through. The BCM4331 radio
+reports subclass `0x80` (`net:other`) and **could never have matched** the predicate, on any
+boot. `arch/x86_64/pci.rs:678-681` still carries the opposite claim in a source comment ("the
+NIC is a Broadcom Wi-Fi part (vendor 0x14e4) that also reports class 0x02"); the reasoning
+there — do not drive a non-Intel part with e1000 register writes — holds, but the device it
+names is wrong. That correction belongs to whoever next touches `init_network`.
+
+**The census made a falsifiable prediction and it held.** `net-class=0x02:2` is the count of
+class-0x02 functions found. A reading of `0x02:1` would have refuted the model outright — it
+would have meant there is only one network-class function on this machine and that the
+existing line names it correctly. Two were found, at 3:0.0 and 4:0.0, and both had their
+capability chains dumped. Topologically the radio sits **alone on bus 4**, behind root port
+`0:28.1 8086:1e12 … pri=0 sec=4 sub=4`.
+
+**Cost — the census is not free, and the total hides that.** `elapsed=6ms` on its own line,
+and `gui` is unmoved at 2533. Those are not the same statement. The census runs at
+1685–1692 ms, *before* the pci-usb phase the GPACE lanes measure, and it pushed everything
+downstream by about that much (`pmc_vram_init` 1799 → 1805 ms). What absorbed it was the
+`sdhc` lane, 327 → **320 ms**, because ACMD41 finished in **392 polls** against Boot AD's 397.
+Six milliseconds of new work and seven milliseconds less power-up polling on an
+eighteen-year-old card is why the total did not move; the accounting closes to 1 ms.
+"The census cost nothing" would not survive a boot where the card polled the same.
+
+**The SD write self-test passed again**, line-identical to §10n's — `armed=1 lba=60799 …
+verify=IDENTICAL restore=IDENTICAL reason=none -> PASS`. It is now a regression floor item,
+not a milestone.
+
+**One robustness datum worth keeping.** This boot's CMD8 read `int=0x00018100`, not Boot
+AC/AD's `0x00018000` — bit 8 is set in the *normal* interrupt half. The classifier still took
+the v1.x branch and still stated its grounds as "error half is bit 16 alone", which is
+correct: §9.3's predicate reads the error half of the word, not the whole word. The
+discriminator §10m's argument rested on has now been exercised against two different register
+words.
+
+**Regression floor.** mbench **28/28 required, 0 forbidden**; `serial-analyzer --wxn`
+**exit 0** (re-run against this slice by the recording seat: exit 0).
+`kern_WX=314 == keep_x=314 == xpages+1 (313+1)` — growth with total coverage.
+`WXAUDIT-NXE … wp=8 wp_mask=0xFF -> PASS`; `WXAUDIT-CORES` unchanged (`CR0.MP` still
+BSP-only); `WXPROBE cpu: cr0=0x0000000080010013 wp=1`; `WXN-x86 … wp=1 -> SWEPT`
+(`residue_leaves=1535`); `SCHED-X86 PLACE-CHECK … verdict=PASS`; `edid present=0`;
+`igpu-blt: ring=absent`.
+
+**Scope note on this slice, recorded because it is a gap and not a pass.** The late userspace
+battery Boot AD carried at 12081 ms — `U10d`, `U11x`, `CFU`, **`CFU2-WGATE`**, `U11m2` — does
+**not** appear anywhere in the Boot AE slice, which runs to 53287 ms, well past where it fired
+on Boot AD (31 `:: U…` lines here against Boot AD's 45). `CFU2-WGATE` is therefore **not
+attested on this boot** — not that it failed, but that this capture does not carry it. The
+same is true of Boot AF. Boot AD is the current metal attestation for that gate.
+
+Read this capture with `awk '/pattern/'` — **not** `grep`.
+
+## §10p — GR20 Boot AF: the radio answered its config space and nothing else (2026-08-07)
+
+Tip `a871f022`, `gui=2542ms`, `hz=2693855145`, slice
+`~/unaos-bench/scratch/gr20/bootAF-slice.log`. The passenger is a strictly read-only recon of
+the device §10o found — config reads plus BAR0 reads, no config write, no register write, no
+BAR sizing. Verbatim:
+
+```
+:: bcma: begin — READ-ONLY recon of PCI class 0x02/sub 0x80 (config reads + BAR0 reads; no config write, no register write, no BAR sizing) ::
+:: bcma: device bdf 4:0.0 14e4:4331 rev=02 ssid=106b:00ef irq=0 pin=A cmd=0x0006 (mem-decode=1 busmaster=1) matches=1 ::
+:: bcma: power cap@0x40 pmcsr=0x4008 state=D0 ::
+:: bcma: bar0=0xc1900000 raw=0xc1900004 type=mem64 prefetch=0 maplen=0x2000 bar0_win(cfg:0x80)=0x18001000 bar0_win2(cfg:0xac)=0x18101000 ::
+:: bcma: REFUSED stage=chipcommon reason=not-decoding chipid=0xffffffff — BAR0 reads all-ones (function not decoding, or the window is dead) ::
+:: bcma: end ok=0 stage=chipcommon elapsed=5ms ::
+```
+
+**CONFIRMED.** Identity (`14e4:4331 rev=02`), subsystem id (`106b:00ef` — an Apple ssid on a
+Broadcom part), power state **D0** from the Power Management capability at `0x40`, and
+`cmd=0x0006` — memory decode and bus master both already on, left that way by firmware.
+`matches=1` pairs cleanly with §10o's `net-class=0x02:2`: the census counted two class-0x02
+functions and this recon's own predicate (class 0x02 / subclass 0x80) selected exactly one of
+them.
+
+**REFUTED — and it was the load-bearing prediction.** `BCMA_ADDR_BASE` (`drivers/bcma.rs:109`)
+is `0x1800_0000`, the backplane address of ChipCommon and the value firmware was expected to
+have left in `BAR0_WIN`. Metal reads **`0x18001000`**. And every BAR0 read came back all-ones,
+so **no chip identity was obtained at all** — not `chipid`, not `ncores`, not the EROM
+pointer. `ok=0 stage=chipcommon`. A note on which check actually fired: the refusal names
+`reason=not-decoding chipid=0xffffffff`, **not** `reason=window-elsewhere` — the all-ones read
+gated first, so the window mismatch is reported by the informational line above it and is not
+itself the stated cause of the stop.
+
+**The seat's leading hypothesis is that this is OUR bug, not the hardware — and it is a
+hypothesis, not a finding.** Two things in that BAR line are suspect on their face:
+
+* **`raw=0xc1900004`.** Bit 2 is set, which is a 64-bit memory BAR: the upper 32 bits of the
+  address live in the *next* BAR slot, and any mapping that treats `0xc1900000` as the whole
+  address is reading a base it did not fully decode.
+* **`maplen=0x2000`.** This is `BAR0_MAP_LEN` (`drivers/bcma.rs:119`), a compile-time
+  constant, printed. The arc performed no BAR sizing — it says so on its own first line — so
+  nothing in this capture establishes that the window is 0x2000 long, or that 0x2000 is the
+  right amount to map. The field describes what the driver mapped, not what the device has.
+
+Neither of these is established as the cause of the all-ones reads, and **no cause is settled
+here**. A diagnostic arc is open; this section records what the boot printed and what is
+suspected, and stops there.
+
+**One config-space delta between consecutive boots, recorded because it is the device under
+investigation.** The census read `4:0.0` as `sts=0x0018` this boot against `sts=0x0010` on
+Boot AE — bit 3 (Interrupt Status) set here, clear there. `CapList` (bit 4) is set on both.
+
+**Cost.** The census (6 ms) rode from Boot AE and the recon adds `elapsed=5ms`, both before
+the pci-usb phase. `gui` 2533 → 2542 (**+9**). The lanes account for it: `sdhc` 320 → 325
+(+5 — ACMD41 back to **397 polls** from Boot AE's 392), `kepler` 397 → 396 (−1), `resid`
+2 → 3 (+1), plus the recon's 5 ms upstream. Sum +10 against a measured +9; the accounting
+closes to 1 ms.
+
+**Regression floor.** mbench **28/28 required, 0 forbidden**; `serial-analyzer --wxn`
+**exit 0** (re-run against this slice by the recording seat: exit 0).
+`kern_WX=315 == keep_x=315 == xpages+1 (314+1)` — growth with total coverage, the recon's own
+text. `WXAUDIT-NXE … wp=8 wp_mask=0xFF -> PASS`; `WXAUDIT-CORES` unchanged;
+`WXPROBE cpu: cr0=0x0000000080010013 wp=1`; `WXN-x86 … wp=1 -> SWEPT`
+(`residue_leaves=1535`); `SCHED-X86 PLACE-CHECK … verdict=PASS`; `edid present=0`;
+`igpu-blt: ring=absent`. The SD write self-test passed a third time, line-identical to §10n's.
+As in §10o, this slice does **not** carry the late `CFU2-WGATE` battery — not attested on this
+boot.
+
+Read this capture with `awk '/pattern/'` — **not** `grep`.
