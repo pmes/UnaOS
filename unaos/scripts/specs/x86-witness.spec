@@ -14,6 +14,37 @@
 # the wrong spec for it. x86-fat.spec / rmbp-boot.spec / round6-rmbp.spec cover the other
 # configurations; this one covers the instrument.
 #
+# MINIMUM BUILD GENERATION — `32724cb4` (2026-08-06), and this is a SECOND scope axis, distinct
+# from the knob set above. The GR18 witness round put eight new wires on the x86 console, and the
+# REQUIREs added for them below are red on any capture from an image older than the commit that
+# emitted them — not because the boot was sick, but because the line did not exist yet. Stated as
+# ONE sha rather than eight because the directives land as one block and `32724cb4` is the latest
+# of the introducing commits:
+#   `609d9b3a`  BUY-2, which MOVED the EPACE-TRIM M8 line (see that block — this is why it is
+#               OPTIONAL and not REQUIRE)
+#   `bdfb3b4c`  `late=` on the SMC-BATT witness; `index enumeration STOP-NOTE at idx`
+#   `a2cada19`  the paygo terminals; SMC WALK-QUIET, whose `index walk done` survives as THE
+#               standing per-boot witness
+#   `a0a2d163`  WXN-x86 M1 — the PDPT NX sweep, `WXAUDIT-NXE`
+#   `32724cb4`  M1 hardened — the `-> VACUOUS` verdict, the WXAUDIT leaf histogram, `WXN-FBWC`
+# MEASURED, not asserted: replaying this spec against Boot V (metal, the last capture from before
+# `a0a2d163`) reds exactly FOUR of the six REQUIREs this block added — the WXN sweep verdict, the
+# WXAUDIT histogram, `WXAUDIT-NXE` and `WXN-FBWC`, none of which its kernel could print — and passes
+# the other two, `late=` on the SMC-BATT witness and `index walk done`, both of which it could. That
+# split is the scope line drawn by evidence rather than by claim, and it is the reason this section
+# names a sha instead of saying "recent build".
+# BOOT V REDS FOUR MORE, and they are NOT this block's: `[wc-g] … coverage=full`, `[wc-g] … -> PAID`,
+# the `paygo=yes` rollup and `[wc-d] … coverage=full` were all already in force and all already red
+# there. Boot V's video battery never reached the 15 000 ms deferral horizon — its capture carries a
+# second `BPACE: entry` at 12 952 ms, i.e. the machine came back round before the deferred passes were
+# due — so its wc-g windows end at `state=waiting … -> DEFERRED` (14 of them) with a single wc-d
+# `complete … PAID`. That is a capture that did not sit long enough, not a kernel that never paid, and
+# it is exactly the distinction the header's ORDERING paragraph hands to `--wcg` rather than to this
+# grammar. Recorded so that nobody replaying Boot V reads eight reds and attributes them to one cause.
+# Use `git log` to date a capture, and check it sat past 15 s, before reading any red here.
+# One wire from that round is NOT yet in force — `igpu-blt`, which ships PENDING; its block below
+# carries the promotion sha (`f11e1fc0`) and the reason.
+#
 # WHY THIS FILE EXISTS. Through GR17 the pi4 gate (pi4-regression.spec) was the ONLY automated
 # reader of any `[wc-g]`/`[wc-d]`/`[wc-h]`/`[wc-k]` line anywhere in the tree. Every x86 witness
 # finding — the 17.1 s kepler block, its four-phase decomposition, the paygo deferral that took
@@ -462,6 +493,251 @@ FORBID :: CLOCK-X1: .*\[paygo: .*— SKEW\]
 #   :: CLOCK-X1: NON-MONOTONE — rdtsc 900000000 -> 800000000, uptime 16 -> 15 s (core=3); the clock's monotonicity contract is broken == witness ::
 FORBID :: CLOCK-X1: NON-MONOTONE
 
+# --- WXN-x86 M1: THE PDPT NX SWEEP AND ITS VERDICT -------------------------------------------
+# `a0a2d163` put the first NX bit this kernel has ever written into its own map, and `32724cb4`
+# gave the sweep a VERDICT after its adversarial review found the milestone could be completely
+# vacuous and still print a line that read entirely normal (memory.rs F6, quoted in full at the
+# emitter). That verdict has had no automated reader since it landed, which is the same gap §10h
+# recorded for `[wc-g]` — one subsystem over, with a protection rather than an instrument behind it.
+#
+# NOTE ON THE PREFIX, because it is the one place this file's timestamp idiom does not apply: this
+# whole block fires from `arch::init`, BEFORE the bootpace entry stamp, so every line here carries
+# `[      ?ms]` rather than a millisecond count. No `[0-9]{5,}ms` guard is available on these rules
+# and none is wanted — they are once-per-boot lines with no late-boot failure mode to key on.
+#
+# THE POSITIVE WITNESS. `pdpt_seen`/`nx_set`/`residue_leaves` are named and shaped rather than
+# valued: the first two are functions of the firmware's map (1024 seen / 1022 set on this bench,
+# the two spared GiBs being the image and the AP trampoline) and `residue_leaves` is what the
+# WXAUDIT line below must independently report as `kern_WX`. Pinning any of them by value would
+# make this spec firmware-specific for no gain; pinning them by NAME catches the field going away.
+# Capture line (Boot W; Boot X identical but for `ehdr=0x7B235000` / `img=[0x7B235000,0x7B8E7290)`):
+#   :: WXN-x86: ehdr=0x7B233000 img=[0x7B233000,0x7B8E6DEA) gib_img=1 gib_tramp=0 spare_n=2 pdpt_seen=1024 nx_set=1022 huge_leaf_nx=0 skip_spare=2 skip_user=0 skip_pml4_user=0 skip_selfmap=0 already_nx=0 skip_fb_lock=0 skip_fb_base=0 skip_fb_walk=0 residue_leaves=1535 (1g=0 2m=1023 4k=512 pt=1) pge=0 flush=cr3-reload wp=0 -> SWEPT ::
+REQUIRE :: WXN-x86: ehdr=0x[0-9A-F]+ img=\[0x[0-9A-F]+,0x[0-9A-F]+\) .*pdpt_seen=[0-9]+ nx_set=[0-9]+ .*residue_leaves=[0-9]+ .*wp=[0-9]+ -> SWEPT ::
+# THE TWO NEGATIVE TERMINALS, and an honest account of what they add. Both are structurally
+# EXCLUSIVE with the REQUIRE above — `wxn_pdpt_sweep` has exactly one call site (arch/x86_64/mod.rs:46)
+# and prints exactly one terminal per boot — so a VACUOUS or REFUSED boot already reds this spec by
+# way of the missing SWEPT. What the FORBIDs buy is the DIAGNOSIS: mbench's replay path prints the
+# offending line for a FORBID hit and only a pattern for an unmatched REQUIRE, so with these two
+# rules a failed gate hands the reader `skip_pml4_user=1024 pdpt_seen=0` — the actual cause — instead
+# of "required witness missing". That is worth two lines, and it is the whole claim being made for
+# them; they are not asserted to catch anything the REQUIRE cannot.
+# `-> VACUOUS` — `wxn_pdpt_sweep`'s F6 verdict (memory.rs:1907 at `32724cb4`; anchor on the
+# function, the line drifts). `nx_set == 0` while the map has unspared PDPT entries: the sweep
+# wrote NOTHING. The concrete route is firmware that set U/S on its identity PML4 entries, at which
+# point every descent takes `skip_pml4_user` and the milestone is a no-op that logs like a success.
+# The failure is fail-safe (the sweep can only under-protect), which is why it is a line and not a
+# panic — and precisely why an automated reader is the only thing that will ever notice it.
+# REACHABLE: matched against the emitter's format string with `nx_set=0 pdpt_seen=0
+# skip_pml4_user=1024 residue_leaves=66047` substituted (the U/S map Boot V actually shows the
+# WXAUDIT half of — `kern_WX=66047`), which it catches.
+FORBID :: WXN-x86: .*-> VACUOUS ::
+# `-> REFUSED` — three emitters, all fail-closed early returns that write no entry, all three inside `wxn_pdpt_sweep` (memory.rs:1687
+# (EFER.NXE clear, so bit 63 is RESERVED and every entry would fault the next translation through
+# it), :1696 (the phdr walk found no image bounds, so the sweep cannot know which GiB to spare) and
+# :1720 (the image spans more 1 GiB regions than WXN_MAX_SPARE). Each is the RIGHT behaviour for its
+# condition and each leaves the kernel map unprotected, so each is a fault to report, not to hide.
+# REACHABLE: matched against all three format strings, generated with this bench's field values.
+FORBID :: WXN-x86: .*-> REFUSED
+
+# --- WXAUDIT: THE MAP CENSUS, AND THE HISTOGRAM APPENDED UNDER IT -----------------------------
+# The audit walk `wx_audit_report` (memory.rs:1152) publishes after `syscall::init` has armed
+# EFER.NXE and CR4.SMEP, so its numbers describe an actually-enforcing kernel. There was NO reader
+# of this line in any spec in the tree — not here, not in x86-fat.spec, not in rmbp-boot.spec —
+# which is stated because the natural assumption is that a line this old must already be covered.
+#
+# `l1=/l2=/l3=` are `32724cb4`'s leaf histogram (1 GiB / 2 MiB / 4 KiB counts over the WHOLE map),
+# APPENDED and never inserted: the emitter's own comment makes that the discipline so every existing
+# `awk` over this line keeps matching. This directive is what turns the discipline into a check —
+# it names the pre-existing fields IN THEIR ORIGINAL ORDER and then requires the histogram after
+# them, so an edit that inserted a field mid-line (breaking every positional reader on the bench)
+# goes red here rather than being discovered by a reader whose columns silently shifted.
+# The pattern deliberately STOPS at `l3=` rather than anchoring ` ::`, because the emitter appends
+# one more optional token — see the FORBID below. Two independent claims, two rules.
+# `kern_WX=` is not pinned by value on purpose: it is `residue_leaves` from the sweep above (1535 on
+# this bench, from 66047 before the sweep existed — Boot V shows exactly that), and it becomes an
+# ASSERTED zero at M3, not here.
+# Capture line (Boot W; Boot X identical but for `walk=1717kcyc`):
+#   :: WXAUDIT x86: leaves=66047 user=0 user_WX=0 kern_WX=1535 (2048 MiB) tables=1028 nxe=1 walk=1720kcyc l1=0 l2=65535 l3=512 ::
+REQUIRE :: WXAUDIT x86: leaves=[0-9]+ user=[0-9]+ user_WX=[0-9]+ kern_WX=[0-9]+ \([0-9]+ MiB\) tables=[0-9]+ nxe=[0-9]+ walk=[0-9]+kcyc l1=[0-9]+ l2=[0-9]+ l3=[0-9]+
+# ` TRUNCATED` — the walk ran out of budget and the census above describes PART of the map. This is
+# the one token that makes every number on that line an underestimate, including `user_WX=0`, which
+# is the audit's whole point: an unwalked subtree cannot report the W∧X page it contains. The
+# REQUIRE above matches a truncated line perfectly well (that is what stopping at `l3=` costs), so
+# without this rule a truncated audit reads as a clean one. Emitter: the `a.truncated` tail of
+# `wx_audit_report`'s census line (memory.rs:1165).
+# REACHABLE: matched against the format string with `truncated=true` substituted onto Boot W's
+# field values, which it catches. Zero hits on Boot V, W and X.
+FORBID :: WXAUDIT x86: .* TRUNCATED ::
+
+# --- WXAUDIT-NXE: NX IS PER-CORE MSR STATE, AND THE CENSUS ASKED THE BSP ----------------------
+# The witness `a0a2d163` added for the hazard the audit above structurally cannot see: `nxe=1` on
+# the WXAUDIT line is ONE core's EFER, read once, while the NX'd identity map is SHARED — every AP
+# runs on the BSP's CR3. A core whose EFER.NXE is clear ignores every bit the sweep wrote, and the
+# census would still print `nxe=1`. Each core ORs its own live MSR bit after its own `syscall::init`;
+# `cores` is what SMP believes is online and `nxe` is how many proved it (`wxn_nxe_report`, smp.rs:113).
+# `-> PASS` IS the equality `armed == cores` — the emitter computes the terminal from it — so the
+# terminal is the whole assertion and no `cores=(N) nxe=\1` backreference is needed or wanted.
+# `wp_mask` rides along and is deliberately not constrained: the rMBP firmware leaves CR0.WP=0 (QEMU
+# leaves it 1), M1 does not set it, and NX enforcement is independent of WP. A `wp=0` reading here
+# is the documented metal state, not a fault.
+# NO NEW FORBID, and this is the answer rather than an omission: the failure arm (`wxn_nxe_report`'s `else`, smp.rs:120) prints
+# `… -> FAIL ::`, which BOTH default FORBIDs (`-> FAIL`, `FAIL ::`) already catch. Naming it again
+# would be a rule that cannot fail independently of one already in force. This is the opposite of the
+# CLOCK-X1 case above, where all three fault verdicts end `== witness ::` and the defaults sail past
+# them — the distinction is worth stating, because "add a FORBID for every failure arm" is the wrong
+# rule and this file should not look like it follows one.
+# Capture line (Boot W @ 171 ms; Boot X identical):
+#   :: WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=0 wp_mask=0x0 -> PASS ::
+REQUIRE :: WXAUDIT-NXE: cores=[0-9]+ nxe=[0-9]+ nxe_mask=0x[0-9A-F]+ wp=[0-9]+ wp_mask=0x[0-9A-F]+ -> PASS ::
+
+# --- WXN-FBWC: THE GR15 TRIPWIRE THE SWEEP CARRIES ---------------------------------------------
+# GR15's defect — `map_mmio_window` silently un-typing the framebuffer from WC back to UC, 8.7-9.1x
+# on the blit path, invisible to every permission instrument for two weeks — is why the NX sweep
+# reads the fb leaf before and after itself. The interlock's panicking arms are covered by the
+# default `PANIC` FORBID and need nothing here (all three in `wxn_pdpt_sweep`'s fb interlock — a
+# level change across the sweep, memory.rs:1951; a
+# leaf bit other than PTE_NX moving, :1972; the mapping vanishing, :1998). What needs a rule is the
+# arm that is NOT a panic.
+#
+# THE REQUIRE, and its scope limit stated rather than discovered. `-> LEAF BIT-IDENTICAL` is the
+# `delta == 0` arm: the fb leaf is below the PDPT (lvl 2 on this bench), the sweep wrote only
+# parents, and NOTHING about the leaf moved — `pat=1` still says WC. The emitter has a second
+# CORRECT arm, `-> LEAF NX-ONLY (fb is a 1G leaf this sweep NX'd; expected)`, reachable only when
+# the walk terminates at lvl 3; a host whose firmware maps the fb as a 1 GiB leaf would take it and
+# would red this REQUIRE. That is a SCOPE question, not a defect, and the honest place to answer it
+# is a `(BIT-IDENTICAL|LEAF NX-ONLY)` widening at the moment such a capture exists — not now, on a
+# guess, which would weaken a live rule to accommodate a machine nobody has booted. Verified by
+# generating the NX-ONLY line from the format string: this pattern does NOT match it.
+# Capture line (Boot W; Boot X byte-identical):
+#   :: WXN-FBWC: fb=0x90020000 lvl=2 e=0x00000000900010E3 pat=1 pcd=0 pwt=0 w=1 fx=0 -> LEAF BIT-IDENTICAL ::
+REQUIRE :: WXN-FBWC: fb=0x[0-9A-F]+ lvl=[0-9]+ e=0x[0-9A-F]{16} pat=[0-9]+ pcd=[0-9]+ pwt=[0-9]+ w=[0-9]+ fx=[0-9]+ -> LEAF BIT-IDENTICAL ::
+# `-> SKIPPED` — FORBID, not PENDING, and the choice is not close. PENDING means "a witness whose
+# code is ahead of its bench" and prints "consider promoting to REQUIRE" when it matches, which is
+# nonsense for this line: nobody should ever want the interlock skipped. The emitter — the `else` arm
+# of `wxn_pdpt_sweep`'s `if let Some((e_before, l_before)) = fb_before` (memory.rs:2008) —
+# exists so that a capture with no `WXN-FBWC:` in it is distinguishable from a build that never had
+# the tripwire — F2's own reasoning — and it fires when the WRITER lock was contended, the fb base
+# was unknown, or the pre-sweep walk failed. Any of those means THE GR15 TRIPWIRE DID NOT RUN and
+# the sweep's effect on the panel mapping was never checked.
+# Like the WXN terminals above this is exclusive with the REQUIRE and so cannot red a run the
+# REQUIRE would have passed; it is here for the same reason, and it earns it more sharply — the
+# `skip_lock=/skip_base=/skip_walk=` fields it puts in the failure report are the entire diagnosis,
+# and they appear on NO other line.
+# REACHABLE: matched against the format string with `skip_lock=1` substituted, which it catches.
+FORBID :: WXN-FBWC: .*-> SKIPPED ::
+
+# --- EPACE-TRIM M8: THE 8510's NAK, AND THE FALSIFIER THAT MUST STAY SILENT --------------------
+# M8 (`7498436f`) names WHICH control request eats the ~52 ms the `05ac:8510` spends NAKing through
+# enumeration. Its threshold is 8 ms against a healthy per-transfer cost of 0.13 ms — ~62x — and the
+# emitter's own contract is that HEALTHY BOOTS PRINT ZERO LINES.
+#
+# WHY THE [0] LINE IS `OPTIONAL` AND NOT `REQUIRE`, which is the whole decision in this block. This
+# file distinguishes WITNESS-PRESENCE (assert it) from BEHAVIOUR (report it, never require it), and
+# an M8 line is behaviour: it is a defect being measured, not an instrument proving it is alive.
+# REQUIREing it would build a gate that goes RED WHEN THE BUG IS FIXED — the mirror image of the
+# vacuous-instrument disease every other comment here is written against. That is not hypothetical:
+#   * Boot V (pre-`609d9b3a`):  `[0] … addr=0 … wlen=8  … xfer=50ms` — the MPS0 pre-read.
+#   * Boot W (post-`609d9b3a`): `[0] … addr=2 … wlen=18 … xfer=47ms` — BUY-2 dropped the 8-byte
+#     pre-read for HS targets, that line vanished, and the NAK reappeared on a DIFFERENT request.
+# One landed fix already moved this line once between adjacent captures. A REQUIRE pinning `wlen=18`
+# would have gone red on the very commit that bought the 50 ms back.
+# The cost of OPTIONAL is real and is stated rather than glossed: nothing here proves the M8 meter is
+# still armed, because its healthy output is silence and silence is not matchable. `--slowxfer` in
+# tools/serial-analyzer.py is the reader that prices what IS printed (it exits FINDING on a [1] line);
+# `EPACE: [n] … {xfer=…(n=…) ass=… act=…}` is the always-printed transport meter next door. Recorded
+# here so the next reader does not mistake the OPTIONAL for an oversight.
+# Capture line (Boot W @ 966 ms; Boot X @ 968 ms with `xfer=48ms act=48ms`):
+#   :: EHCI-HID: [0] EPACE-TRIM M8 SLOW-XFER addr=2 hub=0.0 spd=HS bmreq=0x80 breq=0x06 wval=0x0100 widx=0x0000 wlen=18 stg=3 xfer=47ms act=47ms ass=0ms seq=1/8 == witness ::
+OPTIONAL :: EHCI-HID: \[0\] EPACE-TRIM M8 SLOW-XFER addr=[0-9]+ .*wlen=[0-9]+ stg=[0-9]+ xfer=[0-9]+.* == witness ::
+# CONTROLLER [1] IS THE FALSIFIER, and this one IS a hard rule. M8's docstring states the prediction
+# it was built to be wrong about: lines on [0] only, and ZERO on [1], whose 82 control transfers cost
+# 11 ms total across n=3 boots. A line on [1] falsifies the verdict's central claim — that the 52 ms
+# is one device's own answer latency and not a driver-side per-transfer cost — and would mean either
+# the meter or the 8 ms threshold is wrong. Either way the BUY-2 reasoning that has already been
+# spent on this path rests on it, so it goes red rather than into a table nobody reads.
+# Note this FORBID is NOT redundant with the OPTIONAL: they match different controllers, and a boot
+# can print both. Emitter: crates/kernel/src/drivers/ehci/mod.rs:806 (`slow_xfer_witness`, `self.idx`
+# is the controller index). Zero hits on Boot V, W and X.
+# REACHABLE: matched against Boot W's own line with `[0]` replaced by `[1]`, which it catches.
+FORBID :: EHCI-HID: \[1\] EPACE-TRIM M8 SLOW-XFER
+
+# --- IGPU-BLT: THE CENSUS THAT DOES NOT FLY YET (PENDING) --------------------------------------
+# PENDING, with the promotion condition named — the idiom this file already uses twice above, and
+# the honest label for a witness whose code is ahead of every capture in existence.
+#
+# `6283dde3` brought up an IVB BLT ring for console fill/scroll, refusing rather than panicking down
+# every path an accelerator can fail on. On THIS bench the gmux routes the panel to the Kepler, so
+# every iGPU display plane reads zero, `active_surf` is None — and until `f11e1fc0` that case fell
+# through in SILENCE. Boot X is the capture that proved it: the census printed nothing at all, which
+# the playbook had called the worst outcome, and `f11e1fc0` added the outermost refusal arm so the
+# fact is one `awk` away instead of an absence. Boot W predates the ring entirely.
+# So there is NO capture carrying this line, and a REQUIRE would be falsely red on every log ever
+# taken — the "witness that cannot match a real boot" defect, which this file refuses to commit.
+#
+# PROMOTION CONDITION: the first x86 metal capture from an image at or after `f11e1fc0`. On that
+# capture mbench will report this PENDING as matched and flag "consider promoting to REQUIRE";
+# do it then, and this block loses its PENDING and gains its real capture line.
+#
+# THE CLAIM the pattern makes is deliberately just `ring=`, spanning every arm: the module says
+# SOMETHING about the ring on every boot. WHICH arm it says is the finding — `absent
+# why=no-active-surface` is expected on the dual-GPU rMBP until the gmux switch lands, `up` is
+# expected on an iGPU-only host — and pinning an arm would pin a machine. What must never happen
+# again is the census being silent, and `ring=` is exactly that assertion.
+# ONE HONEST CAVEAT, since it bounds what a future green means: the refusal arms live in `igpu::init`
+# downstream of the BAR0 mapping, which has its own early return (`igpu::init`, igpu.rs:263). A host where BAR0
+# does not map prints `[Intel iGPU] Error: … not mapped. Probe aborted.` and no census line — that is
+# a different fault with its own loud line, and this rule would report it as a missing witness.
+# VERIFICATION — NOT a capture match. The pattern was checked against lines generated from both
+# shapes of the emitter's format strings:
+#   igpu.rs:381  ":: igpu-blt: ring=absent why=no-active-surface — every iGPU display plane is off (gmux routes the panel elsewhere); CPU path carries the console ::"
+#   igpu.rs:646  ":: igpu-blt: ring={} fills={} scrolls={} fallbacks={} spins_max={} ::"  ->
+#                ":: igpu-blt: ring=up fills=1204 scrolls=88 fallbacks=0 spins_max=17 ::"
+# It catches both. Zero hits on Boot V, W and X, as expected.
+PENDING :: igpu-blt: ring=
+
+# --- SMC: THE TRUNCATION COUNTER AND THE WALK THAT MUST NOT RE-WEDGE ---------------------------
+# `late=` (`bdfb3b4c`) is the counter that made "every key whole" a MEASUREMENT instead of an
+# inference. The truncation arm used to be invisible: a value byte that arrived after the read
+# stopped was drained and discarded in silence by `close_transaction`, and `unc` — which counts only
+# drains that FAIL — stayed 0, so `unc=0` did not mean "no truncation". The two arms now partition
+# it. The field is APPENDED, never inserted (`batt_witness`'s own comment, smc.rs:1722), so a positional `awk` over an older log
+# still lines up; this directive names the tail of the pre-existing field list and then requires
+# `late=` after it, which is what turns that discipline into a check.
+# PRESENCE, NOT VALUE, and here the reason is specific rather than stylistic: `late` also counts one
+# BENIGN shape — a read that stopped because it filled the caller's buffer on a key longer than the
+# buffer (`read_u16k`'s 2 bytes against a >2-byte key). A discarded byte either way, and the two are
+# told apart only by WHICH KEY was read, which is not on this line. `late=0` is therefore not a
+# verdict this grammar can pronounce; `--smc` in tools/serial-analyzer.py is where that reading lives.
+# Emitter: crates/kernel/src/drivers/smc.rs:1724.
+# Capture line (Boot W @ 1843 ms; Boot X @ 1845 ms):
+#   :: SMC-BATT: present=true soc=90% volt=12589mV amp=519mA full=9962mAh rem=9009mAh ac=derived:charging retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=976 busy=30 late=0 == witness ::
+REQUIRE :: SMC-BATT: present=.*gap=[0-9]+ busy=[0-9]+ late=[0-9]+ == witness ::
+# THE WALK, and why its summary line is load-bearing where its output was not. Boot V measured the
+# per-name index dump at 493 lines / ~25 KB, and the FTDI console's drain of that block displaced the
+# storage bring-up behind it by ~3.5 s. `a2cada19` demoted the DUMP (now behind `UNAOS_SMCWALK=1`)
+# and kept the WALK, because `read_key_by_index` is the GAP-1 sibling fix's only exerciser. This one
+# line is what remains, and the emitter's own comment states the contract: "a shortfall, or this
+# line's absence, says the GAP-1 sibling fix has re-wedged."
+# `walked == count` is NOT pinned by backreference, though the contract invites it: the loop runs to
+# `count.min(MAX_ENUM_KEYS)` with `MAX_ENUM_KEYS = 512` (smc.rs:941/1047), so an SMC with more than
+# 512 keys legitimately reports `512 of N` and the equality would be a false red on that machine.
+# This bench answers 493 of 493. The re-wedge itself is caught by the FORBID below, which is the
+# sharper rule anyway — it names the fault instead of inferring it from an arithmetic shortfall.
+# Emitter: the WALK-QUIET summary at the tail of the `#KEY` index loop, smc.rs:1108. Capture line (Boot W @ 1842 ms; Boot X @ 1843 ms; Boot V @ 1849 ms):
+#   :: SMC-SCOUT: index walk done (493 of 493 names) ::
+REQUIRE :: SMC-SCOUT: index walk done \([0-9]+ of [0-9]+ names\) ::
+# THE RE-WEDGE, forbidden. `bdfb3b4c` split "the SMC has no key at this index" (a clean stop, and a
+# normal end to an enumeration) from "a handshake wedged" (a fault that happens to end it too) so the
+# two stopped sharing a line. Boot U's `index enumeration STOP-NOTE at idx 0` is the exact reading
+# the sibling fix was written against — the walk dying on its first index — and its reappearance
+# means the fix has regressed. Bounded and never forced, so the boot survives it; this is what makes
+# it loud. Note it is invisible to the REQUIRE above WHEN IT IS NOT AT idx 0: the loop breaks and
+# `index walk done (N of M names)` still prints, with a short `N` that nothing else convicts.
+# Emitter: smc.rs:1092-1096 (`Err(SmcError::Stuck(step))`).
+# REACHABLE: matched against the format string with Boot U's `idx 0` reading substituted, which it
+# catches. Zero hits on Boot V, W and X.
+FORBID :: SMC-SCOUT: index enumeration STOP-NOTE at idx [0-9]+
+
 # --- WHAT IS DELIBERATELY NOT PINNED, stated rather than omitted -----------------------------
 #   * `kepler=2564ms`. It is the headline GR17 number and it is NOT a directive, because it is a
 #     MEASUREMENT on a specific machine: the 2012 rMBP's PCIe latency sets the read-back cost,
@@ -475,6 +751,19 @@ FORBID :: CLOCK-X1: NON-MONOTONE
 #     emitting after its last DEFERRED, and silence is not matchable. This is the one gap in the
 #     coverage above, and it is the analyzer's WARN rather than a directive here — recorded so
 #     the next reader does not mistake its absence for an oversight.
+#   * `state=closed … -> UNSPENT`. NOT forbidden, and it is the one paygo terminal that most looks
+#     like it should be. A window that closes with budget left has spent nothing further on a
+#     surface that no longer exists — a fixture tearing down mid-battery, which is normal — and the
+#     terminal exists so the wire says so instead of the window going silent mid-census. Boots W and
+#     X carry many of them, all on win=3, all legitimate. The emitter draws the distinction itself
+#     (video/wcg.rs:2221 names this spec and the `state=sealed … -> UNPAID` rule it DOES forbid):
+#     sealed means the coverage was never bought after the abort budget was spent, closed means
+#     there was nothing left to buy it for. Only the first is a fault.
+#   * A COUNT of `-> PAID` terminals. The REQUIRE above asks for one and deliberately not for four:
+#     `emit=`/`taken=` are still climbing on the console window when a capture ends (Boot W ends with
+#     win=1 PAID at 20682 ms and win=3 still spending), so any fixed count would be a claim about
+#     how long the bench sat rather than about the kernel. Boots W and X each carry three `[wc-g]`
+#     and three-to-four `[wc-d]` PAID lines; the analyzer reports the per-window split.
 #   * `[wc-h]` / `[wc-k]` / `[cursor*]`. Real witnesses, thoroughly pinned by the pi4 gate, and
 #     out of this spec's subject. Adding half-considered copies here would grow the file without
 #     growing the evidence.
