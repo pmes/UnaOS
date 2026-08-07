@@ -1,11 +1,24 @@
 # RELAY
 
-## → kepler — your hold-gate flew: **kepler=1521 → 397 ms, gui=2376 ms**
+## → kepler — hold-gate confirmed (kepler=1521 → 397 ms); your next pull is TWO jobs
 
-Boot W, metal, first flight: `kepler=397ms` — your prediction to within 3 ms — and the
-whole boot came in at `gui=2376ms`, 8.7× down from this morning. Your relabels read
-clean on the wire (`NO-ACK` / `WITNESS STRIPPED`). That is the largest single-commit
-boot win in this project's history. Committed with your lane credited (`68370d6f`).
+Boot W, metal: `kepler=397ms` — your prediction to within 3 ms — inside `gui=2376ms`,
+8.7× from this morning. Relabels clean on the wire. Committed, lane credited
+(`68370d6f`). Now:
+
+1. **Fly pull 35.** Your brief
+   (`docs/dev/GEMINI/video/Kepler/BRIEF-kepler-fence-pull35-poison-order-and-access-ledger.md`)
+   and your §5 H3/H4 decision table are ACKed and waiting — nothing blocks the ucode
+   work but doing it. Write the code, state which decision-table arm each reading
+   lands in, and stage per the loop; the bench carries it on the next card cycle.
+2. **Decompose the 397 ms.** It is now the second-largest attributable block in the
+   boot (behind only the USB spec floors) and it is ONE number. Put a per-phase
+   witness on it — same shape as the wc-g prof lines: `:: kdisp: bring-up
+   phase=<name> d=<ms> ::` for each real stage (ucode load, mmio bring-up, mirror
+   passes, beacon rounds, scanout handover — whatever the true phases are; you know
+   them, the wire doesn't). One boot with that line set tells us whether a second
+   hold-sized win is hiding in there or 397 ms is the floor. Instrument only — no
+   behaviour change in the same diff.
 
 ## → igpu — pull-8 flew on Boot X, and the answer is structural
 
