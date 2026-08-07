@@ -240,6 +240,7 @@ const GMUX_PORT_WRITE: u16 = 0x7D4;
 const GMUX_SWITCH_DISPLAY: u8 = 0x10;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_SWITCH_DDC: u8 = 0x28;
+const GMUX_READ_DDC: u8 = 0x29;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_SWITCH_EXTERNAL: u8 = 0x40;
 const GMUX_READ_DISPLAY: u8 = 0x11;
@@ -287,7 +288,6 @@ unsafe fn gmux_inb(port: u16) -> u8 {
 /// and no caller here swallows a timeout silently.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 unsafe fn gmux_wait_ready() -> bool {
-    let start = crate::arch::ms();
     let mut iters = GMUX_WAIT_ITERS;
     loop {
         if (unsafe { gmux_inb(GMUX_PORT_WRITE) } & 0x01) == 0 {
@@ -306,7 +306,6 @@ unsafe fn gmux_wait_ready() -> bool {
 /// Wait for the gmux to signal that the transaction completed, then consume the reply byte.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 unsafe fn gmux_wait_complete() -> bool {
-    let start = crate::arch::ms();
     let mut iters = GMUX_WAIT_ITERS;
     loop {
         if (unsafe { gmux_inb(GMUX_PORT_WRITE) } & 0x01) != 0 {
@@ -439,7 +438,7 @@ unsafe fn gmux_apply(phase: &str, ddc: u8, disp: u8, ext: u8) -> bool {
         ":: igpu: [GMUX] {} write: ddc={} disp={} ext={} (intent DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X}) ::",
         phase, ok(w_ddc), ok(w_disp), ok(w_ext), ddc, disp, ext);
 
-    let r_ddc = unsafe { gmux_index_read(GMUX_SWITCH_DDC) };
+    let r_ddc = unsafe { gmux_index_read(GMUX_READ_DDC) };
     let r_disp = unsafe { gmux_index_read(GMUX_READ_DISPLAY) };
     let r_ext = unsafe { gmux_index_read(GMUX_READ_EXTERNAL) };
     serial_println!(
@@ -536,7 +535,6 @@ fn gmux_dwell() {
 /// before xHCI enumeration. That is accepted for a one-shot experiment behind a knob.
 ///
 /// Called ONLY from inside the `PROTOCOL PROVEN` branch.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 
 
 pub fn init(gpu: &GpuInfo) {
@@ -721,6 +719,7 @@ pub fn init(gpu: &GpuInfo) {
         // `blitter_*` return false, and the CPU path carries the console exactly as before this
         // module existed. Each refusal names itself on an `igpu-blt: ring=absent` line.
         
+        bring_up_blt_ring(bar0, active_surf);
 
         serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers] On Ivy Bridge (Gen7 / Panther Point 7-Series PCH), the Display Engine is split.");
         serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers, Section 1.1.2] eDP on Port A (DP_A) is CPU-attached (North Display Engine).");
@@ -1011,7 +1010,7 @@ pub unsafe fn gmux_igd_switch() {
     let bar0 = IGPU_BAR0.load(Ordering::SeqCst);
     if bar0 == 0 { return; }
 
-    let ddc = gmux_index_read(GMUX_SWITCH_DDC);
+    let ddc = gmux_index_read(GMUX_READ_DDC);
     let disp = gmux_index_read(GMUX_READ_DISPLAY);
     let ext = gmux_index_read(GMUX_READ_EXTERNAL);
     serial_println!(":: igpu: [GMUX] pre-switch state: DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", ddc, disp, ext);
@@ -1084,4 +1083,12 @@ pub unsafe fn gmux_igd_switch() {
         ACTIVE_SURF.store(surf, Ordering::SeqCst);
     }
     bring_up_blt_ring(bar0, active_surf);
+
+    // FLIGHT 1 unconditionally dwells and reverts, even on success, because the input chain is unverified
+    // and recovery must be automatic.
+    serial_println!(":: igpu: [GMUX] beginning success-path dwell ::");
+    gmux_dwell();
+    let reverted = gmux_revert_now();
+    serial_println!(":: igpu: [GMUX] success-path dwell finished, reverted={} ::", reverted);
+    return;
 }
