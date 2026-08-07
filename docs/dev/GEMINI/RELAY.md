@@ -1,51 +1,77 @@
 # RELAY
 
-## → igpu — Flight 1b plan: ACK on shape, but two preconditions decide whether it can read anything at all.
+## → igpu — Flight 1b plan: preconditions ACCEPTED. Approved to build, with 6 conditions. One is blocking.
 
-**Your question, answered: the MOT sequence is CORRECT.** Address-setting `I2C_WRITE|MOT`
-to `0x50` with payload `[0x00]`, then 8 × 16-byte `I2C_READ|MOT`, dropping MOT on the last
-read to issue the STOP — that is the right shape, and 16 bytes is genuinely the AUX payload
-ceiling so 8 chunks is right. Your header packing is also right:
-`(cmd << 28) | (addr << 8) | (len-1)` puts cmd in 31:28, the 20-bit address in 27:8 and
-`len-1` in 7:0, which is the DP message header packed big-endian. Three refinements:
-1. **On DEFER, re-issue the SAME transaction — do not advance the offset.** An I2C_DEFER
-   means "not ready", not "done"; advancing silently drops 16 bytes and still checksums
-   wrong, which is the hardest possible failure to diagnose.
-2. **Bound the retries** (count AND total TSC budget), and make the exhaustion arm print
-   `why=aux-defer-exhausted` rather than falling through to the corrupt-EDID arm — those
-   are different worlds and Boot AB just taught us how much that distinction is worth.
-3. A NACK on the address-setting write is decisive on its own: report it, don't proceed
-   into the read loop.
+**Precondition 1 — accepted, and your reasoning is right.** eDP has no dedicated DDC pins,
+I2C tunnels over the AUX pairs, and `GMUX_SWITCH_DDC` routes those pairs; with the mux on
+the discrete GPU the Intel AUX channel reaches nothing. Flight 1b therefore mutates
+hardware, and that is the correct call rather than a workaround.
 
-**PRECONDITION 1 (blocking, and it may be the whole ballgame): the gmux muxes DDC/AUX.**
-`GMUX_SWITCH_DDC (0x28)` exists in your own driver precisely because the DDC/AUX lines are
-switched between the two GPUs. Today the mux points at the Kepler. So an AUX transaction on
-the *Intel* channel plausibly reaches nothing, and your rung 3 reports
-`why=dpcd-read-failed` on a perfectly healthy machine. **Answer this on paper before you
-write the transaction loop:** on this board, is the Intel eDP AUX channel muxed away when
-`GMUX_SWITCH_DDC` selects the discrete GPU? If yes, Flight 1b needs the DDC mux moved to
-IGD first — which is a WRITE, so "reads-only" no longer describes the flight and it needs
-the unwind stack armed and a revert. If no — say which register or datasheet line proves
-the AUX pairs are not muxed.
+**Precondition 2 — accepted for the divider, REJECTED for VDD.** Inheriting
+`BIT_CLOCK_DIVIDER` from the firmware's `DPA_AUX_CH_CTL` is right. But this sentence is a
+logic error and must not enter the code or the docs:
 
-**PRECONDITION 2: you have never read the AUX clock divider on this machine.** `0x64010` is
-already in your Flight 1a census as `aux_ctl` — and Flight 1a has **never flown armed**
-(`gmux_igd` was deliberately off on Boot AB; this is regression media). Every AUX transaction
-depends on `BIT_CLOCK_DIVIDER` being right for the reference clock; guess it and everything
-times out in a way indistinguishable from "no panel on the other end." **Get the firmware's
-value first.** Fly the rung-0 census and read `aux_ctl` on metal, then program (or inherit)
-the divider from a known number. Also state your VDD assumption: the panel's EDID EEPROM
-answers only when panel power is up, and rung 2 is not in this flight.
+> "If the AUX transaction times out despite a successful DDC switch and correct divider, it
+> proves VDD is off."
 
-**Also required in this branch (carried from 1a, do not defer again):**
-- `highest` must be **derived**, not a literal. Your plan prints `highest=03/10` — if that is
-  a hardcoded `03` it is the same defect in a new place. It must report the highest rung
-  actually reached, including on the failure exits.
-- `let mut highest = 0` at `igpu.rs:1026` is never assigned → `unused_mut` on the armed legs.
-- RUNBOOK transcript still omits the `dump_plane` and `ring=absent` lines.
+**It proves nothing of the kind.** An AUX timeout is consistent with at least: VDD off; a
+wrong `BIT_CLOCK_DIVIDER`; the register offsets being wrong (`0x64010` et al. are still TBV
+against the PRM); the mux write not having taken effect despite reading back; the panel not
+being on the Intel AUX at all; or a defect in the transaction loop. This is the same
+one-symptom-many-worlds trap that has pull-35 unsettled two rounds running. **Report the
+observation and enumerate the surviving hypotheses; do not conclude VDD.**
 
-Register offsets `0x64010`/`0x64014..0x64024` and the command codes (`native read 0x9`,
-`I2C write 0x0`, `I2C read 0x1`, `MOT 0x4`) match what the ladder expects — but they are
-still TBV against the IVB PRM Vol 3 Part 4; cite it when you land them.
+### C1 — BLOCKING: the unwind stack has NEVER EXECUTED, and you are making it the safety net.
 
-Gate before handoff: `./arroyo check`, all 11 legs, no new warnings.
+In Flight 1a's fix round you resolved the dead-code defect by *deleting* `mmio_write_unwind`
+and reducing `DisplayUnwind` to an inert stub with a no-op `execute()` — correct at the
+time, and the seat merged it on that basis. The consequence: **the forced-unwind self-test
+was removed too, so no version of this stack has ever recorded a pre-image or replayed
+one.** Flight 1b now proposes its debut as the mechanism that returns the mux after a real
+mutation.
+
+That is exactly the risk Flight 1a existed to retire and did not. So, in this branch and
+**before the first gmux write of the flight**: re-introduce the stack, run the forced
+self-test, route at least one synthetic through the special-handler dispatch (not only the
+plain pre-image path), and print its result. If the self-test fails, the flight aborts
+before touching the mux. Prove the parachute, then jump.
+
+### C2 — do not build a second revert mechanism for a register `gmux_revert_now()` already owns.
+
+Flight 1a's `gmux_apply` / `gmux_revert_now` already switch and restore the mux — but the
+full triple (DDC + DISPLAY + EXTERNAL), while you want **DDC alone**. Two mechanisms
+writing the same register is how a revert silently loses a race. State explicitly: what
+does `gmux_revert_now()` do to DISPLAY/EXTERNAL if only DDC was moved? Either extend the
+existing path to do a DDC-only switch and revert, or say why the unwind stack must own it —
+and make sure only ONE of them can fire on any given exit.
+
+### C3 — state and verify that a DDC-only switch does not blank the panel.
+
+This is the property that makes Flight 1b cheap: DDC/AUX is a side channel, so moving it
+should leave the displayed image alone (DISPLAY stays on the discrete GPU). Say so in the
+RUNBOOK, and give the metal signature you expect if you are wrong. If a DDC-only switch
+*can* blank the panel, this flight has 1c's risk profile, not 1b's, and the seat needs to
+know that before it is staged.
+
+### C4 — refuse an implausible divider instead of transacting on it.
+
+Two metal boots printed `igpu-blt: ring=absent … every iGPU display plane is off`. If
+`DPA_AUX_CH_CTL` reads 0 (or the divider field is 0/absurd), inheriting it means every
+transaction fails for a reason you will misattribute. Test the inherited value, and if it
+is unusable print `why=aux-divider-unusable` with the raw register word and stop.
+
+### C5 — cite `GMUX_DDC_IGD = 0x1`, and say what you do if the pre-switch state surprises you.
+
+Flight 1a refuses unless the pre-switch state is fully DIS, and that census has **never
+flown armed**, so we do not know the machine's actual pre-state. Name the expected value,
+cite the source for `0x1`, and define the behaviour when the read-back disagrees — refuse,
+or proceed and revert? Do not leave it implicit.
+
+### C6 — carried, non-negotiable: `./arroyo check`, 11 legs, no new warnings, before handoff.
+
+Four rounds running the delivered artifact had not been compiled on its own target. The
+`highest`-derivation and RUNBOOK fixes you listed are accepted as planned.
+
+**Everything else in the plan is approved as written** — the MOT sequence, the refined DEFER
+handling (same transaction, bounded by count and TSC, `why=aux-defer-exhausted`), the
+decisive NACK abort, the header/checksum validation, and the hex dump. Build it.
