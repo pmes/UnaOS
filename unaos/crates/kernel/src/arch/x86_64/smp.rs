@@ -101,23 +101,39 @@ fn wxn_record_core(idx: usize) {
     }
 }
 
-/// Publish the per-core NX witness. `cores` is the number of cores SMP believes are online
-/// (BSP included); the verdict is `PASS` only when every one of them proved NXE on its own MSR.
-/// Called from `start_aps` on every exit path — including the uniprocessor ones, because a witness
-/// that is absent from the capture you happen to be holding is worth nothing.
+/// Publish the per-core NX + WP witness. `cores` is the number of cores SMP believes are online
+/// (BSP included); the verdict is `PASS` only when every one of them proved BOTH bits on its own
+/// registers. Called from `start_aps` on every exit path — including the uniprocessor ones,
+/// because a witness that is absent from the capture you happen to be holding is worth nothing.
+///
+/// WXN-x86 M3a widened the PASS condition from `nxe == cores` to `nxe == cores && wp == cores`, in
+/// the same commit that arms CR0.WP in `syscall::init`. Before that commit `wp` was a REPORT (the
+/// bit was nobody's job, and on metal it read 0 on every core); from it, WP is the half of W^X that
+/// makes a read-only kernel page bind ring 0 at all, so a core that lacks it is a core on which
+/// M3b/M3c are vacuous — the exact class of silent, protection-shaped nothing this track keeps
+/// paying for. A firmware or CPU that refuses WP is now a boot-visible FAIL rather than a quiet
+/// regression.
+///
+/// The VERDICT TOKEN deliberately stays the bare word `PASS`. It would be tempting to rename it
+/// `PASS(nxe+wp)` so an old capture and a new one cannot be confused, but the line already carries
+/// that distinction in a field a reader can act on — `wp_mask=0x0 -> PASS` is unambiguously the
+/// pre-M3a era and `wp_mask=0xFF -> PASS` the post-M3a one — and `tools/serial-analyzer.py`
+/// (`if w['nxe']['verdict'] != 'PASS'`) matches the token exactly, so a rename would make every
+/// healthy boot report a fault in the one instrument that reads this wire.
 fn wxn_nxe_report(cores: u32) {
     wxn_record_core(0); // the BSP, reading its own live EFER/CR0 right here.
     let nxe = NXE_MASK.load(Ordering::SeqCst);
     let wp = WP_MASK.load(Ordering::SeqCst);
     let armed = nxe.count_ones();
+    let wp_armed = wp.count_ones();
     serial_println!(
         ":: WXAUDIT-NXE: cores={} nxe={} nxe_mask=0x{:X} wp={} wp_mask=0x{:X} -> {} ::",
         cores,
         armed,
         nxe,
-        wp.count_ones(),
+        wp_armed,
         wp,
-        if armed == cores { "PASS" } else { "FAIL" }
+        if armed == cores && wp_armed == cores { "PASS" } else { "FAIL" }
     );
 }
 

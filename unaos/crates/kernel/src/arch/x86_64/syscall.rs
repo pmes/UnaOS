@@ -26,7 +26,7 @@ use core::sync::atomic::{
 };
 
 use spin::Mutex as SpinMutex;
-use x86_64::registers::control::Cr4;
+use x86_64::registers::control::{Cr0, Cr4};
 use x86_64::registers::model_specific::{LStar, Msr};
 use x86_64::VirtAddr;
 
@@ -270,6 +270,9 @@ const EFER_SCE: u64 = 1 << 0; // SYSCALL/SYSRET enable
 const EFER_NXE: u64 = 1 << 11; // NX-bit enable
 // CR4 bit.
 const CR4_SMEP: u64 = 1 << 20;
+// CR0 bit. WXN-x86 M3a: with WP clear, a supervisor write IGNORES PTE.W — every read-only page
+// this arc creates would be advisory. See `init`.
+const CR0_WP: u64 = 1 << 16;
 // SFMASK: RFLAGS bits cleared on syscall entry — IF | TF | DF | AC. Interrupts stay OFF in the
 // handler; DF/AC/TF cleared so the kernel starts from an ABI-clean, deterministic RFLAGS.
 const SYSCALL_FLAG_MASK: u64 = 0x4_0700;
@@ -5702,6 +5705,52 @@ pub fn init() {
             serial_println!(":: SMEP unsupported (TCG?) — metal Ivy Bridge has it ::");
         }
     }
+
+    // WXN-x86 M3a: arm CR0.WP on THIS core. WP is what makes PTE.W bind ring 0 at all — with it
+    // clear (bit 16), a CPL-0 store to a present, non-writable page succeeds silently, so every
+    // read-only kernel page M3b/M3c create would be bookkeeping rather than protection. It is
+    // PER-CORE state and nothing in this kernel has ever set it: the BSP inherits the firmware's
+    // value (Apple EFI leaves it CLEAR on the rMBP — Boot W: `wp=0 wp_mask=0x0`, all eight cores)
+    // and every AP arrives from reset with WP=0, which the trampoline's `orl $0x80000001, %eax`
+    // RMW preserves. QEMU's firmware leaves the BSP at WP=1 and its APs at 0 (`wp_mask=0x1` on a
+    // six-core run), so "the BSP has WP" was never a statement about either platform's APs.
+    //
+    // HERE, in the per-core control-register seat, for the same reason SCE/NXE/SMEP/DR7 are here:
+    // it is the one function both bring-up paths run (BSP from `arch::init`, each AP from
+    // `ap_entry`), it runs with interrupts masked, and on the BSP it precedes
+    // `memory::wxn_pdpt_sweep` by ten lines — so M1's and M2's `with_page_tables_writable` windows
+    // are exercised with WP genuinely armed on the very boot that arms it, in the safest place a
+    // first exercise could happen. RMW, never a whole-CR0 store: PE/MP/ET/NE/PG all live here.
+    //
+    // This commit is expected to be INERT. Arming WP can only change behaviour where a supervisor
+    // store meets a leaf with W=0, and this tree creates no such KERNEL leaf: every path in
+    // `memory.rs` that can omit `PTE_WRITABLE` is a ring-3 one (`map_user_page`, `build_slot`,
+    // `protect_user_slot_range`, `map_slot_fb_page`), M1's PDPT sweep and M2's extent split set NX
+    // and only NX, and metal Boot Z still audits the whole kernel executable extent as writable
+    // (`WXAUDIT x86: kern_WX=319` == M2's `keep_x=319`, and every `WXPROBE map:` leaf reads `w=1`).
+    // The first read-only KERNEL page is M3b's to create; this commit only makes such a page bind.
+    //
+    // THE RING-3 W=0 PAGES ARE EXCLUDED AT RUNTIME, BY A GATE — NOT BY CONSTRUCTION. Ring 3 does
+    // have W=0 pages and the kernel does store into ring-3 memory (`copy_to_user`), so that seam is
+    // the one place arming WP could turn a silent fault loud. It is tempting to say the seam's
+    // lower bound (`lo = USER_BASE + PAGE_SIZE` for `UserAccess::Write`) excludes those pages by
+    // construction. IT DOES NOT, and that sentence is the exact model that hid a live W^X bypass:
+    // the bound encodes the FLAT/U2 layout — one code page at the window base — while the U3 ELF
+    // loader clears `PTE_WRITABLE` per SEGMENT, anywhere in the window
+    // (`memory::protect_user_slot_range`). `VUG-X86.ELF` (first `R E` LOAD memsz 0x1fe5) and
+    // `PULSE-X86.ELF` (0x13ec) both leave page 1 read-only AND executable, so for those slots
+    // `USER_BASE + 0x1000` — the FIRST address that bound admits — is an RO+X ring-3 page.
+    // What actually excludes it is CFU-2: `user_range_ok` walks the LIVE CR3 per page across the
+    // whole range (`memory::user_range_leaf_ok`) and returns `-EFAULT` unless every leaf on every
+    // page folds W. The bound survives only as a fast reject, explicitly not a security claim.
+    // That runtime gate is why arming WP here cannot convert the old silent kernel-as-writer code
+    // injection into a ring-3-triggerable fatal CPL-0 #PF, and it is witnessed rather than assumed:
+    // `:: CFU2-WGATE ... -> PASS ::` (metal Boot Z) proves the seam refuses a write to the RO+X
+    // page, accepts one to a writable page, and refuses an RW->RO straddle whose head it accepts.
+    //
+    // The witness for THIS commit is `wp_mask` on the `WXAUDIT-NXE` line; the falsifier is a `#PF`
+    // with `CAUSED_BY_WRITE | PROTECTION_VIOLATION` naming its own writer's RIP.
+    unsafe { Cr0::write_raw(Cr0::read_raw() | CR0_WP) };
 
     // U2.5 Part 0-ii: clear DR7 once per CPU. The U2 #DB policy (interrupts.rs) resumes a CPL-0 #DB
     // whose RIP lands in the syscall-entry stub, on the assumption that RFLAGS.TF is the ONLY #DB
