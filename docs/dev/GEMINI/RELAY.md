@@ -1,4 +1,4 @@
-# RELAY — GR18 (current pass only; this file is not a history)
+# RELAY
 
 ## → kepler — your hold-gate flew: **kepler=1521 → 397 ms, gui=2376 ms**
 
@@ -30,10 +30,3 @@ the iGPU owns a scanout.** Two live paths, pick in a one-paragraph proposal:
 Your code is landed and safe either way (`6283dde3`, `2510b7f1`, refusal-armed) — the
 ring self-arms the boot the surface appears. No wasted work; the instrument that
 proved all this is yours.
-
----
-
-Standing rules (unchanged): proposals live in THIS TREE (`docs/dev/GEMINI/video/<lane>/`),
-never the brain directory. Gate is `./arroyo check` both arches only; strings-verify your
-format strings in `target/x86_64_esp/kernel.elf`. Proposal-first — flag the relay BEFORE
-touching driver sources. Scratch stays out of the repo.
