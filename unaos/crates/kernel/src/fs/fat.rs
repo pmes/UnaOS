@@ -576,10 +576,50 @@ fn u64le(b: &[u8], off: usize) -> u64 {
 /// away: the per-source lock-span cost documented on [`with_fat_lock`] (a `Usb` RMW is held under masked IRQs
 /// for up to the BOT deadline, not for a polled sector transfer), and USBFALL F1 in `drivers::block`, which
 /// stops a missing SD backend from silently redirecting `Default` writes onto this same stick.
+///
+/// SDHC-4b: `Sdhc` reads the card in the machine's INTERNAL SD slot directly through the SDHCI driver
+/// (`drivers::block::read_block_sdhc`), independent of the backend selector — so on x86 the internal card
+/// can be mounted alongside the USB stick that IS the boot volume, without either of them moving.
+/// **It is READ-ONLY, unconditionally, in this arc**: [`write_sector`] and [`write_sectors`] refuse it with
+/// a one-shot witness. That is the same blanket refusal PIUSB-27 shipped for `Usb`, and it is here for the
+/// reason set out at length in `flight_recorder.rs` §SINGLE FAT WRITER — [`with_fat_lock`] / [`with_dir_lock`]
+/// are INERT on x86, so a second FAT/directory MUTATOR on this target is a proven corruption generator
+/// (A/B-measured cross-linked chains and stolen delete-witness snapshots), and adding a second mountable
+/// volume must not quietly recreate it. As a READER a `Sdhc` mount cannot interact with anything: it is a
+/// separate by-value `FatFs` sharing no state with the boot volume's mount, and the one cross-volume global
+/// in this file (`ALLOC_HINT`) is read only by the cluster ALLOCATOR, which a read-only mount never enters.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BlockSource {
     Default,
     Usb,
+    /// SDHC-4b (x86, `sdhcblk` knob): the internal SD card, READ-ONLY. See the note above.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    Sdhc,
+}
+
+/// SDHC-4b: one-shot latch for the read-only refusal witness, so a writer that retries cannot flood
+/// the console with the same line.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+static SDHC_RO_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// SDHC-4b: refuse a FAT-layer write to the internal SD card, naming the reason once per boot.
+///
+/// This is the whole of the SINGLE FAT WRITER safety argument for this arc, so it is a function rather
+/// than an inline `_ =>` arm: there is exactly one place that decides, both write entry points go
+/// through it, and a future arc that lifts the refusal has exactly one thing to delete. It returns
+/// [`FatError::Unsupported`], not `Io` — a refusal is not a device fault, and the VFS surfaces it as
+/// "read-only volume" rather than as a disk error.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+fn refuse_sdhc_write(site: &str, lba: u64) -> FatError {
+    if !SDHC_RO_REFUSED.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            ":: SDHCBLK: FAT write REFUSED at {} lba={} — the internal SD card is mounted READ-ONLY \
+             (SINGLE FAT WRITER: x86 fat/dir locks are inert, so this build keeps exactly one FAT \
+             mutator) (first, once) ::",
+            site, lba
+        );
+    }
+    FatError::Unsupported
 }
 
 /// Read one 512-byte sector at absolute `lba` into `buf` from `source`. Treats a short copy as I/O error, so
@@ -588,6 +628,8 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
     let r = match source {
         BlockSource::Default => crate::drivers::block::read_block(lba, buf),
         BlockSource::Usb => crate::drivers::block::read_block_usb(lba, buf),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::read_block_sdhc(lba, buf),
     };
     match r {
         Ok(n) if n >= SECTOR_SIZE => Ok(()),
@@ -606,9 +648,19 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
 /// BOT WRITE(10) path (`write_block_usb`, MISSION-gated with an RMW+restore witness); any source
 /// without a verified write path would still be refused here.
 fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> {
+    // SDHC-4b: the internal SD card is READ-ONLY at the FAT layer. Checked BEFORE the block call, so
+    // no CMD24 can be issued by any FAT path however the volume was mounted.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    if source == BlockSource::Sdhc {
+        return Err(refuse_sdhc_write("write_sector", lba));
+    }
     let r = match source {
         BlockSource::Default => crate::drivers::block::write_block(lba, buf),
         BlockSource::Usb => crate::drivers::block::write_block_usb(lba, buf),
+        // Unreachable: the guard above returned. Present so the match stays exhaustive and so a future
+        // arc that deletes the guard gets a compile error here instead of a silent fallthrough.
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => return Err(refuse_sdhc_write("write_sector", lba)),
     };
     r.map_err(|e| match e {
         // WEDGE-8 (F3): see `read_sector` — Busy stays Busy so it can be retried, not mourned.
@@ -668,6 +720,8 @@ fn read_sectors(source: BlockSource, lba: u64, buf: &mut [u8]) -> Result<(), Fat
         let r = match source {
             BlockSource::Default => crate::drivers::block::read_blocks(at, chunk),
             BlockSource::Usb => crate::drivers::block::read_blocks_usb(at, chunk),
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockSource::Sdhc => crate::drivers::block::read_blocks_sdhc(at, chunk),
         };
         match r {
             Ok(n) if n == take => {}
@@ -686,6 +740,11 @@ fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatErr
     if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
         return Err(FatError::Io);
     }
+    // SDHC-4b: read-only, checked before the loop — see `write_sector`.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    if source == BlockSource::Sdhc {
+        return Err(refuse_sdhc_write("write_sectors", lba));
+    }
     let step = crate::drivers::block::MAX_BLOCKS_PER_OP * SECTOR_SIZE;
     let mut off = 0usize;
     while off < buf.len() {
@@ -695,6 +754,9 @@ fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatErr
         let r = match source {
             BlockSource::Default => crate::drivers::block::write_blocks(at, chunk),
             BlockSource::Usb => crate::drivers::block::write_blocks_usb(at, chunk),
+            // Unreachable: the guard above returned. See `write_sector`.
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockSource::Sdhc => return Err(refuse_sdhc_write("write_sectors", at)),
         };
         r.map_err(|_| FatError::Io)?;
         off += take;
@@ -1282,6 +1344,8 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
     let dev = match source {
         BlockSource::Default => crate::drivers::block::info(),
         BlockSource::Usb => crate::drivers::block::usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
     }
     .ok_or(FatError::NoDisk)?;
     if dev.block_size != SECTOR_SIZE as u32 {
@@ -1350,6 +1414,8 @@ fn handle_of(source: BlockSource) -> crate::drivers::block::BlockHandle {
     match source {
         BlockSource::Default => crate::drivers::block::BlockHandle::Global,
         BlockSource::Usb => crate::drivers::block::BlockHandle::Usb,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::BlockHandle::Sdhc,
     }
 }
 
@@ -1430,6 +1496,8 @@ pub fn volume_serials(source: BlockSource) -> alloc::vec::Vec<u32> {
     let dev = match source {
         BlockSource::Default => crate::drivers::block::info(),
         BlockSource::Usb => crate::drivers::block::usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
     };
     let Some(dev) = dev else { return out };
     if dev.block_size != SECTOR_SIZE as u32 {
@@ -3390,6 +3458,68 @@ pub fn probe_once() {
             }
         }
         Err(e) => serial_println!("FS: no FAT filesystem ({:?})", e),
+    }
+}
+
+/// SDHC-4b: one-shot boot probe for the INTERNAL SD card — the witness that says whether the block
+/// backend added by this arc actually reaches a filesystem.
+///
+/// Mirrors [`probe_once`] exactly (a `PROBED` latch, a registry check that no-ops until the device is
+/// there, then one mount and one report), and it runs from the x86 main loop for the same reason
+/// PIUSB-27's mount does: it must fire with no driver lock held, and `sdhc::bring_up` holds the card
+/// lock through its own witnesses.
+///
+/// **This is a READER and nothing else.** It mounts, prints, lists the root, and drops the `FatFs`.
+/// It creates no file, reserves nothing, and writes no sector — see `BlockSource::Sdhc` and
+/// `flight_recorder.rs` §SINGLE FAT WRITER for why that is load-bearing rather than merely modest.
+///
+/// It is able to say NO in three distinguishable ways, which is the point of printing all of them:
+/// * no line at all → `register_sdhc` never ran, i.e. no card was identified (the `[sdhc]` bring-up
+///   lines above it in the log say why);
+/// * `no FAT volume … (NotFat)` → the card is readable but carries no BPB this reader accepts. The
+///   `:: PART: mbr-raw handle=sdhc …` census that `mount_source` emits just above is the raw evidence;
+/// * `no FAT volume … (Io)` → the registry has the card but a read of LBA 0 failed, which contradicts
+///   the bring-up read witnesses and is a real finding about the driver, not about the medium.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn sdhc_probe_once() {
+    static PROBED: AtomicBool = AtomicBool::new(false);
+    if PROBED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(dev) = crate::drivers::block::sdhc_info() else {
+        return; // no card registered under the Sdhc handle (yet, or at all this boot)
+    };
+    PROBED.store(true, Ordering::Relaxed);
+
+    let size_mib = dev.num_blocks.saturating_mul(dev.block_size as u64) / (1024 * 1024);
+    match mount_source(BlockSource::Sdhc) {
+        Ok(fs) => {
+            serial_println!(
+                ":: SDHCBLK: FAT mounted READ-ONLY on the internal SD card ({} MiB): {} ::",
+                size_mib, fs.describe()
+            );
+            match fs.read_root() {
+                Ok(entries) => {
+                    serial_println!(
+                        ":: SDHCBLK: sdhc root directory ({} entries) ::",
+                        entries.len()
+                    );
+                    for de in &entries {
+                        if de.is_dir {
+                            serial_println!(":: SDHCBLK:   <DIR>              {} ::", de.name());
+                        } else {
+                            serial_println!(":: SDHCBLK:   {:>12}       {} ::", de.size, de.name());
+                        }
+                    }
+                }
+                Err(e) => serial_println!(
+                    ":: SDHCBLK: sdhc root directory read error ({:?}) ::", e
+                ),
+            }
+        }
+        Err(e) => serial_println!(
+            ":: SDHCBLK: no FAT volume on the internal SD card ({} MiB, {:?}) ::", size_mib, e
+        ),
     }
 }
 

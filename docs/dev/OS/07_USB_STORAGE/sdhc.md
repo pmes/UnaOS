@@ -1478,3 +1478,204 @@ than `0x00018000`: bit 8 is set in the **normal** interrupt half. The classifier
 the v1.x branch and still gave its grounds as "error half is bit 16 alone", which is what
 §9.3's predicate actually tests. The discriminator has now been exercised against two
 different register words, not one.
+---
+
+## 10. Milestone 4b (SDHC-4b) — the card becomes a BLOCK BACKEND
+
+### 10.1 The gap this closes
+
+After §8 and §9 the driver could do everything to the card and the operating system could
+do nothing with it. Boot AC identified the bench card
+(`:: sdhc: card v1.x SDSC byte-addressed blocks=60800 size=29 MiB rca=0x5bbc ::`, MBR
+partition type `0x06` start 63 count 60732, ADMA2 cross-checked byte-for-byte against PIO at
+three windows) and Boot AD wrote a sector to it and restored it
+(`w1 armed=1 … verify=IDENTICAL restore=IDENTICAL -> PASS`). So `read_block_512`,
+`read_blocks_512` and — behind `sdw` — `write_block_512` were all proven on metal.
+
+None of it was reachable. `drivers/block.rs` has exactly two backends: the xHCI USB-MSC path,
+and `BACKEND_SD` → `drivers::emmc2`. **Every SD arm in that file is
+`#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]`** — the Pi's controller — so on
+x86 `block::read_block` / `block::write_block` have always meant the USB stick and nothing
+else. The card was a driver with no consumer.
+
+SDHC-4b makes it a block backend, so `fs::fat` can mount it.
+
+### 10.2 Selection policy — a THIRD registry handle, not a wider selector
+
+The card is published as `BlockHandle::Sdhc` (`block::SDHC_BLOCK_DEVICE`, reached through
+`block::read_block_sdhc` / `read_blocks_sdhc`), alongside the existing `Global`
+(`BLOCK_DEVICE`) and `Usb` (`USB_BLOCK_DEVICE`) handles. It is **not** a new value of the
+aarch64 `BACKEND` selector, and that is the whole selection policy. Three independent reasons,
+any one of which is sufficient:
+
+1. **A selector would steal the boot volume.** This machine boots from a USB card reader, so
+   the stick *is* `BLOCK_DEVICE`, and `block::info()` is what the flight recorder,
+   `fat::probe_once`, the shell, `fs/unafs.rs` and the installer all read. Flipping a selector
+   would silently re-point every one of them at a different disk — PI-FS-2 (a 14 MiB reader's
+   `num_blocks` clobbering the SD's global on the Pi), in reverse.
+2. **The publish order makes it a race, not a choice.** `sdhc::probe` runs inside the x86 PCI
+   probe; the stick enumerates later, and on x86 `publish_usb_geometry` claims the global
+   **unconditionally**. A card registered into the global would simply be overwritten a moment
+   later — and the "selector" would decide nothing while looking like it decided something.
+3. **Refusal beats precedence.** With a separate handle there is no precedence rule to get
+   wrong. A caller that wants the internal card must NAME it, and nothing in the tree names it
+   except this arc's read-only mount witness. Every existing caller is untouched *by
+   construction* rather than by a policy that has to keep being right.
+
+**Proof of non-interference, at the source level.** There is no new statement anywhere in
+`read_block`, `write_block`, `read_blocks`, `write_blocks` or `publish_usb_geometry` — not one
+`#[cfg]`, not one branch. The change is additive entry points plus one extra arm in the
+handle/source matches, and with the knob off the enum variant does not exist, so those matches
+are byte-identical to the pre-4b tree.
+
+**Proof of non-interference, on the wire.** §10.5.
+
+### 10.3 SINGLE FAT WRITER — what this arc does and does not do about it
+
+`flight_recorder.rs`'s module doc documents, with A/B evidence, the hazard a second mountable
+volume walks straight into. `fs/fat.rs`'s `with_fat_lock` / `with_dir_lock` are **deliberately
+INERT on x86** (masking IRQs across the `hlt`-driven xHCI BOT pump would hang the core), so on
+this target the tree's rule is *at most one FAT/directory MUTATOR*. When the recorder was a
+second one, the measured result was cross-linked chains (`GROW.BIN` chain length 5/6 where 2
+was expected) and delete-witness first-free snapshots stolen mid-verdict: recorder stubbed out
+→ 0/3 FAIL, recorder on → 3/3 FAIL. The recorder's fix was to stop being a mutator at all —
+reserve `UNAOS.LOG` once, then only ever write in place.
+
+**What SDHC-4b does:** it adds a READER.
+
+* The SDHC volume is mounted as a **separate, by-value `FatFs`** (`BlockSource::Sdhc`) that
+  shares no state with the boot volume's mount. The one cross-volume global in `fs/fat.rs` is
+  `ALLOC_HINT`, which is documented advisory-only and is read by the cluster ALLOCATOR — a
+  path a read-only mount never enters.
+* `fat::write_sector` and `fat::write_sectors` **refuse a `Sdhc` source unconditionally, in
+  every cfg**, through one function (`refuse_sdhc_write`) that names the reason once per boot
+  and returns `FatError::Unsupported` — a refusal, not a device fault. This is the same
+  blanket refusal PIUSB-27 shipped for `Usb`, which USB-WRITE later lifted in its own arc with
+  its own witness ladder.
+* Therefore no FAT entry, no directory sector and no data cluster of the internal card is
+  written by this build, and the count of x86 FAT mutators is unchanged at **one**.
+
+**What it does not do:** it does not make the volume writable, and it does not claim the
+hazard is solved. Two things could make a FAT-layer write to this volume safe, and neither is
+in this arc:
+
+1. `with_fat_lock` / `with_dir_lock` become REAL on x86. They cannot simply be un-inerted —
+   the reason they are inert is the BOT pump, so this needs a different mechanism (a
+   non-masking mutex the storage service task can respect), not a flag flip.
+2. The SDHC writer adopts the recorder's shape — reserve once at a point provably before any
+   other writer exists, then only write in place, which is not a FAT mutation after bootstrap.
+
+**The block-layer write pair is a different question, answered differently.**
+`block::write_block_sdhc` / `write_blocks_sdhc` exist and route to `sdhc::write_block_512`,
+but they are additionally `sdw`-gated (so a default image still contains **no CMD24 command
+word at all**, preserving §8's property), and the only route to them is
+`PartitionRange::write_block(s)` with an explicitly `Sdhc`-handled range. `fs/fat.rs` never
+calls `PartitionRange::write_block` — its writers go straight to `write_sector` /
+`write_sectors` — so no FAT mutation can arrive there. Without `sdw` the same entry point
+exists and REFUSES with a one-shot witness, fail-closed in the same direction as USBFALL F1.
+The installer's two `BlockHandle` matches also gained explicit `Sdhc` refusal arms: nothing
+constructs an `Sdhc` install target, and a medium-destroying write is the last place to leave
+an arm falling through.
+
+### 10.4 The knob, the witnesses, and how each says NO
+
+`UNAOS_SDHCBLK=1` → cargo feature `sdhcblk`, wired in `unaos/arroyo` (mapping + the aarch64
+strip + the `x86-all` `KERNEL_CFG_MATRIX` leg) and in `unaos/builder/src/main.rs` — a knob
+wired into arroyo alone ships the backend disabled while the `⚡ kernel features:` banner
+claims it is on (the s42/INSTGUI and WXN-M3b lesson). Default OFF, and off means the enum
+variants do not exist, no registry slot or entry point is compiled, and the registration call
+site in `sdhc::bring_up` is unlinked.
+
+Registration is the LAST thing `bring_up` does, after `verify_read`, `verify_multiblock`,
+`adma2_smoke`, `verify_adma_ab` and `write_selftest`. That ordering is the point: registration
+is the statement *a filesystem may trust this device*, and it should only be made about a card
+whose read path this boot has already exercised and reported on.
+
+Three distinguishable silences, which is what makes the witness falsifiable:
+
+| observation | means |
+|---|---|
+| no `:: SDHCBLK:` line at all | `register_sdhc` never ran — no card identified. The `[sdhc]` bring-up lines above say why. |
+| `registered …` then `no FAT volume … (NotFat)` | the card is readable but carries no BPB this reader accepts. The `:: PART: mbr-raw handle=sdhc …` census printed just above is the medium's own bytes. |
+| `registered …` then `no FAT volume … (Io)` | the registry has the card but a read of LBA 0 failed — which CONTRADICTS the bring-up read witnesses, and is a finding about the driver, not the medium. |
+| `registered …` with `blocks=0` | impossible: `register_sdhc` refuses a zero-block card and says so instead of publishing a device every later bound check would reject. |
+
+### 10.5 QEMU evidence (2026-08-07)
+
+QEMU attaches `sdhci-pci` + `sd-card` by default (§4), so the whole path is exercisable
+without the bench. `target/sdcard.img` was rebuilt as a **16 MiB image mirroring the metal
+card's layout verbatim** — classic MBR, primary slot 1, type `0x06`, start LBA 63 — with a
+FAT16 filesystem, one file and one subdirectory on it.
+
+Armed (`UNAOS_SDHCBLK=1 ./arroyo test-fat part 45`), the card mounts end to end:
+
+```
+:: SDHCBLK: registered internal SD card as block handle Sdhc — blocks=32768 (16 MiB)
+   addressing=byte (global BLOCK_DEVICE untouched) ::
+:: PART: mbr-raw handle=sdhc dev_blocks=32768 sig=55aa ::
+:: PART: mbr handle=sdhc slot=1 type=0x06 boot=0x00 start=63 count=32705 end=32768 ACCEPT ::
+:: PART: mbr census handle=sdhc protective=0 accepted=1 rejected=0 ::
+:: SDHCBLK: FAT mounted READ-ONLY on the internal SD card (16 MiB): FAT16 vol@LBA63
+   volsec=32704 bps=512 spc=4 nfat=2 fatsz=32sec reserved=4 fat@LBA67 data@LBA163
+   clusters=8151 rootdir@LBA131 (32sec) ::
+:: SDHCBLK: sdhc root directory (2 entries) ::
+:: SDHCBLK:             82       HELLO.TXT ::
+:: SDHCBLK:   <DIR>              SUBDIR ::
+```
+
+Three controls, all run at 40–45 s:
+
+* **blank card, knob armed** → `mbr census handle=sdhc sig=absent — not an MBR` followed by
+  `:: SDHCBLK: no FAT volume on the internal SD card (16 MiB, NotFat) ::`. The instrument says
+  NO on a medium that deserves a NO.
+* **no controller, knob armed** (`UNAOS_NOSDHCI=1`) → zero `SDHCBLK` lines, and the boot
+  volume mounts normally. Registration cannot fire without a card.
+* **knob OFF** → zero `SDHCBLK` lines.
+
+**What knob-off costs the image, measured rather than asserted.** One worktree, one
+`target/` dir, this tree vs `3d4ba446`, no knobs on either side: the x86 kernel ELF's `.text`
+(682 479 bytes) and `.rodata` (91 336 bytes) are **byte-identical**. `.data.rel.ro` differs in
+exactly 32 bytes, and every one of them is the `line` field of a `core::panic::Location` whose
+`file` is the 27-character path `crates/kernel/src/fs/fat.rs`, shifted by 68 — the number of
+lines of doc comment and `#[cfg]`-gated code this arc inserted ABOVE those panic sites. There
+is no other difference. (A naive whole-file hash DOES differ, which is why the comparison is
+per-section; and it differs for that reason alone.)
+
+**Non-interference, measured.** Between the knob-off and knob-armed runs the boot volume is
+identical — same census (`handle=global protective=0 accepted=1 rejected=0`), same mount
+(`FAT32 vol@LBA2048 volsec=194560 bps=512 spc=1 nfat=2 fatsz=1497sec reserved=32 fat@LBA2080
+data@LBA5074 clusters=191534 rootclus=2`), same 15-entry root — and the **named verdict sets
+are identical: 37 PASS / 0 FAIL on both runs**. That set includes exactly the fixtures the
+flight-recorder A/B failure destroyed: U10 (`write_grow`), U10c (`create_in_root`), U10d
+(`delete_located`), U11m2 (deferred delete) and U6gx all PASS with the knob armed, and the
+recorder still reports `:: FR: UNAOS.LOG reserved … — flushes are write-in-place only (single
+FAT writer preserved) ::`. The only run-to-run differences in the two logs are `[wc-d]`
+compositor frame counters and the recorder's reserved cluster number, which moves because the
+armed kernel binary is a different size and the ESP files land differently.
+
+### 10.6 The falsifiable metal prediction
+
+On the next attended metal boot with `UNAOS_SDHCBLK=1`, after the `[sdhc] … CARD IDENTIFIED`
+and `w1 … -> DRYRUN` lines already established by Boots AC/AD, the log must contain:
+
+```
+:: SDHCBLK: registered internal SD card as block handle Sdhc — blocks=60800 (29 MiB)
+   addressing=byte (global BLOCK_DEVICE untouched) ::
+:: PART: mbr handle=sdhc slot=1 type=0x06 boot=0x?? start=63 count=60732 end=60795 ACCEPT ::
+:: PART: mbr census handle=sdhc protective=0 accepted=1 rejected=0 ::
+:: SDHCBLK: FAT mounted READ-ONLY on the internal SD card (29 MiB): FAT16 vol@LBA63 …
+```
+
+`blocks=60800`, `start=63`, `count=60732` and `end=60795` are Boot AC's numbers, not estimates
+— a different value in any of them falsifies either this arc's geometry publication or the
+Boot AC reading, and the raw `mbr-raw` line printed above the verdict says which. The mount
+line is the real prediction and it can fail honestly: if partition 1 turns out not to hold a
+BPB this reader accepts, the line reads `no FAT volume … (NotFat)` and the arc has still
+delivered a working block backend with a truthful witness. What must NOT appear under any
+outcome is a `:: SDHCBLK: FAT write REFUSED …` line — nothing in this build writes through the
+FAT layer to that card, so that line firing would mean a caller exists that this analysis
+missed.
+
+The boot volume's own lines (`FS: FAT mounted: FAT32 …`, the `FR: UNAOS.LOG reserved …`
+witness) must be unchanged from the previous boot. Any change there is the regression this
+section's selection policy exists to prevent.

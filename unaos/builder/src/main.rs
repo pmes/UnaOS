@@ -154,6 +154,15 @@ fn main() {
     // wire) would have looked like a card that refused. The `armed=` field exists for exactly this,
     // and it is what caught the same omission in WXN-M3b. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_SDW").is_ok() { feats.push("sdw"); }
+    // SDHC-4b (GR20): UNAOS_SDHCBLK=1 makes the INTERNAL SD card a real x86 block backend, published
+    // under its OWN registry handle (`BlockHandle::Sdhc`) so `fs::fat` can mount it READ-ONLY without
+    // the boot volume — the USB stick this machine boots from — moving at all. THIS list is what
+    // reaches the kernel binary for MEDIA builds, so a knob wired into arroyo alone would ship the
+    // backend disabled while the `⚡ kernel features:` banner claimed it was on (s42/INSTGUI, WXN-M3b).
+    // The failure would be quiet in the worst way here: no `:: SDHCBLK: registered … ::` line and no
+    // mount witness reads exactly like "no card was identified", which is a different finding.
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_SDHCBLK").is_ok() { feats.push("sdhcblk"); }
     // PCI-CENSUS (GR20): UNAOS_PCICENSUS=1 arms the complete READ-ONLY PCI enumeration witness
     // (arch/x86_64/pci.rs::full_census) — one `[PCI-CENSUS]` line per function present, plus a
     // capability dump per network-class function. THIS list is what reaches the kernel binary for

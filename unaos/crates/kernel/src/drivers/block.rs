@@ -166,6 +166,12 @@ pub enum BlockHandle {
     /// The dedicated [`USB_BLOCK_DEVICE`] entry — read/written through [`read_block_usb`] /
     /// [`write_block_usb`], which bypass the backend selector.
     Usb,
+    /// SDHC-4b (x86, `sdhcblk` knob): the dedicated [`SDHC_BLOCK_DEVICE`] entry — the card in the
+    /// machine's INTERNAL SD slot, read through [`read_block_sdhc`] / [`read_blocks_sdhc`], which
+    /// bypass the backend selector exactly as the `Usb` pair does. See the SDHC-4b section below for
+    /// why it is a third handle and not a third value of the `BACKEND` selector.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    Sdhc,
 }
 
 /// INSTALL-SEL: a durable name for ONE block device, good across frames and across a registry change.
@@ -209,6 +215,8 @@ pub fn lookup(id: BlockDeviceId) -> Option<BlockDeviceInfo> {
     let cur = match id.handle {
         BlockHandle::Global => info(),
         BlockHandle::Usb => usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockHandle::Sdhc => sdhc_info(),
     };
     match cur {
         Some(d) if d.slot_id == id.slot_id && d.num_blocks == id.num_blocks => Some(d),
@@ -712,6 +720,210 @@ pub fn write_blocks_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     }
 }
 
+// ===================== SDHC-4b — the internal SD card as a THIRD registry handle =====================
+//
+// Boot AC identified the card in the 2012 rMBP's built-in PCIe SD reader (`drivers/sdhc.rs`) and read
+// it three ways; Boot AD wrote one sector to it and restored it byte-for-byte. The driver therefore
+// has proven `read_block_512` / `read_blocks_512` (and, behind `sdw`, `write_block_512`) — but nothing
+// above the driver could reach them, because the block layer had exactly two backends and every SD arm
+// in it is `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]`, i.e. the Pi's EMMC2. On x86
+// `block::read_block` has always meant the USB stick and nothing else. This section is the seam that
+// lets FAT mount the internal card, and every decision in it is about NOT disturbing that stick.
+//
+// ### Why a third HANDLE and not a third value of `BACKEND`
+// Widening the selector was the obvious shape and it is the wrong one, for three independent reasons:
+//   1. **It would steal the boot volume.** On x86 the machine boots from a USB card reader, so the
+//      stick IS `BLOCK_DEVICE` and `block::info()` is what the flight recorder, `fs/fat.rs`'s
+//      `probe_once`, the shell, `fs/unafs.rs` and the installer all read. Flipping the selector to the
+//      internal card would silently re-point every one of them at a different disk — the failure the
+//      Pi paid for as PI-FS-2 (a 14 MiB reader's `num_blocks` clobbering the SD's global), in reverse.
+//   2. **The publish order makes it a race, not a choice.** `sdhc::probe` runs inside the x86 PCI
+//      probe; the xHCI stick enumerates later and `publish_usb_geometry` on this target claims the
+//      global UNCONDITIONALLY. A card registered into the global would simply be overwritten a second
+//      later, so the "selector" would decide nothing and would hide that it decided nothing.
+//   3. **Refusal beats precedence.** With a separate handle there is no precedence rule to get wrong:
+//      a caller that wants the internal card must NAME it. Nothing in the tree names it today except
+//      the read-only mount witness added by this arc, so every existing caller is untouched by
+//      construction rather than by a policy that has to keep being right.
+// The `Usb` handle is the proven precedent for exactly this (PIUSB-27 added it so the Pi could reach
+// the stick while the microSD owned the global), and this section mirrors it line for line.
+//
+// ### x86 `read_block` / `write_block` are not merely unchanged — they are untouched
+// There is no new statement anywhere in `read_block`, `write_block`, `read_blocks`, `write_blocks` or
+// `publish_usb_geometry`. Not one `#[cfg]`, not one branch. The whole SDHC path is additive entry
+// points plus one extra arm in the handle/source matches, and with the knob off the variant does not
+// exist and those matches are byte-identical to today's.
+//
+// ### SINGLE FAT WRITER (see `flight_recorder.rs`) — what this arc does and does not do about it
+// `fs/fat.rs`'s `with_fat_lock` / `with_dir_lock` are deliberately INERT on x86, so on this target the
+// tree's rule is "at most one FAT/directory MUTATOR". That rule was paid for in A/B-proven cross-linked
+// chains and stolen delete-witness snapshots, and it is why the flight recorder reserves `UNAOS.LOG`
+// once and thereafter only writes IN PLACE.
+//
+// This arc therefore adds a READER, not a writer:
+//   * the SDHC volume is mounted as a SEPARATE, by-value `FatFs` (`fs::fat::BlockSource::Sdhc`) with no
+//     state shared with the boot volume's mount — the `FatFs` is a plain value, and `ALLOC_HINT` (the
+//     only cross-volume global in `fs/fat.rs`) is documented advisory-only and is read by the
+//     ALLOCATOR, which a read-only mount never enters;
+//   * `fs::fat::write_sector` / `write_sectors` REFUSE a `Sdhc` source unconditionally, in every cfg,
+//     with a one-shot witness — the same blanket refusal PIUSB-27 shipped for `Usb`, which USB-WRITE
+//     later lifted in its own arc with its own witness ladder;
+//   * so no FAT entry, no directory sector and no data cluster of the internal card is ever written by
+//     this build, and the count of x86 FAT mutators is unchanged at one.
+// What would have to be true before anything may write through the FAT layer to this volume: either
+// `with_fat_lock`/`with_dir_lock` become REAL on x86 (they cannot mask IRQs across the `hlt`-driven BOT
+// pump, so this needs a different mechanism, not a flag flip), or the SDHC writer adopts the recorder's
+// reserve-once-then-write-in-place shape, which is not a FAT mutation after bootstrap. Neither is in
+// this arc, and until one of them holds, the refusal below is the whole safety argument.
+//
+// The BLOCK-layer write pair below is a different question and is answered differently: it is
+// `sdw`-gated (so a default image contains no CMD24 command word at all — SDHC-4a's property is
+// preserved), it is reachable only through `PartitionRange::write_block(s)` with an explicitly
+// `Sdhc`-handled range, and `fs/fat.rs` never calls `PartitionRange::write_block` (verified: the FAT
+// writers go straight to `write_sector`/`write_sectors`). It exists so the primitive is type-checked
+// through the block seam and available to the next arc, not so that anything in this one uses it.
+
+/// SDHC-4b: geometry of the card in the machine's internal SD slot, published by [`register_sdhc`]
+/// once `sdhc::bring_up` has identified it AND its read witnesses have run. Deliberately a THIRD slot
+/// alongside [`BLOCK_DEVICE`] and [`USB_BLOCK_DEVICE`]: nothing here ever claims the global, so the
+/// boot volume every existing caller reads through `info()` is untouched. `None` until registration.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub static SDHC_BLOCK_DEVICE: Mutex<Option<BlockDeviceInfo>> = Mutex::new(None);
+
+/// SDHC-4b: snapshot of the internal SD card's geometry, if one registered.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn sdhc_info() -> Option<BlockDeviceInfo> {
+    *SDHC_BLOCK_DEVICE.lock()
+}
+
+/// SDHC-4b: publish the internal SD card's geometry under the [`SDHC_BLOCK_DEVICE`] handle.
+///
+/// Called once, from `sdhc::bring_up`, AFTER the read witnesses (`verify_read`, `verify_multiblock`,
+/// `adma2_smoke`, `verify_adma_ab`) have run — so a registered card is one whose read path has already
+/// been exercised and reported on this boot, not merely one that answered CMD2/CMD3. That ordering is
+/// the point: the registry is the thing FAT trusts, so it should only ever name a card the log has
+/// already said something true about.
+///
+/// Returns whether the card was registered. It refuses a zero-block card rather than publishing a
+/// device every subsequent bound check would reject one call later — an instrument that can say NO.
+///
+/// `slot_id` is 0, the same sentinel `register_sd` stamps on the Pi's microSD: 0 is never a live xHCI
+/// device slot, so [`unpublish_usb_geometry`] (which matches on slot id and returns early on 0) can
+/// never retract this entry on a USB disconnect. Belt and braces — that function only ever touches the
+/// `Global` and `Usb` slots anyway.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn register_sdhc(num_blocks: u64, block_addressed: bool) -> bool {
+    if num_blocks == 0 {
+        serial_println!(
+            ":: SDHCBLK: REFUSED to register the internal SD card — num_blocks=0 (nothing to address) ::"
+        );
+        return false;
+    }
+    let dev = BlockDeviceInfo {
+        slot_id: 0,
+        block_size: SECTOR_BYTES as u32,
+        num_blocks,
+        vendor: *b"SD-SLOT ",
+        product: if block_addressed { *b"INTERNAL SDHC/XC" } else { *b"INTERNAL SDSC   " },
+    };
+    *SDHC_BLOCK_DEVICE.lock() = Some(dev);
+    let mib = num_blocks.saturating_mul(SECTOR_BYTES as u64) / (1024 * 1024);
+    serial_println!(
+        ":: SDHCBLK: registered internal SD card as block handle Sdhc — blocks={} ({} MiB) addressing={} \
+         (global BLOCK_DEVICE untouched) ::",
+        num_blocks, mib, if block_addressed { "block" } else { "byte" }
+    );
+    true
+}
+
+/// SDHC-4b: read one block (`lba`) from the internal SD card DIRECTLY through the SDHCI driver,
+/// bypassing the backend selector — the read twin of [`read_block_usb`]. Geometry (block size, bound)
+/// comes from [`SDHC_BLOCK_DEVICE`], re-read on every call as every other entry point does, and
+/// `sdhc::read_block_512` re-guards the LBA against the card's own `num_blocks` one layer down.
+/// Takes no xHCI lock at all, so it cannot interact with the boot volume's transport.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn read_block_sdhc(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = sdhc_info().ok_or(BlockError::NotReady)?;
+    if lba >= dev.num_blocks {
+        return Err(BlockError::BadLba);
+    }
+    crate::drivers::sdhc::read_block_512(lba, buf)
+}
+
+/// SDHC-4b: the counted twin of [`read_block_sdhc`] — `buf.len() / block_size` consecutive blocks in
+/// one call. Bounded by the shared [`span_blocks`] rules so they cannot drift between handles.
+///
+/// The cap those rules apply is [`MAX_BLOCKS_PER_OP`], which is the xHCI staging buffer's capacity and
+/// has nothing to do with the SDHCI path's own limit (`sdhc::MB_MAX_BLOCKS`, which `read_blocks_512`
+/// chunks against internally). Using the published block-layer cap here is deliberate and conservative:
+/// it is the number `fs/fat.rs` already chunks every source against, it is never larger than what the
+/// SD path can serve, and one cap for all handles is one rule to get right instead of three.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn read_blocks_sdhc(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = sdhc_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let n = crate::drivers::sdhc::read_blocks_512(lba, count, buf)?;
+    // A short counted read is an error, never a silent prefix — the same rule the xHCI counted forms
+    // enforce, and the one failure mode a filesystem above has no way to notice.
+    if n < buf.len() {
+        return Err(BlockError::Io);
+    }
+    Ok(buf.len())
+}
+
+/// SDHC-4b: one-shot latch so the refusal below names itself once instead of per retry.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", not(feature = "sdw")))]
+static SDHC_WRITE_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// SDHC-4b: write one block (`lba`) to the internal SD card through the SDHCI driver's polled
+/// single-block CMD24 (`sdhc::write_block_512`, SDHC-4a — metal-proven on Boot AD: `verify=IDENTICAL
+/// restore=IDENTICAL -> PASS`). The driver keeps its own three refusals (WP switch read live, CSD
+/// PERM_WRITE_PROTECT, CSD TMP_WRITE_PROTECT), so this entry point inherits them rather than
+/// re-implementing them.
+///
+/// **Not reachable from the FAT layer in this arc.** `fs::fat::write_sector`/`write_sectors` refuse a
+/// `Sdhc` source unconditionally (see the SINGLE FAT WRITER note above); the only route here is
+/// [`PartitionRange::write_block`] with an explicitly `Sdhc`-handled range, which nothing in `fs/fat.rs`
+/// calls. It is compiled and type-checked so the seam exists and the `sdw` polarity is covered by the
+/// `x86-all` gate leg, not so that this build writes to the card.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw"))]
+pub fn write_block_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let dev = sdhc_info().ok_or(BlockError::NotReady)?;
+    if lba >= dev.num_blocks {
+        return Err(BlockError::BadLba);
+    }
+    crate::drivers::sdhc::write_block_512(lba, buf)
+}
+
+/// SDHC-4b: without `sdw` there is no CMD24 command word in this image at all (SDHC-4a's property),
+/// so the honest answer is a refusal that says why — not a silent `Ok`, and not a call that could not
+/// link. Fails CLOSED, in the same direction as USBFALL F1's `guard_default_write_backend`.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", not(feature = "sdw")))]
+pub fn write_block_sdhc(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
+    if !SDHC_WRITE_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: SDHCBLK: WRITE refused — this build carries no `sdw` feature, so it contains no CMD24 \
+             ladder for the internal SD card (first, once) ::"
+        );
+    }
+    Err(BlockError::NotReady)
+}
+
+/// SDHC-4b: the counted twin of [`write_block_sdhc`]. The SDHCI driver exposes only the single-block
+/// CMD24 primitive, so this LOOPS it, sector by sector — byte-for-byte the same card traffic a
+/// per-sector caller produces, in the same order (exactly the shape `read_blocks`/`write_blocks` use
+/// for the Pi's `emmc2`). CMD25 (WRITE_MULTIPLE_BLOCK) would lift this with no change above the seam.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn write_blocks_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let dev = sdhc_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let bs = dev.block_size as usize;
+    for i in 0..count {
+        write_block_sdhc(lba + i as u64, &buf[i * bs..(i + 1) * bs])?;
+    }
+    Ok(())
+}
+
 // ===================== PARTITION — MBR decode + bounded partition ranges =====================
 //
 // PARTITION (GR9): everything above this line addresses a WHOLE device. A real card carries a
@@ -986,6 +1198,10 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
     let bit: u8 = match handle {
         BlockHandle::Global => 1,
         BlockHandle::Usb => 2,
+        // SDHC-4b: its own latch bit, so the internal card's table is censused once on its own terms
+        // and can never be suppressed by (or suppress) the boot volume's census.
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockHandle::Sdhc => 4,
     };
     let prev = MBR_CENSUS_LATCH.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
     if prev & bit != 0 || sec.len() < SECTOR_BYTES {
@@ -994,6 +1210,8 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
     let name = match handle {
         BlockHandle::Global => "global",
         BlockHandle::Usb => "usb",
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockHandle::Sdhc => "sdhc",
     };
 
     // --- RAW, before decoding anything: the signature word and the four 16-byte entries verbatim.
@@ -1107,6 +1325,8 @@ impl PartitionRange {
         match self.handle {
             BlockHandle::Global => read_block(abs, buf),
             BlockHandle::Usb => read_block_usb(abs, buf),
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockHandle::Sdhc => read_block_sdhc(abs, buf),
         }
     }
 
@@ -1116,6 +1336,11 @@ impl PartitionRange {
         match self.handle {
             BlockHandle::Global => write_block(abs, buf),
             BlockHandle::Usb => write_block_usb(abs, buf),
+            // SDHC-4b: the ONLY route to the internal card's write primitive in this arc. `fs/fat.rs`
+            // does not call `PartitionRange::write_block` (its writers go straight to `write_sector`),
+            // so no FAT mutation can arrive here; a deliberate caller holding an `Sdhc` range can.
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockHandle::Sdhc => write_block_sdhc(abs, buf),
         }
     }
 
@@ -1126,6 +1351,8 @@ impl PartitionRange {
         match self.handle {
             BlockHandle::Global => read_blocks(abs, buf),
             BlockHandle::Usb => read_blocks_usb(abs, buf),
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockHandle::Sdhc => read_blocks_sdhc(abs, buf),
         }
     }
 
@@ -1135,6 +1362,8 @@ impl PartitionRange {
         match self.handle {
             BlockHandle::Global => write_blocks(abs, buf),
             BlockHandle::Usb => write_blocks_usb(abs, buf),
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockHandle::Sdhc => write_blocks_sdhc(abs, buf),
         }
     }
 
@@ -1146,6 +1375,8 @@ impl PartitionRange {
         let dev = match self.handle {
             BlockHandle::Global => info(),
             BlockHandle::Usb => usb_info(),
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockHandle::Sdhc => sdhc_info(),
         }
         .ok_or(BlockError::NotReady)?;
         let bs = dev.block_size as usize;

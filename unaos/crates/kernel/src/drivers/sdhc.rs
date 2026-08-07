@@ -989,9 +989,12 @@ static CARD: Mutex<Option<SdCard>> = Mutex::new(None);
 
 /// The identified card's 512-byte block count, or `None` until [`probe`] has identified one.
 ///
-/// Deliberately NOT published into `drivers::block::BLOCK_DEVICE`: the x86 block layer has no
-/// backend selector, so `publish_usb_geometry` claims that global unconditionally and a card
-/// registered there would silently fight the USB stick for it — the PI-FS-2 clobber in reverse.
+/// Still deliberately NOT published into `drivers::block::BLOCK_DEVICE`, and the reason is unchanged:
+/// the x86 block layer has no backend selector, so `publish_usb_geometry` claims that global
+/// unconditionally and a card registered there would silently fight the USB stick for it — the PI-FS-2
+/// clobber in reverse. SDHC-4b did NOT relax this. It publishes the card under a THIRD registry handle
+/// (`drivers::block::SDHC_BLOCK_DEVICE`, reached through `read_block_sdhc`) that no pre-existing caller
+/// reads, so `block::info()` still names the boot volume and every current FAT user is untouched.
 pub fn card_num_blocks() -> Option<u64> {
     CARD.lock().as_ref().map(|c| c.num_blocks)
 }
@@ -3387,6 +3390,18 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
     // both directions suspect. Disarmed (the default, and every existing build) it issues no CMD24:
     // it runs its gates, prints its verdict as `-> DRYRUN`, and the card is untouched.
     write_selftest(num_blocks);
+
+    // SDHC-4b (`sdhcblk` knob): publish the card to the block layer under its OWN registry handle, so
+    // `fs::fat` can mount it. LAST on purpose, after every witness above: registration is the statement
+    // "a filesystem may trust this device", and it should only ever be made about a card whose read
+    // path THIS boot has already exercised and reported on. The block layer's GLOBAL device (the USB
+    // stick this machine boots from) is not touched — see `drivers::block` §SDHC-4b for why this is a
+    // third handle and not a value of the backend selector.
+    #[cfg(feature = "sdhcblk")]
+    {
+        let block_addressed = CARD.lock().as_ref().map(|c| c.block_addressing).unwrap_or(false);
+        crate::drivers::block::register_sdhc(num_blocks, block_addressed);
+    }
     true
 }
 

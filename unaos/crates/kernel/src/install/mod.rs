@@ -192,6 +192,12 @@ impl InstallTarget for BlockTarget {
             let n = match self.handle {
                 block::BlockHandle::Global => block::read_block(lba + i as u64, chunk),
                 block::BlockHandle::Usb => block::read_block_usb(lba + i as u64, chunk),
+                // SDHC-4b: the installer cannot bind the internal SD card. Nothing constructs an
+                // `Sdhc` target (`InstallTarget::from_parts` is only ever called with `Global`/`Usb`,
+                // and the graphical chooser lists only those two handles), so this arm exists to keep
+                // the match exhaustive and to make the refusal explicit rather than accidental.
+                #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+                block::BlockHandle::Sdhc => Err(block::BlockError::NotReady),
             }
             .map_err(map_blk)?;
             if n < chunk.len() {
@@ -207,6 +213,10 @@ impl InstallTarget for BlockTarget {
             match self.handle {
                 block::BlockHandle::Global => block::write_block(lba + i as u64, chunk),
                 block::BlockHandle::Usb => block::write_block_usb(lba + i as u64, chunk),
+                // SDHC-4b: see `read_sectors` — the installer never binds the internal SD card, and a
+                // medium-destroying write is the last place to let an unreachable arm fall through.
+                #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+                block::BlockHandle::Sdhc => Err(block::BlockError::NotReady),
             }
             .map_err(map_blk)?;
         }

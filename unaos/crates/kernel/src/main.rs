@@ -1050,6 +1050,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             // Once storage is up, mount + log the FAT volume geometry (one-shot).
             unaos_kernel::fs::fat::probe_once();
+            // SDHC-4b (x86, sdhcblk knob): once `sdhc::bring_up` has registered the INTERNAL SD card
+            // under its own block handle, mount it READ-ONLY and emit the witness (one-shot). Runs
+            // here rather than in the bring-up so the card lock is released — the same reason
+            // `probe_once` and `piusb27_service` run from the loop. Reads only: it is not a FAT writer.
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            unaos_kernel::fs::fat::sdhc_probe_once();
             // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under
             // /fs/usb and emit the witness (aarch64 Pi path; runs with the xHCI lock released).
             #[cfg(target_arch = "aarch64")]
@@ -1443,6 +1449,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
         // lock released; read_block re-locks it briefly, so there is no nested-lock hazard.
         unaos_kernel::fs::fat::probe_once();
+        // SDHC-4b (x86, sdhcblk knob): mount the INTERNAL SD card READ-ONLY once it has registered
+        // under its own block handle, and emit the witness (one-shot). See the note at the other loop
+        // site: it reads only and never becomes a second x86 FAT mutator.
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        unaos_kernel::fs::fat::sdhc_probe_once();
         // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under /fs/usb
         // and emit the witness (aarch64 Pi path; runs here with the xHCI lock released, like probe_once).
         #[cfg(target_arch = "aarch64")]
@@ -4017,6 +4028,9 @@ fn x86_usb_pump(cpu: usize) {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI lock
         // released; `read_block` re-locks it briefly.
         unaos_kernel::fs::fat::probe_once();
+        // SDHC-4b (x86, sdhcblk knob): mount the INTERNAL SD card READ-ONLY once registered (one-shot).
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        unaos_kernel::fs::fat::sdhc_probe_once();
         // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial on growth.
         #[cfg(feature = "witness")]
         unaos_kernel::bootlog::service_serial_dump();

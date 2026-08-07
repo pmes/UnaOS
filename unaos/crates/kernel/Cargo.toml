@@ -489,6 +489,41 @@ install_target = ["sdmmc_arm"]
 # x86_64 only; aarch64 media are byte-identical. See docs/dev/OS/07_USB_STORAGE/sdhc.md §SDHC-4a.
 sdw = []
 
+# SDHC-4b (GR20, x86): `UNAOS_SDHCBLK=1` makes the INTERNAL SD card a real block backend, so `fs::fat`
+# can mount it. Boot AC identified the card and Boot AD wrote to it, but nothing above `drivers/sdhc.rs`
+# could reach those primitives: `drivers/block.rs` has two backends and every SD arm in it is
+# `cfg(all(target_arch = "aarch64", feature = "baremetal"))` — the Pi's EMMC2 — so on x86 `read_block`
+# has always meant the USB stick and nothing else.
+#
+# The card is published as a THIRD registry handle (`BlockHandle::Sdhc` / `SDHC_BLOCK_DEVICE`), NOT as a
+# new value of the aarch64 `BACKEND` selector. That is the whole selection policy: the machine boots from
+# a USB card reader, so the stick IS `BLOCK_DEVICE`, and flipping a selector would re-point the flight
+# recorder, `fat::probe_once`, the shell, `fs/unafs.rs` and the installer at a different disk (the PI-FS-2
+# clobber, in reverse) — and would lose the race anyway, since `publish_usb_geometry` claims the global
+# unconditionally on x86 and runs after the PCI probe. With a separate handle there is no precedence rule
+# to get wrong: a caller must NAME the internal card, and nothing does except this arc's read-only mount
+# witness. `read_block`/`write_block` gain not one statement.
+#
+# READ-ONLY at the FAT layer, unconditionally, and that is not modesty — see `flight_recorder.rs`
+# §SINGLE FAT WRITER. `fs/fat.rs`'s `with_fat_lock`/`with_dir_lock` are INERT on x86, so a second
+# unsynchronised FAT/directory MUTATOR there is an A/B-proven corruption generator (cross-linked chains,
+# stolen delete-witness snapshots). A second mountable VOLUME must not quietly become one, so
+# `write_sector`/`write_sectors` refuse a `Sdhc` source with a one-shot witness and this build's count of
+# x86 FAT mutators stays at one. The block-layer write pair (`write_block_sdhc`) is additionally `sdw`-
+# gated, so a default image still contains no CMD24 command word, and it is reachable only through
+# `PartitionRange::write_block` — which `fs/fat.rs` never calls.
+#
+# Default OFF => the `BlockHandle::Sdhc`/`BlockSource::Sdhc` variants do not exist, no registry slot and
+# no entry point is compiled, and the registration call site in `sdhc::bring_up` is unlinked. MEASURED
+# rather than asserted (one worktree, one target dir, this tree vs 3d4ba446, no knobs on either): the
+# x86 kernel ELF's `.text` and `.rodata` are BYTE-IDENTICAL, 682479 and 91336 bytes. `.data.rel.ro`
+# differs in 32 bytes, every one of them a `core::panic::Location` LINE number shifted by 68 in the
+# 27-character path `crates/kernel/src/fs/fat.rs` — i.e. the doc comments and cfg'd code this arc
+# inserted ABOVE existing panic sites, and nothing else. Whichever way the knob points, aarch64 media
+# are byte-identical to each other (arroyo's `arm_features` strips it, like `sdw`/`pcicensus`).
+# x86_64 only. See docs/dev/OS/07_USB_STORAGE/sdhc.md §SDHC-4b.
+sdhcblk = []
+
 # PCI-CENSUS (GR20, x86): the `UNAOS_PCICENSUS=1` complete READ-ONLY PCI enumeration witness
 # (arch/x86_64/pci.rs::full_census). Every other PCI walk in this kernel is TARGETED — xHCI by class
 # triple, storage by class 0x01/0x08, display by class 0x03, and `find_device(0x02, 0x00)` which

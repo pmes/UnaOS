@@ -223,6 +223,28 @@ _feats=""
 # Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
 # disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
 [ -n "${UNAOS_SDW:-}" ] && _feats="${_feats}sdw,"
+# SDHC-4b (GR20): UNAOS_SDHCBLK=1 makes the INTERNAL SD card a real x86 BLOCK BACKEND, so `fs::fat` can
+# mount it. Boot AC identified the card and Boot AD wrote to it, but `drivers/block.rs` had two backends
+# and every SD arm in it is aarch64+baremetal (the Pi's EMMC2), so on x86 `read_block` has always meant
+# the USB stick. The card is published under a THIRD registry handle (`BlockHandle::Sdhc`), NOT as a new
+# backend-selector value: this machine BOOTS from a USB card reader, so the stick is `BLOCK_DEVICE`, and
+# a selector flip would re-point the flight recorder, `fat::probe_once`, the shell, unafs and the
+# installer at a different disk — and would lose the race anyway, since `publish_usb_geometry` claims the
+# global unconditionally on x86 and runs later. `read_block`/`write_block` gain not one statement.
+# READ-ONLY at the FAT layer, unconditionally: `flight_recorder.rs` §SINGLE FAT WRITER documents, with
+# A/B evidence, that a SECOND unsynchronised FAT/directory mutator on x86 (where `with_fat_lock` /
+# `with_dir_lock` are inert) cross-links chains and steals delete-witness snapshots, so a second
+# mountable volume must not become one — `write_sector`/`write_sectors` refuse a `Sdhc` source with a
+# one-shot witness. The witness is `:: SDHCBLK: FAT mounted READ-ONLY … ::` (or an honest `no FAT volume
+# … (NotFat)`), preceded by a `:: PART: mbr-raw handle=sdhc … ::` census of the card's own LBA 0.
+# Default OFF => the handle/source enum variants do not exist and no entry point is compiled; measured
+# knob-off against 3d4ba446 in one worktree, the x86 kernel's `.text` and `.rodata` are BYTE-IDENTICAL
+# and only 32 bytes of `.data.rel.ro` move — `core::panic::Location` line numbers in `fs/fat.rs`, shifted
+# by the 68 lines of comment and cfg'd code this arc inserted above them.
+# x86_64 only; aarch64 media byte-identical whichever way it points (stripped by arm_features below).
+# Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
+# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_SDHCBLK:-}" ] && _feats="${_feats}sdhcblk,"
 # PCI-CENSUS (GR20): UNAOS_PCICENSUS=1 arms the complete READ-ONLY PCI enumeration witness
 # (arch/x86_64/pci.rs::full_census) — one `[PCI-CENSUS]` line per function present on the machine,
 # plus a capability dump for every network-class function. Every other PCI walk in this kernel is
@@ -488,6 +510,14 @@ arm_features() {
     # points, which is the property that lets the x86 track arm a card-write knob without touching the
     # Pi or Jetson media at all.
     f="${f//,sdw,/,}"
+    # SDHC-4b rides the same strip: the registration call site is inside `drivers/sdhc.rs` (reached only
+    # from `arch/x86_64/pci.rs`) and every block/FAT arm the knob adds is gated
+    # `all(target_arch = "x86_64", feature = "sdhcblk")`, so `sdhcblk` emits not one byte of aarch64
+    # CODE — but an enabled feature is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in
+    # would shift every aarch64 media hash between a default build and a `UNAOS_SDHCBLK=1` one for zero
+    # observable change. Stripped => the x86 track can arm an internal-card block backend without
+    # touching the Pi or Jetson media at all.
+    f="${f//,sdhcblk,/,}"
     # PCI-CENSUS (GR20) rides the same strip, for the same reason: `full_census` lives in
     # `arch/x86_64/pci.rs`, so `pcicensus` emits not one byte of aarch64 CODE — but an enabled
     # feature is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in would shift every
@@ -1140,9 +1170,10 @@ check_user_arch() {
 }
 
 # GATE-CFG: the DEFAULT feature set is a tiny fraction of this kernel. `[features]` in
-# crates/kernel/Cargo.toml carries 83 knobs plus `default = []`, so the two legs below compile only
+# crates/kernel/Cargo.toml carries 84 knobs plus `default = []`, so the two legs below compile only
 # (this count was stale at 78 when GR20's `bcmarecon` was added — the real count was already 82,
-# four other-lane knobs having landed without it being bumped; counted, not incremented, with
+# four other-lane knobs having landed without it being bumped; 84 after GR20's `sdhcblk`;
+# counted, not incremented, with
 # `awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+ *=/{print $1}' Cargo.toml`)
 # what survives with every knob off — and `$KERNEL_FEATURES` (the UNAOS_* → cargo-feature mapping at
 # the top of this script) adds knobs only when the OPERATOR sets them, which nobody does before a
@@ -1170,9 +1201,15 @@ check_user_arch() {
 #     arm legs would buy zero coverage and cost a compile, so they are excluded ON EVIDENCE.
 #
 # COVERAGE ARGUMENT (why 3 legs + the 2 default legs are enough). The union of the three feature lists
-# below is EXACTLY the `[features]` table minus `default` — 78 of 78, no more and no less, so a knob
-# added to Cargo.toml without a leg here is a one-line diff to spot. And the DEFAULT legs already
-# compile the all-off state for both arches — so for every feature BOTH polarities of its `#[cfg]` are
+# below is MEANT to be exactly the `[features]` table minus `default`, so a knob added to Cargo.toml
+# without a leg here is a one-line diff to spot. MEASURED on the SDHC-4b tree (2026-08-07), and the
+# claim was stale: the table holds 84 knobs and the three legs' union holds 83 — the one uncovered
+# knob is `nvidia-kepler-kdisp-hold`, the same long-standing gap the GATE-CFG-MIX note below already
+# names and the derived `x86-strict` sweep already closes. Counted, never incremented: compare the
+# `[features]` table (minus `default`) against the union of the three leg feature lists below.
+# `sdhcblk` (SDHC-4b) is on `x86-all`, so this arc does not widen the gap.
+#
+# And the DEFAULT legs already compile the all-off state for both arches — so for every feature BOTH polarities of its `#[cfg]` are
 # type-checked, which is what makes the 61
 # `not(feature = "pi")` / 21 `not(feature = "tegra")` / 14 `not(feature = "baremetal")` sites in the
 # tree real coverage rather than an accident. The three default-ON features (`ehcihid`, `kbdwit`,
@@ -1211,7 +1248,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,wxnro"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,wxnro,sdhcblk"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
