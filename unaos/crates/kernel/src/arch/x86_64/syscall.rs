@@ -3993,11 +3993,17 @@ fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
 /// ### Three consequences, flagged rather than hidden
 ///  * The KeyUp is swallowed on the same predicate, and that is the ONE path here that consumes an
 ///    event without printing (nothing moved, so there is nothing to report). Delivering a lone
-///    release for a press the app never saw is a fabricated edge. Note the arm is UNREACHABLE from
-///    the rMBP's internal keyboard: `ehci::decode_boot_keyboard` emits `Event::Key` only and never
-///    `Event::KeyUp` (a boot keyboard under `SET_IDLE(0)` reports one press and then nothing until
-///    release, and the release report carries no keycodes to decode). Live on the xHCI path, which
-///    does emit both.
+///    release for a press the app never saw is a fabricated edge. EHCI-KEYUP: this arm is now LIVE on
+///    the rMBP's INTERNAL keyboard too. It used to be unreachable there —
+///    `ehci::decode_boot_keyboard` emitted `Event::Key` only — and that gap is what Boot AJ's frozen
+///    vug was (a ring-3 held bit that nothing ever cleared). That decoder now diffs consecutive boot
+///    reports and pushes `Event::KeyUp`, so every TAB typed on the built-in keyboard produces a
+///    release edge that arrives HERE, on a later poll than its press. It is CONSUMED, not delivered:
+///    the drain maps a consumed event to `Event::Unknown`, whose match arm does nothing, so a stray
+///    TAB release cannot reach `handle_key` and put byte 9 into the console line editor. And on the
+///    one path that returns `false` for a release — `cur == 0 && n == 0`, the shell with no windows —
+///    the release still cannot leak: `Event::KeyUp` has no arm in either drain's match either.
+///    Unchanged on the xHCI path, which always emitted both.
 ///  * A focus grant onto a slot torn down between the ring read and the publish is possible and is
 ///    self-healing on the next press, not prevented. See the note at `user_input_set_active` below.
 ///  * x86's [`user_input_set_active`] does NOT drain `pal::EVENT_QUEUE` — the aarch64 twin does, and
