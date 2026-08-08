@@ -194,6 +194,20 @@ fn main() {
     // same direction. Default OFF => module + call site unlinked, media byte-identical. Kept in sync
     // with arroyo's mapping.
     if std::env::var("UNAOS_BCMAS1").is_ok() { feats.push("bcmaS1"); }
+    // BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". Lifts the
+    // EHCI hub-walk depth cap 2 -> 3 to reach the HCI controller behind the FULL-SPEED Broadcom hub
+    // `0a5c:4500`, and — in the SAME change, because either alone is wrong — fixes the
+    // split-transaction TT computation so a device below a non-high-speed hub inherits the nearest
+    // HIGH-SPEED ancestor's TT (USB 2.0 §11.14) instead of its immediate parent's. Then recognizes
+    // interface class 0xE0/0x01/0x01 and issues HCI_Reset (0x0C03) + HCI_Read_Local_Version (0x1001)
+    // over the CONTROL endpoint, reading the replies off the INTERRUPT-IN event endpoint. No bulk,
+    // no async schedule (PROBE-14: this Panther Point's async engine master-aborts); every wait
+    // bounded. `bt` implies `ehcihid`, which this list already pushes by default, so pushing `bt`
+    // alone is the whole delta. THIS list is what reaches the kernel binary for MEDIA builds, so a
+    // knob wired into arroyo alone would ship Bluetooth DISABLED while the banner claims it is on
+    // (the s42/INSTGUI and WXN-M3b failure). Default OFF => cap, TT fix and the whole L0 sequence
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_BT").is_ok() { feats.push("bt"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature

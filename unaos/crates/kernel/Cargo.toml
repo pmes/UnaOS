@@ -279,6 +279,46 @@ ehcihid = ["ehciconfig"]
 # default-ON/negative-knob policy. x86_64-only (the `ehci` module is x86-gated), and `arroyo`'s
 # `arm_features` strips it from aarch64 compiles so aarch64 media stay byte-identical either way.
 kbdwit = []
+# BT-L0 (GR21): `UNAOS_BT=1` arms the first Bluetooth arc — "does the radio answer?", the direct
+# analogue of BCMA-S1, and nothing above it. On the 2012 rMBP the Bluetooth module is a TWO-DEVICE
+# unit on EHCI: a Broadcom hub `0a5c:4500` (addr 5, depth 2, FULL SPEED) with the HCI controller as
+# its single downstream child at depth 3. UnaOS has never enumerated that child, because the hub
+# walk is capped at `depth >= 2` — the radio has been present, powered and answering enumeration
+# for the life of the project while we declined to knock.
+#
+# The knob turns on THREE things that must land together:
+#   1. the hub-walk depth cap lifted 2 -> 3 (enough to bring up a hub AT depth 2);
+#   2. the TT-INHERITANCE FIX in `bring_up_hub` — a device below a hub that is NOT high speed
+#      inherits the nearest HIGH-SPEED ancestor's transaction translator (USB 2.0 §11.14), not its
+#      immediate parent's. The Broadcom hub trains at full speed and owns no TT; without this the
+#      split transactions would be aimed at `HubAddr=5`, which translates nothing, and the radio
+#      would read as DEAD rather than as mis-addressed. Lifting the cap without this fix produces a
+#      confident false negative, which is why they are one change and not two;
+#   3. the class-0xE0/0x01/0x01 (Wireless/RF/Bluetooth) recognition arm plus the L0 sequence:
+#      SET_CONFIGURATION, then `HCI_Reset` (0x0C03) and `HCI_Read_Local_Version_Information`
+#      (0x1001) over the CONTROL endpoint (bmRequestType 0x20, bRequest 0x00 — the Bluetooth USB
+#      transport, Core Vol 4 Part B), with the replies read off the INTERRUPT-IN event endpoint.
+#      The verdict is `Manufacturer_Name` — Broadcom is 0x000F, a value no code path of ours can
+#      fabricate.
+#
+# NO BULK, NO ASYNC SCHEDULE anywhere in this path, and that is a hard constraint rather than a
+# simplification: this Panther Point's async schedule master-aborts its first schedule fetch
+# (PROBE-14, 13 metal probes), and bulk conventionally rides async. The ACL bulk endpoints are
+# named in the witness and never touched. Every wait is bounded (`wait_bounded`'s TSC deadline)
+# and the event drain carries a second, structural cap, so a mute radio costs a bounded delay and
+# never a hung boot.
+#
+# Implies `ehcihid` — the entire implementation lives inside `drivers/ehci/mod.rs`, which is gated
+# on it; arming `bt` without it would ship a knob whose code does not exist. Default OFF => the
+# cap, the TT fix, the recognition arm, the L0 sequence, the `BtEvtEp` type and the `bt_parent`
+# field all vanish and a no-BT boot is byte-identical to trunk. The TT fix is a REAL BUG FIX that
+# wants to be UNGATED in a follow-up once metal has proven it (it can only ever change behaviour
+# below a non-high-speed hub — exactly the tier the depth cap has been hiding). x86_64-only (via
+# the `ehcihid` module gate), and stripped from aarch64 compiles by arroyo's `arm_features` so
+# aarch64 media stay byte-identical either way. Kept in sync with `unaos/arroyo` AND
+# `unaos/builder/src/main.rs` — a knob wired only in arroyo ships disabled while the banner claims
+# it is on (the s42/INSTGUI and WXN-M3b lesson).
+bt = ["ehcihid"]
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
 # path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole
 # (zeolite), and the boot witnesses. Pulls in the x86-only smoltcp optional dependency and compiles

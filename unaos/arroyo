@@ -297,6 +297,25 @@ _feats=""
 # builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled while the
 # banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
 [ -n "${UNAOS_BCMAS1:-}" ] && _feats="${_feats}bcmaS1,"
+# BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". The rMBP's BT
+# module is a two-device unit on EHCI: a Broadcom hub 0a5c:4500 (addr 5, depth 2, FULL SPEED) with
+# the HCI controller as its downstream child at depth 3, which our hub walk has never reached (cap
+# `depth >= 2`). The knob lifts that cap to 3 AND fixes the split-transaction TT computation in the
+# SAME change — a device below a NON-high-speed hub inherits the nearest HIGH-SPEED ancestor's TT
+# (USB 2.0 §11.14), not its immediate parent's; the Broadcom hub is full speed and owns no TT, so
+# lifting the cap alone would aim the splits at a translator that does not exist and the radio would
+# read as dead. Then: recognize interface class 0xE0/0x01/0x01, SET_CONFIGURATION, and issue
+# HCI_Reset (0x0C03) + HCI_Read_Local_Version_Information (0x1001) over the CONTROL endpoint
+# (bmRequestType 0x20), reading the replies off the INTERRUPT-IN event endpoint. Verdict =
+# Manufacturer_Name; Broadcom is 0x000F. NO bulk and NO async schedule anywhere in the path (this
+# Panther Point's async engine master-aborts — PROBE-14); every wait bounded, the event drain capped
+# structurally as well, so a mute radio costs a bounded delay and never a hung boot. Implies
+# `ehcihid` (the code lives inside the x86-gated drivers/ehci/mod.rs). x86_64 only; stripped from
+# aarch64 builds by `arm_features` below. Default OFF => cap, TT fix, recognition arm and the whole
+# L0 sequence unlinked, media byte-identical. Kept in sync with builder/src/main.rs — a knob mapped
+# HERE and missing THERE ships the feature disabled while the banner claims it is on (the s42/INSTGUI
+# and WXN-M3b lesson).
+[ -n "${UNAOS_BT:-}" ] && _feats="${_feats}bt,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -569,6 +588,15 @@ arm_features() {
     # fingerprint, so leaving it in (or its implied `bcmarecon`, already stripped above) would shift
     # every aarch64 media hash for zero observable change.
     f="${f//,bcmaS1,/,}"
+    # BT-L0 (GR21) rides the same strip, for the same reason and by the same mechanism as `kbdwit`
+    # above: every line `bt` gates lives in `drivers/ehci/mod.rs`, which is declared
+    # `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so `bt` emits not one byte of
+    # aarch64 CODE — but an enabled feature is hashed into cargo's `-Cmetadata` fingerprint, so
+    # leaving it in would shift every aarch64 media hash between a default build and a `UNAOS_BT=1`
+    # one for zero observable change. Note `bt` IMPLIES `ehcihid`, which is default-ON and is NOT
+    # stripped (it predates this policy and the Pi/Jetson media hashes are already computed with it
+    # present), so stripping `bt` alone is the whole delta.
+    f="${f//,bt,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -1208,12 +1236,14 @@ check_user_arch() {
 }
 
 # GATE-CFG: the DEFAULT feature set is a tiny fraction of this kernel. `[features]` in
-# crates/kernel/Cargo.toml carries 86 knobs plus `default = []`, so the two legs below compile only
+# crates/kernel/Cargo.toml carries 87 knobs plus `default = []`, so the two legs below compile only
 # (this count was stale at 78 when GR20's `bcmarecon` was added — the real count was already 82,
 # four other-lane knobs having landed without it being bumped; and it was stale AGAIN at 84 for
 # `sdhcblk` — the real count at that base was 85, `wxnro` having landed on `x86-all` without the
-# comment being bumped; RE-COUNTED here to 86 after GR20's `bcmaS1` (which implies `bcmarecon`, so it
-# is one new knob, not two);
+# comment being bumped; it was re-counted to 86 after GR20's `bcmaS1` (which implies `bcmarecon`, so
+# it is one new knob, not two); RE-COUNTED here to 87 after GR21's `bt` — which implies the
+# already-present default-ON `ehcihid`, so it too is one new knob, not two, and 86 was found ACCURATE
+# on GR21's base rather than stale;
 # counted, not incremented, with
 # `awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+ *=/{print $1}' Cargo.toml`)
 # what survives with every knob off — and `$KERNEL_FEATURES` (the UNAOS_* → cargo-feature mapping at
@@ -1247,9 +1277,10 @@ check_user_arch() {
 # claim was stale: the table holds 86 knobs and the three legs' union holds 85 — the one uncovered
 # knob is `nvidia-kepler-kdisp-hold`, the same long-standing gap the GATE-CFG-MIX note below already
 # names and the derived `x86-strict` sweep already closes. Counted, never incremented (re-counted on
-# the BCMA-S1 tree, 2026-08-07): compare the `[features]` table (minus `default`) against the union
-# of the three leg feature lists below. `sdhcblk` (SDHC-4b) and `bcmaS1` (BCMA-S1) are both on
-# `x86-all`, so neither arc widens the gap.
+# the BCMA-S1 tree, 2026-08-07; and AGAIN on the BT-L0 tree, GR21, where the table holds 87 and the
+# union 86, with `nvidia-kepler-kdisp-hold` still the sole gap): compare the `[features]` table
+# (minus `default`) against the union of the three leg feature lists below. `sdhcblk` (SDHC-4b),
+# `bcmaS1` (BCMA-S1) and `bt` (BT-L0) are all on `x86-all`, so no arc widens the gap.
 #
 # And the DEFAULT legs already compile the all-off state for both arches — so for every feature BOTH polarities of its `#[cfg]` are
 # type-checked, which is what makes the 61
@@ -1290,7 +1321,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the

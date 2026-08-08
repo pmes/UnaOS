@@ -513,10 +513,59 @@ pub struct Controller {
     /// MT-INVESTIGATION: reports hex-dumped so far in the raw capture window.
     #[cfg(feature = "mtraw")]
     mt_dumped: u32,
+    /// BT-L0 — the ACTUAL parent (hub address, downstream port) of the device currently being
+    /// enumerated, as opposed to the split-transaction TT it is reached through. They are the
+    /// same thing only below a high-speed hub, which is precisely the assumption the recon's
+    /// §3 note 1 caught the M1 witness making. Carried on the controller rather than added to
+    /// `enumerate_at_zero`'s signature so the knob-off build is untouched: the field, its one
+    /// writer in `bring_up_hub` and its one reader in the M1 witness all vanish with the knob.
+    /// `(0, 0)` at depth 0, where the root witness prints no parent at all.
+    #[cfg(feature = "bt")]
+    bt_parent: (u8, u8),
 }
 
 // Raw pointers to identity-mapped DMA memory; access is serialized by the EHCI_HID mutex.
 unsafe impl Send for Controller {}
+
+/// BT-L0 — `HCI_Reset`: OGF 0x03 (Controller & Baseband) / OCF 0x0003 => opcode 0x0C03. Zero
+/// parameters. A ROM-level command: it answers before any Broadcom patchram (`.hcd`) blob is
+/// loaded, which is what lets this arc test the recon's P7 for free.
+#[cfg(feature = "bt")]
+const BT_HCI_RESET: u16 = 0x0C03;
+/// BT-L0 — `HCI_Read_Local_Version_Information`: OGF 0x04 (Informational) / OCF 0x0001 =>
+/// opcode 0x1001. Zero parameters; 9 return parameters. Also ROM-level.
+#[cfg(feature = "bt")]
+const BT_HCI_READ_LOCAL_VERSION: u16 = 0x1001;
+/// BT-L0 — HCI event code for Command Complete (Bluetooth Core, Vol 4 Part E).
+#[cfg(feature = "bt")]
+const BT_EVT_CMD_COMPLETE: u8 = 0x0E;
+/// BT-L0 — the Bluetooth SIG company identifier for Broadcom. THE deliverable of this arc: a
+/// value that cannot be produced by our own code, by a timing artefact, or by a hopeful
+/// default — it can only have come off the radio.
+#[cfg(feature = "bt")]
+const BT_MFG_BROADCOM: u16 = 0x000F;
+/// BT-L0 — structural cap on events drained while awaiting one Command Complete. This is the
+/// SECOND bound on that loop (each individual read already carries `wait_bounded`'s deadline);
+/// it exists so a controller that streams unrelated events cannot spin the boot indefinitely
+/// inside a loop whose per-iteration bound would keep being satisfied.
+#[cfg(feature = "bt")]
+const BT_EVT_MAX: u32 = 8;
+
+/// BT-L0 — one interrupt-IN endpoint armed for SYNCHRONOUS use.
+///
+/// Deliberately NOT pushed into `Controller::int_eps`: that list is drained by `service()`,
+/// which would run HCI event packets through the HID report decoders. This endpoint is read
+/// inline by the L0 sequence and then deactivated. It does consume one of the four static
+/// int-EP slots for the life of the boot (the recon counted two free on this controller).
+#[cfg(feature = "bt")]
+struct BtEvtEp {
+    qh: *mut Qh,
+    qtd: *mut Qtd,
+    qtd_phys: u64,
+    buf: *mut u8,
+    buf_phys: u64,
+    mps: u16,
+}
 
 pub static EHCI_HID: Mutex<Option<Vec<Controller>>> = Mutex::new(None);
 
@@ -834,9 +883,16 @@ impl Controller {
         // post-HCRESET, VT-d off, BME on — probes 1-7), while the periodic engine DMAs the same
         // pool cleanly. EHCI QHs are engine-agnostic (4.10) — a control QH executes identically
         // from the frame list; only the service cadence differs (S-mask-paced instead of
-        // continuous). HS targets get S-mask 0xFF (every µframe → ~1 ms per control transfer);
-        // FS/LS-behind-TT keep the split masks (SSPLIT µframe 0, CSPLITs 2-4). The async ring
-        // stays programmed-but-disabled (ASE is never set).
+        // continuous). HS targets get S-mask 0x01 (one start per frame → ~1 ms per control
+        // transfer); FS/LS-behind-TT get the same S-mask 0x01 plus the split completion mask
+        // (SSPLIT µframe 0, CSPLITs 2-4). The async ring stays programmed-but-disabled (ASE is
+        // never set).
+        // (BT-L0 instrument note: this block used to open "HS targets get S-mask 0xFF (every
+        // µframe...)", which the `masks` expression four lines below has never done — it writes
+        // 0x01 for both speed classes, as the probe-14c sentence immediately after this one
+        // requires. The 0xFF sentence predated probe-14c and survived it; it is deleted rather
+        // than annotated, because a reader checking the S-mask argument against it would
+        // conclude the periodic-QH discipline had been violated.)
         // Periodic-QH discipline (probe-14c: RL must be 0 on periodic QHs — the RL=4 async
         // idiom made the QH invisible to the periodic scheduler; S-mask 0x01 is the exact
         // shape every passing smoke used).
@@ -1367,16 +1423,47 @@ impl Controller {
                 if class == 0x09 { "A (hub tier / RMH)" } else { "B (direct device)" }
             );
         } else {
+            // BT-L0 instrument fix (recon §3 note 1), knob-gated so the default line is
+            // byte-identical. The trailing `(hub {} port {})` prints `hub_addr`/`hub_port`,
+            // which are the split-transaction TT fields and are DELIBERATELY ZERO for a
+            // high-speed child — so `addr=4 0424:2512 ... (hub 0 port 0)` has always read as
+            // "on hub 0" when that device is on hub 1. Under `bt` the line names the actual
+            // PARENT (tracked in `bt_parent`, stamped by `bring_up_hub` immediately before the
+            // recursion) and labels the TT separately, which is also what makes the recon's P3
+            // (TT must be the SMSC hub 4, never the FS Broadcom hub 5) readable straight off
+            // this line for every device, not just the Bluetooth one.
+            #[cfg(not(feature = "bt"))]
             serial_println!(
                 ":: EHCI-HID: [{}] M1 hub-downstream device addr={} {:04x}:{:04x} class={:#04x} speed={} (hub {} port {}) == witness ::",
                 self.idx, addr, vid, pid, class, speed, hub_addr, hub_port
+            );
+            #[cfg(feature = "bt")]
+            serial_println!(
+                ":: EHCI-HID: [{}] M1 hub-downstream device addr={} {:04x}:{:04x} class={:#04x} speed={} depth={} (parent hub {} port {}) tt=(hub {} port {}) == witness ::",
+                self.idx, addr, vid, pid, class, speed, depth,
+                self.bt_parent.0, self.bt_parent.1, hub_addr, hub_port
             );
         }
 
         if class == 0x09 {
             // Metal (probe-14e): the internal keyboard/trackpad sit behind an SMSC 0424:2512
             // hub which itself hangs off the RMH — depth 2 is the real internal topology.
-            if depth >= 2 {
+            //
+            // BT-L0: the Bluetooth radio sits one tier BELOW that. It is a two-device unit —
+            // the Broadcom hub `0a5c:4500` (addr 5, depth 2, FULL SPEED) with the HCI
+            // controller as its downstream child at depth 3 — so reaching the radio means
+            // bringing up a hub AT depth 2, i.e. a cap of 3. The cap and the TT-inheritance
+            // fix in `bring_up_hub` below are ONE change: lifting the cap alone would program
+            // the splits against a hub that has no TT and the radio would read as dead. Both
+            // are knob-gated together for this arc so a no-BT boot is provably unchanged; the
+            // TT fix is a real bug fix that wants to be ungated in a follow-up once metal has
+            // proven it (it can only ever matter below a non-high-speed hub, which is exactly
+            // the tier the cap has been hiding).
+            #[cfg(not(feature = "bt"))]
+            const HUB_DEPTH_CAP: u8 = 2;
+            #[cfg(feature = "bt")]
+            const HUB_DEPTH_CAP: u8 = 3;
+            if depth >= HUB_DEPTH_CAP {
                 serial_println!(
                     ":: EHCI-HID: [{}] hub at depth {} (addr {}) — beyond the internal tier; skipped ::",
                     self.idx, depth, addr
@@ -1564,7 +1651,42 @@ impl Controller {
             };
             // A FS/LS child is reached via THIS hub's TT: hub_addr = the hub, port = this
             // port. A HS child needs no TT (fields stay zero).
+            #[cfg(not(feature = "bt"))]
             let (ha, hp) = if child_eps == QH_EPS_HIGH { (0, 0) } else { (hub.addr, port as u8) };
+            // BT-L0 — the TT-inheritance fix (recon §3). The rule above is only true when THIS
+            // hub is itself high speed. USB 2.0 §11.14 puts the transaction translator in the
+            // hub whose UPSTREAM connection is high speed and whose downstream ports are
+            // full/low speed. A hub that trains at full speed has no TT at all: it is just
+            // another full-speed device on the bus segment its nearest high-speed ancestor's TT
+            // already serves, and every device below it is served by that same TT.
+            //
+            // On this machine that is not hypothetical. The Broadcom Bluetooth hub `0a5c:4500`
+            // (addr 5) trains at FULL SPEED behind the SMSC `0424:2512` (addr 4, HS) on port 1.
+            // Programming `HubAddr=5` for its children names a hub that owns no TT, the
+            // controller drives SSPLIT/CSPLIT at the wrong address, and the Bluetooth radio
+            // reads as dead rather than as mis-addressed — which is why this fix must land in
+            // the same change as the depth-cap lift above.
+            //
+            // `Target` already carries the TT it was itself reached through (`hub_addr`/
+            // `hub_port`), so a non-HS hub simply passes its own TT down unchanged; the
+            // recursion therefore carries the nearest high-speed ancestor's TT to any depth.
+            // For the Bluetooth controller this yields `(4, 1)` — the SMSC hub and the port
+            // that leads to the full-speed segment — never `(5, …)`.
+            #[cfg(feature = "bt")]
+            let (ha, hp) = if child_eps == QH_EPS_HIGH {
+                (0, 0)
+            } else if hub.eps == QH_EPS_HIGH {
+                (hub.addr, port as u8) // this hub is high speed — it owns the TT
+            } else {
+                (hub.hub_addr, hub.hub_port) // FS/LS hub — no TT here; carry the ancestor's down
+            };
+            // BT-L0 instrument fix (recon §3 note 1): stamp the ACTUAL parent for the M1 witness,
+            // which until now printed the TT fields under a topology label. Set immediately
+            // before the recursion so it is never stale.
+            #[cfg(feature = "bt")]
+            {
+                self.bt_parent = (hub.addr, port as u8);
+            }
             // T_RSTRCY (USB 2.0 §7.1.7.5): the 10 ms of reset recovery owed before the device is
             // addressed. Correctly placed — the only traffic between the reset completing and
             // here is hub-addressed ClearPortFeature. EPACE-TRIM M5 shortened the pre-poll sleep
@@ -1630,6 +1752,18 @@ impl Controller {
                 _ => {}
             }
             off += len;
+        }
+        // BT-L0 — the class-0xE0 recognition arm. Placed HERE, ahead of the "nothing to arm"
+        // exit, because a Bluetooth device has no HID interface at all and would otherwise be
+        // enumerated, logged and dropped exactly as the recon §2b describes. The Bluetooth USB
+        // transport (Bluetooth Core, Vol 4 Part B) puts the HCI transport on interface 0,
+        // class 0xE0 / subclass 0x01 / protocol 0x01; `bt_probe` re-walks the config descriptor
+        // this function already read, so the HID walk above is untouched. It owns
+        // SET_CONFIGURATION for the device it claims and returns true when it did, at which
+        // point there is nothing further for the HID path to do.
+        #[cfg(feature = "bt")]
+        if self.bt_probe(t, cfg, config_value) {
+            return;
         }
         if nfound == 0 {
             serial_println!(
@@ -1930,6 +2064,433 @@ impl Controller {
             );
         }
     }
+
+    // ================================ BT-L0 ==================================================
+    // "Does the radio answer?" — the Bluetooth analogue of BCMA S1, and nothing more. It reaches
+    // the HCI controller behind the Broadcom hub, issues TWO ROM-level HCI commands over the
+    // control endpoint, and reads the replies off the interrupt-IN event endpoint.
+    //
+    // TRANSPORT SCOPE, and why it is deliberately this narrow (recon §4): the Bluetooth USB
+    // transport puts HCI commands on the CONTROL endpoint, HCI events on an INTERRUPT-IN
+    // endpoint, and ACL data on a BULK pair. This arc uses the first two ONLY. It must: this
+    // Panther Point's ASYNC schedule master-aborts its first schedule fetch in every
+    // configuration tried across 13 metal probes (PROBE-14, `control_txn` above), and bulk
+    // conventionally lives on the async schedule. Both transfers used here are already
+    // metal-proven on this exact controller — `control()` does control transfers with TT splits,
+    // and the periodic interrupt-IN path is what carries the internal keyboard. No new transfer
+    // primitive, no bulk endpoint, no async-schedule use. The bulk endpoints are NAMED in the
+    // witness (they exist and a later ACL arc needs them) and never touched.
+    //
+    // BOUNDING: this runs on metal during boot, so a radio that never answers must cost a
+    // bounded delay and not a hang. Every wait here is `wait_bounded` (the driver's standard
+    // TSC-backed `hw_wait_budget()`), and the event-drain loop is additionally bounded by a
+    // structural cap on the number of events read per command. Worst case with a dead radio is
+    // therefore `BT_EVT_MAX` budgets per command, and the path still returns.
+
+    /// BT-L0 — the class-0xE0 recognition arm and the whole L0 sequence.
+    ///
+    /// Returns true iff this device was claimed as a Bluetooth HCI controller (in which case
+    /// SET_CONFIGURATION has been issued by this function and the HID path must not run).
+    ///
+    /// `cfg` aliases `self.data_buf`, which EVERY control transfer overwrites. So the descriptor
+    /// walk is done FIRST, in full, into plain locals, and `cfg` is never read again after the
+    /// first transfer this function issues. That ordering is load-bearing, not stylistic.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_probe(&mut self, t: &Target, cfg: &[u8], config_value: u8) -> bool {
+        // ---- phase 1: pure descriptor walk (no wire traffic) --------------------------------
+        // Bluetooth Core, Vol 4 Part B: the HCI transport is interface 0, class 0xE0 (Wireless)
+        // / subclass 0x01 (RF) / protocol 0x01 (Bluetooth). Interface 1 is SCO audio on
+        // isochronous endpoints with alternate settings; alt 0 is zero-bandwidth and this arc
+        // leaves it there, permanently, by never touching it.
+        let (mut bt_intf, mut evt_ep, mut evt_mps, mut evt_interval) = (None, 0u8, 0u16, 0u8);
+        let (mut bulk_in, mut bulk_out) = (0u8, 0u8);
+        let mut in_bt = false;
+        let mut off = 0usize;
+        while off + 2 <= cfg.len() {
+            let len = cfg[off] as usize;
+            if len == 0 {
+                break;
+            }
+            match cfg[off + 1] {
+                // Interface descriptor. Claim only interface 0 alt 0 of the Bluetooth triple;
+                // any later interface (SCO) clears `in_bt` so its endpoints are never collected.
+                0x04 if off + 9 <= cfg.len() => {
+                    in_bt = cfg[off + 5] == 0xE0
+                        && cfg[off + 6] == 0x01
+                        && cfg[off + 7] == 0x01
+                        && cfg[off + 3] == 0x00 // bAlternateSetting
+                        && bt_intf.is_none();
+                    if in_bt {
+                        bt_intf = Some(cfg[off + 2]);
+                    }
+                }
+                0x05 if in_bt && off + 7 <= cfg.len() => {
+                    let ep = cfg[off + 2];
+                    let mps = ((cfg[off + 4] as u16) | ((cfg[off + 5] as u16) << 8)) & 0x7FF;
+                    match (cfg[off + 3] & 0x3, ep & 0x80 != 0) {
+                        // interrupt IN — the HCI event endpoint, the one this arc reads.
+                        (3, true) if evt_ep == 0 => {
+                            evt_ep = ep & 0xF;
+                            evt_mps = mps;
+                            evt_interval = cfg[off + 6];
+                        }
+                        // bulk — the ACL data pair. Recorded so the witness can state that they
+                        // exist (a later arc needs them); NOT armed, NOT configured, and not
+                        // reachable at all without the async schedule this silicon cannot run.
+                        (2, true) => bulk_in = ep & 0xF,
+                        (2, false) => bulk_out = ep & 0xF,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            off += len;
+        }
+        let Some(intf) = bt_intf else { return false };
+        // A Bluetooth interface with no interrupt-IN endpoint cannot deliver an HCI event, so
+        // there is no L0 to run. Claim it anyway (it is not a HID device) and say why.
+        if evt_ep == 0 {
+            serial_println!(
+                ":: bt-l0: [{}] addr {} intf {} class=0xE0/0x01/0x01 but NO interrupt-IN event endpoint — cannot read HCI events; claimed and stopped ::",
+                self.idx, t.addr, intf
+            );
+            return true;
+        }
+
+        // ---- phase 2: reachability witness (still no wire traffic) --------------------------
+        // The recon's P3 lives on this line. `tt=(hub 4 port 1)` is the SMSC hub — the nearest
+        // HIGH-SPEED ancestor, which is the only hub on this path that owns a transaction
+        // translator. `tt=(hub 5 …)` would mean the split-transaction bug is back: the Broadcom
+        // hub trains at FULL SPEED and has no TT, so splits aimed at it cannot complete and the
+        // radio would read as dead rather than as mis-addressed.
+        let spd = match t.eps {
+            QH_EPS_HIGH => "HS",
+            QH_EPS_LOW => "LS",
+            _ => "FS",
+        };
+        serial_println!(
+            ":: bt-l0: [{}] reachability addr={} spd={} intf={} class=0xE0/0x01/0x01 evt_ep=IN{} mps={} interval={} bulk_in=IN{} bulk_out=OUT{} parent=(hub {} port {}) tt=(hub {} port {}) -> {} == witness ::",
+            self.idx, t.addr, spd, intf, evt_ep, evt_mps, evt_interval, bulk_in, bulk_out,
+            self.bt_parent.0, self.bt_parent.1, t.hub_addr, t.hub_port,
+            if t.eps == QH_EPS_HIGH {
+                "TT-NONE(high-speed device)"
+            } else if t.hub_addr == self.bt_parent.0 {
+                "TT-IS-PARENT(parent hub is high speed)"
+            } else {
+                "TT-INHERITED(parent hub is not high speed; TT is the nearest HS ancestor)"
+            }
+        );
+
+        // ---- phase 3: configure, arm the event endpoint, talk ------------------------------
+        // From here on `cfg` is DEAD — this transfer overwrites the buffer it aliases.
+        if self.control(t, 0x00, 9, config_value as u16, 0, 0, false).is_err() {
+            serial_println!(
+                ":: bt-l0: [{}] addr {} SET_CONFIGURATION({}) failed — no HCI possible ::",
+                self.idx, t.addr, config_value
+            );
+            return true;
+        }
+        let Some(e) = self.bt_arm_events(t, evt_ep, evt_mps) else { return true };
+        let mut toggle = false; // DTC=1 on the QH: software owns the toggle; first IN is DATA0.
+
+        // HCI_Reset — OGF 0x03 / OCF 0x0003 => opcode 0x0C03, zero parameters. ROM-level: it
+        // answers before any patchram blob is loaded, which is what makes P7 free to test.
+        let mut rp = [0u8; 16];
+        match self.bt_hci_command(t, intf, &e, &mut toggle, BT_HCI_RESET, &mut rp) {
+            Some(n) if n >= 1 => serial_println!(
+                ":: bt-l0: [{}] HCI_Reset (0x0C03) -> CmdComplete status={:#04x} -> {} == witness ::",
+                self.idx, rp[0],
+                if rp[0] == 0 { "OK" } else { "NONZERO-STATUS" }
+            ),
+            Some(_) => serial_println!(
+                ":: bt-l0: [{}] HCI_Reset (0x0C03) -> CmdComplete with NO status byte -> MALFORMED ::",
+                self.idx
+            ),
+            None => serial_println!(
+                ":: bt-l0: [{}] HCI_Reset (0x0C03) -> NO-RESPONSE (bounded wait expired) ::",
+                self.idx
+            ),
+        }
+
+        // HCI_Read_Local_Version_Information — OGF 0x04 / OCF 0x0001 => opcode 0x1001, zero
+        // parameters. Return parameters, in order: status(1) HCI_Version(1) HCI_Revision(2)
+        // LMP_Version(1) Manufacturer_Name(2) LMP_Subversion(2) = 9 bytes.
+        //
+        // `Manufacturer_Name` is the deliverable. It is a Bluetooth SIG company identifier;
+        // Broadcom is 0x000F. That field cannot be produced by our own code, by a timing
+        // artefact, or by a hopeful default — it can only come off the radio.
+        let mut rp2 = [0u8; 16];
+        match self.bt_hci_command(t, intf, &e, &mut toggle, BT_HCI_READ_LOCAL_VERSION, &mut rp2) {
+            Some(n) if n >= 9 => {
+                let manufacturer = (rp2[5] as u16) | ((rp2[6] as u16) << 8);
+                let hci_rev = (rp2[2] as u16) | ((rp2[3] as u16) << 8);
+                let lmp_subver = (rp2[7] as u16) | ((rp2[8] as u16) << 8);
+                if manufacturer == BT_MFG_BROADCOM {
+                    serial_println!(
+                        ":: bt-l0: HCI local version — hci_ver={:#04x} hci_rev={:#06x} lmp_ver={:#04x} manufacturer={:#06x} lmp_subver={:#06x} -> BROADCOM ::",
+                        rp2[1], hci_rev, rp2[4], manufacturer, lmp_subver
+                    );
+                } else {
+                    serial_println!(
+                        ":: bt-l0: HCI local version — hci_ver={:#04x} hci_rev={:#06x} lmp_ver={:#04x} manufacturer={:#06x} lmp_subver={:#06x} -> UNEXPECTED-MFG({:#06x}) ::",
+                        rp2[1], hci_rev, rp2[4], manufacturer, lmp_subver, manufacturer
+                    );
+                }
+                // P6 is a MEASUREMENT, not a prediction (recon §5) — HCI_Version resolves which
+                // Broadcom part this is, and the recon explicitly declines to guess it. Printed
+                // separately from the verdict line so a reader cannot mistake the mapping for
+                // evidence: the mapping is spec (Bluetooth Core, Assigned Numbers), the number
+                // is wire.
+                serial_println!(
+                    ":: bt-l0: [{}] HCI_Version {:#04x} => core spec {} (status={:#04x}) == witness ::",
+                    self.idx, rp2[1],
+                    match rp2[1] {
+                        0x03 => "1.2",
+                        0x04 => "2.0+EDR",
+                        0x05 => "2.1+EDR",
+                        0x06 => "3.0+HS",
+                        0x07 => "4.0",
+                        0x08 => "4.1",
+                        0x09 => "4.2",
+                        0x0A => "5.0",
+                        _ => "unmapped",
+                    },
+                    rp2[0]
+                );
+            }
+            Some(n) => serial_println!(
+                ":: bt-l0: HCI local version — SHORT-REPLY ({} return byte(s), 9 required) -> MALFORMED ::",
+                n
+            ),
+            None => serial_println!(
+                ":: bt-l0: HCI local version — NO-RESPONSE (bounded wait expired) ::"
+            ),
+        }
+
+        // Quiesce: the event endpoint stays LINKED in the frame list (its slot is owned for the
+        // boot and any later `arm_interrupt_ep` chains correctly behind it — the same state a
+        // retired `dead` endpoint leaves), but its transfer is deactivated so the controller
+        // stops issuing INs against a device nothing is reading.
+        self.bt_quiesce_events(&e);
+        true
+    }
+
+    /// BT-L0 — build + link the periodic QH for the HCI event endpoint. Same QH shape and same
+    /// frame-list splice as `arm_interrupt_ep` (including the split masks for a FS endpoint
+    /// behind a TT), minus the `int_eps` registration: nothing here is ever handed to
+    /// `service()`. Returns None (with a trace) if the static slot pool is exhausted.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_arm_events(&mut self, t: &Target, ep: u8, mps: u16) -> Option<BtEvtEp> {
+        if self.int_next >= MAX_INT_EPS {
+            serial_println!(
+                ":: bt-l0: [{}] static int-EP pool exhausted ({}) — HCI event endpoint not armed ::",
+                self.idx, MAX_INT_EPS
+            );
+            return None;
+        }
+        let mps = mps.min(INT_BUF_LEN as u16);
+        if mps == 0 {
+            serial_println!(":: bt-l0: [{}] HCI event endpoint reports mps=0 — not armed ::", self.idx);
+            return None;
+        }
+        let slot = &mut (*self.pool()).int_slots[self.int_next];
+        let (qh, qtd, buf) = (
+            &mut slot.qh as *mut Qh,
+            &mut slot.qtd as *mut Qtd,
+            slot.buf.0.as_mut_ptr(),
+        );
+        let (Some(qh_phys), Some(qtd_phys), Some(buf_phys)) =
+            (phys_of(qh, 32), phys_of(qtd, 32), phys_of(buf, INT_BUF_ALIGN))
+        else {
+            serial_println!(
+                ":: bt-l0: [{}] STOP-NOTE int-EP slot failed the phys/alignment contract — HCI event endpoint not armed ::",
+                self.idx
+            );
+            return None;
+        };
+        self.int_next += 1;
+
+        (*qh).ep_chars = (t.addr as u32)
+            | ((ep as u32) << 8)
+            | t.eps
+            | QH_DTC
+            | ((mps as u32) << QH_MPS_SHIFT);
+        // N1 (see `arm_interrupt_ep`): S-mask/C-mask are microframe masks evaluated within every
+        // frame the QH is reached in, so an every-frame frame list stays split-correct. The TT
+        // fields are `t.hub_addr`/`t.hub_port` — for the Bluetooth controller these are the
+        // INHERITED ones from `bring_up_hub` (the SMSC hub), which is the whole point of this arc.
+        let split = if t.eps == QH_EPS_HIGH {
+            0
+        } else {
+            (0x1C << QH_CMASK_SHIFT)
+                | ((t.hub_addr as u32) << QH_HUBADDR_SHIFT)
+                | ((t.hub_port as u32) << QH_PORT_SHIFT)
+        };
+        (*qh).ep_caps = QH_MULT1 | (0x01 << QH_SMASK_SHIFT) | split;
+
+        let fl = self.frame_list;
+        let old_head = core::ptr::read_volatile(fl);
+        (*qh).horiz = old_head;
+        for i in 0..1024 {
+            core::ptr::write_volatile(fl.add(i), (qh_phys as u32) | PTR_TYPE_QH);
+        }
+        if !self.periodic_on {
+            let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
+            let _ = mmio_write32(self.op + OP_USBCMD, cmd | CMD_PSE);
+            self.periodic_on = true;
+        }
+        Some(BtEvtEp { qh, qtd, qtd_phys, buf, buf_phys, mps })
+    }
+
+    /// BT-L0 — arm ONE interrupt-IN transfer on the event endpoint and bounded-wait for it.
+    /// Returns the number of bytes received (possibly 0 — a zero-length packet retires the
+    /// transfer too), or None on timeout or a halted endpoint. Mirrors the two transfer modes
+    /// the driver self-selects (overlay-direct on this metal, qTD-chain on QEMU).
+    #[cfg(feature = "bt")]
+    unsafe fn bt_read_event(&mut self, e: &BtEvtEp, toggle: bool) -> Option<usize> {
+        let dt = if toggle { QTD_DT } else { 0 };
+        let total = e.mps as u32;
+        if self.overlay_mode {
+            (*e.qh).current_qtd = 0;
+            (*e.qh).overlay[0] = PTR_TERMINATE;
+            (*e.qh).overlay[1] = PTR_TERMINATE;
+            (*e.qh).overlay[3] = e.buf_phys as u32;
+            (*e.qh).overlay[4] = 0;
+            core::ptr::write_volatile(
+                &mut (*e.qh).overlay[2],
+                QTD_ACTIVE | QTD_CERR3 | (total << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC | dt,
+            );
+        } else {
+            write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, total, e.buf_phys);
+            (*e.qh).overlay[1] = PTR_TERMINATE;
+            (*e.qh).overlay[2] = 0;
+            (*e.qh).overlay[0] = e.qtd_phys as u32;
+        }
+        let om = self.overlay_mode;
+        let (qh, qtd) = (e.qh, e.qtd);
+        // BOUNDED: `wait_bounded` is the driver's TSC-backed `hw_wait_budget()` deadline — the
+        // same bound every other wait in this file uses. A radio that never answers costs one
+        // budget here, not a hung boot.
+        let done = wait_bounded(|| {
+            let tok = if om {
+                core::ptr::read_volatile(&(*qh).overlay[2])
+            } else {
+                core::ptr::read_volatile(&(*qtd).token)
+            };
+            tok & QTD_ACTIVE == 0
+        });
+        let tok = if om {
+            core::ptr::read_volatile(&(*qh).overlay[2])
+        } else {
+            core::ptr::read_volatile(&(*qtd).token)
+        };
+        if !done {
+            serial_println!(
+                ":: bt-l0: [{}] STOP-NOTE HCI event IN timed out (token={:#010x}) — not forced ::",
+                self.idx, tok
+            );
+            return None;
+        }
+        if tok & QTD_ERR_MASK != 0 {
+            serial_println!(
+                ":: bt-l0: [{}] STOP-NOTE HCI event endpoint halted (token={:#010x}) — endpoint retired, not forced ::",
+                self.idx, tok
+            );
+            return None;
+        }
+        Some((total.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF)) as usize)
+    }
+
+    /// BT-L0 — issue one zero-parameter HCI command over the control endpoint and drain the
+    /// event endpoint until its Command Complete arrives.
+    ///
+    /// The command rides EP0 exactly as the Bluetooth USB transport specifies: bmRequestType
+    /// 0x20 (host-to-device, CLASS, INTERFACE), bRequest 0x00, wValue 0, wIndex = the HCI
+    /// interface, data = the HCI command packet `opcode(2, LE) parameter_total_length(1)`.
+    ///
+    /// Returns the Command Complete's RETURN PARAMETERS (everything after the opcode echo)
+    /// copied into `out`, and their length; None on send failure or if no matching Command
+    /// Complete arrived within `BT_EVT_MAX` bounded reads.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_hci_command(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        opcode: u16,
+        out: &mut [u8; 16],
+    ) -> Option<usize> {
+        self.data_buf.write(opcode as u8);
+        self.data_buf.add(1).write((opcode >> 8) as u8);
+        self.data_buf.add(2).write(0u8); // parameter total length — both commands take none
+        if self.control(t, 0x20, 0x00, 0, intf as u16, 3, false).is_err() {
+            serial_println!(
+                ":: bt-l0: [{}] HCI command {:#06x} — control-OUT failed on EP0 ::",
+                self.idx, opcode
+            );
+            return None;
+        }
+        // Drain: a controller may emit unrelated events (vendor, Command Status) before the
+        // Command Complete we asked for. Structurally bounded, on top of each read's own
+        // deadline, so a chatty or a mute radio both terminate.
+        for _ in 0..BT_EVT_MAX {
+            let n = self.bt_read_event(e, *toggle)?;
+            *toggle = !*toggle;
+            if n == 0 {
+                continue; // zero-length packet: nothing to parse, try again
+            }
+            let pkt = core::slice::from_raw_parts(e.buf, n.min(e.mps as usize));
+            if pkt.len() < 2 {
+                continue;
+            }
+            let (code, plen) = (pkt[0], pkt[1] as usize);
+            if code != BT_EVT_CMD_COMPLETE {
+                serial_println!(
+                    ":: bt-l0: [{}] HCI event {:#04x} plen={} while awaiting CmdComplete for {:#06x} — skipped ::",
+                    self.idx, code, plen, opcode
+                );
+                continue;
+            }
+            // Command Complete parameters: Num_HCI_Command_Packets(1) Command_Opcode(2, LE)
+            // Return_Parameters(...). The return parameters therefore start at packet offset 5.
+            if pkt.len() < 5 {
+                continue;
+            }
+            let echoed = (pkt[3] as u16) | ((pkt[4] as u16) << 8);
+            if echoed != opcode {
+                serial_println!(
+                    ":: bt-l0: [{}] CmdComplete for {:#06x} (ncmd={}) while awaiting {:#06x} — skipped ::",
+                    self.idx, echoed, pkt[2], opcode
+                );
+                continue;
+            }
+            let ret = &pkt[5..];
+            let take = ret.len().min(out.len());
+            out[..take].copy_from_slice(&ret[..take]);
+            return Some(take);
+        }
+        serial_println!(
+            ":: bt-l0: [{}] no CmdComplete for {:#06x} within {} bounded event reads ::",
+            self.idx, opcode, BT_EVT_MAX
+        );
+        None
+    }
+
+    /// BT-L0 — stop the event endpoint. The QH stays linked (its static slot is owned for the
+    /// boot, and the frame-list chain must not be rewritten behind endpoints armed after it);
+    /// clearing Active is what makes the controller skip it, exactly as a retired endpoint.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_quiesce_events(&mut self, e: &BtEvtEp) {
+        if self.overlay_mode {
+            core::ptr::write_volatile(&mut (*e.qh).overlay[2], 0);
+        } else {
+            core::ptr::write_volatile(&mut (*e.qtd).token, 0);
+            (*e.qh).overlay[0] = PTR_TERMINATE;
+            core::ptr::write_volatile(&mut (*e.qh).overlay[2], 0);
+        }
+    }
+    // ============================== end BT-L0 ================================================
 
     /// Build + link one periodic interrupt QH and arm its first qTD.
     ///
@@ -4020,6 +4581,10 @@ pub fn init() {
                         mt_probe: None,
                         #[cfg(feature = "mtraw")]
                         mt_dumped: 0,
+                        // BT-L0: no parent until `bring_up_hub` stamps one; the depth-0 M1
+                        // witness never reads it.
+                        #[cfg(feature = "bt")]
+                        bt_parent: (0, 0),
                     };
                     // Firmware-stale detection BEFORE any schedule programming: probe 2 showed
                     // Apple EFI leaves PSE=1 behind (its pre-boot keyboard), which HSE-halts
