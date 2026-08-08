@@ -12255,10 +12255,13 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
     // app needs to know it was backgrounded.
     SLOT_DETACHED[mapped.slot].store(true, Ordering::Release);
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
-    // Place a bg job on a core chosen by the same round-robin the fixtures use rather than the shell's
-    // own: every `bg` launch runs from the same shell context, so pinning to `this_cpu` would stack every
-    // background program on one core (the aarch64 BG-SPREAD lesson). x86 has no CPU_AUTO, so this is the
-    // simple honest version — spread across the online cores by job count.
+    // Place a bg job on the CALLER's core. `bg_place_cpu` is `meter_current_cpu()` — see its doc for
+    // why the round-robin this comment used to describe was removed (a job placed on a core that is
+    // online but not dispatching sits in that queue forever). The consequence, since SCHED-X86 made
+    // the shell a scheduled task: the caller IS `x86_render_service`, so every `bg` and every
+    // foreground `run` lands on the RENDER core. That is a known-open placement defect
+    // (`scheduler.md:1600-1612`), not the spread this comment previously claimed; fixing it needs
+    // `CPU_AUTO` underneath, which x86 does not have yet.
     let cpu = bg_place_cpu();
     let pid = crate::arch::sched::spawn_user_preemptible(
         BG_TASK_NAME,

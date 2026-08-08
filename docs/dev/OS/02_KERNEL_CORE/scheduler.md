@@ -1554,7 +1554,9 @@ any MTRR type, so the MSR was the only missing piece.
 :: SCHED-X86: input task dispatched on core 7 ::
 :: SCHED-X86: render task dispatched on core 1 — panel owned by the scheduler ::
 :: SCHED-X86 PLACE-CHECK: actual=c1 arg=c1 published=c1 pool=5 collide=0 tier=exclusive verdict=PASS ::
+[schedx86] load-prejoin c0=-- c1=…% …            (SCHEDLOAD-X86, once, at the handoff)
 [schedx86] depth sent=… recv=… inflight=… (render core 1)
+[schedx86] load c0=…% c1=…% … sw=[…] q=[…]       (SCHEDLOAD-X86, every ~5 s)
 ```
 
 The spawn line and the three *dispatched* lines are deliberately separate: spawned
@@ -1610,6 +1612,71 @@ answer, by design: core 0 publishes `scheduler_rsp` from this loop, so WINX-7
 sibling placement may now pick it.
 
 The `rast` knob keeps the inline loop (its demo drives the BSP's local `screen`).
+
+### Per-core busy-TIME accounting + the always-on load witness (x86_64, SCHEDLOAD-X86)
+
+Until this arc, **no serial line on any x86 boot reported per-core load.** The only
+feed was `CPU_BUSY`/`CPU_IDLE`, and reaching it needed an operator: the `sched`/`ps`
+shell verb, or `PULSE.ELF` through `SYS_CPUPULSE(49)`. Every unattended capture in
+the archive is therefore silent about which cores were working — which is the reason
+this is the *first* arc of the SMP balancing campaign rather than a later one. A
+balancer landed without a load witness is unfalsifiable.
+
+`arch::x86_64::sched` now carries a per-core `CoreAccount` and a `core_load(cpu) ->
+CoreLoad` accessor mirroring the aarch64 contract. `run()` folds a measured **span**
+into a rolling ~250 ms window at the two sites that already bumped the event
+counters: `now_cycles()` (rdtsc) taken either side of `switch_context` (busy) and
+either side of `enable_and_hlt` (idle). `CPU_BUSY`/`CPU_IDLE` are untouched and keep
+all five of their consumers — they are a second instrument in a different currency,
+and the arc's cross-check is that the two agree about *which* cores are idle while
+disagreeing about the magnitudes.
+
+Three x86-specific decisions, none of them ports:
+
+* **Spans in TSC, freshness in milliseconds.** `CNTPCT` is system-global, so on
+  aarch64 one core may subtract another's timestamp. `rdtsc` is **per-core**, and
+  cross-core synchronization is a firmware property this kernel neither programs nor
+  verifies — a small negative skew wraps to ~2⁶⁴ and a small positive skew fabricates
+  a window of activity. So every quantity a *remote* reader evaluates uses
+  `arch::ms()` (globally coherent: core 0 alone advances `APIC_TICKS`), and only a
+  core's own self-measured spans are in cycles. The `CoreLoad` field is
+  `fold_age_ms`, not `fold_age_cyc`, for that reason.
+* **No age-on-read (PULSE-5); a pegged-core test instead.** PULSE-5's remedy needs
+  exactly the cross-core cycle subtraction ruled out above. The freeze it fixes is
+  real here too — the arc's QEMU smoke caught a core printing `64%` then `--`, having
+  stopped folding because it was *inside* a task — so `core_load` instead reads
+  `SCHED[cpu].current != 0` together with a fold age past a full window and reports
+  100 %. Both inputs are globally coherent. The sub-window part of PULSE-5 is
+  deliberately not reproduced: it under-reports a busy core by at most one window and
+  can never over-report one, and an inflated percent is the dangerous direction.
+* **No `PaddedUsize`.** Its justification is A72 LL/SC livelock, which does not exist
+  on x86. `CoreAccount` *is* `repr(align(128))` on its own merits — plain write-write
+  false sharing between neighbouring cores' slots on the dispatch path, at the 128-byte
+  effective granularity of Sandy/Ivy Bridge's adjacent-line prefetch.
+
+**`--` versus `0%` is the anti-witness, and it is load-bearing.** `0%` is a
+measurement (this core folded spans; none were busy). `--` is the *absence* of one.
+Collapsing them would make an unaccounted core indistinguishable from a provably idle
+one, which is how an instrument ends up certifying the imbalance it was built to
+detect. The assertion is made on the wire, once per boot: `run_bsp` emits
+`[schedx86] load-prejoin` one statement before entering `run()`, at the single instant
+when core 0 has never folded a span and every AP has. That line **must** read `c0=--`
+with at least one AP carrying a percent; `c0=0%` there refutes the instrument outright.
+
+The steady-state line rides the existing `[schedx86] depth` clock gate (~5 s) in
+`x86_render_service`, emitted after `pal.render()` — below the event-routing block,
+which is the focus-trap seam and is not to be perturbed by an instrument. Every
+`depth` line should be followed by exactly one `load` line. The whole line is composed
+into one stack buffer and handed to a single `serial_println!`: piecewise fragments
+would drop the UART lock between fields, and a witness another core can cut in half is
+not evidence.
+
+Still open after this arc, in the order the campaign takes them: placement
+(`CPU_AUTO`/`spawn_auto`/`PRIO_SERVICE`, which also fixes `bg_place_cpu` above),
+BSP-serial boot probing, band-parallel compositor flush, and work stealing.
+`ui_status::live_permille`'s x86 arm still returns `None` and falls back to the event
+meter — wiring it to this feed so the panel strip and the serial line read one source
+is a follow-up, not part of this arc.
 
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
@@ -1768,6 +1835,11 @@ Combined-boot evidence (one kernel running SMP + USB + net + video):
 - **`RwLock` reader starvation is unbounded** (condvar-blocked tasks do not age),
   and each condvar has a documented capacity precondition. These are recorded as
   preconditions rather than fixed.
+- **x86_64 tasks never migrate, and placement is decided once at spawn.** There is
+  no `CPU_AUTO`, no re-placement at wake, no work stealing, and no service priority
+  band — `make_ready` enqueues on `task.cpu` unconditionally, so nothing can correct
+  an imbalance once it exists. SCHEDLOAD-X86 makes that imbalance *visible* on every
+  boot; the corrections are the arcs after it.
 
 ---
 
