@@ -1108,6 +1108,120 @@ pub fn emit_load_witness(tag: &str) {
     }
 }
 
+// ── STORM-X86: the launch-boundary headroom probe ────────────────────────────────────────────────
+//
+// WHY IT EXISTS ON THIS ARCH. The `storm` verb raises a vug fleet in one command; on aarch64 it has
+// always carried a census at the launch boundary, and the argument for that census is arch-neutral:
+// every OTHER scheduler quantity is sampled on a clock of its own — `[schedx86] load` rides
+// `x86_render_service`'s multi-second heartbeat, the vug CPU-pulse meter rides frames — and the few
+// seconds in which a fleet is being BUILT are shorter than one of those windows. The launch boundary
+// is the only clock that samples the machine at the instant its size changes. A `storm` that printed
+// no census would be a load generator with no instrument, which is not what the verb is for.
+//
+// WHAT ITS SILENCE MEANS — the same rule as aarch64, for the same structural reason. Every `[storm]`
+// line is emitted from the SHELL task, so it can only run while the shell is dispatched, and a fleet
+// that starves the shell is one of the outcomes the probe is hunting. Its silence therefore refutes
+// nothing. Two properties make that silence READABLE: `pre` is emitted before the first launch and
+// one line after EACH successful launch, so the last `[storm] k=` on the wire names the launch after
+// which the shell stopped reporting. The instrument that survives a starved shell is the
+// timer/heartbeat-driven `[schedx86] load` train; read a truncated `[storm]` tail against THAT, and
+// never read a missing `post` as a clean run.
+//
+// WHAT IS DELIBERATELY DIFFERENT FROM THE aarch64 CENSUS, stated so a two-arch capture is not
+// mis-read as a regression on one of them:
+//   * no EL0 `runnable/committed` pair. x86 keeps no per-core ring-3 residency counters (aarch64's
+//     `EL0_RESIDENTS` has no twin here), and the honest report of a quantity this arch does not
+//     measure is its ABSENCE, not a zero. The ring-3 population is reported instead by the process
+//     rows and user slots the verb prints around these lines.
+//   * no `below-band` run-queue depth. There is no service priority band on x86 (`spawn_prio` and
+//     `PRIO_SERVICE` are aarch64's), so `q` is the whole ready queue and there is nothing to split
+//     it against.
+//   * `busy` uses the THREE-form rendering of [`emit_load_witness`] verbatim — `NN%` measured,
+//     `NN%*(name)` inferred, `--` absent. That distinction is the load instrument's whole thesis on
+//     this arch, and a boundary sample that flattened it back into a bare percent would be the one
+//     place a stale or deduced number is most likely to be read as a measurement.
+//
+// COST. One `RUN_QUEUES[c]` acquisition per core, held across `len()` only, taken with interrupts
+// masked — the same bounded, non-nested snapshot `emit_load_witness` takes and for the identical
+// WEDGE-4 `<W1>` reason (`run_queue_len` locks without masking; this runs from a preemptible task).
+// The formatting and the UART write happen with IF restored. Once per launch, never per frame.
+
+/// STORM-X86 — one boundary sample: per-core saturation, ready-queue depth, and cumulative context
+/// switches, under the caller's `phase` label so a capture reads back in launch order.
+///
+/// Arch-neutral name-and-shape mirror of aarch64's `storm_probe`; see the block above for what the
+/// fields mean on THIS arch, which two aarch64 columns are deliberately absent, and what this line's
+/// absence does not prove.
+pub fn storm_probe(phase: &str) {
+    use core::fmt::Write;
+    let seen = crate::arch::acpi::cpu_count().max(1);
+    let n = meter_cpu_count();
+
+    // ── snapshot (IF=0) — R1/H1's requirement, not tidiness: see the block above ────────────────
+    let mut rows = [LoadRow::blank(); MAX_CPUS];
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for (c, row) in rows.iter_mut().enumerate().take(n) {
+            let ld = core_load(c);
+            *row = LoadRow {
+                pct: ld.busy_pct_recent,
+                tracked: ld.tracked,
+                pegged: ld.pegged,
+                name: ld.last_task,
+                sw: ld.ctx_switches,
+                q: run_queue_len(c),
+            };
+        }
+    });
+
+    // ── format + emit (IF restored) ─────────────────────────────────────────────────────────────
+    let mut w = LineBuf::new();
+    let _ = write!(w, "[storm] {} | busy", phase);
+    for (c, row) in rows.iter().enumerate().take(n) {
+        if !row.tracked {
+            let _ = write!(w, " c{}=--", c);
+        } else if row.pegged {
+            let (nm, clip) = peg_name(row.name);
+            let _ = write!(w, " c{}={}%*({}{})", c, row.pct, nm, clip);
+        } else {
+            let _ = write!(w, " c{}={}%", c, row.pct);
+        }
+    }
+    let mut ctx = 0u64;
+    let _ = write!(w, " | rq(ready)");
+    for (c, row) in rows.iter().enumerate().take(n) {
+        let _ = write!(w, " c{}={}", c, row.q);
+        ctx += row.sw;
+    }
+    let _ = write!(w, " | ctx={}", ctx);
+    if seen > n {
+        let _ = write!(w, " cores={}/{} <CAPPED>", n, seen);
+    }
+    if w.overflow {
+        serial_println!("{} <TRUNCATED>", w.as_str());
+    } else {
+        serial_println!("{}", w.as_str());
+    }
+}
+
+/// STORM-X86 — the FULL boundary block, emitted at the two ends of a storm (the per-launch lines in
+/// between are [`storm_probe`] alone, which is the cheap half).
+///
+/// It is [`storm_probe`] followed by the standing load witness re-emitted at THIS instant instead of
+/// on its own heartbeat, tagged with the phase so a capture can tell a boundary emission from a
+/// periodic one. That pairing is the point: the `[storm]` line carries the boundary-specific totals,
+/// and the `[schedx86] load` line beside it is in the exact wording the rest of the capture uses, so
+/// a storm run and a steady-state run are read with one vocabulary.
+///
+/// aarch64's census additionally chains `[pulse5]`/`[spread4]`/`[prio]`; those instruments have no
+/// x86 twin in this arc, and re-emitting a line this arch does not produce is not available to be
+/// got wrong. Nothing here CONSUMES a periodic instrument's state — `emit_load_witness` only reads
+/// the per-core accounts, so calling it at a boundary does not shorten any window the heartbeat is
+/// about to report (the defect aarch64's census documents at `prio_witness`).
+pub fn storm_census(phase: &str) {
+    storm_probe(phase);
+    emit_load_witness(&alloc::format!("-storm-{}", phase));
+}
+
 /// A task name clipped to [`PEG_NAME_CAP`] bytes at a UTF-8 character boundary, so the pegged-core
 /// suffix cannot blow the line bound derived at [`LINEBUF_CAP`]. Returns the slice and a marker that
 /// is `"+"` when clipping occurred — a silently shortened name is a name the reader would mis-match
