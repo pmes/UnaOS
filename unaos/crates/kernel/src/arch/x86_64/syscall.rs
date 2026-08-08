@@ -3415,18 +3415,22 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // WINX-7: if NOBODY currently has input focus, the process that just opened a window gets it.
     //
     // This is the minimum viable focus POLICY, and it is deliberately the weakest one that makes an
-    // interactive ring-3 app reachable at all. x86 has no focus-cycling key yet (the aarch64 WC-C TAB
-    // ring lives in that arch's router seam, which this arc does not have a twin of), so without some
-    // rule a program launched with `bg` would create a window, poll `SYS_INPUT_POLL` forever, and
-    // never receive a single event — indistinguishable from broken input.
+    // interactive ring-3 app reachable at all: without some rule a program launched with `bg` would
+    // create a window, poll `SYS_INPUT_POLL` forever, and never receive a single event —
+    // indistinguishable from broken input.
+    //
+    // WC-TAB/x86 has since supplied the focus RING this note called the follow-on arc (see
+    // `wc_focus_key`), and this rule is kept rather than replaced. The two do different jobs: the
+    // cycle moves focus that already exists, and this is what gives a freshly launched window a
+    // first grant with nothing pressed. What the cycle removes is the trap that made a weak GRANT
+    // rule dangerous — a grant that could never be given back.
     //
     // What makes "only when nobody has focus" the safe version: it can never STEAL focus. A second
     // windowed app launched behind a focused one does not take the keyboard from it, so a background
     // program cannot arrange to receive keystrokes aimed at the window in front of it — which is the
     // property the producer-side focus gate exists to guarantee. Focus returns to the shell when the
     // holder's slot is torn down (`user_input_revoke_slot`), so the next app launched after that one
-    // exits is focusable in turn. A real focus RING — click-to-focus, a reserved cycling key — is the
-    // follow-on arc, and it will replace this rule rather than build on it.
+    // exits is focusable in turn — and, since WC-TAB/x86, without needing that exit at all.
     if USER_INPUT_ACTIVE
         .compare_exchange(0, (slot as u64) + 1, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
@@ -3797,6 +3801,209 @@ pub fn user_input_route(ev: crate::pal::Event) -> crate::pal::Event {
     }
 }
 
+/// WC-TAB/x86 — [`crate::video::wm::focus_ring`] with the KERNEL rows removed, which is what that
+/// helper's own contract already claims to return and what it actually returns only on aarch64.
+///
+/// `focus_ring` filters `used && !compat && owner_asid != 0`. On aarch64 that IS the app set: every
+/// row belongs to an EL0 ASID. On x86 it is not — `fbcon::panel_console_window_open` and `wcx`'s
+/// desktop demo create rows owned by `wm::KERNEL_OWNER_CONSOLE` / `KERNEL_OWNER_DESKTOP`, values
+/// far above `USER_SLOTS` that pass the `!= 0` test. Left in, the cycle would step onto one of them
+/// and `user_input_set_active` would REFUSE it (`slot >= USER_SLOTS`, an early return that publishes
+/// nothing), so TAB would raise the console, print a witness naming a focus that had not moved, and
+/// leave the keyboard exactly where it was — the trap intact behind a line saying otherwise.
+///
+/// Filtered HERE rather than in `wm`: kernel-owned rows exist only on this arch, so the divergence
+/// belongs on this side of the shared helper. (The narrowing in `focus_ring` itself would be a
+/// one-token edit and is the better long-term home; it is a shared-file change and not this arc's.)
+///
+/// Compacts in place and zeroes the tail, so the caller reads `ring[..n]` with no stale owner behind
+/// it. `out` is `focus_ring`'s own buffer type, so no second array is allocated anywhere.
+fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
+    let n = crate::video::wm::focus_ring(out);
+    let mut k = 0usize;
+    for i in 0..n {
+        let owner = out[i];
+        if crate::video::wm::is_kernel_owner(owner) {
+            continue;
+        }
+        out[k] = owner;
+        k += 1;
+    }
+    for e in out[k..n].iter_mut() {
+        *e = 0;
+    }
+    k
+}
+
+/// WC-TAB/x86 — the TAB focus-cycle, and the way out of the focus trap. Returns `true` when the
+/// window system CONSUMED the event: the caller must neither route it into a ring nor hand it to the
+/// console.
+///
+/// TAB is the COMPOSITOR's key, not the focused app's — the one keystroke the window system reserves
+/// for itself so that an operator can always reach the other window, or the shell, from an app that
+/// has taken the keyboard. Boot AH is the argument: a `vug.elf` started by BAREXEC held the last
+/// focus grant for 339 s of a perfectly healthy kernel (165 grants against 164 revokes — the missing
+/// revoke is the one `user_input_revoke_slot` never made, because a DETACHED job's slot is never torn
+/// down), and `kill <pid>` was ungated and unreachable. Reserving the key in the ROUTER rather than
+/// asking apps to forward it is the whole point: a per-app opt-in is no exit at all, since an app can
+/// hold focus hostage simply by not implementing it.
+///
+/// ### The ring, in x86's domain
+/// Slots, `+1`-BIASED, exactly as [`USER_INPUT_ACTIVE`] and `wm`'s window owners carry them — the
+/// bias is shared precisely so these are the SAME numbers at the seam that decides who receives a
+/// keystroke. So `{cur}` and `{next}` in the witness line below are `slot + 1`, and **0 is the SHELL**,
+/// not slot 0. (aarch64 prints bare ASIDs there; the line's shape is deliberately identical, its
+/// domain is not.)
+///
+/// The rotation is `n` window slots from [`focus_ring_apps`] in window-id order — a stable order an
+/// operator can predict, not a walk over a stack that reorders under them — plus ONE MORE: slot `n`
+/// is the SHELL. **That extra slot is what makes this an exit and not a trap.** Cycling only over the
+/// live apps is a closed loop; an operator who tabs into a window could never get the keyboard back.
+/// "No app has focus" is a position in the rotation, not an absence.
+///
+/// ### The guard keys on where focus IS (the aarch64 BGRUN-1 rule, adopted whole)
+///  * at the SHELL (`cur == 0`): consume TAB only if there is a window to enter (`n >= 1`).
+///  * in a WINDOW (`cur != 0`): ALWAYS consumable — the shell is a destination at any `n`, including
+///    `n == 0` (the focused app closed its own window; fall back to the shell rather than strand the
+///    keyboard in a slot with nothing on the panel).
+///
+/// A shared `n < 2` would re-weld the trap the moment a second window closed, which is the mistake
+/// that arc corrected on the other arch; there is no reason to ship it here first.
+///
+/// ### Both directions, one seam
+/// This is the largest structural divergence from aarch64 and it is a simplification, not a gap.
+/// There, `main.rs` calls the router only while `user_input_active() != 0`, so the shell half needed
+/// a second entry point (`wc_shell_focus_key`) on the shell's own drain. On x86 the drain calls
+/// `wc_click_route` + [`user_input_route`] on EVERY event regardless of focus — `user_input_enqueue`
+/// makes the focus test itself — so ONE interception placed ahead of that pair carries app -> shell
+/// and shell -> window alike. No shell-only entry point is needed and none is added; adding one would
+/// be a second predicate to keep in agreement with this one for no behaviour.
+///
+/// ### The SHELL slot is `focus_changed(0)`, not the console's window row
+/// Passed through untranslated, on `wc` builds too. The body carries the argument at the call; the
+/// short form is that fbcon's `KERNEL_OWNER_CONSOLE` row is a frozen boot-log snapshot after
+/// `fbcon::detach()` and the live prompt is the desktop layer, which is what `SHELL_Z` names.
+///
+/// ### Three consequences, flagged rather than hidden
+///  * The KeyUp is swallowed on the same predicate, and that is the ONE path here that consumes an
+///    event without printing (nothing moved, so there is nothing to report). Delivering a lone
+///    release for a press the app never saw is a fabricated edge. Note the arm is UNREACHABLE from
+///    the rMBP's internal keyboard: `ehci::decode_boot_keyboard` emits `Event::Key` only and never
+///    `Event::KeyUp` (a boot keyboard under `SET_IDLE(0)` reports one press and then nothing until
+///    release, and the release report carries no keycodes to decode). Live on the xHCI path, which
+///    does emit both.
+///  * A focus grant onto a slot torn down between the ring read and the publish is possible and is
+///    self-healing on the next press, not prevented. See the note at `user_input_set_active` below.
+///  * x86's [`user_input_set_active`] does NOT drain `pal::EVENT_QUEUE` — the aarch64 twin does, and
+///    that difference is deliberate there rather than an oversight here. So anything typed BEHIND the
+///    TAB survives into the new focus instead of being discarded. The exposure is near nil in practice
+///    (the input service drains the queue at ~1 kHz, so the backlog behind a human's TAB is empty) and
+///    closing it honestly is not a keybinding change: at the render-service seam the events in
+///    question are already off `EVENT_QUEUE` and inside `GUI_CHANNEL_X86`, which the syscall layer
+///    cannot reach, so a drain here would fix one seam and lie about the other.
+pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
+    const K_TAB: u8 = b'\t';
+    let down = match ev {
+        crate::pal::Event::Key(K_TAB) => true,
+        crate::pal::Event::KeyUp(K_TAB) => false,
+        _ => return false,
+    };
+    // WEDGE-2 `<F1>` — a TAB edge has been recognised and the chain begins. Emitted BEFORE
+    // `focus_ring`, which takes the window TABLE lock: a `<F1>` with no successor puts the death in
+    // the ring read, i.e. against `TABLE`. The tokens are carried over from aarch64 rather than left
+    // to that arch because three recorded silicon wedges crossed this exact seam, and x86 is the arch
+    // about to fly it. `focus_changed`'s own `<F4>`..`<F6>` are shared and already fire here, so
+    // without these four a wedge in the ring read or in the focus primitive would leave NO token at
+    // all on x86 where aarch64 would leave `<F1>` with no successor.
+    crate::wedge2::mark("<F1>");
+    let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
+    let n = focus_ring_apps(&mut ring);
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    if cur == 0 && n == 0 {
+        return false; // shell, no windows — TAB stays an ordinary key and reaches the console
+    }
+    if !down {
+        // THE ONE SILENT CONSUME, and it is deliberate. Nothing moved, so there is nothing for the
+        // witness to report; a `[wc-c]` line here would claim a transition that did not happen, and
+        // every reading of the ledger would double-count. Every OTHER path that returns `true` from
+        // this function moves focus and prints — see the note above the `serial_println!`.
+        return true; // swallow the release edge of a Tab whose press we consumed
+    }
+    let at = ring[..n].iter().position(|&o| o == cur);
+    let next = match at {
+        Some(i) if i + 1 == n => 0, // last window -> the shell
+        Some(i) => ring[i + 1],
+        // Focus is in no ring slot. Two distinct cases with one destination: the SHELL entering the
+        // rotation, and a focused app that owns no window of its own (or whose row went away under
+        // it) being rescued to the ring's head. Kept as one arm because the `n == 0` fallthrough
+        // below is what makes the indexing safe, and splitting them would hide that.
+        None if n > 0 => ring[0],
+        None => 0, // no windows at all -> the shell
+    };
+    // NO `next == cur` EARLY RETURN, and the omission is the point. It cannot arise today —
+    // `wm::focus_ring` dedupes by owner, ring entries are never 0, and the `cur == 0 && n == 0` guard
+    // above has already left — so as a guard it would be dead code; as a SILENT CONSUME it would be
+    // worse than dead, because the one way it could ever fire is a broken dedupe upstream, and that
+    // is exactly the case that must reach the wire instead of being swallowed. Left out, such a
+    // failure prints `[wc-c] focus tab-cycle N -> N`, which is a falsifier a boot can actually
+    // observe. The cost of letting it through is NOT free: `focus_changed` is idempotent, but
+    // `user_input_set_active` RESETS the target's ring by contract, so a spurious `N -> N` costs a
+    // redundant composite AND whatever queued input the focused app had not yet read. Paid only if
+    // the dedupe upstream is already broken — and then the wire evidence is worth the price.
+    //
+    // WEDGE-2 `<F2>` — the ring was read and a destination chosen; the focus PRIMITIVE is next.
+    crate::wedge2::mark("<F2>");
+    // Focus moves through the ONE primitive, so the cycle inherits what already hangs off it: the
+    // incoming ring is reset, so a fresh focus starts clean.
+    //
+    // WHAT IT DOES NOT INHERIT: `user_input_set_active` validates RANGE only (`slot < USER_SLOTS`).
+    // It does not — and cannot cheaply — check that the slot is still LIVE, so a target torn down
+    // between the ring read above and this call is published anyway: the teardown's
+    // `user_input_revoke_slot` CAS names the dying slot's biased value, which does not match the
+    // focus still in place, so it clears nothing, and this store then points focus at a dead slot
+    // whose ring no process will ever drain. That is a fresh instance of the trap this arc removes,
+    // and the honest thing to say about it is that it is SELF-HEALING rather than prevented: the
+    // next TAB has `cur != 0`, which the BGRUN-1 guard makes always consumable, and the `None`
+    // arm above rescues it to the ring head or the shell. A liveness test here would not close the
+    // window either — it would be a check between the same two points, i.e. the same TOCTOU one
+    // instruction narrower — so the rescue is the mechanism, not a fallback for it.
+    user_input_set_active(next);
+    // WEDGE-2 `<F3>` — focus routing has moved; the VISIBLE half is next. This is the seam the three
+    // silicon wedges all crossed.
+    crate::wedge2::mark("<F3>");
+    // FOCUS-VIS — the other half of a focus change. `user_input_set_active` moves where KEYSTROKES go;
+    // this moves what the PANEL shows. P59 is what happens when only the first exists: the witness
+    // fires on every press and nothing on screen moves, so the newly focused window stays buried and
+    // the console stays covered — focus that cannot be seen is not focus.
+    //
+    // `next == 0` IS THE SHELL, AND IT IS PASSED THROUGH UNTRANSLATED — including on `wc`, where the
+    // first cut of this arc raised `KERNEL_OWNER_CONSOLE` instead on the theory that "on x86 the
+    // console is a window row". It is, and that row is not the console the operator types into. On
+    // the bench path `fbcon::detach()` runs at the SCHED-X86 handoff, `_print` returns at its first
+    // test from that store on, and fbcon's `KERNEL_OWNER_CONSOLE` row — opened earlier by
+    // `wcx::activate` — is a FROZEN BOOT-LOG SNAPSHOT for the rest of the boot. The live prompt is
+    // `console::Console` drawn through `TargetPal`/`Screen` inside `x86_render_service`: the DESKTOP
+    // layer, which is the layer `SHELL_Z` is. So `focus_changed(0)` is the correct call on this arch
+    // for the same reason it is on the other, and only its arm does the three things this gesture
+    // needs — bump `SHELL_Z` above every window, ERASE the vacated boxes (`nhidden` is filled in
+    // that branch alone), and `screen::request_full_present`, whose doc names TAB-to-the-shell as
+    // the single state it exists to repair. Raising the kernel row does none of them: it brings a
+    // dead snapshot to the front and leaves the live prompt buried and unrepainted.
+    crate::video::wm::focus_changed(next);
+    // WEDGE-2 `<F9>` — `focus_changed` RETURNED and this core is about to fall back into the input
+    // pump. A wire that reaches `<F9>` has exonerated the whole focus path for that press. The
+    // `[wc-c]` line below is the ordinary witness, but it takes the serial lock and is buffered
+    // behind it, so the TOKEN is what proves the return, not the line.
+    crate::wedge2::mark("<F9>");
+    serial_println!(
+        "[wc-c] focus tab-cycle {} -> {} (ring of {} + shell)",
+        cur,
+        next,
+        n
+    );
+    true
+}
+
 /// Reset a slot's input ring (head == tail == 0 => empty). Called on a focus change (a freshly
 /// focused app starts clean — no stale input aimed at whoever had focus before) and from
 /// `clear_handle_row` on slot teardown (a reused slot inherits no stale input). Safe in both cases:
@@ -3859,10 +4066,18 @@ fn user_input_revoke_slot(slot: usize) {
 /// Relaxed and published Release AFTER the payload load — the mirror of the producer's ordering.
 ///
 /// NOT GATED ON FOCUS, deliberately. An unfocused app may drain whatever was queued while it DID have
-/// focus, which is what makes tabbing away and back lossless rather than a silent truncation; the gate
-/// that matters is on the PRODUCER side, where an unfocused app's ring stops filling in the first
-/// place. The distinction is that a program may always read what was already addressed to it, and may
-/// never receive what was addressed to somebody else.
+/// focus, rather than being silently truncated at the moment focus left; the gate that matters is on
+/// the PRODUCER side, where an unfocused app's ring stops filling in the first place. The distinction
+/// is that a program may always read what was already addressed to it, and may never receive what was
+/// addressed to somebody else.
+///
+/// **This is not "tabbing away and back is lossless", and it used to say so.** The claim was vacuous
+/// when written — x86 had no way to tab back — and WC-TAB/x86 made it reachable and false in the same
+/// stroke: [`user_input_set_active`] calls `clear_input_row` on the way IN, so a return of focus wipes
+/// whatever the app had not yet read. The window in which the unread tail survives is therefore
+/// between focus LEAVING and focus RETURNING, and a return closes it. That behaviour is the one to
+/// keep (a fresh focus starts clean, which is what stops a press/release pair from being split across
+/// a focus change); it is the sentence that had to move.
 fn sys_input_poll() -> i64 {
     let Some(slot) = crate::arch::x86_64::memory::current_slot() else {
         return EAGAIN;
