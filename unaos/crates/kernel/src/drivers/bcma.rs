@@ -18,14 +18,17 @@
 //! subclass **0x80** ("other network controller") and therefore *cannot* have matched that filter:
 //! the radio in this machine has never been looked at by our own kernel, not once.
 //!
-//! This module is the first arc of the native-driver path. It converts assumptions into facts and
-//! it writes nothing.
+//! This module is the first arc of the native-driver path. It converts assumptions into facts.
+//! S0 wrote nothing; S1/L0 write exactly ONE register — the `cfg:0x80` window selector — and
+//! restore it, MATCH-verified.
 //!
-//! ## The hard constraint: READ-ONLY, and honest about where read-only stops
+//! ## The hard constraint: READ-ONLY past the selector, and honest about where read-only stops
 //!
-//! Every device access below is a PCI **config-space read** or an **MMIO read** through BAR0. There
-//! is no `write_config_*` call and no `write_volatile` anywhere in this file. That is not a style
-//! preference; it is the arc's whole contract, because the alternative — poking a radio whose
+//! Every device access below is a PCI **config-space read** or an **MMIO read** through BAR0,
+//! except the five `write_config_32` calls to `CFG_BAR0_WIN` (selftest no-op, ChipCommon, EROM,
+//! d11 base, restore). No `write_volatile`, no MMIO write, no other config write exists in this
+//! file. That is not a style preference; it is the arc's whole contract, because the
+//! alternative — poking a radio whose
 //! backplane we have not enumerated — is how you wedge a bus you cannot yet reset.
 //!
 //! Mapping BAR0 (`arch::memory::map_mmio_window`) is a page-table edit, not a device access: the
@@ -137,7 +140,8 @@ const CAP_ID_PM: u8 = 0x01;
 /// `BCMA_PCI_BAR0_WIN` — the backplane address the first 4 KiB of BAR0 decodes to. Linux's
 /// `bcma_scan_switch_core()` writes this register (and nothing else) to move the window from core
 /// to core; it is the single register that gates every backplane read past ChipCommon.
-/// **This arc does not write it.**
+/// **The ONLY register this module ever writes** (S1/L0: three moves + restore, MATCH-verified;
+/// S0 never wrote it).
 const CFG_BAR0_WIN: u8 = 0x80;
 /// `BCMA_PCI_BAR0_WIN2` — the backplane address the SECOND 4 KiB of BAR0 decodes to (the wrapper
 /// window). Read here only to record what firmware left behind.
@@ -226,6 +230,99 @@ const OTPS_GUP_HW: u32 = 0x0000_0100;
 const OTPS_GUP_SW: u32 = 0x0000_0200;
 const OTPS_GUP_CI: u32 = 0x0000_0400;
 const OTPS_GUP_FUSE: u32 = 0x0000_0800;
+
+// ── d11 (802.11 MAC) core registers — b43 `b43.h` MMIO offsets ──────────────────────────────────
+//
+// These are offsets INSIDE the d11 core's own 4 KiB register window, i.e. what BAR0+0 decodes to
+// once cfg:0x80 carries the d11 core's backplane base. Every one of them is a status or control
+// register with NO read side effect. The registers deliberately NOT read here are the ones that
+// would make "read-only" a lie:
+//
+// * `B43_MMIO_GEN_IRQ_REASON` (0x128) and the per-ring `DMA*_REASON` words are **read-to-clear** —
+//   reading them would destroy interrupt state the firmware/PHY bring-up stages will need;
+// * `B43_MMIO_RADIO_CONTROL` (0x3E2) / `RADIO_DATA*` — reading a radio register requires first
+//   WRITING the register index to the control port, so the radio's own id is not a read-only fact;
+// * `B43_MMIO_SHM_CONTROL` (0x160) / `SHM_DATA` — same shape: SHM is an indirect window opened by a
+//   write. The MACCTL `SHM_ENABLED`/`IHR_ENABLED` bits below are the read-only part of that story.
+#[cfg(feature = "bcmaS1")]
+const D11_MACCTL: u64 = 0x0120; // B43_MMIO_MACCTL — MAC control (r/w, no side effect)
+#[cfg(feature = "bcmaS1")]
+const D11_GEN_IRQ_MASK: u64 = 0x012C; // B43_MMIO_GEN_IRQ_MASK (the MASK, not the read-to-clear REASON)
+#[cfg(feature = "bcmaS1")]
+const D11_RADIO_HWENABLED_HI: u64 = 0x0158; // B43_MMIO_RADIO_HWENABLED_HI (u32, phy rev >= 3)
+#[cfg(feature = "bcmaS1")]
+const D11_TSF_LOW: u64 = 0x0180; // B43_MMIO_REV3PLUS_TSF_LOW
+#[cfg(feature = "bcmaS1")]
+const D11_TSF_HIGH: u64 = 0x0184; // B43_MMIO_REV3PLUS_TSF_HIGH
+#[cfg(feature = "bcmaS1")]
+const D11_PHY_VER: u64 = 0x03E0; // B43_MMIO_PHY_VER (u16) — the PHY identity word
+#[cfg(feature = "bcmaS1")]
+const D11_RADIO_HWENABLED_LO: u64 = 0x049A; // B43_MMIO_RADIO_HWENABLED_LO (u16, phy rev < 3)
+
+// `B43_MACCTL_*`. Only the bits whose meaning is unambiguous in b43's header are decoded; the RAW
+// word is on the same line, so a reader can check any bit this file declines to name.
+#[cfg(feature = "bcmaS1")]
+const MACCTL_ENABLED: u32 = 0x0000_0001;
+#[cfg(feature = "bcmaS1")]
+const MACCTL_PSM_RUN: u32 = 0x0000_0002;
+#[cfg(feature = "bcmaS1")]
+const MACCTL_SHM_ENABLED: u32 = 0x0000_0100;
+#[cfg(feature = "bcmaS1")]
+const MACCTL_IHR_ENABLED: u32 = 0x0000_0400;
+#[cfg(feature = "bcmaS1")]
+const MACCTL_BE: u32 = 0x0001_0000;
+#[cfg(feature = "bcmaS1")]
+const MACCTL_AWAKE: u32 = 0x0400_0000;
+#[cfg(feature = "bcmaS1")]
+const MACCTL_GMODE: u32 = 0x8000_0000;
+
+// `B43_PHYVER_*` field masks.
+#[cfg(feature = "bcmaS1")]
+const PHYVER_ANALOG: u16 = 0xF000;
+#[cfg(feature = "bcmaS1")]
+const PHYVER_ANALOG_SHIFT: u16 = 12;
+#[cfg(feature = "bcmaS1")]
+const PHYVER_TYPE: u16 = 0x0F00;
+#[cfg(feature = "bcmaS1")]
+const PHYVER_TYPE_SHIFT: u16 = 8;
+#[cfg(feature = "bcmaS1")]
+const PHYVER_VERSION: u16 = 0x00FF;
+
+/// `B43_PHYTYPE_HT`. The BCM4331 carries the HT-PHY, and this is the number that says so. It is the
+/// falsifiable predicate `docs/dev/OS/06_NETWORK_STACK/bcm4331.md` §S3 already names.
+#[cfg(feature = "bcmaS1")]
+const PHYTYPE_HT: u16 = 7;
+
+// ── AI/aidmp agent (wrapper) identification block ───────────────────────────────────────────────
+//
+// The AXI agent Broadcom wraps each backplane core in is an ARM DMP, and it ends with the standard
+// ARM PrimeCell/CoreSight identification registers: PeripheralID4..7 at 0xFD0..0xFDC, PeripheralID0..3
+// at 0xFE0..0xFEC and ComponentID0..3 at 0xFF0..0xFFC (Broadcom `aidmp.h`, `struct aidmp` tail).
+//
+// This block is the arc's independent cross-check on the EROM walk. The EROM is a ROM we parse; the
+// DMP ids are registers the core answers with. If they agree on the core's part number, the walk's
+// claim that `0x18001000` is core id 0x812 is corroborated by the silicon at that address rather
+// than only by our own decode of a table.
+//
+// The transcription is labelled UNVERIFIED on the witness line and the decode never overrides the
+// raw words, because two things could make a mismatch innocent: the offsets could be transposed, or
+// Broadcom could simply not program the DMP part-number field with the BCMA core id. A MISMATCH is
+// therefore reported as a finding to chase, never as a verdict against the walk.
+#[cfg(feature = "bcmaS1")]
+const DMP_ID_BASE: u64 = 0x0FD0;
+#[cfg(feature = "bcmaS1")]
+const DMP_ID_WORDS: u64 = 12; // 0xFD0..0xFFC inclusive, 12 dwords
+
+/// ARM component-id preamble, `CIDR0/1/2/3`. `CIDR1`'s low nibble is part of the preamble; its high
+/// nibble is the component class.
+#[cfg(feature = "bcmaS1")]
+const CID0_PREAMBLE: u32 = 0x0D;
+#[cfg(feature = "bcmaS1")]
+const CID1_PREAMBLE: u32 = 0x00; // low nibble
+#[cfg(feature = "bcmaS1")]
+const CID2_PREAMBLE: u32 = 0x05;
+#[cfg(feature = "bcmaS1")]
+const CID3_PREAMBLE: u32 = 0xB1;
 
 /// How many 16-bit SPROM shadow words to dump. 220 is `SSB_SPROMSIZE_WORDS_R4`, the size of a
 /// revision-8 SPROM (what a BCM4331 board carries). 220 words = 440 bytes, so the highest byte
@@ -751,6 +848,25 @@ impl<F: Fn(u32) -> u32> Erom<F> {
     }
 }
 
+/// Everything the EROM walk learned about the 802.11 core, carried out of the walk so a later stage
+/// can point the window at it without re-walking.
+///
+/// `wrap` is Linux's `core->wrap` choice — the MASTER wrapper when the core has one, else the slave
+/// wrapper — and it is carried SEPARATELY from `mwrap`/`swrap` because the two are not
+/// interchangeable and because the previous `erom-d11` line got this exactly wrong: it printed
+/// `swrap` as the cfg:0xac target, and on this part the d11 core has `nsw=0`, so that line advised
+/// writing `0x00000000` into the wrapper selector. The value firmware itself left in cfg:0xac —
+/// `0x18101000` — is the MASTER wrapper.
+#[derive(Clone, Copy)]
+struct D11 {
+    base: u64,
+    wrap: u64,
+    wrap_kind: &'static str,
+    mwrap: u64,
+    swrap: u64,
+    rev: u32,
+}
+
 /// Walk the enumeration ROM through an already-open window and print one line per core.
 ///
 /// `read` yields the dword at EROM entry index `i`. It is a closure so the walker is independent of
@@ -771,16 +887,14 @@ impl<F: Fn(u32) -> u32> Erom<F> {
 ///    each read until the port/type stops matching.
 ///
 /// Bounded twice over by the cursor and it reports which bound stopped it. Returns the number of
-/// cores printed.
-fn walk_erom<F: Fn(u32) -> u32>(read: F) -> u32 {
+/// cores printed and, when it found one, the 802.11 core's addresses.
+fn walk_erom<F: Fn(u32) -> u32>(read: F) -> (u32, Option<D11>) {
     let mut e = Erom::new(read);
     let mut cores = 0u32;
     let mut skipped = 0u32;
     let mut stop = "end-tag";
     // The deliverable of this whole arc: where the 802.11 core lives.
-    let mut d11_base: u64 = 0;
-    let mut d11_swrap: u64 = 0;
-    let mut d11_rev: u32 = 0;
+    let mut d11: Option<D11> = None;
 
     loop {
         // ── 1. CIA + CIB ────────────────────────────────────────────────────────────────────────
@@ -932,10 +1046,8 @@ fn walk_erom<F: Fn(u32) -> u32>(read: F) -> u32 {
             (0, "none")
         };
 
-        if id == CORE_ID_80211 && d11_base == 0 {
-            d11_base = base;
-            d11_swrap = swrap;
-            d11_rev = rev;
+        if id == CORE_ID_80211 && d11.is_none() {
+            d11 = Some(D11 { base, wrap, wrap_kind, mwrap, swrap, rev });
         }
 
         if cores < EROM_MAX_CORES {
@@ -958,18 +1070,26 @@ fn walk_erom<F: Fn(u32) -> u32>(read: F) -> u32 {
         cores, skipped, e.i, stop, ev, eu
     );
     // The arc's product, on its own awk-able line: the backplane address of the 802.11 core.
-    if d11_base != 0 {
-        serial_println!(
-            ":: bcma: erom-d11 FOUND id={:#05x} rev={} base={:#010x} swrap={:#010x} — cfg:0x80 <- {:#010x} puts the radio's registers at BAR0+0, cfg:0xac <- {:#010x} puts its reset/clock control at BAR0+0x1000 ::",
-            CORE_ID_80211, d11_rev, d11_base, d11_swrap, d11_base as u32, d11_swrap as u32
-        );
-    } else {
-        serial_println!(
+    //
+    // The cfg:0xac advice is taken from `wrap` — Linux's `core->wrap`, i.e. the MASTER wrapper when
+    // the core has one — and NOT from `swrap`. Boots AL/AM/AN printed `swrap=0x00000000` on this
+    // exact core (it declares `nsw=0 nmw=1`), so the previous form of this line advised writing
+    // `0x00000000` into the wrapper selector: it would have pointed the wrapper aperture at the
+    // bottom of the backplane instead of at the radio, and the value firmware itself left in
+    // cfg:0xac (`0x18101000`) is precisely the `mwrap` printed here. All three addresses are on the
+    // line so the advice can be checked against them.
+    match d11 {
+        Some(d) => serial_println!(
+            ":: bcma: erom-d11 FOUND id={:#05x} rev={} base={:#010x} wrap={:#010x}({}) mwrap={:#010x} swrap={:#010x} — cfg:0x80 <- {:#010x} puts the radio's registers at BAR0+0; cfg:0xac <- {:#010x} (the WRAP address — master wrapper when the core has one, NOT swrap) puts its reset/clock control at BAR0+0x1000 ::",
+            CORE_ID_80211, d.rev, d.base, d.wrap, d.wrap_kind, d.mwrap, d.swrap,
+            d.base as u32, d.wrap as u32
+        ),
+        None => serial_println!(
             ":: bcma: erom-d11 ABSENT — no core id={:#05x} (802.11) in the inventory above after {} cores and {} skips; the radio's backplane base is NOT known and must not be guessed ::",
             CORE_ID_80211, cores, skipped
-        );
+        ),
     }
-    cores
+    (cores, d11)
 }
 
 // ── The probe ───────────────────────────────────────────────────────────────────────────────────
@@ -1601,6 +1721,31 @@ fn s1_window_walk() {
             (cap & CC_CAP_PMU != 0) as u8, (cc_id == DEVID_BCM4331) as u8
         );
 
+        // ── Step 3a: board-identity PRESENCE, read while ChipCommon is in the window. ────────────
+        //
+        // S0 already knows how to print this, but on this machine S0 never gets to: it refuses at
+        // `window-elsewhere` because firmware parks cfg:0x80 on the radio core, so the SPROM/OTP
+        // presence bits have never actually been read on metal. They are three register reads and
+        // the window is already where they live, so they are read here rather than left to S2.
+        //
+        // PRESENCE only. The CONTENTS of either store are out of this arc's reach and say so on
+        // their own lines: the SPROM shadow needs the 4331's external-PA line mux cleared first (a
+        // ChipCommon WRITE), and OTP is fetched by writing a read command to OTPP and polling OTPS.
+        let otps = unsafe { r32(bar0, CC_OTPS) };
+        let otpc = unsafe { r32(bar0, CC_OTPC) };
+        let otpl = unsafe { r32(bar0, CC_OTPL) };
+        let otp_field = (cap & CC_CAP_OTPS_MASK) >> CC_CAP_OTPS_SHIFT;
+        let otp_words: u32 = if otp_field == 0 { 0 } else { 1u32 << (CC_CAP_OTPS_BASE + otp_field) };
+        let otp_programmed = (otps & (OTPS_GUP_HW | OTPS_GUP_SW | OTPS_GUP_CI | OTPS_GUP_FUSE)) != 0;
+        serial_println!(
+            ":: wifi-l0: cc-identity sprom={} (cap bit30) otp={} otp_words={} otps={:#010x} otpc={:#010x} otpl={:#010x} gup(hw={} sw={} ci={} fuse={}) — PRESENCE only; SPROM contents need the 4331 PA-line mux cleared (a ChipCommon WRITE) and OTP contents need a read command written to OTPP, neither of which this arc makes ::",
+            if cap & CC_CAP_SPROM != 0 { "present" } else { "absent" },
+            if otp_words == 0 { "absent" } else if otp_programmed { "present-programmed" } else { "present-blank" },
+            otp_words, otps, otpc, otpl,
+            (otps & OTPS_GUP_HW != 0) as u8, (otps & OTPS_GUP_SW != 0) as u8,
+            (otps & OTPS_GUP_CI != 0) as u8, (otps & OTPS_GUP_FUSE != 0) as u8
+        );
+
         // ── Step 3b: the EROM. It sits on the backplane at `erom`, outside the ChipCommon window,
         // so reaching it needs cfg:0x80 pointed at it — another window write, restored with the rest
         // at Step 4. The window register is 4 KiB-granular (its low 12 bits are ignored by hardware),
@@ -1615,7 +1760,7 @@ fn s1_window_walk() {
                 ":: bcma-s1: WROTE cfg:0x80 old={:#010x} new={:#010x} readback={:#010x} — window now on the EROM; walking read-only ::",
                 BCMA_ADDR_BASE, erom_base, ew
             );
-            let cores = walk_erom(|i| unsafe { r32(bar0, erom_off + (i as u64) * 4) });
+            let (cores, d11) = walk_erom(|i| unsafe { r32(bar0, erom_off + (i as u64) * 4) });
             // The cross-check, corrected. Boot AJ printed `match=0` and treated it as evidence
             // against the walk; only half of that was sound. `BCMA_CC_ID_NRCORES` (chipid[27:24])
             // is the SB-era CoreCount field: `sb_numcores()` reads it, and Linux's bcma — the
@@ -1629,6 +1774,16 @@ fn s1_window_walk() {
                 cores, cc_ncores, (cores == cc_ncores) as u8,
                 if cores == 0 { "WALK-FAILED" } else { "WALK-OK" }, cc_type
             );
+
+            // ── WIFI-L0: reach the radio core itself. Uses the SAME selector (cfg:0x80) already
+            // written twice above and restored at Step 4; no other register is written. ──────────
+            match d11 {
+                Some(d) => d11_l0(bus, dev, func, bar0, d),
+                None => serial_println!(
+                    ":: wifi-l0: SKIPPED reason=no-d11-in-erom — the walk named no core id={:#05x}; the radio's backplane base is not known and this stage will not guess one ::",
+                    CORE_ID_80211
+                ),
+            }
         } else {
             serial_println!(
                 ":: bcma-s1: erom pointer={:#010x} — ChipCommon reports no usable EROM; core inventory not walked (chip type={}) ::",
@@ -1662,4 +1817,226 @@ fn s1_window_walk() {
         if window_confirmed { "CONFIRMED" } else { "REFUTED" },
         if restore_ok { "MATCH" } else { "FAILED" }, ev, eu
     );
+}
+
+// ── WIFI-L0: the d11 core's first reach ─────────────────────────────────────────────────────────
+//
+// `UNAOS_BCMAS1=1`, same knob and same block as S1. This stage adds **no new write target**: it
+// moves cfg:0x80 — the one selector S1 already writes twice and restores at Step 4 — onto the d11
+// core's backplane base, and reads. It writes no core register, no wrapper register and no other
+// config register. Enabling the core, releasing its reset, opening SHM or touching the radio are all
+// WRITES and all belong to S3 and later.
+//
+// ## Why the wrapper needs no write at all on this machine
+//
+// The wrapper aperture is BAR0's second 4 KiB and is selected by cfg:0xAC, which this arc does not
+// write. It does not have to: Boots AL/AM/AN show firmware leaving `cfg:0xAC = 0x18101000`, and the
+// EROM walk independently reports the d11 core's master wrapper at exactly `0x18101000`. So the
+// wrapper reads below are the RADIO's wrapper — but that is a claim with a check, and the check is
+// printed: the live cfg:0xAC value is compared against the EROM's wrap address, and when they differ
+// the wrapper stage REFUSES (naming cfg:0xAC) instead of reading someone else's agent registers and
+// calling them the radio's.
+//
+// ## What "reach" means here, and how it can fail
+//
+// Three independent facts have to line up, and each is its own line:
+//
+// 1. **The selector took.** cfg:0x80 reads back the d11 base. A config-level fact.
+// 2. **The agent answers, and agrees with the ROM.** The AI/aidmp wrapper's ARM identification
+//    block (0xFD0..0xFFC) carries a component-id preamble and a 12-bit part number. The preamble is
+//    a self-check on the offsets; the part number is the cross-check against the EROM's `id=0x812`.
+// 3. **The core answers, and it is the right kind of core.** `PHY_VER` (d11+0x3E0) decodes to a PHY
+//    type, and for a BCM4331 that type must be 7 (HT). This is the predicate `bcm4331.md` §S3
+//    already names, reached here one stage earlier than planned because the radio core arrives out
+//    of reset (Boots AL/AM/AN: `resetctl=0x00000000`, `ioctl=0x00002055`, core-enabled=1).
+//
+// A window read of `0xFFFFFFFF` refutes (1); a preamble mismatch refutes the transcription, not the
+// walk; a `phy_type != 7` would say the part is not what four boots have called it. Each is reported
+// as itself.
+#[cfg(feature = "bcmaS1")]
+fn d11_l0(bus: u8, dev: u8, func: u8, bar0: u64, d: D11) {
+    let dl = Deadline::new();
+    // Read cfg:0xAC LIVE rather than reusing S1's step-1 snapshot. Nothing in this file writes that
+    // register, so the two must be equal — which is exactly why reading it again costs nothing and
+    // why a witness that says "live" should not be quoting a value captured several stages earlier.
+    let live_win2 = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN2) };
+    serial_println!(
+        ":: wifi-l0: begin d11 id={:#05x} rev={} base={:#010x} wrap={:#010x}({}) — moving cfg:0x80 (the ONE selector S1 already writes and restores) onto the radio core; NO core register, NO wrapper register and NO other config register is written ::",
+        CORE_ID_80211, d.rev, d.base, d.wrap, d.wrap_kind
+    );
+
+    // ── 1. The selector. Same register, same proven path; restored by S1's Step 4. ───────────────
+    let want = d.base as u32;
+    unsafe { crate::arch::pci::write_config_32(bus, dev, func, CFG_BAR0_WIN, want) };
+    let win_now = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let win_ok = win_now == want;
+    serial_println!(
+        ":: wifi-l0: WROTE cfg:0x80 new={:#010x} readback={:#010x} took={} — BAR0+0 now decodes to the d11 core's register window ::",
+        want, win_now, win_ok as u8
+    );
+
+    // ── 2. The wrapper, reached WITHOUT writing cfg:0xAC — and only if it is provably the d11's. ──
+    let wrap_is_d11 = d.wrap != 0 && (live_win2 as u64) == d.wrap;
+    let mut agent_ok = false;
+    let mut dmp_part: u32 = 0;
+    let mut dmp_rev: u32 = 0;
+    let mut core_enabled = false;
+    if !wrap_is_d11 {
+        serial_println!(
+            ":: wifi-l0: REFUSED stage=wrapper reason=cfg0xac-elsewhere live-cfg:0xac={:#010x} erom-wrap={:#010x} reg=cfg:0xac(BCMA_PCI_BAR0_WIN2) — the wrapper aperture at bar0+{:#x} is NOT this core's agent; pointing it at the radio is a SECOND config write and this arc makes only the cfg:0x80 one. Reset state and the agent id block are UNREAD, not assumed ::",
+            live_win2, d.wrap, BAR0_WRAP_OFF
+        );
+    } else {
+        let wr_ioctl = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_IOCTL) };
+        let wr_iost = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_IOST) };
+        let wr_rstc = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_RESET_CTL) };
+        let wr_rsts = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_RESET_ST) };
+        let wrap_dead = wr_ioctl == ER_BAD && wr_iost == ER_BAD && wr_rstc == ER_BAD && wr_rsts == ER_BAD;
+        let clk = (wr_ioctl & IOCTL_CLK) != 0;
+        let fgc = (wr_ioctl & IOCTL_FGC) != 0;
+        let in_reset = (wr_rstc & RESET_CTL_RESET) != 0;
+        let gated = (wr_iost & IOST_GATED_CLK) != 0;
+        core_enabled = !wrap_dead && clk && !fgc && !in_reset;
+        serial_println!(
+            ":: wifi-l0: wrap cfg:0xac={:#010x} == erom-wrap {:#010x} (no cfg:0xac write needed): ioctl={:#010x} iost={:#010x} resetctl={:#010x} resetst={:#010x} clk={} fgc={} gated-clk={} in-reset={} core-enabled={} (Linux bcma_core_is_enabled) ::",
+            live_win2, d.wrap, wr_ioctl, wr_iost, wr_rstc, wr_rsts,
+            clk as u8, fgc as u8, gated as u8, in_reset as u8, core_enabled as u8
+        );
+
+        // The agent's ARM identification block. RAW first, in two lines of six dwords, so a decode
+        // bug can never hide the words it came from.
+        let mut idw = [0u32; DMP_ID_WORDS as usize];
+        let mut k = 0u64;
+        while k < DMP_ID_WORDS {
+            idw[k as usize] = unsafe { r32(bar0, BAR0_WRAP_OFF + DMP_ID_BASE + k * 4) };
+            k += 1;
+        }
+        serial_println!(
+            ":: wifi-l0: dmp-raw +0xfd0={:#010x} +0xfd4={:#010x} +0xfd8={:#010x} +0xfdc={:#010x} +0xfe0={:#010x} +0xfe4={:#010x} +0xfe8={:#010x} +0xfec={:#010x} +0xff0={:#010x} +0xff4={:#010x} +0xff8={:#010x} +0xffc={:#010x} ::",
+            idw[0], idw[1], idw[2], idw[3], idw[4], idw[5], idw[6], idw[7], idw[8], idw[9], idw[10], idw[11]
+        );
+        // PeripheralID0..3 at 0xFE0..0xFEC -> idw[4..8]; ComponentID0..3 at 0xFF0..0xFFC -> idw[8..12].
+        let pid0 = idw[4];
+        let pid1 = idw[5];
+        let pid2 = idw[6];
+        let cid0 = idw[8];
+        let cid1 = idw[9];
+        let cid2 = idw[10];
+        let cid3 = idw[11];
+        let preamble_ok = (cid0 & 0xFF) == CID0_PREAMBLE
+            && (cid1 & 0x0F) == CID1_PREAMBLE
+            && (cid2 & 0xFF) == CID2_PREAMBLE
+            && (cid3 & 0xFF) == CID3_PREAMBLE;
+        let cclass = (cid1 >> 4) & 0xF;
+        dmp_part = (pid0 & 0xFF) | ((pid1 & 0x0F) << 8);
+        dmp_rev = (pid2 >> 4) & 0xF;
+        let jep106 = ((pid1 >> 4) & 0xF) | ((pid2 & 0x7) << 4);
+        let id_match = dmp_part == CORE_ID_80211 as u32;
+        agent_ok = preamble_ok;
+        serial_println!(
+            ":: wifi-l0: dmp-decode preamble={} class={} part={:#05x} rev={} jep106={:#04x} jedec-used={} vs erom(id={:#05x} rev={}) id-match={} rev-match={} — offsets/fields are Broadcom aidmp.h + ARM PrimeCell, transcription UNVERIFIED against this part; a MISMATCH here indicts the transcription or Broadcom's use of the field, NOT the EROM walk, and is a finding to chase rather than a verdict ::",
+            if preamble_ok { "OK" } else { "MISMATCH" }, cclass, dmp_part, dmp_rev, jep106,
+            ((pid2 >> 3) & 1) as u8,
+            CORE_ID_80211, d.rev, id_match as u8, (dmp_rev == d.rev) as u8
+        );
+    }
+
+    // ── 3. The core window. Refused outright if the wrapper says the core is held in reset. ──────
+    let mut phy_ok = false;
+    let mut phy_type: u16 = 0xFFFF;
+    if !win_ok {
+        serial_println!(
+            ":: wifi-l0: REFUSED stage=core reason=selector-not-taken readback={:#010x} want={:#010x} — BAR0+0 does not decode to the d11 core, so nothing read there would be the radio ::",
+            win_now, want
+        );
+    } else if wrap_is_d11 && !core_enabled {
+        serial_println!(
+            ":: wifi-l0: REFUSED stage=core reason=core-not-enabled — the agent says this core is in reset or unclocked; its register window would read back nothing meaningful and taking it out of reset is a WRAPPER WRITE (bcma_core_enable), which is stage S3, not this arc ::"
+        );
+    } else {
+        if !wrap_is_d11 {
+            // The core reads below still happen — the selector is confirmed and BAR0+0 is the d11's
+            // window — but the reset state behind them was never read, so say so on its own line
+            // rather than letting the absence of a caveat imply the core was checked.
+            serial_println!(
+                ":: wifi-l0: NOTE stage=core reset-state=UNKNOWN — the agent was not reachable (above), so the reads below are taken WITHOUT knowing whether the core is out of reset; an all-ones window here is therefore ambiguous between 'dark core' and 'not decoding' ::"
+            );
+        }
+        // Every offset below is a status/identity register with no read side effect; the
+        // read-to-clear interrupt-reason words and the indirect SHM/radio ports are deliberately
+        // not touched (see the constant block).
+        let raw0 = unsafe { r32(bar0, 0) };
+        let macctl = unsafe { r32(bar0, D11_MACCTL) };
+        let irqmask = unsafe { r32(bar0, D11_GEN_IRQ_MASK) };
+        let hwen_hi = unsafe { r32(bar0, D11_RADIO_HWENABLED_HI) };
+        let hwen_lo = unsafe { r16(bar0, D11_RADIO_HWENABLED_LO) };
+        serial_println!(
+            ":: wifi-l0: core raw@+0x000={:#010x} macctl={:#010x} (enabled={} psm-run={} shm={} ihr={} big-endian={} awake={} gmode={}) irqmask={:#010x} hwen-hi={:#010x}(bit16={}) hwen-lo={:#06x}(bit4={}) ::",
+            raw0, macctl,
+            (macctl & MACCTL_ENABLED != 0) as u8, (macctl & MACCTL_PSM_RUN != 0) as u8,
+            (macctl & MACCTL_SHM_ENABLED != 0) as u8, (macctl & MACCTL_IHR_ENABLED != 0) as u8,
+            (macctl & MACCTL_BE != 0) as u8, (macctl & MACCTL_AWAKE != 0) as u8,
+            (macctl & MACCTL_GMODE != 0) as u8,
+            irqmask, hwen_hi, ((hwen_hi >> 16) & 1) as u8, hwen_lo, ((hwen_lo >> 4) & 1) as u8
+        );
+
+        // TSF is the d11 core's own free-running counter. Two samples of it are a CLOCK-LIVENESS
+        // reading that no identity register can give: if the low word advances between two reads
+        // taken microseconds apart, the core is not merely decoding, it is running. If it does not
+        // advance that is NOT a fault — the MAC may simply be disabled — so it is reported as a fact
+        // and not as a verdict.
+        let tsf_lo0 = unsafe { r32(bar0, D11_TSF_LOW) };
+        let tsf_hi0 = unsafe { r32(bar0, D11_TSF_HIGH) };
+        let tsf_lo1 = unsafe { r32(bar0, D11_TSF_LOW) };
+        let tsf_hi1 = unsafe { r32(bar0, D11_TSF_HIGH) };
+        let advanced = (tsf_hi1, tsf_lo1) != (tsf_hi0, tsf_lo0);
+        serial_println!(
+            ":: wifi-l0: tsf sample0={:#010x}:{:#010x} sample1={:#010x}:{:#010x} advanced={} — the d11 TSF counter; advanced=1 means the core is CLOCKED AND RUNNING, advanced=0 means only that the MAC is not counting (macctl above says whether it is enabled) and is not by itself a fault ::",
+            tsf_hi0, tsf_lo0, tsf_hi1, tsf_lo1, advanced as u8
+        );
+
+        // The crux read: PHY identity.
+        let pv = unsafe { r16(bar0, D11_PHY_VER) };
+        let analog = (pv & PHYVER_ANALOG) >> PHYVER_ANALOG_SHIFT;
+        phy_type = (pv & PHYVER_TYPE) >> PHYVER_TYPE_SHIFT;
+        let phy_rev = pv & PHYVER_VERSION;
+        phy_ok = pv != 0xFFFF && pv != 0x0000;
+        serial_println!(
+            ":: wifi-l0: phy-ver raw={:#06x} analog={} type={} ({}) rev={} expected-type={} (HT-PHY, the BCM4331's) type-match={} readable={} ::",
+            pv, analog, phy_type, phy_type_name(phy_type), phy_rev,
+            PHYTYPE_HT, (phy_type == PHYTYPE_HT) as u8, phy_ok as u8
+        );
+    }
+
+    // ── 4. REACH verdict — the three facts, named, and never collapsed into one bit silently. ────
+    let reached = win_ok && phy_ok && phy_type == PHYTYPE_HT;
+    serial_println!(
+        ":: wifi-l0: REACH verdict={} selector-took={} agent-answers={} agent-part={:#05x} phy-readable={} phy-type={} — the radio core is REACHED when the selector takes AND its PHY identity word decodes to the HT-PHY; anything less is named above rather than averaged into this line ::",
+        if reached { "REACHED" } else { "NOT-REACHED" },
+        win_ok as u8, agent_ok as u8, dmp_part, phy_ok as u8, phy_type
+    );
+    let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+    serial_println!(
+        ":: wifi-l0: end ok={} d11-rev={} dmp-rev={} phy-type={} wrote-cfg80=1 wrote-cfg-ac=0(audited) wrote-core-regs=0(audited) elapsed={}{} — next gate is FIRMWARE: a d11 MAC runs downloadable microcode, which this tree does not and will not carry (docs/MANIFESTO/CLEAN_ROOM_POLICY.md); see bcm4331.md S4 ::",
+        reached as u8, d.rev, dmp_rev, phy_type, ev, eu
+    );
+}
+
+/// b43 `B43_PHYTYPE_*`. `?` is an honest "not a type this file names"; the number is on the line.
+#[cfg(feature = "bcmaS1")]
+fn phy_type_name(t: u16) -> &'static str {
+    match t {
+        0 => "A",
+        1 => "B",
+        2 => "G",
+        4 => "N",
+        5 => "LP",
+        6 => "SSLPN",
+        7 => "HT",
+        8 => "LCN",
+        9 => "LCNXN",
+        10 => "LCN40",
+        11 => "AC",
+        _ => "?",
+    }
 }
