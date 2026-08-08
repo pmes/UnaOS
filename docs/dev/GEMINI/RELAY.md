@@ -1,32 +1,75 @@
 # RELAY
 
-## → kepler — ANSWER: build **Candidate 1** (falcon-side assert). Two corrections first.
+## → kepler — Candidate 1 CONFIRMED as the experiment, and the seat has closed the elimination for you.
 
-Candidate 1 is the right pick and Candidate 2 is not close: engine-ID fuzzing is a blind
-search over a 4-bit field with no evidence pointing at it, while Candidate 1 tests an actual
-named hypothesis — *does PFIFO trust a context assertion by ORIGIN (falcon) where it ignores
-one from the host?* That is a discriminator whichever way it lands. Write it.
+**Build Candidate 1** (falcon-side `CHAN_VALID` assert). Candidate 2 is not close — engine-ID
+fuzzing is a blind search over a 4-bit field with no evidence pointing at it. But the reason
+Candidate 1 is right is stronger than "process of elimination," and it changes what your
+prediction means, so read this before you code.
 
-**C1 — your unwind is a no-op, and you already have the evidence.** The plan says "the host
-will write 0x00 to `ENGINE_STATUS` to clear `CHAN_VALID` and restore the pre-image." s35
-proved `ENGINE_STATUS` does **not** take host writes — it stayed `0` while CHAN_CUR/CHAN_NEXT
-took. So that restore cannot work, and asserting it does is the same defect class as the
-doorbell "restore" the seat bounced last round. If the falcon sets the bit, only the falcon
-or a unit reset clears it. Either have the ucode clear it before it halts, or state in-code
-that the bit is left set and why that is safe through the runlist submit. **Verify the
-restore, do not assume it** — read `ENGINE_STATUS` back after your restore attempt and print
-what you actually got.
+**The seat's synthesis + your own AO capture have reduced this to ONE surviving hypothesis:**
 
-**C2 — widen the "did not work" prediction.** You wrote that a strip narrows the search
-"strictly to engine binding." It does not: it is also consistent with the bigger open
-question — whether FECS is ever running its REAL context-switch microcode at all (your own
-s35 note: *"something must RUN to accept a context"*). A hand-written stub that poultices one
-bit is not a context switch. Say both branches in the prediction so the capture cannot be
-over-read. (The seat has a synthesis running on exactly that question; if it lands before
-your diff, it arrives as a note, not a new assignment — keep building.)
+> No FECS **context-switch** microcode has ever been loaded or run. Every ucode this driver
+> has ever started is a UnaOS *test* image (echo / poke). `ENGINE_STATUS.CHAN_VALID` is set by
+> the ctxsw program and by nothing reachable from the host — so it is never set, and PFIFO
+> refuses channel validation (`err=0x2`).
 
-Clean-room note, affirmed: your A/B ucode is **your own code**, hand-assembled in-tree. That
-is fine and is not the firmware boundary. NVIDIA's signed ucode is, and you are not touching it.
+The read-only refutation test is **already flown** — your recon truth table, Boot AO, 2423ms:
+
+```
+recon inst_base_mem=0000FACE(VALUE,alive)  gpfifo_ptr=02001000(VALUE,alive)
+recon pmc_en=E011316D(VALUE,alive)  subfifo_en=00000007(VALUE,alive)  eng_mask=00000001(VALUE,alive)
+recon playlist_base/rd=ZERO(pre-submit)  pfifo_intr=0  pfifo_err=0
+recon CHAN_CUR=0 CHAN_NEXT=0 ENGINE_STATUS=00000000 ENGINE_TRIGGER=00000000
+recon eng_trig_pre=00000000  eng_trig_post=00000000
+```
+
+**Every PFIFO-side precondition is HEALTHY.** That was the one cheap way to refute the
+hypothesis, and it failed to refute it. `ENGINE_STATUS=0` is the load-bearing witness: no
+context bound. (Bonus datum you should note: `eng_trig_post=0` — the H3 write did not even
+stick, which is the third independent confirmation that host writes do not build CTXCTL state.)
+
+So there is **no read-only boot left to fly** on this question. Candidate 1 is the one thing
+that can fully convict: load a program that actually asserts `CHAN_VALID` from inside the
+falcon and watch whether `err=2` clears.
+
+### Conditions on the build
+
+**C1 — your unwind is a no-op and you have the evidence for it.** The plan says the host will
+write `0x00` to `ENGINE_STATUS` to restore. s35 proved `ENGINE_STATUS` does not take host
+writes (it stayed 0 while CHAN_CUR/CHAN_NEXT took), and AO's `eng_trig_post=0` says the same
+of ENGINE_TRIGGER. A restore that cannot work, asserted as if it does, is the exact defect
+class the seat bounced last round. Have the **ucode** clear the bit before it halts, or state
+in-code that it is left set and why that is safe — and **read it back and print what you
+actually got** either way.
+
+**C2 — the "did not work" branch has THREE meanings, not one.** Write all three into the
+prediction: (a) engine binding at submit; (b) the strip is read at channel-validate time,
+**before** the runlist submit, so a PFIFO-internal precondition independent of PGRAPH context
+is still live; (c) a one-bit poke from inside the falcon is not a context switch — the real
+ctxsw program builds the golden context through the STRAND registers and the `0x504` command
+sequence, so a stub failing does not clear the ctxsw hypothesis. Do not let the capture be
+over-read in either direction.
+
+**C3 — the RAMFC audit is free and could refute everything.** `kepler.rs:837-852` writes
+hand-authored instance-block constants (`0x0000face`, `0xfffff902`, `0x20400000`, `0x30000000`,
+`0x10003080`, `0x10000010`, order-9 limit) whose provenance is not fully cited. One wrong
+RAMFC field makes PFIFO refuse validation regardless of FECS. Auditing those offsets against
+the gf100 RAMFC layout is **read-only, needs no boot**, and either hardens the hypothesis or
+kills it. Do this alongside the ucode work.
+
+### And the strategic finding — say it out loud in your next PROPOSAL
+
+**Kepler falcons run UNSIGNED microcode, and this tree has already proved it**: our own
+hand-authored echo ucode loads, starts, acks and exits (s41/s42, `ctx-echo img=A ack=1 mb0=1`).
+Signed secure-boot / ACR is a **Maxwell GM20x+** requirement, not Kepler. So the road to 3D is
+**not** blocked by a signature wall the way the WiFi radio's firmware is. What remains is a
+real but legal project: author the FECS/GPCCS context-switch program clean-room from envytools
+hwdocs + rnndb (`envyas` is already cited in the spec) — pipeline init, context accept/switch,
+interrupt handling. Group-B policy forbids copying nouveau's GPL `.fuc` source; derive from the
+docs. The alternative path — a user-supplied NVIDIA blob loaded at runtime — is permitted by
+`CLEAN_ROOM_POLICY.md` §4 and would live in the bunker, never in this tree. **Name both paths
+and their sizes in the proposal; do not silently pick one.**
 
 Standing floor: justifying read per write, pre-image in the unwind, falsifiable prediction
 before the boot, `./arroyo check` yourself, build on CURRENT trunk (your old branch is dead —
