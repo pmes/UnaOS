@@ -1477,6 +1477,12 @@ pub struct Probe {
     /// reading there — see [`clean_invalidate_surface`].
     civac_us: u64,
     t0: u64,
+    /// GR21/WCD-OCC — the boxes of every window ABOVE this one as of the blit (`begin` time). Unioned
+    /// in [`end`] with a read-back-time snapshot, so a mismatching probe a higher window legitimately
+    /// owns is counted `occluded=`, not `fbbad`. x86 only — see [`super::wm::OccSnap`] for why the
+    /// field is off the aarch64 wire that `pi4-regression.spec` reads.
+    #[cfg(target_arch = "x86_64")]
+    occ_before: super::wm::OccSnap,
 }
 
 // ---- WC-G/M3 — the glass read-back, and paying for it as it is used ----------------------------
@@ -1509,11 +1515,20 @@ fn readback(
     stride: usize,
     scale: usize,
     step: usize,
-) -> (usize, usize, usize) {
+    #[cfg(target_arch = "x86_64")] occ_before: super::wm::OccSnap,
+    #[cfg(target_arch = "x86_64")] occ_after: super::wm::OccSnap,
+) -> (usize, usize, usize, usize) {
     let mut checked = 0usize;
     let mut bad = 0usize;
+    // GR21/WCD-OCC — probes that mismatch AND lie under a higher window. Charged to neither `bad`
+    // nor the verdict: a higher window legitimately owns the destination probe. Always 0 on aarch64
+    // (the return slot is fixed so the call site does not fork on arity); the field is off its wire.
+    #[cfg(target_arch = "x86_64")]
+    let mut occluded = 0usize;
+    #[cfg(not(target_arch = "x86_64"))]
+    let occluded = 0usize;
     if x >= pw || y >= ph || scale == 0 || stride < 4 || step == 0 {
-        return (bad, checked, step);
+        return (bad, checked, step, occluded);
     }
     let cols = (pw - x).div_ceil(scale).min(w).min(stride / 4);
     let rows = (ph - y).div_ceil(scale).min(h).min(surf_len / stride);
@@ -1558,13 +1573,30 @@ fn readback(
             if let Some(got) = got {
                 checked += 1;
                 if got != want {
-                    bad += 1;
+                    // GR21/WCD-OCC — attribute to an occluder before charging `fbbad`. A probe
+                    // covered by the pre-blit OR the read-back occluder set is a pixel a higher
+                    // window owns, exactly the `[wc-d]` treatment. Reached only on a probe that
+                    // already disagrees, so a clean pass pays nothing.
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if occ_before.covers(x + col * scale, dy)
+                            || occ_after.covers(x + col * scale, dy)
+                        {
+                            occluded += 1;
+                        } else {
+                            bad += 1;
+                        }
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        bad += 1;
+                    }
                 }
             }
             col += step;
         }
     }
-    (bad, checked, step)
+    (bad, checked, step, occluded)
 }
 
 /// WC-G/M3 (x86 only) — a one-word window over the WC-mapped glass, so a destination row's probes
@@ -2098,6 +2130,36 @@ fn coverage_note(_step: usize) -> &'static str {
     ""
 }
 
+/// GR21/WCD-OCC — the `occluded=N occ=n0/n1` field, inserted between `coverage=` and `us=`. A Display
+/// shim rather than a `&str` because the values are dynamic, mirroring `wm::BandFmt`; a zero-cost
+/// verdict pays no allocation it could fail. On x86 it prints the probes a higher window owned and
+/// the two snapshot box-counts (pre-blit / read-back); on aarch64 it is a unit that writes NOTHING,
+/// which is what keeps the `[wc-g]` wire `pi4-regression.spec` reads byte-identical. See
+/// [`super::wm::OccSnap`] for why the arch gate is a wire boundary.
+#[cfg(target_arch = "x86_64")]
+struct OccNote {
+    occluded: usize,
+    n0: usize,
+    n1: usize,
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+struct OccNote;
+
+#[cfg(target_arch = "x86_64")]
+impl core::fmt::Display for OccNote {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, " occluded={} occ={}/{}", self.occluded, self.n0, self.n1)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+impl core::fmt::Display for OccNote {
+    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        Ok(())
+    }
+}
+
 /// PAYGO — the rollup's policy marker, inserted after `scope=window`. The pi4 gate matches
 /// `scope=window ` with a trailing space so its pattern cannot match `scope=window-band`; an
 /// insertion after the key preserves that, and the empty string preserves the line exactly.
@@ -2254,7 +2316,13 @@ fn paygo_complete(_id: u32, _i: usize) {}
 /// immediately after `draw_window` returns, and with nothing in between: the `after` checksum's
 /// meaning is "the surface as it stood when the copy finished", and any work inserted between the
 /// two widens the window it measures.
-pub fn begin(id: u32, surf: usize, surf_len: usize, compat: bool) -> Option<Probe> {
+pub fn begin(
+    id: u32,
+    surf: usize,
+    surf_len: usize,
+    compat: bool,
+    #[cfg(target_arch = "x86_64")] occ_before: super::wm::OccSnap,
+) -> Option<Probe> {
     let i = id as usize;
     if compat || surf == 0 || surf_len == 0 || i >= IDS {
         return None;
@@ -2299,6 +2367,10 @@ pub fn begin(id: u32, surf: usize, surf_len: usize, compat: bool) -> Option<Prob
         cks_civac,
         cks_blit_us,
         civac_us,
+        // GR21/WCD-OCC — a plain move of a `Copy` value the caller already computed; no clock-relevant
+        // work, and above the `t0` assignment so the ordering law below is untouched.
+        #[cfg(target_arch = "x86_64")]
+        occ_before,
         // LOAD-BEARING ORDERING: the clock starts AFTER the `civac` re-read, and must stay there.
         // `clean_invalidate_range` drops every line of the surface, and the `cks_civac` checksum
         // immediately re-reads all of it — which is precisely what re-warms the source for the blit
@@ -2323,7 +2395,17 @@ pub fn begin(id: u32, surf: usize, surf_len: usize, compat: bool) -> Option<Prob
 /// walks EXACTLY the pixels the blit wrote — a witness that recomputed the bounds could disagree
 /// with the blit about which pixels exist and report that disagreement as a defect.
 #[allow(clippy::too_many_arguments)]
-pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, stride: usize, scale: usize) {
+pub fn end(
+    p: Probe,
+    fb: &FrameBuffer,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    stride: usize,
+    scale: usize,
+    #[cfg(target_arch = "x86_64")] occ_after: super::wm::OccSnap,
+) {
     let us = cycles_to_us(now_cycles().saturating_sub(p.t0));
     // WC-G/M1 — `us=` above is computed FIRST and from `p.t0` alone, exactly as it always was. Every
     // phase clock below starts after it, so no profiling read can enter the timing verdict's bracket.
@@ -2356,7 +2438,14 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
     // `step_eff` is what the walk ACTUALLY used — `readback` collapses the lattice on a rect narrower
     // than its own step — and it is what the `coverage=` marker below is derived from, so the wire
     // reports the pass that ran rather than the pass that was requested.
-    let (bad, checked, step_eff) =
+    // GR21/WCD-OCC — on x86 the read-back excuses probes a higher window owns and returns their
+    // count as a fourth element; aarch64 keeps the three-element return and its byte-identical wire.
+    #[cfg(target_arch = "x86_64")]
+    let (bad, checked, step_eff, occluded) = readback(
+        fb, p.surf, p.surf_len, pw, ph, x, y, w, h, stride, scale, step, p.occ_before, occ_after,
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let (bad, checked, step_eff, _) =
         readback(fb, p.surf, p.surf_len, pw, ph, x, y, w, h, stride, scale, step);
     let readback_us = cycles_to_us(now_cycles().saturating_sub(tp2));
 
@@ -2404,13 +2493,23 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
     let n = W_SAMPLES[w].fetch_add(1, Ordering::Relaxed) + 1;
     W_MAXUS[w].fetch_max(us, Ordering::Relaxed);
 
+    // GR21/WCD-OCC — the `occluded=`/`occ=` field, built here so the serial_println below stays a
+    // single shared call across arches. `OccNote` writes nothing on aarch64, so that wire is
+    // byte-identical; x86 carries the excused-probe count and the two snapshot box-counts.
+    #[cfg(target_arch = "x86_64")]
+    let occ_note = OccNote { occluded, n0: p.occ_before.count(), n1: occ_after.count() };
+    #[cfg(not(target_arch = "x86_64"))]
+    let occ_note = OccNote;
+
     serial_println!(
         // WC-G/M3 — `coverage=` is an INSERTION between `fbbad=` and `us=`, which is what the pi4
         // gate's `\[wc-g\] win=.* fbbad=.* slow=.* ->` permits: nothing renamed, nothing reordered,
         // the terminal still terminal. It is the empty string on every build but an x86 `wcg-paygo`
         // one, so those lines are byte-identical to the ones this module printed before M3. See
         // [`coverage_note`] for why a sampled pass may not print a bare `fbbad=0/…`.
-        "[wc-g] win={} seq={} own={} scale={}x app={:#018x} blit={:#018x} civac={:#018x} after={:#018x} fbbad={}/{}{} us={} rectscan_us={} slow={} -> {}",
+        // GR21/WCD-OCC — `occluded=`/`occ=` is a second such insertion, in the SAME window (between
+        // `coverage=` and `us=`, still inside the pi4 pattern's `.*`), and empty on aarch64.
+        "[wc-g] win={} seq={} own={} scale={}x app={:#018x} blit={:#018x} civac={:#018x} after={:#018x} fbbad={}/{}{}{} us={} rectscan_us={} slow={} -> {}",
         p.id,
         p.seq,
         if p.own { "yes" } else { "no" },
@@ -2422,6 +2521,7 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
         bad,
         checked,
         coverage_note(step_eff),
+        occ_note,
         us,
         rectscan_us,
         if slow { "yes" } else { "no" },
