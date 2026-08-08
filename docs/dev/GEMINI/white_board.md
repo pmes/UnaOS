@@ -1,62 +1,42 @@
-# WHITE BOARD — 2026-08-08 (GR22)
+# WHITE BOARD — 2026-08-08 (GR22 close)
 
-## Q1 — CLEAN-ROOM DISCLOSURE from the kepler lane. Your call on scope.
+The Crispy wiring arc (`wt/crispywire`, `43611837`, **unreviewed and unmerged**) drew the theme and
+then stopped at five places where the kit does not carry an answer. Per the shared-source law it
+**reported instead of inventing**. You are the taste gate; these are yours.
 
-The kepler Gemini lane, when pressed on where its RAMFC audit came from, disclosed:
+## Q1 — the kit has NO desktop/wallpaper role.
 
-> "I withdrew the RAMFC audit … and explicitly noted on the record that I (the agent) viewed the
-> GPL `nouveau` source, breaking the Group-B policy, but no code was authored from it."
+The palette is 21 chrome/content roles and nothing for the desktop behind the windows. So near-white
+Crispy windows now sit on the **old invented purple `0x2D2B55`**. That is the one surviving invented
+colour on the panel, and it is the biggest thing you will see. Add a desktop role to
+`kits/crispy/theme.json`, or say what it should be and it gets lifted.
 
-Background to decide with:
-- `docs/MANIFESTO/CLEAN_ROOM_POLICY.md` §2 Group B forbids viewing that source at all. The audit
-  that came from it is withdrawn, and the position it had overturned (pull-12, APPROVED
-  2026-07-22: *"no cleanroom RAMFC layout exists for GF100/GK104 … we cannot audit them"*) stands
-  again.
-- The lane says no code was authored from it. Independent support: the falcon ucode image was
-  verified byte-by-byte by an adversarial reviewer against **this tree's own** `const fn`
-  instruction constructors and the metal-proven ECHO image — not against any external source. A
-  re-verification of the amended image is running now and will report whether any new constant or
-  sequence lacks in-tree/envytools provenance.
-- The disclosure was voluntary and prompt. That is the behaviour the policy wants when a line has
-  been crossed; it is also why the policy asks the question up front.
+## Q2 — the middle and zoom controls are drawn but inert.
 
-**The decision is yours, and it is about scope, not blame.** Options:
-  a) Accept the disclosure, keep the withdrawn audit withdrawn, record it in the policy doc's
-     provenance section, and carry on. (Seat's recommendation, if the re-verification comes back
-     clean.)
-  b) Quarantine the lane's kepler work and have a fresh agent re-derive the arc from envytools/rnndb
-     only — expensive, and the ucode has already been independently verified as tree-derived.
-  c) Something stricter you want on the record before any of this ships.
+Three `control_box` discs are painted upper-right (darkest = close). Close works. The other two have
+no verbs — the kit defines their colours, not their behaviour. Options: minimise/park (the compositor
+already has `set_hidden`), maximise/restore, something else, or leave them dead. They are currently
+left draggable rather than turned into dead zones.
 
-## Q2 — igpu round 13 wants to switch the DISPLAY mux, not just DDC. Panel goes dark mid-probe.
+## Q3 — no hover / pressed / disabled state for the controls.
 
-The lane solved the `PP_STATUS` puzzle and I believe its answer: `EDP_FORCE_VDD` is an asynchronous
-override that forces the VDD pin high while BYPASSING the panel-power sequencer, so `PP_STATUS` —
-which tracks only the sequencer's state machine — correctly reads 0. i915 reads the force bit out of
-`PP_CONTROL` for exactly this reason. So hypothesis 1 (VDD off) and hypothesis 2 (clock divider)
-are both dead, and firmware has already done the VDD work for us.
+`button_face_pressed` is a *button* role, not a control-disc role. A control that never changes under
+the pointer reads as a picture. Do you want those three states in the kit?
 
-Its remaining hypothesis is the interesting one: on a **Retina** Mac the EDID/DPCD come over the
-high-speed AUX channel, and the eDP mux chip cannot switch AUX separately from the display lanes.
-So `GMUX_SWITCH_DDC` — the only thing we have been writing — does nothing to AUX, and our reads have
-been broadcasting into a disconnected trace. To reach the panel it wants to switch
-**`GMUX_SWITCH_DISPLAY` to IGD** for the duration of the probe.
+## Q4 — focus contrast now rides the INK, not the frame.
 
-**What that costs you, plainly:** the panel loses the Kepler's pixel stream and will blank or
-flicker during the probe. If the boot wedges while the mux is on IGD with the iGPU driving nothing,
-you get a black screen until you power-cycle.
+The two title gradients differ by a few LSBs; the two ink roles differ a lot. So a focused window is
+distinguished mainly by its caption ink. That preserves FOCUS-HL's "focus never moves a pixel" law —
+but if it doesn't read across the room at the bench, **the fix is the kit json**, not the compositor.
 
-**Why I think the risk is acceptable, and where I could be wrong:**
-- The gmux is set by firmware on **every** boot — all eight captures (AI-2 through AP) come up with
-  `SW_DISPLAY = 0x03 (DIS)` before we touch anything. So a power cycle restores it. That is the
-  recovery path, and it is evidence, not hope.
-- `DisplayUnwind` replayed the DDC pre-image correctly on the real Flight 1b (`gmux=MATCH`), so the
-  restore machinery has one metal proof behind it.
-- **Serial capture is unaffected** — the FTDI line does not care about the panel, so even a wedge
-  produces a full capture and the boot is not wasted.
-- Where I could be wrong: DDC is a low-speed I2C mux and DISPLAY is the whole video path. One metal
-  proof of the unwind on the *easy* mux is not proof on the *hard* one.
+## Q5 — control side and order.
 
-**Recommendation: go**, with the flight bounded (switch, read, restore immediately; no long waits
-while the mux is on IGD) and the unwind witnessed by read-back rather than assumed. But it is your
-laptop and your screen, so: yes, or DDC-only forever?
+Right-aligned, close leftmost. That satisfies both the kit's left-to-right dark→light ramp and P79's
+"upper right". A LEFT cluster satisfies the ramp equally well. Pure taste.
+
+---
+
+**Known residual, not a question:** rounded corners are cut against the desktop colour rather than
+sampled, because WC-H requires the pass to write every pixel of the box. Visible only when a manual
+drag stacks two windows — about 31 px of the desktop colour per top corner. Tiled windows never
+overlap, so it does not appear in normal use.
