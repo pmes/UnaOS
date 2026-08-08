@@ -427,7 +427,25 @@ pub unsafe fn map_user_page(va: u64, phys: u64, writable: bool, nx: bool) {
 // new region must be mirrored into every live slot PML4 (or force a rebuild).
 
 /// Number of concurrent per-process address spaces. Hard cap — a STOP tripwire, like M6d's 8.
-pub const USER_SLOTS: usize = 8;
+///
+/// HEADROOM (Boot AL, rMBP) — raised 8 -> 12. Boot AL showed the machine refusing work it had the
+/// RAM to do: with the desktop app resident, `storm` fleets capped at 5 because `MAX_PROCS = 6` sits
+/// under `MAX_PROCS <= USER_SLOTS - 2`, and the slot pool was the term that pinned it. 12 slots put
+/// `MAX_PROCS` at 10 with the SAME 2-slot reserve intact, which is 8 vugs + the desktop app + one
+/// foreground `run`, i.e. the fleet an operator actually asks for plus a margin.
+///
+/// WHAT ONE MORE SLOT COSTS. A slot is `USER_STATIC_SIZE` (0x85000 = 544 KiB) of `.bss` backing plus
+/// four 4 KiB page tables (PML4/PDPT/PD/PT) = 548 KiB. 8 -> 12 is therefore +2.14 MiB of `.bss`
+/// (4.28 MiB -> 6.42 MiB) on a machine with GiBs; the pool is `.bss` (NOBITS), so the boot image on
+/// the ESP does not grow by a byte. Nothing else scales with the count: the per-slot sidecars in
+/// `arch::syscall` (`SLOT_USED`/`SLOT_GEN`/`SLOT_DETACHED`/`SLOT_HIDDEN`/the input rings) are all
+/// written `[_; USER_SLOTS]` or `[_; USER_SLOTS + 1]` and widen with this line, and every sweep over
+/// the pool is a `0..USER_SLOTS` scan of at most 12 iterations off the fast path.
+///
+/// STILL a STOP tripwire, and still not a knob: it is raised HERE, with the `MAX_PROCS` block and
+/// the `storm` clamp recomputed against it in the same change. A blind bump of this line alone
+/// leaves the process table — not the pool — as the ceiling, and says nothing about the reserve.
+pub const USER_SLOTS: usize = 12;
 /// Pages in a user window: code, data, and two stack pages. MUST match `syscall::USER_WINDOW_PAGES`.
 const U3_WINDOW_PAGES: usize = 4;
 pub const PAGE_4K: u64 = 0x1000;
@@ -472,9 +490,20 @@ impl PageTable {
 
 /// WINX-1: the read-only geometry page (1 page), at `USER_BASE + 0x4000`.
 pub const FB_INFO_SIZE: usize = 0x1000;
-/// WINX-1: window surface slots per address space. Matches the compositor's fixed window table
-/// (`video::wm::MAX_WINDOWS`) and `syscall::WIN_MAX`. STOP tripwire: like `USER_SLOTS` this cap is
-/// deliberate — do not raise it for a demo.
+/// WINX-1: window surface slots per address space — how many windows ONE process may hold open at
+/// once (`-EMFILE` past it). STOP tripwire: like `USER_SLOTS` this cap is deliberate — do not raise
+/// it for a demo.
+///
+/// HEADROOM: this used to be asserted EQUAL to `syscall::WIN_MAX` and to `video::wm::MAX_WINDOWS`,
+/// which read as if the three were one number. They are three different questions, and the arc that
+/// raised the global tables (WIN_MAX 8 -> 12, MAX_WINDOWS 8 -> 12) separated them rather than
+/// dragging this one along: the GLOBAL window count had to grow because `MAX_PROCS` did (10 programs
+/// must each be able to own a window, alongside the console), but PER-PROCESS nothing changed — no
+/// shipped program opens more than one window, and 8 is already 8x that. Keeping this at 8 is what
+/// stops the raise from costing 12 slots x 4 extra 64 KiB surface reservations (+3 MiB of `.bss`)
+/// for capacity nothing asks for. The remaining invariant is the SAFE direction and is asserted at
+/// `syscall::WIN_MAX`: `FB_WIN_SLOTS <= WIN_MAX`, since a region slot is indexed per address space
+/// and a global id is not.
 pub const FB_WIN_SLOTS: usize = 8;
 /// WINX-1: VA reserved per window surface slot — 64 KiB = 16 pages = a 128x128 ARGB8888 surface.
 pub const FB_WIN_SLOT_SIZE: usize = 0x1_0000;
@@ -489,8 +518,10 @@ pub const FB_INFO_OFF: usize = U3_WINDOW_PAGES * 4096; // 0x4000
 pub const FB_SURFACE_OFF: usize = FB_INFO_OFF + FB_INFO_SIZE; // 0x5000
 
 /// WINX-1: total per-slot backing — the 16 KiB program window plus the FB hole. Mirrors aarch64's
-/// `USER_STATIC_SIZE` (0x85000). 8 slots of this is ~4.25 MiB of `.bss`, the price of a static pool
-/// with no user-memory allocator; a real allocator is the same later arc `USER_SLOTS` is waiting on.
+/// `USER_STATIC_SIZE` (0x85000). HEADROOM: 12 slots of this is ~6.4 MiB of `.bss` (it was ~4.25 MiB
+/// at 8 slots), the price of a static pool with no user-memory allocator; a real allocator is the
+/// same later arc `USER_SLOTS` is waiting on. The per-slot figure is UNCHANGED by that raise because
+/// `FB_WIN_SLOTS` stayed at 8 — see its doc for why the global window count grew and this did not.
 const USER_STATIC_SIZE: usize = U3_WINDOW_PAGES * 4096 + FB_REGION_SIZE;
 const _: () = assert!(USER_STATIC_SIZE == 0x85000);
 /// The whole region must fit the ONE per-slot PT (512 * 4 KiB = 2 MiB), or the FB leaves would spill

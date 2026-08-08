@@ -1002,9 +1002,12 @@
     the shell, and therefore `kill`, must be unreachable never.)
   - **`jobs` is the SOLE reaper**: a bg row stays claimed after exit (`PEXITED`, `done` posted) until
     `bg_poll(reap=true)` consumes the permit and frees it — bounded and honest (a shell that never reaps
-    eventually reads "process table full", not silent loss). The shell records jobs in a bounded 8-slot
-    table (8 — headroom over the true ceiling, the Proc table's **MAX_PROCS = 6**, which binds first: 6 bg
-    jobs, or 5 alongside one foreground `run`); a spawn the table cannot record is killed, not leaked.
+    eventually reads "process table full", not silent loss). The shell records jobs in a bounded
+    `BG_JOBS` table — deliberately headroom over the true ceiling, the Proc table's **MAX_PROCS**, which
+    binds first: on aarch64 that is 6 bg jobs, or 5 alongside one foreground `run`; a spawn the table
+    cannot record is killed, not leaked. (`BG_JOBS` is arch-neutral and went 8 → 12 at **HEADROOM**,
+    following x86's `MAX_PROCS` to 10; on aarch64 the extra rows can never be claimed. See
+    `scheduler.md`, "Fleet headroom, x86".)
   - **The capacity, and why it is 6 (`PROCS-6`).** The cap was 4; it is 6 so the operator can fill the
     panel with background vugs. Nothing else moved, because every consumer of the cap is parametric —
     the reserve/free/find/census sweeps are `0..MAX_PROCS`, reap accounting is per-row CAS, and both
@@ -1014,8 +1017,9 @@
     spaces (so 6 live bg programs still leave 2 for a foreground `run` and for the launcher fixtures'
     scratch tenancies — this headroom is the reason the cap is 6 and not 8, which would make the Proc
     table and the slot pool exhaust together and disguise every slot-pressure failure as a table-full
-    one), `wm::MAX_WINDOWS` = 8 compositor rows (only EL0 programs mint windows; the shell console is
-    desktop-level, so 6 windowed bg programs fit with room over), and the shell's 8-slot `BG_JOBS`.
+    one), `wm::MAX_WINDOWS` compositor rows (only EL0 programs mint windows; the shell console is
+    desktop-level, so 6 windowed bg programs fit with room over — that constant is arch-neutral and went
+    8 → 12 at HEADROOM, which on aarch64 only widens the margin), and the shell's `BG_JOBS`.
     The first two are now compile-time assertions beside the constant rather than prose (the slot one
     as `MAX_PROCS <= USER_SLOTS - 2`, the margin the sentence above actually promises — a bare `<`
     would have permitted 7, satisfying the letter while starving exactly those two callers).
@@ -1346,10 +1350,12 @@
   `[skill] killed … confirmed=1` line ever reached the wire for them; the relaunched programs showed an
   **empty window** even though their creation blit byte-verified `PASS`; and once four such rows had piled
   up, `bg` refused **every** further launch with `process table full`. Three faces, one fault.
-  - **The chain, end to end.** `THREAD_TABLE` (`syscall.rs`) is **global** and holds `NTHREAD = 8` rows for
-    the whole machine, and a row is released *only* by the owning program's own voluntary
+  - **The chain, end to end.** `THREAD_TABLE` (`syscall.rs`) is **global** and holds `NTHREAD` rows for
+    the whole machine — **8 on aarch64**, raised to **24 on x86 at HEADROOM** — and a row is released
+    *only* by the owning program's own voluntary
     `SYS_THREAD_JOIN`. A program that is **killed** never reaches its joins, so it leaks every row it
-    holds, permanently. `user-vug` spawns two workers, so **four killed vugs exhaust the table**; from then
+    holds, permanently. `user-vug` spawns two workers, so on an 8-row table **four killed vugs exhaust
+    it**; from then
     on every `SYS_THREAD_SPAWN` returns `-EAGAIN`. vug does not check that return (its handles are used
     only for the join), so the next launch runs with **no workers**, its `DONE` word never reaches 2, and
     its per-frame barrier blocks in `futex_wait` **forever — before its first `SYS_WIN_PRESENT`**. That is
@@ -2823,6 +2829,17 @@
     bucket a wake visits, never any value that reaches a surface.
 
 ### x86_64 (branch `hw-rmbp`)
+
+- **HEADROOM** — the ring-3 ceilings, raised coherently (Boot AL). `USER_SLOTS`
+  8 → 12, `MAX_PROCS` 6 → 10, `NTHREAD` 8 → 24, `WIN_MAX` 8 → 12,
+  `wm::MAX_WINDOWS` 8 → 12, `sched::NFUTEX` 16 → 64, `shell::BG_JOBS` 8 → 12;
+  `FB_WIN_SLOTS` deliberately stays 8. The `MAX_PROCS <= USER_SLOTS - 2` reserve
+  is preserved at equality, so none of the new capacity was bought from the
+  margin a foreground `run` depends on. What it buys: **8 vugs all with
+  `workers=2`** alongside the resident desktop app, instead of 5 vugs of which
+  only 4 got workers. The full ledger — which cap bit, why each dependent had to
+  move with it, the RAM cost, and the recomputed `storm` arithmetic — is in
+  [`scheduler.md`](scheduler.md), "Fleet headroom, x86".
 
 - **U1a** — first ring-3 round-trip (the x86 mirror of aarch64 M6a). A
   scheduled task drops to **ring 3** via `iretq` (`sched::spawn_user` /
