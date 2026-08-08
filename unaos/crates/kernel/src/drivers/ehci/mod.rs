@@ -118,6 +118,13 @@ struct IntEp {
     /// CLICK-1: previous report's button bitmask, for button-DOWN edge detection (one
     /// `pal::Event::Button` per press, nothing on release/hold).
     prev_buttons: u8,
+    /// EHCI-KEYUP: the PREVIOUS boot-keyboard report's six keycode slots (bytes 2..8), the state
+    /// [`decode_boot_keyboard`] diffs the current report against to synthesise release edges. Per
+    /// ENDPOINT rather than global because a machine can carry more than one keyboard interface and
+    /// each reports its own full pressed-key set; a shared array would let one keyboard's report
+    /// manufacture releases for another's held keys. All zeros = nothing held (the idle report), which
+    /// is also the correct initial value: before the first report there is nothing to release.
+    kbd_prev_keys: [u8; 6],
     /// CLICK-3: `arch::ms()` at the previous report consumed on THIS endpoint (any report — motion,
     /// button, or idle keep-alive). The re-press recovery below reads the SILENCE between reports,
     /// so it must be stamped by every report, not only by button ones. 0 = no report yet.
@@ -2077,6 +2084,7 @@ impl Controller {
             reports: 0,
             dead: false,
             prev_buttons: 0,
+            kbd_prev_keys: [0; 6],
             last_report_ms: 0,
             // KBDWIT: stamp the silence clock's origin at the moment the endpoint becomes armed —
             // i.e. after the QH is linked and PSE is on, so the interval this witness measures is
@@ -2324,7 +2332,12 @@ impl Controller {
                         }
                     }
                 } else if e.is_kbd {
-                    decode_boot_keyboard(report);
+                    // EHCI-KEYUP: the decoder now carries the previous report's keycodes so it can
+                    // emit release edges. `report` is built from `e.buf` through `from_raw_parts`, a
+                    // raw pointer with no borrow of `e`, so handing the decoder `&mut e.kbd_prev_keys`
+                    // alongside it is not an aliasing violation — the buffer and the diff state are
+                    // disjoint memory.
+                    decode_boot_keyboard(report, &mut e.kbd_prev_keys);
                     if e.reports == 1 || e.reports % 32 == 0 {
                         serial_println!(
                             ":: EHCI-HID: [{}] kbd {} reports, last {:02x} {:02x} .. == witness ::",
@@ -2926,24 +2939,97 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
 /// Boot-keyboard report decode — the same layout, scancode table, and Event delivery as the
 /// xHCI keyboard path (xhci mod.rs event dispatch), so a key is a key whichever controller
 /// carried it. Table shared via pub(crate) rather than duplicated.
-unsafe fn decode_boot_keyboard(report: &[u8]) {
+///
+/// EHCI-KEYUP — THIS PATH NOW SYNTHESISES RELEASES, WHICH IS THE HALF IT WAS MISSING.
+///
+/// Boot AJ (`aj-lockout-forensics.md`, Defect 2a) is what a decoder that emits presses only costs:
+/// the rMBP's INTERNAL keyboard is on EHCI, so on that machine no ring-3 app had ever received a
+/// single `INPUT_EV_KEY_UP`. `user-vug` clears a held bit only on a release, so the first SPACE
+/// latched pause on permanently and the arrow/WASD held bits latched with it — the operator's
+/// "the vug froze". The xHCI decoder has always synthesised releases; this is the same logic, and
+/// it is deliberately a MIRROR rather than a variation, so a key behaves identically whichever
+/// controller carried it.
+///
+/// THE DIFF. A USB boot report is a LEVEL, not an edge: bytes 2..8 carry the FULL set of keycodes
+/// currently down (6-key rollover), so any keycode present in the previous report and absent from
+/// this one was released. `prev_keys` carries that previous set per endpoint and is rewritten here.
+/// The press loop is untouched — `Key(ascii)` still fires for every keycode in every report, so a
+/// device that re-reports while a key is held keeps producing the natural repeats every existing
+/// consumer already sees.
+///
+/// WHY A MISSED RELEASE CANNOT STRAND A KEY HERE. `service_ehci_hid` arms one transfer per service
+/// pass and is polled at frame rate, so reports the device sends between passes are simply never
+/// fetched — the CLICK-3 note above is about exactly that. It cannot cost a release: after a key
+/// comes up the reported level STAYS up-with-nothing-down, so the next report the driver does fetch
+/// carries the released set and the diff fires then. (This is the property the pointer path lacks,
+/// because a button's level can go down again before the next poll.)
+///
+/// MODIFIERS GET NO KeyUp, matching xHCI exactly. `report[0]` is a bitmask, not a keycode; neither
+/// decoder has ever pushed `Key` for a bare modifier, so pushing `KeyUp` for one would fabricate a
+/// release edge for a press ring 3 never saw. Shift at RELEASE time picks the ascii, as on xHCI —
+/// consumers that care about identity match case-insensitively.
+///
+/// NO TYPEMATIC INTERACTION EXISTS ON THIS PATH, and that is a fact about the build, not a
+/// judgement call: `pal`'s host-side typematic tracker — `typematic_note_report`, `typematic_tick`
+/// and the whole `typematic` module — is `#[cfg(all(target_arch = "aarch64", feature =
+/// "baremetal"))]`, while this driver is `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`.
+/// The two are never compiled together, so the P51 wedge and the REPORT-level arm/disarm that cured
+/// it (`pal.rs`, UVUG-6/UVUG-9/PAL-TYPEMATIC) cannot be reached from here and are not re-broken by
+/// this change; calling `typematic_note_report` from this decoder would not even resolve on x86.
+/// Repeat on this arch is the DEVICE's, carried by the re-reported level.
+unsafe fn decode_boot_keyboard(report: &[u8], prev_keys: &mut [u8; 6]) {
     if report.len() < 3 {
         return;
     }
     let shift = report[0] & 0x22 != 0; // L-Shift (bit 1) or R-Shift (bit 5)
-    for &keycode in report.iter().skip(2) {
+    // The ascii for one keycode under the shift state in force. One place, so a press and its
+    // release can never disagree about which character they are about.
+    let ascii_of = |keycode: u8| -> u8 {
+        if (keycode as usize) < super::xhci::HID_SCANCODE_TO_ASCII.len() {
+            let (unshifted, shifted) = super::xhci::HID_SCANCODE_TO_ASCII[keycode as usize];
+            if shift { shifted } else { unshifted }
+        } else {
+            0
+        }
+    };
+    // This report's keycode slots. A report shorter than 8 bytes contributes zeros for the slots it
+    // does not carry — "not down", which is the safe direction: it can only release a key early, and
+    // the next full report re-presses it.
+    let mut cur_keys = [0u8; 6];
+    for (i, slot) in cur_keys.iter_mut().enumerate() {
+        *slot = report.get(2 + i).copied().unwrap_or(0);
+    }
+
+    for &keycode in cur_keys.iter() {
         if keycode <= 1 {
             continue; // no key / ErrorRollOver
         }
-        if (keycode as usize) < super::xhci::HID_SCANCODE_TO_ASCII.len() {
-            let (unshifted, shifted) = super::xhci::HID_SCANCODE_TO_ASCII[keycode as usize];
-            let ascii = if shift { shifted } else { unshifted };
-            if ascii != 0 {
-                serial_println!("EHCI-HID: KEY: '{}' (scancode {:#x})", ascii as char, keycode);
-                crate::pal::push_event(crate::pal::Event::Key(ascii));
-            }
+        let ascii = ascii_of(keycode);
+        if ascii != 0 {
+            serial_println!("EHCI-HID: KEY: '{}' (scancode {:#x})", ascii as char, keycode);
+            crate::pal::push_event(crate::pal::Event::Key(ascii));
         }
     }
+
+    // The release edges. Bounded by six per report, and a human's key releases are human-rate, so
+    // the serial line is unconditional like its `KEY:` twin rather than hidden behind `usbdebug` —
+    // it is the wire evidence that this path emits releases at all, which is the one thing Boot AJ
+    // could not show.
+    for &keycode in prev_keys.iter() {
+        if keycode <= 1 {
+            continue;
+        }
+        if cur_keys.contains(&keycode) {
+            continue; // still held
+        }
+        let ascii = ascii_of(keycode);
+        if ascii != 0 {
+            serial_println!("EHCI-HID: KEYUP: '{}' (scancode {:#x})", ascii as char, keycode);
+            crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
+        }
+    }
+
+    *prev_keys = cur_keys;
 }
 
 // ======================================================================================
