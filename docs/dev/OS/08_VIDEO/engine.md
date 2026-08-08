@@ -5169,7 +5169,10 @@ evidence the pacer works.
 [wpace] rollup wins=8 pres=1866 paced=83 slept=726ms focus=0 resync=98 rate=373.0/s span=5002ms -> PACING
 ```
 
-Four of eight windows never slept once, and one of them presented at 78.9/s on a 16667 us panel.
+One of eight windows presented at 78.9/s on a 16667 us panel. (An earlier draft said "four of eight
+never slept once" — review-corrected: three of those four were at 50.9, 37.9 and 52.9/s, BELOW the
+panel rate, where `paced=0` is exactly HEADROOM and not a defect. **win=3 is the single genuine
+falsifier**, and one is enough.)
 That is line one of this section's own falsification list — *"`paced=0` on every window while
 `[wcn] rate=` sits above 60/s — the pacer is not firing"* — and the verdict still read `PACING`,
 because 83 sleeps on four *other* windows are enough to satisfy `t_paced > 0`.
@@ -5180,12 +5183,20 @@ because 83 sleeps on four *other* windows are enough to satisfy `t_paced > 0`.
    so a present can land up to 999 us **before** its own deadline.
 2. `pace_advance` then computed `next = prev + PANEL_FRAME_US` unconditionally — measuring the next
    deadline from a deadline the caller did not actually wait for, and banking the unslept remainder.
-3. The credit compounds at up to ~1 ms per frame. After ~17 frames (~0.3 s) the deadline sits more
-   than a full frame ahead of now.
+3. ⚠ **REVIEW-CORRECTED.** This step used to read "the credit compounds at up to ~1 ms per frame;
+   after ~17 frames (~0.3 s) the deadline sits more than a full frame ahead." It does not compound:
+   the clock is MILLISECOND-GRANULAR against a 16667 us frame, so `due - now_at_present` cycles
+   667/334/1/668… The runaway arm fires when a window issues its next present **within the same
+   millisecond** as an early one — abrupt and conditional on back-to-back presents, not gradual.
 4. `present_pace`'s safety valve — `if wait_us > PANEL_FRAME_US { return }`, written against a
    *stale* deadline — then fires on every subsequent present and stops sleeping altogether, while
    `pace_advance` keeps advancing (`now <= prev + PANEL_FRAME_US` is trivially true once `prev` is in
    the future).
+
+⚠ **AND `overrun=` CANNOT CORROBORATE ANY OF THIS.** The counter added with the clamp is zero BY
+CONSTRUCTION under that clamp — it can falsify the clamp (a non-zero reading means the clamp failed)
+but it can never diagnose the AQ symptom, which the clamp has already made unreachable. Do not read
+`LATCHED` absent as coverage of the original defect.
 
 **The latch never opens.** Every fast window disabled its own pacer within the first second of its
 life and presented un-paced for the rest of the boot. Windows 2/5/6/8 still paced only because they
@@ -5244,16 +5255,21 @@ in sustained steady state. **x86 had no direct instrument for this** — FLUID-3
 `FL3_OVERLAP` are `target_arch = "aarch64"` only — which is why the overlap went unnamed for as long
 as it did, and why the reading had to be recovered from `[comp2]`'s own two numbers.
 
-Corroborating, from the same boot:
+**A corroboration this section used to carry has been STRUCK, because it was false.** An earlier
+draft cited `[wc-d] verify win=10 … got=0x1e1e1e want=0x100e16 -> FAIL` @229966ms and called
+`0x1e1e1e` "the desktop erase colour", i.e. a foreign painter inside win=10's own rect. Review
+refuted it three ways: `wm::DESKTOP_BG` is `0x002D_2B55`, not `0x1e1e1e`; the `main.rs` line the
+draft cited is a comment about REMOVED pre-CURSOR-1 code which states verbatim that `0x1E1E1E` "is
+neither the desktop colour nor on top of a window"; and `0x1e1e1e` is `video::PANEL_BG` **and
+`vug::BG`, the vug's own surface background** — so on a vug window that reading is most simply the
+window's own pixels and corroborates nothing. It is recorded here rather than deleted because the
+wrong reading was plausible and someone will find that line again.
 
-```
-[ 229966ms] [wc-d] verify win=10 … bad_cache=49664 bad_ram=33499 moved=221400 …
-                   first=(1633,869) got=0x1e1e1e want=0x100e16 -> FAIL
-```
-
-221 400 pixels changed under the verifier between its pre-blit reference and its read-back, and the
-colour on glass is the desktop erase colour — a foreign painter inside win=10's own rect during
-win=10's own composite.
+**The `[comp2]` arithmetic stands alone and needs no corroboration:** mean-per-pass × passes
+exceeding a wall-clock span is a pigeonhole argument, and `pass_us` truncates twice so 144% is a
+FLOOR. One honest narrowing: it proves passes OVERLAP IN TIME, not that two *cores* were drawing —
+a holder descheduled mid-pass while another task composites on the same core produces identical
+arithmetic and the identical bug.
 
 #### The gate
 

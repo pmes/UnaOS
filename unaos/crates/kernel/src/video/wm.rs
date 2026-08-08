@@ -2339,8 +2339,27 @@ pub fn composite() {
         // Service what was declined while we held the gate. Each round is a FULL pass — its own
         // snapshot, its own upward closure, its own back-to-front order and its own cursor tail — so
         // no tail is ever skipped and the coalesced damage is composited in one correct stack.
+        // REVIEW CONDITION 1 — THE MASKED HOLDER DOES NO EXTRA PASSES AT ALL.
+        //
+        // Two facts made the original bound wrong, and both were measured rather than argued.
+        // (a) ARITHMETIC: `rounds < COMP_RERUN_MAX && COMP_PENDING.swap(...)` SHORT-CIRCUITS, so at
+        //     exhaustion the swap never runs, `COMP_PENDING` stays true, and the lost-wakeup block
+        //     below fires a FOURTH `composite_once`. The old docstring said "two extra passes"; the
+        //     code allowed three.
+        // (b) COST: `sys_win_present` reaches here inside `IrqGuard::mask_save()` holding WINDOWS,
+        //     and `arch::ms()` is `apic::ticks()`, which **only the BSP advances**. At Boot AQ's
+        //     measured `max_us = 41048`, four passes on the BSP mask IRQs ~164 ms against ~41 ms
+        //     before — up to ~123 ms of GLOBAL ms-clock loss in a single syscall, on the very clock
+        //     the companion pacer reads to decide when to sleep.
+        //
+        // So the re-runs are given to the callers that can afford them. An unmasked holder (the
+        // service lane, paygo, move_to) absorbs declined damage as before; a MASKED holder does its
+        // one pass and leaves. Nothing is dropped: `COMP_PENDING` stays set, `service_damage` is the
+        // standing backstop, and any later present re-enters. This is the same "refuse to wait when
+        // IRQs are masked" rule `cursor.rs` already follows (WEDGE-8).
+        let masked = crate::arch::irqs_masked();
         let mut rounds = 0u32;
-        while rounds < COMP_RERUN_MAX && COMP_PENDING.swap(false, AcqRel) {
+        while !masked && rounds < COMP_RERUN_MAX && COMP_PENDING.swap(false, AcqRel) {
             if !any_damaged() {
                 break; // the decliner's damage was already absorbed by the round above
             }
@@ -2355,7 +2374,11 @@ pub fn composite() {
         // committed to drawing it, and on a static desktop no later present would arrive to find it.
         // One re-acquisition attempt; a failure here means somebody else now holds the gate and will
         // run the same loop we just did.
-        if COMP_PENDING.load(Acquire)
+        // …and a masked holder does not take this pass either (review condition 1): it is the
+        // fourth composite the arithmetic above accounts for. `COMP_PENDING` remains set for an
+        // unmasked holder or `service_damage` to service.
+        if !masked
+            && COMP_PENDING.load(Acquire)
             && COMP_GATE
                 .compare_exchange(false, true, AcqRel, Relaxed)
                 .is_ok()

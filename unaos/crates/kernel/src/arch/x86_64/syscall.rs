@@ -4002,11 +4002,19 @@ fn pace_advance(id: usize) {
     //
     // Without it the cadence is measured from a deadline the caller may not have waited for: the
     // sub-millisecond remainder in `present_pace` (`ms == 0`) lets a present land up to 999 us early,
-    // and `prev + PANEL_FRAME_US` then banks that 999 us as credit. The credit compounds — about a
-    // millisecond per frame — until the deadline is more than a frame ahead, at which point
-    // `present_pace`'s `wait_us > PANEL_FRAME_US` guard stops sleeping ALTOGETHER and the deadline
-    // runs away for the rest of the boot. Boot AQ's `paced=0 rate=78.9/s` windows are that latch,
-    // closed within the first second of each fast window's life.
+    // and `prev + PANEL_FRAME_US` then banks that remainder as credit. Once the deadline sits more
+    // than a frame ahead, `present_pace`'s `wait_us > PANEL_FRAME_US` guard stops sleeping
+    // ALTOGETHER and the deadline runs away for the rest of the boot.
+    //
+    // ⚠ REVIEW-CORRECTED MECHANISM. An earlier version of this comment said the credit "compounds —
+    // about a millisecond per frame — until after ~17 frames (~0.3 s)". That is NOT what this code
+    // does: the clock is MILLISECOND-GRANULAR (`arch::ms().saturating_mul(1000)`) against a 16667 us
+    // frame, so `due - now_at_present` cycles 667/334/1/668… and does not accumulate. The runaway
+    // arm fires when a window issues its next present WITHIN THE SAME MILLISECOND as an early one —
+    // abrupt and conditional on back-to-back presents, not gradual. And of Boot AQ's four `paced=0`
+    // windows, three (50.9, 37.9, 52.9/s) are BELOW 60/s where `paced=0` is exactly HEADROOM; only
+    // win=3 at 78.9/s was a genuine falsifier. The clamp is right either way — it is the mechanism
+    // story that was wrong, and a wrong story is what a later reader would reason from.
     //
     // `min` and not a resync, because the two arms above are still the right cadence source: a LATE
     // present must keep measuring from `prev` (that is what holds the long-run rate at exactly 60.0
