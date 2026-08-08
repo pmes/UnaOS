@@ -28,11 +28,18 @@ The clock exists and is real: the boot already runs SNTP (`[sntp-x86]` on the AN
 calibrated ms timebase. **Whoever builds this must say which option and why, and must re-verify the
 byte-inertness claim in §9 or explicitly retire it.**
 
-Also: a *scene* is not a palette role. It is a material — and §9 already draws that line, deliberately
-excluding the kit's `content_surface.Paper` block because *"lifting it means porting a multi-octave
-noise generator, a rasterizer concern."* A lake scene sits on the same side of that line. Decide
-whether it is a procedural material, a lifted image, or a gradient-plus-silhouette built from
-palette roles — and note the kernel has no float and no image decoder.
+**A1 FOLLOW-UP (Peter, same day):** *"we must have the paper texture but i don't want it as the
+desktop background"*. So the two materials are SEPARATE and both are wanted:
+  - **Paper stays where the kit already puts it** — `content_surface.Paper` is a CONTENT surface, a
+    procedural texture a content region composites UNDER its content. That is exactly what §9
+    described when it deliberately left it unlifted (`base_rgb`, `algo: "Laid"`, `amplitude: 0.02`,
+    `scale: 4.0`, `octaves: 3`, `seed: 4223012511`). Lifting it means porting a multi-octave noise
+    generator into a kernel with no float — a rasterizer concern, and now a REQUIRED one. It reads
+    `base_rgb` from `CONTENT_FILL`; the two agree by construction.
+  - **The lake scene is the DESKTOP**, and is not paper.
+A scene is still a material, not a palette role: decide procedural vs lifted image vs
+palette-built gradient-plus-silhouette. The kernel has no float and no image decoder, though
+`blend_q16` now exists for integer interpolation.
 
 ### A2 — the middle and zoom controls: **whatever the Mac standard is.**
 > *"whatever mac standard is"*
@@ -49,14 +56,16 @@ has explicitly deferred placement.
 Add the states to the kit. The idiom is **modern, Scandinavian, refined, minimal** — which reads as
 restraint: small deltas, no ornament, no drop shadows for their own sake. Kit json first.
 
-### A4 — focus: **make the whole window more distinguishable, not just the caption.**
-> *"tweak to make it more distinguishable as a whole?"*
+### A4 — **WITHDRAWN by Peter. The standing instruction is PERFORMANCE.**
+> *"i'm not sure about all that as the original question was garbage. just make the os high
+> performance if looks a little off we will change it"*
 
-Today the two title gradients differ by a few LSBs and only the ink differs strongly, so focus reads
-almost entirely in the caption. Peter wants the **whole window** to read as focused. ⚠ Constraint
-that must not be broken while doing it: **FOCUS-HL's law is that focus never moves a pixel** — the
-distinction has to come from colour, not geometry, or the four-rect damage subtraction in
-COMPOSITE-2 stops being focus-independent. Kit json first.
+The question was mine and it was a bad one. **No focus-contrast work is wanted.** The standing
+priority is that **the OS is FAST**; visual imperfection is acceptable and correctable later. Read
+this as the tie-breaker for the whole theme area: when polish competes with performance,
+performance wins, and the look gets revisited afterwards. (If someone does eventually touch focus
+rendering: FOCUS-HL's law is that focus never moves a pixel, because COMPOSITE-2's four-rect damage
+subtraction depends on it. Colour only — but not now.)
 
 ### A5 — control side and order: **leave it, revisit later.**
 > *"ok we can always change things later!"*
