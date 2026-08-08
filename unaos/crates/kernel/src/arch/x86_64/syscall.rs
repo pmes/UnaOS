@@ -13681,10 +13681,31 @@ fn winx2_launcher(_demo_cpu: usize) {
 
     // The kill IS part of the contract: STAT.ELF has no exit path, so this is the only way it stops.
     let verdict = bg_kill(pid, slot as u64);
-    let killed = verdict == "killed";
-    // Reap the row through the same call `jobs` makes, then confirm the pid is gone.
-    let reaped = matches!(bg_poll(pid, true), BgPoll::Faulted | BgPoll::Exited(_));
-    let gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+    // PROCREAP — `bg_kill` REAPS ITS OWN ROW since GR21, and this witness went on asserting the contract
+    // that change replaced. Boot AL, verbatim: `killed=false (killed, row reaped) reaped=false gone=true`.
+    // Every field of that line is the witness being wrong about a kill that worked: the exact-match on
+    // `"killed"` could not match the new verdict string, and the follow-up `bg_poll(pid, true)` was asking
+    // a row that `bg_kill` had already freed to be reaped a second time, which honestly answers `Gone`.
+    //
+    // The two verdicts that both mean CONFIRMED KILLED, ROW GONE — and why BOTH are accepted:
+    //   * `"killed, row reaped"` — `bg_kill` won the `PREAPING` claim and called `proc_free` itself.
+    //   * `"killed — the row was reclaimed on another core"` — `bg_kill` confirmed the reap
+    //     (`kill.is_reaped()` returned true, which is the kill's whole proof) and then lost the claim to
+    //     BGRUN-SCAV. The task is just as retired and the row is just as free; the only difference is
+    //     which core did the bookkeeping. Grading this one red would make the witness fail on a legal
+    //     scheduler interleave — a flaky gate, which is worse than no gate.
+    // EVERY other string `bg_kill` can return is a real failure and still grades red: "no such job
+    // (already reaped?)", "already exited — run `jobs` to reap it", "already killed — the kill is still
+    // armed…", "exited before the kill landed…" and "kill armed — the task retires at its next
+    // preemption" all mean this call did NOT confirm a reap.
+    let killed = verdict == "killed, row reaped"
+        || verdict == "killed — the row was reclaimed on another core";
+    // The reap proof is now the ROW ITSELF, observed and not created: `bg_poll` WITHOUT `reap`, so this
+    // reads the table rather than mutating it. `Gone` means no `PRUNNING`/`PEXITED` row carries this pid
+    // any more, and the kill above is the only thing that can have retired it. A row still `Running` (the
+    // kill did not land) or still `Exited` (a corpse nobody freed — the GR21 leak) fails here, so the
+    // witness keeps exactly the falsifying power the two-step version had.
+    let reaped = matches!(bg_poll(pid, false), BgPoll::Gone);
     // Teardown: the kill's address-space free retires the window rows and drops the FB leaves.
     let tdeadline = crate::arch::ticks() + 2_000;
     while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
@@ -13698,15 +13719,18 @@ fn winx2_launcher(_demo_cpu: usize) {
         crate::arch::sched::yield_now();
     }
 
-    if windowed && presents >= WINX2_MIN_PRESENTS && killed && reaped && gone && cleared {
+    if windowed && presents >= WINX2_MIN_PRESENTS && killed && reaped && cleared {
         serial_println!(
-            ":: WINX-2: STAT.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents, killed + reaped, teardown clean -> PASS ::",
+            ":: WINX-2: STAT.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents, killed + row reaped by the kill, teardown clean -> PASS ::",
             entry, presents
         );
     } else {
+        // The FAIL fields are exactly what is asserted above — no `gone` any more, because the reap proof
+        // and the pid-is-gone proof are now one observation and printing them as two would suggest two
+        // independent checks. `verdict` stays: it is the string the `killed` decision was made on.
         serial_println!(
-            ":: WINX-2: STAT.ELF end-to-end FAIL — windowed={} presents={} killed={} ({}) reaped={} gone={} cleared={} (want true/>={}/true/true/true/true) ::",
-            windowed, presents, killed, verdict, reaped, gone, cleared, WINX2_MIN_PRESENTS
+            ":: WINX-2: STAT.ELF end-to-end FAIL — windowed={} presents={} killed={} (verdict={:?}) row_gone={} cleared={} (want true/>={}/true/true/true) ::",
+            windowed, presents, killed, verdict, reaped, cleared, WINX2_MIN_PRESENTS
         );
     }
 }
