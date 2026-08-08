@@ -252,6 +252,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(any(feature = "installdemo", feature = "install_target", feature = "piinstall"))]
     unaos_kernel::install::selfguard::set_boot_volume_serial(boot_info.boot_volume_serial);
 
+    // FRGUARD (GR21): the SAME field, published a second time — into the block layer's Default-write
+    // substitution guard. Deliberately not sharing INSTALL-SELF's copy above: that one is gated on the
+    // installer features, which no bench or boot build carries, and that is exactly why its
+    // `:: install: boot volume serial …` witness appears ZERO times across the 30-boot capture at
+    // capture/rmbp-gr16-s73. A guard whose own input is invisible on the wire can be neither trusted
+    // nor falsified, so this arm carries its own publication and its own witness. Gated to the builds
+    // that compile the guard, so every other target is untouched.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    unaos_kernel::drivers::block::set_boot_volume_serial(boot_info.boot_volume_serial);
+
     // JC3 (virt/UEFI, GICv3 only): capture the firmware RAM-GiB map from boot_info BEFORE memory::init
     // consumes it (it takes the `&'static mut`), so the EL2->EL1 drop below can build the boot core's EL1
     // identity map. Runtime-gated on `is_v3()` so the GICv2 virt run computes nothing beyond the cheap GIC

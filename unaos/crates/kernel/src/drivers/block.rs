@@ -322,8 +322,13 @@ pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
 /// PIUSB-28: x86 / non-SD-capable targets — the USB stick is the default (boot) block backend, so it
 /// always claims the global `BLOCK_DEVICE` alongside the dedicated USB handle. Preserves the historical
 /// behavior on any target that never compiles the SD backend / BACKEND selector.
+///
+/// FRGUARD (GR21): a claim of the global slot INVALIDATES the boot-medium verdict — the next reader
+/// re-derives it against whatever now occupies the slot. See [`BOOT_MEDIUM_VERDICT`].
 #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
 pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    BOOT_MEDIUM_VERDICT.store(BM_UNKNOWN, core::sync::atomic::Ordering::Release);
     *BLOCK_DEVICE.lock() = Some(dev);
     *USB_BLOCK_DEVICE.lock() = Some(dev);
     set_usb_ready();
@@ -438,13 +443,31 @@ static SUBST_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// canonical backend is SD, a `Default` write with no registered SD returns `NotReady` and says so on serial
 /// once, producing an honest "no writable volume" boot instead of misdirected writes.
 ///
+/// FRGUARD (GR21): **that hazard also exists on x86, and a guard for it now exists there too.** SDHC-4b gave
+/// x86 an internal SD backend that registers as handle `Sdhc` and deliberately leaves `BLOCK_DEVICE` empty,
+/// so an x86 machine can boot with a canonical volume that is not the `Default` target — and Boot AI-2 proved
+/// the consequence on metal: the flight recorder created and wrote a 262 656-byte `/UNAOS.LOG` onto a card
+/// the operator hot-plugged to read, because that card was the first thing to claim the global slot. The x86
+/// arm of `default_writable` (below) closes it, keyed on the boot volume's identity as the UEFI loader
+/// reported it, rather than on this file's `BACKEND` selector, which x86 does not compile.
+///
+/// **The aarch64 arm has a gap this arc does NOT close, recorded in `docs/SECURITY.md`'s USBFALL row and
+/// in `docs/dev/OS/07_USB_STORAGE/usb_xhci.md` §11 so the Pi lane sees it:** the guard below is called
+/// only from [`write_block`], never from [`write_blocks`], so a `Default` MULTI-SECTOR FAT write
+/// (`fs/fat.rs::write_sectors`) bypasses USBFALL F1 entirely on `aarch64 + baremetal`. Pre-existing, real,
+/// and out of this arc's lane — the x86 arm guards both entry points.
+///
 /// Deliberately WRITES ONLY. Reads may still fall through to the BOT path — a read cannot corrupt the wrong
 /// device, and the USB mount has its own dedicated `read_block_usb` handle regardless.
 ///
-/// Deliberately `baremetal`-gated, NOT a blanket "xHCI writes are suspect" rule. On QEMU-virt aarch64
-/// (`test-arm`) and on x86 the SD backend is never compiled, xHCI IS the legitimate sole backend, and this
-/// function does not exist — those builds keep their pre-USBFALL write path byte-for-byte. The refusal is
-/// about substitution on a platform that has a canonical backend, not about xHCI.
+/// Deliberately gated to platforms that HAVE a canonical backend, NOT a blanket "xHCI writes are suspect"
+/// rule. On QEMU-virt aarch64 (`test-arm`) and on an x86 build without `sdhcblk` the SD backend is never
+/// compiled, xHCI IS the legitimate sole backend, and the refusal does not exist — those builds keep their
+/// pre-USBFALL write path byte-for-byte. The refusal is about substitution on a platform that has a
+/// canonical backend, not about xHCI.
+///
+/// FRGUARD (GR21): x86 + `sdhcblk` is now such a platform and has its own arm below. The line above used to
+/// say "and on x86", full stop; Boot AI-2 proved that premise dead.
 ///
 /// Byte-inert on a healthy SD boot: `BACKEND_SD` is set before the first FAT write, so this returns `Ok`
 /// without touching the console.
@@ -453,13 +476,233 @@ pub fn default_writable() -> bool {
     BACKEND.load(Ordering::Acquire) == BACKEND_SD
 }
 
-/// USBFALL F1: targets without the SD backend (x86, QEMU-virt aarch64) have no substitution to refuse — the
-/// enumerated device IS the canonical `Default` backend, so `Default` writes are available whenever the block
-/// layer has one at all. Constant `true` keeps `write_block` and every `read_only()` consumer byte-identical
-/// to pre-USBFALL there.
-#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+// ===================== FRGUARD (GR21) — is the Default slot the medium we BOOTED from? ==============
+//
+// R1 of this arc keyed the guard on CLAIM ORIGIN: boot port scan vs hot-plug edge. That predicate is
+// REFUTED by the bench's own capture and the kernel's own instrument. On the rMBP the mass-storage
+// device sits on port 5, a USB3 port whose link finishes training ~1.6 s after the 100 ms pre-scan
+// settle, so it MISSES the initial CCS scan and is recovered through the hot-plug path — on 30 boots
+// out of 30, without one exception:
+//
+//     xHCI: !! ccs-margin LATE port=5 t_seen_ms=1659 settle_ms=100 short_by_ms<=1559
+//           (missed the initial CCS scan; recovered via CSC; ...) result=CCSMARGIN-LATE
+//     xHCI: [Port 5] device connected (hot-plug); queuing for enumeration.
+//
+// The boot volume and the intruder arrive down the SAME path on this machine. The axis carried no
+// signal, and a guard built on it would have refused the flight recorder on every normal boot.
+//
+// The axis that DOES separate them is which volume the kernel booted FROM, and the handoff for it
+// already exists and is metal-proven: the UEFI loader reads `BS_VolID` off LBA 0 of its own
+// loaded-image device (`read_boot_volume_serial`, bootloader crate — LoadedImage -> DeviceHandle ->
+// BlockIO) and passes it in `BootInfo::boot_volume_serial`. INSTALL-SELF already consumes it to stop
+// the installer erasing the running system; this is the same identity asked a different question.
+//
+// So: a `Default` claimant may be WRITTEN only if it carries the boot volume's serial.
+//   * AH / AI-1 — booted from the 60 GB card in the USB reader, which IS the Default claimant. Match,
+//     writes allowed, byte-identical to trunk.
+//   * AI-2 — booted from that same 60 GB card moved to the INTERNAL slot; the Default claimant is the
+//     operator's 29 MiB Panasonic. Mismatch, writes refused. This is the defect.
+//   * The re-enumeration case R1 had to charge as a fail-closed cost now costs nothing: a boot stick
+//     that chirps and re-enumerates is still the same volume and still matches.
+//
+// The refusal is keyed on a PROOF, not on a failed identity test, and that distinction was forced by
+// running the gate rather than reasoning about it. The first version of this predicate refused
+// whenever the `Default` slot did not carry the boot serial. `UNAOS_SDHCBLK=1 ./arroyo test-fat`
+// showed what that costs:
+//
+//     :: FRGUARD: Default slot (blocks=196608) does NOT carry the boot volume serial 0xfabe1afd …
+//     :: FR: UNAOS.LOG NOT reserved …            <- 47 PASS -> 40 PASS, exit 1
+//
+// In the QEMU harness the boot ESP is deliberately a SEPARATE `ide-hd` and the kernel's `Default` is
+// the `usb-storage` stick ("The boot ESP stays on the separate ide-hd", builder/src/main.rs), so the
+// two can never match — and the kernel has no driver for the ESP, so the boot medium is not reachable
+// through the block layer at all. "Default is not the boot medium" is therefore a perfectly normal
+// state, not evidence of anything. (The same run also killed the assumption that QEMU has no `Sdhc`
+// handle: it registers an emulated 16 MiB card, so `sdhc_info()` is `Some` there too.)
+//
+// So the guard refuses only in the state where it can POSITIVELY locate the boot volume on the other
+// handle — `BM_SUBSTITUTED`. Everything else fails open:
+//
+//   * `sdhc_info().is_none()` — no canonical backend outside the global slot, nothing to substitute
+//     away from. Byte-identical to the pre-FRGUARD constant.
+//   * boot serial 0 — the loader could not identify the medium it booted from (a pre-guard loader, a
+//     non-FAT boot path, an unstamped formatter, aarch64). Announced once, then trunk behaviour.
+//   * `BM_UNPROVEN` — the serial is on neither handle. The QEMU case, and any machine booting from a
+//     device the block layer cannot see.
+//
+// The guard must never be the thing that silently kills the flight recorder; an unidentified or
+// unreachable boot volume is a reason to say so, not a reason to refuse. Same disarm direction
+// INSTALL-SELF takes on the same sentinel.
+
+/// FRGUARD: `BS_VolID` of the volume the kernel was loaded from, as the UEFI loader read it. 0 = absent
+/// (the disarmed sentinel). Published once from the kernel entry path before any storage exists.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+static BOOT_VOLUME_SERIAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Not yet derived for the current occupant of the global slot.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const BM_UNKNOWN: u8 = 0;
+/// The global slot carries the boot volume's serial: it IS the medium we booted from.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const BM_MATCH: u8 = 1;
+/// The global slot does NOT carry it, and the `Sdhc` handle DOES — the boot medium is positively
+/// located somewhere else, so a `Default` write is a proven substitution. The only refusing state.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const BM_SUBSTITUTED: u8 = 2;
+/// Neither handle carries the boot serial — the boot medium is not reachable through the block layer
+/// at all, so nothing here can prove a substitution. FAILS OPEN. This is the normal state for a
+/// machine that boots from a device the kernel has no driver for, which is exactly the QEMU harness:
+/// the boot ESP is a separate `ide-hd` and the kernel's `Default` is the `usb-storage` stick.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const BM_UNPROVEN: u8 = 3;
+
+/// FRGUARD: the cached verdict on the CURRENT occupant of the global slot. Deriving it costs sector
+/// READS (`fat::volume_serials` walks LBA 0, the GPT spans and every MBR partition start), which must
+/// never happen from inside `write_block` — that call can arrive masked, mid-FAT-RMW, with the xHCI
+/// loan already claimed. So the verdict is derived once from an unmasked main-loop context by
+/// [`evaluate_boot_medium_once`] and only READ on the write path. Reset to `BM_UNKNOWN` by
+/// [`publish_usb_geometry`], so a hot-plug that replaces the occupant forces a fresh derivation
+/// instead of inheriting the previous device's verdict.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+static BOOT_MEDIUM_VERDICT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(BM_UNKNOWN);
+
+/// FRGUARD: publish the boot volume serial from `BootInfo`. Called once from the kernel entry path,
+/// before storage is up, so nothing can read a half-initialised guard. Deliberately separate from
+/// `install::selfguard::set_boot_volume_serial`, which consumes the same field: that one is gated on
+/// the installer features and is absent from every bench/boot build, which is exactly why its
+/// `:: install: boot volume serial …` line appears ZERO times in the 30-boot capture. This one is not
+/// gated on the installer, so the guard's own input is on the wire on every boot it can affect.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn set_boot_volume_serial(serial: u32) {
+    BOOT_VOLUME_SERIAL.store(serial, core::sync::atomic::Ordering::Release);
+    if serial == 0 {
+        serial_println!(
+            ":: FRGUARD: boot volume serial ABSENT (0) — Default-write substitution guard DISARMED \
+             (the loader could not identify the medium it booted from; writes behave exactly as trunk) ::"
+        );
+    } else {
+        serial_println!(
+            ":: FRGUARD: boot volume serial=0x{:08x} — Default-write substitution guard ARMED ::",
+            serial
+        );
+    }
+}
+
+/// FRGUARD: derive the boot-medium verdict for the current global-slot occupant, at most once per
+/// claim. MUST be called from an unmasked, lock-free context — it issues sector reads. The x86 main
+/// loop's flight-recorder pass is the site that does so, ahead of every `Default` writer on that pass.
+///
+/// Idempotent and cheap after the first call (one relaxed load). Prints ONE line per derivation naming
+/// the serials on both sides, so "the guard armed and agreed" is a fact in the capture rather than an
+/// inference from silence.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn evaluate_boot_medium_once() {
+    use core::sync::atomic::Ordering;
+    if BOOT_MEDIUM_VERDICT.load(Ordering::Acquire) != BM_UNKNOWN {
+        return; // already derived for this occupant
+    }
+    let boot_serial = BOOT_VOLUME_SERIAL.load(Ordering::Acquire);
+    if boot_serial == 0 || sdhc_info().is_none() || info().is_none() {
+        return; // disarmed, or nothing to judge yet — `default_writable` handles these directly
+    }
+    let glob = info().map(|d| d.num_blocks).unwrap_or(0);
+    let canon = sdhc_info().map(|d| d.num_blocks).unwrap_or(0);
+    let on_default = crate::fs::fat::volume_serials(crate::fs::fat::BlockSource::Default);
+    if on_default.contains(&boot_serial) {
+        BOOT_MEDIUM_VERDICT.store(BM_MATCH, Ordering::Release);
+        serial_println!(
+            ":: FRGUARD: Default slot (blocks={}) CARRIES the boot volume serial 0x{:08x} — it is the \
+             medium this kernel booted from; writes ALLOWED (canonical Sdhc handle blocks={}) ::",
+            glob, boot_serial, canon
+        );
+        return;
+    }
+    // The global slot is not the boot medium. That alone is NOT enough to refuse: a machine can
+    // legitimately boot from a device the block layer cannot reach (no driver for it), in which case
+    // nothing here is a substitution and refusing would be a guess. Refuse only when the boot volume
+    // is POSITIVELY located on the other handle — that is a proof, not an absence of one.
+    let on_sdhc = crate::fs::fat::volume_serials(crate::fs::fat::BlockSource::Sdhc);
+    if on_sdhc.contains(&boot_serial) {
+        BOOT_MEDIUM_VERDICT.store(BM_SUBSTITUTED, Ordering::Release);
+        serial_println!(
+            ":: FRGUARD: SUBSTITUTION — the boot volume serial 0x{:08x} is on the INTERNAL Sdhc card \
+             (blocks={}), not in the Default slot (blocks={}, {} FAT volume(s), none of them ours); \
+             Default writes REFUSED ::",
+            boot_serial, canon, glob, on_default.len()
+        );
+    } else {
+        BOOT_MEDIUM_VERDICT.store(BM_UNPROVEN, Ordering::Release);
+        serial_println!(
+            ":: FRGUARD: boot volume serial 0x{:08x} found on NEITHER handle (Default blocks={} has \
+             {} FAT volume(s), Sdhc blocks={} has {}) — the boot medium is not reachable through the \
+             block layer, so no substitution can be proven; writes ALLOWED (guard DISARMED) ::",
+            boot_serial, glob, on_default.len(), canon, on_sdhc.len()
+        );
+    }
+}
+
+/// USBFALL F1 / FRGUARD (GR21): the x86 arm of the substitution guard. See the section comment above
+/// for why the predicate is what it is, and for the refuted one it replaces.
+///
+/// Deliberately WRITES ONLY, exactly as the aarch64 arm: reads still fall through to the BOT path,
+/// because a read cannot corrupt the wrong device, and the stick keeps its dedicated `read_block_usb`
+/// handle. Pure reads of two atomics — no locks, no sector I/O — so it is safe from any context a
+/// `write_block` can arrive in.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn default_writable() -> bool {
+    use core::sync::atomic::Ordering;
+    if sdhc_info().is_none() {
+        return true; // no canonical backend outside the global slot — nothing to substitute away from
+    }
+    if BOOT_VOLUME_SERIAL.load(Ordering::Acquire) == 0 {
+        return true; // boot medium unidentifiable — FAIL OPEN, announced once at publish time
+    }
+    // Exactly one state refuses: BM_SUBSTITUTED, where the boot volume was positively found on the
+    // other handle. BM_UNKNOWN (not yet derived) and BM_UNPROVEN (boot medium unreachable) both fail
+    // OPEN — the arc's law is that this guard never silently kills the recorder, and neither state is
+    // evidence of a substitution.
+    BOOT_MEDIUM_VERDICT.load(Ordering::Acquire) != BM_SUBSTITUTED
+}
+
+/// USBFALL F1: targets without ANY canonical backend outside the global slot (x86 without `sdhcblk`,
+/// QEMU-virt aarch64) have no substitution to refuse — the enumerated device IS the canonical `Default`
+/// backend, so `Default` writes are available whenever the block layer has one at all. Constant `true`
+/// keeps `write_block` and every `read_only()` consumer byte-identical to pre-USBFALL there.
+#[cfg(not(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "sdhcblk")
+)))]
 pub fn default_writable() -> bool {
     true
+}
+
+/// FRGUARD (GR21): one-shot latch for the x86 refusal witness — same shape as `SUBST_REFUSED`, so a
+/// retrying writer names the refusal once rather than per sector.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+static X86_SUBST_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// FRGUARD (GR21): the x86 twin of [`guard_default_write_backend`]. Fails CLOSED with `NotReady` and one
+/// falsifiable line naming both media, so a capture can tell "the guard fired" from "nothing tried to
+/// write". The witness prints the two geometries because that is what identified the substitution in the
+/// Boot AI-2 forensics: `blocks=124735488` internal vs `dev_blocks=60800` in the global slot.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+fn guard_default_write_backend() -> Result<(), BlockError> {
+    if default_writable() {
+        return Ok(());
+    }
+    if !X86_SUBST_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        let canon = sdhc_info().map(|d| d.num_blocks).unwrap_or(0);
+        let glob = info().map(|d| d.num_blocks).unwrap_or(0);
+        serial_println!(
+            ":: BLOCK: Default WRITE refused — the boot volume serial 0x{:08x} is on the internal \
+             Sdhc card (blocks={}), not in the Default slot (blocks={}); refusing to write this \
+             system's data to a medium it did not boot from (first, once) ::",
+            BOOT_VOLUME_SERIAL.load(core::sync::atomic::Ordering::Acquire),
+            canon,
+            glob
+        );
+    }
+    Err(BlockError::NotReady)
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
@@ -519,6 +762,10 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     // USBFALL F1: fail CLOSED rather than substituting the USB stick for a missing SD card. See
     // `guard_default_write_backend` — compiled only where SD is the canonical backend (Pi bare-metal).
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    guard_default_write_backend()?;
+    // FRGUARD (GR21): the same refusal on x86 + `sdhcblk`, keyed on claim origin instead of the BACKEND
+    // selector. Not compiled at all without the knob, so the plain x86 write path is untouched.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     guard_default_write_backend()?;
 
     let dev = info().ok_or(BlockError::NotReady)?;
@@ -647,6 +894,14 @@ pub fn read_blocks(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 /// path's callers — there is nothing to read first: this is the point where a full-sector overwrite
 /// stops costing a READ(10) it never used.
 pub fn write_blocks(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    // FRGUARD (GR21): the counted path needs the guard as much as the single-block one — `fs/fat.rs`'s
+    // `write_sectors` routes here, and that is the entry point the flight recorder's `write_grow` /
+    // `write_at` actually use. Guarding only `write_block` (as the aarch64 arm does today) would have
+    // left the Boot AI-2 write path wide open. The matching aarch64 gap is recorded in
+    // `docs/SECURITY.md` and `usb_xhci.md` §11 rather than here, so the Pi lane can find it.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    guard_default_write_backend()?;
+
     let dev = info().ok_or(BlockError::NotReady)?;
     let count = span_blocks(&dev, lba, buf.len())?;
 
