@@ -4015,6 +4015,13 @@ fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
 ///    cannot reach, so a drain here would fix one seam and lie about the other.
 pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     const K_TAB: u8 = b'\t';
+    // ALLKEYS (GR21 F4/F5): this matcher binds a BARE Tab, and it can only ever see a bare one —
+    // `Event::Key` carries no modifier, so "require Tab with no modifiers" cannot be enforced here;
+    // it is enforced upstream in `xhci::hid_key_ascii`, which is the ONLY producer of byte 0x09.
+    // That fold suppresses Alt/GUI+Tab (so Cmd-Tab / Alt-Tab no longer reach this at all — a
+    // deliberate loss, named in the predictions file) and suppresses Ctrl-I, whose C0 fold would
+    // otherwise be 0x09 and silently invoke this focus switch. So `Event::Key(0x09)` here is now
+    // provably a physical Tab keypress and nothing else.
     let down = match ev {
         crate::pal::Event::Key(K_TAB) => true,
         crate::pal::Event::KeyUp(K_TAB) => false,
