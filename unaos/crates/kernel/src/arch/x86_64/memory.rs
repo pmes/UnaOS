@@ -823,6 +823,27 @@ pub fn alloc_user_space() -> Option<usize> {
     None
 }
 
+/// STORM-X86 — how many of the [`USER_SLOTS`] address-space slots are UNCLAIMED right now. The
+/// denominator is the constant; this is the numerator the `storm` verb prints on both sides of a
+/// fleet launch, and the question it answers is "did the reserve survive a full fleet" (see the
+/// `MAX_PROCS <= USER_SLOTS - 2` assertion in `arch::syscall`, which is what makes that reserve a
+/// property rather than a hope).
+///
+/// Counts the SAME `SLOT_USED` claim flag `alloc_user_space` sets and `free_user_space_by_cr3`
+/// clears, so it is exactly the pool's own accounting rather than a second tally that could drift
+/// from it. Reads only, no lock: a best-effort snapshot, and a claim landing mid-count moves the
+/// answer by one — which is the honest resolution of a free-running counter and all a headroom
+/// reading needs. Deliberately NOT derived from the process table: a slot outlives the process row
+/// (`user_space_retain` holds it for sibling ELF-2 threads), so the two numbers are different facts
+/// and printing one for the other would hide exactly the leak this exists to catch.
+///
+/// Arch-neutral mirror of aarch64's `arch::boot::user_slots_free`; on x86 the slot pool lives here
+/// in `memory` rather than in a boot module, which is why the `storm` verb reaches it through a
+/// per-arch module alias instead of one fixed path.
+pub fn user_slots_free() -> usize {
+    (0..USER_SLOTS).filter(|&s| !SLOT_USED[s].load(Ordering::Acquire)).count()
+}
+
 /// Allocate `out.len()` slots, filling `out` with their indices. FULL UNWIND on partial failure
 /// (mirrors M6d's `alloc_user_slots`): a slot that was claimed but never installed is released with
 /// no TLB work, so exhaustion never leaks a partial claim. Returns false if the pool can't satisfy

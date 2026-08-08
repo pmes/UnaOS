@@ -25,6 +25,17 @@ use crate::fs::fat::{DirEntry, FatError, FatFs};
 use crate::vug;
 use crate::pal::TargetPal;
 
+// STORM-X86: the module that owns the user address-space slot POOL, aliased per-arch so the `storm`
+// verb's census can name the same fact on both. On aarch64 the pool (`SLOT_USED` + `USER_SLOTS`) is
+// built by the EL0 bring-up in `arch::boot`; on x86 it is the static PML4/PDPT/PD/PT + backing pool
+// in `arch::memory`, claimed by `alloc_user_space`. Same quantity, same denominator, different
+// owning module — an alias rather than a cfg-split at each use site, so the census line stays ONE
+// piece of source and the two arches cannot drift into printing different things.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+use crate::arch::boot as storm_slots;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::memory as storm_slots;
+
 /// JD4: the shell's current working directory as a NORMALIZED, CANONICAL absolute path
 /// ("/" = root, else "/DIR/SUB" in the on-disk 8.3 spelling). A path string, not a cached
 /// cluster: every command re-resolves it from the root, so a swapped or remounted card can
@@ -2376,7 +2387,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // STORM-HEADROOM: the verb existed since P77 but was never listed, so the one command an
             // attended bench uses to load the scheduler was discoverable only from the source. The
             // cap is stated here because it is the first thing a `storm 8` reading needs.
-            #[cfg(feature = "baremetal")]
+            // STORM-X86: listed on both arches now that the verb exists on both. The cap is the same
+            // 6 on each (`MAX_PROCS` in either `arch::syscall`), so the sentence needs no split.
+            #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
             console.println("          storm [n]  (launch n vugs; n>6 is refused by the process table — serial carries the [storm] census)");
             console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
             console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
@@ -3391,7 +3404,14 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 }
             }
         },
-        #[cfg(feature = "baremetal")]
+        // STORM-X86 (Peter, Boot AL, rMBP): this arm was `#[cfg(feature = "baremetal")]` — a Pi-only
+        // gate — while the `bg`/`jobs`/`kill` arms on either side of it had already been widened to
+        // include x86. So `storm` at the x86 prompt fell through to "Unknown command" even though
+        // every mechanism it drives (the bg path, the process table, the slot pool) is live there.
+        // The gate now matches its neighbours exactly. `all(baremetal, aarch64)` is not a narrowing:
+        // `baremetal` is only ever set by the Pi legs (see `arroyo`), so the aarch64 build selects
+        // the identical arm it always did.
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
         "storm" => {
             // STORM-VERB (Peter, P77 sitting): launch a whole vug fleet in one command — `storm [n]`,
             // default 6, so an operator can raise a load storm without typing `bg /fat/VUG.ELF` six
@@ -3409,7 +3429,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // operator who asks for more than the machine has must get a REFUSAL that names the
             // resource, not a silently-lowered request that reads as if it were granted. The cap is
             // not a knob — see the `MAX_PROCS` block in `arch::syscall` for why 6 is where the user
-            // slot reserve puts it, and treat moving it as an arc, not a tuning step.
+            // slot reserve puts it, and treat moving it as an arc, not a tuning step. STORM-X86
+            // checked that this paragraph survives the move: x86's `arch::syscall` sets
+            // `MAX_PROCS = 6` under the SAME `MAX_PROCS <= USER_SLOTS - 2` reserve assertion (both
+            // pools are 8), so `storm 7`/`storm 8` are refused by the process table on either arch
+            // and the sentence needs no per-arch qualification.
             //
             // WHY THE CENSUS SITS HERE. Every scheduler quantity that could name a ceiling already
             // exists, but on other clocks: the `:: SCHED: load ::` train is timer-driven (~1 s
@@ -3419,9 +3443,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // before the first launch, one `[storm] k=` line after each successful one, `post` after
             // the burst. That layout is what makes a WEDGE readable as well as a refusal: if the
             // fleet starves the shell, this verb stops printing, and the last `k=` on the wire names
-            // the launch it stopped after. Its silence proves nothing on its own — the timer-driven
-            // `:: SCHED: load ::` / `[pulse5]` / `[spin1]` lines are the instruments that survive a
-            // starved shell, and they are what a silent tail must be read against.
+            // the launch it stopped after. Its silence proves nothing on its own — and on x86 there
+            // is NO instrument that survives a starved shell (the `[schedx86] load` heartbeat runs
+            // on the same render-service task as this dispatch; on aarch64 the timer-driven
+            // `:: SCHED: load ::` / `[pulse5]` / `[spin1]` train does survive). A silent x86 tail
+            // is settled only by the next boot's slice, honestly.
             let n = args
                 .first()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -3442,16 +3468,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 let j = BG_JOBS.lock();
                 (j.iter().filter(|s| s.is_none()).count(), j.len())
             };
-            let slots_free = crate::arch::boot::user_slots_free();
+            let slots_free = storm_slots::user_slots_free();
             console.println(&alloc::format!(
                 "storm: n={} — {}/{} process rows free, {}/{} job rows, {}/{} user slots",
                 n, rows_free, rows, jobs_free, jobs_rows,
-                slots_free, crate::arch::boot::USER_SLOTS
+                slots_free, storm_slots::USER_SLOTS
             ));
             serial_println!(
                 ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} | user slots free={}/{} ::",
                 n, rows_free, rows_running, rows_exited, rows_orphaned, rows,
-                jobs_free, jobs_rows, slots_free, crate::arch::boot::USER_SLOTS
+                jobs_free, jobs_rows, slots_free, storm_slots::USER_SLOTS
             );
             crate::arch::sched::storm_census("pre");
             let mut launched = 0usize;
@@ -3468,7 +3494,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     serial_println!(
                         ":: STORM: REFUSED at launch {} of {} — fleet stands at {} | proc rows free={} running={} exited={} porphaned={} | user slots free={} ::",
                         launched + 1, n, launched, f, r, e, o,
-                        crate::arch::boot::user_slots_free()
+                        storm_slots::user_slots_free()
                     );
                     break;
                 }
@@ -3488,7 +3514,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 serial_println!(
                     ":: STORM: end | proc rows free={} running={} exited={} porphaned={} of {} | user slots free={}/{} ::",
                     f, r, e, o, crate::arch::syscall::proc_table_rows(),
-                    crate::arch::boot::user_slots_free(), crate::arch::boot::USER_SLOTS
+                    storm_slots::user_slots_free(), storm_slots::USER_SLOTS
                 );
             }
             // `post` is taken immediately, so its busy percents still carry the pre-burst window —
@@ -3501,9 +3527,24 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // WEDGE-8/F3 metal provocation (the fleet supplies preemption pressure; this supplies
             // the driver-claim traffic). See `storm_fat_writer` for the two legs and their honesty
             // rules. Armed AFTER the burst so the census lines above describe the fleet alone.
+            #[cfg(target_arch = "aarch64")]
             if fatw {
                 crate::arch::sched::spawn_auto("stormfatw", storm_fat_writer, 0);
                 console.println("storm: fat writer armed — watch :: STORM: fatw lines on serial");
+            }
+            // STORM-X86: `fat` is PARSED on x86 and then REFUSED OUT LOUD. It is not silently
+            // dropped, because a silently-ignored arg is the worst of the three options — the
+            // operator gets the fleet, sees no `fatw` lines, and cannot tell "the writer ran and
+            // found nothing" from "the writer never existed". The refusal names the reason and the
+            // arch. `storm_fat_writer` stays where it is: it drives `BlockSource::Usb` through the
+            // Pi's `fs::fat` masked-RMW path against the xHCI loan, an aarch64+`baremetal` provocation
+            // (WEDGE-8/F3) with no x86 counterpart in this arc. Porting it is an arc of its own, not
+            // a cfg widening — dragging it over here would compile a writer aimed at a driver claim
+            // this arch does not hold, which is a fake instrument, not a feature.
+            #[cfg(target_arch = "x86_64")]
+            if fatw {
+                console.println("storm: `fat` refused — the USB-writer provocation is aarch64/baremetal-only (fleet launched without it)");
+                serial_println!(":: STORM: fatw REFUSED — aarch64/baremetal-only provocation, not ported to x86 ::");
             }
         },
         #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
