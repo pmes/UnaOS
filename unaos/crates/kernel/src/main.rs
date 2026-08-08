@@ -1045,6 +1045,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // rMBP keyboard/trackpad path. Same polled-service spot as the xHCI hooks above.
             #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
             unaos_kernel::drivers::ehci::service_ehci_hid();
+            // KEYREPEAT-X86: synthesise a held key's repeat before this pass's drain below.
+            #[cfg(target_arch = "x86_64")]
+            x86_typematic_pump();
             // BATMON-1 (x86, smc knob): refresh the battery snapshot (throttled internally to ~1 s)
             // and emit the `:: SMC-BATT: ... ::` witness. This is the serial-less metal-sitting view
             // (fbcon mirrors serial to the screen), so the battery readout is on-screen here too.
@@ -1447,6 +1450,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // keyboard/trackpad). Same polled-service spot as the xHCI hooks above.
         #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
         unaos_kernel::drivers::ehci::service_ehci_hid();
+        // KEYREPEAT-X86: synthesise a held key's repeat before this pass's drain below.
+        #[cfg(target_arch = "x86_64")]
+        x86_typematic_pump();
 
         // STOR-1 (x86, irqstorage knob): bring up the interrupt-driven storage service task once a
         // block device is present (before the storage fixtures submit through it), then run the
@@ -3989,6 +3995,48 @@ fn usb_pump(_: usize) {
 //     repaints through `wm::focus_changed`, so it belongs on the render side. The input task is a
 //     pure forwarder, exactly like the Pi's.
 
+/// KEYREPEAT-X86 (Boot AL) — the x86 twin of the aarch64 pump's typematic call: synthesise a held
+/// key's repeat into `EVENT_QUEUE` once per device-service pass.
+///
+/// WHY IT IS A FUNCTION AND NOT AN INLINE CALL. x86 has THREE mutually-exclusive per-pass service
+/// loops that poll `ehci::service_ehci_hid` — the `usbdebug` terminal loop, the inline BSP console
+/// loop (taken when fewer than two APs came online, so the render/service split cannot be made), and
+/// `x86_usb_pump` (the SCHED-X86 device-service task, the normal desktop path). A repeat that only
+/// fired on one of them would be a boot-configuration-dependent keyboard, which is precisely the
+/// class of divergence GR21 spent two arcs removing from this driver. One body, three call sites.
+///
+/// PLACEMENT WITHIN A PASS mirrors aarch64 exactly: AFTER the HID service call that pushes this
+/// pass's genuine edges, so the tracker has already seen this pass's reports, and BEFORE any drain,
+/// so the injected `Event::Key` rides the identical routing a real press takes — `x86_input_service`
+/// forwards it over `GUI_CHANNEL_X86` to the render task, `wc_click_route`/`user_input_route` apply
+/// the same asid focus rules, and a focused ring-3 app receives it in its own per-process ring. No
+/// per-path code, no second routing policy, and `typematic_tick`'s own backpressure guard refuses to
+/// inject at all while `EVENT_QUEUE` is past half full, so a stuck repeat can never starve real HID.
+///
+/// A no-op without `ehcihid`: the tracker is compiled on x86 only alongside the decoder that feeds
+/// it (`pal.rs` §KEYREPEAT-X86), so a build without the EHCI HID path has no keyboard to repeat for.
+#[cfg(target_arch = "x86_64")]
+fn x86_typematic_pump() {
+    #[cfg(feature = "ehcihid")]
+    if let Some(k) = unaos_kernel::pal::typematic_tick() {
+        // WITNESS, once per boot. The `[keystat] typematic hold end` rollup already reports per-hold
+        // and per-boot repeat counts from shared code, but it only prints when a hold ENDS — so a
+        // capture taken mid-hold, or a boot where the operator never lifted the key, would show
+        // nothing at all and be indistinguishable from the tracker never having been reached. This
+        // line answers "did x86 synthesise a repeat, ever" at the first repeat, which is the single
+        // fact this arc must be falsifiable on.
+        static FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !FIRST.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            serial_println!(
+                ":: KEYREPEAT-X86: first synthesised repeat — key={:#04x} '{}' (host typematic armed on the EHCI keyboard) == witness ::",
+                k,
+                if (32..127).contains(&k) { k as char } else { '.' }
+            );
+        }
+        unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(k));
+    }
+}
+
 /// SCHED-X86: the DEVICE-SERVICE task — every per-pass call the dismantled BSP GUI loop made that
 /// touches hardware and no pixel. Owns the xHCI service family, the FAT/flight-recorder/boot-ledger
 /// pumps, the one-shot witness probes and the NIC drain. Pinned to the service core; never returns.
@@ -4029,6 +4077,9 @@ fn x86_usb_pump(cpu: usize) {
         // keyboard/trackpad). Same polled-service spot as the xHCI hooks above.
         #[cfg(feature = "ehcihid")]
         unaos_kernel::drivers::ehci::service_ehci_hid();
+        // KEYREPEAT-X86: synthesise a held key's repeat into EVENT_QUEUE, which `x86_input_service`
+        // drains and forwards over GUI_CHANNEL_X86 exactly as it does a real press.
+        x86_typematic_pump();
         // BATMON-1 — the SMC accumulator, restored to a path a normal GUI boot actually reaches.
         //
         // This call existed at main.rs:972, but that site sits inside `#[cfg(feature = "usbdebug")]`

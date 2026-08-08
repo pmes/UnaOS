@@ -5530,6 +5530,140 @@ the strand scan bounded by the ring length) and on the first metal boot, which i
 
 ---
 
+## 18. KEYREPEAT-X86 — key repeat on the EHCI keyboard (Boot AL, 2026-08-08)
+
+### 18.1 The observation
+
+Peter, live on the rMBP bench during Boot AL: *"so far so good with keys except no key repeat."*
+Every other property the GR21 EHCI keyboard arc landed holds on metal — caps lock, Ctrl+letter, no
+stuck keys, `kill` works, SPACE both pauses and unpauses, shifted symbols release as themselves.
+Holding a key produced exactly one character.
+
+### 18.2 The cause, and the refuted premise
+
+`decode_boot_keyboard` pushes `Event::Key` at the LEVEL — every held keycode, every report — and its
+doc block concluded from that: *"repeat on this arch is the DEVICE's, carried by the re-reported
+level."* That premise is false for this device. No `SET_IDLE` is sent on the EHCI HID path (stated
+independently in the KBDWIT note), so the internal keyboard runs its default report-on-change
+behaviour: a key held still produces no further reports at all. No re-reported level, therefore no
+repeat. The level loop was correct and simply had nothing to loop over.
+
+The same fact, from the same cause, is what UVUG-5 was written for on aarch64.
+
+### 18.3 The fix: the shared tracker, not a second one
+
+Two review-found boundaries of the fix, on the record before the metal proof:
+
+- **`pal::pump_and_poll` does not tick.** The three top-level x86 service loops all tick the
+  tracker; `pump_and_poll` (the inner pump kernel full-screen demos hold while they block a
+  shell command) services EHCI but deliberately does NOT call `typematic_tick` — on the
+  SCHED-X86 shape the service core's `x86_usb_pump` keeps ticking concurrently, and a second
+  ticker on the demo core would race it. The cost is confined to the inline-BSP boot shape
+  (<2 APs) with a kernel demo active: reports still arm, but no repeats inject for the
+  demo's duration. Known, bounded, and the wire shows it (no `[keystat]` between the demo's
+  entry and exit lines on that shape).
+- **Cross-device detach coupling.** `note_keyboard_detached` is bumped by ANY keyboard slot
+  teardown, including an xHCI external keyboard detaching or enum-recovering — which disarms
+  a hold on the internal EHCI keyboard mid-repeat (safe direction: a lost repeat, never a
+  stuck key). "Repeat stopped when an unrelated USB device bounced" is this, not a bug.
+- Operator note: holding **Enter** at the shell now re-executes the line at ~25/s — same as
+  the Pi, correct, and new on this machine.
+
+`pal.rs`'s host-side typematic tracker was `#[cfg(all(target_arch = "aarch64", feature =
+"baremetal"))]`. Its cfg is widened to
+
+```rust
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
+```
+
+on `mod typematic`, `pack_held`, `typematic_note_report`, `typematic_hold_rollup`,
+`typematic_lapse_disarm` and `typematic_tick`. The `typematic_test_*` aids stay aarch64-only — only
+the aarch64 selftest calls them.
+
+Widening rather than reimplementing is the point: this tracker was purpose-built for a keyboard
+whose correct behaviour is SILENCE while a key is held. Its wedge classes are already cured, on
+metal, on the Pi — report-level arm/disarm so no dropped `KeyUp` can strand a hold (P51), the
+UVUG-9 evidence gate so silence is never read as a wedge (the ~10-repeat stop), the PAL-TYPEMATIC
+lapse re-arm, and the half-full `EVENT_QUEUE` backpressure guard. A private x86 copy would re-open
+all of them.
+
+Three wiring points, all x86-side:
+
+1. **Feed.** `decode_boot_keyboard` calls `pal::typematic_note_report(newest_press, &held)` at the
+   report level, before the release edges, with both the newest press and the full held set resolved
+   through the same `ascii_of` fold the `Event::Key` pushes use. One-for-one with the xHCI feed.
+2. **Detach.** `flush_held_releases` (endpoint death) now also calls `pal::note_keyboard_detached()`.
+   The synthesised `KeyUp`s it emits are EVENT-level and the tracker deliberately does not observe
+   the event stream, so without this a key armed at the instant of death would repeat until the
+   30 s `HOLD_MAX_MS` backstop. This is layer 2, used exactly as xHCI's `reset_soft_state` uses it.
+3. **Pump.** `main::x86_typematic_pump()` calls `pal::typematic_tick()` once per device-service pass
+   and pushes the returned ascii into `EVENT_QUEUE`, from all three mutually-exclusive x86 service
+   loops (`usbdebug`, the inline BSP console loop, and `x86_usb_pump`), so repeat does not depend on
+   how many APs came online. Injecting into `EVENT_QUEUE` means the repeat rides the same routing a
+   real press takes — `x86_input_service` → `GUI_CHANNEL_X86` → the render task, with the same asid
+   focus rules and the same per-process ring for a focused ring-3 app.
+
+Constants are the shared ones: `DELAY_MS` 400, `RATE_MS` 40 (~25 chars/s).
+
+### 18.4 SET_IDLE(rate) was considered and rejected
+
+The alternative was to send `SET_IDLE` with a non-zero rate so the device re-reports and the existing
+level loop delivers repeat. Rejected on four counts, any one of which is sufficient:
+
+- **No initial delay.** Repeat would begin at the first idle period, so an ordinary 80 ms tap emits
+  several characters. Delay-then-rate needs host logic regardless.
+- **Rate is the device's, in 4 ms units, and is coarse and unenforceable.**
+- **Devices may STALL `SET_IDLE`.** The boot-protocol spec permits it. A device that refuses leaves
+  x86 with no repeat at all, i.e. the arc silently does not land.
+- **It inverts the held-state contract.** The `SET_IDLE(0)` silence is what the GAME-MODE held-state
+  consumers were written against; making this endpoint stream changes what every consumer sees.
+
+By contrast the host tracker is silence-proof and device-independent.
+
+### 18.5 What is NOT changed
+
+The `Event::Key` / `Event::KeyUp` edge logic in `decode_boot_keyboard` is untouched. GR21's release
+synthesis is metal-proven as of Boot AL and the tracker is a pure observer at that site — it pushes
+nothing from the decoder.
+
+**aarch64 is behaviourally untouched, and this was measured, not asserted.** `./arroyo kernel8` is
+reproducible on this tree (same sources → same hash, verified by a repeat build). Comparing the
+aarch64 kernel ELF before and after the change:
+
+| section | result |
+| --- | --- |
+| `.text` (0xd2618 bytes) | **byte-identical** |
+| `.data` | **byte-identical** |
+| `.rodata` | **1 byte differs** |
+| `.symtab` / `.strtab` | shifted strings |
+
+The single `.rodata` byte is a `core::panic::Location` line number for a `#[track_caller]` site in
+`main.rs`, `3529 → 3535` — the six lines the two x86 pump call sites add above it. No aarch64
+instruction changed.
+
+### 18.6 Witness grammar
+
+- `:: KEYREPEAT-X86: first synthesised repeat — key=0x.. '<c>' (host typematic armed on the EHCI
+  keyboard) == witness ::` — once per boot, at the first repeat. New in this arc, x86 only. The
+  rollup below only prints when a hold ENDS, so without this a capture taken mid-hold could not
+  distinguish "repeating" from "never reached".
+- `[keystat] typematic hold end — key=0x.. repeats=N re-arms=M window=Wms (boot: repeats=.. re-arms=..)`
+  — shared code, per hold. `window=30000` is the expected value here (this keyboard does not idle
+  re-report, so it never earns the tight 1000 ms window).
+- `[keystat] typematic re-arm — …` — a lapse that recovered. Should not appear on a healthy hold.
+- `[uvug9] typematic hold-max — …` — the 30 s backstop. Should not appear at human hold lengths.
+
+No new knob. Repeat is on whenever `ehcihid` is, which is default-ON.
+
+### 18.7 What metal must verify
+
+See `PREDICTION-keyrepeat.md` at the tree root for the falsifiable statement.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).

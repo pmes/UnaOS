@@ -842,7 +842,37 @@ pub fn keyboard_detach_gen() -> u64 {
 //
 // Witness (`[keystat]`): a re-arm names itself for the first few per hold, and every hold that produced repeats
 // closes with one rollup line — repeats, re-arms, and which window was in force. Bounded by human key holds.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+//
+// ── KEYREPEAT-X86 (Boot AL): THE TRACKER IS NOW COMPILED ON x86 TOO ────────────────────────────────
+//
+// Peter, at the bench on Boot AL: *"so far so good with keys except no key repeat."* Everything else the
+// GR21 EHCI arc landed passes on metal — caps lock, Ctrl+letter, no stuck keys, kill works — and repeat is
+// the one thing that does not, because on x86 the ONLY keyboard the operator can reach is the rMBP's
+// INTERNAL one, which is an EHCI device decoded by `drivers/ehci`, and this module was
+// `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]`. The EHCI decoder therefore had no host
+// repeat available to it at all and said so in its own doc block ("repeat on this arch is the DEVICE's,
+// carried by the re-reported level"). Metal refutes the premise that sentence rests on: the device does
+// NOT re-report a key held still — no SET_IDLE is sent on that path, and the keyboard's default idle
+// behaviour is report-on-change — so "the device's" repeat is no repeat.
+//
+// The cfg is widened to `x86_64 + ehcihid` rather than a second implementation being written, because this
+// tracker was PURPOSE-BUILT for exactly this hardware behaviour. Its whole design premise (UVUG-6/UVUG-9)
+// is a keyboard that goes SILENT while a key is held: report-level arm/disarm so no dropped `KeyUp` can
+// strand a hold (P51), an evidence-gated liveness window so silence is never misread as a wedge (the
+// ~10-repeat stop), and a detach layer for the hold that ends by unplug. Every one of those wedge classes
+// is already cured here, on metal, on the Pi. A private x86 copy would re-open all of them.
+//
+// WHAT DOES NOT CHANGE. On aarch64 the predicate below is still satisfied by the same arm it always was,
+// the module's contents are untouched, and no aarch64 call site moves — so aarch64 codegen is unaffected.
+// The x86 wiring is entirely outside this file: `drivers/ehci` feeds `typematic_note_report` from
+// `decode_boot_keyboard` and `note_keyboard_detached` from `flush_held_releases`, and `main`'s x86 pump
+// loops call `typematic_tick` exactly where the aarch64 pump does — before the drain, so a synthesised
+// repeat rides the SAME EVENT_QUEUE routing (asid focus, compositor, shell) a real press takes, and the
+// backpressure guard still refuses to inject past a half-full ring.
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
 mod typematic {
     use core::sync::atomic::{AtomicU32, AtomicU64};
     /// ASCII of the key eligible to repeat, +1 (0 = none). Newest press wins.
@@ -916,7 +946,10 @@ mod typematic {
 /// valid, bits 56..62 = length, bytes 0..5 = the set in report order. A HID boot report carries at most six
 /// keycodes, so nothing is lost. Order-sensitive by design: a reordered set compares unequal, which only ever
 /// costs a missed latch (the safe direction — the conservative `HOLD_MAX_MS` window stays in force).
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
 fn pack_held(held: &[u8]) -> u64 {
     let n = held.len().min(6);
     let mut v: u64 = (1 << 63) | ((n as u64) << 56);
@@ -931,7 +964,10 @@ fn pack_held(held: &[u8]) -> u64 {
 /// down. Observing releases here (armed key absent from `held`) rather than from the drained event stream is
 /// what closes the UVUG-5 dropped-`KeyUp` hole. A synthesised repeat never comes through here (it is not a HID
 /// report), so the initial delay is honoured exactly once per physical press.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
 pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
     use core::sync::atomic::Ordering;
     let now = crate::arch::ms();
@@ -1032,7 +1068,10 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
 /// counters. Called on the report that ends the hold (empty held set) and on a detach, so a hold that ends by
 /// unplug is accounted exactly like one that ends by release. Silent for a hold that never repeated (a tap),
 /// which is the overwhelming majority of key presses.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
 fn typematic_hold_rollup() {
     use core::sync::atomic::Ordering;
     let repeats = typematic::HOLD_REPEATS.swap(0, Ordering::Relaxed);
@@ -1059,7 +1098,10 @@ fn typematic_hold_rollup() {
 /// PAL-TYPEMATIC — the ONE place a liveness/backstop lapse disarms a hold (`typematic_tick`'s layer-3 arm and
 /// the selftest's forced-lapse aid both go through it). Clears the armed slot and PARKS the key, so the next
 /// report that still contains it re-arms instead of the operator having to lift and re-press.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
 fn typematic_lapse_disarm(k: u8) {
     use core::sync::atomic::Ordering;
     typematic::KEY_P1.store(0, Ordering::Relaxed);
@@ -1069,7 +1111,10 @@ fn typematic_lapse_disarm(k: u8) {
 /// UVUG-6 — if a held key's repeat is due, return its ascii and schedule the next one. Returns `None` when no
 /// key is held, the repeat is not yet due, the keyboard detached, liveness lapsed, or EVENT_QUEUE is past half
 /// full. Called once per USB pump pass, BEFORE the drain, by the host pump in `main`.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
 pub fn typematic_tick() -> Option<u8> {
     use core::sync::atomic::Ordering;
     // (2) detach guard: a keyboard unplugged mid-hold never sends its release report.

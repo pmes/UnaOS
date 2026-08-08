@@ -3712,14 +3712,43 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
 /// releases `!`. The earlier gloss "consumers match case-insensitively" was true for letters and
 /// FALSE for shifted symbols (`!` vs `1`), which is the shifted-symbol strand GR21 closed.
 ///
-/// NO TYPEMATIC INTERACTION EXISTS ON THIS PATH, and that is a fact about the build, not a
-/// judgement call: `pal`'s host-side typematic tracker — `typematic_note_report`, `typematic_tick`
-/// and the whole `typematic` module — is `#[cfg(all(target_arch = "aarch64", feature =
-/// "baremetal"))]`, while this driver is `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`.
-/// The two are never compiled together, so the P51 wedge and the REPORT-level arm/disarm that cured
-/// it (`pal.rs`, UVUG-6/UVUG-9/PAL-TYPEMATIC) cannot be reached from here and are not re-broken by
-/// this change; calling `typematic_note_report` from this decoder would not even resolve on x86.
-/// Repeat on this arch is the DEVICE's, carried by the re-reported level.
+/// ── KEYREPEAT-X86 (Boot AL): THIS DECODER NOW FEEDS THE HOST TYPEMATIC TRACKER ────────────────
+///
+/// The paragraph that stood here said "no typematic interaction exists on this path", called it a
+/// fact about the build rather than a judgement call, and closed with *"repeat on this arch is the
+/// DEVICE's, carried by the re-reported level."* The build fact was true; the closing sentence was
+/// a hypothesis, and Boot AL refuted it — Peter, at the bench: *"so far so good with keys except no
+/// key repeat."* Everything else GR21 landed here passes on metal. Repeat does not, because the
+/// rMBP's internal keyboard does NOT re-report a key that is held still: no SET_IDLE is sent on
+/// this path (see KBDWIT), so the device runs its default report-on-change behaviour and the
+/// "re-reported level" the KeyDown loop below relies on for repeat never arrives. One press report,
+/// one `Event::Key`, and the shell's line editor advances exactly one character — which is the same
+/// symptom, from the same cause, that UVUG-5 was written for on aarch64.
+///
+/// So the tracker's cfg was widened to cover `x86_64 + ehcihid` (see `pal.rs` §KEYREPEAT-X86) and
+/// this decoder feeds it at the REPORT level, exactly as `drivers::xhci` does: the newest ascii
+/// pressed THIS report plus the FULL currently-held ascii set, computed through the same
+/// `ascii_of` fold the `Event::Key` pushes use, so the armed key and the pushed character are the
+/// same byte and a release can never disagree with its press about identity.
+///
+/// WHY THE FEED IS HERE AND NOT AT THE EVENT QUEUE. That is the whole of UVUG-6: `EventQueue::push`
+/// silently DROPS on a full 64-slot ring, so a release learned from the drained event stream can be
+/// lost and the tracker would then repeat a key nobody is holding, forever (the P51 wedge). At the
+/// report level a release is learned from the armed key being ABSENT from the held set — a fact the
+/// queue cannot drop. The three disarm layers and the half-full backpressure guard come with the
+/// shared code, already metal-cured on the Pi.
+///
+/// THE KeyDown/KeyUp EDGES BELOW ARE UNTOUCHED, deliberately: GR21's release synthesis is
+/// metal-proven as of Boot AL (SPACE pauses and unpauses, WASD releases, `!` releases `!`,
+/// modifiers get no `KeyUp`) and nothing in this arc may perturb it. The tracker is a pure OBSERVER
+/// here — it pushes no event from this function; `main`'s x86 pump calls `pal::typematic_tick`.
+///
+/// ON A DEVICE THAT DOES RE-REPORT, the level loop below already delivers repeat at the poll rate,
+/// and the tracker would add its own on top. That is not this machine (Boot AL is the measurement),
+/// and on such a device repeat is already faster than any typematic rate, so the shared tracker's
+/// `STREAMS_WHILE_HELD` evidence latch is left to record the fact rather than a private suppression
+/// being invented here — a suppression that could only ever misfire in the direction of removing
+/// the repeat this arc exists to add.
 ///
 /// ── ALLKEYS P1 (GR21): CAPS LOCK, THE HALF THIS DECODER WAS STILL MISSING ──────────────────────
 ///
@@ -3794,6 +3823,34 @@ unsafe fn decode_boot_keyboard(
             serial_println!("EHCI-HID: KEY: '{}' (scancode {:#x})", ascii as char, keycode);
             crate::pal::push_event(crate::pal::Event::Key(ascii));
         }
+    }
+
+    // KEYREPEAT-X86: feed the host-side typematic tracker at the REPORT LEVEL — BEFORE the release
+    // edges below and before anything else this report will push, so a `KeyUp` the 64-slot ring may
+    // later DROP can never strand a held key (UVUG-6's root cause). `newest_press` is the ascii of a
+    // keycode that is down NOW and was NOT down in the previous report; `held` is every ascii down
+    // now. Both resolve through `ascii_of`, the same fold the `Event::Key` pushes above used, so the
+    // tracker arms the exact byte the consumers received. Non-ascii usages (F-keys, the lock keys)
+    // are absent from both, exactly as on the xHCI feed — `IDLE_RUN_TO_LATCH` covers the residue.
+    // Mirrors `drivers::xhci`'s call site one-for-one; the tracker itself is shared code.
+    {
+        let mut held: [u8; 6] = [0; 6];
+        let mut hn = 0usize;
+        let mut newest_press: u8 = 0;
+        for &keycode in cur_keys.iter() {
+            if keycode <= 1 {
+                continue;
+            }
+            let ascii = ascii_of(keycode);
+            if ascii != 0 {
+                held[hn] = ascii;
+                hn += 1;
+                if !prev_keys.contains(&keycode) {
+                    newest_press = ascii;
+                }
+            }
+        }
+        crate::pal::typematic_note_report(newest_press, &held[..hn]);
     }
 
     // The release edges. Bounded by six per report, and a human's key releases are human-rate, so
@@ -3890,6 +3947,21 @@ unsafe fn flush_held_releases(e: &mut IntEp, idx: usize) {
     }
     e.kbd_prev_keys = [0; 6];
     e.kbd_prev_mods = 0;
+    // KEYREPEAT-X86 — layer 2, and the one hole the ring-3 flush above does NOT close now that this
+    // path has a host repeat. The tracker is fed only from `decode_boot_keyboard`, and a retired
+    // endpoint produces no further report — so a key armed at the instant of death would never see
+    // the ABSENT-from-held-set fact that disarms it, and `typematic_tick` would inject a repeat
+    // every `RATE_MS` until the coarse `HOLD_MAX_MS` backstop fired 30 s later. The synthesised
+    // `KeyUp`s above cannot substitute: they are EVENT-level and the tracker deliberately does not
+    // observe the event stream (that was UVUG-5's dropped-`KeyUp` hole).
+    //
+    // `pal::note_keyboard_detached` is the seam built for exactly this — xHCI's `reset_soft_state`
+    // calls it on the same fact — and it is arch-neutral: a plain generation counter the tracker
+    // folds on its next tick, dropping the armed key, the parked lapse and the streaming verdict.
+    // Called unconditionally rather than only when something was held: this function runs ONCE per
+    // endpoint death (it is idempotent by the zeroing above, and `e.dead` makes the caller skip the
+    // entry forever after), so a spurious generation bump costs nothing when nothing is armed.
+    crate::pal::note_keyboard_detached();
 }
 
 // ======================================================================================
