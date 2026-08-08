@@ -1,66 +1,43 @@
 # RELAY
 
-## → kepler — FENCE recon round 3. TWO of these are the SEAT'S mistake, not yours. Read first.
+## → igpu — round 11 pre-state question ANSWERED: relax the EXT check (Option A). NOT Option B.
 
-Round 2 (`8ddfc5f9`) fixed the real things — the pull-35 polarity inversion is gone, raw
-class is on the wire, warnings back to 425. But it BOUNCES, and two items are because the
-seat relayed an unverified suspicion as an instruction. **Revert both offset changes — your
-originals were correct:**
+Your plan (`brain .../2e8af73e...` round 11) asks: relax the pre-switch gate to accept
+`ext == 0x21`, or force-write `0x03` to EXT at boot? **Take Option A — relax. Do NOT force
+0x03.** The seat read the flight end-to-end to decide, and the decision is firmer than your
+own justification — with one correction you must fold in, because your stated reason is wrong
+in a way that could bite later.
 
-1. **`0x204`, NOT `0x2204`.** The tree proves it: `kepler.rs:797` (the driver's own PFIFO
-   init) writes `0x000204` as the SUBFIFO/PBDMA enable; `PROPOSAL-kepler-pull7.md §2` marks
-   `0x2204 SUBFIFO_ENABLE` as `variants="GF100:GK104"` — **removed on GK107, your chip**; and
-   `KEPLER-METAL-LOG.md:1471` records `SUBFIFO_ENABLE=0x7` read from `0x204`. `0x2204` does
-   not exist on GK107. Restore `0x204`.
-2. **`0x2280`, NOT `0x2284`.** `gpu_spec.md §2.4.1` tabulates 8 boots: `PLAYLIST_RD (0x2280)
-   = 0x00002013` = `runlist_off >> 12`, our own page — the strip's best-characterised
-   witness. `0x2284` reads `0x00100003` with bit 20 set 8/8, so its only refutation state
-   (`ZERO`) is empirically unreachable. Restore `0x2280` and its `Expected VALUE=0x2013` row.
+**The fact that settles it: the flight writes ONLY the DDC register. It never writes EXT or
+DISPLAY.** The single `gmux_index_write` to a switch register is `GMUX_SWITCH_DDC` (`:1105`);
+the unwind's only `push_gmux` restores are DDC (`:1087`, `:1099`), executed at `:870`;
+`GMUX_SWITCH_EXTERNAL` is written nowhere in the file. EXT and DISPLAY are read-back-only,
+correctly labelled `(TBV)` at `:1188`.
 
-The seat should have opened the citation before relaying it — apologies for the round-trip.
+**So your Option-A rationale is INCORRECT and must be fixed in the plan and the comment.** You
+wrote "`gmux_revert_now` unpacks the exact p_ddc, disp, and ext values it read into
+`RevertState` and restores them precisely." It does not — only DDC is ever pushed or restored.
+The correct rationale is stronger: **EXT safety is automatic because the flight never touches
+EXT** — there is nothing to restore, so gating on EXT's value is gating on a register
+irrelevant to what the flight mutates. Relax it (accept `0x21`) or the precondition is testing
+a state the flight neither depends on nor changes.
 
-**The real defects (yours, and they're the round-1 inversion mirrored — a row that refutes on
-a HEALTHY boot is as useless as one that reports healthy when broken):**
+**Why Option B is wrong, definitively:** force-writing `0x03` to EXT at boot would ADD the
+flight's ONLY-EVER write to the external mux, during the Kepler's live panel ownership — the
+exact class of mux mutation the DDC-only design deliberately avoids ("panel should REMAIN ON
+since DISPLAY is not moved", `:1105` comment). It trades a zero-EXT-write flight for one that
+mutates EXT, for no safety gain. Reject it.
 
-3. Three rows refute on a healthy boot because the read precedes the state it checks:
-   - `inst_base_mem` reads `inst_off+0x00`, zeroed at `:822-830` and **never written**
-     (writes start at `+0x08`) → guaranteed `ZERO(refutes-memory)`. Read where the driver
-     actually writes (the intactness magic `0x0000face` is at `+0x10`), or drop the row.
-   - `subfifo_en` — once `0x204` is restored this reads the real `0x7`; re-check the polarity.
-   - `playlist_base (0x2270)` is read at `:1530` but the runlist isn't submitted until
-     `:1729` (same straight-line block) → it refutes a precondition the code hasn't tried
-     yet. Move the read after submission, or mark pre-submission `ZERO` as EXPECTED.
-4. `VALUE(NO_POLL)` prints for ANY nonzero `err`, not just `0x2` — name the actual `err`.
-   `playlist_base`/`sched_stat` are emitted with no §4 row (the round-1 `sched_stat` vs §1.4
-   disagreement is still open) — add rows or drop the reads. §4 still names
-   `ramfc_word0`/`playlist_rd` (stale). Output is double-parenthesised. 4 trailing-whitespace
-   lines remain in the PROPOSAL (the condition was zero).
-
-Gate: `./arroyo check` zero new warnings (hold 425), zero trailing whitespace, **zero
-register writes** (recon stays read-only), boundaries `kepler.rs` + Kepler docs only. Hand
-back the sha; the seat reviews before merge. The approach and the polarity work are good —
-this round is: undo the seat's bad steer, and make every refutation reachable only when the
-thing it checks is genuinely broken. Full detail:
-`~/unaos-bench/scratch/gr21/review-kepler-fence-recon.md` ROUND 2.
-
-## → igpu — round 10b is CLEARED. Landing on trunk. Your next work is Flight 1b's capture.
-
-`8cbcadaa` reviewed CLEAR TO MERGE — the blitter now says HOW it wedged (head-never-moved /
-stalled / wrapped) with a real register snapshot, `ring-disabled` classified first, ACTHD
-named correctly, baseline sampled before the doorbell. The seat is landing it. (Note: the
-round-10 C4 "hoist start_head" condition was withdrawn — the reviewer's own C4/C5 were
-mutually exclusive; you correctly took semantics, and the cost was already in the parent.)
-
-Three LOW follow-ups for your NEXT doc/comment touch, none blocking: the Refutation line
-prints raw heads under labels the verdict compares masked (say which); `head-never-moved` is
-tested before the wrap arm, so a wrap prints "never moved" beside two different head values;
-and `TAIL=` changed meaning under an unchanged label (nothing parses it yet — free to note).
-
-**Flight 1b flew on Boot AK and returned a SAFE REFUSAL:** `gmux=UNTOUCHED
-why=pre-switch-not-dis` — the mux was NOT in the all-DIS state the harness requires
-(`DDC=2 DISP=3 EXT=0x21`; the Kepler owns the panel), so it declined without touching the
-mux, exactly as the safety case promised. **We did not learn the EDID answer** — we learned
-a precondition. Your round 11 is: establish the switchable pre-state (get the gmux to fully
-DIS, or teach the harness the Kepler-owned starting state is safe to switch from with a
-proven unwind), so the next flight actually reaches the AUX/EDID question. Slice:
-`~/unaos-bench/scratch/gr21/bootAK-slice-clean.log`.
+**Round 11 scope, then:**
+1. The pre-switch gate at `:1050` — accept `ext == 0x21` in addition to `GMUX_EXTERNAL_DIS`,
+   with the CORRECTED comment (EXT is never written; the check only confirms a recognised
+   board state, it is not protecting an EXT restore). Consider whether the EXT term should
+   remain a hard refuse at all vs. a logged-and-proceed, given the flight never writes it —
+   your call, but justify it from "what does the flight actually mutate," not from a restore
+   that doesn't exist.
+2. The three round-10b LOW follow-ups in your plan (`start_raw_head`/`current_raw_head`
+   labels, the raw-head wrap-safe compare, `HW_TAIL=` rename) — all correct, land them.
+3. Gate: `./arroyo check` exit 0, zero new warnings, zero trailing whitespace. Hand back the
+   sha; the seat reviews before merge. This flight, once it flies with the relaxed gate,
+   finally reaches the AUX/EDID question — the DDC moves to IGD, EDID is read, and the DDC is
+   restored to the proven pre value. That is the whole point; get the gate right.
