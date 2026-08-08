@@ -93,7 +93,10 @@ A successful run reads roughly (PREDICTED TRANSCRIPT):
 
 ```
 :: igpu: PROTOCOL PROVEN (version plausible)
-:: igpu-dpy: pre-switch state DDC=0x02 DISP=0x03 EXT=0x03
+:: igpu-dpy: pre-switch state DDC=0x02 DISP=0x03 EXT=0x21
+(EXT reads 0x21 on a Kepler-owned boot — the metal norm since AK; 0x03 fully-DIS is also
+accepted. Any other EXT value refuses out loud. Round 11 relaxed the gate; the flight
+still writes only DDC, so EXT never needs restoring.)
 :: igpu-dpy: rung=00 name=census ok=1 bdsm=... ggc=... ggtt0=... ggtt1=... aux_ctl=... frmcnt=...
 :: igpu: [GMUX] running Unwind stack self-test
 :: igpu: [GMUX] Unwind stack MMIO self-test passed

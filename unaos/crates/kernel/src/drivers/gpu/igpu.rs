@@ -260,6 +260,12 @@ const GMUX_DDC_DIS: u8 = 0x02;
 const GMUX_DISPLAY_DIS: u8 = 0x03;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_EXTERNAL_DIS: u8 = 0x03;
+/// The EXT port's value on a Kepler-owned boot — metal fact, Boot AK:
+/// `pre-switch state DDC=0x02 DISP=0x03 EXT=0x21`. Accepted by the Flight 1b pre-switch
+/// gate alongside `GMUX_EXTERNAL_DIS` because the flight writes ONLY the DDC register —
+/// EXT is never modified, so no EXT state needs restoring (round 11, review-conditioned).
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_EXTERNAL_KEPLER_OWNED: u8 = 0x21;
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_DDC_IGD: u8 = 0x01;
@@ -635,7 +641,6 @@ impl BltRing {
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
 
         let start_raw_head = unsafe { core::ptr::read_volatile((self.bar0 + regs::BLT_RING_HEAD) as *const u32) };
-        let start_head = start_raw_head & 0x1FFFFC;
 
         unsafe {
             core::ptr::write_volatile((self.bar0 + regs::BLT_RING_TAIL) as *mut u32, tail);
@@ -1047,8 +1052,9 @@ pub unsafe fn gmux_igd_switch() {
         let ext = gmux_index_read(GMUX_READ_EXTERNAL);
         serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", p_ddc, disp, ext);
 
-        if p_ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32 || (ext != GMUX_EXTERNAL_DIS as u32 && ext != 0x21) {
-            serial_println!(":: igpu: [GMUX] REFUSED: pre-switch state is not fully DIS (DDC={}, DISP={}, EXT={}) — no known safe state to return to ::", p_ddc, disp, ext);
+        if p_ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32
+            || (ext != GMUX_EXTERNAL_DIS as u32 && ext != GMUX_EXTERNAL_KEPLER_OWNED as u32) {
+            serial_println!(":: igpu: [GMUX] REFUSED: pre-switch state outside the accepted set (DDC must be DIS, DISP must be DIS, EXT must be DIS or Kepler-owned 0x21) (DDC={}, DISP={}, EXT={}) ::", p_ddc, disp, ext);
             return Err("pre-switch-not-dis");
         }
         pre_ddc = Some(p_ddc);
