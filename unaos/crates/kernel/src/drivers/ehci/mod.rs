@@ -681,8 +681,9 @@ fn bt_cfg_has_candidate(cfg: &[u8]) -> bool {
 ///
 /// Deliberately NOT pushed into `Controller::int_eps`: that list is drained by `service()`,
 /// which would run HCI event packets through the HID report decoders. This endpoint is read
-/// inline by the L0 sequence and then deactivated. It does consume one of the four static
-/// int-EP slots for the life of the boot (the recon counted two free on this controller).
+/// inline by the L0 sequence and then deactivated. It owns the pool's dedicated `bt_slot` —
+/// NOT one of the `MAX_INT_EPS` (6) HID slots — since MTFIX: on Boot AN it consumed the
+/// fourth of four HID slots and the internal trackpad, enumerated last, fell off the end.
 #[cfg(feature = "bt")]
 struct BtEvtEp {
     qh: *mut Qh,
@@ -2675,7 +2676,9 @@ impl Controller {
     /// BT-L0 — build + link the periodic QH for the HCI event endpoint. Same QH shape and same
     /// frame-list splice as `arm_interrupt_ep` (including the split masks for a FS endpoint
     /// behind a TT), minus the `int_eps` registration: nothing here is ever handed to
-    /// `service()`. Returns None (with a trace) if the static slot pool is exhausted.
+    /// `service()`. Returns None (with a trace) on a second arm attempt (`bt_evt_armed` —
+    /// the quiesced QH stays linked, so re-arming would self-loop the frame list), on mps=0,
+    /// or on a phys-contract violation. It never touches the HID slot pool.
     #[cfg(feature = "bt")]
     unsafe fn bt_arm_events(&mut self, t: &Target, ep: u8, mps: u16) -> Option<BtEvtEp> {
         // MTFIX: the event endpoint owns `bt_slot`, not one of the HID `int_slots` — see the
@@ -3568,7 +3571,7 @@ impl Controller {
 // that endpoint's own completions.
 //
 // BOUNDS. `kbdwit_fired` latches on the first dump: at most one dump per endpoint per boot, at
-// most `MAX_INT_EPS` (4) per controller for a whole boot. `kbdwit_broke` latches the same way, so
+// most `MAX_INT_EPS` (6) per controller for a whole boot. `kbdwit_broke` latches the same way, so
 // KBDWIT-2 adds at most one further line per endpoint per boot — eight lines, once, per endpoint,
 // for the entire boot. No loop, no retry, no wait, no allocation, no register write — every access
 // below is a read. Cost on the service path is one bool test plus one `ms()` read before the
