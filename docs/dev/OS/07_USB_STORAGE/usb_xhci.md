@@ -5664,6 +5664,81 @@ See `PREDICTION-keyrepeat.md` at the tree root for the falsifiable statement.
 
 ---
 
+## 19. DBLSTROKE — the press loop was level-triggered (Boot AN, 2026-08-08)
+
+Peter, at the bench on Boot AN: *"key repeat good but typing fast causes double stroke."* Held-key
+repeat (§18) is correct on metal and normal-speed typing is correct; typing FAST doubles characters.
+
+### 19.1 The mechanism, read straight off the capture
+
+`decode_boot_keyboard`'s press loop pushed `Event::Key(ascii)` for **every keycode in every report**.
+A USB boot report is a LEVEL — bytes 2..8 re-state the full held set — so any report arriving while a
+key is still down re-delivered that key as a fresh press. Fast typing is *defined* by overlap (the
+next key goes down before the last comes up), so every overlapped pair produces exactly such a
+report. `EHCI-HID: KEY:` is logged once per push, so Boot AN convicts it with no new instrument:
+
+```
+[1228135ms] KEY: 'h'                  report [h]     press edge
+[1228275ms] KEY: 'h'   KEY: 'e'       report [h,e]   'h' RESTATED, 'e' pressed
+[1228413ms] KEY: 'e'   KEYUP: 'h'     report [e]     'e' RESTATED, 'h' released
+[1228427ms] KEY: 'l'                  report [l]     press edge
+```
+
+Six `Event::Key` for the four physical presses of "help", twice in the capture (1228135 ms and
+1233645 ms). Type slowly enough that each key is released before the next goes down and every report
+carries one key: no duplicate is possible. That is the reported symptom, exactly bounded.
+
+Ruled out on the same evidence: the typematic tracker (doubles 24..140 ms apart with no 400 ms delay
+elapsed; `re-arms=0` boot-wide; it pushes nothing from the decoder), the CLICK-3 silence/re-press
+recovery (pointer path — it stamps no keyboard state), a duplicated pump (the two pushes carry two
+different report timestamps from one `serial_println!` site), and the console/line-editor consumer
+(the doubling is in the producer's own line, before any consumer sees an event).
+
+### 19.2 The fix
+
+The press loop now pushes only on a press EDGE — `!prev_keys.contains(&keycode)` — reading the same
+`prev_keys`/`cur_keys` diff the release loop has always read, in the opposite direction. Press and
+release are one fact seen twice and cannot disagree about how many there were. This is also the
+contract the rest of the tree was already written against: `vug.rs` GAME-MODE states it verbatim
+("the HID path delivers a Key on the PRESS edge and a KeyUp on the RELEASE edge").
+
+Nothing pays for the lost level repeat, because there was none to lose *on this machine*: no
+`SET_IDLE` is sent on this path (KBDWIT) and the internal keyboard is report-on-change, which is why
+§18 had to add the host tracker at all. Level-driven repeat here was only ever the doubling, paced by
+the operator's other fingers rather than by any repeat rate. On a hypothetical idle-re-reporting
+keyboard the tracker's 400 ms/40 ms is a better repeat than an unthrottled poll-rate spew.
+
+Untouched: the release loop, the dead-endpoint flush, shifted-symbol release folding, Ctrl folding,
+caps lock and the LED SET_REPORT, and the tracker feed (still `newest_press` + the full held set
+through the same `ascii_of` fold).
+
+### 19.3 Witness grammar
+
+- `[keystat] ehci press — edges=E restated=R rollover_reports=P dbl=D window=50ms` — first three
+  suppressions each print, then one line per 32. `restated` counts the pushes the edge gate
+  suppressed, i.e. the doubles the old loop would have emitted; `R>0` is the positive proof that the
+  operator typed with overlap, which is what makes a clean `dbl` result meaningful rather than merely
+  untested. `rollover_reports` counts reports with two or more character keys down — "typing fast"
+  measured rather than described.
+- `[keystat] ehci double-push — ascii=0x.. pushed twice Nms apart (<= 50ms); the PRODUCER is
+  doubling, not the console (boot dbl=..)` — first 8 individually, then counted. An INDEPENDENT
+  detector over what the decoder actually pushes, so it stays valid however the input side is
+  rewritten. It is what makes the next boot decisive either way: doubles on screen with `dbl=0` and
+  `restated>0` moves the fault downstream to the console echo or the line editor; doubles with
+  `dbl>0` refutes this diagnosis and names the ascii and interval.
+
+Both counters are boot totals, zero-cost on a boot where nobody types (no line is emitted). x86-only
+by construction — `drivers/mod.rs` gates `pub mod ehci` on `all(target_arch = "x86_64", feature =
+"ehcihid")`, so aarch64 compiles none of it and its codegen is byte-identical.
+
+### 19.4 What metal must verify
+
+`~/unaos-bench/scratch/gr22/dblstroke-predictions.md` — the falsifiable statement, with the
+falsifiers spelled out. Headline: "help" typed at speed yields exactly four `EHCI-HID: KEY:` lines,
+`dbl=0`, `restated>0`, and §18's `[keystat] typematic hold end` unchanged.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).
