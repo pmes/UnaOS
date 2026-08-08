@@ -5737,6 +5737,77 @@ by construction — `drivers/mod.rs` gates `pub mod ehci` on `all(target_arch = 
 falsifiers spelled out. Headline: "help" typed at speed yields exactly four `EHCI-HID: KEY:` lines,
 `dbl=0`, `restated>0`, and §18's `[keystat] typematic hold end` unchanged.
 
+## 20. MTFIX — the Bluetooth radio ate the trackpad's interrupt-EP slot (Boot AN, 2026-08-08)
+
+### 19.1 The symptom
+
+Boot AN (trunk `d7155e29`) had **no mouse**: over a 20-minute sit with the operator working
+the trackpad, not one motion decode and no cursor. The keyboard (addr 6) and its typematic
+repeats worked the whole time. Boot AL (trunk `eacef0bb`, before bt-l0) had a working cursor.
+
+### 19.2 The conviction — a static slot budget, printed verbatim in the log
+
+Each EHCI controller owns a fixed pool of interrupt-endpoint slots in its `DmaPool`
+(`drivers/ehci/qh.rs`), and `MAX_INT_EPS` was **4**. Controller [1]'s arm order on the rMBP:
+
+| ms | endpoint | slot |
+|---|---|---|
+| 1773 | keyboard addr 6 IN1 | `int_slots[0]` |
+| 1799 | boot-mouse addr 7 IN1 | `int_slots[1]` |
+| 1824 | **bt-l0 HCI event endpoint, addr 8 IN1** | `int_slots[2]` |
+| 1859 | trackpad's boot-keyboard interface, addr 9 IN3 | `int_slots[3]` |
+| 1860 | trackpad's **vendor-multitouch** interface, addr 9 IN1 | *(none — skipped)* |
+
+`bt_arm_events` took `int_slots[int_next]` and bumped `int_next`, so the radio's event
+endpoint — which is read synchronously by the L0 sequence and is deliberately never handed to
+`Controller::service` — nevertheless owned one of the HID budget's four slots for the whole
+boot. The internal trackpad's multitouch interface is the **last** endpoint enumerated, so it
+is the one that fell off the end. It was never armed: no QH, no frame-list link, no `int_eps`
+entry. The log says so plainly, at 1860 ms:
+
+```
+:: EHCI-HID: [1] static int-EP pool exhausted (4) — endpoint skipped ::
+:: EHCI-HID: [1] M1 armed vendor-multitouch addr=9 ep=IN1 mps=64 interval=2 id=0x44 … == witness ::
+```
+
+Before bt-l0 the same machine used exactly 4 of 4. The radio pushed it over by one.
+
+### 19.3 The second defect — a witness that could not fail
+
+The `M1 armed vendor-multitouch` line above is the endpoint that had just been skipped.
+`arm_interrupt_ep` returned `()`, and **both** call sites printed their `== witness` arm line
+and stamped `bootlog` unconditionally after calling it. That is what made "the trackpad is
+armed and silent" the working theory for a whole sitting — the log asserted an arm that never
+happened. `arm_interrupt_ep` now returns `bool`; the witnesses and the `ehci:trackpad-armed`
+milestone are gated on it, and the exhaustion trace is a `STOP-NOTE` naming addr/intf/ep.
+
+### 19.4 The fix
+
+1. `DmaPool` gains `#[cfg(feature = "bt")] pub bt_slot: IntSlot` — the HCI event endpoint gets
+   its own slot, outside `int_slots`. Knob-off the field does not exist and the pool layout is
+   unchanged.
+2. `bt_arm_events` uses `bt_slot`, no longer touches `int_next`, and refuses a second arm on
+   the same controller (`Controller::bt_evt_armed`). The quiesced QH stays **linked** in the
+   periodic chain for the life of the boot (`bt_quiesce_events` only clears Active — the chain
+   must not be rewritten behind endpoints armed after it), so re-arming that slot would rebuild
+   a QH the controller is still walking *and* splice its own physical address in as its own
+   `horiz` successor: a self-loop in the frame list.
+3. `MAX_INT_EPS` 4 → 6. Freeing the BT slot alone restores the exact pre-bt-l0 4/4 fit; the
+   headroom is what keeps one extra plugged-in HID device from starving the internal trackpad
+   again, given an arm order that puts it last. Cost is two static `IntSlot`s per controller.
+
+Refuted along the way: the ordering hypothesis ("the BT event endpoint sits ahead of the
+trackpad in `int_eps` and the service loop starves everything after it"). `bt_arm_events` never
+pushes into `int_eps`, so `Controller::service` cannot see or mis-iterate past it.
+
+### 19.5 What metal must verify
+
+`~/unaos-bench/scratch/gr22/mtfix-predictions.md` carries the falsifiable statement. In short:
+no `static int-EP pool exhausted` line anywhere in the boot; the `M1 armed vendor-multitouch`
+witness still present at ~1860 ms and now true; cursor armed and motion decoding; and every
+bt-l0 witness (census/claim/reachability, `HCI_Reset -> CmdComplete status=0x00`, `hci_ver=0x06
+… -> BROADCOM`) unchanged on a `UNAOS_BT=1` boot.
+
 ---
 
 ## See also
