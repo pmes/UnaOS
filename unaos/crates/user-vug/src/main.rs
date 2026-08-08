@@ -252,6 +252,10 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 2;
 const SYS_YIELD: u64 = 4;
+/// VUGPARK-FALLBACK: `SYS_SLEEP_MS(ms)` — a real timed park on both arches (5 on each; see
+/// `arch/{aarch64,x86_64}/syscall.rs`). Used ONLY when `SYS_INPUT_WAIT` answers a negative, which
+/// today means the x86 dispatcher has no verb 28 and its default arm returned `-ENOSYS`.
+const SYS_SLEEP_MS: u64 = 5;
 const SYS_GETINFO: u64 = 7;
 const SYS_THREAD_SPAWN: u64 = 21;
 const SYS_THREAD_EXIT: u64 = 22;
@@ -510,9 +514,42 @@ fn input_poll() -> u64 {
 }
 /// VUGPAUSE-2: block until this process's input ring may be non-empty. Never called from the rendering
 /// path — only from the idle path, where the alternative was `sys_yield` in a runnable spin.
-#[inline(always)]
+///
+/// VUGPARK-FALLBACK — THE RETURN VALUE IS NOW READ, BECAUSE ON x86 IT IS AN ERROR.
+///
+/// `SYS_INPUT_WAIT` (28) is implemented on aarch64 and NOT on x86_64: that dispatcher's default arm
+/// answers `-ENOSYS` (-38) having done nothing at all. Discarding the return therefore turned the one
+/// call this program makes to STOP burning a core into a no-op, and the idle path — a `continue` back
+/// to the top of the same loop — degenerated into a tight busy spin. Boot AJ measured what that costs
+/// once the compositor stops charging for a suppressed present: ~42,000 present attempts per second
+/// per hidden window, `comp_rate=0.0/s`, verdict `STARVED`.
+///
+/// So: check it, and on ANY negative fall back to a real timed park. `SYS_SLEEP_MS` exists on both
+/// arches and is a genuine tick sleep on metal, so the idle vug leaves the run queue either way. 16 ms
+/// is one frame at 60 Hz — long enough that the park is a park, short enough that a keystroke arriving
+/// the instant after the sleep begins is acted on within a frame, which is below the threshold at which
+/// a human calls an app unresponsive.
+///
+/// This is DELIBERATELY NOT the real fix. `SYS_INPUT_WAIT` on x86 (the aarch64 park + the router's wake
+/// seam) is a separate arc; when it lands, this call starts returning 0 and the fallback goes cold on
+/// its own with nothing to remove. Arch-neutral by construction: on aarch64 the syscall succeeds, the
+/// branch is never taken, and the observable behaviour of this program is exactly what it is today.
+///
+/// `#[inline(never)]`, AND IT IS LOAD-BEARING — this was `#[inline(always)]`. `VUG-X86.ELF` is gated at
+/// a hard 16384 bytes and `.text` sits within tens of bytes of the 8 KiB boundary at which `.bss` moves
+/// to the next page and the FILE grows by 4096 in one step (12568 -> 16664, i.e. straight through the
+/// ceiling). Measured, this arc's two hunks: `always` 8165 -> 8237 `.text`, over the boundary and the
+/// gate fails; `never` 8141, twenty-four bytes UNDER the untouched program. Same phenomenon the SIZE
+/// note above `futex_wait` records — the cost is inlining pressure in the frame loop, not the code
+/// written here. Nothing about correctness depends on it; the image ceiling does.
+#[inline(never)]
 fn input_wait() {
-    unsafe { sys0(SYS_INPUT_WAIT) };
+    /// One 60 Hz frame — the fallback park's period. See the note above.
+    const FALLBACK_PARK_MS: u64 = 16;
+    let rc = unsafe { sys0(SYS_INPUT_WAIT) };
+    if rc >> 63 != 0 {
+        unsafe { sys1(SYS_SLEEP_MS, FALLBACK_PARK_MS) };
+    }
 }
 
 /// FBCON-DMG: present SOURCE rows `[y0, y1)` of `win`, with the MANDATORY whole-box fallback.
@@ -831,6 +868,21 @@ const H_PAUSE: u32 = 1 << 6;
 /// manual control, or holding the pause key would silently stop the idle tumble of an unpaused vug.
 const H_MOTION: u32 = H_YAW_L | H_YAW_R | H_PIT_U | H_PIT_D | H_ZOOM_IN | H_ZOOM_OUT;
 
+/// VUGPAUSE-KEYUP: has this program EVER been delivered an `EV_KEYUP`? One-way, 0 -> 1. It is the
+/// evidence that decides whether the REST of the held word can be trusted — see the note at the
+/// `H_PAUSE` toggle in `drain_input`.
+///
+/// It rides the held word instead of getting a static of its own because a static costs this program
+/// 4096 bytes — `.bss` gains a page, measured — and `VUG-X86.ELF` is built against a HARD 16384-byte
+/// EL0 user window that the 12568-byte binary has under 4 KiB of headroom in. A spare bit in a `u32`
+/// already passed by `&mut` everywhere it is needed costs nothing.
+///
+/// It is NOT a key bit and must never be treated as one: `key_bit` cannot return it, `H_MOTION`
+/// excludes it, and the ONE place that clears the word wholesale — `EV_BUTTON`'s hot-unplug net —
+/// preserves it explicitly. A click must not make this program forget what it learned about its
+/// keyboard.
+const H_SAW_KEYUP: u32 = 1 << 7;
+
 // HID-KEYS arrow C0 codes (see vug.rs), ESC, and CLICK-ONE's pause key.
 const K_RIGHT: u8 = 0x1C;
 const K_LEFT: u8 = 0x1D;
@@ -935,6 +987,31 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
                     // CLICK-ONE: SPACE toggles on the TRUE press edge — a bit that is not already set.
                     // Every later KeyDown for a key still down is a typematic repeat and is absorbed by
                     // the `|=` below, exactly as it always has been for the motion keys.
+                    //
+                    // VUGPAUSE-KEYUP — and the edge test is SUSPENDED while this program has never been
+                    // shown a release. Boot AJ is what that costs otherwise: the kernel's EHCI decoder
+                    // emitted presses only, so `H_PAUSE` was set by the first SPACE and NOTHING could
+                    // ever clear it (`EV_KEYUP` below is the sole writer that does). Pause latched on,
+                    // `frozen` latched on, and the vug had to be killed. The decoder is fixed in the
+                    // same arc, and this is the ring-3 half of the belt: an app should not be one
+                    // driver bug away from a state its operator cannot leave.
+                    //
+                    // WHY IT IS CONDITIONED ON `H_SAW_KEYUP` RATHER THAN JUST DELETING THE `!*held`
+                    // TERM. Deleting it would toggle pause 25 times a second on aarch64, where
+                    // `pal.rs`'s typematic engine SYNTHESISES a KeyDown every 40 ms under a resting
+                    // thumb — the exact reason the edge test was written (see `H_PAUSE`). One bit of
+                    // evidence tells the two worlds apart with no `cfg` and no guesswork: a program that
+                    // has received even ONE release is on a path whose releases work, so its held state
+                    // is true and the edge test is right; a program that has never received one cannot
+                    // trust `*held` at all, and a level-free toggle is strictly better than a wedge.
+                    // The bit is one-way — a keyboard that emits releases does not stop — so the
+                    // fallback ends for good at the first release and never oscillates.
+                    //
+                    // The suspension is implemented at the BOTTOM of this function rather than as a
+                    // second term here: retiring `H_PAUSE` from the held word once per drain is one
+                    // test-and-mask outside the event loop, and this program is 45 bytes of `.text`
+                    // from a hard 16 KiB image ceiling (see `H_SAW_KEYUP`). The behaviour differs only
+                    // for two SPACE presses inside ONE drain, which no human hand produces.
                     if b & !*held & H_PAUSE != 0 {
                         fi.pause_keys += 1;
                     }
@@ -942,6 +1019,10 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
                 }
             }
             EV_KEYUP => {
+                // VUGPAUSE-KEYUP: the evidence bit. Set from ANY release, mapped or not — the question
+                // it answers is "does this input path deliver releases at all?", which a release for a
+                // key this program does not bind answers just as well as one for a key it does.
+                *held |= H_SAW_KEYUP;
                 let k = (lo & 0xFF) as u8;
                 let b = key_bit(k);
                 if b != 0 {
@@ -962,8 +1043,11 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
                 // bool and an i32 through two.
                 if mask != 0 {
                     *drag = 1;
-                    // Press edge also clears held keys — the vug.rs hot-unplug net.
-                    *held = 0;
+                    // Press edge also clears held keys — the vug.rs hot-unplug net. VUGPAUSE-KEYUP:
+                    // every KEY bit goes, and the evidence bit stays. What the net exists to undo is a
+                    // key whose release never arrived; what this program has learned about whether
+                    // releases arrive AT ALL is not held state and a click is no evidence against it.
+                    *held &= H_SAW_KEYUP;
                 } else {
                     if *drag <= CLICK_THRESH {
                         fi.clicks += 1;
@@ -982,6 +1066,20 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
             }
             _ => {}
         }
+    }
+    // VUGPAUSE-KEYUP: on an input path that has never delivered a release, `H_PAUSE` is not allowed to
+    // persist past the drain that set it — nothing else would ever clear it, and a latched bit turns
+    // the press-edge test above into a one-way switch (Boot AJ: pause on, never off, kill the app).
+    // Retiring it here rather than suppressing the edge test per event costs one mask per drain and
+    // keeps the aarch64 typematic absorption exactly as it is: there, `H_SAW_KEYUP` is set by the first
+    // key release the operator ever makes, and this line stops firing for the rest of the run.
+    //
+    // The one residue, stated rather than hidden: until that first release, a release-emitting path is
+    // indistinguishable from a release-less one, so a SPACE held past `DELAY_MS` (400 ms) as the VERY
+    // FIRST key of a run would see its synthesised repeats toggle pause. It costs one keystroke to
+    // leave and cannot recur — any release at all, of any key, ends it for the process's lifetime.
+    if *held & H_SAW_KEYUP == 0 {
+        *held &= !H_PAUSE;
     }
     fi
 }
