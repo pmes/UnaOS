@@ -3901,7 +3901,9 @@ struct BgJob {
 /// table's full arm is reachable only if MAX_PROCS grows past it. 8 slots kept (harmless headroom).
 /// PROCS-6 raised the cap to 6: 6 bg jobs with no foreground `run` (5 with one), still under this
 /// table's 8 and under the compositor's 8 windows, so the full arm remains unreachable — kept anyway,
-/// because it is what makes an untrackable job impossible rather than merely unlikely.
+/// because it is what makes an untrackable job impossible rather than merely unlikely. PROCREAP raised
+/// the x86 cap to 6 as well, so the arithmetic in this paragraph now holds on BOTH arches (it was
+/// 4 on x86 when it was written, and this table's headroom hid the difference).
 ///
 /// ⚠ KERNEL-APPS EVICTION — **on a `wc` x86 boot the ceiling is one lower than the paragraph above
 /// says.** `video::wcx::desktop_app_service` launches the desktop app (`STAT.ELF`) at boot and it
@@ -4175,8 +4177,19 @@ fn bg_jobs(console: &mut Console) {
     serial_println!(":: BGRUN: jobs — {} tracked job(s) after the sweep ::", remaining);
 }
 
-/// BGRUN-1: `kill <pid>` — kill a recorded background job (SKILL-1 underneath). The row is reaped by
-/// the next `jobs`; the table entry stays until then so the operator sees the outcome there.
+/// BGRUN-1: `kill <pid>` — kill a recorded background job (SKILL-1 underneath).
+///
+/// PROCREAP — this doc used to say "the row is reaped by the next `jobs`; the table entry stays until
+/// then", which contradicted the code three lines below it (which drops the entry) and, on x86, was the
+/// live half of the Boot AJ lockout: the x86 `bg_kill` only MARKED the row `PEXITED`, `jobs` is the
+/// sole reaper and reaps only what is still in `BG_JOBS`, so dropping the entry here orphaned the row
+/// for the rest of the boot. Three kills, three rows gone, no recovery short of reboot.
+///
+/// The premise is now TRUE on both arches: a CONFIRMED kill reaps the row IN PLACE inside `bg_kill`
+/// (aarch64 has since round 1; x86 as of this arc), so the entry dropped here names a row that is
+/// already free, and the operator's record of the outcome is THIS line rather than an uninformative
+/// `gone` from a later `jobs`. The witness carries the table accounting so a boot PROVES the transition
+/// instead of implying it.
 #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_kill_cmd(console: &mut Console, pid: u64) {
     let jobs = BG_JOBS.lock();
@@ -4189,17 +4202,26 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
     drop(jobs); // bg_kill yields while confirming; never hold the table lock across that.
     let verdict = crate::arch::syscall::bg_kill(job.pid, job.asid);
     console.println(&alloc::format!("kill: pid {}: {}", pid, verdict));
-    serial_println!(":: BGRUN: kill pid={} — {} ::", pid, verdict);
-    // Lens should-fix (c): a CONFIRMED kill reaps the row in place, so a later `jobs` could only say
-    // "gone" — drop the table entry here instead, so the operator's record of the outcome is THIS
-    // line ("killed — row reaped") rather than an uninformative gone.
     if verdict.starts_with("killed") {
+        // The kernel reaped the row; the shell's entry is now the only stale handle. Drop it.
         let mut jobs = BG_JOBS.lock();
         for slot in jobs.iter_mut() {
             if matches!(slot, Some(j) if j.pid == pid) {
                 *slot = None;
             }
         }
+        drop(jobs);
+        // PROCREAP: the accounting is the point. A kill that claims to have freed a row and did not is
+        // exactly the defect this arc closes, and the old line ("kill pid=N — killed") could not tell
+        // the two apart on the wire. Read the table AFTER the reap: the free count must rise by one per
+        // kill, and a boot that launches and kills repeatedly must never see it drift down.
+        let (free, _running, _exited, _orphaned) = crate::arch::syscall::proc_table_headroom();
+        serial_println!(
+            ":: BGRUN: kill pid={} — {} ({}/{} free) ::",
+            pid, verdict, free, crate::arch::syscall::proc_table_rows()
+        );
+    } else {
+        serial_println!(":: BGRUN: kill pid={} — {} ::", pid, verdict);
     }
 }
 

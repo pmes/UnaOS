@@ -2329,9 +2329,7 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
             let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
             if let Some(id) = crate::arch::sched::current_task_id(cpu) {
                 if let Some(i) = proc_find_running(id) {
-                    PROCS[i].status.store(U4X_KILLED_STATUS, Ordering::Release);
-                    PROCS[i].state.store(PEXITED, Ordering::Release);
-                    PROCS[i].done.post();
+                    proc_publish_exit(i, U4X_KILLED_STATUS);
                 }
             }
         }
@@ -2430,9 +2428,7 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
         if let Some(id) = crate::arch::sched::current_task_id(cpu) {
             if let Some(i) = proc_find_running(id) {
-                PROCS[i].status.store(EXEC_KILLED_STATUS, Ordering::Release);
-                PROCS[i].state.store(PEXITED, Ordering::Release);
-                PROCS[i].done.post();
+                proc_publish_exit(i, EXEC_KILLED_STATUS);
             }
         }
         return;
@@ -2717,9 +2713,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
             let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
             if let Some(id) = crate::arch::sched::current_task_id(cpu) {
                 if let Some(i) = proc_find_running(id) {
-                    PROCS[i].status.store(a0 as i32, Ordering::Release);
-                    PROCS[i].state.store(PEXITED, Ordering::Release);
-                    PROCS[i].done.post();
+                    proc_publish_exit(i, a0 as i32);
                     crate::arch::sched::exit(); // never returns
                 }
             }
@@ -10125,6 +10119,29 @@ fn deriv_derive_from(row: usize, src: usize) -> Option<(u32, u64)> {
 const PFREE: u8 = 0; // entry unused
 const PRUNNING: u8 = 1; // claimed; a child is (or is about to be) running under `pid`
 const PEXITED: u8 = 2; // the child exited/was killed; `status` is valid, awaiting reap by sys_wait
+/// PROCREAP / REVIEW-1: a row a RELEASER holds exclusively while it settles — the transient claim
+/// token, and the thing that makes "who owns this row" answerable at all.
+///
+/// Three paths can release a row on x86 (`bg_poll(reap = true)`, `bg_kill`'s confirmed arm, and
+/// `proc_reserve`'s BGRUN-SCAV sweep), and until this state existed they claimed by CASing
+/// `PEXITED -> PRUNNING`. That is a sound mutual exclusion between the three, and it is NOT enough,
+/// because the winner then spends a multi-instruction span (a `try_wait` on a locked semaphore among
+/// it) with the row reading `PRUNNING` and STILL CARRYING THE OLD PID. A concurrent releaser that lost
+/// the CAS and fell back to identifying the row by pid would read that stale pid and conclude the row
+/// was still its own — and free a row the winner had already handed to a new tenant. The review caught
+/// exactly that window in `bg_kill`.
+///
+/// `PREAPING` closes it structurally rather than by narrowing it: a releaser claims into this state,
+/// clears the identity fields, and only THEN publishes the row's next state (`PRUNNING` for the sweep,
+/// which hands the row straight to a new tenant; `PFREE` via [`proc_free`] for the two reapers). The
+/// Release store that publishes the claim is therefore program-order-AFTER the identity clear, so any
+/// observer that Acquire-reads that published state is guaranteed NOT to see the old pid — which is
+/// what makes `bg_kill`'s identity test a fact rather than a torn read.
+///
+/// Nothing transitions out of `PREAPING` but its holder, so the claim is exclusive by construction.
+/// No path may treat such a row as live: it is neither a dispatchable child (`proc_find_running`), a
+/// waitable child (`proc_find_child`), nor a pollable/killable job.
+const PREAPING: u8 = 3;
 
 /// A spawned child's process control block. Static so it OUTLIVES the child's `Task` Box (freed on
 /// exit) and its slot teardown — the reap accounting must survive both. `done` is posted exactly once
@@ -10145,11 +10162,37 @@ struct Proc {
     /// Posted once by the child (SYS_EXIT or the kill path), awaited once by the parent's sys_wait. A
     /// scheduler-post wake, so sys_wait works under QEMU (unlike a timer-driven sleep).
     done: crate::arch::sched::Semaphore,
+    /// PROCREAP: true iff this row belongs to an OPERATOR-LAUNCHED BACKGROUND program — one spawned
+    /// through [`spawn_user_image_bg_inner`], whose only reaper is the shell (`jobs` ->
+    /// `bg_poll(reap = true)`, or `kill`). Set after the row is claimed and before the task can exist;
+    /// cleared by [`proc_free`] and by every fresh claim.
+    ///
+    /// It is the SCAVENGE PREDICATE, and it is not decoration. `proc_reserve`'s BGRUN-SCAV sweep
+    /// reclaims `PEXITED` rows that nobody will ever reap — but on x86 a `PEXITED` row is NOT
+    /// necessarily unowned: the U7x / U6gx / sock4 fixtures publish `PEXITED` on a launcher-PLANTED row
+    /// (deliberately, and with NO `done` permit posted — the launcher waits on counters) and then free
+    /// that row BY INDEX after their verdict. Scavenging one would hand a live index to a second owner.
+    /// A background program's row is the only kind whose reaper can go missing, so it is the only kind
+    /// the sweep may take. `run_user_image`'s row is excluded for the same reason: its caller holds the
+    /// index across the wait and frees it itself.
+    bg_owned: AtomicBool,
 }
 /// A small cap « USER_SLOTS: if it exhausts, sys_spawn returns -EAGAIN, never grows the slot pool.
-/// DIVERGENCE: aarch64 raised its own cap to 6 in PROCS-6 (background apps filling a panel); these
-/// tables are per-arch and the numbers are not required to track each other.
-const MAX_PROCS: usize = 4;
+///
+/// PROCREAP — raised 4 -> 6, matching aarch64's PROCS-6, so the operator can keep a panel of
+/// background programs and still launch. What the raise had to clear on THIS arch:
+///   * EVERY consumer is parametric. `proc_reserve`/`proc_free`/`proc_find_*`/`bg_poll`/`bg_kill` and
+///     the BGRUN-SCAV sweep are all `0..MAX_PROCS`; the semaphore reservations are `for p in &PROCS`.
+///     `BG_KILLS` is `[Option<BgKill>; MAX_PROCS]` and widens with it. There is no bitmap, no packed
+///     index and no fixed-width field keyed on the old 4.
+///   * ADDRESS SPACES still bind last. Each live row costs one ring-3 slot out of
+///     `memory::USER_SLOTS` = 8, so 6 background rows leave 2 for a foreground `run` and for the
+///     fixtures' scratch tenancies. The const block below asserts that margin rather than promising it.
+///   * WINDOWS fit: `video::wm::MAX_WINDOWS` is 8 and only ring-3 programs mint rows there.
+///   * SHELL side fits: `shell::BG_JOBS` is 8 rows, still strictly above this cap.
+///   * KILL side needs nothing: x86 arms kills through a per-task `Arc<KillSwitch>`, not a fixed
+///     request table, so there is no aarch64-style `MAX_KILL_REQS` coupling to assert here.
+const MAX_PROCS: usize = 6;
 static PROCS: [Proc; MAX_PROCS] = [const {
     Proc {
         pid: AtomicU64::new(0),
@@ -10157,8 +10200,27 @@ static PROCS: [Proc; MAX_PROCS] = [const {
         state: AtomicU8::new(PFREE),
         slot: AtomicUsize::new(0),
         done: crate::arch::sched::Semaphore::new(0),
+        bg_owned: AtomicBool::new(false),
     }
 }; MAX_PROCS];
+
+/// PROCREAP: the cap's two structural neighbours, enforced at compile time rather than left to a
+/// comment. A row that cannot be given an address space can only ever hand back `-EAGAIN` from deeper
+/// in the launch, and a background row that cannot own a window is one the compositor would refuse.
+const _: () = {
+    // Strictly below, by the margin the doc above actually promises: two slots kept free so a
+    // foreground `run` and the fixtures' scratch tenancies can still get an address space with every
+    // background row occupied. `< USER_SLOTS` alone would permit 7, which satisfies the letter of
+    // "leaves slots free" while starving exactly the two callers that need one.
+    assert!(
+        MAX_PROCS <= crate::arch::memory::USER_SLOTS - 2,
+        "MAX_PROCS must leave 2 ring-3 slots free"
+    );
+    assert!(
+        MAX_PROCS <= crate::video::wm::MAX_WINDOWS,
+        "every bg program must be able to own a window"
+    );
+};
 
 /// Claim a FREE Proc entry, returning its index. The CAS on `state` (FREE->RUNNING) is the atomic
 /// ownership token; the pid=0 placeholder is overwritten with the real child pid (Release) by
@@ -10174,10 +10236,110 @@ fn proc_reserve() -> Option<usize> {
             PROCS[i].pid.store(0, Ordering::Release);
             PROCS[i].status.store(0, Ordering::Release);
             PROCS[i].slot.store(0, Ordering::Release);
+            PROCS[i].bg_owned.store(false, Ordering::Release);
+            return Some(i);
+        }
+    }
+    // BGRUN-SCAV (ported from `arch::aarch64::syscall::proc_reserve`): no FREE row. Before failing,
+    // reclaim a row belonging to a BACKGROUND program that has ALREADY EXITED and that nobody has
+    // reaped. BGRUN-1's stated position was that holding those rows is "honest: a shell that never runs
+    // `jobs` eventually gets 'process table full', not silent loss" — right about the STATUS, and wrong
+    // about the RECOVERY, because it assumed a handle always exists to reap through. Boot AJ proved it
+    // does not: three confirmed kills left three rows `PEXITED` forever and the operator ran out of
+    // launchable slots with no recovery short of reboot. The kill half of that is fixed at the source
+    // (`bg_kill` reaps in place now); this is the belt for any OTHER path that can orphan a row.
+    //
+    // The trade is explicit and it is the lesser loss: an unobserved EXIT STATUS is dropped (a later
+    // `jobs` prints `gone` for that pid rather than `exited N`), and in exchange a launch the machine
+    // has the resources to satisfy is not refused. Never silent — the reclaim prints.
+    //
+    // Two guards, both load-bearing:
+    //   * `bg_owned` — see the field's doc. A `PEXITED` row on x86 is not necessarily unowned; the
+    //     fixture launchers plant rows, publish `PEXITED` on them WITHOUT posting `done`, and free them
+    //     by INDEX after their verdict. Only a background row's reaper can go missing.
+    //   * the CAS `PEXITED -> PREAPING` — what makes this safe to race against `jobs` AND against a
+    //     concurrent `bg_kill`: the row is claimed by exactly ONE of the three, so the reap-once
+    //     invariant is preserved rather than weakened (a scavenged row's `jobs` entry takes the `Gone`
+    //     arm, which already exists for this case). The `done` permit is consumed for the same reason
+    //     `bg_poll(reap = true)` consumes it — a reused entry must start at zero permits — and with
+    //     `try_wait`, not `wait`: this must never park under a caller that may hold a lock, and a row
+    //     whose permit is somehow absent must cost a dropped permit, not the shell task.
+    for i in 0..MAX_PROCS {
+        if !PROCS[i].bg_owned.load(Ordering::Acquire) {
+            continue;
+        }
+        if PROCS[i]
+            .state
+            .compare_exchange(PEXITED, PREAPING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let stale_pid = PROCS[i].pid.load(Ordering::Acquire);
+            let stale_status = PROCS[i].status.load(Ordering::Acquire);
+            let _ = PROCS[i].done.try_wait();
+            PROCS[i].pid.store(0, Ordering::Release);
+            PROCS[i].status.store(0, Ordering::Release);
+            PROCS[i].slot.store(0, Ordering::Release);
+            PROCS[i].bg_owned.store(false, Ordering::Release);
+            // REVIEW-1: PUBLISH THE CLAIM LAST. Handing the row to its new tenant (`PRUNNING`) is a
+            // Release store placed strictly AFTER the identity above is erased, so a concurrent
+            // `bg_kill` that Acquire-observes this `PRUNNING` cannot then read the pid it was hunting.
+            // Publishing `PRUNNING` as the CAS target instead — which is what this did before the
+            // review — left the old pid readable for the whole span above, and that was the window in
+            // which a kill could free a row this sweep had already re-let.
+            PROCS[i].state.store(PRUNNING, Ordering::Release);
+            bg_kill_forget(stale_pid);
+            serial_println!(
+                ":: BGRUN-SCAV: process table full — reclaimed row {} from EXITED unreaped pid={} (status={} DISCARDED; `jobs` will read `gone`) ::",
+                i, stale_pid, stale_status
+            );
             return Some(i);
         }
     }
     None
+}
+
+/// PROCREAP: the operator string for a `proc_reserve` refusal, naming the state that actually caused
+/// it. `proc_reserve` has already run the BGRUN-SCAV sweep by the time a caller reaches this, so
+/// whatever the census reports is genuinely un-reclaimable right now — and the old message
+/// unconditionally advised `jobs`, which is a LIE once the sweep exists (if `jobs` could have freed a
+/// row, the sweep already did). Say what actually ran out.
+fn proc_table_full_reason() -> &'static str {
+    let (_, _, exited, _) = proc_table_headroom();
+    if exited > 0 {
+        // REVIEW-2 (F4): the old text named kernel fixtures as the cause. That is the LIKELY cause — the
+        // sweep has already taken every background corpse, so what remains is normally a launcher's
+        // planted row awaiting its verdict, which `jobs` cannot reap and never could — but this bucket
+        // also counts `PREAPING`, a row mid-release, and blaming fixtures for one would send a reader
+        // hunting the wrong subsystem. Say what is observable and let the state say the rest.
+        "process table full — no row is reclaimable: the rest are settling or held by kernel fixtures (`jobs` cannot reap these)"
+    } else {
+        "process table full — every row holds a live program (`kill <pid>` one, or wait for it to exit)"
+    }
+}
+
+/// PROCREAP: the `Proc` table's occupancy right now, as `(free, running, exited_unreaped, orphaned)`.
+/// Reads only; safe from any task. The tuple shape mirrors aarch64's `proc_table_headroom` so the
+/// shell can print the accounting without an arch gate — x86 has no `PORPHANED` state (kills are armed
+/// through a per-task `Arc<KillSwitch>`, never parked in a table), so the fourth field is always 0.
+pub fn proc_table_headroom() -> (usize, usize, usize, usize) {
+    let (mut free, mut running, mut exited) = (0usize, 0usize, 0usize);
+    for i in 0..MAX_PROCS {
+        match PROCS[i].state.load(Ordering::Acquire) {
+            PFREE => free += 1,
+            PRUNNING => running += 1,
+            // PEXITED, and PREAPING with it: a row mid-release is not free yet and is not running.
+            // `PREAPING` is held for a handful of instructions, so it can only ever bias a snapshot
+            // taken inside one — it never persists into an operator-visible census.
+            _ => exited += 1,
+        }
+    }
+    (free, running, exited, 0)
+}
+
+/// PROCREAP: the process-table cap — the denominator for [`proc_table_headroom`]. See the `MAX_PROCS`
+/// block for why it is 6 and why moving it is an arc, not a tuning step.
+pub const fn proc_table_rows() -> usize {
+    MAX_PROCS
 }
 
 /// Find the RUNNING Proc entry whose pid matches — the child-exit / child-kill lookup. Called with a
@@ -10193,15 +10355,60 @@ fn proc_find_running(pid: u64) -> Option<usize> {
 /// => the caller has no such child.
 fn proc_find_child(pid: u64) -> Option<usize> {
     (0..MAX_PROCS).find(|&i| {
-        PROCS[i].state.load(Ordering::Acquire) != PFREE
+        // REVIEW-1: `!= PFREE` would have admitted `PREAPING` — a row some releaser is settling, whose
+        // `done` permit is already spoken for. A `sys_wait` landing on one would park on a permit that
+        // will never come. A row being released is not a waitable child; only these two states are.
+        matches!(PROCS[i].state.load(Ordering::Acquire), PRUNNING | PEXITED)
             && PROCS[i].pid.load(Ordering::Acquire) == pid
     })
 }
 
 /// Release a Proc entry to FREE — after reaping in sys_wait, or unwinding a failed sys_spawn claim.
+/// PROCREAP / REVIEW-2 (F2): publish a row's terminal status — the ONE place `PEXITED` and the `done`
+/// permit are ordered against each other, because the correct order depends on WHO can consume the row.
+///
+/// THE HAZARD. Every releaser (`bg_poll(reap)`, `bg_kill`'s confirmed arm, the BGRUN-SCAV sweep) claims
+/// a row by CASing it out of `PEXITED` and then drains its permit with `try_wait`, which must not park —
+/// they can run under the shell's `BG_JOBS` spinlock. So a releaser that claims inside a
+/// `store(PEXITED)` .. `post()` gap drains nothing, frees the row, and the exiting task's `post()` then
+/// lands a permit on a row that has since been recycled; the next tenant's `sys_wait` returns early on a
+/// stranger's permit. The invariant every `try_wait` site assumes — and which `shell::bg_jobs`'s
+/// LOCK-ACROSS-REAP note already asserts in prose — is **`PEXITED` implies the permit is posted**.
+///
+/// WHY THIS IS NOT SIMPLY "POST FIRST EVERYWHERE". `sys_wait` waits on the permit and then, WITHOUT
+/// consulting `state`, reads the status and `proc_free`s the row. Posting before publishing would let it
+/// free the row before the exiting task's `state.store(PEXITED)` lands — stamping `PEXITED` onto a row
+/// that is now `PFREE` (which nothing recovers: `proc_reserve` claims only from `PFREE`, the sweep only
+/// when `bg_owned`, so it strands for the boot) or onto a new tenant's live `PRUNNING` row, which a
+/// reaper then frees under a running program. That is the round-1 mistake in a new costume: publishing a
+/// state word that another party frees against.
+///
+/// SO THE ORDER IS CHOSEN BY THE ROW'S CONSUMER, and the two sets are disjoint and provable:
+///   * `bg_owned` rows are claimable by the three releasers, and are reachable by `sys_wait` from NO
+///     path — a background pid is never installed in any slot's `HANDLES` row, and a handle is the only
+///     way `sys_wait` can name a child. POST FIRST, so the invariant holds exactly where it is needed.
+///   * every other row (a `sys_spawn` child, a foreground `run`, a fixture's planted row) is reachable
+///     only by an index- or handle-holding waiter and is claimable by NO releaser: the sweep requires
+///     `bg_owned`, and `bg_poll`/`bg_kill` resolve background pids. PUBLISH FIRST, which is `sys_wait`'s
+///     standing contract and the order this code has always had.
+///
+/// The `bg_owned` read is stable here: it is set before the task exists, and cleared only by a releaser,
+/// which must first claim the row out of `PEXITED` — a state this call has not published yet.
+fn proc_publish_exit(i: usize, status: i32) {
+    PROCS[i].status.store(status, Ordering::Release);
+    if PROCS[i].bg_owned.load(Ordering::Acquire) {
+        PROCS[i].done.post();
+        PROCS[i].state.store(PEXITED, Ordering::Release);
+    } else {
+        PROCS[i].state.store(PEXITED, Ordering::Release);
+        PROCS[i].done.post();
+    }
+}
+
 fn proc_free(i: usize) {
     PROCS[i].pid.store(0, Ordering::Release);
     PROCS[i].slot.store(0, Ordering::Release); // U7x: drop the pid->slot map with the entry
+    PROCS[i].bg_owned.store(false, Ordering::Release); // PROCREAP: never leave a stale scavenge permit
     PROCS[i].state.store(PFREE, Ordering::Release);
 }
 
@@ -12303,7 +12510,9 @@ fn load_program_common(bytes: &[u8]) -> Result<(super::elf::Mapped, usize), &'st
         return Err("image larger than the 16 KiB user window");
     }
     let Some(pi) = proc_reserve() else {
-        return Err("process table full (run `jobs` to reap exited jobs)");
+        // PROCREAP: `proc_reserve` has already run the BGRUN-SCAV sweep, so this refusal names what is
+        // genuinely un-reclaimable rather than advising a `jobs` that cannot help.
+        return Err(proc_table_full_reason());
     };
     let mapped = match super::elf::map_image_into_slot(bytes) {
         Ok(m) => m,
@@ -12397,9 +12606,14 @@ pub fn run_user_image(
 /// `(pid, slot, entry)`; the caller records the pid and reaps it later via [`bg_poll`], or stops it with
 /// [`bg_kill`]. Mirrors `run_user_image`'s front half exactly and diverges only in not waiting.
 ///
-/// The Proc row stays claimed after exit (PEXITED, `done` posted) until `bg_poll(reap = true)` consumes
-/// it — the `jobs` verb is the reaper. Rows are a bounded resource (`MAX_PROCS`), which is honest: a
-/// shell that never runs `jobs` eventually gets "process table full", not silent loss.
+/// The Proc row stays claimed after an ordinary exit (PEXITED, `done` posted) until
+/// `bg_poll(reap = true)` consumes it — the `jobs` verb is the reaper. A KILLED row does not wait for
+/// that: [`bg_kill`] reaps in place on a confirmed kill (PROCREAP), because the shell drops its
+/// `BG_JOBS` handle at the same moment and `jobs` could never reach the row again.
+///
+/// Rows are a bounded resource (`MAX_PROCS`), and the shortfall is no longer terminal: `proc_reserve`
+/// runs the BGRUN-SCAV sweep before refusing, reclaiming `bg_owned` rows that exited and were never
+/// reaped. So a shell that never runs `jobs` loses exit STATUSES, not launch capacity.
 pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
     spawn_user_image_bg_inner(bytes, false)
 }
@@ -12427,6 +12641,11 @@ fn spawn_user_image_bg_inner(
 ) -> Result<(u64, u64, u64), &'static str> {
     let _ = no_autofocus; // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
     let (mapped, pi) = load_program_common(bytes)?;
+    // PROCREAP: mark the row SCAVENGEABLE before the task can exist. This is the one launch path whose
+    // reaper is a shell HANDLE (`BG_JOBS`) rather than a held index, so it is the one path whose row can
+    // be orphaned by losing that handle — and therefore the only one BGRUN-SCAV may reclaim. See the
+    // `bg_owned` field doc for why a blanket sweep over `PEXITED` would be unsound on x86.
+    PROCS[pi].bg_owned.store(true, Ordering::Release);
     // WINX-7: mark the slot DETACHED before the task can run, so its first `SYS_WIN_CREATE` publishes
     // the flag and the program never observes a stale `false`. See `SLOT_DETACHED` for why a windowed
     // app needs to know it was backgrounded.
@@ -12491,17 +12710,40 @@ fn bg_place_cpu() -> usize {
 /// else — the pid is the key every other lookup uses.
 pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
     for pi in 0..MAX_PROCS {
-        if PROCS[pi].state.load(Ordering::Acquire) == PFREE {
+        // REVIEW-1: `PREAPING` skips too — a row another releaser is settling is already gone as far
+        // as this caller is concerned, and falling through would report it `Running`.
+        if !matches!(PROCS[pi].state.load(Ordering::Acquire), PRUNNING | PEXITED) {
             continue;
         }
         if PROCS[pi].pid.load(Ordering::Acquire) != pid {
             continue;
         }
         return match PROCS[pi].state.load(Ordering::Acquire) {
+            // REVIEW-2 (F3): name `PREAPING` explicitly. This is a SECOND load of `state` — the filter
+            // above cannot speak for it — so a row that a releaser claimed in between arrives here, and
+            // the catch-all would have called it `Running`. A row being released is `Gone`; the caller's
+            // next `jobs` would say so anyway, and a job reported running one line and gone the next is
+            // the kind of instrument disagreement that costs a bench session to chase.
+            PREAPING => BgPoll::Gone,
             PEXITED => {
                 let status = PROCS[pi].status.load(Ordering::Acquire);
                 if reap {
-                    let _ = PROCS[pi].done.wait();
+                    // PROCREAP: CLAIM the row before releasing it. Since BGRUN-SCAV exists, `PEXITED`
+                    // is no longer a state only this reaper acts on — a concurrent `proc_reserve` on
+                    // another core (the desktop-app service is one) may take the same row. The CAS is
+                    // the same one the sweep uses, so exactly one of the two frees it; a loser reports
+                    // `Gone`, which is what a scavenged row honestly is. `try_wait` (not `wait`) for
+                    // the same reason the sweep uses it: this runs with the shell's `BG_JOBS` spinlock
+                    // held, and a permit that is somehow absent must cost a dropped permit, never the
+                    // shell task.
+                    if PROCS[pi]
+                        .state
+                        .compare_exchange(PEXITED, PREAPING, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        return BgPoll::Gone;
+                    }
+                    let _ = PROCS[pi].done.try_wait();
                     proc_free(pi);
                     bg_kill_forget(pid);
                 }
@@ -12525,7 +12767,8 @@ pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
 pub fn bg_kill(pid: u64, _slot: u64) -> &'static str {
     let mut row: Option<usize> = None;
     for pi in 0..MAX_PROCS {
-        if PROCS[pi].state.load(Ordering::Acquire) != PFREE
+        // REVIEW-1: a `PREAPING` row is being released by someone else and is not a killable job.
+        if matches!(PROCS[pi].state.load(Ordering::Acquire), PRUNNING | PEXITED)
             && PROCS[pi].pid.load(Ordering::Acquire) == pid
         {
             row = Some(pi);
@@ -12553,12 +12796,64 @@ pub fn bg_kill(pid: u64, _slot: u64) -> &'static str {
     if !kill.is_reaped() {
         return "kill armed — the task retires at its next preemption";
     }
-    // Confirmed reaped. The scheduler dropped the task without running the SYS_EXIT accounting, so mark
-    // the row here — `jobs` must be able to reap it exactly like an ordinary exit.
+    // PROCREAP: confirmed reaped — so reap the ROW here too, in place. This used to publish `PEXITED`,
+    // post `done` and leave the reap to the next `jobs`; on Boot AJ that lost three rows for the whole
+    // boot, because `jobs` is keyed on the shell's `BG_JOBS` table and `bg_kill_cmd` drops the killed
+    // pid's entry the moment this returns "killed". The kill destroyed the only handle that could ever
+    // have reached the row. Marking a corpse for a reaper that has just been unhooked is not accounting,
+    // it is a leak — and this is the aarch64 twin's shape (`aarch64::syscall::bg_kill`'s `ok` arm,
+    // LENS MUST-FIX round 1), which has reaped in place since it was written.
+    //
+    // REVIEW-1 — THE RELEASE IS GATED ON A WON CAS, in both arms. The first cut of this gated the
+    // `proc_free` on a pid RE-READ after a failed CAS, and that was a torn guard: BGRUN-SCAV on another
+    // core could win the row and still be several instructions away from erasing its pid, so this read
+    // could match a row the sweep already owned and was re-letting. Two owners of one Proc row — the
+    // exact class of bug this arc exists to end, re-introduced by the fix for it.
+    //
+    // Note the shape a pure state CAS CANNOT have. Claiming the dispatch-boundary case with
+    // `CAS(PRUNNING -> …)` alone is not exclusive, because `state` does not carry identity: "my
+    // PRUNNING row" and "a row the sweep reclaimed and handed to a new tenant" are the same byte, and
+    // such a CAS would win against the new tenant just as happily. Identity has to enter the claim.
+    //
+    // Two arms, and what makes each one exclusive:
+    //   * PEXITED — the target got a real SYS_EXIT in inside the confirm window, so it posted its own
+    //     `done` permit. The CAS into `PREAPING` is the SAME claim BGRUN-SCAV and `bg_poll(reap)` use,
+    //     so exactly one of the three wins; drain the permit so a recycled row starts at zero.
+    //   * PRUNNING — the ordinary dispatch-boundary kill. The task never ran the SYS_EXIT accounting,
+    //     so NO permit was ever posted for this row and none is posted here. The identity test in
+    //     front of the claim is now a FACT and not a race, and it is `PREAPING` that makes it one: a
+    //     sweep publishes `PRUNNING` with a Release store placed after it erases the pid, so observing
+    //     `PRUNNING` here (the failed CAS above loads with Acquire) and then reading OUR pid proves the
+    //     sweep never took this row. And a row that is still ours cannot leave `PRUNNING` behind our
+    //     back — its task is provably retired (`kill.is_reaped()`), the sweep and `bg_poll` claim only
+    //     from `PEXITED`, `proc_reserve` only from `PFREE` — so the CAS that follows cannot lose. It
+    //     is the belt the review asked for, and the row's identity is the buckle.
+    let raced_exit = PROCS[pi]
+        .state
+        .compare_exchange(PEXITED, PREAPING, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    let claimed = raced_exit
+        || (PROCS[pi].pid.load(Ordering::Acquire) == pid
+            && PROCS[pi]
+                .state
+                .compare_exchange(PRUNNING, PREAPING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok());
+    if !claimed {
+        // Another core released this row between the kill's confirm and here — only BGRUN-SCAV can do
+        // that, and it prints when it does. The kill itself succeeded; the row is simply not ours to
+        // free, and saying so is the whole point.
+        bg_kill_forget(pid);
+        return "killed — the row was reclaimed on another core";
+    }
+    if raced_exit {
+        let _ = PROCS[pi].done.try_wait();
+    }
+    // Held exclusively as PREAPING from here: nothing transitions out of it but us, and `proc_free`
+    // clears the identity before publishing PFREE, so the row is never visible as free-and-identified.
     PROCS[pi].status.store(EXEC_KILLED_STATUS, Ordering::Release);
-    PROCS[pi].state.store(PEXITED, Ordering::Release);
-    PROCS[pi].done.post();
-    "killed"
+    proc_free(pi);
+    bg_kill_forget(pid); // `bg_kill_take` already consumed it; belt, and the reap path's twin
+    "killed, row reaped"
 }
 
 // =============================================================================================
