@@ -125,6 +125,45 @@ struct IntEp {
     /// manufacture releases for another's held keys. All zeros = nothing held (the idle report), which
     /// is also the correct initial value: before the first report there is nothing to release.
     kbd_prev_keys: [u8; 6],
+    /// ALLKEYS: the modifier byte (`report[0]`) of the last ACCEPTED report on this endpoint. The
+    /// dead-endpoint flush has no report to read — the device is gone — so it folds each stranded
+    /// key against this to reproduce the shifted ascii the press delivered. Written only on an
+    /// accepted (>= 8-byte) report, so a refused short report cannot corrupt it. 0 = nothing held.
+    kbd_prev_mods: u8,
+    /// ALLKEYS P1: this keyboard's lock-LED bitmap — bit 0 Num, bit 1 Caps, bit 2 Scroll (the HID
+    /// LED page Output report, `xhci::HID_LOCK_KEYS`). It is BOTH halves of caps lock at once: the
+    /// decoder reads bit 1 to pick the case, and the same byte is what SET_REPORT ships to light
+    /// the key. One byte for both is what keeps the lit LED and the typed case from ever disagreeing
+    /// — an operator whose LED says caps but whose keys type lowercase has no way to tell which one
+    /// is lying, so there is deliberately only one truth here.
+    ///
+    /// Per ENDPOINT, for the same reason `kbd_prev_keys` is: two keyboards have two Caps Lock keys
+    /// and two LEDs, and each USB keyboard latches its own. 0 at arm time = all locks off, which is
+    /// the state a freshly-configured HID device is in (SET_CONFIGURATION resets its LEDs), so the
+    /// software state and the hardware agree from the first report without an explicit sync.
+    kbd_leds: u8,
+    /// ALLKEYS P1: the EP0 addressing tuple and interface number for THIS endpoint's device —
+    /// everything `set_hid_leds` needs to send SET_REPORT back to it. Captured at arm time because
+    /// the service loop, where a lock-key press is detected, has no other route to them: it walks
+    /// `int_eps` and the enumeration `Target` is long out of scope by then. `Target` is `Copy` and
+    /// eight bytes, so carrying it costs nothing.
+    kbd_target: Target,
+    kbd_intf: u8,
+    /// ALLKEYS P1: does this keyboard still accept the LED SET_REPORT? Latched FALSE by the first
+    /// refusal and never retried.
+    ///
+    /// This is a COST bound, not a correctness one, and the cost it bounds is severe. A STALL on a
+    /// control request halts EP0, after which every later request to the device just runs out the
+    /// `hw_wait_budget()` — about two seconds. Enumeration is long over by the time a lock key is
+    /// pressed, so a halted EP0 harms nothing else on this device; but WITHOUT this latch a
+    /// keyboard with no settable Output report would spend ~2 s inside `service` on EVERY press of
+    /// Caps Lock, stalling the whole main loop each time. The operator would see the machine freeze
+    /// for two seconds whenever they touched the key — far worse than the dark LED being fixed.
+    ///
+    /// One failed transfer per keyboard per boot is the whole exposure. The CASE half is completely
+    /// unaffected: `kbd_leds` is toggled by the decoder before this is ever consulted, so caps lock
+    /// keeps changing the case of what is typed on a keyboard whose LED cannot be driven.
+    kbd_led_ok: bool,
     /// CLICK-3: `arch::ms()` at the previous report consumed on THIS endpoint (any report — motion,
     /// button, or idle keep-alive). The re-press recovery below reads the SILENCE between reports,
     /// so it must be stamped by every report, not only by button ones. 0 = no report yet.
@@ -1669,7 +1708,7 @@ impl Controller {
                 );
                 continue;
             }
-            self.arm_interrupt_ep(t, ep, mps.min(64), proto == 1, proto == 2, None);
+            self.arm_interrupt_ep(t, ep, mps.min(64), proto == 1, proto == 2, None, intf);
             serial_println!(
                 ":: EHCI-HID: [{}] M2 armed {} addr={} ep=IN{} mps={} interval={} (boot protocol) == witness ::",
                 self.idx,
@@ -1745,7 +1784,7 @@ impl Controller {
             #[cfg(feature = "mtraw")]
             self.bcm5974_mt_raw_probe(t, intf);
         }
-        self.arm_interrupt_ep(t, ep, mps.min(64), false, false, Some(layout));
+        self.arm_interrupt_ep(t, ep, mps.min(64), false, false, Some(layout), intf);
         // GUI-WITNESS: the report-protocol pointer (the rMBP trackpad, incl. the Apple
         // vendor-multitouch interface) is armed — the trackpad-input milestone.
         crate::bootlog::record("ehci:trackpad-armed");
@@ -1924,6 +1963,65 @@ impl Controller {
         }
     }
 
+    /// ALLKEYS P1 — push a keyboard's lock-LED bitmap to the device: SET_REPORT, bmRequestType
+    /// 0x21 (host->device | class | interface recipient), bRequest 0x09, wValue 0x0200
+    /// (report type Output (0x02) in the high byte, report ID 0 in the low), wIndex = interface,
+    /// one data byte OUT carrying bit 0 Num / bit 1 Caps / bit 2 Scroll. Byte-for-byte the request
+    /// the xHCI path sends (`xhci::set_hid_leds`) — the LED is the same HID class request whichever
+    /// controller carries the keyboard, and this being a MIRROR rather than a variation is the
+    /// point: an operator must not be able to tell which controller a keyboard is on.
+    ///
+    /// The payload goes through `self.data_buf`, this controller's EP0 data staging buffer, which
+    /// the OUT data stage in `control_txn` reads from. That is safe here and only here: `service`
+    /// runs in main-loop context (never in an interrupt), the buffer is idle between control
+    /// transfers, and this call site sits AFTER the endpoint walk has dropped its borrow — the
+    /// same position, and the same reasoning, as the `mtraw` mode restore just below.
+    ///
+    /// BEST-EFFORT, ALWAYS. A NAK, STALL, or EP0 timeout is logged and swallowed: plenty of
+    /// keyboards have no settable Output report (and the internal rMBP keyboard's answer is exactly
+    /// what this arc's metal round is meant to find out). The caller has already updated the
+    /// software bitmap, so a refused LED costs the operator a dark key and nothing else — caps lock
+    /// still changes the case of what they type. It must never cost a keystroke.
+    ///
+    /// Returns whether the device accepted it, so the caller can latch a refusing keyboard off
+    /// (`IntEp::kbd_led_ok`) rather than paying an EP0 timeout on every subsequent lock press.
+    unsafe fn set_hid_leds(&mut self, t: &Target, intf: u8, leds: u8) -> bool {
+        self.data_buf.write(leds);
+        let caps = (leds >> 1) & 1;
+        match self.control(t, 0x21, 0x09, 0x0200, intf as u16, 1, false) {
+            Ok(_) => {
+                serial_println!(
+                    ":: EHCI-HID: [{}] ALLKEYS caps={} leds={:#04x} SET_REPORT ok addr={} intf={} == witness ::",
+                    self.idx, caps, leds, t.addr, intf
+                );
+                true
+            }
+            // F6: a plain NAK/STALL/timeout is a device declining the LED — latch off, keep typing.
+            // But `Err("hse")` is NOT that: `control` -> `chain_txn` returns it on a Host System
+            // Error, which that path's own contract says WEDGES the controller (only a full HCRESET
+            // recovers it — RS alone does not). Reading a wedged controller as "device declined an
+            // LED" would make this witness actively false at the moment the keyboard died, so the two
+            // are named apart. Exposure is small — metal settles into `overlay_mode` at enumeration,
+            // so chain mode (the only producer of "hse") is QEMU-only — and recovery is not this
+            // path's job: the enumeration-time handler owns HCRESET. This surfaces it honestly rather
+            // than swallowing it; the LED still latches off either way so no 2 s retry follows.
+            Err("hse") => {
+                serial_println!(
+                    ":: EHCI-HID: [{}] ALLKEYS caps={} leds={:#04x} SET_REPORT HSE addr={} intf={} — controller wedged (needs HCRESET), NOT a device LED decline ::",
+                    self.idx, caps, leds, t.addr, intf
+                );
+                false
+            }
+            Err(e) => {
+                serial_println!(
+                    ":: EHCI-HID: [{}] ALLKEYS caps={} leds={:#04x} SET_REPORT nak addr={} intf={} ({}) — LED latched off, case still tracked ::",
+                    self.idx, caps, leds, t.addr, intf, e
+                );
+                false
+            }
+        }
+    }
+
     /// MT-INVESTIGATION (IVY) — close the capture window: put the pad back into the mode whose
     /// 8-byte relative stream the landed pointer path decodes. Called from the service loop AFTER
     /// its endpoint iteration has finished, so no endpoint borrow is live across the EP0 traffic.
@@ -1957,6 +2055,10 @@ impl Controller {
         is_kbd: bool,
         is_rel: bool,
         layout: Option<ReportLayout>,
+        // ALLKEYS P1: the interface this endpoint belongs to, recorded so a lock-key press
+        // discovered in the service loop can address SET_REPORT back at it. Both call sites
+        // already have it in scope.
+        intf: u8,
     ) {
         if self.int_next >= MAX_INT_EPS {
             serial_println!(
@@ -2085,6 +2187,13 @@ impl Controller {
             dead: false,
             prev_buttons: 0,
             kbd_prev_keys: [0; 6],
+            kbd_prev_mods: 0,
+            // ALLKEYS P1: locks off at arm time — the state SET_CONFIGURATION just left the
+            // device in, so software and hardware agree without an explicit sync request.
+            kbd_leds: 0,
+            kbd_target: *t,
+            kbd_intf: intf,
+            kbd_led_ok: true,
             last_report_ms: 0,
             // KBDWIT: stamp the silence clock's origin at the moment the endpoint becomes armed —
             // i.e. after the QH is linked and PSE is on, so the interval this witness measures is
@@ -2146,9 +2255,16 @@ impl Controller {
         let (kw_op, kw_fl) = (self.op, self.frame_list as *const u32);
         // MT-INVESTIGATION (IVY): local mirror of the capture-window counter, so the endpoint
         // iteration below keeps its exclusive borrow of `int_eps` (the EP0 restore runs after).
+        // ALLKEYS P1: lock-LED writes discovered during the endpoint walk, deferred until after it.
+        // A control transfer needs `&mut self`, which the `iter_mut()` borrow below rules out — the
+        // same constraint `mt_dumped` above is working around. Sized `MAX_INT_EPS` so that if two
+        // keyboards toggle a lock in the SAME service pass neither write is dropped; `Target` is
+        // `Copy`, so the array is plain stack scratch and costs nothing when nothing toggles.
+        let mut led_pushes: [Option<(usize, Target, u8, u8)>; MAX_INT_EPS] = [None; MAX_INT_EPS];
+        let mut n_led = 0usize;
         #[cfg(feature = "mtraw")]
         let mut mt_dumped = if self.mt_probe.is_some() { Some(self.mt_dumped) } else { None };
-        for e in self.int_eps.iter_mut() {
+        for (ep_i, e) in self.int_eps.iter_mut().enumerate() {
             if e.dead {
                 continue;
             }
@@ -2343,7 +2459,20 @@ impl Controller {
                     // raw pointer with no borrow of `e`, so handing the decoder `&mut e.kbd_prev_keys`
                     // alongside it is not an aliasing violation — the buffer and the diff state are
                     // disjoint memory.
-                    decode_boot_keyboard(report, &mut e.kbd_prev_keys);
+                    // ALLKEYS P1: the decoder also owns the lock-key state now. It reports back
+                    // whether this report toggled one; the SET_REPORT that lights the key is queued
+                    // for after the loop, where `self` is borrowable again.
+                    if decode_boot_keyboard(
+                        report,
+                        &mut e.kbd_prev_keys,
+                        &mut e.kbd_prev_mods,
+                        &mut e.kbd_leds,
+                    ) && e.kbd_led_ok
+                        && n_led < led_pushes.len()
+                    {
+                        led_pushes[n_led] = Some((ep_i, e.kbd_target, e.kbd_intf, e.kbd_leds));
+                        n_led += 1;
+                    }
                     if e.reports == 1 || e.reports % 32 == 0 {
                         serial_println!(
                             ":: EHCI-HID: [{}] kbd {} reports, last {:02x} {:02x} .. == witness ::",
@@ -2401,6 +2530,20 @@ impl Controller {
                 (*e.qh).overlay[1] = PTR_TERMINATE;
                 core::ptr::write_volatile(&mut (*e.qh).overlay[2], 0);
                 core::ptr::write_volatile(&mut (*e.qh).overlay[0], e.qtd_phys as u32);
+            }
+        }
+        // ALLKEYS P1: the endpoint borrow is released here, so EP0 is usable again — light (or
+        // extinguish) the lock LEDs this pass toggled. Best-effort by construction: `set_hid_leds`
+        // swallows a refusal, because a keyboard that will not take an Output report must not cost
+        // the input path anything, and the software state has already been updated either way (the
+        // CASE fold works even on a device with no LED at all).
+        for slot in led_pushes.iter().take(n_led) {
+            if let Some((ep_i, t, intf, leds)) = *slot {
+                if !self.set_hid_leds(&t, intf, leds) {
+                    // Refused: latch this keyboard's LED off so a halted EP0 can never cost a
+                    // `hw_wait_budget()` stall on a later press. The case fold is untouched.
+                    self.int_eps[ep_i].kbd_led_ok = false;
+                }
             }
         }
         // MT-INVESTIGATION (IVY): the endpoint borrow is released here, so the EP0 restore is safe
@@ -3002,8 +3145,11 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
 ///
 /// MODIFIERS GET NO KeyUp, matching xHCI exactly. `report[0]` is a bitmask, not a keycode; neither
 /// decoder has ever pushed `Key` for a bare modifier, so pushing `KeyUp` for one would fabricate a
-/// release edge for a press ring 3 never saw. Shift at RELEASE time picks the ascii, as on xHCI —
-/// consumers that care about identity match case-insensitively.
+/// release edge for a press ring 3 never saw. The ascii of a release is picked by
+/// `xhci::hid_key_release_ascii`, which folds on Shift and Caps only, as on xHCI. The invariant is
+/// exact: **a release resolves to the same ascii its press did** — Shift+`1` that pressed `!`
+/// releases `!`. The earlier gloss "consumers match case-insensitively" was true for letters and
+/// FALSE for shifted symbols (`!` vs `1`), which is the shifted-symbol strand GR21 closed.
 ///
 /// NO TYPEMATIC INTERACTION EXISTS ON THIS PATH, and that is a fact about the build, not a
 /// judgement call: `pal`'s host-side typematic tracker — `typematic_note_report`, `typematic_tick`
@@ -3013,21 +3159,63 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
 /// it (`pal.rs`, UVUG-6/UVUG-9/PAL-TYPEMATIC) cannot be reached from here and are not re-broken by
 /// this change; calling `typematic_note_report` from this decoder would not even resolve on x86.
 /// Repeat on this arch is the DEVICE's, carried by the re-reported level.
-unsafe fn decode_boot_keyboard(report: &[u8], prev_keys: &mut [u8; 6]) {
+///
+/// ── ALLKEYS P1 (GR21): CAPS LOCK, THE HALF THIS DECODER WAS STILL MISSING ──────────────────────
+///
+/// Peter, at the bench: *"do we have working shift, caps lock etc — we want all the keys working."*
+/// Shift worked here; Caps Lock did not, and on THIS machine that is the whole story, because the
+/// rMBP's internal keyboard is an EHCI device — so the decoder that had never heard of caps lock
+/// was the only one the operator could reach. The xHCI decoder has read a caps-lock bit since
+/// HID-LED; this path did not, so the key was inert and the LED never lit.
+///
+/// BOTH HALVES OR NEITHER, and that is not a stylistic preference. Case logic without an LED gives
+/// an operator a keyboard that types capitals with an unlit key — indistinguishable from a stuck
+/// Shift. An LED without case logic gives a lit key that types lowercase. Either half alone reads
+/// as a BROKEN keyboard, so this decoder toggles the state and the caller lights the key, both
+/// driven from the single `kbd_leds` byte that the case fold and SET_REPORT each read.
+///
+/// The decoder does not itself send SET_REPORT — it cannot. It is called from inside
+/// `Controller::service`'s `for e in self.int_eps.iter_mut()`, which holds an exclusive borrow of
+/// `int_eps`, while a control transfer needs `&mut self`. So it RETURNS whether the bitmap changed
+/// and the caller issues the request after the loop drops that borrow — the same deferral shape the
+/// `mtraw` capture-window restore already uses at that site.
+///
+/// MODIFIER POLICY is `xhci::hid_key_ascii`'s, not this function's, and deliberately so: Ctrl/Alt/
+/// GUI folding was absent from BOTH decoders (Cmd-Q typed a bare `q` into the shell line), and
+/// fixing it in one place while the other kept a private copy of the fold is exactly how the
+/// caps-lock divergence arose. The whole decision now lives in one function both controllers call.
+///
+/// PER-RELEASE ASCII, and why `prev_mods` exists. A release edge fires exactly once and is never
+/// re-sent, so it MUST resolve to the same ascii FAMILY its press did or it strands the key in every
+/// held-state consumer (Boot AJ). The live release path has the current `report[0]` in hand; the
+/// dead-endpoint flush ([`flush_held_releases`]) does not — the device is gone — so the modifier
+/// byte of the last ACCEPTED report is carried in `prev_mods` for it to fold against. Both paths go
+/// through `xhci::hid_key_release_ascii`, which depends only on Shift and Caps: Shift+`1` that
+/// pressed `!` releases `!`, not `1`.
+///
+/// Returns `true` if this report toggled a lock key — i.e. the caller owes the device a SET_REPORT.
+unsafe fn decode_boot_keyboard(
+    report: &[u8],
+    prev_keys: &mut [u8; 6],
+    prev_mods: &mut u8,
+    leds: &mut u8,
+) -> bool {
     if report.len() < 8 {
-        return; // short/partial boot report — see SHORT REPORTS ARE REFUSED WHOLE above
+        return false; // short/partial boot report — refused whole (keyup F1); see SHORT REPORTS above
     }
-    let shift = report[0] & 0x22 != 0; // L-Shift (bit 1) or R-Shift (bit 5)
-    // The ascii for one keycode under the shift state in force. One place, so a press and its
+    let modifiers = report[0];
+    // ALLKEYS P1: the live caps-lock bit feeds the case fold, so the lit key and the typed case
+    // are the same fact read twice rather than two states that can drift apart.
+    let caps = *leds & 0x02 != 0;
+    // The ascii for one keycode under the modifier state in force. One place, so a press and its
     // release can never disagree about which character they are about.
-    let ascii_of = |keycode: u8| -> u8 {
-        if (keycode as usize) < super::xhci::HID_SCANCODE_TO_ASCII.len() {
-            let (unshifted, shifted) = super::xhci::HID_SCANCODE_TO_ASCII[keycode as usize];
-            if shift { shifted } else { unshifted }
-        } else {
-            0
-        }
-    };
+    let ascii_of = |keycode: u8| -> u8 { super::xhci::hid_key_ascii(keycode, modifiers, caps) };
+    // ALLKEYS: and the same for a RELEASE, which may never resolve to "no event" for a key that has
+    // a character identity — see `hid_key_release_ascii`. A release edge fires once and is never
+    // re-sent, so suppressing one strands the key in every consumer that tracks held state, which is
+    // the precise failure Boot AJ cost this path.
+    let release_ascii_of =
+        |keycode: u8| -> u8 { super::xhci::hid_key_release_ascii(keycode, modifiers, caps) };
     // This report's six keycode slots. The `< 8` guard above is what makes this a COMPLETE picture of
     // what is down — every slot comes from the wire, none is invented — which is the precondition the
     // release diff below needs to be sound. `report[2 + i]` cannot panic for the same reason.
@@ -3058,14 +3246,36 @@ unsafe fn decode_boot_keyboard(report: &[u8], prev_keys: &mut [u8; 6]) {
         if cur_keys.contains(&keycode) {
             continue; // still held
         }
-        let ascii = ascii_of(keycode);
+        let ascii = release_ascii_of(keycode);
         if ascii != 0 {
             serial_println!("EHCI-HID: KEYUP: '{}' (scancode {:#x})", ascii as char, keycode);
             crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
         }
     }
 
+    // ALLKEYS P1: lock-key PRESS edges — a lock usage present now and absent last report. Edge and
+    // not level, because a boot report re-states the full held set: a caps key held down for half a
+    // second is re-reported every poll, and a level test would toggle the state on every one of
+    // those reports, flipping caps tens of times per press and landing on whichever parity the
+    // release happened to fall on. The edge fires exactly once per physical press.
+    //
+    // Note these usages produce NO `Key`/`KeyUp` event and never did — `HID_SCANCODE_TO_ASCII` maps
+    // all three to (0,0), so the loops above skip them. A lock key changes the MEANING of later
+    // keys; it is not itself a character. Mirrors the xHCI toggle loop, sharing its (usage, bit) table.
+    let mut changed = false;
+    for &(usage, bit) in super::xhci::HID_LOCK_KEYS.iter() {
+        if cur_keys.contains(&usage) && !prev_keys.contains(&usage) {
+            *leds ^= bit;
+            changed = true;
+        }
+    }
+
     *prev_keys = cur_keys;
+    // ALLKEYS: remember this accepted report's modifier byte, so a later endpoint-death flush can
+    // resolve each stranded key to the same shifted ascii its press produced. Updated ONLY here —
+    // past the `< 8` guard — so a refused short report never overwrites the last true modifier state.
+    *prev_mods = modifiers;
+    changed
 }
 
 /// EHCI-KEYUP F2 — release every key this endpoint still believes is DOWN, because no further report
@@ -3092,28 +3302,33 @@ unsafe fn decode_boot_keyboard(report: &[u8], prev_keys: &mut [u8; 6]) {
 ///
 /// Idempotent by construction — `kbd_prev_keys` is zeroed, so a second call flushes nothing — and a
 /// no-op on a pointer endpoint, whose `kbd_prev_keys` no decoder ever writes.
+///
+/// ALLKEYS: each stranded key resolves through the SAME fold its press used — `hid_key_release_ascii`
+/// against the last accepted report's modifier byte (`kbd_prev_mods`) and caps state (`kbd_leds`).
+/// The earlier code here used the raw UNSHIFTED byte and reasoned it away with "consumers match
+/// case-insensitively" — true for letters, FALSE for shifted symbols: a Shift+`1` that pressed `!`
+/// would have flushed `KeyUp('1')`, which no consumer holding a bit for `!` can match, stranding the
+/// very key this function exists to release. The invariant is simply: a release resolves to the same
+/// ascii its press did. `hid_key_release_ascii` depends only on Shift and Caps, so a suppressing
+/// modifier held at the instant of death still yields the shift-only byte the press delivered, never 0.
 unsafe fn flush_held_releases(e: &mut IntEp, idx: usize) {
+    let caps = e.kbd_leds & 0x02 != 0;
     for i in 0..e.kbd_prev_keys.len() {
         let keycode = e.kbd_prev_keys[i];
         if keycode <= 1 {
             continue;
         }
-        if (keycode as usize) < super::xhci::HID_SCANCODE_TO_ASCII.len() {
-            // No shift state survives an endpoint death, so the UNSHIFTED ascii is the only honest
-            // choice. It matches what the press loop delivered for every key typed without shift,
-            // and consumers that care about identity match case-insensitively — the same contract
-            // the ordinary shift-at-release path already relies on.
-            let (unshifted, _shifted) = super::xhci::HID_SCANCODE_TO_ASCII[keycode as usize];
-            if unshifted != 0 {
-                serial_println!(
-                    ":: EHCI-HID: [{}] KEYUP-FLUSH: '{}' (scancode {:#x}) — endpoint retired, release synthesised == witness ::",
-                    idx, unshifted as char, keycode
-                );
-                crate::pal::push_event(crate::pal::Event::KeyUp(unshifted));
-            }
+        let ascii = super::xhci::hid_key_release_ascii(keycode, e.kbd_prev_mods, caps);
+        if ascii != 0 {
+            serial_println!(
+                ":: EHCI-HID: [{}] KEYUP-FLUSH: '{}' (scancode {:#x}) — endpoint retired, release synthesised == witness ::",
+                idx, ascii as char, keycode
+            );
+            crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
         }
     }
     e.kbd_prev_keys = [0; 6];
+    e.kbd_prev_mods = 0;
 }
 
 // ======================================================================================
