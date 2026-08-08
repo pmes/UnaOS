@@ -3954,9 +3954,8 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
 /// THE DIFF. A USB boot report is a LEVEL, not an edge: bytes 2..8 carry the FULL set of keycodes
 /// currently down (6-key rollover), so any keycode present in the previous report and absent from
 /// this one was released. `prev_keys` carries that previous set per endpoint and is rewritten here.
-/// The press loop is untouched — `Key(ascii)` still fires for every keycode in every report, so a
-/// device that re-reports while a key is held keeps producing the natural repeats every existing
-/// consumer already sees.
+/// The press loop reads the SAME diff in the other direction (see DBLSTROKE below): a keycode absent
+/// from the previous report and present in this one is a press EDGE, and only an edge pushes `Key`.
 ///
 /// WHY A MISSED RELEASE CANNOT STRAND A KEY HERE. `service_ehci_hid` arms one transfer per service
 /// pass and is polled at frame rate, so reports the device sends between passes are simply never
@@ -4021,12 +4020,56 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
 /// modifiers get no `KeyUp`) and nothing in this arc may perturb it. The tracker is a pure OBSERVER
 /// here — it pushes no event from this function; `main`'s x86 pump calls `pal::typematic_tick`.
 ///
-/// ON A DEVICE THAT DOES RE-REPORT, the level loop below already delivers repeat at the poll rate,
-/// and the tracker would add its own on top. That is not this machine (Boot AL is the measurement),
-/// and on such a device repeat is already faster than any typematic rate, so the shared tracker's
-/// `STREAMS_WHILE_HELD` evidence latch is left to record the fact rather than a private suppression
-/// being invented here — a suppression that could only ever misfire in the direction of removing
-/// the repeat this arc exists to add.
+/// ── DBLSTROKE (Boot AN): THE PRESS LOOP WAS LEVEL-TRIGGERED, AND ROLLOVER DOUBLED EVERY KEY ──────
+///
+/// Peter, at the bench on Boot AN: *"key repeat good but typing fast causes double stroke."* Held-key
+/// repeat and normal-speed typing are both correct; typing FAST doubles characters. The capture names
+/// the mechanism outright, with no new instrument needed — `EHCI-HID: KEY:` is pushed once per
+/// `Event::Key`, and the word "help" typed quickly reads:
+///
+/// ```text
+/// [1228135ms] KEY: 'h'                      report [h]     — press edge
+/// [1228275ms] KEY: 'h'   KEY: 'e'           report [h,e]   — 'h' RESTATED, 'e' pressed
+/// [1228413ms] KEY: 'e'   KEYUP: 'h'         report [e]     — 'e' RESTATED, 'h' released
+/// [1228427ms] KEY: 'l'                      report [l]     — press edge
+/// ```
+///
+/// Two `Event::Key` pushes for one physical press of `h`, and two for `e`. The cause is that the press
+/// loop was a LEVEL loop: it pushed `Key(ascii)` for every keycode in every report, and a USB boot
+/// report re-states the FULL held set. Fast typing is defined by OVERLAP — the next key goes down
+/// before the last one comes up — so every overlapped pair produces a report that re-states the key
+/// already down, and that re-statement was delivered as a second press. Type slowly enough that each
+/// key is fully released first and every report carries exactly one key, and nothing ever repeats:
+/// precisely the reported symptom, precisely bounded.
+///
+/// It is the PRODUCER, not the console or the line editor: the two pushes are two distinct lines from
+/// this function, at two different report timestamps. It is not the typematic tracker either — the
+/// doubles are 140 ms apart with no 400 ms delay elapsed, `[keystat] typematic hold end` shows
+/// `re-arms=0` for the whole boot, and the tracker pushes nothing from here in any case.
+///
+/// THE FIX is to push on the press EDGE, which is the contract every consumer in the tree was already
+/// written against — `vug.rs` GAME-MODE says so in as many words ("the HID path delivers a Key on the
+/// PRESS edge and a KeyUp on the RELEASE edge"), and this decoder's own release loop has always been
+/// an edge. The two loops now read the same `prev_keys`/`cur_keys` diff in opposite directions, so a
+/// press and its release are the same fact seen twice and cannot disagree about how many there were.
+///
+/// WHAT PAYS FOR THE REPEAT THE LEVEL LOOP USED TO PROVIDE: the host typematic tracker, which this
+/// same function already feeds and which is the ONLY source of repeat that ever reached this machine.
+/// The old note here argued the level loop delivered repeat "on a device that does re-report" and so
+/// should stay. On this hardware there is no such device — no `SET_IDLE` is sent on this path (KBDWIT)
+/// and the internal keyboard runs report-on-change — which is why KEYREPEAT-X86 had to add the tracker
+/// at all. Level-driven repeat was therefore never repeat here; it was only ever the doubling, paced
+/// by the operator's other fingers rather than by any repeat rate. And a hypothetical idle-re-reporting
+/// keyboard is better served by the tracker's 400 ms/40 ms than by an unthrottled poll-rate spew.
+///
+/// WITNESS (`[keystat] ehci press`). Two bounded counters that decide the NEXT boot either way:
+/// `restated=` counts the pushes this edge gate suppressed (non-zero proves the operator typed with
+/// overlap and that the old code WOULD have doubled), and `dbl=` is an independent doubled-push
+/// detector that watches what this function actually pushes — the same ascii twice inside
+/// `DOUBLE_WINDOW_MS`. If Peter still sees doubles with `dbl=0`, the producer is clean and the fault
+/// is downstream (console echo or line editor); if `dbl>0` the producer is still doubling and this
+/// diagnosis was wrong. Either way the boot is decisive, which the previous boot's instruments were
+/// not.
 ///
 /// ── ALLKEYS P1 (GR21): CAPS LOCK, THE HALF THIS DECODER WAS STILL MISSING ──────────────────────
 ///
@@ -4062,6 +4105,104 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
 /// pressed `!` releases `!`, not `1`.
 ///
 /// Returns `true` if this report toggled a lock key — i.e. the caller owes the device a SET_REPORT.
+// ── DBLSTROKE witness state ──────────────────────────────────────────────────────────────────────
+//
+// Boot totals only; no per-endpoint state, because the operator has one pair of hands and the question
+// ("does this decoder push the same character twice for one press?") is about the decoder, not about
+// which endpoint carried it. All of it is dead weight on a boot where nobody types: every counter
+// stays 0 and not one line is emitted.
+//
+// This whole block is x86-only by construction — `drivers/mod.rs` gates `pub mod ehci` on
+// `all(target_arch = "x86_64", feature = "ehcihid")`, so aarch64 never compiles a byte of it and no
+// per-item `#[cfg]` is needed (nor would one be honest: it would imply the file is reachable without
+// the feature).
+
+/// DBLSTROKE — `Event::Key` pushes this decoder made, i.e. genuine press edges.
+static PRESS_EDGES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// DBLSTROKE — keycodes seen down in a report that the PREVIOUS report already carried. Under the old
+/// level loop each of these was a second `Event::Key` for a key nobody re-pressed; it is now suppressed
+/// and counted. Non-zero is the positive evidence that the operator typed with OVERLAP during the run,
+/// which is what makes a `dbl=0` result meaningful rather than merely untested.
+static RESTATED_PRESSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// DBLSTROKE — reports carrying two or more character keys down at once: rollover, i.e. "typing fast"
+/// measured rather than inferred from the operator's description.
+static ROLLOVER_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// DBLSTROKE — the independent detector: the same ascii pushed twice by this decoder inside
+/// [`DOUBLE_WINDOW_MS`]. Survives the fix on purpose — it watches the OUTPUT, so it stays valid however
+/// the input side is rewritten, and it is what distinguishes a producer double from a consumer echo.
+static DOUBLE_PUSHES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// DBLSTROKE — ascii of the last `Event::Key` this decoder pushed, +1 (0 = none yet).
+static LAST_PUSH_ASCII: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// DBLSTROKE — `arch::ms()` of that push.
+static LAST_PUSH_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DBLSTROKE — inside this window, the same character twice is a machine artefact, not typing. Human
+/// double-letters ("ll" in "help", "ee" in "seen") are two presses with a release between them and are
+/// paced by fingers: the Boot AN capture puts a deliberate re-tap of the same key ~450 ms apart, and
+/// even the machine doubles it exposed were 24..140 ms. 50 ms sits below anything a hand does and above
+/// every duplicate the level loop produced.
+const DOUBLE_WINDOW_MS: u64 = 50;
+/// DBLSTROKE — how many suppressed restatements name themselves individually before the rollup takes
+/// over. Enough to see the shape at the bench; bounded so a stuck endpoint cannot make serial the new
+/// backpressure.
+const RESTATE_LOG_MAX: u32 = 3;
+/// DBLSTROKE — after the individual lines, one rollup per this many suppressions. At a fast typist's
+/// overlap rate this is a line every few seconds of continuous typing.
+const RESTATE_ROLLUP_EVERY: u32 = 32;
+/// DBLSTROKE — individually-named doubled pushes before that detector also falls back to counting.
+const DOUBLE_LOG_MAX: u32 = 8;
+
+/// DBLSTROKE — record one genuine press edge and run the doubled-push detector over it.
+///
+/// Called ONLY from the `push_event(Event::Key(..))` site, so what it measures is what ring 3 actually
+/// received. If this ever fires after the edge gate, the edge gate is not the whole story and the next
+/// boot says so on its own line rather than leaving the bench to re-describe the symptom.
+fn note_press_edge(ascii: u8) {
+    use core::sync::atomic::Ordering;
+    let now = crate::arch::ms();
+    PRESS_EDGES.fetch_add(1, Ordering::Relaxed);
+    let prev = LAST_PUSH_ASCII.swap(ascii as u32 + 1, Ordering::Relaxed);
+    let prev_ms = LAST_PUSH_MS.swap(now, Ordering::Relaxed);
+    if prev == ascii as u32 + 1 && now >= prev_ms && now.wrapping_sub(prev_ms) <= DOUBLE_WINDOW_MS {
+        let n = DOUBLE_PUSHES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= DOUBLE_LOG_MAX {
+            serial_println!(
+                "[keystat] ehci double-push — ascii={:#04x} pushed twice {}ms apart (<= {}ms); the PRODUCER is doubling, not the console (boot dbl={})",
+                ascii,
+                now.wrapping_sub(prev_ms),
+                DOUBLE_WINDOW_MS,
+                n
+            );
+        }
+    }
+}
+
+/// DBLSTROKE — fold one report's press accounting and emit the bounded rollup.
+///
+/// `down` counts character keys down in the report (rollover measure); `restated` counts those the
+/// previous report already carried (suppressed doubles).
+fn note_press_report(down: u32, restated: u32) {
+    use core::sync::atomic::Ordering;
+    if down >= 2 {
+        ROLLOVER_REPORTS.fetch_add(1, Ordering::Relaxed);
+    }
+    if restated == 0 {
+        return;
+    }
+    let total = RESTATED_PRESSES.fetch_add(restated, Ordering::Relaxed) + restated;
+    let first_few = total <= RESTATE_LOG_MAX;
+    if first_few || total % RESTATE_ROLLUP_EVERY < restated {
+        serial_println!(
+            "[keystat] ehci press — edges={} restated={} (+{} this report) rollover_reports={} dbl={} window={}ms",
+            PRESS_EDGES.load(Ordering::Relaxed),
+            total,
+            restated,
+            ROLLOVER_REPORTS.load(Ordering::Relaxed),
+            DOUBLE_PUSHES.load(Ordering::Relaxed),
+            DOUBLE_WINDOW_MS
+        );
+    }
+}
+
 unsafe fn decode_boot_keyboard(
     report: &[u8],
     prev_keys: &mut [u8; 6],
@@ -4092,16 +4233,33 @@ unsafe fn decode_boot_keyboard(
         *slot = report[2 + i];
     }
 
+    // DBLSTROKE: PRESS EDGES, NOT LEVELS. `prev_keys` is still the PREVIOUS report here (it is
+    // rewritten at the end of this function), so `!prev_keys.contains(&keycode)` is exactly "this
+    // keycode went down in THIS report". A keycode the previous report already carried is a RESTATED
+    // level, not a new press, and pushing `Event::Key` for it is what doubled characters on metal.
+    let mut restated_this_report = 0u32;
+    let mut down_this_report = 0u32;
     for &keycode in cur_keys.iter() {
         if keycode <= 1 {
             continue; // no key / ErrorRollOver
         }
         let ascii = ascii_of(keycode);
-        if ascii != 0 {
-            serial_println!("EHCI-HID: KEY: '{}' (scancode {:#x})", ascii as char, keycode);
-            crate::pal::push_event(crate::pal::Event::Key(ascii));
+        if ascii == 0 {
+            continue;
         }
+        down_this_report += 1;
+        if prev_keys.contains(&keycode) {
+            // Still held from the previous report. Repeat for a held key is the host typematic
+            // tracker's job on this path (KEYREPEAT-X86, fed below) — at 400 ms / 40 ms, once — and
+            // never the report level's, which is paced by the operator's OTHER fingers.
+            restated_this_report += 1;
+            continue;
+        }
+        serial_println!("EHCI-HID: KEY: '{}' (scancode {:#x})", ascii as char, keycode);
+        crate::pal::push_event(crate::pal::Event::Key(ascii));
+        note_press_edge(ascii);
     }
+    note_press_report(down_this_report, restated_this_report);
 
     // KEYREPEAT-X86: feed the host-side typematic tracker at the REPORT LEVEL — BEFORE the release
     // edges below and before anything else this report will push, so a `KeyUp` the 64-slot ring may
