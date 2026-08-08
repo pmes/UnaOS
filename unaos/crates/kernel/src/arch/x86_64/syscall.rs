@@ -14727,7 +14727,27 @@ fn dmg_code(w: u64, i: usize) -> u32 {
 ///      must still be free, or the run is reported NOT RUN rather than graded — a fixture that cannot
 ///      tell its own race from a kernel bug is worse than no fixture.
 ///   5. Release the owner, wait for its exit and both slots' teardown, then grade.
+///
+/// SETTLE FLAG: `video::wcx::desktop_app_service` holds the desktop-app launch (bounded, out loud)
+/// until this witness has had its empty-table entry — Boot AL's launch at 13.257s beat the witness to
+/// row 1 (DMG entry 13.859s) and it printed NOT RUN for the first time in the capture. The flag is
+/// published on EVERY exit (the wrapper stores it after the body returns, NOT RUN paths included).
+///
+/// BORN SETTLED WITHOUT `witness`: the chain that reaches this launcher is witness-gated at its
+/// root — every `u6bx_probe_once` call site is `#[cfg(feature = "witness")]` — and there are three
+/// more shapes that never arrive even with `witness` on (no online AP; `u8x_build()` -> None;
+/// `winx7_build()` -> None, whose early return skips the tail chain). So the holder's termination
+/// argument is its BOUND, never this chain's reachability — and on a build that cannot run the
+/// witness at all (`./arroyo esp-x86` default: `wc` on, `witness` off) the flag starts `true` so the
+/// desktop app pays nothing for a fixture that cannot exist.
+pub static DMG_REFUSE_SETTLED: AtomicBool = AtomicBool::new(!cfg!(feature = "witness"));
+
 fn dmg_refuse_launcher(demo_cpu: usize) {
+    dmg_refuse_witness(demo_cpu);
+    DMG_REFUSE_SETTLED.store(true, Ordering::Release);
+}
+
+fn dmg_refuse_witness(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
         return;

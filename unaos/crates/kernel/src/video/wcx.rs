@@ -291,6 +291,20 @@ const STORAGE_WAIT_MS: u64 = 30_000;
 /// wait has not started". Written and read only by the single pinned service task, hence `Relaxed`.
 static WAIT_SINCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// DMG-REFUSE HOLD — how long the desktop-app launch defers to the refusal witness before giving up
+/// out loud. The witness settles ~1s after storage is ready on the boots in this capture (Boot AL:
+/// launch 13.257s, DMG entry 13.859s; DMG's own clean run measured 719ms on AI-2). The chain's own
+/// bounded sub-waits (U6BX 10s + U8x 5+2s + WINX-7 10s) could stack past this bound if fixtures time
+/// out — that case degrades to today's behaviour (HOLD-EXPIRED, launch, witness NOT RUN), out loud,
+/// which is the deliberate trade: 15s is the cap on what a healthy desktop will ever pay for a
+/// witness, not a promise the witness fits. Like `STORAGE_WAIT_MS` the job is to TERMINATE in a
+/// line rather than in silence.
+const DMG_HOLD_MS: u64 = 15_000;
+
+/// DMG-REFUSE HOLD — `ticks()` at the first held pass, or `0` for "the hold has not started".
+/// Same single-task access pattern as `WAIT_SINCE_MS`, hence `Relaxed`.
+static DMG_HOLD_SINCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Gap in panel pixels between a pinned window's outer box and the panel edge. Matches `wm`'s own
 /// tiling gap in spirit. Witness-only since the demo window went to ring 3 — the MOVE-VACATE probe is
 /// the last thing in this file that pins its own geometry.
@@ -556,6 +570,30 @@ pub fn desktop_app_service() {
             DESKTOP_APP, waited, STORAGE_WAIT_MS
         );
         return;
+    }
+    // DMG-REFUSE HOLD. The refusal witness requires the window table EMPTY at entry, and this launch
+    // is permanent — on Boot AL it took row 1 at 13.257s, the witness entered at 13.859s, and the
+    // capture got its first `NOT RUN` after three boots of `19/19 — witness OK`. On a `witness`
+    // build the flag settles when the launcher chain completes; on every other shape (witness off —
+    // the default esp-x86 media — or a chain leg that never arrives) the flag is BORN settled or the
+    // bound expires OUT LOUD — a desktop that never appears is worse than one lost witness, and the
+    // loss goes on the record either way.
+    if !crate::arch::syscall::DMG_REFUSE_SETTLED.load(Ordering::Acquire) {
+        let now = crate::arch::ticks();
+        let started = DMG_HOLD_SINCE_MS.load(Ordering::Relaxed);
+        if started == 0 {
+            DMG_HOLD_SINCE_MS.store(now.max(1), Ordering::Relaxed);
+            return;
+        }
+        let waited = now.saturating_sub(started);
+        if waited < DMG_HOLD_MS {
+            return;
+        }
+        serial_println!(
+            "[wc-x] desktop-app HOLD-EXPIRED reason=dmg-refuse-unsettled name=/{} waited={}ms threshold={}ms — launching anyway; the refusal witness will print NOT RUN if it arms after this",
+            DESKTOP_APP, waited, DMG_HOLD_MS
+        );
+        // fall through: the launch proceeds and the lost coverage is on the serial record.
     }
     DONE.store(true, Ordering::Relaxed);
 
