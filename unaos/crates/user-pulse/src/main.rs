@@ -973,21 +973,29 @@ pub extern "C" fn _start() -> ! {
         //     instead INVALIDATE the filter: the next real percent snaps rather than ramps.
         //   * THE FIRST PERCENT SNAPS. Ramping a fresh core up from 0 would draw a rise that never
         //     happened. `disp_live` is what distinguishes "converging towards a value" from "has no value".
-        let mut c = 0usize;
-        while c < prev.ncpu {
-            match load[c] {
-                PARKED | RUNNING => disp_live[c] = false,
-                pct => {
-                    let target = pct << 8; // Q8 percent
-                    disp[c] = if disp_live[c] {
-                        (disp[c] * EMA_KEEP + target) / EMA_DIV
-                    } else {
-                        disp_live[c] = true;
-                        target
-                    };
+        //   * IT NEVER FOLDS AN UNDER-WINDOW SAMPLE. Review-caught: ungated, this ran on frames 1..4,
+        //     whose spans are 50/100/150/200 ms — so the FIRST bar anyone sees would have been an average
+        //     containing sub-`win_ms` measurements while the text cell, the witness and the start line all
+        //     said 250 ms. That is exactly the lie the header's baseline rule forbids, and it also defeated
+        //     "the first percent snaps" for the first *visible* frame. Gated on `filled`, the filter cannot
+        //     start before a real window exists.
+        if filled {
+            let mut c = 0usize;
+            while c < prev.ncpu {
+                match load[c] {
+                    PARKED | RUNNING => disp_live[c] = false,
+                    pct => {
+                        let target = pct << 8; // Q8 percent
+                        disp[c] = if disp_live[c] {
+                            (disp[c] * EMA_KEEP + target) / EMA_DIV
+                        } else {
+                            disp_live[c] = true;
+                            target
+                        };
+                    }
                 }
+                c += 1;
             }
-            c += 1;
         }
 
         // VUGMIN: while every window this process owns is hidden below the shell, there is nothing for a

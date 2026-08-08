@@ -7446,7 +7446,7 @@ therefore costs the compositor **strictly less** than it did at 4 Hz, where it p
 | Line | Change |
 | :--- | :--- |
 | `:: PULSE-A: start pid=… win=… ncpu=… cpu=… segs=10 win_ms=250 frame_ms=50 ::` | **`win_ms=` and `frame_ms=` are new.** Now that the measurement window and the frame period are different quantities, a capture showing a percent must also state what span it covers and how often it was recomputed, or it cannot be checked against `[schedx86] load` after the fact. |
-| `:: PULSE-A: first-window cN busy/idle=B/I -> V ::` | **Unchanged in format and in meaning** — still one line per core, still the first *full* 250 ms window, still the raw deltas and the raw verdict. It now lands at ~300 ms of the app's life instead of ~250 ms. |
+| `:: PULSE-A: first-window cN busy/idle=B/I -> V ::` | **Unchanged in format and in meaning** — still one line per core, still the first *full* 250 ms window, still the raw deltas and the raw verdict. It still lands at ~250 ms of the app's life, unchanged: `samples` is incremented before the `samples >= WINDOW_SLOTS` test, so the fifth 50 ms frame satisfies it and its base slot is still the primed baseline — a true 250 ms span at the same instant as before (Boot AN: start 376252 ms, first-window 376502 ms). |
 | `:: PULSE-A: alive pid=… frames=40 ::` | **`frames=8` becomes `frames=40`.** `ALIVE_MARK` was rescaled with the frame rate so the line keeps meaning "~2 s of loop life". `frames` still counts loop passes, not presents, so a hidden monitor still proves it is looping. |
 
 `PULSEW_MIN_PRESENTS` (3) is unchanged and now satisfied in ~400 ms rather than ~1 s; the PULSE-W deadline
@@ -7491,7 +7491,7 @@ to do.
 
 380/(380+177) = 68%. That is two 1 kHz pollers waking ~1.5 times per millisecond between short `hlt`s over
 a 250 ms window — a **cadence**, not a duty cycle. The `[schedx86] load` line straddling the same moment
-says `c7=0%` and `c7=1%`, and across the whole six-vug era `c7` runs 0–7%; that is the SCHEDLOAD-X86
+says `c7=0%` (372202 ms) and `c7=1%` (377265 ms) — the paused instant the question is about. (Do NOT generalise that to the whole six-vug era: under load `c7` is genuinely busy, reading 12, 19, 22, 60, 70, 64, 53, 49, 44% as the fleet is placed. The service core is idle when the fleet is idle, not always.) Corroboration from a THIRD counter on those same lines: `sw[]` is `ACCT.ctx_switches`, the same quantity `CPU_BUSY` counts — `sw[7]` moves 662334 -> 671957 across 5063 ms = 1.90 dispatches/ms, against PULSE's 380/250 ms = 1.52/ms. Two independent counters agreeing on the dispatch RATE while their percents differ by 68x is the cross-check passing, quantitatively. That is the SCHEDLOAD-X86
 `core_load` feed, denominated in TSC **time**, and it is the number that answers "how much of the wall
 clock did this core spend executing".
 
