@@ -222,9 +222,9 @@ unsafe fn read_gmux_trace() -> [u32; 7] { [0; 7] }
 // behaviourally identical to trunk. An earlier attempt replaced those closures with
 // `arch::ms()`-deadline helpers gated on `target_arch` only, so EVERY `unaos_ivb` build (armed
 // or not) picked up a wait whose bound depends on the BSP timer ISR still running. The old
-// bound could not hang; that one could. The armed helpers here carry BOTH an unconditional
-// iteration cap AND an `ms()` deadline, so even on the armed build a stopped clock cannot hang
-// them — whichever bound trips first ends the wait.
+// bound could not hang; that one could. The armed helpers here carry an unconditional
+// iteration cap, so even on the armed build a stopped clock cannot hang
+// them.
 //
 // The panel WILL go black between the switch and the revert. That is the EXPECTED result, not
 // the experiment failing: the census in this same function reads every pipe, every plane and
