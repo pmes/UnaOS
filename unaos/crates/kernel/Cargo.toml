@@ -22,6 +22,24 @@ nvidia-kepler-kdisp-hold = []
 # is byte-identical. Enable via `UNAOS_WC=1` (needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach
 # the seam).
 wc = []
+# VSYNC-PACE: `UNAOS_NOPACE=1` — the ESCAPE HATCH that DISABLES the kernel-side present pacer.
+#
+# The pacer is DEFAULT ON whenever `wc` is on, and that is the deliberate call: a desktop that renders
+# frames the panel cannot scan out is burning CPU for pixels no operator can see, so waste-free is the
+# right default and an opt-in knob would leave the shipped configuration the wasteful one. The negative
+# polarity of this knob follows from that — `UNAOS_PACE=1` would mean every future boot has to remember
+# to arm it.
+#
+# What it is FOR: the bench instruments (`[wc-g]`, `[wc-d]`, `[wcn]`, `[vugmin]`) were calibrated
+# against an UNPACED present path — their rate figures across GR16-GR21 are "how fast can this fleet
+# present", a question the pacer answers by fiat. `UNAOS_NOPACE=1` restores that measurement mode
+# exactly (not one byte of pacer code is linked), so a headroom measurement stays comparable with every
+# capture already taken. Without it the arc would silently invalidate the archive.
+#
+# `nopace` is x86-only in effect (everything it gates lives in `arch/x86_64/syscall.rs`, and `wc` is an
+# x86 feature) and is STRIPPED from aarch64 builds by `arroyo`'s `arm_features`, so Pi and Jetson media
+# stay byte-identical whichever way it points.
+nopace = []
 # INSTGUI: the graphical installer window (UNAOS_INSTGUI=1; requires wc + the x86 engine).
 instgui = ["wc", "installdemo"]
 intel-ivb = []

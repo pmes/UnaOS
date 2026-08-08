@@ -226,6 +226,12 @@ fn main() {
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
     // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WC").is_ok() { feats.push("wc"); }
+    // VSYNC-PACE: UNAOS_NOPACE=1 DISABLES the kernel-side present pacer. The pacer is DEFAULT ON under
+    // `wc` — presents sleep to the panel's 16667 us frame — so this knob is the escape hatch that
+    // restores the UNPACED path the bench instruments were calibrated against. This list is what reaches
+    // the KERNEL build for MEDIA, so the knob has to be mapped here as well as in arroyo, or a metal boot
+    // could never be un-paced. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_NOPACE").is_ok() { feats.push("nopace"); }
     // INSTGUI: UNAOS_INSTGUI=1 opens the graphical installer dialog on the wc desktop. The cargo
     // feature implies `wc` + `installdemo`, but this list is what reaches the KERNEL build for
     // media, so the knob must be mapped here too (arroyo's own list only covers non-media paths —
