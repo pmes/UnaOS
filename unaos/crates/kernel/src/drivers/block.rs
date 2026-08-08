@@ -588,6 +588,18 @@ pub fn set_boot_volume_serial(serial: u32) {
     }
 }
 
+/// FRGUARD: the boot volume's `BS_VolID` as published by [`set_boot_volume_serial`], or 0 when the
+/// loader could not identify the medium it booted from (the disarmed sentinel).
+///
+/// SDHC-4c reads it for its reserve witness ONLY — the line names the boot serial and the card's
+/// volume serial side by side, so a capture shows whether the reserved extent lives on the medium
+/// this kernel booted from, and the FRGUARD verdict above can be read together with it. Nothing
+/// keys behaviour off this getter: SDHC-4c's bound is the LBA extent, not an identity test.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn boot_volume_serial() -> u32 {
+    BOOT_VOLUME_SERIAL.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// FRGUARD: derive the boot-medium verdict for the current global-slot occupant, at most once per
 /// claim. MUST be called from an unmasked, lock-free context — it issues sector reads. The x86 main
 /// loop's flight-recorder pass is the site that does so, ahead of every `Default` writer on that pass.
@@ -1136,11 +1148,13 @@ static SDHC_WRITE_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::
 /// PERM_WRITE_PROTECT, CSD TMP_WRITE_PROTECT), so this entry point inherits them rather than
 /// re-implementing them.
 ///
-/// **Not reachable from the FAT layer in this arc.** `fs::fat::write_sector`/`write_sectors` refuse a
-/// `Sdhc` source unconditionally (see the SINGLE FAT WRITER note above); the only route here is
-/// [`PartitionRange::write_block`] with an explicitly `Sdhc`-handled range, which nothing in `fs/fat.rs`
-/// calls. It is compiled and type-checked so the seam exists and the `sdw` polarity is covered by the
-/// `x86-all` gate leg, not so that this build writes to the card.
+/// **SDHC-4c (supersedes 4b's "not reachable from the FAT layer"):** `fs::fat::write_sector` /
+/// `write_sectors` now route a `Sdhc` source here — but ONLY after `fs::sdhc4c::permit_write` has
+/// admitted the span, i.e. only for LBAs inside the one reserved extent published at boot. Every
+/// other LBA on the card is refused above this function, before any card lock is taken. See
+/// `fs/sdhc4c.rs` for the writable set and the argument that it is closed. The other route,
+/// [`PartitionRange::write_block`] with an explicitly `Sdhc`-handled range, is still called by
+/// nothing in `fs/fat.rs`.
 #[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw"))]
 pub fn write_block_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     let dev = sdhc_info().ok_or(BlockError::NotReady)?;

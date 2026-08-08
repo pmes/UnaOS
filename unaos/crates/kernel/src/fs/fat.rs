@@ -597,29 +597,21 @@ pub enum BlockSource {
     Sdhc,
 }
 
-/// SDHC-4b: one-shot latch for the read-only refusal witness, so a writer that retries cannot flood
-/// the console with the same line.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-static SDHC_RO_REFUSED: AtomicBool = AtomicBool::new(false);
-
-/// SDHC-4b: refuse a FAT-layer write to the internal SD card, naming the reason once per boot.
+/// SDHC-4c: the internal SD card's write decision, in ONE place — superseding SDHC-4b's
+/// `refuse_sdhc_write`, which returned `Unsupported` unconditionally from these same two call sites.
 ///
-/// This is the whole of the SINGLE FAT WRITER safety argument for this arc, so it is a function rather
-/// than an inline `_ =>` arm: there is exactly one place that decides, both write entry points go
-/// through it, and a future arc that lifts the refusal has exactly one thing to delete. It returns
-/// [`FatError::Unsupported`], not `Io` — a refusal is not a device fault, and the VFS surfaces it as
-/// "read-only volume" rather than as a disk error.
+/// The seam is deliberately unchanged in shape: one function, both write entry points go through
+/// it, one-shot witness, [`FatError::Unsupported`] on refusal (a refusal is policy, not a device
+/// fault). What changed is the answer — it is now "yes IF the span lies inside the reserved
+/// extent", which is a STRICTER statement than 4b's blanket no was a loose one: 4b refused at the
+/// FAT layer and left `PartitionRange::write_block` as an unbounded route to the card, while this
+/// bound is checked in absolute LBAs at the point the CMD24 is about to be issued.
+///
+/// See [`crate::fs::sdhc4c`] for the writable set and why it is closed.
 #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-fn refuse_sdhc_write(site: &str, lba: u64) -> FatError {
-    if !SDHC_RO_REFUSED.swap(true, Ordering::Relaxed) {
-        serial_println!(
-            ":: SDHCBLK: FAT write REFUSED at {} lba={} — the internal SD card is mounted READ-ONLY \
-             (SINGLE FAT WRITER: x86 fat/dir locks are inert, so this build keeps exactly one FAT \
-             mutator) (first, once) ::",
-            site, lba
-        );
-    }
-    FatError::Unsupported
+#[inline]
+fn permit_sdhc_write(site: &str, lba: u64, count: u64) -> Result<(), FatError> {
+    crate::fs::sdhc4c::permit_write(site, lba, count)
 }
 
 /// Read one 512-byte sector at absolute `lba` into `buf` from `source`. Treats a short copy as I/O error, so
@@ -648,19 +640,21 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
 /// BOT WRITE(10) path (`write_block_usb`, MISSION-gated with an RMW+restore witness); any source
 /// without a verified write path would still be refused here.
 fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> {
-    // SDHC-4b: the internal SD card is READ-ONLY at the FAT layer. Checked BEFORE the block call, so
-    // no CMD24 can be issued by any FAT path however the volume was mounted.
+    // SDHC-4c: the internal SD card admits a write ONLY inside the reserved extent. Checked BEFORE
+    // the block call, so a refused write issues no CMD24 and takes no card lock, however the volume
+    // was mounted. Unarmed (the default, and every failure of the reserve pass) => refuses exactly
+    // as SDHC-4b did.
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     if source == BlockSource::Sdhc {
-        return Err(refuse_sdhc_write("write_sector", lba));
+        permit_sdhc_write("write_sector", lba, 1)?;
     }
     let r = match source {
         BlockSource::Default => crate::drivers::block::write_block(lba, buf),
         BlockSource::Usb => crate::drivers::block::write_block_usb(lba, buf),
-        // Unreachable: the guard above returned. Present so the match stays exhaustive and so a future
-        // arc that deletes the guard gets a compile error here instead of a silent fallthrough.
+        // Reachable ONLY with the permit armed and this exact LBA inside the reserved extent — the
+        // guard above returned otherwise.
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-        BlockSource::Sdhc => return Err(refuse_sdhc_write("write_sector", lba)),
+        BlockSource::Sdhc => crate::drivers::block::write_block_sdhc(lba, buf),
     };
     r.map_err(|e| match e {
         // WEDGE-8 (F3): see `read_sector` — Busy stays Busy so it can be retried, not mourned.
@@ -740,10 +734,18 @@ fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatErr
     if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
         return Err(FatError::Io);
     }
-    // SDHC-4b: read-only, checked before the loop — see `write_sector`.
+    // SDHC-4c: the WHOLE run is checked against the reserved extent before the loop starts, so a run
+    // that is only partly inside it is refused ENTIRELY rather than half-written and then stopped.
+    // Each chunk is then re-checked inside the loop against the same predicate — the run check is
+    // the atomicity property, the per-chunk check is the bound, and neither is derived from the
+    // other. See `write_sector`.
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     if source == BlockSource::Sdhc {
-        return Err(refuse_sdhc_write("write_sectors", lba));
+        crate::fs::sdhc4c::permit_span(
+            "write_sectors(run)",
+            lba,
+            (buf.len() / SECTOR_SIZE) as u64,
+        )?;
     }
     let step = crate::drivers::block::MAX_BLOCKS_PER_OP * SECTOR_SIZE;
     let mut off = 0usize;
@@ -751,12 +753,16 @@ fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatErr
         let take = core::cmp::min(step, buf.len() - off);
         let at = lba + (off / SECTOR_SIZE) as u64;
         let chunk = &buf[off..off + take];
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        if source == BlockSource::Sdhc {
+            permit_sdhc_write("write_sectors", at, (take / SECTOR_SIZE) as u64)?;
+        }
         let r = match source {
             BlockSource::Default => crate::drivers::block::write_blocks(at, chunk),
             BlockSource::Usb => crate::drivers::block::write_blocks_usb(at, chunk),
-            // Unreachable: the guard above returned. See `write_sector`.
+            // Reachable ONLY with the permit armed and this chunk inside the reserved extent.
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-            BlockSource::Sdhc => return Err(refuse_sdhc_write("write_sectors", at)),
+            BlockSource::Sdhc => crate::drivers::block::write_blocks_sdhc(at, chunk),
         };
         r.map_err(|_| FatError::Io)?;
         off += take;
@@ -1051,6 +1057,33 @@ const RMW_BUSY_ATTEMPTS: u32 = 64;
 /// here, OUTSIDE the masked span (see [`RMW_BUSY_ATTEMPTS`]). The invariant this establishes for
 /// every span in `fs/`: no `without_interrupts` closure ever blocks on a driver lock — it fails
 /// fast with `Busy` and the wait (a `hlt`, schedulable, unmasked) happens out here.
+/// SDHC-4c: the FAT-MUTATION INSTRUMENT for the internal SD card.
+///
+/// [`with_fat_lock_src`] and [`with_dir_lock_src`] are the two wrappers EVERY FAT-table RMW
+/// (`set_fat_entry`, `alloc_cluster`'s compare-and-claim) and EVERY directory RMW (all six
+/// `with_dir_lock` bodies: `write_dir_entry_fields`, `..._mtime`, `create_in_root`, `create_in_dir`,
+/// `write_dir_entry_name`, `mark_dir_deleted`) in this file passes through. Counting here therefore
+/// counts the complete mutator surface with two call sites instead of eight, and — the property
+/// that matters for the instrument-baseline law — it can print NON-ZERO: any future code that
+/// mutates the card's FAT or directory is caught by construction, whether or not the write beneath
+/// it is then refused.
+///
+/// Costs one integer comparison on every RMW on every source; the `Sdhc` variant does not exist
+/// outside `x86_64 + sdhcblk`, so this compiles to nothing at all elsewhere.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+#[inline]
+fn note_sdhc_mutation(source: BlockSource, site: &str) {
+    if source == BlockSource::Sdhc {
+        crate::fs::sdhc4c::note_fat_mutation(site);
+    }
+}
+
+/// No `Sdhc` source exists in this build, so there is nothing to instrument. Byte-identical to
+/// pre-4c on every other target.
+#[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+#[inline(always)]
+fn note_sdhc_mutation(_source: BlockSource, _site: &str) {}
+
 #[inline]
 fn with_fat_lock_src<R>(
     source: BlockSource,
@@ -1058,6 +1091,7 @@ fn with_fat_lock_src<R>(
     mut f: impl FnMut() -> Result<R, FatError>,
 ) -> Result<R, FatError> {
     note_masked_usb_hold(source, site);
+    note_sdhc_mutation(source, site);
     let start = crate::arch::now_cycles();
     let budget = crate::arch::hw_wait_budget();
     for _ in 0..RMW_BUSY_ATTEMPTS {
@@ -1082,6 +1116,7 @@ fn with_dir_lock_src<R>(
     mut f: impl FnMut() -> Result<R, FatError>,
 ) -> Result<R, FatError> {
     note_masked_usb_hold(source, site);
+    note_sdhc_mutation(source, site);
     let start = crate::arch::now_cycles();
     let budget = crate::arch::hw_wait_budget();
     for _ in 0..RMW_BUSY_ATTEMPTS {
@@ -3516,10 +3551,334 @@ pub fn sdhc_probe_once() {
                     ":: SDHCBLK: sdhc root directory read error ({:?}) ::", e
                 ),
             }
+            // SDHC-4c: the reserve pass runs HERE, on the mount this function already has, for two
+            // reasons. (1) Exclusivity: `sdhc_probe_once` is called from the x86 main loop ahead of
+            // `flight_recorder::service()` and every `U*_probe_once` on the same pass, so no other
+            // FAT writer of any volume can be running — the same program-order argument
+            // `flight_recorder.rs` §SINGLE FAT WRITER makes for roster row 1, inherited verbatim.
+            // (2) Cost: a second `mount_source` would re-read the MBR and BPB for nothing.
+            // It is still a one-shot: `PROBED` above latched before the mount.
+            if crate::fs::sdhc4c::claim_reserve_pass() {
+                if let Some((first, sectors)) = fs.sdhc4c_reserve() {
+                    fs.sdhc4c_write_verify(first, sectors);
+                }
+                // The tally closes the pass on EVERY outcome, so "armed and wrote", "refused" and
+                // "the pass never ran" are three distinguishable states in a capture rather than
+                // two states and a silence.
+                crate::fs::sdhc4c::tally();
+            }
         }
-        Err(e) => serial_println!(
-            ":: SDHCBLK: no FAT volume on the internal SD card ({} MiB, {:?}) ::", size_mib, e
-        ),
+        Err(e) => {
+            serial_println!(
+                ":: SDHCBLK: no FAT volume on the internal SD card ({} MiB, {:?}) ::", size_mib, e
+            );
+            // SDHC-4c: no volume means no reservation to adopt. Say so — a silent skip here would
+            // be indistinguishable from a pass that ran and found nothing.
+            if crate::fs::sdhc4c::claim_reserve_pass() {
+                crate::fs::sdhc4c::disarm(
+                    crate::fs::sdhc4c::RESERVE_NAME,
+                    "no FAT volume on the internal SD card",
+                );
+                crate::fs::sdhc4c::tally();
+            }
+        }
+    }
+}
+
+// ===================== SDHC-4c — the reserve-once flight-recorder writer =====================
+//
+// The FIRST persistent write UnaOS makes. Read `fs/sdhc4c.rs` first: it owns the permit, the
+// writable sector set, and the argument for why that set is closed. This section owns the pass that
+// derives the set and then exercises it, in four steps that are deliberately in this order:
+//
+//   RESERVE -> ARM (+ self-test) -> WRITE -> READ BACK
+//
+// ADOPT-ONLY is the whole safety idea. The kernel does not create, grow, delete, rename or truncate
+// the reserved file, on this volume or any other: it LOCATES a file the host staged, proves the
+// chain it already has is one contiguous run wholly inside the data region, and publishes that run
+// as the writable set. Every one of `create_in_root`, `write_grow`, `delete_located` and
+// `alloc_cluster` remains unreachable with `source == Sdhc`, so the card acquires a writer that is
+// not a FAT mutator — the same class the flight recorder became on the boot volume, minus the
+// bootstrap window the recorder still has to reason about (`flight_recorder.rs` §SINGLE FAT
+// WRITER, cases B and C). There is no bootstrap window here because there is no bootstrap.
+//
+// Every failure lands on `sdhc4c::disarm`, which is permanent for the boot and leaves the card in
+// exactly the SDHC-4b state: mounted, readable, and unwritable. The worst outcome this pass has is
+// "refused, nothing written".
+
+/// SDHC-4c: how many bytes the verify pass writes and reads back — one whole sector, at offset 0 of
+/// the reserved file. A whole aligned sector is chosen so `write_span` needs no read-modify-write
+/// and the card sees exactly one CMD24, which makes `cmd24=1` a falsifiable prediction rather than
+/// an approximation.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const SDHC4C_RECORD_BYTES: usize = SECTOR_SIZE;
+
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+impl FatFs {
+    /// SDHC-4c step 1+2: ADOPT the host-staged reservation and publish its LBA extent, or refuse.
+    ///
+    /// Returns the `(first_cluster, sectors)` of the armed extent on success. Every `return` before
+    /// the `arm` call has already named its reason on the wire through `disarm`.
+    fn sdhc4c_reserve(&self) -> Option<(u32, u64)> {
+        use crate::fs::sdhc4c as permit;
+        const NAME: &str = crate::fs::sdhc4c::RESERVE_NAME;
+
+        // The pass is only ever driven for the card, but state that as a check rather than as a
+        // comment: a future caller that hands it the boot volume must be refused, not trusted.
+        if self.source != BlockSource::Sdhc {
+            permit::disarm(NAME, "internal error: reserve pass invoked on a non-Sdhc volume");
+            return None;
+        }
+
+        // --- locate. ADOPT-ONLY: absent is a refusal, never a create. ---
+        let de = match self.find_located(NAME) {
+            Ok((de, _lba, _slot)) => de,
+            Err(FatError::NotFound) => {
+                permit::disarm(
+                    NAME,
+                    "absent from the card's root directory — the HOST stages this file; the kernel \
+                     never creates it, because a create is a directory mutation",
+                );
+                return None;
+            }
+            Err(e) => {
+                serial_println!(
+                    ":: SDHC4C: reserve NAME={} lookup failed ({:?}) ::", NAME, e
+                );
+                permit::disarm(NAME, "root-directory lookup failed");
+                return None;
+            }
+        };
+        if de.is_dir {
+            permit::disarm(NAME, "the name is a DIRECTORY on this card, not a file");
+            return None;
+        }
+        if de.size < crate::fs::sdhc4c::RESERVE_BYTES {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} size={} < required {} ::",
+                NAME, de.size, crate::fs::sdhc4c::RESERVE_BYTES
+            );
+            permit::disarm(
+                NAME,
+                "the staged file is SHORTER than the reservation; adopting it would mean growing \
+                 it later, and a grow is a FAT mutation",
+            );
+            return None;
+        }
+        let first = de.first_cluster;
+        if !self.valid_cluster(first) {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} first_cluster={} is not a valid data cluster (2..{}) ::",
+                NAME, first, self.count_of_clusters + 2
+            );
+            permit::disarm(NAME, "the staged file has no valid cluster chain head");
+            return None;
+        }
+
+        // --- walk the chain the file ALREADY has. `collect_chain` only READS the FAT. ---
+        // The extent covers exactly the clusters `RESERVE_BYTES` needs, NOT the whole file: it is
+        // the tightest closed set, and it agrees with the `size` the writer below passes to
+        // `write_at`, so the two independent bounds (LBA extent, byte clamp) describe the same
+        // region rather than one being slack against the other.
+        let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
+        let need = (crate::fs::sdhc4c::RESERVE_BYTES as usize).div_ceil(clus_bytes);
+        let clusters = match self.collect_chain(first, need) {
+            Ok(c) => c,
+            Err(e) => {
+                serial_println!(":: SDHC4C: reserve NAME={} chain walk failed ({:?}) ::", NAME, e);
+                permit::disarm(NAME, "the staged file's cluster chain is malformed");
+                return None;
+            }
+        };
+        if clusters.len() < need {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} chain covers {} clusters, needs {} ::",
+                NAME, clusters.len(), need
+            );
+            permit::disarm(NAME, "the cluster chain ends before the reservation does");
+            return None;
+        }
+        // CONTIGUITY. Not an optimisation: a single run is what lets the writable set be ONE
+        // interval, and one interval is what makes the bound a single comparison that a reader can
+        // check by eye. A fragmented file is refused rather than described by a list of ranges.
+        let mut runs = 1usize;
+        for i in 1..clusters.len() {
+            if clusters[i] != clusters[i - 1] + 1 {
+                runs += 1;
+            }
+        }
+        if runs != 1 {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} cluster={} size={} runs={} contiguous=0 ::",
+                NAME, first, de.size, runs
+            );
+            permit::disarm(
+                NAME,
+                "the staged file is FRAGMENTED; the permit describes exactly one LBA interval",
+            );
+            return None;
+        }
+
+        // --- prove the interval before publishing it. Four independent bounds. ---
+        let nsec = need as u64 * self.sec_per_clus as u64;
+        let a = self.cluster_lba(clusters[0]);
+        let b = a + nsec;
+
+        // (1) THE load-bearing one: the extent starts at or after the first data sector. On FAT the
+        // boot sector, the reserved sectors, both FAT copies and the FAT16 fixed root directory all
+        // live BELOW `data_start`, so this single inequality puts every one of them permanently out
+        // of reach of a permitted write — whatever the chain walk returned, and whether or not the
+        // BPB is honest about anything else.
+        if a < self.data_start {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} lba={} is BELOW data_start={} ::",
+                NAME, a, self.data_start
+            );
+            permit::disarm(NAME, "the derived extent reaches metadata sectors");
+            return None;
+        }
+        // (2) and it ends at or before the last addressable data sector.
+        let data_end = self.data_start + self.count_of_clusters as u64 * self.sec_per_clus as u64;
+        if b > data_end {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} end={} is PAST the data region end={} ::",
+                NAME, b, data_end
+            );
+            permit::disarm(NAME, "the derived extent runs past the data region");
+            return None;
+        }
+        // (3) the volume's and the partition's own extents — two separate on-disk claims, checked
+        // by the same `in_extent` every read of this volume is checked against.
+        if let Err(e) = self.in_extent(a, nsec) {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} extent=[{}..{}) rejected by in_extent ({:?}) ::",
+                NAME, a, b, e
+            );
+            permit::disarm(NAME, "the derived extent leaves the volume or the partition");
+            return None;
+        }
+        // (4) the device's own capacity, asked of the block layer rather than derived from the BPB.
+        let dev_blocks = crate::drivers::block::sdhc_info()
+            .map(|d| d.num_blocks)
+            .unwrap_or(0);
+        if b > dev_blocks {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} end={} is PAST the card's num_blocks={} ::",
+                NAME, b, dev_blocks
+            );
+            permit::disarm(NAME, "the derived extent runs past the end of the card");
+            return None;
+        }
+
+        if !permit::arm(
+            NAME,
+            first,
+            de.size,
+            runs,
+            a,
+            b,
+            crate::drivers::block::boot_volume_serial(),
+            self.vol_id,
+        ) {
+            return None;
+        }
+        // The bound, tested through the bound's own predicate, before anything is written.
+        permit::selftest_bounds();
+        if !permit::armed() {
+            return None; // the self-test disarmed it; it printed why
+        }
+        Some((first, nsec))
+    }
+
+    /// SDHC-4c step 3+4: write one record in place at offset 0 of the reserved extent and READ IT
+    /// BACK, checksumming both. An echo that cannot fail proves nothing, so the verdict is a
+    /// comparison of two FNV-1a hashes over bytes that made a round trip through the card.
+    #[cfg(feature = "sdw")]
+    fn sdhc4c_write_verify(&self, first: u32, _sectors: u64) {
+        use crate::fs::sdhc4c as permit;
+        let (a, b) = permit::extent();
+
+        // The record. Fixed length, one whole sector, ASCII, newline-terminated so a host `head -c
+        // 512` on the file is readable without tooling. `cy=` is the raw cycle counter — the only
+        // clock this pass can be sure of — so two boots produce different bytes and a stale-file
+        // read cannot be mistaken for a fresh write.
+        let body = alloc::format!(
+            ":: SDHC4C-REC: unaos first-persistent-write cy={} cluster={} lba=[{}..{}) vol=0x{:08x} ::\n",
+            crate::arch::now_cycles(),
+            first,
+            a,
+            b,
+            self.vol_id
+        );
+        let mut rec = alloc::vec![b' '; SDHC4C_RECORD_BYTES];
+        let n = core::cmp::min(body.len(), SDHC4C_RECORD_BYTES);
+        rec[..n].copy_from_slice(&body.as_bytes()[..n]);
+        rec[SDHC4C_RECORD_BYTES - 1] = b'\n';
+        let want = permit::fnv1a(&rec);
+
+        // `size` is RESERVE_BYTES, not the file's on-disk size: `write_at` clamps to it, so the
+        // writer's byte bound and the permit's LBA bound describe the same region.
+        let wrote = match self.write_at(first, crate::fs::sdhc4c::RESERVE_BYTES, 0, &rec) {
+            Ok(w) => w,
+            Err(e) => {
+                serial_println!(
+                    ":: SDHC4C: in-place write FAILED ({:?}) lba=[{}..{}) — nothing is claimed to \
+                     have landed ::",
+                    e, a, b
+                );
+                return;
+            }
+        };
+        if wrote != rec.len() {
+            serial_println!(
+                ":: SDHC4C: in-place write SHORT wrote={} of {} lba=[{}..{}) ::",
+                wrote, rec.len(), a, b
+            );
+            return;
+        }
+
+        // READ BACK from the medium. Same extent, same offset, through the ordinary read path.
+        let mut back = alloc::vec::Vec::new();
+        if let Err(e) = self.read_at(
+            first,
+            crate::fs::sdhc4c::RESERVE_BYTES,
+            0,
+            &mut back,
+            SDHC4C_RECORD_BYTES,
+        ) {
+            serial_println!(
+                ":: SDHC4C: read-back FAILED ({:?}) — the write is UNVERIFIED lba=[{}..{}) ::",
+                e, a, b
+            );
+            return;
+        }
+        let got = permit::fnv1a(&back);
+        if back.len() == rec.len() && got == want && back[..] == rec[..] {
+            serial_println!(
+                ":: SDHC4C: in-place write ok bytes={} lba=[{}..{}) readback=MATCH fnv=0x{:08x} ::",
+                wrote, a, b, got
+            );
+        } else {
+            serial_println!(
+                ":: SDHC4C: !! read-back MISMATCH bytes={} got={} fnv-want=0x{:08x} \
+                 fnv-got=0x{:08x} lba=[{}..{}) — the card did NOT return what was written ::",
+                wrote, back.len(), want, got, a, b
+            );
+        }
+    }
+
+    /// SDHC-4c: without `sdw` this image contains no CMD24 ladder at all (SDHC-4a's property, and
+    /// the default x86 polarity), so the honest report is that the permit armed and the write leg is
+    /// absent — not silence, and not a fabricated success.
+    #[cfg(not(feature = "sdw"))]
+    fn sdhc4c_write_verify(&self, _first: u32, _sectors: u64) {
+        let (a, b) = crate::fs::sdhc4c::extent();
+        serial_println!(
+            ":: SDHC4C: in-place write SKIPPED lba=[{}..{}) — this build carries no `sdw` feature, \
+             so it contains no CMD24 ladder for the internal SD card; the permit is armed and the \
+             extent is published, but nothing can write to it (UNAOS_SDW=1 arms the write leg) ::",
+            a, b
+        );
     }
 }
 

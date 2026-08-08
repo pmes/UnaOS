@@ -1731,3 +1731,154 @@ About 4 ms, and "it cost nothing" would be the wrong reading of an unmoved total
 by construction** and the arc adds no write path to it, so nothing here bears on 4c. The
 identification path (§9) and the armed write self-test (§8) both ran on this boot unchanged
 and passed, so the block backend does not disturb the layers underneath it.
+
+---
+
+## 11. Milestone 4c (SDHC-4c) — the FIRST PERSISTENT WRITE, bounded to a reserved extent
+
+SDHC-4b mounted the internal card and refused every FAT-layer write to it unconditionally. 4c
+replaces that single refusal with a single **permit**, at the same seam, and the card becomes
+writable — but only inside one published interval of LBAs, fixed before the first write is
+possible.
+
+This is the arc that makes anything in UnaOS survive a reboot. It is deliberately the smallest
+possible version of that: one file, one extent, one sector written and read back.
+
+### 11.1 The shape: adopt-only, reserve-once
+
+§10.3 named two paths out of 4b. 4c takes path (b) in its strongest variant — **host-staged
+reserve, zero kernel FAT mutation on the card, ever**:
+
+1. The **host** stages a fixed-size (64 KiB), contiguous `UNALOG.BIN` in the root of the card's
+   FAT volume.
+2. The kernel **adopts** it: locate the entry, require `size >= 64 KiB` and a valid chain head,
+   walk the chain it already has, require exactly **one contiguous run**, derive the absolute LBA
+   extent, prove it, publish it.
+3. Every later write is admitted only inside that extent.
+
+The kernel never calls `create_in_root`, `write_grow`, `delete_located` or `alloc_cluster` with
+`source == Sdhc`, in any cfg. The flight recorder still needs those (cases B and C of
+`reserve_log`) because it must work on a volume it did not prepare; the card is media the host
+prepares, so 4c keeps **only** the recorder's case A — the zero-mutation case that already fires
+on every real boot. There is no bootstrap window to reason about, because there is no bootstrap.
+
+Consequence: the x86 FAT-mutator count stays at **one**, on the *boot* volume, unchanged. The card
+acquires a writer that is not a mutator, so there is nothing to serialize it against and no lock is
+introduced or claimed. §10.3's `ALLOC_HINT` non-interference argument survives verbatim — a path
+that never allocates never enters `alloc_cluster`.
+
+### 11.2 The writable sector set, and why it is closed
+
+Implementation: `crates/kernel/src/fs/sdhc4c.rs` (the permit) and the reserve/verify pass in
+`fs/fat.rs` (`FatFs::sdhc4c_reserve`, `FatFs::sdhc4c_write_verify`), driven from `sdhc_probe_once`.
+
+A build can write to the internal card **only** through `fs::fat::write_sector` /
+`write_sectors` with `source == Sdhc`, and both call `sdhc4c::permit_write` before the block layer
+is reached. It admits `[lba, lba+count)` iff:
+
+1. the permit state is `ST_ARMED`, and
+2. `EXTENT_LBA <= lba` and `lba + count <= EXTENT_END`.
+
+`EXTENT_LBA`/`EXTENT_END` are stored **exactly once**, by `arm`, under a compare-exchange on the
+state (`ST_UNATTEMPTED -> ST_ARMING`). Nothing else in the kernel stores to them; `permit_write`
+only loads. Both initialise to 0, so even a torn read yields an empty interval, which admits
+nothing — the initial values fail closed on their own.
+
+Before arming, the reserve pass proves four independent bounds:
+
+| # | check | what it closes |
+|---|---|---|
+| 1 | `lba >= data_start` | **the load-bearing one.** On FAT the boot sector, the reserved sectors, both FAT copies and the FAT16 fixed root all live BELOW `data_start`. This single inequality puts every one of them permanently out of reach, whatever the chain walk returned. |
+| 2 | `end <= data_start + count_of_clusters * spc` | the extent cannot run past the addressable data region |
+| 3 | `in_extent(lba, n)` | the volume's `tot_sec` AND the partition table's declared length — two separate on-disk claims, the same check every read of the volume passes |
+| 4 | `end <= sdhc_info().num_blocks` | the device's own capacity, asked of the block layer rather than derived from the BPB |
+
+No knob widens the set. `permit_write` carries no `cfg` beyond the module gate, takes no bypass
+argument, and is the only producer of `Ok(())` on the path. `sdw` gates whether a CMD24 ladder
+exists in the image at all (§8's property, preserved — the default x86 image still contains no
+CMD24 command word); it cannot loosen the bound, only remove the ability to write anything.
+
+### 11.3 The bounds self-test
+
+Immediately after arming, `selftest_bounds` attempts four spans that must be refused — one sector
+below the extent, one above, one straddling the top edge, and one whose length overflows — through
+`in_reserved_extent`, **the same function `permit_write` calls**. It cannot pass against a copy of
+the arithmetic that has drifted from the real one. If any span is admitted, the permit disarms
+itself on the spot and the card reverts to read-only.
+
+It deliberately does not go through `permit_write`, so a passing self-test leaves `refusals=0` and
+the must-not-appear refusal line absent: a self-test must not forge the arc's own failure
+signature.
+
+### 11.4 FRGUARD composition
+
+FRGUARD (`drivers/block.rs`) answers a different question about a different handle: may the
+*Default* slot be written, given the boot volume's `BS_VolID`. It refuses in exactly one state,
+`BM_SUBSTITUTED`. That is the Boot AI-2 configuration, in which 4c's target IS the boot medium —
+and it is the case the extent bound exists for. A write to the medium the kernel booted from is
+admitted only inside the reserved file's own clusters, checked in absolute LBAs at the point the
+CMD24 is about to be issued: one level BELOW where FRGUARD checks, and per sector rather than per
+handle. FRGUARD is neither consulted nor weakened; it keeps refusing `Default` writes in that state
+exactly as before. The reserve witness prints the boot serial and the card's volume serial side by
+side so the two verdicts can be read together.
+
+### 11.5 The witnesses
+
+```
+:: SDHC4C: reserve NAME=UNALOG.BIN cluster=K size=S runs=1 lba=[A..B) sectors=N permit=ARMED (…) ::
+:: SDHC4C: selftest bounds extent=[A..B) — 4/4 out-of-extent spans REFUSED (…) ::
+:: SDHC4C: in-place write ok bytes=W lba=[A..B) readback=MATCH fnv=0x……… ::
+:: SDHC4C: tally fat-mutations-on-sdhc=0 permits=N refusals=0 cmd24=N armed=1 ::
+```
+
+Every failure instead produces `permit=UNARMED (<reason>) — the card stays READ-ONLY`, which is a
+**successful** outcome of the arc: it degrades to exactly 4b. The reasons are distinguishable —
+no FAT volume, absent, a directory, too short, no valid chain head, malformed chain, short chain,
+fragmented, and one per failed bound.
+
+`fat-mutations-on-sdhc` is a **real** counter, not one that can only print 0. It is incremented in
+`with_fat_lock_src` / `with_dir_lock_src` — the two wrappers every FAT-table RMW (`set_fat_entry`,
+`alloc_cluster`) and all six directory RMW bodies funnel through — whenever the source is `Sdhc`.
+Any future code that mutates the card's FAT or directory is caught by construction, whether or not
+the write beneath it is then refused.
+
+The must-not-appear line is `:: SDHC4C: permit REFUSED …`.
+
+### 11.6 QEMU coverage — the ladder actually executes
+
+§4's card image used to be a blank 16 MiB file, which meant an adopt-only arc could only ever be
+compiled and skipped under QEMU. `builder/src/main.rs::stage_sdhc4c_volume` now lays down a FAT16
+superfloppy carrying the same reservation, written in plain Rust (no `mkfs.vfat`/`mtools`
+dependency) so the geometry is fixed exactly and the builder can print the extent it staged. The
+kernel's witness must name the same interval — a cross-check computed independently on the other
+side of the boot, not a tautology.
+
+`UNAOS_SDCARD_BLANK=1` restores the blank image, which is the fixture for the refusal path.
+
+Measured on this tree, all four polarities `EXIT=0`:
+
+| run | fixture | outcome |
+|---|---|---|
+| A | staged card + `sdw` | `lba=[97..225)` matching the builder's prediction, selftest 4/4, write ok, `readback=MATCH`, `cmd24=1`; a re-boot on the same image preserves the volume and writes a NEW record (different `fnv`) |
+| B | staged card, no `sdw` | ARMED, `in-place write SKIPPED … no CMD24 ladder`, `cmd24=0` |
+| C | blank card | `no FAT volume` → `permit=UNARMED`, card stays read-only |
+| D | no `sdhcblk` | not compiled; zero `SDHC4C` lines |
+
+Host-side byte check of `target/sdcard.img` after run A — the check no in-kernel counter can fake:
+boot sector intact; the two FAT copies byte-identical; chain 2..33 contiguous with EOC at 33 and
+cluster 34 still FREE; root directory entry unchanged and no new entry; sector 97 carries the
+record; sectors 98..224 still 0xAA; every sector at or after 225 still zero. **Exactly one sector
+of a 16 MiB medium changed, and it is the first sector of the reserved extent.**
+
+QEMU-green is not correct — the metal predictions are published in
+`~/unaos-bench/scratch/gr22/sdhc4c-predictions.md`, keyed on Boot AG's geometry
+(`lba(c) = 216 + (c-2)*4`, so a 64 KiB file at cluster 2 predicts `lba=[216..344)`).
+
+### 11.7 What 4c does NOT do
+
+* It does not lift `sdw` to default-on. §10.3's open question Q1 stands, and this arc takes the
+  recommended answer: a default image still contains no CMD24 ladder.
+* It does not add CMD25. `write_blocks_sdhc` still loops single-block CMD24, and `cmd24=` is now
+  the instrument that prices it — the number the one-volume collapse needs.
+* It does not touch the installer's `Sdhc` refusal arms, the `publish_usb_geometry` guard, or the
+  shell → `irqstorage` routing. Those remain the collapse prerequisites listed in §10.

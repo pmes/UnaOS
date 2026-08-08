@@ -784,9 +784,19 @@ fn main() {
     // Kept in sync with unaos/arroyo (UNAOS_NOSDHCI).
     if std::env::var("UNAOS_NOSDHCI").is_err() {
         let sd_image = target_dir.join("sdcard.img");
-        if !sd_image.exists() {
-            let f = std::fs::File::create(&sd_image).expect("failed to create target/sdcard.img");
-            f.set_len(16 * 1024 * 1024).expect("failed to size target/sdcard.img");
+        // SDHC-4c: the card image is no longer blank by default — it carries a FAT16 superfloppy
+        // with the host-staged reservation `UNALOG.BIN` on it, so the reserve/arm/write/read-back
+        // ladder actually EXECUTES under QEMU instead of being compiled and skipped. See
+        // `stage_sdhc4c_volume`. `UNAOS_SDCARD_BLANK=1` restores the old blank 16 MiB file, which
+        // is the fixture for the honest-refusal path (`no FAT volume ... permit=UNARMED`).
+        if std::env::var("UNAOS_SDCARD_BLANK").is_ok() {
+            if !sd_image.exists() {
+                let f = std::fs::File::create(&sd_image).expect("failed to create target/sdcard.img");
+                f.set_len(16 * 1024 * 1024).expect("failed to size target/sdcard.img");
+            }
+            println!("   SDHC-4c: UNAOS_SDCARD_BLANK — card image left BLANK (exercises the `no FAT volume` refusal)");
+        } else {
+            stage_sdhc4c_volume(&sd_image);
         }
         cmd.arg("-device").arg("sdhci-pci,id=sdhci0")
            .arg("-drive").arg(format!("if=none,id=sdcard0,format=raw,file={}", sd_image.display()))
@@ -853,4 +863,128 @@ fn main() {
         let mut child = cmd.spawn().unwrap();
         child.wait().unwrap();
     }
+}
+
+// ===================== SDHC-4c — the host-staged reservation, for QEMU =====================
+//
+// SDHC-4c's kernel side is ADOPT-ONLY: it locates a fixed-size, contiguous file that the HOST put
+// on the card's FAT volume, publishes that file's LBA extent as the only writable set on the
+// medium, and refuses everything else. That design has an obvious consequence for verification —
+// with a blank card image the arc's entire ladder (adopt, arm, self-test, write, read back) is
+// compiled and never runs, and "it skipped honestly" is not evidence that the interesting path
+// works. This function is the host half, so the ladder EXECUTES under `./arroyo test-fat`.
+//
+// The volume is written here in plain Rust rather than shelled out to `mkfs.vfat` + `mtools` for
+// two reasons. It removes a build dependency the sandbox does not always have. And, more usefully,
+// it fixes the geometry EXACTLY, so this builder can print the extent it just staged and the
+// kernel's `:: SDHC4C: reserve ... lba=[A..B) ::` witness can be compared against a number that was
+// computed independently, on the other side of the boot. A mismatch convicts the kernel's BPB
+// arithmetic or its chain walk; agreement is a real cross-check, not a tautology.
+//
+// GEOMETRY (16 MiB = 32768 sectors, FAT16 superfloppy at LBA 0, no partition table):
+//   bytes/sec 512, sec/clus 4 (2 KiB clusters), reserved 1, 2 FATs x 32 sectors, root dir 32 sectors
+//   first_data_sector = 1 + 2*32 + 32 = 97          => cluster 2 starts at LBA 97
+//   data sectors      = 32768 - 97 = 32671          => 8167 clusters (FAT16: 4085 <= n < 65525 OK)
+//   FAT capacity      = 32 * 512 / 2 = 8192 entries >= 8167 + 2                    OK
+//   UNALOG.BIN        = 65536 bytes = 32 clusters, laid down CONTIGUOUSLY at cluster 2
+//   => the reserved extent is LBA [97 .. 225), 128 sectors. That is the number to predict.
+const SD4C_TOTAL_SECTORS: u32 = 32768;
+const SD4C_SEC_PER_CLUS: u32 = 4;
+const SD4C_RESERVED: u32 = 1;
+const SD4C_NUM_FATS: u32 = 2;
+const SD4C_FAT_SECTORS: u32 = 32;
+const SD4C_ROOT_ENTRIES: u32 = 512; // 512 * 32 B = 16384 B = 32 sectors
+const SD4C_FIRST_CLUSTER: u32 = 2;
+const SD4C_RESERVE_BYTES: u32 = 64 * 1024;
+/// Bytes 3..11 of the boot sector (`BS_OEMName`). Doubles as this fixture's signature: an image
+/// already carrying it is left ALONE, so whatever the previous run's kernel wrote into the reserved
+/// file survives into the next boot. That is what makes "the record persisted across a reboot"
+/// observable under QEMU at all, and persistence is the entire point of the arc.
+const SD4C_OEM: &[u8; 8] = b"UNAOS4C ";
+
+fn stage_sdhc4c_volume(path: &std::path::Path) {
+    let root_dir_sectors = SD4C_ROOT_ENTRIES * 32 / 512;
+    let first_data_sector = SD4C_RESERVED + SD4C_NUM_FATS * SD4C_FAT_SECTORS + root_dir_sectors;
+    let clus_bytes = SD4C_SEC_PER_CLUS * 512;
+    let need_clusters = SD4C_RESERVE_BYTES.div_ceil(clus_bytes);
+    let extent_start = first_data_sector; // cluster 2 == the first data sector
+    let extent_end = extent_start + need_clusters * SD4C_SEC_PER_CLUS;
+
+    // Already staged by a previous run? Leave the DATA alone — see `SD4C_OEM`.
+    if let Ok(existing) = std::fs::read(path) {
+        if existing.len() == (SD4C_TOTAL_SECTORS as usize) * 512 && existing[3..11] == SD4C_OEM[..] {
+            println!(
+                "   SDHC-4c: card image already staged ({}) — reserved {} preserved, extent LBA [{}..{}) ({} sectors); a previous boot's record survives",
+                path.display(), "UNALOG.BIN", extent_start, extent_end, extent_end - extent_start
+            );
+            return;
+        }
+    }
+
+    let mut img = vec![0u8; (SD4C_TOTAL_SECTORS as usize) * 512];
+
+    // ---- boot sector (BPB) ----
+    let bs = &mut img[0..512];
+    bs[0] = 0xEB; bs[1] = 0x3C; bs[2] = 0x90; // BS_JmpBoot — the VBR discriminator parse_bpb demands
+    bs[3..11].copy_from_slice(SD4C_OEM);
+    bs[11..13].copy_from_slice(&512u16.to_le_bytes());          // BPB_BytsPerSec
+    bs[13] = SD4C_SEC_PER_CLUS as u8;                            // BPB_SecPerClus
+    bs[14..16].copy_from_slice(&(SD4C_RESERVED as u16).to_le_bytes()); // BPB_RsvdSecCnt
+    bs[16] = SD4C_NUM_FATS as u8;                                // BPB_NumFATs
+    bs[17..19].copy_from_slice(&(SD4C_ROOT_ENTRIES as u16).to_le_bytes()); // BPB_RootEntCnt
+    bs[19..21].copy_from_slice(&(SD4C_TOTAL_SECTORS as u16).to_le_bytes()); // BPB_TotSec16 (32768 fits)
+    bs[21] = 0xF8;                                               // BPB_Media (fixed disk)
+    bs[22..24].copy_from_slice(&(SD4C_FAT_SECTORS as u16).to_le_bytes()); // BPB_FATSz16
+    bs[24..26].copy_from_slice(&32u16.to_le_bytes());            // BPB_SecPerTrk (cosmetic)
+    bs[26..28].copy_from_slice(&2u16.to_le_bytes());             // BPB_NumHeads (cosmetic)
+    bs[36] = 0x80;                                               // BS_DrvNum
+    bs[38] = 0x29;                                               // BS_BootSig — VolID/VolLab present
+    bs[39..43].copy_from_slice(&0x4C43_3443u32.to_le_bytes());   // BS_VolID ("LC4C") — the witness prints it
+    bs[43..54].copy_from_slice(b"UNAOS SDHC4");                  // BS_VolLab (11 B, space padded)
+    bs[54..62].copy_from_slice(b"FAT16   ");                     // BS_FilSysType
+    bs[510] = 0x55; bs[511] = 0xAA;
+
+    // ---- the FATs: cluster 2..(2+need-1) is ONE contiguous chain, then EOC ----
+    let mut fat = vec![0u8; (SD4C_FAT_SECTORS as usize) * 512];
+    let put = |f: &mut [u8], i: u32, v: u16| {
+        let o = (i as usize) * 2;
+        f[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    };
+    put(&mut fat, 0, 0xFFF8); // media descriptor in entry 0
+    put(&mut fat, 1, 0xFFFF); // EOC in entry 1
+    for k in 0..need_clusters {
+        let c = SD4C_FIRST_CLUSTER + k;
+        let next = if k + 1 == need_clusters { 0xFFFF } else { (c + 1) as u16 };
+        put(&mut fat, c, next);
+    }
+    for n in 0..SD4C_NUM_FATS {
+        let off = ((SD4C_RESERVED + n * SD4C_FAT_SECTORS) as usize) * 512;
+        img[off..off + fat.len()].copy_from_slice(&fat);
+    }
+
+    // ---- root directory: one 8.3 entry, no LFN ----
+    let root_off = ((SD4C_RESERVED + SD4C_NUM_FATS * SD4C_FAT_SECTORS) as usize) * 512;
+    let de = &mut img[root_off..root_off + 32];
+    de[0..11].copy_from_slice(b"UNALOG  BIN"); // 8.3, space padded, no dot on disk
+    de[11] = 0x20;                             // ATTR_ARCHIVE — a plain file
+    de[26..28].copy_from_slice(&(SD4C_FIRST_CLUSTER as u16).to_le_bytes()); // DIR_FstClusLO
+    de[28..32].copy_from_slice(&SD4C_RESERVE_BYTES.to_le_bytes());          // DIR_FileSize
+
+    // ---- the reservation's own bytes: a recognisable fill, so a kernel write is VISIBLE ----
+    // 0xAA is not 0x00: a host-side `xxd` after the run distinguishes "the kernel wrote here" from
+    // "this sector was never touched", which zero-fill would not.
+    let data_off = (extent_start as usize) * 512;
+    let data_len = ((extent_end - extent_start) as usize) * 512;
+    for b in &mut img[data_off..data_off + data_len] {
+        *b = 0xAA;
+    }
+
+    std::fs::write(path, &img).expect("failed to write target/sdcard.img");
+    println!(
+        "   SDHC-4c: staged FAT16 card image ({}) — UNALOG.BIN cluster={} size={} contiguous, \
+         data@LBA{} => PREDICTED reserved extent LBA [{}..{}) ({} sectors); the kernel's \
+         `:: SDHC4C: reserve ...` witness must name exactly this",
+        path.display(), SD4C_FIRST_CLUSTER, SD4C_RESERVE_BYTES, first_data_sector,
+        extent_start, extent_end, extent_end - extent_start
+    );
 }
