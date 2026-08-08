@@ -662,7 +662,7 @@ impl BltRing {
 
                 let verdict = if (ctl & 1) == 0 {
                     "ring-disabled"
-                } else if current_head == start_head {
+                } else if current_raw_head == start_raw_head {
                     "head-never-moved"
                 } else if (current_raw_head >> 21) != (start_raw_head >> 21) {
                     "head-wrapped"
@@ -671,8 +671,8 @@ impl BltRing {
                 };
 
                 serial_println!(":: igpu: STOP-NOTE blitter wedged, ring marked dead ({}) ::", verdict);
-                serial_println!(":: igpu: [BLT] Snapshot: HEAD=0x{:08X} TAIL=0x{:08X} CTL=0x{:08X} ACTHD=0x{:08X} ::", current_raw_head, hw_tail, ctl, acthd);
-                serial_println!(":: igpu: [BLT] Refutation: start_head=0x{:08X} current_head=0x{:08X} tail=0x{:08X} hw_tail=0x{:08X} ::", start_raw_head, current_raw_head, tail, hw_tail);
+                serial_println!(":: igpu: [BLT] Snapshot: HEAD=0x{:08X} HW_TAIL=0x{:08X} CTL=0x{:08X} ACTHD=0x{:08X} ::", current_raw_head, hw_tail, ctl, acthd);
+                serial_println!(":: igpu: [BLT] Refutation: start_raw_head=0x{:08X} current_raw_head=0x{:08X} tail=0x{:08X} hw_tail=0x{:08X} ::", start_raw_head, current_raw_head, tail, hw_tail);
 
                 return false; // Return and let the CPU fallback path take over
             }
@@ -1047,7 +1047,7 @@ pub unsafe fn gmux_igd_switch() {
         let ext = gmux_index_read(GMUX_READ_EXTERNAL);
         serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", p_ddc, disp, ext);
 
-        if p_ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32 || ext != GMUX_EXTERNAL_DIS as u32 {
+        if p_ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32 || (ext != GMUX_EXTERNAL_DIS as u32 && ext != 0x21) {
             serial_println!(":: igpu: [GMUX] REFUSED: pre-switch state is not fully DIS (DDC={}, DISP={}, EXT={}) — no known safe state to return to ::", p_ddc, disp, ext);
             return Err("pre-switch-not-dis");
         }
