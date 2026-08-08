@@ -3410,14 +3410,96 @@ fn owner_is_focus_exempt(_owner: u64) -> bool {
 /// bit and the same offset the aarch64 info page uses, so one arch-neutral program reads it on both.
 const FB_FLAG_DETACHED: u32 = 1 << 0;
 
+/// VUGMIN/x86: bit 1 of the same word — every window this process owns is hidden below the shell's z,
+/// so nothing it renders can reach the panel. The aarch64 twin (`FB_FLAG_HIDDEN`) is the same bit at
+/// the same offset by the SHARED-LAYOUT law: `user-vug` reads `flags & 2` on both arches from one
+/// source line.
+///
+/// The difference from bit 0 that decides the whole shape below: bit 0 is fixed before the process
+/// runs, so the info-page write `sys_win_create` performs anyway is always in time. **Bit 1 changes
+/// under a running process**, and the info-page writers run only on create/map — which is exactly why
+/// x86 needed a SETTER that republishes, not merely a flag the create path folds in. Without one the
+/// bit is an unobservable atomic, which is what it was: `wm::vugmin_publish`'s x86 arm was
+/// `let _ = hidden;` and no hidden app on this arch has ever been told.
+const FB_FLAG_HIDDEN: u32 = 1 << 1;
+
+/// VUGMIN/x86: which slots are currently HIDDEN — every live, non-compat window they own sits below
+/// `video::wm`'s `SHELL_Z`. The x86 twin of aarch64's `HIDDEN_ASIDS`, kept as a per-slot
+/// `AtomicBool` array rather than a bitmask because that is the shape this file's other per-slot
+/// process flags already have (`SLOT_DETACHED`, `SLOT_NO_AUTOFOCUS`) and `USER_SLOTS` is 8.
+///
+/// `video::wm` owns the z-order that decides the answer; this module owns the flag and the info page.
+/// Fail-safe direction is aarch64's, and for aarch64's reason: an out-of-range owner reads back "not
+/// hidden", i.e. keeps rendering. A vug that idles when it should not is a vug that stops responding;
+/// a vug that renders when it could idle merely wastes what it wastes today.
+static SLOT_HIDDEN: [AtomicBool; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+
+/// VUGMIN/x86: the PROCESS-FLAGS word for `slot`, as published into its RO info page. Factored out
+/// because BOTH publishers must write the identical word — [`fb_info_write_flags`] on window create
+/// and [`set_hidden`] on every focus change — and a writer that rebuilt only its own bit would clear
+/// the other's on every store.
+fn fb_info_flags(slot: usize) -> u32 {
+    let mut f = 0;
+    if SLOT_DETACHED[slot].load(Ordering::Acquire) {
+        f |= FB_FLAG_DETACHED;
+    }
+    if SLOT_HIDDEN[slot].load(Ordering::Acquire) {
+        f |= FB_FLAG_HIDDEN;
+    }
+    f
+}
+
 /// WINX-7: publish slot `slot`'s process-flags word into its RO info page. Written through the KERNEL
 /// identity pointer — ring 3's alias of this page is read-only — and called from `sys_win_create`, which
 /// is what maps the info page in the first place, so the word is present the moment a program can read
 /// it and never before.
 fn fb_info_write_flags(slot: usize) {
     let info = crate::arch::x86_64::memory::slot_fb_info_ptr(slot) as *mut u32;
-    let flags = if SLOT_DETACHED[slot].load(Ordering::Acquire) { FB_FLAG_DETACHED } else { 0 };
-    unsafe { info.add(0x20 / 4).write_volatile(flags) };
+    unsafe { info.add(0x20 / 4).write_volatile(fb_info_flags(slot)) };
+}
+
+/// VUGMIN/x86 SEAM: record whether owner `asid`'s windows are hidden below the shell, and PUBLISH it.
+/// Public because its callers are `video::wm`'s (`vugmin_publish`) — the arch twin of
+/// `arch::aarch64::syscall::set_hidden`, same name, same signature, same idempotence.
+///
+/// `asid` is a `wm` OWNER, i.e. `slot + 1`-biased on this arch (see the CLICK-X86 note in
+/// `sys_win_create`). Kernel furniture owners live far above `USER_SLOTS` and are rejected by the
+/// bound, as is owner 0.
+///
+/// **THE SETTER IS THE PUBLISHER.** See [`FB_FLAG_HIDDEN`] for why that is not a stylistic choice.
+/// Only the flags WORD is rewritten: the geometry fields belong to the info-page writers, which own
+/// the window table's view of them, and touching them here would race those writers for no reason. A
+/// `u32` store is single-copy-atomic on x86-64, so a concurrent ring-3 read sees the old value or the
+/// new one and never a tear.
+///
+/// Takes NO LOCK — two atomics and one `write_volatile` into per-slot kernel backing whose address is
+/// pure pointer arithmetic — which is the property `wm`'s "no calls out from under `TABLE`" note
+/// already asserts of this seam.
+///
+/// Writing a slot with no live window is harmless and deliberately unguarded: the backing is static
+/// and exists for the slot's whole life, and [`clear_hidden`] at the teardown funnel means a dead
+/// slot's word cannot outlive its owner.
+pub fn set_hidden(asid: u64, on: bool) {
+    if asid == 0 || asid > crate::arch::memory::USER_SLOTS as u64 {
+        return;
+    }
+    let slot = (asid - 1) as usize;
+    SLOT_HIDDEN[slot].store(on, Ordering::Release);
+    fb_info_write_flags(slot);
+}
+
+/// VUGMIN/x86: clear `slot`'s hidden bit on teardown. Called from [`clear_handle_row`] beside the
+/// `SLOT_DETACHED` clear, under the identical rule and for the identical reason: SLOTS ARE RECYCLED,
+/// so without this a slot last used by a vug that was hidden when it died would hand its stale bit to
+/// the next tenant — which would come up already idling, having never been hidden at all. That is the
+/// worse of the two failure directions (a window that draws nothing), so it is closed at the funnel
+/// rather than at each launcher.
+fn clear_hidden(slot: usize) {
+    if slot < crate::arch::memory::USER_SLOTS {
+        SLOT_HIDDEN[slot].store(false, Ordering::Release);
+        fb_info_write_flags(slot);
+    }
 }
 
 /// WINX-1: `SYS_WIN_CREATE(w, h)` -> window id (0..WIN_MAX), or a negative errno.
@@ -10467,6 +10549,10 @@ pub fn clear_handle_row(slot: usize) {
     // foreground `run` landing in a slot a `bg` job just vacated must not inherit "I was detached"
     // and skip its own frame cap.
     SLOT_DETACHED[slot].store(false, Ordering::Release);
+    // VUGMIN/x86: and the hidden bit, on the same terms. A slot whose last tenant died while hidden
+    // must not hand that bit to the next one — see `clear_hidden`. This also rewrites the flags word,
+    // so the page a recycled slot exposes is already correct before its new tenant can read it.
+    clear_hidden(slot);
     // DESKTOP-APP: per-TENANT for exactly the same reason — an operator-typed launch that lands in the
     // slot the desktop app vacated must get the ordinary first-window grant, AND must not have its
     // clicks consumed as furniture. Both readers of the flag depend on this clear.

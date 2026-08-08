@@ -455,9 +455,23 @@ fn vugmin_publish(asid: u64, hidden: bool) {
     if asid == 0 || asid >= 64 {
         return;
     }
+    // VUGMIN-D — BOTH ARCHES PUBLISH. Until this commit the `cfg` pair here read
+    // `#[cfg(aarch64+baremetal)] set_hidden(...)` / `#[cfg(not(...))] let _ = hidden;`, i.e. on x86
+    // the whole seam was a discard: `wm` hid every window on a TAB-to-shell and the apps were never
+    // told. What that cost is measured — Boot AJ, two vugs at 42,000 presents/s each with
+    // `comp_rate=0.0/s` and the rollup reading `STARVED` — because the compositor's ACCEPT was the
+    // only pacer those apps had, and a suppressed present returns before it reaches `composite()`.
+    // The `cfg`s are per-arch dispatch now, not a live arm and a dead one; each names the module that
+    // owns that arch's info page, and both are `baremetal`-gated because the info page is.
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     crate::arch::aarch64::syscall::set_hidden(asid, hidden);
-    #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+    // No `baremetal` conjunct on this arm: unlike aarch64's, `arch::x86_64::syscall` is compiled
+    // unconditionally (`arch/x86_64/mod.rs`), and so is the info page it publishes through.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::syscall::set_hidden(asid, hidden);
+    // The hosted aarch64 builds (`pi`/`tegra` without `baremetal`) compile no `syscall` module and no
+    // info page, so there is nothing to publish to — they still have to consume the argument.
+    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "baremetal"))))]
     let _ = hidden;
     #[cfg(feature = "witness")]
     {
