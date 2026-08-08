@@ -90,6 +90,7 @@ pub mod regs {
     pub const BLT_RING_HEAD: usize = 0x22034;
     pub const BLT_RING_START: usize = 0x22038;
     pub const BLT_RING_CTL: usize = 0x2203C;
+    pub const BLT_RING_ACTHD: usize = 0x22074;
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -222,9 +223,9 @@ unsafe fn read_gmux_trace() -> [u32; 7] { [0; 7] }
 // behaviourally identical to trunk. An earlier attempt replaced those closures with
 // `arch::ms()`-deadline helpers gated on `target_arch` only, so EVERY `unaos_ivb` build (armed
 // or not) picked up a wait whose bound depends on the BSP timer ISR still running. The old
-// bound could not hang; that one could. The armed helpers here carry an unconditional
-// iteration cap, so even on the armed build a stopped clock cannot hang
-// them.
+// bound could not hang; that one could. The armed gmux helpers here carry an unconditional
+// iteration cap, so even on the armed build a stopped clock cannot hang them
+// (though `dp_aux_transfer`'s inner wait remains rdtsc-deadline-only).
 //
 // The panel WILL go black between the switch and the revert. That is the EXPECTED result, not
 // the experiment failing: the census in this same function reads every pipe, every plane and
@@ -633,6 +634,9 @@ impl BltRing {
         self.tail = tail;
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
 
+        let start_raw_head = unsafe { core::ptr::read_volatile((self.bar0 + regs::BLT_RING_HEAD) as *const u32) };
+        let start_head = start_raw_head & 0x1FFFFC;
+
         unsafe {
             core::ptr::write_volatile((self.bar0 + regs::BLT_RING_TAIL) as *mut u32, tail);
         }
@@ -641,7 +645,8 @@ impl BltRing {
         let max_spins = 1_000_000; // bounded cycle budget timeout (approx 1M pause cycles)
 
         loop {
-            let current_head = unsafe { core::ptr::read_volatile((self.bar0 + regs::BLT_RING_HEAD) as *const u32) } & 0x1FFFFC;
+            let current_raw_head = unsafe { core::ptr::read_volatile((self.bar0 + regs::BLT_RING_HEAD) as *const u32) };
+            let current_head = current_raw_head & 0x1FFFFC;
             if current_head == tail {
                 break;
             }
@@ -650,7 +655,25 @@ impl BltRing {
             if spins > max_spins {
                 self.dead = true;
                 self.fallbacks += 1;
-                serial_println!(":: igpu: STOP-NOTE blitter wedged, ring marked dead ::");
+
+                let ctl = unsafe { core::ptr::read_volatile((self.bar0 + regs::BLT_RING_CTL) as *const u32) };
+                let acthd = unsafe { core::ptr::read_volatile((self.bar0 + regs::BLT_RING_ACTHD) as *const u32) };
+                let hw_tail = unsafe { core::ptr::read_volatile((self.bar0 + regs::BLT_RING_TAIL) as *const u32) };
+
+                let verdict = if (ctl & 1) == 0 {
+                    "ring-disabled"
+                } else if current_head == start_head {
+                    "head-never-moved"
+                } else if (current_raw_head >> 21) != (start_raw_head >> 21) {
+                    "head-wrapped"
+                } else {
+                    "head-stalled-mid-run"
+                };
+
+                serial_println!(":: igpu: STOP-NOTE blitter wedged, ring marked dead ({}) ::", verdict);
+                serial_println!(":: igpu: [BLT] Snapshot: HEAD=0x{:08X} TAIL=0x{:08X} CTL=0x{:08X} ACTHD=0x{:08X} ::", current_raw_head, hw_tail, ctl, acthd);
+                serial_println!(":: igpu: [BLT] Refutation: start_head=0x{:08X} current_head=0x{:08X} tail=0x{:08X} hw_tail=0x{:08X} ::", start_raw_head, current_raw_head, tail, hw_tail);
+
                 return false; // Return and let the CPU fallback path take over
             }
         }

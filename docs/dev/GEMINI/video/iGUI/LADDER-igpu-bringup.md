@@ -638,7 +638,7 @@ clock out of memory.**
 | all | `mmio_read(base, offset)` — `igpu.rs:786-788` | **There is no `mmio_write` in `igpu.rs`.** `kepler.rs:2189` has `pub unsafe fn mmio_write(base, offset, val)` — do **not** reach across into the kepler lane. Add a local one, and make it the unwind-recording helper (§3). |
 | all | `regs` module — `igpu.rs:3-84` | Already has 30+ offsets including every PPS, GMBUS, FDI, pipe and plane register the ladder needs. Extend it; do not start a second table. |
 | all | The citation-comment style — `igpu.rs:226-231`, `724-728` | Cite the PRM section at the point of use. Two reviews have already re-litigated an uncited gmux wait; the same will happen to every uncited display bit. |
-| 0 | gmux write logic — `igpu.rs:432-461`; `gmux_index_read`/`_write` — `:326`, `:341`; `gmux_wait_ready`/`_complete` — `:290`, `:308` | Verdict decided by read-back, doubly-bounded waits, `0xFFFFFFFF` sentinel. Reuse unchanged. |
+| 0 | gmux write logic — `igpu.rs:432-461`; `gmux_index_read`/`_write` — `:326`, `:341`; `gmux_wait_ready`/`_complete` — `:290`, `:308` | Verdict decided by read-back, iteration-bounded waits, `0xFFFFFFFF` sentinel. Reuse unchanged. |
 | 0 | `dump_pipe` / `dump_plane` — `igpu.rs:756-784` | Already print exactly the fields the rungs need. Make them the post-rung census. |
 | 0 | `crate::arch::pci::read_config_32` — `pci.rs:7` | `u8` offset reaches GGC (`0x50`) and BDSM (`0xB0`) at BDF `0:0:0`. |
 | all | `RevertState` pack/unpack + `gmux_state_update` — `igpu.rs:354-421` | The compare-exchange discipline is the model for `DisplayUnwind`'s claim. One encode point, one decode point. |

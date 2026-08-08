@@ -110,8 +110,8 @@ A successful run reads roughly (PREDICTED TRANSCRIPT):
 | Line you see | What it means | What to do |
 |---|---|---|
 | `LADDER highest=05/10 name=end ok=1` | The whole experiment succeeded. The mux write lands; EDID was read. | Nothing. Pull the stick. |
-| `LADDER ... why=edid-header-corrupt` | The EDID was read but lacks the valid 8-byte header. | Safe. Pull the stick. |
-| `LADDER ... why=edid-checksum-bad` | The EDID was read but its checksum failed. | Safe. Pull the stick. |
+| `LADDER ... why=edid-header-corrupt` | The EDID was read but lacks the valid 8-byte header. | Safe. Pull the stick (unless `gmux=FAILED` co-fired, which demands a power cycle). |
+| `LADDER ... why=edid-checksum-bad` | The EDID was read but its checksum failed. | Safe. Pull the stick (unless `gmux=FAILED` co-fired, which demands a power cycle). |
 | `REFUSED: pre-switch state is not fully DIS` | The gmux was not in the expected discrete state. **No write was issued**. | Safe. Power cycle and try again. |
 | `REFUSED: aux_ctl=... SEND_BUSY is set at boot` | AUX channel busy. **No write was issued**. `bdsm`/`ggc`/`ggtt0`/`ggtt1` show if memory is mapped; `frmcnt` shows if the pipe is running. | Safe. Power cycle and try again. |
 | `REFUSED: aux_ctl=... clock divider is 0` | AUX clock missing. **No write was issued**. `bdsm`/`ggc`/`ggtt0`/`ggtt1` show if memory is mapped; `frmcnt` shows if the pipe is running. | Safe. Power cycle and try again. |
