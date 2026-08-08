@@ -14664,7 +14664,21 @@ fn dmg_code(w: u64, i: usize) -> u32 {
 ///      must still be free, or the run is reported NOT RUN rather than graded — a fixture that cannot
 ///      tell its own race from a kernel bug is worse than no fixture.
 ///   5. Release the owner, wait for its exit and both slots' teardown, then grade.
+///
+/// SETTLE FLAG: `video::wcx::desktop_app_service` holds the desktop-app launch (bounded, out loud)
+/// until this witness has had its empty-table entry — Boot AL's launch at 13.16s beat the witness to
+/// row 1 and it printed NOT RUN for the first time in the capture. The flag is published on EVERY
+/// exit (the wrapper stores it after the body returns, NOT RUN paths included), and the chain that
+/// reaches it is unconditional on x86 (`winx7_launcher`'s tail), so a holder can never wait forever
+/// on a flag no code path sets.
+pub static DMG_REFUSE_SETTLED: AtomicBool = AtomicBool::new(false);
+
 fn dmg_refuse_launcher(demo_cpu: usize) {
+    dmg_refuse_witness(demo_cpu);
+    DMG_REFUSE_SETTLED.store(true, Ordering::Release);
+}
+
+fn dmg_refuse_witness(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
         return;

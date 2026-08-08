@@ -291,6 +291,16 @@ const STORAGE_WAIT_MS: u64 = 30_000;
 /// wait has not started". Written and read only by the single pinned service task, hence `Relaxed`.
 static WAIT_SINCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// DMG-REFUSE HOLD — how long the desktop-app launch defers to the refusal witness before giving up
+/// out loud. The witness settles ~1s after storage is ready on the boots in this capture (metal:
+/// armed 13.76s vs storage 13.16s on Boot AL); the bound exists for the boot shape nobody predicted,
+/// and like `STORAGE_WAIT_MS` its job is to TERMINATE in a line rather than in silence.
+const DMG_HOLD_MS: u64 = 15_000;
+
+/// DMG-REFUSE HOLD — `ticks()` at the first held pass, or `0` for "the hold has not started".
+/// Same single-task access pattern as `WAIT_SINCE_MS`, hence `Relaxed`.
+static DMG_HOLD_SINCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Gap in panel pixels between a pinned window's outer box and the panel edge. Matches `wm`'s own
 /// tiling gap in spirit. Witness-only since the demo window went to ring 3 — the MOVE-VACATE probe is
 /// the last thing in this file that pins its own geometry.
@@ -556,6 +566,29 @@ pub fn desktop_app_service() {
             DESKTOP_APP, waited, STORAGE_WAIT_MS
         );
         return;
+    }
+    // DMG-REFUSE HOLD. The refusal witness requires the window table EMPTY at entry, and this launch
+    // is permanent — on Boot AL it took row 1 at 13.16s, the witness armed at 13.76s, and the capture
+    // got its first `NOT RUN` after three boots of `19/19 — witness OK`. The witness chain is
+    // unconditional on x86 (`winx7_launcher`'s tail), so the flag always settles; holding here is a
+    // sub-second defer on the boots measured, and the bound gives up OUT LOUD — a desktop that never
+    // appears is worse than one lost witness, and the loss goes on the record either way.
+    if !crate::arch::syscall::DMG_REFUSE_SETTLED.load(Ordering::Acquire) {
+        let now = crate::arch::ticks();
+        let started = DMG_HOLD_SINCE_MS.load(Ordering::Relaxed);
+        if started == 0 {
+            DMG_HOLD_SINCE_MS.store(now.max(1), Ordering::Relaxed);
+            return;
+        }
+        let waited = now.saturating_sub(started);
+        if waited < DMG_HOLD_MS {
+            return;
+        }
+        serial_println!(
+            "[wc-x] desktop-app HOLD-EXPIRED reason=dmg-refuse-unsettled waited={}ms threshold={}ms — launching anyway; the refusal witness will print NOT RUN if it arms after this",
+            waited, DMG_HOLD_MS
+        );
+        // fall through: the launch proceeds and the lost coverage is on the serial record.
     }
     DONE.store(true, Ordering::Relaxed);
 
