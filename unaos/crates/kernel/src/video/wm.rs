@@ -2484,6 +2484,13 @@ fn composite_inner() -> CursorTail {
     #[cfg(feature = "witness")]
     if sprite_now.is_none() {
         CUR12_NOSPRITE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // CURSOR-VUG — and WHY it is down. `visible()` is two relaxed loads and a subtraction, taken
+        // only on the arm that already has nothing to do, so it costs the mechanism nothing. A
+        // SUBSET of the line above, never an alternative to it: `nosprite - hidden` is the
+        // population that owes an explanation, and pairing the two is the whole point.
+        if !crate::pal::cursor::visible() {
+            CUR12_HIDDEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
     }
     if let Some(p) = sprite_now {
         let sbox = (p.bx, p.by, p.bw, p.bh);
@@ -5486,6 +5493,30 @@ static CUR3_DECL_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 #[cfg(feature = "witness")]
 static CUR12_NOSPRITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// CURSOR-VUG — the subset of [`CUR12_NOSPRITE`] where the pointer was DELIBERATELY off the panel:
+/// `pal::cursor::visible()` was false, i.e. no report has ever arrived or CURSOR-HIDE's 1.5 s idle
+/// expiry has passed.
+///
+/// ### Why `nosprite` could not be read without it
+/// `nosprite` conflates three states with three different fixes: the pointer has never existed
+/// (QEMU, or pre-first-report), the pointer is auto-hidden because the operator stopped moving, and
+/// the pointer SHOULD be on the panel but the module has it down (a bracket that lost it, a refused
+/// `sprite_plan()` claim, an undraw with no matching draw). Only the third indicts anything, and
+/// before this term the line could not say which one it was looking at.
+///
+/// It is the term that falsifies CURSOR-VUG's own fix. The routed-pointer defect
+/// (`pal::cursor::track_routed`) presents as `nosprite ≈ passes` while a vug holds focus, because
+/// the sprite is frozen, then hidden, then taken off the panel by a composite tail — and every one
+/// of those passes is `hidden`, since `visible()` is false throughout. With the fix in, a block
+/// taken while the operator is moving the pointer over a focused vug must show `hidden ≈ 0`; a
+/// block that still shows `hidden ≈ nosprite ≈ passes` says reports are still not reaching
+/// `pal::cursor`, which is the defect and not a symptom of it.
+///
+/// A subset, not a partition: it is counted INSIDE the `nosprite` arm and never added to it, so
+/// `nosprite - hidden` is the population that owes an explanation.
+#[cfg(feature = "witness")]
+static CUR12_HIDDEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// CURSOR-12 — the sprite was on the panel, but no live window above the shell met its box. The
 /// pointer is over the desktop; nothing to compose through, and WC-I's whole point.
 #[cfg(feature = "witness")]
@@ -5550,7 +5581,7 @@ static CUR12_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// CURSOR-14 — the previous rollup's reading of every term above, so the block can report a WINDOW
 /// instead of a running total. Order is the print order; see [`cursor12_rollup`] for why.
 #[cfg(feature = "witness")]
-static CUR12_PREV: [core::sync::atomic::AtomicU64; 8] = [
+static CUR12_PREV: [core::sync::atomic::AtomicU64; 9] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
@@ -5558,6 +5589,10 @@ static CUR12_PREV: [core::sync::atomic::AtomicU64; 8] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    // CURSOR-VUG — slot 8, `hidden`. Appended rather than inserted: every other slot index is a
+    // literal at its `cur12_window` call site, and renumbering them would silently re-pair a term
+    // with another term's previous reading.
     core::sync::atomic::AtomicU64::new(0),
 ];
 
@@ -5598,6 +5633,7 @@ fn cursor12_rollup(scope: &str) {
     let planned = cur12_window(5, CUR3_PLANNED.load(Relaxed));
     let probe = cur12_window(6, CUR12_EXCL_PROBE.load(Relaxed));
     let unver = cur12_window(7, CUR12_EXCL_UNVERIFIED.load(Relaxed));
+    let hidden = cur12_window(8, CUR12_HIDDEN.load(Relaxed));
     let cum = CUR12_PASSES.load(Relaxed);
     // The dominant term, named rather than left to arithmetic. Ties go to the earliest predicate in
     // the chain, which is the one a reader has to fix first anyway.
@@ -5633,9 +5669,15 @@ fn cursor12_rollup(scope: &str) {
     } else {
         "window"
     };
+    // CURSOR-VUG — `hidden=` rides immediately behind `nosprite=`, because it is a SUBSET of it and
+    // adjacency is what makes `nosprite - hidden` legible without arithmetic on two ends of a line.
+    // The VERDICT SET is deliberately unchanged: `-> nosprite` still names the dominant predicate,
+    // and a reader keyed on the terminal token reads the same tokens it always did. What `hidden=`
+    // adds is the second question the terminal cannot carry — whether that `nosprite` is the pointer
+    // being deliberately off the panel or the module having lost it.
     serial_println!(
-        "[cursor12] offer scope={} adm={} passes={} nosprite={} nohit={} reserved={} nosession={} planned={} excl_probe={} excl_unverified={} cum={} -> {}",
-        scope, adm, passes, nosprite, nohit, reserved, nosession, planned, probe, unver, cum, why
+        "[cursor12] offer scope={} adm={} passes={} nosprite={} hidden={} nohit={} reserved={} nosession={} planned={} excl_probe={} excl_unverified={} cum={} -> {}",
+        scope, adm, passes, nosprite, hidden, nohit, reserved, nosession, planned, probe, unver, cum, why
     );
 }
 

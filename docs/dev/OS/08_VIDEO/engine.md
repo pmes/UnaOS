@@ -7347,3 +7347,129 @@ lines below are what it CAN read.
   fields are invariants rather than measurements — `band=no` on every line, `span=` always equal to
   the box height, `banded=0` with `minspan=0 minspan_bytes=0`, and never a `scope=window-band`
   rollup. A band-carrying field with any other value on aarch64 is itself the finding.
+
+## CURSOR-VUG — a focused app was swallowing the pointer, and the arrow with it (2026-08-08)
+
+Peter, Boots AL and AO: *"vug blocks mouse cursor" / "vug covers mouse"* — the arrow disappears over
+a presenting vug window and does not come back.
+
+### The premise this arc was briefed on, and why it did not survive the capture
+
+The brief carried a diagnosis: compose-through is dormant because `composite_inner`'s per-window
+`may_overlay` exclusions can never pass under per-present WC-G/WC-D, so `[cursor12] planned=` is 0 on
+every pass and the sprite is bracketed around every composite instead of being composed into it. The
+prescribed fix was to relax those exclusions.
+
+**The only x86 capture in the tree that carries the cursor block refutes it.** GR21
+`~/unaos-bench/scratch/gr21/cap.log`, the last live-scope sample of that boot:
+
+```
+[cursor12] offer scope=live adm=window passes=3495 nosprite=121 nohit=1001 reserved=0 nosession=3 planned=2370 excl_probe=0 excl_unverified=0 cum=21115 -> below-session
+[cursor3]  rollup scope=live planned=4790 offers=4790 taken=4567 adopt=4790 repaint=1 settle=5 ensure=16319 straddle=2927 disjoint=223 partial=2704 lock=5 budget=0 stale=0 -> COMPOSED
+[cursor11] compose-through scope=live passes=4795 bracketed=2 px_deferred=520882 px_installed=490624 px_redrawn=576 -> THROUGH
+[cursor6]  rollup scope=live present_over=0 masked=4572 repaired=1 desktop_over=0 mismatch=0 uncover_lost=0/4790 -> INTACT
+```
+
+`planned` is 2370 in that window and 4790 cumulative; `offers == planned`; 95% of offers are TAKEN;
+`bracketed=2` out of 4795 passes; and **both `may_overlay` exclusions are exactly 0**. Compose-through
+is not dormant — it is the steady state, and `present_over=0` says no present ever landed on an
+unbracketed arrow either. Relaxing the exclusions would have moved nothing, and the CURSOR-12 ledger
+above already predicted that: the WC-G probe is budgeted per window id and returns `None` once spent,
+and WC-D publishes `VERIFIED` on its FIRST verdict, so a window waiting for its full verdict already
+composes. Both gates are bounded per window by construction and cannot be a steady state.
+
+### The actual mechanism: `user_input_route` eats pointer reports
+
+`arch::x86_64::syscall::user_input_route` offers every event to the FOCUSED ring-3 app and returns
+`Event::Unknown` when the ring takes it, so the shell's drain falls through its catch-all arm.
+`Event::Mouse` and `Event::MouseAbsolute` are packable. **From the instant a vug takes focus, no
+pointer report reaches `pal::cursor::move_rel`/`set_abs` at all.** Three consequences:
+
+1. **The sprite freezes** where it was when the raising click landed.
+2. **It is then erased, and only over a presenting window.** `visible()` goes false 1.5 s later
+   (CURSOR-HIDE), and `cursor::refresh_locked` undraws UNCONDITIONALLY while redrawing only while
+   `visible()`. So the next composite tail that brackets the arrow's box takes it off the panel and
+   nothing puts it back. Over a static desktop no tail runs there and the frozen arrow simply sits;
+   over a PRESENTING vug a tail runs within a frame. That asymmetry is the whole of the report — the
+   arrow vanishes over a vug and nowhere else, which reads as the vug covering it.
+3. **Every cursor witness goes silent**, because `pal::cursor::rollup_tick` hangs off the motion
+   path. In `cap.log` the last live block is at `144821ms`, sitting inside a run of trackpad clicks;
+   the boot then runs to `870474ms` — **725 s** — with GUI apps launching and exiting throughout and
+   not one further `[cursor12]`. The click that raised a window is the last pointer report the kernel
+   sprite ever saw.
+
+### The fix
+
+`user_input_route` tracks the system pointer on the CONSUMED branch:
+
+```rust
+if user_input_enqueue(ev) {
+    crate::pal::cursor::track_routed(&ev);   // CURSOR-VUG
+    crate::pal::Event::Unknown
+} else { ev }
+```
+
+`pal::cursor::track_routed` (x86 only) matches `Mouse`/`MouseAbsolute`, resolves panel geometry from
+`video::WRITER` (the router has no `pal` in hand), and delegates to the existing `move_rel`/`set_abs`
+— which stamp the activity clock, repaint the sprite, and tick the rollup exactly as an unrouted
+report does.
+
+**Delivery semantics are untouched.** The app still receives the report; the shell still sees
+`Event::Unknown`. Tracking only on the consumed branch is what keeps each report applied exactly
+once: the drain already moves the pointer for events the router DECLINED, and a relative report
+applied on both paths would double the motion. A framebuffer that is not ready, or a degenerate
+panel, is a no-op.
+
+Lock discipline is the drain's, unchanged — `user_input_route`'s sole caller is the shell's input
+drain, unmasked, holding none of `SPRITE`/`WRITER`/`TABLE`, which is the same context the drain's own
+`move_rel` call one arm below already runs in.
+
+### The instrument: `[cursor12] hidden=`
+
+The wire grows one term, immediately behind `nosprite=` because it is a SUBSET of it:
+
+```
+[cursor12] offer scope=… adm=… passes=N nosprite=… hidden=… nohit=… reserved=… nosession=… planned=… excl_probe=… excl_unverified=… cum=… -> why
+```
+
+`nosprite` conflated three states with three different fixes — the pointer has never existed (QEMU,
+or pre-first-report), the pointer is auto-hidden because the operator stopped moving, and the pointer
+SHOULD be on the panel but the module has it down. Only the third indicts anything. `hidden` is the
+passes where `pal::cursor::visible()` was false, so `nosprite - hidden` is the population that owes an
+explanation.
+
+It is also the term that **falsifies this arc's own fix**. The routed-pointer defect presents as
+`nosprite ≈ hidden ≈ passes` while a vug holds focus. With the fix in, a block taken while the
+operator moves the pointer over a focused vug must show `hidden ≈ 0`.
+
+The VERDICT SET is deliberately unchanged — `-> nosprite` still names the dominant predicate, and
+anything keyed on the terminal token reads what it always did.
+
+**aarch64 is not byte-identical, and the divergence is one field.** The counter and the print are
+`#[cfg(feature = "witness")]` rather than arch-gated, so the `[cursor12]` line grows `hidden=` on both
+arches — deliberately, because one line format that means different things per arch is worse than a
+one-field diff. Nothing keys on the line: `scripts/specs/` contains no `cursor12` pattern, and the
+aarch64 QEMU suite never reaches `wci_rollup`'s fixture caller, so `target/serial-arm.log` carries no
+`[cursor12]` and no gate line count moves. `track_routed` itself is `#[cfg(target_arch = "x86_64")]`
+and `user_input_route` lives in `arch/x86_64/`, so the MECHANISM is x86-only outright.
+
+### Gate results (CURSOR-VUG)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**, 0 errors, and the warning multiset is
+  byte-identical to the pre-arc baseline (70 distinct lines, `diff` clean).
+* `./arroyo test` — 0 FAIL. Pointer-free suite, so `track_routed` is unreachable and no line moves.
+* `./arroyo test-arm` — 0 FAIL, no `[cursor12]` emitted.
+
+### Metal watch-list (CURSOR-VUG)
+
+* **The arrow tracks the mouse over a focused, presenting vug.** That is the whole claim, and it is
+  visible without a capture.
+* **`[cursor12] scope=live` blocks keep arriving for the whole sitting**, at ~5 s cadence, including
+  while a vug holds focus. Silence after a window is raised means the fix did not take.
+* **`hidden ≈ 0` in a block taken while the pointer is moving.** `hidden ≈ nosprite ≈ passes` means
+  reports are still not reaching `pal::cursor` — the defect, not a symptom of it.
+* **`planned` stays non-zero and `[wc-d]`/`[wc-g]` verdicts stay `PASS`/`CLEAN`.** Nothing in this
+  arc touched the verifiers, the overlay, or `may_overlay`; a moved verdict is a surprise and is
+  BOUNCE-worthy.
+* **`[cursor6] present_over=` stays 0.** A climbing `present_over` would mean the now-live arrow is
+  being overwritten unbracketed — the one way this fix could make the panel worse rather than better.

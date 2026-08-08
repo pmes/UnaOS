@@ -422,6 +422,69 @@ pub mod cursor {
         repaint_on_move();
     }
 
+    /// CURSOR-VUG — the SYSTEM pointer follows a report a ring-3 app consumed.
+    ///
+    /// ### The defect this closes
+    /// `arch::x86_64::syscall::user_input_route` hands every packable event to the FOCUSED app's
+    /// ring and returns `Event::Unknown`, and the shell's drain then falls through its catch-all
+    /// arm. `Event::Mouse`/`Event::MouseAbsolute` are packable, so from the instant a vug takes
+    /// focus **no pointer report reaches [`move_rel`]/[`set_abs`] at all**. Three consequences, all
+    /// of them Peter's "vug blocks mouse cursor" (Boots AL/AO) stated from a different side:
+    ///
+    /// * The sprite stops moving. The arrow is frozen wherever it was when the click landed.
+    /// * [`visible`] goes false 1.5 s later ([`HIDE_AFTER_MS`]), and `refresh_locked` undraws
+    ///   unconditionally while redrawing only while visible — so the next composite tail over the
+    ///   arrow's box TAKES IT OFF THE PANEL and nothing puts it back. Over a static desktop nothing
+    ///   composites there and the frozen arrow simply sits; over a PRESENTING vug a tail runs within
+    ///   a frame, which is exactly why the arrow vanishes over a vug and nowhere else.
+    /// * Every cursor witness goes silent, because [`rollup_tick`] hangs off the motion path. That
+    ///   is the 725 s of silence after `144821ms` in the GR21 rmbp capture — the last live
+    ///   `[cursor12]` block sits between two trackpad clicks, and the one that raised a window is
+    ///   the last pointer report the kernel sprite ever saw.
+    ///
+    /// ### Why the position update belongs here and not in the drain
+    /// The drain already calls [`move_rel`]/[`set_abs`] for events the router did NOT take. Doing it
+    /// there for taken events too would need the taken/not-taken answer at four separate drains, and
+    /// a relative report applied twice would DOUBLE the motion. Applied at the router, on the
+    /// consumed branch only, each report moves the pointer exactly once on exactly one path.
+    ///
+    /// The app still receives the report unchanged — this is not a policy change about who gets
+    /// input. It is the statement that the arrow is a property of the SCREEN rather than of the
+    /// shell: on x86 `SPRITE_OWNS_PAINT` is true, the compositor owns the only pointer on the panel,
+    /// and no app draws one of its own.
+    ///
+    /// Panel geometry is resolved from `video::WRITER` rather than passed in, because the router has
+    /// no `pal` in hand. A framebuffer that is not ready yet, or a degenerate panel, is a no-op —
+    /// there is nothing to clamp against and nothing on the glass to draw on.
+    ///
+    /// Lock discipline is the drain's, unchanged: this runs from the shell's input drain (the sole
+    /// caller of `user_input_route`), unmasked, holding none of `SPRITE`/`WRITER`/`TABLE` — the same
+    /// context the drain's own `move_rel` call at the next arm already runs in.
+    #[cfg(target_arch = "x86_64")]
+    pub fn track_routed(ev: &super::Event) {
+        let (dx, dy, abs) = match *ev {
+            super::Event::Mouse { x, y } => (x, y, false),
+            super::Event::MouseAbsolute { x, y } => (x, y, true),
+            _ => return,
+        };
+        let (w, h) = {
+            let fb = *crate::video::WRITER.lock();
+            if !fb.is_ready() {
+                return;
+            }
+            let i = fb.info();
+            (i.width as i32, i.height as i32)
+        };
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        if abs {
+            set_abs(dx, dy, w, h);
+        } else {
+            move_rel(dx, dy, w, h);
+        }
+    }
+
     /// CURSOR-X86 — put the compositor sprite where the pointer now is, on the report that moved it.
     ///
     /// THE ONE CHOKE POINT. `move_rel` and `set_abs` are the only two functions in the kernel that
