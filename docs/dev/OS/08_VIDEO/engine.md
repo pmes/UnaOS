@@ -3395,7 +3395,10 @@ verdict has been taken on the kit these numbers come from, so they are no longer
 provisional. Because every consumer will read the names and never the literals, a
 later verdict change still edits that one file.
 
-**Wiring is a follow-up arc.** Nothing consumes the table yet; `wm.rs`,
+**Wiring is a follow-up arc.** *(Superseded by CRISPYWIRE below — `wm.rs` now
+consumes the whole table and the module is no longer byte-inert. The paragraph is
+kept because the byte-inertness check it records is what made the later diff
+readable.)* Nothing consumes the table yet; `wm.rs`,
 `screen.rs` and fbcon are untouched by CRISPY-PI. The module is byte-inert by
 construction (all `const`, no statics, no code, compile-time-only assertions), and
 that was verified rather than assumed: `target/pi_baremetal/kernel8.img` hashes
@@ -3464,6 +3467,149 @@ was cut mid-line at 1991 lines. Every witness had in fact printed, so it was tem
 to read it as a pass; it is not one, by the harness's own rule, and it was re-run at
 150 s to get the conclusive 3123-line result above. A green count inside a truncated
 capture proves only that nothing had failed *yet*.
+
+#### CRISPYWIRE — the wiring arc: the compositor draws Crispy
+
+CRISPY-PI and CRISPY-PI-2 lifted the table and said in as many words that wiring was
+a follow-up arc, with `wm.rs`, `screen.rs` and fbcon untouched. **That sentence is now
+retired.** `video/wm.rs` sources every chrome colour and every chrome metric from
+`video/theme.rs`; the table is no longer byte-inert, and WC-A's invented constants are
+gone — `CHROME_BORDER`, `CHROME_TITLE_BG`, `CHROME_TITLE_FG`, FOCUS-HL's two brightened
+variants and CLOSE-BOX's two red boxes have no successors.
+
+**Metrics.** `wm::TITLE_H` is `theme::TITLE_HEIGHT` (34, was 12), `wm::BORDER` is
+`theme::FRAME` (5, was 1), `wm`'s tiling `GAP` is `theme::GAP` (12, was 8). The names
+were kept rather than renamed because they are load-bearing in five modules — `wm`,
+`wcx`, `fbcon`, `instgui` and the x86 syscall selftests — and every one of those derives
+its geometry from the symbol, so re-pointing the symbol at the table moved all of them at
+once and left no stale literal to hunt.
+
+**What the chrome now is.** A 1-px `frame_line` keyline around the outer box; a
+`theme::BEVEL` hairline inside it, `bevel_light` on top/left and `bevel_shadow` on
+bottom/right; `chrome_face` between the bevel and the strip; a `title_height` strip
+painted ONE ROW AT A TIME as a linear ramp between the kit's two active or two inactive
+stops with the gloss composited over it; `corner_radius` on the two TOP corners; three
+`control_box`-diameter discs filled `control_close` / `control_mid` / `control_zoom`; and
+the caption inked `title_text_active` or `title_text_inactive`. Focus no longer changes
+the frame — Crispy signals it with the gradient pair and the ink pair, so FOCUS-HL's
+"focus never moves a pixel" argument survives and strengthens (focus does not change the
+frame's colour either, which keeps COMPOSITE-2's four-rect subtraction focus-independent).
+
+**The interpolator §9 said the wiring arc owed.** `blend_q16` blends two roles by a Q16
+scalar, per channel, integer only: the product is exact in `i64` and the single `>> 16`
+carries a `+ 1 << 15` bias so it rounds half-up in both directions. **Residual: at most
+1/2 LSB per channel per blend.** That is the whole of the ramp's error, which is exactly
+where §9 said it belonged. The Q16 carriage of the gloss scalars is what makes this
+possible without float or `libm`.
+
+**The one shape the kit does not specify, stated rather than left implicit.** The kit
+gives `top_alpha`, `falloff` and `bottom_alpha` and no curve. This arc commits to:
+*`falloff` is the fraction of the strip height over which the highlight decays from
+`top_alpha` to `bottom_alpha`; below that band the alpha is `bottom_alpha`.* At the kit's
+`0.14 / 0.5 / 0.0` that is a 14 % white highlight on the top row, gone by the middle of
+the strip. The alternative reading (falloff as an exponent) needs a power function for no
+gain the kit asks for.
+
+**Rounded corners, and the one honest limit.** The corner cut-outs are painted
+`DESKTOP_BG`, not sampled from underneath, because there is nothing to sample: WC-H's
+invariant is that the pass writes every pixel of the clipped box, so a corner cannot be
+left unwritten. Where a manual drag stacks two windows the upper one's top corners show
+~31 px of desktop each instead of the window below. Tiled windows never overlap, so this
+is invisible in the ordinary layout. Recorded rather than hidden; fixing it needs an
+under-sample the compositor does not have.
+
+**Hit-testing follows the drawing, by construction.** `close_box` returns the CLOSE
+disc's bounding box and `in_circle` — not a rect test — is what both the painter and
+`close_box_hit` use inside it. A rect test would have accepted the four corners of the
+bounding box, which are painted title gradient: hit region and drawn region would have
+disagreed over ~21 % of the box, in precisely the pixels a user can see are not the
+button. `title_bar_hit` excludes the close disc with the same predicate. The middle and
+zoom discs are drawn and carry no verb — `wm` has no minimise and no zoom, and the kit
+supplies colours, not behaviours — so a press on them is an ordinary drag rather than a
+dead zone.
+
+##### Three fixtures were lying, and the geometry change is what exposed them
+
+The real risk in this arc was never colour. It was that `TITLE_H` and `BORDER` are read
+by hit-testing, the tiler, the move clamps, MOVE-VACATE damage and the selftest fixtures,
+and that a fixture tuned to the old numbers would keep passing while testing nothing.
+Three did:
+
+* **`retile_selftest` probed the frame, not the content.** It sampled
+  `outer.y + TITLE_H + 1`, but the content origin is `outer.y + TITLE_H + BORDER`. At
+  WC-A's `BORDER = 1` the sample point's own `+1` stood in for the frame and it landed on
+  the content's first row **by coincidence**. At `FRAME = 5` the same expression lands
+  four rows up, inside the frame, and the leg reported `painted=false live=false` against
+  a compositor that was painting correctly. The x term had been explicit all along.
+* **Both aarch64 close-box legs kept a private copy of `close_box`'s arithmetic** — a
+  `TITLE_H`-sided square flush against the right border — to solve for the window origin
+  that puts the control under the real cursor. Against a disc in a cluster of three it
+  misses, and both legs reported `SKIP`. They now solve from the SHIPPING geometry
+  (`aim_close_control`: place the row somewhere legal, ask `close_box_rect` where the
+  control actually is, translate by the residual, and verify with `close_box_hit` because
+  `move_to` clamps). This is HITTEST-GEOM's lesson applied a second time to the same
+  battery. The x86 `wmdirect` leg had the same duplicated arithmetic and now reads
+  `wm::close_box_rect` too.
+* **Three fixture surfaces were too narrow for the control to exist.** `wm::controls`
+  declines a strip that cannot hold the cluster plus a caption —
+  `2*FRAME + GAP + (3*CONTROL_BOX + 2*GAP) + GAP + 8` = 102 px, against WC-A's 26. An
+  8x8 surface gives `bw = 8*scale + 10`, which is 42 at the scale the tiler picks on the
+  bench panel; the 32x8 x86 fixture gives 74. Both are under the floor, so the close legs
+  would have reported skip for the rest of the tree's life. `HT_SURF` and `WMD_SURF` are
+  now 96 px wide, which clears 102 at scale 1 and therefore at every scale.
+
+##### The witness, and why it is NOT `witness`-gated
+
+```
+[crispy] theme=us-crispy-modern@0787ba9f frame=5 bevel=1 title_h=34 radius=12 ctrl=12 gap=12 face=0xececee keyline=0xb4b4b9 bevels=0xffffff/0xaaaaaf title_act=0xeeeef1->0xe3e3e8 title_ina=0xf4f4f5->0xefeff1 ink=0x252629/0x7a7a7e ctrls=0x3d5f92/0x678cba/0x92aac9 gloss_q16=9175/32768/0 desktop=0x2d2b55
+[crispy] ramp act row0=0xf0f0f3 rowN=0xe3e3e8 ina row0=0xf6f6f6 rowN=0xefeff1
+```
+
+Emitted once, from the first chrome paint of the boot — so its presence proves the Crispy
+path RAN, not merely that it compiled. The second line is the interpolator's own output
+rather than its inputs: `0xF0F0F3` is the `0xEEEEF1` stop lifted 14 % toward white, and
+`rowN` is the bottom stop exactly, so the capture carries the gloss's EFFECT.
+
+It is deliberately not `witness`-gated, on `wm_act`'s precedent. `./arroyo esp-x86` builds
+the metal image with `ehcihid,kbdwit,wc,smolnet` and **no `witness`** — a gated line is
+absent from the only artefact that matters. That was checked with `strings` on the staged
+`kernel.elf` rather than assumed, and **the first cut of this witness failed the check.**
+Both `target/x86_64_esp/kernel.elf` and `target/pi_baremetal/kernel8.img` now carry it.
+
+##### What the table did not carry — reported, not invented
+
+The shared-source law forbids filling a gap with a guess, so these are open questions for
+the taste gate rather than decisions this arc took:
+
+1. **There is no desktop / wallpaper role.** The kit's palette is 21 chrome and content
+   roles; nothing describes the desktop. `DESKTOP_BG` keeps its pre-existing
+   `0x002D2B55`, so near-white windows now sit on the old purple. (`DESKTOP_BG`'s own doc
+   anticipated that "the crispy theme will hand the compositor real desktop data" — it
+   does not.)
+2. **No verbs for the middle and zoom controls**, only fills.
+3. **No hover, disabled or pressed state for a title-bar control** — `button_face_pressed`
+   is a *button* role, not a control role, so the discs are drawn in one state.
+4. **Focus contrast now rides the ink.** The two title gradients differ by a few LSBs; the
+   two inks differ by a great deal. Both are drawn, because both are what the kit says
+   focus looks like. If focus does not read across the bench, the fix is in the kit json.
+5. **Control side and order.** The cluster is right-aligned with close leftmost, which
+   satisfies both the kit's darkest-to-lightest left-to-right ramp and P79's "close button
+   in the upper right". A left-hand cluster would satisfy the ramp equally.
+
+##### CRISPYWIRE gate results
+
+`./arroyo check` and `UNAOS_WC=1 ./arroyo check`: both arches clean, no new warnings.
+`UNAOS_WC=1 ./arroyo test`: `[clickroute] route ... -> PASS`, `[wm-act] direct
+partition=true grab=true route=true content=true **close=true** dragdead=true -> PASS`.
+`./arroyo test-arm`: clean. `./arroyo kernel8-test 150`: **91/91 required witnesses, 0
+forbidden**, at BOTH the default 640x480 and the bench's
+`UNAOS_FBW=1920 UNAOS_FBH=1200` — the widened fixtures were checked on the small panel
+too, because that is where a wider window is most likely not to fit. `[wc-j] retile ...
+-> PASS` and `[clickroute] hit-test ... close=true closereal=true -> PASS`: both
+previously-skipping legs now return real verdicts.
+
+Metal is not claimed. The chrome's verdict is Peter's eyes, and the predictions this arc
+was written against are in `~/unaos-bench/scratch/gr22/crispywire-predictions.md`.
 
 ### WC-L — the staged erase loses its DIRECT fallback
 

@@ -36,9 +36,14 @@
 //!
 //! # Wiring status
 //!
-//! Nothing consumes this table yet. Lifting the data and wiring the compositor are
-//! deliberately separate arcs; the wiring arc (`wm.rs`, `screen.rs`, fbcon) follows.
-//! Until then this module is byte-inert: all `const`, no statics, no code.
+//! **WIRED (CRISPYWIRE).** `video/wm.rs` consumes this table: every chrome colour and every
+//! chrome metric the window compositor draws with resolves to a role or a metric below, on both
+//! arches. `wm::TITLE_H` is [`TITLE_HEIGHT`], `wm::BORDER` is [`FRAME`], the tiler's gap is
+//! [`GAP`]. The module is no longer byte-inert — that was a property of having no consumers, not
+//! a goal. `screen.rs` and fbcon are still untouched, and there is still **no desktop-background
+//! role in the kit** for them to read; see `docs/dev/OS/08_VIDEO/engine.md` §CRISPYWIRE.
+//!
+//! A verdict change still edits THIS FILE ONLY: every consumer reads the names.
 //!
 //! # Representation
 //!

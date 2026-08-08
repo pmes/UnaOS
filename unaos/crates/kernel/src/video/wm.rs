@@ -88,11 +88,21 @@ pub const MAX_WINDOWS: usize = 12;
 /// reach the compositor.
 pub const MAX_TITLE: usize = 16;
 
-/// WC-A — height in panel pixels of the kernel-drawn title strip above each window's content.
-pub const TITLE_H: usize = 12;
+/// Height in panel pixels of the kernel-drawn title strip above each window's content.
+///
+/// CRISPYWIRE — **this is `theme::TITLE_HEIGHT`, not a compositor number.** WC-A's invented `12`
+/// is gone: the strip is the kit's `metrics.title_height`, and it changes when the kit changes.
+/// The name is kept because it is load-bearing across four modules (`wm`, `wcx`, `fbcon`,
+/// `instgui`) and the x86 syscall selftests — every one of them derives its geometry from this
+/// symbol, so re-pointing it at the table moves all of them at once and leaves no stale literal.
+pub const TITLE_H: usize = super::theme::TITLE_HEIGHT;
 
-/// WC-A — width in panel pixels of the kernel-drawn window border.
-pub const BORDER: usize = 1;
+/// Width in panel pixels of the kernel-drawn window frame.
+///
+/// CRISPYWIRE — **this is `theme::FRAME`.** WC-A's invented `1` is gone. The frame is now thick
+/// enough to carry what Crispy puts in it: an outer keyline, a bevel hairline, and the chrome face
+/// between them. See [`paint_window`] for the layering.
+pub const BORDER: usize = super::theme::FRAME;
 
 /// A window identifier. Ids are `1..=MAX_WINDOWS`; `0` is never a valid window and is the
 /// fail-closed return for every operation that could not be satisfied.
@@ -6671,30 +6681,232 @@ fn wcn_forget(id: WinId) {
 static COMPOSITE_WITNESSED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// WC-A — kernel chrome colours (0x00RRGGBB, the `put_pixel` convention; the panel's RGB/BGR layout
-/// is applied by `FrameBuffer`). Deliberately flat and un-host-like: this is UnaOS chrome, not an
-/// imitation of anyone's title bar.
-const CHROME_BORDER: u32 = 0x003A_3A46;
-const CHROME_TITLE_BG: u32 = 0x001E_1E28;
-const CHROME_TITLE_FG: u32 = 0x00C8_C8D8;
+// ---- CRISPYWIRE: the chrome is drawn FROM THE TABLE -------------------------------------------
+//
+// Every colour below resolves to a `video::theme` role. WC-A's `CHROME_BORDER`/`CHROME_TITLE_BG`/
+// `CHROME_TITLE_FG`, FOCUS-HL's two brightened variants and CLOSE-BOX's two red boxes were all
+// INVENTED numbers, and they are gone. The shared-source law (engine.md §9) is that both arches
+// take their chrome from `theme.rs`, which mirrors `kits/crispy/theme.json` — so a taste change is
+// an edit to one file, and nothing here may hold a literal for the kit to disagree with.
+//
+// **What the table did not carry, and was therefore NOT invented here:**
+//  * a DESKTOP background role — the kit's palette has 21 chrome/content roles and no wallpaper.
+//    [`DESKTOP_BG`] keeps its pre-existing value and is flagged for Peter rather than replaced with
+//    a guess; see its doc comment.
+//  * hover, disabled and pressed-CONTROL states — `button_face_pressed` is a *button* role, not a
+//    title-bar-control role, and the kit gives the three circles exactly one fill each. The
+//    controls are therefore drawn in one state only.
+//  * verbs for the middle and zoom controls. The kit gives them colours; `wm` has no minimise and
+//    no zoom, so they are drawn and are deliberately NOT excluded from the drag strip (see
+//    [`title_bar_hit`]) — an inert circle that swallowed drags would be worse than one that does
+//    not. Only [`close_box`] is a control with an action.
 
-/// FOCUS-HL — the same three chrome colours, brightened, for the window that currently holds focus.
-/// The border carries most of the signal (it frames the whole window, so it reads at a glance from
-/// across the bench) and the title strip lifts with it so the two do not disagree.
+/// CRISPYWIRE — has the theme witness been emitted? One line per boot: it names constants, so a
+/// second copy would carry no information and the compositor paints chrome at frame rate.
 ///
-/// Chosen to stay in the same flat, un-host-like family as the resting colours — this marks focus, it
-/// does not imitate anyone's title bar — while clearing a wide enough gap to be unambiguous on the
-/// bench panel rather than only on a screenshot.
-const CHROME_BORDER_FOCUS: u32 = 0x008C_8CB4;
-const CHROME_TITLE_BG_FOCUS: u32 = 0x003A_3A5A;
+/// **Deliberately NOT `witness`-gated**, on `wm_act`'s precedent. `./arroyo esp-x86` builds the
+/// metal image with `ehcihid,kbdwit,wc,smolnet` — no `witness` — so a `witness`-gated line is
+/// absent from the only artefact that matters here: a bench capture. That was checked with
+/// `strings` on the staged `kernel.elf` rather than assumed, and the first cut of this witness
+/// FAILED it. The cost of ungating is one bounded serial line per boot.
+static CRISPY_WITNESSED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
-/// CLOSE-BOX (P79) — the close box's chrome colours. Red-tinted deliberately: the box is the ONE
-/// piece of chrome a click ACTS on (see [`close_box`]), and it must read as such from across the
-/// bench, so it does not share the title strip's blue family. The focused window's box brightens
-/// with the rest of its chrome so the two never disagree about who has focus; the glyph reuses
-/// [`CHROME_TITLE_FG`] so the X is exactly as legible as the title beside it.
-const CHROME_CLOSE_BG: u32 = 0x0046_262C;
-const CHROME_CLOSE_BG_FOCUS: u32 = 0x00A0_3C46;
+/// CRISPYWIRE — **the wire says what the chrome drew.** Emitted from the first chrome paint of the
+/// boot, so its presence in a capture proves the Crispy path RAN rather than merely compiled: a
+/// banner or a `strings` hit would show the constants exist, this shows a window was framed with
+/// them. Names the theme revision and every metric and role the chrome resolved, so a panel
+/// photograph can be checked against the numbers instead of against a memory of them.
+///
+/// Bounded by construction: one line, once — and unconditional, so it reaches the metal image.
+fn crispy_witness() {
+    use core::sync::atomic::Ordering;
+    if CRISPY_WITNESSED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    use super::theme;
+    serial_println!(
+        "[crispy] theme=us-crispy-modern@0787ba9f frame={} bevel={} title_h={} radius={} ctrl={} gap={} face={:#08x} keyline={:#08x} bevels={:#08x}/{:#08x} title_act={:#08x}->{:#08x} title_ina={:#08x}->{:#08x} ink={:#08x}/{:#08x} ctrls={:#08x}/{:#08x}/{:#08x} gloss_q16={}/{}/{} desktop={:#08x}",
+        theme::FRAME,
+        theme::BEVEL,
+        theme::TITLE_HEIGHT,
+        theme::CORNER_RADIUS,
+        theme::CONTROL_BOX,
+        theme::GAP,
+        theme::CHROME_FACE,
+        theme::FRAME_LINE,
+        theme::BEVEL_LIGHT,
+        theme::BEVEL_SHADOW,
+        theme::TITLE_ACTIVE_TOP,
+        theme::TITLE_ACTIVE_BOTTOM,
+        theme::TITLE_INACTIVE_TOP,
+        theme::TITLE_INACTIVE_BOTTOM,
+        theme::TITLE_TEXT_ACTIVE,
+        theme::TITLE_TEXT_INACTIVE,
+        theme::CONTROL_CLOSE,
+        theme::CONTROL_MID,
+        theme::CONTROL_ZOOM,
+        theme::GLOSS_TOP_ALPHA_Q16,
+        theme::GLOSS_FALLOFF_Q16,
+        theme::GLOSS_BOTTOM_ALPHA_Q16,
+        DESKTOP_BG,
+    );
+    // The resolved title ramp's two ENDPOINT rows, computed by the interpolator that will draw
+    // them — so the capture carries the gloss's effect and not only its inputs. Row 0 is the top
+    // stop with the full gloss over it; row `TITLE_H-1` is the bottom stop with none.
+    serial_println!(
+        "[crispy] ramp act row0={:#08x} rowN={:#08x} ina row0={:#08x} rowN={:#08x}",
+        title_row_color(0, theme::TITLE_HEIGHT, true),
+        title_row_color(theme::TITLE_HEIGHT - 1, theme::TITLE_HEIGHT, true),
+        title_row_color(0, theme::TITLE_HEIGHT, false),
+        title_row_color(theme::TITLE_HEIGHT - 1, theme::TITLE_HEIGHT, false),
+    );
+}
+
+/// CRISPYWIRE — unpack a `0x00RRGGBB` role into `(r, g, b)`.
+#[inline]
+const fn chans(c: u32) -> (u32, u32, u32) {
+    ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
+}
+
+/// CRISPYWIRE — repack `(r, g, b)` into the `put_pixel` convention (`0x00RRGGBB`; the panel's
+/// RGB/BGR byte layout is applied by `FrameBuffer`, not here).
+#[inline]
+const fn pack(r: u32, g: u32, b: u32) -> u32 {
+    (r << 16) | (g << 8) | b
+}
+
+/// CRISPYWIRE — **the interpolator §9 says the wiring arc owes.** Blend `a` toward `b` by `t`,
+/// where `t` is Q16 (`theme::Q16_ONE` == fully `b`), per channel, in integer arithmetic only.
+///
+/// ### Why Q16, and where the residual error lives
+/// The theme table carries the gloss scalars at Q16 *precisely so this function can exist without
+/// float*: an endpoint quantized to Q16 is within ~4e-6 of the host's `f32`, against ~2e-3 for a
+/// `u8`. §9 is explicit that bit-for-bit agreement with a quartzite pixel holds for FLAT FILLS and
+/// not for the ramp, because the host interpolates in `f32` and rounds each *composited* alpha,
+/// which no table of endpoints can reproduce. This is the other half of that statement: the ramp's
+/// error is the interpolator's, and it is bounded here.
+///
+/// The bound: the product `delta * t` is exact in `i64` (|delta| <= 255, t <= 65536, so at most
+/// 2^24), and the only lossy step is the single `>> 16`, taken with a `+ 1 << 15` bias so it rounds
+/// half-up in both directions rather than toward negative infinity. **Residual: at most 1/2 LSB per
+/// channel per blend**, i.e. a drawn channel is never more than one 8-bit step from the value the
+/// host's `f32` ramp would round to. No float, no `libm`, and no intermediate that can overflow.
+#[inline]
+fn blend_q16(a: u32, b: u32, t: u32) -> u32 {
+    let t = t.min(super::theme::Q16_ONE) as i64;
+    let (ar, ag, ab) = chans(a);
+    let (br, bg, bb) = chans(b);
+    let ch = |x: u32, y: u32| -> u32 {
+        let d = y as i64 - x as i64;
+        // Round-half-up on the Q16 product, then back to 8-bit. Clamped for form's sake: both
+        // endpoints are <= 255 and `t <= 1.0`, so the result is already in range.
+        ((x as i64 + ((d * t + (1 << 15)) >> 16)).clamp(0, 255)) as u32
+    };
+    pack(ch(ar, br), ch(ag, bg), ch(ab, bb))
+}
+
+/// CRISPYWIRE — the title strip's row colour at row `j` of `h`, for a focused / unfocused window.
+///
+/// Two blends per row, in this order, because that is the order the material describes: the
+/// gradient between the kit's two stops, then the gloss laid OVER it.
+///
+/// ### The gradient
+/// `theme::TITLE_{ACTIVE,INACTIVE}_{TOP,BOTTOM}` are exact colours (§9); the ramp between them is
+/// linear in row index, `t = j / (h - 1)`, so row 0 is exactly the top stop and row `h-1` is
+/// exactly the bottom stop. A one-row strip is all top stop.
+///
+/// ### The gloss, and the reading of `falloff` this arc commits to
+/// The kit gives three scalars — `top_alpha`, `falloff`, `bottom_alpha` — and no shape. §9 says the
+/// shape is "a property of the interpolator the wiring arc writes", so it is stated here rather
+/// than left implicit: **`falloff` is the fraction of the strip's height over which the highlight
+/// decays from `top_alpha` to `bottom_alpha`; below that band the alpha is `bottom_alpha`.** At the
+/// kit's `0.5 / 0.14 / 0.0` that is a white highlight at 14 % on the top row, fading to nothing by
+/// the middle of the strip and absent below it — which is what "restrained gloss" describes and
+/// what the kit's own sample renders show. The alternative reading (falloff as an exponent) would
+/// need a power function, i.e. float or a table, for no gain the kit asks for.
+fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
+    use super::theme;
+    let (top, bot) = if focused {
+        (theme::TITLE_ACTIVE_TOP, theme::TITLE_ACTIVE_BOTTOM)
+    } else {
+        (theme::TITLE_INACTIVE_TOP, theme::TITLE_INACTIVE_BOTTOM)
+    };
+    let span = h.saturating_sub(1).max(1);
+    let t = ((j.min(span) as u64 * theme::Q16_ONE as u64) / span as u64) as u32;
+    let base = blend_q16(top, bot, t);
+    // The gloss band, in rows: `falloff` of the strip height, at least one row so a degenerate
+    // falloff still puts the top stop's highlight somewhere rather than dividing by zero.
+    let band = ((h as u64 * theme::GLOSS_FALLOFF_Q16 as u64) >> 16).max(1) as usize;
+    let g = if j >= band {
+        theme::GLOSS_BOTTOM_ALPHA_Q16
+    } else {
+        let gt = ((j as u64 * theme::Q16_ONE as u64) / band as u64) as u32;
+        // The alpha ramp is itself a Q16 blend — of scalars rather than colours, so it is done
+        // inline: `top + (bottom - top) * gt`, same round-half-up bias as `blend_q16`.
+        let (a, b) = (
+            theme::GLOSS_TOP_ALPHA_Q16 as i64,
+            theme::GLOSS_BOTTOM_ALPHA_Q16 as i64,
+        );
+        (a + (((b - a) * gt as i64 + (1 << 15)) >> 16)).clamp(0, theme::Q16_ONE as i64) as u32
+    };
+    if g == 0 {
+        base
+    } else {
+        blend_q16(base, theme::GLOSS_HIGHLIGHT, g)
+    }
+}
+
+/// CRISPYWIRE — the title caption's ink for a focused / unfocused window. `theme::TITLE_TEXT_*`.
+///
+/// **This is now the loudest half of the focus signal**, and deliberately so. FOCUS-HL used to
+/// brighten the frame and the strip because it had invented colours free to diverge as far as it
+/// liked; Crispy's two title gradients differ by only a few LSBs (`0xEEEEF1`/`0xE3E3E8` against
+/// `0xF4F4F5`/`0xEFEFF1`), while its two title inks differ by a great deal (`0x252629` near-black
+/// against `0x7A7A7E` mid grey). Both pairs are drawn, because both are what the kit says focus
+/// looks like; the ink is simply the pair a human reads from across the bench. See the report note
+/// on focus contrast — this is an observation about the approved kit, not a licence to adjust it.
+#[inline]
+fn title_ink(focused: bool) -> u32 {
+    if focused {
+        super::theme::TITLE_TEXT_ACTIVE
+    } else {
+        super::theme::TITLE_TEXT_INACTIVE
+    }
+}
+
+/// CRISPYWIRE — is pixel `(i, j)` of an `r`-sided corner block OUTSIDE the rounded corner?
+///
+/// Exact integer, half-pixel accurate, no float and no `libm`: the corner's centre is at `(r, r)`
+/// in block coordinates and the pixel's centre at `(i + 1/2, j + 1/2)`, so the halves are cleared
+/// by doubling every term — `dx2 = 2r - 2i - 1`, and the test is `dx2² + dy2² > (2r)²`. Every
+/// quantity fits comfortably in `usize` for any radius a title bar can hold.
+#[inline]
+fn corner_outside(i: usize, j: usize, r: usize) -> bool {
+    if r == 0 {
+        return false;
+    }
+    let dx = (2 * r).saturating_sub(2 * i + 1);
+    let dy = (2 * r).saturating_sub(2 * j + 1);
+    dx * dx + dy * dy > (2 * r) * (2 * r)
+}
+
+/// CRISPYWIRE — is panel point `(px, py)` inside the circle whose bounding box is `(bx, by, d)`?
+///
+/// The ONE predicate for a circular title-bar control, shared by the painter and the hit-tester so
+/// that what is drawn is exactly what is clickable — the same by-construction argument
+/// [`close_box`] has always made for its rect, now made for a circle. Same doubled-coordinate
+/// trick as [`corner_outside`]: centre at `(bx + d/2, by + d/2)`, pixel centres at `+1/2`.
+#[inline]
+fn in_circle(px: usize, py: usize, bx: usize, by: usize, d: usize) -> bool {
+    if px < bx || py < by || px >= bx + d || py >= by + d {
+        return false;
+    }
+    let (i, j) = (px - bx, py - by);
+    let dx = (2 * i + 1) as i64 - d as i64;
+    let dy = (2 * j + 1) as i64 - d as i64;
+    dx * dx + dy * dy <= (d as i64) * (d as i64)
+}
 
 /// The outer box `(x, y, w, h)` a window occupies on the panel, chrome included. A compat window
 /// (the `present_surface` shim) has no chrome, so its outer box is exactly its content.
@@ -6762,24 +6974,58 @@ fn damaged_box(r: &Window, band: Option<(usize, usize)>) -> (usize, usize, usize
 /// * **Owner-0 rows: no.** Kernel furniture (the CLICK-SHELL distinction: shell/desktop rows carry
 ///   `owner_asid == 0`, which is also why [`hit_test`] never names them) is not an app the operator
 ///   can exit; a close box on the console would be an invitation to kill the shell.
-/// * **A strip too narrow to hold the box plus one title glyph: no.** Degenerate geometry declines
-///   the control rather than drawing an unhittable sliver.
+/// * **A strip too narrow to hold the whole control cluster plus one title glyph: no.** Degenerate
+///   geometry declines the control rather than drawing an unhittable sliver.
+///
+/// ### CRISPYWIRE — the box is now a CIRCLE, and it is one of three
+/// Crispy draws three circular title-bar controls (`CONTROL_CLOSE`/`_MID`/`_ZOOM`, a ramp of the
+/// accent hue from darkest to lightest), sized by `metrics.control_box` read as a DIAMETER. This
+/// function returns the CLOSE circle's bounding box; [`controls`] lays out all three from the same
+/// arithmetic, and [`in_circle`] — not a rect test — is what both the painter and
+/// [`close_box_hit`] use inside that box, so the drawn disc and the clickable disc are the same
+/// pixels. `TITLE_H`-sided square, gone.
 fn close_box(r: &Window) -> Option<(usize, usize, usize)> {
+    controls(r).map(|(cx, cy, d)| (cx, cy, d))
+}
+
+/// CRISPYWIRE — the three circular title-bar controls' layout: the CLOSE circle's bounding box
+/// `(x, y, diameter)`. The middle and zoom circles follow it at a [`GAP`] pitch, so the cluster is
+/// `close`, `mid`, `zoom` left to right — the order the kit's own ramp is described in (darkest to
+/// lightest). The cluster is right-aligned in the strip, inset by one `GAP` from the frame, which
+/// keeps the close control in the window's upper right where CLOSE-BOX (P79) put it.
+///
+/// Every number here is a metric: [`BORDER`] is `theme::FRAME`, [`GAP`] is `theme::GAP`, the
+/// diameter is `theme::CONTROL_BOX`, and the vertical centring is against [`TITLE_H`] =
+/// `theme::TITLE_HEIGHT`. The single non-theme literal is `8`, the font cell's width — that is a
+/// property of `font8x8`, not of the kit, and it appears only in the "is there room for a caption
+/// at all" test.
+fn controls(r: &Window) -> Option<(usize, usize, usize)> {
     if r.compat || r.owner_asid == 0 {
         return None;
     }
     let (bx, by, bw, _bh) = outer_box(r);
-    let side = TITLE_H;
-    if bw < 2 * BORDER + 2 * side {
+    let d = super::theme::CONTROL_BOX;
+    // Cluster: three discs at a `GAP` pitch, one `GAP` clear of the right frame, and enough strip
+    // left over for one glyph of caption plus its own `GAP`. Anything narrower declines.
+    let cluster = 3 * d + 2 * GAP;
+    if bw < 2 * BORDER + GAP + cluster + GAP + 8 {
         return None;
     }
-    Some((bx + bw - BORDER - side, by + BORDER, side))
+    let right = bx + bw - BORDER - GAP;
+    // Vertically centred in the strip; `TITLE_H > CONTROL_BOX` is a const-assert in `theme.rs`.
+    let cy = by + BORDER + (TITLE_H - d) / 2;
+    Some((right - cluster, cy, d))
 }
 
 /// CLOSE-BOX — does panel point `(x, y)` land in window `id`'s close box? The router's second
 /// question, asked only AFTER [`hit_test`] has named `id` as the owner of the point — so this is a
 /// rect test against one row, not a scan, and the z-order question is already settled by the time
 /// it runs. `false` for a dead id and for every row [`close_box`] declines.
+///
+/// CRISPYWIRE — the test is [`in_circle`], not a rect, because the control Crispy draws is a disc.
+/// A rect test would have accepted the four corners of the bounding box, which are painted title
+/// gradient and not control: the hit region and the drawn region would have disagreed by ~21 % of
+/// the box's area, in exactly the pixels a user can see are not the button.
 pub fn close_box_hit(id: WinId, x: i32, y: i32) -> bool {
     if x < 0 || y < 0 {
         return false;
@@ -6787,9 +7033,19 @@ pub fn close_box_hit(id: WinId, x: i32, y: i32) -> bool {
     let (px, py) = (x as usize, y as usize);
     let t = table();
     match row(&t, id).and_then(close_box) {
-        Some((cx, cy, s)) => px >= cx && px < cx + s && py >= cy && py < cy + s,
+        Some((cx, cy, d)) => in_circle(px, py, cx, cy, d),
         None => false,
     }
+}
+
+/// CRISPYWIRE — the CLOSE control's bounding box `(x, y, diameter)` in panel pixels, or `None` for
+/// a row that has no control. Public so a fixture can PRESS the control the compositor actually
+/// drew instead of re-deriving its position from `TITLE_H` and `BORDER` — the x86 `wmdirect`
+/// selftest kept its own copy of that arithmetic, which was correct only for the square box WC-A
+/// invented and would have quietly reported a SKIP against a disc.
+pub fn close_box_rect(id: WinId) -> Option<(usize, usize, usize)> {
+    let t = table();
+    row(&t, id).and_then(close_box)
 }
 
 // ---- WMDIRECT: chrome geometry as a ROUTING question -------------------------------------------
@@ -6847,6 +7103,13 @@ pub fn chrome_hit(id: WinId, x: i32, y: i32) -> bool {
 /// here rather than left to caller ordering: the box lives inside the strip, and a drag that could
 /// begin on the close control would make "press the close box and twitch" mean move-instead-of-close.
 /// The two controls are disjoint at this layer, so no caller can get their precedence wrong.
+///
+/// CRISPYWIRE — the exclusion is the CLOSE DISC and only it, tested with the same [`in_circle`]
+/// the painter uses. The middle and zoom circles beside it are drawn but carry no verb (`wm` has no
+/// minimise and no zoom), and the kit supplies colours, not behaviours: rather than invent an
+/// action or leave two dead zones in the drag handle, a press on them is an ordinary title-bar
+/// drag. If Crispy's middle/zoom are meant to DO something, that is a question for the taste gate,
+/// not a decision this arc could take from the table.
 pub fn title_bar_hit(id: WinId, x: i32, y: i32) -> bool {
     if x < 0 || y < 0 {
         return false;
@@ -6868,7 +7131,7 @@ pub fn title_bar_hit(id: WinId, x: i32, y: i32) -> bool {
         return false;
     }
     match close_box(r) {
-        Some((cx, cy, s)) => !(px >= cx && px < cx + s && py >= cy && py < cy + s),
+        Some((cx, cy, d)) => !in_circle(px, py, cx, cy, d),
         None => true,
     }
 }
@@ -7777,11 +8040,15 @@ fn paint_window(
         // FOCUS-HL: the ONLY difference the focused window's chrome carries is these two colours. The
         // geometry is identical either way, so focus never moves a pixel — it just repaints the frame
         // and strip that were already going to be painted, at no extra cost per present.
-        let (border, title_bg) = if focused {
-            (CHROME_BORDER_FOCUS, CHROME_TITLE_BG_FOCUS)
-        } else {
-            (CHROME_BORDER, CHROME_TITLE_BG)
-        };
+        //
+        // CRISPYWIRE — the fill colour is `theme::CHROME_FACE`, the kit's window-body role, and it
+        // is the SAME colour focused or not. Crispy does not signal focus with the frame: it
+        // signals it with the title gradient's stops and the caption's ink, both of which are
+        // resolved per-row below. FOCUS-HL's argument (identical geometry, so focus never moves a
+        // pixel) survives intact and is now stronger — focus does not change the frame's colour
+        // either, so the four-rect subtraction is focus-independent by construction.
+        let border = super::theme::CHROME_FACE;
+        crispy_witness();
         if c2_cols > 0 && c2_rows > 0 {
             let cx0 = r.x.saturating_sub(ox);
             let cy0 = r.y as isize - oy as isize;
@@ -7803,49 +8070,136 @@ fn paint_window(
         } else {
             fill_rect_v(dst, lbx, lby, bw, bh, border);
         }
+        // CRISPYWIRE — the title strip, ONE ROW AT A TIME, because Crispy's title bar is a
+        // gradient with a gloss over it rather than a flat fill. `title_row_color` resolves both
+        // (kit stops, kit gloss scalars, integer Q16 throughout); the cost is `TITLE_H` short
+        // `fill_rect`s per window per compose instead of one, which is 34 spans over a strip that
+        // is at most a few hundred pixels wide — immaterial beside the content upscale
+        // COMPOSITE-2 measured at ~12 ms. Signed `y` per row, so a chunked stage's later bands drop
+        // the rows above their own origin exactly as `fill_rect_v` always did.
+        let strip_w = bw.saturating_sub(2 * BORDER);
+        for j in 0..TITLE_H {
+            fill_rect_v(
+                dst,
+                lbx + BORDER,
+                lby + (BORDER + j) as isize,
+                strip_w,
+                1,
+                title_row_color(j, TITLE_H, focused),
+            );
+        }
+        // CRISPYWIRE — the frame's own structure, laid over the face fill at the box edges: a
+        // 1-px `FRAME_LINE` keyline on the outside, then a `theme::BEVEL`-thick hairline inside it,
+        // light on the top/left and shadow on the bottom/right. The face fill above already put
+        // `CHROME_FACE` everywhere between the bevel and the strip, so these are the only frame
+        // pixels that are not face.
+        let bev = super::theme::BEVEL;
+        let kl = super::theme::FRAME_LINE;
+        // Keyline: four 1-px edges of the outer box.
+        fill_rect_v(dst, lbx, lby, bw, 1, kl);
+        fill_rect_v(dst, lbx, lby + bh as isize - 1, bw, 1, kl);
+        fill_rect_v(dst, lbx, lby, 1, bh, kl);
+        fill_rect_v(dst, lbx + bw.saturating_sub(1), lby, 1, bh, kl);
+        // Bevel, inside the keyline. `theme::BEVEL < theme::FRAME` is a const-assert, so these can
+        // never reach the strip.
+        let (bl, bs) = (super::theme::BEVEL_LIGHT, super::theme::BEVEL_SHADOW);
+        fill_rect_v(dst, lbx + 1, lby + 1, bw.saturating_sub(2), bev, bl);
+        fill_rect_v(dst, lbx + 1, lby + 1, bev, bh.saturating_sub(2), bl);
         fill_rect_v(
             dst,
-            lbx + BORDER,
-            lby + BORDER as isize,
-            bw.saturating_sub(2 * BORDER),
-            TITLE_H,
-            title_bg,
+            lbx + 1,
+            lby + bh as isize - 1 - bev as isize,
+            bw.saturating_sub(2),
+            bev,
+            bs,
         );
-        // CLOSE-BOX — the close control, over the strip's right end. The rect comes from
-        // `close_box` (the SAME function the router hit-tests, so what is drawn is what is
-        // clickable), converted to this destination's origin exactly as the strip above was; the
-        // title's width budget below excludes it so a long title truncates BESIDE the box rather
-        // than running under it. Signed-`y` discipline matches `fill_rect_v`/`draw_title`: a
-        // chunked stage's later bands see the box above their row 0 and skip those lines.
-        let close_w = match close_box(r) {
-            Some((cbx, cby, s)) => {
-                let clx = cbx.saturating_sub(ox);
-                let cly = cby as isize - oy as isize;
-                let close_bg = if focused { CHROME_CLOSE_BG_FOCUS } else { CHROME_CLOSE_BG };
-                fill_rect_v(dst, clx, cly, s, s, close_bg);
-                // The X glyph: two 2-px diagonals, inset so the strokes never touch the box edge.
-                let g = 3;
-                let n = s.saturating_sub(2 * g);
-                for i in 0..n {
-                    let dy = cly + (g + i) as isize;
-                    if dy < 0 {
-                        continue;
-                    }
-                    dst.put_pixel(clx + g + i, dy as usize, CHROME_TITLE_FG);
-                    dst.put_pixel(clx + g + i + 1, dy as usize, CHROME_TITLE_FG);
-                    dst.put_pixel(clx + g + (n - 1 - i), dy as usize, CHROME_TITLE_FG);
-                    dst.put_pixel(clx + g + (n - 1 - i) + 1, dy as usize, CHROME_TITLE_FG);
+        fill_rect_v(
+            dst,
+            lbx + bw.saturating_sub(1 + bev),
+            lby + 1,
+            bev,
+            bh.saturating_sub(2),
+            bs,
+        );
+        // CRISPYWIRE — `theme::CORNER_RADIUS`, on the two TOP corners (the kit says top; the
+        // bottom stays square). The pixels outside the arc are painted [`DESKTOP_BG`] and the
+        // keyline is re-laid ALONG the arc, so the silhouette actually reads as rounded rather
+        // than as a rounded outline on a square block.
+        //
+        // ⚠ **The one honest limit.** These pixels are painted desktop, not sampled from what is
+        // underneath, because there is nothing underneath to sample: WC-H's invariant is that this
+        // pass writes every pixel of the clipped box (the staged back layer carries the previous
+        // window's residue otherwise), so a corner cannot simply be left unwritten. Where a window
+        // overlaps another window, each top corner shows ~31 px of desktop instead of the window
+        // below. Tiled windows — every window `place` lays out — never overlap, so this is visible
+        // only after a manual drag stacks two windows. Recorded rather than hidden: fixing it needs
+        // an under-sample the compositor does not have today.
+        let rad = super::theme::CORNER_RADIUS.min(bw / 2).min(bh / 2);
+        for j in 0..rad {
+            let dy = lby + j as isize;
+            if dy < 0 {
+                continue;
+            }
+            let mut first = rad;
+            for i in 0..rad {
+                if !corner_outside(i, j, rad) {
+                    first = i;
+                    break;
                 }
-                s + 2
+            }
+            if first > 0 {
+                fill_rect_v(dst, lbx, dy, first, 1, DESKTOP_BG);
+                fill_rect_v(dst, lbx + bw - first, dy, first, 1, DESKTOP_BG);
+            }
+            dst.put_pixel(lbx + first, dy as usize, kl);
+            dst.put_pixel(lbx + bw - 1 - first, dy as usize, kl);
+        }
+        // CRISPYWIRE — the three circular title-bar controls. `controls` gives the CLOSE disc's
+        // bounding box and the pitch; the other two follow at a `GAP`. Each is filled with its own
+        // kit role — `CONTROL_CLOSE`, `CONTROL_MID`, `CONTROL_ZOOM`, the accent ramp from darkest
+        // to lightest — through the SAME `in_circle` predicate `close_box_hit` tests with, so the
+        // drawn disc and the clickable disc are one set of pixels by construction. No glyph is
+        // drawn inside them: the kit gives the controls a fill and no symbol, and an invented X
+        // would be an invented colour.
+        let ctrl_w = match controls(r) {
+            Some((cbx, cby, d)) => {
+                let cly = cby as isize - oy as isize;
+                let roles = [
+                    super::theme::CONTROL_CLOSE,
+                    super::theme::CONTROL_MID,
+                    super::theme::CONTROL_ZOOM,
+                ];
+                for (n, &col) in roles.iter().enumerate() {
+                    let bxn = cbx + n * (d + GAP);
+                    let clx = bxn.saturating_sub(ox);
+                    for j in 0..d {
+                        let dy = cly + j as isize;
+                        if dy < 0 {
+                            continue;
+                        }
+                        for i in 0..d {
+                            if in_circle(bxn + i, cby + j, bxn, cby, d) {
+                                dst.put_pixel(clx + i, dy as usize, col);
+                            }
+                        }
+                    }
+                }
+                // The caption's width budget: the whole cluster plus the `GAP` that separates it
+                // from the text, so a long title truncates BESIDE the controls, never under them.
+                3 * d + 2 * GAP + 2 * GAP
             }
             None => 0,
         };
+        // CRISPYWIRE — the caption: inset one `GAP` from the frame, vertically centred in the
+        // strip against the 8-px font cell, and inked with the kit's focused/unfocused title text
+        // role.
         draw_title(
             dst,
             r,
-            lbx + BORDER + 2,
-            lby + BORDER as isize + 2,
-            bw.saturating_sub(2 * BORDER + 4 + close_w),
+            lbx + BORDER + GAP,
+            lby + BORDER as isize + (TITLE_H.saturating_sub(8) / 2) as isize,
+            bw.saturating_sub(2 * BORDER + GAP + ctrl_w),
+            title_ink(focused),
         );
     }
 
@@ -8498,7 +8852,18 @@ fn stage_fill(
 /// destination are dropped; the rest are drawn at their true position, and `put_pixel` clips the
 /// bottom as it always did. For `y >= 0` — the direct path, and any stage that fits in one band —
 /// this is byte-for-byte the pre-WC-M loop.
-fn draw_title(fb: &super::FrameBuffer, r: &Window, x: usize, y: isize, max_w: usize) {
+///
+/// CRISPYWIRE — the ink is a PARAMETER, not a constant: Crispy carries two title-text roles
+/// (`title_text_active` / `title_text_inactive`) and the caller resolves which through
+/// [`title_ink`]. WC-A's single `CHROME_TITLE_FG` is gone.
+fn draw_title(
+    fb: &super::FrameBuffer,
+    r: &Window,
+    x: usize,
+    y: isize,
+    max_w: usize,
+    ink: u32,
+) {
     let cols = max_w / 8;
     for (i, &b) in r.title[..r.title_len].iter().enumerate() {
         if i >= cols {
@@ -8513,7 +8878,7 @@ fn draw_title(fb: &super::FrameBuffer, r: &Window, x: usize, y: isize, max_w: us
             }
             for rx in 0..8 {
                 if byte & (1 << rx) != 0 {
-                    fb.put_pixel(x + i * 8 + rx, dy as usize, CHROME_TITLE_FG);
+                    fb.put_pixel(x + i * 8 + rx, dy as usize, ink);
                 }
             }
         }
@@ -8932,7 +9297,14 @@ fn retile_selftest() {
     };
     // Sample the survivor's CONTENT origin, not its chrome: chrome is redrawn identically at the new
     // position, so a chrome pixel cannot distinguish "moved" from "still there".
-    let (bx0, by0) = (before.0 + BORDER, before.1 + TITLE_H);
+    //
+    // CRISPYWIRE — the y term carries `+ BORDER`, which it did not before. The content origin is
+    // `outer.y + TITLE_H + BORDER`, and this probe read `outer.y + TITLE_H + 1`: at WC-A's
+    // `BORDER = 1` the `+1` the sample points add stood in for the frame and the probe landed on
+    // the content's first row BY COINCIDENCE. At Crispy's `FRAME = 5` the same expression lands
+    // four rows up, inside the frame, and the leg reported `painted=false live=false` against a
+    // compositor that was painting correctly. The x term was right all along (`+ BORDER` explicit).
+    let (bx0, by0) = (before.0 + BORDER, before.1 + TITLE_H + BORDER);
     let painted = read(bx0 + 1, by0 + 1) == b_col;
 
     close(wa);
@@ -8940,7 +9312,7 @@ fn retile_selftest() {
     let after = info_box(wb).unwrap_or(before);
     let moved = after != before;
     // The survivor still reaches the panel at its NEW box...
-    let live_ok = read(after.0 + BORDER + 1, after.1 + TITLE_H + 1) == b_col;
+    let live_ok = read(after.0 + BORDER + 1, after.1 + TITLE_H + BORDER + 1) == b_col;
     // ...and its OLD box is desktop again. Three points inside the abandoned content area.
     let mut clean = 0usize;
     let pts = [(bx0 + 1, by0 + 1), (bx0 + 2, by0 + 2), (bx0 + 5, by0 + 5)];
@@ -9149,8 +9521,10 @@ fn create_inner(
 
 /// Choose `id`'s scale and on-panel origin. WC-A2 tiles windows left-to-right; the compat window is
 /// placed by the legacy centering rule at composite time and is skipped here.
-/// WC-A — gap in panel pixels between tiled windows (and from the panel edge).
-const GAP: usize = 8;
+/// Gap in panel pixels between tiled windows (and from the panel edge).
+///
+/// CRISPYWIRE — `theme::GAP`, the kit's `metrics.gap`. WC-A's invented `8` is gone.
+const GAP: usize = super::theme::GAP;
 
 /// WC-SCALE — the LEGIBILITY CEILING on a window's integer upscale, for a panel `ph` pixels tall.
 ///
@@ -9331,7 +9705,12 @@ fn reclaim(vacated: &[(usize, usize, usize, usize)]) {
 /// only ever reads a window's surface). Both probe windows share it — this witness reads the TABLE,
 /// not the panel, so the colours carry no verdict and there is no reason to have two.
 #[cfg(feature = "witness")]
-static HT_SURF: [u32; 64] = [0x0020_C080; 64];
+///
+/// CRISPYWIRE — 96x8 (768 words), not 8x8. Leg 10 closes `wa` THROUGH THE ROUTER, so `wa` must be a
+/// row whose title strip can actually hold Crispy's control cluster; an 8-px surface cannot at any
+/// scale the tiler picks, and the leg would report SKIP forever. `wb` is widened with it so the two
+/// stay the identical stacked pair legs 1-5 assert against.
+static HT_SURF: [u32; 768] = [0x0020_C080; 768];
 
 /// CLICK-ROUTE — the HIT-TEST witness: does [`hit_test`] name the window an operator would say they
 /// clicked on?
@@ -9607,6 +9986,42 @@ fn clickplain_leg(_owner: u64, _other: u64, _surf: usize, _len: usize) -> Option
 /// placement lands under some other window. A release edge follows the press either way, leaving
 /// the router's mask tracker as it was found (the release follows a DROPPED press, so it is
 /// consumed too — asserting nothing, restoring everything).
+/// CRISPYWIRE — **place `w` so its CLOSE control's centre lands exactly on panel point `(cx, cy)`.**
+///
+/// The aarch64 close legs drive the SHIPPED router, which reads the REAL cursor — the CLICK-PLAIN
+/// fixture discipline is "move the window under the pointer, never the pointer" — so a leg has to
+/// solve for the window origin that puts the control under the hand. Both legs used to solve it
+/// with their own copy of `close_box`'s arithmetic (`x = cx + TITLE_H/2 - w*scale`, i.e. a
+/// `TITLE_H`-sided square flush against the right border). That copy was only ever correct for the
+/// square box WC-A invented; against Crispy's `control_box`-diameter DISC in a right-aligned
+/// cluster of three it misses, and the legs report SKIP — a fixture that silently tests nothing,
+/// which HITTEST-GEOM already convicted once on this exact battery.
+///
+/// This solves it from the SHIPPING geometry instead, and is therefore correct for any chrome the
+/// kit ever describes: place the row somewhere legal, ask [`close_box_rect`] where the control
+/// actually IS, and translate the origin by the residual. [`move_to`] CLAMPS, so the result is
+/// verified with [`close_box_hit`] rather than assumed — a window that cannot be positioned to put
+/// its control under the pointer returns `false` and its leg reports a skip honestly.
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
+fn aim_close_control(w: WinId, cx: i32, cy: i32) -> bool {
+    // A provisional placement that is legal by construction: the origin must clear the chrome the
+    // window carries above and to the left of its content.
+    move_to(w, BORDER, TITLE_H + BORDER);
+    let Some((bx, by, d)) = close_box_rect(w) else {
+        return false; // the strip declined the control (too narrow for the cluster plus a caption)
+    };
+    let Some(i) = info(w) else { return false };
+    // The control's centre minus the origin is a CONSTANT of the row's geometry, so one translation
+    // is exact — no search, no iteration.
+    let nx = i.x as i64 + (cx as i64 - (bx + d / 2) as i64);
+    let ny = i.y as i64 + (cy as i64 - (by + d / 2) as i64);
+    if nx < BORDER as i64 || ny < (TITLE_H + BORDER) as i64 {
+        return false; // the window would need to start off the panel
+    }
+    move_to(w, nx as usize, ny as usize);
+    close_box_hit(w, cx, cy)
+}
+
 #[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
 fn closebox_leg(owner: u64, surf: usize, len: usize) -> Option<bool> {
     use crate::arch::aarch64::syscall as sc;
@@ -9622,25 +10037,20 @@ fn closebox_leg(owner: u64, surf: usize, len: usize) -> Option<bool> {
     if cx < 96 || cy < 96 || cx + 96 >= pw || cy + 96 >= ph {
         return None;
     }
-    let w = create(owner, surf, len, 8, 8, 32, b"ht-x");
+    // CRISPYWIRE — 96 source px wide, not 8. `wm::controls` declines a strip too narrow to hold
+    // the three-disc cluster and a caption, and an 8-px surface is under that at every scale the
+    // tiler picks (8*4 + 10 = 42 against a 102-px floor) — this leg would have reported SKIP for
+    // the rest of time. 96 clears it at scale 1 and therefore at all of them.
+    let w = create(owner, surf, len, 96, 8, 384, b"ht-x");
     if w == WIN_NONE {
         return None;
     }
-    // Place the CONTENT origin so the close box contains the pointer. From `close_box`'s own
-    // arithmetic (BORDER=1 cancels): the box spans x in [r.x + w*scale - side, r.x + w*scale) and
-    // y in [r.y - TITLE_H, r.y - TITLE_H + side); aim the pointer at the box's centre. The scale
-    // is read back from the row `create` actually minted, not re-derived.
-    let side = TITLE_H as i32;
-    let ws = match info(w) {
-        Some(wi) => (wi.w * wi.scale) as i32,
-        None => 0,
-    };
-    let (x, y) = (cx + side / 2 - ws, cy + TITLE_H as i32 - side / 2);
-    if ws == 0 || x < 0 || y < (TITLE_H + BORDER) as i32 {
+    // CRISPYWIRE — solved from the SHIPPING geometry (see `aim_close_control`), not from a private
+    // copy of `close_box`'s arithmetic.
+    if !aim_close_control(w, cx, cy) {
         close(w);
         return None;
     }
-    move_to(w, x as usize, y as usize);
     focus_changed(owner); // raise it above the fixture rows the earlier legs left behind
     sc::user_input_set_active(owner); // the closed owner also holds focus: the arm must hand it back
     // Fixture validity: the pointer must address THIS window, in its CLOSE BOX.
@@ -9706,16 +10116,14 @@ fn closebox_real_leg(w: WinId, owner: u64) -> Option<bool> {
     if cx < 96 || cy < 96 || cx + 96 >= pw || cy + 96 >= ph {
         return None;
     }
-    let side = TITLE_H as i32;
-    let ws = match info(w) {
-        Some(wi) => (wi.w * wi.scale) as i32,
-        None => 0, // `wa` already gone (leg 9's retry fell through onto it): no fixture
-    };
-    let (x, y) = (cx + side / 2 - ws, cy + TITLE_H as i32 - side / 2);
-    if ws == 0 || x < 0 || y < (TITLE_H + BORDER) as i32 {
-        return None; // no row was minted here: `wa` stays for the battery's own close
+    if info(w).is_none() {
+        return None; // `wa` already gone (leg 9's retry fell through onto it): no fixture
     }
-    move_to(w, x as usize, y as usize);
+    // CRISPYWIRE — same solve as leg 9, and for the same reason: the private copy of `close_box`'s
+    // arithmetic that used to live here could not find a disc.
+    if !aim_close_control(w, cx, cy) {
+        return None; // the row stays for the battery's own close
+    }
     focus_changed(owner);
     sc::user_input_set_active(owner);
     if hit_test(cx, cy).map(|(i, a, _)| (i, a)) != Some((w, owner)) || !close_box_hit(w, cx, cy) {
@@ -9827,10 +10235,12 @@ pub fn hittest_selftest() {
 
     let s = &raw const HT_SURF as usize;
     let len = core::mem::size_of_val(&HT_SURF);
-    // 8x8 ARGB8888, stride 32 BYTES (= 8 px) — the FOCUS-VIS surface geometry exactly. The compositor
-    // picks the upscale itself (`place_scale`), which is the scale `spawn_geometry` answered with.
-    let wa = create(ASID_A, s, len, 8, 8, 32, b"ht-a");
-    let wb = create(ASID_B, s, len, 8, 8, 32, b"ht-b");
+    // CRISPYWIRE — 96x8 ARGB8888, stride 384 BYTES (= 96 px). The compositor picks the upscale
+    // itself (`place_scale`), which is the scale `spawn_geometry` answered with. Both rows are the
+    // same size and are stacked at the same origin, exactly as before; only the width moved, so
+    // that leg 10's router-driven close has a strip wide enough to carry a close control.
+    let wa = create(ASID_A, s, len, 96, 8, 384, b"ht-a");
+    let wb = create(ASID_B, s, len, 96, 8, 384, b"ht-b");
     if wa == WIN_NONE || wb == WIN_NONE {
         serial_println!("[clickroute] hit-test -> SKIP (window table full: a={} b={})", wa, wb);
         close(wa);
