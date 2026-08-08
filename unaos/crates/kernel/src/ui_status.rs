@@ -494,10 +494,18 @@ static PULSE: Mutex<PulseState> = Mutex::new(PulseState {
 ///
 /// `sched::core_load(c).busy_pct_recent` is SCHED-5/SCHED-7's rolling ~250 ms CNTPCT accounting — the
 /// number `top` and the `SCHED: load` heartbeat report — so the instrument and the console are reading
-/// one feed. `None` means "no live number for this core": either the arch has no such accounting (x86)
-/// or SCHED-8's `tracked` flag says the core is not currently inside `run()` and its slot is a frozen
-/// snapshot. `None` sends the caller to the `meter_cpu_ticks` fallback, which is where VUG-HONESTY's
-/// PARKED decision lives — so this function never has to invent a load, and never gets the chance to.
+/// one feed. `None` means "no live number for this core": either this arch's arm is not wired to a
+/// busy-time feed, or SCHED-8's `tracked` flag says the core is not currently inside `run()` and its
+/// slot is a frozen snapshot. `None` sends the caller to the `meter_cpu_ticks` fallback, which is
+/// where VUG-HONESTY's PARKED decision lives — so this function never has to invent a load, and never
+/// gets the chance to.
+///
+/// SCHEDLOAD-X86 — "the arch has no such accounting (x86)" is no longer why the x86 arm returns
+/// `None`. `arch::x86_64::sched::core_load` now exists, with the same `busy_pct_recent`/`tracked`
+/// contract (spans in TSC, freshness in ms — see that module for why the two clocks differ), and it
+/// backs the always-on `[schedx86] load` serial witness. What is missing is only the WIRE: adopting
+/// it here so the panel strip and the console read one feed, which is the aarch64 lesson recorded at
+/// the top of this module and is a deliberate follow-up rather than part of that arc.
 ///
 /// Resolution note: the source is a percent, so its quantum is 10‰. That is coarser than the meter's
 /// 1‰ storage and deliberately not smoothed or interpolated here — a fabricated intermediate value is

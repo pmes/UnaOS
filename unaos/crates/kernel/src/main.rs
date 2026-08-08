@@ -4291,6 +4291,17 @@ fn x86_render_service(cpu: usize) {
                 sent.wrapping_sub(recv),
                 cpu
             );
+            // SCHEDLOAD-X86 load witness, riding the depth line's clock gate — the two are the answer
+            // halves of one question and are worth reading as a pair: `depth` says whether the GUI
+            // pipe is backed up, `load` says what the other seven cores were doing while it was not.
+            // Every boot emits this without an operator launching anything, which is the whole point:
+            // until now the only per-core load feed on x86 was `SYS_CPUPULSE`, i.e. a ring-3 app
+            // somebody had to start, so no unattended capture has ever contained a load number.
+            //
+            // Emitted from HERE — after `pal.render()`, inside the existing rate limit — deliberately.
+            // The event-routing block above (`wc_click_route` -> `user_input_route` -> `handle_key`)
+            // is the seam of the open focus-trap defect and is not to be perturbed by an instrument.
+            unaos_kernel::arch::sched::emit_load_witness("");
         }
     }
 }

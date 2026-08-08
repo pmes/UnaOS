@@ -364,8 +364,764 @@ static SCHED: [SchedCpu; MAX_CPUS] = [const { SchedCpu::new() }; MAX_CPUS];
 /// each time it idles (`hlt`). The demo samples both once per frame and shows busy/(busy+idle) over
 /// the window as a per-core bar. Introspection only — never read on any scheduling path. This is the
 /// SEAM a real per-core utilization feed would replace.
+///
+/// SCHEDLOAD-X86 — the replacement now exists alongside (`ACCT` / [`core_load`]) and these two are
+/// DELIBERATELY LEFT INTACT. They are an EVENT-COUNT feed with five live consumers that read them as
+/// such (`SYS_CPUPULSE` -> `PULSE.ELF`, `vug.rs`'s meter, `ui_status`'s fallback, `selftest`, the
+/// `sched` shell verb); silently redefining their currency to time would break every one of them and
+/// would also destroy the arc's own cross-check, which is that the TIME feed and the EVENT feed must
+/// agree about WHICH cores are idle while disagreeing about the magnitudes. Two instruments, one
+/// question: that is the point, not a duplication to be tidied away.
 static CPU_BUSY: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static CPU_IDLE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+// ── SCHEDLOAD-X86 ───────────────────────────────────────────────────────────────────────────────
+// Per-core busy-TIME accounting: what fraction of the last ~250 ms each core spent EXECUTING a task,
+// as opposed to how many times it was handed one.
+//
+// WHY A SECOND FEED. `CPU_BUSY`/`CPU_IDLE` count EVENTS — one increment per dispatch, one per `hlt`.
+// The ratio they yield is a cadence proxy, not a duty cycle, and on the metal capture it reads (a)
+// `c1 = 3/243 -> 1%` for the core that owns every pixel on the machine, because the render task
+// blocks in `recv` and is therefore dispatch-SPARSE however expensive each pass is, and (b)
+// `c3 = 1897489/0 -> 100%` for a ring-3 spinner, four orders of magnitude away from `c7`'s `348/157`
+// while both are simply "the core was busy". Neither number can be compared to the other and neither
+// can be compared across cores, so no balancer can be built on them. Exactly ONE reading from that
+// feed is unambiguous — `busy == 0` means zero tasks ran — and it is that reading, and only that
+// reading, which the new feed must reproduce (see [`emit_load_witness`]).
+//
+// DENOMINATED IN TSC, NOT IN APIC TICKS. `arch::now_cycles()` is `rdtsc`, invariant on Nehalem+ and
+// calibrated against the ACPI PM timer at `t~116ms` (`apic::tsc_hz()`); the APIC TIMER's rate is a
+// separate quantity and is NOT calibrated the same way (`scheduler.md:1766`). Spans are therefore
+// measured in TSC, and the window budget is `tsc_hz()/4`.
+//
+// ...EXCEPT FRESHNESS, WHICH IS DENOMINATED IN MILLISECONDS, AND THAT DIVERGENCE FROM THE AARCH64
+// TWIN IS THE ONE LOAD-BEARING DESIGN DECISION HERE. On aarch64 `CNTPCT` is a SYSTEM-global counter:
+// core A can subtract a timestamp core B wrote and get a real elapsed span. `rdtsc` is a PER-CORE
+// counter. Synchronization across packages/cores is a firmware property (the reset-time TSC sync,
+// `IA32_TSC_ADJUST`) that this kernel neither programs nor verifies, so a cross-core `now_cycles() -
+// their_timestamp` is NOT a sound elapsed time — a modest negative skew wraps to ~2^64 and a modest
+// positive skew fabricates a full window of activity. Every quantity a REMOTE reader evaluates
+// therefore uses `arch::ms()`, which is globally coherent by construction (`APIC_TICKS` is advanced
+// by core 0 alone; see `run_bsp`'s clock note). Every quantity a core evaluates about ITSELF — the
+// busy and idle spans — stays in TSC, where `rdtsc` is exact. Nothing in this module ever subtracts
+// two TSC readings taken on different cores.
+//
+// AGE-ON-READ (aarch64's PULSE-5) FOR THE SELF ROW ONLY, AND A DIFFERENT MECHANISM FOR THE REST.
+// PULSE-5 exists because the Pi's window can only close at a dispatch boundary, so one compute-bound
+// task freezes the percent for an unbounded time; its remedy is to add `now - run_t0` into the window
+// at READ time. Across cores that is exactly the unsound TSC subtraction ruled out above — but it is
+// perfectly sound when the reader IS the owning core, and that case is not a corner: the witness is
+// emitted from the render task, about the render core, at the end of its own pass. `core_load` tests
+// `cpu == meter_current_cpu()` and takes the live span only there. See `live_span_cyc`, whose
+// soundness argument is much simpler than the aarch64 twin's — a core's scheduler loop runs only when
+// no task is running on that core, so there is no concurrency to order and no fence is needed.
+//
+// For REMOTE cores the freeze is still real — the arc's own QEMU smoke printed `c2=64%` and then
+// `c2=--` on the next line, a core that had stopped folding because it was inside a task rather than
+// because it had stopped working. That case is handled by a different and cheaper route: `core_load`
+// reads `SCHED[cpu].current != 0` (a task is executing) together with `fold_age_ms >= LOAD_WINDOW_MS`
+// (the span has already outlasted a whole window) and reports 100%. Both inputs are globally coherent
+// — an atomic pointer and the core-0 ms clock — so this reaches PULSE-5's case-1 conclusion with no
+// cross-core cycle arithmetic at all. It is an INFERENCE, not a measurement, and the witness marks it
+// as such on the wire (`100%*`); see `CoreLoad::pegged` for why that distinction is not optional.
+//
+// The finer-grained half of PULSE-5 (a partial in-flight span shorter than one window, on a REMOTE
+// core) is deliberately not reproduced: it is precisely the part that needs a live cross-core cycle
+// delta. Its absence under-reports such a core for at most one window, which is the safe direction —
+// an inflated percent would send a future balancer AWAY from a core that is actually free. That is a
+// statement about THIS omission and must not be read as a claim that the instrument cannot
+// over-report at all: it can, by exactly one mechanism, `busy_pct`'s partial-window blend, bounded by
+// one decaying window and documented there. The omission also matters far less here than on the Pi:
+// x86 has a live 1 kHz LVT timer on every core and `QUANTUM_TICKS = 4`, so an ordinary preemptible
+// task's span is broken, and folded, every ~4 ms.
+//
+// NO `PaddedUsize`. The aarch64 padding fix is justified there by the A72 having no LSE atomics, so
+// an LL/SC reservation broken by a same-cache-line store from a neighbour can livelock; x86 has no
+// LL/SC and that argument does not exist here. `CoreAccount` IS cache-line aligned below, on its own
+// (much weaker) merits, which are spelled out at the `repr(align)` attribute — do not read that as
+// the A72 fix having been ported.
+
+/// The rolling load window. ONE constant, expressed in milliseconds, from which both denominations
+/// are derived — the TSC budget a core folds spans against ([`load_window_cyc`]) and the ms-clock
+/// bounds a remote reader thresholds against ([`LOAD_STALE_MS`], and the pegged-core test in
+/// [`core_load`]). Keeping it single-sourced is what makes "the window has elapsed" mean the same
+/// thing to the writer and to the reader despite their using different clocks.
+const LOAD_WINDOW_MS: u64 = 250;
+
+/// The rolling load window in TSC cycles. Read from the calibrated `apic::tsc_hz()` on every call
+/// rather than cached: unlike the aarch64 twin's `CNTFRQ_EL0` sysreg read this is one relaxed atomic
+/// load, so a cache would buy nothing and would risk latching the pre-calibration fallback forever.
+///
+/// Before calibration (`tsc_hz() == 0`) it falls back to a nominal 2.3 GHz — the Ivy Bridge
+/// MacBookPro10,1 base clock. That only stretches or shrinks the SMOOTHING span; it cannot bias the
+/// percent, which is a ratio of two spans measured in the same units. Calibration completes at
+/// `t~116ms` and the scheduler is not enabled until `t~243ms`, so on a real boot the fallback is
+/// never actually the number in force.
+#[inline]
+fn load_window_cyc() -> u64 {
+    let hz = apic::tsc_hz();
+    let hz = if hz == 0 { 2_300_000_000 } else { hz };
+    hz / 1000 * LOAD_WINDOW_MS
+}
+
+/// Sentinel `recent_pct` meaning "no window has completed yet" — fall back to the partial window.
+const LOAD_PCT_NONE: u32 = u32::MAX;
+
+/// Sentinel `last_acct_ms` meaning "this core has NEVER folded a span", i.e. it has never been inside
+/// `run()`. A dedicated out-of-band value rather than `0`, because `arch::ms()` legitimately reads 0
+/// during early boot and "folded at ms 0" must not be confusable with "never folded" — that
+/// confusion is precisely what would make a never-scheduled core print a fabricated `0%`.
+const ACCT_MS_NEVER: u64 = u64::MAX;
+
+/// One core's busy-time accounting slot.
+///
+/// SINGLE-WRITER: every field is written ONLY by the owning core's `run()` loop, so `Relaxed` is
+/// sufficient for the accounting arithmetic. Read cross-core by introspection ([`core_load`]) only —
+/// never consulted on any scheduling path in this arc.
+///
+/// R1/§10 — the writes are NOT uniformly IF=0, and the distinction is worth stating precisely rather
+/// than glossing. The busy-arm fold runs at the loop top with interrupts masked; the IDLE-arm fold
+/// runs immediately after `enable_and_hlt` returns, i.e. with IF=1, so its load-add-store sequence is
+/// technically interruptible. It is still sound, for a reason stronger than masking: **no interrupt
+/// path anywhere touches `ACCT`.** The timer/IPI handlers write `SCHED[cpu]`, `percpu`, and the APIC,
+/// and `timer_preempt` returns early on `current == 0` — which is exactly the state of a core running
+/// that fold. There is therefore no writer to race with and no update that can be lost.
+///
+/// CACHE-LINE ALIGNED, on x86's own merits and NOT as a port of the aarch64 `PaddedUsize` fix (whose
+/// justification is A72 LL/SC livelock and does not exist on this arch). The merit here is plain
+/// write-write false sharing: the slot is ~72 bytes of atomics that the owning core STORES to on
+/// every dispatch pass — thousands of times a second, per core — and eight unaligned slots would pack
+/// two or three cores' write sets into one 64-byte line, so core 3's fold would steal the line from
+/// core 4's in a loop that is on the dispatch path. 128 rather than 64: Sandy/Ivy Bridge L2 fetches
+/// adjacent line pairs, making the effective sharing granularity 128 bytes on the bench machine. The
+/// cost is 1 KiB of `.bss` for `MAX_CPUS = 8`.
+#[repr(align(128))]
+struct CoreAccount {
+    /// Cumulative context switches INTO a task on this core (one per busy dispatch). This is the
+    /// SAME quantity `CPU_BUSY[cpu]` counts; it is carried here as well so the witness line and the
+    /// `CoreLoad` contract need not reach across to the other feed, and so that a divergence between
+    /// the two is itself observable.
+    ctx_switches: AtomicU64,
+    /// TSC cycles spent EXECUTING tasks in the CURRENT (incomplete) window.
+    win_busy_cyc: AtomicU64,
+    /// TSC cycles spent IDLE (`hlt`, empty queue) in the current window. The window rolls over when
+    /// `win_busy_cyc + win_idle_cyc` reaches [`load_window_cyc`].
+    win_idle_cyc: AtomicU64,
+    /// Busy percent (0..=100) of the last COMPLETED window, or [`LOAD_PCT_NONE`] before the first.
+    recent_pct: AtomicU32,
+    /// `arch::ms()` at the most recent fold, or [`ACCT_MS_NEVER`]. Milliseconds, not cycles — this is
+    /// the one quantity a REMOTE core evaluates, and `rdtsc` is per-core (see the module note above).
+    /// A core going round the dispatch loop folds a span every pass, so this stays fresh; a core that
+    /// left `run()`, or that never entered it, stops touching it and reads STALE.
+    last_acct_ms: AtomicU64,
+    /// R1/M3 — the TSC instant at which the CURRENTLY-EXECUTING task's span began on this core, or 0
+    /// when this core is not inside a task. Published immediately before `switch_context` and cleared
+    /// by the fold in [`account`](Self::account), so while it is non-zero the span it anchors is
+    /// provably NOT yet in `win_busy_cyc` and adding `now - run_t0` cannot double-count.
+    ///
+    /// READ BY THE OWNING CORE ONLY. This is the one place the aarch64 twin's age-on-read is adopted,
+    /// and it is adopted for exactly the case where the cross-core `rdtsc` objection does not apply.
+    /// See [`live_span_cyc`](Self::live_span_cyc) for the soundness argument, which is much simpler
+    /// here than on aarch64 — it needs no fences at all.
+    run_t0: AtomicU64,
+    /// Seqlock sequence for the last-task pair: even = stable, odd = write in progress.
+    last_seq: AtomicU64,
+    /// Id of the last task dispatched here (0 = none yet).
+    last_id: AtomicU64,
+    /// `&'static str` name of the last task, split into `.as_ptr()` + `.len()`, both published under
+    /// the seqlock. A `&'static str` is a 16-byte fat pointer no single atomic can hold, so the
+    /// seqlock is what makes the cross-core read of the pair sound (never a torn ptr-from-A /
+    /// len-from-B).
+    last_name_ptr: AtomicUsize,
+    last_name_len: AtomicUsize,
+}
+
+impl CoreAccount {
+    const fn new() -> Self {
+        CoreAccount {
+            ctx_switches: AtomicU64::new(0),
+            win_busy_cyc: AtomicU64::new(0),
+            win_idle_cyc: AtomicU64::new(0),
+            recent_pct: AtomicU32::new(LOAD_PCT_NONE),
+            last_acct_ms: AtomicU64::new(ACCT_MS_NEVER),
+            run_t0: AtomicU64::new(0),
+            last_seq: AtomicU64::new(0),
+            last_id: AtomicU64::new(0),
+            last_name_ptr: AtomicUsize::new(0),
+            last_name_len: AtomicUsize::new(0),
+        }
+    }
+
+    /// Fold one measured span into the rolling window (owning core only). Exactly one of
+    /// `busy_cyc` / `idle_cyc` is non-zero per call: `account(delta, 0)` after a task's execution span
+    /// (measured around `switch_context`), `account(0, delta)` after an idle `hlt`. On window
+    /// completion — busy+idle reaching the ~250 ms budget — it snapshots the busy TIME fraction and
+    /// resets.
+    ///
+    /// Marking the slot fresh is the FIRST thing it does, so a core that is dispatching is provably
+    /// tracked even if the span it just measured was zero-length.
+    #[inline]
+    fn account(&self, busy_cyc: u64, idle_cyc: u64) {
+        self.last_acct_ms.store(crate::arch::ms(), Ordering::Relaxed);
+        // R1/M3: ANY fold ends the in-flight span — whatever was executing has now been measured and
+        // is about to land in `win_busy_cyc`, so `live_span_cyc` must stop aging it. Cleared here
+        // rather than in the busy arm alone so both call sites are covered with no branch.
+        self.run_t0.store(0, Ordering::Relaxed);
+        let busy = self.win_busy_cyc.load(Ordering::Relaxed) + busy_cyc;
+        let idle = self.win_idle_cyc.load(Ordering::Relaxed) + idle_cyc;
+        let total = busy + idle;
+        if total >= load_window_cyc() {
+            // `total >= budget > 0`, so the division is safe and the result is already 0..=100.
+            self.recent_pct.store((busy * 100 / total) as u32, Ordering::Relaxed);
+            self.win_idle_cyc.store(0, Ordering::Relaxed);
+            self.win_busy_cyc.store(0, Ordering::Relaxed);
+        } else {
+            self.win_idle_cyc.store(idle, Ordering::Relaxed);
+            self.win_busy_cyc.store(busy, Ordering::Relaxed);
+        }
+    }
+
+    /// Publish the last-dispatched task's id + name under the seqlock (owning core only): bump the
+    /// sequence ODD, write the pair, bump it EVEN. A reader that sees a stable even sequence on both
+    /// sides of its loads therefore has a consistent snapshot.
+    #[inline]
+    fn note_last(&self, id: u64, name: &'static str) {
+        let seq = self.last_seq.load(Ordering::Relaxed);
+        self.last_seq.store(seq + 1, Ordering::Release); // odd: write in progress
+        self.last_id.store(id, Ordering::Relaxed);
+        self.last_name_ptr.store(name.as_ptr() as usize, Ordering::Relaxed);
+        self.last_name_len.store(name.len(), Ordering::Relaxed);
+        self.last_seq.store(seq + 2, Ordering::Release); // even: stable
+    }
+
+    /// R1/M3 — TSC cycles this core has ALREADY spent inside the task it is executing RIGHT NOW, or 0
+    /// if it is not inside one.
+    ///
+    /// **CALLABLE ONLY ON THE OWNING CORE.** `rdtsc` is per-core, so `now_cycles() - run_t0` is an
+    /// elapsed time only when both readings come from the same counter. [`core_load`] enforces this
+    /// with an explicit `cpu == meter_current_cpu()` test and passes 0 otherwise; a remote caller
+    /// simply loses the in-flight term, which is the pre-R1 behaviour.
+    ///
+    /// SOUNDNESS, and it is much simpler than the aarch64 twin's — it needs no fences and no
+    /// double-count argument. `run_t0` is written only by THIS core's scheduler loop, and that loop
+    /// runs only when no task is running on this core. So while the caller (a task, or the scheduler
+    /// itself) is executing here, the writer provably is not: there is no concurrency to order. And
+    /// the span cannot be counted twice, because `account()` clears `run_t0` BEFORE the busy total it
+    /// folds becomes visible to anyone — while `run_t0` is non-zero its span is by construction not
+    /// yet in `win_busy_cyc`. `emit_load_witness` additionally takes its snapshot with interrupts
+    /// masked, so not even a preemption can land between the two reads.
+    #[inline]
+    fn live_span_cyc(&self) -> u64 {
+        let t0 = self.run_t0.load(Ordering::Relaxed);
+        if t0 == 0 { 0 } else { crate::arch::now_cycles().wrapping_sub(t0) }
+    }
+
+    /// Busy percent (0..=100) for the window AS IT STANDS, with `live` the in-flight execution span
+    /// (see [`live_span_cyc`](Self::live_span_cyc)); pass 0 when the caller is not the owning core.
+    /// Three cases, in the order tested:
+    ///
+    ///   1. The in-flight span alone covers a whole window: the last ~250 ms were, in their entirety,
+    ///      this core executing one task. That is 100 %, MEASURED, and no other term can change it.
+    ///   2. The current window already holds a full budget's worth of measured time (or no window has
+    ///      ever completed, so there is no history to consult): report the measured occupancy alone.
+    ///   3. The window is still short: report the measured part at FULL weight and fill only the
+    ///      REMAINDER from the last completed window's rate. That is what keeps the number continuous
+    ///      — a core that just rolled its window does not drop to a noisy two-millisecond sample —
+    ///      while bounding how much of the answer can be historical: the stale term's weight is
+    ///      exactly the fraction of the window not yet measured, and it decays to zero as the window
+    ///      fills.
+    ///
+    /// R1/M1 — CASE 3 IS THE ONE WAY THIS INSTRUMENT CAN OVER-REPORT, and the bound is worth stating
+    /// because a previous revision of these comments claimed it could never happen. A core that was
+    /// 100 % busy in window N-1 and goes fully idle in window N reads its OLD percent at the start of
+    /// N and decays linearly to 0 across ~250 ms, rather than dropping instantly. It is bounded by one
+    /// window, it is always decaying, and it cannot fire for a core that has been idle for a whole
+    /// window — but a core that finished work < 250 ms before a witness line WILL print a non-zero
+    /// percent. Any refutation criterion phrased as "a percent on a core PULSE-A shows at `busy=0`"
+    /// must tolerate that, or it is a false-refutation trigger.
+    ///
+    /// The alternative — dropping the blend and reporting `busy/elapsed` alone — is strictly worse:
+    /// immediately after a roll `elapsed` is one span, so a single 2 ms busy sample would print 100 %
+    /// outright. The blend trades an unbounded sampling error for a bounded, decaying one.
+    ///
+    /// Lock-free, allocation-free, no CROSS-core TSC subtraction.
+    fn busy_pct(&self, live: u64) -> u32 {
+        let budget = load_window_cyc();
+        if live >= budget {
+            return 100; // case 1 — the whole window is one uninterrupted execution span
+        }
+        let busy = self.win_busy_cyc.load(Ordering::Relaxed) + live;
+        let idle = self.win_idle_cyc.load(Ordering::Relaxed);
+        let elapsed = busy + idle;
+        let recent = self.recent_pct.load(Ordering::Relaxed);
+        if elapsed >= budget || recent == LOAD_PCT_NONE {
+            if elapsed == 0 {
+                0
+            } else {
+                ((busy * 100 / elapsed) as u32).min(100)
+            }
+        } else {
+            // `busy` < 2*budget and `recent` <= 100, so both products stay far inside u64.
+            let rem = budget - elapsed;
+            (((busy * 100 + recent as u64 * rem) / budget) as u32).min(100)
+        }
+    }
+
+    /// Is this core's load being accounted RIGHT NOW — i.e. is `busy_pct` a LIVE number?
+    ///
+    /// True when the owning core folded a span within [`LOAD_STALE_MS`]. False when the slot has never
+    /// been touched (a core that has not entered `run()` — the BSP before its handoff, an AP not yet
+    /// released) or has gone stale (a core that LEFT `run()`, or one masking its own timer under a
+    /// cooperative ring-3 task). An untracked core is reported `--` by every honest view rather than
+    /// as its frozen last percent, and never as `0%` — a fabricated zero on a core that is actually
+    /// pegged is the exact failure this arc exists to make impossible.
+    ///
+    /// This is the fold-age half of the question only. [`core_load`] ORs in the pegged-core arm, which
+    /// re-admits a core that stopped folding because it is inside one long execution span; a caller
+    /// wanting the raw staleness reads `fold_age_ms`.
+    fn tracked(&self) -> bool {
+        self.fold_age_ms() < LOAD_STALE_MS
+    }
+
+    /// Milliseconds since this core last folded a span, or [`ACCT_MS_NEVER`] if it never has. The raw
+    /// quantity [`tracked`](Self::tracked) thresholds.
+    ///
+    /// `saturating_sub` rather than `wrapping_sub`: `arch::ms()` is monotone, so a "negative" age can
+    /// only come from a torn or racing read, and clamping it to 0 (freshest) is the reading that
+    /// cannot invent staleness out of a race.
+    fn fold_age_ms(&self) -> u64 {
+        let last = self.last_acct_ms.load(Ordering::Relaxed);
+        if last == ACCT_MS_NEVER {
+            return ACCT_MS_NEVER;
+        }
+        crate::arch::ms().saturating_sub(last)
+    }
+
+    /// Read the last-task pair with a bounded seqlock retry. The `&'static str` reconstruction is
+    /// sound: the writer only ever publishes a live `'static` name's `(ptr, len)`, and the seqlock
+    /// guarantees the reader sees a MATCHING pair.
+    ///
+    /// R1/L1 — the `fence(Acquire)` before the second sequence read is the canonical seqlock shape and
+    /// is not decoration. An Acquire *load* orders what follows it; what this reader needs is for the
+    /// data loads ABOVE to be ordered before the validating load BELOW, which is a fence's job. On
+    /// x86-TSO loads are never reordered with loads, so the code was already correct on this machine —
+    /// the fence buys conformance to the memory model rather than to the microarchitecture, and costs
+    /// nothing (it compiles to no instruction on x86-64).
+    fn last_task(&self) -> (u64, &'static str) {
+        for _ in 0..8 {
+            let s1 = self.last_seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                continue; // write in progress; retry
+            }
+            let id = self.last_id.load(Ordering::Relaxed);
+            let ptr = self.last_name_ptr.load(Ordering::Relaxed);
+            let len = self.last_name_len.load(Ordering::Relaxed);
+            core::sync::atomic::fence(Ordering::Acquire);
+            if self.last_seq.load(Ordering::Relaxed) != s1 {
+                continue; // changed under us; retry
+            }
+            if ptr == 0 || len == 0 {
+                return (id, "-");
+            }
+            // SAFETY: `ptr`/`len` were published together (seqlock-consistent) from a live
+            // `&'static str`, so this reconstructs that exact, still-live string slice.
+            let name = unsafe {
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr as *const u8, len))
+            };
+            return (id, name);
+        }
+        (self.last_id.load(Ordering::Relaxed), "?")
+    }
+}
+
+/// How long a slot may go unfolded before its percent stops being reported as live. Two load windows
+/// of slack, so a slow rollover never mislabels a genuinely-scheduled core as stale, while a core that
+/// has actually stopped dispatching is disqualified within half a second.
+const LOAD_STALE_MS: u64 = 2 * LOAD_WINDOW_MS;
+
+static ACCT: [CoreAccount; MAX_CPUS] = [const { CoreAccount::new() }; MAX_CPUS];
+
+/// A snapshot of one core's live scheduler load. Returned by [`core_load`]; consumed by the
+/// `[schedx86] load` witness. Every field is a point-in-time read — introspection only, never
+/// consulted on a scheduling path in this arc.
+///
+/// Mirrors the aarch64 `CoreLoad` contract field-for-field with three deliberate divergences:
+///   * there is no `busy_pct_recent` EXCLUDING a service band, because x86 has no `PRIO_SERVICE`
+///     (`spawn_prio` and the band are Arc 1's business);
+///   * the freshness field is `fold_age_ms`, not `fold_age_cyc`. Same quantity, different
+///     denomination, and the rename is deliberate rather than cosmetic: on this arch that age MUST be
+///     measured in the globally-coherent ms clock, because `rdtsc` is per-core (see the module note
+///     at `CoreAccount`). A field named `..._cyc` holding milliseconds would be the kind of quiet lie
+///     this instrument exists to prevent;
+///   * there is an extra field, `pegged`, which aarch64 has no need of. See it.
+pub struct CoreLoad {
+    /// Busy TIME fraction (0..=100). Only meaningful when `tracked` is true, and its PROVENANCE is
+    /// `pegged` — read the two together or not at all.
+    pub busy_pct_recent: u32,
+    /// Cumulative context switches into a task on this core since boot.
+    pub ctx_switches: u64,
+    /// Id of the last task dispatched on this core (0 = none yet).
+    pub last_task_id: u64,
+    /// Name of the last task dispatched on this core ("-" = none yet). While `pegged` is true this is
+    /// ALMOST CERTAINLY also the task the core is executing right now — but "almost" is the honest
+    /// word and R2/L1 is why. [`core_load`] loads `current` before this name precisely so the name is
+    /// as-new-or-newer than the `current` that set `pegged`, which closes the stale-name direction;
+    /// the remaining window is a remote dispatch landing between the two loads, which the emit-side
+    /// interrupt mask cannot help with because the racing writer is another core. Best-effort and
+    /// stale-by-one-able, not proven. See the note at the `current_raw` load.
+    pub last_task: &'static str,
+    /// Is `busy_pct_recent` a LIVE number? False for a core that has never entered `run()` or has
+    /// stopped folding spans WITHOUT a task executing; such a core renders `--`, never a percent.
+    pub tracked: bool,
+    /// R1/H2 — WAS `busy_pct_recent` MEASURED, OR INFERRED? True means inferred: no span was folded
+    /// for this window, and the 100 % was DEDUCED from a live `current` plus a fold age past a full
+    /// window (see [`core_load`]). False means every cycle in the number was measured and folded.
+    ///
+    /// This field exists because the arc's own thesis demands it. The module argues at length that
+    /// `--` must not collapse into `0%` — that the absence of a measurement must not print as one.
+    /// An INFERENCE printed as a measurement is the same category error one level up, and worse,
+    /// because the inferred value is the extreme of the scale: an inferred `100%` is byte-identical to
+    /// a core that folded a full window of real busy spans. Every renderer of this struct MUST make
+    /// the two distinguishable; `emit_load_witness` does it with a trailing `*`.
+    ///
+    /// It also decides whether the arc's headline cross-check can be scored at all. If the core
+    /// PULSE-A reports at 100 % reads 100 % here via the pegged arm, the two feeds are not agreeing
+    /// for independent reasons — `current != 0` and "this core is dispatching" are near-identical
+    /// facts, so the agreement would be structural rather than evidential.
+    pub pegged: bool,
+    /// Milliseconds since this core last folded a load span; [`ACCT_MS_NEVER`] if it never has.
+    /// `tracked` answers "is this worth PRINTING" with ~500 ms of slack; this is the raw measurement,
+    /// so a future caller asking the much tighter question "may I hand this core work only it can
+    /// run" can pick its own bound.
+    pub fold_age_ms: u64,
+}
+
+/// Read a core's live load: busy-TIME percent over the rolling ~250 ms window, whether that percent
+/// was measured or inferred, cumulative context switches, the last task dispatched, and the freshness
+/// of all of it. Allocation-free and lock-free; callable from ANY core. Introspection only.
+///
+/// An out-of-range core reads as never-tracked rather than as zero load — the same distinction the
+/// `tracked` flag draws for a real core.
+pub fn core_load(cpu: usize) -> CoreLoad {
+    if cpu >= MAX_CPUS {
+        return CoreLoad {
+            busy_pct_recent: 0,
+            ctx_switches: 0,
+            last_task_id: 0,
+            last_task: "-",
+            tracked: false,
+            pegged: false,
+            fold_age_ms: ACCT_MS_NEVER,
+        };
+    }
+    let acct = &ACCT[cpu];
+    // R2/L1 — `current` is loaded BEFORE the task name, not after, and the reason is an ordering the
+    // previous revision claimed but did not establish. The writer's order per dispatch is
+    // `note_last(T)` then `current = T`; a reader that takes the NAME first and `current` second can
+    // therefore observe a name from the previous dispatch beside a `current` from the new one, and the
+    // writer's ordering buys it nothing. Reading `current` first inverts that: the `note_last(T)` that
+    // precedes the `current = T` we observe has already happened, so the name we read afterwards is T
+    // or NEWER.
+    //
+    // "Or newer" is the honest residue, and it is not closed here. If the core dispatches again
+    // between the two loads the name advances past the `current` we tested — but that requires the
+    // core to have folded a span, which makes `fold_age_ms` fresh and `pegged` false, so the row is
+    // not printed with a name at all. What remains is a genuine tens-of-nanoseconds race against a
+    // <=4/s dispatch rate on a core that is pegged by definition (order 1e-7 per emit). The mask in
+    // `emit_load_witness` does NOT help, because the racing writer is a remote core. So: the pegged
+    // attribution is BEST-EFFORT and stale-by-one-able, not proven — treat a `100%*(name)` as strong
+    // evidence about the core and good-but-unwarranted evidence about the name.
+    let current_raw = SCHED[cpu].current.load(Ordering::Acquire);
+    let (last_task_id, last_task) = acct.last_task();
+    let fold_age_ms = acct.fold_age_ms();
+    // R1/M3 — SELF AGE-ON-READ. The module declines aarch64's PULSE-5 wholesale because
+    // `now_cycles() - their_t0` is unsound across cores. That argument is correct and it does NOT
+    // apply when the reader IS the owning core, where the subtraction is the same same-core rdtsc
+    // pair the fold already performs twice per dispatch. Declining it there was a real loss of
+    // resolution on the one core the survey most wants a number for: the witness is emitted from the
+    // render task itself, at the END of its pass, and that task's span is folded only when it later
+    // blocks in `recv` — so before this arm c1 reported its own load missing most of the current pass,
+    // every single time, biased low by roughly 2x at exactly the sample point.
+    let live = if cpu == meter_current_cpu() { acct.live_span_cyc() } else { 0 };
+    // A CORE PEGGED BY ONE LONG SPAN MUST READ PEGGED, NOT `--`. This was found by the arc's own QEMU
+    // smoke, which printed `c2=64%` and then `c2=--` on the next 5 s line: a core that had stopped
+    // folding because it was INSIDE a task, not because it had stopped working. `--` is the right
+    // answer for "no measurement"; it is the wrong answer for "one measurement that has not finished",
+    // and on a balancer's input those are opposite readings.
+    //
+    // The test is sound on this arch, which is why it is worth having:
+    //   * `SCHED[cpu].current != 0` says a task is executing here. It is published Release before the
+    //     switch and cleared AFTER the fold that closes the span, so a reader can never see a live
+    //     `current` paired with an already-banked span.
+    //   * `fold_age_ms >= LOAD_WINDOW_MS` says the span it is executing has already outlasted a whole
+    //     window. The two together mean the last window was, in its entirety, this core running one
+    //     task — which is 100%, and no other term can change it.
+    // Both quantities are globally coherent (an atomic pointer and the core-0 ms clock), so this
+    // reaches aarch64 PULSE-5's case-1 conclusion WITHOUT the cross-core `rdtsc` subtraction that
+    // mechanism would otherwise require and that this arch cannot honestly perform.
+    //
+    // `live == 0` gates it: when we DO have the in-flight span (the self row) the number is measured
+    // and needs no inference, and `busy_pct`'s case 1 reaches the identical 100% by measurement. So
+    // the pegged arm is, by construction, a REMOTE-core fallback — which is also why marking it on the
+    // wire matters (R1/H2): everything it produces is deduced, not counted.
+    //
+    // Below `LOAD_WINDOW_MS` a remote core's in-flight span is simply not counted yet, so the
+    // instrument under-reports it for at most one window. That direction is the safe one — an inflated
+    // percent would send a future balancer AWAY from a core that is actually free. It is NOT, however,
+    // a claim that the instrument can never over-report: `busy_pct`'s stale blend can, by up to one
+    // decaying window, and that bound is documented there (R1/M1).
+    let pegged = live == 0
+        && fold_age_ms != ACCT_MS_NEVER
+        && fold_age_ms >= LOAD_WINDOW_MS
+        && current_raw != 0;
+    // R2/H1 — THERE ARE THREE INDEPENDENT REASONS A ROW IS LIVE, AND ALL THREE MUST BE NAMED HERE.
+    // This predicate was `pegged || acct.tracked()`, which was correct only until `pegged` was gated
+    // on `live == 0` to make it a remote-only fallback. That gate silently removed the self row's
+    // rescue: the witness is emitted from INSIDE the render task, so for c1 `run_t0` is always set,
+    // `live > 0`, and `pegged` is therefore always FALSE — collapsing `tracked` to
+    // `fold_age_ms < LOAD_STALE_MS`, which for the self row IS THE CURRENT PASS'S DURATION. Any render
+    // pass reaching the emit >= 500 ms after its dispatch would have printed `c1=--`, the absence
+    // token, for the core holding the longest, cleanest, same-core-measured span on the machine —
+    // while `busy_pct`'s case 1 was sitting right there ready to return a MEASURED 100%. The emitter
+    // tests `!tracked` first, so the absence token would have won over the measurement. Boot AH's
+    // first render pass is 237 ms (dispatch 2553 ms -> first depth line 2790 ms) against that 500 ms
+    // threshold: a 2.1x margin on a pass that builds a ~28 MiB back buffer, which a heavier first
+    // paint (UNAOS_WC compositor path, 2880x1800) crosses. It would also have self-tripped the arc's
+    // own refutation criterion, which declares any steady-line `--` a defect.
+    //
+    // The three reasons, none of which implies another:
+    //   1. `live > 0`  — we HOLD a measured in-flight span for this core (self row only). A core
+    //      executing a task is being accounted by definition; this is the most direct evidence of
+    //      liveness there is, and it is exactly what the previous predicate omitted.
+    //   2. `pegged`    — we can INFER the core is inside a long span (remote row).
+    //   3. `acct.tracked()` — it folded a span recently (the fold-age test, which governs every core
+    //      that is neither executing nor inferable: idle cores, and cores that left `run()`).
+    // Anything added later that produces a percent must extend this list too, or it will be computed
+    // and then thrown away behind a `--`.
+    let tracked = live > 0 || pegged || acct.tracked();
+    CoreLoad {
+        busy_pct_recent: if pegged { 100 } else { acct.busy_pct(live) },
+        ctx_switches: acct.ctx_switches.load(Ordering::Relaxed),
+        last_task_id,
+        last_task,
+        tracked,
+        pegged,
+        fold_age_ms,
+    }
+}
+
+/// A bounded, allocation-free line buffer for [`emit_load_witness`], with an explicit overflow flag.
+/// Truncation is recorded rather than silent: a witness that quietly loses its last two cores would
+/// read as a shorter machine, which is exactly the class of lie this arc is built to exclude.
+struct LineBuf {
+    buf: [u8; LINEBUF_CAP],
+    len: usize,
+    overflow: bool,
+}
+
+/// Capacity of [`LineBuf`], with the bound proved rather than guessed — and R2/L2 corrected the proof
+/// after the first version got the per-core term and the cap suffix wrong. It held, but a comment that
+/// says "proved" and then miscounts is the exact class this arc exists to police, so the arithmetic is
+/// spelled out term by term. Worst case for `MAX_CPUS = 8`:
+///
+/// | term | bytes |
+/// | --- | --- |
+/// | `"[schedx86] load"` | 15 |
+/// | tag (`"-prejoin"`, budgeted) | 16 |
+/// | 8 x `" cN=100%*(<16-byte name>+)"` — space, `cN=`, `100`, `%`, `*`, `(`, name, clip `+`, `)` = 28 | 224 |
+/// | `" sw=["` + 8 x 20 digits of `u64::MAX` + 7 commas + `"]"` | 173 |
+/// | `" q=["` + 8 x 10 digits + 7 commas + `"]"` | 92 |
+/// | `" cores=8/NNN <CAPPED>"` | 21 |
+/// | **total** | **541** |
+///
+/// 768 therefore carries ~227 bytes of headroom, enough for a further field without re-deriving this.
+/// [`LineBuf`] reports overflow on the wire regardless, so the bound is belt and braces.
+const LINEBUF_CAP: usize = 768;
+
+/// Longest task name the witness will print for a pegged core, in bytes. Bounds the line (see
+/// [`LINEBUF_CAP`]); truncation is at a UTF-8 character boundary and is marked with a trailing `+`
+/// (R2/L3 — an earlier revision of this line said `…`, which the code never emitted).
+const PEG_NAME_CAP: usize = 16;
+
+impl LineBuf {
+    const fn new() -> Self {
+        LineBuf { buf: [0; LINEBUF_CAP], len: 0, overflow: false }
+    }
+    /// The accumulated bytes as a `&str`. Everything written is ASCII produced by this module's own
+    /// `write!`s, plus (for pegged cores only) a task name — which is a `&'static str` literal from a
+    /// spawn site, so the slice is valid UTF-8; the `from_utf8` is checked rather than assumed anyway,
+    /// because an instrument that can emit garbage bytes on a bad read is worse than one that says so.
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("<witness: non-utf8>")
+    }
+}
+
+/// One core's row in the witness snapshot. Taken ONCE per core under a single interrupt mask (see
+/// [`emit_load_witness`]) so that a row's percent, its dispatch count and its queue depth all describe
+/// the same instant — a reader diffing `sw` against a percent on the same line is exactly what the
+/// cross-check criterion asks for, and two reads at two instants would quietly break it.
+#[derive(Clone, Copy)]
+struct LoadRow {
+    pct: u32,
+    tracked: bool,
+    pegged: bool,
+    name: &'static str,
+    sw: u64,
+    q: usize,
+}
+
+impl LoadRow {
+    const fn blank() -> Self {
+        LoadRow { pct: 0, tracked: false, pegged: false, name: "-", sw: 0, q: 0 }
+    }
+}
+
+impl core::fmt::Write for LineBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        if self.len + b.len() > LINEBUF_CAP {
+            self.overflow = true;
+            return Err(core::fmt::Error);
+        }
+        self.buf[self.len..self.len + b.len()].copy_from_slice(b);
+        self.len += b.len();
+        Ok(())
+    }
+}
+
+/// SCHEDLOAD-X86 — the always-on per-core load witness. Emits ONE serial line:
+///
+/// ```text
+/// [schedx86] load c0=0% c1=3% c2=-- c3=100%*(pulse) c4=0% c5=0% c6=0% c7=11% sw=[..] q=[..]
+/// ```
+///
+/// THE PER-CORE TOKEN HAS EXACTLY THREE FORMS, and the distinction between them is the instrument:
+///
+/// | form | meaning |
+/// | --- | --- |
+/// | `cN=NN%` | **MEASURED.** Every cycle in the number was folded from a real span over the window. |
+/// | `cN=100%*(name)` | **INFERRED.** No span was folded for this window; the value is deduced from a live `current` plus a fold age past a whole window. `name` is the task holding the core. |
+/// | `cN=--` | **ABSENT.** No live measurement at all — the core never entered `run()`, or stopped folding with nothing executing. |
+///
+/// `sw` is cumulative context switches per core; `q` is the instantaneous ready-queue depth. `tag` is
+/// appended to the `load` token (`""` for the steady heartbeat, `"-prejoin"` for the boot one-shot).
+///
+/// WHY THREE FORMS AND NOT TWO. `0%` is a MEASUREMENT — this core folded spans and none were busy.
+/// `--` is the ABSENCE of one. Collapsing them would make an unaccounted core indistinguishable from a
+/// provably idle one, which is how an instrument ends up certifying the very imbalance it was built to
+/// detect. `100%*` is the same argument one level up (R1/H2): an inferred value printed identically to
+/// a measured one is the same category error, and worse here because the inferred value is the extreme
+/// of the scale. Without the marker the arc's headline PULSE-A cross-check cannot be scored — a core
+/// agreeing at 100 % via the pegged arm agrees for a reason that is near-identical to PULSE-A's own
+/// ("this core is dispatching"), i.e. structurally rather than evidentially.
+///
+/// WHY THE SNAPSHOT IS TAKEN WITH INTERRUPTS MASKED (R1/H1) — this is a correctness requirement, not
+/// tidiness. `run_queue_len` acquires `RUN_QUEUES[c]`, a plain `spin::Mutex` with NO IRQ masking, and
+/// its own doc names it a WEDGE-4 `<W1>` hazard site. This witness runs from `x86_render_service` — a
+/// PREEMPTIBLE task on the core that owns the panel — so unmasked it would be a permanent, silent
+/// self-deadlock waiting to happen: preempt the render task while it holds `RUN_QUEUES[1]`, and `run()`
+/// on the same core then needs that identical lock at IF=0 to requeue the very task that holds it.
+/// Nothing breaks the cycle, nothing panics, and because this witness is emitted FROM the dead task,
+/// no instrument on the machine would report it. Masking removes the preemption that forms the cycle.
+///
+/// THE MASKED SECTION IS BOUNDED AND TAKES NOTHING ELSE. It is `n <= MAX_CPUS = 8` iterations of:
+/// a handful of relaxed atomic loads, one bounded (8-retry) seqlock read, and ONE `RUN_QUEUES[c]`
+/// acquisition held only across `len()` (a sum over `NUM_PRIORITIES = 4` `VecDeque::len`s). The locks
+/// are taken and released one at a time — never nested, so no lock-order inversion is possible — and
+/// no allocation, no UART and no other lock is touched inside. Order of tens of nanoseconds per core,
+/// sub-microsecond total.
+///
+/// R2/M2 — WHY THE PRINT IS OUTSIDE THE MASK, corrected. A previous revision of this comment argued
+/// that keeping `serial_println!` outside `without_interrupts` avoids "a guaranteed 8 ms of masked
+/// interrupts on the render core every 5 seconds". **That was a false premise**: `serial::_print`
+/// wraps its ENTIRE write in `interrupts::without_interrupts` itself (`serial.rs:105`), so the masked
+/// wire time happens either way and nesting would change nothing measurable.
+///
+/// The real reasons, both of which survive checking:
+///   * The snapshot is masked because `run_queue_len` NEEDS it (above). The print does not need it,
+///     and extending a mask past its justification is how a mask stops being reviewable.
+///   * The unmasked print cannot re-open the H1 shape, for a structural reason rather than a
+///     probabilistic one: `_print` takes `SERIAL1` with **`try_lock()`, never `lock()`**, defers to
+///     `serial_ring` when contended, and carries a lock-free `raw_byte` panic hatch. No core can
+///     block on the UART lock, so no holder can be preempted into a cycle. The serial path is
+///     immune to the wedge by construction, which is exactly why it is safe to leave alone.
+///
+/// Call from a rate-limited path only; it is introspection, never a scheduling decision.
+pub fn emit_load_witness(tag: &str) {
+    use core::fmt::Write;
+    let seen = crate::arch::acpi::cpu_count().max(1);
+    let n = meter_cpu_count();
+
+    // ── snapshot (IF=0) ─────────────────────────────────────────────────────────────────────────
+    let mut rows = [LoadRow::blank(); MAX_CPUS];
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for (c, row) in rows.iter_mut().enumerate().take(n) {
+            let ld = core_load(c);
+            *row = LoadRow {
+                pct: ld.busy_pct_recent,
+                tracked: ld.tracked,
+                pegged: ld.pegged,
+                name: ld.last_task,
+                sw: ld.ctx_switches,
+                q: run_queue_len(c),
+            };
+        }
+    });
+
+    // ── format + emit (IF restored) ─────────────────────────────────────────────────────────────
+    let mut w = LineBuf::new();
+    let _ = write!(w, "[schedx86] load{}", tag);
+    for (c, row) in rows.iter().enumerate().take(n) {
+        if !row.tracked {
+            let _ = write!(w, " c{}=--", c);
+        } else if row.pegged {
+            // R1/H2: the `*` says DEDUCED, not counted. The name is worth attributing here and only
+            // here — a pegged core is by definition executing something — but it is BEST-EFFORT, not
+            // proven: see R2/L1 at `core_load`'s `current_raw` load for the remaining stale-by-one
+            // window. Read the `*` as evidence about the core and the name as a strong hint.
+            let (nm, clip) = peg_name(row.name);
+            let _ = write!(w, " c{}={}%*({}{})", c, row.pct, nm, clip);
+        } else {
+            let _ = write!(w, " c{}={}%", c, row.pct);
+        }
+    }
+    let _ = write!(w, " sw=[");
+    for (c, row) in rows.iter().enumerate().take(n) {
+        let _ = write!(w, "{}{}", if c == 0 { "" } else { "," }, row.sw);
+    }
+    let _ = write!(w, "] q=[");
+    for (c, row) in rows.iter().enumerate().take(n) {
+        let _ = write!(w, "{}{}", if c == 0 { "" } else { "," }, row.q);
+    }
+    let _ = write!(w, "]");
+    // R1/L4: the column count is capped at `MAX_CPUS`. Say so when it BINDS, for the same reason
+    // `LineBuf` reports truncation — a witness that quietly drops its last two cores reads as a
+    // shorter machine, and the bench rMBP is exactly 8 logical cores, i.e. zero headroom.
+    if seen > n {
+        let _ = write!(w, " cores={}/{} <CAPPED>", n, seen);
+    }
+    if w.overflow {
+        // Say so on the wire rather than shipping a line that merely LOOKS complete.
+        serial_println!("{} <TRUNCATED>", w.as_str());
+    } else {
+        serial_println!("{}", w.as_str());
+    }
+}
+
+/// A task name clipped to [`PEG_NAME_CAP`] bytes at a UTF-8 character boundary, so the pegged-core
+/// suffix cannot blow the line bound derived at [`LINEBUF_CAP`]. Returns the slice and a marker that
+/// is `"+"` when clipping occurred — a silently shortened name is a name the reader would mis-match
+/// against a spawn site, which is the same lie class `<TRUNCATED>` and `<CAPPED>` exist to prevent.
+fn peg_name(name: &'static str) -> (&'static str, &'static str) {
+    if name.len() <= PEG_NAME_CAP {
+        return (name, "");
+    }
+    let mut end = PEG_NAME_CAP;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&name[..end], "+")
+}
 
 /// True once the BSP has finished SMP verification and turned scheduling on. Gates the timer
 /// handler's preempt branch so the pre-scheduler smoke test (`smp::verify_smp`) is provably
@@ -2740,6 +3496,15 @@ pub fn run_bsp(cpu: usize) -> ! {
     // work, and its absence with the spawn line present means the handoff block ran but `run()` was
     // never entered.
     serial_println!(":: SCHED-X86: BSP entered run loop cpu={} ::", cpu);
+    // SCHEDLOAD-X86 ANTI-WITNESS, and the only instant on the whole boot at which it can be taken.
+    // Core 0 has not yet folded a single span — it is one statement away from `run()` — while the APs
+    // have been dispatching since the scheduler was enabled. So this line MUST read `c0=--` with at
+    // least one other core carrying a percent. If it reads `c0=0%` the accounting is fabricating a
+    // measurement for a core it has never measured, and every "idle core" this arc reports downstream
+    // is worthless; if it reads `c0=--` and so does everything else, the APs are not being accounted
+    // either. Cheap enough to be unconditional (one line, once per boot) and it is the assertion the
+    // survey's Arc-0 anti-witness names.
+    emit_load_witness("-prejoin");
     run()
 }
 
@@ -2793,6 +3558,13 @@ fn run() -> ! {
         match next {
             Some(task) => {
                 CPU_BUSY[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
+                // SCHEDLOAD-X86: the busy-TIME feed's dispatch-side bookkeeping, taken here — the same
+                // site and the same instant as the event counter above, so the two instruments can
+                // never disagree about WHETHER a dispatch happened while disagreeing (as they must)
+                // about what it cost. `name`/`id` are read while `task` is still a `Box`, before it is
+                // handed to `into_raw`.
+                ACCT[cpu].ctx_switches.fetch_add(1, Ordering::Relaxed);
+                ACCT[cpu].note_last(task.id, task.name);
                 task.state.store(STATE_RUNNING, Ordering::Release);
                 // Fresh quantum + clear the reschedule signal, and publish the running priority so a
                 // remote waker/spawner can tell whether a newly-ready task should preempt us.
@@ -2844,9 +3616,35 @@ fn run() -> ! {
                 crate::arch::gdt::set_privilege_stack0(cpu, ktop);
                 percpu::set_syscall_kernel_rsp(ktop);
 
+                // SCHEDLOAD-X86: anchor the EXECUTION span. Taken as late as possible — the last
+                // statement before the switch — so the CR3 / TSS.RSP0 / syscall-rsp installs above are
+                // scheduler overhead and are charged to neither busy nor idle, which is the same
+                // accounting boundary the aarch64 twin draws. One `rdtsc`, no memory traffic.
+                //
+                // R1/M3: the same reading is also PUBLISHED (`run_t0`), which is what lets this core
+                // read its own in-flight span before the switch back closes it. Cleared by the fold
+                // below, so while it is set the span it anchors is provably not yet banked.
+                let busy_t0 = crate::arch::now_cycles();
+                ACCT[cpu].run_t0.store(busy_t0, Ordering::Relaxed);
                 unsafe {
                     switch_context(SCHED[cpu].scheduler_rsp.as_ptr(), entry_rsp);
                 }
+                // SCHEDLOAD-X86: ...and close it here, the first statement after the switch returns.
+                // Both readings are taken on THIS core, so the subtraction is a sound elapsed time
+                // even though `rdtsc` is per-core. `wrapping_sub` because the TSC is a free-running
+                // 64-bit counter.
+                //
+                // The span INCLUDES any interrupt handler that fired while the task was running: that
+                // time is the core being busy on this task's behalf. R1/M2 — but read that narrowly,
+                // because it is only true WHILE A TASK IS RUNNING. The idle arm below charges the
+                // waking handler to IDLE, so a core with an empty run queue that is saturated
+                // servicing device IRQs reads 0%, not busy. That is a real blind spot in what this
+                // instrument can see, not an arithmetic bug, and it is not hypothetical: core 0 is the
+                // sole advancer of `APIC_TICKS`, so it carries a strictly larger ISR share than any AP
+                // while having nothing pinned to it, and will report 0% on every line regardless.
+                // Anything that balances against these numbers must know that ISR load is invisible
+                // here. Documented in `scheduler.md` under the SCHEDLOAD-X86 limits.
+                ACCT[cpu].account(crate::arch::now_cycles().wrapping_sub(busy_t0), 0);
 
                 // --- The task switched back to us (yield / preempt / block / exit). IF=0. ---
                 SCHED[cpu].current.store(0, Ordering::Release);
@@ -2894,7 +3692,15 @@ fn run() -> ! {
                 // lost. On wake we loop back to the top (which `cli`s) and re-check the queue +
                 // sleepers.
                 CPU_IDLE[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
+                // SCHEDLOAD-X86: the IDLE span, measured the same way and on the same core. It runs
+                // from just before the `sti; hlt` to just after the waking interrupt returns past it,
+                // so it counts the handler that woke us as idle time. That is a deliberate and bounded
+                // over-count of idleness — one interrupt's worth per idle pass, microseconds against a
+                // ~1 ms tick — and it errs in the safe direction: this instrument can under-report a
+                // core's load, never invent load that is not there.
+                let idle_t0 = crate::arch::now_cycles();
                 x86_64::instructions::interrupts::enable_and_hlt();
+                ACCT[cpu].account(0, crate::arch::now_cycles().wrapping_sub(idle_t0));
             }
         }
     }
