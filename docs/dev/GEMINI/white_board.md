@@ -1,18 +1,26 @@
-# WHITE BOARD — 2026-08-07 (GR20)
+# WHITE BOARD — 2026-08-07 (GR21)
 
-No open questions.
+Two questions, both SDHC-4c planning — neither blocks anything now; decide any time
+before the 4c arc starts.
 
-(Question 1 — iGPU Flight 1 scope — answered: **A, grow the arc.** Full IVB display bring-up
-joins Flight 1; the serial link is the debug path.)
+## Q1 — When 4c lands, does the default x86 image ever ship with SD write (`sdw`) ON, or does it stay knob-gated?
 
-(Question 2 — the internal SDXC slot — answered by inspection, and the seat's framing was
-wrong: the card is a v1.x SDSC and the defect was ours. Fixed, metal-proven Boot AC, and the
-first SD write flew clean on Boot AD.)
+Background: 4b mounted the internal card READ-ONLY with exactly one FAT writer allowed on
+x86. The 4c design note (`~/unaos-bench/scratch/gr21/sdhc4c-writer-shape.md`) recommends
+the flight-recorder shape — host-staged contiguous file, kernel writes only in place inside
+a one-shot-armed LBA extent, no FAT-chain mutation ever — which keeps the single-writer
+proof intact by construction. Even so, every write path to the only persistent internal
+medium is brick surface. **Seat recommends: keep it knob-gated through 4c and revisit at
+the one-volume collapse.** Only reason to ship it on: the flight recorder on the internal
+card becomes useful on every boot without bench setup.
 
-(Question 3 — the WiFi goal — answered by Peter 2026-08-07: **A, own the BCM4331 driver.**
-The native SoftMAC path, sized honestly at 8,000–15,000 lines: BCMA backplane/EROM walk,
-SPROM/OTP calibration, HT-PHY + 2059 radio init, a non-redistributable Broadcom microcode
-blob, DMA rings, an 802.11 station layer, then WPA2-PSK. Multi-arc project. First arc is
-reconnaissance — a read-only BCMA EROM walk and SPROM/OTP read — which converts the plan's
-assumptions into facts before a single control register is written. Boot AE's PCI census
-identifies the radio; the seat carries this into the arc plan.)
+## Q2 — Will you spend one flight (and a spare >29 MiB card) proving the rMBP firmware can boot from the internal SDXC slot at all?
+
+Background: the one-volume collapse (boot medium = internal card, USB reader retired) has
+two hard gates before any code matters: the firmware must enumerate the internal slot as a
+boot device, and the card must be bigger than the current 29 MiB v1.x Panasonic. Neither is
+knowable from software we control — it is one experiment: ESP image on a spare SD card in
+the internal slot, does the boot picker offer it. If the firmware refuses, the collapse
+target changes (USB stays the boot medium; the internal card stays data), and 4c's design
+is unaffected either way. No urgency — this only sequences when the collapse arc gets
+scheduled.
