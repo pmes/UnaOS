@@ -5196,6 +5196,201 @@ fn click_pointer_pos() -> (i32, i32) {
     crate::pal::cursor::pos(w, h)
 }
 
+/// WMDIRECT — `[wm-act]`/`[clickroute]` close lines emitted, against [`CLOSE_LOG_MAX_X86`]. The
+/// close box is a hand gesture and so is human-rate by construction, but the budget is stated rather
+/// than assumed: a stuck button re-reported at HID rate must not be able to bury the wire.
+static CLOSE_LOG_COUNT_X86: AtomicU64 = AtomicU64::new(0);
+const CLOSE_LOG_MAX_X86: u64 = 128;
+
+/// WMDIRECT — the settle code of the most recent close-box click, so the witness can assert WHICH
+/// arm of [`wc_close_click`] ran rather than only that the row went away. A code and not the string,
+/// because the string is `bg_kill`'s and is not a stable comparison key.
+///
+/// `0` none yet · `1` NOPROC (no live process behind the owner — closing the windows was the whole
+/// effect) · `2` a real `bg_kill` settle, whatever it said.
+#[cfg(feature = "witness")]
+static CLOSE_LAST_SETTLE_X86: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_NONE_X86: u32 = 0;
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_NOPROC_X86: u32 = 1;
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_KILLED_X86: u32 = 2;
+
+/// WMDIRECT / CLOSE-BOX (x86) — **the close click's whole effect: the windows go, then the process
+/// goes.** Called from [`wc_click_route_at`]'s close arm only, with the press already consumed.
+///
+/// ### The order, and why it is this order
+/// 1. **Windows first** — `wm::close_owner` removes EVERY row the owner holds (an app may own
+///    several windows and they close together), erases the vacated boxes, re-tiles and composites,
+///    so the operator's click is answered ON THE PANEL immediately rather than after a kill settles.
+///    Idempotent against the teardown's own `close_owner`, which will find zero rows. It also
+///    cancels a drag of any of those rows (`wm::drag_forget_owner`), which is what makes "close a
+///    window you are mid-drag of" leave no dangling gesture.
+/// 2. **Focus next** — if the closed owner held the keyboard it goes back to the SHELL, through the
+///    one focus primitive, in the canonical order (`user_input_set_active(0)` then
+///    `wm::focus_changed(0)`) — the same state a TAB-to-shell or a desktop-miss click leaves.
+///    Without it the keyboard would keep addressing a process that is about to be dead.
+/// 3. **Kill last** — [`bg_kill`], the EXISTING and metal-proven x86 kill path, ASID-scoped through
+///    the pid it resolves below. No second teardown is written here.
+///
+/// ### Why calling `bg_kill` from the input path is safe on THIS arch
+/// The aarch64 twin deliberately does NOT reap (it settles the row instead), because a foreground
+/// `run_user_image` launcher there holds the row index across its wait and would double-free. x86's
+/// `bg_kill` closes that hazard IN ITSELF, and it is the reason this arc reuses it rather than
+/// inventing a settle: its REVIEW-1 claim is a won CAS into `PREAPING` plus a pid identity test, and
+/// `PREAPING` is the single token `proc_free`, `bg_poll(reap)` and the BGRUN-SCAV sweep all claim
+/// through. Exactly one of them can win, whichever core they run on, so this call cannot free a row
+/// another owner still holds. Nothing about the caller being the input pump changes that argument.
+///
+/// Returns the settle string `bg_kill` produced, for the witness line; `"noproc"` when the owner
+/// resolves to no live process (kernel furniture, a witness fixture, or an app that already exited),
+/// in which case closing the windows was the whole of the effect.
+#[cfg(feature = "wc")]
+fn wc_close_click(owner: u64) -> &'static str {
+    let closed = crate::video::wm::close_owner(owner);
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
+        user_input_set_active(0);
+    }
+    if crate::video::wm::focus_asid() == owner {
+        crate::video::wm::focus_changed(0);
+    }
+    // `wm` owners for user rows are `slot + 1`-biased and `Proc::slot` is stored with the SAME bias
+    // (see that field), so the owner IS the key — no arithmetic, and therefore no bias to get wrong.
+    // Kernel furniture (`is_kernel_owner`) and owner 0 can never match a live row and fall out here.
+    let mut target: Option<u64> = None;
+    for pi in 0..MAX_PROCS {
+        if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING
+            && PROCS[pi].slot.load(Ordering::Acquire) as u64 == owner
+        {
+            let pid = PROCS[pi].pid.load(Ordering::Acquire);
+            // `pid == 0` is a claimed row mid-publish: a kill needs a tid to name, and the publish
+            // window is microseconds wide — the operator's next click lands after it.
+            if pid != 0 {
+                target = Some(pid);
+            }
+            break;
+        }
+    }
+    let Some(pid) = target else {
+        #[cfg(feature = "witness")]
+        CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NOPROC_X86, Ordering::Release);
+        if CLOSE_LOG_COUNT_X86.load(Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
+            serial_println!(
+                "[wm-act] close-box owner={:#x} closed={} window(s), no live process — nothing to kill",
+                owner, closed
+            );
+        }
+        return "noproc";
+    };
+    #[cfg(feature = "witness")]
+    CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_KILLED_X86, Ordering::Release);
+    bg_kill(pid, owner)
+}
+
+/// WMDIRECT — the code of the most recent close-box settle. Witness-only; racy against a concurrent
+/// operator click, which no witness leg runs under.
+#[cfg(feature = "witness")]
+pub fn wc_close_last_settle() -> u32 {
+    CLOSE_LAST_SETTLE_X86.load(Ordering::Acquire)
+}
+
+#[cfg(not(feature = "wc"))]
+fn wc_close_click(_owner: u64) -> &'static str {
+    "nowc"
+}
+
+/// WMDIRECT — **advance a live title-bar drag to the CURRENT pointer position.**
+///
+/// The one entry point the pointer path calls after it has moved the shared cursor state; a no-op
+/// (one acquire load) when no drag is live, which is every report on a boot where nobody grabbed a
+/// title bar. It reads the same `pal::cursor` position every other pointer consumer reads rather
+/// than re-deriving motion from the HID delta, so the window and the arrow can never disagree about
+/// where the hand is.
+///
+/// ### The throttle, and why the release is exempt
+/// A `move_to` is a table lock, a whole-box erase, a damage pass and a composite; a trackpad reports
+/// far faster than a panel can absorb that. So motion is admitted at most once per
+/// [`DRAG_MOTION_MS`], and the drag's FINAL position is applied unthrottled by the release edge in
+/// [`wc_click_route_at`] — otherwise the last few reports of a fast gesture would be dropped and the
+/// window would settle short of where the operator let go.
+///
+/// Locks: reads `WRITER` then the cursor lock (through `click_pointer_pos`), both released before
+/// `wm::drag_motion` takes the window table. No nesting, so no new lock order.
+#[cfg(feature = "wc")]
+pub fn wc_drag_motion() {
+    if crate::video::wm::drag_active() == crate::video::wm::WIN_NONE {
+        return;
+    }
+    let now = crate::arch::ticks();
+    let last = DRAG_MOTION_LAST_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < DRAG_MOTION_MS {
+        return;
+    }
+    DRAG_MOTION_LAST_MS.store(now, Ordering::Relaxed);
+    let (x, y) = click_pointer_pos();
+    crate::video::wm::drag_motion(x, y);
+}
+
+#[cfg(not(feature = "wc"))]
+pub fn wc_drag_motion() {}
+
+/// WMDIRECT — minimum spacing between drag repositions, in ms. ~60 Hz: fast enough that the window
+/// tracks the hand, slow enough that a trackpad sweep cannot queue more composites than the panel
+/// can retire.
+#[cfg(feature = "wc")]
+const DRAG_MOTION_MS: u64 = 16;
+#[cfg(feature = "wc")]
+static DRAG_MOTION_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// WMDIRECT — **THE X86 EVENT-ROUTING CHAIN, AS ONE FUNCTION.** Both x86 drains (the BSP GUI loop
+/// and the SCHED-X86 render service) called an identical three-line `if/else if/else` inline; this
+/// is that chain, named once.
+///
+/// The order is load-bearing and is documented at each callee:
+///  1. `wc_focus_key` — `<TAB>` is addressed to the WINDOW SYSTEM, not to any app, and must be
+///     judged before either router or a focused app swallows the only exit from its own window.
+///  2. `wc_click_route` — a pointer BUTTON is addressed by POSITION before it is delivered by FOCUS.
+///  3. `user_input_route` — everything else goes to whoever holds the keyboard.
+///
+/// Returns `Event::Unknown` (never `Event::None`) for a consumed event, because every drain on this
+/// arch treats `None` as end-of-queue.
+///
+/// **It exists as a function so the witness can drive the REAL chain.** `wmdirect_selftest` asserts
+/// against this call and [`wc_route_tail`], not against a transcription of them — the failure this
+/// closes is a witness that tests the API while the path a pointer report actually takes is inert.
+pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event {
+    if wc_focus_key(raw) {
+        crate::pal::Event::Unknown
+    } else if wc_click_route(raw) {
+        crate::pal::Event::Unknown
+    } else {
+        user_input_route(raw)
+    }
+}
+
+/// WMDIRECT — **the drain's TAIL: what a pointer report owes the window system after the drain's own
+/// arms have run.** Today that is exactly one thing — steering a live title-bar drag.
+///
+/// Keyed on the RAW report and NOT on the routed outcome. `Event::Mouse`/`Event::MouseAbsolute` are
+/// PACKABLE, so a focused ring-3 app with room in its ring consumes every pointer report and the
+/// drain's pointer arms never run; a title-bar grab GUARANTEES that state, because the chrome arm of
+/// [`wc_click_route_at`] focuses the dragged window's own owner. Keyed on the outcome, the drag would
+/// be dead for every app window and alive only for the console and the focus-exempt desktop row.
+///
+/// Called AFTER the drain's `match`, so the shared `pal::cursor` position this reads is fresh on both
+/// branches — `pal::cursor::track_routed` applied it on the consumed branch (CURSOR-VUG), the
+/// `Mouse`/`MouseAbsolute` arms applied it on the declined one. Exactly one tick per report either
+/// way, so a relative report is never applied twice.
+pub fn wc_route_tail(raw: crate::pal::Event) {
+    if matches!(
+        raw,
+        crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. }
+    ) {
+        wc_drag_motion();
+    }
+}
+
 /// CLICK-X86 — **route a pointer button by POSITION rather than by focus.** The shell's event drain
 /// calls this on every event, BEFORE `user_input_route`; non-`Button` events return `false` untouched.
 ///
@@ -5279,6 +5474,61 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
     if mask & !prev != 0 {
         // PRESS edge.
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
+        // WMDIRECT — **CHROME IS JUDGED BEFORE THE APP ARMS, AND THAT IS THE WHOLE ROUTING RULE.**
+        //
+        // *A press on a window's kernel-drawn chrome — close box, title strip, border — is an
+        // instruction to the WINDOW SYSTEM and is consumed here; a press on its content is the app's
+        // input and falls through to the arms below.*
+        //
+        // Neither side can be starved by the other, and neither claim is a policy:
+        //  * **The app cannot be starved of content clicks.** `wm::chrome_hit` is `outer_box` MINUS
+        //    `content_box` — a region the app's surface does not cover a pixel of. There is no point
+        //    at which both answers are "mine", so the WM cannot take a click the app could have had.
+        //  * **The WM cannot be locked out by a full-screen app.** `chrome_hit` declines COMPAT rows
+        //    (the `present_surface` shim draws no chrome, so the difference is empty) — a
+        //    full-screen app keeps its whole panel, and the WM's own reach into that state is `<TAB>`
+        //    and the desktop-miss arm, exactly as before this arc.
+        //
+        // Placed AHEAD of the kernel-furniture and focus-exempt arms deliberately: the console's
+        // title bar is furniture too, and dragging it must work whether or not the row is a focus
+        // target. `close_box` already declines owner-0 rows, so the console has no close control to
+        // reach and the shell cannot be killed by a click.
+        if let Some((win, owner, _z)) = crate::video::wm::hit_test(x, y) {
+            if crate::video::wm::close_box_hit(win, x, y) {
+                // CLOSE — the press is CONSUMED (target DROP, so the release is dropped with it):
+                // the owner it would have been delivered to is being torn down.
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                let settle = wc_close_click(owner);
+                if CLOSE_LOG_COUNT_X86.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
+                    serial_println!(
+                        "[wm-act] close win={} owner={:#x} at ({},{}) -> settle={}",
+                        win, owner, x, y, settle
+                    );
+                }
+                clickroute_witness(x, y, win, owner, cur, "close", 0);
+                return true;
+            }
+            if crate::video::wm::chrome_hit(win, x, y) {
+                // TITLE BAR / BORDER — raise and focus through the SAME primitives the content arms
+                // use (no second focus mechanism), then, on the title strip only, grab the window.
+                // Kernel furniture and focus-exempt rows keep their own rule: raise the row, but
+                // hand the KEYBOARD to the shell rather than to a program with no input ring.
+                if crate::video::wm::is_kernel_owner(owner) || owner_is_focus_exempt(owner) {
+                    user_input_set_active(0);
+                } else if owner != cur {
+                    user_input_set_active(owner);
+                }
+                crate::video::wm::focus_changed(owner);
+                let how = if crate::video::wm::drag_begin(win, x, y) {
+                    "drag"
+                } else {
+                    "chrome"
+                };
+                clickroute_witness(x, y, win, owner, cur, how, 0);
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                return true;
+            }
+        }
         match crate::video::wm::hit_test(x, y) {
             // KERNEL FURNITURE — raise it, hand the keyboard to the shell, consume the press.
             Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => {
@@ -5357,6 +5607,19 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
             }
         }
     } else if prev & !mask != 0 {
+        // WMDIRECT — a live drag ENDS on the release, and its FINAL position is applied here,
+        // unthrottled. `wc_drag_motion`'s ~60 Hz admission is what keeps a trackpad sweep from
+        // queueing more composites than the panel can retire, and its cost is that the last few
+        // reports of a fast gesture are dropped; without this line the window would settle wherever
+        // the last admitted report put it rather than where the operator let go.
+        //
+        // Ahead of the target test, and unconditional on it: the drag's press was consumed with
+        // target DROP, so the arm below already answers `true` for it — this only has to make sure
+        // the gesture is finished before that answer is given.
+        if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE {
+            crate::video::wm::drag_motion(x, y);
+            crate::video::wm::drag_end();
+        }
         // RELEASE edge — follow the press, or drop. Never hit-tested: the release belongs to whoever
         // received the press, not to whatever the pointer has since been dragged over.
         let target = CLICK_PRESS_TARGET.load(Ordering::Acquire);
@@ -5574,6 +5837,260 @@ pub fn clickroute_selftest() {
     wm::close(wa);
     wm::close(wb);
     wm::close(wk);
+    user_input_set_active(saved_focus);
+    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+    wm::focus_reset();
+}
+
+/// The WMDIRECT probe surface — 32x8 ARGB8888 (stride 128 B, 1024 B total). WIDER than the
+/// `clickroute` fixture's 8x8 on purpose: `wm::close_box` DECLINES a title strip too narrow to hold
+/// the box plus a glyph (`bw < 2*BORDER + 2*TITLE_H`, i.e. 26 px), and an 8-px-wide surface is under
+/// that at scale 1 — the close leg would have silently tested nothing on a small panel.
+#[cfg(all(feature = "witness", feature = "wc"))]
+#[repr(align(4))]
+struct WmdSurf([u32; 256]);
+#[cfg(all(feature = "witness", feature = "wc"))]
+static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; 256]);
+
+/// WMDIRECT — the DIRECT-MANIPULATION witness: does a press on a window's CHROME reach the window
+/// system, does a press on its CONTENT still reach the app, and does a pointer report actually STEER
+/// a live drag through the path a real report takes?
+///
+/// Headless-drivable on `clickroute_selftest`'s idiom and for its reason: QEMU delivers no pointer,
+/// so every position is a PARAMETER and every claim is made against the window table.
+///
+/// ### It drives the ROUTED SEAM, not the API
+/// The `move` leg's first cut called `wm::drag_motion` directly. That asserted against `wm`'s API and
+/// printed `move=true` while the live drag was INERT: the drain's tick sat inside the
+/// `Event::Mouse` match arm, keyed on the POST-routing event, and `Event::Mouse` is packable — so a
+/// focused ring-3 app swallowed every report and the tick never ran. A title-bar grab guarantees that
+/// focus (the chrome arm focuses the dragged window's owner), so the verb the arc exists for was dead
+/// for every app window and the witness could not see it.
+///
+/// So the `route` leg drives [`wc_route_event`] + [`wc_route_tail`] — the SAME two functions both x86
+/// drains call — with a ring-3 owner focused and a synthetic `MouseAbsolute` report. It fails on the
+/// broken shape and passes on the fixed one, which is the only property that makes it a gate.
+///
+/// ### The legs, each a distinct failure direction
+///  1. **partition** — chrome and content disagree at the geometry layer. Catches a chrome rect that
+///     overlaps the content: the WM stealing clicks the app should have had.
+///  2. **grab** — a title-strip press is CONSUMED, moves focus to that window's owner, and starts a
+///     drag. Catches chrome falling through to the app arms.
+///  3. **route** — a pointer report pushed through the REAL routing chain, with the dragged app
+///     holding focus and its ring draining, RELOCATES the row; the release ends the drag and leaves
+///     the row PINNED. Catches the inert-drag defect above, and a WM still dragging after the hand
+///     let go.
+///  4. **content** — a press on the SAME window's content is NOT consumed. The other half of the
+///     partition, asserted through the router rather than the geometry.
+///  5. **close** — a press on the close box is CONSUMED, the row is GONE, and the settle is NOPROC
+///     (the fixture owner has no live process, so closing the windows is the whole effect). Covers
+///     `close_box_hit`'s routing arm, `wc_close_click`'s owner->pid resolution and its no-process
+///     arm; the `bg_kill` call itself is the one line here that stays metal-only, and the doc's
+///     watch-list says so.
+///  6. **dragdead** — a window closed mid-drag leaves `drag_active() == WIN_NONE`.
+///
+/// Self-cleaning: the probe rows are closed and the input focus restored.
+#[cfg(all(feature = "witness", feature = "wc"))]
+pub fn wmdirect_selftest() {
+    use crate::pal::Event;
+    use crate::video::wm;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let (pw, ph) = {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[wm-act] direct -> SKIP (framebuffer not ready)");
+            return;
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    if pw < 256 || ph < 256 {
+        serial_println!("[wm-act] direct -> SKIP (panel {}x{} too small)", pw, ph);
+        return;
+    }
+    // Biased slots, i.e. the values `SYS_WIN_CREATE` mints and `USER_INPUT_ACTIVE` carries. Both are
+    // REAL slot numbers (not the kernel band), because the `route` leg needs `user_input_enqueue` to
+    // accept a push for the focused owner — that is the packable-consume path it exists to drive.
+    const OWNER_D: u64 = 3; // slot 2
+    // A SECOND row, and it is not scenery. Every leg needs the probe row ABOVE the shell —
+    // `hit_test` skips anything `SHELL_Z` overtook — so the focus these legs park elsewhere must be a
+    // WINDOW's focus and never the shell's: `focus_changed(0)` raises `SHELL_Z` over the whole table
+    // and the probe point would resolve to no window. (Not a hypothesis: the first cut of this
+    // witness focused the shell and read `grab=false` with `[clickroute] press ... win=0` beside it.)
+    const OWNER_O: u64 = 4; // slot 3
+    let s = &raw const WMD_SURF as usize;
+    let len = core::mem::size_of_val(&WMD_SURF);
+    let w = wm::create(OWNER_D, s, len, 32, 8, 128, b"wmd");
+    let wo = wm::create(OWNER_O, s, len, 32, 8, 128, b"wmo");
+    if w == wm::WIN_NONE || wo == wm::WIN_NONE {
+        serial_println!("[wm-act] direct -> SKIP (window table full: d={} o={})", w, wo);
+        wm::close(w);
+        wm::close(wo);
+        return;
+    }
+    let saved_focus = user_input_active();
+    let (ox, oy) = (pw / 3, ph / 3 + wm::TITLE_H + wm::BORDER);
+    wm::move_to(w, ox, oy);
+    // Disjoint from the probe row by a whole panel third, so no raise can make `wo` own a probe point
+    // and turn the "different window" legs into "already focused" ones.
+    wm::move_to(wo, pw / 3, ph / 3 * 2 + wm::TITLE_H + wm::BORDER);
+    // Read the placement back rather than assuming it: `move_to` CLAMPS to the live panel.
+    let Some(inf) = wm::info(w) else {
+        serial_println!("[wm-act] direct -> SKIP (row vanished)");
+        wm::close(w);
+        wm::close(wo);
+        return;
+    };
+    // A title-strip point: one pixel inside the left border, mid-strip. The close box is at the RIGHT
+    // end of the strip, so the left end is unambiguously drag. A content point: inside the surface.
+    let tpx = (inf.x + 1) as i32;
+    let tpy = (inf.y - wm::TITLE_H / 2 - wm::BORDER) as i32;
+    let cpx = (inf.x + 1) as i32;
+    let cpy = (inf.y + 1) as i32;
+
+    // Leg 1 — the partition, asked of the geometry directly.
+    let partition_ok = wm::chrome_hit(w, tpx, tpy)
+        && wm::title_bar_hit(w, tpx, tpy)
+        && !wm::chrome_hit(w, cpx, cpy)
+        && !wm::title_bar_hit(w, cpx, cpy)
+        && wm::hit_test(tpx, tpy).map(|(id, _, _)| id) == Some(w);
+
+    // Leg 2 — the grab. Focus parked on the OTHER window, so this press must MOVE it.
+    user_input_set_active(OWNER_O);
+    wm::focus_changed(OWNER_O);
+    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+    let grab_consumed = wc_click_route_at(Event::Button(1), tpx, tpy);
+    let grab_ok = grab_consumed && wm::drag_active() == w && user_input_active() == OWNER_D;
+
+    // Leg 3 — THE ROUTED SEAM. Park the arrow at the grab point, then push a synthetic
+    // `MouseAbsolute` for a point 24 px away through `wc_route_event` + `wc_route_tail`, exactly as
+    // both drains do. `OWNER_D` holds focus (leg 2 put it there, which is what a real grab does) and
+    // its ring is empty, so the report is PACKED AND CONSUMED — `ev` comes back `Unknown` and the
+    // drain's pointer arms never run. That is precisely the state in which the pre-fix tick was
+    // unreachable, so this leg is `false` on the broken shape.
+    //
+    // `set_abs` takes HID space (0..=32767); the router's consume branch applies the same conversion
+    // through `pal::cursor::track_routed`, so the panel position the tail reads is derived by the
+    // shipping code and not by this witness.
+    let before = (inf.x, inf.y);
+    let hid = |v: i32, span: usize| -> i32 {
+        ((v as i64 * 32767) / (span.max(1) as i64 - 1).max(1)) as i32
+    };
+    crate::pal::cursor::set_abs(hid(tpx, pw), hid(tpy, ph), pw as i32, ph as i32);
+    let raw = Event::MouseAbsolute {
+        x: hid(tpx + 24, pw),
+        y: hid(tpy + 24, ph),
+    };
+    let routed = wc_route_event(raw);
+    let consumed_by_ring = matches!(routed, Event::Unknown);
+    wc_route_tail(raw);
+    let after = wm::info(w).map(|i| (i.x, i.y));
+    // The release ends the drag. It is a Button, so it goes through the click router as always.
+    let rel_consumed = wc_click_route_at(Event::Button(0), tpx + 24, tpy + 24);
+    let route_ok = consumed_by_ring
+        && after.is_some()
+        && after != Some(before)
+        && rel_consumed
+        && wm::drag_active() == wm::WIN_NONE
+        && wm::is_pinned(w);
+
+    // Leg 4 — content still reaches the app. Re-derive the point: the row has MOVED.
+    let content_ok = match wm::info(w) {
+        Some(i) => {
+            let (px, py) = ((i.x + 1) as i32, (i.y + 1) as i32);
+            user_input_set_active(OWNER_O);
+            wm::focus_changed(OWNER_O);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            let consumed = wc_click_route_at(Event::Button(1), px, py);
+            wc_click_route_at(Event::Button(0), px, py);
+            !consumed && wm::drag_active() == wm::WIN_NONE
+        }
+        None => false,
+    };
+
+    // Leg 6 — a window closed mid-drag leaves no live drag. Run BEFORE the close leg because it
+    // needs a row, and its own `wm::close` is the teardown it is asserting about.
+    let dragdead_ok = match wm::info(w) {
+        Some(i) => {
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
+            wm::close(w);
+            grabbed && wm::drag_active() == wm::WIN_NONE
+        }
+        None => false,
+    };
+
+    // Leg 5 — THE CLOSE BOX, through the router. A fresh row for it: leg 6 closed the first one.
+    // `OWNER_D` is a real slot with NO live Proc row, so `wc_close_click` must resolve no pid, take
+    // its no-process arm, and report NOPROC — while `close_owner` still removes the row, which is the
+    // "closing the windows was the whole effect" contract.
+    CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NONE_X86, Ordering::Release);
+    let wc = wm::create(OWNER_D, s, len, 32, 8, 128, b"wmc");
+    let close_ok = if wc == wm::WIN_NONE {
+        None
+    } else {
+        wm::move_to(wc, ox, oy);
+        match wm::info(wc) {
+            // The close box, derived the way `wm::close_box` derives it: a `TITLE_H`-sided square at
+            // the right end of the strip, flush inside the border. Confirmed against the shipping
+            // predicate before it is pressed, so a geometry that DECLINED the control reports a skip
+            // rather than a false pass.
+            Some(i) => {
+                let bw = i.w * i.scale + 2 * wm::BORDER;
+                let bx = i.x - wm::BORDER;
+                let by = i.y - wm::TITLE_H - wm::BORDER;
+                let px = (bx + bw - wm::BORDER - wm::TITLE_H / 2) as i32;
+                let py = (by + wm::BORDER + wm::TITLE_H / 2) as i32;
+                if !wm::close_box_hit(wc, px, py) {
+                    None
+                } else {
+                    user_input_set_active(OWNER_O);
+                    wm::focus_changed(OWNER_O);
+                    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+                    let consumed = wc_click_route_at(Event::Button(1), px, py);
+                    Some(
+                        consumed
+                            && wm::info(wc).is_none()
+                            && wc_close_last_settle() == CLOSE_SETTLE_NOPROC_X86,
+                    )
+                }
+            }
+            None => None,
+        }
+    };
+
+    let ok = partition_ok
+        && grab_ok
+        && route_ok
+        && content_ok
+        && dragdead_ok
+        && close_ok.unwrap_or(true);
+    serial_println!(
+        "[wm-act] direct partition={} grab={} route={} content={} close={} dragdead={} from=({},{}) to=({},{}) -> {}",
+        partition_ok,
+        grab_ok,
+        route_ok,
+        content_ok,
+        match close_ok {
+            Some(v) => if v { "true" } else { "false" },
+            None => "skip",
+        },
+        dragdead_ok,
+        before.0,
+        before.1,
+        after.map(|a| a.0).unwrap_or(0),
+        after.map(|a| a.1).unwrap_or(0),
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    wm::close(w); // idempotent — leg 6 already closed it on the path that reached it.
+    wm::close(wc);
+    wm::close(wo);
     user_input_set_active(saved_focus);
     CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
@@ -14099,6 +14616,12 @@ fn winx_launcher(demo_cpu: usize) {
     crate::video::wm::hittest_selftest();
     #[cfg(feature = "witness")]
     clickroute_selftest();
+    // WMDIRECT — third and last of the click family, and deliberately last: it MOVES a row (a drag
+    // is a `move_to`, which pins the row against the tiler) and closes it under a live drag, so it
+    // is the most disruptive of the three. Running it after the other two means neither of them can
+    // inherit a pinned fixture or a re-tiled panel.
+    #[cfg(all(feature = "witness", feature = "wc"))]
+    wmdirect_selftest();
 }
 
 // =============================================================================================

@@ -7777,3 +7777,264 @@ readings shift meaning, and one source is named for the follow-up:
   the pixel clock and actives and are NOT witness-gated; deriving `frame_us` needs only hblank and
   vblank from the same 18 bytes. That is the follow-up the day a non-60 Hz panel or a modeset
   arrives — today x86 drives exactly one mode, inherited from firmware.
+
+---
+
+## WMDIRECT — direct manipulation: click-to-raise, drag-to-move, close (x86, 2026-08-08)
+
+UnaOS had a compositor, chrome, focus and a TAB cycle, and a pointer that could not manipulate a
+window with any of it. Click-to-raise landed for x86 with CLICK-PLAIN and the close box landed for
+aarch64 with CLOSE-BOX; what was missing on x86 was the close box, and what was missing on BOTH was
+any way to move a window with the hand. This arc closes all three on x86 and states the routing rule
+that makes them coexist with the apps underneath.
+
+### The routing rule, in one sentence
+
+> **A press on a window's kernel-drawn CHROME — title strip, borders, close box — is an instruction
+> to the WINDOW SYSTEM and is consumed by it; a press anywhere on the window's CONTENT is the app's
+> own input and is delivered to its owner.**
+
+It is asked in `wc_click_route_at`'s press arm BEFORE any of the app arms, and it is a pure function
+of geometry: `wm::chrome_hit` is `outer_box` MINUS `content_box`, computed from the same
+`w * scale` / `h * scale` product both rects are built from. Two properties follow without a policy:
+
+* **An app cannot be starved of content clicks.** The chrome region is one the app's surface does not
+  cover a pixel of, so there is no point at which both answers are "mine". Every press the app could
+  have handled still reaches it, through the arms that were already there.
+* **The WM cannot be locked out by a full-screen app.** `chrome_hit` declines COMPAT rows outright —
+  the `present_surface` shim draws no chrome, so the difference is empty. A full-screen app keeps its
+  whole panel, and the WM's reach into that state remains `<TAB>` and the desktop-miss arm, exactly
+  as before this arc.
+
+The chrome test is placed ahead of the kernel-furniture and focus-exempt arms deliberately: the
+console's title bar is furniture too and must be draggable whether or not the row is a focus target.
+`wm::close_box` already declines owner-0 rows, so the console has no close control to reach and the
+shell cannot be killed by a click.
+
+### The three verbs
+
+* **Click-to-raise / click-to-focus** was already here (CLICK-PLAIN) and is unchanged. Chrome presses
+  raise through the SAME focus primitive — `user_input_set_active` then `wm::focus_changed`, in that
+  order — so there is still exactly one focus mechanism and GR21's focus trap has no second path to
+  reappear on.
+* **Drag-to-move by the title bar.** `wm::drag_begin` / `drag_motion` / `drag_end`, four atomics and
+  no lock, one drag at a time because there is one pointer. A drag is a (window id, owner asid, grab
+  offset) — a NAME for a row, never a handle to one. The grab offset keeps the same point under the
+  hand for the whole gesture. Motion is admitted at most once per 16 ms (`DRAG_MOTION_MS`) because a
+  `move_to` is a lock, a whole-box erase, a damage pass and a composite, and a trackpad reports far
+  faster than a panel can absorb that; the release edge applies the FINAL position unthrottled, so
+  the window settles where the operator let go rather than at the last admitted report.
+
+### THE DRAG IS DRIVEN BY THE RAW REPORT, NOT BY THE ROUTED ONE
+
+This is the single subtlety in the arc and it was wrong in the first cut, so it is stated first.
+
+`Event::Mouse` and `Event::MouseAbsolute` are **packable**. Whenever a ring-3 app holds focus and its
+32-slot ring is not full, `user_input_route` consumes the report whole and returns `Event::Unknown` —
+the drain's `Mouse`/`MouseAbsolute` arms never run. **A title-bar grab GUARANTEES that state**,
+because the chrome arm of `wc_click_route_at` calls `user_input_set_active(owner)` with the dragged
+window's own owner. A drag tick placed inside those arms is therefore dead for every app window, and
+alive only for the console and the focus-exempt desktop row, whose arms take `set_active(0)`.
+
+The symptom that shape produces on metal, and did not produce in any gate: grab a vug's title bar,
+sweep — the arrow moves (CURSOR-VUG keeps it alive) and the window sits still — release, and the
+window TELEPORTS to the release point via the unthrottled final reposition. It is also
+**app-dependent and nondeterministic**: an app that stops draining fills its ring, the push fails,
+the report is declined, and the drag springs to life mid-gesture. And the 16 ms throttle above would
+be describing a path that never executes.
+
+So the tick is keyed on the **raw** report and lives in `wc_route_tail`, called after the drain's
+`match` in both x86 drains:
+
+* **consumed** — `user_input_route` → `pal::cursor::track_routed` has already applied the report
+  (CURSOR-VUG, merged the same day). Without that arc this would steer to a stale position, so the
+  fix is only correct on top of it.
+* **declined** — the `Mouse`/`MouseAbsolute` arms have just applied it.
+
+Exactly one tick per pointer report either way, so a relative report is never applied twice and the
+throttle measures real time. `wc_route_event` and `wc_route_tail` are the chain and the tail named
+once and shared by both drains — which is also what lets the witness assert against the real seam.
+* **Close.** `wc_close_click` on x86: windows first (`wm::close_owner`, so the panel answers the
+  click immediately), focus next (to the shell, if the dying owner held it), kill last — through
+  `bg_kill`, the existing metal-proven path, resolved by owner because `wm` owners and `Proc::slot`
+  carry the SAME `slot + 1` bias. No second teardown was written.
+
+Calling `bg_kill` from the input pump is safe on x86 for a reason the aarch64 twin does not have:
+`bg_kill`'s REVIEW-1 claim is a won CAS into `PREAPING` plus a pid identity test, and `PREAPING` is
+the single token `proc_free`, `bg_poll(reap)` and the BGRUN-SCAV sweep all claim through. Exactly one
+of them can win, on any core. aarch64 settles instead of reaping because a foreground
+`run_user_image` launcher there holds the row index across its wait; x86's does not reach this path.
+
+**This is a NEW CALLER CONTEXT, and "the existing metal-proven path" is true of the function and not
+of this seam.** Every pre-existing `bg_kill` caller is a launcher task, a fixture, or the console's
+`kill` verb; none of them is the GUI input drain. What the new context costs is a bound that must be
+stated rather than assumed:
+
+> `bg_kill` waits up to `KILL_CONFIRM_MS` (**2000 ms**) for the reap to confirm, and it runs on the
+> drain. For that whole window the GUI drain is descheduled — **pointer and keyboard are dead**.
+
+Why it is nevertheless fast in every interactive case, and this reason is load-bearing:
+`KillSwitch::request` calls `kill_wake_parked`, which evicts the doomed task from (a) the per-CPU
+`PARK_SLEEP` sleeper lists and (b) any futex bucket. Both interactive idle states are swept —
+`SYS_INPUT_WAIT` parks on a futex, and VSYNC-PACE's `present_pace` uses `sleep_ms` — so an idle
+windowed app is re-readied immediately and retires one dispatch later.
+
+The residual, named: **a task parked on a kernel `Semaphore` is NOT evicted** (`SYS_THREAD_JOIN`,
+`SYS_WAIT`). `sched.rs`'s own `kill_wake_parked` doc block states this and calls the proper fix — a
+`kill_wake_parked_semaphores` hook, the shape aarch64 uses — a separate arc. Until that lands,
+closing the window of an app blocked in a join burns the full 2000 ms with the desktop unresponsive.
+It is LATE, not immortal: both ring-3 semaphore parks wait on something itself killable, so the post
+is reachable. On the metal watch-list below.
+
+### The layout decision, stated
+
+**A window the operator moved stops being tiled, for good.** `move_to` sets `Window::pinned` and
+`place` skips every pinned row, so a drag is not undone by the next create or close. The alternative
+— re-tile everything and snap the window back — is rejected because a desktop in which the machine
+can move a window out from under the hand is not one an operator can model. The cost is stated too:
+pinned windows do not compact when their neighbours close, so a dragged-out desktop keeps its gaps.
+
+### A window killed mid-drag
+
+Three independent guards, and the drag ENDS on each rather than merely skipping:
+
+1. `wm::drag_forget` / `drag_forget_owner` are called by `close` and `close_owner`, so the close box,
+   a `kill` and an ordinary task exit all cancel the gesture as part of freeing the row.
+2. If the dragged id no longer names a live row, the next motion cancels — covering any teardown that
+   ever forgets (1).
+3. If the id names a live row whose OWNER differs, the drag cancels — covering the SLOT RECYCLE,
+   where the window died and its id was re-issued to a different program while the hand was still
+   down. Steering that would be moving a stranger's window.
+
+**Guard 3 is enforced INSIDE the mover's critical section, not at the caller, and that placement is
+the whole of its correctness.** Window ids are recycled slot aliases with no generation counter
+(`create_inner`: `let id = (slot + 1) as WinId`). The pre-fix `drag_motion` read the row under
+`TABLE`, dropped the guard, and then called a `move_to` that re-matched on **id alone** — a gap that
+spans a `WRITER` acquisition, inside which another core can `close` the row and `create` a new one
+into the same slot. The drag would then relocate, clamp and **PIN a stranger's window**, and
+`drag_forget` could not help because `drag_motion` holds `id` in a local and never re-reads
+`DRAG_WIN`. So the expectation travels *with* the request: `move_to_inner(id, Some(owner), …)`
+re-tests the owner under the lock that performs the mutation, and a failure there ends the drag with
+`drag-cancel … row-recycled`. The pre-filter before the call is kept, but only as a cheap early exit
+— it is explicitly not the guard. `move_to`'s own signature and behaviour are unchanged (it passes
+`None`, "any owner"), so no existing caller and neither arch moves.
+
+### The move reports what it CLAMPED to, not what was asked for
+
+`move_to_inner` returns the origin the row actually ended up at and whether its outer box changed.
+The drag caches that, not its own request. Caching the request breaks against a panel EDGE, where the
+clamp refuses the same origin on every report: the cheap-skip never hits, so each report pays a table
+lock, a `damage_all` and a composite for a window that does not move — and `DRAG_MOVES` counts moves
+that never happened, so `drag-end … placed` prints for a gesture that placed nothing. Both are fixed
+by the same return value.
+
+### Damage on a move
+
+Nothing new: `move_to` already erases the vacated box, re-damages what the erase reached, and raises
+`request_full_present` — the MOVE-VACATE cure (`[wc-x] move-vacate … desktop=5/5 stale=0/5`, x86 s42)
+for the case where a desktop-layer present repaints the unoccluded box from content that predates the
+erase. The drag path deliberately does not duplicate any of it; it calls `move_to`.
+
+Locks: no lock is held across a composite. `drag_begin` takes `TABLE` to read the origin and releases
+it; `drag_motion` reads the row under `TABLE`, RELEASES the guard, and only then calls `move_to`,
+which takes `WRITER` then `TABLE` for itself. The cursor bracket is untouched — `move_to`'s
+`cursor::repaint()` before its `composite()` (CURSOR-14) is the same code it always was.
+
+### Witness
+
+`[wm-act]`, one bounded line per gesture (`WM_ACT_LOG_MAX = 256` shared across the vocabulary — the
+begin/end/close arms are human-rate by construction, but the CANCEL arm is driven by motion reports
+and a pathological state could reach it at HID rate):
+
+```
+[wm-act] drag-begin  win=1 owner=0x3 at (427,272) -> grabbed
+[wm-act] drag-end    win=1 owner=0x3 at (450,303) -> placed | no-move
+[wm-act] drag-cancel win=1 owner=0x3 at (450,303) -> closed | owner-closed | row-gone | row-recycled
+[wm-act] close       win=1 owner=0x3 at (548,273) -> settle=noproc | settle=killed, row reaped
+```
+
+`row-recycled` is the one cancel reason that can only come from the in-lock owner test, so its
+appearance on a capture is proof the TOCTOU window was hit and closed rather than merely argued
+about.
+
+and the existing `[clickroute]` line gains two dispositions, `-> drag` and `-> chrome` (both with
+`deliver=0`) and `-> close`, so one wire tells chrome from content for every press.
+
+### Gate results (WMDIRECT, 2026-08-08, QEMU x86_64 `UNAOS_WC=1`)
+
+```
+[wm-act] direct partition=true grab=true route=true content=true close=true dragdead=true
+         from=(426,279) to=(450,303) -> PASS
+[wm-act] close win=1 owner=0x3 at (548,273) -> settle=noproc
+[clickroute] route hit=true deliver=true depth=1/2 kernel=true desktop=true nofab=true -> PASS
+[clickroute] hit-test ... -> PASS
+```
+
+`wmdirect_selftest` (x86, `witness` + `wc`) is headless-drivable on `clickroute_selftest`'s idiom —
+every position is a parameter, every claim is against the window table. Its six legs and the
+refutation each one catches:
+
+* **partition** — chrome and content disagree at the geometry layer. Catches a chrome rect that
+  overlaps the content, i.e. the WM stealing clicks the app should have had.
+* **grab** — a title-strip press is consumed, moves focus, and starts a drag. Catches chrome falling
+  through to the app arms.
+* **route** — a synthetic pointer report pushed through `wc_route_event` + `wc_route_tail` (the SAME
+  two functions both drains call), with the dragged app holding focus and its ring draining, so the
+  report is PACKED AND CONSUMED. Catches the inert-drag defect, and a WM still dragging after the
+  hand let go.
+* **content** — a press on the SAME window's content is not consumed. The other half of the
+  partition, asserted through the router rather than the geometry.
+* **close** — a close-box press is consumed, the row is GONE, and the settle is NOPROC. Covers
+  `close_box_hit`'s routing arm, `wc_close_click`'s owner→pid resolution and its no-process arm.
+* **dragdead** — a window closed mid-drag leaves `drag_active() == WIN_NONE`.
+
+**The `route` leg is falsifiable and was falsified.** Restoring the pre-fix shape (tick keyed on the
+routed outcome) makes it read `route=false from=(426,279) to=(426,279)` — the window did not move —
+and restoring the fix makes it pass. That experiment is the reason it is a gate rather than a
+description: the leg it replaced called `wm::drag_motion` directly, bypassed the drain seam entirely,
+and printed `move=true` while the live drag was inert for every app window.
+
+The fixture is 32x8 rather than the `clickroute` witness's 8x8 because `wm::close_box` DECLINES a
+strip narrower than `2*BORDER + 2*TITLE_H` (26 px); at 8 px wide the close leg would have silently
+tested nothing on a small panel. The close leg confirms `close_box_hit` before pressing, so a
+declined geometry reports `close=skip` rather than a false pass.
+
+The witness earned its keep twice. Its first cut parked focus on the SHELL between legs,
+`focus_changed(0)` raised `SHELL_Z` over the whole table, and the probe resolved to no window —
+`grab=false` with `[clickroute] press … win=0` beside it; the fixture now parks focus on a second
+WINDOW. Its second cut is the `route` leg above, which is what found the packable-consume defect.
+
+**What still has no automated coverage:** the `bg_kill` call itself. The close leg drives the NOPROC
+arm (a fixture owner with no live process); killing a real ring-3 program from the close box is
+metal-only, and is on the watch-list below.
+
+### aarch64
+
+Behaviour-identical, not byte-identical, and the difference is enumerated: `wm.rs` gains the
+chrome/drag API (which that arch's router never calls — no drag is ever begun there) and two
+`drag_forget*` calls in `close`/`close_owner` that are a load and a compare when no drag is live,
+which is every call on that arch. The `main.rs` motion hooks are `#[cfg(target_arch = "x86_64")]`.
+The aarch64 close box (CLOSE-BOX, P79) is untouched and keeps its settle-not-reap shape.
+
+### Metal watch-list (WMDIRECT)
+
+* **Click a background window's title bar.** Expect `[wm-act] drag-begin` and `[clickroute] … ->
+  drag deliver=0`. A `raise+deliver` line for a title-bar press means the chrome test missed — read
+  the row's `scale`, since chrome thickness is scale-invariant while content is not.
+* **Drag it across another window.** The vacated box must not keep a copy of the window. A trail is
+  a MOVE-VACATE regression, not a drag bug: `move_to`'s erase reaches glass, so suspect the
+  desktop-layer present that repaints over it.
+* **Click the same window's middle.** Expect `deliver=` naming its owner. A `drag` or `chrome`
+  disposition here is the starvation direction and is the one refutation that would justify reverting
+  the ordering.
+* **Close a window mid-drag** (grab the title bar, then let a `kill` land). Expect `drag-cancel …
+  closed`, and no further `[wm-act]` for that id.
+* **Close box on a running app.** The one path with no automated coverage. Expect `[wm-act] close …
+  settle=killed, row reaped` and the row gone from `jobs`. A surviving Proc row is the refutation;
+  `killed — the row was reclaimed on another core` is CORRECT (BGRUN-SCAV won the race), not a leak.
+* **Close the window of an app blocked in `SYS_THREAD_JOIN` / `SYS_WAIT`.** The one known-slow case:
+  `kill_wake_parked` does not evict semaphore parks, so expect up to 2000 ms with pointer and
+  keyboard dead before the row settles. If that is felt in practice, the fix is the
+  `kill_wake_parked_semaphores` hook aarch64 already has — a scheduler arc, not a video one.
+* **Drag a window whose app is being killed at the same moment.** `drag-cancel … row-recycled` on the
+  wire is the in-lock owner test firing; anything moving that the hand did not grab is the refutation.

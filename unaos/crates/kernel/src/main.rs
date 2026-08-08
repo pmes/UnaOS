@@ -1601,16 +1601,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // is inside `user_input_enqueue`), so app -> shell and shell -> window pass through the
             // same line; the Pi needs a second entry point on its shell drain only because its router
             // is reached solely while an app has focus.
+            // WMDIRECT — `raw` is hoisted out of this block because a live title-bar DRAG has to be
+            // steered by the report the HARDWARE sent, not by what routing left of it. See the drag
+            // tick after the match below for the whole argument.
             #[cfg(target_arch = "x86_64")]
-            let ev = {
+            let (raw, ev) = {
                 let raw = pal.poll_event();
-                if unaos_kernel::arch::x86_64::syscall::wc_focus_key(raw) {
-                    unaos_kernel::pal::Event::Unknown
-                } else if unaos_kernel::arch::x86_64::syscall::wc_click_route(raw) {
-                    unaos_kernel::pal::Event::Unknown
-                } else {
-                    unaos_kernel::arch::x86_64::syscall::user_input_route(raw)
-                }
+                (raw, unaos_kernel::arch::x86_64::syscall::wc_route_event(raw))
             };
             #[cfg(not(target_arch = "x86_64"))]
             let ev = pal.poll_event();
@@ -1708,6 +1705,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // Timer / Unknown: nothing to do.
                 _ => {}
             }
+            // WMDIRECT — **STEER A LIVE TITLE-BAR DRAG, OFF `raw`, AFTER THE ARMS ABOVE.**
+            //
+            // The predicate is the RAW report and NOT `ev`, and that distinction is the whole of this
+            // line's correctness. `Event::Mouse`/`Event::MouseAbsolute` are PACKABLE, so whenever a
+            // ring-3 app holds focus and its ring is not full, `user_input_route` consumes the report
+            // and hands back `Event::Unknown` — it never reaches the pointer arms at all. A title-bar
+            // grab GUARANTEES exactly that state, because the chrome arm of `wc_click_route_at` calls
+            // `user_input_set_active(owner)` with the dragged window's own owner. Keyed on `ev`, the
+            // drag would therefore be dead for every app window and alive only for the console and
+            // the focus-exempt desktop row (whose arms take `set_active(0)`) — app-dependent,
+            // nondeterministic (an app that stops draining fills its ring, the push fails, and the
+            // drag springs to life mid-gesture), and with the release edge's unthrottled final
+            // reposition TELEPORTING the window to wherever the hand let go.
+            //
+            // Placed after the `match` rather than beside the routers so that the cursor is FRESH on
+            // both branches, which is the other half of it — `wc_drag_motion` reads the shared
+            // `pal::cursor` position rather than the report's delta:
+            //   * CONSUMED — `user_input_route` -> `pal::cursor::track_routed` has already applied it
+            //     (CURSOR-VUG). Without that arc this line would steer to a stale position.
+            //   * DECLINED — the `Mouse`/`MouseAbsolute` arms above have just applied it.
+            // Exactly ONE tick per pointer report either way, so a relative report is never applied
+            // twice and the 16 ms throttle measures real time rather than a doubled rate.
+            //
+            // Costs one `matches!` on non-pointer events and one atomic load when no drag is live,
+            // which is every report on a boot where nobody grabbed a title bar.
+            #[cfg(target_arch = "x86_64")]
+            unaos_kernel::arch::x86_64::syscall::wc_route_tail(raw);
         }
 
         // CURSOR-HIDE: restore the pixels under the sprite once when the auto-hide delay
@@ -4272,13 +4296,7 @@ fn x86_render_service(cpu: usize) {
             // intercepting it after `user_input_route` would mean the focused app swallows the only
             // exit from its own window. This is the seam the bench media actually runs, so it is the
             // one Boot AH's trap was sprung on.
-            let ev = if unaos_kernel::arch::x86_64::syscall::wc_focus_key(raw) {
-                unaos_kernel::pal::Event::Unknown
-            } else if unaos_kernel::arch::x86_64::syscall::wc_click_route(raw) {
-                unaos_kernel::pal::Event::Unknown
-            } else {
-                unaos_kernel::arch::x86_64::syscall::user_input_route(raw)
-            };
+            let ev = unaos_kernel::arch::x86_64::syscall::wc_route_event(raw);
 
             match ev {
                 unaos_kernel::pal::Event::Key(c) => {
@@ -4317,6 +4335,33 @@ fn x86_render_service(cpu: usize) {
                 // Timer (the pulse) / KeyUp / Unknown: nothing to dispatch — the tail below still runs.
                 _ => {}
             }
+
+            // WMDIRECT — **STEER A LIVE TITLE-BAR DRAG, OFF `raw`, AFTER THE ARMS ABOVE.**
+            //
+            // The predicate is the RAW report and NOT `ev`, and that distinction is the whole of this
+            // line's correctness. `Event::Mouse`/`Event::MouseAbsolute` are PACKABLE, so whenever a
+            // ring-3 app holds focus and its ring is not full, `user_input_route` consumes the report
+            // and hands back `Event::Unknown` — it never reaches the pointer arms at all. A title-bar
+            // grab GUARANTEES exactly that state, because the chrome arm of `wc_click_route_at` calls
+            // `user_input_set_active(owner)` with the dragged window's own owner. Keyed on `ev`, the
+            // drag would therefore be dead for every app window and alive only for the console and
+            // the focus-exempt desktop row (whose arms take `set_active(0)`) — app-dependent,
+            // nondeterministic (an app that stops draining fills its ring, the push fails, and the
+            // drag springs to life mid-gesture), and with the release edge's unthrottled final
+            // reposition TELEPORTING the window to wherever the hand let go.
+            //
+            // Placed after the `match` rather than beside the routers so that the cursor is FRESH on
+            // both branches, which is the other half of it — `wc_drag_motion` reads the shared
+            // `pal::cursor` position rather than the report's delta:
+            //   * CONSUMED — `user_input_route` -> `pal::cursor::track_routed` has already applied it
+            //     (CURSOR-VUG). Without that arc this line would steer to a stale position.
+            //   * DECLINED — the `Mouse`/`MouseAbsolute` arms above have just applied it.
+            // Exactly ONE tick per pointer report either way, so a relative report is never applied
+            // twice and the 16 ms throttle measures real time rather than a doubled rate.
+            //
+            // Costs one `matches!` on non-pointer events and one atomic load when no drag is live,
+            // which is every report on a boot where nobody grabbed a title bar.
+            unaos_kernel::arch::x86_64::syscall::wc_route_tail(raw);
 
             // Take the next queued event if one is already waiting; otherwise the burst is drained
             // and we fall through to the single present. Never parks, so an empty channel costs one
