@@ -1506,6 +1506,73 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     // --- Witness Rematch ---
                                     serial_println!(":: kepler: witness-rematch begin (pgraph on) ::");
 
+                                    // --- Recon: PFIFO/Channel Validate Strip ---
+                                    let class_alive = |v: u32, zero_refute: &'static str| -> &'static str {
+                                        let c = classify_fecs_word(v);
+                                        if c == "VALUE" { "VALUE,alive" }
+                                        else if c == "ZERO" { zero_refute }
+                                        else if c == "POISON" { "POISON,severed" }
+                                        else { "ABSENT,severed" }
+                                    };
+                                    let class_zero = |v: u32, val_refute: &'static str| -> &'static str {
+                                        let c = classify_fecs_word(v);
+                                        if c == "ZERO" { "ZERO,alive" }
+                                        else if c == "VALUE" { val_refute }
+                                        else if c == "POISON" { "POISON,severed" }
+                                        else { "ABSENT,severed" }
+                                    };
+                                    let class_presubmit = |v: u32| -> &'static str {
+                                        let c = classify_fecs_word(v);
+                                        if c == "ZERO" { "ZERO,pre-submit" }
+                                        else if c == "VALUE" { "VALUE,pre-submit-dirty" }
+                                        else if c == "POISON" { "POISON,severed" }
+                                        else { "ABSENT,severed" }
+                                    };
+
+                                    let inst_base_mem = core::ptr::read_volatile((bar1 + inst_off + 0x10) as *const u32);
+                                    let gpfifo_ptr = core::ptr::read_volatile((bar1 + inst_off + 0x48) as *const u32);
+                                    let pmc_en = mmio_read(bar0, 0x200);
+                                    let subfifo_en = mmio_read(bar0, 0x204);
+                                    let eng_mask = mmio_read(bar0, 0x2390);
+                                    let playlist_base = mmio_read(bar0, 0x2270);
+                                    let playlist_rd = mmio_read(bar0, 0x2280);
+                                    let pfifo_intr = mmio_read(bar0, 0x2100);
+                                    let pfifo_err = mmio_read(bar0, 0x252c);
+                                    let sched_stat = mmio_read(bar0, 0x263c);
+
+                                    serial_println!(":: kepler: recon inst_base_mem={:08X}({}) gpfifo_ptr={:08X}({}) ::",
+                                        inst_base_mem, class_alive(inst_base_mem, "ZERO,refutes-memory"),
+                                        gpfifo_ptr, class_alive(gpfifo_ptr, "ZERO,refutes-memory"));
+                                    serial_println!(":: kepler: recon pmc_en={:08X}({}) subfifo_en={:08X}({}) eng_mask={:08X}({}) ::",
+                                        pmc_en, class_alive(pmc_en, "ZERO,refutes-active"),
+                                        subfifo_en, class_alive(subfifo_en, "ZERO,refutes-active"),
+                                        eng_mask, class_alive(eng_mask, "ZERO,refutes-active"));
+                                    serial_println!(":: kepler: recon playlist_base={:08X}({}) playlist_rd={:08X}({}) ::",
+                                        playlist_base, class_presubmit(playlist_base),
+                                        playlist_rd, class_presubmit(playlist_rd));
+                                    
+                                    if pfifo_err == 2 {
+                                        serial_println!(":: kepler: recon pfifo_intr={:08X}({}) pfifo_err={:08X}(VALUE,NO_POLL) sched_stat={:08X}({}) ::",
+                                            pfifo_intr, class_zero(pfifo_intr, "VALUE,INTR_PENDING"),
+                                            pfifo_err, sched_stat, class_alive(sched_stat, "ZERO,refutes-active"));
+                                    } else {
+                                        let err_c = classify_fecs_word(pfifo_err);
+                                        if err_c == "ZERO" {
+                                            serial_println!(":: kepler: recon pfifo_intr={:08X}({}) pfifo_err={:08X}(ZERO,alive) sched_stat={:08X}({}) ::",
+                                                pfifo_intr, class_zero(pfifo_intr, "VALUE,INTR_PENDING"),
+                                                pfifo_err, sched_stat, class_alive(sched_stat, "ZERO,refutes-active"));
+                                        } else if err_c == "POISON" || err_c == "ABSENT" {
+                                            serial_println!(":: kepler: recon pfifo_intr={:08X}({}) pfifo_err={:08X}({},severed) sched_stat={:08X}({}) ::",
+                                                pfifo_intr, class_zero(pfifo_intr, "VALUE,INTR_PENDING"),
+                                                pfifo_err, err_c, sched_stat, class_alive(sched_stat, "ZERO,refutes-active"));
+                                        } else {
+                                            serial_println!(":: kepler: recon pfifo_intr={:08X}({}) pfifo_err={:08X}(VALUE,err=0x{:X},unnamed) sched_stat={:08X}({}) ::",
+                                                pfifo_intr, class_zero(pfifo_intr, "VALUE,INTR_PENDING"),
+                                                pfifo_err, pfifo_err,
+                                                sched_stat, class_alive(sched_stat, "ZERO,refutes-active"));
+                                        }
+                                    }
+
                                     // 2. Bind and Enable PFIFO_CHAN for channel 1
                                     mmio_write(bar0, 0x800000 + (1 * 8), 0); 
                                     mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400); 
