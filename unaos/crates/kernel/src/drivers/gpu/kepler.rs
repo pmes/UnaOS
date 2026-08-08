@@ -1573,6 +1573,18 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                         }
                                     }
 
+                                    // FENCE Arc: Hypothesis 3 - ENGINE_TRIGGER host handshake (Placement Experiment)
+                                    let eng_trig_pre = fecs_read(bar0, 0x409c08);
+                                    serial_println!(":: kepler: recon eng_trig_pre={:08X} ::", eng_trig_pre);
+
+                                    if eng_trig_pre == 1 {
+                                        serial_println!(":: kepler: eng_trig_pre == 1 (NULL RESULT, write is no-op) ::");
+                                    }
+
+                                    fecs_write(bar0, 0x409c08, 1);
+                                    let eng_trig_post = fecs_read(bar0, 0x409c08);
+                                    serial_println!(":: kepler: recon eng_trig_post={:08X} ::", eng_trig_post);
+
                                     // 2. Bind and Enable PFIFO_CHAN for channel 1
                                     mmio_write(bar0, 0x800000 + (1 * 8), 0); 
                                     mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400); 
@@ -1580,13 +1592,16 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
 
                                     let err = mmio_read(bar0, 0x252c);
                                     let stat = mmio_read(bar0, 0x263c);
+                                    let err_c = class_zero(err, "VALUE,NO_POLL");
                                     let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
                                     serial_println!(":: kepler: sched-status post-init err={:08X} ({}) stat={:08X} ::", err, err_str, stat);
 
                                     if err == 0 {
-                                        serial_println!(":: kepler: H3/H4 arm=Worked ::");
+                                        serial_println!(":: kepler: H3 arm=Worked ::");
                                     } else if err == 2 {
-                                        serial_println!(":: kepler: H3/H4 arm=Did-not-work ::");
+                                        serial_println!(":: kepler: H3 arm=Did-not-work (STRIPPED) ::");
+                                    } else {
+                                        serial_println!(":: kepler: H3 arm=Made-it-worse ({}) ::", err_c);
                                     }
 
                                     let ch_1_0_pre = mmio_read(bar0, 0x800000 + (1 * 8));
@@ -1595,8 +1610,11 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     
                                     // Witness check
                                     if (ch_1_0_pre & 0xC0000000) != 0xC0000000 {
-                                        serial_println!(":: kepler: WITNESS STRIPPED. Restoring inst_off+0x0C ::");
+                                        serial_println!(":: kepler: WITNESS STRIPPED. Restoring inst_off+0x0C and engine_trigger ::");
                                         core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, (userd_off >> 32) as u32);
+                                        fecs_write(bar0, 0x409c08, eng_trig_pre);
+                                        serial_println!(":: kepler: recon engine_trigger_restore={:08X} ::", fecs_read(bar0, 0x409c08));
+
                                         // Re-test PFIFO_CHAN[1] to clear state
                                         mmio_write(bar0, 0x800000 + (1 * 8), 0);
                                         mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400);
@@ -1607,7 +1625,9 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                         let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
                                         serial_println!(":: kepler: sched-status post-restore err={:08X} ({}) stat={:08X} ::", err, err_str, stat);
                                     } else {
-                                        serial_println!(":: kepler: WITNESS PASSED - bits stuck! ::");
+                                        serial_println!(":: kepler: WITNESS PASSED - bits stuck! Restoring engine_trigger ::");
+                                        fecs_write(bar0, 0x409c08, eng_trig_pre);
+                                        serial_println!(":: kepler: recon engine_trigger_restore={:08X} ::", fecs_read(bar0, 0x409c08));
                                     }
 
                                     // --- POLL-CONTROL leg (GR5, s37): the one variable never varied WITH an

@@ -43,8 +43,28 @@ We will insert the following read-only block immediately before line 1512.
 Every `{}` classification will state the raw class (`VALUE`, `ZERO`, `POISON`, `ABSENT`) and append an explicitly stated refutation or healthy value exactly matching the deliverable table (e.g., `ZERO,refutes-active`, `VALUE,alive`, `VALUE,NO_POLL`).
 
 ## 3. Write Experiment
-**None proposed at this stage.**
-Per the brief, we perform *at most one* write experiment *only if* the recon names a specific missing precondition. Since we do not yet know which precondition is unmet, we will execute this read-only recon first to collect the missing data. The output will yield the Deliverable table.
+
+The `ENGINE_TRIGGER` (`0x409c08`) host handshake (Hypothesis 3) is actually NOT untried; `kepler.rs:1372-1380` already writes `1` to it (pull 35's H2/H3 arm) during the ucode-echo loop, which fires on every FIFO boot. Sitting #37 shows that this initial write succeeds (`img=A`), and no PMC reset intervenes before our validation logic at `:1576`.
+
+However, sitting #35 showed that host pokes to CTXCTL registers took but built no state. The genuinely new variable we are testing is **PLACEMENT**: we will execute the write post-ucode, immediately pre-VALID. We also note that sitting #37 retired `NO_POLL`: writing `VALID` without `POLL_ENABLE` gives byte-identical `err=0x2`, so we must drop the `NO_POLL` framing.
+
+We will add a write experiment immediately after the recon reads and before the `VALID` write at `:1576`.
+1. **Justifying Read (Pre-Image):** We will read `ENGINE_TRIGGER` (`0x409c08`) via `fecs_read` to capture the handshake state before intervention.
+2. **Write:** We will write `1` (the value pull 34/35 already writes) to `ENGINE_TRIGGER` (`0x409c08`) via `fecs_write` to complete the host handshake.
+3. **Restoration:** Following the BCMA-S1 shape, we will read back the `ENGINE_TRIGGER` state to verify the write. On every exit path (whether the witness passes, strips, or wedges), we will restore `ENGINE_TRIGGER` to its exact pre-image value so that we leave a defined state (e.g. not leaving `1` latched through the runlist submit if it was `0`).
+
+### Emitter Strings (The Prediction)
+
+We predict that completing the host handshake at this new placement will satisfy PFIFO's validation gate. When the fence works (the validation succeeds):
+- The readback at `:1525` (now the readback after the write) will retain the `VALID` bit: it will read `0xC0000000 | (inst_off >> 12)` (or similar, depending on the exact written instance offset).
+- `pfifo_err` (`CHAN_TABLE_ERROR`) will remain `0x0` (quiet), rather than stripping to `0x00002000` with `err=0x2`.
+
+**Null-Result Flag:** If `eng_trig_pre` reads `1`, our write of `1` is a no-op. The boot proves nothing about placement, and this shape will be logged as a null result.
+
+**Refutation Shapes:**
+If the write experiment fails (a refute):
+- **Stripped:** The channel readback still strips `VALID` (`0x00002000`), and `pfifo_err` reports `0x2`.
+- **Wedged (Made it worse):** `pfifo_err` is altered to an unhandled or poisoned state (`POISON`, `ABSENT`, or unnamed values). This will be distinctly printed by routing `err` through `classify_fecs_word`.
 
 ## 4. Deliverable Recon Table
 The following table maps the falsifiable outcomes of our recon to the hardware precondition they refute. The seat will fill in the `Observed` column from the metal log.
@@ -61,5 +81,4 @@ The following table maps the falsifiable outcomes of our recon to the hardware p
 | No Faults | `pfifo_intr` | `ZERO` | `VALUE` (nonzero) | | |
 | No Faults | `pfifo_err` | `ZERO` | `VALUE` (nonzero) | | |
 | Sched Healthy | `sched_stat` | `VALUE` (nonzero) | `ZERO` | | |
-
-Whichever precondition lands in a Refutation State identifies the exact gate blocking `VALID`.
+| Host Handshake | `engine_trigger` | `VALUE` | `ZERO` | | |
