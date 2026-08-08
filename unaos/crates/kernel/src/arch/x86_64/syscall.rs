@@ -4236,8 +4236,24 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
 /// first keystroke routed to a window and strand everything queued behind it. `Event::Unknown`
 /// already falls through every such loop's catch-all arm as a no-op, which is precisely the
 /// "swallowed, keep draining" semantics required.
+///
+/// ### CURSOR-VUG — a consumed POINTER report still moves the system arrow
+///
+/// `Event::Mouse`/`Event::MouseAbsolute` are packable, so before this arc a focused ring-3 app
+/// swallowed every pointer report whole: the shell's drain fell through its catch-all arm and
+/// `pal::cursor::move_rel` was never called again for as long as that app held focus. The arrow
+/// froze, auto-hid 1.5 s later, and was then taken off the panel by the next composite tail that
+/// bracketed its box — which over a PRESENTING window is within a frame and over a static desktop is
+/// never. That asymmetry is Peter's "vug blocks mouse cursor" exactly, and it is also why every
+/// cursor witness stops emitting at the moment a window is raised (`pal::cursor::rollup_tick` hangs
+/// off the same motion path). See [`crate::pal::cursor::track_routed`] for the full ledger.
+///
+/// The delivery decision is UNTOUCHED — the app receives the report, and the shell still sees
+/// `Event::Unknown`. Only the consumed branch tracks, so a report the router declined is moved by
+/// the drain exactly once, as it always was; a relative report can never be applied twice.
 pub fn user_input_route(ev: crate::pal::Event) -> crate::pal::Event {
     if user_input_enqueue(ev) {
+        crate::pal::cursor::track_routed(&ev);
         crate::pal::Event::Unknown
     } else {
         ev
