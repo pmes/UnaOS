@@ -5207,6 +5207,135 @@ is the pass condition.
 
 ---
 
+### WCSER — one composite pass on the panel at a time (x86)
+
+**P-AQ (Peter, bench rMBP, Boot AQ):** *"massive flicker in stacked windows and even without mouse
+movement the lower window bleeds through especially for the top window in a stack if it is
+selected."*
+
+#### The defect
+
+`composite()` is called once per present, from the presenting task's own core, and nothing excluded
+two of them. Each pass takes its own damage snapshot, closes it upwards over occlusion, and blits
+back-to-front. That is correct in isolation and **not composable**: pass A drawing `{lower, upper}`
+and pass B drawing `{upper}` can interleave as
+
+```
+A.lower … B.upper … A.upper
+```
+
+which leaves the LOWER window's pixels on top of the upper one for the length of one window blit.
+At the panel that is the lower window bleeding through the upper; repeated at the fleet's present
+rate it is a flicker. `F4`'s `BLIT_ACTIVE` is a **counter**, not a mutex — it exists so a teardown
+can drain in-flight blits, and it never excluded anything.
+
+#### The evidence is arithmetic, not inference
+
+`[comp2]` reports pass count and mean pass time over a measured span, so the compositor's duty cycle
+is a division:
+
+| at | passes | pass_us | span | pass-time | utilisation |
+|---|---|---|---|---|---|
+| 665644ms | 1807 | 3997 | 5000ms | 7.22 s | **144 %** |
+| 653759ms | 1225 | 2656 | 3061ms | 3.25 s | **106 %** |
+
+A single compositor cannot exceed 100 %. At least two cores were inside `composite` simultaneously,
+in sustained steady state. **x86 had no direct instrument for this** — FLUID-3's `FL3_DEPTH_MAX` /
+`FL3_OVERLAP` are `target_arch = "aarch64"` only — which is why the overlap went unnamed for as long
+as it did, and why the reading had to be recovered from `[comp2]`'s own two numbers.
+
+Corroborating, from the same boot:
+
+```
+[ 229966ms] [wc-d] verify win=10 … bad_cache=49664 bad_ram=33499 moved=221400 …
+                   first=(1633,869) got=0x1e1e1e want=0x100e16 -> FAIL
+```
+
+221 400 pixels changed under the verifier between its pre-blit reference and its read-back, and the
+colour on glass is the desktop erase colour — a foreign painter inside win=10's own rect during
+win=10's own composite.
+
+#### The gate
+
+`composite()` on x86 now takes `COMP_GATE`, a **non-blocking** flag; `composite_once` is the pass it
+used to be, unchanged.
+
+* **Try, never spin.** A loser never waits, on any core, masked or not. This is the F4 family's law
+  (`cursor::claim_bounded` states it for `SPRITE`): `composite` is reached from `sched::exit` →
+  `close_owner` with interrupts already masked, and from both present chains holding `IrqGuard` +
+  `WINDOWS`. A blocking acquisition on any of those is a wedge. The gate adds nothing to
+  `DrainBarrier::drain`'s wait set — `BLIT_ACTIVE` is still the only thing that barrier waits on.
+* **Nothing is dropped.** A decliner returns *before* the table snapshot, so it clears no `damaged`
+  flag and consumes no band; the damage it would have drawn is still on the table. It publishes
+  `COMP_PENDING` and runs the `Untouched` cursor tail (`ensure_drawn`), because `wm::erase` takes the
+  sprite down and leaves the composite that follows to put it back — a contract that predates WC-I
+  and that a decline may not break.
+* **The holder re-runs** a full pass (own snapshot, own closure, own order, own tail — so no tail is
+  ever skipped) while `COMP_PENDING` is set and `any_damaged()` still holds, bounded by
+  `COMP_RERUN_MAX = 2`. **That bound is an IRQ-masked-time bound, not a throughput one**: the holder
+  is usually `sys_win_present` inside `IrqGuard::mask_save()` holding `WINDOWS`, and each round
+  extends the masked window by a whole pass (~4 ms mean, 41 ms worst on AQ).
+* **A lost-wakeup close** re-arms one more attempt after release, for the decliner that publishes
+  between the holder's last `swap` and its release. Without it, a static desktop could keep damage on
+  the table with no core committed to drawing it.
+* **Reentrancy is safe by construction**: a nested `composite()` on the gate-holding core simply
+  declines and is picked up by the holder's own loop.
+
+The effect at the panel is **coalescing**: several windows' presents that used to be several
+uncoordinated whole-stack rewrites become one correctly-ordered pass over their union.
+
+#### `[wcser]` — the instrument the fix produces
+
+Rides `[wcn]`'s cadence and span, directly under the per-window `comp_rate=` lines it explains:
+
+```
+[wcser] scope=live entered=N declined=M reruns=R declined_pct=P span=Sms -> SERIAL|SOLO
+```
+
+`declined` is the reading: the number of composite passes that would previously have been
+interleaving their blits with another core's. `SOLO` (`declined=0`) is **not** a failure — it is a
+period in which one core did all the compositing — but it *is* a falsifier for any claim that this
+gate fixed a flicker observed during that period.
+
+#### x86 only, and the cfg is not the justification
+
+aarch64 already carries FLUID-3's depth instrument and its own metal cadence. Changing the Pi's
+compositor from the x86 seat, with no Pi boot to verify it, is what this tree's verification law
+forbids. The aarch64 arm of `composite` calls `composite_once` directly, so that arch's behaviour is
+byte-identical to before.
+
+#### Refuted along the way
+
+* **"Null keep-alive pointer reports drive the repaint path with no motion."** REFUTED at the
+  source: every `Event::Mouse` producer already filters zero motion before pushing
+  (`drivers/ehci/mod.rs` ×4 — including the rMBP internal trackpad's live 0x02 path — and
+  `drivers/xhci/mod.rs`). There is no null-report stream on this hardware, so gating
+  `pal::cursor::track_routed` on `x != 0 || y != 0` would be a no-op on metal. It was not done.
+* **"The cursor's `repair` → `damage_intersecting` cascade is the rate driver."** Not the driver:
+  `[cursor8] floor_ms=8`, ~21 cascades/s against `[wcn] comp_rate=605/s`. CURSOR-VUG is not
+  reverted and needs no gate. What it did was make the focused window's stack a fresh source of
+  composite passes — which is why the symptom was worst on the selected top window — but the passes,
+  not the cursor, are the defect.
+* **Intra-pass z-order was never wrong.** The upward closure to a fixed point and the ascending
+  `(z, id)` sort are correct and untouched. The bug is strictly *between* passes.
+
+#### Metal watch-list (WCSER)
+
+* **The prediction**: stacked windows hold a steady image, no lower-window content through an upper
+  one with or without pointer motion, and the selected top window is the steadiest rather than the
+  worst. On the wire: `[wcser] … -> SERIAL` with `declined > 0`, and `[comp2] passes × pass_us`
+  falling below the span (utilisation under 100 %, which serialisation forces).
+* **The refutes**: `[wcser] -> SOLO` throughout a sitting in which the flicker persists (the
+  interleave was not happening and the conviction is wrong — the single strongest falsifier, and one
+  line); `declined_pct` high with the flicker unchanged (the gate excludes passes but the bleed has
+  another source — next suspects are the kernel-side composite callers, which are not paced, and
+  `cursor::refresh_locked`'s save-under captured mid-pass); any `[wc-d]`/`[wc-g]` verdict that was
+  PASS/CLEAN on AQ and is not now; the pointer freezing over a focused vug again (the declined
+  pass's `ensure_drawn` tail is not honouring `wm::erase`'s contract); a visible latency step in
+  present-heavy scenes (`COMP_RERUN_MAX` is costing more masked time than budgeted — drop it to 1).
+
+---
+
 ### CURSOR-11 — the arrow stops leaving the glass over a presenting window
 
 **P73 (Peter, bench Pi 4).** With the pointer parked over a PRESENTING vug, the cursor and the vug's
