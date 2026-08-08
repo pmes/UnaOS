@@ -568,6 +568,11 @@ pub struct Controller {
     /// `(0, 0)` at depth 0, where the root witness prints no parent at all.
     #[cfg(feature = "bt")]
     bt_parent: (u8, u8),
+    /// MTFIX — has this controller's single `bt_slot` already been handed to a radio? The slot's
+    /// QH stays linked in the periodic chain for the life of the boot, so it can be armed exactly
+    /// once; see `bt_arm_events`.
+    #[cfg(feature = "bt")]
+    bt_evt_armed: bool,
 }
 
 // Raw pointers to identity-mapped DMA memory; access is serialized by the EHCI_HID mutex.
@@ -1921,7 +1926,11 @@ impl Controller {
                 );
                 continue;
             }
-            self.arm_interrupt_ep(t, ep, mps.min(64), proto == 1, proto == 2, None, intf);
+            // MTFIX: the witness and the bootlog stamp below are now GATED on the arm having
+            // happened — see `arm_interrupt_ep`'s return value.
+            if !self.arm_interrupt_ep(t, ep, mps.min(64), proto == 1, proto == 2, None, intf) {
+                continue;
+            }
             serial_println!(
                 ":: EHCI-HID: [{}] M2 armed {} addr={} ep=IN{} mps={} interval={} (boot protocol) == witness ::",
                 self.idx,
@@ -1997,7 +2006,12 @@ impl Controller {
             #[cfg(feature = "mtraw")]
             self.bcm5974_mt_raw_probe(t, intf);
         }
-        self.arm_interrupt_ep(t, ep, mps.min(64), false, false, Some(layout), intf);
+        // MTFIX: everything below — the bootlog milestone and both `== witness` lines — is the
+        // report of an endpoint that IS armed. Boot AN printed all of it for an endpoint the
+        // exhausted slot pool had just skipped.
+        if !self.arm_interrupt_ep(t, ep, mps.min(64), false, false, Some(layout), intf) {
+            return;
+        }
         // GUI-WITNESS: the report-protocol pointer (the rMBP trackpad, incl. the Apple
         // vendor-multitouch interface) is armed — the trackpad-input milestone.
         crate::bootlog::record("ehci:trackpad-armed");
@@ -2664,10 +2678,17 @@ impl Controller {
     /// `service()`. Returns None (with a trace) if the static slot pool is exhausted.
     #[cfg(feature = "bt")]
     unsafe fn bt_arm_events(&mut self, t: &Target, ep: u8, mps: u16) -> Option<BtEvtEp> {
-        if self.int_next >= MAX_INT_EPS {
+        // MTFIX: the event endpoint owns `bt_slot`, not one of the HID `int_slots` — see the
+        // field's doc-comment in `qh.rs` for the Boot AN conviction. The slot is single, and
+        // `bt_quiesce_events` leaves its QH LINKED in the periodic chain for the life of the boot
+        // (the chain must not be rewritten behind endpoints armed after it), so re-arming it for a
+        // second radio would rebuild a QH the controller is still walking AND splice its own
+        // physical address in as its own `horiz` successor — a self-loop in the frame list. One
+        // arm per controller, refused honestly.
+        if self.bt_evt_armed {
             serial_println!(
-                ":: bt-l0: [{}] static int-EP pool exhausted ({}) — HCI event endpoint not armed ::",
-                self.idx, MAX_INT_EPS
+                ":: bt-l0: [{}] HCI event endpoint slot already owned by an earlier radio on this controller — not armed ::",
+                self.idx
             );
             return None;
         }
@@ -2676,7 +2697,7 @@ impl Controller {
             serial_println!(":: bt-l0: [{}] HCI event endpoint reports mps=0 — not armed ::", self.idx);
             return None;
         }
-        let slot = &mut (*self.pool()).int_slots[self.int_next];
+        let slot = &mut (*self.pool()).bt_slot;
         let (qh, qtd, buf) = (
             &mut slot.qh as *mut Qh,
             &mut slot.qtd as *mut Qtd,
@@ -2691,7 +2712,7 @@ impl Controller {
             );
             return None;
         };
-        self.int_next += 1;
+        self.bt_evt_armed = true;
 
         (*qh).ep_chars = (t.addr as u32)
             | ((ep as u32) << 8)
@@ -2898,13 +2919,20 @@ impl Controller {
         // discovered in the service loop can address SET_REPORT back at it. Both call sites
         // already have it in scope.
         intf: u8,
-    ) {
+        // MTFIX: returns whether the endpoint is ACTUALLY armed. Both call sites printed their
+        // `== witness` line (and stamped `bootlog`) unconditionally after calling this, so on Boot
+        // AN the log carried `M1 armed vendor-multitouch addr=9` on the line immediately AFTER
+        // `static int-EP pool exhausted (4) — endpoint skipped`, for the very endpoint that had
+        // just been skipped. A witness that fires when the thing it witnesses did not happen is
+        // worse than no witness: it is what made "the trackpad is armed and silent" the working
+        // theory for a whole sitting. The verdict now comes from the arming path itself.
+    ) -> bool {
         if self.int_next >= MAX_INT_EPS {
             serial_println!(
-                ":: EHCI-HID: [{}] static int-EP pool exhausted ({}) — endpoint skipped ::",
-                self.idx, MAX_INT_EPS
+                ":: EHCI-HID: [{}] STOP-NOTE static int-EP pool exhausted ({}) — addr {} intf {} ep=IN{} NOT armed ::",
+                self.idx, MAX_INT_EPS, t.addr, intf, ep
             );
-            return;
+            return false;
         }
         let slot = &mut (*self.pool()).int_slots[self.int_next];
         let (qh, qtd, buf) = (
@@ -2924,7 +2952,7 @@ impl Controller {
                 ":: EHCI-HID: [{}] STOP-NOTE int-EP slot failed the phys/alignment contract — endpoint skipped ::",
                 self.idx
             );
-            return;
+            return false;
         };
         self.int_next += 1;
 
@@ -3069,6 +3097,8 @@ impl Controller {
             #[cfg(feature = "mtraw_inject")]
             mt_prev: None,
         });
+        // MTFIX: armed, linked, and registered with `service()` — the only path that returns true.
+        true
     }
 
     /// The controller's static DMA pool (index-bound checked at construction).
@@ -5320,6 +5350,9 @@ pub fn init() {
                         // witness never reads it.
                         #[cfg(feature = "bt")]
                         bt_parent: (0, 0),
+                        // MTFIX: the dedicated HCI-event slot is free until a radio claims it.
+                        #[cfg(feature = "bt")]
+                        bt_evt_armed: false,
                     };
                     // Firmware-stale detection BEFORE any schedule programming: probe 2 showed
                     // Apple EFI leaves PSE=1 behind (its pre-boot keyboard), which HSE-halts
