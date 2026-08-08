@@ -455,9 +455,23 @@ fn vugmin_publish(asid: u64, hidden: bool) {
     if asid == 0 || asid >= 64 {
         return;
     }
+    // VUGMIN-D — BOTH ARCHES PUBLISH. Until this commit the `cfg` pair here read
+    // `#[cfg(aarch64+baremetal)] set_hidden(...)` / `#[cfg(not(...))] let _ = hidden;`, i.e. on x86
+    // the whole seam was a discard: `wm` hid every window on a TAB-to-shell and the apps were never
+    // told. What that cost is measured — Boot AJ, two vugs at 42,000 presents/s each with
+    // `comp_rate=0.0/s` and the rollup reading `STARVED` — because the compositor's ACCEPT was the
+    // only pacer those apps had, and a suppressed present returns before it reaches `composite()`.
+    // The `cfg`s are per-arch dispatch now, not a live arm and a dead one; each names the module that
+    // owns that arch's info page, and both are `baremetal`-gated because the info page is.
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     crate::arch::aarch64::syscall::set_hidden(asid, hidden);
-    #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+    // No `baremetal` conjunct on this arm: unlike aarch64's, `arch::x86_64::syscall` is compiled
+    // unconditionally (`arch/x86_64/mod.rs`), and so is the info page it publishes through.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::syscall::set_hidden(asid, hidden);
+    // The hosted aarch64 builds (`pi`/`tegra` without `baremetal`) compile no `syscall` module and no
+    // info page, so there is nothing to publish to — they still have to consume the argument.
+    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "baremetal"))))]
     let _ = hidden;
     #[cfg(feature = "witness")]
     {
@@ -794,7 +808,42 @@ pub fn close_compat() -> bool {
 /// thing the panel gets back is a full repaint from the LATEST surface content, not from whatever the
 /// last composited frame happened to be. Nothing is deferred here; a pass is skipped, not owed.
 pub fn present(id: WinId) -> bool {
+    present_banded(id, None) != Presented::NoRow
+}
+
+/// PRESSURE-1 — what a present actually DID, for the one caller that has to charge for it.
+///
+/// [`present`]'s `bool` cannot answer the question: it folds "the pass ran" and "the pass was
+/// suppressed because the owner is hidden" into the same `true`. That is exactly right for the kernel
+/// callers, which present furniture and do not care, and exactly wrong for the syscall layer, which is
+/// the only pacer a ring-3 app has. A suppressed present returns before it reaches [`composite`], so
+/// on the measured boot it cost ~24 microseconds against ~3.8 ms for a real one, and two apps that had
+/// been presenting at 264/s each went to 42,000/s each the moment they were hidden — with
+/// `comp_rate=0.0/s` and the rollup reading `STARVED`. The compositor's ACCEPT was the pacer, and a
+/// decline handed the pacing back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Presented {
+    /// The pass ran — the surface reached [`composite`].
+    Composited,
+    /// The row is live, but every window its owner holds is below `SHELL_Z`: VUGMIN-B suppressed the
+    /// pass before `composite()`. Nothing is owed — see [`present`]'s note on unhide.
+    Suppressed,
+    /// `id` named no live window. The pre-existing `false` of [`present`], unchanged, and deliberately
+    /// NOT a form of `Suppressed`: a headless run (`wm` never ready, so the syscall layer holds
+    /// `WIN_NONE`) lands here on every present, and charging for it would throttle every app on a
+    /// machine with no panel.
+    NoRow,
+}
+
+/// PRESSURE-1: [`present`], reporting which of the three outcomes it took. Same pass, same order, same
+/// witnesses — the only difference is what the caller is told.
+pub fn present_outcome(id: WinId) -> Presented {
     present_banded(id, None)
+}
+
+/// PRESSURE-1: [`present_rows`], reporting which of the three outcomes it took.
+pub fn present_rows_outcome(id: WinId, sy0: usize, sy1: usize) -> Presented {
+    present_banded(id, Some((sy0, sy1)))
 }
 
 /// FBCON-DMG — present `id`, declaring only SOURCE rows `[sy0, sy1)` of its surface damaged.
@@ -810,13 +859,13 @@ pub fn present(id: WinId) -> bool {
 ///
 /// Returns `false` if `id` names no live window.
 pub fn present_rows(id: WinId, sy0: usize, sy1: usize) -> bool {
-    present_banded(id, Some((sy0, sy1)))
+    present_banded(id, Some((sy0, sy1))) != Presented::NoRow
 }
 
 /// The body both present verbs share. `band` is `None` for a whole-box present, which is
 /// byte-for-byte the pre-FBCON-DMG [`present`]; see that function's docs for VUGMIN-B and WC-N,
 /// neither of which this arc touches.
-fn present_banded(id: WinId, band: Option<(usize, usize)>) -> bool {
+fn present_banded(id: WinId, band: Option<(usize, usize)>) -> Presented {
     // WC-G — the surface as the OWNER declared it finished. Taken here and nowhere else: this is the
     // one moment the owner is provably not writing (it is parked inside `SYS_WIN_PRESENT`), so it is
     // the only honest baseline for the `app` leg. The identity is captured under the table lock and
@@ -852,7 +901,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>) -> bool {
                 // to charge it to, so it lands on the aggregate line.
                 #[cfg(feature = "witness")]
                 WCN_STALE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                return false;
+                return Presented::NoRow;
             }
         };
         skip = owner_hidden(&t, owner, SHELL_Z.load(core::sync::atomic::Ordering::Acquire));
@@ -878,12 +927,12 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>) -> bool {
             // exact interval whose `hid=` count is the point.
             wcn_tick();
         }
-        return true;
+        return Presented::Suppressed;
     }
     composite();
     #[cfg(feature = "witness")]
     wcn_tick();
-    true
+    Presented::Composited
 }
 
 /// Move `id`'s content origin to `(x, y)` on the panel, clamped on BOTH bounds so the window (with
