@@ -2329,9 +2329,7 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
             let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
             if let Some(id) = crate::arch::sched::current_task_id(cpu) {
                 if let Some(i) = proc_find_running(id) {
-                    PROCS[i].status.store(U4X_KILLED_STATUS, Ordering::Release);
-                    PROCS[i].state.store(PEXITED, Ordering::Release);
-                    PROCS[i].done.post();
+                    proc_publish_exit(i, U4X_KILLED_STATUS);
                 }
             }
         }
@@ -2430,9 +2428,7 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
         if let Some(id) = crate::arch::sched::current_task_id(cpu) {
             if let Some(i) = proc_find_running(id) {
-                PROCS[i].status.store(EXEC_KILLED_STATUS, Ordering::Release);
-                PROCS[i].state.store(PEXITED, Ordering::Release);
-                PROCS[i].done.post();
+                proc_publish_exit(i, EXEC_KILLED_STATUS);
             }
         }
         return;
@@ -2717,9 +2713,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
             let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
             if let Some(id) = crate::arch::sched::current_task_id(cpu) {
                 if let Some(i) = proc_find_running(id) {
-                    PROCS[i].status.store(a0 as i32, Ordering::Release);
-                    PROCS[i].state.store(PEXITED, Ordering::Release);
-                    PROCS[i].done.post();
+                    proc_publish_exit(i, a0 as i32);
                     crate::arch::sched::exit(); // never returns
                 }
             }
@@ -10299,9 +10293,12 @@ fn proc_reserve() -> Option<usize> {
 fn proc_table_full_reason() -> &'static str {
     let (_, _, exited, _) = proc_table_headroom();
     if exited > 0 {
-        // Only NON-background rows can be left here (the sweep takes the others), i.e. a fixture's
-        // planted row awaiting its launcher's verdict. `jobs` cannot reap those and never could.
-        "process table full — every free-able row is already reclaimed; the rest are held by kernel fixtures still settling"
+        // REVIEW-2 (F4): the old text named kernel fixtures as the cause. That is the LIKELY cause — the
+        // sweep has already taken every background corpse, so what remains is normally a launcher's
+        // planted row awaiting its verdict, which `jobs` cannot reap and never could — but this bucket
+        // also counts `PREAPING`, a row mid-release, and blaming fixtures for one would send a reader
+        // hunting the wrong subsystem. Say what is observable and let the state say the rest.
+        "process table full — no row is reclaimable: the rest are settling or held by kernel fixtures (`jobs` cannot reap these)"
     } else {
         "process table full — every row holds a live program (`kill <pid>` one, or wait for it to exit)"
     }
@@ -10354,6 +10351,47 @@ fn proc_find_child(pid: u64) -> Option<usize> {
 }
 
 /// Release a Proc entry to FREE — after reaping in sys_wait, or unwinding a failed sys_spawn claim.
+/// PROCREAP / REVIEW-2 (F2): publish a row's terminal status — the ONE place `PEXITED` and the `done`
+/// permit are ordered against each other, because the correct order depends on WHO can consume the row.
+///
+/// THE HAZARD. Every releaser (`bg_poll(reap)`, `bg_kill`'s confirmed arm, the BGRUN-SCAV sweep) claims
+/// a row by CASing it out of `PEXITED` and then drains its permit with `try_wait`, which must not park —
+/// they can run under the shell's `BG_JOBS` spinlock. So a releaser that claims inside a
+/// `store(PEXITED)` .. `post()` gap drains nothing, frees the row, and the exiting task's `post()` then
+/// lands a permit on a row that has since been recycled; the next tenant's `sys_wait` returns early on a
+/// stranger's permit. The invariant every `try_wait` site assumes — and which `shell::bg_jobs`'s
+/// LOCK-ACROSS-REAP note already asserts in prose — is **`PEXITED` implies the permit is posted**.
+///
+/// WHY THIS IS NOT SIMPLY "POST FIRST EVERYWHERE". `sys_wait` waits on the permit and then, WITHOUT
+/// consulting `state`, reads the status and `proc_free`s the row. Posting before publishing would let it
+/// free the row before the exiting task's `state.store(PEXITED)` lands — stamping `PEXITED` onto a row
+/// that is now `PFREE` (which nothing recovers: `proc_reserve` claims only from `PFREE`, the sweep only
+/// when `bg_owned`, so it strands for the boot) or onto a new tenant's live `PRUNNING` row, which a
+/// reaper then frees under a running program. That is the round-1 mistake in a new costume: publishing a
+/// state word that another party frees against.
+///
+/// SO THE ORDER IS CHOSEN BY THE ROW'S CONSUMER, and the two sets are disjoint and provable:
+///   * `bg_owned` rows are claimable by the three releasers, and are reachable by `sys_wait` from NO
+///     path — a background pid is never installed in any slot's `HANDLES` row, and a handle is the only
+///     way `sys_wait` can name a child. POST FIRST, so the invariant holds exactly where it is needed.
+///   * every other row (a `sys_spawn` child, a foreground `run`, a fixture's planted row) is reachable
+///     only by an index- or handle-holding waiter and is claimable by NO releaser: the sweep requires
+///     `bg_owned`, and `bg_poll`/`bg_kill` resolve background pids. PUBLISH FIRST, which is `sys_wait`'s
+///     standing contract and the order this code has always had.
+///
+/// The `bg_owned` read is stable here: it is set before the task exists, and cleared only by a releaser,
+/// which must first claim the row out of `PEXITED` — a state this call has not published yet.
+fn proc_publish_exit(i: usize, status: i32) {
+    PROCS[i].status.store(status, Ordering::Release);
+    if PROCS[i].bg_owned.load(Ordering::Acquire) {
+        PROCS[i].done.post();
+        PROCS[i].state.store(PEXITED, Ordering::Release);
+    } else {
+        PROCS[i].state.store(PEXITED, Ordering::Release);
+        PROCS[i].done.post();
+    }
+}
+
 fn proc_free(i: usize) {
     PROCS[i].pid.store(0, Ordering::Release);
     PROCS[i].slot.store(0, Ordering::Release); // U7x: drop the pid->slot map with the entry
@@ -12668,6 +12706,12 @@ pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
             continue;
         }
         return match PROCS[pi].state.load(Ordering::Acquire) {
+            // REVIEW-2 (F3): name `PREAPING` explicitly. This is a SECOND load of `state` — the filter
+            // above cannot speak for it — so a row that a releaser claimed in between arrives here, and
+            // the catch-all would have called it `Running`. A row being released is `Gone`; the caller's
+            // next `jobs` would say so anyway, and a job reported running one line and gone the next is
+            // the kind of instrument disagreement that costs a bench session to chase.
+            PREAPING => BgPoll::Gone,
             PEXITED => {
                 let status = PROCS[pi].status.load(Ordering::Acquire);
                 if reap {
