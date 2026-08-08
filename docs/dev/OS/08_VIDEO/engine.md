@@ -6854,7 +6854,10 @@ is claimed by no line it prints.
 
 ### ARTIFACT-AUDIT — what an x86 image can and cannot be asked (2026-08-04)
 
-DMG-REFUSE proves the ABI's refusal contract on QEMU; FBCON-DMG's pixel verdict still waits on metal.
+DMG-REFUSE proves the ABI's refusal contract on QEMU *and on witness metal boots — where, since the
+Boot AL collision, `desktop_app_service` holds its launch (bounded, out loud) until the witness
+settles, because the desktop app's permanent window otherwise occupies the table the witness
+requires empty*; FBCON-DMG's pixel verdict still waits on metal.
 Between those two sits a cheaper question the bench reaches for first — *is this feature actually in
 the image on the stick?* — and the obvious way of asking it returns the wrong answer four different
 ways. All counts below were taken against the real `esp-x86` build
@@ -7126,7 +7129,7 @@ creates in a fixed order: console, then probe.
 |----|------------|---------|-----------|-----------|
 | `win=1` | **the panel console** — fbcon routed into a window; the subject of this arc | 1312x736 | 1314x750 | `[wc-x] console-window win=1 panel=2880x1800 surf=1312x736 box=1314x750 at (783,444) …`, and `[wc-x] activate … console_win=1` |
 | `win=2` | the MOVE-VACATE probe — witness builds only, one-shot, opened and closed in a clear corner. It was `win=3` while the demo window still existed | 8x8 @ 8x | 66x78 | `[wc-x] move-vacate win=2 scale=8x from=(8,8) to=(90,8) box=66x78 painted=true … -> PASS` |
-| first free slot | **the desktop app** — `STAT.ELF`, launched by `wcx::desktop_app_service` from the device-service pass. A ring-3 window like any other: it takes whichever slot is free when its `SYS_WIN_CREATE` lands, so its id is `2` or `3` depending on whether the probe has already opened and closed | 128x128 | scale-dependent | `[wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 entry=0x… pid=P slot=S DETACHED, left RUNNING`, then `[wc-a] create win=<n> asid=<a> surf=128x128 …` |
+| first free slot | **the desktop app** — `STAT.ELF`, launched by `wcx::desktop_app_service` from the device-service pass. A ring-3 window like any other: it takes whichever slot is free when its `SYS_WIN_CREATE` lands — and on a witness build that is now *after* the DMG-REFUSE hold releases, so its id follows the witness ladder's teardown state rather than racing it (Boot AL, pre-hold, saw it land in row 1 mid-ladder and void the refusal witness) | 128x128 | scale-dependent | `[wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 entry=0x… pid=P slot=S DETACHED, left RUNNING`, then `[wc-a] create win=<n> asid=<a> surf=128x128 …` |
 
 The box arithmetic corroborates the wire independently, through `TITLE_H = 12` and `BORDER = 1`:
 8·8 + 2 = 66 and 8·8 + 12 + 2 = 78 for the probe. (The retired demo window's 96·8 + 2 = 770 and
