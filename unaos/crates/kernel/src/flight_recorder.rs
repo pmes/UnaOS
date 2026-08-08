@@ -338,9 +338,16 @@ static REUSED: AtomicBool = AtomicBool::new(false);
 //     pair the aarch64 UNAFS.ATR ACL store binds to. It survives a re-enumeration of the same physical
 //     card (a re-plug changes the xHCI slot id but not the serial), so a legitimate replug is not a
 //     refusal;
-//   * the block device geometry `num_blocks` — it catches a second volume that happens to carry the
-//     same serial (a byte-for-byte image written to two differently sized cards), which the fingerprint
-//     alone cannot tell apart.
+//   * the block device geometry `num_blocks` PLUS the INQUIRY vendor/product strings — these catch a
+//     second volume that happens to carry the same serial (a byte-for-byte image written to another
+//     card), which the FAT fingerprint alone cannot tell apart. The INQUIRY strings cost nothing:
+//     they are already in `BlockDeviceInfo`, and a re-plug of the same device reports them unchanged.
+//
+// RESIDUAL, stated rather than papered over: two cards of the SAME size in the SAME model of reader,
+// written from the SAME staged image, are identical in every one of these fields. That is routine
+// bench practice, so it is not a theoretical collision. The latch catches a DIFFERENT volume; it does
+// not catch a DUPLICATE one. Closing that needs an identity the medium cannot clone, which nothing in
+// this tree currently carries across the boundary.
 //
 // Both are captured inside `reserve_log`, from the very mount the reservation mutates, so there is no
 // window between "which volume did we reserve on" and "which volume did we record". A mismatch is a
@@ -349,8 +356,27 @@ static LOG_VOL_LATCHED: AtomicBool = AtomicBool::new(false);
 static LOG_VOL_ID: AtomicU32 = AtomicU32::new(0);
 static LOG_VOL_CLUSTERS: AtomicU32 = AtomicU32::new(0);
 static LOG_VOL_BLOCKS: AtomicU64 = AtomicU64::new(0);
+/// The INQUIRY vendor+product bytes of the device the reservation ran on, packed as one 64-bit FNV-1a
+/// digest. A digest rather than the 24 raw bytes because this is compared, never displayed, and an
+/// atomic keeps the whole check lock-free on the flush path.
+static LOG_VOL_INQ: AtomicU64 = AtomicU64::new(0);
 /// One-shot latch for the mismatch witness, so a throttled-but-repeating flush names it once.
 static LOG_VOL_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// FRVOL: FNV-1a over the INQUIRY vendor+product strings of the current `Default` device. 0 when no
+/// device is registered — which `volume_matches` treats as a mismatch against any latched non-zero
+/// digest, the fail-closed direction.
+fn default_inquiry_digest() -> u64 {
+    let Some(d) = crate::drivers::block::info() else {
+        return 0;
+    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in d.vendor.iter().chain(d.product.iter()) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 
 /// FRVOL: bind the recorder to `fs` — the volume the reservation is about to mutate. Called from
 /// `reserve_log` immediately after its mount succeeds and BEFORE any directory or FAT byte is touched,
@@ -363,6 +389,7 @@ fn latch_volume(fs: &crate::fs::fat::FatFs) {
         crate::drivers::block::info().map(|d| d.num_blocks).unwrap_or(0),
         Ordering::Relaxed,
     );
+    LOG_VOL_INQ.store(default_inquiry_digest(), Ordering::Relaxed);
     LOG_VOL_LATCHED.store(true, Ordering::Release);
 }
 
@@ -379,6 +406,7 @@ fn volume_matches(fs: &crate::fs::fat::FatFs) -> bool {
     vol_id == LOG_VOL_ID.load(Ordering::Relaxed)
         && clusters == LOG_VOL_CLUSTERS.load(Ordering::Relaxed)
         && blocks == LOG_VOL_BLOCKS.load(Ordering::Relaxed)
+        && default_inquiry_digest() == LOG_VOL_INQ.load(Ordering::Relaxed)
 }
 
 /// FRVOL: the refusal witness. Names BOTH volumes, because "the recorder refused" is only falsifiable
@@ -547,6 +575,17 @@ pub fn service() {
         return; // storage not up yet — nothing to flush to
     }
 
+    // FRGUARD (GR21): derive the boot-medium verdict before asking for it. This is THE unmasked,
+    // lock-free, heap-available site on the x86 main loop, and it sits ahead of every `Default`
+    // writer on the same pass (the `U*_probe_once` ladder and the installer both gate on the same
+    // `block::info()` this function has just watched become `Some`). Deriving costs sector READS —
+    // `fat::volume_serials` walks LBA 0, the GPT spans and every MBR partition start — which is
+    // exactly why it cannot live inside `write_block`, where the caller may be masked, mid-FAT-RMW
+    // and already holding the xHCI loan. Idempotent: one acquire load after the first call, re-armed
+    // only when a new device claims the global slot.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    crate::drivers::block::evaluate_boot_medium_once();
+
     // FRGUARD (GR21): do not even ATTEMPT a reservation on a volume the block layer will refuse to
     // write. The refusal would surface anyway — every mutating path below ends at `write_block` /
     // `write_blocks`, which fail closed — but it would surface LATE and in the wrong voice: the
@@ -562,8 +601,8 @@ pub fn service() {
             .is_ok()
     {
         serial_println!(
-            ":: FR: {} NOT reserved — the block layer refuses Default WRITEs here (the canonical \
-             volume is not the one in the global slot); this boot's log stays in RAM ::",
+            ":: FR: {} NOT reserved — the block layer refuses Default WRITEs here (the global slot is \
+             not the medium this kernel booted from); this boot's log stays in RAM ::",
             LOG_NAME
         );
     }

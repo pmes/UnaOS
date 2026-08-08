@@ -2217,15 +2217,6 @@ pub struct XhciController {
     /// re-queued by a genuine (re)attach it is treated as a hot-plug and pays the full debounce,
     /// which is the metal-proven behaviour (the SD-reader FS-chirp failure) and must not be lost.
     boot_scan_ports: Vec<u8>,
-    /// FRGUARD (GR21): ports whose CURRENT enumeration was queued by a hot-plug edge rather than by
-    /// the initial boot CCS scan. `boot_scan_ports` cannot answer this question at bring-up time —
-    /// it is deliberately CONSUMED on pop (see above) and is empty by the time the SCSI chain runs —
-    /// so the verdict is copied here at pop and kept for as long as the port stays enumerated.
-    /// Membership is the origin of the device on that port, and it is what `bring_up_storage` hands
-    /// `block::publish_usb_geometry` so the block layer can tell the boot volume from a medium the
-    /// operator inserted mid-boot. Boot AI-2 is the case: the storage device on the hot-plugged port
-    /// claimed the global `BLOCK_DEVICE` 296 s in and the flight recorder wrote to it.
-    hotplug_ports: Vec<u8>,
     /// The most recent enumeration stall (for `usbinfo`): where a port's enumeration died.
     last_stall: Option<EnumStall>,
     /// Total enumeration stalls since boot.
@@ -2336,7 +2327,6 @@ impl XhciController {
             enum_saw_disconnect: false,
             requeue_after_settle: Vec::new(),
             boot_scan_ports: Vec::new(),
-            hotplug_ports: Vec::new(),
             port_protocols,
             enum_stage: "idle",
             enum_stage_set_at: 0,
@@ -4906,21 +4896,6 @@ impl XhciController {
                 }
                 None => false,
             };
-            // FRGUARD (GR21): keep the verdict `boot_scan` just consumed, on a list that is NOT
-            // consumed, so `bring_up_storage` can still answer "was this device hot-plugged?" a
-            // second and a SET_CONFIGURATION later. Re-asserted on every pop, so a port that was a
-            // boot-scan entry and is later re-queued by a genuine attach flips to hot-plug — the
-            // same direction `boot_scan_ports`' own consume-on-pop rule takes.
-            {
-                let known = self.hotplug_ports.iter().position(|&p| p == port);
-                match (boot_scan, known) {
-                    (false, None) => self.hotplug_ports.push(port),
-                    (true, Some(i)) => {
-                        self.hotplug_ports.remove(i);
-                    }
-                    _ => {}
-                }
-            }
             let portsc = self.read_portsc(port);
             if (portsc & 1) == 0 {
                 // Not connected — but a USB3 link stuck in an error state reads CCS=0 too
@@ -8951,17 +8926,7 @@ impl XhciController {
         // only when USB is the active backend: on the Pi the microSD registered at BSP probe, so a later
         // USB stick must NOT clobber the SD's geometry (PI-FS-2: a 14 MiB card reader bounded fresh unafs
         // mounts → OutOfBounds(63)); on x86 the stick is the boot backend and still claims the global.
-        //
-        // FRGUARD (GR21): hand the block layer the CLAIM ORIGIN — was this device found by the initial
-        // boot port scan, or queued by a live connect-change edge? The port is the slot's, so this is the
-        // device's own origin and not "did anything get hot-plugged this boot". The block layer records it
-        // and only an `x86_64 + sdhcblk` build reads it back (`block::default_writable`); every other
-        // target ignores the argument entirely.
-        let hotplug_origin = {
-            let port = self.slots.get(slot as usize).map(|s| s.port_id).unwrap_or(0);
-            port != 0 && self.hotplug_ports.contains(&port)
-        };
-        crate::drivers::block::publish_usb_geometry(dev_info, hotplug_origin);
+        crate::drivers::block::publish_usb_geometry(dev_info);
         // GUI-WITNESS: the USB block device is up (geometry published). One of the "did storage come
         // up?" milestones a silent boot otherwise can't answer on-panel.
         crate::bootlog::record("block:up");

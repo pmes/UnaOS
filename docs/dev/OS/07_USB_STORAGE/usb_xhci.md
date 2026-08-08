@@ -5277,9 +5277,25 @@ volume" (`VfsError::Unsupported`) **up front** rather than looking writable and 
 deliberately still fall through (a read cannot corrupt the wrong device, and the USB mount has its own
 `read_block_usb` handle) — the residual is ledgered in [`SECURITY.md`](../../SECURITY.md): a no-SD Pi can
 still *read* a `Default` volume off a substituted stick. The guard is
-`baremetal`-gated on purpose: on QEMU-virt aarch64 (`test-arm`) and on x86 the SD backend is never compiled,
+`baremetal`-gated on purpose: on QEMU-virt aarch64 (`test-arm`) the SD backend is never compiled,
 xHCI **is** the legitimate sole backend, and the function does not exist — those builds are byte-identical
 to pre-USBFALL. The rule is about substitution on a platform that has a canonical backend, not about xHCI.
+
+> **The x86 half of that sentence expired (FRGUARD, GR21, 2026-08-07).** SDHC-4b gave x86 a canonical
+> backend that is NOT the `Default` target — the internal SD registers as handle `Sdhc` and leaves the
+> global slot empty — and Boot AI-2 caught the flight recorder writing `/UNAOS.LOG` onto a card the
+> operator had hot-plugged to read. `x86_64 + sdhcblk` now has its own arm of `default_writable`, keyed
+> on the boot volume's `BS_VolID` as the UEFI loader reported it. See the FRGUARD row in
+> [`SECURITY.md`](../../SECURITY.md).
+>
+> **⚠ Pi lane — F1 has a hole on aarch64 that FRGUARD found and did not close.**
+> `guard_default_write_backend` is called from `write_block` **only**. Since MULTIBLK, every
+> whole-sector run goes through `fs/fat.rs::write_sectors` → `block::write_blocks`, which carries **no
+> guard on `aarch64 + baremetal`**. So a `Default` multi-sector FAT write on a no-SD Pi still lands on
+> the substituted stick — precisely the failure F1 exists to prevent, on the path that carries almost
+> all of the bytes. The x86 arm guards both entry points; the aarch64 arm was left byte-identical
+> because that was the GR21 arc's contract. **The fix is one `#[cfg]`'d call at the head of
+> `write_blocks`.** Ledgered as an open item in [`SECURITY.md`](../../SECURITY.md).
 
 **F2 — the lock span, stated per source.** `fat.rs`'s `with_fat_lock` justified holding `FAT_MUTATION`
 across block I/O with "the aarch64 I/O is polled, so the span is a couple of bounded polled sector
