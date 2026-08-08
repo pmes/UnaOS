@@ -2309,12 +2309,20 @@ impl Controller {
         }
         let wtotal = (cfg[2] as u16) | ((cfg[3] as u16) << 8);
         let want = wtotal.min(BT_CFG_MAX);
-        let over = wtotal > BT_CFG_MAX;
+        let mut over = wtotal > BT_CFG_MAX;
+        let mut got_short: Option<u16> = None;
         let have = cfg.len() as u16;
         // The parameter `cfg` is DEAD past this point; the shadow is the only descriptor read.
         let cfg: &[u8] = if want > have {
             match self.control(t, 0x80, 6, 0x0200, 0, want, true) {
                 Ok(n) if n >= 9 => {
+                    // A short control IN (9 <= n < want) is a TRUNCATED census, not a complete one —
+                    // review C4: without this the walk would read fewer bytes than the descriptor
+                    // declares and the census would claim the whole device silently.
+                    if (n as u16) < want {
+                        over = true;
+                        got_short = Some(n as u16);
+                    }
                     core::slice::from_raw_parts(self.data_buf, (n as usize).min(BT_CFG_MAX as usize))
                 }
                 _ => {
@@ -2460,14 +2468,21 @@ impl Controller {
         }
         if dropped > 0 || over {
             serial_println!(
-                ":: bt-l0: [{}] census addr={} INCOMPLETE — {} interface descriptor(s) past the {}-entry table{} ::",
+                ":: bt-l0: [{}] census addr={} INCOMPLETE — {} interface descriptor(s) past the {}-entry table{}{} ::",
                 self.idx, t.addr, dropped, BT_CENSUS_MAX,
-                if over {
+                if wtotal > BT_CFG_MAX {
                     "; wTotalLength exceeds the 256-byte control buffer, tail unread"
                 } else {
                     ""
-                }
+                },
+                if got_short.is_some() { "; short control read, tail unread" } else { "" }
             );
+            if let Some(g) = got_short {
+                serial_println!(
+                    ":: bt-l0: [{}] census addr={} short read got={} want={} ::",
+                    self.idx, t.addr, g, want
+                );
+            }
         }
 
         let (mut sel, mut tier) = (BtIntf::default(), 0u8);
@@ -2609,15 +2624,18 @@ impl Controller {
                 serial_println!(
                     ":: bt-l0: [{}] HCI_Version {:#04x} => core spec {} (status={:#04x}) == witness ::",
                     self.idx, rp2[1],
+                    // Bluetooth SIG Assigned Numbers, HCI Version — the pre-arc table was shifted
+                    // one slot (0x06 printed "3.0+HS"); review-corrected against the SIG list.
                     match rp2[1] {
-                        0x03 => "1.2",
-                        0x04 => "2.0+EDR",
-                        0x05 => "2.1+EDR",
-                        0x06 => "3.0+HS",
-                        0x07 => "4.0",
-                        0x08 => "4.1",
-                        0x09 => "4.2",
-                        0x0A => "5.0",
+                        0x02 => "1.2",
+                        0x03 => "2.0+EDR",
+                        0x04 => "2.1+EDR",
+                        0x05 => "3.0+HS",
+                        0x06 => "4.0",
+                        0x07 => "4.1",
+                        0x08 => "4.2",
+                        0x09 => "5.0",
+                        0x0A => "5.1",
                         _ => "unmapped",
                     },
                     rp2[0]
