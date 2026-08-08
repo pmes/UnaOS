@@ -1550,7 +1550,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     serial_println!(":: kepler: recon playlist_base={:08X}({}) playlist_rd={:08X}({}) ::",
                                         playlist_base, class_presubmit(playlist_base),
                                         playlist_rd, class_presubmit(playlist_rd));
-                                    
+
                                     if pfifo_err == 2 {
                                         serial_println!(":: kepler: recon pfifo_intr={:08X}({}) pfifo_err={:08X}(VALUE,NO_POLL) sched_stat={:08X}({}) ::",
                                             pfifo_intr, class_zero(pfifo_intr, "VALUE,INTR_PENDING"),
