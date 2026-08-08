@@ -628,8 +628,12 @@ const BT_EVENT_MASK: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x00];
 /// endpoint's max packet is 16 B (census: `IN1/int/16`), but an HCI event runs up to 2 + 255 B;
 /// the USB transport delivers it as ceil(len/mps) interrupt-IN transfers. 260 covers the largest
 /// defined event (an LE Advertising Report) with headroom, so L2 (LE scan) extends without
-/// resizing. An event whose declared length exceeds this is still fully drained off the endpoint
-/// (to keep the toggle in sync) but reported truncated.
+/// resizing. An event whose declared length exceeds this is reported truncated and the reassembler
+/// BREAKS WITHOUT DRAINING the remainder — so the toggle's relationship to the device is lost and the
+/// caller must stop issuing commands, not continue. (Review C2: an earlier comment here claimed the
+/// remainder was drained to keep sync; it is not, and the two `trunc` branches show it. Unreachable
+/// today — the largest possible event is 2+255=257 < 260 — but whoever resizes this cap for L2 must
+/// either add the drain or keep honouring the stop.)
 #[cfg(feature = "bt")]
 const BT_EVT_ASM_MAX: usize = 260;
 /// BT-L0 — HCI event code for Command Complete (Bluetooth Core, Vol 4 Part E).
@@ -2793,7 +2797,13 @@ impl Controller {
                 // Read_Local_Supported_Commands: status(1) + Supported_Commands(64). The full
                 // 64-octet bitfield is the wire truth L2 decodes for LE-scan support; printed
                 // whole, bounded. `n` may be 65 (all octets) when the reassembly fit.
-                BT_HCI_READ_LOCAL_COMMANDS if n >= 1 => {
+                // Review C1: the guard is `n >= 65` (status + the full 64-octet bitfield), NOT `n >= 1`.
+                // This is the ONLY command in the table that needs multi-packet reassembly, so a partial
+                // reassembly is exactly the failure this arc's central mechanism exists to prevent — and
+                // with a `>= 1` guard it would have printed a normal `== witness ::` line with a short
+                // `n=` instead of falling to MALFORMED. A witness that cannot fail on the one case it was
+                // built to prove is not a witness.
+                BT_HCI_READ_LOCAL_COMMANDS if n >= 65 => {
                     serial_print!(
                         ":: bt-l1: [{}] HCI_Read_Local_Supported_Commands (0x1002) status={:#04x} n={} cmds=[",
                         self.idx, status, n.saturating_sub(1)
