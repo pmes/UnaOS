@@ -232,45 +232,104 @@ const OTPS_GUP_FUSE: u32 = 0x0000_0800;
 /// touched is 0x830 + 0x1B7 = 0x9E7, comfortably inside the 4 KiB core window.
 const SPROM_WORDS: u64 = 220;
 
-/// EROM entry encodings (Linux `drivers/bcma/scan.c`).
+// ── EROM entry encodings — Broadcom AI ("aidmp") enumeration ROM ────────────────────────────────
+//
+// Layout as decoded by Linux `drivers/bcma/scan.{h,c}` (`SCAN_*`) and Broadcom's `siutils_priv.h`
+// (`CIA_*`, `CIB_*`, `AD_*`, `SD_*`). Boot AJ's walk found ZERO cores against the previous
+// transcription, and the abort line it printed is the proof of WHICH transcription was wrong:
+//
+// ```text
+// :: bcma: erom-abort at entry 4 while consuming 2 master ports of core id=0xf80 ::
+// ```
+//
+// The first EROM word on a BCM4331 is ChipCommon's CIA. Decoding it with the OLD masks
+// (`id = word[23:12]`) yields `0xf80`; decoding it with the masks below (`id = word[19:8]`,
+// `manuf = word[31:20]`) yields `manuf=0x4bf (BCM) id=0x800 (chipcommon) class=0` from the SAME
+// word `0x4BF80001`. Only one of those is a core this chip has.
+//
+// The same line convicts the CIB masks, at the bit level. `nmp=2` came out of the old
+// `(cib >> 13) & 0xF`, so ChipCommon's real CIB has bits 16:13 = `0b0010` — bit 14 set, 13/15/16
+// clear — and bit 14 is the low bit of `CIB_NMW` below, i.e. ChipCommon has an odd number of master
+// wrappers (1). Meanwhile "entry 4" is arithmetic: the walk read CIA at 0, CIB at 1, then consumed
+// TWO entries before failing a tag check, so entry 2 really did carry the master-port tag (`nmp`
+// is genuinely >= 1) and entry 3 — ChipCommon's FIRST ADDRESS descriptor, its `base` — was eaten as
+// if it were a second master port. A count of 1/1/1/1 for nmp/nsp/nmw/nsw reproduces the observed
+// `nmp=2` exactly through the old mask. Every field below is anchored to that reading; nothing here
+// is asserted about a bit the capture is silent on.
+
+/// Entry is populated. Bit 0 of every EROM dword.
 const ER_VALID: u32 = 0x0000_0001;
+/// Tag field for COMPONENT / MASTER-PORT / END entries: bits 3:1.
 const ER_TAG: u32 = 0x0000_000E;
-const ER_TAG_CI: u32 = 0x0000_0000; // component identifier (a core)
+/// Tag field for ADDRESS entries: bits 2:1 **only** (Linux `SCAN_ER_TAGX`).
+///
+/// This narrower mask is not a nicety. In an address descriptor bit 3 is NOT tag — it is
+/// [`AD_AG32`], "a high address dword follows". Classifying an address descriptor with the full
+/// `0xE` therefore mis-reads every 64-bit-capable descriptor as "not an address", and Linux uses
+/// `SCAN_ER_TAGX` in exactly one place for exactly this reason: `bcma_erom_get_addr_desc`.
+const ER_TAGX: u32 = 0x0000_0006;
+const ER_TAG_CI: u32 = 0x0000_0000; // component identifier (CIA, then CIB)
 const ER_TAG_MP: u32 = 0x0000_0002; // master port descriptor
 const ER_TAG_ADDR: u32 = 0x0000_0004; // address descriptor
 const ER_TAG_END: u32 = 0x0000_000E; // end of the ROM
+/// The end sentinel is the WHOLE word, not just its tag: `ER_TAG_END | ER_VALID`.
+const ER_END_WORD: u32 = ER_TAG_END | ER_VALID;
 const ER_BAD: u32 = 0xFFFF_FFFF;
 
-const CIA_MFG_MASK: u32 = 0x0000_0FFF;
-const CIA_ID_MASK: u32 = 0x00FF_F000;
-const CIA_ID_SHIFT: u32 = 12;
-const CIA_CLASS_MASK: u32 = 0x0F00_0000;
-const CIA_CLASS_SHIFT: u32 = 24;
+// Component Identifier A — manufacturer / core id / class, above the 4-bit tag.
+const CIA_MFG_MASK: u32 = 0xFFF0_0000;
+const CIA_MFG_SHIFT: u32 = 20;
+const CIA_ID_MASK: u32 = 0x000F_FF00;
+const CIA_ID_SHIFT: u32 = 8;
+const CIA_CLASS_MASK: u32 = 0x0000_00F0;
+const CIA_CLASS_SHIFT: u32 = 4;
 
-const CIB_NMW_MASK: u32 = 0x0000_00F8; // # master wrappers
-const CIB_NMW_SHIFT: u32 = 3;
-const CIB_NSW_MASK: u32 = 0x0000_1F00; // # slave wrappers
-const CIB_NSW_SHIFT: u32 = 8;
-const CIB_NMP_MASK: u32 = 0x0001_E000; // # master ports
-const CIB_NMP_SHIFT: u32 = 13;
-const CIB_NSP_MASK: u32 = 0x001E_0000; // # slave ports
-const CIB_NSP_SHIFT: u32 = 17;
+// Component Identifier B — port and wrapper counts, and the CORE revision.
+const CIB_NMP_MASK: u32 = 0x0000_01E0; // # master ports
+const CIB_NMP_SHIFT: u32 = 5;
+const CIB_NSP_MASK: u32 = 0x0000_1E00; // # slave ports
+const CIB_NSP_SHIFT: u32 = 9;
+const CIB_NMW_MASK: u32 = 0x0007_C000; // # master wrappers
+const CIB_NMW_SHIFT: u32 = 14;
+const CIB_NSW_MASK: u32 = 0x00F8_0000; // # slave wrappers
+const CIB_NSW_SHIFT: u32 = 19;
 const CIB_REV_MASK: u32 = 0xFF00_0000;
 const CIB_REV_SHIFT: u32 = 24;
 
-const ADDR_AS_TYPE: u32 = 0x0000_0002; // "size is in the next dword" flag
-const ADDR_AS_64: u32 = 0x0000_0004; // address is 64-bit (a second dword follows)
-const ADDR_TYPE_MASK: u32 = 0x0000_00C0;
-const ADDR_TYPE_SHIFT: u32 = 6;
-const ADDR_SZ_MASK: u32 = 0x0000_0038;
-const ADDR_SZ_SZD: u32 = 0x0000_0018; // "size descriptor follows"
-const ADDR_ADDR_MASK: u32 = 0xFFFF_F000;
+// Address descriptor.
+const AD_ADDR_MASK: u32 = 0xFFFF_F000;
+const AD_PORT_MASK: u32 = 0x0000_0F00; // which port of the component this address belongs to
+const AD_PORT_SHIFT: u32 = 8;
+const AD_TYPE_MASK: u32 = 0x0000_00C0;
+const AD_TYPE_SHIFT: u32 = 6;
+const AD_TYPE_SLAVE: u32 = 0; // the core's own register window
+const AD_TYPE_BRIDGE: u32 = 1; // a backplane bridge, not a core
+const AD_TYPE_SWRAP: u32 = 2; // slave wrapper — reset/clock control
+const AD_TYPE_MWRAP: u32 = 3; // master wrapper
+const AD_SZ_MASK: u32 = 0x0000_0030;
+const AD_SZ_SZD: u32 = 0x0000_0030; // size lives in a following SIZE descriptor
+/// Address is 64-bit: a high dword follows. **Bit 3**, which is why address descriptors are
+/// classified with [`ER_TAGX`] and not [`ER_TAG`].
+const AD_AG32: u32 = 0x0000_0008;
+/// In a SIZE descriptor, "a high size dword follows".
+const SD_SG32: u32 = 0x0000_0008;
 
-/// Hard iteration ceiling on the EROM walk. A real EROM is on the order of 60-100 dwords; 512 is
-/// far above any plausible one, so hitting it is itself information and is reported. This is the
-/// STRUCTURAL bound; the TSC deadline below is the WALL-CLOCK bound, and both are needed — a walk
-/// over a stuck-at-zero window would satisfy neither on its own.
-const EROM_MAX_ENTRIES: u32 = 512;
+/// Manufacturer ids (Linux `BCMA_MANUF_*`).
+const MANUF_ARM: u16 = 0x43B;
+const MANUF_MIPS: u16 = 0x4A7;
+const MANUF_BCM: u16 = 0x4BF;
+/// `BCMA_CORE_DEFAULT` — an ARM-manufactured component with this id is a placeholder, not a core.
+const CORE_ID_DEFAULT: u16 = 0xFFF;
+/// `BCMA_CORE_80211` — the d11 radio core. The one id this whole path exists to locate.
+const CORE_ID_80211: u16 = 0x812;
+
+/// Hard iteration ceiling on the EROM walk, in dwords, and it is the ARCHITECTURAL bound rather
+/// than a round number: the EROM is reached through the 4 KiB BAR0 core window, so dword 1024 is
+/// the first read that would leave the window entirely. A real EROM is on the order of 60-100
+/// dwords, so hitting this is itself information and is reported. This is the STRUCTURAL bound; the
+/// TSC deadline below is the WALL-CLOCK bound, and both are needed — a walk over a stuck-at-zero
+/// window would satisfy neither on its own.
+const EROM_MAX_ENTRIES: u32 = BCMA_CORE_SIZE / 4;
 
 /// How many cores are printed. The 4331 backplane has ~8; 32 cannot be reached honestly.
 const EROM_MAX_CORES: u32 = 32;
@@ -404,8 +463,18 @@ fn find_wifi() -> (Option<(u8, u8, u8)>, u32) {
 /// `BCMA_CORE_80211` is **0x812** and `BCMA_CORE_PCIE` is **0x820**. Nothing had run the EROM walk
 /// yet, so no capture could catch it; it would have mislabelled every core on the first successful
 /// walk and, worse, sent a bring-up stage at the PCIe core while calling it the radio.
+///
+/// Re-checked entry-by-entry against the header for S1b, which corrected four more: 0x836 was named
+/// "shim" (`BCMA_CORE_SHIM` is **0x837**; 0x836 has no name), 0x83D "usb30-host" (it is
+/// `USB30_DEV`), 0x83E "arm-ca9" (it is `ARM_CR4`; `ARMCA9` is **0x510**), and the sub-0x800 range —
+/// where the ids this walker must recognise as "not a core" live — was absent entirely.
 fn core_name(id: u16) -> &'static str {
     match id {
+        0x367 => "oob-router",
+        0x50B => "ns-chipcommon-b",
+        0x510 => "arm-ca9",
+        0x5DC => "4706-mac-gbit-common",
+        0x700 => "invalid",
         0x800 => "chipcommon",
         0x801 => "iline20",
         0x802 => "sram",
@@ -415,7 +484,10 @@ fn core_name(id: u16) -> &'static str {
         0x806 => "ethernet",
         0x807 => "v90",
         0x808 => "usb11-hostdev",
+        0x809 => "adsl",
+        0x80A => "iline100",
         0x80B => "ipsec",
+        0x80C => "utopia",
         0x80D => "pcmcia",
         0x80E => "internal-mem",
         0x80F => "memc-sdram",
@@ -432,11 +504,13 @@ fn core_name(id: u16) -> &'static str {
         0x81A => "usb20-dev",
         0x81B => "sdio-host",
         0x81C => "roboswitch",
+        0x81D => "para-ata",
         0x81E => "sata-xordma",
         0x81F => "ethernet-gbit",
         0x820 => "pcie",
         0x821 => "phy-n",
         0x822 => "sram-ctl",
+        0x823 => "mini-macphy",
         0x824 => "arm-1176",
         0x825 => "arm-7tdmi",
         0x826 => "phy-lp",
@@ -455,13 +529,37 @@ fn core_name(id: u16) -> &'static str {
         0x833 => "spi-host",
         0x834 => "i2s",
         0x835 => "sdr-ddr1-mem-ctl",
-        0x836 => "shim",
+        0x837 => "shim",
         0x83B => "phy-ac",
         0x83C => "pcie2",
-        0x83D => "usb30-host",
-        0x83E => "arm-ca9",
+        0x83D => "usb30-dev",
+        0x83E => "arm-cr4",
+        0x840 => "gci",
+        0x846 => "cmem",
+        0x847 => "arm-ca7",
+        0x849 => "sys-mem",
+        0xFFF => "default(placeholder)",
         _ => "?",
     }
+}
+
+/// Manufacturer id → name. Broadcom's own backplane cores read `0x4bf`; the ARM cores Broadcom
+/// licenses (CM3 on a 4331) read `0x43b`, and a component that reads neither is a decode smell
+/// worth seeing on the line rather than a number the reader has to look up.
+fn manuf_name(m: u16) -> &'static str {
+    match m {
+        MANUF_ARM => "arm",
+        MANUF_MIPS => "mips",
+        MANUF_BCM => "bcm",
+        _ => "?",
+    }
+}
+
+/// Cores that legitimately carry NO wrapper. Linux refuses to treat a wrapper-less component as a
+/// core except for this exact list (`bcma_get_next_core`), because a wrapper-less component is
+/// normally a bus artefact rather than something a driver can reset and drive.
+fn core_needs_no_wrapper(id: u16) -> bool {
+    matches!(id, 0x5DC /* 4706 mac-gbit common */ | 0x50B /* ns chipcommon b */ | 0x827 /* pmu */ | 0x840 /* gci */)
 }
 
 /// Render a raw backplane window address as a core (or wrapper) index on the standard grid.
@@ -488,161 +586,375 @@ fn grid_index(addr: u32, base: u32) -> Option<u32> {
 /// Address-descriptor port type.
 fn addr_type_name(t: u32) -> &'static str {
     match t {
-        0 => "slave",
-        1 => "bridge",
-        2 => "swrap",
-        3 => "mwrap",
+        AD_TYPE_SLAVE => "slave",
+        AD_TYPE_BRIDGE => "bridge",
+        AD_TYPE_SWRAP => "swrap",
+        AD_TYPE_MWRAP => "mwrap",
         _ => "?",
+    }
+}
+
+/// A bounded, **pushback-capable** cursor over the enumeration ROM.
+///
+/// Pushback is the property the previous walker lacked and the reason Boot AJ found zero cores.
+/// An EROM is not a fixed-arity record: a component declares how many PORTS it has, not how many
+/// address descriptors, and each port carries one or more descriptors terminated only by the next
+/// descriptor failing to match that port and type. The only way to read it is to look at the next
+/// word, consume it if it matches, and leave the cursor untouched if it does not — Linux's
+/// `bcma_erom_get_ent` / `bcma_erom_push_ent` pair. Here that is expressed directly: [`Erom::peek`]
+/// never advances, and every accessor advances only on a match.
+///
+/// Both bounds live in the cursor rather than in the walk, so no accessor can read past them: the
+/// structural [`EROM_MAX_ENTRIES`] (the 4 KiB window's dword count) and a wall-clock [`Deadline`].
+/// Once either fires, `overrun` names it and every subsequent read returns `None`.
+struct Erom<F: Fn(u32) -> u32> {
+    read: F,
+    /// Cursor, in dwords from the EROM base.
+    i: u32,
+    dl: Deadline,
+    /// Empty until a bound (or an all-ones read) stopped the walk; then the name of that bound.
+    overrun: &'static str,
+}
+
+impl<F: Fn(u32) -> u32> Erom<F> {
+    fn new(read: F) -> Self {
+        Erom { read, i: 0, dl: Deadline::new(), overrun: "" }
+    }
+
+    /// True once a bound has fired. Distinguishes "this entry is not what I asked for" (a normal,
+    /// expected pushback) from "the walk cannot continue" — which is the distinction that decides
+    /// whether a `None` below means *end of a port's descriptors* or *stop and report*.
+    fn stopped(&self) -> bool {
+        !self.overrun.is_empty()
+    }
+
+    /// The word at the cursor WITHOUT consuming it.
+    fn peek(&mut self) -> Option<u32> {
+        if self.i >= EROM_MAX_ENTRIES {
+            self.overrun = "entry-cap";
+            return None;
+        }
+        if self.dl.expired() {
+            self.overrun = "tsc-deadline";
+            return None;
+        }
+        let v = (self.read)(self.i);
+        if v == ER_BAD {
+            self.overrun = "all-ones";
+            return None;
+        }
+        Some(v)
+    }
+
+    /// Consume the word at the cursor unconditionally. Used only for the continuation dwords of a
+    /// descriptor already accepted (a 64-bit address half, a size descriptor), which are raw data
+    /// and carry no tag of their own.
+    fn take(&mut self) -> Option<u32> {
+        let v = self.peek()?;
+        self.i += 1;
+        Some(v)
+    }
+
+    /// A component-identifier word (CIA, then CIB). Consumes on match; on a mismatch the cursor does
+    /// NOT move, which is what lets the caller then test the same position for the end sentinel.
+    fn ci(&mut self) -> Option<u32> {
+        let ent = self.peek()?;
+        if (ent & ER_VALID) == 0 || (ent & ER_TAG) != ER_TAG_CI {
+            return None;
+        }
+        self.i += 1;
+        Some(ent)
+    }
+
+    /// Is the cursor sitting on the end sentinel? Non-consuming.
+    fn at_end(&mut self) -> bool {
+        matches!(self.peek(), Some(e) if e == ER_END_WORD)
+    }
+
+    /// One master-port descriptor. Consumes on match only.
+    fn mst_port(&mut self) -> Option<u32> {
+        let ent = self.peek()?;
+        if (ent & ER_VALID) == 0 || (ent & ER_TAG) != ER_TAG_MP {
+            return None;
+        }
+        self.i += 1;
+        Some(ent)
+    }
+
+    /// Is the cursor sitting on a BRIDGE address descriptor? Non-consuming
+    /// (Linux `bcma_erom_is_bridge`). A bridge component is a backplane artefact, not a core.
+    fn at_bridge(&mut self) -> bool {
+        match self.peek() {
+            Some(e) => {
+                (e & ER_VALID) != 0
+                    && (e & ER_TAGX) == ER_TAG_ADDR
+                    && ((e & AD_TYPE_MASK) >> AD_TYPE_SHIFT) == AD_TYPE_BRIDGE
+            }
+            None => false,
+        }
+    }
+
+    /// One address descriptor of exactly `want_type` on exactly `want_port`, returning its base
+    /// address; `None` (cursor unmoved) when the next entry is anything else.
+    ///
+    /// The port match is not decoration: it is the ONLY terminator a port's descriptor list has.
+    /// Linux's `bcma_erom_get_addr_desc` checks valid, tag (with the narrow [`ER_TAGX`]), type AND
+    /// port for exactly this reason.
+    fn addr_desc(&mut self, want_type: u32, want_port: u32) -> Option<u64> {
+        let ent = self.peek()?;
+        if (ent & ER_VALID) == 0
+            || (ent & ER_TAGX) != ER_TAG_ADDR
+            || ((ent & AD_TYPE_MASK) >> AD_TYPE_SHIFT) != want_type
+            || ((ent & AD_PORT_MASK) >> AD_PORT_SHIFT) != want_port
+        {
+            return None;
+        }
+        self.i += 1;
+        let mut addr = (ent & AD_ADDR_MASK) as u64;
+        if (ent & AD_AG32) != 0 {
+            addr |= (self.take()? as u64) << 32;
+        }
+        if (ent & AD_SZ_MASK) == AD_SZ_SZD {
+            // The size lives in a following descriptor, which itself may be two dwords wide.
+            let sz = self.take()?;
+            if (sz & SD_SG32) != 0 {
+                self.take()?;
+            }
+        }
+        Some(addr)
+    }
+
+    /// Advance to the next component identifier (or the end sentinel) without consuming it —
+    /// Linux `bcma_erom_skip_component`. Used when a component turns out not to be a core: its
+    /// remaining descriptors must still be stepped over, or every core after it decodes as noise.
+    fn skip_component(&mut self) {
+        loop {
+            let ent = match self.peek() {
+                Some(e) => e,
+                None => return,
+            };
+            if ent == ER_END_WORD || ((ent & ER_VALID) != 0 && (ent & ER_TAG) == ER_TAG_CI) {
+                return;
+            }
+            self.i += 1;
+        }
     }
 }
 
 /// Walk the enumeration ROM through an already-open window and print one line per core.
 ///
 /// `read` yields the dword at EROM entry index `i`. It is a closure so the walker is independent of
-/// HOW the EROM was reached: this arc can only reach it when firmware happens to have parked the
-/// BAR0 window on it, but the same walker serves the stage that programs the window deliberately.
+/// HOW the EROM was reached: S0 can only reach it when firmware happens to have parked the BAR0
+/// window on it, while S1 points cfg:0x80 at it deliberately.
 ///
-/// Bounded twice over (structural `EROM_MAX_ENTRIES`, wall-clock `Deadline`) and it reports which
-/// bound stopped it. Returns the number of cores printed.
+/// The structure follows Linux `bcma_bus_scan` / `bcma_get_next_core` step for step, because the
+/// EROM's arity is data-dependent and any shortcut desynchronises the cursor:
+///
+/// 1. CIA + CIB (both tagged CI) — identity, revision, port and wrapper counts;
+/// 2. reject non-cores: an ARM `0xFFF` placeholder, a component with **no slave port**, a
+///    wrapper-less component that is not one of the four ids allowed to be wrapper-less, and a
+///    bridge — each SKIPPED to the next component rather than parsed;
+/// 3. `nmp` master-port descriptors;
+/// 4. the first slave address descriptor on port 0 — the core's register base, the value a driver
+///    puts in `BCMA_PCI_BAR0_WIN`;
+/// 5. every remaining slave-port descriptor, then the master wrappers, then the slave wrappers,
+///    each read until the port/type stops matching.
+///
+/// Bounded twice over by the cursor and it reports which bound stopped it. Returns the number of
+/// cores printed.
 fn walk_erom<F: Fn(u32) -> u32>(read: F) -> u32 {
-    let dl = Deadline::new();
-    let mut i = 0u32;
+    let mut e = Erom::new(read);
     let mut cores = 0u32;
+    let mut skipped = 0u32;
     let mut stop = "end-tag";
+    // The deliverable of this whole arc: where the 802.11 core lives.
+    let mut d11_base: u64 = 0;
+    let mut d11_swrap: u64 = 0;
+    let mut d11_rev: u32 = 0;
 
     loop {
-        if i >= EROM_MAX_ENTRIES {
-            stop = "entry-cap";
-            break;
-        }
-        if dl.expired() {
-            stop = "tsc-deadline";
-            break;
-        }
-        let cia = read(i);
-        i += 1;
+        // ── 1. CIA + CIB ────────────────────────────────────────────────────────────────────────
+        let cia = match e.ci() {
+            Some(v) => v,
+            None => {
+                // The ONE clean exit: the cursor is on the end sentinel and `stop` keeps its
+                // initial "end-tag". Anything else overwrites it, so a walk that ends any other way
+                // cannot be mistaken for a complete one.
+                if e.stopped() {
+                    stop = e.overrun;
+                } else if !e.at_end() {
+                    stop = "not-ci";
+                }
+                break;
+            }
+        };
+        let cib = match e.ci() {
+            Some(v) => v,
+            None => {
+                stop = if e.stopped() { e.overrun } else { "cib-malformed" };
+                break;
+            }
+        };
 
-        if cia == ER_BAD {
-            stop = "all-ones";
-            break;
-        }
-        if (cia & ER_TAG) == ER_TAG_END {
-            break;
-        }
-        if (cia & ER_VALID) == 0 || (cia & ER_TAG) != ER_TAG_CI {
-            // Not a component identifier: skip it rather than mis-decoding it. A malformed EROM
-            // reaches the entry cap above, which is reported.
-            continue;
-        }
-
-        let cib = read(i);
-        i += 1;
-        if cib == ER_BAD || (cib & ER_TAG) != ER_TAG_CI {
-            stop = "cib-malformed";
-            break;
-        }
-
-        let mfg = (cia & CIA_MFG_MASK) as u16;
+        let mfg = ((cia & CIA_MFG_MASK) >> CIA_MFG_SHIFT) as u16;
         let id = ((cia & CIA_ID_MASK) >> CIA_ID_SHIFT) as u16;
         let class = (cia & CIA_CLASS_MASK) >> CIA_CLASS_SHIFT;
         let rev = (cib & CIB_REV_MASK) >> CIB_REV_SHIFT;
-        let nmw = (cib & CIB_NMW_MASK) >> CIB_NMW_SHIFT;
-        let nsw = (cib & CIB_NSW_MASK) >> CIB_NSW_SHIFT;
         let nmp = (cib & CIB_NMP_MASK) >> CIB_NMP_SHIFT;
         let nsp = (cib & CIB_NSP_MASK) >> CIB_NSP_SHIFT;
+        let nmw = (cib & CIB_NMW_MASK) >> CIB_NMW_SHIFT;
+        let nsw = (cib & CIB_NSW_MASK) >> CIB_NSW_SHIFT;
 
-        // Master port descriptors carry no address; they are consumed so the address descriptors
-        // that follow are read at the right index. Their tag is CHECKED rather than assumed — a
-        // miscounted `nmp` would otherwise silently shift every address below by a dword and
-        // produce a core list of plausible-looking nonsense, which is the one failure mode of an
-        // EROM walk that a reader cannot spot from the output.
-        let mut m = 0;
-        while m < nmp && i < EROM_MAX_ENTRIES {
-            let mp = read(i);
-            i += 1;
-            m += 1;
-            if mp == ER_BAD || (mp & ER_TAG) != ER_TAG_MP {
-                stop = "mp-malformed";
+        // ── 2. the not-a-core filters ───────────────────────────────────────────────────────────
+        let reject = if mfg == MANUF_ARM && id == CORE_ID_DEFAULT {
+            "arm-placeholder"
+        } else if nsp == 0 {
+            "no-slave-port"
+        } else if nmw + nsw == 0 && !core_needs_no_wrapper(id) {
+            "no-wrapper"
+        } else if e.at_bridge() {
+            "bridge"
+        } else {
+            ""
+        };
+        if !reject.is_empty() {
+            // A skipped component is PRINTED. It is not noise: it is the difference between "this
+            // chip has 7 cores" and "this chip has 7 cores and 2 components we chose not to call
+            // cores", and a reader comparing our count against Linux's needs to see which.
+            serial_println!(
+                ":: bcma: erom-skip id={:#05x} ({}) mfg={:#05x}({}) rev={} reason={} nsp={} nmp={} nsw={} nmw={} ::",
+                id, core_name(id), mfg, manuf_name(mfg), rev, reject, nsp, nmp, nsw, nmw
+            );
+            skipped += 1;
+            e.skip_component();
+            if e.stopped() {
+                stop = e.overrun;
                 break;
             }
+            continue;
         }
-        if stop != "end-tag" {
+
+        // ── 3. master ports (no address; consumed so the addresses below land at the right index)
+        let mut m = 0u32;
+        while m < nmp {
+            if e.mst_port().is_none() {
+                break;
+            }
+            m += 1;
+        }
+        if m != nmp {
+            stop = if e.stopped() { e.overrun } else { "mp-malformed" };
             serial_println!(
-                ":: bcma: erom-abort at entry {} while consuming {} master ports of core id={:#05x} ::",
-                i, nmp, id
+                ":: bcma: erom-abort at entry {} consuming master port {}/{} of core id={:#05x} ({}) cia={:#010x} cib={:#010x} ::",
+                e.i, m, nmp, id, core_name(id), cia, cib
             );
             break;
         }
 
-        // Address descriptors: nsp slave ports, then nmw + nsw wrapper ports. The FIRST slave
-        // address is the core's register base — the address a driver would put in BAR0_WIN — and
-        // the first slave WRAPPER address is where its reset/clock control lives. Both are printed.
-        let total_addr = nsp + nmw + nsw;
-        let mut base: u64 = 0;
-        let mut wrap: u64 = 0;
-        let mut wrap_kind: &'static str = "none";
-        let mut a = 0u32;
-        let mut printed_extra = 0u32;
-        while a < total_addr && i < EROM_MAX_ENTRIES && !dl.expired() {
-            let ad = read(i);
-            i += 1;
-            if ad == ER_BAD || (ad & ER_TAG) != ER_TAG_ADDR {
-                stop = "addr-malformed";
+        // ── 4. the core's register base: first slave address descriptor, port 0 ─────────────────
+        let base = match e.addr_desc(AD_TYPE_SLAVE, 0) {
+            Some(a) => a,
+            None => {
+                stop = if e.stopped() { e.overrun } else { "no-slave-addr" };
+                serial_println!(
+                    ":: bcma: erom-abort at entry {} — core id={:#05x} ({}) declares nsp={} but its next entry is not a {} address descriptor on port 0 ::",
+                    e.i, id, core_name(id), nsp, addr_type_name(AD_TYPE_SLAVE)
+                );
                 break;
             }
-            let mut addr = (ad & ADDR_ADDR_MASK) as u64;
-            if (ad & ADDR_AS_64) != 0 {
-                addr |= (read(i) as u64) << 32;
-                i += 1;
+        };
+
+        // ── 5. the remaining slave-port descriptors, then the wrappers ──────────────────────────
+        let mut extra_slave = 0u32;
+        let mut p = 0u32;
+        while p < nsp && !e.stopped() {
+            while e.addr_desc(AD_TYPE_SLAVE, p).is_some() {
+                extra_slave += 1;
             }
-            if (ad & ADDR_SZ_MASK) == ADDR_SZ_SZD {
-                // A size descriptor follows (one dword, two when 64-bit).
-                let sz = read(i);
-                i += 1;
-                if (sz & ADDR_AS_TYPE) != 0 {
-                    i += 1;
+            p += 1;
+        }
+
+        let mut mwrap: u64 = 0;
+        let mut w = 0u32;
+        while w < nmw && !e.stopped() {
+            let mut j = 0u32;
+            while let Some(a) = e.addr_desc(AD_TYPE_MWRAP, w) {
+                if w == 0 && j == 0 {
+                    mwrap = a;
                 }
+                j += 1;
             }
-            let ty = (ad & ADDR_TYPE_MASK) >> ADDR_TYPE_SHIFT;
-            if a < nsp {
-                if a == 0 {
-                    base = addr;
-                } else {
-                    printed_extra += 1;
+            w += 1;
+        }
+
+        // Linux's slave-wrapper port numbering: a component with more than one slave PORT numbers
+        // its slave wrappers from 1, not 0 (`u8 hack = (ports[1] == 1) ? 0 : 1;`). Getting this
+        // wrong does not corrupt the walk — the port match simply never fires and the wrapper reads
+        // as absent — which is precisely the kind of silent hole this walk exists to close.
+        let hack = if nsp == 1 { 0 } else { 1 };
+        let mut swrap: u64 = 0;
+        let mut s = 0u32;
+        while s < nsw && !e.stopped() {
+            let mut j = 0u32;
+            while let Some(a) = e.addr_desc(AD_TYPE_SWRAP, s + hack) {
+                if s == 0 && j == 0 {
+                    swrap = a;
                 }
-            } else if ty == 2 {
-                // Slave wrapper — the window that carries this core's reset/clock control, and the
-                // one Linux puts in `core->wrap`. PREFERRED over a master wrapper even when a
-                // master wrapper was seen first (the EROM emits master wrappers before slave ones),
-                // because a bring-up stage driving the wrong wrapper looks exactly like a core that
-                // will not come out of reset.
-                wrap = addr;
-                wrap_kind = addr_type_name(ty);
-            } else if ty == 3 && wrap == 0 {
-                wrap = addr;
-                wrap_kind = addr_type_name(ty);
+                j += 1;
             }
-            a += 1;
+            s += 1;
+        }
+
+        // `wrap` as Linux computes `core->wrap`: the master wrapper when there is one, else the
+        // slave wrapper. BOTH are printed, because they are not interchangeable — the SLAVE wrapper
+        // is where IOCTL/RESET_CTL live, and it is the one cfg:0xAC must carry to take a core out
+        // of reset. A bring-up stage handed a master wrapper looks exactly like a core that will
+        // not wake up.
+        let (wrap, wrap_kind) = if mwrap != 0 {
+            (mwrap, addr_type_name(AD_TYPE_MWRAP))
+        } else if swrap != 0 {
+            (swrap, addr_type_name(AD_TYPE_SWRAP))
+        } else {
+            (0, "none")
+        };
+
+        if id == CORE_ID_80211 && d11_base == 0 {
+            d11_base = base;
+            d11_swrap = swrap;
+            d11_rev = rev;
         }
 
         if cores < EROM_MAX_CORES {
             serial_println!(
-                ":: bcma: core[{}] id={:#05x} ({}) rev={} mfg={:#05x} class={} base={:#x} wrap={:#x}({}) nsp={} nmp={} nsw={} nmw={} extra-slave-addr={} ::",
-                cores, id, core_name(id), rev, mfg, class, base, wrap, wrap_kind, nsp, nmp, nsw,
-                nmw, printed_extra
+                ":: bcma: core[{}] id={:#05x} ({}) rev={} mfg={:#05x}({}) class={} base={:#x} wrap={:#x}({}) mwrap={:#x} swrap={:#x} nsp={} nmp={} nsw={} nmw={} extra-slave-addr={} ::",
+                cores, id, core_name(id), rev, mfg, manuf_name(mfg), class, base, wrap, wrap_kind,
+                mwrap, swrap, nsp, nmp, nsw, nmw, extra_slave
             );
         }
         cores += 1;
-        if stop != "end-tag" {
+        if e.stopped() {
+            stop = e.overrun;
             break;
         }
     }
 
-    let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+    let (ev, eu) = fmt_dur(e.dl.elapsed_cycles());
     serial_println!(
-        ":: bcma: erom-walk cores={} entries={} stop={} elapsed={}{} ::",
-        cores, i, stop, ev, eu
+        ":: bcma: erom-walk cores={} skipped={} entries={} stop={} elapsed={}{} ::",
+        cores, skipped, e.i, stop, ev, eu
     );
+    // The arc's product, on its own awk-able line: the backplane address of the 802.11 core.
+    if d11_base != 0 {
+        serial_println!(
+            ":: bcma: erom-d11 FOUND id={:#05x} rev={} base={:#010x} swrap={:#010x} — cfg:0x80 <- {:#010x} puts the radio's registers at BAR0+0, cfg:0xac <- {:#010x} puts its reset/clock control at BAR0+0x1000 ::",
+            CORE_ID_80211, d11_rev, d11_base, d11_swrap, d11_base as u32, d11_swrap as u32
+        );
+    } else {
+        serial_println!(
+            ":: bcma: erom-d11 ABSENT — no core id={:#05x} (802.11) in the inventory above after {} cores and {} skips; the radio's backplane base is NOT known and must not be guessed ::",
+            CORE_ID_80211, cores, skipped
+        );
+    }
     cores
 }
 
@@ -1262,8 +1574,14 @@ fn s1_window_walk() {
             ":: bcma-s1: cc-raw chipid={:#010x} cap={:#010x} cap_ext={:#010x} chipstatus={:#010x} erom={:#010x} ::",
             chipid, cap, cap_ext, chipst, erom
         );
+        // Field-by-field, with the bit range on every field, so the decode is checkable against the
+        // raw word on the line above without a header to hand. Masks are Linux
+        // `BCMA_CC_ID_{ID,REV,PKG,NRCORES,TYPE}` verbatim; Boot AJ's 0x13924331 decodes to
+        // id=0x4331 rev=2 pkg=9 nrcores=3 type=1, and every one of those is what the register says.
+        // `nrcores` is labelled with its provenance because it is NOT the core count on this part —
+        // see the cross-check after the walk.
         serial_println!(
-            ":: bcma-s1: chip id={:#06x} rev={} pkg={} ncores={} type={} ({}) pmu={} is-4331={} ::",
+            ":: bcma-s1: chip id[15:0]={:#06x} rev[19:16]={} pkg[23:20]={} nrcores[27:24]={}(SB-era CoreCount, advisory) type[31:28]={} ({}) pmu={} is-4331={} ::",
             cc_id, cc_rev, cc_pkg, cc_ncores, cc_type,
             match cc_type { 0 => "ssb/sb", 1 => "bcma/erom", 2 => "bcma-single", _ => "?" },
             (cap & CC_CAP_PMU != 0) as u8, (cc_id == DEVID_BCM4331) as u8
@@ -1284,9 +1602,18 @@ fn s1_window_walk() {
                 BCMA_ADDR_BASE, erom_base, ew
             );
             let cores = walk_erom(|i| unsafe { r32(bar0, erom_off + (i as u64) * 4) });
+            // The cross-check, corrected. Boot AJ printed `match=0` and treated it as evidence
+            // against the walk; only half of that was sound. `BCMA_CC_ID_NRCORES` (chipid[27:24])
+            // is the SB-era CoreCount field: `sb_numcores()` reads it, and Linux's bcma — the
+            // driver model for a socitype=1 part like this one — never reads it at all, because on
+            // an AI backplane the EROM is the only authority on the core list. So a MISMATCH is not
+            // by itself a defect and must not be reported as one. What IS a defect, unambiguously,
+            // is a walk that finds zero cores while ChipCommon answers, and that gets its own
+            // verdict.
             serial_println!(
-                ":: bcma-s1: erom-cross-check walk-cores={} chipcommon-ncores={} match={} — a mismatch convicts the walk or the window, NOT the machine ::",
-                cores, cc_ncores, (cores == cc_ncores) as u8
+                ":: bcma-s1: erom-cross-check walk-cores={} chipcommon-nrcores={} equal={} verdict={} — NRCORES is the SB-era CoreCount field (chipid[27:24]); on socitype={} (bcma/erom) the EROM walk is authoritative and Linux's bcma never reads NRCORES, so a difference is EXPECTED, not a fault. Zero cores IS a fault. ::",
+                cores, cc_ncores, (cores == cc_ncores) as u8,
+                if cores == 0 { "WALK-FAILED" } else { "WALK-OK" }, cc_type
             );
         } else {
             serial_println!(
