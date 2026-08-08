@@ -1571,10 +1571,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             //
             // `Event::Unknown` for a consumed click, and never `Event::None`: `None` is this loop's
             // end-of-queue sentinel, so returning it would truncate the drain at the first click.
+            //
+            // WC-TAB/x86 — and TAB is judged BEFORE either router, because it is addressed to neither.
+            // It belongs to the window system itself: `wc_focus_key` is the one keystroke that moves
+            // focus rather than being delivered under it, and it must be intercepted ahead of
+            // `user_input_route` or the focused app swallows the only exit from its own window (Boot
+            // AH: 165 focus grants, 164 revokes, `kill <pid>` unreachable for the rest of the boot).
+            // Ahead of `wc_click_route` too — that call reads the cursor and hit-tests, work a key
+            // event has no business paying for; it returns `false` for any non-`Button` regardless.
+            //
+            // ONE interception covers BOTH directions on this arch, which is the divergence from
+            // aarch64 worth naming. This pair runs on every event whatever holds focus (the focus test
+            // is inside `user_input_enqueue`), so app -> shell and shell -> window pass through the
+            // same line; the Pi needs a second entry point on its shell drain only because its router
+            // is reached solely while an app has focus.
             #[cfg(target_arch = "x86_64")]
             let ev = {
                 let raw = pal.poll_event();
-                if unaos_kernel::arch::x86_64::syscall::wc_click_route(raw) {
+                if unaos_kernel::arch::x86_64::syscall::wc_focus_key(raw) {
+                    unaos_kernel::pal::Event::Unknown
+                } else if unaos_kernel::arch::x86_64::syscall::wc_click_route(raw) {
                     unaos_kernel::pal::Event::Unknown
                 } else {
                     unaos_kernel::arch::x86_64::syscall::user_input_route(raw)
@@ -4176,7 +4192,15 @@ fn x86_render_service(cpu: usize) {
             // right for a keystroke and wrong for a click (that belongs to the window under the cursor),
             // so `wc_click_route` hit-tests the press first and answers `true` only when it CONSUMED the
             // event. Both return `Event::Unknown` (never `Event::None`) for a consumed event.
-            let ev = if unaos_kernel::arch::x86_64::syscall::wc_click_route(raw) {
+            //
+            // WC-TAB/x86 — and TAB is judged ahead of both, for the reason the dismantled loop's copy
+            // of this block states: it is addressed to the window system rather than to any app, and
+            // intercepting it after `user_input_route` would mean the focused app swallows the only
+            // exit from its own window. This is the seam the bench media actually runs, so it is the
+            // one Boot AH's trap was sprung on.
+            let ev = if unaos_kernel::arch::x86_64::syscall::wc_focus_key(raw) {
+                unaos_kernel::pal::Event::Unknown
+            } else if unaos_kernel::arch::x86_64::syscall::wc_click_route(raw) {
                 unaos_kernel::pal::Event::Unknown
             } else {
                 unaos_kernel::arch::x86_64::syscall::user_input_route(raw)
