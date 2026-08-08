@@ -434,7 +434,7 @@ pub unsafe fn map_user_page(va: u64, phys: u64, writable: bool, nx: bool) {
 /// `MAX_PROCS` at 10 with the SAME 2-slot reserve intact, which is 8 vugs + the desktop app + one
 /// foreground `run`, i.e. the fleet an operator actually asks for plus a margin.
 ///
-/// WHAT ONE MORE SLOT COSTS. A slot is `USER_STATIC_SIZE` (0x85000 = 544 KiB) of `.bss` backing plus
+/// WHAT ONE MORE SLOT COSTS. A slot is `USER_STATIC_SIZE` (0x85000 = 532 KiB) of `.bss` backing plus
 /// four 4 KiB page tables (PML4/PDPT/PD/PT) = 548 KiB. 8 -> 12 is therefore +2.14 MiB of `.bss`
 /// (4.28 MiB -> 6.42 MiB) on a machine with GiBs; the pool is `.bss` (NOBITS), so the boot image on
 /// the ESP does not grow by a byte. Nothing else scales with the count: the per-slot sidecars in

@@ -302,8 +302,11 @@ use unaos_boot_info::PixelFormat;
 /// and small enough that the checksum reads do not dominate the interval being timed.
 const SAMPLES: u32 = 4;
 
-/// Window ids this witness tracks. Matches `wm::MAX_WINDOWS`; ids at or above it are not sampled.
-const IDS: usize = 8;
+/// Window ids this witness tracks — wm ids run 1..=MAX_WINDOWS and this table indexes them raw,
+/// so it needs MAX_WINDOWS+1 rows (index 0 is dead). Derived, with a tripwire: the headroom
+/// review caught the literal 8 leaving WC-G silently blind on 5 of 12 rows after the raise.
+const IDS: usize = crate::video::wm::MAX_WINDOWS + 1;
+const _: () = assert!(IDS > crate::video::wm::MAX_WINDOWS);
 
 /// One 60 Hz frame, in microseconds. The bench panel is 60 Hz; a slower panel only makes the
 /// derived `rectscan_us` larger and the reported `slow=yes` more conservative.
