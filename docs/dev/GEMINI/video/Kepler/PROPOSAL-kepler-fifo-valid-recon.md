@@ -51,7 +51,13 @@ However, sitting #35 showed that host pokes to CTXCTL registers took but built n
 We will add a write experiment immediately after the recon reads and before the `VALID` write at `:1576`.
 1. **Justifying Read (Pre-Image):** We will read `ENGINE_TRIGGER` (`0x409c08`) via `fecs_read` to capture the handshake state before intervention.
 2. **Write:** We will write `1` (the value pull 34/35 already writes) to `ENGINE_TRIGGER` (`0x409c08`) via `fecs_write` to complete the host handshake.
-3. **Restoration:** Following the BCMA-S1 shape, we will read back the `ENGINE_TRIGGER` state to verify the write. On every exit path (whether the witness passes, strips, or wedges), we will restore `ENGINE_TRIGGER` to its exact pre-image value so that we leave a defined state (e.g. not leaving `1` latched through the runlist submit if it was `0`).
+3. **Restoration (review-corrected):** `ENGINE_TRIGGER` (0x409c08) is an edge-semantic
+   doorbell (STUDY: DAEMON2CTXCTL_REQ / CHSW_PENDING). It has no pre-image to restore:
+   writing a read-back `1` would fire it again, and writing `0` is a no-op. The honest
+   unwind is NO exit write on any path — the single experiment write leaves no latched
+   residue by the same edge semantics, and the post-restore re-test stays a clean reading
+   of the inst_off restore alone. We read `eng_trig_pre` first only to flag the null-result
+   shape (pre==1 means the placement write is a no-op and the boot proves nothing).
 
 ### Emitter Strings (The Prediction)
 

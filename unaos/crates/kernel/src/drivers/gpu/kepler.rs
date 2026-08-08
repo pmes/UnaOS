@@ -1592,7 +1592,9 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
 
                                     let err = mmio_read(bar0, 0x252c);
                                     let stat = mmio_read(bar0, 0x263c);
-                                    let err_c = class_zero(err, "VALUE,NO_POLL");
+                                    // Review C3/C4: an unnamed wedge value must print what the chip
+                                    // actually said, never the retired NO_POLL name.
+                                    let err_c = class_zero(err, "VALUE,unnamed");
                                     let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
                                     serial_println!(":: kepler: sched-status post-init err={:08X} ({}) stat={:08X} ::", err, err_str, stat);
 
@@ -1610,10 +1612,17 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     
                                     // Witness check
                                     if (ch_1_0_pre & 0xC0000000) != 0xC0000000 {
-                                        serial_println!(":: kepler: WITNESS STRIPPED. Restoring inst_off+0x0C and engine_trigger ::");
+                                        serial_println!(":: kepler: WITNESS STRIPPED. Restoring inst_off+0x0C ::");
                                         core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, (userd_off >> 32) as u32);
-                                        fecs_write(bar0, 0x409c08, eng_trig_pre);
-                                        serial_println!(":: kepler: recon engine_trigger_restore={:08X} ::", fecs_read(bar0, 0x409c08));
+                                        // Review C5: NO engine_trigger write-back on any exit. 0x409c08 is an
+                                        // edge-semantic doorbell (the lane's own STUDY: DAEMON2CTXCTL_REQ /
+                                        // CHSW_PENDING) — it has no pre-image to restore; writing eng_trig_pre
+                                        // back would FIRE it again when pre==1 (the common case: :1372-1380
+                                        // rings it every FIFO boot), and writing 0 is a no-op. The one write
+                                        // at the experiment site leaves no latched residue by the same edge
+                                        // semantics, so leaving it alone through the runlist submit is the
+                                        // honest unwind. This also keeps the post-restore re-test below a
+                                        // clean reading of the inst_off restore alone.
 
                                         // Re-test PFIFO_CHAN[1] to clear state
                                         mmio_write(bar0, 0x800000 + (1 * 8), 0);
@@ -1625,9 +1634,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                         let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
                                         serial_println!(":: kepler: sched-status post-restore err={:08X} ({}) stat={:08X} ::", err, err_str, stat);
                                     } else {
-                                        serial_println!(":: kepler: WITNESS PASSED - bits stuck! Restoring engine_trigger ::");
-                                        fecs_write(bar0, 0x409c08, eng_trig_pre);
-                                        serial_println!(":: kepler: recon engine_trigger_restore={:08X} ::", fecs_read(bar0, 0x409c08));
+                                        serial_println!(":: kepler: WITNESS PASSED - bits stuck! (engine_trigger left untouched — edge doorbell, no residue; see the C5 note on the STRIPPED arm) ::");
                                     }
 
                                     // --- POLL-CONTROL leg (GR5, s37): the one variable never varied WITH an
