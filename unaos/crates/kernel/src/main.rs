@@ -4044,6 +4044,19 @@ fn x86_usb_pump(cpu: usize) {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI lock
         // released; `read_block` re-locks it briefly.
         unaos_kernel::fs::fat::probe_once();
+        // DESKTOP-APP (wc knob): the deferred half of kernel-apps eviction move #1. `wcx::activate`
+        // used to open a kernel-drawn demo window at the Kepler takeover seam; it now ARMS a launch
+        // there and this pass performs it, putting `STAT.ELF` on the desktop as a real ring-3 process
+        // with a real ASID instead of ~110 lines of ring-0 furniture.
+        //
+        // HERE and nowhere else, for three reasons the function's own doc spells out: the launch
+        // reads the FAT volume (an `XHCI_CONTROLLER` taker, which the placement rule above forbids on
+        // the render core), it spawns onto `bg_place_cpu()` = the CALLER's core, so the caller must
+        // be a core that actually dispatches (the BSP's inline GUI loop is not — that is the whole
+        // SCHED-X86 finding), and it must WAIT for xHCI to enumerate storage, which only a repeating
+        // service pass can do. One-shot inside; two atomic loads on every pass but one.
+        #[cfg(feature = "wc")]
+        unaos_kernel::video::wcx::desktop_app_service();
         // SDHC-4b (x86, sdhcblk knob): mount the INTERNAL SD card READ-ONLY once registered (one-shot).
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         unaos_kernel::fs::fat::sdhc_probe_once();

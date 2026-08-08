@@ -3902,7 +3902,24 @@ struct BgJob {
 /// PROCS-6 raised the cap to 6: 6 bg jobs with no foreground `run` (5 with one), still under this
 /// table's 8 and under the compositor's 8 windows, so the full arm remains unreachable — kept anyway,
 /// because it is what makes an untrackable job impossible rather than merely unlikely.
-/// Shell access is single-task, but the Mutex keeps the invariant explicit rather than relying on it.
+///
+/// ⚠ KERNEL-APPS EVICTION — **on a `wc` x86 boot the ceiling is one lower than the paragraph above
+/// says.** `video::wcx::desktop_app_service` launches the desktop app (`STAT.ELF`) at boot and it
+/// never exits, so it permanently holds one Proc row, one user slot, one `wm` window and one row of
+/// THIS table. The operator's budget is therefore **5** bg jobs with no foreground `run` (4 with
+/// one) on such a boot. The window is a wash — the kernel-drawn row it replaced held one too — and
+/// the full arm of this table is still unreachable, but the Proc-row arithmetic above is the number
+/// a reader would quote and it is no longer the whole story.
+///
+/// ⚠ **Shell access is NO LONGER single-task.** It used to be, and this note used to say so while
+/// keeping the Mutex "explicit rather than relying on it". The eviction added a second caller on a
+/// DIFFERENT core: `adopt_bg_job` runs from the device-service task (`x86_usb_pump`, service core)
+/// while the shell runs in `x86_render_service` (render core). The Mutex is now load-bearing — do
+/// not drop it. No live hazard today (the service-core call happens once, at boot, before an
+/// operator can type `jobs`), and cross-core contention on a raw `spin::Mutex` is bounded spin that
+/// progresses — the SCHED-X86 deadlock rule is about two preemptible takers on ONE core. But note
+/// that `bg_jobs` holds this lock across `console.println`, which on a `wc` build routes through the
+/// compositor: a future second cross-core caller could spin for the length of a repaint.
 #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);
 
@@ -4198,8 +4215,14 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
 /// Note what this does NOT change: the kernel `Proc` row and its `KillSwitch` are registered by
 /// `spawn_user_image_bg` itself, so `bg_kill`/`bg_poll` can always reach the pid. Only the shell's
 /// NAME for it comes from here.
+///
+/// `pub(crate)` since the kernel-apps eviction, for ONE second caller:
+/// [`crate::video::wcx::desktop_app_service`], which launches the desktop app at boot with nobody at
+/// the prompt to type `bg`. Registering it here is what keeps `jobs` and `kill` TRUTHFUL —
+/// `bg_kill_cmd` resolves a pid through this table and REFUSES one it cannot find, so an
+/// unregistered launch would be a running ring-3 program the operator can neither list nor stop.
 #[cfg(target_arch = "x86_64")]
-fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
+pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
     let mut jobs = BG_JOBS.lock();
     let Some(free) = jobs.iter_mut().find(|s| s.is_none()) else {
         return false;
