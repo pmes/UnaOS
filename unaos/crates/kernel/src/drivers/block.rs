@@ -308,8 +308,14 @@ pub fn write_block_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 /// unafs mounts to the reader's size → `PartError::OutOfBounds(63)`. On x86 (no `register_sd`, no BACKEND
 /// selector) the stick IS the default/boot backend, so this always claims the global — byte-identical to
 /// the pre-PIUSB-28 behavior there. Must run OUTSIDE the xHCI controller lock's storage callers as before.
+///
+/// FRGUARD (GR21): `hotplug` says HOW this claim arrived — `false` for a device found by the initial
+/// port scan (the boot volume), `true` for one queued by a live connect-change edge. It is recorded,
+/// never acted on, here; only [`default_writable`] reads it, and only on `x86_64 + sdhcblk`. This arm
+/// ignores it entirely, so the Pi's decisions are unchanged.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
-pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
+pub fn publish_usb_geometry(dev: BlockDeviceInfo, hotplug: bool) {
+    let _ = hotplug; // aarch64 keys its substitution guard on the BACKEND selector, not on claim origin
     *USB_BLOCK_DEVICE.lock() = Some(dev);
     // Claim the global only while USB is still the active backend; once the SD has registered, leave
     // BLOCK_DEVICE (the SD's geometry) untouched — the stick stays reachable via USB_BLOCK_DEVICE.
@@ -322,8 +328,17 @@ pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
 /// PIUSB-28: x86 / non-SD-capable targets — the USB stick is the default (boot) block backend, so it
 /// always claims the global `BLOCK_DEVICE` alongside the dedicated USB handle. Preserves the historical
 /// behavior on any target that never compiles the SD backend / BACKEND selector.
+///
+/// FRGUARD (GR21): the claim ORIGIN is recorded here — see [`GLOBAL_CLAIM_HOTPLUG`]. Recording is all
+/// that happens; the registry writes below are byte-identical to the pre-FRGUARD ones, so a build
+/// without `sdhcblk` is unchanged in both code and decisions.
 #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
-pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
+pub fn publish_usb_geometry(dev: BlockDeviceInfo, hotplug: bool) {
+    // Ordered BEFORE the registry write, so no reader can observe a populated global slot whose
+    // origin flag still describes the PREVIOUS claimer.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    GLOBAL_CLAIM_HOTPLUG.store(hotplug, core::sync::atomic::Ordering::Release);
+    let _ = hotplug;
     *BLOCK_DEVICE.lock() = Some(dev);
     *USB_BLOCK_DEVICE.lock() = Some(dev);
     set_usb_ready();
@@ -438,13 +453,25 @@ static SUBST_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// canonical backend is SD, a `Default` write with no registered SD returns `NotReady` and says so on serial
 /// once, producing an honest "no writable volume" boot instead of misdirected writes.
 ///
+/// FRGUARD (GR21): **that hazard also exists on x86, and a guard for it now exists there too.** SDHC-4b gave
+/// x86 an internal SD backend that registers as handle `Sdhc` and deliberately leaves `BLOCK_DEVICE` empty,
+/// so an x86 machine can boot with a canonical volume that is not the `Default` target — and Boot AI-2 proved
+/// the consequence on metal: the flight recorder created and wrote a 262 656-byte `/UNAOS.LOG` onto a card
+/// the operator hot-plugged to read, because that card was the first thing to claim the global slot. The x86
+/// arm of `default_writable` (below) closes it, keyed on claim ORIGIN rather than on this file's `BACKEND`
+/// selector, which x86 does not compile.
+///
 /// Deliberately WRITES ONLY. Reads may still fall through to the BOT path — a read cannot corrupt the wrong
 /// device, and the USB mount has its own dedicated `read_block_usb` handle regardless.
 ///
-/// Deliberately `baremetal`-gated, NOT a blanket "xHCI writes are suspect" rule. On QEMU-virt aarch64
-/// (`test-arm`) and on x86 the SD backend is never compiled, xHCI IS the legitimate sole backend, and this
-/// function does not exist — those builds keep their pre-USBFALL write path byte-for-byte. The refusal is
-/// about substitution on a platform that has a canonical backend, not about xHCI.
+/// Deliberately gated to platforms that HAVE a canonical backend, NOT a blanket "xHCI writes are suspect"
+/// rule. On QEMU-virt aarch64 (`test-arm`) and on an x86 build without `sdhcblk` the SD backend is never
+/// compiled, xHCI IS the legitimate sole backend, and the refusal does not exist — those builds keep their
+/// pre-USBFALL write path byte-for-byte. The refusal is about substitution on a platform that has a
+/// canonical backend, not about xHCI.
+///
+/// FRGUARD (GR21): x86 + `sdhcblk` is now such a platform and has its own arm below. The line above used to
+/// say "and on x86", full stop; Boot AI-2 proved that premise dead.
 ///
 /// Byte-inert on a healthy SD boot: `BACKEND_SD` is set before the first FAT write, so this returns `Ok`
 /// without touching the console.
@@ -453,13 +480,87 @@ pub fn default_writable() -> bool {
     BACKEND.load(Ordering::Acquire) == BACKEND_SD
 }
 
-/// USBFALL F1: targets without the SD backend (x86, QEMU-virt aarch64) have no substitution to refuse — the
-/// enumerated device IS the canonical `Default` backend, so `Default` writes are available whenever the block
-/// layer has one at all. Constant `true` keeps `write_block` and every `read_only()` consumer byte-identical
-/// to pre-USBFALL there.
-#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+/// FRGUARD (GR21): how the CURRENT occupant of the global [`BLOCK_DEVICE`] slot got there — `true` if it
+/// was queued by a live connect-change (hot-plug) edge, `false` if the initial port scan found it. Written
+/// by [`publish_usb_geometry`] on every claim, so it always describes the device the slot holds now.
+///
+/// This is the whole discriminator, and it is the one the metal capture forces. Boots AH and AI-1 ALSO had
+/// an `Sdhc` handle registered (the operator's 29 MiB Panasonic sat in the internal slot, `blocks=60800`)
+/// while the machine booted from a 60 GB card in a USB reader, and the flight recorder's writes to that
+/// boot volume were entirely correct. A guard keyed on "an `Sdhc` handle exists" alone would have refused
+/// them. What is different about Boot AI-2 is not that a canonical backend existed — it is that the global
+/// slot was still EMPTY when the boot finished and was then claimed, 296 seconds in, by a medium the
+/// operator plugged in to read.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+static GLOBAL_CLAIM_HOTPLUG: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// USBFALL F1 / FRGUARD (GR21): the x86 arm of the substitution guard — the same policy as the Pi's,
+/// re-keyed onto the predicate that is actually true on this target.
+///
+/// x86 has no `BACKEND` selector to read, because SDHC-4b deliberately gave the internal SD card its own
+/// THIRD registry handle and left the global slot untouched (see the SDHC-4b section below for why). So
+/// "is the global slot holding the canonical backend?" is asked here as its two-part equivalent:
+///
+///   1. **Is there a canonical backend outside the global slot at all?** `sdhc_info().is_some()` — a card
+///      that `register_sdhc` accepted after its read witnesses ran. If not, nothing can be substituted
+///      away from and this is `true`, exactly as the pre-FRGUARD constant was.
+///   2. **Did the global slot's occupant arrive as a HOT-PLUG?** If it was found by the boot port scan it
+///      IS the boot volume and its writes are the rightful ones (Boots AA..AI-1). If it arrived later, on
+///      a live connect-change edge, on a machine that already had a canonical volume it never claimed,
+///      then a `Default` WRITE is a substitution of one physical medium for another — Boot AI-2, where
+///      the recorder created a 262 656-byte `/UNAOS.LOG` on the operator's card at 312070 ms.
+///
+/// Deliberately WRITES ONLY, exactly as the aarch64 arm: reads still fall through to the BOT path, because
+/// a read cannot corrupt the wrong device, and the stick keeps its dedicated `read_block_usb` handle.
+///
+/// Byte-inert on every boot with no internal card, and on every boot whose boot volume claimed the global
+/// during the port scan — i.e. it returns `true` without touching the console on the entire AA..AI-1 series.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn default_writable() -> bool {
+    if sdhc_info().is_none() {
+        return true; // no canonical backend outside the global slot — nothing to substitute away from
+    }
+    !GLOBAL_CLAIM_HOTPLUG.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// USBFALL F1: targets without ANY canonical backend outside the global slot (x86 without `sdhcblk`,
+/// QEMU-virt aarch64) have no substitution to refuse — the enumerated device IS the canonical `Default`
+/// backend, so `Default` writes are available whenever the block layer has one at all. Constant `true`
+/// keeps `write_block` and every `read_only()` consumer byte-identical to pre-USBFALL there.
+#[cfg(not(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "sdhcblk")
+)))]
 pub fn default_writable() -> bool {
     true
+}
+
+/// FRGUARD (GR21): one-shot latch for the x86 refusal witness — same shape as `SUBST_REFUSED`, so a
+/// retrying writer names the refusal once rather than per sector.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+static X86_SUBST_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// FRGUARD (GR21): the x86 twin of [`guard_default_write_backend`]. Fails CLOSED with `NotReady` and one
+/// falsifiable line naming both media, so a capture can tell "the guard fired" from "nothing tried to
+/// write". The witness prints the two geometries because that is what identified the substitution in the
+/// Boot AI-2 forensics: `blocks=124735488` internal vs `dev_blocks=60800` in the global slot.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+fn guard_default_write_backend() -> Result<(), BlockError> {
+    if default_writable() {
+        return Ok(());
+    }
+    if !X86_SUBST_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        let canon = sdhc_info().map(|d| d.num_blocks).unwrap_or(0);
+        let glob = info().map(|d| d.num_blocks).unwrap_or(0);
+        serial_println!(
+            ":: BLOCK: Default WRITE refused — canonical backend is Sdhc (blocks={}), global slot is a \
+             HOT-PLUGGED device (blocks={}); refusing to write the boot volume's data to somebody else's \
+             medium (first, once) ::",
+            canon, glob
+        );
+    }
+    Err(BlockError::NotReady)
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
@@ -519,6 +620,10 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     // USBFALL F1: fail CLOSED rather than substituting the USB stick for a missing SD card. See
     // `guard_default_write_backend` — compiled only where SD is the canonical backend (Pi bare-metal).
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    guard_default_write_backend()?;
+    // FRGUARD (GR21): the same refusal on x86 + `sdhcblk`, keyed on claim origin instead of the BACKEND
+    // selector. Not compiled at all without the knob, so the plain x86 write path is untouched.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     guard_default_write_backend()?;
 
     let dev = info().ok_or(BlockError::NotReady)?;
@@ -647,6 +752,15 @@ pub fn read_blocks(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 /// path's callers — there is nothing to read first: this is the point where a full-sector overwrite
 /// stops costing a READ(10) it never used.
 pub fn write_blocks(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    // FRGUARD (GR21): the counted path needs the guard as much as the single-block one — `fs/fat.rs`'s
+    // `write_sectors` routes here, and that is the entry point the flight recorder's `write_grow` /
+    // `write_at` actually use. Guarding only `write_block` (as the aarch64 arm does today) would have
+    // left the Boot AI-2 write path wide open. Deliberately NOT added to the aarch64 arm in this arc:
+    // that gap is real but it is the Pi lane's to close, and this arc's contract is that aarch64 makes
+    // byte-identical decisions.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    guard_default_write_backend()?;
+
     let dev = info().ok_or(BlockError::NotReady)?;
     let count = span_blocks(&dev, lba, buf.len())?;
 

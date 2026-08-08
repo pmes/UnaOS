@@ -79,7 +79,7 @@
 //! flush, but still one bounded write on the reserve pass only.
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use spin::Mutex;
 
 /// Ring capacity. 64 KiB held "a full vm-image boot" when that claim was written, but the FTDI
@@ -318,6 +318,91 @@ static PAD_NEXT: AtomicBool = AtomicBool::new(false);
 /// header has to say which case the reservation took.
 static REUSED: AtomicBool = AtomicBool::new(false);
 
+// ===================== FRVOL (GR21) — the recorder's volume is latched at reserve =====================
+//
+// `LOG_FIRST` / `LOG_SIZE` name a cluster chain and a byte count. They do not name a DISK. Every flush
+// re-derives the disk from `fat::mount()`, which is hardcoded to `BlockSource::Default` (`fs/fat.rs`),
+// i.e. whatever device occupies the global `BLOCK_DEVICE` slot at that instant — and on x86 that slot
+// can change occupant while the kernel runs, because `publish_usb_geometry` claims it on every USB
+// storage enumeration including a hot-plug. So "cluster 2, 262 656 bytes" can be resolved against one
+// medium at reservation time and a DIFFERENT medium one flush later, with every offset still in range
+// and every write reporting PASS. That is not a hypothetical: Boot AI-2 wrote the recorder's file onto
+// a card the operator had inserted to read.
+//
+// The block-layer guard (`block::default_writable`, FRGUARD) refuses the WRITE in the case it can see.
+// This latch is the recorder's own half and it is independent of it: it binds the reservation to the
+// identity of the volume it ran on, and every later flush must land on THAT volume or be refused. Two
+// identities are kept because each closes what the other cannot:
+//
+//   * the FAT volume fingerprint `(BS_VolID, count_of_clusters)` — `FatFs::volume_fingerprint`, the same
+//     pair the aarch64 UNAFS.ATR ACL store binds to. It survives a re-enumeration of the same physical
+//     card (a re-plug changes the xHCI slot id but not the serial), so a legitimate replug is not a
+//     refusal;
+//   * the block device geometry `num_blocks` — it catches a second volume that happens to carry the
+//     same serial (a byte-for-byte image written to two differently sized cards), which the fingerprint
+//     alone cannot tell apart.
+//
+// Both are captured inside `reserve_log`, from the very mount the reservation mutates, so there is no
+// window between "which volume did we reserve on" and "which volume did we record". A mismatch is a
+// REFUSAL with a witness naming both — never a silent retarget, and never a write.
+static LOG_VOL_LATCHED: AtomicBool = AtomicBool::new(false);
+static LOG_VOL_ID: AtomicU32 = AtomicU32::new(0);
+static LOG_VOL_CLUSTERS: AtomicU32 = AtomicU32::new(0);
+static LOG_VOL_BLOCKS: AtomicU64 = AtomicU64::new(0);
+/// One-shot latch for the mismatch witness, so a throttled-but-repeating flush names it once.
+static LOG_VOL_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// FRVOL: bind the recorder to `fs` — the volume the reservation is about to mutate. Called from
+/// `reserve_log` immediately after its mount succeeds and BEFORE any directory or FAT byte is touched,
+/// so even a reservation that fails half way has already recorded which medium it was working on.
+fn latch_volume(fs: &crate::fs::fat::FatFs) {
+    let (vol_id, clusters) = fs.volume_fingerprint();
+    LOG_VOL_ID.store(vol_id, Ordering::Relaxed);
+    LOG_VOL_CLUSTERS.store(clusters, Ordering::Relaxed);
+    LOG_VOL_BLOCKS.store(
+        crate::drivers::block::info().map(|d| d.num_blocks).unwrap_or(0),
+        Ordering::Relaxed,
+    );
+    LOG_VOL_LATCHED.store(true, Ordering::Release);
+}
+
+/// FRVOL: is `fs` the volume the reservation ran on? `true` when nothing is latched yet (the reserve
+/// pass itself, which is what does the latching) so the check adds no ordering requirement of its own.
+/// Refusing on a mismatch is the whole point: the alternative is writing this boot's log over 262 656
+/// bytes of somebody else's medium at offsets that are all perfectly in range.
+fn volume_matches(fs: &crate::fs::fat::FatFs) -> bool {
+    if !LOG_VOL_LATCHED.load(Ordering::Acquire) {
+        return true;
+    }
+    let (vol_id, clusters) = fs.volume_fingerprint();
+    let blocks = crate::drivers::block::info().map(|d| d.num_blocks).unwrap_or(0);
+    vol_id == LOG_VOL_ID.load(Ordering::Relaxed)
+        && clusters == LOG_VOL_CLUSTERS.load(Ordering::Relaxed)
+        && blocks == LOG_VOL_BLOCKS.load(Ordering::Relaxed)
+}
+
+/// FRVOL: the refusal witness. Names BOTH volumes, because "the recorder refused" is only falsifiable
+/// if a reader can see which medium it was reserved on and which one `Default` resolves to now.
+fn refuse_foreign_volume(fs: &crate::fs::fat::FatFs) -> crate::fs::fat::FatError {
+    if !LOG_VOL_REFUSED.swap(true, Ordering::Relaxed) {
+        let (vol_id, clusters) = fs.volume_fingerprint();
+        let blocks = crate::drivers::block::info().map(|d| d.num_blocks).unwrap_or(0);
+        serial_println!(
+            ":: FR: flush REFUSED — {} was reserved on volume id={:#010x} clusters={} blocks={}, but \
+             BlockSource::Default now resolves to volume id={:#010x} clusters={} blocks={}; the boot \
+             volume changed under the recorder and it does not follow (first, once) ::",
+            LOG_NAME,
+            LOG_VOL_ID.load(Ordering::Relaxed),
+            LOG_VOL_CLUSTERS.load(Ordering::Relaxed),
+            LOG_VOL_BLOCKS.load(Ordering::Relaxed),
+            vol_id,
+            clusters,
+            blocks
+        );
+    }
+    crate::fs::fat::FatError::Unsupported
+}
+
 /// FRSTAMP — the file's FIRST line: which boot owns these bytes.
 ///
 /// The stale-log trap this closes: `reserve_log`'s reuse case leaves a previous boot's `UNAOS.LOG`
@@ -390,6 +475,9 @@ fn stamp_reservation(reused: bool) -> Result<usize, crate::fs::fat::FatError> {
 fn reserve_log() -> Result<(u32, u32, bool), crate::fs::fat::FatError> {
     use crate::fs::fat::{self, FatError};
     let fs = fat::mount()?;
+    // FRVOL (GR21): bind the recorder to THIS volume before the first directory byte moves. Every
+    // later flush re-derives its disk from `BlockSource::Default`, which a hot-plug can re-point.
+    latch_volume(&fs);
     let (dir_lba, dir_off) = match fs.find_located(LOG_NAME) {
         Ok((de, _dl, _doff)) if de.is_dir => return Err(FatError::IsDirectory),
         Ok((de, _dl, _doff))
@@ -426,6 +514,11 @@ fn write_log(data: &[u8]) -> Result<usize, crate::fs::fat::FatError> {
     let first = LOG_FIRST.load(Ordering::Acquire);
     let size = LOG_SIZE.load(Ordering::Acquire);
     let fs = crate::fs::fat::mount()?; // read-only: re-reads the BPB, mutates nothing
+    // FRVOL (GR21): the mount above resolved `BlockSource::Default` AGAIN. If the global slot changed
+    // occupant since the reservation, `first`/`size` now address a stranger's clusters — refuse.
+    if !volume_matches(&fs) {
+        return Err(refuse_foreign_volume(&fs));
+    }
     if data.is_empty() {
         return Ok(0);
     }
@@ -452,6 +545,27 @@ pub fn service() {
 
     if crate::drivers::block::info().is_none() {
         return; // storage not up yet — nothing to flush to
+    }
+
+    // FRGUARD (GR21): do not even ATTEMPT a reservation on a volume the block layer will refuse to
+    // write. The refusal would surface anyway — every mutating path below ends at `write_block` /
+    // `write_blocks`, which fail closed — but it would surface LATE and in the wrong voice: the
+    // reuse case (an existing, large-enough `UNAOS.LOG` already on the foreign medium) mutates
+    // nothing, so `reserve_log` succeeds and the boot prints `reserved … stamped=false`, a line that
+    // reads like a success against a card the recorder must not touch. Asking first turns that into
+    // one honest sentence. Latched to state 2 (permanent): a substitution is not a transient.
+    // Byte-inert wherever `default_writable()` is the constant `true` — every x86 build without
+    // `sdhcblk`, and every QEMU-virt aarch64 build.
+    if !crate::drivers::block::default_writable()
+        && RESERVED
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    {
+        serial_println!(
+            ":: FR: {} NOT reserved — the block layer refuses Default WRITEs here (the canonical \
+             volume is not the one in the global slot); this boot's log stays in RAM ::",
+            LOG_NAME
+        );
     }
 
     // SINGLE FAT WRITER: reserve the file on the FIRST pass storage is present — before any fixture
