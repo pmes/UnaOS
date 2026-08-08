@@ -1554,9 +1554,9 @@ any MTRR type, so the MSR was the only missing piece.
 :: SCHED-X86: input task dispatched on core 7 ::
 :: SCHED-X86: render task dispatched on core 1 — panel owned by the scheduler ::
 :: SCHED-X86 PLACE-CHECK: actual=c1 arg=c1 published=c1 pool=5 collide=0 tier=exclusive verdict=PASS ::
-[schedx86] load-prejoin c0=-- c1=…% …            (SCHEDLOAD-X86, once, at the handoff)
+[schedx86] load-prejoin c0=-- c1=…% …                      (SCHEDLOAD-X86, once, at the handoff)
 [schedx86] depth sent=… recv=… inflight=… (render core 1)
-[schedx86] load c0=…% c1=…% … sw=[…] q=[…]       (SCHEDLOAD-X86, every ~5 s)
+[schedx86] load c0=…% c1=…% c2=100%*(name) … sw=[…] q=[…]  (SCHEDLOAD-X86, every ~5 s)
 ```
 
 The spawn line and the three *dispatched* lines are deliberately separate: spawned
@@ -1631,7 +1631,38 @@ all five of their consumers — they are a second instrument in a different curr
 and the arc's cross-check is that the two agree about *which* cores are idle while
 disagreeing about the magnitudes.
 
-Three x86-specific decisions, none of them ports:
+#### The per-core token has exactly three forms
+
+This is the instrument. Reading the line without reading this table gets it wrong.
+
+| form | meaning |
+| --- | --- |
+| `cN=NN%` | **MEASURED.** Every cycle in the number was folded from a real span over the window. |
+| `cN=100%*(name)` | **INFERRED.** No span was folded for this window; the value is deduced from a live `current` plus a fold age past a whole window. `name` is the task holding the core (clipped to 16 bytes, `+` if clipped). |
+| `cN=--` | **ABSENT.** No live measurement at all — the core never entered `run()`, or stopped folding with nothing executing. |
+
+`0%` is a measurement (this core folded spans; none were busy); `--` is the *absence*
+of one. Collapsing them would make an unaccounted core indistinguishable from a
+provably idle one, which is how an instrument ends up certifying the imbalance it was
+built to detect. `100%*` is that same argument one level up, and it matters more,
+because the inferred value is the extreme of the scale: without the marker an
+*inference* prints byte-for-byte as a *measurement*. The adversarial review caught the
+collapse in the first revision, and the QEMU trace shows exactly why it matters —
+`c2=100%*(zeolite-resolver)` (inferred, `sw[2]=20`) beside `c3=100%` (measured,
+`sw[3]=34,481,377`) on the same line. It also decides whether the PULSE-A cross-check
+can be scored at all: a core agreeing at 100 % via the pegged arm agrees for a reason
+near-identical to PULSE-A's own ("this core is dispatching"), i.e. structurally rather
+than evidentially.
+
+The anti-witness is asserted on the wire, once per boot: `run_bsp` emits
+`[schedx86] load-prejoin` one statement before entering `run()`, at the single instant
+when core 0 has never folded a span and every AP has. That line **must** read `c0=--`
+with at least one AP carrying a percent; `c0=0%` there refutes the instrument outright.
+Note what it does *not* claim: the x86 BSP **does** enter `run()` (`main.rs:1362`
+whenever `online.len() >= 2`), so `c0` reads `0%` on every steady line thereafter. The
+prejoin `--` describes one instant, not a permanent state.
+
+#### Design decisions, none of them ports
 
 * **Spans in TSC, freshness in milliseconds.** `CNTPCT` is system-global, so on
   aarch64 one core may subtract another's timestamp. `rdtsc` is **per-core**, and
@@ -1641,42 +1672,83 @@ Three x86-specific decisions, none of them ports:
   `arch::ms()` (globally coherent: core 0 alone advances `APIC_TICKS`), and only a
   core's own self-measured spans are in cycles. The `CoreLoad` field is
   `fold_age_ms`, not `fold_age_cyc`, for that reason.
-* **No age-on-read (PULSE-5); a pegged-core test instead.** PULSE-5's remedy needs
-  exactly the cross-core cycle subtraction ruled out above. The freeze it fixes is
-  real here too — the arc's QEMU smoke caught a core printing `64%` then `--`, having
-  stopped folding because it was *inside* a task — so `core_load` instead reads
+* **Age-on-read for the SELF row only.** The cross-core objection above does not apply
+  when the reader *is* the owning core, where the subtraction is the same same-core
+  `rdtsc` pair the fold already performs twice per dispatch — and it needs no fences,
+  because a core's scheduler loop runs only when no task is running on it, so there is
+  no concurrency to order. This matters because the witness is emitted from the render
+  task at the *end* of its pass, and that task's span is folded only when it later
+  blocks in `recv`: without the self arm, c1 reported its own load missing most of the
+  current pass every time, biased low by ~2× at exactly the sample point. Adding it
+  moved c1 from `0–1%` to `2–3%` in the QEMU battery.
+* **No cross-core age-on-read (PULSE-5); a pegged-core test instead.** For *remote*
+  cores PULSE-5's remedy still needs the ruled-out subtraction. The freeze it fixes is
+  real here too — the arc's own QEMU smoke caught a core printing `64%` then `--`,
+  having stopped folding because it was *inside* a task — so `core_load` instead reads
   `SCHED[cpu].current != 0` together with a fold age past a full window and reports
-  100 %. Both inputs are globally coherent. The sub-window part of PULSE-5 is
-  deliberately not reproduced: it under-reports a busy core by at most one window and
-  can never over-report one, and an inflated percent is the dangerous direction.
+  100 %, marked `*`. Both inputs are globally coherent.
 * **No `PaddedUsize`.** Its justification is A72 LL/SC livelock, which does not exist
   on x86. `CoreAccount` *is* `repr(align(128))` on its own merits — plain write-write
   false sharing between neighbouring cores' slots on the dispatch path, at the 128-byte
   effective granularity of Sandy/Ivy Bridge's adjacent-line prefetch.
 
-**`--` versus `0%` is the anti-witness, and it is load-bearing.** `0%` is a
-measurement (this core folded spans; none were busy). `--` is the *absence* of one.
-Collapsing them would make an unaccounted core indistinguishable from a provably idle
-one, which is how an instrument ends up certifying the imbalance it was built to
-detect. The assertion is made on the wire, once per boot: `run_bsp` emits
-`[schedx86] load-prejoin` one statement before entering `run()`, at the single instant
-when core 0 has never folded a span and every AP has. That line **must** read `c0=--`
-with at least one AP carrying a percent; `c0=0%` there refutes the instrument outright.
+#### Documented limits — read these before balancing against these numbers
+
+1. **ISR-only load is invisible; it reads `0%`.** A busy span includes interrupt
+   handlers that fire *while a task is running*, but the idle arm charges the waking
+   handler to **idle**. So a core with an empty run queue that is saturated servicing
+   device IRQs reads `0%`. Not hypothetical: core 0 is the sole advancer of
+   `APIC_TICKS`, carries a strictly larger ISR share than any AP, has nothing pinned to
+   it, and will report `0%` on every line regardless of how much interrupt work it does.
+2. **The instrument CAN over-report, by one mechanism and one only.** `busy_pct`'s
+   partial-window blend fills the not-yet-elapsed remainder of the current window at the
+   last completed window's rate, so a core that was busy and has just gone idle decays
+   from its old percent to 0 across ~250 ms instead of dropping instantly. Bounded by
+   one window, always decaying, and it cannot fire for a core idle for a full window —
+   but **any refutation criterion of the form "a percent on a core PULSE-A shows at
+   `busy=0`" must tolerate it**, or it is a false-refutation trigger. (The alternative,
+   reporting `busy/elapsed` alone, is worse: right after a roll a single 2 ms busy
+   sample would print 100 %.) The missing sub-window term for *remote* cores can only
+   under-report, which is the safe direction; the blend is the exception.
+3. **A foreground shell command silences the witness.** `handle_key` holds
+   `SCREEN_APP_ACTIVE` for the whole of `dispatch_command`, during which
+   `x86_input_service` sends nothing into `GUI_CHANNEL_X86` and the render task is
+   blocked inside the command — so there is **no `depth` line and no `load` line** for
+   the duration. Use `bg` to observe a program's load, not a foreground `run`.
+4. **Two builds emit neither line.** Both require `run_bsp`, which the `rast` feature
+   and the `online.len() < 2` fallback (`main.rs:1363`, "GUI stays inline on the BSP")
+   both skip — and in those builds `x86_render_service` is never spawned either. A
+   silent capture from such a build is not a regression.
+5. **The column count is capped at `MAX_CPUS = 8`.** The bench rMBP is exactly 8
+   logical cores, i.e. zero headroom. When the cap binds, the line says so
+   (`cores=8/N <CAPPED>`) rather than silently reading as a shorter machine.
 
 The steady-state line rides the existing `[schedx86] depth` clock gate (~5 s) in
 `x86_render_service`, emitted after `pal.render()` — below the event-routing block,
 which is the focus-trap seam and is not to be perturbed by an instrument. Every
-`depth` line should be followed by exactly one `load` line. The whole line is composed
-into one stack buffer and handed to a single `serial_println!`: piecewise fragments
-would drop the UART lock between fields, and a witness another core can cut in half is
-not evidence.
+`depth` line should be followed by exactly one `load` line.
+
+Two properties of the emit are load-bearing rather than stylistic. The per-core
+**snapshot is taken with interrupts masked**: `run_queue_len` acquires `RUN_QUEUES[c]`,
+a plain `spin::Mutex` with no IRQ masking whose own doc names it a WEDGE-4 `<W1>`
+hazard site, and this witness runs from a *preemptible* task on the render core.
+Unmasked it is a permanent silent self-deadlock waiting to happen — preempt the render
+task while it holds `RUN_QUEUES[1]`, and `run()` on the same core then needs that exact
+lock at IF=0 to requeue the very task holding it; nothing breaks the cycle, nothing
+panics, and since the witness is emitted *from* the dead task, nothing reports it. The
+masked section is bounded (≤ 8 iterations of lock-free reads plus one non-nested
+run-queue acquisition each, no allocation, no UART, no other lock) and the ~8 ms UART
+write is deliberately left outside it. The whole line is then composed into one stack
+buffer and handed to a **single** `serial_println!`: piecewise fragments would drop the
+UART lock between fields, and a witness another core can cut in half is not evidence.
 
 Still open after this arc, in the order the campaign takes them: placement
 (`CPU_AUTO`/`spawn_auto`/`PRIO_SERVICE`, which also fixes `bg_place_cpu` above),
 BSP-serial boot probing, band-parallel compositor flush, and work stealing.
 `ui_status::live_permille`'s x86 arm still returns `None` and falls back to the event
 meter — wiring it to this feed so the panel strip and the serial line read one source
-is a follow-up, not part of this arc.
+is the survey's Arc-0 scope item 4, **deferred by the implementing session and awaiting
+the integrator's explicit accept**, not silently dropped.
 
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
