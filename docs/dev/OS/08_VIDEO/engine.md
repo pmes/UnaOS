@@ -5157,6 +5157,201 @@ evidence the pacer works.
 
 ---
 
+### VSYNC-PACE r2 — the deadline ran away and latched the pacer OFF (Boot AQ)
+
+**The wire said it on the first paced boot and nothing read it.** Boot AQ, `[wpace]` at 670899ms:
+
+```
+[wpace] win=0 pres=255 paced=0 slept=0ms rate=50.9/s frame_us=16667
+[wpace] win=1 pres=190 paced=0 slept=0ms rate=37.9/s frame_us=16667
+[wpace] win=3 pres=395 paced=0 slept=0ms rate=78.9/s frame_us=16667
+[wpace] win=4 pres=265 paced=0 slept=0ms rate=52.9/s frame_us=16667
+[wpace] rollup wins=8 pres=1866 paced=83 slept=726ms focus=0 resync=98 rate=373.0/s span=5002ms -> PACING
+```
+
+One of eight windows presented at 78.9/s on a 16667 us panel. (An earlier draft said "four of eight
+never slept once" — review-corrected: three of those four were at 50.9, 37.9 and 52.9/s, BELOW the
+panel rate, where `paced=0` is exactly HEADROOM and not a defect. **win=3 is the single genuine
+falsifier**, and one is enough.)
+That is line one of this section's own falsification list — *"`paced=0` on every window while
+`[wcn] rate=` sits above 60/s — the pacer is not firing"* — and the verdict still read `PACING`,
+because 83 sleeps on four *other* windows are enough to satisfy `t_paced > 0`.
+
+#### The mechanism: banked credit, then a permanent latch
+
+1. `present_pace` deliberately does not sleep a sub-millisecond remainder (`if ms == 0 { return }`),
+   so a present can land up to 999 us **before** its own deadline.
+2. `pace_advance` then computed `next = prev + PANEL_FRAME_US` unconditionally — measuring the next
+   deadline from a deadline the caller did not actually wait for, and banking the unslept remainder.
+3. ⚠ **REVIEW-CORRECTED.** This step used to read "the credit compounds at up to ~1 ms per frame;
+   after ~17 frames (~0.3 s) the deadline sits more than a full frame ahead." It does not compound:
+   the clock is MILLISECOND-GRANULAR against a 16667 us frame, so `due - now_at_present` cycles
+   667/334/1/668… The runaway arm fires when a window issues its next present **within the same
+   millisecond** as an early one — abrupt and conditional on back-to-back presents, not gradual.
+4. `present_pace`'s safety valve — `if wait_us > PANEL_FRAME_US { return }`, written against a
+   *stale* deadline — then fires on every subsequent present and stops sleeping altogether, while
+   `pace_advance` keeps advancing (`now <= prev + PANEL_FRAME_US` is trivially true once `prev` is in
+   the future).
+
+⚠ **AND `overrun=` CANNOT CORROBORATE ANY OF THIS.** The counter added with the clamp is zero BY
+CONSTRUCTION under that clamp — it can falsify the clamp (a non-zero reading means the clamp failed)
+but it can never diagnose the AQ symptom, which the clamp has already made unreachable. Do not read
+`LATCHED` absent as coverage of the original defect.
+
+**The latch never opens.** Every fast window disabled its own pacer within the first second of its
+life and presented un-paced for the rest of the boot. Windows 2/5/6/8 still paced only because they
+were slow enough to hit the resync arm often enough to re-anchor.
+
+#### The fix, and the counter that makes it falsifiable
+
+`pace_advance` now clamps: `next = next.min(now + PANEL_FRAME_US)`. The deadline may never sit more
+than one frame ahead of now, which makes the `wait_us > PANEL_FRAME_US` arm **unreachable by
+construction**. `min` and not a resync, because both existing arms remain the right cadence source —
+a LATE present must keep measuring from `prev` (that is what holds the long-run rate at exactly 60.0
+across tick-granular sleeps), and only an EARLY present can produce a deadline beyond
+`now + PANEL_FRAME_US`. The cost of the cap is the ≤999 us that was not slept, paid once, instead of
+banked forever.
+
+The safety valve is now **counted**: `[wpace] rollup … overrun=` and a new verdict `LATCHED` that
+outranks both `PACING` and `HEADROOM`. Non-zero is a live defect, not a slow machine. `overrun=0`
+is the pass condition.
+
+---
+
+### WCSER — one composite pass on the panel at a time (x86)
+
+**P-AQ (Peter, bench rMBP, Boot AQ):** *"massive flicker in stacked windows and even without mouse
+movement the lower window bleeds through especially for the top window in a stack if it is
+selected."*
+
+#### The defect
+
+`composite()` is called once per present, from the presenting task's own core, and nothing excluded
+two of them. Each pass takes its own damage snapshot, closes it upwards over occlusion, and blits
+back-to-front. That is correct in isolation and **not composable**: pass A drawing `{lower, upper}`
+and pass B drawing `{upper}` can interleave as
+
+```
+A.lower … B.upper … A.upper
+```
+
+which leaves the LOWER window's pixels on top of the upper one for the length of one window blit.
+At the panel that is the lower window bleeding through the upper; repeated at the fleet's present
+rate it is a flicker. `F4`'s `BLIT_ACTIVE` is a **counter**, not a mutex — it exists so a teardown
+can drain in-flight blits, and it never excluded anything.
+
+#### The evidence is arithmetic, not inference
+
+`[comp2]` reports pass count and mean pass time over a measured span, so the compositor's duty cycle
+is a division:
+
+| at | passes | pass_us | span | pass-time | utilisation |
+|---|---|---|---|---|---|
+| 665644ms | 1807 | 3997 | 5000ms | 7.22 s | **144 %** |
+| 653759ms | 1225 | 2656 | 3061ms | 3.25 s | **106 %** |
+
+A single compositor cannot exceed 100 %. At least two cores were inside `composite` simultaneously,
+in sustained steady state. **x86 had no direct instrument for this** — FLUID-3's `FL3_DEPTH_MAX` /
+`FL3_OVERLAP` are `target_arch = "aarch64"` only — which is why the overlap went unnamed for as long
+as it did, and why the reading had to be recovered from `[comp2]`'s own two numbers.
+
+**A corroboration this section used to carry has been STRUCK, because it was false.** An earlier
+draft cited `[wc-d] verify win=10 … got=0x1e1e1e want=0x100e16 -> FAIL` @229966ms and called
+`0x1e1e1e` "the desktop erase colour", i.e. a foreign painter inside win=10's own rect. Review
+refuted it three ways: `wm::DESKTOP_BG` is `0x002D_2B55`, not `0x1e1e1e`; the `main.rs` line the
+draft cited is a comment about REMOVED pre-CURSOR-1 code which states verbatim that `0x1E1E1E` "is
+neither the desktop colour nor on top of a window"; and `0x1e1e1e` is `video::PANEL_BG` **and
+`vug::BG`, the vug's own surface background** — so on a vug window that reading is most simply the
+window's own pixels and corroborates nothing. It is recorded here rather than deleted because the
+wrong reading was plausible and someone will find that line again.
+
+**The `[comp2]` arithmetic stands alone and needs no corroboration:** mean-per-pass × passes
+exceeding a wall-clock span is a pigeonhole argument, and `pass_us` truncates twice so 144% is a
+FLOOR. One honest narrowing: it proves passes OVERLAP IN TIME, not that two *cores* were drawing —
+a holder descheduled mid-pass while another task composites on the same core produces identical
+arithmetic and the identical bug.
+
+#### The gate
+
+`composite()` on x86 now takes `COMP_GATE`, a **non-blocking** flag; `composite_once` is the pass it
+used to be, unchanged.
+
+* **Try, never spin.** A loser never waits, on any core, masked or not. This is the F4 family's law
+  (`cursor::claim_bounded` states it for `SPRITE`): `composite` is reached from `sched::exit` →
+  `close_owner` with interrupts already masked, and from both present chains holding `IrqGuard` +
+  `WINDOWS`. A blocking acquisition on any of those is a wedge. The gate adds nothing to
+  `DrainBarrier::drain`'s wait set — `BLIT_ACTIVE` is still the only thing that barrier waits on.
+* **Nothing is dropped.** A decliner returns *before* the table snapshot, so it clears no `damaged`
+  flag and consumes no band; the damage it would have drawn is still on the table. It publishes
+  `COMP_PENDING` and runs the `Untouched` cursor tail (`ensure_drawn`), because `wm::erase` takes the
+  sprite down and leaves the composite that follows to put it back — a contract that predates WC-I
+  and that a decline may not break.
+* **The holder re-runs** a full pass (own snapshot, own closure, own order, own tail — so no tail is
+  ever skipped) while `COMP_PENDING` is set and `any_damaged()` still holds, bounded by
+  `COMP_RERUN_MAX = 2`. **That bound is an IRQ-masked-time bound, not a throughput one**: the holder
+  is usually `sys_win_present` inside `IrqGuard::mask_save()` holding `WINDOWS`, and each round
+  extends the masked window by a whole pass (~4 ms mean, 41 ms worst on AQ).
+* **A lost-wakeup close** re-arms one more attempt after release, for the decliner that publishes
+  between the holder's last `swap` and its release. Without it, a static desktop could keep damage on
+  the table with no core committed to drawing it.
+* **Reentrancy is safe by construction**: a nested `composite()` on the gate-holding core simply
+  declines and is picked up by the holder's own loop.
+
+The effect at the panel is **coalescing**: several windows' presents that used to be several
+uncoordinated whole-stack rewrites become one correctly-ordered pass over their union.
+
+#### `[wcser]` — the instrument the fix produces
+
+Rides `[wcn]`'s cadence and span, directly under the per-window `comp_rate=` lines it explains:
+
+```
+[wcser] scope=live entered=N declined=M reruns=R declined_pct=P span=Sms -> SERIAL|SOLO
+```
+
+`declined` is the reading: the number of composite passes that would previously have been
+interleaving their blits with another core's. `SOLO` (`declined=0`) is **not** a failure — it is a
+period in which one core did all the compositing — but it *is* a falsifier for any claim that this
+gate fixed a flicker observed during that period.
+
+#### x86 only, and the cfg is not the justification
+
+aarch64 already carries FLUID-3's depth instrument and its own metal cadence. Changing the Pi's
+compositor from the x86 seat, with no Pi boot to verify it, is what this tree's verification law
+forbids. The aarch64 arm of `composite` calls `composite_once` directly, so that arch's behaviour is
+byte-identical to before.
+
+#### Refuted along the way
+
+* **"Null keep-alive pointer reports drive the repaint path with no motion."** REFUTED at the
+  source: every `Event::Mouse` producer already filters zero motion before pushing
+  (`drivers/ehci/mod.rs` ×4 — including the rMBP internal trackpad's live 0x02 path — and
+  `drivers/xhci/mod.rs`). There is no null-report stream on this hardware, so gating
+  `pal::cursor::track_routed` on `x != 0 || y != 0` would be a no-op on metal. It was not done.
+* **"The cursor's `repair` → `damage_intersecting` cascade is the rate driver."** Not the driver:
+  `[cursor8] floor_ms=8`, ~21 cascades/s against `[wcn] comp_rate=605/s`. CURSOR-VUG is not
+  reverted and needs no gate. What it did was make the focused window's stack a fresh source of
+  composite passes — which is why the symptom was worst on the selected top window — but the passes,
+  not the cursor, are the defect.
+* **Intra-pass z-order was never wrong.** The upward closure to a fixed point and the ascending
+  `(z, id)` sort are correct and untouched. The bug is strictly *between* passes.
+
+#### Metal watch-list (WCSER)
+
+* **The prediction**: stacked windows hold a steady image, no lower-window content through an upper
+  one with or without pointer motion, and the selected top window is the steadiest rather than the
+  worst. On the wire: `[wcser] … -> SERIAL` with `declined > 0`, and `[comp2] passes × pass_us`
+  falling below the span (utilisation under 100 %, which serialisation forces).
+* **The refutes**: `[wcser] -> SOLO` throughout a sitting in which the flicker persists (the
+  interleave was not happening and the conviction is wrong — the single strongest falsifier, and one
+  line); `declined_pct` high with the flicker unchanged (the gate excludes passes but the bleed has
+  another source — next suspects are the kernel-side composite callers, which are not paced, and
+  `cursor::refresh_locked`'s save-under captured mid-pass); any `[wc-d]`/`[wc-g]` verdict that was
+  PASS/CLEAN on AQ and is not now; the pointer freezing over a focused vug again (the declined
+  pass's `ensure_drawn` tail is not honouring `wm::erase`'s contract); a visible latency step in
+  present-heavy scenes (`COMP_RERUN_MAX` is costing more masked time than budgeted — drop it to 1).
+
+---
+
 ### CURSOR-11 — the arrow stops leaving the glass over a presenting window
 
 **P73 (Peter, bench Pi 4).** With the pointer parked over a PRESENTING vug, the cursor and the vug's
