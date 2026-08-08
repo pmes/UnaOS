@@ -2957,7 +2957,7 @@ const PORPHANED: u8 = 3;
 ///     the launcher fixtures' scratch tenancies. 8 would make the Proc table and the slot pool exhaust
 ///     together and turn every slot-pressure failure into a table-full one; 6 keeps the pool the honest
 ///     backstop it was designed to be. That headroom is the reason this is 6.
-///   * WINDOWS fit. `video::wm::MAX_WINDOWS` is 8 and only EL0 programs mint windows (the shell console
+///   * WINDOWS fit. `video::wm::MAX_WINDOWS` is 12 (shared raise; aarch64 claims at most its own WIN_MAX=8) and only EL0 programs mint windows (the shell console
 ///     is desktop-level, not a wm row), so 6 windowed bg programs sit inside the compositor table with
 ///     room to spare, and the tiler's wrap-and-stack keeps every box clear of the `ui_status` chrome.
 ///   * SHELL side fits. `shell::BG_JOBS` is 8 rows, still strictly above this cap.

@@ -1308,6 +1308,76 @@ The clamp is deliberately left at 8 rather than lowered to 6: an operator asking
 for more than the machine has must get a *refusal that names the resource*, not
 a silently-lowered request that reads as if it were granted.
 
+### Fleet headroom, x86 (HEADROOM, Boot AL)
+
+**Everything above still describes aarch64 exactly, and no longer describes
+x86.** Boot AL took the reading the section above says is unavailable and found
+the ceiling was not one cap but three, stacked so that raising any one alone
+would have moved nothing:
+
+| constant | was | now (x86) | aarch64 | what it bounds |
+| --- | --- | --- | --- | --- |
+| `memory::USER_SLOTS` | 8 | **12** | 8 | concurrent ring-3 address spaces |
+| `syscall::MAX_PROCS` | 6 | **10** | 6 | live `Proc` rows (`<= USER_SLOTS - 2`) |
+| `syscall::NTHREAD` | 8 | **24** | 8 | joinable ring-3 thread handles, machine-wide |
+| `syscall::WIN_MAX` | 8 | **12** | 8 | global window ids |
+| `wm::MAX_WINDOWS` | 8 | **12** | 12 | compositor rows (arch-neutral) |
+| `sched::NFUTEX` | 16 | **64** | 64 | distinct futex keys with waiters parked |
+| `shell::BG_JOBS` | 8 | **12** | 12 | shell job rows (arch-neutral) |
+| `memory::FB_WIN_SLOTS` | 8 | 8 | 8 | windows ONE process may hold (`-EMFILE`) |
+
+**`NTHREAD` was the cap the operator could see.** With six vugs up, vugs 5 and 6
+logged `SYS_THREAD_SPAWN denied a=11 b=11 workers=0 -> inline raster`: eight rows
+at two workers per vug seats four vugs, and the two that fell back to inline
+raster ran at roughly **4x** the frame rate of the four with workers. A fleet of
+identical programs running at two speeds, with nothing in any program to explain
+it — the "predetermined fps" read off the panel for weeks was a table size.
+
+**`MAX_PROCS` was the cap the operator hit.** On a `wc` boot the desktop app
+(`STAT.ELF`) holds a row permanently and never exits, so six rows meant `storm`
+fleets capped at **five**.
+
+**`NFUTEX` was the cap that would have replaced them.** A vug holds *three* live
+keys while idle (`DONE`, `PHASE`, its input ring), so a ten-program fleet wants
+30 buckets against a pool of 16 — and the overflow is silent, because
+`TableFull` degrades every caller to a spin. x86 had simply never taken the
+raise aarch64 made at VUGPAUSE-2; without it, the `NTHREAD` cliff would have
+been traded for a futex cliff that looks identical from the panel.
+
+**The reserve did not move.** `MAX_PROCS <= USER_SLOTS - 2` now holds at
+*equality* (10 ≤ 10): the two-slot margin a foreground `run` and the launcher
+fixtures live on is exactly as wide as it was, and none of the new capacity was
+bought from it. `FB_WIN_SLOTS` deliberately did **not** follow `WIN_MAX` — the
+per-process window cap is unchanged at 8, which is what keeps the raise from
+costing 12 slots × 4 extra 64 KiB surface reservations (~3 MiB) for capacity no
+shipped program asks for. The `WIN_MAX == FB_WIN_SLOTS` assertion became
+`FB_WIN_SLOTS <= WIN_MAX`, and `sys_win_create`'s region-slot search was
+re-bounded to `FB_WIN_SLOTS` — left at `WIN_MAX` it would have handed out region
+slots 8..11 and walked off the end of the slot's FB region.
+
+**What the machine should now support**, and what the storm census grades it
+against: **8 vugs** all with `workers=2`, alongside the resident desktop app,
+with one `Proc` row still free for a foreground `run` and `user slots free >= 2`
+at the end of the burst. `storm 9` is the largest fleet that completes as asked
+on a `wc` boot; the tenth launch is the one the process table refuses.
+
+**The clamp is now derived, not written down.** It admits
+`proc_table_rows() + 2` — the same "two past the ceiling, so the refusal names
+the resource" margin the section above argues for, maintained as a *margin*
+rather than as the literal `8` it happened to equal when `MAX_PROCS` was 6. On
+aarch64 that evaluates to 8 and the arithmetic above is unchanged; on x86 it is
+12, so `storm 11`/`storm 12` are the requests that cannot succeed on an empty
+boot. The `storm` help line is built from the same call, so it can no longer
+quote a stale ceiling.
+
+**Cost.** One address-space slot is `USER_STATIC_SIZE` (0x85000 = 544 KiB) of
+`.bss` backing plus four 4 KiB page tables; 8 → 12 is **+2.14 MiB** of `.bss`
+(4.28 → 6.42 MiB). `.bss` is NOBITS, so the boot image on the ESP does not grow.
+Every other table in the list costs kilobytes or less. Against that: task count
+is the axis the placement arcs are measured on, and a full 8-vug fleet is now
+**24 tasks** (a vug is a triple) plus the desktop app, against four cores —
+where the aarch64 section above tops out at ~18.
+
 **The instrument.** What a storm run could not previously answer is "what breaks
 first as *n* grows", because every quantity that would name a ceiling rides a
 different clock — the `:: SCHED: load ::` train is timer-driven (~1 s windows,

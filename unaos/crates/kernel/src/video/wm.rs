@@ -64,9 +64,24 @@ use spin::{Mutex, MutexGuard};
 
 /// WC-A — the window table is fixed-size and statically allocated: the compositor runs from syscall
 /// context on a non-coherent scan-out path where a heap allocation (or a growable table) would be
-/// both a latency and a failure mode we do not want. Eight windows is far past what a 1920-wide panel
-/// can usefully tile at a legible integer scale.
-pub const MAX_WINDOWS: usize = 8;
+/// both a latency and a failure mode we do not want.
+///
+/// HEADROOM — raised 8 -> 12. The old note said eight was "far past what a 1920-wide panel can
+/// usefully tile at a legible integer scale", and as a TILING argument that is still true; it was
+/// simply not the binding argument. The binding one is arithmetic: `arch::syscall`'s
+/// `MAX_PROCS <= MAX_WINDOWS` assertion ("every bg program must be able to own a window") makes this
+/// table a hard ceiling on the process table, and x86's `MAX_PROCS` went to 10. With the console
+/// window occupying a row of its own, a full fleet of 10 ring-3 programs needs 11 — so 12, one row
+/// of margin. A 12th window is not expected to be LEGIBLE at 1920 wide; it is expected to EXIST, so
+/// that a program's launch is refused by a resource that is genuinely exhausted rather than by the
+/// compositor's tiling taste.
+///
+/// This constant is arch-NEUTRAL and so is the raise: aarch64 keeps `MAX_PROCS = 6` and its own
+/// `WIN_MAX = 8`, both strictly under this, so on that arch the change adds four permanently-free
+/// rows and moves no behaviour. The cost is the table itself and the fixed-size scratch arrays sized
+/// from it (`[Window; 12]` plus a handful of `[(usize,usize,usize,usize); 12]` stack scratches) —
+/// every one of them parametric, and every sweep already a bounded `0..MAX_WINDOWS` scan.
+pub const MAX_WINDOWS: usize = 12;
 
 /// WC-A — maximum stored title length in bytes. Titles are kernel-owned byte strings (ASCII, not
 /// NUL-terminated); anything longer is truncated at [`create`] time, so a hostile length can never
@@ -269,7 +284,9 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
 /// critical section. This is the WEDGE-4 discipline that fixed `RUN_QUEUES`, transposed to `wm`.
 /// It is affordable because all 23 sections are bounded `MAX_WINDOWS`-row scans with no print, no
 /// allocation, no I/O and no nested blocking lock; the two longest are the composite snapshot
-/// (8 rows + damage clear, with the blit itself OUTSIDE the guard) and the focus-raise scan.
+/// (`MAX_WINDOWS` rows + damage clear, with the blit itself OUTSIDE the guard) and the focus-raise
+/// scan. HEADROOM widened that to 12 rows; a 12-row scan with no print and no allocation is still
+/// far inside the bound this discipline needs.
 ///
 /// A try-lock with backoff cannot work here: the holder is on the SAME core and cannot run while we
 /// back off, so a masked backoff is the same deadlock with extra steps. Moving the composite off the
@@ -5923,11 +5940,17 @@ impl WcnRow {
 /// because `WcnRow` holds atomics; the assertion below is what keeps it honest if [`MAX_WINDOWS`]
 /// ever moves.
 #[cfg(feature = "witness")]
-static WCN: [WcnRow; 8] = [
+static WCN: [WcnRow; 12] = [
     WcnRow::new(),
     WcnRow::new(),
     WcnRow::new(),
     WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    // HEADROOM: four rows added with `MAX_WINDOWS` 8 -> 12. The assertion below is exactly the
+    // tripwire the original note promised — it is what caught this array on the raise.
     WcnRow::new(),
     WcnRow::new(),
     WcnRow::new(),

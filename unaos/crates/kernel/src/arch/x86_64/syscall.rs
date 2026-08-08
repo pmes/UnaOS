@@ -3210,10 +3210,24 @@ fn sys_sleep_ms(ms: u64) -> i64 {
 // (the U1a/U1b/U2 tasks, which have no private address space and therefore no FB region); those callers
 // get `-EINVAL`, the same refusal aarch64 gives ASID 0.
 
-/// WINX-1: the fixed window count. Matches `memory::FB_WIN_SLOTS` and the compositor's fixed table.
+/// WINX-1: the fixed GLOBAL window count — how many windows may be open across the whole machine.
 /// STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not raise it for a demo.
-const WIN_MAX: usize = 8;
-const _: () = assert!(WIN_MAX == crate::arch::x86_64::memory::FB_WIN_SLOTS);
+///
+/// HEADROOM — raised 8 -> 12, with `MAX_PROCS` 6 -> 10 and `USER_SLOTS` 8 -> 12. A window is the
+/// thing a launched program is FOR, so the global table has to be able to hold one per live process
+/// plus the console: 10 + 1 = 11, and 12 leaves a row of margin. Raising it alone would have been
+/// pointless (the process table would still refuse the 7th launch) and raising the others without it
+/// would have traded a `-EAGAIN` at spawn for an `-ENFILE` at the first `SYS_WIN_CREATE`.
+const WIN_MAX: usize = 12;
+/// HEADROOM: was `WIN_MAX == FB_WIN_SLOTS`. That equality was never the requirement — it was two
+/// caps that happened to share a value, and it silently made every per-address-space REGION SLOT
+/// index legal as a global window id and vice versa. The real requirement is one-directional and is
+/// what the raise had to preserve: a region slot allocated by `sys_win_create` is bounded by the
+/// candidate range this file scans, and it indexes `memory::slot_fb_win_*` which is sized
+/// `FB_WIN_SLOTS`. So `FB_WIN_SLOTS` may be smaller than `WIN_MAX` (a process may not open every
+/// window in the machine — that is `-EMFILE`) but never larger. See `memory::FB_WIN_SLOTS` for why
+/// the per-process cap stayed at 8 while the global one grew.
+const _: () = assert!(crate::arch::x86_64::memory::FB_WIN_SLOTS <= WIN_MAX);
 const _: () = assert!(WIN_MAX <= crate::video::wm::MAX_WINDOWS);
 
 /// WINX-1: one window table row. `owner == WIN_OWNER_FREE` means FREE. Unlike aarch64 — where ASID 0 is
@@ -3234,7 +3248,7 @@ struct WinEntry {
     wm_id: crate::video::wm::WinId,
 }
 
-/// WINX-1: the free-row sentinel. `usize::MAX` is not a reachable slot index (`USER_SLOTS` is 8).
+/// WINX-1: the free-row sentinel. `usize::MAX` is not a reachable slot index (`USER_SLOTS` is 12).
 const WIN_OWNER_FREE: usize = usize::MAX;
 
 impl WinEntry {
@@ -3432,7 +3446,7 @@ const FB_FLAG_HIDDEN: u32 = 1 << 1;
 /// VUGMIN/x86: which slots are currently HIDDEN — every live, non-compat window they own sits below
 /// `video::wm`'s `SHELL_Z`. The x86 twin of aarch64's `HIDDEN_ASIDS`, kept as a per-slot
 /// `AtomicBool` array rather than a bitmask because that is the shape this file's other per-slot
-/// process flags already have (`SLOT_DETACHED`, `SLOT_NO_AUTOFOCUS`) and `USER_SLOTS` is 8.
+/// process flags already have (`SLOT_DETACHED`, `SLOT_NO_AUTOFOCUS`) and `USER_SLOTS` is 12.
 ///
 /// `video::wm` owns the z-order that decides the answer; this module owns the flag and the info page.
 /// Fail-safe direction is aarch64's, and for aarch64's reason: an out-of-range owner reads back "not
@@ -3545,8 +3559,14 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     };
     let _irq = IrqGuard::mask_save();
     let mut t = WINDOWS.lock();
-    // Lowest-free REGION slot for this address space.
-    let rslot = match (0..WIN_MAX)
+    // Lowest-free REGION slot for this address space. HEADROOM: the CANDIDATE range is
+    // `FB_WIN_SLOTS` — the per-address-space cap, which is what `mem::slot_fb_win_surface_ptr` and
+    // `map_slot_fb_win` are sized by — while the SCAN that decides which candidates are taken runs
+    // over the whole global table (`WIN_MAX` rows, any of which could belong to this slot). The two
+    // were both `WIN_MAX` while the caps were equal; once `WIN_MAX` grew to 12 with `FB_WIN_SLOTS`
+    // at 8, a candidate range of `WIN_MAX` would have handed out region slot 8..11 and walked off
+    // the end of the slot's FB region — the `-EMFILE` this arm documents would never have fired.
+    let rslot = match (0..mem::FB_WIN_SLOTS)
         .find(|&r| !(0..WIN_MAX).any(|i| t[i].owner == slot && t[i].rslot as usize == r))
     {
         Some(r) => r,
@@ -4012,7 +4032,7 @@ static USER_INPUT_RESUMES: [AtomicU64; crate::arch::memory::USER_SLOTS] =
 /// VUGPAUSE-2/x86: the synthetic futex key for `slot`'s input ring.
 ///
 /// `sched::futex_key` builds a user key as `((slot + 1) << 56) | (uaddr & 0x00FF_FFFF_FFFF_FFFF)`,
-/// and `USER_SLOTS` is 8, so the tag byte a ring-3 program's key can carry is 1..=8 and bit 63 is
+/// and `USER_SLOTS` is 12, so the tag byte a ring-3 program's key can carry is 1..=12 and bit 63 is
 /// free forever. Setting it puts every input key in a space no user word can name — which matters
 /// more than it looks, because the futex buckets are SHARED: a program that could forge an input key
 /// could wake (or, worse, park on) another process's ring. It cannot reach this space at all.
@@ -5131,7 +5151,24 @@ pub fn clickroute_selftest() {
 /// How many concurrently-tracked joinable ring-3 threads the kernel holds handles for. A small fixed
 /// pool (`user-vug` uses 2 per process); `-EAGAIN` when exhausted, after the scavenge below has had
 /// its chance. STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not raise it for a demo.
-const NTHREAD: usize = 8;
+///
+/// HEADROOM (Boot AL, rMBP) — raised 8 -> 24, and this was the cap the operator could actually SEE.
+/// With 6 vugs up, vugs 5 and 6 logged `SYS_THREAD_SPAWN denied a=11 b=11 workers=0 -> inline
+/// raster`: 8 rows / 2 workers per vug = 4 vugs served, and the two that fell back to inline raster
+/// ran at roughly 4x the frame rate of the four with workers. That split — a fleet of identical
+/// programs running at two different speeds with nothing in the program to explain it — is the
+/// "predetermined fps" that has been read off the panel for weeks. It is a table size.
+///
+/// WHY 24 AND NOT 20. `MAX_PROCS` is 10 and a vug takes 2 rows, so 20 is the exact fit and therefore
+/// the wrong number: a row is released by the owner's own voluntary `SYS_THREAD_JOIN`, so a KILLED
+/// program leaks its rows until the lazy scavenge below reclaims them — and the scavenge runs only
+/// under pressure, i.e. only after some later spawn has ALREADY been denied. At an exact fit, one
+/// killed vug means the next launch's second worker takes the `-EAGAIN` path, which is precisely the
+/// asymmetry this raise exists to remove. 24 is 20 plus two dead programs' worth of slack, so the
+/// scavenge stays the belt it was designed to be rather than the thing the steady state depends on.
+/// The cost is 16 more `Option<ThreadRec>` rows (~40 bytes each) behind one `SpinMutex` — under a
+/// kilobyte, and the only loop over it is the `position(is_none)` claim, bounded at 24.
+const NTHREAD: usize = 24;
 
 /// One live thread the kernel can be `SYS_THREAD_JOIN`ed on.
 struct ThreadRec {
@@ -7482,7 +7519,7 @@ pub fn u3_5_run_fixture(cpu: usize) {
     // the slot. On a reap TIMEOUT (`!reaped`), the spinner never self-exits (it never syscalls), so it
     // is still ALIVE and running under `cr3` — freeing that slot here would be unsafe (a later
     // `alloc_user_space` could rebuild a live address space underfoot) and could double-free against a
-    // late scheduler reap. Leaking one of the 8 slots is harmless: U3.5 is the LAST ring-3 fixture, and
+    // late scheduler reap. Leaking one of the 12 slots is harmless: U3.5 is the LAST ring-3 fixture, and
     // a timeout is already a hard FAIL. So we deliberately do NOT free here.
 }
 
@@ -10622,13 +10659,34 @@ struct Proc {
 ///     `BG_KILLS` is `[Option<BgKill>; MAX_PROCS]` and widens with it. There is no bitmap, no packed
 ///     index and no fixed-width field keyed on the old 4.
 ///   * ADDRESS SPACES still bind last. Each live row costs one ring-3 slot out of
-///     `memory::USER_SLOTS` = 8, so 6 background rows leave 2 for a foreground `run` and for the
+///     `memory::USER_SLOTS`, so the background rows must leave 2 for a foreground `run` and for the
 ///     fixtures' scratch tenancies. The const block below asserts that margin rather than promising it.
-///   * WINDOWS fit: `video::wm::MAX_WINDOWS` is 8 and only ring-3 programs mint rows there.
-///   * SHELL side fits: `shell::BG_JOBS` is 8 rows, still strictly above this cap.
+///   * WINDOWS fit: only ring-3 programs mint rows in `video::wm`, plus the console.
+///   * SHELL side fits: `shell::BG_JOBS` stays strictly above this cap.
 ///   * KILL side needs nothing: x86 arms kills through a per-task `Arc<KillSwitch>`, not a fixed
 ///     request table, so there is no aarch64-style `MAX_KILL_REQS` coupling to assert here.
-const MAX_PROCS: usize = 6;
+///
+/// HEADROOM (Boot AL, rMBP) — raised 6 -> 10, x86 only (aarch64 keeps PROCS-6). The number the
+/// operator meets is not this one: `video::wcx::desktop_app_service` launches `STAT.ELF` at boot and
+/// it never exits, so at 6 a `storm` fleet capped at **5**. The target is a fleet of 8 vugs with the
+/// desktop app still resident and a foreground `run` still possible — 8 + 1 = 9 rows in use, so 10.
+///
+/// EVERY TERM RE-DERIVED, not assumed:
+///   * `USER_SLOTS` 8 -> 12 keeps `MAX_PROCS <= USER_SLOTS - 2` at EQUALITY (10 <= 10), so the
+///     2-slot reserve is exactly as wide as it was, not narrowed to buy rows. That is deliberate:
+///     the reserve is what a foreground `run` and the fixture tenancies live on, and it is stated as
+///     an absolute 2, not a fraction.
+///   * `video::wm::MAX_WINDOWS` 8 -> 12 for the assertion below — 10 programs plus the console is 11.
+///   * `WIN_MAX` 8 -> 12 to match, or the global window table would refuse what the process table
+///     admits.
+///   * `NTHREAD` 8 -> 24, because a fleet whose programs cannot all get workers is a fleet running
+///     at two different speeds; see that constant.
+///   * `shell::BG_JOBS` 8 -> 12, restoring the "strictly above the cap" property this list claims.
+///   * `shell`'s `storm` clamp is now DERIVED from `proc_table_rows()`, so it cannot drift from this
+///     line again.
+/// Everything else was already parametric and needed no edit: the reserve/free/find/census loops,
+/// `BG_KILLS`, and the per-slot sidecar arrays.
+const MAX_PROCS: usize = 10;
 static PROCS: [Proc; MAX_PROCS] = [const {
     Proc {
         pid: AtomicU64::new(0),
@@ -10773,7 +10831,8 @@ pub fn proc_table_headroom() -> (usize, usize, usize, usize) {
 }
 
 /// PROCREAP: the process-table cap — the denominator for [`proc_table_headroom`]. See the `MAX_PROCS`
-/// block for why it is 6 and why moving it is an arc, not a tuning step.
+/// block for why it is 10 and why moving it is an arc, not a tuning step (HEADROOM raised it 6 -> 10;
+/// `shell`'s `storm` clamp is derived from THIS function so the two cannot drift apart again).
 pub const fn proc_table_rows() -> usize {
     MAX_PROCS
 }
@@ -13408,10 +13467,12 @@ unaos_user_winx:
     mov rdi, r13
     syscall
 
-    // (8) FAIL-CLOSED: present a window id this process never created. WIN_MAX-1 = 7 is in range but
-    //     free, so the ownership gate must answer -EBADF (-9), not 0.
+    // (8) FAIL-CLOSED: present a window id this process never created. WIN_MAX-1 = 11 is in range
+    //     but free, so the ownership gate must answer -EBADF (-9), not 0. HEADROOM: this literal
+    //     tracks `WIN_MAX` (8 -> 12) — left at 7 it would still have been in range and free, so the
+    //     probe would still have passed while no longer testing the row it names.
     mov rax, 30                               // SYS_WIN_PRESENT
-    mov rdi, 7
+    mov rdi, 11
     syscall
     cmp rax, -9                               // -EBADF
     jne 8f
@@ -13713,7 +13774,7 @@ fn winx2_launcher(_demo_cpu: usize) {
     // REVIEW C2 — `Gone` IS NOT A FREED ROW. `bg_poll`'s scan filter admits only `PRUNNING`/`PEXITED`,
     // so a row STUCK IN `PREAPING` — claimed by a releaser that never reached `proc_free` — falls
     // through to the trailing `BgPoll::Gone`. That is the exact leak class this witness exists to catch
-    // (`MAX_PROCS` is 6; six stuck rows and no program can ever launch again), and it would have graded
+    // (`MAX_PROCS` is 10; ten stuck rows and no program can ever launch again), and it would have graded
     // GREEN on the `Gone` check alone.
     //
     // So take the CENSUS, the shell's own idiom at `shell::bg_kill_cmd` — "the free count must rise by
@@ -14469,7 +14530,7 @@ const DMG_EXPECT: u64 = {
 // sweep collapses 19 chances to get it wrong into one. The selector indexes the id array the setup
 // builds on the stack, which is how a probe can name an id the fixture only learns at runtime:
 //   0 = the prober's 128x128 window   1 = the prober's 128x32 window   2 = the OWNER's window
-//   3 = a provably-free row           4 = 8 (== WIN_MAX, the first out-of-range id)
+//   3 = a provably-free row           4 = 12 (== WIN_MAX, the first out-of-range id)
 //   5 = u64::MAX (a wildly out-of-range id)
 core::arch::global_asm!(
     r#"
@@ -14556,7 +14617,7 @@ unaos_user_dmg_probe:
     mov  [r15 + 16], rax                      // sel 2 = the OWNER's window (planted)
     mov  rax, [rbx + 16]
     mov  [r15 + 24], rax                      // sel 3 = a provably-free row (planted)
-    mov  qword ptr [r15 + 32], 8              // sel 4 = WIN_MAX, the first out-of-range id
+    mov  qword ptr [r15 + 32], 12             // sel 4 = WIN_MAX, the first out-of-range id
     mov  qword ptr [r15 + 40], -1             // sel 5 = u64::MAX, wildly out of range
 
     // (4) Report our own ids BACK through the param block, so the launcher can cross-check them
@@ -14637,7 +14698,7 @@ unaos_user_dmg_table:
     .quad 2, 64,  32                          // P13 EACCES — the owner's window, a MALFORMED band (ORDER)
     .quad 3, 0,   11                          // P14 EBADF  — a free row, a valid band
     .quad 3, 64,  32                          // P15 EBADF  — a free row, a malformed band (ORDER)
-    .quad 4, 0,   11                          // P16 EBADF  — id 8 == WIN_MAX, the first out-of-range id
+    .quad 4, 0,   11                          // P16 EBADF  — id 12 == WIN_MAX, the first out-of-range id
     .quad 5, 0,   11                          // P17 EBADF  — id u64::MAX
     .quad 0, 0,   128                         // P18 accept — LAST: the window still presents after 13 refusals
 

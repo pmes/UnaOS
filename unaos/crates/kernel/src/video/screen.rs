@@ -407,7 +407,7 @@ pub fn adopt_desktop_bg(color: u32) {
 ///  * none does — the gap runs to the nearest occluder start to the right of `xs` on this row, or to
 ///    `x1` when there is none.
 ///
-/// Deliberately not a sorted-interval merge: `MAX_WINDOWS` is 8 and this runs per scanline of a
+/// Deliberately not a sorted-interval merge: `MAX_WINDOWS` is small (12 since the x86 headroom raise; the linear-scan argument holds) and this runs per scanline of a
 /// damage rect, so a linear scan over at most eight boxes beats building any structure, and it needs
 /// no allocation on a path that must not allocate.
 fn next_visible_span(

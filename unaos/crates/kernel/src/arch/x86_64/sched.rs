@@ -2854,9 +2854,29 @@ impl Semaphore {
 // `futex_wake` pops a waiter under the bucket lock but calls `make_ready` only AFTER releasing it, so
 // the run-queue lock is never nested under a bucket lock and the existing acyclic order holds.
 
-/// Distinct futex keys the kernel can have waiters parked on at once (never grown — the same fixed
-/// discipline as `USER_SLOTS` / the process table). `user-vug` uses ONE key per process.
-const NFUTEX: usize = 16;
+/// Distinct futex keys the kernel can have waiters parked on at once (the same fixed discipline as
+/// `USER_SLOTS` / the process table).
+///
+/// HEADROOM — raised 16 -> 64, catching up to the identical raise aarch64 made at VUGPAUSE-2 and
+/// which x86 never took. The doc line that used to sit here ("`user-vug` uses ONE key per process")
+/// is why the audit had to reach this constant at all, and it is the pre-VUGPAUSE-2 claim: a vug
+/// holds THREE live keys while idle — its `DONE` barrier word, the `PHASE` release word BOTH workers
+/// park on, and its input ring.
+///
+/// THE ARITHMETIC THIS HAD TO SATISFY. At 3 keys per program and `MAX_PROCS` = 10, a full fleet
+/// wants 30 buckets; 16 could not seat even six. And the overflow does not fail loudly — that is the
+/// whole danger. `futex_wait` returns `TableFull`, `sys_futex` degrades it to `-EAGAIN` and
+/// `SYS_INPUT_WAIT` degrades it to a yield, so the programs that lost the race quietly stop parking
+/// and start SPINNING: a fleet of identical programs running at two different speeds with nothing in
+/// any program to explain it, which is precisely the symptom HEADROOM exists to remove. It would
+/// have replaced the `NTHREAD` cliff with a futex cliff and looked the same from the panel.
+///
+/// 64 rather than a tighter fit, for the reason aarch64 states: a full `USER_SLOTS` fleet must not
+/// be able to reach it, and a bucket is a lock, a key and a `VecDeque` header. Matching aarch64's
+/// width also means the two arches' vug frame loops now pay the SAME bucket-scan cost, which is the
+/// one real price here (`futex_wait`'s selection is a linear scan under each bucket's raw lock, on
+/// the barrier hot path) — and it is a price aarch64 has been paying, measured, since VUGPAUSE-2.
+const NFUTEX: usize = 64;
 
 /// One futex wait bucket: a keyed FIFO wait queue with a `Semaphore`-style raw lock handed to the
 /// scheduler at park time.

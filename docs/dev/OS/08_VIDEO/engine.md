@@ -1043,12 +1043,24 @@ could not be on screen at once. `video::wm` is the seam that fixes that.
 
 ### The table
 
-A fixed array of `MAX_WINDOWS = 8` rows, statically allocated behind one `spin::Mutex`. The
+A fixed array of `MAX_WINDOWS = 12` rows, statically allocated behind one `spin::Mutex`. The
 compositor runs from syscall context on a non-coherent scan-out path, where a heap allocation would
-be both a latency cost and a failure mode. Each row carries: id (`1..=8`; `0` is `WIN_NONE`, the
+be both a latency cost and a failure mode. Each row carries: id (`1..=12`; `0` is `WIN_NONE`, the
 fail-closed return of every operation), owner ASID (opaque here — `wm` never reads task state),
 content origin and source extent, integer scale, z-order, surface pointer + stride, a damage flag,
 and a title truncated to `MAX_TITLE = 16` bytes at create time.
+
+**`MAX_WINDOWS` was 8 until HEADROOM (x86, Boot AL).** The original note argued for 8 from tiling —
+"far past what a 1920-wide panel can usefully tile at a legible integer scale" — which is still true
+and was never the binding argument. The binding one is that `arch::syscall` asserts
+`MAX_PROCS <= MAX_WINDOWS` ("every bg program must be able to own a window"), which makes this table
+a hard ceiling on the *process* table. When x86's `MAX_PROCS` went 6 → 10, a full fleet of ten ring-3
+programs plus the console window needed 11 rows, so the table went to 12 — one row of margin. The
+constant is arch-neutral and the raise is not a behaviour change on aarch64, which keeps
+`MAX_PROCS = 6` and `WIN_MAX = 8`: there it adds four permanently-free rows. A twelfth window is not
+expected to be *legible* at 1920 wide; it is expected to *exist*, so that a launch is refused by a
+resource which is genuinely exhausted rather than by the compositor's tiling taste. See
+`02_KERNEL_CORE/userspace.md` (HEADROOM) for the rest of the ledger.
 
 ### Composite on present, no thread
 

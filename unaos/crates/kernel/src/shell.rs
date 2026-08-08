@@ -2387,10 +2387,15 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // STORM-HEADROOM: the verb existed since P77 but was never listed, so the one command an
             // attended bench uses to load the scheduler was discoverable only from the source. The
             // cap is stated here because it is the first thing a `storm 8` reading needs.
-            // STORM-X86: listed on both arches now that the verb exists on both. The cap is the same
-            // 6 on each (`MAX_PROCS` in either `arch::syscall`), so the sentence needs no split.
+            // STORM-X86 listed it on both arches and could state one number, because `MAX_PROCS` was
+            // 6 on each. HEADROOM split them (x86 10, aarch64 6), so the line is BUILT from
+            // `proc_table_rows()` rather than written down: a help line that names a stale ceiling is
+            // worse than no help line, since it is the one place an operator trusts without checking.
             #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
-            console.println("          storm [n]  (launch n vugs; n>6 is refused by the process table — serial carries the [storm] census)");
+            console.println(&alloc::format!(
+                "          storm [n]  (launch n vugs; n>{} is refused by the process table — serial carries the [storm] census)",
+                crate::arch::syscall::proc_table_rows()
+            ));
             console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
             console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
@@ -3422,18 +3427,33 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             //
             // STORM-HEADROOM — WHAT ACTUALLY BOUNDS `n`. The sentence this replaces ("the job table
             // (8 slots) and PROCS-6's bg cap bound n") was true and useless: it named both bounds
-            // without saying which one BITES. The clamp below admits 8; `syscall::proc_table_rows()`
-            // is 6. So `storm 7` and `storm 8` cannot succeed as asked on ANY boot, empty or not —
-            // the seventh launch is refused by the process table, the loop stops, and the fleet that
-            // remains is the same fleet `storm 6` builds. The clamp stays at 8 deliberately: an
-            // operator who asks for more than the machine has must get a REFUSAL that names the
-            // resource, not a silently-lowered request that reads as if it were granted. The cap is
-            // not a knob — see the `MAX_PROCS` block in `arch::syscall` for why 6 is where the user
-            // slot reserve puts it, and treat moving it as an arc, not a tuning step. STORM-X86
-            // checked that this paragraph survives the move: x86's `arch::syscall` sets
-            // `MAX_PROCS = 6` under the SAME `MAX_PROCS <= USER_SLOTS - 2` reserve assertion (both
-            // pools are 8), so `storm 7`/`storm 8` are refused by the process table on either arch
-            // and the sentence needs no per-arch qualification.
+            // without saying which one BITES. The one that bites is the PROCESS TABLE, always: the
+            // job table is kept strictly above it and the user-slot pool keeps a 2-slot reserve
+            // above THAT, so `syscall::proc_table_rows()` is the first ceiling a growing fleet
+            // reaches, on either arch.
+            //
+            // THE CLAMP IS DERIVED, NOT WRITTEN DOWN. It admits `proc_table_rows() + 2` — two past
+            // the ceiling, deliberately, and that margin is the whole design: an operator who asks
+            // for more than the machine has must get a REFUSAL that names the resource, not a
+            // silently-lowered request that reads as if it were granted. It used to be the literal
+            // `8`, which was `6 + 2` at the time and became a lie the moment HEADROOM moved x86's
+            // `MAX_PROCS` to 10 (a `storm 9` would have been quietly served as `storm 8`). Deriving
+            // it means the margin, not the number, is what is maintained.
+            //
+            // WHAT THAT MEANS PER ARCH, recomputed:
+            //   * **aarch64** — `MAX_PROCS = 6`, so the clamp admits 8 and the arithmetic is
+            //     unchanged from STORM-X86: `storm 7`/`storm 8` cannot succeed as asked on ANY boot,
+            //     the SEVENTH launch is refused by the process table, and the fleet that remains is
+            //     the same fleet `storm 6` builds.
+            //   * **x86** — `MAX_PROCS = 10`, so the clamp admits 12 and `storm 11`/`storm 12` are
+            //     the requests that cannot succeed on an empty boot; the ELEVENTH launch is the one
+            //     the process table refuses. On a `wc` boot the desktop app holds a row permanently,
+            //     so the refusal arrives one earlier: the TENTH launch, i.e. `storm 9` is the
+            //     largest fleet that completes as asked and `storm 8` is the largest that still
+            //     leaves a row for a foreground `run`.
+            // The cap is not a knob — see the `MAX_PROCS` block in `arch::syscall` for why 10 is
+            // where the user-slot reserve puts it on x86, and treat moving it as an arc, not a
+            // tuning step. (HEADROOM was that arc.)
             //
             // WHY THE CENSUS SITS HERE. Every scheduler quantity that could name a ceiling already
             // exists, but on other clocks: the `:: SCHED: load ::` train is timer-driven (~1 s
@@ -3452,7 +3472,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 .first()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(6)
-                .clamp(1, 8);
+                .clamp(1, crate::arch::syscall::proc_table_rows() + 2);
             // STORM-FATW: `fat` anywhere in the args arms the USB-traffic writer (below). A bare
             // `storm fat` keeps the default fleet of 6 (the non-numeric arg falls through the parse).
             let fatw = args.iter().any(|a| *a == "fat");
@@ -3937,22 +3957,25 @@ struct BgJob {
 }
 
 /// BGRUN-1: the shell's job table. Bounded like every table in this kernel. LENS CORRECTION
-/// (round 1): the binding resource is the Proc table (`MAX_PROCS`), not the 8 user address-space
+/// (round 1): the binding resource is the Proc table (`MAX_PROCS`), not the user address-space
 /// slots — so the real ceiling is `MAX_PROCS - 1` bg jobs alongside one foreground `run`, and this
-/// table's full arm is reachable only if MAX_PROCS grows past it. 8 slots kept (harmless headroom).
-/// PROCS-6 raised the cap to 6: 6 bg jobs with no foreground `run` (5 with one), still under this
-/// table's 8 and under the compositor's 8 windows, so the full arm remains unreachable — kept anyway,
-/// because it is what makes an untrackable job impossible rather than merely unlikely. PROCREAP raised
-/// the x86 cap to 6 as well, so the arithmetic in this paragraph now holds on BOTH arches (it was
-/// 4 on x86 when it was written, and this table's headroom hid the difference).
+/// table's full arm is reachable only if MAX_PROCS grows past it. Rows are kept strictly ABOVE the
+/// Proc cap on purpose (harmless headroom): it is what makes an untrackable job impossible rather
+/// than merely unlikely.
 ///
-/// ⚠ KERNEL-APPS EVICTION — **on a `wc` x86 boot the ceiling is one lower than the paragraph above
-/// says.** `video::wcx::desktop_app_service` launches the desktop app (`STAT.ELF`) at boot and it
-/// never exits, so it permanently holds one Proc row, one user slot, one `wm` window and one row of
-/// THIS table. The operator's budget is therefore **5** bg jobs with no foreground `run` (4 with
-/// one) on such a boot. The window is a wash — the kernel-drawn row it replaced held one too — and
-/// the full arm of this table is still unreachable, but the Proc-row arithmetic above is the number
-/// a reader would quote and it is no longer the whole story.
+/// HEADROOM — 8 -> 12 rows, because x86's `MAX_PROCS` went 6 -> 10 and 8 rows would no longer have
+/// been strictly above it. That is the whole reason for the raise; the arm still cannot be reached.
+/// The table is arch-neutral and so is the raise: aarch64 keeps `MAX_PROCS = 6`, so there it simply
+/// adds four rows that can never be claimed. The per-arch ceilings are now:
+///   * **x86** — 9 bg jobs with no foreground `run` (8 with one), see the eviction note below.
+///   * **aarch64** — 6 bg jobs with no foreground `run` (5 with one), unchanged by this arc.
+///
+/// ⚠ KERNEL-APPS EVICTION — **on a `wc` x86 boot the ceiling is one lower than a bare reading of
+/// `MAX_PROCS` says.** `video::wcx::desktop_app_service` launches the desktop app (`STAT.ELF`) at
+/// boot and it never exits, so it permanently holds one Proc row, one user slot, one `wm` window and
+/// one row of THIS table. With `MAX_PROCS = 10` the operator's budget on such a boot is therefore
+/// **9** bg jobs with no foreground `run` (8 with one) — which is exactly the fleet HEADROOM was
+/// sized for: `storm 8` plus the desktop app, with a row still free for a foreground `run`.
 ///
 /// ⚠ **Shell access is NO LONGER single-task.** It used to be, and this note used to say so while
 /// keeping the Mutex "explicit rather than relying on it". The eviction added a second caller on a
@@ -3964,7 +3987,7 @@ struct BgJob {
 /// that `bg_jobs` holds this lock across `console.println`, which on a `wc` build routes through the
 /// compositor: a future second cross-core caller could spin for the length of a repaint.
 #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
-static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);
+static BG_JOBS: spin::Mutex<[Option<BgJob>; 12]> = spin::Mutex::new([None; 12]);
 
 /// STORM-FATW: the bounded USB-traffic writer `storm [n] fat` arms — the driver-claim half of the
 /// WEDGE-8/F3 metal provocation (the vug fleet is the preemption half). Two legs, decided once at
