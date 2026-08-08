@@ -1,42 +1,71 @@
 # WHITE BOARD — 2026-08-08 (GR22 close)
 
-The Crispy wiring arc (`wt/crispywire`, `43611837`, **unreviewed and unmerged**) drew the theme and
-then stopped at five places where the kit does not carry an answer. Per the shared-source law it
-**reported instead of inventing**. You are the taste gate; these are yours.
+## ✅ ALL FIVE CRISPY QUESTIONS ANSWERED BY THE TASTE GATE (Peter, 2026-08-08)
 
-## Q1 — the kit has NO desktop/wallpaper role.
+Recorded verbatim, with what each one costs to build. **The shared-source law applies to every
+one of these: the value changes in `kits/crispy/theme.json` FIRST, then is re-lifted into
+`video/theme.rs`.** Nothing here has been started — GR22 closed on "no new work".
 
-The palette is 21 chrome/content roles and nothing for the desktop behind the windows. So near-white
-Crispy windows now sit on the **old invented purple `0x2D2B55`**. That is the one surviving invented
-colour on the panel, and it is the biggest thing you will see. Add a desktop role to
-`kits/crispy/theme.json`, or say what it should be and it gets lifted.
+### A1 — the desktop. **A SCENE, and DAY/NIGHT ON THE CLOCK.**
+> *"do a take on plasma sub-arctic theme (we must have day/night mode that switches with the
+> clock) that could be a scene from pristine little northern minnesota lake where UM researchers
+> invented the honeycrisp had their orchard"*
 
-## Q2 — the middle and zoom controls are drawn but inert.
+The reference is the University of Minnesota Horticultural Research Center at Excelsior on Lake
+Minnetonka — where Honeycrisp was bred. Cold clear water, birch and granite, low northern light,
+an orchard on the shore. A sub-arctic Plasma take, rendered as a scene rather than a flat fill.
 
-Three `control_box` discs are painted upper-right (darkest = close). Close works. The other two have
-no verbs — the kit defines their colours, not their behaviour. Options: minimise/park (the compositor
-already has `set_hidden`), maximise/restore, something else, or leave them dead. They are currently
-left draggable rather than turned into dead zones.
+⚠ **THIS CHANGES THE THEME'S ARCHITECTURE, and it is the most important consequence on this
+board.** `video/theme.rs` is today *"byte-inert by construction (all `const`, no statics, no code,
+compile-time-only assertions)"* — `engine.md` §9 verified that by hashing `kernel8.img` with and
+without it. **Day/night on the clock means two palettes and a clock-driven selector**, i.e. state
+and code where there is now only data. Options, cheapest first, for whoever takes the arc:
+  a) two `const` palettes + a selector function; the table stays data, one small function chooses.
+  b) a palette *pair* per role with the selector inlined at each read site.
+  c) something richer (dusk/dawn interpolation) — but note the tree has an integer-only gradient
+     interpolator now (`blend_q16`), so a timed crossfade is reachable without float.
+The clock exists and is real: the boot already runs SNTP (`[sntp-x86]` on the AN capture) and has a
+calibrated ms timebase. **Whoever builds this must say which option and why, and must re-verify the
+byte-inertness claim in §9 or explicitly retire it.**
 
-## Q3 — no hover / pressed / disabled state for the controls.
+Also: a *scene* is not a palette role. It is a material — and §9 already draws that line, deliberately
+excluding the kit's `content_surface.Paper` block because *"lifting it means porting a multi-octave
+noise generator, a rasterizer concern."* A lake scene sits on the same side of that line. Decide
+whether it is a procedural material, a lifted image, or a gradient-plus-silhouette built from
+palette roles — and note the kernel has no float and no image decoder.
 
-`button_face_pressed` is a *button* role, not a control-disc role. A control that never changes under
-the pointer reads as a picture. Do you want those three states in the kit?
+### A2 — the middle and zoom controls: **whatever the Mac standard is.**
+> *"whatever mac standard is"*
 
-## Q4 — focus contrast now rides the INK, not the frame.
+So: **close / minimise / zoom.** Minimise has a home already — the compositor's `set_hidden` is
+merged and metal-proven (a hidden window parks instead of starving the compositor). Zoom needs
+maximise/restore, which means remembering a pre-zoom rect per window. Close already works.
+Note the current paint is right-aligned with close leftmost; macOS is upper-LEFT. See A5 — Peter
+has explicitly deferred placement.
 
-The two title gradients differ by a few LSBs; the two ink roles differ a lot. So a focused window is
-distinguished mainly by its caption ink. That preserves FOCUS-HL's "focus never moves a pixel" law —
-but if it doesn't read across the room at the bench, **the fix is the kit json**, not the compositor.
+### A3 — hover / pressed / disabled: **yes, and the vocabulary is named.**
+> *"oh yes we want it very modern i guess this will be very Scandinavian refined but minimal"*
 
-## Q5 — control side and order.
+Add the states to the kit. The idiom is **modern, Scandinavian, refined, minimal** — which reads as
+restraint: small deltas, no ornament, no drop shadows for their own sake. Kit json first.
 
-Right-aligned, close leftmost. That satisfies both the kit's left-to-right dark→light ramp and P79's
-"upper right". A LEFT cluster satisfies the ramp equally well. Pure taste.
+### A4 — focus: **make the whole window more distinguishable, not just the caption.**
+> *"tweak to make it more distinguishable as a whole?"*
+
+Today the two title gradients differ by a few LSBs and only the ink differs strongly, so focus reads
+almost entirely in the caption. Peter wants the **whole window** to read as focused. ⚠ Constraint
+that must not be broken while doing it: **FOCUS-HL's law is that focus never moves a pixel** — the
+distinction has to come from colour, not geometry, or the four-rect damage subtraction in
+COMPOSITE-2 stops being focus-independent. Kit json first.
+
+### A5 — control side and order: **leave it, revisit later.**
+> *"ok we can always change things later!"*
+
+Right-aligned, close leftmost, stands for now.
 
 ---
 
-**Known residual, not a question:** rounded corners are cut against the desktop colour rather than
+**Known residual, unchanged:** rounded corners are cut against the desktop colour rather than
 sampled, because WC-H requires the pass to write every pixel of the box. Visible only when a manual
-drag stacks two windows — about 31 px of the desktop colour per top corner. Tiled windows never
-overlap, so it does not appear in normal use.
+drag stacks two windows — about 31 px per top corner. A1's scene will make this more visible than
+the flat purple does, so it likely wants fixing in the same arc.
