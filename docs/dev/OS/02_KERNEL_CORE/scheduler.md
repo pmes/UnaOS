@@ -1597,19 +1597,15 @@ slack** — one AP failing INIT-SIPI-SIPI yields `PARTIAL`, not `FAIL`.
 Sites that DECLINE print the measured pool rather than a description of it, e.g.
 `:: U6gx: placement pool too small (aps=4 pool=2, need 3) — owner/grants demo skipped ::`.
 
-One placement site is deliberately **not** under this owner: `syscall::bg_place_cpu`,
-which starts `bg`/`run` programs on the caller's core — since SCHED-X86, the render
-core. That is not a rule-1 deadlock (the storage syscall handler is IF-masked and
-cannot be preempted holding `XHCI_CONTROLLER`); it is an operator-facing placement
-question — a foreground `run` degrades the panel for its duration — and it is open.
+One placement site was deliberately **not** under this owner: `syscall::bg_place_cpu`,
+which started `bg`/`run` programs on the caller's core — since SCHED-X86, the render
+core. That was never a rule-1 deadlock (the storage syscall handler is IF-masked and
+cannot be preempted holding `XHCI_CONTROLLER`); it was an operator-facing placement
+question — a foreground `run` degrades the panel for its duration — and it was open
+until SMPBAL-X86 (below), which makes it `CPU_AUTO`.
 
-**Expected at the bench, not fixed here:** the shell now runs inside
-`x86_render_service`, so `bg_place_cpu()`'s premise ("the caller's core is
-definitionally scheduling") finally holds and programs start — but they start on
-the **render** core, so a foreground `run` degrades the panel for its duration.
-That is a syscall-layer placement question. `sibling_online_cpu` also changes
-answer, by design: core 0 publishes `scheduler_rsp` from this loop, so WINX-7
-sibling placement may now pick it.
+`sibling_online_cpu` also changes answer, by design: core 0 publishes
+`scheduler_rsp` from this loop, so WINX-7 sibling placement may now pick it.
 
 The `rast` knob keeps the inline loop (its demo drives the BSP's local `screen`).
 
@@ -1772,13 +1768,152 @@ which closes the stale direction; a remote dispatch landing between the two load
 still name a newer task, and the emit-side mask cannot help because the racing writer is
 another core. Read the `*` as evidence about the core and the name as a strong hint.
 
-Still open after this arc, in the order the campaign takes them: placement
-(`CPU_AUTO`/`spawn_auto`/`PRIO_SERVICE`, which also fixes `bg_place_cpu` above),
-BSP-serial boot probing, band-parallel compositor flush, and work stealing.
-`ui_status::live_permille`'s x86 arm still returns `None` and falls back to the event
-meter — wiring it to this feed so the panel strip and the serial line read one source
-is the survey's Arc-0 scope item 4, **deferred by the implementing session and awaiting
-the integrator's explicit accept**, not silently dropped.
+Still open after this arc, in the order the campaign takes them: BSP-serial boot
+probing and band-parallel compositor flush. Placement and work stealing are the next
+section. `ui_status::live_permille`'s x86 arm still returns `None` and falls back to
+the event meter — wiring it to this feed so the panel strip and the serial line read
+one source is the survey's Arc-0 scope item 4, **deferred by the implementing session
+and awaiting the integrator's explicit accept**, not silently dropped.
+
+### Load-balanced placement + work stealing (x86_64, SMPBAL-X86)
+
+The measurement SCHEDLOAD-X86 exists to make finally got taken at the bench: six vug
+instances open on the rMBP, and the load line read one core pinned near 100 % with
+several workers flat at 0 %. Two mechanisms produced that, and this arc lands both
+halves plus the correctness fix migration forces.
+
+**Why the pile-up happened.** Every x86 spawn site named a core, and that decision was
+final — `make_ready` enqueued on `task.cpu` unconditionally, nothing re-placed at wake,
+and `run()`'s empty-queue arm went straight to `enable_and_hlt`. `bg_place_cpu` returned
+the caller's core, the caller is the shell, and since SCHED-X86 the shell *is*
+`x86_render_service`. So every program launched landed on the render core and stayed
+there, whatever the other seven cores were doing.
+
+**Placement — `CPU_AUTO`.** `sched::CPU_AUTO` (`usize::MAX`) is a sentinel `target_cpu`
+meaning "place me". `pick_cpu` checks the **pin contract first**: any other value is
+returned unchanged, so every pre-existing spawn site — render, input, usb-pump, the
+whole fixture ladder — is untouched and `SCHED-X86 PLACE-CHECK` keeps reading `PASS`
+with no exemption (and must not be given one; a `PLACE-CHECK` taught to tolerate
+migration cannot falsify what it was built for). For `CPU_AUTO` it scans the
+**dispatching** cores — `ONLINE_MASK`, set at the top of `run()`, which is the "is this
+core actually popping its queue" predicate `bg_place_cpu` has wanted since WINX-3 — and
+picks by (1) shallowest ready queue, (2) lowest SCHEDLOAD-X86 busy percent, (3) a
+rotating cursor. Three exclusions, of two different kinds:
+
+| # | excluded | kind | relaxes? |
+| --- | --- | --- | --- |
+| 1 | core 0, for a **cooperative** (IF=0) ring-3 task | correctness — it masks the timer for its lifetime and freezes the global ms-clock | **never** |
+| 2 | the **service** core | deadlock — `x86_usb_pump` holds the raw `XHCI_CONTROLLER` spinlock there, and a co-located preemptible task that also takes it (any ring-3 program touching storage) can preempt the holder then spin on a lock whose owner cannot run. This is `xhci_worker_cpu`'s rule, which DECLINES rather than co-locate | tier 2 |
+| 3 | the **render** core | performance — it owns the panel and hosts the shell, and it is the core the imbalance piled onto | tier 3 |
+
+Rules 2 and 3 relax in tiers mirroring `smp::worker_pool`'s
+`Exclusive`/`SvcShared`/`RenderShared`, so a machine with too few dispatching cores
+still places somewhere real. Rule 1 has no tier. `run_user_image` and `bg_place_cpu`
+now pass `CPU_AUTO`, which closes the open item above.
+
+**Correction — `try_steal`.** Placement is one guess made at spawn; stealing is what
+makes a wrong guess cheap. An idle core — one whose own queue came up empty — takes one
+eligible task off the deepest other queue instead of halting: peek depths, steal under
+the **victim's lock only** (re-checking depth), release, re-home `task.cpu`, push
+locally. One lock at a time, so no ordering hazard. `STEAL_MIN_DEPTH = 2` leaves the
+last ready task at home, which is what stops two idle cores ping-ponging a lone task.
+`steal_one` scans **LOW→HIGH** priority — take a core's background work, never its most
+urgent task. Neither the render core nor the service core steals — exclusions 2 and 3
+above, repeated here because a steal is a placement decision `pick_cpu` never sees — but
+both remain valid *victims*, since draining eligible work off them is the point.
+Exclusion 1 is likewise repeated in `steal_one`'s predicate.
+
+**Eligibility is the pin contract, and on x86 that includes ring-3 tasks.** `Task.steal_ok`
+is set once at spawn as `requested_cpu == CPU_AUTO`. aarch64 excludes EL0 tasks
+categorically; x86 does not need to, and the asymmetry is worth stating precisely
+because it is the reverse of what was expected. aarch64 cannot steal an EL0 task
+because three per-core residency tables keyed on `task.cpu` are mutated only at spawn,
+re-place and reap while its `try_steal` re-homes without transferring them — x86 has no
+such tables. There is no ASID, no per-`(core, slot)` table, no FPU/XSAVE state (the
+target builds `+soft-float` with SSE/AVX off), no FS base, and GS base is pure per-core
+state a migrated task correctly reads fresh. Everything per-task is re-derived at the
+single dispatch site: CR3, TSS.RSP0 and the SYSCALL kernel rsp. So `task.cpu` is a pure
+*policy* field here, and the whole aarch64 SPREAD-4…15 apparatus — margin, freshness
+gate, co-placement, recruit — is deliberately **not** ported. That layer exists solely
+because EL0 tasks there cannot be stolen, it ships a documented 4–10 migrations/sec/task
+churn cost, and its own file records three successive arcs of it being "correct on a
+saturated board and wrong on an idle one".
+
+**The TLB obligation — and why it ships in the same commit.** x86 has no broadcast
+invalidation and no shootdown IPI: `invlpg` and `mov cr3` are both core-local. Every
+user-TLB argument in `memory.rs` rested on an unwritten premise — *the only core that
+ever installs a given user CR3 is the core that will restore the kernel CR3 when that
+address space is torn down* — which held **only because tasks did not migrate**.
+Stealing falsifies it, and the failure is silent rather than a crash, because
+`slot_cr3(s)` is a fixed physical address reused by every tenant of that slot over the
+same backing frames:
+
+* *intra-tenant* — a task stolen away from core B, changing its own leaves elsewhere,
+  and stolen back, runs on B's stale entries if B dispatched nothing else meanwhile;
+* *cross-tenant* — a task migrates off B and exits elsewhere, so only that core
+  restores; the slot is freed and re-allocated at the same CR3 over the same frames, and
+  the **new** tenant dispatched on B runs under the **previous** tenant's cached
+  translations. That is stale W bits against the new ELF's W^X layout (a live W^X bypass
+  of the GR19 shape) plus reach into window-surface pages `clear_slot_fb` unmapped with
+  a local `invlpg` only.
+
+Both need only that core B dispatched nothing with a different CR3 in the interval,
+which is exactly the state `try_steal` runs in. The fix needs no IPI, because a core
+idling on a stale root cannot *consume* a stale user translation — the kernel half is
+identical in every slot PML4 and the kernel reaches user backing through identity
+aliases, never `USER_BASE`. So the reload is deferred to the dispatch that would use it:
+`memory::AS_GEN` is bumped by every user-leaf mutation (slot build, teardown/recycle,
+the ELF permission pass, every window map/unmap), `SchedCpu.cr3_gen` records the
+generation at which each core last validated its live CR3, and the dispatch site reloads
+CR3 unconditionally when the two differ instead of taking `switch_cr3_if_needed`'s skip.
+A full non-global flush on this hardware — nothing the kernel maps carries `PTE_GLOBAL`
+and firmware leaves CR4.PGE clear. Cost: one relaxed load per dispatch, one atomic add
+per mutation, at most one extra `mov cr3` per core per mutation. Deliberately *not*
+"make the reload unconditional for user targets", which would regress the U3.5 fast path
+the conditional exists for.
+
+**Witnesses.**
+
+```
+:: SCHEDPLACE-X86: '<name>' -> c<N> (q=<depth> load=<pct>% from c<caller>) ::   (first 24 auto-placements)
+:: [smpbal] steal '<name>' c<A>->c<B> ::                                       (first 24 migrations)
+[schedx86] load c0=…% … sw=[…] q=[…] steal=<moves>/<passes> asgen=<gen>/<reloads>  (every ~5 s)
+```
+
+`steal=` carries **both** terms, never just the count, because the ratio is the
+falsifier and the count alone is not. aarch64 paid for that lesson: a steal counter
+climbing at *dispatch* rate rather than at *idle-pass* rate means churn, not balance. A
+fleet in balance shows moves ≪ passes, with moves going flat while passes keep climbing.
+**`steal=0/<large>` is a healthy reading**, not a dead instrument: it says placement got
+it right and no core ever had backlog behind a running task. `passes = 0` is the dead
+reading.
+
+`asgen=` exists because the CR3-generation fix has no other falsifiable surface — a
+stale-TLB cross-tenant read is silent by construction, so the only thing observable
+about the mechanism is whether it *fires*. A generation climbing with window/launch
+activity while `reloads` stays at 0 means the dispatch site is not consulting it.
+
+**Limits, stated rather than discovered later.**
+
+1. **Sleepers are never touched.** A sleep deadline lives in the parking core's local
+   APIC tick domain and is not portable between cores. A sleeping task is not in a run
+   queue, so `try_steal` cannot reach it — and must not be "helpfully" taught to.
+2. **The steal takes a *remote* run-queue lock**, which is new on this arch. Both the
+   peek and the steal go through the WEDGE-4 bounded-spin wrapper on `wedge2` builds, so
+   `<W1>`/`<W2>` still see every acquisition. Land the first metal boots with
+   `UNAOS_WEDGE2=1`.
+3. **`<W1>` changes meaning slightly.** `wedge4`'s flag is set and cleared by the
+   captured core index, so it is still mechanically correct across a migration, but read
+   the token as "some core was mid-enqueue", not "this core was".
+4. **The load percent cannot see ISR load** (SCHEDLOAD-X86 limit 1), so a core saturated
+   servicing device interrupts with an empty queue reads 0 % and looks like a placement
+   candidate. That is unchanged by this arc and bounded by the fact that placement is
+   only a hint.
+5. **Two witness structures under feature gates would under-report across a migration**
+   and are left alone deliberately: `video/cursor.rs`'s overlay `owner_cpu` and
+   `wedge2::CHAIN_CORE` both compare an owner-core claim recorded earlier. Neither is
+   reachable in practice — the compositor task is explicitly placed, hence pinned — and
+   weakening either would retire a real falsifier.
 
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
@@ -1937,11 +2072,17 @@ Combined-boot evidence (one kernel running SMP + USB + net + video):
 - **`RwLock` reader starvation is unbounded** (condvar-blocked tasks do not age),
   and each condvar has a documented capacity precondition. These are recorded as
   preconditions rather than fixed.
-- **x86_64 tasks never migrate, and placement is decided once at spawn.** There is
-  no `CPU_AUTO`, no re-placement at wake, no work stealing, and no service priority
-  band — `make_ready` enqueues on `task.cpu` unconditionally, so nothing can correct
-  an imbalance once it exists. SCHEDLOAD-X86 makes that imbalance *visible* on every
-  boot; the corrections are the arcs after it.
+- ~~**x86_64 tasks never migrate, and placement is decided once at spawn.**~~ **Stale
+  — retired by SMPBAL-X86.** x86 now has `CPU_AUTO` placement over the dispatching
+  cores and idle-core work stealing, for kernel *and* ring-3 tasks. What it still does
+  **not** have, on purpose: no re-placement at wake (`rewake_place`), no service
+  priority band (`PRIO_SERVICE`/`spawn_prio` remain aarch64-only, so an operator-started
+  program is still a round-robin peer of the compositor wherever it lands), and none of
+  the aarch64 SPREAD-4…15 layer. Correction happens on the idle side only.
+- **No TLB-shootdown IPI on x86.** Cross-core staleness of *user* mappings is handled by
+  the `AS_GEN` deferred-reload scheme (SMPBAL-X86), not by invalidation. Kernel-half
+  mappings mutated after a slot's PML4 was built are a separate, pre-existing question
+  that scheme does not address.
 
 ---
 
