@@ -18,14 +18,17 @@
 //! subclass **0x80** ("other network controller") and therefore *cannot* have matched that filter:
 //! the radio in this machine has never been looked at by our own kernel, not once.
 //!
-//! This module is the first arc of the native-driver path. It converts assumptions into facts and
-//! it writes nothing.
+//! This module is the first arc of the native-driver path. It converts assumptions into facts.
+//! S0 wrote nothing; S1/L0 write exactly ONE register — the `cfg:0x80` window selector — and
+//! restore it, MATCH-verified.
 //!
-//! ## The hard constraint: READ-ONLY, and honest about where read-only stops
+//! ## The hard constraint: READ-ONLY past the selector, and honest about where read-only stops
 //!
-//! Every device access below is a PCI **config-space read** or an **MMIO read** through BAR0. There
-//! is no `write_config_*` call and no `write_volatile` anywhere in this file. That is not a style
-//! preference; it is the arc's whole contract, because the alternative — poking a radio whose
+//! Every device access below is a PCI **config-space read** or an **MMIO read** through BAR0,
+//! except the five `write_config_32` calls to `CFG_BAR0_WIN` (selftest no-op, ChipCommon, EROM,
+//! d11 base, restore). No `write_volatile`, no MMIO write, no other config write exists in this
+//! file. That is not a style preference; it is the arc's whole contract, because the
+//! alternative — poking a radio whose
 //! backplane we have not enumerated — is how you wedge a bus you cannot yet reset.
 //!
 //! Mapping BAR0 (`arch::memory::map_mmio_window`) is a page-table edit, not a device access: the
@@ -137,7 +140,8 @@ const CAP_ID_PM: u8 = 0x01;
 /// `BCMA_PCI_BAR0_WIN` — the backplane address the first 4 KiB of BAR0 decodes to. Linux's
 /// `bcma_scan_switch_core()` writes this register (and nothing else) to move the window from core
 /// to core; it is the single register that gates every backplane read past ChipCommon.
-/// **This arc does not write it.**
+/// **The ONLY register this module ever writes** (S1/L0: three moves + restore, MATCH-verified;
+/// S0 never wrote it).
 const CFG_BAR0_WIN: u8 = 0x80;
 /// `BCMA_PCI_BAR0_WIN2` — the backplane address the SECOND 4 KiB of BAR0 decodes to (the wrapper
 /// window). Read here only to record what firmware left behind.
@@ -2013,7 +2017,7 @@ fn d11_l0(bus: u8, dev: u8, func: u8, bar0: u64, d: D11) {
     );
     let (ev, eu) = fmt_dur(dl.elapsed_cycles());
     serial_println!(
-        ":: wifi-l0: end ok={} d11-rev={} dmp-rev={} phy-type={} wrote-cfg80=1 wrote-cfg-ac=0 wrote-core-regs=0 elapsed={}{} — next gate is FIRMWARE: a d11 MAC runs downloadable microcode, which this tree does not and will not carry (docs/MANIFESTO/CLEAN_ROOM_POLICY.md); see bcm4331.md S4 ::",
+        ":: wifi-l0: end ok={} d11-rev={} dmp-rev={} phy-type={} wrote-cfg80=1 wrote-cfg-ac=0(audited) wrote-core-regs=0(audited) elapsed={}{} — next gate is FIRMWARE: a d11 MAC runs downloadable microcode, which this tree does not and will not carry (docs/MANIFESTO/CLEAN_ROOM_POLICY.md); see bcm4331.md S4 ::",
         reached as u8, d.rev, dmp_rev, phy_type, ev, eu
     );
 }
