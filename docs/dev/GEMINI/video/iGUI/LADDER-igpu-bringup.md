@@ -162,7 +162,7 @@ whole ladder is a single `awk`:
 ```
 :: igpu-dpy: rung=NN name=<short> ok=<0|1> <k=v …> ::            # per rung
 :: igpu-dpy: rung=NN name=<short> UNWIND pre=0x… post=0x… ok=… ::  # per unwind entry
-:: igpu-dpy: LADDER highest=NN/10 name=<short> ok=<0|1> why=<token> unwound=<n> gmux=<MATCH|FAILED> elapsed_ms=<n> ::
+:: igpu-dpy: LADDER highest=NN/10 name=<short> ok=<0|1> pending=<n> gmux=<MATCH|FAILED> why=<token> elapsed_ms=<n> ::
 ```
 
 The `LADDER` line is the single awk target and **must be emitted on every exit path** — including
@@ -199,7 +199,7 @@ Vol 3 Part 4 and against i915's `g4x_dp.c` / `intel_pps.c` enable sequence.**
   `0x64010..0x64024` window. **Offsets TBV.** Read-only here; just prove the window is not `0xFFFFFFFF`.
 
 **Read-back predicate:** `SWITCH_DDC/DISPLAY/EXTERNAL` read back (indices `0x29`/`0x11`/`0x41`) as
-`0x01/0x02/0x02` — the existing `gmux_apply` MATCH (`igpu.rs:432-461`). Non-zero-on-success
+`0x01/0x02/0x02` — the existing MATCH (`igpu.rs:432-461`). Non-zero-on-success
 additions: `BDSM != 0 && BDSM != 0xFFFFFFFF`, and the AUX window not reading all-ones.
 **Note:** the DDC read index `0x29` (`igpu.rs:243`) is still uncited — the branch's own citation
 block (`igpu.rs:226-231`) lists only `0x28`. Cite it or drop the read-back to `0x28`.
@@ -212,7 +212,7 @@ block (`igpu.rs:226-231`) lists only `0x28`. Cite it or drop the read-back to `0
 
 **Black-panel failure mode:** expected and unavoidable — the mux now points at an unconfigured
 display engine. Discrimination: `rung=00 name=mux ok=0` with the per-register `MISMATCH` lines
-already emitted by `gmux_apply` names *which* of the three did not land.
+already emitted names *which* of the three did not land.
 
 **Unwind:** nothing pushed yet; `gmux_revert_now()` alone.
 
@@ -331,7 +331,7 @@ active area.
 **Witness:**
 ```
 :: igpu-dpy: rung=03 name=aux ok=1 dpcd_rev=0x11 max_rate=0x0A lanes=4 edid=OK hdr=OK csum=OK dtd=2880x1800 pclk_khz=… ::
-:: igpu-dpy: rung=03 name=aux ok=0 why=<aux-timeout|aux-rxerr|edid-hdr|edid-csum|dpcd-implausible> ctl=0x… ::
+:: igpu-dpy: rung=03 name=aux ok=0 why=<aux-timeout|aux-rxerr|edid-header-corrupt|edid-checksum-bad|dpcd-implausible> ctl=0x… ::
 ```
 
 **Black-panel failure mode:** none directly — this rung writes no display state. Its failure mode is
@@ -638,7 +638,7 @@ clock out of memory.**
 | all | `mmio_read(base, offset)` — `igpu.rs:786-788` | **There is no `mmio_write` in `igpu.rs`.** `kepler.rs:2189` has `pub unsafe fn mmio_write(base, offset, val)` — do **not** reach across into the kepler lane. Add a local one, and make it the unwind-recording helper (§3). |
 | all | `regs` module — `igpu.rs:3-84` | Already has 30+ offsets including every PPS, GMBUS, FDI, pipe and plane register the ladder needs. Extend it; do not start a second table. |
 | all | The citation-comment style — `igpu.rs:226-231`, `724-728` | Cite the PRM section at the point of use. Two reviews have already re-litigated an uncited gmux wait; the same will happen to every uncited display bit. |
-| 0 | `gmux_apply` — `igpu.rs:432-461`; `gmux_index_read`/`_write` — `:326`, `:341`; `gmux_wait_ready`/`_complete` — `:290`, `:308` | Verdict decided by read-back, doubly-bounded waits, `0xFFFFFFFF` sentinel. Reuse unchanged. |
+| 0 | gmux write logic — `igpu.rs:432-461`; `gmux_index_read`/`_write` — `:326`, `:341`; `gmux_wait_ready`/`_complete` — `:290`, `:308` | Verdict decided by read-back, doubly-bounded waits, `0xFFFFFFFF` sentinel. Reuse unchanged. |
 | 0 | `dump_pipe` / `dump_plane` — `igpu.rs:756-784` | Already print exactly the fields the rungs need. Make them the post-rung census. |
 | 0 | `crate::arch::pci::read_config_32` — `pci.rs:7` | `u8` offset reaches GGC (`0x50`) and BDSM (`0xB0`) at BDF `0:0:0`. |
 | all | `RevertState` pack/unpack + `gmux_state_update` — `igpu.rs:354-421` | The compare-exchange discipline is the model for `DisplayUnwind`'s claim. One encode point, one decode point. |
@@ -701,7 +701,7 @@ ends with the machine back on the Kepler console.** No boot proves nothing.
 **Deliverable:** the unwind path is proven *before* it is needed — arm the stack, push two synthetic
 entries against a harmless scratch register, force an unwind, prove every pre-image restored and the
 gmux reverted. Plus the rung-0 census (BDSM/GGC/GGTT/AUX window/FRMCOUNT).
-**Witness:** `LADDER highest=00/10 … unwound=2 gmux=MATCH`.
+**Witness:** `LADDER highest=00/10 … pending=2 gmux=MATCH`.
 **Risk:** same as `2be56eb2` today — mux moves, panel dark for the dwell, comes back.
 **Why first:** an unwind stack that has never executed is an instrument that cannot execute in the
 state it reports on. Every later flight bets the machine on it.

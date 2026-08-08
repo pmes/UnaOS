@@ -89,7 +89,7 @@ pub fn gmux_revert_now() -> bool {
         if s.armed { Some(RevertState { armed: false, due: false, ..s }) } else { None }
     });
     let Some(s) = claimed else { /* prints "NOT ARMED — no write issued" */ return false; };
-    unsafe { gmux_apply("revert", s.ddc, s.disp, s.ext) }
+    // ... write the triple and read back ...
 }
 ```
 
@@ -137,7 +137,7 @@ The x86_64 difference was then run down rather than waved away:
 
 ### 5 — a failed write is not a switch ✅
 
-`gmux_apply()` writes the triple, reads all three back, and decides the verdict **from
+The gmux write block writes the triple, reads all three back, and decides the verdict **from
 the read-back**. The write helpers' booleans are printed (`ddc=ok disp=TIMEOUT ext=ok`)
 because they say *where* it broke, but they decide nothing. Each disagreeing register is
 named with both values:

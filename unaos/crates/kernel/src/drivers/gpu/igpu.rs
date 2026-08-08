@@ -222,9 +222,9 @@ unsafe fn read_gmux_trace() -> [u32; 7] { [0; 7] }
 // behaviourally identical to trunk. An earlier attempt replaced those closures with
 // `arch::ms()`-deadline helpers gated on `target_arch` only, so EVERY `unaos_ivb` build (armed
 // or not) picked up a wait whose bound depends on the BSP timer ISR still running. The old
-// bound could not hang; that one could. The armed helpers here carry BOTH an unconditional
-// iteration cap AND an `ms()` deadline, so even on the armed build a stopped clock cannot hang
-// them — whichever bound trips first ends the wait.
+// bound could not hang; that one could. The armed helpers here carry an unconditional
+// iteration cap, so even on the armed build a stopped clock cannot hang
+// them.
 //
 // The panel WILL go black between the switch and the revert. That is the EXPECTED result, not
 // the experiment failing: the census in this same function reads every pipe, every plane and
@@ -263,7 +263,7 @@ const GMUX_EXTERNAL_DIS: u8 = 0x03;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_DDC_IGD: u8 = 0x01;
 
-/// Baseline's iteration bound, kept UNCONDITIONALLY alongside the TSC deadline.
+/// Baseline's iteration bound, kept UNCONDITIONALLY.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_WAIT_ITERS: u32 = 5000;
 /// How long the mux stays on IGD before the revert fires.
@@ -281,8 +281,8 @@ unsafe fn gmux_inb(port: u16) -> u8 {
     val
 }
 
-/// Wait for the gmux to be ready to accept an index byte. Bounded twice over: an iteration
-/// count that cannot depend on any clock. Returns false on timeout —
+/// Wait for the gmux to be ready to accept an index byte. Bounded by an iteration count that cannot depend on any clock.
+/// Returns false on timeout —
 /// and no caller here swallows a timeout silently.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 unsafe fn gmux_wait_ready() -> bool {
@@ -1039,13 +1039,13 @@ pub unsafe fn gmux_igd_switch() {
         let frmcnt = mmio_read(bar0, 0x70040);
 
         if (aux_ctl & DP_AUX_CH_CTL_SEND_BUSY) != 0 {
-            serial_println!(":: igpu: [AUX] REFUSED: aux_ctl=0x{:08X} SEND_BUSY is set at boot ::", aux_ctl);
+            serial_println!(":: igpu: [AUX] REFUSED: aux_ctl=0x{:08X} SEND_BUSY is set at boot bdsm=0x{:08X} ggc=0x{:08X} ggtt0=0x{:08X} ggtt1=0x{:08X} frmcnt=0x{:08X} ::", aux_ctl, bdsm, ggc, ggtt0, ggtt1, frmcnt);
             return Err("aux-busy-at-boot");
         }
 
         let clock_divider = aux_ctl & 0x7FF;
         if clock_divider == 0 {
-            serial_println!(":: igpu: [AUX] REFUSED: aux_ctl=0x{:08X} clock divider is 0 ::", aux_ctl);
+            serial_println!(":: igpu: [AUX] REFUSED: aux_ctl=0x{:08X} clock divider is 0 bdsm=0x{:08X} ggc=0x{:08X} ggtt0=0x{:08X} ggtt1=0x{:08X} frmcnt=0x{:08X} ::", aux_ctl, bdsm, ggc, ggtt0, ggtt1, frmcnt);
             return Err("aux-divider-unusable");
         }
 
@@ -1114,13 +1114,13 @@ pub unsafe fn gmux_igd_switch() {
         let header: [u8; 8] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
         if &edid[0..8] != &header {
             serial_println!(":: igpu: [AUX] EDID Header corrupt: {:02X?} ::", &edid[0..8]);
-            return Err("edid-corrupt");
+            return Err("edid-header-corrupt");
         }
 
         let checksum: u8 = edid.iter().fold(0, |acc, &x| acc.wrapping_add(x));
         if checksum != 0 {
             serial_println!(":: igpu: [AUX] EDID Checksum failed: {} ::", checksum);
-            return Err("edid-corrupt");
+            return Err("edid-checksum-bad");
         }
 
         serial_println!(":: igpu: [AUX] EDID Dump ::");
@@ -1171,6 +1171,6 @@ pub unsafe fn gmux_igd_switch() {
         "UNTOUCHED"
     };
 
-    serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name={} ok={} unwound={} gmux={} why={} elapsed_ms={} ::",
+    serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name={} ok={} pending={} gmux={} why={} elapsed_ms={} ::",
         highest, rung_name, ok_flag, unwound_count, gmux_verdict, why_str, get_elapsed_ms());
 }
