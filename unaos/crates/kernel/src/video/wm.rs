@@ -1685,6 +1685,93 @@ pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize
     n
 }
 
+/// GR21/WCD-OCC — a snapshot of the outer boxes of every window drawn ON TOP of one window under
+/// verify, so the scan-out read-back ([`verify_window`]) and the glass read-back ([`super::wcg`])
+/// can tell a pixel a HIGHER window legitimately owns from a pixel the blit got wrong.
+///
+/// The read-back witnesses assert *"every pixel of this window's content rect on the panel equals
+/// this window's source surface"* — a claim that is false for any window with a live window over
+/// it. Boot AK made this reachable as a STEADY STATE: an evicted desktop app (`STAT.ELF`) sits in
+/// the tiler's second tile whenever a second window is open, and its chrome box straddles the
+/// pinned console's top-left third. The panel is correct — `STAT` really is over the console — but
+/// the console's own read-back charged `win=1` for 256 410 pixels `STAT` owns and reported `-> FAIL`
+/// (`[wc-d]`) / `-> BLIT` (`[wc-g]`). This snapshot subtracts those pixels.
+///
+/// **x86 only, and the arch gate is a wire boundary, not a scoping convenience.** `wm.rs`/`wcg.rs`
+/// and the tiler are SHARED with aarch64, and `scripts/specs/pi4-regression.spec` reads the
+/// `[wc-d]`/`[wc-g]` line format. The `occluded=`/`occ=` fields and the counting behind them are
+/// therefore gated to x86 so the aarch64 wire stays byte-identical — the same protection-boundary
+/// argument WCD-TEARDOWN's interlock made (`wm.rs:3580`). The false FAIL is identical on aarch64
+/// (same `wm.rs`, same tiler, same routed console); fixing it there moves another track's gate
+/// wire and is the integrator's call.
+///
+/// A snapshot, never a handle — read under the table lock and copied out, exactly as [`occluders`]
+/// is, so a window that moves or closes immediately afterwards is repaired by the mover's own
+/// composite and never by us.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub struct OccSnap {
+    boxes: [(usize, usize, usize, usize); MAX_WINDOWS],
+    n: usize,
+}
+
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+impl OccSnap {
+    /// The empty snapshot — no window above the one under check.
+    pub const fn none() -> Self {
+        Self {
+            boxes: [(0, 0, 0, 0); MAX_WINDOWS],
+            n: 0,
+        }
+    }
+
+    /// The number of occluder boxes captured — the two operands of the `occ=n0/n1` wire field.
+    pub fn count(&self) -> usize {
+        self.n
+    }
+
+    /// Does any occluder box cover panel pixel `(x, y)`? A mismatching pixel that a higher window
+    /// covers is that window's pixel, not the blit's to answer. Saturating add mirrors [`outer_box`]:
+    /// an absurd box clips rather than wrapping into one that would silently stop being hittable.
+    pub fn covers(&self, x: usize, y: usize) -> bool {
+        self.boxes[..self.n].iter().any(|&(bx, by, bw, bh)| {
+            x >= bx && y >= by && x < bx.saturating_add(bw) && y < by.saturating_add(bh)
+        })
+    }
+}
+
+/// GR21/WCD-OCC — the outer boxes of every live, non-compat window stacked ABOVE `(z, id)`.
+///
+/// Mirrors [`occluders`]'s population (`used`, non-`compat`) but filters relative to ONE window
+/// rather than to the shell: a window `rr` occludes the window under check iff it is drawn AFTER it,
+/// i.e. `(rr.z, rr.id) > (z, id)` — the same back-to-front key `composite` sorts the blit order by,
+/// so the set is exactly the windows whose pixels can legitimately sit over the verified rect. The
+/// window under check is excluded for free (`(z, id)` is not `> (z, id)`), and so is anything at or
+/// below its z, which keeps a real corruption UNDER a sibling that is not actually above it still
+/// chargeable. Compat rows are excluded for the reason [`occluders`] gives — a compat row IS the
+/// full-screen present path, and while it owns the panel the render task is parked and not
+/// verifying anyway.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn occluders_above(z: u32, id: u32) -> OccSnap {
+    let t = table();
+    let mut snap = OccSnap::none();
+    for r in t.rows.iter() {
+        if !r.used || r.compat {
+            continue;
+        }
+        if (r.z, r.id) <= (z, id) {
+            continue;
+        }
+        let b = outer_box(r);
+        if b.2 == 0 || b.3 == 0 {
+            continue;
+        }
+        snap.boxes[snap.n] = b;
+        snap.n += 1;
+    }
+    snap
+}
+
 /// WC-I — how did this present's occluder snapshot AGE while the desktop was copying?
 ///
 /// [`occluders`] is a snapshot, and the sentence above ("a window that moves or closes immediately
@@ -2697,7 +2784,18 @@ fn composite_inner() -> CursorTail {
         // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
         // and "as the copy left it", and anything inserted between them widens the interval they
         // measure into something other than the copy. Budgeted per window id; `None` once spent.
-        #[cfg(feature = "witness")]
+        // GR21/WCD-OCC — the occluder set as of the blit is handed to `wcg::begin` on x86, so the
+        // glass read-back can excuse a pixel a higher window owns exactly as `[wc-d]` does. aarch64
+        // keeps the four-argument call and its byte-identical wire.
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        let wcg_probe = super::wcg::begin(
+            rows[i].id,
+            rows[i].surf,
+            rows[i].surf_len,
+            rows[i].compat,
+            occluders_above(rows[i].z, rows[i].id),
+        );
+        #[cfg(all(feature = "witness", not(target_arch = "x86_64")))]
         let wcg_probe = super::wcg::begin(rows[i].id, rows[i].surf, rows[i].surf_len, rows[i].compat);
         // CURSOR-3 — WHICH WINDOWS MAY CARRY THE SPRITE. WC-I's invariant "no verified pixel is ever
         // read with the sprite on the panel" is preserved here rather than weakened: this pass may
@@ -2771,6 +2869,13 @@ fn composite_inner() -> CursorTail {
         #[cfg(feature = "witness")]
         if let Some(p) = wcg_probe {
             let r = &rows[i];
+            // GR21/WCD-OCC — the read-back-time occluder set, unioned in `end` with the pre-blit set
+            // carried in the probe. x86 only; aarch64 keeps the eight-argument call.
+            #[cfg(target_arch = "x86_64")]
+            super::wcg::end(
+                p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale, occluders_above(r.z, r.id),
+            );
+            #[cfg(not(target_arch = "x86_64"))]
             super::wcg::end(p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale);
         }
         // WC-H — print the back-layer sample the blit above recorded, if any. Deliberately AFTER
@@ -3047,8 +3152,18 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     let info = fb.info();
     let VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
-        #[cfg(target_arch = "x86_64")] seq } = vr;
+        #[cfg(target_arch = "x86_64")] seq,
+        #[cfg(target_arch = "x86_64")] occ_before } = vr;
     let wi = r.id as usize;
+    // GR21/WCD-OCC — the occluder set as of the READ-BACK (post-blit). Taken once, here, before the
+    // multi-second glass read the passes run, so the table lock it briefly holds never overlaps that
+    // read. Unioned with `occ_before` per pixel below: a mismatching pixel covered by EITHER snapshot
+    // is one a higher window owns, which conservatively excuses a window that moved between the two
+    // instants (the AK case, one re-tile removed). A window that enters mid-read is the same residual
+    // hole WCD-PRE already names for a source that moves mid-read — those pixels are not on the glass
+    // to be read. x86 only; see [`OccSnap`].
+    #[cfg(target_arch = "x86_64")]
+    let occ_after = occluders_above(r.z, r.id);
 
     // WCD-PRE — the per-pixel liveness question, asked only of pixels that already disagree. `want` was
     // frozen before the blit; if the SOURCE no longer holds that value, this pixel's reference moved
@@ -3074,6 +3189,11 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         // want=0x00000000`, fabricating fbcon black: the exact colour that falsified the first model,
         // on the arm built to diagnose the next one.
         let mut first_moved = (0usize, 0usize, 0u32, 0u32);
+        // GR21/WCD-OCC — pixels that mismatch AND lie under a higher window. Counted here, charged
+        // to neither `bad` nor `moved`: a higher window legitimately owns the destination, so the
+        // console's blit is not the writer being adjudicated. x86 only.
+        #[cfg(target_arch = "x86_64")]
+        let mut occluded = 0usize;
         for row in row0..row1 {
             // WC-D/PAYGO — the lattice's per-row phase. A full pass (`step == 1`) starts at column 0 and
             // advances by one, which is the `for col in 0..cols` loop this was before, exactly. A sampled
@@ -3111,10 +3231,28 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
                                 }
                                 moved += 1;
                             } else {
-                                if bad == 0 {
-                                    first = (dx, dy, got, want);
+                                // GR21/WCD-OCC — attribute to an occluder before charging `bad`, after
+                                // the WCD-PRE re-read above and only on a pixel that already disagrees,
+                                // so a clean blit never reaches the walk. A pixel covered by the
+                                // pre-blit OR the read-back occluder set is owned by a higher window.
+                                #[cfg(target_arch = "x86_64")]
+                                {
+                                    if occ_before.covers(dx, dy) || occ_after.covers(dx, dy) {
+                                        occluded += 1;
+                                    } else {
+                                        if bad == 0 {
+                                            first = (dx, dy, got, want);
+                                        }
+                                        bad += 1;
+                                    }
                                 }
-                                bad += 1;
+                                #[cfg(not(target_arch = "x86_64"))]
+                                {
+                                    if bad == 0 {
+                                        first = (dx, dy, got, want);
+                                    }
+                                    bad += 1;
+                                }
                             }
                         }
                     }
@@ -3122,9 +3260,20 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
                 col += step;
             }
         }
-        (checked, bad, moved, nonzero, first, first_moved)
+        #[cfg(target_arch = "x86_64")]
+        {
+            (checked, bad, moved, nonzero, first, first_moved, occluded)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            (checked, bad, moved, nonzero, first, first_moved)
+        }
     };
 
+    #[cfg(target_arch = "x86_64")]
+    let (checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, occ_cache) =
+        pass(fb);
+    #[cfg(not(target_arch = "x86_64"))]
     let (checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache) = pass(fb);
 
     // Discard, never clean — see the doc comment. Bare `IVAC` is what makes `bad_ram` able to fail.
@@ -3145,6 +3294,9 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     }
     let ram_indep = cfg!(target_arch = "aarch64");
 
+    #[cfg(target_arch = "x86_64")]
+    let (_, bad_ram, moved_ram, _, first_ram, firstmv_ram, occ_ram) = pass(fb);
+    #[cfg(not(target_arch = "x86_64"))]
     let (_, bad_ram, moved_ram, _, first_ram, firstmv_ram) = pass(fb);
     // `cksum` is the `[wc-c]` FNV over the SOURCE slot, carried here so a verdict is content-aware: without
     // it a blank surface blitted faithfully onto a blank rect is a PASS indistinguishable from a verified
@@ -3156,6 +3308,12 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     // The worse of the two passes: a pixel whose reference moved during EITHER read-back is unadjudicated,
     // and taking the max keeps a single moving pixel from being averaged out of the line.
     let moved = moved_cache.max(moved_ram);
+    // GR21/WCD-OCC — the worse of the two passes, same rule as `moved`: a pixel excused as occluded
+    // in EITHER read-back is unadjudicated by the console's blit, and the max keeps a single such
+    // pixel visible on the line. `ok` is UNCHANGED — occluded pixels were never charged to `bad`, so
+    // a verdict is CLEAN/PASS iff the non-occluded, non-moved mismatches are zero.
+    #[cfg(target_arch = "x86_64")]
+    let occluded = occ_cache.max(occ_ram);
     let ok = bad_cache == 0 && bad_ram == 0;
     let live = ok && moved > 0;
     let first = if bad_cache > 0 { first_cache } else { first_ram };
@@ -3217,9 +3375,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         let retry = aborts <= WCD_ABORT_MAX;
         let fst = if bad_cache > 0 || bad_ram > 0 { first } else { first_moved };
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} rect={}x{}+{}+{} fills={}->{} fact={}/{} desk={}->{} dact={}/{} aborts={}/{} retry={} -> SKIP (teardown)",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} rect={}x{}+{}+{} fills={}->{} fact={}/{} desk={}->{} dact={}/{} aborts={}/{} retry={} -> SKIP (teardown)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero,
+            occluded, occ_before.count(), occ_after.count(), cksum,
             // WCD-TEARDOWN — the mismatching pixel from whichever arm actually fired. `bad` writes
             // `first`, `moved` writes `first_moved`, and printing the wrong one is how the first cut
             // would have invented a black pixel on the arm meant to diagnose black pixels.
@@ -3264,9 +3423,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         // aarch64 has no interlock and its line must stay byte-identical to the pre-interlock wire.
         #[cfg(target_arch = "x86_64")]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} cksum_pre={:#018x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> LIVE (unverifiable)",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} occluded={} occ={}/{} cksum={:#018x} cksum_pre={:#018x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum, cksum_pre,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero,
+            occluded, occ_before.count(), occ_after.count(), cksum, cksum_pre,
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active
         );
@@ -3291,9 +3451,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         // exposure visible.
         #[cfg(target_arch = "x86_64")]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} nonzero={} cksum={:#018x} first=none fills={}->{} fact={}/{} desk={}->{} dact={}/{} stable={} -> PASS",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=none fills={}->{} fact={}/{} desk={}->{} dact={}/{} stable={} -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, yn(ram_indep), moved, nonzero, cksum,
+            checked, coverage, yn(ram_indep), moved, nonzero,
+            occluded, occ_before.count(), occ_after.count(), cksum,
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active, yn(stable)
         );
@@ -3317,9 +3478,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         // has deliberately declined to abort on.
         #[cfg(target_arch = "x86_64")]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> FAIL",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero,
+            occluded, occ_before.count(), occ_after.count(), cksum,
             first.0, first.1, first.2, first.3,
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active
@@ -3396,6 +3558,11 @@ struct VerifyRef {
     /// aarch64 has no interlock at all (the arch gate is a protection boundary; see WCD-TEARDOWN).
     #[cfg(target_arch = "x86_64")]
     seq: PanelSeq,
+    /// GR21/WCD-OCC — the boxes of every window ABOVE this one at reference time (pre-blit). Unioned
+    /// in [`verify_window`] with a read-back-time snapshot, so a mismatching pixel a higher window
+    /// legitimately owns is counted `occluded=`, not `bad=`. x86 only; see [`OccSnap`].
+    #[cfg(target_arch = "x86_64")]
+    occ_before: OccSnap,
 }
 
 /// WC-D — capture the read-back's reference, from the composite loop, BEFORE `draw_window` runs.
@@ -3539,8 +3706,14 @@ fn verify_reference(
     // would abandon verdicts for a race that cannot reach them. See [`PANEL_FILL_EPOCH`].
     #[cfg(target_arch = "x86_64")]
     let seq = panel_seq();
+    // GR21/WCD-OCC — the occluder set as of the reference (pre-blit). Read here, alongside the `want`
+    // snapshot, so it describes the same instant the source bytes were frozen at; [`verify_window`]
+    // unions it with a read-back-time snapshot to excuse a window that moved between the two.
+    #[cfg(target_arch = "x86_64")]
+    let occ_before = occluders_above(r.z, r.id);
     Some(VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
-        #[cfg(target_arch = "x86_64")] seq })
+        #[cfg(target_arch = "x86_64")] seq,
+        #[cfg(target_arch = "x86_64")] occ_before })
 }
 
 /// WC-D — `band=` on the wire: `none` for a whole-box verdict, `y0..y1` in SOURCE rows for a banded one.
