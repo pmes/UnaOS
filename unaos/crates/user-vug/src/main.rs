@@ -189,10 +189,31 @@
 // reason than pause's: a headless QEMU run has no HID, so nothing ever TABs to the shell, so nothing is
 // ever hidden. `kernel8-test`'s 300-frame checksum proves it both before and after.
 //
+// VSYNC-PACE (GR22, x86) — THE CLAUSE BELOW IS NOW HALF FALSE, AND THE HALF THAT DIED IS THE KERNEL'S.
+// "…and none in the kernel's present path either" held until GR22. On x86 with the window compositor
+// armed (`wc`, i.e. every desktop boot, unless `UNAOS_NOPACE=1`), `SYS_WIN_PRESENT` and
+// `SYS_WIN_PRESENT_ROWS` now SLEEP the caller to the panel's 16667 µs frame boundary before compositing.
+//
+// That is a different thing from an fps target in this program, and the distinction is the reason the
+// clause below is amended rather than deleted. An fps target is a TUNING CONSTANT: it has to be guessed,
+// it is wrong on the next panel, and it has to be re-guessed in every program that ever opens a window —
+// and this program still has none, which is why it needed no change at all for the pacer to work. What
+// the kernel added is the PANEL'S PHYSICS: the beam publishes one frame every 16667 µs, so a second
+// present inside that interval is composited, paid for, and overwritten before anyone can see it. That
+// fact is known on the side of the seam that owns the panel and is identical for every client, so it
+// belongs there and nowhere else.
+//
+// Consequences for anyone reading this loop: on a paced x86 boot the loop's rate converges to ~60/s with
+// no code here doing anything about it, `[wcn] gap` collapses onto 16..17 ms (which the WC-N watch-list
+// used to call a finding and now calls the healthy signature there), and the VUGFPS overlay reads ~60
+// rather than the 55.8–100.5 scatter Boot AO measured. aarch64 is untouched — the Pi's plateau was and
+// remains the barrier story below, which is a different mechanism with a different fix.
+//
 // VUG-PACE — A VUG RUNS AT THE MACHINE'S SPEED, NOT THE SCHEDULER'S. P73: "there's a delay to a vug
 // speeding up when it's the only one running", and "vug still wants to go back to what it thinks its fps is
 // supposed to be even though it could run faster". There is no fps target in this program and never has
-// been — no sleep, no frame budget, no throttle, and none in the kernel's present path either. The plateau
+// been — no sleep, no frame budget, no throttle, and (see VSYNC-PACE above) none in the kernel's present
+// path either until GR22 put the PANEL's cadence there on x86. The plateau
 // was the FRAME BARRIER parking on its first pass: a park costs a wake plus a dispatch, dispatch latency
 // belongs to the run queue rather than to the spare CPU, and two arrivals per frame put two of those round
 // trips under every healthy frame. A floor made of dispatch latency does not fall when the machine empties

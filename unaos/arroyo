@@ -374,6 +374,15 @@ _feats=""
 # Needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach the activation seam.
 # Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_WC:-}" ] && _feats="${_feats}wc,"
+# VSYNC-PACE: UNAOS_NOPACE=1 DISABLES the kernel-side present pacer (`nopace`). The pacer is DEFAULT ON
+# under `wc`: `SYS_WIN_PRESENT`/`SYS_WIN_PRESENT_ROWS` sleep the caller to the panel's 16667 µs frame, so
+# a ring-3 program converges to ~60 presents/s with no app change and the cycles above that rate go back
+# to the fleet. Set this to restore the UNPACED path the bench instruments were calibrated against —
+# `[wc-g]`/`[wc-d]`/`[wcn]` rate figures from GR16-GR21 are headroom measurements and are not comparable
+# with a paced boot. Knob set => not one byte of pacer code is linked. The pacer's own witness is
+# `[wpace]` (needs UNAOS_WITNESS). Stripped from aarch64 by `arm_features` below.
+# Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_NOPACE:-}" ] && _feats="${_feats}nopace,"
 # INSTGUI: UNAOS_INSTGUI=1 opens the graphical installer dialog on the wc desktop (implies wc).
 [ -n "${UNAOS_INSTGUI:-}" ] && _feats="${_feats}instgui,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
@@ -597,6 +606,13 @@ arm_features() {
     # stripped (it predates this policy and the Pi/Jetson media hashes are already computed with it
     # present), so stripping `bt` alone is the whole delta.
     f="${f//,bt,/,}"
+    # VSYNC-PACE (GR22) rides the same strip, for the same reason: every line `nopace` gates lives in
+    # `arch/x86_64/syscall.rs` and is additionally `wc`-gated (an x86-only feature), so `nopace` emits not
+    # one byte of aarch64 CODE — but an enabled feature is hashed into cargo's `-Cmetadata` fingerprint, so
+    # leaving it in would shift every aarch64 media hash between a default build and a `UNAOS_NOPACE=1` one
+    # for zero observable change. Stripped => the x86 track can arm (or disarm) the present pacer without
+    # touching Pi or Jetson media at all.
+    f="${f//,nopace,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -1332,6 +1348,20 @@ KERNEL_CFG_MATRIX=(
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
   # (the QEMU-virt virtio-net driver, which carries no board gate of its own and so type-checks here).
   "arm-tegra   ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet"
+  # VSYNC-PACE (GR22) — x86, compositor ON, present pacer OFF. A leg of its own, and the reason is a hole
+  # `nopace` gates nothing unless `wc` is also set (the pacer lives inside the `wc` half of
+  # `arch/x86_64/syscall.rs`), so `wc` OFF + `nopace` ON type-checks the same empty set the default legs
+  # already do. REVIEW C3 CORRECTION: an earlier version of this comment claimed the pairwise-mix legs
+  # "never guarantee a leg with BOTH ON" and that wc+nopace "would have been compiled by nothing". That
+  # is FALSE — the reviewer reconstructed `build_cfg_legs` against the post-arc Cargo.toml and found
+  # `x86-mix-1` (wc+nopace, witness off) and `x86-mix-2` (wc+nopace+witness) already cover it. This leg
+  # is kept as explicit belt-and-braces, named rather than derived, because the mix legs are
+  # INDEX-DERIVED from `[features]` order: adding `nopace` (N 47->48) reshuffled all eight of them, so
+  # any claim of the form "config X is covered by x86-mix-N" is stale the moment a feature is added.
+  # `x86-all` deliberately does NOT carry `nopace`:
+  # it is the shipped-desktop leg and must keep the pacer's ARMED polarity under type-check. This leg is
+  # the disarmed twin, and between them both polarities of every `#[cfg]` in the family are compiled.
+  "x86-nopace  ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,wc,witness,nopace,ehcihid,smolnet"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

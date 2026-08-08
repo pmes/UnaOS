@@ -5030,6 +5030,11 @@ spread — are bench readings.
 
 * **`gapmin == gapmax` on a busy vug is the finding.** It would mean the rate is paced, not earned,
   and the next question is by what — the present syscall, the drain barrier, or the app's own loop.
+  **Amended by VSYNC-PACE (GR22), x86 only.** On a `wc` boot without `UNAOS_NOPACE=1` the answer to
+  "by what" is now *known*: the present syscall, deliberately. A collapse onto `gap=16..17ms` with
+  `rate≈60/s` is the pacer working and is the HEALTHY signature there, not a finding. The rule keeps
+  its full original force on aarch64, on every `UNAOS_NOPACE=1` boot, and for any collapse onto a
+  value that is **not** the panel frame — a vug pinned at 30.7/s is still somebody else's ceiling.
 * **`comp` far above `att` across the fleet** means the tiling has the windows overlapping enough that
   every present costs several blits. That is a placement problem wearing a performance costume.
 * **`aborted` climbing** is the F4 drain barrier eating passes under load — presents that cost a
@@ -5038,6 +5043,117 @@ spread — are bench readings.
   mean presents are reaching `composite` and the blit loop is never drawing them.
 * **`parked` large while the operator says the vug looks frozen** is the good outcome — it says the
   vug is in VUGPAUSE-2's idle and is waiting for input, not starved.
+
+---
+
+### VSYNC-PACE — presents are paced to the panel, in the kernel (x86)
+
+**P, Boots AL/AN/AO.** *"they are not all running the same fps … fall back to their predetermined
+fps"* / *"fps still all over"*. Boot AO's eight vugs ran **55.8–100.5 presents/s** each, every one of
+them `parked=0`, `comp == att`, on a panel whose `[wc-h]` frame is `frame_us=16667`.
+
+The NTHREAD=8 cliff that explained the earlier 4x split is fixed and AO shows 8/8 with workers, so
+what remains is dispatch-latency and load variance — real physics. Two things follow, and together
+they are the whole arc:
+
+1. **Nothing above the panel rate is ever seen.** The compositor treats 16667 µs as the frame. A
+   present landing inside a frame another present already claimed is composited, charged to the CPU,
+   and overwritten before the beam reaches it. A vug at 100/s spends ~40% of its render budget on
+   pixels no operator can observe.
+2. **The spread *is* the complaint.** Clamping the top removes its visible half: every vug with
+   headroom lands on the same number, and the ones genuinely short of a frame's work are the only
+   ones left below it — which is the honest picture rather than a flattened one.
+
+#### The mechanism
+
+`SYS_WIN_PRESENT(30)` and `SYS_WIN_PRESENT_ROWS(33)` **sleep the caller** to the presenting window's
+next frame boundary, then composite normally. Per window, in `arch/x86_64/syscall.rs`:
+
+| piece | what it does |
+|---|---|
+| `WIN_PACE_DUE_US[id]` | µs deadline of the next frame this window may present on; `0` = no cadence |
+| `present_pace(slot,id)` | before the lock: sleeps `floor((due−now)/1000)` ms if the window is early |
+| `pace_advance(id)` | inside the ownership-checked block: `due += 16667`, resyncing to *now* if more than a frame late |
+| `SLOT_FOCUS_SEQ[slot]` | bumped on focus arrival — the next present from that slot's windows is exempt |
+
+Four properties are load-bearing and each is a refutation the design had to survive:
+
+* **Sleep, not refuse.** A `Deferred` return would send the client straight back round its loop, so a
+  refusal converts wasted composites into a wasted spin and frees no CPU at all. Only sleeping hands
+  the cycles back, and the caller BLOCKS, so the core is released rather than spun.
+* **Never under the lock.** The sleep happens before `WINDOWS` is taken, and the `[wpace]` emit after
+  it is released — PRESSURE-1's rule, for PRESSURE-1's reason. The deadline is advanced *inside* the
+  guarded block, so no slot can push another slot's window into the future.
+* **Latency is bounded at one frame**, which is what "vsync" means, and it is bounded *by
+  construction*: the deadline can never sit more than one frame ahead, and a reading that somehow
+  does is treated as stale and not slept on.
+* **Input is exempt.** The first present after a focus arrival skips the pacer entirely and restarts
+  the cadence from that instant. A frame of added latency reads as smoothness in a render loop and as
+  sluggishness in the frame that answers the operator, so the one edge where it is not acceptable is
+  carved out. The exemption is per-slot and lock-free precisely because `user_input_set_active` runs
+  on the input path, where taking the outermost compositor lock would invent a lock edge.
+
+**Zero app changes.** `user-vug` is not recompiled by this arc; its existing loop converges on its
+own. That was the design test: a per-app fps target has to be guessed, is wrong on the next panel, and
+has to be re-guessed in every program that opens a window. The panel's frame interval is not a
+constant of that kind — it is the machine's physics, known on the side of the seam that owns the
+panel, and identical for every client.
+
+#### Gating, and the knob
+
+Compiled only under `wc`, so every headless gate and every non-compositor boot runs the pre-arc
+present path exactly — which is what keeps the fixture batteries, whose ring-3 witnesses present in
+tight bounded loops, unperturbed. aarch64 is untouched: nothing here leaves `arch/x86_64/`, and
+`arroyo`'s `arm_features` strips `nopace` so Pi and Jetson media stay byte-identical either way.
+
+`UNAOS_NOPACE=1` **disables** the pacer. The negative polarity is deliberate: a desktop that renders
+frames the panel cannot scan out is burning CPU for nothing, so waste-free is the right default and an
+opt-in knob would leave the shipped configuration the wasteful one. What the hatch is *for* is the
+archive — `[wc-g]`, `[wc-d]`, `[wcn]` and `[vugmin]` were calibrated against an unpaced path, and
+their GR16–GR21 rate figures are *headroom* measurements ("how fast can this fleet present"), a
+question the pacer answers by fiat. `UNAOS_NOPACE=1` restores that measurement mode exactly.
+
+#### `[wpace]` — the pacer's own witness
+
+A pacer that acts silently is unfalsifiable: "the fps converged" and "the vugs happened to slow down"
+produce the same `[wcn]` line. `[wpace]` reports the pacer's own actions, on `[wcn]`'s cadence and in
+`[wcn]`'s shape (5 s period, one compare-exchange claim, per-window lines plus an aggregate,
+dirty-paced so an idle desktop is silent). `witness`-gated, like every other window witness.
+
+```
+[wpace] win=<id> pres=<n> paced=<n> slept=<n>ms rate=<x.y>/s frame_us=16667
+[wpace] rollup wins=<n> pres=<n> paced=<n> slept=<n>ms focus=<n> resync=<n>
+        rate=<x.y>/s span=<n>ms -> <PACING|HEADROOM>
+```
+
+`paced` is presents this pacer delayed; `slept` the ms it delayed them by; `focus` the input-latency
+exemptions taken; `resync` the cadence restarts caused by a client that could not keep up. The
+verdict names what the block **proves**: `PACING` means real presents were delayed; `HEADROOM` means
+presents arrived and none needed delaying — a correct outcome on a loaded machine, and **not**
+evidence the pacer works.
+
+**How to falsify the arc from one block:**
+
+* `paced=0` everywhere while `[wcn] rate=` sits above 60/s — the pacer is not firing, and any
+  convergence is somebody else's;
+* `slept` summing to far less than `paced × 16` — the sleeps are being cut short (uncalibrated tick,
+  or `sleep_ms` returning early);
+* `resync` climbing with `paced` near zero — the fleet is *below* the panel rate and the pacer is a
+  no-op; must not be read as convergence;
+* `focus=0` across a session with focus changes — the input-latency exemption is dead code.
+
+#### Metal watch-list (VSYNC-PACE)
+
+* **The prediction**: eight vugs converge to `[wcn] rate≈60/s` with `gap=16..17ms`, `[wpace] ->
+  PACING`, and `SCHED: load` falling by roughly the fraction of presents removed.
+* **The refutes**: a vug that was *below* 60/s before the arc must not read slower after it (the
+  pacer only ever delays a window that is early — if a slow window slows further, the deadline
+  arithmetic is wrong, most likely the resync); and the first frame after a focus change must not be
+  delayed (`[wpace] focus=` must advance whenever the operator TABs).
+* **`BPACE gui=` is boot-time**, emitted before the desktop exists, so it must be *unaffected*. A
+  moved `gui` total on a paced boot is a finding about the arc's blast radius, not about the panel.
+* **Do not compare a paced boot's `[wcn]`/`[wc-g]` rates with a pre-GR22 capture.** Re-take the
+  baseline with `UNAOS_NOPACE=1` or the comparison is between two different questions.
 
 ---
 
@@ -7634,3 +7750,30 @@ awk '/PULSE-A: first-window c7|SCHED-X86 PLACE|schedx86. load/' <log>
 `svc=cN` names the core, `first-window cN busy/idle=B/I` is the event ratio PULSE draws, and the
 `[schedx86] load cN=` on the neighbouring lines is the time ratio. Nothing about PULSEFLUID changes any of
 this: the app reads the same feed with the same rule, five times more often.
+### VSYNC-PACE — what the pacer changed about READING the other instruments (review C5/C6)
+
+The pacer sleeps ring-3 callers to the panel boundary inside `SYS_WIN_PRESENT`/`_ROWS`. Four
+readings shift meaning, and one source is named for the follow-up:
+
+- **`[wpace] pres=` / `rate=` is not a glass rate.** It is incremented from `pace_advance`, which
+  runs *before* `wc_shim::present`, so it counts SUPPRESSED presents too. Consistent with
+  `FB_PRESENT_COUNT`, but do not read it as frames that reached the panel.
+- **`[wcn] active_ms` no longer means "the window was busy".** `wcn_note_present` folds any
+  inter-present gap under `WCN_PARK_GAP_MS` into `active_ms`, and the pacer's sleep happens
+  *before* `wm` is entered — so the sleep is booked as active time. A paced vug idle 40% of each
+  frame still reads `active≈5000ms parked=0ms` over a 5 s rollup.
+- **`[vugmin] presents_skipped` drops ~17x** for a hidden-but-presenting app: the pacer caps its
+  arrival rate at ~58/s before PRESSURE-1's charge ever applies.
+- **The kernel-side composite path is NOT paced.** The console/fbcon, `x86_render_service` and the
+  WINX fixtures call `wm` directly, never through the syscall — so the shell window and every
+  kernel witness composite run unpaced. Only ring-3 apps are paced.
+- **`resync` is aggregate-dominated by slow clients.** Any app below the panel rate takes the
+  resync branch on every present (PULSE at 20 Hz contributes ~100 per 5 s rollup by itself), so the
+  rule "resync climbing with paced near zero means HEADROOM" stops discriminating once a slow app
+  is live. Read `resync` per-window, not from the rollup.
+- **The 16667 µs constant is right on this panel, and a real source exists for the day it isn't.**
+  The bench EDID reads `native=2880x1800 pclk_khz=337750`, i.e. ≈59.99 Hz, frame ≈16669 µs — 0.01%
+  from the constant. `video::edid_block()` and `init_edid`'s detailed-timing parse already carry
+  the pixel clock and actives and are NOT witness-gated; deriving `frame_us` needs only hblank and
+  vblank from the same 18 bytes. That is the follow-up the day a non-60 Hz panel or a modeset
+  arrives — today x86 drives exactly one mode, inherited from firmware.
