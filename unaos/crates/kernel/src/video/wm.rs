@@ -963,6 +963,38 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>) -> Presented {
 /// Returns `false` if `id` names no live window, or if the framebuffer is not ready (nothing sane to
 /// clamp against).
 pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
+    !matches!(move_to_inner(id, None, x, y), Moved::NoRow)
+}
+
+/// WMDIRECT — the outcome of a [`move_to_inner`], carrying what the row ACTUALLY ended up at.
+///
+/// The clamped origin is a return value and not something the caller can re-derive, because the
+/// clamp is a function of the row's `scale` and the live panel — both read under the same lock the
+/// move happens in. A caller that guessed would be guessing about a window it does not own.
+#[derive(Clone, Copy)]
+enum Moved {
+    /// No live row of that id, no row with the expected OWNER, or no ready framebuffer.
+    NoRow,
+    /// The row is at `(x, y)` after clamping; `changed` is whether its outer box actually moved.
+    Placed { x: usize, y: usize, changed: bool },
+}
+
+/// WMDIRECT — [`move_to`] with an OWNER EXPECTATION, re-tested inside the table critical section
+/// that performs the move.
+///
+/// ### The TOCTOU this closes, which is not hypothetical
+/// Window ids are RECYCLED SLOT ALIASES with no generation counter (`create_inner`: `let id = (slot
+/// + 1) as WinId`, and its own comment says so). A caller that validates a row, drops the guard and
+/// then calls a mover keyed on ID ALONE has a window in which another core can `close` that row and
+/// `create` a new one into the same slot — and the mover will then relocate, clamp and PIN a
+/// STRANGER'S window. The gap is not instruction-sized either: it spans a `WRITER` acquisition.
+///
+/// `drag_motion` is exactly that caller, so the expectation travels WITH the request and is checked
+/// where the mutation happens rather than before it. `None` means "any owner" and is what every
+/// pre-existing caller passes through [`move_to`] — an app moving its own window has already been
+/// through the syscall layer's ownership gate, and the kernel's own movers (`place`, the console)
+/// name rows they minted.
+fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Moved {
     // WEDGE-1r2 `<D1>`/`<d1>` — a barrier-raising path begins, BEFORE the `WRITER`/`TABLE`
     // acquisitions that stand between here and `DrainBarrier::drain`. See the ledger block above
     // `DrainBarrier`: this is the region WEDGE-1's in-spin tripwire cannot report on, because a core
@@ -975,14 +1007,18 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
     // lock while touching `WRITER`, so keeping WRITER-then-TABLE strictly non-overlapping here is
     // what makes the two orders unable to interleave into a cycle.
     if !fb.is_ready() {
-        return false;
+        return Moved::NoRow;
     }
     let info = fb.info();
 
+    let mut placed = Moved::NoRow;
     let vacated = {
         let mut t = table();
+        // WMDIRECT — the owner test is HERE, inside the critical section that mutates the row, and
+        // not at the caller. See this function's doc block: between a caller's check and this lock
+        // the slot can be closed and re-issued, and an id alone cannot tell the two tenants apart.
         match row_mut(&mut t, id) {
-            Some(r) => {
+            Some(r) if expect_owner.is_none_or(|o| r.owner_asid == o) => {
                 let before = outer_box(r);
                 // Largest origin that keeps the whole window (content + chrome) on the panel; falls back
                 // to the minimum when the window is wider/taller than the panel.
@@ -997,9 +1033,17 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
                 r.y = y.clamp(TITLE_H + BORDER, max_y);
                 r.pinned = true;
                 r.damage_all();
-                if outer_box(r) == before { None } else { Some(before) }
+                let changed = outer_box(r) != before;
+                // WMDIRECT — report the CLAMPED origin, not the requested one. A drag against a
+                // panel edge asks for an origin the clamp refuses on every report; a caller that
+                // cached its own request would never see its cheap-skip hit and would take a table
+                // lock, a `damage_all` and a composite for each one, while counting moves that did
+                // not happen.
+                placed = Moved::Placed { x: r.x, y: r.y, changed };
+                if changed { Some(before) } else { None }
             }
-            None => return false,
+            // No such row, or a row that now belongs to somebody else — the slot was recycled.
+            _ => return Moved::NoRow,
         }
     };
     // FOCUS-VIS — a move VACATES its old box, and nothing was repainting it. The compositor draws
@@ -1040,7 +1084,7 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
         super::cursor::repaint();
         composite();
     }
-    true
+    placed
 }
 
 /// Close `id`, freeing its table row. The surface itself belongs to the owner's address space and is
@@ -1055,6 +1099,10 @@ pub fn close(id: WinId) -> bool {
     // not be threaded into the death chain the token opens.
     #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
     paygo_at_close(id);
+    // WMDIRECT — the drag does not survive the window. Ahead of the row free (and of the WEDGE
+    // token) so the gesture is cancelled while the id still means something; after this point the
+    // slot may be re-issued and a live drag would be steering a stranger's window.
+    drag_forget(id);
     // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`. `close` reaches its barrier through a `TABLE` critical
     // section, so the token has to precede the lock to cover the death that happens ON it.
     crate::wedge2::mark_composite("<D1>", "<d1>");
@@ -1104,6 +1152,9 @@ pub fn close_owner(owner_asid: u64) -> usize {
     // task exit, most of them owning no window), which is why the chain gate is what makes the token
     // affordable here at all.
     crate::wedge2::mark_composite("<D1>", "<d1>");
+    // WMDIRECT — see `close`. Keyed on the OWNER here because this path clears every row the ASID
+    // holds under one lock and no longer knows their ids by the time it returns.
+    drag_forget_owner(owner_asid);
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut n = 0;
     {
@@ -6739,6 +6790,324 @@ pub fn close_box_hit(id: WinId, x: i32, y: i32) -> bool {
         Some((cx, cy, s)) => px >= cx && px < cx + s && py >= cy && py < cy + s,
         None => false,
     }
+}
+
+// ---- WMDIRECT: chrome geometry as a ROUTING question -------------------------------------------
+//
+// **The routing rule, in one sentence:** a press on a window's kernel-drawn CHROME (title strip,
+// borders, close box) is an instruction to the WINDOW SYSTEM and is consumed by it, while a press
+// anywhere on the window's CONTENT is the app's own input and is delivered to its owner — so the WM
+// can never starve an app of a click it could have handled, and an app can never lock the WM out of
+// the furniture it does not own.
+//
+// The rule is total and it is a pure function of geometry: `outer_box` minus `content_box` IS the
+// chrome, and the app's surface does not cover one pixel of it. Nothing here is a policy the app can
+// influence, so there is no state in which the two answers can both be "mine".
+
+/// WMDIRECT — the CONTENT rectangle of `r` in panel pixels: exactly the region [`paint_window`]
+/// blits the owner's surface into. Complementary to [`outer_box`] by construction (the same
+/// `w * scale` / `h * scale` product), which is what makes "outer minus content" an exact partition
+/// with no seam a click can fall into.
+fn content_box(r: &Window) -> (usize, usize, usize, usize) {
+    (
+        r.x,
+        r.y,
+        r.w.saturating_mul(r.scale),
+        r.h.saturating_mul(r.scale),
+    )
+}
+
+fn in_box(px: usize, py: usize, b: (usize, usize, usize, usize)) -> bool {
+    px >= b.0 && py >= b.1 && px < b.0.saturating_add(b.2) && py < b.1.saturating_add(b.3)
+}
+
+/// WMDIRECT — is panel point `(x, y)` on window `id`'s kernel CHROME rather than on its content?
+///
+/// The router's first question after [`hit_test`] has named `id`. `true` means the window system
+/// owns this press; `false` means the app does. Declines COMPAT rows outright: `outer_box` and
+/// `content_box` are the same rect there (the `present_surface` shim draws no chrome), so the
+/// difference is empty and a full-screen app keeps every pixel of its own panel — which is the
+/// half of the rule that stops the WM locking a full-screen app out of its clicks.
+pub fn chrome_hit(id: WinId, x: i32, y: i32) -> bool {
+    if x < 0 || y < 0 {
+        return false;
+    }
+    let (px, py) = (x as usize, y as usize);
+    let t = table();
+    match row(&t, id) {
+        Some(r) if !r.compat => in_box(px, py, outer_box(r)) && !in_box(px, py, content_box(r)),
+        _ => false,
+    }
+}
+
+/// WMDIRECT — is panel point `(x, y)` on window `id`'s TITLE STRIP (the drag handle)?
+///
+/// The strip is the [`TITLE_H`] band between the top border and the content, inset by [`BORDER`] on
+/// both sides — the same rect [`draw_title`] writes into. The CLOSE BOX is deliberately excluded
+/// here rather than left to caller ordering: the box lives inside the strip, and a drag that could
+/// begin on the close control would make "press the close box and twitch" mean move-instead-of-close.
+/// The two controls are disjoint at this layer, so no caller can get their precedence wrong.
+pub fn title_bar_hit(id: WinId, x: i32, y: i32) -> bool {
+    if x < 0 || y < 0 {
+        return false;
+    }
+    let (px, py) = (x as usize, y as usize);
+    let t = table();
+    let Some(r) = row(&t, id) else { return false };
+    if r.compat {
+        return false;
+    }
+    let (bx, by, bw, _bh) = outer_box(r);
+    let strip = (
+        bx.saturating_add(BORDER),
+        by.saturating_add(BORDER),
+        bw.saturating_sub(2 * BORDER),
+        TITLE_H,
+    );
+    if !in_box(px, py, strip) {
+        return false;
+    }
+    match close_box(r) {
+        Some((cx, cy, s)) => !(px >= cx && px < cx + s && py >= cy && py < cy + s),
+        None => true,
+    }
+}
+
+// ---- WMDIRECT: the drag ------------------------------------------------------------------------
+//
+// ONE drag at a time, because there is one pointer. The state is four atomics and no lock: a drag is
+// (window id, owner asid, grab offset), and every one of them is re-validated on every motion — the
+// drag never holds a handle to a row, only a NAME for one. That is what makes a window killed
+// mid-drag safe rather than a use-after-free: the next motion looks the id up, fails to find it (or
+// finds a DIFFERENT owner in a recycled slot), and ends the drag.
+
+/// WMDIRECT — the window currently being dragged, or [`WIN_NONE`].
+static DRAG_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
+/// WMDIRECT — the owner ASID the drag was started against. A table row is a recyclable slot: the
+/// window can die and the id be re-issued to a different program between two motion reports, and
+/// then a live drag would be steering a stranger's window. The owner is the identity half of the
+/// name, and it is checked on every motion.
+static DRAG_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WMDIRECT — grab offset: pointer position MINUS the window's content origin at press time, so the
+/// window keeps the same point under the hand for the whole gesture (a drag that snapped the origin
+/// to the cursor would make every grab jump the window to put its corner under the pointer).
+static DRAG_OFF_X: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+static DRAG_OFF_Y: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+/// WMDIRECT — the last origin this drag actually applied, so an unchanged motion costs one compare
+/// instead of a `move_to` (a table lock, a whole-box damage and a composite).
+static DRAG_LAST_X: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(i64::MIN);
+static DRAG_LAST_Y: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(i64::MIN);
+/// WMDIRECT — motions applied in the current drag, for the `end` witness line.
+static DRAG_MOVES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WMDIRECT — `[wm-act]` lines emitted, against [`WM_ACT_LOG_MAX`]. The begin/end/close lines are
+/// human-rate by construction (a hand cannot grab faster than serial can print), but the CANCEL arm
+/// is driven by motion reports and a pathological state could reach it at HID rate, so the whole
+/// vocabulary shares one bounded budget rather than trusting the shape of any one arm.
+static WM_ACT_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const WM_ACT_LOG_MAX: u64 = 256;
+
+/// WMDIRECT — the bounded `[wm-act]` witness. A desktop interaction that leaves no trace cannot be
+/// debugged from a capture, so every gesture that changes window state names itself, its window and
+/// its outcome on exactly one line.
+fn wm_act(action: &str, id: WinId, owner: u64, outcome: &str, x: i64, y: i64) {
+    use core::sync::atomic::Ordering;
+    if WM_ACT_LOG.fetch_add(1, Ordering::Relaxed) >= WM_ACT_LOG_MAX {
+        return;
+    }
+    serial_println!(
+        "[wm-act] {} win={} owner={:#x} at ({},{}) -> {}",
+        action, id, owner, x, y, outcome
+    );
+}
+
+/// WMDIRECT — the window a drag is currently steering, or [`WIN_NONE`].
+pub fn drag_active() -> WinId {
+    DRAG_WIN.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// WMDIRECT — **begin a title-bar drag of `id` grabbed at panel point `(x, y)`.**
+///
+/// Returns `false` (and starts nothing) for a dead id, a compat row, or a point that is not on the
+/// row's title strip — so a caller cannot mint a drag out of a press the geometry does not support.
+/// Idempotent in the direction that matters: a second `begin` replaces the first, because there is
+/// one pointer and the previous gesture can only be stale.
+///
+/// Locks: takes [`TABLE`] to read the row's origin and releases it before returning. No composite,
+/// no sleep, nothing nested — the press itself moves no pixels, so a grab costs one lock and six
+/// relaxed stores.
+pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
+    use core::sync::atomic::Ordering;
+    if !title_bar_hit(id, x, y) {
+        return false;
+    }
+    let (owner, ox, oy) = {
+        let t = table();
+        match row(&t, id) {
+            Some(r) if !r.compat => (r.owner_asid, r.x as i64, r.y as i64),
+            _ => return false,
+        }
+    };
+    DRAG_OFF_X.store(x as i64 - ox, Ordering::Relaxed);
+    DRAG_OFF_Y.store(y as i64 - oy, Ordering::Relaxed);
+    DRAG_LAST_X.store(ox, Ordering::Relaxed);
+    DRAG_LAST_Y.store(oy, Ordering::Relaxed);
+    DRAG_MOVES.store(0, Ordering::Relaxed);
+    DRAG_OWNER.store(owner, Ordering::Release);
+    // Published LAST: `DRAG_WIN` is the flag every other entry point tests, so it must not become
+    // visible before the offsets a concurrent motion would read through it.
+    DRAG_WIN.store(id, Ordering::Release);
+    wm_act("drag-begin", id, owner, "grabbed", x as i64, y as i64);
+    true
+}
+
+/// WMDIRECT — **steer the live drag to panel point `(x, y)`.** Returns `true` iff the window moved.
+///
+/// Cheap and total when no drag is live: one acquire load and a return, which is what makes it safe
+/// to call from the pointer path on every motion report.
+///
+/// ### A window killed mid-drag cannot leave the WM dragging a dead row
+/// Three independent guards, in order, and the drag ENDS (rather than merely skipping) on each:
+///  1. [`drag_forget`] is called by [`close`] and [`close_owner`], so the ordinary teardown paths —
+///     the close box, a `kill`, and a task exit — cancel the drag as part of freeing the row.
+///  2. If the id no longer names a live row, this cancels. That covers any teardown that ever
+///     forgets to call (1).
+///  3. If the id names a live row whose OWNER differs, this cancels. That covers the recycle: the
+///     slot was freed and re-issued to a different program while the hand was still down, and
+///     steering it would be moving a stranger's window.
+///
+/// Locks: reads the row under [`TABLE`] and RELEASES the guard before calling [`move_to`], which
+/// takes `WRITER` then `TABLE` for itself and composites. No lock is held across the composite pass.
+pub fn drag_motion(x: i32, y: i32) -> bool {
+    use core::sync::atomic::Ordering;
+    let id = DRAG_WIN.load(Ordering::Acquire);
+    if id == WIN_NONE {
+        return false;
+    }
+    let want = DRAG_OWNER.load(Ordering::Acquire);
+    // A cheap PRE-FILTER, and deliberately only that. It ends the drag promptly on a row that is
+    // already gone, but it is NOT the safety property: the guard is dropped before the move, and an
+    // id is a recyclable slot alias, so between here and the mutation the slot can be closed and
+    // re-issued. The expectation therefore travels INTO the mover and is re-tested under the lock
+    // that moves the row — see `move_to_inner`. Without that, the check below is a TOCTOU and the
+    // drag can relocate and PIN a stranger's window.
+    let live = {
+        let t = table();
+        row(&t, id).map(|r| (r.owner_asid, r.compat))
+    };
+    match live {
+        Some((owner, false)) if owner == want => {}
+        _ => {
+            // The row died or was recycled under the hand — guards (2) and (3).
+            drag_cancel("row-gone");
+            return false;
+        }
+    }
+    let nx = (x as i64 - DRAG_OFF_X.load(Ordering::Relaxed)).max(0);
+    let ny = (y as i64 - DRAG_OFF_Y.load(Ordering::Relaxed)).max(0);
+    if nx == DRAG_LAST_X.load(Ordering::Relaxed) && ny == DRAG_LAST_Y.load(Ordering::Relaxed) {
+        return false; // no pixel would change; skip the lock, the damage and the composite.
+    }
+    // `move_to_inner` clamps the origin to the live panel, marks the row PINNED, erases the VACATED
+    // box, re-damages what the erase reached and asks the desktop for a full present — the
+    // MOVE-VACATE cure, already in that function and deliberately not duplicated here.
+    match move_to_inner(id, Some(want), nx as usize, ny as usize) {
+        Moved::NoRow => {
+            // The owner test FAILED INSIDE THE LOCK: the slot was recycled in the gap above. The
+            // window was not moved, and this is the arm that proves the pre-filter is not the guard.
+            drag_cancel("row-recycled");
+            false
+        }
+        Moved::Placed { x: ax, y: ay, changed } => {
+            // Cache what the panel ACTUALLY took, not what was asked for. A drag pushed against an
+            // edge asks for a refused origin on every report; caching the request would defeat the
+            // cheap-skip above and pay a lock, a `damage_all` and a composite for each one.
+            DRAG_LAST_X.store(ax as i64, Ordering::Relaxed);
+            DRAG_LAST_Y.store(ay as i64, Ordering::Relaxed);
+            if changed {
+                DRAG_MOVES.fetch_add(1, Ordering::Relaxed);
+            }
+            changed
+        }
+    }
+}
+
+/// WMDIRECT — end the live drag, if any. Returns the window that was being dragged.
+pub fn drag_end() -> WinId {
+    use core::sync::atomic::Ordering;
+    let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel);
+    if id != WIN_NONE {
+        let owner = DRAG_OWNER.swap(0, Ordering::AcqRel);
+        let n = DRAG_MOVES.swap(0, Ordering::Relaxed);
+        let (x, y) = (
+            DRAG_LAST_X.load(Ordering::Relaxed),
+            DRAG_LAST_Y.load(Ordering::Relaxed),
+        );
+        if n == 0 {
+            wm_act("drag-end", id, owner, "no-move", x, y);
+        } else {
+            wm_act("drag-end", id, owner, "placed", x, y);
+        }
+    }
+    id
+}
+
+/// WMDIRECT — abandon the live drag with a named reason. Same clearing as [`drag_end`]; the
+/// distinct witness verb is what lets a capture tell "the operator let go" from "the window went
+/// away under the hand".
+fn drag_cancel(why: &str) {
+    use core::sync::atomic::Ordering;
+    let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel);
+    if id != WIN_NONE {
+        let owner = DRAG_OWNER.swap(0, Ordering::AcqRel);
+        DRAG_MOVES.store(0, Ordering::Relaxed);
+        wm_act(
+            "drag-cancel",
+            id,
+            owner,
+            why,
+            DRAG_LAST_X.load(Ordering::Relaxed),
+            DRAG_LAST_Y.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// WMDIRECT — **the drag does not survive the window.** Called by [`close`] and [`close_owner`]
+/// while (or immediately after) the row is freed, so the teardown itself is what cancels the
+/// gesture rather than the next motion report noticing.
+///
+/// A load and a compare when no drag is live, which is every call on a boot where nobody dragged
+/// anything — including every call on aarch64, whose router never begins one.
+pub fn drag_forget(id: WinId) {
+    use core::sync::atomic::Ordering;
+    if id != WIN_NONE && DRAG_WIN.load(Ordering::Acquire) == id {
+        drag_cancel("closed");
+    }
+}
+
+/// WMDIRECT — cancel a drag of any window owned by `owner_asid`. The [`close_owner`] twin of
+/// [`drag_forget`]: that path frees every row an ASID holds at once and clears them before it can
+/// report their ids, so the cancellation is keyed on the owner instead.
+pub fn drag_forget_owner(owner_asid: u64) {
+    use core::sync::atomic::Ordering;
+    if owner_asid != 0
+        && DRAG_WIN.load(Ordering::Acquire) != WIN_NONE
+        && DRAG_OWNER.load(Ordering::Acquire) == owner_asid
+    {
+        drag_cancel("owner-closed");
+    }
+}
+
+/// WMDIRECT — a user-placed window is PINNED and the tiler leaves it alone; report whether `id` is.
+///
+/// **The layout decision, stated once:** a window the OPERATOR moved stops being tiled, for good.
+/// [`move_to`] sets `Window::pinned`, and [`place`] skips every pinned row — so a drag is not undone
+/// by the next create or close, and the alternative (re-tile everything and snap the window back) is
+/// rejected because a desktop in which the machine can move a window out from under the hand is not
+/// one an operator can model. The cost is stated too: pinned windows do not compact when their
+/// neighbours close, so a dragged-out desktop stays as the operator arranged it, including its gaps.
+pub fn is_pinned(id: WinId) -> bool {
+    let t = table();
+    row(&t, id).map(|r| r.pinned).unwrap_or(false)
 }
 
 fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)) -> bool {
