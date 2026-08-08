@@ -318,6 +318,22 @@ kbdwit = []
 # aarch64 media stay byte-identical either way. Kept in sync with `unaos/arroyo` AND
 # `unaos/builder/src/main.rs` — a knob wired only in arroyo ships disabled while the banner claims
 # it is on (the s42/INSTGUI and WXN-M3b lesson).
+#
+# BT-L1 (GR22): the same knob now carries the first real command/event round-trips beyond the
+# version read, still strict bring-up (no pairing, no data). Through the armed event endpoint and
+# the existing control path, a small command TABLE runs after the L0 sequence: `HCI_Read_BD_ADDR`
+# (0x1009 — the radio's own MAC/identity), `HCI_Read_Buffer_Size` (0x1005 — ACL/SCO packet length
+# + count), `HCI_Read_Local_Supported_Features` (0x1003 — proves LE from byte-4 bit-6 of the LMP
+# mask rather than inferring it from the 4.0 version), `HCI_Read_Local_Supported_Commands` (0x1002)
+# and finally `HCI_Set_Event_Mask` (0x0C01 — the first WRITE, set to the reset default so it is
+# idempotent and witnessed by its CommandComplete status). Each command witnesses with the
+# `bt-l1:` prefix; a bounded-wait timeout is a clean STOP naming the command, never a hang. The one
+# structural addition is MULTI-PACKET EVENT REASSEMBLY in `bt_hci_command`: the event endpoint's
+# max packet is 16 B but `_Read_Local_Supported_Commands` returns a 70-byte event, so a whole event
+# is now gathered across several interrupt-IN packets (the data toggle advancing on each) before it
+# is parsed — the path L2 (LE scan) needs. No new endpoint is armed (mtfix's slot budget holds),
+# no async, no bulk; every command is a MANDATORY HCI command, so a status=0x01 (Unknown Command)
+# would be the clean-room/patchram boundary and is witnessed as such, not patched around.
 bt = ["ehcihid"]
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
 # path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole

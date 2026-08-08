@@ -587,6 +587,55 @@ const BT_HCI_RESET: u16 = 0x0C03;
 /// opcode 0x1001. Zero parameters; 9 return parameters. Also ROM-level.
 #[cfg(feature = "bt")]
 const BT_HCI_READ_LOCAL_VERSION: u16 = 0x1001;
+/// BT-L1 — `HCI_Read_BD_ADDR`: OGF 0x04 (Informational) / OCF 0x0009 => opcode 0x1009. Zero
+/// parameters; returns status(1) + BD_ADDR(6, little-endian). THE identity read a stack starts
+/// from — the radio's own public device address. Mandatory command, present before any patchram.
+#[cfg(feature = "bt")]
+const BT_HCI_READ_BD_ADDR: u16 = 0x1009;
+/// BT-L1 — `HCI_Read_Buffer_Size`: OGF 0x04 / OCF 0x0005 => opcode 0x1005. Zero parameters;
+/// returns status(1) + HC_ACL_Data_Packet_Length(2) + HC_SCO_Data_Packet_Length(1) +
+/// HC_Total_Num_ACL_Data_Packets(2) + HC_Total_Num_SCO_Data_Packets(2) = 8 return bytes. The
+/// ACL/SCO packet length + count any future data path sizes its flow control from. Mandatory.
+#[cfg(feature = "bt")]
+const BT_HCI_READ_BUFFER_SIZE: u16 = 0x1005;
+/// BT-L1 — `HCI_Read_Local_Supported_Features`: OGF 0x04 / OCF 0x0003 => opcode 0x1003. Zero
+/// parameters; returns status(1) + LMP_Features(8). The "LE Supported (Controller)" bit is
+/// byte 4 bit 6 (mask 0x40; BlueZ `LMP_LE`) and "BR/EDR Not Supported" is byte 4 bit 5 (0x20;
+/// `LMP_NO_BREDR`). L0 read BT 4.0 from the version; this PROVES LE from the feature mask rather
+/// than inferring it from the core spec number. Mandatory.
+#[cfg(feature = "bt")]
+const BT_HCI_READ_LOCAL_FEATURES: u16 = 0x1003;
+/// BT-L1 — `HCI_Read_Local_Supported_Commands`: OGF 0x04 / OCF 0x0002 => opcode 0x1002. Zero
+/// parameters; returns status(1) + Supported_Commands(64) = 65 return bytes. That reply is 70
+/// bytes on the wire (event header 2 + CmdComplete prefix 3 + 65), which at the event endpoint's
+/// 16-byte max packet spans FIVE interrupt-IN transfers — the multi-packet event reassembly this
+/// arc adds to `bt_hci_command`. Mandatory.
+#[cfg(feature = "bt")]
+const BT_HCI_READ_LOCAL_COMMANDS: u16 = 0x1002;
+/// BT-L1 — `HCI_Set_Event_Mask`: OGF 0x03 (Controller & Baseband) / OCF 0x0001 => opcode 0x0C01.
+/// Eight-byte parameter (the event mask); returns status(1). This arc's FIRST write command.
+#[cfg(feature = "bt")]
+const BT_HCI_SET_EVENT_MASK: u16 = 0x0C01;
+/// BT-L1 — the event mask this arc writes: the Bluetooth Core RESET DEFAULT
+/// (0x0000_1FFF_FFFF_FFFF — events through bit 44), little-endian on the wire. Writing the
+/// controller's OWN reset default is the safest possible first write: it re-affirms current state,
+/// so the command is idempotent and cannot disturb bring-up, while still exercising the
+/// CommandComplete write path end to end. The mask is not persistent hardware state (an HCI_Reset
+/// restores it), so nothing is left changed for a later boot.
+#[cfg(feature = "bt")]
+const BT_EVENT_MASK: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x00];
+/// BT-L1 — reassembly cap for one HCI event that spans multiple event-endpoint packets. The event
+/// endpoint's max packet is 16 B (census: `IN1/int/16`), but an HCI event runs up to 2 + 255 B;
+/// the USB transport delivers it as ceil(len/mps) interrupt-IN transfers. 260 covers the largest
+/// defined event (an LE Advertising Report) with headroom, so L2 (LE scan) extends without
+/// resizing. An event whose declared length exceeds this is reported truncated and the reassembler
+/// BREAKS WITHOUT DRAINING the remainder — so the toggle's relationship to the device is lost and the
+/// caller must stop issuing commands, not continue. (Review C2: an earlier comment here claimed the
+/// remainder was drained to keep sync; it is not, and the two `trunc` branches show it. Unreachable
+/// today — the largest possible event is 2+255=257 < 260 — but whoever resizes this cap for L2 must
+/// either add the drain or keep honouring the stop.)
+#[cfg(feature = "bt")]
+const BT_EVT_ASM_MAX: usize = 260;
 /// BT-L0 — HCI event code for Command Complete (Bluetooth Core, Vol 4 Part E).
 #[cfg(feature = "bt")]
 const BT_EVT_CMD_COMPLETE: u8 = 0x0E;
@@ -2591,7 +2640,7 @@ impl Controller {
         // HCI_Reset — OGF 0x03 / OCF 0x0003 => opcode 0x0C03, zero parameters. ROM-level: it
         // answers before any patchram blob is loaded, which is what makes P7 free to test.
         let mut rp = [0u8; 16];
-        match self.bt_hci_command(t, intf, &e, &mut toggle, BT_HCI_RESET, &mut rp) {
+        match self.bt_hci_command(t, intf, &e, &mut toggle, BT_HCI_RESET, &[], &mut rp) {
             Some(n) if n >= 1 => serial_println!(
                 ":: bt-l0: [{}] HCI_Reset (0x0C03) -> CmdComplete status={:#04x} -> {} == witness ::",
                 self.idx, rp[0],
@@ -2615,7 +2664,7 @@ impl Controller {
         // Broadcom is 0x000F. That field cannot be produced by our own code, by a timing
         // artefact, or by a hopeful default — it can only come off the radio.
         let mut rp2 = [0u8; 16];
-        match self.bt_hci_command(t, intf, &e, &mut toggle, BT_HCI_READ_LOCAL_VERSION, &mut rp2) {
+        match self.bt_hci_command(t, intf, &e, &mut toggle, BT_HCI_READ_LOCAL_VERSION, &[], &mut rp2) {
             Some(n) if n >= 9 => {
                 let manufacturer = (rp2[5] as u16) | ((rp2[6] as u16) << 8);
                 let hci_rev = (rp2[2] as u16) | ((rp2[3] as u16) << 8);
@@ -2663,6 +2712,120 @@ impl Controller {
             None => serial_println!(
                 ":: bt-l0: HCI local version — NO-RESPONSE (bounded wait expired) ::"
             ),
+        }
+
+        // ---- BT-L1: the first real command/event round-trips beyond the version read ---------
+        // A small command TABLE, issued in order through the now-armed event endpoint on the same
+        // running toggle. Read-only identity/params first, then the one WRITE (Set_Event_Mask).
+        // Each row: issue, bounded-wait its CommandComplete, decode status + payload, witness with
+        // the `bt-l1:` prefix. A None (bounded wait expired) is a CLEAN STOP naming the command —
+        // the sequence breaks rather than hanging or improvising. L2 (LE scan) extends this table.
+        //
+        // Every command here is a MANDATORY HCI command (present before any Broadcom patchram
+        // `.hcd`), so an "unknown command" status would be a genuine finding, not an expected
+        // firmware gate — it is witnessed as UNKNOWN-CMD and reported, never patched around.
+        let l1: [(u16, &str, &[u8]); 5] = [
+            (BT_HCI_READ_BD_ADDR, "HCI_Read_BD_ADDR", &[]),
+            (BT_HCI_READ_BUFFER_SIZE, "HCI_Read_Buffer_Size", &[]),
+            (BT_HCI_READ_LOCAL_FEATURES, "HCI_Read_Local_Supported_Features", &[]),
+            (BT_HCI_READ_LOCAL_COMMANDS, "HCI_Read_Local_Supported_Commands", &[]),
+            (BT_HCI_SET_EVENT_MASK, "HCI_Set_Event_Mask", &BT_EVENT_MASK),
+        ];
+        for &(opcode, name, params) in l1.iter() {
+            // 68 bytes holds the largest L1 return payload — Read_Local_Supported_Commands'
+            // status(1) + Supported_Commands(64) = 65 — with slack; every other command is far
+            // smaller.
+            let mut rp = [0u8; 68];
+            let Some(n) = self.bt_hci_command(t, intf, &e, &mut toggle, opcode, params, &mut rp)
+            else {
+                // Bounded wait expired: name the command and STOP the L1 sequence. Not a hang,
+                // not forced — the event path or a firmware gate is the suspect (see predictions).
+                serial_println!(
+                    ":: bt-l1: [{}] {} ({:#06x}) -> NO-RESPONSE (bounded wait expired) — L1 STOP ::",
+                    self.idx, name, opcode
+                );
+                break;
+            };
+            if n < 1 {
+                serial_println!(
+                    ":: bt-l1: [{}] {} ({:#06x}) -> CmdComplete with NO status byte -> MALFORMED ::",
+                    self.idx, name, opcode
+                );
+                continue;
+            }
+            let status = rp[0];
+            // 0x01 = Unknown HCI Command. Called out explicitly because for a MANDATORY command it
+            // is the clean-room / patchram boundary signal (docs/MANIFESTO/CLEAN_ROOM_POLICY.md),
+            // not an ordinary error.
+            if status == 0x01 {
+                serial_println!(
+                    ":: bt-l1: [{}] {} ({:#06x}) -> status=0x01 UNKNOWN-CMD — a mandatory command was refused; possible patchram gate (STOP, do not add firmware) ::",
+                    self.idx, name, opcode
+                );
+            }
+            match opcode {
+                // Read_BD_ADDR: status(1) + BD_ADDR(6, little-endian, LSB first on the wire).
+                // Rendered MSB-first (the human notation), so the OUI is the leading three octets.
+                BT_HCI_READ_BD_ADDR if n >= 7 => serial_println!(
+                    ":: bt-l1: [{}] HCI_Read_BD_ADDR (0x1009) status={:#04x} bd_addr={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} oui={:02x}:{:02x}:{:02x} == witness ::",
+                    self.idx, status, rp[6], rp[5], rp[4], rp[3], rp[2], rp[1], rp[6], rp[5], rp[4]
+                ),
+                // Read_Buffer_Size: status(1) acl_len(2,LE) sco_len(1) acl_num(2,LE) sco_num(2,LE).
+                BT_HCI_READ_BUFFER_SIZE if n >= 8 => {
+                    let acl_len = (rp[1] as u16) | ((rp[2] as u16) << 8);
+                    let sco_len = rp[3];
+                    let acl_num = (rp[4] as u16) | ((rp[5] as u16) << 8);
+                    let sco_num = (rp[6] as u16) | ((rp[7] as u16) << 8);
+                    serial_println!(
+                        ":: bt-l1: [{}] HCI_Read_Buffer_Size (0x1005) status={:#04x} acl_len={} acl_num={} sco_len={} sco_num={} == witness ::",
+                        self.idx, status, acl_len, acl_num, sco_len, sco_num
+                    );
+                }
+                // Read_Local_Supported_Features: status(1) + LMP_Features(8). LE-supported is
+                // byte 4 bit 6 (mask 0x40, BlueZ LMP_LE); BR/EDR Not Supported is byte 4 bit 5
+                // (0x20). The full 8-byte mask is printed verbatim so the capture can be
+                // re-decoded if a bit position is ever questioned.
+                BT_HCI_READ_LOCAL_FEATURES if n >= 9 => {
+                    let f = &rp[1..9];
+                    let le = f[4] & 0x40 != 0;
+                    let no_bredr = f[4] & 0x20 != 0;
+                    serial_println!(
+                        ":: bt-l1: [{}] HCI_Read_Local_Supported_Features (0x1003) status={:#04x} lmp_features=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] LE(controller)={} BR/EDR-not-supported={} == witness ::",
+                        self.idx, status, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], le, no_bredr
+                    );
+                }
+                // Read_Local_Supported_Commands: status(1) + Supported_Commands(64). The full
+                // 64-octet bitfield is the wire truth L2 decodes for LE-scan support; printed
+                // whole, bounded. `n` may be 65 (all octets) when the reassembly fit.
+                // Review C1: the guard is `n >= 65` (status + the full 64-octet bitfield), NOT `n >= 1`.
+                // This is the ONLY command in the table that needs multi-packet reassembly, so a partial
+                // reassembly is exactly the failure this arc's central mechanism exists to prevent — and
+                // with a `>= 1` guard it would have printed a normal `== witness ::` line with a short
+                // `n=` instead of falling to MALFORMED. A witness that cannot fail on the one case it was
+                // built to prove is not a witness.
+                BT_HCI_READ_LOCAL_COMMANDS if n >= 65 => {
+                    serial_print!(
+                        ":: bt-l1: [{}] HCI_Read_Local_Supported_Commands (0x1002) status={:#04x} n={} cmds=[",
+                        self.idx, status, n.saturating_sub(1)
+                    );
+                    for j in 1..n {
+                        serial_print!("{:02x}{}", rp[j], if j + 1 < n { " " } else { "" });
+                    }
+                    serial_println!("] == witness ::");
+                }
+                // Set_Event_Mask: status(1) only. The first WRITE — witnessed with its status; a
+                // 0x00 proves the write path end to end, and the mask is the reset default so the
+                // command is idempotent and leaves no persistent state changed.
+                BT_HCI_SET_EVENT_MASK if n >= 1 => serial_println!(
+                    ":: bt-l1: [{}] HCI_Set_Event_Mask (0x0C01) status={:#04x} -> {} (mask=reset-default 0x00001FFFFFFFFFFF, idempotent) == witness ::",
+                    self.idx, status,
+                    if status == 0 { "OK" } else { "NONZERO-STATUS" }
+                ),
+                _ => serial_println!(
+                    ":: bt-l1: [{}] {} ({:#06x}) status={:#04x} -> SHORT-REPLY ({} return byte(s)) -> MALFORMED ::",
+                    self.idx, name, opcode, status, n
+                ),
+            }
         }
 
         // Quiesce: the event endpoint stays LINKED in the frame list (its slot is owned for the
@@ -2808,16 +2971,28 @@ impl Controller {
         Some((total.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF)) as usize)
     }
 
-    /// BT-L0 — issue one zero-parameter HCI command over the control endpoint and drain the
-    /// event endpoint until its Command Complete arrives.
+    /// BT-L0/L1 — issue one HCI command over the control endpoint and drain the event endpoint
+    /// until its Command Complete arrives.
     ///
     /// The command rides EP0 exactly as the Bluetooth USB transport specifies: bmRequestType
     /// 0x20 (host-to-device, CLASS, INTERFACE), bRequest 0x00, wValue 0, wIndex = the HCI
-    /// interface, data = the HCI command packet `opcode(2, LE) parameter_total_length(1)`.
+    /// interface, data = the HCI command packet `opcode(2, LE) parameter_total_length(1)
+    /// parameters(N)`. `params` is empty for the L0 reads and the L1 identity reads, and eight
+    /// bytes for `HCI_Set_Event_Mask`; it is bounded by 255 (the length field is one byte) and by
+    /// the EP0 data buffer.
     ///
-    /// Returns the Command Complete's RETURN PARAMETERS (everything after the opcode echo)
-    /// copied into `out`, and their length; None on send failure or if no matching Command
-    /// Complete arrived within `BT_EVT_MAX` bounded reads.
+    /// BT-L1 — MULTI-PACKET EVENT REASSEMBLY. The event endpoint's max packet is 16 B, but an HCI
+    /// event runs up to 2 + 255 B (`HCI_Read_Local_Supported_Commands` alone is 70). One
+    /// `bt_read_event` is one interrupt-IN transaction = one packet; a whole event is
+    /// ceil(len/mps) of them, and the data toggle advances on EVERY packet regardless of event
+    /// boundaries. So this function reassembles: the first packet gives the event's total length
+    /// (`2 + Parameter_Total_Length`), and it keeps reading (toggling each time) until the whole
+    /// event is gathered, before parsing. A non-target event (vendor, Command Status) is
+    /// reassembled in full and discarded so the endpoint stays byte-synchronised for the next one.
+    ///
+    /// Returns the matching Command Complete's RETURN PARAMETERS (everything after the opcode
+    /// echo) copied into `out`, and the number of bytes copied (`min(actual, out.len())`); None on
+    /// send failure or if no matching Command Complete arrived within `BT_EVT_MAX` bounded events.
     #[cfg(feature = "bt")]
     unsafe fn bt_hci_command(
         &mut self,
@@ -2826,12 +3001,23 @@ impl Controller {
         e: &BtEvtEp,
         toggle: &mut bool,
         opcode: u16,
-        out: &mut [u8; 16],
+        params: &[u8],
+        out: &mut [u8],
     ) -> Option<usize> {
+        // The command packet: opcode(2, LE) parameter_total_length(1) parameters(N), written into
+        // the EP0 data buffer `control` sends from. `params` is capped by the length field (255)
+        // and by the buffer; L1's largest is the 8-byte event mask, so this never truncates in
+        // practice, but the guard keeps a future long-parameter command honest.
+        // 253 = the 256-byte EP0 data buffer (`qh::Buf256`) minus the 3-byte command header.
+        let plen = params.len().min(255).min(253);
         self.data_buf.write(opcode as u8);
         self.data_buf.add(1).write((opcode >> 8) as u8);
-        self.data_buf.add(2).write(0u8); // parameter total length — both commands take none
-        if self.control(t, 0x20, 0x00, 0, intf as u16, 3, false).is_err() {
+        self.data_buf.add(2).write(plen as u8);
+        for (i, &b) in params[..plen].iter().enumerate() {
+            self.data_buf.add(3 + i).write(b);
+        }
+        let wlen = (3 + plen) as u16;
+        if self.control(t, 0x20, 0x00, 0, intf as u16, wlen, false).is_err() {
             serial_println!(
                 ":: bt-l0: [{}] HCI command {:#06x} — control-OUT failed on EP0 ::",
                 self.idx, opcode
@@ -2839,23 +3025,63 @@ impl Controller {
             return None;
         }
         // Drain: a controller may emit unrelated events (vendor, Command Status) before the
-        // Command Complete we asked for. Structurally bounded, on top of each read's own
-        // deadline, so a chatty or a mute radio both terminate.
+        // Command Complete we asked for. Structurally bounded (`BT_EVT_MAX` whole events), on top
+        // of each packet read's own TSC deadline, so a chatty or a mute radio both terminate.
+        let mut asm = [0u8; BT_EVT_ASM_MAX];
         for _ in 0..BT_EVT_MAX {
-            let n = self.bt_read_event(e, *toggle)?;
+            // ---- reassemble ONE complete event -------------------------------------------------
+            let n0 = self.bt_read_event(e, *toggle)?;
             *toggle = !*toggle;
-            if n == 0 {
-                continue; // zero-length packet: nothing to parse, try again
+            if n0 == 0 {
+                continue; // zero-length packet retires a transfer with nothing to parse; retry
             }
-            let pkt = core::slice::from_raw_parts(e.buf, n.min(e.mps as usize));
-            if pkt.len() < 2 {
-                continue;
+            let take0 = n0.min(e.mps as usize).min(BT_EVT_ASM_MAX);
+            core::ptr::copy_nonoverlapping(e.buf, asm.as_mut_ptr(), take0);
+            let mut have = take0;
+            if have < 2 {
+                continue; // malformed: no event header
             }
-            let (code, plen) = (pkt[0], pkt[1] as usize);
+            let total = 2 + asm[1] as usize; // EventCode(1) Parameter_Total_Length(1) + params
+            // Keep reading packets until the whole event is gathered. Each read still toggles and
+            // is TSC-bounded; the packet count is capped so a stuck endpoint cannot spin here.
+            let mut trunc = false;
+            let max_pkts = BT_EVT_ASM_MAX / (e.mps as usize).max(1) + 2;
+            let mut pkts = 1;
+            while have < total {
+                if pkts >= max_pkts {
+                    trunc = true;
+                    break;
+                }
+                let ni = self.bt_read_event(e, *toggle)?;
+                *toggle = !*toggle;
+                pkts += 1;
+                let ni = ni.min(e.mps as usize);
+                if ni == 0 {
+                    // A short/zero packet before `total` ends the event early — treat what we have
+                    // as the whole of it rather than reading into the next event.
+                    break;
+                }
+                let room = BT_EVT_ASM_MAX - have;
+                let store = ni.min(room);
+                core::ptr::copy_nonoverlapping(e.buf, asm.as_mut_ptr().add(have), store);
+                have += store;
+                if store < ni {
+                    // Buffer full but the event continues; we have already read this packet off
+                    // the endpoint (sync preserved). Nothing more can be stored.
+                    trunc = true;
+                    break;
+                }
+                if ni < e.mps as usize {
+                    break; // short packet = last packet of the event
+                }
+            }
+            let pkt = &asm[..have];
+            // ---- parse -------------------------------------------------------------------------
+            let (code, params_len) = (pkt[0], pkt[1] as usize);
             if code != BT_EVT_CMD_COMPLETE {
                 serial_println!(
                     ":: bt-l0: [{}] HCI event {:#04x} plen={} while awaiting CmdComplete for {:#06x} — skipped ::",
-                    self.idx, code, plen, opcode
+                    self.idx, code, params_len, opcode
                 );
                 continue;
             }
@@ -2872,13 +3098,19 @@ impl Controller {
                 );
                 continue;
             }
+            if trunc {
+                serial_println!(
+                    ":: bt-l0: [{}] CmdComplete for {:#06x} TRUNCATED — event exceeds the {}-byte reassembly buffer ::",
+                    self.idx, opcode, BT_EVT_ASM_MAX
+                );
+            }
             let ret = &pkt[5..];
-            let take = ret.len().min(out.len());
-            out[..take].copy_from_slice(&ret[..take]);
-            return Some(take);
+            let copy = ret.len().min(out.len());
+            out[..copy].copy_from_slice(&ret[..copy]);
+            return Some(copy);
         }
         serial_println!(
-            ":: bt-l0: [{}] no CmdComplete for {:#06x} within {} bounded event reads ::",
+            ":: bt-l0: [{}] no CmdComplete for {:#06x} within {} bounded events ::",
             self.idx, opcode, BT_EVT_MAX
         );
         None
