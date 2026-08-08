@@ -540,13 +540,20 @@ pub fn desktop_app_service() {
             WAIT_SINCE_MS.store(now.max(1), Ordering::Relaxed);
             return;
         }
-        if now.saturating_sub(started) < STORAGE_WAIT_MS {
+        let waited = now.saturating_sub(started);
+        if waited < STORAGE_WAIT_MS {
             return;
         }
         DONE.store(true, Ordering::Relaxed);
+        // `waited`, the MEASUREMENT — not `STORAGE_WAIT_MS`, the threshold. At the 1 kHz service
+        // pass the two differ by a millisecond, so printing the constant was accurate and still
+        // wrong in kind: a constant sitting in a measurement field is the exact shape this tree's
+        // instrument laws exist to catch, and the real value was already computed one line up. If
+        // this ever reads far above the threshold, the service pass itself stalled — which the
+        // constant could never have told anyone.
         serial_println!(
-            "[wc-x] desktop-app DECLINE reason=no-storage name=/{} waited={}ms — no block device ever enumerated; the desktop keeps the console window only",
-            DESKTOP_APP, STORAGE_WAIT_MS
+            "[wc-x] desktop-app DECLINE reason=no-storage name=/{} waited={}ms threshold={}ms — no block device ever enumerated; the desktop keeps the console window only",
+            DESKTOP_APP, waited, STORAGE_WAIT_MS
         );
         return;
     }
@@ -606,8 +613,15 @@ pub fn desktop_app_service() {
     if !(bytes.len() >= 4 && bytes[0..4] == [0x7F, b'E', b'L', b'F']) {
         // The loader would otherwise take this down its FLAT-blob path. Same refusal, and the same
         // reason, as the shell's BARE-EXEC arm: a name launches ELF programs, nothing else.
+        //
+        // `not-elf64-MAGIC`, not `not-elf64`. The bare form is a strict PREFIX of the
+        // `not-elf64-class` reason below, and this tree reads captures with `awk '/pattern/'` — so
+        // `awk '/reason=not-elf64/'` would match BOTH refusals and an analyst counting them after
+        // the flight would silently conflate "not an ELF at all" with "an ELF32". It was the only
+        // prefix collision among the image's `reason=` literals; every one is now independently
+        // greppable, which is a property worth keeping as reasons are added.
         serial_println!(
-            "[wc-x] desktop-app DECLINE reason=not-elf64 name=/{} bytes={}",
+            "[wc-x] desktop-app DECLINE reason=not-elf64-magic name=/{} bytes={}",
             DESKTOP_APP, bytes.len()
         );
         return;

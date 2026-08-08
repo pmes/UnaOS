@@ -338,8 +338,9 @@ _feats=""
 # same loader `bg`/BARE-EXEC use. STAT.ELF must be on the DATA volume (target/x86_64_data/), or the
 # boot prints one DECLINE line and continues with the console window alone. x86_64-only module;
 # DEFAULT OFF => the module, BOTH of its call sites, and the whole SLOT_NO_AUTOFOCUS focus-exemption
-# (its flag, the grant check in sys_win_create, the click-router arm and both witness strings) are
-# unlinked. aarch64 stays BYTE-IDENTICAL.
+# (its flag, the grant check in sys_win_create, the click-router arm and its ONE witness string —
+# the click arm prints nothing of its own, it reuses clickroute_witness's pre-existing `consume`
+# verdict, which the knob does not unlink) are unlinked. aarch64 stays BYTE-IDENTICAL.
 #
 # ⚠ x86 with the knob OFF is FUNCTIONALLY unchanged but NOT byte-identical after the kernel-apps
 # eviction, and the old wording here claimed otherwise. Measured, not reasoned: knob-off esp-x86

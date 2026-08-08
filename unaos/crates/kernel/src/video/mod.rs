@@ -71,7 +71,11 @@ pub mod vperf;
 // launch of the DESKTOP APP — the ring-3 `STAT.ELF` that replaced the kernel-drawn demo window in
 // the kernel-apps eviction. Changes nothing in `wm`
 // or `cursor` (both are already arch-neutral); it only gives them a window to composite. x86-only
-// AND knob-gated (`UNAOS_WC=1`), so aarch64 and every default x86 artifact are byte-identical.
+// AND knob-gated (`UNAOS_WC=1`): aarch64 stays BYTE-IDENTICAL (no aarch64 file is touched), and a
+// knob-off x86 build carries no feature code and no behaviour change — but it is NOT byte-identical
+// since the kernel-apps eviction, differing by relocated rodata immediates in
+// `arch/x86_64/syscall.rs` plus symbol-string-table length. Measured, not assumed; see the `wc` knob
+// comment in `arroyo` for the hashes and the byte counts.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod wcx;
 // CRISPY-PI theme const table — carried verbatim from hw-pi4 (single-author law: edits flow
