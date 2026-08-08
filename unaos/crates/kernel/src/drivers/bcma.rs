@@ -285,13 +285,23 @@ const CIA_CLASS_MASK: u32 = 0x0000_00F0;
 const CIA_CLASS_SHIFT: u32 = 4;
 
 // Component Identifier B — port and wrapper counts, and the CORE revision.
-const CIB_NMP_MASK: u32 = 0x0000_01E0; // # master ports
-const CIB_NMP_SHIFT: u32 = 5;
-const CIB_NSP_MASK: u32 = 0x0000_1E00; // # slave ports
+//
+// The CIB is a contiguous tiling of FOUR 5-bit counts starting immediately above the tag nibble:
+// nmp at bits 8:4, nsp at 13:9, nmw at 18:14, nsw at 23:19, then the 8-bit rev at 31:24. Each mask
+// is the previous one shifted left by 5; each shift is the previous plus 5. That tiling is the
+// whole check — a mask narrower than 5 bits orphans the count's low bit, and the S1b review caught
+// exactly that here: `nmp` shipped as `0x1E0 >> 5` (bits 8:5, four bits) dropped bit 4, so a true
+// count of 1 decoded as `floor(1/2) = 0`, the walk consumed zero master ports, then read
+// ChipCommon's real master-port descriptor as its "first slave address" and aborted with cores=0 —
+// the SAME class of off-by-a-bit error this arc convicted the old CIA masks for. `nsp` had the
+// identical latent slip (`0x1E00`, bits 12:9). Both are now the full 5 bits.
+const CIB_NMP_MASK: u32 = 0x0000_01F0; // # master ports  — bits 8:4
+const CIB_NMP_SHIFT: u32 = 4;
+const CIB_NSP_MASK: u32 = 0x0000_3E00; // # slave ports   — bits 13:9
 const CIB_NSP_SHIFT: u32 = 9;
-const CIB_NMW_MASK: u32 = 0x0007_C000; // # master wrappers
+const CIB_NMW_MASK: u32 = 0x0007_C000; // # master wrappers — bits 18:14
 const CIB_NMW_SHIFT: u32 = 14;
-const CIB_NSW_MASK: u32 = 0x00F8_0000; // # slave wrappers
+const CIB_NSW_MASK: u32 = 0x00F8_0000; // # slave wrappers  — bits 23:19
 const CIB_NSW_SHIFT: u32 = 19;
 const CIB_REV_MASK: u32 = 0xFF00_0000;
 const CIB_REV_SHIFT: u32 = 24;
@@ -856,9 +866,13 @@ fn walk_erom<F: Fn(u32) -> u32>(read: F) -> u32 {
             Some(a) => a,
             None => {
                 stop = if e.stopped() { e.overrun } else { "no-slave-addr" };
+                // Carry the raw CIA/CIB words, as the mp-malformed abort does: this is the abort a
+                // CIB count-mask bug fires (a too-small nmp under-consumes the master ports, so the
+                // real master-port descriptor lands here in place of the slave address), and the
+                // predictions doc names these raw words as the lever for a second failed boot.
                 serial_println!(
-                    ":: bcma: erom-abort at entry {} — core id={:#05x} ({}) declares nsp={} but its next entry is not a {} address descriptor on port 0 ::",
-                    e.i, id, core_name(id), nsp, addr_type_name(AD_TYPE_SLAVE)
+                    ":: bcma: erom-abort at entry {} — core id={:#05x} ({}) declares nsp={} nmp={} but its next entry is not a {} address descriptor on port 0; cia={:#010x} cib={:#010x} ::",
+                    e.i, id, core_name(id), nsp, nmp, addr_type_name(AD_TYPE_SLAVE), cia, cib
                 );
                 break;
             }
