@@ -7347,3 +7347,165 @@ lines below are what it CAN read.
   fields are invariants rather than measurements — `band=no` on every line, `span=` always equal to
   the box height, `banded=0` with `minspan=0 minspan_bytes=0`, and never a `scope=window-band`
   rollup. A band-carrying field with any other value on aarch64 is itself the finding.
+
+---
+
+## 10. PULSEFLUID — the windowed `PULSE.ELF` meter's refresh, and the one filter that is display-only
+
+*Scope: `unaos/crates/user-pulse/src/main.rs` (a ring-3 EL0 program, arch-neutral above its two syscall
+stubs, shipped as `PULSE-X86.ELF` on x86 and `PULSE.ELF` on aarch64). The kernel's own full-screen `pulse`
+verb and the PULSE-2/3/4 instrument panel above are untouched by this arc.*
+
+Peter, from the rMBP bench (Boots AN/AO): *"i feel like the pulse leds should be more fluid if you have so
+many threads going."* With 24 thread rows and the SMPBAL balancer running there is far more scheduler
+motion than the window was showing, and the meters stepped rather than moved.
+
+### What was actually chunky
+
+Two independent causes, only one of which was about the data.
+
+1. **The reporting rate, not the measurement, was 4 Hz.** The loop slept `REFRESH_MS` = 250 ms, sampled,
+   painted, and discarded the previous snapshot — so a viewer got a new number five times less often than
+   the instrument could honestly produce one.
+2. **The track quantised to 10%.** `PULSE_SEGS` is 10, so the bar could only ever sit at a multiple of 10%,
+   and the `RUNNING`/idle breath hopped one whole segment every 300 ms.
+
+### There is no kernel-side publication cadence to fix
+
+Worth stating explicitly, because the brief for this arc allowed for the opposite finding. `SYS_CPUPULSE`
+(49) reports **cumulative** counters — `sched::meter_cpu_ticks(c)` reads `CPU_BUSY[c]`/`CPU_IDLE[c]`, which
+`run()` bumps per dispatch and per `hlt` with no window and no rollup. Any pair of samples is therefore a
+valid window at any spacing the caller likes, and the kernel publishes nothing on a timer. The 250 ms was
+purely the app's own choice of how often to look. (This is *not* true of the SCHEDLOAD-X86 `core_load` feed,
+which does fold into a ~250 ms window kernel-side — but that feed is not what this app reads.)
+
+### The sliding window: 5x the reports, the same 250 ms of evidence
+
+`FRAME_MS` = 50 ms is now the frame period (sample **and** repaint); `WINDOW_SLOTS` = 5 is how many frames
+the measurement window spans, so `REFRESH_MS` = `FRAME_MS * WINDOW_SLOTS` = 250 ms, **unchanged**. A 5-deep
+`HIST` ring in `.bss` holds the last five snapshots; each frame reads the slot it is about to overwrite —
+which by construction holds the counters from exactly five samples ago — and stores the current one in its
+place. No copying, no growth, and every painted percent is still a real ratio of real counter deltas over a
+real 250 ms span.
+
+This is **oversampling, not interpolation**. It also makes the printed number *steadier* rather than
+noisier, because consecutive frames share four fifths of their evidence.
+
+The baseline law is intact: the ring is primed with the startup baseline and the program paints nothing
+until `samples >= WINDOW_SLOTS`, so the first frame it ever presents still has a full 250 ms behind it. A
+refused sample does not advance `samples`, so a stream of refusals cannot fake a full window into being.
+
+### Sub-segment resolution on the track, and a continuous breath
+
+The fill is computed in Q8 segments. Whole segments draw `METER_PURPLE`; the **leading** segment is blended
+between `METER_DIM` and `METER_PURPLE` in proportion to the fractional part, which resolves the same
+measured value ~256x more finely than a 10-step track without inventing any of it. `MIN_LIT_Q` (96/256 of
+the first LED) is the sub-segment restatement of the old `if filled < 1 { filled = 1 }` rule — a live load
+must never round down to an unlit track — and it is strictly nearer the truth than the old rule, which
+inflated everything from 1% to 4% into a full segment.
+
+The PULSE-ALIVE breath is now a glow with a triangular falloff spanning ±1.25 segments, swept across the
+track once per `BREATH_MS` = 3000 ms. That is the same ground at the same speed as the old one-segment-per-
+300 ms hop, drawn continuously instead of in ten jerks.
+
+`PARKED` is untouched: alternating `METER_PARKED` dashes on bare background, never a percent, never a 0%.
+
+### The one filter, and where it is *not*
+
+The bar's fill is an **exponential moving average** of the measured percents — `disp = (2*disp + measured)/3`
+per 50 ms frame, a ~100 ms time constant. **This is display smoothing: a rendering choice about how a bar
+catches up, not a measurement.** It is confined to `disp`, which only the fill case of `draw_pulse_bar`
+reads. Specifically it is **not** in:
+
+* the **text cell** beside each bar, which prints the raw measured percent;
+* the **`:: PULSE-A: first-window cN busy/idle=…`** serial witness, which prints the raw deltas and the raw
+  `classify` verdict — so a headless gate parses the measurement, never the filter.
+
+Two properties the filter must keep, both enforced in the fold:
+
+* **A sentinel is not a load.** `PARKED` and `RUNNING` are the two "no percent is honest here" answers.
+  Averaging either would produce an enormous fake load *and* would carry state across the boundary between
+  measured and not-measured, so both **invalidate** the filter instead; the next real percent snaps.
+* **The first percent snaps.** Ramping a fresh core up from 0 would draw a rise that never happened.
+
+### Pacing: 5x the frames, less compositor work when nobody is looking
+
+The loop still blocks in `SYS_SLEEP_MS` and never spins — one syscall per 50 ms. `SYS_INPUT_WAIT` (28) is
+deliberately not used: it is implemented on aarch64 only, and a monitor must repaint on a timer rather than
+on input anyway.
+
+What pays for the higher frame rate is the VUGMIN hidden bit. The RO info page's process-flags word
+(`base + 0x4000`, word `0x20`, bit 1) means "every window this process owns is hidden below the shell";
+while it is set the loop keeps **sampling** — so the window behind the first visible frame is real and
+never stopped being measured — and skips the raster and the present entirely. A hidden `PULSE.ELF`
+therefore costs the compositor **strictly less** than it did at 4 Hz, where it presented regardless. The
+`INPUT_PER_FRAME` = 8 drain cap now costs 50 ms of latency instead of 250 ms for the same UVUG-9 protection.
+
+### Serial witnesses (changed)
+
+| Line | Change |
+| :--- | :--- |
+| `:: PULSE-A: start pid=… win=… ncpu=… cpu=… segs=10 win_ms=250 frame_ms=50 ::` | **`win_ms=` and `frame_ms=` are new.** Now that the measurement window and the frame period are different quantities, a capture showing a percent must also state what span it covers and how often it was recomputed, or it cannot be checked against `[schedx86] load` after the fact. |
+| `:: PULSE-A: first-window cN busy/idle=B/I -> V ::` | **Unchanged in format and in meaning** — still one line per core, still the first *full* 250 ms window, still the raw deltas and the raw verdict. It now lands at ~300 ms of the app's life instead of ~250 ms. |
+| `:: PULSE-A: alive pid=… frames=40 ::` | **`frames=8` becomes `frames=40`.** `ALIVE_MARK` was rescaled with the frame rate so the line keeps meaning "~2 s of loop life". `frames` still counts loop passes, not presents, so a hidden monitor still proves it is looping. |
+
+`PULSEW_MIN_PRESENTS` (3) is unchanged and now satisfied in ~400 ms rather than ~1 s; the PULSE-W deadline
+was deliberately **not** tightened to match, because it is a wedge detector and a generous one costs
+nothing on a passing run.
+
+### Arch
+
+`user-pulse` is one shared crate built for both arches. Every change here is arch-neutral Rust above the
+two `sysabi` stubs, and the info-page flags word is published identically by both
+(`arch/x86_64/syscall.rs::fb_info_write_flags` and `arch/aarch64/syscall.rs::fb_info_write_legacy`, word
+`0x20`, `FB_FLAG_HIDDEN = 1 << 1`), so the Pi gets the same fluid meters and the same hidden-window saving.
+The only kernel-side edit in this arc is a comment in `arch/x86_64/syscall.rs` (the PULSE-W present-budget
+note), which `arch/mod.rs`'s `cfg_if` excludes from the aarch64 build entirely — the aarch64 kernel image
+is byte-identical.
+
+### Sizes
+
+`.text` 5100 → 5873 B (page ceiling 8192), `.bss` 288 → 1568 B (ceiling 8192 below the info page at
+`base + 0x4000`), stripped ELF 12568 B on both arches (`arroyo`'s cap is 16384).
+
+### Answered in passing: "why does pulse show core 8 66% when all is paused?" (Boot AN)
+
+Two facts, both verifiable from the capture.
+
+**"Core 8" is `c7`.** The row label is 1-based: `user-pulse/src/main.rs` draws it from
+`digits_of(c as u64 + 1)`, where `c` is the zero-based core index of the `SYS_CPUPULSE` payload. There is
+no extra row and no reordering — row *n* is core *n-1*. Row 8 is `c7`.
+
+**`c7` is the SCHED-X86 device-service core, and 66% is an EVENT ratio, not a duty cycle.** Boot AN's
+placement line reads `:: SCHED-X86 PLACE: aps=7 render=c1 svc=c7 worker=[c2,c3,c4] xhci=[c2,c3] …`, so
+`c7` carries `x86_usb_pump` and `x86_input_service`. Both are 1 kHz pollers: each loop body ends in
+`sleep_ticks(1)`, so each task is *dispatched* about once per millisecond whether or not it finds anything
+to do.
+
+`SYS_CPUPULSE` exposes `CPU_BUSY`/`CPU_IDLE`, which count **events** — one increment per dispatch, one per
+`hlt` — so PULSE's percent is `dispatches / (dispatches + hlts)`. Boot AN's own witness line at 376502 ms:
+
+```
+:: PULSE-A: first-window c7 busy/idle=380/177 -> 68% ::
+```
+
+380/(380+177) = 68%. That is two 1 kHz pollers waking ~1.5 times per millisecond between short `hlt`s over
+a 250 ms window — a **cadence**, not a duty cycle. The `[schedx86] load` line straddling the same moment
+says `c7=0%` and `c7=1%`, and across the whole six-vug era `c7` runs 0–7%; that is the SCHEDLOAD-X86
+`core_load` feed, denominated in TSC **time**, and it is the number that answers "how much of the wall
+clock did this core spend executing".
+
+So the two instruments are not in conflict and neither is wrong: on an all-paused fleet `c7` spends ~5% of
+its time working and wakes up ~1500 times a second to check. `scheduler.md` states the design intent
+directly — the two feeds "must agree about WHICH cores are idle while disagreeing about the magnitudes" —
+and this reading is that cross-check passing, not failing.
+
+**Verification line (any capture with PULSE.ELF running):**
+
+```
+awk '/PULSE-A: first-window c7|SCHED-X86 PLACE|schedx86. load/' <log>
+```
+
+`svc=cN` names the core, `first-window cN busy/idle=B/I` is the event ratio PULSE draws, and the
+`[schedx86] load cN=` on the neighbouring lines is the time ratio. Nothing about PULSEFLUID changes any of
+this: the app reads the same feed with the same rule, five times more often.

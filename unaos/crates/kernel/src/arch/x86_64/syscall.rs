@@ -15147,9 +15147,16 @@ fn winx8_launcher(_demo_cpu: usize) {
 // =============================================================================================
 
 /// PULSE-1: how many presents PULSE.ELF must land before we accept it is really running its refresh loop
-/// rather than having created a window and wedged. The app repaints at `REFRESH_MS` = 250 ms and sleeps
-/// BEFORE its first sample (its baseline is deliberately never painted), so three presents is ~1 s of its
-/// life — which is why the deadline below is longer than WINX-8's.
+/// rather than having created a window and wedged. The app sleeps a full 250 ms measurement window before
+/// its first paint (its baseline is deliberately never painted) and then repaints at `FRAME_MS` = 50 ms
+/// since PULSEFLUID, so three presents is ~400 ms of its life — it used to be ~1 s, which is why the
+/// deadline below is longer than WINX-8's. The deadline is deliberately NOT tightened to match: it is a
+/// wedge detector, and a generous one costs nothing on a passing run.
+///
+/// One consequence worth stating because a future reader will otherwise re-derive it from a red gate: the
+/// app now skips its present entirely while the VUGMIN hidden bit is set. This witness spawns it via `bg`
+/// and never hides it, so the count still accrues; a variant of this fixture that hid the window would be
+/// asserting the opposite of PULSEFLUID's contract and must not be written.
 const PULSEW_MIN_PRESENTS: u64 = 3;
 
 /// PULSE-1: load `PULSE.ELF` off the mounted FAT volume and run the whole `bg` lifecycle on it.
