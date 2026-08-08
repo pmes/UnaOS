@@ -1074,10 +1074,31 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
     // keeps the aarch64 typematic absorption exactly as it is: there, `H_SAW_KEYUP` is set by the first
     // key release the operator ever makes, and this line stops firing for the rest of the run.
     //
-    // The one residue, stated rather than hidden: until that first release, a release-emitting path is
-    // indistinguishable from a release-less one, so a SPACE held past `DELAY_MS` (400 ms) as the VERY
-    // FIRST key of a run would see its synthesised repeats toggle pause. It costs one keystroke to
-    // leave and cannot recur — any release at all, of any key, ends it for the process's lifetime.
+    // THE ONE RESIDUE, and its true scope — stated rather than hidden, and NARROWER on one arch than
+    // the other for a reason worth knowing at a bench.
+    //
+    // Until the first release, a release-emitting path is indistinguishable from a release-less one,
+    // so a SPACE held past `DELAY_MS` (400 ms) as the VERY FIRST key of a run would see its
+    // synthesised repeats toggle pause. It costs one keystroke to leave and cannot recur — any
+    // release at all, of any key, ends it for the process's lifetime.
+    //
+    //   * On x86 it is unreachable in the launch flow, and that is a property of the kernel rather
+    //     than luck. `SYS_WIN_CREATE` grants focus to the first window while the shell is idle
+    //     (`:: wc-x86: input focus -> slot N (first window, shell was idle) ::`), and x86's
+    //     `user_input_set_active` deliberately does NOT drain `pal::EVENT_QUEUE`. So the RELEASE of
+    //     the Enter that launched the program — tens of milliseconds behind its press, well inside a
+    //     human key hold — routes into the freshly focused ring and sets this bit long before any
+    //     400 ms delay could expire. Moot in the other direction too: x86 has no typematic
+    //     synthesiser at all, so there is nothing there to repeat.
+    //   * On aarch64 — the arch where the repeat engine that makes this matter actually LIVES — that
+    //     mitigation does NOT transfer, and assuming it did would be the comfortable wrong answer.
+    //     `user_input_set_active` there drains and DISCARDS the pre-launch queue on purpose
+    //     (UVUG-8r2: `[uvug8] focus asid=N — discarded K pre-launch event(s) from EVENT_QUEUE`),
+    //     precisely so the launch keystroke is not mistaken for in-app interaction — and the
+    //     launching Enter's release is one of the events it throws away. So the first release this
+    //     program sees on the Pi is a genuinely in-app one, and the residue stands exactly as written
+    //     above: first key of the run, held past 400 ms, pause flickers and settles on the parity of
+    //     the repeat count. Bounded, self-ending, one tap to correct.
     if *held & H_SAW_KEYUP == 0 {
         *held &= !H_PAUSE;
     }

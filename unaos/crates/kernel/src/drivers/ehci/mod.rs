@@ -2199,6 +2199,12 @@ impl Controller {
                     idx, tok
                 );
                 e.dead = true;
+                // EHCI-KEYUP F2: the endpoint is retired for the rest of the boot — this loop
+                // `continue`s past a `dead` entry forever after — so any key down at this instant
+                // would NEVER receive its release. Flush them. See `flush_held_releases` for why
+                // this is the one asymmetric case the poll-gap argument does not cover, and why
+                // ring 3 cannot recover from it on its own.
+                flush_held_releases(e, idx);
                 continue;
             }
             // KBDWIT-2: a clean retirement — the endpoint answered. THE decision-table entry.
@@ -2947,8 +2953,21 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
 /// single `INPUT_EV_KEY_UP`. `user-vug` clears a held bit only on a release, so the first SPACE
 /// latched pause on permanently and the arrow/WASD held bits latched with it — the operator's
 /// "the vug froze". The xHCI decoder has always synthesised releases; this is the same logic, and
-/// it is deliberately a MIRROR rather than a variation, so a key behaves identically whichever
-/// controller carried it.
+/// it is deliberately a MIRROR rather than a variation.
+///
+/// WHAT "MIRROR" MEANS HERE, SCOPED — because the unqualified claim is not true and the difference
+/// is one a bench reading could trip over. The mirror is over the EDGE MODEL: which keycodes produce
+/// a release, when, and in what order. That half is byte-equivalent to xHCI's — same set diff, same
+/// `<= 1` guard, same position-independent `contains` test, same "no `KeyUp` for a modifier", same
+/// shift-at-release-time. It is NOT a mirror over ASCII MAPPING: xHCI computes
+/// `eff_shift = shift ^ (caps & is_letter)` from the device's `keyboard_leds`, and this decoder has
+/// no caps state at all and uses bare `shift`. So under Caps Lock a LETTER's ascii differs between
+/// the two controllers — on the press as much as on the release. That is PRE-EXISTING (the press
+/// loop was already caps-blind before this arc), it is internally consistent here because both loops
+/// share `ascii_of` so a press and its release can never disagree about which character they are
+/// about, and it is being closed by the `seat/gr21-allkeys` arc stacked on this one. It is named
+/// rather than fixed here on purpose: this commit's contract is the edge model, and widening it to
+/// the mapping would put two independent changes in one bisect.
 ///
 /// THE DIFF. A USB boot report is a LEVEL, not an edge: bytes 2..8 carry the FULL set of keycodes
 /// currently down (6-key rollover), so any keycode present in the previous report and absent from
@@ -2959,10 +2978,27 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
 ///
 /// WHY A MISSED RELEASE CANNOT STRAND A KEY HERE. `service_ehci_hid` arms one transfer per service
 /// pass and is polled at frame rate, so reports the device sends between passes are simply never
-/// fetched — the CLICK-3 note above is about exactly that. It cannot cost a release: after a key
-/// comes up the reported level STAYS up-with-nothing-down, so the next report the driver does fetch
-/// carries the released set and the diff fires then. (This is the property the pointer path lacks,
-/// because a button's level can go down again before the next poll.)
+/// fetched — the CLICK-3 note above is about exactly that. It cannot cost a release: USB is
+/// host-polled, so a device with a pending state change holds it until the next IN token rather than
+/// losing it, and the re-arm happens in the SAME service pass as this decode. All four poll-gap
+/// cases are symmetric — press+release both inside a gap loses both edges; press seen then release
+/// seen pairs; release+re-press inside a gap collapses to a hold with no fabricated edge. (This is
+/// the property the pointer path lacks, because a button's level can go down again before the next
+/// poll.) **The one ASYMMETRIC case is not a poll gap at all: it is endpoint DEATH, and it is closed
+/// separately by [`flush_held_releases`].**
+///
+/// SHORT REPORTS ARE REFUSED WHOLE, and the `< 8` is load-bearing rather than defensive dressing.
+/// This guard was `< 3` and `cur_keys` zero-fills the slots a short report does not carry, so a full
+/// report followed by a SHORT one emitted a `KeyUp` for everything held in the missing slots — a
+/// FABRICATED release, the exact class this arc exists to remove, arriving by a different door (a
+/// fabricated SPACE release clears `H_PAUSE`, the next full report re-presses it as a fresh edge,
+/// and pause toggles on its own). xHCI cannot do this: it reads a fixed 8-byte staging buffer
+/// UNCONDITIONALLY (`from_raw_parts(data_buf_ptr, 8)`), so a short transfer leaves the previous
+/// bytes in place and reads as STILL HELD — the conservative direction. Refusing the report whole
+/// takes that same direction with no staging buffer: no press, no release, and `prev_keys` is left
+/// untouched, so nothing is invented and the next conforming report resolves the truth. Zero
+/// behavioural cost on any conforming device — the boot protocol is fixed at 8 bytes and this
+/// driver arms these endpoints at `mps=8`.
 ///
 /// MODIFIERS GET NO KeyUp, matching xHCI exactly. `report[0]` is a bitmask, not a keycode; neither
 /// decoder has ever pushed `Key` for a bare modifier, so pushing `KeyUp` for one would fabricate a
@@ -2978,8 +3014,8 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
 /// this change; calling `typematic_note_report` from this decoder would not even resolve on x86.
 /// Repeat on this arch is the DEVICE's, carried by the re-reported level.
 unsafe fn decode_boot_keyboard(report: &[u8], prev_keys: &mut [u8; 6]) {
-    if report.len() < 3 {
-        return;
+    if report.len() < 8 {
+        return; // short/partial boot report — see SHORT REPORTS ARE REFUSED WHOLE above
     }
     let shift = report[0] & 0x22 != 0; // L-Shift (bit 1) or R-Shift (bit 5)
     // The ascii for one keycode under the shift state in force. One place, so a press and its
@@ -2992,12 +3028,12 @@ unsafe fn decode_boot_keyboard(report: &[u8], prev_keys: &mut [u8; 6]) {
             0
         }
     };
-    // This report's keycode slots. A report shorter than 8 bytes contributes zeros for the slots it
-    // does not carry — "not down", which is the safe direction: it can only release a key early, and
-    // the next full report re-presses it.
+    // This report's six keycode slots. The `< 8` guard above is what makes this a COMPLETE picture of
+    // what is down — every slot comes from the wire, none is invented — which is the precondition the
+    // release diff below needs to be sound. `report[2 + i]` cannot panic for the same reason.
     let mut cur_keys = [0u8; 6];
     for (i, slot) in cur_keys.iter_mut().enumerate() {
-        *slot = report.get(2 + i).copied().unwrap_or(0);
+        *slot = report[2 + i];
     }
 
     for &keycode in cur_keys.iter() {
@@ -3030,6 +3066,54 @@ unsafe fn decode_boot_keyboard(report: &[u8], prev_keys: &mut [u8; 6]) {
     }
 
     *prev_keys = cur_keys;
+}
+
+/// EHCI-KEYUP F2 — release every key this endpoint still believes is DOWN, because no further report
+/// will ever arrive to say otherwise.
+///
+/// THE ONE ASYMMETRIC LOSS. [`decode_boot_keyboard`]'s poll-gap argument is sound and covers every
+/// case where reports keep flowing: a release the driver did not fetch is re-read from the next
+/// report's level. It says nothing about the endpoint being RETIRED. `service_ehci_hid` sets
+/// `e.dead = true` on `tok & QTD_ERR_MASK` (the `STOP-NOTE interrupt endpoint halted` line) and
+/// thereafter skips that entry for the rest of the boot — there is no next report, so a key held at
+/// that instant is stranded in ring 3 forever.
+///
+/// AND RING 3 CANNOT SAVE ITSELF FROM IT. `user-vug`'s `H_SAW_KEYUP` belt is deliberately ONE-WAY:
+/// once any release has been seen the pause-retire stops firing for the life of the process. So a
+/// mid-hold endpoint death puts the operator straight back in Boot AJ — `H_PAUSE` latched, the
+/// crystal frozen, kill the app — with the belt disarmed by its own correct behaviour.
+///
+/// This is xHCI's countermeasure ported to the shape EHCI has. There, `Slot::reset_soft_state` calls
+/// `pal::note_keyboard_detached()` under the note that "under `SET_IDLE(0)` that key's `KeyUp` will
+/// NEVER arrive", feeding the aarch64 typematic tracker's detach layer. That tracker does not exist
+/// on x86 (see the typematic note on the decoder), so the same fact is answered where x86 CAN answer
+/// it: emit the releases the device now never will, through the ordinary event path, so every ring-3
+/// consumer sees an honest edge rather than an absence it has no way to notice.
+///
+/// Idempotent by construction — `kbd_prev_keys` is zeroed, so a second call flushes nothing — and a
+/// no-op on a pointer endpoint, whose `kbd_prev_keys` no decoder ever writes.
+unsafe fn flush_held_releases(e: &mut IntEp, idx: usize) {
+    for i in 0..e.kbd_prev_keys.len() {
+        let keycode = e.kbd_prev_keys[i];
+        if keycode <= 1 {
+            continue;
+        }
+        if (keycode as usize) < super::xhci::HID_SCANCODE_TO_ASCII.len() {
+            // No shift state survives an endpoint death, so the UNSHIFTED ascii is the only honest
+            // choice. It matches what the press loop delivered for every key typed without shift,
+            // and consumers that care about identity match case-insensitively — the same contract
+            // the ordinary shift-at-release path already relies on.
+            let (unshifted, _shifted) = super::xhci::HID_SCANCODE_TO_ASCII[keycode as usize];
+            if unshifted != 0 {
+                serial_println!(
+                    ":: EHCI-HID: [{}] KEYUP-FLUSH: '{}' (scancode {:#x}) — endpoint retired, release synthesised == witness ::",
+                    idx, unshifted as char, keycode
+                );
+                crate::pal::push_event(crate::pal::Event::KeyUp(unshifted));
+            }
+        }
+    }
+    e.kbd_prev_keys = [0; 6];
 }
 
 // ======================================================================================
