@@ -2079,10 +2079,14 @@ Combined-boot evidence (one kernel running SMP + USB + net + video):
   priority band (`PRIO_SERVICE`/`spawn_prio` remain aarch64-only, so an operator-started
   program is still a round-robin peer of the compositor wherever it lands), and none of
   the aarch64 SPREAD-4…15 layer. Correction happens on the idle side only.
-- **No TLB-shootdown IPI on x86.** Cross-core staleness of *user* mappings is handled by
-  the `AS_GEN` deferred-reload scheme (SMPBAL-X86), not by invalidation. Kernel-half
-  mappings mutated after a slot's PML4 was built are a separate, pre-existing question
-  that scheme does not address.
+- **No TLB-shootdown IPI on x86.** Cross-core staleness of *user* mappings is handled at
+  DISPATCH by the `AS_GEN` deferred-reload scheme (SMPBAL-X86), not by invalidation — and
+  dispatch is the scheme's boundary: a sibling ring-3 thread of the same process already
+  RUNNING on another core (shared `user_cr3`, placed by `sibling_online_cpu`) keeps stale
+  leaves for the rest of its quantum when a peer unmaps a user page (local `invlpg` only).
+  Pre-existing, not widened by this arc (threads are `steal_ok == false`), and OPEN.
+  Kernel-half mappings mutated after a slot's PML4 was built are a separate, pre-existing
+  question the scheme also does not address.
 
 ---
 

@@ -1255,7 +1255,10 @@ impl RunQueue {
     /// `STATE_READY` — a running task is out of the queue in `current`, a blocked one is in a wait
     /// queue or a sleeper list — so anything reachable here is safe to re-home. `wait_ticks` and
     /// `effective_level` are read/written under this same lock, satisfying their "never cross-CPU"
-    /// discipline; the thief's `push` re-bases both anyway.
+    /// discipline; the thief's `push` re-bases both — which is a BEHAVIOUR CHANGE, not an
+    /// assurance (review C6): a stolen task loses its aging promotion and restarts at base
+    /// priority on the thief. Benign for the ring-3 fleet this arc places (they re-age in ms),
+    /// stated so nobody reads a stolen task's level reset as a scheduler bug.
     ///
     /// TWO filters, and both are load-bearing:
     ///   * `steal_ok` — the pin contract (`Task::steal_ok`). Render / input / usb-pump and every
@@ -2278,12 +2281,14 @@ static PLACE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 ///      ring-3 task with IF=0 on core 0 masks the timer for its lifetime and freezes the global
 ///      ms-clock, because `timer_interrupt_handler`'s `cpu_index == 0` arm is the sole advancer of
 ///      `APIC_TICKS`.
-///   2. **The SERVICE core** (`smp::service_cpu`). This is the `xhci_worker_cpu` rule, and it is a
-///      DEADLOCK rule, not a performance one. `x86_usb_pump` holds the raw `XHCI_CONTROLLER`
-///      spinlock on that core; a co-located PREEMPTIBLE task that also takes it — which any ring-3
-///      program does the moment it touches storage — can preempt the holder and then spin on a lock
-///      whose owner cannot run. `xhci_worker_cpu` DECLINES rather than co-locate for exactly this;
-///      a load-balancer that placed there would silently undo that decision.
+///   2. **The SERVICE core** (`smp::service_cpu`). This is the `xhci_worker_cpu` rule. It was a
+///      DEADLOCK rule before WEDGE-8; today it is a SERIALISATION/LATENCY rule (review-corrected):
+///      WEDGE-8 made `XHCI_CONTROLLER` a masked O(1) loan — `claim()` and `Drop` take the mutex
+///      only under `IrqMask`, so no holder can be preempted mid-hold and the preempt-the-holder
+///      deadlock is structurally impossible. What remains true: a ring-3 program placed there
+///      contends the service core's storage latency, and `xhci_worker_cpu` still DECLINES to
+///      co-locate. The tier-1 relaxation needs a 2-dispatching-core machine to fire — unreachable
+///      on the 8-core bench — and is safe when it does, merely slower.
 ///   3. **The RENDER core.** Performance: it owns the panel and hosts the shell, it is the core the
 ///      measured imbalance piled onto, and putting a fresh program back on it restores the defect
 ///      this arc exists to remove.
@@ -2355,6 +2360,13 @@ fn pick_cpu(requested: usize, cooperative_user: bool, name: &'static str) -> usi
     let Some((cpu, depth, pct)) = best else {
         // Nothing is dispatching yet (pre-`enable()` spawn). Fall back to the caller's core, which is
         // the pre-arc behaviour and definitionally reachable — the caller is executing on it.
+        // Review C1: the fallback must not silently relax rule 1 (cooperative ring-3 on the clock
+        // core freezes the ms-clock). Latent today — both CPU_AUTO producers spawn preemptible —
+        // but the guard is one spawn site away from live, so it is asserted, not assumed.
+        debug_assert!(
+            !(cooperative_user && here == 0),
+            "pick_cpu fallback would place a cooperative ring-3 task on the clock core"
+        );
         return here;
     };
     if PLACE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < PLACE_LOG_MAX {

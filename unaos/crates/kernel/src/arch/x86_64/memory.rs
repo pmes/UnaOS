@@ -358,6 +358,10 @@ unsafe fn next_table(entry: *mut u64) -> *mut u64 {
 /// as requested. Asserts the leaf was previously empty (caller must `translate` it first). NX
 /// requires EFER.NXE, enabled in `syscall::init` before any mapping.
 pub unsafe fn map_user_page(va: u64, phys: u64, writable: bool, nx: bool) {
+    // AS_GEN (review C5): deliberately NO generation bump here, alone among the user-leaf
+    // mutators. This helper asserts the PTE was NOT-PRESENT, and x86 never caches a non-present
+    // translation, so no core can hold a stale view of a page that was never mapped — the
+    // not-present argument below covers the cross-core case the bump exists for.
     // WXAUDIT: the W^X gate on the ONE ring-3 mapping seam that lacked it. `protect_user_slot_range`
     // already refuses a W+X segment and `map_slot_fb_page`/`build_slot` mint constant shapes, but this
     // helper takes `writable` and `nx` as INDEPENDENT arguments, so nothing stopped a future caller from
