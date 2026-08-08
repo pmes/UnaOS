@@ -27,6 +27,16 @@
 //!
 //! ## THE WRITABLE SECTOR SET, AND WHY IT IS CLOSED
 //!
+//! SCOPE FIRST, because an earlier wording of this block claimed more than is true and was
+//! falsified by a line in the same capture it was written against. What follows describes **the
+//! FAT layer's** writable set. The image also contains SDHC-4a's `write_selftest`
+//! (`drivers/sdhc.rs:3165`, called unconditionally from `bring_up`), which under the same `sdw`
+//! feature writes and then RESTORES `num_blocks - 1` on every armed boot, outside this permit and
+//! gated by its own seven-rung ladder. On the bench card that is LBA 60799, and it is on the wire
+//! every boot: `:: sdhc: w1 armed=1 lba=60799 ... verify=IDENTICAL restore=IDENTICAL -> PASS ::`
+//! (Boots AL/AM/AN/AO). This arc neither adds nor removes that write; it must not pretend the
+//! medium sees only its own.
+//!
 //! Under this arc a build can write to the internal SD card ONLY through
 //! [`crate::fs::fat::write_sector`] / `write_sectors` with `source == BlockSource::Sdhc`, and both
 //! call [`permit_write`] BEFORE the block layer is touched. `permit_write` admits a span
@@ -41,13 +51,17 @@
 //! boot before the first write is possible, and it is derived in [`crate::fs::fat`]'s reserve pass
 //! from the cluster chain of a file the HOST staged — never from anything computed at write time.
 //!
-//! The reserve pass additionally proves, before arming, that the interval lies wholly inside the
-//! mounted volume's DATA REGION (`lba >= data_start`). That single inequality is what makes the
-//! set closed against the structures that matter: on FAT the boot sector, the reserved sectors,
-//! both FAT copies and the FAT16 fixed root directory all live BELOW `data_start`, so no permitted
-//! write can reach any of them, whatever the chain walk returned. The interval is also checked
-//! against the volume extent, the partition extent (`in_extent`, two independent on-disk claims)
-//! and the device's own `num_blocks`.
+//! The reserve pass additionally checks `lba >= data_start` — but be precise about what that
+//! buys, because an earlier wording of this paragraph got it wrong. That inequality is
+//! TAUTOLOGICAL and can never fire: `valid_cluster(c)` requires `c >= 2` and
+//! `cluster_lba(c) = data_start + (c - 2) * spc`, so a chain-derived `a` is `>= data_start` by
+//! construction. The metadata really is unreachable — the boot sector, the reserved sectors, both
+//! FAT copies and the FAT16 fixed root all live below `data_start` — but the REASON is
+//! `valid_cluster` plus `cluster_lba`'s linearity, and that reason is NOT independent of the BPB:
+//! `data_start` appears on both sides, so a dishonest BPB moves the extent and the floor together.
+//! The bounds that are genuinely BPB-independent are the partition claim (`in_extent`, a separate
+//! on-disk structure) and the device's own `num_blocks` (from the block layer). Those two are what
+//! survive a lying BPB, and they are why the set stays bounded even then.
 //!
 //! There is no knob that widens the set. `permit_write` carries no `cfg` beyond this module's own
 //! gate, has no bypass argument, and is the only producer of `Ok(())` on the path. The `sdw`

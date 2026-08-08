@@ -1882,3 +1882,47 @@ QEMU-green is not correct — the metal predictions are published in
   the instrument that prices it — the number the one-volume collapse needs.
 * It does not touch the installer's `Sdhc` refusal arms, the `publish_usb_geometry` guard, or the
   shell → `irqstorage` routing. Those remain the collapse prerequisites listed in §10.
+
+### §11.5 Review corrections — what the closure claim does and does not say
+
+An adversarial review reproduced the host-side proof with an independent BPB decoder sharing no
+code with the kernel or the builder, and confirmed the property that matters: **a permitted write
+cannot reach the boot sector, the reserved sectors, either FAT copy, the FAT16 root directory, or
+any sector outside the reserved file's own clusters.** It also falsified three claims as worded.
+They are corrected here rather than quietly edited, because each is the kind of statement a later
+arc would otherwise inherit as proven.
+
+1. **The set is closed at the FAT LAYER, not on the medium.** SDHC-4a's `write_selftest`
+   (`drivers/sdhc.rs:3165`, called unconditionally from `bring_up`) writes and restores
+   `num_blocks - 1` on every `sdw` boot, outside this permit, under its own seven-rung ladder —
+   LBA 60799 on the bench card, visible in Boots AL/AM/AN/AO as
+   `:: sdhc: w1 armed=1 lba=60799 ... verify=IDENTICAL restore=IDENTICAL -> PASS ::`. SDHC-4c
+   inherits that write; it does not create it, and it must not claim the medium sees only its own.
+2. **`lba >= data_start` is tautological** — `valid_cluster(c) => c >= 2` and
+   `cluster_lba(c) = data_start + (c-2)*spc`, so the check can never fire, and it is not
+   independent of the BPB (`data_start` is on both sides). The BPB-independent bounds are
+   `in_extent` (the MBR partition claim) and `num_blocks` (from the block layer).
+3. **"Exactly one sector changed" means one sector DIFFERS.** Three were written: the record at the
+   extent's first sector, plus `num_blocks - 1` twice by the 4a ladder (pattern, then restore),
+   which the byte comparison cannot see because it comes back identical. Also note the staged
+   QEMU superfloppy now places 4a's scratch sector INSIDE the mounted volume's extent — slack
+   beyond the last cluster (data ends at LBA 32764, scratch is 32767), where the previous blank
+   image put it outside any filesystem.
+
+### §11.6 Prerequisites before the extent is written more than once per boot
+
+- **Bind the extent to device identity.** The published extent is absolute LBAs with no `vol_id` /
+  `num_blocks` binding, and nothing re-checks at write time. Harmless while arm and write happen
+  inside one `sdhc_probe_once` call with one write per boot — but the moment a service loop writes
+  repeatedly, a hot-swap makes the extent point at a different medium. Close it the way
+  `flight_recorder.rs`'s FRSTAMP does before that arc lands.
+- **cfg blind spot.** `sdhcblk` and `sdw` are carried by exactly one leg (`x86-all`) and it carries
+  BOTH, so `all(sdhcblk, not(sdw))` — the write-refusal arm and this module's skip arm — is
+  type-checked by zero legs of `./arroyo check`. It compiles clean by hand and is exercised by the
+  QEMU fixture; either add an `x86-sdhcblk-nosdw` leg or read that polarity as fixture-covered only.
+- **The bench card carries no reserved file.** Boot AO's root listing has 11 entries and no
+  `UNALOG.BIN`, so the first metal boot of this build takes the honest-refusal path
+  (`permit=UNARMED (absent from the card's root directory)`) and writes nothing. Staging the file
+  is a prerequisite for exercising the interesting path — and clusters 2+ are already occupied, so
+  the staged file will NOT start at cluster 2 and the extent will not be `[216..344)`. Read the
+  first cluster K off the host before the boot; the extent is `[216 + (K-2)*4 .. +128)`.
