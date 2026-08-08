@@ -114,3 +114,11 @@ before. Any change there refutes the "shared code, widened cfg" claim.
 - `./arroyo kernel8` — builds; reproducible (same sources twice → same hash).
 - Metal is the only thing that can decide the above. QEMU delivers no EHCI HID, so no repeat is ever
   synthesised there and the QEMU paths are byte-identical in behaviour.
+
+## Ninth signature (review condition c)
+
+- Repeat stops mid-hold with no release: check for an xHCI keyboard slot teardown line in the
+  same window — `note_keyboard_detached` is cross-device, so an external keyboard bounce
+  disarms the internal hold (safe direction). Distinct from the UVUG-9 latch (window=1000)
+  and from HOLD_MAX_MS (30s, prints `[uvug9] typematic hold-max`).
+- Operator expectation: held Enter re-executes the shell line at ~25/s (correct, Pi-equal, new here).

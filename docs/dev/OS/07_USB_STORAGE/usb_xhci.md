@@ -5552,6 +5552,23 @@ The same fact, from the same cause, is what UVUG-5 was written for on aarch64.
 
 ### 18.3 The fix: the shared tracker, not a second one
 
+Two review-found boundaries of the fix, on the record before the metal proof:
+
+- **`pal::pump_and_poll` does not tick.** The three top-level x86 service loops all tick the
+  tracker; `pump_and_poll` (the inner pump kernel full-screen demos hold while they block a
+  shell command) services EHCI but deliberately does NOT call `typematic_tick` — on the
+  SCHED-X86 shape the service core's `x86_usb_pump` keeps ticking concurrently, and a second
+  ticker on the demo core would race it. The cost is confined to the inline-BSP boot shape
+  (<2 APs) with a kernel demo active: reports still arm, but no repeats inject for the
+  demo's duration. Known, bounded, and the wire shows it (no `[keystat]` between the demo's
+  entry and exit lines on that shape).
+- **Cross-device detach coupling.** `note_keyboard_detached` is bumped by ANY keyboard slot
+  teardown, including an xHCI external keyboard detaching or enum-recovering — which disarms
+  a hold on the internal EHCI keyboard mid-repeat (safe direction: a lost repeat, never a
+  stuck key). "Repeat stopped when an unrelated USB device bounced" is this, not a bug.
+- Operator note: holding **Enter** at the shell now re-executes the line at ~25/s — same as
+  the Pi, correct, and new on this machine.
+
 `pal.rs`'s host-side typematic tracker was `#[cfg(all(target_arch = "aarch64", feature =
 "baremetal"))]`. Its cfg is widened to
 

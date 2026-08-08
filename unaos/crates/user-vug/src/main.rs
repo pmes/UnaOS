@@ -1088,8 +1088,8 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
     //     `user_input_set_active` deliberately does NOT drain `pal::EVENT_QUEUE`. So the RELEASE of
     //     the Enter that launched the program — tens of milliseconds behind its press, well inside a
     //     human key hold — routes into the freshly focused ring and sets this bit long before any
-    //     400 ms delay could expire. Moot in the other direction too: x86 has no typematic
-    //     synthesiser at all, so there is nothing there to repeat.
+    //     400 ms delay could expire. (Since the keyrepeat arc x86 runs the shared typematic
+    //     synthesiser too — its repeats land here and are absorbed by the same press-edge test.)
     //   * On aarch64 — the arch where the repeat engine that makes this matter actually LIVES — that
     //     mitigation does NOT transfer, and assuming it did would be the comfortable wrong answer.
     //     `user_input_set_active` there drains and DISCARDS the pre-launch queue on purpose
