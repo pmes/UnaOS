@@ -745,7 +745,11 @@ pub const KERNEL_OWNER_BASE: u64 = 0xFFFF_FF00;
 /// CLICK-X86: the panel console's row (`fbcon::panel_console_window_open`).
 pub const KERNEL_OWNER_CONSOLE: u64 = KERNEL_OWNER_BASE + 1;
 
-/// CLICK-X86: the desktop demo window's row (`wcx::activate`).
+/// CLICK-X86: the desktop furniture's row. **No producer since the kernel-apps eviction** — it named
+/// `wcx::activate`'s kernel-drawn demo window, which is now a ring-3 process (`STAT.ELF`) owning an
+/// ordinary user row. Kept as a RESERVED value rather than deleted: [`is_kernel_owner`] is a range
+/// test over the whole band, the console row above still uses it, and the next piece of kernel-owned
+/// desktop furniture should take this number rather than mint a third one.
 pub const KERNEL_OWNER_DESKTOP: u64 = KERNEL_OWNER_BASE + 2;
 
 /// CLICK-X86 — is `asid` in the reserved kernel-owner band? `false` for `0`, which still means

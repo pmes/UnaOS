@@ -43,17 +43,46 @@
 //!
 //! The console window is the only window this module creates. The SECOND window on the desktop is a
 //! ring-3 PROCESS — see *The desktop's second window is a program* below — created later, by its own
-//! `SYS_WIN_CREATE`, and therefore carrying the later `z`. The sitting still shows two real windows
-//! with real occlusion between them; one of them now has a pid.
+//! `SYS_WIN_CREATE`, and therefore carrying the later `z`. The sitting shows two real windows, one of
+//! which now has a pid.
+//!
+//! **It does NOT show occlusion between them, and an earlier draft of this doc claimed it did.** The
+//! console is PINNED by `create_at` and the desktop app is not: it goes through the ordinary tiler,
+//! which places a 128x128 surface at `(9,21)` on this panel. On the 2880x1800 bench panel the console
+//! box spans x 783..2097 and the app's box spans x 8..778 — they miss by five pixels. Occlusion was
+//! one of the two things the deleted demo window existed to demonstrate, and it is not demonstrated
+//! any more. Deliberately NOT fixed by moving the app's row: `SPAWN-PLACE` exists because
+//! create-then-move showed on the metal (s41) as a window that appears at the tiler's origin and
+//! jumps, plus an abandoned box the move has to erase — re-introducing that to stage a screenshot
+//! would be paying a real defect for a demonstration. Recorded as lost coverage instead.
 //!
 //! ### The desktop's second window is a PROGRAM (kernel-apps eviction, move #1)
 //!
 //! This module used to author a 96x64 calibration surface and open a kernel-owned window over it —
-//! ~110 ring-0 lines that shipped on every boot to prove exactly one thing: that a second window
-//! exists, occludes the console, and composites. `STAT.ELF` is that same fixture in ring 3, it is
-//! already staged on the DATA volume, and the x86 metal capture has it passing end-to-end 24 times.
-//! Peter's directive is that the apps in the kernel move into user space, and panel furniture drawn
-//! by the kernel for a human to look at is an app by the boundary rule in the eviction survey.
+//! ~110 ring-0 lines that shipped on every boot. `STAT.ELF` is a ring-3 fixture of the same shape, it
+//! is already staged on the DATA volume, and the x86 metal capture has it passing end-to-end 24
+//! times. Peter's directive is that the apps in the kernel move into user space, and panel furniture
+//! drawn by the kernel for a human to look at is an app by the boundary rule in the eviction survey.
+//!
+//! **What the eviction COSTS, named rather than glossed.** The deleted `paint_demo` was a calibration
+//! target with four distinct diagnostic jobs, and `STAT.ELF` — which draws a pid and a frame counter
+//! — replaces none of them one-for-one:
+//!
+//!   * *content extent vs the kernel-drawn border* — PARTLY covered. Any window's chrome is drawn by
+//!     `wm` from its own constants, and the console window's `[wc-x] console-window … box=` line
+//!     states the box arithmetic on the wire, so the relationship is checkable without a photograph.
+//!   * *GOP channel-order survival* (the R/G/B bars) — **LOST.** Nothing else on the panel proves
+//!     `put_pixel`'s per-layout re-encode by eye, and a swapped pair used to show instantly.
+//!   * *isotropic nearest-neighbour upscale* (the diagonal) — **LOST as a visual check.** The app is
+//!     still upscaled (128x128 at 6x here), so a gross stride error still deforms it, but there is no
+//!     figure whose distortion is diagnostic.
+//!   * *dropped/duplicated rows* (the single-pixel checkerboard) — **LOST as a visual check**, and
+//!     this is the one with an instrumented replacement: `video/wcg.rs` checksums a surface at four
+//!     moments around one blit, which asks the same question on the wire instead of on glass.
+//!
+//! Two of the four are genuinely gone and the eviction survey did not record it. That is a knowing
+//! trade — ~110 ring-0 lines on every boot against two by-eye checks nobody has needed since the
+//! panel path settled — and it is written here so it is a decision and not an accident.
 //!
 //! So the demo window is GONE and what replaces it is a launch. The launch cannot happen HERE:
 //! [`activate`] runs mid-`takeover_display`, from inside PCI enumeration, where there is no FAT
@@ -201,24 +230,27 @@ impl SurfaceDesc {
 
 /// ACTIVATE-ONCE — the origin that owns the compositor, or [`ORIGIN_NONE`].
 ///
-/// This REPLACES `DEMO_WIN` as the re-entry guard, and the replacement is the point. `DEMO_WIN` is
-/// stored LATE — after the desktop clear, the console window and the demo window — so every DECLINE
-/// path returned with it still clear. With one caller that was harmless; with two it is a hole a
-/// second entry walks straight through, running a second full-panel `fill_screen` over a live
-/// compositor (the exact "second writer" this module's front-buffer law forbids) and then finding
-/// `panel_console_window_open` hand back the EXISTING console window against the new geometry.
+/// This REPLACED a re-entry guard (`DEMO_WIN`) that was stored LATE — after the desktop clear, the
+/// console window and the demo window — so every DECLINE path returned with it still clear. With one
+/// caller that was harmless; with two it is a hole a second entry walks straight through, running a
+/// second full-panel `fill_screen` over a live compositor (the exact "second writer" this module's
+/// front-buffer law forbids) and then finding `panel_console_window_open` hand back the EXISTING
+/// console window against the new geometry.
 ///
 /// So the latch is claimed at the TOP and RELEASED on every decline: a genuinely-failed first
 /// attempt must not permanently kill the compositor for the other origin, while a SUCCESSFUL first
 /// attempt is final and the second caller is refused with one line.
 ///
-/// ⚠ RESIDUAL, named rather than hidden: the last two decline paths (`geometry-unavailable`,
-/// `create-failed`) are reached AFTER the desktop clear and AFTER the console window exists, so the
-/// release hands the next origin an entry that would clear the panel underneath a live console
-/// window. That is the lesser of the two evils only because those two declines mean the window table
-/// itself refused, and a compositor that cannot open a window has nothing to protect. A second
-/// caller must not retry past a post-console decline; the `latch=released` on the line is what tells
-/// it which decline it was.
+/// ⚠ RESIDUAL, named rather than hidden — and NARROWED to one path by the kernel-apps eviction. The
+/// hole is a decline reached AFTER the desktop clear, because the release then hands the next origin
+/// an entry that would clear the panel underneath a live console window. There used to be three such
+/// paths; deleting the demo window deleted two of them (`geometry-unavailable` and `create-failed`,
+/// both of which were the demo's own `spawn_geometry`/`create_at`), and the arming that replaced them
+/// cannot fail. **The one that remains is `console-window-declined`** — and it is the least harmful
+/// of the three, because it fires when the window table itself refused the console, at which point
+/// the compositor owns no window and has nothing to protect. A second caller must still not retry
+/// past a post-console decline; the `latch=released` on the line is what tells it which decline it
+/// was.
 static ACTIVATED: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(ORIGIN_NONE);
 
@@ -246,6 +278,18 @@ const DESKTOP_APP: &str = "STAT.ELF";
 /// disowned. This is set exactly once, at the end of a SUCCESSFUL activation, and never cleared.
 static DESKTOP_APP_ARMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// DESKTOP-APP — how long [`desktop_app_service`] waits for a block device before giving up OUT LOUD.
+///
+/// Generous against this bench: the deferred SCSI bring-up behind `service_storage` can run for
+/// seconds after xHCI enumeration, and refusing early would turn a slow stick into a missing one.
+/// The number matters far less than the fact that the wait TERMINATES in a line rather than in
+/// silence — see the bounded-wait note in `desktop_app_service`.
+const STORAGE_WAIT_MS: u64 = 30_000;
+
+/// DESKTOP-APP — `ticks()` at the first service pass that found no block device, or `0` for "the
+/// wait has not started". Written and read only by the single pinned service task, hence `Relaxed`.
+static WAIT_SINCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Gap in panel pixels between a pinned window's outer box and the panel edge. Matches `wm`'s own
 /// tiling gap in spirit. Witness-only since the demo window went to ring 3 — the MOVE-VACATE probe is
@@ -482,7 +526,28 @@ pub fn desktop_app_service() {
     // The same storage gate `fat::probe_once` uses, for the same reason: `mount()` on a boot whose
     // xHCI has not yet enumerated a stick is a "no volume" that means "not yet", not "not ever", and
     // consuming the one-shot on it would refuse a launch the media could have served.
+    //
+    // BOUNDED, not open-ended. Waiting forever was the honest-looking version and it is the weakest
+    // form of evidence this tree accepts: on a boot where nothing ever enumerates, an unbounded wait
+    // discharges the ARMED line's stated job — "a boot that arms and never launches is visibly a boot
+    // that lost its program" — purely by ABSENCE. So the wait gives up OUT LOUD. The clock starts at
+    // the first pass rather than at boot, so a late activation does not eat the budget, and
+    // `.max(1)` keeps `0` meaning "not started" even in the vanishing case where `ticks()` reads 0.
     if crate::drivers::block::info().is_none() {
+        let now = crate::arch::ticks();
+        let started = WAIT_SINCE_MS.load(Ordering::Relaxed);
+        if started == 0 {
+            WAIT_SINCE_MS.store(now.max(1), Ordering::Relaxed);
+            return;
+        }
+        if now.saturating_sub(started) < STORAGE_WAIT_MS {
+            return;
+        }
+        DONE.store(true, Ordering::Relaxed);
+        serial_println!(
+            "[wc-x] desktop-app DECLINE reason=no-storage name=/{} waited={}ms — no block device ever enumerated; the desktop keeps the console window only",
+            DESKTOP_APP, STORAGE_WAIT_MS
+        );
         return;
     }
     DONE.store(true, Ordering::Relaxed);
@@ -505,6 +570,15 @@ pub fn desktop_app_service() {
         );
         return;
     };
+    // A DIRECTORY called `STAT.ELF` would otherwise reach `read_file`, come back `IsDirectory`, and
+    // be reported as `read-failed` — contained, but mislabelled, and the operator would go looking
+    // for a bad volume instead of a bad name.
+    if de.is_dir {
+        serial_println!(
+            "[wc-x] desktop-app DECLINE reason=is-directory name=/{}", DESKTOP_APP
+        );
+        return;
+    }
     let cap = crate::arch::syscall::user_window_size();
     if de.size == 0 || de.size as usize > cap {
         serial_println!(
@@ -518,12 +592,60 @@ pub fn desktop_app_service() {
         serial_println!("[wc-x] desktop-app DECLINE reason=read-failed name=/{}", DESKTOP_APP);
         return;
     }
+    // SHORT READ. `read_file`'s own doc: a file whose cluster chain ends before `de.size` yields a
+    // SHORT READ rather than an error. FATREAD-1 was exactly this class of silent mismatch — it is
+    // what blocked `bg /fat/STAT.ELF` on x86 — and the shell's `read_el0_image` carries this check
+    // for that reason. Without it the loader gets a truncated image and reports something unrelated.
+    if bytes.len() != de.size as usize {
+        serial_println!(
+            "[wc-x] desktop-app DECLINE reason=short-read name=/{} got={} want={}",
+            DESKTOP_APP, bytes.len(), de.size
+        );
+        return;
+    }
     if !(bytes.len() >= 4 && bytes[0..4] == [0x7F, b'E', b'L', b'F']) {
         // The loader would otherwise take this down its FLAT-blob path. Same refusal, and the same
         // reason, as the shell's BARE-EXEC arm: a name launches ELF programs, nothing else.
         serial_println!(
             "[wc-x] desktop-app DECLINE reason=not-elf64 name=/{} bytes={}",
             DESKTOP_APP, bytes.len()
+        );
+        return;
+    }
+    // THE HEADER CHECKS THE SIBLING LOADER PATH ALREADY MAKES — `read_el0_image`'s, verbatim in
+    // meaning if not in wording. The `e_machine` one is the load-bearing addition and the reason this
+    // block exists at all: **both arches stage a file called `STAT.ELF`**, so an aarch64 image on x86
+    // media is the single most likely media mistake this arc will meet, and it is precisely the
+    // mistake the eviction's whole failure story is about. Without these it lands as
+    // `reason=spawn-rejected why=<loader string>` — contained, but naming the loader's complaint
+    // rather than the operator's error.
+    if bytes.len() < 20 {
+        serial_println!(
+            "[wc-x] desktop-app DECLINE reason=truncated-header name=/{} bytes={} (need >= 20 for e_machine)",
+            DESKTOP_APP, bytes.len()
+        );
+        return;
+    }
+    if bytes[4] != 2 {
+        serial_println!(
+            "[wc-x] desktop-app DECLINE reason=not-elf64-class name=/{} ei_class={} (want 2)",
+            DESKTOP_APP, bytes[4]
+        );
+        return;
+    }
+    if bytes[5] != 1 {
+        serial_println!(
+            "[wc-x] desktop-app DECLINE reason=not-little-endian name=/{} ei_data={} (want 1)",
+            DESKTOP_APP, bytes[5]
+        );
+        return;
+    }
+    let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+    if machine != 62 {
+        // 62 = EM_X86_64; 183 = EM_AARCH64, i.e. the Pi's STAT.ELF staged on x86 media.
+        serial_println!(
+            "[wc-x] desktop-app DECLINE reason=wrong-arch name=/{} e_machine={} (want 62 = EM_X86_64; 183 = EM_AARCH64 means the aarch64 STAT.ELF is on this stick)",
+            DESKTOP_APP, machine
         );
         return;
     }

@@ -3173,8 +3173,10 @@ fn sys_sleep_ms(ms: u64) -> i64 {
 
 // =============================================================================================
 // WINX-1 — the WINDOW SURFACE/VERB SEAM. The x86 twin of the aarch64 WC-B block, wired to the SAME
-// arch-neutral compositor (`video::wm`), which has always been arch-neutral and until now had no x86
-// caller other than `video/wcx.rs`'s kernel-drawn demo window.
+// arch-neutral compositor (`video::wm`), which has always been arch-neutral and until this seam had
+// no x86 caller other than `video/wcx.rs`'s activation. (That activation's own windows were the
+// console and a kernel-drawn demo window; since the kernel-apps eviction only the console remains,
+// and the desktop's second window comes through THESE verbs like any other program's.)
 //
 // TWO INDICES, deliberately distinct (the aarch64 distinction, and it matters for the same reasons):
 //   * the WINDOW ID (0..WIN_MAX) — GLOBAL, what ring 3 passes to the verbs;
@@ -3332,11 +3334,77 @@ static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
 /// window as `SLOT_DETACHED` — after `load_program_common` has named the slot and before the task can
 /// run — which makes the exemption unraceable rather than probably-early-enough.
 ///
-/// Narrow on purpose. It suppresses the AUTOMATIC grant only: the desktop app stays in `focus_ring`,
-/// stays hittable, and `<TAB>` or a click still gives it the keyboard if the operator wants it to
-/// have it. Nothing here can take focus away from anyone.
+/// Narrow on purpose. It withholds the two gestures that would hand the keyboard to this window
+/// WITHOUT the operator naming it — the first-window grant here, and the raise-and-deliver click in
+/// [`wc_click_route_at`] (which the replaced kernel row also declined). `<TAB>` still reaches it:
+/// the row stays in `focus_ring_apps`, so the app is one keystroke away for anyone who wants it.
+/// Nothing here can take focus away from anyone.
+///
+/// ### `wc`-gated, and what that does and does not buy
+///
+/// The exemption exists for `video::wcx`'s desktop app, which does not exist without `UNAOS_WC=1`.
+/// The flag, both of its readers ([`slot_is_focus_exempt`] and [`owner_is_focus_exempt`]) and the
+/// spawn entry point are all gated, so a plain x86 kernel carries no static, no branch on the
+/// `SYS_WIN_CREATE` path, no arm in the click router and neither witness string — no feature code at
+/// all, and no behaviour change.
+///
+/// It does NOT buy byte-identity, and the claim was checked rather than assumed. Knob-off `esp-x86`
+/// built at the arc's base and at this commit, in the same worktree path, differs: 56 bytes of
+/// symbol-string table, plus NINE bytes inside a `.text` that is the same size (925727 B) with no
+/// named function changing size — relocated rodata immediates in this file, whose anon-constant
+/// ordering moved when `spawn_user_image_bg` became a wrapper over `spawn_user_image_bg_inner`.
+/// `arroyo`'s knob comment says so now; it used to claim byte-identity, and that would have been
+/// false. aarch64 IS byte-identical — no aarch64 file is touched at all.
+#[cfg(feature = "wc")]
 static SLOT_NO_AUTOFOCUS: [AtomicBool; crate::arch::memory::USER_SLOTS] =
     [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+
+/// DESKTOP-APP: is `slot` exempt from the first-window focus grant — and SAY SO if it is.
+///
+/// The witness line lives here rather than at the call site so both readers of the flag cannot drift
+/// apart in what they print. Note what this line is and is not evidence of (review F13): it fires on
+/// EVERY `SYS_WIN_CREATE` from an exempt slot, including ones where `USER_INPUT_ACTIVE != 0` and the
+/// grant would not have fired anyway. It is the ABSENCE of the paired
+/// `input focus -> slot N (first window, shell was idle)` that carries the load; quote them together.
+#[cfg(feature = "wc")]
+fn slot_is_focus_exempt(slot: usize) -> bool {
+    if !SLOT_NO_AUTOFOCUS[slot].load(Ordering::Acquire) {
+        return false;
+    }
+    serial_println!(
+        ":: wc-x86: input focus NOT granted to slot {} (desktop app — exempt from the first-window grant; <TAB> still reaches it) ::",
+        slot
+    );
+    true
+}
+#[cfg(not(feature = "wc"))]
+fn slot_is_focus_exempt(_slot: usize) -> bool {
+    false
+}
+
+/// DESKTOP-APP: is `owner` — a `wm` owner ASID, `slot + 1`-BIASED — an exempt slot's window?
+///
+/// The bias is the whole of the arithmetic here and it is the thing to get wrong: `wm` owners for
+/// user rows are `slot + 1` (see the CLICK-X86 note in `sys_win_create`), kernel furniture lives in a
+/// reserved band far above `USER_SLOTS`, and `0` means "nobody owns this row". Both of those are
+/// rejected before the subtraction, and the result is bounds-checked, so no owner value from the
+/// table can index outside the array.
+///
+/// Silent — unlike [`slot_is_focus_exempt`], which prints. The click router has its own witness
+/// (`clickroute_witness`) and reports this arm as `consume`, so a second line here would double-count
+/// the same gesture in the ledger.
+#[cfg(feature = "wc")]
+fn owner_is_focus_exempt(owner: u64) -> bool {
+    if owner == 0 || crate::video::wm::is_kernel_owner(owner) {
+        return false;
+    }
+    let slot = (owner - 1) as usize;
+    slot < crate::arch::memory::USER_SLOTS && SLOT_NO_AUTOFOCUS[slot].load(Ordering::Acquire)
+}
+#[cfg(not(feature = "wc"))]
+fn owner_is_focus_exempt(_owner: u64) -> bool {
+    false
+}
 
 /// WINX-7: the process-flags word's DETACHED bit, at info-page byte offset `0x20`. Bit 0, the same
 /// bit and the same offset the aarch64 info page uses, so one arch-neutral program reads it on both.
@@ -3466,15 +3534,12 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // that is right for a launch the operator asked for and wrong for the one the compositor asks
     // for at boot. See [`SLOT_NO_AUTOFOCUS`] for the full argument. The CAS is skipped rather than
     // undone: publishing focus and then taking it back would be a real transition the whole ledger
-    // would have to account for, and there is nothing here to take back.
-    if SLOT_NO_AUTOFOCUS[slot].load(Ordering::Acquire) {
-        serial_println!(
-            ":: wc-x86: input focus NOT granted to slot {} (desktop app — exempt from the first-window grant; <TAB> or a click still reaches it) ::",
-            slot
-        );
-    } else if USER_INPUT_ACTIVE
-        .compare_exchange(0, (slot as u64) + 1, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+    // would have to account for, and there is nothing here to take back. `slot_is_focus_exempt` is
+    // a `const false` on a non-`wc` build, so this reads as the unqualified original there.
+    if !slot_is_focus_exempt(slot)
+        && USER_INPUT_ACTIVE
+            .compare_exchange(0, (slot as u64) + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     {
         clear_input_row(slot); // a fresh focus starts clean, exactly as `user_input_set_active` does
         serial_println!(":: wc-x86: input focus -> slot {} (first window, shell was idle) ::", slot);
@@ -4304,6 +4369,34 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         match crate::video::wm::hit_test(x, y) {
             // KERNEL FURNITURE — raise it, hand the keyboard to the shell, consume the press.
             Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => {
+                clickroute_witness(x, y, win, owner, cur, "consume", 0);
+                user_input_set_active(0);
+                crate::video::wm::focus_changed(owner);
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                true
+            }
+            // DESKTOP-APP FURNITURE — a USER row whose slot is exempt from the focus grant. Treated
+            // exactly like the kernel-furniture arm above, and placed above BOTH app arms so it
+            // fires whether or not the row already holds focus — which is what makes it furniture
+            // rather than a focus target that merely starts unfocused.
+            //
+            // ### Why this arm exists
+            //
+            // The row this replaced was `KERNEL_OWNER_DESKTOP` and took the FIRST arm: clicking the
+            // desktop's furniture raised it and handed the keyboard to the SHELL. Making that same
+            // furniture a ring-3 process moved it into the arm below, which does the opposite
+            // (`user_input_set_active(owner)`), so the identical operator gesture on the identical
+            // piece of desktop went from "a reliable way to get the prompt back" to "a reliable way
+            // to lose the keyboard to a program with no `SYS_INPUT_POLL` at all". Recoverable with
+            // `<TAB>`, but inverted and silent, and inverted against the very thing being evicted.
+            //
+            // [`SLOT_NO_AUTOFOCUS`] already names exactly the set this applies to — kernel-initiated
+            // launches, of which there is one — so the click path asks the same question the grant
+            // path asks instead of inventing a second notion of furniture. Nothing is made
+            // unreachable: the desktop app stays in `focus_ring_apps`, so `<TAB>` still gives it the
+            // keyboard for anyone who wants it to have it. What is withheld is only the gesture that
+            // used to mean the opposite.
+            Some((win, owner, _z)) if owner_is_focus_exempt(owner) => {
                 clickroute_witness(x, y, win, owner, cur, "consume", 0);
                 user_input_set_active(0);
                 crate::video::wm::focus_changed(owner);
@@ -10375,7 +10468,9 @@ pub fn clear_handle_row(slot: usize) {
     // and skip its own frame cap.
     SLOT_DETACHED[slot].store(false, Ordering::Release);
     // DESKTOP-APP: per-TENANT for exactly the same reason — an operator-typed launch that lands in the
-    // slot the desktop app vacated must get the ordinary first-window grant.
+    // slot the desktop app vacated must get the ordinary first-window grant, AND must not have its
+    // clicks consumed as furniture. Both readers of the flag depend on this clear.
+    #[cfg(feature = "wc")]
     SLOT_NO_AUTOFOCUS[slot].store(false, Ordering::Release);
     for i in 0..NHANDLE {
         // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind),
@@ -12307,7 +12402,8 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
 ///
 /// Deliberately NOT a public policy knob for the shell: `bg`, `run` and BARE-EXEC are operator-driven
 /// launches and must keep the ordinary grant. This entry point exists for kernel-initiated launches
-/// and has exactly one caller.
+/// and has exactly one caller — and it is `wc`-gated, because that caller is.
+#[cfg(feature = "wc")]
 pub fn spawn_user_image_bg_no_autofocus(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
     spawn_user_image_bg_inner(bytes, true)
 }
@@ -12316,6 +12412,7 @@ fn spawn_user_image_bg_inner(
     bytes: &[u8],
     no_autofocus: bool,
 ) -> Result<(u64, u64, u64), &'static str> {
+    let _ = no_autofocus; // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
     let (mapped, pi) = load_program_common(bytes)?;
     // WINX-7: mark the slot DETACHED before the task can run, so its first `SYS_WIN_CREATE` publishes
     // the flag and the program never observes a stale `false`. See `SLOT_DETACHED` for why a windowed
@@ -12323,6 +12420,7 @@ fn spawn_user_image_bg_inner(
     SLOT_DETACHED[mapped.slot].store(true, Ordering::Release);
     // DESKTOP-APP: the focus exemption, in the SAME pre-spawn window and for the same reason — the
     // flag has to be true before the task exists, not before it gets around to opening a window.
+    #[cfg(feature = "wc")]
     SLOT_NO_AUTOFOCUS[mapped.slot].store(no_autofocus, Ordering::Release);
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
     // Place a bg job on a core chosen by the same round-robin the fixtures use rather than the shell's

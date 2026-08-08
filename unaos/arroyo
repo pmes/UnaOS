@@ -337,9 +337,22 @@ _feats=""
 # SCHED-X86 device-service pass once storage is up, launches the shipped ring-3 STAT.ELF through the
 # same loader `bg`/BARE-EXEC use. STAT.ELF must be on the DATA volume (target/x86_64_data/), or the
 # boot prints one DECLINE line and continues with the console window alone. x86_64-only module;
-# DEFAULT OFF => the module and BOTH of its call sites are unlinked, so every x86 and aarch64
-# artifact is byte-identical without it. Needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach the
-# activation seam. Kept in sync with builder/src/main.rs.
+# DEFAULT OFF => the module, BOTH of its call sites, and the whole SLOT_NO_AUTOFOCUS focus-exemption
+# (its flag, the grant check in sys_win_create, the click-router arm and both witness strings) are
+# unlinked. aarch64 stays BYTE-IDENTICAL.
+#
+# ⚠ x86 with the knob OFF is FUNCTIONALLY unchanged but NOT byte-identical after the kernel-apps
+# eviction, and the old wording here claimed otherwise. Measured, not reasoned: knob-off esp-x86
+# built at 38ae067e and at this arc, same worktree path, gives kernel.elf sha256 1205c2ec… vs
+# 0a929c50…. The delta is 56 bytes of symbol-string table and NINE bytes inside .text (which is the
+# same size, 925727 B, with no named function changing size) — relocated rodata immediates in
+# arch/x86_64/syscall.rs, whose anon-constant ordering moved when spawn_user_image_bg was refactored
+# into a wrapper over spawn_user_image_bg_inner. Nothing the knob gates is present; the module simply
+# was not left bit-for-bit undisturbed. Say "no feature code and no behaviour change", not
+# "byte-identical", for x86 from here on.
+#
+# Needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach the activation seam.
+# Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_WC:-}" ] && _feats="${_feats}wc,"
 # INSTGUI: UNAOS_INSTGUI=1 opens the graphical installer dialog on the wc desktop (implies wc).
 [ -n "${UNAOS_INSTGUI:-}" ] && _feats="${_feats}instgui,"
