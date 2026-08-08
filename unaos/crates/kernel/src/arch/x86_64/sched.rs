@@ -3512,6 +3512,44 @@ pub fn run_bsp(cpu: usize) -> ! {
 /// "scheduler context". Never returns. Pops a task, switches into it, and — when it switches back
 /// (yield / preempt / exit) — requeues or frees it, then repeats; idles in an atomic `sti; hlt`
 /// when the queue is empty.
+/// VUGPAUSE-2/x86: milliseconds between two runs of the input-wait backstop. The global timebase is
+/// 1 kHz (`apic::ticks()` is ms), so 256 is ~4 wake/poll/re-park cycles per second for an idle app.
+/// Far below what a load meter can resolve, and far inside any liveness bound measured in polls: the
+/// app keeps its old "I am still polling" contract with the watchdogs while costing effectively nothing.
+const INPUT_WAIT_BACKSTOP_MS: u64 = 256;
+
+/// VUGPAUSE-2/x86: the ms at which the next backstop pass is due. GLOBAL rather than per-CPU, and
+/// claimed by CAS, so the cadence is ONE pass per period across the whole machine and not one per core
+/// — six cores each waking every parked app would be six times the work for exactly the same effect.
+static INPUT_WAIT_BACKSTOP_DUE: AtomicU64 = AtomicU64::new(0);
+
+/// VUGPAUSE-2/x86: run the input-wait backstop if its period has elapsed. Called from the scheduler
+/// loop top. A loser of the CAS simply skips; it does not spin or retry.
+///
+/// `apic::ticks()` advances from the BSP's timer IRQ, so this is a load of an atomic that barely moves
+/// before the APIC heartbeat is armed. Nothing is lost there — nothing can be parked in
+/// `SYS_INPUT_WAIT` before ring 3 exists.
+#[inline]
+fn input_wait_backstop() {
+    let now = apic::ticks();
+    let due = INPUT_WAIT_BACKSTOP_DUE.load(Ordering::Relaxed);
+    if now < due {
+        return;
+    }
+    if INPUT_WAIT_BACKSTOP_DUE
+        .compare_exchange(
+            due,
+            now.wrapping_add(INPUT_WAIT_BACKSTOP_MS),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    crate::arch::x86_64::syscall::user_input_wake_backstop();
+}
+
 fn run() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
     // Aging sweep cadence, kept as a stack local (run() is `-> !`, entered once per CPU, so this
@@ -3531,6 +3569,12 @@ fn run() -> ! {
         // an idle CPU with only a pending sleeper makes progress; worst-case wake latency is one
         // tick. Same CPU, no IPI — `make_ready` pushes onto this CPU's own run queue.
         drain_due_sleepers(cpu);
+
+        // VUGPAUSE-2/x86: release every task parked in `SYS_INPUT_WAIT`, on a coarse cadence. Here for
+        // the same structural reason as the sleeper drain above — it is a periodic re-ready pass, it
+        // needs `make_ready`, and this is the one place in the kernel that runs forever on every core
+        // with IRQs masked and no lock held.
+        input_wait_backstop();
 
         // Age then pick, under ONE run-queue lock acquisition: run the anti-starvation sweep (gated
         // to ~every AGING_INTERVAL ticks) AFTER the sleeper drain (so freshly-woken sleepers, pushed

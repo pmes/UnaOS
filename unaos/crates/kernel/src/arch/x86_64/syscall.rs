@@ -83,8 +83,19 @@ const FUTEX_WAKE: u64 = 1;
 // WINX-7: SYS_INPUT_POLL() -> a packed input event (>= 0, bit 63 always clear) / -EAGAIN when the
 // caller's ring is empty. The delivery half of "a ring-3 app can be interactive": the kernel holds a
 // small per-process ring, the router fills the FOCUSED process's ring, and ring 3 drains its own
-// nonblocking. 28 is unassigned on both arches.
+// nonblocking. 28 is `SYS_INPUT_WAIT`, its blocking half — see below.
 const SYS_INPUT_POLL: u64 = 27;
+// VUGPAUSE-2/x86: `SYS_INPUT_WAIT() -> 0 / -EINVAL` — the BLOCKING half of the pair. Block until the
+// CALLING process's input ring is (or may be) non-empty. Nothing is dequeued: the caller's ordinary
+// `SYS_INPUT_POLL` drain runs next and sees every event, which is what lets an app fold this in with
+// no restructuring. `-EINVAL` off the shared kernel window (no private slot) or off a schedulable
+// task.
+//
+// SHARED-NUMBER LAW: 28, no arguments, `0`/`-EINVAL`, identical to `arch/aarch64/syscall.rs`'s
+// `SYS_INPUT_WAIT` (const at its :192, dispatch at its :6190, handler at its :12976). `user-vug`'s
+// `input_wait()` is `sys0(SYS_INPUT_WAIT)` — one arch-neutral source line that until this commit fell
+// through this dispatcher's `_ => -38` on x86 and turned the designed park into a tight busy loop.
+const SYS_INPUT_WAIT: u64 = 28;
 // U4x: the process-model pair (same numbers as aarch64 U4). `sys_spawn` loads the fixed on-disk
 // program (`HELLO.BIN`) into a fresh slot, runs it ring-3 as a CHILD, and returns a small HANDLE
 // index into the caller's per-process handle table; `sys_wait(handle)` blocks until that child exits
@@ -2598,6 +2609,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_THREAD_EXIT => sys_thread_exit(), // never returns
         SYS_FUTEX => sys_futex(a0, a1, a2),
         SYS_INPUT_POLL => sys_input_poll(),
+        SYS_INPUT_WAIT => sys_input_wait(),
         // PULSE-1: the per-core load sample. Unconditional for the same reason the window verbs are —
         // core ring-3 surface a monitoring app is written against, backed by a sampler that is always
         // compiled.
@@ -3487,6 +3499,15 @@ pub fn set_hidden(asid: u64, on: bool) {
     let slot = (asid - 1) as usize;
     SLOT_HIDDEN[slot].store(on, Ordering::Release);
     fb_info_write_flags(slot);
+    // VUGPAUSE-2/x86: an UNHIDE is a wake edge, and it is the one the ring cannot supply. A hidden app
+    // is by construction not the focused one, so nothing is routed to it; if it is parked in
+    // `sys_input_wait` the only thing that changed when it became visible again is the word written
+    // just above — which nothing wakes on. Without this the restore would wait for the backstop
+    // (~256 ms) or, if the tick is not live, forever. Ordered AFTER the info-page publish so the woken
+    // app's first read of the flags word already shows it visible and it does not immediately re-park.
+    if !on {
+        user_input_wake_edge(slot, "unhide");
+    }
 }
 
 /// VUGMIN/x86: clear `slot`'s hidden bit on teardown. Called from [`clear_handle_row`] beside the
@@ -3872,6 +3893,135 @@ static USER_INPUT_HEAD: [AtomicU32; crate::arch::memory::USER_SLOTS] =
 static USER_INPUT_TAIL: [AtomicU32; crate::arch::memory::USER_SLOTS] =
     [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
 
+/// VUGPAUSE-2/x86: per-slot "this slot has a task parked in [`sys_input_wait`]" flag. Set immediately
+/// before the futex park, cleared immediately after it returns — and ALSO cleared on slot teardown by
+/// [`clear_input_parked`], because the park is a kill boundary the task can `exit()` out of
+/// (`sched::futex_wait`'s pre-park `task_kill_armed` refusal, and `kill_wake_parked`'s eviction of an
+/// already-parked one), so the clear on the normal path is not sufficient on its own.
+///
+/// **WHO MAY CLEAR THIS, and why the question is load-bearing.** The flag is a gate, not a hint:
+/// [`user_input_wake_edge`] returns early on a clear flag, so EVERY wake edge is gated on it. The
+/// aarch64 seat spent a bench session (P72) discovering that `clear_input_row` — which
+/// [`user_input_set_active`] calls on a focus ARRIVAL, i.e. exactly when a parked background app is
+/// being handed the keyboard — wiped the flag microseconds before the arrival's own wake read it. The
+/// arrival woke nobody, the unhide woke nobody, the press woke nobody, and the app was parked on a key
+/// nothing would ever name again: "once a vug goes into the background it is stopped and cannot be
+/// restarted". That defect is designed out here rather than reproduced: the invariant is SET by the
+/// parker before parking; CLEARED by the parker on return, or by slot teardown, and by nothing else.
+/// A stale-SET flag costs one wasted `futex_wake` per backstop period on a key with no waiters; a
+/// stale-CLEAR flag costs a task that never runs again. The two are traded in that direction on
+/// purpose, and [`user_input_wake_backstop`] does not consult it at all.
+static USER_INPUT_PARKED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+
+/// VUGPAUSE-2/x86: how many times a task has PARKED in [`sys_input_wait`], and how many waiters the
+/// wake seam has released. Cumulative for the boot; they drive the `[vugpause2]` witness and should
+/// track each other — a `blocked` that climbs while `wakes` stalls is an app going to sleep and not
+/// being woken, which is the exact failure this mechanism has to be able to report on itself.
+static USER_INPUT_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static USER_INPUT_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// VUGPAUSE-2/x86: per-slot count of NAMED-EDGE resumes (`focus` / `unhide`) this slot has taken.
+/// Exists only to pace [`user_input_wake_edge`]'s print on a power-of-two cadence. Per-slot rather
+/// than global because the question the line answers ("did THIS app resume, or is it stranded?") is
+/// per-slot: a global cadence would let a busy app's traffic silence a newly launched one's first
+/// resume. Cleared on teardown beside the park flag — the count paces a witness across one tenancy.
+static USER_INPUT_RESUMES: [AtomicU64; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+
+/// VUGPAUSE-2/x86: the synthetic futex key for `slot`'s input ring.
+///
+/// `sched::futex_key` builds a user key as `((slot + 1) << 56) | (uaddr & 0x00FF_FFFF_FFFF_FFFF)`,
+/// and `USER_SLOTS` is 8, so the tag byte a ring-3 program's key can carry is 1..=8 and bit 63 is
+/// free forever. Setting it puts every input key in a space no user word can name — which matters
+/// more than it looks, because the futex buckets are SHARED: a program that could forge an input key
+/// could wake (or, worse, park on) another process's ring. It cannot reach this space at all.
+///
+/// Non-zero by construction, which `futex_wait`/`futex_wake` both `debug_assert!`.
+#[inline]
+fn input_futex_key(slot: usize) -> u64 {
+    const _: () = assert!(
+        crate::arch::memory::USER_SLOTS < 128,
+        "input futex keys claim bit 63; a slot tag that reaches it would collide with a user key"
+    );
+    (1u64 << 63) | ((slot as u64) + 1)
+}
+
+/// VUGPAUSE-2/x86 WAKE SEAM: release every task parked in [`sys_input_wait`] on `slot`'s ring.
+/// Returns how many were woken (0 is the overwhelmingly common case — nobody is parked).
+///
+/// Called from THREE edges, and all three are needed for a blocked app to be as responsive as a
+/// polling one was:
+///   * [`user_input_push`] — the event itself. The latency-critical one: the router publishes TAIL and
+///     then wakes, so a keypress arriving while an app is idle re-readies it in the same pass the
+///     router runs in, not a poll period later.
+///   * [`user_input_set_active`] — a focus ARRIVAL. Focus does not enqueue anything (it RESETS the
+///     ring), so without this an app parked on an empty ring would sleep through being handed the
+///     keyboard.
+///   * [`set_hidden`]`(asid, false)` — an UNHIDE. The hidden bit lives in the info page, not in the
+///     ring, so nothing about becoming visible again touches TAIL. This is the edge that makes the
+///     VUGMIN idle exit-able, and it is ordered AFTER the info-page publish so a woken app's first
+///     read of the flags word already shows it visible.
+fn user_input_wake(slot: usize) -> usize {
+    user_input_wake_edge(slot, "")
+}
+
+/// VUGPAUSE-2/x86: [`user_input_wake`] with the EDGE named, for the wire.
+///
+/// A non-empty `edge` asks for a `[vugpause2] resume` line when this call actually releases someone.
+/// Only the two OPERATOR-RATE edges pass one — focus arrival and unhide, the pair that resumes a
+/// backgrounded app. The router's per-event push passes `""` and stays silent: it fires at
+/// mouse-motion rate and a line per event would be a flood.
+///
+/// The print is on a per-slot POWER-OF-TWO cadence (the 1st, 2nd, 4th, 8th, … resume prints), for the
+/// reason the aarch64 twin records from a real capture: one focus change fires several of these from
+/// inside the input path on several cores, and an unpaced line overran the UART mid-word and blocked
+/// the press path while it did. Every resume is still COUNTED in `USER_INPUT_WAKES`; the printed line
+/// carries `n=`, this slot's cumulative resume count, so a reader can subtract across two lines and
+/// know how many were elided.
+fn user_input_wake_edge(slot: usize, edge: &str) -> usize {
+    if slot >= crate::arch::memory::USER_SLOTS {
+        return 0;
+    }
+    if !USER_INPUT_PARKED[slot].load(Ordering::Acquire) {
+        return 0; // fast path: nobody has parked on this ring
+    }
+    let n = crate::arch::sched::futex_wake(input_futex_key(slot), usize::MAX);
+    if n != 0 {
+        USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
+        if !edge.is_empty() {
+            let seen = USER_INPUT_RESUMES[slot].fetch_add(1, Ordering::Relaxed) + 1;
+            if seen.is_power_of_two() {
+                serial_println!(
+                    "[vugpause2] resume slot={} edge={} woken={} n={}",
+                    slot, edge, n, seen
+                );
+            }
+        }
+    }
+    n
+}
+
+/// VUGPAUSE-2/x86 BACKSTOP: wake every parked input waiter, unconditionally. Called on a coarse
+/// cadence from the scheduler loop (`sched::run`), and it is a LIVENESS device, not a correctness one
+/// — the three wake edges above are what make the wait responsive.
+///
+/// **It does not consult [`USER_INPUT_PARKED`].** The aarch64 twin used to, and that turned P72's
+/// stale clear from a hiccup into a permanent strand: the one mechanism whose whole job is to be the
+/// net that catches a missed wake was itself gated on the same flag every missed wake had already gone
+/// through. A backstop that can be disabled by the bug it exists to survive is not a backstop. So it
+/// wakes all `USER_SLOTS` keys blind — 8 `futex_wake` calls per period, each a bounded scan of the
+/// bucket array, and a wake on a key with no waiters allocates nothing and readies nobody. Any future
+/// stale clear therefore costs an idle app one backstop period of latency, once, rather than its life.
+pub fn user_input_wake_backstop() {
+    for slot in 0..crate::arch::memory::USER_SLOTS {
+        let n = crate::arch::sched::futex_wake(input_futex_key(slot), usize::MAX);
+        if n != 0 {
+            USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The slot currently designated to RECEIVE input, `+1`-BIASED: 0 means "no ring-3 target — the shell
 /// owns the keyboard", and `s + 1` means slot `s` has focus.
 ///
@@ -3946,6 +4096,11 @@ fn user_input_push(slot: usize, packed: u64) -> bool {
     // the payload visible to it, so the two stores must not be reordered.
     USER_INPUT_TAIL[slot].store(tail.wrapping_add(1), Ordering::Release);
     USER_INPUT_DELIVERED.fetch_add(1, Ordering::Relaxed);
+    // VUGPAUSE-2/x86: the latency-critical wake edge, and it must be AFTER the TAIL publish — the
+    // parked task's futex compares the tail word it slept on, so a wake issued before the store could
+    // find the value unchanged and re-park on an event that has already arrived. Unnamed edge (`""`
+    // via `user_input_wake`): this runs at mouse-motion rate and prints nothing.
+    user_input_wake(slot);
     true
 }
 
@@ -4221,6 +4376,21 @@ pub fn user_input_set_active(slot_plus1: u64) {
         clear_input_row(slot); // a fresh focus starts clean
     }
     USER_INPUT_ACTIVE.store(slot_plus1, Ordering::Release);
+    // VUGPAUSE-2/x86: a focus ARRIVAL is a wake edge, and it is the one the RING cannot supply — focus
+    // enqueues nothing, it RESETS the ring, so an app parked on an empty ring sees no TAIL movement
+    // when it is handed the keyboard. LAST, after the focus word is published, so the woken task
+    // re-polls against the new state rather than the old.
+    //
+    // `clear_input_row` above deliberately does NOT touch `USER_INPUT_PARKED` — that is the whole of
+    // the aarch64 P72 lesson this arch is built to not repeat; see the flag's doc.
+    //
+    // It fires while the app may still be HIDDEN (`wm::focus_changed` runs after this in the click
+    // router): the woken app re-reads its flags word, may find itself still hidden and re-park, and is
+    // then released again by the unhide edge in `set_hidden`. BOTH edges are needed; neither is
+    // redundant.
+    if slot_plus1 != 0 {
+        user_input_wake_edge((slot_plus1 - 1) as usize, "focus");
+    }
 }
 
 /// WINX-7: revoke input focus if the dying `slot` holds it, and reset its ring. Called from
@@ -4243,6 +4413,104 @@ fn user_input_revoke_slot(slot: usize) {
         serial_println!(":: wc-x86: input focus revoked — slot {} torn down ::", slot);
     }
     clear_input_row(slot);
+}
+
+/// VUGPAUSE-2/x86: drop `slot`'s "a task is parked in [`sys_input_wait`]" flag, and its resume-print
+/// pacing count with it. EXACTLY ONE CALLER, and the restriction is the fix: [`clear_handle_row`],
+/// i.e. slot teardown.
+///
+/// The failure modes are not symmetric, which is why this is separated from the ring reset it would
+/// otherwise ride along with. A stale-SET flag costs one wasted `futex_wake` per backstop period on a
+/// key with no waiters. A stale-CLEAR flag costs a task that is parked forever — the flag is the only
+/// thing standing between every wake edge and the parked waiter, and a task that never runs again
+/// never re-sets it. So it may be cleared only by the parker itself (on the normal return from
+/// [`sys_input_wait`]) or by the one event that proves the parker is gone.
+fn clear_input_parked(slot: usize) {
+    if slot < crate::arch::memory::USER_SLOTS {
+        USER_INPUT_PARKED[slot].store(false, Ordering::Release);
+        USER_INPUT_RESUMES[slot].store(0, Ordering::Relaxed);
+    }
+}
+
+/// VUGPAUSE-2/x86: `SYS_INPUT_WAIT()` — block until the CALLING process's input ring is (or may be)
+/// non-empty. Returns 0 — it is a WAIT, not a read: nothing is dequeued, so the caller's ordinary
+/// [`sys_input_poll`] drain runs next and sees every event. `-EINVAL` off a private slot (the shared
+/// kernel window is not an input target, the same refusal the window verbs give it) or off a
+/// schedulable task.
+///
+/// ABI: syscall 28, no arguments, `0`/`-EINVAL` — byte-for-byte the aarch64 contract, so `user-vug`'s
+/// existing arch-neutral `input_wait()` call site simply starts working here with no ring-3 change.
+///
+/// ### Why this exists
+///
+/// VUGPAUSE and VUGMIN stopped an idle app from RENDERING; they did not stop it from RUNNING. The idle
+/// loop they left behind is `drain_input` + `SYS_YIELD`, a runnable spin that never parks and is
+/// therefore always in a run queue. On x86 it was worse than a spin: the call fell through the
+/// dispatcher's `_ => -38` and the call site discards its return, so the "park" was a bare loop
+/// iteration. That residue is this syscall's whole target.
+///
+/// The three deliberate properties:
+///   * SAME-TICK WAKE. The wake is issued by [`user_input_push`] itself, so the latency from "the
+///     router enqueued a keypress" to "the app is ready to run" is one `make_ready` — strictly better
+///     than the yield loop, which could not act until it was next dispatched.
+///   * KILL-SURVIVABLE. This is TEARDOWN-1's futex, not a new primitive, so a parked task inherits
+///     `futex_wait`'s pre-park `task_kill_armed` refusal and `kill_wake_parked`'s eviction of an
+///     already-parked target. An app blocked here is exactly as killable as one blocked in the frame
+///     barrier — which is the answer to "an unbounded futex_wait is an unkillable empty window".
+///   * BOUNDED ANYWAY. [`user_input_wake_backstop`] releases every parked waiter a few times a second,
+///     so any missed edge costs one period of latency rather than a strand.
+///
+/// **No liveness stamps here, unlike the aarch64 twin.** That one calls `gui_watchdog::note_progress`
+/// and stamps a takeover heartbeat, because on that arch `sys_input_poll` does too and both watchdogs
+/// measure an EL0 app's liveness in polls. This arch's `sys_input_poll` stamps neither, so a stamp
+/// here would be a coupling that exists on one side only — a park that fed a watchdog its poll never
+/// feeds. Mirroring `sys_input_poll` exactly is what keeps the pair consistent.
+fn sys_input_wait() -> i64 {
+    let Some(slot) = crate::arch::x86_64::memory::current_slot() else {
+        return EINVAL;
+    };
+    let head = USER_INPUT_HEAD[slot].load(Ordering::Relaxed); // this task is the sole consumer
+    let tail = USER_INPUT_TAIL[slot].load(Ordering::Acquire);
+    if head != tail {
+        return 0; // already has work — never park on a non-empty ring
+    }
+    // Park on the ring's TAIL word. `futex_wait` re-reads it under the bucket lock and refuses to park
+    // if it has moved, which closes the window between the load above and the park below. The address
+    // is KERNEL memory (the ring is kernel-side; ring 3 reaches it only through the two verbs), which
+    // `futex_wait` dereferences at CPL 0 under the caller's still-live CR3 — the higher half is mapped
+    // in every address space, so this is the same read it would make of a user word, minus the
+    // validation the syscall layer owes for user addresses and this address does not need.
+    USER_INPUT_PARKED[slot].store(true, Ordering::Release);
+    let n = USER_INPUT_BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Witness on a POWER-OF-TWO cadence (1, 2, 4, 8, …). An idle fleet parks thousands of times a
+    // minute, so a per-park line would be a flood and a one-shot line would say nothing about whether
+    // the mechanism kept working; a logarithmic cadence is bounded at ~40 lines for any conceivable
+    // boot and still shows the ratio moving. `wakes` beside `blocked` is the pair that matters.
+    if n & (n - 1) == 0 {
+        serial_println!(
+            "[vugpause2] blocked={} wakes={} slot={}",
+            n,
+            USER_INPUT_WAKES.load(Ordering::Relaxed),
+            slot
+        );
+    }
+    let key = input_futex_key(slot);
+    let uaddr = core::ptr::addr_of!(USER_INPUT_TAIL[slot]) as u64;
+    let r = crate::arch::sched::futex_wait(key, uaddr, tail);
+    USER_INPUT_PARKED[slot].store(false, Ordering::Release);
+    match r {
+        // Woken by a wake edge, or the ring moved under the compare (`Mismatch`) — either way the
+        // caller's next drain is the thing that decides, so both are simply "go look".
+        crate::arch::sched::FutexWait::Woken | crate::arch::sched::FutexWait::Mismatch => 0,
+        // Every bucket is busy with another key. Returning 0 degrades this syscall to a `SYS_YIELD`
+        // for that iteration — the pre-VUGPAUSE-2 behaviour, which is the right thing to fall back to.
+        crate::arch::sched::FutexWait::TableFull => 0,
+        // TEARDOWN-1: the caller has an ARMED kill and was refused the park; it is about to be retired
+        // at the syscall boundary on the way out. 0, exactly as `sys_futex`'s `FUTEX_WAIT` arm returns
+        // for the same outcome — the value is never observed by ring 3.
+        crate::arch::sched::FutexWait::Killed => 0,
+        crate::arch::sched::FutexWait::NoTask => EINVAL,
+    }
 }
 
 /// WINX-7: `SYS_INPUT_POLL()` — nonblocking dequeue of the next input event for the CALLING process.
@@ -10545,6 +10813,12 @@ pub fn clear_handle_row(slot: usize) {
     // generation bump above also retires this slot's thread-table rows for the lazy scavenge in
     // `sys_thread_spawn` — a killed threaded program leaks no rows permanently.
     user_input_revoke_slot(slot);
+    // VUGPAUSE-2/x86: and the park flag — THE ONLY PLACE IT MAY BE CLEARED other than by the parker
+    // itself on its normal return. `user_input_revoke_slot` above resets the ring but must not touch
+    // this, because `clear_input_row` is shared with the focus-ARRIVAL path; see `USER_INPUT_PARKED`.
+    // Teardown is the one event that PROVES the parker is gone: it is the path a task killed inside
+    // `sched::futex_wait` exits through without ever reaching its own clear.
+    clear_input_parked(slot);
     // WINX-7: the detached mark is per-TENANT, not per-slot, so it must die with the tenant — a
     // foreground `run` landing in a slot a `bg` job just vacated must not inherit "I was detached"
     // and skip its own frame cap.
