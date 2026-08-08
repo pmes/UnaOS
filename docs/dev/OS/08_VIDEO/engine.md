@@ -5157,6 +5157,56 @@ evidence the pacer works.
 
 ---
 
+### VSYNC-PACE r2 — the deadline ran away and latched the pacer OFF (Boot AQ)
+
+**The wire said it on the first paced boot and nothing read it.** Boot AQ, `[wpace]` at 670899ms:
+
+```
+[wpace] win=0 pres=255 paced=0 slept=0ms rate=50.9/s frame_us=16667
+[wpace] win=1 pres=190 paced=0 slept=0ms rate=37.9/s frame_us=16667
+[wpace] win=3 pres=395 paced=0 slept=0ms rate=78.9/s frame_us=16667
+[wpace] win=4 pres=265 paced=0 slept=0ms rate=52.9/s frame_us=16667
+[wpace] rollup wins=8 pres=1866 paced=83 slept=726ms focus=0 resync=98 rate=373.0/s span=5002ms -> PACING
+```
+
+Four of eight windows never slept once, and one of them presented at 78.9/s on a 16667 us panel.
+That is line one of this section's own falsification list — *"`paced=0` on every window while
+`[wcn] rate=` sits above 60/s — the pacer is not firing"* — and the verdict still read `PACING`,
+because 83 sleeps on four *other* windows are enough to satisfy `t_paced > 0`.
+
+#### The mechanism: banked credit, then a permanent latch
+
+1. `present_pace` deliberately does not sleep a sub-millisecond remainder (`if ms == 0 { return }`),
+   so a present can land up to 999 us **before** its own deadline.
+2. `pace_advance` then computed `next = prev + PANEL_FRAME_US` unconditionally — measuring the next
+   deadline from a deadline the caller did not actually wait for, and banking the unslept remainder.
+3. The credit compounds at up to ~1 ms per frame. After ~17 frames (~0.3 s) the deadline sits more
+   than a full frame ahead of now.
+4. `present_pace`'s safety valve — `if wait_us > PANEL_FRAME_US { return }`, written against a
+   *stale* deadline — then fires on every subsequent present and stops sleeping altogether, while
+   `pace_advance` keeps advancing (`now <= prev + PANEL_FRAME_US` is trivially true once `prev` is in
+   the future).
+
+**The latch never opens.** Every fast window disabled its own pacer within the first second of its
+life and presented un-paced for the rest of the boot. Windows 2/5/6/8 still paced only because they
+were slow enough to hit the resync arm often enough to re-anchor.
+
+#### The fix, and the counter that makes it falsifiable
+
+`pace_advance` now clamps: `next = next.min(now + PANEL_FRAME_US)`. The deadline may never sit more
+than one frame ahead of now, which makes the `wait_us > PANEL_FRAME_US` arm **unreachable by
+construction**. `min` and not a resync, because both existing arms remain the right cadence source —
+a LATE present must keep measuring from `prev` (that is what holds the long-run rate at exactly 60.0
+across tick-granular sleeps), and only an EARLY present can produce a deadline beyond
+`now + PANEL_FRAME_US`. The cost of the cap is the ≤999 us that was not slept, paid once, instead of
+banked forever.
+
+The safety valve is now **counted**: `[wpace] rollup … overrun=` and a new verdict `LATCHED` that
+outranks both `PACING` and `HEADROOM`. Non-zero is a live defect, not a slow machine. `overrun=0`
+is the pass condition.
+
+---
+
 ### CURSOR-11 — the arrow stops leaving the glass over a presenting window
 
 **P73 (Peter, bench Pi 4).** With the pointer parked over a PRESENTING vug, the cursor and the vug's
