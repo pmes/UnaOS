@@ -13679,6 +13679,9 @@ fn winx2_launcher(_demo_cpu: usize) {
         crate::arch::sched::yield_now();
     }
 
+    // PROCREAP CENSUS — the `Proc` table's free count BEFORE the kill. See the `row_freed` note below
+    // for why the `Gone` observation alone is not a reap proof.
+    let free_before = proc_table_headroom().0;
     // The kill IS part of the contract: STAT.ELF has no exit path, so this is the only way it stops.
     let verdict = bg_kill(pid, slot as u64);
     // PROCREAP — `bg_kill` REAPS ITS OWN ROW since GR21, and this witness went on asserting the contract
@@ -13706,6 +13709,24 @@ fn winx2_launcher(_demo_cpu: usize) {
     // kill did not land) or still `Exited` (a corpse nobody freed — the GR21 leak) fails here, so the
     // witness keeps exactly the falsifying power the two-step version had.
     let reaped = matches!(bg_poll(pid, false), BgPoll::Gone);
+    // REVIEW C2 — `Gone` IS NOT A FREED ROW. `bg_poll`'s scan filter admits only `PRUNNING`/`PEXITED`,
+    // so a row STUCK IN `PREAPING` — claimed by a releaser that never reached `proc_free` — falls
+    // through to the trailing `BgPoll::Gone`. That is the exact leak class this witness exists to catch
+    // (`MAX_PROCS` is 6; six stuck rows and no program can ever launch again), and it would have graded
+    // GREEN on the `Gone` check alone.
+    //
+    // So take the CENSUS, the shell's own idiom at `shell::bg_kill_cmd` — "the free count must rise by
+    // one per kill, and a boot that launches and kills repeatedly must never see it drift down".
+    // `proc_table_headroom` counts `PREAPING` with the EXITED bucket, never with `free`, which is
+    // precisely what makes it able to say what `bg_poll` cannot.
+    //
+    // EXACTLY one, not at-least-one: this witness's own program is the only thing that retires between
+    // the two reads. Nothing else in the launcher chain spawns here (it runs in program order on one
+    // task), and the desktop app is a steady tenant that neither exits nor forks. A delta of 2 would
+    // mean some other row was reaped in this window and the count could not be attributed to this kill
+    // — which is a fact worth failing on rather than absorbing.
+    let free_after = proc_table_headroom().0;
+    let row_freed = free_after == free_before + 1;
     // Teardown: the kill's address-space free retires the window rows and drops the FB leaves.
     let tdeadline = crate::arch::ticks() + 2_000;
     while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
@@ -13719,18 +13740,21 @@ fn winx2_launcher(_demo_cpu: usize) {
         crate::arch::sched::yield_now();
     }
 
-    if windowed && presents >= WINX2_MIN_PRESENTS && killed && reaped && cleared {
+    if windowed && presents >= WINX2_MIN_PRESENTS && killed && reaped && row_freed && cleared {
         serial_println!(
-            ":: WINX-2: STAT.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents, killed + row reaped by the kill, teardown clean -> PASS ::",
-            entry, presents
+            ":: WINX-2: STAT.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents, killed + row reaped by the kill ({}->{}/{} free), teardown clean -> PASS ::",
+            entry, presents, free_before, free_after, proc_table_rows()
         );
     } else {
         // The FAIL fields are exactly what is asserted above — no `gone` any more, because the reap proof
         // and the pid-is-gone proof are now one observation and printing them as two would suggest two
-        // independent checks. `verdict` stays: it is the string the `killed` decision was made on.
+        // independent checks. `verdict` stays: it is the string the `killed` decision was made on, and
+        // the census is printed as the raw before/after pair so a PREAPING stall is READABLE (row_gone
+        // true, row_freed false, free count flat) rather than inferable.
         serial_println!(
-            ":: WINX-2: STAT.ELF end-to-end FAIL — windowed={} presents={} killed={} (verdict={:?}) row_gone={} cleared={} (want true/>={}/true/true/true) ::",
-            windowed, presents, killed, verdict, reaped, cleared, WINX2_MIN_PRESENTS
+            ":: WINX-2: STAT.ELF end-to-end FAIL — windowed={} presents={} killed={} (verdict={:?}) row_gone={} row_freed={} (free {}->{}/{}) cleared={} (want true/>={}/true/true/true/true) ::",
+            windowed, presents, killed, verdict, reaped, row_freed,
+            free_before, free_after, proc_table_rows(), cleared, WINX2_MIN_PRESENTS
         );
     }
 }
@@ -14967,10 +14991,21 @@ fn winx8_launcher(_demo_cpu: usize) {
 
     // The kill IS part of the contract for a `bg` vug: it was launched DETACHED, so it skips its frame
     // cap and tumbles until it is killed — which is the whole point of publishing that flag.
+    //
+    // PROCREAP + REVIEW C2 — the WINX-2 refresh, applied verbatim here, and it was NOT cosmetic on this
+    // witness: `bg_kill` has not returned the bare string `"killed"` since GR21 reaped the row in place,
+    // so `verdict == "killed"` was UNSATISFIABLE and the `-> PASS` arm below could never be reached on
+    // any boot. See `winx2_launcher` for the full reasoning on each of the three checks; the short form:
+    // both self-reaping verdicts mean confirmed-killed-and-row-gone, the reap is OBSERVED with a
+    // non-reaping `bg_poll` instead of asking a freed row to be reaped twice, and the `Proc` census
+    // closes the `PREAPING`-stall hole that `BgPoll::Gone` cannot see.
+    let free_before = proc_table_headroom().0;
     let verdict = bg_kill(pid, slot as u64);
-    let killed = verdict == "killed";
-    let reaped = matches!(bg_poll(pid, true), BgPoll::Faulted | BgPoll::Exited(_));
-    let gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let killed = verdict == "killed, row reaped"
+        || verdict == "killed — the row was reclaimed on another core";
+    let reaped = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let free_after = proc_table_headroom().0;
+    let row_freed = free_after == free_before + 1;
     let tdeadline = crate::arch::ticks() + 2_000;
     while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
         crate::arch::sched::yield_now();
@@ -14981,15 +15016,16 @@ fn winx8_launcher(_demo_cpu: usize) {
         crate::arch::sched::yield_now();
     }
 
-    if windowed && presents >= WINX8_MIN_PRESENTS && killed && reaped && gone && cleared {
+    if windowed && presents >= WINX8_MIN_PRESENTS && killed && reaped && row_freed && cleared {
         serial_println!(
-            ":: WINX-8: VUG.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents with {} ring-3 thread(s), killed + reaped, teardown clean -> PASS ::",
-            entry, presents, threads
+            ":: WINX-8: VUG.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents with {} ring-3 thread(s), killed + row reaped by the kill ({}->{}/{} free), teardown clean -> PASS ::",
+            entry, presents, threads, free_before, free_after, proc_table_rows()
         );
     } else {
         serial_println!(
-            ":: WINX-8: VUG.ELF end-to-end FAIL — windowed={} presents={} threads={} killed={} ({}) reaped={} gone={} cleared={} (want true/>={}/-/true/true/true/true) ::",
-            windowed, presents, threads, killed, verdict, reaped, gone, cleared, WINX8_MIN_PRESENTS
+            ":: WINX-8: VUG.ELF end-to-end FAIL — windowed={} presents={} threads={} killed={} (verdict={:?}) row_gone={} row_freed={} (free {}->{}/{}) cleared={} (want true/>={}/-/true/true/true/true) ::",
+            windowed, presents, threads, killed, verdict, reaped, row_freed,
+            free_before, free_after, proc_table_rows(), cleared, WINX8_MIN_PRESENTS
         );
     }
 }
@@ -15079,10 +15115,17 @@ fn pulsew_launcher(_demo_cpu: usize) {
     // The kill is still ISSUED — a monitor with no frame cap and no timeout must not be left holding a slot
     // and a window row for the rest of the boot — but see the verdict note below for why its outcome is
     // REPORTED rather than ASSERTED here.
+    // PROCREAP — the same three observations WINX-2/WINX-8 assert, made here for the REPORT below. They
+    // are refreshed rather than left alone because a report that describes a contract the kernel no
+    // longer has is worse than no report: `verdict == "killed"` could not match `bg_kill`'s post-GR21
+    // self-reaping strings, so this line said `UNCONFIRMED` on every clean run.
+    let free_before = proc_table_headroom().0;
     let verdict = bg_kill(pid, slot as u64);
-    let killed = verdict == "killed";
-    let reaped = matches!(bg_poll(pid, true), BgPoll::Faulted | BgPoll::Exited(_));
-    let gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let killed = verdict == "killed, row reaped"
+        || verdict == "killed — the row was reclaimed on another core";
+    let reaped = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let free_after = proc_table_headroom().0;
+    let row_freed = free_after == free_before + 1;
     let tdeadline = crate::arch::ticks() + 2_000;
     while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
         crate::arch::sched::yield_now();
@@ -15101,14 +15144,17 @@ fn pulsew_launcher(_demo_cpu: usize) {
     // BEFORE its first present and `exit(2)`s on a refusal — a wrong number or a wrong payload layout
     // cannot produce presents, so `presents >= PULSEW_MIN_PRESENTS` IS the cross-boundary agreement proof.
     //
-    // The bg KILL/TEARDOWN leg is deliberately NOT part of this verdict. It is WINX-2's contract and it is
-    // RED at this commit's baseline in the IDENTICAL shape — `killed=false (kill armed — the task retires at
-    // its next preemption)`, with `reaped`/`gone`/`cleared` all false — for a sleeping ring-3 task that never
-    // reaches a kill boundary inside `KILL_CONFIRM_MS`. That is one defect, on a path this arc does not
-    // touch, already reported loudly by its own witness a few lines earlier in the same log. Asserting it
-    // again here would print one defect as two reds and make a second gate step permanently red without
-    // adding one bit of information. So the raw teardown state is put on the wire VERBATIM in its own line
-    // below — nothing is hidden, and the day WINX-2 goes green this line goes quiet with it.
+    // The bg KILL/TEARDOWN leg is deliberately NOT part of this verdict: it is WINX-2's contract, WINX-2
+    // asserts it a few lines earlier in the same log, and a sleeping ring-3 task that misses its kill
+    // boundary inside `KILL_CONFIRM_MS` is one defect that should print as one red, not two. So the raw
+    // teardown state goes on the wire VERBATIM in its own line below — nothing is hidden, and nothing is
+    // graded twice.
+    //
+    // (The earlier wording here predicted a specific baseline failure — `kill armed — the task retires at
+    // its next preemption`, everything false. That prediction is retired: the shape actually seen on Boot
+    // AL was `killed, row reaped` with the WITNESS misreading it, which is a different thing entirely and
+    // is what the refresh above fixes. A comment that names an expected failure string ages into a claim
+    // about the kernel, so this one now names only the structure of the decision.)
     if windowed && presents >= PULSEW_MIN_PRESENTS {
         serial_println!(
             ":: PULSE-W: PULSE.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents of per-core pulse bars sampled through SYS_CPUPULSE({}) -> PASS ::",
@@ -15116,18 +15162,22 @@ fn pulsew_launcher(_demo_cpu: usize) {
         );
     } else {
         serial_println!(
-            ":: PULSE-W: PULSE.ELF end-to-end FAIL — windowed={} presents={} (want true/>={}); kill='{}' reaped={} gone={} cleared={} ::",
-            windowed, presents, PULSEW_MIN_PRESENTS, verdict, reaped, gone, cleared
+            ":: PULSE-W: PULSE.ELF end-to-end FAIL — windowed={} presents={} (want true/>={}); kill={:?} row_gone={} row_freed={} (free {}->{}/{}) cleared={} ::",
+            windowed, presents, PULSEW_MIN_PRESENTS, verdict, reaped, row_freed,
+            free_before, free_after, proc_table_rows(), cleared
         );
     }
     // The teardown observation. Not a verdict — see the note above. Reported unconditionally so the state is
     // never inferred from a silence, and worded so it cannot be mistaken for a second verdict on one defect.
-    if killed && reaped && gone && cleared {
-        serial_println!(":: PULSE-W: teardown observation — kill='{}' reaped/gone/cleared all true; the bg lifecycle leg (WINX-2's contract) is clean on this run ::", verdict);
+    if killed && reaped && row_freed && cleared {
+        serial_println!(
+            ":: PULSE-W: teardown observation — kill={:?}, the row is gone AND the Proc census rose {}->{}/{}, window cleared; the bg lifecycle leg (WINX-2's contract) is clean on this run ::",
+            verdict, free_before, free_after, proc_table_rows()
+        );
     } else {
         serial_println!(
-            ":: PULSE-W: teardown observation — kill='{}' reaped={} gone={} cleared={}; UNCONFIRMED, and the WINX-2 witness above reports the same bg kill-boundary state at this baseline. Not asserted here: one defect, on a path this arc does not touch, is not counted twice ::",
-            verdict, reaped, gone, cleared
+            ":: PULSE-W: teardown observation — kill={:?} row_gone={} row_freed={} (free {}->{}/{}) cleared={}; UNCONFIRMED, and the WINX-2 witness above asserts this same bg kill-boundary state. Not asserted here: one defect is not counted twice ::",
+            verdict, reaped, row_freed, free_before, free_after, proc_table_rows(), cleared
         );
     }
 }
