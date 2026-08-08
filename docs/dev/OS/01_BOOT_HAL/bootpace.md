@@ -2958,3 +2958,141 @@ PASS, 1753 lines scanned); `serial-analyzer --wxn` **exit 0**.
   why=no-active-surface`.
 
 Read this capture with `awk '/pattern/'` — **not** `grep`.
+
+## §10s — GR21 Boot AI: the kernel's text is read-only on metal, and the prediction hit every field (2026-08-07)
+
+Tip `566d6c04`, `gui=2538ms`, `hz=2693860340`, slice
+`~/unaos-bench/scratch/gr21/bootAI-slice-clean.log` (capture `rmbp-gr16-s73`), `kernel.elf`
+sha256 `0a69cde6…`. **One passenger, deliberately: WXN M3b, the `W`-clear on the kernel's
+executable pages, armed by `UNAOS_WXNRO=1` on top of Boot AH's standing knob set.** No `gmux_igd`,
+no `bcmarecon`/`bcmaS1` — the flight was kept dedicated so that anything the map edit broke could
+not be blamed on a second passenger, and so that the ELF link the prediction was computed against
+was the ELF link that flew.
+
+**This is the boot on which the whole of the kernel's `.text` became read-only on real silicon.**
+Boot AA (§10k) armed `CR0.WP` on all eight cores and gave the hardware the *enforcement*; M3b is
+the leaf edit that gives it something to enforce. Together they close the arc GR19 opened when a
+review of M3 found a **live ring-3 code-injection bypass** (CFU-2, Boot Z) — the reason the
+milestone order inverted in the first place.
+
+### Four lines, and every field was predicted before the flight
+
+```
+:: WXN-M2: xseg=[0x7B1D7000,0x7B328000) xsegs=2 xpages=337 … nx_4k=1198 keep_x=338 … -> SPLIT ::
+:: WXN-M3B-PRE: … xpages=337 wseg=[0x7B328000,0x7B8BF000) armed=1 would=337 already_ro=0 wskip=0
+   absent=0 huge_leaves=0 huge_pages=0 pre_w=337 would_w=337 tramp=0x8000 -> CENSUS ::
+:: WXN-M3B: … armed=1 cleared=337 would=337 already_ro=0 wskip=0 absent=0 huge_leaves=0
+   huge_pages=0 verify_w=0 expect_w=0 pre_w=337 would_w=337 fb=0x90020000 fb_delta=0x0 fb_chk=1
+   tramp=0x8000 tramp_w=1 pge=0 flush=cr3-reload -> RO ::
+:: WXAUDIT x86: leaves=67069 user=0 user_WX=0 kern_WX=1 (0 MiB) tables=1030 nxe=1 walk=1725kcyc
+   l1=0 l2=65533 l3=1536 ::
+```
+
+**`kern_WX` 337 → 1.** Boot AH's kernel had 337 pages that were simultaneously writable and
+executable — every page of its own text, by construction. Boot AI has **one**, and it is the AP
+trampoline at `0x8000`, which `start_aps` must be able to write until the last AP is online; its
+lifecycle is **M3c** and was not attempted here. The M3b identity closes exactly:
+`kern_WX = keep_x − already_ro − cleared = 338 − 0 − 337 = 1`.
+
+**The prediction is the point, and it is on disk with a timestamp earlier than the boot.**
+`~/unaos-bench/scratch/gr21/m3b-prediction.md` was written before the flight and named every field
+above: `xpages=337`, `keep_x=338`, `cleared=337`, `would=337`, `wskip=0`, `already_ro=0`,
+`verify_w=0`, `expect_w=0`, `tramp_w=1`, `fb_delta=0x0`, `fb_chk=1`, `kern_WX=1`. **All of them,
+to the number, on the first flight.** The number that had to be *recomputed* rather than copied is
+`N`: GR20's brief carried `xpages=316 / keep_x=317`, measured against `ee0c5628` with a different
+feature set, and those were **stale** — the prediction doc re-derived `N = 337` from the armed
+`esp-x86` link at this trunk with the bench knob set (`readelf -lW` on the four `PT_LOAD`s), and
+verified that the mid-measurement trunk move `0962f271 → 76df0c82` left all four
+`p_vaddr`/`p_memsz` values byte-identical because the igpu changes sit behind `gmux_igd`, which is
+off in this set. A prediction copied forward would have missed by 21 pages and had no way to tell
+that miss from a coverage failure.
+
+### The readback, and what it does not prove
+
+```
+:: WXPROBE map: at=ktext  va=0x7B2A3E20 lvl=4K e=0x000000007B2A3061 p=1 w=0 … fw=0 fx=1 ::
+:: WXPROBE map: at=kimg   va=0x7B1D7000 lvl=4K e=0x000000007B1D7061 p=1 w=0 … fw=0 fx=1 ::
+:: WXPROBE map: at=ap8000 va=0x8000     lvl=4K e=0x0000000000008003 p=1 w=1 … fw=1 fx=1 ::
+:: WXPROBE map: at=fb     va=0x90020000 lvl=2M e=0x00000000900010E3 p=1 w=1 … pat=1 fx=0 ::
+```
+
+`ktext` and `kimg` read `w=0 fw=0 fx=1` — read-only *and* still executable, through the fold, not
+merely at the leaf. The trampoline is **unchanged at `w=1`**, exactly as designed. And the
+framebuffer is **still WC** (`lvl=2M`, `pat=1`) — the GR15 retype that took two weeks to notice is
+intact across the write window, corroborated independently by the belt on the wire (`fb_delta=0x0
+fb_chk=1`, the interlock that *ran* rather than an assert that could have been silently skipped).
+
+**What is not proven by any of this, stated the way the ledger states it:** `verify_w=0` and `w=0`
+are **page-table readbacks**. They prove the bits; they do not prove the silicon honours them. The
+only true falsifier is a CPL-0 store into the extent that is expected to fault and is recovered
+from — a ring-0 twin of `u1b-code-write`, for which this kernel has no `#PF`-resume path. That is
+**M3d**, and it is not claimed.
+
+### The instrument was proven able to convict before the flight
+
+This matters more than the green. `02df0530` taught `serial-analyzer --wxn` the M3b era —
+without it the analyzer's rise-WARN discriminator, built on `keep_x == xpages + 1 == kern_WX`,
+would have printed a factually wrong explanation on an armed capture and, because `<` is its
+"explicable" direction, **a half-cleared extent would have produced the same note and no
+warning.** Re-run against the trunk analyzer *before* the boot, its four fixtures
+(`~/unaos-bench/scratch/gr20/m3b-anlz-fixtures/`) behave: `synth-m3b-healthy` → **0**,
+`synth-m3b-disarmed` → **0**, `synth-m3b-short` (`cleared=315 would=316`) → **5**,
+`synth-m3b-wskip` → **5**. A green `--wxn` on this capture is therefore evidence rather than
+silence — the GR13/GR15/GR18/GR19 failure this track keeps paying for.
+
+The analyzer says so in its own words on this slice:
+
+```
+ok  M3b identity: kern_WX=1 == keep_x=338 - already_ro=0 - cleared=337 = 1
+ok  M3b clears:   cleared=337 == would=337
+ok  M3b verify:   verify_w=0 == expect_w=0
+ok  M3b wskip:    wskip=0
+ok  M3b fb-belt:  fb_chk=1 fb_delta=0x0
+```
+
+### Cost
+
+**None that this instrumentation can resolve.** `gui` 2532 → **2538** (+6), inside the 2532–2542
+band Boots AG and AH already occupy with no W-clear aboard. The lanes say where the +6 went:
+`sdhc` 320 → **326** (+6) on **399 ACMD41 polls** against Boot AH's 389 — the same ten-poll
+power-up variance on the same eighteen-year-old card that moved AG → AH by −5 in the other
+direction. `kepler` 396 → 395, `detect=5`, `igpu=1` unchanged, `resid` 2 → 3. **The W-clear is not
+inside any lane the witness measures at all**: `wxn_ro_stage` runs as the third stage of
+`wxn_pdpt_sweep`, before `smp::start_aps` and before the TSC has a timebase — its three lines
+carry the `[      ?ms]` prefix — so its cost is a walk of 337 leaves and one CR3 reload, folded
+into a window the ledger does not stamp. Saying "M3b cost 6 ms" would be reading the SD card's
+variance as the map edit's price; saying it cost nothing the ledger can see is what the capture
+supports.
+
+### Regression floor
+
+mbench **33/33 required, 0 forbidden** (re-run by the recording seat against this slice: PASS,
+1791 lines scanned); `serial-analyzer --wxn` **exit 0**; `--wxprobe` **exit 0**.
+
+- `WXAUDIT-NXE: cores=8 nxe=8 nxe_mask=0xFF wp=8 wp_mask=0xFF -> PASS` at 171 ms;
+  `WXAUDIT-CORES: n=8 cr0=[0x80010013,0x80010011 ×7] wp=0xFF nxe=0xFF` — M3a holding, `CR0.MP`
+  still BSP-only. The analyzer's per-core cross-check closes: bit 16 of every one of the eight
+  `cr0` values agrees with `wp=0xFF`.
+- `WXAUDIT-SLOT: ring-3 window W^X verified (slot 0, leaves=4, wx=0, nxe=1)`;
+  `WXPROBE cpu: cr0=0x0000000080010013 wp=1 … smep=1 nxe=1`; `WXN-x86 … wp=1 -> SWEPT`
+  (`residue_leaves=1535`).
+- `CFU2-WGATE … -> PASS`, all five arms, at 12829 ms — the **third consecutive** boot to attest
+  it. Boot AG's bounded storage wait fired again (`U9x` gate at 12545 ms, storage arrived at
+  12829 ms, a **284 ms** wait), so the fix has now held across three different wait lengths
+  (561 / 351 / 284 ms) rather than one lucky flight.
+- `WINX-1`, `WINX-2`, `WINX-3`, `WINX-7`, `WINX-8` and `PULSE-W` all PASS — **the ring-3 launcher
+  chain is unaffected by the kernel text going read-only**, which is the load-bearing negative:
+  every one of those runs through `run_user_image`/`spawn_user_image_bg` and through
+  `with_page_tables_writable`, whose six call sites now open a `CR0.WP` window against leaves that
+  are genuinely `W=0` for the first time.
+- `[sdhc] bdf 3:0.1 CARD IDENTIFIED — 60800 blocks, byte-addressed, csd v1`;
+  `sdhc: w1 armed=1 … verify=IDENTICAL restore=IDENTICAL -> PASS` (sixth flight);
+  `SDHCBLK: FAT mounted READ-ONLY … FAT16 vol@LBA63 volsec=60732 …` at 2546 ms — SDHC-4b
+  reproduces a third time.
+- `SCHED-X86 PLACE-CHECK: actual=c1 arg=c1 published=c1 pool=5 collide=0 tier=exclusive
+  verdict=PASS`; `video: edid present=0`; `igpu-blt: ring=absent why=no-active-surface`.
+- Trend caveat the analyzer raises itself and which is worth keeping: this capture carries **one**
+  boot with WXN wires, so the cross-boot `kern_WX` trend and the `WXN-FBWC` consecutive-boot diff
+  are **not tested here** — they are untested, not passed.
+
+Read this capture with `awk '/pattern/'` — **not** `grep`.
