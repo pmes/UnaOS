@@ -3946,9 +3946,10 @@ pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // worse than dead, because the one way it could ever fire is a broken dedupe upstream, and that
     // is exactly the case that must reach the wire instead of being swallowed. Left out, such a
     // failure prints `[wc-c] focus tab-cycle N -> N`, which is a falsifier a boot can actually
-    // observe. `user_input_set_active` and `focus_changed` are both documented idempotent on a
-    // no-op focus, so the cost of letting it through is a redundant composite of already-damaged
-    // rows.
+    // observe. The cost of letting it through is NOT free: `focus_changed` is idempotent, but
+    // `user_input_set_active` RESETS the target's ring by contract, so a spurious `N -> N` costs a
+    // redundant composite AND whatever queued input the focused app had not yet read. Paid only if
+    // the dedupe upstream is already broken — and then the wire evidence is worth the price.
     //
     // WEDGE-2 `<F2>` — the ring was read and a destination chosen; the focus PRIMITIVE is next.
     crate::wedge2::mark("<F2>");
