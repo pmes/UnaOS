@@ -3678,19 +3678,92 @@ fn sys_win_present(win: u64) -> i64 {
         return EBADF;
     }
     let id = win as usize;
-    let _irq = IrqGuard::mask_save();
-    let t = WINDOWS.lock();
-    if t[id].owner == WIN_OWNER_FREE {
-        return EBADF;
+    // PRESSURE-1: the lock span is unchanged and ends HERE. The back-pressure below can sleep, and
+    // sleeping under `WINDOWS` with IF masked would park the outermost compositor lock on a task the
+    // scheduler will not run for a millisecond — every other window on the machine behind it. So the
+    // outcome leaves the guarded block as a value and the charge is applied outside it.
+    let outcome = {
+        let _irq = IrqGuard::mask_save();
+        let t = WINDOWS.lock();
+        if t[id].owner == WIN_OWNER_FREE {
+            return EBADF;
+        }
+        if t[id].owner != slot {
+            return EACCES;
+        }
+        let e = t[id];
+        FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+        let o = wc_shim::present(e.wm_id);
+        drop(t);
+        o
+    };
+    present_backpressure(slot, outcome)
+}
+
+/// PRESSURE-1: the non-error status a present returns when the compositor DECLINED it because every
+/// window the caller owns is hidden below the shell. Positive, so bit 63 is clear and it is
+/// unambiguously not an errno: every in-tree client already tests `rc >> 63` for failure and a client
+/// that only tests for failure keeps working unchanged. A caller that wants to be a good citizen can
+/// test for it and stop rendering; a caller that ignores it is throttled anyway, below.
+const WIN_PRESENT_HIDDEN: i64 = 1;
+
+/// PRESSURE-1: how many CONSECUTIVE suppressed presents a slot gets for free before each one costs it
+/// a tick. Reset by any present that actually composites, so this is per HIDE EPISODE, not per boot.
+///
+/// **Why there is a grace at all.** A window can be hidden between a frame's first and last present
+/// (the operator TABs mid-frame), and stalling a millisecond inside a present that was going to be the
+/// app's last before it noticed the bit would be a latency cost paid by a correct app for the
+/// compositor's timing. Eight is a whole frame's worth of banded presents on the measured client and
+/// costs nothing at steady state: while hidden the counter never resets, so the grace is spent once
+/// per episode and every present after it is charged.
+const HIDDEN_PRESENT_GRACE: u32 = 8;
+
+/// PRESSURE-1: what a charged suppressed present costs. One tick — the x86 timebase is 1 kHz, so
+/// `sleep_ms(1)` is exactly one tick — which caps an uncooperative hidden app at ~1,000 presents/s
+/// against the 42,000/s Boot AJ measured. Deliberately the smallest unit the scheduler has: the point
+/// is to restore SOME pacing to a path that had none, not to punish, and one tick is already a 42x
+/// reduction. The app is BLOCKED for it, so the core is released rather than spun.
+const HIDDEN_PRESENT_SLEEP_MS: u64 = 1;
+
+/// PRESSURE-1: per-slot count of consecutive presents the compositor declined.
+static SLOT_HIDDEN_PRESENTS: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+
+/// PRESSURE-1: charge `slot` for the present it just made, and give it the answer.
+///
+/// THE DEFECT, stated before the fix. `wm::present` suppresses a hidden owner's pass before
+/// `composite()` and returns — so on Boot AJ two vugs that presented 264 times a second while visible
+/// presented 42,000 times a second each once hidden, driving `comp_rate` to `0.0/s` and the rollup
+/// verdict to `STARVED` for four consecutive windows. Nothing reached the panel. The compositor's
+/// ACCEPT had been the only thing pacing those apps, and declining a present handed the pacing back to
+/// the app that was already misbehaving.
+///
+/// Commits 1 and 2 of this arc fix the COOPERATIVE path: the app is now told it is hidden and has a
+/// real park to sleep in. This is the part that does not depend on the app's cooperation, which is the
+/// point — "the compositor keeps running" is a whole-system availability property and should not be
+/// contingent on every ring-3 program being well written. An app that never reads the hidden bit and
+/// never calls `SYS_INPUT_WAIT` is now capped at ~1,000 suppressed presents/s per slot.
+///
+/// VISIBLE PRESENTS ARE NOT TOUCHED — same return (0), same path, same cost, and the counter is reset
+/// rather than read. Neither is `NoRow`: see `wc_shim::present`.
+fn present_backpressure(slot: usize, outcome: crate::video::wm::Presented) -> i64 {
+    use crate::video::wm::Presented;
+    match outcome {
+        Presented::Composited | Presented::NoRow => {
+            SLOT_HIDDEN_PRESENTS[slot].store(0, Ordering::Relaxed);
+            0
+        }
+        Presented::Suppressed => {
+            let n = SLOT_HIDDEN_PRESENTS[slot].fetch_add(1, Ordering::Relaxed) + 1;
+            if n > HIDDEN_PRESENT_GRACE {
+                // Called with `WINDOWS` released and the IRQ guard dropped — see `sys_win_present`.
+                // `sleep_ms` is a no-op outside a scheduled task, so this cannot hang a caller that
+                // has no scheduler to wake it.
+                crate::arch::sched::sleep_ms(HIDDEN_PRESENT_SLEEP_MS);
+            }
+            WIN_PRESENT_HIDDEN
+        }
     }
-    if t[id].owner != slot {
-        return EACCES;
-    }
-    let e = t[id];
-    FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
-    wc_shim::present(e.wm_id);
-    drop(t);
-    0
 }
 
 /// FBCON-DMG: `SYS_WIN_PRESENT_ROWS(win, y0, y1)` -> 0, or a negative errno. The DAMAGE-CARRYING present:
@@ -3727,26 +3800,32 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
         return EBADF;
     }
     let id = win as usize;
-    let _irq = IrqGuard::mask_save();
-    let t = WINDOWS.lock();
-    if t[id].owner == WIN_OWNER_FREE {
-        return EBADF;
-    }
-    if t[id].owner != slot {
-        return EACCES;
-    }
-    let e = t[id];
-    // The range check runs against THIS row's surface height, read under the same hold that validated the
-    // ownership — so the `h` the band is judged against is provably the `h` of the window being presented.
-    if y1 <= y0 || y1 > e.h as u64 {
-        return EINVAL;
-    }
-    // The same counter the whole-box verb bumps: this IS a present that reached the compositor, and the
-    // headless witness must not go blind on a window that switched to banded presents.
-    FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
-    wc_shim::present_rows(e.wm_id, y0 as usize, y1 as usize);
-    drop(t);
-    0
+    // PRESSURE-1: the lock span ends here and the charge is applied outside it, for `sys_win_present`'s
+    // reason — the back-pressure can sleep, and sleeping under the outermost compositor lock with IF
+    // masked would park every other window on the machine behind this one.
+    let outcome = {
+        let _irq = IrqGuard::mask_save();
+        let t = WINDOWS.lock();
+        if t[id].owner == WIN_OWNER_FREE {
+            return EBADF;
+        }
+        if t[id].owner != slot {
+            return EACCES;
+        }
+        let e = t[id];
+        // The range check runs against THIS row's surface height, read under the same hold that validated the
+        // ownership — so the `h` the band is judged against is provably the `h` of the window being presented.
+        if y1 <= y0 || y1 > e.h as u64 {
+            return EINVAL;
+        }
+        // The same counter the whole-box verb bumps: this IS a present that reached the compositor, and the
+        // headless witness must not go blind on a window that switched to banded presents.
+        FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+        let o = wc_shim::present_rows(e.wm_id, y0 as usize, y1 as usize);
+        drop(t);
+        o
+    };
+    present_backpressure(slot, outcome)
 }
 
 /// WINX-1: total `SYS_WIN_PRESENT` calls that reached the compositor — the headless witness's proof that
@@ -3816,20 +3895,27 @@ mod wc_shim {
     }
 
     /// `video::wm::present` — damage-mark and run the compositor pass. Called with `WINDOWS` held.
-    pub fn present(id: WinId) {
-        if id != WIN_NONE {
-            wm::present(id);
+    ///
+    /// PRESSURE-1: reports wm's OUTCOME rather than nothing, because the syscall layer above has to
+    /// charge for a declined present. `WIN_NONE` — the compositor refused this window a row, which a
+    /// headless run does for every window — is `NoRow`, never `Suppressed`: it is not back-pressure,
+    /// and charging for it would throttle every app on a machine with no panel.
+    pub fn present(id: WinId) -> wm::Presented {
+        if id == WIN_NONE {
+            return wm::Presented::NoRow;
         }
+        wm::present_outcome(id)
     }
 
     /// FBCON-DMG: `video::wm::present_rows` — the same pass, damage-marking only SOURCE rows
     /// `[sy0, sy1)`. Called with `WINDOWS` held, exactly like [`present`]. The band has already been
     /// validated against this row's surface height by `sys_win_present_rows`, so wm's own whole-box
     /// degrade is unreachable from the syscall path — it stays as wm's contract with its other callers.
-    pub fn present_rows(id: WinId, sy0: usize, sy1: usize) {
-        if id != WIN_NONE {
-            wm::present_rows(id, sy0, sy1);
+    pub fn present_rows(id: WinId, sy0: usize, sy1: usize) -> wm::Presented {
+        if id == WIN_NONE {
+            return wm::Presented::NoRow;
         }
+        wm::present_rows_outcome(id, sy0, sy1)
     }
 
     /// `video::wm::close`. Runs a drain barrier, so every caller invokes it with `WINDOWS` RELEASED.
