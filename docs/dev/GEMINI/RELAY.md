@@ -1,32 +1,40 @@
 # RELAY
 
-## → igpu — 🛬 LANDED ON TRUNK. Flight 1b is queued for metal. Your next round is the post-flight cleanup.
+## → kepler — FENCE brief. Your heartbeat is merged (`794cbccb` → trunk); DISPLAY is now Claude's.
 
-Your round-8 work is on trunk and pushed: `666a5c41` (the round-8 diff, committed byte-identical
-to what the review cleared) + `e325baa7` (seat-applied RUNBOOK corrections M11/M12/M13, so the
-triage table now predicts what the code actually prints: `name=end`, `unwound=1`, census `ok=1`,
-and the `UNTOUCHED` row no longer claims "touching no registers") — merged at **`76df0c82`**.
-Gate at the merge: 11/11 legs, exit 0. **Build every future change on trunk `76df0c82`; your
-file there IS your round-8 work plus the three doc lines. Never regenerate the file.**
+**The standing problem is yours: PFIFO strips VALID from the channel write.** `kepler.rs:1512`
+writes it, `:1525` reads back `0x00002000`, `err=0x2` — every boot, ~35 pulls of history.
+This arc is RECONNAISSANCE FIRST:
 
-**Flight schedule:** F1b flies AFTER Boot AI (M3b, staging now) — it gets its own boot and you
-get the capture. Nothing for you to wait on; the assignment below is post-flight cleanup and
-none of it may change flight behaviour.
+1. **Read-only recon:** around the failing write, dump the PFIFO/channel state that decides
+   validity (runlist status, channel instance/RAMFC pointers, engine status, intr/error
+   registers) as classified witnesses — **raw hex on every line + a verdict with a stated
+   refutation value** (the law your heartbeat round just learned; no bare `UNKNOWN`s).
+   Deliverable: a table that says WHICH precondition the hardware considers unmet.
+2. **At most ONE write experiment**, and only if the recon names a specific missing
+   precondition: BCMA-S1 shape — record the pre-image, self-test the unwind, write, read
+   back, restore, witness every step. No experiment without a falsifiable prediction in
+   your PROPOSAL doc first (emitter-exact strings — the M12 law).
+3. **Boundaries:** `kepler.rs` + `docs/dev/GEMINI/video/Kepler/` only. ⛔ `kepler_display.rs`
+   is Claude's now — a diff touching it bounces whole. ⛔ Firmware blobs and blob-derived
+   code go to the private `UnaOS-bunker` repo ONLY (with PROVENANCE.md entries), never here.
+4. Gate: `./arroyo check` exit 0, zero new warnings, zero trailing whitespace. Hand back
+   sha + the recon table; the seat reviews before merge.
 
-### Assignment — round 9, docs-and-comments only, on trunk `76df0c82`:
+## → igpu — while Flight 1b waits for its boot (staging NOW): the blitter learns to say how it died.
 
-1. **C2 (five rounds old — close it):** `igpu.rs:266` drop "alongside the TSC deadline";
-   `:284` → "Bounded by an iteration count that cannot depend on any clock." The comments
-   promise a second bound that was removed; a future reader will delete the real bound
-   believing the phantom one backstops it.
-2. **M14:** split `why=edid-corrupt` into `edid-header-corrupt` / `edid-checksum-bad`
-   (`igpu.rs:1117` vs `:1123`) — two exits currently share one `why=`.
-3. **M15:** the census move behind the AUX guards lost `bdsm/ggc/ggtt0/ggtt1/frmcnt` on the
-   two AUX-precondition refusals — exactly the boots where they matter. Duplicate the five
-   values into the two REFUSED lines (or hoist the print back before the guards).
-4. **M16:** `unwound=` reports `unwind.len` BEFORE `execute()` — pending, not unwound.
-   Rename the field (`pending=`) or sample after; RUNBOOK follows whichever you pick.
+Round 9b is merged (`ae304d95`). F1b flies next; its capture writes your round 10. Until
+then, one code round in your own file:
 
-Gate: `./arroyo check` 11/11 exit 0, zero new warnings vs `76df0c82`, zero trailing whitespace.
-M14/M15 change witness strings — update the RUNBOOK rows in the SAME commit so the doc and the
-wire never diverge again. Hand back when green; the seat reviews before it merges.
+1. **Classify the blitter submit verdict.** `igpu.rs:600-664` spins on `HEAD==TAIL` with a
+   1M-spin bound and one undifferentiated `blitter wedged` string. Split it:
+   head-never-moved / head-stalled-mid-run / head-wrapped, and snapshot the ring registers
+   (HEAD/TAIL/CTL/status) at death — raw hex + verdict, refutation value stated. ~60–100
+   lines. This is the V3D lesson (classified death > bare death) landing on IVB.
+2. Same commit, docs: the F4 residual (`LADDER-igpu-bringup.md:641` still says
+   "doubly-bounded waits" — the C2 fossil's last home) + the 9b review nits N5 (reflow the
+   ragged `:226` wrap), N6 (scope the banner sentence — `dp_aux_transfer`'s inner wait is
+   rdtsc-deadline-only), N7 (note that EDID-failure rows can co-fire with `gmux=FAILED`,
+   whose power-cycle advice outranks theirs).
+3. Rules unchanged: build on trunk (`794cbccb`+), never regenerate, `igpu.rs` +
+   `docs/dev/GEMINI/video/iGUI/` only, gate green + zero new warnings, hand back the sha.
