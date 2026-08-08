@@ -1736,11 +1736,41 @@ Unmasked it is a permanent silent self-deadlock waiting to happen — preempt th
 task while it holds `RUN_QUEUES[1]`, and `run()` on the same core then needs that exact
 lock at IF=0 to requeue the very task holding it; nothing breaks the cycle, nothing
 panics, and since the witness is emitted *from* the dead task, nothing reports it. The
-masked section is bounded (≤ 8 iterations of lock-free reads plus one non-nested
-run-queue acquisition each, no allocation, no UART, no other lock) and the ~8 ms UART
-write is deliberately left outside it. The whole line is then composed into one stack
-buffer and handed to a **single** `serial_println!`: piecewise fragments would drop the
-UART lock between fields, and a witness another core can cut in half is not evidence.
+masked section is bounded: ≤ 8 iterations of lock-free reads plus one non-nested
+run-queue acquisition each, no allocation, no UART, no other lock.
+
+The `serial_println!` is left **outside** that mask, and the reason matters because an
+earlier version of this paragraph gave a wrong one. It claimed the placement avoids
+"~8 ms of masked interrupts every 5 s" — false: `serial::_print` already wraps its
+entire write in `without_interrupts` (`serial.rs:105`), so that masked wire time is paid
+either way and nesting would change nothing measurable. The true reasons are that the
+snapshot is masked because `run_queue_len` *needs* it and the print does not, and that
+the print cannot re-open the wedge for a structural reason: `_print` takes `SERIAL1`
+with **`try_lock()`, never `lock()`**, defers to `serial_ring` when contended, and has a
+lock-free `raw_byte` panic hatch — so no core can block on the UART lock and no holder
+can be preempted into a cycle. The serial path is immune to this wedge by construction.
+
+The whole line is then composed into one stack buffer and handed to a **single**
+`serial_println!`: piecewise fragments would drop the UART lock between fields, and a
+witness another core can cut in half is not evidence.
+
+**A row counts as live for three independent reasons**, and the list is written out
+because losing one of them nearly printed the `--` token for the best-measured core on
+the machine. `tracked` is `live > 0 || pegged || fold_age_ms < 500 ms`: (1) we hold a
+measured in-flight span for it (the self row); (2) we can infer one (`pegged`, remote
+rows); (3) it folded a span recently. Gating `pegged` on `live == 0` — correct in
+itself, to make inference a remote-only fallback — briefly removed reason (1) from the
+predicate, and since `fold_age_ms` for the self row *is the current pass's duration*,
+any render pass reaching the emit ≥ 500 ms after its dispatch would have printed
+`c1=--` while a measured 100 % sat unused behind it. Boot AH's first render pass is
+237 ms against that 500 ms threshold. Anything added later that produces a percent must
+extend the list too.
+
+The pegged token's `(name)` is **best-effort**, not proven. `core_load` loads `current`
+before the name so the name is as-new-or-newer than the `current` that set `pegged`,
+which closes the stale direction; a remote dispatch landing between the two loads can
+still name a newer task, and the emit-side mask cannot help because the racing writer is
+another core. Read the `*` as evidence about the core and the name as a strong hint.
 
 Still open after this arc, in the order the campaign takes them: placement
 (`CPU_AUTO`/`spawn_auto`/`PRIO_SERVICE`, which also fixes `bg_place_cpu` above),

@@ -763,8 +763,12 @@ pub struct CoreLoad {
     /// Id of the last task dispatched on this core (0 = none yet).
     pub last_task_id: u64,
     /// Name of the last task dispatched on this core ("-" = none yet). While `pegged` is true this is
-    /// also the name of the task the core is executing RIGHT NOW: `note_last` publishes it before
-    /// `current` is set, and `current` is what `pegged` tests.
+    /// ALMOST CERTAINLY also the task the core is executing right now — but "almost" is the honest
+    /// word and R2/L1 is why. [`core_load`] loads `current` before this name precisely so the name is
+    /// as-new-or-newer than the `current` that set `pegged`, which closes the stale-name direction;
+    /// the remaining window is a remote dispatch landing between the two loads, which the emit-side
+    /// interrupt mask cannot help with because the racing writer is another core. Best-effort and
+    /// stale-by-one-able, not proven. See the note at the `current_raw` load.
     pub last_task: &'static str,
     /// Is `busy_pct_recent` a LIVE number? False for a core that has never entered `run()` or has
     /// stopped folding spans WITHOUT a task executing; such a core renders `--`, never a percent.
@@ -811,6 +815,23 @@ pub fn core_load(cpu: usize) -> CoreLoad {
         };
     }
     let acct = &ACCT[cpu];
+    // R2/L1 — `current` is loaded BEFORE the task name, not after, and the reason is an ordering the
+    // previous revision claimed but did not establish. The writer's order per dispatch is
+    // `note_last(T)` then `current = T`; a reader that takes the NAME first and `current` second can
+    // therefore observe a name from the previous dispatch beside a `current` from the new one, and the
+    // writer's ordering buys it nothing. Reading `current` first inverts that: the `note_last(T)` that
+    // precedes the `current = T` we observe has already happened, so the name we read afterwards is T
+    // or NEWER.
+    //
+    // "Or newer" is the honest residue, and it is not closed here. If the core dispatches again
+    // between the two loads the name advances past the `current` we tested — but that requires the
+    // core to have folded a span, which makes `fold_age_ms` fresh and `pegged` false, so the row is
+    // not printed with a name at all. What remains is a genuine tens-of-nanoseconds race against a
+    // <=4/s dispatch rate on a core that is pegged by definition (order 1e-7 per emit). The mask in
+    // `emit_load_witness` does NOT help, because the racing writer is a remote core. So: the pegged
+    // attribution is BEST-EFFORT and stale-by-one-able, not proven — treat a `100%*(name)` as strong
+    // evidence about the core and good-but-unwarranted evidence about the name.
+    let current_raw = SCHED[cpu].current.load(Ordering::Acquire);
     let (last_task_id, last_task) = acct.last_task();
     let fold_age_ms = acct.fold_age_ms();
     // R1/M3 — SELF AGE-ON-READ. The module declines aarch64's PULSE-5 wholesale because
@@ -852,13 +873,38 @@ pub fn core_load(cpu: usize) -> CoreLoad {
     let pegged = live == 0
         && fold_age_ms != ACCT_MS_NEVER
         && fold_age_ms >= LOAD_WINDOW_MS
-        && SCHED[cpu].current.load(Ordering::Acquire) != 0;
+        && current_raw != 0;
+    // R2/H1 — THERE ARE THREE INDEPENDENT REASONS A ROW IS LIVE, AND ALL THREE MUST BE NAMED HERE.
+    // This predicate was `pegged || acct.tracked()`, which was correct only until `pegged` was gated
+    // on `live == 0` to make it a remote-only fallback. That gate silently removed the self row's
+    // rescue: the witness is emitted from INSIDE the render task, so for c1 `run_t0` is always set,
+    // `live > 0`, and `pegged` is therefore always FALSE — collapsing `tracked` to
+    // `fold_age_ms < LOAD_STALE_MS`, which for the self row IS THE CURRENT PASS'S DURATION. Any render
+    // pass reaching the emit >= 500 ms after its dispatch would have printed `c1=--`, the absence
+    // token, for the core holding the longest, cleanest, same-core-measured span on the machine —
+    // while `busy_pct`'s case 1 was sitting right there ready to return a MEASURED 100%. The emitter
+    // tests `!tracked` first, so the absence token would have won over the measurement. Boot AH's
+    // first render pass is 237 ms (dispatch 2553 ms -> first depth line 2790 ms) against that 500 ms
+    // threshold: a 2.1x margin on a pass that builds a ~28 MiB back buffer, which a heavier first
+    // paint (UNAOS_WC compositor path, 2880x1800) crosses. It would also have self-tripped the arc's
+    // own refutation criterion, which declares any steady-line `--` a defect.
+    //
+    // The three reasons, none of which implies another:
+    //   1. `live > 0`  — we HOLD a measured in-flight span for this core (self row only). A core
+    //      executing a task is being accounted by definition; this is the most direct evidence of
+    //      liveness there is, and it is exactly what the previous predicate omitted.
+    //   2. `pegged`    — we can INFER the core is inside a long span (remote row).
+    //   3. `acct.tracked()` — it folded a span recently (the fold-age test, which governs every core
+    //      that is neither executing nor inferable: idle cores, and cores that left `run()`).
+    // Anything added later that produces a percent must extend this list too, or it will be computed
+    // and then thrown away behind a `--`.
+    let tracked = live > 0 || pegged || acct.tracked();
     CoreLoad {
         busy_pct_recent: if pegged { 100 } else { acct.busy_pct(live) },
         ctx_switches: acct.ctx_switches.load(Ordering::Relaxed),
         last_task_id,
         last_task,
-        tracked: pegged || acct.tracked(),
+        tracked,
         pegged,
         fold_age_ms,
     }
@@ -873,16 +919,28 @@ struct LineBuf {
     overflow: bool,
 }
 
-/// Capacity of [`LineBuf`], with the bound proved rather than guessed. Worst case for `MAX_CPUS = 8`:
-/// `"[schedx86] load"` (15) + a tag (<= 16) + 8 x `" cN=100%*(nnnnnnnnnnnnnnnn)"` — percent, pegged
-/// marker and a [`PEG_NAME_CAP`]-capped task name — (8 x 26 = 208) + `" sw=["` (5) + 8 x 20 decimal
-/// digits of `u64::MAX` + 7 commas (167) + `"]"` (1) + `" q=["` (4) + 8 x 10 digits + 7 commas (87) +
-/// `"]"` (1) + a `" cores=8/N"` cap suffix (12) = 516. 768 leaves headroom for a further field without
-/// re-deriving this.
+/// Capacity of [`LineBuf`], with the bound proved rather than guessed — and R2/L2 corrected the proof
+/// after the first version got the per-core term and the cap suffix wrong. It held, but a comment that
+/// says "proved" and then miscounts is the exact class this arc exists to police, so the arithmetic is
+/// spelled out term by term. Worst case for `MAX_CPUS = 8`:
+///
+/// | term | bytes |
+/// | --- | --- |
+/// | `"[schedx86] load"` | 15 |
+/// | tag (`"-prejoin"`, budgeted) | 16 |
+/// | 8 x `" cN=100%*(<16-byte name>+)"` — space, `cN=`, `100`, `%`, `*`, `(`, name, clip `+`, `)` = 28 | 224 |
+/// | `" sw=["` + 8 x 20 digits of `u64::MAX` + 7 commas + `"]"` | 173 |
+/// | `" q=["` + 8 x 10 digits + 7 commas + `"]"` | 92 |
+/// | `" cores=8/NNN <CAPPED>"` | 21 |
+/// | **total** | **541** |
+///
+/// 768 therefore carries ~227 bytes of headroom, enough for a further field without re-deriving this.
+/// [`LineBuf`] reports overflow on the wire regardless, so the bound is belt and braces.
 const LINEBUF_CAP: usize = 768;
 
 /// Longest task name the witness will print for a pegged core, in bytes. Bounds the line (see
-/// [`LINEBUF_CAP`]); truncation is at a UTF-8 character boundary and is marked with a trailing `…`.
+/// [`LINEBUF_CAP`]); truncation is at a UTF-8 character boundary and is marked with a trailing `+`
+/// (R2/L3 — an earlier revision of this line said `…`, which the code never emitted).
 const PEG_NAME_CAP: usize = 16;
 
 impl LineBuf {
@@ -971,9 +1029,22 @@ impl core::fmt::Write for LineBuf {
 /// acquisition held only across `len()` (a sum over `NUM_PRIORITIES = 4` `VecDeque::len`s). The locks
 /// are taken and released one at a time — never nested, so no lock-order inversion is possible — and
 /// no allocation, no UART and no other lock is touched inside. Order of tens of nanoseconds per core,
-/// sub-microsecond total. The UART write is DELIBERATELY OUTSIDE the mask: `serial_println!` of a
-/// ~100-character line is ~8 ms of wire time at 115200, and holding IF=0 across that would trade a
-/// rare deadlock for a guaranteed 8 ms of masked interrupts on the render core every 5 seconds.
+/// sub-microsecond total.
+///
+/// R2/M2 — WHY THE PRINT IS OUTSIDE THE MASK, corrected. A previous revision of this comment argued
+/// that keeping `serial_println!` outside `without_interrupts` avoids "a guaranteed 8 ms of masked
+/// interrupts on the render core every 5 seconds". **That was a false premise**: `serial::_print`
+/// wraps its ENTIRE write in `interrupts::without_interrupts` itself (`serial.rs:105`), so the masked
+/// wire time happens either way and nesting would change nothing measurable.
+///
+/// The real reasons, both of which survive checking:
+///   * The snapshot is masked because `run_queue_len` NEEDS it (above). The print does not need it,
+///     and extending a mask past its justification is how a mask stops being reviewable.
+///   * The unmasked print cannot re-open the H1 shape, for a structural reason rather than a
+///     probabilistic one: `_print` takes `SERIAL1` with **`try_lock()`, never `lock()`**, defers to
+///     `serial_ring` when contended, and carries a lock-free `raw_byte` panic hatch. No core can
+///     block on the UART lock, so no holder can be preempted into a cycle. The serial path is
+///     immune to the wedge by construction, which is exactly why it is safe to leave alone.
 ///
 /// Call from a rate-limited path only; it is introspection, never a scheduling decision.
 pub fn emit_load_witness(tag: &str) {
@@ -1004,9 +1075,10 @@ pub fn emit_load_witness(tag: &str) {
         if !row.tracked {
             let _ = write!(w, " c{}=--", c);
         } else if row.pegged {
-            // R1/H2: the `*` says DEDUCED, not counted. The name is sound to attribute here and only
-            // here — `pegged` tested a live `current`, and `note_last` publishes the name BEFORE
-            // `current` is set, so for a pegged core the last task dispatched IS the task executing.
+            // R1/H2: the `*` says DEDUCED, not counted. The name is worth attributing here and only
+            // here — a pegged core is by definition executing something — but it is BEST-EFFORT, not
+            // proven: see R2/L1 at `core_load`'s `current_raw` load for the remaining stale-by-one
+            // window. Read the `*` as evidence about the core and the name as a strong hint.
             let (nm, clip) = peg_name(row.name);
             let _ = write!(w, " c{}={}%*({}{})", c, row.pct, nm, clip);
         } else {
