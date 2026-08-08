@@ -1939,6 +1939,19 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                             fecs_write(bar0, pbase + 0x100, 2); // CPUCTL START_TRIGGER
                                             serial_println!(":: kepler: ucode-poke start img=POKE ::");
 
+                                            // Heartbeat poll: wait for the falcon to reach the loop.
+                                            // The poll is bounded to ~1000 host reads (~1 ms) so it does
+                                            // not delay cmd=1 past ECHO_BOUND (1,048,576 falcon iters).
+                                            let mut hb = 0;
+                                            let mut hb_iters = 0u32;
+                                            for _ in 0..1000 {
+                                                hb_iters += 1;
+                                                hb = fecs_read(bar0, pbase + 0x044); // MAILBOX1
+                                                // Expect 0x02, accept 0x01. If 0, it's just mb0 bleeding over.
+                                                if hb != MB_SEED && classify_fecs_word(hb) == "VALUE" { break; }
+                                            }
+                                            serial_println!(":: kepler: ucode-poke heartbeat hb={:08X} hb_iters={} ::", hb, hb_iters);
+
                                             fecs_write(bar0, pbase + 0x800, 1); // host-cmd: do the poke
 
                                             // Host-side bound, in HOST MMIO reads. ECHO_BOUND is a
@@ -1955,9 +1968,33 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
 
                                             let mb0 = fecs_read(bar0, pbase + 0x040);
                                             let phase = fecs_read(bar0, pbase + 0x044);
+                                            let scratch0 = fecs_read(bar0, pbase + 0x800);
+                                            let cpuctl = fecs_read(bar0, pbase + 0x100);
+                                            let gpccs = mmio_read(bar0, 0x41A100);
+
                                             let class = classify_fecs_word(ack);
-                                            serial_println!(":: kepler: ctx-poke img=POKE ack={:08X} mb0={:08X} phase={:08X} iters={} class={} ::",
-                                                ack, mb0, phase, ack_iters, class);
+                                            let get_verdict = |v: u32, exp: u32| -> &'static str {
+                                                let c = classify_fecs_word(v);
+                                                if c == "VALUE" { if v == exp { "alive" } else { "value-mismatch" } }
+                                                else if c == "POISON" { "severed" }
+                                                else { c }
+                                            };
+
+                                            let scratch0_verdict = get_verdict(scratch0, 0x00000001);
+                                            let gpccs_verdict = get_verdict(gpccs, 0x00000010);
+                                            let cpuctl_verdict = {
+                                                let c = classify_fecs_word(cpuctl);
+                                                if c == "VALUE" {
+                                                    if (cpuctl & 0x10) != 0 { "alive" } else { "value-mismatch" }
+                                                } else if c == "POISON" {
+                                                    "severed"
+                                                } else {
+                                                    c
+                                                }
+                                            };
+
+                                            serial_println!(":: kepler: ctx-poke img=POKE ack={:08X} mb0={:08X} phase={:08X} scratch0={:08X}({}) cpuctl={:08X}({}) gpccs={:08X}({}) iters={} class={} ::",
+                                                ack, mb0, phase, scratch0, scratch0_verdict, cpuctl, cpuctl_verdict, gpccs, gpccs_verdict, ack_iters, class);
 
                                             if phase == ucode::PHASE_A_BOUND {
                                                 serial_println!(":: kepler: ucode-poke EXIT-BY-BOUND img=POKE bound={} — command never observed, 0x409504 NOT read ::",
