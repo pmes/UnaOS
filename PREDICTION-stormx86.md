@@ -149,3 +149,18 @@ xHCI loan (WEDGE-8/F3) and stays `#[cfg(feature = "baremetal")]`; porting it is 
 * `storm 8` reporting `launched 8/8` — the process-table cap stopped biting, which would make the
   clamp's honesty argument false.
 * Any `fatw` line on x86.
+
+## REVIEW CORRECTIONS (seat, pre-flight — these supersede §1/§2 where they conflict)
+
+1. **No x86 instrument survives a starved shell.** The `[schedx86] load` heartbeat is emitted
+   from `x86_render_service` — the same task that dispatches shell commands — so a truncated
+   `[storm]` tail and a stopped `load` train are ONE silence. §1's closing claim is withdrawn;
+   a silent tail is settled by the next boot, not by a surviving witness.
+2. **On the `UNAOS_WC=1` build §1 names, STAT.ELF (the desktop app) already holds one proc
+   row, one job row, and one user slot.** Expected transcript: `storm: n=6 — 5/6 process rows
+   free, 7/8 job rows, 7/8 user slots`, FIVE launches (`k=1..5`), then
+   `:: STORM: REFUSED at launch 6 of 6 ... ::` and `storm: launched 5/6 vugs`; `storm 8` is
+   refused at launch 6 of 8. Scoreable claims `user slots free=2/8` and
+   `proc rows free=0 running=6` stand (the desktop app substitutes for the sixth vug).
+   The all-six transcript applies only to a knob-off (no `wc`) build or a card with no
+   STAT.ELF staged. The `free < 2` refute stays discriminating in both shapes.

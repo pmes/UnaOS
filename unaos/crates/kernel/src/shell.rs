@@ -3443,9 +3443,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // before the first launch, one `[storm] k=` line after each successful one, `post` after
             // the burst. That layout is what makes a WEDGE readable as well as a refusal: if the
             // fleet starves the shell, this verb stops printing, and the last `k=` on the wire names
-            // the launch it stopped after. Its silence proves nothing on its own — the timer-driven
-            // `:: SCHED: load ::` / `[pulse5]` / `[spin1]` lines are the instruments that survive a
-            // starved shell, and they are what a silent tail must be read against.
+            // the launch it stopped after. Its silence proves nothing on its own — and on x86 there
+            // is NO instrument that survives a starved shell (the `[schedx86] load` heartbeat runs
+            // on the same render-service task as this dispatch; on aarch64 the timer-driven
+            // `:: SCHED: load ::` / `[pulse5]` / `[spin1]` train does survive). A silent x86 tail
+            // is settled only by the next boot's slice, honestly.
             let n = args
                 .first()
                 .and_then(|s| s.parse::<usize>().ok())

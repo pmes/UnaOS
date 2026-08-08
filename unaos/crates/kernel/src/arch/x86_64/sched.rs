@@ -1123,9 +1123,11 @@ pub fn emit_load_witness(tag: &str) {
 // that starves the shell is one of the outcomes the probe is hunting. Its silence therefore refutes
 // nothing. Two properties make that silence READABLE: `pre` is emitted before the first launch and
 // one line after EACH successful launch, so the last `[storm] k=` on the wire names the launch after
-// which the shell stopped reporting. The instrument that survives a starved shell is the
-// timer/heartbeat-driven `[schedx86] load` train; read a truncated `[storm]` tail against THAT, and
-// never read a missing `post` as a clean run.
+// which the shell stopped reporting. On x86 NO instrument survives a starved shell — the
+// `[schedx86] load` heartbeat is emitted from `x86_render_service`, the SAME task that dispatches
+// shell commands, so both stop together (review-corrected: the aarch64 census can lean on its
+// timer-driven train; this one cannot). A truncated `[storm]` tail plus a stopped `load` train is
+// ONE silence, not two witnesses — never read a missing `post` as a clean run.
 //
 // WHAT IS DELIBERATELY DIFFERENT FROM THE aarch64 CENSUS, stated so a two-arch capture is not
 // mis-read as a regression on one of them:
