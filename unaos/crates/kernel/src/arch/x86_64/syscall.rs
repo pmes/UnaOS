@@ -12994,7 +12994,13 @@ pub fn run_user_image(
     let _ = name; // the task name is fixed (`RUN_TASK_NAME`) so the kill arm can match it
     let (mapped, pi) = load_program_common(bytes)?;
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
-    let cpu = crate::arch::sched::meter_current_cpu();
+    // SMPBAL-X86: a foreground `run` is load-balanced, not stuck on the caller's core. The caller is
+    // `x86_render_service` (the shell runs there since SCHED-X86), so `meter_current_cpu()` put every
+    // program on the RENDER core and a `run` degraded the panel for its whole duration — the open
+    // item at `scheduler.md`'s placement section. `CPU_AUTO` picks the shallowest dispatching queue,
+    // excludes the render core while any other core is dispatching, and marks the task steal-eligible
+    // so an idle core can correct the choice later.
+    let cpu = crate::arch::sched::CPU_AUTO;
     let pid = crate::arch::sched::spawn_user_preemptible(
         RUN_TASK_NAME,
         mapped.entry,
@@ -13101,13 +13107,7 @@ fn spawn_user_image_bg_inner(
     #[cfg(feature = "wc")]
     SLOT_NO_AUTOFOCUS[mapped.slot].store(no_autofocus, Ordering::Release);
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
-    // Place a bg job on the CALLER's core. `bg_place_cpu` is `meter_current_cpu()` — see its doc for
-    // why the round-robin this comment used to describe was removed (a job placed on a core that is
-    // online but not dispatching sits in that queue forever). The consequence, since SCHED-X86 made
-    // the shell a scheduled task: the caller IS `x86_render_service`, so every `bg` and every
-    // foreground `run` lands on the RENDER core. That is a known-open placement defect
-    // (`scheduler.md:1600-1612`), not the spread this comment previously claimed; fixing it needs
-    // `CPU_AUTO` underneath, which x86 does not have yet.
+    // SMPBAL-X86: load-balanced placement. See `bg_place_cpu`.
     let cpu = bg_place_cpu();
     let pid = crate::arch::sched::spawn_user_preemptible(
         BG_TASK_NAME,
@@ -13122,31 +13122,32 @@ fn spawn_user_image_bg_inner(
     Ok((pid, mapped.slot as u64, mapped.entry))
 }
 
-/// WINX-2: choose the core a background job starts on — the CALLER's core.
+/// WINX-2: choose the core a background job starts on. SMPBAL-X86: `CPU_AUTO` — the scheduler places
+/// it on the shallowest DISPATCHING run queue and marks it steal-eligible.
 ///
-/// This started as a round-robin over `0..meter_cpu_count()`, mirroring aarch64's BG-SPREAD intent
+/// The full history, because it is a two-defect sequence and both defects are instructive.
+///
+/// It started as a round-robin over `0..meter_cpu_count()`, mirroring aarch64's BG-SPREAD intent
 /// (every `bg` runs from the same shell context, so pinning to one core piles every background program
 /// onto it). That was WRONG and the WINX-3 witness caught it: `meter_cpu_count()` reports how many cores
 /// the METER knows about, which is not the same as how many are released into `run()` and actually
 /// dispatching. A job placed on a core that is online but not scheduling sits in that core's run queue
 /// forever — spawned, never dispatched, never exiting, and invisible except as a job that never starts.
 ///
-/// The caller's core is definitionally scheduling (we are running on it), so placement here is
-/// always-correct if not always-optimal. Spreading properly needs an "is this core dispatching"
-/// predicate that x86's scheduler does not expose yet (aarch64 gets this from `CPU_AUTO`, which picks by
-/// ready-queue depth among cores it knows are live). That predicate is the honest prerequisite for
-/// re-introducing spread, and it is a scheduler change, not a syscall-layer one.
+/// So it became `meter_current_cpu()`, the caller's own core, which is definitionally dispatching
+/// (we are running on it) — always-correct if not always-optimal. Then SCHED-X86 made the shell a
+/// scheduled task, and the caller became `x86_render_service`: every `bg` and every foreground `run`
+/// piled onto the RENDER core. That is the imbalance the bench measured with six vugs open — one core
+/// saturated, five at 0 % — and it was left open in the doc because fixing it honestly needed the
+/// missing "is this core dispatching" predicate, which is a scheduler change and not a syscall-layer
+/// one.
 ///
-/// SCHED-X86 — and "definitionally scheduling" was, until that arc, FALSE for the only caller that
-/// matters. The shell ran in the BSP's inline GUI loop, on a core that never popped its run queue, so
-/// every `bg`/`run` landed on core 0 and sat there: the metal capture showed 2 BGRUN spawns, zero
-/// `SYS_WIN_CREATE`, zero `:: SYSCALL:` witnesses, and both kills burning the full `KILL_CONFIRM_MS`.
-/// The shell is now the `x86_render_service` task, so this function's own premise finally holds and
-/// programs start. The consequence to expect at the bench: they start ON THE RENDER CORE, so a
-/// foreground `run` (whose `yield_now` wait loop interleaves with rendering) degrades the panel for
-/// its duration. That is a syscall-layer placement question, deliberately not fixed here.
+/// SMPBAL-X86 supplies exactly that predicate — `ONLINE_MASK`, set at the top of `run()` — so the
+/// spread this function originally wanted is finally safe to ask for. `CPU_AUTO` is that ask.
+/// Placement is only a hint: the task is also `steal_ok`, so if the guess is wrong an idle core
+/// corrects it within one idle pass.
 fn bg_place_cpu() -> usize {
-    crate::arch::sched::meter_current_cpu()
+    crate::arch::sched::CPU_AUTO
 }
 
 /// WINX-2: poll a background pid. With `reap` set, a `PEXITED` row is consumed here — the posted `done`

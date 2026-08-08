@@ -304,6 +304,33 @@ pub struct Task {
     /// + drop + mark reaped) instead of requeuing. An `Arc` (like `done_sem`) so the requester's clone
     /// keeps it alive after the Box is dropped.
     kill: Option<Arc<KillSwitch>>,
+    /// SMPBAL-X86: `true` = an idle core may STEAL this task out of its run queue ([`try_steal`]);
+    /// `false` = it is PINNED to `cpu` and never migrates. The PIN CONTRACT: set once at spawn as
+    /// `requested_cpu == CPU_AUTO`, so a caller that named a core gets exactly the core it named,
+    /// forever, and only a caller that said "place me" is eligible to be re-placed later. Every
+    /// pre-existing spawn site in the tree names a core, so all of them stay pinned and behave as
+    /// before this arc — including render / input / usb-pump, which is why `SCHED-X86 PLACE-CHECK`
+    /// needs no exemption and must not be given one.
+    ///
+    /// Read only under the owning run-queue's lock (`RunQueue::steal_one`); never mutated — the
+    /// stealer re-homes `cpu`, not this. Unlike aarch64, ring-3 tasks are NOT categorically excluded:
+    /// x86 has no ASID and no per-`(core, slot)` residency table, so `cpu` is a pure policy field on
+    /// this arch. See `steal_one` for the one class that IS excluded, and `AS_GEN` in `memory.rs` for
+    /// the TLB obligation migration creates here.
+    steal_ok: bool,
+}
+
+impl Task {
+    /// SMPBAL-X86: a COOPERATIVE ring-3 task — one that drops to ring 3 with RFLAGS.IF clear and
+    /// therefore runs to completion with the timer masked. `user_entry != 0` is what makes a task
+    /// ring-3 (a kernel task leaves it 0 and is `preemptible == false` too, which is why both terms
+    /// are needed). Such a task must never run on core 0: `timer_interrupt_handler`'s `cpu_index == 0`
+    /// arm is the sole advancer of `APIC_TICKS`, so masking the timer there freezes `arch::ms()` for
+    /// the machine.
+    #[inline]
+    fn is_cooperative_user(&self) -> bool {
+        self.user_entry != 0 && !self.preemptible
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -339,6 +366,15 @@ struct SchedCpu {
     park_lock: AtomicU64,
     /// PARK_SLEEP: the wake deadline, in this CPU's local timer ticks.
     park_deadline: AtomicU64,
+    /// SMPBAL-X86: the `memory::as_gen()` value at which this core last UNCONDITIONALLY reloaded CR3,
+    /// i.e. the generation of user page-table state its TLB is known to be consistent with. Written
+    /// and read only by this core's `run()` at IF=0, so `Relaxed` is sufficient; the ordering that
+    /// matters is on `AS_GEN` itself, which the mutating side publishes `AcqRel`.
+    ///
+    /// The initial 0 is deliberately BELOW the initial `AS_GEN` of 1, so a core's very first dispatch
+    /// always takes the reload arm. That costs one `mov cr3` per core per boot and removes the need to
+    /// reason about whether the pre-scheduler CR3 was ever validated.
+    cr3_gen: AtomicU64,
 }
 
 impl SchedCpu {
@@ -353,6 +389,7 @@ impl SchedCpu {
             park_waiters: AtomicU64::new(0),
             park_lock: AtomicU64::new(0),
             park_deadline: AtomicU64::new(0),
+            cr3_gen: AtomicU64::new(0),
         }
     }
 }
@@ -931,10 +968,12 @@ struct LineBuf {
 /// | 8 x `" cN=100%*(<16-byte name>+)"` — space, `cN=`, `100`, `%`, `*`, `(`, name, clip `+`, `)` = 28 | 224 |
 /// | `" sw=["` + 8 x 20 digits of `u64::MAX` + 7 commas + `"]"` | 173 |
 /// | `" q=["` + 8 x 10 digits + 7 commas + `"]"` | 92 |
+/// | `" steal="` + 2 x 20 digits of `u64::MAX` + `"/"` (SMPBAL-X86) | 48 |
+/// | `" asgen="` + 2 x 20 digits of `u64::MAX` + `"/"` (SMPBAL-X86) | 48 |
 /// | `" cores=8/NNN <CAPPED>"` | 21 |
-/// | **total** | **541** |
+/// | **total** | **637** |
 ///
-/// 768 therefore carries ~227 bytes of headroom, enough for a further field without re-deriving this.
+/// 768 therefore carries ~131 bytes of headroom, enough for a further field without re-deriving this.
 /// [`LineBuf`] reports overflow on the wire regardless, so the bound is belt and braces.
 const LINEBUF_CAP: usize = 768;
 
@@ -992,7 +1031,7 @@ impl core::fmt::Write for LineBuf {
 /// SCHEDLOAD-X86 — the always-on per-core load witness. Emits ONE serial line:
 ///
 /// ```text
-/// [schedx86] load c0=0% c1=3% c2=-- c3=100%*(pulse) c4=0% c5=0% c6=0% c7=11% sw=[..] q=[..]
+/// [schedx86] load c0=0% c1=3% c2=-- c3=100%*(pulse) … sw=[..] q=[..] steal=M/P asgen=G/R
 /// ```
 ///
 /// THE PER-CORE TOKEN HAS EXACTLY THREE FORMS, and the distinction between them is the instrument:
@@ -1003,8 +1042,11 @@ impl core::fmt::Write for LineBuf {
 /// | `cN=100%*(name)` | **INFERRED.** No span was folded for this window; the value is deduced from a live `current` plus a fold age past a whole window. `name` is the task holding the core. |
 /// | `cN=--` | **ABSENT.** No live measurement at all — the core never entered `run()`, or stopped folding with nothing executing. |
 ///
-/// `sw` is cumulative context switches per core; `q` is the instantaneous ready-queue depth. `tag` is
-/// appended to the `load` token (`""` for the steady heartbeat, `"-prejoin"` for the boot one-shot).
+/// `sw` is cumulative context switches per core; `q` is the instantaneous ready-queue depth;
+/// `steal=M/P` is SMPBAL-X86's cumulative migrations over the idle passes that attempted one (see
+/// `STEAL_PASSES` for why both terms are printed); `asgen=G/R` is the live address-space generation
+/// over the dispatches that had to re-validate CR3 against it (see `CR3_RELOADS`). `tag` is appended
+/// to the `load` token (`""` for the steady heartbeat, `"-prejoin"` for the boot one-shot).
 ///
 /// WHY THREE FORMS AND NOT TWO. `0%` is a MEASUREMENT — this core folded spans and none were busy.
 /// `--` is the ABSENCE of one. Collapsing them would make an unaccounted core indistinguishable from a
@@ -1093,7 +1135,20 @@ pub fn emit_load_witness(tag: &str) {
     for (c, row) in rows.iter().enumerate().take(n) {
         let _ = write!(w, "{}{}", if c == 0 { "" } else { "," }, row.q);
     }
-    let _ = write!(w, "]");
+    // SMPBAL-X86: cumulative migrations / idle passes that attempted one. Both numbers, never just
+    // the first: a steal count alone cannot distinguish balancing from churn, and the ratio is the
+    // arc's own falsifier (see `STEAL_PASSES`). It rides this line rather than a line of its own so
+    // the moves can be read against the per-core percents they are supposed to have flattened.
+    let (moves, passes) = steal_counters();
+    let _ = write!(w, "] steal={}/{}", moves, passes);
+    // SMPBAL-X86: the CR3-generation fix's only falsifiable reading — the live address-space
+    // generation and the number of dispatches that had to re-validate against it. See `CR3_RELOADS`.
+    let _ = write!(
+        w,
+        " asgen={}/{}",
+        crate::arch::memory::as_gen(),
+        CR3_RELOADS.load(Ordering::Relaxed)
+    );
     // R1/L4: the column count is capped at `MAX_CPUS`. Say so when it BINDS, for the same reason
     // `LineBuf` reports truncation — a witness that quietly drops its last two cores reads as a
     // shorter machine, and the bench rMBP is exactly 8 logical cores, i.e. zero headroom.
@@ -1307,6 +1362,41 @@ impl RunQueue {
         }
         None
     }
+    /// SMPBAL-X86 — remove and return the first STEAL-ELIGIBLE ready task for a thief on `thief_cpu`,
+    /// scanning LOW→HIGH priority (take a core's BACKGROUND work first, never rob it of its most
+    /// urgent task — note `.iter_mut()`, NOT the `.rev()` `pop_highest` uses) and front-first within a
+    /// level (oldest waiter). Returns `None` when the queue holds only pinned or excluded work.
+    ///
+    /// Runs on the THIEF's core under the VICTIM's run-queue lock. Every task in a run queue is
+    /// `STATE_READY` — a running task is out of the queue in `current`, a blocked one is in a wait
+    /// queue or a sleeper list — so anything reachable here is safe to re-home. `wait_ticks` and
+    /// `effective_level` are read/written under this same lock, satisfying their "never cross-CPU"
+    /// discipline; the thief's `push` re-bases both — which is a BEHAVIOUR CHANGE, not an
+    /// assurance (review C6): a stolen task loses its aging promotion and restarts at base
+    /// priority on the thief. Benign for the ring-3 fleet this arc places (they re-age in ms),
+    /// stated so nobody reads a stolen task's level reset as a scheduler bug.
+    ///
+    /// TWO filters, and both are load-bearing:
+    ///   * `steal_ok` — the pin contract (`Task::steal_ok`). Render / input / usb-pump and every
+    ///     fixture named a core, so they are skipped and left exactly where they were placed.
+    ///   * cooperative ring-3 onto core 0 — a task with RFLAGS.IF clear in ring 3 masks the timer for
+    ///     its lifetime, and core 0 is the sole advancer of the global ms-clock. `pick_cpu` encodes
+    ///     the same rule for PLACEMENT; it has to be repeated here because a later migration is a
+    ///     placement decision that `pick_cpu` never sees.
+    ///
+    /// O(ready tasks) worst case, and off the switch hot path — only an idle core with an empty queue
+    /// ever calls it.
+    fn steal_one(&mut self, thief_cpu: usize) -> Option<Box<Task>> {
+        for level in self.levels.iter_mut() {
+            let pos = level.iter().position(|t| {
+                t.steal_ok && !(thief_cpu == 0 && t.is_cooperative_user())
+            });
+            if let Some(pos) = pos {
+                return level.remove(pos);
+            }
+        }
+        None
+    }
     /// Priority-aging sweep (anti-starvation): RELOCATE every ready task that has now waited at
     /// least `AGE_TICKS` one level UP, carrying any surplus credit to the next sweep. `elapsed` is
     /// the local ticks since the previous sweep. Run on the OWNING CPU under the run-queue lock.
@@ -1396,9 +1486,17 @@ mod wedge4 {
     static W1_EMITS: AtomicU32 = AtomicU32::new(0);
     static W2_EMITS: AtomicU32 = AtomicU32::new(0);
 
-    /// Mark this CPU inside the window. Caller clears with [`leave`] on the same CPU — the spawn
-    /// paths run preemptible, but a preempted task resumes on the queue-owning CPU it was pinned
-    /// to, so the flag it set is the flag it clears.
+    /// Mark this CPU inside the window. Caller clears with [`leave`] on the SAME INDEX it entered
+    /// with, and every call site captures that index into a stack local before `enter` and passes
+    /// the same local to `leave` — so the flag it sets is the flag it clears.
+    ///
+    /// SMPBAL-X86 CORRECTION. The justification used to be "a preempted task resumes on the
+    /// queue-owning CPU it was pinned to". That is no longer true — `try_steal` migrates tasks — but
+    /// the mechanism survives unchanged, because it never depended on the pin: it depends on the
+    /// captured local, which travels with the task. What DOES change is the meaning of the `<W1>`
+    /// token on the wire: read it as "some core was mid-enqueue", not "this core was". A task that
+    /// migrates between `enter` and `leave` leaves the flag set on the core it entered on, which is
+    /// the core whose lock it actually took, so the attribution is still the honest one.
     pub fn enter(cpu: usize) {
         IN_RQ[cpu].store(true, Ordering::Relaxed);
     }
@@ -1556,7 +1654,8 @@ fn build_initial_frame(stack: &mut [u8], trampoline: extern "C" fn() -> !) -> u6
 
 /// Shared spawn path: build a kernel thread at `priority` (optionally carrying a `done_sem`
 /// completion signal for `join`), enqueue it on `target_cpu`'s run queue, and poke that CPU. Returns
-/// the new task's id. `target_cpu` must be an online AP.
+/// the new task's id. `target_cpu` must be an online AP, or [`CPU_AUTO`] to let `pick_cpu` place it
+/// (which also makes it steal-eligible — see `Task::steal_ok`).
 fn spawn_inner(
     name: &'static str,
     entry: fn(usize),
@@ -1565,6 +1664,10 @@ fn spawn_inner(
     priority: u8,
     done_sem: Option<Arc<Semaphore>>,
 ) -> u64 {
+    // SMPBAL-X86: the pin contract is decided from the REQUESTED value, before placement resolves it.
+    // A kernel task is never a cooperative ring-3 task, so the core-0 exclusion does not apply.
+    let steal_ok = target_cpu == CPU_AUTO;
+    let target_cpu = pick_cpu(target_cpu, false, name);
     assert!(target_cpu < MAX_CPUS, "spawn: target_cpu out of range");
 
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
@@ -1589,6 +1692,7 @@ fn spawn_inner(
         user_cr3: 0,
         preemptible: false,
         kill: None,
+        steal_ok,
     });
 
     // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`.
@@ -1784,6 +1888,11 @@ fn spawn_user_inner(
     preemptible: bool,
     kill: Option<Arc<KillSwitch>>,
 ) -> u64 {
+    // SMPBAL-X86: pin contract from the REQUESTED value; `!preemptible` here means a COOPERATIVE
+    // ring-3 task, which `pick_cpu` must keep off core 0 (the global ms-clock) — and which
+    // `steal_one` must likewise never move onto core 0 later.
+    let steal_ok = target_cpu == CPU_AUTO;
+    let target_cpu = pick_cpu(target_cpu, !preemptible, name);
     assert!(target_cpu < MAX_CPUS, "spawn_user: target_cpu out of range");
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
     let ctx_rsp = build_initial_frame(&mut stack, user_task_trampoline);
@@ -1806,6 +1915,7 @@ fn spawn_user_inner(
         user_cr3,
         preemptible,
         kill,
+        steal_ok,
     });
     // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`.
     #[cfg(feature = "wedge2")]
@@ -1981,6 +2091,11 @@ pub fn spawn_user_thread(
     target_cpu: usize,
     user_cr3: u64,
 ) -> JoinHandle {
+    // SMPBAL-X86: a thread is spawned PREEMPTIBLE, so the core-0 exclusion does not apply. Its one
+    // caller (`sys_thread_spawn`) names a core via `sibling_online_cpu`, so `steal_ok` is false and
+    // the WINX-7 sibling placement is unchanged; the `CPU_AUTO` arm is here for symmetry only.
+    let steal_ok = target_cpu == CPU_AUTO;
+    let target_cpu = pick_cpu(target_cpu, false, name);
     assert!(target_cpu < MAX_CPUS, "spawn_user_thread: target_cpu out of range");
     assert!(user_cr3 != 0, "spawn_user_thread: a thread needs a real private address space");
     let done = Arc::new(Semaphore::new(0));
@@ -2007,6 +2122,7 @@ pub fn spawn_user_thread(
         user_cr3,
         preemptible: true, // see the section header: a worker must share its core, not own it
         kill: None,
+        steal_ok,
     });
     // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`. Same idiom as every
     // other enqueue site (`spawn_inner` / `spawn_user_inner` / `make_ready`) — no new lock ORDER is
@@ -2210,10 +2326,194 @@ fn poke_for(target: usize, prio: u8) {
     }
 }
 
-/// Mark a parked/just-woken task READY, push it onto its PINNED CPU's run queue, and poke that CPU
-/// (waking it or preempting a lower-priority task). Used by the sleeper drain (same CPU) and
-/// `Semaphore::post` (cross-CPU wake). The task always returns to `task.cpu`, so its GS base stays
-/// correct on resume (tasks don't migrate). Caller runs with IF=0.
+// ── SMPBAL-X86: PLACEMENT (`CPU_AUTO`) ──────────────────────────────────────────────────────────
+//
+// Until this arc every x86 spawn site named a core and that decision was final: `make_ready`
+// enqueued on `task.cpu` unconditionally, nothing re-placed at wake, and `run()`'s empty-queue arm
+// went straight to `enable_and_hlt`. The measured consequence on the bench rMBP was six ring-3 vugs
+// on ONE core with five cores at 0 %, because every `bg`/`run` launch inherits the shell's core and
+// the shell is the render task.
+//
+// `CPU_AUTO` is the opt-in half of the fix (the corrective half is `try_steal`). A caller that names
+// a core still gets exactly that core — the PIN CONTRACT, checked first in `pick_cpu` — so every
+// pre-existing spawn site is unchanged. A caller that passes `CPU_AUTO` is placed on the least-loaded
+// DISPATCHING core and is marked `steal_ok`, which is what makes it correctable later.
+//
+// x86 deliberately does NOT get the aarch64 SPREAD-4…15 apparatus: no re-place at wake, no margin,
+// no freshness gate, no co-placement or recruit lanes. That layer exists on aarch64 solely because
+// EL0 tasks there cannot be stolen, and its own file records that three successive arcs of it were
+// "correct on a saturated board and wrong on an idle one". Here, placement is a one-shot hint and
+// `try_steal` is the correction; if placement guesses wrong an idle core fixes it within one idle
+// pass, which is a far shorter feedback loop than any tuning constant.
+
+/// SMPBAL-X86: sentinel `target_cpu` meaning "don't pin me — place me on the least-loaded dispatching
+/// core, and let an idle core steal me later". The aarch64 twin is `aarch64::sched::CPU_AUTO`.
+pub const CPU_AUTO: usize = usize::MAX;
+
+/// SMPBAL-X86: cores that have entered `run()` and are therefore actually DISPATCHING — the candidate
+/// set for `CPU_AUTO` placement and the victim/thief set for stealing.
+///
+/// "Online" must mean dispatching, not merely brought up. That is the WINX-2 `bg_place_cpu` lesson
+/// written into a data structure: `meter_cpu_count()` reports how many cores the METER knows about,
+/// and a task placed on a core that is online but still sitting in `wait_and_run` is spawned, never
+/// dispatched, never joined — a silent hang with no witness. `sibling_online_cpu` probes
+/// `scheduler_rsp != 0` for the same reason; this flag is the explicit version, set at the top of
+/// `run()` (which is the one function every core — APs via `wait_and_run`, the BSP via `run_bsp` —
+/// must pass through), so it is true strictly before that core can pop its first task.
+static ONLINE_MASK: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// SMPBAL-X86: rotating start index for `pick_cpu`'s scan, so fully-tied cores fill round-robin
+/// instead of every tie landing on the lowest index. Introspection-grade ordering (`Relaxed`) — a
+/// racing read at worst re-uses a start position, which costs nothing but a tie broken the same way
+/// twice.
+static AUTO_ROTATE: AtomicUsize = AtomicUsize::new(0);
+
+/// SMPBAL-X86: register `cpu` as dispatching. Called from `run()` before its first pop.
+fn mark_online(cpu: usize) {
+    if cpu < MAX_CPUS {
+        ONLINE_MASK[cpu].store(true, Ordering::Release);
+    }
+}
+
+/// SMPBAL-X86: is `cpu` dispatching? Introspection + the placement/steal candidate test.
+#[inline]
+fn cpu_dispatching(cpu: usize) -> bool {
+    cpu < MAX_CPUS && ONLINE_MASK[cpu].load(Ordering::Acquire)
+}
+
+/// SMPBAL-X86: rate limit for the one-shot `SCHEDPLACE-X86` witness — the first `PLACE_LOG_MAX`
+/// auto-placements are named on the wire, then it goes quiet. Enough to cover a six-vug launch at the
+/// bench without a busy desktop flooding the log.
+const PLACE_LOG_MAX: u32 = 24;
+static PLACE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// SMPBAL-X86: choose the core a `CPU_AUTO` spawn lands on. Returns `requested` unchanged for every
+/// other value — the PIN CONTRACT, and it is checked FIRST so a named core can never be second-guessed.
+///
+/// THREE exclusions, and they are not the same kind of rule.
+///
+///   1. **Core 0 for a COOPERATIVE ring-3 task** (`cooperative_user`, i.e.
+///      `Task::is_cooperative_user`). HARD — it is a correctness rule, never relaxed at any tier: a
+///      ring-3 task with IF=0 on core 0 masks the timer for its lifetime and freezes the global
+///      ms-clock, because `timer_interrupt_handler`'s `cpu_index == 0` arm is the sole advancer of
+///      `APIC_TICKS`.
+///   2. **The SERVICE core** (`smp::service_cpu`). This is the `xhci_worker_cpu` rule. It was a
+///      DEADLOCK rule before WEDGE-8; today it is a SERIALISATION/LATENCY rule (review-corrected):
+///      WEDGE-8 made `XHCI_CONTROLLER` a masked O(1) loan — `claim()` and `Drop` take the mutex
+///      only under `IrqMask`, so no holder can be preempted mid-hold and the preempt-the-holder
+///      deadlock is structurally impossible. What remains true: a ring-3 program placed there
+///      contends the service core's storage latency, and `xhci_worker_cpu` still DECLINES to
+///      co-locate. The tier-1 relaxation needs a 2-dispatching-core machine to fire — unreachable
+///      on the 8-core bench — and is safe when it does, merely slower.
+///   3. **The RENDER core.** Performance: it owns the panel and hosts the shell, it is the core the
+///      measured imbalance piled onto, and putting a fresh program back on it restores the defect
+///      this arc exists to remove.
+///
+/// Rules 2 and 3 RELAX in tiers (both, then render only, then neither) so a machine with too few
+/// dispatching cores still places somewhere real instead of failing; rule 1 never relaxes. The tier
+/// ladder deliberately mirrors `smp::worker_pool`'s `Exclusive` / `SvcShared` / `RenderShared`.
+///
+/// Key chain, best first: (1) shallowest ready queue, (2) lowest rolling busy percent from the
+/// SCHEDLOAD-X86 feed (an UNTRACKED core scores 0 — it has folded no span, and a core that just
+/// entered `run()` genuinely has no load), (3) the rotating cursor. Depth leads because it is an
+/// exact instantaneous count while the percent is a ~250 ms lagging window; the percent breaks ties
+/// between equally-shallow queues, which is the common case on an idle desktop.
+///
+/// LOCKING. `run_queue_len` takes a run-queue lock with no IRQ masking of its own, and this runs from
+/// the spawn paths at IF possibly 1 — the WEDGE-4 `<W1>` shape. The whole scan is therefore taken
+/// inside `without_interrupts`, exactly as `emit_load_witness` does and for the same reason: preempt
+/// a task while it holds `RUN_QUEUES[c]` and that core's `run()` then spins on it at IF=0 forever.
+/// The section is bounded — at most `MAX_CPUS` iterations of one lock acquisition held across
+/// `len()`, taken and released one at a time, never nested, no allocation and no UART inside.
+fn pick_cpu(requested: usize, cooperative_user: bool, name: &'static str) -> usize {
+    if requested != CPU_AUTO {
+        return requested;
+    }
+    let here = percpu::this_cpu().cpu_index as usize;
+    let render = crate::arch::smp::render_cpu();
+    let service = crate::arch::smp::service_cpu();
+    let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
+
+    // Tier ladder: exclude {render, service}, then {render}, then nothing. Rule 1 (core 0 for a
+    // cooperative ring-3 task) is outside the ladder — it never relaxes.
+    let mut best: Option<(usize, usize, u32)> = None; // (cpu, depth, pct)
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for tier in 0..3u8 {
+            for i in 0..MAX_CPUS {
+                let c = (rot + i) % MAX_CPUS;
+                if !cpu_dispatching(c) {
+                    continue;
+                }
+                if cooperative_user && c == 0 {
+                    continue; // hard rule: never a cooperative ring-3 task on the clock core
+                }
+                if tier < 2 && render == Some(c) {
+                    continue;
+                }
+                if tier < 1 && service == Some(c) {
+                    continue;
+                }
+                let depth = RUN_QUEUES[c].lock().len();
+                // `live = 0`: this is a CROSS-core read, and `live_span_cyc` would subtract another
+                // core's `rdtsc` anchor from ours. `busy_pct`'s own contract says pass 0 here. A core
+                // that has never folded a span scores 0, which is the truth for a core that just
+                // entered `run()`.
+                let pct = ACCT[c].busy_pct(0);
+                let better = match best {
+                    None => true,
+                    Some((_, bd, bp)) => depth < bd || (depth == bd && pct < bp),
+                };
+                if better {
+                    best = Some((c, depth, pct));
+                }
+            }
+            if best.is_some() {
+                return;
+            }
+        }
+    });
+
+    let Some((cpu, depth, pct)) = best else {
+        // Nothing is dispatching yet (pre-`enable()` spawn). Fall back to the caller's core, which is
+        // the pre-arc behaviour and definitionally reachable — the caller is executing on it.
+        // Review C1: the fallback must not silently relax rule 1 (cooperative ring-3 on the clock
+        // core freezes the ms-clock). Latent today — both CPU_AUTO producers spawn preemptible —
+        // but the guard is one spawn site away from live, so it is asserted, not assumed.
+        debug_assert!(
+            !(cooperative_user && here == 0),
+            "pick_cpu fallback would place a cooperative ring-3 task on the clock core"
+        );
+        return here;
+    };
+    if PLACE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < PLACE_LOG_MAX {
+        serial_println!(
+            ":: SCHEDPLACE-X86: '{}' -> c{} (q={} load={}% from c{}) ::",
+            name,
+            cpu,
+            depth,
+            pct,
+            here
+        );
+    }
+    cpu
+}
+
+/// Mark a parked/just-woken task READY, push it onto its CURRENT HOME CPU's run queue, and poke that
+/// CPU (waking it or preempting a lower-priority task). Used by the sleeper drain (same CPU) and
+/// `Semaphore::post` (cross-CPU wake). Caller runs with IF=0.
+///
+/// SMPBAL-X86 — this doc used to read "the task always returns to `task.cpu`, so its GS base stays
+/// correct on resume (tasks don't migrate)". The MECHANISM is unchanged and still correct; the reason
+/// given for it was wrong twice over. Tasks now migrate (`try_steal`), and `task.cpu` is simply the
+/// task's CURRENT home — re-homed by the stealer before the push, so a later wake delivers the task
+/// to where it now lives. And GS base was never a per-task property: it is pure per-core state
+/// programmed in `percpu::init_cpu`, so a migrated task reading the NEW core's per-CPU block is the
+/// correct behaviour, not a hazard. What actually had to be repaired for migration is the TLB — see
+/// `AS_GEN` in `memory.rs`.
+///
+/// x86 deliberately has no `rewake_place` twin: re-placing on every wake is what drove aarch64's
+/// SPREAD-4/5/6 churn (`rewake=3256 and climbing` on a six-vug fleet). Correction happens on the idle
+/// side instead, where it costs an idle core's spare cycles rather than a waking task's latency.
 fn make_ready(task: Box<Task>) {
     let target = task.cpu as usize;
     let prio = task.priority;
@@ -3585,14 +3885,21 @@ pub fn wait_and_run() -> ! {
 ///     `spawn_user_preemptible`, IF=1). The rule, written down: never place a COOPERATIVE ring-3
 ///     task on core 0.
 ///
-///   * **Placement can never surprise us, because x86 tasks do not migrate.** aarch64 needs a
-///     `mark_online` here so that `CPU_AUTO` placement and work-stealing may start using core 0;
-///     x86 has neither — there is no `CPU_AUTO`, no `spawn_auto`, and no steal predicate anywhere
-///     (`run()`'s empty-queue arm goes straight to `enable_and_hlt`, where the aarch64 twin calls
-///     `try_steal`). `make_ready` enqueues on `task.cpu` unconditionally, so every task stays on the
-///     core its spawner named, forever. The consequence is the honest one and it cuts both ways:
-///     nothing can wander onto core 0 uninvited, and core 0 will run ONLY what is explicitly pinned
-///     to it — it cannot heal load imbalance, and with nothing pinned there it simply idles.
+///   * **Placement (SMPBAL-X86 — this bullet is the one the arc rewrote).** It used to read
+///     "placement can never surprise us, because x86 tasks do not migrate": there was no `CPU_AUTO`
+///     and no steal predicate, `make_ready` enqueued on `task.cpu` unconditionally, and core 0 ran
+///     only what was explicitly pinned to it — which is to say it idled, and no imbalance anywhere
+///     could ever heal. Both halves now exist. `run()` calls `mark_online(cpu)` before its first pop
+///     (the x86 twin of the `mark_online` aarch64 does here), so from this call on core 0 is a
+///     `CPU_AUTO` placement candidate and a steal thief/victim like any other.
+///
+///     The residual hazard named two bullets up is unchanged and is now ENCODED rather than merely
+///     documented: a COOPERATIVE (IF=0) ring-3 task must never reach core 0, because it would mask
+///     the timer for its lifetime and freeze the global ms-clock. `pick_cpu` excludes core 0 for that
+///     task class at placement and `RunQueue::steal_one` excludes it again at migration — two sites,
+///     because a steal is a placement decision `pick_cpu` never sees. Kernel tasks are safe
+///     (`task_trampoline` enables interrupts on entry) and the live shell paths are safe
+///     (`run_user_image` / `spawn_user_image_bg` both use `spawn_user_preemptible`, IF=1).
 ///
 ///   * **The `c0:0/0` meter reading heals, and that is a display change, not load moving.**
 ///     `CPU_BUSY[0]`/`CPU_IDLE[0]` are frozen at (0,0) today because core 0 never enters this loop;
@@ -3666,8 +3973,157 @@ fn input_wait_backstop() {
     crate::arch::x86_64::syscall::user_input_wake_backstop();
 }
 
+// ── SMPBAL-X86: WORK STEALING ───────────────────────────────────────────────────────────────────
+//
+// Placement (`CPU_AUTO`) is a one-shot guess made at spawn; this is the correction. An idle core —
+// one whose own ready queue came up empty — pulls ONE steal-eligible task off the most-loaded
+// dispatching core instead of going straight to `hlt`, so backlog drains onto idle silicon rather
+// than queueing behind a saturated core.
+//
+// Protocol, race-free against the existing per-core run-queue spinlocks:
+//   1. VICTIM SELECT (advisory peek): scan dispatching cores != self for the deepest queue at or
+//      above `STEAL_MIN_DEPTH`, taking and releasing each core's lock one at a time.
+//   2. STEAL, under the VICTIM's lock ONLY: re-read the depth (it may have drained since the peek)
+//      and, if still at the floor, `steal_one()`. The lock is released before this core's own queue
+//      is touched, so exactly ONE run-queue lock is held at a time — no lock ordering, no deadlock.
+//   3. RE-HOME (we exclusively own the popped Box): `task.cpu = cpu`, then push locally. A later wake
+//      through `make_ready` now delivers the task to its new home.
+//
+// WHY THIS IS SOUND ON x86, stated because it is the arch-specific half:
+//   * There is no per-task hardware state to strand. No FPU/XSAVE context exists anywhere in this
+//     kernel (the target json builds `+soft-float` with SSE/AVX off), there is no FS base, and GS
+//     base is pure per-core state — a migrated task reading the new core's per-CPU block is correct.
+//   * Everything else per-task is re-derived at the single dispatch site: CR3, TSS.RSP0 and the
+//     SYSCALL kernel rsp are all installed there from the incoming `Task`, covering first entry and
+//     resume alike.
+//   * The four `debug_assert!((*raw).cpu as usize == cpu)` invariants are PRESERVED, not exempted,
+//     because step 3 re-homes before the push.
+//   * `SLEEPERS` is NOT touched, deliberately. A sleep deadline is in the parking core's local APIC
+//     tick domain and is not portable; a sleeping task is not in a run queue, so it is not reachable
+//     from here. Do not "helpfully" migrate sleepers.
+//   * The TLB obligation migration creates — x86 has no shootdown IPI and `slot_cr3(s)` is a fixed
+//     address reused by every tenant of a slot — is discharged by the address-space generation, see
+//     `AS_GEN` in `memory.rs` and the dispatch site below. That fix is not separable from this one.
+
+/// SMPBAL-X86: minimum victim queue depth to steal from. `2` leaves the last ready task at its home
+/// core (a core with one task is not "loaded"), which is what stops two idle cores ping-ponging a
+/// lone task between them.
+const STEAL_MIN_DEPTH: usize = 2;
+
+/// SMPBAL-X86: rate limit for the per-steal witness — the first `STEAL_LOG_MAX` migrations are named
+/// on the wire, then it goes quiet. The cumulative `steal=` field on the `[schedx86] load` line keeps
+/// counting after that, so the log stays bounded without the measurement stopping.
+const STEAL_LOG_MAX: u32 = 24;
+static STEAL_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// SMPBAL-X86: total tasks MOVED by stealing, machine-wide.
+static STEAL_MOVES: AtomicU64 = AtomicU64::new(0);
+
+/// SMPBAL-X86: total idle passes that RAN the steal attempt, machine-wide. Reported alongside
+/// `STEAL_MOVES` because the ratio is the falsifier: a steal count climbing at DISPATCH rate rather
+/// than at idle-pass rate is churn, not balance (aarch64's own lesson, paid for over three arcs). A
+/// fleet in balance shows moves ≪ passes and moves going flat while passes keep climbing.
+static STEAL_PASSES: AtomicU64 = AtomicU64::new(0);
+
+/// SMPBAL-X86: cumulative `(moves, passes)` for the load witness. Introspection only.
+fn steal_counters() -> (u64, u64) {
+    (STEAL_MOVES.load(Ordering::Relaxed), STEAL_PASSES.load(Ordering::Relaxed))
+}
+
+/// SMPBAL-X86: dispatches that took the UNCONDITIONAL CR3 reload arm — i.e. this core's `cr3_gen` was
+/// behind `memory::as_gen()` and its TLB had to be re-validated. Bumped on the RARE arm only, so the
+/// common no-mutation dispatch pays one relaxed load and nothing else.
+///
+/// This exists because the CR3-generation fix is otherwise INVISIBLE. It has no failure mode a
+/// witness could catch after the fact — a stale-TLB cross-tenant read is silent by construction —
+/// so the only falsifiable thing about it is whether it FIRES. Reported against the live generation:
+/// `asgen=<gen>/<reloads>`. A generation climbing with window activity while reloads stays at 0 means
+/// the dispatch site is not consulting it and the whole mechanism is dead.
+static CR3_RELOADS: AtomicU64 = AtomicU64::new(0);
+
+/// SMPBAL-X86: an idle `cpu` (its own ready queue came up empty) tries to steal ONE eligible task
+/// from the most-loaded dispatching core. Returns `true` if a task landed on this core's queue — the
+/// caller then loops back to the top of `run()` and dispatches it rather than halting.
+///
+/// Called from `run()`'s empty-queue arm with IF ALREADY 0 (the loop top masked), which is the
+/// run-queue lock contract; no extra masking is needed and none is taken. At most one run-queue lock
+/// is held at any instant.
+///
+/// NEITHER THE RENDER CORE NOR THE SERVICE CORE STEALS — the same two exclusions `pick_cpu` applies,
+/// and they have to be repeated here because a steal is a placement decision `pick_cpu` never sees.
+/// The service one is a DEADLOCK rule (`x86_usb_pump` holds the raw `XHCI_CONTROLLER` spinlock there;
+/// a co-located preemptible task that also takes it can preempt the holder and spin forever — the
+/// rule `smp::xhci_worker_cpu` DECLINES rather than break); the render one is the panel's latency
+/// budget, which its idleness between frames represents rather than spare capacity. Both remain valid
+/// VICTIMS: anything steal-eligible sitting on them is precisely what should be drained away. The
+/// tier relaxation `pick_cpu` does has no analogue here and needs none — refusing to steal always
+/// leaves the task where it already runs correctly.
+fn try_steal(cpu: usize) -> bool {
+    if crate::arch::smp::render_cpu() == Some(cpu) || crate::arch::smp::service_cpu() == Some(cpu) {
+        return false;
+    }
+    STEAL_PASSES.fetch_add(1, Ordering::Relaxed);
+
+    // 1. PEEK for the deepest OTHER dispatching queue at or above the floor. Each depth read takes
+    //    that core's lock and releases it immediately — one at a time, never two at once, and the
+    //    result is treated as advisory (step 2 re-checks under the lock it actually steals from).
+    //    Say "peek", not "lock-free": these ARE acquisitions, and they go through the same bounded
+    //    wrapper as everything else so the wedge probe can see them.
+    let mut victim: Option<usize> = None;
+    let mut best_depth = STEAL_MIN_DEPTH - 1;
+    for c in 0..MAX_CPUS {
+        if c == cpu || !cpu_dispatching(c) {
+            continue;
+        }
+        #[cfg(feature = "wedge2")]
+        let depth = wedge4::lock_or_squawk(&RUN_QUEUES[c]).len();
+        #[cfg(not(feature = "wedge2"))]
+        let depth = RUN_QUEUES[c].lock().len();
+        if depth > best_depth {
+            best_depth = depth;
+            victim = Some(c);
+        }
+    }
+    let Some(v) = victim else {
+        return false;
+    };
+
+    // 2. Steal under the victim's lock ONLY, re-checking the depth (it may have drained since the
+    //    peek). The guard is scoped so it is dropped before this core's own queue is touched.
+    let stolen = {
+        // WEDGE-4: this is a REMOTE run-queue acquisition, new on this arch, so it goes through the
+        // same bounded-spin wrapper as the dispatcher's own — otherwise it would be the one
+        // acquisition the wedge probe cannot see.
+        #[cfg(feature = "wedge2")]
+        let mut vq = wedge4::lock_or_squawk(&RUN_QUEUES[v]);
+        #[cfg(not(feature = "wedge2"))]
+        let mut vq = RUN_QUEUES[v].lock();
+        if vq.len() < STEAL_MIN_DEPTH { None } else { vq.steal_one(cpu) }
+    };
+    let Some(mut task) = stolen else {
+        return false;
+    };
+
+    // 3. Re-home and enqueue locally. We exclusively own the Box here, so this write races nothing.
+    //    `name` is copied out BEFORE the push — the Box moves.
+    let name = task.name;
+    task.cpu = cpu as u32;
+    #[cfg(feature = "wedge2")]
+    wedge4::lock_or_squawk(&RUN_QUEUES[cpu]).push(task);
+    #[cfg(not(feature = "wedge2"))]
+    RUN_QUEUES[cpu].lock().push(task);
+    STEAL_MOVES.fetch_add(1, Ordering::Relaxed);
+    if STEAL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEAL_LOG_MAX {
+        serial_println!(":: [smpbal] steal '{}' c{}->c{} ::", name, v, cpu);
+    }
+    true
+}
+
 fn run() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
+    // SMPBAL-X86: register as DISPATCHING before the first pop, so `pick_cpu` and `try_steal` may use
+    // this core — and, just as important, so neither can use a core that has not reached here.
+    mark_online(cpu);
     // Aging sweep cadence, kept as a stack local (run() is `-> !`, entered once per CPU, so this
     // survives the CPU's whole lifetime — no SchedCpu field needed). Seed from the LIVE tick count:
     // by now the AP burned ticks in `wait_and_run`'s hlt loop / the BSP during verify_smp, so a 0
@@ -3746,11 +4202,42 @@ fn run() -> ! {
                 // just-preempted user task's CR3 (which could be freed on that task's teardown). We
                 // are IF=0 here (loop top), and "only if different" skips the redundant full-flush
                 // `mov cr3` on the common no-switch case.
+                //
+                // SMPBAL-X86: and this is where the CR3 install stops being a pure optimization
+                // question. `switch_cr3_if_needed` skips the reload when this core's LIVE CR3 already
+                // equals the target, inferring "then my TLB is already correct for it". That
+                // inference held only because tasks did not migrate: every core that ever installed a
+                // given user CR3 was a core on which a task holding it would later exit and restore
+                // the kernel CR3. Stealing falsifies it, and because `slot_cr3(s)` is a FIXED physical
+                // address shared by every tenant of that slot over the SAME backing frames, the
+                // failure is silent and cross-tenant — a new program dispatched on a core still
+                // standing on the recycled root would run under the previous tenant's cached leaves
+                // (stale W bits against the new ELF's W^X layout, plus reach into window-surface pages
+                // that `clear_slot_fb` unmapped with a core-local `invlpg` only).
+                //
+                // So the skip is now conditional on this core having validated its TLB at the CURRENT
+                // address-space generation. `AS_GEN` (`memory.rs`) is bumped by every user-leaf
+                // mutation anywhere; a core whose stamp is behind reloads unconditionally — a full
+                // non-global flush on this hardware, since nothing the kernel maps carries
+                // `PTE_GLOBAL` and firmware leaves CR4.PGE clear — and restamps. One relaxed load per
+                // dispatch in the steady state; at most one extra `mov cr3` per core per mutation.
+                //
+                // Note the ordering: `as_gen()` is read BEFORE the reload, so a mutation that lands
+                // between the read and the reload leaves this core stamped one generation short and
+                // it reloads again next dispatch. Erring stale-low is the safe direction; erring
+                // stale-high would be the bug.
                 let target_cr3 = {
                     let uc = unsafe { (*raw).user_cr3 };
                     if uc != 0 { uc } else { crate::arch::memory::kernel_cr3() }
                 };
-                unsafe { crate::arch::memory::switch_cr3_if_needed(target_cr3) };
+                let as_gen = crate::arch::memory::as_gen();
+                if SCHED[cpu].cr3_gen.load(Ordering::Relaxed) == as_gen {
+                    unsafe { crate::arch::memory::switch_cr3_if_needed(target_cr3) };
+                } else {
+                    unsafe { crate::arch::memory::load_cr3(target_cr3) };
+                    SCHED[cpu].cr3_gen.store(as_gen, Ordering::Relaxed);
+                    CR3_RELOADS.fetch_add(1, Ordering::Relaxed); // rare arm only — see `CR3_RELOADS`
+                }
 
                 // U4x: install the incoming task's KERNEL-STACK anchors here too — the M7-twin of the
                 // CR3-at-dispatch above. TSS.RSP0 is the stack the CPU switches to on a ring-3
@@ -3846,6 +4333,16 @@ fn run() -> ! {
                 }
             }
             None => {
+                // SMPBAL-X86: before halting, try to pull one task off the most-loaded core. This is
+                // the exact slot the aarch64 twin uses, and the placement is deliberate: it runs only
+                // when this core has genuinely nothing of its own, so the steal rate is bounded by the
+                // idle-pass rate and one steal is taken per pass at most. A success falls through to
+                // the loop top (which re-pops under the lock) rather than dispatching inline, so the
+                // stolen task goes through the ordinary aging + pick path with no second code path.
+                // IF is 0 here — masked at the loop top and not yet re-enabled by the `hlt` below.
+                if try_steal(cpu) {
+                    continue;
+                }
                 // Nothing to run: sleep until an interrupt (timer or a `spawn`/wake IPI). The `sti;
                 // hlt` pair is atomic — an interrupt latched before the `sti` still fires and
                 // returns past the `hlt`, so a wake that arrived in the empty-check window is not

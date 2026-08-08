@@ -358,6 +358,10 @@ unsafe fn next_table(entry: *mut u64) -> *mut u64 {
 /// as requested. Asserts the leaf was previously empty (caller must `translate` it first). NX
 /// requires EFER.NXE, enabled in `syscall::init` before any mapping.
 pub unsafe fn map_user_page(va: u64, phys: u64, writable: bool, nx: bool) {
+    // AS_GEN (review C5): deliberately NO generation bump here, alone among the user-leaf
+    // mutators. This helper asserts the PTE was NOT-PRESENT, and x86 never caches a non-present
+    // translation, so no core can hold a stale view of a page that was never mapped — the
+    // not-present argument below covers the cross-core case the bump exists for.
     // WXAUDIT: the W^X gate on the ONE ring-3 mapping seam that lacked it. `protect_user_slot_range`
     // already refuses a W+X segment and `map_slot_fb_page`/`build_slot` mint constant shapes, but this
     // helper takes `writable` and `nx` as INDEPENDENT arguments, so nothing stopped a future caller from
@@ -615,6 +619,10 @@ pub unsafe fn protect_user_slot_range(
             invlpg(va);
         }
     }
+    // SMPBAL-X86: the `invlpg`s above are CORE-LOCAL. Publish the change so every other core reloads
+    // CR3 at its next dispatch — a migrated task must not run on another core's cached pre-`protect`
+    // leaves (that would be a stale-W W^X bypass of the GR19 shape).
+    bump_as_gen();
 }
 
 /// WINX-1: kernel identity pointer to slot `s`'s RO info page.
@@ -644,9 +652,15 @@ pub fn fb_win_surface_va(w: usize) -> u64 {
 /// IDEMPOTENT by design (a re-create of the same region slot re-installs identical leaves). The `invlpg`
 /// is unconditional and cheap: mapping a previously-NOT-PRESENT leaf needs no shootdown on x86 (a
 /// non-present translation is never cached), and re-mapping an identical leaf is a no-op, so this only
-/// has to cover the case where a leaf's flags changed. Cross-core staleness is not reachable here: a
-/// slot's user leaves are only ever touched by a window verb running in that slot, or by teardown, which
-/// reloads CR3 (a full non-global flush) before the slot can be reused.
+/// has to cover the case where a leaf's flags changed.
+///
+/// SMPBAL-X86 CORRECTION. This doc used to close with "cross-core staleness is not reachable here: a
+/// slot's user leaves are only ever touched by a window verb running in that slot, or by teardown,
+/// which reloads CR3 before the slot can be reused." Both halves of that argument assumed the task
+/// never leaves the core it was spawned on. Under work stealing a window verb runs on whichever core
+/// the task has migrated to, and the teardown reload happens on whichever core the task died on — so
+/// ANOTHER core can be left holding cached leaves for this slot. The local `invlpg` stands; what
+/// covers the other cores is the `bump_as_gen()` below (see `AS_GEN`).
 unsafe fn map_slot_fb_page(s: usize, off: usize, writable: bool) {
     debug_assert!(s < USER_SLOTS && off + 4096 <= USER_STATIC_SIZE);
     let va = super::syscall::USER_BASE + off as u64;
@@ -659,6 +673,7 @@ unsafe fn map_slot_fb_page(s: usize, off: usize, writable: bool) {
         *slot_pt_ptr(s).add(pt_index(va)) = (frame & PTE_ADDR) | flags;
         invlpg(va);
     }
+    bump_as_gen(); // SMPBAL-X86: the invlpg above is core-local; tell every other core to reload
 }
 
 /// WINX-1: map slot `s`'s RO info page (ring-3 read-only — the kernel publishes geometry there and ring-3
@@ -693,6 +708,10 @@ pub unsafe fn unmap_slot_fb_win(s: usize, w: usize, pages: usize) {
             invlpg(va);
         }
     }
+    // SMPBAL-X86: this is the direction that MUST reach other cores — the mapping was live, so it is
+    // cached wherever the owning task has run. Core-local `invlpg` cannot retire those copies; the
+    // generation bump makes every other core reload CR3 before it dispatches anything again.
+    bump_as_gen();
 }
 
 /// WINX-1: drop every FB leaf of slot `s` — the info page and all window surface slots — and zero the
@@ -711,6 +730,7 @@ pub unsafe fn clear_slot_fb(s: usize) {
         invlpg(info_va);
         core::ptr::write_bytes(slot_backing_ptr(s).add(FB_INFO_OFF), 0, FB_REGION_SIZE);
     }
+    bump_as_gen(); // SMPBAL-X86: the info-page unmap above is core-local (see `AS_GEN`)
 }
 
 /// U4x: the address-space SLOT the caller is currently running in, matched from the LIVE CR3 against
@@ -739,6 +759,55 @@ pub fn kernel_cr3() -> u64 {
     cur
 }
 
+// ── SMPBAL-X86: the ADDRESS-SPACE GENERATION ────────────────────────────────────────────────────
+//
+// x86 has no broadcast TLB invalidation and no shootdown IPI: `invlpg` and `mov cr3` are both
+// CORE-LOCAL (`apic.rs` names shootdown IPIs as future work). Every user-TLB correctness argument
+// in this module therefore rested on an UNWRITTEN premise —
+//
+//     "the only core that ever installs a given user CR3 is the core that will restore the kernel
+//      CR3 when that address space is torn down"
+//
+// — which held only because tasks did not migrate. Work stealing (`sched::try_steal`) falsifies it,
+// and the failure mode is silent: `slot_cr3(s)` is a FIXED physical address per slot, identical for
+// every tenant of that slot over the same backing frames, so a core left standing on a recycled
+// root would skip `switch_cr3_if_needed`'s reload and run the NEW tenant under the OLD tenant's
+// cached leaves — stale W bits against the new ELF's W^X layout, plus reach into window-surface
+// pages that `clear_slot_fb` unmapped with a core-local `invlpg` only.
+//
+// The fix needs no IPI, because a core idling on a stale root cannot CONSUME a stale user
+// translation: the kernel half is byte-identical in every slot PML4 (`build_slot`) and the kernel
+// addresses user backing through identity aliases, never through `USER_BASE`. Stale user entries
+// are reachable only by DISPATCHING a task, so the reload can be deferred to that dispatch.
+//
+// `AS_GEN` is bumped by every mutation of any slot's USER leaves — allocation (`build_slot` does no
+// flush of its own), teardown/recycle (`free_user_space_by_cr3`), the ELF permission pass
+// (`protect_user_slot_range`), and every window map/unmap. The scheduler records, per core, the
+// generation at which that core last validated its live CR3 (`SchedCpu.cr3_gen`); when the two
+// differ at dispatch it reloads CR3 unconditionally — a full non-global flush on this hardware,
+// since no mapping the kernel builds is ever marked `PTE_GLOBAL` and firmware leaves CR4.PGE clear
+// on the bench machine — and restamps. Cost: one relaxed load per dispatch, one atomic add per
+// address-space mutation, and at most one extra `mov cr3` per core per mutation.
+//
+// Deliberately NOT "make `load_cr3` unconditional for user targets": that reintroduces a full TLB
+// flush on EVERY user dispatch and regresses the U3.5 fast path the conditional exists for.
+static AS_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// SMPBAL-X86: the current address-space generation (see `AS_GEN`). Read by the scheduler's dispatch
+/// site once per dispatch.
+#[inline]
+pub fn as_gen() -> u64 {
+    AS_GEN.load(Ordering::Acquire)
+}
+
+/// SMPBAL-X86: publish that some slot's USER leaves changed, so every core re-validates its live CR3
+/// at its next dispatch. Called from every user-leaf mutation in this module. `AcqRel` because the
+/// leaf writes that precede it must be visible to the core that acts on the new generation.
+#[inline]
+fn bump_as_gen() {
+    AS_GEN.fetch_add(1, Ordering::AcqRel);
+}
+
 /// Load `cr3` into the CR3 register (installs that address space; flushes the non-global TLB).
 #[inline]
 pub unsafe fn load_cr3(cr3: u64) {
@@ -758,6 +827,12 @@ pub fn restore_kernel_cr3() {
 /// established for BOTH first entry (was the trampoline) and resume-after-preemption (which never
 /// goes through the trampoline). `target` is a raw CR3 base (no PCID — CR4.PCIDE is off), directly
 /// comparable to the live CR3 base.
+///
+/// SMPBAL-X86 — READ THE PRECONDITION. "This core is already standing on this address space, so its
+/// TLB is already correct for it" is sound only while nothing has changed that space's user leaves
+/// behind this core's back. That is no longer guaranteed by "tasks do not migrate", so this must NOT
+/// be called bare from the dispatch site: `sched::run` calls it only on the arm where the core's
+/// recorded `cr3_gen` matches [`as_gen`], and reloads unconditionally otherwise. See `AS_GEN`.
 #[inline]
 pub unsafe fn switch_cr3_if_needed(target: u64) {
     if cr3_table() as u64 != target {
@@ -817,6 +892,10 @@ pub fn alloc_user_space() -> Option<usize> {
             // actually in the PT, so a future edit that makes a user page W+X fails here — at the
             // allocation that would have handed it to ring 3 — instead of silently shipping.
             wx_check_slot(s);
+            // SMPBAL-X86: `build_slot` writes leaves and issues NO flush at all — it relied entirely
+            // on the CR3 reload at the new tenant's first dispatch, which under migration may be
+            // skipped on a core still standing on this slot's (recycled, fixed) CR3. Publish.
+            bump_as_gen();
             return Some(s);
         }
     }
@@ -869,6 +948,15 @@ pub fn alloc_user_spaces(out: &mut [usize]) -> bool {
 
 /// Release the slot whose CR3 is `cr3`. The caller MUST have already restored the kernel CR3 (that
 /// `mov cr3` full-flush is what retires this slot's user TLB entries) — see `restore_kernel_cr3`.
+///
+/// SMPBAL-X86 CORRECTION. That caller-side reload retires the entries on ONE core: the one the dying
+/// task happened to be on. Before work stealing that was every core that could have cached them,
+/// because a task lived and died on the core it was spawned on. It no longer is. The reload
+/// requirement stands (a core must not sit on a root it no longer has a task for), but it is no
+/// longer sufficient on its own — `clear_slot_fb` below and the `SLOT_USED` release both bump
+/// `AS_GEN`, which is what makes a RECYCLED slot safe to dispatch on a core that never ran the
+/// previous tenant. Without that, the next tenant of this slot — same CR3 value, same backing frames
+/// — would run under the previous tenant's cached leaves on such a core.
 pub fn free_user_space_by_cr3(cr3: u64) {
     for s in 0..USER_SLOTS {
         if slot_cr3(s) == cr3 {
@@ -886,6 +974,11 @@ pub fn free_user_space_by_cr3(cr3: u64) {
             super::syscall::win_close_slot(s);
             unsafe { clear_slot_fb(s) };
             SLOT_USED[s].store(false, Ordering::Release);
+            // SMPBAL-X86: the RECYCLE point. `clear_slot_fb` above already bumped, but state that
+            // dependency here rather than inheriting it — this store is what makes the slot claimable
+            // again, and it is the instant after which another core's cached leaves for this CR3
+            // describe a DIFFERENT tenant.
+            bump_as_gen();
             return;
         }
     }
