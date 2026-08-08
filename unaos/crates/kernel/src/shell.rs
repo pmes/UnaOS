@@ -4198,8 +4198,14 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
 /// Note what this does NOT change: the kernel `Proc` row and its `KillSwitch` are registered by
 /// `spawn_user_image_bg` itself, so `bg_kill`/`bg_poll` can always reach the pid. Only the shell's
 /// NAME for it comes from here.
+///
+/// `pub(crate)` since the kernel-apps eviction, for ONE second caller:
+/// [`crate::video::wcx::desktop_app_service`], which launches the desktop app at boot with nobody at
+/// the prompt to type `bg`. Registering it here is what keeps `jobs` and `kill` TRUTHFUL —
+/// `bg_kill_cmd` resolves a pid through this table and REFUSES one it cannot find, so an
+/// unregistered launch would be a running ring-3 program the operator can neither list nor stop.
 #[cfg(target_arch = "x86_64")]
-fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
+pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
     let mut jobs = BG_JOBS.lock();
     let Some(free) = jobs.iter_mut().find(|s| s.is_none()) else {
         return false;

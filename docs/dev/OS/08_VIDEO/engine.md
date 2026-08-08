@@ -7112,20 +7112,28 @@ Neither is a video finding; both are recorded here because they are hit while re
 #### The window-id map — read this before attributing any `[wc-x]` or `[wc-h]` line
 
 Ids are table-slot order, assigned as `(slot + 1)` in `wm::create_inner`, and `wcx::activate()`
-creates in a fixed order: console, then demo, then probe.
+creates in a fixed order: console, then probe.
+
+> ⚠ **CHANGED BY THE KERNEL-APPS EVICTION (move #1).** `wcx::activate()` no longer creates a demo
+> window. Every capture taken before that arc maps `win=2` to the kernel-drawn 96x64 calibration
+> window (`[wc-x] demo win=2 surf=96x64 at (2103,1117) scale=8x z=2` → `[wc-x] present win=2
+> rows=1104..1630 ok=true`, outer box 770x526) and `win=3` to the MOVE-VACATE probe. **Read historical
+> logs with that map and current logs with the table below.** The line that now stands where
+> `[wc-x] demo …` used to is `[wc-x] desktop-app ARMED name=/STAT.ELF …`, and the desktop's second
+> window arrives later, from ring 3, through the ordinary `[wc-a] create …` path.
 
 | id | what it is | surface | outer box | wire line |
 |----|------------|---------|-----------|-----------|
 | `win=1` | **the panel console** — fbcon routed into a window; the subject of this arc | 1312x736 | 1314x750 | `[wc-x] console-window win=1 panel=2880x1800 surf=1312x736 box=1314x750 at (783,444) …`, and `[wc-x] activate … console_win=1` |
-| `win=2` | the WC-X demo window | 96x64 @ 8x | 770x526 | `[wc-x] demo win=2 surf=96x64 at (2103,1117) scale=8x z=2` |
-| `win=3` | the MOVE-VACATE probe — witness builds only, one-shot, opened and closed in a clear corner | 8x8 @ 8x | 66x78 | `[wc-x] move-vacate win=3 scale=8x from=(8,8) to=(90,8) box=66x78 painted=true … -> PASS` |
+| `win=2` | the MOVE-VACATE probe — witness builds only, one-shot, opened and closed in a clear corner. It was `win=3` while the demo window still existed | 8x8 @ 8x | 66x78 | `[wc-x] move-vacate win=2 scale=8x from=(8,8) to=(90,8) box=66x78 painted=true … -> PASS` |
+| first free slot | **the desktop app** — `STAT.ELF`, launched by `wcx::desktop_app_service` from the device-service pass. A ring-3 window like any other: it takes whichever slot is free when its `SYS_WIN_CREATE` lands, so its id is `2` or `3` depending on whether the probe has already opened and closed | 128x128 | scale-dependent | `[wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 entry=0x… pid=P slot=S DETACHED, left RUNNING`, then `[wc-a] create win=<n> asid=<a> surf=128x128 …` |
 
 The box arithmetic corroborates the wire independently, through `TITLE_H = 12` and `BORDER = 1`:
-96·8 + 2 = 770 and 64·8 + 12 + 2 = 526; 8·8 + 2 = 66 and 8·8 + 12 + 2 = 78. **`win=3` is the probe,
-not the console.** A reading that puts the banded console at `win=3` is crediting this arc with the
-probe's 8x8 box, which is cheap because it is small, not because anything narrowed it.
+8·8 + 2 = 66 and 8·8 + 12 + 2 = 78 for the probe. (The retired demo window's 96·8 + 2 = 770 and
+64·8 + 12 + 2 = 526 is what every pre-eviction capture shows at `win=2`.) **A reading that puts the
+banded console at anything but `win=1` is crediting this arc with another window's box.**
 
-⚠ **Only `win=1` and `win=2` are stable identities. Ids 3 and above are RECYCLED SLOTS.** The probe is
+⚠ **Only `win=1` is a stable identity. Ids 2 and above are RECYCLED SLOTS.** The probe is
 opened and closed early, and every later ring-3 window takes whichever slot is free, so a single boot
 carries several unrelated `win=3` windows. In s70's second boot, slot 3 is created five separate times
 under `asid=0x0`, `0x1`, `0xc0a` and `0x1` again, at surfaces `8x8` and `128x128`; slots 4 and 5 appear
@@ -7264,9 +7272,11 @@ lines below are what it CAN read.
 
 ### Metal watch-list (FBCON-DMG)
 
-* **`win=1` is the console.** `win=2` is the demo window and `win=3` is the MOVE-VACATE probe; see
-  the window-id map under *Metal status*. Every number quoted for this arc must come from `win=1`,
-  and a capture file may hold several boots — attribute by boot boundary before attributing by id.
+* **`win=1` is the console.** Since the kernel-apps eviction, `win=2` is the MOVE-VACATE probe on a
+  witness build and the desktop app (`STAT.ELF`) otherwise; in a PRE-eviction capture `win=2` is the
+  kernel-drawn demo window and `win=3` is the probe. See the window-id map under *Metal status*.
+  Every number quoted for this arc must come from `win=1`, and a capture file may hold several
+  boots — attribute by boot boundary before attributing by id.
 * **Before blaming the boot, confirm the image was armed — and do not confirm it with `[wc-h]`.**
   Every `[wc-h]` literal this arc added is present with `UNAOS_WITNESS=1` alone, identically in an
   image built with the compositor knobs OFF, so finding them on a stick proves nothing about the

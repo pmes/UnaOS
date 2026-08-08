@@ -41,9 +41,30 @@
 //! ordinary row in the window table over it, and paints its glyphs there. Z-order now does the job
 //! the band was doing, which is the whole reason the band was only ever provisional.
 //!
-//! The console window is created FIRST and the demo window second, so the demo's later `z` puts it
-//! in front — the sitting shows two real windows with real occlusion between them, rather than two
-//! windows that were carefully arranged never to meet.
+//! The console window is the only window this module creates. The SECOND window on the desktop is a
+//! ring-3 PROCESS — see *The desktop's second window is a program* below — created later, by its own
+//! `SYS_WIN_CREATE`, and therefore carrying the later `z`. The sitting still shows two real windows
+//! with real occlusion between them; one of them now has a pid.
+//!
+//! ### The desktop's second window is a PROGRAM (kernel-apps eviction, move #1)
+//!
+//! This module used to author a 96x64 calibration surface and open a kernel-owned window over it —
+//! ~110 ring-0 lines that shipped on every boot to prove exactly one thing: that a second window
+//! exists, occludes the console, and composites. `STAT.ELF` is that same fixture in ring 3, it is
+//! already staged on the DATA volume, and the x86 metal capture has it passing end-to-end 24 times.
+//! Peter's directive is that the apps in the kernel move into user space, and panel furniture drawn
+//! by the kernel for a human to look at is an app by the boundary rule in the eviction survey.
+//!
+//! So the demo window is GONE and what replaces it is a launch. The launch cannot happen HERE:
+//! [`activate`] runs mid-`takeover_display`, from inside PCI enumeration, where there is no FAT
+//! volume (xHCI has not enumerated storage), no shell, and — on the SCHED-X86 split — no core yet
+//! dispatching ring 3. What this module does at the seam is ARM the request and say so on the wire;
+//! [`desktop_app_service`] performs it, from the device-service task, on the first pass where storage
+//! is up. The two lines are deliberately distinct: `ARMED` says the compositor asked for its second
+//! window, `LAUNCH`/`DECLINE` says what became of the request. Keeping the ARMED line is what
+//! preserves the early-failure signal the kernel-drawn window used to give for free — a boot that
+//! arms and never launches is now visibly a boot that lost its program, not a boot that lost its
+//! compositor.
 //!
 //! Serial is unaffected by any of this: `serial_println!` still writes the UART on every line, and
 //! the FTDI mirror the bench reads is unconditional in this build. The window is where the text is
@@ -62,9 +83,10 @@
 //!
 //! ### Front-buffer discipline
 //!
-//! Every pixel this module authors lands in [`DEMO_SURF`], a cached-RAM kernel surface. It performs
-//! no framebuffer write of its own and reads the front buffer never — `wm` owns the panel writes
-//! and does them through its staged path. There is no direct-front-buffer fallback in this file.
+//! This module authors NO window pixels at all any more — the calibration surface went with the demo
+//! window, and the desktop's second window paints itself from ring 3. It performs no framebuffer
+//! write of its own and reads the front buffer never — `wm` owns the panel writes and does them
+//! through its staged path. There is no direct-front-buffer fallback in this file.
 //!
 //! The one exception, and its exact scope: [`activate_on`] clears the whole panel to
 //! `wm::DESKTOP_BG` once, BEFORE the first window exists (see the DESKTOP-CLEAR comment there). At
@@ -200,80 +222,36 @@ impl SurfaceDesc {
 static ACTIVATED: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(ORIGIN_NONE);
 
-/// The demo surface's source dimensions, in pixels. Small on purpose: the compositor's own scale
-/// rule magnifies it to the panel (4x on a ≤1799-row panel), so a small source is what exercises the
-/// upscale path, and a small source is also what keeps this buffer in BSS at a size nobody has to
-/// think about (96 * 64 * 4 = 24 KiB).
-const DEMO_W: usize = 96;
-const DEMO_H: usize = 64;
-
-/// The demo surface, in ARGB8888 with a stride of exactly one row. Kernel-owned cached RAM: the
-/// compositor reads it as a source and never writes it, and nothing in user mode can reach it.
+/// DESKTOP-APP — the program that IS the desktop's second window, by its 8.3 name in the root of the
+/// volume `crate::fs::fat::mount()` binds (on x86 always the USB mass-storage DATA volume — the ESP
+/// the firmware booted is unreachable after `ExitBootServices`, so `target/x86_64_data/` is the tree
+/// that has to carry it).
 ///
-/// `static mut` rather than a `Mutex`: `wm::create` takes the surface as a raw address it will read
-/// from composite context, so the buffer must have a stable address independent of any guard. It is
-/// written exactly once, by [`paint_demo`], before the window that references it exists.
-#[repr(align(4))]
-struct DemoSurface([u32; DEMO_W * DEMO_H]);
-static mut DEMO_SURF: DemoSurface = DemoSurface([0; DEMO_W * DEMO_H]);
+/// Spelled in the on-disk 8.3 case, and the match is case-insensitive regardless: `DirEntry::eq_name`
+/// compares with `eq_ignore_ascii_case` against the short name and the long name alike, so this
+/// constant would resolve `stat.elf` as readily. Uppercase is used because it is what the directory
+/// literally holds and what every other witness line in the tree quotes.
+const DESKTOP_APP: &str = "STAT.ELF";
 
-/// The window id [`activate_on`] opened, or [`wm::WIN_NONE`] if it has not run or declined.
+/// DESKTOP-APP — has [`activate_on`] asked for the desktop's second window yet?
 ///
-/// NO LONGER THE GUARD — see [`ACTIVATED`], which is claimed at the top of `activate_on` where this
-/// one was stored at the bottom. This stays for the witness lines and for anything that wants to ask
-/// "did the demo window actually open", which is a different question from "has the compositor been
-/// claimed".
-static DEMO_WIN: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(wm::WIN_NONE);
+/// The whole of the deferral. `activate_on` cannot launch a program (no FAT volume, no ELF loader
+/// reachable from inside PCI enumeration, and on the SCHED-X86 split no core dispatching ring 3 yet),
+/// so it sets this and prints one line; [`desktop_app_service`] watches it from the device-service
+/// task and performs the launch on the first pass where storage is up.
+///
+/// Deliberately a SECOND flag rather than a read of [`ACTIVATED`]: the latch is RELEASED on every
+/// decline path, so a boot whose activation failed late would otherwise look identical to a boot that
+/// never ran the seam, and the service task would launch a window onto a desktop the compositor had
+/// disowned. This is set exactly once, at the end of a SUCCESSFUL activation, and never cleared.
+static DESKTOP_APP_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
-/// Gap in panel pixels between the demo window's outer box and the panel edge. Matches `wm`'s own
-/// tiling gap in spirit; it is only used to inset the pinned demo window from the bottom-right
-/// corner, so the frame the compositor draws is visible on all four sides in a bench photograph.
+/// Gap in panel pixels between a pinned window's outer box and the panel edge. Matches `wm`'s own
+/// tiling gap in spirit. Witness-only since the demo window went to ring 3 — the MOVE-VACATE probe is
+/// the last thing in this file that pins its own geometry.
+#[cfg(feature = "witness")]
 const EDGE_GAP: usize = 8;
-
-/// Fill [`DEMO_SURF`] with a calibration pattern.
-///
-/// **Not theme, not chrome.** The window's border and title strip are painted by the compositor from
-/// `wm`'s own constants, as they are for every window; nothing here invents a chrome colour or a
-/// desktop colour, and this module deliberately defines no colour table of its own. What it draws is
-/// *content* — the kind of content a calibration target is made of, chosen so that a photograph of
-/// the panel answers questions:
-///
-///   * a 1-px frame in white — proves the window's content extent, and where it sits relative to the
-///     kernel-drawn border (the two must be adjacent, never overlapping);
-///   * pure red / green / blue vertical bars — prove the channel order survives the GOP layout
-///     conversion (`FrameBuffer::put_pixel` re-encodes per layout; a swapped pair shows instantly);
-///   * a corner-to-corner diagonal — proves the nearest-neighbour upscale is isotropic; a stride
-///     error in the blit turns a diagonal into a staircase with a visible slope change;
-///   * a single-pixel checkerboard block — the highest spatial frequency the surface can carry, so
-///     any row that the present drops or duplicates shows up as a band of flat colour.
-fn paint_demo() {
-    // SAFETY: called exactly once, from `activate`, before the window that names this buffer is
-    // created — so no compositor pass can be reading it, and there is no other writer at all.
-    let px = unsafe { &mut (*core::ptr::addr_of_mut!(DEMO_SURF)).0 };
-    for y in 0..DEMO_H {
-        for x in 0..DEMO_W {
-            let c = if x == 0 || y == 0 || x == DEMO_W - 1 || y == DEMO_H - 1 {
-                0x00FF_FFFF
-            } else if x * DEMO_H == y * DEMO_W {
-                0x00FF_FFFF
-            } else if y >= DEMO_H - 12 && x >= DEMO_W - 12 {
-                // Single-pixel checkerboard, bottom-right.
-                if (x + y) & 1 == 0 { 0x00FF_FFFF } else { 0x0000_0000 }
-            } else if y < 12 {
-                // Channel bars across the top third of the width each.
-                match x * 3 / DEMO_W {
-                    0 => 0x00FF_0000,
-                    1 => 0x0000_FF00,
-                    _ => 0x0000_00FF,
-                }
-            } else {
-                0x0000_0000
-            };
-            px[y * DEMO_W + x] = c;
-        }
-    }
-}
 
 /// WC-X86 — activate the compositor on the x86 panel, on whatever surface [`super::WRITER`] already
 /// describes. Unchanged signature, unchanged meaning; idempotent, a second call is a no-op.
@@ -429,7 +407,8 @@ pub fn activate_on(desc: SurfaceDesc) {
         wm::DESKTOP_BG
     );
 
-    // RULED — the console becomes a window. Opened FIRST so the demo below carries the higher z.
+    // RULED — the console becomes a window. Opened FIRST, so the desktop app launched below carries
+    // the higher z when its own `SYS_WIN_CREATE` lands.
     // Its own witness lines (`[wc-x] console-window …`) report the geometry and the panic fallback.
     let cwin = super::fbcon::panel_console_window_open();
     if cwin == wm::WIN_NONE {
@@ -439,73 +418,18 @@ pub fn activate_on(desc: SurfaceDesc) {
     }
     serial_println!("[wc-x] activate panel={}x{} console_win={}", pw, ph, cwin);
 
-    paint_demo();
-    // Taking the ADDRESS of a `static mut` is safe — no reference is formed. The one place a
-    // reference is formed is `paint_demo`, which carries the safety argument for it.
-    let surf = core::ptr::addr_of_mut!(DEMO_SURF) as usize;
-    let surf_len = DEMO_W * DEMO_H * 4;
-    // SPAWN-PLACE — the demo's OUTER box is pinned into the panel's bottom-right corner, and the
-    // geometry is settled BEFORE the row exists. `wm::create` + `wm::move_to` computed the same
-    // placement, but only after `create` had already composited a frame of this window at the
-    // tiler's top-left origin — visible on the metal (s41) as a window that appears top-left and
-    // jumps, and as an abandoned box the move then has to erase. `spawn_geometry` answers the size
-    // question (the tiler's own scale rule) without a row, and `create_at` takes the content origin,
-    // so the first and only frame this window ever presents is at the position it keeps.
+    // DESKTOP-APP — ARM the desktop's second window. It is a PROGRAM now, so it cannot be opened
+    // from here; see the module docs for why this seam is structurally too early for a launch, and
+    // [`desktop_app_service`] for the pass that performs it.
     //
-    // Overlapping the console window is still intended: the demo is created later, so it has the
-    // higher z, and the overlap is what makes the occlusion visible in a bench photograph.
-    let (_scale, ow, oh) = match wm::spawn_geometry(DEMO_W, DEMO_H) {
-        Some(g) => g,
-        None => {
-            ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
-            serial_println!("[wc-x] activate DECLINE reason=geometry-unavailable latch=released");
-            return;
-        }
-    };
-    let ox = pw.saturating_sub(ow).saturating_sub(EDGE_GAP);
-    let oy = ph
-        .saturating_sub(crate::ui_status::chrome_h(ph))
-        .saturating_sub(oh)
-        .saturating_sub(EDGE_GAP);
-    // CLICK-X86 — owner [`wm::KERNEL_OWNER_DESKTOP`]: this window belongs to the KERNEL, not to any
-    // address space, and both consequences that reading was chosen for still hold — it is outside the
-    // focus ring (`focus_ring` skips the reserved band) and outside `close_owner`'s reach (which
-    // refuses it), so no user task may present, move or close it. It is now HITTABLE, which owner 0
-    // silently prevented: the demo is panel furniture in the corner and the operator will click it.
-    // A distinct band value from the console's, so a click raises exactly the window under the hand.
-    let id = wm::create_at(
-        wm::KERNEL_OWNER_DESKTOP,
-        surf,
-        surf_len,
-        DEMO_W as u32,
-        DEMO_H as u32,
-        (DEMO_W * 4) as u32,
-        b"unaos wc",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
-    );
-    if id == wm::WIN_NONE {
-        ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
-        serial_println!("[wc-x] activate DECLINE reason=create-failed latch=released");
-        return;
-    }
+    // Set AFTER the console window, i.e. only on a fully successful activation: every decline above
+    // returns with this still clear, so the service task cannot put a window on a desktop the
+    // compositor released.
+    DESKTOP_APP_ARMED.store(true, Ordering::Release);
     serial_println!(
-        "[wc-x] spawn-place win={} box={}x{} at ({},{}) (created in place, no move)",
-        id, ow, oh, ox, oy
+        "[wc-x] desktop-app ARMED name=/{} (deferred to the device-service pass — no FAT volume or ELF loader at this seam)",
+        DESKTOP_APP
     );
-
-    DEMO_WIN.store(id, Ordering::Relaxed);
-    let ok = wm::present(id);
-
-    if let Some(i) = wm::info(id) {
-        let y0 = i.y.saturating_sub(wm::TITLE_H + wm::BORDER);
-        let y1 = (i.y + i.h * i.scale + wm::BORDER).min(ph);
-        serial_println!(
-            "[wc-x] demo win={} surf={}x{} at ({},{}) scale={}x z={}",
-            i.id, i.w, i.h, i.x, i.y, i.scale, i.z
-        );
-        serial_println!("[wc-x] present win={} rows={}..{} ok={}", i.id, y0, y1, ok);
-    }
 
     #[cfg(feature = "witness")]
     move_vacate_probe(pw, ph);
@@ -516,8 +440,131 @@ pub fn activate_on(desc: SurfaceDesc) {
     super::instgui::open();
 }
 
+/// DESKTOP-APP — perform the deferred launch of the desktop's second window. **One shot per boot**,
+/// and a no-op on every pass but one.
+///
+/// ### Where this must be called from, and why it is not a choice
+///
+/// From `x86_usb_pump`, the SCHED-X86 DEVICE-SERVICE task, beside `fat::probe_once`. Three
+/// constraints pick that site and together they leave no other:
+///
+///  1. **It reads the FAT volume**, and a FAT read takes `XHCI_CONTROLLER` — a raw `spin::Mutex`.
+///     `main.rs`'s placement rule is explicit that no xHCI taker may be added to the RENDER core, so
+///     the render/shell task is out; the service core is where the xHCI takers live.
+///  2. **It spawns a ring-3 task**, and `spawn_user_image_bg` places it on `bg_place_cpu()` = the
+///     CALLER's core. That is only correct from a context that is itself dispatching. The BSP's
+///     inline GUI loop never enters the scheduler — the exact defect SCHED-X86 named, where two BGRUN
+///     spawns produced zero `SYS_WIN_CREATE` — so the call must come from a scheduled task, and this
+///     task is one. Nothing here fires on the inline-loop fallback, and that is deliberate rather
+///     than an omission: a launch there would be a job that never runs.
+///  3. **It must WAIT for storage.** The seam that arms it runs during PCI enumeration, long before
+///     xHCI has enumerated a mass-storage device. A service pass repeats, so "not yet" costs one
+///     atomic load and the launch lands on the first pass that can serve it.
+///
+/// ### Failure is one line and boot continues
+///
+/// Every exit after the storage gate prints exactly one `[wc-x] desktop-app …` line naming the
+/// reason, and the one-shot is consumed either way — a volume with no `STAT.ELF` refuses once, not
+/// once per millisecond. Nothing else about the boot changes: the compositor, the console window and
+/// the desktop are already up, and the panel simply carries one window instead of two.
+pub fn desktop_app_service() {
+    use core::sync::atomic::Ordering;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    // Not armed = the activation never completed. Cheapest test first, and it is the one that is
+    // false on every boot without the Kepler takeover.
+    if !DESKTOP_APP_ARMED.load(Ordering::Acquire) {
+        return;
+    }
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    // The same storage gate `fat::probe_once` uses, for the same reason: `mount()` on a boot whose
+    // xHCI has not yet enumerated a stick is a "no volume" that means "not yet", not "not ever", and
+    // consuming the one-shot on it would refuse a launch the media could have served.
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+    DONE.store(true, Ordering::Relaxed);
+
+    let Ok(fs) = crate::fs::fat::mount() else {
+        serial_println!(
+            "[wc-x] desktop-app DECLINE reason=no-fat-volume name=/{} — the desktop keeps the console window only",
+            DESKTOP_APP
+        );
+        return;
+    };
+    let Ok(de) = fs.find_in_root(DESKTOP_APP) else {
+        // Name the VOLUME, not "the boot volume": `fat::mount()` binds the USB mass-storage device
+        // xHCI enumerated, and the volume UEFI booted from is a different thing the kernel cannot
+        // read after `ExitBootServices`. The WINX-2 witness learned this the hard way on an attended
+        // rMBP boot and its message is the model for this one.
+        serial_println!(
+            "[wc-x] desktop-app DECLINE reason=absent name=/{} — not on the mounted DATA volume (the USB mass-storage device, NOT the UEFI boot volume); stage target/x86_64_data/ onto it",
+            DESKTOP_APP
+        );
+        return;
+    };
+    let cap = crate::arch::syscall::user_window_size();
+    if de.size == 0 || de.size as usize > cap {
+        serial_println!(
+            "[wc-x] desktop-app DECLINE reason=size name=/{} bytes={} cap={} (the ring-3 program window)",
+            DESKTOP_APP, de.size, cap
+        );
+        return;
+    }
+    let mut bytes = alloc::vec![0u8; de.size as usize];
+    if fs.read_file(&de, &mut bytes, cap).is_err() {
+        serial_println!("[wc-x] desktop-app DECLINE reason=read-failed name=/{}", DESKTOP_APP);
+        return;
+    }
+    if !(bytes.len() >= 4 && bytes[0..4] == [0x7F, b'E', b'L', b'F']) {
+        // The loader would otherwise take this down its FLAT-blob path. Same refusal, and the same
+        // reason, as the shell's BARE-EXEC arm: a name launches ELF programs, nothing else.
+        serial_println!(
+            "[wc-x] desktop-app DECLINE reason=not-elf64 name=/{} bytes={}",
+            DESKTOP_APP, bytes.len()
+        );
+        return;
+    }
+
+    // THE SAME LOADER `bg` AND BARE-EXEC TAKE. Not a new path: per-segment W^X, the ring-3 window
+    // bound and the fault-kill net are whatever `spawn_user_image_bg` already enforces, and the slot
+    // is marked DETACHED before the task can run, so the program's first `SYS_WIN_CREATE` sees the
+    // flag exactly as a `bg`'d one does.
+    //
+    // The ONE divergence, and it is the difference between furniture and a launch the operator asked
+    // for: `..._no_autofocus` suppresses the first-window focus GRANT. `sys_win_create` hands the
+    // keyboard to any program that opens a window while nobody holds focus — which the shell, at
+    // boot, definitionally does not — and `STAT.ELF` has no `SYS_INPUT_POLL` at all, so an
+    // unqualified launch here would end the boot with the keyboard published to a program that
+    // cannot read it. The window this replaces was `KERNEL_OWNER_DESKTOP` and was outside the focus
+    // ring by construction; this is that property carried across the eviction. The app stays
+    // hittable and stays in the TAB ring — only the automatic grant is withheld.
+    match crate::arch::syscall::spawn_user_image_bg_no_autofocus(&bytes) {
+        Ok((pid, slot, entry)) => {
+            // Register it in the shell's job table, under the same canonical path a typed launch
+            // would record. `jobs` must list the desktop app and `kill <pid>` must reach it: the
+            // verb resolves a pid through that table and refuses one it cannot find, so skipping
+            // this would leave a ring-3 program running that the operator can neither see nor stop.
+            // Unlike BARE-EXEC this does NOT kill the job when the table is full — the table is
+            // empty at boot so it cannot happen, and killing the desktop's only window over a
+            // bookkeeping failure would be the worse outcome if it somehow did. Say so instead.
+            let tracked = crate::shell::adopt_bg_job(pid, slot, "/STAT.ELF");
+            serial_println!(
+                "[wc-x] desktop-app LAUNCH name=/{} bytes={} entry={:#x} pid={} slot={} DETACHED, left RUNNING, tracked={}",
+                DESKTOP_APP, bytes.len(), entry, pid, slot, tracked
+            );
+        }
+        Err(why) => serial_println!(
+            "[wc-x] desktop-app DECLINE reason=spawn-rejected name=/{} why={}",
+            DESKTOP_APP, why
+        ),
+    }
+}
+
 /// The probe surface for [`move_vacate_probe`] — one flat colour, chosen to be nothing else on the
-/// panel: not [`wm::DESKTOP_BG`], not the chrome, not any bar in the demo pattern.
+/// panel: not [`wm::DESKTOP_BG`], not the chrome, not any bar the desktop app draws.
 #[cfg(feature = "witness")]
 const PROBE_COL: u32 = 0x00FF_00FF;
 #[cfg(feature = "witness")]

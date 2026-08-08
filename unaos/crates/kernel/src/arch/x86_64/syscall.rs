@@ -3309,6 +3309,35 @@ const FB_MAGIC: u32 = 0x4E49_5755;
 static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
     [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
 
+/// DESKTOP-APP: which slots are exempt from the FIRST-WINDOW focus grant in [`sys_win_create`].
+///
+/// ### The defect this exists to prevent, stated before the fix
+///
+/// `sys_win_create` gives input focus to any process that opens a window while `USER_INPUT_ACTIVE`
+/// is 0 — the minimum viable policy that makes a `bg`'d interactive app reachable at all, and it is
+/// right for every launch an OPERATOR asks for. The kernel-apps eviction introduced the first launch
+/// nobody asks for: `wcx::desktop_app_service` starts `STAT.ELF` at boot, as the compositor's
+/// furniture, and its window opens at a moment when the shell is by definition idle. Unqualified,
+/// that grant would fire on it — and `STAT.ELF` never calls `SYS_INPUT_POLL` (it is a paint loop with
+/// no input path at all), so the boot would end with the keyboard published to a program that cannot
+/// read it. Every keystroke would land in a ring nobody drains, and the prompt would be dead until
+/// the operator discovered `<TAB>`. The kernel-drawn window this replaces was `KERNEL_OWNER_DESKTOP`
+/// and was outside the focus ring by construction; keeping the desktop's furniture out of the
+/// keyboard's way is that property preserved across the eviction, not a new policy.
+///
+/// ### Why a slot flag and not a check at the call site
+///
+/// The launcher cannot set it after `spawn_user_image_bg` returns: the task is runnable the moment it
+/// is spawned and could reach `SYS_WIN_CREATE` first. So it is set INSIDE the spawn, in the same
+/// window as `SLOT_DETACHED` — after `load_program_common` has named the slot and before the task can
+/// run — which makes the exemption unraceable rather than probably-early-enough.
+///
+/// Narrow on purpose. It suppresses the AUTOMATIC grant only: the desktop app stays in `focus_ring`,
+/// stays hittable, and `<TAB>` or a click still gives it the keyboard if the operator wants it to
+/// have it. Nothing here can take focus away from anyone.
+static SLOT_NO_AUTOFOCUS: [AtomicBool; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+
 /// WINX-7: the process-flags word's DETACHED bit, at info-page byte offset `0x20`. Bit 0, the same
 /// bit and the same offset the aarch64 info page uses, so one arch-neutral program reads it on both.
 const FB_FLAG_DETACHED: u32 = 1 << 0;
@@ -3431,7 +3460,19 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // property the producer-side focus gate exists to guarantee. Focus returns to the shell when the
     // holder's slot is torn down (`user_input_revoke_slot`), so the next app launched after that one
     // exits is focusable in turn — and, since WC-TAB/x86, without needing that exit at all.
-    if USER_INPUT_ACTIVE
+    //
+    // DESKTOP-APP — and it is qualified now, by exactly one slot flag. "Nobody has focus" is the
+    // shell's NORMAL state, so the grant fires on whatever windowed program happens to open first;
+    // that is right for a launch the operator asked for and wrong for the one the compositor asks
+    // for at boot. See [`SLOT_NO_AUTOFOCUS`] for the full argument. The CAS is skipped rather than
+    // undone: publishing focus and then taking it back would be a real transition the whole ledger
+    // would have to account for, and there is nothing here to take back.
+    if SLOT_NO_AUTOFOCUS[slot].load(Ordering::Acquire) {
+        serial_println!(
+            ":: wc-x86: input focus NOT granted to slot {} (desktop app — exempt from the first-window grant; <TAB> or a click still reaches it) ::",
+            slot
+        );
+    } else if USER_INPUT_ACTIVE
         .compare_exchange(0, (slot as u64) + 1, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
@@ -10333,6 +10374,9 @@ pub fn clear_handle_row(slot: usize) {
     // foreground `run` landing in a slot a `bg` job just vacated must not inherit "I was detached"
     // and skip its own frame cap.
     SLOT_DETACHED[slot].store(false, Ordering::Release);
+    // DESKTOP-APP: per-TENANT for exactly the same reason — an operator-typed launch that lands in the
+    // slot the desktop app vacated must get the ordinary first-window grant.
+    SLOT_NO_AUTOFOCUS[slot].store(false, Ordering::Release);
     for i in 0..NHANDLE {
         // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind),
         // then the rights and kind — so no intermediate state is ever a live handle with stale rights/kind.
@@ -12249,11 +12293,37 @@ pub fn run_user_image(
 /// it — the `jobs` verb is the reaper. Rows are a bounded resource (`MAX_PROCS`), which is honest: a
 /// shell that never runs `jobs` eventually gets "process table full", not silent loss.
 pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
+    spawn_user_image_bg_inner(bytes, false)
+}
+
+/// DESKTOP-APP: [`spawn_user_image_bg`] for a launch NOBODY ASKED FOR — the compositor's own desktop
+/// app, started at boot by `video::wcx::desktop_app_service`.
+///
+/// Identical in every respect but one: the slot is marked [`SLOT_NO_AUTOFOCUS`] before the task can
+/// run, so the program's first `SYS_WIN_CREATE` does not take the keyboard off an idle shell. That
+/// module's doc carries the whole argument; the reason it is a separate ENTRY POINT rather than a
+/// flag the caller sets afterwards is that the task is runnable the instant it is spawned, so
+/// "afterwards" is a race the desktop app would sometimes lose.
+///
+/// Deliberately NOT a public policy knob for the shell: `bg`, `run` and BARE-EXEC are operator-driven
+/// launches and must keep the ordinary grant. This entry point exists for kernel-initiated launches
+/// and has exactly one caller.
+pub fn spawn_user_image_bg_no_autofocus(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
+    spawn_user_image_bg_inner(bytes, true)
+}
+
+fn spawn_user_image_bg_inner(
+    bytes: &[u8],
+    no_autofocus: bool,
+) -> Result<(u64, u64, u64), &'static str> {
     let (mapped, pi) = load_program_common(bytes)?;
     // WINX-7: mark the slot DETACHED before the task can run, so its first `SYS_WIN_CREATE` publishes
     // the flag and the program never observes a stale `false`. See `SLOT_DETACHED` for why a windowed
     // app needs to know it was backgrounded.
     SLOT_DETACHED[mapped.slot].store(true, Ordering::Release);
+    // DESKTOP-APP: the focus exemption, in the SAME pre-spawn window and for the same reason — the
+    // flag has to be true before the task exists, not before it gets around to opening a window.
+    SLOT_NO_AUTOFOCUS[mapped.slot].store(no_autofocus, Ordering::Release);
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
     // Place a bg job on a core chosen by the same round-robin the fixtures use rather than the shell's
     // own: every `bg` launch runs from the same shell context, so pinning to `this_cpu` would stack every
