@@ -1349,12 +1349,16 @@ KERNEL_CFG_MATRIX=(
   # (the QEMU-virt virtio-net driver, which carries no board gate of its own and so type-checks here).
   "arm-tegra   ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet"
   # VSYNC-PACE (GR22) — x86, compositor ON, present pacer OFF. A leg of its own, and the reason is a hole
-  # the pairwise-mix legs below cannot close by construction: their covering array guarantees, for every
-  # ordered pair (X, Y), a leg with Y ON and X OFF. It never guarantees a leg with BOTH ON. For `nopace`
-  # that is exactly the configuration that matters — `nopace` gates nothing unless `wc` is also set (the
-  # pacer lives inside the `wc` half of `arch/x86_64/syscall.rs`), so `wc` OFF + `nopace` ON type-checks
-  # the same empty set the default legs already do, and the escape hatch a bench measurement would
-  # actually boot would have been compiled by nothing. `x86-all` deliberately does NOT carry `nopace`:
+  # `nopace` gates nothing unless `wc` is also set (the pacer lives inside the `wc` half of
+  # `arch/x86_64/syscall.rs`), so `wc` OFF + `nopace` ON type-checks the same empty set the default legs
+  # already do. REVIEW C3 CORRECTION: an earlier version of this comment claimed the pairwise-mix legs
+  # "never guarantee a leg with BOTH ON" and that wc+nopace "would have been compiled by nothing". That
+  # is FALSE — the reviewer reconstructed `build_cfg_legs` against the post-arc Cargo.toml and found
+  # `x86-mix-1` (wc+nopace, witness off) and `x86-mix-2` (wc+nopace+witness) already cover it. This leg
+  # is kept as explicit belt-and-braces, named rather than derived, because the mix legs are
+  # INDEX-DERIVED from `[features]` order: adding `nopace` (N 47->48) reshuffled all eight of them, so
+  # any claim of the form "config X is covered by x86-mix-N" is stale the moment a feature is added.
+  # `x86-all` deliberately does NOT carry `nopace`:
   # it is the shipped-desktop leg and must keep the pacer's ARMED polarity under type-check. This leg is
   # the disarmed twin, and between them both polarities of every `#[cfg]` in the family are compiled.
   "x86-nopace  ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,wc,witness,nopace,ehcihid,smolnet"

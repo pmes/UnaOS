@@ -3741,9 +3741,19 @@ const WIN_PRESENT_HIDDEN: i64 = 1;
 /// **Why there is a grace at all.** A window can be hidden between a frame's first and last present
 /// (the operator TABs mid-frame), and stalling a millisecond inside a present that was going to be the
 /// app's last before it noticed the bit would be a latency cost paid by a correct app for the
-/// compositor's timing. Eight is a whole frame's worth of banded presents on the measured client and
-/// costs nothing at steady state: while hidden the counter never resets, so the grace is spent once
-/// per episode and every present after it is charged.
+/// compositor's timing. Eight was a whole frame's worth of banded presents on the measured client, and
+/// while hidden the counter never resets, so the grace is spent once per episode and every present
+/// after it is charged.
+///
+/// VSYNC-PACE CHANGED THIS ARITHMETIC (review C2), and the old sentence is left above only so the
+/// change is legible. `pace_advance` runs BEFORE `wc_shim::present`, so a suppressed present still
+/// advances the cadence: a hidden window that keeps presenting is now DOUBLE-SLEPT — up to a frame in
+/// `present_pace`, then PRESSURE-1's 1 ms — landing at ~58/s. So (a) eight suppressed presents now
+/// span eight PANEL FRAMES (~133 ms), not one, and the app is unthrottled by PRESSURE-1 for that
+/// window; (b) PRESSURE-1's measured ~1,000/s hidden cap becomes ~58/s. The system property still
+/// holds — the pacer caps the arrival rate before the charge ever matters, and it caps it harder —
+/// but any reading of GR21's hidden-present figures against a paced boot is comparing two different
+/// machines. The double sleep is INTENDED: a hidden app deserves both bounds.
 const HIDDEN_PRESENT_GRACE: u32 = 8;
 
 /// PRESSURE-1: what a charged suppressed present costs. One tick — the x86 timebase is 1 kHz, so
@@ -3874,8 +3884,14 @@ static WIN_PACE_DUE_US: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN
 ///
 /// A hostile slot can call `SYS_WIN_PRESENT` on another slot's id and clobber that window's recorded
 /// generation. The whole effect is one extra un-paced frame, or one missed focus exemption, for a
-/// window it does not own; it cannot stall that window, because the DEADLINE — the only field that can
-/// delay anyone — is written exclusively inside the ownership-checked block.
+/// window it does not own; it cannot stall that window — but NOT for the reason an earlier draft of
+/// this comment gave (review C1). The deadline is NOT written exclusively inside the ownership-checked
+/// block: the focus-exemption branch in `present_pace` STORES 0 to `WIN_PACE_DUE_US[id]` outside any
+/// ownership check, for an id the caller may not own. The stall-immunity property survives because
+/// that store can only CLEAR a cadence, never push a deadline forward — clearing makes the next
+/// present immediate, which is the safe direction. The residual is real and bounded: a hostile slot
+/// can consume one focus exemption belonging to another slot's window, costing that window at most
+/// one frame.
 #[cfg(all(feature = "wc", not(feature = "nopace")))]
 static WIN_PACE_SEQ: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
 
@@ -3973,6 +3989,11 @@ fn pace_advance(id: usize) {
 fn pace_reset(id: usize) {
     if id < WIN_MAX {
         WIN_PACE_DUE_US[id].store(0, Ordering::Relaxed);
+        // Review C4: the SEQ must be reset with the deadline. Window ids are recycled, and a new
+        // tenant inheriting the previous one's focus generation would miss (or gain) exactly one
+        // input exemption — a one-frame artefact that would be invisible and unexplainable on the
+        // wire. Clearing both makes a recycled row indistinguishable from a fresh one.
+        WIN_PACE_SEQ[id].store(0, Ordering::Relaxed);
     }
 }
 

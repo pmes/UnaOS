@@ -7463,3 +7463,31 @@ lines below are what it CAN read.
   fields are invariants rather than measurements — `band=no` on every line, `span=` always equal to
   the box height, `banded=0` with `minspan=0 minspan_bytes=0`, and never a `scope=window-band`
   rollup. A band-carrying field with any other value on aarch64 is itself the finding.
+
+### VSYNC-PACE — what the pacer changed about READING the other instruments (review C5/C6)
+
+The pacer sleeps ring-3 callers to the panel boundary inside `SYS_WIN_PRESENT`/`_ROWS`. Four
+readings shift meaning, and one source is named for the follow-up:
+
+- **`[wpace] pres=` / `rate=` is not a glass rate.** It is incremented from `pace_advance`, which
+  runs *before* `wc_shim::present`, so it counts SUPPRESSED presents too. Consistent with
+  `FB_PRESENT_COUNT`, but do not read it as frames that reached the panel.
+- **`[wcn] active_ms` no longer means "the window was busy".** `wcn_note_present` folds any
+  inter-present gap under `WCN_PARK_GAP_MS` into `active_ms`, and the pacer's sleep happens
+  *before* `wm` is entered — so the sleep is booked as active time. A paced vug idle 40% of each
+  frame still reads `active≈5000ms parked=0ms` over a 5 s rollup.
+- **`[vugmin] presents_skipped` drops ~17x** for a hidden-but-presenting app: the pacer caps its
+  arrival rate at ~58/s before PRESSURE-1's charge ever applies.
+- **The kernel-side composite path is NOT paced.** The console/fbcon, `x86_render_service` and the
+  WINX fixtures call `wm` directly, never through the syscall — so the shell window and every
+  kernel witness composite run unpaced. Only ring-3 apps are paced.
+- **`resync` is aggregate-dominated by slow clients.** Any app below the panel rate takes the
+  resync branch on every present (PULSE at 20 Hz contributes ~100 per 5 s rollup by itself), so the
+  rule "resync climbing with paced near zero means HEADROOM" stops discriminating once a slow app
+  is live. Read `resync` per-window, not from the rollup.
+- **The 16667 µs constant is right on this panel, and a real source exists for the day it isn't.**
+  The bench EDID reads `native=2880x1800 pclk_khz=337750`, i.e. ≈59.99 Hz, frame ≈16669 µs — 0.01%
+  from the constant. `video::edid_block()` and `init_edid`'s detailed-timing parse already carry
+  the pixel clock and actives and are NOT witness-gated; deriving `frame_us` needs only hblank and
+  vblank from the same 18 bytes. That is the follow-up the day a non-60 Hz panel or a modeset
+  arrives — today x86 drives exactly one mode, inherited from firmware.
