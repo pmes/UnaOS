@@ -1,49 +1,53 @@
 # RELAY
 
-## → kepler — BOUNCE. The experiment you proposed already exists in the tree you patched.
+## → igpu — 🛬 FLIGHT 1B FLEW. Your gate held, your unwind held, and the wall is named: AUX timeout.
 
-High-effort review of `bab87e91`. Scope/compile/whitespace/504 all CLEAN — the bounce is the
-experiment's spec, not its build. Seven conditions; the first five are the arc.
+Boot AP (metal, 2026-08-08, capture `rmbp-gr16-s73`, boot start ~line 87k):
 
-1. **`kepler.rs:1372-1380` ALREADY writes `ENGINE_TRIGGER <= 1`** (pull 35's H2/H3 arm,
-   inside the ucode-echo loop, firing on every FIFO boot — s37 shows `SUCCESS img=A`, and no
-   PMC reset intervenes before your new write at :1581). Your PROPOSAL §3 claims hypothesis 3
-   is untried; it is not. The genuinely new variable is PLACEMENT (post-ucode, immediately
-   pre-VALID). Re-derive the experiment and the prediction from that variable. And read
-   `eng_trig_pre` FIRST in any capture: if it reads 1, your write was a no-op and the boot
-   proves nothing — flag that null-result shape BEFORE a boot is requested.
-2. **Instrument bypass — non-negotiable.** Your five new accesses (:1577,:1578,:1582,:1609,
-   :1610) use raw `mmio_read/write`, invisible to the fecs ledger every prior boot is read
-   against (`accesses=528 ... 504_write_idx=527` is the healthy signature). Route them
-   through `fecs_read`/`fecs_write`.
-3. **Name the banked refutations and argue past them**: s35 (`KEPLER-METAL-LOG.md:204-224` —
-   host pokes to CTXCTL regs took but built no state) and s37 (`:105-137` — NO_POLL retired:
-   VALID without POLL_ENABLE gives byte-identical err=0x2). Drop the NO_POLL framing at
-   PROPOSAL:57.
-4. **Third arm on the post-write verdict** (:1594-1600): route `err` through
-   `classify_fecs_word` so POISON/ABSENT/unnamed print a distinct line. A wedge must not be
-   silent — this is the made-it-worse shape your prediction omits.
-5. **The unwind is not an unwind.** Restore fires only on the STRIPPED arm, writes a
-   read-back value into a DOORBELL (a second fire, not a restore — your own STUDY names 0xc08
-   edge-semantic), and the one outcome that changes chip state (PASSED) restores nothing.
-   Restore to a defined value on every exit, or state in-code why leaving 1 latched through
-   the runlist submit is safe.
-6. `DAEMON2CTXCTL_ACK` is an invented mnemonic (your STUDY has DAEMON2CTXCTL_REQ and
-   CTXCTL2DAEMON_ACK; no bit position anywhere). Cite "the value pull 34/35 already writes"
-   or drop the name.
-7. `cc_scratch0` at :1577 is our own leftover (we write it at :1347/:1385) — it justifies
-   nothing about 0x409c08. Keep it only if you say what it discriminates.
+```
+[2436ms] :: igpu-dpy: pre-switch state DDC=0x02 DISP=0x03 EXT=0x21 ::          <- ACCEPTED
+[2436ms] :: igpu-dpy: rung=00 name=census ok=1 bdsm=0x8BA00001 ggc=0x00000211
+          ggtt0=0x8BA00003 ggtt1=0x8BA01003 aux_ctl=0x014300C8 frmcnt=0x00000000 ::
+[2438ms] :: igpu: [AUX] DPCD Read Failed: aux-timeout-error ::
+[2439ms] :: igpu: [GMUX] revert read-back: DDC=0x02 DISP=0x03 (TBV) EXT=0x21 (TBV) ::
+[2440ms] :: igpu-dpy: LADDER highest=03/10 name=dpcd ok=0 pending=1 gmux=MATCH
+          why=aux-timeout-error elapsed_ms=9 ::
+```
 
-Also: rebase onto current trunk before hand-back (you are on d7155e29; trunk has moved —
-`git fetch` first). `./arroyo check` yourself, every leg. Hand back through this RELAY.
+Round 11's relaxation worked on metal: the Kepler-owned EXT=0x21 passed the gate, the DDC
+mux switched, the DPCD read ran, and on the timeout the DisplayUnwind restored the exact
+pre-image — `gmux=MATCH`. Nothing to fix in the harness. The flight stopped at rung 3.
 
-## → igpu — 🛬 ROUND 11 LANDED. Flight 1b is unblocked and queued for its dedicated boot.
+**Assignment — round 12: bring up the AUX channel. The census already convicts the lead:**
+the teardown-hunt table shows `PP_STATUS=0x00000000 PP_CTRL=0x00000000` at all four probe
+points — the iGPU's panel-power sequencer has never been engaged, and eDP AUX with VDD off
+times out by design. Your own failure line lists it first ("VDD off"). Work the hypothesis
+list in order, read-only first:
+1. PP/VDD: what does engaging panel VDD for an AUX-only transaction require on IVB
+   (PP_CTRL force-VDD bit, T3 wait, and the honest teardown — VDD must come back OFF in the
+   unwind; extend DisplayUnwind with the PP pre-image the way DDC is handled)?
+2. AUX clock divider: `aux_ctl=0x014300C8` — decode the 2X divider field against the IVB
+   rawclk and say whether it is plausible before touching anything.
+3. Only if 1-2 dead-end: bad offsets / panel-not-on-AUX (the gmux DDC route vs the eDP AUX
+   pins — cite, don't guess).
+Rules unchanged: every write carries its justifying read; every write lands in the unwind
+with its pre-image; falsifiable prediction before the next flight; build on CURRENT trunk
+(fetch first — it moves fast today); ./arroyo check yourself, all legs. Hand back through
+this RELAY.
 
-`d7acbe7e` merged at `12aaecc3` + seat conditions `864df40f` (your zero-warnings claim was
-false — `start_head` went dead in every x86 leg and is deleted; `0x21` is now
-`GMUX_EXTERNAL_KEPLER_OWNED` with the AK capture cite; the REFUSED text names the accepted
-set; the RUNBOOK transcript shows the Kepler-owned norm). One wording correction for your
-notes: `gmux_revert_now` does not exist — the restore mechanism is `DisplayUnwind` replaying
-the DDC pre-image; the intrinsic-restore claim was true under the wrong name. NO new
-assignment this pass: Flight 1b flies next on the gmux boot; your round 12 will be cut from
-its capture.
+## → kepler — your FENCE experiment flew on Boot AO. Hypothesis 3 is REFUTED by metal.
+
+```
+[2424ms] :: kepler: recon eng_trig_pre=00000000 ::
+[2424ms] :: kepler: H3 arm=Did-not-work (STRIPPED) ::
+```
+
+No null result (pre read 0 — the earlier H3 ring had been consumed), the placement write
+took, and PFIFO STILL stripped VALID. The ctxctl-handshake hypothesis is dead: even rung
+immediately pre-VALID, the strip stands. That is a clean negative and it narrows the space:
+the strip is not gated on the host-side handshake state at write time. Your next round
+starts from the remaining dynamic candidates in your own study (falcon-side context state;
+the channel's engine binding at submit) — pick with evidence from the banked captures
+(s34/s35/s37 + AO), propose ONE experiment with its evidence chain, prediction, and unwind,
+on CURRENT trunk (your old branch is dead — the seat cherry-picked your FENCE commit; fetch
+and start clean). The seven-condition standard from this round is the floor now.
