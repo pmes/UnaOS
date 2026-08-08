@@ -352,6 +352,27 @@ kbdwit = []
 # is parsed — the path L2 (LE scan) needs. No new endpoint is armed (mtfix's slot budget holds),
 # no async, no bulk; every command is a MANDATORY HCI command, so a status=0x01 (Unknown Command)
 # would be the clean-room/patchram boundary and is witnessed as such, not patched around.
+#
+# BT-L2 (GR22): the same knob now runs an **LE SCAN** after L1 — the first thing this radio does
+# that a person can see. Sequence, all through the already-armed event endpoint (no new endpoint,
+# so mtfix's slot budget is untouched): `HCI_Set_Event_Mask` (0x0C01) REWRITTEN to
+# 0x2000_1FFF_FFFF_FFFF, because L1's value is the spec reset default and the reset default does
+# NOT include LE Meta Event (bit 61) — every advertising report rides that bit, and without this
+# write a scan runs, hears everything and reports a silent, entirely wrong empty room;
+# `HCI_LE_Set_Event_Mask` (0x2001) for the Advertising Report sub-event; `HCI_LE_Set_Scan_Parameters`
+# (0x200B) passive, interval == window == 0x0060 (60 ms, continuous), own address public, accept-all
+# filter policy; `HCI_LE_Set_Scan_Enable` (0x200C) with filter_duplicates on. Advertising reports
+# (event 0x3E subevent 0x02) are then drained for a BOUNDED 500 ms wall-clock window and decoded to
+# address, address type, RSSI, event type and the Complete/Shortened Local Name AD structure; one
+# `bt-l2:` line per distinct device (cap 16, truncation stated, never silent) plus a rollup.
+# Scanning is DISABLED on every exit path that could have started it — including the unconfirmed
+# enable — because a radio left scanning burns power and floods the event endpoint for the rest of
+# the boot, on the same controller as the internal keyboard and trackpad. The scan starts only from
+# a fully confirmed base (L0 reset + version and every L1 row status 0x00, and LE claimed by the LMP
+# feature mask); anything else prints why and changes nothing. A status 0x01 (Unknown HCI Command)
+# on an LE command is the patchram/.hcd FIRMWARE BOUNDARY (docs/MANIFESTO/CLEAN_ROOM_POLICY.md):
+# witnessed and stopped at, never patched around. Boot cost is the 500 ms window plus ~5 control
+# transfers; x86-only, and `arm_features` strips the knob so aarch64 media stay byte-identical.
 bt = ["ehcihid"]
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
 # path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole
