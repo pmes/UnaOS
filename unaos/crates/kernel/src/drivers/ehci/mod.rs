@@ -596,6 +596,81 @@ const BT_MFG_BROADCOM: u16 = 0x000F;
 /// inside a loop whose per-iteration bound would keep being satisfied.
 #[cfg(feature = "bt")]
 const BT_EVT_MAX: u32 = 8;
+/// BT-L0B — how many bytes of a candidate's CONFIGURATION descriptor this driver will read.
+/// Exactly `qh::Buf256`, the EP0 data-stage buffer: the descriptor is read into `data_buf` and
+/// walked in place, so the buffer's size IS the bound. A Bluetooth composite's wTotalLength is
+/// ~180-220 B on the devices this arc targets; anything past 256 B is reported as truncated by
+/// the census rather than silently dropped.
+#[cfg(feature = "bt")]
+const BT_CFG_MAX: u16 = 256;
+/// BT-L0B — bound on the interface CENSUS: interface descriptors recorded and printed. Every
+/// alternate setting counts as one entry (that is the point — the alt fan-out of the SCO
+/// interface is exactly the descriptor-layout question the census exists to answer). Twelve
+/// covers a 4-interface BT composite with a 6-alt SCO interface with room to spare; past that
+/// the census says how many it dropped.
+#[cfg(feature = "bt")]
+const BT_CENSUS_MAX: usize = 12;
+/// BT-L0B — bound on endpoints listed per interface in the census line.
+#[cfg(feature = "bt")]
+const BT_EP_MAX: usize = 8;
+
+/// BT-L0B — one interface descriptor as the census/selection walk sees it.
+///
+/// `int_in`/`bulk_in`/`bulk_out` are the SELECTION evidence (endpoint numbers, 0 = absent);
+/// `eps` is the CENSUS evidence (every endpoint of this interface, in descriptor order,
+/// verbatim). The two are kept apart on purpose: selection must never quietly depend on a field
+/// the printed line does not show.
+#[cfg(feature = "bt")]
+#[derive(Clone, Copy, Default)]
+struct BtIntf {
+    num: u8,
+    alt: u8,
+    cls: u8,
+    sub: u8,
+    pro: u8,
+    neps: u8,
+    int_in: u8,
+    int_mps: u16,
+    int_iv: u8,
+    bulk_in: u8,
+    bulk_out: u8,
+    /// (bEndpointAddress, bmAttributes & 0x3, wMaxPacketSize & 0x7FF)
+    eps: [(u8, u8, u16); BT_EP_MAX],
+    nep: u8,
+}
+
+/// BT-L0B — the CANDIDATE GATE, run on the 64-byte view `configure_hid` already holds.
+///
+/// Purely a filter, and deliberately loose: it decides only whether this device is worth ONE
+/// extra EP0 transfer (the full-descriptor re-read) plus a census. It is NOT the claim rule —
+/// `bt_probe`'s evidence-based selection is. Loose means: subclass 0x01 (RF) + protocol 0x01
+/// (Bluetooth), with the class byte either the spec's 0xE0 (Wireless Controller, Bluetooth
+/// Core Vol 4 Part B) or 0xFF (vendor-classed, which is how the Broadcom parts behind Apple's
+/// hub present). A HID keyboard is 0x03/0x01/0x01 and is NOT matched by this — the class byte
+/// is what excludes it.
+///
+/// Returns false => `bt_probe` returns immediately with no wire traffic and no output, so every
+/// non-candidate device on the bus behaves byte-for-byte as it did before this arc.
+#[cfg(feature = "bt")]
+fn bt_cfg_has_candidate(cfg: &[u8]) -> bool {
+    let mut off = 0usize;
+    while off + 2 <= cfg.len() {
+        let len = cfg[off] as usize;
+        if len == 0 {
+            break;
+        }
+        if cfg[off + 1] == 0x04
+            && off + 9 <= cfg.len()
+            && cfg[off + 6] == 0x01
+            && cfg[off + 7] == 0x01
+            && (cfg[off + 5] == 0xE0 || cfg[off + 5] == 0xFF)
+        {
+            return true;
+        }
+        off += len;
+    }
+    false
+}
 
 /// BT-L0 — one interrupt-IN endpoint armed for SYNCHRONOUS use.
 ///
@@ -1802,9 +1877,13 @@ impl Controller {
         // BT-L0 — the class-0xE0 recognition arm. Placed HERE, ahead of the "nothing to arm"
         // exit, because a Bluetooth device has no HID interface at all and would otherwise be
         // enumerated, logged and dropped exactly as the recon §2b describes. The Bluetooth USB
-        // transport (Bluetooth Core, Vol 4 Part B) puts the HCI transport on interface 0,
-        // class 0xE0 / subclass 0x01 / protocol 0x01; `bt_probe` re-walks the config descriptor
-        // this function already read, so the HID walk above is untouched. It owns
+        // transport (Bluetooth Core, Vol 4 Part B) puts the HCI transport on an interface of
+        // class 0xE0 / subclass 0x01 / protocol 0x01 — an interface the spec does not oblige to
+        // be first, and whose class triple the SCO interface shares (BT-L0B: `bt_probe` selects
+        // by the interrupt-IN endpoint, not by descriptor order). `bt_probe` re-walks the config
+        // descriptor this function already read — and, for a Bluetooth candidate only, re-reads
+        // it in full first, which is safe HERE because the HID walk above has already finished
+        // and nothing below reads `cfg` again. The HID walk itself is untouched. It owns
         // SET_CONFIGURATION for the device it claims and returns true when it did, at which
         // point there is nothing further for the HID path to do.
         #[cfg(feature = "bt")]
@@ -2199,17 +2278,98 @@ impl Controller {
     ///
     /// `cfg` aliases `self.data_buf`, which EVERY control transfer overwrites. So the descriptor
     /// walk is done FIRST, in full, into plain locals, and `cfg` is never read again after the
-    /// first transfer this function issues. That ordering is load-bearing, not stylistic.
+    /// last transfer this function issues. That ordering is load-bearing, not stylistic.
+    ///
+    /// BT-L0B refines that: the incoming `cfg` is the HID path's 64-byte-capped view, which on a
+    /// Bluetooth composite is a stub. Phase 0 gates on the stub, re-reads the descriptor in full
+    /// into the same buffer, and rebinds `cfg` to the full view; the parameter is dead from that
+    /// point on. The re-read is a control transfer and therefore itself destroys the parameter's
+    /// contents — which is why it happens before anything else is collected, and why it happens
+    /// only for a candidate device.
     #[cfg(feature = "bt")]
     unsafe fn bt_probe(&mut self, t: &Target, cfg: &[u8], config_value: u8) -> bool {
-        // ---- phase 1: pure descriptor walk (no wire traffic) --------------------------------
-        // Bluetooth Core, Vol 4 Part B: the HCI transport is interface 0, class 0xE0 (Wireless)
-        // / subclass 0x01 (RF) / protocol 0x01 (Bluetooth). Interface 1 is SCO audio on
-        // isochronous endpoints with alternate settings; alt 0 is zero-bandwidth and this arc
-        // leaves it there, permanently, by never touching it.
-        let (mut bt_intf, mut evt_ep, mut evt_mps, mut evt_interval) = (None, 0u8, 0u16, 0u8);
-        let (mut bulk_in, mut bulk_out) = (0u8, 0u8);
-        let mut in_bt = false;
+        // ---- phase 0: candidate gate + FULL descriptor (BT-L0B) -----------------------------
+        // Two facts about the descriptor this function is handed, both load-bearing:
+        //
+        //   * it is `configure_hid`'s buffer, and that read is CAPPED AT 64 BYTES
+        //     (`total = wTotalLength.min(64)`). That cap is a HID-path economy which predates
+        //     this arc and which this arc does NOT touch — the keyboard/hub walk above it is
+        //     metal-proven. But a Bluetooth composite's wTotalLength is ~180-220 B, so what
+        //     arrives here is a STUB of the device: interfaces and endpoints past byte 64 do
+        //     not exist as far as the old walk was concerned.
+        //   * `cfg` aliases `self.data_buf`, so any control transfer destroys it.
+        //
+        // So: gate on the stub (no traffic, no output, non-candidates unchanged), then for a
+        // candidate re-read the descriptor IN FULL. `data_buf` is `Buf256`, so up to 256 B lands
+        // without changing the HID path's cap by one byte. This is safe at this call site
+        // specifically: `configure_hid` finished its own descriptor walk into `found[]` BEFORE
+        // calling us and never reads `cfg` again afterwards — only `nfound`/`config_value`.
+        if cfg.len() < 4 || !bt_cfg_has_candidate(cfg) {
+            return false;
+        }
+        let wtotal = (cfg[2] as u16) | ((cfg[3] as u16) << 8);
+        let want = wtotal.min(BT_CFG_MAX);
+        let over = wtotal > BT_CFG_MAX;
+        let have = cfg.len() as u16;
+        // The parameter `cfg` is DEAD past this point; the shadow is the only descriptor read.
+        let cfg: &[u8] = if want > have {
+            match self.control(t, 0x80, 6, 0x0200, 0, want, true) {
+                Ok(n) if n >= 9 => {
+                    core::slice::from_raw_parts(self.data_buf, (n as usize).min(BT_CFG_MAX as usize))
+                }
+                _ => {
+                    serial_println!(
+                        ":: bt-l0: [{}] addr {} full config re-read (wTotalLength={}) FAILED — only the 64-byte HID-path view exists; claimed and stopped ::",
+                        self.idx, t.addr, wtotal
+                    );
+                    return true;
+                }
+            }
+        } else {
+            cfg
+        };
+
+        // ---- phase 1: census + EVIDENCE-BASED selection (no wire traffic) -------------------
+        // Bluetooth Core, Vol 4 Part B names the HCI transport interface class 0xE0 (Wireless
+        // Controller) / subclass 0x01 (RF) / protocol 0x01 (Bluetooth), and puts HCI COMMANDS on
+        // the control endpoint and HCI EVENTS on an interrupt-IN endpoint. What the spec does
+        // NOT promise is that this interface comes first in the configuration descriptor, nor
+        // that it is the only one wearing that class triple: the SCO audio interface is
+        // isochronous and, on real parts, carries the same triple. A first-match-by-class latch
+        // therefore lands on an interface that has no event endpoint BY DESIGN — which is
+        // exactly what Boot AM printed (`intf 1 ... NO interrupt-IN event endpoint`), and the
+        // old `bt_intf.is_none()` guard then made that first mistake permanent.
+        //
+        // So the rule here is EVIDENCE, not order: among alt-0 interfaces, take one that
+        // actually carries an interrupt-IN endpoint. Two tiers, tried in order:
+        //   tier 1 — class 0xE0/0x01/0x01 with an interrupt-IN endpoint. The spec device.
+        //   tier 2 — class 0xFF/0x01/0x01 (vendor-classed, subclass/protocol still RF/Bluetooth)
+        //            carrying the full HCI transport endpoint fingerprint: interrupt-IN (events)
+        //            + bulk-IN + bulk-OUT (ACL). This is not a spec claim and is not labelled as
+        //            one; it is a structural match, and it exists because the Broadcom parts
+        //            behind Apple's hub report a vendor device class (0xff was read off addr 8
+        //            on Boot AM) rather than 0xE0. Requiring all three endpoints AND the
+        //            RF/Bluetooth subclass+protocol pair is what keeps it from claiming an
+        //            unrelated vendor interface.
+        // Anything else: print the census and stop, exactly as today.
+        let mut alts = [0u8; 16];
+        let mut off = 0usize;
+        while off + 2 <= cfg.len() {
+            let len = cfg[off] as usize;
+            if len == 0 {
+                break;
+            }
+            if cfg[off + 1] == 0x04 && off + 9 <= cfg.len() {
+                let i = (cfg[off + 2] as usize) & 0xF;
+                alts[i] = alts[i].saturating_add(1);
+            }
+            off += len;
+        }
+
+        let mut tbl = [BtIntf::default(); BT_CENSUS_MAX];
+        let mut n_intf = 0usize;
+        let mut dropped = 0usize;
+        let mut cur: Option<usize> = None;
         let mut off = 0usize;
         while off + 2 <= cfg.len() {
             let len = cfg[off] as usize;
@@ -2217,50 +2377,150 @@ impl Controller {
                 break;
             }
             match cfg[off + 1] {
-                // Interface descriptor. Claim only interface 0 alt 0 of the Bluetooth triple;
-                // any later interface (SCO) clears `in_bt` so its endpoints are never collected.
                 0x04 if off + 9 <= cfg.len() => {
-                    in_bt = cfg[off + 5] == 0xE0
-                        && cfg[off + 6] == 0x01
-                        && cfg[off + 7] == 0x01
-                        && cfg[off + 3] == 0x00 // bAlternateSetting
-                        && bt_intf.is_none();
-                    if in_bt {
-                        bt_intf = Some(cfg[off + 2]);
+                    if n_intf < BT_CENSUS_MAX {
+                        tbl[n_intf] = BtIntf {
+                            num: cfg[off + 2],
+                            alt: cfg[off + 3],
+                            neps: cfg[off + 4],
+                            cls: cfg[off + 5],
+                            sub: cfg[off + 6],
+                            pro: cfg[off + 7],
+                            ..Default::default()
+                        };
+                        cur = Some(n_intf);
+                        n_intf += 1;
+                    } else {
+                        // Past the table: stop attributing endpoints, do not mis-file them.
+                        cur = None;
+                        dropped += 1;
                     }
                 }
-                0x05 if in_bt && off + 7 <= cfg.len() => {
-                    let ep = cfg[off + 2];
-                    let mps = ((cfg[off + 4] as u16) | ((cfg[off + 5] as u16) << 8)) & 0x7FF;
-                    match (cfg[off + 3] & 0x3, ep & 0x80 != 0) {
-                        // interrupt IN — the HCI event endpoint, the one this arc reads.
-                        (3, true) if evt_ep == 0 => {
-                            evt_ep = ep & 0xF;
-                            evt_mps = mps;
-                            evt_interval = cfg[off + 6];
+                0x05 if off + 7 <= cfg.len() => {
+                    if let Some(k) = cur {
+                        let f = &mut tbl[k];
+                        let ep = cfg[off + 2];
+                        let attr = cfg[off + 3] & 0x3;
+                        let mps = ((cfg[off + 4] as u16) | ((cfg[off + 5] as u16) << 8)) & 0x7FF;
+                        if (f.nep as usize) < BT_EP_MAX {
+                            f.eps[f.nep as usize] = (ep, attr, mps);
+                            f.nep += 1;
                         }
-                        // bulk — the ACL data pair. Recorded so the witness can state that they
-                        // exist (a later arc needs them); NOT armed, NOT configured, and not
-                        // reachable at all without the async schedule this silicon cannot run.
-                        (2, true) => bulk_in = ep & 0xF,
-                        (2, false) => bulk_out = ep & 0xF,
-                        _ => {}
+                        match (attr, ep & 0x80 != 0) {
+                            // interrupt IN — the HCI event endpoint, the one this arc reads.
+                            (3, true) if f.int_in == 0 => {
+                                f.int_in = ep & 0xF;
+                                f.int_mps = mps;
+                                f.int_iv = cfg[off + 6];
+                            }
+                            // bulk — the ACL data pair. Recorded so the witness can state that
+                            // they exist (a later arc needs them), and, at tier 2, as part of
+                            // the transport fingerprint; NOT armed, NOT configured, and not
+                            // reachable at all without the async schedule this silicon cannot
+                            // run.
+                            (2, true) => f.bulk_in = ep & 0xF,
+                            (2, false) => f.bulk_out = ep & 0xF,
+                            _ => {}
+                        }
                     }
                 }
                 _ => {}
             }
             off += len;
         }
-        let Some(intf) = bt_intf else { return false };
-        // A Bluetooth interface with no interrupt-IN endpoint cannot deliver an HCI event, so
-        // there is no L0 to run. Claim it anyway (it is not a HID device) and say why.
-        if evt_ep == 0 {
-            serial_println!(
-                ":: bt-l0: [{}] addr {} intf {} class=0xE0/0x01/0x01 but NO interrupt-IN event endpoint — cannot read HCI events; claimed and stopped ::",
-                self.idx, t.addr, intf
+
+        // The CENSUS: one line per interface descriptor, printed before any decision is taken,
+        // so the next capture convicts descriptor-layout questions from the wire instead of
+        // from a hypothesis. Bounded by `BT_CENSUS_MAX` x `BT_EP_MAX`, and reached only by a
+        // candidate device.
+        for k in 0..n_intf {
+            let f = tbl[k];
+            serial_print!(
+                ":: bt-l0: [{}] census addr={} intf={} alt={} alts={} class={:#04x}/{:#04x}/{:#04x} neps={} eps=[",
+                self.idx, t.addr, f.num, f.alt, alts[(f.num as usize) & 0xF], f.cls, f.sub, f.pro,
+                f.neps
             );
-            return true;
+            for j in 0..(f.nep as usize) {
+                let (ep, attr, mps) = f.eps[j];
+                serial_print!(
+                    "{}{}/{}/{}{}",
+                    if ep & 0x80 != 0 { "IN" } else { "OUT" },
+                    ep & 0xF,
+                    match attr {
+                        0 => "ctl",
+                        1 => "iso",
+                        2 => "blk",
+                        _ => "int",
+                    },
+                    mps,
+                    if j + 1 < f.nep as usize { " " } else { "" }
+                );
+            }
+            serial_println!("] == witness ::");
         }
+        if dropped > 0 || over {
+            serial_println!(
+                ":: bt-l0: [{}] census addr={} INCOMPLETE — {} interface descriptor(s) past the {}-entry table{} ::",
+                self.idx, t.addr, dropped, BT_CENSUS_MAX,
+                if over {
+                    "; wTotalLength exceeds the 256-byte control buffer, tail unread"
+                } else {
+                    ""
+                }
+            );
+        }
+
+        let (mut sel, mut tier) = (BtIntf::default(), 0u8);
+        let mut saw_e0 = false;
+        for k in 0..n_intf {
+            let f = tbl[k];
+            if f.alt != 0 {
+                continue;
+            }
+            let spec = f.cls == 0xE0 && f.sub == 0x01 && f.pro == 0x01;
+            saw_e0 |= spec;
+            let t_k = if spec && f.int_in != 0 {
+                1u8
+            } else if f.cls == 0xFF
+                && f.sub == 0x01
+                && f.pro == 0x01
+                && f.int_in != 0
+                && f.bulk_in != 0
+                && f.bulk_out != 0
+            {
+                2u8
+            } else {
+                continue;
+            };
+            if tier == 0 || t_k < tier {
+                tier = t_k;
+                sel = f;
+            }
+        }
+        if tier == 0 {
+            // No interface carries an HCI event endpoint under either rule. Preserve the old
+            // outcome exactly: a device that DOES wear the spec triple is claimed (it is not a
+            // HID device and must not fall through to the HID path); one that only tripped the
+            // vendor half of the gate is handed back, unclaimed, as it was before this arc.
+            serial_println!(
+                ":: bt-l0: [{}] addr {} — NO interface carries an interrupt-IN HCI event endpoint (spec 0xE0/0x01/0x01, or vendor 0xFF/0x01/0x01 with int-IN + bulk pair); census above is the wire truth; {} ::",
+                self.idx, t.addr,
+                if saw_e0 { "claimed and stopped" } else { "not claimed" }
+            );
+            return saw_e0;
+        }
+        let intf = sel.num;
+        let (evt_ep, evt_mps, evt_interval) = (sel.int_in, sel.int_mps, sel.int_iv);
+        let (bulk_in, bulk_out) = (sel.bulk_in, sel.bulk_out);
+        serial_println!(
+            ":: bt-l0: [{}] claim addr={} intf={} alt=0 class={:#04x}/{:#04x}/{:#04x} evt_ep=IN{} -> selected by ENDPOINT EVIDENCE, tier {} ({}) == witness ::",
+            self.idx, t.addr, intf, sel.cls, sel.sub, sel.pro, evt_ep, tier,
+            if tier == 1 {
+                "spec: Bluetooth Core Vol 4 Part B class triple + interrupt-IN"
+            } else {
+                "vendor-classed: RF/Bluetooth subclass+protocol + int-IN/bulk-IN/bulk-OUT HCI fingerprint"
+            }
+        );
 
         // ---- phase 2: reachability witness (still no wire traffic) --------------------------
         // The recon's P3 lives on this line. `tt=(hub 4 port 1)` is the SMSC hub — the nearest
@@ -2274,8 +2534,8 @@ impl Controller {
             _ => "FS",
         };
         serial_println!(
-            ":: bt-l0: [{}] reachability addr={} spd={} intf={} class=0xE0/0x01/0x01 evt_ep=IN{} mps={} interval={} bulk_in=IN{} bulk_out=OUT{} parent=(hub {} port {}) tt=(hub {} port {}) -> {} == witness ::",
-            self.idx, t.addr, spd, intf, evt_ep, evt_mps, evt_interval, bulk_in, bulk_out,
+            ":: bt-l0: [{}] reachability addr={} spd={} intf={} class={:#04x}/{:#04x}/{:#04x} evt_ep=IN{} mps={} interval={} bulk_in=IN{} bulk_out=OUT{} parent=(hub {} port {}) tt=(hub {} port {}) -> {} == witness ::",
+            self.idx, t.addr, spd, intf, sel.cls, sel.sub, sel.pro, evt_ep, evt_mps, evt_interval, bulk_in, bulk_out,
             self.bt_parent.0, self.bt_parent.1, t.hub_addr, t.hub_port,
             if t.eps == QH_EPS_HIGH {
                 "TT-NONE(high-speed device)"
