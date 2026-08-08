@@ -227,10 +227,15 @@ const CC_SPROM_PCIE6: u64 = 0x0830;
 /// the two is the defect this stage was bounced for; see [`sprom_offset_for`].
 #[cfg(feature = "bcmaS1")]
 const CC_SROM_CONTROL: u64 = 0x0190;
-/// `BCMA_CC_SROM_CONTROL_PRESENT`. Transcribed from `bcma_driver_chipcommon.h`; UNVERIFIED against
-/// this part, so the raw word is always printed beside the decode.
+/// `BCMA_CC_SROM_CONTROL_PRESENT` = **bit 0**, verified against
+/// `bcma_driver_chipcommon.h:281` (`0x00000001`). The first cut had `0x00800000` — which IS a real
+/// macro in that same header, but it is `BCMA_CC_CAP_BROM`, a bit in the CAPABILITIES register, not
+/// in SROM_CONTROL at all. Every defined bit here lives in [31:29] or [5:0]; bit 23 is undefined and
+/// would have read 0, turning the "no external SPROM attached" branch into a CONFIDENT WRONG
+/// determination on a board whose ChipCommon `cap` bit 30 already says sprom=present. The raw word
+/// is still printed beside the decode.
 #[cfg(feature = "bcmaS1")]
-const SROM_CONTROL_PRESENT: u32 = 0x0080_0000;
+const SROM_CONTROL_PRESENT: u32 = 0x0000_0001;
 
 /// `BCMA_CC_CAP_SPROM` — an SPROM is present on this board.
 const CC_CAP_SPROM: u32 = 0x4000_0000;
@@ -496,7 +501,8 @@ const CORE_ID_DEFAULT: u16 = 0xFFF;
 /// `BCMA_CORE_80211` — the d11 radio core. The one id this whole path exists to locate.
 const CORE_ID_80211: u16 = 0x812;
 /// `BCMA_CORE_CHIPCOMMON` — core index 0 on every AI backplane. Its CORE revision (from the EROM
-/// CIB, not the chip rev in `chipid[19:16]`) is what selects the SPROM shadow offset (S2).
+/// CIB, not the chip rev in `chipid[19:16]`) is NOT what selects the SPROM shadow offset — that was the refuted first cut. It selects
+/// whether SROM_CONTROL's PRESENT bit is authoritative for SPROM PRESENCE (`bcma_sprom_ext_available`).
 const CORE_ID_CHIPCOMMON: u16 = 0x800;
 
 /// Hard iteration ceiling on the EROM walk, in dwords, and it is the ARCHITECTURAL bound rather
@@ -2211,9 +2217,12 @@ fn oui_known(o: [u8; 3]) -> &'static str {
 // ## What it reads, and why read-only reaches it
 //
 // The SPROM "shadow" is a 16-bit window inside ChipCommon's own register block
-// (`CC_SPROM`/`CC_SPROM_PCIE6`). On a socitype=1 PCIe part the offset is `0x830` when the ChipCommon
-// CORE rev is >= 31 (Boot AO: rev 37) — the CORE rev from the EROM, NOT the chip rev in
-// `chipid[19:16]`. Every read is an `r16` of a status/identity word with no side effect. The three
+// (`CC_SPROM`). The offset is `0x800` for this part, unconditionally — see `sprom_offset_for` for
+// the three sourcing points. (The first cut of this arc claimed `0x830` keyed on ChipCommon CORE
+// rev >= 31; that was REFUTED in review: the BCM4331 is the one chip Linux names as EXCLUDED from
+// 0x830, and the rev>=31 test belongs to SPROM PRESENCE detection, not offset selection. The
+// inversion is recorded rather than hidden because the wrong rule read plausibly.)
+// Every read is an `r16` of a status/identity word with no side effect. The three
 // facts a stack needs come out of it: the station MAC (`il0macaddr`, the WiFi twin of BT's BD_ADDR),
 // the enabled bands (the antenna-available masks), and the board id (`board_type`, `board_rev`,
 // `boardflags`).
