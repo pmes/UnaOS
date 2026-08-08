@@ -210,8 +210,27 @@ const CC_OTPL: u64 = 0x001C; // OTP layout
 const CC_CHIPSTATUS: u64 = 0x002C; // chip status (per-chip bit meanings)
 const CC_CAP_EXT: u64 = 0x00AC; // capabilities extension
 const CC_EROM: u64 = 0x00FC; // backplane address of the enumeration ROM
-const CC_SPROM: u64 = 0x0800; // SPROM shadow, ChipCommon rev < 31
-const CC_SPROM_PCIE6: u64 = 0x0830; // SPROM shadow, ChipCommon rev >= 31
+const CC_SPROM: u64 = 0x0800; // SPROM shadow — the offset Linux uses on the BCM4331 (see S2)
+/// Alternate SPROM shadow (the PCIe-core rev >= 6 offset; **not** the 4331's — see
+/// [`sprom_offset_for`]). Only S2 touches it, and only to dump it for the record beside the chosen
+/// offset, so that one capture can settle the offset rule either way.
+#[cfg(feature = "bcmaS1")]
+const CC_SPROM_PCIE6: u64 = 0x0830;
+
+/// `BCMA_CC_SROM_CONTROL` — the SPROM interface control register, and the SECOND half of Linux's
+/// `bcma_sprom_ext_available()`: on a ChipCommon CORE rev >= 31 that advertises `CAP_SPROM`, an
+/// external SPROM is *actually present* iff `SROM_CONTROL.PRESENT` is set. Reading it turns the
+/// BLOCKED branch below from a guess ("the shadow looks empty, maybe the PA mux") into a
+/// determination ("the chip itself says no external SPROM is attached").
+///
+/// This is a PRESENCE-detection register. It is emphatically NOT the offset selector — conflating
+/// the two is the defect this stage was bounced for; see [`sprom_offset_for`].
+#[cfg(feature = "bcmaS1")]
+const CC_SROM_CONTROL: u64 = 0x0190;
+/// `BCMA_CC_SROM_CONTROL_PRESENT`. Transcribed from `bcma_driver_chipcommon.h`; UNVERIFIED against
+/// this part, so the raw word is always printed beside the decode.
+#[cfg(feature = "bcmaS1")]
+const SROM_CONTROL_PRESENT: u32 = 0x0080_0000;
 
 /// `BCMA_CC_CAP_SPROM` — an SPROM is present on this board.
 const CC_CAP_SPROM: u32 = 0x4000_0000;
@@ -329,6 +348,53 @@ const CID3_PREAMBLE: u32 = 0xB1;
 /// touched is 0x830 + 0x1B7 = 0x9E7, comfortably inside the 4 KiB core window.
 const SPROM_WORDS: u64 = 220;
 
+// ── SROM revision-8 field offsets (S2) ──────────────────────────────────────────────────────────
+//
+// Byte offsets INSIDE the SPROM image, i.e. relative to the shadow base (`CC_SPROM`/`CC_SPROM_PCIE6`);
+// the MMIO address is `shadow_base + field`. Transcribed from Linux `include/linux/ssb/ssb_regs.h`
+// (`SSB_SPROM8_*` / `SSB_SPROM1_SPID`), which is what `bcma_sprom_extract_r8` reads. The
+// transcription is labelled UNVERIFIED on every S2 witness line and the RAW word is always printed
+// beside the decode — a bring-up recon that guesses a bit is worth less than one that shows its
+// evidence.
+//
+// **Nothing here is corroborated by a capture, and the first cut of this block claimed otherwise.**
+// It justified its offsets as "matching what S0's dump already decodes" — which is circular twice
+// over: S0 carried the *same* constants, and on this machine S0 has never once reached ChipCommon
+// (it refuses at `window-elsewhere`), so its dump has never run. There is no prior reading to agree
+// with. What these offsets have instead is a STRUCTURAL check: the rev-8 block is contiguous —
+// `BOARDREV 0x82`, `BFL 0x84/0x86`, `BFL2 0x88/0x8A`, `IL0MAC 0x8C`, `ANTAVAIL 0x9C` — so an offset
+// that lands outside that run is convicted by the layout itself. That is what caught `0x4A`/`0x5C`,
+// which are the *rev-4* block. Metal settles the rest.
+#[cfg(feature = "bcmaS1")]
+const SP8_SPID: u64 = 0x0004; // board_type (SSB_SPROM1_SPID) — should equal the PCI ssid device id
+/// `SSB_SPROM8_IL0MAC` (ssb_regs.h) — the station MAC, 3 big-endian 16-bit words.
+///
+/// **0x8C, not 0x4A.** The first cut of this stage used `0x4A`, which is not the rev-8 MAC and is
+/// not even the rev-4 MAC: it is `SSB_SPROM4_BFL2HI`/`SSB_SPROM5_BFLLO`, i.e. a **boardflags** word.
+/// Reading it and calling it a station MAC produces six plausible-looking bytes that are not an
+/// address, and the `unicast` test on them is a coin flip rather than a check. The correct offset
+/// sits immediately after this revision's boardflags block (`BOARDREV 0x82`, `BFL* 0x84..0x8A`),
+/// which is the structural cross-check on the transcription.
+///
+/// Not `bcmaS1`-gated: the S0 recon decodes a MAC candidate too, and it carried the same wrong
+/// literal inline. One constant, both paths, so the bug cannot be re-seeded in the half that a
+/// review is not looking at.
+const SP8_IL0MAC: u64 = 0x008C;
+/// `SSB_SPROM8_ANTAVAIL` (ssb_regs.h) — [7:0] = 2.4GHz antenna mask, [15:8] = 5GHz antenna mask.
+/// **0x9C, not 0x5C** — `0x5C` is the *rev-4* antavail, the same revision-block slip as the MAC above.
+#[cfg(feature = "bcmaS1")]
+const SP8_ANTAVAIL: u64 = 0x009C;
+#[cfg(feature = "bcmaS1")]
+const SP8_BOARDREV: u64 = 0x0082; // SSB_SPROM8_BOARDREV
+#[cfg(feature = "bcmaS1")]
+const SP8_BFL_LO: u64 = 0x0084; // SSB_SPROM8_BFLLO  (boardflags, low half)
+#[cfg(feature = "bcmaS1")]
+const SP8_BFL_HI: u64 = 0x0086; // SSB_SPROM8_BFLHI  (boardflags, high half)
+#[cfg(feature = "bcmaS1")]
+const SP8_BFL2_LO: u64 = 0x0088; // SSB_SPROM8_BFL2LO (boardflags2, low half)
+#[cfg(feature = "bcmaS1")]
+const SP8_BFL2_HI: u64 = 0x008A; // SSB_SPROM8_BFL2HI (boardflags2, high half)
+
 // ── EROM entry encodings — Broadcom AI ("aidmp") enumeration ROM ────────────────────────────────
 //
 // Layout as decoded by Linux `drivers/bcma/scan.{h,c}` (`SCAN_*`) and Broadcom's `siutils_priv.h`
@@ -429,6 +495,9 @@ const MANUF_BCM: u16 = 0x4BF;
 const CORE_ID_DEFAULT: u16 = 0xFFF;
 /// `BCMA_CORE_80211` — the d11 radio core. The one id this whole path exists to locate.
 const CORE_ID_80211: u16 = 0x812;
+/// `BCMA_CORE_CHIPCOMMON` — core index 0 on every AI backplane. Its CORE revision (from the EROM
+/// CIB, not the chip rev in `chipid[19:16]`) is what selects the SPROM shadow offset (S2).
+const CORE_ID_CHIPCOMMON: u16 = 0x800;
 
 /// Hard iteration ceiling on the EROM walk, in dwords, and it is the ARCHITECTURAL bound rather
 /// than a round number: the EROM is reached through the 4 KiB BAR0 core window, so dword 1024 is
@@ -888,13 +957,17 @@ struct D11 {
 ///
 /// Bounded twice over by the cursor and it reports which bound stopped it. Returns the number of
 /// cores printed and, when it found one, the 802.11 core's addresses.
-fn walk_erom<F: Fn(u32) -> u32>(read: F) -> (u32, Option<D11>) {
+fn walk_erom<F: Fn(u32) -> u32>(read: F) -> (u32, Option<D11>, Option<u32>) {
     let mut e = Erom::new(read);
     let mut cores = 0u32;
     let mut skipped = 0u32;
     let mut stop = "end-tag";
     // The deliverable of this whole arc: where the 802.11 core lives.
     let mut d11: Option<D11> = None;
+    // The ChipCommon (core index 0) revision, carried out for S2's SPROM-offset choice. It is the
+    // CORE rev (EROM CIB), which is what Linux `bcma_sprom_get` keys the shadow offset on — NOT the
+    // chip rev in `chipid[19:16]`.
+    let mut cc_rev: Option<u32> = None;
 
     loop {
         // ── 1. CIA + CIB ────────────────────────────────────────────────────────────────────────
@@ -1049,6 +1122,9 @@ fn walk_erom<F: Fn(u32) -> u32>(read: F) -> (u32, Option<D11>) {
         if id == CORE_ID_80211 && d11.is_none() {
             d11 = Some(D11 { base, wrap, wrap_kind, mwrap, swrap, rev });
         }
+        if id == CORE_ID_CHIPCOMMON && cc_rev.is_none() {
+            cc_rev = Some(rev);
+        }
 
         if cores < EROM_MAX_CORES {
             serial_println!(
@@ -1089,7 +1165,7 @@ fn walk_erom<F: Fn(u32) -> u32>(read: F) -> (u32, Option<D11>) {
             CORE_ID_80211, cores, skipped
         ),
     }
-    (cores, d11)
+    (cores, d11, cc_rev)
 }
 
 // ── The probe ───────────────────────────────────────────────────────────────────────────────────
@@ -1422,9 +1498,12 @@ fn recon_readonly() {
     );
 
     if sprom_present {
-        // Shadow offset moves at ChipCommon rev 31 (Linux `bcma_sprom_get`). Print which was used —
-        // a dump at the wrong offset is exactly the failure this field lets a reader catch.
-        let spoff = if cc_rev >= 31 { CC_SPROM_PCIE6 } else { CC_SPROM };
+        // Shadow offset + the REASON for it, from the one shared helper (see `sprom_offset_for`).
+        // This used to read `if cc_rev >= 31 { PCIE6 }` with `cc_rev` being the CHIP rev — wrong
+        // twice over: the rev-31 test belongs to SPROM presence detection, not offset selection, and
+        // the BCM4331 is the part Linux explicitly excludes from the alternate offset. Printing the
+        // reason is what makes a wrong offset catchable from a capture.
+        let (spoff, spoff_reason) = sprom_offset_for(cc_id);
         let mut all_ff = true;
         let mut all_00 = true;
         let sdl = Deadline::new();
@@ -1445,11 +1524,12 @@ fn recon_readonly() {
         }
         let last = unsafe { r16(bar0, spoff + (SPROM_WORDS - 1) * 2) };
         let srev = (last & 0xFF) as u8;
-        // The MAC candidate (SSB_SPROM8_IL0MAC, byte offset 0x4A within the SPROM image), stored
-        // big-endian per 16-bit word.
-        let m0 = unsafe { r16(bar0, spoff + 0x4A) };
-        let m1 = unsafe { r16(bar0, spoff + 0x4C) };
-        let m2 = unsafe { r16(bar0, spoff + 0x4E) };
+        // The MAC candidate ([`SP8_IL0MAC`] = 0x8C), stored big-endian per 16-bit word. This read
+        // used the literal `0x4A` — which is not the rev-8 MAC and not even the rev-4 MAC, but
+        // `SSB_SPROM4_BFL2HI`/`SSB_SPROM5_BFLLO`, a BOARDFLAGS word. It now shares S2's constant.
+        let m0 = unsafe { r16(bar0, spoff + SP8_IL0MAC) };
+        let m1 = unsafe { r16(bar0, spoff + SP8_IL0MAC + 2) };
+        let m2 = unsafe { r16(bar0, spoff + SP8_IL0MAC + 4) };
         let mac = [
             (m0 >> 8) as u8, (m0 & 0xFF) as u8,
             (m1 >> 8) as u8, (m1 & 0xFF) as u8,
@@ -1462,8 +1542,8 @@ fn recon_readonly() {
         let degenerate = all_ff || all_00
             || (mac == [0, 0, 0, 0, 0, 0]) || (mac == [0xFF; 6]);
         serial_println!(
-            ":: bcma: sprom-decode offset={:#05x} words={} last={:#06x} rev={} rev-supported={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} unicast={} all_ff={} all_00={} verdict={} (crc NOT computed in this arc) ::",
-            spoff, SPROM_WORDS, last, srev,
+            ":: bcma: sprom-decode offset={:#05x} offset-reason={} mac-off={:#05x} words={} last={:#06x} rev={} rev-supported={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} unicast={} all_ff={} all_00={} verdict={} (crc NOT computed in this arc; `unicast` alone is a coin flip — S2's wifi-s2: lines carry the OUI check) ::",
+            spoff, spoff_reason, SP8_IL0MAC, SPROM_WORDS, last, srev,
             if (8..=11).contains(&srev) { 1 } else { 0 },
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             unicast as u8, all_ff as u8, all_00 as u8,
@@ -1760,7 +1840,7 @@ fn s1_window_walk() {
                 ":: bcma-s1: WROTE cfg:0x80 old={:#010x} new={:#010x} readback={:#010x} — window now on the EROM; walking read-only ::",
                 BCMA_ADDR_BASE, erom_base, ew
             );
-            let (cores, d11) = walk_erom(|i| unsafe { r32(bar0, erom_off + (i as u64) * 4) });
+            let (cores, d11, cc_core_rev) = walk_erom(|i| unsafe { r32(bar0, erom_off + (i as u64) * 4) });
             // The cross-check, corrected. Boot AJ printed `match=0` and treated it as evidence
             // against the walk; only half of that was sound. `BCMA_CC_ID_NRCORES` (chipid[27:24])
             // is the SB-era CoreCount field: `sb_numcores()` reads it, and Linux's bcma — the
@@ -1784,6 +1864,12 @@ fn s1_window_walk() {
                     CORE_ID_80211
                 ),
             }
+
+            // ── WIFI-S2: the board's IDENTITY and CAPABILITY from the SPROM shadow. Uses the SAME
+            // cfg:0x80 selector (moved back to ChipCommon), restored at Step 4; no other write. The
+            // SPROM offset needs the ChipCommon CORE rev the walk just captured, which is why S2
+            // runs here (after the walk) rather than at Step 3a. ─────────────────────────────────
+            s2_board_identity(bus, dev, func, bar0, cc_id, cc_core_rev);
         } else {
             serial_println!(
                 ":: bcma-s1: erom pointer={:#010x} — ChipCommon reports no usable EROM; core inventory not walked (chip type={}) ::",
@@ -2039,4 +2125,347 @@ fn phy_type_name(t: u16) -> &'static str {
         11 => "AC",
         _ => "?",
     }
+}
+
+/// Which ChipCommon offset the SPROM shadow is read from, and the REASON, so the witness can carry
+/// both. Returns `(offset, reason)`.
+///
+/// **The BCM4331 uses `0x800`, and it is the chip explicitly excluded from the alternative.** This
+/// function exists because the first cut of S2 got the rule backwards, and the wrong rule is an easy
+/// one to re-derive, so the sourcing is recorded here rather than in a commit message:
+///
+/// * Current Linux `drivers/bcma/sprom.c` sets `u16 offset = BCMA_CC_SPROM` on the external-SPROM
+///   path and never moves it — `BCMA_CC_SPROM_PCIE6` does not appear in that file at all.
+/// * The historical (v3.2-era) code that did use `0x830` reads
+///   `offset = (chipinfo.id == 0x4331) ? BCMA_CC_SPROM : BCMA_CC_SPROM_PCIE6;` — i.e. the 4331 is
+///   the ONE part named as an exception, and the rule it stands in for is **PCIe-core rev >= 6**,
+///   not a ChipCommon revision.
+/// * The `rev >= 31` test that the first cut borrowed appears exactly once in `sprom.c`, inside
+///   `bcma_sprom_ext_available()`, where it selects **SROM_CONTROL over CHIPSTATUS for PRESENCE
+///   DETECTION**. It has nothing to do with the shadow's address. Two different functions.
+///
+/// So on this part the answer is `0x800` — which is what the old S0 code happened to print, though
+/// for the wrong reason (it keyed on the chip rev). Both the offset AND the reason go on the wire,
+/// and S2 dumps the shadow at BOTH candidates so a single metal boot settles it either way.
+///
+/// Not `bcmaS1`-gated: S0 chooses a shadow offset as well and had its own copy of the broken rule.
+/// One function, both paths.
+fn sprom_offset_for(chip_id: u16) -> (u64, &'static str) {
+    if chip_id == 0x4331 {
+        (CC_SPROM, "bcm4331-named-exception(Linux: 4331 ? BCMA_CC_SPROM : PCIE6); current sprom.c uses BCMA_CC_SPROM unconditionally")
+    } else {
+        (CC_SPROM, "default BCMA_CC_SPROM — current Linux sprom.c never moves the offset on the external-SPROM path")
+    }
+}
+
+/// Is this OUI one we recognise as Apple's or Broadcom's?
+///
+/// **Deliberately NON-EXHAUSTIVE, and the verdict leans the safe way because of it.** Apple alone
+/// holds several hundred OUIs; this table is the subset that can be transcribed with confidence,
+/// weighted to the 2010-2012 era this board is from. An unrecognised OUI therefore yields
+/// `oui-known=0` and downgrades the verdict to `SUSPECT` — which UNDERSTATES a genuine Apple MAC
+/// whose prefix is simply missing here. That direction is chosen on purpose: this check exists to
+/// stop the stage calling six boardflags bytes a MAC, and a false `SUSPECT` costs a line of reading
+/// while a false `PLAUSIBLE` is exactly the failure the review caught. The raw bytes are always on
+/// the line, so a reader can overrule this table from the capture.
+#[cfg(feature = "bcmaS1")]
+fn oui_known(o: [u8; 3]) -> &'static str {
+    match o {
+        // Broadcom.
+        [0x00, 0x10, 0x18] | [0x00, 0x1B, 0xE9] | [0x18, 0xC0, 0x86] => "broadcom",
+        // Apple — era-weighted subset (2008-2013 Macs), non-exhaustive.
+        [0x00, 0x1B, 0x63]
+        | [0x00, 0x1E, 0xC2]
+        | [0x00, 0x1F, 0xF3]
+        | [0x00, 0x21, 0xE9]
+        | [0x00, 0x22, 0x41]
+        | [0x00, 0x23, 0x12]
+        | [0x00, 0x23, 0x6C]
+        | [0x00, 0x23, 0xDF]
+        | [0x00, 0x24, 0x36]
+        | [0x00, 0x25, 0x00]
+        | [0x00, 0x25, 0x4B]
+        | [0x00, 0x25, 0xBC]
+        | [0x00, 0x26, 0x08]
+        | [0x00, 0x26, 0x4A]
+        | [0x00, 0x26, 0xB0]
+        | [0x00, 0x26, 0xBB]
+        | [0x00, 0x3E, 0xE1]
+        | [0x04, 0x0C, 0xCE]
+        | [0x04, 0x1E, 0x64]
+        | [0x04, 0x54, 0x53]
+        | [0x04, 0xF1, 0x3E]
+        | [0x08, 0x00, 0x07]
+        | [0x0C, 0x3E, 0x9F] => "apple",
+        _ => "",
+    }
+}
+
+// ── WIFI-S2: board identity + capability from the SPROM shadow ───────────────────────────────────
+//
+// `UNAOS_BCMAS1=1`, same knob and same block as S1/L0. This stage adds **no new write target**: it
+// moves cfg:0x80 — the one selector S1 already writes and restores at Step 4 — back onto ChipCommon
+// (`0x18000000`, where the SPROM shadow lives) and reads. It writes no ChipCommon register, no core
+// register and no second config register.
+//
+// ## What it reads, and why read-only reaches it
+//
+// The SPROM "shadow" is a 16-bit window inside ChipCommon's own register block
+// (`CC_SPROM`/`CC_SPROM_PCIE6`). On a socitype=1 PCIe part the offset is `0x830` when the ChipCommon
+// CORE rev is >= 31 (Boot AO: rev 37) — the CORE rev from the EROM, NOT the chip rev in
+// `chipid[19:16]`. Every read is an `r16` of a status/identity word with no side effect. The three
+// facts a stack needs come out of it: the station MAC (`il0macaddr`, the WiFi twin of BT's BD_ADDR),
+// the enabled bands (the antenna-available masks), and the board id (`board_type`, `board_rev`,
+// `boardflags`).
+//
+// ## Where read-only stops, and the write it will name instead
+//
+// On the BCM4331 the external power-amplifier control lines are muxed onto the SPROM pins; Linux
+// calls `bcma_chipco_bcm4331_ext_pa_lines_ctl(cc, false)` — a ChipCommon chip-control WRITE — before
+// reading the shadow. That write is past this arc's read-only ceiling. So if the shadow reads
+// all-`0xFFFF` (or all-zero), S2 does NOT poke the mux: it reports `BLOCKED`, NAMES the write (as L0
+// names the cfg:0x80 write it declines), and notes that the identity may instead live in OTP
+// (`gup(ci)` above), whose CONTENTS need a read command written to OTPP — also a write, also refused.
+//
+// ## Honesty about the field offsets
+//
+// Only the MAC and the SROM revision are treated as confident (they match S0's decode and
+// `bcm4331.md`). Every other field prints its RAW word beside an UNVERIFIED decode, and `board_type`
+// carries its own self-check: Linux takes it from `SSB_SPROM1_SPID`, which equals the PCI subsystem
+// device id, so a mismatch against the live `ssid` device convicts the offset rather than the board.
+#[cfg(feature = "bcmaS1")]
+fn s2_board_identity(bus: u8, dev: u8, func: u8, bar0: u64, chip_id: u16, cc_core_rev: Option<u32>) {
+    let dl = Deadline::new();
+
+    // ── 1. Point the ONE selector back at ChipCommon; the SPROM shadow is in its window. Same
+    // cfg:0x80 register S1 writes and restores at Step 4 — no restore of its own here. ────────────
+    unsafe { crate::arch::pci::write_config_32(bus, dev, func, CFG_BAR0_WIN, BCMA_ADDR_BASE) };
+    let win_now = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let win_ok = win_now == BCMA_ADDR_BASE;
+
+    // The offset and the REASON for it, both on the wire. See `sprom_offset_for`: on the 4331 this is
+    // 0x800, and the ChipCommon-rev test that once chose 0x830 here belongs to PRESENCE detection,
+    // not to offset selection. The core rev is still carried and printed — it is what gates the
+    // SROM_CONTROL presence read below — but it no longer picks the address.
+    let ccrev = cc_core_rev.unwrap_or(0);
+    let ccrev_known = cc_core_rev.is_some();
+    let (spoff, spoff_reason) = sprom_offset_for(chip_id);
+    serial_println!(
+        ":: wifi-s2: begin — board identity from the SPROM shadow; cfg:0x80 back on ChipCommon ({:#010x}) readback={:#010x} took={} — shadow offset={:#06x} reason={} (chip={:#06x}); ChipCommon CORE rev={} rev-known={} is used ONLY for the SROM_CONTROL presence test, NOT for this offset ::",
+        BCMA_ADDR_BASE, win_now, win_ok as u8, spoff, spoff_reason, chip_id, ccrev, ccrev_known as u8
+    );
+    if !win_ok {
+        serial_println!(
+            ":: wifi-s2: REFUSED stage=selector reason=not-taken readback={:#010x} want={:#010x} — BAR0+0 does not decode to ChipCommon, so the shadow reads below would not be the SPROM; nothing read ::",
+            win_now, BCMA_ADDR_BASE
+        );
+        let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+        serial_println!(
+            ":: wifi-s2: end ok=0 stage=selector sprom-readable=0 wrote-cfg80=1(selector, restored by S1) elapsed={}{} ::",
+            ev, eu
+        );
+        return;
+    }
+
+    // ── 2. PRESENCE, determined rather than inferred. This is the OTHER half of Linux's
+    // `bcma_sprom_ext_available()` — and the function whose `rev >= 31` test the first cut of this
+    // stage mistook for an offset rule. On a ChipCommon CORE rev >= 31 that advertises CAP_SPROM, an
+    // external SPROM is present iff SROM_CONTROL.PRESENT is set; below rev 31 the answer comes from
+    // CHIPSTATUS instead and this register is not the authority, so it is read but not ruled on. One
+    // register read, and it is what turns the BLOCKED branch from a guess into a determination. ────
+    let srom_ctl = unsafe { r32(bar0, CC_SROM_CONTROL) };
+    let ctl_authoritative = ccrev_known && ccrev >= 31;
+    let ext_present = (srom_ctl & SROM_CONTROL_PRESENT) != 0;
+    serial_println!(
+        ":: wifi-s2: srom-control raw={:#010x} @cc+{:#06x} present-bit={:#010x} present={} authoritative={} (Linux bcma_sprom_ext_available: the PRESENT bit decides ONLY when the ChipCommon CORE rev >= 31 — here rev={} known={}; below that CHIPSTATUS is the authority and this line is advisory). Transcription UNVERIFIED; raw word is the evidence ::",
+        srom_ctl, CC_SROM_CONTROL, SROM_CONTROL_PRESENT, ext_present as u8,
+        ctl_authoritative as u8, ccrev, ccrev_known as u8
+    );
+
+    // ── 3. Dump the shadow read-only at BOTH candidate offsets. The decode below uses `spoff`
+    // (0x800 for this part), but a single metal boot should be able to settle the offset question
+    // either way without a second flight, so the alternate window is dumped beside it. Degeneracy is
+    // tracked ONLY for the chosen offset, and `words_read` is counted so a loop cut short by the TSC
+    // deadline cannot masquerade as an all-ff verdict. ─────────────────────────────────────────────
+    let mut all_ff = true;
+    let mut all_00 = true;
+    let mut words_read = 0u64;
+    let sdl = Deadline::new();
+    let mut w = 0u64;
+    while w < SPROM_WORDS && !sdl.expired() {
+        serial_print!(":: wifi-s2: sprom+{:#05x}", spoff + w * 2);
+        let mut k = 0u64;
+        while k < 8 && w + k < SPROM_WORDS {
+            let v = unsafe { r16(bar0, spoff + (w + k) * 2) };
+            if v != 0xFFFF {
+                all_ff = false;
+            }
+            if v != 0x0000 {
+                all_00 = false;
+            }
+            serial_print!(" {:04x}", v);
+            words_read += 1;
+            k += 1;
+        }
+        serial_println!(" ::");
+        w += 8;
+    }
+    let dump_complete = words_read == SPROM_WORDS;
+    if !dump_complete {
+        // A truncated dump cannot support ANY verdict about the shadow's contents — least of all
+        // "all-ff", which a zero-word read would satisfy vacuously.
+        serial_println!(
+            ":: wifi-s2: dump-truncated words-read={} of {} stop=tsc-deadline — the degeneracy verdict below is NOT taken from a partial dump ::",
+            words_read, SPROM_WORDS
+        );
+    }
+
+    // The alternate offset, dumped for the record so the offset rule is settleable from one capture.
+    // Not decoded, not used in any verdict — evidence only.
+    let altoff = if spoff == CC_SPROM { CC_SPROM_PCIE6 } else { CC_SPROM };
+    let adl = Deadline::new();
+    let mut aw = 0u64;
+    while aw < SPROM_WORDS && !adl.expired() {
+        serial_print!(":: wifi-s2: sprom-alt+{:#05x}", altoff + aw * 2);
+        let mut k = 0u64;
+        while k < 8 && aw + k < SPROM_WORDS {
+            serial_print!(" {:04x}", unsafe { r16(bar0, altoff + (aw + k) * 2) });
+            k += 1;
+        }
+        serial_println!(" ::");
+        aw += 8;
+    }
+    serial_println!(
+        ":: wifi-s2: sprom-alt-note offset={:#06x} dumped for the record and NOT decoded — the chosen offset is {:#06x} ({}). If the decode below is degenerate while this alternate window carries structure, the offset rule is refuted and this capture is enough to say so ::",
+        altoff, spoff, spoff_reason
+    );
+
+    // ── 4. BLOCKED? An all-FF / all-00 shadow on the 4331 is the PA-line mux, not an empty board —
+    // unless SROM_CONTROL authoritatively says no external SPROM is attached, in which case it is a
+    // determination. Name the write; do not make it. ─────────────────────────────────────────────
+    if dump_complete && (all_ff || all_00) {
+        serial_println!(
+            ":: wifi-s2: BLOCKED stage=sprom-shadow reason=all-{} — the shadow at offset {:#06x} reads uniformly {} across all {} words. SROM_CONTROL.PRESENT={} authoritative={} => {}. On the BCM4331 the external-PA control lines are muxed onto the SPROM pins; Linux clears them with bcma_chipco_bcm4331_ext_pa_lines_ctl() — a ChipCommon chip-control WRITE — BEFORE reading this shadow. That write is past this arc's read-only ceiling and is NOT made. Identity may instead live in OTP (gup(ci)), whose CONTENTS need a read command written to OTPP — also a write, also refused. MAC/bands/board UNKNOWN, not guessed ::",
+            if all_ff { "ff" } else { "00" }, spoff,
+            if all_ff { "0xffff" } else { "0x0000" }, words_read,
+            ext_present as u8, ctl_authoritative as u8,
+            if ctl_authoritative && !ext_present {
+                "DETERMINED: no external SPROM is attached — the empty shadow is the truth, not the mux"
+            } else if ctl_authoritative && ext_present {
+                "an external SPROM IS attached, so the empty shadow points at the PA-line mux"
+            } else {
+                "presence not authoritative at this ChipCommon rev; mux vs absent is UNDECIDED"
+            }
+        );
+        let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+        serial_println!(
+            ":: wifi-s2: end ok=0 stage=sprom-shadow sprom-readable=0 reason={} srom-present={} words-read={} wrote-cfg80=1(selector, restored by S1) wrote-sprom-ctl=0(audited) elapsed={}{} ::",
+            if ctl_authoritative && !ext_present { "no-external-sprom" } else { "pa-line-mux-or-absent" },
+            ext_present as u8, words_read, ev, eu
+        );
+        return;
+    }
+
+    // ── 4. Decode. RAW words are on the dump above; the MAC and revision are confident, the rest is
+    // labelled UNVERIFIED with board_type carrying its own ssid self-check. ──────────────────────
+    let last = unsafe { r16(bar0, spoff + (SPROM_WORDS - 1) * 2) };
+    let srev = (last & 0xFF) as u8;
+    let rev_supported = (8..=11).contains(&srev);
+
+    let m0 = unsafe { r16(bar0, spoff + SP8_IL0MAC) };
+    let m1 = unsafe { r16(bar0, spoff + SP8_IL0MAC + 2) };
+    let m2 = unsafe { r16(bar0, spoff + SP8_IL0MAC + 4) };
+    let mac = [
+        (m0 >> 8) as u8,
+        (m0 & 0xFF) as u8,
+        (m1 >> 8) as u8,
+        (m1 & 0xFF) as u8,
+        (m2 >> 8) as u8,
+        (m2 & 0xFF) as u8,
+    ];
+    let unicast = (mac[0] & 1) == 0;
+    let locally_admin = (mac[0] & 2) != 0;
+    let mac_degenerate = mac == [0, 0, 0, 0, 0, 0] || mac == [0xFF; 6];
+    // `unicast` alone is a COIN FLIP, not a check — bit 0 of any arbitrary byte is clear half the
+    // time, which is precisely how the first cut of this stage could have printed six boardflags
+    // bytes and called them a plausible MAC. The OUI test is what gives the claim something it can
+    // actually fail on, and the table is non-exhaustive in the safe direction (see `oui_known`).
+    let oui = [mac[0], mac[1], mac[2]];
+    let oui_vendor = oui_known(oui);
+    let oui_is_known = !oui_vendor.is_empty();
+    serial_println!(
+        ":: wifi-s2: mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} oui={:02x}:{:02x}:{:02x} oui-known={} oui-vendor={} unicast={} locally-admin={} degenerate={} — il0macaddr @sprom+{:#05x} (SSB_SPROM8_IL0MAC, 3 BE words); the radio's identity, the WiFi twin of BT's BD_ADDR. `unicast` alone is a coin flip and is NOT sufficient; the OUI table is NON-EXHAUSTIVE, so oui-known=0 downgrades the verdict rather than convicting the address — the raw bytes here are the evidence ::",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        oui[0], oui[1], oui[2], oui_is_known as u8,
+        if oui_is_known { oui_vendor } else { "unrecognised" },
+        unicast as u8, locally_admin as u8, mac_degenerate as u8, SP8_IL0MAC
+    );
+
+    // Band capability: the antenna-available word. Low byte = 2.4GHz antenna mask, high byte = 5GHz.
+    // A nonzero 5GHz mask is the SPROM's own statement that the board is 5GHz-capable; the 4331 is a
+    // dual-band 3x3:3 part, so both bytes are expected nonzero.
+    let antavail = unsafe { r16(bar0, spoff + SP8_ANTAVAIL) };
+    let ant_bg = (antavail & 0x00FF) as u8;
+    let ant_a = ((antavail >> 8) & 0xFF) as u8;
+    let band_24 = ant_bg != 0;
+    let band_5 = ant_a != 0;
+    serial_println!(
+        ":: wifi-s2: band antavail-raw={:#06x} @sprom+{:#05x} ant-2.4ghz-mask={:#04x} ant-5ghz-mask={:#04x} band-2.4ghz={} band-5ghz={} dual-band={} — SSB_SPROM8_ANTAVAIL (lo=2.4GHz, hi=5GHz antenna masks). Decode UNVERIFIED (offset from ssb_regs.h); RAW word shown, verdict is the SPROM's statement of which bands are populated, not the PHY's ::",
+        antavail, SP8_ANTAVAIL, ant_bg, ant_a, band_24 as u8, band_5 as u8, (band_24 && band_5) as u8
+    );
+
+    // Board id. `board_type` is SSB_SPROM1_SPID, and in the normal case the SPROM is what programs
+    // the PCIe subsystem id, so the two agree — which makes this a useful cross-check but NOT a law:
+    // a mismatch convicts the OFFSET **or** the board (a board that does not program the subsystem
+    // id from this word), and the witness says exactly that rather than blaming the offset alone.
+    // boardflags/rev are UNVERIFIED, RAW on the dump above.
+    let ss = unsafe { read_config_32(bus, dev, func, CFG_SUBSYS) };
+    let ss_dev = (ss >> 16) as u16;
+    let board_type = unsafe { r16(bar0, spoff + SP8_SPID) };
+    let board_rev = unsafe { r16(bar0, spoff + SP8_BOARDREV) };
+    let bfl_lo = unsafe { r16(bar0, spoff + SP8_BFL_LO) };
+    let bfl_hi = unsafe { r16(bar0, spoff + SP8_BFL_HI) };
+    let bfl2_lo = unsafe { r16(bar0, spoff + SP8_BFL2_LO) };
+    let bfl2_hi = unsafe { r16(bar0, spoff + SP8_BFL2_HI) };
+    let type_matches_ssid = board_type == ss_dev;
+    serial_println!(
+        ":: wifi-s2: board type={:#06x} (SSB_SPROM1_SPID @sprom+{:#05x}; pci-ssid-device={:#06x} match={}) rev={:#06x} @sprom+{:#05x} boardflags={:04x}{:04x} boardflags2={:04x}{:04x} — the SPROM normally programs the PCIe subsystem id, so a match corroborates the offset; a MISMATCH convicts the offset OR the board (one that does not source its subsystem id from this word), not the offset alone. boardflags/rev decode UNVERIFIED, RAW dump above ::",
+        board_type, SP8_SPID, ss_dev, type_matches_ssid as u8, board_rev, SP8_BOARDREV,
+        bfl_hi, bfl_lo, bfl2_hi, bfl2_lo
+    );
+
+    // ── 5. Verdict + end.
+    //
+    // PLAUSIBLE has to be able to FAIL on the headline claim — the MAC — or it is decoration. The
+    // first cut gated it on `unicast && rev_supported && type_matches_ssid`, and every one of those
+    // three could pass while the MAC itself was six bytes of boardflags read from the wrong offset:
+    // `board_type`/`board_rev` sit at offsets that were correct all along, so they corroborate the
+    // SHADOW, not the MAC's offset, and `unicast` on a wrong word is a coin flip. So the MAC now
+    // carries its own independent condition (a recognised OUI) and the verdict names which leg failed
+    // rather than collapsing them.
+    //
+    // Source note: SPROM present AND OTP gup(ci) programmed, so the shadow may be OTP-backed on this
+    // Apple board; either way this is the read-only path.
+    let mac_credible = !mac_degenerate && unicast && oui_is_known;
+    let shadow_credible = rev_supported && type_matches_ssid;
+    let verdict = if mac_degenerate {
+        "NO-MAC"
+    } else if mac_credible && shadow_credible {
+        "PLAUSIBLE"
+    } else {
+        "SUSPECT"
+    };
+    serial_println!(
+        ":: wifi-s2: identity-verdict {} mac-credible={} (non-degenerate={} unicast={} oui-known={}) shadow-credible={} (srom-rev={} rev-supported={} board-type-matches-ssid={}) dual-band={} source=SPROM-shadow(OTP gup(ci) may back it) — PLAUSIBLE requires the MAC leg AND the shadow leg independently: board_type/board_rev corroborate the SHADOW, never the MAC's own offset, so they cannot stand in for it. SPROM CRC-8 NOT computed in this arc (polynomial not transcribed); a wrong table would lie BAD on a good SPROM ::",
+        verdict, mac_credible as u8, (!mac_degenerate) as u8, unicast as u8, oui_is_known as u8,
+        shadow_credible as u8, srev, rev_supported as u8, type_matches_ssid as u8,
+        (band_24 && band_5) as u8
+    );
+    let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+    serial_println!(
+        ":: wifi-s2: end ok={} sprom-readable=1 words-read={} offset={:#06x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mac-credible={} srom-rev={} dual-band={} srom-present={} wrote-cfg80=1(selector, restored by S1) wrote-sprom-ctl=0(audited) wrote-otpp=0(audited) elapsed={}{} — the MAC's offset (SSB_SPROM8_IL0MAC 0x8c) and this offset rule (0x800 for the 4331) are TRANSCRIBED, not yet corroborated on metal; the alt-offset dump above is what settles them. Next writes (PA-line mux, OTP command, core enable) are S2-contents/S3 and past read-only ::",
+        (verdict == "PLAUSIBLE") as u8, words_read, spoff,
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mac_credible as u8,
+        srev, (band_24 && band_5) as u8, ext_present as u8, ev, eu
+    );
 }
