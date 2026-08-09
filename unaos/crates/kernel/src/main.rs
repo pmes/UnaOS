@@ -431,6 +431,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
         unaos_kernel::shell::pi_ls_witness();
 
+        // MIDDEN-M1 (witness battery): the shell's interpreter is now `unaos/libs/sys/midden_core`,
+        // shared with the Ring 3 `midden` handler. The live `:: [midden] ... ::` line needs a
+        // keystroke and the headless gates type nothing, so this drives the SAME `plan()` the
+        // prompt drives — core-answer, host-routing, `.elf`-elided resolution, and verb-beats-
+        // program precedence — over a synthetic volume, in the uniform `:: TSTE: ... ::` shape.
+        // Arch-neutral by construction (the core carries no `cfg`), so the identical four lines
+        // land on the x86 battery below.
+        #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+        unaos_kernel::shell::midden_witness();
+
         // INSTALL-PI: the installer engine's first LIVE end-to-end execution — GPT → FAT32 → payload copy
         // → sha extent-verify onto the emmc2 microSD just censused above. Three-gate escalation (census /
         // scratch-ladder / destructive-confirm), all `piinstall*`-gated, so a default build compiles NONE
@@ -773,6 +783,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             unaos_kernel::arch::syscall::nmi_self_fire();
             unaos_kernel::arch::syscall::canonical_guard_selftest();
         }
+
+        // MIDDEN-M1 (witness battery): the x86 half of the shell-core fixture — see the aarch64
+        // call site for what it proves. It needs no hardware at all (a synthetic volume), so it
+        // sits with the other kernel-side boundary fixtures rather than with the storage probes.
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
+        unaos_kernel::shell::midden_witness();
 
         // CLOCK-X1 (M3): the x86 wall-clock timebase witness — the SAMPLE half. Runs after
         // `apic::calibrate` (step 4b''') so the invariant TSC is calibrated; silent if this machine

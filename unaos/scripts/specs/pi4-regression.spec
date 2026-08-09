@@ -1003,6 +1003,33 @@ FORBID :: MAILBOX: BUSY
 # ---       same hash must appear in a QEMU capture and in a metal capture, because the generator is
 # ---       integer-only and both arches are little-endian. A DIFFERENT hash means a parameter
 # ---       drifted from the kit — which is exactly the drift the shared-source law exists to catch.
+# --- MIDDEN-M1: the shell console's interpreter is the shared no_std core -----------------------
+# `shell::midden_witness` (witness battery, both arches) drives `midden_core::plan` over a synthetic
+# volume, so these four hold with no keyboard, no card and no FAT. They are REQUIREd rather than
+# left as prose because the whole point of the arc is that there is exactly ONE command table: if
+# the kernel ever grows a second decision path, `midden.route` or `midden.precedence` is what
+# notices. FORBID catches the fixture reporting a real mismatch (it prints what it got).
+#   dispatch   — a core verb is answered IN the core, with real text (not routed, not swallowed)
+#   route      — a host verb comes back as Host with its args intact
+#   resolve    — the `.elf` the user did not type is elided to a name on the volume (`vug` -> VUG.ELF
+#                against the fixture's exact-match NameList)
+#   precedence — a verb still beats a program of the same stem (`stat` vs STAT.ELF)
+#
+# FOUR RULES, NOT FIVE. The fixture also echoes `:: [midden] resolve "vug" -> VUG.ELF ::` beside its
+# `midden.resolve` verdict, and an earlier draft REQUIREd that line too. It was withdrawn as a gate
+# for two reasons, both worth keeping written down. It ASSERTS NOTHING NEW: the same fixture, in the
+# same call, already scored `midden.resolve -> PASS` on exactly that comparison, so the extra rule
+# could only ever fail in lockstep with the one above it — coverage arithmetic, not coverage. And it
+# reads as a claim about the LIVE shell that is false: on x86 the live line says `-> vug.elf`,
+# because `FatVolume::is_file` matches FAT case-insensitively and the core's as-typed probe hits
+# first. `-> VUG.ELF` is the FIXTURE's spelling (an exact-match `NameList`) and nothing else's.
+# The honest delta of the midden arc against this gate is therefore FOUR REQUIREs and one FORBID.
+REQUIRE :: TSTE: midden.dispatch -> PASS ::
+REQUIRE :: TSTE: midden.route -> PASS ::
+REQUIRE :: TSTE: midden.resolve -> PASS ::
+REQUIRE :: TSTE: midden.precedence -> PASS ::
+FORBID :: TSTE: midden\.\w+ -> FAIL
+
 REQUIRE \[paper\] kit=us-crispy-modern@0787ba9f algo=laid octaves=3 scale=4 amp_q16=1311 seed=0xfbb60e9f base=0xf5f2ea tile=352x64 hash=0x0df2b838251069dc
 #
 # ---    2. THE FIXTURE VERDICT is the stronger statement, and it is why the hash above is not

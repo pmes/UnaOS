@@ -1,0 +1,23 @@
+[package]
+name = "midden_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Midden core: the ring-neutral shell interpreter — one command table, one parser, one resolver, shared by Ring 0 and Ring 3."
+
+# The core is `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, and has NO
+# dependencies at all — not even our own crates. It is the same shape as
+# `unaos/libs/sys/helm` and `unaos/libs/fs/unafs`: a shared core under
+# `unaos/libs/`, a member of the ROOT host workspace, pulled by the kernel as a
+# path dep with `default-features = false`.
+#
+# The default-on `std` feature exists only so a host build (the `midden`
+# handler, a vessel, a test binary) can link it without ceremony; the core
+# itself compiles identically either way. Nothing in `src/` is `std`-gated
+# today — the feature is the seam, declared now so the kernel's
+# `default-features = false` spelling is honest rather than decorative.
+[dependencies]
+
+[features]
+default = ["std"]
+std = []

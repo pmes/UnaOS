@@ -946,6 +946,15 @@ linked_list_allocator = "0.10.6"
 font8x8 = { version = "0.3.1", default-features = false }
 cfg-if = "1.0.0"
 unaos-boot-info = { path = "../boot-info" }
+# MIDDEN-M1: the shell core. `unaos/libs/sys/midden_core` is the ONE command
+# table / parser / bare-name resolver, shared with the Ring 3 `midden` handler —
+# same convention as `libs/fs/unafs` and `libs/sys/helm`: a root-workspace
+# member pulled here as a path dep with `default-features = false` (its `std`
+# feature is host-only ceremony; the core itself is `no_std` + `alloc` and has
+# no dependencies at all). Arch-neutral on purpose: the kernel passes a
+# `midden_core::Facts` built with `cfg!()`, so ONE compiled core tells the truth
+# on x86 and aarch64 both.
+midden_core = { path = "../../libs/sys/midden_core", default-features = false }
 net = { path = "../net" }
 fdt = "0.1.5"
 # RAST-1 / RAST-TEGRA: platform-neutral (no_std, arch-agnostic) software rasterizer. `optional` so

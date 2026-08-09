@@ -2310,13 +2310,224 @@ impl History {
     }
 }
 
+// --- MIDDEN-M1: the seam between the kernel console and the shared shell core -----------------
+//
+// Three small pieces, and deliberately only three: what this build can do (`midden_facts`), how
+// the core asks "is that a file?" (`FatVolume`), and how a terminal message reaches the panel
+// (`render_message`). Everything else about what a command MEANS now lives in
+// `unaos/libs/sys/midden_core`, shared with the Ring 3 `midden` handler.
+
+/// Describe this build to the core.
+///
+/// The core carries no `#[cfg(target_arch)]` — a shell core that only tells the truth on one arch
+/// is not a shared core — so the facts are built here, at the single call site, with `cfg!` and
+/// `#[cfg]`. `proc_rows` is READ from the process table rather than written down (HEADROOM split
+/// the cap 10 on x86 / 6 on aarch64, and a help line naming a stale ceiling is worse than none).
+fn midden_facts() -> midden_core::Facts {
+    // The process verbs (`run`/`bg`/`jobs`/`kill`/`storm`) are registered on aarch64-baremetal and
+    // on x86; this mirrors the `#[cfg]` on their match arms exactly.
+    // `arch::syscall` itself is `baremetal`-gated on aarch64, so the cap must be read under the
+    // SAME condition that decides whether the verbs exist — a build with no process table has no
+    // storm cap to name, and 0 is the honest stand-in because `proc_verbs` is false beside it.
+    #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+    let (proc_verbs, proc_rows) = (true, crate::arch::syscall::proc_table_rows());
+    #[cfg(not(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64")))]
+    let (proc_verbs, proc_rows) = (false, 0usize);
+    midden_core::Facts {
+        aarch64: cfg!(target_arch = "aarch64"),
+        x86: cfg!(target_arch = "x86_64"),
+        v3d: cfg!(all(target_arch = "aarch64", feature = "v3d")),
+        proc_verbs,
+        proc_rows,
+        // BARE-NAME LAUNCH is x86-only today: `bare_exec` + `spawn_user_image_bg` off the FAT
+        // volume. With this false the core never probes the volume and never returns `Plan::Exec`,
+        // so an aarch64 build does exactly what it did before this crate existed.
+        exec: cfg!(target_arch = "x86_64"),
+    }
+}
+
+/// The core's one filesystem question, answered over the shell's real volume.
+///
+/// Not a filesystem trait: `is_file` is true iff the name resolves to a regular (non-directory)
+/// file from the shell's cwd, and that is all the resolver is allowed to know. Stateless like
+/// every other FAT verb — the volume is mounted per question, so a swapped card is picked up on
+/// the next command.
+struct FatVolume;
+
+impl midden_core::Volume for FatVolume {
+    #[cfg(target_arch = "x86_64")]
+    fn is_file(&mut self, name: &str) -> bool {
+        let Ok(fs) = crate::fs::fat::mount() else { return false };
+        matches!(
+            resolve_path(&fs, &normalize_path(&cwd_path(), name)),
+            Ok(Resolved::Entry(de, _)) if !de.is_dir
+        )
+    }
+    // aarch64 never sets `Facts::exec`, so the core never calls this. Answering `false` rather
+    // than reaching for unafs keeps the promise: no behaviour change on a build with no loader.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn is_file(&mut self, _name: &str) -> bool {
+        false
+    }
+}
+
+/// Render one `midden_core::Message` to the console — the Ring 0 half of "views are the only path
+/// to the user".
+///
+/// The core returns ONE string; the console is line-oriented, so this splits on `\n` and prints
+/// each line, which is byte-for-byte what the old per-line `console.println` calls did. `NoOp`
+/// prints nothing at all (not a blank line): silence is the message.
+fn render_message(console: &mut Console, msg: &midden_core::Message) {
+    if matches!(msg, midden_core::Message::NoOp) {
+        return;
+    }
+    for line in msg.text().split('\n') {
+        console.println(line);
+    }
+}
+
+/// MIDDEN-M1 WITNESS (witness battery): prove, headlessly and on BOTH arches, that the console's
+/// interpreter is the shared core and that extension-elided resolution works.
+///
+/// Why a fixture and not just the live line: the live `:: [midden] ... ::` witness needs a
+/// keystroke, and the headless QEMU gates type nothing. This drives the same `midden_core::plan`
+/// the prompt drives, over a synthetic volume, and asserts the four properties that would silently
+/// rot: a core verb is answered in-core, a host verb is routed (not swallowed), a bare name elides
+/// `.elf` to the on-disk spelling, and a verb still beats a program of the same stem. Each check
+/// prints in the uniform `:: TSTE: <name> -> PASS/FAIL ::` shape, so the boot-replay ring picks
+/// them up and `tste` lists them.
+///
+/// It can fail: every assertion compares against a literal expected value, and a FAIL line names
+/// what it got.
+#[cfg(feature = "witness")]
+pub fn midden_witness() {
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+
+    // A volume that is NOT the real one, and a build description that is NOT this build's: the
+    // fixture must prove the RESOLVER, on every arch, not the card in the slot or the `cfg` this
+    // kernel happens to carry. (`vug` is a verb on aarch64 and a program name on x86 — the fixture
+    // pins the x86 shape so the `.elf` elision is exercised on the Pi gate too, which is the only
+    // headless gate that runs today.)
+    const NAMES: &[&str] = &["VUG.ELF", "STAT.ELF", "README.TXT"];
+    let facts = midden_core::Facts {
+        x86: true,
+        exec: true,
+        proc_verbs: true,
+        proc_rows: midden_facts().proc_rows,
+        aarch64: false,
+        v3d: false,
+    };
+
+    // 1. dispatch — a core verb is answered by the core, with real text.
+    let mut vol = midden_core::NameList(NAMES);
+    let p = midden_core::plan("echo midden m1", &facts, &mut vol);
+    let ok = matches!(&p, midden_core::Plan::Say(m)
+        if m.kind() == "TerminalOutput" && m.text() == "midden m1");
+    verdict("midden.dispatch", ok, &alloc::format!("{:?}", p));
+
+    // 2. routing — a host verb comes back as Host with its args intact, never swallowed.
+    let mut vol = midden_core::NameList(NAMES);
+    let p = midden_core::plan("cat DOCS/README.TXT", &facts, &mut vol);
+    let ok = matches!(&p, midden_core::Plan::Host { verb, rest }
+        if verb == "cat" && rest == "DOCS/README.TXT");
+    verdict("midden.route", ok, &alloc::format!("{:?}", p));
+
+    // 3. resolve — the `.elf` the user did not type, elided against the on-disk name.
+    let mut vol = midden_core::NameList(NAMES);
+    let p = midden_core::plan("vug", &facts, &mut vol);
+    let ok = matches!(&p, midden_core::Plan::Exec { typed, name }
+        if typed == "vug" && name == "VUG.ELF");
+    verdict("midden.resolve", ok, &alloc::format!("{:?}", p));
+    if let midden_core::Plan::Exec { typed, name } = &p {
+        serial_println!(":: [midden] resolve \"{}\" -> {} ::", typed, name);
+    }
+
+    // 4. precedence — `stat` is a verb and STAT.ELF is on the volume; the verb wins. This is the
+    //    collision MIDDEN_CONVERGENCE §5 records, pinned here so a later "improvement" that lets a
+    //    program shadow a verb cannot land quietly.
+    let mut vol = midden_core::NameList(NAMES);
+    let p = midden_core::plan("stat FOO", &facts, &mut vol);
+    let ok = matches!(&p, midden_core::Plan::Host { verb, .. } if verb == "stat");
+    verdict("midden.precedence", ok, &alloc::format!("{:?}", p));
+}
+
 /// Run one command. Returns `true` if the command took over the whole screen with its own
 /// graphics (e.g. `vug`), so the caller should NOT repaint the console over it.
 pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetPal) -> bool {
-    // Split command and args (simple whitespace split)
-    let mut parts = cmd_line.trim().split_whitespace();
-    let command = parts.next().unwrap_or("");
-    let args: Vec<&str> = parts.collect();
+    // MIDDEN-M1 — ONE INTERPRETER, AND IT IS MIDDEN'S.
+    //
+    // This function used to be a rival shell: it split the line itself, decided by `match` arm
+    // what counted as a command, wrote its own help text, and invented "Unknown command" in a
+    // `_ =>` fallthrough — none of it shared with `handlers/midden`, the shell handler that is
+    // supposed to BE the UnaOS shell. Two interpreters, two command tables, no shared line.
+    //
+    // Now the line goes to `midden_core::plan` first (unaos/libs/sys/midden_core — no_std,
+    // forbid(unsafe_code), the same shared-core convention as libs/fs/unafs and libs/sys/helm),
+    // and this function services what comes back:
+    //
+    //   Nothing  — empty line, nothing printed (the old `"" => {}` arm).
+    //   Say(msg) — the core answered in full (help/echo/ver/gneiss, and every refusal). We render
+    //              the `TerminalOutput`/`TerminalError` and return. THIS is the console rendering
+    //              a bandy-shaped terminal message, in Ring 0, off the shared core.
+    //   Exec     — a bare name resolved to a program on disk, `.elf` elided if the user left it
+    //              off (x86; see `bare_exec`). `ls` still shows STAT.ELF — elision is a lookup
+    //              rule, never a storage or display rule.
+    //   Host     — a verb the core knows but only the kernel can perform. The giant match below
+    //              is that service layer, and ONLY that: it no longer decides what a word means.
+    //
+    // What is still deferred is stated plainly rather than implied: the FAT/VFS/net/process verbs
+    // remain kernel-side implementations reached through `Plan::Host`. See
+    // docs/dev/USERLAND/MIDDEN_CONVERGENCE.md §2 for the split and what M2 moves.
+    let facts = midden_facts();
+    let mut vol = FatVolume;
+    let plan = midden_core::plan(cmd_line, &facts, &mut vol);
+
+    // WITNESS (must be able to fail): one line per dispatched line, naming the message the core
+    // produced. A line that never reached the core cannot print this, and a core that produced
+    // nothing prints `len=0` rather than a plausible number.
+    match &plan {
+        midden_core::Plan::Nothing => {}
+        midden_core::Plan::Say(msg) => serial_println!(
+            ":: [midden] cmd=\"{}\" -> {} len={} ::",
+            cmd_line.trim(), msg.kind(), msg.len()
+        ),
+        midden_core::Plan::Exec { typed, name } => serial_println!(
+            ":: [midden] resolve \"{}\" -> {} ::", typed, name
+        ),
+        midden_core::Plan::Host { verb, .. } => serial_println!(
+            ":: [midden] cmd=\"{}\" -> Host verb={} ::", cmd_line.trim(), verb
+        ),
+    }
+
+    let (verb, rest) = match plan {
+        midden_core::Plan::Nothing => return false,
+        midden_core::Plan::Say(msg) => {
+            render_message(console, &msg);
+            return false;
+        }
+        midden_core::Plan::Exec { typed, name } => {
+            #[cfg(target_arch = "x86_64")]
+            bare_exec(console, &typed, &name);
+            // No build outside x86 sets `Facts::exec`, so the core never hands this arm a plan
+            // there; the branch exists so the match is total and the day a loader arrives on
+            // another arch the compiler points here.
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = (&typed, &name);
+                console.println("Unknown command. Type 'help' for assistance.");
+            }
+            return false;
+        }
+        midden_core::Plan::Host { verb, rest } => (verb, rest),
+    };
+    let command: &str = &verb;
+    let args: Vec<&str> = rest.split_whitespace().collect();
 
     // The `vug` and `pulse` commands paint full-screen views; everything else leaves the
     // console visible. PI-APP-1: `v3d` blits the visible battery onto the live scanout, so it too
@@ -2335,74 +2546,6 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     let took_screen = false;
 
     match command {
-        "ver" | "version" => {
-            console.println("unaOS v0.1.0 (Kernel: Jules 1 / Cortex: Jules 6)");
-        },
-        "help" => {
-            console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
-            console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
-            console.println("FILES:    fatinfo (FAT geometry), ls [-l] [dir], cd [dir], pwd, cat <path>");
-            console.println("PAGING:   head <path> [n], tail <path> [n]  (first / last n lines, default 10)");
-            console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm [-r] [-f] <path>");
-            console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
-            console.println("VFS:      vfs write|append|rm|mkdir <path> [text]  (unified namespace: / native, /fat FAT)");
-            console.println("          rm -r <dir>  (recursively delete a directory tree; root refused)");
-            console.println("COPY:     cp [-f] <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
-            console.println("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
-            console.println("MOVE:     mv [-f] <src...> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
-            console.println("FLAGS:    default is no-clobber; -f = force overwrite (rm: quiet on missing), -n = no-clobber");
-            console.println("WILDCARD: * / ? in the last path component — ls/cat/rm/cp/mv expand it (e.g. rm *.TMP, cp *.TXT DOCS/)");
-            console.println("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
-            console.println("TREE:     find [root] <pattern>  (recursive glob search), du [dir]  (recursive size tally)");
-            console.println("          uptime  (seconds since boot; shows the wall clock when set)");
-            console.println("INSPECT:  stat <path>  (full on-disk detail), xd <path> [off] [len]  (bounded hexdump)");
-            #[cfg(target_arch = "aarch64")]
-            console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, absolute paths)");
-            #[cfg(target_arch = "aarch64")]
-            console.println("          utouch <path>, uwrite <path> <text>, umkdir <path>, urm <path>  (write-through)");
-            console.println("          usnaps, usnap <name>, usnapdrop <gen>  (retained roots / snapshots)");
-            #[cfg(target_arch = "aarch64")]
-            console.println("          usnapls <gen> [path], usnapcat <gen> <path>  (read a snapshot; current-ACL enforced)");
-            console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
-            console.println("          time  (shared civil clock: ISO-8601 UTC + source; unsynced until SNTP/setdate)");
-            // `pulse` draws through the aarch64-only `vug` module, so it is listed only where it can
-            // actually run — help text that advertises a verb the build cannot dispatch is worse than
-            // no help at all.
-            #[cfg(target_arch = "aarch64")]
-            console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
-            #[cfg(not(target_arch = "aarch64"))]
-            console.println("SMP:      sched (per-CPU run queues)");
-            #[cfg(target_arch = "aarch64")]
-            console.println("          top  (per-core load: recent busy%, ctx-switches, last task)");
-            // PI-APP-1: v3d-gated so the knob-off build's help text stays byte-identical to baseline.
-            #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
-            console.println("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
-            // BGRUN-1: background user-mode runs — the concurrent-apps line (windows coexist; TAB cycles).
-            #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
-            console.println("PROC:     run <path> (foreground), bg <path> (background), jobs (list+reap), kill <pid>");
-            // BARE-EXEC: the shortest way to start a program, so it is listed where an operator
-            // looks. Named after the verbs above because it is the fallthrough BEHIND them.
-            #[cfg(target_arch = "x86_64")]
-            console.println("          <name.elf>  (just type it: vug.elf runs VUG.ELF in a window, prompt returns)");
-            // STORM-HEADROOM: the verb existed since P77 but was never listed, so the one command an
-            // attended bench uses to load the scheduler was discoverable only from the source. The
-            // cap is stated here because it is the first thing a `storm 8` reading needs.
-            // STORM-X86 listed it on both arches and could state one number, because `MAX_PROCS` was
-            // 6 on each. HEADROOM split them (x86 10, aarch64 6), so the line is BUILT from
-            // `proc_table_rows()` rather than written down: a help line that names a stale ceiling is
-            // worse than no help line, since it is the one place an operator trusts without checking.
-            #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
-            console.println(&alloc::format!(
-                "          storm [n]  (launch n vugs; n>{} is refused by the process table — serial carries the [storm] census)",
-                crate::arch::syscall::proc_table_rows()
-            ));
-            console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
-            console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
-            console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
-            console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
-            console.println("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
-            console.println("          get <ip> [port] [path]  (HTTP/1.0 GET)");
-        },
         "date" => {
             // JD17/CLOCK-3/PI-UI-3: show the kernel wall clock. The UNIFIED civil clock is the source of
             // truth: prefer the Unix anchor (an SNTP sync on the Pi — PI-NET-16 — or a `setdate` seed), so a
@@ -2472,16 +2615,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // Let's implement a clear method on Console.
             console.clear();
         },
-        "echo" => {
-            let content = args.join(" ");
-            console.println(&content);
-        },
         "panic" => {
             // Test the Exception Handler
             panic!("Manual Panic Requested by Architect!");
-        },
-        "gneiss" => {
-             console.println("Gneiss is Home.");
         },
         "usbinfo" => {
             for line in crate::drivers::xhci::usb_summary() {
@@ -3583,20 +3719,31 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 Some(pid) => bg_kill_cmd(console, pid),
             }
         },
-        "" => {}, // Ignore empty enter
-        _ => {
-            // BARE-EXEC (GR20, x86): the typed word is not a verb — before refusing, try it as a
-            // PROGRAM. `vug.elf` at the prompt launches `VUG.ELF` off the FAT volume in the
-            // background, window open, prompt back. See `bare_exec` for the precedence rule (verbs
-            // always win, and this arm is reached only after every verb has been tried) and for the
-            // four distinct refusals it can give instead of a silent nothing.
-            #[cfg(target_arch = "x86_64")]
-            let handled = bare_exec(console, command);
-            #[cfg(not(target_arch = "x86_64"))]
-            let handled = false;
-            if !handled {
-                console.println("Unknown command. Type 'help' for assistance.");
-            }
+        // MIDDEN-M1: this arm is a DRIFT NET, and as of this arc it is unreachable — deliberately.
+        //
+        // It no longer means "unknown word": the core already ruled on that, and an unknown word
+        // comes back as `Plan::Say(TerminalError)` and never arrives here. What could arrive is a
+        // word midden's table calls a verb that THIS build does not compile the machinery for —
+        // and that set is empty today, because every `Avail` in `HOST_VERBS` mirrors the `#[cfg]`
+        // on its arm below exactly (the review checked all 78 spellings arm by arm). So the table
+        // and the match agree, and nothing reaches this arm.
+        //
+        // It is kept because that agreement is a HAND-MAINTAINED invariant across two files. Add a
+        // verb to `HOST_VERBS` and forget its arm, or `#[cfg]`-narrow an arm without narrowing its
+        // `Avail`, and the drift lands HERE — as a sentence naming the verb, on the panel — rather
+        // than as a word that silently does nothing. Deleting the arm would make that same drift a
+        // non-exhaustive-match compile error only if the match were over an enum, and it is over
+        // `&str`; there is no compiler check to fall back on. Hence: unreachable by construction,
+        // retained as the net for the construction breaking.
+        //
+        // (No example is given on purpose. Every plausible one is wrong: `uls`/`top` on x86 are
+        // `Avail::Aarch64`/an arm that prints its own aarch64-only message, and `vug`'s `Avail`
+        // tracks the v3d cfg. If a real reachable case ever appears, it is a BUG in the table.)
+        other => {
+            console.println(&alloc::format!(
+                "{}: not available on this build (the verb exists; this kernel does not carry it)",
+                other
+            ));
         }
     }
 
@@ -4331,18 +4478,31 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
 /// BARE-EXEC (GR20, x86): run a program by TYPING ITS NAME — `vug.elf` at the prompt starts
 /// `VUG.ELF` off the FAT volume, in a window, with the prompt back immediately.
 ///
-/// Called from the ONE place a shell can safely do this: `dispatch_command`'s final fallthrough arm,
-/// after every verb has been tried. **Precedence is therefore absolute and needs no tie-break rule —
-/// a known verb always wins.** A file called `LS` on the volume is unreachable this way and that is
-/// correct; `run ./LS` names it explicitly.
+/// MIDDEN-M1: called from `dispatch_command`'s `Plan::Exec` arm, which `midden_core` produces only
+/// after `is_verb` said no. **Precedence is therefore absolute and needs no tie-break rule — a known
+/// verb always wins.** A file called `LS` on the volume is unreachable this way and that is correct;
+/// `run ./LS` names it explicitly.
 ///
 /// # Resolution
 ///
-/// The SAME resolution `cat` uses, verbatim: `fs::fat::mount()` (on x86 always the USB mass-storage
-/// DATA volume) + `normalize_path` against the JD4 cwd + `resolve_path`. That walk matches components
-/// with `eq_ignore_ascii_case`, so **`vug.elf` finds `VUG.ELF`** with no special-casing — FAT short
-/// names are stored uppercase and the existing walk was already case-insensitive. `cd DOCS` then a
-/// bare name works for the same reason, since the cwd is applied first.
+/// `midden_core::resolve_exec` decides which SPELLING to load and hands it here as `name`; `typed`
+/// is what the user actually wrote, and every message quotes the one the reader recognises. The
+/// core tries the exact token first, then — and only for a bare leaf carrying no extension — the
+/// `.elf` suffix, so **`vug` finds `VUG.ELF`** with nobody typing the extension and without `ls`
+/// hiding it.
+///
+/// **On x86, `name` is NOT the on-disk spelling** and no caller may assume it is. `FatVolume`'s
+/// `is_file` walks FAT with `eq_ignore_ascii_case`, so the core's `vug.elf` probe matches the
+/// on-disk `VUG.ELF` and the core returns the string `"vug.elf"` — the resolver's upper-cased arm
+/// never fires here (it is there for the fixture's exact-match `NameList` and for a future
+/// case-sensitive `Volume`). The genuine on-disk 8.3 spelling appears one step below, as `canon`,
+/// which the re-resolve reads out of the directory entry; that is the name the serial refusal
+/// lines quote. Beneath that, this function performs the SAME resolution `cat` uses, verbatim:
+/// `fs::fat::mount()` (on x86 always the USB mass-storage DATA volume) + `normalize_path` against
+/// the JD4 cwd + `resolve_path`. That walk matches components with `eq_ignore_ascii_case`, so
+/// `vug.elf` already found `VUG.ELF` before the elision existed; the elision is what makes the
+/// *bare* `vug` work. `cd DOCS` then a bare name works for the same reason, since the cwd is
+/// applied first.
 ///
 /// # Why background, and how the operator stops it
 ///
@@ -4354,30 +4514,38 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
 ///
 /// # Silence vs. refusal — where the boundary is
 ///
-/// Returns `false` ONLY while the token has not been shown to name a file: no volume, no such path, a
-/// directory. Those fall through to the caller's "Unknown command", which is the right answer for a
-/// typo. The moment the token resolves to a real FILE this function OWNS the reply and every exit
-/// says why — not found is the caller's, but not-an-ELF, wrong-arch, too-big, unreadable and
-/// spawn-rejected are all named here. Nothing may end in silence.
+/// The core established that `name` is a real file before building `Plan::Exec`, so from here on
+/// this function OWNS the reply and every exit says why: not-an-ELF, wrong-arch, too-big,
+/// unreadable and spawn-rejected are all named. The one remaining `false` path is a volume that
+/// changed under us between the core's probe and this read (a card pulled mid-command) — an honest
+/// race, reported as such rather than as a typo. Nothing may end in silence.
 ///
 /// The loader is untouched: the bytes go to `spawn_user_image_bg` exactly as `bg` sends them, so the
 /// per-segment W^X mapping, the ring-3 window bound and the fault-kill net are the same ones CFU-2's
 /// write gate is built on. This adds a way to CALL the loader, never a way to relax it.
 #[cfg(target_arch = "x86_64")]
-fn bare_exec(console: &mut Console, token: &str) -> bool {
-    // --- quiet gate: is this token even a file? -------------------------------------------------
+fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
+    // --- re-resolve the core's answer over the live volume ---------------------------------------
+    // The core probed through this same mount a moment ago; re-resolving costs one walk and closes
+    // the window where the card changed underneath. A miss here is a RACE, not a typo, and says so.
     let Ok(fs) = crate::fs::fat::mount() else {
-        return false; // no volume — an unknown word is just an unknown word
+        console.println(&alloc::format!("{}: the volume went away before it could be started", typed));
+        serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: volume vanished after resolution ::", name, typed);
+        return false;
     };
-    let canon = match resolve_path(&fs, &normalize_path(&cwd_path(), token)) {
+    let canon = match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
         Ok(Resolved::Entry(de, canon)) if !de.is_dir => canon,
-        _ => return false, // no such path, or a directory — not a program name
+        _ => {
+            console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
+            serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
+            return false;
+        }
     };
-    // --- loud from here: the token named a real file, so we owe an outcome ----------------------
+    // --- loud from here: the name is a real file, so we owe an outcome --------------------------
     // Every refusal below is mirrored to serial as well as the panel. The panel line is what the
     // operator reads; the serial line is what a headless capture reads, and without it a bench log
     // could not tell "refused, and here is why" from "the keystroke never arrived".
-    let Some(bytes) = read_el0_image(console, token, token) else {
+    let Some(bytes) = read_el0_image(console, typed, name) else {
         // read_el0_image named the reason on the panel (size / arch / read error).
         serial_println!(":: BAREXEC: {} — REFUSED at the image read/pre-check (see the panel line) ::", canon);
         return true;
@@ -4388,11 +4556,11 @@ fn bare_exec(console: &mut Console, token: &str) -> bool {
         // here: a bare name launches ELF programs, nothing else. `run <path>` still reaches the flat
         // path for anyone who means it.
         console.println(&alloc::format!(
-            "{}: not an executable (no ELF64 magic) — a bare name runs ELF programs only", token
+            "{}: not an executable (no ELF64 magic) — a bare name runs ELF programs only", typed
         ));
         serial_println!(
             ":: BAREXEC: {} (typed '{}') — REFUSED: not an ELF64 image (no magic); {} bytes read ::",
-            canon, token, bytes.len()
+            canon, typed, bytes.len()
         );
         return true;
     }
@@ -4406,7 +4574,7 @@ fn bare_exec(console: &mut Console, token: &str) -> bool {
                 // and `kill` could never name. Same rule `bg` follows, same reason.
                 let why = crate::arch::syscall::bg_kill(pid, slot);
                 console.println(&alloc::format!(
-                    "{}: job table full — spawned pid {} was killed ({})", token, pid, why
+                    "{}: job table full — spawned pid {} was killed ({})", typed, pid, why
                 ));
                 serial_println!(
                     ":: BAREXEC: {} — job table full, pid={} killed ({}) ::", canon, pid, why
@@ -4418,12 +4586,12 @@ fn bare_exec(console: &mut Console, token: &str) -> bool {
             ));
             serial_println!(
                 ":: BAREXEC: {} (typed '{}') — loaded {} bytes, entry {:#x}, pid={} slot={} DETACHED, left RUNNING ::",
-                canon, token, n, entry, pid, slot
+                canon, typed, n, entry, pid, slot
             );
             true
         }
         Err(why) => {
-            console.println(&alloc::format!("{}: {}", token, why));
+            console.println(&alloc::format!("{}: {}", typed, why));
             serial_println!(":: BAREXEC: {} — rejected ({}) ::", canon, why);
             true
         }
