@@ -8641,6 +8641,40 @@ fn fill_rect_v(dst: &super::FrameBuffer, x: usize, y: isize, w: usize, h: usize,
     dst.fill_rect(x, 0, w, h - skip, color);
 }
 
+/// CERAMIC — `fill_rect_v` with the brushed-aluminium material on it: the same rectangle, but each
+/// row painted in `base` modulated by [`super::ceramic`] at that row's offset INSIDE THE WINDOW BOX.
+///
+/// `lby` is the box's top edge in `dst`'s own (signed) coordinates, so `y - lby` is the box-local
+/// row — which is what anchors the grain to the window rather than to the panel. A window therefore
+/// keeps its own machining under a drag, and a chunked stage's later bands continue the same grain
+/// because `lby` describes the whole box in every band (WC-M).
+///
+/// **This adds no per-pixel work.** `FrameBuffer::fill_rect` already walks a rectangle one row at a
+/// time, calling `fill_span4` per row; splitting the call into one per row does the identical span
+/// work and adds, per ROW, one table lookup, three channel multiplies and one `encode4`. See
+/// `ceramic`'s module header for why the material is per-row in the first place, and
+/// `ceramic::selftest` leg 6 for the measured cost of the multiply.
+fn fill_rect_ceramic(
+    dst: &super::FrameBuffer,
+    x: usize,
+    y: isize,
+    w: usize,
+    h: usize,
+    base: u32,
+    lby: isize,
+) {
+    if w == 0 {
+        return;
+    }
+    for j in 0..h {
+        let dy = y + j as isize;
+        // Rows above the box cannot occur (every chrome rect starts at or below `lby`), but the
+        // saturating form keeps the index total rather than relying on that.
+        let brow = (dy - lby).max(0) as usize;
+        fill_rect_v(dst, x, dy, w, 1, super::ceramic::shade(base, brow));
+    }
+}
+
 /// WC-H — paint the window's chrome and upscaled content into `dst`, whose origin sits at panel
 /// coordinate `(ox, oy)`. The two callers differ only in that origin: the direct path passes the
 /// front framebuffer with `(0, 0)`, the staged path passes the back layer with the outer box's
@@ -8717,6 +8751,15 @@ fn paint_window(
         // resolved per-row below. FOCUS-HL's argument (identical geometry, so focus never moves a
         // pixel) survives intact and is now stronger — focus does not change the frame's colour
         // either, so the four-rect subtraction is focus-independent by construction.
+        //
+        // CERAMIC — the face is no longer a FLAT `CHROME_FACE`: it is `CHROME_FACE` machined by
+        // `super::ceramic`, the brushed-aluminium material Peter named on 2026-08-09 ("texture to
+        // the window borders ... the 'ceramic' aluminum acer has on this zen"). The role is
+        // unchanged and un-replaced — the material MODULATES it by at most 2 % of a channel, so
+        // every argument above survives verbatim: the fill is still DENSE over the same pixel set
+        // (WC-H), still the four-rect subtraction (COMPOSITE-2), and still focus-independent, since
+        // the material is a function of the row and nothing else. The cost is per chrome ROW, not
+        // per pixel — see `fill_rect_ceramic`.
         let border = super::theme::CHROME_FACE;
         crispy_witness();
         if c2_cols > 0 && c2_rows > 0 {
@@ -8727,18 +8770,20 @@ fn paint_window(
             let box_x1 = lbx + bw;
             let box_y1 = lby + bh as isize;
             // Above the content (border + title band) and below it (bottom border + any clip gap).
-            fill_rect_v(dst, lbx, lby, bw, (cy0 - lby).max(0) as usize, border);
+            fill_rect_ceramic(dst, lbx, lby, bw, (cy0 - lby).max(0) as usize, border, lby);
             if box_y1 > cy1 {
-                fill_rect_v(dst, lbx, cy1, bw, (box_y1 - cy1) as usize, border);
+                fill_rect_ceramic(dst, lbx, cy1, bw, (box_y1 - cy1) as usize, border, lby);
             }
-            // Beside it, only over the content's own rows.
+            // Beside it, only over the content's own rows. The two side borders share a row, and
+            // therefore share a shade exactly — the material is constant across the grain, so the
+            // left and right frame edges of a window are machined from the same stroke.
             let mid_h = (cy1 - cy0).max(0) as usize;
-            fill_rect_v(dst, lbx, cy0, cx0.saturating_sub(lbx), mid_h, border);
+            fill_rect_ceramic(dst, lbx, cy0, cx0.saturating_sub(lbx), mid_h, border, lby);
             if box_x1 > cx1 {
-                fill_rect_v(dst, cx1, cy0, box_x1 - cx1, mid_h, border);
+                fill_rect_ceramic(dst, cx1, cy0, box_x1 - cx1, mid_h, border, lby);
             }
         } else {
-            fill_rect_v(dst, lbx, lby, bw, bh, border);
+            fill_rect_ceramic(dst, lbx, lby, bw, bh, border, lby);
         }
         // CRISPYWIRE — the title strip, ONE ROW AT A TIME, because Crispy's title bar is a
         // gradient with a gloss over it rather than a flat fill. `title_row_color` resolves both
@@ -8747,6 +8792,13 @@ fn paint_window(
         // is at most a few hundred pixels wide — immaterial beside the content upscale
         // COMPOSITE-2 measured at ~12 ms. Signed `y` per row, so a chunked stage's later bands drop
         // the rows above their own origin exactly as `fill_rect_v` always did.
+        //
+        // CERAMIC — and because the strip was ALREADY a row loop, the material is free here in the
+        // strictest sense: the same `TITLE_H` spans, each with one extra multiply on the colour the
+        // row was going to be filled with anyway. The gradient, the gloss and the focus distinction
+        // are `title_row_color`'s and are untouched; ceramic machines the result. The row index is
+        // `BORDER + j`, the strip row's offset inside the box, so the title's grain is continuous
+        // with the frame's around it rather than restarting at the strip.
         let strip_w = bw.saturating_sub(2 * BORDER);
         for j in 0..TITLE_H {
             fill_rect_v(
@@ -8755,7 +8807,7 @@ fn paint_window(
                 lby + (BORDER + j) as isize,
                 strip_w,
                 1,
-                title_row_color(j, TITLE_H, focused),
+                super::ceramic::shade(title_row_color(j, TITLE_H, focused), BORDER + j),
             );
         }
         // CRISPYWIRE — the frame's own structure, laid over the face fill at the box edges: a
@@ -8763,6 +8815,14 @@ fn paint_window(
         // light on the top/left and shadow on the bottom/right. The face fill above already put
         // `CHROME_FACE` everywhere between the bevel and the strip, so these are the only frame
         // pixels that are not face.
+        //
+        // CERAMIC, scoped honestly: the keyline and the two bevel hairlines are NOT machined, and
+        // that is a decision rather than an omission. They are `theme::BEVEL` = 1 px wide — a
+        // single-pixel edge has no room to show a grain, and modulating it would only add per-edge
+        // noise to the two lines whose entire job is to state where the frame's plane changes.
+        // Peter's directive names the borders as a *surface*; the surface is the face above, which
+        // is machined. If the taste gate wants the edges machined too, it is one `shade` call on
+        // each of `kl`, `bl` and `bs`.
         let bev = super::theme::BEVEL;
         let kl = super::theme::FRAME_LINE;
         // CRISPYWIRE-REVIEW — the keyline's THICKNESS is `theme::BEVEL` too, not a literal `1`.
@@ -8860,6 +8920,13 @@ fn paint_window(
                     super::theme::CONTROL_MID,
                     super::theme::CONTROL_ZOOM,
                 ];
+                //
+                // CERAMIC — the discs are machined too, at `ceramic::CONTROL_GAIN_Q16` (half), so
+                // the material reads as the same metal without competing with a 12-px silhouette.
+                // The shade is resolved ONCE PER ROW of the disc, outside the column loop, because
+                // the material is constant across a row: the per-pixel work inside `in_circle` is
+                // byte-for-byte what it was. The row index is the disc row's offset inside the box,
+                // so the discs sit in the same stroke as the strip under them.
                 for (n, &col) in roles.iter().enumerate() {
                     let bxn = cbx + n * (d + GAP);
                     let clx = bxn.saturating_sub(ox);
@@ -8868,9 +8935,14 @@ fn paint_window(
                         if dy < 0 {
                             continue;
                         }
+                        let shaded = super::ceramic::shade_gain(
+                            col,
+                            (dy - lby).max(0) as usize,
+                            super::ceramic::CONTROL_GAIN_Q16,
+                        );
                         for i in 0..d {
                             if in_circle(bxn + i, cby + j, bxn, cby, d) {
-                                dst.put_pixel(clx + i, dy as usize, col);
+                                dst.put_pixel(clx + i, dy as usize, shaded);
                             }
                         }
                     }

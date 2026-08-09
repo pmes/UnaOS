@@ -8602,3 +8602,168 @@ paper. The 4x4 corner is also structurally checkable: the laid phases at rows 0.
 
 Both lines are pinned in `scripts/specs/pi4-regression.spec`; the required-witness count goes
 **91 -> 93**, plus one `FORBID` on the FAIL verdict.
+
+## CERAMIC — brushed aluminium for the chrome, and where each material goes (2026-08-09)
+
+`video/ceramic.rs`. PAPER above put a material under the kernel's one content surface. CERAMIC is
+its counterpart on the other side of the glass, and it comes with the scope for both, from Peter's
+directive of 2026-08-09, verbatim:
+
+> *"the 'paper' is about having a subtle texture for the human experience and would like to add
+> texture to the window borders scrollbars buttons etc and have paper for text surfaces. the
+> 'ceramic' aluminum acer has on this zen is really nice and would be incredible if you could
+> emulate it then crispy would truly be an amalgamation of macos/apple"*
+
+**Ceramic on the chrome, paper on the text.**
+
+### DERIVED, and it says so
+
+The kit has no ceramic. `kits/crispy/theme.json` @ `us-crispy-modern` `0787ba9f` carries
+`content_surface.Paper` and nothing else; `libs/quartzite/src/surface.rs`'s `PaperAlgo` has no
+metal arm. Every constant in `ceramic.rs` is therefore **derived**, and each one's provenance line
+says what it was derived *from* — the directive, or the amplitude budget, or the pixel grid —
+rather than naming a json key that does not exist. This matters more than usual precisely because
+Peter authorised the material himself: the taste gate settles *whether*, the shared-source law
+still settles *how*, and the honest form of "how" for something with no upstream is a named table
+with a disclosed derivation, not scattered magic numbers with a fake citation.
+
+The one value that genuinely cannot be derived from anything — the lattice seed — is derived by a
+*stated rule* instead: it is FNV-1a 32 of the ASCII bytes `ceramic` (`0x75AE_10B7`), using the same
+FNV constants the module's checksum already uses at 64 bits. Anyone reading the line can reproduce
+the number, which "a seed I picked" would not permit.
+
+If a future kit adds a `Ceramic` block, this table is what it replaces, one constant at a time.
+
+### The model: a brushed lid is a PER-ROW material
+
+Brushed anodised aluminium has two things going on. A dense field of fine parallel striations left
+by the brush, which runs in one direction — across the lid, i.e. along `x` for a screen-aligned
+surface; and a broad luminance undulation from the sheet's curvature, which is what makes metal
+read as an object rather than as noise on a plane. To first order **both are functions of `y`
+alone**, so ceramic is a one-dimensional field over rows.
+
+That is not a shortcut taken for speed. It is the ideal limit of the anisotropy the material is
+defined by, and it happens to be free — see the cost section. It is also the file's one disclosed
+deviation, in `paper.rs` deviation 1's class: the real lid varies a little *along* the brush, this
+model's cross-grain variation is exactly zero, so two chrome pixels on the same row of the same
+window get byte-identical shades. The cost is that a very wide title bar shows no along-grain
+drift; the benefit is that a chrome span stays a flat span.
+
+| parameter | value | derived from |
+| --- | --- | --- |
+| `SEED` | `0x75AE_10B7` | FNV-1a 32 of `b"ceramic"` — a stated rule, not a pick |
+| `GRAIN_PITCH` | 2 px | the finest pitch that still admits a smoothed octave above the pixel grid |
+| `GRAIN_OCTAVES` | 2 | consequence of the pitch: octave 1 lands at exactly 1 px, the pixel limit |
+| `GRAIN_AMP_Q16` | 786 (0.012) | the larger share of paper's 0.02 budget — the striations are the subject |
+| `CURVE_AMP_Q16` | 524 (0.008) | the remainder; deliberately the smaller share |
+| `CONTROL_GAIN_Q16` | 32768 (½) | the directive's "lower amplitude so the discs stay legible" |
+| `TILE_H` | 128 rows | broad curve relative to a 34-px title bar; see the divisibility asserts |
+
+`GRAIN_AMP_Q16 + CURVE_AMP_Q16 = 1310/65536 = 0.01999` — paper's contrast budget exactly, and a
+const-assert holds it there. Persistence, lacunarity, the lattice hash, the Hermite fade, the
+wrapping value noise, the fBm and the four-term sine are all **`paper.rs`'s, reused rather than
+copied**, so there is one implementation of each in the kernel and paper's pinned fixture guards
+both users. `paper`'s tile hash is unchanged by this arc (`0x0df2b838251069dc`), which is the
+regression proof that the shared primitives were not perturbed.
+
+Seam-freedom pins the tile the way it pinned paper's: the row count must be a multiple of the grain
+pitch (the wrap is `TILE_H / GRAIN_PITCH` = 64 cells, doubling per octave), the curve is exactly one
+turn of the sine over the tile, and `65536 % TILE_H == 0` so the curve's phase step is an exact
+integer rather than a rounding accident. All three are const-asserted.
+
+### It modulates; it never replaces
+
+`ceramic::shade(role, row)` multiplies a packed `0x00RRGGBB` role by a Q16 factor inside `1 ± 0.02`.
+No colour is stored in `ceramic.rs`, so every chrome pixel is still the Crispy role it always was
+and a `theme.rs` change carries through for free. Two consequences are load-bearing and are
+asserted in the fixture: **black stays black** (a multiplicative modulation cannot invent ink on a
+glyph or lift a shadow), and **zero gain is the identity**, bit for bit.
+
+One honest residual: unlike paper — whose field is a zero-mean sine pair, so the flat fill it
+replaced is exactly the texture's mean — ceramic's grain is a value-noise fBm whose mean is only
+approximately centred. The chrome's average brightness therefore moves by a fraction of one `u8`
+step. Recorded rather than implied away.
+
+### Where each material actually goes
+
+| surface | material | gain |
+| --- | --- | --- |
+| window face / frame / borders (`CHROME_FACE`) | ceramic | full |
+| title strip (the gradient + gloss `title_row_color` resolves) | ceramic | full |
+| the three circular title controls | ceramic | half |
+| keyline + the two bevel hairlines | **none** — see below | — |
+| `instgui`'s content well (`CONTENT_FILL`) | paper | — |
+| every other window's content | neither — ring-3 pixels | — |
+
+**The keyline and bevels are deliberately unmachined.** They are `theme::BEVEL` = 1 px wide; a
+single-pixel edge has no room to show a grain, and modulating it would only add per-edge noise to
+the two lines whose entire job is to state where the frame's plane changes. The directive names the
+borders as a *surface*, and the surface is the face, which is machined. Reversing this is one
+`shade` call on each of `kl`, `bl` and `bs` if the taste gate wants it.
+
+**Two things Peter named that do not exist in the tree.** There is **no scrollbar** — `theme.rs`
+carries `SCROLL_TRACK`, `SCROLL_THUMB` and `SCROLLBAR_WIDTH`, but nothing draws a scrollbar; the two
+colour roles appear only in `instgui` as a selected-row highlight and a progress trough. And there
+is **no button chrome in the compositor** — `instgui::button` draws buttons inside a client surface,
+not chrome the window manager paints. Neither was invented to have something to texture.
+
+**The console window's text background was not touched**, on purpose: that path (`fbcon`'s routed
+console surface) is owned by a concurrent arc, and colliding with it would cost more than the
+texture is worth. It is the obvious next surface for paper.
+
+The grain is indexed by the row's offset **inside the window box**, not by its panel row, so a
+window carries its own machining under a drag — which is what makes it read as an object rather
+than as a hole cut in a textured screen. A chunked stage's later bands continue the same grain
+because the box's top edge (`lby`) describes the whole box in every band (WC-M).
+
+### Why this costs no pixels
+
+`FrameBuffer::fill_rect` already walks its rectangle **one row at a time**, calling `fill_span4`
+per row. A per-row material therefore adds no per-pixel work at all: `wm::fill_rect_ceramic` splits
+the chrome's `fill_rect` calls into one per row, and each does the identical `fill_span4` the single
+call would have done for that row anyway. What is added, **per chrome row**, is one table lookup,
+three channel multiplies and one `encode4`. The title strip was already a row loop, so there the
+material is free in the strictest sense — one extra multiply on a colour the row was going to be
+filled with regardless. The control discs resolve their shade once per disc *row*, outside the
+column loop, so the per-pixel work inside `in_circle` is byte-for-byte what it was.
+
+This is the shape the standing performance priority asks for — *"if chrome texturing measurably
+costs frames, make it a cheap lookup (precomputed per-row modulation) rather than per-pixel math at
+paint time"* — adopted from the start rather than retrofitted. The table is **512 bytes** of `.bss`
+(128 `u32`) against paper's 88 KiB, generated once behind a `spin::Once`.
+
+**Measured.** `ceramic::selftest` leg 6 times `shade` — the one operation the material adds — over
+`1 << 14` calls on the monotonic counter, and puts ticks-per-1024 on the wire. QEMU raspi4b,
+`CNTFRQ = 62.5 MHz` (16 ns/tick): `tk/1k = 1355` at 1920x1200 and `1820` at 640x480, i.e.
+**21–28 ns per call** under emulation. A 514x526 window box pays that on roughly 1080 rows per
+composite (two side borders of ~482 rows each, a ~44-row top band, a 5-row bottom, 34 strip rows and
+3x12 disc rows): **≈ 23-31 µs per window per composite, in QEMU**. Against COMPOSITE-2's measured
+~12 ms content upscale for the same box that is **~0.25 %**, and it is a pessimistic figure —
+emulated integer multiplies and call overhead are exactly what QEMU exaggerates.
+
+### The wire, and what it proves
+
+```
+[ceramic] derived=peter-2026-08-09 algo=brushed-1d grain_oct=2 pitch=2 grain_amp_q16=786 curve_amp_q16=524 ctrl_gain_q16=32768 seed=0x75ae10b7 rows=128 hash=0x2c525bfdb49df67d
+```
+
+One line at first generation, **not `witness`-gated**, on `paper`'s precedent (itself on
+`wm::crispy_witness`'s): the metal image is built without the `witness` feature, so a gated line is
+absent from the only artefact that matters. Integer-only on two little-endian arches, so QEMU and
+metal must print the same hash; a different one means a parameter drifted.
+
+`ceramic::selftest` is the stronger statement. It recomputes every row from scratch and asserts both
+determinism and the checksum pinned in the source; asserts the **amplitude budget on every row**
+(the 2 %-of-a-channel promise, checked rather than claimed in prose); asserts that `shade` is a
+modulation and not a painter (zero gain is the identity; black is black at every row and gain);
+asserts eight reference shades of `CHROME_FACE` byte for byte; and checks two **hand-derivable
+identities** — at an even row the grain's coarse octave sits exactly on a lattice point, so the
+wrapping value noise IS the lattice hash of that cell; and at row `TILE_H / 4` the curve's phase is
+exactly a quarter turn, so the shared sine returns exactly `65536`. Both can be re-derived on paper
+from the formulas in the file, so a coefficient typo cannot hide behind a checksum nobody can
+reproduce.
+
+Both lines are pinned in `scripts/specs/pi4-regression.spec`; the required-witness count goes
+**93 -> 95**, plus one `FORBID` on the FAIL verdict. Green at both gate geometries — `./arroyo
+kernel8-test 240` at default and at `UNAOS_FBW=1920 UNAOS_FBH=1200`, 95/95 each, with the same
+ceramic hash and the same unchanged paper hash in both captures.

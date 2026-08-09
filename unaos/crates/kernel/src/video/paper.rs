@@ -276,7 +276,7 @@ pub fn fill_rect(dst: &mut [u32], surf_w: usize, x: usize, y: usize, w: usize, h
 /// `surface.rs`'s `hash2`, VERBATIM: the lattice hash, a PCG-style final mix. Already pure
 /// integer in the kit, so the entropy source is shared exactly rather than approximated.
 #[inline]
-fn hash2(xi: i64, yi: i64, seed: u32) -> u32 {
+pub(super) fn hash2(xi: i64, yi: i64, seed: u32) -> u32 {
     let mut h = seed
         .wrapping_add((xi as u32).wrapping_mul(0x9E37_79B1))
         .wrapping_add((yi as u32).wrapping_mul(0x85EB_CA77));
@@ -290,13 +290,13 @@ fn hash2(xi: i64, yi: i64, seed: u32) -> u32 {
 
 /// The kit's `hash_unit` at Q16: `(h >> 8) / 2^24` in `f32` is `h >> 16` in Q16. Deviation 3.
 #[inline]
-fn hash_q16(xi: i64, yi: i64, seed: u32) -> i64 {
+pub(super) fn hash_q16(xi: i64, yi: i64, seed: u32) -> i64 {
     (hash2(xi, yi, seed) >> 16) as i64
 }
 
 /// The kit's `smooth(t) = t*t*(3 - 2t)` Hermite fade, at Q16. `t` in `[0, 65536)`.
 #[inline]
-fn smooth_q16(t: i64) -> i64 {
+pub(super) fn smooth_q16(t: i64) -> i64 {
     let t2 = (t * t) >> 16;
     (t2 * (3 * 65536 - 2 * t)) >> 16
 }
@@ -307,7 +307,7 @@ fn smooth_q16(t: i64) -> i64 {
 /// At an integer lattice point the fade is zero and the result is exactly
 /// `hash_q16(x % wx, y % wy, seed)` — the identity [`selftest`] checks by hand.
 #[inline]
-fn value_noise_q16(x: i64, y: i64, seed: u32, wx: i64, wy: i64) -> i64 {
+pub(super) fn value_noise_q16(x: i64, y: i64, seed: u32, wx: i64, wy: i64) -> i64 {
     let xi = x >> 16;
     let yi = y >> 16;
     let fx = smooth_q16(x & 0xFFFF);
@@ -329,7 +329,7 @@ fn value_noise_q16(x: i64, y: i64, seed: u32, wx: i64, wy: i64) -> i64 {
 /// The wrap period doubles with the coordinate at every octave, so all `ENV_OCTAVES` layers close
 /// on the same tile boundary.
 #[inline]
-fn fbm_q16(x: i64, y: i64, seed: u32, octaves: u32, wx: i64, wy: i64) -> i64 {
+pub(super) fn fbm_q16(x: i64, y: i64, seed: u32, octaves: u32, wx: i64, wy: i64) -> i64 {
     let mut sum = 0i64;
     let mut amp = 65536i64;
     let mut norm = 0i64;
@@ -360,7 +360,7 @@ const SIN_P7: i64 = -297; // -0.00468175413, nudged for an exact endpoint
 /// `sin(2*pi*turn)` at Q16, where `turn` is a phase in TURNS at Q16 (only the fractional part is
 /// read). Result in `[-65536, 65536]`.
 #[inline]
-fn sin_turn_q16(turn: i64) -> i64 {
+pub(super) fn sin_turn_q16(turn: i64) -> i64 {
     let mut t = turn & 0xFFFF;
     let neg = t >= 32768;
     if neg {
@@ -440,7 +440,7 @@ fn generate(px: &mut [u32; TILE_W * TILE_H]) {
 /// FNV-1a 64, `wcg::checksum`'s constants and byte order, over the tile's words as they sit in
 /// memory. Both arches are little-endian, so the same tile hashes the same on both — which is the
 /// whole point of printing it.
-fn fnv1a(px: &[u32]) -> u64 {
+pub(super) fn fnv1a(px: &[u32]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for &w in px.iter() {
         for k in 0..4 {

@@ -13764,6 +13764,13 @@ fn wcb_launcher(_demo_cpu: usize) {
     // (which emits the unconditional `[paper]` wire line naming the checksum the verdict asserts).
     #[cfg(feature = "witness")]
     crate::video::paper::selftest();
+    // CERAMIC: the brushed-chrome material's determinism fixture, beside paper's and for the same
+    // reasons — it mints no window, reads no panel, and its only side effect is generating the one
+    // 512-byte row table (which emits the unconditional `[ceramic]` wire line naming the checksum
+    // the verdict asserts). Its leg 6 also times `shade`, the one operation the material adds to a
+    // composite, so the cost of chrome texturing is a number in every capture.
+    #[cfg(feature = "witness")]
+    crate::video::ceramic::selftest();
 }
 
 // =============================================================================================
