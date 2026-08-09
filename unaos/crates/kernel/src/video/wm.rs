@@ -7885,7 +7885,17 @@ fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
 /// glyph was even asked for). The glyph term doubled with the caption's `TEXT_PX` scale, which is
 /// the other half of why the number moved.
 fn controls(r: &Window) -> Option<(usize, usize, usize)> {
-    if r.compat || r.owner_asid == 0 {
+    // CLOSEISO — kernel FURNITURE gets no control cluster, and `owner_asid == 0` is not the test
+    // that says so. CLICK-X86 gave the panel console a RESERVED owner (`KERNEL_OWNER_CONSOLE`,
+    // `0xffffff01`) rather than 0, so the old pair drew a fully live close disc on the console: a
+    // click on it routed `wc_close_click(0xffffff01)` and, before `close_owner` learned to refuse
+    // furniture, would have reaped the operator's only surface outright. `close_owner`'s refusal
+    // makes that click harmless NOW, but a control that cannot act must not be painted — an
+    // affordance that does nothing is the same lie as a witness that cannot fail. `is_kernel_owner`
+    // is the question actually being asked, and asking it here means every consumer of `controls`
+    // (the painter, `control_disc`, `control_hit`, and each of the three `*_hit` helpers) inherits
+    // the answer from one place instead of re-deriving it.
+    if r.compat || r.owner_asid == 0 || is_kernel_owner(r.owner_asid) {
         return None;
     }
     let (bx, by, bw, _bh) = outer_box(r);
