@@ -5681,19 +5681,75 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         // target. `close_box` already declines owner-0 rows, so the console has no close control to
         // reach and the shell cannot be killed by a click.
         if let Some((win, owner, _z)) = crate::video::wm::hit_test(x, y) {
-            if crate::video::wm::close_box_hit(win, x, y) {
-                // CLOSE — the press is CONSUMED (target DROP, so the release is dropped with it):
-                // the owner it would have been delivered to is being torn down.
-                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
-                let settle = wc_close_click(owner);
-                if CLOSE_LOG_COUNT_X86.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
-                    serial_println!(
-                        "[wm-act] close win={} owner={:#x} at ({},{}) -> settle={}",
-                        win, owner, x, y, settle
-                    );
+            // WMCTRL — **ONE question for the whole control cluster.** `control_hit` names WHICH of
+            // the three discs the press landed on, from the same `control_disc` accessor the painter
+            // lays them out with, so a control that is drawn is a control that can be pressed and
+            // vice versa. Before this only CLOSE was wired, its hit box was the cluster's left
+            // anchor (i.e. the LEFTMOST disc), and the other two fell through to the title-bar drag
+            // below — so on the metal a press aimed at minimise killed the process.
+            //
+            // All three arms CONSUME the press: a control is an instruction to the window system,
+            // never app input. Close and minimise take `CLICK_TARGET_DROP` because the window the
+            // release would be delivered to is going away or going under; zoom does too, for the
+            // simpler reason that a control press has no release semantics at all.
+            match crate::video::wm::control_hit(win, x, y) {
+                Some(crate::video::wm::Ctrl::Close) => {
+                    // CLOSE — the press is CONSUMED (target DROP, so the release is dropped with
+                    // it): the owner it would have been delivered to is being torn down.
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    let settle = wc_close_click(owner);
+                    if CLOSE_LOG_COUNT_X86.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
+                        serial_println!(
+                            "[wm-act] close win={} owner={:#x} at ({},{}) -> settle={}",
+                            win, owner, x, y, settle
+                        );
+                    }
+                    clickroute_witness(x, y, win, owner, cur, "close", 0);
+                    return true;
                 }
-                clickroute_witness(x, y, win, owner, cur, "close", 0);
-                return true;
+                Some(crate::video::wm::Ctrl::Minimise) => {
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    let settle = crate::video::wm::minimise(win);
+                    // The KEYBOARD follows the window off the panel. Without this the operator is
+                    // typing into something they can no longer see; with it the prompt comes back,
+                    // which is also the surface `<TAB>` — the way back to the parked window — is
+                    // reached from. `focus_changed(0)` is deliberately NOT called: that is the
+                    // SHELL arm, and it parks EVERY owner. Minimise is one window's gesture.
+                    if cur == owner {
+                        user_input_set_active(0);
+                    }
+                    if CLOSE_LOG_COUNT_X86.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
+                        serial_println!(
+                            "[wm-act] minimise win={} owner={:#x} at ({},{}) -> settle={}",
+                            win, owner, x, y, settle
+                        );
+                    }
+                    clickroute_witness(x, y, win, owner, cur, "minimise", 0);
+                    return true;
+                }
+                Some(crate::video::wm::Ctrl::Zoom) => {
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    // Raise and focus first, on the title-bar arm's own rule: pressing a control is
+                    // an interaction with the window, and a zoomed window that stayed behind another
+                    // one would be a maximise the operator cannot see the result of.
+                    if !crate::video::wm::is_kernel_owner(owner)
+                        && !owner_is_focus_exempt(owner)
+                        && owner != cur
+                    {
+                        user_input_set_active(owner);
+                    }
+                    crate::video::wm::focus_changed(owner);
+                    let settle = crate::video::wm::zoom(win);
+                    if CLOSE_LOG_COUNT_X86.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
+                        serial_println!(
+                            "[wm-act] zoom win={} owner={:#x} at ({},{}) -> settle={}",
+                            win, owner, x, y, settle
+                        );
+                    }
+                    clickroute_witness(x, y, win, owner, cur, "zoom", 0);
+                    return true;
+                }
+                None => {}
             }
             if crate::video::wm::chrome_hit(win, x, y) {
                 // TITLE BAR / BORDER — raise and focus through the SAME primitives the content arms
@@ -6152,8 +6208,11 @@ pub fn wmdirect_selftest() {
         wm::close(wo);
         return;
     };
-    // A title-strip point: one pixel inside the left border, mid-strip. The close box is at the RIGHT
-    // end of the strip, so the left end is unambiguously drag. A content point: inside the surface.
+    // A title-strip point: one pixel inside the left border, mid-strip. WMCTRL moved the control
+    // cluster to the LEFT end of the strip, so this point is re-argued rather than inherited: the
+    // cluster is inset `BORDER + GAP` from the outer box and this point is `BORDER + 1` in, i.e. a
+    // whole `GAP` short of the first disc, so it is still unambiguously drag. A content point:
+    // inside the surface.
     let tpx = (inf.x + 1) as i32;
     let tpy = (inf.y - wm::TITLE_H / 2 - wm::BORDER) as i32;
     let cpx = (inf.x + 1) as i32;
@@ -6281,6 +6340,108 @@ pub fn wmdirect_selftest() {
         None => false,
     };
 
+    // ---- WMCTRL legs ------------------------------------------------------------------------
+    //
+    // **The defect these exist to catch, stated so they can fail on it.** `controls` returns the
+    // CLUSTER's left anchor; `close_box` used to return it unchanged, so the CLOSE hit region was
+    // the LEFTMOST disc while the painter drew three. A press aimed at minimise killed a process on
+    // the metal. The three legs below assert that each disc answers for ITSELF and that neither of
+    // the other two is close — a leg that would have been RED on the shipping code, which is the
+    // only kind worth adding.
+    //
+    // `None` is a SKIP, on leg 5's rule: a strip too narrow for the cluster has no control to press,
+    // and a fixture that reported that as a failure would be reporting the geometry, not the wiring.
+    let disc_centre = |b: (usize, usize, usize)| ((b.0 + b.2 / 2) as i32, (b.1 + b.2 / 2) as i32);
+
+    // Leg 7 — GEOMETRY. The three discs are distinct, ordered left to right close/minimise/zoom, and
+    // `close_box_hit` accepts EXACTLY the close disc. The last three conjuncts are the metal bug.
+    let ctrlgeom_ok = match (
+        wm::control_disc_rect(w, wm::Ctrl::Close),
+        wm::control_disc_rect(w, wm::Ctrl::Minimise),
+        wm::control_disc_rect(w, wm::Ctrl::Zoom),
+    ) {
+        (Some(c), Some(m), Some(z)) => {
+            let (cx, cy) = disc_centre(c);
+            let (mx, my) = disc_centre(m);
+            let (zx, zy) = disc_centre(z);
+            Some(
+                c.0 < m.0
+                    && m.0 < z.0
+                    && wm::control_hit(w, cx, cy) == Some(wm::Ctrl::Close)
+                    && wm::control_hit(w, mx, my) == Some(wm::Ctrl::Minimise)
+                    && wm::control_hit(w, zx, zy) == Some(wm::Ctrl::Zoom)
+                    && wm::close_box_hit(w, cx, cy)
+                    && !wm::close_box_hit(w, mx, my)
+                    && !wm::close_box_hit(w, zx, zy),
+            )
+        }
+        _ => None,
+    };
+
+    // Leg 8 — ZOOM THROUGH THE ROUTER, both ways. Press the zoom disc: the press is consumed, the
+    // window is STILL ALIVE (the whole point — it must not route to close), and its placement
+    // changed. Press it again at its NEW position: the placement comes back to exactly what it was.
+    // The disc is re-read from `control_disc_rect` between presses because the window moved under
+    // it; re-deriving the point would test the fixture's arithmetic instead of the compositor's.
+    let zoom_ok = match (wm::info(w), wm::control_disc_rect(w, wm::Ctrl::Zoom)) {
+        (Some(g0), Some(b)) => {
+            let (zx, zy) = disc_centre(b);
+            user_input_set_active(OWNER_O);
+            wm::focus_changed(OWNER_O);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            let c1 = wc_click_route_at(Event::Button(1), zx, zy);
+            match (wm::info(w), wm::control_disc_rect(w, wm::Ctrl::Zoom)) {
+                (Some(g1), Some(b2)) => {
+                    let grew = (g1.x, g1.y, g1.scale) != (g0.x, g0.y, g0.scale);
+                    let (zx2, zy2) = disc_centre(b2);
+                    // Only press if the disc really is the topmost thing at that point — a zoomed
+                    // window can end up under the other probe row, and pressing through it would
+                    // test `wo`'s chrome, not this leg's.
+                    if wm::hit_test(zx2, zy2).map(|(id, _, _)| id) != Some(w) {
+                        Some(false)
+                    } else {
+                        CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+                        let c2 = wc_click_route_at(Event::Button(1), zx2, zy2);
+                        let back = wm::info(w)
+                            .map(|g2| (g2.x, g2.y, g2.scale) == (g0.x, g0.y, g0.scale))
+                            .unwrap_or(false);
+                        Some(c1 && c2 && grew && back)
+                    }
+                }
+                _ => Some(false),
+            }
+        }
+        _ => None,
+    };
+
+    // Leg 9 — MINIMISE THROUGH THE ROUTER, AND THE WAY BACK. Press the minimise disc: consumed, the
+    // window is STILL ALIVE (it must not route to close), and it is now BELOW the shell — which is
+    // what "parked" means on this system (`above_shell` is a strict `z > SHELL_Z`). Then `<TAB>`'s
+    // own primitive, `focus_changed(owner)`, must bring it back above the shell.
+    //
+    // **The restore half is not decoration.** A control that hides a window with no way back is
+    // worse than an inert one, and this is the assertion that the way back exists.
+    let minim_ok = match wm::control_disc_rect(w, wm::Ctrl::Minimise) {
+        Some(b) => {
+            let (mx, my) = disc_centre(b);
+            user_input_set_active(OWNER_D);
+            wm::focus_changed(OWNER_D);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            let consumed = wc_click_route_at(Event::Button(1), mx, my);
+            let alive = wm::info(w).is_some();
+            let parked = wm::info(w).map(|g| g.z <= wm::shell_z()).unwrap_or(false);
+            // The keyboard must have left with the window, or the operator is typing at something
+            // they cannot see.
+            let keys_left = user_input_active() == 0;
+            // THE WAY BACK — the same primitive `wc_focus_key` drives, on an owner the focus ring
+            // still contains (its filter has no z-order term).
+            wm::focus_changed(OWNER_D);
+            let restored = wm::info(w).map(|g| g.z > wm::shell_z()).unwrap_or(false);
+            Some(consumed && alive && parked && keys_left && restored)
+        }
+        None => None,
+    };
+
     // Leg 6 — a window closed mid-drag leaves no live drag. Run BEFORE the close leg because it
     // needs a row, and its own `wm::close` is the teardown it is asserting about.
     let dragdead_ok = match wm::info(w) {
@@ -6338,6 +6499,12 @@ pub fn wmdirect_selftest() {
         }
     };
 
+    // WMCTRL — a skip-or-bool leg renders as `true`/`false`/`skip`, exactly as `close` does.
+    let leg = |v: Option<bool>| match v {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "skip",
+    };
     let ok = partition_ok
         && grab_ok
         && route_ok
@@ -6345,9 +6512,12 @@ pub fn wmdirect_selftest() {
         && dragdead_ok
         && level_ok
         && tabcancel_ok
-        && close_ok.unwrap_or(true);
+        && close_ok.unwrap_or(true)
+        && ctrlgeom_ok.unwrap_or(true)
+        && zoom_ok.unwrap_or(true)
+        && minim_ok.unwrap_or(true);
     serial_println!(
-        "[wm-act] direct partition={} grab={} route={} content={} level={} tabcancel={} close={} dragdead={} from=({},{}) to=({},{}) -> {}",
+        "[wm-act] direct partition={} grab={} route={} content={} level={} tabcancel={} close={} dragdead={} ctrlgeom={} zoom={} minimise={} from=({},{}) to=({},{}) -> {}",
         partition_ok,
         grab_ok,
         route_ok,
@@ -6359,6 +6529,9 @@ pub fn wmdirect_selftest() {
             None => "skip",
         },
         dragdead_ok,
+        leg(ctrlgeom_ok),
+        leg(zoom_ok),
+        leg(minim_ok),
         before.0,
         before.1,
         after.map(|a| a.0).unwrap_or(0),

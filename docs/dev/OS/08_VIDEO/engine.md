@@ -8767,3 +8767,153 @@ Both lines are pinned in `scripts/specs/pi4-regression.spec`; the required-witne
 **93 -> 95**, plus one `FORBID` on the FAIL verdict. Green at both gate geometries — `./arroyo
 kernel8-test 240` at default and at `UNAOS_FBW=1920 UNAOS_FBH=1200`, 95/95 each, with the same
 ceramic hash and the same unchanged paper hash in both captures.
+
+## WMCTRL — the title-bar controls do what they look like (2026-08-09)
+
+Bench report, that morning, on metal: *"the minimize button killed stat and
+console!"*
+
+### The defect, and it was two defects
+
+`controls()` returns the control CLUSTER's left anchor. `close_box()` returned
+that anchor **unchanged**, and `close_box_hit` tests `in_circle` against it as a
+`CONTROL_BOX`-sided box — so the close control's hit region was the **leftmost
+disc**, while `paint_window` drew three discs at `anchor + n * (d + GAP)`. The
+capture is unambiguous: a press at panel x=2765 (the leftmost disc) routed
+`-> close` and killed the process, while a press at x=2791 (the middle disc)
+fell through to the title-bar drag arm, because minimise and zoom were **painted
+but not wired to anything at all**.
+
+Both halves are the same root cause: the painter and the router derived disc
+positions separately, and only the painter derived all three.
+
+### Per-disc geometry, single-sourced
+
+`Ctrl::{Close, Minimise, Zoom}` names the control; `control_disc(r, which)`
+returns that disc's box from the cluster anchor and the one pitch. The painter
+walks `CTRLS` and calls it; `control_hit` walks `CTRLS` and calls it;
+`close_box_hit` is now `control_hit(..) == Some(Ctrl::Close)`; the fixture reads
+`control_disc_rect`. There is no second copy of the arithmetic for a drawn
+control and a clickable control to disagree over — hit-testing follows drawing
+by construction, which is the CRISPYWIRE law this violated.
+
+### The cluster moved to the LEFT (Peter, 2026-08-09)
+
+*"well on mac the buttons are on the left, correct? ours are on the right so
+that's what they seem out of order."* The ORDER was already macOS's
+(close, minimise, zoom); the SIDE was not. On a right-aligned cluster the eye
+reads the outer disc as close, because every right-aligned window system it has
+met puts it there — so a correct order read as backwards, and the operator
+reached for the wrong disc. `controls()` now anchors at `bx + BORDER + GAP` and
+`paint_window` starts the caption at `BORDER + CTRL_RESERVE`; the reserve is
+unchanged in size and only changed side, so the caption's width budget is
+byte-identical. This **supersedes white-board A5** ("right-aligned, close
+leftmost, stands for now").
+
+### Red / yellow / green, in Crispy's register — and the provenance is stated
+
+White-board Q9, answered `b`: *"q9 b on a red yellow green top left of window."*
+Three new roles in `video/theme.rs` — `CTRL_CLOSE` `#C25F55`, `CTRL_MIN`
+`#C89C52`, `CTRL_ZOOM` `#5E9468` — muted clay red, ochre, sage. They are
+**DERIVED, not lifted**: `kits/crispy/` is not reachable from this repo
+(white-board Q4), so they carry no kit hash and are marked pending re-lift as
+`palette.ctrl_close` / `_min` / `_zoom`. macOS's own `#FF5F57 / #FEBC2E /
+#28C840` are deliberately NOT used — fully saturated is wrong against this kit's
+near-white chrome and its muted `ACCENT`. The kit's three blue `CONTROL_*` steps
+are KEPT in the table (no arc deletes a lifted role); nothing paints them now.
+
+Colour is not the only cue. Each disc carries a **punch-out glyph** — `×`, `−`,
+a frame — drawn in the title gradient's own top stop, i.e. the surface showing
+through the disc. That is shape, not palette: it invents nothing, and it is what
+modern macOS shows on hover. It is drawn unconditionally rather than on hover,
+because hover feedback costs a composite pass per pointer motion and
+**performance is the standing priority**.
+
+### Minimise is a POSITION, and it is reversible
+
+There is no minimised flag and none was added. A row with `z < SHELL_Z` is below
+the shell, is not composited (`above_shell`), and once every window its owner
+holds is down there `owner_hidden` is true — which is what `vugmin_publish` hands
+to `set_hidden`, which is what lets a parked vug stop presenting instead of
+starving the compositor. `wm::minimise(id)` drops the row to `z = 0`, erases the
+vacated box through `move_to_inner`'s five-step epilogue, and republishes the
+owner's bit. The router hands the keyboard back to the shell on the same press.
+
+**The way back is `<TAB>`.** `focus_ring` selects on
+`used && !compat && owner_asid != 0` — a test with no z-order term — so a parked
+window stays in the rotation, and `focus_changed(owner)` takes the RAISE arm,
+which gives it a fresh top-of-stack z and publishes `hidden=false` (the unhide
+wake edge). A dock is a separate arc; until it lands `<TAB>` is the interim
+route, and it is asserted on the wire (leg 9 below), not assumed.
+
+### Zoom remembers
+
+`Window::zoom_saved: Option<(x, y, scale)>` — per row, so several windows can be
+zoomed at once. A zoom changes only `scale`, `x` and `y`: `w`/`h`/`stride` are
+the app's surface and the RO info page publishes no position or scale field, so a
+zoom is invisible to the owner and needs no notification path. The maximised
+scale is the largest whose chrome-inclusive box fits the work area (panel minus
+`ui_status::chrome_h`, the same budget `place` lays out against), capped by
+`legibility_cap` — so zoom means "as large as this system will draw it", not
+"stretched to the glass". **Moving a zoomed window discards the memory**
+(`move_to_inner`, gated on `changed`): re-anchoring would make "restore" mean a
+position the operator has never seen.
+
+### Witness
+
+`[wm-act] minimise win= owner= at (x,y) -> settle=` and `[wm-act] zoom ... ->
+settle=`, mirroring the close line. Settles are total and every one is reachable:
+`norow`, `declined`, `already`, `parked`, `parked-visible`; `nofb`, `zoomed`,
+`restored`, `zoomed-nochange`, `restored-nochange`. The no-change tokens exist so
+a leg that presses zoom cannot be satisfied by a window that never moved.
+
+`wmdirect_selftest` grew from **8 legs to 11**:
+
+* **ctrlgeom** — the three discs are distinct, ordered `close < minimise < zoom`
+  left to right, each answers `control_hit` with ITSELF, and `close_box_hit`
+  accepts exactly one of them. The last three conjuncts are the metal bug.
+* **zoom** — press the zoom disc through `wc_click_route_at`: consumed, the
+  window is still ALIVE, its placement changed. Press it again at its NEW disc
+  position (re-read, not re-derived): the placement returns exactly.
+* **minimise** — press the minimise disc: consumed, still ALIVE, now below the
+  shell, and the keyboard left with it. Then `focus_changed(owner)` — `<TAB>`'s
+  own primitive — must bring it back above the shell.
+
+### Gate results (WMCTRL, 2026-08-09)
+
+```
+./arroyo check                                    x86_64 OK, aarch64 OK
+UNAOS_WC=1 ./arroyo check                         both arches OK, 12 cfg legs
+./arroyo kernel8-test 240                         MBENCH PASS 99/99, 0 forbidden
+UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 240
+                                                  MBENCH PASS 99/99, 0 forbidden
+UNAOS_WC=1 ./arroyo test                          [wm-act] direct ... -> PASS
+```
+
+```
+[wm-act] zoom win=1 owner=0x3 at (524,320) -> settle=zoomed
+[wm-act] zoom win=1 owner=0x3 at (450,346) -> settle=restored
+[wm-act] minimise win=1 owner=0x3 at (500,320) -> settle=parked
+[wm-act] direct partition=true grab=true route=true content=true level=true
+         tabcancel=true close=true dragdead=true ctrlgeom=true zoom=true
+         minimise=true ... -> PASS
+```
+
+### The legs can FAIL — proven, not asserted
+
+`Ctrl::Minimise::index()` forced from 1 to 0, so the minimise hit test resolves
+to the close disc — the shipping defect, reintroduced deliberately:
+
+```
+[wm-act] close win=1 owner=0x3 at (476,320) -> settle=noproc     <- the minimise disc, killing the row
+[wm-act] direct ... ctrlgeom=false zoom=true minimise=false ... -> FAIL
+```
+
+That is Peter's metal symptom reproduced inside the fixture. Restored, and the
+line returns to `PASS`.
+
+### Open — a taste question this arc did NOT take
+
+Nothing here answers whether the DESKTOP (not the window chrome) wants the same
+semantic treatment, and the three blue `CONTROL_*` roles now have no consumer.
+Both wait on the kit becoming reachable (white-board Q4) and on the re-lift.

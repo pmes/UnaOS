@@ -128,14 +128,17 @@ pub const TITLE_SCALE: usize = {
 pub const TITLE_CELL: usize = FONT_CELL * TITLE_SCALE;
 
 /// CRISPYWIRE-REVIEW — the strip width the three-disc control cluster RESERVES, measured from the
-/// inner edge of the right frame: the cluster itself (`3 * CONTROL_BOX` at a `GAP` pitch = two
-/// inter-disc gaps), plus the `GAP` that insets it from the frame, plus the `GAP` that separates it
-/// from the caption. `3*12 + 2*12 + 2*12 = 84` at the kit's numbers.
+/// inner edge of the LEFT frame (WMCTRL, Peter 2026-08-09: the cluster is left-aligned, macOS-side;
+/// it was measured from the right frame before, and the SIZE is identical either way): the cluster
+/// itself (`3 * CONTROL_BOX` at a `GAP` pitch = two inter-disc gaps), plus the `GAP` that insets it
+/// from the frame, plus the `GAP` that separates it from the caption. `3*12 + 2*12 + 2*12 = 84` at
+/// the kit's numbers.
 ///
-/// ONE definition, two consumers: [`controls`] subtracts it to decide whether a strip is wide enough
-/// to carry a cluster AND a caption glyph, and [`paint_window`] subtracts it from the caption's width
-/// budget. They were separate copies, and they disagreed by one `GAP` — the threshold admitted strips
-/// the painter then gave a zero-glyph budget.
+/// ONE definition, three consumers: [`controls`] subtracts it to decide whether a strip is wide
+/// enough to carry a cluster AND a caption glyph, and [`paint_window`] uses it BOTH as the caption's
+/// left inset (`BORDER + CTRL_RESERVE` is the first caption column) and in the caption's width
+/// budget. They were separate copies, and they disagreed by one `GAP` — the threshold admitted
+/// strips the painter then gave a zero-glyph budget.
 const CTRL_RESERVE: usize = 3 * super::theme::CONTROL_BOX + 4 * GAP;
 
 /// A window identifier. Ids are `1..=MAX_WINDOWS`; `0` is never a valid window and is the
@@ -221,6 +224,21 @@ struct Window {
     /// spec's REQUIRE while the app's real content is never checked at all. The verdict waits for
     /// content the app actually put there.
     presented: bool,
+    /// WMCTRL — the placement this window had BEFORE the zoom control maximised it, as
+    /// `(x, y, scale)`, or `None` when it is not zoomed. Per ROW rather than a single global slot,
+    /// so several windows can be zoomed at once and each remembers its own way back.
+    ///
+    /// `w`/`h` are deliberately NOT part of it: the surface dimensions are the app's and a zoom
+    /// never touches them. What a zoom changes is the compositor's integer upscale and the origin,
+    /// which is the whole of this module's say over how big a window looks.
+    ///
+    /// **Moving a zoomed window DISCARDS the memory** — see [`move_to_inner`], which clears it on
+    /// any move that actually relocates the box. The alternative (re-anchoring the saved rect to the
+    /// drag delta) was rejected because it makes "restore" mean a position the operator has never
+    /// seen: they dragged the window somewhere on purpose, and a later unzoom that teleported it
+    /// back to a pre-drag origin would be the surprise. After a drag the next zoom press simply
+    /// maximises from where the window now is.
+    zoom_saved: Option<(usize, usize, usize)>,
 }
 
 impl Window {
@@ -246,6 +264,7 @@ impl Window {
             compat: false,
             pinned: false,
             presented: false,
+            zoom_saved: None,
         }
     }
 
@@ -1078,6 +1097,13 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
                 r.pinned = true;
                 r.damage_all();
                 let changed = outer_box(r) != before;
+                // WMCTRL — a move that actually relocates the box DISCARDS the pre-zoom memory. See
+                // [`Window::zoom_saved`] for why discard rather than re-anchor. Gated on `changed`
+                // so a no-op move (a drag report that clamps to the same origin, of which there are
+                // many against a panel edge) cannot silently un-zoom a window nobody moved.
+                if changed {
+                    r.zoom_saved = None;
+                }
                 // WMDIRECT — report the CLAMPED origin, not the requested one. A drag against a
                 // panel edge asks for an origin the clamp refuses on every report; a caller that
                 // cached its own request would never see its cheap-skip hit and would take a table
@@ -7477,6 +7503,50 @@ fn in_circle(px: usize, py: usize, bx: usize, by: usize, d: usize) -> bool {
     dx * dx + dy * dy <= (d as i64) * (d as i64)
 }
 
+/// WMCTRL — is disc-local pixel `(i, j)` of a `d`-diameter control part of `which`'s SYMBOL?
+///
+/// ### ⛔ SHARED-SOURCE LAW — this adds a SHAPE, not a COLOUR
+/// The kit carries exactly three control fills (`control_close`/`_mid`/`_zoom`) and no fourth role
+/// for a symbol, and this arc may not invent one. So the symbol is not painted in an invented ink:
+/// it is a PUNCH-OUT, drawn in the title gradient's own top stop — the colour the disc is sitting
+/// on, one role over in the same table — which is the surface showing through the disc. Every pixel
+/// this function marks is a colour the strip already has.
+///
+/// The kit's own ramp comment names the semantics this follows (*"darkest (close) to lightest
+/// (zoom)"*, and `control_mid` is documented as *"middle (minimise)"*), so the destructive control
+/// keeps the darkest fill — which is also the highest contrast against the pale title strip
+/// (`0x3D5F92` on `0xEEEEF1`), i.e. the most visually distinct disc available goes to the one press
+/// an operator cannot undo. **A red/yellow/green semantic palette is a QUESTION FOR PETER** and this
+/// arc does not take it.
+///
+/// ### The shapes
+/// Disc-local `(i, j)` are turned into the SAME half-pixel offsets [`in_circle`] uses
+/// (`dx = 2i+1-d`), so the symbol is centred on the disc's true centre and not half a pixel off it.
+/// `g = d/2` bounds a centred square of side `d/2`; inside it:
+///
+/// * `Close` — the two diagonals, `|dx| == |dy|`: an X.
+/// * `Minimise` — the two centre rows, `|dy| == 1`: a horizontal bar.
+/// * `Zoom` — the square's outline: a frame, i.e. "fill the panel".
+///
+/// A disc too small to hold a legible symbol (`d < 8`) gets none rather than a smudge; the kit's
+/// `control_box` is 12, so that arm is a floor and not the shipping case.
+fn ctrl_glyph(which: Ctrl, i: usize, j: usize, d: usize) -> bool {
+    if d < 8 {
+        return false;
+    }
+    let g = (d / 2) as i64;
+    let dx = (2 * i + 1) as i64 - d as i64;
+    let dy = (2 * j + 1) as i64 - d as i64;
+    if dx.abs() > g || dy.abs() > g {
+        return false;
+    }
+    match which {
+        Ctrl::Close => dx.abs() == dy.abs(),
+        Ctrl::Minimise => dy.abs() == 1,
+        Ctrl::Zoom => dx.abs() >= g - 1 || dy.abs() >= g - 1,
+    }
+}
+
 /// CRISPYWIRE-REVIEW — is panel point `(px, py)` on one of `r`'s two ROUNDED TOP CORNERS, i.e. on a
 /// pixel [`paint_window`] fills with the DESKTOP rather than with chrome?
 ///
@@ -7570,7 +7640,8 @@ fn damaged_box(r: &Window, band: Option<(usize, usize)>) -> (usize, usize, usize
     (bx, y0, bw, y1 - y0)
 }
 
-/// CLOSE-BOX (P79, bench: "put a close button in the upper right of the windows to exit") — the
+/// CLOSE-BOX (P79, bench: "put a close button in the upper right of the windows to exit"; WMCTRL,
+/// Peter 2026-08-09: the cluster is now upper LEFT, macOS-side) — the
 /// close box's panel rect as `(x, y, side)`, or `None` for a row that has no close box.
 ///
 /// ### Geometry — one function, two consumers
@@ -7606,14 +7677,73 @@ fn damaged_box(r: &Window, band: Option<(usize, usize)>) -> (usize, usize, usize
 /// same pixels out of [`hit_test`], [`chrome_hit`] and [`title_bar_hit`], so a press on a corner
 /// reaches the shell exactly as the pixel shows. Drawn desktop, clicked desktop.
 fn close_box(r: &Window) -> Option<(usize, usize, usize)> {
-    controls(r).map(|(cx, cy, d)| (cx, cy, d))
+    control_disc(r, Ctrl::Close)
+}
+
+/// WMCTRL — **which of the three title-bar controls**, in the order the cluster is laid out left to
+/// right. The Mac order (white-board A2, *"whatever mac standard is"*): close, minimise, zoom.
+///
+/// ### Why this type exists — the defect it closes
+/// [`controls`] returns the CLUSTER's left anchor. [`close_box`] used to return that anchor
+/// UNCHANGED, and `close_box_hit` tests [`in_circle`] against it as a `d`-sided box — so the close
+/// control's HIT REGION was the LEFTMOST disc, while the painter drew three discs at the same pitch
+/// and only the operator knew which was which. On the metal (Peter, Boot minimise-kill) a press at
+/// panel x=2765 — the leftmost disc, the one an operator reaches for expecting *minimise* on a
+/// then right-aligned cluster — routed `-> close` and killed the process, while the MIDDLE disc at
+/// x=2791 fell through to the title-bar drag because nothing was wired to it at all.
+///
+/// The anchor is no longer a control. Every consumer names the control it means and gets that disc's
+/// box from ONE function, so a painter/hit-test divergence is not expressible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ctrl {
+    /// Destructive: closes the window and tears its owner down. Leftmost.
+    Close,
+    /// Parks the window below the shell — reversible with `<TAB>`. Middle.
+    Minimise,
+    /// Maximise/restore, with the pre-zoom placement remembered. Rightmost.
+    Zoom,
+}
+
+impl Ctrl {
+    /// The control's position in the cluster, 0 = leftmost.
+    const fn index(self) -> usize {
+        match self {
+            Ctrl::Close => 0,
+            Ctrl::Minimise => 1,
+            Ctrl::Zoom => 2,
+        }
+    }
+
+    /// The witness/`[wm-act]` name of this control.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Ctrl::Close => "close",
+            Ctrl::Minimise => "minimise",
+            Ctrl::Zoom => "zoom",
+        }
+    }
+}
+
+/// WMCTRL — the cluster, in paint order and in hit order. ONE list; the painter walks it and
+/// [`control_hit`] walks it, so a control that is drawn is a control that can be pressed.
+const CTRLS: [Ctrl; 3] = [Ctrl::Close, Ctrl::Minimise, Ctrl::Zoom];
+
+/// WMCTRL — **the bounding box `(x, y, diameter)` of ONE control disc**, or `None` for a row
+/// [`controls`] declines. The single source of per-disc geometry: disc `i` sits at
+/// `anchor + i * (CONTROL_BOX + GAP)`, which is the same pitch [`controls`] sums into `cluster`.
+///
+/// The painter calls this, [`control_hit`] calls this, and the fixture calls
+/// [`control_disc_rect`] which calls this. There is deliberately no second copy of the pitch.
+fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
+    controls(r).map(|(cbx, cy, d)| (cbx + which.index() * (d + GAP), cy, d))
 }
 
 /// CRISPYWIRE — the three circular title-bar controls' layout: the CLOSE circle's bounding box
 /// `(x, y, diameter)`. The middle and zoom circles follow it at a [`GAP`] pitch, so the cluster is
 /// `close`, `mid`, `zoom` left to right — the order the kit's own ramp is described in (darkest to
-/// lightest). The cluster is right-aligned in the strip, inset by one `GAP` from the frame, which
-/// keeps the close control in the window's upper right where CLOSE-BOX (P79) put it.
+/// lightest — superseded by the SEMANTIC red/yellow/green set, see `theme::CTRL_CLOSE`). The
+/// cluster is LEFT-aligned in the strip, inset by one `GAP` from the frame, which puts the close
+/// control in the window's upper left, where macOS puts it (Peter, 2026-08-09).
 ///
 /// Every number here is a metric: [`BORDER`] is `theme::FRAME`, [`GAP`] is `theme::GAP`, the
 /// diameter is `theme::CONTROL_BOX`, and the vertical centring is against [`TITLE_H`] =
@@ -7642,16 +7772,26 @@ fn controls(r: &Window) -> Option<(usize, usize, usize)> {
     }
     let (bx, by, bw, _bh) = outer_box(r);
     let d = super::theme::CONTROL_BOX;
-    // Cluster: three discs at a `GAP` pitch, one `GAP` clear of the right frame, and enough strip
+    // Cluster: three discs at a `GAP` pitch, one `GAP` clear of the LEFT frame, and enough strip
     // left over for one glyph of caption plus its own `GAP`. Anything narrower declines.
-    let cluster = 3 * d + 2 * GAP;
+    //
+    // ### WMCTRL — the cluster is LEFT-aligned (Peter, 2026-08-09)
+    // *"well on mac the buttons are on the left, correct? ours are on the right so that's what they
+    // seem out of order."* That is the whole explanation for why a correct macOS ORDER
+    // (close, minimise, zoom) read as backwards: on a RIGHT-aligned cluster the eye reads the outer
+    // disc as close, because every right-aligned window system it has ever met puts it there. The
+    // order was never the problem — the side was. This supersedes the white-board A5 deferral
+    // ("right-aligned, close leftmost, stands for now").
+    //
+    // The reserve is unchanged in SIZE and only changes SIDE: `CTRL_RESERVE` is still the strip the
+    // cluster costs the caption, and the caption is still one `GAP` clear of the far frame. See
+    // [`CTRL_RESERVE`] and `paint_window`, which subtract exactly this.
     if bw < 2 * BORDER + GAP + CTRL_RESERVE + TITLE_CELL {
         return None;
     }
-    let right = bx + bw - BORDER - GAP;
     // Vertically centred in the strip; `TITLE_H > CONTROL_BOX` is a const-assert in `theme.rs`.
     let cy = by + BORDER + (TITLE_H - d) / 2;
-    Some((right - cluster, cy, d))
+    Some((bx + BORDER + GAP, cy, d))
 }
 
 /// CLOSE-BOX — does panel point `(x, y)` land in window `id`'s close box? The router's second
@@ -7664,15 +7804,7 @@ fn controls(r: &Window) -> Option<(usize, usize, usize)> {
 /// gradient and not control: the hit region and the drawn region would have disagreed by ~21 % of
 /// the box's area, in exactly the pixels a user can see are not the button.
 pub fn close_box_hit(id: WinId, x: i32, y: i32) -> bool {
-    if x < 0 || y < 0 {
-        return false;
-    }
-    let (px, py) = (x as usize, y as usize);
-    let t = table();
-    match row(&t, id).and_then(close_box) {
-        Some((cx, cy, d)) => in_circle(px, py, cx, cy, d),
-        None => false,
-    }
+    control_hit(id, x, y) == Some(Ctrl::Close)
 }
 
 /// CRISPYWIRE — the CLOSE control's bounding box `(x, y, diameter)` in panel pixels, or `None` for
@@ -7681,8 +7813,246 @@ pub fn close_box_hit(id: WinId, x: i32, y: i32) -> bool {
 /// selftest kept its own copy of that arithmetic, which was correct only for the square box WC-A
 /// invented and would have quietly reported a SKIP against a disc.
 pub fn close_box_rect(id: WinId) -> Option<(usize, usize, usize)> {
+    control_disc_rect(id, Ctrl::Close)
+}
+
+/// WMCTRL — the bounding box `(x, y, diameter)` of control `which` on window `id`, or `None` for a
+/// dead id or a row with no control cluster. Public for the same reason [`close_box_rect`] is: a
+/// fixture must PRESS the disc the compositor actually drew, never a re-derivation of it.
+pub fn control_disc_rect(id: WinId, which: Ctrl) -> Option<(usize, usize, usize)> {
     let t = table();
-    row(&t, id).and_then(close_box)
+    row(&t, id).and_then(|r| control_disc(r, which))
+}
+
+/// WMCTRL — **which control, if any, does panel point `(x, y)` land on?** The router's second
+/// question, asked once: one table lock, one walk of [`CTRLS`], [`in_circle`] per disc. The discs
+/// are disjoint by construction (`GAP > 0` between boxes of side `d`), so at most one can answer.
+///
+/// This is the replacement for asking three separate predicates in sequence — three lock
+/// acquisitions where the press is one event, and three chances for the arms to fall out of the
+/// order the painter draws them in.
+pub fn control_hit(id: WinId, x: i32, y: i32) -> Option<Ctrl> {
+    if x < 0 || y < 0 {
+        return None;
+    }
+    let (px, py) = (x as usize, y as usize);
+    let t = table();
+    let r = row(&t, id)?;
+    CTRLS.iter().copied().find(|&c| {
+        matches!(control_disc(r, c), Some((cx, cy, d)) if in_circle(px, py, cx, cy, d))
+    })
+}
+
+/// WMCTRL — does `(x, y)` land on window `id`'s MINIMISE control? [`control_hit`] narrowed; kept as
+/// a named predicate so a fixture can assert one disc without matching on the enum.
+pub fn minimise_hit(id: WinId, x: i32, y: i32) -> bool {
+    control_hit(id, x, y) == Some(Ctrl::Minimise)
+}
+
+/// WMCTRL — does `(x, y)` land on window `id`'s ZOOM control? See [`minimise_hit`].
+pub fn zoom_hit(id: WinId, x: i32, y: i32) -> bool {
+    control_hit(id, x, y) == Some(Ctrl::Zoom)
+}
+
+/// WMCTRL — **MINIMISE `id`: park it below the shell.** Returns the outcome token the router prints
+/// on its `[wm-act]` line; every value is reachable and the function is total.
+///
+/// ### What "minimise" IS on this system
+/// There is no separate minimised flag and none is added. Visibility here is a POSITION: a row with
+/// `z < SHELL_Z` is below the shell, is not composited ([`above_shell`]), and — once every window
+/// its owner holds is down there — makes [`owner_hidden`] true, which is what [`vugmin_publish`]
+/// hands to the syscall layer's `set_hidden`, which is what lets a parked vug stop presenting
+/// instead of starving the compositor. So the whole of minimise is: drop the row to the bottom of
+/// the stack, erase the box it vacated, and republish the owner's hidden bit.
+///
+/// ### ⛔ IT IS REVERSIBLE, AND THAT IS THE PRECONDITION FOR WIRING IT AT ALL
+/// A control that hides a window with no way back is worse than an inert one. The way back is
+/// `<TAB>`: `focus_ring` selects on `used && !compat && owner_asid != 0` — a test with NO z-order
+/// term — so a parked window stays in the focus rotation, and `wc_focus_key` -> `focus_changed(owner)`
+/// takes the RAISE arm, which gives the row a fresh top-of-stack `z` and publishes `hidden=false`
+/// (the unhide wake edge VUGPAUSE-2 delivers). The window comes back where it was, running.
+/// Clicking its owner's remaining visible window restores it the same way, through the same primitive.
+///
+/// There is no dock or taskbar yet, so `<TAB>` is the only route back; that is a UI gap, not a
+/// one-way trip, and it is the same route that already un-parks everything the shell arm hides.
+///
+/// ### Outcomes
+/// * `norow` — no live window of that id.
+/// * `declined` — a compat row or kernel furniture (owner 0). Neither has a control cluster to press
+///   in the first place ([`controls`] declines both), so this is a belt-and-braces arm.
+/// * `already` — the row is already below the shell; nothing moved and nothing was published.
+/// * `parked` — down, and its owner is now hidden (every window it holds is below the shell).
+/// * `parked-visible` — down, but the owner still has another window above the shell, so it keeps
+///   rendering. Not an error: minimise is a WINDOW gesture and hiding is an OWNER property.
+pub fn minimise(id: WinId) -> &'static str {
+    use core::sync::atomic::Ordering;
+    // WEDGE-1r2 `<D1>`/`<d1>` — a barrier-raising path begins, ahead of the `TABLE` acquisition.
+    // Same token, same reason, as `move_to`/`close`.
+    crate::wedge2::mark_composite("<D1>", "<d1>");
+    let shell = SHELL_Z.load(Ordering::Acquire);
+    let mut t = table();
+    let (owner, vacated) = match row_mut(&mut t, id) {
+        None => return "norow",
+        Some(r) => {
+            if r.compat || r.owner_asid == 0 {
+                return "declined";
+            }
+            if !above_shell(r, shell) {
+                return "already";
+            }
+            let b = outer_box(r);
+            // The BOTTOM of the stack. Fresh z's are allocated from `next_z` upward and are always
+            // >= 1, and `SHELL_Z` is drawn from the same counter, so 0 is below every live window
+            // AND below the shell however many focus changes have happened — including the boot
+            // state where the shell has never been focused and `SHELL_Z` is still 0, since
+            // `above_shell` is a STRICT `r.z > shell`.
+            r.z = 0;
+            // So a later raise repaints from the source surface rather than trusting whatever
+            // survived on the panel — the same reason the shell arm of `focus_changed` damages.
+            r.damage_all();
+            (r.owner_asid, b)
+        }
+    };
+    let hid = owner_hidden(&t, owner, shell);
+    drop(t);
+    // VUGMIN-B — outside the guard, on this module's standing convention for this seam.
+    vugmin_publish(owner, hid);
+    // The vacate epilogue, identical to `move_to_inner`'s and load-bearing for the same reasons:
+    // barrier first so an in-flight blit of the old geometry cannot land after the erase, then
+    // desktop colour, then re-damage the neighbours the erase reached, then force the desktop's next
+    // present to re-derive (MOVE-VACATE), then close the sprite bracket before compositing.
+    let barrier = DrainBarrier::drain();
+    erase(&[vacated]);
+    damage_intersecting(vacated.0, vacated.1, vacated.2, vacated.3);
+    super::screen::request_full_present();
+    drop(barrier);
+    super::cursor::repaint();
+    composite();
+    if hid { "parked" } else { "parked-visible" }
+}
+
+/// WMCTRL — the maximised integer upscale for a `w x h` surface on a `pw x usable_h` work area:
+/// the largest factor whose CHROME-INCLUSIVE outer box still fits, capped by [`legibility_cap`],
+/// never 0.
+///
+/// The cap is kept deliberately. It is the WC-SCALE invariant (`ui::SCALE_MAX` against the panel's
+/// own metrics) and it reads `ph`, not `usable_h`, because it is a function of panel DENSITY rather
+/// than of layout area — the same split [`place_scale`] makes. A consequence worth naming: on a very
+/// large panel a small surface will NOT fill the work area, because filling it would mean a
+/// nearest-neighbour blow-up past what the kit calls legible. Zoom means "as large as this system is
+/// willing to draw it", not "stretched to the glass".
+fn zoom_scale(pw: usize, usable_h: usize, ph: usize, w: usize, h: usize) -> usize {
+    let sw = pw.saturating_sub(2 * BORDER) / w.max(1);
+    let sh = usable_h.saturating_sub(TITLE_H + 2 * BORDER) / h.max(1);
+    sw.min(sh).min(legibility_cap(ph)).max(1)
+}
+
+/// WMCTRL — **ZOOM `id`: maximise to the work area, or restore the placement it had before.**
+/// Returns the outcome token the router prints on its `[wm-act]` line.
+///
+/// ### The work area, and what a zoom is allowed to change
+/// The work area is the panel minus `ui_status::chrome_h` — the CPU pulse band and the status line —
+/// which is exactly the budget [`place`] already lays out against, read here rather than re-derived
+/// into a second copy. There is no top/left/right reservation on this system, so the rest of the
+/// panel is fair game.
+///
+/// A zoom changes only `scale`, `x` and `y`. It does NOT touch `w`/`h`/`stride`/`surf_len`: those
+/// describe the app's own surface, the app allocated them, and the kernel resizing them under a
+/// running program would be a read past a mapping. Nothing has to be told either — the RO info page
+/// publishes `w`, `h`, stride and size and carries no position or scale field, so a zoom is
+/// invisible to the owner by construction and needs no notification path.
+///
+/// ### Restore
+/// The pre-zoom `(x, y, scale)` lives on the ROW ([`Window::zoom_saved`]), so a second press puts
+/// the window back exactly where it was; a move in between discards the memory and the next press
+/// maximises afresh. See that field for why discard beats re-anchor.
+///
+/// ### Outcomes
+/// * `nofb` — no ready framebuffer; nothing to maximise against.
+/// * `norow` / `declined` — as [`minimise`].
+/// * `zoomed` — maximised, the previous placement remembered.
+/// * `restored` — put back, the memory consumed.
+/// * `zoomed-nochange` / `restored-nochange` — the row did not actually move (already exactly at the
+///   maximised placement, or restored to the placement it already had). Reported distinctly so a
+///   fixture leg that asserts `zoomed` cannot be satisfied by a window that never moved. The memory
+///   transition still happened, so the next press does the opposite thing.
+pub fn zoom(id: WinId) -> &'static str {
+    crate::wedge2::mark_composite("<D1>", "<d1>");
+    // Panel geometry BEFORE the table lock, and the `WRITER` guard dropped inside this statement:
+    // the two locks are never nested here, exactly as `place`/`move_to_inner` keep them unnested.
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        return "nofb";
+    }
+    let info = fb.info();
+    let (pw, ph) = (info.width, info.height);
+    let usable_h = ph
+        .saturating_sub(crate::ui_status::chrome_h(ph))
+        .max(1);
+
+    let mut t = table();
+    let (vacated, outcome) = match row_mut(&mut t, id) {
+        None => return "norow",
+        Some(r) => {
+            if r.compat || r.owner_asid == 0 {
+                return "declined";
+            }
+            let before = outer_box(r);
+            let out = match r.zoom_saved.take() {
+                Some((sx, sy, ss)) => {
+                    r.x = sx;
+                    r.y = sy;
+                    r.scale = ss;
+                    "restored"
+                }
+                None => {
+                    let s = zoom_scale(pw, usable_h, ph, r.w, r.h);
+                    r.zoom_saved = Some((r.x, r.y, r.scale));
+                    r.scale = s;
+                    let ow = r.w.saturating_mul(s).saturating_add(2 * BORDER);
+                    let oh = r
+                        .h
+                        .saturating_mul(s)
+                        .saturating_add(TITLE_H + 2 * BORDER);
+                    // Centre the OUTER box in the work area, then step in to the content origin —
+                    // the coordinate the row actually stores. `saturating_sub` handles a surface
+                    // whose chrome-inclusive box is larger than the work area (possible only when
+                    // `zoom_scale` already floored to 1): it pins to the top-left, which is where
+                    // `move_to`'s clamp would put it anyway.
+                    r.x = pw.saturating_sub(ow) / 2 + BORDER;
+                    r.y = usable_h.saturating_sub(oh) / 2 + TITLE_H + BORDER;
+                    // The tiler must leave it alone, exactly as an explicit `move_to` pins it.
+                    r.pinned = true;
+                    "zoomed"
+                }
+            };
+            r.damage_all();
+            let changed = outer_box(r) != before;
+            // A no-change outcome is reported as such rather than folded into the success token: a
+            // leg that presses zoom and reads `zoomed` off a row that did not move would be a leg
+            // that cannot fail.
+            let tok = match (changed, out) {
+                (true, o) => o,
+                (false, "restored") => "restored-nochange",
+                (false, _) => "zoomed-nochange",
+            };
+            (if changed { Some(before) } else { None }, tok)
+        }
+    };
+    drop(t);
+    if let Some(b) = vacated {
+        // The same five-step vacate `move_to_inner` performs, and for the same five reasons. A zoom
+        // resizes the outer box under a fixed-ish origin, so a RESTORE shrinks it and abandons a
+        // ring of old frame that nothing else in this module repaints.
+        let barrier = DrainBarrier::drain();
+        erase(&[b]);
+        damage_intersecting(b.0, b.1, b.2, b.3);
+        super::screen::request_full_present();
+        drop(barrier);
+        super::cursor::repaint();
+        composite();
+    }
+    outcome
 }
 
 // ---- WMDIRECT: chrome geometry as a ROUTING question -------------------------------------------
@@ -8919,13 +9289,16 @@ fn paint_window(
         // drawn inside them: the kit gives the controls a fill and no symbol, and an invented X
         // would be an invented colour.
         let ctrl_w = match controls(r) {
-            Some((cbx, cby, d)) => {
-                let cly = cby as isize - oy as isize;
-                let roles = [
-                    super::theme::CONTROL_CLOSE,
-                    super::theme::CONTROL_MID,
-                    super::theme::CONTROL_ZOOM,
-                ];
+            Some(_) => {
+                // WMCTRL — the glyph ink is a PUNCH-OUT of the strip the disc sits on: the title
+                // gradient's own top stop, shaded by the same `ceramic` gain as the disc, so the
+                // symbol reads as the surface showing through rather than as a fourth colour. It
+                // invents nothing — see the SHARED-SOURCE note above `ctrl_glyph`.
+                let punch = if focused {
+                    super::theme::TITLE_ACTIVE_TOP
+                } else {
+                    super::theme::TITLE_INACTIVE_TOP
+                };
                 //
                 // CERAMIC — the discs are machined too, at `ceramic::CONTROL_GAIN_Q16` (half), so
                 // the material reads as the same metal without competing with a 12-px silhouette.
@@ -8933,8 +9306,26 @@ fn paint_window(
                 // the material is constant across a row: the per-pixel work inside `in_circle` is
                 // byte-for-byte what it was. The row index is the disc row's offset inside the box,
                 // so the discs sit in the same stroke as the strip under them.
-                for (n, &col) in roles.iter().enumerate() {
-                    let bxn = cbx + n * (d + GAP);
+                //
+                // WMCTRL — the position of each disc comes from `control_disc`, THE SAME ACCESSOR
+                // `control_hit` tests, walked over THE SAME `CTRLS` list. The painter used to
+                // re-derive `cbx + n * (d + GAP)` from the cluster anchor while the hit test read
+                // the anchor as if it were the close disc; that divergence is what killed a process
+                // under a press aimed at minimise, and it is no longer expressible.
+                for which in CTRLS {
+                    let Some((bxn, cby, d)) = control_disc(r, which) else {
+                        continue;
+                    };
+                    // WMCTRL — the SEMANTIC roles (Peter, 2026-08-09, white board Q9b): red,
+                    // yellow, green, in Crispy's muted register. See `theme::CTRL_CLOSE` for the
+                    // provenance and for why the kit's three blue steps are kept but no longer
+                    // painted.
+                    let col = match which {
+                        Ctrl::Close => super::theme::CTRL_CLOSE,
+                        Ctrl::Minimise => super::theme::CTRL_MIN,
+                        Ctrl::Zoom => super::theme::CTRL_ZOOM,
+                    };
+                    let cly = cby as isize - oy as isize;
                     let clx = bxn.saturating_sub(ox);
                     for j in 0..d {
                         let dy = cly + j as isize;
@@ -8946,10 +9337,17 @@ fn paint_window(
                             (dy - lby).max(0) as usize,
                             super::ceramic::CONTROL_GAIN_Q16,
                         );
+                        let ink = super::ceramic::shade_gain(
+                            punch,
+                            (dy - lby).max(0) as usize,
+                            super::ceramic::CONTROL_GAIN_Q16,
+                        );
                         for i in 0..d {
-                            if in_circle(bxn + i, cby + j, bxn, cby, d) {
-                                dst.put_pixel(clx + i, dy as usize, shaded);
+                            if !in_circle(bxn + i, cby + j, bxn, cby, d) {
+                                continue;
                             }
+                            let px = if ctrl_glyph(which, i, j, d) { ink } else { shaded };
+                            dst.put_pixel(clx + i, dy as usize, px);
                         }
                     }
                 }
@@ -8970,10 +9368,16 @@ fn paint_window(
         // `TITLE_SCALE` for the derivation and for why exact 15 needs a rasterizer). The centring
         // is against the SCALED cell height, and the width budget is counted in scaled glyphs by
         // `draw_title` itself, so both moved with it.
+        // WMCTRL — the caption starts AFTER the cluster now that the cluster is on the LEFT.
+        // `CTRL_RESERVE` is exactly `GAP + cluster + GAP` — the inset from the frame, the discs, and
+        // the separation from the text — so `BORDER + CTRL_RESERVE` is the first caption column, and
+        // the width budget below is unchanged: the caption still ends one `GAP` inside the far
+        // frame. A row with no cluster (`ctrl_w == 0`) keeps the plain `BORDER + GAP` inset it had.
+        let cap_x = lbx + BORDER + if ctrl_w > 0 { CTRL_RESERVE } else { GAP };
         draw_title(
             dst,
             r,
-            lbx + BORDER + GAP,
+            cap_x,
             lby + BORDER as isize + (TITLE_H.saturating_sub(TITLE_CELL) / 2) as isize,
             bw.saturating_sub(2 * BORDER + GAP + ctrl_w),
             title_ink(focused),

@@ -198,6 +198,44 @@ pub const CONTROL_MID: u32 = 0x0067_8CBA;
 pub const CONTROL_ZOOM: u32 = 0x0092_AAC9;
 
 // ---------------------------------------------------------------------------
+// SEMANTIC control fills — Peter's ruling, 2026-08-09 (white board Q9, answer
+// "b on a red yellow green top left of window").
+//
+// ⛔ PROVENANCE, STATED PLAINLY: these three are DERIVED, not lifted. They do not
+// appear in any `palette.*` entry of any kit revision, because `kits/crispy/` is
+// not reachable from this repo (white-board Q4, the standing gap; the shared-source
+// law currently rests on in-tree triangulation). They are entered here as the
+// authored source of record and are PENDING RE-LIFT into
+// `kits/crispy/theme.json` — as `palette.ctrl_close` / `_min` / `_zoom` — the
+// moment that kit is reachable. No kit hash is cited above them, deliberately: a
+// fabricated citation would be worse than the gap it papers over.
+//
+// The register is Crispy's, not Apple's. macOS ships `#FF5F57 / #FEBC2E / #28C840`
+// — fully saturated, and wrong against this kit's near-white chrome (`0xEEEEF1`)
+// and its muted accent (`0x4A73AA`). These are the same three SIGNALS taken down to
+// the refined Scandinavian-minimal register the rest of the table sits in: hue
+// preserved so the meaning is unmistakable, saturation and value pulled to where
+// they belong beside `ACCENT`.
+//
+// The three blue `CONTROL_*` roles above are KEPT. They are the kit's own ramp and
+// this arc has no authority to delete a lifted role; nothing in the tree consumes
+// them since `paint_window` moved to the semantic set, so they stand as the record
+// of what the kit says until the re-lift reconciles the two.
+// ---------------------------------------------------------------------------
+
+/// DERIVED (Peter, 2026-08-09, white board Q9b) — CLOSE control fill: a muted clay
+/// red. `#C25F55`, hue 6°, the destructive signal at Crispy's saturation.
+pub const CTRL_CLOSE: u32 = 0x00C2_5F55;
+
+/// DERIVED (Peter, 2026-08-09, white board Q9b) — MINIMISE control fill: a muted
+/// ochre. `#C89C52`, hue 39°.
+pub const CTRL_MIN: u32 = 0x00C8_9C52;
+
+/// DERIVED (Peter, 2026-08-09, white board Q9b) — ZOOM control fill: a muted sage
+/// green. `#5E9468`, hue 135°.
+pub const CTRL_ZOOM: u32 = 0x005E_9468;
+
+// ---------------------------------------------------------------------------
 // Gloss — `palette.gloss`. A white highlight applied with a two-stop alpha
 // falloff. The three scalars are unit values in the json; they are carried here as
 // **Q16 fixed point** (`value * 65536`, same round-half-up rule) rather than `u8`,
@@ -332,7 +370,10 @@ const _: () = {
 /// palette carries no per-colour alpha. If a future kit adds alpha, this block is
 /// the tripwire that says so.
 const _: () = {
-    const ROLES: [u32; 22] = [
+    const ROLES: [u32; 25] = [
+        CTRL_CLOSE,
+        CTRL_MIN,
+        CTRL_ZOOM,
         CHROME_FACE,
         BEVEL_LIGHT,
         BEVEL_SHADOW,
@@ -389,6 +430,19 @@ const _: () = {
     assert!(CONTROL_CLOSE != TITLE_ACTIVE_TOP);
     assert!(CONTROL_MID != TITLE_ACTIVE_TOP);
     assert!(CONTROL_ZOOM != TITLE_ACTIVE_TOP);
+    // The SEMANTIC set carries the same two obligations, and one more that the blue
+    // ramp never had: three DIFFERENT HUES, not three steps of one. A pair that
+    // collapsed here would put the destructive control and a harmless one in the
+    // same colour, which is the exact failure this set exists to remove.
+    assert!(CTRL_CLOSE != CTRL_MIN);
+    assert!(CTRL_MIN != CTRL_ZOOM);
+    assert!(CTRL_CLOSE != CTRL_ZOOM);
+    assert!(CTRL_CLOSE != TITLE_ACTIVE_TOP);
+    assert!(CTRL_MIN != TITLE_ACTIVE_TOP);
+    assert!(CTRL_ZOOM != TITLE_ACTIVE_TOP);
+    assert!(CTRL_CLOSE != TITLE_INACTIVE_TOP);
+    assert!(CTRL_MIN != TITLE_INACTIVE_TOP);
+    assert!(CTRL_ZOOM != TITLE_INACTIVE_TOP);
     // The gloss must be lighter than what it glosses, or it is not a highlight.
     assert!(GLOSS_HIGHLIGHT != CHROME_FACE);
     // The gloss fades downward. Iteration 3 takes the bottom stop to exactly 0, so
