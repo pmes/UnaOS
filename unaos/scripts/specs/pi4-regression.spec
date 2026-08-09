@@ -989,3 +989,29 @@ FORBID :: MAILBOX: BUSY
 # ---    costs Peter a bench sitting chasing a bug that is not there. The tokens' value is diagnostic
 # ---    and ORDERED ("which was last on the wire"), which this grammar cannot express regardless.
 # ---    Token table and the reading procedure: docs/dev/OS/08_VIDEO/engine.md WEDGE-2.
+
+# --- PAPER — the Crispy kit's content-surface texture, and its determinism -------------------
+# ---    `video/paper.rs` ports `kits/crispy/theme.json`'s `content_surface.Paper` block (the
+# ---    multi-octave "Laid" noise `theme.rs` and engine.md §9 deliberately left unlifted) into
+# ---    integer Q16. Two directives, and they answer different questions.
+#
+# ---    1. THE WIRE LINE names every kit parameter the generator actually used AND the FNV-1a 64
+# ---       of the pixels it produced. It is emitted once, from the first generation, and is NOT
+# ---       witness-gated (`wm::crispy_witness`'s precedent — the metal image carries no `witness`
+# ---       feature, so a gated line is absent from the only artefact that matters). Pinning the
+# ---       hash here is what makes "which texture is the glass showing" a replayable question: the
+# ---       same hash must appear in a QEMU capture and in a metal capture, because the generator is
+# ---       integer-only and both arches are little-endian. A DIFFERENT hash means a parameter
+# ---       drifted from the kit — which is exactly the drift the shared-source law exists to catch.
+REQUIRE \[paper\] kit=us-crispy-modern@0787ba9f algo=laid octaves=3 scale=4 amp_q16=1311 seed=0xfbb60e9f base=0xf5f2ea tile=352x64 hash=0x0df2b838251069dc
+#
+# ---    2. THE FIXTURE VERDICT is the stronger statement, and it is why the hash above is not
+# ---       merely a number copied from a run: `paper::selftest` recomputes every pixel from
+# ---       scratch, hashes that independently of the stored tile, and asserts BOTH that the two
+# ---       agree (determinism) and that they equal the checksum pinned in the source. It also
+# ---       asserts the top-left 4x4 byte for byte and three hand-derivable primitive identities
+# ---       (`smooth(0.5) == 0.5`, the sine's four exact quadrant points, and value-noise-at-a-
+# ---       lattice-point == the lattice hash), so a coefficient typo cannot hide behind a checksum
+# ---       nobody can reproduce on paper. Witness-gated, like every other fixture in this spec.
+REQUIRE :: PAPER: kit texture .* :: PASS ::
+FORBID :: PAPER: .* :: FAIL ::
