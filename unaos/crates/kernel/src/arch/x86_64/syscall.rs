@@ -3859,6 +3859,24 @@ fn present_backpressure(slot: usize, outcome: crate::video::wm::Presented) -> i6
 #[cfg(all(feature = "wc", not(feature = "nopace")))]
 const PANEL_FRAME_US: u64 = 16_667;
 
+/// VSYNC-PACE r3 — THE CLOCK-GRANULARITY ALLOWANCE, and it is a MEASUREMENT of `arch::ms`, not a
+/// tuning knob. Review condition 2.
+///
+/// Every microsecond this pacer reads comes from `crate::arch::ms().saturating_mul(1000)`, so `now`
+/// is truncated to a whole millisecond while the deadline grid is exact to the microsecond. On a
+/// 16667 us frame the grid's offset within the millisecond cycles 667 → 334 → 1 → 668 …, which means
+/// a correctly-paced present routinely observes its own deadline sitting up to 999 us further ahead
+/// than real time actually is. That is not credit, drift, or a runaway; it is the resolution of the
+/// clock, and it is bounded by construction: `present_pace` sleeps `floor(wait_us / 1000)` ms, so
+/// what it leaves unslept is `wait_us mod 1000` ∈ [0, 999].
+///
+/// Both of the pacer's one-frame bounds are therefore stated as `PANEL_FRAME_US + PACE_SLACK_US`:
+/// tighter than that and the clock's own resolution reads as a fault (see `pace_advance`'s clamp and
+/// `present_pace`'s latch, which must agree — a clamp that admits a deadline the latch then refuses
+/// to sleep on would turn over-pacing into NO pacing).
+#[cfg(all(feature = "wc", not(feature = "nopace")))]
+const PACE_SLACK_US: u64 = 1_000;
+
 /// VSYNC-PACE: per-window deadline — `arch::ms() * 1000` of the next frame boundary this window may
 /// present on. `0` is the "no cadence yet" sentinel: a fresh window, a recycled row, and a window whose
 /// slot has just been handed focus all read 0 and present IMMEDIATELY.
@@ -3910,9 +3928,18 @@ static SLOT_FOCUS_SEQ: [AtomicU64; crate::arch::memory::USER_SLOTS] =
 /// biasing it down to ~58. A sub-millisecond remainder therefore presents immediately, and the deadline
 /// arithmetic — which is exact in microseconds and never rounded — absorbs the phase.
 ///
-/// BOUNDED, twice over: the deadline can never sit more than one frame ahead (`pace_advance`), and a
-/// reading that somehow exceeds that is treated as a stale deadline and NOT slept on. So the maximum
-/// delay this function can impose is one panel frame, whatever the clock does.
+/// ⚠ REVIEW CONDITION 2 — WHAT THAT PARAGRAPH LEFT OUT, because it was the whole bug. "The deadline
+/// arithmetic absorbs the phase" was only ever true of `pace_advance`'s two cadence ARMS; its CLAMP
+/// then threw the phase away again, on every frame, by capping the deadline at a millisecond-truncated
+/// `now + PANEL_FRAME_US`. The long-run rate this docstring claims to hold at 60.0 was in fact biased
+/// to ~62.5/s. The clamp now carries [`PACE_SLACK_US`], and with it the claim above is true as
+/// written — see `pace_advance` for the derivation and for the `[wpace]` reading that falsifies it.
+///
+/// BOUNDED, twice over: the deadline can never sit more than one frame plus one clock tick ahead
+/// (`pace_advance`'s clamp), and a reading that exceeds THAT is treated as a stale deadline and NOT
+/// slept on. So the maximum delay this function can impose is one panel frame plus one scheduler
+/// tick, whatever the clock does. Both bounds are `PANEL_FRAME_US + PACE_SLACK_US` and neither may be
+/// narrowed alone.
 #[cfg(all(feature = "wc", not(feature = "nopace")))]
 fn present_pace(slot: usize, id: usize) {
     // The focus exemption, first: it must beat every other consideration, including a deadline that is
@@ -3937,7 +3964,7 @@ fn present_pace(slot: usize, id: usize) {
         return; // the frame boundary has already passed; this present is on time
     }
     let wait_us = due - now;
-    if wait_us > PANEL_FRAME_US {
+    if wait_us > PANEL_FRAME_US.saturating_add(PACE_SLACK_US) {
         // VSYNC-PACE r2 — THE LATCH, and why this arm is now COUNTED rather than silent.
         //
         // Boot AQ, `[wpace]`: four of eight windows read `paced=0` on a `frame_us=16667` panel while
@@ -3957,6 +3984,13 @@ fn present_pace(slot: usize, id: usize) {
         // Once closed the latch never opens: the window presents un-paced at whatever rate its render
         // loop can reach, for the rest of the boot. `pace_advance`'s clamp is the fix; this arm is the
         // defence that must now be unreachable, and `[wpace] overrun=` is what says whether it is.
+        //
+        // REVIEW CONDITION 2 — the threshold carries [`PACE_SLACK_US`], and it MUST. A correctly
+        // paced client that renders fast presents again within a millisecond or two of its last one,
+        // so it observes `wait_us ≈ FRAME + (due mod 1000)` — up to 999 us over a bare `FRAME`. At
+        // the old threshold that healthy reading tripped this arm, and the window then presented
+        // un-paced. The bound here and `pace_advance`'s clamp are the SAME bound seen from the two
+        // ends; widening one without the other converts over-pacing into no pacing at all.
         wpace_note_overrun();
         return; // stale/implausible deadline — never sleep longer than one frame
     }
@@ -4019,9 +4053,39 @@ fn pace_advance(id: usize) {
     // `min` and not a resync, because the two arms above are still the right cadence source: a LATE
     // present must keep measuring from `prev` (that is what holds the long-run rate at exactly 60.0
     // across tick-granular sleeps), and only an EARLY one — the only case that can produce a deadline
-    // ahead of `now + PANEL_FRAME_US` — is capped. The cost of the cap is at most the 999 us that was
-    // not slept, paid once, instead of banked forever.
-    let next = next.min(now.saturating_add(PANEL_FRAME_US));
+    // ahead of `now + PANEL_FRAME_US` — is capped.
+    //
+    // ⚠ REVIEW CONDITION 2 — THE CAP WAS ONE CLOCK TICK TOO TIGHT, AND IT FIRED EVERY FRAME.
+    //
+    // The old bound was `now + PANEL_FRAME_US` exactly, and the sentence above it claimed the cost was
+    // "at most the 999 us that was not slept, paid once". That is FALSE, and the mechanism is the
+    // review-corrected one two paragraphs up, followed one step further. In healthy steady state:
+    //
+    //   * `present_pace` sleeps `floor(wait_us / 1000)` ms, so the present lands `due mod 1000` us
+    //     EARLY — 667 us on the dominant phase of the 667/334/1 cycle.
+    //   * `now` here is `arch::ms() * 1000`, truncated, so `now < prev` by that same remainder.
+    //   * `next = prev + FRAME` is therefore `now + FRAME + 667`, which is MORE than one frame ahead
+    //     of `now` — so the cap won, on an ordinary correctly-paced early present, EVERY FRAME.
+    //   * Winning re-anchors the grid to the truncated `now`, discarding 667 us of period each time.
+    //     The effective period becomes ~16000 us and the ceiling ~62.5/s on a 60 Hz panel: not a
+    //     once-paid cost but a permanent per-frame bias, and one that reads as a HEALTHY `paced=`.
+    //
+    // The fix keeps the anti-latch protection intact and stops it firing on the healthy path, by
+    // stating the bound at the resolution the clock actually has (see [`PACE_SLACK_US`]): a deadline
+    // may sit one frame plus one clock tick ahead. That admits exactly the remainder `present_pace`
+    // declined to sleep — which cannot accumulate, because `next` advances by one frame while `now`
+    // advances by real time — and still hard-caps the runaway arm, which needs UNBOUNDED growth (two
+    // presents inside one millisecond gain a whole frame each). `present_pace`'s latch is widened by
+    // the same term in the same commit; the two bounds are one bound and must not drift apart.
+    //
+    // AR METAL PREDICTION, fast window, `[wpace] rollup`:
+    //   * `rate 60.0–60.9` with `overrun=0`  → CLEAN. The grid is preserved and the cap is dormant.
+    //   * `rate 61–63` with `overrun=0`      → the clamp is still over-pacing (this bug, unfixed or
+    //                                          under-widened): the cap is winning on the early path.
+    //   * `overrun > 0`                      → LATCHED. The cap failed to bound the deadline and
+    //                                          `present_pace` stopped sleeping; the runaway is back.
+    //   * `paced=0` with `rate > 60`         → unfixed: that window is not being paced at all.
+    let next = next.min(now.saturating_add(PANEL_FRAME_US).saturating_add(PACE_SLACK_US));
     WIN_PACE_DUE_US[id].store(next, Ordering::Relaxed);
     wpace_note_present(id);
 }
@@ -4091,8 +4155,12 @@ fn pace_focus_arrival(_slot: usize) {}
 //   * `resync=` climbing with `paced=` near zero — the fleet is BELOW the panel rate and the pacer is a
 //     no-op, which is the correct behaviour for a loaded machine and must not be read as convergence;
 //   * `focus=0` across a session with focus changes — the input-latency exemption is dead code;
-//   * `overrun>0` (verdict `LATCHED`) — a deadline sat more than one frame ahead of now, which
-//     `pace_advance`'s clamp makes impossible; the pacer has disabled itself for that window.
+//   * `overrun>0` (verdict `LATCHED`) — a deadline sat more than one frame (plus the clock tick
+//     `PACE_SLACK_US` allows) ahead of now, which `pace_advance`'s clamp makes impossible; the pacer
+//     has disabled itself for that window.
+//   * `rate` above ~61/s with `overrun=0` — the opposite failure, and the one review condition 2
+//     fixed: the clamp firing on every healthy early present, re-anchoring the grid to a truncated
+//     millisecond and biasing the ceiling to ~62.5/s. `60.0-60.9` is the clean reading.
 //
 // VSYNC-PACE r2 — THE FIRST OF THOSE FIRED AND WAS NOT READ. Boot AQ printed `paced=0` for windows
 // presenting at 37.9-78.9/s on a 16667 us panel, which is line one of this list verbatim. The cause was
@@ -4115,11 +4183,14 @@ static WPACE_SLEPT_MS: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_
 static WPACE_FOCUS: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
 static WPACE_RESYNC: AtomicU64 = AtomicU64::new(0);
-/// VSYNC-PACE r2: aggregate-only — presents that found a deadline MORE THAN ONE FRAME ahead and
-/// therefore refused to sleep. With `pace_advance`'s clamp in place this is unreachable by
-/// construction, so any non-zero reading is a live defect and not a slow machine: it means something
-/// wrote `WIN_PACE_DUE_US` past `now + PANEL_FRAME_US`, which is the runaway that made Boot AQ's
-/// fastest windows read `paced=0`. Zero is the pass condition.
+/// VSYNC-PACE r2: aggregate-only — presents that found a deadline more than one frame PLUS ONE CLOCK
+/// TICK ahead ([`PACE_SLACK_US`]; review condition 2 widened this arm and `pace_advance`'s clamp by
+/// the same term, and they must stay equal) and therefore refused to sleep. With that clamp in place
+/// this is unreachable by construction, so any non-zero reading is a live defect and not a slow
+/// machine: it means something wrote `WIN_PACE_DUE_US` past `now + PANEL_FRAME_US + PACE_SLACK_US`,
+/// which is the runaway that made Boot AQ's fastest windows read `paced=0`. Zero is the pass
+/// condition, and it is one half of a pair: `overrun=0` with `rate` above ~61 means the clamp is
+/// over-pacing rather than latching. See `pace_advance` for the full AR prediction table.
 #[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
 static WPACE_OVERRUN: AtomicU64 = AtomicU64::new(0);
 /// VSYNC-PACE: `arch::ms()` at the last rollup, and the emit CLAIM.
