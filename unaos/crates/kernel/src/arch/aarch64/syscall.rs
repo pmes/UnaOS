@@ -12773,6 +12773,46 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 }
                 true
             }
+            // WMCTRL — the OTHER TWO CONTROLS, wired on the same rule the close arm states: a press
+            // on kernel-drawn chrome is an instruction to the window system, consumed here, never
+            // app input. They used to fall through to the arms below, which is how a cluster of
+            // three discs behaved as one button and two decorations. `minimise_hit`/`zoom_hit` read
+            // the SAME `control_disc` accessor the painter draws with, so each disc answers for
+            // itself; the close arm above now does too, and is no longer the cluster's left anchor.
+            Some((win, owner, _z)) if crate::video::wm::minimise_hit(win, x, y) => {
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                let settle = crate::video::wm::minimise(win);
+                // The keyboard follows the window off the panel — otherwise the operator types into
+                // something they cannot see. The shell is also where `<TAB>`, the way back to the
+                // parked window, is reached from. NOT `focus_changed(0)`: that arm parks everything.
+                if cur == owner {
+                    user_input_set_active(0);
+                }
+                if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX {
+                    serial_println!(
+                        "[wm-act] minimise win={} owner={} at ({},{}) -> settle={}",
+                        win, owner, x, y, settle
+                    );
+                }
+                true
+            }
+            Some((win, owner, _z)) if crate::video::wm::zoom_hit(win, x, y) => {
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                // Raise and focus first: a maximise the operator cannot see the result of (because
+                // the window stayed behind another one) is not a maximise.
+                if owner != cur {
+                    user_input_set_active(owner);
+                }
+                crate::video::wm::focus_changed(owner);
+                let settle = crate::video::wm::zoom(win);
+                if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX {
+                    serial_println!(
+                        "[wm-act] zoom win={} owner={} at ({},{}) -> settle={}",
+                        win, owner, x, y, settle
+                    );
+                }
+                true
+            }
             Some((win, owner, _z)) if owner != cur => {
                 // The ONLY line this arc adds to serial, and only on the arm that changes behaviour:
                 // a click that MOVED focus. Human-rate by construction (one line per click that lands
