@@ -6271,6 +6271,177 @@ refutation that outranks every other line: **HID dead after `bt-l3` = the endpoi
 
 ---
 
+## 23. BTNAME — the speaker was heard, and its name was one character (`UNAOS_BT=1`, 2026-08-09)
+
+Boot AR was flown with Peter's speaker deliberately switched ON. BT-L3 reported
+`peer NOT SELECTED — name=MEGABOOM considered=0 matched=0`, and the brief for the next arc was
+written on the hypothesis that an Ultimate Ears MEGABOOM is a **Bluetooth Classic** device that an
+LE scan can never see, so the next rung had to be BT-L4 (HCI Inquiry).
+
+**That hypothesis is refuted by our own capture, and BT-L4 was not built.** This section records
+what the evidence actually says, the instrument the arc added instead, and the one road that does
+still need Classic.
+
+### 23.1 The device, from the host's own stack (ESTABLISHED)
+
+With the speaker connected to the development host, `bluetoothctl` reports:
+
+```
+Device 88:C6:26:CC:2D:3C (public)
+    Name: MEGABOOM        Class: 0x00240418      Icon: audio-headphones
+    UUIDs: Audio Sink (A2DP), A/V Remote Control (AVRCP), Advanced Audio Distribution,
+           Handsfree, Headset, Headset HS, Serial Port, PnP Information, 0000_61fe (UE proprietary)
+```
+
+Class of Device `0x00240418` decodes, per Assigned Numbers §2.8 (bits 1:0 format, 7:2 minor,
+12:8 major, 23:13 service):
+
+| field | value | meaning |
+|---|---|---|
+| Major Device Class | `(0x0418 >> 8) & 0x1F` = `0x04` | Audio/Video |
+| Minor Device Class | `(0x18 >> 2) & 0x3F` = `0x06` | Headphones |
+| Service bits | 18, 21 | Rendering, Audio |
+
+And Boot AR's LE sighting was:
+
+```
+:: bt-l2: [1] dev 01 addr=88:c6:26:cc:2d:3c type=public evt=ADV_IND rssi=-97dBm reports=1 name="." ::
+```
+
+**The same address, byte for byte.** So the speaker is dual-mode and uses its public identity
+address on both transports: it emits connectable LE advertisements (`ADV_IND`) *and* carries its
+audio over Classic profiles. A2DP has no LE transport in the core spec, so the audio side is
+necessarily BR/EDR; the LE side is almost certainly the companion-app channel behind that
+proprietary `0x61FE` service.
+
+### 23.2 What the capture proves, and what it does not
+
+**ESTABLISHED**
+
+- The receive path works. A real `ADV_IND` was reassembled off a 16-byte interrupt endpoint,
+  decoded, and its six address bytes match the host's ground truth exactly. A payload that passes
+  the controller's CRC and yields the right address is an intact report, not noise.
+- Therefore a rollup of `distinct_devices=0` (boots 2-4 of `gr23-bootAR`) is a statement about
+  **the room**, not about our stack: the mask writes are witnessed at status 0x00, and the same
+  build heard a device on boot 1.
+- The device is reachable by LE scan. It does not need Inquiry to be *found*.
+- `-97 dBm` is essentially the noise floor, from a device in the same room. Discovery on a bounded
+  500 ms window is therefore expected to be intermittent regardless of anything in this section.
+
+**NOT ESTABLISHED (and we cannot test the speaker's firmware)**
+
+- Whether the LE advertisement ever carries the friendly name "MEGABOOM", in `ADV_IND` or only in
+  a `SCAN_RSP`. Our scan is PASSIVE, so a name that lives in the scan response is heard only if
+  somebody else solicits it.
+- Whether LE advertising is continuous or gated on pairing mode.
+
+### 23.3 The `"."`, and why the parser is not the defect
+
+`name="."` means the decode produced **exactly one byte, and that byte was not printable ASCII** —
+the witness renders every unprintable byte as `.`. The leading suspicion was the AD walk, because
+an AD `Length` octet **counts the type octet but not itself**, and the classic off-by-one on that
+produces a one-character result. Every candidate was tested against the code:
+
+| candidate | verdict |
+|---|---|
+| off-by-one on `Length` | **REFUTED.** `src = &data[off+2 .. off+1+l]` is `l-1` bytes — correct. Introducing the off-by-one yields `".MEGABOOM"` (a *leading* dot, name intact), not a bare `"."` |
+| type byte read as the first name byte | **REFUTED.** `src` starts at `off+2`, past the type octet |
+| truncation (`~(cut)`) firing wrongly | **REFUTED.** `ncut` needs `src.len() > 24`, and the witness carried no `~(cut)` |
+| walk terminating early on a zero-length structure | **REFUTED as a cause of `"."`** — that path yields `nlen == 0`, which prints `name=(none)` |
+| transport/reassembly misalignment | **REFUTED.** `bt_arm_read` arms exactly `mps` (one qTD = one packet); `bt_wait_read` derives length from the qTD residual; reassembly runs to `2 + Parameter_Total_Length`. And a misaligned payload could not have produced a byte-exact address |
+| the payload genuinely carried a one-byte name | **NOT REFUTED — the surviving explanation** |
+
+The walk was also unchanged between the L2-only build that flew boot 1 and today's (`0c1d121f`
+vs HEAD, modulo the empty-name guard), so nothing regressed under it.
+
+**Conclusion: the name filter did its job. The decode is spec-correct. What the capture could not
+do was let anyone *check* that** — because a one-character real name and a seven-byte misparse
+render identically. That, not the parser, is the defect this arc fixes.
+
+### 23.4 What the arc built
+
+**1. The walk moved to `drivers/ehci/bt_name.rs`** — the AD walk, the name cap, and the two match
+rules (`bt_name_contains_ci`, `bt_name_maybe_ci`). Nothing in that file performs I/O or touches a
+register, which is what makes the next two items possible.
+
+**2. `bt_name_fixture()` — an in-kernel fixture, run before the radio is asked anything.** Eight
+payloads whose decode is known in advance, driven through the *same* `bt_decode_local_name` the
+drain runs, one witness line each plus a tally. It is unconditional and sits ahead of every L2
+gate: a boot where the scan never starts is exactly the boot where the decode still needs to
+answer for itself. Legs: a realistic `ADV_IND` carrying a Complete Local Name of `MEGABOOM` behind
+two other AD structures; the observed one-byte-name payload; shortened-only; shortened-then-
+complete; the empty-complete-does-not-erase-shortened regression; no-name-at-all; a `Length` that
+runs past the payload; and an over-long name that must be marked cut.
+
+**3. `tools/btname_harness.rs` — the same source, runnable on the host.** It `include!`s
+`bt_name.rs` rather than copying it, so it cannot pass on a transcription the kernel does not run:
+
+```
+rustc -O tools/btname_harness.rs -o ~/unaos-bench/scratch/gr23/btname && ~/unaos-bench/scratch/gr23/btname    # pass=15 fail=0
+```
+
+Falsifiability was demonstrated, not asserted: breaking the length handling to
+`&data[off+1 .. off+1+l]` turns 6 of the 15 legs red (exit 1), including
+`megaboom-complete want name="MEGABOOM" | got name=".MEGABOOM"`. Restored, green again.
+
+**4. The RAW payload witness.** Any device whose decoded name is shorter than three characters —
+**including `(none)`** — now prints the bytes the walk actually saw:
+
+```
+:: bt-l2: [1] dev 01 RAW ad — decoded name is 1 char(s), too short to trust: Data_Length=NN
+   bytes=[02 01 06 ...] — this is the payload the name walk actually saw; ... == witness ::
+```
+
+The raw payload is stored with the report that supplied the stored name (or the latest nameless
+one), so `raw` and `name` always describe the same payload rather than two different reports.
+
+**No HCI command, no radio state, and no transfer was added.** `bt_name_fixture` takes `&self`,
+arms no qTD and touches no endpoint, so the endpoint-`armed` invariant is untouched by
+construction — there is no new `bt_arm_read` call site anywhere in the diff.
+
+### 23.5 The RSSI floor does not reject this device
+
+Confirmed unchanged: the floor (`BT_L3_RSSI_FLOOR = -60`) is applied **only** in the match arm
+where no name filter is armed. With `BT_L3_PEER_NAME = Some("MEGABOOM")` the floor is skipped
+entirely, so the speaker's -97 dBm cannot disqualify it. This is deliberate — a named peer across
+the room is still the right peer — and it matters more now that we know how weak the signal is.
+
+### 23.6 The Classic road, named and not started
+
+LE discovery reaches this device, but an LE connection reaches its **control** service, not its
+audio. Playing sound through it requires the Classic stack:
+
+- `HCI_Write_Inquiry_Mode(0x02)` + `HCI_Inquiry` (GIAC `0x9E8B33`) to discover, draining
+  `Inquiry Result` (0x02) / `with RSSI` (0x22) / `Extended Inquiry Result` (0x2F), with
+  `HCI_Inquiry_Cancel` (0x0402) on every exit path.
+- **The event mask must be widened again**: Inquiry Complete (bit 0) and Inquiry Result (bit 1)
+  are inside L1's reset default, and Inquiry Result with RSSI (bit 33) is too — but **Extended
+  Inquiry Result is bit 46, outside the `0x00001FFFFFFFFFFF` default**, so EIR (where a friendly
+  name arrives without a separate `HCI_Remote_Name_Request`) needs the mask extended exactly as L2
+  extended it for LE Meta at bit 61.
+- Then the actual work: ACL link, L2CAP, SDP, AVDTP, and an SBC encoder for A2DP.
+
+That last line is the whole point. Discovery is a rung; **A2DP is a stack**, and it is a much
+larger road than the L0-L3 ladder that precedes it. It is named here so the size of it is a
+decision rather than a surprise.
+
+Note also that inquiry **transmits** — it is not the passive listen L2 does. That is the normal way
+any Bluetooth host discovers an audio device, but it is a disclosure Peter gets to make, not one to
+smuggle inside a rung.
+
+### 23.7 What metal must verify
+
+`~/unaos-bench/scratch/gr23/btname-predictions.md` carries the ranked, falsifiable outcomes. The
+decisive one: with the speaker on and in range, the fixture prints 8/8 and the RAW line names the
+real cause — a payload with no name structure convicts the walk (and becomes a ninth leg), a
+payload carrying a genuine one-byte name exonerates it and makes passive name-matching structurally
+unable to find this speaker.
+
+The refutation that outranks the rest is unchanged from §22: **HID dead after `bt-l2` = the
+endpoint invariant broke** — though this arc adds no `bt_arm_read` call site to break it.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).
