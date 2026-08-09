@@ -373,6 +373,94 @@ const PHYVER_VERSION: u16 = 0x00FF;
 #[cfg(feature = "bcmaS1")]
 const PHYTYPE_HT: u16 = 7;
 
+// ── S4a: the SHM indirect window — the FIRST MMIO WRITE this file makes ─────────────────────────
+//
+// Everything above this line is read-only at the MMIO level: S0/S1/L0/S2r write exactly one PCI
+// CONFIG register (cfg:0x80, the BAR0 core selector) and restore it. This block is the exception and
+// it is deliberately small.
+//
+// ## What is written, and why it is not a state change
+//
+// `SHM_CONTROL` (d11+0x160) is an ADDRESS-WINDOW register: a routing selector plus a word index that
+// says which shared-memory location the data port at `SHM_DATA` (d11+0x164) will read. It is the
+// read side's plumbing. Writing it does not start, stop, reset, interrupt or reconfigure anything:
+//
+// * it is NOT `MACCTL` (0x120) — no `PSM_RUN`, no `PSM_JMP0`, no `ENABLED` bit is touched;
+// * it is NOT the wrapper `RESET_CTL`/`IOCTL` — the core is neither reset nor re-clocked;
+// * it is NOT `RADIO_CONTROL` (0x3E2) — no radio-silicon register is addressed, let alone written;
+// * nothing is written to `SHM_DATA`, so no shared-memory location and no PSM instruction word is
+//   modified. The upload path S4 owns (stream words into `SHM_DATA` with the window on
+//   `B43_SHM_UCODE`) is precisely what this probe does NOT do.
+//
+// b43 uses this exact window, with the PSM running, for every runtime shared-memory access it makes;
+// the operation is ordinary, not exotic. The one honest caveat is that the resident microcode also
+// uses shared memory — but through the PSM's own port, not through this host aperture, and the host
+// aperture carries no arbitration state that a read could disturb.
+//
+// ## Worst case if an offset here is wrong
+//
+// A wrong routing value or a wrong word index reads a DIFFERENT shared-memory word. That is garbage
+// in, garbage out — a misleading number on the wire, not damage. There is no write-side consequence
+// because there is no write to the data port. The witness therefore prints the raw words first and
+// the decode second, and every degenerate reading has its own name.
+//
+// ## Access rule (b43 `b43_shm_read16`, `b43_shm_control_word`)
+//
+// For `B43_SHM_SHARED` the caller's BYTE offset is turned into a DWORD index (`offset >> 2`) and
+// written as `(routing << 16) | index`. The data port then depends on the offset's low bits: a
+// 4-aligned word comes out of `SHM_DATA` (0x164) and the odd 2-byte half comes out of
+// `SHM_DATA_UNALIGNED` (0x166). The control word is the SAME in both cases; only the port differs.
+// So the four identity words need exactly TWO distinct window selects (index 0 and index 1) — but
+// this probe re-writes the select before every read, exactly as b43 does, because nothing in b43
+// establishes whether a READ advances the window, and assuming it does not would be an unearned
+// optimisation on a path whose whole point is to find out how the window behaves.
+/// `B43_MMIO_SHM_CONTROL` — the SHM address/routing window select (u32, write).
+#[cfg(feature = "bcmaS1")]
+const D11_SHM_CONTROL: u64 = 0x0160;
+/// `B43_MMIO_SHM_DATA` — the data port for a 4-ALIGNED shared-memory word (u32/u16, read).
+#[cfg(feature = "bcmaS1")]
+const D11_SHM_DATA: u64 = 0x0164;
+/// `B43_MMIO_SHM_DATA_UNALIGNED` — the data port for the ODD 2-byte half of the selected dword.
+#[cfg(feature = "bcmaS1")]
+const D11_SHM_DATA_UNALIGNED: u64 = 0x0166;
+
+/// `B43_SHM_SHARED` — the routing value for the shared-memory region (as opposed to `B43_SHM_UCODE`
+/// = 0, the instruction memory the upload path streams into, which this arc never selects).
+#[cfg(feature = "bcmaS1")]
+const SHM_ROUTE_SHARED: u32 = 0x0001;
+
+// `B43_SHM_SH_UCODE*` — BYTE offsets inside the shared-memory region at which a running d11
+// microcode publishes its own identity. b43 reads exactly these four, in this order, immediately
+// after it starts the PSM.
+#[cfg(feature = "bcmaS1")]
+const SHM_SH_UCODEREV: u16 = 0x0000;
+#[cfg(feature = "bcmaS1")]
+const SHM_SH_UCODEPATCH: u16 = 0x0002;
+#[cfg(feature = "bcmaS1")]
+const SHM_SH_UCODEDATE: u16 = 0x0004;
+#[cfg(feature = "bcmaS1")]
+const SHM_SH_UCODETIME: u16 = 0x0006;
+
+/// b43's hard rejection threshold: `fwrev <= 0x128` (296) is "firmware from binary drivers older
+/// than version 4.x", which b43 refuses outright. Anything above it is a revision b43 will work with.
+#[cfg(feature = "bcmaS1")]
+const UCODEREV_TOO_OLD: u16 = 0x0128;
+
+/// The three RX/TX header-format boundaries b43 selects on (`B43_FW_HDR_351` / `_410` / `_598`).
+/// These are NOT rejection thresholds — they say which frame-header layout a given microcode
+/// generation uses, and therefore which generation a resident image belongs to.
+#[cfg(feature = "bcmaS1")]
+const UCODEREV_HDR_351: u16 = 351;
+#[cfg(feature = "bcmaS1")]
+const UCODEREV_HDR_410: u16 = 410;
+#[cfg(feature = "bcmaS1")]
+const UCODEREV_HDR_598: u16 = 598;
+
+/// b43's open-firmware discriminator: `dev->fw.opensource = (fwdate == 0xFFFF)`. OpenFWWF stamps
+/// `UCODEDATE` with `0xFFFF` and encodes its own patch level in `UCODETIME` instead of a build time.
+#[cfg(feature = "bcmaS1")]
+const UCODEDATE_OPENSOURCE: u16 = 0xFFFF;
+
 // ── AI/aidmp agent (wrapper) identification block ───────────────────────────────────────────────
 //
 // The AXI agent Broadcom wraps each backplane core in is an ARM DMP, and it ends with the standard
@@ -624,6 +712,25 @@ unsafe fn r32(base: u64, off: u64) -> u32 {
 /// As [`r32`].
 unsafe fn r16(base: u64, off: u64) -> u16 {
     core::ptr::read_volatile((base + off) as *const u16)
+}
+
+/// Write a u32 into the identity-mapped BAR0 window.
+///
+/// **This is the only MMIO write in this file, and it has exactly one call site**
+/// ([`d11_s4a_shm_probe`]), where it writes exactly one register: the d11 core's `SHM_CONTROL`
+/// address-window select. It is deliberately NOT a general-purpose accessor and it is deliberately
+/// not offered to the rest of the module: every other stage in this driver is MMIO-read-only, and a
+/// convenient `w32` sitting in scope is how that property stops being true by accident.
+///
+/// # Safety
+/// The caller must have mapped the window (`map_mmio_window`) AND proved the page present with
+/// `translate()`, AND must have established that BAR0+0 currently decodes to the d11 core (a
+/// `cfg:0x80` readback), because the same offset in another core's window is another register
+/// entirely. The caller must additionally have argued that the specific register being written has
+/// no device-state side effect — see the S4a constant block for that argument.
+#[cfg(feature = "bcmaS1")]
+unsafe fn w32(base: u64, off: u64, val: u32) {
+    core::ptr::write_volatile((base + off) as *mut u32, val);
 }
 
 // ── Capability walk (read-only) ─────────────────────────────────────────────────────────────────
@@ -2168,6 +2275,14 @@ fn d11_l0(bus: u8, dev: u8, func: u8, bar0: u64, d: D11) {
     // ── 3b. S3's verdict, decided from the words above and from NO further device access. ────────
     d11_s3_witness(wrap_regs, core_regs);
 
+    // ── 3c. S4a: identify the RESIDENT microcode through the SHM window. This is the one stage in
+    // this file that writes an MMIO register, and it writes only `SHM_CONTROL` — the read side's
+    // address window. It runs AFTER S3's ownership verdict deliberately: `PSM_RUN` is the context
+    // that decides whether an identity word means anything at all, so it must already be on the
+    // wire when the probe's own lines are read. It is passed `core_regs` rather than re-reading
+    // MACCTL, for the same reason S3 is: one read, one authority. ────────────────────────────────
+    d11_s4a_shm_probe(bar0, win_ok, core_regs);
+
     // ── 4. REACH verdict — the three facts, named, and never collapsed into one bit silently. ────
     let reached = win_ok && phy_ok && phy_type == PHYTYPE_HT;
     serial_println!(
@@ -2179,6 +2294,204 @@ fn d11_l0(bus: u8, dev: u8, func: u8, bar0: u64, d: D11) {
     serial_println!(
         ":: wifi-l0: end ok={} d11-rev={} dmp-rev={} phy-type={} wrote-cfg80=1 wrote-cfg-ac=0(audited) wrote-core-regs=0(audited) elapsed={}{} — next gate is FIRMWARE: a d11 MAC runs downloadable microcode, which this tree does not and will not carry (docs/MANIFESTO/CLEAN_ROOM_POLICY.md); see bcm4331.md S4 ::",
         reached as u8, d.rev, dmp_rev, phy_type, ev, eu
+    );
+}
+
+/// One shared-memory 16-bit read, done the way `b43_shm_read16` does it.
+///
+/// Returns `(control_word_written, control_word_readback, value)`. The control readback is carried
+/// out of here rather than discarded because it is the only per-read evidence that the window select
+/// took at all — see [`d11_s4a_shm_probe`] for why it is treated as advisory.
+///
+/// The BYTE offset is converted to a DWORD index (`>> 2`) for the control word, and the offset's low
+/// bits pick the data port: `SHM_DATA` for a 4-aligned word, `SHM_DATA_UNALIGNED` for the odd half.
+/// The control word is identical for both halves of a dword; only the port differs.
+#[cfg(feature = "bcmaS1")]
+fn shm_read16_shared(bar0: u64, byte_off: u16) -> (u32, u32, u16) {
+    let ctl = (SHM_ROUTE_SHARED << 16) | ((byte_off >> 2) as u32);
+    // The write. This is the whole write surface of stage S4a.
+    unsafe { w32(bar0, D11_SHM_CONTROL, ctl) };
+    let ctl_rb = unsafe { r32(bar0, D11_SHM_CONTROL) };
+    let port = if byte_off & 0x3 != 0 { D11_SHM_DATA_UNALIGNED } else { D11_SHM_DATA };
+    let val = unsafe { r16(bar0, port) };
+    (ctl, ctl_rb, val)
+}
+
+/// **WIFI-S4a — identify the RESIDENT microcode, with two window selects and no state change.**
+///
+/// `docs/dev/OS/06_NETWORK_STACK/bcm4331.md` §S4 records the finding this stage acts on: at UnaOS
+/// boot the d11's `MACCTL` already carries `PSM_RUN`, so **somebody's microcode is executing in that
+/// processor right now** — shaped like b43's, on the evidence of the `IOCTL` bits and the selected
+/// 20 MHz bandwidth. L0 could not name it, because the revision word a running microcode publishes
+/// about itself lives behind an indirect window whose read requires a write, and L0 makes no MMIO
+/// write. That is the entire gap this stage closes.
+///
+/// ## The safety argument, in full
+///
+/// The probe writes **one register: `SHM_CONTROL` (d11+0x160)**, an address-window select on the
+/// read path (see the S4a constant block for the register-by-register argument). It writes nothing
+/// to `SHM_DATA`, so no shared-memory word and no PSM instruction is modified. It does not touch
+/// `MACCTL`, so `PSM_RUN` and `PSM_JMP0` are exactly as the machine handed them over. It does not
+/// touch the wrapper, so nothing is reset or re-clocked. It does not touch `RADIO_CONTROL`, so no
+/// radio-silicon register is even addressed. It uploads nothing. The resident image keeps running,
+/// unaltered, through the whole stage — which is the point: an image that had to be disturbed to be
+/// identified could not be identified.
+///
+/// A wrong offset in this file reads the wrong shared-memory word and prints a misleading number.
+/// It cannot damage anything, because there is no write to the data port. That asymmetry is why this
+/// probe is worth making before the upload path exists.
+///
+/// ## What it settles for the S-ladder
+///
+/// S4's upload depends on this exact mechanism — indirect window, routing value, dword indexing,
+/// data-port selection. Running it read-only against a PSM that is *known* to be alive tests the
+/// mechanism where a failure is diagnosable, instead of discovering a mis-transcribed routing
+/// constant in the middle of a streaming upload where the only symptom is a handshake that never
+/// arrives.
+///
+/// ## Every failure has its own name
+///
+/// * `all-ff` — every word `0xFFFF`: the read path is dead (the core window stopped decoding).
+/// * `all-zero` — every word `0`: the window select had no effect, or nothing ever published an
+///   identity into shared memory.
+/// * `stuck-data-port` — all four words equal and neither of the above: the data port is returning
+///   one value regardless of the select, so the window is not being honoured. These four words have
+///   no reason whatsoever to be equal, which is what makes the test sharp.
+/// * `no-ucoderev` — the other words carry structure but `UCODEREV` itself is `0`/`0xFFFF`.
+///
+/// None of these is folded into the others, and none is averaged into a single bit.
+#[cfg(feature = "bcmaS1")]
+fn d11_s4a_shm_probe(bar0: u64, win_ok: bool, core_regs: Option<(u32, u32, u32)>) {
+    let dl = Deadline::new();
+
+    if !win_ok {
+        serial_println!(
+            ":: wifi-s4a: REFUSED stage=selector reason=not-taken — cfg:0x80 does not read back the d11 base, so BAR0+0 is not the radio's window and d11+0x160 would be some other core's register. NOTHING was written ::"
+        );
+        return;
+    }
+    let macctl = match core_regs {
+        Some((m, _, _)) => m,
+        None => {
+            serial_println!(
+                ":: wifi-s4a: REFUSED stage=core reason=core-window-unread — L0 declined the core reads (selector or reset state), so MACCTL is UNKNOWN and this stage will not write an MMIO register into a window it has not established is answering. NOTHING was written ::"
+            );
+            return;
+        }
+    };
+    if macctl == ER_BAD {
+        serial_println!(
+            ":: wifi-s4a: REFUSED stage=core reason=macctl-all-ones macctl={:#010x} — the core window is not decoding; writing SHM_CONTROL into a dark window would prove nothing and read nothing. NOTHING was written ::",
+            macctl
+        );
+        return;
+    }
+
+    let psm_run = (macctl & MACCTL_PSM_RUN) != 0;
+    let shm_enabled = (macctl & MACCTL_SHM_ENABLED) != 0;
+    let big_endian = (macctl & MACCTL_BE) != 0;
+    serial_println!(
+        ":: wifi-s4a: begin — SHM probe of the RESIDENT microcode. WRITES: SHM_CONTROL (d11+{:#06x}) ONLY — an ADDRESS-WINDOW register on the read path. NOT written: SHM_DATA (no shared-memory word and no PSM instruction is modified), MACCTL (PSM_RUN/PSM_JMP0 untouched), wrapper RESET_CTL/IOCTL (no reset, no re-clock), RADIO_CONTROL (no radio-silicon register is addressed). NO upload, NO reset, NO PSM state change — the resident image keeps running unaltered. Context from S3: macctl={:#010x} psm-run={} shm-enabled={} big-endian={} — an identity word is only meaningful while a PSM is executing, so psm-run=0 makes a zero reading EXPECTED rather than a fault ::",
+        D11_SHM_CONTROL, macctl, psm_run as u8, shm_enabled as u8, big_endian as u8
+    );
+
+    // The four identity words. b43 reads exactly these, in this order, right after it starts the
+    // PSM. Each read re-writes the select (b43's own behaviour) — four writes of two distinct
+    // values, indices 0 and 1, routing 0x0001 (B43_SHM_SHARED).
+    let (c0, rb0, rev) = shm_read16_shared(bar0, SHM_SH_UCODEREV);
+    let (c1, rb1, patch) = shm_read16_shared(bar0, SHM_SH_UCODEPATCH);
+    let (c2, rb2, date) = shm_read16_shared(bar0, SHM_SH_UCODEDATE);
+    let (c3, rb3, time) = shm_read16_shared(bar0, SHM_SH_UCODETIME);
+
+    // The control readback. b43 never reads this register, so whether it is readable at all is
+    // UNKNOWN on this part — which is exactly why the reading is reported three ways instead of
+    // being turned into a pass/fail. `dead` (all-ones) is the one case that is load-bearing: it says
+    // the MMIO path itself is gone, independently of what the data port returned.
+    let sel_dead = rb0 == ER_BAD && rb1 == ER_BAD && rb2 == ER_BAD && rb3 == ER_BAD;
+    let sel_echo = rb0 == c0 && rb1 == c1 && rb2 == c2 && rb3 == c3;
+    let sel_verdict = if sel_dead {
+        "DEAD(all-ones — the MMIO path, not just the window)"
+    } else if sel_echo {
+        "CONFIRMED(readback == written)"
+    } else {
+        "NOT-READABLE(advisory — b43 never reads this register, so a non-echoing select is not by itself a fault)"
+    };
+    serial_println!(
+        ":: wifi-s4a: shm-raw sel=[{:#010x},{:#010x},{:#010x},{:#010x}] sel-readback=[{:#010x},{:#010x},{:#010x},{:#010x}] select={} ucoderev={:#06x}@+{:#04x}(port {:#06x}) patch={:#06x}@+{:#04x}(port {:#06x}) date={:#06x}@+{:#04x}(port {:#06x}) time={:#06x}@+{:#04x}(port {:#06x}) — routing {:#06x} (B43_SHM_SHARED), byte offset >> 2 as the dword index, 4-aligned halves off SHM_DATA and odd halves off SHM_DATA_UNALIGNED (b43 b43_shm_read16). RAW first: a decode bug must never be able to hide the words it came from ::",
+        c0, c1, c2, c3, rb0, rb1, rb2, rb3, sel_verdict,
+        rev, SHM_SH_UCODEREV, D11_SHM_DATA,
+        patch, SHM_SH_UCODEPATCH, D11_SHM_DATA_UNALIGNED,
+        date, SHM_SH_UCODEDATE, D11_SHM_DATA,
+        time, SHM_SH_UCODETIME, D11_SHM_DATA_UNALIGNED,
+        SHM_ROUTE_SHARED
+    );
+
+    // ── Degeneracy, each mode named separately. ──────────────────────────────────────────────────
+    let all_ff = rev == 0xFFFF && patch == 0xFFFF && date == 0xFFFF && time == 0xFFFF;
+    let all_zero = rev == 0 && patch == 0 && date == 0 && time == 0;
+    let all_same = rev == patch && patch == date && date == time;
+    let rev_degenerate = rev == 0 || rev == 0xFFFF;
+
+    // ── The decode, rendered the way b43 renders it. ─────────────────────────────────────────────
+    // b43: "version %u.%u (20%.2i-%.2i-%.2i %.2i:%.2i:%.2i)" with
+    //   year = (fwdate >> 12) & 0xF (plus 2000), month = (fwdate >> 8) & 0xF, day = fwdate & 0xFF,
+    //   hour = (fwtime >> 11) & 0x1F, minute = (fwtime >> 5) & 0x3F, second = fwtime & 0x1F.
+    let opensource = date == UCODEDATE_OPENSOURCE;
+    let year = 2000 + ((date >> 12) & 0xF);
+    let month = (date >> 8) & 0xF;
+    let day = date & 0xFF;
+    let hour = (time >> 11) & 0x1F;
+    let minute = (time >> 5) & 0x3F;
+    let second = time & 0x1F;
+    let stamp_plausible = !opensource
+        && (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && hour <= 23
+        && minute <= 59;
+    let hdr_format = if rev >= UCODEREV_HDR_598 {
+        "598+"
+    } else if rev >= UCODEREV_HDR_410 {
+        "410..597"
+    } else if rev >= UCODEREV_HDR_351 {
+        "351..409"
+    } else {
+        "pre-351"
+    };
+    serial_println!(
+        ":: wifi-s4a: shm-decode rev={} patch={} build={}-{:02}-{:02} {:02}:{:02}:{:02} stamp-plausible={} opensource={} (b43: fw.opensource = (UCODEDATE == 0xFFFF); OpenFWWF stamps the date 0xFFFF and puts its patch level in UCODETIME, so patch={} would be the open-firmware reading) b43-too-old={} (rejects rev <= {:#06x}) hdr-format={} (B43_FW_HDR_351/410/598 pick the RX/TX header layout — generation markers, NOT rejection thresholds) ::",
+        rev, patch, year, month, day, hour, minute, second,
+        stamp_plausible as u8, opensource as u8, time,
+        (rev <= UCODEREV_TOO_OLD) as u8, UCODEREV_TOO_OLD, hdr_format
+    );
+
+    // ── The verdict. ─────────────────────────────────────────────────────────────────────────────
+    let (identified, reason) = if all_ff {
+        (false, "all-ff — every identity word reads 0xFFFF: the READ PATH is dead. The core window stopped decoding between L0's reads and this one, or the select write took the window somewhere unmapped. This is NOT a statement about the microcode")
+    } else if all_zero {
+        (false, "all-zero — every identity word reads 0. Two live explanations, and this stage cannot separate them: the window select had no effect (wrong routing value or wrong dword indexing, i.e. the mechanism S4 depends on is mis-transcribed), or the resident image never published an identity into shared memory. The select-readback leg above is the tie-breaker to reach for")
+    } else if all_same {
+        (false, "stuck-data-port — all four words are equal and are neither 0 nor 0xFFFF, so the data port is returning one value regardless of the select. UCODEREV/PATCH/DATE/TIME have no reason to be equal on any real image; the window is not being honoured")
+    } else if rev_degenerate {
+        (false, "no-ucoderev — the surrounding words carry structure but UCODEREV itself is 0/0xFFFF. The window works and something is there; the revision word specifically is not published (or is not at this offset on this image)")
+    } else {
+        (true, "a non-degenerate revision word was read out of shared memory")
+    };
+    serial_println!(
+        ":: wifi-s4a: SHM probe UCODEREV={} PATCH={} DATE={:#06x}({}-{:02}-{:02}) TIME={:#06x}({:02}:{:02}:{:02}) (via SHM_CONTROL d11+{:#06x} sel={:#010x}/{:#010x} routing={:#06x}) — resident ucode {} ::",
+        rev, patch, date, year, month, day, time, hour, minute, second,
+        D11_SHM_CONTROL, c0, c2, SHM_ROUTE_SHARED,
+        if identified { "IDENTIFIED" } else { "NOT-DECODABLE" }
+    );
+    if !identified {
+        serial_println!(":: wifi-s4a: NOT-DECODABLE reason={} ::", reason);
+    }
+
+    let (ev, eu) = fmt_dur(dl.elapsed_cycles());
+    serial_println!(
+        ":: wifi-s4a: end ok={} rev={} psm-run={} select={} wrote-shm-control=4(2 distinct selects; b43 re-writes the select before every read and this probe does not optimise that away, because nothing establishes whether a READ advances the window) wrote-shm-data=0(audited) wrote-macctl=0(audited) wrote-wrapper=0(audited) wrote-radio=0(audited) uploaded-bytes=0(audited) elapsed={}{} — the resident image is still running; see bcm4331.md §S4a for what each UCODEREV value implies for the ladder ::",
+        identified as u8, rev, psm_run as u8,
+        if sel_dead { "DEAD" } else if sel_echo { "CONFIRMED" } else { "NOT-READABLE" },
+        ev, eu
     );
 }
 
