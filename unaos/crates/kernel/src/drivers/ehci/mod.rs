@@ -624,6 +624,112 @@ const BT_HCI_SET_EVENT_MASK: u16 = 0x0C01;
 /// restores it), so nothing is left changed for a later boot.
 #[cfg(feature = "bt")]
 const BT_EVENT_MASK: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x00];
+/// BT-L2 — the event mask an LE SCAN needs, and the reason L2 must rewrite one L1 already wrote.
+///
+/// L1's value is the Bluetooth Core RESET DEFAULT, and the reset default does **not** include
+/// **LE Meta Event (bit 61)** — every LE Advertising Report is delivered as an LE Meta Event
+/// (event code 0x3E), so with the default mask a scan runs, finds devices, and reports *nothing*:
+/// a clean, silent, entirely wrong "no devices found". Bit 61 lives in octet 7 (bits 56-63) at
+/// bit 5 => 0x20, giving 0x2000_1FFF_FFFF_FFFF, little-endian on the wire. Everything the reset
+/// default enabled stays enabled; this only ADDS the LE meta channel.
+///
+/// PROVENANCE FOR A LATER ARC — L2 does NOT put this mask back. When the scan ends, the widened
+/// mask (LE Meta enabled) is left in place on the controller and the event ENDPOINT is quiesced,
+/// so the controller has a channel it may emit on and nothing is reading it. That combination is
+/// harmless exactly as long as the endpoint stays quiesced: the qTD is inactive, so an LE Meta
+/// Event has nowhere to land and the controller is not issuing INs. Any arc that RE-ARMS this
+/// endpoint inherits the widened mask, not the reset default — it will see LE Meta traffic it did
+/// not ask for unless it writes its own `HCI_Set_Event_Mask` first. Narrowing it here instead
+/// would cost another command round-trip on every boot to undo a state nothing currently reads.
+#[cfg(feature = "bt")]
+const BT_EVENT_MASK_LE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x20];
+/// BT-L2 — `HCI_LE_Set_Event_Mask`: OGF 0x08 (LE Controller) / OCF 0x0001 => opcode 0x2001.
+/// Eight-byte parameter (the LE event mask); returns status(1). The SECOND gate in front of an
+/// advertising report: `Set_Event_Mask` bit 61 opens the LE Meta channel, this mask selects which
+/// LE sub-events travel down it.
+#[cfg(feature = "bt")]
+const BT_HCI_LE_SET_EVENT_MASK: u16 = 0x2001;
+/// BT-L2 — the LE event mask this arc writes: bits 0..4, the Bluetooth Core reset default for the
+/// LE event mask (LE Connection Complete, **LE Advertising Report (bit 1)**, LE Connection Update
+/// Complete, LE Read Remote Features Complete, LE Long Term Key Request). Bit 1 is the one this
+/// arc needs; the other four are the spec default and are left as the controller already has them,
+/// so the write cannot narrow a mask a later arc will want. Deliberately NOT all-ones: bits above
+/// 4 are undefined on a 4.0 controller and could earn an Invalid-HCI-Parameters status.
+#[cfg(feature = "bt")]
+const BT_LE_EVENT_MASK: [u8; 8] = [0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+/// BT-L2 — `HCI_LE_Set_Scan_Parameters`: OGF 0x08 / OCF 0x000B => opcode 0x200B. Seven parameter
+/// bytes: LE_Scan_Type(1) LE_Scan_Interval(2, LE) LE_Scan_Window(2, LE) Own_Address_Type(1)
+/// Scanning_Filter_Policy(1). Returns status(1).
+#[cfg(feature = "bt")]
+const BT_HCI_LE_SET_SCAN_PARAMS: u16 = 0x200B;
+/// BT-L2 — `HCI_LE_Set_Scan_Enable`: OGF 0x08 / OCF 0x000C => opcode 0x200C. Two parameter bytes:
+/// LE_Scan_Enable(1) Filter_Duplicates(1). Returns status(1). **This is the command that must run
+/// on every exit path**: a radio left scanning burns power and floods the event endpoint for the
+/// rest of the boot, on the same controller as the internal keyboard and trackpad.
+#[cfg(feature = "bt")]
+const BT_HCI_LE_SET_SCAN_ENABLE: u16 = 0x200C;
+/// BT-L2 — scan type 0x00 = PASSIVE. A passive scanner listens only; it never transmits SCAN_REQ,
+/// so it cannot be observed by the devices it discovers and cannot collide on the advertising
+/// channels. The cost is that SCAN_RSP payloads (where some devices put their name) are not
+/// solicited — names then come only from the advertising PDU itself. That is the right trade for a
+/// bring-up arc: discovery must not perturb the room.
+#[cfg(feature = "bt")]
+const BT_LE_SCAN_TYPE_PASSIVE: u8 = 0x00;
+/// BT-L2 — scan interval and window, in units of 0.625 ms (Bluetooth Core, Vol 2 Part E). Both are
+/// 0x0060 = 96 => **60 ms**, and window == interval means CONTINUOUS scanning: the radio listens
+/// 100 % of the time inside the bounded window, hopping to the next advertising channel each
+/// interval. Why these numbers:
+///   * continuous (window == interval) is the only duty cycle that makes a *short* bounded window
+///     honest — at 50 % duty a device could advertise entirely inside our deaf half and the arc
+///     would report an empty room it never actually listened to;
+///   * 60 ms per channel rotates all three advertising channels (37/38/39) in 180 ms, so a
+///     `BT_L2_SCAN_MS`-long window covers each channel several times over;
+///   * it is comfortably inside the spec range 0x0004..=0x4000 and is a value real stacks use.
+#[cfg(feature = "bt")]
+const BT_LE_SCAN_INTERVAL: u16 = 0x0060;
+#[cfg(feature = "bt")]
+const BT_LE_SCAN_WINDOW: u16 = 0x0060;
+/// BT-L2 — own address type 0x00 = PUBLIC. The radio's own BD_ADDR (the one L1 read) is used as
+/// the scanner address. Passive scanning never transmits, so this field selects nothing that goes
+/// on air here; public is the honest declaration and matches the address L1 witnessed.
+#[cfg(feature = "bt")]
+const BT_LE_OWN_ADDR_PUBLIC: u8 = 0x00;
+/// BT-L2 — scanning filter policy 0x00 = accept all advertising packets (no white list). The white
+/// list is empty on a freshly reset controller, so any other policy would filter everything out.
+#[cfg(feature = "bt")]
+const BT_LE_SCAN_FILTER_ALL: u8 = 0x00;
+/// BT-L2 — HCI event code for an LE Meta Event (Bluetooth Core, Vol 4 Part E) and the subevent
+/// code for LE Advertising Report.
+#[cfg(feature = "bt")]
+const BT_EVT_LE_META: u8 = 0x3E;
+#[cfg(feature = "bt")]
+const BT_LE_SUBEVT_ADV_REPORT: u8 = 0x02;
+/// BT-L2 — AD structure types carrying a device name (Bluetooth Core Supplement / Assigned
+/// Numbers, Generic Access Profile): 0x08 Shortened Local Name, 0x09 Complete Local Name.
+#[cfg(feature = "bt")]
+const BT_AD_NAME_SHORT: u8 = 0x08;
+#[cfg(feature = "bt")]
+const BT_AD_NAME_COMPLETE: u8 = 0x09;
+/// BT-L2 — the BOUNDED scan window, in milliseconds of wall clock. 500 ms is the whole of what
+/// this arc costs the boot beyond a handful of control transfers, and it is chosen against the
+/// advertising intervals real devices use: connectable-discoverable advertisers (phones, watches,
+/// headphones in pairing or background mode) sit in the 20-300 ms band, so a 500 ms continuous
+/// listen sees each of them several times, while a device on a 1.28 s low-power interval may be
+/// missed — which is why the rollup reports a WINDOW, never a room. Enlarging it buys diminishing
+/// discovery for linear boot time; the constant is here so that trade is a one-line decision.
+#[cfg(feature = "bt")]
+const BT_L2_SCAN_MS: u64 = 500;
+/// BT-L2 — cap on DISTINCT devices held in the scan table (and therefore on witness lines). Bench
+/// rooms with a dozen live radios are ordinary; 16 covers that with slack. Reports for a
+/// seventeenth distinct address are COUNTED and the rollup says the table truncated — silent
+/// truncation would read as "that is all there was".
+#[cfg(feature = "bt")]
+const BT_L2_MAX_DEV: usize = 16;
+/// BT-L2 — cap on the local-name bytes kept per device. AD names run to 29 bytes; 24 keeps the
+/// witness line one serial line without eliding the distinguishing part of a real name. A name cut
+/// at the cap is printed with a trailing `~`.
+#[cfg(feature = "bt")]
+const BT_L2_NAME_MAX: usize = 24;
 /// BT-L1 — reassembly cap for one HCI event that spans multiple event-endpoint packets. The event
 /// endpoint's max packet is 16 B (census: `IN1/int/16`), but an HCI event runs up to 2 + 255 B;
 /// the USB transport delivers it as ceil(len/mps) interrupt-IN transfers. 260 covers the largest
@@ -741,6 +847,74 @@ struct BtEvtEp {
     buf: *mut u8,
     buf_phys: u64,
     mps: u16,
+}
+
+/// BT-L2 — outcome of ONE reassembled HCI event read off the event endpoint.
+///
+/// `Idle` is the case that only exists because L2 reads on a DEADLINE rather than on a command:
+/// the first packet's budget expired with **the transfer still armed**. The endpoint is still
+/// byte-synchronised and the toggle is unadvanced, so the caller may either poll it again or hand
+/// it to the next command as pre-armed — what it must NOT do is arm a second transfer over it.
+/// `Stop` means the endpoint is no longer usable (halted, or a timeout part-way through an event,
+/// which loses the toggle's relationship to the device).
+#[cfg(feature = "bt")]
+enum BtEvt {
+    /// A complete event of `len` bytes sits in the caller's reassembly buffer. `trunc` = the event
+    /// declared more than the buffer holds. No transfer is armed.
+    Got { len: usize, trunc: bool },
+    /// First-packet budget expired. THE TRANSFER IS STILL ARMED; `0` is the qTD token as read.
+    Idle(u32),
+    /// The EVENT ENDPOINT is unusable — **no further EVENT READ may be issued on it**.
+    ///
+    /// This forbids reads on the interrupt-IN event endpoint. It does NOT forbid EP0: the
+    /// mandatory `HCI_LE_Set_Scan_Enable(disable)` is a control-OUT on a different endpoint, and
+    /// it is the write that actually stops the radio, so it still goes out on every path that
+    /// could have started a scan. What it may not do is *read the reply*. The two `Stop` causes
+    /// are handled differently by `bt_le_scan`:
+    ///
+    /// * **halted** (`QTD_ERR_MASK`) — the endpoint retired the transfer. The disable is sent with
+    ///   `bt_hci_send` alone and witnessed as explicitly UNREAD; no `CommandComplete` is claimed,
+    ///   and no stall clear is attempted (this arc does not re-open a halted endpoint).
+    /// * **mid-event timeout** — the endpoint is fine, the *event* is lost, and the transfer is
+    ///   STILL ARMED (see `bt_read_full_event`). That is the ordinary pre-armed hand-off: the
+    ///   disable's `bt_hci_command_ex` consumes the outstanding transfer instead of arming over it.
+    Stop,
+}
+
+/// BT-L2 — one distinct device seen during the scan window.
+///
+/// Keyed by (address, address type): a device that changes its resolvable-private address mid-scan
+/// is genuinely a different address on the air, and this table reports the air, not a guess about
+/// identity. `rssi` is the LATEST report's value (not a peak or an average — an average over an
+/// unknown number of channel dwells would be a statistic this arc has not earned).
+#[cfg(feature = "bt")]
+#[derive(Clone, Copy)]
+struct BtDev {
+    addr: [u8; 6],
+    atype: u8,
+    evt: u8,
+    rssi: i8,
+    name: [u8; BT_L2_NAME_MAX],
+    nlen: u8,
+    /// Set when the name was cut at `BT_L2_NAME_MAX`.
+    ncut: bool,
+    reports: u16,
+}
+
+#[cfg(feature = "bt")]
+impl Default for BtDev {
+    fn default() -> Self {
+        BtDev {
+            addr: [0; 6],
+            atype: 0,
+            evt: 0,
+            rssi: 127, // 127 = RSSI not available (Bluetooth Core)
+            name: [0; BT_L2_NAME_MAX],
+            nlen: 0,
+            ncut: false,
+            reports: 0,
+        }
+    }
 }
 
 pub static EHCI_HID: Mutex<Option<Vec<Controller>>> = Mutex::new(None);
@@ -2636,24 +2810,49 @@ impl Controller {
         }
         let Some(e) = self.bt_arm_events(t, evt_ep, evt_mps) else { return true };
         let mut toggle = false; // DTC=1 on the QH: software owns the toggle; first IN is DATA0.
+        // THE ONE `armed` FLAG for this radio, threaded through every L0/L1/L2 command. It says
+        // whether an interrupt-IN transfer is outstanding on the event endpoint; nothing may
+        // `bt_arm_read` while it is true. It is false here because nothing has been armed yet.
+        let mut armed = false;
 
         // HCI_Reset — OGF 0x03 / OCF 0x0003 => opcode 0x0C03, zero parameters. ROM-level: it
         // answers before any patchram blob is loaded, which is what makes P7 free to test.
+        // BT-L2 STAGE GUARD (review note 2, inherited from L1): L1 ran unconditionally — even
+        // where L0 had timed out — on a toggle whose relationship to the device was then unknown.
+        // Its writes were idempotent so the blast radius was nil, but L2 arms a REPEATED event
+        // stream on the controller that also carries the internal keyboard and trackpad. So each
+        // stage now records whether it CONFIRMED, and the scan does not start unless they all did.
+        let mut reset_ok = false;
+        let mut ver_ok = false;
         let mut rp = [0u8; 16];
-        match self.bt_hci_command(t, intf, &e, &mut toggle, BT_HCI_RESET, &[], &mut rp) {
-            Some(n) if n >= 1 => serial_println!(
-                ":: bt-l0: [{}] HCI_Reset (0x0C03) -> CmdComplete status={:#04x} -> {} == witness ::",
-                self.idx, rp[0],
-                if rp[0] == 0 { "OK" } else { "NONZERO-STATUS" }
-            ),
+        match self.bt_hci_command(t, intf, &e, &mut toggle, BT_HCI_RESET, &[], &mut rp, &mut armed) {
+            Some(n) if n >= 1 => {
+                reset_ok = rp[0] == 0;
+                serial_println!(
+                    ":: bt-l0: [{}] HCI_Reset (0x0C03) -> CmdComplete status={:#04x} -> {} == witness ::",
+                    self.idx, rp[0],
+                    if rp[0] == 0 { "OK" } else { "NONZERO-STATUS" }
+                );
+            }
             Some(_) => serial_println!(
                 ":: bt-l0: [{}] HCI_Reset (0x0C03) -> CmdComplete with NO status byte -> MALFORMED ::",
                 self.idx
             ),
-            None => serial_println!(
-                ":: bt-l0: [{}] HCI_Reset (0x0C03) -> NO-RESPONSE (bounded wait expired) ::",
-                self.idx
-            ),
+            None => {
+                // L0 STOP (finding 3). HCI_Reset drawing no reply is not a row to note and walk
+                // past: the very first command on this endpoint did not complete, so either a
+                // transfer is still outstanding (`armed`) or the toggle's relationship to the
+                // device is unknown — and every command after it would be issued into that. The
+                // stage guard below would already have blocked the L2 scan; this stops the L0/L1
+                // traffic too. `bt_quiesce_events` writes the qTD token to 0, which is what
+                // DISARMS the outstanding transfer before this function returns.
+                serial_println!(
+                    ":: bt-l0: [{}] HCI_Reset (0x0C03) -> NO-RESPONSE (bounded wait expired) — L0 STOP: no further HCI command is issued on this radio (armed={}), and the event endpoint is quiesced ::",
+                    self.idx, armed
+                );
+                self.bt_quiesce_events(&e);
+                return true;
+            }
         }
 
         // HCI_Read_Local_Version_Information — OGF 0x04 / OCF 0x0001 => opcode 0x1001, zero
@@ -2664,8 +2863,11 @@ impl Controller {
         // Broadcom is 0x000F. That field cannot be produced by our own code, by a timing
         // artefact, or by a hopeful default — it can only come off the radio.
         let mut rp2 = [0u8; 16];
-        match self.bt_hci_command(t, intf, &e, &mut toggle, BT_HCI_READ_LOCAL_VERSION, &[], &mut rp2) {
+        match self.bt_hci_command(
+            t, intf, &e, &mut toggle, BT_HCI_READ_LOCAL_VERSION, &[], &mut rp2, &mut armed,
+        ) {
             Some(n) if n >= 9 => {
+                ver_ok = rp2[0] == 0;
                 let manufacturer = (rp2[5] as u16) | ((rp2[6] as u16) << 8);
                 let hci_rev = (rp2[2] as u16) | ((rp2[3] as u16) << 8);
                 let lmp_subver = (rp2[7] as u16) | ((rp2[8] as u16) << 8);
@@ -2731,19 +2933,27 @@ impl Controller {
             (BT_HCI_READ_LOCAL_COMMANDS, "HCI_Read_Local_Supported_Commands", &[]),
             (BT_HCI_SET_EVENT_MASK, "HCI_Set_Event_Mask", &BT_EVENT_MASK),
         ];
+        // BT-L2 stage guard, continued: `l1_ok` falls to false on ANY row that did not come back
+        // with a well-formed status=0x00 reply; `le_supported` is read from the LMP feature mask
+        // rather than inferred from the 4.0 version number, because a scan on a controller whose
+        // own feature mask denies LE is a command sequence with no defensible expectation.
+        let mut l1_ok = true;
+        let mut le_supported = false;
         for &(opcode, name, params) in l1.iter() {
             // 68 bytes holds the largest L1 return payload — Read_Local_Supported_Commands'
             // status(1) + Supported_Commands(64) = 65 — with slack; every other command is far
             // smaller.
             let mut rp = [0u8; 68];
-            let Some(n) = self.bt_hci_command(t, intf, &e, &mut toggle, opcode, params, &mut rp)
-            else {
+            let Some(n) = self.bt_hci_command(
+                t, intf, &e, &mut toggle, opcode, params, &mut rp, &mut armed,
+            ) else {
                 // Bounded wait expired: name the command and STOP the L1 sequence. Not a hang,
                 // not forced — the event path or a firmware gate is the suspect (see predictions).
                 serial_println!(
                     ":: bt-l1: [{}] {} ({:#06x}) -> NO-RESPONSE (bounded wait expired) — L1 STOP ::",
                     self.idx, name, opcode
                 );
+                l1_ok = false;
                 break;
             };
             if n < 1 {
@@ -2751,9 +2961,13 @@ impl Controller {
                     ":: bt-l1: [{}] {} ({:#06x}) -> CmdComplete with NO status byte -> MALFORMED ::",
                     self.idx, name, opcode
                 );
+                l1_ok = false;
                 continue;
             }
             let status = rp[0];
+            if status != 0 {
+                l1_ok = false;
+            }
             // 0x01 = Unknown HCI Command. Called out explicitly because for a MANDATORY command it
             // is the clean-room / patchram boundary signal (docs/MANIFESTO/CLEAN_ROOM_POLICY.md),
             // not an ordinary error.
@@ -2789,6 +3003,7 @@ impl Controller {
                     let f = &rp[1..9];
                     let le = f[4] & 0x40 != 0;
                     let no_bredr = f[4] & 0x20 != 0;
+                    le_supported = le; // BT-L2 stage guard reads this, not the version number.
                     serial_println!(
                         ":: bt-l1: [{}] HCI_Read_Local_Supported_Features (0x1003) status={:#04x} lmp_features=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] LE(controller)={} BR/EDR-not-supported={} == witness ::",
                         self.idx, status, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], le, no_bredr
@@ -2821,11 +3036,37 @@ impl Controller {
                     self.idx, status,
                     if status == 0 { "OK" } else { "NONZERO-STATUS" }
                 ),
-                _ => serial_println!(
-                    ":: bt-l1: [{}] {} ({:#06x}) status={:#04x} -> SHORT-REPLY ({} return byte(s)) -> MALFORMED ::",
-                    self.idx, name, opcode, status, n
-                ),
+                _ => {
+                    // A reply too short for its own decoder is a MALFORMED row, and the L2 stage
+                    // guard must see it as one — including the `n < 65` reassembly failure that
+                    // review C1 routed here on purpose.
+                    l1_ok = false;
+                    serial_println!(
+                        ":: bt-l1: [{}] {} ({:#06x}) status={:#04x} -> SHORT-REPLY ({} return byte(s)) -> MALFORMED ::",
+                        self.idx, name, opcode, status, n
+                    );
+                }
             }
+        }
+
+        // ---- BT-L2: LE scan — the first thing this radio does that a person can see -----------
+        // THE GUARD (review note 2). A scan is not another idempotent write: it turns on a
+        // REPEATED event stream on the controller that also carries the internal keyboard and the
+        // trackpad. So it starts only from a fully confirmed base — every preceding stage came
+        // back well-formed with status 0x00 — and only on a controller whose own LMP feature mask
+        // claims LE. Anything else prints why and leaves the radio exactly as L1 left it.
+        if !(reset_ok && ver_ok && l1_ok) {
+            serial_println!(
+                ":: bt-l2: [{}] LE scan NOT STARTED — a preceding stage did not confirm (reset_ok={} version_ok={} l1_ok={}); the radio is left as L1 left it ::",
+                self.idx, reset_ok, ver_ok, l1_ok
+            );
+        } else if !le_supported {
+            serial_println!(
+                ":: bt-l2: [{}] LE scan NOT STARTED — LMP feature mask reports LE(controller)=false; no LE command is defensible on this part ::",
+                self.idx
+            );
+        } else {
+            self.bt_le_scan(t, intf, &e, &mut toggle, &mut armed);
         }
 
         // Quiesce: the event endpoint stays LINKED in the frame list (its slot is owned for the
@@ -2834,6 +3075,537 @@ impl Controller {
         // stops issuing INs against a device nothing is reading.
         self.bt_quiesce_events(&e);
         true
+    }
+
+    /// BT-L2 — issue one LE bring-up command and witness its status.
+    ///
+    /// Returns the CommandComplete status byte, or None when no well-formed reply arrived (already
+    /// witnessed). A status of 0x01 (Unknown HCI Command) is called out separately: on an LE
+    /// command it is the patchram/`.hcd` FIRMWARE BOUNDARY (`docs/MANIFESTO/CLEAN_ROOM_POLICY.md`)
+    /// — this arc witnesses it and stops, and adds no firmware path.
+    #[cfg(feature = "bt")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_l2_cmd(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+        opcode: u16,
+        name: &str,
+        params: &[u8],
+    ) -> Option<u8> {
+        let mut rp = [0u8; 16];
+        let Some(n) =
+            self.bt_hci_command_ex(t, intf, e, toggle, opcode, params, &mut rp, armed)
+        else {
+            // `bt_hci_command_ex` returns None for an EP0 SEND FAILURE as well as for a send that
+            // drew no reply, and does not distinguish them in its return. Say so rather than assert
+            // the wait expired: the EP0 failure witnesses itself on its own line if it occurred.
+            serial_println!(
+                ":: bt-l2: [{}] {} ({:#06x}) -> NO-RESPONSE — either the bounded wait expired with no CommandComplete, or the EP0 control-OUT failed (which prints its own line above) ::",
+                self.idx, name, opcode
+            );
+            return None;
+        };
+        if n < 1 {
+            serial_println!(
+                ":: bt-l2: [{}] {} ({:#06x}) -> CmdComplete with NO status byte -> MALFORMED ::",
+                self.idx, name, opcode
+            );
+            return None;
+        }
+        let st = rp[0];
+        if st == 0x01 {
+            serial_println!(
+                ":: bt-l2: [{}] {} ({:#06x}) -> status=0x01 UNKNOWN-CMD — this controller refuses an LE command; that is the patchram/.hcd firmware boundary (docs/MANIFESTO/CLEAN_ROOM_POLICY.md). STOP — no firmware path is added here ::",
+                self.idx, name, opcode
+            );
+        }
+        serial_println!(
+            ":: bt-l2: [{}] {} ({:#06x}) status={:#04x} -> {} == witness ::",
+            self.idx, name, opcode, st,
+            if st == 0 { "OK" } else { "FAIL" }
+        );
+        Some(st)
+    }
+
+    /// BT-L2 — LE SCAN: open the LE event channel, scan passively for a bounded window, report the
+    /// devices heard, and turn the radio back off.
+    ///
+    /// The order is forced by the spec and by what L1's review found. `HCI_Set_Event_Mask` comes
+    /// FIRST because L1 wrote the reset default, and the reset default does not include LE Meta
+    /// Event (bit 61) — every advertising report rides that one bit, so without this write the
+    /// scan below would run correctly, hear everything, and report a silent, entirely wrong empty
+    /// room. `HCI_LE_Set_Event_Mask` then selects the Advertising Report sub-event within that
+    /// channel. Only then are scan parameters set and scanning enabled.
+    ///
+    /// **Scanning is disabled on every exit path that could have enabled it** — including the
+    /// unconfirmed one, where the enable's CommandComplete never arrived and the controller must
+    /// therefore be assumed to be scanning. A radio left scanning burns power and floods the event
+    /// endpoint for the rest of the boot, on the same EHCI controller as the internal keyboard and
+    /// trackpad. The paths that return BEFORE the enable command never enabled anything and have
+    /// nothing to undo.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_le_scan(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+    ) {
+        // TWO GUARDS ARE LOAD-BEARING HERE, and both are outside this function:
+        //
+        // 1. THE L2 STAGE GUARD in `bt_probe` — this is reached only when `reset_ok && ver_ok &&
+        //    l1_ok && le_supported`. Every one of those required a well-formed status=0x00 reply,
+        //    which means every preceding command RETIRED its read: that is the only reason `armed`
+        //    can be relied on to describe the endpoint truthfully on entry. (It is now threaded in
+        //    from `bt_probe` rather than assumed false, so even a path that changes is correct.)
+        // 2. `bt_quiesce_events` in `bt_probe`, AFTER this returns — it writes the qTD token to 0,
+        //    which is what disarms whatever transfer is still outstanding when this function ends.
+        //    Nothing in here needs to un-arm on the way out; nothing in here may leak an armed
+        //    transfer to a LATER subsystem either, because that quiesce is unconditional.
+
+        // ---- 1. HCI_Set_Event_Mask — open the LE Meta Event channel (bit 61) -----------------
+        match self.bt_l2_cmd(
+            t, intf, e, toggle, armed,
+            BT_HCI_SET_EVENT_MASK, "HCI_Set_Event_Mask(+LE-Meta)", &BT_EVENT_MASK_LE,
+        ) {
+            Some(0) => serial_println!(
+                ":: bt-l2: [{}] event mask=0x20001FFFFFFFFFFF — LE Meta Event (bit 61) ENABLED (L1 wrote the reset default 0x00001FFFFFFFFFFF, which does NOT carry it) == witness ::",
+                self.idx
+            ),
+            _ => {
+                serial_println!(
+                    ":: bt-l2: [{}] LE scan NOT STARTED — the event mask could not be widened to carry LE Meta Events; a scan behind this would report nothing and mean nothing ::",
+                    self.idx
+                );
+                return;
+            }
+        }
+
+        // ---- 2. HCI_LE_Set_Event_Mask — select the Advertising Report sub-event ---------------
+        match self.bt_l2_cmd(
+            t, intf, e, toggle, armed,
+            BT_HCI_LE_SET_EVENT_MASK, "HCI_LE_Set_Event_Mask", &BT_LE_EVENT_MASK,
+        ) {
+            Some(0) => serial_println!(
+                ":: bt-l2: [{}] LE event mask=0x000000000000001F — LE Advertising Report (bit 1) ENABLED == witness ::",
+                self.idx
+            ),
+            _ => {
+                serial_println!(
+                    ":: bt-l2: [{}] LE scan NOT STARTED — the LE event mask was not accepted ::",
+                    self.idx
+                );
+                return;
+            }
+        }
+
+        // ---- 3. HCI_LE_Set_Scan_Parameters — passive, continuous, public address --------------
+        // LE_Scan_Type(1) LE_Scan_Interval(2, LE) LE_Scan_Window(2, LE) Own_Address_Type(1)
+        // Scanning_Filter_Policy(1).
+        let sp: [u8; 7] = [
+            BT_LE_SCAN_TYPE_PASSIVE,
+            BT_LE_SCAN_INTERVAL as u8,
+            (BT_LE_SCAN_INTERVAL >> 8) as u8,
+            BT_LE_SCAN_WINDOW as u8,
+            (BT_LE_SCAN_WINDOW >> 8) as u8,
+            BT_LE_OWN_ADDR_PUBLIC,
+            BT_LE_SCAN_FILTER_ALL,
+        ];
+        match self.bt_l2_cmd(
+            t, intf, e, toggle, armed,
+            BT_HCI_LE_SET_SCAN_PARAMS, "HCI_LE_Set_Scan_Parameters", &sp,
+        ) {
+            Some(0) => serial_println!(
+                ":: bt-l2: [{}] scan parameters — type=PASSIVE(listen only, no SCAN_REQ) interval={:#06x}(={}us) window={:#06x}(={}us) => CONTINUOUS (window==interval) own_addr=PUBLIC filter_policy=ACCEPT-ALL == witness ::",
+                self.idx,
+                BT_LE_SCAN_INTERVAL, BT_LE_SCAN_INTERVAL as u32 * 625,
+                BT_LE_SCAN_WINDOW, BT_LE_SCAN_WINDOW as u32 * 625
+            ),
+            _ => {
+                serial_println!(
+                    ":: bt-l2: [{}] LE scan NOT STARTED — scan parameters were not accepted; nothing was enabled ::",
+                    self.idx
+                );
+                return;
+            }
+        }
+
+        // ---- 4. HCI_LE_Set_Scan_Enable(enable) ------------------------------------------------
+        // LE_Scan_Enable(1) Filter_Duplicates(1). Duplicate filtering ON: the controller then
+        // reports each advertiser once per enable, which is what makes a bounded window's report
+        // count a measure of DEVICES rather than of how chatty the room is.
+        let (drain, must_disable) = match self.bt_l2_cmd(
+            t, intf, e, toggle, armed,
+            BT_HCI_LE_SET_SCAN_ENABLE, "HCI_LE_Set_Scan_Enable(enable)", &[0x01, 0x01],
+        ) {
+            Some(0) => {
+                serial_println!(
+                    ":: bt-l2: [{}] scan ENABLED — passive, filter_duplicates=on, bounded window={}ms == witness ::",
+                    self.idx, BT_L2_SCAN_MS
+                );
+                (true, true)
+            }
+            Some(_) => {
+                // An explicit nonzero status means the controller REFUSED to start: nothing is
+                // scanning, so there is nothing to turn off.
+                serial_println!(
+                    ":: bt-l2: [{}] scan NOT enabled — the controller returned a nonzero status; no scan ran and nothing needs disabling ::",
+                    self.idx
+                );
+                (false, false)
+            }
+            None => {
+                // `bt_l2_cmd` returns None for BOTH an EP0 send failure and a send with no
+                // CommandComplete — it cannot tell them apart, so this line must not claim the
+                // packet went out (it previously did). Either way the conservative reading is the
+                // same and it is the one that governs: if the packet DID reach the radio, the radio
+                // may be scanning. Do NOT drain (the event path is the suspect), but DO disable —
+                // an unconfirmed enable is exactly the case the "off on every exit path" rule
+                // exists for, and the disable is harmless if nothing ever started.
+                serial_println!(
+                    ":: bt-l2: [{}] scan enable UNCONFIRMED — no CommandComplete came back, and an EP0 send failure is indistinguishable here (it prints its own line above if it happened). The controller must therefore be ASSUMED to be scanning, so the disable below runs anyway ::",
+                    self.idx
+                );
+                (false, true)
+            }
+        };
+
+        // ---- 5. drain LE Advertising Reports for the bounded window ---------------------------
+        // `ep_halted` = the drain ended on `BtEvt::Stop` from a real endpoint halt, which is the
+        // one state in which the disable below may not read its own reply.
+        let mut ep_halted = false;
+        if drain {
+            ep_halted = self.bt_le_drain(e, toggle, armed);
+        }
+
+        // ---- 6. HCI_LE_Set_Scan_Enable(disable) — the mandatory exit --------------------------
+        // RECONCILIATION with `BtEvt::Stop` ("do not issue further commands"): Stop forbids further
+        // EVENT READS on the interrupt-IN endpoint, not this EP0 control-OUT — and the EP0 write is
+        // the thing that actually stops the radio, so it goes out on every path that could have
+        // started a scan. Only the READ is conditional:
+        //   * halted endpoint  -> send only, and witness explicitly that nothing was read. No stall
+        //     clear and no toggle reset is attempted: re-opening a halted endpoint is a decision
+        //     with its own evidence requirements and this arc does not make it.
+        //   * everything else (including a mid-event timeout Stop, and a window that simply
+        //     expired) -> the transfer is still ARMED and `armed` carries it forward; the pre-armed
+        //     hand-off in `bt_hci_command_ex` consumes it rather than arming a second qTD over it.
+        if must_disable {
+            if ep_halted {
+                let sent = self.bt_hci_send(t, intf, BT_HCI_LE_SET_SCAN_ENABLE, &[0x00, 0x00]);
+                serial_println!(
+                    ":: bt-l2: [{}] scan disable SENT UNREAD — the event endpoint HALTED during the drain, so NO CommandComplete was read for HCI_LE_Set_Scan_Enable(0x200C) enable=0 and none is claimed; reading a halted endpoint is exactly what BtEvt::Stop forbids. The EP0 control-OUT, which is what stops the radio, was {} ::",
+                    self.idx,
+                    if sent { "SENT successfully" } else { "REFUSED by EP0 (see the line above)" }
+                );
+            } else {
+                let mut rp = [0u8; 16];
+                match self.bt_hci_command_ex(
+                    t, intf, e, toggle,
+                    BT_HCI_LE_SET_SCAN_ENABLE, &[0x00, 0x00], &mut rp, armed,
+                ) {
+                    Some(n) if n >= 1 => serial_println!(
+                        ":: bt-l2: [{}] scan DISABLED — HCI_LE_Set_Scan_Enable(0x200C) enable=0 status={:#04x} -> {} == witness ::",
+                        self.idx, rp[0],
+                        if rp[0] == 0 { "OK" } else { "NONZERO-STATUS" }
+                    ),
+                    _ => serial_println!(
+                        ":: bt-l2: [{}] scan disable UNCONFIRMED — no CommandComplete for HCI_LE_Set_Scan_Enable(0x200C) enable=0. The EP0 write is what stops the radio and it was attempted (an EP0 failure prints its own line above); what is missing is the confirmation, not the attempt ::",
+                        self.idx
+                    ),
+                }
+            }
+        }
+    }
+
+    /// BT-L2 — read LE Advertising Reports off the event endpoint for a BOUNDED wall-clock window
+    /// and build the distinct-device table.
+    ///
+    /// The window is why `bt_read_full_event` takes a budget: `hw_wait_budget()` is two seconds
+    /// per silent read, so a drain built on the L0/L1 read primitive would cost seconds in a quiet
+    /// room. Here each first-packet read is bounded by what REMAINS of the window, so an empty
+    /// room costs exactly `BT_L2_SCAN_MS` and no more — and the one transfer left armed when the
+    /// window expires is handed forward (`armed`) to the disable command rather than abandoned.
+    ///
+    /// WHAT L2 COSTS, stated as a bound and not as the happy path: the DRAIN is capped at
+    /// `BT_L2_SCAN_MS`, but the commands around it are not. Each of the five bring-up commands and
+    /// the mandatory disable reads its CommandComplete on the full `hw_wait_budget()` (~1.1 s at
+    /// the bench part's 2.3 GHz, up to ~2.5 s under TCG) for its FIRST packet, so a radio that
+    /// stops answering can add up to roughly one budget per outstanding command — the disable alone
+    /// is ~2.5 s worst case. The scan window is bounded; the L2 STAGE is bounded by those budgets,
+    /// on the order of seconds, not by 500 ms and not by any "≤800 ms" figure.
+    ///
+    /// Nothing is printed inside the loop: serial at 115200 is far slower than the event stream,
+    /// so a per-report print would make the instrument change what it measures. The table is
+    /// collected first and witnessed after, which also lets a name arriving in a later report be
+    /// attached to a device first heard without one.
+    /// Returns whether the drain ended on a HALTED event endpoint (`BtEvt::Stop` from
+    /// `QTD_ERR_MASK`). The caller needs that fact to decide whether the mandatory scan-disable may
+    /// read its own `CommandComplete` — see `BtEvt::Stop`.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_le_drain(&mut self, e: &BtEvtEp, toggle: &mut bool, armed: &mut bool) -> bool {
+        // Window in TSC units. `tsc_hz()` is 0 only if calibration failed or ran too early.
+        //
+        // UNCALIBRATED FALLBACK, stated honestly: with `tsc_hz() == 0` there is no cycles->time
+        // mapping at all, so no fallback can be `BT_L2_SCAN_MS` in wall-clock terms — the best
+        // available is a deliberately chosen CYCLE count. `hw_wait_budget()` in that state returns
+        // the fixed `HW_WAIT_BUDGET` = 2.5e9-cycle guess (NOT 2 s of anything), so a quarter of it
+        // is 625e6 cycles: ~0.27 s on the 2.3 GHz bench part, ~0.13 s at 5 GHz, ~0.63 s at 1 GHz.
+        // That is the same ORDER as the nominal 500 ms window across the plausible clock range,
+        // which is the whole of the claim — it is a bounded guess, not a 500 ms window.
+        //
+        // The rollup below prints the window through `epace_ms`, which also needs `tsc_hz()`; with
+        // it zero the rollup reads `window=0ms(nominal 500ms)`. THAT PAIR IS THE UNCALIBRATED
+        // SIGNATURE — a zero window in the witness means the TSC was uncalibrated, never that the
+        // drain did not run.
+        let hz = crate::arch::x86_64::apic::tsc_hz();
+        let win_cy = if hz != 0 {
+            (hz / 1000).saturating_mul(BT_L2_SCAN_MS)
+        } else {
+            crate::arch::hw_wait_budget() / 4
+        };
+        let t0 = crate::arch::now_cycles();
+
+        let mut devs = [BtDev::default(); BT_L2_MAX_DEV];
+        let mut ndev = 0usize;
+        let mut dropped = 0u32; // reports whose address the table had no room for
+        let mut reports = 0u32; // advertising reports decoded
+        let mut events = 0u32; // whole events reassembled
+        let mut other = 0u32; // events that were not LE Advertising Reports
+        let mut malformed = 0u32; // events that claimed to be but did not parse
+        let mut multi = 0u32; // events declaring Num_Reports > 1
+        let mut extra = 0u32; // reports inside those events that were NOT decoded
+        let mut halted = false;
+        let mut asm = [0u8; BT_EVT_ASM_MAX];
+
+        loop {
+            let el = crate::arch::now_cycles().wrapping_sub(t0);
+            if el >= win_cy {
+                break;
+            }
+            let (len, trunc) = match self.bt_read_full_event(e, toggle, armed, win_cy - el, &mut asm)
+            {
+                BtEvt::Got { len, trunc } => (len, trunc),
+                // Window expired with nothing on the wire. The transfer stays armed (`*armed`);
+                // the disable command consumes it.
+                BtEvt::Idle(_) => break,
+                BtEvt::Stop => {
+                    halted = true;
+                    break;
+                }
+            };
+            if len < 2 {
+                continue; // zero-length packet: not an event
+            }
+            events += 1;
+            if trunc {
+                // REASSEMBLY TRUNCATION IS UNREACHABLE FOR A SPEC-CONFORMING EVENT. An HCI event is
+                // at most EventCode(1) + Parameter_Total_Length(1) + 255 = 257 bytes, and the
+                // reassembly cap `BT_EVT_ASM_MAX` is 260 — so `trunc` can only be set by an event
+                // that declared more than the spec allows, or by the packet-count ceiling. What
+                // that means for the witness: `malformed=` in the rollup is driven by the PARSE
+                // GUARDS below (num==0, len<13, a data length past the event), not by reassembly.
+                // A nonzero `malformed=` is a statement about event CONTENT, not about buffering.
+                malformed += 1;
+                continue;
+            }
+            let pkt = &asm[..len];
+            // LE Meta Event: EventCode(1)=0x3E Parameter_Total_Length(1) Subevent_Code(1) ...
+            if pkt[0] != BT_EVT_LE_META || len < 4 || pkt[2] != BT_LE_SUBEVT_ADV_REPORT {
+                other += 1;
+                continue;
+            }
+            // LE Advertising Report: Num_Reports(1) then, per report, Event_Type(1)
+            // Address_Type(1) Address(6) Length_Data(1) Data(Length_Data) RSSI(1).
+            let num = pkt[3];
+            if num == 0 {
+                malformed += 1;
+                continue;
+            }
+            if num > 1 {
+                // The spec renders the fields as parallel arrays for Num_Reports > 1; controllers
+                // in practice emit exactly one. Rather than guess a layout this arc has not seen
+                // on the wire, the FIRST report is decoded and the remainder are COUNTED and named
+                // in the rollup.
+                multi += 1;
+                extra += (num - 1) as u32;
+            }
+            if len < 13 {
+                malformed += 1;
+                continue;
+            }
+            let evt_type = pkt[4];
+            let atype = pkt[5];
+            let mut addr = [0u8; 6];
+            addr.copy_from_slice(&pkt[6..12]);
+            let dlen = pkt[12] as usize;
+            if len < 13 + dlen + 1 {
+                malformed += 1;
+                continue;
+            }
+            let data = &pkt[13..13 + dlen];
+            let rssi = pkt[13 + dlen] as i8;
+            reports += 1;
+
+            // AD structures: a sequence of (Length(1), AD_Type(1), AD_Data(Length-1)). Walk far
+            // enough to find a local name; a Complete Local Name (0x09) ends the walk, a Shortened
+            // one (0x08) is kept but the walk continues in case the complete name follows.
+            let mut name = [0u8; BT_L2_NAME_MAX];
+            let mut nlen = 0usize;
+            let mut ncut = false;
+            let mut off = 0usize;
+            while off + 2 <= dlen {
+                let l = data[off] as usize;
+                if l == 0 || off + 1 + l > dlen {
+                    break; // 0 = end of significant part; over-long = malformed tail, stop
+                }
+                let ty = data[off + 1];
+                if ty == BT_AD_NAME_COMPLETE || ty == BT_AD_NAME_SHORT {
+                    let src = &data[off + 2..off + 1 + l];
+                    // An EMPTY name field (Length==1: type byte only, no data) is legal on the air
+                    // and carries no name. Without this guard a Complete Local Name of zero bytes
+                    // ERASED a Shortened name captured earlier in the same walk — a device that
+                    // advertises "Pete" then an empty complete name would print name=(none). An
+                    // empty field is skipped; a COMPLETE one still ends the walk, because the
+                    // device has told us there is no longer name to wait for.
+                    if !src.is_empty() {
+                        let take = src.len().min(BT_L2_NAME_MAX);
+                        name[..take].copy_from_slice(&src[..take]);
+                        nlen = take;
+                        ncut = src.len() > BT_L2_NAME_MAX;
+                    }
+                    if ty == BT_AD_NAME_COMPLETE {
+                        break;
+                    }
+                }
+                off += 1 + l;
+            }
+
+            // Merge into the distinct-device table, keyed by (address, address type).
+            let mut hit = None;
+            for i in 0..ndev {
+                if devs[i].addr == addr && devs[i].atype == atype {
+                    hit = Some(i);
+                    break;
+                }
+            }
+            match hit {
+                Some(i) => {
+                    devs[i].reports = devs[i].reports.saturating_add(1);
+                    devs[i].rssi = rssi; // latest, not an average this arc has not earned
+                    devs[i].evt = evt_type;
+                    if devs[i].nlen == 0 && nlen > 0 {
+                        devs[i].name = name;
+                        devs[i].nlen = nlen as u8;
+                        devs[i].ncut = ncut;
+                    }
+                }
+                None if ndev < BT_L2_MAX_DEV => {
+                    devs[ndev] = BtDev {
+                        addr,
+                        atype,
+                        evt: evt_type,
+                        rssi,
+                        name,
+                        nlen: nlen as u8,
+                        ncut,
+                        reports: 1,
+                    };
+                    ndev += 1;
+                }
+                None => dropped += 1,
+            }
+        }
+
+        let elapsed = epace_ms(crate::arch::now_cycles().wrapping_sub(t0)).unwrap_or(0);
+
+        // ---- witness: one line per distinct device -------------------------------------------
+        for i in 0..ndev {
+            let d = devs[i];
+            // BD_ADDR travels little-endian (LSB first) and is rendered MSB-first, the human
+            // notation — the same order L1's `bd_addr=` line uses.
+            serial_print!(
+                ":: bt-l2: [{}] dev {:02} addr={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={} evt={} rssi=",
+                self.idx, i + 1,
+                d.addr[5], d.addr[4], d.addr[3], d.addr[2], d.addr[1], d.addr[0],
+                match d.atype {
+                    0x00 => "public",
+                    0x01 => "random",
+                    0x02 => "public-identity",
+                    0x03 => "random-identity",
+                    _ => "reserved",
+                },
+                match d.evt {
+                    0x00 => "ADV_IND",
+                    0x01 => "ADV_DIRECT_IND",
+                    0x02 => "ADV_SCAN_IND",
+                    0x03 => "ADV_NONCONN_IND",
+                    0x04 => "SCAN_RSP",
+                    _ => "reserved",
+                }
+            );
+            if d.rssi == 127 {
+                serial_print!("n/a");
+            } else {
+                serial_print!("{}dBm", d.rssi);
+            }
+            serial_print!(" reports={} name=", d.reports);
+            if d.nlen == 0 {
+                serial_print!("(none)");
+            } else {
+                serial_print!("\"");
+                for j in 0..d.nlen as usize {
+                    let b = d.name[j];
+                    // Names are UTF-8 on the air; the serial witness is ASCII, so anything outside
+                    // printable ASCII is shown as '.' rather than corrupting the line.
+                    serial_print!("{}", if (0x20..0x7F).contains(&b) { b as char } else { '.' });
+                }
+                serial_print!("\"{}", if d.ncut { "~(cut)" } else { "" });
+            }
+            serial_println!(" == witness ::");
+        }
+
+        // ---- witness: the rollup --------------------------------------------------------------
+        serial_println!(
+            ":: bt-l2: [{}] LE scan rollup — window={}ms(nominal {}ms) distinct_devices={} adv_reports={} events={} non_adv_events={} malformed={} multi_report_events={}(extra_reports_not_decoded={}) {} == witness ::",
+            self.idx, elapsed, BT_L2_SCAN_MS, ndev, reports, events, other, malformed, multi, extra,
+            if dropped > 0 {
+                "table TRUNCATED at the cap — further distinct addresses were heard and are NOT listed"
+            } else {
+                "table complete (no truncation)"
+            }
+        );
+        if dropped > 0 {
+            serial_println!(
+                ":: bt-l2: [{}] LE scan TRUNCATION — {} report(s) named address(es) past the {}-device table cap; the device list above is a PREFIX of what was on the air, not all of it ::",
+                self.idx, dropped, BT_L2_MAX_DEV
+            );
+        }
+        if halted {
+            serial_println!(
+                ":: bt-l2: [{}] LE scan ENDED EARLY — the event endpoint stopped being usable mid-window; the counts above cover only the part of the window that ran ::",
+                self.idx
+            );
+        }
+        // ZERO DEVICES is only a statement about the AIR if the window actually ran to term. On a
+        // halt the drain stopped early and the endpoint, not the room, is the story — the
+        // ENDED EARLY line above already says so, and claiming silence on top of it would be a
+        // second, wrong explanation for the same zero. The window quoted is the MEASURED `elapsed`,
+        // not the nominal constant, so a short window cannot masquerade as a full one.
+        if ndev == 0 && !halted {
+            // The failure mode L1's review warned about (a masked LE Meta channel) is ruled out by
+            // construction here: both mask writes above returned status 0x00 and are witnessed, or
+            // this drain never ran. So zero means nothing was heard, not that nothing was routed.
+            serial_println!(
+                ":: bt-l2: [{}] LE scan found ZERO devices. Both the Event Mask (LE Meta, bit 61) and the LE Event Mask (Advertising Report, bit 1) were written and CONFIRMED above, so this is silence on the air across the {}ms measured (nominal {}ms) — not a masked event stream. A bounded window is not a survey: devices advertising slower than it can be missed ::",
+                self.idx, elapsed, BT_L2_SCAN_MS
+            );
+        }
+        halted
     }
 
     /// BT-L0 — build + link the periodic QH for the HCI event endpoint. Same QH shape and same
@@ -2912,12 +3684,17 @@ impl Controller {
         Some(BtEvtEp { qh, qtd, qtd_phys, buf, buf_phys, mps })
     }
 
-    /// BT-L0 — arm ONE interrupt-IN transfer on the event endpoint and bounded-wait for it.
-    /// Returns the number of bytes received (possibly 0 — a zero-length packet retires the
-    /// transfer too), or None on timeout or a halted endpoint. Mirrors the two transfer modes
-    /// the driver self-selects (overlay-direct on this metal, qTD-chain on QEMU).
+    /// BT-L0 — arm ONE interrupt-IN transfer on the event endpoint. Does NOT wait.
+    ///
+    /// BT-L2 split this out of `bt_read_event` so that a read can be *polled to a deadline*
+    /// instead of always spending a full `hw_wait_budget()`: the LE-scan drain reads on a
+    /// wall-clock window, and at 2 s per silent read (`HW_WAIT_SECONDS`) a bounded window is
+    /// impossible without separating the arm from the wait. Arming over an already-armed transfer
+    /// would clobber a qTD the controller may be executing — every caller must therefore know
+    /// whether one is outstanding (see `BtEvt::Idle`). Mirrors the two transfer modes the driver
+    /// self-selects (overlay-direct on this metal, qTD-chain on QEMU).
     #[cfg(feature = "bt")]
-    unsafe fn bt_read_event(&mut self, e: &BtEvtEp, toggle: bool) -> Option<usize> {
+    unsafe fn bt_arm_read(&mut self, e: &BtEvtEp, toggle: bool) {
         let dt = if toggle { QTD_DT } else { 0 };
         let total = e.mps as u32;
         if self.overlay_mode {
@@ -2936,39 +3713,171 @@ impl Controller {
             (*e.qh).overlay[2] = 0;
             (*e.qh).overlay[0] = e.qtd_phys as u32;
         }
+    }
+
+    /// BT-L0/L2 — poll the ARMED interrupt-IN transfer for at most `budget` `now_cycles()` units.
+    ///
+    /// Returns `Some(len)` when the transfer retired (possibly 0 — a zero-length packet retires a
+    /// transfer too), or `None` on budget expiry **or** a halted endpoint; `*halted` distinguishes
+    /// the two, because they are opposite facts: on expiry the transfer is STILL ARMED and the
+    /// endpoint is fine, on a halt the endpoint is retired. Prints nothing on expiry — L2 expires
+    /// on purpose, once per scan window — but does witness a halt, which is never routine.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_wait_read(&mut self, e: &BtEvtEp, budget: u64, halted: &mut bool) -> Option<usize> {
+        *halted = false;
         let om = self.overlay_mode;
         let (qh, qtd) = (e.qh, e.qtd);
-        // BOUNDED: `wait_bounded` is the driver's TSC-backed `hw_wait_budget()` deadline — the
-        // same bound every other wait in this file uses. A radio that never answers costs one
-        // budget here, not a hung boot.
-        let done = wait_bounded(|| {
-            let tok = if om {
+        let read_tok = || {
+            if om {
                 core::ptr::read_volatile(&(*qh).overlay[2])
             } else {
                 core::ptr::read_volatile(&(*qtd).token)
-            };
-            tok & QTD_ACTIVE == 0
-        });
-        let tok = if om {
-            core::ptr::read_volatile(&(*qh).overlay[2])
-        } else {
-            core::ptr::read_volatile(&(*qtd).token)
+            }
         };
+        // BOUNDED, exactly as `wait_bounded` is, but on a CALLER-SUPPLIED budget: L0/L1 pass
+        // `hw_wait_budget()` and get the pre-L2 behaviour byte for byte; L2's drain passes what is
+        // left of its scan window. A radio that never answers costs one budget, not a hung boot.
+        let start = crate::arch::now_cycles();
+        let mut done = false;
+        loop {
+            if read_tok() & QTD_ACTIVE == 0 {
+                done = true;
+                break;
+            }
+            if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let tok = read_tok();
         if !done {
-            serial_println!(
-                ":: bt-l0: [{}] STOP-NOTE HCI event IN timed out (token={:#010x}) — not forced ::",
-                self.idx, tok
-            );
             return None;
         }
         if tok & QTD_ERR_MASK != 0 {
+            *halted = true;
             serial_println!(
                 ":: bt-l0: [{}] STOP-NOTE HCI event endpoint halted (token={:#010x}) — endpoint retired, not forced ::",
                 self.idx, tok
             );
             return None;
         }
-        Some((total.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF)) as usize)
+        Some(((e.mps as u32).saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF)) as usize)
+    }
+
+    /// BT-L1/L2 — reassemble ONE complete HCI event off the event endpoint.
+    ///
+    /// The event endpoint's max packet is 16 B, but an HCI event runs up to 2 + 255 B. One
+    /// interrupt-IN transaction is one packet; a whole event is ceil(len/mps) of them, and the data
+    /// toggle advances on EVERY packet regardless of event boundaries. So: the first packet gives
+    /// the event's total length (`2 + Parameter_Total_Length`) and the rest are read (toggling
+    /// each time) until the event is gathered.
+    ///
+    /// `armed` says a transfer is ALREADY outstanding (L2's drain leaves exactly one behind when
+    /// its window expires); it is consumed rather than re-armed, and cleared. `first_budget`
+    /// bounds only the FIRST packet — once an event has begun, continuation packets always use the
+    /// full `hw_wait_budget()`, because abandoning an event half-read is what actually desyncs the
+    /// toggle. That is why an expiry mid-event returns `Stop` while an expiry before one returns
+    /// `Idle`.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_read_full_event(
+        &mut self,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+        first_budget: u64,
+        asm: &mut [u8],
+    ) -> BtEvt {
+        let cap = asm.len().min(BT_EVT_ASM_MAX);
+        if !*armed {
+            self.bt_arm_read(e, *toggle);
+        }
+        // ARMED IS A FACT ABOUT THE CONTROLLER, NOT A WISH. From here a transfer IS outstanding,
+        // and `*armed` is cleared only where one of two things actually retired it: a successful
+        // `bt_wait_read` (the qTD completed), or a halt (the endpoint retired it itself). It is
+        // NEVER cleared on the `!halted` budget expiry: there the qTD is still ACTIVE and
+        // CONTROLLER-OWNED, and a cleared flag would let the next caller `bt_arm_read` a second
+        // qTD over a live one — a DMA race on the shared buffer plus a toggle desync. This is the
+        // invariant `BtEvt::Idle` documents, and it must hold on the MID-EVENT expiry below too,
+        // which returns `Stop` rather than `Idle` but leaves the same live transfer behind.
+        *armed = true;
+        let mut halted = false;
+        let Some(n0) = self.bt_wait_read(e, first_budget, &mut halted) else {
+            if halted {
+                // A halt retires the transfer with the endpoint: nothing is outstanding.
+                *armed = false;
+                return BtEvt::Stop;
+            }
+            // Budget expired with the transfer still armed and the toggle unadvanced.
+            let tok = if self.overlay_mode {
+                core::ptr::read_volatile(&(*e.qh).overlay[2])
+            } else {
+                core::ptr::read_volatile(&(*e.qtd).token)
+            };
+            return BtEvt::Idle(tok);
+        };
+        *armed = false;
+        *toggle = !*toggle;
+        if n0 == 0 {
+            // A zero-length packet retires a transfer with nothing to parse. Not an event.
+            return BtEvt::Got { len: 0, trunc: false };
+        }
+        let take0 = n0.min(e.mps as usize).min(cap);
+        core::ptr::copy_nonoverlapping(e.buf, asm.as_mut_ptr(), take0);
+        let mut have = take0;
+        if have < 2 {
+            return BtEvt::Got { len: have, trunc: false }; // malformed: no event header
+        }
+        let total = 2 + asm[1] as usize; // EventCode(1) Parameter_Total_Length(1) + params
+        let mut trunc = false;
+        let max_pkts = cap / (e.mps as usize).max(1) + 2;
+        let mut pkts = 1;
+        while have < total {
+            if pkts >= max_pkts {
+                trunc = true;
+                break;
+            }
+            self.bt_arm_read(e, *toggle);
+            *armed = true;
+            let Some(ni) = self.bt_wait_read(e, crate::arch::hw_wait_budget(), &mut halted) else {
+                if !halted {
+                    // The qTD is STILL ACTIVE and controller-owned. `Stop` here means the EVENT is
+                    // lost (the toggle's relationship to the device is gone), not that the transfer
+                    // is gone — so `*armed` stays TRUE and is handed forward, exactly as on the
+                    // `Idle` path. Clearing it here was the bug: the mandatory scan-disable's own
+                    // `bt_read_full_event` would then have armed a second qTD over this live one.
+                    serial_println!(
+                        ":: bt-l0: [{}] STOP-NOTE HCI event IN timed out mid-event ({} of {} bytes) — not forced; the transfer is left ARMED and handed forward ::",
+                        self.idx, have, total
+                    );
+                } else {
+                    *armed = false;
+                }
+                return BtEvt::Stop;
+            };
+            *armed = false;
+            *toggle = !*toggle;
+            pkts += 1;
+            let ni = ni.min(e.mps as usize);
+            if ni == 0 {
+                // A short/zero packet before `total` ends the event early — treat what we have as
+                // the whole of it rather than reading into the next event.
+                break;
+            }
+            let room = cap - have;
+            let store = ni.min(room);
+            core::ptr::copy_nonoverlapping(e.buf, asm.as_mut_ptr().add(have), store);
+            have += store;
+            if store < ni {
+                // Buffer full but the event continues; we have already read this packet off the
+                // endpoint (sync preserved). Nothing more can be stored.
+                trunc = true;
+                break;
+            }
+            if ni < e.mps as usize {
+                break; // short packet = last packet of the event
+            }
+        }
+        BtEvt::Got { len: have, trunc }
     }
 
     /// BT-L0/L1 — issue one HCI command over the control endpoint and drain the event endpoint
@@ -3003,7 +3912,25 @@ impl Controller {
         opcode: u16,
         params: &[u8],
         out: &mut [u8],
+        // BOUNCE FIX (finding 3): this used to pass `&mut false`, DISCARDING the armed-out. On the
+        // L0/L1 path a command that timed out on its first packet left a live qTD behind and the
+        // next command armed a second one over it — the same DMA race + toggle desync as the L2
+        // bug, one layer down. `bt_probe` now owns ONE `armed` flag and threads it through every
+        // L0/L1/L2 command, so the fact is never dropped on the floor.
+        armed: &mut bool,
     ) -> Option<usize> {
+        self.bt_hci_command_ex(t, intf, e, toggle, opcode, params, out, armed)
+    }
+
+    /// BT-L0/L2 — write ONE HCI command packet into the EP0 data buffer and SEND it. Reads
+    /// nothing. Returns whether the control-OUT succeeded (a failure witnesses itself).
+    ///
+    /// Split out of `bt_hci_command_ex` for the one case where the reply must not be read: when
+    /// the event endpoint has HALTED, `BtEvt::Stop` forbids further event reads, but the mandatory
+    /// `HCI_LE_Set_Scan_Enable(disable)` still has to reach the radio — and it rides EP0, which the
+    /// halt did not touch. See `BtEvt::Stop`.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_hci_send(&mut self, t: &Target, intf: u8, opcode: u16, params: &[u8]) -> bool {
         // The command packet: opcode(2, LE) parameter_total_length(1) parameters(N), written into
         // the EP0 data buffer `control` sends from. `params` is capped by the length field (255)
         // and by the buffer; L1's largest is the 8-byte event mask, so this never truncates in
@@ -3022,6 +3949,33 @@ impl Controller {
                 ":: bt-l0: [{}] HCI command {:#06x} — control-OUT failed on EP0 ::",
                 self.idx, opcode
             );
+            return false;
+        }
+        true
+    }
+
+    /// BT-L2 — `bt_hci_command` with the pre-armed hand-off.
+    ///
+    /// `armed` in => the LE-scan drain left one interrupt-IN transfer outstanding when its window
+    /// expired; that transfer is a perfectly good read and this command's CommandComplete will
+    /// land in it, so it is CONSUMED rather than re-armed over. `armed` out => this command left
+    /// one outstanding in turn (only possible on the first-packet timeout path). This is what lets
+    /// the mandatory `LE_Set_Scan_Enable(disable)` be issued straight out of a drain that ended on
+    /// silence, without arming a second qTD over a live one.
+    #[cfg(feature = "bt")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_hci_command_ex(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        opcode: u16,
+        params: &[u8],
+        out: &mut [u8],
+        armed: &mut bool,
+    ) -> Option<usize> {
+        if !self.bt_hci_send(t, intf, opcode, params) {
             return None;
         }
         // Drain: a controller may emit unrelated events (vendor, Command Status) before the
@@ -3030,50 +3984,27 @@ impl Controller {
         let mut asm = [0u8; BT_EVT_ASM_MAX];
         for _ in 0..BT_EVT_MAX {
             // ---- reassemble ONE complete event -------------------------------------------------
-            let n0 = self.bt_read_event(e, *toggle)?;
-            *toggle = !*toggle;
-            if n0 == 0 {
-                continue; // zero-length packet retires a transfer with nothing to parse; retry
-            }
-            let take0 = n0.min(e.mps as usize).min(BT_EVT_ASM_MAX);
-            core::ptr::copy_nonoverlapping(e.buf, asm.as_mut_ptr(), take0);
-            let mut have = take0;
+            let (have, trunc) = match self.bt_read_full_event(
+                e,
+                toggle,
+                armed,
+                crate::arch::hw_wait_budget(),
+                &mut asm,
+            ) {
+                BtEvt::Got { len, trunc } => (len, trunc),
+                BtEvt::Idle(tok) => {
+                    // Same bound, same message, same "not forced" discipline as before L2 split
+                    // the read primitives: on a COMMAND the full budget expiring is a timeout.
+                    serial_println!(
+                        ":: bt-l0: [{}] STOP-NOTE HCI event IN timed out (token={:#010x}) — not forced ::",
+                        self.idx, tok
+                    );
+                    return None;
+                }
+                BtEvt::Stop => return None,
+            };
             if have < 2 {
-                continue; // malformed: no event header
-            }
-            let total = 2 + asm[1] as usize; // EventCode(1) Parameter_Total_Length(1) + params
-            // Keep reading packets until the whole event is gathered. Each read still toggles and
-            // is TSC-bounded; the packet count is capped so a stuck endpoint cannot spin here.
-            let mut trunc = false;
-            let max_pkts = BT_EVT_ASM_MAX / (e.mps as usize).max(1) + 2;
-            let mut pkts = 1;
-            while have < total {
-                if pkts >= max_pkts {
-                    trunc = true;
-                    break;
-                }
-                let ni = self.bt_read_event(e, *toggle)?;
-                *toggle = !*toggle;
-                pkts += 1;
-                let ni = ni.min(e.mps as usize);
-                if ni == 0 {
-                    // A short/zero packet before `total` ends the event early — treat what we have
-                    // as the whole of it rather than reading into the next event.
-                    break;
-                }
-                let room = BT_EVT_ASM_MAX - have;
-                let store = ni.min(room);
-                core::ptr::copy_nonoverlapping(e.buf, asm.as_mut_ptr().add(have), store);
-                have += store;
-                if store < ni {
-                    // Buffer full but the event continues; we have already read this packet off
-                    // the endpoint (sync preserved). Nothing more can be stored.
-                    trunc = true;
-                    break;
-                }
-                if ni < e.mps as usize {
-                    break; // short packet = last packet of the event
-                }
+                continue; // zero-length or headerless packet: nothing to parse; retry
             }
             let pkt = &asm[..have];
             // ---- parse -------------------------------------------------------------------------

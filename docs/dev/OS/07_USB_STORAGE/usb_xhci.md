@@ -5810,6 +5810,134 @@ bt-l0 witness (census/claim/reachability, `HCI_Reset -> CmdComplete status=0x00`
 
 ---
 
+## 21. BT-L2 — LE scan: the radio discovers the room (`UNAOS_BT=1`, 2026-08-08)
+
+### 21.1 Where L2 sits
+
+`bt_probe` (in `drivers/ehci/mod.rs`, feature `bt`) now runs three stages against the Broadcom HCI
+controller behind the internal Bluetooth hub:
+
+| stage | what it does | witness prefix |
+|---|---|---|
+| L0 | claim by endpoint evidence, arm the event endpoint, `HCI_Reset`, `Read_Local_Version` | `bt-l0:` |
+| L1 | BD_ADDR, buffer size, supported features/commands, first write (`Set_Event_Mask`) | `bt-l1:` |
+| **L2** | **LE scan: mask, scan parameters, enable, bounded drain, disable** | `bt-l2:` |
+
+No new endpoint is armed at any stage past L0 — L2 is more commands and a drain on the endpoint
+that already exists, so the MTFIX slot budget of §20 is untouched.
+
+### 21.2 The event mask is the whole ballgame
+
+L1's `HCI_Set_Event_Mask` wrote the Bluetooth Core **reset default**, `0x0000_1FFF_FFFF_FFFF`. That
+value is correct as a write-path exercise and wrong for a scanner: it stops at bit 44, and **LE Meta
+Event is bit 61**. Every LE Advertising Report is delivered as an LE Meta Event (event code `0x3E`,
+subevent `0x02`), so a scan run behind the reset default enables correctly, hears every device in
+the room, and reports *nothing* — a clean, silent, entirely wrong "no devices found".
+
+L2 therefore rewrites the mask to `0x2000_1FFF_FFFF_FFFF` (bit 61 = octet 7 bit 5 = `0x20`) before
+anything else, and only then sets the **LE** event mask (`HCI_LE_Set_Event_Mask`, OGF 0x08 / OCF
+0x0001 => `0x2001`) to `0x1F` — the LE reset default, whose bit 1 is LE Advertising Report. Both
+writes are witnessed with their status; if either does not return `0x00` the scan does not start,
+because a scan behind a closed channel would produce a number that means nothing.
+
+This is also why a zero-device rollup is a real finding here rather than an ambiguity: the rollup's
+zero-device line states that both masks were confirmed, so zero means silence on the air.
+
+### 21.3 Scan parameters, and why these numbers
+
+`HCI_LE_Set_Scan_Parameters` (OGF 0x08 / OCF 0x000B => `0x200B`), seven bytes:
+
+| field | value | why |
+|---|---|---|
+| LE_Scan_Type | `0x00` passive | listen only, never transmit SCAN_REQ: discovery must not perturb the room, and cannot be observed by it. Cost: no SCAN_RSP payloads, so names come only from the advertising PDU. |
+| LE_Scan_Interval | `0x0060` = 60 ms | rotates all three advertising channels (37/38/39) in 180 ms, so a 500 ms window covers each several times. |
+| LE_Scan_Window | `0x0060` = 60 ms | **equal to the interval = continuous scanning.** At any lower duty cycle a device could advertise entirely inside the deaf half and the arc would report an empty room it never listened to. A short bounded window is only honest at 100 % duty. |
+| Own_Address_Type | `0x00` public | the BD_ADDR L1 read. Passive scanning transmits nothing, so this declares rather than decides. |
+| Scanning_Filter_Policy | `0x00` accept all | the white list is empty on a freshly reset controller; any other policy filters everything out. |
+
+`HCI_LE_Set_Scan_Enable` (`0x200C`) then enables with `filter_duplicates = 1`, which makes the
+report count a measure of devices rather than of how chatty the room is.
+
+### 21.4 The bounded window, and the read primitive it forced
+
+The drain runs for `BT_L2_SCAN_MS` = **500 ms** of wall clock, measured on the TSC. 500 ms is chosen
+against real advertising intervals: connectable-discoverable devices (phones, watches, headphones)
+sit in the 20-300 ms band and are seen several times over, while a device on a 1.28 s low-power
+interval can be missed. **The rollup reports a window, never a room.**
+
+Making that bound real required splitting the L0 read primitive. `hw_wait_budget()` on x86 is
+`HW_WAIT_SECONDS` = 2 s, so the old `bt_read_event` (arm + wait one full budget) would cost seconds
+per silent read and no bounded window could exist. `bt_read_event` is now:
+
+- `bt_arm_read` — arm one interrupt-IN transfer, no wait;
+- `bt_wait_read` — poll the armed transfer for a **caller-supplied** budget;
+- `bt_read_full_event` — reassemble one whole event across packets (the L1 mechanism, unchanged),
+  returning `Got` / `Idle` / `Stop`.
+
+`Idle` is the case that only a deadline-driven reader can hit: the first packet's budget expired
+**with the transfer still armed**. Arming a second qTD over a live one would clobber a descriptor
+the controller may be executing, so `Idle` is not silently retried — the armed transfer is handed
+forward (`armed`) to the next command through `bt_hci_command_ex`, whose CommandComplete lands in
+it. Continuation packets *inside* an event always use the full budget: abandoning an event half-read
+is what actually desynchronises the toggle, so a mid-event expiry is `Stop`, not `Idle`.
+
+L0/L1 pass `hw_wait_budget()` and get their pre-L2 behaviour, message for message.
+
+### 21.5 Decoding, and what is reported
+
+An LE Advertising Report carries, per report: Event_Type(1), Address_Type(1), Address(6, little
+endian — rendered MSB-first like L1's `bd_addr=`), Length_Data(1), Data, RSSI(1, signed; `127` =
+not available). The AD payload is walked as `(Length, AD_Type, Value)` triples far enough to pull a
+**Complete (0x09)** or **Shortened (0x08) Local Name**; a complete name ends the walk.
+
+The spec renders the report fields as parallel arrays when `Num_Reports > 1`; controllers in
+practice emit exactly one. Rather than guess a layout this arc has never seen on the wire, the first
+report is decoded and the remainder are **counted** and named in the rollup
+(`multi_report_events=`, `extra_reports_not_decoded=`).
+
+Devices are keyed by (address, address type) into a 16-entry table — a device that rotates its
+resolvable private address mid-scan is genuinely a different address on the air, and this table
+reports the air. Nothing is printed inside the loop: serial at 115200 is slower than the event
+stream, so a per-report print would make the instrument change what it measures. Reports for a
+seventeenth distinct address are counted and the rollup says the table truncated; **silent
+truncation would read as "that is all there was".**
+
+### 21.6 Off on every exit path
+
+A radio left scanning burns power and floods the event endpoint for the rest of the boot, on the
+same EHCI controller as the internal keyboard and trackpad. So `HCI_LE_Set_Scan_Enable(0)` runs on
+every path that could have started a scan — including the **unconfirmed** enable, where the command
+went out on EP0 but no CommandComplete came back and the controller must therefore be assumed to be
+scanning. The paths that return *before* the enable (mask refused, parameters refused, an explicit
+nonzero enable status) never started anything and have nothing to undo; each says so.
+
+If the disable's own CommandComplete is not observed, the witness says exactly that: the EP0 write
+is what stops the radio and it was attempted; what is missing is the confirmation, not the attempt.
+
+### 21.7 The stage guard
+
+L1's review flagged that L1 ran even where L0 had timed out, on a toggle whose relationship to the
+device was unknown. Blast radius was nil because L1's only write was idempotent. A scan is not: it
+turns on a repeated event stream. So each stage now records whether it **confirmed** — `reset_ok`,
+`ver_ok`, `l1_ok` (every row well-formed with status `0x00`, including the `n >= 65` reassembly
+guard of review C1) — and L2 starts only if all three hold *and* the LMP feature mask claims
+`LE(controller)`. Otherwise it prints which one failed and leaves the radio as L1 left it.
+
+### 21.8 The firmware boundary
+
+Every LE command used here is defined by the Bluetooth Core spec, not by Broadcom. A status
+`0x01` (Unknown HCI Command) on any of them would mean the controller's ROM does not carry LE until
+a patchram `.hcd` is loaded — which is the clean-room boundary of
+[`docs/MANIFESTO/CLEAN_ROOM_POLICY.md`](../../../MANIFESTO/CLEAN_ROOM_POLICY.md) and belongs in
+UnaOS-bunker. `bt_l2_cmd` witnesses that status explicitly and the sequence stops. **No firmware
+path is added by this arc.**
+
+### 21.9 What metal must verify
+
+`~/unaos-bench/scratch/gr22/btl2-predictions.md` carries the falsifiable statement.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).
