@@ -567,3 +567,141 @@ whether the boot continues cleanly past it is itself the observation. The
 evidence available from this leg is (a) the line appears at all, (b) the boot
 survives to its normal end markers, and (c) the *next* boot's rest values are
 unchanged. Nothing more is claimed.
+
+## 11. FENCE — the falcon asserts CHAN_VALID (UNFLOWN)
+
+This section appends to §3, §5 and §8. Nothing above it is superseded.
+
+**Status: UNFLOWN.** The image and the host leg described here have never
+executed on hardware, and they cannot be exercised in emulation — **QEMU has no
+Kepler**. A green `test-x86` on this code means it took a path that never
+touched a GPU, which is worse than a hang because it reads like evidence. Do not
+cite emulation for any claim in this section. Predictions for the first capture
+are recorded outside the tree, before the fact, at
+`~/unaos-bench/scratch/gr23/fence-predictions.md`.
+
+### 11.1 The experiment
+
+§7 named the wall: `ENGINE_STATUS.CHAN_VALID` is the bit PFIFO's validation
+plausibly keys on, and it is set by nothing reachable from the host (refutation
+7). Candidate 1 is that the assertion must **originate from the falcon**,
+mimicking a real context-switch completion. `ucode::FENCE_A_BYTES` writes
+`CHAN_VALID` into `ENGINE_STATUS` from inside FECS, reads it back into MAILBOX0,
+holds it while the host submits the runlist, and clears it on host command.
+
+It is decisive both ways. `err=0` proves PFIFO only trusts falcon-originated
+state. `err=0x2` eliminates the candidate and points at engine binding at submit
+— and, because the readback tells us whether the bit was even set, that
+elimination is sharper than the eleven strip eliminations before it.
+
+### 11.2 A new port, DERIVED
+
+| Host offset | Register | `& 0xffc` | `<< 6` | Falcon index | Status |
+| --- | --- | --- | --- | --- | --- |
+| `0xC00` | `ENGINE_STATUS` | `0xC00` | | **`0x30000`** | **DERIVED (untested)** |
+
+Derived by the §3 rule, asserted at compile time in `regs`, and never
+hand-written at a call site. It has the same standing the `0x800`/`0x804` pair
+had before s37: correct by the only rule that has ever been right, and unproven.
+If the falcon's readback of this port returns `0` while the ack says the assert
+executed, "wrong port" and "the bit is not falcon-assertable" are **not yet
+distinguishable** — that ambiguity is a finding, not a defect.
+
+### 11.3 The assertion lattice — the actual gate
+
+The listing in `kepler.rs` is a doc comment on the byte array, and a block of
+`const _: () = { … }` assertions checks the bytes back against it. Both images
+that preceded FENCE carry the same treatment. The property being built is **two
+independent derivations meeting at a human-readable listing**:
+
+- listing → bytes (typed by hand, from the mnemonics), and
+- bytes → decoded fields → listing (computed by the assertions).
+
+The assertions therefore check **decoded properties, never literal bytes**. This
+distinction is the whole point and it is not stylistic:
+
+```rust
+// A CHECKSUM OF YOUR OWN TYPING — would not catch a wrong displacement,
+// because you would type the same wrong number in both places:
+assert!(b[0x43] == 0xf4 && b[0x44] == 0x0b && b[0x45] == 0x14);
+
+// VERIFICATION — contains no displacement at all. It computes one from the
+// two addresses the listing names, and `bra_target` recovers the address
+// from the byte by the opposite arithmetic:
+assert!(eq3(&slice3(b, 0x43), &bra_to(BRA_EQ, 0x43, 0x57))); // -> do_assert
+assert!(bra_target(b, 0x43) == 0x57);
+```
+
+Standing requirements for any future image in this module:
+
+1. Every branch gets **both** a `bra_to(cc, at, label)` and a `bra_target`
+   assertion. ⚠ **Falcon `bra` displacements are relative to the address of the
+   branch instruction itself**, not the following instruction — envydis resolves
+   them that way and every image here is authored under that rule. Re-deriving
+   it as `at + 3 + disp` (the intuition from most other ISAs) shifts every
+   target by the instruction width; it reads perfectly in a listing and lands
+   mid-instruction on silicon.
+2. Every port immediate comes from `regs::falcon_io()`. Never a typed hex
+   literal — that rule predates this section and has been violated once.
+3. Assert decoded **fields** (opcode via the constructor, register index via
+   `reg << 4`, immediate via the named constant) wherever a decoder can be
+   written.
+4. Keep the zero-tail guard and the anti-`0x409504` guards. The tail helpers are
+   bounded by `b.len()`, not a literal: they once took `[u8; 128]`, and a
+   192-byte image checked under a `< 128` bound would leave its last 64 bytes
+   unexamined while still reporting a clean tail.
+5. Every store uses `iowrs` (`0xd1`), and the lattice asserts the async `iowr`
+   (`0xd0`) form appears nowhere. The two differ by one bit, read identically in
+   a hex blob, and the async form yields a program that "runs" while its
+   observable never arrives.
+6. **No external assembler.** Images are hand-authored against the listing. A
+   script outside the tree that produces shipped kernel bytes has no provenance
+   and no review; if a helper is ever written it belongs under `unaos/tools/`
+   with its own tests, and the lattice must still assert independently of it.
+
+A green `./arroyo check` **with `UNAOS_KEPLER=1`** means the lattice agreed —
+that is the test passing, not a formality. Note the condition: `kepler.rs` sits
+behind the `nvidia-kepler` feature, so a bare `./arroyo check` never compiles
+these assertions at all and cannot fail on them.
+
+### 11.4 The ritual, restated as the FENCE leg implements it
+
+§4 in full, plus three things §4 did not say out loud:
+
+- **Halt the core before every upload, and prove the halt by readback.**
+  `CPUCTL` bit 4 is STOPPED; writing it requests a halt, reading it back
+  establishes one. Rewriting IMEM under a running falcon leaves it executing a
+  half-old, half-new program that goes on writing the very mailboxes the next
+  leg reads as its own result. The ECHO leg was doing exactly this and now halts
+  too.
+- **Seed all four observables** (MAILBOX0, MAILBOX1, CC_SCRATCH[0],
+  CC_SCRATCH[1]) before each launch, so "unchanged" keeps one meaning for every
+  one of them.
+- **Per-image magic as the first executed instruction.** FENCE writes
+  `A55E7A55` to MAILBOX0 before anything else. With the host seed `A5A50000`
+  this separates three otherwise identical silences: *uploaded and running*,
+  *nothing ran*, and *IMEM held stale bytes from another leg*. Without it, "the
+  mailbox did not change" and "a different program is running" read alike.
+- **The ack gets its own register.** `CC_SCRATCH[1]` carries "I reached the
+  assert"; MAILBOX0 carries the ENGINE_STATUS readback. Two facts, two
+  registers — on one register they are untellable.
+- **Two loops, two counters, two give-up markers.** poll1 exhausting means the
+  ASSERT command was never observed (`FFFFFFBD`); poll2 exhausting means it
+  asserted and then never observed the CLEAR (`FFFFFFBC`). Those license
+  opposite conclusions about the host↔FECS channel. Both are `u32` constants and
+  the host gate compares them for **equality, first** — as sign-extended words
+  they satisfy any naive `> 0` or `>= 3` progress test placed ahead of them.
+
+### 11.5 The verdict is gated on the channel readback
+
+After rewriting `PFIFO_CHAN[1]` the host **reads it back** and prints
+`VALID-stuck=`. If the hardware dropped VALID immediately, `err` describes some
+other channel state and means nothing about this experiment; the leg prints
+`FENCE VOID` and draws no conclusion in either direction. The restore of
+`inst_off+0x0C` reproduces the canonical write **including `| 0x80000000`** — the
+pre-existing restore dropped that bit, so a "restored" instance block was never
+the one the channel was built with.
+
+The leg is placed after every ECHO observable is harvested and **before** the
+`0x409504` recon block, because the first access to that offset wedges every
+later read in the unit for the boot (§5.4) and would void the verdict.
