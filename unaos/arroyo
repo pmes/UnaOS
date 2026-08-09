@@ -1605,12 +1605,39 @@ check_both() {
     local _urc=0
     check_user_arch x86_64  || _urc=1
     check_user_arch aarch64 || _urc=1
+
+    # GATE-CORE: the HOST unit tests of the shared no_std cores the kernel links. `midden_core` is
+    # the shell's one command table, parser and bare-name resolver (unaos/libs/sys/midden_core), and
+    # its assertions are the only thing standing between a table edit and a shell that quietly
+    # decides words differently — including the case rule, where `is_verb` disagreeing with the
+    # case-insensitive FAT walk means a dropped `LS.ELF` can be launched by typing `LS`.
+    #
+    # WHY IT BELONGS IN `check` AND NOT IN A README. These ran hand-only, and a suite that is listed
+    # as a gate in the docs but is not in any gate is exactly the vacuous instrument this tree keeps
+    # catching. The cost is ~1 s: the crate is `no_std` + `alloc`, has zero dependencies, and builds
+    # for the HOST here (the kernel legs above already proved it compiles for both targets).
+    #
+    # Root workspace, not `unaos/`: `midden_core` is a member of the repo-root `Cargo.toml`, the same
+    # convention as `libs/fs/unafs` and `libs/sys/helm`, so `-p` is resolved from `WORKSPACE_DIR/..`.
+    local _crc=0
+    echo -e "${COLOR_YELLOW}⚡ Host tests: shared cores (midden_core)...${COLOR_RESET}"
+    if (cd "$WORKSPACE_DIR/.." && cargo test -p midden_core); then
+        echo -e "${COLOR_GREEN}✅ midden_core tests OK${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}  ❌ midden_core host tests FAILED${COLOR_RESET}"
+        _crc=1
+    fi
+
     if [ "$_urc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — userspace crates did not compile (see above)${COLOR_RESET}"
         return 1
     fi
     if [ "$_krc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — cfg-gated kernel code did not compile (see above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_crc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a shared core's host tests did not pass (see above)${COLOR_RESET}"
         return 1
     fi
 }

@@ -320,10 +320,17 @@ and nothing else reaches it.
 
 **The first step is not any of that, and it is smaller than it sounds.** It is the one prerequisite
 both B and C need and neither can fake: **make the syscall ABI a single, versioned, shared
-artifact.** Today the numbers are written down at least three times — `arch/x86_64/syscall.rs`,
-`arch/aarch64/syscall.rs`, and again by hand inside each EL0 blob (`midden.rs` re-declares its own
-`SYS_*` constants and its own register convention). Nothing enforces that they agree; a mismatch is
-a silent wrong-syscall, not a compile error.
+artifact.** Today the numbers are written down in **six or more places, and they have already
+diverged** — this is a live defect, not a tidiness argument. The two kernel dispatchers
+(`arch/x86_64/syscall.rs`, `arch/aarch64/syscall.rs`) each hold a list, and then **every EL0 blob
+re-declares its own** `SYS_*` constants and its own register convention by hand: user-stat,
+user-pulse, user-blob/`midden.rs`, user-vug. Nothing enforces that any of them agree, and they do
+not — aarch64 defines `SYS_REPORT=3`, `SYS_GETPID=6`, `SYS_MSEND`/`SYS_MRECV`=19/20,
+`SYS_FB_MAP`/`SYS_FB_PRESENT`=24/25, `SYS_WIN_MOVE=31` and `SYS_WIN_CLOSE=32`, none of which x86
+has; x86 adds `SYS_WIN_PRESENT_ROWS=33` and `SYS_CPUPULSE=49`, which aarch64 lacks. A blob compiled
+against the wrong list does not fail to build; it issues a **silently wrong syscall**. That makes
+the shared-ABI crate below the highest-value small arc in this document, and it is scoped as its own
+arc rather than folded into the shell work.
 
 The fix is a small `no_std` crate — `unaos/libs/sys/abi`, exactly the convention this arc used for
 `midden_core` — holding the syscall numbers, the argument/return conventions, the error numbers and
@@ -351,16 +358,47 @@ Nothing is renamed. Nothing is hidden. `ls` prints `STAT.ELF` because the file i
 
 0. **Is it a verb on this build?** If yes, it is the verb — full stop. Precedence is absolute and
    needs no tie-break rule. (`Avail` makes "on this build" real: `vug` is a verb on aarch64 and is
-   *not* one on x86, where it must fall through and start `VUG.ELF`.)
+   *not* one on x86, where it must fall through and start `VUG.ELF`.) The question is asked
+   **case-insensitively**, through `midden_core::canon_verb` — see "The case rule" below, which is
+   part of this same precedence and not a separate nicety.
 1. **Exact match.** `VUG.ELF` typed in full is `VUG.ELF`. Elision can never steal from an exact
    hit, so no file is ever unreachable by its own spelling.
-2. **Extension-elided, as typed** — `vug` → `vug.elf`.
-3. **Extension-elided, upper-cased** — `vug` → `VUG.ELF`. FAT short names are upper-case on disk;
-   this is the arm that actually fires on the boot volume.
+2. **Extension-elided, as typed** — `vug` → `vug.elf`. **On the kernel this is the arm that fires.**
+   `FatVolume::is_file` walks FAT with `eq_ignore_ascii_case` (short names are stored upper-case, so
+   the walk has always had to), which means the probe for `vug.elf` MATCHES the on-disk `VUG.ELF`
+   and the resolver returns the string `"vug.elf"`.
+3. **Extension-elided, ASCII-upper-cased** — `vug` → `VUG.ELF`. **Latent, not live.** Arm 2 always
+   wins on any case-insensitive `Volume`, which is every volume the kernel has today; this arm is
+   reached only by a case-SENSITIVE backend — the boot fixture's exact-match `NameList`, a future
+   UnaFS mount, a host `std::fs` implementation. It is kept because it makes those backends behave
+   like the FAT one for one extra probe, and it is documented as latent so that no gate is ever
+   written against a spelling the kernel does not emit. (Consequence, and it is the reason this
+   paragraph exists: the live x86 serial line is `:: [midden] resolve "vug" -> vug.elf ::`. The
+   `-> VUG.ELF` spelling belongs to the fixture alone. The genuine on-disk name is available one
+   layer down as `bare_exec`'s `canon`, read back out of the directory entry.)
+   The uppercase transform is `to_ascii_uppercase`, deliberately: Unicode casing changes a token's
+   length (`ß` → `SS`, `ﬁ` → `FI`), and a resolver must not probe for names the user never typed.
 
 Only the **last path component** is elided (`DOCS/vug` → `DOCS/vug.elf`, never `DOCS.ELF/vug`), and
 a leaf that already carries a `.` is never re-suffixed — which is what stops `vug.txt` from quietly
 launching `VUG.ELF`.
+
+### The case rule: verbs win in ANY case, and that is a security property
+
+The FAT resolver underneath has always been case-insensitive. So if the verb table were consulted
+case-**sensitively**, typing `LS` — with caps lock on, or simply mirroring the 8.3 spelling `ls`
+itself prints — would miss the table, fall through to resolution, probe `LS.elf`, match a dropped
+`LS.ELF` case-insensitively, and **launch it**. The same for `RM`, `Cat`, `Kill`, `Write` and the
+capital variant of all 78 verbs. That is precisely the shadowing this section calls a security
+problem, reachable through the one spelling the rule did not cover.
+
+So `is_verb` and `plan` both look the word up through `canon_verb` (ASCII lower-case), and
+`Plan::Host` carries the **canonical** verb outward — the ring's service `match` arms are lower-case
+literals, and handing back a raw `LS` would land in the `other =>` arm and print "the verb exists;
+this kernel does not carry it" about a verb this kernel carries. Only the verb is folded: arguments
+and `Plan::Exec`'s `typed` keep the user's own spelling, because a file name is not a verb name.
+Pinned by `a_verb_wins_in_any_case_and_arrives_canonical` (`LS`/`Ls`/`lS`/`ls` all dispatch as `ls`
+against a volume that does carry `LS.ELF`).
 
 **The collision, stated rather than papered over.** `stat` is a verb *and* `STAT.ELF` is staged on
 the volume. Under rule 0 the verb wins, so a bare `stat` will not launch `STAT.ELF`; it is reachable
@@ -404,30 +442,50 @@ attributes, where it can be done the way BeFS did it rather than faked.
   resolution is permitted to ask.
 * **The kernel calls THROUGH it.** `dispatch_command`'s first act is `midden_core::plan(...)`. The
   old `_ =>` fallthrough is gone: an unknown word is now a `Message::TerminalError` produced by the
-  core, and the surviving `other =>` arm means only *"this verb exists but this build does not
-  carry it"* — a different fact, given its own sentence.
+  core. The surviving `other =>` arm is a **drift net, and it is unreachable today** — every `Avail`
+  in `HOST_VERBS` mirrors the `#[cfg]` on its match arm exactly (checked arm by arm across all 78
+  spellings), so the set of "verbs this build cannot perform" is empty and nothing reaches it. It is
+  kept because that agreement is a hand-maintained invariant across two files with no compiler check
+  behind it (the match is over `&str`, so a missing arm is not a non-exhaustive-match error): add a
+  verb to the table and forget its arm, or narrow an arm's `cfg` without narrowing its `Avail`, and
+  the drift surfaces there as a named sentence on the panel instead of as a word that silently does
+  nothing. No example is given at the arm on purpose — the obvious candidates are all wrong (`uls`
+  on x86 is `Avail::Aarch64` and never becomes a `Host` plan; `top` has no `cfg` at all and prints
+  its own aarch64-only message from inside its arm; `vug`'s `Avail` tracks the v3d `cfg`) — and a
+  case that genuinely reaches it would be a **bug in the table**, not a documented behaviour.
 * **`help`, `echo`, `ver`/`version`, `gneiss` and the empty line moved into the core**, and their
   output reaches the panel through `render_message(console, &Message)` — Ring 0 rendering a
   terminal message off the shared core.
-* **Bare-name launch with `.elf` elision** (x86), per §5. `bare_exec` now receives the core's
-  resolved on-disk `name` alongside the `typed` word and quotes whichever the reader recognises.
+* **Bare-name launch with `.elf` elision** (x86), per §5. `bare_exec` receives the core's chosen
+  `name` alongside the `typed` word and quotes whichever the reader recognises. `name` is the
+  spelling the resolver LOADS, **not** the on-disk spelling — on FAT those differ (§5, arm 2); the
+  real 8.3 name is `canon`, read back from the directory entry by the re-resolve, and that is what
+  the serial refusal lines quote.
 * **Witnesses, both able to fail.**
   * Live, one per dispatched line:
     `:: [midden] cmd="help" -> TerminalOutput len=N ::`,
     `:: [midden] cmd="ls" -> Host verb=ls ::`,
-    `:: [midden] resolve "vug" -> VUG.ELF ::`.
+    `:: [midden] resolve "vug" -> vug.elf ::` (the as-typed arm; see §5 for why the on-disk
+    `VUG.ELF` is not what this line carries).
   * Boot fixture (`witness` battery, both arches, `shell::midden_witness`): four checks in the
     uniform `:: TSTE: <name> -> PASS/FAIL ::` shape — `midden.dispatch` (a core verb is answered
     in-core with real text), `midden.route` (a host verb is routed with its args intact),
-    `midden.resolve` (`vug` → `VUG.ELF`), `midden.precedence` (a verb beats a program of the same
-    stem). Each FAIL line prints what it got.
-* **The pi4 regression spec gates all of it.** `scripts/specs/pi4-regression.spec` gains five
-  `REQUIRE`s (the four fixture verdicts plus the live `resolve "vug" -> VUG.ELF` line) and one
-  `FORBID` (`:: TSTE: midden\.\w+ -> FAIL`), taking the gate from **93 to 98 required witnesses**.
-  A fixture that merely printed would not be a gate; these fail the build.
-* **10 host unit tests** in the core (`cargo test -p midden_core`), including the one that matters
-  most: `verb_ness_follows_the_build` — the assertion that `vug` is a verb on aarch64 and a program
-  name on x86.
+    `midden.resolve` (`vug` → `VUG.ELF` against the fixture's exact-match `NameList`),
+    `midden.precedence` (a verb beats a program of the same stem). Each FAIL line prints what it
+    got.
+* **Both regression specs gate it, on both arches.** `scripts/specs/pi4-regression.spec` gains four
+  `REQUIRE`s (the fixture verdicts) and one `FORBID` (`:: TSTE: midden\.\w+ -> FAIL`), taking the
+  gate from **93 to 97 required witnesses**; `scripts/specs/x86-witness.spec` gains the same four
+  and the same `FORBID`, because `midden_witness` is called under
+  `#[cfg(all(target_arch = "x86_64", feature = "witness"))]` too and was printing four ungated PASS
+  lines on the rMBP. Deliberately NOT required on either side: the fixture's companion echo
+  `:: [midden] resolve "vug" -> VUG.ELF ::`. It restates the `midden.resolve` verdict over the same
+  comparison (arithmetic, not coverage) and its spelling is the fixture's, not the live shell's.
+* **12 host unit tests** in the core (`cargo test -p midden_core`), and they are a GATE:
+  `./arroyo check` runs them after the userspace legs, so the table cannot drift behind a green
+  compile. Two carry the most: `verb_ness_follows_the_build` (`vug` is a verb on aarch64 and a
+  program name on x86) and `a_verb_wins_in_any_case_and_arrives_canonical` (§5's case rule — `LS`
+  lists the directory even with `LS.ELF` on the volume).
 
 ### Deferred, named
 

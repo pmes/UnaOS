@@ -255,6 +255,29 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     ("jobs", Avail::Proc), ("kill", Avail::Proc),
 ];
 
+/// The canonical (lower-case) spelling of a typed word.
+///
+/// **Verb lookup is case-INSENSITIVE, and that is a security property, not a
+/// convenience.** The resolver underneath it always was: the kernel's FAT walk
+/// matches components with `eq_ignore_ascii_case`, so `resolve_exec("LS")`
+/// probes `LS.elf` and the volume happily answers with `LS.ELF`. If `is_verb`
+/// had stayed case-SENSITIVE, then typing `LS` — with caps lock on, or simply
+/// mirroring the 8.3 spelling `ls` itself prints — would have missed the verb
+/// table and **launched a dropped `LS.ELF` instead of listing the directory**.
+/// The same held for `RM`, `Cat`, `Kill`, `Write` and the caps variant of every
+/// other verb. §5's rule ("a shell where a dropped file can shadow `ls` is a
+/// security problem") is only true if it holds for every spelling of the word,
+/// so the table is consulted through this function and never against the raw
+/// token.
+///
+/// ASCII only, deliberately: `to_ascii_lowercase` cannot change a token's
+/// length or invent characters the user did not type (Unicode case folding can
+/// — `İ` lower-cases to two chars). Verbs are ASCII words; a non-ASCII token is
+/// left exactly as typed and is therefore not a verb, which is correct.
+pub fn canon_verb(word: &str) -> String {
+    word.to_ascii_lowercase()
+}
+
 /// `true` iff `word` is a shell verb **on this build** — core-answered or
 /// ring-serviced.
 ///
@@ -263,9 +286,13 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
 /// that is a verb somewhere else but not here is honestly NOT a verb here, and
 /// is free to become a program name — which is exactly how `vug` starts
 /// `VUG.ELF` on x86 while staying the 3D sculptor verb on the Pi.
+///
+/// Case-insensitive via [`canon_verb`]: `LS`, `Ls` and `lS` are all the verb
+/// `ls`.
 pub fn is_verb(word: &str, facts: &Facts) -> bool {
-    CORE_VERBS.contains(&word)
-        || HOST_VERBS.iter().any(|(n, a)| *n == word && a.on(facts))
+    let w = canon_verb(word);
+    let w: &str = &w;
+    CORE_VERBS.contains(&w) || HOST_VERBS.iter().any(|(n, a)| *n == w && a.on(facts))
 }
 
 // ---------------------------------------------------------------------------
@@ -316,9 +343,16 @@ impl Volume for NameList<'_> {
 ///    real name always gets that name; elision can never steal from an exact
 ///    hit, so no file becomes unreachable by its own spelling.
 /// 2. **Extension-elided, as typed.** `vug` → `vug.elf`.
-/// 3. **Extension-elided, upper-cased.** `vug` → `VUG.ELF` — FAT's short names
-///    are upper-case on disk, so this is the arm that actually fires on the
-///    boot volume today.
+/// 3. **Extension-elided, upper-cased.** `vug` → `VUG.ELF`. This arm is **dead
+///    on the kernel today and is not the one that fires on the boot volume** —
+///    the x86 `Volume` impl walks FAT with `eq_ignore_ascii_case`, so arm 2's
+///    probe for `vug.elf` already MATCHES the on-disk `VUG.ELF` and returns the
+///    string `"vug.elf"`. Arm 3 exists for two callers that are not that one:
+///    the boot fixture's `NameList`, which compares names exactly, and any
+///    future case-SENSITIVE `Volume` (a UnaFS mount, a host `std::fs` backend).
+///    Keeping it costs one probe and removes a silent behaviour difference
+///    between those backends; it is documented as latent rather than live so a
+///    gate is never written against a spelling the kernel does not produce.
 ///
 /// Only the LAST path component is elided; a token containing `/` keeps its
 /// directory part (`DOCS/vug` → `DOCS/vug.elf`, never `DOCS.ELF/vug`).
@@ -352,7 +386,12 @@ pub fn resolve_exec(token: &str, vol: &mut dyn Volume) -> Option<String> {
         if vol.is_file(&as_typed) {
             return Some(as_typed);
         }
-        let upper = format!("{}{}.{}", dir, leaf.to_uppercase(), ext.to_uppercase());
+        // ASCII case only. `str::to_uppercase` is UNICODE: `ﬁ` becomes `FI`,
+        // `ß` becomes `SS`, `ı` becomes `I` — each of them a name of a
+        // different LENGTH than the one the user typed, probed against a
+        // volume that never contained it. A filename transform must not invent
+        // characters, so this is the ASCII twin.
+        let upper = format!("{}{}.{}", dir, leaf.to_ascii_uppercase(), ext.to_ascii_uppercase());
         if upper != as_typed && vol.is_file(&upper) {
             return Some(upper);
         }
@@ -394,11 +433,22 @@ pub fn plan(line: &str, facts: &Facts, vol: &mut dyn Volume) -> Plan {
     let rest = trimmed[word.len()..].trim_start();
     let args: Vec<&str> = rest.split_whitespace().collect();
 
-    if CORE_VERBS.contains(&word) {
-        return Plan::Say(answer(word, &args, facts));
+    // CASE. The table is consulted through `canon_verb`, never against the raw
+    // token — see that function for why this is a security property and not a
+    // nicety. The CANONICAL spelling is what leaves in `Plan::Host`, because the
+    // ring's service `match` arms are lower-case literals: handing it back a raw
+    // `LS` would miss every arm and land in `other =>`, printing "the verb
+    // exists; this kernel does not carry it" about a verb this kernel carries.
+    // `Plan::Exec` is unaffected — `typed` and the resolver both keep the user's
+    // own spelling, because a FILE name is not a verb name.
+    let canon = canon_verb(word);
+    let canon: &str = &canon;
+
+    if CORE_VERBS.contains(&canon) {
+        return Plan::Say(answer(canon, &args, facts));
     }
-    if HOST_VERBS.iter().any(|(n, a)| *n == word && a.on(facts)) {
-        return Plan::Host { verb: word.to_string(), rest: rest.to_string() };
+    if HOST_VERBS.iter().any(|(n, a)| *n == canon && a.on(facts)) {
+        return Plan::Host { verb: canon.to_string(), rest: rest.to_string() };
     }
     if facts.exec {
         if let Some(name) = resolve_exec(word, vol) {
@@ -592,6 +642,51 @@ mod tests {
         assert!(h.contains("SMP:      sched (per-CPU run queues)"));
         assert!(h.contains("n>10 is refused"));
         assert!(h.contains("the .elf is optional"));
+    }
+
+    #[test]
+    fn a_verb_wins_in_any_case_and_arrives_canonical() {
+        // The volume carries LS.ELF — a dropped program named exactly like the
+        // 8.3 spelling `ls` itself prints. Every casing of the verb must still
+        // be the VERB, or a dropped file shadows `ls` for anyone with caps lock
+        // on. (Before the case fold, `is_verb("LS")` was false and the FAT
+        // walk's `eq_ignore_ascii_case` then matched LS.ELF: a launch.)
+        let mut v = NameList(&["LS.ELF", "VUG.ELF"]);
+        let f = Facts { exec: true, x86: true, ..Facts::bare() };
+        for typed in ["LS", "Ls", "lS", "ls"] {
+            assert!(is_verb(typed, &f), "{typed} must be the verb");
+            assert_eq!(
+                plan(typed, &f, &mut v),
+                // The verb leaves CANONICAL: the ring's match arms are
+                // lower-case, so a raw `LS` would fall to `other =>`.
+                Plan::Host { verb: "ls".to_string(), rest: String::new() },
+                "{typed} must dispatch as the verb `ls`, not launch LS.ELF"
+            );
+        }
+        // Args survive the fold untouched — only the VERB is canonicalised.
+        assert_eq!(
+            plan("CAT DoCs/ReadMe.TXT", &f, &mut v),
+            Plan::Host { verb: "cat".to_string(), rest: "DoCs/ReadMe.TXT".to_string() }
+        );
+        // And a core verb folds too, answering rather than refusing.
+        let Plan::Say(m) = plan("ECHO Hi There", &f, &mut v) else { panic!("ECHO") };
+        assert_eq!(m, Message::TerminalOutput("Hi There".to_string()));
+        // A non-verb is still a program, and its own spelling is preserved.
+        assert_eq!(
+            plan("VUG", &f, &mut v),
+            Plan::Exec { typed: "VUG".to_string(), name: "VUG.ELF".to_string() }
+        );
+    }
+
+    #[test]
+    fn upper_casing_a_leaf_is_ascii_only() {
+        // `str::to_uppercase` would turn `ß` into `SS` and probe a name one
+        // byte longer than anything the user typed. The resolver must not
+        // invent characters: no ASCII-uppercase form of these exists on the
+        // volume, so both simply miss.
+        let mut v = NameList(&["SS.ELF", "FI.ELF"]);
+        assert_eq!(resolve_exec("ß", &mut v), None);
+        assert_eq!(resolve_exec("\u{fb01}", &mut v), None);
     }
 
     #[test]

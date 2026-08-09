@@ -1023,6 +1023,38 @@ REQUIRE :: BPACE: sched t=[0-9]+ms d=[0-9]+ms ::
 #   :: GPACE: xtail=0ms(n=1) bench=0ms(n=0) detect=5ms(n=1) igpu=1ms(n=1) kepler=396ms(n=1) sdhc=12ms(n=1) nic=0ms(n=1) resid=3ms == witness ::
 REQUIRE :: GPACE: xtail=[0-9]+ms\(n=[0-9]+\) .*kepler=[0-9]+ms\(n=[0-9]+\) .*== witness ::
 
+# --- MIDDEN-M1: the shell console's interpreter is the shared no_std core ----------------------
+# `shell::midden_witness` runs on BOTH arches — `main.rs` calls it under
+# `#[cfg(all(target_arch = "x86_64", feature = "witness"))]` as well as on the pi4 path — so these
+# four PASS lines are on every witness-armed rMBP boot, which is every boot this spec scopes to.
+# They were pinned on the pi4 gate first and NOT here, and that asymmetry was the defect: the same
+# fixture, printing the same four verdicts, gated on one arch and merely printed on the other.
+#
+# What each proves (the fixture drives `midden_core::plan` over a synthetic volume, so it needs no
+# keyboard, no card and no FAT — it is the interpreter under test, not the storage):
+#   dispatch   — a core verb is answered IN the core, with real text (not routed, not swallowed)
+#   route      — a host verb comes back as Host with its args intact
+#   resolve    — the `.elf` the user did not type is elided to a name on the volume
+#   precedence — a verb still beats a program of the same stem (`stat` vs STAT.ELF), which is the
+#                security half of the rule: a dropped file must not shadow a verb
+#
+# NOT PINNED, and stated so the omission is not read as an oversight: the fixture's companion echo
+# `:: [midden] resolve "vug" -> VUG.ELF ::`. It asserts nothing the `midden.resolve` verdict above
+# does not already assert on the same comparison, and its spelling is the FIXTURE's — the LIVE x86
+# line reads `-> vug.elf`, because `FatVolume::is_file` walks FAT case-insensitively and the core's
+# as-typed probe hits before the upper-cased one. A rule written against `-> VUG.ELF` would look
+# like a claim about the live shell and be false. The live per-dispatched-line witness is not
+# pinned at all here for the reason it cannot be: it needs a keystroke, and this capture is a boot.
+#
+# MINIMUM BUILD GENERATION for this block: the midden-core arc (`shell: one interpreter, and it is
+# midden's`) and its review follow-up. Captures older than it carry no `:: TSTE: midden.` line and
+# will red these four — the same honest scope axis the WXN block above draws, for the same reason.
+REQUIRE :: TSTE: midden.dispatch -> PASS ::
+REQUIRE :: TSTE: midden.route -> PASS ::
+REQUIRE :: TSTE: midden.resolve -> PASS ::
+REQUIRE :: TSTE: midden.precedence -> PASS ::
+FORBID :: TSTE: midden\.\w+ -> FAIL
+
 # --- THE KNOB-GATED WITNESSES, AND THE DIRECTIVE THIS GRAMMAR DOES NOT HAVE -------------------
 # GR20 landed two more load-bearing wires that this file DELIBERATELY DOES NOT REQUIRE, and the
 # reason is a hole in the grammar rather than a judgement about the wires:

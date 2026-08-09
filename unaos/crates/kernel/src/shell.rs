@@ -3719,12 +3719,26 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 Some(pid) => bg_kill_cmd(console, pid),
             }
         },
-        // MIDDEN-M1: this arm no longer means "unknown word" — the core already ruled on that,
-        // and an unknown word never reaches here (it comes back as `Plan::Say(TerminalError)`).
-        // It now means exactly one thing: the word IS in midden's command table, but THIS build
-        // does not compile the machinery to perform it (e.g. `uls` on x86, `top` on x86, `vug`
-        // where the demo module is absent). That deserves its own answer, not the sentence a typo
-        // gets — a verb that exists but is unavailable here is a different fact.
+        // MIDDEN-M1: this arm is a DRIFT NET, and as of this arc it is unreachable — deliberately.
+        //
+        // It no longer means "unknown word": the core already ruled on that, and an unknown word
+        // comes back as `Plan::Say(TerminalError)` and never arrives here. What could arrive is a
+        // word midden's table calls a verb that THIS build does not compile the machinery for —
+        // and that set is empty today, because every `Avail` in `HOST_VERBS` mirrors the `#[cfg]`
+        // on its arm below exactly (the review checked all 78 spellings arm by arm). So the table
+        // and the match agree, and nothing reaches this arm.
+        //
+        // It is kept because that agreement is a HAND-MAINTAINED invariant across two files. Add a
+        // verb to `HOST_VERBS` and forget its arm, or `#[cfg]`-narrow an arm without narrowing its
+        // `Avail`, and the drift lands HERE — as a sentence naming the verb, on the panel — rather
+        // than as a word that silently does nothing. Deleting the arm would make that same drift a
+        // non-exhaustive-match compile error only if the match were over an enum, and it is over
+        // `&str`; there is no compiler check to fall back on. Hence: unreachable by construction,
+        // retained as the net for the construction breaking.
+        //
+        // (No example is given on purpose. Every plausible one is wrong: `uls`/`top` on x86 are
+        // `Avail::Aarch64`/an arm that prints its own aarch64-only message, and `vug`'s `Avail`
+        // tracks the v3d cfg. If a real reachable case ever appears, it is a BUG in the table.)
         other => {
             console.println(&alloc::format!(
                 "{}: not available on this build (the verb exists; this kernel does not carry it)",
@@ -4463,11 +4477,19 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
 ///
 /// # Resolution
 ///
-/// `midden_core::resolve_exec` decides the on-disk spelling and hands it here as `name`; `typed` is
-/// what the user actually wrote, and every message quotes the one the reader recognises. The core
-/// tries the exact token first, then — and only for a bare leaf carrying no extension — the
-/// `.elf`/`.ELF` suffix, so **`vug` finds `VUG.ELF`** with nobody typing the extension and without
-/// `ls` hiding it. Beneath that, this function performs the SAME resolution `cat` uses, verbatim:
+/// `midden_core::resolve_exec` decides which SPELLING to load and hands it here as `name`; `typed`
+/// is what the user actually wrote, and every message quotes the one the reader recognises. The
+/// core tries the exact token first, then — and only for a bare leaf carrying no extension — the
+/// `.elf` suffix, so **`vug` finds `VUG.ELF`** with nobody typing the extension and without `ls`
+/// hiding it.
+///
+/// **On x86, `name` is NOT the on-disk spelling** and no caller may assume it is. `FatVolume`'s
+/// `is_file` walks FAT with `eq_ignore_ascii_case`, so the core's `vug.elf` probe matches the
+/// on-disk `VUG.ELF` and the core returns the string `"vug.elf"` — the resolver's upper-cased arm
+/// never fires here (it is there for the fixture's exact-match `NameList` and for a future
+/// case-sensitive `Volume`). The genuine on-disk 8.3 spelling appears one step below, as `canon`,
+/// which the re-resolve reads out of the directory entry; that is the name the serial refusal
+/// lines quote. Beneath that, this function performs the SAME resolution `cat` uses, verbatim:
 /// `fs::fat::mount()` (on x86 always the USB mass-storage DATA volume) + `normalize_path` against
 /// the JD4 cwd + `resolve_path`. That walk matches components with `eq_ignore_ascii_case`, so
 /// `vug.elf` already found `VUG.ELF` before the elision existed; the elision is what makes the
