@@ -2355,9 +2355,37 @@ fn midden_facts() -> midden_core::Facts {
 struct FatVolume;
 
 impl midden_core::Volume for FatVolume {
+    /// APPLOAD/LAUNCH-AR: probe the PROGRAM SOURCE, not the default handle.
+    ///
+    /// This is the half of APPLOAD that was missed. `read_el0_image` was moved to
+    /// `mount_program_source()` because the global `BLOCK_DEVICE` cannot answer "where do
+    /// executables live" on a machine booted from the internal SD reader — `SDHCBLK` registers the
+    /// card as handle `Sdhc` and says so on the wire ("global BLOCK_DEVICE untouched"). But the
+    /// LOADER is not the first thing a bare name meets: the RESOLVER is, and it was left on
+    /// `mount()`. On Boot AR that asymmetry cost the operator the whole feature — `SDHCBLK` listed
+    /// `12568 VUG.ELF`, the operator typed `vug`, and this probe answered `false` through a handle
+    /// that does not exist, so the core never built `Plan::Exec` and the console said "Unknown
+    /// command" about a file the same boot had just printed.
+    ///
+    /// A probe and a load that disagree about WHICH volume is the volume can only ever produce
+    /// that shape, so they are now the same question asked of the same handle. `midden.execvol`
+    /// below pins them together.
     #[cfg(target_arch = "x86_64")]
     fn is_file(&mut self, name: &str) -> bool {
-        let Ok(fs) = crate::fs::fat::mount() else { return false };
+        let fs = match crate::fs::fat::mount_program_source() {
+            Ok(fs) => fs,
+            Err(e) => {
+                // Loud, and able to fail: a resolver that answers "no such program" because it
+                // could not mount anything is indistinguishable, from the panel, from a typo. This
+                // line is the difference, and it names the handles that WERE available so the
+                // capture shows what the probe was offered rather than only what it concluded.
+                serial_println!(
+                    ":: [midden] exec-probe \"{}\" -> NO VOLUME ({:?}; handles={}) ::",
+                    name, e, crate::drivers::block::source_census()
+                );
+                return false;
+            }
+        };
         matches!(
             resolve_path(&fs, &normalize_path(&cwd_path(), name)),
             Ok(Resolved::Entry(de, _)) if !de.is_dir
@@ -2455,6 +2483,42 @@ pub fn midden_witness() {
     let p = midden_core::plan("stat FOO", &facts, &mut vol);
     let ok = matches!(&p, midden_core::Plan::Host { verb, .. } if verb == "stat");
     verdict("midden.precedence", ok, &alloc::format!("{:?}", p));
+
+    // 5. execvol (x86) — THE PROBE AND THE LOAD MUST NAME THE SAME VOLUME.
+    //
+    // The four legs above run over a synthetic `NameList`, which is exactly why none of them could
+    // catch Boot AR: they prove the resolver's LOGIC and say nothing about which handle the real
+    // `FatVolume` binds. This leg asks the same question twice through two independent producers —
+    // the probe `midden_core::resolve_exec` makes (`FatVolume::is_file`) and the mount the loader
+    // performs (`read_el0_image`'s `mount_program_source`) — and asserts they AGREE. Disagreement
+    // is the Boot AR bug in one line: the card is mounted, `SDHCBLK` lists the program, the loader
+    // could read it, and the resolver says no such name.
+    //
+    // Agreement, not presence: a volume with no `VUG.ELF` staged must PASS (both false), because
+    // this fixture is pinning the wiring and not the contents of whatever card is in the slot. It
+    // is therefore quiet in QEMU, where both handles usually answer alike, and load-bearing on
+    // metal, where they did not.
+    #[cfg(target_arch = "x86_64")]
+    {
+        const PROBE: &str = "VUG.ELF";
+        let mut v = FatVolume;
+        let by_resolver = midden_core::Volume::is_file(&mut v, PROBE);
+        let by_loader = match crate::fs::fat::mount_program_source() {
+            Ok(fs) => matches!(
+                resolve_path(&fs, &normalize_path(&cwd_path(), PROBE)),
+                Ok(Resolved::Entry(de, _)) if !de.is_dir
+            ),
+            Err(_) => false,
+        };
+        verdict(
+            "midden.execvol",
+            by_resolver == by_loader,
+            &alloc::format!(
+                "resolver={} loader={} handles={}",
+                by_resolver, by_loader, crate::drivers::block::source_census()
+            ),
+        );
+    }
 }
 
 /// Run one command. Returns `true` if the command took over the whole screen with its own
@@ -2497,8 +2561,17 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             ":: [midden] cmd=\"{}\" -> {} len={} ::",
             cmd_line.trim(), msg.kind(), msg.len()
         ),
-        midden_core::Plan::Exec { typed, name } => serial_println!(
-            ":: [midden] resolve \"{}\" -> {} ::", typed, name
+        // LAUNCH-AR: `cmd=`-shaped, like its three siblings, and NOT the fixture's wording.
+        //
+        // This arm used to print `resolve "vug" -> VUG.ELF`, which is byte-for-byte the line
+        // `midden_witness` prints from its synthetic `NameList`. Reading Boot AR's capture, that
+        // made the ONE `resolve "vug" -> VUG.ELF` in the log look like proof the operator's launch
+        // had resolved, when it was the boot fixture talking and the operator's own line was the
+        // `TerminalError` two thousand lines later. A witness that cannot be told apart from a
+        // fixture is not a witness. Same `cmd="<line>" ->` prefix as `Say`/`Host` now, so the
+        // operator's dispatch is greppable as one family and the disposition is the tail.
+        midden_core::Plan::Exec { name, .. } => serial_println!(
+            ":: [midden] cmd=\"{}\" -> Exec {} ::", cmd_line.trim(), name
         ),
         midden_core::Plan::Host { verb, .. } => serial_println!(
             ":: [midden] cmd=\"{}\" -> Host verb={} ::", cmd_line.trim(), verb
@@ -4498,7 +4571,9 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
 /// case-sensitive `Volume`). The genuine on-disk 8.3 spelling appears one step below, as `canon`,
 /// which the re-resolve reads out of the directory entry; that is the name the serial refusal
 /// lines quote. Beneath that, this function performs the SAME resolution `cat` uses, verbatim:
-/// `fs::fat::mount()` (on x86 always the USB mass-storage DATA volume) + `normalize_path` against
+/// `fs::fat::mount_program_source()` (the handle the block layer names as the one executables live
+/// on — the USB mass-storage DATA volume, or the internal SD card when that is what booted us) +
+/// `normalize_path` against
 /// the JD4 cwd + `resolve_path`. That walk matches components with `eq_ignore_ascii_case`, so
 /// `vug.elf` already found `VUG.ELF` before the elision existed; the elision is what makes the
 /// *bare* `vug` work. `cd DOCS` then a bare name works for the same reason, since the cwd is
@@ -4528,7 +4603,10 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // --- re-resolve the core's answer over the live volume ---------------------------------------
     // The core probed through this same mount a moment ago; re-resolving costs one walk and closes
     // the window where the card changed underneath. A miss here is a RACE, not a typo, and says so.
-    let Ok(fs) = crate::fs::fat::mount() else {
+    // LAUNCH-AR: the PROGRAM SOURCE, matching `FatVolume::is_file` above and `read_el0_image`
+    // below. All three legs of a bare-name launch — probe, re-resolve, read — now bind the same
+    // handle; the Boot AR failure was exactly what happens when they do not.
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
         console.println(&alloc::format!("{}: the volume went away before it could be started", typed));
         serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: volume vanished after resolution ::", name, typed);
         return false;
