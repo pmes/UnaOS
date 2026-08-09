@@ -8,7 +8,21 @@ was verified bit-exact), and ceramic + paper-on-more-surfaces is building.
 
 ---
 
-## Q6 — BT-L3 will briefly CONNECT TO A STRANGER'S DEVICE. Is that acceptable to fly?
+## ✅ Q6 — ANSWERED: connect to Peter's own speaker, "MEGABOOM". Being built now.
+
+> *"can you program it to find my speaker id 'MEGABOOM'?"*
+
+So the filter is BY ADVERTISED NAME (not BD_ADDR — he does not know its address, and a name filter
+is what makes it reproducible for him): `BT_L3_PEER_NAME = Some("MEGABOOM")`, case-insensitive
+substring, reusing L2's existing AD Local Name decode rather than a second parser. Nothing else in
+the room gets connected to. ⚠ ONE THING MAY COME BACK AS A QUESTION: if the MEGABOOM puts its name
+only in a SCAN RESPONSE rather than in the advertisement, a PASSIVE scan never sees it — and going
+active means TRANSMITTING, which is a separate decision and will be brought back here rather than
+taken silently.
+
+**Original question, kept for the record:**
+
+## Q6 (original) — BT-L3 will briefly CONNECT TO A STRANGER'S DEVICE. Is that acceptable to fly?
 
 L3 is written and in review. It scans, picks **the first `ADV_IND` peer it hears**, opens a
 link-layer connection, and releases it within milliseconds. No pairing, no bonding, no data read,
@@ -43,7 +57,21 @@ it answers the same engineering question (does the connect path work end to end?
 else's hardware involved. **Your call; it is a one-constant change either way and nothing flies
 until you rule.**
 
-## Q7 — kepler and igpu have now each bounced FOUR and TWO times. Keep spending lane cycles?
+## ✅ Q7 — ANSWERED: keep both lanes, and be a drill sergeant about it.
+
+> *"try being more drill sergeant like 'what's your major malfunction gemini?!?!?!'"*
+
+Adopted in RELAY.md as of this pass. First application: kepler's round-4 plan is CORRECT on all
+eleven bounce items — and its verification plan said "read the QEMU output to confirm SUCCESS
+instead of HANG." **QEMU has no Kepler.** A green run there would mean the code took a path that
+never touched the hardware, which is worse than HANG, not better. That got said in those words.
+Its open question (Falcon-side CHAN_VALID vs fuzzing the engine ID) is answered: finish the one
+already written — it is decisive in both directions, and the losing outcome queues the other
+candidate for free.
+
+**Original question, kept for the record:**
+
+## Q7 (original) — kepler and igpu have now each bounced FOUR and TWO times. Keep spending lane cycles?
 
 Both lanes came back today claiming their bounce lists were fully addressed. Both were wrong in
 ways that would have cost a boot (details in RELAY.md):
