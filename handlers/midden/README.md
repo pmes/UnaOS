@@ -7,6 +7,15 @@ userspace handler set described in
 
 ## Status
 
+> **2026-08-09 — the command table moved out from under this crate.** The parser, the command
+> table, the bare-name resolver (including `.elf` elision) and the help text now live once, `no_std`,
+> in [`unaos/libs/sys/midden_core`](../../unaos/libs/sys/midden_core), and the **kernel** shell
+> already calls through it — the framebuffer console has no interpreter of its own any more. This
+> crate has **not** been rewired onto the core yet; that lands with the view work, so the handler
+> and its console view migrate together rather than half-migrating now. Everything below still
+> describes what this crate does today. The split, and what remains, is
+> [`docs/dev/USERLAND/MIDDEN_CONVERGENCE.md`](../../docs/dev/USERLAND/MIDDEN_CONVERGENCE.md).
+
 **Design-stage / early stub.** The command surface exists and produces real
 messages, but most commands return placeholder output and the handler is not yet
 wired into the Synapse. See [Implemented](#implemented-today) vs.
@@ -83,3 +92,5 @@ cargo build -p midden
 - [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md) — userspace component model (vessels / handlers / libraries).
 - [`docs/CODEX.md`](../../docs/CODEX.md) — the handler manifest.
 - [`libs/bandy`](../../libs/bandy) — `SMessage`, `Synapse`, `BandyMember`.
+- [`unaos/libs/sys/midden_core`](../../unaos/libs/sys/midden_core) — the shared `no_std` interpreter core (command table, parser, resolver, help).
+- [`docs/dev/USERLAND/MIDDEN_CONVERGENCE.md`](../../docs/dev/USERLAND/MIDDEN_CONVERGENCE.md) — the convergence assessment and the M1 split.
