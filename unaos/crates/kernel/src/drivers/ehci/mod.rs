@@ -735,6 +735,31 @@ const BT_LE_OWN_ADDR_PUBLIC: u8 = 0x00;
 /// list is empty on a freshly reset controller, so any other policy would filter everything out.
 #[cfg(feature = "bt")]
 const BT_LE_SCAN_FILTER_ALL: u8 = 0x00;
+/// BT-L2 — `Filter_Duplicates` for `HCI_LE_Set_Scan_Enable`. **0x00 = OFF**, and this constant
+/// exists because the previous 0x01 made the rollup unable to answer the question Boot AR asked.
+///
+/// THE INSTRUMENT BLINDNESS, stated exactly. With duplicate filtering ON the controller reports
+/// each advertiser AT MOST ONCE per enable, so by construction `adv_reports <= distinct_devices`
+/// and every per-device `reports=` is 1. That makes two utterly different rooms print the same
+/// line: a speaker heard THIRTY times in 500 ms at a healthy signal, and a speaker heard ONCE at
+/// the edge of sensitivity, both render as `distinct_devices=1 adv_reports=1 ... reports=1`. The
+/// Boot AR captures are exactly that line, and the count in them was never evidence about the
+/// receiver — it was the parameter talking back.
+///
+/// With it OFF, `reports=` becomes RECEIVE DEPTH: the number of advertising PDUs this radio
+/// actually demodulated from that address inside the window. A connectable-discoverable advertiser
+/// at a 20-100 ms interval emits 5-25 advertising events in 500 ms, so a healthy receiver returns
+/// a count in that band and a deaf one returns 1 or 2 — the discrimination the old parameter
+/// destroyed. It also gives the RSSI more than one sample (see `rssi_min`/`rssi_max`), which is
+/// what separates a real measurement from a reported floor.
+///
+/// COST: none on the air — `Filter_Duplicates` changes what the CONTROLLER suppresses before it
+/// posts an event, and a passive scanner still transmits nothing. The cost is host-side: more
+/// events across the same bounded window, all inside `bt_le_drain`'s existing `win_cy` bound, with
+/// no extra command and no extra armed transfer. The device table is keyed by address, so a chatty
+/// room cannot overflow it — `BT_L2_MAX_DEV` still caps DISTINCT devices, and `reports` saturates.
+#[cfg(feature = "bt")]
+const BT_LE_SCAN_FILTER_DUP: u8 = 0x00;
 /// BT-L2 — HCI event code for an LE Meta Event (Bluetooth Core, Vol 4 Part E) and the subevent
 /// code for LE Advertising Report.
 #[cfg(feature = "bt")]
@@ -1125,6 +1150,18 @@ struct BtDev {
     atype: u8,
     evt: u8,
     rssi: i8,
+    /// THE RSSI SPREAD across every report merged into this entry — weakest and strongest sample.
+    ///
+    /// Boot AR is why these exist. Two entirely different devices, on two different boots, both
+    /// printed EXACTLY `rssi=-97dBm`, and with duplicate filtering on there was one sample apiece,
+    /// so the log could not distinguish a measurement that happened to land there from a value the
+    /// controller reports whenever it decodes a packet at the edge of sensitivity. A SPREAD
+    /// answers that: real RSSI wanders several dB across consecutive advertising PDUs from one
+    /// transmitter, so `min == max` over many reports is a clamp and a few dB of movement is a
+    /// measurement. Both are seeded from the first report for the address — never from
+    /// `Default`, whose 0 would read as a 0 dBm sighting.
+    rssi_min: i8,
+    rssi_max: i8,
     name: [u8; BT_L2_NAME_MAX],
     nlen: u8,
     /// Set when the name was cut at `BT_L2_NAME_MAX`.
@@ -1159,7 +1196,12 @@ impl Default for BtDev {
             addr: [0; 6],
             atype: 0,
             evt: 0,
-            rssi: 127, // 127 = RSSI not available (Bluetooth Core)
+            rssi: BT_L3_RSSI_NA, // 127 = RSSI not available (Bluetooth Core)
+            // The SAME sentinel, not 0: a default-constructed slot has heard nothing, and 0 dBm
+            // extremes on a never-populated entry would be a sighting the radio never made. Every
+            // real entry overwrites both from its first report anyway.
+            rssi_min: BT_L3_RSSI_NA,
+            rssi_max: BT_L3_RSSI_NA,
             name: [0; BT_L2_NAME_MAX],
             nlen: 0,
             ncut: false,
@@ -3646,17 +3688,18 @@ impl Controller {
         }
 
         // ---- 4. HCI_LE_Set_Scan_Enable(enable) ------------------------------------------------
-        // LE_Scan_Enable(1) Filter_Duplicates(1). Duplicate filtering ON: the controller then
-        // reports each advertiser once per enable, which is what makes a bounded window's report
-        // count a measure of DEVICES rather than of how chatty the room is.
+        // LE_Scan_Enable(1) Filter_Duplicates(1). Duplicate filtering is now OFF — see
+        // `BT_LE_SCAN_FILTER_DUP` for why. In one line: with it ON the report count could not
+        // exceed the device count, so it measured the parameter rather than the receiver.
         let (drain, must_disable) = match self.bt_l2_cmd(
             t, intf, e, toggle, armed,
-            BT_HCI_LE_SET_SCAN_ENABLE, "HCI_LE_Set_Scan_Enable(enable)", &[0x01, 0x01],
+            BT_HCI_LE_SET_SCAN_ENABLE, "HCI_LE_Set_Scan_Enable(enable)",
+            &[0x01, BT_LE_SCAN_FILTER_DUP],
         ) {
             Some(0) => {
                 serial_println!(
-                    ":: bt-l2: [{}] scan ENABLED — passive, filter_duplicates=on, bounded window={}ms == witness ::",
-                    self.idx, BT_L2_SCAN_MS
+                    ":: bt-l2: [{}] scan ENABLED — passive, filter_duplicates={} (OFF: every advertising PDU this radio demodulates is reported, so reports= is RECEIVE DEPTH and not a device count), bounded window={}ms == witness ::",
+                    self.idx, BT_LE_SCAN_FILTER_DUP, BT_L2_SCAN_MS
                 );
                 (true, true)
             }
@@ -4761,6 +4804,18 @@ impl Controller {
                 Some(i) => {
                     devs[i].reports = devs[i].reports.saturating_add(1);
                     devs[i].rssi = rssi; // latest, not an average this arc has not earned
+                    // THE SPREAD, over the same samples. 127 is the spec's "RSSI not available"
+                    // sentinel, not a +127 dBm sighting, so it is kept out of the extremes — one
+                    // n/a report would otherwise pin `max` at 127 for the whole window and hide
+                    // exactly the clamp this pair exists to expose.
+                    if rssi != BT_L3_RSSI_NA {
+                        if devs[i].rssi_min == BT_L3_RSSI_NA || rssi < devs[i].rssi_min {
+                            devs[i].rssi_min = rssi;
+                        }
+                        if devs[i].rssi_max == BT_L3_RSSI_NA || rssi > devs[i].rssi_max {
+                            devs[i].rssi_max = rssi;
+                        }
+                    }
                     devs[i].evt = evt_type;
                     // STICKY, unlike `evt`: connectability is a fact about the device, and a later
                     // SCAN_RSP or ADV_NONCONN_IND from the same address does not un-say it.
@@ -4815,6 +4870,10 @@ impl Controller {
                         atype,
                         evt: evt_type,
                         rssi,
+                        // Seeded from THIS report, not from `Default` — a zeroed extreme would
+                        // print as a 0 dBm sighting, which is a stronger claim than any real one.
+                        rssi_min: rssi,
+                        rssi_max: rssi,
                         name,
                         nlen: nlen as u8,
                         ncut,
@@ -4934,10 +4993,25 @@ impl Controller {
                     _ => "reserved",
                 }
             );
-            if d.rssi == 127 {
+            if d.rssi == BT_L3_RSSI_NA {
                 serial_print!("n/a");
             } else {
                 serial_print!("{}dBm", d.rssi);
+            }
+            // THE SPREAD next to the last sample. `spread=0dB` over many reports is the signature
+            // of a reported floor rather than a measurement; a few dB of movement is a real one.
+            // Only printed when there is more than one sample to spread over — one report has no
+            // spread to report, and printing `spread=0dB` there would be a claim, not a datum.
+            if d.reports > 1 {
+                if d.rssi_min == BT_L3_RSSI_NA || d.rssi_max == BT_L3_RSSI_NA {
+                    serial_print!("(min/max=n/a — every report carried the 127 not-available sentinel)");
+                } else {
+                    serial_print!(
+                        "(min={}dBm max={}dBm spread={}dB)",
+                        d.rssi_min, d.rssi_max,
+                        d.rssi_max as i16 - d.rssi_min as i16
+                    );
+                }
             }
             serial_print!(" reports={} name=", d.reports);
             if d.nlen == 0 {
@@ -4995,6 +5069,26 @@ impl Controller {
                 "table complete (no truncation)"
             }
         );
+        // ---- witness: THE RECEIVE-DEPTH READING ------------------------------------------------
+        // The arithmetic the counts above must be read against, printed beside them so a capture
+        // interprets itself and nobody has to remember the advertising intervals.
+        //
+        // An advertising EVENT is transmitted on all three primary channels (37/38/39). A scanner
+        // listens on ONE of them per scan interval and, at window==interval, listens continuously —
+        // so with a 60 ms interval each channel gets roughly a third of the window and essentially
+        // every advertising event that occurs while that channel is selected is catchable.
+        //   * a device in PAIRING/discoverable mode advertises every 20-100 ms => 5-25 events in
+        //     500 ms => a healthy receiver returns reports in that band for it;
+        //   * a device on a 1.28 s background interval => ~0.4 events in 500 ms => hearing NOTHING
+        //     from it is the expected outcome, most boots, and says nothing about the receiver.
+        // The discriminating case is therefore a device KNOWN to be advertising fast: reports=1-2
+        // where the arithmetic says 5-25 is a receiver problem, not a quiet room. Under the old
+        // Filter_Duplicates=on this line could not have been written — the count was capped at one
+        // per device by the parameter itself.
+        serial_println!(
+            ":: bt-l2: [{}] LE scan receive depth — filter_duplicates is OFF, so adv_reports={} counts PDUs demodulated, not devices. Expected for a discoverable/pairing advertiser (20-100ms interval) over {}ms: 5-25 reports. Expected for a background advertiser (1.28s interval): ~0.4, i.e. usually zero. A device known to be pairing that yields 0-2 reports is a RECEIVE deficit; a device on a slow interval yielding 0 is arithmetic == witness ::",
+            self.idx, reports, BT_L2_SCAN_MS
+        );
         if dropped > 0 {
             serial_println!(
                 ":: bt-l2: [{}] LE scan TRUNCATION — {} report(s) named address(es) past the {}-device table cap; the device list above is a PREFIX of what was on the air, not all of it ::",
@@ -5017,7 +5111,7 @@ impl Controller {
             // construction here: both mask writes above returned status 0x00 and are witnessed, or
             // this drain never ran. So zero means nothing was heard, not that nothing was routed.
             serial_println!(
-                ":: bt-l2: [{}] LE scan found ZERO devices. Both the Event Mask (LE Meta, bit 61) and the LE Event Mask (Advertising Report, bit 1) were written and CONFIRMED above, so this is silence on the air across the {}ms measured (nominal {}ms) — not a masked event stream. A bounded window is not a survey: devices advertising slower than it can be missed ::",
+                ":: bt-l2: [{}] LE scan found ZERO devices. Both the Event Mask (LE Meta, bit 61) and the LE Event Mask (Advertising Report, bit 1) were written and CONFIRMED above, so this is silence on the air across the {}ms measured (nominal {}ms) — not a masked event stream. Nor is it a channel-coverage artefact: the three PRIMARY advertising channels (37/38/39) are not host-selectable — HCI_LE_Set_Host_Channel_Classification (0x2014) classifies DATA channels 0-36 only, and this arc never issues it, so the scanner's primary-channel rotation is the controller's and is complete by construction. A bounded window is not a survey: devices advertising slower than it can be missed ::",
                 self.idx, elapsed, BT_L2_SCAN_MS
             );
         }
