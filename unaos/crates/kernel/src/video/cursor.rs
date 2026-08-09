@@ -458,8 +458,11 @@ fn claim_bounded(budget_ms: u64) -> Result<SpriteLoan, SpriteClaimError> {
 /// [`repaint`]. That is not silence: on such a panel nothing is painting over the arrow either, which
 /// is the same condition that makes the wait harmless. It cannot accumulate (an `AtomicBool`, not a
 /// count) and it cannot be lost (only [`take_present_dirty`] clears it, and only by granting it).
+/// Review condition 3 widened this to `pub(super)`: `wm::composite`'s WCSER decline path is a second
+/// caller with the same need — it must discharge the sprite duty from inside ANOTHER core's CURSOR-1
+/// bracket, where drawing is exactly the thing it may not do. No behaviour here changes.
 #[cold]
-fn owe_repaint() {
+pub(super) fn owe_repaint() {
     // CURSOR-9's predicate: a painter may have taken one of our pixels without a handback. Armed
     // first, so a consumer that observes the owed flag observes this too.
     TOUCHED_SINCE_DRAW.store(true, Ordering::Release);
@@ -477,6 +480,13 @@ fn owe_repaint() {
 static REPAINT_OWED: AtomicBool = AtomicBool::new(false);
 
 /// WEDGE-9 — claims refused for [`SpriteClaimError::Busy`], over every entry point.
+///
+/// ⚠ SINCE REVIEW CONDITION 3 THIS IS NOT PURELY A CLAIM COUNT. `[wedge9] refused=` counts every
+/// [`owe_repaint`], and `wm::composite`'s WCSER decline path now arms one per declined pass without
+/// ever attempting a claim. So on x86 with a contended compositor, `refused` ≈ claim refusals +
+/// `[wcser] declined`; the two lines are emitted on the same cadence, so subtract if the claim
+/// population alone is what a reading needs. `refused_masked` is unaffected in kind (a decline from a
+/// masked present chain is genuinely masked) but shares the same inflation.
 #[cfg(feature = "witness")]
 static W9_REFUSED: AtomicU64 = AtomicU64::new(0);
 

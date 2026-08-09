@@ -2380,8 +2380,26 @@ pub fn composite() {
             WCSER_DECLINED.fetch_add(1, Relaxed);
             // `wm::erase` takes the sprite down and leaves the composite that follows to put it back.
             // That contract predates WC-I and a decline may not break it, so a declined pass still
-            // runs the `Untouched` tail — one relaxed load and a boolean in the common case (WC-I).
-            super::cursor::ensure_drawn();
+            // discharges the sprite duty — but it DEFERS it rather than performing it.
+            //
+            // REVIEW CONDITION 3 — `owe_repaint`, NOT `ensure_drawn`.
+            //
+            // We are, by definition, inside another core's CURSOR-1 bracket: the holder took the
+            // sprite down before its first window pixel and does not put it back until its last
+            // `draw_window`/`verify_window` has returned, and it holds no `SPRITE` lock across those
+            // blits. `ensure_drawn` here is therefore an UNSERIALISED SPRITE WRITER INTO A
+            // HALF-COMPOSITED STACK: it draws the arrow over rows the holder is still rewriting, and
+            // — worse, because it outlives the frame — it captures its save-under FROM those
+            // half-composited pixels, so the next undraw restores garbage to the panel. That is a
+            // per-pixel bleed with exactly the shape of AQ's `[wc-d] moved=` reading.
+            //
+            // `owe_repaint` is the strictly stronger duty taken one pass later (WEDGE-9's own words):
+            // it writes nothing now, and the holder's tail — which runs OUTSIDE the `BlitGuard`, on
+            // a finished stack, holding `SPRITE` — repaints the whole sprite. Same guarantee, correct
+            // bracket. The alternative shape (`ensure_drawn` only when `COMP_GATE` reads false) is
+            // strictly worse: that load is a race by construction, since the holder can release
+            // between the load and the draw.
+            super::cursor::owe_repaint();
             return;
         }
         #[cfg(feature = "witness")]
@@ -5031,17 +5049,64 @@ static SIDEBYSIDE_WITNESSED: core::sync::atomic::AtomicBool =
 // exactly nothing to `DrainBarrier::drain`'s wait set — `BLIT_ACTIVE` is still the only thing that
 // barrier waits on, and this gate is taken and released strictly OUTSIDE it.
 //
-// **NOTHING IS DROPPED.** A decliner returns before the table snapshot, so it clears no `damaged`
-// flag and consumes no band; the damage it would have drawn is still on the table. It publishes
-// `COMP_PENDING`, and the holder re-runs a full pass for as long as that flag is set and the table
-// still has work, bounded by `COMP_RERUN_MAX`. The effect at the panel is COALESCING: several
-// windows' presents that used to be several uncoordinated whole-stack rewrites become one
-// correctly-ordered pass over their union.
+// **NOTHING IS DROPPED — BUT ON THE DOMINANT PATH NOTHING RE-RUNS EITHER (review condition 4).** A
+// decliner returns before the table snapshot, so it clears no `damaged` flag and consumes no band;
+// the damage it would have drawn is still on the table, and it publishes `COMP_PENDING`. What happens
+// next depends entirely on whether the HOLDER has interrupts masked, and the earlier version of this
+// ledger described only the branch that almost never runs:
+//
+//   * UNMASKED holder (the service lane's `service_damage`, paygo, `move_to`) — re-runs a full pass
+//     while `COMP_PENDING` is set and the table still has work, bounded by `COMP_RERUN_MAX`, then
+//     takes the lost-wakeup re-acquisition. This is the branch `COMP_RERUN_MAX` and the lost-wakeup
+//     close exist for.
+//   * MASKED holder — `sys_win_present`, which is the overwhelming majority of passes, arrives inside
+//     `IrqGuard::mask_save()` holding `WINDOWS`. The `!masked` guard in `composite` disables BOTH the
+//     re-run loop and the lost-wakeup close for it. It runs its one pass and leaves. ZERO re-run
+//     rounds, by construction, on the path that produces nearly all the declines.
+//
+// THE BACKSTOP IS `service_damage`, AND IT IS EVENT-DRIVEN, NOT PERIODIC. `COMP_PENDING` and the
+// damage flags simply stay set until some pass takes them. In practice that pass is `service_damage`,
+// reached from `Screen::flush` in `main::x86_render_service` — a lane that BLOCKS on
+// `GUI_CHANNEL_X86.recv()` (main.rs, the render loop's first statement). It is therefore fed by
+// events, and its liveness on an otherwise idle machine comes from the input service's `Event::Timer`
+// pulse. That dependency is named here because it is the whole liveness argument.
+//
+// THE EXPOSURE BOUND, STATED HONESTLY: the tail of a burst on an idle fleet can sit undrawn until the
+// next event reaches the render lane. Not a frame, not a bounded interval — the next event. On a
+// machine with a live timer pulse that is one pulse; with the pulse stopped it is unbounded, and that
+// is the same standing liveness assumption `PAYGO-TERM` already records below.
+//
+// The effect at the panel when passes DO overlap is still COALESCING: several windows' presents that
+// used to be several uncoordinated whole-stack rewrites become one correctly-ordered pass over their
+// union — the decliners' damage joins the holder's own snapshot, or the next pass's.
 //
 // **x86 ONLY, and the gate is the justification, not the cfg.** aarch64 already carries FLUID-3's
 // depth instrument and its own metal cadence; changing the Pi's compositor from the x86 seat, with no
 // Pi boot to verify it, is exactly what this tree's verification law forbids. The aarch64 arm of
 // `composite` calls `composite_once` directly, so that arch's behaviour is byte-identical to before.
+// **NO STALE-HOLDER BREAKER, AND THE REASON IS A RACE — review condition 1, considered and DECLINED.**
+//
+// The obvious companion to the `WEDGED` verdict is a timeout: stamp `arch::ms()` on acquire and let
+// `service_damage` force-clear a holder older than ~250 ms. It was written out and rejected on two
+// counts, both fatal in the same direction — they reintroduce the interleaved blit this gate exists
+// to prevent.
+//
+//   (a) DOUBLE RELEASE. `COMP_GATE` is a bool, so the release sites store `false` unconditionally.
+//       If the breaker clears a holder that is merely slow (not dead), a second core acquires, and
+//       then the ORIGINAL holder's `store(false)` releases the SECOND core's gate — admitting a
+//       third. The gate does not fail closed; it fails open and compounding. Fixing that needs an
+//       owner token (`AtomicU64`, release by `compare_exchange(my_tok, 0)`), i.e. a redesign of the
+//       gate's representation inside the review of the gate.
+//   (b) EVEN TOKENISED, THE BREAK IS THE BUG. A token makes the release safe but does not make the
+//       break safe: a genuinely-alive slow holder is still blitting when the breaker admits a second
+//       compositor to the same glass. Boot AQ measured `max_us = 41048` — a real pass can already be
+//       41 ms, so any threshold is a bet that no pass is ever 6× its measured worst case, and losing
+//       that bet costs exactly the flicker this arc removed.
+//
+// So the wedge is REPORTED, not repaired. `[wcser] -> WEDGED` names it on the wire the period it
+// happens, and a wedge is a fault in `composite_once` — a bug to fix at the source, not a state to
+// paper over on every frame. If metal ever shows a real `WEDGED`, the token form of (a) is the
+// starting point, with a threshold argued from that boot's `[comp2] max_us`.
 #[cfg(target_arch = "x86_64")]
 static COMP_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -5050,20 +5115,31 @@ static COMP_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 #[cfg(target_arch = "x86_64")]
 static COMP_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// WCSER — how many extra rounds one gate holder will run for decliners before returning.
+/// WCSER — how many extra rounds one UNMASKED gate holder will run for decliners before returning.
 ///
-/// **The bound is an IRQ-MASKED-TIME bound, not a throughput one, and that is why it is this small.**
-/// The holder is usually `sys_win_present`, which runs inside `IrqGuard::mask_save()` holding
-/// `WINDOWS`; every re-run round extends that masked window by a whole pass. Boot AQ's `[comp2]`
-/// measured `pass_us=3997` mean with `max_us=41048`, so each round costs ~4 ms typical and tens of ms
-/// worst case. Two rounds caps the added masked time at two passes — and two is already above the
-/// steady-state need, because the same capture's ~144% compositor utilisation is about two cores, so
-/// a single round absorbs the one decliner that overlap produces.
+/// ⚠ REVIEW CONDITION 4 — THIS BOUND DOES NOT APPLY TO THE PATH THAT PRODUCES THE DECLINES. An
+/// earlier version of this docstring reasoned about `sys_win_present`'s masked window as though the
+/// re-run loop ran there. It does not: `composite`'s `!masked` guard disables the loop AND the
+/// lost-wakeup close for every masked holder, and `sys_win_present` — inside `IrqGuard::mask_save()`
+/// holding `WINDOWS` — is essentially all of them. A masked holder does exactly one pass.
 ///
-/// Nothing is lost by stopping here. The decliner's damage is still on the table (it cleared no flag),
-/// `COMP_PENDING` is still set, and the lost-wakeup close below re-arms one more attempt; failing
-/// that, the next present of any window in the fleet composites it. The bound trades a frame of
-/// latency for a bounded masked window, which is the trade this file's whole F4/WEDGE family makes.
+/// So this constant bounds only the UNMASKED holders: the service lane, paygo, `move_to`. The
+/// masked-time argument that set the value at 2 is still the right argument (Boot AQ's `[comp2]`
+/// measured `pass_us=3997` mean with `max_us=41048`, and `arch::ms()` is `apic::ticks()`, which only
+/// the BSP advances, so a masked round is global ms-clock loss) — it is simply no longer the
+/// governing one, because the population it governs never runs masked in the first place. Two rounds
+/// remains the value: it is above the steady-state need (~144% compositor utilisation is about two
+/// cores, so one round absorbs the one decliner overlap produces) and cheap where it now applies.
+///
+/// **CONSEQUENCE, AND THE AR PREDICTION.** With the dominant path taking zero rounds, this constant,
+/// `any_damaged`, and the lost-wakeup re-acquisition may all be unreachable on metal. `[wcser]
+/// reruns=` is the falsifier and it is already on the wire: **if `reruns=0` on EVERY rollup of a
+/// contended boot, then `COMP_RERUN_MAX`, `any_damaged` and the lost-wakeup close are dead code on
+/// x86** and should be deleted rather than documented. A non-zero reading names the unmasked lane
+/// that is doing the absorbing and keeps them.
+///
+/// Nothing is lost by stopping here, but the recovery is `service_damage`, not this loop — see the
+/// module ledger above [`COMP_GATE`] for that path's event-driven liveness and its exposure bound.
 #[cfg(target_arch = "x86_64")]
 const COMP_RERUN_MAX: u32 = 2;
 
@@ -5073,6 +5149,11 @@ const COMP_RERUN_MAX: u32 = 2;
 /// interleaving their blits with another core's, per 5 s. Non-zero proves the concurrency the
 /// `[comp2]` utilisation arithmetic could only infer; a fall to zero would mean the fleet stopped
 /// overlapping, not that the gate stopped working (`entered` is the denominator that separates them).
+///
+/// `reruns` is the SECOND reading, and review condition 4 gave it a job: it is the liveness proof for
+/// the re-run machinery, which the `!masked` guard reaches only from the unmasked lanes. Expected
+/// value on a present-dominated boot is ZERO, and zero is the deletion verdict for `COMP_RERUN_MAX`,
+/// `any_damaged` and the lost-wakeup close — see [`COMP_RERUN_MAX`].
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
 static WCSER_ENTERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
@@ -5087,6 +5168,23 @@ static WCSER_RERUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// and now is not), `-> SOLO` when no pass was ever declined. SOLO is not a failure: it is a period
 /// in which one core did all the compositing, which is what an idle or lightly-loaded desktop looks
 /// like. It IS a falsifier for any claim that the gate fixed a flicker observed during that period.
+///
+/// REVIEW CONDITION 1 — `-> WEDGED`, AND WHY IT OUTRANKS `SERIAL`.
+///
+/// `entered=0 declined=N declined_pct=100` is the WEDGE SIGNATURE: a holder took `COMP_GATE` and
+/// never released it (a fault inside `composite_once`, a core that died holding it), so for the whole
+/// period every pass on every core was declined and NOTHING reached the panel. Under the original
+/// verdict that period printed `-> SERIAL` — the PASS verdict — because `declined > 0` was the only
+/// test. The instrument would have reported the healthiest possible reading for the worst possible
+/// failure, and `declined_pct=100` (the tell) is a field a human has to notice rather than a verdict
+/// a matcher can fail on.
+///
+/// So `entered == 0 && declined > 0` is now named, and it is tested FIRST. It cannot collide with a
+/// healthy period: a healthy period always has at least one pass that took the gate, because a
+/// decliner can only exist while a holder is running. `entered == 0 && declined == 0` is still the
+/// dirty-paced silent return below — no compositing at all is idleness, not a wedge.
+///
+/// NO AUTOMATIC BREAKER — deliberately; see the stale-holder note above [`COMP_GATE`].
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
 fn wcser_emit(scope: &str, span: u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -5107,7 +5205,15 @@ fn wcser_emit(scope: &str, span: u64) {
         reruns,
         pct,
         span,
-        if declined > 0 { "SERIAL" } else { "SOLO" }
+        // WEDGED is tested first and outranks SERIAL: a period in which every pass was declined and
+        // none was ever entered is a permanently-held gate, not successful serialisation.
+        if entered == 0 {
+            "WEDGED"
+        } else if declined > 0 {
+            "SERIAL"
+        } else {
+            "SOLO"
+        }
     );
 }
 
@@ -6360,6 +6466,13 @@ static C2_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// FBCON-DMG — `box_px_pp` is INSERTED between `dmg_px_pp` and `rate=`, not appended: `span=` stays
 /// the terminal field so any matcher anchored on the end of this line is unaffected. See the module
 /// note above for what the pair is for.
+///
+/// COMP2-UTIL (review condition 5) — `util_pct` follows the same rule, inserted between `box_px_pp`
+/// and `rate=` with `span=` still terminal. `tools/serial-analyzer.py` carries this line only as
+/// docstring EXAMPLES and parses no field of it, so nothing downstream needed changing; the two
+/// examples there are pre-`util_pct` and are left as the historical captures they quote. The field's
+/// derivation, its >100 meaning and the paired verdict it belongs to are documented at the
+/// computation site below.
 #[cfg(feature = "witness")]
 fn comp2_emit(span: u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -6377,8 +6490,40 @@ fn comp2_emit(span: u64) {
         return;
     }
     let us = |cyc: u64| super::wcg::cycles_to_us(cyc / passes);
+    // COMP2-UTIL (review condition 5) — the multiply AR used to do by hand, done on the wire.
+    //
+    // `passes * pass_us * 100 / (span * 1000)` is the percentage of wall time this period that was
+    // spent inside a composite pass. ABOVE 100 IS THE WHOLE POINT: one compositor cannot exceed 100%,
+    // so >100 is direct arithmetic proof that two or more cores were inside `composite` at once. Boot
+    // AQ read ~144% and ~106% that way, and that inference is what the WCSER gate was built from.
+    // `span` is the same `span` the line already prints, so the reading is self-contained.
+    //
+    // ⚠ THE HONEST AR VERDICT IS A PAIR, NOT THIS FIELD ALONE:
+    //     `[comp2] util_pct < 100` AND `[wcser] declined > 0` -> SERIAL
+    // `util_pct` falling below 100 on its own proves nothing — an idle period reads low too. It is
+    // only evidence that the overlap STOPPED when `[wcser]` independently says passes were being
+    // excluded in the same period. Either half alone is compatible with "the fleet went quiet".
+    //
+    // OPEN ITEM, recorded so AR is read against it rather than around it: Boot AQ's `[wc-d] verify
+    // win=10 moved=221400 FAIL` is the per-pixel bleed witness and it still has NO explanation. The
+    // gate is a hypothesis for it, not a diagnosis. PREDICTED READING: if the gate is the cure,
+    // `moved` collapses toward zero on a boot whose `[wcser]` says SERIAL. If `moved` stays around
+    // ~221k WITH a SERIAL verdict, the gate is not the whole bug, and the next suspect is the cursor
+    // decline race — the `owe_repaint` change of review condition 3, which removes an unserialised
+    // sprite writer from inside another core's CURSOR-1 bracket and is exactly a per-pixel-bleed
+    // mechanism. That would make AR the first boot able to separate the two.
+    let span_us = span.saturating_mul(1000);
+    let util_pct = if span_us == 0 {
+        0
+    } else {
+        // Ordered to keep the product in range: per-pass microseconds first, then scale.
+        us(pass_cyc)
+            .saturating_mul(passes)
+            .saturating_mul(100)
+            .saturating_div(span_us)
+    };
     serial_println!(
-        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} rate={}.{}/s span={}ms",
+        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} util_pct={} rate={}.{}/s span={}ms",
         passes,
         us(pass_cyc),
         super::wcg::cycles_to_us(max_cyc),
@@ -6389,6 +6534,7 @@ fn comp2_emit(span: u64) {
         bytes / passes,
         dmg_px / passes,
         box_px / passes,
+        util_pct,
         passes.saturating_mul(10_000) / span.max(1) / 10,
         passes.saturating_mul(10_000) / span.max(1) % 10,
         span
