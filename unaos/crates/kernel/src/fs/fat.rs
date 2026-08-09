@@ -1371,6 +1371,43 @@ pub fn mount() -> Result<FatFs, FatError> {
     mount_source(BlockSource::Default)
 }
 
+/// APPLOAD: mount the volume a PROGRAM should be loaded from — the global block device if one is
+/// registered, else (x86 + `sdhcblk`) the card in the machine's internal SD slot.
+///
+/// This is [`mount`] for the one class of caller that means "wherever I can find an executable",
+/// rather than "the device the system is bound to". The distinction had no consequences while the
+/// only readable medium was the boot stick; it acquired one the moment SDHC-4b gave the internal
+/// reader a handle of its own, because a machine booted from that reader has a mounted, listed,
+/// program-bearing volume and an EMPTY global slot at the same time.
+///
+/// Precedence and its compatibility argument live on [`crate::drivers::block::program_source`]; the
+/// short form is that the global wins whenever it exists, so this is identical to [`mount`] on every
+/// boot that already worked.
+///
+/// **The read path follows the handle, by construction.** The handle is mapped to the matching
+/// [`BlockSource`] here and every subsequent read — the BPB probe, the partition scan, each directory
+/// sector, each data cluster — routes through `read_sector` / `read_sectors`, which already dispatch
+/// per source (`Sdhc` -> `read_block_sdhc` / `read_blocks_sdhc`, bypassing the backend selector).
+/// No second read mechanism is introduced and none is needed.
+pub fn mount_program_source() -> Result<FatFs, FatError> {
+    let (_dev, handle) = crate::drivers::block::program_source().ok_or(FatError::NoDisk)?;
+    mount_source(source_of(handle))
+}
+
+/// APPLOAD: the inverse of [`handle_of`] — which [`BlockSource`] reads a given registry handle.
+///
+/// Total by construction, so a handle added to the block layer without a source here is a compile
+/// error rather than a silent mis-route. `Usb` is mapped for totality only:
+/// [`crate::drivers::block::program_source`] never returns it (see the precedence note there).
+fn source_of(handle: crate::drivers::block::BlockHandle) -> BlockSource {
+    match handle {
+        crate::drivers::block::BlockHandle::Global => BlockSource::Default,
+        crate::drivers::block::BlockHandle::Usb => BlockSource::Usb,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        crate::drivers::block::BlockHandle::Sdhc => BlockSource::Sdhc,
+    }
+}
+
 /// PIUSB-27: mount a FAT volume from a chosen block `source`. `Default` is the globally-registered device
 /// (SD on the Pi); `Usb` reads the USB stick directly through the xHCI controller so it can be browsed
 /// read-only even while the SD backend owns the global block device. Geometry comes from the matching

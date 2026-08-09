@@ -3814,10 +3814,18 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
             p
         }
     };
-    let fs = match crate::fs::fat::mount() {
+    // APPLOAD: `mount_program_source` — this function's ENTIRE job is finding an executable, which is
+    // the one question the global handle alone cannot answer on a machine booted from the internal SD
+    // reader. `bg /fat/VUG.ELF` reported `-ENOENT` there while the card was mounted and the file
+    // listed. `/fat` stays the alias for "the one FAT volume this arch mounts"; which handle serves
+    // that volume is now the block layer's decision, not this call site's assumption.
+    let fs = match crate::fs::fat::mount_program_source() {
         Ok(fs) => fs,
         Err(e) => {
-            console.println(&alloc::format!("{}: no FAT filesystem ({:?})", verb, e));
+            console.println(&alloc::format!(
+                "{}: no FAT filesystem ({:?}; handles={})",
+                verb, e, crate::drivers::block::source_census()
+            ));
             return None;
         }
     };

@@ -547,7 +547,13 @@ pub fn desktop_app_service() {
     // that lost its program" — purely by ABSENCE. So the wait gives up OUT LOUD. The clock starts at
     // the first pass rather than at boot, so a late activation does not eat the budget, and
     // `.max(1)` keeps `0` meaning "not started" even in the vanishing case where `ticks()` reads 0.
-    if crate::drivers::block::info().is_none() {
+    //
+    // APPLOAD: `program_source()`, not `info()`. `info()` reads the GLOBAL handle alone, so a machine
+    // booted from the INTERNAL SD reader with no USB stick declined here — for thirty seconds and
+    // then permanently — while `:: SDHCBLK: … STAT.ELF …` sat a few lines up in the same capture,
+    // naming the very file this launch wanted. The question this gate asks is "can I load a program
+    // from anywhere", and that question has a block-layer answer now.
+    if crate::drivers::block::program_source().is_none() {
         let now = crate::arch::ticks();
         let started = WAIT_SINCE_MS.load(Ordering::Relaxed);
         if started == 0 {
@@ -565,9 +571,14 @@ pub fn desktop_app_service() {
         // instrument laws exist to catch, and the real value was already computed one line up. If
         // this ever reads far above the threshold, the service pass itself stalled — which the
         // constant could never have told anyone.
+        //
+        // APPLOAD: the census, not a boot-wide claim. The old tail read "no block device ever
+        // enumerated" — an assertion about the whole machine drawn from ONE of three registry slots,
+        // and it was false on the boot that exposed this. `handles=` says what was actually
+        // inspected, so this refusal is falsifiable by the capture it appears in.
         serial_println!(
-            "[wc-x] desktop-app DECLINE reason=no-storage name=/{} waited={}ms threshold={}ms — no block device ever enumerated; the desktop keeps the console window only",
-            DESKTOP_APP, waited, STORAGE_WAIT_MS
+            "[wc-x] desktop-app DECLINE reason=no-storage name=/{} waited={}ms threshold={}ms handles={} — no handle offered a program source; the desktop keeps the console window only",
+            DESKTOP_APP, waited, STORAGE_WAIT_MS, crate::drivers::block::source_census()
         );
         return;
     }
@@ -597,10 +608,12 @@ pub fn desktop_app_service() {
     }
     DONE.store(true, Ordering::Relaxed);
 
-    let Ok(fs) = crate::fs::fat::mount() else {
+    // APPLOAD: the same handle ladder the storage gate above cleared — mounting `Default` here after
+    // clearing the gate on `program_source` would be the identical defect one line later.
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
         serial_println!(
-            "[wc-x] desktop-app DECLINE reason=no-fat-volume name=/{} — the desktop keeps the console window only",
-            DESKTOP_APP
+            "[wc-x] desktop-app DECLINE reason=no-fat-volume name=/{} handles={} — the desktop keeps the console window only",
+            DESKTOP_APP, crate::drivers::block::source_census()
         );
         return;
     };
