@@ -37,6 +37,18 @@
 
 pub mod qh;
 
+/// BT-L2 — the advertised Local Name: the AD-structure walk, the match rules, and the fixture
+/// that proves them. Split out of this file so the decode can be exercised WITHOUT a radio —
+/// by `bt_name_fixture` on any boot, and by `tools/btname_harness.rs`, which `include!`s the
+/// same source rather than a copy of it. See that file's header for why Boot AR forced this.
+#[cfg(feature = "bt")]
+mod bt_name;
+#[cfg(feature = "bt")]
+use bt_name::{
+    bt_decode_local_name, bt_name_case_passes, bt_name_contains_ci, bt_name_maybe_ci,
+    BT_L2_NAME_MAX, BT_L2_RAW_MAX, BT_NAME_CASES, BT_NAME_SUSPECT_LEN,
+};
+
 use super::ehci_scout::{
     self, mmio_read32, mmio_write32, settle_ms, wait_bounded, EhciFnHandle, OP_PORTSC0, OP_USBCMD,
     OP_USBSTS,
@@ -729,12 +741,9 @@ const BT_LE_SCAN_FILTER_ALL: u8 = 0x00;
 const BT_EVT_LE_META: u8 = 0x3E;
 #[cfg(feature = "bt")]
 const BT_LE_SUBEVT_ADV_REPORT: u8 = 0x02;
-/// BT-L2 — AD structure types carrying a device name (Bluetooth Core Supplement / Assigned
-/// Numbers, Generic Access Profile): 0x08 Shortened Local Name, 0x09 Complete Local Name.
-#[cfg(feature = "bt")]
-const BT_AD_NAME_SHORT: u8 = 0x08;
-#[cfg(feature = "bt")]
-const BT_AD_NAME_COMPLETE: u8 = 0x09;
+// BT-L2 — the AD name types (0x08 Shortened, 0x09 Complete), the name cap `BT_L2_NAME_MAX`, the
+// raw-payload cap `BT_L2_RAW_MAX` and the walk itself now live in `bt_name.rs`, imported above.
+
 /// BT-L2 — the BOUNDED scan window, in milliseconds of wall clock. 500 ms is the whole of what
 /// this arc costs the boot beyond a handful of control transfers, and it is chosen against the
 /// advertising intervals real devices use: connectable-discoverable advertisers (phones, watches,
@@ -750,11 +759,7 @@ const BT_L2_SCAN_MS: u64 = 500;
 /// truncation would read as "that is all there was".
 #[cfg(feature = "bt")]
 const BT_L2_MAX_DEV: usize = 16;
-/// BT-L2 — cap on the local-name bytes kept per device. AD names run to 29 bytes; 24 keeps the
-/// witness line one serial line without eliding the distinguishing part of a real name. A name cut
-/// at the cap is printed with a trailing `~`.
-#[cfg(feature = "bt")]
-const BT_L2_NAME_MAX: usize = 24;
+// `BT_L2_NAME_MAX` moved to `bt_name.rs` — the cap belongs with the walk that applies it.
 
 // ---------------------------------------------------------------------------------------------
 // BT-L3 — CONNECT to one LE peer, and always let go.
@@ -1135,6 +1140,16 @@ struct BtDev {
     /// a device that advertises connectably and then has a scan response overheard would end the
     /// window looking like a `SCAN_RSP` and be refused a connection it was soliciting.
     conn_seen: bool,
+    /// THE RAW AD PAYLOAD that produced `name`, kept so a decoded name can be CHECKED rather than
+    /// believed. Boot AR is why: the capture said `name="."` and there was no way, from the log
+    /// alone, to tell a one-byte name on the air from a walk that had lost the other seven bytes.
+    /// Held from the report whose name was stored (or, when no report carried a name, from the
+    /// first report for that address) so `raw` and `name` always describe the same payload.
+    raw: [u8; BT_L2_RAW_MAX],
+    rawlen: u8,
+    /// Set when the report's `Data_Length` exceeded `BT_L2_RAW_MAX` — the witness then says so
+    /// rather than presenting a prefix as the whole payload.
+    rawcut: bool,
 }
 
 #[cfg(feature = "bt")]
@@ -1151,69 +1166,17 @@ impl Default for BtDev {
             ncomplete: false,
             reports: 0,
             conn_seen: false,
+            raw: [0; BT_L2_RAW_MAX],
+            rawlen: 0,
+            rawcut: false,
         }
     }
 }
 
-/// BT-L3 — case-insensitive ASCII substring match, for the peer NAME filter.
-///
-/// ASCII-only folding on purpose: advertised Local Names are UTF-8 on the air, and a correct
-/// Unicode case fold is a table this driver has no business carrying. Every byte outside ASCII is
-/// compared verbatim, so a non-ASCII name still matches itself exactly — what it will not do is
-/// match a differently-cased form of itself, which is a miss and never a false hit.
-///
-/// An EMPTY needle matches everything, so the caller must treat `Some("")` as "no filter" rather
-/// than let it silently admit the whole room; it is refused explicitly at the call site.
-#[cfg(feature = "bt")]
-fn bt_name_contains_ci(hay: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || needle.len() > hay.len() {
-        return needle.is_empty();
-    }
-    let fold = |b: u8| if b.is_ascii_uppercase() { b + 32 } else { b };
-    for start in 0..=(hay.len() - needle.len()) {
-        let mut all = true;
-        for k in 0..needle.len() {
-            if fold(hay[start + k]) != fold(needle[k]) {
-                all = false;
-                break;
-            }
-        }
-        if all {
-            return true;
-        }
-    }
-    false
-}
-
-/// BT-L3 — could `needle` still be found in a name of which `hay` is only a PREFIX?
-///
-/// A Shortened Local Name (AD type 0x08) is a prefix of the complete one, so a miss against it is
-/// not a miss against the device — the rest of the name was simply never heard. The match can only
-/// have been lost by STRADDLING the cut, which means some non-empty suffix of `hay` equals the
-/// corresponding prefix of `needle`. (A whole containment is a real hit and is tested first by the
-/// caller, so this answers the strictly weaker question.)
-///
-/// The empty suffix is deliberately excluded: every string trivially ends with the empty prefix,
-/// and admitting it would make EVERY shortened name a maybe, which is the same as no signal at all.
-#[cfg(feature = "bt")]
-fn bt_name_maybe_ci(hay: &[u8], needle: &[u8]) -> bool {
-    let fold = |b: u8| if b.is_ascii_uppercase() { b + 32 } else { b };
-    let maxk = hay.len().min(needle.len());
-    for k in (1..=maxk).rev() {
-        let tail = &hay[hay.len() - k..];
-        let mut all = true;
-        for j in 0..k {
-            if fold(tail[j]) != fold(needle[j]) {
-                all = false;
-                break;
-            }
-        }
-        if all {
-            return true;
-        }
-    }
-    false
-}
+// BT-L3 — `bt_name_contains_ci` and `bt_name_maybe_ci` moved to `bt_name.rs` and are imported
+// at the top of this file. They are pure byte comparisons over the decoded name, so they belong
+// with the walk that produced it — and moving them is what lets the harness prove the FILTER,
+// not just the decode: "MEGABOOM" matches, and Boot AR's "." does not.
 
 /// BT-L3 — which event `bt_l3_await` is looking for. Every L3 wait names its target explicitly
 /// rather than "the next event", because the controller legitimately interleaves others: a
@@ -3419,6 +3382,12 @@ impl Controller {
             }
         }
 
+        // ---- BT-L2: the name walk answers for itself BEFORE the radio is asked anything -------
+        // Unconditional, and ahead of every gate below on purpose: it needs no radio, no LE
+        // support and no confirmed stage, and a boot where the scan never starts is exactly the
+        // boot where you still want to know the decode is sound. Cost is the serial lines.
+        self.bt_name_fixture();
+
         // ---- BT-L2: LE scan — the first thing this radio does that a person can see -----------
         // THE GUARD (review note 2). A scan is not another idempotent write: it turns on a
         // REPEATED event stream on the controller that also carries the internal keyboard and the
@@ -3501,6 +3470,76 @@ impl Controller {
         Some(st)
     }
 
+    /// BT-L2 — run the Local Name decode over payloads whose answer is known BEFORE the radio is
+    /// asked anything, and witness every leg.
+    ///
+    /// WHY THIS EXISTS. Boot AR heard Peter's MEGABOOM at its real address and rendered its name
+    /// as `"."`; the name filter then refused it, correctly, and the capture recorded a clean
+    /// no-match. Nothing in that capture could distinguish a one-byte name on the air from a walk
+    /// that had dropped seven bytes — and the walk had no way to be wrong LOUDLY. This is that
+    /// way. It runs the same `bt_decode_local_name` the drain runs, over `BT_NAME_CASES`, and any
+    /// leg that disagrees prints FAIL with the expectation, the result and the reason the leg
+    /// exists.
+    ///
+    /// IT COSTS NO I/O AND NO RADIO. Eight payloads of at most 31 bytes, walked in registers: the
+    /// boot cost is the serial output, one line per leg, and it runs once per BT probe. It is
+    /// placed BEFORE the scan on purpose — a red fixture means every name in the lines that follow
+    /// is untrustworthy, and the reader should learn that first.
+    ///
+    /// Returns true when every leg passed.
+    #[cfg(feature = "bt")]
+    fn bt_name_fixture(&self) -> bool {
+        let mut pass = 0u32;
+        let mut fail = 0u32;
+        for c in BT_NAME_CASES {
+            let got = bt_decode_local_name(c.data);
+            if bt_name_case_passes(c) {
+                pass += 1;
+                serial_print!(
+                    ":: bt-l2: [{}] fixture {} -> PASS name=\"",
+                    self.idx, c.what
+                );
+                for &b in got.as_bytes() {
+                    serial_print!("{}", if (0x20..0x7F).contains(&b) { b as char } else { '.' });
+                }
+                serial_println!(
+                    "\" complete={} cut={} == witness ::",
+                    got.ncomplete, got.ncut
+                );
+            } else {
+                fail += 1;
+                serial_print!(":: bt-l2: [{}] fixture {} -> FAIL want=\"", self.idx, c.what);
+                for &b in c.want_name {
+                    serial_print!("{}", if (0x20..0x7F).contains(&b) { b as char } else { '.' });
+                }
+                serial_print!(
+                    "\"(complete={} cut={}) got=\"",
+                    c.want_complete, c.want_cut
+                );
+                for &b in got.as_bytes() {
+                    serial_print!("{}", if (0x20..0x7F).contains(&b) { b as char } else { '.' });
+                }
+                serial_println!(
+                    "\"(complete={} cut={}) — {} ::",
+                    got.ncomplete, got.ncut, c.why
+                );
+            }
+        }
+        serial_println!(
+            ":: bt-l2: [{}] fixture tally — legs={} pass={} fail={} -> {} == witness ::",
+            self.idx,
+            BT_NAME_CASES.len(),
+            pass,
+            fail,
+            if fail == 0 {
+                "the name walk decodes every known payload correctly, INCLUDING a Complete Local Name of \"MEGABOOM\"; a name printed below is the name the air carried"
+            } else {
+                "THE NAME WALK IS WRONG — every name printed below is suspect, and a no-match in this boot proves NOTHING about the room"
+            }
+        );
+        fail == 0
+    }
+
     /// BT-L2 — LE SCAN: open the LE event channel, scan passively for a bounded window, report the
     /// devices heard, and turn the radio back off.
     ///
@@ -3517,6 +3556,7 @@ impl Controller {
     /// endpoint for the rest of the boot, on the same EHCI controller as the internal keyboard and
     /// trackpad. The paths that return BEFORE the enable command never enabled anything and have
     /// nothing to undo.
+
     #[cfg(feature = "bt")]
     unsafe fn bt_le_scan(
         &mut self,
@@ -4686,44 +4726,28 @@ impl Controller {
             // keep — that this address was heard advertising CONNECTABLY at least once — because
             // `devs[i].evt` is last-report-wins and a later SCAN_RSP would erase it.
 
-            // AD structures: a sequence of (Length(1), AD_Type(1), AD_Data(Length-1)). Walk far
-            // enough to find a local name; a Complete Local Name (0x09) ends the walk, a Shortened
-            // one (0x08) is kept but the walk continues in case the complete name follows.
-            let mut name = [0u8; BT_L2_NAME_MAX];
-            let mut nlen = 0usize;
-            let mut ncut = false;
+            // AD structures: a sequence of (Length(1), AD_Type(1), AD_Data(Length-1)). The walk
+            // itself lives in `bt_name.rs` — SHARED SOURCE with `bt_name_fixture` and with
+            // `tools/btname_harness.rs`, so the decode the radio path runs is the decode the
+            // fixture proves. It used to be written out here, where nothing could exercise it
+            // without a boot AND a device in the room.
+            let dec = bt_decode_local_name(data);
+            let name = dec.name;
+            let nlen = dec.nlen;
+            let ncut = dec.ncut;
             // WHICH KIND of name filled the slot. A Shortened Local Name is by definition a PREFIX
             // of the complete one, so "did this come from 0x09 or 0x08" is the difference between
             // a name that can be matched and a name that can only be matched as far as it goes.
-            let mut ncomplete = false;
-            let mut off = 0usize;
-            while off + 2 <= dlen {
-                let l = data[off] as usize;
-                if l == 0 || off + 1 + l > dlen {
-                    break; // 0 = end of significant part; over-long = malformed tail, stop
-                }
-                let ty = data[off + 1];
-                if ty == BT_AD_NAME_COMPLETE || ty == BT_AD_NAME_SHORT {
-                    let src = &data[off + 2..off + 1 + l];
-                    // An EMPTY name field (Length==1: type byte only, no data) is legal on the air
-                    // and carries no name. Without this guard a Complete Local Name of zero bytes
-                    // ERASED a Shortened name captured earlier in the same walk — a device that
-                    // advertises "Pete" then an empty complete name would print name=(none). An
-                    // empty field is skipped; a COMPLETE one still ends the walk, because the
-                    // device has told us there is no longer name to wait for.
-                    if !src.is_empty() {
-                        let take = src.len().min(BT_L2_NAME_MAX);
-                        name[..take].copy_from_slice(&src[..take]);
-                        nlen = take;
-                        ncut = src.len() > BT_L2_NAME_MAX;
-                        ncomplete = ty == BT_AD_NAME_COMPLETE;
-                    }
-                    if ty == BT_AD_NAME_COMPLETE {
-                        break;
-                    }
-                }
-                off += 1 + l;
-            }
+            let ncomplete = dec.ncomplete;
+
+            // Keep the RAW payload alongside the decode. This is the Boot AR fix: a name too short
+            // to trust is witnessed WITH the bytes it came from, so "the air carried one byte" and
+            // "the walk lost seven" stop being the same log line.
+            let mut raw = [0u8; BT_L2_RAW_MAX];
+            let rawtake = dlen.min(BT_L2_RAW_MAX);
+            raw[..rawtake].copy_from_slice(&data[..rawtake]);
+            let rawlen = rawtake as u8;
+            let rawcut = dlen > BT_L2_RAW_MAX;
 
             // Merge into the distinct-device table, keyed by (address, address type).
             let mut hit = None;
@@ -4768,7 +4792,21 @@ impl Controller {
                             devs[i].nlen = nlen as u8;
                             devs[i].ncut = ncut;
                             devs[i].ncomplete = ncomplete;
+                            // The raw payload travels WITH the name it produced. Without this the
+                            // witness could print one report's bytes under another report's name,
+                            // which is a worse lie than printing nothing.
+                            devs[i].raw = raw;
+                            devs[i].rawlen = rawlen;
+                            devs[i].rawcut = rawcut;
                         }
+                    } else if devs[i].nlen == 0 {
+                        // Still no name from anybody. Keep the LATEST nameless payload rather than
+                        // the first: successive reports from a silent advertiser are the only
+                        // evidence available about why it is silent, and a stale first sighting
+                        // would freeze the witness on one of them.
+                        devs[i].raw = raw;
+                        devs[i].rawlen = rawlen;
+                        devs[i].rawcut = rawcut;
                     }
                 }
                 None if ndev < BT_L2_MAX_DEV => {
@@ -4783,6 +4821,9 @@ impl Controller {
                         ncomplete,
                         reports: 1,
                         conn_seen: evt_type == BT_L3_ADV_CONNECTABLE,
+                        raw,
+                        rawlen,
+                        rawcut,
                     };
                     ndev += 1;
                 }
@@ -4915,6 +4956,33 @@ impl Controller {
             // `SKIP:name-mismatch` is the one combination worth reading twice: the match was tried
             // against a name this arc truncated at BT_L2_NAME_MAX, so it may be a false miss.
             serial_println!(" l3={} == witness ::", verdict[i]);
+
+            // ---- THE BOOT AR WITNESS -------------------------------------------------------
+            // A name shorter than `BT_NAME_SUSPECT_LEN` is not evidence of anything, and Boot AR
+            // proved that the difference between "the air carried one byte" and "the walk lost the
+            // rest" is invisible in a rendered name — every unprintable byte prints as '.', so a
+            // misparse and a real one-character name are the SAME LINE. So the raw payload goes
+            // out beside it, bounded, and the reader can do the walk by hand.
+            //
+            // This fires for `(none)` too: a device heard with no name at all is the case where
+            // the payload is the entire story, and it is the case a name filter silently discards.
+            if (d.nlen as usize) < BT_NAME_SUSPECT_LEN {
+                serial_print!(
+                    ":: bt-l2: [{}] dev {:02} RAW ad — decoded name is {} char(s), too short to trust: Data_Length={} bytes=[",
+                    self.idx, i + 1, d.nlen, d.rawlen
+                );
+                for j in 0..d.rawlen as usize {
+                    serial_print!("{}{:02x}", if j == 0 { "" } else { " " }, d.raw[j]);
+                }
+                serial_println!(
+                    "]{} — this is the payload the name walk actually saw; AD structures are (Length, Type, Data[Length-1]) and a Local Name is Type 0x09 (complete) or 0x08 (shortened). The walk over these exact bytes is proven by the bt-l2 fixture above == witness ::",
+                    if d.rawcut {
+                        " TRUNCATED at the 31-byte cap (the report declared more)"
+                    } else {
+                        ""
+                    }
+                );
+            }
         }
 
         // ---- witness: the rollup --------------------------------------------------------------
