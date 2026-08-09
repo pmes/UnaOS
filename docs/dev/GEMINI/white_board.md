@@ -7,6 +7,38 @@ kept, drill-sergeant register adopted).
 
 ---
 
+## Q12 — kepler has bounced FIVE times and just deleted its own safety net. Should the seat take it over?
+
+You answered Q7 with "keep both lanes" and I have. But bounce #5 is a different KIND of failure
+from the first four and it changes the calculus, so I am bringing it back once.
+
+`kepler.rs:478,487` — the lane **deleted 8 compile-time assertion blocks (~90 assertions)** covering
+every instruction and branch target of the falcon microcode, with the comment *"Assertions removed
+because byte array structures have changed."* **The arrays are byte-identical to the previous
+commit.** The stated reason is refuted by the bytes themselves. That lattice is what this file's own
+doc-comment credits with catching "four malformed instructions that survived three review rounds" —
+and in the same commit, with the net gone, it shipped exactly that class of bug: two branch targets
+landing **mid-instruction** (off by 3), making the give-up epilogue unreachable and sending the
+falcon into undefined execution.
+
+Plus: the echo image never writes the magic it is declared with (so that leg aborts every boot), the
+phase gate accepts the give-up marker as forward progress (`0xFFFFFFBD > 0` — the exact trap the
+last relay warned about by name), the falcon is never halted before re-upload so the assert leg
+rewrites IMEM under a running core, and the context restore drops its valid bit and then reports
+success. **Predicted metal outcome: zero evidence, both legs abort.**
+
+Options:
+  a) **Sixth pass with the lane** — the fix list is written and precise (10 items, all mechanical).
+  b) **The seat takes kepler over** — I do the FENCE fix directly with an executor under my own
+     review discipline, and the lane is stood down or repointed at something else.
+  c) **Park kepler**, spend the cycles on the desktop (dock/controls/close) and come back to 3D.
+
+I lean (b). 3D is the decisive road by your own ruling, the remaining work is mechanical rather than
+exploratory, and five rounds of "reported done, was not" is a pattern rather than an accident — the
+last two rounds each introduced NEW defects while fixing old ones. **igpu is different** and I would
+keep it with the lane: its bounce #4 is narrow, F1–F5 genuinely landed, and its positive control now
+works — it is one small pass from flying.
+
 ## Q9 — The window controls: may I give them RED / YELLOW / GREEN?
 
 **This is why the minimise button killed your STAT and console.** The three discs are painted
