@@ -4999,6 +4999,18 @@ pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // redundant composite AND whatever queued input the focused app had not yet read. Paid only if
     // the dedupe upstream is already broken — and then the wire evidence is worth the price.
     //
+    // DRAGREL — **A FOCUS SWITCH CANCELS A LIVE DRAG.** Not a convenience: a drag steering a window
+    // the operator has just tabbed AWAY from is never what the gesture meant, and on metal it was
+    // the state the missed release left behind — the previous window silently following the pointer
+    // under the newly focused one, with no visible thing to let go of. `<TAB>` is the one input the
+    // operator always has, so it is also the escape. Placed BEFORE the focus primitive so the cancel
+    // is attributed to the window that was actually being dragged, and named `focus-key` so a
+    // capture can tell this end from the two release ends. NOT `wc`-gated, for the same reason
+    // `wc_click_route_at`'s drag arms are not: `drag_begin` is reachable in a plain build too, so a
+    // gate here would leave exactly that build with a drag `<TAB>` cannot escape.
+    if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE {
+        crate::video::wm::drag_cancel("focus-key");
+    }
     // WEDGE-2 `<F2>` — the ring was read and a destination chosen; the focus PRIMITIVE is next.
     crate::wedge2::mark("<F2>");
     // Focus moves through the ONE primitive, so the cycle inherits what already hangs off it: the
@@ -5468,6 +5480,33 @@ fn wc_close_click(_owner: u64) -> &'static str {
 #[cfg(feature = "wc")]
 pub fn wc_drag_motion() {
     if crate::video::wm::drag_active() == crate::video::wm::WIN_NONE {
+        return;
+    }
+    // DRAGREL — **THE DRAG ENDS WHEN THE BUTTON IS UP, WHETHER OR NOT ITS EDGE ARRIVED.**
+    //
+    // The release arm in `wc_click_route_at` is the primary end: it carries the exact release
+    // position and is exempt from the throttle below. It is not sufficient on metal. The EHCI
+    // interrupt endpoint is armed for ONE report per service pass and a report is a LEVEL, so a
+    // release can be superseded before it is ever read (the CLICK-3 ledger in `drivers/ehci`
+    // documents that loss for presses; it costs a drag its ENTIRE END). A drag that outlives the
+    // hand is the worst failure this path has — the window then tracks the pointer for the rest of
+    // the boot, through focus changes, invisibly.
+    //
+    // So the tail asks the LEVEL, which every pointer report writes and no missed edge can falsify.
+    // Applied here rather than before the throttle: the final `drag_motion` is the same unthrottled
+    // settle the release arm performs, so the window lands where the hand actually is, and the
+    // distinct `release-level` reason on the `[wm-act]` line is what lets a capture say which of the
+    // two paths ended the gesture on real silicon.
+    //
+    // LIMIT, stated rather than papered over: the tail runs off POINTER REPORTS, so a drag whose
+    // release is lost and whose hand then goes perfectly still stays live until the pointer moves
+    // again. That residue is harmless by construction — a drag that is not being steered moves no
+    // window — and the FIRST report that could do harm is also the one that ends it. The operator's
+    // escape from the state in the meantime is `<TAB>`, which cancels (see `wc_focus_key`).
+    if !crate::pal::cursor::button_down() {
+        let (x, y) = click_pointer_pos();
+        crate::video::wm::drag_motion(x, y);
+        crate::video::wm::drag_cancel("release-level");
         return;
     }
     let now = crate::arch::ticks();
@@ -6051,6 +6090,12 @@ static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; 1024]);
 ///     arm; the `bg_kill` call itself is the one line here that stays metal-only, and the doc's
 ///     watch-list says so.
 ///  6. **dragdead** — a window closed mid-drag leaves `drag_active() == WIN_NONE`.
+///  7. **level** (DRAGREL) — the drag ends from the button LEVEL alone, with NO `Button` event
+///     routed at any point. This is the metal case: the release report can be dropped outright (one
+///     report per service pass, and a report is a level), so leg 3's routed `Button(0)` is a
+///     fixture-only luxury and the drag that never ended on glass passed leg 3 every time.
+///  8. **tabcancel** (DRAGREL) — `<TAB>` while a drag is live cancels it. The operator escape from a
+///     window that is following the pointer with nothing visible to let go of.
 ///
 /// Self-cleaning: the probe rows are closed and the input focus restored.
 #[cfg(all(feature = "witness", feature = "wc"))]
@@ -6125,6 +6170,10 @@ pub fn wmdirect_selftest() {
     user_input_set_active(OWNER_O);
     wm::focus_changed(OWNER_O);
     CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+    // DRAGREL — the fixture must publish the pointer LEVEL a real press publishes, or leg 3's motion
+    // would reach a tail that reads "button up" and end the drag through the new belt instead of
+    // through the release EVENT it exists to test. Two legs, two paths, each driven honestly.
+    crate::pal::cursor::set_button_level(true);
     let grab_consumed = wc_click_route_at(Event::Button(1), tpx, tpy);
     let grab_ok = grab_consumed && wm::drag_active() == w && user_input_active() == OWNER_D;
 
@@ -6152,6 +6201,7 @@ pub fn wmdirect_selftest() {
     wc_route_tail(raw);
     let after = wm::info(w).map(|i| (i.x, i.y));
     // The release ends the drag. It is a Button, so it goes through the click router as always.
+    crate::pal::cursor::set_button_level(false);
     let rel_consumed = wc_click_route_at(Event::Button(0), tpx + 24, tpy + 24);
     let route_ok = consumed_by_ring
         && after.is_some()
@@ -6170,6 +6220,63 @@ pub fn wmdirect_selftest() {
             let consumed = wc_click_route_at(Event::Button(1), px, py);
             wc_click_route_at(Event::Button(0), px, py);
             !consumed && wm::drag_active() == wm::WIN_NONE
+        }
+        None => false,
+    };
+
+    // Leg 7 — DRAGREL, THE LEVEL PATH, WITH NO RELEASE EVENT ANYWHERE IN IT. Leg 3 ends its drag
+    // with a routed `Button(0)`; on metal that event can simply never arrive, and this leg is the
+    // one that proves the drag still ends. Grab the title strip, publish "button up" as the pointer
+    // LEVEL — the same store every EHCI report performs — then drive ONE motion report through the
+    // real tail. No `Button` is routed at any point.
+    //
+    // Falsifiable by construction: with the level consulted, the tail ends the drag; without it (or
+    // with the level left DOWN) the tail merely steers and `drag_active()` still names the window.
+    let level_ok = match wm::info(w) {
+        Some(i) => {
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            user_input_set_active(OWNER_O);
+            wm::focus_changed(OWNER_O);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            // The press publishes the level the same way a real pad does; the grab itself is the
+            // ordinary chrome arm.
+            crate::pal::cursor::set_button_level(true);
+            let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
+            // The hand lets go and the report carrying that edge is LOST. Only the level moves.
+            crate::pal::cursor::set_button_level(false);
+            let raw = Event::MouseAbsolute {
+                x: hid(px + 8, pw),
+                y: hid(py + 8, ph),
+            };
+            let routed = wc_route_event(raw);
+            wc_route_tail(raw);
+            let _ = routed;
+            let ended = wm::drag_active() == wm::WIN_NONE;
+            // Leave the router's press tracker as it was found — the press above is still
+            // outstanding, and a phantom press would make the NEXT leg's release drop.
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            grabbed && ended
+        }
+        None => false,
+    };
+
+    // Leg 8 — DRAGREL, the operator escape: `<TAB>` while a drag is live cancels it. Same shape as
+    // leg 7's grab, then one `Event::Key(0x09)` through `wc_focus_key` — the real chain's first arm.
+    let tabcancel_ok = match wm::info(w) {
+        Some(i) => {
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            user_input_set_active(OWNER_O);
+            wm::focus_changed(OWNER_O);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            crate::pal::cursor::set_button_level(true);
+            let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
+            let consumed = wc_focus_key(Event::Key(b'\t'));
+            let ended = wm::drag_active() == wm::WIN_NONE;
+            // Swallow the TAB's release edge, then unwind this leg's own fixture state.
+            let _ = wc_focus_key(Event::KeyUp(b'\t'));
+            crate::pal::cursor::set_button_level(false);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            grabbed && consumed && ended
         }
         None => false,
     };
@@ -6236,13 +6343,17 @@ pub fn wmdirect_selftest() {
         && route_ok
         && content_ok
         && dragdead_ok
+        && level_ok
+        && tabcancel_ok
         && close_ok.unwrap_or(true);
     serial_println!(
-        "[wm-act] direct partition={} grab={} route={} content={} close={} dragdead={} from=({},{}) to=({},{}) -> {}",
+        "[wm-act] direct partition={} grab={} route={} content={} level={} tabcancel={} close={} dragdead={} from=({},{}) to=({},{}) -> {}",
         partition_ok,
         grab_ok,
         route_ok,
         content_ok,
+        level_ok,
+        tabcancel_ok,
         match close_ok {
             Some(v) => if v { "true" } else { "false" },
             None => "skip",

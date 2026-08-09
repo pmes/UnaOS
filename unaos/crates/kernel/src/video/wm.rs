@@ -7807,7 +7807,13 @@ pub fn drag_end() -> WinId {
 /// WMDIRECT — abandon the live drag with a named reason. Same clearing as [`drag_end`]; the
 /// distinct witness verb is what lets a capture tell "the operator let go" from "the window went
 /// away under the hand".
-fn drag_cancel(why: &str) {
+///
+/// DRAGREL — `pub` because the x86 router now ends drags for two reasons the release EVENT cannot
+/// name: the button LEVEL reading up (`"release-level"` — a release report that was never delivered)
+/// and a `<TAB>` focus switch (`"focus-key"`). Both want the reason ON THE WIRE: `drag_end`'s
+/// `placed`/`no-move` outcome is the ordinary "the operator let go" reading, so a capture attributes
+/// the end by verb (`drag-end` vs `drag-cancel`) and then by reason.
+pub fn drag_cancel(why: &str) {
     use core::sync::atomic::Ordering;
     let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel);
     if id != WIN_NONE {
