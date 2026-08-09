@@ -36,9 +36,33 @@
 //!
 //! # Wiring status
 //!
-//! Nothing consumes this table yet. Lifting the data and wiring the compositor are
-//! deliberately separate arcs; the wiring arc (`wm.rs`, `screen.rs`, fbcon) follows.
-//! Until then this module is byte-inert: all `const`, no statics, no code.
+//! **WIRED (CRISPYWIRE).** `video/wm.rs` consumes this table: every chrome colour and every
+//! chrome metric the window compositor draws with resolves to a role or a metric below, on both
+//! arches. `wm::TITLE_H` is [`TITLE_HEIGHT`], `wm::BORDER` is [`FRAME`], the tiler's gap is
+//! [`GAP`]. The module is no longer byte-inert — that was a property of having no consumers, not
+//! a goal.
+//!
+//! CRISPYWIRE-REVIEW adds [`TEXT_PX`] to that set: the window caption is drawn at the nearest
+//! integer scale of the 8-px bitmap cell toward it (`wm::TITLE_SCALE` = 2, so 16 px drawn for the
+//! 15 px asked). [`LINE_HEIGHT_PCT`] remains the one metric with no consumer — window captions are
+//! a single line, so there is no inter-line distance for it to set.
+//!
+//! ### Still UN-WIRED — invented colours, next arc's scope
+//!
+//! The claim above is scoped to the **window compositor's chrome**. These modules paint the same
+//! glass from constants of their own, and this pass deliberately did not touch them (one arc, one
+//! scope) — they are named here so the gap is disclosed rather than implied away:
+//!
+//!  * **`screen.rs` and fbcon** — untouched, and there is still **no desktop-background role in the
+//!    kit** for them to read.
+//!  * **`ui_status.rs`** — the bottom instrument strip: `METER_DIM`, `METER_BREATH`, `METER_PARKED`
+//!    (lines 229/232/234) and the three VU colours `LED_GREEN` / `LED_AMBER` / `LED_RED` (727-729).
+//!    The LED ramp is arguably an instrument rather than chrome, which is itself a taste question.
+//!  * **`video/cursor.rs`** — the pointer sprite's `FILL` and `SHADOW` (lines 110/112).
+//!
+//! See `docs/dev/OS/08_VIDEO/engine.md` §CRISPYWIRE.
+//!
+//! A verdict change still edits THIS FILE ONLY: every consumer reads the names.
 //!
 //! # Representation
 //!

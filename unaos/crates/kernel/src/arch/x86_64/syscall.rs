@@ -5991,15 +5991,29 @@ pub fn clickroute_selftest() {
     wm::focus_reset();
 }
 
-/// The WMDIRECT probe surface — 32x8 ARGB8888 (stride 128 B, 1024 B total). WIDER than the
+/// The WMDIRECT probe surface — 128x8 ARGB8888 (stride 512 B, 4096 B total). WIDER than the
 /// `clickroute` fixture's 8x8 on purpose: `wm::close_box` DECLINES a title strip too narrow to hold
-/// the box plus a glyph (`bw < 2*BORDER + 2*TITLE_H`, i.e. 26 px), and an 8-px-wide surface is under
-/// that at scale 1 — the close leg would have silently tested nothing on a small panel.
+/// its control, and an 8-px-wide surface is under that at scale 1 — the close leg would have
+/// silently tested nothing on a small panel.
+///
+/// CRISPYWIRE — **re-sized against the CRISPY threshold, not left at the old one.** Crispy's title
+/// bar carries a cluster of three `control_box`-diameter discs at a `gap` pitch, so `wm::controls`
+/// declines a strip too narrow to hold the cluster and a caption glyph, against WC-A's 26. A 32-px
+/// surface gives `bw = 32*scale + 10`, which is below that at scale 1 and 2 — so the leg would have
+/// gone on reporting a skip on any panel whose scale rule landed there, and the arc would have
+/// shipped an untested close control.
+///
+/// CRISPYWIRE-REVIEW — **and the threshold moved, so this moved with it.** Two corrections raised
+/// it: the decline test had been one `GAP` short of the painter's own budget, and the caption's
+/// glyph doubled to 16 px when it started honouring `metrics.text_px`. The floor is now
+/// `2*FRAME + GAP + CTRL_RESERVE + TITLE_CELL` = `10 + 12 + 84 + 16` = **122 px**, and 96 px gave
+/// `96 + 10 = 106` — under it at scale 1. 128 px restores the invariant the sizing was chosen for:
+/// `128 + 10 = 138` clears 122 at scale 1 and therefore at every scale.
 #[cfg(all(feature = "witness", feature = "wc"))]
 #[repr(align(4))]
-struct WmdSurf([u32; 256]);
+struct WmdSurf([u32; 1024]);
 #[cfg(all(feature = "witness", feature = "wc"))]
-static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; 256]);
+static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; 1024]);
 
 /// WMDIRECT — the DIRECT-MANIPULATION witness: does a press on a window's CHROME reach the window
 /// system, does a press on its CONTENT still reach the app, and does a pointer report actually STEER
@@ -6072,8 +6086,8 @@ pub fn wmdirect_selftest() {
     const OWNER_O: u64 = 4; // slot 3
     let s = &raw const WMD_SURF as usize;
     let len = core::mem::size_of_val(&WMD_SURF);
-    let w = wm::create(OWNER_D, s, len, 32, 8, 128, b"wmd");
-    let wo = wm::create(OWNER_O, s, len, 32, 8, 128, b"wmo");
+    let w = wm::create(OWNER_D, s, len, 128, 8, 512, b"wmd");
+    let wo = wm::create(OWNER_O, s, len, 128, 8, 512, b"wmo");
     if w == wm::WIN_NONE || wo == wm::WIN_NONE {
         serial_println!("[wm-act] direct -> SKIP (window table full: d={} o={})", w, wo);
         wm::close(w);
@@ -6178,36 +6192,41 @@ pub fn wmdirect_selftest() {
     // its no-process arm, and report NOPROC — while `close_owner` still removes the row, which is the
     // "closing the windows was the whole effect" contract.
     CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NONE_X86, Ordering::Release);
-    let wc = wm::create(OWNER_D, s, len, 32, 8, 128, b"wmc");
+    let wc = wm::create(OWNER_D, s, len, 128, 8, 512, b"wmc");
     let close_ok = if wc == wm::WIN_NONE {
         None
     } else {
         wm::move_to(wc, ox, oy);
         match wm::info(wc) {
-            // The close box, derived the way `wm::close_box` derives it: a `TITLE_H`-sided square at
-            // the right end of the strip, flush inside the border. Confirmed against the shipping
-            // predicate before it is pressed, so a geometry that DECLINED the control reports a skip
-            // rather than a false pass.
-            Some(i) => {
-                let bw = i.w * i.scale + 2 * wm::BORDER;
-                let bx = i.x - wm::BORDER;
-                let by = i.y - wm::TITLE_H - wm::BORDER;
-                let px = (bx + bw - wm::BORDER - wm::TITLE_H / 2) as i32;
-                let py = (by + wm::BORDER + wm::TITLE_H / 2) as i32;
-                if !wm::close_box_hit(wc, px, py) {
-                    None
-                } else {
-                    user_input_set_active(OWNER_O);
-                    wm::focus_changed(OWNER_O);
-                    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
-                    let consumed = wc_click_route_at(Event::Button(1), px, py);
-                    Some(
-                        consumed
-                            && wm::info(wc).is_none()
-                            && wc_close_last_settle() == CLOSE_SETTLE_NOPROC_X86,
-                    )
+            // CRISPYWIRE — the close control's CENTRE, read back from `wm::close_box_rect` rather
+            // than re-derived here. The old copy of the arithmetic (a `TITLE_H`-sided square flush
+            // against the right border) was correct only for WC-A's invented square box; Crispy's
+            // control is a `control_box`-diameter DISC in a right-aligned cluster of three, and a
+            // fixture that kept computing the old point would have missed the disc and reported a
+            // SKIP — a leg that silently tests nothing. There is now exactly one owner of this
+            // geometry, and the fixture asks it.
+            Some(_i) => match wm::close_box_rect(wc) {
+                // The control was DECLINED (a strip too narrow for the cluster plus a caption).
+                // Reported as a skip, exactly as a missed hit-test would be.
+                None => None,
+                Some((cbx, cby, d)) => {
+                    let px = (cbx + d / 2) as i32;
+                    let py = (cby + d / 2) as i32;
+                    if !wm::close_box_hit(wc, px, py) {
+                        None
+                    } else {
+                        user_input_set_active(OWNER_O);
+                        wm::focus_changed(OWNER_O);
+                        CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+                        let consumed = wc_click_route_at(Event::Button(1), px, py);
+                        Some(
+                            consumed
+                                && wm::info(wc).is_none()
+                                && wc_close_last_settle() == CLOSE_SETTLE_NOPROC_X86,
+                        )
+                    }
                 }
-            }
+            },
             None => None,
         }
     };
