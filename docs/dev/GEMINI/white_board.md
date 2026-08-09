@@ -56,16 +56,11 @@ has explicitly deferred placement.
 Add the states to the kit. The idiom is **modern, Scandinavian, refined, minimal** — which reads as
 restraint: small deltas, no ornament, no drop shadows for their own sake. Kit json first.
 
-### A4 — **WITHDRAWN by Peter. The standing instruction is PERFORMANCE.**
-> *"i'm not sure about all that as the original question was garbage. just make the os high
-> performance if looks a little off we will change it"*
+### A4 — can you tell which window is focused? **Not really. Peter: leave it, make the OS fast.**
+> *"just make the os high performance if looks a little off we will change it"*
 
-The question was mine and it was a bad one. **No focus-contrast work is wanted.** The standing
-priority is that **the OS is FAST**; visual imperfection is acceptable and correctable later. Read
-this as the tie-breaker for the whole theme area: when polish competes with performance,
-performance wins, and the look gets revisited afterwards. (If someone does eventually touch focus
-rendering: FOCUS-HL's law is that focus never moves a pixel, because COMPOSITE-2's four-rect damage
-subtraction depends on it. Colour only — but not now.)
+The kit's focused and unfocused title shades are nearly identical, so only the caption ink changes.
+**Do not build anything for this.** Standing priority: speed over polish.
 
 ### A5 — control side and order: **leave it, revisit later.**
 > *"ok we can always change things later!"*
