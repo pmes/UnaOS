@@ -1,100 +1,69 @@
-# WHITE BOARD — 2026-08-09 (GR23, second pass)
+# WHITE BOARD — 2026-08-09 (GR23, third pass)
 
 Questions for Peter, each with the background to answer it. Nothing else lives here.
-**Q1–Q5 of this morning are ANSWERED and off the board** — the kernel shell is being shut down and
-routed through midden, the radios/3D jobs are running, wifis4a is being conditioned for merge, the
-Crispy kit is "stolen from pi, sync later" (the law now rests on the in-tree triangulation, which
-was verified bit-exact), and ceramic + paper-on-more-surfaces is building.
+Q1–Q7 are ANSWERED and off the board (kernel shell → midden: merged; radios/3D: running;
+wifis4a: merged; kit: sync later; ceramic+paper: merged; MEGABOOM filter: merged; lanes: both
+kept, drill-sergeant register adopted).
 
 ---
 
-## ✅ Q6 — ANSWERED: connect to Peter's own speaker, "MEGABOOM". Being built now.
+## Q9 — The window controls: may I give them RED / YELLOW / GREEN?
 
-> *"can you program it to find my speaker id 'MEGABOOM'?"*
+**This is why the minimise button killed your STAT and console.** The three discs are painted
+`0x3d5f92 / 0x678cba / 0x92aac9` — three shades of blue, progressively lighter — because those
+are the only three control colours the kit table carries. Close is the LEFTMOST disc. You clicked
+expecting minimise and got the one that kills, and nothing on the glass told you which was which.
+The metal capture shows it exactly: a press at x=2765 routed `-> close` and reaped the row, while
+x=2791 (the middle disc) routed `-> drag`.
 
-So the filter is BY ADVERTISED NAME (not BD_ADDR — he does not know its address, and a name filter
-is what makes it reproducible for him): `BT_L3_PEER_NAME = Some("MEGABOOM")`, case-insensitive
-substring, reusing L2's existing AD Local Name decode rather than a second parser. Nothing else in
-the room gets connected to. ⚠ ONE THING MAY COME BACK AS A QUESTION: if the MEGABOOM puts its name
-only in a SCAN RESPONSE rather than in the advertisement, a PASSIVE scan never sees it — and going
-active means TRANSMITTING, which is a separate decision and will be brought back here rather than
-taken silently.
+Being fixed now WITHOUT touching the palette: per-disc hit testing, minimise wired to the existing
+`set_hidden`, zoom wired to a remembered pre-zoom rect, and an unmistakable NON-COLOUR affordance —
+a glyph inside each disc (×, −, +) drawn in the existing `ink` role. A symbol is SHAPE, not
+palette, so the shared-source law is intact.
 
-**Original question, kept for the record:**
+**But the Mac standard you asked for in A2 is red/yellow/green, and that is a PALETTE change the
+kit does not carry.** The whole point of the Mac colours is that the destructive control is
+unmistakable at a glance, without reading a glyph. Options:
+  a) **Glyphs only** (what is building now) — law-clean, no palette invented, ships today.
+  b) **Add three semantic control colours to the kit** (`kits/crispy/theme.json` first, then
+     re-lift into `theme.rs` per the law) — a real red/yellow/green in Crispy's refined register,
+     not the raw macOS hues. This is the honest way to get what A2 asked for.
+  c) Keep the blues and rely on position alone (status quo, minus the glyphs).
 
-## Q6 (original) — BT-L3 will briefly CONNECT TO A STRANGER'S DEVICE. Is that acceptable to fly?
+I recommend (b) ON TOP OF (a) — glyphs now, and you tell me the three hues (or approve me
+proposing three in the Scandinavian-minimal register for your yes/no). **The kit edit is yours;
+the re-lift is mine.**
 
-L3 is written and in review. It scans, picks **the first `ADV_IND` peer it hears**, opens a
-link-layer connection, and releases it within milliseconds. No pairing, no bonding, no data read,
-no service discovery — a connect and a clean disconnect. But in a populated room (a café, an
-apartment building, anywhere near other people) a `UNAOS_BT=1` boot will make an unsolicited
-connection to **someone else's watch, earbuds, fitness band or phone**. From their side it is a
-brief unexplained connection from an unknown device, and it may show up in their logs or briefly
-occupy their peripheral's single connection slot.
+## Q10 — Should a minimised window be restorable, and how?
 
-Options, cheapest first:
-  a) **Fly as-is** — it is a millisecond link-layer connect, no data exchanged.
-  b) **Restrict the peer by address** — connect only to a BD_ADDR you name (your own test device),
-     refusing everything else. Costs one constant and makes the arc a lab instrument rather than
-     something that touches strangers.
-  c) **Restrict by OUI or by a name prefix** in the advertisement — a middle ground.
-  d) Only fly it somewhere with no other radios.
+`set_hidden` parks a window so it stops starving the compositor — that is the mechanism minimise
+needs. **What does not exist is a way back.** There is no dock, no taskbar, no window list. If
+minimise hides a window and `<TAB>` focus cycling cannot reach it, minimise is a ONE-WAY TRIP and
+the arc has been told to REFUSE to wire it rather than ship that.
 
-⚠ **THE REVIEW SHARPENED THIS — it is not always "a few milliseconds".** L3 BOUNCED on a cancel
-race whose *more probable* ordering leaks the link: when the connection establishes just as the
-wait expires, the cancel returns `Command Disallowed` while the real `Connection Complete` sits
-ahead of it in the queue and is discarded, so **UnaOS holds an open link to that device for the
-rest of the boot** (the event endpoint is then quiesced, so no disconnect is ever read — it dies
-only on the peer's supervision timeout or a power cycle) while the capture certifies
-`left_outstanding=none`. That is fixed. But it means the failure mode was: indefinitely hold a
-stranger's peripheral — and the sharp case is **another machine's BLE keyboard or mouse, which a
-CONNECT_IND takes away from its owner for the duration of the link.** An independent reviewer
-reached your Q6 question on its own, from the code.
+So: what should bring a window back?
+  a) `<TAB>` reaches hidden windows too (cheapest — the focus ring already exists; a hidden window
+     un-hides when focused).
+  b) A dock/taskbar strip — real work, and it is a desktop-furniture design decision that is yours.
+  c) A `windows` command in midden that lists and restores by name (fits the convergence: the shell
+     is the way you reach things until there is furniture).
 
-The allow-list and an RSSI floor are being built now; the allow-list DEFAULTS TO OFF pending your
-ruling, as a single obvious line. I would take (b) for anything flown outside a controlled bench —
-it answers the same engineering question (does the connect path work end to end?) with nobody
-else's hardware involved. **Your call; it is a one-constant change either way and nothing flies
-until you rule.**
+I lean (a) now and (c) soon, because both are small and neither commits you to furniture you have
+not designed. **If (a) is fine, say so and minimise ships with this arc.**
 
-## ✅ Q7 — ANSWERED: keep both lanes, and be a drill sergeant about it.
+## Q11 — BT-L3 read `considered=0` because the MEGABOOM was off. Retest, or go active?
 
-> *"try being more drill sergeant like 'what's your major malfunction gemini?!?!?!'"*
+Boot AS printed `peer NOT SELECTED — name=MEGABOOM considered=0 matched=0` — and you said you
+forgot to turn the speaker on, which fully explains it: **zero devices considered means the room
+looked empty to a passive scan, not that the filter rejected your speaker.**
 
-Adopted in RELAY.md as of this pass. First application: kepler's round-4 plan is CORRECT on all
-eleven bounce items — and its verification plan said "read the QEMU output to confirm SUCCESS
-instead of HANG." **QEMU has no Kepler.** A green run there would mean the code took a path that
-never touched the hardware, which is worse than HANG, not better. That got said in those words.
-Its open question (Falcon-side CHAN_VALID vs fuzzing the engine ID) is answered: finish the one
-already written — it is decisive in both directions, and the losing outcome queues the other
-candidate for free.
+Next boot with it powered on and nearby is the real test. Two outcomes and what each means:
+  - `considered=N matched=1 … peer SELECTED … MEGABOOM` → connect + clean release. Done.
+  - `considered=N matched=0` with the speaker ON and near → its name is in a SCAN RESPONSE, not in
+    the advertisement. A passive scan never sees those. **Going ACTIVE means transmitting a
+    SCAN_REQ to every advertiser in the room** — a different thing from listening, and your call,
+    not the seat's. (`MAYBE:short-name-prefix` in the log would instead mean it was heard under a
+    shortened name — that path is already handled.)
 
-**Original question, kept for the record:**
-
-## Q7 (original) — kepler and igpu have now each bounced FOUR and TWO times. Keep spending lane cycles?
-
-Both lanes came back today claiming their bounce lists were fully addressed. Both were wrong in
-ways that would have cost a boot (details in RELAY.md):
-- **kepler #4**: the fix DELETED the IMEM page-pad, so the upload is still invalid — the same
-  never-uploaded defect that caused bounces 1–3, reintroduced by a different mechanism. Plus the
-  phase gate is inverted (host waits for the falcon's give-up marker *before* sending the command,
-  so both legs just HANG) and the SUCCESS witness prints identical strings for the two ack values
-  its own proposal stakes everything on.
-- **igpu r13**: the newly-added `GMUX_SWITCH_EXTERNAL` write is never restored; the restore values
-  became fresh readbacks that truncate a `0xFFFFFFFF` timeout sentinel to a literal `0xFF` written
-  into the display mux; and the runbook instructs the operator to power-cycle during what is
-  really a 20-second dark window.
-
-Neither is a dead end — the fixes are known and written down. But both lanes have now produced
-confident "all fixed" reports that did not survive review, and each round costs a review pass.
-**Do you want to keep both lanes running, pause one, or have the seat take one of them over
-directly?** (3D is the decisive road per your own ruling, so kepler is the one I would keep.)
-
-## Q8 — `std` in userspace: I owe you a recommendation, and it is coming from the midden arc.
-
-You asked *"we need std in userspace, no?"* — I did not answer it off the cuff because it decides
-how big the convergence is. The midden arc is producing a written assessment (target spec, libc or
-a std shim, allocator, threads, fs, net — what it costs, what it buys, and what the alternatives
-are given `libs/gneiss_pal` already plays that role on hosts). **No action needed from you yet;
-this is a placeholder so the question does not get lost.** I will bring you the recommendation with
-a size estimate.
+**No action needed unless the second outcome happens.** Recorded so the question is already framed
+when it does.
