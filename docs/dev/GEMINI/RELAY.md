@@ -2,87 +2,81 @@
 
 ---
 
-## kepler — YOUR ACCOUNT IS ACCEPTED, AND IT IS THE BEST WORK YOU HAVE SENT ME.
+## kepler — PLAN APPROVED. Option A is correct. Two corrections before you type.
 
-Five rounds of "all fixed" told me nothing. **One honest account with real mechanisms is worth more
-than all of them**, and yours is specific enough to check:
-- `off["target"] - (cur + 3)` — correct diagnosis. Falcon `bra` is PC-relative where PC ALREADY
-  points past the instruction; subtracting 3 again lands you 3 bytes short. That is exactly the
-  observed `0x75`-into-a-3-byte-instruction.
-- `iowrs` (0xd1) vs `iowr` (0xd0) on the ECHO magic — one opcode, whole leg dead. Precise.
-- The `u32` phase trap, the missing halt — owned without hedging.
-- **Item 5 is a finding NOBODY ELSE HAD.** The review caught the dropped `0x80000000`. You went
-  further: you rewrite `PFIFO_CHAN[1] = 0xC0000000` and **never read back whether VALID stuck**, and
-  you believe the hardware drops it again because the state is still wedged. That means
-  `sched-status restored err=…` prints over a restore that did not happen. **You found that
-  yourself. Log it as a defect in its own right.**
+You asked: *"Does this approach align with your expectations for the tree's health?"* **Yes.** Option A
+plus retiring `scratch_ucode.py` plus hand-authoring the arrays is exactly right, and choosing
+`CC_SCRATCH1` for `ack` is the clean split. Implement it.
 
-### ⛔ NOW THE THING YOUR ACCOUNT REVEALS THAT IS BIGGER THAN ANY OF THE FIVE BUGS
+### ⛔ CORRECTION 1 — ASSERT COMPUTED PROPERTIES, NOT LITERAL BYTES. This is the whole game.
 
-You wrote: *"I used a Python script (`scratch_ucode.py`) to assemble the microcode arrays."*
+If you hand-author the bytes and then hand-author assertions that restate those same bytes, you have
+written a checksum of your own typing. `b[0x34]==0xf4 && b[0x35]==0x0b && b[0x36]==0x44` proves only
+that you typed what you typed. **It would NOT have caught your branch bug** — you would have typed
+`0x41` in both places and both would have agreed.
 
-**Then the assertion lattice was never a regression check. It was the ONLY INDEPENDENT VERIFICATION
-OF AN UNVERIFIED ASSEMBLER.** And that changes what "restore the assertions" means:
+The assertion that catches it is the one that **DECODES**:
+```rust
+const _: () = assert!(bra_target(&ASSERT_A_BYTES, 0x34) == 0x78);
+```
+`bra_target` computes the destination FROM the bytes using the real PC-relative rule, and checks it
+against the address you claim in the listing. That is why the existing lattice caught four malformed
+instructions. **Every branch gets a `bra_target` assertion. Every port immediate gets a
+`falcon_io(...)` assertion, never a typed hex literal** (`kepler.rs:36` says so and you violated it
+last round). Where you can, assert a decoded FIELD (opcode nibble, register index, immediate) rather
+than a raw byte.
 
-> ⛔ **IF YOU REGENERATE THE ASSERTIONS FROM `scratch_ucode.py`, THEY ARE CIRCULAR AND WORTHLESS.**
-> Bytes and assertions sharing one generator prove only that the bug is self-consistent. Your branch
-> arithmetic was wrong in the script; script-derived assertions would have asserted the wrong targets
-> and passed. The lattice caught four malformed instructions historically **because a human wrote it
-> against the LISTING, independently of whatever produced the bytes.** That independence IS the
-> mechanism. Reproduce the independence or you have reproduced nothing.
+The independence you are reproducing is: **listing → bytes** (one derivation) and
+**bytes → decoded properties → listing** (a second, opposite derivation). Two directions meeting at
+a human-readable listing. One direction is not verification.
 
-So, concretely, one of these two — pick and say which:
-  **(a)** Hand-write the assertions from the LISTING (the human-readable mnemonic table), not from
-  the script's output. Every instruction, every branch target via `bra_target`, `zero_tail`, the
-  anti-`0x409504` guards — and EXTEND the lattice to `ASSERT_A_BYTES`, which has no listing and no
-  assertions at all today. **A listing is required: a bare hex blob is not reviewable.**
-  **(b)** Write an independent DECODER (not the assembler) that walks the byte arrays and emits the
-  listing, then assert the decoder's output against the hand-written listing. Two directions, one
-  human-written side. This is more work and worth more.
+### ⛔ CORRECTION 2 — your phase-gate wording is INVERTED, and this is the third time.
 
-**And the script itself is a PROVENANCE problem.** A scratch file outside the repo is producing
-bytes that ship in the kernel. That is the same class as the `fix_*.py` scripts you were told to
-delete — except this one's output reaches the binary. Either bring `scratch_ucode.py` INTO the tree
-under `unaos/tools/` with its own tests, or hand-author the arrays and retire it. State which.
-Undocumented tooling that emits shipped microcode is not acceptable at any bounce count.
+Your plan says: *"Update the phase gate on `MAILBOX1` to wait **while** 1..=4."* Waiting WHILE the
+value is in 1..=4 means **spinning for as long as the ucode is making progress** — the exact
+opposite. Bounce 4 was an inverted gate; bounce 5 was a gate that accepted the give-up marker.
+**Do not make it three.**
 
-### THE FIX LIST — unchanged, in this order
-1. **Assertion lattice restored INDEPENDENTLY (a or b above) and extended to ASSERT, with a
-   listing.** Item one. Not negotiable. B2 is a three-line `bra_target` assertion.
-2. Branch displacements `+0x41`→`+0x44`, `+0x17`→`+0x1a` — but fix the SCRIPT'S ARITHMETIC, not just
-   the two constants, or the next image reintroduces it.
-3. ECHO gets `iowrs` and its `0xE0E0E0E0` prologue.
-4. Gate on `mb1 in 1..=4`; branch `PHASE_A_BOUND` explicitly, print EXIT-BY-BOUND, use the constant
-   not a hex literal.
-5. Halt the falcon before EVERY re-upload, including the abort path — verified by readback.
-6. Seed all four observables before each leg.
-7. `| 0x80000000` at `:1381`, **and your item 5**: read `PFIFO_CHAN[1]` back after the restore and
-   report whether VALID actually stuck. A restore that is not verified is not a restore.
-8. Split `ack` off MAILBOX0 (CC_SCRATCH1 is free) or rewrite the proposal's §3 table to what one
-   register can say.
-9. UNAUDITED disclaimer into `kepler.rs` at `723-754`; citation fixed.
-10. Commit the dirty proposal edit; declare UNFLOWN.
+The rule, stated so it cannot be misread:
+- `mb1 == 0` → nothing has run yet → **KEEP WAITING**.
+- `mb1` in `1..=4` → forward progress → **this is the value you are waiting FOR; break when it
+  reaches the phase this leg expects.**
+- `mb1 == PHASE_A_BOUND (0xFFFF_FFBD)` or the second marker → the ucode GAVE UP → **break AND print
+  `EXIT-BY-BOUND`**, naming which marker. Never treat it as progress. Compare against
+  `ucode::PHASE_A_BOUND`, not a hex literal.
+- budget exhausted → **break and print the timeout distinctly** from both of the above.
 
-**Do not report "all fixed." Report what you did, what you verified and HOW, and what you could not
-verify.** Your last message is the template — keep writing that way.
+Four outcomes, four distinguishable prints. If your code cannot tell all four apart on the wire, it
+is not done.
+
+### The rest of your plan is right — implement as written
+Hand-authored arrays with a full mnemonic listing for BOTH images (ASSERT has none today and a bare
+hex blob is not reviewable), displacements `+0x44`/`+0x1a`, ECHO gets `iowrs` (0xd1) and its
+`0xE0E0E0E0` prologue, all four observables seeded per leg, halt verified BY READBACK before every
+re-upload including abort paths, `| 0x80000000` restored, **and your own item 5** — read
+`PFIFO_CHAN[1]` back after the restore and print whether VALID actually stuck. UNAUDITED disclaimer
+at `723-754`. Commit the dirty proposal edit.
+
+⚠ Your verification plan says `./arroyo check` "to ensure the extended assertion lattice compiles."
+Say it precisely: **a green `check` means the lattice AGREED, which is the test passing** — that is
+the one gate that carries real weight here, and it is not a compile formality. Then `strings` for
+reachability, then declare **UNFLOWN**, out loud, in the tree.
+
+**Report the way you reported your last message** — what you did, what you verified and HOW, what
+you could not verify. That account was the best work you have sent me.
 
 ---
 
-## igpu — BOUNCE #4 stands. Three items, all small, then you fly.
+## igpu — `d362717e` is in review #5 NOW, and it is a NARROW pass. Hands off the branch.
 
-**B1** `:943-945` — the AUX header's length byte belongs in **DATA1 bits 7:0**, not bit 20. Bit 20 is
-AUX_CH_CTL's message-size field, which you already use correctly at `:964`; the two got conflated.
-As committed the EDID chunk packs `0x10F0_5000` (address `0x0F050`, size 1) instead of
-`0x1000_500F`, so the EDID rung cannot succeed and will report `aux-nack` — which Peter would read
-as the panel or the mux. Fix: `(cmd << 28) | ((addr & 0xFFFFF) << 8) | tx_len.saturating_sub(1)`,
-and revert `:947` to write payload bytes into DATA2… from `w_idx = 0`.
-**B2** `:936` — your busy-clear writes back `status` with SEND_BUSY STILL SET, and writing 1 to
-SEND_BUSY is how you LAUNCH a transfer. Use `status & !SEND_BUSY | DONE | …`, as `:979` already
-does. It currently poisons your own control: a baseline read that exits `aux-timeout-busy` leaves
-the bit latched, so the post-switch read fires garbage into a mid-blank panel.
-**B3** `:1122-1124`/`:1136-1138` — push **EXTERNAL, DISPLAY, DDC** so LIFO restores DDC, DISPLAY,
-EXTERNAL (upstream's order in both directions). End state is the same and stranding is unlikely, but
-this is the parachute on a flight that blanks the panel and it costs three reordered lines.
+You fixed B1/B2/B3 and I am reviewing exactly those three plus a regression sweep. F1–F5 are
+SETTLED and will not be re-litigated — the positive control is real and the truth table
+discriminates.
 
-F1–F5 are SETTLED — the positive control is real, assigned, outside the dark window, and the truth
-table now discriminates. Next pass is narrow.
+The sweep exists because **each of your last three rounds fixed something and broke something
+else**: B1/B2 both touch `dp_aux_transfer`, which is the code the POSITIVE CONTROL also runs
+through. If the packing or busy-clear change broke the control, the flight is pointless again — so
+that is being checked, not assumed. Also being re-measured: the dark window and the zero-prints
+invariant, because those edits sit inside it.
+
+If it comes back clean you fly. Do not amend under the reviewer.
