@@ -26,9 +26,22 @@ Options, cheapest first:
   c) **Restrict by OUI or by a name prefix** in the advertisement — a middle ground.
   d) Only fly it somewhere with no other radios.
 
-I would take (b) for anything flown outside a controlled bench — it answers the same engineering
-question (does the connect path work end to end?) with nobody else's hardware involved. **Your
-call; it is a one-constant change either way and I will do whichever you say before it flies.**
+⚠ **THE REVIEW SHARPENED THIS — it is not always "a few milliseconds".** L3 BOUNCED on a cancel
+race whose *more probable* ordering leaks the link: when the connection establishes just as the
+wait expires, the cancel returns `Command Disallowed` while the real `Connection Complete` sits
+ahead of it in the queue and is discarded, so **UnaOS holds an open link to that device for the
+rest of the boot** (the event endpoint is then quiesced, so no disconnect is ever read — it dies
+only on the peer's supervision timeout or a power cycle) while the capture certifies
+`left_outstanding=none`. That is fixed. But it means the failure mode was: indefinitely hold a
+stranger's peripheral — and the sharp case is **another machine's BLE keyboard or mouse, which a
+CONNECT_IND takes away from its owner for the duration of the link.** An independent reviewer
+reached your Q6 question on its own, from the code.
+
+The allow-list and an RSSI floor are being built now; the allow-list DEFAULTS TO OFF pending your
+ruling, as a single obvious line. I would take (b) for anything flown outside a controlled bench —
+it answers the same engineering question (does the connect path work end to end?) with nobody
+else's hardware involved. **Your call; it is a one-constant change either way and nothing flies
+until you rule.**
 
 ## Q7 — kepler and igpu have now each bounced FOUR and TWO times. Keep spending lane cycles?
 
