@@ -6125,11 +6125,17 @@ pub fn clickroute_selftest() {
 /// `2*FRAME + GAP + CTRL_RESERVE + TITLE_CELL` = `10 + 12 + 84 + 16` = **122 px**, and 96 px gave
 /// `96 + 10 = 106` — under it at scale 1. 128 px restores the invariant the sizing was chosen for:
 /// `128 + 10 = 138` clears 122 at scale 1 and therefore at every scale.
+///
+/// KNURL — **and the floor moved a third time, so the literal is gone.** Peter's size ruling took
+/// `theme::CONTROL_BOX` from 12 to 24 (*"window buttons are very small"*), taking the floor to
+/// 158 px, which 128 no longer clears — the close leg would have gone back to reporting a skip.
+/// The geometry is now `wm::FIX_W` x `wm::FIX_H`, sized from `wm::CLUSTER_MIN_SRC_W` under a
+/// `const` assertion in `wm.rs`, so the next metric move fails the build instead of the gate.
 #[cfg(all(feature = "witness", feature = "wc"))]
 #[repr(align(4))]
-struct WmdSurf([u32; 1024]);
+struct WmdSurf([u32; crate::video::wm::FIX_W * crate::video::wm::FIX_H]);
 #[cfg(all(feature = "witness", feature = "wc"))]
-static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; 1024]);
+static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; crate::video::wm::FIX_W * crate::video::wm::FIX_H]);
 
 /// WMDIRECT — the DIRECT-MANIPULATION witness: does a press on a window's CHROME reach the window
 /// system, does a press on its CONTENT still reach the app, and does a pointer report actually STEER
@@ -6208,8 +6214,8 @@ pub fn wmdirect_selftest() {
     const OWNER_O: u64 = 4; // slot 3
     let s = &raw const WMD_SURF as usize;
     let len = core::mem::size_of_val(&WMD_SURF);
-    let w = wm::create(OWNER_D, s, len, 128, 8, 512, b"wmd");
-    let wo = wm::create(OWNER_O, s, len, 128, 8, 512, b"wmo");
+    let w = wm::create(OWNER_D, s, len, wm::FIX_W as u32, wm::FIX_H as u32, wm::FIX_STRIDE as u32, b"wmd");
+    let wo = wm::create(OWNER_O, s, len, wm::FIX_W as u32, wm::FIX_H as u32, wm::FIX_STRIDE as u32, b"wmo");
     if w == wm::WIN_NONE || wo == wm::WIN_NONE {
         serial_println!("[wm-act] direct -> SKIP (window table full: d={} o={})", w, wo);
         wm::close(w);
@@ -6481,7 +6487,7 @@ pub fn wmdirect_selftest() {
     // its no-process arm, and report NOPROC — while `close_owner` still removes the row, which is the
     // "closing the windows was the whole effect" contract.
     CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NONE_X86, Ordering::Release);
-    let wc = wm::create(OWNER_D, s, len, 128, 8, 512, b"wmc");
+    let wc = wm::create(OWNER_D, s, len, wm::FIX_W as u32, wm::FIX_H as u32, wm::FIX_STRIDE as u32, b"wmc");
     let close_ok = if wc == wm::WIN_NONE {
         None
     } else {

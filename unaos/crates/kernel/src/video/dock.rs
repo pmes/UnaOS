@@ -141,11 +141,20 @@ const STRIP_H: usize = TILE_H + 2 * PAD;
 
 /// The running indicator's diameter, px.
 ///
-/// DERIVED, and stated as derived: `theme::CONTROL_BOX / 2` — the title-bar control disc, halved. The
-/// kit has no pip metric, and the derivation is the same shape `theme::CONTROL_RADIUS` uses on the
-/// same key. Halved rather than taken whole because a pip the size of a control READS as a control,
-/// and a dot the operator tries to click is worse than no dot.
-const IND_D: usize = theme::CONTROL_BOX / 2;
+/// DERIVED, and stated as derived: `theme::GAP / 2` — half the padding band the pip sits in.
+///
+/// ⚠ **RE-DERIVED, same VALUE (6 px), by KNURL.** It was `theme::CONTROL_BOX / 2`, on the argument
+/// that *"a pip the size of a control READS as a control, and a dot the operator tries to click is
+/// worse than no dot"*. Peter's size ruling then took `CONTROL_BOX` from 12 to 24, which broke that
+/// derivation in both directions at once: arithmetically it violated the `IND_D < PAD` assertion
+/// below (12 is not less than `GAP` = 12, a BUILD failure), and semantically it produced a pip of
+/// exactly the OLD control's diameter — i.e. the one outcome the halving existed to prevent.
+///
+/// So the pip is now derived from the band that actually bounds it, `PAD` = `theme::GAP`, which is
+/// the constraint the assertion states and is independent of how large a control disc becomes. The
+/// rendered pip is unchanged at 6 px; only its provenance moved. This is the sole line of the dock
+/// module the size ruling touched, and it was touched because the alternative was a red tree.
+const IND_D: usize = theme::GAP / 2;
 
 /// The glyph cell the caption is drawn at — [`wm::TITLE_CELL`], i.e. the kit's `text_px` resolved to
 /// the nearest integer scale of the bitmap font, exactly as the window caption resolves it. One

@@ -131,8 +131,9 @@ pub const TITLE_CELL: usize = FONT_CELL * TITLE_SCALE;
 /// inner edge of the LEFT frame (WMCTRL, Peter 2026-08-09: the cluster is left-aligned, macOS-side;
 /// it was measured from the right frame before, and the SIZE is identical either way): the cluster
 /// itself (`3 * CONTROL_BOX` at a `GAP` pitch = two inter-disc gaps), plus the `GAP` that insets it
-/// from the frame, plus the `GAP` that separates it from the caption. `3*12 + 2*12 + 2*12 = 84` at
-/// the kit's numbers.
+/// from the frame, plus the `GAP` that separates it from the caption. `3*24 + 2*12 + 2*12 = 120`
+/// since Peter's size ruling took `CONTROL_BOX` from 12 to 24 (*"window buttons are very small"* —
+/// see `theme::CONTROL_BOX` for the 2x-Retina arithmetic); it was 84 at the kit's 12.
 ///
 /// ONE definition, three consumers: [`controls`] subtracts it to decide whether a strip is wide
 /// enough to carry a cluster AND a caption glyph, and [`paint_window`] uses it BOTH as the caption's
@@ -140,6 +141,21 @@ pub const TITLE_CELL: usize = FONT_CELL * TITLE_SCALE;
 /// budget. They were separate copies, and they disagreed by one `GAP` — the threshold admitted
 /// strips the painter then gave a zero-glyph budget.
 const CTRL_RESERVE: usize = 3 * super::theme::CONTROL_BOX + 4 * GAP;
+
+/// **The smallest SOURCE width whose window carries a control cluster at scale 1** — and therefore
+/// at every scale, since `spawn_geometry`'s box width `w * scale + 2 * BORDER` is monotone in
+/// `scale`.
+///
+/// [`controls`] declines a box narrower than `2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL`, and a
+/// window's box is `w * scale + 2 * BORDER`, so the `2*BORDER` cancels and the condition on the
+/// source width alone is `w >= GAP + CTRL_RESERVE + TITLE_CELL` — **148 px** at the current metrics
+/// (`12 + 120 + 16`), 112 before the size ruling.
+///
+/// This exists because that threshold has now moved TWICE and both times a fixture surface was left
+/// behind it, turning a close-control gate into a silent SKIP (CRISPYWIRE sized one from 8 to 32,
+/// CRISPYWIRE-REVIEW from 96 to 128). Every fixture that needs a cluster sizes itself against this
+/// constant with a `const` assertion, so the third move fails the BUILD instead of the gate.
+pub const CLUSTER_MIN_SRC_W: usize = GAP + CTRL_RESERVE + TITLE_CELL;
 
 /// A window identifier. Ids are `1..=MAX_WINDOWS`; `0` is never a valid window and is the
 /// fail-closed return for every operation that could not be satisfied.
@@ -7878,12 +7894,19 @@ fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
 ///
 /// ```text
 /// 2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL
-///   = 2*5    + 12  + 84           + 16        = 122 px
+///   = 2*5    + 12  + 120          + 16        = 158 px
 /// ```
 ///
 /// against the 102 the arithmetic used to produce (and the 106 the painter actually needed before a
 /// glyph was even asked for). The glyph term doubled with the caption's `TEXT_PX` scale, which is
 /// the other half of why the number moved.
+///
+/// ### The threshold moved AGAIN with Peter's size ruling
+/// `CONTROL_BOX` went 12 -> 24 (*"window buttons are very small"*; see `theme::CONTROL_BOX`), so
+/// `CTRL_RESERVE` went 84 -> 120 and this floor 122 -> 158. Both numbers are derived and moved by
+/// themselves. What did NOT move by itself is the width of the fixture surfaces that have to clear
+/// the floor — so they are now sized from [`CLUSTER_MIN_SRC_W`] under a `const` assertion instead
+/// of from a literal with a comment beside it.
 fn controls(r: &Window) -> Option<(usize, usize, usize)> {
     // CLOSEISO — kernel FURNITURE gets no control cluster, and `owner_asid == 0` is not the test
     // that says so. CLICK-X86 gave the panel console a RESERVED owner (`KERNEL_OWNER_CONSOLE`,
@@ -9444,10 +9467,11 @@ fn paint_window(
                     let Some((bxn, cby, d)) = control_disc(r, which) else {
                         continue;
                     };
-                    // WMCTRL — the SEMANTIC roles (Peter, 2026-08-09, white board Q9b): red,
-                    // yellow, green, in Crispy's muted register. See `theme::CTRL_CLOSE` for the
-                    // provenance and for why the kit's three blue steps are kept but no longer
-                    // painted.
+                    // WMCTRL — the SEMANTIC roles (Peter, 2026-08-09): red, yellow, green, and
+                    // since the "same color as mac" ruling they are the macOS hues unmodified
+                    // rather than the muted derivations that preceded them. See
+                    // `theme::CTRL_CLOSE` for the provenance, for the reversal, and for why the
+                    // kit's three blue steps are kept but no longer painted.
                     let col = match which {
                         Ctrl::Close => super::theme::CTRL_CLOSE,
                         Ctrl::Minimise => super::theme::CTRL_MIN,
@@ -9474,7 +9498,22 @@ fn paint_window(
                             if !in_circle(bxn + i, cby + j, bxn, cby, d) {
                                 continue;
                             }
-                            let px = if ctrl_glyph(which, i, j, d) { ink } else { shaded };
+                            // KNURL — the disc's FACE is milled; the glyph is not. The symbol is a
+                            // punch-out, i.e. the strip showing THROUGH the disc, and a hole in a
+                            // knurled knob has no knurling in it. Leaving `ink` smooth is what the
+                            // physical model says and it is also what keeps a 6-px glyph legible
+                            // inside a 12-px disc.
+                            //
+                            // Indexed by the DISC-LOCAL `(i, j)`, not the panel position: a knurl
+                            // is cut into the knob, so all three discs carry the identical pattern
+                            // and it travels with the window under a drag. `knurl::shade` is one
+                            // 64-byte-table lookup and three multiplies — see `knurl::selftest`
+                            // leg 7 for the measured cost.
+                            let px = if ctrl_glyph(which, i, j, d) {
+                                ink
+                            } else {
+                                super::knurl::shade(shaded, i, j)
+                            };
                             dst.put_pixel(clx + i, dy as usize, px);
                         }
                     }
@@ -10641,7 +10680,7 @@ fn closeiso_selftest() {
     // Tiled, not pinned: the tiler lays these out without overlap by construction, and a close
     // re-tiles the survivors — which is the real shape (no ring-3 program moves its own window) and
     // the reason every read below re-derives the box instead of remembering it.
-    let wk = create(KERNEL_OWNER_CONSOLE, sk, sk_len, 128, 8, 512, b"ci-k");
+    let wk = create(KERNEL_OWNER_CONSOLE, sk, sk_len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"ci-k");
     let wa = create(ASID_APP, sa, len, 8, 8, 32, b"ci-a");
     let wf = create(ASID_FORCED, sf, len, 8, 8, 32, b"ci-f");
     if wk == WIN_NONE || wa == WIN_NONE || wf == WIN_NONE {
@@ -11182,7 +11221,35 @@ fn reclaim(vacated: &[(usize, usize, usize, usize)]) {
 /// 138, which restores "clears at scale 1 and therefore at every scale". `place_scale` picks 2 or
 /// more at both gate geometries, so this is margin rather than a live fix; margin is what the
 /// original sizing was for.
-static HT_SURF: [u32; 1024] = [0x0020_C080; 1024];
+///
+/// KNURL — **and it moved a third time, which is why it is no longer a literal.** Peter's size
+/// ruling took `theme::CONTROL_BOX` from 12 to 24, so the floor went 122 -> 158 and 128 px
+/// (`138`) fell under it. The width is now [`FIX_W`], sized from [`CLUSTER_MIN_SRC_W`] under a
+/// `const` assertion: a fourth move of the metric fails the BUILD rather than turning leg 10 and
+/// the close-box leg into silent SKIPs, which is the exact failure this comment has now recorded
+/// three times.
+static HT_SURF: [u32; FIX_W * FIX_H] = [0x0020_C080; FIX_W * FIX_H];
+
+/// The fixture surfaces' SOURCE width, in pixels. Sized from the shipping geometry rather than
+/// picked: it must clear [`CLUSTER_MIN_SRC_W`] (148 px at the current metrics) so that every
+/// fixture window carries a control cluster at scale 1 and therefore at every scale. 160 is the
+/// next multiple of 32 above the floor, i.e. 12 px of margin against the next metric nudge.
+#[cfg(feature = "witness")]
+pub const FIX_W: usize = 160;
+
+/// The fixture surfaces' SOURCE height. Unchanged: nothing about the control cluster is a function
+/// of height, and 8 rows keeps the surfaces small.
+#[cfg(feature = "witness")]
+pub const FIX_H: usize = 8;
+
+/// The fixture surfaces' stride in BYTES — `FIX_W` ARGB8888 pixels, no padding.
+#[cfg(feature = "witness")]
+pub const FIX_STRIDE: usize = FIX_W * 4;
+
+/// **The tripwire the last three re-sizings needed and did not have.** If a theme metric ever
+/// raises `controls`'s floor past the fixture width again, this fails the build.
+#[cfg(feature = "witness")]
+const _: () = assert!(FIX_W >= CLUSTER_MIN_SRC_W);
 
 /// CLICK-ROUTE — the HIT-TEST witness: does [`hit_test`] name the window an operator would say they
 /// clicked on?
@@ -11514,7 +11581,7 @@ fn closebox_leg(owner: u64, surf: usize, len: usize) -> Option<bool> {
     // tiler picks (8*4 + 10 = 42 against the floor) — this leg would have reported SKIP for the
     // rest of time. CRISPYWIRE-REVIEW: the floor is now 122 px, so the width went 96 -> 128 to keep
     // clearing it at scale 1 (`128 + 10 = 138`) and therefore at all of them. See `HT_SURF`.
-    let w = create(owner, surf, len, 128, 8, 512, b"ht-x");
+    let w = create(owner, surf, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"ht-x");
     if w == WIN_NONE {
         return None;
     }
@@ -11757,8 +11824,8 @@ pub fn hittest_selftest() {
     // same size and are stacked at the same origin, exactly as before; only the width moved, so
     // that leg 10's router-driven close has a strip wide enough to carry a close control.
     // CRISPYWIRE-REVIEW widened it again, 96 -> 128, against the corrected 122-px floor.
-    let wa = create(ASID_A, s, len, 128, 8, 512, b"ht-a");
-    let wb = create(ASID_B, s, len, 128, 8, 512, b"ht-b");
+    let wa = create(ASID_A, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"ht-a");
+    let wb = create(ASID_B, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"ht-b");
     if wa == WIN_NONE || wb == WIN_NONE {
         serial_println!("[clickroute] hit-test -> SKIP (window table full: a={} b={})", wa, wb);
         close(wa);
