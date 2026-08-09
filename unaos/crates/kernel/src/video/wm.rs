@@ -1214,6 +1214,22 @@ pub fn close(id: WinId) -> bool {
 /// Close every window owned by `owner_asid` and return how many rows were freed. Task teardown
 /// (`clear_handle_row`) calls this so a dead ASID can never leave a window compositing from a
 /// surface whose address space is gone.
+///
+/// ### CLOSEISO — KERNEL FURNITURE IS NEVER REAPED BY AN OWNER-SCOPED CLOSE
+///
+/// This is the blast-radius primitive: it is the one call that removes rows it was not handed the id
+/// of, and it is reached from BOTH the process teardown and the operator's close control
+/// (`wc_close_click`). A furniture row (the reserved kernel-owner band — `fbcon`'s console window
+/// lives there since CLICK-X86) is refused here, per row, and the refusal is LOUD.
+///
+/// Today the refusal is unreachable by arithmetic: the match is `r.owner_asid == owner_asid`, and a
+/// user owner is a `slot + 1` bias that can never land in the band. That is exactly why the guard is
+/// worth its two lines — it makes the console's survival a property of THIS function rather than a
+/// property of how the callers happen to compute an ASID. It also closes the one live path that does
+/// reach it with a band value: `close_box` declines only `owner_asid == 0`, so the console row is
+/// drawn WITH a close control, and clicking it routes `wc_close_click(KERNEL_OWNER_CONSOLE)` straight
+/// here. The control is another arc's code and is not touched; what is guaranteed here is that no
+/// amount of clicking it can take the console away.
 pub fn close_owner(owner_asid: u64) -> usize {
     // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`, and note that THIS is the path that matters most: it
     // is reached from `sched::exit` → `clear_handle_row`, which has already masked interrupts, so a
@@ -1226,11 +1242,26 @@ pub fn close_owner(owner_asid: u64) -> usize {
     // holds under one lock and no longer knows their ids by the time it returns.
     drag_forget_owner(owner_asid);
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+    // CLOSEISO — WHICH ids, not merely how many. A count cannot be falsified against the panel: the
+    // Boot AR line `closed=1` was true and told the reader nothing about which window went. The list
+    // is what makes "closing one program's window closed exactly that window" a checkable claim.
+    let mut ids = [WIN_NONE; MAX_WINDOWS];
     let mut n = 0;
+    // CLOSEISO — furniture rows this call REFUSED to reap. Never nonzero on any path a user close
+    // takes; printed unconditionally when it is, because a close aimed at the console is either a
+    // bug in the router or a bug in ownership, and both are the operator losing their machine.
+    let mut refused = [WIN_NONE; MAX_WINDOWS];
+    let mut nrefused = 0usize;
     {
         let mut t = table();
         for r in t.rows.iter_mut() {
             if r.used && r.owner_asid == owner_asid {
+                if is_kernel_owner(r.owner_asid) {
+                    refused[nrefused] = r.id;
+                    nrefused += 1;
+                    continue;
+                }
+                ids[n] = r.id;
                 vacated[n] = outer_box(r);
                 // WC-N — same slot-recycle reset as `close`. Under the table lock here because the
                 // row's id is only readable before the clear; `wcn_forget` is one relaxed store.
@@ -1241,6 +1272,15 @@ pub fn close_owner(owner_asid: u64) -> usize {
             }
         }
     }
+    // CLOSEISO — the loud arm. Unconditional (not witness-gated): a build without witnesses is the
+    // build the operator is sitting in front of, and this is the line that tells them their close
+    // control was aimed at the machine's own furniture.
+    if nrefused > 0 {
+        serial_println!(
+            "[wc-a] close_owner asid={:#x} REFUSED furniture rows={} ids={:?} — KERNEL FURNITURE IS NOT CLOSABLE",
+            owner_asid, nrefused, &refused[..nrefused]
+        );
+    }
     if n == 0 {
         return 0;
     }
@@ -1250,7 +1290,10 @@ pub fn close_owner(owner_asid: u64) -> usize {
     // WC-B's per-ASID surface mappings it becomes a kernel abort mid-blit.
     let barrier = DrainBarrier::drain();
     #[cfg(feature = "witness")]
-    serial_println!("[wc-a] close_owner asid={:#x} closed={}", owner_asid, n);
+    serial_println!(
+        "[wc-a] close_owner asid={:#x} closed={} ids={:?} refused={}",
+        owner_asid, n, &ids[..n], nrefused
+    );
     // WC-J — the EXIT-TEARDOWN twin of `close`'s reclaim, and the path P61 actually took: a
     // backgrounded app reaches its exit with a window open, `clear_handle_row` lands here, and every
     // OTHER app's window is re-tiled by the `place` below. Same two sets, same treatment.
@@ -1579,6 +1622,11 @@ pub fn focus_changed(asid: u64) {
     // FV-EXEMPT — of those boxes, how many belong to a row that [`above_shell`] says is STILL VISIBLE.
     // That number ought to be zero by the definition of the set, and it is not: see the shell arm.
     let mut exempt = 0usize;
+    // CLOSEISO — how many rows the shell raise passed over as KERNEL FURNITURE: not hidden, not
+    // erased, still composited. On the wire beside `hidden=`/`exempt=` so the Boot AR line
+    // (`hidden=1 exempt=0`, which was the console going dark) reads `hidden=0 furniture=1` now, and a
+    // future regression that starts hiding the console again shows up as the count moving back.
+    let mut furniture = 0usize;
     // VUGMIN-B/C — (owner asid, is it now hidden) pairs, built under the table lock below and published
     // to the syscall layer after the guard drops. The SHELL arm fills this from [`vugmin_scan`] (every
     // owner, all hidden); since CLICK-PLAIN the RAISE arm fills in exactly ONE row — `marks[0]`, the
@@ -1612,6 +1660,28 @@ pub fn focus_changed(asid: u64) {
             newz = z;
             for r in t.rows.iter_mut() {
                 if r.used && r.z < z {
+                    // CLOSEISO — KERNEL FURNITURE IS NOT COLLECTED, AND THEREFORE NOT ERASED.
+                    //
+                    // `above_shell` already exempts it, so the row keeps compositing; the question
+                    // this branch settles is whether its pixels are painted over with `DESKTOP_BG`
+                    // on the way past. For a compat row the answer is "yes, and the `composite` at
+                    // the tail puts them straight back" — the contradiction FV-EXEMPT counts. For
+                    // the console that round trip is not survivable: WC-L may DEFER the fill under
+                    // `STAGE` contention, in which case `drain_deferred` paints desktop colour over
+                    // the console a pass AFTER the repaint has already restored it, and the operator
+                    // is left with a blank rectangle where their console was. An exempt row vacates
+                    // nothing, so there is nothing here to reclaim; the row is merely re-damaged so
+                    // the tail composite repaints it over whatever the shell raise disturbed.
+                    //
+                    // Deliberately narrower than "collect only `!above_shell`": what a BACKGROUND
+                    // full-screen app's pixels should do across a shell TAB is still the open panel
+                    // question FV-EXEMPT names, and this arc does not settle it. The furniture case
+                    // is not that question — it has a metal verdict.
+                    if is_kernel_owner(r.owner_asid) {
+                        furniture += 1;
+                        r.damage_all();
+                        continue;
+                    }
                     // FV-EXEMPT — **`r.z < z` IS NOT THE HIDING PREDICATE, AND THIS SET IS THEREFORE
                     // NOT WHAT `hidden=` HAS BEEN CALLING IT.** [`above_shell`] is what decides
                     // whether a row stops compositing, and it EXEMPTS compat rows on purpose: a
@@ -1716,8 +1786,8 @@ pub fn focus_changed(asid: u64) {
         // rather than hidden (see the shell arm). `hidden=N exempt=0` is the line reading it always
         // implied; any other reading is the contradiction, named.
         serial_println!(
-            "[wc-fv] focus shell z={} hidden={} exempt={}",
-            newz, nhidden, exempt
+            "[wc-fv] focus shell z={} hidden={} exempt={} furniture={}",
+            newz, nhidden, exempt, furniture
         );
     } else {
         serial_println!(
@@ -1741,7 +1811,7 @@ pub fn focus_changed(asid: u64) {
             asid, nmarks
         );
     }
-    let _ = (raised, first_id, newz, exempt);
+    let _ = (raised, first_id, newz, exempt, furniture);
     // WEDGE-2 `<F6>` — the `[wc-fv]` line above is the LAST thing every recorded wedge printed, so
     // this token is the one that matters most: it is emitted after that line and before the composite
     // pass. `<F6>` present with nothing after it says the chain survived the print and died inside
@@ -1763,8 +1833,39 @@ pub fn focus_changed(asid: u64) {
 /// Compat rows are exempt: a compat window IS the full-screen present path, it carries owner ASID 0 and
 /// is not addressable as a focus target at all (see [`focus_ring`]), so it can never be raised back
 /// above a shell that overtook it — hiding it would strand a full-screen app's output permanently.
+///
+/// ### CLOSEISO — KERNEL FURNITURE IS EXEMPT TOO, AND THAT IS THE CONSOLE'S WHOLE PROTECTION
+///
+/// Boot AR, metal, operator verdict: *"closing stat should not also close console!"*. The wire says
+/// what happened, to the millisecond:
+///
+/// ```text
+/// [  53869ms] [wc-a] close_owner asid=0x2 closed=1
+/// [  53878ms] [wc-fv] focus shell z=38 hidden=1 exempt=0
+/// [  53878ms] [wm-act] close win=3 owner=0x2 at (2449,641) -> settle=killed, row reaped
+/// ```
+///
+/// The close reaped exactly ONE row — the app's, as it should. Then `wc_close_click` handed the
+/// keyboard back to the shell, `focus_changed(0)` gave `SHELL_Z` a fresh z above every window, and
+/// the only other live row on the panel — `fbcon`'s console window, `KERNEL_OWNER_CONSOLE`, z=1,
+/// created at 2763ms and never raised since — fell below the shell. `hidden=1` IS the console. Its
+/// box was erased to [`DESKTOP_BG`] and this predicate then made [`composite`] skip it for the rest
+/// of the boot. Nothing "closed" the console; the shell raise made it uncompositable, which on the
+/// glass is the same event and, for the operator, a worse one — the console is the only way to talk
+/// to the machine.
+///
+/// The exemption is stated HERE, in the one predicate that decides whether a row composites, rather
+/// than at any of the call sites that can raise the shell: a rule about which rows may vanish belongs
+/// to the definition of vanishing. Kernel furniture is not a focus target ([`focus_ring`] skips the
+/// reserved band) and is not an app's window — it is the machine's own surface, and no gesture aimed
+/// at a program may take it off the glass. Compat rows are exempt for the mirror-image reason (they
+/// cannot be raised back); furniture is exempt because it must never need to be.
+///
+/// Consequence, stated rather than discovered: TAB-to-the-shell no longer hides the console WINDOW
+/// either (it still raises the shell over every app window, which is the whole of that gesture's
+/// purpose). That is a visible change on the panel and it is the intended one.
 fn above_shell(r: &Window, shell: u32) -> bool {
-    r.compat || r.z > shell
+    r.compat || is_kernel_owner(r.owner_asid) || r.z > shell
 }
 
 /// WC-E — restore the whole window layer over a background that was just repainted underneath it.
@@ -10437,6 +10538,147 @@ pub fn vacate_selftest() {
         if ok { "PASS" } else { "FAIL" }
     );
     retile_selftest();
+    closeiso_selftest();
+    repaint();
+}
+
+/// CLOSEISO — the CLOSE-ISOLATION witness: **does closing one program's window close exactly that
+/// window, and does the kernel console survive it?**
+///
+/// ### Why this exists (Boot AR, metal, attended)
+/// *"closing stat should not also close console!"*. The operator clicked the close control on the
+/// STAT.ELF window and the console window went with it. The wire was not silent, it was merely
+/// un-falsifiable:
+///
+/// ```text
+/// [  53869ms] [wc-a] close_owner asid=0x2 closed=1
+/// [  53878ms] [wc-fv] focus shell z=38 hidden=1 exempt=0
+/// ```
+///
+/// `closed=1` is true — one row, the app's. The damage is on the SECOND line: `wc_close_click` hands
+/// the keyboard back to the shell, `focus_changed(0)` raises `SHELL_Z` above every window, and the
+/// console row (`KERNEL_OWNER_CONSOLE`, z=1 since 2763ms) drops below it — erased to [`DESKTOP_BG`]
+/// and skipped by [`composite`] from then on. See [`above_shell`] for the fix; this is its falsifier.
+///
+/// ### The three legs
+/// 1. **isolate** — a furniture row and an ordinary app row are live and the app holds focus. Run the
+///    close click's EXACT sequence (`close_owner(app)` then `focus_changed(0)`) and read the panel
+///    back at the furniture row's content origin: it must still hold the furniture colour. The table
+///    is asked too ([`owner_hidden`]), because "still on the glass" and "the compositor still thinks
+///    it is visible" are two claims and the bug made them disagree.
+/// 2. **forced** — THE FALSIFIABILITY PROOF, and it is not a switch: a THIRD row goes through the
+///    identical sequence, in the same call, differing from the furniture row in ONE property — its
+///    owner is an ordinary ASID rather than a reserved kernel one. That row MUST come back
+///    [`DESKTOP_BG`]. So the bug is forced and shown failing on every run: leg 2 is what leg 1 looked
+///    like before the exemption, and if a future edit drops the exemption the two legs read the same
+///    and the line prints FAIL. A leg that can only pass proves nothing; these two disagree by
+///    construction or the fix is gone.
+/// 3. **refuse** — [`close_owner`] aimed straight at the furniture owner (which is reachable today:
+///    `close_box` declines only `owner_asid == 0`, so the console row is drawn WITH a close control
+///    and clicking it routes here) frees ZERO rows and leaves the row live. This is the structural
+///    half — no owner-scoped close, from any caller, can take the console.
+///
+/// Self-cleaning and one-shot on the same terms as its neighbours: every row it made is closed by id
+/// (`close`, not `close_owner` — the furniture row refuses the latter, which is the point of leg 3),
+/// `SHELL_Z` and `FOCUS_ASID` are restored, and the live set is repainted.
+#[cfg(feature = "witness")]
+fn closeiso_selftest() {
+    use core::sync::atomic::Ordering;
+
+    // The app whose window the operator closes, and the ordinary-owner control row.
+    const ASID_APP: u64 = 0xE2A;
+    const ASID_FORCED: u64 = 0xE2F;
+
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[wc-iso] close-iso -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let info = fb.info();
+    if info.width < 256 || info.height < 128 {
+        serial_println!(
+            "[wc-iso] close-iso -> SKIP (panel {}x{} too small)",
+            info.width, info.height
+        );
+        return;
+    }
+
+    let sk = &raw const HT_SURF as usize;
+    let sk_len = core::mem::size_of_val(&HT_SURF);
+    let sa = &raw const FV_SURF_A as usize;
+    let sf = &raw const FV_SURF_B as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+    let (k_col, a_col, f_col) = (HT_SURF[0], FV_SURF_A[0], FV_SURF_B[0]);
+    let _ = a_col;
+
+    // Tiled, not pinned: the tiler lays these out without overlap by construction, and a close
+    // re-tiles the survivors — which is the real shape (no ring-3 program moves its own window) and
+    // the reason every read below re-derives the box instead of remembering it.
+    let wk = create(KERNEL_OWNER_CONSOLE, sk, sk_len, 128, 8, 512, b"ci-k");
+    let wa = create(ASID_APP, sa, len, 8, 8, 32, b"ci-a");
+    let wf = create(ASID_FORCED, sf, len, 8, 8, 32, b"ci-f");
+    if wk == WIN_NONE || wa == WIN_NONE || wf == WIN_NONE {
+        serial_println!(
+            "[wc-iso] close-iso -> SKIP (window table full: k={} a={} f={})",
+            wk, wa, wf
+        );
+        close(wk);
+        close(wa);
+        close(wf);
+        return;
+    }
+    present(wk);
+    present(wa);
+    present(wf);
+
+    let read = |x: usize, y: usize| super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
+    // The content origin of a row, one pixel in, from its CURRENT outer box.
+    let probe = |id: WinId| -> Option<(usize, usize)> {
+        info_box(id).map(|b| (b.0 + BORDER + 1, b.1 + TITLE_H + BORDER + 1))
+    };
+    let sample = |id: WinId| -> u32 { probe(id).map(|(x, y)| read(x, y)).unwrap_or(0) };
+
+    // The app holds focus, as it does after the operator drags or clicks its title bar — this is what
+    // makes `wc_close_click` take the `focus_changed(0)` arm at all.
+    focus_changed(ASID_APP);
+    let base_k = sample(wk) == k_col;
+    let base_f = sample(wf) == f_col;
+
+    // ── THE GESTURE, exactly as `wc_close_click` performs it ────────────────────────────────────
+    let closed = close_owner(ASID_APP);
+    focus_changed(0);
+
+    let got_k = sample(wk);
+    let got_f = sample(wf);
+    let iso_ok = got_k == k_col;
+    let forced_ok = got_f == DESKTOP_BG;
+    // The table's own answer, beside the panel's: `above_shell` must still call the furniture row
+    // visible. (`owner_hidden` is the predicate every present-suppression path reads.)
+    let table_ok = {
+        let t = table();
+        !owner_hidden(&t, KERNEL_OWNER_CONSOLE, shell_z())
+    };
+    let closed_ok = closed == 1 && info_box(wa).is_none() && info_box(wk).is_some();
+
+    // ── LEG 3: the close control aimed at the console itself ────────────────────────────────────
+    let refused = close_owner(KERNEL_OWNER_CONSOLE);
+    let refuse_ok = refused == 0 && info_box(wk).is_some();
+
+    let ok = base_k && base_f && iso_ok && forced_ok && table_ok && closed_ok && refuse_ok;
+    serial_println!(
+        "[wc-iso] close-iso base_k={} base_f={} closed={}/{} isolate={:#08x}/{} forced={:#08x}/{} table_visible={} refuse={}/{} -> {}",
+        base_k, base_f, closed, closed_ok, got_k, iso_ok, got_f, forced_ok, table_ok,
+        refused, refuse_ok,
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    close(wk);
+    close(wf);
+    // Same restore its neighbours make: the shell back at the bottom, focus back to the shell, and the
+    // live set repainted — this leg's `focus_changed(0)` pushed every OTHER live window under the
+    // shell too, and `composite_inner` has already eaten their damage flags.
+    SHELL_Z.store(0, Ordering::Release);
+    FOCUS_ASID.store(0, Ordering::Release);
     repaint();
 }
 
