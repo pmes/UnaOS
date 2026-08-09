@@ -82,6 +82,12 @@ pub mod wcx;
 // through the pi4 seat from the taste-gate). Declared for INSTGUI's use; full chrome wiring
 // (wm/fbcon reading these instead of their own constants) remains the later lockstep arc.
 pub mod theme;
+// PAPER — the Crispy kit's `content_surface.Paper` material, the multi-octave noise generator
+// `theme.rs` and engine.md §9 deliberately left unlifted, ported to integer Q16 (the kernel has no
+// float and no libm). A CONTENT surface only — Peter's white-board ruling is that the paper is NOT
+// the desktop background. Arch-neutral and unconditional: one 88 KiB `.bss` tile generated once on
+// first use, blitted thereafter.
+pub mod paper;
 // INSTGUI — the first graphical installer: a kernel-owned, CRISPY-themed window over the
 // installer engine (choose disk → erase warning → engine run → verdict). x86-only, and gated
 // on BOTH `wc` (it is a compositor client) and `instgui` (`UNAOS_INSTGUI=1`).

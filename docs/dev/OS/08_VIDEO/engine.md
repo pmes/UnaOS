@@ -3390,6 +3390,14 @@ multi-octave noise generator, a rasterizer concern. It belongs beside the
 surface/material code when it lands, reading `base_rgb` from `CONTENT_FILL` (the
 two agree by construction). This table stays palette + metrics only.
 
+> **SUPERSEDED for the Paper block by PAPER (2026-08-09) — see §PAPER below.** The
+> generator has been ported: `video/paper.rs`, integer Q16, no float and no libm.
+> Everything the paragraph above says is still true of *this table* — `theme.rs`
+> stays palette + metrics, the Paper block is still not a constant here, and the
+> texture still reads its base from `CONTENT_FILL`. What changed is that "when it
+> lands" has happened, and it landed exactly where the paragraph predicted:
+> beside the rasteriser, as a material, in its own module.
+
 **Taste gate is CLOSED — APPROVED** (iteration 3, Peter, 2026-07-26). The visual
 verdict has been taken on the kit these numbers come from, so they are no longer
 provisional. Because every consumer will read the names and never the literals, a
@@ -8485,3 +8493,112 @@ The aarch64 close box (CLOSE-BOX, P79) is untouched and keeps its settle-not-rea
   `kill_wake_parked_semaphores` hook aarch64 already has — a scheduler arc, not a video one.
 * **Drag a window whose app is being killed at the same moment.** `drag-cancel … row-recycled` on the
   wire is the in-lock owner test firing; anything moving that the hand did not grab is the refutation.
+
+## PAPER — the kit's content-surface texture, ported to integer Q16 (2026-08-09)
+
+`video/paper.rs`. The Crispy kit's `content_surface.Paper` block — the one part of
+`kits/crispy/theme.json` §9 deliberately left unlifted, with the note that *"lifting it means
+porting a multi-octave noise generator, a rasterizer concern"* — is now in the kernel. §9's
+"What is not lifted" paragraph carries a pointer here and is otherwise unchanged: `theme.rs` is
+still palette + metrics, and the texture still takes its base colour from `CONTENT_FILL`.
+
+**Peter's ruling is the whole scope** (white board 2026-08-08, A1 follow-up): *"we must have the
+paper texture but i don't want it as the desktop background"*. Paper is a **CONTENT** surface.
+The desktop keeps `DESKTOP_BG` today and the lake scene later, and nothing in `paper.rs` is
+reachable from a desktop fill.
+
+### What was ported, and from where
+
+The json block gives `base_rgb`, `algo: "Laid"`, `amplitude: 0.02`, `scale: 4.0`, `octaves: 3`,
+`seed: 4223012511`. The *algorithm* those parameters drive is `libs/quartzite/src/surface.rs`'s
+`field_at`, `PaperAlgo::Laid` arm — laid lines at the `scale` pitch, chain lines at `11x` that,
+both amplitude-modulated by a three-octave fBm envelope sampled at `scale * 8`. That arm's
+literals (`0.82`, `0.30`, `0.35 + 0.65 *`, the `0x9E37_79B1`/`0x85EB_CA77` lattice hash, the
+`0x68E3_1DA4` per-octave seed offset) are kit source too, and are lifted with the same provenance
+discipline as the palette: the module header maps every one of them to its kernel constant. Every
+Q16 literal was produced by the kit's own pinned rounding rule at Q16 (`v * 65536 + 0.5`,
+truncated), which is what `theme.rs` already does for the gloss scalars.
+
+One reading worth recording because it *looks* ambiguous and is not: the `Laid` arm hard-codes
+`3` octaves for its envelope and never reads `params.octaves`. The json's `octaves: 3` is the
+same number, so both readings agree and there was nothing to ask. A future kit that moved
+`octaves` off 3 would be a kit bug to report, not a kernel decision — the generator would still
+use 3.
+
+### Integer-only, and how far the fidelity claim reaches
+
+Q16 in `i64` throughout, on `blend_q16`'s precedent. No `f32`, no libm. Against a bit-exact
+`f64` model of `field_at` (wrapping disabled, so the comparison is arithmetic only) the integer
+field's maximum absolute error is **6.9e-5** of full scale — at `amplitude = 0.02` that is 4e-4
+of one `u8` step, i.e. the same 8-bit image.
+
+Three deviations are disclosed in the module header and are repeated here because they are the
+part a reviewer should attack:
+
+1. **The lattice wraps; the host's does not.** `surface.rs` never tiles — it generates across a
+   whole region and decorrelates neighbours with a per-region seed. A kernel that must not
+   regenerate per region or per frame has to tile, so the value noise reduces its lattice indices
+   modulo the tile's cell count (doubling with each octave, as the coordinates do). That is a
+   different *instance* of the same generator, seamless by construction — not an approximation.
+   It is the one deviation that is a choice rather than an arithmetic consequence.
+2. **`sin` is a four-term odd polynomial.** The `x^7` coefficient is nudged from the Taylor
+   `-307` to `-297` so the quarter-wave endpoint is exactly `65536`; maximum error over all
+   65536 phases is 3 Q16 units (4.6e-5), and 0/¼/½/¾ turn are exact.
+3. **`hash_unit` truncates to Q16** (`h >> 16` where the host does `(h >> 8) as f32 / 2^24`),
+   < 1.6e-5 per lattice value. The hash *itself* is verbatim — the kit's `hash2` is already pure
+   integer, with no float or JS dependence anywhere in it, so the entropy source is shared
+   exactly rather than substituted.
+
+A fourth, structural: the host's seed is per-region, the kernel has one tile from the kit's one
+seed, so adjacent content regions correlate where the host's would not. That is the price of
+generate-once.
+
+### The tile size is a divisibility fact, not a taste call
+
+The kit names no tile size (it never tiles). Seam-freedom pins it: the laid lines have period
+`scale` = 4 px in y, the chain lines `scale * 11` = 44 px in x, and the envelope's coarsest
+lattice cell is `scale * 8` = 32 px on both axes — a wrapped lattice can only close on a whole
+number of cells. So width must be a multiple of `lcm(44, 32) = 352` and height of
+`lcm(4, 32) = 32`. **352 x 64** is the smallest such tile with more than one envelope cell
+vertically: 88 KiB of `.bss` (no image cost), comfortably L2-resident, which is what keeps the
+blit cheap. Generated once on first use behind a `spin::Once`; the blit is a modular row copy,
+and nothing regenerates per frame. Const-asserted, so the divisibility cannot rot silently.
+
+### The consumer, stated narrowly
+
+`video/instgui.rs`'s content well — the sunken bevel that was a flat `CONTENT_FILL` — is the only
+consumer, and it is the only kernel-drawn content surface that exists. Every other window's
+content pixels belong to a ring-3 app: the compositor reads app surfaces and never writes them,
+and `SYS_WIN_CREATE` hands out freshly mapped (zeroed) pages that the app paints. **Extending
+paper to app windows is not a `paper.rs` change**; it is a decision about whether the kernel
+pre-paints a mapped surface, which would also move WC-B's fixture checksum. Recorded as the open
+edge rather than done quietly.
+
+Because `paper.rs` derives its base from `CONTENT_FILL`, the flat fill it replaces is exactly the
+texture's mean — nothing drawn on top of the well moves by a pixel.
+
+### The wire, and what it proves
+
+```
+[paper] kit=us-crispy-modern@0787ba9f algo=laid octaves=3 scale=4 amp_q16=1311 seed=0xfbb60e9f base=0xf5f2ea tile=352x64 hash=0x0df2b838251069dc
+```
+
+One line, at first generation, **not `witness`-gated** — `wm::crispy_witness`'s precedent: the
+metal image is built without the `witness` feature, so a gated line is absent from the only
+artefact that matters. It names every parameter the generator actually used and the FNV-1a 64 of
+the pixels it produced, so "which texture is the glass showing" is a replayable question rather
+than a photograph. The generator is integer-only and both arches are little-endian, so QEMU and
+metal must print the *same* hash; a different one means a parameter drifted from the kit, which is
+the drift the shared-source law exists to catch.
+
+`paper::selftest` is the stronger statement, and it is why the hash is not merely a number copied
+out of a run. It recomputes every pixel from scratch, hashes that independently of the stored
+tile, and asserts both that the two agree (determinism) and that they equal the checksum pinned in
+the source. It also asserts the top-left 4x4 byte for byte and three hand-derivable identities —
+`smooth(0.5) == 0.5`, the sine's four exact quadrant points, and value-noise-at-a-lattice-point
+== the lattice hash — so a coefficient typo cannot hide behind a checksum nobody can reproduce on
+paper. The 4x4 corner is also structurally checkable: the laid phases at rows 0..3 are
+`+0.7071, +0.7071, -0.7071, -0.7071`, so rows 0-1 must be lighter than rows 2-3, and they are.
+
+Both lines are pinned in `scripts/specs/pi4-regression.spec`; the required-witness count goes
+**91 -> 93**, plus one `FORBID` on the FAIL verdict.

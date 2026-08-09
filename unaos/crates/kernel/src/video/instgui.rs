@@ -236,10 +236,24 @@ fn repaint() {
     let px = unsafe { &mut (*core::ptr::addr_of_mut!(SURF)).0 };
 
     // Chrome-adjacent frame: wm draws the real title strip; inside, the CRISPY
-    // content well — sunken bevel around CONTENT_FILL.
+    // content well — sunken bevel around the content surface.
+    //
+    // PAPER: the well is the kit's `content_surface.Paper` material, not a flat `CONTENT_FILL`.
+    // This is the ONE consumer touch: the kit puts paper under CONTENT, never under the desktop
+    // (white board 2026-08-08), and this well is the only kernel-drawn content surface in the tree
+    // — every other window's pixels belong to a ring-3 app. `super::paper` derives its base from
+    // `theme::CONTENT_FILL`, so the flat fill this replaces is exactly the texture's mean; nothing
+    // drawn on top (text, rows, buttons) moves by a pixel.
     fill(px, 0, 0, W, H, theme::CHROME_FACE);
     bevel(px, 4, 4, W - 8, H - 8, false);
-    fill(px, 4 + theme::BEVEL, 4 + theme::BEVEL, W - 8 - 2 * theme::BEVEL, H - 8 - 2 * theme::BEVEL, theme::CONTENT_FILL);
+    super::paper::fill_rect(
+        px,
+        W,
+        4 + theme::BEVEL,
+        4 + theme::BEVEL,
+        W - 8 - 2 * theme::BEVEL,
+        H - 8 - 2 * theme::BEVEL,
+    );
 
     let lx = 24;
     match st {

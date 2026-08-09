@@ -13759,6 +13759,11 @@ fn wcb_launcher(_demo_cpu: usize) {
     // restores SHELL_Z/FOCUS_ASID, repaints), so nothing after it sees a changed table.
     #[cfg(feature = "witness")]
     crate::video::wm::hittest_selftest();
+    // PAPER: the kit texture's determinism fixture, LAST — it neither mints a window nor reads the
+    // panel, so it perturbs nothing above it, and its only side effect is generating the one tile
+    // (which emits the unconditional `[paper]` wire line naming the checksum the verdict asserts).
+    #[cfg(feature = "witness")]
+    crate::video::paper::selftest();
 }
 
 // =============================================================================================
