@@ -5974,10 +5974,81 @@ and the controller would ignore our CONNECT_IND anyway. `ADV_SCAN_IND` (`0x02`) 
 `ADV_NONCONN_IND` (`0x03`) are non-connectable by definition; `SCAN_RSP` (`0x04`) is not an
 advertisement.
 
-The pick is **first-heard, not strongest**: an RSSI ranking would have to hold the whole window
-before deciding and would still be picking a stranger, so the deterministic rule is the honest one.
-It is witnessed *before* anything is done with it, so a capture always shows which address L3 aimed
-at independently of what happened next.
+#### 22.2a Who L3 is *allowed* to connect to — the name filter (white board Q6, ruled)
+
+First-heard **reaches into the room.** On a bench with neighbours, the first `ADV_IND` is a
+stranger's phone, a tracker, or — the case that decided this — another machine's BLE keyboard or
+mouse, which a CONNECT_IND takes away from its owner for as long as the link is held. Two
+independent reviews reached that conclusion separately, and **Peter ruled**: the bench connects to
+his own speaker, an Ultimate Ears **MEGABOOM**, and to nothing else.
+
+The filter is **by advertised name, not by BD_ADDR** — the address is not known, and a name is what
+makes the run reproducible for whoever is at the bench: turn the speaker on, boot, and it is the
+peer.
+
+```rust
+const BT_L3_PEER_NAME: Option<&str> = Some("MEGABOOM");
+```
+
+| filter | rule | when it applies |
+|---|---|---|
+| connectable | the address must have been heard advertising `ADV_IND` (`Event_Type` `0x00`) at least once | always, and the flag is **sticky** (`BtDev::conn_seen`). `devs[i].evt` is last-report-wins, so a device that advertised connectably and then had a scan response overheard would otherwise end the window looking like a `SCAN_RSP` and be refused a connection it was soliciting. |
+| address type | `Peer_Address_Type` must be `0x00` public or `0x01` random | always. `0x02`/`0x03` are the *resolved identity* forms — a 4.0 part does not accept them in `HCI_LE_Create_Connection`, and this arc has no resolving list to have produced one honestly. Posting one raw is an out-of-range parameter dressed as a peer. |
+| **name** | advertised Local Name **contains** `BT_L3_PEER_NAME`, case-insensitive | when `Some` and non-empty. `Some("")` is "no filter written by accident" and is **not** honoured as one. |
+| RSSI floor | `BT_L3_RSSI_FLOOR` = **-60 dBm** | only when the name filter is `None` — a *named* peer across the room is still the right peer. RSSI `127` means *not available*; a floor cannot be applied to an unknown value and admitting unknowns would make the rule decorative, so `127` is skipped under its own name. |
+
+**Selection happens after the window, off the merged device table** — not inside the drain loop.
+The name is why: a device's Local Name may arrive in a *later* report than its first sighting, so a
+first-heard rule evaluated in-loop would judge a device on a name it had not yet said. The table has
+merged all of it by then, and the pass is free (nothing prints inside the loop; this runs once over
+at most 16 entries with the radio already quiet).
+
+**The name decode is L2's, reused unchanged** — the `BT_AD_NAME_COMPLETE` (`0x09`) /
+`BT_AD_NAME_SHORT` (`0x08`) walk in `bt_le_drain`, including the empty-Complete-name guard fixed
+earlier. There is no second name parser. Matching is ASCII-case-insensitive on purpose: advertised
+names are UTF-8 and a correct Unicode fold is a table this driver has no business carrying, so
+non-ASCII bytes compare verbatim — which can miss, never falsely hit.
+
+> **PASSIVE SCAN, AND WHAT IT MAY NOT HEAR.** L2 scans passively; it sends no `SCAN_REQ`. A name
+> that a device carries *only* in its `SCAN_RSP` is reachable here only when some **other** nearby
+> device solicits it and our controller is listening. The merge accepts a name from any report type,
+> so an overheard scan response does supply one — but it is not guaranteed. Whether a MEGABOOM puts
+> its name in the `ADV_IND` payload or only in the scan response is a question metal answers, not
+> this document. **Switching to an active scan is NOT done here**: active scanning transmits a
+> `SCAN_REQ` to every advertiser in the room, which is a larger decision than this arc's brief and
+> is Peter's to make. If the bench shows `SKIP:no-name-advertised` against the speaker's address,
+> that is the finding, and active scan is the separate decision it opens.
+
+Every candidate is witnessed. Each distinct device's own L2 line now carries an **`l3=` verdict**,
+so a capture answers *"why not that one?"* for every device in the room — a peer that was not
+selected is otherwise indistinguishable from a peer that was never heard:
+
+```
+:: bt-l2: [N] dev 03 addr=.. type=public evt=ADV_IND rssi=-48dBm reports=7 name="MEGABOOM" l3=SELECTED == witness ::
+:: bt-l2: [N] dev 04 addr=.. type=random evt=ADV_IND rssi=-71dBm reports=2 name="Pete's Buds" l3=SKIP:name-mismatch == witness ::
+:: bt-l3: [N] peer rule — NAME FILTER ARMED, name="MEGABOOM" (case-insensitive substring ...) == witness ::
+:: bt-l3: [N] peer SELECTED addr=.. type=public — ... considered=N matched=1 == witness ::
+```
+
+and when the speaker is off or out of range, in those words, with no create issued:
+
+```
+:: bt-l3: [N] peer NOT SELECTED — no device passed the filters: name=MEGABOOM considered=N matched=0.
+   NO HCI_LE_Create_Connection is issued, nothing is outstanding ... == witness ::
+```
+
+The verdicts include `SKIP:no-name-advertised`, `SKIP:name-mismatch`, `SKIP:identity-address-type`,
+`SKIP:below-rssi-floor`, `SKIP:rssi-unavailable`, `not-connectable`, `SELECTED`, and
+`also-matched` (a second device answering the same name — not an error, but connecting to both is
+not on offer and picking silently would hide the ambiguity). A `~(cut)` next to a
+`SKIP:name-mismatch` is the one combination worth reading twice: the match was tried against a name
+truncated at `BT_L2_NAME_MAX` (24 bytes), so it may be a **false miss**, and it is visible rather
+than silent.
+
+The RSSI floor, the fallback rule, is a **mitigation and not a guarantee** and the witness says so
+in those words: RSSI is not distance, a high-power advertiser two rooms away can clear -60 dBm and a
+shielded one on the desk can fail it. It is worth having on its own terms because the failure it
+prevents is the one that matters — silently connecting to the *loudest* stranger.
 
 ### 22.3 `HCI_LE_Create_Connection` (`0x200D`), 25 bytes, every one justified
 
@@ -6011,14 +6082,62 @@ and later LE commands are refused with Command Disallowed for the rest of the bo
   Initiating state, so **no cancel is owed** and none is issued;
 * the EP0 control-OUT for the create itself failed → nothing reached the radio, same conclusion.
 
-Between the first two there is a genuine race: the cancel can *lose*, and the controller then
-answers it with an `LE Connection Complete` carrying status `0x00` and a real handle. The link is
-live. That path is handled — the cancel branch falls through into the disconnect branch — and
-witnessed as `CANCEL LOST THE RACE`, not assumed away.
+#### 22.4a The cancel race, in the ordering that actually happens
+
+Between the first two bullets there is a genuine race, and the **likely** ordering is not the one
+the first cut of this arc handled. That cut assumed: cancel → Command Complete `0x00` → `LE
+Connection Complete` `0x00` with a handle. Per Core Vol 4 Part E the commoner sequence is the
+reverse. `HCI_LE_Create_Connection_Cancel` answers **`0x0C` Command Disallowed** when the
+controller is no longer Initiating — which is exactly its state once the connection *has*
+established — and the `LE Connection Complete` carrying the real handle was queued **ahead of** that
+Command Complete.
+
+So the wait for the Command Complete reads the meta event **first**. It is not what that wait asked
+for, and the loop stepped over it: `here += 1; *seen += 1; continue`. That discarded the only handle
+by which the link could ever be released. What followed was worse than a leak, it was a leak with a
+clean certificate: the `0x0C` branch set `outstanding = false`, printed *"there was no create to
+cancel"*, and the tally computed `(live=false, outstanding=false)` → **`left_outstanding=none`**.
+On metal that is an open LE link to a stranger's device for the **rest of the boot** —
+`bt_quiesce_events` deactivates the event qTD immediately afterwards, so no `Disconnection Complete`
+can ever be read, and the link dies only on the peer's supervision timeout or a power cycle.
+
+The fix is a **latch**, `BtL3State`, carried across every wait of one L3 run:
+
+* any `LE Connection Complete` with status `0x00` that a wait walks past has its handle latched
+  (`live_handle`) instead of discarded — and the `take()` on consumption means the several places
+  that consult it cannot double-count one connection;
+* a walked-past `LE Connection Complete` with a **nonzero** status sets `resolved_nonzero`: no link,
+  but the create resolved, which is the *other* thing `0x0C` can mean;
+* `blind` is set whenever a wait did **not** read its window to term — a truncated event stepped
+  over undecoded, an unreadable endpoint, or the structural `BT_L3_EVT_MAX` = 16 cap reached (the
+  second entry to the same hole: pre-scan-disable advertising reports draining during the
+  `BT_L3_CONN_MS` wait can exhaust the cap). It is what makes the *absence* of a latch admissible
+  as evidence or not.
+
+The latch is consulted at three points: before any cancel is considered (§3b, so a cancel is never
+issued against a link that already exists), inside the `0x0C` branch, and once more after the whole
+teardown block, since the cancel's own short-event / timeout / unreadable branches would otherwise
+leave without looking. Every consultation that finds a handle falls through into the disconnect
+path and prints `LATCHED LINK RECOVERED`.
+
+That also lets `0x0C` say something it previously **asserted with no evidence at all**. It now reads
+as *never-initiating* only when no connection event of any status was walked past — and an
+established connection would have queued one ahead of this very Command Complete, so that absence is
+real evidence. When `blind` is set the line says so, in the same breath, as a caveat rather than a
+verdict.
+
+#### 22.4b An unreadable endpoint is latched, and no read is retried after it
 
 As in L2, `BtEvt::Stop` forbids further **event reads**, not EP0 writes. Every teardown command is
 still *sent* on a path where the endpoint has become unreadable; what the arc will not do is claim a
 reply it could not read, and the tally then reports the outcome as unconfirmed.
+
+`Stop` is now **latched in `BtL3State`**, and `bt_l3_await` returns immediately — without arming —
+once it is set. That is not tidiness. A later `bt_read_full_event` finds `armed == false` (the halt
+cleared it) and re-arms, writing a fresh `QTD_ACTIVE` overlay, which **clears the QH's Halted bit
+while the device's STALL condition stands** — the endpoint then looks healthy and is not. The
+`SENT UNREAD` witnesses distinguish the two facts they used to conflate: a read that was *attempted*
+and found the endpoint dead, versus no read attempted because an earlier section already latched it.
 
 ### 22.5 The armed invariant, preserved by construction
 
@@ -6043,6 +6162,20 @@ read as evidence that nothing happened):
 one. **The arc ending with a live connection or an unresolved create is the must-not-appear
 condition**, and the tally declares it in those words.
 
+Two things about this line were themselves wrong and are fixed:
+
+* **`elapsed=` no longer fabricates a zero.** It used `epace_ms(..).unwrap_or(0)`, which printed
+  `elapsed=0ms` on exactly the run §22.7 claimed could not masquerade — the *uncalibrated* one,
+  where `epace_ms` returns `None`. A fabricated zero in milliseconds is indistinguishable from an L3
+  that did nothing. It now uses `epace_fmt`, the rest of the file's answer: raw cycles with a `cy`
+  unit when the TSC rate is unknown, so the line reads `elapsed=NNNNNNNNcy` and cannot be mistaken
+  for a measured millisecond.
+* **The `(live, outstanding) = (true, true)` arm had no producer.** Every site that sets `live` also
+  resolves `outstanding` in the same breath — a connection event is precisely what takes the
+  controller out of the Initiating state — and `outstanding` is never set again after the create.
+  A dead arm asserting an unreachable condition is a claim, so `live` is now matched first and
+  swallows both: if a link is held, that is the headline whatever `outstanding` says.
+
 ### 22.7 What L3 costs
 
 `bt` is off by default; all of this is the cost of a `UNAOS_BT=1` boot, added to L2's ~590 ms empty
@@ -6052,15 +6185,40 @@ condition**, and the tally declares it in those words.
 
 | path | added |
 |---|---|
-| no connectable peer heard | **0 ms** |
+| no peer passed the filters (speaker off, out of range, or nothing connectable heard) | **0 ms** |
 | create refused | ≤ 300 ms |
 | connect + clean release, typical | ~100-400 ms |
 | create timed out, cancelled | ≤ 2100 ms |
-| **cancel loses the race, then disconnects — worst case** | **≤ 3000 ms** |
+| **cancel loses the race, then disconnects — worst case** | **≤ 3000 ms** of event waits |
 
-With `tsc_hz() == 0` every L3 window collapses to `hw_wait_budget()/4`, so the worst case *falls*;
-the tally prints the measured `elapsed=`, so an uncalibrated run cannot masquerade as a calibrated
-one.
+**The ≤ 3000 ms was not a bound when it was first written, and now is.** `bt_read_full_event` gave
+every **continuation** packet the whole of `hw_wait_budget()` (~1.1 s calibrated on the bench part,
+the fixed 2.5e9-cycle guess uncalibrated), and only the *first* packet of an event was bounded by
+the caller's window. An `LE Advertising Report` is three or more packets on a 16 B endpoint, and L3
+makes up to six waits, each able to begin reassembling one — so a wait that had "bought" 300 ms
+could stall for 300 ms **plus one full budget per continuation packet**. The real worst case was
+~3.0 s **+ up to ~12 s**.
+
+The fix is the preferred one: the deadline is passed down. `bt_read_full_event` now takes a
+`cont_budget` alongside `first_budget`, bounding the continuation **phase** (not each packet), and
+`bt_l3_await` passes what REMAINS of its own window to both. The bound a caller states is now the
+bound it gets. The reason continuations were unbounded still holds and is preserved: abandoning an
+event half-read desynchronises the toggle, so a continuation expiry returns `Stop` (the endpoint is
+finished with) while a first-packet expiry returns `Idle` (nothing was lost). `bt_hci_command` — a
+command path whose first-packet budget is already the full one, reading 70-byte events — passes
+`hw_wait_budget()` for both and is byte-for-byte unchanged, as is L2's drain, which keeps the full
+continuation budget deliberately: a report arriving in the last milliseconds of the window is worth
+finishing, and the drain has no teardown behind it waiting on the clock.
+
+The 3000 ms is the sum of the six waits on the longest path — 300 (create Command Status) + 1200
+(Connection Complete) + 300 (cancel Command Complete) + 300 (post-cancel meta) + 300 (disconnect
+Command Status) + 600 (Disconnection Complete). On top of it sit **up to three EP0 control-OUTs**
+(create, cancel, disconnect), each with its own transfer budget; those are writes, not waits, and
+are not included in the figure.
+
+With `tsc_hz() == 0` every L3 window collapses to `hw_wait_budget()/4`, so the worst case *falls* —
+and the tally now prints `elapsed=NNNNcy` rather than a fabricated `0ms` on that run (§22.6), which
+is what actually makes an uncalibrated run unable to masquerade as a calibrated one.
 
 ### 22.8 What metal must verify
 

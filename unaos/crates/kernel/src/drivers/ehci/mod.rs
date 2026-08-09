@@ -794,6 +794,76 @@ const BT_LE_SUBEVT_CONN_COMPLETE: u8 = 0x01;
 /// in any case ignore our CONNECT_IND. So: 0x00, and nothing else.
 #[cfg(feature = "bt")]
 const BT_L3_ADV_CONNECTABLE: u8 = 0x00;
+
+// ============================ WHO L3 IS ALLOWED TO CONNECT TO ==============================
+// Picking the first `ADV_IND` heard REACHES INTO THE ROOM. On a bench with neighbours that is a
+// stranger's phone, a tracker, or — the sharp case — another machine's BLE keyboard or mouse,
+// which a CONNECT_IND takes away from its owner for as long as the link is held. Two independent
+// reviews reached the same conclusion, so the mechanism is built here and defaulted safe.
+
+/// BT-L3 — **PEER NAME FILTER.** When `Some(s)`, L3 connects only to a peer whose ADVERTISED LOCAL
+/// NAME contains `s` as a case-insensitive substring; every other candidate is counted and
+/// witnessed as skipped. When `None`, selection falls back to first-heard filtered by
+/// `BT_L3_RSSI_FLOOR` below.
+///
+/// RULING — white board Q6, answered: **the bench connects to Peter's own speaker, an Ultimate Ears
+/// MEGABOOM.** By NAME rather than by BD_ADDR, because the address is not known and a name filter
+/// is what makes the run reproducible for whoever is at the bench — turn the speaker on, boot,
+/// and it is the peer. Changing the target is ONE EDIT OF ONE LINE.
+///
+/// WHAT THIS DEPENDS ON, stated because it is the thing that can make a correct build connect to
+/// nothing: the name must be in an AD structure this arc can HEAR. L2 scans PASSIVELY — it sends no
+/// SCAN_REQ — so a name that a device carries only in its SCAN_RSP (`Event_Type` 0x04) is reachable
+/// here only when some OTHER nearby device solicits it and our controller happens to be listening.
+/// The name decode is L2's, unchanged and shared (the `BT_AD_NAME_COMPLETE`/`BT_AD_NAME_SHORT` walk
+/// in `bt_le_drain`), and it accepts a name from ANY report type — so a scan response overheard in
+/// the window does supply one. What this arc will NOT do is switch to an ACTIVE scan to guarantee
+/// it: active scanning TRANSMITS a SCAN_REQ to every advertiser in the room, which is a larger
+/// decision than this arc's brief and is Peter's to make.
+///
+/// Matching is on the name as DECODED AND CAPPED at `BT_L2_NAME_MAX` (24 bytes). A device whose
+/// name is longer than that and whose match would fall past the cut is reported as cut (`~(cut)`)
+/// on its witness line, so a false miss is visible rather than silent.
+#[cfg(feature = "bt")]
+const BT_L3_PEER_NAME: Option<&str> = Some("MEGABOOM");
+
+/// BT-L3 — RSSI floor in dBm, applied ONLY when `BT_L3_PEER_NAME` is `None` (a name filter already
+/// names its peer, and the right peer across the room is still the right peer).
+///
+/// -60 dBm is roughly arm's length to a couple of metres for a typical BLE advertiser: it admits a
+/// device on the bench and excludes most of what is merely in the building. It is a MITIGATION,
+/// not a guarantee — RSSI is not distance, a high-power advertiser two rooms away can clear it and
+/// a shielded one on the desk can fail it. It is worth having on its own terms because the failure
+/// it prevents is the one that matters: silently connecting to the loudest stranger.
+///
+/// An advertising report may report RSSI as 127 = NOT AVAILABLE. A floor cannot be applied to an
+/// unknown value, and admitting unknowns would make the rule decorative, so 127 is SKIPPED and
+/// counted under its own name.
+#[cfg(feature = "bt")]
+const BT_L3_RSSI_FLOOR: i8 = -60;
+/// BT-L3 — the RSSI value an advertising report uses for "not available" (Bluetooth Core).
+#[cfg(feature = "bt")]
+const BT_L3_RSSI_NA: i8 = 127;
+
+// BT-L3 — the per-candidate verdicts, one per distinct device, printed on that device's own L2
+// witness line. They exist so a capture answers "why not that one?" for EVERY device in the room:
+// a peer that was not selected is otherwise indistinguishable from a peer that was never heard.
+#[cfg(feature = "bt")]
+const BT_L3_V_NOT_CONNECTABLE: &str = "not-connectable(no ADV_IND heard from it)";
+#[cfg(feature = "bt")]
+const BT_L3_V_ATYPE: &str = "SKIP:identity-address-type(0x02/0x03 cannot go in a create)";
+#[cfg(feature = "bt")]
+const BT_L3_V_NO_NAME: &str = "SKIP:no-name-advertised";
+#[cfg(feature = "bt")]
+const BT_L3_V_NAME_MISMATCH: &str = "SKIP:name-mismatch";
+#[cfg(feature = "bt")]
+const BT_L3_V_RSSI_NA: &str = "SKIP:rssi-unavailable(the floor cannot be applied)";
+#[cfg(feature = "bt")]
+const BT_L3_V_BELOW_FLOOR: &str = "SKIP:below-rssi-floor";
+#[cfg(feature = "bt")]
+const BT_L3_V_SELECTED: &str = "SELECTED";
+#[cfg(feature = "bt")]
+const BT_L3_V_ALSO_MATCHED: &str = "also-matched(another device answers the same name; not used)";
 /// BT-L3 — connection interval min/max, in units of 1.25 ms (Core range 0x0006..=0x0C80, i.e.
 /// 7.5 ms..4.0 s). 0x0018 = 24 => **30 ms**, 0x0028 = 40 => **50 ms**. A range rather than a point
 /// so the peer's controller can pick something it already runs; 30-50 ms is the ordinary
@@ -1023,6 +1093,11 @@ struct BtDev {
     /// Set when the name was cut at `BT_L2_NAME_MAX`.
     ncut: bool,
     reports: u16,
+    /// BT-L3 — STICKY: this address was heard advertising CONNECTABLY (`ADV_IND`, `Event_Type`
+    /// 0x00) at least once in the window. `evt` above is last-report-wins and cannot answer this:
+    /// a device that advertises connectably and then has a scan response overheard would end the
+    /// window looking like a `SCAN_RSP` and be refused a connection it was soliciting.
+    conn_seen: bool,
 }
 
 #[cfg(feature = "bt")]
@@ -1037,8 +1112,39 @@ impl Default for BtDev {
             nlen: 0,
             ncut: false,
             reports: 0,
+            conn_seen: false,
         }
     }
+}
+
+/// BT-L3 — case-insensitive ASCII substring match, for the peer NAME filter.
+///
+/// ASCII-only folding on purpose: advertised Local Names are UTF-8 on the air, and a correct
+/// Unicode case fold is a table this driver has no business carrying. Every byte outside ASCII is
+/// compared verbatim, so a non-ASCII name still matches itself exactly — what it will not do is
+/// match a differently-cased form of itself, which is a miss and never a false hit.
+///
+/// An EMPTY needle matches everything, so the caller must treat `Some("")` as "no filter" rather
+/// than let it silently admit the whole room; it is refused explicitly at the call site.
+#[cfg(feature = "bt")]
+fn bt_name_contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return needle.is_empty();
+    }
+    let fold = |b: u8| if b.is_ascii_uppercase() { b + 32 } else { b };
+    for start in 0..=(hay.len() - needle.len()) {
+        let mut all = true;
+        for k in 0..needle.len() {
+            if fold(hay[start + k]) != fold(needle[k]) {
+                all = false;
+                break;
+            }
+        }
+        if all {
+            return true;
+        }
+    }
+    false
 }
 
 /// BT-L3 — which event `bt_l3_await` is looking for. Every L3 wait names its target explicitly
@@ -1072,6 +1178,45 @@ enum BtL3Await {
     Got(usize),
     Timeout,
     Stop,
+}
+
+/// BT-L3 — the facts a wait learns that its CALLER did not ask for, carried across every wait of
+/// one L3 run. Three separate defects live here, and they are one structure because they are one
+/// problem: `bt_l3_await` walks past every event that is not the `want`, and some of those events
+/// are load-bearing.
+///
+/// * `live_handle` — **THE CANCEL RACE.** The likely ordering of a lost cancel is NOT the one the
+///   first cut of this arc handled. Per Core Vol 4 Part E, `HCI_LE_Create_Connection_Cancel`
+///   answers with Command Complete **status 0x0C (Command Disallowed)** once the controller is no
+///   longer Initiating — which is exactly the state it is in when the connection HAS established.
+///   The `LE Connection Complete` (status 0x00, real handle) is then already queued AHEAD of the
+///   cancel's Command Complete, so the wait for the Command Complete reads the meta event FIRST,
+///   fails the `want` match, and would step over it. Stepping over that event throws away the only
+///   handle by which the link could ever be released: `bt_quiesce_events` deactivates the event
+///   qTD immediately afterwards, so no `Disconnection Complete` is ever read and the link survives
+///   until the PEER's supervision timeout or a power cycle — while the tally certifies
+///   `left_outstanding=none`. So: any `LE Connection Complete` with status 0x00 that a wait walks
+///   past is LATCHED here, and the teardown consults the latch before it concludes anything.
+/// * `resolved_nonzero` — an `LE Connection Complete` with a NONZERO status that was walked past.
+///   No link exists, but the create RESOLVED (the controller left the Initiating state to send
+///   it), which is the other thing a 0x0C answer to the cancel can mean.
+/// * `blind` — set whenever a wait ended without having read its whole window: a truncated event
+///   was stepped over undecoded, or the structural `BT_L3_EVT_MAX` cap ended the wait early. It is
+///   what makes the *absence* of a latch admissible as evidence or not. Without it, "no connection
+///   event was walked past" would be asserted by a loop that may simply have stopped looking.
+/// * `stopped` — the event endpoint became unreadable (`BtEvt::Stop`: a halt, or an event lost
+///   mid-reassembly). ONCE LATCHED, NO FURTHER READ IS ATTEMPTED. This is not a tidiness rule: a
+///   later `bt_read_full_event` sees `armed == false` after a halt cleared it, re-arms, and writes
+///   a fresh `QTD_ACTIVE` overlay — which clears the QH's Halted bit while the DEVICE's STALL
+///   condition is untouched. The teardown COMMANDS still go out (they ride EP0, which `Stop` says
+///   nothing about); only the reads are refused, and the witnesses say so.
+#[cfg(feature = "bt")]
+#[derive(Clone, Copy, Default)]
+struct BtL3State {
+    live_handle: Option<u16>,
+    resolved_nonzero: bool,
+    blind: bool,
+    stopped: bool,
 }
 
 pub static EHCI_HID: Mutex<Option<Vec<Controller>>> = Mutex::new(None);
@@ -3545,6 +3690,15 @@ impl Controller {
     ///
     /// `seen` accumulates every whole event reassembled, matching or not, so the L3 tally can say
     /// how much traffic it walked past rather than implying the wanted event was the only one.
+    ///
+    /// `st` IS NOT BOOKKEEPING. Everything this function walks past is discarded, and one of the
+    /// events it walks past — an `LE Connection Complete` carrying a live handle — is the only
+    /// thing by which a link can ever be released. `st` is where a walked-past event is latched so
+    /// the caller can consult it before concluding; see `BtL3State` for the ordering that makes
+    /// this the LIKELY path rather than a corner. `st.stopped` also makes the "no more reads"
+    /// rule structural: once an unreadable endpoint has been seen, this function returns without
+    /// touching it again, so no later wait can re-arm a qTD over a halt and clear the QH's Halted
+    /// bit behind a device STALL that is still set.
     #[cfg(feature = "bt")]
     #[allow(clippy::too_many_arguments)]
     unsafe fn bt_l3_await(
@@ -3555,20 +3709,45 @@ impl Controller {
         want: BtL3Want,
         budget_cy: u64,
         seen: &mut u32,
+        st: &mut BtL3State,
         asm: &mut [u8],
     ) -> BtL3Await {
+        // A latched halt is permanent for the rest of L3. NO READ IS ATTEMPTED — not even an arm.
+        if st.stopped {
+            return BtL3Await::Stop;
+        }
         let t0 = crate::arch::now_cycles();
         let mut here = 0u32;
         loop {
             let el = crate::arch::now_cycles().wrapping_sub(t0);
-            if el >= budget_cy || here >= BT_L3_EVT_MAX {
+            if el >= budget_cy {
                 return BtL3Await::Timeout;
             }
-            let len = match self.bt_read_full_event(e, toggle, armed, budget_cy - el, asm) {
+            if here >= BT_L3_EVT_MAX {
+                // The structural cap ended the wait while events were still arriving. The window
+                // was NOT read to term, so the absence of a latch below proves nothing.
+                st.blind = true;
+                return BtL3Await::Timeout;
+            }
+            let len = match self.bt_read_full_event(
+                e,
+                toggle,
+                armed,
+                budget_cy - el,
+                // FINDING 2: the continuation phase is bounded by what REMAINS of this wait's own
+                // window, not by a fresh `hw_wait_budget()` per packet. Without this, one wait
+                // could outlast its stated budget by several seconds and the arc's worst case was
+                // a claim rather than a bound.
+                budget_cy - el,
+                asm,
+            ) {
                 BtEvt::Got { len, trunc } => {
                     if trunc {
                         // A truncated event cannot be matched against `want` without guessing at
-                        // the part that did not fit. Counted and stepped over, never decoded.
+                        // the part that did not fit. Counted and stepped over, never decoded —
+                        // and because it MIGHT have been the connection event, this wait can no
+                        // longer be cited as having seen everything.
+                        st.blind = true;
                         here += 1;
                         *seen += 1;
                         continue;
@@ -3578,7 +3757,11 @@ impl Controller {
                 // The window expired with nothing on the wire. The transfer stays armed and is
                 // handed forward through `armed` — the teardown command consumes it.
                 BtEvt::Idle(_) => return BtL3Await::Timeout,
-                BtEvt::Stop => return BtL3Await::Stop,
+                BtEvt::Stop => {
+                    st.stopped = true;
+                    st.blind = true;
+                    return BtL3Await::Stop;
+                }
             };
             here += 1;
             *seen += 1;
@@ -3607,6 +3790,32 @@ impl Controller {
             if hit {
                 return BtL3Await::Got(len);
             }
+            // ---- THE LATCH (FINDING 1) --------------------------------------------------------
+            // Not the event this wait wanted, so the loop is about to step over it. If it is an
+            // `LE Connection Complete`, stepping over it silently is what leaks a link to a
+            // stranger's device for the rest of the boot. The 21-byte length is the same one the
+            // decoders above require; a shorter one cannot be trusted to carry a handle, and it
+            // set `blind` — the honest reading is "something connection-shaped went past and could
+            // not be read", not "nothing was there".
+            if pkt[0] == BT_EVT_LE_META && len >= 3 && pkt[2] == BT_LE_SUBEVT_CONN_COMPLETE {
+                if len >= 21 {
+                    if pkt[3] == 0x00 {
+                        // A LIVE HANDLE. Latched only if one is not already held: the first is
+                        // the one this arc created, and a second would be a link this arc did not
+                        // ask for and cannot release with a single handle anyway.
+                        if st.live_handle.is_none() {
+                            st.live_handle =
+                                Some(((pkt[4] as u16) | ((pkt[5] as u16) << 8)) & 0x0FFF);
+                        }
+                    } else {
+                        // No link, but the create RESOLVED: the controller left the Initiating
+                        // state in order to send this.
+                        st.resolved_nonzero = true;
+                    }
+                } else {
+                    st.blind = true;
+                }
+            }
         }
     }
 
@@ -3619,9 +3828,17 @@ impl Controller {
     /// * a create that DID NOT resolve is withdrawn with `HCI_LE_Create_Connection_Cancel`.
     ///
     /// and by the fact that between those two states there is a genuine race — the cancel may lose,
-    /// in which case the controller reports `LE Connection Complete` with status 0x00 in reply to
-    /// the cancel and the link IS live. That case is handled, not assumed away: the cancel path
-    /// falls through into the disconnect path when it sees it.
+    /// in which case the link IS live and the right teardown is a disconnect.
+    ///
+    /// THE RACE HAS TWO ORDERINGS AND THE LIKELIER ONE IS NOT THE OBVIOUS ONE. The obvious one is
+    /// cancel -> Command Complete 0x00 -> `LE Connection Complete` 0x00 with a handle, and it is
+    /// handled inline below. The likelier one is the reverse: once the connection has established
+    /// the controller is no longer Initiating, so it answers the cancel with Command Complete
+    /// **0x0C (Command Disallowed)** — with the `LE Connection Complete` carrying the real handle
+    /// already queued AHEAD of it. The wait for that Command Complete therefore reads the meta
+    /// event first, and a wait discards everything that is not what it asked for. `BtL3State` is
+    /// where that discard was turned into a latch; every teardown decision consults it before
+    /// concluding, and `left_outstanding=none` is only printed when it has.
     ///
     /// MUST-NOT-APPEAR, and the tally exists to make it visible: this function ending with a live
     /// connection or an unresolved create. `left_outstanding=` on the tally line is that condition;
@@ -3648,6 +3865,10 @@ impl Controller {
         let mut live = false; // a connection is established and not yet released
         let mut outstanding = false; // a create was issued and has not been seen to resolve
         let mut handle = 0u16;
+        // Everything the waits learn that their caller did not ask for: a walked-past connection
+        // event, a walked-past resolution, whether any wait ended blind, and whether the event
+        // endpoint has become unreadable. See `BtL3State`.
+        let mut st3 = BtL3State::default();
         let t0 = crate::arch::now_cycles();
 
         // ---- 1. HCI_LE_Create_Connection ------------------------------------------------------
@@ -3693,7 +3914,9 @@ impl Controller {
             BT_LE_SCAN_INTERVAL, BT_LE_SCAN_INTERVAL as u32 * 625,
             BT_LE_SCAN_WINDOW, BT_LE_SCAN_WINDOW as u32 * 625,
             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0],
-            if atype == 0x00 { "public" } else if atype == 0x01 { "random" } else { "reserved" },
+            // Only 0x00/0x01 can reach here: the selection filter refuses the identity forms
+            // (0x02/0x03), which is the whole reason this gloss has no third arm.
+            if atype == 0x00 { "public" } else { "random" },
             BT_L3_CONN_INTERVAL_MIN, BT_L3_CONN_INTERVAL_MAX,
             BT_L3_CONN_INTERVAL_MIN as u32 * 1250, BT_L3_CONN_INTERVAL_MAX as u32 * 1250,
             BT_L3_CONN_LATENCY,
@@ -3727,7 +3950,7 @@ impl Controller {
             e, toggle, armed,
             BtL3Want::CmdStatus(BT_HCI_LE_CREATE_CONN),
             Self::bt_l3_budget(BT_L3_CMD_MS),
-            &mut seen, &mut asm,
+            &mut seen, &mut st3, &mut asm,
         );
         match r {
             BtL3Await::Got(_) => {
@@ -3775,7 +3998,7 @@ impl Controller {
                 e, toggle, armed,
                 BtL3Want::LeMeta(BT_LE_SUBEVT_CONN_COMPLETE),
                 Self::bt_l3_budget(BT_L3_CONN_MS),
-                &mut seen, &mut asm,
+                &mut seen, &mut st3, &mut asm,
             );
             match r {
                 BtL3Await::Got(len) if len >= 21 => {
@@ -3804,7 +4027,11 @@ impl Controller {
                             ":: bt-l3: [{}] LE Connection Complete — status={:#04x} -> NOT CONNECTED{}. The create RESOLVED (the controller left the Initiating state to send this), so no cancel is owed == witness ::",
                             self.idx, st,
                             match st {
-                                0x02 => " (UNKNOWN-CONNECTION-IDENTIFIER: the create was cancelled)",
+                                // 0x02 here is NOT "the create was cancelled": no cancel has been
+                                // issued at this point in the arc, and the only cancel this arc
+                                // ever sends is section 4a below. Reaching it here means the
+                                // CONTROLLER dropped the create for a reason of its own.
+                                0x02 => " (UNKNOWN-CONNECTION-IDENTIFIER: the controller dropped the create without a cancel from us — this arc has issued none yet)",
                                 0x3E => " (CONNECTION-FAILED-TO-BE-ESTABLISHED: the peer answered the CONNECT_IND and then went silent)",
                                 _ => "",
                             }
@@ -3826,6 +4053,27 @@ impl Controller {
             }
         }
 
+        // ---- 3b. RECONCILE THE LATCH, BEFORE ANY CANCEL IS CONSIDERED --------------------------
+        // Sections 2 and 3 each walk past every event that is not the one they asked for. If one
+        // of those was an `LE Connection Complete` with status 0x00, a LINK EXISTS and the right
+        // teardown is a disconnect, not a cancel — issuing a cancel against an established link is
+        // both useless and the shape that produced the leak this fix exists for. Consulted here so
+        // that `outstanding` is resolved before section 4a can act on a stale reading of it.
+        if !live {
+            if let Some(h) = self.bt_l3_claim_latched(&mut st3, "the create/connect waits") {
+                completed += 1;
+                live = true;
+                handle = h;
+                outstanding = false;
+            } else if outstanding && st3.resolved_nonzero {
+                outstanding = false;
+                serial_println!(
+                    ":: bt-l3: [{}] create RESOLVED OUT OF BAND — an LE Connection Complete with a NONZERO status was walked past by an earlier wait. No link exists, but the controller left the Initiating state to send it, so no cancel is owed == witness ::",
+                    self.idx
+                );
+            }
+        }
+
         // ---- 4a. MANDATORY TEARDOWN: withdraw an unresolved create -----------------------------
         // An outstanding create is not a loose end, it is a STUCK CONTROLLER: the Initiating state
         // persists and later LE commands are refused with Command Disallowed for the rest of the
@@ -3841,15 +4089,34 @@ impl Controller {
                 );
             } else {
                 cancels += 1;
-                // The cancel answers with a Command Complete (status only). Status 0x00 = the
-                // create was withdrawn and an LE Connection Complete with status 0x02 follows;
-                // status 0x0C (Command Disallowed) = there was no create to cancel, which resolves
-                // `outstanding` just as well.
+                // The cancel answers with a Command Complete (status only), and BOTH of its
+                // statuses are ambiguous until the latch is consulted:
+                //
+                //   0x00 — the create was withdrawn and an `LE Connection Complete` reporting the
+                //          cancellation (status 0x02) should follow. It may instead carry status
+                //          0x00 and a real handle: the cancel lost the race by a hair.
+                //   0x0C — Command Disallowed. This does NOT mean "there was no create". It means
+                //          the controller is not Initiating RIGHT NOW, and the commonest reason
+                //          for that is THE CONNECTION ALREADY ESTABLISHED — in which case the
+                //          `LE Connection Complete` carrying the handle was queued AHEAD of this
+                //          Command Complete and the wait below has already walked past it. That is
+                //          the likelier of the two orderings, and reading 0x0C as "nothing to
+                //          cancel" is what leaked a live link while the tally said `none`.
+                //
+                // Both branches therefore consult `st3` before concluding anything.
+                //
+                // FINDING 3: whether a read was even ATTEMPTED is a separate fact from whether one
+                // succeeded, and the SENT UNREAD witnesses used to conflate them. A halt latched by
+                // an earlier section makes `bt_l3_await` return `Stop` without touching the
+                // endpoint — which is the correct behaviour (re-arming over a halt clears the QH's
+                // Halted bit behind a device STALL that is still set) but is NOT the same event as
+                // a read that was tried and found the endpoint dead.
+                let read_attempted = !st3.stopped;
                 let r = self.bt_l3_await(
                     e, toggle, armed,
                     BtL3Want::CmdComplete(BT_HCI_LE_CREATE_CONN_CANCEL),
                     Self::bt_l3_budget(BT_L3_CMD_MS),
-                    &mut seen, &mut asm,
+                    &mut seen, &mut st3, &mut asm,
                 );
                 match r {
                     BtL3Await::Got(len) if len >= 6 => {
@@ -3859,12 +4126,38 @@ impl Controller {
                             self.idx, st,
                             match st {
                                 0x00 => "ACCEPTED (an LE Connection Complete reporting the cancellation should follow)",
-                                0x0C => "COMMAND-DISALLOWED (there was no create to cancel — the controller was not initiating)",
+                                0x0C => "COMMAND-DISALLOWED (the controller is not Initiating — either it never was, or the connection has ALREADY ESTABLISHED; the latch below decides which)",
                                 _ => "UNEXPECTED-STATUS",
                             }
                         );
                         if st == 0x0C {
-                            outstanding = false;
+                            // FINDING 1. The Command Complete arrived, so any `LE Connection
+                            // Complete` the controller queued ahead of it has ALREADY been walked
+                            // past by the wait above and sits in the latch. Consult it before
+                            // deciding what 0x0C meant.
+                            if let Some(h) = self.bt_l3_claim_latched(&mut st3, "the cancel's own wait") {
+                                completed += 1;
+                                live = true;
+                                handle = h;
+                                outstanding = false;
+                            } else if st3.resolved_nonzero {
+                                outstanding = false;
+                                serial_println!(
+                                    ":: bt-l3: [{}] COMMAND-DISALLOWED explained — an LE Connection Complete with a NONZERO status was walked past, so the create had already resolved without a link. Nothing is outstanding and nothing is live == witness ::",
+                                    self.idx
+                                );
+                            } else {
+                                outstanding = false;
+                                serial_println!(
+                                    ":: bt-l3: [{}] COMMAND-DISALLOWED read as NEVER-INITIATING — no LE Connection Complete of any status was walked past by any wait of this run, and an established connection would have queued one AHEAD of this Command Complete. {} == witness ::",
+                                    self.idx,
+                                    if st3.blind {
+                                        "CAVEAT, and it is the whole of the evidence: at least one wait ended BLIND (a truncated event stepped over, an unreadable endpoint, or the event cap reached), so this run cannot prove it saw everything. If a link was established it is NOT released by this arc"
+                                    } else {
+                                        "Every wait of this run read its window to term, so the absence of that event is evidence and not merely silence"
+                                    }
+                                );
+                            }
                         } else if st == 0x00 {
                             // THE RACE. A cancel can lose: the CONNECT_IND may already have been
                             // answered, in which case this meta event carries status 0x00 and a
@@ -3873,7 +4166,7 @@ impl Controller {
                                 e, toggle, armed,
                                 BtL3Want::LeMeta(BT_LE_SUBEVT_CONN_COMPLETE),
                                 Self::bt_l3_budget(BT_L3_CMD_MS),
-                                &mut seen, &mut asm,
+                                &mut seen, &mut st3, &mut asm,
                             );
                             match r2 {
                                 BtL3Await::Got(len) if len >= 21 => {
@@ -3919,22 +4212,58 @@ impl Controller {
                         self.idx, BT_L3_CMD_MS
                     ),
                     BtL3Await::Stop => serial_println!(
-                        ":: bt-l3: [{}] HCI_LE_Create_Connection_Cancel (0x200E) SENT UNREAD — the event endpoint is not readable, so no CmdComplete is claimed. The EP0 write, which is what withdraws the create, went out; treated as STILL OUTSTANDING == witness ::",
-                        self.idx
+                        ":: bt-l3: [{}] HCI_LE_Create_Connection_Cancel (0x200E) SENT UNREAD — {}, so no CmdComplete is claimed. The EP0 write, which is what withdraws the create, went out; treated as STILL OUTSTANDING == witness ::",
+                        self.idx,
+                        if read_attempted {
+                            "a read was ATTEMPTED and the event endpoint proved unreadable"
+                        } else {
+                            "NO READ WAS ATTEMPTED: an earlier section already found the event endpoint unreadable and that fact is latched, so this arc does not re-arm a transfer over a halt (which would clear the QH's Halted bit while the device's STALL stands)"
+                        }
                     ),
                 }
             }
         }
 
+        // ---- 4a-bis. RECONCILE THE LATCH ONE LAST TIME -----------------------------------------
+        // The cancel's own waits walk past events too, and its short-event / timeout / unreadable
+        // branches all leave without consulting the latch. This is the last point at which a
+        // walked-past handle can still be turned into a disconnect, so it is checked here rather
+        // than trusted to the branches above. Cheap, and the alternative is a leaked link.
+        if !live {
+            if let Some(h) = self.bt_l3_claim_latched(&mut st3, "the teardown's waits") {
+                completed += 1;
+                live = true;
+                handle = h;
+                outstanding = false;
+            }
+        }
+
         // ---- 4b. MANDATORY TEARDOWN: release a live connection ---------------------------------
         if live {
-            if self.bt_l3_disconnect(t, intf, e, toggle, armed, handle, &mut seen, &mut asm) {
+            if self.bt_l3_disconnect(
+                t, intf, e, toggle, armed, handle, &mut seen, &mut st3, &mut asm,
+            ) {
                 disconnected += 1;
                 live = false;
             }
         }
 
         self.bt_l3_tally(t0, seen, attempted, completed, disconnected, cancels, live, outstanding);
+    }
+
+    /// BT-L3 — take a latched live handle, if one is held, and witness the recovery.
+    ///
+    /// Consumes the latch (`take`), so the several places that consult it cannot double-count the
+    /// same connection. `at` names WHICH group of waits walked the event past, because that is the
+    /// diagnostic content: it says which ordering the controller actually produced.
+    #[cfg(feature = "bt")]
+    fn bt_l3_claim_latched(&self, st: &mut BtL3State, at: &str) -> Option<u16> {
+        let h = st.live_handle.take()?;
+        serial_println!(
+            ":: bt-l3: [{}] LATCHED LINK RECOVERED — an LE Connection Complete with status=0x00 handle={:#06x} was walked past by {} because it was not the event that wait asked for. THIS IS THE CANCEL RACE IN ITS LIKELIER ORDERING: the connection established, so the controller was no longer Initiating and answered the cancel with Command Disallowed, having already queued this event ahead of it. Discarding it would have left a LIVE LINK to the peer for the rest of the boot (the event qTD is deactivated straight after L3, so no Disconnection Complete could ever be read). The handle is adopted: the create RESOLVED, nothing is outstanding, and the link is DISCONNECTED below == witness ::",
+            self.idx, h, at
+        );
+        Some(h)
     }
 
     /// BT-L3 — release one live connection. Returns whether a `Disconnection Complete` with status
@@ -3954,6 +4283,7 @@ impl Controller {
         armed: &mut bool,
         handle: u16,
         seen: &mut u32,
+        st: &mut BtL3State,
         asm: &mut [u8],
     ) -> bool {
         // Connection_Handle(2, LE) Reason(1).
@@ -3973,7 +4303,7 @@ impl Controller {
             e, toggle, armed,
             BtL3Want::CmdStatus(BT_HCI_DISCONNECT),
             Self::bt_l3_budget(BT_L3_CMD_MS),
-            seen, asm,
+            seen, st, asm,
         );
         match r {
             BtL3Await::Got(_) if asm[2] == 0x00 => serial_println!(
@@ -4005,7 +4335,7 @@ impl Controller {
             e, toggle, armed,
             BtL3Want::Evt(BT_EVT_DISCONN_COMPLETE),
             Self::bt_l3_budget(BT_L3_DISC_MS),
-            seen, asm,
+            seen, st, asm,
         );
         match r {
             BtL3Await::Got(len) if len >= 6 => {
@@ -4066,15 +4396,24 @@ impl Controller {
         live: bool,
         outstanding: bool,
     ) {
-        let elapsed = epace_ms(crate::arch::now_cycles().wrapping_sub(t0)).unwrap_or(0);
+        // FINDING 5: `unwrap_or(0)` printed `elapsed=0ms` on exactly the run this doc-comment said
+        // could not masquerade — the UNCALIBRATED one, where `epace_ms` returns None. A fabricated
+        // zero in milliseconds is indistinguishable from an L3 that did nothing. `epace_fmt` is the
+        // rest of this file's answer: raw cycles with a `cy` unit when the TSC rate is unknown.
+        let (elapsed, unit) = epace_fmt(crate::arch::now_cycles().wrapping_sub(t0));
         serial_println!(
-            ":: bt-l3: [{}] L3 tally — elapsed={}ms events_read={} connections_attempted={} connections_completed={} disconnections_confirmed={} cancels_issued={} left_outstanding={} == witness ::",
-            self.idx, elapsed, events, attempted, completed, disconnected, cancels,
+            ":: bt-l3: [{}] L3 tally — elapsed={}{} events_read={} connections_attempted={} connections_completed={} disconnections_confirmed={} cancels_issued={} left_outstanding={} == witness ::",
+            self.idx, elapsed, unit, events, attempted, completed, disconnected, cancels,
+            // FINDING 4: the fourth arm of this match, `(true, true)`, had NO PRODUCER. Every site
+            // that sets `live` also resolves `outstanding` in the same breath — a connection event
+            // is precisely what takes the controller out of the Initiating state — and `outstanding`
+            // is never set again after the create. Rather than leave a dead arm asserting a
+            // condition the code cannot reach, `live` is matched first and swallows both: if a link
+            // is held, that is the headline whatever `outstanding` says.
             match (live, outstanding) {
                 (false, false) => "none",
-                (true, false) => "A LIVE CONNECTION — the teardown was not confirmed. THIS IS THE MUST-NOT-APPEAR CONDITION",
+                (true, _) => "A LIVE CONNECTION — the teardown was not confirmed. THIS IS THE MUST-NOT-APPEAR CONDITION",
                 (false, true) => "AN UNRESOLVED HCI_LE_Create_Connection — the controller may still be INITIATING and will refuse later LE commands. THIS IS THE MUST-NOT-APPEAR CONDITION",
-                (true, true) => "BOTH a live connection AND an unresolved create. THIS IS THE MUST-NOT-APPEAR CONDITION",
             }
         );
     }
@@ -4104,11 +4443,17 @@ impl Controller {
     /// `QTD_ERR_MASK`). The caller needs that fact to decide whether the mandatory scan-disable may
     /// read its own `CommandComplete` — see `BtEvt::Stop`.
     ///
-    /// BT-L3 — also returns the PEER L3 will try to connect to: `(address, address type)` of the
-    /// FIRST report whose Event_Type is `ADV_IND` (0x00, connectable undirected). First-heard, not
-    /// strongest: an RSSI ranking would have to hold the whole window before deciding and would
-    /// still be picking a stranger, so the simple deterministic rule is the honest one. `None` when
-    /// the window heard nothing connectable — and then L3 issues no create at all.
+    /// BT-L3 — also returns the PEER L3 will try to connect to: `(address, address type)`, chosen
+    /// AFTER the window from the merged device table by the selection pass below. `None` when
+    /// nothing passed the filters — and then L3 issues no create at all, so there is nothing to
+    /// cancel or disconnect.
+    ///
+    /// The filters, and why selection is not made inside the drain loop: the primary rule is
+    /// `BT_L3_PEER_NAME` (Peter's ruling, white board Q6 — connect to HIS speaker, by advertised
+    /// name), and a device's Local Name may arrive in a LATER report than its first sighting, or in
+    /// a scan response overheard from someone else's active scan. A first-heard rule evaluated
+    /// in-loop would judge a device on a name it had not yet said. The name decode is the AD walk
+    /// below, reused unchanged — there is no second name parser.
     #[cfg(feature = "bt")]
     unsafe fn bt_le_drain(
         &mut self,
@@ -4148,7 +4493,8 @@ impl Controller {
         let mut multi = 0u32; // events declaring Num_Reports > 1
         let mut extra = 0u32; // reports inside those events that were NOT decoded
         let mut halted = false;
-        // BT-L3 — the first connectable (`ADV_IND`) advertiser heard, and nothing else about it.
+        // BT-L3 — the selected advertiser, and nothing else about it. Filled AFTER the window by
+        // the selection pass over the merged device table, not inside the drain loop.
         let mut peer: Option<([u8; 6], u8)> = None;
         let mut asm = [0u8; BT_EVT_ASM_MAX];
 
@@ -4157,8 +4503,18 @@ impl Controller {
             if el >= win_cy {
                 break;
             }
-            let (len, trunc) = match self.bt_read_full_event(e, toggle, armed, win_cy - el, &mut asm)
-            {
+            // The DRAIN's continuations keep the full budget deliberately: an advertising report
+            // arriving in the last milliseconds of the window is worth finishing, and the drain is
+            // the one caller that has no teardown behind it waiting on the clock. L2's stated
+            // bound is the one it has always had — see the cost paragraph on this function.
+            let (len, trunc) = match self.bt_read_full_event(
+                e,
+                toggle,
+                armed,
+                win_cy - el,
+                crate::arch::hw_wait_budget(),
+                &mut asm,
+            ) {
                 BtEvt::Got { len, trunc } => (len, trunc),
                 // Window expired with nothing on the wire. The transfer stays armed (`*armed`);
                 // the disable command consumes it.
@@ -4221,12 +4577,13 @@ impl Controller {
             let rssi = pkt[13 + dlen] as i8;
             reports += 1;
 
-            // BT-L3 — latch the first CONNECTABLE UNDIRECTED advertiser. `ADV_DIRECT_IND` (0x01)
-            // is connectable too but names an initiator that is not us, so it is not eligible;
-            // 0x02/0x03 are non-connectable and 0x04 is a scan response, not an advertisement.
-            if peer.is_none() && evt_type == BT_L3_ADV_CONNECTABLE {
-                peer = Some((addr, atype));
-            }
+            // BT-L3 — THE PEER IS NOT CHOSEN HERE. It is chosen after the window, off the merged
+            // device table below, and the reason is the NAME: a device's Local Name may arrive in
+            // a LATER report than its first sighting (or in an overheard scan response), so a
+            // first-heard rule evaluated inside this loop would judge a device on a name it had
+            // not yet said. All this loop records is the sticky fact the table cannot otherwise
+            // keep — that this address was heard advertising CONNECTABLY at least once — because
+            // `devs[i].evt` is last-report-wins and a later SCAN_RSP would erase it.
 
             // AD structures: a sequence of (Length(1), AD_Type(1), AD_Data(Length-1)). Walk far
             // enough to find a local name; a Complete Local Name (0x09) ends the walk, a Shortened
@@ -4275,6 +4632,9 @@ impl Controller {
                     devs[i].reports = devs[i].reports.saturating_add(1);
                     devs[i].rssi = rssi; // latest, not an average this arc has not earned
                     devs[i].evt = evt_type;
+                    // STICKY, unlike `evt`: connectability is a fact about the device, and a later
+                    // SCAN_RSP or ADV_NONCONN_IND from the same address does not un-say it.
+                    devs[i].conn_seen |= evt_type == BT_L3_ADV_CONNECTABLE;
                     if devs[i].nlen == 0 && nlen > 0 {
                         devs[i].name = name;
                         devs[i].nlen = nlen as u8;
@@ -4291,6 +4651,7 @@ impl Controller {
                         nlen: nlen as u8,
                         ncut,
                         reports: 1,
+                        conn_seen: evt_type == BT_L3_ADV_CONNECTABLE,
                     };
                     ndev += 1;
                 }
@@ -4299,6 +4660,71 @@ impl Controller {
         }
 
         let elapsed = epace_ms(crate::arch::now_cycles().wrapping_sub(t0)).unwrap_or(0);
+
+        // ---- BT-L3: SELECT THE PEER, off the merged table --------------------------------------
+        // After the window, not inside it, and the NAME is why. A device's Local Name may arrive in
+        // a later report than its first sighting, or in a scan response overheard from someone
+        // else's active scan; the table has merged all of that by now, so every candidate is judged
+        // on everything it said rather than on the first thing it said. It is also free: nothing
+        // prints inside the drain loop (see this function's note on serial cost), and this pass
+        // runs once over at most `BT_L2_MAX_DEV` entries with the radio already quiet.
+        //
+        // A VERDICT PER CANDIDATE, carried onto that device's own witness line below, so a capture
+        // answers "why not that one?" for every device in the room without a second pass by hand.
+        let mut verdict = [BT_L3_V_NOT_CONNECTABLE; BT_L2_MAX_DEV];
+        let mut considered = 0u32; // devices that were connectable and could be judged at all
+        let mut matched = 0u32; // devices that passed every filter (only the first is used)
+        for i in 0..ndev {
+            let d = devs[i];
+            if !d.conn_seen {
+                continue; // verdict stays NOT_CONNECTABLE
+            }
+            // Only Public (0x00) and Random (0x01) may go into `HCI_LE_Create_Connection`'s
+            // Peer_Address_Type. 0x02/0x03 are the RESOLVED IDENTITY forms: a 4.0 part does not
+            // accept them there, and this arc has no resolving list to have produced one honestly.
+            // Posting one raw would be an out-of-range parameter dressed as a peer.
+            if d.atype != 0x00 && d.atype != 0x01 {
+                verdict[i] = BT_L3_V_ATYPE;
+                continue;
+            }
+            considered += 1;
+            match BT_L3_PEER_NAME {
+                // THE NAME FILTER — Peter's ruling. Only a device whose advertised Local Name
+                // contains the target is eligible, however loud or however early anything else is.
+                Some(want) if !want.is_empty() => {
+                    if d.nlen == 0 {
+                        verdict[i] = BT_L3_V_NO_NAME;
+                        continue;
+                    }
+                    if !bt_name_contains_ci(&d.name[..d.nlen as usize], want.as_bytes()) {
+                        verdict[i] = BT_L3_V_NAME_MISMATCH;
+                        continue;
+                    }
+                }
+                // No name filter: the RSSI floor is the whole of the mitigation, so it applies.
+                // (`Some("")` falls here on purpose — an empty needle matches everything, which is
+                // "no filter" written by accident, and it is not honoured as one.)
+                _ => {
+                    if d.rssi == BT_L3_RSSI_NA {
+                        verdict[i] = BT_L3_V_RSSI_NA;
+                        continue;
+                    }
+                    if d.rssi < BT_L3_RSSI_FLOOR {
+                        verdict[i] = BT_L3_V_BELOW_FLOOR;
+                        continue;
+                    }
+                }
+            }
+            matched += 1;
+            if peer.is_none() {
+                peer = Some((d.addr, d.atype));
+                verdict[i] = BT_L3_V_SELECTED;
+            } else {
+                // A second device answering to the same name is not an error, but connecting to
+                // both is not on offer and picking silently would hide the ambiguity.
+                verdict[i] = BT_L3_V_ALSO_MATCHED;
+            }
+        }
 
         // ---- witness: one line per distinct device -------------------------------------------
         for i in 0..ndev {
@@ -4343,7 +4769,10 @@ impl Controller {
                 }
                 serial_print!("\"{}", if d.ncut { "~(cut)" } else { "" });
             }
-            serial_println!(" == witness ::");
+            // BT-L3 — the verdict for THIS device, decided above. `~(cut)` next to a
+            // `SKIP:name-mismatch` is the one combination worth reading twice: the match was tried
+            // against a name this arc truncated at BT_L2_NAME_MAX, so it may be a false miss.
+            serial_println!(" l3={} == witness ::", verdict[i]);
         }
 
         // ---- witness: the rollup --------------------------------------------------------------
@@ -4384,15 +4813,32 @@ impl Controller {
         }
         // BT-L3 — witness the PICK before anything is done with it, so a capture always shows which
         // address L3 aimed at (or that it had nothing to aim at) independently of what happened next.
+        //
+        // THE SELECTION RULE ITSELF is witnessed first, unconditionally, because a capture must
+        // say WHO WAS ELIGIBLE before it says who was picked — a run that connected to nobody and
+        // a run that was forbidden from connecting to anybody are different runs.
+        match BT_L3_PEER_NAME {
+            Some(want) if !want.is_empty() => serial_println!(
+                ":: bt-l3: [{}] peer rule — NAME FILTER ARMED, name=\"{}\" (case-insensitive substring of the advertised Local Name; white board Q6, Peter's ruling: the bench connects to HIS OWN speaker and to nothing else). The RSSI floor is NOT applied — a named peer across the room is still the right peer. The scan is PASSIVE, so a name carried only in a SCAN_RSP is heard only if someone else solicits it == witness ::",
+                self.idx, want
+            ),
+            _ => serial_println!(
+                ":: bt-l3: [{}] peer rule — NAME FILTER UNSET: the peer is the first connectable advertiser of the window that clears the RSSI floor of {}dBm. That floor is a NEARBY-ONLY mitigation and not an identity check — a loud stranger can clear it, and connecting to a stranger's keyboard takes it from its owner for the duration == witness ::",
+                self.idx, BT_L3_RSSI_FLOOR
+            ),
+        }
         match peer {
             Some((a, ty)) => serial_println!(
-                ":: bt-l3: [{}] peer SELECTED addr={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={} — first ADV_IND (Event_Type 0x00, connectable undirected) of the window; ADV_DIRECT_IND(0x01) is excluded (its initiator is not us), 0x02/0x03 are non-connectable, 0x04 is a scan response == witness ::",
+                ":: bt-l3: [{}] peer SELECTED addr={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={} — heard advertising connectably (ADV_IND, Event_Type 0x00) and passed every filter; considered={} matched={} == witness ::",
                 self.idx, a[5], a[4], a[3], a[2], a[1], a[0],
-                if ty == 0x00 { "public" } else if ty == 0x01 { "random" } else { "reserved" }
+                if ty == 0x00 { "public" } else { "random" },
+                considered, matched
             ),
             None => serial_println!(
-                ":: bt-l3: [{}] peer NOT SELECTED — the window heard no ADV_IND (connectable undirected) advertiser; NO HCI_LE_Create_Connection is issued and there is nothing to cancel or disconnect == witness ::",
-                self.idx
+                ":: bt-l3: [{}] peer NOT SELECTED — no device passed the filters: name={} considered={} matched=0. NO HCI_LE_Create_Connection is issued, nothing is outstanding, and there is nothing to cancel or disconnect. The ordinary reading with a name filter armed is that the named device is OFF or OUT OF RANGE; the per-device l3= verdicts above say which of the two the room looked like == witness ::",
+                self.idx,
+                match BT_L3_PEER_NAME { Some(w) if !w.is_empty() => w, _ => "(unset)" },
+                considered
             ),
         }
         (halted, peer)
@@ -4564,10 +5010,21 @@ impl Controller {
     ///
     /// `armed` says a transfer is ALREADY outstanding (L2's drain leaves exactly one behind when
     /// its window expires); it is consumed rather than re-armed, and cleared. `first_budget`
-    /// bounds only the FIRST packet — once an event has begun, continuation packets always use the
-    /// full `hw_wait_budget()`, because abandoning an event half-read is what actually desyncs the
-    /// toggle. That is why an expiry mid-event returns `Stop` while an expiry before one returns
-    /// `Idle`.
+    /// bounds only the FIRST packet; `cont_budget` bounds the CONTINUATION PHASE — every packet
+    /// after the first, taken together, not each.
+    ///
+    /// WHY CONTINUATIONS ARE NOW BOUNDED SEPARATELY, and why that is a defect fix and not a knob:
+    /// this function used to give every continuation packet the whole of `hw_wait_budget()`
+    /// (~1.1 s calibrated on the bench part, 2.5e9 cycles uncalibrated). A caller that believed it
+    /// had bought a 300 ms window could therefore stall for that window PLUS one full budget per
+    /// continuation packet — and an `LE Advertising Report` is three or more packets on a 16 B
+    /// endpoint. L3 makes up to six bounded waits, so the arc's "3.0 s worst case" was out by
+    /// roughly four times the wait budget. Passing the caller's REMAINING window down makes the
+    /// bound the caller states the bound it actually gets. The reason continuations were unbounded
+    /// in the first place still holds and is preserved: abandoning an event half-read desynchronises
+    /// the toggle, so a continuation expiry returns `Stop` (the endpoint is finished with) while a
+    /// first-packet expiry returns `Idle` (nothing was lost). Callers that genuinely want the old
+    /// behaviour — `bt_hci_command`, whose first-packet budget IS `hw_wait_budget()` — pass it.
     #[cfg(feature = "bt")]
     unsafe fn bt_read_full_event(
         &mut self,
@@ -4575,6 +5032,7 @@ impl Controller {
         toggle: &mut bool,
         armed: &mut bool,
         first_budget: u64,
+        cont_budget: u64,
         asm: &mut [u8],
     ) -> BtEvt {
         let cap = asm.len().min(BT_EVT_ASM_MAX);
@@ -4621,14 +5079,20 @@ impl Controller {
         let mut trunc = false;
         let max_pkts = cap / (e.mps as usize).max(1) + 2;
         let mut pkts = 1;
+        // The continuation phase's own clock. `cont_budget` is the budget for the WHOLE phase, so
+        // each packet gets what is left of it — an event that arrives one packet at a time cannot
+        // multiply the caller's window by its packet count.
+        let tc0 = crate::arch::now_cycles();
         while have < total {
             if pkts >= max_pkts {
                 trunc = true;
                 break;
             }
+            let cont_rem =
+                cont_budget.saturating_sub(crate::arch::now_cycles().wrapping_sub(tc0));
             self.bt_arm_read(e, *toggle);
             *armed = true;
-            let Some(ni) = self.bt_wait_read(e, crate::arch::hw_wait_budget(), &mut halted) else {
+            let Some(ni) = self.bt_wait_read(e, cont_rem, &mut halted) else {
                 if !halted {
                     // The qTD is STILL ACTIVE and controller-owned. `Stop` here means the EVENT is
                     // lost (the toggle's relationship to the device is gone), not that the transfer
@@ -4778,6 +5242,10 @@ impl Controller {
                 e,
                 toggle,
                 armed,
+                crate::arch::hw_wait_budget(),
+                // A COMMAND's continuation keeps the pre-existing full budget: L0/L1 read
+                // 70-byte events (`Read_Local_Supported_Commands`) on this path and their
+                // first-packet budget is already the full one, so there is no window to shrink to.
                 crate::arch::hw_wait_budget(),
                 &mut asm,
             ) {
