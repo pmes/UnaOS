@@ -3574,10 +3574,38 @@ pub fn sdhc_probe_once() {
             );
             // SDHC-4c: no volume means no reservation to adopt. Say so — a silent skip here would
             // be indistinguishable from a pass that ran and found nothing.
+            //
+            // WITNESS HONESTY: the three ways a mount fails are three different findings about
+            // three different layers, and one shared reason ("no FAT volume") made them read as the
+            // same one. They are separated here so a capture never has to be re-flown to learn
+            // which layer said no. The FOURTH state — the internal reader has no medium at all —
+            // never reaches this arm: `sdhc_probe_once` returns above without latching `PROBED`
+            // when `sdhc_info()` is `None`, so an empty slot prints NO `SDHCBLK:`/`SDHC4C:` line of
+            // any kind and the reserve pass does not run. Absence of the whole block is that
+            // state's signature, and the `[sdhc]` bring-up lines say why the card was never
+            // registered.
             if crate::fs::sdhc4c::claim_reserve_pass() {
                 crate::fs::sdhc4c::disarm(
                     crate::fs::sdhc4c::RESERVE_NAME,
-                    "no FAT volume on the internal SD card",
+                    match e {
+                        // The handle was published when the probe latched and is gone now — a
+                        // medium/registry disappearance, NOT a filesystem verdict.
+                        FatError::NoDisk => {
+                            "the internal SD backend has NO registered medium — the card handle \
+                             vanished between the probe and the mount; nothing was searched"
+                        }
+                        // A read of LBA 0 failed. This says nothing about what the card contains.
+                        FatError::Io => {
+                            "reading LBA 0 of the internal SD card FAILED — this is a driver/medium \
+                             read failure, NOT evidence about the card's contents"
+                        }
+                        // The card read fine and simply is not a filesystem this reader mounts.
+                        _ => {
+                            "a medium IS present and readable on the internal SD card, but it \
+                             carries no FAT volume this reader accepts (see the PART mbr-raw census \
+                             above) — no root directory was searched"
+                        }
+                    },
                 );
                 crate::fs::sdhc4c::tally();
             }
@@ -3615,6 +3643,98 @@ const SDHC4C_RECORD_BYTES: usize = SECTOR_SIZE;
 
 #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
 impl FatFs {
+    /// SDHC-4c: ONE bounded line saying which volume the reserve pass searched and what its root
+    /// walk actually saw. Printed only on the not-found / lookup-failed path, so a healthy boot pays
+    /// nothing and a refusal is self-explanatory in the capture without a second boot.
+    ///
+    /// Three facts the bare `NotFound` could not carry, each of which has cost a boot:
+    ///   * **volume identity** — kind, extent, label and `BS_VolID`. The internal SDHCI slot and the
+    ///     medium this kernel booted from are separate block handles; a refusal that does not name
+    ///     the volume cannot distinguish "the host staged nothing" from "the host staged onto the
+    ///     other device".
+    ///   * **read failure vs genuine absence** — the walk's `Result` is reported verbatim. A
+    ///     truncated or failed sector read stops a walk early and is NOT evidence of absence.
+    ///   * **where the walk stopped** — the 0x00 end-of-directory slot index, or `none` if the walk
+    ///     ran off the end of the chain. A terminator at slot 0 means an empty (or unreadable-as-
+    ///     directory) root, which reads very differently from a terminator after 200 entries.
+    ///
+    /// Bounded by construction: at most `WITNESS_NAMES` short names are rendered, counters are
+    /// `u32`, and the whole thing is one line issued at most once per boot (the reserve pass is a
+    /// one-shot). It re-walks the root rather than instrumenting `locate_in_dir_sectors`, so the
+    /// hot lookup path every path resolution runs stays exactly as it was.
+    fn sdhc4c_root_witness(&self, name: &str) {
+        /// How many short names the line carries. Eight is what fits alongside the identity fields
+        /// without wrapping the FTDI ring's useful width, and is enough to recognise a staging set.
+        const WITNESS_NAMES: u32 = 8;
+
+        let start = match self.kind {
+            FatKind::Fat32 => Some(self.root_cluster),
+            FatKind::Fat16 => None,
+        };
+        let mut sectors = 0u32;
+        let mut slots = 0u32;
+        let mut entries = 0u32;
+        let mut shown = 0u32;
+        let mut term: Option<u32> = None;
+        let mut names = String::new();
+
+        let walk = self.walk_dir_sectors(start, |_lba, sec| {
+            sectors += 1;
+            for i in 0..(SECTOR_SIZE / 32) {
+                match classify_dir_slot(&sec[i * 32..i * 32 + 32]) {
+                    DirSlot::End => {
+                        term = Some(slots);
+                        return true;
+                    }
+                    DirSlot::Skip => slots += 1,
+                    DirSlot::Entry(de) => {
+                        slots += 1;
+                        entries += 1;
+                        if shown < WITNESS_NAMES {
+                            if shown > 0 {
+                                names.push(' ');
+                            }
+                            names.push_str(de.short_name());
+                            shown += 1;
+                        }
+                    }
+                }
+            }
+            false
+        });
+
+        let label = self.label();
+        serial_println!(
+            ":: SDHC4C-ROOT: NAME={} not matched on vol=FAT{}@LBA{} volsec={} label={} \
+             serial=0x{:08x} | walk: read={} sectors={} slots={} entries={} terminator={} | \
+             first{}: {} ::",
+            name,
+            match self.kind {
+                FatKind::Fat16 => 16,
+                FatKind::Fat32 => 32,
+            },
+            self.part_lba,
+            self.vol_sectors,
+            if label.is_empty() { "-" } else { label.as_str() },
+            self.vol_id,
+            match walk {
+                Ok(()) => String::from("OK"),
+                // A failed walk means the counters below are a PREFIX, not a census — say so in the
+                // same field that carries the error, so the two can never be read apart.
+                Err(e) => alloc::format!("FAILED({:?})-counts-are-a-PREFIX", e),
+            },
+            sectors,
+            slots,
+            entries,
+            match term {
+                Some(at) => alloc::format!("slot#{}", at),
+                None => String::from("none(ran-off-the-end)"),
+            },
+            shown,
+            if names.is_empty() { "(none)" } else { names.as_str() },
+        );
+    }
+
     /// SDHC-4c step 1+2: ADOPT the host-staged reservation and publish its LBA extent, or refuse.
     ///
     /// Returns the `(first_cluster, sectors)` of the armed extent on success. Every `return` before
@@ -3634,10 +3754,18 @@ impl FatFs {
         let de = match self.find_located(NAME) {
             Ok((de, _lba, _slot)) => de,
             Err(FatError::NotFound) => {
+                // SDHC4C-ROOT: "not found" alone cannot say WHICH volume was searched, and on this
+                // machine that is the whole question — the internal SDHCI slot and the boot medium
+                // are two different devices, and the host stages onto one of them. Name the volume
+                // and what the walk saw before refusing. Boot AR (2026-08-08) refused here while
+                // the staged file sat on the boot volume: the Sdhc handle held a 29 MiB FAT16 card
+                // (11 entries, no UNALOG.BIN) and the 59.5 GB FAT32 card was mounted on `Default`.
+                self.sdhc4c_root_witness(NAME);
                 permit::disarm(
                     NAME,
-                    "absent from the card's root directory — the HOST stages this file; the kernel \
-                     never creates it, because a create is a directory mutation",
+                    "absent from the root directory of the volume mounted on the internal SD card \
+                     (identified on the SDHC4C-ROOT line above) — the HOST stages this file; the \
+                     kernel never creates it, because a create is a directory mutation",
                 );
                 return None;
             }
@@ -3645,7 +3773,12 @@ impl FatFs {
                 serial_println!(
                     ":: SDHC4C: reserve NAME={} lookup failed ({:?}) ::", NAME, e
                 );
-                permit::disarm(NAME, "root-directory lookup failed");
+                self.sdhc4c_root_witness(NAME);
+                permit::disarm(
+                    NAME,
+                    "root-directory lookup FAILED — this is a read/geometry failure, NOT evidence \
+                     that the file is absent (SDHC4C-ROOT above says where the walk stopped)",
+                );
                 return None;
             }
         };
