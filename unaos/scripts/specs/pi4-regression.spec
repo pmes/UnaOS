@@ -887,8 +887,14 @@ FORBID \[spread2\] .* ratio ([5-9][0-9]{2}|[0-9]{4,})
 # with the settle read-back asserted `noproc-selftest` — the leg that fails if a close resolves to
 # the wrong row or the discriminator regresses. The line is the whole CLICK-ROUTE suite's verdict,
 # so pinning it here also pins legs 1-9 (`-> PASS` at the tail).
+#
+# CRISPYWIRE-REVIEW adds leg 11 to the SAME line rather than a new REQUIRE, because it is the same
+# verdict: `corner=true` is the two ROUNDED TOP CORNERS routing as desktop — the pixels the painter
+# fills `DESKTOP_BG` are owned by no window, so a press on one reaches the shell instead of raising
+# the window it visibly is not on. It failed before that pass and it is pinned here so it cannot
+# silently return to `skip`.
 # See docs/dev/OS/08_VIDEO/engine.md CLOSE-BOX.
-REQUIRE \[clickroute\] hit-test at .*close=true closereal=true -> PASS
+REQUIRE \[clickroute\] hit-test at .*corner=true close=true closereal=true -> PASS
 
 # CLOSE-FIX (P82) — the wire DISCRIMINATOR. The bench read `close=win3 asid=3085 settle=noproc`
 # and could not tell the selftest's synthetic no-op from a real click whose ASID-scoped kill found

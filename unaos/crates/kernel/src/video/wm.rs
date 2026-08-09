@@ -104,6 +104,40 @@ pub const TITLE_H: usize = super::theme::TITLE_HEIGHT;
 /// between them. See [`paint_window`] for the layering.
 pub const BORDER: usize = super::theme::FRAME;
 
+/// The bitmap font's cell edge, in source pixels. A property of `font8x8`, not of the kit — the kit
+/// has no glyph-cell metric because it assumes a rasterizer. Named rather than spelled `8` at each
+/// use so [`TITLE_CELL`]'s derivation below reads as arithmetic instead of as two magic numbers.
+const FONT_CELL: usize = 8;
+
+/// CRISPYWIRE-REVIEW — the integer scale the 8-px font cell is drawn at so the caption lands as
+/// close to the kit's `metrics.text_px` as a BITMAP font can get.
+///
+/// The kit asks for 15 px of text. `font8x8` has one size, so the only honest freedom is an integer
+/// replication factor, and the nearest one is `round(TEXT_PX / FONT_CELL)` — written in integer
+/// arithmetic as `(TEXT_PX + FONT_CELL/2) / FONT_CELL`, floored at 1 so a small future `text_px`
+/// cannot erase the caption. At the kit's `15` that is `(15 + 4) / 8 = 2`, i.e. **16 px drawn for 15
+/// px asked**. Reaching 15 exactly needs a rasterizer the kernel does not have; the derivation is
+/// here, in code, so a kit change moves the caption instead of leaving a bare `2` behind.
+pub const TITLE_SCALE: usize = {
+    let s = (super::theme::TEXT_PX + FONT_CELL / 2) / FONT_CELL;
+    if s < 1 { 1 } else { s }
+};
+
+/// The drawn width (and height) of one caption glyph, in panel pixels — the unit both the caption
+/// painter's width budget and [`controls`]'s decline threshold are counted in.
+pub const TITLE_CELL: usize = FONT_CELL * TITLE_SCALE;
+
+/// CRISPYWIRE-REVIEW — the strip width the three-disc control cluster RESERVES, measured from the
+/// inner edge of the right frame: the cluster itself (`3 * CONTROL_BOX` at a `GAP` pitch = two
+/// inter-disc gaps), plus the `GAP` that insets it from the frame, plus the `GAP` that separates it
+/// from the caption. `3*12 + 2*12 + 2*12 = 84` at the kit's numbers.
+///
+/// ONE definition, two consumers: [`controls`] subtracts it to decide whether a strip is wide enough
+/// to carry a cluster AND a caption glyph, and [`paint_window`] subtracts it from the caption's width
+/// budget. They were separate copies, and they disagreed by one `GAP` — the threshold admitted strips
+/// the painter then gave a zero-glyph budget.
+const CTRL_RESERVE: usize = 3 * super::theme::CONTROL_BOX + 4 * GAP;
+
 /// A window identifier. Ids are `1..=MAX_WINDOWS`; `0` is never a valid window and is the
 /// fail-closed return for every operation that could not be satisfied.
 pub type WinId = u32;
@@ -1442,6 +1476,15 @@ pub fn hit_test(x: i32, y: i32) -> Option<(WinId, u64, u32)> {
         // Saturating adds mirror `outer_box`'s own saturation: an absurd box clips, it never wraps
         // into a small one that would silently stop being hittable.
         if px < bx || py < by || px >= bx.saturating_add(bw) || py >= by.saturating_add(bh) {
+            continue;
+        }
+        // CRISPYWIRE-REVIEW — the outer box is a RECTANGLE and the window is not: Crispy's head is
+        // rounded, and the pixels the painter cut out of the two top corners are filled with the
+        // DESKTOP. A window may not own a pixel it draws the desktop on, or a press on a corner
+        // would raise and focus a window the operator can see is not there. Falling THROUGH (rather
+        // than returning) is the point: a window stacked underneath still gets the click, exactly as
+        // the corner shows it.
+        if outside_top_corner(r, px, py) {
             continue;
         }
         match best {
@@ -6908,6 +6951,49 @@ fn in_circle(px: usize, py: usize, bx: usize, by: usize, d: usize) -> bool {
     dx * dx + dy * dy <= (d as i64) * (d as i64)
 }
 
+/// CRISPYWIRE-REVIEW — is panel point `(px, py)` on one of `r`'s two ROUNDED TOP CORNERS, i.e. on a
+/// pixel [`paint_window`] fills with the DESKTOP rather than with chrome?
+///
+/// ### Why this exists
+/// CRISPYWIRE rounded the head but left the routing square. The painter cut ~31 px out of each top
+/// corner and filled them `DESKTOP_BG`, while [`hit_test`] and [`chrome_hit`] went on testing the
+/// rectangular [`outer_box`] — so those pixels LOOKED like desktop and BEHAVED like window: a press
+/// on one raised and focused the window instead of reaching the shell. This is the predicate that
+/// closes the gap, and it is the SAME arithmetic the painter runs, not a second copy of it.
+///
+/// ### Why it agrees with the painter by construction
+/// The painter walks `j` in `0..rad` and, for each row, finds `first` = the smallest block column
+/// `i` with `!corner_outside(i, j, rad)`, then fills `[0, first)` from the left edge and the mirror
+/// span from the right. [`corner_outside`] is monotone in `i` (`dx` shrinks as `i` grows), so that
+/// filled span is exactly `{ i : corner_outside(i, j, rad) }` — which is what this asks, once per
+/// point, for whichever of the two corners the point falls in. The keyline pixel at `first` is NOT
+/// in the set, and it is chrome in both senses.
+///
+/// `rad` is derived here as the painter derives it, from the same [`outer_box`]. The painter's own
+/// `bw`/`bh` are PANEL-CLIPPED (see the note in [`draw_window`]), so for a window wider or taller
+/// than the panel the two radii can differ; every window `place` and `move_to` produce is fully
+/// on-panel, and a clipped corner is off-panel anyway, so no click can land in the difference.
+fn outside_top_corner(r: &Window, px: usize, py: usize) -> bool {
+    if r.compat {
+        return false; // no chrome, no corners
+    }
+    let (bx, by, bw, bh) = outer_box(r);
+    let rad = super::theme::CORNER_RADIUS.min(bw / 2).min(bh / 2);
+    if rad == 0 || py < by || py >= by.saturating_add(rad) {
+        return false;
+    }
+    let j = py - by;
+    // `rad <= bw / 2`, so the two corner blocks cannot overlap and neither subtraction can wrap.
+    let i = if px >= bx && px < bx + rad {
+        px - bx
+    } else if px >= bx + bw - rad && px < bx + bw {
+        bx + bw - 1 - px // the right corner is the left one mirrored, as the painter fills it
+    } else {
+        return false;
+    };
+    corner_outside(i, j, rad)
+}
+
 /// The outer box `(x, y, w, h)` a window occupies on the panel, chrome included. A compat window
 /// (the `present_surface` shim) has no chrome, so its outer box is exactly its content.
 /// F5 — every product and sum here saturates. The kernel builds with overflow checks off, so a
@@ -6962,11 +7048,9 @@ fn damaged_box(r: &Window, band: Option<(usize, usize)>) -> (usize, usize, usize
 /// close box's panel rect as `(x, y, side)`, or `None` for a row that has no close box.
 ///
 /// ### Geometry — one function, two consumers
-/// A [`TITLE_H`]-sided square at the RIGHT end of the title strip, flush against the inner edge of
-/// the border: `x = bx + bw - BORDER - side`, `y = by + BORDER`. Derived from the outer box so the
-/// drawn box and the hit-tested box are the same rect BY CONSTRUCTION — [`paint_window`] draws this
-/// rect and [`close_box_hit`] tests it, and there is deliberately no second copy of the arithmetic
-/// for the two to disagree over.
+/// [`controls`] is the single source: it lays the cluster out, and [`in_circle`] is the one predicate
+/// both the painter and [`close_box_hit`] test inside it. There is deliberately no second copy of the
+/// arithmetic for the drawn control and the clickable control to disagree over.
 ///
 /// ### Who gets one
 /// * **Compat rows: no.** The `present_surface` shim has no chrome at all — there is no strip to
@@ -6984,6 +7068,17 @@ fn damaged_box(r: &Window, band: Option<(usize, usize)>) -> (usize, usize, usize
 /// arithmetic, and [`in_circle`] — not a rect test — is what both the painter and
 /// [`close_box_hit`] use inside that box, so the drawn disc and the clickable disc are the same
 /// pixels. `TITLE_H`-sided square, gone.
+///
+/// ### CRISPYWIRE-REVIEW — and the rounded corners are DESKTOP, in both senses
+/// The two top corners the painter cuts are not a chrome role and they are not an invented colour.
+/// They are **transparency to the desktop**: those pixels show whatever the desktop surface is —
+/// today the interim `DESKTOP_BG` placeholder, later the approved lake scene (white-board A1) — so
+/// the colour there is the DESKTOP's problem to answer, not a gap in the kit's chrome palette. The
+/// kit is not missing a "window corner" role; there is nothing for it to be missing.
+///
+/// That framing is only honest if the routing agrees, and it does: [`outside_top_corner`] takes the
+/// same pixels out of [`hit_test`], [`chrome_hit`] and [`title_bar_hit`], so a press on a corner
+/// reaches the shell exactly as the pixel shows. Drawn desktop, clicked desktop.
 fn close_box(r: &Window) -> Option<(usize, usize, usize)> {
     controls(r).map(|(cx, cy, d)| (cx, cy, d))
 }
@@ -6996,9 +7091,25 @@ fn close_box(r: &Window) -> Option<(usize, usize, usize)> {
 ///
 /// Every number here is a metric: [`BORDER`] is `theme::FRAME`, [`GAP`] is `theme::GAP`, the
 /// diameter is `theme::CONTROL_BOX`, and the vertical centring is against [`TITLE_H`] =
-/// `theme::TITLE_HEIGHT`. The single non-theme literal is `8`, the font cell's width — that is a
-/// property of `font8x8`, not of the kit, and it appears only in the "is there room for a caption
-/// at all" test.
+/// `theme::TITLE_HEIGHT`. The single non-theme quantity is [`TITLE_CELL`], the drawn size of one
+/// caption glyph — a property of `font8x8` scaled to `theme::TEXT_PX`, not of the kit — and it
+/// appears only in the "is there room for a caption at all" test.
+///
+/// ### CRISPYWIRE-REVIEW — the threshold now equals the painter's own budget
+/// It did not. The decline test counted the cluster's insetting `GAP` once where [`paint_window`]
+/// counted it twice, so it was one `GAP` (12 px) LOW: a strip could clear the threshold, get a
+/// control cluster drawn, and then be handed a caption budget with no room in it. Both sides now
+/// subtract [`CTRL_RESERVE`], and the decline is exactly *"after the frame, the caption's left inset
+/// and everything the cluster reserves, is one whole glyph left?"*:
+///
+/// ```text
+/// 2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL
+///   = 2*5    + 12  + 84           + 16        = 122 px
+/// ```
+///
+/// against the 102 the arithmetic used to produce (and the 106 the painter actually needed before a
+/// glyph was even asked for). The glyph term doubled with the caption's `TEXT_PX` scale, which is
+/// the other half of why the number moved.
 fn controls(r: &Window) -> Option<(usize, usize, usize)> {
     if r.compat || r.owner_asid == 0 {
         return None;
@@ -7008,7 +7119,7 @@ fn controls(r: &Window) -> Option<(usize, usize, usize)> {
     // Cluster: three discs at a `GAP` pitch, one `GAP` clear of the right frame, and enough strip
     // left over for one glyph of caption plus its own `GAP`. Anything narrower declines.
     let cluster = 3 * d + 2 * GAP;
-    if bw < 2 * BORDER + GAP + cluster + GAP + 8 {
+    if bw < 2 * BORDER + GAP + CTRL_RESERVE + TITLE_CELL {
         return None;
     }
     let right = bx + bw - BORDER - GAP;
@@ -7084,6 +7195,12 @@ fn in_box(px: usize, py: usize, b: (usize, usize, usize, usize)) -> bool {
 /// `content_box` are the same rect there (the `present_surface` shim draws no chrome), so the
 /// difference is empty and a full-screen app keeps every pixel of its own panel — which is the
 /// half of the rule that stops the WM locking a full-screen app out of its clicks.
+///
+/// CRISPYWIRE-REVIEW — and "outer minus content" is a rectangle minus a rectangle, while the drawn
+/// silhouette has two ROUNDED top corners. The corner cut-outs are painted desktop, so they are not
+/// this window's chrome and [`outside_top_corner`] takes them back out — the same predicate, and the
+/// same arithmetic, the painter cut them with. Without this the partition claimed pixels the window
+/// does not draw.
 pub fn chrome_hit(id: WinId, x: i32, y: i32) -> bool {
     if x < 0 || y < 0 {
         return false;
@@ -7091,7 +7208,11 @@ pub fn chrome_hit(id: WinId, x: i32, y: i32) -> bool {
     let (px, py) = (x as usize, y as usize);
     let t = table();
     match row(&t, id) {
-        Some(r) if !r.compat => in_box(px, py, outer_box(r)) && !in_box(px, py, content_box(r)),
+        Some(r) if !r.compat => {
+            in_box(px, py, outer_box(r))
+                && !in_box(px, py, content_box(r))
+                && !outside_top_corner(r, px, py)
+        }
         _ => false,
     }
 }
@@ -7128,6 +7249,13 @@ pub fn title_bar_hit(id: WinId, x: i32, y: i32) -> bool {
         TITLE_H,
     );
     if !in_box(px, py, strip) {
+        return false;
+    }
+    // CRISPYWIRE-REVIEW — the strip's rect reaches into the two rounded corners (the frame is 5 px
+    // and the radius 12), and those pixels are painted desktop. `hit_test` already declines them, so
+    // the router cannot arrive here with one; this keeps the DRAG HANDLE honest for any caller that
+    // asks directly, so a grab can never begin on a pixel that shows the desktop.
+    if outside_top_corner(r, px, py) {
         return false;
     }
     match close_box(r) {
@@ -7778,6 +7906,22 @@ fn draw_window(
     // claiming 10000x10000 would spin ~1e8 clipped pokes per present, from syscall context.
     let bw = bw.min(pw - bx);
     let bh = bh.min(ph - by);
+    // CRISPYWIRE-REVIEW — a note on what this clip means for the chrome that `paint_window` draws
+    // from `bw`/`bh` rather than from the row.
+    //
+    // The control discs come from `controls(r)`, which reads `outer_box` and is therefore in TRUE
+    // panel coordinates — the clip does not move them. The KEYLINE's right edge, the BEVEL's right
+    // edge and the RIGHT ROUNDED CORNER are all keyed off the clipped `bw`, so for a window wider
+    // than the panel they would be drawn at the panel's edge — mid-window — rather than at the
+    // window's own right edge, which does not exist on screen.
+    //
+    // Unreachable for any window the compositor produces: `place` sizes every box to fit and
+    // `move_to` clamps the origin so the whole outer box stays on-panel, so `bw`/`bh` are the true
+    // dimensions for every normally-placed window and this is the identity. Recorded because the
+    // clip is a SAFETY bound (it exists so a nonsense row cannot spin ~1e8 clipped pokes), not a
+    // layout decision, and the two are easy to confuse when reading `paint_window`. The right fix,
+    // if a window ever does exceed the panel, is to pass the unclipped extent alongside the clipped
+    // one and key the edge chrome off the former — not to widen this clip.
 
     // WC-H — compose off-screen and present the box as contiguous rows. Returns false when the
     // back-layer is unavailable (compat row, over-cap geometry, another core holding it, or the
@@ -8095,30 +8239,38 @@ fn paint_window(
         // pixels that are not face.
         let bev = super::theme::BEVEL;
         let kl = super::theme::FRAME_LINE;
-        // Keyline: four 1-px edges of the outer box.
-        fill_rect_v(dst, lbx, lby, bw, 1, kl);
-        fill_rect_v(dst, lbx, lby + bh as isize - 1, bw, 1, kl);
-        fill_rect_v(dst, lbx, lby, 1, bh, kl);
-        fill_rect_v(dst, lbx + bw.saturating_sub(1), lby, 1, bh, kl);
+        // CRISPYWIRE-REVIEW — the keyline's THICKNESS is `theme::BEVEL` too, not a literal `1`.
+        // `metrics.bevel` is the kit's hairline metric ("iteration 3 makes the bevel a true
+        // hairline"), and the keyline is the frame's other hairline; there is no second metric in
+        // the table for it, and a bare `1` here would be a compositor number sitting in a wired
+        // path. Identical output at the kit's `bevel = 1`, and it moves with the kit if that
+        // changes. The bevel's own inset is `kw` for the same reason: it is drawn *inside* the
+        // keyline, so the offset is the keyline's width, not the number one.
+        let kw = bev;
+        // Keyline: four `kw`-thick edges of the outer box.
+        fill_rect_v(dst, lbx, lby, bw, kw, kl);
+        fill_rect_v(dst, lbx, lby + bh as isize - kw as isize, bw, kw, kl);
+        fill_rect_v(dst, lbx, lby, kw, bh, kl);
+        fill_rect_v(dst, lbx + bw.saturating_sub(kw), lby, kw, bh, kl);
         // Bevel, inside the keyline. `theme::BEVEL < theme::FRAME` is a const-assert, so these can
         // never reach the strip.
         let (bl, bs) = (super::theme::BEVEL_LIGHT, super::theme::BEVEL_SHADOW);
-        fill_rect_v(dst, lbx + 1, lby + 1, bw.saturating_sub(2), bev, bl);
-        fill_rect_v(dst, lbx + 1, lby + 1, bev, bh.saturating_sub(2), bl);
+        fill_rect_v(dst, lbx + kw, lby + kw as isize, bw.saturating_sub(2 * kw), bev, bl);
+        fill_rect_v(dst, lbx + kw, lby + kw as isize, bev, bh.saturating_sub(2 * kw), bl);
         fill_rect_v(
             dst,
-            lbx + 1,
-            lby + bh as isize - 1 - bev as isize,
-            bw.saturating_sub(2),
+            lbx + kw,
+            lby + bh as isize - kw as isize - bev as isize,
+            bw.saturating_sub(2 * kw),
             bev,
             bs,
         );
         fill_rect_v(
             dst,
-            lbx + bw.saturating_sub(1 + bev),
-            lby + 1,
+            lbx + bw.saturating_sub(kw + bev),
+            lby + kw as isize,
             bev,
-            bh.saturating_sub(2),
+            bh.saturating_sub(2 * kw),
             bs,
         );
         // CRISPYWIRE — `theme::CORNER_RADIUS`, on the two TOP corners (the kit says top; the
@@ -8126,14 +8278,27 @@ fn paint_window(
         // keyline is re-laid ALONG the arc, so the silhouette actually reads as rounded rather
         // than as a rounded outline on a square block.
         //
-        // ⚠ **The one honest limit.** These pixels are painted desktop, not sampled from what is
+        // CRISPYWIRE-REVIEW — **the corner is the DESKTOP's, not a chrome role.** `DESKTOP_BG`
+        // appearing inside a window's silhouette is not this path inventing a colour: these pixels
+        // are transparency to the desktop, and they show whatever the desktop surface happens to be
+        // — today the interim `DESKTOP_BG` placeholder, later the approved lake scene (white-board
+        // A1). What colour belongs there is the desktop's question to answer; the kit is not missing
+        // a chrome role for it. `outside_top_corner` takes exactly these pixels out of `hit_test`,
+        // `chrome_hit` and `title_bar_hit`, so a press on one reaches the shell — drawn desktop and
+        // clicked desktop are the same set.
+        //
+        // ⚠ **The one honest limit.** They are painted desktop rather than SAMPLED from what is
         // underneath, because there is nothing underneath to sample: WC-H's invariant is that this
         // pass writes every pixel of the clipped box (the staged back layer carries the previous
         // window's residue otherwise), so a corner cannot simply be left unwritten. Where a window
         // overlaps another window, each top corner shows ~31 px of desktop instead of the window
         // below. Tiled windows — every window `place` lays out — never overlap, so this is visible
         // only after a manual drag stacks two windows. Recorded rather than hidden: fixing it needs
-        // an under-sample the compositor does not have today.
+        // an under-sample the compositor does not have today. (Routing does NOT have that limit:
+        // `hit_test` falls through to the window underneath, so the click is already correct.)
+        //
+        // The arc keyline below is one pixel per row by construction — it is the boundary of the
+        // filled span, not a rect edge, so it has no thickness to take from `kw`.
         let rad = super::theme::CORNER_RADIUS.min(bw / 2).min(bh / 2);
         for j in 0..rad {
             let dy = lby + j as isize;
@@ -8184,22 +8349,31 @@ fn paint_window(
                         }
                     }
                 }
-                // The caption's width budget: the whole cluster plus the `GAP` that separates it
-                // from the text, so a long title truncates BESIDE the controls, never under them.
-                3 * d + 2 * GAP + 2 * GAP
+                // The caption's width budget: everything the cluster reserves — itself, the `GAP`
+                // that insets it from the frame and the `GAP` that separates it from the text — so
+                // a long title truncates BESIDE the controls, never under them. CRISPYWIRE-REVIEW:
+                // this is `CTRL_RESERVE`, the same constant `controls` declines against, instead of
+                // a second copy of the sum that disagreed with it by one `GAP`.
+                CTRL_RESERVE
             }
             None => 0,
         };
         // CRISPYWIRE — the caption: inset one `GAP` from the frame, vertically centred in the
-        // strip against the 8-px font cell, and inked with the kit's focused/unfocused title text
-        // role.
+        // strip, and inked with the kit's focused/unfocused title text role.
+        //
+        // CRISPYWIRE-REVIEW — drawn at `TITLE_SCALE`, so the caption honours `metrics.text_px`
+        // (15 px asked, 16 px drawn — the nearest integer scale of the 8-px bitmap cell; see
+        // `TITLE_SCALE` for the derivation and for why exact 15 needs a rasterizer). The centring
+        // is against the SCALED cell height, and the width budget is counted in scaled glyphs by
+        // `draw_title` itself, so both moved with it.
         draw_title(
             dst,
             r,
             lbx + BORDER + GAP,
-            lby + BORDER as isize + (TITLE_H.saturating_sub(8) / 2) as isize,
+            lby + BORDER as isize + (TITLE_H.saturating_sub(TITLE_CELL) / 2) as isize,
             bw.saturating_sub(2 * BORDER + GAP + ctrl_w),
             title_ink(focused),
+            TITLE_SCALE,
         );
     }
 
@@ -8856,6 +9030,11 @@ fn stage_fill(
 /// CRISPYWIRE — the ink is a PARAMETER, not a constant: Crispy carries two title-text roles
 /// (`title_text_active` / `title_text_inactive`) and the caller resolves which through
 /// [`title_ink`]. WC-A's single `CHROME_TITLE_FG` is gone.
+///
+/// CRISPYWIRE-REVIEW — and the cell is drawn at `scale`, a nearest-integer replication of the 8-px
+/// bitmap toward the kit's `metrics.text_px` (see [`TITLE_SCALE`]). `max_w` stays in PANEL pixels
+/// and the column count divides by the SCALED cell, so a caller's budget means the same thing at
+/// every scale. `scale = 1` is byte-for-byte the pre-review loop.
 fn draw_title(
     fb: &super::FrameBuffer,
     r: &Window,
@@ -8863,8 +9042,11 @@ fn draw_title(
     y: isize,
     max_w: usize,
     ink: u32,
+    scale: usize,
 ) {
-    let cols = max_w / 8;
+    let scale = scale.max(1); // a zero scale would draw nothing and divide by zero below
+    let cell = FONT_CELL * scale;
+    let cols = max_w / cell;
     for (i, &b) in r.title[..r.title_len].iter().enumerate() {
         if i >= cols {
             break;
@@ -8872,13 +9054,19 @@ fn draw_title(
         let ch = if (0x20..0x7f).contains(&b) { b } else { b' ' };
         let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
         for (ry, byte) in bitmap.iter().enumerate() {
-            let dy = y + ry as isize;
-            if dy < 0 {
-                continue;
-            }
-            for rx in 0..8 {
-                if byte & (1 << rx) != 0 {
-                    fb.put_pixel(x + i * 8 + rx, dy as usize, ink);
+            // WC-M's clip, per SCALED row: each source row of the glyph now occupies `scale`
+            // destination rows, and each is dropped independently if it lands above the band.
+            for sy in 0..scale {
+                let dy = y + (ry * scale + sy) as isize;
+                if dy < 0 {
+                    continue;
+                }
+                for rx in 0..FONT_CELL {
+                    if byte & (1 << rx) != 0 {
+                        for sx in 0..scale {
+                            fb.put_pixel(x + i * cell + rx * scale + sx, dy as usize, ink);
+                        }
+                    }
                 }
             }
         }
@@ -9706,11 +9894,18 @@ fn reclaim(vacated: &[(usize, usize, usize, usize)]) {
 /// not the panel, so the colours carry no verdict and there is no reason to have two.
 #[cfg(feature = "witness")]
 ///
-/// CRISPYWIRE — 96x8 (768 words), not 8x8. Leg 10 closes `wa` THROUGH THE ROUTER, so `wa` must be a
-/// row whose title strip can actually hold Crispy's control cluster; an 8-px surface cannot at any
+/// CRISPYWIRE — 128x8 (1024 words), not 8x8. Leg 10 closes `wa` THROUGH THE ROUTER, so `wa` must be
+/// a row whose title strip can actually hold Crispy's control cluster; an 8-px surface cannot at any
 /// scale the tiler picks, and the leg would report SKIP forever. `wb` is widened with it so the two
 /// stay the identical stacked pair legs 1-5 assert against.
-static HT_SURF: [u32; 768] = [0x0020_C080; 768];
+///
+/// CRISPYWIRE-REVIEW — 96 px became 128. `controls`'s floor rose from 102 to **122 px** (the decline
+/// test was one `GAP` short of the painter's budget, and the caption glyph doubled with
+/// `metrics.text_px`), and 96 px gives `bw = 96*scale + 10` = 106 at scale 1 — under it. 128 gives
+/// 138, which restores "clears at scale 1 and therefore at every scale". `place_scale` picks 2 or
+/// more at both gate geometries, so this is margin rather than a live fix; margin is what the
+/// original sizing was for.
+static HT_SURF: [u32; 1024] = [0x0020_C080; 1024];
 
 /// CLICK-ROUTE — the HIT-TEST witness: does [`hit_test`] name the window an operator would say they
 /// clicked on?
@@ -10037,11 +10232,12 @@ fn closebox_leg(owner: u64, surf: usize, len: usize) -> Option<bool> {
     if cx < 96 || cy < 96 || cx + 96 >= pw || cy + 96 >= ph {
         return None;
     }
-    // CRISPYWIRE — 96 source px wide, not 8. `wm::controls` declines a strip too narrow to hold
+    // CRISPYWIRE — 128 source px wide, not 8. `wm::controls` declines a strip too narrow to hold
     // the three-disc cluster and a caption, and an 8-px surface is under that at every scale the
-    // tiler picks (8*4 + 10 = 42 against a 102-px floor) — this leg would have reported SKIP for
-    // the rest of time. 96 clears it at scale 1 and therefore at all of them.
-    let w = create(owner, surf, len, 96, 8, 384, b"ht-x");
+    // tiler picks (8*4 + 10 = 42 against the floor) — this leg would have reported SKIP for the
+    // rest of time. CRISPYWIRE-REVIEW: the floor is now 122 px, so the width went 96 -> 128 to keep
+    // clearing it at scale 1 (`128 + 10 = 138`) and therefore at all of them. See `HT_SURF`.
+    let w = create(owner, surf, len, 128, 8, 512, b"ht-x");
     if w == WIN_NONE {
         return None;
     }
@@ -10145,6 +10341,50 @@ fn closebox_real_leg(w: WinId, owner: u64) -> Option<bool> {
     Some(consumed && gone && settle_ok && refocused)
 }
 
+/// CRISPYWIRE-REVIEW leg 11 — **the rounded corner routes as DESKTOP.** The one leg that would have
+/// failed before this pass: CRISPYWIRE rounded the head and left `hit_test` testing the rectangular
+/// outer box, so ~31 px per corner drew desktop and clicked window.
+///
+/// Two claims and a control, all against the SHIPPING geometry (`outer_box` + `corner_outside`),
+/// never a re-derived constant — HITTEST-GEOM's lesson, which this battery has already been taught
+/// twice:
+///
+///  * the box's top-LEFT pixel and its top-RIGHT pixel are owned by NEITHER probe row, and
+///    [`chrome_hit`] declines both for both rows;
+///  * the control — one radius in along the same row, past the arc — IS owned by a probe row and
+///    IS chrome. Without it the leg would pass on a `hit_test` that had simply stopped working.
+///
+/// `None` (a reported `skip`, not a silent pass) when the kit's radius is too small to cut the
+/// corner pixel at all: `corner_outside(0, 0, rad)` is false for `rad = 1`, and a leg that probes a
+/// pixel the painter never removed is asserting nothing. At the kit's `corner_radius = 12` it holds.
+#[cfg(feature = "witness")]
+fn corner_leg(wa: WinId, wb: WinId) -> Option<bool> {
+    let (bx, by, bw, rad) = {
+        let t = table();
+        let r = row(&t, wb)?;
+        let (bx, by, bw, bh) = outer_box(r);
+        let rad = super::theme::CORNER_RADIUS.min(bw / 2).min(bh / 2);
+        (bx, by, bw, rad)
+    };
+    // The table lock is released above: `hit_test` and `chrome_hit` take it themselves.
+    if rad == 0 || bw < 2 * rad || !corner_outside(0, 0, rad) {
+        return None;
+    }
+    let ours = |p: Option<(WinId, u64, u32)>| p.map(|(id, _, _)| id == wa || id == wb) == Some(true);
+    let (lx, rx, ty) = ((bx as i32), ((bx + bw - 1) as i32), (by as i32));
+    // Claim: both top corner pixels are desktop, to the router and to the chrome partition alike.
+    let corners_free = !ours(hit_test(lx, ty))
+        && !ours(hit_test(rx, ty))
+        && !chrome_hit(wa, lx, ty)
+        && !chrome_hit(wb, lx, ty)
+        && !chrome_hit(wa, rx, ty)
+        && !chrome_hit(wb, rx, ty);
+    // Control: one radius in, the same row is ordinary chrome and a probe row owns it.
+    let (kx, ky) = ((bx + rad) as i32, ty);
+    let edge_chrome = ours(hit_test(kx, ky)) && chrome_hit(wb, kx, ky);
+    Some(corners_free && edge_chrome)
+}
+
 /// CLOSE-FIX, DORMANT half: no arch router in this build, so leg 10 asserts nothing.
 #[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
 fn closebox_real_leg(_w: WinId, _owner: u64) -> Option<bool> {
@@ -10235,12 +10475,13 @@ pub fn hittest_selftest() {
 
     let s = &raw const HT_SURF as usize;
     let len = core::mem::size_of_val(&HT_SURF);
-    // CRISPYWIRE — 96x8 ARGB8888, stride 384 BYTES (= 96 px). The compositor picks the upscale
+    // CRISPYWIRE — 128x8 ARGB8888, stride 512 BYTES (= 128 px). The compositor picks the upscale
     // itself (`place_scale`), which is the scale `spawn_geometry` answered with. Both rows are the
     // same size and are stacked at the same origin, exactly as before; only the width moved, so
     // that leg 10's router-driven close has a strip wide enough to carry a close control.
-    let wa = create(ASID_A, s, len, 96, 8, 384, b"ht-a");
-    let wb = create(ASID_B, s, len, 96, 8, 384, b"ht-b");
+    // CRISPYWIRE-REVIEW widened it again, 96 -> 128, against the corrected 122-px floor.
+    let wa = create(ASID_A, s, len, 128, 8, 512, b"ht-a");
+    let wb = create(ASID_B, s, len, 128, 8, 512, b"ht-b");
     if wa == WIN_NONE || wb == WIN_NONE {
         serial_println!("[clickroute] hit-test -> SKIP (window table full: a={} b={})", wa, wb);
         close(wa);
@@ -10256,6 +10497,10 @@ pub fn hittest_selftest() {
     let inside = hit_test(ix, iy);
     let inside_ok = inside.is_some();
     let topmost_ok = inside.map(|(_, a, _)| a) == Some(ASID_B);
+    // Leg 11 — CRISPYWIRE-REVIEW. Runs HERE, while both probe rows are up and above the shell and
+    // before leg 3 starts moving focus around: the claim is about GEOMETRY, so the simplest z-state
+    // is the right one to make it in. Asserts nothing about focus and leaves nothing behind.
+    let corner: Option<bool> = corner_leg(wa, wb);
     focus_changed(ASID_A);
     let raise_ok = hit_test(ix, iy).map(|(_, a, _)| a) == Some(ASID_A);
     // Raising A cannot lower anything, so a point unowned before the probes existed is unowned now
@@ -10305,6 +10550,7 @@ pub fn hittest_selftest() {
         && shell != Some(false)
         && bare != Some(false)
         && plain.map(|(a, b, c)| a && b && c) != Some(false)
+        && corner != Some(false)
         && closebox != Some(false)
         && closereal != Some(false);
     let verdict3 = |v: Option<(bool, bool, bool)>, pick: fn((bool, bool, bool)) -> bool| match v {
@@ -10319,7 +10565,7 @@ pub fn hittest_selftest() {
     };
     let (mx, my) = miss_pt.unwrap_or((-1, -1));
     serial_println!(
-        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} close={} closereal={} -> {}",
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} corner={} close={} closereal={} -> {}",
         ix, iy, inside_ok, topmost_ok, raise_ok,
         match outside_ok {
             Some(true) => "true",
@@ -10332,6 +10578,7 @@ pub fn hittest_selftest() {
         verdict3(plain, |t| t.0),
         verdict3(plain, |t| t.1),
         verdict3(plain, |t| t.2),
+        match corner { Some(true) => "true", Some(false) => "false", None => "skip" },
         match closebox { Some(true) => "true", Some(false) => "false", None => "skip" },
         match closereal { Some(true) => "true", Some(false) => "false", None => "skip" },
         if ok { "PASS" } else { "FAIL" }

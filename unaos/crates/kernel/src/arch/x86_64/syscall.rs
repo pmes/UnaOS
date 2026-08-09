@@ -5843,23 +5843,29 @@ pub fn clickroute_selftest() {
     wm::focus_reset();
 }
 
-/// The WMDIRECT probe surface — 96x8 ARGB8888 (stride 384 B, 3072 B total). WIDER than the
+/// The WMDIRECT probe surface — 128x8 ARGB8888 (stride 512 B, 4096 B total). WIDER than the
 /// `clickroute` fixture's 8x8 on purpose: `wm::close_box` DECLINES a title strip too narrow to hold
 /// its control, and an 8-px-wide surface is under that at scale 1 — the close leg would have
 /// silently tested nothing on a small panel.
 ///
 /// CRISPYWIRE — **re-sized against the CRISPY threshold, not left at the old one.** Crispy's title
 /// bar carries a cluster of three `control_box`-diameter discs at a `gap` pitch, so `wm::controls`
-/// now declines a strip narrower than `2*FRAME + GAP + (3*CONTROL_BOX + 2*GAP) + GAP + 8` = 102 px,
-/// against WC-A's 26. A 32-px surface gives `bw = 32*scale + 10`, which is BELOW 102 at scale 1 and
-/// 2 — so the leg would have gone on reporting a skip on any panel whose scale rule landed there,
-/// and the arc would have shipped an untested close control. 96 px clears the threshold at scale 1
-/// (`96 + 10 = 106`) and therefore at every scale.
+/// declines a strip too narrow to hold the cluster and a caption glyph, against WC-A's 26. A 32-px
+/// surface gives `bw = 32*scale + 10`, which is below that at scale 1 and 2 — so the leg would have
+/// gone on reporting a skip on any panel whose scale rule landed there, and the arc would have
+/// shipped an untested close control.
+///
+/// CRISPYWIRE-REVIEW — **and the threshold moved, so this moved with it.** Two corrections raised
+/// it: the decline test had been one `GAP` short of the painter's own budget, and the caption's
+/// glyph doubled to 16 px when it started honouring `metrics.text_px`. The floor is now
+/// `2*FRAME + GAP + CTRL_RESERVE + TITLE_CELL` = `10 + 12 + 84 + 16` = **122 px**, and 96 px gave
+/// `96 + 10 = 106` — under it at scale 1. 128 px restores the invariant the sizing was chosen for:
+/// `128 + 10 = 138` clears 122 at scale 1 and therefore at every scale.
 #[cfg(all(feature = "witness", feature = "wc"))]
 #[repr(align(4))]
-struct WmdSurf([u32; 768]);
+struct WmdSurf([u32; 1024]);
 #[cfg(all(feature = "witness", feature = "wc"))]
-static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; 768]);
+static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; 1024]);
 
 /// WMDIRECT — the DIRECT-MANIPULATION witness: does a press on a window's CHROME reach the window
 /// system, does a press on its CONTENT still reach the app, and does a pointer report actually STEER
@@ -5932,8 +5938,8 @@ pub fn wmdirect_selftest() {
     const OWNER_O: u64 = 4; // slot 3
     let s = &raw const WMD_SURF as usize;
     let len = core::mem::size_of_val(&WMD_SURF);
-    let w = wm::create(OWNER_D, s, len, 96, 8, 384, b"wmd");
-    let wo = wm::create(OWNER_O, s, len, 96, 8, 384, b"wmo");
+    let w = wm::create(OWNER_D, s, len, 128, 8, 512, b"wmd");
+    let wo = wm::create(OWNER_O, s, len, 128, 8, 512, b"wmo");
     if w == wm::WIN_NONE || wo == wm::WIN_NONE {
         serial_println!("[wm-act] direct -> SKIP (window table full: d={} o={})", w, wo);
         wm::close(w);
@@ -6038,7 +6044,7 @@ pub fn wmdirect_selftest() {
     // its no-process arm, and report NOPROC — while `close_owner` still removes the row, which is the
     // "closing the windows was the whole effect" contract.
     CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NONE_X86, Ordering::Release);
-    let wc = wm::create(OWNER_D, s, len, 96, 8, 384, b"wmc");
+    let wc = wm::create(OWNER_D, s, len, 128, 8, 512, b"wmc");
     let close_ok = if wc == wm::WIN_NONE {
         None
     } else {

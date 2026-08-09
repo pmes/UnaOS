@@ -3510,13 +3510,26 @@ gives `top_alpha`, `falloff` and `bottom_alpha` and no curve. This arc commits t
 the strip. The alternative reading (falloff as an exponent) needs a power function for no
 gain the kit asks for.
 
-**Rounded corners, and the one honest limit.** The corner cut-outs are painted
-`DESKTOP_BG`, not sampled from underneath, because there is nothing to sample: WC-H's
-invariant is that the pass writes every pixel of the clipped box, so a corner cannot be
-left unwritten. Where a manual drag stacks two windows the upper one's top corners show
-~31 px of desktop each instead of the window below. Tiled windows never overlap, so this
-is invisible in the ordinary layout. Recorded rather than hidden; fixing it needs an
-under-sample the compositor does not have.
+**Rounded corners: the pixels are the DESKTOP's, not a chrome role.** `DESKTOP_BG`
+appearing inside a window's silhouette is not the chrome path inventing a colour. The two
+top corner cut-outs are **transparency to the desktop** — they show whatever the desktop
+surface is, today the interim `DESKTOP_BG` placeholder and later the approved lake scene
+(white-board A1). What colour belongs there is the DESKTOP's question to answer; the kit is
+not missing a "window corner" role, because there is no such role to miss. CRISPYWIRE-REVIEW
+states this rather than leaving `DESKTOP_BG`-inside-a-window to read as a new chrome use of
+an invented value.
+
+That framing is only honest if the ROUTING agrees, and after CRISPYWIRE-REVIEW it does — see
+"the corners drew desktop and clicked window" below.
+
+**The one honest limit.** The corner pixels are *painted* desktop, not *sampled* from
+underneath, because there is nothing to sample: WC-H's invariant is that the pass writes
+every pixel of the clipped box, so a corner cannot be left unwritten. Where a manual drag
+stacks two windows the upper one's top corners show ~31 px of desktop each instead of the
+window below. Tiled windows never overlap, so this is invisible in the ordinary layout.
+Recorded rather than hidden; fixing it needs an under-sample the compositor does not have.
+(The *routing* has no such limit: `hit_test` falls through to the window underneath, so the
+click is already right even where the pixel is not.)
 
 **Hit-testing follows the drawing, by construction.** `close_box` returns the CLOSE
 disc's bounding box and `in_circle` — not a rect test — is what both the painter and
@@ -3551,12 +3564,66 @@ Three did:
   battery. The x86 `wmdirect` leg had the same duplicated arithmetic and now reads
   `wm::close_box_rect` too.
 * **Three fixture surfaces were too narrow for the control to exist.** `wm::controls`
-  declines a strip that cannot hold the cluster plus a caption —
-  `2*FRAME + GAP + (3*CONTROL_BOX + 2*GAP) + GAP + 8` = 102 px, against WC-A's 26. An
-  8x8 surface gives `bw = 8*scale + 10`, which is 42 at the scale the tiler picks on the
-  bench panel; the 32x8 x86 fixture gives 74. Both are under the floor, so the close legs
-  would have reported skip for the rest of the tree's life. `HT_SURF` and `WMD_SURF` are
-  now 96 px wide, which clears 102 at scale 1 and therefore at every scale.
+  declines a strip that cannot hold the cluster plus a caption glyph. An 8x8 surface gives
+  `bw = 8*scale + 10`, which is 42 at the scale the tiler picks on the bench panel; the
+  32x8 x86 fixture gives 74. Both are under the floor, so the close legs would have
+  reported skip for the rest of the tree's life. `HT_SURF` and `WMD_SURF` were widened to
+  96 px, and CRISPYWIRE-REVIEW widened them again to **128 px** when the floor itself was
+  corrected upward to 122 — see below.
+
+##### CRISPYWIRE-REVIEW — the review conditions
+
+The wiring passed its own gates and was reviewed against the shipped code. Five defects and
+three disclosures came out of that; all eight are applied here.
+
+**1. The corners drew desktop and clicked window.** The painter cut ~31 px out of each top
+corner and filled it `DESKTOP_BG`, while `hit_test`, `chrome_hit` and `title_bar_hit` went
+on testing the rectangular `outer_box`. Those pixels *looked* like desktop and *behaved*
+like window: a press on one raised and focused a window the operator can see is not there.
+
+`outside_top_corner` closes it, and it is the SAME arithmetic the painter cuts with, not a
+second copy — the painter walks `j` in `0..rad`, finds the smallest column `i` with
+`!corner_outside(i, j, rad)` and fills `[0, i)` from each edge; `corner_outside` is monotone
+in `i`, so that filled span IS `{ i : corner_outside(i, j, rad) }`, which is what the
+predicate asks once per point. The keyline pixel at the boundary is not in the set and is
+chrome in both senses. `hit_test` *falls through* rather than returning, so a window stacked
+underneath receives the click exactly as the corner shows it. This is what makes the
+"corners are the desktop's" framing above true rather than merely stated.
+
+**2. The caption ignored `metrics.text_px`.** It drew the 8-px font cell at scale 1 while
+the approved table asks for 15, and `theme::TEXT_PX` was consumed nowhere. `draw_title` now
+takes a scale and `wm::TITLE_SCALE` derives it in code as
+`(TEXT_PX + FONT_CELL/2) / FONT_CELL`, floored at 1 — nearest integer replication of the
+bitmap cell, `2` at the kit's numbers. The centring is against the scaled height and the
+width budget is counted in scaled glyphs.
+
+**3. The control threshold was one `GAP` short of the painter's budget.** `controls`
+declined below 102 px while `paint_window` reserved 106 before a glyph was asked for, so a
+strip could clear the threshold, get a cluster drawn, and be handed a caption budget with no
+room in it. Both sides now subtract one constant, `CTRL_RESERVE` = `3*CONTROL_BOX + 4*GAP` =
+84, and the floor is `2*FRAME + GAP + CTRL_RESERVE + TITLE_CELL` = `10 + 12 + 84 + 16` =
+**122 px**. (The glyph term doubled with finding 2, which is the other half of the move.)
+`HT_SURF` and `WMD_SURF` went 96 -> 128 px so `bw = 128*scale + 10` = 138 still clears 122
+at scale 1 — the margin the 96 was chosen for. `place_scale` picks 2 or more at both gate
+geometries, so this is margin, not a live fix.
+
+**4. The keyline's thickness was a literal.** It is `theme::BEVEL` now — the kit's hairline
+metric, and the frame's other hairline; there is no separate keyline metric in the table.
+The bevel's inset is the keyline's width for the same reason. Identical output at
+`bevel = 1`, and it moves with the kit.
+
+**5. A stale doc block.** `close_box`'s header still described the `TITLE_H`-sided square
+CRISPYWIRE had deleted 15 lines further down. Replaced by one sentence naming
+`controls()` / `in_circle` as the single source.
+
+**6. Panel-clipped extents, recorded.** `paint_window` receives `bw`/`bh` already clipped to
+the panel. The control discs come from `controls(r)` in TRUE panel coordinates, but the
+keyline's right edge, the bevel's right edge and the right rounded corner key off the clipped
+width — so a window wider than the panel would draw its "right edge" mid-window. Unreachable
+(`place` sizes to fit, `move_to` clamps), comment only, no behaviour change. Noted because
+the clip is a safety bound, not a layout decision, and the two read alike.
+
+**7-8. Two disclosures**, in the list below and in `theme.rs`'s header.
 
 ##### The witness, and why it is NOT `witness`-gated
 
@@ -3595,6 +3662,22 @@ the taste gate rather than decisions this arc took:
 5. **Control side and order.** The cluster is right-aligned with close leftmost, which
    satisfies both the kit's darkest-to-lightest left-to-right ramp and P79's "close button
    in the upper right". A left-hand cluster would satisfy the ramp equally.
+6. **`text_px` is honoured by nearest-integer BITMAP SCALE, not exactly.** The kit asks for
+   15 px of text; the kernel has `font8x8` and no rasterizer, so the caption is drawn at
+   `wm::TITLE_SCALE` = `round(15 / 8)` = 2, i.e. **16 px for the 15 asked**. The derivation
+   is in code, so a kit change moves the caption. Exact 15 needs a rasterizer, which is the
+   `content_surface.Paper` lane's problem, not chrome's.
+7. **`line_height_pct` has no consumer.** Window captions are a single line, so there is no
+   inter-line distance for `165 %` to set. It is lifted and unconsumed, and that is the
+   honest state — not a gap in the wiring.
+8. **Three modules paint the same glass and are still un-wired.** The "every chrome value
+   resolves to the table" claim is scoped to the WINDOW COMPOSITOR. Outside it:
+   `screen.rs` and fbcon (untouched, and the kit still carries no desktop-background role);
+   `ui_status.rs`'s bottom strip — `METER_DIM` / `METER_BREATH` / `METER_PARKED` and the
+   three VU colours `LED_GREEN` / `LED_AMBER` / `LED_RED`; and `video/cursor.rs`'s pointer
+   `FILL` and `SHADOW`. All invented, all next arc's scope, deliberately not wired in this
+   pass. (Whether the VU ramp is chrome at all, or an instrument exempt from the kit, is
+   itself a taste question.)
 
 ##### CRISPYWIRE gate results
 
@@ -3610,6 +3693,29 @@ previously-skipping legs now return real verdicts.
 
 Metal is not claimed. The chrome's verdict is Peter's eyes, and the predictions this arc
 was written against are in `~/unaos-bench/scratch/gr22/crispywire-predictions.md`.
+
+##### CRISPYWIRE-REVIEW gate results
+
+`./arroyo check` and `UNAOS_WC=1 ./arroyo check`: both arches clean, no new warnings (the
+one warning naming `wm.rs` — `value assigned to 'placed' is never read`, line 1058 — is
+present at the pre-review baseline, 14 occurrences either side).
+
+`./arroyo kernel8-test 150`: **91/91 required witnesses, 0 forbidden**, at BOTH the default
+640x480 and `UNAOS_FBW=1920 UNAOS_FBH=1200`. The count is UNCHANGED because leg 11 was
+folded into the existing `[clickroute] hit-test` REQUIRE rather than given a REQUIRE of its
+own — it is the same battery's verdict, and a second line would have counted one assertion
+twice:
+
+```
+[clickroute] hit-test at (215,161) inside=true topmost=true raise=true outside=true
+  miss=(254,200) hidden=true shell=true bare=true hit=true deliver=true wake=true
+  corner=true close=true closereal=true -> PASS
+```
+
+**The leg was proven falsifiable, not merely green.** With `outside_top_corner` forced to
+return `false` — the exact pre-review behaviour — the same gate reads `corner=false -> FAIL`
+and **90/91**. A hit-test leg that cannot fail is this tree's most expensive kind of lie, so
+the probe was run rather than argued.
 
 ### WC-L — the staged erase loses its DIRECT fallback
 
