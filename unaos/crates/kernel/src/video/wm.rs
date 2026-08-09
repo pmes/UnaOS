@@ -2381,9 +2381,17 @@ pub fn count() -> usize {
 /// Whenever the sprite could be over a pixel this pass writes, it is taken OFF the panel before any
 /// window pixel is drawn or read, and put back only after the last `draw_window` / `verify_window`
 /// has returned. That ordering is what makes the cursor free of consequences for the witnesses:
-/// `[wc-d]`'s scan-out read-back never sees a sprite pixel in a window's rect, and `[wc-c]`'s
-/// checksum reads the source surface, which the cursor never touches. (The second, independent
-/// guarantee is that the sprite is drawn only after a real pointer report — see `video::cursor`.)
+/// THIS pass cannot read its own sprite pixels out of a window's rect, and `[wc-c]`'s checksum reads
+/// the source surface, which the cursor never touches. (The second, independent guarantee is that the
+/// sprite is drawn only after a real pointer report — see `video::cursor`.)
+///
+/// WCD-SPRITE (Boot AR) — that is a claim about THIS pass and it was over-read as a claim about the
+/// panel. The bracket holds no `SPRITE` lock, so another core's pointer report, `repaint` or
+/// `ensure_drawn` can put the arrow back at any instant; a `[wc-d]` verdict reads the glass for over a
+/// second, and AR caught one arriving BETWEEN the two read-back passes (`bad_cache=0 bad_ram=144`,
+/// `got=0xffffff` — `cursor::FILL`, and 144 is one arrow's painted set at scale 2 exactly). The
+/// witness therefore models the sprite itself rather than relying on this ordering; see the
+/// WCD-SPRITE ledger in [`verify_window`].
 ///
 /// Every early return in the pass body (the drain barrier, a framebuffer that is not ready) reports
 /// the same `disturbed` answer the full pass does, so there is no path that can paint or verify with
@@ -2586,6 +2594,17 @@ fn composite_once() {
         C2_PASSES.fetch_add(1, Relaxed);
         C2_PASS_CYC.fetch_add(pass, Relaxed);
         C2_PASS_MAX_CYC.fetch_max(pass, Relaxed);
+        // COMP2-STRADDLE — split this pass at the rollup epoch. `pass_us` above keeps its meaning
+        // (the mean COST of a pass, which is a whole-pass question and must not be clipped); these
+        // two counters answer the different question `util_pct` asks, which is how much of THIS
+        // span's wall clock was spent inside a pass. `epoch == 0` is the pre-first-rollup state and
+        // makes `start == c2_t0`, charging the pass whole, which is correct: nothing has been
+        // printed yet for it to straddle. See the ledger above [`C2_EPOCH_CYC`].
+        let epoch = C2_EPOCH_CYC.load(Relaxed);
+        let start = if c2_t0 > epoch { c2_t0 } else { epoch };
+        let in_span = end.saturating_sub(start);
+        C2_INSPAN_CYC.fetch_add(in_span, Relaxed);
+        C2_STRADDLE_CYC.fetch_add(pass.saturating_sub(in_span), Relaxed);
     }
 }
 
@@ -3471,7 +3490,53 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         v & 0x00FF_FFFF
     };
 
+    // ### WCD-SPRITE — the arrow is a panel writer, and the bracket does not cover this read
+    //
+    // Boot AR (metal, x86) printed, for a window whose reference was black:
+    //
+    //   [wc-d] verify win=1 … bad_cache=0 bad_ram=144 moved=0 … got=0xffffff want=0x000000
+    //          first=(1372,892) -> FAIL
+    //
+    // 144 is not a round number that happens to fit. `cursor::sprite_color` paints the 8x8 `ARROW`
+    // mask (28 set bits) plus its one-block down-right shadow, whose 28 blocks include 20 already
+    // under the fill — a painted set of exactly 36 blocks, each `scale` x `scale` panel pixels. At the
+    // sprite scale of 2 that is 36 * 4 = 144, every painted pixel of one arrow and not one more. And
+    // `got=0xffffff` is `cursor::FILL` to the bit. The window's blit is not the writer; the pointer is.
+    //
+    // `bad_cache=0` with `bad_ram=144` dates it precisely: the arrow was absent for the first
+    // read-back pass and present for the second, i.e. drawn BETWEEN them. That is exactly what
+    // WCD-RAMINDEP says an x86 disagreement between the two passes means — "something wrote the panel
+    // under the verdict" — and here the something is benign and expected. CURSOR-1's bracket holds the
+    // sprite off the panel across `draw_window`/`verify_window` for the pass that TOOK it, but it
+    // holds no `SPRITE` lock, and a full verdict reads the glass for well over a second (see the
+    // PAYGO note: 1.4-1.9 s a sample). Any pointer report, `repaint` or `ensure_drawn` on another core
+    // in that window puts the arrow back over the rect mid-read.
+    //
+    // So a cursor resting over a window could manufacture a FAIL, with a first-pixel colour that
+    // reads as a spectacular blit defect. Excused here, as a fourth attribution bucket beside
+    // WCD-PRE's `moved` and WCD-OCC's `occluded`, and COUNTED rather than dropped: `sprite_px=` on
+    // every verdict line says how many pixels this pass declined to charge to the blit because the
+    // arrow was over them. A real mismatch under the sprite is therefore still visible — it is in that
+    // count, and a `sprite_px` far above one arrow's painted set (36 * scale^2) is itself a reading.
+    //
+    // The test is the union of the box at pass entry and the box at the instant of the mismatch, which
+    // is what covers BOTH directions of the AR case: an arrow that arrived during the read (live box
+    // covers it) and one that left during the read (entry box covers it). The live read is taken only
+    // on a pixel that already disagrees, so a clean blit never pays for it. Residual hole, of the same
+    // class WCD-PRE and WCD-OCC already name: an arrow that both arrived and left between the probe
+    // and the re-read is invisible to both boxes and its pixels are still charged to `bad`.
+    let sprite_covers = |b: Option<(usize, usize, usize, usize)>, x: usize, y: usize| -> bool {
+        match b {
+            Some((bx, by, bw, bh)) => x >= bx && y >= by && x < bx + bw && y < by + bh,
+            None => false,
+        }
+    };
+
     let pass = |fb: &super::FrameBuffer| {
+        // WCD-SPRITE — re-read per pass, not once for both: the two read-backs are seconds apart and
+        // AR's arrow arrived in the gap between them.
+        let sprite_enter = super::cursor::live_box_relaxed();
+        let mut sprite_px = 0usize;
         let mut checked = 0usize;
         let mut bad = 0usize;
         let mut moved = 0usize;
@@ -3529,10 +3594,18 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
                                 // the WCD-PRE re-read above and only on a pixel that already disagrees,
                                 // so a clean blit never reaches the walk. A pixel covered by the
                                 // pre-blit OR the read-back occluder set is owned by a higher window.
+                                // WCD-SPRITE — the fourth bucket, tested last of the excusals so a
+                                // moved reference and an occluding window keep their existing
+                                // attributions. Both arches: the sprite is `video::cursor`'s and is
+                                // not arch-gated.
+                                let on_sprite = sprite_covers(sprite_enter, dx, dy)
+                                    || sprite_covers(super::cursor::live_box_relaxed(), dx, dy);
                                 #[cfg(target_arch = "x86_64")]
                                 {
                                     if occ_before.covers(dx, dy) || occ_after.covers(dx, dy) {
                                         occluded += 1;
+                                    } else if on_sprite {
+                                        sprite_px += 1;
                                     } else {
                                         if bad == 0 {
                                             first = (dx, dy, got, want);
@@ -3542,10 +3615,14 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
                                 }
                                 #[cfg(not(target_arch = "x86_64"))]
                                 {
-                                    if bad == 0 {
-                                        first = (dx, dy, got, want);
+                                    if on_sprite {
+                                        sprite_px += 1;
+                                    } else {
+                                        if bad == 0 {
+                                            first = (dx, dy, got, want);
+                                        }
+                                        bad += 1;
                                     }
-                                    bad += 1;
                                 }
                             }
                         }
@@ -3556,19 +3633,19 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         }
         #[cfg(target_arch = "x86_64")]
         {
-            (checked, bad, moved, nonzero, first, first_moved, occluded)
+            (checked, bad, moved, nonzero, first, first_moved, occluded, sprite_px)
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            (checked, bad, moved, nonzero, first, first_moved)
+            (checked, bad, moved, nonzero, first, first_moved, sprite_px)
         }
     };
 
     #[cfg(target_arch = "x86_64")]
-    let (checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, occ_cache) =
+    let (checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, occ_cache, spr_cache) =
         pass(fb);
     #[cfg(not(target_arch = "x86_64"))]
-    let (checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache) = pass(fb);
+    let (checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, spr_cache) = pass(fb);
 
     // Discard, never clean — see the doc comment. Bare `IVAC` is what makes `bad_ram` able to fail.
     // WCD-BAND: the extent follows the verified rows, not the whole window, so a banded verdict
@@ -3589,9 +3666,9 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     let ram_indep = cfg!(target_arch = "aarch64");
 
     #[cfg(target_arch = "x86_64")]
-    let (_, bad_ram, moved_ram, _, first_ram, firstmv_ram, occ_ram) = pass(fb);
+    let (_, bad_ram, moved_ram, _, first_ram, firstmv_ram, occ_ram, spr_ram) = pass(fb);
     #[cfg(not(target_arch = "x86_64"))]
-    let (_, bad_ram, moved_ram, _, first_ram, firstmv_ram) = pass(fb);
+    let (_, bad_ram, moved_ram, _, first_ram, firstmv_ram, spr_ram) = pass(fb);
     // `cksum` is the `[wc-c]` FNV over the SOURCE slot, carried here so a verdict is content-aware: without
     // it a blank surface blitted faithfully onto a blank rect is a PASS indistinguishable from a verified
     // crystal. `nonzero` is the same question asked of the DESTINATION. `cksum_pre` is the same FNV taken at
@@ -3608,6 +3685,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     // a verdict is CLEAN/PASS iff the non-occluded, non-moved mismatches are zero.
     #[cfg(target_arch = "x86_64")]
     let occluded = occ_cache.max(occ_ram);
+    // WCD-SPRITE — the worse of the two passes, same rule as `moved` and `occluded`, and for the same
+    // reason: AR's arrow was over the rect for exactly ONE of the two read-backs, so a min (or either
+    // pass alone) would report zero for a boot whose FAIL the sprite caused.
+    let sprite_px = spr_cache.max(spr_ram);
     let ok = bad_cache == 0 && bad_ram == 0;
     let live = ok && moved > 0;
     let first = if bad_cache > 0 { first_cache } else { first_ram };
@@ -3669,9 +3750,9 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         let retry = aborts <= WCD_ABORT_MAX;
         let fst = if bad_cache > 0 || bad_ram > 0 { first } else { first_moved };
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} rect={}x{}+{}+{} fills={}->{} fact={}/{} desk={}->{} dact={}/{} aborts={}/{} retry={} -> SKIP (teardown)",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} rect={}x{}+{}+{} fills={}->{} fact={}/{} desk={}->{} dact={}/{} aborts={}/{} retry={} -> SKIP (teardown)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
             occluded, occ_before.count(), occ_after.count(), cksum,
             // WCD-TEARDOWN — the mismatching pixel from whichever arm actually fired. `bad` writes
             // `first`, `moved` writes `first_moved`, and printing the wrong one is how the first cut
@@ -3717,18 +3798,18 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         // aarch64 has no interlock and its line must stay byte-identical to the pre-interlock wire.
         #[cfg(target_arch = "x86_64")]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} occluded={} occ={}/{} cksum={:#018x} cksum_pre={:#018x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> LIVE (unverifiable)",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} cksum_pre={:#018x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
             occluded, occ_before.count(), occ_after.count(), cksum, cksum_pre,
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active
         );
         #[cfg(not(target_arch = "x86_64"))]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum, cksum_pre
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero, cksum, cksum_pre
         );
     } else if ok {
         // WCD-TEARDOWN — the interlock's reading rides the PASS line too, on x86.
@@ -3745,18 +3826,18 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         // exposure visible.
         #[cfg(target_arch = "x86_64")]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=none fills={}->{} fact={}/{} desk={}->{} dact={}/{} stable={} -> PASS",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=none fills={}->{} fact={}/{} desk={}->{} dact={}/{} stable={} -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, yn(ram_indep), moved, nonzero,
+            checked, coverage, yn(ram_indep), moved, sprite_px, nonzero,
             occluded, occ_before.count(), occ_after.count(), cksum,
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active, yn(stable)
         );
         #[cfg(not(target_arch = "x86_64"))]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} nonzero={} cksum={:#018x} first=none -> PASS",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} first=none -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, yn(ram_indep), moved, nonzero, cksum
+            checked, coverage, yn(ram_indep), moved, sprite_px, nonzero, cksum
         );
     } else {
         // WCD-TEARDOWN — the FAIL line carries the interlock reading too, and this arm is the reason
@@ -3772,9 +3853,9 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         // has deliberately declined to abort on.
         #[cfg(target_arch = "x86_64")]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> FAIL",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
             occluded, occ_before.count(), occ_after.count(), cksum,
             first.0, first.1, first.2, first.3,
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
@@ -3782,9 +3863,9 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         );
         #[cfg(not(target_arch = "x86_64"))]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero, cksum,
             first.0, first.1, first.2, first.3
         );
     }
@@ -6507,6 +6588,60 @@ static C2_DMG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 #[cfg(feature = "witness")]
 static C2_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// ---- COMP2-STRADDLE — attributing a pass's time to the span it actually ran in -------------------
+//
+// **The defect, from Boot AR (metal).** The line read
+//
+//   [comp2] rollup passes=31 pass_us=217205 max_us=1258783 … util_pct=112 span=5983ms
+//
+// with `[wcser]` independently reporting the serialising gate working. 31 × 217205 us = 6.73 s
+// against a 5.98 s span, so `util_pct` printed 112 — on a boot where two cores provably could not be
+// inside `composite` at once. The cause is attribution, not concurrency: `C2_PASS_CYC` is charged the
+// WHOLE of a pass at the instant the pass ENDS, so a pass that STRADDLES a rollup boundary is counted
+// entirely in the span it ends in. AR's `max_us=1258783` is a single 1.26 s pass — over a fifth of
+// the span — and one of those landing across the boundary is enough on its own.
+//
+// That is fatal for this field specifically. `util_pct > 100` is the ONLY thing this instrument says
+// that convicts anybody (Boot AQ's 144% is what the WCSER gate was built from), and a benign
+// boundary straddle produced the same reading as the bug. An instrument whose alarm has a benign
+// cause cannot fire.
+//
+// **The fix: time-in-span, charged at the pass's end from a cycle EPOCH.** `C2_EPOCH_CYC` holds the
+// cycle stamp of the last rollup drain. A finishing pass splits its own interval at that stamp:
+// `end - max(t0, epoch)` ran inside the current span and is charged to `C2_INSPAN_CYC`; the
+// remainder ran before the span began and is charged to `C2_STRADDLE_CYC`.
+//
+// Carrying the remainder BACKWARD into the span it belongs to was the alternative and is impossible
+// here: that span has already been printed by the time the pass ends. So the remainder is not
+// silently dropped — it is PRINTED, as `straddle_us=`, which is the second half of the contract. A
+// reader who wants the older span's true utilisation adds this span's `straddle_us` to it, and a
+// `straddle_us` of zero says the question does not arise.
+//
+// **Why this SHARPENS the verdict rather than blunting it.** With time-in-span attribution the sum of
+// charged intervals is the measure of the union of the passes' in-span time IF AND ONLY IF the passes
+// do not overlap. Serialised, that union is a subset of the span, so `util_pct <= 100` HOLDS BY
+// CONSTRUCTION and any reading above 100 is arithmetic proof that two intervals overlapped — which is
+// exactly and only concurrency. The field keeps its power to fire and loses its one benign cause.
+// (The old form could ALSO under-report: a span containing no pass END read 0% however busy it was.)
+//
+// The denominator moves into the same clock for the same reason: `util_pct` is now
+// `inspan_cyc / (now_cyc - prev_epoch)`, epoch to epoch, instead of cycles-converted-to-us over the
+// `arch::ms()` span. Both terms are then read from one counter at one place in the emit, so the ratio
+// carries no ms/cycle skew and no `cycles_to_us` rounding. `span=` still prints the ms figure it
+// always did; the two agree to within the emit's own duration and are not required to agree exactly.
+//
+// Two residual holes, named rather than argued away. A pass IN FLIGHT at the drain contributes
+// nothing until it ends (then only its in-span part) — utilisation is charged when it is known, not
+// when it is incurred. And a pass ending in the narrow window between the epoch store and the counter
+// swap is charged against the NEW epoch into counters about to be drained for the OLD span: it
+// under-reports by that sliver and can never inflate, which is the direction an alarm field must err.
+#[cfg(feature = "witness")]
+static C2_EPOCH_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static C2_INSPAN_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static C2_STRADDLE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// COMPOSITE-2 — drain the ledger and print the rollup line. Called from [`wcn_emit`] so the two
 /// instruments share one cadence and one `span`; all averages are per-pass, in microseconds.
 /// `blit_us` subtracts the cache term because the flush is timed INSIDE the loop (it is per-window,
@@ -6526,9 +6661,21 @@ static C2_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// examples there are pre-`util_pct` and are left as the historical captures they quote. The field's
 /// derivation, its >100 meaning and the paired verdict it belongs to are documented at the
 /// computation site below.
+///
+/// COMP2-STRADDLE — `straddle_us` is inserted immediately BEFORE `util_pct` by the same rule (`span=`
+/// terminal, `rate=` still last-but-one), because it is the correction term a reader needs in hand
+/// when reading `util_pct`. The analyzer's position is unchanged: it parses no field of this line.
 #[cfg(feature = "witness")]
 fn comp2_emit(span: u64) {
     use core::sync::atomic::Ordering::Relaxed;
+    // COMP2-STRADDLE — the epoch FIRST, before the counters are drained. A pass ending in the gap
+    // between the two then splits against the new epoch and lands in counters this drain is about to
+    // take, which under-reports by that sliver; the other order would let it add a whole pre-epoch
+    // pass to the new span and INFLATE it. An alarm field errs low.
+    let now_cyc = crate::arch::now_cycles();
+    let prev_epoch = C2_EPOCH_CYC.swap(now_cyc, Relaxed);
+    let inspan_cyc = C2_INSPAN_CYC.swap(0, Relaxed);
+    let straddle_cyc = C2_STRADDLE_CYC.swap(0, Relaxed);
     let passes = C2_PASSES.swap(0, Relaxed);
     let pass_cyc = C2_PASS_CYC.swap(0, Relaxed);
     let max_cyc = C2_PASS_MAX_CYC.swap(0, Relaxed);
@@ -6545,11 +6692,17 @@ fn comp2_emit(span: u64) {
     let us = |cyc: u64| super::wcg::cycles_to_us(cyc / passes);
     // COMP2-UTIL (review condition 5) — the multiply AR used to do by hand, done on the wire.
     //
-    // `passes * pass_us * 100 / (span * 1000)` is the percentage of wall time this period that was
-    // spent inside a composite pass. ABOVE 100 IS THE WHOLE POINT: one compositor cannot exceed 100%,
-    // so >100 is direct arithmetic proof that two or more cores were inside `composite` at once. Boot
-    // AQ read ~144% and ~106% that way, and that inference is what the WCSER gate was built from.
-    // `span` is the same `span` the line already prints, so the reading is self-contained.
+    // The percentage of wall time this period that was spent inside a composite pass. ABOVE 100 IS
+    // THE WHOLE POINT: one compositor cannot exceed 100%, so >100 is direct arithmetic proof that two
+    // or more cores were inside `composite` at once. Boot AQ read ~144% and ~106% that way, and that
+    // inference is what the WCSER gate was built from.
+    //
+    // COMP2-STRADDLE (Boot AR) — the numerator is NO LONGER `passes * pass_us`. That product counted
+    // a boundary-straddling pass wholly in the span it ended in and printed AR's benign `util_pct=112`
+    // on a provably serial boot. It is now `C2_INSPAN_CYC`: the sum of each pass's time that fell
+    // inside THIS span, over the epoch-to-epoch cycle count. Serialised, that sum cannot exceed the
+    // span, so >100 is again concurrency and nothing else. The remainder charged to a previous span
+    // prints beside it as `straddle_us=`. Full argument at [`C2_EPOCH_CYC`].
     //
     // ⚠ THE HONEST AR VERDICT IS A PAIR, NOT THIS FIELD ALONE:
     //     `[comp2] util_pct < 100` AND `[wcser] declined > 0` -> SERIAL
@@ -6566,17 +6719,25 @@ fn comp2_emit(span: u64) {
     // sprite writer from inside another core's CURSOR-1 bracket and is exactly a per-pixel-bleed
     // mechanism. That would make AR the first boot able to separate the two.
     let span_us = span.saturating_mul(1000);
-    let util_pct = if span_us == 0 {
+    // COMP2-STRADDLE — epoch-to-epoch cycles, the same clock the numerator is measured in. The ms
+    // fallback covers the very first rollup only (`prev_epoch == 0`), where there is no previous
+    // epoch to subtract and no pass has had a boundary to straddle either.
+    let span_cyc = if prev_epoch == 0 {
         0
     } else {
-        // Ordered to keep the product in range: per-pass microseconds first, then scale.
-        us(pass_cyc)
-            .saturating_mul(passes)
+        now_cyc.saturating_sub(prev_epoch)
+    };
+    let util_pct = if span_cyc > 0 {
+        inspan_cyc.saturating_mul(100).saturating_div(span_cyc)
+    } else if span_us == 0 {
+        0
+    } else {
+        super::wcg::cycles_to_us(inspan_cyc)
             .saturating_mul(100)
             .saturating_div(span_us)
     };
     serial_println!(
-        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} util_pct={} rate={}.{}/s span={}ms",
+        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} straddle_us={} util_pct={} rate={}.{}/s span={}ms",
         passes,
         us(pass_cyc),
         super::wcg::cycles_to_us(max_cyc),
@@ -6587,6 +6748,9 @@ fn comp2_emit(span: u64) {
         bytes / passes,
         dmg_px / passes,
         box_px / passes,
+        // COMP2-STRADDLE — a TOTAL for the span, not a per-pass mean: it is the correction term for
+        // the PREVIOUS line's `util_pct`, and a mean would not add to anything.
+        super::wcg::cycles_to_us(straddle_cyc),
         util_pct,
         passes.saturating_mul(10_000) / span.max(1) / 10,
         passes.saturating_mul(10_000) / span.max(1) % 10,
