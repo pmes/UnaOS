@@ -159,7 +159,7 @@ pub trait GneissPal {
 // Now every screen-owning loop shares this position and draws the same metrics-scaled arrow.
 pub mod cursor {
     use super::GneissPal;
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use spin::Mutex;
 
     /// 8×8 arrow mask, MSB = leftmost pixel.
@@ -255,6 +255,36 @@ pub mod cursor {
     const HIDE_AFTER_MS: u64 = 1500;
     /// ms() timestamp of the last pointer report; 0 = never (cursor starts hidden).
     static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
+
+    // --- DRAGREL (metal defect fix: a title-bar drag never ended) -----------------------------
+    //
+    // THE POINTER'S BUTTON **LEVEL**, published beside its position, and it is here for the same
+    // reason the position is: it is pointer STATE, every producer already writes it, and more than
+    // one consumer needs to ask "is the button down RIGHT NOW?" without waiting for an event.
+    //
+    // Why an event was not enough. The HID pointer paths deliver `Event::Button` on EDGES, and the
+    // interrupt endpoint is armed for ONE report per service pass (see the CLICK-3 ledger in
+    // `drivers/ehci/mod.rs`): a report is a LEVEL, so a release that lands between two service
+    // passes is superseded by whatever the pad reports next and its EDGE is simply gone. A gesture
+    // whose END is carried only by that edge — a title-bar drag — then never ends, and the window
+    // follows the pointer for the rest of the boot. The release EDGE is still emitted (it gives the
+    // exact release position, unthrottled); this level is the BELT under it, consulted by the
+    // routing tail on every motion report, and it cannot be missed because every report writes it.
+    /// Whether the pointer's PRIMARY button is currently held, as of the most recent HID report.
+    /// Written by every pointer parse path; false before the first report.
+    static BUTTON_DOWN: AtomicBool = AtomicBool::new(false);
+
+    /// DRAGREL — publish the primary button's CURRENT level. Called from every pointer report,
+    /// pressed or not, edge or no edge.
+    pub fn set_button_level(down: bool) {
+        BUTTON_DOWN.store(down, Ordering::Relaxed);
+    }
+
+    /// DRAGREL — the primary button's level as of the last pointer report. `false` when no pointer
+    /// has ever reported, which is the correct reading for "nothing is being held".
+    pub fn button_down() -> bool {
+        BUTTON_DOWN.load(Ordering::Relaxed)
+    }
 
     /// Stamp the pointer-activity clock (a real report just arrived).
     fn touch() {

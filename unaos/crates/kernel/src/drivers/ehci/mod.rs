@@ -293,9 +293,29 @@ static PTR_PRESS_RECOVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::
 impl IntEp {
     /// CLICK-3 — the ONE button-transition decision every EHCI pointer path shares (trackpad 0x02,
     /// parsed report-pointer, boot mouse). Stamps the report clock, decides whether this report is a
-    /// primary-button PRESS, and updates `prev_buttons`. Returns `true` when the caller owes exactly
-    /// one `pal::Event::Button`. Release and hold return `false` — the emit contract is unchanged.
-    fn note_buttons(&mut self, buttons: u8, idx: usize) -> bool {
+    /// primary-button PRESS, and updates `prev_buttons`.
+    ///
+    /// DRAGREL — returns `(press, release)`: `press` is the CLICK-1/CLICK-3 verdict, bit-for-bit the
+    /// predicate this function has always returned (down edge, or a still-down report after
+    /// `CLICK_REPRESS_QUIET_MS` of endpoint silence), and `release` is the newly added primary
+    /// 1 -> 0 edge. The caller owes one `pal::Event::Button(buttons)` for EITHER — the press event's
+    /// mask has the primary bit set, the release event's has it clear, which is how every consumer
+    /// tells them apart.
+    ///
+    /// **The press semantics are unchanged and must stay unchanged.** A release edge is a new
+    /// OBSERVATION, not a new definition of a press: `prev_buttons`, the quiet-gap recovery and the
+    /// `usbdebug` press ledger below all behave exactly as before.
+    ///
+    /// It also PUBLISHES the current level to `pal::cursor::set_button_level` on every report, edge
+    /// or not. That is the half a missed report cannot destroy: this endpoint is armed for one
+    /// report per service pass, so a release edge CAN be lost outright (the CLICK-3 ledger above),
+    /// and the routing tail reads the level instead of trusting an edge to arrive.
+    ///
+    /// KNOWN ASYMMETRY (deliberate, out of this arc's lane): `drivers/xhci/mod.rs` still emits
+    /// `Event::Button` on the DOWN edge only and publishes no level. That path is not the rMBP
+    /// trackpad's, so it is not the drag defect this arc closes; it wants the same two lines and is
+    /// a follow-up.
+    fn note_buttons(&mut self, buttons: u8, idx: usize) -> (bool, bool) {
         let now = crate::arch::ms();
         let prev = self.prev_buttons;
         // Silence since the PREVIOUS report on this endpoint (before this one is stamped). `== 0`
@@ -305,7 +325,12 @@ impl IntEp {
         self.last_report_ms = now;
         self.prev_buttons = buttons;
         let down = buttons & 0x01 != 0;
+        // DRAGREL — the level, published before any edge test and on every report.
+        crate::pal::cursor::set_button_level(down);
         let edge = down && prev & 0x01 == 0;
+        // DRAGREL — the primary RELEASE edge. Orthogonal to the press arms: it cannot be true in the
+        // same report as `edge` or `repress` (both require `down`).
+        let release = !down && prev & 0x01 != 0;
         // The recovery arm: still down, was down, and the endpoint was silent across the gap.
         let repress = down && prev & 0x01 != 0 && quiet;
         #[cfg(feature = "usbdebug")]
@@ -331,7 +356,7 @@ impl IntEp {
         }
         #[cfg(not(feature = "usbdebug"))]
         let _ = idx;
-        edge || repress
+        (edge || repress, release)
     }
 }
 
@@ -5854,10 +5879,20 @@ impl Controller {
                             // CLICK-3: the edge test plus re-press recovery (see `note_buttons`) —
                             // this is the path the rMBP internal trackpad takes, and the one where
                             // the stale latch swallowed every stationary second click.
-                            if e.note_buttons(buttons, idx) {
+                            // DRAGREL: and ONE more on the release edge (buttons == 0x00 here), so a
+                            // gesture whose end matters — a title-bar drag — has an event that says
+                            // so. The press half above is untouched.
+                            let (press, release) = e.note_buttons(buttons, idx);
+                            if press {
                                 crate::pal::push_event(crate::pal::Event::Button(buttons));
                                 serial_println!(
                                     ":: EHCI-HID: [{}] trackpad click (button-down edge, buttons={:#04x}) == witness ::",
+                                    idx, buttons
+                                );
+                            } else if release {
+                                crate::pal::push_event(crate::pal::Event::Button(buttons));
+                                serial_println!(
+                                    ":: EHCI-HID: [{}] trackpad release (button-up edge, buttons={:#04x}) == witness ::",
                                     idx, buttons
                                 );
                             }
@@ -5876,8 +5911,10 @@ impl Controller {
                         }
                         // CLICK-1: primary-button DOWN edge → one Button event (same semantic as
                         // the trackpad path above).
+                        // DRAGREL: plus the release edge, same semantic as the trackpad path above.
                         let btn = (buttons & 0xFF) as u8;
-                        if e.note_buttons(btn, idx) {
+                        let (press, release) = e.note_buttons(btn, idx);
+                        if press || release {
                             crate::pal::push_event(crate::pal::Event::Button(btn));
                         }
                         if e.reports == 1 || e.reports % 32 == 0 {
@@ -5921,7 +5958,9 @@ impl Controller {
                         crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
                     }
                     // CLICK-1: boot-mouse buttons live in report[0]; primary DOWN edge → Button.
-                    if e.note_buttons(report[0], idx) {
+                    // DRAGREL: and the primary UP edge, same as the other two pointer paths.
+                    let (press, release) = e.note_buttons(report[0], idx);
+                    if press || release {
                         crate::pal::push_event(crate::pal::Event::Button(report[0]));
                     }
                     if e.reports == 1 || e.reports % 32 == 0 {
