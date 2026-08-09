@@ -587,7 +587,11 @@ plausibly keys on, and it is set by nothing reachable from the host (refutation
 7). Candidate 1 is that the assertion must **originate from the falcon**,
 mimicking a real context-switch completion. `ucode::FENCE_A_BYTES` writes
 `CHAN_VALID` into `ENGINE_STATUS` from inside FECS, reads it back into MAILBOX0,
-holds it while the host submits the runlist, and clears it on host command.
+holds it while the host re-validates the channel, and clears it on host
+command. What it measures is **channel validation** — `PFIFO_CHAN[1]` written,
+the error read at `0x252c` — apples-to-apples with the existing validate legs.
+It does **not** submit a runlist; the submit (`0x2270`/`0x2274`) is downstream of
+this leg and neither reached nor perturbed by it.
 
 It is decisive both ways. `err=0` proves PFIFO only trusts falcon-originated
 state. `err=0x2` eliminates the candidate and points at engine binding at submit
@@ -611,8 +615,9 @@ distinguishable** — that ambiguity is a finding, not a defect.
 
 The listing in `kepler.rs` is a doc comment on the byte array, and a block of
 `const _: () = { … }` assertions checks the bytes back against it. Both images
-that preceded FENCE carry the same treatment. The property being built is **two
-independent derivations meeting at a human-readable listing**:
+that preceded FENCE carry the same treatment. The property being built is that
+**the bytes are checked against the listing by arithmetic the author did not
+perform**:
 
 - listing → bytes (typed by hand, from the mnemonics), and
 - bytes → decoded fields → listing (computed by the assertions).
@@ -631,6 +636,21 @@ assert!(b[0x43] == 0xf4 && b[0x44] == 0x0b && b[0x45] == 0x14);
 assert!(eq3(&slice3(b, 0x43), &bra_to(BRA_EQ, 0x43, 0x57))); // -> do_assert
 assert!(bra_target(b, 0x43) == 0x57);
 ```
+
+**Be precise about what the second assertion buys**, because the loose version of
+this claim is itself a trap. `bra_to` and `bra_target` are exact inverses, so for
+a branch the second assert is logically *implied* by the first — it is not an
+independent derivation and calling it one overstates the lattice. What it
+actually catches is **one-sided redefinition**: if someone changes `bra_target`
+alone (to `at + 3 + disp`, the historical bounce), the two stop agreeing and the
+build fails, naming every branch. That is a real and historically-attested
+failure mode, and it is worth two lines — but it is a consistency check between
+two helpers, not a second opinion about the bytes.
+
+The branch convention is settled by **metal**, not by preference: under
+`at + 3 + disp` the s37 ECHO loop could never have re-executed its `iord` and so
+could never have acked, yet s37 observed `ucode-echo SUCCESS`. Hardware refutes
+the alternative.
 
 Standing requirements for any future image in this module:
 
@@ -659,10 +679,26 @@ Standing requirements for any future image in this module:
    and no review; if a helper is ever written it belongs under `unaos/tools/`
    with its own tests, and the lattice must still assert independently of it.
 
-A green `./arroyo check` **with `UNAOS_KEPLER=1`** means the lattice agreed —
-that is the test passing, not a formality. Note the condition: `kepler.rs` sits
-behind the `nvidia-kepler` feature, so a bare `./arroyo check` never compiles
-these assertions at all and cannot fail on them.
+A green `./arroyo check` means the lattice agreed — that is the test passing,
+not a formality. **A bare `./arroyo check` DOES evaluate these assertions**, with
+no knob required: `kepler.rs` is behind the `nvidia-kepler` feature, but
+`check_both` runs `check_kernel_cfg`, and two legs of `KERNEL_CFG_MATRIX` —
+`x86-all` and `x86-nopace` — carry that feature. Breaking a single image byte
+turns `x86-all`, `x86-nopace` and `x86-mix-0` red on a plain `check`.
+
+That was not always true, and the history is worth keeping because it is the
+reason to state the current fact precisely. The ECHO lattice landed at
+`a93e7927` (2026-07-26); the cfg-coverage gate that compiles it by default
+landed at `944b853e` (2026-08-03, "arroyo: close two vacuities in the check
+gate"). For those eight days the assertions were real but **default-unchecked** —
+green on a bare `check` that never compiled them. Since `944b853e` they have
+been checked by every run.
+
+⚠ Do not restate the stale version. A future session that reads "the bare gate
+does not compile this" will conclude its lattice is dead when it is live, and
+either stop trusting a working gate or rebuild one that already exists. If you
+need to confirm the property rather than take it on faith, the check is cheap:
+perturb one byte of any image and run a plain `./arroyo check`.
 
 ### 11.4 The ritual, restated as the FENCE leg implements it
 

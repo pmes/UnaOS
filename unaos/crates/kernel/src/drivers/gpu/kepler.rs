@@ -456,7 +456,19 @@ pub mod ucode {
     const fn bra_to(cc: u8, at: usize, target: usize) -> [u8; 3] {
         let d = target as isize - at as isize;
         assert!(d >= -128 && d <= 127); // I8 displacement form
-        [0xf4, cc, d as u8]
+        bra(cc, d as u8)
+    }
+    /// A port immediate narrowed to the `mov_i16` form, with the narrowing
+    /// CHECKED rather than assumed.
+    ///
+    /// `IO_MAILBOX0 as u16` is correct today only because the port happens to
+    /// be `0x1000`. A port above 16 bits needs a `mov`/`sethi` pair, not a wider
+    /// immediate — so a bare `as u16` on one would not merely truncate a number,
+    /// it would assert the wrong instruction FORM and silently drop the high
+    /// half. This turns that into a build failure.
+    const fn port_i16(port: u32) -> u16 {
+        assert!(port <= 0xFFFF, "port needs a mov/sethi pair, not a bare I16");
+        port as u16
     }
     /// True if the 3-byte instruction `needle` occurs anywhere in `b`.
     const fn contains3(b: &[u8], needle: &[u8; 3]) -> bool {
@@ -511,8 +523,8 @@ pub mod ucode {
         assert!(eq4(&slice4(b, 0x06), &mov_i16(2, (IO_CC_SCRATCH1 & 0xFFFF) as u16)));
         assert!(eq3(&slice3(b, 0x0a), &sethi_i8(2, (IO_CC_SCRATCH1 >> 16) as u8)));
         assert!(eq3(&slice3(b, 0x0d), &mov_i8(3, 1))); // the ack value
-        assert!(eq4(&slice4(b, 0x10), &mov_i16(6, IO_MAILBOX0 as u16)));
-        assert!(eq4(&slice4(b, 0x14), &mov_i16(7, IO_MAILBOX1 as u16)));
+        assert!(eq4(&slice4(b, 0x10), &mov_i16(6, port_i16(IO_MAILBOX0))));
+        assert!(eq4(&slice4(b, 0x14), &mov_i16(7, port_i16(IO_MAILBOX1))));
         assert!(eq3(&slice3(b, 0x18), &mov_i8(5, 0x00)));
         assert!(eq4(&slice4(b, 0x1b), &sethi_i16(5, (ECHO_BOUND >> 16) as u16)));
         assert!(eq3(&slice3(b, 0x1f), &mov_i8(0, PHASE_A_PRELOOP)));
@@ -587,8 +599,8 @@ pub mod ucode {
         // ⛔ the poison port, derived — this is the one place 0x504 may appear
         assert!(eq4(&slice4(b, 0x10), &mov_i16(8, (IO_WRCMD_CMD & 0xFFFF) as u16)));
         assert!(eq3(&slice3(b, 0x14), &sethi_i8(8, (IO_WRCMD_CMD >> 16) as u8)));
-        assert!(eq4(&slice4(b, 0x17), &mov_i16(6, IO_MAILBOX0 as u16)));
-        assert!(eq4(&slice4(b, 0x1b), &mov_i16(7, IO_MAILBOX1 as u16)));
+        assert!(eq4(&slice4(b, 0x17), &mov_i16(6, port_i16(IO_MAILBOX0))));
+        assert!(eq4(&slice4(b, 0x1b), &mov_i16(7, port_i16(IO_MAILBOX1))));
         assert!(eq3(&slice3(b, 0x1f), &mov_i8(5, 0x00)));
         assert!(eq4(&slice4(b, 0x22), &sethi_i16(5, (ECHO_BOUND >> 16) as u16)));
         assert!(eq3(&slice3(b, 0x26), &mov_i8(0, PHASE_A_PRELOOP)));
@@ -646,10 +658,16 @@ pub mod ucode {
     // the context-valid assertion must ORIGINATE FROM THE FALCON, the way a
     // real context-switch completion would. This image writes CHAN_VALID to
     // ENGINE_STATUS from inside FECS, reads it back so we learn whether the bit
-    // even took, holds it while the host submits the runlist, and clears it on
-    // command. It is decisive both ways: `err=0` proves PFIFO only trusts
-    // falcon-originated state; `err=0x2` eliminates the candidate and points at
-    // engine binding at submit time.
+    // even took, holds it while the host re-validates the channel, and clears it
+    // on command.
+    //
+    // What this measures is CHANNEL VALIDATION — the host writes PFIFO_CHAN[1]
+    // and reads the error at 0x252c, apples-to-apples with the existing
+    // validate legs. It does NOT submit a runlist: the real runlist submit
+    // (0x2270/0x2274) is downstream of this leg and untouched by it.
+    //
+    // Decisive both ways: `err=0` proves PFIFO only trusts falcon-originated
+    // state; `err=0x2` eliminates the candidate and points at engine binding.
     // =====================================================================
 
     /// ENGINE_STATUS (`+0xC00`), falcon-side. **DERIVED (untested)** — see the
@@ -756,7 +774,7 @@ pub mod ucode {
     /// // 0x66 | d1 23 00    | iowrs I[$r2], $r3     | CC_SCRATCH[1] = 2 (ACK, own obs.)
     /// // 0x69 | f0 07 04    | mov   $r0, 0x04       |
     /// // 0x6c | d1 70 00    | iowrs I[$r7], $r0     | MAILBOX1 = phase 04 (holding)
-    /// // poll2:                                     | hold while the host submits
+    /// // poll2:                                     | hold across the host's validate
     /// // 0x6f | cf 14 00    | iord  $r4, I[$r1]     |
     /// // 0x72 | b0 44 03    | cmpu b32 $r4, 0x03    | CMD_FENCE_CLEAR?
     /// // 0x75 | f4 0b 14    | bra eq, +0x14         | -> 0x89 do_clear
@@ -854,7 +872,11 @@ pub mod ucode {
     // ---------------------------------------------------------------------
     // FENCE — full coverage, 0x00 through 0x97, `zero_tail` closing 0x97..192.
     //
-    // Read this as the second of two independent derivations. The listing above
+    // Read this as the bytes checked against the listing by arithmetic the
+    // author did not perform. (For BRANCHES specifically, the paired
+    // `bra_to`/`bra_target` asserts are exact inverses — the second is implied
+    // by the first, and what it buys is one-sided-redefinition detection, not a
+    // second opinion. See spec §11.3.) The listing above
     // was written first and the bytes typed from it; these assertions rebuild
     // the instructions from the *decoded* fields — opcode via the constructor,
     // register index via `reg << 4`, port immediate via `falcon_io()`, branch
@@ -872,8 +894,8 @@ pub mod ucode {
         assert!(eq3(&slice3(b, 0x03), &sethi_i8(1, (IO_CC_SCRATCH0 >> 16) as u8)));
         assert!(eq4(&slice4(b, 0x06), &mov_i16(2, (IO_CC_SCRATCH1 & 0xFFFF) as u16)));
         assert!(eq3(&slice3(b, 0x0a), &sethi_i8(2, (IO_CC_SCRATCH1 >> 16) as u8)));
-        assert!(eq4(&slice4(b, 0x0d), &mov_i16(6, IO_MAILBOX0 as u16)));
-        assert!(eq4(&slice4(b, 0x11), &mov_i16(7, IO_MAILBOX1 as u16)));
+        assert!(eq4(&slice4(b, 0x0d), &mov_i16(6, port_i16(IO_MAILBOX0))));
+        assert!(eq4(&slice4(b, 0x11), &mov_i16(7, port_i16(IO_MAILBOX1))));
         assert!(eq3(&slice3(b, 0x15), &mov_i8(8, (IO_ENGINE_STATUS & 0xFF) as u8)));
         assert!(eq3(&slice3(b, 0x18), &sethi_i8(8, (IO_ENGINE_STATUS >> 16) as u8)));
         assert!(eq3(&slice3(b, 0x1b), &mov_i8(3, CHAN_VALID as u8)));
@@ -1672,7 +1694,18 @@ pub fn init(gpu: &GpuInfo) {
                                             let pre_mb0 = fecs_read(bar0, base + 0x040);
                                             let pre_cpuctl = fecs_read(bar0, base + 0x100);
                                             serial_println!(":: kepler: ucode pre mailbox0={:08X} cpuctl={:08X} ::", pre_mb0, pre_cpuctl);
-                                        
+
+                                            // Halt before rewriting IMEM, and prove it. Pass A can
+                                            // leave the core started-and-stalled (the s28 signature
+                                            // 0x00000012 — trigger latched, core refused), and pass B
+                                            // then rewrites IMEM underneath it. The unit is at rest on
+                                            // the first pass, so this is a no-op there and load-
+                                            // bearing on the second.
+                                            fecs_write(bar0, base + 0x100, 0x10); // CPUCTL <- STOPPED
+                                            let ab_halt = fecs_read(bar0, base + 0x100);
+                                            serial_println!(":: kepler: ucode halt img={} cpuctl={:08X} halted={} ::",
+                                                img_label, ab_halt, if (ab_halt & 0x10) != 0 { "Y" } else { "N" });
+
                                             // Upload, padding the full IMEM page so the code TLB marks it usable.
                                             fecs_write(bar0, base + 0x180, 1 << 24); // IMEMC offset=0, AINCW
                                             fecs_write(bar0, base + 0x188, 0);       // IMEMT tag=0 (matches BOOTVEC=0)
@@ -2182,11 +2215,17 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                 tlb, if tlb == TLB_PAGE0_USABLE { "Y" } else { "N" });
 
                                             // --- readback verify through AINCR --------------------
-                                            // This is what catches an upload aimed at the wrong
-                                            // register: had the words gone to IMEMC instead of IMEMD,
-                                            // IMEM would still hold its old contents and the very
-                                            // first compare would miss. It reports WHERE and WITH
-                                            // WHAT, so a mismatch is diagnosable rather than a flag.
+                                            // Catches an upload aimed at the wrong register: had the
+                                            // words gone to IMEMC instead of IMEMD, IMEM would still
+                                            // hold its previous contents and the compare would miss.
+                                            //
+                                            // ⚠ It does NOT necessarily miss at word 0. FENCE words
+                                            // 0..2 are byte-identical to ECHO's s37 prologue (both
+                                            // images open by loading the same two CC_SCRATCH ports),
+                                            // so against a stale ECHO image in IMEM the first
+                                            // divergence is word 3. Do not read "idx=0" as the
+                                            // signature of a failed upload, and do not read a clean
+                                            // word 0 as evidence the upload took.
                                             fecs_write(bar0, fb + 0x180, IMEMC_AINCR);
                                             let mut verify_ok = true;
                                             let mut bad_at = 0usize;
@@ -2201,8 +2240,12 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                     bad_want = img[k];
                                                 }
                                             }
-                                            serial_println!(":: kepler: FENCE verify ok={} words={} first-bad idx={} got={:08X} want={:08X} ::",
-                                                if verify_ok { "Y" } else { "N" }, img.len(), bad_at, bad_got, bad_want);
+                                            if verify_ok {
+                                                serial_println!(":: kepler: FENCE verify ok=Y words={} — every word matched ::", img.len());
+                                            } else {
+                                                serial_println!(":: kepler: FENCE verify ok=N words={} first-bad idx={} got={:08X} want={:08X} ::",
+                                                    img.len(), bad_at, bad_got, bad_want);
+                                            }
 
                                             let dmactl_pre = fecs_read(bar0, fb + 0x10C);
                                             fecs_write(bar0, fb + 0x10C, dmactl_pre & !1);
@@ -2221,13 +2264,35 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                 fecs_write(bar0, fb + 0x100, CPUCTL_START); // START_TRIGGER
                                                 serial_println!(":: kepler: FENCE start bootvec=0 cpuctl<={:08X} ::", CPUCTL_START);
 
-                                                // --- gate 1: did it start? FOUR outcomes, four prints.
+                                                // --- gate 1: did it start? -----------------------
                                                 //
-                                                // ⚠ The two bound markers are tested for EQUALITY and
-                                                // FIRST. They are sign-extended words — PHASE_A_BOUND
-                                                // is 0xFFFFFFBD — so any `> 0` or `>= 3` progress test
-                                                // reached first would swallow them and report forward
-                                                // progress on a program that gave up.
+                                                // Honest reachable set HERE is {progress, foreign,
+                                                // timeout}: the loop breaks on the first non-seed
+                                                // read and the pre-loop stamp lands within
+                                                // microseconds, so neither bound marker can be the
+                                                // first thing observed. The bound arms are kept
+                                                // because they cost nothing and because gate3 — after
+                                                // the CLEAR command, where a bound exit IS the
+                                                // expected failure — shares this vocabulary.
+                                                //
+                                                // ⚠ The bound markers are tested for EQUALITY and
+                                                // FIRST regardless. They are sign-extended words —
+                                                // PHASE_A_BOUND is 0xFFFFFFBD — so any `> 0` or
+                                                // `>= 3` test reached first would swallow them and
+                                                // report forward progress on a program that gave up.
+                                                //
+                                                // Phase membership is a SET, not a range. FENCE
+                                                // writes only {1,3,4,5}; `mb1 == 2` is reachable only
+                                                // from a foreign image (ECHO/POKE stamp
+                                                // PHASE_A_POSTREAD there) — which is precisely the
+                                                // stale-IMEM case FOREIGN-PHASE exists to name, and a
+                                                // `1..=5` range would have called it progress.
+                                                let is_fence_phase = |v: u32| {
+                                                    v == ucode::PHASE_FENCE_PRELOOP as u32
+                                                        || v == ucode::PHASE_FENCE_PREASSERT as u32
+                                                        || v == ucode::PHASE_FENCE_ASSERTED as u32
+                                                        || v == ucode::PHASE_FENCE_DONE as u32
+                                                };
                                                 let mut mb1 = 0u32;
                                                 let mut gate1 = "timeout";
                                                 for _ in 0..ucode::HOST_ACK_ITERS {
@@ -2235,11 +2300,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                     if mb1 == ucode::PHASE_A_BOUND { gate1 = "bound1"; break; }
                                                     if mb1 == ucode::PHASE_FENCE_BOUND2 { gate1 = "bound2"; break; }
                                                     if mb1 == MB_SEED || mb1 == 0 { core::hint::spin_loop(); continue; }
-                                                    if mb1 >= ucode::PHASE_FENCE_PRELOOP as u32
-                                                        && mb1 <= ucode::PHASE_FENCE_DONE as u32 {
-                                                        gate1 = "progress";
-                                                        break;
-                                                    }
+                                                    if is_fence_phase(mb1) { gate1 = "progress"; break; }
                                                     gate1 = "foreign";
                                                     break;
                                                 }
@@ -2286,15 +2347,68 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                     let es_falcon = fecs_read(bar0, fb + 0x040);
                                                     let phase = fecs_read(bar0, fb + 0x044);
                                                     let es_host = fecs_read(bar0, fb + 0xC00);
+                                                    // THE TREATMENT. These two are not decoration —
+                                                    // they gate the verdict below. `acked` = the
+                                                    // falcon reached do_assert at all; `took` = the
+                                                    // bit is actually set in ENGINE_STATUS.
+                                                    let acked = ack != MB_SEED;
+                                                    let took = (es_falcon & ucode::CHAN_VALID) != 0;
                                                     serial_println!(":: kepler: FENCE assert ack={:08X} iters={} phase={:08X} eng-status-per-falcon={:08X} eng-status-per-host={:08X} ::",
                                                         ack, ack_iters, phase, es_falcon, es_host);
-                                                    serial_println!(":: kepler: FENCE assert took={} class={} ::",
-                                                        if (es_falcon & ucode::CHAN_VALID) != 0 { "Y" } else { "N" },
+                                                    serial_println!(":: kepler: FENCE assert acked={} took={} class={} ::",
+                                                        if acked { "Y" } else { "N" },
+                                                        if took { "Y" } else { "N" },
                                                         classify_fecs_word(es_falcon));
 
-                                                    // --- submit, and read PFIFO's verdict --------
+                                                    // --- WHERE DID THE WRITE LAND? -----------------
+                                                    // `acked=Y took=N` is the ambiguous reading this
+                                                    // arc shipped with: either the derived port
+                                                    // 0x30000 is not ENGINE_STATUS and the write
+                                                    // landed somewhere else, or the port is right and
+                                                    // ENGINE_STATUS ignores a falcon-side write. The
+                                                    // two license opposite next moves.
+                                                    //
+                                                    // A read-only sweep of the FECS host window
+                                                    // separates them by finding CHAN_VALID's value
+                                                    // where it actually is. Every offset here is
+                                                    // proven-live (spec §2) and 0x504 is EXCLUDED —
+                                                    // reading it wedges the unit for the boot (§5.4)
+                                                    // and would void everything after this point.
+                                                    if acked && !took {
+                                                        serial_println!(":: kepler: FENCE stray-sweep begin — hunting CHAN_VALID={:08X} across the FECS window (0x504 excluded) ::",
+                                                            ucode::CHAN_VALID);
+                                                        let mut hits = 0u32;
+                                                        for off in (0..=0x1FCusize).step_by(4) {
+                                                            let v = fecs_read(bar0, fb + off);
+                                                            if v == ucode::CHAN_VALID {
+                                                                hits += 1;
+                                                                serial_println!(":: kepler: FENCE stray-sweep HIT off={:03X} val={:08X} ::", off, v);
+                                                            }
+                                                        }
+                                                        for &off in &[0x800usize, 0x804, 0xB00, 0xB04, 0xC00, 0xC08] {
+                                                            let v = fecs_read(bar0, fb + off);
+                                                            if v == ucode::CHAN_VALID {
+                                                                hits += 1;
+                                                                serial_println!(":: kepler: FENCE stray-sweep HIT off={:03X} val={:08X} ::", off, v);
+                                                            }
+                                                        }
+                                                        // MAILBOX0/1 legitimately hold falcon-written
+                                                        // values, so a hit there is not a stray; the
+                                                        // interesting hits are anywhere else.
+                                                        if hits == 0 {
+                                                            serial_println!(":: kepler: FENCE stray-sweep NONE — CHAN_VALID is nowhere in the window; the write did not land in a register we can see, so a WRONG PORT is not ruled out ::");
+                                                        } else {
+                                                            serial_println!(":: kepler: FENCE stray-sweep hits={} — compare against MAILBOX0(040)/MAILBOX1(044); a hit at any OTHER offset names where the derived port actually points ::", hits);
+                                                        }
+                                                    }
+
+                                                    // --- re-validate the channel, read the verdict
                                                     // Rebuild the channel exactly as the canonical
-                                                    // instance-block setup did, high bit included.
+                                                    // instance-block setup did, high bit included,
+                                                    // then read the channel-validate error at 0x252c.
+                                                    // This is a VALIDATE, not a runlist submit; the
+                                                    // submit (0x2270/0x2274) is downstream and is not
+                                                    // reached or perturbed from here.
                                                     unsafe {
                                                         core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32,
                                                             ((userd_off >> 32) as u32) | 0x80000000);
@@ -2311,12 +2425,27 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                         chan_want, chan_rb, if stuck { "Y" } else { "N" });
                                                     serial_println!(":: kepler: FENCE verdict err={:08X} stat={:08X} ::", err, stat);
 
-                                                    // The readback is a precondition of the verdict,
-                                                    // not decoration: if the hardware dropped VALID
-                                                    // the instant we wrote it, then `err` describes
-                                                    // some other channel state and means nothing
-                                                    // about our experiment either way.
-                                                    if !stuck {
+                                                    // ⛔ TWO preconditions gate this verdict, and the
+                                                    // treatment gate comes FIRST.
+                                                    //
+                                                    // If the falcon never reached the assert, or
+                                                    // reached it and the bit did not take, then no
+                                                    // falcon-asserted CHAN_VALID ever existed and the
+                                                    // experiment was never performed. `err` would then
+                                                    // read 0x2 — the standing result for 28 sittings —
+                                                    // and an ungated three-way would print CANDIDATE-1
+                                                    // ELIMINATED. That is the EXPECTED answer, so it
+                                                    // would be believed, on a boot where the treatment
+                                                    // was never applied. The `err == 0` arm is worse
+                                                    // still: a false CONFIRMED. Same class of defect
+                                                    // that killed bounce 5, and the same argument the
+                                                    // `stuck` gate below already makes.
+                                                    if !acked || !took {
+                                                        serial_println!(":: kepler: FENCE VOID (treatment not applied) acked={} took={} — no falcon-asserted CHAN_VALID existed when the channel was written; err={:08X} says NOTHING about candidate 1 and NO conclusion is drawn ::",
+                                                            if acked { "Y" } else { "N" },
+                                                            if took { "Y" } else { "N" },
+                                                            err);
+                                                    } else if !stuck {
                                                         serial_println!(":: kepler: FENCE VOID — VALID did not stick in PFIFO_CHAN[1]; err={:08X} is uninterpretable and NO conclusion is drawn ::", err);
                                                     } else if err == 0 {
                                                         serial_println!(":: kepler: FENCE CANDIDATE-1 CONFIRMED err=00000000 — PFIFO validated the channel with a FALCON-asserted CHAN_VALID ::");
@@ -2678,7 +2807,16 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                         const IMEM_PAGE_WORDS: usize = 0x40;
                                         const MB_SEED: u32 = 0xA5A5_0000;
 
-                                        // Halt the core if the echo leg left it running.
+                                        // Halt the core if the echo leg left it running, and PROVE
+                                        // the halt. This comment used to sit above the DMACTL clear
+                                        // alone, which is not a halt: clearing REQUIRE_CTX permits a
+                                        // core to run, it does not stop one. The echo/FENCE legs
+                                        // before this one both start cores.
+                                        fecs_write(bar0, pbase + 0x100, 0x10); // CPUCTL <- STOPPED
+                                        let poke_halt = fecs_read(bar0, pbase + 0x100);
+                                        serial_println!(":: kepler: ucode-poke halt cpuctl={:08X} halted={} ::",
+                                            poke_halt, if (poke_halt & 0x10) != 0 { "Y" } else { "N" });
+
                                         let dmactl_pre = fecs_read(bar0, pbase + 0x10C);
                                         fecs_write(bar0, pbase + 0x10C, dmactl_pre & !1);
 
