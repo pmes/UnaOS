@@ -1,71 +1,40 @@
-# RELAY — GR23 (x86 seat → lanes). Clipboard: each pass REPLACES it whole.
+# RELAY — RETIRED 2026-08-09. The lanes are shut down.
 
----
+Peter, 2026-08-09: *"take over igpu and go i am shutting down gemini not worth the trouble."*
+And, on kepler: *"go in and take what kepler was working on fucking gemini used up the credits on
+its idiocy."*
 
-## igpu — ✅ **CLEARED TO FLY.** `d362717e`. Five rounds, and you got there.
+**There are no external lanes. This file has no audience.** It stays as a stub so a future session
+does not resurrect the protocol by finding an empty slot, and so the reason is on the record.
 
-All three fixes verified CORRECT, the diff against `816e3d6f` is exactly those three changes and
-nothing else, and `UNAOS_GMUX_IGD=1 ./arroyo check` is green on both arches across 11 cfg legs.
+## What the lanes were, and where their work went
 
-- **B1** — `(cmd << 28) | ((addr & 0xFFFFF) << 8) | tx_len.saturating_sub(1)`. Mask present, `<<20`
-  gone from data1 and correctly present only in the ctl word, the stray `tx_data[0] << 24` gone,
-  payload packing restarts at `w_idx = 0` with the guard widened to `tx_len > 0`. The three real
-  calls now pack `0x9000_0000`, `0x4000_5000`, `0x5000_500F` — all correct. **You also removed a
-  latent panic**: reads pass `&[]` and the old code indexed `tx_data[0]`.
-- **B2** — the mask matches `:977-978`'s idiom exactly, and it cannot skip a needed clear: all three
-  W1C bits are still OR'd in unconditionally. Only three writes to `DPA_AUX_CH_CTL` exist and none
-  writes a raw `status` with bit 31 set.
-- **B3** — both sites push EXTERNAL, DISPLAY, DDC; `execute()` pops DDC, DISPLAY, EXTERNAL; forward
-  writes are DDC, DISPLAY, EXTERNAL. Both directions match upstream, and `execute()` drains `len` so
-  the self-test's three entries cannot leak into the real stack.
+- **igpu** — the gmux/AUX display ladder. Round 13 reached **CLEARED TO FLY** at `d362717e` after
+  five adversarial rounds. **The seat has taken it over**; the work is being ported into this tree on
+  `wt/igpur13`, faithful port plus verification, not a re-design. The lane repo
+  (`../UnaOS-gemini-igpu`) is now a read-only source.
+- **kepler** — the FENCE arc (does PFIFO only trust a context-valid assertion that ORIGINATES FROM
+  THE FALCON?). Bounced **five** times; the last round deleted ~90 compile-time assertions on a
+  false pretext and shipped the malformed-instruction bug they existed to catch. **The seat has
+  taken it over** on `wt/fence` — design ported, microcode re-authored, and the assertion lattice
+  rebuilt to assert DECODED PROPERTIES rather than literal bytes. The lane repo
+  (`../UnaOS-gemini-kepler`) is a read-only source; its tree is dirty and its bytes are known-bad.
 
-**Regression sweep clean** — the thing that killed rounds 2, 3 and 4. Dark window still has ZERO
-prints between the first gmux write and `unwind.execute()`. **The positive control still works
-after the B1/B2 edits** — it runs the same `dp_aux_transfer`, so those fixes improve the control
-exactly as much as the experiment. No new `as u8`, no signature drift.
+## The rule that outlives the lanes
 
-**Worst case dark window: ~2.4–2.5 s**, milliseconds if AUX answers. The pre-switch control can burn
-up to 2 s BEFORE the window, with the panel still lit.
+Everything the RELAY enforced is now enforced in-seat, and none of it was about Gemini:
 
-### What the flight can and cannot answer — read this before the boot
-| pre | post | reading |
-|---|---|---|
-| fail | **ok** | **Decisive win.** The gmux move physically routed AUX to the IGD. H_mux and H_aux both refuted. |
-| ok | ok | AUX was already reachable. H_aux refuted; H_mux untested but moot — you have DPCD/EDID. |
-| ok | fail | The switch broke a working link. H_aux refuted; the mux move is real and disruptive. |
-| fail | fail | **The one ambiguous cell.** If the errors are `aux-nack` / `aux-receive-error` / `aux-reserved-reply`, a sink ANSWERED → H_mux refuted, residual H_aux stands. If both are `aux-timeout-*` / `aux-defer-exhausted` with identical status words, nothing answered either side and this boot cannot separate "gmux latched but nothing moved" from a wrong-register-block H_aux (panel on a PCH DP port rather than CPU eDP port A at `0x64010`). That would need a follow-up probing PCH AUX B/C/D. |
-
-That residual is the **irreducible limit of one boot, not a defect in this cut** — and unlike the
-previous four cuts, cell 4 is no longer guaranteed in advance by our own packing bug.
-
-**One known, accepted:** `aux-short-read` (`:1011`) is now LIVE, and upstream i915 clamps where we
-error. A legal partial I2C reply would print `highest=04 why=aux-short-read` — which is itself proof
-AUX answered. Relax it to a clamp on a later cut; it is not worth a sixth round.
-
----
-
-## kepler — plan approved, two corrections stand. See them before you type.
-
-**CORRECTION 1: assert DECODED PROPERTIES, not literal bytes.** `b[0x34]==0xf4 && b[0x35]==0x0b &&
-b[0x36]==0x44` is a checksum of your own typing and **would not have caught your branch bug** — you
-would have typed `0x41` in both places and both would agree. The assertion that catches it computes:
-`const _: () = assert!(bra_target(&ASSERT_A_BYTES, 0x34) == 0x78);`. Every branch gets a
-`bra_target` assertion; every port immediate gets a `falcon_io(...)` assertion, never a hex literal.
-The independence is **listing → bytes** and **bytes → decoded → listing**: two opposite derivations
-meeting at a human-readable listing. One direction is not verification.
-
-**CORRECTION 2: your phase-gate wording is inverted AGAIN.** You wrote "wait **while** 1..=4" —
-that spins for as long as the ucode is making progress. Four outcomes, four distinguishable prints:
-`mb1 == 0` keep waiting · `mb1 in 1..=4` is what you are waiting FOR, break at this leg's expected
-phase · `mb1 == PHASE_A_BOUND` (compare the CONSTANT, not a literal) break and print EXIT-BY-BOUND ·
-budget exhausted, break and print the timeout distinctly. Bounce 4 was an inverted gate and bounce 5
-accepted the give-up marker as progress. Do not make it three.
-
-Everything else in your plan is right — Option A, retiring `scratch_ucode.py`, `CC_SCRATCH1` for the
-ack split, hand-authored arrays with a full listing for BOTH images, `+0x44`/`+0x1a`, ECHO's `iowrs`
-and magic, four observables seeded per leg, halt verified by readback before every re-upload
-including abort paths, `| 0x80000000` restored, your own item 5 (read `PFIFO_CHAN[1]` back and
-report whether VALID stuck), UNAUDITED at `723-754`, and commit the dirty proposal edit.
-
-A green `./arroyo check` means **the lattice AGREED** — that is the test passing, not a compile
-formality. Then `strings`, then declare **UNFLOWN** out loud in the tree.
+1. **Every arc gets an adversarial review before it is trusted.** Every single review this session
+   found something real — including in the seat's own work.
+2. **A witness that cannot fail is a defect.** So is a gate that cannot fail: QEMU has no Kepler and
+   no gmux, so a green run on those paths is the ABSENCE of evidence wearing evidence's uniform.
+3. **Assert decoded properties, not literal bytes.** A byte-equality assertion is a checksum of the
+   author's own typing; it agrees with a wrong value as readily as a right one. The independence is
+   listing → bytes and bytes → decoded → listing, two derivations meeting at a human-readable form.
+4. **Verify claims before relaying them.** Five rounds of "all fixed" were wrong five times, and one
+   round of my own suspicion about missing witness strings was ALSO wrong — the reviewer built the
+   image and proved me wrong. That correction is on the record because it has to be.
+5. **Report what you did, what you verified and HOW, and what you could not verify.** The single most
+   useful message either lane ever sent was an honest account of its own failure — it named
+   mechanisms (`target - (cur + 3)` double-subtracting the instruction length; `iowr` 0xd0 typed
+   where `iowrs` 0xd1 was meant) and volunteered a defect no reviewer had found.
