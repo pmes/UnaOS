@@ -2550,6 +2550,23 @@ fn composite_once() {
     #[cfg(feature = "witness")]
     let c2_t0 = crate::arch::now_cycles();
     let mut tail = composite_inner();
+    // DOCK — the strip is the pass's LAST layer under the sprite: after every window, before the
+    // cursor tail. Two lines, and both of them gated to the arch and knob the dock exists on.
+    //
+    // It is damage-driven and returns `false` without touching a pixel unless the tile model changed
+    // or this pass painted over the strip (see `dock::compose`), so the steady-state cost of this
+    // call is one bounded table scan and an integer compare — charged to `pass_us` below, which is
+    // where a cost the composite pays belongs.
+    //
+    // A repaint takes the sprite down itself and answers `true`; upgrading the tail to `Repaint` is
+    // what puts it back, and is the same upgrade `take_present_dirty` performs immediately below.
+    // `Adopt` and `Settle` are NOT downgraded — each is the sole closer of a session state whose loss
+    // would strand the overlay mechanism, and each already repaints the sprite from the finished
+    // front, which is over the strip this call just painted.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    if super::dock::compose() && tail == CursorTail::Untouched {
+        tail = CursorTail::Repaint;
+    }
     #[cfg(feature = "witness")]
     let c2_t1 = crate::arch::now_cycles();
     // CURSOR-7 — read BEFORE the tail runs, so a repaint the tail is already going to do is not
@@ -11231,4 +11248,120 @@ pub fn focus_reset() {
     SHELL_Z.store(0, Ordering::Release);
     FOCUS_ASID.store(0, Ordering::Release);
     repaint();
+}
+
+// ---- DOCK seam ---------------------------------------------------------------------------------
+//
+// **Additive, and gated to exactly where the dock exists.** `video::dock` is
+// `x86_64 + feature = "wc"`; so is everything below. On aarch64, and on a knob-off x86 build, this
+// block does not compile and the artifact is unchanged — which is also why it is APPENDED rather
+// than filed next to `focus_ring`, whose neighbourhood it belongs to logically: a definition
+// inserted higher up renumbers every `core::panic::Location` below it, and those records are in the
+// loadable image. `focus_reset` above states the same rule for the same reason.
+//
+// Two new items and no edit to an existing one. The dock needs three facts `info` does not carry —
+// the CAPTION, whether the row is on the panel, and whether it holds focus — and it needs them for
+// every row at once; and it needs to know whether the pass that just ran painted over the strip.
+// Both are answered by ONE bounded scan of the table under ONE lock, because the dock runs at the
+// tail of every composite and a second lock there is a cost with no content.
+
+/// DOCK — one row of the window table, as the dock needs to draw and route it.
+///
+/// A SNAPSHOT, never a handle, on [`info`]'s rule: re-read it after any mutating call. The caption is
+/// copied rather than borrowed because the table lock is released before the dock draws anything.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[derive(Clone, Copy)]
+pub struct DockEntry {
+    /// Window id (`1..=MAX_WINDOWS`).
+    pub id: WinId,
+    /// Owning address-space id — what a tile press raises, through [`focus_changed`].
+    pub owner_asid: u64,
+    /// The kernel's copy of the caption. Kernel-owned bytes; an app cannot forge another window's.
+    pub title: [u8; MAX_TITLE],
+    pub title_len: usize,
+    /// **Is this row ON THE PANEL?** [`above_shell`], i.e. the compositor's own visibility predicate
+    /// rather than a second notion invented for the dock. `false` is the MINIMISED case — the row is
+    /// below [`SHELL_Z`], composites not at all, and is exactly what the dock exists to give a way
+    /// back to. A dock built on a "visible windows" enumeration would omit it.
+    pub visible: bool,
+    /// Does this row's owner hold focus ([`FOCUS_ASID`])? Drives the caption ink only.
+    pub focused: bool,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+impl DockEntry {
+    /// A zeroed entry, for the caller's scratch array.
+    pub const fn empty() -> Self {
+        Self {
+            id: WIN_NONE,
+            owner_asid: 0,
+            title: [0u8; MAX_TITLE],
+            title_len: 0,
+            visible: false,
+            focused: false,
+        }
+    }
+}
+
+/// DOCK — the tile model AND the strip's damage question, from one table scan.
+///
+/// Writes the dock-addressable rows into `out` in window-id order (deterministic, [`focus_ring`]'s
+/// rule: the tile a window occupies must not shuffle under the operator's hand) and returns
+/// `(count, clobbered)`.
+///
+/// `clobbered` answers: *did any row that the compositor will paint intersect `rect`?* The dock
+/// passes the rect it last painted, and uses the answer as its second damage condition — a window
+/// repainted over the strip has destroyed it, and only then must the strip be redrawn. `rect` with a
+/// zero extent asks nothing and always answers `false`, which is what a caller that only wants the
+/// model passes.
+///
+/// **Which rows are dock-addressable.** Live, non-compat rows with a non-zero owner — the same set
+/// [`focus_ring`] cycles and [`hit_test`] can name, and for the same reason: a compat row carries
+/// owner ASID 0 (the `SYS_FB_PRESENT` hook has none), is not a focus target, and a tile for it would
+/// name nobody and raise nothing. Kernel-owned rows (the panel console) ARE included: they have an
+/// owner, `focus_changed` raises them, and a dock that could not bring the console back would be
+/// missing the one window an operator most needs to reach.
+///
+/// Cost and locks: one `TABLE` acquisition, one bounded `MAX_WINDOWS` scan, no allocation, no nested
+/// lock, no new lock order — [`focus_ring`]'s and [`occluders`]'s shape exactly.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn dock_scan(
+    out: &mut [DockEntry; MAX_WINDOWS],
+    rect: (usize, usize, usize, usize),
+) -> (usize, bool) {
+    let shell = shell_z();
+    let focus = focus_asid();
+    let (rx, ry, rw, rh) = rect;
+    let ask = rw != 0 && rh != 0;
+    let t = table();
+    let mut n = 0usize;
+    let mut clobbered = false;
+    for r in t.rows.iter() {
+        if !r.used {
+            continue;
+        }
+        if ask && r.damaged && above_shell(r, shell) && boxes_overlap(outer_box(r), (rx, ry, rw, rh))
+        {
+            clobbered = true;
+        }
+        if r.compat || r.owner_asid == 0 {
+            continue;
+        }
+        out[n] = DockEntry {
+            id: r.id,
+            owner_asid: r.owner_asid,
+            title: r.title,
+            title_len: r.title_len.min(MAX_TITLE),
+            visible: above_shell(r, shell),
+            focused: r.owner_asid == focus,
+        };
+        n += 1;
+    }
+    // No sort: `create_inner` mints `id = slot + 1`, so a scan in ARRAY order is already a scan in
+    // ascending id order, and the id-order determinism [`focus_ring`] pays a sort for is free here.
+    // The invariant is asserted rather than trusted — it is one line, it runs on a 12-element array
+    // of 40-byte entries in the hot tail of every composite pass, and a future id scheme that broke
+    // it would silently start shuffling tiles under the operator's hand.
+    debug_assert!(out[..n].windows(2).all(|p| p[0].id < p[1].id));
+    (n, clobbered)
 }

@@ -5661,6 +5661,27 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
     if mask & !prev != 0 {
         // PRESS edge.
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
+        // DOCK — **judged before EVERY window arm, because the dock is composited on top of them.**
+        //
+        // `wm::hit_test` knows nothing of the strip: it answers from the window table, and a window
+        // lying under the dock would take a press the operator can see landed on a dock tile. Asking
+        // the dock first is the same ordering rule the chrome arm below states for chrome — the
+        // painter that owns the pixel owns the press — applied to the layer above the window layer.
+        //
+        // Neither side can be starved. The dock declines every point outside its own strip
+        // (`Layout::contains`, the same accessor its painter draws from, corners included), so there
+        // is no point at which both this arm and a window arm answer "mine"; and the strip is
+        // auto-sized to its tiles and drawn only when there is at least one, so a bare desktop has no
+        // dock to swallow anything.
+        //
+        // Consumed, with the target set to DROP so the matching RELEASE is dropped rather than
+        // delivered into whatever holds focus after the raise — the rule the close and chrome arms
+        // below already follow for the same reason.
+        #[cfg(feature = "wc")]
+        if crate::video::dock::press_at(x, y) {
+            CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+            return true;
+        }
         // WMDIRECT — **CHROME IS JUDGED BEFORE THE APP ARMS, AND THAT IS THE WHOLE ROUTING RULE.**
         //
         // *A press on a window's kernel-drawn chrome — close box, title strip, border — is an
@@ -14894,6 +14915,12 @@ fn winx_launcher(demo_cpu: usize) {
     crate::video::wm::hittest_selftest();
     #[cfg(feature = "witness")]
     clickroute_selftest();
+    // DOCK — fourth of the click family. It mints three rows of its own and drives `focus_changed(0)`,
+    // so it belongs here for the reason the two above do: after every one-shot per-window latch. It
+    // runs after `clickroute_selftest` rather than before because it leaves a raised window behind
+    // (that IS its verdict) and would otherwise change which owner the routing legs start from.
+    #[cfg(all(feature = "witness", feature = "wc"))]
+    crate::video::dock::selftest();
     // WMDIRECT — third and last of the click family, and deliberately last: it MOVES a row (a drag
     // is a `move_to`, which pins the row against the tiler) and closes it under a live drag, so it
     // is the most disruptive of the three. Running it after the other two means neither of them can

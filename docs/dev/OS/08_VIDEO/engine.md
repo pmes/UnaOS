@@ -8767,3 +8767,176 @@ Both lines are pinned in `scripts/specs/pi4-regression.spec`; the required-witne
 **93 -> 95**, plus one `FORBID` on the FAIL verdict. Green at both gate geometries — `./arroyo
 kernel8-test 240` at default and at `UNAOS_FBW=1920 UNAOS_FBH=1200`, 95/95 each, with the same
 ceramic hash and the same unchanged paper hash in both captures.
+
+## DOCK — every window has a way back (x86, 2026-08-09)
+
+**Peter's ruling, white board Q10, verbatim:** *"i guess mac has had the dock forever so we should
+have a doc and all macos like experience. remember we are trying to make mac users comfortable with
+unaos/crispy we are pretending to be a normal OS. crispy is meant to be an amalgamation of macos
+over the years"* — with the standing priority from the same board, *"just make the os high
+performance if looks a little off we will change it"*.
+
+`video/dock.rs`, `#[cfg(all(target_arch = "x86_64", feature = "wc"))]`. aarch64 does not compile it;
+a knob-off x86 build carries neither the module nor its two seams.
+
+### What it is
+
+A **window switcher**, and nothing else. One tile per dock-addressable window — live, non-compat,
+non-zero owner, which is the same set `focus_ring` cycles and `hit_test` can name — **including the
+windows that are not on the panel**. That inclusion is the whole point. `wm` expresses "minimised" as
+a POSITION: a row whose `z` is below `SHELL_Z` fails `above_shell`, does not composite at all, and
+until this module the only gesture that could bring it back was `<TAB>`. With minimise wired to
+`set_hidden`, a window the operator can send away and cannot call back is a window they have lost.
+
+It is **NOT an app launcher and carries no app grid** — `ARCHITECTURE.md` is explicit that UnaOS
+avoids fixed-feature apps, and there is exactly one launch path in this kernel (the shell's program
+source / `bg`). This module does not add a second one.
+
+### Geometry and material — no new theme role was needed, and none was invented
+
+| element | colour | metric |
+|---|---|---|
+| strip face | `CHROME_FACE` under `ceramic::shade` | `2*GAP + BUTTON_HEIGHT` = 52 px tall |
+| strip keyline | `FRAME_LINE` | 1 px, radius `CORNER_RADIUS` (all four corners) |
+| strip top bevel | `BEVEL_LIGHT` | `BEVEL` px |
+| tile face | `BUTTON_FACE` / `BUTTON_FACE_PRESSED` under `ceramic::shade_gain` at `CONTROL_GAIN_Q16` | `BUTTON_HEIGHT` x auto, radius `WIDGET_RADIUS` |
+| caption ink | `TITLE_TEXT_ACTIVE` / `TITLE_TEXT_INACTIVE` | `wm::TITLE_CELL` |
+| running indicator | `ACCENT` (on the panel) / `SCROLL_THUMB` (minimised) | `CONTROL_BOX / 2` |
+| padding, inter-tile gap, bottom margin | — | `GAP` |
+
+Centred, bottom-anchored one `GAP` off the panel edge (macOS default), auto-sized to its contents:
+the caption budget starts at 8 glyphs and steps down until the whole strip fits between two `GAP`
+margins. Two numbers are DERIVED rather than lifted, and both say so in the source: the indicator's
+diameter is `CONTROL_BOX / 2` (the title-bar disc halved — a pip must not read as a control), derived
+the way `theme::CONTROL_RADIUS` is derived from the same key; and the tile takes the material at
+`CONTROL_GAIN_Q16` rather than full gain, for ceramic's own stated reason. `kits/crispy/` is not in
+this repo and nothing in the module pretends to have read it.
+
+### Hit-testing follows drawing BY CONSTRUCTION
+
+One geometry accessor, `dock::Layout`. `paint` draws from it and `press_at` routes from it; there is
+no second copy of the tile arithmetic to drift. This is crispywire's law, restated — `wm::controls`
+and `wm::paint_window` kept separate copies of the control-cluster reserve and differed by one `GAP`,
+so the threshold admitted strips the painter then gave a zero-glyph budget.
+
+The press seam is at the **head** of `wc_click_route_at`'s press edge, ahead of every window arm,
+because the dock is composited ON TOP of the window layer: `wm::hit_test` knows nothing of the strip
+and would hand a dock press to the window underneath. Neither side can be starved — `Layout::contains`
+declines every point outside the strip (cut corners included, exactly as `hit_test` declines a
+window's cut head corners), so no point is claimed by both, and the strip is drawn only when there is
+at least one tile.
+
+A tile press does what the router's own raise arm does, through the same two primitives in the same
+order: `user_input_set_active(owner)` (or `(0)` for a kernel-owned row — the console has no input
+ring), then `wm::focus_changed(owner)`. `focus_changed` is what makes this a RESTORE rather than a
+raise: it takes a fresh `z` off the same monotonic allocator for every window the owner has, lifting a
+row from below `SHELL_Z` back over the shell, AND publishes the owner's UNHIDE to the syscall layer,
+which is the wake edge a parked vug needs. One gesture, both halves, no new focus mechanism.
+
+### Damage model — it does not repaint per frame
+
+`dock::compose` runs from `wm::composite_once`, after the window loop and before the cursor tail. It
+repaints on exactly two conditions:
+
+1. **the tile model changed** — window set, caption, visible/focused/pressed state, or layout. All of
+   it folded into one FNV-1a `u64` signature, so the test is an integer compare;
+2. **the pass painted over the strip** — a damaged, visible window whose outer box intersects the rect
+   the dock last painted. Answered inside `wm::dock_scan`, the same bounded `MAX_WINDOWS` scan that
+   produces the model, so it costs no second lock and no second walk.
+
+A quiet pass therefore pays one `dock_scan`, one hash, one compare, and returns having read no pixel
+and written none.
+
+### Front-buffer discipline, and the sprite
+
+WC-H/WC-K/WC-L hold: each panel row of the strip is composed in a cached scratch row and copied out
+with one `FrameBuffer::blit` (a strip row is contiguous), then the whole rect is cleaned once with
+`flush_rect`. That is `stage_fill`'s shape at one-row granularity; the scratch is two 8 KiB `.bss`
+rows rather than a whole-strip buffer. `try_lock`, never `lock` — a contended pass declines and
+repaints next time.
+
+The sprite is bracketed on `wm::erase`'s rule: `compose` calls `cursor::undraw()` before the first
+byte lands and returns `true`, which upgrades the pass's cursor tail to `Repaint`. `Adopt` and
+`Settle` are never downgraded — each is the sole closer of a session state, and each already repaints
+the sprite from the finished front, which is over the strip.
+
+### Cost, measured
+
+The curvature is paid for only where there IS curvature. The first cut ran the corner test at every
+pixel (and four more through the keyline ring): **1 799 002 cycles / 18 992 px ≈ 95 cyc/px**. A
+rounded rectangle is straight everywhere except within `r` of a corner, so the row is laid down as
+flat spans and only the `STRIP_R`-wide end bands on the `2*STRIP_R` corner rows are tested per pixel.
+Same pixels, same shape, **457 689 cycles ≈ 24 cyc/px — 3.9x cheaper**.
+
+Headless x86 QEMU, `UNAOS_WC=1 ./arroyo test 60`, three tiles at 504 x 52:
+
+```
+[dock] selftest passes=38 paints=26 rate=684/1k scan=41545cyc/20us paint=609453cyc/305us px/paint=18992 ...
+[comp2] rollup passes=2 pass_us=16999 max_us=19232 sprite_us=484 blit_us=14718 dmg_px_pp=119700 ...
+```
+
+So a **repaint is ~1.8 % of a composite pass** and the **quiet-pass cost is ~0.12 %** of one, on a
+TCG host where every emulated instruction is dear. `rate=684/1k` is the selftest storm's own rate (it
+creates, raises and closes rows, and each is a model change); the number that matters for a settled
+desktop is the model-unchanged path, which is the `scan=` figure alone.
+
+The ledger is **not `witness`-gated** — the metal image is built without `witness`, and a cost claim
+absent from that artifact is not a claim — and it is emitted from `compose` itself on a 5 s cadence
+(`ROLLUP_PERIOD_US`, matching `wm`'s `WCN_ROLLUP_MS`) so it has a caller the linker keeps. Reachability
+in the metal image is checked with `strings`, not inferred from the feature banner:
+
+```
+$ strings -a target/x86_64_esp/kernel.elf | awk '/\[dock\]/'
+[dock] 
+[dock] press at (
+[dock] decline reason=not-word4
+```
+
+`rate` is the falsifiable half: a dock that quietly redrew every frame would print `paints == passes`.
+
+### The witness
+
+`:: DOCK: ... :: PASS ::`, five legs, `witness`-gated, run from the x86 selftest block after
+`clickroute_selftest` (it mints three rows and drives `focus_changed(0)`, so it belongs after every
+one-shot per-window latch):
+
+1. **model** — three windows, all pushed below the shell, two raised back. The dock must report all
+   three, with exactly the un-raised one marked not-visible. A dock enumerating only on-panel windows
+   reports two here.
+2. **geom** — the press point is tile `k`'s centre as `Layout` computes it, and `Layout::tile_at` must
+   answer `k` for it.
+3. **restore** — a synthetic press at the hidden window's tile centre is consumed, and the window
+   comes back (`z < shell_z` before, `> shell_z` after).
+4. **specific** — it raised THAT window: it is now above both others.
+5. **miss** — a press one pixel above the strip is NOT consumed; the dock does not swallow the panel.
+
+Falsifiability proven rather than asserted: forcing `Layout::tile_at` to answer `Some(0)` for every
+point (a one-line off-by-N, the classic painter/router drift) produced
+
+```
+:: DOCK: strip tiles=3 ... model=true geom=false restore=false specific=false miss=true :: FAIL ::
+```
+
+and reverting restored `PASS`. Three of five legs move under the injected defect; `miss` correctly
+does not, since it never enters a tile.
+
+### Seams touched, and what was NOT
+
+`video/wm.rs` gains **two items and no edit to an existing function body**, both appended at the end
+of the file behind the same x86+`wc` gate (an insertion higher up renumbers every
+`core::panic::Location` below it, and those records are in the loadable image): `DockEntry` and
+`dock_scan`. The only change inside an existing function is the two-line call in `composite_once`.
+`paint_window`, the control discs and the close/teardown path are untouched.
+
+### Known gaps, stated rather than implied away
+
+* **HOVER is not wired.** Only PRESS feedback exists (`BUTTON_FACE_PRESSED`). Hover would need a
+  motion hook in the pointer path, which was outside this arc's lane.
+* **Windows are not kept off the strip.** macOS windows go under the dock and so do ours — the dock
+  is painted last, so it is always on top — but the tiler still places windows over the bottom of the
+  panel, so a window that overlaps the strip and presents at frame rate will repaint the dock at frame
+  rate. Fixing it means reserving the strip inside `wm::place`, which is the tiler, and belongs to
+  whoever owns that file next.
+* **A cut strip corner is filled with `DESKTOP_BG`**, exactly as `paint_window` fills a window's cut
+  head corners. Over a window rather than the desktop that is four small wrong pixels per corner. Same
+  rule the window chrome already lives with, recorded rather than newly introduced.
