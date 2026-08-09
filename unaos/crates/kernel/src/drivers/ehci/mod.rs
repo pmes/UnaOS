@@ -856,6 +856,13 @@ const BT_L3_V_ATYPE: &str = "SKIP:identity-address-type(0x02/0x03 cannot go in a
 const BT_L3_V_NO_NAME: &str = "SKIP:no-name-advertised";
 #[cfg(feature = "bt")]
 const BT_L3_V_NAME_MISMATCH: &str = "SKIP:name-mismatch";
+/// BT-L3 — the device advertised only a SHORTENED Local Name, that name did not contain the target,
+/// but it is a PREFIX of a name that still could — the match would straddle the cut. NOT connected
+/// to: a maybe is not a match, and this arc does not reach for a device on a guess. Printed so that
+/// "my speaker was not found" and "my speaker was heard and could not be confirmed" are different
+/// lines in the capture, because they have completely different fixes.
+#[cfg(feature = "bt")]
+const BT_L3_V_MAYBE_SHORT: &str = "MAYBE:short-name-prefix(heard, NOT connected — needs the complete name)";
 #[cfg(feature = "bt")]
 const BT_L3_V_RSSI_NA: &str = "SKIP:rssi-unavailable(the floor cannot be applied)";
 #[cfg(feature = "bt")]
@@ -1092,6 +1099,11 @@ struct BtDev {
     nlen: u8,
     /// Set when the name was cut at `BT_L2_NAME_MAX`.
     ncut: bool,
+    /// Set when `name` came from a COMPLETE Local Name (AD type 0x09) rather than a Shortened one
+    /// (0x08). A shortened name is a PREFIX of the complete one, so this decides both whether a
+    /// later report may replace the stored name and whether a name MISS is final or merely
+    /// unproven — see the merge and `BT_L3_V_MAYBE_SHORT`.
+    ncomplete: bool,
     reports: u16,
     /// BT-L3 — STICKY: this address was heard advertising CONNECTABLY (`ADV_IND`, `Event_Type`
     /// 0x00) at least once in the window. `evt` above is last-report-wins and cannot answer this:
@@ -1111,6 +1123,7 @@ impl Default for BtDev {
             name: [0; BT_L2_NAME_MAX],
             nlen: 0,
             ncut: false,
+            ncomplete: false,
             reports: 0,
             conn_seen: false,
         }
@@ -1136,6 +1149,36 @@ fn bt_name_contains_ci(hay: &[u8], needle: &[u8]) -> bool {
         let mut all = true;
         for k in 0..needle.len() {
             if fold(hay[start + k]) != fold(needle[k]) {
+                all = false;
+                break;
+            }
+        }
+        if all {
+            return true;
+        }
+    }
+    false
+}
+
+/// BT-L3 — could `needle` still be found in a name of which `hay` is only a PREFIX?
+///
+/// A Shortened Local Name (AD type 0x08) is a prefix of the complete one, so a miss against it is
+/// not a miss against the device — the rest of the name was simply never heard. The match can only
+/// have been lost by STRADDLING the cut, which means some non-empty suffix of `hay` equals the
+/// corresponding prefix of `needle`. (A whole containment is a real hit and is tested first by the
+/// caller, so this answers the strictly weaker question.)
+///
+/// The empty suffix is deliberately excluded: every string trivially ends with the empty prefix,
+/// and admitting it would make EVERY shortened name a maybe, which is the same as no signal at all.
+#[cfg(feature = "bt")]
+fn bt_name_maybe_ci(hay: &[u8], needle: &[u8]) -> bool {
+    let fold = |b: u8| if b.is_ascii_uppercase() { b + 32 } else { b };
+    let maxk = hay.len().min(needle.len());
+    for k in (1..=maxk).rev() {
+        let tail = &hay[hay.len() - k..];
+        let mut all = true;
+        for j in 0..k {
+            if fold(tail[j]) != fold(needle[j]) {
                 all = false;
                 break;
             }
@@ -3734,10 +3777,14 @@ impl Controller {
                 toggle,
                 armed,
                 budget_cy - el,
-                // FINDING 2: the continuation phase is bounded by what REMAINS of this wait's own
-                // window, not by a fresh `hw_wait_budget()` per packet. Without this, one wait
-                // could outlast its stated budget by several seconds and the arc's worst case was
-                // a claim rather than a bound.
+                // FINDING 2, and its re-verify. All three budgets are this wait's REMAINING
+                // window: the per-packet caps, and — the one that actually bounds it — the
+                // whole-call deadline measured from entry. One `bt_read_full_event` therefore
+                // cannot outlast `budget_cy - el`, however many packets the event takes and
+                // however late in the window its first packet lands. That is what makes the loop
+                // above bounded by `budget_cy`, and the arc's ≤3000 ms an arithmetic sum of the
+                // six wait constants rather than a hopeful description of them.
+                budget_cy - el,
                 budget_cy - el,
                 asm,
             ) {
@@ -3931,7 +3978,10 @@ impl Controller {
                 ":: bt-l3: [{}] HCI_LE_Create_Connection (0x200D) NOT SENT — the EP0 control-OUT failed (its own line is above). The command never reached the radio, so no create is outstanding and no cancel is owed == witness ::",
                 self.idx
             );
-            self.bt_l3_tally(t0, seen, attempted, completed, disconnected, cancels, live, outstanding);
+            self.bt_l3_tally(
+                t0, seen, attempted, completed, disconnected, cancels, live, outstanding,
+                st3.live_handle,
+            );
             return;
         }
         attempted += 1;
@@ -4038,10 +4088,18 @@ impl Controller {
                         );
                     }
                 }
-                BtL3Await::Got(len) => serial_println!(
-                    ":: bt-l3: [{}] LE Connection Complete SHORT-EVENT ({} bytes, 21 required) -> MALFORMED — the create is treated as OUTSTANDING (this event cannot be trusted to say it resolved) and the cancel below runs == witness ::",
-                    self.idx, len
-                ),
+                BtL3Await::Got(len) => {
+                    // A connection-SHAPED event that could not be decoded is exactly the state in
+                    // which "no connection event was seen" must not be asserted later. The latch
+                    // sets `blind` for events it WALKS PAST; this one was consumed as the wanted
+                    // event, so it has to set it here or the 0x0C branch would print its
+                    // un-caveated NEVER-INITIATING line on a run that did see something.
+                    st3.blind = true;
+                    serial_println!(
+                        ":: bt-l3: [{}] LE Connection Complete SHORT-EVENT ({} bytes, 21 required) -> MALFORMED — the create is treated as OUTSTANDING (this event cannot be trusted to say it resolved) and the cancel below runs. This run is now BLIND: a connection-shaped event went by undecoded == witness ::",
+                        self.idx, len
+                    );
+                }
                 BtL3Await::Timeout => serial_println!(
                     ":: bt-l3: [{}] NO LE Connection Complete within {}ms — the controller is still INITIATING. The ordinary reading is that the peer stopped advertising between the scan and the create. The create is OUTSTANDING and MUST be cancelled == witness ::",
                     self.idx, BT_L3_CONN_MS
@@ -4188,10 +4246,15 @@ impl Controller {
                                         );
                                     }
                                 }
-                                BtL3Await::Got(len) => serial_println!(
-                                    ":: bt-l3: [{}] post-cancel LE Connection Complete SHORT-EVENT ({} bytes, 21 required) -> MALFORMED; the cancel returned status 0x00 so the create is believed withdrawn, but this arc did not READ the confirmation and says so — treated as STILL OUTSTANDING == witness ::",
-                                    self.idx, len
-                                ),
+                                BtL3Await::Got(len) => {
+                                    // Same asymmetry, same fix: consumed as the wanted event and
+                                    // undecodable, so this run cannot later claim it saw nothing.
+                                    st3.blind = true;
+                                    serial_println!(
+                                        ":: bt-l3: [{}] post-cancel LE Connection Complete SHORT-EVENT ({} bytes, 21 required) -> MALFORMED; the cancel returned status 0x00 so the create is believed withdrawn, but this arc did not READ the confirmation and says so — treated as STILL OUTSTANDING, and the run is BLIND == witness ::",
+                                        self.idx, len
+                                    );
+                                }
                                 BtL3Await::Timeout => serial_println!(
                                     ":: bt-l3: [{}] cancel ACCEPTED but NO LE Connection Complete followed within {}ms. The withdrawal is unconfirmed — treated as STILL OUTSTANDING rather than assumed clean == witness ::",
                                     self.idx, BT_L3_CMD_MS
@@ -4248,7 +4311,10 @@ impl Controller {
             }
         }
 
-        self.bt_l3_tally(t0, seen, attempted, completed, disconnected, cancels, live, outstanding);
+        self.bt_l3_tally(
+            t0, seen, attempted, completed, disconnected, cancels, live, outstanding,
+            st3.live_handle,
+        );
     }
 
     /// BT-L3 — take a latched live handle, if one is held, and witness the recovery.
@@ -4395,15 +4461,24 @@ impl Controller {
         cancels: u32,
         live: bool,
         outstanding: bool,
+        stray: Option<u16>,
     ) {
         // FINDING 5: `unwrap_or(0)` printed `elapsed=0ms` on exactly the run this doc-comment said
         // could not masquerade — the UNCALIBRATED one, where `epace_ms` returns None. A fabricated
         // zero in milliseconds is indistinguishable from an L3 that did nothing. `epace_fmt` is the
         // rest of this file's answer: raw cycles with a `cy` unit when the TSC rate is unknown.
         let (elapsed, unit) = epace_fmt(crate::arch::now_cycles().wrapping_sub(t0));
+        // A latched handle that NO teardown consumed. The invariant "this cannot happen" rests on
+        // an argument — a single create cannot produce two status-0x00 Connection Completes — and
+        // an argument is not a construction. If one is still held here it is an UNDISCONNECTED
+        // LINK, so it is reported rather than dropped, and it reads `none` on every correct path.
         serial_println!(
-            ":: bt-l3: [{}] L3 tally — elapsed={}{} events_read={} connections_attempted={} connections_completed={} disconnections_confirmed={} cancels_issued={} left_outstanding={} == witness ::",
+            ":: bt-l3: [{}] L3 tally — elapsed={}{} events_read={} connections_attempted={} connections_completed={} disconnections_confirmed={} cancels_issued={} unconsumed_latched_handle={} left_outstanding={} == witness ::",
             self.idx, elapsed, unit, events, attempted, completed, disconnected, cancels,
+            match stray {
+                None => "none",
+                Some(_) => "A HANDLE NO TEARDOWN CLAIMED — a second status-0x00 LE Connection Complete was latched and never disconnected. THIS IS A MUST-NOT-APPEAR CONDITION and it means a link is open that this arc did not release",
+            },
             // FINDING 4: the fourth arm of this match, `(true, true)`, had NO PRODUCER. Every site
             // that sets `live` also resolves `outstanding` in the same breath — a connection event
             // is precisely what takes the controller out of the Initiating state — and `outstanding`
@@ -4513,6 +4588,7 @@ impl Controller {
                 armed,
                 win_cy - el,
                 crate::arch::hw_wait_budget(),
+                u64::MAX, // no whole-call deadline: L2's behaviour is unchanged by design
                 &mut asm,
             ) {
                 BtEvt::Got { len, trunc } => (len, trunc),
@@ -4591,6 +4667,10 @@ impl Controller {
             let mut name = [0u8; BT_L2_NAME_MAX];
             let mut nlen = 0usize;
             let mut ncut = false;
+            // WHICH KIND of name filled the slot. A Shortened Local Name is by definition a PREFIX
+            // of the complete one, so "did this come from 0x09 or 0x08" is the difference between
+            // a name that can be matched and a name that can only be matched as far as it goes.
+            let mut ncomplete = false;
             let mut off = 0usize;
             while off + 2 <= dlen {
                 let l = data[off] as usize;
@@ -4611,6 +4691,7 @@ impl Controller {
                         name[..take].copy_from_slice(&src[..take]);
                         nlen = take;
                         ncut = src.len() > BT_L2_NAME_MAX;
+                        ncomplete = ty == BT_AD_NAME_COMPLETE;
                     }
                     if ty == BT_AD_NAME_COMPLETE {
                         break;
@@ -4635,10 +4716,34 @@ impl Controller {
                     // STICKY, unlike `evt`: connectability is a fact about the device, and a later
                     // SCAN_RSP or ADV_NONCONN_IND from the same address does not un-say it.
                     devs[i].conn_seen |= evt_type == BT_L3_ADV_CONNECTABLE;
-                    if devs[i].nlen == 0 && nlen > 0 {
-                        devs[i].name = name;
-                        devs[i].nlen = nlen as u8;
-                        devs[i].ncut = ncut;
+                    // NAME MERGE — MONOTONE MORE INFORMATION, not first-name-wins.
+                    //
+                    // THIS IS THE LINE THAT WOULD HAVE LOST PETER'S SPEAKER. It used to be
+                    // `if devs[i].nlen == 0 && nlen > 0` — first name wins, permanently. A device
+                    // that advertises a SHORTENED Local Name first and the COMPLETE one in a later
+                    // report kept the short one for the whole window. A MEGABOOM heard as "MEGA"
+                    // and then as "MEGABOOM" would print SKIP:name-mismatch and never be connected
+                    // to — and the log would look like a clean, correct no-match. That is exactly
+                    // the failure Peter would experience as "it didn't find my speaker", with
+                    // nothing in the capture admitting it.
+                    //
+                    // A stored name is REPLACED when the new one strictly dominates it:
+                    //   * nothing stored yet, or
+                    //   * stored came from a Shortened (0x08) and this one is COMPLETE (0x09), or
+                    //   * both are shortened and this one is longer (a longer prefix is strictly
+                    //     more of the same name).
+                    // A Complete name is never replaced by a Shortened one, and never by another
+                    // Complete one — the device has already said there is no more name to wait for.
+                    if nlen > 0 {
+                        let take_it = devs[i].nlen == 0
+                            || (!devs[i].ncomplete && ncomplete)
+                            || (!devs[i].ncomplete && !ncomplete && nlen > devs[i].nlen as usize);
+                        if take_it {
+                            devs[i].name = name;
+                            devs[i].nlen = nlen as u8;
+                            devs[i].ncut = ncut;
+                            devs[i].ncomplete = ncomplete;
+                        }
                     }
                 }
                 None if ndev < BT_L2_MAX_DEV => {
@@ -4650,6 +4755,7 @@ impl Controller {
                         name,
                         nlen: nlen as u8,
                         ncut,
+                        ncomplete,
                         reports: 1,
                         conn_seen: evt_type == BT_L3_ADV_CONNECTABLE,
                     };
@@ -4674,6 +4780,7 @@ impl Controller {
         let mut verdict = [BT_L3_V_NOT_CONNECTABLE; BT_L2_MAX_DEV];
         let mut considered = 0u32; // devices that were connectable and could be judged at all
         let mut matched = 0u32; // devices that passed every filter (only the first is used)
+        let mut maybes = 0u32; // shortened names the target could still straddle — heard, not used
         for i in 0..ndev {
             let d = devs[i];
             if !d.conn_seen {
@@ -4697,7 +4804,17 @@ impl Controller {
                         continue;
                     }
                     if !bt_name_contains_ci(&d.name[..d.nlen as usize], want.as_bytes()) {
-                        verdict[i] = BT_L3_V_NAME_MISMATCH;
+                        // A miss against a SHORTENED name is not a miss against the device: the
+                        // rest of the name was never heard. If the target could still straddle
+                        // the cut, say so distinctly — but do NOT connect on a maybe.
+                        verdict[i] = if !d.ncomplete
+                            && bt_name_maybe_ci(&d.name[..d.nlen as usize], want.as_bytes())
+                        {
+                            maybes += 1;
+                            BT_L3_V_MAYBE_SHORT
+                        } else {
+                            BT_L3_V_NAME_MISMATCH
+                        };
                         continue;
                     }
                 }
@@ -4835,10 +4952,15 @@ impl Controller {
                 considered, matched
             ),
             None => serial_println!(
-                ":: bt-l3: [{}] peer NOT SELECTED — no device passed the filters: name={} considered={} matched=0. NO HCI_LE_Create_Connection is issued, nothing is outstanding, and there is nothing to cancel or disconnect. The ordinary reading with a name filter armed is that the named device is OFF or OUT OF RANGE; the per-device l3= verdicts above say which of the two the room looked like == witness ::",
+                ":: bt-l3: [{}] peer NOT SELECTED — no device passed the filters: name={} considered={} matched=0 maybe_short_name={}. NO HCI_LE_Create_Connection is issued, nothing is outstanding, and there is nothing to cancel or disconnect. {} == witness ::",
                 self.idx,
                 match BT_L3_PEER_NAME { Some(w) if !w.is_empty() => w, _ => "(unset)" },
-                considered
+                considered, maybes,
+                if maybes > 0 {
+                    "READ THIS BEFORE CONCLUDING THE DEVICE WAS ABSENT: a device advertised a SHORTENED Local Name that the target could still straddle. It was HEARD and deliberately NOT connected to, because a maybe is not a match. Its l3=MAYBE line above names it"
+                } else {
+                    "The ordinary reading with a name filter armed is that the named device is OFF or OUT OF RANGE; the per-device l3= verdicts above say which of the two the room looked like"
+                }
             ),
         }
         (halted, peer)
@@ -5009,9 +5131,23 @@ impl Controller {
     /// each time) until the event is gathered.
     ///
     /// `armed` says a transfer is ALREADY outstanding (L2's drain leaves exactly one behind when
-    /// its window expires); it is consumed rather than re-armed, and cleared. `first_budget`
-    /// bounds only the FIRST packet; `cont_budget` bounds the CONTINUATION PHASE — every packet
-    /// after the first, taken together, not each.
+    /// its window expires); it is consumed rather than re-armed, and cleared. THREE budgets, and
+    /// they are three because two could not express the thing that matters:
+    ///
+    /// * `first_budget` — the FIRST packet only.
+    /// * `cont_budget` — each CONTINUATION packet, individually.
+    /// * `call_budget` — the WHOLE CALL, measured from entry, and it is the one that makes a
+    ///   caller's window a real bound. Each continuation waits `min(cont_budget, what remains of
+    ///   call_budget)`, so a caller that passes its remaining window for all three gets a call that
+    ///   cannot outlast that window, full stop.
+    ///
+    /// WHY `call_budget` EXISTS — the review caught this twice. The first cut gave every
+    /// continuation the full `hw_wait_budget()`, so a wait could overrun by a budget per packet.
+    /// The second cut bounded the continuation PHASE but started its clock AFTER the first packet
+    /// landed — so a first packet arriving at the window edge handed the continuation phase a
+    /// FRESH full window, and one wait could still take `first_budget + cont_budget` ≈ 2× the
+    /// caller's window. A DURATION IS NOT A DEADLINE. `call_budget` is measured from entry and is
+    /// the deadline; `cont_budget` remains as the per-packet cap the command paths rely on.
     ///
     /// WHY CONTINUATIONS ARE NOW BOUNDED SEPARATELY, and why that is a defect fix and not a knob:
     /// this function used to give every continuation packet the whole of `hw_wait_budget()`
@@ -5033,8 +5169,11 @@ impl Controller {
         armed: &mut bool,
         first_budget: u64,
         cont_budget: u64,
+        call_budget: u64,
         asm: &mut [u8],
     ) -> BtEvt {
+        // THE DEADLINE, taken before anything is armed. Everything below measures against this.
+        let tcall = crate::arch::now_cycles();
         let cap = asm.len().min(BT_EVT_ASM_MAX);
         if !*armed {
             self.bt_arm_read(e, *toggle);
@@ -5079,17 +5218,17 @@ impl Controller {
         let mut trunc = false;
         let max_pkts = cap / (e.mps as usize).max(1) + 2;
         let mut pkts = 1;
-        // The continuation phase's own clock. `cont_budget` is the budget for the WHOLE phase, so
-        // each packet gets what is left of it — an event that arrives one packet at a time cannot
-        // multiply the caller's window by its packet count.
-        let tc0 = crate::arch::now_cycles();
         while have < total {
             if pkts >= max_pkts {
                 trunc = true;
                 break;
             }
-            let cont_rem =
-                cont_budget.saturating_sub(crate::arch::now_cycles().wrapping_sub(tc0));
+            // Each continuation gets the SMALLER of its own per-packet cap and what is left of the
+            // whole-call deadline. The deadline is measured from `tcall` — function ENTRY, before
+            // the first packet — which is the difference between a duration and a deadline, and
+            // the whole of why one wait can no longer take twice its caller's window.
+            let cont_rem = cont_budget
+                .min(call_budget.saturating_sub(crate::arch::now_cycles().wrapping_sub(tcall)));
             self.bt_arm_read(e, *toggle);
             *armed = true;
             let Some(ni) = self.bt_wait_read(e, cont_rem, &mut halted) else {
@@ -5243,10 +5382,14 @@ impl Controller {
                 toggle,
                 armed,
                 crate::arch::hw_wait_budget(),
-                // A COMMAND's continuation keeps the pre-existing full budget: L0/L1 read
-                // 70-byte events (`Read_Local_Supported_Commands`) on this path and their
+                // A COMMAND's continuation keeps the pre-existing full PER-PACKET budget: L0/L1
+                // read 70-byte events (`Read_Local_Supported_Commands`) on this path and their
                 // first-packet budget is already the full one, so there is no window to shrink to.
                 crate::arch::hw_wait_budget(),
+                // No whole-call deadline, which is this path's behaviour BYTE FOR BYTE as it was
+                // before the budget split: `min(cont_budget, MAX - elapsed)` is `cont_budget`.
+                // The loop around this call is bounded structurally by `BT_EVT_MAX` instead.
+                u64::MAX,
                 &mut asm,
             ) {
                 BtEvt::Got { len, trunc } => (len, trunc),

@@ -6005,7 +6005,27 @@ at most 16 entries with the radio already quiet).
 
 **The name decode is L2's, reused unchanged** — the `BT_AD_NAME_COMPLETE` (`0x09`) /
 `BT_AD_NAME_SHORT` (`0x08`) walk in `bt_le_drain`, including the empty-Complete-name guard fixed
-earlier. There is no second name parser. Matching is ASCII-case-insensitive on purpose: advertised
+earlier. There is no second name parser.
+
+> **THE MERGE RULE THAT WOULD HAVE LOST THE SPEAKER.** The table's name merge was
+> *first-name-wins* (`if devs[i].nlen == 0 && nlen > 0`). A device that advertises a **Shortened**
+> Local Name first and the **Complete** one in a later report kept the short one for the whole
+> window — so a MEGABOOM heard as `MEGA` and then as `MEGABOOM` would print `SKIP:name-mismatch`
+> and never be connected to, with a log that looks like a clean, correct no-match. That is exactly
+> the failure Peter would experience as *"it didn't find my speaker"*, with nothing in the capture
+> admitting it. The merge is now **monotone-more-information**: a stored name is replaced when
+> nothing is stored, when a Shortened one is superseded by a **Complete** one, or when both are
+> shortened and the new one is longer. A Complete name is never replaced — the device has said
+> there is no more name to wait for. `BtDev::ncomplete` tracks which kind filled the slot.
+
+And because a shortened name is a **prefix** of the complete one, a miss against it is not a miss
+against the device. When the target could still **straddle the cut** (some non-empty suffix of the
+stored name equals the corresponding prefix of the target), the verdict is
+`MAYBE:short-name-prefix(heard, NOT connected — needs the complete name)` and the count surfaces on
+the `peer NOT SELECTED` line as `maybe_short_name=N`, with the line telling the reader to stop
+before concluding the device was absent. **A maybe is never connected to** — this arc does not reach
+for a device on a guess — but *"my speaker was not found"* and *"my speaker was heard and could not
+be confirmed"* are different lines in the capture, because they have completely different fixes. Matching is ASCII-case-insensitive on purpose: advertised
 names are UTF-8 and a correct Unicode fold is a table this driver has no business carrying, so
 non-ASCII bytes compare verbatim — which can miss, never falsely hit.
 
@@ -6037,9 +6057,9 @@ and when the speaker is off or out of range, in those words, with no create issu
    NO HCI_LE_Create_Connection is issued, nothing is outstanding ... == witness ::
 ```
 
-The verdicts include `SKIP:no-name-advertised`, `SKIP:name-mismatch`, `SKIP:identity-address-type`,
-`SKIP:below-rssi-floor`, `SKIP:rssi-unavailable`, `not-connectable`, `SELECTED`, and
-`also-matched` (a second device answering the same name — not an error, but connecting to both is
+The verdicts include `SKIP:no-name-advertised`, `SKIP:name-mismatch`, `MAYBE:short-name-prefix`,
+`SKIP:identity-address-type`, `SKIP:below-rssi-floor`, `SKIP:rssi-unavailable`, `not-connectable`,
+`SELECTED`, and `also-matched` (a second device answering the same name — not an error, but connecting to both is
 not on offer and picking silently would hide the ambiguity). A `~(cut)` next to a
 `SKIP:name-mismatch` is the one combination worth reading twice: the match was tried against a name
 truncated at `BT_L2_NAME_MAX` (24 bytes), so it may be a **false miss**, and it is visible rather
@@ -6155,7 +6175,7 @@ read as evidence that nothing happened):
 
 ```
 :: bt-l3: [N] L3 tally — elapsed=NNNms events_read=N connections_attempted=N connections_completed=N
-   disconnections_confirmed=N cancels_issued=N left_outstanding=none == witness ::
+   disconnections_confirmed=N cancels_issued=N unconsumed_latched_handle=none left_outstanding=none == witness ::
 ```
 
 `left_outstanding=` reads `none` on every correct path and names what is left on every incorrect
@@ -6170,6 +6190,11 @@ Two things about this line were themselves wrong and are fixed:
   that did nothing. It now uses `epace_fmt`, the rest of the file's answer: raw cycles with a `cy`
   unit when the TSC rate is unknown, so the line reads `elapsed=NNNNNNNNcy` and cannot be mistaken
   for a measured millisecond.
+* **`unconsumed_latched_handle=` is new, and it closes an invariant that rested on an argument.**
+  The claim "no undisconnected handle reaches the tally" held because a single create cannot produce
+  two status-`0x00` Connection Completes — an argument, not a construction. If a latched handle is
+  still held when the tally runs, it is an **open link this arc did not release**, so it is now
+  reported rather than dropped. It reads `none` on every correct path.
 * **The `(live, outstanding) = (true, true)` arm had no producer.** Every site that sets `live` also
   resolves `outstanding` in the same breath — a connection event is precisely what takes the
   controller out of the Initiating state — and `outstanding` is never set again after the create.
@@ -6199,22 +6224,41 @@ makes up to six waits, each able to begin reassembling one — so a wait that ha
 could stall for 300 ms **plus one full budget per continuation packet**. The real worst case was
 ~3.0 s **+ up to ~12 s**.
 
-The fix is the preferred one: the deadline is passed down. `bt_read_full_event` now takes a
-`cont_budget` alongside `first_budget`, bounding the continuation **phase** (not each packet), and
-`bt_l3_await` passes what REMAINS of its own window to both. The bound a caller states is now the
-bound it gets. The reason continuations were unbounded still holds and is preserved: abandoning an
-event half-read desynchronises the toggle, so a continuation expiry returns `Stop` (the endpoint is
-finished with) while a first-packet expiry returns `Idle` (nothing was lost). `bt_hci_command` — a
-command path whose first-packet budget is already the full one, reading 70-byte events — passes
-`hw_wait_budget()` for both and is byte-for-byte unchanged, as is L2's drain, which keeps the full
-continuation budget deliberately: a report arriving in the last milliseconds of the window is worth
-finishing, and the drain has no teardown behind it waiting on the clock.
+**A DURATION IS NOT A DEADLINE — and the first attempt at this fix got that wrong too.** It bounded
+the continuation *phase* rather than each packet, but started that phase's clock **after the first
+packet landed**. A first packet arriving at the window edge therefore handed the continuation phase a
+*fresh full window*, and one wait could still take `first_budget + cont_budget` ≈ **2×** the caller's
+window: ~6000 ms, not 3000. The re-verify caught it.
 
-The 3000 ms is the sum of the six waits on the longest path — 300 (create Command Status) + 1200
-(Connection Complete) + 300 (cancel Command Complete) + 300 (post-cancel meta) + 300 (disconnect
-Command Status) + 600 (Disconnection Complete). On top of it sit **up to three EP0 control-OUTs**
-(create, cancel, disconnect), each with its own transfer budget; those are writes, not waits, and
-are not included in the figure.
+`bt_read_full_event` now takes **three** budgets, and it takes three because two could not express
+the thing that matters:
+
+| budget | bounds | measured from |
+|---|---|---|
+| `first_budget` | the first packet | the wait for that packet |
+| `cont_budget` | each continuation packet, individually | that packet's own wait |
+| **`call_budget`** | **the whole call** | **function ENTRY, before anything is armed** |
+
+Each continuation waits `min(cont_budget, call_budget − elapsed_since_entry)`. `bt_l3_await` passes
+its remaining window for all three, so one `bt_read_full_event` cannot outlast that window however
+many packets the event takes and however late in the window its first packet lands. *That* is what
+makes the bound a caller states the bound it gets.
+
+The reason continuations were unbounded in the first place still holds and is preserved: abandoning
+an event half-read desynchronises the toggle, so a continuation expiry returns `Stop` (the endpoint
+is finished with) while a first-packet expiry returns `Idle` (nothing was lost). `bt_hci_command`
+and L2's drain pass `call_budget = u64::MAX`, which makes `min(cont_budget, MAX − elapsed)` exactly
+`cont_budget` — **byte-for-byte their pre-existing behaviour**. Both are deliberately left alone:
+the command path is bounded structurally by `BT_EVT_MAX` instead, and for the drain, a report
+arriving in the last milliseconds of the window is worth finishing and there is no teardown behind
+it waiting on the clock.
+
+With `call_budget` in place each of the six waits is bounded by its own constant, so the 3000 ms is
+now an arithmetic sum and not a description: 300 (create Command Status) + 1200 (Connection
+Complete) + 300 (cancel Command Complete) + 300 (post-cancel meta) + 300 (disconnect Command Status)
++ 600 (Disconnection Complete). On top of it sit **up to three EP0 control-OUTs** (create, cancel,
+disconnect), each with its own transfer budget; those are writes, not waits, and are not included in
+the figure.
 
 With `tsc_hz() == 0` every L3 window collapses to `hw_wait_budget()/4`, so the worst case *falls* —
 and the tally now prints `elapsed=NNNNcy` rather than a fabricated `0ms` on that run (§22.6), which
