@@ -153,6 +153,112 @@ pub fn usb_info() -> Option<BlockDeviceInfo> {
     *USB_BLOCK_DEVICE.lock()
 }
 
+// ===================== APPLOAD — "is there storage I can load a PROGRAM from?" =====================
+//
+// SDHC-4b gave the internal SD slot a THIRD handle ([`SDHC_BLOCK_DEVICE`]) and `register_sdhc` says
+// so verbatim: "(global BLOCK_DEVICE untouched)". That was deliberate and it stays — the point of
+// the third handle is that a card in the internal reader can never disturb the transport the boot
+// volume is being read through.
+//
+// The DEFECT that motivates this section is not in that decision; it is that every consumer asking a
+// DIFFERENT question — "is there any storage at all that I could load a program off?" — was written
+// against [`info`], which reads the GLOBAL handle and nothing else. So a machine booted from the
+// INTERNAL reader with no USB stick printed
+//
+//     :: SDHCBLK: 8472 STAT.ELF / 12568 VUG.ELF / 12568 PULSE.ELF ::
+//
+// (the card mounted, the programs listed, by name and by size) and then, in the same capture,
+//
+//     [wc-x] desktop-app DECLINE reason=no-storage … no block device ever enumerated
+//
+// while that card sat mounted. The registry was right; the question was asked of the wrong slot.
+//
+// [`program_source`] below is that question, asked ONCE, in the block layer, so no consumer has to
+// carry a `#[cfg]` to get it right.
+//
+// ### PRECEDENCE, and why it is this way round
+//
+// GLOBAL first, Sdhc only as a fallback. This is the whole compatibility argument and it is worth
+// stating flatly: on any boot where the global handle is populated — every boot that has ever run
+// this code, every boot from a USB stick, every Pi boot where `register_sd` claimed the global —
+// `program_source` returns EXACTLY what `info()` returned, from the same slot, read through the same
+// path. No existing boot changes behaviour, because on an existing boot the fallback arm is never
+// reached. The internal card is consulted only in the case that used to have no answer at all.
+//
+// The precedence is also the correct one on the merits, not merely the safe one: the global handle
+// is whatever the active backend selected as THE device, and a machine that has both a boot stick
+// and an internal card should keep loading its programs off the volume the rest of the system is
+// already bound to. A card in the reader is a second source, never a preemption.
+//
+// The `Usb` handle is deliberately NOT in the ladder. It exists so the Pi can reach a stick while
+// the microSD owns the global; on x86 the stick IS the global, so including it here would either be
+// a duplicate of the global arm or would let a Pi program load silently retarget. One fallback,
+// named, is the whole change.
+
+/// APPLOAD: the block device a program should be loaded from, with the HANDLE it was found under —
+/// `None` only when there is genuinely nowhere to look.
+///
+/// Precedence: the global [`BLOCK_DEVICE`] if it is registered, else (x86 + `sdhcblk`) the internal
+/// SD card under [`SDHC_BLOCK_DEVICE`]. See the section note above for why the global comes first and
+/// why that makes this a strict superset of [`info`] rather than a change to any existing boot.
+///
+/// The returned handle is not decoration: the three handles are served by DIFFERENT read paths
+/// (`read_block` goes through the backend selector, `read_block_sdhc` bypasses it into the SDHCI
+/// driver), so a caller that reads without honouring the handle would issue the wrong transport's
+/// commands. `fs::fat::mount_program_source` is the intended consumer and it maps this handle
+/// straight onto the matching `fs::fat::BlockSource`.
+pub fn program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
+    if let Some(dev) = info() {
+        return Some((dev, BlockHandle::Global));
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    if let Some(dev) = sdhc_info() {
+        return Some((dev, BlockHandle::Sdhc));
+    }
+    None
+}
+
+/// APPLOAD: what [`program_source`] LOOKED AT, for the witness lines that report its `None`.
+///
+/// The defect this arc fixes was invisible for exactly one reason: the decline line asserted "no
+/// block device ever enumerated" when it had only ever consulted one of three slots. A refusal that
+/// cannot name what it inspected cannot be falsified by the capture it appears in. So every consumer
+/// that declines on an absent program source now prints this census beside the reason, and a future
+/// no-apps boot names its own cause instead of a boot-wide claim it never checked.
+///
+/// Every field can read either way on a real boot, and the three renderings are distinguishable:
+/// `sdhc=present` (a card registered), `sdhc=absent` (the feature is in, nothing registered),
+/// `sdhc=unbuilt` (no `sdhcblk` in this image, so the handle does not exist to be consulted).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SourceCensus {
+    /// The global [`BLOCK_DEVICE`] slot holds a device.
+    pub global: bool,
+    /// The internal-SD slot: `Some(true/false)` when this image carries the handle, `None` when it
+    /// does not — which is a different fact from "the handle is empty" and is printed differently.
+    pub sdhc: Option<bool>,
+}
+
+impl core::fmt::Display for SourceCensus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "global={}", if self.global { "present" } else { "absent" })?;
+        match self.sdhc {
+            Some(true) => write!(f, " sdhc=present"),
+            Some(false) => write!(f, " sdhc=absent"),
+            None => write!(f, " sdhc=unbuilt"),
+        }
+    }
+}
+
+/// APPLOAD: snapshot the handles [`program_source`] consults. Pure query — takes each slot's lock
+/// briefly and changes nothing, so it is safe to call from a decline path.
+pub fn source_census() -> SourceCensus {
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    let sdhc = Some(sdhc_info().is_some());
+    #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+    let sdhc = None;
+    SourceCensus { global: info().is_some(), sdhc }
+}
+
 /// INSTALL-SEL: which of the two registry handles a device row was read from. The block layer keeps
 /// two `Option<BlockDeviceInfo>` slots — the GLOBAL [`BLOCK_DEVICE`] (whatever the active backend is:
 /// the xHCI stick on x86, the microSD once `register_sd` has run on the Pi) and the dedicated USB

@@ -14823,8 +14823,14 @@ fn winx2_launcher(_demo_cpu: usize) {
         return;
     }
     // Read the image exactly as the shell's x86 `bg` does: FAT boot partition, root directory, 8.3 name.
-    let Ok(fs) = crate::fs::fat::mount() else {
-        serial_println!(":: WINX-2: no FAT boot volume — STAT.ELF end-to-end witness skipped ::");
+    // APPLOAD: `mount_program_source` — the same ladder the shell's `bg` now walks, which is what
+    // "exactly as the shell's x86 `bg` does" was always claiming. The skip line carries the handle
+    // census because the old one asserted absence without naming what it had looked at.
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+        serial_println!(
+            ":: WINX-2: no FAT volume on any program-source handle (handles={}) — STAT.ELF end-to-end witness skipped ::",
+            crate::drivers::block::source_census()
+        );
         return;
     };
     let Ok(de) = fs.find_in_root("STAT.ELF") else {
@@ -16171,8 +16177,12 @@ fn winx8_launcher(_demo_cpu: usize) {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    let Ok(fs) = crate::fs::fat::mount() else {
-        serial_println!(":: WINX-8: no FAT volume on the block device — VUG.ELF end-to-end witness skipped ::");
+    // APPLOAD: see `winx2_launcher` — program source, not the global handle alone.
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+        serial_println!(
+            ":: WINX-8: no FAT volume on any program-source handle (handles={}) — VUG.ELF end-to-end witness skipped ::",
+            crate::drivers::block::source_census()
+        );
         return;
     };
     let Ok(de) = fs.find_in_root("VUG.ELF") else {
@@ -16305,8 +16315,12 @@ fn pulsew_launcher(_demo_cpu: usize) {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    let Ok(fs) = crate::fs::fat::mount() else {
-        serial_println!(":: PULSE-W: no FAT volume on the block device — PULSE.ELF end-to-end witness skipped ::");
+    // APPLOAD: see `winx2_launcher` — program source, not the global handle alone.
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+        serial_println!(
+            ":: PULSE-W: no FAT volume on any program-source handle (handles={}) — PULSE.ELF end-to-end witness skipped ::",
+            crate::drivers::block::source_census()
+        );
         return;
     };
     let Ok(de) = fs.find_in_root("PULSE.ELF") else {
