@@ -1015,3 +1015,31 @@ REQUIRE \[paper\] kit=us-crispy-modern@0787ba9f algo=laid octaves=3 scale=4 amp_
 # ---       nobody can reproduce on paper. Witness-gated, like every other fixture in this spec.
 REQUIRE :: PAPER: kit texture .* :: PASS ::
 FORBID :: PAPER: .* :: FAIL ::
+
+# --- CERAMIC — the brushed-aluminium chrome material, and its determinism -------------------
+# ---    `video/ceramic.rs` is paper's counterpart on the other side of the glass: Peter's
+# ---    directive of 2026-08-09 asked for texture on the window borders and buttons and paper on
+# ---    the text surfaces, and named the material ("the 'ceramic' aluminum acer has on this zen").
+# ---    It is DERIVED, not lifted — the kit carries no ceramic block — and the module says so in
+# ---    as many words rather than dressing its constants up as a citation. The two directives here
+# ---    answer the same two questions paper's do.
+#
+# ---    1. THE WIRE LINE names every derived parameter the generator used AND the FNV-1a 64 of the
+# ---       row table it produced. Emitted once, from the first generation, NOT witness-gated (the
+# ---       metal image carries no `witness` feature). Integer-only on both little-endian arches, so
+# ---       a QEMU capture and a metal capture must print the SAME hash; a different one means a
+# ---       parameter drifted.
+REQUIRE \[ceramic\] derived=peter-2026-08-09 algo=brushed-1d grain_oct=2 pitch=2 grain_amp_q16=786 curve_amp_q16=524 ctrl_gain_q16=32768 seed=0x75ae10b7 rows=128 hash=0x2c525bfdb49df67d
+#
+# ---    2. THE FIXTURE VERDICT is the stronger statement. `ceramic::selftest` recomputes every row
+# ---       from scratch and asserts determinism AND the pinned checksum; asserts the AMPLITUDE
+# ---       BUDGET on every row (no row may move a channel by more than 1310/65536 = 2 %, which is
+# ---       the promise that the material cannot fight the Crispy palette); asserts that `shade` is
+# ---       a modulation and not a painter (zero gain is the identity, and black stays black at
+# ---       every row and gain); asserts eight reference shades of `CHROME_FACE` byte for byte; and
+# ---       checks two hand-derivable identities — value-noise-at-an-even-row == the lattice hash,
+# ---       and the curve's exact quarter turn at row `TILE_H/4`. Its last leg TIMES `shade`, the
+# ---       one operation the material adds per chrome ROW (the per-pixel span work is unchanged),
+# ---       so the cost of chrome texturing is data rather than an estimate. Witness-gated.
+REQUIRE :: CERAMIC: brushed material .* :: PASS ::
+FORBID :: CERAMIC: .* :: FAIL ::

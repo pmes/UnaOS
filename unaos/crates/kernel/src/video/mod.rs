@@ -88,6 +88,13 @@ pub mod theme;
 // the desktop background. Arch-neutral and unconditional: one 88 KiB `.bss` tile generated once on
 // first use, blitted thereafter.
 pub mod paper;
+// CERAMIC — brushed anodised aluminium for the window CHROME, the counterpart to paper's content
+// surface (Peter's directive 2026-08-09: "texture to the window borders scrollbars buttons etc and
+// have paper for text surfaces"). DERIVED, not lifted — the kit carries no ceramic block, and the
+// module header says so rather than dressing the parameters up as a citation. A per-ROW material
+// (the brush runs along x), so it is 512 bytes of `.bss` and costs no per-pixel work at all: it
+// reuses paper's Q16 primitives and modulates the existing theme roles, never replaces them.
+pub mod ceramic;
 // INSTGUI — the first graphical installer: a kernel-owned, CRISPY-themed window over the
 // installer engine (choose disk → erase warning → engine run → verdict). x86-only, and gated
 // on BOTH `wc` (it is a compositor client) and `instgui` (`UNAOS_INSTGUI=1`).
