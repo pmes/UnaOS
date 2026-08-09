@@ -78,6 +78,14 @@ pub mod vperf;
 // comment in `arroyo` for the hashes and the byte counts.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod wcx;
+// DOCK: the bottom strip — one tile per live window, INCLUDING the ones that are not on the panel,
+// and a press that raises and un-hides the window it names. Peter's ruling, white board Q10
+// (2026-08-09): "mac has had the dock forever so we should have a doc and all macos like
+// experience". A window switcher, not an app launcher — there is no app grid here and no second
+// launch path. Same gate as `wcx` (x86 panel path, `UNAOS_WC=1`): aarch64 does not compile it and a
+// knob-off x86 build carries neither the module nor its two seams.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod dock;
 // CRISPY-PI theme const table — carried verbatim from hw-pi4 (single-author law: edits flow
 // through the pi4 seat from the taste-gate). Declared for INSTGUI's use; full chrome wiring
 // (wm/fbcon reading these instead of their own constants) remains the later lockstep arc.
