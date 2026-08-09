@@ -2148,7 +2148,7 @@ fn d11_l0(bus: u8, dev: u8, func: u8, bar0: u64, d: D11) {
         let advanced = (tsf_hi1, tsf_lo1) != (tsf_hi0, tsf_lo0);
         core_regs = Some((macctl, tsf_hi1, tsf_lo1));
         serial_println!(
-            ":: wifi-l0: tsf sample0={:#010x}:{:#010x} sample1={:#010x}:{:#010x} advanced={} — the d11 TSF counter; advanced=1 means the core is CLOCKED AND RUNNING, advanced=0 means only that the MAC is not counting (macctl above says whether it is enabled) and is not by itself a fault ::",
+            ":: wifi-l0: tsf sample0={:#010x}:{:#010x} sample1={:#010x}:{:#010x} advanced={} — the d11 TSF counter; advanced=1 means the TSF counter is clocked and advancing (no claim about the PSM), advanced=0 means only that the MAC is not counting (macctl above says whether it is enabled) and is not by itself a fault ::",
             tsf_hi0, tsf_lo0, tsf_hi1, tsf_lo1, advanced as u8
         );
 
@@ -2200,7 +2200,7 @@ fn d11_l0(bus: u8, dev: u8, func: u8, bar0: u64, d: D11) {
 ///    rather than believed from a boolean.
 /// 2. **Whose configuration this is.** The b43 core bits (`PHY_CLKEN`, `MACPHYCLKEN`, `PHY_BW`,
 ///    `GMODE`) sit outside the enable rule and are not power-on defaults; combined with `MACCTL`'s
-///    `PSM_RUN` and a TSF that predates our own uptime, they say the radio was brought up by the
+///    `PSM_RUN`, they say the radio was brought up by the
 ///    platform firmware before this kernel existed. "Enabled" and "in a state we chose" are
 ///    different claims and this stage refuses to conflate them.
 /// 3. **What S3 therefore still owes.** Nothing for reachability; a reset-to-known-state before S4,
@@ -2209,7 +2209,9 @@ fn d11_l0(bus: u8, dev: u8, func: u8, bar0: u64, d: D11) {
 ///
 /// The `reachability=` field is the standing check: a future part — a different card, a cold power
 /// cycle, a firmware that skips the AirPort — that arrives NOT enabled prints `REQUIRED`, and S3 is
-/// a stage again. The no-op is recorded as a *measurement*, never as an assumption.
+/// a stage again. That S3 owes no write is recorded as a *measurement*, never as an assumption —
+/// and it does not mean `bcma_core_enable` would be inert if run: its first act is
+/// `bcma_core_disable`'s reset assert, which is exactly what S4's prologue needs.
 #[cfg(feature = "bcmaS1")]
 fn d11_s3_witness(wrap: Option<(u32, u32, u32, u32)>, core: Option<(u32, u32, u32)>) {
     let (ioctl, iost, rstc, rsts) = match wrap {
@@ -2227,9 +2229,9 @@ fn d11_s3_witness(wrap: Option<(u32, u32, u32, u32)>, core: Option<(u32, u32, u3
     let in_reset = (rstc & RESET_CTL_RESET) != 0;
     let enabled = masked == IOCTL_CLK && !in_reset;
     serial_println!(
-        ":: wifi-s3: enable-rule ioctl={:#010x} (ioctl&(CLK|FGC))={:#06x} want={:#06x} match={} resetctl={:#010x} (resetctl&RESET)={} resetst={:#010x} => bcma_core_is_enabled={} — Linux drivers/bcma/core.c is EXACTLY these two tests and inspects no other bit; the masked values are printed beside the verdict so a capture can recheck it rather than take it ::",
+        ":: wifi-s3: enable-rule ioctl={:#010x} (ioctl&(CLK|FGC))={:#06x} want={:#06x} match={} resetctl={:#010x} (resetctl&RESET)={:#06x} in-reset={} resetst={:#010x} => bcma_core_is_enabled={} — Linux drivers/bcma/core.c is EXACTLY these two tests and inspects no other bit; the masked values are printed beside the verdict so a capture can recheck it rather than take it ::",
         ioctl, masked, IOCTL_CLK, (masked == IOCTL_CLK) as u8,
-        rstc, in_reset as u8, rsts, enabled as u8
+        rstc, rstc & RESET_CTL_RESET, in_reset as u8, rsts, enabled as u8
     );
 
     // ── 2. The core-specific IOCTL bits — outside the rule, and the whole evidence for ownership. ─
@@ -2240,7 +2242,7 @@ fn d11_s3_witness(wrap: Option<(u32, u32, u32, u32)>, core: Option<(u32, u32, u3
         _ => "reserved",
     };
     serial_println!(
-        ":: wifi-s3: ioctl-decode clk={} fgc={} phy-clken={} phy-reset={} macphyclken={} pllrefsel={} phy-bw={} gmode={} pme-en={} bist-en={} — b43 B43_BCMA_IOCTL_* CORE bits, which bcma_core_is_enabled does NOT inspect. CLK+PHY_CLKEN+MACPHYCLKEN set with FGC and PHY_RESET clear, and a bandwidth SELECTED, is the state a COMPLETED d11 bring-up leaves behind; it is not a power-on default, because power-on does not pick a channel bandwidth ::",
+        ":: wifi-s3: ioctl-decode clk={} fgc={} phy-clken={} phy-reset={} macphyclken={} pllrefsel={} phy-bw={} gmode={} pme-en={} bist-en={} — b43 B43_BCMA_IOCTL_* CORE bits, which bcma_core_is_enabled does NOT inspect. CLK+PHY_CLKEN+MACPHYCLKEN set with FGC and PHY_RESET clear, and a bandwidth SELECTED, is the state a COMPLETED d11 bring-up leaves behind. PHY_BW is a TWO-BIT field whose all-zero encoding decodes as 10MHz, so the claim is NOT that power-on picks no bandwidth: it is that the field reads 0x40 (20MHz) rather than the all-zero reset encoding, and 0x40 is precisely the value b43_wireless_core_reset writes — so the field WAS written, by something shaped like b43 ::",
         (ioctl & IOCTL_CLK != 0) as u8, (ioctl & IOCTL_FGC != 0) as u8,
         (ioctl & IOCTL_PHY_CLKEN != 0) as u8, (ioctl & IOCTL_PHY_RESET != 0) as u8,
         (ioctl & IOCTL_MACPHYCLKEN != 0) as u8, (ioctl & IOCTL_PLLREFSEL != 0) as u8,
@@ -2260,6 +2262,7 @@ fn d11_s3_witness(wrap: Option<(u32, u32, u32, u32)>, core: Option<(u32, u32, u3
 
     // ── 4. Ownership: the MAC's own state, and where the TSF says it came from. ──────────────────
     let mut psm_run = false;
+    let macctl_read = core.is_some();
     if let Some((macctl, tsf_hi, tsf_lo)) = core {
         psm_run = (macctl & MACCTL_PSM_RUN) != 0;
         serial_println!(
@@ -2274,19 +2277,23 @@ fn d11_s3_witness(wrap: Option<(u32, u32, u32, u32)>, core: Option<(u32, u32, u3
         // the cycle count up) keeps the arithmetic away from u64 overflow entirely.
         let hz = crate::bootpace::origin_hz();
         let per_us = hz / 1_000_000;
+        let origin = crate::bootpace::origin_cycles();
         let tsf_us = ((tsf_hi as u64) << 32) | (tsf_lo as u64);
         if per_us == 0 {
             serial_println!(
                 ":: wifi-s3: tsf-provenance UNAVAILABLE tsf={}us reason=tsc-rate-unknown origin-hz={} — the bootpace origin rate has not been calibrated yet, so this kernel's uptime cannot be expressed in microseconds and the comparison below is NOT made up from a guessed frequency ::",
                 tsf_us, hz
             );
+        } else if origin == 0 {
+            serial_println!(
+                ":: wifi-s3: tsf-provenance UNAVAILABLE tsf={}us reason=origin-unset origin-hz={} — the bootpace origin CYCLE STAMP has not been taken, so 'now - origin' would be the raw TSC and the uptime would be fabricated. It is refused for the same reason an uncalibrated rate is ::",
+                tsf_us, hz
+            );
         } else {
-            let up_us = crate::arch::now_cycles()
-                .wrapping_sub(crate::bootpace::origin_cycles())
-                / per_us;
+            let up_us = crate::arch::now_cycles().wrapping_sub(origin) / per_us;
             let predates = tsf_us > up_us;
             serial_println!(
-                ":: wifi-s3: tsf-provenance tsf={}us uptime={}us predates-us={} delta={}us tsc-hz={} — a TSF LARGER than our own uptime means the d11 MAC was started BEFORE this kernel was, i.e. by the platform firmware, so the IOCTL/MACCTL state above is INHERITED and not ours. The uptime is sampled AFTER the TSF, which can only overstate it, so this test errs toward NOT claiming foreign ownership ::",
+                ":: wifi-s3: tsf-provenance tsf={}us uptime={}us predates-us={} delta={}us tsc-hz={} — a TSF larger than our own uptime means the counter has been running longer than this kernel has. It does NOT by itself mean firmware started the MAC: whether this counter free-runs with the PSM halted is undocumented in both directions, so this line is corroboration, never the ownership verdict — that verdict is PSM_RUN's alone. The uptime is sampled AFTER the TSF, which can only overstate it, so this test errs toward NOT claiming foreign ownership ::",
                 tsf_us, up_us, predates as u8, tsf_us.saturating_sub(up_us), hz
             );
         }
@@ -2298,10 +2305,14 @@ fn d11_s3_witness(wrap: Option<(u32, u32, u32, u32)>, core: Option<(u32, u32, u3
 
     // ── 5. The verdict, and the standing check. ──────────────────────────────────────────────────
     serial_println!(
-        ":: wifi-s3: VERDICT reachability={} enable-writes-needed={} ownership={} reset-to-known-state-writes-needed={} wrote-anything=0 — reachability SATISFIED means bcma_core_enable is a NO-OP on this part AS IT ARRIVES: S3 owes nothing to make the core answer, and everything L0/S2r read was read without it. What S3 still owes is to take the core OFF the firmware's configuration and onto ours, and that belongs to S4 as its prologue rather than standing as an independent stage. reachability=REQUIRED on any future boot puts bcma_core_enable back and makes S3 a stage again — this line is a standing check on every boot, not a one-time reading ::",
-        if enabled { "SATISFIED(no-op)" } else { "REQUIRED" },
+        ":: wifi-s3: VERDICT reachability={} enable-writes-needed={} ownership={} reset-to-known-state-writes-needed={} wrote-anything=0 — reachability SATISFIED means S3 owes NO WRITE to make the core answer — not that bcma_core_enable would be inert if run: its first act is bcma_core_disable's reset assert, which is exactly S4's prologue. Everything L0/S2r read was read without it. What S3 still owes is to take the core OFF the firmware's configuration and onto ours, and that belongs to S4 as its prologue rather than standing as an independent stage. reachability=REQUIRED on any future boot puts bcma_core_enable back and makes S3 a stage again — this line is a standing check on every boot, not a one-time reading. ownership: FOREIGN = MACCTL was read and PSM_RUN is set; OURS-OR-IDLE = MACCTL was read and PSM_RUN is clear; UNREAD = the core window was refused, so nothing was read and nothing is claimed — UNREAD is NOT folded into a 'not foreign' reading ::",
+        if enabled { "SATISFIED(no-write)" } else { "REQUIRED" },
         (!enabled) as u8,
-        if psm_run { "FOREIGN" } else { "UNPROVEN" },
+        match (macctl_read, psm_run) {
+            (false, _) => "UNREAD",
+            (true, true) => "FOREIGN",
+            (true, false) => "OURS-OR-IDLE",
+        },
         psm_run as u8
     );
 }
