@@ -339,6 +339,43 @@ active area.
 mode makes rung 6 fail. `why=aux-timeout` most likely means VDD is not actually on, which **retro-
 actively falsifies the `0xABCD0008` = forced-VDD reading** — a genuinely valuable negative result.
 
+**Result:** Flight 1b (Boot AK) returned `why=aux-timeout-error`. Hypothesis 3 dictates the Retina gmux cannot switch AUX separately; it requires switching `GMUX_SWITCH_DISPLAY` to reach the panel.
+
+**Round 13 — the flight that can answer it.** Moving `GMUX_SWITCH_DISPLAY` (and `EXTERNAL`) to IGD
+blanks the panel for the probe window, so the round-13 flight is built around three things:
+
+1. **A pre-switch positive control.** A one-byte DPCD native read at address 0 runs BEFORE the first
+   mux-moving write — same `dp_aux_transfer`, same inherited clock divider, same 1-byte buffer, its
+   own budget consumed before the dark window's deadline exists. Without it, a post-switch success
+   proves nothing (AUX might already have reached the panel) and a post-switch failure proves nothing
+   either (the AUX block might be broken independent of routing). This control is what makes the
+   flight able to answer the question at all.
+2. **Everything buffered.** Not one serial print happens between the first gmux write and
+   `unwind.execute()`. A failure therefore leaves a fully readable capture instead of a hang behind a
+   black screen.
+3. **A parachute of validated constants.** The pre-switch gate checks every mux read against a set
+   of named constants, and the LIFO unwind writes back **the member it validated** — never a live
+   re-read, because a timed-out gmux read returns `0xFFFFFFFF`, which truncates to `0xFF` and would
+   leave the panel dark.
+
+The accepted set, and why it is a set. `DDC` and `DISPLAY` must be DIS — every capture the tree
+records reads `DDC=0x02 DISP=0x03`, so neither has a second legitimate value. `EXTERNAL` may be DIS
+**or** `GMUX_EXTERNAL_KEPLER_OWNED` (`0x21`), the Boot AK metal norm: `0x21` is what this machine
+actually reads when the firmware leaves the port Kepler-owned, which is why round 11 admitted it and
+why round 13 continues to. Demanding DIS there would make the flight refuse on the only machine it
+was written for. Both EXTERNAL registers are relaxed — the recorded `0x21` was seen on
+`READ_EXTERNAL`, and `SWITCH_EXTERNAL` has never been captured on a Kepler-owned boot.
+
+The restore follows the validation: EXTERNAL goes back to the value that was found, not to a blanket
+DIS, because forcing a Kepler-owned port to DIS is not a restore but a silent state change. The
+MATCH verdict likewise compares EXTERNAL against the validated pre-image, so a correct restore on a
+Kepler-owned machine reports MATCH rather than FAILED. The `0xFFFFFFFF` sentinel is neither
+constant, so it can never pass the gate; anything outside the set REFUSES with
+`pre-switch-not-accepted` before a mux is touched.
+
+`why=aux-short-read` is KNOWN AND ACCEPTED, not a defect: it is a legal partial I2C reply where
+upstream i915 clamps instead of erroring, and seeing it is itself proof that AUX answered.
+
 **Unwind:** nothing persistent. But **`SWITCH_DDC` must be on IGD** (rung 0) or AUX talks to nothing;
 if rung 0's DDC leg mismatched, refuse this rung rather than time out.
 

@@ -251,6 +251,8 @@ const GMUX_PORT_WRITE: u16 = 0x7D4;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_SWITCH_DDC: u8 = 0x28;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_SWITCH_DISPLAY: u8 = 0x10;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_READ_DISPLAY: u8 = 0x11;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_READ_EXTERNAL: u8 = 0x41;
@@ -260,22 +262,44 @@ const GMUX_DDC_DIS: u8 = 0x02;
 const GMUX_DISPLAY_DIS: u8 = 0x03;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_EXTERNAL_DIS: u8 = 0x03;
-/// The EXT port's value on a Kepler-owned boot — metal fact, Boot AK:
-/// `pre-switch state DDC=0x02 DISP=0x03 EXT=0x21`. Accepted by the Flight 1b pre-switch
-/// gate alongside `GMUX_EXTERNAL_DIS` because the flight writes ONLY the DDC register —
-/// EXT is never modified, so no EXT state needs restoring (round 11, review-conditioned).
+/// A GATE-ACCEPTED EXTERNAL pre-state: the EXT port's value on a Kepler-owned boot. Metal fact,
+/// Boot AK: `pre-switch state DDC=0x02 DISP=0x03 EXT=0x21`. This is the NORM on the 2012 rMBP —
+/// what the firmware actually leaves behind — not an anomaly, which is why round 11 first admitted
+/// it and why round 13 continues to.
+///
+/// The pre-switch gate accepts EXTERNAL in `{ GMUX_EXTERNAL_DIS, GMUX_EXTERNAL_KEPLER_OWNED }` and
+/// the unwind restores **the member it validated**, never a blanket `GMUX_EXTERNAL_DIS`: forcing a
+/// Kepler-owned port to DIS is not a restore, it is a silent state change. Anything outside the set
+/// — including the 0xFFFFFFFF gmux-timeout sentinel — refuses before any mux is touched.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_EXTERNAL_KEPLER_OWNED: u8 = 0x21;
 
+/// Name an EXTERNAL register value for the witness lines, so a reader never has to guess whether
+/// an `EXT=0x21` in a capture is the correct Kepler-owned pre-state or a failed restore.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+fn ext_state_name(v: u32) -> &'static str {
+    if v == GMUX_EXTERNAL_DIS as u32 {
+        "DIS"
+    } else if v == GMUX_EXTERNAL_KEPLER_OWNED as u32 {
+        "kepler-owned"
+    } else {
+        "UNACCEPTED"
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_SWITCH_EXTERNAL: u8 = 0x40;
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_DISPLAY_IGD: u8 = 0x02;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_EXTERNAL_IGD: u8 = 0x02;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_DDC_IGD: u8 = 0x01;
 
 /// Baseline's iteration bound, kept UNCONDITIONALLY.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_WAIT_ITERS: u32 = 5000;
-/// How long the mux stays on IGD before the revert fires.
-#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-const GMUX_DWELL_MS: u64 = 10_000;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 unsafe fn gmux_outb(port: u16, val: u8) {
     unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags)); }
@@ -919,30 +943,39 @@ const DP_AUX_CH_CTL_TIME_OUT_1600US: u32 = 3 << 26;
 const DP_AUX_CH_CTL_RECEIVE_ERROR: u32 = 1 << 25;
 
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-unsafe fn dp_aux_transfer(bar0: usize, clock_divider: u32, cmd: u32, addr: u32, tx_len: u32, tx_data: &[u8], rx_data: &mut [u8]) -> Result<(), &'static str> {
+unsafe fn dp_aux_transfer(bar0: usize, clock_divider: u32, cmd: u32, addr: u32, tx_len: u32, tx_data: &[u8], rx_data: &mut [u8], window_deadline: u64) -> Result<(), (&'static str, u32)> {
     let mut retry_count = 0;
-    let deadline = crate::arch::now_cycles() + (crate::arch::hw_wait_budget() * 2);
 
     let is_write = (cmd & 0x3) == 0;
     let send_bytes = if is_write { 4 + tx_len } else { 4 };
 
     loop {
-        if crate::arch::now_cycles() >= deadline || retry_count >= 7 {
-            return Err("aux-defer-exhausted");
+        if crate::arch::now_cycles() >= window_deadline || retry_count >= 7 {
+            return Err(("aux-defer-exhausted", 0));
         }
 
-        let data1 = (cmd << 28) | ((addr & 0xFFFFF) << 8) | (tx_len.saturating_sub(1));
+        let mut status = core::ptr::read_volatile((bar0 + regs::DPA_AUX_CH_CTL) as *const u32);
+        if (status & DP_AUX_CH_CTL_SEND_BUSY) != 0 {
+            core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_CTL) as *mut u32, (status & !DP_AUX_CH_CTL_SEND_BUSY) | DP_AUX_CH_CTL_DONE | DP_AUX_CH_CTL_TIME_OUT_ERROR | DP_AUX_CH_CTL_RECEIVE_ERROR);
+            status = core::ptr::read_volatile((bar0 + regs::DPA_AUX_CH_CTL) as *const u32);
+            if (status & DP_AUX_CH_CTL_SEND_BUSY) != 0 {
+                return Err(("aux-defer-busy", status));
+            }
+        }
+
+        let data1 = (cmd << 28) | ((addr & 0xFFFFF) << 8) | tx_len.saturating_sub(1);
         core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *mut u32, data1);
 
-        if is_write {
-            let mut idx = 0;
+        if is_write && tx_len > 0 {
+            let mut w_idx = 0;
             let data_regs = [regs::DPA_AUX_CH_DATA2, regs::DPA_AUX_CH_DATA3, regs::DPA_AUX_CH_DATA4, regs::DPA_AUX_CH_DATA5];
             for reg_offset in &data_regs {
+                if w_idx >= tx_len { break; }
                 let mut val = 0u32;
                 for b in 0..4 {
-                    if idx < tx_data.len() {
-                        val |= (tx_data[idx] as u32) << (24 - (b * 8));
-                        idx += 1;
+                    if w_idx < tx_len {
+                        val |= (tx_data[w_idx as usize] as u32) << (24 - (b * 8));
+                        w_idx += 1;
                     }
                 }
                 core::ptr::write_volatile((bar0 + *reg_offset) as *mut u32, val);
@@ -952,7 +985,6 @@ unsafe fn dp_aux_transfer(bar0: usize, clock_divider: u32, cmd: u32, addr: u32, 
         let ctl = DP_AUX_CH_CTL_SEND_BUSY | DP_AUX_CH_CTL_DONE | DP_AUX_CH_CTL_TIME_OUT_ERROR | DP_AUX_CH_CTL_RECEIVE_ERROR | DP_AUX_CH_CTL_TIME_OUT_1600US | (send_bytes << 20) | (clock_divider & 0x7FF);
         core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_CTL) as *mut u32, ctl);
 
-        let mut status;
         let wait_deadline = crate::arch::now_cycles() + (crate::arch::hw_wait_budget() / 100);
         loop {
             status = core::ptr::read_volatile((bar0 + regs::DPA_AUX_CH_CTL) as *const u32);
@@ -962,17 +994,17 @@ unsafe fn dp_aux_transfer(bar0: usize, clock_divider: u32, cmd: u32, addr: u32, 
         }
 
         if (status & DP_AUX_CH_CTL_SEND_BUSY) != 0 {
-            return Err("aux-timeout-busy");
+            return Err(("aux-timeout-busy", status));
         }
 
         let status_clean = status & !DP_AUX_CH_CTL_SEND_BUSY;
         core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_CTL) as *mut u32, status_clean | DP_AUX_CH_CTL_DONE | DP_AUX_CH_CTL_TIME_OUT_ERROR | DP_AUX_CH_CTL_RECEIVE_ERROR);
 
         if (status & DP_AUX_CH_CTL_TIME_OUT_ERROR) != 0 {
-            return Err("aux-timeout-error (Hypotheses: VDD off, wrong divider, bad offsets, mux write failed, panel not on AUX)");
+            return Err(("aux-timeout-error", status));
         }
         if (status & DP_AUX_CH_CTL_RECEIVE_ERROR) != 0 {
-            return Err("aux-receive-error");
+            return Err(("aux-receive-error", status));
         }
 
         let rx_data1 = core::ptr::read_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *const u32);
@@ -984,7 +1016,7 @@ unsafe fn dp_aux_transfer(bar0: usize, clock_divider: u32, cmd: u32, addr: u32, 
         let reply_status = if is_i2c { i2c_reply } else { native_reply };
 
         if reply_status == 3 {
-            return Err("aux-reserved-reply");
+            return Err(("aux-reserved-reply", status));
         }
 
         if reply_status == 2 {
@@ -993,11 +1025,15 @@ unsafe fn dp_aux_transfer(bar0: usize, clock_divider: u32, cmd: u32, addr: u32, 
         }
 
         if reply_status == 1 {
-            return Err("aux-nack");
+            return Err(("aux-nack", status));
         }
 
         let total_rx = (status >> 20) & 0x1F;
         let payload_rx = total_rx.saturating_sub(1) as usize;
+
+        if !is_write && payload_rx != rx_data.len() {
+            return Err(("aux-short-read", status));
+        }
 
         if payload_rx > 0 && !is_write {
             let to_copy = core::cmp::min(payload_rx, rx_data.len());
@@ -1037,27 +1073,70 @@ pub unsafe fn gmux_igd_switch() {
     let mut rung_name = "harness";
     let mut unwind = DisplayUnwind::new(0);
 
+    let mut out_dpcd: Option<u8> = None;
+    let mut out_edid: Option<[u8; 128]> = None;
+    let mut out_pre_dpcd: Option<u8> = None;
+    let mut out_pre_dpcd_err: Option<&'static str> = None;
+    let mut out_pre_dpcd_status = 0;
+    let mut pp_before: Option<(u32, u32)> = None;
+    let mut pp_after: Option<(u32, u32)> = None;
+    let mut mux_reads = (0, 0, 0);
+
     // Will be captured dynamically based on live pre-image
     let mut pre_ddc: Option<u32> = None;
+    let mut pre_disp: Option<u32> = None;
+    // The EXTERNAL pre-image, split: `pre_ext` is the SWITCH_EXTERNAL target register (what the
+    // unwind writes back), `pre_ext_status` is the READ_EXTERNAL status register (what the MATCH
+    // verdict compares). Both are validated against the same two-constant set before either is
+    // trusted — see the pre-switch gate.
+    let mut pre_ext: Option<u32> = None;
+    let mut pre_ext_status: Option<u32> = None;
     let mut mux_touched = false;
 
-    let mut execute_harness = || -> Result<(), &'static str> {
-        if !PROTOCOL_PROVEN.load(Ordering::SeqCst) { return Err("protocol-unproven"); }
+    let mut execute_harness = || -> Result<(), (&'static str, u32)> {
+        if !PROTOCOL_PROVEN.load(Ordering::SeqCst) { return Err(("protocol-unproven", 0)); }
         let bar0 = IGPU_BAR0.load(Ordering::SeqCst);
-        if bar0 == 0 { return Err("bar0-unmapped"); }
+        if bar0 == 0 { return Err(("bar0-unmapped", 0)); }
         unwind.bar0 = bar0;
 
         let p_ddc = gmux_index_read(GMUX_SWITCH_DDC);
+        let p_disp = gmux_index_read(GMUX_SWITCH_DISPLAY);
+        let p_ext = gmux_index_read(GMUX_SWITCH_EXTERNAL);
         let disp = gmux_index_read(GMUX_READ_DISPLAY);
         let ext = gmux_index_read(GMUX_READ_EXTERNAL);
-        serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", p_ddc, disp, ext);
+        serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} SW_DISP=0x{:02X} SW_EXT=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} sw_ext_state={} ext_state={} ::",
+            p_ddc, p_disp, p_ext, disp, ext, ext_state_name(p_ext), ext_state_name(ext));
 
-        if p_ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32
-            || (ext != GMUX_EXTERNAL_DIS as u32 && ext != GMUX_EXTERNAL_KEPLER_OWNED as u32) {
-            serial_println!(":: igpu: [GMUX] REFUSED: pre-switch state outside the accepted set (DDC must be DIS, DISP must be DIS, EXT must be DIS or Kepler-owned 0x21) (DDC={}, DISP={}, EXT={}) ::", p_ddc, disp, ext);
-            return Err("pre-switch-not-dis");
+        // THE GATE VALIDATES AGAINST A SET OF NAMED CONSTANTS, AND THE UNWIND RESTORES THE MEMBER
+        // IT VALIDATED. The two halves are one property and must be read together.
+        //
+        // DDC and DISPLAY: strict DIS. Every pre-switch capture the tree records reads DDC=0x02 and
+        // DISP=0x03 — DIS is the only value ever observed for either, so there is no second
+        // legitimate member to admit, and admitting one on speculation would be inventing a state.
+        //
+        // EXTERNAL: DIS *or* `GMUX_EXTERNAL_KEPLER_OWNED` (0x21). 0x21 is the Boot AK metal NORM —
+        // what this machine actually reads when the firmware leaves the port Kepler-owned — which
+        // is exactly why round 11 relaxed this gate. Demanding DIS here would make the flight
+        // REFUSE on the only machine it was written for. Both EXTERNAL registers are relaxed: the
+        // recorded 0x21 was observed on READ_EXTERNAL, and SWITCH_EXTERNAL has never been captured
+        // on a Kepler-owned boot, so neither may be assumed DIS.
+        //
+        // THE SENTINEL CANNOT PASS. A timed-out `gmux_index_read` returns 0xFFFFFFFF, which is
+        // neither `GMUX_EXTERNAL_DIS` nor `GMUX_EXTERNAL_KEPLER_OWNED` (nor DDC/DISPLAY's DIS), so
+        // every read is refused before anything is stored, and `as u8` never gets the chance to
+        // truncate it to 0xFF and write a dark panel into the display mux. What the safety property
+        // forbids is pushing an UNVALIDATED live read; a value proven equal to one of two named
+        // 8-bit constants is not an unvalidated read.
+        let ext_ok = |v: u32| v == GMUX_EXTERNAL_DIS as u32 || v == GMUX_EXTERNAL_KEPLER_OWNED as u32;
+        if p_ddc != GMUX_DDC_DIS as u32 || p_disp != GMUX_DISPLAY_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32
+            || !ext_ok(p_ext) || !ext_ok(ext) {
+            // Buffer the REFUSED print; the outer error handler will print it
+            return Err(("pre-switch-not-accepted", 0));
         }
         pre_ddc = Some(p_ddc);
+        pre_disp = Some(p_disp);
+        pre_ext = Some(p_ext);
+        pre_ext_status = Some(ext);
 
         rung_name = "census";
         let ggc = crate::arch::pci::read_config_32(0, 0, 0, 0x50);
@@ -1069,13 +1148,13 @@ pub unsafe fn gmux_igd_switch() {
 
         if (aux_ctl & DP_AUX_CH_CTL_SEND_BUSY) != 0 {
             serial_println!(":: igpu: [AUX] REFUSED: aux_ctl=0x{:08X} SEND_BUSY is set at boot bdsm=0x{:08X} ggc=0x{:08X} ggtt0=0x{:08X} ggtt1=0x{:08X} frmcnt=0x{:08X} ::", aux_ctl, bdsm, ggc, ggtt0, ggtt1, frmcnt);
-            return Err("aux-busy-at-boot");
+            return Err(("aux-busy-at-boot", 0));
         }
 
         let clock_divider = aux_ctl & 0x7FF;
         if clock_divider == 0 {
             serial_println!(":: igpu: [AUX] REFUSED: aux_ctl=0x{:08X} clock divider is 0 bdsm=0x{:08X} ggc=0x{:08X} ggtt0=0x{:08X} ggtt1=0x{:08X} frmcnt=0x{:08X} ::", aux_ctl, bdsm, ggc, ggtt0, ggtt1, frmcnt);
-            return Err("aux-divider-unusable");
+            return Err(("aux-divider-unusable", 0));
         }
 
         serial_println!(":: igpu-dpy: rung=00 name=census ok=1 bdsm=0x{:08X} ggc=0x{:08X} ggtt0=0x{:08X} ggtt1=0x{:08X} aux_ctl=0x{:08X} frmcnt=0x{:08X} ::",
@@ -1090,74 +1169,101 @@ pub unsafe fn gmux_igd_switch() {
         unwind.push_mmio(regs::DPA_AUX_CH_DATA1, test_val);
         core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *mut u32, !test_val);
 
-        unwind.push_gmux(GMUX_SWITCH_DDC, pre_ddc.unwrap() as u8);
+        // Push order EXTERNAL, DISPLAY, DDC so the LIFO unwind restores DDC, DISPLAY, EXTERNAL —
+        // the reverse of the forward write order, matching upstream apple-gmux. EXTERNAL is
+        // restored to `p_ext`, the pre-image the gate above validated against the two-constant set;
+        // DDC and DISPLAY are restored to DIS because DIS is the only value their gate admits.
+        unwind.push_gmux(GMUX_SWITCH_EXTERNAL, p_ext as u8);
+        unwind.push_gmux(GMUX_SWITCH_DISPLAY, GMUX_DISPLAY_DIS);
+        unwind.push_gmux(GMUX_SWITCH_DDC, GMUX_DDC_DIS);
 
         let _ = unwind.execute();
 
         let test_val_after = core::ptr::read_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *const u32);
         if test_val_after != test_val {
             serial_println!(":: igpu: [GMUX] Unwind stack MMIO self-test FAILED (expected 0x{:08X}, got 0x{:08X}) ::", test_val, test_val_after);
-            return Err("unwind-mmio-failed");
+            return Err(("unwind-mmio-failed", 0));
         }
         serial_println!(":: igpu: [GMUX] Unwind stack MMIO self-test passed ::");
         serial_println!(":: igpu: [GMUX] Unwind stack gmux-dispatch=REACHED (Gmux restore path executed without faulting, not implying restore verified) ::");
 
-        unwind.push_gmux(GMUX_SWITCH_DDC, pre_ddc.unwrap() as u8);
+        // Push order EXTERNAL, DISPLAY, DDC so the LIFO unwind restores DDC, DISPLAY, EXTERNAL —
+        // the reverse of the forward write order, matching upstream apple-gmux. EXTERNAL is
+        // restored to `p_ext`, the pre-image the gate above validated against the two-constant set;
+        // DDC and DISPLAY are restored to DIS because DIS is the only value their gate admits.
+        unwind.push_gmux(GMUX_SWITCH_EXTERNAL, p_ext as u8);
+        unwind.push_gmux(GMUX_SWITCH_DISPLAY, GMUX_DISPLAY_DIS);
+        unwind.push_gmux(GMUX_SWITCH_DDC, GMUX_DDC_DIS);
+
+        // F1: ASSIGN out_pre_dpcd_err, out_pre_dpcd_status, out_pre_dpcd before the first gmux write.
+        let mut pre_dpcd_rev = [0u8; 1];
+        let pre_deadline = crate::arch::now_cycles() + (crate::arch::hw_wait_budget() * 1);
+        if let Err((e, stat)) = dp_aux_transfer(bar0, clock_divider, DP_AUX_NATIVE_READ, 0x00000, 1, &[], &mut pre_dpcd_rev, pre_deadline) {
+            out_pre_dpcd_err = Some(e);
+            out_pre_dpcd_status = stat;
+        } else {
+            out_pre_dpcd = Some(pre_dpcd_rev[0]);
+        }
+
+        // F2: ASSIGN pp_before before the first gmux write.
+        pp_before = Some((mmio_read(bar0, regs::PCH_PP_CONTROL), mmio_read(bar0, regs::PCH_PP_STATUS)));
 
         highest = 2;
         rung_name = "switch";
-        serial_println!(":: igpu: [GMUX] switching DDC to IGD (0x{:02X}) — panel should REMAIN ON since DISPLAY is not moved ::", GMUX_DDC_IGD);
         mux_touched = true;
+
+        // F6: Forward writes to DDC, DISPLAY, EXTERNAL.
         gmux_index_write(GMUX_SWITCH_DDC, GMUX_DDC_IGD);
-        let read_ddc = gmux_index_read(GMUX_SWITCH_DDC);
-        if read_ddc != GMUX_DDC_IGD as u32 {
-            return Err("mux-ddc-switch-failed");
+        gmux_index_write(GMUX_SWITCH_DISPLAY, GMUX_DISPLAY_IGD);
+        gmux_index_write(GMUX_SWITCH_EXTERNAL, GMUX_EXTERNAL_IGD);
+
+        mux_reads.0 = gmux_index_read(GMUX_SWITCH_DDC);
+        mux_reads.1 = gmux_index_read(GMUX_SWITCH_DISPLAY);
+        mux_reads.2 = gmux_index_read(GMUX_SWITCH_EXTERNAL);
+
+        if mux_reads.0 != GMUX_DDC_IGD as u32 || mux_reads.1 != GMUX_DISPLAY_IGD as u32 || mux_reads.2 != GMUX_EXTERNAL_IGD as u32 {
+            return Err(("mux-switch-failed", 0));
         }
 
         highest = 3;
         rung_name = "dpcd";
+        let window_deadline = crate::arch::now_cycles() + (crate::arch::hw_wait_budget() * 1);
+
         let mut dpcd_rev = [0u8; 1];
-        if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_NATIVE_READ, 0x00000, 1, &[], &mut dpcd_rev) {
-            serial_println!(":: igpu: [AUX] DPCD Read Failed: {} ::", e);
+        if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_NATIVE_READ, 0x00000, 1, &[], &mut dpcd_rev, window_deadline) {
+            pp_after = Some((mmio_read(bar0, regs::PCH_PP_CONTROL), mmio_read(bar0, regs::PCH_PP_STATUS)));
             return Err(e);
         }
-        serial_println!(":: igpu: [AUX] DPCD REV: 0x{:02X} ::", dpcd_rev[0]);
+        out_dpcd = Some(dpcd_rev[0]);
 
         highest = 4;
         rung_name = "edid";
-        if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_I2C_WRITE | DP_AUX_I2C_MOT, 0x50, 1, &[0x00], &mut []) {
-            serial_println!(":: igpu: [AUX] EDID Address Set NACKed/Failed: {} ::", e);
-            return Err("edid-address-nack");
+        if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_I2C_WRITE | DP_AUX_I2C_MOT, 0x50, 1, &[0x00], &mut [], window_deadline) {
+            pp_after = Some((mmio_read(bar0, regs::PCH_PP_CONTROL), mmio_read(bar0, regs::PCH_PP_STATUS)));
+            return Err(e);
         }
 
         let mut edid = [0u8; 128];
         for chunk in 0..8 {
             let offset = chunk * 16;
             let cmd = if chunk == 7 { DP_AUX_I2C_READ } else { DP_AUX_I2C_READ | DP_AUX_I2C_MOT };
-            if let Err(e) = dp_aux_transfer(bar0, clock_divider, cmd, 0x50, 16, &[], &mut edid[offset..offset + 16]) {
-                serial_println!(":: igpu: [AUX] EDID chunk {} failed: {} ::", chunk, e);
-                return Err("edid-chunk-read-failed");
+            if let Err(e) = dp_aux_transfer(bar0, clock_divider, cmd, 0x50, 16, &[], &mut edid[offset..offset + 16], window_deadline) {
+                pp_after = Some((mmio_read(bar0, regs::PCH_PP_CONTROL), mmio_read(bar0, regs::PCH_PP_STATUS)));
+                return Err(e);
             }
         }
 
+        pp_after = Some((mmio_read(bar0, regs::PCH_PP_CONTROL), mmio_read(bar0, regs::PCH_PP_STATUS)));
+        out_edid = Some(edid);
+
         let header: [u8; 8] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
         if &edid[0..8] != &header {
-            serial_println!(":: igpu: [AUX] EDID Header corrupt: {:02X?} ::", &edid[0..8]);
-            return Err("edid-header-corrupt");
+            return Err(("edid-header-corrupt", 0));
         }
 
         let checksum: u8 = edid.iter().fold(0, |acc, &x| acc.wrapping_add(x));
         if checksum != 0 {
-            serial_println!(":: igpu: [AUX] EDID Checksum failed: {} ::", checksum);
-            return Err("edid-checksum-bad");
-        }
-
-        serial_println!(":: igpu: [AUX] EDID Dump ::");
-        for i in 0..8 {
-            let row = &edid[(i*16)..((i+1)*16)];
-            serial_print!(":: igpu: [AUX] {:02X}0: ", i);
-            for b in row { serial_print!("{:02X} ", b); }
-            serial_println!("::");
+            return Err(("edid-checksum-bad", 0));
         }
 
         highest = 5;
@@ -1165,33 +1271,91 @@ pub unsafe fn gmux_igd_switch() {
         Ok(())
     };
 
+    let mut why_status = 0;
     match execute_harness() {
         Ok(_) => {
             ok_flag = 1;
         }
-        Err(e) => {
-            serial_println!(":: igpu: [GMUX] REFUSED: {} ::", e);
+        Err((e, stat)) => {
             why_str = e;
+            why_status = stat;
         }
     }
 
     let unwound_count = unwind.len;
     let revert_ok = unwind.execute();
 
+    if let Some(e) = out_pre_dpcd_err {
+        serial_println!(":: igpu: [AUX] PRE-SWITCH DPCD Read Failed: {} (status: 0x{:08X}) ::", e, out_pre_dpcd_status);
+    } else if let Some(rev) = out_pre_dpcd {
+        serial_println!(":: igpu: [AUX] PRE-SWITCH DPCD REV: 0x{:02X} ::", rev);
+    } else {
+        serial_println!(":: igpu: [AUX] PRE-SWITCH DPCD Read: (n/a - path never reached) ::");
+    }
+
+    if mux_touched {
+        serial_println!(":: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD (panel BLANKED/FLICKERED) ::");
+        if mux_reads.0 != GMUX_DDC_IGD as u32 || mux_reads.1 != GMUX_DISPLAY_IGD as u32 || mux_reads.2 != GMUX_EXTERNAL_IGD as u32 {
+            serial_println!(":: igpu: [GMUX] Switch verification failed: DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", mux_reads.0, mux_reads.1, mux_reads.2);
+        }
+        if let Some(pb) = pp_before {
+            serial_println!(":: igpu: [AUX] PCH_PP_STATUS/CONTROL Before AUX: STATUS=0x{:08X} CONTROL=0x{:08X} ::", pb.1, pb.0);
+        } else {
+            serial_println!(":: igpu: [AUX] PCH_PP_STATUS/CONTROL Before AUX: (n/a - path never reached) ::");
+        }
+        if let Some(pa) = pp_after {
+            serial_println!(":: igpu: [AUX] PCH_PP_STATUS/CONTROL After AUX:  STATUS=0x{:08X} CONTROL=0x{:08X} ::", pa.1, pa.0);
+        } else {
+            serial_println!(":: igpu: [AUX] PCH_PP_STATUS/CONTROL After AUX:  (n/a - path never reached) ::");
+        }
+    }
+
+    if let Some(rev) = out_dpcd {
+        serial_println!(":: igpu: [AUX] DPCD REV: 0x{:02X} ::", rev);
+    } else {
+        serial_println!(":: igpu: [AUX] DPCD REV: (n/a) ::");
+    }
+
+    if let Some(edid) = out_edid {
+        serial_println!(":: igpu: [AUX] EDID Dump ::");
+        for i in 0..8 {
+            let row = &edid[(i*16)..((i+1)*16)];
+            serial_print!(":: igpu: [AUX] {:02X}0: ", i);
+            for b in row { serial_print!("{:02X} ", b); }
+            serial_println!("::");
+        }
+    } else {
+        serial_println!(":: igpu: [AUX] EDID Dump: (n/a) ::");
+    }
+
+    if ok_flag == 0 {
+        serial_println!(":: igpu: [GMUX] REFUSED: {} (status: 0x{:08X}) ::", why_str, why_status);
+    }
+
     // Read back to decide gmux= verdict. Only DDC is proven, others are TBV.
-    let gmux_verdict = if let Some(intent_ddc) = pre_ddc {
+    let gmux_verdict = if let (Some(intent_ddc), Some(intent_disp), Some(intent_ext), Some(intent_ext_status)) = (pre_ddc, pre_disp, pre_ext, pre_ext_status) {
         if mux_touched {
             let post_ddc = gmux_index_read(GMUX_SWITCH_DDC);
-            let post_disp = gmux_index_read(GMUX_READ_DISPLAY);
-            let post_ext = gmux_index_read(GMUX_READ_EXTERNAL);
+            let post_disp_target = gmux_index_read(GMUX_SWITCH_DISPLAY);
+            let post_disp_status = gmux_index_read(GMUX_READ_DISPLAY);
+            let post_ext_target = gmux_index_read(GMUX_SWITCH_EXTERNAL);
+            let post_ext_status = gmux_index_read(GMUX_READ_EXTERNAL);
 
-            let verdict = if post_ddc == intent_ddc && revert_ok {
+            // EXTERNAL is compared against the VALIDATED PRE-IMAGE, not against DIS. On a
+            // Kepler-owned machine the correct restore lands 0x21, and comparing that to DIS would
+            // report FAILED for a restore that was exactly right.
+            let verdict = if post_ddc == intent_ddc
+                && post_disp_target == intent_disp && post_disp_status == GMUX_DISPLAY_DIS as u32
+                && post_ext_target == intent_ext && post_ext_status == intent_ext_status
+                && revert_ok {
                 "MATCH"
             } else {
                 "FAILED"
             };
 
-            serial_println!(":: igpu: [GMUX] revert read-back: DDC=0x{:02X} DISP=0x{:02X} (TBV) EXT=0x{:02X} (TBV) ::", post_ddc, post_disp, post_ext);
+            serial_println!(":: igpu: [GMUX] revert read-back: DDC=0x{:02X} SWITCH_DISP=0x{:02X} READ_DISP=0x{:02X} SWITCH_EXT=0x{:02X} READ_EXT=0x{:02X} (TBV) ::", post_ddc, post_disp_target, post_disp_status, post_ext_target, post_ext_status);
+            serial_println!(":: igpu: [GMUX] EXTERNAL restored to {} (SWITCH_EXT 0x{:02X}->0x{:02X}, READ_EXT 0x{:02X}->0x{:02X}) — the validated pre-image, not a blanket DIS ::",
+                ext_state_name(intent_ext), intent_ext, post_ext_target, intent_ext_status, post_ext_status);
             verdict
         } else {
             "UNTOUCHED"
