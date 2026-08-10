@@ -1120,6 +1120,32 @@ OPTIONAL \[PCI-CENSUS\] done: devices=[0-9]+ functions=[0-9]+ printed=[0-9]+ tru
 OPTIONAL :: bcma: begin — READ-ONLY recon of PCI class 0x02/sub 0x80
 OPTIONAL :: bcma: end ok=[01] stage=\S+ elapsed=[0-9]+ms ::
 
+# --- WC-K2 — a desktop fill must never reach the front buffer outside a composite publish -------
+#     The one `[wc-k]` subject this spec takes, because the x86 half of the mechanism has no other
+#     gate. `wm::erase` no longer writes a pixel: it queues its vacated boxes and
+#     `wm::drain_deferred` publishes them at the head of the composite pass the erase site already
+#     ran in the same call. `wm::stage_fill` therefore has exactly one caller and is told so
+#     (`from_drain`); a present taken from anywhere else prints the line these FORBID and carries
+#     `outside=` into the `scope=fills` rollup.
+#
+#     WHY HERE AND NOT ONLY ON PI. Boot AS was an attended x86 drag ("still some flickering from
+#     title bar"), and review condition 1's stranding case -- a wakeup consumed by
+#     `wm::composite`'s re-run loop or its lost-wakeup block while a fill is still queued -- lives
+#     in code that is `#[cfg(target_arch = "x86_64")]`. The pi4 spec cannot reach it.
+#
+#     NOT REQUIREs. `[wc-k]` fills need window teardown to happen at all, and this spec's boots are
+#     scoped to the kepler/paygo knob set rather than to a window fixture battery, so a REQUIRE here
+#     would be red on configuration instead of on health -- the trap the `build=` note above records.
+#     The pi4 gate owns the positive claims (`-> BUFFERED`, `reason=route`, `outside=0`); these two
+#     lines own the x86 negative one, which needs no completeness claim to be worth having.
+#
+#     `-> RESCUED` is deliberately NOT forbidden and not required: a rescue is review condition 1's
+#     fix firing, i.e. a fill the pre-fix code would have stranded. It is a number to read, and it
+#     needs a DECLINED pass to arise at all, so requiring it would be a claim about core scheduling.
+#     See docs/dev/OS/08_VIDEO/engine.md §WC-K2.
+FORBID \[wc-k\] .*-> UNPUBLISHED
+FORBID \[wc-k\] .*outside=[1-9]
+
 # --- WHAT IS DELIBERATELY NOT PINNED, stated rather than omitted -----------------------------
 #   * `kepler=2564ms`. It is the headline GR17 number and it is NOT a directive, because it is a
 #     MEASUREMENT on a specific machine: the 2012 rMBP's PCIe latency sets the read-back cost,
@@ -1146,9 +1172,16 @@ OPTIONAL :: bcma: end ok=[01] stage=\S+ elapsed=[0-9]+ms ::
 #     win=1 PAID at 20682 ms and win=3 still spending), so any fixed count would be a claim about
 #     how long the bench sat rather than about the kernel. Boots W and X each carry three `[wc-g]`
 #     and three-to-four `[wc-d]` PAID lines; the analyzer reports the per-window split.
-#   * `[wc-h]` / `[wc-k]` / `[cursor*]`. Real witnesses, thoroughly pinned by the pi4 gate, and
-#     out of this spec's subject. Adding half-considered copies here would grow the file without
-#     growing the evidence.
+#   * `[wc-h]` / `[cursor*]`, and every `[wc-k]` line except the two WC-K2 FORBIDs below. Real
+#     witnesses, thoroughly pinned by the pi4 gate, and out of this spec's subject. Adding
+#     half-considered copies here would grow the file without growing the evidence.
+#     WC-K2 IS THE NAMED EXCEPTION, and the exception has a reason rather than an appetite: the
+#     defect it removes was reported on THIS machine (Boot AS, attended, x86 drag), the mechanism it
+#     forbids -- a desktop fill reaching the front buffer outside a composite publish -- is
+#     arch-independent code in `video/wm.rs`, and the x86 wakeup gates it depends on
+#     (`COMP_GATE`/`COMP_PENDING`, review condition 1) DO NOT EXIST on aarch64 at all. So the pi4
+#     gate cannot red for the x86-only half, and a claim that the fix reds the gate was, until these
+#     two lines, a claim about a platform where the bug could not occur. See the block below.
 #   * The SECOND `GPACE:` line — `span=417ms anchor=enum:p1 since-entry=2203ms hz=… build=kepler+
 #     takeover+fifo+ivb+wc+smc+ == the pci-usb d= split ::`. Tempting, because `build=` names the
 #     knob set this whole spec is scoped to. Not pinned, and the reason is that pinning it either

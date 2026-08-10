@@ -419,7 +419,17 @@ pub const DECL_LOCK: u32 = 3;
 pub const DECL_ALLOC: u32 = 4;
 /// Not a failure: the witness build's deliberate one-shot fallback, so WC-D verifies the direct path
 /// at least once per boot. Counted apart from the real declines and never affects the verdict.
+///
+/// **WC-K2r — STILL LIVE. Do not delete this alongside WC-L's erase fixture.** The two are unrelated
+/// despite the shared word: WC-L's latch lived in `wm::stage_fill` (the DESKTOP FILL path) and WC-K2
+/// retired it, while this one belongs to `wm::stage_window` (the WINDOW path), where the direct
+/// fallback still exists and still needs a per-boot witness. `[wc-h] win=N staged=no reason=fixture
+/// -> DIRECT` is its line and it is expected on every witness boot.
 pub const DECL_FIXTURE: u32 = 5;
+/// WC-K2 — not a failure either, and not a staging attempt at all: the erase path no longer
+/// publishes, so every vacated box is queued for the compositor's drain BY DESIGN. Only
+/// [`erase_defer`] ever carries it; [`stage_window`](super::wm) cannot produce it.
+pub const DECL_ROUTE: u32 = 6;
 
 fn decl_name(kind: u32) -> &'static str {
     match kind {
@@ -428,6 +438,7 @@ fn decl_name(kind: u32) -> &'static str {
         DECL_LOCK => "lock",
         DECL_ALLOC => "alloc",
         DECL_FIXTURE => "fixture",
+        DECL_ROUTE => "route",
         _ => "?",
     }
 }
@@ -1110,6 +1121,25 @@ const E_SAMPLES: u32 = 4;
 /// (more than this many) goes quiet, with the counters still running.
 const E_DECL_LINES: u32 = 16;
 
+/// WC-K2r — `reason=route` lines get their OWN budget, and a small one.
+///
+/// The first cut spent [`E_DECL_LINES`] on them, which is the instrument-that-cannot-speak defect in
+/// a new costume. Before WC-K2 a deferral was an EXCEPTION and sixteen lines were generous; after it
+/// every erase in the system is a deferral, and one metal drag produces up to four per motion report
+/// — the budget is gone inside four reports, and everything that shares it goes quiet with it. What
+/// goes quiet is not decoration: `erase_drop`'s `-> LOST` line (the `geom`/`cap` fill the panel never
+/// received) and the genuine `lock`/`alloc` deferrals that are WC-L's whole subject, i.e. the two
+/// classes a boot most needs to be able to report at minute forty.
+///
+/// Four lines is enough for the spec's REQUIRE to have something to match and for a reader to see
+/// the shape of the route on the wire; after that the route is COUNT-ONLY (`defers=` in the rollup),
+/// which is the right treatment for a per-motion-report event. The failure classes keep all sixteen.
+const E_ROUTE_LINES: u32 = 4;
+
+/// Route deferral lines emitted, capped at [`E_ROUTE_LINES`]. Separate from [`E_DECL_LINES_OUT`] on
+/// purpose — sharing the counter is what created the starvation this splits.
+static E_ROUTE_LINES_OUT: AtomicU32 = AtomicU32::new(0);
+
 /// Staged fills recorded so far, capped at [`E_SAMPLES`] for line purposes.
 static E_TAKEN: AtomicU32 = AtomicU32::new(0);
 /// Staged fills whose PRESENT phase alone outran the beam's time on the box.
@@ -1125,9 +1155,19 @@ static E_NONCONTIG: AtomicU32 = AtomicU32::new(0);
 /// therefore still exactly right: those panel rows hold whatever the departed window left there, and
 /// no later pass is going to fix them. Neither reason is reachable on any panel this kernel drives.
 static E_DECLINE: AtomicU32 = AtomicU32::new(0);
-/// WC-L — fills that could not reach the back layer on their first attempt and were queued as
-/// deferred damage instead of written direct. Not a defect: the fill still arrives through the
-/// staged path, one composite pass later.
+/// Fills queued as deferred damage rather than published on the spot.
+///
+/// **WC-K2r — the WC-L reading of this counter is stale and is replaced, not annotated.** It used to
+/// mean "could not reach the back layer on its first attempt", i.e. a contention event. After WC-K2
+/// it means "was routed", which is every erase in the boot: `route` deferrals dominate it and
+/// `lock`/`alloc` are a garnish. The counter that still carries WC-L's meaning is [`E_REDEFER`] — a
+/// box the DRAIN tried and could not stage — and that is the one to read for contention.
+///
+/// It is also a SNAPSHOT, not a boot total. The `scope=fills` rollup prints once, at sample
+/// [`E_SAMPLES`], so `defers=` reports the deferrals seen up to the fourth staged fill and nothing
+/// after it. That was already true under WC-L and unremarkable when deferrals were rare; with the
+/// route dominating, `defers=4` on a boot that went on to route thousands is the expected reading
+/// and not a broken counter. The completeness question belongs to the FORBIDs, per `scope=fills`.
 static E_DEFER: AtomicU32 = AtomicU32::new(0);
 /// WC-L — deferred boxes that were still unable to stage when the drain retried them, and went back
 /// on the queue. A steady-state non-zero here means the staging lock is contended for longer than a
@@ -1152,6 +1192,34 @@ const E_REDEFER_MAX: u32 = 8;
 /// full. Sound (the drain re-damages every window the enlarged box reaches, exactly as WC-J's
 /// `reclaim` does), but it repaints more panel than strictly owed, so it is counted.
 static E_COALESCE: AtomicU32 = AtomicU32::new(0);
+/// WC-K2 — desktop fills that reached the FRONT BUFFER from outside a composite publish.
+///
+/// After WC-K2 `wm::erase` writes no pixel: it queues, and `wm::drain_deferred` — at the head of a
+/// composite pass — is the only caller of `wm::stage_fill`. This counts the presents taken with
+/// `from_drain == false`, i.e. a desktop fill landing on the glass as its own panel event, ahead of
+/// the window repaint that belongs with it. That two-event shape IS the drag seam WC-K2 removed, so
+/// it is a structural regression rather than a timing one and it outranks every timing term in the
+/// rollup's precedence.
+///
+/// Zero by construction today. The counter exists because "by construction" is a claim about the
+/// caller graph, and a caller graph is exactly the kind of thing a later arc changes without noticing.
+static E_OUTSIDE: AtomicU32 = AtomicU32::new(0);
+
+/// WC-K2r — composite passes taken ONLY because the erase queue was non-empty, on the two x86
+/// wakeup gates that consume `COMP_PENDING` (`wm::composite`'s re-run loop and its lost-wakeup
+/// block). Each one is a desktop fill the pre-fix code would have stranded: it swapped the wakeup to
+/// false, asked `any_damaged()` alone, got `no`, and left a queued box with no core committed to it.
+///
+/// **Reported, never forbidden, and not a completeness claim.** What a reader wants — "no queued box
+/// ever outlives the next completed pass" — cannot be answered from inside a boot, and for WC-G's
+/// reason restated: the stranded state IS "no further pass arrives", so the detector that would
+/// observe it is the pass that does not happen. A residency counter has the same hole (it can only
+/// tick when a pass runs). So this counts the fix FIRING instead, which is the falsifiable half: a
+/// boot with `rescues>0` is one where the old code dropped a fill, and a boot with `rescues=0` has
+/// simply never met the condition. The completeness question stays where WC-K put it, with the
+/// FORBIDs.
+static E_RESCUE: AtomicU32 = AtomicU32::new(0);
+
 /// Deferral lines emitted, capped at [`E_DECL_LINES`].
 static E_DECL_LINES_OUT: AtomicU32 = AtomicU32::new(0);
 /// The largest present-phase duration seen across staged fills, in microseconds.
@@ -1197,10 +1265,20 @@ pub fn erase_defer(w: usize, h: usize, reason: u32, requeued: bool) {
             );
         }
     }
-    let n = E_DECL_LINES_OUT.fetch_add(1, Ordering::Relaxed) + 1;
-    if n > E_DECL_LINES {
-        E_DECL_LINES_OUT.store(E_DECL_LINES + 1, Ordering::Relaxed);
-        return;
+    // WC-K2r — the route takes its own small budget; every other reason keeps the full one. See
+    // [`E_ROUTE_LINES`] for why sharing them starved the classes that matter.
+    if reason == DECL_ROUTE {
+        let n = E_ROUTE_LINES_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n > E_ROUTE_LINES {
+            E_ROUTE_LINES_OUT.store(E_ROUTE_LINES + 1, Ordering::Relaxed);
+            return;
+        }
+    } else {
+        let n = E_DECL_LINES_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n > E_DECL_LINES {
+            E_DECL_LINES_OUT.store(E_DECL_LINES + 1, Ordering::Relaxed);
+            return;
+        }
     }
     serial_println!(
         "[wc-k] erase box={}x{} staged=defer reason={} requeued={} -> DEFERRED",
@@ -1238,6 +1316,39 @@ pub fn erase_drop(w: usize, h: usize, reason: u32) {
 /// rollup's `coalesced=` is where a boot that is doing it constantly becomes visible.
 pub fn erase_coalesce() {
     E_COALESCE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// WC-K2r — count a pass rescued by [`E_RESCUE`]'s condition, and name the first one on the wire.
+pub fn erase_wakeup_rescue() {
+    let n = E_RESCUE.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 {
+        // One line, at the first occurrence, on the `scope=starve` pattern: the `scope=fills` rollup
+        // fires at sample 4 and a rescue by its nature arrives later (it needs a DECLINED pass, which
+        // needs two cores compositing at once). A counter whose only home is a rollup that has
+        // already printed is a counter nobody reads.
+        serial_println!("[wc-k] rollup scope=wakeup rescues={} -> RESCUED", n);
+    }
+}
+
+/// WC-K2 — record a desktop fill that is about to reach the front buffer from outside a composite
+/// publish, and SAY SO on the wire the first time it happens.
+///
+/// The one-shot line is not decoration and not a duplicate of the rollup field. The `scope=fills`
+/// rollup prints ONCE, at sample [`E_SAMPLES`], and cannot retract; a boot whose erase path is
+/// healthy for its first four fills and is then handed back a direct publisher by a later arc would
+/// otherwise carry a printed `TEAR-FREE` over exactly the defect. Same reasoning that gives
+/// `-> STARVED` its own line: a FORBID is only worth having if the boot can still trip it after the
+/// rollup has spoken.
+pub fn erase_outside_publish(w: usize, h: usize) {
+    let n = E_OUTSIDE.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 {
+        serial_println!(
+            "[wc-k] rollup scope=publish box={}x{} outside={} -> UNPUBLISHED",
+            w,
+            h,
+            n
+        );
+    }
 }
 
 /// WC-K — report one staged desktop fill: the box, the composed row, how long the compose and the
@@ -1329,7 +1440,16 @@ pub fn erase_note(
         let nc = E_NONCONTIG.load(Ordering::Relaxed);
         let decl = E_DECLINE.load(Ordering::Relaxed);
         let redef = E_REDEFER.load(Ordering::Relaxed);
-        let verdict = if nc > 0 {
+        let outside = E_OUTSIDE.load(Ordering::Relaxed);
+        let verdict = if outside > 0 {
+            // WC-K2 sits ABOVE `SPLIT`, and the ordering is an argument rather than a preference.
+            // Every term below it describes the SHAPE or the TIMING of a present the compositor
+            // owns; this one says a desktop fill was published as its own panel event, outside the
+            // composite that repaints the windows over it. A well-shaped, untorn present of the
+            // wrong publisher is precisely what the drag seam was, and reporting it as `TEAR-FREE`
+            // with a footnote is the mistake WC-K made with `-> DIRECT`.
+            "UNPUBLISHED"
+        } else if nc > 0 {
             "SPLIT"
         } else if torn_n > 0 {
             "AT-RISK"
@@ -1341,15 +1461,17 @@ pub fn erase_note(
             "TEAR-FREE"
         };
         serial_println!(
-            "[wc-k] rollup scope=fills samples={} rows={} torn={} noncontig={} declines={} defers={} redefers={} coalesced={} maxpresent_us={} frame_us={} -> {}",
+            "[wc-k] rollup scope=fills samples={} rows={} torn={} noncontig={} declines={} outside={} defers={} redefers={} coalesced={} rescues={} maxpresent_us={} frame_us={} -> {}",
             n,
             E_ROWS.load(Ordering::Relaxed),
             torn_n,
             nc,
             decl,
+            outside,
             E_DEFER.load(Ordering::Relaxed),
             E_REDEFER.load(Ordering::Relaxed),
             E_COALESCE.load(Ordering::Relaxed),
+            E_RESCUE.load(Ordering::Relaxed),
             E_MAXPRES.load(Ordering::Relaxed),
             FRAME_US,
             verdict
