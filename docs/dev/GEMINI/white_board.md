@@ -1,74 +1,50 @@
-# WHITE BOARD — 2026-08-09 (GR24, first pass)
+# WHITE BOARD — 2026-08-10 (GR24, closing pass)
 
 Questions for Peter, each with the background to answer it. Nothing else lives here.
 
-**Answered and off the board:** the control hues (the loud macOS set shipped with knurl — your
-size-and-hue ruling) · MEGABOOM matching (by ADDRESS, your 2026-08-08 ruling — merged with zero
-new transmit in the match itself) · lane shutdown (done; the seat adopted all seven branches).
+**Answered and off the board since the first pass:** boot planning (Q5 — the fourteen card is
+written and ready; Boot AT flew the adopt7 card) · the MEGABOOM connect (Boot AS: CONNECTED and
+cleanly released, first BT link this OS has made) · Q2's evidentiary half (a live app window at
+bw=106 had no controls on real glass — the witness now names every such window).
 
 ---
 
 ## Q1 — igpu round 13 was amended AFTER your clearance. Veto or confirm before it flies.
 
-The adoption review found the round's answer gated on registers never read back on this machine:
-the post-switch check demanded an echo from `SWITCH_DISPLAY`/`SWITCH_EXTERNAL` (write-side ports
-with no proven echo — a switch that WORKED could have failed the comparison, blanked the panel,
-and aborted before the first AUX transaction), and the pre-switch gate's `SWITCH_DISPLAY==DIS`
-term conflated that register with `READ_DISPLAY`. Both are now advisory; only metal-proven
-registers abort or vote (DDC's echo, the two `READ_*` ports). The RUNBOOK's predicted transcript
-also contradicted itself — its own success line would have printed `gmux=FAILED` and sent you to
-a power cycle on a correct boot; fixed. **The flight artifact is therefore no longer byte-for-byte
-the one you cleared.** Every change makes it strictly less likely to refuse or lie, none touches
-the parachute, and the armed build type-checks green — but post-clearance amendment is yours to
-veto. Diff: `git log --oneline 509b9706..50969ab8`.
+Unchanged from the first pass, still awaiting your word. The adoption review found the flight
+gated on registers never read back on this machine; the amendments make it strictly less likely
+to refuse or lie, none touch the parachute, and the armed build is green. The single-use media is
+staged (`igpur13-…-f8da2af1`, FENCE strings verified absent). Diff:
+`git log --oneline 509b9706..50969ab8`.
 
-## Q2 — Windows 122–158 px wide now silently lose their whole control cluster. Which way?
+## Q2 — Windows 122–158 px wide silently lose their whole cluster. Option (c) still wants a ruling.
 
-KNURL's 24 px discs moved the cluster's width floor from 122 to 158 px of box width. A live ring-3
-window whose box lands in that band draws NO close/minimise/zoom — no witness, no skip line — and
-its app has no way to know. The fixtures were all re-sized to clear the floor, so no gate sees it.
-Options: (a) accept and witness it (one `[wm]` line when a cluster is declined for width — cheap,
-honest, ships today); (b) let narrow windows keep a smaller disc set (breaks "the size a Mac draws
-them"); (c) set a minimum window width ≥ 158 so the band cannot exist. I lean (a)+(c) together —
-say the word and it lands this round.
+Option (a) — the witness — is MERGED and already caught a real victim (the midden app's own
+window at bw=106, Boot AS). What remains yours: (c) a minimum window width ≥ 158 so the band
+cannot exist, or (b) smaller discs for narrow windows (breaks "the size a Mac draws them").
+The wire will now show you every occurrence; rule whenever the evidence satisfies you.
 
 ## Q3 — The discs sit 5 px from the frame; a Mac gives them ~16. Raise TITLE_HEIGHT?
 
-`(TITLE_HEIGHT − CONTROL_BOX) / 2 = (34 − 24) / 2 = 5 px` clearance. KNURL flagged it in-tree and
-deliberately did not take the question — chrome proportions are the taste gate. Raising
-TITLE_HEIGHT to ~40–56 gives macOS-like air around the discs but costs every window that much
-content height. Veto by eye on the next boot, or name a number.
+Unchanged: `(34 − 24) / 2 = 5 px`. Veto by eye on the fourteen boot, or name a number
+(~40–56 gives macOS-like air, costs every window that much content height).
 
-## Q4 — `ls`/`cat`/`stat` are still dead on an internal-reader boot. Which volume should they mean?
+## Q4 — FAT verbs: the proposed ruling is now IMPLEMENTED and merged. Veto if it's wrong.
 
-`vug` launches now (the resolver, re-resolve, and loader all bind `mount_program_source()`), but
-~23 other `fat::mount()` sites in shell.rs — the whole FAT verb family — still ask the default
-handle, which does not exist on a machine booted from the internal SD reader. Boot AR shows you
-typing `ls` twice before `vug`. The read verbs could move to the program source mechanically, but
-the card mounts READ-ONLY there, so the write verbs (`write`, `rm`, `mkdir`...) cannot follow —
-they would need either a loud per-verb refusal ("this volume is read-only") or a split where reads
-follow the program source and writes stay on the (absent) default and refuse with the census line.
-One ruling wanted: **reads follow the program source everywhere, writes refuse loudly on a
-read-only source** — say yes and it is a mechanical arc; say different and I brief it your way.
+Reads follow the program source; writes refuse loudly on a read-only one, naming volume, reason,
+and census. It bounced once in review (vacuous witnesses) and re-landed with legs that fire on a
+real census and a compile-time law that shell.rs cannot bind the default handle. If you wanted a
+different shape, say so — it is one revert away and the alternative brief is a sentence.
 
 ## Q6 — WiFi: may the card carry the extracted b43 firmware blob?
 
-GR22 answered the authoring question — writing the D11 microcode ourselves is not tractable, and
-OpenFWWF does not cover this core. The bcma plumbing is audited end to end (wifis1–4a), so the
-only thing between here and an association attempt is the proprietary firmware blob, extracted
-b43-style and loaded from the card at boot. Nothing ships anywhere; it lives on your bench media
-only. **Yes** → three arcs: blob load + D11 core boot (witnessed), open-network auth/assoc, DHCP
-over the smolnet stack that already exists. **No** → WiFi parks honestly and nothing pretends
-otherwise.
+Unchanged. Yes → three arcs to an association attempt (bcma plumbing audited, smolnet exists).
+No → WiFi parks honestly.
 
-## Q5 — Boot planning: four things want glass, two of them are flights.
+## Q7 — The bench serial: ttyUSB1 is gone from the host, and boots fly deaf without it.
 
-Never flown: the drag with sliver-erase (the flicker fix) · the 24 px knurled controls in the
-macOS hues · the dock + close-isolation already on the card from GR23 · the MEGABOOM by-address
-selection (its first boot decides the connect). Flights, both gated green and both needing your
-go: **igpu round 13** (pending Q1 — blanks the panel ~2.4–2.5 s) and **kepler FENCE** (first
-flight ever — QEMU has no Kepler, so metal is its only test; the verdict now requires both the
-falcon-side AND host-side ENGINE_STATUS to carry the bit, re-checks the hold at the stimulus, and
-force-clears host-side if the falcon's clear loses the race). The desktop work wants you clicking;
-the flights blank or perturb the panel — same card or separate ones, your call. Media stages
-whenever you say.
+Boot AT ran uncaptured — squawk alive on ttyUSB0 heard nothing, because the x86 serial rides the
+second FTDI channel and only `/dev/ttyUSB0` enumerates right now. Everything the fourteen boot
+exists to answer (FENCE-r2's ladder, the [spread] placement verdict, the BT bulk-transport
+question) speaks only on serial. Nothing for me to fix from the seat — this is a cable/adapter
+fact on your bench. Flag it before the next sitting if a captured boot is wanted.
