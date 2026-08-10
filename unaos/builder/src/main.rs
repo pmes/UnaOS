@@ -208,6 +208,17 @@ fn main() {
     // (the s42/INSTGUI and WXN-M3b failure). Default OFF => cap, TT fix and the whole L0 sequence
     // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_BT").is_ok() { feats.push("bt"); }
+    // BT-C1 (GR24): UNAOS_BTC=1 arms the first BR/EDR step toward A2DP audio — HCI_Create_Connection
+    // (0x0405) pages the speaker at the BD_ADDR in bt_name.rs, witnesses Connection Complete (event
+    // 0x03) or the failure status, and releases the link (or cancels an unresolved page). Its own
+    // knob, and NOT part of UNAOS_BT, because a page is a directed transmission that makes an
+    // audible noise on the speaker: a boot that did not ask for one must be structurally incapable
+    // of issuing one. `btc` implies `bt` in Cargo.toml, so pushing `btc` alone arms the whole BT
+    // stack. THIS list is what reaches the kernel binary for MEDIA builds, so a knob wired into
+    // arroyo alone would ship the page DISABLED while the banner claims it is on (the s42/INSTGUI
+    // and WXN-M3b failure). Default OFF => the page code and its constants unlinked, media
+    // byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_BTC").is_ok() { feats.push("btc"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature

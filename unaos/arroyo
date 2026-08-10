@@ -316,6 +316,20 @@ _feats=""
 # HERE and missing THERE ships the feature disabled while the banner claims it is on (the s42/INSTGUI
 # and WXN-M3b lesson).
 [ -n "${UNAOS_BT:-}" ] && _feats="${_feats}bt,"
+# BT-C1 (GR24): UNAOS_BTC=1 arms the first BR/EDR step toward A2DP audio — HCI_Create_Connection
+# (0x0405) PAGES Peter's speaker at the BD_ADDR in bt_name.rs, witnesses Connection Complete (event
+# 0x03) or the failure status, and releases the link (or cancels an unresolved page). Conservative
+# packet types (DM1|DH1), role switch allowed, page timeout shortened from the 5.12 s reset default
+# to 1.28 s (Core Vol 4 Part E §7.3.16) so a powered-off speaker cannot cost the boot five seconds.
+# NO Write_Scan_Enable is issued: §7.3.18 governs INBOUND inquiry/page scan and paging out needs
+# none of it. Its own knob and NOT part of UNAOS_BT because a page is a directed transmission that
+# makes an audible noise on the speaker — a boot that did not ask for one must be incapable of
+# issuing one. Implies `btc = ["bt"]` in Cargo.toml, so setting this alone arms the whole BT stack.
+# x86_64 only; stripped from aarch64 builds by `arm_features` below. Default OFF => the page code,
+# its constants and the classic Connection-Complete latch unlinked, media byte-identical. Kept in
+# sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
+# while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_BTC:-}" ] && _feats="${_feats}btc,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -607,6 +621,14 @@ arm_features() {
     # stripped (it predates this policy and the Pi/Jetson media hashes are already computed with it
     # present), so stripping `bt` alone is the whole delta.
     f="${f//,bt,/,}"
+    # BT-C1 (GR24) rides the same strip, for the same reason and as a consequence of the same fact:
+    # `btc` implies `bt`, whose only code is inside the x86-gated `drivers/ehci/mod.rs`, so `btc`
+    # emits not one byte of aarch64 CODE — but an enabled feature is hashed into cargo's
+    # `-Cmetadata` fingerprint, so leaving it in (or its implied `bt`, stripped just above) would
+    # shift every aarch64 media hash between a default build and a `UNAOS_BTC=1` one for zero
+    # observable change. Stripped => the x86 track can page a speaker without touching Pi or Jetson
+    # media at all.
+    f="${f//,btc,/,}"
     # VSYNC-PACE (GR22) rides the same strip, for the same reason: every line `nopace` gates lives in
     # `arch/x86_64/syscall.rs` and is additionally `wc`-gated (an x86-only feature), so `nopace` emits not
     # one byte of aarch64 CODE — but an enabled feature is hashed into cargo's `-Cmetadata` fingerprint, so
@@ -1338,7 +1360,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the

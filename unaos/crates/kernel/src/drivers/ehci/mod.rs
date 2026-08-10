@@ -1198,6 +1198,116 @@ const BT_L4_TXN_MS: u64 = 50;
 #[cfg(feature = "bt")]
 const BT_L4_PKT_MAX: u32 = 8;
 
+// ---------------------------------------------------------------------------------------------
+// BT-C1 — the FIRST BR/EDR step, and the first thing on this radio aimed at AUDIO.
+//
+// Everything above this line is LOW ENERGY. A2DP is not: the Advanced Audio Distribution Profile
+// runs over classic BR/EDR L2CAP, and the first move toward it is to PAGE the speaker — an
+// `HCI_Create_Connection` (0x0405) that establishes an ACL link on the basic-rate radio. This arc
+// takes that one step and lets go: page, witness the `Connection Complete` (event 0x03) or the
+// failure status honestly, disconnect. No SDP, no L2CAP channel, no AVDTP, no audio.
+//
+// WHY IT IS BEHIND ITS OWN KNOB (`UNAOS_BTC=1` => feature `btc`). A page is the loudest thing this
+// project has ever put on the air. It is a directed transmission at a named device that, on a
+// speaker, ANSWERS AUDIBLY — the MEGABOOM plays its connection tone — and it can take the device
+// away from whatever it is currently paired to. Every LE stage above it is either passive or
+// bounded to a device Peter named; this one makes noise in his room. So it cannot ride the same
+// knob as the rest: a boot that did not ask for a page must be incapable of issuing one, which is
+// a compile-time property here and not a runtime check.
+//
+// PREREQUISITES, and the Core spec sections that say which are real:
+//   * `HCI_Write_Scan_Enable` (Vol 4 Part E §7.3.18) is NOT required. It governs whether THIS
+//     device performs inquiry scan and page SCAN — i.e. whether others can find and page US.
+//     Paging OUT needs none of it, and enabling it would make this machine discoverable on the
+//     bench, which is a state change nobody asked for.
+//   * `HCI_Write_Page_Timeout` (Vol 4 Part E §7.3.16) IS written, and for a boot-cost reason. The
+//     reset default is 0x2000 = 5.12 s, which a powered-off speaker would spend in full on every
+//     boot that arms this knob. `BT_C1_PAGE_TIMEOUT` shortens it; see there.
+//   * No inquiry is run, so the peer's page-scan repetition mode is unknown and the conservative
+//     value is sent (see `BT_C1_PSRM`).
+//   * No pairing, no authentication, no encryption. A speaker already bonded to this machine's
+//     BD_ADDR may accept the link outright; one that is not may refuse it, and a refusal is a
+//     perfectly good witnessed answer.
+// ---------------------------------------------------------------------------------------------
+
+/// BT-C1 — `HCI_Create_Connection`: OGF 0x01 (Link Control) / OCF 0x0005 => opcode 0x0405.
+/// Thirteen parameter bytes: BD_ADDR(6) Packet_Type(2) Page_Scan_Repetition_Mode(1) Reserved(1)
+/// Clock_Offset(2) Allow_Role_Switch(1). Like its LE cousin it answers with a **Command Status**;
+/// the real result is the `Connection Complete` event (0x03).
+#[cfg(feature = "btc")]
+const BT_HCI_CREATE_CONN: u16 = 0x0405;
+/// BT-C1 — `HCI_Create_Connection_Cancel`: OGF 0x01 / OCF 0x0008 => opcode 0x0408. Six parameter
+/// bytes (the BD_ADDR being paged); returns status(1) + BD_ADDR(6) in a **Command Complete**. The
+/// classic analogue of `HCI_LE_Create_Connection_Cancel`, and it exists here for the same reason:
+/// a page left outstanding holds the controller in a state that refuses later connection commands,
+/// and this arc must not leave one behind.
+#[cfg(feature = "btc")]
+const BT_HCI_CREATE_CONN_CANCEL: u16 = 0x0408;
+/// BT-C1 — `HCI_Write_Page_Timeout`: OGF 0x03 / OCF 0x0018 => opcode 0x0C18. Two parameter bytes
+/// (the timeout, in 0.625 ms slots); returns status(1). Vol 4 Part E §7.3.16.
+#[cfg(feature = "btc")]
+const BT_HCI_WRITE_PAGE_TIMEOUT: u16 = 0x0C18;
+/// BT-C1 — the page timeout this arc writes: 0x0800 = 2048 slots x 0.625 ms = **1.28 s**.
+///
+/// The reset default is 0x2000 (5.12 s), and it is spent IN FULL whenever the peer is off, out of
+/// range, or not page-scanning — which on a bench is most boots. 1.28 s is the classic-Bluetooth
+/// value a page train needs to be given a fair chance (a full R2 page train is nominally 2.56 s of
+/// scanning on the PEER's side, but the paging side retransmits continuously, so a device that is
+/// scanning at all is normally reached well inside a second) and it caps what a dead speaker costs
+/// the boot. The spec range is 0x0001..0xFFFF; this is comfortably inside it.
+#[cfg(feature = "btc")]
+const BT_C1_PAGE_TIMEOUT: u16 = 0x0800;
+/// BT-C1 — `Packet_Type` for the page: **DM1 (0x0008) | DH1 (0x0010) = 0x0018**, and nothing else.
+///
+/// The field is a bitmap of the baseband packet types the link MAY use (Vol 4 Part E §7.1.5), and
+/// its polarity is treacherous: for the 2/3-Mbps EDR types the bits mean "do NOT use", so the
+/// all-zeros value a naive reader might pick actually permits everything. Naming exactly the two
+/// one-slot basic-rate types is conservative in the direction that matters — the shortest packets,
+/// the ones every BR/EDR device supports, no EDR negotiation — and this arc carries no audio, so
+/// there is nothing that wants the bandwidth. A speaker that needs more for A2DP later gets it
+/// from a `Change_Connection_Packet_Type`, which is a different arc's problem.
+#[cfg(feature = "btc")]
+const BT_C1_PACKET_TYPE: u16 = 0x0018;
+/// BT-C1 — `Page_Scan_Repetition_Mode` = **R2 (0x02)**, the conservative assumption.
+///
+/// The field tells the controller how the PEER page-scans, so it can size the page train (Vol 2
+/// Part B §8.3.3). It is normally taken from an inquiry result; this arc runs no inquiry, so it is
+/// a guess, and the two guesses fail differently: assuming a mode with MORE scanning than the peer
+/// really does (R0/R1 when it is R2) may under-page and miss a device that was reachable, while
+/// assuming R2 when it is really R0 only spends page attempts that were not needed. Over-paging
+/// costs time inside a timeout this arc already shortened; under-paging costs a FALSE NEGATIVE,
+/// which is the one outcome an experiment must not manufacture.
+#[cfg(feature = "btc")]
+const BT_C1_PSRM: u8 = 0x02;
+/// BT-C1 — `Clock_Offset` = 0x0000. Bit 15 is the "offset valid" flag and it is CLEAR here: no
+/// inquiry has been run, so no offset is known, and declaring an invalid one valid would send the
+/// controller paging at the wrong clock phase.
+#[cfg(feature = "btc")]
+const BT_C1_CLOCK_OFFSET: u16 = 0x0000;
+/// BT-C1 — `Allow_Role_Switch` = 0x01: the peer MAY become master of this link. Peripherals that
+/// expect to run their own piconet (speakers commonly do, so they can hold several sources) refuse
+/// or drop links they are not allowed to take over, so refusing the switch is a way to fail a page
+/// for a reason that has nothing to do with reachability.
+#[cfg(feature = "btc")]
+const BT_C1_ALLOW_ROLE_SWITCH: u8 = 0x01;
+/// BT-C1 — HCI event code 0x03 = `Connection Complete` (classic). Eleven parameters:
+/// Status(1) Connection_Handle(2) BD_ADDR(6) Link_Type(1) Encryption_Enabled(1) => 13 bytes on the
+/// wire. It is enabled by the event mask L1 already wrote — bit 2 of the reset default — so BT-C1
+/// writes no mask, exactly as BT-L3 writes none.
+#[cfg(feature = "btc")]
+const BT_EVT_CONN_COMPLETE: u8 = 0x03;
+/// BT-C1 — `Link_Type` 0x01 = ACL. 0x00 is SCO and 0x02 eSCO; neither can result from this
+/// command, and a `Connection Complete` carrying one would mean the event belongs to some other
+/// connection and its handle must not be adopted.
+#[cfg(feature = "btc")]
+const BT_C1_LINK_TYPE_ACL: u8 = 0x01;
+/// BT-C1 — bounded wall-clock window, in ms, for the `Connection Complete` after the page is
+/// accepted. Sized to sit just past `BT_C1_PAGE_TIMEOUT` (1.28 s): the controller answers with a
+/// Page Timeout status (0x04) of its own accord when the timeout expires, and a window that closed
+/// FIRST would report "no answer" on a boot where the controller was about to say exactly why.
+#[cfg(feature = "btc")]
+const BT_C1_CONN_MS: u64 = 1600;
+
 /// BT-L1 — reassembly cap for one HCI event that spans multiple event-endpoint packets. The event
 /// endpoint's max packet is 16 B (census: `IN1/int/16`), but an HCI event runs up to 2 + 255 B;
 /// the USB transport delivers it as ceil(len/mps) interrupt-IN transfers. 260 covers the largest
@@ -1507,6 +1617,16 @@ struct BtL3State {
     resolved_nonzero: bool,
     blind: bool,
     stopped: bool,
+    /// BT-C1 — the CLASSIC analogue of `live_handle`, and it exists for exactly the reason that one
+    /// does. A `Connection Complete` (event 0x03) with status 0x00 carries the only handle by which
+    /// a BR/EDR link can ever be released, and the cancel race has the same likelier-than-obvious
+    /// ordering on classic as on LE: the connection establishes, so the controller is no longer
+    /// paging and answers `Create_Connection_Cancel` with Command Disallowed — having already
+    /// queued the `Connection Complete` AHEAD of that Command Complete, where the cancel's own wait
+    /// walks straight past it. Without this latch that is a live link to a speaker, held for the
+    /// rest of the boot, with a tally line saying nothing is outstanding.
+    #[cfg(feature = "btc")]
+    classic_handle: Option<u16>,
 }
 
 pub static EHCI_HID: Mutex<Option<Vec<Controller>>> = Mutex::new(None);
@@ -3545,6 +3665,12 @@ impl Controller {
         // own feature mask denies LE is a command sequence with no defensible expectation.
         let mut l1_ok = true;
         let mut le_supported = false;
+        // BT-C1 stage guard: the OTHER half of the same feature byte. "BR/EDR Not Supported" is
+        // byte 4 bit 5 (0x20); a controller that sets it is LE-only and a classic page on it is a
+        // command with no defensible expectation. Read here, next to `le_supported`, so the two
+        // guards come from the same reply rather than from two readings of it.
+        #[cfg(feature = "btc")]
+        let mut bredr_supported = false;
         for &(opcode, name, params) in l1.iter() {
             // 68 bytes holds the largest L1 return payload — Read_Local_Supported_Commands'
             // status(1) + Supported_Commands(64) = 65 — with slack; every other command is far
@@ -3610,6 +3736,11 @@ impl Controller {
                     let le = f[4] & 0x40 != 0;
                     let no_bredr = f[4] & 0x20 != 0;
                     le_supported = le; // BT-L2 stage guard reads this, not the version number.
+                    // BT-C1 reads the same byte's other bit, and inverts it exactly once, here.
+                    #[cfg(feature = "btc")]
+                    {
+                        bredr_supported = !no_bredr;
+                    }
                     serial_println!(
                         ":: bt-l1: [{}] HCI_Read_Local_Supported_Features (0x1003) status={:#04x} lmp_features=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] LE(controller)={} BR/EDR-not-supported={} == witness ::",
                         self.idx, status, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], le, no_bredr
@@ -3685,6 +3816,29 @@ impl Controller {
             );
         } else {
             self.bt_le_scan(t, intf, &e, &mut toggle, &mut armed);
+        }
+
+        // ---- BT-C1: the classic page, and only if this boot asked for one ----------------------
+        // AFTER the LE work has released everything it took (the scan is disabled and confirmed,
+        // any LE link is disconnected) and BEFORE the event endpoint is quiesced, because the page
+        // reads its `Connection Complete` off that endpoint. Compile-gated on `btc`: a boot that
+        // did not set `UNAOS_BTC=1` contains no page code at all, which is the property a
+        // transmission that makes an audible noise in Peter's room deserves.
+        #[cfg(feature = "btc")]
+        {
+            if !(reset_ok && ver_ok && l1_ok) {
+                serial_println!(
+                    ":: bt-c1: [{}] page NOT ATTEMPTED — a preceding stage did not confirm (reset_ok={} version_ok={} l1_ok={}); no HCI_Create_Connection was issued == witness ::",
+                    self.idx, reset_ok, ver_ok, l1_ok
+                );
+            } else if !bredr_supported {
+                serial_println!(
+                    ":: bt-c1: [{}] page NOT ATTEMPTED — the LMP feature mask sets BR/EDR-Not-Supported, so this part is LE-only and a classic page on it has no defensible expectation; no HCI_Create_Connection was issued == witness ::",
+                    self.idx
+                );
+            } else {
+                self.bt_c1_page(t, intf, &e, &mut toggle, &mut armed);
+            }
         }
 
         // Quiesce: the event endpoint stays LINKED in the frame list (its slot is owned for the
@@ -4278,6 +4432,26 @@ impl Controller {
             // decoders above require; a shorter one cannot be trusted to carry a handle, and it
             // set `blind` — the honest reading is "something connection-shaped went past and could
             // not be read", not "nothing was there".
+            // BT-C1 — the same latch, for the classic `Connection Complete` (event 0x03). Layout:
+            // Status(1) Connection_Handle(2) BD_ADDR(6) Link_Type(1) Encryption_Enabled(1) after
+            // the two header bytes = 13 on the wire. Only an ACL link is adopted: a SCO/eSCO
+            // Connection Complete belongs to a connection this arc did not create and its handle
+            // must not be disconnected as if it were ours.
+            #[cfg(feature = "btc")]
+            if pkt[0] == BT_EVT_CONN_COMPLETE {
+                if len >= 13 {
+                    if pkt[2] == 0x00 && pkt[11] == BT_C1_LINK_TYPE_ACL {
+                        if st.classic_handle.is_none() {
+                            st.classic_handle =
+                                Some(((pkt[3] as u16) | ((pkt[4] as u16) << 8)) & 0x0FFF);
+                        }
+                    } else if pkt[2] != 0x00 {
+                        st.resolved_nonzero = true;
+                    }
+                } else {
+                    st.blind = true;
+                }
+            }
             if pkt[0] == BT_EVT_LE_META && len >= 3 && pkt[2] == BT_LE_SUBEVT_CONN_COMPLETE {
                 if len >= 21 {
                     if pkt[3] == 0x00 {
@@ -5330,6 +5504,350 @@ impl Controller {
         );
     }
     // ============================== end BT-L4 ================================================
+
+    // ================================ BT-C1 ==================================================
+
+    /// BT-C1 — PAGE the speaker on BR/EDR, and always let go. The first step toward A2DP audio.
+    ///
+    /// `HCI_Create_Connection` (0x0405) establishes a classic ACL link to a named BD_ADDR. That is
+    /// all this does. There is no SDP query, no L2CAP channel, no AVDTP stream and no audio; the
+    /// arc's whole claim is "this radio can reach that speaker on the basic-rate transport, and
+    /// here is the handle it got, and here is it being handed back".
+    ///
+    /// THE SAME THREE-STATE TEARDOWN AS BT-L3, for the same reason and with the same race:
+    ///   * a page that RESOLVED into a link is released with `HCI_Disconnect`;
+    ///   * a page that did NOT resolve is withdrawn with `HCI_Create_Connection_Cancel` (0x0408);
+    ///   * and the cancel can LOSE — in which case the link is live and the right teardown is the
+    ///     disconnect. `BtL3State::classic_handle` is where a `Connection Complete` walked past by
+    ///     the cancel's own wait is caught; the state object is this function's own, so nothing it
+    ///     latches can be confused with BT-L3's LE bookkeeping.
+    ///
+    /// MUST-NOT-APPEAR, and the tally names it: this function ending with a live link or an
+    /// unresolved page.
+    #[cfg(feature = "btc")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_c1_page(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+    ) {
+        let addr = BT_L3_PEER_ADDR_BYTES; // WIRE order (LSB first) — see `bt_name.rs`
+        let text = bt_addr_render_msb(&addr);
+        let mut asm = [0u8; BT_EVT_ASM_MAX];
+        let mut st = BtL3State::default();
+        let mut seen = 0u32;
+        let mut live = false;
+        let mut outstanding = false;
+        let mut handle = 0u16;
+        let mut disconnected = 0u32;
+        let mut cancels = 0u32;
+        let t0 = crate::arch::now_cycles();
+
+        // ---- 1. bound what a dead speaker costs the boot ---------------------------------------
+        // Vol 4 Part E §7.3.16. Written BEFORE the page, because it is the page's own deadline.
+        let mut rp = [0u8; 8];
+        let pt = [BT_C1_PAGE_TIMEOUT as u8, (BT_C1_PAGE_TIMEOUT >> 8) as u8];
+        match self.bt_hci_command(
+            t, intf, e, toggle, BT_HCI_WRITE_PAGE_TIMEOUT, &pt, &mut rp, armed,
+        ) {
+            Some(n) if n >= 1 => serial_println!(
+                ":: bt-c1: [{}] HCI_Write_Page_Timeout (0x0C18) status={:#04x} timeout={:#06x} (={}ms; reset default 0x2000 = 5120ms) -> {} == witness ::",
+                self.idx, rp[0], BT_C1_PAGE_TIMEOUT,
+                (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000,
+                if rp[0] == 0x00 { "ACCEPTED" } else { "REFUSED — the page below runs on the controller's own timeout, not this one" }
+            ),
+            Some(_) => serial_println!(
+                ":: bt-c1: [{}] HCI_Write_Page_Timeout (0x0C18) -> CmdComplete with NO status byte -> MALFORMED; the page below runs on the controller's own timeout ::",
+                self.idx
+            ),
+            None => serial_println!(
+                ":: bt-c1: [{}] HCI_Write_Page_Timeout (0x0C18) -> NO-RESPONSE; the page below runs on the controller's own timeout (5120ms) and this boot pays it if the speaker is off ::",
+                self.idx
+            ),
+        }
+
+        // ---- 2. HCI_Create_Connection ----------------------------------------------------------
+        // Thirteen parameter bytes: BD_ADDR(6) Packet_Type(2) Page_Scan_Repetition_Mode(1)
+        // Reserved(1) Clock_Offset(2) Allow_Role_Switch(1). Every value is justified at its
+        // constant. The Reserved octet is 0x00 by the spec's own instruction, not by choice.
+        let cp: [u8; 13] = [
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+            BT_C1_PACKET_TYPE as u8,
+            (BT_C1_PACKET_TYPE >> 8) as u8,
+            BT_C1_PSRM,
+            0x00,
+            BT_C1_CLOCK_OFFSET as u8,
+            (BT_C1_CLOCK_OFFSET >> 8) as u8,
+            BT_C1_ALLOW_ROLE_SWITCH,
+        ];
+        serial_println!(
+            ":: bt-c1: [{}] page parameters — peer={} packet_type={:#06x}(DM1|DH1, basic rate, one slot) psrm={:#04x}(R2, conservative: no inquiry was run) clock_offset={:#06x}(bit15 clear = NOT valid) allow_role_switch={:#04x}(the peer may take the link) reserved=0x00; NO Write_Scan_Enable is issued — Vol 4 Part E §7.3.18 governs INBOUND inquiry/page scan and paging out needs none of it, while enabling it would make this machine discoverable == witness ::",
+            self.idx,
+            core::str::from_utf8(&text).unwrap_or("??:??:??:??:??:??"),
+            BT_C1_PACKET_TYPE, BT_C1_PSRM, BT_C1_CLOCK_OFFSET, BT_C1_ALLOW_ROLE_SWITCH
+        );
+        if !self.bt_hci_send(t, intf, BT_HCI_CREATE_CONN, &cp) {
+            serial_println!(
+                ":: bt-c1: [{}] HCI_Create_Connection (0x0405) NOT SENT — the EP0 control-OUT failed (its own line is above). The command never reached the radio, so no page is outstanding and no cancel is owed == witness ::",
+                self.idx
+            );
+            self.bt_c1_tally(t0, seen, 0, 0, disconnected, cancels, live, outstanding);
+            return;
+        }
+        // FROM THIS INSTANT the controller may be paging.
+        outstanding = true;
+
+        // ---- 3. Command Status for 0x0405 -------------------------------------------------------
+        let mut accepted = false;
+        let r = self.bt_l3_await(
+            e, toggle, armed,
+            BtL3Want::CmdStatus(BT_HCI_CREATE_CONN),
+            Self::bt_l3_budget(BT_L3_CMD_MS),
+            &mut seen, &mut st, &mut asm,
+        );
+        match r {
+            BtL3Await::Got(_) => {
+                let s = asm[2];
+                if s == 0x00 {
+                    accepted = true;
+                    serial_println!(
+                        ":: bt-c1: [{}] HCI_Create_Connection (0x0405) -> CommandStatus status={:#04x} -> ACCEPTED, the controller is now PAGING {} == witness ::",
+                        self.idx, s, core::str::from_utf8(&text).unwrap_or("??")
+                    );
+                } else {
+                    outstanding = false;
+                    serial_println!(
+                        ":: bt-c1: [{}] HCI_Create_Connection (0x0405) -> CommandStatus status={:#04x} -> REFUSED{} — the controller did NOT start paging, so no cancel is owed == witness ::",
+                        self.idx, s,
+                        match s {
+                            0x01 => " (UNKNOWN-CMD: this controller's ROM does not carry Create_Connection — the patchram/.hcd boundary, docs/MANIFESTO/CLEAN_ROOM_POLICY.md; no firmware path is added here)",
+                            0x0C => " (COMMAND-DISALLOWED: the controller is in a state that forbids it — a link to this BD_ADDR may already exist)",
+                            0x12 => " (INVALID-HCI-PARAMETERS: one of the parameters witnessed above is out of range for this part)",
+                            _ => "",
+                        }
+                    );
+                }
+            }
+            BtL3Await::Timeout => serial_println!(
+                ":: bt-c1: [{}] HCI_Create_Connection (0x0405) -> NO CommandStatus within {}ms — the command went out on EP0 and the controller MAY be paging, so it is treated as OUTSTANDING and the cancel below runs == witness ::",
+                self.idx, BT_L3_CMD_MS
+            ),
+            BtL3Await::Stop => serial_println!(
+                ":: bt-c1: [{}] HCI_Create_Connection (0x0405) -> event endpoint became UNREADABLE before any CommandStatus. The page is treated as OUTSTANDING; the cancel below is SENT on EP0 (which the halt did not touch) and its reply is not read == witness ::",
+                self.idx
+            ),
+        }
+
+        // ---- 4. Connection Complete (event 0x03) -------------------------------------------------
+        if accepted {
+            let r = self.bt_l3_await(
+                e, toggle, armed,
+                BtL3Want::Evt(BT_EVT_CONN_COMPLETE),
+                Self::bt_l3_budget(BT_C1_CONN_MS),
+                &mut seen, &mut st, &mut asm,
+            );
+            match r {
+                BtL3Await::Got(len) if len >= 13 => {
+                    let s = asm[2];
+                    let h = ((asm[3] as u16) | ((asm[4] as u16) << 8)) & 0x0FFF;
+                    // Whatever the status, the page RESOLVED: the controller left the paging state
+                    // in order to send this. Nothing to cancel either way.
+                    outstanding = false;
+                    if s == 0x00 && asm[11] == BT_C1_LINK_TYPE_ACL {
+                        live = true;
+                        handle = h;
+                        serial_println!(
+                            ":: bt-c1: [{}] Connection Complete (0x03) — status={:#04x} handle={:#06x} peer={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link_type={:#04x}(ACL) encryption={:#04x} -> BR/EDR LINK ESTABLISHED. This is the transport A2DP runs on; nothing above L2CAP is attempted and the link is released below == witness ::",
+                            self.idx, s, h,
+                            asm[10], asm[9], asm[8], asm[7], asm[6], asm[5],
+                            asm[11], asm[12]
+                        );
+                    } else if s == 0x00 {
+                        // A link, but not one this command can have made. Not adopted, and said so
+                        // loudly: disconnecting a handle that is not ours is worse than leaking it.
+                        serial_println!(
+                            ":: bt-c1: [{}] Connection Complete (0x03) status=0x00 handle={:#06x} link_type={:#04x} -> NOT AN ACL LINK (0x00=SCO, 0x02=eSCO). A page cannot produce this, so the event belongs to a connection this arc did not create; the handle is NOT adopted and NOT disconnected == witness ::",
+                            self.idx, h, asm[11]
+                        );
+                    } else {
+                        serial_println!(
+                            ":: bt-c1: [{}] Connection Complete (0x03) — status={:#04x} -> NOT CONNECTED{}. The page RESOLVED (the controller left the paging state to send this), so no cancel is owed == witness ::",
+                            self.idx, s,
+                            match s {
+                                0x04 => " (PAGE TIMEOUT: the speaker did not answer the page train within the timeout written above — it is off, out of range, or not page-scanning. THIS IS THE ORDINARY RESULT FOR A POWERED-OFF SPEAKER and says nothing against the radio)",
+                                0x05 => " (AUTHENTICATION FAILURE)",
+                                0x08 => " (CONNECTION TIMEOUT)",
+                                0x0D | 0x0E | 0x0F => " (CONNECTION REJECTED: the peer refused — limited resources, security, or an unacceptable BD_ADDR. A speaker bonded to another host commonly answers this)",
+                                0x16 => " (CONNECTION TERMINATED BY LOCAL HOST)",
+                                0x1F => " (UNSPECIFIED ERROR)",
+                                _ => "",
+                            }
+                        );
+                    }
+                }
+                BtL3Await::Got(len) => {
+                    st.blind = true;
+                    serial_println!(
+                        ":: bt-c1: [{}] Connection Complete (0x03) SHORT-EVENT ({} bytes, 13 required) -> MALFORMED — the page is treated as OUTSTANDING (this event cannot be trusted to say it resolved) and the cancel below runs. This run is now BLIND == witness ::",
+                        self.idx, len
+                    );
+                }
+                BtL3Await::Timeout => serial_println!(
+                    ":: bt-c1: [{}] NO Connection Complete within {}ms — longer than the {}ms page timeout written above, so the controller should have reported a Page Timeout of its own accord and did not. The page is OUTSTANDING and MUST be cancelled == witness ::",
+                    self.idx, BT_C1_CONN_MS, (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000
+                ),
+                BtL3Await::Stop => serial_println!(
+                    ":: bt-c1: [{}] event endpoint became UNREADABLE while awaiting Connection Complete — the page is OUTSTANDING and the cancel is SENT UNREAD below == witness ::",
+                    self.idx
+                ),
+            }
+        }
+
+        // ---- 4b. reconcile the latch before any cancel is considered -----------------------------
+        if !live {
+            if let Some(h) = st.classic_handle.take() {
+                live = true;
+                handle = h;
+                outstanding = false;
+                serial_println!(
+                    ":: bt-c1: [{}] LATCHED LINK RECOVERED — a Connection Complete with status=0x00 handle={:#06x} was walked past by a wait that asked for something else. Discarding it would have left a LIVE BR/EDR LINK to the speaker for the rest of the boot; the event qTD is deactivated straight after this stage, so no Disconnection Complete could ever be read. The handle is adopted and the link is DISCONNECTED below == witness ::",
+                    self.idx, h
+                );
+            }
+        }
+
+        // ---- 5. MANDATORY TEARDOWN: withdraw an unresolved page ----------------------------------
+        if outstanding {
+            if !self.bt_hci_send(t, intf, BT_HCI_CREATE_CONN_CANCEL, &addr) {
+                serial_println!(
+                    ":: bt-c1: [{}] HCI_Create_Connection_Cancel (0x0408) NOT SENT — the EP0 control-OUT failed (its own line is above). THE PAGE REMAINS OUTSTANDING == witness ::",
+                    self.idx
+                );
+            } else {
+                cancels += 1;
+                let r = self.bt_l3_await(
+                    e, toggle, armed,
+                    BtL3Want::CmdComplete(BT_HCI_CREATE_CONN_CANCEL),
+                    Self::bt_l3_budget(BT_L3_CMD_MS),
+                    &mut seen, &mut st, &mut asm,
+                );
+                match r {
+                    BtL3Await::Got(len) if len >= 6 => {
+                        let s = asm[5];
+                        serial_println!(
+                            ":: bt-c1: [{}] HCI_Create_Connection_Cancel (0x0408) -> CmdComplete status={:#04x} -> {} == witness ::",
+                            self.idx, s,
+                            match s {
+                                0x00 => "ACCEPTED (a Connection Complete reporting the cancellation, status 0x02, should follow)",
+                                0x02 => "UNKNOWN-CONNECTION-IDENTIFIER (the controller is not paging this address — either it never was, or the link already established; the latch below decides which)",
+                                0x0C => "COMMAND-DISALLOWED (the controller is not paging — commonly because the connection has ALREADY ESTABLISHED; the latch below decides)",
+                                _ => "UNEXPECTED-STATUS",
+                            }
+                        );
+                        outstanding = false;
+                        // Either ordering of the race resolves here: a Connection Complete queued
+                        // AHEAD of this Command Complete is in the latch, and one queued BEHIND it
+                        // is caught by the second wait.
+                        if st.classic_handle.is_none() && s == 0x00 {
+                            let r2 = self.bt_l3_await(
+                                e, toggle, armed,
+                                BtL3Want::Evt(BT_EVT_CONN_COMPLETE),
+                                Self::bt_l3_budget(BT_L3_CMD_MS),
+                                &mut seen, &mut st, &mut asm,
+                            );
+                            match r2 {
+                                BtL3Await::Got(len) if len >= 13 => serial_println!(
+                                    ":: bt-c1: [{}] post-cancel Connection Complete status={:#04x}{} == witness ::",
+                                    self.idx, asm[2],
+                                    if asm[2] == 0x02 { " (UNKNOWN-CONNECTION-IDENTIFIER, the spec's cancellation status — the page is withdrawn)" } else { "" }
+                                ),
+                                _ => serial_println!(
+                                    ":: bt-c1: [{}] cancel ACCEPTED but no decodable Connection Complete followed within {}ms; the withdrawal is unconfirmed and this arc says so rather than assuming it == witness ::",
+                                    self.idx, BT_L3_CMD_MS
+                                ),
+                            }
+                        }
+                    }
+                    BtL3Await::Got(len) => serial_println!(
+                        ":: bt-c1: [{}] HCI_Create_Connection_Cancel (0x0408) -> CmdComplete SHORT-EVENT ({} bytes, 6 required) -> MALFORMED; the page is treated as STILL OUTSTANDING == witness ::",
+                        self.idx, len
+                    ),
+                    BtL3Await::Timeout => serial_println!(
+                        ":: bt-c1: [{}] HCI_Create_Connection_Cancel (0x0408) SENT but NO CmdComplete within {}ms. The EP0 write, which is what withdraws the page, was made; what is missing is the confirmation — treated as STILL OUTSTANDING == witness ::",
+                        self.idx, BT_L3_CMD_MS
+                    ),
+                    BtL3Await::Stop => serial_println!(
+                        ":: bt-c1: [{}] HCI_Create_Connection_Cancel (0x0408) SENT UNREAD — the event endpoint is unreadable, so no CmdComplete is claimed. Treated as STILL OUTSTANDING == witness ::",
+                        self.idx
+                    ),
+                }
+            }
+        }
+
+        // ---- 5b. the last chance to turn a walked-past handle into a disconnect -------------------
+        if !live {
+            if let Some(h) = st.classic_handle.take() {
+                live = true;
+                handle = h;
+                outstanding = false;
+                serial_println!(
+                    ":: bt-c1: [{}] LATCHED LINK RECOVERED from the cancel's own wait — Connection Complete status=0x00 handle={:#06x}. THIS IS THE CANCEL RACE IN ITS LIKELIER ORDERING: the link established, so the controller was no longer paging and refused the cancel, having already queued this event ahead of it == witness ::",
+                    self.idx, h
+                );
+            }
+        }
+
+        // ---- 6. MANDATORY TEARDOWN: release a live link ------------------------------------------
+        // `HCI_Disconnect` (0x0406) is link-type agnostic — the same command, the same Command
+        // Status + Disconnection Complete pair, so BT-L3's teardown is reused verbatim rather than
+        // transcribed. Its witness lines carry the `bt-l3:` prefix, which is correct: it IS the L3
+        // teardown, doing its job on a handle BT-C1 handed it.
+        if live {
+            let mut asm2 = [0u8; BT_EVT_ASM_MAX];
+            if self.bt_l3_disconnect(
+                t, intf, e, toggle, armed, handle, &mut seen, &mut st, &mut asm2,
+            ) {
+                disconnected += 1;
+                live = false;
+            }
+        }
+
+        self.bt_c1_tally(
+            t0, seen, 1, u32::from(disconnected > 0 || live), disconnected, cancels, live,
+            outstanding,
+        );
+    }
+
+    /// BT-C1 — the end-of-stage tally, in the shape BT-L3's is: `left_outstanding=` reads `none` on
+    /// every correct path and names what is left on every other.
+    #[cfg(feature = "btc")]
+    #[allow(clippy::too_many_arguments)]
+    fn bt_c1_tally(
+        &self,
+        t0: u64,
+        events: u32,
+        pages: u32,
+        completed: u32,
+        disconnected: u32,
+        cancels: u32,
+        live: bool,
+        outstanding: bool,
+    ) {
+        let (elapsed, unit) = epace_fmt(crate::arch::now_cycles().wrapping_sub(t0));
+        serial_println!(
+            ":: bt-c1: [{}] C1 tally — elapsed={}{} events_read={} pages_attempted={} links_established={} disconnections_confirmed={} cancels_issued={} left_outstanding={} == witness ::",
+            self.idx, elapsed, unit, events, pages, completed, disconnected, cancels,
+            match (live, outstanding) {
+                (false, false) => "none",
+                (true, _) => "A LIVE BR/EDR LINK — the teardown was not confirmed. THIS IS THE MUST-NOT-APPEAR CONDITION",
+                (false, true) => "AN UNRESOLVED HCI_Create_Connection — the controller may still be PAGING. THIS IS THE MUST-NOT-APPEAR CONDITION",
+            }
+        );
+    }
+    // ============================== end BT-C1 ================================================
 
     /// BT-L2 — read LE Advertising Reports off the event endpoint for a BOUNDED wall-clock window
     /// and build the distinct-device table.
