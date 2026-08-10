@@ -1085,6 +1085,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // `probe_once` and `piusb27_service` run from the loop. Reads only: it is not a FAT writer.
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             unaos_kernel::fs::fat::sdhc_probe_once();
+            // FATVERB: the shell's storage witness — the read verbs, the exec probe and the write
+            // gate must all name the same handle, and a write verb must consult the gate before it
+            // mutates. One-shot. It MUST run here and not with the other shell fixtures at step 5:
+            // the adoption review's capture showed those legs firing before `pci::init` and before
+            // the USB publish, so they read `handles=global=absent sdhc=absent` and passed on
+            // all-false inputs. Placed after the two probes above, the census names real handles
+            // and the legs have something to be wrong about. It drives real verbs against a
+            // throwaway console and mutates nothing (its write leg targets an unresolvable name).
+            #[cfg(all(target_arch = "x86_64", feature = "witness"))]
+            unaos_kernel::shell::fatverb_storage_witness();
             // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under
             // /fs/usb and emit the witness (aarch64 Pi path; runs with the xHCI lock released).
             #[cfg(target_arch = "aarch64")]
@@ -1486,6 +1496,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // site: it reads only and never becomes a second x86 FAT mutator.
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         unaos_kernel::fs::fat::sdhc_probe_once();
+        // FATVERB: the shell's storage witness (one-shot) — see the note at the first loop site.
+        // This file carries THREE storage-ready passes and which one a given x86 build reaches
+        // depends on its knobs, so the call sits at all three and the latch inside makes it speak
+        // exactly once. Mutates nothing.
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
+        unaos_kernel::shell::fatverb_storage_witness();
         // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under /fs/usb
         // and emit the witness (aarch64 Pi path; runs here with the xHCI lock released, like probe_once).
         #[cfg(target_arch = "aarch64")]
@@ -4172,6 +4188,12 @@ fn x86_usb_pump(cpu: usize) {
         // SDHC-4b (x86, sdhcblk knob): mount the INTERNAL SD card READ-ONLY once registered (one-shot).
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         unaos_kernel::fs::fat::sdhc_probe_once();
+        // FATVERB: the shell's storage witness (one-shot) — see the note at the first loop site.
+        // This file carries THREE storage-ready passes and which one a given x86 build reaches
+        // depends on its knobs, so the call sits at all three and the latch inside makes it speak
+        // exactly once. Mutates nothing.
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
+        unaos_kernel::shell::fatverb_storage_witness();
         // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial on growth.
         #[cfg(feature = "witness")]
         unaos_kernel::bootlog::service_serial_dump();

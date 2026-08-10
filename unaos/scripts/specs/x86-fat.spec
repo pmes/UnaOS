@@ -134,3 +134,23 @@ FORBID :: WXAUDIT x86: .* TRUNCATED ::
 REQUIRE :: WXAUDIT-NXE: cores=[0-9]+ nxe=[0-9]+ nxe_mask=0x[0-9A-F]+ wp=[0-9]+ wp_mask=0x[0-9A-F]+ -> PASS ::
 REQUIRE :: WXN-FBWC: fb=0x[0-9A-F]+ lvl=[0-9]+ e=0x[0-9A-F]{16} pat=[0-9]+ pcd=[0-9]+ pwt=[0-9]+ w=[0-9]+ fx=[0-9]+ -> LEAF BIT-IDENTICAL ::
 FORBID :: WXN-FBWC: .*-> SKIPPED ::
+
+# --- FATVERB (GR24) — the shell's file verbs bind the PROGRAM SOURCE, and a write verb asks first --
+# --- These two legs run from the storage-ready service pass, NOT with the other shell fixtures at
+# --- main.rs step 5: an earlier cut of them fired before `pci::init` and the USB publish and passed
+# --- on `handles=global=absent sdhc=absent`, i.e. on all-false inputs, which is dead rather than
+# --- quiet. Each leg DRIVES A REAL VERB (`ls_path`; `fs_rm` against an unresolvable name, so the
+# --- gate is exercised and nothing is mutated) and asserts the binding that verb STAMPED, requiring
+# --- the stamp counter to advance — so a verb that stops routing through the shared mount helpers
+# --- fails the leg instead of inheriting an earlier answer. Falsified both ways on this host
+# --- (2026-08-09): armed, both PASS; with `ls_path`/`fs_rm` bypassing the helpers,
+# --- `readvol -> FAIL (… read_ran=false read=never …)` and `writegate -> FAIL (gate_ran=false …)`.
+# --- SCOPE: `witness` only. They need no FAT image and no `sdhcblk` — the summary line's census
+# --- reads `sdhc=unbuilt` on this spec's build and the legs still carry content, because the
+# --- handle-agreement and counter halves are independent of which handles exist. The wait is
+# --- BOUNDED (30 s, wcx's threshold): a boot that never gets a block device still emits all three
+# --- lines with an empty census, so these REQUIREs cannot go red for want of a card.
+# --- MINIMUM BUILD GENERATION — the FATVERB commit (2026-08-09); older images cannot print them.
+REQUIRE :: TSTE: fatverb\.readvol -> PASS ::
+REQUIRE :: TSTE: fatverb\.writegate -> PASS ::
+REQUIRE :: \[fatverb\] storage witness: exec=[a-z-]+ read=[a-z-]+ gate=[a-z-]+ waited=[0-9]+ms handles=global=(present|absent) sdhc=(present|absent|unbuilt) ::

@@ -240,14 +240,275 @@ fn fs5_say(console: &mut Console, line: &str) {
     serial_println!(":: fs5: {} ::", line);
 }
 
+// ===================== FATVERB — the verbs find their volume ========================================
+//
+// Boot AR, second half. LAUNCH-AR moved the three EXEC legs (the `FatVolume::is_file` probe, the
+// `bare_exec` re-resolve, the `read_el0_image` load) from the default-handle `fat::mount` to
+// `fat::mount_program_source()`, because on a machine booted from the internal SD reader the global
+// `BLOCK_DEVICE` slot is EMPTY — `SDHCBLK` registers the card under its own handle and says so on
+// the wire. That fixed launching. It did not fix looking: Peter typed `ls` twice on that same boot
+// and got nothing, because the twenty-five FAT verbs in this file were all still asking the handle
+// that does not exist there. A shell where `ls` and `vug` disagree about which volume is the volume
+// is not a shell.
+//
+// So every verb binds the SAME handle the exec legs bind. The two helpers below are the only place
+// that binding is expressed, which is the point: the failure mode this arc closes is call sites
+// drifting apart, and twenty-five copies of `match fat::mount` is how they drifted.
+//
+// READ and WRITE are split because they are not the same question.
+//   * A read verb needs a volume. If it cannot get one it says so, naming the handles it was
+//     offered — the `exec-probe ... NO VOLUME (...; handles=...)` idiom, because a decline that
+//     cannot name what it inspected cannot be falsified by the capture it appears in.
+//   * A write verb needs a volume that ADMITS WRITES, and on the internal reader it will not get
+//     one: `Sdhc` is a read-only mount outside the reserved flight-recorder extent (SDHC-4c). Left
+//     ungated, `rm FOO` on that boot would walk a real directory mutation down to `write_sector`,
+//     collect `Unsupported` from the permit, and surface as a per-sector I/O error — or, worse for
+//     a multi-step verb like `write` (delete-then-recreate) or `mv`, get part-way. So the gate runs
+//     BEFORE the first mutation, refuses LOUDLY on both sinks, and names the volume, the reason and
+//     the census. It never silently no-ops.
+//
+// `mount_program_source()` is IDENTICAL to `mount()` on every configuration that already worked:
+// aarch64 and x86-without-`sdhcblk` have no second handle, and where a global device is registered
+// it still wins the precedence ladder. The behaviour only differs on the one boot shape that was
+// already broken.
+
+/// FATVERB: WHICH HANDLE A BINDING SITE ACTUALLY BOUND — recorded as a fact, not recomputed.
+///
+/// This exists because the first cut of the FATVERB witness was A==A and the adoption review said
+/// so: it compared `mount_program_source() + resolve` against `mount_program_source() + resolve`
+/// and would have passed with every read verb reverted to the old handle. The only way a fixture
+/// can tell "the verbs bind the program source" from "this expression binds the program source" is
+/// to observe what the VERBS DID, so each binding site stamps its answer here and the witness reads
+/// the stamps after driving a real verb.
+///
+/// The SEQ counters are the half that makes a revert visible. A leg that only compared the stamps
+/// would still pass against a stale pair left by some earlier call; requiring the counter to ADVANCE
+/// across the driven verb means a verb that no longer routes through these helpers fails the leg
+/// instead of inheriting somebody else's answer.
+///
+/// Plain relaxed atomics: this is an instrument, it is read only by the one-shot witness, and it is
+/// on the path of every file verb — it must cost nothing and must never introduce an ordering that
+/// the verbs would not otherwise have.
+mod bind {
+    /// Never asked.
+    pub const NONE: u8 = 0;
+    /// Asked; nothing mounted (the decline path).
+    pub const DECLINED: u8 = 1;
+    pub const GLOBAL: u8 = 2;
+    pub const USB: u8 = 3;
+    pub const SDHC: u8 = 4;
+    /// The write gate ADMITTED the volume.
+    pub const ADMITTED: u8 = 5;
+    /// The write gate REFUSED it as read-only.
+    pub const REFUSED_RO: u8 = 6;
+
+    pub fn of(fs: &crate::fs::fat::FatFs) -> u8 {
+        match fs.source_name() {
+            "global" => GLOBAL,
+            "usb" => USB,
+            _ => SDHC,
+        }
+    }
+
+    /// Only the x86 storage witness renders these; the verbs stamp and never read.
+    #[cfg(target_arch = "x86_64")]
+    pub fn name(code: u8) -> &'static str {
+        match code {
+            NONE => "never",
+            DECLINED => "declined",
+            GLOBAL => "global",
+            USB => "usb",
+            SDHC => "sdhc",
+            ADMITTED => "admitted",
+            REFUSED_RO => "refused-ro",
+            _ => "?",
+        }
+    }
+}
+
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering as BindOrd};
+
+/// The handle the READ verbs' binding site last bound, and how many times it has bound anything.
+static READ_BIND: AtomicU8 = AtomicU8::new(bind::NONE);
+static READ_BIND_SEQ: AtomicU32 = AtomicU32::new(0);
+/// The handle the EXEC PROBE (`FatVolume::is_file`) last bound. Independent producer, independent
+/// call path — this is the pair `fatverb_storage_witness` compares. x86 only: aarch64 never sets
+/// `Facts::exec`, so the probe is a constant `false` there and has no handle to stamp.
+#[cfg(target_arch = "x86_64")]
+static EXEC_BIND: AtomicU8 = AtomicU8::new(bind::NONE);
+#[cfg(target_arch = "x86_64")]
+static EXEC_BIND_SEQ: AtomicU32 = AtomicU32::new(0);
+/// What the WRITE gate last answered, and how many times it has answered.
+static WRITE_GATE: AtomicU8 = AtomicU8::new(bind::NONE);
+static WRITE_GATE_SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn stamp(cell: &AtomicU8, seq: &AtomicU32, code: u8) {
+    cell.store(code, BindOrd::Relaxed);
+    seq.fetch_add(1, BindOrd::Relaxed);
+}
+
+/// FATVERB: the write gate's answer, decided but not yet rendered. Split out from
+/// [`mount_write_volume`] so the witness can drive a real write verb and read the gate's recorded
+/// answer without a console, and so the rendering lives in exactly one place.
+enum WriteVolume {
+    /// The program source mounted and admits ordinary file mutation.
+    Admitted(FatFs),
+    /// It mounted and REFUSES: the handle's name, the volume label, the reason.
+    ReadOnly(&'static str, String, &'static str),
+    /// Nothing mounted at all.
+    NoVolume(FatError),
+}
+
+/// FATVERB: mount the volume a READ verb should act on — the program source, so `ls` and a bare
+/// name are looking at the same card. Stamps [`READ_BIND`] either way, including on the decline:
+/// "the read verbs asked and got nothing" is a different fact from "the read verbs never asked",
+/// and Boot AR's symptom was the first one.
+fn open_read_volume() -> Result<FatFs, FatError> {
+    match crate::fs::fat::mount_program_source() {
+        Ok(fs) => {
+            stamp(&READ_BIND, &READ_BIND_SEQ, bind::of(&fs));
+            Ok(fs)
+        }
+        Err(e) => {
+            stamp(&READ_BIND, &READ_BIND_SEQ, bind::DECLINED);
+            Err(e)
+        }
+    }
+}
+
+/// FATVERB: the WRITE gate. Mount the program source, then ask the BLOCK LAYER — through the one
+/// predicate `crate::fs::fat::BlockSource::write_veto`, which the VFS's `FatBackend::read_only`
+/// also forwards to — whether that source can be mutated at all. Runs before any directory entry,
+/// cluster chain or FAT sector has been touched.
+fn open_write_volume() -> WriteVolume {
+    let fs = match open_read_volume() {
+        Ok(fs) => fs,
+        Err(e) => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::DECLINED);
+            return WriteVolume::NoVolume(e);
+        }
+    };
+    match fs.write_veto() {
+        None => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::ADMITTED);
+            WriteVolume::Admitted(fs)
+        }
+        Some(why) => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::REFUSED_RO);
+            WriteVolume::ReadOnly(fs.source_name(), fs.label(), why)
+        }
+    }
+}
+
+// FATVERB: TWO SINKS, TWO LENGTHS — and that is deliberate, not laziness.
+//
+// The first cut printed one ~235-character line to both. The panel is 128–180 columns depending on
+// the scale metrics, so the census tail — the part that says WHICH handles existed, i.e. the whole
+// diagnostic — was clipped off the right edge and never reached the eye it was written for. Serial
+// has no such limit and a bench capture wants everything. So the operator gets a sentence and the
+// capture gets the forensics, and they carry the same verdict word (`REFUSED READ-ONLY`) so one is
+// greppable from the other.
+
+/// FATVERB: the read verbs' decline, on both sinks. Boot AR's symptom WAS a read decline — `ls`
+/// twice, nothing back — so the headless capture must carry it. Without the mirror a bench log
+/// cannot tell "the verb declined, and here is what it was offered" from "the keystroke never
+/// arrived", which is exactly the ambiguity that cost the first diagnosis.
+fn mount_read_volume(console: &mut Console, verb: &str) -> Option<FatFs> {
+    match open_read_volume() {
+        Ok(fs) => Some(fs),
+        Err(e) => {
+            console.println(&alloc::format!("{}: no FAT filesystem ({:?})", verb, e));
+            serial_println!(
+                ":: [fatverb] {} -> NO VOLUME ({:?}; handles={}) ::",
+                verb, e, crate::drivers::block::source_census()
+            );
+            None
+        }
+    }
+}
+
+/// FATVERB: the write verbs' gate, on both sinks. `None` means the caller has already been
+/// explained to and must return WITHOUT mutating anything.
+fn mount_write_volume(console: &mut Console, verb: &str) -> Option<FatFs> {
+    match open_write_volume() {
+        WriteVolume::Admitted(fs) => Some(fs),
+        WriteVolume::ReadOnly(source, label, why) => {
+            console.println(&alloc::format!("{}: REFUSED READ-ONLY ({})", verb, source));
+            serial_println!(
+                ":: [fatverb] {} -> REFUSED READ-ONLY (source={} label={} reason={}; handles={}) ::",
+                verb,
+                source,
+                if label.is_empty() { "-" } else { &label },
+                why,
+                crate::drivers::block::source_census()
+            );
+            None
+        }
+        WriteVolume::NoVolume(e) => {
+            console.println(&alloc::format!("{}: no FAT filesystem ({:?})", verb, e));
+            serial_println!(
+                ":: [fatverb] {} -> NO VOLUME ({:?}; handles={}) ::",
+                verb, e, crate::drivers::block::source_census()
+            );
+            None
+        }
+    }
+}
+
+// ===================== FATVERB — THE SOURCE LAW, ENFORCED BY THE COMPILER ==========================
+//
+// The arc's claim is "no FAT verb in this file binds the default handle any more". That was true the
+// day it landed and grep-true ever since, which is worth exactly nothing: the Boot AR defect WAS a
+// call site left behind, and the next one will arrive the same way — someone adds a verb, copies the
+// nearest neighbour, and the neighbour they copy is from a different file. A runtime witness cannot
+// catch that; it can only observe the verbs it happens to drive.
+//
+// So the law is checked where it can actually be violated — at compile time, over this file's own
+// source, on every `arroyo check` leg and every cfg combination. A re-introduced default-handle
+// mount here is a BUILD ERROR naming this comment, not a silent regression that waits for a bench.
+//
+// SCOPE, honestly. The needle is the path spelling `::mount` immediately followed by an empty
+// argument list — assembled below byte by byte, so that neither the needle nor this paragraph trips
+// the law it defines. That covers `crate::fs::fat::mount(…)` with no arguments and every
+// abbreviation of it that keeps the path separator. It does NOT catch a `use` import of the function
+// followed by a bare call: a determined evasion defeats it. This is a tripwire against the failure
+// that actually happens — a copied call site — not a sandbox. `mount_source` and
+// `mount_program_source` do not match, which is the point: those are the callers we want.
+//
+// Prose elsewhere in this file deliberately names the function without parentheses for the same
+// reason.
+const _: () = {
+    const SRC: &[u8] = include_bytes!("shell.rs");
+    const NEEDLE: [u8; 9] = [b':', b':', b'm', b'o', b'u', b'n', b't', b'(', b')'];
+    let mut i = 0usize;
+    let mut hits = 0usize;
+    while i + NEEDLE.len() <= SRC.len() {
+        // Cheap first-byte reject, then the full compare — keeps const-eval linear and fast over a
+        // file this size.
+        if SRC[i] == NEEDLE[0] {
+            let mut k = 0usize;
+            while k < NEEDLE.len() && SRC[i + k] == NEEDLE[k] {
+                k += 1;
+            }
+            if k == NEEDLE.len() {
+                hits += 1;
+            }
+        }
+        i += 1;
+    }
+    assert!(
+        hits == 0,
+        "FATVERB source law: shell.rs must not bind the default FAT handle. A file verb reads and \
+         writes the PROGRAM SOURCE, through mount_read_volume / mount_write_volume — see the FATVERB \
+         section. If you are only naming the function in prose, spell it without parentheses."
+    );
+};
+
 /// JD6 `touch`: ensure a 0-length file exists at `path` in ANY directory the shell can reach
 /// (create if absent; idempotent no-op if present). Rides the dir-aware `locate_in_dir` /
 /// `create_in_dir` twins — the parent may be the root or any subdirectory.
 fn fs_touch(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("touch: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "touch") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("touch: {}", msg)),
@@ -270,10 +531,7 @@ fn fs_touch(console: &mut Console, arg: &str) {
 /// in-place shrink primitive, and the directory-field publisher is private). A directory target is
 /// refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
 fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("write: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "write") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("write: {}", msg)),
@@ -321,10 +579,7 @@ fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
 /// (allocate + zero-fill + chain new clusters, directory `size` published LAST). A directory target
 /// is refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
 fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("append: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "append") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("append: {}", msg)),
@@ -365,10 +620,7 @@ fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
 /// missing-target error quietly (POSIX `rm -f`); a wrong-usage `-EISDIR` is still shown under `-f`.
 /// Rides the dir-aware locate_in_dir twin.
 fn fs_rm(console: &mut Console, arg: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rm") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         // JD14: `-f` is lenient about a missing target (POSIX `rm -f NOSUCH` is quiet). A missing
@@ -406,10 +658,7 @@ fn fs_rm(console: &mut Console, arg: &str, force: bool) {
 /// parent is a plain file → `-ENOTDIR` (both from `resolve_write_target`); volume or parent-dir full
 /// → `-ENOSPC`; a non-8.3 name → `-EINVAL`. The root itself as a target → `-EISDIR` (it always exists).
 fn fs_mkdir(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("mkdir: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "mkdir") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("mkdir: {}", msg)),
@@ -444,10 +693,7 @@ fn fs_mkdir(console: &mut Console, arg: &str) {
 /// it and gets an honest `-ENOENT`, exactly the JD4 stale-cwd worst case (the cwd is a re-resolved path
 /// string, not a cached chain head). No corruption — `delete_located` is crash-safe.
 fn fs_rmdir(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rmdir: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rmdir") else { return };
     // Refuse the root explicitly, with the honest errno. `resolve_write_target` would report the "/"
     // path as `-EISDIR`, but the volume root is never a removable directory (it is unnameable and
     // cluster 0 is not freeable). This also covers `rmdir .` at the root and `rmdir ..` that pops to it.
@@ -503,10 +749,7 @@ fn fs_rmdir(console: &mut Console, arg: &str) {
 /// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel
 /// core); a future single-pass primitive could tighten that, tracked as a JD9 note.
 fn fs_cp(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "cp") else { return };
     // --- Resolve the SOURCE to a concrete file (a directory source is out of scope). ---
     let src_norm = normalize_path(&cwd_path(), src);
     let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
@@ -717,10 +960,7 @@ fn cp_tree(
 /// failing path + errno; nothing is rolled back (a partial tree is left on disk, crash-safe per the
 /// FATDIRS/JD6 ordering — the operator can `rmdir`/`rm` it).
 fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "cp") else { return };
     // --- Resolve the SOURCE. Root is refused; a file degrades to the plain file copy. ---
     let src_norm = normalize_path(&cwd_path(), src);
     let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
@@ -914,10 +1154,7 @@ fn force_remove_existing(
 /// `remove_dir` primitives JD6/JD7/JD9 already exercise and ledger, so it inherits their locking
 /// analysis unchanged (no new fat.rs surface, no new lock, no new namespace interaction).
 fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rm") else { return };
     // Refuse the root explicitly, with the honest errno, BEFORE any walk. `normalize_path` folds
     // `rm -r .` at the root and `rm -r ..` that pops to it into "/". The root refusal stands even
     // under `-f` — `rm -rf /` is a footgun the panel never honours (cluster 0 is unremovable).
@@ -991,10 +1228,7 @@ fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
 /// `move_entry` publishes the destination BEFORE `0xE5`ing the source, so a power-cut mid-move leaves
 /// a benign duplicate (two names, one chain), never a lost chain.
 fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("mv: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "mv") else { return };
     // --- Resolve the SOURCE to a concrete entry (file or dir). The volume root has no leaf name to
     //     move AS, so it is refused. ---
     let src_norm = normalize_path(&cwd_path(), src);
@@ -1131,10 +1365,7 @@ fn cat_render(console: &mut Console, fs: &FatFs, de: &DirEntry, canon: &str) {
 /// bounds the read and the heap. A directory or the root is `-EISDIR`. Every access rides the JD3
 /// wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel core.
 fn fs_head(console: &mut Console, arg: &str, n: u32) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("head: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "head") else { return };
     let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
         Ok(Resolved::Root) => return console.println("head: /: is a directory (-EISDIR)"),
         Ok(Resolved::Entry(de, canon)) => {
@@ -1198,10 +1429,7 @@ fn fs_head(console: &mut Console, arg: &str, n: u32) {
 /// note records the bound. A directory or the root is `-EISDIR`; an empty file prints nothing. Every
 /// access rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang.
 fn fs_tail(console: &mut Console, arg: &str, n: u32) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("tail: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "tail") else { return };
     let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
         Ok(Resolved::Root) => return console.println("tail: /: is a directory (-EISDIR)"),
         Ok(Resolved::Entry(de, canon)) => {
@@ -1331,7 +1559,9 @@ fn print_dir_listing(console: &mut Console, entries: &[DirEntry], long: bool) {
 // ---------------------------------------------------------------------------------------------
 // PI-SHELL-LS — `ls` on the Pi shell lists the NATIVE unafs volume (the SD-card partition), not FAT.
 //
-// The shared `ls`/`dir` arm rides `fat::mount()` — the x86 USB-storage backend. The Pi has no FAT
+// The shared `ls`/`dir` arm rides the FAT program source (FATVERB: `mount_read_volume`; before that
+// the default-handle `fat::mount`) — the x86 USB-storage backend, or the internal SD card when that is what booted us.
+// The Pi has no FAT
 // volume mounted (its native store is unafs; FAT on the SD card is only the firmware boot partition),
 // so on the board `ls` printed "ls: no FAT filesystem (...)". The unafs volume DOES work — it is the
 // very volume PI-NET-15 serves at `/fs/` (what Safari sees, K3HELLO.TXT et al.) via the same
@@ -1746,9 +1976,8 @@ fn ls_resolved(console: &mut Console, fs: &FatFs, path: &str, long: bool) {
 /// can share the exact resolve/print behaviour for a non-trailing-glob fall-through.
 #[cfg(not(target_arch = "aarch64"))]
 fn ls_path(console: &mut Console, arg: &str, long: bool) {
-    match crate::fs::fat::mount() {
-        Ok(fs) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg), long),
-        Err(e) => console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
+    if let Some(fs) = mount_read_volume(console, "ls") {
+        ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg), long);
     }
 }
 
@@ -1757,10 +1986,7 @@ fn ls_path(console: &mut Console, arg: &str, long: bool) {
 /// how a shell hands matched names to `ls`); no match is an honest "no match".
 #[cfg(not(target_arch = "aarch64"))]
 fn ls_globbed(console: &mut Console, arg: &str, long: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "ls") else { return };
     match glob_expand(&fs, arg) {
         Glob::Literal(p) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), &p), long),
         Glob::Matched { entries, .. } if entries.is_empty() =>
@@ -1774,10 +2000,7 @@ fn ls_globbed(console: &mut Console, arg: &str, long: bool) {
 /// directory match is skipped with the classic `-EISDIR` note; no match is an honest "no match". A
 /// glob confined to a non-trailing component falls through to a literal resolve (honest error).
 fn cat_globbed(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "cat") else { return };
     match glob_expand(&fs, arg) {
         Glob::Literal(p) => match resolve_path(&fs, &normalize_path(&cwd_path(), &p)) {
             Ok(Resolved::Root) => console.println("cat: /: is a directory (-EISDIR)"),
@@ -1837,10 +2060,7 @@ fn expand_sources(console: &mut Console, fs: &FatFs, verb: &str, sources: &[&str
 /// a file degrades to a plain delete). SNAPSHOT-safety holds through the recursion too: each concrete
 /// match is re-resolved by its canonical path, and a completed `rm -r` never touches a sibling's slot.
 fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rm") else { return };
     for a in args {
         match glob_expand(&fs, a) {
             Glob::Literal(p) =>
@@ -1863,10 +2083,7 @@ fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool, force: bool
 /// can only land INTO a directory). Each source rides the existing `fs_cp` / `fs_cp_recursive` (the
 /// `FILE DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-copy.
 fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: bool, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "cp") else { return };
     let srcs = expand_sources(console, &fs, "cp", sources);
     if srcs.is_empty() {
         return; // every pattern was empty (each already reported "no match")
@@ -1888,10 +2105,7 @@ fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: boo
 /// (the `SRC DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-move — a wildcard move never
 /// invalidates its own list.
 fn mv_globbed(console: &mut Console, sources: &[&str], dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("mv: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "mv") else { return };
     let srcs = expand_sources(console, &fs, "mv", sources);
     if srcs.is_empty() {
         return;
@@ -2002,10 +2216,7 @@ fn find_walk(
 /// a FILE root degrades to a single self-match test (the POSIX shape — `find` a file tests that file);
 /// a mid-walk I/O error reports the path + errno with the partial hits/count already shown.
 fn fs_find(console: &mut Console, root_arg: &str, pat: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("find: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "find") else { return };
     let norm = normalize_path(&cwd_path(), root_arg);
     let mut stats = FindStats { matches: 0, dirs: 0 };
     match resolve_path(&fs, &norm) {
@@ -2084,10 +2295,7 @@ fn du_subtree(
 /// file bytes are real. A missing path is `-ENOENT`; a mid-walk read error reports the path + errno
 /// with the partial per-child lines and a total of what was tallied (honest partial).
 fn fs_du(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("du: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "du") else { return };
     let norm = normalize_path(&cwd_path(), arg);
     let (cluster, canon) = match resolve_path(&fs, &norm) {
         Ok(Resolved::Root) => (0u32, String::new()),
@@ -2179,10 +2387,7 @@ fn decode_attr(a: u8) -> String {
 /// reports the root honestly — it is a directory with NO directory entry of its own. Missing path is
 /// `-ENOENT`. Read-only; no glob (a metacharacter resolves literally → `-ENOENT`).
 fn fs_stat(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("stat: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "stat") else { return };
     // The volume root has no directory entry of its own — report it honestly, no slot.
     if normalize_path(&cwd_path(), arg) == "/" {
         console.println("  path:  /");
@@ -2256,10 +2461,7 @@ fn xd_rows(console: &mut Console, base: usize, data: &[u8]) {
 /// note is printed. off/len are parsed decimal or `0x`-hex by the caller.
 fn fs_xd(console: &mut Console, arg: &str, off: u32, len: usize) {
     const XD_MAX: usize = 4096;
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("xd: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "xd") else { return };
     let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
         Ok(Resolved::Root) => return console.println("xd: /: is a directory (-EISDIR)"),
         Ok(Resolved::Entry(de, canon)) => (de, canon),
@@ -2368,13 +2570,20 @@ impl midden_core::Volume for FatVolume {
     /// command" about a file the same boot had just printed.
     ///
     /// A probe and a load that disagree about WHICH volume is the volume can only ever produce
-    /// that shape, so they are now the same question asked of the same handle. `midden.execvol`
-    /// below pins them together.
+    /// that shape, so they are now the same question asked of the same handle.
+    ///
+    /// FATVERB: it also STAMPS what it bound into [`EXEC_BIND`]. `fatverb_storage_witness` compares
+    /// that stamp against the one the read verbs leave, which is the only version of "the probe and
+    /// `ls` agree" that a reverted read verb can fail.
     #[cfg(target_arch = "x86_64")]
     fn is_file(&mut self, name: &str) -> bool {
         let fs = match crate::fs::fat::mount_program_source() {
-            Ok(fs) => fs,
+            Ok(fs) => {
+                stamp(&EXEC_BIND, &EXEC_BIND_SEQ, bind::of(&fs));
+                fs
+            }
             Err(e) => {
+                stamp(&EXEC_BIND, &EXEC_BIND_SEQ, bind::DECLINED);
                 // Loud, and able to fail: a resolver that answers "no such program" because it
                 // could not mount anything is indistinguishable, from the panel, from a typo. This
                 // line is the difference, and it names the handles that WERE available so the
@@ -2484,41 +2693,182 @@ pub fn midden_witness() {
     let ok = matches!(&p, midden_core::Plan::Host { verb, .. } if verb == "stat");
     verdict("midden.precedence", ok, &alloc::format!("{:?}", p));
 
-    // 5. execvol (x86) — THE PROBE AND THE LOAD MUST NAME THE SAME VOLUME.
-    //
-    // The four legs above run over a synthetic `NameList`, which is exactly why none of them could
-    // catch Boot AR: they prove the resolver's LOGIC and say nothing about which handle the real
-    // `FatVolume` binds. This leg asks the same question twice through two independent producers —
-    // the probe `midden_core::resolve_exec` makes (`FatVolume::is_file`) and the mount the loader
-    // performs (`read_el0_image`'s `mount_program_source`) — and asserts they AGREE. Disagreement
-    // is the Boot AR bug in one line: the card is mounted, `SDHCBLK` lists the program, the loader
-    // could read it, and the resolver says no such name.
-    //
-    // Agreement, not presence: a volume with no `VUG.ELF` staged must PASS (both false), because
-    // this fixture is pinning the wiring and not the contents of whatever card is in the slot. It
-    // is therefore quiet in QEMU, where both handles usually answer alike, and load-bearing on
-    // metal, where they did not.
-    #[cfg(target_arch = "x86_64")]
-    {
-        const PROBE: &str = "VUG.ELF";
-        let mut v = FatVolume;
-        let by_resolver = midden_core::Volume::is_file(&mut v, PROBE);
-        let by_loader = match crate::fs::fat::mount_program_source() {
-            Ok(fs) => matches!(
-                resolve_path(&fs, &normalize_path(&cwd_path(), PROBE)),
-                Ok(Resolved::Entry(de, _)) if !de.is_dir
-            ),
-            Err(_) => false,
-        };
-        verdict(
-            "midden.execvol",
-            by_resolver == by_loader,
-            &alloc::format!(
-                "resolver={} loader={} handles={}",
-                by_resolver, by_loader, crate::drivers::block::source_census()
-            ),
-        );
+    // The STORAGE legs used to sit here, and that was the defect the adoption review convicted.
+    // `midden_witness` runs at main.rs step 5, BEFORE `pci::init` and before the USB storage
+    // publish, so every storage leg read `handles=global=absent sdhc=absent` and passed on all-false
+    // inputs — vacuous on QEMU and on metal, forever. They now live in `fatverb_storage_witness`
+    // below, called from the storage-ready service pass beside `fat::probe_once`.
+}
+
+// ===================== FATVERB — the storage witness, after storage exists =========================
+
+/// FATVERB: one-shot latch. The service loop calls the witness every pass; it must speak once.
+#[cfg(target_arch = "x86_64")]
+static FATVERB_WITNESS_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// FATVERB: when the wait for a program source began (`arch::ticks()` ms, 0 = not yet waiting).
+#[cfg(target_arch = "x86_64")]
+static WITNESS_WAIT_SINCE_MS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// FATVERB: how long to wait for a block device before witnessing an empty census anyway. Same
+/// value and same reasoning as `video::wcx::STORAGE_WAIT_MS` — generous against the deferred SCSI
+/// bring-up on this bench, and the number matters far less than the wait terminating in a line.
+#[cfg(target_arch = "x86_64")]
+const STORAGE_WAIT_MS: u64 = 30_000;
+
+/// FATVERB: THE VERBS AND THE PROBE MUST BIND THE SAME HANDLE, AND A WRITE VERB MUST CONSULT THE GATE.
+///
+/// **Where this runs, and why that is the whole point.** The first cut put these legs in
+/// `midden_witness`, which fires at main.rs step 5 — before `pci::init`, before the xHCI storage
+/// publish, before `sdhc::bring_up`. The review's capture settled it: all three legs passed with
+/// `handles=global=absent sdhc=absent`, i.e. with every input false. A fixture whose inputs cannot
+/// be non-trivial is not quiet, it is dead. This one is called from the storage-ready service pass,
+/// immediately after `fat::probe_once()` / `sdhc_probe_once()` have run, so by the time it speaks
+/// the census names real handles and the questions have content.
+///
+/// **What makes each leg falsifiable.** Not comparing an expression with itself — the other half of
+/// the review. Each leg DRIVES A REAL VERB and reads the stamp that verb left behind:
+///
+/// * `fatverb.readvol` runs `ls_path`, the function the `ls`/`dir` dispatch arm calls, and then
+///   requires (a) that the read-verb binding counter ADVANCED across that call, and (b) that the
+///   handle it stamped equals the handle the exec probe stamped. Revert `ls_path` to the old
+///   default-handle `fat::mount` and (a) fails, because a reverted verb never reaches the recorder. Point the
+///   read helper at a different handle and (b) fails. Neither half can be satisfied by evaluating
+///   one expression twice, which is precisely what the first cut did.
+///
+/// * `fatverb.writegate` runs `fs_rm` against a name that cannot exist, and requires that the write
+///   gate's counter advanced and that its recorded answer matches the mounted source's veto. The
+///   probe name is deliberately unresolvable, so on a WRITABLE volume the verb gates through and
+///   then stops at `NotFound` — the fixture drives the real refusal path without ever creating,
+///   truncating or unlinking anything. On a READ-ONLY source the gate fires and the verb never
+///   reaches the directory at all, which is the property the arc exists to guarantee.
+///
+/// The verbs print to a THROWAWAY `Console` (heap-only, no panel, dropped on return), so the
+/// fixture's own output never lands on the operator's screen; the verbs' serial mirrors still reach
+/// the capture, which is where a bench reader wants them.
+///
+/// **Quiet, not vacuous, in QEMU.** Where the handles agree the stamps agree and the legs pass —
+/// but they pass on inputs that were free to differ, and the counters prove the verbs ran.
+#[cfg(target_arch = "x86_64")]
+pub fn fatverb_storage_witness() {
+    use core::sync::atomic::Ordering;
+    if FATVERB_WITNESS_DONE.load(Ordering::Acquire) {
+        return;
     }
+    // BOUNDED WAIT FOR A PROGRAM SOURCE — the second half of "not vacuous", and it is not optional.
+    //
+    // Being called from the storage-ready pass is necessary but not sufficient: the pass begins
+    // running long before the deferred SCSI bring-up behind `service_storage` finishes, so a witness
+    // that latched on its FIRST call would fire with an empty census on exactly the configurations
+    // where storage is slow — which is the `midden_witness` failure again, one screen further down
+    // the boot. Measured on this host: the plain `./arroyo test` shape had `sdhc=present` on the
+    // first pass, and the `test-fat sf` shape had nothing at all, so the two differ and neither can
+    // be assumed.
+    //
+    // The shape is `wcx::desktop_app_service`'s, deliberately — including its law that the wait
+    // TERMINATES IN A LINE rather than in silence. A boot that genuinely never gets a block device
+    // must still emit these legs (a read verb with no volume is Boot AR's own symptom, and a spec
+    // REQUIRE must not go red because the machine had no card in it), so the deadline expires into
+    // the witness rather than out of it, and the census on the line says which it was.
+    if crate::drivers::block::program_source().is_none() {
+        let now = crate::arch::ticks();
+        let started = WITNESS_WAIT_SINCE_MS.load(Ordering::Relaxed);
+        if started == 0 {
+            WITNESS_WAIT_SINCE_MS.store(now.max(1), Ordering::Relaxed);
+            return;
+        }
+        if now.saturating_sub(started) < STORAGE_WAIT_MS {
+            return;
+        }
+        // Fall through: speak on an empty census, and say so below.
+    }
+    if FATVERB_WITNESS_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let waited = match WITNESS_WAIT_SINCE_MS.load(Ordering::Relaxed) {
+        0 => 0,
+        t => crate::arch::ticks().saturating_sub(t),
+    };
+
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+
+    // A name that resolves on no volume anyone will ever stage: the write leg must be able to run
+    // on a WRITABLE boot volume without mutating it, so the gate is what it exercises, not the
+    // directory. `$` is legal in a FAT 8.3 name, so this reaches the resolver rather than dying in
+    // path validation — the leg must test the gate, not the parser.
+    const NOSUCH: &str = "$FATVERB.$$$";
+    // The read probe: any name will do, because the leg asserts AGREEMENT about the handle, never
+    // presence of the file. `VUG.ELF` is used only so the exec probe's stamp comes from the same
+    // question `bare_exec` asks in anger.
+    const PROBE: &str = "VUG.ELF";
+
+    let census = crate::drivers::block::source_census();
+
+    // --- readvol -------------------------------------------------------------------------------
+    let exec_seq0 = EXEC_BIND_SEQ.load(BindOrd::Relaxed);
+    let mut v = FatVolume;
+    let _ = midden_core::Volume::is_file(&mut v, PROBE);
+    let exec_ran = EXEC_BIND_SEQ.load(BindOrd::Relaxed) > exec_seq0;
+    let exec_bound = EXEC_BIND.load(BindOrd::Relaxed);
+
+    let read_seq0 = READ_BIND_SEQ.load(BindOrd::Relaxed);
+    {
+        // The REAL read verb, exactly as the `ls`/`dir` dispatch arm invokes it.
+        let mut sink = Console::new();
+        ls_path(&mut sink, ".", false);
+    }
+    let read_ran = READ_BIND_SEQ.load(BindOrd::Relaxed) > read_seq0;
+    let read_bound = READ_BIND.load(BindOrd::Relaxed);
+
+    verdict(
+        "fatverb.readvol",
+        exec_ran && read_ran && exec_bound == read_bound,
+        &alloc::format!(
+            "exec_ran={} read_ran={} exec={} read={} handles={}",
+            exec_ran, read_ran, bind::name(exec_bound), bind::name(read_bound), census
+        ),
+    );
+
+    // --- writegate -----------------------------------------------------------------------------
+    // The independent side of the comparison: what the SOURCE says, read straight off the block
+    // layer's own predicate, before the verb runs.
+    let veto = crate::fs::fat::mount_program_source().ok().and_then(|fs| fs.write_veto());
+    let gate_seq0 = WRITE_GATE_SEQ.load(BindOrd::Relaxed);
+    {
+        // The REAL write verb. `force = true` so a hypothetical prompt cannot stall the boot.
+        let mut sink = Console::new();
+        fs_rm(&mut sink, NOSUCH, true);
+    }
+    let gate_ran = WRITE_GATE_SEQ.load(BindOrd::Relaxed) > gate_seq0;
+    let gate = WRITE_GATE.load(BindOrd::Relaxed);
+    let gate_agrees = match veto {
+        Some(_) => gate == bind::REFUSED_RO,
+        None => gate == bind::ADMITTED || gate == bind::DECLINED,
+    };
+    verdict(
+        "fatverb.writegate",
+        gate_ran && gate_agrees,
+        &alloc::format!(
+            "gate_ran={} gate={} veto={} handles={}",
+            gate_ran, bind::name(gate), veto.unwrap_or("none"), census
+        ),
+    );
+
+    // `waited` is the MEASUREMENT, not the threshold: a reader can tell "storage was there on the
+    // first pass" (0 ms) from "the deadline expired and this census is empty because nothing ever
+    // arrived" (>= the threshold), which is the difference between a quiet leg and a dead one.
+    serial_println!(
+        ":: [fatverb] storage witness: exec={} read={} gate={} waited={}ms handles={} ::",
+        bind::name(exec_bound), bind::name(read_bound), bind::name(gate), waited, census
+    );
 }
 
 /// Run one command. Returns `true` if the command took over the whole screen with its own
@@ -2698,9 +3048,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "fatinfo" => {
-            match crate::fs::fat::mount() {
-                Ok(fs) => console.println(&fs.describe()),
-                Err(e) => console.println(&alloc::format!("fatinfo: no FAT filesystem ({:?})", e)),
+            if let Some(fs) = mount_read_volume(console, "fatinfo") {
+                console.println(&fs.describe());
             }
         },
         "ls" | "dir" => {
@@ -2734,8 +3083,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // JD4: change the shell's working directory. No argument (or `/`) returns to the
             // root. The stored cwd is the CANONICAL on-disk spelling of the resolved path.
             let path = normalize_path(&cwd_path(), args.first().copied().unwrap_or("/"));
-            match crate::fs::fat::mount() {
-                Ok(fs) => match resolve_path(&fs, &path) {
+            if let Some(fs) = mount_read_volume(console, "cd") {
+                match resolve_path(&fs, &path) {
                     Ok(Resolved::Root) => {
                         *CWD.lock() = None;
                         console.println("/");
@@ -2750,8 +3099,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         }
                     }
                     Err(msg) => console.println(&alloc::format!("cd: {}", msg)),
-                },
-                Err(e) => console.println(&alloc::format!("cd: no FAT filesystem ({:?})", e)),
+                }
             }
         },
         "pwd" => {
@@ -2762,15 +3110,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match args.first() {
                 None => console.println("usage: cat <path>"),
                 Some(name) if has_glob(name) => cat_globbed(console, name),
-                Some(name) => match crate::fs::fat::mount() {
-                    Ok(fs) => match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
-                        Ok(Resolved::Root) =>
-                            console.println("cat: /: is a directory (-EISDIR)"),
-                        Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
-                        Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
-                    },
-                    Err(e) => console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
-                },
+                Some(name) => {
+                    if let Some(fs) = mount_read_volume(console, "cat") {
+                        match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
+                            Ok(Resolved::Root) =>
+                                console.println("cat: /: is a directory (-EISDIR)"),
+                            Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
+                            Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
+                        }
+                    }
+                }
             }
         },
         "head" => {
@@ -3198,9 +3547,19 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                                 let label = fs.label();
                                 let label = if label.is_empty() { String::from("-") } else { label };
                                 let vol_mib = fs.volume_bytes() / (1024 * 1024);
+                                // FATVERB: the posture is ASKED, not remembered. This line claimed
+                                // "(read-only)" from PIUSB-27, which USB-WRITE F3 retired when it
+                                // routed the `Usb` arm to the verified BOT WRITE(10) path — so
+                                // `diskinfo` had been telling the operator the stick could not be
+                                // written for as long as it could. One predicate now answers for the
+                                // VFS, the shell's write gate and this line.
+                                let posture = match fs.write_veto() {
+                                    None => "read-write",
+                                    Some(_) => "read-only",
+                                };
                                 fs5_say(console, &alloc::format!(
-                                    "USB FAT: {}  label {}  volume {} MiB  mounted /usb (read-only)",
-                                    kind, label, vol_mib));
+                                    "USB FAT: {}  label {}  volume {} MiB  mounted /usb ({})",
+                                    kind, label, vol_mib, posture));
                             }
                             Err(e) => fs5_say(console, &alloc::format!(
                                 "USB FAT: unmounted ({})", crate::fs::fat::fat_reason(e))),
@@ -3900,9 +4259,12 @@ fn parse_num(s: &str) -> Option<u64> {
 /// honest hot-plug posture (doc §6): absent → `/usb` is simply not in the table,
 /// so a `/usb/...` path falls through to the native root and resolves to a clean
 /// `-ENOENT`, never a panic. The USB volume is read through the xHCI `Usb` source
-/// and is **read-only by construction** (PIUSB-27): a `vfs write|append|rm|mkdir`
-/// at `/usb` returns `-ENOTSUP` (the FatBackend refuses writes on a non-Default
-/// source before touching the block layer). Rebuilt per invocation, so a stick
+/// and is **writable** since USB-WRITE F3, which routed the `Usb` arm to the
+/// verified BOT WRITE(10) path and retired PIUSB-27's blanket refusal. Whether a
+/// `vfs write|append|rm|mkdir` at `/usb` is admitted is decided by exactly one
+/// predicate — `fat::BlockSource::write_veto`, which `FatBackend::read_only`
+/// forwards to — so this note cannot drift from the code again the way its
+/// PIUSB-27 predecessor did. Rebuilt per invocation, so a stick
 /// hot-plugged (or ejected) between commands is picked up on the next `vfs`.
 /// EXEC-1: `run <path>` — load an ELF64 (or flat) user program off the VFS namespace and execute it in user mode,
 /// reporting its exit status. Reads the whole file through the same `MountTable` the `vfs` verb uses,
@@ -3939,7 +4301,8 @@ fn parse_num(s: &str) -> Option<u64> {
 /// * **There is no VFS namespace.** `impl VfsBackend for FatBackend` and `NativeBackend` are
 ///   `#[cfg(target_arch = "aarch64")]` (see `fs/vfs.rs`), which is why `vfs_cmd` already refuses on
 ///   x86. So the x86 twin reads through the FAT-direct path the `cat` verb uses
-///   (`fs::fat::mount()` + `resolve_path` + the JD4 cwd), which is the path Peter's `cat hello.txt`
+///   (FATVERB: `mount_read_volume` + `resolve_path` + the JD4 cwd — the same program-source handle
+///   this loader binds), which is the path Peter's `cat hello.txt`
 ///   demonstrably exercises. `/fat/NAME` is accepted as an alias for that volume's root, because it
 ///   is the form the packaging text tells the operator to type and the only FAT volume x86 mounts
 ///   IS the DATA volume.
@@ -4006,9 +4369,11 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
 /// "every check can say NO" discipline, over the only file surface this arch has.
 ///
 /// x86 has no VFS namespace (`fs/vfs.rs` gates both backend impls to aarch64, which is why `vfs_cmd`
-/// refuses here), so this reads through the FAT-direct path `cat` uses: `fs::fat::mount()` — which on
-/// x86 is ALWAYS the USB mass-storage DATA volume, never the UEFI boot volume the kernel cannot
-/// reach — resolved through the JD4 cwd exactly like every other file verb.
+/// refuses here), so this reads through the FAT-direct path `cat` uses: the PROGRAM SOURCE
+/// (FATVERB — `cat` now binds `mount_program_source` through `mount_read_volume`, exactly as this
+/// loader does), which on x86 is the USB mass-storage DATA volume, or the internal SD card on a
+/// machine booted from the reader — never the UEFI boot volume the kernel cannot reach — resolved
+/// through the JD4 cwd exactly like every other file verb.
 ///
 /// **`/fat` is accepted as an alias for that volume's root.** It is the form the packaging text tells
 /// the operator to type (`esp-x86` prints "…or `bg /fat/VUG.ELF` reports -ENOENT"), the form
@@ -4755,7 +5120,8 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
         Some(&o) => o,
         None => {
             console.println("usage: vfs <write|append|rm|mkdir> <path> [text ...]");
-            console.println("  namespace: / = native UnaFS, /fat = FAT boot partition, /usb = USB stick (read-only)");
+            // FATVERB: not "(read-only)" — USB-WRITE F3 made the stick writable; see `diskinfo`.
+            console.println("  namespace: / = native UnaFS, /fat = FAT boot partition, /usb = USB stick");
             return;
         }
     };

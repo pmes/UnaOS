@@ -597,6 +597,100 @@ pub enum BlockSource {
     Sdhc,
 }
 
+impl BlockSource {
+    /// FATVERB: this handle's name, spelled exactly as [`crate::drivers::block::SourceCensus`]
+    /// spells it — so a refusal that prints both reads as one sentence
+    /// ("source=sdhc ... handles=global=absent sdhc=present") instead of in two vocabularies.
+    pub fn name(&self) -> &'static str {
+        match self {
+            BlockSource::Default => "global",
+            BlockSource::Usb => "usb",
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockSource::Sdhc => "sdhc",
+        }
+    }
+
+    /// FATVERB: may an ORDINARY FILE MUTATION (create / write / delete / mkdir) reach a volume
+    /// mounted through this source? `None` = yes. `Some(reason)` = no, and the reason names the
+    /// mechanism that says no.
+    ///
+    /// **On the source, not on the volume, and there is exactly one of these.** It answers a
+    /// question about the HANDLE, not about any particular BPB, so a `FatFs` and a
+    /// [`crate::fs::vfs::FatBackend`] mounted through the same handle cannot disagree about whether
+    /// it is writable — which they could, and did, when `FatBackend::read_only` carried its own copy
+    /// of the `Default` arm. [`FatFs::write_veto`] and `FatBackend::read_only` are both forwards to
+    /// this function now.
+    ///
+    /// Why it exists: LAUNCH-AR pointed the exec legs at [`mount_program_source`], and FATVERB
+    /// pointed the shell's twenty-five file verbs at the same call, because a shell where `ls` and
+    /// `vug` disagree about which volume is the volume is not a shell. On a machine booted from the
+    /// internal SD reader that call binds [`BlockSource::Sdhc`], which is READ-ONLY outside the
+    /// reserved flight-recorder extent. Without a gate, `rm FOO` there would walk a real directory
+    /// mutation down to [`write_sector`], collect [`FatError::Unsupported`] from SDHC-4c's permit,
+    /// and surface as a per-sector I/O error on a volume that was never writable — and a multi-step
+    /// verb (`write`'s delete-then-recreate, `mv`) would get PART-WAY. This is the layer that can
+    /// say no in advance, before a half-finished mutation exists to be rolled back.
+    ///
+    /// **A prediction of the block layer's answer, not a second copy of it.** The `Default` arm
+    /// asks [`crate::drivers::block::default_writable`] — the same predicate `write_block` itself
+    /// enforces — so it cannot drift from it. The `Sdhc` arm is NOT a forward: it states SDHC-4c's
+    /// standing answer for a span OUTSIDE the reserved extent, which is every span a file verb can
+    /// name (the reserved file is staged by the host; the kernel never creates, grows or deletes
+    /// it). The `Usb` arm defers to nothing at all — it is a flat assertion that USB-WRITE F3's BOT
+    /// WRITE(10) path is verified and routed, and if that ever stops being true this arm is where
+    /// the lie will be, not in the block layer.
+    ///
+    /// Conservative in one direction only. A `Some` can cost a write the permit would in principle
+    /// have admitted (a file verb landing inside the reserved extent — unreachable, since reaching
+    /// it means mutating the FAT or a directory entry, which SDHC-4c counts as a finding). A `None`
+    /// cannot admit a write the block layer would refuse: `Default` defers, `Sdhc` never returns
+    /// `None`, and `Usb` has an unconditional write path.
+    pub fn write_veto(&self) -> Option<&'static str> {
+        match self {
+            // USBFALL F1 / FRGUARD: the global slot is refused in exactly one state — the boot
+            // volume positively found on the OTHER handle. `unknown` and `unproven` fail OPEN.
+            BlockSource::Default => {
+                if crate::drivers::block::default_writable() {
+                    None
+                } else {
+                    Some(DEFAULT_VETO)
+                }
+            }
+            // USB-WRITE (F3): the stick's BOT WRITE(10) path is verified and routed.
+            BlockSource::Usb => None,
+            // SDHC-4b/4c: the internal reader admits CMD24 only inside the reserved flight-recorder
+            // extent, which no file verb can name. See [`crate::fs::sdhc4c`].
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockSource::Sdhc => Some(
+                "the internal SD reader is mounted READ-ONLY \u{2014} only the reserved \
+                 flight-recorder extent admits a write (SDHC-4c), and no file verb can name it",
+            ),
+        }
+    }
+}
+
+// FATVERB: the `Default` refusal names the guard that ACTUALLY refuses on this target, because
+// there are two of them and they refuse for different reasons. Naming the wrong one in an operator-
+// facing line sends the reader to the wrong forensics: on the Pi the question is "is the SD backend
+// selected", on the rMBP it is "did the boot volume turn up on the other handle". A single blended
+// string would have been false on both.
+/// FRGUARD (x86 + `sdhcblk`): the boot volume was positively found on the other handle.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const DEFAULT_VETO: &str = "the boot volume was found on another handle, so the block layer \
+                            refuses writes through the global slot (FRGUARD / USBFALL F1)";
+/// USBFALL F1 (aarch64 bare-metal): no SD backend is selected, so `write_block` fails closed
+/// rather than substituting the USB stick.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const DEFAULT_VETO: &str = "the SD backend is not selected, so the block layer fails writes closed \
+                            rather than substituting the USB stick (USBFALL F1)";
+/// Targets with no canonical backend outside the global slot: `default_writable()` is a constant
+/// `true` there, so this arm is unreachable and the string is never printed. Present for totality.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "sdhcblk"),
+    all(target_arch = "aarch64", feature = "baremetal")
+)))]
+const DEFAULT_VETO: &str = "the block layer refuses writes through the global slot";
+
 /// SDHC-4c: the internal SD card's write decision, in ONE place — superseding SDHC-4b's
 /// `refuse_sdhc_write`, which returned `Unsupported` unconditionally from these same two call sites.
 ///
@@ -1923,6 +2017,18 @@ impl FatFs {
         } else {
             String::from(raw)
         }
+    }
+
+    /// FATVERB: the registry handle this volume reads through, spelled exactly as
+    /// [`crate::drivers::block::SourceCensus`] spells it. Forwards to [`BlockSource::name`].
+    pub fn source_name(&self) -> &'static str {
+        self.source.name()
+    }
+
+    /// FATVERB: may an ORDINARY FILE MUTATION reach this volume? Forwards to
+    /// [`BlockSource::write_veto`], which is the single definition — see it for the argument.
+    pub fn write_veto(&self) -> Option<&'static str> {
+        self.source.write_veto()
     }
 
     /// The end-of-chain marker to write into a terminal cluster's FAT entry (`>= 0xFFF8` / `>= 0x0FFFFFF8`

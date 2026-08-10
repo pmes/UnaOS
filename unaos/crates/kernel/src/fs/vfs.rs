@@ -470,14 +470,15 @@ impl FatBackend {
     /// `default_writable()` is a constant `true`. `Usb` is unaffected: it reaches
     /// the stick through its own `write_block_usb` handle, which the F1 guard
     /// deliberately does not gate.
+    ///
+    /// FATVERB: this is now a FORWARD, not a second copy. It used to carry its own `match` over
+    /// the source, and the shell's write gate carried another — two predicates for one question,
+    /// free to drift, on a target where the `Default` arm is the difference between a write that
+    /// lands and a write that fails closed several sectors in. `BlockSource::write_veto` is the
+    /// single definition; the VFS reports its presence as a boolean and the shell prints its text.
     #[cfg(target_arch = "aarch64")]
     fn read_only(&self) -> bool {
-        match self.source {
-            crate::fs::fat::BlockSource::Default => {
-                !crate::drivers::block::default_writable()
-            }
-            crate::fs::fat::BlockSource::Usb => false,
-        }
+        self.source.write_veto().is_some()
     }
 
     /// Resolve a volume-relative path to its FAT directory entry by walking the
