@@ -139,6 +139,11 @@ pub mod wedge2;
 // not knob-gated); costs ~16 KiB of `.bss` and introduces no lock. See the module docs for the
 // deadlock analysis that keeps the panic and WEDGE-2/WEDGE-4 breadcrumb paths unblockable.
 pub mod serial_ring;
+// TERM_RING (MIDDEN_CONVERGENCE §3, M2): the bounded terminal OUTPUT transport between a producer and
+// whatever task owns the console view. Built on `serial_ring::LineRing` — lock-free, alloc-free,
+// drop-newest with a counted refusal — so a producer in an IRQ-masked or print-locked context can emit
+// a console line without blocking and without allocating. Arch-neutral; costs ~15 KiB of `.bss`.
+pub mod termring;
 
 pub fn init() {
     arch::init();

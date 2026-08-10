@@ -14591,6 +14591,14 @@ pub fn u7_launcher(demo_cpu: usize) {
     // IMAGES, closing the "same 8.3 name = same principal" residual (the loader now mints IMAGE_SHA256). Its
     // own uncounted `:: IMG-SIG: … PASS ::` line; read-only, no disk write.
     image_sig_selftest();
+    // TERM_RING (MIDDEN_CONVERGENCE §3, M2): the terminal-output transport's own witness — the ring
+    // refuses exactly the records its drop-NEWEST bound says it must, hands the survivors back in
+    // order and byte-exact, seals an over-long record with the truncation mark, and accounts for
+    // every record under the tap conservation law. In-RAM (no disk, no card, no panel) and it holds
+    // the ring against foreign producers for its duration, so it can perturb nothing here; its own
+    // uncounted `:: TERMRING: … :: PASS ::` line.
+    #[cfg(feature = "witness")]
+    crate::termring::termring_selftest();
     // FATDIRS: exercise the new fat.rs directory create/remove seam (create_dir/remove_dir) on the live
     // volume — LAST in the chain (its disk I/O can never perturb the 23 fixtures or the witnesses), fully
     // self-cleaning. Its own uncounted `:: FATDIRS: … PASS ::` line. Unblocks JD7's Orin-panel mkdir/rmdir.

@@ -1129,3 +1129,29 @@ FORBID :: KNURL: .* :: FAIL ::
 # ---       them. A shared-primitive edit that somehow updated both pinned constants in step would
 # ---       still have to keep this line honest.
 REQUIRE :: KNURL: .* paper=0x0df2b838251069dc ceramic=0x2c525bfdb49df67d unchanged
+
+# --- TERM_RING — the terminal-output transport (MIDDEN_CONVERGENCE §3, M2) ---------------------
+# ---    Until this arc the framebuffer console WAS the output buffer: `Console::println` pushed a
+# ---    String into the view's history Vec, so nothing but the render task could emit a console
+# ---    line. `termring` is the transport that seam needed — a 64-slot, 240-byte-per-record
+# ---    `serial_ring::LineRing`: lock-free, alloc-free, drop-NEWEST with a counted refusal, safe
+# ---    from an IRQ-masked or print-locked producer. (§3 sketched `arch::sched::Channel`; that has
+# ---    no try_send, sleeps on a Mutex<VecDeque>, and asserts it runs on a scheduled task, so it is
+# ---    unusable from exactly the contexts §3 names. The divergence is recorded in §3 itself.)
+# ---
+# ---    `termring::termring_selftest` proves four properties, each able to fail alone, with the
+# ---    consumer PARKED so the producer genuinely outruns it:
+# ---      1. bound + refusal — 80 records offered, exactly 64 accepted, exactly 16 refused, and
+# ---         the ring reports 64 in flight (a ring that grew, or overwrote instead of refusing,
+# ---         fails here);
+# ---      2. drop-NEWEST, order and bytes — the survivors are sequences 0..64, drained in that
+# ---         order, each byte-identical to a freshly recomputed fixture line (drop-OLDEST would
+# ---         hand back 16..80 and fail the FIRST comparison);
+# ---      3. truncation is SEALED, not silent — an over-long record comes back <= 240 bytes ending
+# ---         in TRUNCATION_MARK, with the tear counted;
+# ---      4. the tap conservation law — submitted == absorbed + dropped + suppressed + in_flight.
+# ---    The verdict line carries every decoded count, so this rule cannot be satisfied by a leg
+# ---    that merely printed: the fixture emits PASS only when all four hold, and it has no SKIP
+# ---    arm (it is in-RAM — no panel, no disk, no card to be absent). A FAIL is caught by the
+# ---    battery's built-in `FAIL ::` FORBID.
+REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
