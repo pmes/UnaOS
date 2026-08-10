@@ -3860,6 +3860,12 @@ It proves the `-> DEFERRED` line, the queue round trip, the drain's re-damage, a
 erase one pass later. It does **not** prove behaviour under genuine lock contention; that proof rides
 the next metal boot, and `redefers=` is where it will show.
 
+> **Superseded by WC-K2 (2026-08-09).** The fixture is gone. `wm::erase` no longer publishes, so the
+> queue is not the failure route but the only route: every erase in the boot performs the round trip
+> this latch used to stage by hand, and the spec's REQUIRE is narrowed from `reason=.*` to
+> `reason=route`. The paragraph above is kept because its second half still stands — the *requeue*
+> arm remains unproven on QEMU, exactly as stated here.
+
 #### WC-L gate results (2026-07-26, QEMU raspi4b)
 
 `./arroyo kernel8-test 90` — **81/81 required witnesses, 0 forbidden**, 1886 lines scanned:
@@ -9318,3 +9324,132 @@ constants; `ctrl_glyph`, `control_disc`, `controls`, `control_hit`, `in_circle` 
 drag/click/hit-test and close/teardown path are **unedited** — the discs' geometry and routing are
 byte-identical, only the fill of a disc pixel changed. The fixture surface geometry moved to named
 constants (call sites only, no function body). The dock module's one line is above.
+
+## WC-K2 — `wm::erase` stops writing to the glass (2026-08-09)
+
+**The report.** Boot AS, attended: *"still some flickering from title bar"* during a window drag.
+DRAGFLICK had landed and had held — every gesture on the wire printed `[drag] … flash_px=0 -> ONCE`
+with an erase extent around 1% of the outer box — so the residual was not the defect DRAGFLICK
+convicted.
+
+### The mechanism, and why extent arithmetic could not reach it
+
+DRAGFLICK's own ledger predicted this. `wm::erase` published straight to the **front buffer**:
+`stage_fill` composed a row and `flush_rect` put `DESKTOP_BG` on the panel inside the call, while the
+window's pixels did not reach their new origin until the following `composite()` had finished —
+`[comp2]` measures that pass at 2279..2839 µs on the bench panel. So one motion report was **two
+panel events about 2.3 ms apart**, and a scan-out landing between them shows the window's trailing
+edge as bare desktop with the leading edge not yet advanced.
+
+Against a 16.7 ms frame that is roughly a one-in-seven chance per report, and a pointer reports
+faster than a hundred times a second. Cutting the extent further cannot help: the sliver is already
+~1% of the box, and what the eye is catching is the **gap between the two publishes**, not their
+size. On a diagonal step the old box's border and title-strip columns also lie *inside* the new box,
+where the erase deliberately does not go — they hold one-step-stale chrome for the same gap.
+
+### The fix
+
+`erase` no longer writes a pixel. It clips its boxes to the panel and queues them on WC-L's
+deferred-erase queue with a new reason, `route`; `drain_deferred` — which already runs at the head of
+every composite pass, stages through `stage_fill`, re-damages the windows the paint reaches and arms
+`request_full_present` — publishes them. The desktop fill and the window repaint therefore land
+inside **one** composite pass, the drain at its head and the blits a few tens of microseconds later.
+
+The gap does not become zero and this section does not claim it does. What it stops being is a whole
+compositor pass wide, and `erase` stops being a panel writer at all.
+
+**Uniform across every erase site**, deliberately: the move path, `close`, `close_owner`, the zoom
+restore, the park, and WC-J's `reclaim` (the create/close re-tile). Two disciplines for "how a
+vacated box reaches the panel" would be one more than the module can defend, and the structural leg
+below is only worth having if there is exactly one publisher. The cost is uniform and small: every
+one of those sites already ends in a `composite()` **in the same call** (the compat `create_inner`
+arm composites from `compat_present`), so FOCUS-VIS's and WC-J's "desktop colour NOW" argument
+becomes "desktop colour at the end of this call, published with the windows" — not "one operator
+event later", which is the delay those arcs were written against.
+
+### The F4 drain barrier — re-derived, and KEPT
+
+The tempting reading is that the barrier at `move_to_inner` (and its twins at `close`,
+`close_owner`, the park and the zoom restore) loses its subject: `erase` writes nothing, so there is
+no panel write left between the barrier and `drop(barrier)` for a stale blit to overtake. That
+reading is wrong, and dropping the barrier on it would reintroduce the ghost one link further down —
+the paint did not disappear, it **moved** into the `composite()` at the end of the same block.
+
+The property the barrier must buy is unchanged in substance and one step longer in the chain: *no
+blit taken against this row's old geometry may land after the vacated box is repainted.* It holds in
+two parts:
+
+1. **Nothing stale is in flight when the barrier comes down** — `DrainBarrier::drain`'s own
+   guarantee, unchanged: it spins until `BLIT_ACTIVE` is zero.
+2. **Nothing stale can be created after it comes down** — the table mutation is already committed and
+   its guard released, so every snapshot taken from that point reads the *new* geometry. A composite
+   starting in the gap between `drop(barrier)` and our own drain blits the window where it now is,
+   which is what we want painted.
+
+The barrier stays, with the argument restated rather than inherited. For the teardown paths it also
+still carries its original, separate duty (a surface about to be unmapped must not be under an
+in-flight blit), which WC-K2 does not touch.
+
+### The CURSOR-14 bracket-closers are gone
+
+`erase` used to open a CURSOR-1 bracket (`cursor::undraw()` — it was a raw desktop fill under the
+sprite) and CURSOR-14 had each caller close it with `cursor::repaint()` before its composite. After
+WC-K2 neither has a subject. Leaving the `repaint()` in place would be an **unbracketed** whole-sprite
+restore→save→draw over whatever window the pointer rests on, once per motion report at pointer rate —
+precisely the cost FLICKER-2 removed from `drain_deferred` and FLICKER-3 removed from
+`Screen::flush`, and this would have been the largest instance of it in the system. Both are removed.
+The sprite is handled where the paint now happens: `drain_deferred`'s handback, which is *masked* to
+the queued boxes and taken only when one of them meets the sprite, and `composite`'s own tail.
+
+### WC-L's deferral fixture is retired
+
+WC-L forced exactly one deferral per boot from a one-shot latch in `stage_fill`, because QEMU has no
+lock contention of its own and the queue round trip had no witness outside a hardware boot. After
+WC-K2 the queue is not the failure route, it is the **only** route: every erase in the boot performs
+that round trip, on both arches, in every build. The latch would have been forcing by hand the one
+property the mechanism can no longer avoid demonstrating, so it is gone and the spec's REQUIRE is
+narrowed from `reason=.*` to `reason=route`.
+
+What the fixture never proved, and still does not, is the **requeue** arm — a drain that tries and
+fails. WC-L said so at the time; `redefers=` on a metal boot remains its only witness.
+
+### The structural leg — `-> UNPUBLISHED`
+
+`wm::stage_fill` now has exactly one caller, and it is told so (`from_drain`). The check sits at the
+last statement before the first byte reaches the front buffer, so it fires on a fill that *reaches
+glass* from outside a composite publish rather than merely on an unexpected call that then declines.
+It prints its own one-shot line, `[wc-k] rollup scope=publish box=WxH outside=N -> UNPUBLISHED`, on
+the `scope=starve` pattern — the `scope=fills` rollup fires at sample 4 and cannot retract — and
+`outside=` is also carried in that rollup, where it outranks every timing term in the precedence: a
+well-shaped, untorn present by the wrong publisher is exactly what the drag seam was made of.
+
+It cannot pass vacuously, and the non-vacuity is the **pairing**, not the FORBID. `-> BUFFERED`
+requires that staged fills happened at all; `reason=route` requires that they arrived through the
+queue. A boot with no fills reds on the first, a boot whose fills bypassed the queue reds on the
+second, and a boot that published one outside a composite reds here.
+
+What it does not cover, stated plainly: a future path that bypasses `stage_fill` entirely and pokes
+the framebuffer itself. That is WC-G's original shape and WCD-TEARDOWN's `PanelWriteGuard` is its
+detector.
+
+### What the witnesses now mean
+
+* `[wc-j] move-once` — `flash_px`/`exact` observe **the extent handed to the compositor**, from the
+  same one array the queue received; `old_desktop`/`new_window` remain panel read-backs taken after
+  `move_to` returns, i.e. after that composite. The two halves still pull opposite ways. The single
+  divergence between queued and painted is `defer_erase`'s coalescing, which only ever *enlarges* the
+  painted region, so `flash_px=0` stays a floor rather than an estimate.
+* `[wc-x] move-vacate` — the vacated box still reaches glass; WC-K2 moves *when*, not *whether*. The
+  one case that changes is an x86 composite declining on `COMP_GATE`: the box then rides the holder's
+  re-run or the next pass, one frame later, which is WC-L's documented cost arriving on a path that
+  previously did not pay it.
+* `[wc-k]` — `reason=route` is the dominant deferral reason on a healthy boot. `lock`/`alloc` still
+  mean what they meant: the *drain* could not stage.
+
+### Metal watch-list
+
+Drag a window diagonally, slowly, across another and along a panel edge. Expect: no desktop-coloured
+flash at the trailing edge, no bright one-step-stale chrome line inside the window box, `[drag] … ->
+ONCE` unchanged, `[wc-k] … reason=route requeued=no -> DEFERRED` at drag rate, `redefers=` low, and
+`outside=0`. A *trail* left behind the window points at the drain (a composite that declined and was
+never re-run), not at the extent.

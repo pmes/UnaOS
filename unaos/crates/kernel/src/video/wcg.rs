@@ -420,6 +420,10 @@ pub const DECL_ALLOC: u32 = 4;
 /// Not a failure: the witness build's deliberate one-shot fallback, so WC-D verifies the direct path
 /// at least once per boot. Counted apart from the real declines and never affects the verdict.
 pub const DECL_FIXTURE: u32 = 5;
+/// WC-K2 — not a failure either, and not a staging attempt at all: the erase path no longer
+/// publishes, so every vacated box is queued for the compositor's drain BY DESIGN. Only
+/// [`erase_defer`] ever carries it; [`stage_window`](super::wm) cannot produce it.
+pub const DECL_ROUTE: u32 = 6;
 
 fn decl_name(kind: u32) -> &'static str {
     match kind {
@@ -428,6 +432,7 @@ fn decl_name(kind: u32) -> &'static str {
         DECL_LOCK => "lock",
         DECL_ALLOC => "alloc",
         DECL_FIXTURE => "fixture",
+        DECL_ROUTE => "route",
         _ => "?",
     }
 }
@@ -1152,6 +1157,19 @@ const E_REDEFER_MAX: u32 = 8;
 /// full. Sound (the drain re-damages every window the enlarged box reaches, exactly as WC-J's
 /// `reclaim` does), but it repaints more panel than strictly owed, so it is counted.
 static E_COALESCE: AtomicU32 = AtomicU32::new(0);
+/// WC-K2 — desktop fills that reached the FRONT BUFFER from outside a composite publish.
+///
+/// After WC-K2 `wm::erase` writes no pixel: it queues, and `wm::drain_deferred` — at the head of a
+/// composite pass — is the only caller of `wm::stage_fill`. This counts the presents taken with
+/// `from_drain == false`, i.e. a desktop fill landing on the glass as its own panel event, ahead of
+/// the window repaint that belongs with it. That two-event shape IS the drag seam WC-K2 removed, so
+/// it is a structural regression rather than a timing one and it outranks every timing term in the
+/// rollup's precedence.
+///
+/// Zero by construction today. The counter exists because "by construction" is a claim about the
+/// caller graph, and a caller graph is exactly the kind of thing a later arc changes without noticing.
+static E_OUTSIDE: AtomicU32 = AtomicU32::new(0);
+
 /// Deferral lines emitted, capped at [`E_DECL_LINES`].
 static E_DECL_LINES_OUT: AtomicU32 = AtomicU32::new(0);
 /// The largest present-phase duration seen across staged fills, in microseconds.
@@ -1238,6 +1256,27 @@ pub fn erase_drop(w: usize, h: usize, reason: u32) {
 /// rollup's `coalesced=` is where a boot that is doing it constantly becomes visible.
 pub fn erase_coalesce() {
     E_COALESCE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// WC-K2 — record a desktop fill that is about to reach the front buffer from outside a composite
+/// publish, and SAY SO on the wire the first time it happens.
+///
+/// The one-shot line is not decoration and it is not a duplicate of the rollup field. The fills
+/// rollup prints ONCE, at sample [`E_SAMPLES`], and cannot retract; a boot whose erase path is
+/// healthy for its first four fills and is then given back a direct publisher by a later arc would
+/// otherwise carry a printed `TEAR-FREE` over exactly the defect. Same reasoning that makes the
+/// deferral lines unbudgeted and gives `-> STARVED` its own line: a FORBID is only worth having if
+/// the boot can still trip it after the rollup has spoken.
+pub fn erase_outside_publish(w: usize, h: usize) {
+    let n = E_OUTSIDE.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 {
+        serial_println!(
+            "[wc-k] rollup scope=publish box={}x{} outside={} -> UNPUBLISHED",
+            w,
+            h,
+            n
+        );
+    }
 }
 
 /// WC-K — report one staged desktop fill: the box, the composed row, how long the compose and the
@@ -1329,7 +1368,16 @@ pub fn erase_note(
         let nc = E_NONCONTIG.load(Ordering::Relaxed);
         let decl = E_DECLINE.load(Ordering::Relaxed);
         let redef = E_REDEFER.load(Ordering::Relaxed);
-        let verdict = if nc > 0 {
+        let outside = E_OUTSIDE.load(Ordering::Relaxed);
+        let verdict = if outside > 0 {
+            // WC-K2 sits ABOVE `SPLIT`, and the ordering is an argument rather than a preference.
+            // Every term below it describes the SHAPE or the TIMING of a present the compositor
+            // owns; this one says a desktop fill was published as its own panel event, outside the
+            // composite that repaints the windows over it. A well-shaped, untorn present of the
+            // wrong publisher is precisely what the drag seam was, and reporting it as `TEAR-FREE`
+            // with a footnote is the mistake WC-K made with `-> DIRECT`.
+            "UNPUBLISHED"
+        } else if nc > 0 {
             "SPLIT"
         } else if torn_n > 0 {
             "AT-RISK"
@@ -1341,12 +1389,13 @@ pub fn erase_note(
             "TEAR-FREE"
         };
         serial_println!(
-            "[wc-k] rollup scope=fills samples={} rows={} torn={} noncontig={} declines={} defers={} redefers={} coalesced={} maxpresent_us={} frame_us={} -> {}",
+            "[wc-k] rollup scope=fills samples={} rows={} torn={} noncontig={} declines={} outside={} defers={} redefers={} coalesced={} maxpresent_us={} frame_us={} -> {}",
             n,
             E_ROWS.load(Ordering::Relaxed),
             torn_n,
             nc,
             decl,
+            outside,
             E_DEFER.load(Ordering::Relaxed),
             E_REDEFER.load(Ordering::Relaxed),
             E_COALESCE.load(Ordering::Relaxed),

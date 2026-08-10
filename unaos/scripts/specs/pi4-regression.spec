@@ -624,6 +624,18 @@ REQUIRE \[wc-j\] retile survivor=.* moved=true painted=true live=true old_deskto
 # ---    (the original leg re-ran `subtract_box` itself and passed with the fix reverted).
 # ---    `recorded=true` pins the record to this leg's own window. Restoring the whole-box erase
 # ---    passes the read-backs and fails `flash_px=0` with the overlap area as the count.
+# ---
+# ---    WC-K2 CHANGED WHAT THE RECORD IS AN OBSERVATION OF, and the leg is left standing rather than
+# ---    quietly re-pointed. `erase` no longer paints: it hands its boxes to the compositor, and the
+# ---    drain publishes them at the head of the `composite()` the move already ran. So `flash_px`
+# ---    and `exact` now observe THE EXTENT HANDED TO THE COMPOSITOR, taken from the same one array
+# ---    the queue received, while `old_desktop`/`new_window` remain PANEL read-backs taken after
+# ---    `move_to` -- i.e. after that composite. The two halves therefore still pull opposite ways
+# ---    (a fix that stops erasing fails the read-backs; a whole-box erase fails `flash_px=0`), and
+# ---    they are no longer simultaneous claims. The single divergence between queued and painted is
+# ---    `defer_erase`'s coalescing, which only ever ENLARGES the painted region, so `flash_px=0`
+# ---    stays a floor rather than an estimate; `coalesced=` in the `[wc-k]` rollup is where a boot
+# ---    doing it constantly would say so.
 REQUIRE \[wc-j\] move-once .* painted=true moved=true old_desktop=true .* new_window=true .* flash_px=0 exact=true -> PASS
 FORBID \[wc-j\] .*-> FAIL
 
@@ -664,7 +676,7 @@ FORBID \[wc-j\] .*-> FAIL
 # ---    the rollup claims only the fills it has seen and the completeness question is the FORBIDs'.
 # ---    Witness-feature only. See docs/dev/OS/08_VIDEO/engine.md §WC-K.
 REQUIRE \[wc-k\] erase box=.* staged=yes .* contig=yes .* torn=.* -> BUFFERED
-REQUIRE \[wc-k\] rollup scope=fills samples=.* noncontig=.* declines=.* -> TEAR-FREE
+REQUIRE \[wc-k\] rollup scope=fills samples=.* noncontig=.* declines=.* outside=0 .* -> TEAR-FREE
 FORBID \[wc-k\] .*staged=no
 FORBID \[wc-k\] .*-> DIRECT
 FORBID \[wc-k\] .*contig=no
@@ -683,11 +695,19 @@ FORBID \[wc-k\] .*-> UNSTAGED
 # ---    no emitter in `wcg` can produce `staged=no` or `-> DIRECT` for `[wc-k]` at all. They stay,
 # ---    because they are where a reintroduced fallback would land.
 # ---
-# ---    `-> DEFERRED` is REQUIRED, not merely permitted: a witness build forces exactly one
-# ---    deferral per boot (the one-shot fixture in `wm::stage_fill`), because QEMU has no
-# ---    contention of its own and a path whose only witness is a hardware boot is a path that
-# ---    regresses between hardware boots -- which is how WC-K shipped a fallback nobody had seen
-# ---    fire. The `BUFFERED` line the drain produces one pass later is covered by the REQUIRE above.
+# ---    `-> DEFERRED` is REQUIRED, not merely permitted. Under WC-L that took a one-shot FIXTURE in
+# ---    `wm::stage_fill`, because QEMU has no lock contention of its own and a path whose only
+# ---    witness is a hardware boot is a path that regresses between hardware boots -- which is how
+# ---    WC-K shipped a fallback nobody had seen fire. WC-K2 RETIRED THAT FIXTURE, and the retirement
+# ---    is a strengthening: the queue is no longer the failure route, it is the ONLY route, so every
+# ---    erase in the boot performs the round trip the fixture used to stage by hand. The REQUIRE is
+# ---    accordingly narrowed to `reason=route`, which is the reason only a real erase site can
+# ---    produce -- a boot that satisfied it with a `lock` deferral would now be reporting contention,
+# ---    not routing. The `BUFFERED` line the drain produces is covered by the REQUIRE above.
+# ---
+# ---    What the fixture never proved, and still does not: the REQUEUE arm, a drain that tries and
+# ---    fails. WC-L said so at the time (its fixture deferred with `requeued=no` and the drain then
+# ---    succeeded); `redefers=` on a metal boot remains its only witness.
 # ---
 # ---    `staged=drop`/`-> LOST` is a fill that could neither stage nor defer (permanent `geom`/`cap`
 # ---    reasons, unreachable on any panel this kernel drives). It feeds `declines=` and so the
@@ -701,9 +721,46 @@ FORBID \[wc-k\] .*-> UNSTAGED
 # ---    `E_REDEFER_MAX` requeues the rollup says STARVED instead. It also gets a one-shot
 # ---    `scope=starve` line of its own, because the sampled rollup fires at fill 4 and starvation
 # ---    by its nature arrives late -- an already-printed rollup cannot retract.
-REQUIRE \[wc-k\] erase box=.* staged=defer reason=.* requeued=no -> DEFERRED
+REQUIRE \[wc-k\] erase box=.* staged=defer reason=route requeued=no -> DEFERRED
 FORBID \[wc-k\] .*-> LOST
 FORBID \[wc-k\] .*-> STARVED
+# --- WC-K2: `wm::erase` STOPS WRITING TO THE GLASS, and the drag seam dies structurally.
+# ---    Boot AS, attended: "still some flickering from title bar" during a window drag. DRAGFLICK
+# ---    had held -- every gesture printed `[drag] ... flash_px=0 -> ONCE` with an erase extent
+# ---    around 1% of the box -- so what was left was not an EXTENT defect but a SEQUENCING one, and
+# ---    DRAGFLICK's own ledger named it in advance. `erase` published `DESKTOP_BG` straight to the
+# ---    front buffer (`stage_fill` + `flush_rect`), and the window's pixels did not reach its new
+# ---    origin until the following `composite()` had finished -- `[comp2]` measures that pass at
+# ---    2279..2839 us. One motion report was therefore TWO panel events ~2.3 ms apart, and a
+# ---    scan-out landing between them shows the trailing edge as bare desktop with the window not
+# ---    yet advanced. Against a 16.7 ms frame that is roughly one report in seven, at pointer rate.
+# ---
+# ---    WC-K2 removes the first event rather than shortening it. Every erase site -- the move path,
+# ---    `close`, `close_owner`, the zoom restore, the park, and WC-J's `reclaim` -- queues its
+# ---    vacated boxes as DEFERRED DAMAGE (`reason=route`), and WC-L's `drain_deferred` publishes
+# ---    them at the head of the composite pass those sites already ran in the same call. The gap
+# ---    does not become zero and this spec does not claim it does; it stops being a whole
+# ---    compositor pass wide, and `erase` stops being a panel writer at all.
+# ---
+# ---    `-> UNPUBLISHED` IS THE LEG, and it is a caller-graph assertion made checkable. After WC-K2
+# ---    `wm::stage_fill` has exactly one caller, `drain_deferred`, which says so (`from_drain`).
+# ---    The check sits at the last statement before the first byte reaches the front buffer, so it
+# ---    fires on a fill that REACHES GLASS from outside a composite publish and not merely on a call
+# ---    from an unexpected place that then declines. It prints its own one-shot line on the
+# ---    `scope=starve` pattern, because the `scope=fills` rollup fires at sample 4 and cannot
+# ---    retract, and it outranks every timing term in that rollup's precedence: a well-shaped,
+# ---    untorn present by the wrong publisher is precisely what the drag seam was made of.
+# ---
+# ---    It CANNOT PASS VACUOUSLY, and that is the pairing rather than the FORBID. `-> BUFFERED`
+# ---    above requires that staged fills happened at all; `reason=route` above requires that they
+# ---    arrived through the queue. A boot with no fills reds on the first, a boot whose fills
+# ---    bypassed the queue reds on the second, and a boot that published one outside a composite
+# ---    reds here. What it does not cover, said plainly: a future path that bypasses `stage_fill`
+# ---    entirely and pokes the framebuffer itself -- that is WC-G's original shape, and WCD-TEARDOWN's
+# ---    `PanelWriteGuard` is its detector.
+# ---    See docs/dev/OS/08_VIDEO/engine.md §WC-K2.
+FORBID \[wc-k\] .*-> UNPUBLISHED
+FORBID \[wc-k\] .*outside=[1-9]
 # --- PULSE-2: the always-running per-core CPU pulse, as an INSTRUMENT PANEL in the standing gap at
 # ---    the bottom of the panel -- below the tiled windows, above the PI-UI-2 status line.
 # ---

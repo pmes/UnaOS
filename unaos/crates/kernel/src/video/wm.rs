@@ -1145,14 +1145,39 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
     if let Some((b, after)) = vacated {
         // F4 — the same phase barrier `close`/`close_owner` raise, and for the same reason. A composite
         // on another core may have snapshotted this row at its OLD geometry a moment ago and still be
-        // blitting it; without the barrier that in-flight blit lands AFTER the erase below and paints
-        // the ghost straight back. The row is live (unlike the teardown paths) so nothing is being
-        // unmapped and the stale frame would self-heal at WC-E's next flush — but "self-heals within a
-        // frame" is exactly the standard the ghost fails, and the barrier is the mechanism this module
-        // already has for "a snapshot of this row is in flight and its pixels are no longer wanted".
+        // blitting it; without the barrier that in-flight blit lands AFTER the vacated box is repainted
+        // and paints the ghost straight back. The row is live (unlike the teardown paths) so nothing is
+        // being unmapped and the stale frame would self-heal at WC-E's next flush — but "self-heals
+        // within a frame" is exactly the standard the ghost fails, and the barrier is the mechanism this
+        // module already has for "a snapshot of this row is in flight and its pixels are no longer
+        // wanted".
         //
         // Raised AFTER the table lock is released, as `drain`'s contract requires: a composite that
         // takes the lock from here on sees the barrier and skips, so `BLIT_ACTIVE` can only fall.
+        //
+        // ### WC-K2 — RE-DERIVED, AND KEPT
+        //
+        // The obvious reading of WC-K2 is that this barrier loses its subject: `erase` no longer
+        // writes a pixel, so there is no longer a panel write between the drain and `drop(barrier)`
+        // for a stale blit to overtake. That reading is wrong, and dropping the barrier on it would
+        // reintroduce the ghost one link further down.
+        //
+        // The paint did not disappear; it MOVED, into the `composite()` at the end of this block. So
+        // the property the barrier has to buy is unchanged in substance and one step longer in the
+        // chain: *no blit taken against this row's OLD geometry may land after the vacated box is
+        // repainted.* It still holds, in two parts.
+        //
+        //  1. **Nothing stale is in flight when the barrier comes down.** That is `drain`'s own
+        //     guarantee, exactly as before — it spins until `BLIT_ACTIVE` is zero.
+        //  2. **Nothing stale can be CREATED after it comes down.** The table mutation above is
+        //     already committed and its guard already released, so every snapshot taken from here on
+        //     reads the NEW geometry. A composite starting in the gap between `drop(barrier)` and our
+        //     own drain therefore blits the window where it now is, which is what we want painted.
+        //
+        // The two together are what the erase-site version proved, and they are what the composite-site
+        // paint needs. The barrier stays, with the argument restated rather than inherited — a phase
+        // barrier whose justification has quietly stopped matching the code is worse than no barrier,
+        // because the next reader will trust it.
         let barrier = DrainBarrier::drain();
         // DRAGFLICK — **ERASE THE VACATED BOX MINUS THE BOX THE WINDOW NOW OCCUPIES.**
         //
@@ -1180,10 +1205,21 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // invariant WC-J asserts and which [`movevacate_selftest`] now asserts both algebraically and
         // on the panel.
         //
-        // WC-H is untouched. Every part still goes through the same [`stage_fill`] + `flush_rect`
-        // staged path with the same deferral rules; what changed is WHICH rectangles are passed, not
-        // how a rectangle reaches the panel. Up to four small staged fills where there was one large
-        // one, each far under `MAX_STAGE_BYTES`, and the tear-free contract is per-fill.
+        // WC-H is untouched. Every part still goes through the same [`stage_fill`] staged path with
+        // the same deferral rules; what changed is WHICH rectangles are passed, not how a rectangle
+        // reaches the panel. Up to four small staged fills where there was one large one, each far
+        // under `MAX_STAGE_BYTES`, and the tear-free contract is per-fill.
+        //
+        // ### WC-K2 — and the second half of the same defect
+        //
+        // The paragraph above says the flicker "is a property of the ERASE EXTENT rather than of the
+        // number of passes". That was true of the defect DRAGFLICK convicted and it is not the whole
+        // story: with the extent cut to ~1% of the box, Boot AS still read "still some flickering from
+        // title bar". What is left IS the number of passes — `erase` published `DESKTOP_BG` to the
+        // glass here and the window arrived at its new origin ~2.3 ms later, so each motion report was
+        // two panel events and the beam could land between them. WC-K2 removes the first event: the
+        // parts below are handed to the compositor as deferred damage, and `drain_deferred` publishes
+        // them at the head of the `composite()` that ends this block. See [`erase`].
         let mut parts = [(0usize, 0usize, 0usize, 0usize); 4];
         let nparts = subtract_box(b, after, &mut parts);
         // Review condition (dragflick adoption): ONE binding for the erase and its witnesses. The
@@ -1191,6 +1227,15 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // unconditional record `[wc-j] move-once` reads back (so the gate observes the erase that
         // HAPPENED, not a re-derivation it performs itself), and `drag_note_move` is the
         // drag-scoped budget. An extent regression here changes `eparts` and both see it.
+        //
+        // WC-K2 — what the note-takers now record is what was HANDED TO THE COMPOSITOR, because that
+        // is what `erase` now does with the slice. The binding is what keeps that honest: the boxes
+        // queued and the boxes recorded are one array, so the record cannot describe an extent the
+        // drain was never given. What the drain then paints can differ from it in exactly one way —
+        // a full queue coalesces a box into a neighbour's bounding box, which only ever ENLARGES the
+        // painted region (`defer_erase`), so `flash_px = 0` on the record remains a sound floor for
+        // the property `[wc-j] move-once` asserts, and `coalesced=` in the `[wc-k]` rollup is where a
+        // boot doing it constantly says so.
         let eparts = &parts[..nparts];
         erase(eparts);
         #[cfg(feature = "witness")]
@@ -1202,22 +1247,28 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // slivers were repainted desktop; narrowing it here would leave a neighbour lying under the
         // overlap unrepainted.
         damage_intersecting(b.0, b.1, b.2, b.3);
-        // MOVE-VACATE (x86 s42 probe, `[wc-x] move-vacate … desktop=5/5 stale=0/5`): the erase
-        // REACHES glass, but a desktop-layer present can later repaint the unoccluded box from
+        // MOVE-VACATE (x86 s42 probe, `[wc-x] move-vacate … desktop=5/5 stale=0/5`): the vacated box
+        // does reach glass, but a desktop-layer present can later repaint the unoccluded box from
         // content that predates it — the ghost is the LATER writer, not the erase. Same cure
         // `reclaim` uses: force the next present to re-derive the whole surface.
+        //
+        // WC-K2 moves WHEN it reaches glass, not WHETHER: the fill is published by the drain at the
+        // head of the `composite()` below instead of by this call, so the probe still reads desktop
+        // after a `move_to` returns. The one case that changes is an x86 composite that DECLINES on
+        // `COMP_GATE` — the box then rides the holder's re-run or the next pass, one frame later,
+        // which is WC-L's documented cost arriving on a path that previously did not pay it.
         super::screen::request_full_present();
         // Re-open before recompositing — a composite under a raised barrier is a no-op.
         drop(barrier);
-        // CURSOR-14 — CLOSE THE ERASE BRACKET BEFORE THE COMPOSITE, per CURSOR-13's single rule:
-        // composite owns the sprite, and a caller-side bracket may not span a composite. `erase`
-        // above took the arrow off the panel (it is a raw desktop fill and genuinely needs to), and
-        // this call used to hand the restore to `composite`'s own tail — which meant the pass ran
-        // with `sprite_plan() == None` and could not compose the arrow through the re-tile it is
-        // about to perform. Putting it back HERE costs one restore/save/draw on a window move, and
-        // the save is taken against a front buffer whose desktop is already final, exactly as
-        // `Screen::flush` takes it. The tail is unaffected: `Untouched` still ends in `ensure_drawn`.
-        super::cursor::repaint();
+        // CURSOR-14's bracket-closer is GONE, and its absence is the point rather than an omission.
+        // It existed because `erase` opened a CURSOR-1 bracket (a raw desktop fill under the sprite),
+        // and it closed it here so the bracket would not span the composite. After WC-K2 `erase`
+        // paints nothing and takes nothing down, so a `cursor::repaint()` here would be an
+        // unbracketed whole-sprite restore→save→draw over whatever window the pointer rests on —
+        // once per motion report, at pointer rate. That is precisely the cost FLICKER-2 removed from
+        // `drain_deferred` and FLICKER-3 removed from `Screen::flush`, and re-paying it on the drag
+        // path would be the largest instance of it in the system. The sprite is handled where the
+        // paint now happens: the drain's masked handback, and `composite`'s own tail. See [`erase`].
         composite();
     }
     placed
@@ -1269,10 +1320,10 @@ pub fn close(id: WinId) -> bool {
     reclaim(&moved[..nv]);
     // Re-open the barrier before recompositing — a composite under a raised barrier is a no-op.
     drop(barrier);
-    // CURSOR-14 — close the erase bracket before the composite. Same rule and same argument as
-    // `move_to`'s; placed after BOTH reclaims, because each of them erases and the sprite must go
-    // back on a panel whose desktop is finished.
-    super::cursor::repaint();
+    // WC-K2 — no CURSOR-14 bracket-closer here any more. `erase` paints nothing and takes the sprite
+    // down for nothing, so there is no bracket left to close; a `cursor::repaint()` on this line
+    // would be an unbracketed whole-sprite cycle. `drain_deferred`'s masked handback and
+    // `composite`'s tail own the sprite through the publish. See [`erase`].
     composite();
     true
 }
@@ -1390,8 +1441,10 @@ pub fn close_owner(owner_asid: u64) -> usize {
     // reference wedge2 run, not the 96 that made `<D1>` unaffordable ungated. And a wedge that eats
     // the panel is worth naming whether or not a TAB happens to be in flight.
     crate::wedge2::mark("<D4>");
-    // CURSOR-14 — close the erase bracket before the composite; see `move_to`.
-    super::cursor::repaint();
+    // WC-K2 — no CURSOR-14 bracket-closer here any more. `erase` paints nothing and takes the sprite
+    // down for nothing, so there is no bracket left to close; a `cursor::repaint()` on this line
+    // would be an unbracketed whole-sprite cycle. `drain_deferred`'s masked handback and
+    // `composite`'s tail own the sprite through the publish. See [`erase`].
     composite();
     n
 }
@@ -1414,71 +1467,67 @@ pub fn close_owner(owner_asid: u64) -> usize {
 /// up instantly, as a visible rectangle where a window used to be.
 pub const DESKTOP_BG: u32 = 0x002D_2B55;
 
-/// Paint the given outer boxes with the desktop background and clean them for the scan-out — the panel
-/// area a closed window vacated. Windows that overlapped it are repainted by the [`composite`] that
-/// follows (closing damages the whole live set through [`place`]).
+/// WC-K2 — HAND the given outer boxes to the compositor as DEFERRED DESKTOP DAMAGE. This function
+/// writes no pixel. The desktop fill is published by [`drain_deferred`], at the head of the
+/// [`composite`] pass every caller runs next — the same pass that repaints the windows over it.
 ///
-/// ### WC-K — why this fill is staged too
+/// ### The drag seam (Peter, Boot AS, attended: "still some flickering from title bar")
 ///
-/// WC-H convicted the *shape* of a write, not the identity of its writer: per-pixel `put_pixel` into
-/// the live front framebuffer, unsynchronised against the beam, is structurally overtaken by the
-/// scan-out and latches part-old/part-new. `fill_rect` is exactly that shape — `w * h`
-/// bounds-checked pokes into memory the HVS is scanning right now — and until this arc `erase` was
-/// the last writer in the window lifecycle still doing it. WC-I's standing note named the debt
-/// ("`erase` is still unstaged and still fills the desktop directly"); WC-J made it heavier by
-/// calling `erase` on three more paths through [`reclaim`], so every close and every re-tile ran a
-/// direct fill over boxes as large as a whole tile.
+/// DRAGFLICK cut the erase EXTENT to the sliver a move genuinely vacates, and the sliver held on the
+/// wire: every attended gesture printed `[drag] … flash_px=0 -> ONCE` with an erase extent around 1%
+/// of the box. What was left is a SEQUENCING defect, not an extent one, and no further extent
+/// arithmetic can reach it.
 ///
-/// [`stage_fill`] gives it the WC-H discipline, and deliberately not a third one: compose in cached
-/// RAM, present as contiguous full-width row copies out of the same [`STAGE`] buffer, under the same
-/// cap, and the same `try_lock`.
+/// `erase` published straight to the GLASS: [`stage_fill`] composed a row and `flush_rect` put
+/// `DESKTOP_BG` on the panel HERE, and the window's pixels did not arrive at their new origin until
+/// the `composite()` below had finished — `[comp2]` measures that pass at 2279..2839 us on the bench
+/// panel. So one motion report was TWO panel events about 2.3 ms apart, and a scan-out landing
+/// between them shows the trailing edge as bare desktop while the window has not yet advanced. On a
+/// 16.7 ms frame that is roughly a one-in-seven chance per report, and a pointer reports faster than
+/// a hundred times a second: the residual flicker along the title strip is that gap being sampled,
+/// several times a second. It is exactly what DRAGFLICK's own ledger predicted would be left.
 ///
-/// ### WC-L — why there is no direct fallback any more
+/// WC-K2 removes the FIRST event. The boxes are queued as deferred damage, so the desktop fill and
+/// the window repaint reach the panel inside ONE composite pass — the drain at its head, the blits
+/// a few tens of microseconds later — instead of being separated by a whole pass. The gap does not
+/// become zero and this ledger will not claim it does; what it stops being is millisecond-wide, and
+/// `erase` stops being a panel writer at all.
 ///
-/// WC-K kept `fill_rect` as the last resort when staging was unavailable, and reported it. The P64
-/// attended boot showed what that costs: on two focus tab-cycle transitions under ~99% core load the
-/// erase path could not take [`STAGE`] and wrote a 514x526 desktop fill DIRECTLY into the buffer the
-/// HVS was scanning — `[wc-k] erase box=514x526 staged=no reason=lock -> DIRECT`, twice. Every other
-/// fill that boot was `BUFFERED`. So the fallback did not make the discipline robust; it made it
-/// conditional on nothing else wanting the lock, and it re-introduced under load exactly the last
-/// direct front-buffer writer WC-K existed to remove.
+/// ### Uniform, and why
 ///
-/// The fallback is therefore GONE. When [`stage_fill`] cannot stage, the box is pushed onto
-/// [`DEFER`] as deferred damage — desktop-colour repaint owed — and [`drain_deferred`], at the head
-/// of the next composite pass, erases it through the staged path and re-damages the windows the
-/// paint reached. This is not a second queue with its own rules: it is WC-J's `reclaim` shape
-/// (erase, `damage_intersecting`, `request_full_present`) applied to a box whose erase arrived one
-/// pass late. A one-frame-late desktop repaint is a cost the panel can absorb; a torn front-buffer
-/// write is not.
+/// Every erase site takes this route: the move path, [`close`], [`close_owner`], the zoom restore,
+/// the park, and WC-J's [`reclaim`] (the create/close re-tile). Two disciplines for "how a vacated
+/// box reaches the panel" would be one more than this module can defend, and the structural claim
+/// below is only worth having if there is exactly ONE publisher. The cost is uniform too, and it is
+/// small: every one of those sites already ends in a `composite()` **in the same call** (the compat
+/// `create_inner` arm composites from `compat_present`), so the FOCUS-VIS/WC-J "desktop colour NOW"
+/// argument becomes "desktop colour at the end of this call, published with the windows" — not "one
+/// operator event later", which is the delay those arcs were actually written against.
 ///
-/// ### Cursor coherence
+/// ### What this buys structurally
 ///
-/// Unchanged, and unchanged on purpose. The `undraw()` below takes the sprite off the panel before
-/// the FIRST byte of any fill lands (staged or direct — staging moves where the composing writes go,
-/// never when the panel writes happen relative to this bracket), and the `composite()` that every
-/// `erase` caller runs next puts it back. The staged fill does NOT take CURSOR-3's overlay: that
-/// path exists for a window whose staged box wholly contains the sprite and whose compositor pass
-/// handed `draw_window` a `cursor::Plan`. `erase` has no plan — it is not a compositor pass, it
-/// holds no claim on the sprite's state machine, and inventing one here would mean a second,
-/// unsynchronised writer of the save-under. So the overlay decision this path takes is the same one
-/// `stage_window` takes when `cur` is `None`: compose no sprite, and leave the repaint to the
-/// following composite. That is CURSOR-3's own fallback, not a new rule.
+/// [`stage_fill`] now has exactly ONE caller, [`drain_deferred`], and it is told so rather than
+/// left to infer it (`from_drain`). A fill that reaches the front buffer from anywhere else is
+/// counted and printed — `[wc-k] rollup scope=publish … -> UNPUBLISHED`, which the spec FORBIDs — so
+/// a reintroduced direct erase reds the gate instead of costing another attended boot. The WC-H/WC-K
+/// tear contract is untouched: same [`STAGE`] buffer, same `try_lock`, same [`MAX_STAGE_BYTES`] cap,
+/// same per-row contiguity check, same `-> BUFFERED` verdict. What changed is WHO calls it and WHEN,
+/// never how a rectangle reaches the panel.
 ///
-/// CURSOR-14 — the RESTORE is no longer the following composite's tail. `move_to`, `close` and
-/// `close_owner` each call `cursor::repaint()` after their last erase and BEFORE their `composite()`,
-/// so the bracket this function opens is closed by its caller rather than spanning a compositor pass.
-/// The undraw below is unchanged and still required: a raw desktop fill with no session is exactly
-/// the class CURSOR-13 kept bracketed.
+/// ### Cursor
+///
+/// The CURSOR-1 undraw is GONE from here, and with it the CURSOR-14 `cursor::repaint()` its callers
+/// took before their composite. Both existed for one reason — this function was about to paint the
+/// panel under the sprite — and after WC-K2 neither has a subject. [`drain_deferred`] owns the
+/// bracket now, and owns it better: FLICKER-2's handback is MASKED to the queued boxes and taken
+/// only when one of them meets the sprite, where the bracket here was whole-sprite, unconditional,
+/// and paid on every move at pointer rate. Removing it is FLICKER-2's and FLICKER-3's own fix
+/// applied to the last site still paying for a bracket it could not use.
 fn erase(boxes: &[(usize, usize, usize, usize)]) {
-    // CURSOR-1: take the sprite off the panel before repainting desktop under it. Without this the
-    // fills below would overwrite the sprite, and the save-under would later restore pre-erase
-    // pixels over freshly-painted desktop — a stale patch the following composite would not repaint
-    // (composite repaints windows, not the desktop). The `composite()` that every erase caller runs
-    // next puts the sprite back.
-    super::cursor::undraw();
     let fb = *super::WRITER.lock();
     // Guard intentionally dropped here: this function never takes the table lock, so it cannot
-    // participate in a WRITER/TABLE cycle.
+    // participate in a WRITER/TABLE cycle. The panel is read for its GEOMETRY only — nothing below
+    // touches a framebuffer byte.
     if !fb.is_ready() {
         return;
     }
@@ -1487,21 +1536,11 @@ fn erase(boxes: &[(usize, usize, usize, usize)]) {
         if w == 0 || h == 0 || x >= info.width || y >= info.height {
             continue;
         }
-        // F6 — clip before iterating, as in `draw_window`.
+        // F6 — clip before queueing, as in `draw_window`. The drain re-clips as well (a coalesced
+        // union is a synthesised box whose panel may have changed underneath it), but a degenerate
+        // or wholly off-panel box must not occupy a queue slot in the first place.
         let (w, h) = (w.min(info.width - x), h.min(info.height - y));
-        // WC-L — staged or nothing. A box that cannot stage becomes deferred damage; it does NOT
-        // reach the panel through this call, so the cache flush below is skipped for it too (there
-        // is nothing of ours in those rows to publish, and flushing them would push whatever the
-        // window left there back out as if it were fresh).
-        if !stage_fill(&fb, x, y, w, h, DESKTOP_BG, false) {
-            continue;
-        }
-        let y0 = y.min(info.height);
-        let y1 = (y + h).min(info.height);
-        if y1 > y0 {
-            // COMPOSITE-2 — the fill's own columns, not full-width scanlines (see `draw_window`).
-            fb.flush_rect(x, y0, w, y1 - y0);
-        }
+        defer_erase(x, y, w, h, DEFER_ROUTE, false);
     }
 }
 
@@ -1838,9 +1877,11 @@ pub fn focus_changed(asid: u64) {
     // composite pass.
     crate::wedge2::mark("<F5>");
     if nhidden > 0 {
-        // Desktop colour under the vacated boxes NOW (visible immediately), console TEXT over it at the
-        // desktop's next present. Splitting it that way is what keeps the response instant without this
-        // path needing a `&mut Screen` it has no right to.
+        // Desktop colour under the vacated boxes, console TEXT over it at the desktop's next present.
+        // Splitting it that way is what keeps the response instant without this path needing a
+        // `&mut Screen` it has no right to. WC-K2 — "immediately" is now the `composite()` at the end
+        // of this function rather than this line; the boxes are queued and that pass publishes them
+        // together with the windows it repaints.
         erase(&hidden[..nhidden]);
     }
     if asid == 0 {
@@ -4437,10 +4478,11 @@ impl Drop for DeskWriteGuard {
 
 /// WCD-TEARDOWN — desktop-colour box fills, the writer class the abort test actually consults.
 ///
-/// **Bracketed at [`stage_fill`], not at [`erase`].** `stage_fill(.., DESKTOP_BG, ..)` has two
-/// callers, `erase` and [`drain_deferred`], and the deferred drain reaches glass without passing
-/// through `erase` at all, so a guard on `erase` missed a whole writer the s73 capture shows firing
-/// in bulk. Guarding the fill is what makes the claim true rather than intended.
+/// **Bracketed at [`stage_fill`], not at [`erase`].** The s73 capture showed the deferred drain
+/// reaching glass without passing through `erase` at all, so a guard on `erase` missed a whole
+/// writer that was firing in bulk. Guarding the fill is what makes the claim true rather than
+/// intended — and WC-K2 has since turned that observation into the rule: `erase` now writes nothing
+/// and [`drain_deferred`] is `stage_fill`'s only caller, so this is the sole bracket there is.
 ///
 /// **And below the decline tests, not above them.** `stage_fill` can decline — `defer!` when `STAGE`
 /// is held or the heap will not grow, `drop_fill!` on a degenerate or over-cap box — and a declined
@@ -8125,7 +8167,10 @@ pub fn minimise(id: WinId) -> &'static str {
     damage_intersecting(vacated.0, vacated.1, vacated.2, vacated.3);
     super::screen::request_full_present();
     drop(barrier);
-    super::cursor::repaint();
+    // WC-K2 — no CURSOR-14 bracket-closer here any more. `erase` paints nothing and takes the sprite
+    // down for nothing, so there is no bracket left to close; a `cursor::repaint()` on this line
+    // would be an unbracketed whole-sprite cycle. `drain_deferred`'s masked handback and
+    // `composite`'s tail own the sprite through the publish. See [`erase`].
     composite();
     if hid { "parked" } else { "parked-visible" }
 }
@@ -8248,7 +8293,10 @@ pub fn zoom(id: WinId) -> &'static str {
         damage_intersecting(b.0, b.1, b.2, b.3);
         super::screen::request_full_present();
         drop(barrier);
-        super::cursor::repaint();
+        // WC-K2 — no CURSOR-14 bracket-closer here any more. `erase` paints nothing and takes the sprite
+        // down for nothing, so there is no bracket left to close; a `cursor::repaint()` on this line
+        // would be an unbracketed whole-sprite cycle. `drain_deferred`'s masked handback and
+        // `composite`'s tail own the sprite through the publish. See [`erase`].
         composite();
     }
     outcome
@@ -8419,7 +8467,17 @@ static MOVE_LAST_NPARTS: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 
 /// DRAGFLICK review condition — record the erase [`move_to_inner`] just performed, for ANY mover.
 /// The slice is the one `erase` received (one shared local at the call site binds them), so what
-/// this records is the extent that reached the glass, not the extent the fix intended.
+/// this records is the extent the erase path actually took, not the extent the fix intended.
+///
+/// WC-K2 — and that extent is now what was **handed to the compositor**, because handing it over is
+/// what `erase` does. Said plainly rather than left for a reader to infer from the call site: this
+/// record no longer means "these pixels were on the glass when this line ran", it means "these
+/// boxes were queued as desktop damage and the `composite()` at the end of this move published
+/// them". Nothing the leg asserts changes standing — `[wc-j] move-once` reads these statics AFTER
+/// its `move_to` has returned, i.e. after that composite, and confirms the sliver on the PANEL as
+/// well — but the two claims are no longer simultaneous and the doc must not pretend they are.
+/// The one divergence between queued and painted is `defer_erase`'s coalescing, which only ever
+/// enlarges the painted region, so `flash_px == 0` here remains a floor rather than an estimate.
 #[cfg(feature = "witness")]
 fn move_note_erase(
     id: WinId,
@@ -8880,12 +8938,20 @@ const DEFER_GEOM: u32 = 1;
 const DEFER_CAP: u32 = 2;
 const DEFER_LOCK: u32 = 3;
 const DEFER_ALLOC: u32 = 4;
+/// WC-K2 — the reason that is NOT a failure. Every other value on this list names something that
+/// went wrong at a staging attempt; `route` names a box that was never offered to [`stage_fill`] at
+/// the erase site at all, because after WC-K2 no erase site publishes. Kept in the same vocabulary
+/// rather than given its own field so that one reader — `[wc-k] erase … reason=` — answers "why is
+/// this box on the queue" for every box on it, and so a boot where `route` STOPS being the dominant
+/// reason is visible as a change in that one column.
+const DEFER_ROUTE: u32 = 6;
 #[cfg(feature = "witness")]
 const _: () = assert!(
     DEFER_GEOM == super::wcg::DECL_GEOM
         && DEFER_CAP == super::wcg::DECL_CAP
         && DEFER_LOCK == super::wcg::DECL_LOCK
         && DEFER_ALLOC == super::wcg::DECL_ALLOC
+        && DEFER_ROUTE == super::wcg::DECL_ROUTE
 );
 
 /// WC-L — panel boxes owed a desktop-colour repaint that could not be staged when they were vacated.
@@ -8909,14 +8975,25 @@ static DEFER: Mutex<([(usize, usize, usize, usize); MAX_DEFER], usize)> =
 /// case must cost one relaxed load and no lock traffic at all.
 static DEFER_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// WC-L — one-shot latch for the deferral fixture in [`stage_fill`]. Witness builds only.
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
-static DEFER_FIXTURE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// WC-K2 — WC-L's one-shot deferral FIXTURE is gone, and its removal is a strengthening rather than
+// a loss of coverage. That latch existed because QEMU has no lock contention of its own, so the
+// queue round trip — defer, drain, stage, present — had no witness outside a hardware boot, and
+// WC-K had already shipped one unwitnessed path. It proved exactly one thing: a box can go on the
+// queue with `requeued=no` and come off it through the staged path. After WC-K2 EVERY erase in the
+// boot does that, on both arches, in every build, so the fixture would have been forcing by hand
+// the one property the mechanism now cannot avoid demonstrating. (What it never proved, and what
+// still rides a metal boot, is the REQUEUE arm — a drain that tries and fails. WC-L said so at the
+// time; `redefers=` in the rollup remains its only witness.)
 
-/// WC-L — queue a clipped panel box for a desktop repaint the staged path could not deliver now.
+/// WC-L — queue a clipped panel box for a desktop repaint the panel has not received yet.
 ///
-/// `requeued` distinguishes a box deferred at its original erase from one the drain retried and
-/// could still not stage; both are honest, but a boot doing the second is telling the operator the
+/// WC-K2 made this the ORDINARY route rather than the fallback one. Every [`erase`] queues here with
+/// [`DEFER_ROUTE`], and the only fills that reach the panel are the ones [`drain_deferred`] takes
+/// off this queue inside a composite pass. WC-L's own entries (`lock`, `alloc`) still arrive, from
+/// the drain's own failed staging attempts, and mean exactly what they meant.
+///
+/// `requeued` distinguishes a box arriving from an erase site from one the drain retried and could
+/// still not stage; both are honest, but a boot doing the second is telling the operator the
 /// staging lock is contended for longer than a composite interval.
 ///
 /// On a full queue the box is UNIONED into an existing entry rather than dropped. The union is sound
@@ -10329,7 +10406,19 @@ fn stage_window(
 
 /// WC-K — the back-layer path for a SOLID fill: compose one row of `color` in cached RAM, then
 /// present the box to the front framebuffer as `h` contiguous row copies. Returns `false` when the
-/// back layer is unavailable, leaving the front untouched so [`erase`] can run the direct fill.
+/// fill did not reach the panel — deferred (`lock`/`alloc`) or dropped (`geom`/`cap`). There has
+/// been no direct fallback behind it since WC-L.
+///
+/// ### WC-K2 — `from_drain`, and why the caller has to say it
+///
+/// After WC-K2 this function has exactly ONE caller: [`drain_deferred`], at the head of a composite
+/// pass. `erase` no longer publishes at all — it queues, and the drain publishes — so every present
+/// this function takes is part of a composite's own publish. `from_drain` carries that fact in
+/// rather than leaving it to be inferred: it feeds the `requeued=` field a deferral reports (a
+/// deferral raised here is by definition the drain failing to deliver a box it already held), and it
+/// is the discriminator for the structural leg below. A `false` here means a desktop fill is
+/// reaching the glass outside a composite publish, which is the two-event shape WC-K2 removed and
+/// the shape the drag seam was made of.
 ///
 /// ### Why one row and not the whole box
 ///
@@ -10357,7 +10446,7 @@ fn stage_fill(
     w: usize,
     h: usize,
     color: u32,
-    requeued: bool,
+    from_drain: bool,
 ) -> bool {
     // WC-L — the four decline reasons split by whether RETRYING can ever succeed, and the split is
     // load-bearing rather than tidy.
@@ -10368,7 +10457,7 @@ fn stage_fill(
     // staged path next composite. There is no direct `fill_rect` behind this function any more.
     macro_rules! defer {
         ($reason:expr) => {{
-            defer_erase(x, y, w, h, $reason, requeued);
+            defer_erase(x, y, w, h, $reason, from_drain);
             return false;
         }};
     }
@@ -10389,28 +10478,6 @@ fn stage_fill(
             super::wcg::erase_drop(w, h, _reason);
             return false;
         }};
-    }
-    // WC-L DEFERRAL FIXTURE (witness builds only) — force exactly one deferral per boot, on the
-    // first erase that is not already a drain retry.
-    //
-    // QEMU never reaches this path on its own, and that is precisely why WC-K shipped with a direct
-    // fallback nobody had seen fire: the condition needs a second core wanting `STAGE` at the moment
-    // a window is torn down, which took a 1920x1200 bench panel at ~99% load to produce, twice, in
-    // one attended boot. A path whose only witness is a hardware boot is a path that regresses
-    // between hardware boots. The latch is the WC-H fallback fixture's shape, for the same reason and
-    // with the same one-shot discipline: `swap(true)` so it can fire at most once, and gated on
-    // `!requeued` so the drain's retry is guaranteed to take the real staged path and the queued box
-    // is provably delivered rather than cycling.
-    //
-    // What it proves in `kernel8-test`: the `-> DEFERRED` line, the queue round trip, the drain's
-    // `damage_intersecting` re-damage, and the `BUFFERED` erase that follows one pass later. What it
-    // does NOT prove is behaviour under genuine lock contention — for that the proof still rides a
-    // metal boot, and the rollup's `redefers=` is where it will show.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-    {
-        if !requeued && !DEFER_FIXTURE.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            defer!(DEFER_LOCK);
-        }
     }
     let info = fb.info();
     let bpp = info.bytes_per_pixel;
@@ -10469,6 +10536,27 @@ fn stage_fill(
 
     #[cfg(feature = "witness")]
     let t1 = crate::arch::now_cycles();
+
+    // WC-K2 — THE STRUCTURAL LEG, and it sits HERE, at the last statement before the first byte
+    // reaches the front buffer, rather than at function entry. What the arc claims is not "nobody
+    // calls `stage_fill` from outside the drain" but the narrower, checkable thing: **no desktop
+    // fill reaches the glass outside a composite publish**. A call from elsewhere that declines
+    // above never touched a panel byte and is not the defect; a call that gets this far is.
+    //
+    // Reachable for the WHOLE boot (the emitter prints its own one-shot line, on the `STARVED`
+    // pattern, and does not wait on the sample rollup which may already have fired), and it cannot
+    // pass vacuously: the spec pairs the FORBID with a REQUIRE that `-> BUFFERED` fills happened at
+    // all and a REQUIRE that they arrived by `reason=route`, so "no fills" and "fills that never
+    // went through the queue" both red rather than reading clean.
+    //
+    // What it does NOT catch, stated so nobody reads more into it: a future path that bypasses
+    // `stage_fill` entirely and pokes the framebuffer itself. That is WC-G's original shape and it
+    // has its own detectors (`PanelWriteGuard`, the WCD teardown verdict); this one is about the
+    // caller graph of the staged fill.
+    #[cfg(feature = "witness")]
+    if !from_drain {
+        super::wcg::erase_outside_publish(w, h);
+    }
 
     // Present: one bulk copy per row. ROW-CONTIGUITY is checked here rather than asserted in a
     // comment — each destination run must be exactly `row_bytes` long, must fit inside its scanline
@@ -11646,9 +11734,11 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
 /// and reaped.
 ///
 /// ### The three steps, and why all three
-/// * **erase** — desktop colour on the panel NOW, so the ghost is gone within this call rather than at
-///   the desktop's next tick. Same immediate-response argument `focus_changed` makes for its hidden
-///   boxes.
+/// * **erase** — the vacated boxes are handed to the compositor as deferred desktop damage, and the
+///   `composite()` the caller runs next publishes them. WC-K2: the ghost is still gone within this
+///   CALL rather than at the desktop's next tick, which is what the immediate-response argument
+///   (`focus_changed`'s, for its hidden boxes) actually asks for — what it is no longer is a panel
+///   event of its own, ahead of the window repaint that belongs with it.
 /// * **damage_intersecting** — a survivor whose box OVERLAPS a reclaimed one just had a bite taken out
 ///   of it by the erase; it must be repainted by the composite the caller runs next.
 /// * **request_full_present** — the desktop's own content (the console's text, the status strip) is
