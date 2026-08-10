@@ -1,65 +1,64 @@
-# WHITE BOARD — 2026-08-09 (GR23, fourth pass)
+# WHITE BOARD — 2026-08-09 (GR24, first pass)
 
 Questions for Peter, each with the background to answer it. Nothing else lives here.
 
-**Everything asked earlier today is ANSWERED and off the board:** kernel shell → midden (merged) ·
-radios/3D (running) · wifis4a (merged) · the Crispy kit "stolen from pi, sync later" · ceramic +
-paper (merged) · MEGABOOM by name (merged) · controls red/yellow/green top-left (merged) · dock
-(merged) · **and the lanes: the seat has taken BOTH, Gemini is shut down.**
+**Answered and off the board:** the control hues (the loud macOS set shipped with knurl — your
+size-and-hue ruling) · MEGABOOM matching (by ADDRESS, your 2026-08-08 ruling — merged with zero
+new transmit in the match itself) · lane shutdown (done; the seat adopted all seven branches).
 
 ---
 
-## Q13 — The three control hues: veto by eye, or leave them?
+## Q1 — igpu round 13 was amended AFTER your clearance. Veto or confirm before it flies.
 
-I showed you these on the actual chrome. They are MERGED and on the next card either way — this is
-a "change them or don't" question, not a blocker.
+The adoption review found the round's answer gated on registers never read back on this machine:
+the post-switch check demanded an echo from `SWITCH_DISPLAY`/`SWITCH_EXTERNAL` (write-side ports
+with no proven echo — a switch that WORKED could have failed the comparison, blanked the panel,
+and aborted before the first AUX transaction), and the pre-switch gate's `SWITCH_DISPLAY==DIS`
+term conflated that register with `READ_DISPLAY`. Both are now advisory; only metal-proven
+registers abort or vote (DDC's echo, the two `READ_*` ports). The RUNBOOK's predicted transcript
+also contradicted itself — its own success line would have printed `gmux=FAILED` and sent you to
+a power cycle on a correct boot; fixed. **The flight artifact is therefore no longer byte-for-byte
+the one you cleared.** Every change makes it strictly less likely to refuse or lie, none touches
+the parachute, and the armed build type-checks green — but post-clearance amendment is yours to
+veto. Diff: `git log --oneline 509b9706..50969ab8`.
 
-| control | hex | reading |
-|---|---|---|
-| close | `0x00C25F55` | clay red, hue 6° |
-| minimise | `0x00C89C52` | ochre, hue 39° |
-| zoom | `0x005E9468` | sage, hue 135° |
+## Q2 — Windows 122–158 px wide now silently lose their whole control cluster. Which way?
 
-They keep macOS's HUE ANGLES (6/39/135) so the meaning is unmistakable, but pull saturation and
-value into the register the rest of the table lives in — `#FF5F57 / #FEBC2E / #28C840` are fully
-saturated and shout against near-white chrome and a muted accent. **If you want the louder macOS
-hues instead, that is one line each.** Provenance is honest in `theme.rs`: derived, your ruling,
-no kit hash, pending re-lift when `kits/crispy/` becomes reachable.
+KNURL's 24 px discs moved the cluster's width floor from 122 to 158 px of box width. A live ring-3
+window whose box lands in that band draws NO close/minimise/zoom — no witness, no skip line — and
+its app has no way to know. The fixtures were all re-sized to clear the floor, so no gate sees it.
+Options: (a) accept and witness it (one `[wm]` line when a cluster is declined for width — cheap,
+honest, ships today); (b) let narrow windows keep a smaller disc set (breaks "the size a Mac draws
+them"); (c) set a minimum window width ≥ 158 so the band cannot exist. I lean (a)+(c) together —
+say the word and it lands this round.
 
-## Q14 — The MEGABOOM: the next boot's RAW line decides, and one outcome needs your ruling.
+## Q3 — The discs sit 5 px from the frame; a Mac gives them ~16. Raise TITLE_HEIGHT?
 
-Boot AS read `name="."` for `88:c6:26:cc:2d:3c` — your speaker's exact address, so **we did hear
-it.** The parser was investigated and CLEARED: introducing the off-by-one produces `".MEGABOOM"`,
-not a bare `"."`. The real defect was that **one unprintable byte and a real `.` rendered
-identically** — the witness could not tell us which. Fixed: any name under three characters now
-prints its RAW BYTES.
+`(TITLE_HEIGHT − CONTROL_BOX) / 2 = (34 − 24) / 2 = 5 px` clearance. KNURL flagged it in-tree and
+deliberately did not take the question — chrome proportions are the taste gate. Raising
+TITLE_HEIGHT to ~40–56 gives macOS-like air around the discs but costs every window that much
+content height. Veto by eye on the next boot, or name a number.
 
-So the next boot with the speaker on and near tells us which world we are in:
-  - **`name="MEGABOOM"`** → connect and clean release. Nothing needed from you.
-  - **RAW shows a real Local Name we mis-decoded** → my bug, I fix it, nothing needed from you.
-  - **RAW shows the advertisement carries NO name** (or a genuine one-byte one) → **passive LE
-    matching can NEVER find this speaker.** Then it is your call between: match by ADDRESS
-    (`88:C6:26:CC:2D:3C`, zero transmit, works today) or **ACTIVE scanning, which TRANSMITS a
-    SCAN_REQ to every advertiser in the room.** I will not switch to active silently.
+## Q4 — `ls`/`cat`/`stat` are still dead on an internal-reader boot. Which volume should they mean?
 
-Recorded so the question is already framed when the capture lands.
+`vug` launches now (the resolver, re-resolve, and loader all bind `mount_program_source()`), but
+~23 other `fat::mount()` sites in shell.rs — the whole FAT verb family — still ask the default
+handle, which does not exist on a machine booted from the internal SD reader. Boot AR shows you
+typing `ls` twice before `vug`. The read verbs could move to the program source mechanically, but
+the card mounts READ-ONLY there, so the write verbs (`write`, `rm`, `mkdir`...) cannot follow —
+they would need either a loud per-verb refusal ("this volume is read-only") or a split where reads
+follow the program source and writes stay on the (absent) default and refuse with the census line.
+One ruling wanted: **reads follow the program source everywhere, writes refuse loudly on a
+read-only source** — say yes and it is a mechanical arc; say different and I brief it your way.
 
-## Q15 — When do you want the next boot? A lot is merged that has never been on glass.
+## Q5 — Boot planning: four things want glass, two of them are flights.
 
-Trunk is 99/99 and carries, none of it yet flown: **the controls top-left in red/yellow/green with
-working minimise and zoom** · **the dock** (every window has a way back, hidden ones included) ·
-**the close-isolation fix** (closing STAT no longer takes the console — the console was never
-closed, it stopped being COMPOSITED) · **the console furniture fix** (it was being drawn with a
-live close button that would have reaped your only surface) · the BT name raw-bytes witness · the
-midden shell convergence.
-
-**Plus two flights that are ready and are yours to schedule:**
-  - **igpu round 13 — CLEARED TO FLY** after five adversarial rounds. It blanks the panel for
-    ~2.4-2.5 s and answers whether the eDP AUX lines are gmux-routed. It discriminates decisively in
-    3 of 4 outcomes; the 4th ambiguity is named and is the irreducible limit of one boot. Being
-    ported into our tree now.
-  - **kepler FENCE** — the seat is re-authoring it. Not ready; will be reviewed before it flies.
-
-I can stage media whenever you say. **The desktop work and the igpu flight can ride the same card
-or separate ones — your call, since the igpu flight blanks the panel and the desktop work wants
-you clicking things.**
+Never flown: the drag with sliver-erase (the flicker fix) · the 24 px knurled controls in the
+macOS hues · the dock + close-isolation already on the card from GR23 · the MEGABOOM by-address
+selection (its first boot decides the connect). Flights, both gated green and both needing your
+go: **igpu round 13** (pending Q1 — blanks the panel ~2.4–2.5 s) and **kepler FENCE** (first
+flight ever — QEMU has no Kepler, so metal is its only test; the verdict now requires both the
+falcon-side AND host-side ENGINE_STATUS to carry the bit, re-checks the hold at the stimulus, and
+force-clears host-side if the falcon's clear loses the race). The desktop work wants you clicking;
+the flights blank or perturb the panel — same card or separate ones, your call. Media stages
+whenever you say.
