@@ -1925,6 +1925,68 @@ impl FatFs {
         }
     }
 
+    /// FATVERB: the registry handle this volume reads through, spelled exactly as
+    /// [`crate::drivers::block::SourceCensus`] spells it — so a refusal that prints both reads as one
+    /// sentence ("source=sdhc ... handles=global=absent sdhc=present") instead of two vocabularies.
+    pub fn source_name(&self) -> &'static str {
+        match self.source {
+            BlockSource::Default => "global",
+            BlockSource::Usb => "usb",
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockSource::Sdhc => "sdhc",
+        }
+    }
+
+    /// FATVERB: may an ORDINARY FILE MUTATION (create / write / delete / mkdir) reach this volume?
+    /// `None` = yes. `Some(reason)` = no, and the reason names the mechanism that says no.
+    ///
+    /// This exists because the shell's write verbs acquired a way to be WRONG the moment
+    /// LAUNCH-AR pointed the exec legs at [`mount_program_source`]: on a machine booted from the
+    /// internal SD reader that call binds [`BlockSource::Sdhc`], and `Sdhc` is a READ-ONLY mount for
+    /// everything except the reserved flight-recorder extent. Moving the write verbs onto the same
+    /// handle as the read verbs — which is the only way `ls` and `rm` can agree about what "here"
+    /// means — therefore has to come with a gate, or `rm FOO` would walk a FAT mutation all the way
+    /// down to [`write_sector`], collect [`FatError::Unsupported`] from SDHC-4c's permit, and leave
+    /// the operator staring at a per-sector I/O error for a volume that was never writable.
+    ///
+    /// **A prediction, not a copy of one.** Nothing here re-implements a bound: the `Default` arm
+    /// asks [`crate::drivers::block::default_writable`] (the USBFALL F1 / FRGUARD substitution
+    /// guard, the same predicate `write_block` enforces), and the `Sdhc` arm states SDHC-4c's own
+    /// standing answer for a span OUTSIDE the reserved extent, which is every span a file verb can
+    /// name — the reserved file is staged by the host and the kernel never creates, grows or deletes
+    /// it. The enforcement stays where it was; this is the layer that can say so IN ADVANCE, before
+    /// a half-finished directory mutation exists to be rolled back.
+    ///
+    /// Deliberately conservative in one direction only: a `Some` here can cost a write that the
+    /// permit would in principle have admitted (a shell verb that happened to land inside the
+    /// reserved extent — unreachable, since reaching it means mutating the FAT or a directory
+    /// entry, which SDHC-4c counts as a finding). A `None` can never admit a write the block layer
+    /// would refuse, because both `None` arms defer to the block layer's own predicate.
+    pub fn write_veto(&self) -> Option<&'static str> {
+        match self.source {
+            // USBFALL F1 / FRGUARD: the global slot is refused when the boot volume was positively
+            // found on the OTHER handle. Both `unknown` and `unproven` fail open there, so this is
+            // `false` only in the one state that is evidence of a substitution.
+            BlockSource::Default => {
+                if crate::drivers::block::default_writable() {
+                    None
+                } else {
+                    Some("the boot volume was found on another handle, so the block layer refuses \
+                          writes through the global slot (USBFALL F1 / FRGUARD)")
+                }
+            }
+            // USB-WRITE (F3): the stick's BOT WRITE(10) path is verified and routed.
+            BlockSource::Usb => None,
+            // SDHC-4b/4c: the internal reader admits CMD24 only inside the reserved flight-recorder
+            // extent, which no file verb can name. See `crate::fs::sdhc4c`.
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockSource::Sdhc => Some(
+                "the internal SD reader is mounted READ-ONLY — only the reserved flight-recorder \
+                 extent admits a write (SDHC-4c), and no file verb can name it",
+            ),
+        }
+    }
+
     /// The end-of-chain marker to write into a terminal cluster's FAT entry (`>= 0xFFF8` / `>= 0x0FFFFFF8`
     /// both read as EOC; write the canonical all-ones form).
     fn eoc_value(&self) -> u32 {

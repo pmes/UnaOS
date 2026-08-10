@@ -240,14 +240,116 @@ fn fs5_say(console: &mut Console, line: &str) {
     serial_println!(":: fs5: {} ::", line);
 }
 
+// ===================== FATVERB — the verbs find their volume ========================================
+//
+// Boot AR, second half. LAUNCH-AR moved the three EXEC legs (the `FatVolume::is_file` probe, the
+// `bare_exec` re-resolve, the `read_el0_image` load) from `fat::mount()` to
+// `fat::mount_program_source()`, because on a machine booted from the internal SD reader the global
+// `BLOCK_DEVICE` slot is EMPTY — `SDHCBLK` registers the card under its own handle and says so on
+// the wire. That fixed launching. It did not fix looking: Peter typed `ls` twice on that same boot
+// and got nothing, because the twenty-five FAT verbs in this file were all still asking the handle
+// that does not exist there. A shell where `ls` and `vug` disagree about which volume is the volume
+// is not a shell.
+//
+// So every verb binds the SAME handle the exec legs bind. The two helpers below are the only place
+// that binding is expressed, which is the point: the failure mode this arc closes is call sites
+// drifting apart, and twenty-five copies of `match fat::mount()` is how they drifted.
+//
+// READ and WRITE are split because they are not the same question.
+//   * A read verb needs a volume. If it cannot get one it says so, naming the handles it was
+//     offered — the `exec-probe ... NO VOLUME (...; handles=...)` idiom, because a decline that
+//     cannot name what it inspected cannot be falsified by the capture it appears in.
+//   * A write verb needs a volume that ADMITS WRITES, and on the internal reader it will not get
+//     one: `Sdhc` is a read-only mount outside the reserved flight-recorder extent (SDHC-4c). Left
+//     ungated, `rm FOO` on that boot would walk a real directory mutation down to `write_sector`,
+//     collect `Unsupported` from the permit, and surface as a per-sector I/O error — or, worse for
+//     a multi-step verb like `write` (delete-then-recreate) or `mv`, get part-way. So the gate runs
+//     BEFORE the first mutation, refuses LOUDLY on both sinks, and names the volume, the reason and
+//     the census. It never silently no-ops.
+//
+// `mount_program_source()` is IDENTICAL to `mount()` on every configuration that already worked:
+// aarch64 and x86-without-`sdhcblk` have no second handle, and where a global device is registered
+// it still wins the precedence ladder. The behaviour only differs on the one boot shape that was
+// already broken.
+
+/// FATVERB: the write gate's answer, rendered but not yet printed. Split out from
+/// [`mount_write_volume`] so `midden.writegate` can assert the gate FIRES without a console — the
+/// witness and the verbs then exercise one decision, not two copies of it.
+enum WriteVolume {
+    /// The program source mounted and admits ordinary file mutation.
+    Admitted(FatFs),
+    /// It mounted and REFUSES. Carries the finished refusal line.
+    ReadOnly(String),
+    /// Nothing mounted at all. Carries the finished decline line.
+    NoVolume(String),
+}
+
+/// FATVERB: mount the volume a READ verb should act on — the program source, so `ls` and a bare
+/// name are looking at the same card. `Err` is the finished decline line, census included.
+fn open_read_volume(verb: &str) -> Result<FatFs, String> {
+    crate::fs::fat::mount_program_source().map_err(|e| {
+        alloc::format!(
+            "{}: no FAT filesystem ({:?}; handles={})",
+            verb, e, crate::drivers::block::source_census()
+        )
+    })
+}
+
+/// FATVERB: the WRITE gate. Mount the program source, then ask the block layer whether that source
+/// can be mutated at all ([`crate::fs::fat::FatFs::write_veto`]) — before any directory entry,
+/// cluster chain or FAT sector has been touched.
+fn open_write_volume(verb: &str) -> WriteVolume {
+    let fs = match open_read_volume(verb) {
+        Ok(fs) => fs,
+        Err(line) => return WriteVolume::NoVolume(line),
+    };
+    match fs.write_veto() {
+        None => WriteVolume::Admitted(fs),
+        Some(why) => {
+            let label = fs.label();
+            WriteVolume::ReadOnly(alloc::format!(
+                "{}: REFUSED READ-ONLY (source={} label={} reason={}; handles={})",
+                verb,
+                fs.source_name(),
+                if label.is_empty() { "-" } else { &label },
+                why,
+                crate::drivers::block::source_census()
+            ))
+        }
+    }
+}
+
+/// FATVERB: [`open_read_volume`] + print. `None` means the caller has already been explained to and
+/// should just return.
+fn mount_read_volume(console: &mut Console, verb: &str) -> Option<FatFs> {
+    match open_read_volume(verb) {
+        Ok(fs) => Some(fs),
+        Err(line) => {
+            console.println(&line);
+            None
+        }
+    }
+}
+
+/// FATVERB: [`open_write_volume`] + print, on BOTH sinks. The panel line is what the operator
+/// reads; the serial mirror is what a headless capture reads, and without it a bench log could not
+/// tell "the verb refused, and here is why" from "the keystroke never arrived".
+fn mount_write_volume(console: &mut Console, verb: &str) -> Option<FatFs> {
+    match open_write_volume(verb) {
+        WriteVolume::Admitted(fs) => Some(fs),
+        WriteVolume::ReadOnly(line) | WriteVolume::NoVolume(line) => {
+            console.println(&line);
+            serial_println!(":: [fatverb] {} ::", line);
+            None
+        }
+    }
+}
+
 /// JD6 `touch`: ensure a 0-length file exists at `path` in ANY directory the shell can reach
 /// (create if absent; idempotent no-op if present). Rides the dir-aware `locate_in_dir` /
 /// `create_in_dir` twins — the parent may be the root or any subdirectory.
 fn fs_touch(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("touch: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "touch") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("touch: {}", msg)),
@@ -270,10 +372,7 @@ fn fs_touch(console: &mut Console, arg: &str) {
 /// in-place shrink primitive, and the directory-field publisher is private). A directory target is
 /// refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
 fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("write: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "write") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("write: {}", msg)),
@@ -321,10 +420,7 @@ fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
 /// (allocate + zero-fill + chain new clusters, directory `size` published LAST). A directory target
 /// is refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
 fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("append: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "append") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("append: {}", msg)),
@@ -365,10 +461,7 @@ fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
 /// missing-target error quietly (POSIX `rm -f`); a wrong-usage `-EISDIR` is still shown under `-f`.
 /// Rides the dir-aware locate_in_dir twin.
 fn fs_rm(console: &mut Console, arg: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rm") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         // JD14: `-f` is lenient about a missing target (POSIX `rm -f NOSUCH` is quiet). A missing
@@ -406,10 +499,7 @@ fn fs_rm(console: &mut Console, arg: &str, force: bool) {
 /// parent is a plain file → `-ENOTDIR` (both from `resolve_write_target`); volume or parent-dir full
 /// → `-ENOSPC`; a non-8.3 name → `-EINVAL`. The root itself as a target → `-EISDIR` (it always exists).
 fn fs_mkdir(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("mkdir: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "mkdir") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("mkdir: {}", msg)),
@@ -444,10 +534,7 @@ fn fs_mkdir(console: &mut Console, arg: &str) {
 /// it and gets an honest `-ENOENT`, exactly the JD4 stale-cwd worst case (the cwd is a re-resolved path
 /// string, not a cached chain head). No corruption — `delete_located` is crash-safe.
 fn fs_rmdir(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rmdir: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rmdir") else { return };
     // Refuse the root explicitly, with the honest errno. `resolve_write_target` would report the "/"
     // path as `-EISDIR`, but the volume root is never a removable directory (it is unnameable and
     // cluster 0 is not freeable). This also covers `rmdir .` at the root and `rmdir ..` that pops to it.
@@ -503,10 +590,7 @@ fn fs_rmdir(console: &mut Console, arg: &str) {
 /// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel
 /// core); a future single-pass primitive could tighten that, tracked as a JD9 note.
 fn fs_cp(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "cp") else { return };
     // --- Resolve the SOURCE to a concrete file (a directory source is out of scope). ---
     let src_norm = normalize_path(&cwd_path(), src);
     let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
@@ -717,10 +801,7 @@ fn cp_tree(
 /// failing path + errno; nothing is rolled back (a partial tree is left on disk, crash-safe per the
 /// FATDIRS/JD6 ordering — the operator can `rmdir`/`rm` it).
 fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "cp") else { return };
     // --- Resolve the SOURCE. Root is refused; a file degrades to the plain file copy. ---
     let src_norm = normalize_path(&cwd_path(), src);
     let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
@@ -914,10 +995,7 @@ fn force_remove_existing(
 /// `remove_dir` primitives JD6/JD7/JD9 already exercise and ledger, so it inherits their locking
 /// analysis unchanged (no new fat.rs surface, no new lock, no new namespace interaction).
 fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rm") else { return };
     // Refuse the root explicitly, with the honest errno, BEFORE any walk. `normalize_path` folds
     // `rm -r .` at the root and `rm -r ..` that pops to it into "/". The root refusal stands even
     // under `-f` — `rm -rf /` is a footgun the panel never honours (cluster 0 is unremovable).
@@ -991,10 +1069,7 @@ fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
 /// `move_entry` publishes the destination BEFORE `0xE5`ing the source, so a power-cut mid-move leaves
 /// a benign duplicate (two names, one chain), never a lost chain.
 fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("mv: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "mv") else { return };
     // --- Resolve the SOURCE to a concrete entry (file or dir). The volume root has no leaf name to
     //     move AS, so it is refused. ---
     let src_norm = normalize_path(&cwd_path(), src);
@@ -1131,10 +1206,7 @@ fn cat_render(console: &mut Console, fs: &FatFs, de: &DirEntry, canon: &str) {
 /// bounds the read and the heap. A directory or the root is `-EISDIR`. Every access rides the JD3
 /// wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel core.
 fn fs_head(console: &mut Console, arg: &str, n: u32) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("head: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "head") else { return };
     let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
         Ok(Resolved::Root) => return console.println("head: /: is a directory (-EISDIR)"),
         Ok(Resolved::Entry(de, canon)) => {
@@ -1198,10 +1270,7 @@ fn fs_head(console: &mut Console, arg: &str, n: u32) {
 /// note records the bound. A directory or the root is `-EISDIR`; an empty file prints nothing. Every
 /// access rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang.
 fn fs_tail(console: &mut Console, arg: &str, n: u32) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("tail: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "tail") else { return };
     let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
         Ok(Resolved::Root) => return console.println("tail: /: is a directory (-EISDIR)"),
         Ok(Resolved::Entry(de, canon)) => {
@@ -1331,7 +1400,9 @@ fn print_dir_listing(console: &mut Console, entries: &[DirEntry], long: bool) {
 // ---------------------------------------------------------------------------------------------
 // PI-SHELL-LS — `ls` on the Pi shell lists the NATIVE unafs volume (the SD-card partition), not FAT.
 //
-// The shared `ls`/`dir` arm rides `fat::mount()` — the x86 USB-storage backend. The Pi has no FAT
+// The shared `ls`/`dir` arm rides the FAT program source (FATVERB: `mount_read_volume`; before that
+// `fat::mount()`) — the x86 USB-storage backend, or the internal SD card when that is what booted us.
+// The Pi has no FAT
 // volume mounted (its native store is unafs; FAT on the SD card is only the firmware boot partition),
 // so on the board `ls` printed "ls: no FAT filesystem (...)". The unafs volume DOES work — it is the
 // very volume PI-NET-15 serves at `/fs/` (what Safari sees, K3HELLO.TXT et al.) via the same
@@ -1746,9 +1817,8 @@ fn ls_resolved(console: &mut Console, fs: &FatFs, path: &str, long: bool) {
 /// can share the exact resolve/print behaviour for a non-trailing-glob fall-through.
 #[cfg(not(target_arch = "aarch64"))]
 fn ls_path(console: &mut Console, arg: &str, long: bool) {
-    match crate::fs::fat::mount() {
-        Ok(fs) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg), long),
-        Err(e) => console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
+    if let Some(fs) = mount_read_volume(console, "ls") {
+        ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg), long);
     }
 }
 
@@ -1757,10 +1827,7 @@ fn ls_path(console: &mut Console, arg: &str, long: bool) {
 /// how a shell hands matched names to `ls`); no match is an honest "no match".
 #[cfg(not(target_arch = "aarch64"))]
 fn ls_globbed(console: &mut Console, arg: &str, long: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "ls") else { return };
     match glob_expand(&fs, arg) {
         Glob::Literal(p) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), &p), long),
         Glob::Matched { entries, .. } if entries.is_empty() =>
@@ -1774,10 +1841,7 @@ fn ls_globbed(console: &mut Console, arg: &str, long: bool) {
 /// directory match is skipped with the classic `-EISDIR` note; no match is an honest "no match". A
 /// glob confined to a non-trailing component falls through to a literal resolve (honest error).
 fn cat_globbed(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "cat") else { return };
     match glob_expand(&fs, arg) {
         Glob::Literal(p) => match resolve_path(&fs, &normalize_path(&cwd_path(), &p)) {
             Ok(Resolved::Root) => console.println("cat: /: is a directory (-EISDIR)"),
@@ -1837,10 +1901,7 @@ fn expand_sources(console: &mut Console, fs: &FatFs, verb: &str, sources: &[&str
 /// a file degrades to a plain delete). SNAPSHOT-safety holds through the recursion too: each concrete
 /// match is re-resolved by its canonical path, and a completed `rm -r` never touches a sibling's slot.
 fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rm") else { return };
     for a in args {
         match glob_expand(&fs, a) {
             Glob::Literal(p) =>
@@ -1863,10 +1924,7 @@ fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool, force: bool
 /// can only land INTO a directory). Each source rides the existing `fs_cp` / `fs_cp_recursive` (the
 /// `FILE DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-copy.
 fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: bool, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "cp") else { return };
     let srcs = expand_sources(console, &fs, "cp", sources);
     if srcs.is_empty() {
         return; // every pattern was empty (each already reported "no match")
@@ -1888,10 +1946,7 @@ fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: boo
 /// (the `SRC DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-move — a wildcard move never
 /// invalidates its own list.
 fn mv_globbed(console: &mut Console, sources: &[&str], dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("mv: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "mv") else { return };
     let srcs = expand_sources(console, &fs, "mv", sources);
     if srcs.is_empty() {
         return;
@@ -2002,10 +2057,7 @@ fn find_walk(
 /// a FILE root degrades to a single self-match test (the POSIX shape — `find` a file tests that file);
 /// a mid-walk I/O error reports the path + errno with the partial hits/count already shown.
 fn fs_find(console: &mut Console, root_arg: &str, pat: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("find: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "find") else { return };
     let norm = normalize_path(&cwd_path(), root_arg);
     let mut stats = FindStats { matches: 0, dirs: 0 };
     match resolve_path(&fs, &norm) {
@@ -2084,10 +2136,7 @@ fn du_subtree(
 /// file bytes are real. A missing path is `-ENOENT`; a mid-walk read error reports the path + errno
 /// with the partial per-child lines and a total of what was tallied (honest partial).
 fn fs_du(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("du: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "du") else { return };
     let norm = normalize_path(&cwd_path(), arg);
     let (cluster, canon) = match resolve_path(&fs, &norm) {
         Ok(Resolved::Root) => (0u32, String::new()),
@@ -2179,10 +2228,7 @@ fn decode_attr(a: u8) -> String {
 /// reports the root honestly — it is a directory with NO directory entry of its own. Missing path is
 /// `-ENOENT`. Read-only; no glob (a metacharacter resolves literally → `-ENOENT`).
 fn fs_stat(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("stat: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "stat") else { return };
     // The volume root has no directory entry of its own — report it honestly, no slot.
     if normalize_path(&cwd_path(), arg) == "/" {
         console.println("  path:  /");
@@ -2256,10 +2302,7 @@ fn xd_rows(console: &mut Console, base: usize, data: &[u8]) {
 /// note is printed. off/len are parsed decimal or `0x`-hex by the caller.
 fn fs_xd(console: &mut Console, arg: &str, off: u32, len: usize) {
     const XD_MAX: usize = 4096;
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("xd: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "xd") else { return };
     let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
         Ok(Resolved::Root) => return console.println("xd: /: is a directory (-EISDIR)"),
         Ok(Resolved::Entry(de, canon)) => (de, canon),
@@ -2518,6 +2561,61 @@ pub fn midden_witness() {
                 by_resolver, by_loader, crate::drivers::block::source_census()
             ),
         );
+
+        // 6. readvol (x86) — AND SO MUST THE READ VERBS.
+        //
+        // `execvol` above pins the probe to the loader. It says nothing about `ls`, and `ls` is what
+        // Peter actually typed on Boot AR: twice, on a machine whose card was mounted and listed,
+        // and got nothing back, because every read verb in this file was still asking the global
+        // handle. This leg asks the SAME name through the read verbs' own mount helper
+        // (`open_read_volume`, the one `ls`/`cat`/`stat`/`cd` all go through — not a copy of it)
+        // and asserts it agrees with the exec probe.
+        //
+        // Same discipline as `execvol`: AGREEMENT, not presence. Both `false` on a card with no
+        // `VUG.ELF` staged is a PASS, so the fixture pins the wiring and never the contents of
+        // whatever is in the slot. Quiet in QEMU, where the two handles answer alike; the whole
+        // arc's claim on metal, where they did not.
+        let by_read_verb = match open_read_volume("midden") {
+            Ok(fs) => matches!(
+                resolve_path(&fs, &normalize_path(&cwd_path(), PROBE)),
+                Ok(Resolved::Entry(de, _)) if !de.is_dir
+            ),
+            Err(_) => false,
+        };
+        verdict(
+            "midden.readvol",
+            by_resolver == by_read_verb,
+            &alloc::format!(
+                "resolver={} read-verb={} handles={}",
+                by_resolver, by_read_verb, crate::drivers::block::source_census()
+            ),
+        );
+
+        // 7. writegate (x86) — A WRITE VERB MUST REFUSE A VOLUME THAT CANNOT BE WRITTEN.
+        //
+        // Legs 5 and 6 make every verb bind one handle. That is the fix, and it is also the new
+        // hazard: on a machine booted from the internal reader the handle they now all bind is
+        // `Sdhc`, which is READ-ONLY outside the reserved flight-recorder extent. A `rm` that
+        // followed the read verbs onto that handle without a gate would begin a real directory
+        // mutation and only discover the refusal several sectors down, inside `write_sector`.
+        //
+        // So: whenever the mounted program source declares a veto, the write verbs' own gate
+        // (`open_write_volume` — again the one they call, not a restatement) must answer
+        // `ReadOnly`, and when it declares none the gate must admit. Both halves can fail, and the
+        // failure they catch is the gate being bypassed or the predicate drifting from the block
+        // layer's. Quiet in QEMU, where the program source is the writable global slot and both
+        // sides read `false`; the refusal itself is exercised the first time this runs on a boot
+        // whose only volume is the card.
+        let veto = crate::fs::fat::mount_program_source().ok().and_then(|fs| fs.write_veto());
+        let gate_refused = matches!(open_write_volume("midden"), WriteVolume::ReadOnly(_));
+        verdict(
+            "midden.writegate",
+            veto.is_some() == gate_refused,
+            &alloc::format!(
+                "veto={} gate_refused={} handles={}",
+                veto.unwrap_or("none"), gate_refused, crate::drivers::block::source_census()
+            ),
+        );
     }
 }
 
@@ -2698,9 +2796,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "fatinfo" => {
-            match crate::fs::fat::mount() {
-                Ok(fs) => console.println(&fs.describe()),
-                Err(e) => console.println(&alloc::format!("fatinfo: no FAT filesystem ({:?})", e)),
+            if let Some(fs) = mount_read_volume(console, "fatinfo") {
+                console.println(&fs.describe());
             }
         },
         "ls" | "dir" => {
@@ -2734,8 +2831,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // JD4: change the shell's working directory. No argument (or `/`) returns to the
             // root. The stored cwd is the CANONICAL on-disk spelling of the resolved path.
             let path = normalize_path(&cwd_path(), args.first().copied().unwrap_or("/"));
-            match crate::fs::fat::mount() {
-                Ok(fs) => match resolve_path(&fs, &path) {
+            if let Some(fs) = mount_read_volume(console, "cd") {
+                match resolve_path(&fs, &path) {
                     Ok(Resolved::Root) => {
                         *CWD.lock() = None;
                         console.println("/");
@@ -2750,8 +2847,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         }
                     }
                     Err(msg) => console.println(&alloc::format!("cd: {}", msg)),
-                },
-                Err(e) => console.println(&alloc::format!("cd: no FAT filesystem ({:?})", e)),
+                }
             }
         },
         "pwd" => {
@@ -2762,15 +2858,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match args.first() {
                 None => console.println("usage: cat <path>"),
                 Some(name) if has_glob(name) => cat_globbed(console, name),
-                Some(name) => match crate::fs::fat::mount() {
-                    Ok(fs) => match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
-                        Ok(Resolved::Root) =>
-                            console.println("cat: /: is a directory (-EISDIR)"),
-                        Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
-                        Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
-                    },
-                    Err(e) => console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
-                },
+                Some(name) => {
+                    if let Some(fs) = mount_read_volume(console, "cat") {
+                        match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
+                            Ok(Resolved::Root) =>
+                                console.println("cat: /: is a directory (-EISDIR)"),
+                            Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
+                            Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
+                        }
+                    }
+                }
             }
         },
         "head" => {
@@ -3939,7 +4036,8 @@ fn parse_num(s: &str) -> Option<u64> {
 /// * **There is no VFS namespace.** `impl VfsBackend for FatBackend` and `NativeBackend` are
 ///   `#[cfg(target_arch = "aarch64")]` (see `fs/vfs.rs`), which is why `vfs_cmd` already refuses on
 ///   x86. So the x86 twin reads through the FAT-direct path the `cat` verb uses
-///   (`fs::fat::mount()` + `resolve_path` + the JD4 cwd), which is the path Peter's `cat hello.txt`
+///   (FATVERB: `mount_read_volume` + `resolve_path` + the JD4 cwd — the same program-source handle
+///   this loader binds), which is the path Peter's `cat hello.txt`
 ///   demonstrably exercises. `/fat/NAME` is accepted as an alias for that volume's root, because it
 ///   is the form the packaging text tells the operator to type and the only FAT volume x86 mounts
 ///   IS the DATA volume.
@@ -4006,9 +4104,11 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
 /// "every check can say NO" discipline, over the only file surface this arch has.
 ///
 /// x86 has no VFS namespace (`fs/vfs.rs` gates both backend impls to aarch64, which is why `vfs_cmd`
-/// refuses here), so this reads through the FAT-direct path `cat` uses: `fs::fat::mount()` — which on
-/// x86 is ALWAYS the USB mass-storage DATA volume, never the UEFI boot volume the kernel cannot
-/// reach — resolved through the JD4 cwd exactly like every other file verb.
+/// refuses here), so this reads through the FAT-direct path `cat` uses: the PROGRAM SOURCE
+/// (FATVERB — `cat` now binds `mount_program_source` through `mount_read_volume`, exactly as this
+/// loader does), which on x86 is the USB mass-storage DATA volume, or the internal SD card on a
+/// machine booted from the reader — never the UEFI boot volume the kernel cannot reach — resolved
+/// through the JD4 cwd exactly like every other file verb.
 ///
 /// **`/fat` is accepted as an alias for that volume's root.** It is the form the packaging text tells
 /// the operator to type (`esp-x86` prints "…or `bg /fat/VUG.ELF` reports -ENOENT"), the form
