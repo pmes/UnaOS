@@ -9446,10 +9446,74 @@ detector.
 * `[wc-k]` — `reason=route` is the dominant deferral reason on a healthy boot. `lock`/`alloc` still
   mean what they meant: the *drain* could not stage.
 
+### Review conditions applied (WC-K2r, same day)
+
+The arc was adopted with fixes. All seven are in the follow-up commit; the four that changed
+behaviour are here, the three that changed only what is claimed are folded into the sections above.
+
+**1 — the stranded fill, which was the P61 ghost by a new route.** `wm::composite`'s x86 re-run loop
+and its lost-wakeup block each *consume* `COMP_PENDING` and then gate on `any_damaged()` alone. That
+was the complete question while a declined pass could only owe window damage; after WC-K2 it can also
+owe a desktop fill, and the two are independent. Close the last window, `close_owner` the last owner,
+park or zoom-restore clear of every survivor — nothing intersects the vacated box, `any_damaged()` is
+false, the wakeup is already gone, and the queued fill has no core committed to it on a desktop where
+no later present is coming. `close_owner` from `sched::exit` runs IRQ-masked, so it takes neither path
+itself. Both gates now ask `any_damaged() || deferred_owed()`, one relaxed load on `DEFER_N`.
+
+The proof is a witness and deliberately not a leg, for WC-G's reason restated: the stranded state
+*is* "no further pass arrives", so the detector that would observe it is the pass that does not
+happen — and a residency counter has the same hole, since it can only tick when a pass runs. What is
+falsifiable is the fix FIRING, so `rescues=` counts passes taken only because the queue was
+non-empty. `rescues>0` is a boot where the old code dropped a fill; `rescues=0` is a boot that never
+met the condition. Reported, never forbidden. The completeness question stays with the FORBIDs.
+
+**2 — the line budget.** `reason=route` was sharing `E_DECL_LINES` (16) with `erase_drop`. One metal
+drag spends that in about four motion reports, after which `-> LOST` is unreachable and genuine
+`lock`/`alloc` deferrals are invisible: the instrument-that-cannot-speak defect in a new costume, and
+a straight regression of WC-L's own "deferral lines are UNBUDGETED" decision. The route now has its
+own `E_ROUTE_LINES = 4` and is count-only thereafter; the failure classes keep all sixteen. `E_DEFER`'s
+docstring is rewritten (it no longer means "could not stage", it means "was routed" — `E_REDEFER` is
+the contention counter now) and states that `defers=` is a snapshot at sample `E_SAMPLES`, not a boot
+total.
+
+**3 — `compat_present`'s two early returns.** `create_inner`'s re-tile queues route boxes and the
+compat arm deliberately does not composite; both returns then left those boxes with no pass committed
+to them. Folded into one exit that runs the same `composite()` the success path runs.
+
+**5 — no drain under a raised phase barrier.** `composite_inner` tests `DRAIN_PENDING` and aborts,
+but at the table snapshot — which is *after* the drain, because WC-L/CURSOR-5 put the drain ahead of
+the bracket. A pass entering while another core's vacate held the barrier would therefore publish that
+core's fills and abort before drawing a window: the fill on the glass, the windows one pass later, for
+the barrier's width. That is the exact two-event shape this arc deletes, re-created by the one path
+that skips its composite. `drain_deferred` now returns early on `DRAIN_PENDING != 0`; the holder is on
+its way to its own `composite()`, so the boxes are drained by the pass they belong to.
+
+**6 — the sprite's net.** FLICKER-2's `sprite_box()` snapshot can be one pointer report stale, and it
+argued the degradation away on "the mover's own repaint re-establishes it". Under WC-K2 that has a
+hole the size of a *stationary* pointer: the caller-side `cursor::repaint()` this arc removed was what
+mended a sprite hole when the pointer stops inside a box about to be filled — no further motion, no
+mover's repaint, and a desktop-coloured bite out of the arrow until something else disturbs it. The
+drain now asks the module's own question per painted box, at paint time, against the live mirror:
+`note_present_over_sprite(sprite_hit)`. A box the snapshot called clear and the mirror calls hit is
+unbracketed and arms `PRESENT_DIRTY`, the repair request. Two relaxed loads and a store per painted
+box.
+
+**7 — coverage conceded, not glossed.** Retiring WC-L's fixture also retired the only QEMU exercise of
+`stage_fill`'s `defer!` exits, on **both** arches: `lock` and `alloc` now have no witness outside a
+metal boot, where WC-L had one synthetic `lock` per boot. That is a real loss and it is the price of
+removing a latch that had become unreachable (`!requeued` can never hold once the drain is the only
+caller). `wcg::DECL_FIXTURE` is a *different* fixture — `stage_window`'s, on the window path, where the
+direct fallback still exists — and carries a note saying so, because deleting it alongside would take
+`[wc-h] … reason=fixture -> DIRECT` with it. The two `[wc-k]` FORBIDs are now in `x86-witness.spec`
+too: the report was an x86 drag, and review condition 1's gates are `#[cfg(target_arch = "x86_64")]`,
+so the pi4 gate structurally cannot red for that half.
+
 ### Metal watch-list
 
 Drag a window diagonally, slowly, across another and along a panel edge. Expect: no desktop-coloured
 flash at the trailing edge, no bright one-step-stale chrome line inside the window box, `[drag] … ->
-ONCE` unchanged, `[wc-k] … reason=route requeued=no -> DEFERRED` at drag rate, `redefers=` low, and
-`outside=0`. A *trail* left behind the window points at the drain (a composite that declined and was
-never re-run), not at the extent.
+ONCE` unchanged, `[wc-k] … reason=route requeued=no -> DEFERRED` (four lines, then count-only),
+`redefers=` low, `coalesced=` near zero, and `outside=0`. Then park the pointer *inside* a window and
+close it: the arrow must survive the vacate. `rescues=` is worth reading — non-zero means the
+stranding condition is live on this machine. A *trail* left behind the window points at the drain (a
+composite that declined and was never re-run), not at the extent.

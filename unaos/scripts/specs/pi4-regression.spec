@@ -632,10 +632,14 @@ REQUIRE \[wc-j\] retile survivor=.* moved=true painted=true live=true old_deskto
 # ---    the queue received, while `old_desktop`/`new_window` remain PANEL read-backs taken after
 # ---    `move_to` -- i.e. after that composite. The two halves therefore still pull opposite ways
 # ---    (a fix that stops erasing fails the read-backs; a whole-box erase fails `flash_px=0`), and
-# ---    they are no longer simultaneous claims. The single divergence between queued and painted is
-# ---    `defer_erase`'s coalescing, which only ever ENLARGES the painted region, so `flash_px=0`
-# ---    stays a floor rather than an estimate; `coalesced=` in the `[wc-k]` rollup is where a boot
-# ---    doing it constantly would say so.
+# ---    they are no longer simultaneous claims.
+# ---
+# ---    AND `flash_px=0` DOES NOT BOUND THE PAINTED FLASH under coalescing -- stated here because the
+# ---    first cut of this note claimed it did. `flash_px` counts erased pixels INSIDE THE NEW BOX; a
+# ---    union enlarges the painted region, which is exactly that quantity, while the recorded value
+# ---    stays 0. So the record measures the REQUEST, and `coalesced=` in the `[wc-k]` rollup is the
+# ---    signal that request and paint have parted company. Near zero -- the normal state, since every
+# ---    erase site composites in the same call -- they are the same number.
 REQUIRE \[wc-j\] move-once .* painted=true moved=true old_desktop=true .* new_window=true .* flash_px=0 exact=true -> PASS
 FORBID \[wc-j\] .*-> FAIL
 
@@ -761,6 +765,26 @@ FORBID \[wc-k\] .*-> STARVED
 # ---    See docs/dev/OS/08_VIDEO/engine.md §WC-K2.
 FORBID \[wc-k\] .*-> UNPUBLISHED
 FORBID \[wc-k\] .*outside=[1-9]
+# --- WC-K2r: `-> RESCUED` is NEITHER required NOR forbidden, and that is a decision.
+# ---    Review condition 1: the two x86 wakeup gates consumed COMP_PENDING and then asked
+# ---    `any_damaged()` alone, so a vacate whose box intersects NO surviving window -- a last-window
+# ---    close, a close_owner on the last owner, a park or zoom-restore jumping clear -- dropped both
+# ---    the queued fill and the retry that would have collected it. Both gates now ask
+# ---    `any_damaged() || deferred_owed()`, and `rescues=` counts the passes taken only because the
+# ---    erase queue was non-empty.
+# ---
+# ---    It is not REQUIREd because the condition needs a DECLINED pass, which needs two cores
+# ---    compositing at once, which this gate's single-core QEMU boot cannot arrange -- requiring it
+# ---    would red an honest run. It is not FORBIDden because a rescue is the fix WORKING.
+# ---
+# ---    And the thing a reader actually wants -- "no queued box outlives the next completed pass" --
+# ---    is NOT ASSERTED ANYWHERE, deliberately. It cannot be, from inside a boot: the stranded state
+# ---    IS "no further pass arrives", so the detector would have to be the pass that does not happen.
+# ---    That is WC-G's completeness lesson in its original form, and the honest response is the same
+# ---    one WC-K gave -- claim the samples seen, leave completeness to the FORBIDs, and say here that
+# ---    the gap exists rather than let the next reader mistake `rescues=` for a proof.
+# ---    Neither gate exists on aarch64 at all (`COMP_GATE` is x86-only), so the x86 half of this
+# ---    condition is pinned in scripts/specs/x86-witness.spec, not here.
 # --- PULSE-2: the always-running per-core CPU pulse, as an INSTRUMENT PANEL in the standing gap at
 # ---    the bottom of the panel -- below the tiled windows, above the PI-UI-2 status line.
 # ---

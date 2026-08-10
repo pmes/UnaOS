@@ -791,28 +791,44 @@ pub(super) fn compat_present(
         }
         id
     };
+    // WC-K2r REVIEW CONDITION 3 — THE TWO EARLY RETURNS THAT USED TO LEAVE BOXES QUEUED.
+    //
+    // `create_inner` re-tiles, and its re-tile runs WC-J's `reclaim`, which after WC-K2 queues route
+    // boxes instead of painting them. On the compat path `create_inner` deliberately does not
+    // composite (its comment says why: the row's real scale and origin are set in the second critical
+    // section below, and a composite here would flash the surface at 1x). That was harmless while
+    // `erase` published on the spot. It is not harmless now: both returns below would leave the
+    // survivors' abandoned tiles queued with no pass committed to them — the same stranding shape
+    // review condition 1 closes on the x86 wakeup gates, arriving by a different door.
+    //
+    // The returns are therefore routed through ONE exit that composites. Not by moving the
+    // `composite()` into `create_inner` (that would reintroduce the mis-scaled flash the compat arm
+    // exists to avoid) and not by draining here (the drain belongs to a composite pass, which is the
+    // arc's whole point) — the exit simply runs the same `composite()` the success path runs, which
+    // drains the queue at its head and finds no damaged row to draw when the present bailed.
     {
         let mut t = table();
-        let r = match row_mut(&mut t, id) {
+        match row_mut(&mut t, id) {
             // F2 — re-check under the lock: the row could have been closed and recycled between the
             // guard above and here.
-            Some(r) if r.compat => r,
-            _ => return,
-        };
-        // Rows-fit-slot is tautological here (see above); pixels-fit-stride is the real constraint.
-        if w.saturating_mul(4) > stride {
-            return;
+            Some(r) if r.compat && w.saturating_mul(4) <= stride => {
+                // Rows-fit-slot is tautological here (see above); pixels-fit-stride is the real
+                // constraint, and it is folded into the match arm so both refusals take one exit.
+                r.surf = surf;
+                r.surf_len = surf_len;
+                r.w = w;
+                r.h = h;
+                r.stride = stride;
+                r.scale = scale;
+                r.x = x;
+                r.y = y;
+                r.damage_all();
+                r.presented = true;
+            }
+            // Both refusals — a recycled/non-compat row, and pixels that do not fit the stride —
+            // land here and fall through to the `composite()` below rather than returning.
+            _ => {}
         }
-        r.surf = surf;
-        r.surf_len = surf_len;
-        r.w = w;
-        r.h = h;
-        r.stride = stride;
-        r.scale = scale;
-        r.x = x;
-        r.y = y;
-        r.damage_all();
-        r.presented = true;
     }
     composite();
 }
@@ -1231,11 +1247,18 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // WC-K2 — what the note-takers now record is what was HANDED TO THE COMPOSITOR, because that
         // is what `erase` now does with the slice. The binding is what keeps that honest: the boxes
         // queued and the boxes recorded are one array, so the record cannot describe an extent the
-        // drain was never given. What the drain then paints can differ from it in exactly one way —
-        // a full queue coalesces a box into a neighbour's bounding box, which only ever ENLARGES the
-        // painted region (`defer_erase`), so `flash_px = 0` on the record remains a sound floor for
-        // the property `[wc-j] move-once` asserts, and `coalesced=` in the `[wc-k]` rollup is where a
-        // boot doing it constantly says so.
+        // drain was never given.
+        //
+        // WC-K2r — AND IT DOES NOT BOUND WHAT THE PANEL FLASHED. The first cut of this note claimed
+        // `flash_px = 0` was still "a sound floor" under coalescing because a union only ever
+        // enlarges the painted region. That is backwards, and the review was right to catch it:
+        // `flash_px` counts erased pixels INSIDE THE NEW BOX, so a union that grows the painted
+        // region grows exactly the quantity `flash_px` is supposed to bound, while the recorded
+        // number stays 0. Under coalescing the record is not a floor, not a bound, and not wrong
+        // about what it measures — it measures what was HANDED OVER, and the painted flash is a
+        // different number that nothing here observes. `coalesced=` in the `[wc-k]` rollup is the
+        // signal that the two have diverged: near zero, the record is the painted extent; non-zero,
+        // it is only the request.
         let eparts = &parts[..nparts];
         erase(eparts);
         #[cfg(feature = "witness")]
@@ -2721,11 +2744,38 @@ pub fn composite() {
         // one pass and leaves. Nothing is dropped: `COMP_PENDING` stays set, `service_damage` is the
         // standing backstop, and any later present re-enters. This is the same "refuse to wait when
         // IRQs are masked" rule `cursor.rs` already follows (WEDGE-8).
+        //
+        // ### WC-K2r REVIEW CONDITION 1 — `any_damaged()` IS NO LONGER THE WHOLE QUESTION
+        //
+        // Both gates below consume `COMP_PENDING` and then decide whether the pass is worth running.
+        // Before WC-K2 the only thing a declined pass could owe was window damage, so `any_damaged()`
+        // was the complete test. It is not any more: a declined pass can also owe a DESKTOP FILL, and
+        // the two are independent. The stranding case is exact and it is the P61 ghost by a new
+        // route — a close of the LAST window, a `close_owner` on the last owner, a park or a zoom
+        // restore that jumps clear of every survivor. Nothing intersects the vacated box, so
+        // `any_damaged()` is false; the wakeup has already been swapped to false; and the queued fill
+        // is left with no core committed to draining it, on a desktop where no later present is
+        // coming. `close_owner` from `sched::exit` is worse still — it runs IRQ-masked, so it takes
+        // neither of these paths itself and depends entirely on whoever holds the gate.
+        //
+        // So the question both gates ask is now "is anything OWED", and a non-empty erase queue is
+        // owed. One relaxed load on a path that has just run a whole composite; `DEFER_N` is the flag
+        // `drain_deferred` already reads once per pass for exactly this "is anything owed" purpose.
         let masked = crate::arch::irqs_masked();
         let mut rounds = 0u32;
         while !masked && rounds < COMP_RERUN_MAX && COMP_PENDING.swap(false, AcqRel) {
-            if !any_damaged() {
+            let dmg = any_damaged();
+            let owed = deferred_owed();
+            if !dmg && !owed {
                 break; // the decliner's damage was already absorbed by the round above
+            }
+            // WC-K2r — a pass taken ONLY because the erase queue was non-empty. Counted because the
+            // fix has to be shown REACHABLE: a boot with `rescues=0` has never exercised the
+            // condition, and a boot with `rescues>0` is one where the pre-fix code dropped a desktop
+            // fill. Not forbidden — a rescue is the mechanism working.
+            #[cfg(feature = "witness")]
+            if !dmg && owed {
+                super::wcg::erase_wakeup_rescue();
             }
             rounds += 1;
             #[cfg(feature = "witness")]
@@ -2747,10 +2797,21 @@ pub fn composite() {
                 .compare_exchange(false, true, AcqRel, Relaxed)
                 .is_ok()
         {
-            if COMP_PENDING.swap(false, AcqRel) && any_damaged() {
-                #[cfg(feature = "witness")]
-                WCSER_RERUNS.fetch_add(1, Relaxed);
-                composite_once();
+            if COMP_PENDING.swap(false, AcqRel) {
+                let dmg = any_damaged();
+                let owed = deferred_owed();
+                if dmg || owed {
+                    // WC-K2r — same rescue count, same reason; this is the other gate that consumes
+                    // the wakeup, and a fix applied to only one of them would leave the defect on the
+                    // rarer path, which is the one a static desktop actually takes.
+                    #[cfg(feature = "witness")]
+                    if !dmg && owed {
+                        super::wcg::erase_wakeup_rescue();
+                    }
+                    #[cfg(feature = "witness")]
+                    WCSER_RERUNS.fetch_add(1, Relaxed);
+                    composite_once();
+                }
             }
             COMP_GATE.store(false, Release);
         }
@@ -2766,6 +2827,22 @@ pub fn composite() {
 fn any_damaged() -> bool {
     let t = table();
     t.rows.iter().any(|r| r.used && r.damaged)
+}
+
+/// WC-K2r — is a DESKTOP FILL owed? The other half of "is anything owed", and the half
+/// [`any_damaged`] structurally cannot see: the erase queue holds boxes that belong to no row, and
+/// the whole point of the stranding case is that no row intersects them.
+///
+/// One relaxed load, no lock. Deliberately reads the mirror rather than `DEFER.lock().1` — the same
+/// choice [`drain_deferred`] makes, and for the same reason: this runs on the hot path of every
+/// present, on every core.
+///
+/// Over-answering is safe and under-answering is not, which is the direction the mirror errs in: a
+/// box queued a moment after this load is answered by its own site's `composite()`, while a box
+/// missed here is a box nobody is coming back for.
+#[cfg(target_arch = "x86_64")]
+fn deferred_owed() -> bool {
+    DEFER_N.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
 fn composite_once() {
@@ -8476,8 +8553,12 @@ static MOVE_LAST_NPARTS: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// them". Nothing the leg asserts changes standing — `[wc-j] move-once` reads these statics AFTER
 /// its `move_to` has returned, i.e. after that composite, and confirms the sliver on the PANEL as
 /// well — but the two claims are no longer simultaneous and the doc must not pretend they are.
-/// The one divergence between queued and painted is `defer_erase`'s coalescing, which only ever
-/// enlarges the painted region, so `flash_px == 0` here remains a floor rather than an estimate.
+/// WC-K2r — and it does NOT bound the flash the panel showed. `flash_px` counts erased pixels inside
+/// the new box; `defer_erase`'s coalescing enlarges the painted region, which is precisely the
+/// quantity `flash_px` was bounding, while the recorded value stays 0. So under coalescing this
+/// record describes the REQUEST and not the paint, and `coalesced=` in the `[wc-k]` rollup is the
+/// signal that the two have parted company. Near zero — the boot's normal state, because every erase
+/// site composites in the same call — they are the same number.
 #[cfg(feature = "witness")]
 fn move_note_erase(
     id: WinId,
@@ -8922,10 +9003,29 @@ fn subtract_box(
 
 // ---- WC-L: the deferred-erase queue ------------------------------------------------------------
 
-/// Deferred erase boxes held at once. [`MAX_WINDOWS`] because the deferred set is bounded by the
-/// same thing every other erase set in this module is: the boxes a re-tile or a teardown can vacate
-/// in one operation is at most the live window count. Overflow is not dropped — it coalesces (see
-/// [`defer_erase`]) — so this is a fidelity bound, not a correctness one.
+/// Deferred erase boxes held at once. Overflow is not dropped — it coalesces (see [`defer_erase`]) —
+/// so this is a fidelity bound, not a correctness one.
+///
+/// **WC-K2r — the old rationale no longer holds and is replaced rather than patched.** WC-L sized
+/// this at [`MAX_WINDOWS`] because "the boxes a re-tile or a teardown can vacate in one operation is
+/// at most the live window count". A move now contributes up to FOUR boxes of its own
+/// ([`subtract_box`] partitions into at most four parts), so a single drag step can occupy half the
+/// queue and two undrained steps can fill it.
+///
+/// It is kept at [`MAX_WINDOWS`] anyway, and the argument is now about DRAIN RATE rather than about
+/// the largest single operation. Every erase site composites in the same call, and the drain runs at
+/// the head of every pass, so the queue's steady state is "what one operation queued, taken off by
+/// the pass that operation runs". Depth only accumulates when passes are DECLINED (x86 `COMP_GATE`)
+/// or the staging lock is held, and both are the transient, counted conditions WC-L already prices
+/// (`redefers=`, `coalesced=`). Growing the array to hide them would trade a counted symptom for an
+/// uncounted one; the honest instrument is `coalesced=`, and a boot where it is not near zero is
+/// telling the operator the drain is not keeping up.
+///
+/// What overflow costs in the new world is worth naming precisely, because it is not what it was: a
+/// coalesced union of two drag slivers is a band along the drag path, and that band CAN reach the
+/// window's current box — which the per-move subtraction was careful to exclude. The paint is still
+/// sound (the drain re-damages every window the enlarged box meets, and the same pass repaints it),
+/// but it is a one-pass flash of exactly the kind this arc removes. `coalesced=` is where that shows.
 const MAX_DEFER: usize = MAX_WINDOWS;
 
 /// Why a fill could not stage. These mirror `wcg`'s `DECL_*`, and the mirror is not duplication for
@@ -9080,6 +9180,23 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
     if DEFER_N.load(core::sync::atomic::Ordering::Relaxed) == 0 {
         return false;
     }
+    // WC-K2r REVIEW CONDITION 5 — NOT UNDER A RAISED PHASE BARRIER.
+    //
+    // `composite_inner` tests `DRAIN_PENDING` and aborts, but it does so at the table snapshot —
+    // which is AFTER this drain, because WC-L/CURSOR-5 deliberately put the drain ahead of both the
+    // cursor bracket and the snapshot. So without this guard a pass entering while some other core's
+    // vacate holds the barrier would publish that core's desktop fills and then abort before drawing
+    // a single window: the fill on the glass, the windows one pass later, for the barrier's whole
+    // width. That is precisely the two-event shape WC-K2 exists to delete, re-created by the one
+    // path that skips the composite it was supposed to travel with.
+    //
+    // Skipping costs nothing that is not already owed. The barrier holder is on its way to its own
+    // `composite()` (that is what every vacate site does after `drop(barrier)`), so the queue is
+    // drained by the pass the boxes belong to, which is the arc's whole claim. Read with `Acquire`,
+    // matching the `composite_inner` test it mirrors.
+    if DRAIN_PENDING.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        return false;
+    }
     // Probe the staging lock BEFORE emptying the queue or touching the sprite. A `None` here means
     // every box in the queue is about to re-defer, so the cheapest and least disruptive thing this
     // pass can do is nothing at all: leave the queue as it is (no requeue churn, no `redefers`
@@ -9162,6 +9279,29 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
             fb.flush_rect(x, y0, w, y1 - y0);
         }
         damage_intersecting(x, y, w, h);
+        // WC-K2r REVIEW CONDITION 6 — THE SPRITE'S NET, restored where it can be exact.
+        //
+        // `sprite_hit` above is computed from `sprite_box()`, a snapshot that can be one pointer
+        // report stale, and FLICKER-2 argued that degradation away on the grounds that "the mover's
+        // own `repaint` re-establishes it". Under WC-K2 that argument has a hole the size of a
+        // stationary pointer: the caller-side `cursor::repaint()` this arc removed used to be the
+        // thing that mended a sprite hole when the pointer STOPS inside a box that is about to be
+        // filled — no further motion, no mover's repaint, and a desktop-coloured bite out of the
+        // arrow until something else disturbs it.
+        //
+        // The net is the mechanism the module already has for exactly this question, and it is asked
+        // per box, at PAINT time, against the LIVE mirror rather than the snapshot:
+        // `note_present_over_sprite` is what every other painter calls when its rows may have landed
+        // on the arrow. `bracketed = sprite_hit` is the honest argument — a masked handback WAS taken
+        // for this box and the tail owes it a repaint, so it arms `TOUCHED_SINCE_DRAW` only; a box
+        // the snapshot said was clear and the live mirror says was not is UNBRACKETED, and arms
+        // `PRESENT_DIRTY`, which is the repair request. Two relaxed loads and a store per painted
+        // box, on a path that has just copied `h` rows.
+        if let Some(sb) = super::cursor::live_box_relaxed() {
+            if boxes_overlap(sb, (x, y, w, h)) {
+                super::cursor::note_present_over_sprite(sprite_hit);
+            }
+        }
         painted = true;
     }
     if painted {
