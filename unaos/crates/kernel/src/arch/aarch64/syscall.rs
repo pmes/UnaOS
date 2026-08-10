@@ -13816,6 +13816,13 @@ fn wcb_launcher(_demo_cpu: usize) {
     // restores SHELL_Z/FOCUS_ASID, repaints), so nothing after it sees a changed table.
     #[cfg(feature = "witness")]
     crate::video::wm::hittest_selftest();
+    // CTRLWIT: the control-cluster DECLINE witness, right after the hit-test battery — it is the
+    // same shape of fixture (mints synthetic rows, reaps them, restores the panel) and it must run
+    // after every per-window one-shot above has been claimed, or its three probe rows would burn
+    // latches the arc's real windows are owed. It re-pins its rows at scale 1 so its verdict is a
+    // property of the compositor and not of the panel it happens to be running on.
+    #[cfg(feature = "witness")]
+    crate::video::wm::ctrldecline_selftest();
     // PAPER: the kit texture's determinism fixture, LAST — it neither mints a window nor reads the
     // panel, so it perturbs nothing above it, and its only side effect is generating the one tile
     // (which emits the unconditional `[paper]` wire line naming the checksum the verdict asserts).

@@ -1243,3 +1243,40 @@ REQUIRE :: KNURL: .* paper=0x0df2b838251069dc ceramic=0x2c525bfdb49df67d unchang
 # ---    report at the operator's first Enter on a boot that lost nothing — an instrument
 # ---    manufacturing the fault it exists to detect.
 REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
+# --- CTRLWIT — a window that loses its control cluster says so on the wire ----------------------
+# ---    KNURL's 24-px discs moved `wm::controls`'s width floor 122 -> 158 px. A live ring-3 window
+# ---    with an outer box in [122,158) therefore stopped getting a close, a minimise and a zoom —
+# ---    silently: nothing on the panel said so, nothing on the wire said so, and the owning app had
+# ---    no way to ask. `wm.rs` now ARMS a per-window latch at that exact branch and speaks it from
+# ---    the end of the composite pass (`[wm] controls-declined win= owner= bw= floor=`), once per
+# ---    window per boot — the painter runs at frame rate, so a line per pass would be a flood.
+# ---    Ungated, on `wm::crispy_witness`'s precedent: the metal image carries no `witness` feature,
+# ---    and the metal capture is the artefact that matters.
+#
+# ---    ONE REQUIRE, and it is the FIXTURE's verdict rather than the diagnostic line, because the
+# ---    diagnostic line alone cannot distinguish "the witness works" from "some window happened to
+# ---    be narrow". `wm::ctrldecline_selftest` pins three rows at scale 1 (so the claim is a
+# ---    property of the compositor and not of the 640x480 panel `kernel8-test` happens to run on)
+# ---    and asserts five things that can each fail:
+# ---      * a row ONE pixel under the floor gets no cluster (`none=true`), and
+# ---      * it SPOKE, exactly once — `fired=1`, read off the module's EMISSION counter, so a latch
+# ---        that armed and never reached the wire scores 0 and reds this rule;
+# ---      * four further looks at the same row keep it at one (`rl=1`) — the rate limit;
+# ---      * a row exactly AT the floor keeps its cluster (`some=true`) — the control, without which
+# ---        a `controls` that had simply stopped answering `Some` would pass the first three;
+# ---      * kernel FURNITURE is suppressed WITHOUT a line (`furniture none=true silent=true`) —
+# ---        that decline is policy, not a defect, and a witness that cried wolf on it once per boot
+# ---        would be noise. The furniture row is pinned narrow too, so it would trip the width arm
+# ---        as well if the furniture arm were not reached first;
+# ---      * and that furniture row is REAPED (`reaped=true`). CLOSEISO makes `close_owner` refuse
+# ---        every kernel-band row, so the battery's teardown sweep is structurally blind to it and
+# ---        the leak guard could never have caught it leaking. The reap is asserted by id, against
+# ---        the table, which is the only place that can answer it.
+# ---    `fired=` and `rl=` are PER-SLOT emission deltas, not a global total: this boot's earlier
+# ---    fixtures mint 32x8 rows that decline legitimately, and a global counter would have let one
+# ---    of them inflate the delta and red a kernel that was behaving perfectly.
+# ---    Every number is pinned, so the fixture's own SKIP line (window table full) cannot satisfy
+# ---    this rule and neither can its FAIL — the values are what make it a gate rather than a
+# ---    presence check.
+REQUIRE :: WMCTRL: controls-declined — floor=158 under bw=157 none=true fired=1 rl=1 atfloor bw=158 some=true furniture none=true silent=true reaped=true :: PASS ::
+FORBID :: WMCTRL: .* :: FAIL ::
