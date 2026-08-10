@@ -249,13 +249,16 @@ and its reason are stated rather than quietly edited away.
     no lock to contend and no contention-drop path at all — the only loss left is the ring genuinely
     filling, derived from the monotonic claim counter. `termring` follows *that* rule, the lock-free
     one, not the one the old text described.
-* **A transport drop costs ORDER, not content.** `Console::println` stages through the ring and then
-  drains it, because on today's surfaces the producer runs *on* the consumer's task. If the ring
-  refuses a record, the console places the line directly in `history`, so an operator never loses
-  output; the record is still charged as `dropped`, because what the transport lost is real — that
-  line's FIFO position relative to records still in flight. Counting it keeps the ledger honest
-  about a transport that could not carry its offered traffic; the fallback keeps the panel complete
-  while it is.
+* **A transport drop costs neither content nor order.** `Console::println` drains the ring, stages
+  into it, and drains again, because on today's surfaces the producer runs *on* the consumer's task.
+  If the ring refuses a record the console places the line directly in `history` — and the LEADING
+  drain is what makes that safe: with the ring emptied first, the fallback line lands at the true
+  tail instead of jumping ahead of up to 64 older records still in flight. What the refusal costs is
+  then exactly one thing, the fact that the record did not travel by the transport, and that is what
+  the counted `dropped` charge says. A TRUNCATION is the injury with no fallback: that record did
+  travel and arrived short, its tail replaced by `TRUNCATION_MARK`. `service()` states the two
+  separately for that reason, because a message that credited the fallback for both would be false
+  about the torn half.
 * **The drain site.** `main.rs`'s `handle_key`, immediately after `dispatch_command` returns and
   immediately before the post-command `console.draw(pal)`: the first moment the render task owns the
   view again, which is the exclusive-drainer contract `LineRing::drain` requires. It runs
@@ -266,17 +269,27 @@ and its reason are stated rather than quietly edited away.
   now structural: the GUI channel carries *input* (`pal::Event`) toward the render task; `TERM_RING`
   carries *output* away from producers toward whoever renders the console. They are different types
   on purpose — the input channel may block a USB pump; the output transport may block nobody.
-* **Fan-out.** Still one consumer (the console view), still not a broadcast tree. When a second
-  arrives (a log sink, a `TerminalView`), the ring gains a small fixed subscriber array. Nothing in
-  the built shape forecloses that: `drain` is already a `FnMut(&str)` over whole records.
+* **Fan-out, and the precondition it must clear.** Still one consumer (the console view), still not
+  a broadcast tree; `drain` is already a `FnMut(&str)` over whole records, so nothing in the built
+  shape forecloses a second. But the exclusive-drainer contract is satisfied today by `&mut Console`,
+  and that borrow is **per-`Console` while `TERM_RING` is one global**. With one console the two
+  coincide. A second view holding its own `&mut Console` would drain records destined for the first,
+  and neither the borrow checker nor the ring would object — the output would simply appear on the
+  wrong screen. That is the concrete reason a second consumer needs the fixed subscriber array rather
+  than a second caller of `Console::drain_output`, and it is a precondition to check before adding
+  one, not a refactor to discover afterwards.
 * **The witness.** `termring::termring_selftest` (`witness`-gated, wired on the pi4 chain in
   `arch/aarch64/syscall.rs`, `REQUIRE`d by `scripts/specs/pi4-regression.spec`) parks the consumer,
   offers 80 records, and asserts four independently-failable properties: the bound and the refusal
   (exactly 64 accepted, 16 refused, 64 in flight); drop-NEWEST with order and byte round-trip (the
   survivors are sequences `0..64` — drop-OLDEST would return `16..80` and fail the first comparison);
-  truncation sealed with `TRUNCATION_MARK` and counted; and the conservation law over the whole
-  fixture. Every count is decoded onto the verdict line, so the gate cannot be satisfied by a leg
-  that merely printed.
+  truncation sealed with `TRUNCATION_MARK` and counted; a policy refusal charged as `suppressed`
+  rather than as loss; and the conservation law over the whole fixture, sampled while the hold is
+  still up so an attended keystroke cannot flake it red. Every count is decoded onto the verdict
+  line, so the gate cannot be satisfied by a leg that merely printed. The fixture does not rewind the
+  counters — its 16 drops and 1 tear really happened — but it does clear the ANNOUNCEMENT latch,
+  because those events are reported on its own line and a latch left armed would make `service()`
+  print a spurious loss report at the operator's first Enter on a boot with no real loss.
 
 ---
 

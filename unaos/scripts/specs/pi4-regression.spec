@@ -1149,9 +1149,16 @@ REQUIRE :: KNURL: .* paper=0x0df2b838251069dc ceramic=0x2c525bfdb49df67d unchang
 # ---         hand back 16..80 and fail the FIRST comparison);
 # ---      3. truncation is SEALED, not silent — an over-long record comes back <= 240 bytes ending
 # ---         in TRUNCATION_MARK, with the tear counted;
-# ---      4. the tap conservation law — submitted == absorbed + dropped + suppressed + in_flight.
+# ---      4. a policy refusal is NOT a loss — one record offered while the hold is up charges
+# ---         `suppressed` and leaves `dropped` alone (the one law term nothing else exercises);
+# ---      5. the tap conservation law — submitted == absorbed + dropped + suppressed + in_flight,
+# ---         sampled BEFORE the hold is released so an attended keystroke cannot flake it red.
 # ---    The verdict line carries every decoded count, so this rule cannot be satisfied by a leg
-# ---    that merely printed: the fixture emits PASS only when all four hold, and it has no SKIP
+# ---    that merely printed: the fixture emits PASS only when all five hold, and it has no SKIP
 # ---    arm (it is in-RAM — no panel, no disk, no card to be absent). A FAIL is caught by the
 # ---    battery's built-in `FAIL ::` FORBID.
+# ---    `latch_cleared=17` on the verdict line is the fixture disarming its OWN announcement latch
+# ---    (16 drops + 1 tear, all deliberate). Without it `termring::service` would print a loss
+# ---    report at the operator's first Enter on a boot that lost nothing — an instrument
+# ---    manufacturing the fault it exists to detect.
 REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::

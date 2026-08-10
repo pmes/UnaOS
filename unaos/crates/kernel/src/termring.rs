@@ -42,15 +42,20 @@
 //     deliberately NOT enrolled in `serial_ring::taps()`: that array is the census of taps on the
 //     SERIAL wire, and this ring is not one of them.
 //
-// ── Drop-newest costs ORDER here, not content ───────────────────────────────────────────────────
+// ── What a drop actually costs, and what it must not ────────────────────────────────────────────
 //
-// [`crate::console::Console::println`] stages through this ring and then drains it, because on the
-// surfaces that exist today the producer IS the consumer's task. When the ring refuses a record the
-// console falls back to pushing the line straight into `history`, so a transport drop never costs
-// the operator a line of output — it costs the ring's ORDERING guarantee for that line, and it is
-// counted as `dropped` regardless. Counting it is what keeps the ledger honest about a transport
-// that could not carry the traffic offered to it; the fallback is what keeps the panel correct while
-// it is.
+// [`crate::console::Console::println`] drains this ring, stages into it, and drains again, because
+// on the surfaces that exist today the producer IS the consumer's task. When the ring refuses a
+// record the console falls back to pushing the line straight into `history`. The leading drain is
+// what makes that fallback safe: with the ring emptied first, the fallback line lands at the true
+// tail instead of jumping ahead of up to [`TERM_SLOTS`] older records that were still in flight. So
+// a transport drop costs the operator neither content nor order — it costs only the fact that the
+// record did not travel by the transport, which is exactly what the counted `dropped` charge says.
+// Counting it keeps the ledger honest about a transport that could not carry its offered traffic;
+// the fallback keeps the panel correct while it is.
+//
+// A TRUNCATION is the injury with no fallback: that record travelled and arrived short, its tail
+// replaced by `serial_ring::TRUNCATION_MARK`. [`service`] states the two separately for that reason.
 //
 // ── Arch neutrality ─────────────────────────────────────────────────────────────────────────────
 //
@@ -70,10 +75,13 @@ use crate::serial_ring::{LineRing, Staged, TapCounters};
 pub const TERM_SLOTS: usize = 64;
 
 /// Bytes per record. Fixed and inline — no `alloc::String` — because producers include IRQ-masked
-/// contexts and contexts holding the print lock, where an allocation is not permitted. Comfortably
-/// wider than a panel row at any scale this kernel drives (1920 px at the scale-2 cell is 120 cells);
-/// a longer line is sealed with `serial_ring::TRUNCATION_MARK` and counted as a tear, never silently
-/// shortened.
+/// contexts and contexts holding the print lock, where an allocation is not permitted.
+///
+/// 240 is exactly one full row on both bench geometries, which is not a coincidence: `ui::Metrics`
+/// makes the cell scale with panel HEIGHT, so the Pi's 1920x1200 lands at scale 1 (cell 8 -> 240
+/// columns) and a 4K panel at 2160 rows lands at scale 2 (cell 16 -> 3840/16 = 240 columns). A wider
+/// panel than either would exceed it; such a line is sealed in place with
+/// `serial_ring::TRUNCATION_MARK` and counted as a tear, never silently shortened.
 pub const TERM_LINE: usize = 240;
 
 static TERM_RING: LineRing<TERM_SLOTS, TERM_LINE> = LineRing::new();
@@ -127,7 +135,11 @@ pub fn console_out_str(text: &str) -> bool {
 /// Emit every staged record, in order, into `emit`, and return how many.
 ///
 /// **Caller contract**, inherited from [`LineRing::drain`]: the caller must hold the view
-/// exclusively, which is what makes the drainer unique. Today that is `&mut Console`.
+/// exclusively, which is what makes the drainer unique. Today that is `&mut Console` — and note the
+/// gap that borrow does NOT close: it is per-`Console` while this ring is one global. With exactly
+/// one console the two coincide; a second view holding its own `&mut Console` would silently drain
+/// records meant for the first. Fan-out therefore needs the fixed subscriber array §3 describes, not
+/// a second caller of this function. That is a precondition to check before adding one.
 pub fn drain<F: FnMut(&str)>(emit: F) -> u64 {
     if HOLD.load(Ordering::Acquire) {
         return 0;
@@ -152,13 +164,18 @@ pub fn in_flight() -> u64 {
 /// Self-rate-limiting on `TapCounters::take_pending`: a ring that is not losing records prints
 /// nothing at all, and one that is prints once per burst rather than once per record. Call from an
 /// IF=1, unlocked, non-print context — it prints, and the drain site is exactly such a context.
+/// The two components it announces are different injuries and the wording must not blur them: a
+/// DROPPED record never travelled (the ring was full at `TERM_SLOTS`; the console's direct-push
+/// fallback still places the text, so what was lost is the transport's carriage of it, not the
+/// output), while a TRUNCATED record did travel and arrived SHORT — its tail is gone for good,
+/// replaced by `serial_ring::TRUNCATION_MARK`, and no fallback recovers it.
 pub fn service() {
     if TERM_TAP.take_pending() > 0 {
         serial_println!(
-            ":: termring: {} record(s) dropped, {} truncated since boot (transport full — {} slots x {} B; the console's direct-push fallback kept the text, the ring lost the ordering) == witness ::",
+            ":: termring: {} record(s) dropped (ring full at {} slots — the console placed the text directly, the transport did not carry it), {} truncated (over {} B, tail sealed and NOT recoverable) since boot == witness ::",
             TERM_TAP.dropped.load(Ordering::Relaxed),
-            TERM_TAP.torn.load(Ordering::Relaxed),
             TERM_SLOTS,
+            TERM_TAP.torn.load(Ordering::Relaxed),
             TERM_LINE,
         );
     }
@@ -211,14 +228,25 @@ fn fixture_line(i: usize, buf: &mut [u8; TERM_LINE]) -> usize {
 ///     sequence check; a mangled slot fails the byte check.
 ///  3. **Truncation is SEALED, not silent.** A record longer than [`TERM_LINE`] must come back at
 ///     most `TERM_LINE` bytes, ending in `serial_ring::TRUNCATION_MARK`, with the tear counted.
-///  4. **The conservation law.** `submitted == absorbed + dropped + suppressed + in_flight` over the
+///  4. **A policy refusal is not a loss.** One record offered through [`console_out`] while [`HOLD`]
+///     is up must charge `suppressed`, not `dropped`. That distinction is the whole reason
+///     `TapCounters` separates the two, and `suppressed` is the one term of the law below that
+///     nothing else in this fixture would exercise.
+///  5. **The conservation law.** `submitted == absorbed + dropped + suppressed + in_flight` over the
 ///     whole fixture. This is the property that catches an accounting hole rather than a mechanism
-///     one: any path that consumes a record without charging the ledger breaks it.
+///     one: any path that consumes a record without charging the ledger breaks it. Sampled BEFORE
+///     [`HOLD`] is released: after the release a keystroke on an attended boot can stage a record
+///     between the seven loads and make a healthy ledger read short, and `FAIL ::` is a built-in
+///     FORBID — a fixture that can go red for a reason unrelated to its property is worse than none.
 ///
-/// One-shot, in-RAM, and self-cleaning: it raises [`HOLD`] so no foreign line can enter, leaves the
-/// ring empty, and restores the counters' *invariants* (not their values — a ledger that could be
-/// rewound would not be a ledger). `pre=` on the verdict line reports anything it had to clear out
-/// before it started, so a nonzero is visible rather than absorbed into the result.
+/// One-shot and in-RAM. It raises [`HOLD`] so no foreign line can enter for its duration, and leaves
+/// the ring empty. It does NOT restore the counters — a ledger that could be rewound would not be a
+/// ledger, and the 16 drops and 1 tear below are real events that really happened. What it does
+/// clear is the ANNOUNCEMENT latch (`take_pending`), because those 17 events are the fixture's own
+/// and are already reported on this line: leaving the latch armed would make [`service`] print a
+/// "16 dropped, 1 truncated" loss report at the operator's first Enter on a boot with no real loss
+/// at all — an instrument manufacturing the fault it exists to detect. `pre=` reports anything the
+/// fixture had to clear out before it started, so a nonzero is visible rather than absorbed.
 #[cfg(feature = "witness")]
 pub fn termring_selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -288,15 +316,28 @@ pub fn termring_selftest() {
         && trunc_marked
         && TERM_TAP.torn.load(Ordering::Relaxed) == torn_before + 1;
 
-    HOLD.store(false, Ordering::Release);
+    // ── LEG 4: a policy refusal is charged as `suppressed`, not as loss ─────────────────────────
+    let sup_before = TERM_TAP.suppressed.load(Ordering::Relaxed);
+    let drop_before = TERM_TAP.dropped.load(Ordering::Relaxed);
+    let held_landed = console_out(format_args!("TR-HELD (must be declined, not lost)"));
+    let sup_ok = !held_landed
+        && TERM_TAP.suppressed.load(Ordering::Relaxed) == sup_before + 1
+        && TERM_TAP.dropped.load(Ordering::Relaxed) == drop_before
+        && in_flight() == 0;
 
-    // ── LEG 4: the conservation law ─────────────────────────────────────────────────────────────
+    // ── LEG 5: the conservation law, sampled while the ring is still held ───────────────────────
     let (sub, abs, stg, drp, sup, torn, inflt) = ledger();
     let law_ok = sub == abs + drp + sup + inflt;
 
-    let ok = bound_ok && order_ok && bytes_ok && drain_ok && trunc_ok && law_ok;
+    // The fixture's own 16 drops and 1 tear are reported on the verdict line below, so the
+    // announcement latch must not survive it into `service`. See this function's docs.
+    let announced = TERM_TAP.take_pending();
+
+    HOLD.store(false, Ordering::Release);
+
+    let ok = bound_ok && order_ok && bytes_ok && drain_ok && trunc_ok && sup_ok && law_ok;
     serial_println!(
-        ":: TERMRING: transport ring slots={} len={} pre={} offered={} accepted={} refused={} drained={} bound={} order={} bytes={} trunc={}(len={} sealed={}) law={} ledger[sub={} abs={} stg={} drp={} sup={} torn={} inflight={}] :: {} ::",
+        ":: TERMRING: transport ring slots={} len={} pre={} offered={} accepted={} refused={} drained={} bound={} order={} bytes={} trunc={}(len={} sealed={}) sup={} law={} latch_cleared={} ledger[sub={} abs={} stg={} drp={} sup={} torn={} inflight={}] :: {} ::",
         TERM_SLOTS,
         TERM_LINE,
         pre,
@@ -310,7 +351,9 @@ pub fn termring_selftest() {
         trunc_ok,
         trunc_len,
         trunc_marked,
+        sup_ok,
         law_ok,
+        announced,
         sub,
         abs,
         stg,
