@@ -705,11 +705,18 @@ perturb one byte of any image and run a plain `./arroyo check`.
 §4 in full, plus three things §4 did not say out loud:
 
 - **Halt the core before every upload, and prove the halt by readback.**
-  `CPUCTL` bit 4 is STOPPED; writing it requests a halt, reading it back
-  establishes one. Rewriting IMEM under a running falcon leaves it executing a
-  half-old, half-new program that goes on writing the very mailboxes the next
-  leg reads as its own result. The ECHO leg was doing exactly this and now halts
-  too.
+  `CPUCTL` bit 4 is STOPPED — §2.1 documents it as a **status** bit ("set when
+  the core is halted"), and *writing* it as a halt request is **DERIVED,
+  uncited**: no sitting has demonstrated the write-side behaviour, and the only
+  documented write to CPUCTL is bit 1 (START_TRIGGER). The readback is also
+  weak by construction — the rest value is `0x10`, so on a core already parked
+  the "proof of halt" passes trivially and is unproven in exactly the case
+  where it matters. It is kept as a gate because every image ends in `exit`
+  (which parks at `0x10` per s33boot2) so the gate's failure mode is a skipped
+  leg, not a lie — but a future sitting should cite or falsify the write-side
+  claim. Rewriting IMEM under a running falcon leaves it executing a half-old,
+  half-new program that goes on writing the very mailboxes the next leg reads
+  as its own result. The ECHO leg was doing exactly this and now halts too.
 - **Seed all four observables** (MAILBOX0, MAILBOX1, CC_SCRATCH[0],
   CC_SCRATCH[1]) before each launch, so "unchanged" keeps one meaning for every
   one of them.
@@ -737,6 +744,26 @@ other channel state and means nothing about this experiment; the leg prints
 `inst_off+0x0C` reproduces the canonical write **including `| 0x80000000`** — the
 pre-existing restore dropped that bit, so a "restored" instance block was never
 the one the channel was built with.
+
+Two more VOID arms sit ahead of the readback gate (adoption-review conditions):
+
+- **`took_host`** — the falcon-side readback travels through the DERIVED port
+  0x30000 twice, so on a wrong derivation `took=Y` proves only self-consistency.
+  The host's own read of `fb+0xC00` (§2-metal-proven) must carry the bit too;
+  `FENCE VOID (port unconfirmed)` otherwise, because a verdict measured on the
+  wrong register would be *believed* — err=2 is the expected answer.
+- **`held`** — the treatment is re-read at the moment of the stimulus
+  (`hold-recheck` line): between the ack and the channel write sit ~13 ms serial
+  lines and, on the ambiguous branch, a 134-read sweep, while poll2's budget is
+  tens of ms. A lapsed hold prints `FENCE VOID (hold lapsed)`.
+
+**Unwind is guaranteed host-side.** The falcon's `do_clear` is the polite path
+and timing can defeat it (giveup2 exits without clearing). On `cleared=N` the
+host writes `0` to `fb+0xC00` itself and prints `HOST-FORCED clear`. This is
+also the note the instrument-baseline law demands: on a FENCE boot, the
+downstream `bind-post ENGINE_STATUS=` and `witness pre-rewrite PFIFO_CHAN[1]=`
+lines read state FENCE touched (and then restored/cleared) rather than what the
+previous leg left — their baselines are FENCE-relative on such boots.
 
 The leg is placed after every ECHO observable is harvested and **before** the
 `0x409504` recon block, because the first access to that offset wedges every

@@ -688,6 +688,16 @@ pub mod ucode {
     /// different program is running" read exactly alike.
     pub const FENCE_MAGIC: u32 = 0xA55E_7A55;
 
+    /// The host's mailbox seed, hoisted here (review condition) so the three leg-local
+    /// `MB_SEED`s alias ONE value and the invariant below covers all of them.
+    pub const MB_SEED: u32 = 0xA5A5_0000;
+
+    // Review condition: the fail-closed property of the `took` gate rests on BOTH magics having
+    // CHAN_VALID's bit clear — a torn/stale MAILBOX0 read of either then yields took=N (VOID),
+    // never a false Y. That was true by luck of the hex; these make it load-bearing.
+    const _: () = assert!(FENCE_MAGIC & CHAN_VALID == 0);
+    const _: () = assert!(MB_SEED & CHAN_VALID == 0);
+
     /// Host→falcon commands on CC_SCRATCH[0].
     pub const CMD_FENCE_ASSERT: u32 = 1;
     pub const CMD_FENCE_CLEAR: u32 = 3;
@@ -1678,7 +1688,7 @@ pub fn init(gpu: &GpuInfo) {
                                         // Pull 34 R3-AMEND: the echo images now live at module scope
                                         // (byte listings + compile-time port/derivation asserts).
                                         use ucode::UCODE_CTX_ECHO_A;
-                                        const MB_SEED: u32 = 0xA5A5_0000;
+                                        const MB_SEED: u32 = ucode::MB_SEED;
                                         // IMEM page granularity: the code TLB marks a page usable only when the
                                         // last word of the 0x40-word page is written (nouveau pads for this reason).
                                         const IMEM_PAGE_WORDS: usize = 0x40;
@@ -2154,7 +2164,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     // ===========================================================
                                     {
                                         use ucode::UCODE_CTX_FENCE_A;
-                                        const MB_SEED: u32 = 0xA5A5_0000;
+                                        const MB_SEED: u32 = ucode::MB_SEED;
                                         const IMEM_PAGE_WORDS: usize = 0x40;
                                         // IMEMC control bits, named. Bit 24 auto-increments on
                                         // WRITES, bit 25 on READS; setting 24 and then reading back
@@ -2353,11 +2363,21 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                     // bit is actually set in ENGINE_STATUS.
                                                     let acked = ack != MB_SEED;
                                                     let took = (es_falcon & ucode::CHAN_VALID) != 0;
+                                                    // Review condition: the HOST-side read votes too. `es_falcon` travels
+                                                    // through the DERIVED port 0x30000 twice (the falcon iowr's it and
+                                                    // iord's it back) — if the derivation is wrong the falcon sets and
+                                                    // reads some OTHER register and `took=Y` proves only self-consistency.
+                                                    // `es_host` is the §2-metal-proven host-side ENGINE_STATUS at
+                                                    // fb+0xC00; the bit is real only if BOTH sides see it. `took` without
+                                                    // `took_host` is its own named class below, and the verdict is
+                                                    // withheld rather than printed on the wrong register.
+                                                    let took_host = (es_host & ucode::CHAN_VALID) != 0;
                                                     serial_println!(":: kepler: FENCE assert ack={:08X} iters={} phase={:08X} eng-status-per-falcon={:08X} eng-status-per-host={:08X} ::",
                                                         ack, ack_iters, phase, es_falcon, es_host);
-                                                    serial_println!(":: kepler: FENCE assert acked={} took={} class={} ::",
+                                                    serial_println!(":: kepler: FENCE assert acked={} took={} took_host={} class={} ::",
                                                         if acked { "Y" } else { "N" },
                                                         if took { "Y" } else { "N" },
+                                                        if took_host { "Y" } else { "N" },
                                                         classify_fecs_word(es_falcon));
 
                                                     // --- WHERE DID THE WRITE LAND? -----------------
@@ -2409,6 +2429,19 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                     // This is a VALIDATE, not a runlist submit; the
                                                     // submit (0x2270/0x2274) is downstream and is not
                                                     // reached or perturbed from here.
+                                                    // Review condition: THE HOLD IS RE-CHECKED AT THE STIMULUS. The
+                                                    // treatment was sampled at the ack, but between there and here sit
+                                                    // several ~13 ms serial lines and (on the ambiguous branch) a 134-read
+                                                    // sweep — while the falcon's poll2 budget is tens of ms. If poll2
+                                                    // expired, the falcon took giveup2 and exited without clearing, or
+                                                    // cleared and left; either way the bit's state NOW, not at the ack,
+                                                    // is what the channel write is measured against.
+                                                    let es_hold = fecs_read(bar0, fb + 0xC00);
+                                                    let phase_hold = fecs_read(bar0, fb + 0x044);
+                                                    let held = (es_hold & ucode::CHAN_VALID) != 0
+                                                        && phase_hold == ucode::PHASE_FENCE_ASSERTED as u32;
+                                                    serial_println!(":: kepler: FENCE hold-recheck eng-status={:08X} phase={:08X} held={} ::",
+                                                        es_hold, phase_hold, if held { "Y" } else { "N" });
                                                     unsafe {
                                                         core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32,
                                                             ((userd_off >> 32) as u32) | 0x80000000);
@@ -2445,6 +2478,13 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                             if acked { "Y" } else { "N" },
                                                             if took { "Y" } else { "N" },
                                                             err);
+                                                    } else if !took_host {
+                                                        // Review condition: same defect class as the bounce, one branch
+                                                        // over — a verdict printed on an experiment performed on the
+                                                        // wrong register would be believed BECAUSE err=2 is expected.
+                                                        serial_println!(":: kepler: FENCE VOID (port unconfirmed) — CHAN_VALID visible falcon-side only; host-side ENGINE_STATUS (fb+0xC00, metal-proven) does not carry it, so the derived port 0x30000 may not be ENGINE_STATUS and err={:08X} was measured against an assertion that never landed there; NO conclusion is drawn ::", err);
+                                                    } else if !held {
+                                                        serial_println!(":: kepler: FENCE VOID (hold lapsed) — the bit was set at the ack but not at the stimulus (poll2 likely expired between them); the channel was written against an unheld fence and err={:08X} is uninterpretable ::", err);
                                                     } else if !stuck {
                                                         serial_println!(":: kepler: FENCE VOID — VALID did not stick in PFIFO_CHAN[1]; err={:08X} is uninterpretable and NO conclusion is drawn ::", err);
                                                     } else if err == 0 {
@@ -2476,6 +2516,20 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                     let es_final = fecs_read(bar0, fb + 0xC00);
                                                     serial_println!(":: kepler: FENCE unwind eng-status={:08X} cleared={} ::",
                                                         es_final, if es_final == 0 { "Y" } else { "N" });
+                                                    // Review condition: FENCE may not leave ENGINE_STATUS perturbed for
+                                                    // the rest of the boot. The falcon's do_clear is the polite path and
+                                                    // TIMING CAN DEFEAT IT — poll2's budget is tens of ms and the host
+                                                    // spends 60-200 ms of serial and sweep before the CLEAR arrives, so
+                                                    // giveup2-without-clearing is the LIKELY path, not the corner. Two
+                                                    // downstream instruments read this register (bind-post ENGINE_STATUS
+                                                    // and the runlist submit's engine state); a host-side write is the
+                                                    // fallback timing cannot defeat.
+                                                    if es_final != 0 {
+                                                        fecs_write(bar0, fb + 0xC00, 0);
+                                                        let es_forced = fecs_read(bar0, fb + 0xC00);
+                                                        serial_println!(":: kepler: FENCE unwind HOST-FORCED clear eng-status={:08X} forced-cleared={} ::",
+                                                            es_forced, if es_forced == 0 { "Y" } else { "N" });
+                                                    }
 
                                                     // Park the core halted so the recon block below,
                                                     // and the next boot's rest values, read a quiet
@@ -2805,7 +2859,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                         let pbase = 0x409000usize;
                                         let img = &ucode::UCODE_CTX_POKE_A[..];
                                         const IMEM_PAGE_WORDS: usize = 0x40;
-                                        const MB_SEED: u32 = 0xA5A5_0000;
+                                        const MB_SEED: u32 = ucode::MB_SEED;
 
                                         // Halt the core if the echo leg left it running, and PROVE
                                         // the halt. This comment used to sit above the DMACTL clear
