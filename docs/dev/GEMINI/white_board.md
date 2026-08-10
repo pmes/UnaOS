@@ -51,6 +51,16 @@ follow the program source and writes stay on the (absent) default and refuse wit
 One ruling wanted: **reads follow the program source everywhere, writes refuse loudly on a
 read-only source** — say yes and it is a mechanical arc; say different and I brief it your way.
 
+## Q6 — WiFi: may the card carry the extracted b43 firmware blob?
+
+GR22 answered the authoring question — writing the D11 microcode ourselves is not tractable, and
+OpenFWWF does not cover this core. The bcma plumbing is audited end to end (wifis1–4a), so the
+only thing between here and an association attempt is the proprietary firmware blob, extracted
+b43-style and loaded from the card at boot. Nothing ships anywhere; it lives on your bench media
+only. **Yes** → three arcs: blob load + D11 core boot (witnessed), open-network auth/assoc, DHCP
+over the smolnet stack that already exists. **No** → WiFi parks honestly and nothing pretends
+otherwise.
+
 ## Q5 — Boot planning: four things want glass, two of them are flights.
 
 Never flown: the drag with sliver-erase (the flicker fix) · the 24 px knurled controls in the
