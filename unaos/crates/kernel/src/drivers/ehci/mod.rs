@@ -5097,15 +5097,20 @@ impl Controller {
             // consulted for ANY candidate. That is what makes the -97 dBm sighting connectable —
             // the floor is arm 3 and this `continue`s or falls through before it is ever read.
             if let Some(want) = BT_L3_PEER_ADDR {
-                if !bt_addr_eq(&d.addr, &want) {
-                    verdict[i] = BT_L3_V_ADDR_MISMATCH;
-                    continue;
-                }
-                // Bytes matched. The type is checked SEPARATELY from the bytes purely so this
-                // near-miss gets its own verdict; `bt_addr_matches` is the same conjunction and is
-                // what the fixture drives.
-                if d.atype != BT_L3_PEER_ADDR_TYPE {
-                    verdict[i] = BT_L3_V_ADDR_TYPE;
+                // THE VERDICT IS `bt_addr_matches` — the same call the fixture and the harness
+                // drive, not a re-spelling of it. Open-coding the conjunction here is how the
+                // radio path and six green fixture legs drift apart with no light coming on:
+                // lose or invert the type term and every leg stays green while the radio pages a
+                // colliding random address. `bt_addr_eq` is consulted only AFTER the shared rule
+                // has said no, to name WHICH near-miss this was.
+                if !bt_addr_matches(&d.addr, d.atype, &want, BT_L3_PEER_ADDR_TYPE) {
+                    verdict[i] = if !bt_addr_eq(&d.addr, &want) {
+                        BT_L3_V_ADDR_MISMATCH
+                    } else {
+                        // Bytes matched, type did not — a distinct verdict, because those six
+                        // bytes belonging to a DIFFERENT device deserves its own line.
+                        BT_L3_V_ADDR_TYPE
+                    };
                     continue;
                 }
             } else {
@@ -5327,7 +5332,7 @@ impl Controller {
                 serial_print!("{}", b as char);
             }
             serial_println!(
-                " type={} (white board Q14, Peter's ruling 2026-08-08: match his MEGABOOM by BD_ADDR). It DECIDES ALONE: the name filter and the RSSI floor are both bypassed for every candidate — which is deliberate, because this device was heard at -97dBm and would fail the {}dBm floor by 37dB. Matching is on the six bytes AS STORED (wire order, LSB first) plus the address type; the rendering above is the same MSB-first form every dev line uses, and the bt-l2 address fixture pins the two to each other. The scan stays PASSIVE — an address filter needs nothing a SCAN_REQ would buy == witness ::",
+                " type={} (white board Q14, Peter's ruling 2026-08-08: match his MEGABOOM by BD_ADDR). It DECIDES ALONE: the name filter and the RSSI floor are both bypassed for every candidate — which is deliberate, because this device was heard at -97dBm and would fail the {}dBm floor by 37dB. Matching is on the six bytes AS STORED (wire order, LSB first) plus the address type; the rendering above is the same MSB-first form every dev line uses, and the bt-l2 address fixture pins the two to each other. The scan stays PASSIVE — an address filter needs nothing a SCAN_REQ would buy. THE MATCH is what transmits nothing: a match arms HCI_LE_Create_Connection, which DOES page the peer, and its own witness lines below own that transmit == witness ::",
                 if BT_L3_PEER_ADDR_TYPE == 0x00 { "public" } else { "random" },
                 BT_L3_RSSI_FLOOR
             );
@@ -5342,6 +5347,19 @@ impl Controller {
                 self.idx, BT_L3_RSSI_FLOOR
             ),
         }
+        }
+        // Review conditions (btaddr adoption): the NOT SELECTED prose below must not claim more
+        // than the table can prove. This asks the one question the address filter makes cheap —
+        // did the target's six bytes appear AT ALL, connectable or not — because the selection
+        // loop above never reaches the address chain for a non-connectable sighting, and a
+        // capped table (`dropped > 0`) is a PREFIX of the room, not the room.
+        let mut target_seen = false;
+        if let Some(want) = BT_L3_PEER_ADDR {
+            for i in 0..ndev {
+                if bt_addr_eq(&devs[i].addr, &want) {
+                    target_seen = true;
+                }
+            }
         }
         match peer {
             Some((a, ty)) => serial_println!(
@@ -5375,6 +5393,16 @@ impl Controller {
                     considered, maybes,
                     if maybes > 0 && BT_L3_PEER_ADDR.is_none() {
                         "READ THIS BEFORE CONCLUDING THE DEVICE WAS ABSENT: a device advertised a SHORTENED Local Name that the target could still straddle. It was HEARD and deliberately NOT connected to, because a maybe is not a match. Its l3=MAYBE line above names it"
+                    } else if BT_L3_PEER_ADDR.is_some() && target_seen {
+                        // Review condition: this arm exists because without it the "not in the
+                        // room" text below would fire for a target that WAS heard — just never
+                        // connectably inside the window, the expected shape for a speaker
+                        // already connected to another host.
+                        "READ THIS BEFORE CONCLUDING THE DEVICE WAS ABSENT: the target's six bytes DID appear in the table — just never as a connectable ADV_IND inside the window (its l3= line above says which way: not-connectable, or an address-type mismatch, meaning those bytes belong to a DIFFERENT device). Presence without an ADV_IND is what a speaker already connected to another host looks like; it is NOT evidence the device is off"
+                    } else if BT_L3_PEER_ADDR.is_some() && dropped > 0 {
+                        // Review condition: a capped table is a prefix of the room — the target
+                        // may never have entered it, and no text below may claim it was absent.
+                        "the device table hit its cap and dropped report(s) — see the TRUNCATION line above. The list is a PREFIX of the room: the target may never have entered the table at all, so this zero is evidence about the CAP, not about the air"
                     } else if BT_L3_PEER_ADDR.is_some() && considered == 0 {
                         // THE READING THAT CHANGED. With the address rule armed there is no filter
                         // left that could have rejected the target quietly, so a zero here is a
@@ -5383,7 +5411,7 @@ impl Controller {
                         // nature, so with the speaker ON this is the expected shape of a MISS.
                         "considered=0 WITH THE ADDRESS RULE ARMED IS EVIDENCE ABOUT THE AIR, NOT ABOUT THE FILTER: no connectable advertiser of any address entered the table, so nothing was rejected — the 500ms window simply overlapped no advertisement. The target was last heard at -97dBm, at which range its reports are intermittent; the honest next step is another window, not a change to the filter"
                     } else if BT_L3_PEER_ADDR.is_some() {
-                        "the room was heard and the target was not in it: every device above carries its own address and an l3=SKIP:address-mismatch (or SKIP:address-type-mismatch, which means those six bytes belong to a DIFFERENT device). The ordinary reading is that the target is OFF or out of range"
+                        "the room was heard and the target was not in it: the table was not capped, the target's six bytes appear nowhere in it (connectable or otherwise), and every device above carries its own l3= verdict — address-mismatch for the connectable ones, not-connectable for the rest. The ordinary reading is that the target is OFF or out of range"
                     } else {
                         "The ordinary reading with a name filter armed is that the named device is OFF or OUT OF RANGE; the per-device l3= verdicts above say which of the two the room looked like"
                     }

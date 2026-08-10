@@ -413,8 +413,13 @@ pub fn bt_addr_case_passes(c: &BtAddrCase) -> bool {
 ///
 /// This is the leg that fails if `BT_L3_PEER_ADDR_BYTES` is ever rewritten MSB-first. It is
 /// deliberately separate from the match legs: those would still all pass with a consistently
-/// reversed constant (they compare it against itself) — only this one compares it against the
-/// OUTSIDE WORLD.
+/// reversed constant (they compare it against itself) — only this one pins BYTES to TEXT.
+///
+/// Scoped honestly (review condition): both constants were written by the same hand in the same
+/// commit, so this is a SELF-CONSISTENCY check, not an outside-world comparison. It catches the
+/// one failure mode it was built for — BYTES reversed alone — and cannot catch a wrong address;
+/// the tether to the world is Peter's host report quoted in both docblocks, which a reader must
+/// still check by eye.
 pub fn bt_addr_order_holds() -> bool {
     &bt_addr_render_msb(&BT_L3_PEER_ADDR_BYTES) == BT_L3_PEER_ADDR_TEXT
 }
