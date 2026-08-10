@@ -1110,9 +1110,13 @@ pub unsafe fn gmux_igd_switch() {
         // THE GATE VALIDATES AGAINST A SET OF NAMED CONSTANTS, AND THE UNWIND RESTORES THE MEMBER
         // IT VALIDATED. The two halves are one property and must be read together.
         //
-        // DDC and DISPLAY: strict DIS. Every pre-switch capture the tree records reads DDC=0x02 and
-        // DISP=0x03 — DIS is the only value ever observed for either, so there is no second
-        // legitimate member to admit, and admitting one on speculation would be inventing a state.
+        // DDC: strict DIS — every pre-switch capture reads DDC=0x02, so there is no second
+        // legitimate member to admit. READ_DISPLAY (`disp`): strict DIS — every recorded
+        // DISP=0x03 is THIS register. SWITCH_DISPLAY (`p_disp`) is printed but NOT gated (review
+        // condition): the earlier strict term conflated it with READ_DISPLAY — SWITCH_DISPLAY has
+        // never been captured on this machine — and it is not a restore value either (the unwind
+        // writes the constant DIS), so gating on it protected nothing and added one more way for
+        // the flight to refuse without answering.
         //
         // EXTERNAL: DIS *or* `GMUX_EXTERNAL_KEPLER_OWNED` (0x21). 0x21 is the Boot AK metal NORM —
         // what this machine actually reads when the firmware leaves the port Kepler-owned — which
@@ -1128,7 +1132,7 @@ pub unsafe fn gmux_igd_switch() {
         // forbids is pushing an UNVALIDATED live read; a value proven equal to one of two named
         // 8-bit constants is not an unvalidated read.
         let ext_ok = |v: u32| v == GMUX_EXTERNAL_DIS as u32 || v == GMUX_EXTERNAL_KEPLER_OWNED as u32;
-        if p_ddc != GMUX_DDC_DIS as u32 || p_disp != GMUX_DISPLAY_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32
+        if p_ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32
             || !ext_ok(p_ext) || !ext_ok(ext) {
             // Buffer the REFUSED print; the outer error handler will print it
             return Err(("pre-switch-not-accepted", 0));
@@ -1170,9 +1174,11 @@ pub unsafe fn gmux_igd_switch() {
         core::ptr::write_volatile((bar0 + regs::DPA_AUX_CH_DATA1) as *mut u32, !test_val);
 
         // Push order EXTERNAL, DISPLAY, DDC so the LIFO unwind restores DDC, DISPLAY, EXTERNAL —
-        // the reverse of the forward write order, matching upstream apple-gmux. EXTERNAL is
-        // restored to `p_ext`, the pre-image the gate above validated against the two-constant set;
-        // DDC and DISPLAY are restored to DIS because DIS is the only value their gate admits.
+        // the SAME order as the forward writes (review condition: an earlier comment called this
+        // "the reverse", which is false — upstream apple-gmux uses DDC→DISPLAY→EXTERNAL in both
+        // directions, and so does this). EXTERNAL is restored to `p_ext`, the pre-image the gate
+        // above validated against the two-constant set; DDC and DISPLAY are restored to DIS — for
+        // DDC the only value its gate admits, for DISPLAY the constant upstream restores.
         unwind.push_gmux(GMUX_SWITCH_EXTERNAL, p_ext as u8);
         unwind.push_gmux(GMUX_SWITCH_DISPLAY, GMUX_DISPLAY_DIS);
         unwind.push_gmux(GMUX_SWITCH_DDC, GMUX_DDC_DIS);
@@ -1188,9 +1194,11 @@ pub unsafe fn gmux_igd_switch() {
         serial_println!(":: igpu: [GMUX] Unwind stack gmux-dispatch=REACHED (Gmux restore path executed without faulting, not implying restore verified) ::");
 
         // Push order EXTERNAL, DISPLAY, DDC so the LIFO unwind restores DDC, DISPLAY, EXTERNAL —
-        // the reverse of the forward write order, matching upstream apple-gmux. EXTERNAL is
-        // restored to `p_ext`, the pre-image the gate above validated against the two-constant set;
-        // DDC and DISPLAY are restored to DIS because DIS is the only value their gate admits.
+        // the SAME order as the forward writes (review condition: an earlier comment called this
+        // "the reverse", which is false — upstream apple-gmux uses DDC→DISPLAY→EXTERNAL in both
+        // directions, and so does this). EXTERNAL is restored to `p_ext`, the pre-image the gate
+        // above validated against the two-constant set; DDC and DISPLAY are restored to DIS — for
+        // DDC the only value its gate admits, for DISPLAY the constant upstream restores.
         unwind.push_gmux(GMUX_SWITCH_EXTERNAL, p_ext as u8);
         unwind.push_gmux(GMUX_SWITCH_DISPLAY, GMUX_DISPLAY_DIS);
         unwind.push_gmux(GMUX_SWITCH_DDC, GMUX_DDC_DIS);
@@ -1221,7 +1229,14 @@ pub unsafe fn gmux_igd_switch() {
         mux_reads.1 = gmux_index_read(GMUX_SWITCH_DISPLAY);
         mux_reads.2 = gmux_index_read(GMUX_SWITCH_EXTERNAL);
 
-        if mux_reads.0 != GMUX_DDC_IGD as u32 || mux_reads.1 != GMUX_DISPLAY_IGD as u32 || mux_reads.2 != GMUX_EXTERNAL_IGD as u32 {
+        // Review condition: only DDC's read-back may abort the flight. SWITCH_DISPLAY and
+        // SWITCH_EXTERNAL have never been read back on this machine, and write-side switch ports
+        // that do not echo their value would fail this comparison on a switch that WORKED —
+        // blanking the panel and aborting before the first AUX transaction, the whole round spent
+        // and nothing learned. DDC's echo is metal-proven and stays strict; the other two are
+        // advisory (the [GMUX] witness prints all three), and the AUX/EDID rungs below are the
+        // actual test of whether the mux moved.
+        if mux_reads.0 != GMUX_DDC_IGD as u32 {
             return Err(("mux-switch-failed", 0));
         }
 
@@ -1296,7 +1311,7 @@ pub unsafe fn gmux_igd_switch() {
     if mux_touched {
         serial_println!(":: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD (panel BLANKED/FLICKERED) ::");
         if mux_reads.0 != GMUX_DDC_IGD as u32 || mux_reads.1 != GMUX_DISPLAY_IGD as u32 || mux_reads.2 != GMUX_EXTERNAL_IGD as u32 {
-            serial_println!(":: igpu: [GMUX] Switch verification failed: DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", mux_reads.0, mux_reads.1, mux_reads.2);
+            serial_println!(":: igpu: [GMUX] switch read-back mismatch (DDC is the only echo proven on this machine; DISP/EXT are advisory — see the AUX rungs for whether the mux moved): DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", mux_reads.0, mux_reads.1, mux_reads.2);
         }
         if let Some(pb) = pp_before {
             serial_println!(":: igpu: [AUX] PCH_PP_STATUS/CONTROL Before AUX: STATUS=0x{:08X} CONTROL=0x{:08X} ::", pb.1, pb.0);
@@ -1333,7 +1348,7 @@ pub unsafe fn gmux_igd_switch() {
     }
 
     // Read back to decide gmux= verdict. Only DDC is proven, others are TBV.
-    let gmux_verdict = if let (Some(intent_ddc), Some(intent_disp), Some(intent_ext), Some(intent_ext_status)) = (pre_ddc, pre_disp, pre_ext, pre_ext_status) {
+    let gmux_verdict = if let (Some(intent_ddc), Some(_intent_disp), Some(intent_ext), Some(intent_ext_status)) = (pre_ddc, pre_disp, pre_ext, pre_ext_status) {
         if mux_touched {
             let post_ddc = gmux_index_read(GMUX_SWITCH_DDC);
             let post_disp_target = gmux_index_read(GMUX_SWITCH_DISPLAY);
@@ -1344,9 +1359,15 @@ pub unsafe fn gmux_igd_switch() {
             // EXTERNAL is compared against the VALIDATED PRE-IMAGE, not against DIS. On a
             // Kepler-owned machine the correct restore lands 0x21, and comparing that to DIS would
             // report FAILED for a restore that was exactly right.
+            //
+            // Review condition: the verdict rests ONLY on registers proven readable on this
+            // machine — DDC's echo and the two READ_* status ports. SWITCH_DISPLAY and
+            // SWITCH_EXTERNAL read-backs are printed as TBV but do not vote: a write-side port
+            // that does not echo would otherwise flip a correct restore to FAILED, and the
+            // RUNBOOK's FAILED row tells the operator to power-cycle a healthy machine.
             let verdict = if post_ddc == intent_ddc
-                && post_disp_target == intent_disp && post_disp_status == GMUX_DISPLAY_DIS as u32
-                && post_ext_target == intent_ext && post_ext_status == intent_ext_status
+                && post_disp_status == GMUX_DISPLAY_DIS as u32
+                && post_ext_status == intent_ext_status
                 && revert_ok {
                 "MATCH"
             } else {

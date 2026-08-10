@@ -693,7 +693,7 @@ clock out of memory.**
 
 Current wiring, verified in-tree:
 - `Cargo.toml:37` — `gmux_igd = []`; `:27` — `intel-ivb = []`; `:28` — `unaos_ivb = ["unaos-boot-info/unaos_ivb"]`.
-- `arroyo:249` — `UNAOS_GMUX_IGD=1` → `gmux_igd`; `builder/src/main.rs:173` — same.
+- `arroyo:397` — `UNAOS_GMUX_IGD=1` → `gmux_igd`; `builder/src/main.rs:254` — same.
 - `pci.rs:641` — the switch call is `#[cfg(all(feature = "gmux_igd", feature = "intel-ivb"))]`.
 - **`unaos_ivb` is a cross-crate feature**: `BootInfo`'s `igpu_trace_*` / `gmux_trace_0` /
   `kdisp_trace_*` fields are `#[cfg(feature = "unaos_ivb")]` (`boot-info/src/lib.rs:84-97`), so

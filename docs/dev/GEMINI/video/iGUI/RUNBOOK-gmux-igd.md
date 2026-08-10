@@ -26,20 +26,31 @@ After the sitting: re-flash the stick with a normal build, or pull it out and la
 2. The gmux protocol check runs. If it reports `PROTOCOL UNPROVEN`, **nothing is
    written** and the boot continues — that is a valid, safe outcome.
 3. On `PROTOCOL PROVEN`, the pre-switch mux state is read and saved.
-4. **Flight 1b Specific:** We run the Unwind Stack self-test. If it fails, we abort.
-5. The mux is switched to the integrated GPU **for DISPLAY, EXTERNAL, and DDC** (`GMUX_DISPLAY_IGD`, `GMUX_EXTERNAL_IGD`, `GMUX_DDC_IGD`).
-6. **THE PANEL WILL BLANK OR FLICKER.** We are moving the DISPLAY mux to route the AUX channel. This is an expected, by-design blanking window.
-7. We inherit the AUX clock divider, read DPCD, and read the 128-byte EDID over the I2C-over-AUX protocol.
-8. The EDID hex dump is printed to serial — **after** the restore, not during the dark window.
+4. **Flight 1b Specific:** We run the Unwind Stack self-test. If it fails, we abort. The
+   self-test writes the pre-state values back into all three SWITCH ports — nothing moves
+   value-wise, but if the gmux re-runs its switch sequence on any write, a brief flicker
+   HERE (before the dark window) is possible and is not a failure.
+5. **The pre-switch positive control:** a DPCD read is attempted with the mux still on the
+   discrete GPU (up to ~2 s). If it ANSWERS, AUX already reaches the panel without any
+   switch — that line alone is the headline result (see the table below).
+6. The mux is switched to the integrated GPU **for DISPLAY, EXTERNAL, and DDC** (`GMUX_DISPLAY_IGD`, `GMUX_EXTERNAL_IGD`, `GMUX_DDC_IGD`).
+7. **THE PANEL WILL BLANK OR FLICKER.** We are moving the DISPLAY mux to route the AUX channel. This is an expected, by-design blanking window.
+8. We inherit the AUX clock divider, read DPCD, and read the 128-byte EDID over the I2C-over-AUX protocol.
+9. The EDID hex dump is printed to serial — **after** the restore, not during the dark window.
    Nothing at all is printed between the first gmux write and the restore; every result is
    buffered so that a failure leaves a readable capture instead of a hang behind a black screen.
-9. The `DisplayUnwind` stack forcefully restores the muxes from CONSTANTS, LIFO: `DDC`, then
-   `DISPLAY`, then `EXTERNAL` — the reverse of the forward write order, matching upstream
-   `apple-gmux`. It never re-reads the live mux to decide what to write back: a timed-out gmux
-   read returns `0xFFFFFFFF`, which truncates to `0xFF` and would leave a dark panel.
-10. Boot continues into xHCI enumeration and the GUI.
+10. The `DisplayUnwind` stack forcefully restores the muxes LIFO: `DDC`, then `DISPLAY`, then
+   `EXTERNAL` — the SAME order as the forward writes (upstream `apple-gmux` uses
+   DDC→DISPLAY→EXTERNAL in both directions). `DDC` and `DISPLAY` are restored to the DIS
+   constants; `EXTERNAL` is restored to **the validated pre-image it found** (0x21 on a
+   Kepler-owned boot), never a blanket constant. It never re-reads the live mux to decide
+   what to write back: a timed-out gmux read returns `0xFFFFFFFF`, which truncates to `0xFF`
+   and would leave a dark panel.
+11. Boot continues into xHCI enumeration and the GUI.
 
-Total added time: minimal. If the panel goes dark and stays dark, treat it as the failure case below.
+Total added time: up to ~2 s for the pre-switch control (only if it times out) plus a dark
+window bounded at ~2.5 s worst case — observed 2.4–2.5 s. If the panel goes dark and STAYS
+dark past 5 s, treat it as the failure case below.
 
 ---
 
@@ -110,8 +121,11 @@ validated**, never a blanket DIS: forcing a Kepler-owned port to DIS is not a re
 silent state change. `sw_ext_state=` / `ext_state=` on the pre-switch line name which one was
 found, and the `EXTERNAL restored to ...` line after the revert names which one was written back.
 
-`DDC` and `DISPLAY` stay strict DIS — every capture the tree records reads `DDC=0x02 DISP=0x03`,
-so there is no second legitimate value to admit for either.
+`DDC` stays strict DIS (`DDC=0x02` in every capture), and so does `READ_DISPLAY` (`DISP=0x03` —
+every recorded `DISP=0x03` is the READ register, 0x11). `SWITCH_DISPLAY` (`SW_DISP=`) is printed
+but NOT gated: it has never been captured on this machine, it is not a restore value (the unwind
+writes the DIS constant), and gating on it only added a way for the flight to refuse without
+answering.
 
 Anything outside the accepted set — including the `0xFFFFFFFF` gmux-timeout sentinel, which is
 neither constant — REFUSES with `why=pre-switch-not-accepted` **before any mux is touched**: panel
@@ -131,9 +145,15 @@ state` line together name the value that blocked it.
 :: igpu: [AUX] EDID Dump
 :: igpu: [AUX] 00: 00 FF FF FF FF FF FF 00 ...
 ...
-:: igpu: [GMUX] revert read-back: DDC=0x02 SWITCH_DISP=0x03 READ_DISP=0x03 SWITCH_EXT=0x03 READ_EXT=0x03 (TBV)
-:: igpu-dpy: LADDER highest=05/10 name=end ok=1 pending=1 gmux=MATCH why=none elapsed_ms=...
+:: igpu: [GMUX] revert read-back: DDC=0x02 SWITCH_DISP=0x03 READ_DISP=0x03 SWITCH_EXT=0x21 READ_EXT=0x21 (TBV)
+:: igpu-dpy: LADDER highest=05/10 name=end ok=1 pending=3 gmux=MATCH why=none elapsed_ms=...
 ```
+
+(On this Kepler-owned machine the EXTERNAL pair reads back `0x21`, matching the pre-switch line
+above — `0x03` would only appear on a fully-DIS machine. `pending=3` is the three gmux restore
+entries the run leaves accounted; it is the expected value, not a leak. The `SWITCH_*` values in
+the read-back are TBV — write-side ports have no proven echo on this machine, so only `DDC` and
+the two `READ_*` ports vote in `gmux=`.)
 
 | Line you see | What it means | What to do |
 |---|---|---|
@@ -147,7 +167,7 @@ state` line together name the value that blocked it.
 | `why=aux-short-read` | **KNOWN AND ACCEPTED — not a defect.** A legal partial I2C reply; upstream i915 clamps here instead of erroring. Seeing it is itself proof that AUX *answered*. | Nothing. Record the line. |
 | `REFUSED: aux_ctl=... SEND_BUSY is set at boot` | AUX channel busy. **No write was issued**. `bdsm`/`ggc`/`ggtt0`/`ggtt1` show if memory is mapped; `frmcnt` shows if the pipe is running. | Safe. Power cycle and try again. |
 | `REFUSED: aux_ctl=... clock divider is 0` | AUX clock missing. **No write was issued**. `bdsm`/`ggc`/`ggtt0`/`ggtt1` show if memory is mapped; `frmcnt` shows if the pipe is running. | Safe. Power cycle and try again. |
-| `LADDER ... gmux=FAILED` | The mux was **not proven** back. | Power cycle. Report the whole `[GMUX]` block. |
+| `LADDER ... gmux=FAILED` | The mux was **not proven** back. The verdict votes only on `DDC` and the two `READ_*` status ports. | Before treating it as real: cross-check `READ_DISP`/`READ_EXT` on the `revert read-back` line against the `pre-switch state` line — if they match the pre-state, the restore very likely worked and one register misread. Then power cycle regardless, and report the whole `[GMUX]` block. |
 | `LADDER ... gmux=UNTOUCHED` | The harness aborted before switching the mux; the DDC channel was never moved to the IGD. | Safe. Power cycle if needed or pull stick. |
 | No `[GMUX]` lines at all on an armed build | The probe never reached the arm, or the build was not actually armed. | Check the boot banner really ends `...,unaos_ivb,gmux_igd`. |
 

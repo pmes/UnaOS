@@ -247,8 +247,9 @@ fn main() {
     // unaos_ivb rides the same knob: it adds the teardown-trace fields to the SHARED BootInfo
     // struct, so kernel and bootloader must agree on it (see the bootloader build below).
     if std::env::var("UNAOS_IVB").is_ok() { feats.push("intel-ivb"); feats.push("unaos_ivb"); }
-    // GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the integrated GPU + timed
-    // auto-revert. Kept in sync with arroyo's mapping — the builder rebuilds the kernel, so a knob
+    // GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the integrated GPU with an
+    // unwind-stack restore on the same call stack (round 13 removed the timed auto-revert).
+    // Kept in sync with arroyo's mapping — the builder rebuilds the kernel, so a knob
     // armed in arroyo but missing HERE ships the feature DISABLED while every log line claims it is
     // on. That failure mode has already cost this project weeks on the kepler and igpu lanes.
     if std::env::var("UNAOS_GMUX_IGD").is_ok() { feats.push("gmux_igd"); }

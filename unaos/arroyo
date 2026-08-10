@@ -388,8 +388,9 @@ _feats=""
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
-# GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the INTEGRATED GPU plus its timed
-# auto-revert (drivers/gpu/igpu.rs). ⛔ SINGLE-USE TEST MEDIA — the knob is baked into the image and
+# GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the INTEGRATED GPU with an unwind-stack
+# restore on the same call stack — no dwell, no timer (drivers/gpu/igpu.rs; round 13 removed the
+# timed auto-revert). ⛔ SINGLE-USE TEST MEDIA — the knob is baked into the image and
 # nothing guards it across boots, so every boot from that stick switches the mux again. Re-flash
 # after the sitting. Without this line the feature exists in Cargo.toml but no gate can reach it:
 # `./arroyo check` type-checked only the DISARMED build, so "gate green" said nothing about the
