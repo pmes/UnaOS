@@ -1985,6 +1985,87 @@ activity while `reloads` stays at 0 means the dispatch site is not consulting it
    reachable in practice — the compositor task is explicitly placed, hence pinned — and
    weakening either would retire a real falsifier.
 
+### The corrector that could not see the packing (x86_64, VUGSPREAD)
+
+**Symptom, Boot AS.** A vug held `[wpace] win=1 pres=96 paced=0 slept=0ms rate=19.1/s`
+for the whole capture — every present already late, never reaching the pacer's sleep —
+while the desktop on `win=0` held a clean `60.0/s` on the same wire. Present syscalls
+were not the cost (`[wc-h] maxpresent_us=4775` against a ~52 ms frame). The CPU-pulse
+census read `c0 busy/idle=61455/249 -> 99%`, `c5 -> 99%`, and `c3`/`c4` at exactly
+`0/250`: two cores pegged, two cores never dispatching a thing. And the corrective half
+of SMPBAL-X86 read `steal=1/4574483` — **one migration in four and a half million idle
+passes, over ten minutes, on a visibly lopsided machine.**
+
+**Three defects, all convicted from the source before the next boot.**
+
+1. **A ring-3 thread's core was treated as a pin.** `spawn_user_thread` set
+   `steal_ok = target_cpu == CPU_AUTO`, and its own comment observed — without alarm —
+   that `sys_thread_spawn` always names a core, so `steal_ok` was *always* false. The pin
+   contract exists so that render / input / usb-pump / fixtures, which name a core because
+   the core is part of their correctness, never migrate. A `SYS_THREAD_SPAWN` core is not
+   that: ring 3 passes `place ∈ {0 = my core, 1 = a sibling}`, a locality *hint* in the only
+   vocabulary the syscall has. Promoting it to a kernel guarantee made the parent process
+   movable and its own threads immovable, which was never a considered position. A vug is a
+   parent plus two workers and asks for one worker at `place=0` — so parent and worker
+   shared one core **by request, permanently, with nothing in the system able to undo it.**
+2. **"A sibling" meant "the same sibling, every time."** `sibling_online_cpu` returned the
+   first core matching its probe, in index order, with no reference to load. Every `place=1`
+   thread on the machine landed on the same low-numbered core.
+3. **The steal floor counted the wrong population.** `STEAL_MIN_DEPTH = 2` was justified as
+   "a core with one task is not loaded" — a true sentence attached to the wrong quantity. A
+   run queue holds only READY tasks; the executing one lives in `SCHED[cpu].current`. So a
+   floor of 2 *on the queue* means three runnable tasks before a core counts as loaded, and
+   the 2-on-1 packing sits at queue depth **one**. It was not missed by the corrector; it
+   was below the corrector's floor by construction.
+
+**The repairs, all in `arch/x86_64/sched.rs`.** A ring-3 thread is steal-eligible, full
+stop — it starts exactly where `sys_thread_spawn` asked and an idle core may correct it
+later, which is this arch's whole stated model. `sibling_online_cpu` now chooses among the
+eligible cores with `pick_cpu`'s key chain (shallowest queue, then lowest rolling busy
+percent, then the shared rotating cursor), deprioritising render/service in a two-step
+ladder rather than excluding them — excluding them outright would reintroduce the silent
+`bg_place_cpu` hang its probe exists to prevent. And the floor is asked of the *victim*:
+depth 1 suffices when the victim is running something (that is two runnable tasks), while a
+victim at `PRIO_IDLE` keeps the floor of 2, because that core is between tasks and about to
+dispatch the very task a thief would take — which is the ping-pong the constant was
+actually reaching for. The eligibility probe, the pin contract for named *kernel* spawns,
+the one-task-per-idle-pass rate bound and the `AS_GEN` TLB discharge are all unchanged.
+
+**`[spread]` — the placement witness.** One line, emitted from `emit_load_witness` so it
+rides that instrument's existing rate limit and adds no clock:
+
+```text
+[spread] pack=1 spare=3 rqp=[0/0/0,1/0/0,--,1/1/1,…] steal=4/812331 remig=0 decl=t:0 e:812327 f:0 p:0 d:0
+```
+
+`rqp` is `running/ready/pinned` per core (`--` for a core that never entered `run()` — not
+an idle core, and the distinction is the same one `[schedx86] load` draws between a measured
+zero and an absent measurement). `pack` counts dispatching cores carrying `running + ready
+>= 2`; `spare` counts dispatching cores with nothing at all. **`pack >= 1` together with
+`spare >= 1` is the defect.** `decl=` breaks declined steals into disjoint reasons — thief
+excluded / nothing ready anywhere / below floor / all pinned / drained under the lock — and
+`e + f + p + d + moves == passes` is checkable on the wire, so a path added without a counter
+shows up as arithmetic that does not close rather than as a quiet gap. `remig` counts steals
+of a task that had already migrated: without it, "moves went up" is not evidence of anything.
+
+Each candidate mechanism was given a distinct signature *before* the code was written, and
+one of the rows is a refutation of the whole arc:
+
+| next boot shows | reading |
+| --- | --- |
+| `pack=0` at every sample while a window sits at 19 fps | placement is **not** the cause; the frame time is elsewhere |
+| `pack>=1`, `spare>=1`, packed core's `pinned` > 0 | the pin contract held the packing — repair (1) is the one that mattered |
+| `pack>=1`, `spare>=1`, `pinned=0`, `decl f:` climbing | the floor hid it — repair (3) is the one that mattered |
+| `pack>=1`, `spare>=1`, `decl e:` climbing alone | the packed core's queue is empty at every peek — not a run-queue phenomenon, and no repair here can touch it |
+| `moves` climbing with `remig` climbing beside it | a latch traded for churn — revert the floor, keep the pin fix |
+| `pack -> 0`, `moves` a handful then flat, `remig 0` | fixed, and settled rather than oscillating |
+
+**QEMU cannot gate this.** The behaviour is a function of core count, real dispatch timing
+and a frame-paced ring-3 fleet; `kernel8-test` is aarch64 and does not compile this file at
+all. The x86 legs prove the code type-checks and the witness is bounded; the placement
+behaviour itself is metal-only, and is stated so rather than dressed in a gate that cannot
+fail.
+
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
 **SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.
