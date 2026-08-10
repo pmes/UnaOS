@@ -37,17 +37,17 @@ pub extern "C" fn _start() -> ! {
     naked_asm!(
         "mov  x23, xzr",              // witness bitmask = 0
         // (0) SYS_OPEN K2PRIV.BIN, mode 3 = RW | O_CREAT, O_PUBLIC CLEAR -> PRIVATE (this program owns it)
-        "mov  x8, #11",               // SYS_OPEN
+        "mov  x8, #{sys_open}",       // SYS_OPEN
         "adr  x0, 0f",                // name = "K2PRIV.BIN" (PC-relative EL0 VA)
         "mov  x1, #(1f - 0f)",        // name length
-        "mov  x2, #3",                // O_CREAT | RW, private
+        "mov  x2, #{o_create_rw}",    // O_CREAT | RW, private
         "svc  #0",
         "mov  x19, x0",               // x19 = handle (>=0) or -errno
         "tbnz x19, #63, 8f",          // a negative return (denied/error) -> report the partial witness
         "add  x23, x23, #1",          // bit0: open admitted (created-and-owned, or re-admitted by name)
         // (1) SYS_WRITE 16 bytes -> grow-from-empty on the create; in-place owner write on a re-open
         "adr  x1, 2f",                // buf = the 16-byte pattern
-        "mov  x8, #1",                // SYS_WRITE
+        "mov  x8, #{sys_write}",      // SYS_WRITE
         "mov  x0, x19",               // fd = handle
         "mov  x2, #16",               // len = 16
         "svc  #0",
@@ -56,10 +56,10 @@ pub extern "C" fn _start() -> ! {
         "add  x23, x23, #2",          // bit1: owner write OK
         "8:",
         "mov  x0, x23",               // SYS_REPORT(final witness) -> the launcher reads K2_OWN_WITNESS
-        "mov  x8, #3",
+        "mov  x8, #{sys_report}",
         "svc  #0",
-        "mov  x8, #2",                // SYS_EXIT(K2_EXIT_STATUS) -> EL0_K2_DONE
-        "movz x0, #0x82",
+        "mov  x8, #{sys_exit}",       // SYS_EXIT(EXIT_STATUS_K2) -> EL0_K2_DONE
+        "movz x0, #{k2_status}",
         "svc  #0",
         "9: b 9b",                    // sys_exit never returns; belt-and-braces guard
         ".balign 4",
@@ -67,6 +67,14 @@ pub extern "C" fn _start() -> ! {
         "1:",
         ".balign 8",
         "2: .ascii \"K2-OWNED-SECRET!\"", // exactly 16 bytes — the owner's pattern
+        // ABIFREEZE: `const` operands out of `una_abi` — the one declaration of the table, shared
+        // with the kernel arm that dispatches these numbers and matches this exit status.
+        sys_open = const una_abi::SYS_OPEN,
+        sys_write = const una_abi::SYS_WRITE,
+        sys_report = const una_abi::SYS_REPORT,
+        sys_exit = const una_abi::SYS_EXIT,
+        o_create_rw = const (una_abi::O_CREAT | una_abi::O_RW),
+        k2_status = const una_abi::EXIT_STATUS_K2,
     );
 }
 

@@ -66,12 +66,9 @@
 //            rcx (the saved RIP) and r11 (the saved RFLAGS), so both are declared clobbered — omitting
 //            them would let the compiler keep a live value in a register the CPU is about to destroy.
 // ---------------------------------------------------------------------------------------------
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
-const SYS_SLEEP_MS: u64 = 5;
-const SYS_GETINFO: u64 = 7;
-const SYS_WIN_CREATE: u64 = 29;
-const SYS_WIN_PRESENT: u64 = 30;
+// ABIFREEZE: the numbers are IMPORTED, not re-typed. This block used to be six local `const`s that
+// nothing compared against the kernel's — see `una_abi`'s divergence ledger for what that cost.
+use una_abi::{SYS_EXIT, SYS_GETINFO, SYS_SLEEP_MS, SYS_WIN_CREATE, SYS_WIN_PRESENT, SYS_WRITE};
 
 // WITSWEEP — REGISTER-SURVIVAL INVARIANT (sys1..sys3): the `in("x1")`/`in("x2")`/`in("x8")`
 // constraints below PROMISE the compiler those registers survive the `svc`. That is sound today only

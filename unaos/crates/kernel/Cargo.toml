@@ -946,6 +946,11 @@ linked_list_allocator = "0.10.6"
 font8x8 = { version = "0.3.1", default-features = false }
 cfg-if = "1.0.0"
 unaos-boot-info = { path = "../boot-info" }
+# ABIFREEZE: the syscall ABI, declared exactly once. `arch/x86_64/syscall.rs` and
+# `arch/aarch64/syscall.rs` both `use` their numbers/flags/layouts from here instead of
+# re-declaring them, and so does every `user-*` crate — so a number cannot mean two things
+# at once. no_std, no dependencies, nothing but `const`. See crates/una-abi/src/lib.rs.
+una-abi = { path = "../una-abi" }
 # MIDDEN-M1: the shell core. `unaos/libs/sys/midden_core` is the ONE command
 # table / parser / bare-name resolver, shared with the Ring 3 `midden` handler —
 # same convention as `libs/fs/unafs` and `libs/sys/helm`: a root-workspace

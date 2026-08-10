@@ -29,25 +29,32 @@ pub extern "C" fn _start() -> ! {
     naked_asm!(
         "mov  x23, xzr",              // witness bitmask = 0
         // (0) SYS_OPEN K2PRIV.BIN RO (mode 0, no O_CREAT) -> the owned file exists; a non-owner is denied
-        "mov  x8, #11",               // SYS_OPEN
+        "mov  x8, #{sys_open}",       // SYS_OPEN
         "adr  x0, 0f",                // name = "K2PRIV.BIN"
         "mov  x1, #(1f - 0f)",        // name length
         "mov  x2, #0",                // RO, no O_CREAT
         "svc  #0",
-        "cmn  x0, #13",               // x0 == -13 (-EACCES)?  the impostor MUST be denied by name
+        "cmn  x0, #{eacces}",         // x0 == -EACCES?  the impostor MUST be denied by name
         "b.ne 8f",
         "add  x23, x23, #1",          // bit0: non-owner open denied (-EACCES) — the deny half is REAL
         "8:",
         "mov  x0, x23",               // SYS_REPORT(final witness) -> the launcher reads K2_IMP_WITNESS
-        "mov  x8, #3",
+        "mov  x8, #{sys_report}",
         "svc  #0",
-        "mov  x8, #2",                // SYS_EXIT(K2_EXIT_STATUS) -> EL0_K2_DONE
-        "movz x0, #0x82",
+        "mov  x8, #{sys_exit}",       // SYS_EXIT(EXIT_STATUS_K2) -> EL0_K2_DONE
+        "movz x0, #{k2_status}",
         "svc  #0",
         "9: b 9b",                    // sys_exit never returns; belt-and-braces guard
         ".balign 4",
         "0: .ascii \"K2PRIV.BIN\"",
         "1:",
+        // ABIFREEZE: `const` operands out of `una_abi`. `eacces` is the POSITIVE magnitude because
+        // `cmn` adds — the ABI declares the errno as the negative return a caller sees.
+        sys_open = const una_abi::SYS_OPEN,
+        sys_report = const una_abi::SYS_REPORT,
+        sys_exit = const una_abi::SYS_EXIT,
+        eacces = const (-una_abi::EACCES),
+        k2_status = const una_abi::EXIT_STATUS_K2,
     );
 }
 

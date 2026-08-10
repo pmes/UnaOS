@@ -386,6 +386,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c8352f8c05e47892e7eaf13b34abd76a7f4aeaf817b716e88789381927f199c"
 
 [[package]]
+name = "una-abi"
+version = "0.1.0"
+
+[[package]]
 name = "unafs"
 version = "0.1.0"
 dependencies = [
@@ -422,6 +426,7 @@ dependencies = [
  "smoltcp",
  "spin 0.12.1",
  "uart_16550",
+ "una-abi",
  "unafs",
  "unaos-boot-info",
  "volatile 0.6.1",

@@ -33,22 +33,22 @@ use x86_64::VirtAddr;
 use crate::arch::percpu::{KERNEL_RSP_OFFSET, USER_RSP_OFFSET};
 
 // --- Syscall numbers (the tiny U1a subset; mirrors aarch64). ---
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
+use una_abi::SYS_WRITE;
+use una_abi::SYS_EXIT;
 // WINX-1: the PROCESS verbs x86 was missing, at their SHARED numbers (the aarch64 twins are
 // `sys_yield`/`sys_sleep_ms`/`sys_getinfo`). 3 (`SYS_REPORT`) and 6 (`SYS_GETPID`) stay unimplemented
 // here: x86 routes fixture witnesses BY TASK NAME through the `SYS_EXIT` arm (the u5x/u6x idiom), so it
 // has never needed `SYS_REPORT`, and nothing yet asks for a bare pid that `SYS_GETINFO` does not carry.
 // Their NUMBERS are reserved by the shared law regardless — an x86 caller of 3 or 6 falls to the
 // `-ENOSYS` default rather than colliding with something else.
-const SYS_YIELD: u64 = 4;
-const SYS_SLEEP_MS: u64 = 5;
-const SYS_GETINFO: u64 = 7;
+use una_abi::SYS_YIELD;
+use una_abi::SYS_SLEEP_MS;
+use una_abi::SYS_GETINFO;
 // WINX-1: the WINDOW verbs, at the shared numbers the aarch64 WC-B arc minted. 31 (`SYS_WIN_MOVE`) and
 // 32 (`SYS_WIN_CLOSE`) are reserved but not implemented this arc: nothing x86 runs asks to reposition or
 // explicitly retire a window, and a window is retired correctly at slot teardown (`win_close_slot`).
-const SYS_WIN_CREATE: u64 = 29;
-const SYS_WIN_PRESENT: u64 = 30;
+use una_abi::SYS_WIN_CREATE;
+use una_abi::SYS_WIN_PRESENT;
 // FBCON-DMG: `SYS_WIN_PRESENT_ROWS(win, y0, y1)` — the DAMAGE-CARRYING present. ADDITIVE: 30 keeps its
 // exact one-argument shape on both arches, because widening it in place is not safe. The dispatcher's own
 // note (see `syscall_dispatch`) records that a program which does not load an argument register "simply
@@ -60,7 +60,7 @@ const SYS_WIN_PRESENT: u64 = 30;
 // there (`const SYS_WIN_CLOSE: u64 = 32;`, arch/aarch64/syscall.rs:215) with nothing defined or reserved
 // above it; x86's own private block starts at 40 (`SYS_SOCKET`). Taking 33 keeps the ABI alignable — an
 // aarch64 twin can mint the same number later without moving anything.
-const SYS_WIN_PRESENT_ROWS: u64 = 33;
+use una_abi::SYS_WIN_PRESENT_ROWS;
 // WINX-7: the THREAD verbs, at the shared numbers the aarch64 ELF-2 arc minted. Semantics are the
 // aarch64 twins', verbatim:
 //   SYS_THREAD_SPAWN(entry, sp, arg, place) -> thread handle >= 0 / -errno. A new ring-3 task under the
@@ -69,22 +69,22 @@ const SYS_WIN_PRESENT_ROWS: u64 = 33;
 //   SYS_THREAD_JOIN(handle) -> 0 / -ESRCH. Block until that thread finishes, then reap its handle.
 //   SYS_THREAD_EXIT() — terminate the calling thread: post its completion (waking a joiner) and drop
 //     this task's hold on the shared address space (teardown only on the LAST thread).
-const SYS_THREAD_SPAWN: u64 = 21;
-const SYS_THREAD_EXIT: u64 = 22;
-const SYS_THREAD_JOIN: u64 = 23;
+use una_abi::SYS_THREAD_SPAWN;
+use una_abi::SYS_THREAD_EXIT;
+use una_abi::SYS_THREAD_JOIN;
 // WINX-7: SYS_FUTEX(uaddr, op, val) -> op-specific / -errno — the ring-3 wait/wake a userspace mutex or
 // frame barrier is built out of. `op`: 0 = WAIT (block iff `*uaddr == val`), 1 = WAKE (wake up to
 // `val` waiters; returns the count woken). 24/25 (`SYS_FB_MAP`/`SYS_FB_PRESENT`) stay reserved and
 // unimplemented on x86 — see the window-verb note above.
-const SYS_FUTEX: u64 = 26;
+use una_abi::SYS_FUTEX;
 /// WINX-7: `SYS_FUTEX` sub-ops (passed in the second argument). Shared with aarch64 by law.
-const FUTEX_WAIT: u64 = 0;
-const FUTEX_WAKE: u64 = 1;
+use una_abi::FUTEX_WAIT;
+use una_abi::FUTEX_WAKE;
 // WINX-7: SYS_INPUT_POLL() -> a packed input event (>= 0, bit 63 always clear) / -EAGAIN when the
 // caller's ring is empty. The delivery half of "a ring-3 app can be interactive": the kernel holds a
 // small per-process ring, the router fills the FOCUSED process's ring, and ring 3 drains its own
 // nonblocking. 28 is `SYS_INPUT_WAIT`, its blocking half — see below.
-const SYS_INPUT_POLL: u64 = 27;
+use una_abi::SYS_INPUT_POLL;
 // VUGPAUSE-2/x86: `SYS_INPUT_WAIT() -> 0 / -EINVAL` — the BLOCKING half of the pair. Block until the
 // CALLING process's input ring is (or may be) non-empty. Nothing is dequeued: the caller's ordinary
 // `SYS_INPUT_POLL` drain runs next and sees every event, which is what lets an app fold this in with
@@ -95,36 +95,36 @@ const SYS_INPUT_POLL: u64 = 27;
 // `SYS_INPUT_WAIT` (const at its :192, dispatch at its :6190, handler at its :12976). `user-vug`'s
 // `input_wait()` is `sys0(SYS_INPUT_WAIT)` — one arch-neutral source line that until this commit fell
 // through this dispatcher's `_ => -38` on x86 and turned the designed park into a tight busy loop.
-const SYS_INPUT_WAIT: u64 = 28;
+use una_abi::SYS_INPUT_WAIT;
 // U4x: the process-model pair (same numbers as aarch64 U4). `sys_spawn` loads the fixed on-disk
 // program (`HELLO.BIN`) into a fresh slot, runs it ring-3 as a CHILD, and returns a small HANDLE
 // index into the caller's per-process handle table; `sys_wait(handle)` blocks until that child exits
 // and returns its status (or `-ECHILD` if the handle is not in the caller's table).
-const SYS_SPAWN: u64 = 8;
-const SYS_WAIT: u64 = 9;
+use una_abi::SYS_SPAWN;
+use una_abi::SYS_WAIT;
 // U5x: operate on the caller's OWN handle table as capabilities. `a0` selects the sub-op
 // (`CAP_OP_GRANT`/`CAP_OP_REVOKE`); the remaining args are op-specific (see `sys_cap`). GRANT mints a
 // new, rights-attenuated handle to the same target as a source handle the caller holds `CAP_GRANT` on;
 // REVOKE clears a handle the caller owns. The enforcement layer sits at the handle lookup
 // (`handle_resolve`). Same number as aarch64 U5.
-const SYS_CAP: u64 = 10;
+use una_abi::SYS_CAP;
 /// `SYS_CAP` sub-ops (in `a0`). GRANT: `a1`=source handle idx, `a2`=requested rights mask -> new handle
 /// idx (attenuated) or a negative errno. REVOKE: `a1`=handle idx to drop -> 0 or a negative errno.
-const CAP_OP_GRANT: u64 = 0;
-const CAP_OP_REVOKE: u64 = 1;
+use una_abi::CAP_OP_GRANT;
+use una_abi::CAP_OP_REVOKE;
 /// U7x: revoke a TRANSFER the caller previously made with `SYS_XFER` (`a1` = the transfer id SYS_XFER
 /// returned). Sender-only (the transfer RECORD is sender-owned); single-level — revoking a transfer makes
 /// the RECEIVED capability stale at its next `handle_resolve` (and discards it if still pending in the
 /// recipient's inbox), but does NOT cascade through further re-transfers (revocation TREES are deferred).
-const CAP_OP_XREVOKE: u64 = 2;
+use una_abi::CAP_OP_XREVOKE;
 // U6bx: REAL File handles — the object table's first resource syscalls on a non-Console kind (the
 // aarch64 pi4 U6b twin; same numbers). OPEN(name_ptr, name_len) looks the name up in the BSP-STAGED
 // file set — not the disk: the SYSCALL handler runs IF-masked and the xHCI BOT read pump `hlt()`s, so
 // an in-handler disk read would hang the core (see the STORAGE / IF NOTE at the pre-stage buffer) —
 // and mints a File handle carrying `CAP_READ`. READ(handle, buf, len) serves the staged bytes through
 // that handle, gated by File + `CAP_READ` at `handle_resolve` (the `sys_write` Console twin).
-const SYS_OPEN: u64 = 11;
-const SYS_READ: u64 = 12;
+use una_abi::SYS_OPEN;
+use una_abi::SYS_READ;
 // U7x: cross-process capability transfer — the FIRST cross-process op on the object table (the aarch64
 // pi4 U7 twin; same numbers). XFER(dest, src, req_rights) deposits an ATTENUATED copy of a capability
 // the caller holds into the recipient's per-SLOT transfer INBOX (the one deliberately cross-slot
@@ -135,14 +135,14 @@ const SYS_READ: u64 = 12;
 // CAP_OP_XREVOKE), RECV -> a handle index. x86 divergence: rows are keyed by address-space SLOT, and the
 // SHARED_ROW (the U1a/U1b/U2 kernel window, torn down never and owned by no single process) is refused
 // as a transfer endpoint — both XFER and RECV from a shared-window caller return -EACCES.
-const SYS_XFER: u64 = 13;
-const SYS_RECV: u64 = 14;
+use una_abi::SYS_XFER;
+use una_abi::SYS_RECV;
 // U9x: absolute seek on an open File descriptor (the aarch64 pi4 U9 twin; same number). SEEK(handle,
 // offset) -> the new absolute offset, or a negative errno. The CHECK requires a File handle carrying ANY
 // of `CAP_READ|CAP_WRITE`; an offset PAST the file's size is `-EINVAL` (seeking exactly TO size, the EOF
 // position, is legal). A later SYS_READ / File SYS_WRITE resumes from the seeked offset. No I/O — a pure
 // descriptor-state update, so it is IF-masked-handler-safe (the whole x86 staged-storage divergence).
-const SYS_SEEK: u64 = 15;
+use una_abi::SYS_SEEK;
 // U11x: CLOSE an open File — SYS_CLOSE(handle) -> `0`, or a negative errno (the aarch64 pi4 U11 twin; same
 // number). Frees the handle's open-file DESCRIPTOR (bumping its generation so a first-fit slot reuse can never
 // re-bind a lingering sibling file-id to a different file — the U9x revoke+reopen aliasing gap) and clears the
@@ -151,28 +151,28 @@ const SYS_SEEK: u64 = 15;
 // returns cleanly; a use-after-close is denied). No I/O — the x86 staged write-back happens at whole-task
 // teardown (`clear_files_row`), so like a revoke this drop DISCARDS any un-flushed dirty bytes (only teardown
 // persists; a future arc could make an explicit close enqueue the flush).
-const SYS_CLOSE: u64 = 17;
+use una_abi::SYS_CLOSE;
 // U10 M3: DELETE (unlink) the runtime-created file an open File+CAP_WRITE handle names — SYS_UNLINK(handle) -> 0,
 // or a negative errno (the aarch64 U10 twin; same number). Gated by the SAME single CAP_WRITE CHECK as write
 // (delete is a mutation). Marks the name gone for the row (a re-open is -ENOENT), invalidates ALL of this
 // process's descriptors for it (the U11x gen-tag mechanism — no stale reference), and enqueues the on-disk delete
 // (create+grow+delete replayed at the launcher's IF=1 drain, since the fixture's create/grow never persisted).
-const SYS_UNLINK: u64 = 16;
+use una_abi::SYS_UNLINK;
 // U10: SYS_OPEN `mode` bit1 — create the file if it is absent from the "volume" (the aarch64 U10 O_CREAT twin;
 // same encoding). bit0 = RW. `mode == 3` (O_CREAT | RW) is what the create/delete fixtures pass. A create is
 // inherently RW (you create to write it); higher bits (O_TRUNC/O_EXCL/O_APPEND) stay reserved this arc.
-const O_CREAT: u64 = 1 << 1;
+use una_abi::O_CREAT;
 // U6x: SYS_OPEN `mode` bit2 — opt an O_CREAT of a NEW name OUT of owned-by-default into world-access (the
 // aarch64 U6 twin; same encoding). Ignored on an open of an existing file (ownership is fixed at create) and
 // outside O_CREAT. Owned-by-default: a private create (no O_PUBLIC) records the creator as OWNER; O_PUBLIC
 // keeps the pre-U6 open-by-anyone behaviour. See `open_create_new` and the owner/grants block.
-const O_PUBLIC: u64 = 1 << 2;
+use una_abi::O_PUBLIC;
 // U6x: UnaFS owner/grants delegation — SYS_FGRANT(file_handle, child_handle, rights) -> 0, or a negative errno
 // (the aarch64 U6 twin; same number). The OWNER of a private created file grants (a CAP_READ|CAP_WRITE subset)
 // or revokes (rights == 0) access to another principal named OWNER-SCOPED by a `Child` handle the caller holds
 // (the SYS_XFER idiom — no raw pid/slot from ring 3). The grant is an ACL edge on the FILE (nothing delivered to
 // the grantee's table); the grantee opens the name and the SYS_OPEN ACL admits it. See `sys_fgrant`.
-const SYS_FGRANT: u64 = 18;
+use una_abi::SYS_FGRANT;
 // SOCK-2 (ROADMAP §1b): the UDP socket syscall family — the FIRST time ring 3 reaches the network.
 // A socket is a new object-table kind (`KIND_SOCKET`, already scaffolded as the U6bx/U9x kind
 // negative) whose value word is a persistent-`SocketSet` id; the handle is a capability exactly like a
@@ -206,13 +206,13 @@ const SYS_FGRANT: u64 = 18;
 // reference cannot pass, because a fixture that keeps the old immediate lands in an unrelated arm (or
 // `-ENOSYS`) and fails its verdict.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SOCKET: u64 = 40;
+use una_abi::SYS_SOCKET;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_BIND: u64 = 41;
+use una_abi::SYS_BIND;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SENDTO: u64 = 42;
+use una_abi::SYS_SENDTO;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_RECVFROM: u64 = 43;
+use una_abi::SYS_RECVFROM;
 // SOCK-3 (ROADMAP §1b): the TCP CLIENT socket syscalls — ring 3's first byte stream. A TCP socket is
 // minted by `SYS_SOCKET` with type SOCK_STREAM(1) (the same `KIND_SOCKET` capability, gen-fenced value
 // word). CONNECT(handle, msg_ptr, msg_len) active-opens to the peer in `msg`'s 8-byte
@@ -223,18 +223,18 @@ const SYS_RECVFROM: u64 = 43;
 // `CAP_WRITE`, recv needs `CAP_READ`, connect needs `CAP_WRITE` (a configuring authority, like bind).
 // x86-only, knob-on; aarch64 / knob-off never compile these arms (byte-identical).
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_CONNECT: u64 = 44;
+use una_abi::SYS_CONNECT;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SEND: u64 = 45;
+use una_abi::SYS_SEND;
 // `SYS_SOCK_RECV` (not `SYS_RECV` — 14 is the capability-transfer inbox recv) — the stream recv.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SOCK_RECV: u64 = 46;
+use una_abi::SYS_SOCK_RECV;
 // SOCK-6: TCP SERVER sockets — `SYS_LISTEN` arms a passive listener, `SYS_ACCEPT` polls for an inbound
 // connection and mints a fresh `KIND_SOCKET` handle for it (the ring 3 now ACCEPTS inbound TCP).
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_LISTEN: u64 = 47;
+use una_abi::SYS_LISTEN;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_ACCEPT: u64 = 48;
+use una_abi::SYS_ACCEPT;
 // PULSE-1: SYS_CPUPULSE(ptr) -> 0 / -EFAULT — the per-core load SAMPLE, copied out to ring 3. 49 is the
 // next free number in the shared space (48, `SYS_ACCEPT`, was the high-water mark on either arch), and the
 // number is minted on BOTH arches per the shared-numbering law even though only the x86 desktop ships an
@@ -247,7 +247,7 @@ const SYS_ACCEPT: u64 = 48;
 // percent could not tell an honest 0% from a FROZEN counter, which is the one distinction
 // `vug::classify_load` exists to preserve. Handing out `(busy, idle)` per core plus the observer's own core
 // index gives ring 3 every input that rule needs, and no fabricated ones.
-const SYS_CPUPULSE: u64 = 49;
+use una_abi::SYS_CPUPULSE;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -3041,14 +3041,16 @@ fn copy_to_user(user_ptr: u64, src: &[u8]) -> Result<(), i64> {
 // liveness: before `apic::calibrate` runs, a tick is ~0.8 ms under QEMU, so a sleep runs proportionally
 // short — the documented degradation `arch::ms_to_ticks` already carries.
 
-/// WINX-1: `SYS_GETINFO`'s payload — the fixed `{pid, ticks}` struct copied out to ring 3. `#[repr(C)]`
-/// plain-old-data, field-for-field identical to the aarch64 `UserInfo`, so one arch-neutral ring-3
-/// program reads the same two little-endian u64s on either arch.
-#[repr(C)]
-struct UserInfo {
-    pid: u64,
-    ticks: u64,
-}
+/// WINX-1: `SYS_GETINFO`'s payload — the fixed `{pid, ticks}` struct copied out to ring 3. ABIFREEZE
+/// moved the declaration into `una_abi`, so it is now the SAME TYPE the aarch64 kernel and every
+/// ring-3 program use, rather than three `#[repr(C)]` declarations trusted to stay in step.
+///
+/// The `ticks` field's UNIT does not match aarch64's and never has (una-abi's divergence ledger D1):
+/// x86 fills it from `arch::ticks()` at `apic::TICK_HZ` = 1000 Hz, so one tick is one millisecond,
+/// while aarch64 fills it from its 250 Hz scheduler tick. That is shipped behaviour on both sides and
+/// this arc does not move it; what changed is that ring 3 now reads the rate from
+/// `una_abi::GETINFO_TICK_HZ` instead of hard-coding a guess.
+use una_abi::UserInfo;
 
 /// WINX-1: `SYS_GETINFO(user_ptr)` — write `{pid, ticks}` to the caller's buffer through the validated
 /// `copy_to_user` seam. Returns 0, or `-EFAULT` if the destination fails validation (outside the ring-3
@@ -3109,19 +3111,16 @@ fn sys_getinfo(user_ptr: u64) -> i64 {
 /// ring-3 program declares from this document — it is ABI, not an implementation detail, and it is
 /// deliberately NOT read from `vug::MAX_METER_CPUS` (that constant is the in-kernel meter's scratch cap and
 /// is free to change without breaking a shipped ring-3 binary). They happen to be equal today at 16.
-const PULSE_MAX_CPUS: usize = 16;
+use una_abi::PULSE_MAX_CPUS;
 
 /// PULSE-1: `SYS_CPUPULSE`'s payload. `#[repr(C)]` plain-old-data, no padding (all `u64`), so the byte
 /// layout is stable for the ring-3 program that reads it back: `ncpu` at 0, `demo` at 8, then
 /// `PULSE_MAX_CPUS` pairs of `(busy, idle)` cumulative tick counts, core-major — core `c`'s busy count at
 /// `16 + c*16`, its idle count at `24 + c*16`. 272 bytes total. Entries at or past `ncpu` are zeroed, never
 /// stale: a caller that trusts `ncpu` and one that scans the whole array agree.
-#[repr(C)]
-struct UserPulse {
-    ncpu: u64,
-    demo: u64,
-    ticks: [u64; PULSE_MAX_CPUS * 2],
-}
+/// ABIFREEZE: the struct itself now lives in `una_abi` — `user-pulse` reads these exact bytes back,
+/// so the layout is ABI and belongs with the number that returns it.
+use una_abi::UserPulse;
 
 /// PULSE-1: `SYS_CPUPULSE(user_ptr)` — write the per-core load sample to the caller's buffer through the
 /// validated `copy_to_user` seam. Returns 0, or `-EFAULT` if the destination fails validation (outside the
@@ -4548,11 +4547,11 @@ mod wc_shim {
 
 /// WINX-7 packed-event type tags (bits [55:48] of the packed u64). Shared with aarch64 by law, so one
 /// arch-neutral ring-3 program decodes the same wire form on both.
-const INPUT_EV_KEY_DOWN: u64 = 1; // a key PRESS   (payload[7:0] = ASCII / the C0 arrow codes)
-const INPUT_EV_KEY_UP: u64 = 2; // a key RELEASE (payload[7:0] = same)
-const INPUT_EV_MOUSE_REL: u64 = 3; // relative pointer motion  (payload[31:16] = dx, [15:0] = dy, i16)
-const INPUT_EV_MOUSE_ABS: u64 = 4; // absolute pointer position(payload[31:16] = x,  [15:0] = y,  i16)
-const INPUT_EV_BUTTON: u64 = 5; // a pointer button state    (payload[7:0] = button bitmask)
+use una_abi::INPUT_EV_KEY_DOWN; // a key PRESS   (payload[7:0] = ASCII / the C0 arrow codes)
+use una_abi::INPUT_EV_KEY_UP; // a key RELEASE (payload[7:0] = same)
+use una_abi::INPUT_EV_MOUSE_REL; // relative pointer motion  (payload[31:16] = dx, [15:0] = dy, i16)
+use una_abi::INPUT_EV_MOUSE_ABS; // absolute pointer position(payload[31:16] = x,  [15:0] = y,  i16)
+use una_abi::INPUT_EV_BUTTON; // a pointer button state    (payload[7:0] = button bitmask)
 
 /// Per-process input ring capacity. A power of two, because occupancy is `tail.wrapping_sub(head)`
 /// and the slot index is `& (CAP - 1)`.
@@ -12387,11 +12386,11 @@ static HANDLES: [[AtomicU64; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
 /// `CAP_READ`/`CAP_EXEC`/`CAP_REVOKE` round out the model (U8x: revoking a handle carrying `CAP_REVOKE`
 /// kills its derivation SUBTREE; a right-less revoke stays local — U5x's ownership semantics). Values are
 /// stable across arches (aarch64 U5 twin).
-const CAP_READ: u32 = 1 << 0; // 0x01
-const CAP_WRITE: u32 = 1 << 1; // 0x02
-const CAP_EXEC: u32 = 1 << 2; // 0x04
-const CAP_GRANT: u32 = 1 << 3; // 0x08
-const CAP_REVOKE: u32 = 1 << 4; // 0x10 (U8x: revoking a handle carrying this kills its derivation SUBTREE)
+use una_abi::CAP_READ; // 0x01
+use una_abi::CAP_WRITE; // 0x02
+use una_abi::CAP_EXEC; // 0x04
+use una_abi::CAP_GRANT; // 0x08
+use una_abi::CAP_REVOKE; // 0x10 (U8x: revoking a handle carrying this kills its derivation SUBTREE)
 // The rights are the distinct low 5 bits — a well-formed bitmask (each a single, non-overlapping bit,
 // which the attenuation check `req & !src` relies on). This const-assert verifies that and anchors every
 // CAP_* as used, so the model bit not yet exercised in Rust this arc (CAP_EXEC — held by no fixture, so
