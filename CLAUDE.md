@@ -68,6 +68,12 @@ several sessions can work in parallel without stepping on each other.
   conflict-free: x86 vs aarch64 rarely collide; docs/`arroyo` the integrator
   reconciles at merge.)
 
+- **Never `git stash` in this repo or any worktree of it.** The stash stack is ONE stack
+  shared across all worktrees; with parallel sessions live, a stash is a race by
+  construction (three cross-session pops in GR24 alone). To take a clean baseline:
+  snapshot your diff to `~/unaos-bench/scratch/<arc>/`, verify the patch re-applies,
+  then `git apply -R` — or `git worktree add` a throwaway tree at the baseline sha.
+
 ## Arc discipline
 
 - One arc per session, defined by your brief
