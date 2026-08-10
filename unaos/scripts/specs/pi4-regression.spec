@@ -1154,9 +1154,16 @@ REQUIRE :: KNURL: .* paper=0x0df2b838251069dc ceramic=0x2c525bfdb49df67d unchang
 # ---      * kernel FURNITURE is suppressed WITHOUT a line (`furniture none=true silent=true`) —
 # ---        that decline is policy, not a defect, and a witness that cried wolf on it once per boot
 # ---        would be noise. The furniture row is pinned narrow too, so it would trip the width arm
-# ---        as well if the furniture arm were not reached first.
+# ---        as well if the furniture arm were not reached first;
+# ---      * and that furniture row is REAPED (`reaped=true`). CLOSEISO makes `close_owner` refuse
+# ---        every kernel-band row, so the battery's teardown sweep is structurally blind to it and
+# ---        the leak guard could never have caught it leaking. The reap is asserted by id, against
+# ---        the table, which is the only place that can answer it.
+# ---    `fired=` and `rl=` are PER-SLOT emission deltas, not a global total: this boot's earlier
+# ---    fixtures mint 32x8 rows that decline legitimately, and a global counter would have let one
+# ---    of them inflate the delta and red a kernel that was behaving perfectly.
 # ---    Every number is pinned, so the fixture's own SKIP line (window table full) cannot satisfy
 # ---    this rule and neither can its FAIL — the values are what make it a gate rather than a
 # ---    presence check.
-REQUIRE :: WMCTRL: controls-declined — floor=158 under bw=157 none=true fired=1 rl=1 atfloor bw=158 some=true furniture none=true silent=true :: PASS ::
+REQUIRE :: WMCTRL: controls-declined — floor=158 under bw=157 none=true fired=1 rl=1 atfloor bw=158 some=true furniture none=true silent=true reaped=true :: PASS ::
 FORBID :: WMCTRL: .* :: FAIL ::
