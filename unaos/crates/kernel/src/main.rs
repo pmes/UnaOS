@@ -2352,6 +2352,17 @@ fn handle_key(
         let took_screen = unaos_kernel::shell::dispatch_command(&cmd, console, pal);
         unaos_kernel::gui_watchdog::on_app_exit();
         SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+        // TERM_RING (MIDDEN_CONVERGENCE §3, M2): THE DRAIN SITE. `dispatch_command` has returned, so
+        // the render task owns the view again — the exclusive-drainer contract `termring::drain`
+        // requires — and this is the first moment a record staged by a producer that is NOT this task
+        // (an IRQ-masked context, a future second consumer's peer) can be moved into the scrollback.
+        // Runs before the repaint below so anything drained is on screen this frame, and
+        // unconditionally (a took_screen command has restored the console by the time it returns, and
+        // its next repaint would otherwise be the first to show the backlog). `service` announces any
+        // transport loss on the wire, on change only; both are no-ops on an empty, lossless ring, which
+        // is what keeps the aarch64 path byte-identical.
+        console.drain_output();
+        unaos_kernel::termring::service();
         if !took_screen {
             console.draw(pal);
         }

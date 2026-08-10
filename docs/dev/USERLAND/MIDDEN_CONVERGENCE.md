@@ -200,33 +200,96 @@ the discipline this needs, including the rule that a full-screen command parks t
 inside `dispatch_command` so nothing may be pushed while it cannot drain, and a depth witness
 (`sent - recv`).
 
-### Design: `TERM_RING` — the bounded in-kernel terminal ring
+### `TERM_RING` — the bounded in-kernel terminal transport (BUILT, M2)
 
-* **Type.** `Channel<TerminalMsg>` where `TerminalMsg` is a fixed-size record — a small inline
-  `[u8; N]` plus a length and a kind tag, **not** an `alloc::String`. The reason is the same one
-  behind `bootlog`'s ring and the FTDI capture ring: producers include contexts that are IRQ-masked
-  or hold the print lock, where an allocation is not permitted.
-* **Capacity: 64 records**, matching `GUI_CHANNEL_X86`. Rationale: the consumer is the same render
-  task, on the same core, at the same tempo; a deeper ring only buys latency before the same drop.
-* **Drop policy: drop-newest, and count.** Never block a producer, never overwrite history. A
-  dropped record increments an overflow counter that the ring reports, so a truncated session is
-  *visibly* truncated. (This is `selftest.rs`'s existing rule for its boot-replay ring — `try_lock`
-  only, drop on contention, count overflow drops — and it is right for the same reason.)
-* **Relation to `GUI_CHANNEL_X86`: a sibling, never a replacement, and never nested.** The GUI
-  channel carries *input* (`pal::Event`) toward the render task; `TERM_RING` carries *output*
-  (terminal messages) toward whatever is rendering the console. Merging them would be a deadlock
-  waiting to happen: `dispatch_command` runs **inside** the render task, so a producer that pushed
-  onto the channel the render task is blocked on would be pushing into a queue only it can drain.
-* **Fan-out.** The Synapse is MPMC; `Channel` is not. That difference is real and does not need
-  solving in Ring 0 yet: today there is exactly one consumer (the console window). When a second
-  arrives (a log sink, a `TerminalView`), the ring gains a small fixed subscriber array — bounded,
-  not a broadcast tree.
+**M1 did not build this ring, and that was deliberate.** With one producer and one consumer on the
+same core the message went straight from `midden_core::plan` to `render_message(console, &msg)`;
+adding a queue between two statements in the same function would have been ceremony, and a ring
+nobody drains is a bug factory. **M2's TERM_RING arc built it** — `crates/kernel/src/termring.rs`,
+with the drain wired at `main.rs`'s `handle_key` and a witness on the pi4 chain. What follows is
+what exists, not what was planned; where the built thing diverges from M1's sketch, the divergence
+and its reason are stated rather than quietly edited away.
 
-**M1 does not build this ring**, and that is deliberate. With one producer and one consumer on the
-same core the message goes straight from `midden_core::plan` to `render_message(console, &msg)` —
-adding a queue between two statements in the same function would be ceremony, and a ring nobody
-drains is a bug factory. The design is recorded here so that M2 (the console window as a real view,
-and a second consumer) has a decided answer rather than an invented one.
+* **Role: a TRANSPORT, not the scrollback.** The ring carries lines from a producer toward the task
+  that owns the console view; `Console::history` remains the display store. This split is what makes
+  the drop policy below correct. Drop-newest is right for a transport — the backlog is the symptom,
+  and the newest line is the one the producer could not afford to wait for — and exactly wrong for a
+  scrollback, which would then stop showing the present. Two roles, two objects, one policy each:
+  `termring` drops newest, `Console::place` drops oldest.
+* **Type: `serial_ring::LineRing<64, 240>`, NOT `arch::sched::Channel<TerminalMsg>`.** This is the
+  one place the build diverges from the M1 sketch above, and the reasons are ones this very section
+  supplies without having drawn the conclusion. `Channel` has no `try_send`; its buffer is a
+  *sleeping* `Mutex<VecDeque>`; and its `send`/`recv` assert they are running on a scheduled task.
+  Each of those is fatal to the producer contexts this section itself names — IRQ-masked code and
+  code holding the print lock may not sleep, may not allocate, and may not be on a task at all — and
+  a blocking `send` from inside `dispatch_command` would push onto a queue only the blocked render
+  task can drain, which is the deadlock the "sibling, never nested" bullet warns about. `LineRing`
+  (`serial_ring.rs`, SERWIT-1's machinery made reusable) is the same 64-slot bound with none of it:
+  three atomics plus per-slot atomics, no Mutex, no allocation, no reentrancy into `serial_println!`,
+  const-constructible as a `static`, and a `Staged::Full` return that hands the caller a *counted
+  refusal* instead of a wait. The record is still fixed-size and inline — `[u8; 240]` plus a length —
+  for exactly the reason the sketch gave.
+* **Capacity: 64 records**, matching `GUI_CHANNEL_X86`, unchanged from the M1 ruling: the consumer is
+  the same render task, on the same core, at the same tempo, so a deeper ring only buys latency
+  before the same drop. 240 bytes per record is comfortably wider than a panel row at any scale this
+  kernel drives (1920 px at the scale-2 cell is 120 cells); a longer line is sealed in place with
+  `serial_ring::TRUNCATION_MARK` and counted as a tear, never silently shortened.
+* **Drop policy: drop-newest, and count.** Never block a producer, never overwrite history. The
+  ledger is a `serial_ring::TapCounters` (`termring::TERM_TAP`) under the same conservation law the
+  four SERWIT-2 mirror taps satisfy —
+  `submitted == absorbed + dropped + suppressed + in_flight` — and `termring::service()` announces
+  un-announced loss on the wire as a `:: termring: … == witness ::` line, on change only
+  (`take_pending` self-rate-limits, so a lossless ring prints nothing at all). `TERM_TAP` is
+  deliberately *not* enrolled in `serial_ring::taps()`: that array is the census of taps on the
+  serial wire, and this ring is not one of them.
+  * *Correction to the M1 text.* The parenthesis above used to cite `selftest.rs`'s boot-replay ring
+    as "`try_lock` only, drop on contention, count overflow drops". That has not been true since
+    **SERWIT-2**: the replay ring's `Mutex<BootRing>` is gone (`selftest.rs`, `BootSlots`). A writer
+    claims its index with one `fetch_add` and publishes the slot with one release store, so there is
+    no lock to contend and no contention-drop path at all — the only loss left is the ring genuinely
+    filling, derived from the monotonic claim counter. `termring` follows *that* rule, the lock-free
+    one, not the one the old text described.
+* **A transport drop costs neither content nor order.** `Console::println` drains the ring, stages
+  into it, and drains again, because on today's surfaces the producer runs *on* the consumer's task.
+  If the ring refuses a record the console places the line directly in `history` — and the LEADING
+  drain is what makes that safe: with the ring emptied first, the fallback line lands at the true
+  tail instead of jumping ahead of up to 64 older records still in flight. What the refusal costs is
+  then exactly one thing, the fact that the record did not travel by the transport, and that is what
+  the counted `dropped` charge says. A TRUNCATION is the injury with no fallback: that record did
+  travel and arrived short, its tail replaced by `TRUNCATION_MARK`. `service()` states the two
+  separately for that reason, because a message that credited the fallback for both would be false
+  about the torn half.
+* **The drain site.** `main.rs`'s `handle_key`, immediately after `dispatch_command` returns and
+  immediately before the post-command `console.draw(pal)`: the first moment the render task owns the
+  view again, which is the exclusive-drainer contract `LineRing::drain` requires. It runs
+  unconditionally (including for a `took_screen` command, which has already restored the console),
+  followed by `termring::service()`. Both are no-ops on an empty, lossless ring — which is what
+  makes the aarch64 path, where the same `handle_key` is the BSP GUI loop's, byte-identical.
+* **Relation to `GUI_CHANNEL_X86`: a sibling, never a replacement, and never nested.** Unchanged and
+  now structural: the GUI channel carries *input* (`pal::Event`) toward the render task; `TERM_RING`
+  carries *output* away from producers toward whoever renders the console. They are different types
+  on purpose — the input channel may block a USB pump; the output transport may block nobody.
+* **Fan-out, and the precondition it must clear.** Still one consumer (the console view), still not
+  a broadcast tree; `drain` is already a `FnMut(&str)` over whole records, so nothing in the built
+  shape forecloses a second. But the exclusive-drainer contract is satisfied today by `&mut Console`,
+  and that borrow is **per-`Console` while `TERM_RING` is one global**. With one console the two
+  coincide. A second view holding its own `&mut Console` would drain records destined for the first,
+  and neither the borrow checker nor the ring would object — the output would simply appear on the
+  wrong screen. That is the concrete reason a second consumer needs the fixed subscriber array rather
+  than a second caller of `Console::drain_output`, and it is a precondition to check before adding
+  one, not a refactor to discover afterwards.
+* **The witness.** `termring::termring_selftest` (`witness`-gated, wired on the pi4 chain in
+  `arch/aarch64/syscall.rs`, `REQUIRE`d by `scripts/specs/pi4-regression.spec`) parks the consumer,
+  offers 80 records, and asserts four independently-failable properties: the bound and the refusal
+  (exactly 64 accepted, 16 refused, 64 in flight); drop-NEWEST with order and byte round-trip (the
+  survivors are sequences `0..64` — drop-OLDEST would return `16..80` and fail the first comparison);
+  truncation sealed with `TRUNCATION_MARK` and counted; a policy refusal charged as `suppressed`
+  rather than as loss; and the conservation law over the whole fixture, sampled while the hold is
+  still up so an attended keystroke cannot flake it red. Every count is decoded onto the verdict
+  line, so the gate cannot be satisfied by a leg that merely printed. The fixture does not rewind the
+  counters — its 16 drops and 1 tear really happened — but it does clear the ANNOUNCEMENT latch,
+  because those events are reported on its own line and a latch left armed would make `service()`
+  print a spurious loss report at the operator's first Enter on a boot with no real loss.
 
 ---
 

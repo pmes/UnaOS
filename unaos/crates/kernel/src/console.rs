@@ -57,18 +57,70 @@ impl Console {
     }
 
     pub fn clear(&mut self) {
+        // TERM_RING: retire whatever the transport is still holding as well, otherwise the next drain
+        // would repaint lines the operator just cleared. The records are charged as absorbed — they
+        // reached the view's owner, which then discarded them; that is a view decision, not transport
+        // loss, and the ledger must not book it as one.
+        let _ = crate::termring::drain(|_| {});
         self.history.clear();
     }
 
-    pub fn println(&mut self, text: &str) {
+    /// Place one line in the VIEW's own store. The scrollback is bounded ([`Self::HISTORY_MAX`]) and
+    /// drops OLDEST — the opposite of `termring`'s drop-NEWEST, and deliberately so: a transport must
+    /// not make a producer wait, but a scrollback that discarded the newest line would stop showing
+    /// the present.
+    fn place(&mut self, text: &str) {
         self.history.push(String::from(text));
-        // Retain enough scrollback to fill the tallest panels we run on (native 4K ~= 90 rows at
-        // the scale-2 line pitch). Bounded so the buffer can't grow without limit; large enough that
-        // a full screen is always drawable (the old 25-line cap starved the bottom third at native
-        // resolution).
         if self.history.len() > Self::HISTORY_MAX {
             self.history.remove(0);
         }
+    }
+
+    /// TERM_RING (M2): move every record the transport is holding into the view's store, in order.
+    /// Returns how many. Draining an empty ring is a no-op, so this is safe to call from any repaint
+    /// site.
+    ///
+    /// **Fan-out precondition.** `termring::drain`'s exclusive-drainer contract is satisfied here by
+    /// `&mut Console`, but note what that does and does not buy: the borrow is per-`Console` while
+    /// `TERM_RING` is one global. With exactly one console — the shape today — the two coincide. A
+    /// SECOND view (a `TerminalView`, a log sink) holding its own `&mut Console` would drain records
+    /// destined for the first and neither borrow checker nor ring would object; the records would
+    /// simply go to the wrong screen. That is the concrete reason fan-out needs the fixed subscriber
+    /// array §3 describes rather than a second caller of this method, and it is a precondition to
+    /// check before adding one, not a refactor to discover afterwards.
+    pub fn drain_output(&mut self) -> u64 {
+        let history = &mut self.history;
+        let max = Self::HISTORY_MAX;
+        crate::termring::drain(|line| {
+            history.push(String::from(line));
+            if history.len() > max {
+                history.remove(0);
+            }
+        })
+    }
+
+    /// Emit one line of console output.
+    ///
+    /// TERM_RING (M2): the line goes through the terminal TRANSPORT rather than straight into the
+    /// view's store, so this is no longer the only way a console line can come into existence — any
+    /// producer may `termring::console_out`, including from a context that may not allocate or
+    /// block. The drain happens immediately here because on today's surfaces the producer runs ON
+    /// the render task; a foreign producer's records are picked up by the same drain, in FIFO order
+    /// with these, at whichever of the two drain sites reaches them first.
+    ///
+    /// **The drain comes FIRST, and the order is load-bearing.** If the transport refuses the record
+    /// (ring full — it is drop-newest and never blocks) the line is placed directly, and placing it
+    /// while records older than it were still in flight would put it AHEAD of up to `TERM_SLOTS` of
+    /// them. Draining first empties the ring, so the fallback line lands at the true tail and the
+    /// scrollback stays in order even in the overflow case. What the refusal then costs is only the
+    /// counted `dropped` charge — the record did not travel by the transport, and the ledger says so
+    /// — not the reader's sense of what happened first.
+    pub fn println(&mut self, text: &str) {
+        self.drain_output();
+        if !crate::termring::console_out_str(text) {
+            self.place(text);
+        }
+        self.drain_output();
         // JD11: mirror the line to the output sink if one is installed (tegra bench transcript).
         // After the history push so a panic in the sink can't lose the panel line; the sink is a
         // no-op (`None`) on every non-tegra surface.
@@ -83,7 +135,11 @@ impl Console {
     // in the same place in both. Top-down terminal fill: history starts at the top and each new line
     // pushes the prompt DOWN; once the screen is full the oldest lines scroll off the top.
 
-    /// Retained scrollback cap — generous enough that even a 4K panel's worth of rows is drawable.
+    /// Retained scrollback cap. The constraint it has to satisfy is `HISTORY_MAX > page_rows` for the
+    /// tallest panel this kernel drives, or the bottom of a full screen would be starved (the old
+    /// 25-line cap did exactly that at native resolution). The tallest is a 4K panel: 2160 rows puts
+    /// `Metrics::for_height` at scale 2, so `line_h` is 24 and `page_rows` is 88. 256 is therefore
+    /// just under three screenfuls there, and many more on anything smaller.
     const HISTORY_MAX: usize = 256;
     /// The console background (Moonstone).
     const BG: u32 = 0x2D2B55;
