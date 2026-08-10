@@ -102,6 +102,55 @@ fn main() {
         }
     }
 
+    // ---- BT-L3: the ADDRESS rule, same shared source ------------------------------------------
+    for c in BT_ADDR_CASES {
+        let got = bt_addr_matches(&c.addr, c.atype, &c.want, c.want_type);
+        if bt_addr_case_passes(c) {
+            pass += 1;
+            println!(
+                "PASS {:<40} addr={} type={:#04x} match={}",
+                c.what,
+                render(&bt_addr_render_msb(&c.addr)),
+                c.atype,
+                got
+            );
+        } else {
+            fail += 1;
+            println!(
+                "FAIL {:<40} addr={} type={:#04x} match={} want {}\n     why: {}",
+                c.what,
+                render(&bt_addr_render_msb(&c.addr)),
+                c.atype,
+                got,
+                c.expect,
+                c.why
+            );
+        }
+    }
+    // THE BYTE-ORDER RELATIONSHIP — the constant, rendered the way the witness renders a stored
+    // address, against the text the host's own pairing record prints. This is the leg that fails
+    // if `BT_L3_PEER_ADDR_BYTES` is ever rewritten MSB-first; the match legs above would not,
+    // because they compare the constant against itself.
+    if bt_addr_order_holds() {
+        pass += 1;
+        println!(
+            "PASS {:<40} wire {:02x?} renders as {} == host's {}",
+            "byte-order-relationship",
+            BT_L3_PEER_ADDR_BYTES,
+            render(&bt_addr_render_msb(&BT_L3_PEER_ADDR_BYTES)),
+            render(BT_L3_PEER_ADDR_TEXT)
+        );
+    } else {
+        fail += 1;
+        println!(
+            "FAIL {:<40} wire {:02x?} renders as {} but the host reports {}\n     why: the target constant is in the WRONG BYTE ORDER — the address filter cannot match anything",
+            "byte-order-relationship",
+            BT_L3_PEER_ADDR_BYTES,
+            render(&bt_addr_render_msb(&BT_L3_PEER_ADDR_BYTES)),
+            render(BT_L3_PEER_ADDR_TEXT)
+        );
+    }
+
     println!("\nbtname harness — pass={} fail={}", pass, fail);
     if fail != 0 {
         std::process::exit(1);

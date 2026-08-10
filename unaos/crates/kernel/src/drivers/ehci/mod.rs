@@ -45,8 +45,11 @@ pub mod qh;
 mod bt_name;
 #[cfg(feature = "bt")]
 use bt_name::{
-    bt_decode_local_name, bt_name_case_passes, bt_name_contains_ci, bt_name_maybe_ci,
-    BT_L2_NAME_MAX, BT_L2_RAW_MAX, BT_NAME_CASES, BT_NAME_SUSPECT_LEN,
+    bt_addr_case_passes, bt_addr_eq, bt_addr_matches, bt_addr_order_holds, bt_addr_render_msb,
+    bt_decode_local_name,
+    bt_name_case_passes, bt_name_contains_ci, bt_name_maybe_ci, BT_ADDR_CASES, BT_ADDR_TYPE_PUBLIC,
+    BT_L2_NAME_MAX, BT_L2_RAW_MAX, BT_L3_PEER_ADDR_BYTES, BT_L3_PEER_ADDR_TEXT, BT_NAME_CASES,
+    BT_NAME_SUSPECT_LEN,
 };
 
 use super::ehci_scout::{
@@ -856,15 +859,69 @@ const BT_L3_ADV_CONNECTABLE: u8 = 0x00;
 // which a CONNECT_IND takes away from its owner for as long as the link is held. Two independent
 // reviews reached the same conclusion, so the mechanism is built here and defaulted safe.
 
+// ------------------------------------------------------------------------------------------
+// THE PRECEDENCE, STATED ONCE, HERE. Exactly one rule decides each candidate, and they are tried
+// in this order:
+//
+//   1. `BT_L3_PEER_ADDR`  — if `Some`, IT DECIDES ALONE. Address (six bytes) + address type.
+//                           The name is not consulted, and THE RSSI FLOOR IS NOT APPLIED.
+//   2. `BT_L3_PEER_NAME`  — else, if `Some` and non-empty: the advertised Local Name filter.
+//                           The RSSI floor is not applied here either.
+//   3. `BT_L3_RSSI_FLOOR` — else: first-heard connectable advertiser clearing the floor.
+//
+// The selection pass in `bt_le_drain` is written as one `match`/`else` chain in that order, and
+// the `peer rule` witness line prints WHICH ARM WAS ARMED before any candidate is judged. Nothing
+// below (2) or (3) has been deleted: they are the fallback if the address ever changes — a
+// different speaker, a replacement unit, a bench that is not Peter's.
+// ------------------------------------------------------------------------------------------
+
+/// BT-L3 — **PEER ADDRESS FILTER**, and the rule with the highest precedence. When `Some`, L3
+/// connects only to the device whose BD_ADDR is exactly these six bytes AND whose address type is
+/// `BT_L3_PEER_ADDR_TYPE`; nothing else about the device is consulted.
+///
+/// RULING — white board Q14, answered 2026-08-08: *"do what you need i will have it on"*. Peter
+/// authorised the approach and will have the speaker powered for the next boot.
+///
+/// WHY ADDRESS AND NOT NAME. The address is KNOWN — `bluetoothctl` on the host reports the paired
+/// device as `88:C6:26:CC:2D:3C (public)  Name: MEGABOOM`, and boot AR decoded byte for byte the
+/// same address off the air. Matching it is:
+///   * DETERMINISTIC — six bytes, either equal or not, with no decode between the air and the
+///     decision;
+///   * ZERO-TRANSMIT — it needs nothing the passive scan does not already hear. The alternative on
+///     the table was an ACTIVE scan, which transmits a SCAN_REQ to every advertiser in the room;
+///   * IMMUNE TO THE OPEN NAME QUESTION — boot AR rendered this device's name as `"."`, one
+///     unprintable byte. The walk was investigated and CLEARED (introducing the off-by-one yields
+///     ".MEGABOOM", not "."), but "cleared" is not "explained", and the address does not care.
+///
+/// **THE BYTE ORDER IS THE ONE WAY THIS FAILS SILENTLY.** These are the bytes in WIRE order (LSB
+/// first), which is how `bt_le_drain` stores what the controller sent; the witness lines render
+/// them MSB-first. Written the other way round the filter matches nothing on every boot and says
+/// nothing about why. The constant, the rendering and the host's own text are pinned to each other
+/// by `bt_addr_order_holds` and run as a fixture leg on every boot — see `bt_addr_fixture`.
+#[cfg(feature = "bt")]
+const BT_L3_PEER_ADDR: Option<[u8; 6]> = Some(BT_L3_PEER_ADDR_BYTES);
+
+/// BT-L3 — the address TYPE the filter above requires. `0x00` = Public, which is what the host
+/// reports for this device. Checked separately from the bytes so a random-address device with a
+/// numerically colliding address is refused with its own named verdict rather than silently.
+#[cfg(feature = "bt")]
+const BT_L3_PEER_ADDR_TYPE: u8 = BT_ADDR_TYPE_PUBLIC;
+
 /// BT-L3 — **PEER NAME FILTER.** When `Some(s)`, L3 connects only to a peer whose ADVERTISED LOCAL
 /// NAME contains `s` as a case-insensitive substring; every other candidate is counted and
 /// witnessed as skipped. When `None`, selection falls back to first-heard filtered by
 /// `BT_L3_RSSI_FLOOR` below.
 ///
+/// **THIS IS NOW THE FALLBACK, NOT THE ARMED RULE** — `BT_L3_PEER_ADDR` above is `Some` and
+/// decides alone. Everything below is kept, working and unchanged so that clearing the address
+/// constant restores it intact: it is what the bench falls back to if the speaker is replaced, or
+/// if the address ever turns out not to be stable.
+///
 /// RULING — white board Q6, answered: **the bench connects to Peter's own speaker, an Ultimate Ears
-/// MEGABOOM.** By NAME rather than by BD_ADDR, because the address is not known and a name filter
-/// is what makes the run reproducible for whoever is at the bench — turn the speaker on, boot,
-/// and it is the peer. Changing the target is ONE EDIT OF ONE LINE.
+/// MEGABOOM.** Q6 chose the NAME because the address was not known at the time; it since became
+/// known (the host's own pairing record, corroborated by boot AR off the air), and Q14 replaced
+/// the mechanism with the address while leaving the target the same device. Changing the target is
+/// ONE EDIT OF ONE LINE either way.
 ///
 /// WHAT THIS DEPENDS ON, stated because it is the thing that can make a correct build connect to
 /// nothing: the name must be in an AD structure this arc can HEAR. L2 scans PASSIVELY — it sends no
@@ -882,8 +939,18 @@ const BT_L3_ADV_CONNECTABLE: u8 = 0x00;
 #[cfg(feature = "bt")]
 const BT_L3_PEER_NAME: Option<&str> = Some("MEGABOOM");
 
-/// BT-L3 — RSSI floor in dBm, applied ONLY when `BT_L3_PEER_NAME` is `None` (a name filter already
-/// names its peer, and the right peer across the room is still the right peer).
+/// BT-L3 — RSSI floor in dBm, applied ONLY when BOTH `BT_L3_PEER_ADDR` and `BT_L3_PEER_NAME` are
+/// unset (a filter that already names its peer names it; the right peer across the room is still
+/// the right peer).
+///
+/// **THIS IS LOAD-BEARING NOW.** Boot AR heard the target at **-97 dBm** — essentially the noise
+/// floor, from a speaker in the same room as a host that is actively connected to it. It would
+/// fail this floor by 37 dB. With the address filter armed the floor is not reached at all (arm 1
+/// of the precedence chain returns before arm 3 is consulted, and the `l3=` verdicts prove which
+/// arm ran), so the weak signal cannot reject the peer. What a weak signal CAN do is make the
+/// advertisement intermittent: if it is not heard inside the 500 ms window the device never
+/// enters the table, and the capture reads `considered=0`. With the speaker on, that is now
+/// evidence about THE AIR, not about the filter.
 ///
 /// -60 dBm is roughly arm's length to a couple of metres for a typical BLE advertiser: it admits a
 /// device on the bench and excludes most of what is merely in the building. It is a MITIGATION,
@@ -907,6 +974,16 @@ const BT_L3_RSSI_NA: i8 = 127;
 const BT_L3_V_NOT_CONNECTABLE: &str = "not-connectable(no ADV_IND heard from it)";
 #[cfg(feature = "bt")]
 const BT_L3_V_ATYPE: &str = "SKIP:identity-address-type(0x02/0x03 cannot go in a create)";
+/// BT-L3 — the ADDRESS filter was armed and this device's BD_ADDR is not the target's. The
+/// device's own address is on the same witness line, so "not my speaker" is checkable by eye
+/// against the target printed in the `peer rule` line.
+#[cfg(feature = "bt")]
+const BT_L3_V_ADDR_MISMATCH: &str = "SKIP:address-mismatch";
+/// BT-L3 — the six bytes matched and the ADDRESS TYPE did not. Its own verdict because it is the
+/// one near-miss worth reading twice: a random address can collide numerically with a public one,
+/// so this line means "a different device is using those bytes", not "the target answered oddly".
+#[cfg(feature = "bt")]
+const BT_L3_V_ADDR_TYPE: &str = "SKIP:address-type-mismatch(right bytes, wrong address type)";
 #[cfg(feature = "bt")]
 const BT_L3_V_NO_NAME: &str = "SKIP:no-name-advertised";
 #[cfg(feature = "bt")]
@@ -3429,6 +3506,12 @@ impl Controller {
         // support and no confirmed stage, and a boot where the scan never starts is exactly the
         // boot where you still want to know the decode is sound. Cost is the serial lines.
         self.bt_name_fixture();
+        // ---- BT-L3: and so does the ADDRESS rule, for the same money ---------------------------
+        // Five comparisons and one rendering. It runs here rather than at the selection because
+        // the selection only runs when a radio answered and a device was heard — and the boot
+        // where nothing is heard is precisely the boot where "is the filter even capable of
+        // matching?" is the question. A red leg here means every address verdict below is void.
+        self.bt_addr_fixture();
 
         // ---- BT-L2: LE scan — the first thing this radio does that a person can see -----------
         // THE GUARD (review note 2). A scan is not another idempotent write: it turns on a
@@ -3577,6 +3660,95 @@ impl Controller {
                 "the name walk decodes every known payload correctly, INCLUDING a Complete Local Name of \"MEGABOOM\"; a name printed below is the name the air carried"
             } else {
                 "THE NAME WALK IS WRONG — every name printed below is suspect, and a no-match in this boot proves NOTHING about the room"
+            }
+        );
+        fail == 0
+    }
+
+    /// BT-L3 — the ADDRESS rule answers for itself, before the radio is asked anything.
+    ///
+    /// Two independent propositions, and they fail differently:
+    ///
+    ///   * THE MATCH LEGS (`BT_ADDR_CASES`) prove the rule discriminates: the target matches, one
+    ///     byte off does not, the byte-reversed form does not, and the right bytes with the wrong
+    ///     address type do not.
+    ///   * THE BYTE-ORDER LEG (`bt_addr_order_holds`) proves the constant is the RIGHT address.
+    ///     It has to be separate: the match legs compare the constant against ITSELF, so they all
+    ///     still pass if it is written MSB-first — the filter would then be consistently, silently
+    ///     wrong on every boot. Only this leg compares it against the outside world, the text the
+    ///     host's own pairing record prints.
+    ///
+    /// Returns true when every leg passed.
+    #[cfg(feature = "bt")]
+    fn bt_addr_fixture(&self) -> bool {
+        let mut pass = 0u32;
+        let mut fail = 0u32;
+        for c in BT_ADDR_CASES {
+            let got = bt_addr_matches(&c.addr, c.atype, &c.want, c.want_type);
+            if bt_addr_case_passes(c) {
+                pass += 1;
+                serial_print!(":: bt-l3: [{}] addr-fixture {} -> PASS addr=", self.idx, c.what);
+                for &b in bt_addr_render_msb(&c.addr).iter() {
+                    serial_print!("{}", b as char);
+                }
+                serial_println!(
+                    " type={:#04x} match={} (expected {}) == witness ::",
+                    c.atype, got, c.expect
+                );
+            } else {
+                fail += 1;
+                serial_print!(":: bt-l3: [{}] addr-fixture {} -> FAIL addr=", self.idx, c.what);
+                for &b in bt_addr_render_msb(&c.addr).iter() {
+                    serial_print!("{}", b as char);
+                }
+                serial_println!(
+                    " type={:#04x} match={} but expected {} — {} ::",
+                    c.atype, got, c.expect, c.why
+                );
+            }
+        }
+        // THE BYTE-ORDER RELATIONSHIP, printed whichever way it goes: the constant rendered the
+        // way every witness line renders a stored address, against the text the host reports.
+        let order = bt_addr_order_holds();
+        if order {
+            pass += 1;
+        } else {
+            fail += 1;
+        }
+        serial_print!(
+            ":: bt-l3: [{}] addr-fixture byte-order-relationship -> {} constant(wire order, LSB first)=[",
+            self.idx,
+            if order { "PASS" } else { "FAIL" }
+        );
+        for (j, b) in BT_L3_PEER_ADDR_BYTES.iter().enumerate() {
+            serial_print!("{}{:02x}", if j == 0 { "" } else { " " }, b);
+        }
+        serial_print!("] renders MSB-first as ");
+        for &b in bt_addr_render_msb(&BT_L3_PEER_ADDR_BYTES).iter() {
+            serial_print!("{}", b as char);
+        }
+        serial_print!(", host reports ");
+        for &b in BT_L3_PEER_ADDR_TEXT.iter() {
+            serial_print!("{}", b as char);
+        }
+        serial_println!(
+            " — {} == witness ::",
+            if order {
+                "the two agree, so the constant is the address the air will carry, stored the way bt_le_drain stores it"
+            } else {
+                "THE TWO DISAGREE — the constant is written in the WRONG BYTE ORDER and the address filter cannot match anything; every address verdict below is void and a no-match this boot proves NOTHING about the room"
+            }
+        );
+        serial_println!(
+            ":: bt-l3: [{}] addr-fixture tally — legs={} pass={} fail={} -> {} == witness ::",
+            self.idx,
+            BT_ADDR_CASES.len() + 1,
+            pass,
+            fail,
+            if fail == 0 {
+                "the address rule discriminates correctly AND the target constant is the right address in the right order; an l3= address verdict below is a fact about the device"
+            } else {
+                "THE ADDRESS RULE IS WRONG — every address verdict below is suspect"
             }
         );
         fail == 0
@@ -4920,40 +5092,60 @@ impl Controller {
                 continue;
             }
             considered += 1;
-            match BT_L3_PEER_NAME {
-                // THE NAME FILTER — Peter's ruling. Only a device whose advertised Local Name
-                // contains the target is eligible, however loud or however early anything else is.
-                Some(want) if !want.is_empty() => {
-                    if d.nlen == 0 {
-                        verdict[i] = BT_L3_V_NO_NAME;
-                        continue;
-                    }
-                    if !bt_name_contains_ci(&d.name[..d.nlen as usize], want.as_bytes()) {
-                        // A miss against a SHORTENED name is not a miss against the device: the
-                        // rest of the name was never heard. If the target could still straddle
-                        // the cut, say so distinctly — but do NOT connect on a maybe.
-                        verdict[i] = if !d.ncomplete
-                            && bt_name_maybe_ci(&d.name[..d.nlen as usize], want.as_bytes())
-                        {
-                            maybes += 1;
-                            BT_L3_V_MAYBE_SHORT
-                        } else {
-                            BT_L3_V_NAME_MISMATCH
-                        };
-                        continue;
-                    }
+            // ---- THE PRECEDENCE CHAIN, in the order declared at `BT_L3_PEER_ADDR` -------------
+            // ADDRESS first and alone: when it is armed, neither the name nor the RSSI floor is
+            // consulted for ANY candidate. That is what makes the -97 dBm sighting connectable —
+            // the floor is arm 3 and this `continue`s or falls through before it is ever read.
+            if let Some(want) = BT_L3_PEER_ADDR {
+                if !bt_addr_eq(&d.addr, &want) {
+                    verdict[i] = BT_L3_V_ADDR_MISMATCH;
+                    continue;
                 }
-                // No name filter: the RSSI floor is the whole of the mitigation, so it applies.
-                // (`Some("")` falls here on purpose — an empty needle matches everything, which is
-                // "no filter" written by accident, and it is not honoured as one.)
-                _ => {
-                    if d.rssi == BT_L3_RSSI_NA {
-                        verdict[i] = BT_L3_V_RSSI_NA;
-                        continue;
+                // Bytes matched. The type is checked SEPARATELY from the bytes purely so this
+                // near-miss gets its own verdict; `bt_addr_matches` is the same conjunction and is
+                // what the fixture drives.
+                if d.atype != BT_L3_PEER_ADDR_TYPE {
+                    verdict[i] = BT_L3_V_ADDR_TYPE;
+                    continue;
+                }
+            } else {
+                match BT_L3_PEER_NAME {
+                    // THE NAME FILTER — arm 2, reached only with the address filter unset. Only a
+                    // device whose advertised Local Name contains the target is eligible, however
+                    // loud or however early anything else is.
+                    Some(want) if !want.is_empty() => {
+                        if d.nlen == 0 {
+                            verdict[i] = BT_L3_V_NO_NAME;
+                            continue;
+                        }
+                        if !bt_name_contains_ci(&d.name[..d.nlen as usize], want.as_bytes()) {
+                            // A miss against a SHORTENED name is not a miss against the device: the
+                            // rest of the name was never heard. If the target could still straddle
+                            // the cut, say so distinctly — but do NOT connect on a maybe.
+                            verdict[i] = if !d.ncomplete
+                                && bt_name_maybe_ci(&d.name[..d.nlen as usize], want.as_bytes())
+                            {
+                                maybes += 1;
+                                BT_L3_V_MAYBE_SHORT
+                            } else {
+                                BT_L3_V_NAME_MISMATCH
+                            };
+                            continue;
+                        }
                     }
-                    if d.rssi < BT_L3_RSSI_FLOOR {
-                        verdict[i] = BT_L3_V_BELOW_FLOOR;
-                        continue;
+                    // Arm 3 — no address filter AND no name filter: the RSSI floor is the whole of
+                    // the mitigation, so it applies. (`Some("")` falls here on purpose — an empty
+                    // needle matches everything, which is "no filter" written by accident, and it
+                    // is not honoured as one.)
+                    _ => {
+                        if d.rssi == BT_L3_RSSI_NA {
+                            verdict[i] = BT_L3_V_RSSI_NA;
+                            continue;
+                        }
+                        if d.rssi < BT_L3_RSSI_FLOOR {
+                            verdict[i] = BT_L3_V_BELOW_FLOOR;
+                            continue;
+                        }
                     }
                 }
             }
@@ -5121,6 +5313,25 @@ impl Controller {
         // THE SELECTION RULE ITSELF is witnessed first, unconditionally, because a capture must
         // say WHO WAS ELIGIBLE before it says who was picked — a run that connected to nobody and
         // a run that was forbidden from connecting to anybody are different runs.
+        //
+        // The three arms are the three arms of the precedence chain, in order, so the line names
+        // which one actually ran — a capture must never leave the reader to infer it from the
+        // constants in a build they cannot see.
+        if let Some(want) = BT_L3_PEER_ADDR {
+            let txt = bt_addr_render_msb(&want);
+            serial_print!(
+                ":: bt-l3: [{}] peer rule — ADDRESS FILTER ARMED, addr=",
+                self.idx
+            );
+            for &b in txt.iter() {
+                serial_print!("{}", b as char);
+            }
+            serial_println!(
+                " type={} (white board Q14, Peter's ruling 2026-08-08: match his MEGABOOM by BD_ADDR). It DECIDES ALONE: the name filter and the RSSI floor are both bypassed for every candidate — which is deliberate, because this device was heard at -97dBm and would fail the {}dBm floor by 37dB. Matching is on the six bytes AS STORED (wire order, LSB first) plus the address type; the rendering above is the same MSB-first form every dev line uses, and the bt-l2 address fixture pins the two to each other. The scan stays PASSIVE — an address filter needs nothing a SCAN_REQ would buy == witness ::",
+                if BT_L3_PEER_ADDR_TYPE == 0x00 { "public" } else { "random" },
+                BT_L3_RSSI_FLOOR
+            );
+        } else {
         match BT_L3_PEER_NAME {
             Some(want) if !want.is_empty() => serial_println!(
                 ":: bt-l3: [{}] peer rule — NAME FILTER ARMED, name=\"{}\" (case-insensitive substring of the advertised Local Name; white board Q6, Peter's ruling: the bench connects to HIS OWN speaker and to nothing else). The RSSI floor is NOT applied — a named peer across the room is still the right peer. The scan is PASSIVE, so a name carried only in a SCAN_RSP is heard only if someone else solicits it == witness ::",
@@ -5131,6 +5342,7 @@ impl Controller {
                 self.idx, BT_L3_RSSI_FLOOR
             ),
         }
+        }
         match peer {
             Some((a, ty)) => serial_println!(
                 ":: bt-l3: [{}] peer SELECTED addr={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={} — heard advertising connectably (ADV_IND, Event_Type 0x00) and passed every filter; considered={} matched={} == witness ::",
@@ -5138,17 +5350,45 @@ impl Controller {
                 if ty == 0x00 { "public" } else { "random" },
                 considered, matched
             ),
-            None => serial_println!(
-                ":: bt-l3: [{}] peer NOT SELECTED — no device passed the filters: name={} considered={} matched=0 maybe_short_name={}. NO HCI_LE_Create_Connection is issued, nothing is outstanding, and there is nothing to cancel or disconnect. {} == witness ::",
-                self.idx,
-                match BT_L3_PEER_NAME { Some(w) if !w.is_empty() => w, _ => "(unset)" },
-                considered, maybes,
-                if maybes > 0 {
-                    "READ THIS BEFORE CONCLUDING THE DEVICE WAS ABSENT: a device advertised a SHORTENED Local Name that the target could still straddle. It was HEARD and deliberately NOT connected to, because a maybe is not a match. Its l3=MAYBE line above names it"
-                } else {
-                    "The ordinary reading with a name filter armed is that the named device is OFF or OUT OF RANGE; the per-device l3= verdicts above say which of the two the room looked like"
+            None => {
+                serial_print!(
+                    ":: bt-l3: [{}] peer NOT SELECTED — no device passed the filters: rule=",
+                    self.idx
+                );
+                // Name the ARMED rule and its target, not a constant that may not have been read.
+                match BT_L3_PEER_ADDR {
+                    Some(want) => {
+                        serial_print!("address ");
+                        for &b in bt_addr_render_msb(&want).iter() {
+                            serial_print!("{}", b as char);
+                        }
+                    }
+                    None => {
+                        serial_print!(
+                            "name {}",
+                            match BT_L3_PEER_NAME { Some(w) if !w.is_empty() => w, _ => "(unset)" }
+                        );
+                    }
                 }
-            ),
+                serial_println!(
+                    " considered={} matched=0 maybe_short_name={}. NO HCI_LE_Create_Connection is issued, nothing is outstanding, and there is nothing to cancel or disconnect. {} == witness ::",
+                    considered, maybes,
+                    if maybes > 0 && BT_L3_PEER_ADDR.is_none() {
+                        "READ THIS BEFORE CONCLUDING THE DEVICE WAS ABSENT: a device advertised a SHORTENED Local Name that the target could still straddle. It was HEARD and deliberately NOT connected to, because a maybe is not a match. Its l3=MAYBE line above names it"
+                    } else if BT_L3_PEER_ADDR.is_some() && considered == 0 {
+                        // THE READING THAT CHANGED. With the address rule armed there is no filter
+                        // left that could have rejected the target quietly, so a zero here is a
+                        // statement about the air: nothing connectable was heard AT ALL inside the
+                        // window. Boot AR heard this device at -97dBm, which is intermittent by
+                        // nature, so with the speaker ON this is the expected shape of a MISS.
+                        "considered=0 WITH THE ADDRESS RULE ARMED IS EVIDENCE ABOUT THE AIR, NOT ABOUT THE FILTER: no connectable advertiser of any address entered the table, so nothing was rejected — the 500ms window simply overlapped no advertisement. The target was last heard at -97dBm, at which range its reports are intermittent; the honest next step is another window, not a change to the filter"
+                    } else if BT_L3_PEER_ADDR.is_some() {
+                        "the room was heard and the target was not in it: every device above carries its own address and an l3=SKIP:address-mismatch (or SKIP:address-type-mismatch, which means those six bytes belong to a DIFFERENT device). The ordinary reading is that the target is OFF or out of range"
+                    } else {
+                        "The ordinary reading with a name filter armed is that the named device is OFF or OUT OF RANGE; the per-device l3= verdicts above say which of the two the room looked like"
+                    }
+                );
+            }
         }
         (halted, peer)
     }

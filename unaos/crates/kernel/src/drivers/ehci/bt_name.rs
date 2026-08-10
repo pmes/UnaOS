@@ -1,5 +1,8 @@
 // BT-L2 — the advertised Local Name: the AD-structure walk, the match rules, and the fixture
-// that proves the walk on payloads whose answer is known in advance.
+// that proves the walk on payloads whose answer is known in advance. Since GR23 it also carries
+// BT-L3's ADDRESS match (`bt_addr_matches` and below) for exactly the same reasons: it is pure
+// byte handling with a right answer known in advance, so it belongs where a fixture and the
+// host harness can drive the same source the radio path runs.
 //
 // WHY THIS IS ITS OWN FILE. Boot AR heard Peter's MEGABOOM — `addr=88:c6:26:cc:2d:3c`, byte for
 // byte the address the host's own stack reports for it — and rendered its name as `"."`, one
@@ -265,4 +268,153 @@ pub const BT_NAME_CASES: &[BtNameCase] = &[
 pub fn bt_name_case_passes(c: &BtNameCase) -> bool {
     let got = bt_decode_local_name(c.data);
     got.as_bytes() == c.want_name && got.ncomplete == c.want_complete && got.ncut == c.want_cut
+}
+
+// ===========================================================================================
+// BT-L3 — THE ADDRESS MATCH. Same file, same reasons: pure byte handling, no I/O, shared with
+// the fixture and with `tools/btname_harness.rs` rather than transcribed into either.
+// ===========================================================================================
+
+/// `Peer_Address_Type` values that may go into `HCI_LE_Create_Connection`. 0x02/0x03 are the
+/// resolved-identity forms and are refused earlier, by the caller.
+pub const BT_ADDR_TYPE_PUBLIC: u8 = 0x00;
+pub const BT_ADDR_TYPE_RANDOM: u8 = 0x01;
+
+/// **THE BYTE ORDER, AND THE ONLY PLACE IT IS WRITTEN DOWN.**
+///
+/// A BD_ADDR travels LITTLE-ENDIAN on the wire: the `LE Advertising Report`'s six `Address`
+/// octets arrive LSB first, and `bt_le_drain` stores them exactly as they arrived
+/// (`addr.copy_from_slice(&pkt[6..12])` — no reversal). The human notation is the reverse, so
+/// every witness renders `addr[5]` first. A constant written in the HUMAN order and compared
+/// against a stored address therefore NEVER MATCHES, and nothing in a capture would say why:
+/// the target would simply never be selected, on every boot, silently.
+///
+/// So the constant is written in WIRE order — and `bt_addr_render_msb` below plus the
+/// `byte-order-relationship` fixture leg pin the relationship between it and the printed form,
+/// so that a future reader cannot get it wrong and a future editor cannot get it wrong quietly.
+///
+/// `88:c6:26:cc:2d:3c` is Peter's Ultimate Ears MEGABOOM: the address his own host stack reports
+/// for the paired device, and byte for byte the address boot AR decoded off the air.
+pub const BT_L3_PEER_ADDR_BYTES: [u8; 6] = [0x3C, 0x2D, 0xCC, 0x26, 0xC6, 0x88];
+
+/// The SAME address in the human, MSB-first notation, as ASCII — the exact text a witness line
+/// prints. The fixture asserts `bt_addr_render_msb(BT_L3_PEER_ADDR_BYTES) == this`, which is what
+/// makes the wire order above checkable rather than merely asserted in a comment.
+pub const BT_L3_PEER_ADDR_TEXT: &[u8; 17] = b"88:c6:26:cc:2d:3c";
+
+/// Render a stored (wire-order) BD_ADDR into the human MSB-first `aa:bb:cc:dd:ee:ff` ASCII form.
+/// Lowercase hex, to match every existing `bt-l2`/`bt-l3` witness line.
+pub fn bt_addr_render_msb(addr: &[u8; 6]) -> [u8; 17] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [b':'; 17];
+    for k in 0..6 {
+        let b = addr[5 - k];
+        out[k * 3] = HEX[(b >> 4) as usize];
+        out[k * 3 + 1] = HEX[(b & 0x0F) as usize];
+    }
+    out
+}
+
+/// Byte-for-byte address equality. Trivial on purpose: the value of putting it here is that the
+/// fixture, the harness and the radio path all call the SAME comparison, so a leg that passes is
+/// a statement about the selection the radio will actually make.
+pub fn bt_addr_eq(a: &[u8; 6], b: &[u8; 6]) -> bool {
+    a == b
+}
+
+/// The full address rule: the six bytes AND the address type.
+///
+/// The type is part of the identity, not decoration. A public and a random address are drawn from
+/// different spaces and a random one can collide with a public one numerically; connecting to a
+/// random-address device because its bytes happen to equal our public target would be exactly the
+/// "reached into the room" failure the whole filter exists to prevent. The host reports Peter's
+/// speaker as `(public)`, so `BT_ADDR_TYPE_PUBLIC` is what the caller asks for.
+pub fn bt_addr_matches(addr: &[u8; 6], atype: u8, want: &[u8; 6], want_type: u8) -> bool {
+    bt_addr_eq(addr, want) && atype == want_type
+}
+
+/// One address fixture leg: a candidate as the drain would have stored it, the target, and the
+/// verdict the rule MUST reach.
+pub struct BtAddrCase {
+    pub what: &'static str,
+    /// The candidate address in WIRE order — i.e. exactly as `bt_le_drain` stores it.
+    pub addr: [u8; 6],
+    pub atype: u8,
+    pub want: [u8; 6],
+    pub want_type: u8,
+    pub expect: bool,
+    /// Why this leg exists — printed on FAILURE so a red fixture explains itself in the capture.
+    pub why: &'static str,
+}
+
+pub const BT_ADDR_CASES: &[BtAddrCase] = &[
+    BtAddrCase {
+        what: "megaboom-exact",
+        addr: BT_L3_PEER_ADDR_BYTES,
+        atype: BT_ADDR_TYPE_PUBLIC,
+        want: BT_L3_PEER_ADDR_BYTES,
+        want_type: BT_ADDR_TYPE_PUBLIC,
+        expect: true,
+        why: "the target address, public, must match itself — if this leg is red the filter \
+               cannot select anything and a no-match proves nothing about the room",
+    },
+    BtAddrCase {
+        what: "wrong-last-byte",
+        // Wire order, so index 0 is the byte printed LAST: 88:c6:26:cc:2d:3d.
+        addr: [0x3D, 0x2D, 0xCC, 0x26, 0xC6, 0x88],
+        atype: BT_ADDR_TYPE_PUBLIC,
+        want: BT_L3_PEER_ADDR_BYTES,
+        want_type: BT_ADDR_TYPE_PUBLIC,
+        expect: false,
+        why: "one byte off is a DIFFERENT device; an address filter that admits a neighbour is \
+               not an address filter",
+    },
+    BtAddrCase {
+        what: "byte-order-reversed-must-not-match",
+        // The target written in the HUMAN order by mistake — the exact error this file exists to
+        // make impossible. It must NOT match a correctly stored wire-order address.
+        addr: [0x88, 0xC6, 0x26, 0xCC, 0x2D, 0x3C],
+        atype: BT_ADDR_TYPE_PUBLIC,
+        want: BT_L3_PEER_ADDR_BYTES,
+        want_type: BT_ADDR_TYPE_PUBLIC,
+        expect: false,
+        why: "if this leg PASSES as a match the constant was written MSB-first and the filter is \
+               silently dead on every boot",
+    },
+    BtAddrCase {
+        what: "right-bytes-wrong-address-type",
+        addr: BT_L3_PEER_ADDR_BYTES,
+        atype: BT_ADDR_TYPE_RANDOM,
+        want: BT_L3_PEER_ADDR_BYTES,
+        want_type: BT_ADDR_TYPE_PUBLIC,
+        expect: false,
+        why: "a random address may collide numerically with a public one; the type is part of \
+               the identity and a create posted with the wrong one names a different device",
+    },
+    BtAddrCase {
+        what: "all-zero-candidate",
+        addr: [0; 6],
+        atype: BT_ADDR_TYPE_PUBLIC,
+        want: BT_L3_PEER_ADDR_BYTES,
+        want_type: BT_ADDR_TYPE_PUBLIC,
+        expect: false,
+        why: "a default-initialised BtDev must not match the target — an empty table entry is \
+               not a sighting",
+    },
+];
+
+/// Run one address fixture leg. Returns `true` when the rule reached the expected verdict.
+pub fn bt_addr_case_passes(c: &BtAddrCase) -> bool {
+    bt_addr_matches(&c.addr, c.atype, &c.want, c.want_type) == c.expect
+}
+
+/// THE BYTE-ORDER RELATIONSHIP, as a checkable proposition: the constant, rendered the way every
+/// witness line renders a stored address, is the address Peter's host reports.
+///
+/// This is the leg that fails if `BT_L3_PEER_ADDR_BYTES` is ever rewritten MSB-first. It is
+/// deliberately separate from the match legs: those would still all pass with a consistently
+/// reversed constant (they compare it against itself) — only this one compares it against the
+/// OUTSIDE WORLD.
+pub fn bt_addr_order_holds() -> bool {
+    &bt_addr_render_msb(&BT_L3_PEER_ADDR_BYTES) == BT_L3_PEER_ADDR_TEXT
 }
