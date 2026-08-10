@@ -613,6 +613,16 @@ pub struct Controller {
     /// once; see `bt_arm_events`.
     #[cfg(feature = "bt")]
     bt_evt_armed: bool,
+    /// BT-L4 — the claimed radio's ACL data pair: `(bulk_in, bulk_out, in_mps, out_mps)`, endpoint
+    /// numbers only (no direction bit), `(0, 0, 0, 0)` until a radio is claimed.
+    ///
+    /// Carried on the controller for the same reason `bt_parent` is: the ACL exchange runs deep
+    /// inside `bt_l3_connect`, four call frames below the descriptor walk that learned these
+    /// numbers, and threading four more parameters through `bt_le_scan` -> `bt_l3_connect` would
+    /// change three signatures to move a fact that never varies within a radio. Written exactly
+    /// once, in `bt_probe`'s selection, and read exactly once, in `bt_l4_att`.
+    #[cfg(feature = "bt")]
+    bt_acl: (u8, u8, u16, u16),
 }
 
 // Raw pointers to identity-mapped DMA memory; access is serialized by the EHCI_HID mutex.
@@ -1063,6 +1073,131 @@ const BT_L3_DISC_MS: u64 = 600;
 #[cfg(feature = "bt")]
 const BT_L3_EVT_MAX: u32 = 16;
 
+// ---------------------------------------------------------------------------------------------
+// BT-L4 — ONE ATT read over the live LE link, and the transport question it had to answer first.
+//
+// THE TRANSPORT, STATED BEFORE ANY PROTOCOL. Through GR23 this driver armed exactly ONE Bluetooth
+// endpoint: the interrupt-IN HCI EVENT endpoint (`bt_arm_events`, periodic schedule, its own
+// `bt_slot`). HCI COMMANDS ride EP0 control (`bt_hci_send`, bmRequestType 0x20 — Bluetooth Core
+// Vol 4 Part B). The ACL DATA pair — bulk-IN / bulk-OUT on the same interface — was named in the
+// L0 reachability witness and NEVER TOUCHED, and the reason was recorded in the feature docs as a
+// hard constraint: bulk conventionally rides the ASYNC schedule, and this Panther Point's async
+// engine master-aborted its first schedule fetch across 13 metal probes (PROBE-14).
+//
+// That constraint was true of the async engine as it was then driven. It is NOT true of how this
+// driver drives it now, and the fact that supersedes it is PROBE-14e, established after the L0
+// scope note was written and recorded at `overlay_txn`: overlay-direct rides the ASYNC engine,
+// and "async only ever died at the qTD FETCH, which overlay-direct never performs". Every EP0
+// control transfer on this metal — including every HCI command L0/L1/L2/L3 send — is already an
+// async-engine transaction with ASE toggled per stage. So the async schedule is not unreachable
+// on this silicon; the qTD FETCH is. A bulk transaction that pre-loads the QH overlay performs no
+// qTD fetch either.
+//
+// WHAT IS THEREFORE NEW HERE, AND WHAT IS NOT. Not new: the transaction primitive (overlay-direct
+// on the work QH, ASE per transaction, bounded token poll — metal-proven thousands of times per
+// boot). New, and UNPROVEN ON METAL until the next boot says otherwise: pointing that primitive at
+// a BULK endpoint rather than at EP0. `bt_acl_txn` is written so that the capture distinguishes
+// the two — every ACL transaction witnesses its endpoint, token and residual, so a failure names
+// whether the transaction ran at all, halted, or simply found no data.
+//
+// SCOPE. One ATT Read_By_Type_Request for the Battery Level characteristic, and whatever answer
+// comes back. It is deliberately the smallest useful GATT exchange: a 7-byte ATT PDU that fits the
+// 23-byte default ATT MTU with room to spare, needs no MTU exchange, no pairing, no encryption,
+// and no discovery round trip. It runs between `LE Connection Complete` and `HCI_Disconnect`, and
+// NOTHING it does can prevent the disconnect: it is bounded on every path and returns unit.
+// ---------------------------------------------------------------------------------------------
+
+/// BT-L4 — ACL-U packet-boundary flag, host to controller: 0b10 = FIRST packet of a higher-layer
+/// message, NON-automatically-flushable (Bluetooth Core Vol 4 Part E §5.4.2). It occupies bits
+/// 12-13 of the first ACL header halfword, above the 12-bit connection handle. 0b01 (continuing
+/// fragment) is what a second fragment of the same L2CAP PDU would carry; this arc never fragments
+/// — its whole PDU is 11 bytes against an ACL packet length of at least 27 — so only the START
+/// value is defined here, and the reassembly side refuses anything else rather than guessing.
+#[cfg(feature = "bt")]
+const BT_ACL_PB_START_NONFLUSH: u16 = 0b10;
+/// BT-L4 — the ACL-U continuation flag (0b01). Named only so the receive path can SAY that it saw
+/// a fragment it will not reassemble, instead of printing a bare number.
+#[cfg(feature = "bt")]
+const BT_ACL_PB_CONT: u16 = 0b01;
+/// BT-L4 — L2CAP CID 0x0004 = the ATT fixed channel on an LE-U logical link (Bluetooth Core Vol 3
+/// Part A §2.1, Table 2.3). Fixed: no channel configuration and no connection request exist on
+/// LE-U for it, which is exactly why one ATT request is reachable in a single packet.
+#[cfg(feature = "bt")]
+const BT_L2CAP_CID_ATT: u16 = 0x0004;
+/// BT-L4 — L2CAP CID 0x0005 = the LE signalling channel. Not used by this arc, and named for the
+/// receive path: a peer commonly sends an `L2CAP_CONNECTION_PARAMETER_UPDATE_REQ` on it moments
+/// after the link comes up, and an ACL packet walked past should be identified, not counted.
+#[cfg(feature = "bt")]
+const BT_L2CAP_CID_LE_SIG: u16 = 0x0005;
+/// BT-L4 — ATT opcodes (Bluetooth Core Vol 3 Part F §3.4.4): Read By Type Request / Response, and
+/// the Error Response every request may be answered with instead.
+#[cfg(feature = "bt")]
+const BT_ATT_OP_READ_BY_TYPE_REQ: u8 = 0x08;
+#[cfg(feature = "bt")]
+const BT_ATT_OP_READ_BY_TYPE_RSP: u8 = 0x09;
+#[cfg(feature = "bt")]
+const BT_ATT_OP_ERROR_RSP: u8 = 0x01;
+/// BT-L4 — the characteristic being read: **Battery Level, UUID 0x2A19** (Bluetooth Assigned
+/// Numbers; the sole characteristic of the Battery Service, UUID 0x180F).
+///
+/// WHY READ-BY-TYPE AND NOT A SERVICE DISCOVERY FIRST. `ATT_READ_BY_TYPE_REQ` over the whole
+/// handle range 0x0001..0xFFFF asks the peer for every attribute of this TYPE and its value, in
+/// one round trip, without knowing a single handle in advance. The alternative — discover the
+/// Battery Service by UUID, then discover its characteristics, then read the value handle — is
+/// three round trips to learn what one already returns. The cost of the shortcut is that a peer
+/// with no Battery Service answers `ATT_ERROR_RSP` with `Attribute Not Found` (0x0A), which is a
+/// perfectly good, fully witnessed answer: it proves the whole stack end to end (ACL out, L2CAP,
+/// ATT, ACL in) and says only that this particular speaker does not publish a battery level.
+///
+/// The two bytes travel LITTLE-ENDIAN, like every other UUID on the wire.
+#[cfg(feature = "bt")]
+const BT_ATT_UUID_BATTERY_LEVEL: u16 = 0x2A19;
+/// BT-L4 — the handle range of the request: the whole attribute space. §3.4.4.1 requires
+/// `Starting_Handle >= 0x0001` and `Ending_Handle >= Starting_Handle`; 0x0000 is not a valid
+/// handle and would earn `Invalid Handle` (0x01).
+#[cfg(feature = "bt")]
+const BT_ATT_HANDLE_FIRST: u16 = 0x0001;
+#[cfg(feature = "bt")]
+const BT_ATT_HANDLE_LAST: u16 = 0xFFFF;
+/// BT-L4 — the ATT_MTU this arc relies on, and does NOT negotiate. 23 bytes is the LE default
+/// (Vol 3 Part F §3.2.9 / Vol 3 Part G §5.2.1) and is the value in force until an
+/// `ATT_EXCHANGE_MTU_REQ` changes it. The request built here is 7 bytes and any response is capped
+/// at 23 by the peer, so no fragmentation is possible in either direction — which is why the
+/// receive path is allowed to refuse a continuation fragment rather than reassemble one.
+#[cfg(feature = "bt")]
+const BT_ATT_MTU_DEFAULT: usize = 23;
+/// BT-L4 — cap on ACL bytes staged for one transaction. 4 (ACL header) + 4 (L2CAP header) + the
+/// default ATT MTU, rounded up to 64: the same order as the endpoint's own max packet, and small
+/// enough that the buffer this rides in (`data_buf`, `Buf256`) is nowhere near its limit.
+#[cfg(feature = "bt")]
+const BT_ACL_BUF_MAX: usize = 64;
+/// BT-L4 — bounded wall-clock window, in ms, for the peer's ATT response to arrive on bulk-IN.
+/// Sized against the link this arc negotiates: `BT_L3_CONN_INTERVAL_MIN/MAX` are 30-50 ms, and a
+/// peripheral answers an ATT request on one of the next connection events, so 600 ms is at least
+/// a dozen opportunities. It is spent ONLY on a link that came up, and it is spent as a series of
+/// short bulk-IN polls, not as one long block.
+#[cfg(feature = "bt")]
+const BT_L4_RSP_MS: u64 = 600;
+/// BT-L4 — bounded wall-clock window, in ms, for the ACL **OUT** transaction's token to retire. A
+/// single 15-byte packet to a controller that has just accepted commands on EP0; if it has not
+/// retired in 50 ms the async engine is not running it at all, which is the PROBE-14 outcome and
+/// is not made truer by waiting longer.
+///
+/// THE IN DIRECTION DOES NOT USE THIS, AND THAT IS DELIBERATE. Each bulk-IN gets the WHOLE
+/// remaining response window as one transaction, rather than a series of short polls. A short poll
+/// that expires leaves the transfer ACTIVE and the next poll rewrites the overlay — so a packet
+/// landing in the gap between the two would be lost AND would desynchronise the pipe's data
+/// toggle, silently, for every packet after it. One arm per packet has no such gap: the loop
+/// iterates only when a transaction actually retired.
+#[cfg(feature = "bt")]
+const BT_L4_TXN_MS: u64 = 50;
+/// BT-L4 — structural cap on ACL packets read while awaiting the ATT response, on top of the
+/// wall-clock window. Same role `BT_L3_EVT_MAX` plays for events: a peer that streams signalling
+/// or notification traffic must not let a loop whose per-iteration bound keeps being satisfied run
+/// on. Eight is generous — the expected count is one.
+#[cfg(feature = "bt")]
+const BT_L4_PKT_MAX: u32 = 8;
+
 /// BT-L1 — reassembly cap for one HCI event that spans multiple event-endpoint packets. The event
 /// endpoint's max packet is 16 B (census: `IN1/int/16`), but an HCI event runs up to 2 + 255 B;
 /// the USB transport delivers it as ceil(len/mps) interrupt-IN transfers. 260 covers the largest
@@ -1127,6 +1262,11 @@ struct BtIntf {
     int_iv: u8,
     bulk_in: u8,
     bulk_out: u8,
+    /// BT-L4 — the ACL pair's max packet sizes. Recorded alongside the endpoint numbers for the
+    /// same reason `int_mps` is: a QH cannot be programmed without one, and reading it back off
+    /// the census table by eye is exactly the transcription this struct exists to avoid.
+    bulk_in_mps: u16,
+    bulk_out_mps: u16,
     /// (bEndpointAddress, bmAttributes & 0x3, wMaxPacketSize & 0x7FF)
     eps: [(u8, u8, u16); BT_EP_MAX],
     nep: u8,
@@ -3111,13 +3251,22 @@ impl Controller {
                                 f.int_mps = mps;
                                 f.int_iv = cfg[off + 6];
                             }
-                            // bulk — the ACL data pair. Recorded so the witness can state that
-                            // they exist (a later arc needs them), and, at tier 2, as part of
-                            // the transport fingerprint; NOT armed, NOT configured, and not
-                            // reachable at all without the async schedule this silicon cannot
-                            // run.
-                            (2, true) => f.bulk_in = ep & 0xF,
-                            (2, false) => f.bulk_out = ep & 0xF,
+                            // bulk — the ACL data pair, and at tier 2 part of the transport
+                            // fingerprint. Through GR23 these were RECORDED AND NEVER TOUCHED:
+                            // bulk conventionally rides the async schedule and this Panther
+                            // Point's async engine master-aborts its first schedule FETCH
+                            // (PROBE-14). BT-L4 revisits that on the one fact probe-14e
+                            // established afterwards — overlay-direct never performs a qTD fetch
+                            // and therefore already rides the async engine successfully for every
+                            // EP0 control transfer this driver makes. See `bt_acl_txn`.
+                            (2, true) if f.bulk_in == 0 => {
+                                f.bulk_in = ep & 0xF;
+                                f.bulk_in_mps = mps;
+                            }
+                            (2, false) if f.bulk_out == 0 => {
+                                f.bulk_out = ep & 0xF;
+                                f.bulk_out_mps = mps;
+                            }
                             _ => {}
                         }
                     }
@@ -3217,6 +3366,10 @@ impl Controller {
         let intf = sel.num;
         let (evt_ep, evt_mps, evt_interval) = (sel.int_in, sel.int_mps, sel.int_iv);
         let (bulk_in, bulk_out) = (sel.bulk_in, sel.bulk_out);
+        // BT-L4 — latch the ACL pair for `bt_l4_att`, which runs four frames below here. Written
+        // even when one or both are absent (0): `bt_l4_att` gates on them and says so, which is a
+        // better witness than a silently skipped stage.
+        self.bt_acl = (bulk_in, bulk_out, sel.bulk_in_mps, sel.bulk_out_mps);
         serial_println!(
             ":: bt-l0: [{}] claim addr={} intf={} alt=0 class={:#04x}/{:#04x}/{:#04x} evt_ep=IN{} -> selected by ENDPOINT EVIDENCE, tier {} ({}) == witness ::",
             self.idx, t.addr, intf, sel.cls, sel.sub, sel.pro, evt_ep, tier,
@@ -3239,8 +3392,9 @@ impl Controller {
             _ => "FS",
         };
         serial_println!(
-            ":: bt-l0: [{}] reachability addr={} spd={} intf={} class={:#04x}/{:#04x}/{:#04x} evt_ep=IN{} mps={} interval={} bulk_in=IN{} bulk_out=OUT{} parent=(hub {} port {}) tt=(hub {} port {}) -> {} == witness ::",
-            self.idx, t.addr, spd, intf, sel.cls, sel.sub, sel.pro, evt_ep, evt_mps, evt_interval, bulk_in, bulk_out,
+            ":: bt-l0: [{}] reachability addr={} spd={} intf={} class={:#04x}/{:#04x}/{:#04x} evt_ep=IN{} mps={} interval={} bulk_in=IN{}/{} bulk_out=OUT{}/{} parent=(hub {} port {}) tt=(hub {} port {}) -> {} == witness ::",
+            self.idx, t.addr, spd, intf, sel.cls, sel.sub, sel.pro, evt_ep, evt_mps, evt_interval,
+            bulk_in, sel.bulk_in_mps, bulk_out, sel.bulk_out_mps,
             self.bt_parent.0, self.bt_parent.1, t.hub_addr, t.hub_port,
             if t.eps == QH_EPS_HIGH {
                 "TT-NONE(high-speed device)"
@@ -4581,6 +4735,19 @@ impl Controller {
             }
         }
 
+        // ---- 4a-ter. BT-L4: ONE ATT READ, ON A LINK THAT IS ABOUT TO BE RELEASED ---------------
+        // Placed HERE and nowhere else: after every path that can establish or recover a handle has
+        // run, and BEFORE the mandatory teardown, so that
+        //   * it can only ever run on a handle this arc has proven live, and
+        //   * it is structurally incapable of skipping the disconnect — it returns unit, it is
+        //     bounded on every path, and the `if live` block below is not conditional on anything
+        //     it does.
+        // The cost it adds to a boot that reaches here is bounded by `BT_L4_RSP_MS` plus one
+        // `BT_L4_TXN_MS` for the send.
+        if live {
+            self.bt_l4_att(t, handle);
+        }
+
         // ---- 4b. MANDATORY TEARDOWN: release a live connection ---------------------------------
         if live {
             if self.bt_l3_disconnect(
@@ -4772,6 +4939,397 @@ impl Controller {
             }
         );
     }
+
+    // ================================ BT-L4 ==================================================
+
+    /// BT-L4 — ONE overlay-direct transaction on a BULK endpoint of the claimed radio.
+    ///
+    /// This is `overlay_txn`'s shape aimed somewhere new, and the differences are the whole of the
+    /// review surface:
+    ///
+    /// * **The QH is the same one.** `self.async_qh` is the driver's single work QH, already
+    ///   ring-linked behind the dummy async head. Retargeting it is exactly what `control_txn`
+    ///   does on every transfer; the only thing that makes it safe is that this driver is strictly
+    ///   synchronous (one transfer in flight, main-loop context, EHCI_HID mutex held), and the
+    ///   next `control_txn` retargets it again in full. **No control transfer may run between the
+    ///   OUT and the IN of an ACL exchange**, and none does: `bt_l4_att` issues no HCI command.
+    /// * **No C-bit.** `QH_CTL_EP` marks a CONTROL endpoint behind a TT (EHCI 1.0 §3.6.2) and is
+    ///   wrong on a bulk endpoint; the TT hub address/port still apply, because a full-speed bulk
+    ///   endpoint behind a high-speed hub is still reached by split transactions.
+    /// * **Software owns the toggle.** `QH_DTC` makes the controller take the toggle from the
+    ///   overlay token, so the caller passes the current one in and reads the next one out of the
+    ///   retired token's DT bit. A bulk pipe's toggle persists across transfers for the life of the
+    ///   pipe, and getting it wrong makes the peer silently discard packets — which is why it is
+    ///   returned as data rather than assumed.
+    /// * **Bounded, and quiet on the ordinary case.** A bulk-IN on an endpoint with no data NAKs
+    ///   until the budget expires; that is the EXPECTED outcome of a poll, not an error, so
+    ///   expiry returns `Err("nodata")` without printing. Real failures (halt/XactErr) print.
+    ///
+    /// Returns the number of bytes actually transferred and the toggle to use next.
+    ///
+    /// CHAIN MODE IS REFUSED, HONESTLY. `overlay_mode == false` means this controller executes
+    /// fetched qTDs (QEMU's model) and has never been driven overlay-direct. Building a second,
+    /// unexercised qTD-chain bulk path to serve a configuration that has no Bluetooth radio in it
+    /// would be inventing coverage; the caller says so in the capture and skips L4.
+    #[cfg(feature = "bt")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_acl_txn(
+        &mut self,
+        t: &Target,
+        ep: u8,
+        dir_in: bool,
+        mps: u16,
+        len: u32,
+        toggle: bool,
+        budget: u64,
+    ) -> Result<(u32, bool), &'static str> {
+        let qh = self.async_qh;
+        (*qh).ep_chars = (t.addr as u32)
+            | ((ep as u32) << 8)
+            | t.eps
+            | QH_DTC
+            | ((mps as u32) << QH_MPS_SHIFT);
+        // Split fields for a FS/LS endpoint behind a TT. On the async schedule the controller runs
+        // the split state machine itself (EHCI 1.0 §4.12.1) and does not consult S-mask/C-mask, but
+        // `control_txn` writes them on this same QH for FS targets and the masks are harmless where
+        // they are ignored; writing the same shape keeps the two paths comparable in a register
+        // dump. The TT hub address and port are NOT optional — without them a full-speed endpoint
+        // behind the SMSC hub is unreachable, which is the BT-L0 lesson in a different transfer
+        // type.
+        let masks = if t.eps == QH_EPS_HIGH {
+            0x01 << QH_SMASK_SHIFT
+        } else {
+            (0x01 << QH_SMASK_SHIFT) | (0x1C << QH_CMASK_SHIFT)
+        };
+        (*qh).ep_caps = QH_MULT1
+            | masks
+            | ((t.hub_addr as u32) << QH_HUBADDR_SHIFT)
+            | ((t.hub_port as u32) << QH_PORT_SHIFT);
+
+        let pid = if dir_in { QTD_PID_IN } else { QTD_PID_OUT };
+        let dt = if toggle { QTD_DT } else { 0 };
+        (*qh).current_qtd = 0;
+        (*qh).overlay[0] = PTR_TERMINATE;
+        (*qh).overlay[1] = PTR_TERMINATE;
+        (*qh).overlay[3] = self.data_buf_phys as u32;
+        (*qh).overlay[4] = 0;
+        core::ptr::write_volatile(
+            &mut (*qh).overlay[2],
+            QTD_ACTIVE | QTD_CERR3 | (len << QTD_TOTAL_SHIFT) | pid | QTD_IOC | dt,
+        );
+        (*qh).horiz = (self.head_phys as u32) | PTR_TYPE_QH;
+        let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
+        let _ = mmio_write32(self.op + OP_USBCMD, cmd | CMD_ASE);
+        // The ASE handshake is NOT waited on here, unlike `overlay_txn`. It is folded into the one
+        // deadline below: the token cannot retire before the schedule is running, so a completion
+        // seen at all proves the schedule ran, and a completion never seen is reported as the same
+        // "did not retire" either way. One deadline, and it is the caller's.
+        let start = crate::arch::now_cycles();
+        let mut done = false;
+        loop {
+            if core::ptr::read_volatile(&(*qh).overlay[2]) & QTD_ACTIVE == 0 {
+                done = true;
+                break;
+            }
+            if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let tok = core::ptr::read_volatile(&(*qh).overlay[2]);
+        let cmd2 = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
+        let _ = mmio_write32(self.op + OP_USBCMD, cmd2 & !CMD_ASE);
+        if !done {
+            // The overlay is left ACTIVE, exactly as `overlay_txn`'s own timeout path leaves it.
+            // That is safe for the same reason: ASE has just been cleared, so the async engine no
+            // longer traverses the ring, and the next transaction (control or ACL) rewrites the
+            // overlay before setting ASE again.
+            return Err("nodata");
+        }
+        if tok & QTD_ERR_MASK != 0 {
+            serial_println!(
+                ":: bt-l4: [{}] ACL {}{} HALTED token={:#010x} (halted/xact — the transaction reached the wire and failed, which is a different fact from silence) == witness ::",
+                self.idx, if dir_in { "IN" } else { "OUT" }, ep, tok
+            );
+            return Err("halted");
+        }
+        let moved = len.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF);
+        Ok((moved, tok & QTD_DT != 0))
+    }
+
+    /// BT-L4 — read the peer's Battery Level over the live LE link, and witness every layer.
+    ///
+    /// Runs between `LE Connection Complete` and `HCI_Disconnect`, on a handle the caller has
+    /// already proven live. It returns unit and cannot fail the arc: every path is bounded and the
+    /// disconnect that follows is unconditional.
+    ///
+    /// THE FOUR LAYERS, each witnessed separately so a failure names the one that broke:
+    ///   1. **USB bulk** — `bt_acl_txn` on the ACL OUT/IN endpoints (`bt-l4: transport`).
+    ///   2. **HCI ACL** — the 4-byte header: handle + PB/BC flags + data length (Vol 4 Part E §5.4.2).
+    ///   3. **L2CAP** — the 4-byte header: PDU length + CID 0x0004 (Vol 3 Part A §3.1).
+    ///   4. **ATT** — `ATT_READ_BY_TYPE_REQ`, and the response or error the peer returns.
+    ///
+    /// WHAT THE HOST DOES NOT DO HERE, and why it is defensible: no ACL flow control. The Core spec
+    /// bounds the host to `HC_Total_Num_ACL_Data_Packets` unacknowledged packets, tracked via
+    /// `Number Of Completed Packets` events (Vol 4 Part E §4.1.1). This arc sends exactly ONE
+    /// packet on a controller L1 witnessed as having at least one ACL buffer, so the bound cannot
+    /// be exceeded by construction — there is no credit accounting because there is nothing to
+    /// account. The `Number Of Completed Packets` event the controller emits in reply lands on the
+    /// event endpoint and is walked past by the disconnect's own waits, which is what `bt_l3_await`
+    /// does with every event it did not ask for.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_l4_att(&mut self, t: &Target, handle: u16) {
+        let (bulk_in, bulk_out, in_mps, out_mps) = self.bt_acl;
+        // ---- the transport gate ---------------------------------------------------------------
+        // Every reason L4 might be unreachable is named on ONE line, before anything is sent, so a
+        // capture with no ACL traffic in it says why rather than merely lacking it.
+        if bulk_in == 0 || bulk_out == 0 || in_mps == 0 || out_mps == 0 || !self.overlay_mode {
+            serial_println!(
+                ":: bt-l4: [{}] ATT read NOT ATTEMPTED — bulk_in=IN{}/{} bulk_out=OUT{}/{} overlay_mode={}; {}. NO ACL packet was sent and the disconnect below is unaffected == witness ::",
+                self.idx, bulk_in, in_mps, bulk_out, out_mps, self.overlay_mode,
+                if !self.overlay_mode {
+                    "this controller executes FETCHED qTDs (chain mode) and has never been driven overlay-direct; BT-L4's transport argument rests on probe-14e's overlay-direct-on-async finding and does not extend to a chain path this arc has not built"
+                } else {
+                    "the claimed interface does not carry a usable ACL bulk pair, so there is no data transport to the link at all"
+                }
+            );
+            return;
+        }
+        serial_println!(
+            ":: bt-l4: [{}] transport — ACL pair addr={} bulk_out=OUT{}/{}B bulk_in=IN{}/{}B spd={} tt=(hub {} port {}) mode=overlay-direct-on-ASYNC (probe-14e: overlay-direct performs NO qTD fetch, which is the operation PROBE-14 indicted; this is the FIRST bulk traffic this driver has ever issued and the next line is what proves or refutes it) == witness ::",
+            self.idx, t.addr, bulk_out, out_mps, bulk_in, in_mps,
+            match t.eps { QH_EPS_HIGH => "HS", QH_EPS_LOW => "LS", _ => "FS" },
+            t.hub_addr, t.hub_port
+        );
+
+        // ---- build the packet -------------------------------------------------------------------
+        // ACL header (4) + L2CAP header (4) + ATT PDU (7) = 15 bytes.
+        //   ACL   : Handle(12b) | PB(2b) | BC(2b), then Data_Total_Length(2) — both little-endian.
+        //   L2CAP : PDU_Length(2) = 7, Channel_ID(2) = 0x0004.
+        //   ATT   : Opcode(1)=0x08, Starting_Handle(2), Ending_Handle(2), Attribute_Type(2 = UUID).
+        // BC = 0b00 (point-to-point) is the only legal value on an LE-U link and is therefore
+        // written as the absence of bits rather than as a named constant.
+        let att: [u8; 7] = [
+            BT_ATT_OP_READ_BY_TYPE_REQ,
+            BT_ATT_HANDLE_FIRST as u8,
+            (BT_ATT_HANDLE_FIRST >> 8) as u8,
+            BT_ATT_HANDLE_LAST as u8,
+            (BT_ATT_HANDLE_LAST >> 8) as u8,
+            BT_ATT_UUID_BATTERY_LEVEL as u8,
+            (BT_ATT_UUID_BATTERY_LEVEL >> 8) as u8,
+        ];
+        let hdr0 = (handle & 0x0FFF) | (BT_ACL_PB_START_NONFLUSH << 12);
+        let l2len = att.len() as u16;
+        let acl_len = l2len + 4;
+        let pkt: [u8; 15] = [
+            hdr0 as u8,
+            (hdr0 >> 8) as u8,
+            acl_len as u8,
+            (acl_len >> 8) as u8,
+            l2len as u8,
+            (l2len >> 8) as u8,
+            BT_L2CAP_CID_ATT as u8,
+            (BT_L2CAP_CID_ATT >> 8) as u8,
+            att[0], att[1], att[2], att[3], att[4], att[5], att[6],
+        ];
+        serial_println!(
+            ":: bt-l4: [{}] ATT_READ_BY_TYPE_REQ built — handle={:#06x} pb={:#04b}(START-NONFLUSH) bc=0b00 acl_len={} l2cap_len={} cid={:#06x}(ATT) opcode={:#04x} range={:#06x}..{:#06x} uuid={:#06x}(Battery Level, Battery Service 0x180F) att_mtu={}(LE default, NOT negotiated) bytes={} == witness ::",
+            self.idx, handle & 0x0FFF, BT_ACL_PB_START_NONFLUSH, acl_len, l2len,
+            BT_L2CAP_CID_ATT, BT_ATT_OP_READ_BY_TYPE_REQ,
+            BT_ATT_HANDLE_FIRST, BT_ATT_HANDLE_LAST, BT_ATT_UUID_BATTERY_LEVEL,
+            BT_ATT_MTU_DEFAULT, pkt.len()
+        );
+
+        // ---- 1. ACL OUT --------------------------------------------------------------------------
+        // The bulk pipe's toggle: a SET_CONFIGURATION resets every endpoint's toggle to DATA0
+        // (USB 2.0 §9.4.5), the ACL endpoints have carried no traffic since, so the first packet
+        // out is DATA0 and the first packet in is DATA0 as well. The two directions keep INDEPENDENT
+        // toggles — they are separate pipes.
+        for (i, &b) in pkt.iter().enumerate() {
+            self.data_buf.add(i).write(b);
+        }
+        let mut out_toggle = false;
+        match self.bt_acl_txn(
+            t, bulk_out, false, out_mps, pkt.len() as u32, out_toggle,
+            Self::bt_l3_budget(BT_L4_TXN_MS),
+        ) {
+            Ok((moved, next)) if moved as usize == pkt.len() => {
+                out_toggle = next;
+                serial_println!(
+                    ":: bt-l4: [{}] ACL OUT{} SENT {}/{} bytes, next_toggle={} -> the ACL data endpoint ACCEPTED a bulk transaction. THE ASYNC-SCHEDULE QUESTION IS ANSWERED FOR BULK == witness ::",
+                    self.idx, bulk_out, moved, pkt.len(), if out_toggle { "DATA1" } else { "DATA0" }
+                );
+            }
+            Ok((moved, _)) => {
+                serial_println!(
+                    ":: bt-l4: [{}] ACL OUT{} SHORT — {}/{} bytes moved. A partially written ACL packet is not a packet; the controller has been handed a fragment it cannot parse and this arc sends no more. NO response is awaited == witness ::",
+                    self.idx, bulk_out, moved, pkt.len()
+                );
+                return;
+            }
+            Err(why) => {
+                serial_println!(
+                    ":: bt-l4: [{}] ACL OUT{} FAILED ({}) — {}. The disconnect below is unaffected == witness ::",
+                    self.idx, bulk_out, why,
+                    if why == "nodata" {
+                        "the transaction did not retire within its budget: the async engine either never ran it or the controller never accepted it. THIS IS THE PROBE-14 QUESTION ANSWERED IN THE NEGATIVE FOR BULK, and it is the outcome the transport line above is written to make legible"
+                    } else {
+                        "the transaction reached the wire and the endpoint halted"
+                    }
+                );
+                return;
+            }
+        }
+        let _ = out_toggle; // the pipe is not used again this boot; kept so the fact is witnessed
+
+        // ---- 2. ACL IN, bounded ------------------------------------------------------------------
+        // Poll the ACL IN endpoint until the ATT response arrives, the window closes, or the packet
+        // cap is reached. Packets that are not ours are IDENTIFIED and stepped over — a peer may put
+        // an L2CAP connection-parameter-update request on CID 0x0005 the moment the link comes up,
+        // and counting that as "no answer" would be a false negative.
+        let t0 = crate::arch::now_cycles();
+        let win = Self::bt_l3_budget(BT_L4_RSP_MS);
+        let mut in_toggle = false;
+        let mut pkts = 0u32;
+        let mut other = 0u32;
+        let mut answered = false;
+        while pkts < BT_L4_PKT_MAX {
+            let el = crate::arch::now_cycles().wrapping_sub(t0);
+            if el >= win {
+                break;
+            }
+            // ONE arm per packet, given the whole of what remains of the window (see
+            // `BT_L4_TXN_MS`). `BT_ACL_BUF_MAX` (64) is the transfer size asked for; the peer's
+            // answer is capped at the 23-byte ATT MTU plus 8 header bytes, so a short packet
+            // retires it early and the residual reports the real length.
+            let (got, next) =
+                match self.bt_acl_txn(t, bulk_in, true, in_mps, BT_ACL_BUF_MAX as u32, in_toggle, win - el) {
+                    Ok(v) => v,
+                    // The window expired with the transfer still active — no packet arrived, and
+                    // no packet was lost either, because nothing re-arms over it.
+                    Err("nodata") => break,
+                    Err(_) => break, // a halt printed its own line and retired the endpoint
+                };
+            if got == 0 {
+                // A zero-length bulk-IN retires a transfer without carrying anything. Counted (it
+                // proves the pipe is live) and stepped over.
+                in_toggle = next;
+                pkts += 1;
+                continue;
+            }
+            in_toggle = next;
+            pkts += 1;
+            let mut buf = [0u8; BT_ACL_BUF_MAX];
+            let n = (got as usize).min(BT_ACL_BUF_MAX);
+            for (i, b) in buf[..n].iter_mut().enumerate() {
+                *b = self.data_buf.add(i).read();
+            }
+            if n < 8 {
+                serial_println!(
+                    ":: bt-l4: [{}] ACL IN{} SHORT-PACKET {} bytes (8 required for an ACL+L2CAP header) -> undecodable, stepped over == witness ::",
+                    self.idx, bulk_in, n
+                );
+                other += 1;
+                continue;
+            }
+            let rh = (buf[0] as u16) | ((buf[1] as u16) << 8);
+            let (rhandle, pb) = (rh & 0x0FFF, (rh >> 12) & 0b11);
+            let rlen = (buf[2] as u16) | ((buf[3] as u16) << 8);
+            let l2 = (buf[4] as u16) | ((buf[5] as u16) << 8);
+            let cid = (buf[6] as u16) | ((buf[7] as u16) << 8);
+            if rhandle != handle & 0x0FFF || cid != BT_L2CAP_CID_ATT || pb == BT_ACL_PB_CONT {
+                serial_println!(
+                    ":: bt-l4: [{}] ACL IN{} packet {} — handle={:#06x} pb={:#04b} acl_len={} l2cap_len={} cid={:#06x}{} -> NOT the ATT response, stepped over == witness ::",
+                    self.idx, bulk_in, pkts, rhandle, pb, rlen, l2, cid,
+                    if cid == BT_L2CAP_CID_LE_SIG {
+                        "(LE signalling — commonly a connection-parameter-update request)"
+                    } else if pb == BT_ACL_PB_CONT {
+                        "(CONTINUATION fragment: this arc's request and any answer to it fit one packet, so a fragment is not reassembled — it is named and refused)"
+                    } else {
+                        ""
+                    }
+                );
+                other += 1;
+                continue;
+            }
+            // ---- 3. the ATT PDU ------------------------------------------------------------------
+            let att_pdu = &buf[8..n];
+            if att_pdu.is_empty() {
+                serial_println!(
+                    ":: bt-l4: [{}] ACL IN{} carried an EMPTY ATT PDU (l2cap_len={}) -> malformed, stepped over == witness ::",
+                    self.idx, bulk_in, l2
+                );
+                other += 1;
+                continue;
+            }
+            answered = true;
+            match att_pdu[0] {
+                BT_ATT_OP_READ_BY_TYPE_RSP if att_pdu.len() >= 2 => {
+                    // Response: Opcode(1) Length(1) Attribute_Data_List(...), where Length is the
+                    // size of ONE (handle, value) pair and the list is a whole number of them.
+                    let each = att_pdu[1] as usize;
+                    let list = &att_pdu[2..];
+                    let pairs = if each >= 3 { list.len() / each } else { 0 };
+                    if pairs == 0 {
+                        serial_println!(
+                            ":: bt-l4: [{}] ATT_READ_BY_TYPE_RSP with pair_len={} and {} list byte(s) -> NO complete (handle,value) pair; the response is malformed or truncated == witness ::",
+                            self.idx, each, list.len()
+                        );
+                    } else {
+                        let h = (list[0] as u16) | ((list[1] as u16) << 8);
+                        let level = list[2];
+                        serial_println!(
+                            ":: bt-l4: [{}] ATT_READ_BY_TYPE_RSP — pair_len={} pairs={} first_handle={:#06x} BATTERY LEVEL = {}% (uuid {:#06x}){} -> THE PEER'S GATT SERVER ANSWERED A READ. LE data path proven end to end: bulk-OUT -> L2CAP CID 0x0004 -> ATT -> bulk-IN == witness ::",
+                            self.idx, each, pairs, h, level, BT_ATT_UUID_BATTERY_LEVEL,
+                            if level > 100 {
+                                " (OUT OF RANGE: the Battery Level characteristic is defined 0..100, so this byte is not a percentage and the pair layout should be doubted)"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
+                BT_ATT_OP_ERROR_RSP if att_pdu.len() >= 5 => {
+                    // Error: Opcode(1)=0x01 Request_Opcode_In_Error(1) Attribute_Handle(2) Error_Code(1)
+                    let (req, eh, ec) = (
+                        att_pdu[1],
+                        (att_pdu[2] as u16) | ((att_pdu[3] as u16) << 8),
+                        att_pdu[4],
+                    );
+                    serial_println!(
+                        ":: bt-l4: [{}] ATT_ERROR_RSP — request_opcode={:#04x} handle={:#06x} error={:#04x}{} -> THE PEER'S GATT SERVER ANSWERED. The transport is proven end to end; what is absent is the characteristic, not the path == witness ::",
+                        self.idx, req, eh, ec,
+                        match ec {
+                            0x0A => " (ATTRIBUTE NOT FOUND: this peer publishes no Battery Level characteristic — the expected answer from a speaker that does not report battery over GATT)",
+                            0x02 => " (READ NOT PERMITTED)",
+                            0x05 => " (INSUFFICIENT AUTHENTICATION: the characteristic exists but needs a paired, encrypted link — this arc pairs with nothing)",
+                            0x0F => " (INSUFFICIENT ENCRYPTION: as above, and it names encryption specifically)",
+                            0x01 => " (INVALID HANDLE)",
+                            _ => "",
+                        }
+                    );
+                }
+                op => serial_println!(
+                    ":: bt-l4: [{}] ATT PDU opcode={:#04x} len={} on CID 0x0004 -> neither a Read By Type Response nor an Error Response. The transport carried a well-formed ATT packet, which is the transport claim; the opcode is the peer's business == witness ::",
+                    self.idx, op, att_pdu.len()
+                ),
+            }
+            break;
+        }
+        let (el, unit) = epace_fmt(crate::arch::now_cycles().wrapping_sub(t0));
+        serial_println!(
+            ":: bt-l4: [{}] L4 tally — elapsed={}{} acl_packets_read={} stepped_over={} answered={} window={}ms packet_cap={} -> {} == witness ::",
+            self.idx, el, unit, pkts, other, answered, BT_L4_RSP_MS, BT_L4_PKT_MAX,
+            if answered {
+                "the ATT layer replied"
+            } else if pkts > 0 {
+                "ACL packets arrived but none was the ATT response — the bulk pipe is LIVE and the answer is missing, which are two different findings and this line separates them"
+            } else {
+                "NO ACL packet arrived within the window. The OUT was accepted by the controller, so the transport question is answered for the send direction; the receive direction is unproven"
+            }
+        );
+    }
+    // ============================== end BT-L4 ================================================
 
     /// BT-L2 — read LE Advertising Reports off the event endpoint for a BOUNDED wall-clock window
     /// and build the distinct-device table.
@@ -8547,6 +9105,9 @@ pub fn init() {
                         // MTFIX: the dedicated HCI-event slot is free until a radio claims it.
                         #[cfg(feature = "bt")]
                         bt_evt_armed: false,
+                        // BT-L4: no ACL pair until `bt_probe` claims a radio and records one.
+                        #[cfg(feature = "bt")]
+                        bt_acl: (0, 0, 0, 0),
                     };
                     // Firmware-stale detection BEFORE any schedule programming: probe 2 showed
                     // Apple EFI leaves PSE=1 behind (its pre-boot keyboard), which HSE-halts
