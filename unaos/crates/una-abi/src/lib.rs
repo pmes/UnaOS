@@ -65,9 +65,16 @@
 //
 //  D4. Sentinel exit statuses and the ELF-1 witness token are kernel-side `const`s matched against
 //      immediates hand-written into ring-3 asm (`movz x0, #0x82`, `#0xB5`, `#0x1E`). Values agreed.
-//      RESOLVED: declared here; the kernel imports them and the blobs assert against them (the asm
-//      sites keep their immediates — see `user-blob/src/owner.rs` — with a `const _: () = assert!`
-//      tripwire beside each, because an `asm!` immediate cannot be a `use`d path).
+//      RESOLVED: declared here, and BOTH sides now name this declaration. The asm blobs were the
+//      expected exception — a raw `asm!` immediate cannot be a `use`d path, so the freeze looked
+//      like it would have to settle for an `assert!` tripwire beside each one. It did not:
+//      `naked_asm!`/`global_asm!` accept `const` OPERANDS, so `user-blob`, `user-blob-x86`,
+//      `user-elf`, `owner.rs` and `imp.rs` feed these values (and their syscall numbers) straight
+//      out of this crate — `mov x8, #{sys_write}`, `sys_write = const una_abi::SYS_WRITE`. That is
+//      strictly stronger than a tripwire: a tripwire DETECTS a divergence, a `const` operand makes
+//      one unrepresentable. It is also byte-neutral — every blob objcopies identically to the
+//      hand-written immediates, which `arroyo kernel8`'s entry-bytes and page-budget assertions
+//      independently confirm.
 //
 //  Not a divergence, recorded so the next reader does not re-derive it: verbs 3, 6, 19, 20, 24, 25,
 //  31, 32 are aarch64-only and 33, 40..=49 are x86-only TODAY. Those are implementation gaps at
@@ -404,9 +411,20 @@ pub struct UserInfo {
 /// The two kernels fill that field from two different clocks, and both are shipped, metal-proven
 /// behaviour that this crate does not get to change:
 ///
-///   * x86_64 — `arch::ticks()`, calibrated to `apic::TICK_HZ` = 1000 Hz. One tick is one
-///     millisecond.
-///   * aarch64 — `timer::ticks()`, the 250 Hz scheduler tick. One tick is four milliseconds.
+///   * x86_64 — `arch::ticks()`, from the local-APIC heartbeat ARMED at `apic::TICK_HZ` = 1000 Hz.
+///     One tick is one millisecond. Strictly: one tick is one millisecond once `apic::calibrate` has
+///     set the divisor; before that the heartbeat runs on the fixed fallback count (~0.8 ms/tick
+///     under QEMU, unmeasured on metal), so the earliest ticks of a boot are approximate. Every
+///     consumer of this timebase already lives with that — `arch::ms_to_ticks`, and therefore
+///     `sched::sleep_ms`, derive from the same armed rate — and it is orders of magnitude smaller
+///     than the 4x this constant exists to prevent.
+///   * aarch64 — `timer::ticks()`, the 250 Hz scheduler tick. One tick is four milliseconds; the
+///     down-counter reload is `CNTFRQ / TICK_HZ`, so there is no calibration phase to qualify.
+///
+/// Both kernels bind this constant to their own timer with a `const _: () = assert!` beside
+/// `sys_getinfo` (`== apic::TICK_HZ` on x86, `== super::timer::TICK_HZ` on aarch64), so this is not a
+/// fourth hand-copy of the number: retuning either heartbeat without moving this constant is a
+/// COMPILE ERROR, not a silently wrong fps readout.
 ///
 /// Ring 3 must therefore NEVER hard-code a rate, and must never assume the field is milliseconds.
 /// Ask this constant, or convert with [`getinfo_ticks_to_ms`]. Both mistakes were live in the tree:
@@ -433,8 +451,8 @@ pub const fn getinfo_ticks_to_ms(ticks: u64) -> u64 {
 
 /// The ABI cap on cores [`SYS_CPUPULSE`] reports. FIXED, because it sizes a `#[repr(C)]` struct a
 /// ring-3 program declares from this document — it is ABI, not an implementation detail, and it is
-/// deliberately NOT derived from the in-kernel meter's scratch cap (which is free to change without
-/// breaking a shipped ring-3 binary). They happen to be equal today at 16.
+/// deliberately NOT derived from `vug::MAX_METER_CPUS` (the in-kernel meter's scratch cap, which is
+/// free to change without breaking a shipped ring-3 binary). They happen to be equal today at 16.
 pub const PULSE_MAX_CPUS: usize = 16;
 
 /// The [`SYS_CPUPULSE`] payload as a count of `u64` words: `ncpu`, `demo`, then

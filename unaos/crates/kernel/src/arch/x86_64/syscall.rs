@@ -3052,6 +3052,22 @@ fn copy_to_user(user_ptr: u64, src: &[u8]) -> Result<(), i64> {
 /// `una_abi::GETINFO_TICK_HZ` instead of hard-coding a guess.
 use una_abi::UserInfo;
 
+// ABIFREEZE (divergence D1): the ABI's declared tick rate MUST be the rate this kernel's heartbeat is
+// armed at, because `sys_getinfo` below hands ring 3 that tick count RAW.
+//
+// Without this line `una_abi::GETINFO_TICK_HZ` would be a fourth hand-copy of the number with no link
+// to the timer — and retuning `apic::TICK_HZ` would silently hand `user-vug` and `user-pulse` back the
+// exact 4x unit bug the freeze just removed, with nothing in any gate to catch it. The assert makes a
+// retune a COMPILE ERROR here until the ABI constant moves with it (verified by negative test on the
+// aarch64 twin: setting `timer::TICK_HZ` to 200 fails the build).
+//
+// Note it binds the ARMED rate, not the achieved one: `apic::TICK_HZ` is what `calibrate` aims the
+// divisor at. Before calibration the heartbeat runs on the fixed fallback count (~0.8 ms/tick under
+// QEMU), so the very earliest ticks of a boot are not exactly milliseconds. That is a pre-existing
+// property of the timebase, unchanged by this arc, and it is the same approximation
+// `arch::ms_to_ticks` already makes for `sched::sleep_ms`.
+const _: () = assert!(una_abi::GETINFO_TICK_HZ == crate::arch::apic::TICK_HZ);
+
 /// WINX-1: `SYS_GETINFO(user_ptr)` — write `{pid, ticks}` to the caller's buffer through the validated
 /// `copy_to_user` seam. Returns 0, or `-EFAULT` if the destination fails validation (outside the ring-3
 /// window, wrapping, or aimed at the read-only code page — `UserAccess::Write` starts past page 0). An
@@ -4751,7 +4767,7 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
         Event::Button(mask) => (INPUT_EV_BUTTON, mask as u64),
         Event::Timer | Event::None | Event::Unknown => return None,
     };
-    Some((ty << 48) | payload)
+    Some(una_abi::input_ev_pack(ty, payload))
 }
 
 /// Push a pre-packed event into `slot`'s ring — the SPSC producer half. DROP-NEWEST on a full ring, so

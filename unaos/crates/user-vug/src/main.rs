@@ -1196,9 +1196,12 @@ fn stall_witness(latch: &AtomicU32, frame: u32, tail: &[u8], value: u32) {
 // The stagger observation (s1p: replacement vugs visibly outpace the originals) needs a PER-VUG
 // number, and the serial line cannot carry one per frame for six windows. So each vug measures and
 // draws its own rate in its top-left corner: frames presented per second, from `SYS_GETINFO`'s
-// `ticks` field (the 250 Hz scheduler tick — the only EL0-reachable clock; CNTVCT_EL0 is not
-// EL0-enabled). One getinfo per frame is one syscall beside the existing input poll; the displayed
-// value refreshes once per second, so the digits are readable rather than flickering.
+// `ticks` field — the only ring-3-reachable clock on either arch (CNTVCT_EL0 is not EL0-enabled).
+// ABIFREEZE D1: that field's RATE is per-arch (250 Hz scheduler tick on aarch64, 1 kHz on x86), which
+// is exactly what this code used to get wrong, so the divisor comes from `una_abi::GETINFO_TICK_HZ`
+// and not from a number written here. One getinfo per frame is one syscall beside the existing input
+// poll; the displayed value refreshes once per second — a real second on both arches now — so the
+// digits are readable rather than flickering.
 //
 // CHECKSUM DISCIPLINE: the overlay is drawn ONLY when `detached || interactive` — a desktop
 // (`bg`) or operator-driven vug. The FOREGROUND auto path (every fixture/battery leg, the QEMU
@@ -1247,7 +1250,8 @@ unsafe fn draw_digit(surf: *mut u8, d: usize, x: i32, y: i32, color: u32) {
     }
 }
 
-/// `SYS_GETINFO` -> the kernel's 250 Hz tick count, or 0 on error (a 0 delta just skips the update).
+/// `SYS_GETINFO` -> the kernel's tick count at `TICK_HZ` (250 Hz aarch64 / 1 kHz x86 — ABIFREEZE D1),
+/// or 0 on error (a 0 delta just skips the update).
 fn getinfo_ticks() -> u64 {
     let mut info = [0u64; 2]; // {pid, ticks}, #[repr(C)] — see kernel sys_getinfo
     let p = info.as_mut_ptr() as u64;
@@ -1354,7 +1358,7 @@ fn fps_refresh(ticks: &mut u64, mark: &mut u32, fps: u32, frame: u32) -> u32 {
     if now > *ticks {
         let dt = (now - *ticks) as u32;
         if dt >= TICK_HZ {
-            // frames since last refresh, scaled to per-second at the 250 Hz tick.
+            // frames since last refresh, scaled to per-second at THIS arch's tick rate.
             let v = ((frame.wrapping_sub(*mark) as u64 * TICK_HZ as u64 + (dt / 2) as u64) / dt as u64) as u32;
             *ticks = now;
             *mark = frame;

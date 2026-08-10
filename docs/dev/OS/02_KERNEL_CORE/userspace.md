@@ -2969,7 +2969,7 @@
 
 Conventions shared across arches:
 
-- **The syscall ABI is FROZEN in one crate: [`unaos/crates/una-abi`](../../../../crates/una-abi/src/lib.rs).**
+- **The syscall ABI is FROZEN in one crate: [`unaos/crates/una-abi`](../../../../unaos/crates/una-abi/src/lib.rs).**
   That crate — `no_std`, no dependencies, nothing but `const` — is the single
   declaration of the syscall numbers, the sub-op/flag encodings, the packed
   layouts ring 3 reads back, and the shared magic values. `arch/x86_64/syscall.rs`,

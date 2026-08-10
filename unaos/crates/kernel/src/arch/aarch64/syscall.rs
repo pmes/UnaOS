@@ -6692,6 +6692,22 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
 /// needs is `una_abi::GETINFO_TICK_HZ`. See una-abi's divergence ledger, D1.
 use una_abi::UserInfo;
 
+// ABIFREEZE (divergence D1): the ABI's declared tick rate MUST be the rate this kernel's heartbeat is
+// armed at, because `sys_getinfo` below hands EL0 that tick count RAW.
+//
+// The x86 twin carries the identical assert against `apic::TICK_HZ` (1000). The two rates DIFFER —
+// that is the divergence — and these two lines are what keep each arch's ABI constant honest about its
+// own clock, so a retune of either timer becomes a COMPILE ERROR rather than a silent 4x error in
+// every ring-3 program that reads `ticks`.
+//
+// VERIFIED BY NEGATIVE TEST, not assumed: setting `timer::TICK_HZ` to 200 fails `./arroyo check` with
+// `error[E0080] ... assertion failed` on the `arm-pi` leg (the x86 twin fails on the very first leg).
+// It does NOT fire on the plain `aarch64` leg, and that is correct rather than a hole: this whole
+// module is `#[cfg(feature = "baremetal")]` (arch/aarch64/mod.rs), so a non-baremetal aarch64 build
+// compiles no syscall surface at all and has no ABI to protect. Every configuration that HAS
+// `sys_getinfo` checks it.
+const _: () = assert!(una_abi::GETINFO_TICK_HZ == super::timer::TICK_HZ);
+
 /// SYS_GETINFO(user_ptr): write a small fixed {pid, ticks} struct to the caller's buffer via
 /// `copy_to_user` — the to-user direction's exerciser. Returns 0, or `-EFAULT` if the pointer/length fails
 /// validation (e.g. aimed at the RO code page) — an error RETURN, never a task-kill.
@@ -12063,7 +12079,7 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
         Event::Button(mask) => (INPUT_EV_BUTTON, mask as u64),
         Event::Timer | Event::None | Event::Unknown => return None,
     };
-    Some((ty << 48) | payload)
+    Some(una_abi::input_ev_pack(ty, payload))
 }
 
 /// ELF-5 ROUTER SEAM (public, in-lane): enqueue one input event into the ACTIVE process's ring. Called by the
@@ -13257,7 +13273,7 @@ fn input_launcher(_demo_cpu: usize) {
     let obs2 = INPUT_OBS[2].load(Ordering::Acquire);
     let n = INPUT_OBS_N.load(Ordering::Acquire);
     let done = INPUT_PARENT_DONE.load(Ordering::Acquire);
-    let expected = (INPUT_EV_KEY_DOWN << 48) | (b'A' as u64);
+    let expected = una_abi::input_ev_pack(INPUT_EV_KEY_DOWN, b'A' as u64);
     let eagain = EAGAIN as u64; // -EAGAIN sign-extended to u64
     if done && ok && n == 3 && obs0 == eagain && obs1 == expected && obs2 == eagain {
         serial_println!(
