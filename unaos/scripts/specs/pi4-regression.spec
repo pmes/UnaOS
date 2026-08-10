@@ -618,11 +618,12 @@ REQUIRE \[wc-j\] retile survivor=.* moved=true painted=true live=true old_deskto
 # ---    box came back as desktop, and every flashed pixel was repainted a millisecond later.
 # ---    The leg therefore asks the EXTENT question, in two halves that pull opposite ways so it
 # ---    cannot pass by accident. `old_desktop`/`new_window` are panel read-backs and hold the
-# ---    MOVE-VACATE floor (a fix that merely stopped erasing fails here). `flash_px=0` and
-# ---    `exact=true` are integer identities over `subtract_box` — no desktop pixel inside the box
-# ---    the window now occupies, and the erased parts plus the overlap account for the old box
-# ---    exactly (so no pixel is left unowned at any other geometry). Restoring the whole-box erase
-# ---    passes the read-backs and fails `flash_px=0`.
+# ---    MOVE-VACATE floor (a fix that merely stopped erasing fails here). `flash_px` and `exact`
+# ---    are read back from the record the erase call site wrote (`move_note_erase`, from the same
+# ---    slice `erase` received) — an OBSERVATION of the erase that happened, not a re-derivation
+# ---    (the original leg re-ran `subtract_box` itself and passed with the fix reverted).
+# ---    `recorded=true` pins the record to this leg's own window. Restoring the whole-box erase
+# ---    passes the read-backs and fails `flash_px=0` with the overlap area as the count.
 REQUIRE \[wc-j\] move-once .* painted=true moved=true old_desktop=true .* new_window=true .* flash_px=0 exact=true -> PASS
 FORBID \[wc-j\] .*-> FAIL
 

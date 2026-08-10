@@ -8525,9 +8525,10 @@ the same deferral rules; what changed is which rectangles are passed, not how a 
 panel. Up to four small staged fills replace one large one, each far under `MAX_STAGE_BYTES`, and the
 tear-free contract is per-fill.
 
-**Cost.** Per motion report, at the bench's 1920x1200 with a typical window outer box of ~740 000 px
-(`[comp2] box_px_pp=761613`) and a 4-px diagonal step: erase drops from **740 000 px to ~5 900 px**,
-about **1%** — roughly 2.9 MB of staged fill and cache flush per motion becomes ~23 KB. Composites
+**Cost.** Per motion report, at the bench's 1920x1200 with a typical window outer box of 761 613 px
+(`[comp2] box_px_pp=761613`, ≈1013x751) and a 4-px diagonal step: erase drops from **761 613 px to
+7 044 px** (`4·(w+h−4)` for that box), about **0.93%** — roughly 3.05 MB of staged fill and cache
+flush per motion becomes ~28 KB, ~108× less. Composites
 are unchanged at one per applied motion; the saving is entirely the erase.
 
 **The witness.** `[drag] win= owner= end= moves= composites= erase_rects= erase_px= erase_px_pm=

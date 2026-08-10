@@ -1170,9 +1170,17 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // one, each far under `MAX_STAGE_BYTES`, and the tear-free contract is per-fill.
         let mut parts = [(0usize, 0usize, 0usize, 0usize); 4];
         let nparts = subtract_box(b, after, &mut parts);
-        erase(&parts[..nparts]);
+        // Review condition (dragflick adoption): ONE binding for the erase and its witnesses. The
+        // slice `erase` receives is the slice both note-takers receive — `move_note_erase` is the
+        // unconditional record `[wc-j] move-once` reads back (so the gate observes the erase that
+        // HAPPENED, not a re-derivation it performs itself), and `drag_note_move` is the
+        // drag-scoped budget. An extent regression here changes `eparts` and both see it.
+        let eparts = &parts[..nparts];
+        erase(eparts);
         #[cfg(feature = "witness")]
-        drag_note_move(&parts[..nparts], b, after);
+        move_note_erase(id, eparts, b, after);
+        #[cfg(feature = "witness")]
+        drag_note_move(id, eparts, b, after);
         // The RE-DAMAGE stays on the WHOLE old box, deliberately. It names the windows a move
         // UNCOVERED, and that question is about the box the window left rather than about which
         // slivers were repainted desktop; narrowing it here would leave a neighbour lying under the
@@ -8375,7 +8383,46 @@ static DRAG_MOVES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 // DESKTOP COLOUR inside a box the same window occupied in the same motion. It is exactly zero after
 // the erase-extent fix and it is ~99% of the window's area before it, so the line reads `-> ONCE`
 // now and `-> FLASH` on any revert.
-/// DRAGFLICK — composites this drag ran (one per applied motion).
+/// DRAGFLICK review condition — the LAST move's erase, as the erase path actually performed it.
+/// Written unconditionally by [`move_note_erase`] (no `DRAG_WIN` gate — the selftest's mover is
+/// not a drag), read back by `[wc-j] move-once`, which is what turns that leg from a re-derivation
+/// into an observation. `MOVE_LAST_WIN` lets the reader reject cross-talk from a concurrent mover.
+#[cfg(feature = "witness")]
+static MOVE_LAST_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
+#[cfg(feature = "witness")]
+static MOVE_LAST_ERASE_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static MOVE_LAST_FLASH_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static MOVE_LAST_NPARTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGFLICK review condition — record the erase [`move_to_inner`] just performed, for ANY mover.
+/// The slice is the one `erase` received (one shared local at the call site binds them), so what
+/// this records is the extent that reached the glass, not the extent the fix intended.
+#[cfg(feature = "witness")]
+fn move_note_erase(
+    id: WinId,
+    parts: &[(usize, usize, usize, usize)],
+    _old: (usize, usize, usize, usize),
+    new: (usize, usize, usize, usize),
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut px = 0u64;
+    let mut flash = 0u64;
+    for &p in parts.iter() {
+        px += p.2 as u64 * p.3 as u64;
+        flash += intersect_area(p, new);
+    }
+    MOVE_LAST_ERASE_PX.store(px, Relaxed);
+    MOVE_LAST_FLASH_PX.store(flash, Relaxed);
+    MOVE_LAST_NPARTS.store(parts.len() as u64, Relaxed);
+    // Published last: the reader loads the id first and gives up on a mismatch.
+    MOVE_LAST_WIN.store(id, core::sync::atomic::Ordering::Release);
+}
+
+/// DRAGFLICK — erase-path notes this drag accumulated (one per applied motion). NOT a composite
+/// census: `present()`, `repaint()` and the WC-L drain never enter this counter, so it cannot see
+/// a drag being composited twice — see the conservation note at [`drag_report`].
 #[cfg(feature = "witness")]
 static DRAG_COMPOSITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// DRAGFLICK — staged desktop-colour rectangles this drag pushed to the panel.
@@ -8395,18 +8442,20 @@ static DRAG_FLASH_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 
 /// DRAGFLICK — record one motion's erase against the live drag, if there is one.
 ///
-/// Gated on `DRAG_WIN` rather than on the caller, because [`move_to_inner`] is reached from four
-/// unrelated places and only the pointer-driven one is the gesture this line is about. Five relaxed
-/// adds on a path that has just taken two locks and is about to composite; the loop runs at most four
-/// times.
+/// Gated on `DRAG_WIN == id` — the DRAGGED window, not merely "a drag is live" (review condition:
+/// the earlier gate folded any other window's `move_to` landing during a drag — a tile placement
+/// on app launch, an app moving its own window — into the drag's budget, which is exactly the
+/// dilution the docs claimed was excluded). Five relaxed adds on a path that has just taken two
+/// locks and is about to composite; the loop runs at most four times.
 #[cfg(feature = "witness")]
 fn drag_note_move(
+    id: WinId,
     parts: &[(usize, usize, usize, usize)],
     old: (usize, usize, usize, usize),
     new: (usize, usize, usize, usize),
 ) {
     use core::sync::atomic::Ordering::{Acquire, Relaxed};
-    if DRAG_WIN.load(Acquire) == WIN_NONE {
+    if DRAG_WIN.load(Acquire) != id {
         return;
     }
     let mut px = 0u64;
@@ -8444,8 +8493,12 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
     }
     let per = if moves > 0 { px / moves } else { 0 };
     let box_per = if moves > 0 { box_px / moves } else { 0 };
-    // A composite per applied motion is the budget; more than that means something is compositing the
-    // drag twice, which is the OTHER shape this line has to be able to catch.
+    // CONSERVATION, not a composite census (review condition): `comps` counts erase-path notes,
+    // which increment on exactly the condition `moves` does — so for a clean gesture the two are
+    // EQUAL by construction, and `comps <= moves` can only fail on a counter leak (a superseded
+    // begin, cross-window fold-in — both now closed at their sources). A drag composited twice by
+    // `present()`/`repaint()` does NOT enter `comps` and cannot be caught here; that shape belongs
+    // to the `[comp2]`/`[wcn]` censuses.
     let ok = flash == 0 && comps <= moves;
     serial_println!(
         "[drag] win={} owner={:#x} end={} moves={} composites={} erase_rects={} erase_px={} erase_px_pm={} box_px_pm={} flash_px={} -> {}",
@@ -8515,6 +8568,18 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
     DRAG_LAST_X.store(ox, Ordering::Relaxed);
     DRAG_LAST_Y.store(oy, Ordering::Relaxed);
     DRAG_MOVES.store(0, Ordering::Relaxed);
+    // Review condition (dragflick adoption): a superseding `begin` is the THIRD way a gesture
+    // ends, and it was the one path that reset none of the budget counters — a press landing
+    // while a drag was still live started the new gesture with the old one's pixels on its
+    // ledger and `comps > moves`, flipping a healthy build's verdict to FLASH.
+    #[cfg(feature = "witness")]
+    {
+        DRAG_COMPOSITES.store(0, Ordering::Relaxed);
+        DRAG_ERASE_RECTS.store(0, Ordering::Relaxed);
+        DRAG_ERASE_PX.store(0, Ordering::Relaxed);
+        DRAG_BOX_PX.store(0, Ordering::Relaxed);
+        DRAG_FLASH_PX.store(0, Ordering::Relaxed);
+    }
     DRAG_OWNER.store(owner, Ordering::Release);
     // Published LAST: `DRAG_WIN` is the flag every other entry point tests, so it must not become
     // visible before the offsets a concurrent motion would read through it.
@@ -10835,12 +10900,15 @@ pub fn vacate_selftest() {
 /// the right edge — all outside the new box by construction for a diagonal step) must equal
 /// `DESKTOP_BG` byte-for-byte, and the new content origin must hold the surface colour.
 ///
-/// Half 2 is ALGEBRAIC, deliberately, because a read-back cannot see it: the flash is transient by
-/// definition and the composite that follows repaints it. So the leg interrogates the extent
-/// arithmetic the panel path actually runs — [`subtract_box`] on the same two boxes — and asserts the
-/// partition property in full: `sum(parts) + area(old ∩ new) == area(old)` (nothing left unowned, so
-/// half 1 cannot be regressed silently at some other geometry) and `sum(parts ∩ new) == 0` (nothing
-/// painted desktop that is about to be window). Both are exact integer identities with no tolerance.
+/// Half 2 is an OBSERVATION of the erase path, not a re-derivation (review condition: the original
+/// leg called [`subtract_box`] itself and asserted over its own local result, which passed with the
+/// fix fully reverted — a gate that interrogates only itself). [`move_note_erase`] records, at the
+/// erase call site and from the same slice `erase` received, the pixels actually painted desktop
+/// and how many of them lay inside the new box; this leg reads those statics back after its own
+/// `move_to` and asserts `flash_px == 0` over what HAPPENED. The partition identity
+/// `erased + area(old ∩ new) == area(old)` is still asserted (nothing left unowned), now over the
+/// recorded extent. Restoring the whole-box erase makes the recorded flash the overlap area — a
+/// six-digit number — and the leg fails. Both checks are exact integer identities, no tolerance.
 ///
 /// One-shot and self-cleaning on the same terms as its neighbours: it makes one row and closes it.
 #[cfg(feature = "witness")]
@@ -10926,22 +10994,22 @@ fn movevacate_selftest() {
     let new_window = read(ox + STEP + 1, oy + STEP + 1) == a_col
         && read(new.0 + new.2 / 2, new.1 + TITLE_H / 2) != DESKTOP_BG;
 
-    // Half 2 — the extent arithmetic the panel path ran, re-run and asserted exactly.
-    let mut parts = [(0usize, 0usize, 0usize, 0usize); 4];
-    let n = subtract_box(old, new, &mut parts);
-    let mut erased_px = 0u64;
-    let mut flash_px = 0u64;
-    for &p in parts[..n].iter() {
-        erased_px += p.2 as u64 * p.3 as u64;
-        flash_px += intersect_area(p, new);
-    }
+    // Half 2 — the erase the panel path actually PERFORMED, read back from the record
+    // `move_note_erase` wrote at the erase call site. `MOVE_LAST_WIN` rejects cross-talk: if a
+    // concurrent mover overwrote the record between our `move_to` and here, the id differs and
+    // the leg says so instead of asserting over a stranger's erase.
+    use core::sync::atomic::Ordering::{Acquire, Relaxed as RelaxedMv};
+    let recorded = MOVE_LAST_WIN.load(Acquire) == w;
+    let erased_px = MOVE_LAST_ERASE_PX.load(RelaxedMv);
+    let flash_px = MOVE_LAST_FLASH_PX.load(RelaxedMv);
+    let n = MOVE_LAST_NPARTS.load(RelaxedMv) as usize;
     let overlap_px = intersect_area(old, new);
     let box_px = old.2 as u64 * old.3 as u64;
-    let exact = erased_px + overlap_px == box_px;
+    let exact = recorded && erased_px + overlap_px == box_px;
 
-    let ok = painted && moved && clean == pts.len() && new_window && flash_px == 0 && exact;
+    let ok = painted && moved && clean == pts.len() && new_window && recorded && flash_px == 0 && exact;
     serial_println!(
-        "[wc-j] move-once step={} painted={} moved={} old_desktop={} ({}/{}) new_window={} parts={} erased_px={} overlap_px={} box_px={} flash_px={} exact={} -> {}",
+        "[wc-j] move-once step={} painted={} moved={} old_desktop={} ({}/{}) new_window={} parts={} erased_px={} overlap_px={} box_px={} recorded={} flash_px={} exact={} -> {}",
         STEP,
         painted,
         moved,
@@ -10953,6 +11021,7 @@ fn movevacate_selftest() {
         erased_px,
         overlap_px,
         box_px,
+        recorded,
         flash_px,
         exact,
         if ok { "PASS" } else { "FAIL" }
