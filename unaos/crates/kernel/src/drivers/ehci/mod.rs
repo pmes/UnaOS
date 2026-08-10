@@ -1166,11 +1166,19 @@ const BT_ATT_HANDLE_LAST: u16 = 0xFFFF;
 /// receive path is allowed to refuse a continuation fragment rather than reassemble one.
 #[cfg(feature = "bt")]
 const BT_ATT_MTU_DEFAULT: usize = 23;
-/// BT-L4 — cap on ACL bytes staged for one transaction. 4 (ACL header) + 4 (L2CAP header) + the
-/// default ATT MTU, rounded up to 64: the same order as the endpoint's own max packet, and small
-/// enough that the buffer this rides in (`data_buf`, `Buf256`) is nowhere near its limit.
+/// BT-L4 — capacity, in bytes, of the buffer one ACL transaction may use. It is the whole of
+/// `data_buf` (`qh::Buf256`), which is the EP0 data buffer this path borrows.
+///
+/// REVIEW CONDITION 3 — THIS IS A CAPACITY, NOT A TRANSFER LENGTH, and the first cut conflated the
+/// two. It asked for a hardcoded 64 bytes on every bulk-IN. On this bench part the ACL endpoint's
+/// max packet is 64 and the two numbers coincide, which is exactly why the bug would not show
+/// here — but a high-speed ACL endpoint reports 512, and a device that sends a 512-byte packet
+/// into a 64-byte request BABBLES: the controller halts the pipe (EHCI 1.0 §4.15.2.2) and every
+/// later transfer on it fails. A bulk-IN transfer length must be a whole number of max packets, so
+/// the request length is now `in_mps`, read from the endpoint descriptor, and an `in_mps` larger
+/// than this capacity is refused by name in the transport gate rather than truncated into a babble.
 #[cfg(feature = "bt")]
-const BT_ACL_BUF_MAX: usize = 64;
+const BT_ACL_BUF_MAX: usize = 256;
 /// BT-L4 — bounded wall-clock window, in ms, for the peer's ATT response to arrive on bulk-IN.
 /// Sized against the link this arc negotiates: `BT_L3_CONN_INTERVAL_MIN/MAX` are 30-50 ms, and a
 /// peripheral answers an ATT request on one of the next connection events, so 600 ms is at least
@@ -3819,9 +3827,18 @@ impl Controller {
         }
 
         // ---- BT-C1: the classic page, and only if this boot asked for one ----------------------
-        // AFTER the LE work has released everything it took (the scan is disabled and confirmed,
-        // any LE link is disconnected) and BEFORE the event endpoint is quiesced, because the page
-        // reads its `Connection Complete` off that endpoint. Compile-gated on `btc`: a boot that
+        // ORDERING, and it is an ordering and not a guarantee (review condition 6). BT-C1 runs
+        // AFTER the whole LE stage has returned and BEFORE `bt_quiesce_events`, the latter because
+        // the page reads its `Connection Complete` off the event endpoint. What "after" buys is
+        // that L2's mandatory scan-disable and L3's mandatory teardown have both been ATTEMPTED,
+        // and each witnessed its own outcome. It does NOT buy that they SUCCEEDED: `bt_l3_connect`
+        // returns unit, and its must-not-appear conditions (`left_outstanding=` naming a live link
+        // or an unresolved create) are reported on the L3 tally rather than propagated. So an LE
+        // link that L3 failed to release is still there when the page goes out — an honest
+        // statement of the coupling, which the first cut of this comment overclaimed as a fact.
+        // The two links are independent (different transports, different handles) and the page
+        // does not depend on the LE state, so this is a note for whoever reads a capture with two
+        // must-not-appear lines in it, not a reason to gate. Compile-gated on `btc`: a boot that
         // did not set `UNAOS_BTC=1` contains no page code at all, which is the property a
         // transmission that makes an audible noise in Peter's room deserves.
         #[cfg(feature = "btc")]
@@ -4434,18 +4451,31 @@ impl Controller {
             // not be read", not "nothing was there".
             // BT-C1 — the same latch, for the classic `Connection Complete` (event 0x03). Layout:
             // Status(1) Connection_Handle(2) BD_ADDR(6) Link_Type(1) Encryption_Enabled(1) after
-            // the two header bytes = 13 on the wire. Only an ACL link is adopted: a SCO/eSCO
-            // Connection Complete belongs to a connection this arc did not create and its handle
-            // must not be disconnected as if it were ours.
+            // the two header bytes = 13 on the wire.
+            //
+            // TWO CONDITIONS ON ADOPTION, and both are about not disconnecting a stranger's link.
+            // Only an ACL link is taken: a SCO/eSCO Connection Complete cannot have come from a
+            // page and belongs to a connection this arc did not create. And (review condition 5)
+            // only one whose BD_ADDR is the address this arc paged: an INBOUND connection from
+            // some other device, accepted by the controller while this wait was running, is
+            // exactly the event shape being matched here, and adopting it would mean tearing down
+            // a link that was never ours. The bytes arrive in wire order, which is the order
+            // `BT_L3_PEER_ADDR_BYTES` is written in — see the byte-order docblock in `bt_name.rs`.
             #[cfg(feature = "btc")]
             if pkt[0] == BT_EVT_CONN_COMPLETE {
                 if len >= 13 {
-                    if pkt[2] == 0x00 && pkt[11] == BT_C1_LINK_TYPE_ACL {
+                    let ours = bt_addr_eq(
+                        &[pkt[5], pkt[6], pkt[7], pkt[8], pkt[9], pkt[10]],
+                        &BT_L3_PEER_ADDR_BYTES,
+                    );
+                    if pkt[2] == 0x00 && pkt[11] == BT_C1_LINK_TYPE_ACL && ours {
                         if st.classic_handle.is_none() {
                             st.classic_handle =
                                 Some(((pkt[3] as u16) | ((pkt[4] as u16) << 8)) & 0x0FFF);
                         }
-                    } else if pkt[2] != 0x00 {
+                    } else if pkt[2] != 0x00 && ours {
+                        // A page THIS ARC made, resolved without a link. A nonzero status for some
+                        // OTHER address says nothing about our page and must not clear it.
                         st.resolved_nonzero = true;
                     }
                 } else {
@@ -5050,8 +5080,16 @@ impl Controller {
                 false
             }
             BtL3Await::Timeout => {
+                // REVIEW CONDITION 6 — the supervision-timeout figure is the value BT-L3 asked for
+                // in its `HCI_LE_Create_Connection`, and it describes an LE link ONLY. Since BT-C1
+                // reuses this teardown for a CLASSIC handle, the number would be quoted at a link
+                // it has nothing to do with: a BR/EDR link's supervision timeout is the
+                // controller's own (`HCI_Write_Link_Supervision_Timeout`, default 0x7D00 = 20 s),
+                // which this arc never writes and therefore cannot name. The caveat is carried in
+                // the line rather than the constant being suppressed, because on the LE path the
+                // figure IS the right one and is worth having in the capture.
                 serial_println!(
-                    ":: bt-l3: [{}] NO Disconnection Complete within {}ms — the disconnect was accepted but the release is NOT confirmed. The link will in any case drop on its own supervision timeout ({}ms) == witness ::",
+                    ":: bt-l3: [{}] NO Disconnection Complete within {}ms — the disconnect was accepted but the release is NOT confirmed. The link will in any case drop on its own supervision timeout; on an LE link that is the {}ms this arc negotiated, and ON A CLASSIC (BT-C1) HANDLE IT IS NOT — a BR/EDR link uses the controller's own link supervision timeout, which this arc neither writes nor reads == witness ::",
                     self.idx, BT_L3_DISC_MS, BT_L3_SUPERVISION_TIMEOUT as u32 * 10
                 );
                 false
@@ -5194,10 +5232,11 @@ impl Controller {
         (*qh).horiz = (self.head_phys as u32) | PTR_TYPE_QH;
         let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
         let _ = mmio_write32(self.op + OP_USBCMD, cmd | CMD_ASE);
-        // The ASE handshake is NOT waited on here, unlike `overlay_txn`. It is folded into the one
-        // deadline below: the token cannot retire before the schedule is running, so a completion
-        // seen at all proves the schedule ran, and a completion never seen is reported as the same
-        // "did not retire" either way. One deadline, and it is the caller's.
+        // The ASE-ON handshake is not waited on separately: it is folded into the one deadline
+        // below, because the token cannot retire before the schedule is running, so a completion
+        // seen at all proves the schedule ran and a completion never seen is reported as the same
+        // "did not retire" either way. The ASE-OFF handshake is a different matter entirely and IS
+        // waited on — see the review-condition block after the loop.
         let start = crate::arch::now_cycles();
         let mut done = false;
         loop {
@@ -5213,11 +5252,35 @@ impl Controller {
         let tok = core::ptr::read_volatile(&(*qh).overlay[2]);
         let cmd2 = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
         let _ = mmio_write32(self.op + OP_USBCMD, cmd2 & !CMD_ASE);
+        // REVIEW CONDITION 2 — WAIT FOR THE SCHEDULE TO ACTUALLY STOP. Writing ASE=0 does not stop
+        // async traversal; it REQUESTS a stop, and the controller may defer the transition to a
+        // frame boundary or later (EHCI 1.0 §4.8.2). USBSTS bit 15 (Async Schedule Status) is the
+        // handshake, and `overlay_txn` has always waited on it — this function's first cut did not,
+        // on the argument that the token deadline subsumed it. It does not, and the gap is not
+        // cosmetic. On the `nodata` path the qTD is left ACTIVE by design, so between this write
+        // and the engine actually parking there is a window in which a live bulk-IN can still DMA
+        // into `data_buf` — the SHARED EP0 data buffer. The very next thing the caller does is the
+        // mandatory `HCI_Disconnect`, which stages its command bytes in that same buffer: a late
+        // ACL packet landing there would overwrite the teardown before `control_txn` sends it, and
+        // the arc's one unconditional promise — the link is always released — would be defeated by
+        // a race that leaves no trace in the capture. It would also advance the pipe's data toggle
+        // behind our reading of it, which is exactly the desync the one-arm-per-packet redesign
+        // claims to have eliminated. `wait_bounded` is the same TSC-bounded primitive the cited
+        // idiom uses, so a controller that never parks costs one bounded budget and not a hang.
+        let ass_off = wait_bounded(|| mmio_read32(self.op + OP_USBSTS).unwrap_or(0) & (1 << 15) == 0);
+        if !ass_off {
+            serial_println!(
+                ":: bt-l4: [{}] STOP-NOTE ACL {}{} — USBSTS.ASS did not clear within the bounded budget after ASE=0; the async engine may still be traversing the ring and the shared EP0 data buffer is NOT provably quiet. USBCMD={:#010x} USBSTS={:#010x} == witness ::",
+                self.idx, if dir_in { "IN" } else { "OUT" }, ep,
+                mmio_read32(self.op + OP_USBCMD).unwrap_or(0),
+                mmio_read32(self.op + OP_USBSTS).unwrap_or(0)
+            );
+        }
         if !done {
-            // The overlay is left ACTIVE, exactly as `overlay_txn`'s own timeout path leaves it.
-            // That is safe for the same reason: ASE has just been cleared, so the async engine no
-            // longer traverses the ring, and the next transaction (control or ACL) rewrites the
-            // overlay before setting ASE again.
+            // The overlay is left ACTIVE, exactly as `overlay_txn`'s own timeout path leaves it —
+            // and, now that the ASS handshake above has run, for the reason that path relies on:
+            // the async engine has PARKED, so nothing is executing this qTD, and the next
+            // transaction (control or ACL) rewrites the overlay before setting ASE again.
             return Err("nodata");
         }
         if tok & QTD_ERR_MASK != 0 {
@@ -5257,12 +5320,20 @@ impl Controller {
         // ---- the transport gate ---------------------------------------------------------------
         // Every reason L4 might be unreachable is named on ONE line, before anything is sent, so a
         // capture with no ACL traffic in it says why rather than merely lacking it.
-        if bulk_in == 0 || bulk_out == 0 || in_mps == 0 || out_mps == 0 || !self.overlay_mode {
+        if bulk_in == 0
+            || bulk_out == 0
+            || in_mps == 0
+            || out_mps == 0
+            || !self.overlay_mode
+            || in_mps as usize > BT_ACL_BUF_MAX
+        {
             serial_println!(
-                ":: bt-l4: [{}] ATT read NOT ATTEMPTED — bulk_in=IN{}/{} bulk_out=OUT{}/{} overlay_mode={}; {}. NO ACL packet was sent and the disconnect below is unaffected == witness ::",
-                self.idx, bulk_in, in_mps, bulk_out, out_mps, self.overlay_mode,
+                ":: bt-l4: [{}] ATT read NOT ATTEMPTED — bulk_in=IN{}/{} bulk_out=OUT{}/{} overlay_mode={} buf_capacity={}; {}. NO ACL packet was sent and the disconnect below is unaffected == witness ::",
+                self.idx, bulk_in, in_mps, bulk_out, out_mps, self.overlay_mode, BT_ACL_BUF_MAX,
                 if !self.overlay_mode {
                     "this controller executes FETCHED qTDs (chain mode) and has never been driven overlay-direct; BT-L4's transport argument rests on probe-14e's overlay-direct-on-async finding and does not extend to a chain path this arc has not built"
+                } else if bulk_in != 0 && in_mps as usize > BT_ACL_BUF_MAX {
+                    "the ACL IN endpoint's max packet exceeds the buffer this path borrows. A bulk-IN must be asked for in whole max-packets or the device BABBLES and the controller halts the pipe, so a short request is not an option and the stage is refused instead (review condition 3)"
                 } else {
                     "the claimed interface does not carry a usable ACL bulk pair, so there is no data transport to the link at all"
                 }
@@ -5364,20 +5435,22 @@ impl Controller {
         let t0 = crate::arch::now_cycles();
         let win = Self::bt_l3_budget(BT_L4_RSP_MS);
         let mut in_toggle = false;
-        let mut pkts = 0u32;
+        let mut pkts = 0u32; // packets that CARRIED bytes
+        let mut zlps = 0u32; // zero-length packets — see the tally
         let mut other = 0u32;
         let mut answered = false;
-        while pkts < BT_L4_PKT_MAX {
+        while pkts + zlps < BT_L4_PKT_MAX {
             let el = crate::arch::now_cycles().wrapping_sub(t0);
             if el >= win {
                 break;
             }
             // ONE arm per packet, given the whole of what remains of the window (see
-            // `BT_L4_TXN_MS`). `BT_ACL_BUF_MAX` (64) is the transfer size asked for; the peer's
-            // answer is capped at the 23-byte ATT MTU plus 8 header bytes, so a short packet
-            // retires it early and the residual reports the real length.
+            // `BT_L4_TXN_MS`), and asked for in WHOLE MAX PACKETS — `in_mps`, not a constant. See
+            // `BT_ACL_BUF_MAX` for why a short request is a babble and not an economy. The peer's
+            // answer is capped at the 23-byte ATT MTU plus 8 header bytes, so it comes back short
+            // and the residual reports the real length.
             let (got, next) =
-                match self.bt_acl_txn(t, bulk_in, true, in_mps, BT_ACL_BUF_MAX as u32, in_toggle, win - el) {
+                match self.bt_acl_txn(t, bulk_in, true, in_mps, in_mps as u32, in_toggle, win - el) {
                     Ok(v) => v,
                     // The window expired with the transfer still active — no packet arrived, and
                     // no packet was lost either, because nothing re-arms over it.
@@ -5385,10 +5458,13 @@ impl Controller {
                     Err(_) => break, // a halt printed its own line and retired the endpoint
                 };
             if got == 0 {
-                // A zero-length bulk-IN retires a transfer without carrying anything. Counted (it
-                // proves the pipe is live) and stepped over.
+                // REVIEW CONDITION 6 — a zero-length bulk-IN retires a transfer without carrying
+                // anything. It is counted SEPARATELY from packets that carried bytes, because the
+                // tally's three-way verdict turns on the difference: a run that saw only ZLPs has
+                // NOT seen "ACL packets arrive", and lumping them together would let that verdict
+                // fire on an empty pipe.
                 in_toggle = next;
-                pkts += 1;
+                zlps += 1;
                 continue;
             }
             in_toggle = next;
@@ -5483,8 +5559,20 @@ impl Controller {
                         }
                     );
                 }
+                // REVIEW CONDITION 6 — the TRUNCATED forms, split out of the catch-all below.
+                // Both of these opcodes fell through the guarded arms above only because the PDU
+                // was too short to decode, and the catch-all then called them "a well-formed ATT
+                // packet". They are the opposite of well-formed: they are the answer this arc
+                // asked for, arriving unreadable, and that is a finding about the TRANSPORT (a
+                // fragment, a wrong length, a mis-sized read) rather than about the peer's choice
+                // of opcode.
+                BT_ATT_OP_READ_BY_TYPE_RSP | BT_ATT_OP_ERROR_RSP => serial_println!(
+                    ":: bt-l4: [{}] ATT PDU opcode={:#04x} TRUNCATED — {} byte(s), {} required. This IS the response opcode this arc asked for, arriving too short to decode: the ATT layer answered but the bytes did not survive the path. NOT a well-formed packet, and not evidence the transport is sound == witness ::",
+                    self.idx, att_pdu[0], att_pdu.len(),
+                    if att_pdu[0] == BT_ATT_OP_ERROR_RSP { 5 } else { 2 }
+                ),
                 op => serial_println!(
-                    ":: bt-l4: [{}] ATT PDU opcode={:#04x} len={} on CID 0x0004 -> neither a Read By Type Response nor an Error Response. The transport carried a well-formed ATT packet, which is the transport claim; the opcode is the peer's business == witness ::",
+                    ":: bt-l4: [{}] ATT PDU opcode={:#04x} len={} on CID 0x0004 -> neither a Read By Type Response nor an Error Response. The bytes parsed as an ATT PDU on the ATT channel, which is the transport claim; the opcode is the peer's business == witness ::",
                     self.idx, op, att_pdu.len()
                 ),
             }
@@ -5492,12 +5580,14 @@ impl Controller {
         }
         let (el, unit) = epace_fmt(crate::arch::now_cycles().wrapping_sub(t0));
         serial_println!(
-            ":: bt-l4: [{}] L4 tally — elapsed={}{} acl_packets_read={} stepped_over={} answered={} window={}ms packet_cap={} -> {} == witness ::",
-            self.idx, el, unit, pkts, other, answered, BT_L4_RSP_MS, BT_L4_PKT_MAX,
+            ":: bt-l4: [{}] L4 tally — elapsed={}{} acl_packets_with_data={} zero_length_packets={} stepped_over={} answered={} window={}ms packet_cap={} -> {} == witness ::",
+            self.idx, el, unit, pkts, zlps, other, answered, BT_L4_RSP_MS, BT_L4_PKT_MAX,
             if answered {
                 "the ATT layer replied"
             } else if pkts > 0 {
-                "ACL packets arrived but none was the ATT response — the bulk pipe is LIVE and the answer is missing, which are two different findings and this line separates them"
+                "ACL packets CARRYING DATA arrived but none was the ATT response — the bulk pipe is LIVE and the answer is missing, which are two different findings and this line separates them"
+            } else if zlps > 0 {
+                "only ZERO-LENGTH packets arrived. A ZLP retires a transfer and so proves the IN pipe is being serviced, but it carries nothing: this is NOT 'ACL packets arrived', and the previous cut of this tally would have said it was"
             } else {
                 "NO ACL packet arrived within the window. The OUT was accepted by the controller, so the transport question is answered for the send direction; the receive direction is unproven"
             }
@@ -5653,10 +5743,22 @@ impl Controller {
                 BtL3Await::Got(len) if len >= 13 => {
                     let s = asm[2];
                     let h = ((asm[3] as u16) | ((asm[4] as u16) << 8)) & 0x0FFF;
-                    // Whatever the status, the page RESOLVED: the controller left the paging state
-                    // in order to send this. Nothing to cancel either way.
-                    outstanding = false;
-                    if s == 0x00 && asm[11] == BT_C1_LINK_TYPE_ACL {
+                    // REVIEW CONDITION 5 — is this event about the address WE paged? An inbound
+                    // connection from another device wears exactly this event shape, and the code
+                    // already reasons this way about `link_type`; the BD_ADDR deserves the same
+                    // scepticism. Wire order, matching `BT_L3_PEER_ADDR_BYTES`.
+                    let ours = bt_addr_eq(
+                        &[asm[5], asm[6], asm[7], asm[8], asm[9], asm[10]],
+                        &BT_L3_PEER_ADDR_BYTES,
+                    );
+                    // A Connection Complete FOR OUR ADDRESS resolves the page whatever its status:
+                    // the controller left the paging state in order to send it. One for a
+                    // different address resolves nothing, so `outstanding` stands and the cancel
+                    // below still runs.
+                    if ours {
+                        outstanding = false;
+                    }
+                    if s == 0x00 && asm[11] == BT_C1_LINK_TYPE_ACL && ours {
                         live = true;
                         handle = h;
                         serial_println!(
@@ -5747,10 +5849,31 @@ impl Controller {
                                 _ => "UNEXPECTED-STATUS",
                             }
                         );
-                        outstanding = false;
-                        // Either ordering of the race resolves here: a Connection Complete queued
-                        // AHEAD of this Command Complete is in the latch, and one queued BEHIND it
-                        // is caught by the second wait.
+                        // REVIEW CONDITION 4 — `outstanding` is resolved ONLY inside the statuses
+                        // this arc can actually READ, exactly as BT-L3 does it. An
+                        // UNEXPECTED-STATUS is a reply whose meaning for the paging state is
+                        // unknown, and clearing the flag on it would print `left_outstanding=none`
+                        // on the strength of a byte nobody has interpreted. The three known
+                        // statuses each say the controller is no longer paging: 0x00 (the cancel
+                        // took), 0x02 (it is not paging this address), 0x0C (it is not paging at
+                        // all — commonly because the link established).
+                        if s == 0x00 || s == 0x02 || s == 0x0C {
+                            outstanding = false;
+                        }
+                        // Either ordering of the race is resolved: a Connection Complete queued
+                        // AHEAD of this Command Complete is already in the latch (claimed at 5b
+                        // below), and one queued BEHIND it is caught by the second wait here.
+                        //
+                        // REVIEW CONDITION 1 — AND THE SUCCESS ARM ADOPTS THE LINK. The first cut
+                        // of this arm PRINTED the post-cancel Connection Complete and threw it
+                        // away: no `live`, no handle. A cancel that returns 0x00 and is then
+                        // answered with status 0x00 and a real handle is the cancel LOSING THE
+                        // RACE by a hair — the link is UP. Discarding it left a live BR/EDR ACL to
+                        // Peter's speaker running until the peer's own supervision timeout dropped
+                        // it, with `left_outstanding=none` on the tally saying otherwise, and with
+                        // `bt_quiesce_events` deactivating the event endpoint moments later so no
+                        // Disconnection Complete could ever be read. Same shape as BT-L3's arm, and
+                        // for the same reason it exists there.
                         if st.classic_handle.is_none() && s == 0x00 {
                             let r2 = self.bt_l3_await(
                                 e, toggle, armed,
@@ -5759,11 +5882,40 @@ impl Controller {
                                 &mut seen, &mut st, &mut asm,
                             );
                             match r2 {
-                                BtL3Await::Got(len) if len >= 13 => serial_println!(
-                                    ":: bt-c1: [{}] post-cancel Connection Complete status={:#04x}{} == witness ::",
-                                    self.idx, asm[2],
-                                    if asm[2] == 0x02 { " (UNKNOWN-CONNECTION-IDENTIFIER, the spec's cancellation status — the page is withdrawn)" } else { "" }
-                                ),
+                                BtL3Await::Got(len) if len >= 13 => {
+                                    let cs = asm[2];
+                                    let ch = ((asm[3] as u16) | ((asm[4] as u16) << 8)) & 0x0FFF;
+                                    let ours = bt_addr_eq(
+                                        &[asm[5], asm[6], asm[7], asm[8], asm[9], asm[10]],
+                                        &BT_L3_PEER_ADDR_BYTES,
+                                    );
+                                    if cs == 0x00 && asm[11] == BT_C1_LINK_TYPE_ACL && ours {
+                                        live = true;
+                                        handle = ch;
+                                        serial_println!(
+                                            ":: bt-c1: [{}] CANCEL LOST THE RACE — post-cancel Connection Complete status=0x00 handle={:#06x} link_type={:#04x}(ACL) peer={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}: the page had already succeeded when the cancel went out. The link is LIVE and is DISCONNECTED below == witness ::",
+                                            self.idx, ch, asm[11],
+                                            asm[10], asm[9], asm[8], asm[7], asm[6], asm[5]
+                                        );
+                                    } else if cs == 0x00 {
+                                        serial_println!(
+                                            ":: bt-c1: [{}] post-cancel Connection Complete status=0x00 handle={:#06x} link_type={:#04x} peer={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} -> NOT ADOPTED ({}). A handle this arc cannot prove it created is not one it may disconnect == witness ::",
+                                            self.idx, ch, asm[11],
+                                            asm[10], asm[9], asm[8], asm[7], asm[6], asm[5],
+                                            if !ours {
+                                                "the BD_ADDR is not the address this arc paged"
+                                            } else {
+                                                "link_type is not ACL (0x00=SCO, 0x02=eSCO), which a page cannot produce"
+                                            }
+                                        );
+                                    } else {
+                                        serial_println!(
+                                            ":: bt-c1: [{}] post-cancel Connection Complete status={:#04x}{} == witness ::",
+                                            self.idx, cs,
+                                            if cs == 0x02 { " (UNKNOWN-CONNECTION-IDENTIFIER, the spec's cancellation status — the page is withdrawn and no link exists)" } else { "" }
+                                        );
+                                    }
+                                }
                                 _ => serial_println!(
                                     ":: bt-c1: [{}] cancel ACCEPTED but no decodable Connection Complete followed within {}ms; the withdrawal is unconfirmed and this arc says so rather than assuming it == witness ::",
                                     self.idx, BT_L3_CMD_MS
@@ -5805,6 +5957,7 @@ impl Controller {
         // Status + Disconnection Complete pair, so BT-L3's teardown is reused verbatim rather than
         // transcribed. Its witness lines carry the `bt-l3:` prefix, which is correct: it IS the L3
         // teardown, doing its job on a handle BT-C1 handed it.
+        let established = u32::from(live);
         if live {
             let mut asm2 = [0u8; BT_EVT_ASM_MAX];
             if self.bt_l3_disconnect(
@@ -5815,10 +5968,10 @@ impl Controller {
             }
         }
 
-        self.bt_c1_tally(
-            t0, seen, 1, u32::from(disconnected > 0 || live), disconnected, cancels, live,
-            outstanding,
-        );
+        // `established` is read BEFORE the teardown clears `live` — the old expression
+        // (`disconnected > 0 || live`) was the same number by accident on every path and would
+        // have started lying the moment a second link could be adopted.
+        self.bt_c1_tally(t0, seen, 1, established, disconnected, cancels, live, outstanding);
     }
 
     /// BT-C1 — the end-of-stage tally, in the shape BT-L3's is: `left_outstanding=` reads `none` on
