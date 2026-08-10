@@ -768,6 +768,16 @@ pub mod ucode {
     const _: () = assert!(PROBE_B_MAGIC != FENCE_MAGIC && ACK_MAGIC != FENCE_MAGIC);
     const _: () = assert!(PROBE_B_MAGIC != MB_SEED && ACK_MAGIC != MB_SEED);
     const _: () = assert!(PROBE_B_MAGIC != 0 && ACK_MAGIC != 0);
+    // ⛔ PROBE_B_MAGIC's TOP NIBBLE IS ZERO, and that is now enforced rather
+    // than a lucky property of the hex. The host plants this value into
+    // CHAN_CUR, and the channel registers in this part carry their control bits
+    // in the top nibble — PFIFO_CHAN[1] is written `0xC0000000 | pageno`, and
+    // the FENCE leg's own `stuck` gate reads `chan_rb & 0xC0000000`. A magic
+    // with high bits set would be a magic that also asserts whatever CHAN_CUR
+    // keeps up there, turning a passive plant into a second stimulus. Same
+    // doctrine as the CHAN_VALID-bit-clear asserts above: the probe must
+    // perturb exactly one thing, its value.
+    const _: () = assert!(PROBE_B_MAGIC & 0xF000_0000 == 0);
 
     /// Host→falcon commands on CC_SCRATCH[0].
     pub const CMD_FENCE_ASSERT: u32 = 1;
@@ -778,12 +788,22 @@ pub mod ucode {
     // constants and never against a hex literal.
     pub const PHASE_FENCE_PRELOOP: u8 = 0x01;
     /// Round 2 — stamped after the mapping-ladder probe, before poll1. Its
-    /// job is to localise a stall: `iowrs` is synchronous, so a probe port the
-    /// unit does not decode could in principle park the core. If MAILBOX1 never
-    /// leaves the seed while MAILBOX0 holds [`FENCE_MAGIC`], the falcon died in
-    /// the probe; if it reaches `0x02`, the probe completed and anything later
-    /// is not the probe's fault.
-    pub const PHASE_FENCE_PROBED: u8 = 0x02;
+    /// job is to localise a stall: a probe port the unit does not decode could
+    /// in principle park the core. If MAILBOX1 never leaves the seed while
+    /// MAILBOX0 holds [`FENCE_MAGIC`], the falcon died in the probe; if it
+    /// reaches this stamp, the probe completed and anything later is not the
+    /// probe's fault.
+    ///
+    /// ⛔ **`0x06`, and NOT `0x02`.** `0x02` is [`PHASE_A_POSTREAD`] — the
+    /// stamp the ECHO and POKE images write. The FENCE host gate's
+    /// `is_fence_phase` set is what distinguishes "our image is running" from
+    /// "IMEM still holds a previous leg's program", and adding `0x02` to that
+    /// set would have made a stale ECHO image read as `PROGRESS` and disarmed
+    /// `FOREIGN-PHASE` — the exact stale-IMEM case the per-image magic and the
+    /// phase set exist to catch, defeated by a one-byte collision. The phase
+    /// vocabulary is shared across every image in this module, so a new stamp
+    /// must be checked against *all* of it, not just its own image's.
+    pub const PHASE_FENCE_PROBED: u8 = 0x06;
     pub const PHASE_FENCE_PREASSERT: u8 = 0x03;
     pub const PHASE_FENCE_ASSERTED: u8 = 0x04;
     pub const PHASE_FENCE_DONE: u8 = 0x05;
@@ -842,7 +862,10 @@ pub mod ucode {
     /// a write can issue a DMA transfer, and "the write did not land" and "the
     /// write started something" look identical from the mailboxes. A read has
     /// no such failure mode. The lattice below asserts that no `iowr`/`iowrs`
-    /// to `$r10` exists anywhere in the image, for any source register.
+    /// through `$r10` exists anywhere in the image, for any source register —
+    /// and, separately and more strongly, its contiguous per-address coverage
+    /// of `0x00..=0xb1` plus `zero_tail` means no *other* register is ever
+    /// built to the ladder port either.
     ///
     /// ```text
     /// // Addr | Bytes       | Instruction           | Note
@@ -864,8 +887,8 @@ pub mod ucode {
     /// // 0x2d | f0 a3 02    | sethi $r10, 0x02      | $r10 = 0x2C000    DERIVED (ladder)
     /// // 0x30 | cf a4 00    | iord  $r4, I[$r10]    | ⭐ LADDER: read the host's magic
     /// // 0x33 | d1 24 00    | iowrs I[$r2], $r4     | CC_SCRATCH[1] = what came back (s37)
-    /// // 0x36 | f0 07 02    | mov   $r0, 0x02       |
-    /// // 0x39 | d1 70 00    | iowrs I[$r7], $r0     | MAILBOX1 = phase 02 (probed)
+    /// // 0x36 | f0 07 06    | mov   $r0, 0x06       | 0x06, NOT 0x02 — see PHASE_FENCE_PROBED
+    /// // 0x39 | d1 70 00    | iowrs I[$r7], $r0     | MAILBOX1 = phase 06 (probed)
     /// // ---------------------------------------------------------------------
     /// // 0x3c | f0 57 00    | mov   $r5, 0x00       |
     /// // 0x3f | f1 53 10 00 | sethi $r5, 0x0010     | $r5 = 00100000 = poll1 budget
@@ -936,8 +959,8 @@ pub mod ucode {
         0xf0, 0xa3, 0x02,             // sethi $r10, 0x02   ($r10 = 0x2C000)
         0xcf, 0xa4, 0x00,             // iord  $r4, I[$r10]  ⭐ THE LADDER (read only)
         0xd1, 0x24, 0x00,             // iowrs I[$r2], $r4   CC_SCRATCH[1] = readback
-        0xf0, 0x07, 0x02,             // mov   $r0, 0x02
-        0xd1, 0x70, 0x00,             // iowrs I[$r7], $r0   phase 02 (probed)
+        0xf0, 0x07, 0x06,             // mov   $r0, 0x06
+        0xd1, 0x70, 0x00,             // iowrs I[$r7], $r0   phase 06 (probed)
         0xf0, 0x57, 0x00,             // mov   $r5, 0x00
         0xf1, 0x53, 0x10, 0x00,       // sethi $r5, 0x0010  poll1 budget
         0xf0, 0x97, 0x00,             // mov   $r9, 0x00
@@ -948,10 +971,10 @@ pub mod ucode {
         0xd1, 0x70, 0x00,             // iowrs I[$r7], $r0
         0xcf, 0x14, 0x00,             // poll1: iord $r4, I[$r1]
         0xb0, 0x44, 0x01,             // cmpu b32 $r4, 0x01
-        0xf4, 0x0b, 0x14,             // bra eq, +0x14 -> 0x7d do_assert
+        0xf4, 0x0b, 0x14,             // bra eq, +0x14 -> 0x72 do_assert
         0xb6, 0x52, 0x01,             // sub b32 $r5, 0x01
         0xb0, 0x54, 0x00,             // cmpu b32 $r5, 0x00
-        0xf4, 0x1b, 0xf1,             // bra ne, -0x0f -> 0x63 poll1
+        0xf4, 0x1b, 0xf1,             // bra ne, -0x0f -> 0x58 poll1
         0xf0, 0x07, 0xbd,             // giveup1: mov $r0, 0xbd
         0xd1, 0x70, 0x00,             // iowrs I[$r7], $r0
         0xf8, 0x02,                   // exit
@@ -965,10 +988,10 @@ pub mod ucode {
         0xd1, 0x70, 0x00,             // iowrs I[$r7], $r0
         0xcf, 0x14, 0x00,             // poll2: iord $r4, I[$r1]
         0xb0, 0x44, 0x03,             // cmpu b32 $r4, 0x03
-        0xf4, 0x0b, 0x14,             // bra eq, +0x14 -> 0xaf do_clear
+        0xf4, 0x0b, 0x14,             // bra eq, +0x14 -> 0xa4 do_clear
         0xb6, 0x92, 0x01,             // sub b32 $r9, 0x01
         0xb0, 0x94, 0x00,             // cmpu b32 $r9, 0x00
-        0xf4, 0x1b, 0xf1,             // bra ne, -0x0f -> 0x95 poll2
+        0xf4, 0x1b, 0xf1,             // bra ne, -0x0f -> 0x8a poll2
         0xf0, 0x07, 0xbc,             // giveup2: mov $r0, 0xbc
         0xd1, 0x70, 0x00,             // iowrs I[$r7], $r0
         0xf8, 0x02,                   // exit
@@ -999,7 +1022,7 @@ pub mod ucode {
     pub const UCODE_CTX_FENCE_A: [u32; 48] = pack192(&FENCE_A_BYTES);
 
     // ---------------------------------------------------------------------
-    // FENCE — full coverage, 0x00 through 0x97, `zero_tail` closing 0x97..192.
+    // FENCE — full coverage, 0x00 through 0xb1, `zero_tail` closing 0xb2..192.
     //
     // Read this as the bytes checked against the listing by arithmetic the
     // author did not perform. (For BRANCHES specifically, the paired
@@ -1129,14 +1152,26 @@ pub mod ucode {
         assert!(!contains3(b, &iowr(2, 4)));
         assert!(!contains3(b, &iowr(2, 12)));
 
-        // ⛔ THE LADDER IS READ-ONLY, and this is the assertion that makes it
-        // so rather than the comment above. An IO port whose decode we do not
-        // know may be a COMMAND register — `+0x118` in the standard falcon
-        // block is `DMATRFCMD`, so a stray write can start a DMA transfer, and
-        // "the write did not land" and "the write started something" are
-        // indistinguishable from the mailboxes. No store to `$r10` may exist in
-        // this image, in either the sync or the async form, from any source
+        // ⛔ THE LADDER IS READ-ONLY. An IO port whose decode we do not know
+        // may be a COMMAND register — `+0x118` in the standard falcon block is
+        // `DMATRFCMD`, so a stray write can start a DMA transfer, and "the
+        // write did not land" and "the write started something" are
+        // indistinguishable from the mailboxes. No store through `$r10` may
+        // exist, in either the sync or the async form, from any source
         // register. Enumerated over all sixteen, not spot-checked.
+        //
+        // ⚠ SCOPE THIS CLAIM HONESTLY. What the loop below proves is "no store
+        // through `$r10`" — NOT "no store to port 0x2C000", which is a strictly
+        // stronger statement it cannot make on its own: another register loaded
+        // with the same value would be a different byte pattern, and the high
+        // halves collide anyway (`0x2C000 >> 16` and `0x20000 >> 16` are both
+        // `0x02`, so a `sethi` scan cannot separate them). The stronger property
+        // does hold, but it is carried by a DIFFERENT part of the lattice: the
+        // per-address coverage above pins EVERY instruction from 0x00 to 0xb1
+        // contiguously, and `zero_tail` closes the rest, so the image provably
+        // contains only the listed instructions and no other register is ever
+        // built to the ladder port at all. This loop is the cheap, local,
+        // intention-revealing guard; full coverage is the actual guarantee.
         let mut src = 0u8;
         while src < 16 {
             assert!(!contains3(b, &iowrs(10, src)));
@@ -1175,15 +1210,65 @@ pub mod ucode {
         assert!(n_clear == 1);
         assert!(n_ladder == 1);
 
-        // Every phase stamp is a distinct byte. The host's `is_fence_phase` set
-        // and its bound comparisons both key on these; two phases sharing a
-        // value would make "probed" and "pre-loop" one event.
-        assert!(PHASE_FENCE_PRELOOP != PHASE_FENCE_PROBED);
-        assert!(PHASE_FENCE_PROBED != PHASE_FENCE_PREASSERT);
-        assert!(PHASE_FENCE_PREASSERT != PHASE_FENCE_ASSERTED);
-        assert!(PHASE_FENCE_ASSERTED != PHASE_FENCE_DONE);
+        // ⛔ THE PHASE VOCABULARY IS SHARED, AND THIS CHECK IS PAIRWISE OVER
+        // ALL OF IT — not just over FENCE's own stamps.
+        //
+        // `is_fence_phase` is what tells "our image is running" from "IMEM
+        // still holds ECHO or POKE", so a FENCE stamp that collides with a
+        // PHASE_A_* stamp does not merely blur two FENCE states: it makes a
+        // stale foreign image read as PROGRESS and disarms FOREIGN-PHASE.
+        // PHASE_FENCE_PROBED was authored as 0x02 and 0x02 is
+        // PHASE_A_POSTREAD — caught at review, and the reason this loop
+        // compares every pair rather than the neighbours a hand-written chain
+        // happens to name.
+        // THE DISTINCT VOCABULARY. Every value any image in this module can
+        // stamp into MAILBOX1, listed once, checked pairwise.
+        let phases: [u32; 8] = [
+            PHASE_A_PRELOOP as u32,   // 0x01 — also FENCE's PRELOOP, see below
+            PHASE_A_POSTREAD as u32,  // 0x02 — ECHO/POKE only. NOT a FENCE stamp
+            PHASE_A_PREACK as u32,    // 0x03 — also FENCE's PREASSERT
+            PHASE_A_POSTACK as u32,   // 0x04 — also FENCE's ASSERTED
+            PHASE_FENCE_DONE as u32,  // 0x05 — FENCE only
+            PHASE_FENCE_PROBED as u32, // 0x06 — FENCE only, round 2
+            PHASE_A_BOUND,            // FFFFFFBD
+            PHASE_FENCE_BOUND2,       // FFFFFFBC
+        ];
+        let mut i = 0;
+        while i < phases.len() {
+            let mut j = i + 1;
+            while j < phases.len() {
+                assert!(phases[i] != phases[j]);
+                j += 1;
+            }
+            i += 1;
+        }
+        // THREE FENCE STAMPS DELIBERATELY ALIAS PHASE_A_* VALUES, and writing
+        // them down is the point — the pairwise loop above found the third one
+        // (PRELOOP) that this comment did not originally admit to.
+        //
+        // The aliasing is tolerable ONLY because each aliased value is already
+        // inside `is_fence_phase`: a stale ECHO stamping 1, 3 or 4 and FENCE
+        // stamping 1, 3 or 4 are indistinguishable either way, so the alias
+        // costs nothing that was not already spent, and the per-image MAGIC in
+        // MAILBOX0 is what actually separates the two images.
+        //
+        // What is NOT tolerable is a stamp that FENCE writes and ECHO also
+        // writes while sitting OUTSIDE that set — which is exactly what
+        // PHASE_FENCE_PROBED=0x02 would have been: `0x02` is PHASE_A_POSTREAD,
+        // adding it to `is_fence_phase` would have made a stale ECHO image read
+        // as PROGRESS, and FOREIGN-PHASE — the only instrument that catches
+        // stale IMEM — would have been disarmed by one byte.
+        assert!(PHASE_FENCE_PRELOOP == PHASE_A_PRELOOP);
+        assert!(PHASE_FENCE_PREASSERT == PHASE_A_PREACK);
+        assert!(PHASE_FENCE_ASSERTED == PHASE_A_POSTACK);
+        // ⛔ And the load-bearing one: the round-2 stamp aliases NOTHING.
+        assert!(PHASE_FENCE_PROBED != PHASE_A_PRELOOP);
+        assert!(PHASE_FENCE_PROBED != PHASE_A_POSTREAD);
+        assert!(PHASE_FENCE_PROBED != PHASE_A_PREACK);
+        assert!(PHASE_FENCE_PROBED != PHASE_A_POSTACK);
         assert!(PHASE_FENCE_PROBED as u32 != PHASE_A_BOUND);
         assert!(PHASE_FENCE_PROBED as u32 != PHASE_FENCE_BOUND2);
+        assert!(PHASE_FENCE_PROBED != PHASE_FENCE_DONE);
     };
 
     // The FENCE image fits inside the single 0x40-word IMEM page the upload pads
@@ -2372,28 +2457,45 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                 [0x800usize, 0x804, 0xB00, 0xB04, 0xC00, 0xC08][i - 128]
                                             }
                                         }
-                                        // What each moved offset means, and — the load-bearing half
-                                        // — whether ANY leg of this boot admits to writing it. A
-                                        // delta at an offset with no admitted writer is the only
-                                        // kind of hit that can name where a DERIVED port points, so
-                                        // "expected" is returned as a flag the counter reads, not
-                                        // inferred back out of the prose.
-                                        let sweep_tag = |off: usize| -> (bool, &'static str) {
+                                        // What each moved offset means, in THREE classes — and the
+                                        // three-way split is the load-bearing part.
+                                        //
+                                        //   WRITTEN  — a leg of this boot wrote it on purpose.
+                                        //   HARDWARE — nobody wrote it; it moved because the core
+                                        //              ran. IDLESTATE and the unnamed 0x12C track
+                                        //              the falcon's own execution state and change
+                                        //              between "parked" and "ran and parked" with
+                                        //              no store involved.
+                                        //   STRAY    — neither. The ONLY class that can name where
+                                        //              a DERIVED port points.
+                                        //
+                                        // Round 1's sweep failed by diluting its needle (`2` matches
+                                        // half the chip), and a two-way split here would repeat that
+                                        // failure one level up: every healthy boot would print ⭐
+                                        // STRAY on registers that always move, and a real stray
+                                        // would arrive in a column of them and be read as normal.
+                                        // A signal that fires on healthy boots is not a signal.
+                                        #[derive(PartialEq)]
+                                        enum SweepClass { Written, Hardware, Stray }
+                                        use SweepClass::*;
+                                        let sweep_tag = |off: usize| -> (SweepClass, &'static str) {
                                             match off {
-                                                0x040 => (true, "MAILBOX0 — falcon: magic, then the ENGINE_STATUS readback"),
-                                                0x044 => (true, "MAILBOX1 — falcon: phase stamps"),
-                                                0x100 => (true, "CPUCTL — the core ran and parked"),
-                                                0x104 => (true, "BOOTVEC — host wrote 0 before the start"),
-                                                0x10C => (true, "DMACTL — host cleared REQUIRE_CTX before the start"),
-                                                0x180 => (true, "IMEMC — the upload and its verify moved the address port"),
-                                                0x184 => (true, "IMEMD — reading it AINCRs; delta not meaningful"),
-                                                0x1C0 => (true, "DMEMC"),
-                                                0x1C4 => (true, "DMEMD — reading it AINCRs; delta not meaningful"),
-                                                0x800 => (true, "CC_SCRATCH0 — host: the command word"),
-                                                0x804 => (true, "CC_SCRATCH1 — falcon: ladder readback, then ACK_MAGIC"),
-                                                0xB00 => (true, "CHAN_CUR — the ladder SOURCE; the host plants the magic here and restores it"),
-                                                0xC00 => (true, "ENGINE_STATUS — the treatment itself"),
-                                                _ => (false, "⭐ STRAY — no leg in this boot admits to writing here"),
+                                                0x040 => (Written, "MAILBOX0 — falcon: magic, then the ENGINE_STATUS readback"),
+                                                0x044 => (Written, "MAILBOX1 — falcon: phase stamps"),
+                                                0x100 => (Written, "CPUCTL — host wrote the halt and the start trigger"),
+                                                0x104 => (Written, "BOOTVEC — host wrote 0 before the start"),
+                                                0x10C => (Written, "DMACTL — host cleared REQUIRE_CTX before the start"),
+                                                0x180 => (Written, "IMEMC — the upload and its verify moved the address port"),
+                                                0x184 => (Written, "IMEMD — reading it AINCRs; delta not meaningful"),
+                                                0x1C0 => (Written, "DMEMC"),
+                                                0x1C4 => (Written, "DMEMD — reading it AINCRs; delta not meaningful"),
+                                                0x800 => (Written, "CC_SCRATCH0 — host: the command word"),
+                                                0x804 => (Written, "CC_SCRATCH1 — falcon: ladder readback, then ACK_MAGIC"),
+                                                0xB00 => (Written, "CHAN_CUR — the ladder SOURCE; host plants the magic here and restores it"),
+                                                0xC00 => (Written, "ENGINE_STATUS — the treatment itself"),
+                                                0x108 => (Hardware, "IDLESTATE — moves because the core ran; no store involved (§2 rest 20402050)"),
+                                                0x12C => (Hardware, "0x12C (unnamed, §2 rest 00081103) — execution-state side effect, not a store"),
+                                                _ => (Stray, "⭐ STRAY — no leg wrote here and it is not a known run-side effect"),
                                             }
                                         };
                                         // Name the value when it is one of ours. This is the half of
@@ -2514,12 +2616,42 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                 // does not take, the probe answers nothing and the
                                                 // leg must say so rather than read a null as a
                                                 // mapping failure.
+                                                // Capture the pre-value so the restore puts back
+                                                // what was actually there. §2 says CHAN_CUR rests
+                                                // at 0 (s34) — but this leg runs after several
+                                                // others, "0" is a claim about a fresh unit, and
+                                                // restoring a literal would silently paper over a
+                                                // non-zero pre-value instead of reporting it.
+                                                let chan_cur_pre = fecs_read(bar0, fb + 0xB00);
                                                 fecs_write(bar0, fb + 0xB00, ucode::PROBE_B_MAGIC);
                                                 let plant_rb = fecs_read(bar0, fb + 0xB00);
-                                                let plant_ok = plant_rb == ucode::PROBE_B_MAGIC;
-                                                serial_println!(":: kepler: FENCE ladder plant off=B00 want={:08X} readback={:08X} planted={} ::",
-                                                    ucode::PROBE_B_MAGIC, plant_rb,
+                                                // ⛔ THE ALIAS GATE. `mapped` is
+                                                // `plant_ok && probe_read == MAGIC`, and without
+                                                // this third term those two can BOTH be satisfied
+                                                // with the falcon having done nothing at all: if
+                                                // the host write at fb+0xB00 aliased onto fb+0x804,
+                                                // the magic would be sitting in CC_SCRATCH[1]
+                                                // before the core ever started, the "falcon read"
+                                                // would be reading the host's own write, and the
+                                                // leg would print MAPPED and then proceed to make
+                                                // the unsafe write it exists to gate. The delta
+                                                // sweep cannot catch it either — the baseline is
+                                                // captured AFTER the plant, so an aliased landing
+                                                // is baked into the baseline and is not a delta.
+                                                //
+                                                // One read closes it. CC_SCRATCH[1] was seeded to
+                                                // MB_SEED above and nothing has run since, so it
+                                                // MUST still read MB_SEED here.
+                                                let cc1_after_plant = fecs_read(bar0, fb + 0x804);
+                                                let cc1_quiet = cc1_after_plant == MB_SEED;
+                                                let plant_ok = plant_rb == ucode::PROBE_B_MAGIC && cc1_quiet;
+                                                serial_println!(":: kepler: FENCE ladder plant off=B00 pre={:08X} want={:08X} readback={:08X} cc1-quiet={} cc1={:08X} planted={} ::",
+                                                    chan_cur_pre, ucode::PROBE_B_MAGIC, plant_rb,
+                                                    if cc1_quiet { "Y" } else { "N" }, cc1_after_plant,
                                                     if plant_ok { "Y" } else { "N" });
+                                                if !cc1_quiet {
+                                                    serial_println!(":: kepler: FENCE ladder plant ALIAS-DETECTED — writing fb+0xB00 changed fb+0x804 with the core halted, so the two offsets are not independent registers. Any 'falcon read the magic' result this boot would be the host reading its own write; the ladder is VOID and the assert will be withheld ::");
+                                                }
 
                                                 // --- SWEEP BASELINE (round 2) ----------------
                                                 // Boot AS's sweep had no baseline and the whole
@@ -2571,11 +2703,22 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                 // report forward progress on a program that gave up.
                                                 //
                                                 // Phase membership is a SET, not a range. FENCE
-                                                // writes only {1,3,4,5}; `mb1 == 2` is reachable only
-                                                // from a foreign image (ECHO/POKE stamp
+                                                // writes only {1,3,4,5,6}; `mb1 == 2` is reachable
+                                                // only from a foreign image (ECHO/POKE stamp
                                                 // PHASE_A_POSTREAD there) — which is precisely the
                                                 // stale-IMEM case FOREIGN-PHASE exists to name, and a
-                                                // `1..=5` range would have called it progress.
+                                                // `1..=6` range would have called it progress.
+                                                //
+                                                // ⛔ THIS IS WHY ROUND 2'S NEW STAMP IS 0x06 AND NOT
+                                                // 0x02. It was authored as 0x02, which is
+                                                // PHASE_A_POSTREAD: adding it to this set would have
+                                                // admitted a stale ECHO image as PROGRESS and
+                                                // disarmed the FOREIGN-PHASE arm two lines below —
+                                                // silently deleting the only instrument that catches
+                                                // stale IMEM, while this very comment went on
+                                                // asserting the property it had just broken. The
+                                                // lattice now checks the whole phase vocabulary
+                                                // pairwise so the next stamp cannot repeat it.
                                                 let is_fence_phase = |v: u32| {
                                                     v == ucode::PHASE_FENCE_PRELOOP as u32
                                                         || v == ucode::PHASE_FENCE_PROBED as u32
@@ -2643,24 +2786,48 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                         ucode::PROBE_B_MAGIC, probe_read,
                                                         if mapped { "Y" } else { "N" });
                                                     serial_println!(":: kepler: FENCE ladder VERDICT {} ::",
-                                                        if !plant_ok {
+                                                        if !cc1_quiet {
+                                                            "VOID (plant aliased) — writing fb+0xB00 moved fb+0x804 with the core halted; the two offsets are not independent and any 'falcon read' this boot is the host reading its own write"
+                                                        } else if !plant_ok {
                                                             "VOID (plant refused) — the host could not put the magic at fb+0xB00, so the falcon read nothing meaningful; this says nothing about the derivation. §2's s35 write-took claim needs re-examining"
                                                         } else if mapped {
-                                                            "MAPPED — the falcon read the exact authored magic through I[2C000]. (off & 0xffc) << 6 reaches host 0xB00 from inside the falcon, so the rule DOES extend above 0x804 and port 30000 is a plausible ENGINE_STATUS. ⚠ Proven for the READ path only: the write decode is the same address decode, but that is an inference, not this boot's observation"
+                                                            "MAPPED — the falcon read the exact authored magic through I[2C000]. (off & 0xffc) << 6 reaches host 0xB00 from inside the falcon, so the rule DOES extend above 0x804. ⚠ TWO limits, both real: (1) READ path only — the write decode is the same address decode, but that is an inference, not this boot's observation; (2) IO BIT 16 IS STILL UNTESTED — 0x2C000 exercises bits 17|15|14 and 0x30000 is 17|16, so this rung does not cover the one bit that differs. 30000 is more plausible, NOT proven"
                                                         } else if probe_read == ucode::MB_SEED {
                                                             "UNRUN — CC_SCRATCH[1] still holds the host seed; the falcon never executed the ladder read at all. Check the phase stamp, not the mapping"
                                                         } else {
                                                             "UNMAPPED — the magic was planted and the falcon read something else through I[2C000]. The <<6 derivation does NOT reach host 0xB00; port 30000 is UNPROVEN, the assert is WITHHELD below, and round 3 is a mapping arc rather than a fence arc"
                                                         });
+                                                    // Classify what came back. 00000000 and
+                                                    // BADF1000 are the same word to an equality test
+                                                    // and completely different next moves: ZERO says
+                                                    // the port decoded to something that reads as
+                                                    // nothing, while the nonexistent-PRI signature
+                                                    // says the falcon's own IO space faulted the
+                                                    // access — one is a mapping question, the other
+                                                    // is a poison question (§5.4).
+                                                    if !mapped && plant_ok {
+                                                        serial_println!(":: kepler: FENCE ladder probe-class read={:08X} class={} ::",
+                                                            probe_read, classify_fecs_word(probe_read));
+                                                    }
                                                     // Restore CHAN_CUR host-side, before the
                                                     // stimulus. Same doctrine as the ENGINE_STATUS
                                                     // unwind: a restore that depends on falcon
-                                                    // timing is one timing can defeat. Its rest
-                                                    // value is 0 (§2, s34).
-                                                    fecs_write(bar0, fb + 0xB00, 0);
+                                                    // timing is one timing can defeat.
+                                                    //
+                                                    // Restored to THIS BOOT'S pre-value, not to a
+                                                    // literal 0. §2 records the rest value as 0
+                                                    // (s34), but that is a claim about a fresh unit
+                                                    // and this leg runs after several others —
+                                                    // writing a literal would quietly overwrite a
+                                                    // non-zero pre-value and call it a restore. The
+                                                    // line prints the pre-value so a divergence from
+                                                    // §2 is visible rather than erased.
+                                                    fecs_write(bar0, fb + 0xB00, chan_cur_pre);
                                                     let cc_rb = fecs_read(bar0, fb + 0xB00);
-                                                    serial_println!(":: kepler: FENCE ladder restore CHAN_CUR={:08X} restored={} ::",
-                                                        cc_rb, if cc_rb == 0 { "Y" } else { "N" });
+                                                    serial_println!(":: kepler: FENCE ladder restore CHAN_CUR pre={:08X} now={:08X} restored={} matches-s35-rest={} ::",
+                                                        chan_cur_pre, cc_rb,
+                                                        if cc_rb == chan_cur_pre { "Y" } else { "N" },
+                                                        if chan_cur_pre == 0 { "Y" } else { "N" });
 
                                                     // ⛔ THE ASSERT IS GATED ON THE LADDER.
                                                     //
@@ -2678,7 +2845,16 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                     // reports why. A boot that answers the mapping
                                                     // question and declines the unsafe write is a
                                                     // successful boot.
-                                                    let mut ack = 0u32;
+                                                    // Seeded to MB_SEED, not 0. On the withheld path
+                                                    // the poll loop never runs, and `ack=00000000`
+                                                    // in the witness line would read as "the loop
+                                                    // ran and CC_SCRATCH[1] came back zero" — a
+                                                    // measurement that never happened, printed in
+                                                    // the same slot as one that did. MB_SEED is the
+                                                    // value that means "untouched" everywhere else
+                                                    // in this leg (§4 step 1), so it means that here
+                                                    // too.
+                                                    let mut ack = MB_SEED;
                                                     let mut ack_iters = 0u32;
                                                     if !mapped {
                                                         serial_println!(":: kepler: FENCE assert WITHHELD — the ladder did not confirm that (off&0xffc)<<6 reaches above 0x804, so iowrs I[{:05X}] would be a write to an address of unknown decode, and an unknown falcon IO address can be a command register (DMATRFCMD at +0x118). The falcon will exit poll1 by bound; NO treatment is applied and NO verdict is claimed ::",
@@ -2759,6 +2935,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                         SWEEP_N, ucode::PROBE_B_MAGIC, ucode::ACK_MAGIC);
                                                     let mut moved = 0u32;
                                                     let mut strays = 0u32;
+                                                    let mut hw_moves = 0u32;
                                                     for i in 0..SWEEP_N {
                                                         let off = sweep_off(i);
                                                         let v = fecs_read(bar0, fb + off);
@@ -2766,23 +2943,53 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                             continue;
                                                         }
                                                         moved += 1;
-                                                        let (expected, tag) = sweep_tag(off);
-                                                        if !expected {
+                                                        let (class, tag) = sweep_tag(off);
+                                                        if class == Stray {
                                                             strays += 1;
                                                         }
-                                                        serial_println!(":: kepler: FENCE delta off={:03X} base={:08X} now={:08X}{} — {} ::",
-                                                            off, sweep_base[i], v, sweep_val(v), tag);
+                                                        if class == Hardware {
+                                                            hw_moves += 1;
+                                                        }
+                                                        // BOTH ends are annotated. The plant happens
+                                                        // BEFORE the baseline and CHAN_CUR is restored
+                                                        // BEFORE this sweep, so an aliased plant is
+                                                        // invisible in `now=` — it can only ever show
+                                                        // up as `base=<magic> now=00000000` at an
+                                                        // offset nobody wrote. Naming the value on the
+                                                        // base side is what makes that signature
+                                                        // legible instead of a bare pair of hex words.
+                                                        serial_println!(":: kepler: FENCE delta off={:03X} base={:08X}{} now={:08X}{} — {} ::",
+                                                            off, sweep_base[i], sweep_val(sweep_base[i]),
+                                                            v, sweep_val(v), tag);
                                                     }
-                                                    // The ladder is read-only, so the only value
-                                                    // this leg can send to an unproven port is
-                                                    // CHAN_VALID, and only on a MAPPED boot. A
-                                                    // stray whose DELTA is 0 -> 2 is therefore what
-                                                    // names where I[0x30000] points. PROBE_B_MAGIC
-                                                    // is host-planted and belongs at 0xB00 only —
-                                                    // seeing it anywhere else would mean the host
-                                                    // write aliased, which is its own finding.
-                                                    serial_println!(":: kepler: FENCE delta-sweep moved={} strays={} — a STRAY whose delta is 0->{:08X} names where I[{:05X}] points; PROBE_B_MAGIC belongs at 0xB00 and nowhere else ::",
-                                                        moved, strays, ucode::CHAN_VALID, ucode::IO_ENGINE_STATUS);
+                                                    // TWO signatures, and both are stated as the
+                                                    // DELTAS they actually are — the correction the
+                                                    // first cut of this line needed.
+                                                    //
+                                                    // (1) The falcon's write. The ladder is
+                                                    // read-only, so the only value this leg can send
+                                                    // to an unproven port is CHAN_VALID, and only on
+                                                    // a MAPPED boot: a stray going `0 -> 2` names
+                                                    // where I[0x30000] points.
+                                                    //
+                                                    // (2) The host's plant. "PROBE_B_MAGIC appears at
+                                                    // 0xB00 and nowhere else" was NOT an observable
+                                                    // criterion and has been withdrawn: the plant
+                                                    // precedes the baseline, so an aliased landing is
+                                                    // already in `base=` and is not a delta at all,
+                                                    // and the restore precedes this sweep, so `now=`
+                                                    // is back to the pre-value. What IS observable is
+                                                    // the restore's own shadow — `base=0B005EED
+                                                    // now=00000000` at an offset nobody wrote. That
+                                                    // is the signature to hunt, and the fast, direct
+                                                    // check for the one alias that would poison the
+                                                    // verdict (0xB00 -> 0x804) is the post-plant
+                                                    // `ladder plant` line's `cc1-quiet=`, not this
+                                                    // sweep.
+                                                    serial_println!(":: kepler: FENCE delta-sweep moved={} strays={} hw={} — a STRAY going 0->{:08X} names where I[{:05X}] points; a STRAY going {:08X}->00000000 is an ALIASED HOST PLANT (the restore's shadow) ::",
+                                                        moved, strays, hw_moves,
+                                                        ucode::CHAN_VALID, ucode::IO_ENGINE_STATUS,
+                                                        ucode::PROBE_B_MAGIC);
                                                     serial_println!(":: kepler: FENCE dmatrf-row post 110={:08X} 114={:08X} 118={:08X} 11C={:08X} — compare against the pre row; 118=DMATRFCMD bit1=IDLE ::",
                                                         fecs_read(bar0, fb + 0x110), fecs_read(bar0, fb + 0x114),
                                                         fecs_read(bar0, fb + 0x118), fecs_read(bar0, fb + 0x11C));
@@ -3402,8 +3609,11 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     // number itself is UNPINNED; a refusal is reported as VOID (the
                                     // rung was mis-derived), never as "BAR1 is paged".
                                     {
-                                        /// `NV_PBUS_BAR0_WINDOW` — **DERIVED, UNPINNED**. The window
-                                        /// base is in units of 64 KiB; the aperture is `0x700000`.
+                                        /// `NV_PBUS_BAR0_WINDOW` — **UNPINNED** (spec §0.1, row in
+                                        /// §2.0). The window base is in units of 64 KiB; the
+                                        /// aperture is `0x700000`, itself UNPINNED. Nothing this
+                                        /// boot depends on may rest on either: a refusal is
+                                        /// reported as a mis-derived rung, never as an answer.
                                         const PBUS_BAR0_WINDOW: usize = 0x0017_00;
                                         const PRAMIN_BASE: usize = 0x0070_0000;
                                         /// High-entropy and authored (§4.2). Never `2`.

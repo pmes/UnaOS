@@ -16,6 +16,21 @@ someone deriving a Falcon IO port from memory instead of from §3.
 Claims still awaiting metal are labelled **DERIVED (untested)**. Do not
 promote them without a sitting.
 
+### 0.1 The tag vocabulary
+
+Exactly four tags, so a reader never has to guess how much weight a line
+carries. Anything stronger than `DERIVED` names a sitting.
+
+| Tag | Means | May a boot depend on it? |
+| --- | --- | --- |
+| *(sitting id, e.g. `s29`)* | Observed on this bench, in that sitting. The strongest thing this document has. | Yes |
+| **DERIVED** | Follows from a rule this bench has proven (almost always §3's `<< 6`), applied to a register this bench has seen. No sitting has exercised *this* instance. | Yes, if the leg reports what it assumed and can void itself |
+| **EXT** | External documentation — envytools/rnndb/nouveau — for a register or field this bench has **also** observed, so the external source is supplying a *name or bit meaning*, not the register's existence. | Yes, for naming; never as the sole basis for a write |
+| **UNPINNED** | External or inferred, with **no** corroborating observation on this part. A guess with a citation. | **No.** A leg may probe it, but must report a refusal as "this rung was mis-derived", never as an answer |
+
+`EXT-UNPINNED` in imported notes means `UNPINNED`. When a claim would carry two
+tags, the weaker one wins.
+
 ## 1. The Falcon microcontroller
 
 NVIDIA GPUs from the Fermi/Kepler era use custom 32-bit microcontrollers
@@ -76,6 +91,21 @@ read **before UnaOS wrote anything** in that boot.
 | `+0xB04` | `CHAN_NEXT` | `0x00000000`, host-writable | s34 (rest), s35 (write took) |
 | `+0xC00` | `ENGINE_STATUS` | `0x00000000` | s34 (rest), s35 (CHAN_VALID not host-assertable) |
 | `+0xC08` | `ENGINE_TRIGGER` | `0x00000000` | s34 |
+
+### 2.0 Registers outside the Falcon unit that this document touches
+
+Everything in the table above is an offset **from the unit base** (§1). These
+are not: they are absolute BAR0 addresses, they belong to other blocks, and
+they are listed here so no reader has to work out which kind of number they are
+looking at.
+
+| BAR0 address | Name | Rest value | Evidence |
+| --- | --- | --- | --- |
+| `0x001700` | `NV_PBUS_BAR0_WINDOW` | — | **UNPINNED** — the PRAMIN window base, in units of 64 KiB. No sitting has written or read it on this part; §11.6.1's probe is the first, and a refusal there is reported as a mis-derived rung, not as a result |
+| `0x700000` | PRAMIN aperture (1 MiB) | — | **UNPINNED** — the window `0x001700` selects. A `0xBADFxxxx` read here means the aperture is not at this address on this part (§5.4's nonexistent-PRI signature), not that the question was answered |
+
+Both are read-only to every leg of this document except §11.6.1, which makes
+one reversible write to `0x001700` under the risk statement recorded there.
 
 ### 2.1 CPUCTL bit meanings
 
@@ -651,6 +681,24 @@ merely read it. A magic the falcon reads back through `I[0x2C000]` proves the
 derivation reaches the high region; anything else lands the fault on the
 mapping. See §11.6 for why the probe reads rather than writes.
 
+⚠ **And here is what the rung does NOT cover, stated before anyone quotes a
+`MAPPED` result as more than it is.** Write the two indices out in bits:
+
+| Port | Host offset | IO index | Bits set |
+| --- | --- | --- | --- |
+| ladder | `0xB00` | `0x2C000` | 17, 15, 14 |
+| target | `0xC00` | `0x30000` | 17, **16** |
+
+**Bit 16 is exercised by no rung this campaign has ever run.** The proven ports
+use bit 12 (`0x1000`), bit 13 (`0x1100`) and bit 17 (`0x20000`); the ladder adds
+15 and 14. Bit 16 corresponds to bit 10 of the host offset, which is set only in
+`0x400`–`0x7FF` (where the sole documented register is the poison offset
+`0x504`, §5.4) and in `0xC00`+ (the target itself and `ENGINE_TRIGGER`, which is
+a trigger and cannot be poked to find out). So there is no safe rung for it, and
+a `MAPPED` ladder makes `0x30000` **more plausible, not proven**. The witness
+line says so in those words, and any future claim that the derivation is
+"settled above `0x804`" must carry this caveat with it.
+
 ### 11.3 The assertion lattice — the actual gate
 
 The listing in `kepler.rs` is a doc comment on the byte array, and a block of
@@ -937,9 +985,25 @@ a defect — §11.2's standing.
    enumerates all sixteen source registers to assert that **no** `iowr`/`iowrs`
    to the ladder port exists anywhere in the image.
 
-   Honest limit: this proves the mapping for the **read** path. The write decode
-   is the same address decode, so a confirmed read is strong evidence for the
-   write — but that is an inference, and the witness line says so.
+   **The alias gate, added at review.** `mapped` is
+   `plant_ok && probe_read == MAGIC`, and those two terms can BOTH be satisfied
+   with the falcon having done nothing: if the host's write at `fb+0xB00`
+   aliased onto `fb+0x804`, the magic would already be sitting in
+   `CC_SCRATCH[1]` before the core started, the "falcon read" would be the host
+   reading its own write, and the leg would print `MAPPED` and then go on to
+   make the very write it exists to gate. The delta sweep cannot catch it —
+   the baseline is captured *after* the plant, so an aliased landing is baked
+   into the baseline and is not a delta at all. One read closes it:
+   `CC_SCRATCH[1]` was seeded to `MB_SEED` and nothing has run, so it must
+   still read `MB_SEED`. The witness carries `cc1-quiet=`; `N` prints
+   `ALIAS-DETECTED` and voids the ladder.
+
+   **Two honest limits, both in the witness text.** (1) This proves the mapping
+   for the **read** path; the write decode is the same address decode, so a
+   confirmed read is strong evidence, but it is an inference. (2) **IO bit 16
+   remains untested** — `0x2C000` is bits 17|15|14 and `0x30000` is 17|16, so
+   the rung does not cover the one bit that differs. See §11.2's bit table.
+   `MAPPED` makes `0x30000` more plausible; it does not prove it.
 2. **The assert is GATED on the ladder.** If the ladder does not confirm the
    mapping, the host never sends `CMD_FENCE_ASSERT`; the falcon exits poll1 by
    bound, and the leg prints `FENCE assert WITHHELD` with the reason. Boot AS
@@ -951,18 +1015,50 @@ a defect — §11.2's standing.
    cosmetic: the ladder writes `CC_SCRATCH[1]` before poll1 begins, so the old
    `ack != MB_SEED` test would have fired on its first read and reported an ack
    the falcon had not yet given.
-4. **The sweep became a delta sweep.** A 134-offset baseline is captured with
-   the core halted and the image verified, immediately before `CPUCTL <= START`;
-   the post-treatment pass reports only **changes**, each tagged with whether any
-   leg of the boot admits to writing that offset. `0x504` is excluded by
-   construction (§5.4). It runs on every FENCE boot, not only the ambiguous
-   branch.
-5. **`DMATRFCMD` and its neighbours are printed every boot**, before and after,
+4. **The sweep became a delta sweep, in three classes.** A 134-offset baseline
+   is captured with the core halted and the image verified, immediately before
+   `CPUCTL <= START`; the post-treatment pass reports only **changes**. `0x504`
+   is excluded by construction (§5.4), and it runs on every FENCE boot.
+
+   Each moved offset is classed `WRITTEN` (a leg wrote it), `HARDWARE` (nobody
+   wrote it; it moved because the core ran — `IDLESTATE` at `+0x108` and the
+   unnamed `+0x12C`) or `STRAY` (neither). The three-way split is not
+   presentation. A two-way split would print `⭐ STRAY` on registers that move
+   on *every* healthy boot, and a real stray would then arrive inside a column
+   of false ones — the same diluted-needle failure as round 1's `0x00000002`,
+   one level up. **A signal that fires on healthy boots is not a signal.**
+5. **The one criterion that was unobservable has been withdrawn.** An earlier
+   draft of this section promised that `PROBE_B_MAGIC` "appears at `0xB00` and
+   nowhere else". It cannot: the plant precedes the baseline, so an aliased
+   landing is already in `base=` and is not a delta; and `CHAN_CUR` is restored
+   before the sweep runs, so `now=` is back to the pre-value either way. What
+   **is** observable is the restore's own shadow — `base=0B005EED
+   now=00000000` at an offset nobody wrote — so both ends of every delta are
+   now value-annotated and the witness advertises *that* signature. The fast,
+   direct check for the one alias that would actually poison the verdict
+   (`0xB00` → `0x804`) is the `cc1-quiet=` gate above, not the sweep.
+6. **`DMATRFCMD` and its neighbours are printed every boot**, before and after,
    on a `dmatrf-row` line that names what the register is — so the next session
    reads `0x118` as a rest value on sight instead of re-deriving it.
-6. **`CHAN_CUR` is planted and restored host-side**, both from `fb+0xB00`. Same
-   doctrine as the `ENGINE_STATUS` unwind: a restore that depends on the
-   falcon's timing is one that timing can defeat.
+7. **`CHAN_CUR` is planted and restored host-side**, both from `fb+0xB00`, and
+   the restore puts back **this boot's pre-value**, not a literal `0`. §2
+   records the rest value as `0` (s34), but that is a claim about a fresh unit
+   and this leg runs after several others; writing a literal would quietly
+   overwrite a non-zero pre-value and call it a restore. The witness prints the
+   pre-value and flags whether it matched §2.
+8. **The round-2 phase stamp is `0x06`, and the whole phase vocabulary is now
+   checked pairwise.** It was authored as `0x02` — which is
+   `PHASE_A_POSTREAD`, the stamp ECHO and POKE write. Adding `0x02` to the
+   host's `is_fence_phase` set would have made a stale ECHO image in IMEM read
+   as `PROGRESS`, disarming `FOREIGN-PHASE`: the only instrument that catches
+   stale IMEM, deleted by a one-byte collision, while the comment beside it
+   went on asserting the property it had just broken. The lattice now compares
+   every pair of stamps across **all** images, which immediately surfaced three
+   pre-existing deliberate aliases (`FENCE_PRELOOP`≡`A_PRELOOP`,
+   `PREASSERT`≡`A_PREACK`, `ASSERTED`≡`A_POSTACK`) that were previously
+   undocumented. Those are safe — each value is already inside the set, so the
+   alias costs nothing that was not already spent, and the per-image MAGIC is
+   what separates the images — but they are now written down as decisions.
 
 #### What round 2's boot must show
 
@@ -975,25 +1071,39 @@ prints exactly one of four states, and each licenses a different next move:
 | `UNMAPPED` | plant took, falcon read something else | The rule does not reach `0xB00`. **State (b)**: `0x30000` is unproven, the assert is withheld, and round 3 is a mapping arc, not a fence arc |
 | `UNRUN` | `CC_SCRATCH[1]` still holds the host seed | The falcon never executed the ladder read. A phase problem, not a mapping result |
 | `VOID (plant refused)` | the host could not write `fb+0xB00` | Says nothing about the derivation — and puts §2's s35 "write took" claim in question |
+| `VOID (plant aliased)` | writing `fb+0xB00` moved `fb+0x804`, core halted | The two offsets are not independent registers. Every "falcon read" this boot is the host reading its own write; the ladder and the assert are both void |
+
+On `UNMAPPED` the leg additionally prints `ladder probe-class read=… class=…`,
+because `00000000` and `0xBADF1000` are one word to an equality test and two
+different next moves: `ZERO` is a mapping question (the port decoded to
+something that reads as nothing), while the nonexistent-PRI signature is a
+poison question (§5.4).
 
 Supporting lines the boot must also carry, or the ladder itself is not trusted:
 
-- `FENCE ladder plant off=B00 … planted=Y` — before the start.
+- `FENCE ladder plant off=B00 pre=… cc1-quiet=Y planted=Y` — before the start.
+  `cc1-quiet=N` is the alias gate firing and voids everything downstream.
 - `FENCE sweep-baseline n=134 captured` — before the start. Without it every
   delta below is unfalsifiable.
 - `FENCE dmatrf-row pre …` and `… post …`. **Prediction, recorded before the
   fact:** `118=00000002` in both, unchanged, because it is `DMATRFCMD` idling.
   If the post row differs from the pre row, argument 1 above is wrong and this
   section needs rewriting.
-- `FENCE ladder restore CHAN_CUR=00000000 restored=Y` — the perturbation is
-  undone before the stimulus.
-- `FENCE delta-sweep moved=N strays=M`. Under the read-only ladder the only
-  value this leg can send to an unproven port is `CHAN_VALID`, and only on a
-  `MAPPED` boot where the assert actually runs — so a **stray whose delta is
-  `0 -> 00000002`** is what would name where `I[0x30000]` points. That is now a
-  *delta* claim, not a value match, which is the whole difference from round 1.
-  `strays=0`, with every `moved` offset accounted for by an admitted writer, is
-  the clean outcome; `0x0B005EED` should appear at `0xB00` and nowhere else.
+- `FENCE ladder restore CHAN_CUR pre=… now=… restored=Y matches-s35-rest=Y` —
+  the perturbation is undone before the stimulus, against the pre-value.
+  `matches-s35-rest=N` is a finding about §2, not a failure of this leg.
+- `FENCE delta-sweep moved=N strays=M hw=K`. Two signatures, both stated as the
+  deltas they are:
+  - a **stray going `0 -> 00000002`** names where `I[0x30000]` points (the only
+    value the read-only ladder can send to an unproven port, and only on a
+    `MAPPED` boot where the assert runs);
+  - a **stray going `0B005EED -> 00000000`** is an aliased host plant, caught
+    as the restore's shadow.
+
+  `strays=0`, with every `moved` offset accounted for by `WRITTEN` or
+  `HARDWARE`, is the clean outcome. `hw=K` is expected to be small and non-zero
+  on a healthy boot — it is the count of registers that move because the core
+  ran, and it is broken out precisely so it does not inflate `strays`.
 - `FENCE VOID cause — ladder mapped=…` on any void boot, naming which of states
   (a) and (b) the evidence supports. A void that does not say why is what round
   1 delivered, and it is what cost this round.
@@ -1015,7 +1125,7 @@ because it may moot everything above.
 aperture** — to PFIFO as if they were physical VRAM page numbers
 (`0x800000+8 <- 0xC0000000 | (inst_off >> 12)`, `0x2270 <- runlist_off >> 12`).
 On this generation BAR1 is generally understood to be a **paged window** with
-its own instance block and page tables (EXT, **UNPINNED**). If that holds here,
+its own instance block and page tables (**UNPINNED**, §0.1). If that holds here,
 a BAR1 offset is a virtual address in the BAR1 space, `inst_off >> 12` is not
 the page the FIFO fetches, and **every FIFO pointer this driver has ever written
 was wrong** — which independently explains `err=0x2`, `ACTIVE=0` on all three
@@ -1033,7 +1143,9 @@ physical page of the same number, and reads the dword back through BAR0.
   same number. The root cause is live and takes priority over the port question.
 - `VOID` — the BAR1 write did not stick, `0x001700` refused the window value, or
   `0x700000` read `0xBADFxxxx`. The rung was mis-derived; the question is still
-  open. `NV_PBUS_BAR0_WINDOW = 0x001700` is **DERIVED, UNPINNED**.
+  open. `NV_PBUS_BAR0_WINDOW = 0x001700` and the `0x700000` aperture are both
+  **UNPINNED** (§0.1) and now carry rows in §2.0 — which is exactly why a
+  refusal here is reported as a mis-derived rung and never as an answer.
 
 ⛔ **Risk, stated.** This makes **one write to an unproven PBUS register**. It is
 a deliberate, single, reversible exception to the pull-28 ban: the pre-value is
