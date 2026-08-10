@@ -318,6 +318,27 @@ pub struct Task {
     /// this arch. See `steal_one` for the one class that IS excluded, and `AS_GEN` in `memory.rs` for
     /// the TLB obligation migration creates here.
     steal_ok: bool,
+    /// VUGSPREAD: how many times [`try_steal`] has MIGRATED this task since it was spawned.
+    ///
+    /// Written only by the thief, at step 3 of the steal protocol, where it owns the popped Box
+    /// exclusively — so it needs no atomicity and no lock beyond the pop's own.
+    ///
+    /// It exists because a moves COUNT cannot tell balancing from ping-pong, and that distinction is
+    /// the whole lesson aarch64 paid three arcs for. A fleet that SETTLES shows several distinct
+    /// tasks each migrating once; a fleet that THRASHES shows one task's counter climbing. The
+    /// per-steal witness prints it, and [`STEAL_REMIGS`] counts the steals that found it already
+    /// non-zero — so the churn question survives past `STEAL_LOG_MAX`, on the rollup, rather than
+    /// going quiet exactly when a long run would start to answer it.
+    migrations: u32,
+    /// VUGSPREAD (review F16): this task's core came from a RING-3 PLACEMENT HINT — the `place`
+    /// argument of `SYS_THREAD_SPAWN`, resolved by the kernel to an index. True for exactly the
+    /// population that the pin contract used to freeze and this arc released; false for every kernel
+    /// spawn site and for `CPU_AUTO` processes, which were already movable.
+    ///
+    /// Attribution only. It is never read on a scheduling path — `steal_ok` alone governs
+    /// eligibility, and giving this field any authority would quietly recreate the two-class
+    /// distinction the arc removed.
+    hint_placed: bool,
 }
 
 impl Task {
@@ -375,6 +396,21 @@ struct SchedCpu {
     /// always takes the reload arm. That costs one `mov cr3` per core per boot and removes the need to
     /// reason about whether the pre-scheduler CR3 was ever validated.
     cr3_gen: AtomicU64,
+    /// VUGSPREAD: the CR3 this core's SCHEDULER last installed — a shadow of the live register, kept
+    /// so the dispatch site can count the address-space switches a migration causes without reading
+    /// CR0/CR3 a second time per dispatch.
+    ///
+    /// INTROSPECTION ONLY, and that is load-bearing: the real skip decision is still
+    /// `switch_cr3_if_needed`'s HARDWARE compare against the live register. This shadow only decides
+    /// whether a counter is bumped, so a drift costs a miscount and can never install a wrong root.
+    ///
+    /// It is nevertheless exact, because every CR3 mutation on this arch is either a sched.rs site
+    /// that maintains it (the two dispatch arms, `exit`'s teardown restore, `reap_killed`'s) or the
+    /// `syscall.rs` probe pair, which saves and restores around itself and so is net-zero across any
+    /// point the scheduler can observe. Written and read only by the owning core at IF=0, hence
+    /// `Relaxed`. The initial 0 is not a real CR3, so a core's first dispatch always counts — one
+    /// per core per boot, which is the truth.
+    cr3_live: AtomicU64,
 }
 
 impl SchedCpu {
@@ -390,6 +426,7 @@ impl SchedCpu {
             park_lock: AtomicU64::new(0),
             park_deadline: AtomicU64::new(0),
             cr3_gen: AtomicU64::new(0),
+            cr3_live: AtomicU64::new(0),
         }
     }
 }
@@ -973,9 +1010,27 @@ struct LineBuf {
 /// | `" cores=8/NNN <CAPPED>"` | 21 |
 /// | **total** | **637** |
 ///
-/// 768 therefore carries ~131 bytes of headroom, enough for a further field without re-deriving this.
-/// [`LineBuf`] reports overflow on the wire regardless, so the bound is belt and braces.
-const LINEBUF_CAP: usize = 768;
+/// 768 carried ~131 bytes of headroom against that 637.
+///
+/// VUGSPREAD added a SECOND user, [`emit_spread_witness`], and the review round that followed added
+/// five fields to it, so the buffer is now sized on THAT line rather than the load line. Worst case
+/// for `MAX_CPUS = 8`, term by term:
+///
+/// | term | bytes |
+/// | --- | --- |
+/// | `"[spread] pack=8 spare=8 rqp=["` | 29 |
+/// | 8 x `",1/<20 digits>/<20 digits>"` — comma, `1`, `/`, ready, `/`, pinned = 44 | 352 |
+/// | `"] steal=<20>/<20> m1=<20> mh=<20> remig=<20> packseen=<20> cr3sw=<20>"` | 180 |
+/// | `" decl=t:<20> e:<20> f:<20> p:<20> d:<20> i:<20>"` | 144 |
+/// | `" cores=8/NNN <CAPPED>"` | 21 |
+/// | **total** | **726** |
+///
+/// 768 would have left 42 bytes — headroom too thin to add a field without re-deriving this, which
+/// is exactly the situation the original note was written to avoid. **1024** restores ~298 bytes.
+/// The cost is 256 more bytes of a 16 KiB kernel stack, on a witness path that allocates nothing and
+/// is never nested. [`LineBuf`] reports overflow on the wire regardless, so the bound is belt and
+/// braces either way — but a bound that is quietly one field from binding is not a bound.
+const LINEBUF_CAP: usize = 1024;
 
 /// Longest task name the witness will print for a pegged core, in bytes. Bounds the line (see
 /// [`LINEBUF_CAP`]); truncation is at a UTF-8 character boundary and is marked with a trailing `+`
@@ -1161,6 +1216,168 @@ pub fn emit_load_witness(tag: &str) {
     } else {
         serial_println!("{}", w.as_str());
     }
+    // VUGSPREAD: the placement half of the same question, on the same clock. `seen` rides along so
+    // the column cap is reported on BOTH lines — review F13: a capped `[spread]` would under-count
+    // `pack` and over-state `spare` for the invisible cores, which is the one direction that makes
+    // this witness certify headroom the machine does not have.
+    emit_spread_witness(n, seen);
+}
+
+/// VUGSPREAD — the PLACEMENT witness. One serial line, emitted from [`emit_load_witness`] so it
+/// rides that instrument's existing rate limit and introduces no clock of its own:
+///
+/// ```text
+/// [spread] pack=0 spare=3 rqp=[0/0/0,1/0/0,--,1/1/1,…] steal=4/812331 m1=3 mh=4 remig=0 packseen=12 cr3sw=91204 decl=t:0 e:812327 f:0 p:0 d:0 i:0
+/// ```
+///
+/// `rqp` is one token per core, `running/ready/pinned`:
+///   * `running` — 1 if a task is dispatched here right now (`SCHED[c].current != 0`), else 0. The
+///     pointer is TESTED, never dereferenced: the Box is owned by that core's `run()` and a remote
+///     read of its contents would be a use-after-free waiting for a teardown to line up.
+///   * `ready` — tasks in the ready queue. Excludes the running one, which is the arithmetic the
+///     old steal floor got wrong (see `steal_floor`).
+///   * `pinned` — how many of those `ready` tasks `steal_one` may never take.
+///   * `--` — this core never entered `run()`. Not an idle core, and not counted in `spare`.
+///
+/// `pack` counts DISPATCHING cores with `running + ready >= 2` — cores carrying more runnable work
+/// than they can execute. `spare` counts dispatching cores with nothing running and nothing ready.
+/// **`pack >= 1` together with `spare >= 1` is the defect this arc exists to remove**, and it is a
+/// machine-wide statement rather than a per-core one because that is the shape a reader can score
+/// against `[wpace]` on the same wire.
+///
+/// `m1` / `mh` attribute the moves (see `STEAL_M_DEPTH1` / `STEAL_M_HINT`); `packseen` is the
+/// high-rate companion to `pack` (see `PACK_SEEN`); `cr3sw` is what the moves COST (see
+/// `CR3_SWITCHES`); `decl` names every declined attempt (see `STEAL_D_*`).
+///
+/// **THE CONSERVATION LAW, and its tolerance (review F11).** `e + f + p + d + i + moves == passes`,
+/// with `t` outside `passes` because `STEAL_PASSES` is bumped after the thief exclusion. The terms
+/// are read at slightly different instants from a machine that keeps incrementing them, so a
+/// residual of a FEW is sampling skew and means nothing. A residual in the THOUSANDS, or one that
+/// grows with the capture, means a return path was added without a counter — at which point the
+/// `decl` breakdown is incomplete and every attribution below it is suspect. Score the magnitude,
+/// not the equality.
+///
+/// WHAT THE NEXT BOOT CAN ACTUALLY PRODUCE — review F16 rewrote this table, because the first
+/// version listed PRE-fix diagnoses that a POST-fix boot cannot reach, which is the same defect as a
+/// witness that cannot fail. All three repairs are in force on the next capture; the rows below are
+/// what that machine can print.
+///
+/// | the next boot shows | reading |
+/// | --- | --- |
+/// | `pack -> 0`, `moves` a handful then flat, `remig 0`, `win=1` off 19.1/s | **PASS.** Spread, and settled rather than oscillating. |
+/// | `pack=0` and `packseen` near 0 at every sample, `win=1` still at 19.1/s | **REFUTED.** No packing existed at the 5 s census OR at the millions of steal-pass observations between them, so the frame time was never a placement problem. Go to the yield-spin barrier: the TIME feed already reads c0/c5 at 2–3 % where the EVENT feed reads 99 %. |
+/// | `pack=0` but `packseen/passes` materially non-zero, rate unchanged | the packing is real and TRANSIENT — sub-census, forming and clearing inside a frame. Neither the floor nor the pin can hold a queue that is empty whenever it is looked at; this is a barrier/wake-latency story, not a placement one. |
+/// | `pack>=1`, `spare>=1`, packed core's `pinned` > 0 | **THE FIX FAILED**, and this is the row that says so — not, as an earlier draft had it, a vindication of the pin repair. Post-fix a ring-3 thread is steal-eligible, so a pinned task still sitting on a packed core is either a kernel task that legitimately named that core (check the `[schedx86] load` name) or a ring-3 path that does not go through `spawn_user_thread`. Find which before touching anything else. |
+/// | `pack>=1`, `spare>=1`, `pinned=0`, `decl i:` climbing | the idle-floor GUARD is what is holding the packing: every ready-holding core is going idle between the peek and the lock and re-raising its floor to 2. That is the ping-pong brake working as specified and declining a move that would in fact have helped. It is a tuning question, not a defect, and the change would be to let a depth-1 steal through when the thief has been idle for more than one pass. |
+/// | `decl f:` climbing post-fix | narrower than it was: with the per-victim floor in force, `f` can only fire when EVERY ready-holding core is at `PRIO_IDLE` with depth 1. Same guard as the row above, observed one step earlier. It does NOT mean "the old floor hid it" — that diagnosis is unreachable now. |
+/// | `moves` climbing with `remig` beside it, or `cr3sw` delta outrunning the `steal=` delta | churn. See `scheduler.md` for the numeric revert criterion; "climbing" against a baseline of one move in four and a half million passes is not a threshold. |
+///
+/// **THE TWO REPAIRS ARE NOT FULLY SEPARABLE, and `m1`/`mh` say how far separation goes.** A vug
+/// worker packed behind its parent needed BOTH the pin release and the floor change, and it scores
+/// on both counters — that is the honest answer, not a shortcoming. What the pair does settle is the
+/// one-sided cases: `mh > 0` with `m1 == 0` means the pin was the whole story, `m1 > 0` with
+/// `mh == 0` means the floor was. Anything else is a joint result and must be reported as one.
+///
+/// SNAPSHOT DISCIPLINE is `emit_load_witness`'s, verbatim and for its reasons: the scan takes
+/// `RUN_QUEUES[c]` (a plain `spin::Mutex` with no IRQ masking) from a preemptible task on the render
+/// core, so it runs inside `without_interrupts` or it is a latent self-deadlock. Bounded: `n <=
+/// MAX_CPUS` iterations of one relaxed load plus one lock held across a walk of `NUM_PRIORITIES`
+/// short deques, taken and released one at a time, no allocation and no UART inside. The census walks
+/// the queue rather than calling `len()` because `pinned` cannot be counted any other way; the queues
+/// it walks are the same ones `len()` already sums over.
+fn emit_spread_witness(n: usize, seen: usize) {
+    use core::fmt::Write;
+
+    /// One core's placement row. `Copy` and plain, so the masked snapshot allocates nothing.
+    #[derive(Clone, Copy)]
+    struct SpreadRow {
+        dispatching: bool,
+        running: bool,
+        ready: usize,
+        pinned: usize,
+    }
+
+    let mut rows =
+        [SpreadRow { dispatching: false, running: false, ready: 0, pinned: 0 }; MAX_CPUS];
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for (c, row) in rows.iter_mut().enumerate().take(n) {
+            row.dispatching = cpu_dispatching(c);
+            // TESTED, not dereferenced — see the doc above.
+            row.running = SCHED[c].current.load(Ordering::Acquire) != 0;
+            let (ready, pinned) = RUN_QUEUES[c].lock().census();
+            row.ready = ready;
+            row.pinned = pinned;
+        }
+    });
+
+    let mut pack = 0usize;
+    let mut spare = 0usize;
+    for row in rows.iter().take(n) {
+        if !row.dispatching {
+            continue;
+        }
+        let runnable = usize::from(row.running) + row.ready;
+        if runnable >= 2 {
+            pack += 1;
+        } else if runnable == 0 {
+            spare += 1;
+        }
+    }
+
+    let mut w = LineBuf::new();
+    let _ = write!(w, "[spread] pack={} spare={} rqp=[", pack, spare);
+    for (c, row) in rows.iter().enumerate().take(n) {
+        // A core that is not dispatching gets `--` rather than `0/0/0`, the same distinction
+        // `[schedx86] load` draws between a measured zero and an absent measurement: a core that
+        // never entered `run()` is not an idle core, and printing it as one would let the witness
+        // certify spare capacity the machine does not have.
+        let sep = if c == 0 { "" } else { "," };
+        if row.dispatching {
+            let _ = write!(
+                w,
+                "{}{}/{}/{}",
+                sep,
+                u8::from(row.running),
+                row.ready,
+                row.pinned
+            );
+        } else {
+            let _ = write!(w, "{}--", sep);
+        }
+    }
+    let (moves, passes) = steal_counters();
+    let _ = write!(
+        w,
+        "] steal={}/{} m1={} mh={} remig={} packseen={} cr3sw={}",
+        moves,
+        passes,
+        STEAL_M_DEPTH1.load(Ordering::Relaxed),
+        STEAL_M_HINT.load(Ordering::Relaxed),
+        STEAL_REMIGS.load(Ordering::Relaxed),
+        PACK_SEEN.load(Ordering::Relaxed),
+        CR3_SWITCHES.load(Ordering::Relaxed),
+    );
+    let _ = write!(
+        w,
+        " decl=t:{} e:{} f:{} p:{} d:{} i:{}",
+        STEAL_D_THIEF.load(Ordering::Relaxed),
+        STEAL_D_EMPTY.load(Ordering::Relaxed),
+        STEAL_D_FLOOR.load(Ordering::Relaxed),
+        STEAL_D_PINNED.load(Ordering::Relaxed),
+        STEAL_D_DRAIN.load(Ordering::Relaxed),
+        STEAL_D_IDLEFLOOR.load(Ordering::Relaxed),
+    );
+    // Review F13: carry the column cap onto THIS line too. `pack` and `spare` are sums over the
+    // columns printed, so a capped machine under-reports packing and over-reports spare capacity —
+    // the one direction in which this witness could certify headroom that is not there.
+    if seen > n {
+        let _ = write!(w, " cores={}/{} <CAPPED>", n, seen);
+    }
+    if w.overflow {
+        serial_println!("{} <TRUNCATED>", w.as_str());
+    } else {
+        serial_println!("{}", w.as_str());
+    }
 }
 
 // ── STORM-X86: the launch-boundary headroom probe ────────────────────────────────────────────────
@@ -1276,6 +1493,22 @@ pub fn storm_probe(phase: &str) {
 /// about to report (the defect aarch64's census documents at `prio_witness`).
 pub fn storm_census(phase: &str) {
     storm_probe(phase);
+    // VUGSPREAD (review F17/F7c): re-arm the per-steal witness at the launch boundary.
+    //
+    // `STEAL_LOG_MAX` names the first 24 migrations of a boot and then goes quiet forever. Before
+    // this arc that cap was generous — Boot AS spent its whole 24 on nothing, because there was ONE
+    // steal in ten minutes. With the corrector actually able to see the packing it is the opposite
+    // problem: a settling fleet burns the cap during early boot on migrations nobody is asking
+    // about, and the storm that the arc is *for* then reports its moves as an uninterpretable
+    // increment on `steal=`, with no names, no source cores and no `m=` churn counts. The boot that
+    // is supposed to settle this question would be the one boot that could not answer it.
+    //
+    // Reset at the boundary rather than raising the cap: the cap is what keeps a thrashing fleet
+    // from flooding the wire, and raising it would trade a bounded silence for an unbounded flood.
+    // Zeroing here re-arms exactly 24 named lines per storm phase, which is a launch's worth. The
+    // cumulative `steal=`/`m1`/`mh`/`remig` totals on `[spread]` are untouched by this and keep
+    // counting across the reset, so nothing measured is lost — only the naming is renewed.
+    STEAL_LOG_COUNT.store(0, Ordering::Relaxed);
     emit_load_witness(&alloc::format!("-storm-{}", phase));
 }
 
@@ -1396,6 +1629,37 @@ impl RunQueue {
             }
         }
         None
+    }
+    /// VUGSPREAD: `(ready, pinned)` for this queue — how many READY tasks it holds, and how many of
+    /// those [`steal_one`](Self::steal_one) may never take (`!steal_ok`). Taken under the queue's own
+    /// lock, by the `[spread]` witness only; never consulted on a scheduling path.
+    ///
+    /// The PAIR is the instrument. `ready` alone cannot separate "this core is packed and no idle
+    /// core has looked yet" from "this core is packed with work no idle core is ALLOWED to take",
+    /// and those two diagnoses want opposite repairs — the first a corrector that runs, the second a
+    /// pin contract that is too wide. A census that printed one number would read identically under
+    /// both, which is the class of witness this tree does not accept.
+    ///
+    /// `pinned` counts the `steal_ok` filter ONLY, not `steal_one`'s second filter (a cooperative
+    /// ring-3 task that a core-0 thief must skip). Those two differ: this census is a property of the
+    /// QUEUE, while the second filter is a property of the (queue, thief) pair and would print a
+    /// different number for every core that read it. Review F8-doc — say the bound rather than imply
+    /// it: this is O(ready tasks) over `NUM_PRIORITIES` deques, i.e. the same walk `len()` sums over,
+    /// and it is bounded in practice by `RUNQ_CAPACITY` (64) per level rather than by anything
+    /// structural. It runs inside the witness's masked section, at the witness's rate, and nowhere
+    /// else.
+    fn census(&self) -> (usize, usize) {
+        let mut ready = 0;
+        let mut pinned = 0;
+        for level in self.levels.iter() {
+            for t in level.iter() {
+                ready += 1;
+                if !t.steal_ok {
+                    pinned += 1;
+                }
+            }
+        }
+        (ready, pinned)
     }
     /// Priority-aging sweep (anti-starvation): RELOCATE every ready task that has now waited at
     /// least `AGE_TICKS` one level UP, carrying any surplus credit to the next sweep. `elapsed` is
@@ -1693,6 +1957,8 @@ fn spawn_inner(
         preemptible: false,
         kill: None,
         steal_ok,
+        migrations: 0,
+        hint_placed: false,
     });
 
     // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`.
@@ -1916,6 +2182,8 @@ fn spawn_user_inner(
         preemptible,
         kill,
         steal_ok,
+        migrations: 0,
+        hint_placed: false,
     });
     // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`.
     #[cfg(feature = "wedge2")]
@@ -2091,10 +2359,49 @@ pub fn spawn_user_thread(
     target_cpu: usize,
     user_cr3: u64,
 ) -> JoinHandle {
-    // SMPBAL-X86: a thread is spawned PREEMPTIBLE, so the core-0 exclusion does not apply. Its one
-    // caller (`sys_thread_spawn`) names a core via `sibling_online_cpu`, so `steal_ok` is false and
-    // the WINX-7 sibling placement is unchanged; the `CPU_AUTO` arm is here for symmetry only.
-    let steal_ok = target_cpu == CPU_AUTO;
+    // SMPBAL-X86: a thread is spawned PREEMPTIBLE, so the core-0 exclusion does not apply.
+    //
+    // VUGSPREAD — this used to read `let steal_ok = target_cpu == CPU_AUTO;`, and the note beside it
+    // observed, without alarm, that `sys_thread_spawn` always names a core so `steal_ok` is always
+    // false. That was the defect, stated in the code and not recognised as one.
+    //
+    // Read the pin contract for what it says: a caller that NAMED a core gets that core forever. It
+    // exists so that render, input, usb-pump and the fixtures — kernel spawn sites that name a core
+    // because the core is part of their correctness — are never migrated. A `SYS_THREAD_SPAWN` core
+    // is not that. Ring 3 passes `place` ∈ {0 = my core, 1 = a sibling}, which is a HINT about
+    // locality expressed in the only vocabulary the syscall has; the kernel then resolves it to an
+    // index. Marking the result a PIN promoted a user-space hint into a kernel guarantee, and the
+    // consequence was measured on Boot AS: a vug is a parent plus two workers, `place=0` puts one
+    // worker on the parent's own core BY REQUEST, and nothing in the system could ever undo it — two
+    // ring-3 threads time-sharing one core at 19 fps while c3 and c4 sat at 0 %, for ten minutes.
+    //
+    // So a ring-3 thread is steal-eligible, full stop. Its placement is still honoured — it starts
+    // exactly where `sys_thread_spawn` asked — and an idle core may correct it later, which is the
+    // arch's whole stated model ("placement is a one-shot hint and `try_steal` is the correction").
+    // Nothing about the migration is new or unproven here: a thread is preemptible, `steal_one`
+    // already excludes the one class that must not move (a cooperative ring-3 task onto core 0, and
+    // a thread is not cooperative), and the TLB obligation is discharged by `AS_GEN` exactly as it is
+    // for the `bg-user` PROCESS this thread shares an address space with — a process that has been
+    // steal-eligible since SMPBAL-X86 landed. Making the parent movable and its threads immovable was
+    // never a considered position.
+    //
+    // REVIEW F2 — THE ARGUMENT ABOVE IS SCOPED TO THIS FUNCTION'S ONE CALLER, and that scope is now
+    // asserted rather than assumed. Everything that makes the release safe is a property of a
+    // `SYS_THREAD_SPAWN` thread: it is preemptible (so it is not `steal_one`'s excluded class), it
+    // has a private address space whose TLB obligation `AS_GEN` discharges, and its core is a ring-3
+    // HINT rather than a correctness requirement. A future KERNEL caller reaching this function with
+    // a core that is part of its correctness would be handed `steal_ok = true` and silently migrated
+    // — the exact failure the pin contract exists to prevent, arriving from the other direction.
+    //
+    // **STOP if you are about to add a second caller.** The unconditional `steal_ok` is not a
+    // property of this function; it is a property of ring-3 threads. A caller that needs a real pin
+    // needs a parameter here, not a comment.
+    debug_assert!(
+        user_cr3 != 0 && user_entry != 0,
+        "spawn_user_thread: steal_ok is unconditional here on the strength of this being a ring-3 \
+         thread — a kernel caller must not reach it"
+    );
+    let steal_ok = true;
     let target_cpu = pick_cpu(target_cpu, false, name);
     assert!(target_cpu < MAX_CPUS, "spawn_user_thread: target_cpu out of range");
     assert!(user_cr3 != 0, "spawn_user_thread: a thread needs a real private address space");
@@ -2123,6 +2430,9 @@ pub fn spawn_user_thread(
         preemptible: true, // see the section header: a worker must share its core, not own it
         kill: None,
         steal_ok,
+        migrations: 0,
+        // VUGSPREAD (review F16): this core came from ring 3's `place` argument. Attribution only.
+        hint_placed: true,
     });
     // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`. Same idiom as every
     // other enqueue site (`spawn_inner` / `spawn_user_inner` / `make_ready`) — no new lock ORDER is
@@ -2148,13 +2458,78 @@ pub fn spawn_user_thread(
 /// never run, and never joined — a silent hang at the parent's frame barrier. So the probe is a core
 /// that has actually PUBLISHED a scheduler context (`scheduler_rsp != 0`, written by the first
 /// `switch_context` that core's `run()` performed); a core still sitting in `wait_and_run` has not.
+/// VUGSPREAD — IT WAS "A SIBLING", AND IT MEANT "THE SAME SIBLING, EVERY TIME".
+///
+/// The scan above returned the FIRST core matching the probe, in index order, with no reference to
+/// what that core was already doing. On an eight-core machine every `place=1` thread in the system
+/// therefore landed on the same low-numbered core, and a second vug's worker joined the first vug's
+/// worker there while the high-numbered cores stayed empty. Boot AS shows the shape from the other
+/// end: the CPU-pulse census reads c0 and c5 pegged, c3 and c4 at exactly `busy/idle=0/250`.
+///
+/// "A sibling" was always a policy, not a constraint — the caller asked for "not my core", nothing
+/// more — so the choice among the eligible cores is free, and it now uses the SAME key chain
+/// [`pick_cpu`] uses: shallowest ready queue first (an exact instantaneous count), lowest rolling
+/// busy percent as the tie-break (a ~250 ms lagging window), then the rotating cursor so full ties
+/// fill round-robin rather than all landing on the lowest index. Sharing the cursor with `pick_cpu`
+/// is deliberate: a process and the threads it spawns are placed against one rotation, not two that
+/// can synchronise.
+///
+/// The ELIGIBILITY probe is unchanged on purpose — still `scheduler_rsp != 0`, still the WINX-2
+/// `bg_place_cpu` lesson (a thread placed on a core that never dispatches is spawned, never run, and
+/// never joined: a silent hang at the parent's frame barrier). This arc changes WHICH eligible core
+/// is chosen, and nothing about which cores are eligible.
+///
+/// Render and service are DEPRIORITISED, not excluded — preferred away from first, accepted if they
+/// are all that is dispatching. Excluding them outright would reintroduce the hang this function's
+/// probe exists to prevent, on a machine small enough that they are the only siblings.
+///
+/// The ladder here is TWO tiers — `{render, service}` excluded, then nothing excluded — and review
+/// F21 is right that this is NOT `pick_cpu`'s ladder, which is THREE (`{render, service}`, then
+/// `{render}`, then nothing). The difference is deliberate, and is written down so the two are not
+/// "unified" later by someone reading a looser earlier wording. `pick_cpu`'s middle rung keeps a
+/// long-lived program off the SERVICE core one rung longer than off the render core, because that
+/// rung is where the `xhci_worker_cpu` storage-latency preference lives. Here the caller's own core
+/// is already excluded, so by the time the first rung fails the machine has at most two dispatching
+/// cores left and there is no third candidate for a middle rung to choose between. Ordering
+/// render-before-service at that point would be a distinction with no set to apply it to.
+///
+/// LOCKING: `run_queue_len`'s WEDGE-4 `<W1>` shape. The caller is `sys_thread_spawn`, i.e. syscall
+/// context at IF possibly 1, so the whole scan is taken inside `without_interrupts` for the identical
+/// reason `pick_cpu` and `emit_load_witness` do — at most `MAX_CPUS` iterations, one run-queue lock
+/// at a time, never nested, no allocation and no UART inside.
 pub fn sibling_online_cpu(caller: usize) -> usize {
-    for c in 0..MAX_CPUS {
-        if c != caller && SCHED[c].scheduler_rsp.load(Ordering::Acquire) != 0 {
-            return c;
+    let render = crate::arch::smp::render_cpu();
+    let service = crate::arch::smp::service_cpu();
+    let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
+    let mut best: Option<(usize, usize, u32)> = None; // (cpu, depth, pct)
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for tier in 0..2u8 {
+            for i in 0..MAX_CPUS {
+                let c = (rot + i) % MAX_CPUS;
+                if c == caller || SCHED[c].scheduler_rsp.load(Ordering::Acquire) == 0 {
+                    continue;
+                }
+                if tier < 1 && (render == Some(c) || service == Some(c)) {
+                    continue;
+                }
+                let depth = RUN_QUEUES[c].lock().len();
+                // Cross-core read: `busy_pct`'s own contract says pass 0 for `live` here, because
+                // `live_span_cyc` would subtract another core's `rdtsc` anchor from ours.
+                let pct = ACCT[c].busy_pct(0);
+                let better = match best {
+                    None => true,
+                    Some((_, bd, bp)) => depth < bd || (depth == bd && pct < bp),
+                };
+                if better {
+                    best = Some((c, depth, pct));
+                }
+            }
+            if best.is_some() {
+                return;
+            }
         }
-    }
-    caller
+    });
+    best.map_or(caller, |(c, _, _)| c)
 }
 
 /// Turn scheduling on (idempotent): release the APs from their post-online wait loop into `run()`
@@ -2598,6 +2973,8 @@ pub fn exit() -> ! {
         let user_cr3 = (*raw).user_cr3;
         if user_cr3 != 0 {
             crate::arch::memory::restore_kernel_cr3();
+            // VUGSPREAD: keep the `cr3_live` shadow honest across a teardown restore — see `SchedCpu::cr3_live`.
+            SCHED[cpu].cr3_live.store(crate::arch::memory::kernel_cr3(), Ordering::Relaxed);
             user_space_release(user_cr3);
         }
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
@@ -4010,8 +4387,20 @@ fn input_wait_backstop() {
 //      through `make_ready` now delivers the task to its new home.
 //
 // WHY THIS IS SOUND ON x86, stated because it is the arch-specific half:
-//   * There is no per-task hardware state to strand. No FPU/XSAVE context exists anywhere in this
-//     kernel (the target json builds `+soft-float` with SSE/AVX off), there is no FS base, and GS
+//   * There is no per-task hardware state to strand. VUGSPREAD/review F3 corrects the reason given
+//     for the FP half, which was false as written ("no FPU/XSAVE context exists anywhere in this
+//     kernel"): x87/MMX is ring-3-REACHABLE on this machine — CR0.EM/TS are 0 out of INIT and the
+//     U2.5 first-entry scrub twenty lines into `user_task_trampoline` exists precisely because a
+//     ring-3 program can leave live mantissa bits in the FP file. The correct statement is narrower
+//     and survives that: **x87 is not per-TASK state in this scheduler at all.** Nothing here saves,
+//     restores, or attributes the FP file to a task, migrated or not — a ring-3 task that dirties it
+//     already loses that state to the next task on its OWN core, and a migration is not a new
+//     hazard, only the same one on a different core. What makes the omission tolerable rather than a
+//     latent bug is a CONVENTION, not an enforcement: the userspace targets are built `+soft-float`,
+//     so no program in the tree keeps a value there across a preemption. **A future ring-3 program
+//     compiled with hardware FP would need per-task save/restore — and would need it with or without
+//     stealing.** The kernel's own `+soft-float` is what makes the scrub safe at CPL 0; it is not
+//     what makes ring 3 safe. There is no FS base, and GS
 //     base is pure per-core state — a migrated task reading the new core's per-CPU block is correct.
 //   * Everything else per-task is re-derived at the single dispatch site: CR3, TSS.RSP0 and the
 //     SYSCALL kernel rsp are all installed there from the incoming `Task`, covering first entry and
@@ -4029,6 +4418,133 @@ fn input_wait_backstop() {
 /// core (a core with one task is not "loaded"), which is what stops two idle cores ping-ponging a
 /// lone task between them.
 const STEAL_MIN_DEPTH: usize = 2;
+
+// ── VUGSPREAD: THE FLOOR WAS COUNTING THE WRONG POPULATION ──────────────────────────────────────
+//
+// `STEAL_MIN_DEPTH`'s justification above — "a core with one task is not loaded" — is a true
+// sentence attached to the wrong quantity. A run queue holds only READY tasks; the task a core is
+// EXECUTING lives in `SCHED[cpu].current`, not in `levels`. So a floor of 2 ON THE QUEUE means a
+// core needs THREE runnable tasks before an idle core will judge it loaded, and the packing this arc
+// was opened on — a vug's parent and one of its workers time-sharing one core with two cores at 0 %
+// — sits at queue depth ONE. It was not missed by the corrector; it was BELOW the corrector's floor
+// by construction, which is why Boot AS reads `steal=1/4574483`: one migration in four and a half
+// million idle passes, over ten minutes, on a visibly lopsided machine.
+//
+// The floor is therefore asked of the VICTIM rather than read off a constant:
+//   * a victim that is RUNNING something carries that task PLUS its queue, so depth 1 already means
+//     two runnable tasks and an idle core should take one;
+//   * a victim at `PRIO_IDLE` is between tasks and is about to dispatch the very task we would take.
+//     Stealing its only ready task is exactly how two idle cores start ping-ponging one task — the
+//     hazard the constant was reaching for — so that case keeps the floor of 2, unchanged.
+//
+// This does not widen the steal in the direction that hurt aarch64. The rate is still bounded by the
+// idle-pass rate at one task per pass, the thief still must have nothing of its own, and the pin
+// contract is untouched. What changes is only WHICH victims are visible: cores that are genuinely
+// running one task while another waits behind it.
+
+/// VUGSPREAD: the ready-queue depth at which an idle core may take one of `victim`'s tasks. See the
+/// block above.
+///
+/// Best-effort by design: `current_prio` may be a tick stale. Being wrong costs at most one extra
+/// migration — the thief re-homes the Box it exclusively owns and the task runs there — and can
+/// never lose or duplicate a task, because the decision is re-taken under the victim's own lock.
+///
+/// Called from the LOCK site. `try_steal`'s peek loop INLINES this rule rather than calling it, so
+/// that the `current_prio` load it needs for the floor is the same one review F15's `PACK_SEEN`
+/// observation reads — one load answering both questions instead of two loads that could disagree
+/// with each other within a single iteration. Keep the two in step if either changes.
+#[inline]
+fn steal_floor(victim: usize) -> usize {
+    if SCHED[victim].current_prio.load(Ordering::Acquire) == PRIO_IDLE {
+        STEAL_MIN_DEPTH
+    } else {
+        1
+    }
+}
+
+// ── VUGSPREAD: WHY A STEAL DID NOT HAPPEN ───────────────────────────────────────────────────────
+//
+// `steal=M/P` says how often the corrector ran and how rarely it moved anything. It does NOT say
+// why, and on Boot AS the two readings that matter — "there was nothing to take" and "there was
+// something to take and the rules forbade it" — are indistinguishable in it. They are opposite
+// diagnoses: the first refutes the placement hypothesis outright, the second convicts a specific
+// rule. So every declined attempt now names its reason, and the reasons are DISJOINT:
+//
+// | counter | meaning | which mechanism it fingerprints |
+// | --- | --- | --- |
+// | `t` [`STEAL_D_THIEF`] | the thief is the render or service core | neither — an expected refusal |
+// | `e` [`STEAL_D_EMPTY`] | no other dispatching core held ANY ready task | the machine really was unpacked |
+// | `f` [`STEAL_D_FLOOR`] | ready tasks existed, none reached its victim's floor | the floor (fixed above) |
+// | `p` [`STEAL_D_PINNED`] | a victim qualified, every ready task on it was pinned or excluded | the pin contract |
+// | `d` [`STEAL_D_DRAIN`] | the victim drained between the peek and the lock | benign raciness |
+//
+// The arithmetic is checkable ON THE WIRE, which is what stops the set from quietly losing a case:
+// `e + f + p + d + moves == passes`, and `t` sits outside `passes` because `STEAL_PASSES` is bumped
+// after the thief exclusion. A capture where those do not add up means a path was added without a
+// counter, and the witness is lying rather than merely incomplete.
+/// Review F10 — `d` was ONE counter covering two different events, which contradicted the
+/// disjointness the table claims. A victim whose queue is EMPTY when the lock is taken drained under
+/// a race (benign, and says nothing about policy); a victim holding `0 < len < floor` did NOT drain
+/// — it went IDLE between the peek and the lock, raising its own floor from 1 to 2. The second is
+/// **the new idle-floor guard firing**, i.e. this arc's own ping-pong brake doing its job, and
+/// reading it as a race would hide exactly the mechanism a reviewer would want to audit.
+static STEAL_D_THIEF: AtomicU64 = AtomicU64::new(0);
+static STEAL_D_EMPTY: AtomicU64 = AtomicU64::new(0);
+static STEAL_D_FLOOR: AtomicU64 = AtomicU64::new(0);
+static STEAL_D_PINNED: AtomicU64 = AtomicU64::new(0);
+/// The victim's queue was EMPTY under the lock — a true drain, a benign race.
+static STEAL_D_DRAIN: AtomicU64 = AtomicU64::new(0);
+/// The victim still held work but had gone IDLE, raising its floor to `STEAL_MIN_DEPTH`. The guard.
+static STEAL_D_IDLEFLOOR: AtomicU64 = AtomicU64::new(0);
+
+// ── VUGSPREAD: WHICH REPAIR DID THE WORK ────────────────────────────────────────────────────────
+//
+// Review F16. Three repairs landed together, and "the fleet spread out" attributes to none of them.
+// Two of the three are separable by a counter, and both counters are read at the moment of a move —
+// the only instant at which the question has an answer:
+//
+//   * `STEAL_M_DEPTH1` — moves taken from a victim whose ready queue held exactly ONE task. That is
+//     precisely the population the old constant floor of 2 excluded, so this counts moves that could
+//     not have happened before `steal_floor`.
+//   * `STEAL_M_HINT` — moves of a task whose core came from a ring-3 placement hint
+//     ([`Task::hint_placed`]). That is precisely the population the old pin contract froze, so this
+//     counts moves that could not have happened before the `spawn_user_thread` change.
+//
+// They are independent, not exclusive: a vug worker packed behind its parent scores BOTH, which is
+// the honest answer — that move needed both repairs and neither alone would have produced it. The
+// third repair (`sibling_online_cpu`) is a PLACEMENT change and leaves no trace in the steal path at
+// all; it is read off `[spread] rqp=` at launch (workers landing on distinct low-load cores) and off
+// `SCHEDPLACE-X86`, never off these.
+static STEAL_M_DEPTH1: AtomicU64 = AtomicU64::new(0);
+static STEAL_M_HINT: AtomicU64 = AtomicU64::new(0);
+
+/// VUGSPREAD (review F15) — idle passes on which at least one OTHER dispatching core was PACKED
+/// (running a task with at least one more ready behind it).
+///
+/// The `[spread]` census samples every ~5 s from the render service. Packing that forms and clears
+/// between two samples is invisible to it, so a refutation read off `pack=0` alone would be reading
+/// a sampling artefact as a fact. This is the high-rate companion: it is evaluated on every steal
+/// pass — millions per capture — inside the peek loop that already holds the depth, so it costs one
+/// comparison and no extra lock. `packseen/passes` is a duty cycle, and a `pack=0` census standing
+/// beside a `packseen` near zero is a REAL refutation, where `pack=0` alone is only a quiet sample.
+static PACK_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// VUGSPREAD (review F7) — dispatches that took `switch_cr3_if_needed`'s reload, i.e. installed a
+/// DIFFERENT address space than the one this core was standing on. Distinct from [`CR3_RELOADS`],
+/// which counts only the generation-behind revalidation arm.
+///
+/// This is the price tag on a migration, and it exists so the revert criterion in `scheduler.md` can
+/// be a number instead of an adjective: on this hardware nothing kernel-mapped carries `PTE_GLOBAL`
+/// and firmware leaves CR4.PGE clear, so every one of these is a WHOLE-TLB flush. Note it is NOT a
+/// migration counter — an ordinary two-program alternation on one core takes this arm constantly —
+/// so read its DELTA against the `steal=` delta over the same interval, never its absolute value.
+static CR3_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// VUGSPREAD: steals whose task had ALREADY migrated at least once (`Task::migrations > 0`). The
+/// churn term. A balancing fleet drives `STEAL_MOVES` up a handful of times and leaves this at or
+/// near zero; a thrashing one drives the two up together. Without it, "moves went up" is not
+/// evidence of anything.
+static STEAL_REMIGS: AtomicU64 = AtomicU64::new(0);
 
 /// SMPBAL-X86: rate limit for the per-steal witness — the first `STEAL_LOG_MAX` migrations are named
 /// on the wire, then it goes quiet. The cumulative `steal=` field on the `[schedx86] load` line keeps
@@ -4080,6 +4596,7 @@ static CR3_RELOADS: AtomicU64 = AtomicU64::new(0);
 /// leaves the task where it already runs correctly.
 fn try_steal(cpu: usize) -> bool {
     if crate::arch::smp::render_cpu() == Some(cpu) || crate::arch::smp::service_cpu() == Some(cpu) {
+        STEAL_D_THIEF.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     STEAL_PASSES.fetch_add(1, Ordering::Relaxed);
@@ -4089,8 +4606,13 @@ fn try_steal(cpu: usize) -> bool {
     //    result is treated as advisory (step 2 re-checks under the lock it actually steals from).
     //    Say "peek", not "lock-free": these ARE acquisitions, and they go through the same bounded
     //    wrapper as everything else so the wedge probe can see them.
+    //    VUGSPREAD: the floor is now per-victim (`steal_floor`), and `any_ready` remembers whether
+    //    ANY other core held a ready task at all — that is what separates "nothing to take" from
+    //    "something to take, below the floor", the two readings `steal=M/P` alone conflates.
     let mut victim: Option<usize> = None;
-    let mut best_depth = STEAL_MIN_DEPTH - 1;
+    let mut best_depth = 0usize;
+    let mut any_ready = false;
+    let mut saw_pack = false;
     for c in 0..MAX_CPUS {
         if c == cpu || !cpu_dispatching(c) {
             continue;
@@ -4099,17 +4621,47 @@ fn try_steal(cpu: usize) -> bool {
         let depth = wedge4::lock_or_squawk(&RUN_QUEUES[c]).len();
         #[cfg(not(feature = "wedge2"))]
         let depth = RUN_QUEUES[c].lock().len();
-        if depth > best_depth {
+        if depth == 0 {
+            continue;
+        }
+        any_ready = true;
+        // The two questions the floor asks, asked once: is this core RUNNING something (so its
+        // queue depth understates its runnable count by one), and does its depth clear the floor
+        // that answer implies. `running` doubles as review F15's high-rate packing observation —
+        // running + at least one ready IS a packed core, seen here millions of times per capture
+        // rather than at the census's ~5 s sample.
+        let running = SCHED[c].current_prio.load(Ordering::Acquire) != PRIO_IDLE;
+        if running {
+            saw_pack = true;
+        }
+        let floor = if running { 1 } else { STEAL_MIN_DEPTH };
+        if depth >= floor && depth > best_depth {
             best_depth = depth;
             victim = Some(c);
         }
     }
+    if saw_pack {
+        PACK_SEEN.fetch_add(1, Ordering::Relaxed);
+    }
     let Some(v) = victim else {
+        if any_ready { &STEAL_D_FLOOR } else { &STEAL_D_EMPTY }.fetch_add(1, Ordering::Relaxed);
         return false;
     };
 
     // 2. Steal under the victim's lock ONLY, re-checking the depth (it may have drained since the
     //    peek). The guard is scoped so it is dropped before this core's own queue is touched.
+    //    VUGSPREAD: the floor is re-ASKED here, not carried from the peek — the victim may have gone
+    //    idle in between, in which case the stricter idle floor is the one that should apply.
+    //
+    // Review F10: the short-read is a THREE-way answer, not a flag — `Some(true)` the queue was empty (a
+    // true race), `Some(false)` it still held work but the victim had gone idle and raised its own
+    // floor (this arc's ping-pong guard firing), `None` the queue cleared the floor and `steal_one`
+    // itself declined. Collapsing the first two would file the guard's every firing as a race.
+    let mut short: Option<bool> = None;
+    // The victim's depth AS MEASURED UNDER ITS OWN LOCK — the peek's `best_depth` is advisory and
+    // must not be the number attribution is scored on (review F16 wants moves the OLD floor would
+    // have refused, and only the locked read can say whether this was one).
+    let victim_depth: usize;
     let stolen = {
         // WEDGE-4: this is a REMOTE run-queue acquisition, new on this arch, so it goes through the
         // same bounded-spin wrapper as the dispatcher's own — otherwise it would be the one
@@ -4118,9 +4670,22 @@ fn try_steal(cpu: usize) -> bool {
         let mut vq = wedge4::lock_or_squawk(&RUN_QUEUES[v]);
         #[cfg(not(feature = "wedge2"))]
         let mut vq = RUN_QUEUES[v].lock();
-        if vq.len() < STEAL_MIN_DEPTH { None } else { vq.steal_one(cpu) }
+        let len = vq.len();
+        victim_depth = len;
+        if len < steal_floor(v) {
+            short = Some(len == 0);
+            None
+        } else {
+            vq.steal_one(cpu)
+        }
     };
     let Some(mut task) = stolen else {
+        match short {
+            Some(true) => &STEAL_D_DRAIN,
+            Some(false) => &STEAL_D_IDLEFLOOR,
+            None => &STEAL_D_PINNED,
+        }
+        .fetch_add(1, Ordering::Relaxed);
         return false;
     };
 
@@ -4128,13 +4693,29 @@ fn try_steal(cpu: usize) -> bool {
     //    `name` is copied out BEFORE the push — the Box moves.
     let name = task.name;
     task.cpu = cpu as u32;
+    // VUGSPREAD: the per-task migration count, bumped where the Box is exclusively owned. `m=1` on
+    // every line is a fleet settling; the same name coming back with `m=2,3,4…` is churn, and that
+    // is the reading the constant-floor change above has to be judged against.
+    task.migrations = task.migrations.saturating_add(1);
+    let mig = task.migrations;
+    if mig > 1 {
+        STEAL_REMIGS.fetch_add(1, Ordering::Relaxed);
+    }
+    // Review F16 — attribute the move to the repair(s) that made it possible. Both, or neither, or
+    // one: a vug worker packed behind its parent scores both, and that is the honest answer.
+    if victim_depth == 1 {
+        STEAL_M_DEPTH1.fetch_add(1, Ordering::Relaxed); // the old constant floor would have refused
+    }
+    if task.hint_placed {
+        STEAL_M_HINT.fetch_add(1, Ordering::Relaxed); // the old pin contract would have frozen it
+    }
     #[cfg(feature = "wedge2")]
     wedge4::lock_or_squawk(&RUN_QUEUES[cpu]).push(task);
     #[cfg(not(feature = "wedge2"))]
     RUN_QUEUES[cpu].lock().push(task);
     STEAL_MOVES.fetch_add(1, Ordering::Relaxed);
     if STEAL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEAL_LOG_MAX {
-        serial_println!(":: [smpbal] steal '{}' c{}->c{} ::", name, v, cpu);
+        serial_println!(":: [smpbal] steal '{}' c{}->c{} (m={}) ::", name, v, cpu, mig);
     }
     true
 }
@@ -4250,14 +4831,28 @@ fn run() -> ! {
                     let uc = unsafe { (*raw).user_cr3 };
                     if uc != 0 { uc } else { crate::arch::memory::kernel_cr3() }
                 };
+                //
+                // VUGSPREAD adds one counter and no branch. `CR3_RELOADS` already counted the RARE
+                // arm — the generation-behind revalidation — but the arm that a MIGRATION actually
+                // pays was uncounted: a task arriving on a thief core is, by construction, arriving
+                // on a core standing on some other root, so `switch_cr3_if_needed` takes its reload
+                // and this machine flushes the entire TLB (nothing the kernel maps is `PTE_GLOBAL`
+                // and firmware leaves CR4.PGE clear). Widening the steal without a price tag on the
+                // move would leave the revert criterion unfalsifiable, so the switch is counted here
+                // against `cr3_live`. The hardware compare inside `switch_cr3_if_needed` is still the
+                // thing that DECIDES; this only decides whether a number goes up.
                 let as_gen = crate::arch::memory::as_gen();
                 if SCHED[cpu].cr3_gen.load(Ordering::Relaxed) == as_gen {
+                    if SCHED[cpu].cr3_live.load(Ordering::Relaxed) != target_cr3 {
+                        CR3_SWITCHES.fetch_add(1, Ordering::Relaxed);
+                    }
                     unsafe { crate::arch::memory::switch_cr3_if_needed(target_cr3) };
                 } else {
                     unsafe { crate::arch::memory::load_cr3(target_cr3) };
                     SCHED[cpu].cr3_gen.store(as_gen, Ordering::Relaxed);
                     CR3_RELOADS.fetch_add(1, Ordering::Relaxed); // rare arm only — see `CR3_RELOADS`
                 }
+                SCHED[cpu].cr3_live.store(target_cr3, Ordering::Relaxed);
 
                 // U4x: install the incoming task's KERNEL-STACK anchors here too — the M7-twin of the
                 // CR3-at-dispatch above. TSS.RSP0 is the stack the CPU switches to on a ring-3
@@ -4412,6 +5007,10 @@ fn reap_killed(task: Box<Task>) {
         // simply re-arms the same flag; the flag is cleared on the slot's real free edge.
         doom_address_space(task.user_cr3);
         crate::arch::memory::restore_kernel_cr3();
+        // VUGSPREAD: keep the `cr3_live` shadow honest across a teardown restore — see `SchedCpu::cr3_live`.
+        SCHED[percpu::this_cpu().cpu_index as usize]
+            .cr3_live
+            .store(crate::arch::memory::kernel_cr3(), Ordering::Relaxed);
         user_space_release(task.user_cr3);
     }
     if let Some(k) = &task.kill {
