@@ -7696,12 +7696,10 @@ fn in_circle(px: usize, py: usize, bx: usize, by: usize, d: usize) -> bool {
 /// on, one role over in the same table — which is the surface showing through the disc. Every pixel
 /// this function marks is a colour the strip already has.
 ///
-/// The kit's own ramp comment names the semantics this follows (*"darkest (close) to lightest
-/// (zoom)"*, and `control_mid` is documented as *"middle (minimise)"*), so the destructive control
-/// keeps the darkest fill — which is also the highest contrast against the pale title strip
-/// (`0x3D5F92` on `0xEEEEF1`), i.e. the most visually distinct disc available goes to the one press
-/// an operator cannot undo. **A red/yellow/green semantic palette is a QUESTION FOR PETER** and this
-/// arc does not take it.
+/// The semantic palette question WAS taken to Peter, and KNURL shipped his answer: the discs carry
+/// the macOS hues (`theme::CTRL_CLOSE`/`CTRL_MIN`/`CTRL_ZOOM` — red, yellow, green), single-sourced
+/// in the theme table. The punch-out rule above is unchanged by the recolour: the SYMBOL is still
+/// drawn in no invented ink, only the disc fills moved.
 ///
 /// ### The shapes
 /// Disc-local `(i, j)` are turned into the SAME half-pixel offsets [`in_circle`] uses
@@ -7712,8 +7710,8 @@ fn in_circle(px: usize, py: usize, bx: usize, by: usize, d: usize) -> bool {
 /// * `Minimise` — the two centre rows, `|dy| == 1`: a horizontal bar.
 /// * `Zoom` — the square's outline: a frame, i.e. "fill the panel".
 ///
-/// A disc too small to hold a legible symbol (`d < 8`) gets none rather than a smudge; the kit's
-/// `control_box` is 12, so that arm is a floor and not the shipping case.
+/// A disc too small to hold a legible symbol (`d < 8`) gets none rather than a smudge;
+/// `theme::CONTROL_BOX` is 24 since KNURL, so that arm is a floor and not the shipping case.
 fn ctrl_glyph(which: Ctrl, i: usize, j: usize, d: usize) -> bool {
     if d < 8 {
         return false;
@@ -9755,7 +9753,15 @@ fn paint_window(
                 };
                 //
                 // CERAMIC — the discs are machined too, at `ceramic::CONTROL_GAIN_Q16` (half), so
-                // the material reads as the same metal without competing with a 12-px silhouette.
+                // the material reads as the same metal without competing with a 24-px silhouette.
+                //
+                // COMPOSITION DISCLOSURE (review condition): a disc pixel takes ceramic at half
+                // gain (~1%) and then `knurl::shade` at its full 2% — the composed worst-case
+                // deviation is ~3% of a channel, ABOVE the 2%-league knurl.rs's header claims for
+                // itself alone. Deliberate: the two textures are different spatial frequencies and
+                // the sum is still under the JND for a 24-px saturated disc; knurl's leg 4 pins
+                // the un-ceramic'd role, so the composed value has no fixture and this line is
+                // the only place the arithmetic is stated.
                 // The shade is resolved ONCE PER ROW of the disc, outside the column loop, because
                 // the material is constant across a row: the per-pixel work inside `in_circle` is
                 // byte-for-byte what it was. The row index is the disc row's offset inside the box,
@@ -9804,8 +9810,8 @@ fn paint_window(
                             // KNURL — the disc's FACE is milled; the glyph is not. The symbol is a
                             // punch-out, i.e. the strip showing THROUGH the disc, and a hole in a
                             // knurled knob has no knurling in it. Leaving `ink` smooth is what the
-                            // physical model says and it is also what keeps a 6-px glyph legible
-                            // inside a 12-px disc.
+                            // physical model says and it is also what keeps a 12-px glyph legible
+                            // inside a 24-px disc.
                             //
                             // Indexed by the DISC-LOCAL `(i, j)`, not the panel position: a knurl
                             // is cut into the knob, so all three discs carry the identical pattern

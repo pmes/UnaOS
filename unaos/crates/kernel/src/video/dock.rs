@@ -60,12 +60,12 @@
 //! | strip top bevel | [`theme::BEVEL_LIGHT`] | [`theme::BEVEL`] px |
 //! | tile face | [`theme::BUTTON_FACE`] / [`theme::BUTTON_FACE_PRESSED`] under [`ceramic::shade_gain`] at [`ceramic::CONTROL_GAIN_Q16`] | [`theme::BUTTON_HEIGHT`] x auto, radius [`theme::WIDGET_RADIUS`] |
 //! | caption ink | [`theme::TITLE_TEXT_ACTIVE`] / [`theme::TITLE_TEXT_INACTIVE`] | [`super::wm::TITLE_CELL`] |
-//! | running indicator | [`theme::ACCENT`] (on the panel) / [`theme::SCROLL_THUMB`] (minimised) | `CONTROL_BOX / 2` |
+//! | running indicator | [`theme::ACCENT`] (on the panel) / [`theme::SCROLL_THUMB`] (minimised) | `theme::GAP / 2` |
 //! | padding, gaps, bottom margin | — | [`theme::GAP`] |
 //!
 //! The two DERIVED numbers, both stated here rather than buried: the indicator's diameter is
-//! `theme::CONTROL_BOX / 2` (the title-bar disc, halved — the dot is a status pip, not a control, and
-//! must not read as one), derived exactly as `theme::CONTROL_RADIUS` is derived from the same key;
+//! `theme::GAP / 2` (half the padding band the pip sits in — the dot is a status pip, not a
+//! control, and must not read as one; see [`IND_D`] for why KNURL moved it off `CONTROL_BOX`);
 //! and the tile takes the material at [`ceramic::CONTROL_GAIN_Q16`] rather than full gain, for
 //! ceramic's own stated reason — a tile is a small saturated object and the grain competes with it.
 //! Neither is dressed up as a kit citation. `kits/crispy/` is not in this repo and nothing here
