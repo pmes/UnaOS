@@ -8494,6 +8494,61 @@ The aarch64 close box (CLOSE-BOX, P79) is untouched and keeps its settle-not-rea
 * **Drag a window whose app is being killed at the same moment.** `drag-cancel … row-recycled` on the
   wire is the in-lock owner test firing; anything moving that the hand did not grab is the refutation.
 
+### DRAGFLICK — a drag paints the sliver, not the window (2026-08-09)
+
+**The report.** Boot AR, attended, twice: *"window drag still flickering a lot"*. The WCSER
+serialisation fix (one composite pass on the glass at a time) had landed for a different flicker in
+between and did not touch this one.
+
+**The mechanism.** `wm::erase` is not a back-buffer operation. It stages a row through `stage_fill`
+and then `flush_rect`s it, so `DESKTOP_BG` reaches the **glass** inside the call. `move_to_inner`
+erased the **whole** vacated outer box and only then ran `composite()` to put the window back —
+`[comp2]` measures a pass at 2279..2839 µs on the bench panel. A drag step is a handful of pixels, so
+the old and new boxes overlap by ~99% of their area: every motion report published a fully
+desktop-coloured window rectangle for a couple of milliseconds and then repainted it, at pointer
+rate. Two visible states per motion, and the first one was "no window here".
+
+**The fix.** `subtract_box(old, new)` — the erase extent becomes the old box **minus** the box the
+window now occupies, an L (or a single band for an axis-aligned step) `step` pixels wide. Pixels the
+window is about to re-cover already hold that same window's previous frame, so the glass never shows
+anything but window there, and the whole-box damage `damage_all` set has the composite repaint them.
+Nothing else moved: the re-damage still covers the whole old box (it names the windows the move
+*uncovered*), `request_full_present` still fires, the F4 drain barrier and the CURSOR-14 bracket are
+where they were.
+
+**MOVE-VACATE is preserved by construction, not by argument.** `subtract_box` *partitions*: erased
+parts + (old ∩ new) = old, exactly, and the second term is covered by the window itself. No pixel of
+the old box is left unowned.
+
+**WC-H is untouched.** Every part goes through the same `stage_fill` + `flush_rect` staged path with
+the same deferral rules; what changed is which rectangles are passed, not how a rectangle reaches the
+panel. Up to four small staged fills replace one large one, each far under `MAX_STAGE_BYTES`, and the
+tear-free contract is per-fill.
+
+**Cost.** Per motion report, at the bench's 1920x1200 with a typical window outer box of ~740 000 px
+(`[comp2] box_px_pp=761613`) and a 4-px diagonal step: erase drops from **740 000 px to ~5 900 px**,
+about **1%** — roughly 2.9 MB of staged fill and cache flush per motion becomes ~23 KB. Composites
+are unchanged at one per applied motion; the saving is entirely the erase.
+
+**The witness.** `[drag] win= owner= end= moves= composites= erase_rects= erase_px= erase_px_pm=
+box_px_pm= flash_px= -> ONCE|FLASH`, emitted from both `drag_end` and `drag_cancel` (most real bench
+gestures end in `release-level`, not a delivered release). `flash_px` is the defect as a number:
+pixels painted desktop inside the box the same window occupies in the same motion. It is 0 now and
+~99% of the box before; `composites <= moves` catches the other shape, a drag compositing twice.
+`box_px_pm` is the pre-fix cost, carried so the line states its own saving.
+
+**The gate.** `[wc-j] move-once` (`movevacate_selftest`) asks the extent question in two halves that
+pull opposite ways, so it cannot pass by accident: `old_desktop`/`new_window` are panel read-backs
+holding the MOVE-VACATE floor (a fix that merely stopped erasing fails there), while `flash_px=0` and
+`exact=true` are integer identities over `subtract_box` (restoring the whole-box erase passes the
+read-backs and fails those). `pi4-regression.spec` requires it; the pre-existing
+`FORBID \[wc-j\] .*-> FAIL` covers the other direction.
+
+**Metal watch-list.** Drag a window slowly across another: expect no blink of desktop colour through
+the window body, `[drag] … -> ONCE`, and `erase_px_pm` in the low thousands. `-> FLASH` on the wire
+is the revert; a *trail* left behind is the opposite failure and points at the partition, not at the
+erase.
+
 ## PAPER — the kit's content-surface texture, ported to integer Q16 (2026-08-09)
 
 `video/paper.rs`. The Crispy kit's `content_surface.Paper` block — the one part of

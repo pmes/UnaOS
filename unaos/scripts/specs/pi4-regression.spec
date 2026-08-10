@@ -608,6 +608,22 @@ REQUIRE \[cursor6\] rollup scope=.* present_over=.* masked=.* desktop_over=.* mi
 # ---    one. See docs/dev/OS/08_VIDEO/engine.md §WC-J.
 REQUIRE \[wc-j\] vacate close_painted=true close_desktop=true .* owner_painted=true owner_desktop=true .* -> PASS
 REQUIRE \[wc-j\] retile survivor=.* moved=true painted=true live=true old_desktop=true .* -> PASS
+# --- DRAGFLICK — `[wc-j] move-once` is the third half, and it is the one the two above cannot ask.
+# ---    Boot AR, attended, twice: "window drag still flickering a lot". `move_to_inner` erased the
+# ---    WHOLE vacated outer box to the GLASS (`erase` stages a row and `flush_rect`s it) and only
+# ---    then composited the window back — once per motion report. A drag step is a few pixels, so
+# ---    the old and new boxes overlap by ~99%: the operator watched the entire window blink to
+# ---    desktop colour and back at pointer rate, for the ~2.3-2.8 ms `[comp2]` measures a pass at.
+# ---    `vacate` and `retile` both PASSED throughout, and correctly: they ask whether an ABANDONED
+# ---    box came back as desktop, and every flashed pixel was repainted a millisecond later.
+# ---    The leg therefore asks the EXTENT question, in two halves that pull opposite ways so it
+# ---    cannot pass by accident. `old_desktop`/`new_window` are panel read-backs and hold the
+# ---    MOVE-VACATE floor (a fix that merely stopped erasing fails here). `flash_px=0` and
+# ---    `exact=true` are integer identities over `subtract_box` — no desktop pixel inside the box
+# ---    the window now occupies, and the erased parts plus the overlap account for the old box
+# ---    exactly (so no pixel is left unowned at any other geometry). Restoring the whole-box erase
+# ---    passes the read-backs and fails `flash_px=0`.
+REQUIRE \[wc-j\] move-once .* painted=true moved=true old_desktop=true .* new_window=true .* flash_px=0 exact=true -> PASS
 FORBID \[wc-j\] .*-> FAIL
 
 # --- WC-K — the DESKTOP FILL gets the back buffer too -------------------------------------------

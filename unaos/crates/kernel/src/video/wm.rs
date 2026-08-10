@@ -1096,7 +1096,8 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
                 r.y = y.clamp(TITLE_H + BORDER, max_y);
                 r.pinned = true;
                 r.damage_all();
-                let changed = outer_box(r) != before;
+                let after = outer_box(r);
+                let changed = after != before;
                 // WMCTRL — a move that actually relocates the box DISCARDS the pre-zoom memory. See
                 // [`Window::zoom_saved`] for why discard rather than re-anchor. Gated on `changed`
                 // so a no-op move (a drag report that clamps to the same origin, of which there are
@@ -1110,7 +1111,10 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
                 // lock, a `damage_all` and a composite for each one, while counting moves that did
                 // not happen.
                 placed = Moved::Placed { x: r.x, y: r.y, changed };
-                if changed { Some(before) } else { None }
+                // DRAGFLICK — the NEW box travels out with the old one. The erase below subtracts it,
+                // so the pixels this window is about to re-cover are never handed to the desktop
+                // colour first. See the ledger at the erase site.
+                if changed { Some((before, after)) } else { None }
             }
             // No such row, or a row that now belongs to somebody else — the slot was recycled.
             _ => return Moved::NoRow,
@@ -1122,7 +1126,7 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
     // kernel-drawn title strip and border to go with it. Same treatment `close` gives a vacated box —
     // desktop colour, then re-damage whatever the erase reached so the surviving windows repaint over
     // it — because it is the same event: those pixels stopped belonging to this window.
-    if let Some(b) = vacated {
+    if let Some((b, after)) = vacated {
         // F4 — the same phase barrier `close`/`close_owner` raise, and for the same reason. A composite
         // on another core may have snapshotted this row at its OLD geometry a moment ago and still be
         // blitting it; without the barrier that in-flight blit lands AFTER the erase below and paints
@@ -1134,7 +1138,45 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // Raised AFTER the table lock is released, as `drain`'s contract requires: a composite that
         // takes the lock from here on sees the barrier and skips, so `BLIT_ACTIVE` can only fall.
         let barrier = DrainBarrier::drain();
-        erase(&[b]);
+        // DRAGFLICK — **ERASE THE VACATED BOX MINUS THE BOX THE WINDOW NOW OCCUPIES.**
+        //
+        // ### The defect this closes (Peter, Boot AR, attended: "window drag still flickering a lot")
+        // `erase` is not a back-buffer operation. It stages a row and then `flush_rect`s it, so
+        // `DESKTOP_BG` reaches the GLASS right here, and the window's pixels do not come back until
+        // the `composite()` below has finished its blit — `[comp2]` measures that pass at
+        // 2279..2839 us on the bench panel. Erasing the WHOLE old box therefore published a fully
+        // desktop-coloured window rectangle for milliseconds and then repainted it, ONCE PER MOTION
+        // REPORT. A drag step is a handful of pixels, so the old and new boxes overlap by ~99% of
+        // their area: the operator was watching the entire window blink to desktop and back at
+        // pointer rate. That is the flicker, and it is a property of the ERASE EXTENT rather than of
+        // the number of passes — the WCSER serialisation fix (two concurrent composites on one
+        // glass) is a different defect and left this one exactly as it was.
+        //
+        // The cure is extent arithmetic and nothing else. Pixels the window is about to re-cover
+        // already hold that same window's previous frame, one step stale; leaving them alone means
+        // the glass never shows anything but window there, and the composite that follows repaints
+        // them from the whole-box damage `damage_all` just set. Only the SLIVER the window genuinely
+        // left behind — an L, or a thin band, `step` pixels wide — is painted desktop.
+        //
+        // MOVE-VACATE is preserved, and provably rather than by argument: [`subtract_box`] PARTITIONS
+        // the old box into (the erased parts) + (old ∩ new), and the second term is covered by the
+        // window itself at its new origin. No pixel of the old box is left to nobody, which is the
+        // invariant WC-J asserts and which [`movevacate_selftest`] now asserts both algebraically and
+        // on the panel.
+        //
+        // WC-H is untouched. Every part still goes through the same [`stage_fill`] + `flush_rect`
+        // staged path with the same deferral rules; what changed is WHICH rectangles are passed, not
+        // how a rectangle reaches the panel. Up to four small staged fills where there was one large
+        // one, each far under `MAX_STAGE_BYTES`, and the tear-free contract is per-fill.
+        let mut parts = [(0usize, 0usize, 0usize, 0usize); 4];
+        let nparts = subtract_box(b, after, &mut parts);
+        erase(&parts[..nparts]);
+        #[cfg(feature = "witness")]
+        drag_note_move(&parts[..nparts], b, after);
+        // The RE-DAMAGE stays on the WHOLE old box, deliberately. It names the windows a move
+        // UNCOVERED, and that question is about the box the window left rather than about which
+        // slivers were repainted desktop; narrowing it here would leave a neighbour lying under the
+        // overlap unrepainted.
         damage_intersecting(b.0, b.1, b.2, b.3);
         // MOVE-VACATE (x86 s42 probe, `[wc-x] move-vacate … desktop=5/5 stale=0/5`): the erase
         // REACHES glass, but a desktop-layer present can later repaint the unoccluded box from
@@ -8314,6 +8356,112 @@ static DRAG_LAST_X: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI6
 static DRAG_LAST_Y: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(i64::MIN);
 /// WMDIRECT — motions applied in the current drag, for the `end` witness line.
 static DRAG_MOVES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// ---- DRAGFLICK: the per-drag paint budget, on the wire ------------------------------------------
+//
+// **Why this exists.** "Window drag still flickering a lot" was reported twice, hours apart, and the
+// capture could not tell the two reports apart: `[wm-act] drag-begin` / `drag-end` bracket a gesture
+// and say nothing whatever about what the gesture PAINTED, and every rollup in between (`[comp2]`,
+// `[wcn]`, `[wpace]`) is a window-present census that a WM-initiated composite does not enter. So the
+// defect below — a full-window desktop erase per motion report — was invisible on the wire for as
+// long as it existed, and only ever reported by eye.
+//
+// These four counters are the smallest set that makes it visible and makes it FALSIFIABLE. They
+// accumulate only while a drag is live (a `place`, a zoom or an app's own `move_to` is a different
+// event and would only dilute the reading) and are swapped out by the `[drag]` line at the end of the
+// gesture, so a session's cost is reported per session and the statics start every drag at zero.
+//
+// `flash_px` is the verdict term and it is the defect stated as a number: pixels this drag painted
+// DESKTOP COLOUR inside a box the same window occupied in the same motion. It is exactly zero after
+// the erase-extent fix and it is ~99% of the window's area before it, so the line reads `-> ONCE`
+// now and `-> FLASH` on any revert.
+/// DRAGFLICK — composites this drag ran (one per applied motion).
+#[cfg(feature = "witness")]
+static DRAG_COMPOSITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRAGFLICK — staged desktop-colour rectangles this drag pushed to the panel.
+#[cfg(feature = "witness")]
+static DRAG_ERASE_RECTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRAGFLICK — pixels this drag actually repainted desktop.
+#[cfg(feature = "witness")]
+static DRAG_ERASE_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRAGFLICK — the denominator: pixels the pre-fix whole-box erase WOULD have repainted, i.e. the sum
+/// of the vacated outer boxes. Carried so the line states its own saving rather than needing a reader
+/// who remembers the window's geometry.
+#[cfg(feature = "witness")]
+static DRAG_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRAGFLICK — the verdict term: erased pixels that lay inside the window's NEW box. Must be 0.
+#[cfg(feature = "witness")]
+static DRAG_FLASH_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGFLICK — record one motion's erase against the live drag, if there is one.
+///
+/// Gated on `DRAG_WIN` rather than on the caller, because [`move_to_inner`] is reached from four
+/// unrelated places and only the pointer-driven one is the gesture this line is about. Five relaxed
+/// adds on a path that has just taken two locks and is about to composite; the loop runs at most four
+/// times.
+#[cfg(feature = "witness")]
+fn drag_note_move(
+    parts: &[(usize, usize, usize, usize)],
+    old: (usize, usize, usize, usize),
+    new: (usize, usize, usize, usize),
+) {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    if DRAG_WIN.load(Acquire) == WIN_NONE {
+        return;
+    }
+    let mut px = 0u64;
+    let mut flash = 0u64;
+    for &p in parts.iter() {
+        px += p.2 as u64 * p.3 as u64;
+        flash += intersect_area(p, new);
+    }
+    DRAG_COMPOSITES.fetch_add(1, Relaxed);
+    DRAG_ERASE_RECTS.fetch_add(parts.len() as u64, Relaxed);
+    DRAG_ERASE_PX.fetch_add(px, Relaxed);
+    DRAG_BOX_PX.fetch_add(old.2 as u64 * old.3 as u64, Relaxed);
+    DRAG_FLASH_PX.fetch_add(flash, Relaxed);
+}
+
+/// DRAGFLICK — emit the finished drag's paint budget and clear the counters for the next gesture.
+///
+/// Called from BOTH ends of a gesture ([`drag_end`] and [`drag_cancel`]) because the bench's own
+/// drags mostly end in `release-level` and `focus-key`, not in a delivered release — a line that only
+/// `drag_end` emitted would be missing from most real sessions in a capture. Unconditional clear on
+/// either path, so a cancelled gesture cannot leak its cost into the next one's reading.
+///
+/// Silent for a gesture that applied no motion: a grab-and-let-go paints nothing, and a `moves=0`
+/// line every time the operator clicks a title bar would be noise on a budgeted witness channel.
+#[cfg(feature = "witness")]
+fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let comps = DRAG_COMPOSITES.swap(0, Relaxed);
+    let rects = DRAG_ERASE_RECTS.swap(0, Relaxed);
+    let px = DRAG_ERASE_PX.swap(0, Relaxed);
+    let box_px = DRAG_BOX_PX.swap(0, Relaxed);
+    let flash = DRAG_FLASH_PX.swap(0, Relaxed);
+    if moves == 0 && comps == 0 {
+        return;
+    }
+    let per = if moves > 0 { px / moves } else { 0 };
+    let box_per = if moves > 0 { box_px / moves } else { 0 };
+    // A composite per applied motion is the budget; more than that means something is compositing the
+    // drag twice, which is the OTHER shape this line has to be able to catch.
+    let ok = flash == 0 && comps <= moves;
+    serial_println!(
+        "[drag] win={} owner={:#x} end={} moves={} composites={} erase_rects={} erase_px={} erase_px_pm={} box_px_pm={} flash_px={} -> {}",
+        id,
+        owner,
+        how,
+        moves,
+        comps,
+        rects,
+        px,
+        per,
+        box_per,
+        flash,
+        if ok { "ONCE" } else { "FLASH" }
+    );
+}
 /// WMDIRECT — `[wm-act]` lines emitted, against [`WM_ACT_LOG_MAX`]. The begin/end/close lines are
 /// human-rate by construction (a hand cannot grab faster than serial can print), but the CANCEL arm
 /// is driven by motion reports and a pathological state could reach it at HID rate, so the whole
@@ -8462,6 +8610,9 @@ pub fn drag_end() -> WinId {
         } else {
             wm_act("drag-end", id, owner, "placed", x, y);
         }
+        // DRAGFLICK — the gesture's paint budget, on its own line and on its own budget.
+        #[cfg(feature = "witness")]
+        drag_report(id, owner, "placed", n);
     }
     id
 }
@@ -8480,7 +8631,14 @@ pub fn drag_cancel(why: &str) {
     let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel);
     if id != WIN_NONE {
         let owner = DRAG_OWNER.swap(0, Ordering::AcqRel);
-        DRAG_MOVES.store(0, Ordering::Relaxed);
+        let n = DRAG_MOVES.swap(0, Ordering::Relaxed);
+        // DRAGFLICK — a cancelled drag painted just as much as a placed one, and most of the bench's
+        // real gestures end HERE (`release-level`, `focus-key`), so the budget is reported on this arm
+        // too. Emitted before the `[wm-act]` line so the pair reads cost-then-reason in a capture.
+        #[cfg(feature = "witness")]
+        drag_report(id, owner, why, n);
+        #[cfg(not(feature = "witness"))]
+        let _ = n;
         wm_act(
             "drag-cancel",
             id,
@@ -8536,6 +8694,86 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
         && b.0 < a.0.saturating_add(a.2)
         && a.1 < b.1.saturating_add(b.3)
         && b.1 < a.1.saturating_add(a.3)
+}
+
+/// DRAGFLICK — the area of `a ∩ b`, in pixels. Zero when they do not meet.
+///
+/// Witness-only: it exists to STATE the extent property [`subtract_box`] guarantees (`parts ∩ new`
+/// empty, `parts + overlap == old`), not to compute anything the panel path needs — the shipping path
+/// simply erases the parts. So it is cfg'd with its two callers rather than left as dead code on
+/// every production build.
+#[cfg(feature = "witness")]
+fn intersect_area(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)) -> u64 {
+    let x0 = a.0.max(b.0);
+    let y0 = a.1.max(b.1);
+    let x1 = (a.0 + a.2).min(b.0 + b.2);
+    let y1 = (a.1 + a.3).min(b.1 + b.3);
+    if x1 <= x0 || y1 <= y0 {
+        return 0;
+    }
+    (x1 - x0) as u64 * (y1 - y0) as u64
+}
+
+/// DRAGFLICK — **`a` MINUS `b`, as up to four disjoint rectangles written into `out`.** Returns how
+/// many were written.
+///
+/// The one property the caller depends on, and the one [`movevacate_selftest`] asserts:
+///
+/// ```text
+/// area(parts) + area(a ∩ b) == area(a)     and     parts ∩ b == ∅
+/// ```
+///
+/// i.e. this is a PARTITION of `a`, not an approximation of one. The first half is what keeps
+/// MOVE-VACATE intact — every pixel of the old box is either repainted desktop here or covered by the
+/// window at its new origin, so none is left holding a stale frame. The second half is the flicker
+/// fix — nothing that is about to be window is painted desktop first.
+///
+/// The cut is the ordinary top / bottom / left / right decomposition: full-width strips above and
+/// below `b`'s row range, then the left and right columns of the band the two share. Full-width
+/// strips first because a drag's common case is a pure vertical or horizontal step, which then costs
+/// ONE rectangle rather than three. Disjointness is by construction: the strips are separated by row
+/// range and the two columns by column range.
+///
+/// Degenerate and disjoint inputs are handled by the same arithmetic rather than by special cases,
+/// except for the two that have no answer: an empty `a` yields nothing, and a `b` that does not meet
+/// `a` yields `a` whole.
+fn subtract_box(
+    a: (usize, usize, usize, usize),
+    b: (usize, usize, usize, usize),
+    out: &mut [(usize, usize, usize, usize); 4],
+) -> usize {
+    if a.2 == 0 || a.3 == 0 {
+        return 0;
+    }
+    if b.2 == 0 || b.3 == 0 || !boxes_overlap(a, b) {
+        out[0] = a;
+        return 1;
+    }
+    let (ax0, ay0, ax1, ay1) = (a.0, a.1, a.0 + a.2, a.1 + a.3);
+    let (bx0, by0, bx1, by1) = (b.0, b.1, b.0 + b.2, b.1 + b.3);
+    let mut n = 0usize;
+    if by0 > ay0 {
+        out[n] = (ax0, ay0, a.2, by0 - ay0);
+        n += 1;
+    }
+    if by1 < ay1 {
+        out[n] = (ax0, by1, a.2, ay1 - by1);
+        n += 1;
+    }
+    // The rows `a` and `b` share; the left/right columns are cut out of exactly these.
+    let my0 = by0.max(ay0);
+    let my1 = by1.min(ay1);
+    if my1 > my0 {
+        if bx0 > ax0 {
+            out[n] = (ax0, my0, bx0 - ax0, my1 - my0);
+            n += 1;
+        }
+        if bx1 < ax1 {
+            out[n] = (bx1, my0, ax1 - bx1, my1 - my0);
+            n += 1;
+        }
+    }
+    n
 }
 
 // ---- WC-L: the deferred-erase queue ------------------------------------------------------------
@@ -10566,6 +10804,161 @@ pub fn vacate_selftest() {
     );
     retile_selftest();
     closeiso_selftest();
+    movevacate_selftest();
+    repaint();
+}
+
+/// DRAGFLICK — the MOVE→VACATE witness: **does a short move leave the old position clean WITHOUT
+/// painting the desktop through the pixels the window still covers?**
+///
+/// ### Why this exists (Peter, Boot AR, attended)
+/// *"window drag still flickering a lot"* — reported twice, hours apart, and unattributable from the
+/// capture. [`move_to_inner`] erased the WHOLE vacated outer box straight to the glass and only then
+/// composited the window back, once per motion report; for a drag step of a few pixels that is ~99%
+/// of the window blinking to desktop colour and back at pointer rate. `[wc-j] vacate` and
+/// `[wc-j] retile` could not see it: both ask whether a box that was ABANDONED came back as desktop,
+/// and every pixel this defect flashed was correctly repainted a millisecond later, so both passed
+/// throughout.
+///
+/// The question therefore has to be asked as an EXTENT question, and it has two halves that pull in
+/// opposite directions — which is what makes this leg unable to pass by accident:
+///
+///  1. **no residue** (the MOVE-VACATE property, which the fix must not regress). The strip the window
+///     genuinely left behind must read [`DESKTOP_BG`], and the box it moved to must read WINDOW. A fix
+///     that simply stopped erasing would pass half 2 and fail here.
+///  2. **no flash** (the defect). Not one pixel painted desktop may lie inside the box the window
+///     occupies after the move. Restoring the whole-box erase would pass half 1 and fail here.
+///
+/// ### How each half is proved
+/// Half 1 is a PANEL read-back, on `[wc-j] vacate`'s own terms: three points inside the vacated
+/// sliver (the top-left corner, the left column at the bottom of the old box, and the top strip near
+/// the right edge — all outside the new box by construction for a diagonal step) must equal
+/// `DESKTOP_BG` byte-for-byte, and the new content origin must hold the surface colour.
+///
+/// Half 2 is ALGEBRAIC, deliberately, because a read-back cannot see it: the flash is transient by
+/// definition and the composite that follows repaints it. So the leg interrogates the extent
+/// arithmetic the panel path actually runs — [`subtract_box`] on the same two boxes — and asserts the
+/// partition property in full: `sum(parts) + area(old ∩ new) == area(old)` (nothing left unowned, so
+/// half 1 cannot be regressed silently at some other geometry) and `sum(parts ∩ new) == 0` (nothing
+/// painted desktop that is about to be window). Both are exact integer identities with no tolerance.
+///
+/// One-shot and self-cleaning on the same terms as its neighbours: it makes one row and closes it.
+#[cfg(feature = "witness")]
+fn movevacate_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[wc-j] move-once -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let info = fb.info();
+    if info.width < 256 || info.height < 128 {
+        serial_println!(
+            "[wc-j] move-once -> SKIP (panel {}x{} too small)",
+            info.width,
+            info.height
+        );
+        return;
+    }
+
+    const ASID_MV: u64 = 0xE0F;
+    // A DRAG-SIZED step. Big enough that the sliver holds sample points clear of the new box at both
+    // axes, small enough that the overlap is the overwhelming majority of the box — which is the
+    // regime the defect lived in and the one a whole-box erase is most visibly wrong in.
+    const STEP: usize = 4;
+    let sa = &raw const FV_SURF_A as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+    let a_col = FV_SURF_A[0];
+    let read = |x: usize, y: usize| super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
+
+    let oy = info.height / 4 + TITLE_H + BORDER;
+    let ox = info.width / 4;
+
+    let w = create(ASID_MV, sa, len, 8, 8, 32, b"mv-a");
+    if w == WIN_NONE {
+        serial_println!("[wc-j] move-once -> SKIP (no free row)");
+        return;
+    }
+    move_to(w, ox, oy);
+    present(w);
+    let old = match info_box(w) {
+        Some(b) => b,
+        None => {
+            close(w);
+            serial_println!("[wc-j] move-once -> SKIP (no box for the probe row)");
+            return;
+        }
+    };
+    // A vacate check over a box that was never painted proves nothing — `[wc-j] vacate`'s rule.
+    let painted = read(ox + 1, oy + 1) == a_col;
+
+    move_to(w, ox + STEP, oy + STEP);
+    let new = match info_box(w) {
+        Some(b) => b,
+        None => {
+            close(w);
+            serial_println!("[wc-j] move-once -> SKIP (row lost across the move)");
+            return;
+        }
+    };
+    let moved = new != old;
+
+    // Half 1a — the sliver the window really left. All three points are outside `new` for a diagonal
+    // step: the first two by column, the third by row.
+    let pts = [
+        (old.0, old.1),
+        (old.0 + 1, old.1 + old.3 - 1),
+        (old.0 + old.2 - 1, old.1 + 1),
+    ];
+    let mut clean = 0usize;
+    for &(x, y) in pts.iter() {
+        if read(x, y) == DESKTOP_BG {
+            clean += 1;
+        }
+    }
+    // Half 1b — and the window is genuinely THERE, at the new origin, rather than the panel having
+    // simply gone quiet. Content and kernel-drawn chrome both, since the move re-lays both.
+    let new_window = read(ox + STEP + 1, oy + STEP + 1) == a_col
+        && read(new.0 + new.2 / 2, new.1 + TITLE_H / 2) != DESKTOP_BG;
+
+    // Half 2 — the extent arithmetic the panel path ran, re-run and asserted exactly.
+    let mut parts = [(0usize, 0usize, 0usize, 0usize); 4];
+    let n = subtract_box(old, new, &mut parts);
+    let mut erased_px = 0u64;
+    let mut flash_px = 0u64;
+    for &p in parts[..n].iter() {
+        erased_px += p.2 as u64 * p.3 as u64;
+        flash_px += intersect_area(p, new);
+    }
+    let overlap_px = intersect_area(old, new);
+    let box_px = old.2 as u64 * old.3 as u64;
+    let exact = erased_px + overlap_px == box_px;
+
+    let ok = painted && moved && clean == pts.len() && new_window && flash_px == 0 && exact;
+    serial_println!(
+        "[wc-j] move-once step={} painted={} moved={} old_desktop={} ({}/{}) new_window={} parts={} erased_px={} overlap_px={} box_px={} flash_px={} exact={} -> {}",
+        STEP,
+        painted,
+        moved,
+        clean == pts.len(),
+        clean,
+        pts.len(),
+        new_window,
+        n,
+        erased_px,
+        overlap_px,
+        box_px,
+        flash_px,
+        exact,
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    close(w);
     repaint();
 }
 
