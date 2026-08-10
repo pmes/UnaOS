@@ -2969,43 +2969,84 @@
 
 Conventions shared across arches:
 
-- **Syscall numbering is common** (register conventions are per-arch — aarch64:
-  number in `x8`, args `x0..x5`, return `x0`; x86_64: number in `rax`, args
-  `rdi,rsi,rdx,r10,r8,r9`, return `rax`). The number space so far:
+- **The syscall ABI is FROZEN in one crate: [`unaos/crates/una-abi`](../../../../unaos/crates/una-abi/src/lib.rs).**
+  That crate — `no_std`, no dependencies, nothing but `const` — is the single
+  declaration of the syscall numbers, the sub-op/flag encodings, the packed
+  layouts ring 3 reads back, and the shared magic values. `arch/x86_64/syscall.rs`,
+  `arch/aarch64/syscall.rs` and every `user-*` crate `use` it; **no site may
+  re-declare a number**, and a table below that disagrees with the crate is a bug
+  in this document, not in the crate.
 
-  | # | Name | Args | Returns | Notes |
+  Before the freeze the table was declared eight times — both kernels plus a
+  partial re-typing in each ring-3 crate — and `arroyo`'s own `USER_CHECK_MATRIX`
+  note already named those crates "exactly where a syscall-number or stub drift
+  between arches can hide". It had happened; the DIVERGENCE LEDGER at the top of
+  `una-abi/src/lib.rs` records each case and how it was resolved. The headline one:
+  **`SYS_GETINFO`'s `ticks` field has never had the same unit on both arches** —
+  x86 fills it at 1 kHz (one tick = one millisecond), aarch64 at the 250 Hz
+  scheduler tick — and the two arch-neutral programs that read it had assumed
+  OPPOSITE units, so `VUG-X86.ELF` drew an fps figure 4x low and `PULSE.ELF` on the
+  Pi swept a "3-second" animation in 12 s. Both kernels' clocks are shipped
+  behaviour and neither moved; ring 3 now reads the rate from
+  `una_abi::GETINFO_TICK_HZ`.
+
+- **Register conventions are per-arch.** aarch64: number in `x8`, args `x0..x5`,
+  return `x0`, `svc #0`; the SVC path restores the full GPR + FP file. x86_64:
+  number in `rax`, args `rdi,rsi,rdx,r10,r8,r9`, return `rax`, `syscall`; the
+  `sysretq` tail SCRUBS `rdi/rsi/rdx/r8/r9/r10` on **every** return regardless of
+  arity, and `syscall` itself destroys `rcx`/`r11`, so an x86 ring-3 stub must
+  declare all eight as clobbers whatever its own arity.
+
+- **A number means the same verb on every arch, implemented or not.** Numbers
+  1..=33 are the shared block; 40..=48 is where the x86 socket family was moved
+  after it was found colliding with aarch64's 19..=27. A verb an arch reserves but
+  does not dispatch falls to that dispatcher's default arm and returns `-ENOSYS`,
+  which is a designed outcome — `user-vug`'s `present_rows` and its
+  `SYS_INPUT_WAIT` park each carry an explicit fallback for exactly that.
+
+  Implementation matrix at the freeze (`Y` = dispatched, `-` = reserved):
+
+  | # | Name | x86 | arm | Args → returns |
   | :--- | :--- | :--- | :--- | :--- |
-  | 1 | `SYS_WRITE` | fd, buf, len | byte count / `-errno` | fd 1 (stdout) only; buf validated via `copy_from_user` (aarch64 M6f) |
-  | 2 | `SYS_EXIT` | status | — (no return) | scheduler reclaims the task |
-  | 3 | `SYS_REPORT` | value | 0 | **demo-only** accounting channel (aarch64 M6d/M6f); not a real syscall |
-  | 4 | `SYS_YIELD` | — | 0 | aarch64 M6f — thin over `yield_now` |
-  | 5 | `SYS_SLEEP_MS` | ms | 0 | aarch64 M6f — `sleep_ticks` (cooperative yield where no timer IRQ) |
-  | 6 | `SYS_GETPID` | — | task id | aarch64 M6f |
-  | 7 | `SYS_GETINFO` | ptr | 0 / `-EFAULT` | aarch64 M6f — writes {pid, ticks} via `copy_to_user` |
-  | 8 | `SYS_SPAWN` | — | **handle** / `-errno` | aarch64 M7→**U4** — loads the fixed `HELLO.BIN` into a fresh slot, runs it at EL0 as a child, and returns a **handle index into the caller's per-process handle table** (U4 — not the raw pid; arbitrary program-by-name is M8) |
-  | 9 | `SYS_WAIT` | **handle** | exit status / `-ECHILD` | aarch64 M7→**U4** — blocks until the child that *handle* refers to exits (scheduler wake via the child's `done` post); `-ECHILD` if the handle is not in the caller's table (structural ownership) |
+  | 1 | `SYS_WRITE` | Y | Y | fd, buf, len → count / `-errno`. fd 1 = console; a `File` handle with `CAP_WRITE` writes the file |
+  | 2 | `SYS_EXIT` | Y | Y | status → *(no return)* |
+  | 3 | `SYS_REPORT` | - | Y | value → 0. Demo accounting channel keyed by task name |
+  | 4 | `SYS_YIELD` | Y | Y | — → 0 |
+  | 5 | `SYS_SLEEP_MS` | Y | Y | **milliseconds** → 0. Each kernel converts through its own `ms_to_ticks`, so this argument needs no rate correction |
+  | 6 | `SYS_GETPID` | - | Y | — → task id |
+  | 7 | `SYS_GETINFO` | Y | Y | ptr → 0 / `-EFAULT`. Writes `una_abi::UserInfo {pid, ticks}`. **`ticks` is in `GETINFO_TICK_HZ` units, which differ per arch** |
+  | 8 | `SYS_SPAWN` | Y | Y | — → child **handle** / `-errno` (never a raw pid) |
+  | 9 | `SYS_WAIT` | Y | Y | handle → exit status / `-ECHILD` |
+  | 10 | `SYS_CAP` | Y | Y | op, … → op-specific. `CAP_OP_GRANT`/`REVOKE`/`XREVOKE` |
+  | 11 | `SYS_OPEN` | Y | Y | name, len, mode → `File` handle / `-errno`. `mode` = `O_RW`\|`O_CREAT`\|`O_PUBLIC` |
+  | 12 | `SYS_READ` | Y | Y | handle, buf, len → count (0 = EOF) / `-errno`. Needs `CAP_READ` |
+  | 13 | `SYS_XFER` | Y | Y | dest-child, src, rights → transfer id / `-errno` |
+  | 14 | `SYS_RECV` | Y | Y | — → handle / `-errno`. The caller's own capability inbox |
+  | 15 | `SYS_SEEK` | Y | Y | handle, offset → new offset / `-errno` |
+  | 16 | `SYS_UNLINK` | Y | Y | handle → 0 / `-errno`. Needs `CAP_WRITE` |
+  | 17 | `SYS_CLOSE` | Y | Y | handle → 0 / `-errno`. Needs no right |
+  | 18 | `SYS_FGRANT` | Y | Y | file, child, rights → 0 / `-errno`. An ACL edge on the FILE |
+  | 19 | `SYS_MSEND` | - | Y | frame, len → 0 / `-errno`. One BUS v1 request frame |
+  | 20 | `SYS_MRECV` | - | Y | buf, len → reply length / `-errno` |
+  | 21 | `SYS_THREAD_SPAWN` | Y | Y | entry, sp, arg, place → thread handle / `-errno` |
+  | 22 | `SYS_THREAD_EXIT` | Y | Y | — → *(no return)* |
+  | 23 | `SYS_THREAD_JOIN` | Y | Y | handle → 0 / `-ESRCH` |
+  | 24 | `SYS_FB_MAP` | - | Y | — → surface VA / `-errno`. The single-surface compat path |
+  | 25 | `SYS_FB_PRESENT` | - | Y | — → 0 / `-errno` |
+  | 26 | `SYS_FUTEX` | Y | Y | uaddr, op, val → op-specific. `FUTEX_WAIT`=0, `FUTEX_WAKE`=1 |
+  | 27 | `SYS_INPUT_POLL` | Y | Y | — → packed event / `-EAGAIN`. `[55:48]` = type, low 32 = payload, bit 63 always clear |
+  | 28 | `SYS_INPUT_WAIT` | Y | Y | — → 0 / `-EINVAL`. Blocks; dequeues nothing, so it composes with 27 |
+  | 29 | `SYS_WIN_CREATE` | Y | Y | w, h → win id / `-errno`. ARGB8888, `stride = w*4`, 1..=128 each |
+  | 30 | `SYS_WIN_PRESENT` | Y | Y | win → 0 / `-errno`. Whole-window damage |
+  | 31 | `SYS_WIN_MOVE` | - | Y | win, x, y → 0 / `-errno` |
+  | 32 | `SYS_WIN_CLOSE` | - | Y | win → 0 / `-errno` |
+  | 33 | `SYS_WIN_PRESENT_ROWS` | Y | - | win, y0, y1 → 0 / `-errno`. ADDITIVE, because widening 30 in place would let a stale clobber register silently UNDER-repaint |
+  | 40–48 | socket family | Y\* | - | `SOCKET`, `BIND`, `SENDTO`, `RECVFROM`, `CONNECT`, `SEND`, `SOCK_RECV`, `LISTEN`, `ACCEPT`. \* also gated on the `smolnet` feature |
+  | 49 | `SYS_CPUPULSE` | Y | - | ptr → 0 / `-EFAULT`. Writes `una_abi::UserPulse` — RAW cumulative `(busy, idle)` per core, never percentages |
 
-  (Numbers 10–20 are the aarch64 capability/FS/bus surface — `SYS_CAP`=10, `SYS_OPEN`=11,
-  `SYS_READ`=12, `SYS_XFER`=13, `SYS_RECV`=14, `SYS_SEEK`=15, `SYS_UNLINK`=16, `SYS_CLOSE`=17,
-  `SYS_FGRANT`=18, `SYS_MSEND`=19, `SYS_MRECV`=20 — documented in their U5–U11 / BANDY entries.)
+  49 is the high-water mark; the next verb minted takes 50, and 34..=39 stay free
+  between the shared block and the socket family.
 
-  | # | Name | Args | Returns | Notes |
-  | :--- | :--- | :--- | :--- | :--- |
-  | 21 | `SYS_THREAD_SPAWN` | entry, sp, arg, place | **thread handle** / `-errno` | aarch64 **ELF-2** — a new EL0 thread SHARING the caller's `ttbr0`/ASID; `place` 0=caller-core, 1=sibling-core; `arg` in x0; retains the slot (freed on the last thread's exit) |
-  | 22 | `SYS_THREAD_EXIT` | — | — (no return) | aarch64 **ELF-2** — posts the thread's completion + releases the slot; scheduler reclaims the task |
-  | 23 | `SYS_THREAD_JOIN` | handle | 0 / `-ESRCH` | aarch64 **ELF-2** — blocks on the thread's completion `Semaphore`; `-ESRCH` if the handle is not the caller's live thread |
-  | 24 | `SYS_FB_MAP` | — | surface VA / `-errno` | aarch64 **ELF-3** — maps the process's off-screen surface (EL0-RW) + RO info page; EL0 never gets the scan-out |
-  | 25 | `SYS_FB_PRESENT` | — | 0 / `-errno` | aarch64 **ELF-3** — kernel composites the surface to the screen (present hook); records the surface checksum |
-  | 26 | `SYS_FUTEX` | uaddr, op, val | op-specific / `-errno` | aarch64 **ELF-3** — op 0 WAIT (block iff `*uaddr==val`), op 1 WAKE (wake ≤`val`); phys-addr-keyed wait queue |
-  | 27 | `SYS_INPUT_POLL` | — | packed event ≥ 0 / `-EAGAIN` | aarch64 **ELF-5** — nonblocking next input event for the caller (packed u64: `[55:48]`=type, low 32=payload), `-EAGAIN` when its per-process ring is empty; the router fills the ACTIVE process's ring via `user_input_enqueue` |
-  | 28 | *(reserved)* | — | — | `SYS_INPUT_WAIT` — DEFERRED blocking twin of 27; the number stays unused |
-  | 29 | `SYS_WIN_CREATE` | w, h | win id ≥ 0 / `-errno` | aarch64 **WC-B** — allocate a window owned by the caller's ASID and map its negotiated (page-multiple) ARGB8888 surface; `w`,`h` ∈ 1..=128; `-EINVAL` bad geometry / no per-process slot, `-EMFILE` the caller used all 8 of its own region slots, `-ENFILE` the global 8-window table is full |
-  | 30 | `SYS_WIN_PRESENT` | win | 0 / `-errno` | aarch64 **WC-B** — damage-mark + composite the window; `-EBADF` unknown/free id, `-EACCES` owned by another ASID. Bumps the focus-scoped present counter under the same focus guard as `SYS_FB_PRESENT` (the UVUG-8r2 cap reads it) |
-  | 31 | `SYS_WIN_MOVE` | win, x, y | 0 / `-errno` | aarch64 **WC-B** — reposition the window's top-left in screen space; same ownership gate, `-EINVAL` outside ±4096 |
-  | 32 | `SYS_WIN_CLOSE` | win | 0 / `-errno` | aarch64 **WC-B** — unmap the surface (leaves revert to the reserved EL1-only descriptors) and free the row; same ownership gate |
-
-  aarch64 leads 4–9 (M6f 4–7, M7 8–9) and 21–23 (ELF-2 threading); the x86 U-side port adopts the same
-  numbers so the arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).
 - **User faults kill the task, kernel faults stay fatal.** Fault accounting
   is matched (task, vector/EC, address) so demos assert exact outcomes.
 - **User pages are never executable-and-writable**; code pages are read-only

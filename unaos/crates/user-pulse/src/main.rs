@@ -106,15 +106,19 @@
 //            below uses as an argument) — never a bare `in(...)`, which would promise the compiler a
 //            value the kernel has already zeroed.
 // ---------------------------------------------------------------------------------------------
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
-const SYS_SLEEP_MS: u64 = 5;
-const SYS_GETINFO: u64 = 7;
-const SYS_INPUT_POLL: u64 = 27;
-const SYS_WIN_CREATE: u64 = 29;
-const SYS_WIN_PRESENT: u64 = 30;
+// ABIFREEZE: the numbers are IMPORTED, not re-typed — `una_abi` is the one declaration, shared with
+// both kernels. See its divergence ledger for what the eight scattered copies had already cost.
+use una_abi::{
+    SYS_EXIT, SYS_GETINFO, SYS_INPUT_POLL, SYS_SLEEP_MS, SYS_WIN_CREATE, SYS_WIN_PRESENT, SYS_WRITE,
+};
 /// PULSE-1's own verb: fill a caller buffer with the per-core load sample (see `Pulse` below).
-const SYS_CPUPULSE: u64 = 49;
+///
+/// ABIFREEZE (divergence D2): 49 is reserved on BOTH arches but DISPATCHED only by the x86 kernel —
+/// the aarch64 dispatcher has no arm for it and answers `-ENOSYS`, despite the x86 declaration's own
+/// claim that the number was "minted on BOTH arches". `sample()` below already treats a negative
+/// return as "keep the previous picture", so PULSE.ELF degrades honestly on the Pi rather than
+/// drawing fabricated bars; that gap is now stated in one place instead of being invisible.
+use una_abi::SYS_CPUPULSE;
 
 #[cfg(target_arch = "aarch64")]
 mod sysabi {
@@ -284,6 +288,9 @@ static mut INFO: [u64; 2] = [0; 2];
 
 /// Read the kernel's (pid, ticks). Returns (0, 0) if the copy is refused, rather than exiting: a monitor
 /// that cannot learn its own pid can still draw honest bars.
+///
+/// The second element is in KERNEL TICKS, whose rate is per-arch — use [`getinfo_ms`], never the raw
+/// value, wherever a millisecond is meant.
 fn getinfo() -> (u64, u64) {
     let p = core::ptr::addr_of_mut!(INFO) as u64;
     if unsafe { sys1(SYS_GETINFO, p) } >> 63 != 0 {
@@ -293,6 +300,19 @@ fn getinfo() -> (u64, u64) {
         let i = &*core::ptr::addr_of!(INFO);
         (i[0], i[1])
     }
+}
+
+/// ABIFREEZE (divergence D1): the wall-clock read, in MILLISECONDS, on either arch.
+///
+/// `SYS_GETINFO`'s `ticks` field is NOT milliseconds everywhere, and this program used to assume it
+/// was: it named the raw value `ms` and fed it straight to `ms % BREATH_MS` against a 3000-ms period.
+/// That is right on x86 (1 kHz APIC tick == 1 ms) and wrong by 4x on aarch64 (250 Hz scheduler tick),
+/// where the liveness breath swept in 12 s instead of the 3 s its own comment promises. The kernels'
+/// clocks are shipped, metal-proven behaviour and neither moves; the rate now comes from
+/// `una_abi::GETINFO_TICK_HZ`, which is `cfg`-selected to match whichever kernel this image runs on.
+#[inline(always)]
+fn getinfo_ms() -> u64 {
+    una_abi::getinfo_ticks_to_ms(getinfo().1)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -310,8 +330,10 @@ fn getinfo() -> (u64, u64) {
 // >= `ncpu` is legal and means "the observer is on a core outside the meter's coverage"; nothing here
 // special-cases it, and the consequence is simply that no core takes the observer branch.
 // ---------------------------------------------------------------------------------------------
-const MAX_CPUS: usize = 16;
-const PULSE_WORDS: usize = 2 + MAX_CPUS * 2;
+// ABIFREEZE: the core cap and the word count are the KERNEL's, imported. They size the buffer the
+// kernel copies into, so a local copy of `16` here was a silent buffer-overrun waiting for the day
+// the ABI cap moved.
+use una_abi::{PULSE_MAX_CPUS as MAX_CPUS, PULSE_WORDS};
 static mut PULSE: [u64; PULSE_WORDS] = [0; PULSE_WORDS];
 
 /// One sampled window: `ncpu`, the observer's core, and the per-core cumulative counters.
@@ -747,8 +769,7 @@ const ALIVE_MARK: u64 = 40;
 /// five times less latency for the same protection).
 const INPUT_PER_FRAME: u32 = 8;
 
-const EV_KEYDOWN: u64 = 1;
-const K_ESC: u8 = 0x1B;
+use una_abi::{INPUT_EV_KEY_DOWN as EV_KEYDOWN, KEY_ESC as K_ESC};
 
 /// Drain up to `INPUT_PER_FRAME` events; true if the user asked to close the window (ESC or `q`). Every
 /// other event is consumed and ignored — this instrument has no controls.
@@ -760,7 +781,7 @@ fn wants_quit() -> bool {
         if ev >> 63 != 0 {
             break; // -EAGAIN: the ring is empty
         }
-        let kind = (ev >> 48) & 0xFF;
+        let kind = una_abi::input_ev_type(ev);
         if kind == EV_KEYDOWN {
             let k = (ev & 0xFF) as u8;
             if k == K_ESC || k == b'q' || k == b'Q' {
@@ -887,7 +908,9 @@ pub extern "C" fn _start() -> ! {
         // `WINDOW_SLOTS` of these frames, so no frame is ever painted from the startup baseline and every
         // painted frame's deltas span a full `REFRESH_MS`.
         sleep_ms(FRAME_MS);
-        let (_pid, ms) = getinfo();
+        // ABIFREEZE D1: milliseconds, converted from the arch's own tick rate — NOT the raw `ticks`
+        // field, which is 250 Hz on aarch64 and 1 kHz on x86.
+        let ms = getinfo_ms();
         if let Some(now) = sample() {
             // The window's OPENING snapshot: the slot we are about to overwrite holds the counters from
             // exactly `WINDOW_SLOTS` samples ago. Read it out, then store the current one in its place —

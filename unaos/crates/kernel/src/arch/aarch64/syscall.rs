@@ -30,56 +30,56 @@ use spin::Mutex as SpinMutex;
 // --- Syscall numbers. WRITE/EXIT are the M6a/M6b core; REPORT is the M6d demo channel; YIELD/SLEEP_MS/
 // GETPID/GETINFO are the M6f "real" surface (all thin over existing scheduler/timer primitives). The
 // numbering is common across arches (documented in userspace.md) so the x86 U-side port stays aligned. ---
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
+use una_abi::SYS_WRITE;
+use una_abi::SYS_EXIT;
 /// M6d demo: report a u64 value to the kernel, keyed by the calling task's name (see `m6d_report`).
 /// Demo-only accounting channel — a real OS would not have this; it lets an EL0 program hand the kernel
 /// the value it read from its own (slot-private) address space so the verdict can check isolation.
-const SYS_REPORT: u64 = 3;
+use una_abi::SYS_REPORT;
 /// M6f: cooperatively give up the CPU — thin over `sched::yield_now()`. Returns 0.
-const SYS_YIELD: u64 = 4;
+use una_abi::SYS_YIELD;
 /// M6f: sleep ~`a0` milliseconds — thin over `sched::sleep_ticks()` (ms→ticks at the 250 Hz tick, round
 /// up). Returns 0. QEMU has no delivered timer IRQ, so it falls back to a cooperative yield there.
-const SYS_SLEEP_MS: u64 = 5;
+use una_abi::SYS_SLEEP_MS;
 /// M6f: return the calling task's id (pid) in x0.
-const SYS_GETPID: u64 = 6;
+use una_abi::SYS_GETPID;
 /// M6f: write a fixed {pid, ticks} struct to the user pointer in x0 via `copy_to_user`. Returns 0 or -EFAULT.
-const SYS_GETINFO: u64 = 7;
+use una_abi::SYS_GETINFO;
 /// M7/U4: load the fixed on-disk program (`HELLO.BIN`) into a fresh per-task slot, run it at EL0 as a CHILD,
 /// and return a HANDLE index into the CALLER's per-process handle table (U4 — not the raw pid), or a negative
 /// errno. No args this arc — arbitrary program-by-name is M8 (it needs a validated `copy_from_user` name).
 /// See `sys_spawn`.
-const SYS_SPAWN: u64 = 8;
+use una_abi::SYS_SPAWN;
 /// M7/U4: block the caller until the child referred to by the HANDLE in `a0` exits, then return its exit
 /// status (or -ECHILD if that handle is not in the caller's table — structural ownership). Woken by the
 /// child's `done.post()` — a scheduler wake, so it works under QEMU. See `sys_wait`.
-const SYS_WAIT: u64 = 9;
+use una_abi::SYS_WAIT;
 /// U5: operate on the caller's OWN handle table as capabilities. `a0` selects the sub-op
 /// (`CAP_OP_GRANT`/`CAP_OP_REVOKE`); the remaining args are op-specific (see `sys_cap`). GRANT mints a new,
 /// rights-attenuated handle to the same target as a source handle the caller holds `CAP_GRANT` on; REVOKE
 /// clears a handle the caller owns. The enforcement layer sits at the handle lookup (`handle_resolve`).
-const SYS_CAP: u64 = 10;
+use una_abi::SYS_CAP;
 /// `SYS_CAP` sub-ops (in `a0`). GRANT: `a1`=source handle idx, `a2`=requested rights mask -> new handle idx
 /// (attenuated) or a negative errno. REVOKE: `a1`=handle idx to drop -> 0 or a negative errno.
-const CAP_OP_GRANT: u64 = 0;
-const CAP_OP_REVOKE: u64 = 1;
+use una_abi::CAP_OP_GRANT;
+use una_abi::CAP_OP_REVOKE;
 /// U7: revoke a TRANSFER the caller previously made with `SYS_XFER` (`a1` = the transfer id SYS_XFER
 /// returned). Sender-only (the transfer RECORD is sender-owned); single-level — revoking a transfer makes
 /// the RECEIVED capability stale at its next `handle_resolve` (and discards it if still pending in the
 /// recipient's inbox), but does NOT cascade through further re-transfers (revocation TREES are deferred).
-const CAP_OP_XREVOKE: u64 = 2;
+use una_abi::CAP_OP_XREVOKE;
 /// U6b: open a disk file BY NAME under the object table. `a0`=name ptr (EL0), `a1`=name len -> a HANDLE
 /// index naming a `File` object carrying `CAP_READ`, or a negative errno. `copy_from_user`s the (bounded)
 /// name, mounts the single FAT volume, finds the top-level 8.3 entry, allocates a per-task file descriptor,
 /// and installs the File handle first-free. Read-only, flat root, one volume — the capability precursor to
 /// UnaFS grants. See `sys_open`.
-const SYS_OPEN: u64 = 11;
+use una_abi::SYS_OPEN;
 /// U6b: read from an open File handle. `a0`=handle idx, `a1`=dest buf (EL0, writable), `a2`=len -> the byte
 /// count (`0` = EOF), or a negative errno. The CHECK: `handle_resolve(asid, handle, CAP_READ)` must yield a
 /// `File` — a missing right, a non-File kind, or no handle all give `-EACCES` (the object-table enforcement
 /// point, the twin of `sys_write`'s Console+CAP_WRITE). Sequential — the descriptor's offset advances by the
 /// count returned. See `sys_read`.
-const SYS_READ: u64 = 12;
+use una_abi::SYS_READ;
 // U7: cross-process capability transfer — the FIRST cross-process op on the object table. XFER(dest,
 // src, req_rights) deposits an ATTENUATED copy of a capability the caller holds into the recipient's
 // per-ASID transfer INBOX (the one deliberately cross-ASID surface, CAS-managed); the recipient names
@@ -87,14 +87,14 @@ const SYS_READ: u64 = 12;
 // process namespace). RECV() pulls a pending capability out of the CALLER's own inbox into the CALLER's
 // own handle row — so every handle-table row keeps its single writer (the sender NEVER writes the
 // recipient's row). Returns: XFER -> a transfer id (for a later CAP_OP_XREVOKE), RECV -> a handle index.
-const SYS_XFER: u64 = 13;
-const SYS_RECV: u64 = 14;
+use una_abi::SYS_XFER;
+use una_abi::SYS_RECV;
 /// U9: absolute seek on an open File descriptor. `a0`=handle idx, `a1`=absolute byte offset -> the new offset,
 /// or a negative errno. The CHECK: `handle_resolve` must yield a `File` carrying ANY of `CAP_READ|CAP_WRITE`
 /// (a non-File kind / no handle / a revoked-ancestor cap all give `-EACCES`); a request past the file's `size`
 /// is `-EINVAL` (seeking TO `size`, the EOF position, is legal). Sets `FILE_OFFSET` (the U6b sidecar). Both a
 /// later `SYS_READ` and a File `SYS_WRITE` resume from the seeked offset. See `sys_seek`.
-const SYS_SEEK: u64 = 15;
+use una_abi::SYS_SEEK;
 
 /// U10: DELETE (unlink) the file an open File+`CAP_WRITE` handle refers to. `a0`=handle idx -> `0`, or a
 /// negative errno. The CHECK is `sys_write`'s: `handle_resolve(asid, fd, CAP_WRITE)` must yield a `File` (a
@@ -102,7 +102,7 @@ const SYS_SEEK: u64 = 15;
 /// by the SAME single write CHECK. Frees the file's cluster chain (every FAT entry -> 0, ALL copies) and marks
 /// its directory entry deleted (0xE5), then invalidates the descriptor + handle. Dir mark FIRST, then free, so a
 /// crash mid-delete leaves lost clusters (benign), never a live entry pointing at freed/re-allocated clusters.
-const SYS_UNLINK: u64 = 16;
+use una_abi::SYS_UNLINK;
 
 /// U11: CLOSE an open `File` — `a0`=handle idx -> `0`, or a negative errno. Frees the handle's descriptor slot
 /// (bumping the slot's GENERATION so any lingering sibling handle to the same slot goes stale, not re-bound to a
@@ -111,7 +111,7 @@ const SYS_UNLINK: u64 = 16;
 /// `-EINVAL` (Console/Socket are not closeable this arc; never silently corrupted); an unresolvable / already-
 /// closed / stale-slot handle is `-EBADF` (double-close returns cleanly; use-after-close is denied). Only the
 /// CALLER's own descriptor is freed — a cross-process open is unaffected (that lifetime is the open-file refcount).
-const SYS_CLOSE: u64 = 17;
+use una_abi::SYS_CLOSE;
 
 /// U6: GRANT (or revoke) another principal access to a PRIVATE file the caller OWNS — the delegation half of
 /// the UnaFS owner/grants ACL. `a0`=a `File` handle the caller holds (names the file by its on-disk identity),
@@ -120,7 +120,7 @@ const SYS_CLOSE: u64 = 17;
 /// or a negative errno. Only the file's current owner may grant; the grant is an ACL edge on the FILE (nothing
 /// is delivered to the grantee's table) — the grantee simply opens the name and the SYS_OPEN ACL admits it. A
 /// handle a grantee already holds survives a revoke (the ACL gates ACQUISITION, not held caps). See `sys_fgrant`.
-const SYS_FGRANT: u64 = 18;
+use una_abi::SYS_FGRANT;
 
 /// BANDY-1 M2: the on-UnaOS SMessage bus transport (ROADMAP §3b arc 1). SYS_MSEND(frame_ptr,
 /// frame_len) submits ONE v1 request frame (arch/aarch64/bus.rs wire layout); the kernel
@@ -129,8 +129,8 @@ const SYS_FGRANT: u64 = 18;
 /// EXISTING FAT/ACL machinery under the invoker's grants (verdict D — no impersonation, no new
 /// model), and enqueues the reply into the SENDER's bounded mailbox. SYS_MRECV(buf_ptr, buf_len)
 /// dequeues the next reply, blocking on the sys_wait Semaphore idiom while the mailbox is empty.
-const SYS_MSEND: u64 = 19;
-const SYS_MRECV: u64 = 20;
+use una_abi::SYS_MSEND;
+use una_abi::SYS_MRECV;
 
 /// ELF-2: the EL0-threading syscalls (first rung of the thread ladder). Unlike `SYS_SPAWN` (a new PROCESS —
 /// fresh slot/ttbr0/ASID, its own address space), these create/reap THREADS that SHARE the caller's address
@@ -142,9 +142,9 @@ const SYS_MRECV: u64 = 20;
 ///     JoinHandle completion Semaphore. -ESRCH if the handle is not the caller's live thread.
 ///   SYS_THREAD_EXIT(): terminate the calling thread — posts its completion, decrements the slot refcount
 ///     (teardown only on the LAST thread), never returns.
-const SYS_THREAD_SPAWN: u64 = 21;
-const SYS_THREAD_EXIT: u64 = 22;
-const SYS_THREAD_JOIN: u64 = 23;
+use una_abi::SYS_THREAD_SPAWN;
+use una_abi::SYS_THREAD_EXIT;
+use una_abi::SYS_THREAD_JOIN;
 
 /// ELF-3: give EL0 something to draw on + real synchronisation.
 ///   SYS_FB_MAP() -> surface VA >= 0 / -errno
@@ -161,12 +161,12 @@ const SYS_THREAD_JOIN: u64 = 23;
 ///     op=0 FUTEX_WAIT: block iff *uaddr == val, keyed by the physical address of uaddr (bounded queue).
 ///     op=1 FUTEX_WAKE: wake up to `val` waiters on that key; returns the count woken. Enough for a
 ///     userspace mutex/condvar. `uaddr` is validated to lie in the caller's writable user window.
-const SYS_FB_MAP: u64 = 24;
-const SYS_FB_PRESENT: u64 = 25;
-const SYS_FUTEX: u64 = 26;
+use una_abi::SYS_FB_MAP;
+use una_abi::SYS_FB_PRESENT;
+use una_abi::SYS_FUTEX;
 /// SYS_FUTEX sub-ops (in x1).
-const FUTEX_WAIT: u64 = 0;
-const FUTEX_WAKE: u64 = 1;
+use una_abi::FUTEX_WAIT;
+use una_abi::FUTEX_WAKE;
 
 /// ELF-5: input into EL0 — the next ladder rung after surface + threads + futex. An interactive EL0
 /// app needs keys/mouse.
@@ -177,7 +177,7 @@ const FUTEX_WAKE: u64 = 1;
 ///     errno): [55:48] = type (see `INPUT_EV_*`), payload in the low 32 bits — key ASCII / button mask in
 ///     [7:0], mouse dx/x in [31:16] (i16), dy/y in [15:0] (i16). The router seam is `user_input_enqueue`
 ///     (mirroring ELF-3's present seam); active-process registration is `user_input_set_active`.
-const SYS_INPUT_POLL: u64 = 27;
+use una_abi::SYS_INPUT_POLL;
 /// VUGPAUSE-2: the reserved id 28 is now SPENT — `SYS_INPUT_WAIT`, the BLOCKING half of the pair.
 ///   SYS_INPUT_WAIT() -> 0 / -EINVAL
 ///     Block the calling task until its input ring is (or may be) non-empty, then return 0. It does NOT
@@ -189,7 +189,7 @@ const SYS_INPUT_POLL: u64 = 27;
 /// `input_futex_key(asid)` — a synthetic key outside the physical-address space that `sys_futex`'s user
 /// keys occupy, so an EL0 word can never alias an input key. The compare word is the ring's own TAIL,
 /// read at EL1 under the bucket lock, which is what makes the wait race-free against `user_input_push`.
-const SYS_INPUT_WAIT: u64 = 28;
+use una_abi::SYS_INPUT_WAIT;
 
 /// WC-B: the WINDOW verbs — the multi-surface successor to the single-surface `SYS_FB_MAP`/`SYS_FB_PRESENT`
 /// pair. Numbers start at 29 (28 is `SYS_INPUT_WAIT`, reserved by ELF-5 and spent by VUGPAUSE-2).
@@ -209,10 +209,10 @@ const SYS_INPUT_WAIT: u64 = 28;
 ///   SYS_WIN_CLOSE(win) -> 0 / -errno
 ///     Unmap the surface (leaves revert to the reserved EL1-only identity descriptors) and free the
 ///     window. Same ownership gate. Teardown (`clear_handle_row`) closes every window an ASID still owns.
-const SYS_WIN_CREATE: u64 = 29;
-const SYS_WIN_PRESENT: u64 = 30;
-const SYS_WIN_MOVE: u64 = 31;
-const SYS_WIN_CLOSE: u64 = 32;
+use una_abi::SYS_WIN_CREATE;
+use una_abi::SYS_WIN_PRESENT;
+use una_abi::SYS_WIN_MOVE;
+use una_abi::SYS_WIN_CLOSE;
 
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
@@ -3652,11 +3652,11 @@ static HANDLES: [[AtomicU64; NHANDLE]; super::boot::USER_SLOTS + 1] =
 /// `CAP_WRITE` gates `sys_write`; `CAP_GRANT` gates minting attenuated copies; `CAP_READ`/`CAP_EXEC`/
 /// `CAP_REVOKE` round out the model (CAP_REVOKE is reserved for cross-process revocation — U6; U5 revoke is
 /// ownership-based). The values are stable across arches (documented in the permission-model doc).
-const CAP_READ: u32 = 1 << 0; // 0x01 (== fs::unafs::RIGHT_READ, const-asserted at rights_from_native)
-const CAP_WRITE: u32 = 1 << 1; // 0x02
-const CAP_EXEC: u32 = 1 << 2; // 0x04
-const CAP_GRANT: u32 = 1 << 3; // 0x08
-const CAP_REVOKE: u32 = 1 << 4; // 0x10 (U8: revoking a handle carrying this kills its derivation SUBTREE)
+use una_abi::CAP_READ; // 0x01 (== fs::unafs::RIGHT_READ, const-asserted at rights_from_native)
+use una_abi::CAP_WRITE; // 0x02
+use una_abi::CAP_EXEC; // 0x04
+use una_abi::CAP_GRANT; // 0x08
+use una_abi::CAP_REVOKE; // 0x10 (U8: revoking a handle carrying this kills its derivation SUBTREE)
 // The rights are the distinct low 5 bits — a well-formed bitmask (each a single, non-overlapping bit, which
 // the attenuation check `req & !src` relies on). This const-assert verifies that and anchors every CAP_* as
 // used, so the model bits not yet exercised in Rust this arc (CAP_EXEC — held by no fixture, so the
@@ -6683,13 +6683,30 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
     wrote as i64
 }
 
-/// The fixed struct SYS_GETINFO writes to EL0. `#[repr(C)]` so the byte layout is stable for the user
-/// program that reads it back: `pid` at offset 0, `ticks` at offset 8 (16 bytes total).
-#[repr(C)]
-struct UserInfo {
-    pid: u64,
-    ticks: u64,
-}
+/// The fixed struct SYS_GETINFO writes to EL0 — `pid` at offset 0, `ticks` at offset 8, 16 bytes.
+/// ABIFREEZE moved the declaration into `una_abi`: one type, shared with the x86 kernel and with the
+/// ring-3 programs that read the bytes back.
+///
+/// `ticks` here is the 250 Hz SCHEDULER tick, not milliseconds — the x86 kernel's same-named field is
+/// a 1 kHz millisecond count. Both are shipped behaviour and neither moves; the rate a ring-3 program
+/// needs is `una_abi::GETINFO_TICK_HZ`. See una-abi's divergence ledger, D1.
+use una_abi::UserInfo;
+
+// ABIFREEZE (divergence D1): the ABI's declared tick rate MUST be the rate this kernel's heartbeat is
+// armed at, because `sys_getinfo` below hands EL0 that tick count RAW.
+//
+// The x86 twin carries the identical assert against `apic::TICK_HZ` (1000). The two rates DIFFER —
+// that is the divergence — and these two lines are what keep each arch's ABI constant honest about its
+// own clock, so a retune of either timer becomes a COMPILE ERROR rather than a silent 4x error in
+// every ring-3 program that reads `ticks`.
+//
+// VERIFIED BY NEGATIVE TEST, not assumed: setting `timer::TICK_HZ` to 200 fails `./arroyo check` with
+// `error[E0080] ... assertion failed` on the `arm-pi` leg (the x86 twin fails on the very first leg).
+// It does NOT fire on the plain `aarch64` leg, and that is correct rather than a hole: this whole
+// module is `#[cfg(feature = "baremetal")]` (arch/aarch64/mod.rs), so a non-baremetal aarch64 build
+// compiles no syscall surface at all and has no ABI to protect. Every configuration that HAS
+// `sys_getinfo` checks it.
+const _: () = assert!(una_abi::GETINFO_TICK_HZ == super::timer::TICK_HZ);
 
 /// SYS_GETINFO(user_ptr): write a small fixed {pid, ticks} struct to the caller's buffer via
 /// `copy_to_user` — the to-user direction's exerciser. Returns 0, or `-EFAULT` if the pointer/length fails
@@ -8066,14 +8083,14 @@ const MAX_NAME: usize = 12;
 /// U10: `SYS_OPEN` mode bit1 — create the file if it is absent (and endow the write cap, since you create to
 /// write). Bit0 remains RW (U9). `O_CREAT` on an EXISTING file just opens it (idempotent). No `O_TRUNC` /
 /// `O_EXCL` / `O_APPEND` this arc — bits >= 3 stay reserved.
-const O_CREAT: u64 = 1 << 1;
+use una_abi::O_CREAT;
 
 /// U6: `SYS_OPEN` mode bit2 — at an `O_CREAT` of a NEW name, make the file PUBLIC (world-accessible) instead
 /// of the owned-by-default private file. UnaOS is secure-by-default: a plain `O_CREAT` records the creator as
 /// the file's OWNER (private — only the owner or a principal it `SYS_FGRANT`s may open it); `O_PUBLIC` opts a
 /// create OUT of ownership into the pre-U6 open-by-anyone behaviour. Ignored on an open of an existing file
 /// (ownership is fixed at create) and outside `O_CREAT`. See `sys_open` and the owner/grants block.
-const O_PUBLIC: u64 = 1 << 2;
+use una_abi::O_PUBLIC;
 
 /// SYS_OPEN(name_ptr, name_len, mode) -> a File-handle index, or a negative errno. The first resource syscall
 /// routed through a NON-Console object: it makes U6a's `File` scaffold real. `copy_from_user`s the (bounded) 8.3
@@ -9475,7 +9492,7 @@ fn m6g_loader_run(_: usize) {
 // =============================================================================================
 
 /// The witness token ELFHELLO.ELF reports via SYS_REPORT (`movz x0, #0x1E`) — must match the fixture.
-const ELF1_WITNESS_TOKEN: u64 = 0x1E;
+use una_abi::ELF1_WITNESS_TOKEN;
 
 /// The token the ELF-loaded program reported (0 until it runs). Read by `elf1_launcher`'s verdict.
 static ELF1_WITNESS: AtomicU64 = AtomicU64::new(0);
@@ -11779,11 +11796,11 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
 // =============================================================================================
 
 /// ELF-5 packed-event type tags (packed value bits [55:48]).
-const INPUT_EV_KEY_DOWN: u64 = 1; // a key PRESS   (payload[7:0] = ASCII)
-const INPUT_EV_KEY_UP: u64 = 2; // a key RELEASE (payload[7:0] = ASCII)
-const INPUT_EV_MOUSE_REL: u64 = 3; // relative pointer motion (payload[31:16]=dx, [15:0]=dy as i16)
-const INPUT_EV_MOUSE_ABS: u64 = 4; // absolute pointer position (payload[31:16]=x,  [15:0]=y  as i16)
-const INPUT_EV_BUTTON: u64 = 5; // a pointer button-DOWN edge (payload[7:0] = button bitmask)
+use una_abi::INPUT_EV_KEY_DOWN; // a key PRESS   (payload[7:0] = ASCII)
+use una_abi::INPUT_EV_KEY_UP; // a key RELEASE (payload[7:0] = ASCII)
+use una_abi::INPUT_EV_MOUSE_REL; // relative pointer motion (payload[31:16]=dx, [15:0]=dy as i16)
+use una_abi::INPUT_EV_MOUSE_ABS; // absolute pointer position (payload[31:16]=x,  [15:0]=y  as i16)
+use una_abi::INPUT_EV_BUTTON; // a pointer button-DOWN edge (payload[7:0] = button bitmask)
 
 /// Per-ASID input ring capacity (power of two — occupancy math is `tail.wrapping_sub(head)`).
 const INPUT_RING_CAP: usize = 32;
@@ -12062,7 +12079,7 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
         Event::Button(mask) => (INPUT_EV_BUTTON, mask as u64),
         Event::Timer | Event::None | Event::Unknown => return None,
     };
-    Some((ty << 48) | payload)
+    Some(una_abi::input_ev_pack(ty, payload))
 }
 
 /// ELF-5 ROUTER SEAM (public, in-lane): enqueue one input event into the ACTIVE process's ring. Called by the
@@ -13256,7 +13273,7 @@ fn input_launcher(_demo_cpu: usize) {
     let obs2 = INPUT_OBS[2].load(Ordering::Acquire);
     let n = INPUT_OBS_N.load(Ordering::Acquire);
     let done = INPUT_PARENT_DONE.load(Ordering::Acquire);
-    let expected = (INPUT_EV_KEY_DOWN << 48) | (b'A' as u64);
+    let expected = una_abi::input_ev_pack(INPUT_EV_KEY_DOWN, b'A' as u64);
     let eagain = EAGAIN as u64; // -EAGAIN sign-extended to u64
     if done && ok && n == 3 && obs0 == eagain && obs1 == expected && obs2 == eagain {
         serial_println!(
@@ -18036,7 +18053,7 @@ fn clock3_fat_launcher() {
 const K2_OWN_NAME: &str = "K2OWN.BIN"; // the owner program -> principal prog:K2OWN.BIN
 const K2_IMP_NAME: &str = "K2IMP.BIN"; // the impostor program -> principal prog:K2IMP.BIN
 const K2_PRIV_NAME: &str = "K2PRIV.BIN"; // the private file the owner creates at EL0
-const K2_EXIT_STATUS: u64 = 0x82; // both K2 programs' sentinel exit -> EL0_K2_DONE (distinct from 0x6D..0x81)
+use una_abi::EXIT_STATUS_K2 as K2_EXIT_STATUS; // both K2 programs' sentinel exit -> EL0_K2_DONE (distinct from 0x6D..0x81)
 const K2_OWN_WITNESS_ALL: u64 = 0x3; // owner: bit0 open admitted + bit1 owner write OK
 const K2_IMP_WITNESS_ALL: u64 = 0x1; // impostor: bit0 open denied (-EACCES)
 
@@ -21466,7 +21483,7 @@ fn bandy_grant_check() {
 // -----------------------------------------------------------------------------------------------
 
 const MIDDEN_NAME: &str = "MIDDEN.BIN";
-const MIDDEN_EXIT_STATUS: u64 = 0xB5; // midden's sentinel exit -> EL0_MIDDEN_DONE
+use una_abi::EXIT_STATUS_MIDDEN as MIDDEN_EXIT_STATUS; // midden's sentinel exit -> EL0_MIDDEN_DONE
 const MIDTXT_NAME: &str = "MIDTXT.TXT";
 const MIDCPY_NAME: &str = "MIDCPY.TXT";
 const BUSPRIV_NAME: &str = "BUSPRIV.BIN";

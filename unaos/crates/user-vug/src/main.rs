@@ -270,31 +270,28 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 // Syscall ABI (Linux-aarch64): x8 = number, args x0..x5, return in x0. The kernel SVC path preserves
 // every GPR except x0.
 // ---------------------------------------------------------------------------------------------
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
-const SYS_YIELD: u64 = 4;
+// ABIFREEZE: every number below is IMPORTED from `una_abi` — the ONE declaration, shared with both
+// kernels and with every other ring-3 program. This block used to be fourteen local `const`s that
+// nothing in the build compared against the dispatchers they were calling.
+use una_abi::{SYS_EXIT, SYS_WRITE, SYS_YIELD};
 /// VUGPARK-FALLBACK: `SYS_SLEEP_MS(ms)` — a real timed park on both arches (5 on each; see
 /// `arch/{aarch64,x86_64}/syscall.rs`). Used ONLY when `SYS_INPUT_WAIT` answers a negative, which
 /// today means the x86 dispatcher has no verb 28 and its default arm returned `-ENOSYS`.
-const SYS_SLEEP_MS: u64 = 5;
-const SYS_GETINFO: u64 = 7;
-const SYS_THREAD_SPAWN: u64 = 21;
-const SYS_THREAD_EXIT: u64 = 22;
-const SYS_THREAD_JOIN: u64 = 23;
-const SYS_FUTEX: u64 = 26;
-const SYS_INPUT_POLL: u64 = 27;
+use una_abi::{
+    SYS_FUTEX, SYS_GETINFO, SYS_INPUT_POLL, SYS_SLEEP_MS, SYS_THREAD_EXIT, SYS_THREAD_JOIN,
+    SYS_THREAD_SPAWN,
+};
 // VUGPAUSE-2: the BLOCKING half of the input pair. Returns 0 once the ring may be non-empty; it does not
 // dequeue, so the ordinary `drain_input` at the top of the loop still sees every event.
-const SYS_INPUT_WAIT: u64 = 28;
+use una_abi::SYS_INPUT_WAIT;
 // WC-C: the WINDOW verbs replace the single-surface SYS_FB_MAP/SYS_FB_PRESENT compat pair.
-const SYS_WIN_CREATE: u64 = 29;
-const SYS_WIN_PRESENT: u64 = 30;
+use una_abi::{SYS_WIN_CREATE, SYS_WIN_PRESENT};
 // FBCON-DMG: `SYS_WIN_PRESENT_ROWS(win, y0, y1)` — a present that declares which SOURCE rows of this
 // program's own surface actually changed, so the compositor repaints only those. x86 only, for now; the
 // aarch64 kernel does not define 33 and answers `-ENOSYS` (-38) from its dispatcher's default arm, which
 // is why `present_rows` below carries a MANDATORY whole-box fallback rather than treating a failure as an
 // error. Additive: 30 is untouched and still the only present this program makes on aarch64.
-const SYS_WIN_PRESENT_ROWS: u64 = 33;
+use una_abi::SYS_WIN_PRESENT_ROWS;
 
 // WITSWEEP — REGISTER-SURVIVAL INVARIANT (sys0..sys4): these stubs use `in("x1")`/`in("x2")`/
 // `in("x3")`/`in("x8")`, which PROMISES the compiler those registers hold their values across the
@@ -867,10 +864,11 @@ extern "C" fn uvug_worker(arg: usize) -> ! {
 // ---------------------------------------------------------------------------------------------
 // Input decode (SYS_INPUT_POLL packed u64; see docs userspace.md ELF-5).
 // ---------------------------------------------------------------------------------------------
-const EV_KEYDOWN: u64 = 1;
-const EV_KEYUP: u64 = 2;
-const EV_MOUSE_REL: u64 = 3;
-const EV_BUTTON: u64 = 5;
+// ABIFREEZE: the packed-event type tags, imported from the crate the kernels pack them with.
+use una_abi::{
+    INPUT_EV_BUTTON as EV_BUTTON, INPUT_EV_KEY_DOWN as EV_KEYDOWN, INPUT_EV_KEY_UP as EV_KEYUP,
+    INPUT_EV_MOUSE_REL as EV_MOUSE_REL,
+};
 
 // Held-state bits.
 const H_YAW_L: u32 = 1 << 0;
@@ -905,11 +903,10 @@ const H_MOTION: u32 = H_YAW_L | H_YAW_R | H_PIT_U | H_PIT_D | H_ZOOM_IN | H_ZOOM
 const H_SAW_KEYUP: u32 = 1 << 7;
 
 // HID-KEYS arrow C0 codes (see vug.rs), ESC, and CLICK-ONE's pause key.
-const K_RIGHT: u8 = 0x1C;
-const K_LEFT: u8 = 0x1D;
-const K_DOWN: u8 = 0x1E;
-const K_UP: u8 = 0x1F;
-const K_ESC: u8 = 0x1B;
+// ABIFREEZE: the arrow block's C0 codes are the kernel input router's, imported.
+use una_abi::{
+    KEY_DOWN as K_DOWN, KEY_ESC as K_ESC, KEY_LEFT as K_LEFT, KEY_RIGHT as K_RIGHT, KEY_UP as K_UP,
+};
 /// CLICK-ONE: SPACE toggles pause. Chosen because it is UNBOUND here — `key_bit` maps WASD/arrows,
 /// Q/E and the +/- family and nothing else, and ESC is handled ahead of it — so no existing gesture
 /// changes meaning. It is also the conventional pause key, and the xHCI table delivers it as plain
@@ -996,8 +993,8 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
             break; // -EAGAIN: ring empty
         }
         fi.any = true;
-        let ty = (ev >> 48) & 0xFF;
-        let lo = ev & 0xFFFF_FFFF;
+        let ty = una_abi::input_ev_type(ev);
+        let lo = una_abi::input_ev_payload(ev);
         match ty {
             EV_KEYDOWN => {
                 let k = (lo & 0xFF) as u8;
@@ -1199,15 +1196,27 @@ fn stall_witness(latch: &AtomicU32, frame: u32, tail: &[u8], value: u32) {
 // The stagger observation (s1p: replacement vugs visibly outpace the originals) needs a PER-VUG
 // number, and the serial line cannot carry one per frame for six windows. So each vug measures and
 // draws its own rate in its top-left corner: frames presented per second, from `SYS_GETINFO`'s
-// `ticks` field (the 250 Hz scheduler tick — the only EL0-reachable clock; CNTVCT_EL0 is not
-// EL0-enabled). One getinfo per frame is one syscall beside the existing input poll; the displayed
-// value refreshes once per second, so the digits are readable rather than flickering.
+// `ticks` field — the only ring-3-reachable clock on either arch (CNTVCT_EL0 is not EL0-enabled).
+// ABIFREEZE D1: that field's RATE is per-arch (250 Hz scheduler tick on aarch64, 1 kHz on x86), which
+// is exactly what this code used to get wrong, so the divisor comes from `una_abi::GETINFO_TICK_HZ`
+// and not from a number written here. One getinfo per frame is one syscall beside the existing input
+// poll; the displayed value refreshes once per second — a real second on both arches now — so the
+// digits are readable rather than flickering.
 //
 // CHECKSUM DISCIPLINE: the overlay is drawn ONLY when `detached || interactive` — a desktop
 // (`bg`) or operator-driven vug. The FOREGROUND auto path (every fixture/battery leg, the QEMU
 // 300-frame checksum witness) takes neither branch and its surface stays byte-identical.
 // ---------------------------------------------------------------------------------------------
-const TICK_HZ: u32 = 250; // kernel scheduler tick rate (timer.rs TICK_HZ)
+/// ABIFREEZE (divergence D1): the rate of `SYS_GETINFO`'s `ticks` field — IMPORTED, because it is
+/// NOT the same number on both arches and this constant used to claim it was.
+///
+/// It read `const TICK_HZ: u32 = 250` with the comment "kernel scheduler tick rate", which is exactly
+/// right on aarch64 and wrong on x86, where the field is filled from `arch::ticks()` at
+/// `apic::TICK_HZ` = 1000 Hz (one tick per millisecond). VUG-X86.ELF therefore divided a one-second
+/// frame count by 250 and drew an fps figure FOUR TIMES TOO LOW on the panel — and refreshed it four
+/// times a second while the comment below still says "once per second". Neither kernel's clock moves
+/// (both are shipped behaviour); the divisor now comes from the ABI and is correct on either arch.
+const TICK_HZ: u32 = una_abi::GETINFO_TICK_HZ as u32;
 const FPS_C: u32 = 0xFFE8_C98A; // fps digits — warm amber, same as user-stat's pid
 
 /// 5x7 digit glyphs, one byte per row, bit 4 = leftmost column (verbatim from user-stat).
@@ -1241,7 +1250,8 @@ unsafe fn draw_digit(surf: *mut u8, d: usize, x: i32, y: i32, color: u32) {
     }
 }
 
-/// `SYS_GETINFO` -> the kernel's 250 Hz tick count, or 0 on error (a 0 delta just skips the update).
+/// `SYS_GETINFO` -> the kernel's tick count at `TICK_HZ` (250 Hz aarch64 / 1 kHz x86 — ABIFREEZE D1),
+/// or 0 on error (a 0 delta just skips the update).
 fn getinfo_ticks() -> u64 {
     let mut info = [0u64; 2]; // {pid, ticks}, #[repr(C)] — see kernel sys_getinfo
     let p = info.as_mut_ptr() as u64;
@@ -1348,7 +1358,7 @@ fn fps_refresh(ticks: &mut u64, mark: &mut u32, fps: u32, frame: u32) -> u32 {
     if now > *ticks {
         let dt = (now - *ticks) as u32;
         if dt >= TICK_HZ {
-            // frames since last refresh, scaled to per-second at the 250 Hz tick.
+            // frames since last refresh, scaled to per-second at THIS arch's tick rate.
             let v = ((frame.wrapping_sub(*mark) as u64 * TICK_HZ as u64 + (dt / 2) as u64) / dt as u64) as u32;
             *ticks = now;
             *mark = frame;

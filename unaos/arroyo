@@ -1185,8 +1185,13 @@ test_x86_64() {
 #                  one here would be inventing a product, not gating an existing one.
 #   user-pulse     BOTH. Arch-neutral above two syscall stubs; built as PULSE.ELF (aarch64) and
 #   user-stat      PULSE-X86.ELF (x86) — see build_user_pulse_x86 / build_user_aarch64. Same for the
-#   user-vug       STAT/VUG pair. These three are exactly where a syscall-number or stub drift between
-#                  the two arches shows up, so both legs are checked.
+#   user-vug       STAT/VUG pair. These three USED to be exactly where a syscall-number or stub drift
+#                  between the two arches showed up, so both legs are checked. ABIFREEZE closed the
+#                  NUMBER half of that hiding place: every crate below now imports crates/una-abi
+#                  instead of re-declaring the table, so a number cannot differ between a caller and
+#                  the dispatcher it calls. The STUB half — register constraints, clobber lists, and
+#                  the per-arch `cfg` blocks around them — is still hand-written per crate and is
+#                  still exactly what these legs exist to catch.
 #
 # Fields (whitespace-separated; the 4th field runs to end-of-line):
 #   1 crate dir under crates/
