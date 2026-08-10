@@ -210,12 +210,23 @@ pub const CONTROL_ZOOM: u32 = 0x0092_AAC9;
 // moment that kit is reachable. No kit hash is cited above them, deliberately: a
 // fabricated citation would be worse than the gap it papers over.
 //
-// The register is Crispy's, not Apple's. macOS ships `#FF5F57 / #FEBC2E / #28C840`
-// — fully saturated, and wrong against this kit's near-white chrome (`0xEEEEF1`)
-// and its muted accent (`0x4A73AA`). These are the same three SIGNALS taken down to
-// the refined Scandinavian-minimal register the rest of the table sits in: hue
-// preserved so the meaning is unmistakable, saturation and value pulled to where
-// they belong beside `ACCENT`.
+// ### The register is APPLE'S, by ruling — superseding this arc's own derivation
+//
+// These three were first entered as MUTED derivations (`#C25F55 / #C89C52 /
+// #5E9468`): the macOS hues pulled down to the Scandinavian-minimal saturation the
+// rest of this table sits in, on the argument that fully saturated signals fight the
+// near-white chrome (`0xEEEEF1`) and the muted `ACCENT` (`0x4A73AA`).
+//
+// Peter is the taste gate and he overruled it, 2026-08-09, verbatim:
+//
+//     "same color as mac but knurled if possible to add more texture"
+//
+// So the values below are now the **macOS standard hues, unmodified**, and the
+// texture that was to have come from restraint comes instead from the material:
+// `video/knurl.rs` mills a diamond crosshatch into the discs at the same
+// 2 %-of-a-channel budget `paper` and `ceramic` share. The earlier muted triple is
+// recorded here rather than deleted, because the argument for it was recorded and a
+// reversed decision should show its own reversal.
 //
 // The three blue `CONTROL_*` roles above are KEPT. They are the kit's own ramp and
 // this arc has no authority to delete a lifted role; nothing in the tree consumes
@@ -223,17 +234,24 @@ pub const CONTROL_ZOOM: u32 = 0x0092_AAC9;
 // of what the kit says until the re-lift reconciles the two.
 // ---------------------------------------------------------------------------
 
-/// DERIVED (Peter, 2026-08-09, white board Q9b) — CLOSE control fill: a muted clay
-/// red. `#C25F55`, hue 6°, the destructive signal at Crispy's saturation.
-pub const CTRL_CLOSE: u32 = 0x00C2_5F55;
+/// DERIVED (Peter's ruling, 2026-08-09, *"same color as mac"*) — CLOSE control fill:
+/// the macOS standard close hue, `#FF5F57`, hue 3°. Supersedes this table's earlier
+/// muted derivation `#C25F55`. Pending re-lift as `palette.ctrl_close`.
+///
+/// Its red channel is already `0xFF`, so `knurl`'s crest CLIPS on this role and the
+/// crosshatch reads there as its trough alone — disclosed in `knurl.rs` and pinned by
+/// that module's leg 4 rather than left as an unchecked note.
+pub const CTRL_CLOSE: u32 = 0x00FF_5F57;
 
-/// DERIVED (Peter, 2026-08-09, white board Q9b) — MINIMISE control fill: a muted
-/// ochre. `#C89C52`, hue 39°.
-pub const CTRL_MIN: u32 = 0x00C8_9C52;
+/// DERIVED (Peter's ruling, 2026-08-09, *"same color as mac"*) — MINIMISE control
+/// fill: the macOS standard minimise hue, `#FEBC2E`, hue 43°. Supersedes this table's
+/// earlier muted derivation `#C89C52`. Pending re-lift as `palette.ctrl_min`.
+pub const CTRL_MIN: u32 = 0x00FE_BC2E;
 
-/// DERIVED (Peter, 2026-08-09, white board Q9b) — ZOOM control fill: a muted sage
-/// green. `#5E9468`, hue 135°.
-pub const CTRL_ZOOM: u32 = 0x005E_9468;
+/// DERIVED (Peter's ruling, 2026-08-09, *"same color as mac"*) — ZOOM control fill:
+/// the macOS standard zoom hue, `#28C840`, hue 128°. Supersedes this table's earlier
+/// muted derivation `#5E9468`. Pending re-lift as `palette.ctrl_zoom`.
+pub const CTRL_ZOOM: u32 = 0x0028_C840;
 
 // ---------------------------------------------------------------------------
 // Gloss — `palette.gloss`. A white highlight applied with a two-stop alpha
@@ -306,13 +324,50 @@ pub const BUTTON_PAD_X: usize = 18;
 /// `metrics.gap` = `12` @ `0787ba9f` — standard gap between controls, px.
 pub const GAP: usize = 12;
 
-/// `metrics.control_box` = `12` @ `0787ba9f` — the title-bar control's extent, px.
+/// The title-bar control's extent, px — read as a DIAMETER, the controls being circles.
 ///
-/// Iteration 3's controls are **circles**, so this is read as a diameter (the square
-/// box CRISPY-PI named is gone along with its single fill colour). The json carries no
-/// separate radius key; `CONTROL_RADIUS` below is derived from this one number so that
-/// there is still exactly one lifted value.
-pub const CONTROL_BOX: usize = 12;
+/// ⛔ **OVERRIDDEN, and no longer the kit's `metrics.control_box` = `12`.** Peter's ruling from
+/// the bench, 2026-08-09, verbatim: *"window buttons are very small"*.
+///
+/// ### The arithmetic, so the number is derived rather than picked
+///
+/// macOS draws its traffic-light controls at about **12 points**. Peter's panel is a 2880x1800
+/// 15" rMBP — a 2x Retina display — so a Mac renders those discs at about **24 device pixels**.
+///
+/// This metric is a **device-pixel** metric, and nothing magnifies it:
+/// `wm::spawn_geometry` computes `w * scale + 2 * BORDER` and `h * scale + TITLE_H + 2 * BORDER`,
+/// i.e. `wm::place_scale`'s integer upscale (and its `legibility_cap`) apply to the app's CONTENT
+/// only — `BORDER`, `TITLE_HEIGHT` and this box are added unscaled, and `wm::paint_window` writes
+/// the discs through `put_pixel` at panel coordinates. `UNAOS_FBW`/`UNAOS_FBH` change the panel
+/// geometry the content scale is chosen against; they do not change a chrome metric either. So
+/// `12` really was 12 device pixels on glass — **half** the physical size of the thing it is
+/// imitating, which is the whole explanation for the verdict.
+///
+/// `24` is therefore the size that MATCHES the reference, not a size that was liked.
+///
+/// ### What moves with it, and what that cost
+///
+///  * `CONTROL_RADIUS` below: 6 -> 12.
+///  * `wm::CTRL_RESERVE` = `3 * CONTROL_BOX + 4 * GAP`: 84 -> 120, and with it the strip width
+///    `wm::controls` declines below (`2*FRAME + GAP + CTRL_RESERVE + TEXT_CELL` = 122 -> 158) and
+///    the caption's left inset. Both are derived from this constant and moved by themselves; the
+///    fixture surfaces that must clear the threshold are now sized from `wm::CLUSTER_MIN_SRC_W`
+///    with a const-assert, so this metric can never again silently turn a close-control gate into
+///    a SKIP.
+///  * `wm::ctrl_glyph`'s three symbols are all expressed in terms of `d`, so they scale by
+///    themselves — and they scale into BETTER proportions, not worse: the minimise bar is 2 px of
+///    a 24-px disc (macOS-like) where it was 2 px of a 12-px disc (heavy).
+///  * `video/knurl.rs`'s crosshatch becomes legible at all; see its legibility section.
+///
+/// ### ⚠ PROPOSED, NOT DECIDED — `TITLE_HEIGHT` is now tight
+///
+/// The disc is centred in the strip, so the clearance above and below it is
+/// `(TITLE_HEIGHT - CONTROL_BOX) / 2` = `(34 - 24) / 2` = **5 px**. macOS gives its 24-px discs
+/// about 16 px of clearance in a ~56-px strip. The chrome will read as CRAMPED. Raising
+/// `TITLE_HEIGHT` to ~44 (clearance 10) or ~48 (clearance 12) is the fix, and it is a **taste-gate
+/// question** — it changes every window's proportions and the caption's centring — so it is put on
+/// the record here and NOT taken by this arc. The const-assert below still holds with room.
+pub const CONTROL_BOX: usize = 24;
 
 /// Radius of a circular title-bar control, px — `CONTROL_BOX / 2`, derived here rather
 /// than lifted, because the json expresses the control's size only as `control_box`.
@@ -354,8 +409,12 @@ const _: () = {
     assert!(BEVEL < FRAME);
     // The rounded head must fit inside the title bar: 12 < 34.
     assert!(CORNER_RADIUS < TITLE_HEIGHT);
-    // Title-bar controls must fit inside the title bar: 12 < 34.
+    // Title-bar controls must fit inside the title bar: 24 < 34 since the size ruling.
     assert!(CONTROL_BOX < TITLE_HEIGHT);
+    // …and must leave a real clearance band, not merely fit. `(34 - 24)/2` = 5 px each side, which
+    // is tight (see the note on `CONTROL_BOX`: raising `TITLE_HEIGHT` is a proposed taste-gate
+    // question). One bevel of clearance is the floor below which the disc would touch the frame.
+    assert!(TITLE_HEIGHT >= CONTROL_BOX + 2 * BEVEL);
     // A circular control needs a non-degenerate radius, or it cannot be drawn round.
     assert!(CONTROL_RADIUS > 0);
     // Both of a widget's corners must fit within its own height: 2*8 <= 28.

@@ -103,6 +103,13 @@ pub mod paper;
 // (the brush runs along x), so it is 512 bytes of `.bss` and costs no per-pixel work at all: it
 // reuses paper's Q16 primitives and modulates the existing theme roles, never replaces them.
 pub mod ceramic;
+// KNURL — the diamond crosshatch milled into the three title-bar control discs (Peter's ruling
+// 2026-08-09: "same color as mac but knurled if possible to add more texture"). DERIVED, not
+// lifted, on ceramic's terms. Two line families at exactly +/-45 degrees — the level sets of
+// `x + y` and `x - y`, so the angles are integer expressions and cost no rotation arithmetic —
+// summed through paper's shared Q16 sine. Periodic rather than noisy, because a knurl is MILLED:
+// the tile is the field's fundamental domain, 64 bytes of `.bss`, one cache line.
+pub mod knurl;
 // INSTGUI — the first graphical installer: a kernel-owned, CRISPY-themed window over the
 // installer engine (choose disk → erase warning → engine run → verdict). x86-only, and gated
 // on BOTH `wc` (it is a compositor client) and `instgui` (`UNAOS_INSTGUI=1`).
