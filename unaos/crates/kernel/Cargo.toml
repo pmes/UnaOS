@@ -374,6 +374,29 @@ kbdwit = []
 # witnessed and stopped at, never patched around. Boot cost is the 500 ms window plus ~5 control
 # transfers; x86-only, and `arm_features` strips the knob so aarch64 media stay byte-identical.
 bt = ["ehcihid"]
+# BT-C1 (GR24): `UNAOS_BTC=1` arms the FIRST BR/EDR step, and the first thing on this radio aimed at
+# AUDIO. Everything `bt` gates is Low Energy; A2DP is not — it runs over classic BR/EDR L2CAP, and
+# the first move toward it is to PAGE the speaker with `HCI_Create_Connection` (0x0405). This knob
+# adds exactly that one step and its teardown: page, witness `Connection Complete` (event 0x03) or
+# the failure status honestly, disconnect (or cancel an unresolved page). No SDP, no L2CAP channel,
+# no AVDTP, no audio, and no pairing.
+#
+# WHY IT IS ITS OWN KNOB AND NOT PART OF `bt`. A page is the loudest thing this project has ever put
+# on the air: a directed transmission at a named device that, on a speaker, ANSWERS AUDIBLY, and
+# that can take the device away from whatever it is paired to. Every LE stage is passive or bounded
+# to a device Peter named; this one makes noise in his room. So a boot that did not ask for a page
+# must be structurally incapable of issuing one — a compile-time property, not a runtime check.
+#
+# Prerequisites, with the Core spec sections: `HCI_Write_Scan_Enable` (Vol 4 Part E §7.3.18) is NOT
+# written — it governs INBOUND inquiry/page scan and paging out needs none of it, while enabling it
+# would make this machine discoverable. `HCI_Write_Page_Timeout` (§7.3.16) IS written, shortening
+# the 5.12 s reset default to 1.28 s so a powered-off speaker cannot cost the boot five seconds.
+# Gated additionally on the LMP feature mask NOT setting BR/EDR-Not-Supported.
+#
+# Implies `bt` (and through it `ehcihid`) — every line lives in the same x86-gated
+# `drivers/ehci/mod.rs`. Default OFF => the page code, its constants and the classic latch vanish.
+# x86_64 only; `arm_features` strips it so aarch64 media stay byte-identical.
+btc = ["bt"]
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
 # path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole
 # (zeolite), and the boot witnesses. Pulls in the x86-only smoltcp optional dependency and compiles
