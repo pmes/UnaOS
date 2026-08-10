@@ -864,7 +864,9 @@ pub const KERNEL_OWNER_DESKTOP: u64 = KERNEL_OWNER_BASE + 2;
 
 /// CLICK-X86 — is `asid` in the reserved kernel-owner band? `false` for `0`, which still means
 /// "nobody owns this row".
-pub fn is_kernel_owner(asid: u64) -> bool {
+/// `const` so a fixture can assert its synthetic furniture ASID is in the band at COMPILE time,
+/// against this predicate rather than against a second copy of it (see `ctrldecline_selftest`).
+pub const fn is_kernel_owner(asid: u64) -> bool {
     asid >= KERNEL_OWNER_BASE && asid <= KERNEL_OWNER_BASE + 0xFF
 }
 
@@ -2816,6 +2818,13 @@ fn composite_once() {
         C2_INSPAN_CYC.fetch_add(in_span, Relaxed);
         C2_STRADDLE_CYC.fetch_add(pass.saturating_sub(in_span), Relaxed);
     }
+    // CTRLWIT — the pass is over and every `table()` guard it took has dropped, so this is the first
+    // legal place to SPEAK a decline `controls` armed while painting. After the COMPOSITE-2 ledger,
+    // not before it: a serial line inside the clock would charge the pass for the instrument's own
+    // UART time and inflate `pass_us` for exactly the boots where the diagnostic fired.
+    //
+    // Steady-state cost is `MAX_WINDOWS` failed compare-exchanges — no line, no lock, no allocation.
+    controls_declined_drain();
 }
 
 /// What [`composite_inner`] owes the sprite when it returns.
@@ -7920,6 +7929,88 @@ fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
     controls(r).map(|(cbx, cy, d)| (cbx + which.index() * (d + GAP), cy, d))
 }
 
+/// CTRLWIT — the outer-box width at which [`controls`] starts drawing a cluster, as a name.
+///
+/// It is [`CLUSTER_MIN_SRC_W`] plus the frame the SOURCE width does not include, so the two move
+/// together by construction: `bw = w * scale + 2*BORDER` for every non-compat row, hence
+/// `bw >= CLUSTER_MIN_BOX_W` is exactly `w * scale >= CLUSTER_MIN_SRC_W`. 158 px at the current
+/// metrics. It existed as an inline sum in one place and as prose in three; the witness below puts
+/// it on the wire, so it needs a single symbol that cannot drift from the test that uses it.
+pub const CLUSTER_MIN_BOX_W: usize = 2 * BORDER + CLUSTER_MIN_SRC_W;
+
+/// CTRLWIT — the decline witness's per-window state. `UNSEEN -> PENDING -> SPOKEN`, and the id is
+/// the index (ids are `1..=MAX_WINDOWS`, so slot 0 is never touched).
+///
+/// Three states rather than a bool because the LATCH and the PRINT cannot happen in the same place.
+/// [`controls`] runs from `paint_window`, i.e. from inside a `table()` critical section with IRQs
+/// masked, and this module's standing rule is that no such section prints, blocks or allocates. So
+/// the decline ARMS here and [`controls_declined_drain`] speaks it after the guard has dropped —
+/// the same split `paygo_service`'s `stop_note` uses, and for the same reason.
+///
+/// `PENDING` is sticky until it is spoken: a window that declines on one pass and is never painted
+/// again still gets its line at the next drain, and a window that declines on every pass of a
+/// 60 Hz composite still gets exactly one. That is the whole of the rate limit — it is a per-window
+/// latch, not a per-second cadence, because the fact being reported ("this window has no control
+/// cluster") does not change while the window's width does not.
+static CTRL_DECL_STATE: [core::sync::atomic::AtomicU32; MAX_WINDOWS + 1] =
+    [const { core::sync::atomic::AtomicU32::new(CTRL_DECL_UNSEEN) }; MAX_WINDOWS + 1];
+
+/// CTRLWIT — this window has not declined (yet). Reset per TENANT, in `create_inner`: ids are
+/// recycled slot aliases, and a new window in an old slot is a different window that is owed its
+/// own line. Resetting at close instead would be the `PAYGO_SVC_TRIES` bug over again.
+const CTRL_DECL_UNSEEN: u32 = 0;
+/// CTRLWIT — declined, not yet on the wire.
+const CTRL_DECL_PENDING: u32 = 1;
+/// CTRLWIT — declined and reported; the latch is spent for this tenant.
+const CTRL_DECL_SPOKEN: u32 = 2;
+
+/// CTRLWIT — the owner ASID captured at the arming decline, so the drain can name it after the row
+/// may already have been closed.
+static CTRL_DECL_OWNER: [core::sync::atomic::AtomicU64; MAX_WINDOWS + 1] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS + 1];
+
+/// CTRLWIT — the outer-box width captured at the arming decline. Same reason as the owner.
+static CTRL_DECL_BW: [core::sync::atomic::AtomicU32; MAX_WINDOWS + 1] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_WINDOWS + 1];
+
+/// CTRLWIT — how many decline lines this boot has actually PUT ON THE WIRE. The fixture's handle:
+/// "the witness fired exactly once" is a claim about emissions, and an emission counter is the only
+/// thing that can falsify it. Not a debug counter — [`ctrldecline_selftest`] reads it.
+static CTRL_DECL_SPOKE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// CTRLWIT — re-arm the decline witness for a new tenant of slot `id`. Called from `create_inner`.
+fn controls_declined_rearm(id: WinId) {
+    if id != WIN_NONE && (id as usize) <= MAX_WINDOWS {
+        CTRL_DECL_STATE[id as usize]
+            .store(CTRL_DECL_UNSEEN, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// CTRLWIT — **speak every decline that has been armed and not yet reported.** Must be called with
+/// no `table()` guard held; see [`CTRL_DECL_STATE`] for why the arming and the print are split.
+///
+/// The transition is a `compare_exchange`, not a load-then-store, so two cores draining at once
+/// cannot both print the same window's line. A slot that is `UNSEEN` or already `SPOKEN` costs one
+/// failed CAS, which is why this is affordable at the end of every composite pass.
+fn controls_declined_drain() {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
+    for i in 1..=MAX_WINDOWS {
+        if CTRL_DECL_STATE[i]
+            .compare_exchange(CTRL_DECL_PENDING, CTRL_DECL_SPOKEN, AcqRel, Relaxed)
+            .is_ok()
+        {
+            CTRL_DECL_SPOKE_N.fetch_add(1, Relaxed);
+            serial_println!(
+                "[wm] controls-declined win={} owner={:#x} bw={} floor={}",
+                i,
+                CTRL_DECL_OWNER[i].load(Relaxed),
+                CTRL_DECL_BW[i].load(Relaxed),
+                CLUSTER_MIN_BOX_W
+            );
+        }
+    }
+}
+
 /// CRISPYWIRE — the three circular title-bar controls' layout: the CLOSE circle's bounding box
 /// `(x, y, diameter)`. The middle and zoom circles follow it at a [`GAP`] pitch, so the cluster is
 /// `close`, `mid`, `zoom` left to right — the order the kit's own ramp is described in (darkest to
@@ -7985,7 +8076,42 @@ fn controls(r: &Window) -> Option<(usize, usize, usize)> {
     // The reserve is unchanged in SIZE and only changes SIDE: `CTRL_RESERVE` is still the strip the
     // cluster costs the caption, and the caption is still one `GAP` clear of the far frame. See
     // [`CTRL_RESERVE`] and `paint_window`, which subtract exactly this.
-    if bw < 2 * BORDER + GAP + CTRL_RESERVE + TITLE_CELL {
+    if bw < CLUSTER_MIN_BOX_W {
+        // CTRLWIT — and the window SAYS SO, once. This is the decline that is not deliberate: the
+        // furniture arm above is policy (kernel chrome is not closeable, and that is the design),
+        // but this one is a live ring-3 window that asked for a surface, got a frame, and silently
+        // got no close, no minimise and no zoom because KNURL's 24-px discs moved the floor
+        // 122 -> 158 underneath it. Nothing on the wire, nothing in the app: the only way to learn
+        // it was to look at the panel. So the arming is here, at the exact branch that takes the
+        // affordance away, and it carries the two numbers that make the fact ACTIONABLE — the width
+        // the window has and the width it would need.
+        //
+        // Deliberately NOT `witness`-gated, on `crispy_witness`'s precedent: the metal image is
+        // built without the `witness` feature, and a line that is absent from the only artefact
+        // that matters is not a witness. It is affordable ungated because it is latched per window
+        // per boot (see [`CTRL_DECL_STATE`]) — the painter runs at frame rate, and a line per pass
+        // would be a serial flood, not a diagnostic.
+        //
+        // The print itself is NOT here: this runs inside a `table()` critical section. It arms.
+        let i = r.id as usize;
+        if r.id != WIN_NONE
+            && i <= MAX_WINDOWS
+            && CTRL_DECL_STATE[i]
+                .compare_exchange(
+                    CTRL_DECL_UNSEEN,
+                    CTRL_DECL_PENDING,
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            CTRL_DECL_OWNER[i].store(r.owner_asid, core::sync::atomic::Ordering::Relaxed);
+            // Saturating, not truncating: `outer_box` saturates rather than wraps, so a nonsense
+            // row can present an absurd width, and a `as u32` of it would put a SMALL number on the
+            // wire — a witness that lies about the one quantity it exists to report.
+            CTRL_DECL_BW[i]
+                .store(bw.min(u32::MAX as usize) as u32, core::sync::atomic::Ordering::Relaxed);
+        }
         return None;
     }
     // Vertically centred in the strip; `TITLE_H > CONTROL_BOX` is a const-assert in `theme.rs`.
@@ -11398,6 +11524,12 @@ fn create_inner(
     }
     t.rows[slot] = row;
     drop(t);
+    // CTRLWIT — the decline witness re-arms with the tenant, and UNGATED, because the witness itself
+    // is ungated. An id is a recycled slot alias: the window that just took this slot is a different
+    // window from the one that left it, and if its predecessor was narrow enough to lose its control
+    // cluster, a latch left `SPOKEN` would make the new tenant's identical loss silent for the rest
+    // of the boot. Beside the batteries below and for the same reason they give.
+    controls_declined_rearm(id);
     // WC-D: ids are recycled slot aliases, so a fresh window in a used slot is a DIFFERENT window and
     // deserves its own verdict — clear the one-shot latch here rather than at close, which is the point
     // where the id demonstrably names something new.
@@ -12555,4 +12687,167 @@ pub fn dock_scan(
     // it would silently start shuffling tiles under the operator's hand.
     debug_assert!(out[..n].windows(2).all(|p| p[0].id < p[1].id));
     (n, clobbered)
+}
+
+// ---- CTRLWIT fixture ---------------------------------------------------------------------------
+//
+// Appended, on the same argument the DOCK seam above and `focus_reset` make: a definition inserted
+// higher up renumbers every `core::panic::Location` below it, and those records live in the loadable
+// image. This one is `witness`-only, so with the knob off it does not compile and the artifact is
+// byte-identical on both targets — a property that only holds if nothing below it moves.
+
+/// CTRLWIT — **the decline witness, driven to a verdict.** Five legs, and every one of them can
+/// fail; the whole point of the arc is that a window which loses its control cluster says so, and a
+/// fixture that could only ever pass would assert nothing about that.
+///
+/// ### Why the rows are re-pinned instead of merely being created small
+/// The claim is about ONE number: the outer-box width, against [`CLUSTER_MIN_BOX_W`]. But a created
+/// row's box width is `w * scale + 2*BORDER` and `scale` comes from [`place_scale`], which is a
+/// function of the PANEL — 640x480 under `kernel8-test`, 1920x1200 on the bench, 2880x1800 on the
+/// rMBP. A fixture that picked a source width and hoped would straddle the floor on one panel and
+/// clear it on the next, i.e. would be a leg that silently stops asserting when the geometry moves.
+/// So each row is created through the ordinary path and then pinned at `scale = 1` with the exact
+/// source width the leg is about, which makes `bw = w + 2*BORDER` on every panel there is. Both
+/// widths are derived from [`CLUSTER_MIN_SRC_W`], so they follow the kit: when `CONTROL_BOX` moves
+/// again the fixture moves with it rather than testing a stale number.
+///
+/// ### The legs
+/// 1. **The narrow row has no cluster.** `control_disc_rect` is the painter's own path into
+///    [`controls`], not a re-derivation of it — HITTEST-GEOM's lesson.
+/// 2. **And it SAID so, exactly once.** Read off [`CTRL_DECL_SPOKE_N`], which counts EMISSIONS: a
+///    latch that armed and never printed scores 0 here, which is the failure mode the split between
+///    arming and draining introduces and therefore the one that has to be covered.
+/// 3. **The rate limit holds.** Four more looks at the same row, drained after each; the count must
+///    not move. Without the latch the painter would put this line on the wire at frame rate.
+/// 4. **The row AT the floor keeps its cluster, and is silent.** The control for leg 1: without it,
+///    a `controls` that had simply stopped returning `Some` would pass legs 1-3 outright.
+/// 5. **Furniture is suppressed WITHOUT a line.** Kernel chrome has no cluster by policy
+///    (`is_kernel_owner`), and a policy decline is not a defect to report — a witness that fired on
+///    it would cry wolf once per boot forever. The row is pinned narrow too, so it would trip the
+///    width arm as well if the furniture arm were not reached first.
+///
+/// Emits one `:: WMCTRL: controls-declined ... ::` verdict line. Self-cleaning: it mints three rows
+/// with synthetic ASIDs and reaps every one of them, including a sweep that speaks if anything leaks.
+#[cfg(feature = "witness")]
+pub fn ctrldecline_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    /// The narrow row's owner: synthetic, outside the slot range, so it owns nothing but its window.
+    const ASID_N: u64 = 0xC2A;
+    /// The at-the-floor row's owner.
+    const ASID_W: u64 = 0xC2B;
+    /// Leg 5's owner: kernel FURNITURE, but deliberately neither `KERNEL_OWNER_CONSOLE` nor
+    /// `KERNEL_OWNER_DESKTOP`. It has to satisfy `is_kernel_owner` (that is the arm under test) and
+    /// it must not collide with a real furniture row, because the teardown sweep below reaps by
+    /// owner and a sweep on the console's ASID would reap the operator's own surface.
+    const ASID_F: u64 = KERNEL_OWNER_BASE + 0x40;
+    /// One source pixel under the floor: `bw = UNDER_W + 2*BORDER = CLUSTER_MIN_BOX_W - 1`.
+    const UNDER_W: usize = CLUSTER_MIN_SRC_W - 1;
+    /// Exactly the floor: `bw = CLUSTER_MIN_BOX_W`.
+    const AT_W: usize = CLUSTER_MIN_SRC_W;
+    // The fixture surface must be able to SUPPLY both widths, or the rows would be re-pinned to a
+    // width their own surface does not cover.
+    const _: () = assert!(AT_W <= FIX_W && UNDER_W >= 1);
+    const _: () = assert!(is_kernel_owner(ASID_F));
+    const _: () = assert!(ASID_F != KERNEL_OWNER_CONSOLE && ASID_F != KERNEL_OWNER_DESKTOP);
+
+    let s = &raw const HT_SURF as usize;
+    let len = core::mem::size_of_val(&HT_SURF);
+    let wn = create(ASID_N, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"cd-n");
+    let ww = create(ASID_W, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"cd-w");
+    let wf = create(ASID_F, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"cd-f");
+    if wn == WIN_NONE || ww == WIN_NONE || wf == WIN_NONE {
+        serial_println!(
+            ":: WMCTRL: controls-declined — SKIP (window table full: n={} w={} f={}) ::",
+            wn, ww, wf
+        );
+        close(wn);
+        close(ww);
+        close(wf);
+        for a in [ASID_N, ASID_W, ASID_F] {
+            close_owner(a);
+        }
+        return;
+    }
+
+    // Pin all three at scale 1 and at the width their leg is about. `pinned` also takes them out of
+    // the tiler, so the `create` of the next row cannot re-place — and re-scale — the ones already
+    // down. Damage is re-armed so a composite still has something to paint them for.
+    {
+        let mut t = table();
+        for (id, w) in [(wn, UNDER_W), (ww, AT_W), (wf, UNDER_W)] {
+            if let Some(r) = row_mut(&mut t, id) {
+                r.w = w;
+                r.scale = 1;
+                r.pinned = true;
+                r.damage_all();
+            }
+        }
+    }
+
+    // Flush anything the three `create`s armed (at `FIX_W` they clear the floor, so nothing should
+    // be pending — but the baseline is taken AFTER a drain either way, so the legs below measure
+    // their own emissions and not the boot's history).
+    controls_declined_drain();
+    let base = CTRL_DECL_SPOKE_N.load(Ordering::Relaxed);
+    let spoken = || CTRL_DECL_SPOKE_N.load(Ordering::Relaxed).wrapping_sub(base);
+
+    // Leg 1 — the narrow row declines.
+    let under_none = control_disc_rect(wn, Ctrl::Close).is_none();
+    // Leg 2 — and it said so, exactly once.
+    controls_declined_drain();
+    let fired = spoken();
+    // Leg 3 — the rate limit: four more looks, and the wire stays quiet.
+    for _ in 0..4 {
+        let _ = control_disc_rect(wn, Ctrl::Close);
+        controls_declined_drain();
+    }
+    let after_rl = spoken();
+    // Leg 4 — the row AT the floor keeps its cluster.
+    let at_some = control_disc_rect(ww, Ctrl::Close).is_some();
+    // Leg 5 — furniture: no cluster, and no line.
+    let furn_none = control_disc_rect(wf, Ctrl::Close).is_none();
+    controls_declined_drain();
+    let after_all = spoken();
+
+    let ok = under_none
+        && fired == 1
+        && after_rl == 1
+        && at_some
+        && furn_none
+        && after_all == 1;
+    serial_println!(
+        ":: WMCTRL: controls-declined — floor={} under bw={} none={} fired={} rl={} atfloor bw={} some={} furniture none={} silent={} :: {} ::",
+        CLUSTER_MIN_BOX_W,
+        UNDER_W + 2 * BORDER,
+        under_none,
+        fired,
+        after_rl,
+        AT_W + 2 * BORDER,
+        at_some,
+        furn_none,
+        after_all == 1,
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    close(wn);
+    close(ww);
+    close(wf);
+    // The teardown witness guard `hittest_selftest` established: no synthetic row may outlive the
+    // battery, and a leak may not be silent.
+    let mut leaked = 0usize;
+    for a in [ASID_N, ASID_W, ASID_F] {
+        leaked += close_owner(a);
+    }
+    if leaked > 0 {
+        serial_println!(
+            ":: WMCTRL: controls-declined teardown LEAK — {} synthetic row(s) reaped :: FAIL ::",
+            leaked
+        );
+    }
+    repaint();
 }
