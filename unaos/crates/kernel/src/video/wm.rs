@@ -408,6 +408,11 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
 /// Standing rule for future arcs: **no `TABLE` critical section may call anything that can block,
 /// print, or allocate.** True today; this guard makes it load-bearing.
 struct TableGuard {
+    // R0 / rtwit — TABLE max-hold. Declared FIRST so it drops FIRST, just BEFORE `inner` releases
+    // the lock: it therefore times the acquire→release critical section. It measures only (a
+    // `now_cycles()` read + `fetch_max` at drop); a zero-sized no-op when `rtwit` is off. It does
+    // NOT change the inner/_irq order the comment below is load-bearing about.
+    _hold: crate::rtwit::HoldTimer,
     // DECLARATION ORDER IS THE FIX. Rust drops struct fields in declaration order, so the lock
     // guard is released FIRST and the IRQ mask is restored SECOND. The reverse would unmask while
     // still holding TABLE, re-opening a preemption window in the hold's tail — which is precisely
@@ -439,7 +444,9 @@ fn table() -> TableGuard {
     // preemptible, and a holder preempted between our acquire and our mask is the same wedge.
     let _irq = crate::arch::IrqMask::new();
     let inner = TABLE.lock();
-    TableGuard { inner, _irq }
+    // R0 / rtwit — start the TABLE hold timer the instant the lock is held (see `TableGuard`).
+    let _hold = crate::rtwit::hold(crate::rtwit::Lock::Table);
+    TableGuard { _hold, inner, _irq }
 }
 
 /// FOCUS-VIS — **the SHELL's position in the z-order.** The desktop/console is a member of the stack the
@@ -12740,6 +12747,9 @@ fn stage_window(
         Some(g) => g,
         None => decline!(super::wcg::DECL_LOCK),
     };
+    // R0 / rtwit — STAGE max-hold. Declared after the guard so it drops first, timing the
+    // acquire→release span (the stage fill/flush). No-op inline shim when `rtwit` is off.
+    let _sh = crate::rtwit::hold(crate::rtwit::Lock::Stage);
     if stage.len() < need {
         let add = need - stage.len();
         // `try_reserve` + `resize`: an exhausted heap returns here instead of panicking from present
@@ -13113,6 +13123,8 @@ fn stage_fill(
         Some(g) => g,
         None => defer!(DEFER_LOCK),
     };
+    // R0 / rtwit — STAGE max-hold (see the `stage_window` site). No-op inline shim when `rtwit` off.
+    let _sh = crate::rtwit::hold(crate::rtwit::Lock::Stage);
     if stage.len() < row_bytes {
         let add = row_bytes - stage.len();
         // Same `try_reserve` + `resize` contract as `stage_window`: an exhausted heap declines here

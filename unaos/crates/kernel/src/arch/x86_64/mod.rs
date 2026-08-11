@@ -161,7 +161,15 @@ pub fn hw_wait_budget() -> u64 {
 /// to "still masked" rather than unconditionally re-enabling. Needed because `video/wm.rs` compiles
 /// on both arches and must hold the mask exactly as long as a lock guard whose scope the caller
 /// owns (see `video::wm::table`).
-pub struct IrqMask(bool);
+pub struct IrqMask {
+    /// Whether interrupts were enabled at `new()` — i.e. whether this guard owns the OUTERMOST
+    /// transition and must re-enable (and, under `rtwit`, time) on drop.
+    was_enabled: bool,
+    /// R0 / rtwit — TSC at the enabled→disabled transition, for the interrupt-mask span. Only present
+    /// when the ruler is armed; the struct is otherwise byte-identical to the old `IrqMask(bool)`.
+    #[cfg(feature = "rtwit")]
+    t0: u64,
+}
 
 /// WEDGE-8 (F3): true when interrupts are masked on this core (`RFLAGS.IF` clear). Twin of the
 /// aarch64 `irqs_masked`; the block layer uses it to refuse a masked wait on the xHCI loan.
@@ -175,7 +183,13 @@ impl IrqMask {
     pub fn new() -> Self {
         let was_enabled = x86_64::instructions::interrupts::are_enabled();
         x86_64::instructions::interrupts::disable();
-        IrqMask(was_enabled)
+        IrqMask {
+            was_enabled,
+            // R0 / rtwit — stamp the transition only when WE are the outermost mask (interrupts were
+            // enabled); a nested mask reads `was_enabled == false` and its span is not timed.
+            #[cfg(feature = "rtwit")]
+            t0: now_cycles(),
+        }
     }
 }
 
@@ -189,7 +203,11 @@ impl Default for IrqMask {
 impl Drop for IrqMask {
     #[inline]
     fn drop(&mut self) {
-        if self.0 {
+        if self.was_enabled {
+            // R0 / rtwit — fold the outermost mask span before re-enabling. Only the guard that
+            // masked from an enabled state times anything; nested guards restore to "still masked".
+            #[cfg(feature = "rtwit")]
+            crate::rtwit::note_mask_span(now_cycles().wrapping_sub(self.t0));
             x86_64::instructions::interrupts::enable();
         }
     }
@@ -199,5 +217,19 @@ pub fn without_interrupts<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    x86_64::instructions::interrupts::without_interrupts(f)
+    // R0 / rtwit — MAX interrupt-mask span. Rather than reimplement mask/run/restore (which would
+    // drop the crate's UNWIND-SAFE restore — a panic in `f` must not leave IF masked), the timed
+    // path reuses `IrqMask`: its `new()` masks and stamps the outermost transition, its `Drop`
+    // re-enables AND folds the span, and both happen via RAII so an unwinding `f` still restores and
+    // still times. Nesting-aware for free (a nested `IrqMask` finds IF already clear and times
+    // nothing). The knob-off path is the plain crate delegation, so a shipped boot is byte-identical.
+    #[cfg(feature = "rtwit")]
+    {
+        let _timed = IrqMask::new();
+        f()
+    }
+    #[cfg(not(feature = "rtwit"))]
+    {
+        x86_64::instructions::interrupts::without_interrupts(f)
+    }
 }

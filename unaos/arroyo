@@ -457,6 +457,13 @@ _feats=""
 # Needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach the activation seam.
 # Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_WC:-}" ] && _feats="${_feats}wc,"
+# R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
+# (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only, never a mean; pure
+# measurement, changes no scheduling/locking/present behaviour. x86_64-only in effect (the real impl is
+# `target_arch = "x86_64"`-gated; aarch64 gets the inline shim). DEFAULT OFF => every hook is an empty
+# inline shim and a zero-sized HoldTimer, so the boot is byte-inert on the hot path. Emits one `[rtwit]`
+# rollup line per ~5 s from the x86 render-service witness gate. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_RTWIT:-}" ] && _feats="${_feats}rtwit,"
 # VSYNC-PACE r3: UNAOS_VSYNCPACE=1 ARMS the kernel-side present pacer (`vsyncpace`). ⚠ THE POLARITY IS
 # INVERTED from GR22's `UNAOS_NOPACE` — the pacer is now DEFAULT OFF. Unset (the shipped configuration),
 # `SYS_WIN_PRESENT`/`SYS_WIN_PRESENT_ROWS` return as soon as the composite is done and a ring-3 program

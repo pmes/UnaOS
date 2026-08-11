@@ -1049,12 +1049,23 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint) -> bool {
             EVQ_DROP_KEY.fetch_add(1, Relaxed);
         }
     }
+    // R0 / rtwit — input→present proxy: stamp the arrival of this input at the enqueue funnel. Only
+    // the FIRST input since the last composite claims the pending slot, so `in2present` reports the
+    // age of the OLDEST un-presented input. A no-op inline shim when `rtwit` is off. This is the
+    // single enqueue chokepoint (`push_event` and `push_pointer_report` both land here).
+    if stored {
+        crate::rtwit::note_input_enqueued();
+    }
     stored
 }
 
 pub fn push_event(event: Event) {
     crate::arch::without_interrupts(|| {
         let mut q = EVENT_QUEUE.lock();
+        // R0 / rtwit — EVENT_QUEUE max-hold. Declared AFTER the guard so it drops FIRST (just before
+        // release), timing the acquire→release critical section (the push plus the DRAGGLIDE reorder
+        // under `push_locked`). No-op inline shim when `rtwit` is off; no change to lock semantics.
+        let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
         push_locked(&mut q, event, LiftHint::Unknown);
     });
 }
@@ -1086,10 +1097,14 @@ pub fn push_pointer_report(motion: Option<Event>, button: Option<Event>) {
         (Some(m), None) => push_event(m),
         (None, Some(b)) => crate::arch::without_interrupts(|| {
             let mut q = EVENT_QUEUE.lock();
+            // R0 / rtwit — EVENT_QUEUE max-hold (see `push_event`).
+            let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
             push_locked(&mut q, b, LiftHint::NoLift);
         }),
         (Some(m), Some(b)) => crate::arch::without_interrupts(|| {
             let mut q = EVENT_QUEUE.lock();
+            // R0 / rtwit — EVENT_QUEUE max-hold (see `push_event`).
+            let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
             // A lift the ring DROPPED is not behind the edge, so the pairing claim dies with it.
             let hint = if push_locked(&mut q, m, LiftHint::Unknown) {
                 LiftHint::Paired
@@ -1611,7 +1626,12 @@ pub fn typematic_test_force_lapse() {
 pub const TYPEMATIC_IDLE_RUN_TO_LATCH: u32 = typematic::IDLE_RUN_TO_LATCH;
 
 fn pop_event() -> Option<Event> {
-    let ev = crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop());
+    let ev = crate::arch::without_interrupts(|| {
+        let mut q = EVENT_QUEUE.lock();
+        // R0 / rtwit — EVENT_QUEUE max-hold on the DRAIN side (see `push_event`).
+        let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
+        q.pop()
+    });
     if ev.is_some() {
         // UVUG-10: total consumption, across EVERY consumer — the router drain, the user focus-change
         // discard, `pump_and_poll`. `push - drop - pop` is the live ring occupancy; a `pop` count far
