@@ -9123,6 +9123,191 @@ static DO_BURIED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// the arc convicted and the one no existing counter could see. See the ledger in [`stage_fill`].
 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
 static DO_FILL_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WCK4 — the dragged window's box as the DRAIN sees it, published by [`erase_clip`] from the same
+/// table read that builds the erase clip.
+///
+/// ### The instrument fix, and the Boot A reading that forced it
+///
+/// `fill_px` was charged against [`DO_BOX`], which `dragocc_pass` publishes from the pass's table
+/// snapshot — taken AFTER the drain, so at drain time it holds the box from the PREVIOUS pass. The
+/// original ledger called that "one pass stale, and in the harmless direction". It is not harmless
+/// and it is not a handful of pixels: the previous pass's box is the drag's OLD box, the boxes the
+/// drain is publishing are `old \ new`, and `old \ new ⊂ old`. So the term charged the whole of the
+/// gesture's legitimate vacate.
+///
+/// Boot A says so to the pixel. **ELEVEN of its SIXTEEN gestures** print `fill_px` EQUAL to
+/// `[drag]`'s `erase_px` — 2 335 246, 772 709, 1 890 693, 965 164, 2 403 378, 382 886, 96 256,
+/// 1 794 963, 1 825 911, 1 540 193, 1 763 837 — and it is **never higher** in any of the sixteen.
+/// The five that are not equal are all strictly LOWER, and every one of them is accounted for:
+///
+/// * **two `moves=1` gestures** (t=28 267 ms and t=28 270 ms) read `fill_px=0` against
+///   `erase_px=32 976`. A single-motion gesture has exactly one drain, and `drag_report` retires
+///   `DO_BOX` at the previous gesture's end, so that one drain is charged against a cleared box.
+/// * **three multi-motion gestures** — 1 680 019 / 1 684 891, 239 290 / 288 204, 558 130 / 588 576 —
+///   short by 0.3%, 17% and 5%. Same mechanism, one drain's worth each: the gesture's OPENING drain
+///   runs before any pass has re-published `DO_BOX`.
+///
+/// (The first cut of this ledger said "nine of fourteen". It was counted by eye off a `head -20` of
+/// the capture, and both numbers were wrong; the arithmetic above is `awk` over all sixteen pairs.
+/// The conviction is stronger than the miscount claimed, not weaker.)
+///
+/// `fill_px` was a restatement of `erase_px`: a FORBID on the erase erasing.
+///
+/// Read against the LIVE box the term means what its name always claimed — desktop colour published
+/// inside coverage the window still holds — and the vacated slivers, which are disjoint from the new
+/// box by [`subtract_box`]'s partition property, fall out of it arithmetically rather than by
+/// exception. Independence is unchanged in kind: this is a BOX read from the table and tested
+/// against the bytes a `blit` published, while the clip is a sorted interval set walked per row —
+/// exactly the relationship `occ_px` has to [`occ_clip`], which is likewise built from the snapshot
+/// `dragocc_pass` reads.
+///
+/// ### REVIEW (D6) — "the same table read" is a claim about ONE core, and the four words are atomic
+/// SEPARATELY
+///
+/// [`erase_clip`] reads the table once and publishes both the clip and this box from that read, so on
+/// the core that built them they describe one instant. They are not a transaction. A concurrent
+/// core's drain can store its own answer between any two of the four `Relaxed` stores, and
+/// [`stage_fill`] can therefore load a box whose `x` came from one drain and whose `w` came from
+/// another — a TORN box, naming a rectangle neither core ever saw.
+///
+/// Inherited verbatim from [`DO_BOX`], which has the same four-atomic shape and the same argument:
+/// the terms are per-gesture totals about a window that is moving anyway, and a torn read of a box
+/// that differs from both of its parents by a drag step cannot manufacture pixels nobody wrote. What
+/// changes with WCK4 is only that the window of disagreement shrank from ONE WHOLE PASS (the
+/// staleness this static removes, worth `erase_px` per gesture) to the interleave between two drains
+/// on two cores. Strictly better, and stated rather than upgraded to a coherency claim it does not
+/// make.
+///
+/// ### REVIEW (D9) — the residue the drain/snapshot ordering leaves, and why it heals
+///
+/// `drain_deferred` runs at the HEAD of `composite_inner`, so the clip is built from the table as it
+/// stands BEFORE this pass's snapshot. A `move_to` landing on another core between the two makes the
+/// clip one motion old: the erase is then withheld from the window's PREVIOUS box and published into
+/// the sliver it has just vacated — which is the right answer for the sliver and a one-pass-late
+/// withholding for the leading edge, i.e. a few rows of desktop that this pass declines to paint and
+/// the window covers anyway when it blits at its new origin later in the same pass.
+///
+/// It heals within the pass and cannot accumulate: the window is drawn AFTER the drain in every
+/// pass, from the pass's own snapshot, so whatever the clip got wrong the blit gets right a few
+/// microseconds later. The failure mode a stale clip cannot produce is the one the arc is about —
+/// publishing desktop over pixels the pass will NOT repaint — because a box that left the clip did so
+/// by moving, and a window that moved is a window this pass repaints.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_FILL_BOX: [core::sync::atomic::AtomicUsize; 4] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
+/// WCK4 — `DESKTOP_BG` pixels the drain's fills actually PUT ON THE PANEL during this gesture.
+///
+/// The population every other fill term is a fraction of, and the answer to "is `fill_px=0` a clean
+/// drag or a drain that never ran". A gesture with `fillpub_px=0` has published no desktop at all and
+/// its zeros assert nothing.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_FILL_PUB_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WCK4 — pixels the erase clip WITHHELD from publication during this gesture. The mechanism's own
+/// denominator, `clip_px`'s opposite number: a gesture over a panel full of windows whose
+/// `fillclip_px` is 0 has a clip that never ran, and its `fill_px=0` proves nothing.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_FILL_CLIP_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WCK4 — THE PANEL-WIDE VERDICT TERM: published desktop pixels that landed inside SOME box of the
+/// erase clip, whichever it was.
+///
+/// `fill_px` watches the dragged window only, and the symptom Peter reports is about the DOCK. This
+/// term is asked of every published pixel against the whole clip, by a point-in-box walk over the
+/// same boxes ([`OccClip::covers`]) rather than by the span arithmetic that chose the run — so a
+/// mis-sorted `prepare`, an off-by-one in [`OccRows::spans`], or a row filter that admitted the wrong
+/// scanline all read nonzero here. What it cannot audit, stated rather than left to be assumed, is
+/// the clip's POPULATION: a box that never entered the set is a box this term does not know about.
+/// `clipn=`, `dock=` and `fillclip_dock_px=` cover that side — see [`DO_CLIP_N`].
+///
+/// ### REVIEW (D8) — this term is O(k) per published span, and it is inside the clock
+///
+/// [`OccClip::covered_len`] walks all `k` boxes for every span, and a row can carry up to `k + 1`
+/// spans, so the audit is O(k²) per row against a blit loop that is O(k) — on a full-panel erase with
+/// a full window table that is ~13 x 13 x 1200 interval tests. It sits INSIDE `stage_fill`'s
+/// `t1..t_end` bracket, so it inflates `[wc-k] present_us=` and therefore the `torn` comparison
+/// against `rectscan_us` on witness builds. Accepted, and named rather than discovered: the witness
+/// build is not the performance artifact (`[wc-k]`'s cost claims are read from it knowingly, as WC-M
+/// already notes for the banded present), and moving the audit outside the bracket would mean
+/// measuring pixels the bracket did not cover. A tear reported by a witness build is a lead, not a
+/// number.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_FILL_OVER_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WCK4 REVIEW (D1) — **how many boxes the last drain's clip actually held.**
+///
+/// The headline gap the review found: every fill term above is a FORBID measured *against the clip*,
+/// so a clip that is EMPTY makes all of them trivially zero and the gesture reads `CLEAN` while the
+/// panel is being erased. `fillclip_px` catches the empty clip only when something happened to
+/// overlap; nothing on the wire said what the clip CONTAINED.
+///
+/// A snapshot of the most recent drain, not a per-gesture sum: the question a reader asks is "was
+/// there a clip at all, and did it have about the right number of boxes", and a running total over
+/// drains would answer neither. `0` on a gesture with `fillpub_px > 0` is the loud case — desktop
+/// published with nothing on the glass to withhold it from.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_CLIP_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// WCK4 REVIEW (D1) — **the dock strip as the last drain's clip held it**: `x`, `y`, `w`, `h`, with
+/// `w == 0` meaning the strip was not in the clip at all.
+///
+/// The dock is the reported symptom and the one clip member that is not a window, so it is the one
+/// member whose absence is silent: `dock::Layout::for_panel` returns `None` for a panel too narrow or
+/// too short, [`dock_scan`] can answer a tile count of zero, and either way the strip simply never
+/// enters the set. `fillover_px` would still read 0 — it can only see boxes that ARE in the clip —
+/// and the strip would be erased on every drag exactly as it was before this arc.
+///
+/// So the geometry goes on the wire, as `dock=WxH+X+Y` or `dock=absent`. A reader comparing it
+/// against `[dock]`'s own painted rect can see the two agree; a `dock=absent` beside a live strip is
+/// the defect, stated, in the one place a capture can catch it.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_DOCK_BOX: [core::sync::atomic::AtomicUsize; 4] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
+/// WCK4 REVIEW (D1) — pixels withheld **specifically because of the dock strip** during this gesture.
+///
+/// `dock=` says the strip was in the clip; this says the clip USED it. Computed from the real spans
+/// rather than from box arithmetic: per row, the strip's columns inside the fill, MINUS the strip's
+/// columns the row actually published. A healthy drain publishes none of them, so the term is the
+/// intersection area — but it is derived by subtraction from what reached the panel, so a span walk
+/// that leaked into the strip lowers this term at the same time as it raises `fillover_px`, and the
+/// two cannot both look healthy while the strip is being erased.
+///
+/// Zero is legitimate and common (no fill met the strip this gesture). It is a denominator, not a
+/// FORBID: read it WITH `dock=` — `dock=absent` is the finding, `dock=<box> fillclip_dock_px=0` just
+/// means the drag stayed away from the foot of the panel.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_FILL_CLIP_DOCK_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WCK4 REVIEW (D2) — **`blit` calls the drain's fills actually made** during this gesture.
+///
+/// `[wc-k] runs=` prints the fill's row count, which was the call count until this arc and is now a
+/// lower bound on x86 and still exact on aarch64. Correcting that line means `video/wcg.rs`, outside
+/// this arc's lane, so the true number is carried here — see the D2 ledger at the `erase_note` call
+/// in [`stage_fill`]. A gesture whose `fillruns` exceeds its row count had fragmented fills, which is
+/// the clip working; equality means every published row was whole.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_FILL_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCK4 — publish the dragged window's CURRENT box for the fills this drain is about to make.
+///
+/// Called from [`erase_clip`] with the rows it just read, so the box and the clip describe the same
+/// instant. `w == 0` (no drag, or its row has gone) leaves every fill uncharged, exactly as
+/// [`dragocc_target`]'s zero does.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dragfill_box(rows: &[Window; MAX_WINDOWS]) {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    let id = DRAG_WIN.load(Acquire);
+    let found = if id == WIN_NONE {
+        None
+    } else {
+        rows.iter().find(|r| r.used && r.id == id)
+    };
+    match found {
+        Some(r) => {
+            let b = outer_box(r);
+            DO_FILL_BOX[0].store(b.0, Relaxed);
+            DO_FILL_BOX[1].store(b.1, Relaxed);
+            DO_FILL_BOX[2].store(b.2, Relaxed);
+            DO_FILL_BOX[3].store(b.3, Relaxed);
+        }
+        None => DO_FILL_BOX[2].store(0, Relaxed),
+    }
+}
 
 /// WC-K3 — publish the dragged window's geometry for the pass that is about to blit.
 ///
@@ -9302,6 +9487,16 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
         let direct = DO_DIRECT.swap(0, Relaxed);
         let buried = DO_BURIED.swap(0, Relaxed);
         let fpx = DO_FILL_PX.swap(0, Relaxed);
+        let fpub = DO_FILL_PUB_PX.swap(0, Relaxed);
+        let fclip = DO_FILL_CLIP_PX.swap(0, Relaxed);
+        let fovr = DO_FILL_OVER_PX.swap(0, Relaxed);
+        let fruns = DO_FILL_RUNS.swap(0, Relaxed);
+        let fdock = DO_FILL_CLIP_DOCK_PX.swap(0, Relaxed);
+        // REVIEW (D1) — the clip's SHAPE, not a total: `load`, not `swap`, because these describe the
+        // most recent drain rather than the gesture, and clearing them would make the next gesture's
+        // opening report say the clip was empty when it was merely not rebuilt yet.
+        let clipn = DO_CLIP_N.load(Relaxed);
+        let dockw = DO_DOCK_BOX[2].load(Relaxed);
         // REVIEW (NIT 6) — RETIRE THE BOX WITH THE GESTURE. `dragocc_pass` only zeroes `DO_BOX` when a
         // pass actually RUNS with no drag live, and between two gestures there may be none — so every
         // present in the gap kept charging the finished drag's geometry, and the next gesture's report
@@ -9309,28 +9504,64 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
         // both ends of a gesture (`drag_end`, `drag_cancel`, and `drag_forget`/`drag_forget_owner`
         // through the latter) pass through, immediately after the terms it feeds have been swapped out.
         DO_BOX[2].store(0, Relaxed);
+        // WCK4 — and retire the DRAIN's box on the same argument `DO_BOX` is retired on: between two
+        // gestures no drain need run at all, so a box left standing would charge the next gesture's
+        // opening fills against geometry that belonged to the last one.
+        DO_FILL_BOX[2].store(0, Relaxed);
         // `occ_px` is a window publishing over its occluder; `fill_px` is the coalesced desktop erase
         // doing the same thing (review SHOULD-FIX 3), and it is in the verdict because it is the
         // mechanism the arc convicted — a gesture that flashed desktop colour across the console must
         // not read CLEAN. `direct` is the population the clip cannot reach, and a nonzero one is an
-        // unclipped publish whether or not this gesture happened to catch its pixels. All three are
-        // FORBIDs. `clip_px` and `buried` are deliberately NOT in the verdict: they are the
-        // mechanism's denominators, and a gesture over empty desktop legitimately has neither.
-        let clean = opx == 0 && fpx == 0 && direct == 0;
-        serial_println!(
-            "[drag-occ] win={} owner={:#x} moves={} neigh={} neigh_px={} occ_px={} fill_px={} clip_px={} buried={} direct={} -> {}",
-            id,
-            owner,
-            moves,
-            mask.count_ones(),
-            npx,
-            opx,
-            fpx,
-            cpx,
-            buried,
-            direct,
-            if clean { "CLEAN" } else { "BLEED" }
-        );
+        // unclipped publish whether or not this gesture happened to catch its pixels.
+        //
+        // WCK4 adds `fillover_px`, the FOURTH FORBID and the only one that can reach the dock at all:
+        // `fill_px` tests the dragged window's box, the dock is not a window, so a union that erased
+        // the strip read CLEAN on every one of Boot A's gestures that did not also reach under the
+        // drag. Note also that `fill_px` now means something narrower and truer than it did on Boot A
+        // — see [`DO_FILL_BOX`] for why the old reading was `erase_px` under another name, and for
+        // the eleven of sixteen gestures in which the two were equal to the pixel.
+        //
+        // REVIEW (D5) — AND `fillover_px` IS NOT "THE TERM THAT SEES THE SYMPTOM", which is what the
+        // first cut of this comment claimed. It audits the SPAN WALK: it asks whether a published
+        // pixel landed inside a box the clip HOLDS. It says nothing about whether the right boxes are
+        // in the clip, and the strip is precisely the member that can silently fail to be — so
+        // `fillover_px=0` on a gesture whose clip never held the dock is a pass by vacancy. That is
+        // what `clipn=` and `dock=` are for, and why they are read `load`-not-`swap` below. The true
+        // statement of what this term does and does not audit is in [`DO_FILL_OVER_PX`]; this one is
+        // the corrected restatement of it.
+        //
+        // `clip_px`, `buried`, `fillclip_px`, `fillpub_px`, `fillruns`, `fillclip_dock_px`, `clipn`
+        // and `dock` are deliberately NOT in the verdict: they are the mechanism's denominators and
+        // its shape. A gesture over empty desktop legitimately has no `fillclip_px`, a gesture whose
+        // queue never drained legitimately has no `fillpub_px`, and a drag that stayed away from the
+        // foot of the panel legitimately has no `fillclip_dock_px` — but a reader who sees them zero
+        // knows the FORBIDs above assert nothing, which is the whole reason they are on the wire.
+        // `clipn=0` or `dock=absent` beside a nonzero `fillpub_px` is the loud pair.
+        let clean = opx == 0 && fpx == 0 && direct == 0 && fovr == 0;
+        // `dock=` is `WxH+X+Y` (the X11 geometry spelling, so a reader parses it without a legend) or
+        // the literal `absent`. Formatted through two arms rather than a sentinel, because `0x0+0+0`
+        // is a rectangle and `absent` is the absence of one, and this arc exists because those two
+        // were indistinguishable.
+        if dockw == 0 {
+            serial_println!(
+                "[drag-occ] win={} owner={:#x} moves={} neigh={} neigh_px={} occ_px={} fill_px={} clip_px={} buried={} direct={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock=absent fillclip_dock_px={} -> {}",
+                id, owner, moves, mask.count_ones(), npx, opx, fpx, cpx, buried, direct,
+                fpub, fclip, fovr, fruns, clipn, fdock,
+                if clean { "CLEAN" } else { "BLEED" }
+            );
+        } else {
+            serial_println!(
+                "[drag-occ] win={} owner={:#x} moves={} neigh={} neigh_px={} occ_px={} fill_px={} clip_px={} buried={} direct={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock={}x{}+{}+{} fillclip_dock_px={} -> {}",
+                id, owner, moves, mask.count_ones(), npx, opx, fpx, cpx, buried, direct,
+                fpub, fclip, fovr, fruns, clipn,
+                dockw,
+                DO_DOCK_BOX[3].load(Relaxed),
+                DO_DOCK_BOX[0].load(Relaxed),
+                DO_DOCK_BOX[1].load(Relaxed),
+                fdock,
+                if clean { "CLEAN" } else { "BLEED" }
+            );
+        }
     }
 }
 /// WMDIRECT — `[wm-act]` lines emitted, against [`WM_ACT_LOG_MAX`]. The begin/end/close lines are
@@ -9617,9 +9848,19 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 // hold a box. It is passed by REFERENCE for that reason (392 bytes copied per blit, twice, on an
 // arch that provably has nothing to say), and what the arch gate buys is that no aarch64 pixel
 // changes — not that no aarch64 instruction does.
+/// WCK4 — how many boxes a clip can hold: every window, plus the dock strip.
+///
+/// [`occ_clip`] can never fill more than `MAX_WINDOWS` (it is built from the window table and
+/// excludes the subject), so this is one box of headroom for that caller and an exact fit for
+/// [`erase_clip`], whose set is *every* on-glass window AND the dock — furniture that is not a
+/// window and therefore has no row to be found in. Sizing this at `MAX_WINDOWS` and dropping the
+/// overflow would have been a silent hole in exactly the direction the arc is closing: the box that
+/// did not fit is the box that gets published over.
+const OCC_MAX: usize = MAX_WINDOWS + 1;
+
 #[derive(Clone, Copy)]
 struct OccClip {
-    boxes: [(usize, usize, usize, usize); MAX_WINDOWS],
+    boxes: [(usize, usize, usize, usize); OCC_MAX],
     n: usize,
 }
 
@@ -9637,7 +9878,7 @@ struct OccClip {
 /// so the ORDER is precomputed while the row-dependent part stays exact.
 struct OccRows {
     /// `(x0, x1, y0, y1)` — half-open on both axes, clipped to the present's column range.
-    iv: [(usize, usize, usize, usize); MAX_WINDOWS],
+    iv: [(usize, usize, usize, usize); OCC_MAX],
     n: usize,
 }
 
@@ -9645,9 +9886,54 @@ impl OccClip {
     /// Nothing above: the topmost window's clip, and every window's clip on aarch64.
     const fn none() -> Self {
         Self {
-            boxes: [(0, 0, 0, 0); MAX_WINDOWS],
+            boxes: [(0, 0, 0, 0); OCC_MAX],
             n: 0,
         }
+    }
+
+    /// WCK4 — add `b` if it is non-degenerate and there is room. Returns `false` when the box was
+    /// DROPPED for want of capacity, which [`erase_clip`] reports rather than swallows: a dropped
+    /// occluder is a region the erase will publish over.
+    ///
+    /// x86 only, with its sole caller's populated arm: on aarch64 [`erase_clip`] returns
+    /// [`OccClip::none`] and there is nothing to add to it.
+    #[cfg(target_arch = "x86_64")]
+    fn push(&mut self, b: (usize, usize, usize, usize)) -> bool {
+        if b.2 == 0 || b.3 == 0 {
+            return true;
+        }
+        if self.n >= OCC_MAX {
+            return false;
+        }
+        self.boxes[self.n] = b;
+        self.n += 1;
+        true
+    }
+
+    /// WCK4 — how much of the panel-row run `[x0, x1)` at row `y` this clip COVERS. The
+    /// published-pixel audit's kernel: it is asked of the bytes a `blit` has already put on the
+    /// panel, and it must answer 0. See `fillover_px` in [`stage_fill`].
+    ///
+    /// Deliberately over-counts where two occluders overlap each other — the term is a FORBID, so
+    /// "nonzero iff some published pixel was covered" is the whole of what it must be, and a
+    /// double-counted pixel cannot turn a clean drag into a dirty one. Independence: it walks
+    /// `self.boxes` directly, so it shares no arithmetic with [`OccClip::prepare`] or
+    /// [`OccRows::spans`] — neither the sort, nor the column pre-clip, nor the gap cursor — which is
+    /// what lets it catch a bug in any of them.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    fn covered_len(&self, y: usize, x0: usize, x1: usize) -> u64 {
+        let mut n = 0u64;
+        for &(ox, oy, ow, oh) in self.boxes[..self.n].iter() {
+            if ow == 0 || oh == 0 || y < oy || y >= oy.saturating_add(oh) {
+                continue;
+            }
+            let a = x0.max(ox);
+            let b = x1.min(ox.saturating_add(ow));
+            if b > a {
+                n += (b - a) as u64;
+            }
+        }
+        n
     }
 
     /// Is `b` contained OUTRIGHT in one occluder box? The whole-window skip's test, kept to a single
@@ -9671,7 +9957,7 @@ impl OccClip {
     /// is about to copy a box — not once per row, which is what SHOULD-FIX 4 convicted.
     fn prepare(&self, x0: usize, x1: usize) -> OccRows {
         let mut o = OccRows {
-            iv: [(0, 0, 0, 0); MAX_WINDOWS],
+            iv: [(0, 0, 0, 0); OCC_MAX],
             n: 0,
         };
         for &(ox, oy, ow, oh) in self.boxes[..self.n].iter() {
@@ -9701,7 +9987,7 @@ impl OccRows {
     /// disjoint. Returns how many were written to `out`.
     ///
     /// At most `n` covered intervals produce at most `n + 1` gaps, which is why `out` is sized
-    /// `MAX_WINDOWS + 1`. `out` is the CALLER's buffer, hoisted out of its row loop: this function
+    /// `OCC_MAX + 1`. `out` is the CALLER's buffer, hoisted out of its row loop: this function
     /// allocates nothing and initialises nothing per row. One forward pass, no sort — [`prepare`]
     /// ordered the boxes by `x0`, so a box that starts left of the cursor can only extend it, and
     /// gaps fall out in order.
@@ -9712,7 +9998,7 @@ impl OccRows {
         y: usize,
         x0: usize,
         x1: usize,
-        out: &mut [(usize, usize); MAX_WINDOWS + 1],
+        out: &mut [(usize, usize); OCC_MAX + 1],
     ) -> usize {
         let mut n = 0usize;
         let mut cur = x0;
@@ -9796,6 +10082,142 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32) -> OccClip {
         }
     }
     c
+}
+
+// ---- WCK4: the erase's own clip ----------------------------------------------------------------
+//
+// **The defect (Peter, Boot A, attended): "dragging windows makes the taskbar disappear and
+// reappear".** WC-K3 gave the WINDOW blits an occlusion discipline and proved it worked — Boot A
+// reads `occ_px=0` on every one of its fourteen gestures, with `clip_px` up to 351 960 539 to show
+// the mechanism ran. It left the other publisher alone. `drain_deferred` takes the coalesced
+// `defer_erase` queue and paints `DESKTOP_BG` through [`stage_fill`], and a coalesced union is a
+// SYNTHESISED box that reaches wherever its members' bounding rectangle reaches: across the dock,
+// across other windows, across the console. Those pixels are published, and the furniture repaints a
+// pass later — which is the disappear/reappear exactly.
+//
+// **The erase is background, so EVERYTHING on the glass occludes it.** WC-K3's clip is a `(z, id)`
+// half-space because a window may legitimately paint over anything below it. `DESKTOP_BG` may not:
+// it is the bottom layer, and there is no on-glass pixel it is entitled to overwrite. So this clip
+// carries no `(z, id)` term at all — every live, on-glass box is in it.
+//
+// **And the WC-K3 review blocker applies IN REVERSE.** That blocker was "`above_shell` must be
+// TESTED, because a hidden row's box is not a pixel anybody will repaint". Here the same predicate
+// earns its place for the opposite reason: a row BELOW the shell has been hidden and its box erased
+// to desktop colour on purpose, and clipping the erase against it would leave the hidden window's
+// rectangle standing on the panel forever. `above_shell` is therefore the whole membership test, and
+// it is the compositor's own — not a second notion of visibility invented for the erase.
+//
+// **The vacated slivers still erase, and that is not an exception to the rule but an instance of
+// it.** A drag's `defer_erase` boxes are `old \ new`, disjoint from `new` by [`subtract_box`]'s
+// partition property. The dragged window's CURRENT box is in this clip; its old boxes are in no
+// table and are in nothing. So the slivers the gesture actually vacated meet no occluder and are
+// published in full — MOVE-VACATE is untouched — while the union's overreach into the live box is
+// withheld.
+//
+// **The dock is furniture, not a window, so it is added by hand.** `video::dock` owns a strip at the
+// foot of the panel that no row in [`TABLE`] describes; its only defence today is
+// `dock::compose`'s `clobbered` test, which asks whether a WINDOW that intersects the strip was
+// damaged. An erase that lands on the strip with no window near it therefore repaints NEVER, not one
+// pass later — the strip stays desktop-coloured until something else happens to it. The geometry is
+// taken from `dock::Layout::for_panel`, the dock's own single source of tile arithmetic, fed by
+// [`dock_scan`]'s tile count, so nothing here is a second copy of the strip's rectangle.
+//
+// **KNOWN GAP, deliberately left (review D3, a follow-up arc's).** This closes the ERASE path only.
+// [`occ_clip`] — the WINDOW blit path — has no dock term either, so a window whose blit crosses the
+// strip still publishes over it and the strip still repaints a pass later. That case is narrower
+// (`dock::compose`'s `clobbered` test is exactly "a window that meets my rect was damaged", so it
+// does heal, which is the flicker rather than the permanent hole this arc removes) and it is a
+// different predicate on a different path. Named here so the next reader of this ledger does not
+// mistake a residual strip flicker during a slow drag ACROSS the dock for a failure of the erase
+// clip: check `dock=` and `fillclip_dock_px=` first — if the strip was in the erase clip and pixels
+// were withheld there, the residual belongs to D3, not to this code.
+//
+// **x86 only**, on [`OccClip`]'s wire-boundary argument: aarch64 gets [`OccClip::none`], `occ.n` is
+// 0, and every fill takes the whole-row branch — the pre-arc loop, publishing the SAME PIXELS at the
+// same offsets from the same buffer.
+//
+// **"Same pixels", NOT "same bytes", and the review (D7) was right to hold this arc to the
+// correction WC-K3's own review already made.** `stage_fill` now takes a 416-byte `&OccClip` and
+// zero-initialises a 224-byte `OccRows` plus a 240-byte span buffer on EVERY fill, on every arch,
+// including the aarch64 fills that can never have a box to put in them. That is roughly 640 bytes of
+// stack initialisation per fill that did not exist before, and `prepare` is called unconditionally
+// (it returns immediately with `n == 0`, but it is called). What the arch gate buys is that no
+// aarch64 pixel changes — not that no aarch64 instruction does.
+/// WCK4 — the clip for the deferred desktop erase: every box on the glass, plus the dock strip.
+///
+/// `(pw, ph)` is the panel this pass is publishing to; the dock's layout is a function of it.
+/// Returns the clip and how many boxes had to be DROPPED for capacity — zero on any panel this
+/// kernel drives (`MAX_WINDOWS` rows plus one strip is exactly [`OCC_MAX`]), reported so that a
+/// future furniture layer cannot quietly cost the arc its guarantee.
+///
+/// One [`TABLE`] acquisition, released before the caller stages a byte; [`dock_scan`] takes a second
+/// one, sequentially and never nested, which is the same shape and the same lock order the composite
+/// tail already runs on every pass. Both happen ONCE per drain — not once per queued box — and only
+/// on a drain that has boxes to publish.
+#[allow(unused_variables)]
+fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
+    // Both `mut`s belong to the x86 arm below; on aarch64 this returns the empty clip and a zero
+    // count, which is [`OccClip`]'s arch boundary restated for the erase.
+    #[allow(unused_mut)]
+    let mut c = OccClip::none();
+    #[allow(unused_mut)]
+    let mut dropped = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let shell = shell_z();
+        let rows = {
+            let t = table();
+            t.rows
+        };
+        for r in rows.iter() {
+            // `compat` is EXCLUDED, matching `occ_clip`. A compat row is the full-screen present
+            // path: its box is the panel, so admitting it would suppress every desktop erase there
+            // is, on a path this arc has no evidence about and whose own present republishes the
+            // whole screen anyway. The status quo for compat is what ships.
+            if !r.used || r.compat || !above_shell(r, shell) {
+                continue;
+            }
+            if !c.push(outer_box(r)) {
+                dropped += 1;
+            }
+        }
+        // The dragged window's CURRENT box, for the witness — from THIS read of the table, so
+        // `fill_px` stops being charged for the sliver the gesture just vacated. See `DO_FILL_BOX`.
+        #[cfg(feature = "witness")]
+        dragfill_box(&rows);
+        #[cfg(feature = "wc")]
+        {
+            let mut tiles = [DockEntry::empty(); MAX_WINDOWS];
+            // A zero rect asks the damage question nothing; only the tile count is wanted here.
+            let (n, _) = dock_scan(&mut tiles, (0, 0, 0, 0));
+            // REVIEW (D1) — the strip's geometry goes on the wire whether or not there IS one. Every
+            // fill FORBID is measured against the clip, so a strip that never entered it is a strip
+            // the witness cannot see being erased; `dock=absent` is what makes that case loud
+            // instead of silent. Published even when `for_panel` says `None`, which is the whole
+            // point of publishing it. See [`DO_DOCK_BOX`].
+            let rect = super::dock::Layout::for_panel(n, pw, ph).map(|l| l.rect());
+            if let Some(b) = rect {
+                if !c.push(b) {
+                    dropped += 1;
+                }
+            }
+            #[cfg(feature = "witness")]
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                let (dx, dy, dw, dh) = rect.unwrap_or((0, 0, 0, 0));
+                DO_DOCK_BOX[0].store(dx, Relaxed);
+                DO_DOCK_BOX[1].store(dy, Relaxed);
+                DO_DOCK_BOX[2].store(dw, Relaxed);
+                DO_DOCK_BOX[3].store(dh, Relaxed);
+            }
+        }
+        // REVIEW (D1) — and how many boxes the clip ended up with, so an EMPTY clip cannot pass for a
+        // clean gesture. Stored last, after every `push`, and after the dock arm so the count
+        // includes the strip.
+        #[cfg(feature = "witness")]
+        DO_CLIP_N.store(c.n, core::sync::atomic::Ordering::Relaxed);
+    }
+    (c, dropped)
 }
 
 /// WC-K3 — [`occ_clip`] for a caller that holds no pass snapshot: WC-D's repair redraw.
@@ -10157,6 +10579,30 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
         F2W_DRAIN_SKIPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     let info = fb.info();
+    // WCK4 — THE ERASE'S OCCLUSION DISCIPLINE, built ONCE for the whole drain.
+    //
+    // Once, not per box, and the reason is the one SHOULD-FIX 4 gave for hoisting the sort out of
+    // WC-K3's row loop: the geometry is fixed for the drain, and a queue of eight boxes would
+    // otherwise take eight `TABLE` acquisitions and eight `dock_scan`s on the head of a composite
+    // pass. It is built HERE rather than at the top of the function so that the cheap exits above —
+    // empty queue, raised barrier, `STAGE` held — cost exactly what they cost today.
+    //
+    // The lock order is unchanged and no lock is nested: `erase_clip` takes `TABLE` and releases it
+    // before returning, which is the same acquisition `damage_intersecting` makes below, in the same
+    // function, on every box it publishes.
+    let (clip, clip_dropped) = erase_clip(info.width, info.height);
+    // Loud, once, if a future furniture layer ever overflows the clip: a box that did not fit is a
+    // region the erase will publish over, which is the whole defect this arc closes. Not reachable on
+    // any panel this kernel drives — `MAX_WINDOWS` rows plus one dock strip is exactly `OCC_MAX`.
+    #[cfg(feature = "witness")]
+    if clip_dropped > 0 {
+        serial_println!(
+            "[wck4] erase clip OVERFLOW dropped={} cap={} — the erase may publish over live pixels",
+            clip_dropped,
+            OCC_MAX
+        );
+    }
+    let _ = clip_dropped;
     let mut painted = false;
     for &(x, y, w, h) in boxes[..n].iter() {
         // Re-clip: a coalesced union is a synthesised box, and the panel geometry it was clipped
@@ -10165,7 +10611,7 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
             continue;
         }
         let (w, h) = (w.min(info.width - x), h.min(info.height - y));
-        if !stage_fill(fb, x, y, w, h, DESKTOP_BG, true) {
+        if !stage_fill(fb, x, y, w, h, DESKTOP_BG, true, &clip) {
             // `stage_fill` re-queued it; leave the panel alone and try again next pass.
             continue;
         }
@@ -11388,7 +11834,7 @@ fn stage_window(
     // the row loop: `occ` holds the boxes ordered by left edge, `spans` is the row walk's scratch and
     // is overwritten in place. Neither is touched at all on the `clip.n == 0` fast path.
     let occ = clip.prepare(bx, bx + bw);
-    let mut spans = [(0usize, 0usize); MAX_WINDOWS + 1];
+    let mut spans = [(0usize, 0usize); OCC_MAX + 1];
 
     let fb_row = info.stride * bpp;
     // WC-M — one band per turn. `band` is the box-relative row the buffer currently holds.
@@ -11616,6 +12062,7 @@ fn stage_fill(
     h: usize,
     color: u32,
     from_drain: bool,
+    clip: &OccClip,
 ) -> bool {
     // WC-L — the four decline reasons split by whether RETRYING can ever succeed, and the split is
     // load-bearing rather than tidy.
@@ -11732,6 +12179,13 @@ fn stage_fill(
     // (`x * bpp + row_bytes <= fb_row`, so no run wraps into the next row), and consecutive runs must
     // step by exactly one panel row. A `contig=no` would mean the present is no longer the shape
     // WC-H's tear-free argument rests on, whatever the timings say.
+    //
+    // WCK4 — `contig` is still asked of the BOX, not of the spans, and that is the honest question.
+    // It is the geometric precondition WC-H's tear-free argument rests on ("a full row of this box
+    // fits inside one scanline, and consecutive rows step by exactly one panel row"), and every span
+    // the clip emits lies inside `[x, x + w)` by construction — so a run that fits is a bound on
+    // every sub-run of it. Computing it from the spans instead would make the check pass vacuously on
+    // a fully-occluded fill, which is precisely the case where nothing was checked at all.
     let mut contig = x * bpp + row_bytes <= fb_row;
     let mut prev = usize::MAX;
     // WC-K3 REVIEW (SHOULD-FIX 3) — THE ERASE'S OWN PUBLISH INSIDE THE DRAGGED WINDOW'S BOX.
@@ -11753,45 +12207,160 @@ fn stage_fill(
         // "did this desktop row land inside the dragged window's box". `dragocc_target` needs a row;
         // the box is read directly for that reason.
         //
-        // ONE PASS STALE, and in the harmless direction. `drain_deferred` runs at the HEAD of
-        // `composite_inner`, ahead of the table snapshot that `dragocc_pass` publishes from, so this
-        // reads the box the previous pass established — the dragged window one motion report ago,
-        // which is a few pixels away. A drag step is small and the term is a per-gesture total, so
-        // the effect is a handful of pixels at the leading edge of the first fill; it cannot turn a
-        // gesture that flashed nothing into a nonzero reading, and the first pass of a gesture (box
-        // still cleared from the last one) is simply not charged.
+        // WCK4 — read from [`DO_FILL_BOX`], which THIS drain published from the same table read that
+        // built `clip`, and NOT from `DO_BOX`. The old source was one pass stale, and its ledger's
+        // claim that the staleness cost "a handful of pixels at the leading edge" is refuted by Boot
+        // A: the stale box is the drag's OLD box, the queued erases are `old \ new ⊂ old`, and the
+        // term therefore charged the entire legitimate vacate — `fill_px == erase_px` to the pixel in
+        // ELEVEN of that boot's SIXTEEN gestures, and never higher in any of them. The whole
+        // argument, with the numbers and with all five exceptions accounted for, is in
+        // [`DO_FILL_BOX`].
         use core::sync::atomic::Ordering::Relaxed;
-        let dw = DO_BOX[2].load(Relaxed);
+        let dw = DO_FILL_BOX[2].load(Relaxed);
         if dw == 0 {
             None
         } else {
             Some((
-                DO_BOX[0].load(Relaxed),
-                DO_BOX[1].load(Relaxed),
+                DO_FILL_BOX[0].load(Relaxed),
+                DO_FILL_BOX[1].load(Relaxed),
                 dw,
-                DO_BOX[3].load(Relaxed),
+                DO_FILL_BOX[3].load(Relaxed),
             ))
         }
     };
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
-    let mut fill_px = 0u64;
+    let (mut fill_px, mut pub_px, mut clip_px, mut over_px) = (0u64, 0u64, 0u64, 0u64);
+    // REVIEW (D1) — the strip's own withheld total, and (D2) the number of `blit` calls this fill
+    // actually made, which is no longer `h`.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    let (mut dock_px, mut runs) = (0u64, 0u64);
+    // REVIEW (D1) — the dock strip as THIS drain's clip holds it, read once. `w == 0` means the
+    // strip is not in the clip, and then `dock_px` stays 0 — which is the honest answer, and the
+    // reason `dock=absent` is on the wire beside it.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    let dockb = {
+        use core::sync::atomic::Ordering::Relaxed;
+        let dw = DO_DOCK_BOX[2].load(Relaxed);
+        if dw == 0 {
+            None
+        } else {
+            Some((
+                DO_DOCK_BOX[0].load(Relaxed),
+                DO_DOCK_BOX[1].load(Relaxed),
+                dw,
+                DO_DOCK_BOX[3].load(Relaxed),
+            ))
+        }
+    };
+    // WCK4 — ONCE PER FILL, not once per scanline, for SHOULD-FIX 4's reason exactly: the occluder
+    // geometry is fixed for the whole present. `clip.n == 0` — every aarch64 fill, and every x86 fill
+    // onto a panel with nothing on the glass — touches neither, and takes the pre-arc loop below
+    // byte for byte.
+    let occ = clip.prepare(x, x + w);
+    let mut spans = [(0usize, 0usize); OCC_MAX + 1];
     for r in 0..h {
-        let off = (y + r) * fb_row + x * bpp;
+        let py = y + r;
+        let off = py * fb_row + x * bpp;
         if prev != usize::MAX && off != prev + fb_row {
             contig = false;
         }
         prev = off;
-        fb.blit(off, &stage[..row_bytes]);
+        if occ.n == 0 {
+            fb.blit(off, &stage[..row_bytes]);
+            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            {
+                pub_px += w as u64;
+                runs += 1;
+                fill_px += span_occ(fbox, py, x, x + w);
+                // Nothing was withheld on this branch, so the strip's columns in this row were
+                // PUBLISHED. `dock_px` is a withheld total and correctly gains nothing; the loss
+                // shows up in `fillover_px` if the strip was in the clip, and in `dock=absent` if it
+                // was not. Both are the intended reading and neither is silent.
+            }
+            continue;
+        }
+        // The unoccluded sub-runs of this row. Same primitive as the whole row was — a contiguous
+        // `fb.blit` at the panel's stride — so WC-H's tear-free contract is unchanged; what changes
+        // is only which bytes are published. And the composed row is a CONSTANT colour, so any prefix
+        // of it is the right source for a span of any length: no `src` offset arithmetic is needed
+        // here, unlike `draw_window`'s, where each column carries a different pixel.
+        let ns = occ.spans(py, x, x + w, &mut spans);
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        let (mut row_pub, mut row_dock_pub) = (0u64, 0u64);
         #[cfg(all(feature = "witness", target_arch = "x86_64"))]
         {
-            fill_px += span_occ(fbox, y + r, x, x + w);
+            runs += ns as u64;
+        }
+        for &(sx0, sx1) in spans[..ns].iter() {
+            let len = (sx1 - sx0) * bpp;
+            fb.blit(py * fb_row + sx0 * bpp, &stage[..len]);
+            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            {
+                row_pub += (sx1 - sx0) as u64;
+                fill_px += span_occ(fbox, py, sx0, sx1);
+                // REVIEW (D1) — the strip's columns this row PUBLISHED. Subtracted below from the
+                // strip's columns the row COVERED, which makes `dock_px` a measurement of the span
+                // walk rather than a restatement of the two rectangles: a leak into the strip lowers
+                // this term and raises `fillover_px` at the same time.
+                row_dock_pub += span_occ(dockb, py, sx0, sx1);
+                // The published-pixel audit: asked of the run that just reached the panel, against
+                // the clip's UNSORTED, UNPREPARED boxes — not against the `occ` intervals that chose
+                // it. Must be 0; a nonzero reading is a span walk that emitted covered columns.
+                over_px += clip.covered_len(py, sx0, sx1);
+            }
+        }
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        {
+            pub_px += row_pub;
+            clip_px += w as u64 - row_pub;
+            dock_px += span_occ(dockb, py, x, x + w).saturating_sub(row_dock_pub);
         }
     }
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
-    if fill_px > 0 {
-        DO_FILL_PX.fetch_add(fill_px, core::sync::atomic::Ordering::Relaxed);
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        // Folded unconditionally rather than behind `> 0`: `fillpub_px` is the population that says
+        // the drain ran at all, and a fill of a fully-occluded box legitimately publishes nothing
+        // while still owing that fact to the reader.
+        DO_FILL_PUB_PX.fetch_add(pub_px, Relaxed);
+        DO_FILL_CLIP_PX.fetch_add(clip_px, Relaxed);
+        DO_FILL_CLIP_DOCK_PX.fetch_add(dock_px, Relaxed);
+        DO_FILL_RUNS.fetch_add(runs, Relaxed);
+        if fill_px > 0 {
+            DO_FILL_PX.fetch_add(fill_px, Relaxed);
+        }
+        if over_px > 0 {
+            DO_FILL_OVER_PX.fetch_add(over_px, Relaxed);
+        }
     }
 
+    // WCK4 — `w`, `h` and `row_bytes` stay the extent this fill OWED, on `draw_window`'s precedent
+    // for `bytes=`: they are the numbers `[wc-g]` and `x86-witness.spec` are calibrated against, and
+    // moving a gate's wire is not this arc's to do. On an occluded fill they are now an upper bound
+    // rather than an identity — the panel received `w*h - fillclip_px` of it — and the withheld half
+    // is reported where it belongs, as `fillclip_px=` on `[drag-occ]`.
+    //
+    // ### REVIEW (D2) — `[wc-k] runs=` AND `contig=` NOW MISDESCRIBE AN OCCLUDED FILL, AND THE FIX IS
+    // OUT OF LANE
+    //
+    // `wcg::erase_note` prints `runs=` from its `h` parameter and `contig=` from the boolean above.
+    // Both were exact while every row was one full-width `blit`. They are not any more:
+    //
+    // * `runs=h` is a LOWER BOUND. A clipped row emits up to `OCC_MAX + 1` sub-runs, so a fill over a
+    //   busy panel makes up to `13 * h` calls where the line still claims `h`.
+    // * `contig=yes` remains true of what it MEASURES — the box's own row geometry, deliberately, see
+    //   the note above the `contig` binding — but a reader takes it as "the present was `h`
+    //   contiguous full-row copies", and for a clipped fill it was not.
+    // * And the divergence is ARCH-DEPENDENT and silent: on aarch64 `occ.n` is always 0, so `runs=h`
+    //   stays exact there and only the x86 wire drifts. A field that means two things on two arches
+    //   is the shape GR13 convicted three instruments for.
+    //
+    // The honest repair is to pass the real count into `erase_note` as a `spans=` field beside
+    // `runs=`. **That is `video/wcg.rs`, which this arc's lane does not include** (`wm.rs` only), and
+    // a witness signature change there moves `x86-witness.spec`, which another seat owns. So the true
+    // count is carried on THIS module's own wire instead — `fillruns=` on `[drag-occ]` — and the
+    // `[wc-k]` correction is reported to the integrator rather than taken unilaterally. `fillruns >
+    // fillpub_px / w` is the reader's tell that a fill was fragmented at all.
     #[cfg(feature = "witness")]
     super::wcg::erase_note(
         w,
