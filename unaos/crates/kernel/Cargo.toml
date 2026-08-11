@@ -244,6 +244,28 @@ botring64 = []
 # module + call sites vanish, byte-identical. Enable via `UNAOS_WIFI=1`. See
 # docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
 wifi = []
+# WIFI-2: arc 2 of the same ladder — the WRITE rungs (`src/wifi/bringup.rs`). Maps BAR0 (two 4 KiB
+# apertures), moves the backplane window selector cfg:0x80 onto ChipCommon and then onto the
+# enumeration ROM, walks the core table from our own reads with a TAG-driven parse (the declared port
+# counts become an independent arity cross-check instead of the parse driver), cross-checks the d11
+# core's rev/base/master-wrapper against four metal boots AND against the two config registers Apple's
+# firmware left behind, opens the core window, reads MACCTL/PHY_VER/TSF and the wrapper's
+# IOCTL/IOST/RESET_CTL/RESET_ST, and re-measures bcm4331.md §S3's enable rule. On this machine the
+# core arrives enabled, so that rung costs ZERO device writes; on the branch where it does not, it
+# makes only the REVERSIBLE half (deassert RESET, set CLK with FGC clear, every other bit as read) —
+# it NEVER asserts reset, because asserting reset clears MACCTL.PSM_RUN and destroys the microcode the
+# radio arrives running (§5 risk 4). Every device write carries a pre-read/write/post-read witness
+# triple; cfg:0x80's pre-image is recorded, the restore path is self-tested with an in-place no-op
+# BEFORE the window moves, and the restore is MATCH-verified against the recorded value (never against
+# 0x18000000). The microcode upload is REFUSED at a named UNKNOWN — §S4 names the B43_SHM_UCODE
+# routing selector but records no value for it, and CLEAN_ROOM_POLICY §2 puts the only source that
+# carries it off-limits for src/wifi/. IMPLIES `wifi` (arc 2 reads the census's selection and the
+# staged set). x86_64-only and stripped by arroyo's arm_features. QEMU models no BCM4331, so a QEMU run
+# only ever witnesses the honest refusal at `no-radio-selected`; metal-first by construction. Default
+# OFF => not one byte of arc 2 in the image and the census-only boot is byte-identical to arc 1's.
+# Enable via `UNAOS_WIFI2=1`. Kept in sync with arroyo and builder/src/main.rs. See
+# docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+wifi2 = ["wifi"]
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +

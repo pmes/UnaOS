@@ -94,6 +94,16 @@ const FW_SET: &[FwSpec] = &[
     FwSpec { role: "bsinitvals", names: &["ht0bsinitvals29.fw",  "HT0BSI29.FW"] },
 ];
 
+/// How many members a COMPLETE set has. Exported so arc 2's completeness gate reads the same number
+/// this module's own terminal verdict does — a second literal in `bringup.rs` is exactly how "3/3
+/// staged" and "the set is complete" would drift apart without either line changing.
+///
+/// `wifi2`-gated because arc 2 is its only consumer: this module's own verdict uses `FW_SET.len()`
+/// directly, so leaving the alias ungated would emit an unused-constant warning on every arc-1-only
+/// build. Both spellings read the same array, which is the point.
+#[cfg(feature = "wifi2")]
+pub(crate) const FW_SET_LEN: usize = FW_SET.len();
+
 /// Directories searched, in order. `None` = the volume root.
 const SEARCH_DIRS: &[Option<&str>] = &[None, Some("B43"), Some("FIRMWARE")];
 
@@ -122,6 +132,26 @@ pub fn staged_count() -> usize {
 /// Bytes staged for `role`, if that member was staged. Keeps the buffers inside the module.
 pub fn with_staged<R>(role: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     STAGED.lock().iter().find(|s| s.role == role).map(|s| f(s.bytes.as_slice()))
+}
+
+/// The staged microcode's container verdict, as `(layout, type, ver, declared, len)`, or `None` when
+/// the `ucode` role did not stage. `None` while the set is COMPLETE is itself a finding, and arc 2
+/// prints it as one.
+///
+/// This exists so arc 2 does not re-derive the payload offset. W3 — `bcm4331.md` §S4's internally
+/// inconsistent header record — is still an open UNKNOWN, and two independent implementations of an
+/// unresolved rule is exactly how the loader's `hdr=` verdict and an uploader's payload offset come
+/// to disagree without either one looking wrong. One `classify_header`, both readers.
+///
+/// `wifi2`-gated, along with [`FW_SET_LEN`], so that an arc-1-only build's item set is unchanged: the
+/// census-and-staging image stays what it was, rather than "what it was, plus two accessors nothing
+/// calls".
+#[cfg(feature = "wifi2")]
+pub(crate) fn ucode_header() -> Option<(&'static str, u8, u8, u32, usize)> {
+    with_staged("ucode", |b| {
+        let v = classify_header(b);
+        (v.layout, v.kind, v.ver, v.declared, b.len())
+    })
 }
 
 /// Short human reason for a [`FatError`] in the witness lines. A local twin of `fat::fat_reason`,

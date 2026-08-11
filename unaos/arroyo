@@ -384,6 +384,34 @@ _feats=""
 # vanish, media byte-identical. Kept in sync with builder/src/main.rs. See
 # docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
 [ -n "${UNAOS_WIFI:-}" ] && _feats="${_feats}wifi,"
+# WIFI-2: UNAOS_WIFI2=1 arms arc 2 — the WRITE rungs (crates/kernel/src/wifi/bringup.rs). Maps BAR0's
+# two 4 KiB apertures, moves the backplane window selector cfg:0x80 onto ChipCommon and then onto the
+# enumeration ROM, walks the core table from our own reads (a TAG-driven parse, so the EROM's declared
+# port counts become an independent arity cross-check rather than the parse driver — the third of the
+# three defects bcm4331.md §S1b records cannot recur by construction), cross-checks the d11 core's
+# rev/base/master-wrapper against four metal boots AND against the two config registers Apple's
+# firmware left behind, then opens the core window and reads MACCTL/PHY_VER/TSF plus the wrapper's
+# IOCTL/IOST/RESET_CTL/RESET_ST and re-measures §S3's enable rule. On this machine the core arrives out
+# of reset and clocked, so that rung costs ZERO device writes; on the branch where it does not, only
+# the REVERSIBLE half is made (deassert RESET, set CLK with FGC clear, every other IOCTL bit left as
+# read) — reset is NEVER asserted, because asserting it clears MACCTL.PSM_RUN and destroys the
+# microcode the radio arrives running (§5 risk 4). Every device write carries a pre-read/write/
+# post-read witness triple, the cfg:0x80 pre-image is recorded and the restore path is self-tested
+# with an in-place no-op BEFORE the window moves, and the restore is MATCH-verified against the
+# RECORDED value (never against 0x18000000 — the pre-image on this machine is 0x18001000). The
+# microcode upload is REFUSED at a NAMED UNKNOWN: §S4 names the B43_SHM_UCODE routing selector but
+# records no value for it, this tree carries only the SHARED routing S4a reads through, and the one
+# source that carries it is b43 driver source — off-limits for src/wifi/ under CLEAN_ROOM_POLICY §2.
+# IMPLIES `wifi` (arc 2 reads arc 1's selection and its staged set); pushing it alone would build a
+# module whose two inputs do not exist. x86_64-only and stripped by arm_features below. QEMU models no
+# BCM4331, so a QEMU run only ever witnesses the honest refusal; metal-first by construction. Default
+# OFF => not one byte of arc 2 in the image, and a UNAOS_WIFI=1-only boot is byte-identical to the
+# census-and-staging boot arc 1 flew. Kept in sync with builder/src/main.rs. See
+# docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+# Pushed ALONE, not as `wifi,wifi2` — the Cargo implication above is what pulls `wifi` in, and pushing
+# both would put a duplicate `wifi` in the comma list on a `UNAOS_WIFI=1 UNAOS_WIFI2=1` build, which
+# is the shape the arm_features strip below rewrites textually.
+[ -n "${UNAOS_WIFI2:-}" ] && _feats="${_feats}wifi2,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 
@@ -655,6 +683,15 @@ arm_features() {
     # `UNAOS_WIFI=1` one for zero observable change. Stripped => the x86 track can arm the radio's
     # firmware loader without touching Pi or Jetson media at all.
     f="${f//,wifi,/,}"
+    # WIFI-2 (GR25) rides the same strip, for the same reason and as a consequence of the same fact:
+    # `wifi2` implies `wifi`, whose only code is the x86-gated `src/wifi/`, and `bringup.rs` is a
+    # sibling inside that same gate — so `wifi2` emits not one byte of aarch64 CODE. An enabled feature
+    # is still hashed into cargo's `-Cmetadata` fingerprint, so leaving it in would shift every
+    # Pi/Jetson media hash between a default build and a `UNAOS_WIFI2=1` one for zero observable
+    # change. Stripped BEFORE `wifi` would matter if the order were the other way round: `,wifi2,`
+    # does not contain `,wifi,` as a substring (the trailing comma is part of the pattern), so the
+    # `wifi` strip above cannot half-rewrite it and the two lines are order-independent.
+    f="${f//,wifi2,/,}"
     # BT-L0 (GR21) rides the same strip, for the same reason and by the same mechanism as `kbdwit`
     # above: every line `bt` gates lives in `drivers/ehci/mod.rs`, which is declared
     # `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so `bt` emits not one byte of
@@ -1408,7 +1445,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,wifi2"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the

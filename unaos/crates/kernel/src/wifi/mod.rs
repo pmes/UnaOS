@@ -16,10 +16,16 @@
 // ## The ladder (why this arc stops where it stops)
 //   * **Arc 1 (this one) — firmware load.** The set located on media, validated, staged. Radio
 //     identity cross-checked. Everything read-only.
-//   * **Arc 2 — bcma core enumeration + core reset.** Map BAR0, walk the on-chip core table, find the
-//     d11 802.11 core + its wrapper, run §S4's prologue, and stream the staged microcode through the
-//     SHM indirect window. This is the first arc that WRITES the device.
-//   * **Arc 3 — up to an association attempt.** PHY/radio init from the staged initvals, a receive
+//   * **Arc 2 (landed, `bringup.rs`) — bcma core enumeration.** Map BAR0, walk the on-chip core table
+//     from our own reads, find the d11 802.11 core + its master wrapper, read the core and wrapper
+//     state, and re-measure §S3's enable rule. This is the first arc that WRITES: the backplane
+//     window selector always (moved and restored), a backplane register only on the branch where the
+//     core does NOT arrive enabled, and then only its reversible half. **§S4's reset prologue and the
+//     microcode upload moved OUT of this arc and into arc 3** — the prologue destroys the resident
+//     microcode and only a successful upload restores a working state (`bcm4331.md` §5 risk 4), and
+//     the upload is blocked on a routing value no source this module may use records. See
+//     `bringup.rs`'s header.
+//   * **Arc 3 — the prologue, the upload, and up to an association attempt.** PHY/radio init from the staged initvals, a receive
 //     path, a scan, and one authenticate/associate exchange, bound to `smolnet` through the existing
 //     `net_phy` seam the e1000/genet/vnet paths already ride.
 //
@@ -33,21 +39,36 @@
 // into a media image — which is `bcm4331.md` §S4's option 1, the only shape that keeps the tree
 // clean.
 //
-// **The clean-room claim below is about `src/wifi/` and its implementer, and nothing wider.** These
-// three files were written without reading any GPL Linux WiFi driver source; their factual inputs are
-// the public PCI base specification, the public PCI-SIG vendor registry, and this tree's own metal
-// captures and prose in `bcm4331.md`. That is NOT the sourcing of the sibling module: `drivers/bcma.rs`
-// states in its own header that its "register offsets and EROM encodings follow Linux `drivers/bcma`
-// (`bcma_regs.h`, `bcma_driver_chipcommon.h`, `scan.c`) and `b43`'s `B43_MMIO_PHY_VER`", and
-// `bcm4331.md` §S4 says its upload sequence is "transcribed from the b43 reference implementation's
-// *interface*". Anyone extending this module across that boundary inherits `CLEAN_ROOM_POLICY.md`
-// §2's two-team rule and should say which side they are on; this file does not launder the sibling's
-// sourcing and does not claim a subsystem-wide clean room.
+// ## Clean-room posture — TRUE OF ARC 1 ONLY, and arc 2 says so in its own header
+//
+// **`mod.rs`, `bus.rs` and `firmware.rs` carry a clean-room claim. `bringup.rs` does NOT, and the
+// difference is recorded rather than blurred.**
+//
+// Those three arc-1 files were written without reading any GPL Linux WiFi driver source, and without
+// adopting code or constants from `drivers/bcma.rs`. Their factual inputs are the public PCI base
+// specification, the public PCI-SIG vendor registry, and this tree's own metal captures and prose in
+// `bcm4331.md`.
+//
+// **Arc 2's `bringup.rs` is on the other side of that line, by adoption.** Its register-offset and
+// EROM-encoding block and its EROM cursor scaffolding are taken from `drivers/bcma.rs` — which states
+// in its own header that its "register offsets and EROM encodings follow Linux `drivers/bcma`
+// (`bcma_regs.h`, `bcma_driver_chipcommon.h`, `scan.c`) and `b43`'s `B43_MMIO_PHY_VER`" — so
+// `bringup.rs` INHERITS that Group-B provenance under `CLEAN_ROOM_POLICY.md` §2. Only its parse
+// strategy (tag-driven descriptor consumption) is independent work. An earlier version of this
+// paragraph, and of `bringup.rs`'s header, asserted the opposite; the assertion was false and is
+// withdrawn. **`src/wifi/` therefore does not carry a subsystem-wide clean-room claim**, and
+// `bcm4331.md` §S4's own note — that its upload sequence is "transcribed from the b43 reference
+// implementation's *interface*" — stands beside it.
+//
+// The value of a provenance ledger is that it is true. A recorded taint costs nothing; a laundered
+// one costs the credibility of every other claim in the subsystem.
 //
 // Where a fact could not be pinned from a source legal for THIS implementer it is named UNKNOWN in
-// the comments and reported by a witness rather than assumed by the code. Exactly one such fact
-// survives arc 1 — the firmware container header layout, on which `bcm4331.md` §S4's own record is
-// internally inconsistent — and `firmware::classify_header` reports it instead of resolving it.
+// the comments and reported by a witness rather than assumed by the code. Two such facts stand: the
+// firmware container header layout, on which `bcm4331.md` §S4's own record is internally inconsistent
+// (`firmware::classify_header` reports it instead of resolving it), and the `B43_SHM_UCODE` routing
+// value, which no source available to this module records at all and on which arc 2's upload rung
+// refuses.
 //
 // ## Knob and arch gate
 // `UNAOS_WIFI=1` arms the `wifi` Cargo feature. Default OFF => this module and its call sites vanish
@@ -63,6 +84,17 @@
 // `fatverb_storage_witness` placement): which pass a given x86 build reaches depends on its knobs,
 // and the forward-only state machine below speaks exactly once whichever one runs.
 
+/// WIFI-2 (arc 2) — the write rungs. `#[cfg(feature = "wifi2")]`, `UNAOS_WIFI2=1`, default OFF, so a
+/// `UNAOS_WIFI=1`-only boot is the census-and-staging boot arc 1 flew on metal (Boot A) with not one
+/// extra device access and not one extra witness string in the image.
+///
+/// The split is by WRITE, not by convenience: everything arc 1 does is a PCI-config read or a FAT
+/// read, while every rung in `bringup` either writes the backplane window selector or depends on a
+/// window that was moved by one. Two knobs mean the census can be re-flown at any time — to
+/// re-confirm the identity cross-check on a machine, or to isolate a regression — without arming a
+/// single write.
+#[cfg(feature = "wifi2")]
+pub mod bringup;
 pub mod bus;
 pub mod firmware;
 
@@ -116,6 +148,18 @@ pub fn service() {
                 return;
             }
             firmware::stage_once();
+            // Arc 2 runs HERE and only here — after the staging pass, so `staged_count()` is final
+            // and arc 2's completeness gate reads a settled number rather than a race. It is inside
+            // the same forward-only step, so it runs at most once per boot and the state moves to
+            // `S_PARKED` whatever it reports.
+            //
+            // One consequence, stated rather than discovered: a boot where the program-source block
+            // device never appears parks in `S_WAIT_STORAGE` and never reaches arc 2 at all. That is
+            // the SAME deferral arc 1 already announces once on its own line, and the alternative —
+            // walking the backplane on a timer while storage is still enumerating — would put a
+            // window write in a race with the very pass that decides whether an upload may follow.
+            #[cfg(feature = "wifi2")]
+            bringup::bringup_once();
             STATE.store(S_PARKED, Ordering::Relaxed);
         }
     }
