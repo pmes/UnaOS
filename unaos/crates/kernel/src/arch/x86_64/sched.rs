@@ -3588,6 +3588,41 @@ pub fn futex_parked_total() -> usize {
     n
 }
 
+/// WINX7-GO introspection: how many tasks are parked on ONE futex key right now.
+///
+/// The keyed twin of [`futex_parked_total`], and the difference is the whole reason it exists. The
+/// global gauge answers "is ANYTHING parked", which makes any handshake built on it depend on
+/// nothing else in the system happening to park at the same moment — a coupling that is invisible
+/// in the source and that a placement change elsewhere can break silently. This one answers "is the
+/// task I am waiting for parked on the word I am about to write", which is the question a launcher
+/// actually has, and it cannot be satisfied by a stranger.
+///
+/// The same point-in-time caveat applies and the same escape from it: as EVIDENCE that a park
+/// happened this is useless (`syscall::futex_park_count()` is the monotonic counter for that), but
+/// as a HANDSHAKE it is exact whenever the parked task cannot leave until the caller releases it —
+/// the state is level-triggered, so there is no window for the sample to miss.
+///
+/// FUTEX-DUP: every bucket serving `key` is counted, not just the first, for the same reason
+/// `futex_wake` scans them all — one bucket per key is an invariant the claim pass defends but
+/// cannot guarantee, and a handshake that undercounted would release its gate early.
+pub fn futex_waiters_on(key: u64) -> usize {
+    debug_assert!(key != 0, "futex key must be non-zero");
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let mut n = 0usize;
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        if b.key.load(Ordering::Relaxed) == key {
+            n += unsafe { (*b.waiters.get()).len() };
+        }
+        b.unlock_raw();
+    }
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+    n
+}
+
 // ---------------------------------------------------------------------------------------------
 // Mutex<T> — a sleeping mutual-exclusion lock (a binary semaphore guarding owned data)
 // ---------------------------------------------------------------------------------------------
