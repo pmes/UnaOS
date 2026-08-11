@@ -3564,6 +3564,22 @@ fn composite_inner() -> CursorTail {
         crate::arch::now_cycles().saturating_sub(c2_loop0),
         core::sync::atomic::Ordering::Relaxed,
     );
+    // COMP2-SPLIT — and immediately behind it, the compose/present pair this loop's `stage_window`
+    // calls staged. AFTER the charge above and never before it: the drained pair must not be able to
+    // contain cycles whose enclosing loop interval has not been drained too, or a rollup landing in
+    // the gap prints `compose_us + present_us > blit_us` on a healthy compositor and sends the reader
+    // after a phantom. This way round the gap can only under-report the pair — the residual reads
+    // large for one span — which is the direction an alarm field is allowed to err.
+    //
+    // `swap`, not a load: the staging counters carry exactly what has not been folded yet, so a
+    // present in flight across a quiet drain (`comp2_emit` returns early on `passes == 0` AFTER
+    // swapping, discarding what it took) keeps its cycles for the span its loop publication lands in.
+    #[cfg(feature = "witness")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        C2_COMPOSE_CYC.fetch_add(C2_STG_COMPOSE_CYC.swap(0, Relaxed), Relaxed);
+        C2_PRESENT_CYC.fetch_add(C2_STG_PRESENT_CYC.swap(0, Relaxed), Relaxed);
+    }
     // WC-N — the pass reached the blit loop (`drawn == 0` is still a pass: it means every damaged row
     // was below the shell, which is a fact about the shell and not about the pass).
     #[cfg(feature = "witness")]
@@ -6879,6 +6895,9 @@ static WCN_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 //   * `wait_us`   — WRITER read, TABLE lock, damage close, ordering, guard registration: the
 //     serialisation cost between the bracket and the first blit.
 //   * `blit_us`   — the blit loop proper (compose + present copies), MINUS the cache term below.
+//     COMP2-SPLIT: `compose_us` and `present_us` beside it break that sum into the half a copy
+//     engine COULD take (present: staging band → panel, a straight row copy) and the half it could
+//     not (compose: surfaces → staging band, including the scale-2 upscale). See [`C2_COMPOSE_CYC`].
 //   * `cache_us`  — `draw_window`'s trailing `flush_range` (`DC CVAC` sweep + `DSB`), the
 //     non-coherent scan-out's tax, measured separately because it scales with CLEANED bytes and
 //     the fix for it (clean the box, not full-width scanlines) is distinct from the blit fix.
@@ -6932,6 +6951,123 @@ static C2_DMG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// area of. Never used as a denominator; it exists so the line can be read against itself.
 #[cfg(feature = "witness")]
 static C2_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// ---- COMP2-SPLIT — the two halves of `blit_us`, because only one of them is offloadable ----------
+//
+// `blit_us` is a SINGLE number covering two operations with nothing in common but their position in
+// the loop, and the distinction is the whole of the CE question:
+//
+//   * **compose** — window surfaces → the cached-RAM staging band: `paint_window` (chrome, content,
+//     and the nearest-neighbour integer upscale, which on this bench is `scale=2` for every window)
+//     plus `cursor::compose_into`. Per-pixel CPU work on a scaling read. **A copy engine cannot do
+//     this**: a CE is a rectangular memory mover, not a scaler.
+//   * **present** — staging band → panel: `stage_window`'s `fb.blit(...)` row loop, one bulk
+//     `copy_nonoverlapping` per row at the panel's stride, source cached RAM, destination VRAM, no
+//     format conversion and no scaling. **This is the half a copy engine could take**, and its share
+//     of `blit_us` is therefore the CE's entire ceiling.
+//
+// Boot AS read `blit_us=2072` of `pass_us=2074` at 79.3 passes/s and could not say whether present
+// was 200 us of that or 1800. This pair answers it on the wire, from the SAME timestamps `[wc-h]`
+// already takes (`stage_window`'s `compose_cyc`/`present_cyc`, accumulated across WC-M bands) — no
+// new clock reads on the hot path, so the instrument cannot perturb the quantity it reports.
+//
+// ## PUBLICATION ORDER — why there are FOUR counters and not two
+//
+// The self-check below is `compose + present <= blit`, and the naive implementation cannot hold it.
+// `stage_window` knows its two sums PER WINDOW, deep inside the blit loop; `C2_LOOP_CYC` — the
+// numerator `blit_us` comes from — is published ONCE, after the loop closes; `C2_PASSES`, the
+// divisor, bumps later still, at the end of the pass. Charging the pair straight into the drained
+// counters from inside `stage_window` therefore leaves a wide window in which a rollup can drain a
+// pass's compose and present WITHOUT the loop cycles that contain them, and print a span whose two
+// halves exceed the whole. That is reachable: on x86 a pass that declines the `COMP_GATE` still runs
+// `wcn_tick` -> `comp2_emit` while the gate holder is mid-loop, and on aarch64 presents overlap
+// outright. A reader chasing that reading would be chasing the instrument, not the compositor.
+//
+// So `stage_window` charges a STAGING pair, `C2_STG_*`, which no drain ever reads. The staged sums
+// are folded into the drained pair immediately after the `C2_LOOP_CYC` publication that closes the
+// same loop — a few instructions apart, in that ORDER and not the other:
+//
+//   * loop cycles first, pair second: a drain landing between them takes `blit` without its pair.
+//     The residual reads too LARGE for that one span, and the invariant HOLDS.
+//   * pair first, loop second: a drain landing between them takes the pair without its `blit` — the
+//     violation itself. This is the order the instrument must not have.
+//
+// An alarm field errs low, so the safe order is the one that under-reports the pair. Reordering the
+// drain's own swaps does NOT substitute for this: the swaps are one instant, and the hazard is the
+// interval between two charge sites in a different function.
+//
+// The fold is a `swap`, which also closes a hole the drain has had all along: `comp2_emit` swaps its
+// counters and THEN returns early on `passes == 0`, discarding whatever it took. The staging pair is
+// invisible to that swap, so cycles from a present in flight across a quiet drain are not thrown
+// away — they fold into the next span, where the loop cycles containing them land too.
+//
+// **Residual hazard, named rather than argued away.** On x86 the staging pair is single-writer: the
+// `COMP_GATE` admits one compositor, so the fold's `swap` takes exactly the charges of the loop it
+// is closing. On aarch64, where passes may overlap, a fold can take a concurrent pass's partial
+// charges alongside its own; the sums are still conserved across the boot, and within any span that
+// contains both passes' loop publications the invariant holds, but a drain falling between two
+// overlapping passes can attribute one pass's compose to the other's `blit`. aarch64 is not the arch
+// this instrument's question is asked on, and `[comp2] util_pct > 100` already reports the overlap
+// that is its precondition.
+//
+// ## THE SELF-CHECK: the residual, and what a bad one means
+//
+// `compose_us + present_us <= blit_us`, and the gap is meaningful rather than slack. The difference
+// is the per-window work inside the blit loop that is neither: `cursor::overlay_uncover`,
+// `note_present_over_sprite`, `outer_box`/clip arithmetic, `wcn_note_*`, the WC-G/WC-C one-shots —
+// and the one term that can be LARGE — `draw_window`'s DIRECT fallback (`paint_window` straight into
+// the front buffer), which is unstaged and therefore has no compose/present boundary to measure.
+// `cache_us` is already subtracted from `blit_us` upstream and so is in neither term and not part of
+// the residual.
+//
+// One witness one-shot lands INSIDE the pair rather than in the residual, and it is worth naming
+// because it inflates compose and present rather than the gap: WC-D's REPAIR REDRAW (`verify_window`
+// calls `draw_window` again on the verifying pass, both on the seal path and on the repair path).
+// That is a second full staged present of the same window, charged in full. It is budgeted one per
+// window id, so it perturbs a handful of early spans and never the steady state — but an early-span
+// reading with `[wc-d] verify` on the wire in the same window is not a steady-state reading and must
+// not be quoted as the CE number.
+//
+// Expected reading in the steady state (every present staged, witness one-shots long since spent):
+// **residual within ~5% of `blit_us`.** Read the line as lying if:
+//
+//   * `compose_us + present_us > blit_us` — the publication order above exists to make this
+//     unreachable on x86. It means the fold has been moved ahead of the `C2_LOOP_CYC` charge, a
+//     counter is being charged from outside the loop, or (aarch64 only) two passes overlapped across
+//     a drain, in which case `util_pct` says so on the same line.
+//   * residual > ~15% with `[wc-h] decline` and `[wc-d] verify` both quiet in the same window — time
+//     is going somewhere inside the loop that nothing accounts for; suspect a witness one-shot
+//     re-arming per pass.
+//   * `present_us == 0` with `bytes_pp > 0` — bytes reached the panel through a path this pair does
+//     not see. On x86 that is the direct fallback, and `[wc-h]`'s decline counters name which.
+//   * a large residual WITH declines on the wire is NOT a defect: it is the direct path, priced.
+//     That is the one case where the ledger is honest and the CE number is not yet readable, because
+//     a declining boot never took the staged present the CE would replace.
+//
+// **The decision this feeds** (CE-LADDER R0): if `present_us` is at or below ~300 us against Boot
+// AS's `blit_us=2072`, the copy engine's ceiling WITHIN `blit_us` is under 15% of the compositor's
+// cost and the CE ladder STOPS — the money is in compose, which no CE can touch. Metal reads this,
+// not QEMU.
+//
+// `blit_us` is the right scope for that rule but it is not every CE-eligible byte in the pass. The
+// deferred-erase drain's [`stage_fill`] (sole caller [`drain_deferred`], at the head of the pass) is
+// the same primitive over the same staging buffer — one row composed, `h` bulk row copies to the
+// panel — and is therefore CE-eligible too, but it runs BEFORE the loop clock opens and is priced in
+// `sprite_us`, so `present_us` cannot see it. A full-panel erase is the largest single present the
+// compositor takes. If the ladder stops here it stops on the window-present question only; the
+// drain's fill is a separate measurement and a separate decision.
+#[cfg(feature = "witness")]
+static C2_COMPOSE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static C2_PRESENT_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMP2-SPLIT — the staging half of the pair above. Charged by [`stage_window`] per window, folded
+/// into the drained counters beside the `C2_LOOP_CYC` publication that closes the same loop, and
+/// never read by [`comp2_emit`]. See the ledger above for why the indirection is what holds the
+/// invariant, and why the fold must follow the loop charge rather than precede it.
+#[cfg(feature = "witness")]
+static C2_STG_COMPOSE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static C2_STG_PRESENT_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // ---- COMP2-STRADDLE — attributing a pass's time to the span it actually ran in -------------------
 //
@@ -7010,6 +7146,16 @@ static C2_STRADDLE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// COMP2-STRADDLE — `straddle_us` is inserted immediately BEFORE `util_pct` by the same rule (`span=`
 /// terminal, `rate=` still last-but-one), because it is the correction term a reader needs in hand
 /// when reading `util_pct`. The analyzer's position is unchanged: it parses no field of this line.
+///
+/// COMP2-SPLIT — `compose_us` and `present_us` are inserted immediately AFTER `blit_us` under the
+/// same rule (`span=` terminal, `rate=` last-but-one). Adjacency is the point rather than a
+/// preference: they are a DECOMPOSITION of `blit_us`, their residual against it is the instrument's
+/// own self-check, and a reader who has to scan across five fields to subtract will not subtract. No
+/// existing field is renamed, moved relative to its neighbours, or changed in value, so every
+/// `awk '/blit_us=/'`-style harvest that matches on field NAMES reads exactly as before; a harvest
+/// matching on positional `$N` past `blit_us` shifts by two, which is the standing property of every
+/// insertion this line has taken (`box_px_pp`, `util_pct`, `straddle_us`). `tools/serial-analyzer.py`
+/// still parses no field of it.
 #[cfg(feature = "witness")]
 fn comp2_emit(span: u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -7028,6 +7174,10 @@ fn comp2_emit(span: u64) {
     let wait_cyc = C2_WAIT_CYC.swap(0, Relaxed);
     let loop_cyc = C2_LOOP_CYC.swap(0, Relaxed);
     let cache_cyc = C2_CACHE_CYC.swap(0, Relaxed);
+    // COMP2-SPLIT — drained in the same sweep as `loop_cyc`, so the three are always read against one
+    // span and the residual arithmetic below is over comparable terms.
+    let compose_cyc = C2_COMPOSE_CYC.swap(0, Relaxed);
+    let present_cyc = C2_PRESENT_CYC.swap(0, Relaxed);
     let bytes = C2_BYTES.swap(0, Relaxed);
     let dmg_px = C2_DMG_PX.swap(0, Relaxed);
     let box_px = C2_BOX_PX.swap(0, Relaxed);
@@ -7082,13 +7232,23 @@ fn comp2_emit(span: u64) {
             .saturating_div(span_us)
     };
     serial_println!(
-        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} straddle_us={} util_pct={} rate={}.{}/s span={}ms",
+        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} compose_us={} present_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} straddle_us={} util_pct={} rate={}.{}/s span={}ms",
         passes,
         us(pass_cyc),
         super::wcg::cycles_to_us(max_cyc),
         us(sprite_cyc),
         us(wait_cyc),
         us(loop_cyc.saturating_sub(cache_cyc)),
+        // COMP2-SPLIT — `blit_us` decomposed, per pass and in the same units, printed immediately
+        // beside the field they decompose so the residual is read without hunting. They do NOT
+        // replace it: `blit_us` keeps its exact meaning, its exact position and its exact value, and
+        // the pair is only ever ADDED to it. `blit_us - compose_us - present_us` is the unstaged
+        // remainder (direct-path fallback + the loop's per-window witness/sprite bookkeeping) and is
+        // the instrument's self-check: non-negative on x86 by the staged publication order at
+        // [`C2_COMPOSE_CYC`], which is also what keeps the early return below from discarding a
+        // present that was in flight when a quiet span drained.
+        us(compose_cyc),
+        us(present_cyc),
         us(cache_cyc),
         bytes / passes,
         dmg_px / passes,
@@ -10716,6 +10876,27 @@ fn stage_window(
     // of a tall box from a whole-box present of a short one — and with the two sharing one sample
     // budget, the four samples were spent on creation-time whole-box presents before the console had
     // banded once. `stage_note` classifies on `span < bh` and budgets the two classes apart.
+    // COMP2-SPLIT — the same two sums `[wc-h]` reports per present, on their way to a per-SPAN rollup
+    // so `[comp2]` can decompose its own `blit_us`. Charged here rather than re-timed: `stage_note`'s
+    // budget is four samples per class for the whole boot, so it cannot answer a steady-state
+    // question, while this pair is drained every rollup and sees every staged present there is. Both
+    // counters are relaxed adds of values already in hand — no additional clock read on the hot path.
+    //
+    // Into the STAGING counters, not the drained ones. This site is deep inside the blit loop, and the
+    // loop cycles these sums must never exceed are not published until the loop closes; a drain
+    // landing in between would print a span whose halves exceed its whole. The fold happens beside
+    // that publication instead. Full argument, including why the fold follows the loop charge rather
+    // than preceding it, at [`C2_COMPOSE_CYC`].
+    //
+    // A DECLINED present adds nothing to either, by construction: every `decline!` returns before the
+    // band loop. That is what makes the residual against `blit_us` read as the direct path's cost
+    // rather than hiding it.
+    #[cfg(feature = "witness")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        C2_STG_COMPOSE_CYC.fetch_add(compose_cyc, Relaxed);
+        C2_STG_PRESENT_CYC.fetch_add(present_cyc, Relaxed);
+    }
     #[cfg(feature = "witness")]
     super::wcg::stage_note(
         r.id,
