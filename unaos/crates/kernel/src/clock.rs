@@ -320,6 +320,29 @@ pub fn unix_now() -> Option<u64> {
     Some(a.base_unix.saturating_add(elapsed))
 }
 
+/// [`unix_now`] for a caller that must NEVER block — the never-spin-in-composite rule.
+///
+/// The video compositor's furniture strips (`video/strip.rs`) compose at the tail of every present
+/// and take every lock with `try_lock`, declining rather than spinning, so a contended pass repaints
+/// on the next one. A clock read on that path must obey the same rule: `unix_now`'s `UNIX_ANCHOR.lock`
+/// would spin against a concurrent `set_anchor` (an SNTP sync or a `setdate`), and a spin inside a
+/// composite is exactly what that subsystem forbids.
+///
+/// Returns `None` for BOTH "never anchored" and "the anchor lock was momentarily contended", which
+/// the one caller (the menu bar's clock) renders identically as `unsynced` — a strip that cannot read
+/// the clock this pass simply draws no clock and repaints when it can, the same shape `logts_now`
+/// already uses for the same lock. A `None` here is therefore never a lie: it is the absence of a
+/// reading, not a fabricated time.
+pub fn try_unix_now() -> Option<u64> {
+    let guard = UNIX_ANCHOR.try_lock()?;
+    let a = guard.as_ref()?;
+    let elapsed = match monotonic() {
+        Some((ticks, freq)) => ticks.wrapping_sub(a.anchor_ticks) / freq,
+        None => 0, // no invariant/calibrated counter: frozen at the anchored value
+    };
+    Some(a.base_unix.saturating_add(elapsed))
+}
+
 /// The source of the current anchor, or `ClockSource::Unset` while never anchored.
 pub fn source() -> ClockSource {
     (*UNIX_ANCHOR.lock()).as_ref().map(|a| a.source).unwrap_or(ClockSource::Unset)
