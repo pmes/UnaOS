@@ -226,6 +226,24 @@ botring64 = []
 # unconditional — see usb_xhci.md §17 and the BOT-CBW block in drivers/xhci/mod.rs. It graduated
 # from experiment to fix on a two-boot metal A/B and there is deliberately no feature left that
 # could turn it back off.)
+# WIFI-1: the BCM4331 firmware-load path — arc 1 of the association ladder (`src/wifi/`; the wider
+# ladder is docs/dev/OS/06_NETWORK_STACK/bcm4331.md). Finds the AirPort radio in PCI CONFIG space by
+# class 0x02 / subclass **0x80** (class alone selects the BCM57765 Ethernet MAC — bcm4331.md §0) and
+# CROSS-CHECKS device/rev/subsys/BAR0/match-count against three metal boots, printing MATCH or
+# MISMATCH per field. Read-only: no BAR mapping, no MMIO, no register write, no bus-master. Then
+# locates the USER-SUPPLIED firmware SET on the program-source FAT volume (ucode29_mimo.fw +
+# ht0initvals29.fw + ht0bsinitvals29.fw per §S4, 8.3 aliases accepted, searched in /, /B43/,
+# /FIRMWARE/), bounds-validates each, classifies its container header (§S4's record is internally
+# inconsistent: reported, never enforced), and stages the bytes for arc 2. UnaOS ships no firmware
+# (CLEAN_ROOM_POLICY §4) — a missing file prints one honest ABSENT line and the pass ends in one
+# terminal verdict, then parks (no retry, no crash, radio stays down). Arc 2 owns bcma core
+# enumeration + the first device write; arc 3 owns association. Forward-only, at most one staging pass
+# per boot (the call sits at all THREE of main.rs's storage-ready loop passes, the
+# `fatverb_storage_witness` placement). x86_64-only and stripped by arroyo's `arm_features`. QEMU
+# models no BCM4331, so a QEMU run only ever witnesses the honest no-radio refusal. Default OFF =>
+# module + call sites vanish, byte-identical. Enable via `UNAOS_WIFI=1`. See
+# docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+wifi = []
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +

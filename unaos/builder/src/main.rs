@@ -194,6 +194,18 @@ fn main() {
     // same direction. Default OFF => module + call site unlinked, media byte-identical. Kept in sync
     // with arroyo's mapping.
     if std::env::var("UNAOS_BCMAS1").is_ok() { feats.push("bcmaS1"); }
+    // WIFI-1 (GR25): UNAOS_WIFI=1 arms src/wifi/ — the BCM4331 FIRMWARE-LOAD path. Config-space
+    // identification of the AirPort radio (class 0x02 / subclass 0x80), cross-checked against the
+    // metal facts bcm4331.md §0 pinned, then the user-supplied firmware SET located, validated and
+    // staged off the program-source FAT volume. THIS list is what reaches the kernel binary for
+    // MEDIA builds: the builder re-derives the x86 feature set from env, so a knob wired into arroyo
+    // alone ships the loader DISABLED while the `⚡ kernel features:` banner claims it is on (the
+    // s42/INSTGUI and WXN-M3b failure, and the one bcm4331.md §4 calls "not optional"). This arc is
+    // exposed in the same direction as the recon: a loader that silently did not run is
+    // indistinguishable on the wire from media with no firmware on it. Config reads + FAT reads
+    // only; no config write, no register write, no MMIO. Default OFF => module + call sites
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_WIFI").is_ok() { feats.push("wifi"); }
     // BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". Lifts the
     // EHCI hub-walk depth cap 2 -> 3 to reach the HCI controller behind the FULL-SPEED Broadcom hub
     // `0a5c:4500`, and — in the SAME change, because either alone is wrong — fixes the

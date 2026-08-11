@@ -349,6 +349,27 @@ _feats=""
 # media is byte-identical to the pre-flip default whichever way this knob points. Kept in sync with
 # builder/src/main.rs (which produces only x86 media, so it pushes `smolnet` unconditionally-by-default).
 [ -z "${UNAOS_NOSMOLNET:-}" ] && _feats="${_feats}smolnet,"
+# WIFI-1: UNAOS_WIFI=1 arms the BCM4331 FIRMWARE-LOAD path — arc 1 of the association ladder
+# (crates/kernel/src/wifi/; the wider ladder is docs/dev/OS/06_NETWORK_STACK/bcm4331.md). Finds the
+# AirPort radio in PCI CONFIG space by class 0x02 / subclass **0x80** — NOT class alone, which selects
+# the BCM57765 Ethernet MAC at 3:0.0 and is why the radio went unexamined for the life of the project
+# (bcm4331.md §0) — and CROSS-CHECKS its identity (device/rev/subsys/BAR0/match-count) against the
+# values three metal boots pinned, printing MATCH or MISMATCH per field. STRICTLY read-only: no BAR
+# mapping, no MMIO, no register write, no bus-master, no cfg:0x80. Then locates the USER-SUPPLIED
+# firmware SET on the program-source FAT volume — ucode29_mimo.fw + ht0initvals29.fw +
+# ht0bsinitvals29.fw (bcm4331.md §S4, core rev 29 + HT PHY; 8.3 aliases accepted), searched in /,
+# /B43/, /FIRMWARE/ — bounds-validates each, classifies its container header (§S4's own record is
+# internally inconsistent: reported, never enforced) and stages the bytes for arc 2. UnaOS ships NO
+# firmware (docs/MANIFESTO/CLEAN_ROOM_POLICY.md §4, bcm4331.md §S4 option 1): a missing file prints
+# one honest ABSENT line naming what was looked for and where, and the pass ends in one terminal
+# verdict, then parks — no retry, no crash, radio stays down. Forward-only, at most one staging pass
+# per boot; the call sits at all THREE of main.rs's storage-ready loop passes. QEMU models no BCM4331,
+# so a QEMU run only ever witnesses the honest no-radio refusal; metal-first by construction. Arc 2
+# owns bcma core enumeration + the first device write, arc 3 association. x86_64-only and stripped by
+# arm_features, so arming it never shifts a Pi/Jetson media hash. Default OFF => module + call sites
+# vanish, media byte-identical. Kept in sync with builder/src/main.rs. See
+# docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+[ -n "${UNAOS_WIFI:-}" ] && _feats="${_feats}wifi,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 
@@ -612,6 +633,14 @@ arm_features() {
     # fingerprint, so leaving it in (or its implied `bcmarecon`, already stripped above) would shift
     # every aarch64 media hash for zero observable change.
     f="${f//,bcmaS1,/,}"
+    # WIFI-1 (GR25) rides the same strip, for the same reason and by the same mechanism as
+    # `bcmarecon` above: `src/wifi/` is declared `#[cfg(all(feature = "wifi", target_arch =
+    # "x86_64"))]` and all three main-loop call sites carry the same pair, so `wifi` emits not one
+    # byte of aarch64 CODE — but an enabled feature is hashed into cargo's `-Cmetadata` fingerprint,
+    # so leaving it in would shift every aarch64 media hash between a default build and a
+    # `UNAOS_WIFI=1` one for zero observable change. Stripped => the x86 track can arm the radio's
+    # firmware loader without touching Pi or Jetson media at all.
+    f="${f//,wifi,/,}"
     # BT-L0 (GR21) rides the same strip, for the same reason and by the same mechanism as `kbdwit`
     # above: every line `bt` gates lives in `drivers/ehci/mod.rs`, which is declared
     # `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so `bt` emits not one byte of
@@ -1365,7 +1394,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the

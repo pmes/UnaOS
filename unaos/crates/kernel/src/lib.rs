@@ -54,6 +54,17 @@ pub mod net_sntp;
 // yet). See net_dns.rs.
 pub mod net_dns;
 
+// WIFI-1: the BCM4331 firmware-load path (`UNAOS_WIFI=1`) — PCI-config identification of the AirPort
+// radio (class 0x02 / subclass 0x80), cross-checked against the metal facts bcm4331.md §0 pinned,
+// plus the user-supplied firmware SET located, validated and staged off the program-source FAT
+// volume. Read-only in arc 1: no BAR mapping, no device MMIO, no association. x86_64-only (the radio
+// is an rMBP part) and `wifi` is stripped by arroyo's `arm_features`, so arming it never shifts a
+// Pi/Jetson media hash. Default OFF => the module and its three main-loop call sites vanish and every
+// image is byte-identical to baseline. See wifi/mod.rs,
+// docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md and docs/dev/OS/06_NETWORK_STACK/bcm4331.md.
+#[cfg(all(feature = "wifi", target_arch = "x86_64"))]
+pub mod wifi;
+
 pub mod allocator;
 pub mod shell;
 pub mod selftest;
