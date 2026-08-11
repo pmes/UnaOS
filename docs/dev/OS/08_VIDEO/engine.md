@@ -9839,7 +9839,7 @@ Same pixels, same shape, **457 689 cycles ≈ 24 cyc/px — 3.9x cheaper**.
 Headless x86 QEMU, `UNAOS_WC=1 ./arroyo test 60`, three tiles at 504 x 52:
 
 ```
-[dock] selftest passes=38 paints=26 rate=684/1k scan=41545cyc/20us paint=609453cyc/305us px/paint=18992 ...
+[dock] selftest passes=38 paints=26 clob=0 rate=684/1k scan=41545cyc/20us paint=609453cyc/305us px/paint=18992 ...
 [comp2] rollup passes=2 pass_us=16999 max_us=19232 sprite_us=484 blit_us=14718 dmg_px_pp=119700 ...
 ```
 
@@ -9900,14 +9900,124 @@ of the file behind the same x86+`wc` gate (an insertion higher up renumbers ever
 
 * **HOVER is not wired.** Only PRESS feedback exists (`BUTTON_FACE_PRESSED`). Hover would need a
   motion hook in the pointer path, which was outside this arc's lane.
-* **Windows are not kept off the strip.** macOS windows go under the dock and so do ours — the dock
-  is painted last, so it is always on top — but the tiler still places windows over the bottom of the
-  panel, so a window that overlaps the strip and presents at frame rate will repaint the dock at frame
-  rate. Fixing it means reserving the strip inside `wm::place`, which is the tiler, and belongs to
-  whoever owns that file next.
+* **Windows are not kept off the strip** — and as of WCK5 they no longer repaint it either. macOS
+  windows go under the dock and so do ours; the dock is painted last, so it is always on top. The
+  tiler still places windows over the bottom of the panel, and reserving the strip inside `wm::place`
+  still belongs to whoever owns that file next. What is fixed is the consequence: a window that
+  overlaps the strip used to publish its chrome over it on every present and force a repaint at frame
+  rate. See *WCK5* below.
 * **A cut strip corner is filled with `DESKTOP_BG`**, exactly as `paint_window` fills a window's cut
   head corners. Over a window rather than the desktop that is four small wrong pixels per corner. Same
   rule the window chrome already lives with, recorded rather than newly introduced.
+
+### WCK5 — the strip in the window-blit clip (2026-08-11)
+
+**The report (Peter, Boot B, attended): *"dragging is worse for the taskbar now, it goes away
+dragging any window."*** The capture convicted the window-blit path outright. Every `[drag-occ]` line
+in `gr25-bootB` is clean on the ERASE side — `fillover_px=0`, the strip in the erase clip
+(`dock=340x52+1270+1736`), `fillclip_dock_px` nonzero whenever the drag crossed the strip — so WCK4's
+erase discipline was holding. What remained was WCK4's own KNOWN GAP D3: `wm::occ_clip`, the clip a
+WINDOW blit is emitted through, is built from `TABLE` rows, and **the dock is not a row**. A window
+whose `outer_box` overlapped the strip published chrome and corners straight over it on every
+composite; `dock::compose`'s `clobbered` test then repainted the strip at the tail of the same pass.
+Disappear and reappear, at motion rate. DRAGGLIDE raised motion throughput and so raised the rate,
+which is why a change that touched none of this code made the symptom worse.
+
+**The law: the strip is topmost by construction.** Between two windows the membership test is a
+`(z, id)` half-space, because the blit order *is* that key and a window may paint over anything below
+it. The dock is not in that order at all — `composite_once` calls `dock::compose()` after
+`composite_inner` returns, *"the pass's LAST layer under the sprite: after every window, before the
+cursor tail"* — so there is no `z` at which a window is above the strip. A window pixel inside the
+strip is a pixel with a lifetime of one composite tail. So `occ_clip` admits the strip for **every**
+subject, tested only for overlap, with no `(z, id)` term. The `above_shell` membership for rows is
+untouched: the strip is furniture and is admitted outside the row loop, exactly as `erase_clip`
+admits it, so a parked console neither enters the set nor is protected by it.
+
+**Geometry, without a second table lock.** `erase_clip` can afford `wm::dock_scan` and its `TABLE`
+acquisition because it runs once per drain. `occ_clip` runs once per window per pass inside the blit
+loop, where a lock would be both a cost and a fresh interleave. The rect therefore comes from
+`dock::Layout::for_panel` — the dock's own tile arithmetic, the same call `erase_clip` makes — fed by
+`wm::dock_tiles`, which counts dock-addressable rows from the snapshot the pass is already blitting
+from, through `wm::dock_addressable`, the predicate extracted from `dock_scan` rather than copied out
+of it. One definition of which windows the strip is sized by, two callers.
+
+**Capacity.** `OCC_MAX` is `MAX_WINDOWS + 1`. `occ_clip` excludes its own subject, so its worst case
+is `MAX_WINDOWS - 1` windows plus one strip — `MAX_WINDOWS`, still one short, and now stated as
+`OCC_CLIP_MAX` with a `const _: () = assert!(…)`. The strip goes in through `OccClip::push`, so a
+future third piece of furniture is declined rather than written past the end.
+
+**On the wire.** `[drag-occ]` gains three fields, on the same D1 rule WCK4's erase side already
+follows — a zero that cannot tell *"the clip held the dock"* from *"the dock was absent"* is vacuous:
+
+```
+occdock=340x52+1270+1736 occclip_dock=214 occclip_dock_px=1046592
+```
+
+* `occdock=` — the strip as the WINDOW-blit clip saw it, or the literal `absent`. A separate
+  publication from `dock=`, which comes from `erase_clip` and only when a drain ran; a capture in
+  which the two disagree is itself a finding.
+* `occclip_dock=` — window blits during the gesture whose clip **carried** the strip. The population.
+* `occclip_dock_px=` — pixels those blits **withheld** because of it, derived per row as the strip's
+  columns inside the window's box minus the strip's columns the row actually published. A measurement
+  of the span walk, not of two rectangles: a walk that leaks chrome into the strip lowers this term at
+  the same moment it puts pixels on the taskbar. Folded unconditionally, **not** through
+  `dragocc_note` — that path is gated on `dragocc_target`, which returns `None` for the dragged window
+  itself, and the dragged window is precisely the one whose chrome crosses the strip.
+
+`x86-witness.spec` pins the pair: `FORBID \[drag-occ\] .* occclip_dock=[1-9][0-9]* occclip_dock_px=0`
+— the strip in *N* clips and nothing withheld is the defect. `occclip_dock=0` is deliberately not
+forbidden: a drag that stayed away from the foot of the panel legitimately never met the strip.
+
+**The instrument was made to FIRE before it was believed.** On the headless x86 gate the tiler places
+its windows well above a 1280x800 panel's strip, so a clean run reads the honest zero — the strip in
+the clip, nothing crossing it:
+
+```
+... clipn=3 dock=340x52+470+736 fillclip_dock_px=0 occdock=340x52+470+736 occclip_dock=0 occclip_dock_px=0 -> CLEAN
+```
+
+A zero from an instrument that has never been seen nonzero is the failure class this repo keeps
+convicting, so `Layout::for_panel`'s `y` was temporarily pinned to 100 — putting the strip under the
+gate's own windows — and the same run read:
+
+```
+... clipn=3 dock=340x52+470+100 fillclip_dock_px=36608 occdock=340x52+470+100 occclip_dock=7 occclip_dock_px=54808 -> CLEAN
+```
+
+Seven window blits carried the strip and withheld 54 808 pixels of it. The probe was reverted; it is
+recorded here because the reverted diff is the only evidence the counters can move, and because
+`occdock=` tracked `dock=` through both runs, which is the cross-check between the two independent
+publications actually being made rather than assumed.
+
+**And the consequence, on the artifact that showed the symptom.** `occclip_dock_px` is `witness`-only
+and the metal image is built without `witness`, so the `[dock]` ledger carries a `clob=` counter —
+passes in which a window had painted over the strip, counted at the damage question. `paints=`
+conflates a MODEL change (a window opened, closed, was renamed) with a CLOBBER; during a sustained
+drag the model does not change at all, so before WCK5 every paint of a drag was a clobber. `clob=`
+should now be near-idle across a drag, and the on-glass falsification is Peter's eye: **drag any
+window across the strip and the strip must not blink.**
+
+```
+[dock] live passes=1 paints=0 clob=0 rate=0/1k scan=1922740cyc/963us paint=0cyc/0us px/paint=0 ...
+```
+
+**aarch64 is untouched, structurally.** The dock is `x86_64 + wc`; off that, `occ_clip`'s dock term
+does not compile — `super::dock` is never named, no `for_panel` runs, the clip stays `OccClip::none`
+and every aarch64 blit is pixel-identical to the pre-arc blit. `pw`/`ph` are two arguments that arch
+pays and cannot use, which is `OccClip`'s standing *"same pixels, not same bytes"* boundary.
+`pi4-regression.spec` reads 105/105 at both 640x480 and 1920x1200.
+
+**A pre-existing pi4 gate flake, named because this arc tripped over it.** `./arroyo kernel8-test`
+intermittently reds on a `[wc-h] rollup` FORBID — twice in nine runs on this arc's tree
+(`torn=0 declines=1 fixture=1 -> UNSTAGED`) and, checked by reverse-applying the whole diff and
+re-running the same gate at `4d634d06`, **once in two runs at the baseline**
+(`torn=4 maxpresent_us=15455 -> AT-RISK`). Required witnesses are 105/105 in every run, passing and
+failing alike; only the rollup verdict moves, and the "lines scanned" figure swings from 2 563 to
+8 296 across runs, which is a TCG host-load signature. It is not attributable to WCK5 by
+construction: `video/dock.rs` is not compiled on aarch64 (`mod dock` carries the `x86_64 + wc` gate)
+and every line this arc added to `wm.rs` is inside a `target_arch = "x86_64"` block, the two unused
+`occ_clip` arguments excepted. Recorded rather than absorbed — a gate that reds one run in five is a
+gate whose next real regression will be read as noise.
 
 ## KNURL — the milled crosshatch on the control discs, and the size ruling that made it legible (2026-08-09)
 

@@ -373,6 +373,19 @@ static PAINT_PX: AtomicU64 = AtomicU64::new(0);
 static PRESSES_N: AtomicU64 = AtomicU64::new(0);
 static RAISES: AtomicU64 = AtomicU64::new(0);
 static UNHIDES: AtomicU64 = AtomicU64::new(0);
+/// WCK5 — **passes in which a window had painted over the strip.** The repaint this arc is removing.
+///
+/// `paints` conflates the two damage conditions: a MODEL change (a window opened, closed, was renamed
+/// or changed focus — a repaint the dock owes and always will) and a CLOBBER (a window blit published
+/// over the strip, so the strip has to put itself back). During a sustained drag the model does not
+/// change at all, so before WCK5 every paint of a drag was a clobber and the strip was being redrawn
+/// at motion rate — Peter's "it goes away dragging any window", from the panel's own ledger.
+///
+/// `occclip_dock_px` proves the withholding on a `witness` build; this proves the CONSEQUENCE on the
+/// metal image, which is built without `witness` and is the only artifact the symptom was ever seen
+/// on. Deliberately counted at the damage question rather than at the paint, so it stays readable
+/// when a model change and a clobber coincide.
+static CLOBBERS: AtomicU64 = AtomicU64::new(0);
 
 /// The scratch the strip is composed in — CACHED RAM, never the scan-out. One row of logical colours
 /// and one of pre-encoded framebuffer words; the encode is hoisted out of the pixel loop through a
@@ -469,6 +482,10 @@ pub fn compose() -> bool {
     // Ask `wm` for the tile model AND the damage question in ONE table scan: "were any of the
     // windows that intersect the strip I last painted damaged in the pass that just ran?"
     let (n, clobbered) = wm::dock_scan(&mut rows, unpack_rect(PAINTED_RECT.load(Ordering::Acquire)));
+    // WCK5 — one relaxed add on the pass that was clobbered, and nothing at all on the quiet pass.
+    if clobbered {
+        CLOBBERS.fetch_add(1, Ordering::Relaxed);
+    }
     let (pw, ph) = {
         let fb = *super::WRITER.lock();
         if !fb.is_ready() {
@@ -887,10 +904,11 @@ pub fn rollup(scope: &str) {
     let scan = SCAN_CYC.load(Ordering::Relaxed) / passes;
     let paint = PAINT_CYC.load(Ordering::Relaxed) / paints.max(1);
     serial_println!(
-        "[dock] {} passes={} paints={} rate={}/1k scan={}cyc/{}us paint={}cyc/{}us px/paint={} presses={} raises={} unhides={}",
+        "[dock] {} passes={} paints={} clob={} rate={}/1k scan={}cyc/{}us paint={}cyc/{}us px/paint={} presses={} raises={} unhides={}",
         scope,
         PASSES.load(Ordering::Relaxed),
         paints,
+        CLOBBERS.load(Ordering::Relaxed),
         (paints * 1000) / passes,
         scan,
         cycles_to_us(scan),
