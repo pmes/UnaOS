@@ -1,7 +1,8 @@
-//! GEN7-3D rungs R1/R2 — Ivy Bridge GT2 render-engine reconnaissance and the GT power-well wake.
+//! GEN7-3D rungs R1/R2/R3 — Ivy Bridge GT2 render-engine reconnaissance and the GT
+//! power-well wake.
 //!
 //! Design of record: `~/unaos-bench/scratch/gr25/GEN7-3D-draft.md` (GR25). This module
-//! implements two legs of that ladder:
+//! implements three legs of that ladder:
 //!
 //! * **R1 (`recon`)** — a read-only census that answers "is the GT window alive, is there a
 //!   forcewake block where the draft guessed, what is in the GGTT, and where is stolen
@@ -13,13 +14,25 @@
 //!   R1 read dark reading STRUCTURED/varying afterward — a dark→live transition on the
 //!   fourteen ring-block registers R2 never wrote. Three power-management writes, all
 //!   reversed in-rung, and **not one display register** among them.
+//! * **R3 (`forcewake`)** — the rung that goes after the power well itself. R2 flew on Boot
+//!   D and came back `verdict=gt-still-dark trans_untouched=0/14 poll_ack=1`: the write went
+//!   on the wire, the poll target read zero, and **nothing lit**. That is the Sync-Flush
+//!   workaround doing exactly what its own PRM section says it does — draining the command
+//!   streamer — and it is *not* a power-well acquire. R3 therefore drives the two
+//!   **forcewake request/ack register pairs Intel actually published** (on later silicon;
+//!   see the citation classes below), one at a time, each acquire released in-rung with the
+//!   release **verified against the entry value**, and re-reads the same 17-register battery
+//!   under each hold. It writes **two registers at most, one at a time**, both in the GT
+//!   power/PM block, neither in a ring block, neither in a display block.
 //!
 //! ## The structural promise
 //!
 //! **This module cannot black Peter's panel.** Two independent reasons, and both hold:
 //!
 //! 1. R1 writes nothing; R2 writes only three GT **power-management** registers
-//!    (`INSTPM 0x2050`, `RCS_WAKE 0x2700`) and re-parks `INSTPM` before it returns — no GGTT
+//!    (`INSTPM 0x2050`, `RCS_WAKE 0x2700`) and re-parks `INSTPM` before it returns; R3 writes
+//!    only the two **forcewake request** registers (`0x0A188`, `0x1300B0`) and releases each
+//!    back to its entry value in the same rung — no GGTT
 //!    entry, no ring register, nothing in a display block. ⚠ Stated precisely, because the
 //!    loose version of this sentence was wrong: **the one display-block offset this file
 //!    touches is read, never written, in either rung.** That offset is `PCH_PP_CONTROL`
@@ -163,7 +176,19 @@ pub mod g7regs {
     pub const RCS_WAKE: usize = 0x02700;
     pub const RENDER_IDLE_POLL: usize = 0x022AC;
 
-    // ---- [BDW-ONLY] / [CHV-ONLY] — HYPOTHESES, READ ONLY, NEVER WRITTEN ------------
+    // ---- [BDW-ONLY] / [CHV-ONLY] — HYPOTHESES; two of them are WRITTEN by R3 -------
+    //
+    // ⚠ HEADING CORRECTED WHEN R3 LANDED. Through R1/R2 this block was "READ ONLY, NEVER
+    // WRITTEN", and that was true. R3 breaks it deliberately for exactly two offsets —
+    // `HYP_FORCEWAKE_MT` (0x0A188) and `HYP_RENFW_REQ` (0x1300B0), the two **request**
+    // registers of the two forcewake pairs Intel published — and the sentence is fixed here
+    // rather than left standing, because a stale safety claim is worse than none. The other
+    // six offsets in this block are still read-only in every rung. The licence for writing
+    // an offset pinned only on later silicon is the draft's own §0 rule: an [EXT-UNPINNED] /
+    // later-silicon fact's *legal use is as a hypothesis this ladder tests on our own
+    // silicon*, and §5's write-rung rules are what make the test safe — one candidate at a
+    // time, released in-rung, the release verified against the entry value, and no display
+    // register anywhere near it.
     //
     // ⚠ The draft's G2 says the forcewake handshake sits "in the 0x0A180-class block".
     // That is **NOT confirmable against Ivy Bridge documentation**. The complete
@@ -216,6 +241,22 @@ pub mod g7regs {
     // `0x00000000`, and this module classifies both. (b) GTFIFOCTL's documented bit
     // layout is all policy bits and spares: **there is no GT_FIFO_FREE_ENTRIES count
     // field in it**, on any generation, in any Intel PRM. That half of G2 is refuted.
+    //
+    // ⚠ [METAL, Boot D 2026-08-11] — the single most important reading R1 produced, and R3
+    // is built on it. `:: gen7: gt blk=fw name=HYP_GTFIFOCTL off=120008 v0=0000003F
+    // v1=0000003F cls=structured ::` — **this was the ONLY structured register in the whole
+    // 25-register probe.** Every ring-block register, every 0xA18x offset and every other
+    // 0x13xxxx offset read `0x00000000`. So on THIS part, at THIS offset, something decodes
+    // and returns a stable non-zero pattern while the 0x2xxxx ring block is dark. Two
+    // consequences, and neither is a decode of the value (we have no IVB field layout for
+    // it, and `0x3F` is NOT claimed to be a free-entry count — that would be the refuted
+    // half of G2 sneaking back in):
+    //   1. The BAR0 window reaches the 0x12xxxx block, so a zero at 0x1300xx is a statement
+    //      about that register, not about the mapping.
+    //   2. There is a live GT-wrapper block OUTSIDE whatever gates the ring registers.
+    // R3 reads this register in **every** column for exactly that reason: it is the nearest
+    // thing this machine has to an always-on GT witness, so a CHANGE in it across a
+    // forcewake acquire is evidence, and its steadiness is a decode control.
     pub const HYP_GTFIFOCTL: usize = 0x120008;
     // [CHV-ONLY] same doc pp.487-489, GTLC_PW_STAT, Address 130094h, bit 1 ALLOWWAKEERR:
     //       "When access to media or render is observed when ALLOWWAKE=0, the ALLOWWAKERR
@@ -856,12 +897,20 @@ unsafe fn wr(bar0: usize, off: usize, v: u32) {
 /// this field returns zero"), so a healthy decode of `INSTPM=0x00010001` post-reads
 /// `0x00000001`, and the re-park post-reads `0x00000000`. A power-gated window post-reads
 /// `0x00000000` regardless — which is itself a reading, not a hang.
-unsafe fn witnessed_write(bar0: usize, name: &str, off: usize, val: u32, src: &str) {
+///
+/// `tag` names the RUNG on the wire (`wake` for R2, `r3` for R3) so a log reader never has to
+/// infer which rung a write belongs to from its position in the capture.
+///
+/// Returns the POST-read. R2 discards it (its evidence is the battery); R3 needs it, because
+/// whether the target register reads back its own write at all is what decides whether R3's
+/// restore verification has any discriminating power — see `try_candidate`'s `readback=`.
+unsafe fn witnessed_write(bar0: usize, tag: &str, name: &str, off: usize, val: u32, src: &str) -> u32 {
     let pre = rd(bar0, off);
     wr(bar0, off, val);
     let post = rd(bar0, off);
     serial_println!(
-        ":: gen7: wake step name={} off={:06X} wrote={:08X} pre={:08X} post={:08X} src={} ::",
+        ":: gen7: {} step name={} off={:06X} wrote={:08X} pre={:08X} post={:08X} src={} ::",
+        tag,
         name,
         off,
         val,
@@ -869,12 +918,21 @@ unsafe fn witnessed_write(bar0: usize, name: &str, off: usize, val: u32, src: &s
         post,
         src
     );
+    post
 }
 
 /// Read the whole battery once (each register twice), record values and per-register
-/// variance, and print one `col=` line per register. `label` is `pre` or `held`.
+/// variance, and print one `col=` line per register. `label` is the column name (`pre` /
+/// `held` for R2; `r3pre` / `mt` / `renfw` / `r3post` for R3).
+///
+/// ⚠ The `touched=` field on each line is **R2's annotation** — it is the `GT_BATTERY` tuple's
+/// fourth element and it means "the R2 wake sequence writes this register". R3 writes none of
+/// the seventeen, so under an `r3` tag a `touched=1` line is still a register R3 never wrote,
+/// and R3's liveness count is drawn from all seventeen precisely because of that. The field
+/// keeps its name across both rungs so a capture analyzer written for Boot D still parses.
 unsafe fn read_battery(
     bar0: usize,
+    tag: &str,
     label: &str,
     v: &mut [u32; BATTERY_N],
     varied: &mut [bool; BATTERY_N],
@@ -885,7 +943,8 @@ unsafe fn read_battery(
         v[i] = a;
         varied[i] = a != b;
         serial_println!(
-            ":: gen7: wake col={} blk={} name={} off={:06X} v0={:08X} v1={:08X} cls={} varies={} touched={} ::",
+            ":: gen7: {} col={} blk={} name={} off={:06X} v0={:08X} v1={:08X} cls={} varies={} touched={} ::",
+            tag,
             label,
             blk,
             name,
@@ -951,7 +1010,7 @@ pub unsafe fn wake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
     // ---- Before column ----------------------------------------------------------------
     let mut before = [0u32; BATTERY_N];
     let mut before_var = [false; BATTERY_N];
-    read_battery(bar0, "pre", &mut before, &mut before_var);
+    read_battery(bar0, "wake", "pre", &mut before, &mut before_var);
 
     // ---- The wake sequence (draft §3.1 P2 / IVB-V1P3 §1.1.10.9 pp.70-71) --------------
     // Every write PINNED against IVB-V1P3 (the doc pinned in g7regs). The 0x00010001 /
@@ -959,9 +1018,9 @@ pub unsafe fn wake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
     // the same volume ~p.66.
     //
     // Step 1 — INSTPM disable sequence: set data bit 0 (mask bit 16 arms it).
-    witnessed_write(bar0, "INSTPM_disable", g7regs::INSTPM, 0x0001_0001, "IVB-V1P3-1.1.10.9-p70");
+    witnessed_write(bar0, "wake", "INSTPM_disable", g7regs::INSTPM, 0x0001_0001, "IVB-V1P3-1.1.10.9-p70");
     // Step 2 — "Wake up CS but don't do anything".
-    witnessed_write(bar0, "RCS_WAKE_poke", g7regs::RCS_WAKE, 0x0000_0000, "IVB-V1P3-1.1.10.9-p71");
+    witnessed_write(bar0, "wake", "RCS_WAKE_poke", g7regs::RCS_WAKE, 0x0000_0000, "IVB-V1P3-1.1.10.9-p71");
 
     // Step 3 — poll 0x22AC[3:0] == 0 ("Guarantees render pipe is awake"), bounded.
     let mut iters = 0u32;
@@ -990,14 +1049,14 @@ pub unsafe fn wake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
     // ---- Held column — read the SAME battery while the wake is asserted ---------------
     let mut held = [0u32; BATTERY_N];
     let mut held_var = [false; BATTERY_N];
-    read_battery(bar0, "held", &mut held, &mut held_var);
+    read_battery(bar0, "wake", "held", &mut held, &mut held_var);
 
     // ---- Re-park — restore INSTPM = 0x00010000 (clear data bit 0 via mask bit 16) ------
     // This runs on EVERY path that reached here (poll ack OR poll timeout): it is a
     // straight-line write, not inside either branch. It returns INSTPM to the RC6-eligible
     // state firmware left, so the GT may re-enter RC6; no display register is touched and the
     // panel is the Kepler's regardless. The post-read is the reversal witness.
-    witnessed_write(bar0, "INSTPM_repark", g7regs::INSTPM, 0x0001_0000, "IVB-V1P3-1.1.10.9-p71");
+    witnessed_write(bar0, "wake", "INSTPM_repark", g7regs::INSTPM, 0x0001_0000, "IVB-V1P3-1.1.10.9-p71");
 
     // ---- The transition tally — Wall D: a value WE caused is not a witness -------------
     // A register counts as "was dark" if its pre column was zero-or-ones AND did not vary,
@@ -1059,9 +1118,758 @@ pub unsafe fn wake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
         ":: gen7: r2 next={} note=re-parked-INSTPM=0x00010000-no-display-register-touched ::",
         match verdict {
             "gt-woke" => "R3-ggtt-claim(read-only)-then-R4-ring-then-R5-MI_STORE_DATA_IMM",
-            "gt-still-dark" => "STOP-wake-acked-but-battery-dark-forcewake-block-is-elsewhere",
+            "gt-still-dark" => "R3-forcewake-request/ack-pairs(0x0A188/0x130044,0x1300B0/0x1300B4)",
             _ => "STOP-poll-never-cleared-sync-flush-wa-out-of-context-is-not-a-general-wake",
         }
     );
     serial_println!(":: gen7: wake end ::");
+}
+
+// ===================================================================================
+// R3 — the forcewake acquire. The rung that goes after the GT power well itself.
+// ===================================================================================
+//
+// ## Why R3 exists, in one paragraph
+//
+// R2 flew on Boot D (`~/unaos-bench/capture/gr26-bootD/ttyUSB0.log`) and returned
+// `:: gen7: r2 verdict=gt-still-dark trans_all=0/17 trans_untouched=0/14 struct=0 varies=0
+// poll_ack=1 poll_iters=0 rung=R2 wrote=3 reparked=1 ::`. Read carefully, that line says
+// three separate things, and only the first is good news:
+//
+//  * The write path is real — the rung reached the wire and returned. Nothing hung.
+//  * `poll_ack=1 poll_iters=0` is **not** an ack. `0x22AC` read `0x00000000` on the first
+//    look, and `idle[3:0] == 0` is the pass condition, so a **power-gated window that
+//    returns zero for everything passes this poll on iteration zero**. The R2 verdict block
+//    already said so in as many words ("or `0x22AC` was already zero, as a gated window
+//    reads"); Boot D is that sentence coming true. R3 must therefore never build a verdict
+//    on a zero-valued pass condition again — every ack test below is a **transition** test.
+//  * `wake step name=INSTPM_disable wrote=00010001 pre=00000000 post=00000000` — the write
+//    did not latch anything readable. On a mask-write register a zero post-read is expected
+//    (the mask field reads zero) but bit 0 of the DATA field should have read back `1`.
+//    It read `0`. Combined with `trans_untouched=0/14`, the plain reading is: **the whole
+//    0x2xxxx GT register block is behind a closed power well, and the Sync-Flush workaround
+//    cannot open it because draining a command streamer is not the same act as powering
+//    one.** That is the wall the draft's §4.1 named, standing exactly where it said it
+//    would.
+//
+// So R3 stops borrowing a workaround and goes at the documented mechanism: a forcewake
+// **request** register and its **ack** partner, held while the battery is read.
+//
+// ## Provenance, and the clean-room line this rung does not cross
+//
+// The draft's §0 is binding: Intel PRMs are a legal pinning target, **Linux `i915` and Mesa
+// `i965` driver source are off-limits and are not a source for anything in this ladder.**
+// Every offset R3 touches was already in `g7regs` before this rung existed, pinned by
+// document, volume and page **on Broadwell or on Cherryview/Braswell** — because Intel never
+// published the Gen7 forcewake block (R0.1 searched all sixteen IVB volumes; the only hit is
+// the register-less "Force Wakeup bit" prose). No offset in this rung comes from driver
+// source, and none is claimed as an Ivy Bridge fact. They are hypotheses, and §0 says
+// exactly what a hypothesis is for: *to be tested on our own silicon*, which is what a rung
+// is. The wire says `pin=BDW-ONLY` / `pin=CHV-ONLY` on every line so no reader can mistake
+// the class.
+//
+// ## The two candidates, and why both fly in one boot
+//
+//  * **A — MT.** Request `FORCE_WAKE` `0x0A188`, ack `GTSP1 0x130044[15:0]`
+//    ("GT programs this field with the multiple force wake status") — [BDW-ONLY],
+//    IHD-OS-BDW-Vol 2c-11.15 pp.493 / 703. Mask-write form: `0x00010001` requests thread 0,
+//    `0x00010000` releases it. This is the pair whose *ack partner is not in the 0xA18x
+//    block*, which is the specific fact R0.1 established and the draft as first written got
+//    wrong.
+//  * **B — per-well RENFW.** Request `0x1300B0`, ack `0x1300B4` — [CHV-ONLY],
+//    IHD-OS-CHV-BSW-Vol 2c-10.15 pp.1078/1077, "Driver must poll on the corresponding bit to
+//    confirm that the well has woken". A different shape (per-power-well rather than
+//    per-thread) at a different offset.
+//
+// The draft's §5 rule is "one variable per boot, **with an A/B fallback where a single
+// binary question is open**". The question is binary ("does either published pair decode on
+// Gen7?") and B runs **only if A did not wake the GT** — where "wake" means an ack transition
+// AND real battery motion — each with its own hold column and its own release.
+//
+// ⚠ How far that carries, exactly (review, GR26). It makes the VERDICT unambiguous: `woke_by`
+// and `motion_by` both test candidate A first, so any motion A produced is attributed to A.
+// It does **not** make every per-candidate line clean evidence, and the earlier wording here
+// ("a battery that lights under B alone is B's") overstated it. The gap is the
+// motion-without-ack shape: A lights the battery, `a_woke` is false because no ack asserted,
+// B runs anyway, and B's `cand=renfw battery` line is then read on a GT A may already have
+// lit. Closing it would mean skipping B on motion alone — spending the boot's second
+// candidate on precisely the reading that most needs one — so it is documented instead, and
+// the rule for a capture reader is: take the `mt` lines first.
+//
+// ## Wall D for R3 — three ways this rung refuses to fool itself
+//
+// 1. **Every ack test is a transition test with a stability precondition.** An ack counts
+//    only if the register's entry column was `0x0000` in the watched field AND read twice
+//    identically, and the held column is non-zero in that field. Boot D proved why: a
+//    zero-pass condition passed against a dead well on iteration zero.
+// 2. **The liveness evidence is the battery R3 never writes.** All seventeen battery
+//    registers are untouched by R3 (it writes only `0x0A188` / `0x1300B0`, neither of which
+//    is in the battery) — so unlike R2, there is no touched/untouched split to police here
+//    and the whole battery is an honest witness. `gt-woke` needs REAL motion in it (≥2
+//    registers gone structured, or any read-twice `varies`), the same threshold R1 and R2
+//    used, **and** an ack transition. Motion without an ack is not thrown away — it gets its
+//    own verdict (`gt-woke-noack`), because "the write worked and the ack register is not
+//    where we think" is a finding, not a null.
+// 3. **`gt-live-already` dominates the verdict.** If the entry battery — measured before any
+//    write — is already live, a transition-based wake claim is unreadable in principle, and
+//    the rung says so instead of counting motion it cannot attribute. That arm also happens to
+//    be the draft's "CONFIRMED (G1 false)" outcome. ⚠ Stated precisely (review, GR26): this is
+//    a verdict rule, **not a guard that skips the acquires**. Both candidates still run under
+//    `pre_live`, deliberately — on an already-live GT the ack registers' behaviour is the open
+//    question R3 exists to answer, and refusing to write would discard it while making nothing
+//    safer. Earlier wording here said "checked first", which read as a skip.
+//
+// ## Reversibility — the rule this rung is most exposed to, and how it is verified
+//
+// Each candidate is released **in the same rung, on every exit path**, and the release is
+// double-form because the register's write semantics are themselves a hypothesis: first the
+// mask-form release (`0x00010000`, which clears data bit 0 on a mask register and is what
+// the BDW pin documents), then a plain write of **the exact dword read at entry** (a no-op
+// on a mask register, since a zero mask modifies nothing; an exact restore on a plain
+// register). Whichever semantics the part really has, the register ends at its entry value —
+// and the rung does not take that on faith: it re-reads and prints `restored=` per candidate
+// and a rung-wide `restore=clean|dirty`, with a `dirty` result named on the verdict line
+// rather than buried.
+//
+// ⚠ AND THE RE-READ IS ITSELF SUSPECT ON THIS PART (review, GR26) — the honesty this
+// paragraph claims has to survive Wall D pointed at it. `restored=` is
+// `req_post == req_pre && ack_post == ack_pre`, and Boot D predicts **all four of those
+// dwords read `0x00000000`** on this silicon: every 0xA18x and every 0x13xxxx offset read
+// zero. A `0 == 0` compare cannot fail, so on the expected readings `restored=1` would be
+// printed by a rung that released nothing at all — a witness that cannot fail, in a file that
+// convicts other people's instruments for exactly that. It is not fixable by testing
+// something else (there is nothing else to read), so the rung measures whether the check had
+// any power and says so: `readback=` (did the acquire write change the request register's
+// readback?), `ack_moved=`, and `evidence=` per candidate, plus `restore_evidence=real|blind`
+// on the verdict line. `restore=clean restore_evidence=blind` is the honest form of "as far
+// as anything readable on this part can tell" — and it is the outcome to EXPECT on Boot B.
+// The release itself is unaffected: it is correct under either semantics and does not depend
+// on the register being readable; only the claim about it is now bounded.
+// The verdict line also carries `frame=quiet|moved` separately from `restore=`, because a
+// change in the six frame registers R3 never writes is a statement about the GT, not about
+// our footprint, and folding it into `dirty` made a live status register (`GTFIFOCTL`) able
+// to report a perfectly-restored rung as dirty.
+//
+// A candidate whose request register is **already non-zero at entry** is
+// skipped without a write (`skipped=req-preheld`): something else is holding it and this rung
+// will not stomp another owner's state.
+//
+// No clock is reprogrammed, no RC6/RPS policy register is touched, no voltage or frequency
+// request is made, and nothing in a display block is written — the panel is the Kepler's
+// regardless (`igpu.rs` ~778, Boot AS).
+
+/// The always-on / power-frame registers R3 reads in **every** column. None of these is in
+/// `GT_BATTERY`, and R3 writes exactly two of them (the two request registers), which is why
+/// each row carries whether it is a written row.
+///
+/// `HYP_GTFIFOCTL` earns its place from metal: it was the only structured read in R1's
+/// 25-register probe on Boot D (`0x0000003F`, stable), so it is this machine's nearest thing
+/// to an always-on GT witness. Its *value* is not decoded — only its steadiness and any
+/// change across an acquire.
+const FW_FRAME: &[(&str, usize, &str)] = &[
+    ("FORCEWAKE_MT_REQ", g7regs::HYP_FORCEWAKE_MT, "BDW-ONLY-p493"),
+    ("FORCEWAKE_MT_ACK", g7regs::HYP_FORCEWAKE_MT_ACK, "BDW-ONLY-p703"),
+    ("RENFW_REQ", g7regs::HYP_RENFW_REQ, "CHV-ONLY-p1078"),
+    ("RENFW_ACK", g7regs::HYP_RENFW_ACK, "CHV-ONLY-p1077"),
+    ("GTFORCEAWAKE", g7regs::HYP_GTFORCEAWAKE, "BDW-ONLY-p656"),
+    ("GTLC_PW_STAT", g7regs::HYP_GTLC_PW_STAT, "CHV-ONLY-p487"),
+    ("MISC_CTRL0", g7regs::HYP_MISC_CTRL0, "BDW-ONLY-p605"),
+    ("GTFIFOCTL", g7regs::HYP_GTFIFOCTL, "CHV-ONLY-p451/METAL-BootD"),
+];
+
+const FRAME_N: usize = 8;
+
+/// Read the power frame once (each register twice) and print one line per register.
+unsafe fn read_frame(bar0: usize, label: &str, v: &mut [u32; FRAME_N], varied: &mut [bool; FRAME_N]) {
+    for (i, &(name, off, pin)) in FW_FRAME.iter().enumerate() {
+        let a = rd(bar0, off);
+        let b = rd(bar0, off);
+        v[i] = a;
+        varied[i] = a != b;
+        serial_println!(
+            ":: gen7: r3 frame col={} name={} off={:06X} v0={:08X} v1={:08X} cls={} varies={} pin={} ::",
+            label,
+            name,
+            off,
+            a,
+            b,
+            Cls::of(a).name(),
+            if a != b { 1 } else { 0 },
+            pin
+        );
+    }
+}
+
+/// How a candidate acquire ended. Every outcome is named here, before the rung runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Acq {
+    /// The request register was already non-zero at entry — another owner holds it. No write
+    /// was made, and no reading is drawn from this candidate.
+    SkippedPreheld,
+    /// Written, and the ack field made a real dark→set transition.
+    AckTransition,
+    /// Written, and the ack field never left its entry value within the poll budget.
+    NoAck,
+    /// Written, but the ack register's ENTRY column was already non-zero or unstable, so a
+    /// transition is not readable on it. The write still happened and the battery column is
+    /// still valid — this arm exists so an unreadable ack is never scored as an ack.
+    AckUnreadable,
+}
+
+impl Acq {
+    fn name(self) -> &'static str {
+        match self {
+            Acq::SkippedPreheld => "skipped-req-preheld",
+            Acq::AckTransition => "ack-transition",
+            Acq::NoAck => "no-ack",
+            Acq::AckUnreadable => "ack-unreadable",
+        }
+    }
+}
+
+/// Liveness reading of one battery column, measured against the entry column.
+struct Motion {
+    /// Registers dark at entry that read structured in this column.
+    gone_struct: u32,
+    /// Registers that varied between their two reads in this column.
+    varies: u32,
+}
+
+impl Motion {
+    /// The alive threshold, identical to R1's and R2's so the three rungs cannot disagree
+    /// about what "live" means: real motion, or at least two registers gone structured.
+    /// One stray latched bit is not a wake.
+    fn live(&self) -> bool {
+        self.gone_struct >= 2 || self.varies >= 1
+    }
+}
+
+/// Compare a held battery column against the entry column.
+fn motion(before: &[u32; BATTERY_N], before_var: &[bool; BATTERY_N], held: &[u32; BATTERY_N], held_var: &[bool; BATTERY_N]) -> Motion {
+    let mut m = Motion { gone_struct: 0, varies: 0 };
+    for i in 0..BATTERY_N {
+        let was_dark = matches!(Cls::of(before[i]), Cls::Zero | Cls::AllOnes) && !before_var[i];
+        if was_dark && matches!(Cls::of(held[i]), Cls::Structured) {
+            m.gone_struct += 1;
+        }
+        if held_var[i] {
+            m.varies += 1;
+        }
+    }
+    m
+}
+
+/// One forcewake candidate: acquire, poll its ack, read the battery under the hold, release,
+/// verify the release. Returns `(outcome, motion, restored, restore_evidence)`.
+///
+/// `restore_evidence` is the fourth element and it is the review fix that matters most in this
+/// function: it reports whether the `restored` verification could have failed at all on this
+/// part. See the block above the `release` line.
+///
+/// `ack_mask` is the field watched on the ack register. It is the low sixteen bits for both
+/// candidates: BDW pins GTSP1`[15:0]` as the multiple-force-wake status field, and the CHV
+/// per-well pair is documented as "poll on the corresponding bit" without pinning WHICH bit
+/// on this part — so the honest watch is the whole documented field, with the strict bit-0
+/// reading printed alongside it. A wider field cannot manufacture an ack here, because the
+/// test is a transition from a **stable zero** entry column, not a non-zero compare.
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_candidate(
+    bar0: usize,
+    cand: &str,
+    req_off: usize,
+    ack_off: usize,
+    ack_mask: u32,
+    src: &str,
+    poll_max: u32,
+    before: &[u32; BATTERY_N],
+    before_var: &[bool; BATTERY_N],
+) -> (Acq, Motion, bool, bool) {
+    let no_motion = Motion { gone_struct: 0, varies: 0 };
+
+    // Entry images. `req_pre` is what the release must restore the request register to —
+    // read once for the restore target and once more for stability, because a restore target
+    // that is itself unstable is not a restore target.
+    let req_pre = rd(bar0, req_off);
+    let req_pre2 = rd(bar0, req_off);
+    let ack_pre = rd(bar0, ack_off);
+    let ack_pre2 = rd(bar0, ack_off);
+    let ack_readable = (ack_pre & ack_mask) == 0 && ack_pre == ack_pre2;
+    serial_println!(
+        ":: gen7: r3 cand={} entry req_off={:06X} req_pre={:08X} req_pre2={:08X} ack_off={:06X} ack_pre={:08X} ack_pre2={:08X} ack_mask={:08X} ack_readable={} src={} ::",
+        cand,
+        req_off,
+        req_pre,
+        req_pre2,
+        ack_off,
+        ack_pre,
+        ack_pre2,
+        ack_mask,
+        if ack_readable { 1 } else { 0 },
+        src
+    );
+
+    // Refusal: someone already holds this request register. Do not write over another
+    // owner's state — read, report, return.
+    if req_pre != 0 || req_pre2 != 0 {
+        serial_println!(
+            ":: gen7: r3 cand={} outcome={} wrote=0 note=request-register-non-zero-at-entry-not-ours-to-clear ::",
+            cand,
+            Acq::SkippedPreheld.name()
+        );
+        // `evidence=true`: a skipped candidate makes no claim about a RELEASE, only the claim
+        // "nothing was written", and that one is directly established by the two entry reads
+        // printed above. It is not the vacuous `0 == 0` case the release check has to guard.
+        return (Acq::SkippedPreheld, no_motion, true, true);
+    }
+
+    // ---- Acquire ------------------------------------------------------------------------
+    // Mask-write form: upper 16 bits arm the corresponding data bits (IVB-V1P3 ~p.66 for the
+    // generic semantics; BDW p.493 for this register's mask field). Requesting data bit 0.
+    // The post-read is KEPT (review, GR26): whether this register reads back its own write is
+    // what decides whether the release verification below can falsify anything at all. See
+    // `readback=` on the release line.
+    let acq_post = witnessed_write(bar0, "r3", "FW_REQUEST", req_off, 0x0001_0001, src);
+
+    // ---- Poll the ack, bounded ------------------------------------------------------------
+    // The pass condition is `(ack & mask) != 0` — a transition away from the stable zero
+    // entry column. This is the direct correction of the R2/Boot-D defect, where the pass
+    // condition was `== 0` and a dead window satisfied it on iteration zero.
+    //
+    // ⚠ COST, and why it is on the wire (review, GR26). The budget is an ITERATION count, and
+    // an iteration count is not a time. The expected-negative outcome runs this loop to expiry
+    // on BOTH candidates, so R3's expected boot cost is `2 * poll_max` uncached MMIO reads —
+    // and until it flies, nobody knows what that is in milliseconds. `now_cycles()` (rdtsc,
+    // invariant on this part, and it advances regardless of EFLAGS.IF) brackets the loop, so
+    // `cyc=` converts `iters=` into a real number the first time this rung runs. The whole
+    // `igpu::init` span is already inside the boot-pace `G_IGPU` bucket (`arch/x86_64/pci.rs`),
+    // so the cost is double-booked deliberately: once as a phase, once per poll.
+    let t0 = crate::arch::now_cycles();
+    let mut iters = 0u32;
+    let mut ack;
+    loop {
+        ack = rd(bar0, ack_off);
+        if (ack & ack_mask) != 0 {
+            break;
+        }
+        iters += 1;
+        if iters >= poll_max {
+            break;
+        }
+    }
+    let cyc = crate::arch::now_cycles().wrapping_sub(t0);
+    let ack_set = (ack & ack_mask) != 0;
+    serial_println!(
+        ":: gen7: r3 cand={} poll ack_off={:06X} ack={:08X} masked={:08X} bit0={} iters={} max={} set={} cyc={} ::",
+        cand,
+        ack_off,
+        ack,
+        ack & ack_mask,
+        ack & 1,
+        iters,
+        poll_max,
+        if ack_set { 1 } else { 0 },
+        cyc
+    );
+
+    // ---- The held column -------------------------------------------------------------------
+    // Read whether or not the ack asserted: an ack register in the wrong place would not stop
+    // the request register from having woken the well, and that case has its own verdict.
+    let mut held = [0u32; BATTERY_N];
+    let mut held_var = [false; BATTERY_N];
+    read_battery(bar0, "r3", cand, &mut held, &mut held_var);
+    let m = motion(before, before_var, &held, &held_var);
+    serial_println!(
+        ":: gen7: r3 cand={} battery gone_struct={} varies={} of={} live={} ::",
+        cand,
+        m.gone_struct,
+        m.varies,
+        BATTERY_N,
+        if m.live() { 1 } else { 0 }
+    );
+
+    // ---- Release, in two forms, on every path ---------------------------------------------
+    // Form 1 — mask release: clears data bit 0 on a mask-write register (the documented
+    // semantics). Form 2 — exact restore: writes back the dword read at entry, which is a
+    // no-op on a mask register (mask=0 modifies nothing) and an exact restore on a plain one.
+    // Together they return the register to its entry value under EITHER semantics, which
+    // matters because which semantics this part implements is precisely what is unpinned.
+    witnessed_write(bar0, "r3", "FW_RELEASE_MASK", req_off, 0x0001_0000, src);
+    witnessed_write(bar0, "r3", "FW_RELEASE_EXACT", req_off, req_pre, src);
+
+    // ---- Verify the release ----------------------------------------------------------------
+    // Restore is not assumed. `restored` is true only if the request register reads back its
+    // entry dword AND the ack field has returned to its entry value (an ack still asserted
+    // after release means the well is being held by something we cannot see, and that is a
+    // finding the rung must not swallow).
+    let req_post = rd(bar0, req_off);
+    let ack_post = rd(bar0, ack_off);
+    let req_ok = req_post == req_pre;
+    let ack_ok = (ack_post & ack_mask) == (ack_pre & ack_mask);
+    let restored = req_ok && ack_ok;
+
+    // ⚠ WALL D, APPLIED TO THIS RUNG'S OWN SAFETY WITNESS (review, GR26). `restored=1` above
+    // is `req_post == req_pre` AND `ack_post == ack_pre` — and on the readings Boot D
+    // predicts for this part, **every one of those four dwords is `0x00000000`**. A test of
+    // `0 == 0` against `0 == 0` cannot fail, so `restored=1` would be printed by a rung that
+    // released nothing, on a part where the register never reads back anything. That is
+    // precisely the class of defect this module names elsewhere — a witness that cannot fail —
+    // and the safety argument in this file's header leans on it ("the rung does not take that
+    // on faith: it re-reads").
+    //
+    // So the rung measures whether the check HAD any discriminating power, and says so:
+    //   * `req_readback` — did the acquire write change the request register's readback at
+    //     all? If `acq_post == req_pre`, the register did not read back our own write, so the
+    //     later `req_post == req_pre` compare is uninformative about the release.
+    //   * `ack_moved` — did the ack field ever leave its entry value? If not, the `ack_ok`
+    //     compare is uninformative for the same reason.
+    // `evidence=1` means at least one of the two halves could actually have failed.
+    // `evidence=0` means `restored=1` is a statement about a register pair that never moved:
+    // still the best available reading, but NOT proof that a hold was released, and the wire
+    // says so rather than letting `clean` be read as proof.
+    //
+    // This does not weaken the release itself. The release remains correct under either
+    // semantics — the mask form clears data bit 0 on a mask register, and the exact-dword form
+    // runs LAST and restores a plain register — and neither depends on the register being
+    // readable. What changes is only the honesty of the claim about it.
+    let req_readback = acq_post != req_pre;
+    let ack_moved = (ack & ack_mask) != (ack_pre & ack_mask);
+    let evidence = req_readback || ack_moved;
+    serial_println!(
+        ":: gen7: r3 cand={} release req_post={:08X} req_pre={:08X} req_ok={} ack_post={:08X} ack_pre={:08X} ack_ok={} restored={} readback={} ack_moved={} evidence={} ::",
+        cand,
+        req_post,
+        req_pre,
+        if req_ok { 1 } else { 0 },
+        ack_post,
+        ack_pre,
+        if ack_ok { 1 } else { 0 },
+        if restored { 1 } else { 0 },
+        if req_readback { 1 } else { 0 },
+        if ack_moved { 1 } else { 0 },
+        if evidence { 1 } else { 0 }
+    );
+
+    let outcome = if !ack_readable {
+        Acq::AckUnreadable
+    } else if ack_set {
+        Acq::AckTransition
+    } else {
+        Acq::NoAck
+    };
+    serial_println!(
+        ":: gen7: r3 cand={} outcome={} wrote=3 released=1 restored={} evidence={} ::",
+        cand,
+        outcome.name(),
+        if restored { 1 } else { 0 },
+        if evidence { 1 } else { 0 }
+    );
+    (outcome, m, restored, evidence)
+}
+
+/// GEN7 rung R3 — acquire forcewake on the published request/ack pairs and prove the GT
+/// power well opened, on registers the rung never writes.
+///
+/// Called from `igpu::init` immediately after `wake` (R2) and still BEFORE
+/// `bring_up_blt_ring`. R2 re-parks `INSTPM` on every exit path, so R3 starts from the state
+/// firmware left.
+///
+/// # Safety
+/// Same contract as `recon` and `wake`: `bar0` is a live MMIO mapping of at least `bar0_size`
+/// bytes of the IGD's BAR0. R3 writes at most two registers — the forcewake **request**
+/// registers `0x0A188` and `0x1300B0` — one candidate at a time, releasing each in-rung and
+/// verifying the release against the entry value. It writes no ring register, no GGTT entry
+/// and no display register.
+pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
+    serial_println!(
+        ":: gen7: r3 begin rung=R3 mode=write cands=2 bdf={}:{}.{} bar0_size={} ladder=GEN7-3D ::",
+        bus,
+        slot,
+        func,
+        bar0_size
+    );
+
+    // ---- Parachutes, identical discipline to R1/R2 -------------------------------------
+    if bar0 == 0 {
+        serial_println!(":: gen7: r3 verdict=refused-no-bar0 — BAR0 unpublished; no write attempted ::");
+        serial_println!(":: gen7: r3 end ::");
+        return;
+    }
+    // The highest offset R3 touches is RENFW_ACK (0x1300B4); the battery reaches BCS_UHPTR
+    // (0x22134). Checked against the size we were GIVEN, before any write, exactly as R2's
+    // guard is — and against the true maximum of the two, not the one that happens to be
+    // larger on the machine we have.
+    const MAX_OFF: usize = g7regs::HYP_RENFW_ACK + 4;
+    if bar0_size < MAX_OFF {
+        serial_println!(
+            ":: gen7: r3 verdict=refused-bar0-too-small have={} need={} — no write attempted ::",
+            bar0_size,
+            MAX_OFF
+        );
+        serial_println!(":: gen7: r3 end ::");
+        return;
+    }
+
+    // Bounded ack budget. Deliberately smaller than R2's `POLL_MAX`: R3 may run this poll
+    // TWICE and the expected-negative outcome is exactly the one that runs it to expiry, so
+    // an over-large budget buys nothing and spends boot time on a wall we already suspect.
+    // `iters=` is on the wire, so `no-ack` is always readable as "no ack within THIS budget"
+    // rather than as a claim about eternity.
+    const ACK_POLL_MAX: u32 = 200_000;
+
+    // ---- The entry columns ---------------------------------------------------------------
+    let mut frame_pre = [0u32; FRAME_N];
+    let mut frame_pre_var = [false; FRAME_N];
+    read_frame(bar0, "pre", &mut frame_pre, &mut frame_pre_var);
+
+    let mut before = [0u32; BATTERY_N];
+    let mut before_var = [false; BATTERY_N];
+    read_battery(bar0, "r3", "r3pre", &mut before, &mut before_var);
+
+    // Is the battery ALREADY live? If so, no transition-based wake claim is readable, and the
+    // rung says that rather than counting motion it cannot attribute. This is the draft's
+    // "CONFIRMED (G1 false)" arm.
+    //
+    // ⚠ PRECISION FIX (review, GR26). The first cut of this comment said the arm "must be
+    // tested BEFORE any acquire", and the header block said `gt-live-already` "is checked
+    // first" — both of which read as a GUARD that skips the acquires. There is no such guard
+    // and there should not be one. What is true, and all that is claimed here: the entry
+    // battery is MEASURED before any write (that is what makes it an entry column at all), and
+    // `pre_live` DOMINATES the verdict ladder below, above even `gt-woke`. The two acquires
+    // still run, deliberately — on an already-live GT the ack registers' behaviour is exactly
+    // the open question R3 exists to answer, and refusing to write would throw that away while
+    // making the rung no safer. What `pre_live` buys is that no WAKE is claimed from motion
+    // that was already there.
+    let pre_live = {
+        let mut s = 0u32;
+        let mut v = 0u32;
+        for i in 0..BATTERY_N {
+            if matches!(Cls::of(before[i]), Cls::Structured) {
+                s += 1;
+            }
+            if before_var[i] {
+                v += 1;
+            }
+        }
+        serial_println!(
+            ":: gen7: r3 entry-battery structured={} varies={} of={} ::",
+            s,
+            v,
+            BATTERY_N
+        );
+        s >= 2 || v >= 1
+    };
+
+    // ---- Candidate A — the MT pair (BDW-pinned offsets) ----------------------------------
+    let (out_a, m_a, rest_a, ev_a) = try_candidate(
+        bar0,
+        "mt",
+        g7regs::HYP_FORCEWAKE_MT,
+        g7regs::HYP_FORCEWAKE_MT_ACK,
+        0x0000_FFFF,
+        "BDW-2c-11.15-p493/p703",
+        ACK_POLL_MAX,
+        &before,
+        &before_var,
+    );
+
+    // ---- Candidate B — the per-well RENFW pair (CHV-pinned offsets) ----------------------
+    // Runs only if A did not WAKE the GT — `a_woke` = an ack transition AND real battery
+    // motion (draft §5: one variable per boot, A/B fallback on a binary question).
+    //
+    // ⚠ ATTRIBUTION, STATED EXACTLY (review, GR26). The looser claim — "a lit battery is never
+    // ambiguous between the two acquires" — is not what this guard delivers, and the gap is
+    // worth naming because it is a real capture-reading trap. `a_woke` requires an ACK; so if
+    // A produced motion with NO ack (the `gt-woke-noack` shape), B still runs, and B's held
+    // column is then read on a GT that A may already have lit. The VERDICT is safe from it —
+    // `woke_by` and `motion_by` both test `m_a` first, so any motion A produced is attributed
+    // to A and never to B — but B's own `cand=renfw battery` line in that one case is not
+    // clean evidence for B, and a reader must take the `mt` line first. Fixing this by
+    // skipping B on motion-alone would cost the boot its second candidate on exactly the
+    // reading that most needs one, so the trap is documented rather than closed.
+    let a_woke = out_a == Acq::AckTransition && m_a.live();
+    let (out_b, m_b, rest_b, ev_b, b_ran) = if a_woke {
+        serial_println!(":: gen7: r3 cand=renfw SKIPPED=mt-already-woke-gt note=one-variable-per-boot ::");
+        (Acq::NoAck, Motion { gone_struct: 0, varies: 0 }, true, true, false)
+    } else {
+        let (o, m, r, e) = try_candidate(
+            bar0,
+            "renfw",
+            g7regs::HYP_RENFW_REQ,
+            g7regs::HYP_RENFW_ACK,
+            0x0000_FFFF,
+            "CHV-2c-10.15-p1078/p1077",
+            ACK_POLL_MAX,
+            &before,
+            &before_var,
+        );
+        (o, m, r, e, true)
+    };
+
+    // ---- The exit columns — the reversal witness for the whole rung -----------------------
+    let mut frame_post = [0u32; FRAME_N];
+    let mut frame_post_var = [false; FRAME_N];
+    read_frame(bar0, "post", &mut frame_post, &mut frame_post_var);
+
+    let mut after = [0u32; BATTERY_N];
+    let mut after_var = [false; BATTERY_N];
+    read_battery(bar0, "r3", "r3post", &mut after, &mut after_var);
+
+    // Frame-level restore check: every frame register back at its entry dword. Mismatches are
+    // printed individually — a silent count would hide WHICH register we left moved, which is
+    // the only part of a dirty exit anyone can act on.
+    let mut frame_moved = 0u32;
+    for (i, &(name, off, _pin)) in FW_FRAME.iter().enumerate() {
+        if frame_post[i] != frame_pre[i] {
+            frame_moved += 1;
+            serial_println!(
+                ":: gen7: r3 restore-delta name={} off={:06X} pre={:08X} post={:08X} ::",
+                name,
+                off,
+                frame_pre[i],
+                frame_post[i]
+            );
+        }
+    }
+    let mut battery_moved = 0u32;
+    for i in 0..BATTERY_N {
+        if after[i] != before[i] {
+            battery_moved += 1;
+        }
+    }
+    // `GTLC_PW_STAT` bit 1 is CHV's ALLOWWAKEERR: "when access to media or render is observed
+    // when ALLOWWAKE=0, the ALLOWWAKERR bit will be set". If that latch appears on this part
+    // it is a direct statement that our GT reads hit a sleeping well — which is the ladder's
+    // central question. Printed as a delta, never decoded further; on Boot D the register read
+    // `0x00000000`, so its silence is as much a reading as its noise would be.
+    //
+    // The index is looked up BY NAME rather than written as a literal: a hand-counted index
+    // into `FW_FRAME` is a silent-miscount waiting for the next row to be inserted, and a
+    // witness that reads the wrong register is the Wall D defect in its purest form. If the
+    // row ever disappears, the bits report as zero and the `frame` lines still carry the raw
+    // dwords, so the reading degrades to "not measured" rather than to a wrong number.
+    let pw_idx = FW_FRAME.iter().position(|r| r.0 == "GTLC_PW_STAT");
+    let (pwerr_pre, pwerr_post) = match pw_idx {
+        Some(i) => ((frame_pre[i] >> 1) & 1, (frame_post[i] >> 1) & 1),
+        None => (0, 0),
+    };
+    // ⚠ CONFLATION FIX (review, GR26). `restore_clean` was `rest_a && rest_b && frame_moved
+    // == 0`, which folded two different statements into one word on the verdict line:
+    //   (a) "the two registers R3 WROTE are back at their entry dwords" — a restore claim, and
+    //   (b) "none of the six frame registers R3 never wrote changed value" — a statement about
+    //       the GT's own state, not about our footprint.
+    // Six of the eight frame rows are pure status (`GTFIFOCTL`, `GTLC_PW_STAT`, the two ACKs,
+    // `GTFORCEAWAKE`, `MISC_CTRL0`). `GTFIFOCTL` is the ONE live register on this part
+    // (`0x0000003F`, Boot D) and a FIFO-state register is exactly the kind that legitimately
+    // moves — so under the old predicate a perfectly-restored rung would print `restore=dirty`
+    // and read as "R3 left silicon modified". That is a witness crying wolf on the single
+    // field Peter will look at first.
+    //
+    // So the two readings are now separate and BOTH on the verdict line: `restore=` is the
+    // written-register claim (`rest_a && rest_b`, each already verified per candidate against
+    // its entry dword AND its ack field), and `frame=` is the unwritten-neighbourhood reading.
+    // Nothing is lost — including the case that argues for keeping the frame in view at all,
+    // a write to `0x0A188` aliasing into `MISC_CTRL0` at `0x0A180`: that still surfaces as
+    // `frame=moved` on the verdict line with a named `restore-delta` line under it.
+    let restore_clean = rest_a && rest_b;
+    let restore_evidence = ev_a && ev_b;
+    serial_println!(
+        ":: gen7: r3 restore frame_moved={}/{} battery_moved={}/{} cand_mt_restored={} cand_renfw_restored={} mt_evidence={} renfw_evidence={} pwerr_pre={} pwerr_post={} clean={} ::",
+        frame_moved,
+        FRAME_N,
+        battery_moved,
+        BATTERY_N,
+        if rest_a { 1 } else { 0 },
+        if rest_b { 1 } else { 0 },
+        if ev_a { 1 } else { 0 },
+        if ev_b { 1 } else { 0 },
+        pwerr_pre,
+        pwerr_post,
+        if restore_clean { 1 } else { 0 }
+    );
+
+    // ---- The rung verdict — every arm named in source before the rung ran ------------------
+    //  refused-no-bar0 / refused-bar0-too-small  parachutes, above; no write made.
+    //  both-req-preheld   both request registers were non-zero at entry → nothing written,
+    //                     nothing claimed; somebody else owns the block.
+    //  gt-live-already    the entry battery was already live → a transition-based wake claim
+    //                     is unreadable in principle. G1 is FALSE and that is a clean result;
+    //                     every later rung still holds forcewake, because not holding it is a
+    //                     silent-corruption class rather than a speed choice.
+    //  gt-woke            an ack made a real dark→set transition AND the untouched battery
+    //                     lit under that same hold. **The GT power well opened.** `by=` names
+    //                     which published pair did it.
+    //  gt-woke-noack      the battery lit under a hold whose ack never asserted → the request
+    //                     register works and the ack register is not where we think. A
+    //                     finding, and a strictly better one than a null.
+    //  fw-acked-gt-dark   an ack transitioned but no battery column lit → the well
+    //                     acknowledges and the ring block is gated by something else.
+    //  fw-no-ack          no ack transition, no motion, both candidates → neither published
+    //                     forcewake pair decodes on this part. With R2's `gt-still-dark` this
+    //                     is the decisive negative the draft's §4.1 asked for.
+    let woke_by = if out_a == Acq::AckTransition && m_a.live() {
+        "mt"
+    } else if b_ran && out_b == Acq::AckTransition && m_b.live() {
+        "renfw"
+    } else {
+        "none"
+    };
+    let motion_by = if m_a.live() {
+        "mt"
+    } else if b_ran && m_b.live() {
+        "renfw"
+    } else {
+        "none"
+    };
+    let any_ack = out_a == Acq::AckTransition || (b_ran && out_b == Acq::AckTransition);
+    let both_preheld = out_a == Acq::SkippedPreheld && (!b_ran || out_b == Acq::SkippedPreheld);
+
+    let verdict = if both_preheld {
+        "both-req-preheld"
+    } else if pre_live {
+        "gt-live-already"
+    } else if woke_by != "none" {
+        "gt-woke"
+    } else if motion_by != "none" {
+        "gt-woke-noack"
+    } else if any_ack {
+        "fw-acked-gt-dark"
+    } else {
+        "fw-no-ack"
+    };
+
+    // ⚠ `renfw_outcome=` when B never ran (review, GR26). The skip arm above seeds `out_b`
+    // with `Acq::NoAck` purely as a placeholder, so the old line printed
+    // `renfw_ran=0 renfw_outcome=no-ack` — a real-looking outcome for a candidate that was
+    // never attempted, and `no-ack` is the very token this rung's decisive negative rests on.
+    // A capture analyzer keying on `renfw_outcome=` would have counted it. It now prints
+    // `not-run`, which is not in `Acq` (nothing ran, so no acquire outcome exists to name).
+    let out_b_name = if b_ran { out_b.name() } else { "not-run" };
+    serial_println!(
+        ":: gen7: r3 verdict={} by={} mt_outcome={} mt_struct={} mt_varies={} renfw_ran={} renfw_outcome={} renfw_struct={} renfw_varies={} pre_live={} restore={} restore_evidence={} frame={} rung=R3 ::",
+        verdict,
+        woke_by,
+        out_a.name(),
+        m_a.gone_struct,
+        m_a.varies,
+        if b_ran { 1 } else { 0 },
+        out_b_name,
+        m_b.gone_struct,
+        m_b.varies,
+        if pre_live { 1 } else { 0 },
+        if restore_clean { "clean" } else { "dirty" },
+        if restore_evidence { "real" } else { "blind" },
+        if frame_moved == 0 { "quiet" } else { "moved" }
+    );
+    serial_println!(
+        ":: gen7: r3 next={} note=forcewake-requests-released-and-verified-no-display-register-touched ::",
+        match verdict {
+            "gt-woke" => "R3b-hold-forcewake-around-the-R2-sync-flush-then-R4-ggtt-claim",
+            "gt-woke-noack" => "R3b-same-hold-and-hunt-the-ack-register-the-battery-is-the-oracle",
+            "fw-acked-gt-dark" => "STOP-well-acks-but-ring-block-still-gated-report-before-another-write",
+            "gt-live-already" => "R4-ggtt-claim(read-only)-holding-forcewake-from-here-on",
+            "both-req-preheld" => "STOP-request-registers-held-by-another-owner-investigate-before-any-write",
+            _ => "STOP-neither-published-forcewake-pair-decodes-on-gen7-ladder-decision-goes-to-Peter",
+        }
+    );
+    serial_println!(":: gen7: r3 end ::");
 }

@@ -579,6 +579,20 @@ pub fn init(gpu: &GpuInfo) {
         #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
         super::gen7::wake(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func);
 
+        // GEN7-3D rung R3 — the forcewake acquire (UNAOS_IVB3D). R2 flew on Boot D and came
+        // back `gt-still-dark`: its poll passed on iteration zero because a power-gated window
+        // reads zero and the pass condition was `== 0`, and not one of the fourteen ring
+        // registers moved. So R3 goes at the power well itself — the two forcewake
+        // request/ack pairs Intel actually published (0x0A188/0x130044 [BDW], 0x1300B0/0x1300B4
+        // [CHV]) — one candidate at a time, each request released in-rung AND the release
+        // verified against the register's entry dword, with the same 17-register battery read
+        // under each hold. Placed AFTER `wake` (which re-parks INSTPM on every exit path, so R3
+        // starts from firmware's state) and still BEFORE `bring_up_blt_ring`. It writes at most
+        // two GT power-management registers, no ring register, no GGTT entry and no display
+        // register; the panel is the Kepler's, so R3 cannot black Peter's screen.
+        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
+        super::gen7::forcewake(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func);
+
         // BLT ring bring-up. SEAT FIXUP (review round 2): an ACCELERATOR must degrade, never kill
         // the boot — every refusal below breaks out of this block, the ring simply never comes up,
         // `blitter_*` return false, and the CPU path carries the console exactly as before this
