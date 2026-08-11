@@ -6002,9 +6002,15 @@ static WCPAR_STAGE_CPU: [core::sync::atomic::AtomicU64; STAGE_CPUS] =
 /// compose across cores at a glance. Silent on a span where nothing staged, like its `[wcn]`/`[wcser]`
 /// siblings — a period with no compositing is idleness, not a signal.
 ///
-/// It reads `[wcser] declined=` as its companion, not a field it repeats: the flow-arc falsification is
-/// `cores>1` HERE rising while the cross-core `DECL_LOCK` share of `[wcser] declined=` falls, because a
-/// second core that used to lose the one shared buffer now composes into its own.
+/// ⚠ WCPAR-REVIEW: `cores>` here counts DISTINCT cores that staged a compose OVER THE SPAN — NOT cores
+/// composing SIMULTANEOUSLY. On x86 `stage_window`/`stage_fill` are reached only through
+/// `composite_inner`, which still runs under `COMP_GATE`, so two cores never compose at the same instant
+/// yet — steps 1-2 dropped the WINDOWS hold (read `[rtwit] windows_max_us` falling), but the
+/// simultaneous-compose spread awaits the deferred step 3 that narrows `COMP_GATE` to the present only.
+/// Do NOT falsify against `[wcser] declined=`: that counts `COMP_GATE` compare-exchange failures, which
+/// this arc does not touch and will not move; the cross-core STAGE decline it seems to promise did not
+/// exist on x86 (COMP_GATE already serialised the compose). The true flow falsification — `[wcn] rate=`
+/// above 19.6/s AND wall-span < Σ`compose_us` on a multi-vug boot — is a step-3 signal.
 #[cfg(feature = "witness")]
 fn wcpar_emit(span: u64) {
     use core::sync::atomic::Ordering::Relaxed;
