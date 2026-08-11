@@ -5247,9 +5247,16 @@ ever exits.
 ```
 [wcn] win=<id> asid=<owner> live=<yes|no> above=<yes|no> att=<n> comp=<n> hid=<n> bel=<n>
       rate=<x.y>/s comp_rate=<x.y>/s active=<n>ms parked=<n>ms gap=<min>..<max>ms
+      z=<n> pre=<n> drg=<n> dout=<n> dkpx=<n> drly=<n> q=<x.y>..<x.y>
 [wcn] rollup scope=<live|fixture|desktop> wins=<n> att=<n> comp=<n> hid=<n> bel=<n> stale=<n>
       passes=<n> aborted=<n> att_rate=<x.y>/s comp_rate=<x.y>/s span=<n>ms -> <IDLE|STARVED|LIVE>
 ```
+
+The `z=`…`q=` run is WCN-CAUSE (GR25) and is **appended after `gap=`**, so every existing `[wcn]`
+harvest keeps working unchanged. `comp=` keeps its exact meaning and its place on the line; it is
+derived as `pre + drg` rather than counted separately, so the split is an identity by construction
+and there is no verdict field asserting it. Wire cost is ~54 B per per-window line, ~86 KB over an
+800 s boot, on `witness` builds only.
 
 (one physical line each; wrapped here). Rates are fixed-point tenths, for `[pstrip]`'s reason — an
 integer `/s` truncates every honest sub-1 Hz rate to `0`. Aggregate-only fields: `stale` (presents
@@ -5303,12 +5310,182 @@ spread — are bench readings.
   value that is **not** the panel frame — a vug pinned at 30.7/s is still somebody else's ceiling.
 * **`comp` far above `att` across the fleet** means the tiling has the windows overlapping enough that
   every present costs several blits. That is a placement problem wearing a performance costume.
+  **Superseded as a diagnosis by WCN-CAUSE (GR25)** — `drg=` now says how much of `comp - att` the
+  occlusion closure caused, and `dout=`/`dkpx=` say which window is writing the bill rather than
+  paying it. Read those before calling it placement.
 * **`aborted` climbing** is the F4 drain barrier eating passes under load — presents that cost a
   syscall and produced nothing, which is the P66 neighbourhood.
 * **`STARVED`** (`att > 0`, `comp == 0`) with `hid == 0` and `bel == 0` should be impossible; it would
   mean presents are reaching `composite` and the blit loop is never drawing them.
 * **`parked` large while the operator says the vug looks frozen** is the good outcome — it says the
   vug is in VUGPAUSE-2's idle and is waiting for input, not starved.
+
+---
+
+### WCN-CAUSE — why a window is recomposited, and whether its cadence is frame-locked (GR25)
+
+**The scene.** GR25 Boot A (`gr25-bootA/ttyUSB0.log`) shows identical 128x128 scale-6 vug windows,
+same binary, running at wildly different rates, with the scheduler exonerated and the vug arc's own
+conviction withdrawn. Three facts sat on the wire that no existing field could separate.
+
+**1. The `comp/att` fan-out is monotonic in stacking position.** The ten-window block at 805882ms:
+
+```
+[wcn] win=5  asid=0x4 ... att=283 comp=283  ... rate=56.6/s ... gap=1..89ms
+[wcn] win=6  asid=0x5 ... att=308 comp=486  ... rate=61.6/s ... gap=1..86ms
+[wcn] win=7  asid=0x6 ... att=291 comp=777  ... rate=58.3/s ... gap=1..62ms
+[wcn] win=8  asid=0x7 ... att=273 comp=759  ... rate=54.6/s ... gap=1..99ms
+[wcn] win=9  asid=0x8 ... att=269 comp=1330 ... rate=53.6/s ... gap=1..102ms
+[wcn] win=10 asid=0x9 ... att=264 comp=1867 ... rate=53.1/s ... gap=1..97ms
+```
+
+1.00x, 1.58x, 2.67x, 2.78x, 4.94x, 7.07x — climbing with the window index. That is the signature of
+`composite_inner`'s upward occlusion closure: a window is dragged into every LOWER-z neighbour's pass
+that overlaps it, so the higher it sits the more passes it is repainted in.
+
+**2. Fan-out is NOT the slowness, and this refutation matters.** `win=10` carries the worst fan-out in
+the capture (7.07x) and still runs **53.1/s**. The two slow windows carry the *least*:
+
+```
+[wcn] win=3 asid=0x2 ... att=99 comp=99 ... rate=19.6/s ... gap=51..51ms
+[wcn] win=4 asid=0x3 ... att=79 comp=79 ... rate=15.6/s ... gap=17..203ms
+```
+
+`comp == att` — nobody is dragging them in at all. Whatever costs them their frames, it is not being
+recomposited by neighbours. The suspicion runs the other way: they are the windows *doing* the
+dragging, and the closure's whole-box promotion (`bands[j] = None`) is the bill they pay for it.
+
+**3. The slow period is frame-quantised and load-invariant.** The two populations appear together in
+one block at 127371ms:
+
+```
+[wcn] win=2 asid=0x1 ... att=300 comp=300 ... rate=60.0/s ... gap=16..17ms
+[wcn] win=3 asid=0x2 ... att=100 comp=100 ... rate=20.0/s ... gap=50..50ms
+```
+
+Exactly 1 frame against exactly 3. The *load*-invariance is the same window across two very different
+machines — `win=3 gap=52..52ms` at 43314ms and `gap=51..51ms` at 805882ms, with the `[schedx86] load
+… sw=[]` switch vector spanning four orders of magnitude between them. (43314ms carries no `win=2`
+line at all, and 805882ms's `win=2` reads `gap=1..91ms`; neither block is a fast/slow comparison and
+neither is cited as one here.)
+
+**The pacer is not the mechanism, on the spans where that can be said.** The one-window rollups at
+38271–53401ms read `[wpace] win=1 pres=97 paced=0 slept=0ms rate=19.3/s` with `resync=97`,
+`overrun=0` — 97 presents, 97 resyncs, *zero* sleeps — and `pace_advance` resyncs only when a present
+arrives more than a frame late, so there the pacer is passively recording lateness it did not cause.
+`[wpace]`'s `resync`/`overrun` are **fleet aggregates with no per-window breakout**, so the same
+inference cannot be drawn from the ten-window rollups; the exoneration is scoped to the one-window
+spans and stays there until a per-window pacer counter exists.
+
+#### The census
+
+Four counters per window, two on each side of the seam, plus two derived fields.
+
+| field | side | means |
+|---|---|---|
+| `pre` | draggee | blits where the row was ALREADY dirty at the table snapshot |
+| `drg` | draggee | blits the upward closure ADDED — work the owner never asked for |
+| `dout` | dragger | drag-in EDGES this window's OWN damage caused |
+| `dkpx` | dragger | whole-box promotion bill (units of 1024 px) that own damage committed to |
+| `drly` | dragger | edges caused while RELAYING damage the window was itself given |
+| `z` | — | stacking position, from the same snapshot as `asid`/`live`/`above` |
+| `q` | — | `gap` as a multiple of the 16667 us frame, in tenths, rounded |
+
+`comp` is `pre + drg` — derived, not counted, so the split is an identity by construction.
+
+**What the buckets can be wrong about.** `pre` is *not* "its owner presented" — a cursor rect or an
+erase drain also sets the damage flag before a pass; `att` is the owner's own count and `pre - att` is
+a **signed** residual, since `comp < att` is routine when another core's pass has already absorbed a
+window's damage. `dout` counts edges, not blits, and excludes two cases: a `j` merely *widened* from a
+band to a whole box (no window added — that bill lands in `dkpx`), and damage a window is only
+*forwarding* (that raises `drly`). The second exclusion is load-bearing: charging a relay would make
+"the topmost window reads `dout≈0`" a theorem, because the closure only ever walks upward. `dkpx` is a
+pixel bill, not a time bill — `[wc-h] present_us=` is what prices it. A parked window with live
+neighbours can legitimately print `z=0 comp=0 dout>0`; `live=` is what separates that from a closed
+row.
+
+**The falsifiers.** If the fan-out were not the closure, `drg` reads ~0 while `comp - att` stays large.
+If the cadence were not frame-locked, `q` falls outside `[2.9, 3.2]` for the slow population while the
+fast one sits in `[0.9, 1.2]` — a *band*, not an exact integer, because `gap` is whole milliseconds
+against a 16.667 ms frame and the same 3-frame cadence prints `3.0` from `gap=50` and `3.1` from
+`gap=51` (both occur in this capture). `gap=` stays on the line so the division can be checked by hand.
+If z-order were not the discriminator, the slow windows' `z`/`dout` sit in the same range as the fast
+ones'. If the stack were N independent draggers rather than a chain, `drly` reads ~0 across `win=5`
+through `win=10` while `dout` reads large on all of them.
+
+#### What Boot B decides
+
+* **Q1 (why the fan-out differs per window).** `drg` ≈ `comp - att` on `win=6`…`win=10`, climbing with
+  `z`, convicts the upward closure. `drg ≈ 0` with `comp - att` still large refutes it and sends the
+  question to the cursor and erase-drain paths instead. `drly` alongside says whether the fan-out is
+  one chain (a few seed draggers, `drly` carrying the rest up the stack) or a genuine all-pairs
+  overlap, which are different placement problems.
+* **Q2 (is the gap an integer frame multiple).** `q` within `[2.9, 3.2]` on `win=3` beside `q` within
+  `[0.9, 1.2]` on `win=2` convicts an integer-frame cadence lock. A slow-window `q` outside that band
+  — say a flat `2.4..2.6` — refutes it and makes the ~51 ms a cost, not a lock. The criterion is a
+  band and not "reads 3.0" because `gap` is whole milliseconds: `gap=50` gives 3.0 and `gap=51` gives
+  3.1 for the identical cadence, and both spellings are already in Boot A.
+* **Q3 (what distinguishes the slow windows).** The prediction is `dout`/`dkpx` LARGE on `win=3` and
+  `win=4` and ~0 on `win=10`: the slow windows are slow because their own presents drag a big
+  neighbour into a WHOLE-BOX repaint, and load-invariance follows because a fixed pixel bill does not
+  care how many cores are busy. `dout ≈ 0` on the slow windows refutes that and leaves `z` as the only
+  lead.
+
+  **The console's z is the fork, and Boot A cannot settle it.** In the two-window phase the 1242x732
+  console reads `att=0` with `comp_rate` tracking `win=3`'s rate:
+
+  ```
+  [  63390ms] [wcn] win=1 asid=0xffffff01 ... att=0  comp=59  ... comp_rate=21.1/s ... gap=0..0ms
+  [  63390ms] [wcn] win=3 asid=0x2        ... att=54 comp=156 ... rate=19.2/s      ... gap=50..54ms
+  ```
+
+  Two readings fit, and they point at opposite fixes. If the console sits ABOVE `win=3`, then `win=3`
+  is the dragger, pays for a 3.6 MB whole-box console repaint on every present, and its `dout` will be
+  ~1 per present, and its `dkpx` will carry a 1242x732 whole box each time. If the console sits BELOW,
+  then the console's own damage is dragging `win=3` up — which is what `comp=156` against `att=54`
+  already hints at — and the bill belongs to whatever is damaging the console, which will show as the
+  console's own `dout`/`dkpx`. `z=` and the two dragger fields on one line separate these directly;
+  note that `above=yes` here is `above_shell` and says nothing about z relative to other windows,
+  which is exactly the gap `z=` closes.
+
+  `dkpx` is the field that decides it, and D4 is why it can: the console is presented through
+  `route_present_banded`, so it reaches the closure *already dirty with a band* and is promoted to a
+  whole box without any window being added to the pass. That promotion raises no `dout` at all. Had
+  `dkpx` stayed gated on the drag-in edge, the single most important reading for this question would
+  have been invisible.
+
+#### The fix this convicts, and why it is not in this commit
+
+If Boot B reads `dout`/`dkpx` large on the slow windows, the defect is the closure's promotion:
+
+```rust
+if boxes_overlap(bi, outer_box(&rows[j])) {
+    dirty[j] = true;
+    bands[j] = None;   // <- j is promoted to a WHOLE-BOX repaint
+    grew = true;
+}
+```
+
+`j` only has to repaint the rows `i` is about to overwrite — `j ∩ bi` — but it is given its whole box.
+There are two candidate fixes and they apply to different populations.
+
+**On x86, the dragged-in repaint is very often REDUNDANT rather than merely too wide.** `i`'s own blit
+runs under `OccClip`, which already forbids the lower window from writing pixels `j` covers, and the
+clip cannot overflow its capacity into a conservative fallback on this path. Where `j` fully covers the
+overlap, `i` never wrote those pixels, so repainting `j` restores something nothing had disturbed. The
+cheap fix is therefore to **skip the drag entirely for a clip-covered `j`** — no band arithmetic, no
+lattice change, and it removes the work instead of narrowing it.
+
+**The band union remains the fix everywhere the clip is empty** — compat rows, and every non-x86
+target, where `OccClip` carries nothing and the lower write really does land. There `j` must repaint,
+and the correct extent is `j ∩ bi` rather than the whole box.
+
+Neither is landed here. The union is **structural**: `None` is currently the absorbing element of the
+band lattice, so banding the draggee requires a band UNION for the case where two different `i` drag
+the same `j`, and the fixed point's `if dirty[j] && bands[j].is_none() { continue; }` re-entry
+condition has to be re-derived around it. That is a correctness change to the damage lattice, and the
+clip-covered skip needs the census to say how much of the bill it would actually remove. Both should
+follow the conviction, not precede it. Census first.
 
 ---
 

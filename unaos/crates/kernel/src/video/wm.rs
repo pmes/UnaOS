@@ -3461,6 +3461,13 @@ fn composite_inner() -> CursorTail {
     // does reach repaints at least the rows `i` is about to overwrite. A `j` that was itself banded is
     // widened here too, which is why `bands[j].is_some()` re-enters the fixed point — without it a
     // banded window could stay banded while a lower window repainted rows outside that band.
+    // WCN-CAUSE — the SEED set, snapshotted before the closure runs. Every row dirty here had its
+    // damage flag set by something outside this pass (its owner's `present`, a cursor rect, an erase
+    // drain); every row the loop below adds is compositor work its owner never asked for. The two
+    // sets are disjoint by construction and their union is what the blit loop draws, which is what
+    // makes `comp` DERIVABLE as `pre + drg` rather than counted a third time.
+    #[cfg(feature = "witness")]
+    let seed = dirty;
     for _ in 0..MAX_WINDOWS {
         let mut grew = false;
         for i in 0..MAX_WINDOWS {
@@ -3476,6 +3483,36 @@ fn composite_inner() -> CursorTail {
                     continue;
                 }
                 if boxes_overlap(bi, outer_box(&rows[j])) {
+                    // WCN-CAUSE — charge this drag to `i`, the window whose damage reached `j`.
+                    //
+                    // THE EDGE AND THE BILL ARE DIFFERENT EVENTS, and D4 is that they were conflated.
+                    // `dout` is an EDGE: a window ADDED to the pass, so it is `!dirty[j]` only.
+                    // `dkpx` is the whole-box PROMOTION BILL that `bands[j] = None` below commits
+                    // this pass to, and a `j` that was already dirty WITH A BAND is promoted here
+                    // too — it pays the same widening and was previously charged nowhere. That case
+                    // is exactly the banded console under `route_present_banded`, which is the route
+                    // Q3 turns on, so missing it hid the one reading the question needed. The guard
+                    // three lines up (`dirty[j] && bands[j].is_none()` -> continue) means everything
+                    // reaching here satisfies `!dirty[j] || bands[j].is_some()`, so the bill is
+                    // charged unconditionally and the condition is stated by the guard, not repeated.
+                    //
+                    // SEED-GATED, and D3 is why: `dout` charged to a relay window made "topmost
+                    // reads dout≈0" a THEOREM (the closure only ever walks upward, so the top of the
+                    // stack can charge nobody) and let a window that was itself dragged in be billed
+                    // for damage it merely FORWARDED — the fixed point re-reads `bi` from the row it
+                    // just promoted. Only a window acting on its OWN damage is a dragger; a relay is
+                    // counted as `drly`, which is what makes the win=5 -> win=10 chain read as a
+                    // chain rather than as six independent draggers.
+                    #[cfg(feature = "witness")]
+                    {
+                        let (_, _, jw, jh) = outer_box(&rows[j]);
+                        let px = jw as u64 * jh as u64;
+                        if seed[i] {
+                            wcn_note_dragout(rows[i].id, px, !dirty[j]);
+                        } else if !dirty[j] {
+                            wcn_note_relay(rows[i].id);
+                        }
+                    }
                     dirty[j] = true;
                     bands[j] = None;
                     grew = true;
@@ -3684,8 +3721,10 @@ fn composite_inner() -> CursorTail {
             verify_window(&fb, &rows[i], vr, &clip);
         }
         // WC-N — pixels on glass for this window id. The only writer of `comp`.
+        // WCN-CAUSE — `!seed[i]` is the cause: this row was not dirty at the table snapshot, so the
+        // upward closure is the only thing that could have put it in this pass.
         #[cfg(feature = "witness")]
-        wcn_note_drawn(rows[i].id);
+        wcn_note_drawn(rows[i].id, !seed[i]);
         drawn += 1;
     }
     // COMPOSITE-2 — loop closed. The witness one-shots inside it (WC-G/WC-D/WC-C) are charged here
@@ -6977,7 +7016,6 @@ const WCN_PARK_GAP_MS: u64 = 250;
 #[cfg(feature = "witness")]
 struct WcnRow {
     att: core::sync::atomic::AtomicU64,
-    comp: core::sync::atomic::AtomicU64,
     hid: core::sync::atomic::AtomicU64,
     bel: core::sync::atomic::AtomicU64,
     /// Summed inter-present gaps at or under [`WCN_PARK_GAP_MS`] — the window's own active time.
@@ -6991,6 +7029,37 @@ struct WcnRow {
     /// the activity span is a property of the window, not of the reporting cadence, so a rollup
     /// boundary must not manufacture a park out of the gap it straddles.
     last_ms: core::sync::atomic::AtomicU64,
+    /// WCN-CAUSE — blits of this row in a pass where it was ALREADY dirty at the table snapshot,
+    /// i.e. something set its damage flag (its own [`present`], a cursor rect, an erase drain)
+    /// before the pass began. See the WCN-CAUSE ledger for why this is not the same as "its owner
+    /// presented" and how `att` separates the two.
+    ///
+    /// `comp` IS `pre + drg` and is no longer counted separately. It used to be a third counter with
+    /// a `cause=SPLIT` line asserting the sum, which was a tautology: all three were written inside
+    /// one `if` on one path, so no attribution error could make them disagree. The only thing that
+    /// COULD was the multi-counter drain straddle in [`wcn_emit`] — three `swap`s are not one atomic
+    /// read, so a blit landing between them counted in one span and not the other — and a verdict
+    /// whose sole trigger is its own sampling artefact voids good data for a reason that is not a
+    /// defect. Deriving the sum removes both the tautology and the straddle.
+    pre: core::sync::atomic::AtomicU64,
+    /// WCN-CAUSE — blits of this row that the upward occlusion closure ADDED: a lower-z window's
+    /// damage overlapped this row's outer box, so this row was repainted inside a pass its owner
+    /// never asked for.
+    drg: core::sync::atomic::AtomicU64,
+    /// WCN-CAUSE, the DUAL — times this row's OWN damage (it was a seed of the pass) added some
+    /// higher-z window to it. The cost this window imposes on others, rather than the cost others
+    /// impose on it. Seed-gated: see the charge site for why a relay must not be billed as a
+    /// dragger.
+    dout: core::sync::atomic::AtomicU64,
+    /// WCN-CAUSE — the whole-box PROMOTION bill those drags commit the pass to, in units of 1024 px.
+    /// Charged on every promotion this window's own damage causes, including a `j` that was already
+    /// dirty with a BAND and is widened to its whole box — that case adds no window and so raises no
+    /// `dout`, but it is real pixels and it is the console's case.
+    dkpx: core::sync::atomic::AtomicU64,
+    /// WCN-CAUSE — drag-in edges this row caused while it was itself a DRAGGEE, forwarding damage
+    /// the closure had just given it. Separated from `dout` so a chain of overlapping windows reads
+    /// as one chain (`dout` at its foot, `drly` along it) instead of as N independent draggers.
+    drly: core::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "witness")]
@@ -6999,7 +7068,6 @@ impl WcnRow {
         use core::sync::atomic::AtomicU64;
         Self {
             att: AtomicU64::new(0),
-            comp: AtomicU64::new(0),
             hid: AtomicU64::new(0),
             bel: AtomicU64::new(0),
             active_ms: AtomicU64::new(0),
@@ -7007,6 +7075,11 @@ impl WcnRow {
             gap_min: AtomicU64::new(u64::MAX),
             gap_max: AtomicU64::new(0),
             last_ms: AtomicU64::new(0),
+            pre: AtomicU64::new(0),
+            drg: AtomicU64::new(0),
+            dout: AtomicU64::new(0),
+            dkpx: AtomicU64::new(0),
+            drly: AtomicU64::new(0),
         }
     }
 }
@@ -7611,6 +7684,93 @@ fn wedge1_dwell_emit(span: u64) {
     );
 }
 
+// ---- WCN-CAUSE — why a window was recomposited, and whether its cadence is frame-locked ---------
+//
+// GR25 Boot A left three questions on the wire that the existing `[wcn]` fields cannot separate.
+//
+//  1. `comp/att` FANS OUT PER WINDOW, monotonically with stacking position: on the ten-window block
+//     at 805882ms, `win=5 att=283 comp=283` (1.00x) climbing to `win=10 att=264 comp=1867` (7.07x).
+//     `comp > att` was already documented as "a neighbour's present grew the dirty set", but no
+//     counter said WHICH neighbour, or how much of the bill each window was writing rather than
+//     paying. `pre`/`drg` split the draggee's side; `dout`/`dkpx` are the dragger's.
+//
+//  2. THE SLOW WINDOWS' PERIOD IS FRAME-QUANTISED AND LOAD-INVARIANT. One block, 127371ms, carries
+//     both populations: `win=2 rate=60.0/s gap=16..17ms` beside `win=3 rate=20.0/s gap=50..50ms`.
+//     The load-invariance is the SAME window across two very different machines — `win=3`
+//     `gap=52..52ms` at 43314ms and `gap=51..51ms` at 805882ms, where `[schedx86] load ... sw=[]`
+//     spans four orders of magnitude between them. (43314ms has no `win=2` line at all and
+//     805882ms's `win=2` reads `gap=1..91ms`, so neither of those blocks is a fast/slow comparison
+//     and neither is cited as one.) `q=` states the multiple so the reading does not depend on the
+//     reader doing the division.
+//
+//  3. NOTHING ON THE WIRE DISTINGUISHED THE SLOW WINDOWS. `z=` is the candidate discriminator the
+//     first two answers point at: the closure drags in windows ABOVE the damaged one, so a window
+//     low in the stack pays for everything above it that overlaps.
+//
+// ### What each bucket can be wrong about — the admissibility clause
+//
+// * `pre` is NOT "its owner presented". It is "dirty at the table snapshot", which a cursor rect or
+//   an erase drain also produces. `att` is the owner's own count, and `pre - att` is a SIGNED
+//   residual: `comp < att` is routine (a present whose damage another core's pass had already
+//   absorbed produces no blit of its own), so the difference runs both ways and reading it as a
+//   count of cursor/erase damage is only valid when it is positive.
+// * `drg` is exact — the closure is the only writer of the dirty set after the snapshot.
+// * `dout` counts DRAG-IN EDGES caused by a window's OWN damage. Two exclusions, both deliberate:
+//   a `j` already in the pass that is merely widened raises no `dout` (no window was added, and the
+//   bill lands in `dkpx`), and a window forwarding damage it was itself given raises `drly` instead.
+//   Without the second exclusion "the topmost window reads `dout≈0`" would be a THEOREM — the
+//   closure only ever walks upward — and a falsifier that cannot fail is not one.
+// * `dkpx` is a PIXEL bill, not a time bill. It is the whole-box area the promotion commits the pass
+//   to, which is the quantity a banded closure would shrink; it says nothing about what those pixels
+//   cost on this panel. `[wc-h] present_us=` is the term that prices them.
+// * A PARKED window with live neighbours can legitimately print `z=0 comp=0 dout>0`: it caused
+//   promotions in passes it was not itself blitted in. That is not a contradiction and `live=` is
+//   what disambiguates it from a closed row.
+//
+// ### The falsifiers, which is why this census is not decorative
+//
+// * If the fan-out were NOT the closure, `drg` reads ~0 while `comp - att` stays large.
+// * If the slow cadence were NOT a frame lock, `q` sits outside `[2.9, 3.2]` for the slow
+//   population while the fast one sits in `[0.9, 1.2]`. The band and not an exact integer, because
+//   `gap` is whole milliseconds against a 16.667 ms frame: the same 3-frame cadence prints `3.0`
+//   from `gap=50` and `3.1` from `gap=51`, and a criterion of "reads 3.0" would be unreachable on
+//   half the blocks in this very capture. `gap=` stays on the line beside `q=` so the division can
+//   be checked by hand.
+// * If z-order were NOT the discriminator, the slow windows' `z` and `dout` sit in the same range as
+//   the fast ones'.
+// * If the chain were N independent draggers rather than a chain, `drly` reads ~0 across `win=5`
+//   through `win=10` while `dout` reads large on all of them.
+//
+// A census whose buckets cannot disagree is a defect; each of the four readings above is a distinct
+// wire state this block can print.
+//
+// ### Wire cost
+//
+// The appended run is ~54 bytes per per-window line. At the `[wcn]` rollup cadence with a full table
+// that is ~86 KB over an 800 s boot — a fraction of a percent of a capture of this size, and paid
+// only on `witness` builds.
+
+/// WCN-CAUSE — the panel frame period `q=` is stated in, in microseconds.
+///
+/// A LOCAL MIRROR of `video::wcg::FRAME_US` and `arch::x86_64::syscall::PANEL_FRAME_US`, both of
+/// which are private compile-time constants of the same value. Mirrored rather than re-exported
+/// because this arc's lane is this file; if the panel ever stops being 60 Hz all three move together
+/// and `[wc-h] frame_us=` — printed from wcg's copy, in the same capture — is the cross-check that
+/// says so.
+#[cfg(feature = "witness")]
+const WCN_FRAME_US: u64 = 16_667;
+
+/// WCN-CAUSE — `gap` milliseconds as a multiple of [`WCN_FRAME_US`], in tenths.
+///
+/// Rounded, not truncated: a correctly one-frame-paced window measures `gap=16..17ms` against a
+/// 16.667 ms frame, and truncation would print those as `0.9..1.0` — straddling the integer the
+/// reading exists to test. Rounding puts both on `1.0` and leaves `gap=` on the line for anyone who
+/// wants the raw division.
+#[cfg(feature = "witness")]
+fn wcn_frame_q(gap_ms: u64) -> u64 {
+    (gap_ms.saturating_mul(10_000) + WCN_FRAME_US / 2) / WCN_FRAME_US
+}
+
 /// WC-N — the slot for `id`, or `None` for an out-of-range id.
 #[cfg(feature = "witness")]
 fn wcn_slot(id: WinId) -> Option<&'static WcnRow> {
@@ -7648,10 +7808,48 @@ fn wcn_note_present(id: WinId, hidden: bool) {
 }
 
 /// WC-N — record that `id`'s row was blitted by a composite pass. The only "reached glass" writer.
+///
+/// WCN-CAUSE — `dragged` says WHY this blit happened, and the two buckets it feeds partition `comp`
+/// exactly. See the WCN-CAUSE ledger above [`WCN_FRAME_US`] for what each bucket can and cannot say.
 #[cfg(feature = "witness")]
-fn wcn_note_drawn(id: WinId) {
+fn wcn_note_drawn(id: WinId, dragged: bool) {
     if let Some(s) = wcn_slot(id) {
-        s.comp
+        use core::sync::atomic::Ordering::Relaxed;
+        // ONE increment, not two: `comp` is derived as `pre + drg` at emit. A separate `comp`
+        // counter could only ever restate this sum, and its extra `swap` was the one thing that
+        // could make the three disagree. See [`WcnRow::pre`].
+        if dragged {
+            s.drg.fetch_add(1, Relaxed);
+        } else {
+            s.pre.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// WCN-CAUSE — record that `id`'s OWN damage promoted a higher-z window of `px` pixels to a
+/// whole-box repaint, `added` saying whether that promotion also put the window into the pass.
+///
+/// Charged to the DRAGGER, not the draggee: `wcn_note_drawn`'s `drg` already carries the draggee's
+/// side. The pair is what makes the census two-sided — a window can read a large `drg` (it is
+/// expensive to OTHERS' presents) or a large `dout` (others are expensive to ITS presents), and the
+/// two are different defects with different fixes. Nothing in the census forces them to agree.
+#[cfg(feature = "witness")]
+fn wcn_note_dragout(id: WinId, px: u64, added: bool) {
+    if let Some(s) = wcn_slot(id) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if added {
+            s.dout.fetch_add(1, Relaxed);
+        }
+        s.dkpx.fetch_add(px / 1024, Relaxed);
+    }
+}
+
+/// WCN-CAUSE — record that `id` forwarded damage it had itself been given, adding a higher-z window
+/// to the pass. The chain's middle, kept out of `dout` so the chain's FOOT stays identifiable.
+#[cfg(feature = "witness")]
+fn wcn_note_relay(id: WinId) {
+    if let Some(s) = wcn_slot(id) {
+        s.drly
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -7736,7 +7934,10 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // is judged against one table state and one shell position. A slot with traffic but no live row
     // is a window that closed inside this rollup window; it still gets its line (`live=no`), because
     // dropping it would silently delete the last few frames of every window that ever exits.
-    let mut ident = [(0u64, false, false); MAX_WINDOWS]; // (owner asid, live, above shell)
+    // WCN-CAUSE — `z` joins the identity tuple, from the SAME acquisition as `asid`/`live`/`above`.
+    // It has to be this snapshot and not a second one: the whole point of the field is to be read
+    // beside `dout`, and a z taken after a focus change would explain the wrong stack.
+    let mut ident = [(0u64, false, false, 0u32); MAX_WINDOWS]; // (owner asid, live, above shell, z)
     {
         let t = table();
         let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire);
@@ -7744,7 +7945,7 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
             if !r.used || r.id == WIN_NONE || r.id as usize > MAX_WINDOWS {
                 continue;
             }
-            ident[r.id as usize - 1] = (r.owner_asid, true, above_shell(r, shell));
+            ident[r.id as usize - 1] = (r.owner_asid, true, above_shell(r, shell), r.z);
         }
     }
     let (mut t_att, mut t_comp, mut t_hid, mut t_bel) = (0u64, 0u64, 0u64, 0u64);
@@ -7752,18 +7953,27 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     let mut lines: [Option<WcnLine>; MAX_WINDOWS] = [None; MAX_WINDOWS];
     for (i, s) in WCN.iter().enumerate() {
         let att = s.att.swap(0, Relaxed);
-        let comp = s.comp.swap(0, Relaxed);
         let hid = s.hid.swap(0, Relaxed);
         let bel = s.bel.swap(0, Relaxed);
         let active = s.active_ms.swap(0, Relaxed);
         let parked = s.parked_ms.swap(0, Relaxed);
         let gmin = s.gap_min.swap(u64::MAX, Relaxed);
         let gmax = s.gap_max.swap(0, Relaxed);
+        // WCN-CAUSE — `comp` is DERIVED, not drained: these two swaps are the whole of it, so the
+        // sum is an identity by construction and there is no third counter for a straddle to
+        // desynchronise. (The two swaps can still straddle EACH OTHER, but that moves a blit between
+        // spans without ever losing it — the same property every other counter on this line has.)
+        let pre = s.pre.swap(0, Relaxed);
+        let drg = s.drg.swap(0, Relaxed);
+        let comp = pre + drg;
+        let dout = s.dout.swap(0, Relaxed);
+        let dkpx = s.dkpx.swap(0, Relaxed);
+        let drly = s.drly.swap(0, Relaxed);
         t_att += att;
         t_comp += comp;
         t_hid += hid;
         t_bel += bel;
-        let (asid, live, above) = ident[i];
+        let (asid, live, above, z) = ident[i];
         if live {
             wins += 1;
         }
@@ -7793,6 +8003,12 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
             // window honestly has: no interval to measure.
             gap_min: if gmin == u64::MAX { 0 } else { gmin },
             gap_max: gmax,
+            z,
+            pre,
+            drg,
+            dout,
+            dkpx,
+            drly,
         });
     }
     // WEDGE-1r2 — the drain barrier's dwell, taken BEFORE the dirty-paced guard below. A teardown
@@ -7804,8 +8020,20 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
         return; // dirty-paced: a period with no present traffic prints nothing at all.
     }
     for l in lines.iter().flatten() {
+        // WCN-CAUSE — the census fields are APPENDED after `gap=`, which every existing `[wcn]`
+        // harvest in the bench scripts anchors on. Nothing above this point moved, so an awk that
+        // reads `att=`/`comp=`/`gap=` off this line keeps working unchanged. `comp=` keeps its exact
+        // meaning and its place; it is simply summed here rather than counted a third time.
+        //
+        // There is no `cause=` verdict. It asserted `pre + drg == comp` — which is now true by
+        // construction and was a tautology even before, since all three were written inside one `if`
+        // on one path. Its only reachable failure was the multi-counter drain straddle it has since
+        // been designed out of, and a verdict that fires only on its own sampling artefact trains
+        // the reader to discard good blocks.
+        let qmin = wcn_frame_q(l.gap_min);
+        let qmax = wcn_frame_q(l.gap_max);
         serial_println!(
-            "[wcn] win={} asid={:#x} live={} above={} att={} comp={} hid={} bel={} rate={}.{}/s comp_rate={}.{}/s active={}ms parked={}ms gap={}..{}ms",
+            "[wcn] win={} asid={:#x} live={} above={} att={} comp={} hid={} bel={} rate={}.{}/s comp_rate={}.{}/s active={}ms parked={}ms gap={}..{}ms z={} pre={} drg={} dout={} dkpx={} drly={} q={}.{}..{}.{}",
             l.id,
             l.asid,
             if l.live { "yes" } else { "no" },
@@ -7821,7 +8049,17 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
             l.active,
             l.parked,
             l.gap_min,
-            l.gap_max
+            l.gap_max,
+            l.z,
+            l.pre,
+            l.drg,
+            l.dout,
+            l.dkpx,
+            l.drly,
+            qmin / 10,
+            qmin % 10,
+            qmax / 10,
+            qmax % 10
         );
     }
     let passes = WCN_PASSES.swap(0, Relaxed);
@@ -7905,6 +8143,18 @@ struct WcnLine {
     parked: u64,
     gap_min: u64,
     gap_max: u64,
+    /// WCN-CAUSE — stacking position at the identity snapshot, and the census's candidate
+    /// discriminator: the closure drags in windows ABOVE the damaged one.
+    z: u32,
+    /// WCN-CAUSE — the draggee's split of `comp`, which is their sum.
+    pre: u64,
+    drg: u64,
+    /// WCN-CAUSE — the dragger's side: drag-in edges this window's OWN damage caused, the whole-box
+    /// promotion bill (units of 1024 px) it committed those passes to, and the edges it caused while
+    /// relaying damage given to it.
+    dout: u64,
+    dkpx: u64,
+    drly: u64,
 }
 
 /// WC-N — forget a slot's accumulators when its row is freed, so a recycled window id cannot inherit
