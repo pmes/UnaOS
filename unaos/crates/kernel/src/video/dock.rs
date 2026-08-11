@@ -71,6 +71,28 @@
 //! Neither is dressed up as a kit citation. `kits/crispy/` is not in this repo and nothing here
 //! pretends to have read it.
 //!
+//! # STRIPFACTOR — the dock is now TENANT #1 of [`super::strip`], and unchanged by being one
+//!
+//! Peter's 2026-08-11 direction (*"UnaOS is a spatial game-engine OS … we will not always have a
+//! menu bar"*) made the kernel's contribution the STRIP MECHANISM rather than any particular strip.
+//! Everything below that was general — edge-anchored geometry with floors, the staged row-run
+//! painter, the vacated-pixel erase, the damage slot, the cost ledger, the rounded-corner and disc
+//! arithmetic, and occlusion citizenship — moved to [`super::strip`] and is shared with
+//! [`super::menubar`]. What stayed here is everything a DOCK is and a strip is not: the tile model,
+//! the tile arithmetic, the caption budget, the running pip, and the raise-and-unhide press.
+//!
+//! **Nothing about the dock's behaviour moved with it.** The tile geometry, the damage conditions,
+//! the paint order, the colours, and the press routing are the same code reading the same constants;
+//! the primitive received the machinery verbatim rather than a reimplementation of it. Two things
+//! about the ARTIFACT did change, and are disclosed rather than implied away:
+//!
+//!  * the not-word4 decline line is emitted by the primitive for every tenant, so it reads
+//!    `[strip] decline reason=not-word4` where it read `[dock] decline reason=not-word4`;
+//!  * [`super::strip::MAX_STRIP_W`] is 4096, not this module's old 2048, because a FLUSH tenant is
+//!    the panel's full width and the bench panels reach 2880. The scratch is 32 KiB of `.bss`, up
+//!    from 16. The dock's own `const` proof that its worst-case layout fits is unchanged and still
+//!    checked below.
+//!
 //! # Performance — damage-driven, and measured
 //!
 //! **The dock does not repaint per frame.** [`compose`] runs at the tail of every composite pass and
@@ -113,7 +135,7 @@
 //! by one `GAP`. [`selftest`] asserts the two agree by driving a synthetic press at a tile centre
 //! that [`Layout`] itself computed and checking WHICH window came back.
 
-use super::{ceramic, theme, wm};
+use super::{ceramic, strip, theme, wm};
 
 // ---------------------------------------------------------------------------
 // Metrics — every one a `theme` name, or derived from one with the derivation
@@ -121,8 +143,9 @@ use super::{ceramic, theme, wm};
 // ---------------------------------------------------------------------------
 
 /// Padding inside the strip, gap between tiles, and the strip's margin off the panel's bottom edge —
-/// all [`theme::GAP`], the kit's one "standard gap between controls".
-const PAD: usize = theme::GAP;
+/// all [`theme::GAP`], the kit's one "standard gap between controls", by way of the primitive's
+/// [`strip::PAD`] so a strip's margin and a tenant's padding cannot drift apart.
+const PAD: usize = strip::PAD;
 
 /// A tile's height — [`theme::BUTTON_HEIGHT`]. A dock tile IS a button by the kit's own taxonomy: a
 /// raised control with a label that does something when pressed.
@@ -137,7 +160,11 @@ const TILE_R: usize = theme::WIDGET_RADIUS;
 const STRIP_R: usize = theme::CORNER_RADIUS;
 
 /// The strip's height: a tile with the standard gap above and below it.
-const STRIP_H: usize = TILE_H + 2 * PAD;
+///
+/// `pub` since STRIPFACTOR: [`super::menubar`]'s floor is derived from it (the bar must not crowd the
+/// dock off a short panel), and a second copy of this arithmetic there is exactly the drift the
+/// single-accessor law forbids.
+pub const STRIP_H: usize = TILE_H + 2 * PAD;
 
 /// The running indicator's diameter, px.
 ///
@@ -166,13 +193,14 @@ const CELL: usize = wm::TITLE_CELL;
 /// would let four windows fill a 1920 panel.
 const LABEL_MAX: usize = 8;
 
-/// The widest strip this module will compose, in panel pixels — the scratch row's length.
+/// The widest strip the primitive will compose — [`strip::MAX_STRIP_W`], shared with every tenant.
 ///
-/// Sized from the layout it must be able to hold rather than picked: a full table of
-/// [`wm::MAX_WINDOWS`] tiles at [`LABEL_MAX`] glyphs is
-/// `2*PAD + 12*(2*PAD + 8*CELL) + 11*PAD` = `24 + 12*152 + 132` = 1980 px, so 2048 covers every
-/// layout this module can produce on any panel. Two scratch rows of `u32` = 16 KiB of `.bss`.
-const MAX_STRIP_W: usize = 2048;
+/// The dock's own worst case is unchanged and is still what the `const` proof below checks: a full
+/// table of [`wm::MAX_WINDOWS`] tiles at [`LABEL_MAX`] glyphs is
+/// `2*PAD + 12*(2*PAD + 8*CELL) + 11*PAD` = `24 + 12*152 + 132` = 1980 px. STRIPFACTOR raised the
+/// shared bound to 4096 for the flush tenants; the dock neither needs nor is affected by the extra
+/// width, and it no longer owns the scratch that provides it.
+const MAX_STRIP_W: usize = strip::MAX_STRIP_W;
 
 /// The layout cannot ask for a strip the scratch cannot hold. A `const` proof rather than a runtime
 /// clamp, so a future `LABEL_MAX` or `MAX_WINDOWS` raise fails the BUILD.
@@ -228,23 +256,18 @@ impl Layout {
         if n == 0 || n > wm::MAX_WINDOWS {
             return None;
         }
-        if ph < STRIP_H + 2 * PAD {
-            return None;
-        }
         let mut glyphs = LABEL_MAX;
         loop {
             let tile_w = 2 * PAD + glyphs * CELL;
             let w = 2 * PAD + n * tile_w + (n - 1) * PAD;
-            if w + 2 * PAD <= pw && w <= MAX_STRIP_W {
-                return Some(Layout {
-                    x: (pw - w) / 2,
-                    y: ph - PAD - STRIP_H,
-                    w,
-                    h: STRIP_H,
-                    n,
-                    tile_w,
-                    glyphs,
-                });
+            // STRIPFACTOR — the anchoring, the margin and BOTH floors are the primitive's
+            // `frame_centred`: `ph < STRIP_H + 2*PAD`, `w + 2*PAD > pw` and `w > MAX_STRIP_W` were
+            // three separate tests here and are the same three there, in the same order, against the
+            // same constants. The step-down loop stays, because auto-sizing the caption to the panel
+            // is the DOCK's arithmetic, not any strip's.
+            if let Some((x, y, w, h)) = strip::frame_centred(strip::Edge::Bottom, w, STRIP_H, pw, ph)
+            {
+                return Some(Layout { x, y, w, h, n, tile_w, glyphs });
             }
             if glyphs == 1 {
                 return None; // even one glyph per tile will not fit: draw no dock at all.
@@ -289,11 +312,7 @@ impl Layout {
     /// corners.
     #[inline]
     pub fn contains(&self, px: usize, py: usize) -> bool {
-        px >= self.x
-            && px < self.x + self.w
-            && py >= self.y
-            && py < self.y + self.h
-            && !corner_cut(px - self.x, py - self.y, self.w, self.h, STRIP_R)
+        strip::contains(self.rect(), STRIP_R, px, py)
     }
 
     /// The strip as a plain rect, for the damage question.
@@ -303,73 +322,41 @@ impl Layout {
     }
 }
 
-/// Is `(i, j)` outside the rounded corner of a `w` x `h` box with radius `r`?
-///
-/// All four corners, unlike `wm::corner_outside` (which cuts only the two TOP corners of a window
-/// head): the dock is a free-floating slab, so it is rounded all the way round. Integer only —
-/// `dx*dx + dy*dy > r*r` against the corner-circle centre.
-#[inline]
-fn corner_cut(i: usize, j: usize, w: usize, h: usize, r: usize) -> bool {
-    if r == 0 || w < 2 * r || h < 2 * r {
-        return false;
-    }
-    let (cx, cy) = if i < r {
-        (r, if j < r { r } else if j >= h - r { h - r - 1 } else { return false })
-    } else if i >= w - r {
-        (w - r - 1, if j < r { r } else if j >= h - r { h - r - 1 } else { return false })
-    } else {
-        return false;
-    };
-    let dx = if i > cx { i - cx } else { cx - i };
-    let dy = if j > cy { j - cy } else { cy - j };
-    dx * dx + dy * dy > r * r
-}
-
-/// Is `(i, j)` inside the filled disc of diameter `d` whose top-left is `(bx, by)`? The indicator
-/// pip's only shape test; mirrors `wm::in_circle`'s integer form.
-#[inline]
-fn in_disc(i: usize, j: usize, bx: usize, by: usize, d: usize) -> bool {
-    if d == 0 || i < bx || j < by || i >= bx + d || j >= by + d {
-        return false;
-    }
-    let (u, v) = (2 * (i - bx) + 1, 2 * (j - by) + 1);
-    let (du, dv) = (
-        if u > d { u - d } else { d - u },
-        if v > d { v - d } else { d - v },
-    );
-    du * du + dv * dv <= d * d
-}
-
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// The signature of the tile model the strip on the panel was painted from. `0` means "nothing is
-/// painted", which is the state a teardown or a first boot leaves.
-static PAINTED_SIG: AtomicU64 = AtomicU64::new(0);
+/// STRIPFACTOR — the tenant's registry hook: **the dock's rect on this panel, or `None`.**
+///
+/// Registered as [`strip::TENANTS`]`[strip::DOCK_SLOT]`, so this is what `wm::erase_clip` reads. It
+/// is [`Layout::for_panel`] and nothing else — the dock's one source of tile arithmetic, reached
+/// through the tile count [`wm::dock_scan`] reports — which is the same expression the erase clip
+/// used to inline. The dock is unconditionally PRESENT (there is no disable for it: it is the
+/// console's only way back), so `None` here means only that the panel cannot host it.
+pub fn strip_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
+    let mut tiles = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    // A zero rect asks the damage question nothing; only the tile count is wanted here.
+    let (n, _) = wm::dock_scan(&mut tiles, (0, 0, 0, 0));
+    Layout::for_panel(n, pw, ph).map(|l| l.rect())
+}
 
-/// The strip rect currently on the panel, packed `y<<48 | x<<32 | h<<16 | w`, or `0` for none.
-/// Read by [`compose`] to ask `wm` the damage question BEFORE it knows this pass's layout — a
-/// stale rect is safe, because a layout change is also a signature change and repaints regardless.
-static PAINTED_RECT: AtomicU64 = AtomicU64::new(0);
+/// What the dock last put on the panel — signature and rect, in the primitive's [`strip::Slot`].
+/// The rect is read by [`compose`] to ask `wm` the damage question BEFORE it knows this pass's
+/// layout; a stale rect is safe, because a layout change is also a signature change and repaints
+/// regardless.
+static SLOT: strip::Slot = strip::Slot::new();
 
 /// The window id whose tile is held down, or `wm::WIN_NONE`. Cleared by the raise that follows.
 static PRESSED: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 
-/// One-shot: the strip cannot be composed on this surface (not a 4-byte word-aligned layout), said
-/// once rather than on every pass.
-static NOWORD_SAID: AtomicBool = AtomicBool::new(false);
+/// Cost ledger — the primitive's [`strip::Ledger`]. Not `witness`-gated: the metal image is built
+/// WITHOUT `witness`, and a performance claim that is absent from the only artifact that matters is
+/// not a claim.
+static LEDGER: strip::Ledger = strip::Ledger::new();
 
-/// Cost ledger. Not `witness`-gated: the metal image is built WITHOUT `witness`, and a performance
-/// claim that is absent from the only artifact that matters is not a claim. Four relaxed adds per
-/// pass; the rollup line is bounded and rate-limited by its own call site.
-static PASSES: AtomicU64 = AtomicU64::new(0);
-static PAINTS: AtomicU64 = AtomicU64::new(0);
-static SCAN_CYC: AtomicU64 = AtomicU64::new(0);
-static PAINT_CYC: AtomicU64 = AtomicU64::new(0);
-static PAINT_PX: AtomicU64 = AtomicU64::new(0);
+/// The dock's own vocabulary, appended to the ledger's common terms so the line is unchanged.
 static PRESSES_N: AtomicU64 = AtomicU64::new(0);
 static RAISES: AtomicU64 = AtomicU64::new(0);
 static UNHIDES: AtomicU64 = AtomicU64::new(0);
@@ -387,43 +374,26 @@ static UNHIDES: AtomicU64 = AtomicU64::new(0);
 /// when a model change and a clobber coincide.
 static CLOBBERS: AtomicU64 = AtomicU64::new(0);
 
-/// The scratch the strip is composed in — CACHED RAM, never the scan-out. One row of logical colours
-/// and one of pre-encoded framebuffer words; the encode is hoisted out of the pixel loop through a
-/// tiny memo, exactly as `FrameBuffer::encode4` was built for.
+/// The dock's tail on every ledger line: the WCK5 clobber count, presses, and what they did. A macro
+/// rather than a function because `format_args!` borrows its arguments and the result cannot outlive
+/// the call.
 ///
-/// `try_lock`, never `lock`: a contended pass declines and repaints on the next one rather than
-/// spinning inside a composite. That is `wm::stage_fill`'s own rule for `STAGE`.
-struct Scratch {
-    log: [u32; MAX_STRIP_W],
-    raw: [u32; MAX_STRIP_W],
-}
-
-static SCRATCH: spin::Mutex<Scratch> = spin::Mutex::new(Scratch {
-    log: [0; MAX_STRIP_W],
-    raw: [0; MAX_STRIP_W],
-});
-
-#[inline]
-fn pack_rect(r: Option<(usize, usize, usize, usize)>) -> u64 {
-    match r {
-        Some((x, y, w, h)) if w != 0 && h != 0 => {
-            ((y as u64 & 0xFFFF) << 48)
-                | ((x as u64 & 0xFFFF) << 32)
-                | ((h as u64 & 0xFFFF) << 16)
-                | (w as u64 & 0xFFFF)
-        }
-        _ => 0,
-    }
-}
-
-#[inline]
-fn unpack_rect(v: u64) -> (usize, usize, usize, usize) {
-    (
-        ((v >> 32) & 0xFFFF) as usize,
-        ((v >> 48) & 0xFFFF) as usize,
-        (v & 0xFFFF) as usize,
-        ((v >> 16) & 0xFFFF) as usize,
-    )
+/// STRIPFACTOR × WCK5 — `clob=` is dock-specific (WCK5's "a window painted over the strip" counter)
+/// and rides the tail rather than the primitive's common terms, because the menu bar has no such
+/// counter and a shared field would print a meaningless `clob=0` for it. It moved from between
+/// `paints=` and `rate=` (WCK5's inline `serial_println!`) to the tail when the rollup folded onto
+/// `strip::Ledger`; no spec pins its position, so the reconciliation is a field reorder the analyzer
+/// and the FORBIDs (which match `clob=` anywhere) do not see.
+macro_rules! dock_tail {
+    () => {
+        format_args!(
+            "clob={} presses={} raises={} unhides={}",
+            CLOBBERS.load(Ordering::Relaxed),
+            PRESSES_N.load(Ordering::Relaxed),
+            RAISES.load(Ordering::Relaxed),
+            UNHIDES.load(Ordering::Relaxed)
+        )
+    };
 }
 
 /// FNV-1a 64 over the tile model — the whole "has anything changed?" test, reduced to one integer.
@@ -433,36 +403,29 @@ fn unpack_rect(v: u64) -> (usize, usize, usize, usize) {
 /// glyph budget). A field the painter uses and this hash omits is a field whose change would leave a
 /// stale strip on the panel, so the two lists are the same list on purpose.
 fn signature(e: &[wm::DockEntry], l: &Layout, pressed: u32) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut byte = |b: u8, h: &mut u64| {
-        *h ^= b as u64;
-        *h = h.wrapping_mul(0x0000_0100_0000_01B3);
-    };
+    // STRIPFACTOR — the same FNV-1a 64, from the primitive, over the same fields in the same order.
+    let mut h = strip::FNV_BASIS;
     for v in [
         l.x as u64, l.y as u64, l.w as u64, l.h as u64,
         l.n as u64, l.tile_w as u64, l.glyphs as u64, pressed as u64,
     ] {
-        for k in 0..8 {
-            byte(((v >> (k * 8)) & 0xFF) as u8, &mut h);
-        }
+        h = strip::fnv1a_u64(h, v);
     }
     for r in e {
         for k in 0..4 {
-            byte(((r.id >> (k * 8)) & 0xFF) as u8, &mut h);
+            h = strip::fnv1a(h, ((r.id >> (k * 8)) & 0xFF) as u8);
         }
-        for k in 0..8 {
-            byte(((r.owner_asid >> (k * 8)) & 0xFF) as u8, &mut h);
-        }
-        byte(r.visible as u8, &mut h);
-        byte(r.focused as u8, &mut h);
-        byte(r.title_len as u8, &mut h);
+        h = strip::fnv1a_u64(h, r.owner_asid);
+        h = strip::fnv1a(h, r.visible as u8);
+        h = strip::fnv1a(h, r.focused as u8);
+        h = strip::fnv1a(h, r.title_len as u8);
         for &b in r.title[..r.title_len.min(wm::MAX_TITLE)].iter() {
-            byte(b, &mut h);
+            h = strip::fnv1a(h, b);
         }
     }
     // A zero signature means "nothing painted"; fold it away so a real model can never collide with
     // the empty state.
-    if h == 0 { 1 } else { h }
+    strip::seal(h)
 }
 
 // ---------------------------------------------------------------------------
@@ -481,7 +444,7 @@ pub fn compose() -> bool {
     let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
     // Ask `wm` for the tile model AND the damage question in ONE table scan: "were any of the
     // windows that intersect the strip I last painted damaged in the pass that just ran?"
-    let (n, clobbered) = wm::dock_scan(&mut rows, unpack_rect(PAINTED_RECT.load(Ordering::Acquire)));
+    let (n, clobbered) = wm::dock_scan(&mut rows, SLOT.rect());
     // WCK5 — one relaxed add on the pass that was clobbered, and nothing at all on the quiet pass.
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
@@ -489,11 +452,7 @@ pub fn compose() -> bool {
     let (pw, ph) = {
         let fb = *super::WRITER.lock();
         if !fb.is_ready() {
-            PASSES.fetch_add(1, Ordering::Relaxed);
-            SCAN_CYC.fetch_add(
-                crate::arch::now_cycles().saturating_sub(t0),
-                Ordering::Relaxed,
-            );
+            LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
             return false;
         }
         (fb.width(), fb.height())
@@ -504,20 +463,16 @@ pub fn compose() -> bool {
         Some(l) => signature(&rows[..n], &l, pressed),
         None => 0,
     };
-    let painted_sig = PAINTED_SIG.load(Ordering::Acquire);
-    PASSES.fetch_add(1, Ordering::Relaxed);
-    SCAN_CYC.fetch_add(
-        crate::arch::now_cycles().saturating_sub(t0),
-        Ordering::Relaxed,
-    );
+    let painted_sig = SLOT.sig();
+    LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
 
     // The ledger reaches the METAL image, or it is not a performance claim.
     //
     // `rollup` is not `witness`-gated, but a function with no caller outside `witness` is not in the
     // artifact either — the linker drops it and the claim evaporates exactly where it matters. So the
-    // live emitter is HERE, on the path every pass takes, rate-limited to one line per
-    // [`ROLLUP_PERIOD_US`]. Cost on a pass that does not print: one relaxed load and a compare.
-    rollup_tick();
+    // live emitter is HERE, on the path every pass takes, rate-limited by the primitive's `tick`.
+    // Cost on a pass that does not print: one relaxed load and a compare.
+    LEDGER.tick("dock", dock_tail!());
 
     // The two damage conditions, and nothing else. Note the ordering: a signature that MATCHES and a
     // pass that did not touch the strip is the common case and returns here having read no pixel.
@@ -530,39 +485,32 @@ pub fn compose() -> bool {
     // leave its old ends standing on the panel until something else happened to paint over them. The
     // rule is the one `wm::close` follows: erase what you vacate, in the same pass, through the same
     // staged path.
-    let old = PAINTED_RECT.load(Ordering::Acquire);
-    let new = pack_rect(layout.map(|l| l.rect()));
-    let vacated = if old != 0 && old != new { Some(unpack_rect(old)) } else { None };
+    let old = SLOT.packed();
+    let new = strip::pack_rect(layout.map(|l| l.rect()));
+    let vacated = if old != 0 && old != new { Some(strip::unpack_rect(old)) } else { None };
 
     let Some(l) = layout else {
-        if let Some(v) = vacated {
-            let painted = erase_rect(v);
-            PAINTED_SIG.store(0, Ordering::Release);
-            PAINTED_RECT.store(0, Ordering::Release);
-            return painted;
-        }
-        PAINTED_SIG.store(0, Ordering::Release);
-        PAINTED_RECT.store(0, Ordering::Release);
-        return false;
+        SLOT.clear();
+        return match vacated {
+            Some(v) => strip::erase_rect(v),
+            None => false,
+        };
     };
 
     let t1 = crate::arch::now_cycles();
     if let Some(v) = vacated {
         // Erase FIRST, then paint: the new strip lands on top of the cleaned area, so the two never
         // race to own an overlapping pixel and the panel never shows a half-erased strip.
-        erase_rect(v);
+        strip::erase_rect(v);
     }
     if !paint(&l, &rows[..n], pressed) {
         return false;
     }
-    PAINTS.fetch_add(1, Ordering::Relaxed);
-    PAINT_CYC.fetch_add(
+    LEDGER.paint(
         crate::arch::now_cycles().saturating_sub(t1),
-        Ordering::Relaxed,
+        (l.w * l.h) as u64,
     );
-    PAINT_PX.fetch_add((l.w * l.h) as u64, Ordering::Relaxed);
-    PAINTED_SIG.store(sig, Ordering::Release);
-    PAINTED_RECT.store(pack_rect(Some(l.rect())), Ordering::Release);
+    SLOT.store(sig, Some(l.rect()));
     true
 }
 
@@ -572,96 +520,11 @@ pub fn compose() -> bool {
 /// The one framebuffer writer in this module, and it writes the way the subsystem's law requires:
 /// compose a row in cached RAM, copy it out with one `blit`, clean the whole rect once at the end.
 fn paint(l: &Layout, rows: &[wm::DockEntry], pressed: u32) -> bool {
-    let fb = *super::WRITER.lock();
-    if !fb.is_ready() {
-        return false;
-    }
-    if !fb.word4() {
-        if !NOWORD_SAID.swap(true, Ordering::Relaxed) {
-            serial_println!("[dock] decline reason=not-word4 — strip not composed on this surface");
-        }
-        return false;
-    }
-    let info = fb.info();
-    if l.x + l.w > info.width || l.y + l.h > info.height || l.w > MAX_STRIP_W {
-        return false;
-    }
-    let Some(mut s) = SCRATCH.try_lock() else {
-        return false; // contended: the next pass repaints (the signature is still unmatched).
-    };
-
-    // CURSOR — take the arrow off the panel before the first byte lands. `wm::erase`'s bracket, and
-    // for its reason: without it these rows would overwrite the sprite and the save-under would later
-    // restore pre-dock pixels over a freshly painted strip. The caller restores it (we return `true`,
-    // which upgrades the pass's cursor tail to `Repaint`).
-    super::cursor::undraw();
-
-    let stride_b = info.stride * 4;
-    for j in 0..l.h {
-        compose_row(&mut s.log, l, rows, pressed, j);
-        // Encode logical colours to this surface's words, with a two-entry memo: a dock row is long
-        // runs of very few colours, so the memo hits on nearly every pixel and `encode4`'s match runs
-        // a handful of times per row instead of `w` times.
-        let (mut mc, mut mr) = (u32::MAX, 0u32);
-        for i in 0..l.w {
-            let c = s.log[i];
-            if c != mc {
-                mc = c;
-                mr = fb.encode4(c).unwrap_or(0);
-            }
-            s.raw[i] = mr;
-        }
-        let off = (l.y + j) * stride_b + l.x * 4;
-        // SAFETY: `raw` is a live `[u32; MAX_STRIP_W]` and `l.w <= MAX_STRIP_W` (checked above); the
-        // byte view is `4 * l.w` bytes of it, correctly aligned and initialised. `blit` bounds-checks
-        // the destination itself and is a no-op on an overrun.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(s.raw.as_ptr() as *const u8, l.w * 4)
-        };
-        fb.blit(off, bytes);
-    }
-    fb.flush_rect(l.x, l.y, l.w, l.h);
-    true
-}
-
-/// Fill a vacated strip rect with the desktop colour, through the SAME staged row-run path
-/// [`paint`] uses. Returns `true` if it painted (so the caller owes the sprite a `Repaint`).
-///
-/// `wm::erase` does exactly this job for a window's vacated box and would be the natural call — it is
-/// private, it takes a slice of boxes, and it opens and closes its own cursor bracket. Re-entering it
-/// from the tail of a composite pass would nest that bracket inside the one this module already holds.
-/// One row-blit loop over `DESKTOP_BG` is the smaller thing.
-fn erase_rect(r: (usize, usize, usize, usize)) -> bool {
-    let (x, y, w, h) = r;
-    if w == 0 || h == 0 || w > MAX_STRIP_W {
-        return false;
-    }
-    let fb = *super::WRITER.lock();
-    if !fb.is_ready() || !fb.word4() {
-        return false;
-    }
-    let info = fb.info();
-    if x >= info.width || y >= info.height {
-        return false;
-    }
-    let (w, h) = (w.min(info.width - x), h.min(info.height - y));
-    let Some(mut s) = SCRATCH.try_lock() else {
-        return false;
-    };
-    super::cursor::undraw();
-    let raw = fb.encode4(wm::DESKTOP_BG).unwrap_or(0);
-    for i in 0..w {
-        s.raw[i] = raw;
-    }
-    let stride_b = info.stride * 4;
-    for j in 0..h {
-        // SAFETY: as in `paint` — `raw` is a live `[u32; MAX_STRIP_W]`, `w <= MAX_STRIP_W`, and
-        // `blit` bounds-checks its destination.
-        let bytes = unsafe { core::slice::from_raw_parts(s.raw.as_ptr() as *const u8, w * 4) };
-        fb.blit((y + j) * stride_b + x * 4, bytes);
-    }
-    fb.flush_rect(x, y, w, h);
-    true
+    // STRIPFACTOR — the whole body moved to `strip::paint`: the readiness and word4 checks, the
+    // bounds check, the scratch `try_lock`, the cursor bracket, the per-row encode memo, the row
+    // `blit` and the single `flush_rect`. This function is now the dock's row composer and nothing
+    // else, which is exactly the split that lets a second tenant exist.
+    strip::paint("dock", l.rect(), |out, j| compose_row(out, l, rows, pressed, j))
 }
 
 /// Compose panel row `j` of the strip into `out[0..l.w]` as logical `0x00RRGGBB` colours.
@@ -678,7 +541,7 @@ fn erase_rect(r: (usize, usize, usize, usize)) -> bool {
 /// flat spans first and the two `STRIP_R`-wide end bands are patched per-pixel, and only on the
 /// `2*STRIP_R` rows that have a corner in them at all. Same pixels, same shape; the shape test runs
 /// `4 * (2*STRIP_R)^2` times per repaint instead of `5 * w * h`.
-fn compose_row(out: &mut [u32; MAX_STRIP_W], l: &Layout, rows: &[wm::DockEntry], pressed: u32, j: usize) {
+fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32, j: usize) {
     // The strip's material is anchored to the STRIP, not to the panel: index ceramic by the row's
     // offset inside the box, exactly as the window chrome indexes it by the row's offset inside the
     // window. The grain then belongs to the object.
@@ -701,12 +564,12 @@ fn compose_row(out: &mut [u32; MAX_STRIP_W], l: &Layout, rows: &[wm::DockEntry],
     // The corner bands — the only pixels whose membership is in question.
     if j < STRIP_R || j + STRIP_R >= l.h {
         for i in (0..STRIP_R).chain(l.w - STRIP_R..l.w) {
-            if corner_cut(i, j, l.w, l.h, STRIP_R) {
+            if strip::corner_cut(i, j, l.w, l.h, STRIP_R) {
                 // The pixels the painter cuts out of the corners are filled with the DESKTOP, exactly
                 // as `wm::paint_window` fills a window's cut head corners. Same rule, same colour,
                 // and `Layout::contains` declines the same pixels so a press there falls through.
                 out[i] = wm::DESKTOP_BG;
-            } else if edge_ring(i, j, l.w, l.h) {
+            } else if strip::edge_ring(i, j, l.w, l.h, STRIP_R) {
                 out[i] = line;
             }
         }
@@ -722,7 +585,7 @@ fn compose_row(out: &mut [u32; MAX_STRIP_W], l: &Layout, rows: &[wm::DockEntry],
             let py0 = by + th + (PAD - d) / 2;
             let ink = if r.visible { theme::ACCENT } else { theme::SCROLL_THUMB };
             for i in px0..(px0 + d).min(l.w) {
-                if in_disc(i, j, px0, py0, d) {
+                if strip::in_disc(i, j, px0, py0, d) {
                     out[i] = ink;
                 }
             }
@@ -752,7 +615,7 @@ fn compose_row(out: &mut [u32; MAX_STRIP_W], l: &Layout, rows: &[wm::DockEntry],
             let mid0 = (bx + TILE_R).min(hi);
             let mid1 = (bx + tw - TILE_R).max(mid0).min(hi);
             for i in lo..mid0 {
-                if !corner_cut(i - bx, j - by, tw, th, TILE_R) {
+                if !strip::corner_cut(i - bx, j - by, tw, th, TILE_R) {
                     out[i] = tface;
                 }
             }
@@ -760,7 +623,7 @@ fn compose_row(out: &mut [u32; MAX_STRIP_W], l: &Layout, rows: &[wm::DockEntry],
                 out[i] = tface;
             }
             for i in mid1..hi {
-                if !corner_cut(i - bx, j - by, tw, th, TILE_R) {
+                if !strip::corner_cut(i - bx, j - by, tw, th, TILE_R) {
                     out[i] = tface;
                 }
             }
@@ -806,16 +669,9 @@ fn compose_row(out: &mut [u32; MAX_STRIP_W], l: &Layout, rows: &[wm::DockEntry],
     }
 }
 
-/// The keyline follows the ROUNDED edge, not just the four straight sides: a pixel that is inside the
-/// box but whose neighbour one step outward is cut belongs to the outline. One test, no second
-/// radius table.
-#[inline]
-fn edge_ring(i: usize, j: usize, w: usize, h: usize) -> bool {
-    corner_cut(i.wrapping_sub(1).min(w - 1), j, w, h, STRIP_R)
-        || corner_cut((i + 1).min(w - 1), j, w, h, STRIP_R)
-        || corner_cut(i, j.wrapping_sub(1).min(h - 1), w, h, STRIP_R)
-        || corner_cut(i, (j + 1).min(h - 1), w, h, STRIP_R)
-}
+// STRIPFACTOR — `edge_ring` moved to `strip::edge_ring`, which takes the radius as an argument
+// rather than closing over this module's `STRIP_R`. Same four probes, same order, same result for
+// the dock's radius; a flush tenant passes 0 and pays one compare.
 
 // ---------------------------------------------------------------------------
 // The press seam
@@ -899,70 +755,13 @@ pub fn press_at(x: i32, y: i32) -> bool {
 /// number that says whether the strip is damage-driven or is quietly redrawing every frame. A dock
 /// that repainted per frame would show `paints == passes`, so the claim is falsifiable from the wire.
 pub fn rollup(scope: &str) {
-    let passes = PASSES.load(Ordering::Relaxed).max(1);
-    let paints = PAINTS.load(Ordering::Relaxed);
-    let scan = SCAN_CYC.load(Ordering::Relaxed) / passes;
-    let paint = PAINT_CYC.load(Ordering::Relaxed) / paints.max(1);
-    serial_println!(
-        "[dock] {} passes={} paints={} clob={} rate={}/1k scan={}cyc/{}us paint={}cyc/{}us px/paint={} presses={} raises={} unhides={}",
-        scope,
-        PASSES.load(Ordering::Relaxed),
-        paints,
-        CLOBBERS.load(Ordering::Relaxed),
-        (paints * 1000) / passes,
-        scan,
-        cycles_to_us(scan),
-        paint,
-        cycles_to_us(paint),
-        PAINT_PX.load(Ordering::Relaxed) / paints.max(1),
-        PRESSES_N.load(Ordering::Relaxed),
-        RAISES.load(Ordering::Relaxed),
-        UNHIDES.load(Ordering::Relaxed),
-    );
+    // STRIPFACTOR × WCK5 — the common terms come from the primitive's `Ledger`; the dock's own four
+    // (WCK5's clobber count, presses, raises, unhides) are its tail. Every field WCK5's inline line
+    // carried survives — `clob=` moved from between `paints=` and `rate=` to the tail, which no spec
+    // pins.
+    LEDGER.rollup("dock", scope, dock_tail!());
 }
 
-/// How often the live ledger speaks. 5 s, matching `wm`'s own `WCN_ROLLUP_MS` so a capture carries
-/// the dock's line at the same cadence as the compositor's and the two can be read side by side.
-const ROLLUP_PERIOD_US: u64 = 5_000_000;
-
-/// The cycle count at the last live rollup. `0` means "never", which makes the FIRST pass print —
-/// deliberately: a boot whose dock never speaks is then distinguishable from a boot whose dock never
-/// ran, and the first line also states the ledger is alive before any window has moved.
-static ROLLUP_LAST: AtomicU64 = AtomicU64::new(0);
-
-/// Emit the live ledger if this pass is the one that owes it.
-///
-/// Rate-limited on the free-running counter rather than on a pass count, so the cadence is the same
-/// whether the panel is idle or busy. The `compare_exchange` is what keeps two cores from printing
-/// the same interval twice; a loser simply skips, which is correct — the counters are cumulative and
-/// the next interval reports everything.
-fn rollup_tick() {
-    let now = crate::arch::now_cycles();
-    let last = ROLLUP_LAST.load(Ordering::Relaxed);
-    if last != 0 && cycles_to_us(now.saturating_sub(last)) < ROLLUP_PERIOD_US {
-        return;
-    }
-    if ROLLUP_LAST
-        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
-    rollup("live");
-}
-
-/// `rdtsc` ticks to microseconds, at the rate `apic::calibrate` measured against the ACPI PM timer.
-///
-/// The same arithmetic and the same uncalibrated fallback `wcg::cycles_to_us` uses — restated here
-/// rather than called, because `wcg` is `witness`-gated and this ledger deliberately is not (the
-/// metal image is built without `witness`). Two consumers of an unknown TSC rate in this kernel, one
-/// guess: 1.25 GHz, which is what `arch::HW_WAIT_BUDGET` already assumes.
-#[inline]
-fn cycles_to_us(dt: u64) -> u64 {
-    let hz = crate::arch::apic::tsc_hz();
-    let hz = if hz == 0 { 1_250_000_000 } else { hz };
-    dt.saturating_mul(1_000_000) / hz
-}
 
 /// DOCK fixture — **a minimised window is restorable, and the tile that restores it is the tile the
 /// painter drew.**
@@ -1011,6 +810,29 @@ pub fn selftest() {
     if DONE.swap(true, Ordering::AcqRel) {
         return;
     }
+
+    // STRIPFACTOR — the STRIP battery runs as one battery, and the menu bar's fixture is driven from
+    // here rather than from its own call site.
+    //
+    // ⚠ Stated plainly, because it is a compromise and not a design: the natural home is beside
+    // `dock::selftest`'s own invocation in `arch/x86_64/syscall.rs`, and that file is owned by a
+    // concurrent arc and outside this arc's lane. Driving it here buys the identical preconditions —
+    // the same `witness` gate, the same real panel, the same "after every one-shot per-window latch"
+    // ordering — at the cost of coupling two fixtures that are not otherwise related.
+    //
+    // It runs BEFORE this fixture mints its rows, deliberately: the bar's legs are about the registry
+    // and the panel's edges, not about the window table, and running first means they cannot be
+    // perturbed by three synthetic windows — nor skipped by the `SKIP` return below if the table is
+    // full.
+    //
+    // ⚠ **FOR THE INTEGRATOR — re-seat this in `arch/x86_64/syscall.rs` once that lane frees.** The
+    // canonical home is line ~15477 there, immediately after `crate::video::dock::selftest();`, as
+    // its own statement: `crate::video::menubar::selftest();`. It belongs beside the dock's call, not
+    // nested inside the dock fixture — the two fixtures are unrelated and this nesting is a lane
+    // compromise, not a design. When moved, DELETE this call and this comment block; nothing in either
+    // fixture depends on the coupling, and `menubar::selftest`'s own one-shot `DONE` latch makes the
+    // move idempotent (a double-drive from a botched move runs once, not twice).
+    super::menubar::selftest();
 
     /// Three 8x8 ARGB8888 surfaces in rodata — read-only, because the compositor only reads.
     static SURF: [[u32; 64]; 3] = [[0x0020_40FF; 64], [0x0040_FF20; 64], [0x00FF_4020; 64]];
@@ -1135,11 +957,11 @@ pub fn selftest() {
     // removes it), and the rect it reports as painted must FOLLOW: a strip that shrank without
     // erasing what it vacated would still be claiming — and still be showing — the wide rect. This is
     // the defect the leg was written for, found by review rather than by the panel.
-    let rect_before = PAINTED_RECT.load(Ordering::Acquire);
+    let rect_before = SLOT.packed();
     for &i in w.iter() {
         wm::close(i);
     }
-    let rect_after = PAINTED_RECT.load(Ordering::Acquire);
+    let rect_after = SLOT.packed();
     let vacate_ok = rect_before == 0 || rect_after != rect_before;
     crate::arch::x86_64::syscall::user_input_set_active(saved_focus);
     wm::focus_changed(saved_focus);

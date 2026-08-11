@@ -1203,12 +1203,19 @@ FORBID \[wc-k\] .*outside=[1-9]
 # --- emitting a covered column). Its BLEED verdict is computed from real panel writes, so it can
 # --- fail; a boot that drags occluded windows and stays quiet here is the arc's claim holding.
 # --- The OVERFLOW line fires only if the erase clip drops an occluder for capacity — sized
-# --- unreachable today (12 windows + the dock strip = OCC_MAX exactly), so its appearance means
-# --- the sizing law was broken by a later arc, not that the room got busy.
+# --- unreachable today (12 windows + FURNITURE_MAX furniture strips = OCC_MAX exactly), so its
+# --- appearance means the sizing law was broken by a later arc, not that the room got busy.
+# ---
+# --- STRIPFACTOR (2026-08-11) rewrote that sizing from an inline `+ 1` for the dock into
+# --- `MAX_WINDOWS + FURNITURE_MAX`, with `FURNITURE_MAX` const-asserted equal to the strip
+# --- registry's own `strip::STRIP_MAX`. A tenant added to the registry without widening the clip is
+# --- now a BUILD failure rather than a silently dropped occluder, so this FORBID has moved from
+# --- being the ONLY defence to being the second one — it still covers the case the assertion cannot
+# --- see, a tenant whose rect exceeds what its own geometry accessor promised.
 FORBID \[drag-occ\] .*-> BLEED
 FORBID \[wck4\] erase clip OVERFLOW
 
-# --- WCK5: THE STRIP'S WINDOW-BLIT PROTECTION, PINNED ----------------------------------------
+# --- WCK5 × STRIPFACTOR: EVERY STRIP'S WINDOW-BLIT PROTECTION, PINNED ------------------------
 # --- WCK4 closed the ERASE path and left the WINDOW-blit path open (its own KNOWN GAP D3): a
 # --- window whose outer box overlapped the dock published its chrome over the strip on every
 # --- composite and `dock::compose` repainted the strip at the tail of the same pass —
@@ -1217,12 +1224,59 @@ FORBID \[wck4\] erase clip OVERFLOW
 # --- the strip) and `occclip_dock_px=` (pixels those blits withheld because of it), beside
 # --- `occdock=` (the strip as that clip saw it, or `absent`).
 # ---
-# --- The rule below is the D1 lesson stated as a regex. A blit that had the strip in its clip and
-# --- withheld NOTHING is the defect, not the fix — either the span walk published the strip's
-# --- columns or the box went in degenerate. `occclip_dock=0` is NOT forbidden and must not be: a
-# --- gesture that stayed away from the foot of the panel legitimately never met the strip, which
-# --- is exactly why the count is on the wire beside the pixel total rather than instead of it.
+# --- STRIPFACTOR GENERALISED that push: `occ_clip` now carries EVERY furniture strip, so the menu
+# --- bar at the TOP edge — the identical D3 hole one strip along — is protected on the same path,
+# --- and the same pair is published for it: `occclip_bar=` / `occclip_bar_px=`. Both FORBIDs below
+# --- are the D1 lesson stated as a regex: a blit that had a strip in its clip and withheld NOTHING
+# --- is the defect, not the fix — either the span walk published the strip's columns or the box
+# --- went in degenerate. `occclip_dock=0` / `occclip_bar=0` are NOT forbidden and must not be: a
+# --- gesture that stayed away from a strip's edge legitimately never met it, which is exactly why
+# --- the count is on the wire beside the pixel total rather than instead of it. The menu bar is
+# --- DEFAULT OFF, so `occclip_bar=0` is the standing reading — the FORBID guards the case a shell
+# --- has enabled the bar and a window is then dragged across the top.
 FORBID \[drag-occ\] .* occclip_dock=[1-9][0-9]* occclip_dock_px=0
+FORBID \[drag-occ\] .* occclip_bar=[1-9][0-9]* occclip_bar_px=0
+
+# --- STRIPFACTOR: THE REGISTRY'S SHAPE IS ON THE WIRE -------------------------------------------
+# --- `bars=present/total` and `bar=` were added to `[drag-occ]` beside the existing `dock=` for the
+# --- reason `dock=` itself exists: `fillover_px` can only see boxes that ARE in the clip, so a strip
+# --- missing from the registry's walk would be erased on every drag while every other term on the
+# --- line read healthy. With one tenant `dock=` answered that; with two it does not.
+# ---
+# --- `bar=0` is REQUIRED, not merely tolerated, and that is the point: the menu bar is DEFAULT OFF,
+# --- so a boot that has not been told to enable it must show the bar owning no pixels. A nonzero
+# --- width here means something turned a strip on that nothing in this spec asked for. The
+# --- `bars=` term is deliberately spanned rather than pinned to a value — the dock is legitimately
+# --- absent while the window table is empty (`bars=0/2`) and legitimately present once it is not.
+REQUIRE \[drag-occ\] .* bars=[0-9]/[0-9] bar=0 fillclip_dock_px=
+FORBID \[drag-occ\] .* bars=[0-9]/[0-9] bar=[1-9]
+
+# --- STRIPFACTOR: THE MENU BAR IS ABSENT BY DEFAULT, AND SAYS SO -------------------------------
+# --- `video/menubar.rs` is tenant #2 of the strip primitive and exists this arc to PROVE the
+# --- primitive is generic — a one-tenant registry proves nothing. It is inert chrome (no press
+# --- seam: `press=inert` is on the line so a dead press is not read as a routing defect) and it is
+# --- off unless something enables it at runtime.
+# ---
+# --- Six fields are load-bearing and all six are pinned on the PASS line, which already ANDs them:
+# ---   * `default_off=true`  — `strip_rect` is `None` before anything enables it. A bar that
+# ---     defaulted ON fails here, which is the whole of the direction's "absent by default".
+# ---   * `clip_clean=true`   — with the bar off, its slot in the registry's output is EMPTY, so it
+# ---     consumes no occlusion capacity. Not merely uncounted: absent.
+# ---   * `flush=true`        — when enabled the rect is (0,0,pw,BAR_H), corner to corner. A centred
+# ---     or inset bar fails here.
+# ---   * `member=true`       — enabled, it IS in the registry's walk and the present count rose by
+# ---     exactly one. A strip that painted but never entered the clip passes `flush` and fails this.
+# ---   * `floor=true/true`   — the panel floor declines below it AND admits above it, driven with
+# ---     synthetic geometry so neither direction can pass by accident.
+# ---   * `dismissed=true`    — turned off again, the bar erased what it owned and the slot is clear.
+# ---   * `crystal_ok=true`   — the brand CRYSTAL (Peter, "instead of an apple do a small crystal")
+# ---     is drawn at `crystal=WxH+X+Y` and sits wholly inside the bar, left of the title. A brand
+# ---     mark that could not be shown drawn would be unfalsifiable; this pins that it IS. The crystal
+# ---     is INERT this arc (part of the bar's `press=inert`); a crystal MENU is a later arc.
+# --- `clock=` is NOT pinned: it reads `unsynced` on a QEMU boot with no SNTP and `set` on one with
+# --- a civil anchor, and both are correct. Pinning it would red the gate on network configuration.
+REQUIRE :: MENUBAR: .* press=inert default_off=true clip_clean=true flush=true member=true floor=true/true dismissed=true crystal_ok=true :: PASS ::
+FORBID :: MENUBAR: .* :: FAIL ::
 
 # --- CONSOLEWIN: THE CONSOLE'S WAY BACK, PINNED ON THE ARCH THAT HAS A CONSOLE ------------------
 # --- The x86 half of the console-as-window arc had no spec rule at all until this line, which is

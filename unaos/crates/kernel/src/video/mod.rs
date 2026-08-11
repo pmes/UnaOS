@@ -86,6 +86,20 @@ pub mod wcx;
 // knob-off x86 build carries neither the module nor its two seams.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod dock;
+// STRIPFACTOR: the furniture-strip PRIMITIVE — edge-anchored geometry with floors, the staged
+// row-run painter, the vacated-pixel erase, the damage slot, the cost ledger, and the TENANT
+// REGISTRY `wm::erase_clip` walks for occlusion citizenship. Peter's direction 2026-08-11: UnaOS is
+// a spatial game-engine OS and the desktop is one shell on it — "we will not always have a menu
+// bar" — so the kernel's contribution is the mechanism, not any particular strip. `dock` is tenant
+// #1 and `menubar` is tenant #2. Same gate as `dock`/`wcx`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod strip;
+// MENUBAR: the top strip — tenant #2 of `strip`, and DEFAULT OFF. Inert chrome plus the focused
+// window's caption and a UTC clock; a press falls through, because opening menus belongs to the
+// renderer-agnostic menu PROTOCOL whose design ledger is at the foot of that file. Deleting it costs
+// one registry entry, one line of `strip::compose_all`, and this declaration.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod menubar;
 // CRISPY-PI theme const table — carried verbatim from hw-pi4 (single-author law: edits flow
 // through the pi4 seat from the taste-gate). Declared for INSTGUI's use; full chrome wiring
 // (wm/fbcon reading these instead of their own constants) remains the later lockstep arc.

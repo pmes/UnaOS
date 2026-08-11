@@ -10453,3 +10453,240 @@ ONCE` unchanged, `[wc-k] … reason=route requeued=no -> DEFERRED` (four lines, 
 close it: the arrow must survive the vacate. `rescues=` is worth reading — non-zero means the
 stranding condition is live on this machine. A *trail* left behind the window points at the drain (a
 composite that declined and was never re-run), not at the extent.
+
+## STRIPFACTOR — the furniture-strip PRIMITIVE, and the menu bar as a tenant (x86, 2026-08-11)
+
+**Peter's direction, verbatim:** *"UnaOS is a spatial game-engine OS"* — the desktop is one shell
+running on it, not the OS's identity, and *"we will not always have a menu bar"*.
+
+That reshaped what the kernel is allowed to contribute. Not a menu bar: the **mechanism** a menu bar
+is one instance of, and the dock is another, and a game's HUD band or an in-world status overlay is a
+third. `video/strip.rs` is that mechanism; `video/dock.rs` is tenant #1 and `video/menubar.rs` is
+tenant #2.
+
+### What moved, and what did not
+
+Everything about an edge-anchored slab that is not a window moved out of `dock.rs` into `strip.rs`:
+
+| concern | primitive |
+|---|---|
+| edge-anchored geometry with floors | `frame_centred` (the dock's shape), `frame_flush` (a bar's) |
+| rounded-corner / disc / keyline arithmetic | `corner_cut`, `edge_ring`, `in_disc`, `contains` |
+| the staged row-run front-buffer painter | `paint(name, rect, compose_row)` |
+| the vacated-pixel erase | `erase_rect` |
+| the damage slot (signature + owned rect) | `Slot`, `pack_rect`, `fnv1a`, `seal` |
+| the cost ledger and its rate-limited rollup | `Ledger` |
+| occlusion citizenship | `TENANTS`, `rects`, `STRIP_MAX` |
+
+What stayed in `dock.rs` is everything a *dock* is and a strip is not: the tile model, the tile
+arithmetic, the caption budget, the running pip, the raise-and-unhide press. A tenant supplies a rect
+and a row composer; the primitive does the rest. That split is what lets a tenant be deleted without
+touching the primitive, and the primitive be reused without inheriting a desktop's vocabulary.
+
+**The dock's behaviour did not move with its machinery.** The QEMU suites are the proof: the
+spec-pinned `:: DOCK: … :: PASS ::` line is unchanged in every field, and the repaint rate is
+`paints=27 passes=39 rate=692/1k` against the pre-factoring `26/38 rate=684/1k` — the same
+damage-driven shape on a run with one extra composite.
+
+Two things about the **artifact** did change, disclosed rather than implied away:
+
+* the not-word4 decline is emitted by the primitive for every tenant, so it reads
+  `[strip] decline reason=not-word4 first=<tenant>` where it read `[dock] decline reason=not-word4`;
+* `MAX_STRIP_W` is 4096, not the dock's old 2048, because a flush tenant is the panel's full width
+  and the bench rMBP is 2880 wide. The shared scratch is 32 KiB of `.bss`, up from 16. The dock's own
+  `const` proof that its 1980-px worst case fits is unchanged.
+
+### Occlusion citizenship — the sizing law is now a BUILD failure
+
+`wm::OCC_MAX` was `MAX_WINDOWS + 1`, an inline `+ 1` for the dock, and the WCK4 review had already
+named the hazard: a second strip would overflow the clip, the overflow report is `witness`-gated, and
+the metal image is built without `witness` — so an occluder would have been dropped with nothing
+said. It is now `MAX_WINDOWS + FURNITURE_MAX`, with `FURNITURE_MAX` `const`-asserted equal to
+`strip::STRIP_MAX`. A tenant added to the registry without widening the clip fails the build. The
+runtime `OVERFLOW` FORBID stays as the second line of defence, for the case the assertion cannot
+see: a tenant whose rect exceeds what its own accessor promised.
+
+`erase_clip`'s hand-written dock arm became one `strip::rects` walk. An **absent** tenant answers
+`None`, pushes no box, and consumes no capacity — which is what "absent costs nothing" means where it
+is measurable.
+
+### The menu bar — tenant #2, DEFAULT OFF, and inert
+
+It exists this arc to prove the primitive is generic; a one-tenant registry proves nothing. It is
+**flush** (corner to corner at `y = 0`, `theme::TITLE_HEIGHT` tall — the same 34 px a window head is,
+because it does the same job for the focused window), draws the focused window's caption at the left
+and a UTC `HH:MM` clock at the right, and is **off unless something enables it at runtime**. There is
+no build knob: a cargo feature would put its presence in the artifact rather than in the running
+system, and a spatial shell deciding at runtime that it wants a HUD band is the case the primitive
+exists for.
+
+Floors: `FLOOR_H = BAR_H + dock::STRIP_H + 2*PAD` (110 px — the bar must not crowd the dock off a
+short panel, and on a panel that can host only one the **dock** wins, because the dock is the
+console's only way back and the bar is a convenience) and `FLOOR_W = 4*PAD + CRYSTAL_W + 6*CELL`
+(160 px — the `+ CRYSTAL_W` term is the brand mark's own left slot, added when the crystal landed).
+
+**The clock is honest or absent.** `clock::try_unix_now()` is `None` until the civil clock is anchored
+this boot; a bar showing `00:00` or `--:--` would be furniture asserting a fact it does not have, so
+nothing is drawn and the witness says `clock=unsynced`. It is UTC — the kernel carries no timezone.
+
+**It is inert.** No press seam is registered, so a press — the crystal included — falls through to
+whatever is behind it, and `press=inert` is on the witness line so a dead press is not misread as a
+routing defect.
+
+### The brand crystal — UnaOS's mark, where macOS puts its apple
+
+Peter, 2026-08-11: *"instead of an apple do a small crystal"*. UnaOS's identity is crystal — the whole
+handler set is crystal-named (geode, obsidian, quartzite, euclase, zircon, mica) — so the leftmost
+mark on the bar is a small faceted gem, not a fruit. `CRYSTAL_W`x`CRYSTAL_H` = 16x22, sized from
+`theme::CONTROL_BOX` so it reads as the same size-family as the window's traffic-light controls.
+
+It is drawn from the kit's OWN blue accent ramp — `theme::CONTROL_CLOSE`/`_MID`/`_ZOOM`, which
+`theme.rs` records as having had **no consumer** since `paint_window` moved to the semantic
+traffic-light set. The crystal gives those three lifted roles a purpose again; no palette is invented
+(the shared-source law holds). A brilliant-cut silhouette: a flat table at the top, a crown split into
+a shadowed left facet (`CONTROL_CLOSE`) and a lit right facet (`CONTROL_ZOOM`) with a high-contrast
+seam down the centre, a girdle line, and a `CONTROL_MID` pavilion tapering to the point — three facets
+and two facet lines, dense and minimal, all integer arithmetic (the disc/knurl idiom, no float).
+
+The title shifts right to `TITLE_X0 = PAD + CRYSTAL_W + PAD`, as macOS puts its app menus to the right
+of the logo. The crystal appears only when the bar is enabled (it is part of the default-off tenant),
+and it is **inert this arc** — part of the bar's `press=inert`; a crystal MENU (a press on the mark)
+is a later arc.
+
+Witness: the fixture's leg 7 asserts `crystal=WxH+X+Y` sits wholly inside the bar, left of the title,
+at the compiled size — a mark that could not be shown drawn would be unfalsifiable. `crystal_ok=true`
+is pinned on the `:: MENUBAR: … PASS ::` line, and the compiled dims ride the metal-visible `[menubar]`
+rollup as `crystal=16x22`. On glass the silhouette renders:
+
+```
+....####*****...      table + crown: # = CONTROL_CLOSE (shadow), * = CONTROL_ZOOM (light)
+..######*******.
+.#######********
+++++++++++++++++      girdle (widest row)
+.++++++++++++++.
+...+++++++++++..      pavilion: + = CONTROL_MID, tapering to
+.......+++......
+........+.......      the point
+```
+
+### Witness, and the fault injection that caught a vacuous leg
+
+```
+:: MENUBAR: bar=1280x34+0+0 panel=1280x800 floor=144x110 strips=0->1 owned=0x220500 clock=unsynced
+   initial=false press=inert default_off=true clip_clean=true flush=true member=true
+   floor=true/true dismissed=true :: PASS ::
+[drag-occ] … clipn=3 dock=340x52+470+736 bars=1/2 bar=0 fillclip_dock_px=0 -> CLEAN
+```
+
+`bars=present/total` and `bar=` were added to `[drag-occ]` for the reason `dock=` itself exists:
+`fillover_px` can only see boxes that ARE in the clip, so a strip missing from the registry's walk
+would be erased on every drag while every other term read healthy. With one tenant `dock=` answered
+that; with two it does not.
+
+⛔ **The first cut of leg 1 was vacuous, and a fault injection is what found it.** It called
+`set_enabled(false)` and then asserted the bar was off — a tautology proving the setter works, not
+that the flag starts off. Building with `ENABLED` initialised to `true` produced:
+
+```
+:: MENUBAR: … default_off=true … :: PASS ::                 ← the fixture, lying
+[drag-occ] … clipn=4 dock=… bars=2/2 bar=1280 … -> CLEAN    ← the bar on the glass, in the clip
+```
+
+The leg now observes the flag **before anything in the fixture mutates it**, and reports what it saw
+as `initial=`. Re-run under the same injected defect, three legs fire and the harness reds the run:
+
+```
+:: MENUBAR: … initial=true press=inert default_off=false clip_clean=false flush=true member=false
+   floor=true/true dismissed=true :: FAIL ::
+```
+
+That injection also proved the registry→clip path is live rather than decorative: `clipn` went 3 → 4
+and `bar=1280` appeared, i.e. the bar genuinely entered the erase clip through the registry walk.
+
+### Gate note — the intermittent `[wc-h] -> AT-RISK` is pre-existing host-load tear, NAMED
+
+The bench-geometry `kernel8-test` (aarch64, `pi4-regression.spec`) reds intermittently on this arc's
+runs — 10 clean, 2 torn across the review passes. The two torn runs' forbidden hits are the
+compositor PRESENT-tear witness, three instances of one shape:
+
+```
+[wc-h] rollup win=1 scope=window emit=3 age_ms=45467 … torn=20 declines=0 fixture=1 whole=453 …
+       maxpresent_us=20006 … frame_us=16667 -> AT-RISK
+```
+
+It is **not this arc's**, by construction, not merely by rerun:
+
+* `wcg::stage_rollup` prints `-> AT-RISK` when `H_TORN[i] > 0`, and `H_TORN` is incremented in the
+  PRESENT recorder at exactly one site — `present_us > rectscan_us`, i.e. the blit outran the
+  rectangle's expected scan time (`wcg.rs`, `present_us=20006µs` here against a `16667µs` frame). That
+  is a QEMU-under-host-load timing fact on the compositor's present path.
+* This arc's only aarch64-visible change is `OccClip.boxes` widening by one box (13 → 14) in the
+  DESKTOP-ERASE clip. That path does not touch `H_TORN`, the front-buffer lock, or present timing, so
+  it cannot raise `torn`. aarch64 compiles no strip module at all.
+* The host load averaged 18+ across these runs (concurrent arc gates); the tear tracks the load, not
+  the diff.
+
+⚠ **Process miss, recorded rather than hidden:** the FIRST torn instance (initial bench-geometry run)
+was overwritten by clean reruns before it was snapshotted — the bench law is to snapshot a failing
+capture immediately. The lines above are from a later, deliberately-snapshotted reproduction
+(`~/unaos-bench/scratch/stripfactor/final-bench-geom.log`); the identification is exact, the earlier
+loss is the miss.
+
+### MENUP — the menu PROTOCOL, designed, not implemented
+
+The full design ledger is at the foot of `video/menubar.rs`. Its shape, in brief:
+
+**No renderer is privileged.** An app publishes a menu **tree**; a renderer draws it. A desktop shell
+draws a strip and a drop-down, a spatial shell draws a radial menu or an in-world panel, a headless
+session enumerates it into a command palette, an accessibility client speaks it. The load-bearing
+consequence: **the tree carries no geometry** — no x, no y, no pixel ordering hint. A renderer that
+needed a coordinate from the publisher would be a renderer the protocol privileged.
+
+The menu bar is therefore two separable things, both deletable: a **tenant** of the strip primitive
+and a **client** of the protocol.
+
+**ABI additions, every one named with its slot.** The metal half rides the already-frozen bus rather
+than minting a new stamping path, and that is a security decision: `SYS_MSEND`'s frame carries a
+32-byte principal at bytes `16..48` that the *kernel* stamps, a caller-supplied principal being
+rejected `-EINVAL` and never overwritten (BANDY-STAMP). ROADMAP §3b's law — *"every message carries
+the caller's principal … principal-stamping is not retrofittable"* — is thereby satisfied by
+construction.
+
+* bus verb tags (next free is 7): `BUS_VERB_MENU_PUBLISH = 7`, `BUS_VERB_MENU_CLEAR = 8`,
+  `BUS_VERB_MENU_GET = 9`
+* input event types (next free is 6): `INPUT_EV_MENU_PICK = 6`, payload = the publisher's item id
+* wire encoding: `MENU_WIRE_VERSION = 1`, `MENU_LABEL_MAX = 24`, `MENU_DEPTH_MAX = 2`,
+  `MENU_ITEMS_MAX = 64`, `MENU_FLAG_{DISABLED,SEPARATOR,CHECKED,SUBMENU}`. One item is fixed-width
+  (40 B), so a full tree is 2560 B against `BUS_BODY_MAX = 4096`.
+* host `SMessage` variants in the UI block: `MenuPublish`, `MenuCleared`, `MenuQuery`, `MenuIs`,
+  `MenuPick`, plus a `MenuItem` serde type and one golden KAT each.
+
+**No new syscall number is needed** — the menu rides `SYS_MSEND`/`SYS_MRECV`. Nothing is widened:
+`una-abi`'s own rule is that an old ring-3 stub declares unused argument registers as clobbers it
+never writes, so widening a live verb would have the kernel read junk. New tags only.
+
+⛔ **Disclosed gap, not designed away: the host bus has no principal and no addressing.** `Synapse` is
+one flat broadcast channel; every subscriber sees every message and there is no envelope. So
+`principal` on the host variants is *self-asserted* and is **not** a security boundary — it is a
+correlation key. On metal the same field is kernel-stamped and is one. The first protocol arc must
+either scope itself to metal or land the envelope first.
+
+**Who owns menu state: the kernel, beside the window table — and no new handler is invented.** The
+tree was read for this: none of the 20 crates in `handlers/` owns window, shell, or desktop state
+(`junct` is the messaging aggregator; `midden` is the shell's command parser). The thing that already
+knows which principal owns which surface, and reaps both when it dies, is `video/wm.rs`. A registry
+keyed by `owner_asid` is that table's neighbour.
+
+**Falsification for the first protocol arc**, four legs, the first being the one the design turns on:
+
+1. ⛔ **A pick reaches the tree's OWNER, not the focused slot.** A publishes a tree, B holds focus; a
+   pick on A's item must arrive in A's ring and B's must be empty. Focus-addressed delivery — the
+   obvious implementation, since that is what every existing input event does — fails this leg and
+   passes every other one.
+2. A `MENU_PUBLISH` frame with a nonzero principal is rejected `-EINVAL`, registry unchanged.
+3. The caps are refusals, not truncations (items, label length, depth each refused whole).
+4. Reaping: a principal closed by `close_owner` has no entry, and `MENU_GET` answers empty.
+
+And the renderer-agnosticism claim is falsifiable by construction: **the first protocol arc must land
+with no renderer at all** — registry, publish, get, pick, fixtures — and `menubar.rs` unchanged. If
+the protocol cannot be proven working without a bar drawing it, it was not renderer-agnostic.
