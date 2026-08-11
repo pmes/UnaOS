@@ -3729,9 +3729,14 @@ fn sys_win_present(win: u64) -> i64 {
         }
         let e = t[id];
         FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+        // VSYNC-PACE r3: the `[wpace]` present count, HERE and not inside `pace_advance` — it counts an
+        // event that happens on every boot, while the pacer is compiled only under `vsyncpace`. Same
+        // placement rule as the deadline: inside the ownership proof, so a slot cannot inflate another
+        // slot's window. One relaxed atomic.
+        wpace_note_present(id);
         // VSYNC-PACE: the deadline moves only for a present that PASSED the ownership gate, so no slot
         // can push another slot's window into the future. Two atomics and one `arch::ms()` register
-        // read; no call leaves the crate and nothing here can block.
+        // read; no call leaves the crate and nothing here can block. UNPACED BUILD: `{}`.
         pace_advance(id);
         let o = wc_shim::present(e.wm_id);
         drop(t);
@@ -3819,7 +3824,91 @@ fn present_backpressure(slot: usize, outcome: crate::video::wm::Presented) -> i6
     }
 }
 
-// ---- VSYNC-PACE — the kernel-side present pacer --------------------------------------------------
+// ---- VSYNC-PACE — the kernel-side present pacer, NOW OPT-IN ---------------------------------------
+//
+// ⚠ READ THIS BLOCK FIRST. Everything below the r3 heading describes code that is compiled ONLY under
+// `feature = "vsyncpace"` (`UNAOS_VSYNCPACE=1`). ON A SHIPPED BOOT NONE OF IT EXISTS: `present_pace` is
+// the empty stub and `SYS_WIN_PRESENT` returns as soon as its composite is done. The GR22 argument is
+// kept verbatim underneath because it is still the correct argument for the ARMED build, and because a
+// later reader has to be able to see what was decided and what un-decided it.
+//
+// ==================================================================================================
+// VSYNC-PACE r3 (GR25) — UNRESTRICTED IS THE DEFAULT
+// ==================================================================================================
+//
+// P, GR25: *"fps is made up/forced to run a certain speed rather than running unrestricted as does the
+// load across cores."*
+//
+// HE IS RIGHT, AND BOOT B'S CENSUS IS THE PROOF — the pacer was not measuring a rate, it was DECLARING
+// one, and then the witness reported the declaration as though it were a measurement:
+//
+//     [wpace] win=3 pres=311 paced=311 slept=4615ms rate=62.1/s frame_us=16667
+//     [wpace] rollup ... paced=311 slept=4615ms ... -> PACING
+//
+// EVERY present delayed. 4615 ms of a 5009 ms span spent asleep INSIDE the syscall. The remaining
+// ~394 ms carried all 311 frames — 1.27 ms of real work per frame — so the program was idle-by-decree
+// 92% of the time and "62.1/s" was the pacer's ceiling with the program's name on it. `[vugfps] wf=3063`
+// agreed, which is precisely the problem: the meter was honest about a number that was fiction.
+//
+// WHY THE GR22 ARGUMENT DOES NOT SURVIVE. Its two premises are both true and neither one licenses the
+// sleep:
+//
+//  1. "Nothing above the panel rate is ever seen" is a fact about the BEAM, not about the program. It
+//     says the extra composites do not reach an operator's eye. It does not say the kernel should stop
+//     the program from doing work it asked to do — a renderer that wants to run flat out is entitled to,
+//     and on this machine that is exactly how an operator sees the load land across cores.
+//  2. "The spread IS the complaint" was a reading of what Peter wanted, and GR25 corrected the reading.
+//     The complaint was never that the numbers differed; it was that they were not the machine's own.
+//     Clamping the top made every window read the SAME fictional number, which is the failure mode the
+//     complaint now names.
+//
+// WHAT THE PACER PROTECTED — the honest audit, because a sleep is sometimes load-bearing:
+//
+//   * NOT the compositor's serialization. `WCSER` owns one-pass-at-a-time; that lock is correct with or
+//     without a pacer and does not need callers slowed to stay correct.
+//   * NOT a hidden-window runaway. That is PRESSURE-1 (`present_backpressure`), a SEPARATE mechanism on
+//     a SEPARATE path, and it is UNTOUCHED by this arc. A hidden app that never reads `WIN_PRESENT_HIDDEN`
+//     is still capped at ~1000 suppressed presents/s per slot — that cap is a whole-system availability
+//     property and it stays.
+//   * NOT a serial storm. `[wpace]`/`[wcn]` are rollup-paced on their own 5 s claim.
+//
+// It protected CPU cycles from being spent on invisible pixels. That is a POLICY, and the policy is not
+// the kernel's to set by fiat on a machine whose operator has just said otherwise.
+//
+// THE MECHANISM CHOSEN, AND WHY IT IS NEITHER A DROP NOR A REFUSAL. The two replacements on the table
+// were drop/coalesce (newest frame wins) and an EWOULDBLOCK-style non-blocking refusal. BOTH WERE
+// REJECTED, and the reason is the same for both: THE COMPOSITE IS ALREADY THE BACK-PRESSURE. A visible
+// present does real work under `WINDOWS`; the syscall returns when that work is done, so the arrival
+// rate is bounded by what the machine can actually composite — by physics, measured, per boot, with no
+// constant in it. That is the honest mechanism, and it was here all along under the sleep.
+//
+//   * A DROP would make the present return WITHOUT the work, which uncouples the program's rate from the
+//     machine's and lets a 500 fps caller spin the syscall path unboundedly while HIDING the load Peter
+//     asked to see. It also needs a deferred-composite queue to mean "newest frame wins" at all, and
+//     that queue is `pal.rs`'s — outside this lane.
+//   * A REFUSAL is worse on the same axis and GR22 already measured why: a refused client re-enters its
+//     loop and presents again immediately, converting wasted composites into a wasted spin. It frees no
+//     CPU and costs an ABI change.
+//
+// So the default path adds NOTHING. It removes a sleep. `present_pace` is `{}` and the present is the
+// composite plus the return.
+//
+// WHAT THIS EXPOSES, STATED AS A PREDICTION RATHER THAN A CLAIM. With the sleep gone the `WINDOWS` lock
+// is contended by every presenting window instead of ~8% duty-cycled, so the new ceiling is the
+// compositor's serialized throughput, not the panel's frame. That is the RIGHT limiter — it is the
+// machine answering — but it is a NEW regime for `composite_inner`, and the arc that owns that file is
+// the one that gets to act on it. See the r3 census hand-off in `docs/dev/OS/08_VIDEO/engine.md`.
+//
+// THE OPT-IN. `UNAOS_VSYNCPACE=1` arms everything below, unchanged. A per-WINDOW opt-in is the right
+// long-run shape — one program wanting vsync cadence should not require a differently-built kernel — but
+// `SYS_WIN_PRESENT(win)` is a one-argument verb and there is no present-flags seam in `una-abi` to carry
+// the request. The ABI is FROZEN and this arc does not extend it unilaterally: the proposed encoding is
+// designed in the engine.md ledger and implemented by nobody yet. `[wpace] mode=` is already per-window
+// so that when the seam lands the witness needs no shape change.
+//
+// ==================================================================================================
+// GR22's original argument, kept — it is still why the ARMED build sleeps the way it does
+// ==================================================================================================
 //
 // THE DEFECT, stated before the fix. Boots AL/AN/AO, P: "they are not all running the same fps … fall
 // back to their predetermined fps" / "fps still all over". Boot AO's eight vugs ran 55.8–100.5
@@ -3836,6 +3925,7 @@ fn present_backpressure(slot: usize, outcome: crate::video::wm::Presented) -> i6
 //     to the operator as "all over". Clamping the top removes the scatter's visible half: every vug
 //     with headroom lands on the same number, and the ones genuinely short of a frame's work are the
 //     only ones left below it, which is the honest picture.
+//     ⚠ r3: THIS PREMISE WAS A MISREADING OF THE COMPLAINT. See the r3 block above.
 //
 // WHY THE KERNEL AND NOT THE APP. A per-app fps target is a tuning constant: it has to be guessed, it
 // is wrong on the next panel, and it has to be re-guessed in every program that ever opens a window.
@@ -3871,7 +3961,17 @@ fn present_backpressure(slot: usize, outcome: crate::video::wm::Presented) -> i6
 /// NOT A MEASUREMENT. The panel's real mode is not yet queried on x86 (the Kepler takeover publishes
 /// geometry, not timing), so this is the same constant `wcg` already reasons with. When a measured
 /// refresh arrives, this is the single site that consumes it.
-#[cfg(all(feature = "wc", not(feature = "nopace")))]
+///
+/// ⚠ VSYNC-PACE r3 WIDENED THIS GATE past the pacer's, and it is not an oversight. `[wpace]` prints
+/// `frame_us=` on EVERY line, including on the shipped unpaced build where nothing sleeps — because the
+/// panel's frame is still the fact a reader measures the program's rate AGAINST. "`rate=310.0/s` on a
+/// `frame_us=16667` panel" is the whole r3 finding in one line, and dropping the denominator on exactly
+/// the builds that finding comes from would make it unstatable. So: linked whenever the pacer OR the
+/// witness needs it.
+#[cfg(all(
+    feature = "wc",
+    any(feature = "vsyncpace", feature = "witness")
+))]
 const PANEL_FRAME_US: u64 = 16_667;
 
 /// VSYNC-PACE r3 — THE CLOCK-GRANULARITY ALLOWANCE, and it is a MEASUREMENT of `arch::ms`, not a
@@ -3889,7 +3989,7 @@ const PANEL_FRAME_US: u64 = 16_667;
 /// tighter than that and the clock's own resolution reads as a fault (see `pace_advance`'s clamp and
 /// `present_pace`'s latch, which must agree — a clamp that admits a deadline the latch then refuses
 /// to sleep on would turn over-pacing into NO pacing).
-#[cfg(all(feature = "wc", not(feature = "nopace")))]
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
 const PACE_SLACK_US: u64 = 1_000;
 
 /// VSYNC-PACE: per-window deadline — `arch::ms() * 1000` of the next frame boundary this window may
@@ -3899,7 +3999,7 @@ const PACE_SLACK_US: u64 = 1_000;
 /// Indexed by the GLOBAL window id (the `WINDOWS` row index), not by slot, because pacing is a property
 /// of the surface the panel scans out: two windows owned by one process are two independent streams to
 /// the beam and each is entitled to its own frame slot.
-#[cfg(all(feature = "wc", not(feature = "nopace")))]
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
 static WIN_PACE_DUE_US: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
 
 /// VSYNC-PACE: the focus generation each window has already honoured — the input-latency escape.
@@ -3925,12 +4025,12 @@ static WIN_PACE_DUE_US: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN
 /// present immediate, which is the safe direction. The residual is real and bounded: a hostile slot
 /// can consume one focus exemption belonging to another slot's window, costing that window at most
 /// one frame.
-#[cfg(all(feature = "wc", not(feature = "nopace")))]
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
 static WIN_PACE_SEQ: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
 
 /// VSYNC-PACE: per-slot focus generation, bumped on every focus ARRIVAL. Starts equal to every window's
 /// recorded generation (both 0), so the exemption fires on a real arrival and never on boot.
-#[cfg(all(feature = "wc", not(feature = "nopace")))]
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
 static SLOT_FOCUS_SEQ: [AtomicU64; crate::arch::memory::USER_SLOTS] =
     [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
 
@@ -3955,7 +4055,12 @@ static SLOT_FOCUS_SEQ: [AtomicU64; crate::arch::memory::USER_SLOTS] =
 /// slept on. So the maximum delay this function can impose is one panel frame plus one scheduler
 /// tick, whatever the clock does. Both bounds are `PANEL_FRAME_US + PACE_SLACK_US` and neither may be
 /// narrowed alone.
-#[cfg(all(feature = "wc", not(feature = "nopace")))]
+///
+/// ⚠ VSYNC-PACE r3 — THIS BODY IS THE OPT-IN ONE. It is compiled only under `feature = "vsyncpace"`
+/// (`UNAOS_VSYNCPACE=1`). The DEFAULT `present_pace` is the empty stub further down, and a present on a
+/// shipped desktop therefore reaches `WINDOWS` with nothing between it and the composite. Everything
+/// above describes the sleeping build; nothing above describes what Peter boots.
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
 fn present_pace(slot: usize, id: usize) {
     // The focus exemption, first: it must beat every other consideration, including a deadline that is
     // legitimately in the future. `swap` publishes the generation and reads the old one in one step, so
@@ -4029,7 +4134,7 @@ fn present_pace(slot: usize, id: usize) {
 /// returning from a park would find a deadline far in the past and be allowed a burst of un-paced
 /// presents while the cadence walked forward one frame at a time; with it, the first present after the
 /// gap is on time and the second is a frame later.
-#[cfg(all(feature = "wc", not(feature = "nopace")))]
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
 fn pace_advance(id: usize) {
     let now = crate::arch::ms().saturating_mul(1000);
     let prev = WIN_PACE_DUE_US[id].load(Ordering::Relaxed);
@@ -4102,13 +4207,17 @@ fn pace_advance(id: usize) {
     //   * `paced=0` with `rate > 60`         → unfixed: that window is not being paced at all.
     let next = next.min(now.saturating_add(PANEL_FRAME_US).saturating_add(PACE_SLACK_US));
     WIN_PACE_DUE_US[id].store(next, Ordering::Relaxed);
-    wpace_note_present(id);
+    // ⚠ VSYNC-PACE r3 — `wpace_note_present` USED TO LIVE HERE AND MUST NOT. It counts PRESENTS, which
+    // happen on every boot; this function is the PACER, which is compiled only under `vsyncpace`. Left
+    // here, the whole `[wpace]` block would go silent on the shipped (unpaced) desktop — and a witness
+    // that speaks only in the regime the arc removed cannot report the regime the arc installed. The
+    // call now sits in the present verbs beside `pace_advance`, under the same ownership proof.
 }
 
 /// VSYNC-PACE: forget window `id`'s cadence. Called when a row is allocated and when it is retired, so a
 /// recycled id never inherits the previous tenant's phase — the same hygiene `clear_input_row` applies
 /// to a recycled input ring.
-#[cfg(all(feature = "wc", not(feature = "nopace")))]
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
 fn pace_reset(id: usize) {
     if id < WIN_MAX {
         WIN_PACE_DUE_US[id].store(0, Ordering::Relaxed);
@@ -4123,26 +4232,28 @@ fn pace_reset(id: usize) {
 /// VSYNC-PACE: record that `slot` has just been handed input focus. See [`WIN_PACE_SEQ`] — this is the
 /// whole of the input-latency exemption's producer side, and it is one relaxed increment on a path that
 /// runs at human speed.
-#[cfg(all(feature = "wc", not(feature = "nopace")))]
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
 fn pace_focus_arrival(slot: usize) {
     if let Some(s) = SLOT_FOCUS_SEQ.get(slot) {
         s.fetch_add(1, Ordering::Release);
     }
 }
 
-// VSYNC-PACE: the OFF twins. `wc` off (every headless gate, every non-compositor boot) or `nopace` set
-// and not one byte of the pacer is linked — the present path is the pre-arc path exactly, which is what
+// VSYNC-PACE: the OFF twins — ⚠ AND AS OF r3 THESE ARE THE SHIPPED BODIES, not the exceptional ones.
+// `wc` off (every headless gate, every non-compositor boot) OR `vsyncpace` unset (every desktop boot
+// Peter runs, unless he arms it) and not one byte of the pacer is linked — the present path is the
+// pre-GR22 path exactly: a present is the composite and the return, which is what
 // keeps the fixture batteries, whose ring-3 witnesses present in tight bounded loops, unperturbed.
-#[cfg(not(all(feature = "wc", not(feature = "nopace"))))]
+#[cfg(not(all(feature = "wc", feature = "vsyncpace")))]
 #[inline(always)]
 fn present_pace(_slot: usize, _id: usize) {}
-#[cfg(not(all(feature = "wc", not(feature = "nopace"))))]
+#[cfg(not(all(feature = "wc", feature = "vsyncpace")))]
 #[inline(always)]
 fn pace_advance(_id: usize) {}
-#[cfg(not(all(feature = "wc", not(feature = "nopace"))))]
+#[cfg(not(all(feature = "wc", feature = "vsyncpace")))]
 #[inline(always)]
 fn pace_reset(_id: usize) {}
-#[cfg(not(all(feature = "wc", not(feature = "nopace"))))]
+#[cfg(not(all(feature = "wc", feature = "vsyncpace")))]
 #[inline(always)]
 fn pace_focus_arrival(_slot: usize) {}
 
@@ -4183,20 +4294,45 @@ fn pace_focus_arrival(_slot: usize) {}
 // named it in one line, and its absence is why the block read as merely unimpressive rather than broken.
 
 /// VSYNC-PACE: the `[wpace]` rollup period, in ms. `[wcn]`'s, so the blocks interleave.
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "witness"))]
 const WPACE_ROLLUP_MS: u64 = 5000;
 
+/// VSYNC-PACE r3: which REGIME this kernel presents under, printed on every per-window line as `mode=`.
+///
+/// WHY IT IS ON THE WIRE AT ALL. Every `[wpace]` figure in the archive was taken under a pacer, and every
+/// one taken from here on will not be. A rate of 62/s means "the pacer's ceiling" in one regime and "the
+/// machine's answer" in the other, and NOTHING ELSE IN THE LINE DISTINGUISHES THEM — `paced=0 slept=0ms`
+/// reads identically on a free boot and on a paced boot whose fleet was slow (the old `HEADROOM`). A
+/// reader six months from now comparing two captures would have no way to tell which question each was
+/// answering. `mode=` is that way, and it costs six bytes a line.
+///
+/// PER-WINDOW PLACEMENT, ON PURPOSE, THOUGH IT IS A GLOBAL TODAY. The opt-in this arc could not build is
+/// per-WINDOW (see the r3 block above: `SYS_WIN_PRESENT` has no flags argument and `una-abi` is frozen).
+/// When that seam lands, `mode=` becomes a per-row fact and the line shape does not change — the log
+/// format is forward-compatible with the design rather than needing a second migration.
+#[cfg(all(feature = "wc", feature = "witness", feature = "vsyncpace"))]
+const WPACE_MODE: &str = "vsync";
+#[cfg(all(feature = "wc", feature = "witness", not(feature = "vsyncpace")))]
+const WPACE_MODE: &str = "free";
+
+/// VSYNC-PACE r3: true when NO pacing code is linked — the shipped regime. Drives the `FREE` verdict and,
+/// more importantly, the `FORBID` one: on this build `wpace_note_paced` does not exist, so `paced`/`slept`
+/// summing to anything but zero is a contradiction the block must name rather than average away. See the
+/// verdict ladder in [`wpace_emit`].
+#[cfg(all(feature = "wc", feature = "witness"))]
+const WPACE_FREE: bool = !cfg!(feature = "vsyncpace");
+
 /// VSYNC-PACE: per-window `[wpace]` accumulators — presents seen, presents delayed, ms slept.
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "witness"))]
 static WPACE_PRES: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "witness"))]
 static WPACE_PACED: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "witness"))]
 static WPACE_SLEPT_MS: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
 /// VSYNC-PACE: aggregate-only — focus exemptions taken, and cadence resynchronisations.
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "witness"))]
 static WPACE_FOCUS: AtomicU64 = AtomicU64::new(0);
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "witness"))]
 static WPACE_RESYNC: AtomicU64 = AtomicU64::new(0);
 /// VSYNC-PACE r2: aggregate-only — presents that found a deadline more than one frame PLUS ONE CLOCK
 /// TICK ahead ([`PACE_SLACK_US`]; review condition 2 widened this arm and `pace_advance`'s clamp by
@@ -4206,37 +4342,37 @@ static WPACE_RESYNC: AtomicU64 = AtomicU64::new(0);
 /// which is the runaway that made Boot AQ's fastest windows read `paced=0`. Zero is the pass
 /// condition, and it is one half of a pair: `overrun=0` with `rate` above ~61 means the clamp is
 /// over-pacing rather than latching. See `pace_advance` for the full AR prediction table.
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "witness"))]
 static WPACE_OVERRUN: AtomicU64 = AtomicU64::new(0);
 /// VSYNC-PACE: `arch::ms()` at the last rollup, and the emit CLAIM.
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "witness"))]
 static WPACE_LAST_MS: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "witness"))]
 fn wpace_note_present(id: usize) {
     WPACE_PRES[id].fetch_add(1, Ordering::Relaxed);
 }
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "vsyncpace", feature = "witness"))]
 fn wpace_note_paced(id: usize, ms: u64) {
     WPACE_PACED[id].fetch_add(1, Ordering::Relaxed);
     WPACE_SLEPT_MS[id].fetch_add(ms, Ordering::Relaxed);
 }
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "vsyncpace", feature = "witness"))]
 fn wpace_note_focus() {
     WPACE_FOCUS.fetch_add(1, Ordering::Relaxed);
 }
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "vsyncpace", feature = "witness"))]
 fn wpace_note_resync() {
     WPACE_RESYNC.fetch_add(1, Ordering::Relaxed);
 }
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "vsyncpace", feature = "witness"))]
 fn wpace_note_overrun() {
     WPACE_OVERRUN.fetch_add(1, Ordering::Relaxed);
 }
 
 /// VSYNC-PACE: the dirty-paced tick, called at the tail of every accepted present. A loser of the claim
 /// does not retry — the winner is emitting the same evidence.
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+#[cfg(all(feature = "wc", feature = "witness"))]
 fn wpace_tick() {
     let now = crate::arch::ms();
     let last = WPACE_LAST_MS.load(Ordering::Relaxed);
@@ -4263,7 +4399,13 @@ fn wpace_tick() {
 /// interrupts masked would park every window on the machine behind a UART at 115200 baud, which is the
 /// same failure PRESSURE-1's charge was moved out of the guard to avoid. The emit needs no table state —
 /// the accumulators are indexed by window id already — so there is nothing to pay for the hoist with.
-#[cfg(all(feature = "wc", not(feature = "nopace"), feature = "witness"))]
+///
+/// ⚠ VSYNC-PACE r3 — THIS BLOCK SPEAKS ON BOTH REGIMES, and that is the point of widening its gate from
+/// the pacer's to the witness's. On the shipped (unpaced) desktop `paced`/`slept`/`focus`/`resync`/
+/// `overrun` are zero BY CONSTRUCTION — the code that increments them is not linked — so what remains is
+/// `pres` and `rate`, which is now the PROGRAM's rate rather than the pacer's ceiling. That is the number
+/// Peter asked for, and the block exists to put it on the wire.
+#[cfg(all(feature = "wc", feature = "witness"))]
 fn wpace_emit(span: u64) {
     let mut t_pres = 0u64;
     let mut t_paced = 0u64;
@@ -4292,9 +4434,10 @@ fn wpace_emit(span: u64) {
         // Tenths, for `[wcn]`'s reason: an integer /s truncates every honest sub-1 Hz rate to 0.
         let rate = pres.saturating_mul(10_000) / span.max(1);
         serial_println!(
-            "[wpace] win={} pres={} paced={} slept={}ms rate={}.{}/s frame_us={}",
+            "[wpace] win={} pres={} mode={} paced={} slept={}ms rate={}.{}/s frame_us={}",
             i,
             pres,
+            WPACE_MODE,
             paced,
             slept,
             rate / 10,
@@ -4309,10 +4452,28 @@ fn wpace_emit(span: u64) {
     // than a frame ahead is a period in which the pacer disabled itself for that window, and reporting
     // that as PACING (some other window slept) or HEADROOM (the fleet is slow) would bury the one fact
     // that matters. Zero is the pass condition; see `WPACE_OVERRUN`.
-    let verdict = if overrun > 0 {
+    //
+    // VSYNC-PACE r3 — TWO NEW VERDICTS, AND FORBID OUTRANKS EVERYTHING.
+    //
+    //   * FREE     — the shipped regime: `mode=free` and nothing was delayed. This is the PASS reading on
+    //                an unpaced boot, and it is deliberately NOT spelled `HEADROOM`. `HEADROOM` is a
+    //                statement about a fleet that was under the panel rate WITH A PACER WATCHING; `FREE`
+    //                is a statement that no pacer exists. Reading a `mode=free` period as `HEADROOM`
+    //                would let the whole regime change hide inside a verdict the archive already carries.
+    //   * FORBID   — `mode=free` with a NON-ZERO `paced` or `slept`. Unreachable by construction: on this
+    //                build `wpace_note_paced` is not linked, so nothing can increment either counter.
+    //                A non-zero reading therefore means the counters are being written by something that
+    //                is not the pacer, or that a `vsyncpace` build is mislabelling itself as free — either
+    //                way a live defect, and this is the FORBID-shape a reader greps for. Zero is the pass
+    //                condition, exactly as `overrun=0` is on the armed build.
+    let verdict = if WPACE_FREE && (t_paced > 0 || t_slept > 0) {
+        "FORBID"
+    } else if overrun > 0 {
         "LATCHED"
     } else if t_paced > 0 {
         "PACING"
+    } else if WPACE_FREE {
+        "FREE"
     } else {
         "HEADROOM"
     };
@@ -4335,27 +4496,35 @@ fn wpace_emit(span: u64) {
 
 // VSYNC-PACE: the witness's OFF twins. TWO different gates, and the difference is not cosmetic — it is
 // what keeps the cfg-gated coverage legs warning-free, which is the only reason a dead stub would ever
-// be noticed. The four `wpace_note_*` calls live inside the PACER's bodies, so their stubs are needed on
-// exactly one configuration: pacer ON, witness OFF. Giving them the broad gate below would compile four
-// uncallable functions on every `wc`-off leg and earn four `never used` warnings per leg. `wpace_tick`
-// is different: it is called from the present verbs themselves, which are compiled unconditionally, so
-// its stub takes the broad gate.
-#[cfg(all(feature = "wc", not(feature = "nopace"), not(feature = "witness")))]
-#[inline(always)]
-fn wpace_note_present(_id: usize) {}
-#[cfg(all(feature = "wc", not(feature = "nopace"), not(feature = "witness")))]
+// be noticed. The FOUR `wpace_note_paced`/`_focus`/`_resync`/`_overrun` calls live inside the PACER's
+// bodies, so their stubs are needed on exactly one configuration: pacer ON, witness OFF. Giving them the
+// broad gate below would compile four uncallable functions on every `wc`-off leg and earn four
+// `never used` warnings per leg.
+//
+// ⚠ VSYNC-PACE r3 MOVED TWO FUNCTIONS ACROSS THIS LINE, and the move is the whole reason `[wpace]` still
+// speaks on a shipped boot. `wpace_tick` was already broad-gated because it is called from the present
+// verbs, which compile unconditionally. `wpace_note_present` NOW IS TOO, for the identical reason: r3
+// moved its call site out of `pace_advance` (pacer-gated) and into the verbs (unconditional). Both stubs
+// therefore key on the WITNESS gate alone — `not(all(wc, witness))` — and not on the pacer's. Keying
+// either of them on `vsyncpace` would compile a real body and a stub for the same configuration, or
+// neither, depending on which way the arm fell; the pacer's presence is no longer relevant to whether a
+// present is COUNTED.
+#[cfg(all(feature = "wc", feature = "vsyncpace", not(feature = "witness")))]
 #[inline(always)]
 fn wpace_note_paced(_id: usize, _ms: u64) {}
-#[cfg(all(feature = "wc", not(feature = "nopace"), not(feature = "witness")))]
+#[cfg(all(feature = "wc", feature = "vsyncpace", not(feature = "witness")))]
 #[inline(always)]
 fn wpace_note_focus() {}
-#[cfg(all(feature = "wc", not(feature = "nopace"), not(feature = "witness")))]
+#[cfg(all(feature = "wc", feature = "vsyncpace", not(feature = "witness")))]
 #[inline(always)]
 fn wpace_note_resync() {}
-#[cfg(all(feature = "wc", not(feature = "nopace"), not(feature = "witness")))]
+#[cfg(all(feature = "wc", feature = "vsyncpace", not(feature = "witness")))]
 #[inline(always)]
 fn wpace_note_overrun() {}
-#[cfg(not(all(feature = "wc", not(feature = "nopace"), feature = "witness")))]
+#[cfg(not(all(feature = "wc", feature = "witness")))]
+#[inline(always)]
+fn wpace_note_present(_id: usize) {}
+#[cfg(not(all(feature = "wc", feature = "witness")))]
 #[inline(always)]
 fn wpace_tick() {}
 
@@ -4418,6 +4587,9 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
         // The same counter the whole-box verb bumps: this IS a present that reached the compositor, and the
         // headless witness must not go blind on a window that switched to banded presents.
         FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+        // VSYNC-PACE r3: the `[wpace]` present count, for `sys_win_present`'s reason — a banded present is
+        // a present, and the witness must not go blind on a client that switched to damage bands.
+        wpace_note_present(id);
         // VSYNC-PACE: and the same deadline, advanced under the same proof of ownership. The band is
         // deliberately NOT a discount — the panel scans the whole frame either way, so a banded present
         // consumes exactly one frame slot, as a whole-box one does.

@@ -32,24 +32,37 @@ nvidia-kepler-ce = ["nvidia-kepler"]
 # is byte-identical. Enable via `UNAOS_WC=1` (needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach
 # the seam).
 wc = []
-# VSYNC-PACE: `UNAOS_NOPACE=1` — the ESCAPE HATCH that DISABLES the kernel-side present pacer.
+# VSYNC-PACE r3: `UNAOS_VSYNCPACE=1` — the OPT-IN that ARMS the kernel-side present pacer.
 #
-# The pacer is DEFAULT ON whenever `wc` is on, and that is the deliberate call: a desktop that renders
-# frames the panel cannot scan out is burning CPU for pixels no operator can see, so waste-free is the
-# right default and an opt-in knob would leave the shipped configuration the wasteful one. The negative
-# polarity of this knob follows from that — `UNAOS_PACE=1` would mean every future boot has to remember
-# to arm it.
+# ⚠ THE POLARITY IS INVERTED FROM GR22's, DELIBERATELY, AND THIS COMMENT KEEPS THE OLD ARGUMENT SO THE
+# CHANGE IS LEGIBLE. The feature used to be `nopace` and the pacer was DEFAULT ON, justified by: "a
+# desktop that renders frames the panel cannot scan out is burning CPU for pixels no operator can see,
+# so waste-free is the right default and an opt-in knob would leave the shipped configuration the
+# wasteful one."
 #
-# What it is FOR: the bench instruments (`[wc-g]`, `[wc-d]`, `[wcn]`, `[vugmin]`) were calibrated
-# against an UNPACED present path — their rate figures across GR16-GR21 are "how fast can this fleet
-# present", a question the pacer answers by fiat. `UNAOS_NOPACE=1` restores that measurement mode
-# exactly (not one byte of pacer code is linked), so a headroom measurement stays comparable with every
-# capture already taken. Without it the arc would silently invalidate the archive.
+# That argument decides a question the OS is not entitled to decide FOR the program. P, GR25: *"fps is
+# made up/forced to run a certain speed rather than running unrestricted as does the load across
+# cores."* A present is a ring-3 program asking the machine to do work; the machine's answer is how
+# long the work takes, not a sleep chosen on the program's behalf. Boot B is the proof that the old
+# default was answering by fiat: `[wpace] win=3 pres=311 paced=311 slept=4615ms rate=62.1/s` — EVERY
+# present delayed, 4.6 s of a 5 s span spent asleep inside the syscall, and 62.1/s reported as though
+# it were the program's speed when it was the pacer's ceiling.
 #
-# `nopace` is x86-only in effect (everything it gates lives in `arch/x86_64/syscall.rs`, and `wc` is an
-# x86 feature) and is STRIPPED from aarch64 builds by `arroyo`'s `arm_features`, so Pi and Jetson media
-# stay byte-identical whichever way it points.
-nopace = []
+# So: DEFAULT OFF. A present returns as soon as its composite is done, at whatever rate the program can
+# reach, and the load shows up across cores where an operator can see it. See `arch/x86_64/syscall.rs`
+# (`present_pace`) and `docs/dev/OS/08_VIDEO/engine.md` "VSYNC-PACE r3" for why NEITHER a drop nor an
+# EWOULDBLOCK-style refusal replaced the sleep, and for the per-window opt-in ABI this build-level knob
+# stands in for until it exists.
+#
+# What arming it is FOR, unchanged from the old hatch's inverse: the pacer answers "what does this
+# fleet look like clamped to the panel" by fiat, and a boot that wants THAT question answered — a
+# vsync-cadence comparison, a power measurement — arms it explicitly. `[wpace] mode=` names which
+# regime any given capture was taken under, so the two are never confused again.
+#
+# `vsyncpace` is x86-only in effect (everything it gates lives in `arch/x86_64/syscall.rs`, and `wc` is
+# an x86 feature) and is STRIPPED from aarch64 builds by `arroyo`'s `arm_features`, so Pi and Jetson
+# media stay byte-identical whichever way it points.
+vsyncpace = []
 # INSTGUI: the graphical installer window (UNAOS_INSTGUI=1; requires wc + the x86 engine).
 instgui = ["wc", "installdemo"]
 intel-ivb = []
