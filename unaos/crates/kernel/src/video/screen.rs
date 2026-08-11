@@ -353,13 +353,19 @@ pub fn request_full_present() {
     FULL_PRESENT.store(true, core::sync::atomic::Ordering::Release);
 }
 
-/// SHELLDESK — how many FURNITURE strips the desktop present may have to subtract.
+/// SHELLDESK — how many FURNITURE surfaces the desktop present may have to subtract.
 ///
 /// `strip::STRIP_MAX` where the registry exists, `0` where it does not — `video::strip` is compiled
 /// only on x86 with `wc`, so on aarch64 the desktop's occluder array is exactly the WC-I array it has
 /// always been and no arithmetic on this path changes.
+///
+/// MENUFIT — **plus one for the TRANSIENT**. The crystal's dropdown is not a `strip::TENANTS` member
+/// by design (it takes no occlusion slot on the per-window blit path), so `strip::rects` cannot
+/// report it and the `+ 1` cannot come from `STRIP_MAX`. It is stated here, at the one array that
+/// has to hold it, rather than by promoting the menu to a tenant — which would spend a permanent
+/// occlusion slot on a surface that is absent for all but a few seconds of a boot.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-const DESK_STRIP_MAX: usize = super::strip::STRIP_MAX;
+const DESK_STRIP_MAX: usize = super::strip::STRIP_MAX + 1;
 #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
 const DESK_STRIP_MAX: usize = 0;
 
@@ -964,6 +970,21 @@ impl Screen {
             for s in strips.iter().flatten() {
                 if s.2 != 0 && s.3 != 0 && n < occ.len() {
                     occ[n] = *s;
+                    n += 1;
+                }
+            }
+            // MENUFIT — the TRANSIENT, on exactly the strips' terms. The open SHARD menu hangs from
+            // the bar into the middle of the desktop layer, which is the region the shell's
+            // whole-panel `clear_screen` flushes on every repaint; SHELLDESK made the menu reachable
+            // on every boot for the first time, so what had been a latent exposure became the
+            // ordinary path. It is subtracted here and NOT re-derived here: `crystal::open_rect` is
+            // the menu's own accessor, answering `None` the moment the menu closes, so its rows
+            // return to the desktop on the very next present and the dropdown's own dismissal erase
+            // (`strip::erase_rect`, from `crystal::compose`) is what clears the glass — the same
+            // vacate contract the strips keep, obtained from the same kind of accessor.
+            if let Some(m) = super::crystal::open_rect(self.info.width, self.info.height) {
+                if m.2 != 0 && m.3 != 0 && n < occ.len() {
+                    occ[n] = m;
                     n += 1;
                 }
             }
