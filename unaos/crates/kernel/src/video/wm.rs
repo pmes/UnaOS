@@ -12258,6 +12258,9 @@ fn stage_fill(
     // byte for byte.
     let occ = clip.prepare(x, x + w);
     let mut spans = [(0usize, 0usize); OCC_MAX + 1];
+    // WCK4-D2 (integrator): the true `fb.blit` call count, fed to `erase_note` as `spans=` so the
+    // `[wc-k]` line stops being arch-dependent in meaning. Equals `h` wherever no clip exists.
+    let mut blit_calls: usize = 0;
     for r in 0..h {
         let py = y + r;
         let off = py * fb_row + x * bpp;
@@ -12267,6 +12270,7 @@ fn stage_fill(
         prev = off;
         if occ.n == 0 {
             fb.blit(off, &stage[..row_bytes]);
+            blit_calls += 1;
             #[cfg(all(feature = "witness", target_arch = "x86_64"))]
             {
                 pub_px += w as u64;
@@ -12294,6 +12298,7 @@ fn stage_fill(
         for &(sx0, sx1) in spans[..ns].iter() {
             let len = (sx1 - sx0) * bpp;
             fb.blit(py * fb_row + sx0 * bpp, &stage[..len]);
+            blit_calls += 1;
             #[cfg(all(feature = "witness", target_arch = "x86_64"))]
             {
                 row_pub += (sx1 - sx0) as u64;
@@ -12366,6 +12371,7 @@ fn stage_fill(
         w,
         h,
         row_bytes,
+        blit_calls,
         contig,
         crate::arch::now_cycles(),
         t0,
@@ -12375,6 +12381,7 @@ fn stage_fill(
     // Read on every build so the contiguity check is not compiled out of the non-witness kernels: the
     // check is cheap and its absence would make the two builds structurally different here.
     let _ = contig;
+    let _ = blit_calls;
     true
 }
 

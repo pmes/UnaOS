@@ -1195,3 +1195,15 @@ FORBID \[wc-k\] .*outside=[1-9]
 #     `residue + 511*(split_2m + demote_1g) - nx_2m - nx_4k == kern_WX`) is a CROSS-LINE identity,
 #     which this grammar cannot state at all. It lives in `tools/serial-analyzer.py --wxn`, which
 #     reconciles the two walkers per boot and exits FINDING when they disagree.
+
+# --- WCK4: THE ERASE-DISCIPLINE VERDICTS, FORBIDDEN ------------------------------------------
+# --- The [drag-occ] witness measures pixels PUBLISHED into the dragged window's live box by
+# --- painters that are not the dragged window (occ_px = a window over its occluder, fill_px =
+# --- the coalesced desktop erase, direct = the unclipped fallback, fillover_px = the span walk
+# --- emitting a covered column). Its BLEED verdict is computed from real panel writes, so it can
+# --- fail; a boot that drags occluded windows and stays quiet here is the arc's claim holding.
+# --- The OVERFLOW line fires only if the erase clip drops an occluder for capacity — sized
+# --- unreachable today (12 windows + the dock strip = OCC_MAX exactly), so its appearance means
+# --- the sizing law was broken by a later arc, not that the room got busy.
+FORBID \[drag-occ\] .*-> BLEED
+FORBID \[wck4\] erase clip OVERFLOW

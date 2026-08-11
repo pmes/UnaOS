@@ -1374,6 +1374,7 @@ pub fn erase_note(
     w: usize,
     h: usize,
     row_bytes: usize,
+    spans: usize,
     contig: bool,
     t_end: u64,
     t0: u64,
@@ -1401,11 +1402,16 @@ pub fn erase_note(
         return;
     }
     serial_println!(
-        "[wc-k] erase box={}x{} staged=yes rowbytes={} runs={} contig={} compose_us={} present_us={} rectscan_us={} torn={} -> BUFFERED",
+        // `runs=` is the box's row count (the OWED extent, exact on aarch64 where no clip exists);
+        // `spans=` is the number of `blit` calls actually issued — on x86 an occlusion-clipped fill
+        // fragments rows, so `spans > runs` is the fragmentation tell. WCK4-D2: the two fields keep
+        // one meaning on both arches precisely because they are two fields.
+        "[wc-k] erase box={}x{} staged=yes rowbytes={} runs={} spans={} contig={} compose_us={} present_us={} rectscan_us={} torn={} -> BUFFERED",
         w,
         h,
         row_bytes,
         h,
+        spans,
         if contig { "yes" } else { "no" },
         compose_us,
         present_us,
