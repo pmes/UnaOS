@@ -22,8 +22,11 @@ use std::path::{Path, PathBuf};
 // DO NOT DELETE: This powers the core Spatial Code Map (Matrix DAG).
 use std::collections::HashMap;
 
+pub mod finder;
 pub mod graft;
 pub mod indexer;
+
+pub use finder::Finder;
 
 pub enum ScanDepth {
     Interface,
@@ -918,6 +921,10 @@ mod scanner_tests {
 /// The Asynchronous Logic Kernel for the Matrix
 pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<PathBuf>) {
     let mut rx = synapse.subscribe();
+    // The Finder cursor shares the same anchored workspace root as the DAG
+    // scanner; it is a browse capability layered ON the genesis tree, not a
+    // replacement for it.
+    let finder = finder::Finder::new((*absolute_workspace_root).clone());
     println!("[MATRIX] Spatial Anchor Established via Brain Loop: {:?}", absolute_workspace_root);
 
     loop {
@@ -956,6 +963,18 @@ pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<Pa
                         // This raw data structure fuels the instant UI payload mutation.
                         let _ = synapse.fire_async(SMessage::Matrix(MatrixEvent::IngestTopology { ui_dag: compressed_payload, semantic_dag })).await;
                     }
+                }
+            }
+            // --- FINDER (the file-browser capability) ---
+            // Navigation and file verbs are matrix-owned logic (matrix::finder);
+            // the handler wires the resulting events onto the bus. Every op is
+            // principal-attributed and sandboxed to the workspace root.
+            Ok(SMessage::Matrix(ref ev)) if finder::is_finder_request(ev) => {
+                if let Some(principal) = finder::event_principal(ev) {
+                    log::info!("[MATRIX] Finder request from {:?}", principal);
+                }
+                for out in finder.dispatch(ev) {
+                    synapse.fire_async(SMessage::Matrix(out)).await;
                 }
             }
             Ok(_) => {}
