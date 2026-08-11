@@ -6,6 +6,13 @@ license = "GPL-3.0-or-later"
 
 [features]
 default = []
+# R0 / rtwit: the WORST-CASE RULER. Arms the `[rtwit]` tail instruments (input→present latency,
+# per-lock max hold, max interrupt-mask span) — MAXes only, never a mean. Pure measurement: no
+# scheduling/locking/present behaviour changes. DEFAULT OFF => every hook degrades to an empty inline
+# shim and a zero-sized `HoldTimer`, so the boot is byte-inert on the hot path (see `src/rtwit.rs`).
+# x86_64-only in effect (the real impl is gated on `target_arch = "x86_64"`; the shim covers aarch64).
+# Enable via `UNAOS_RTWIT=1`. Kept in sync with arroyo.
+rtwit = []
 # Cleanroom GPU driver features
 nvidia-kepler = []
 nvidia-kepler-takeover = []

@@ -155,6 +155,12 @@ pub mod serial_ring;
 // drop-newest with a counted refusal — so a producer in an IRQ-masked or print-locked context can emit
 // a console line without blocking and without allocating. Arch-neutral; costs ~15 KiB of `.bss`.
 pub mod termring;
+// R0 / rtwit: the WORST-CASE RULER — `[rtwit]` tail instruments (input→present latency, per-lock max
+// hold, max interrupt-mask span). ALWAYS declared; its public surface degrades to empty
+// `#[inline(always)]` shims and a zero-sized `HoldTimer` when the `rtwit` feature is off (or off-arch),
+// so the hooks in `pal.rs`, `video/wm.rs`, `arch/x86_64/{syscall,mod}.rs` stay `#[cfg]`-free. Pure
+// measurement: changes no scheduling/locking/present behaviour. Knob: `UNAOS_RTWIT=1`.
+pub mod rtwit;
 
 pub fn init() {
     arch::init();

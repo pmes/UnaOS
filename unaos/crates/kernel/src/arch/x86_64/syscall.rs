@@ -3721,6 +3721,13 @@ fn sys_win_present(win: u64) -> i64 {
     let outcome = {
         let _irq = IrqGuard::mask_save();
         let t = WINDOWS.lock();
+        // R0 / rtwit — WINDOWS (outermost compositor lock) max-hold. Declared after the guard so it
+        // drops first, timing the acquire→release span. Measurement only; a no-op inline shim when
+        // `rtwit` is off. ⚠ COLLISION: this present path is being restructured by the in-flight
+        // parallel-composite arc; this is the single allowed "timestamp read + fetch_max" hook and
+        // touches no logic — if that arc replaces the single WINDOWS lock, this field measures
+        // whatever hold survives it.
+        let _wh = crate::rtwit::hold(crate::rtwit::Lock::Windows);
         if t[id].owner == WIN_OWNER_FREE {
             return EBADF;
         }
@@ -3739,6 +3746,9 @@ fn sys_win_present(win: u64) -> i64 {
         // read; no call leaves the crate and nothing here can block. UNPACED BUILD: `{}`.
         pace_advance(id);
         let o = wc_shim::present(e.wm_id);
+        // R0 / rtwit — close the WINDOWS hold timer BEFORE the guard so it measures exactly the
+        // acquire→release span, not the block tail after the lock is dropped.
+        drop(_wh);
         drop(t);
         o
     };
@@ -3808,6 +3818,12 @@ fn present_backpressure(slot: usize, outcome: crate::video::wm::Presented) -> i6
     use crate::video::wm::Presented;
     match outcome {
         Presented::Composited | Presented::NoRow => {
+            // R0 / rtwit — a frame actually composited: close the input→present proxy for the oldest
+            // input pending since the previous present (see `crate::rtwit`). Called here, OUTSIDE the
+            // WINDOWS guard and the IRQ mask, so the ruler never lengthens the very hold it measures.
+            // `NoRow` also counts: it is a present that reached the compositor (the WINX-1 present
+            // counter treats it the same). No-op inline shim when `rtwit` is off.
+            crate::rtwit::note_present_composited();
             SLOT_HIDDEN_PRESENTS[slot].store(0, Ordering::Relaxed);
             0
         }
@@ -4572,6 +4588,9 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
     let outcome = {
         let _irq = IrqGuard::mask_save();
         let t = WINDOWS.lock();
+        // R0 / rtwit — WINDOWS max-hold on the BANDED present path (see `sys_win_present`; same
+        // collision note applies).
+        let _wh = crate::rtwit::hold(crate::rtwit::Lock::Windows);
         if t[id].owner == WIN_OWNER_FREE {
             return EBADF;
         }
@@ -4595,6 +4614,8 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
         // consumes exactly one frame slot, as a whole-box one does.
         pace_advance(id);
         let o = wc_shim::present_rows(e.wm_id, y0 as usize, y1 as usize);
+        // R0 / rtwit — close the WINDOWS hold timer before the guard (see `sys_win_present`).
+        drop(_wh);
         drop(t);
         o
     };
@@ -10483,19 +10504,35 @@ fn openf_release(nameid: usize, can_block: bool) {
 /// in a launcher/IF=1 kernel task it masks for the lock hold and restores on release.
 struct IrqGuard {
     was_enabled: bool,
+    /// R0 / rtwit — TSC at the enabled→disabled transition, so this THIRD software mask primitive
+    /// feeds `irqmask_max` too (not just `IrqMask`/`without_interrupts`). Present only when the ruler
+    /// is armed; the struct is otherwise the plain `{ was_enabled }` it was. NOTE: on a SYSCALL path
+    /// IF is already 0 (SFMASK) so `was_enabled` is false and this times nothing — correct, because
+    /// the masking there is the syscall-entry SFMASK, not this guard (see the `rtwit` module's
+    /// SFMASK-gap note). It DOES time the IF=1 kernel-task uses (`ns_lock` from a launcher).
+    #[cfg(feature = "rtwit")]
+    t0: u64,
 }
 
 impl IrqGuard {
     fn mask_save() -> Self {
         let was_enabled = x86_64::instructions::interrupts::are_enabled();
         x86_64::instructions::interrupts::disable();
-        IrqGuard { was_enabled }
+        IrqGuard {
+            was_enabled,
+            #[cfg(feature = "rtwit")]
+            t0: crate::arch::now_cycles(),
+        }
     }
 }
 
 impl Drop for IrqGuard {
     fn drop(&mut self) {
         if self.was_enabled {
+            // R0 / rtwit — fold the outermost mask span before re-enabling (only the guard that
+            // masked from an enabled state times anything; a nested guard restores to "still masked").
+            #[cfg(feature = "rtwit")]
+            crate::rtwit::note_mask_span(crate::arch::now_cycles().wrapping_sub(self.t0));
             x86_64::instructions::interrupts::enable();
         }
     }

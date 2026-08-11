@@ -268,6 +268,12 @@ fn main() {
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
     // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WC").is_ok() { feats.push("wc"); }
+    // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
+    // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
+    // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,
+    // byte-inert. This list reaches the KERNEL build for MEDIA, so a metal boot can arm the ruler.
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_RTWIT").is_ok() { feats.push("rtwit"); }
     // VSYNC-PACE r3: UNAOS_VSYNCPACE=1 ARMS the kernel-side present pacer. ⚠ POLARITY INVERTED from
     // GR22's UNAOS_NOPACE — the pacer is now DEFAULT OFF under `wc`, so an unmodified metal boot presents
     // UNRESTRICTED and this knob is the opt-in that restores the vsync-cadence path. This list is what

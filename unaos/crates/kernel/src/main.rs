@@ -4515,6 +4515,10 @@ fn x86_render_service(cpu: usize) {
             // The event-routing block above (`wc_click_route` -> `user_input_route` -> `handle_key`)
             // is the seam of the open focus-trap defect and is not to be perturbed by an instrument.
             unaos_kernel::arch::sched::emit_load_witness("");
+            // R0 / rtwit: the WORST-CASE RULER's rollup, riding the same ~5 s gate. Emits the
+            // `[rtwit]` line (input→present max/p99, per-lock max holds, max interrupt-mask span,
+            // ruler overhead) and resets every per-span slot. A no-op inline shim when `rtwit` is off.
+            unaos_kernel::rtwit::rollup();
         }
     }
 }
