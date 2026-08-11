@@ -465,6 +465,42 @@ pub fn activate_on(desc: SurfaceDesc) {
         wm::DESKTOP_BG
     );
 
+    // CONSOLEWIN — **THE PANEL MUST BE ABLE TO HOST THE CONSOLE'S WAY BACK, OR IT GETS NO WINDOW.**
+    //
+    // The console window carries a MINIMISE disc (`wm::ctrls_for`), and the only route back from
+    // that park is the dock: x86's `focus_ring_apps` filters the reserved kernel band out of the
+    // `<TAB>` rotation, so a parked console is not in the focus ring at all. `wm::minimise`'s
+    // standing precondition is that a control which hides a window with no way back is worse than
+    // an inert one — so the disc may only be painted on a panel where the dock is guaranteed to
+    // exist.
+    //
+    // It is not guaranteed by geometry alone. `dock::Layout::for_panel` returns `None` when the
+    // strip will not fit, and the strip's width grows with the number of dock-addressable rows, so
+    // the binding case is the WORST one — `MAX_WINDOWS` rows, the label already shrunk to a single
+    // glyph. Below that width there is a live sequence with no way out: park the console, then open
+    // enough windows that the dock cannot lay out, and the console is off the glass for the rest of
+    // the boot with no affordance anywhere that restores it.
+    //
+    // Asserted HERE, once, at the seam that mints the row — rather than at the minimise disc, which
+    // runs at frame rate and would have to answer "is the dock currently drawable" per pass, and
+    // rather than by making `ctrls_for` panel-aware (it is `const` and takes only the row; a cluster
+    // that appeared and vanished with the window COUNT would be a worse affordance than either
+    // answer). The decline is total: no console window, so no minimise disc, so nothing to strand —
+    // the console keeps the pre-window presentation it has at this point in the boot, which is the
+    // same outcome as every other `[wc-x] console-window DECLINE` arm.
+    //
+    // `MAX_WINDOWS` is the count and not the live one deliberately: the check must hold for every
+    // table state the boot can reach, not for the empty table it happens to be run against.
+    if super::dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_none() {
+        ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
+        serial_println!(
+            "[wc-x] activate DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} \
+             (the console's minimise disc would have no way back) latch=released",
+            pw, ph, wm::MAX_WINDOWS
+        );
+        return;
+    }
+
     // RULED — the console becomes a window. Opened FIRST, so the desktop app launched below carries
     // the higher z when its own `SYS_WIN_CREATE` lands.
     // Its own witness lines (`[wc-x] console-window …`) report the geometry and the panic fallback.

@@ -1207,3 +1207,30 @@ FORBID \[wc-k\] .*outside=[1-9]
 # --- the sizing law was broken by a later arc, not that the room got busy.
 FORBID \[drag-occ\] .*-> BLEED
 FORBID \[wck4\] erase clip OVERFLOW
+
+# --- CONSOLEWIN: THE CONSOLE'S WAY BACK, PINNED ON THE ARCH THAT HAS A CONSOLE ------------------
+# --- The x86 half of the console-as-window arc had no spec rule at all until this line, which is
+# --- the arch it actually ships on: `wm::ctrldecline_selftest` and `wm::closeiso_selftest` are
+# --- driven from the aarch64 battery only, so pi4-regression.spec carried the whole arc and the
+# --- panel where the console window EXISTS was pinned by nothing.
+# ---
+# --- `dock::selftest`'s restored row is kernel FURNITURE (a reserved-band owner), and the leg is
+# --- the reversibility proof for the console's new minimise disc. It has to be the dock and not
+# --- `<TAB>`: `focus_ring_apps` filters the reserved band out of the focus rotation, so a parked
+# --- console is not in the ring, and the dock is the whole of its way back.
+# ---
+# --- Four fields are load-bearing and all four are pinned:
+# ---   * `park=parked` — `wm::minimise` on a kernel row went down AND its owner is hidden. The
+# ---     token, not a bool: `parked-visible` is what an `above_shell` that ignores `PARKED_Z` for
+# ---     furniture returns, i.e. the exact regression this arc can cause, and it is a DIFFERENT
+# ---     string rather than a missing line. (Verified by construction: reverting the predicate
+# ---     produced `park=parked-visible/false model=false` on this gate.)
+# ---   * `model=true` — the dock ENUMERATES the parked kernel row. A dock that dropped furniture
+# ---     from its model would leave the console parked with no tile to press.
+# ---   * `restore=true` — a synthetic press at that tile's centre brought it back above the shell.
+# ---   * `specific=true` — it raised THAT row, not merely something.
+# --- Pinned as one rule on the PASS line rather than four, because the fixture already ANDs them
+# --- into its verdict; the fields are named in the pattern so a future edit that drops one from
+# --- the line reds this rule instead of silently narrowing what it asserts.
+REQUIRE :: DOCK: strip tiles=.* model=true geom=true restore=true specific=true miss=true vacate=true furniture park=parked/true :: PASS ::
+FORBID :: DOCK: .* :: FAIL ::

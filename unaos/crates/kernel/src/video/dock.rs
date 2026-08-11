@@ -951,11 +951,25 @@ fn cycles_to_us(dt: u64) -> u64 {
 ///
 /// Five legs, each able to FAIL on its own:
 ///
-/// 1. **the model** — three windows are minted (three distinct owners), then `focus_changed(0)`
-///    pushes every row below the shell and two raises bring two of them back. The dock must report
-///    exactly THREE tiles, of which exactly ONE is not visible. A dock that enumerated only the
-///    windows on the panel would report two here, which is the whole defect this module exists to
-///    prevent — a minimised window with no way back.
+/// ### CONSOLEWIN — the restored window is KERNEL FURNITURE, and that is what this fixture is for
+/// The third row carries a reserved kernel owner rather than an ordinary ASID. It is the same row
+/// legs 1-4 already minimised and brought back, so the shape of the fixture is unchanged; what
+/// changes is that the claim now covers the one window whose reversibility has no other route.
+/// `<TAB>` cannot restore a parked console — x86's `focus_ring_apps` filters the reserved band out
+/// of the focus rotation — so the dock IS the console's way back, and `wm::minimise`'s standing
+/// precondition ("a control that hides a window with no way back is worse than an inert one") rests
+/// on this leg for every kernel row. `wm::dock_scan` has included kernel-owned rows since the module
+/// landed; what did not exist was a leg that would notice if that stopped being true.
+///
+/// It also means the row must be parked EXPLICITLY (see the `wm::minimise` call below): furniture is
+/// exempt from the shell raise, so `focus_changed(0)` no longer puts it under, and the fixture uses
+/// the gesture the operator's minimise disc actually calls.
+///
+/// 1. **the model** — three windows are minted (three distinct owners), `focus_changed(0)` pushes
+///    every row below the shell, two raises bring two of them back, and the third is minimised. The
+///    dock must report exactly THREE tiles, of which exactly ONE is not visible. A dock that
+///    enumerated only the windows on the panel would report two here, which is the whole defect this
+///    module exists to prevent — a minimised window with no way back.
 /// 2. **geometry agreement** — the press point is TILE `k`'s centre as [`Layout`] computes it, and
 ///    `Layout::tile_at` must answer `k` for it. Painter and router share the accessor, so this leg
 ///    fails only if the accessor is internally inconsistent.
@@ -982,7 +996,27 @@ pub fn selftest() {
 
     /// Three 8x8 ARGB8888 surfaces in rodata — read-only, because the compositor only reads.
     static SURF: [[u32; 64]; 3] = [[0x0020_40FF; 64], [0x0040_FF20; 64], [0x00FF_4020; 64]];
-    const OWNERS: [u64; 3] = [0xD0C1, 0xD0C2, 0xD0C3];
+    /// CONSOLEWIN — the THIRD owner is kernel FURNITURE, and it is the row leg 3 restores.
+    ///
+    /// It was an ordinary ASID (`0xD0C3`). The change is what makes this fixture the x86 witness for
+    /// the arc's reopen claim, and it costs nothing: `w[2]` is already the row the legs minimise and
+    /// bring back, so the only thing that moves is WHICH owner is being proved restorable.
+    ///
+    /// Why it has to be this row and not an extra fourth one: the console's route back is the only
+    /// one in the system that `<TAB>` cannot serve — x86's `focus_ring_apps` filters the reserved
+    /// band out of the focus rotation, so a parked kernel row is not in the ring at all. The dock is
+    /// therefore not a convenience for it, it is the whole of its reversibility, and
+    /// `wm::minimise`'s precondition ("a control that hides a window with no way back is worse than
+    /// an inert one") rests on THIS leg for furniture. `dock_scan` includes kernel-owned rows by
+    /// design and has since the module landed; what was missing was a leg that would notice if that
+    /// stopped being true.
+    ///
+    /// Deliberately NOT `KERNEL_OWNER_CONSOLE`: the real console row carries that owner on a live
+    /// x86 boot, and a fixture sharing it would make `owner_hidden` and every owner-scoped raise
+    /// ambiguous between the operator's console and a synthetic 8x8 square. Any value in the
+    /// reserved band satisfies `is_kernel_owner`, which is the arm under test.
+    const OWNER_FURNITURE: u64 = wm::KERNEL_OWNER_BASE + 0x50;
+    const OWNERS: [u64; 3] = [0xD0C1, 0xD0C2, OWNER_FURNITURE];
     const NAMES: [&[u8]; 3] = [b"dockA", b"dockB", b"dockC"];
 
     let saved_focus = crate::arch::x86_64::syscall::user_input_active();
@@ -1018,6 +1052,22 @@ pub fn selftest() {
     wm::focus_changed(0);
     wm::focus_changed(OWNERS[0]);
     wm::focus_changed(OWNERS[1]);
+    // CONSOLEWIN — **and w[2] is parked EXPLICITLY, because the shell raise no longer parks it.**
+    //
+    // `w[2]` is kernel furniture now, and furniture is exempt from the incidental hide: a shell raise
+    // sweeping past it leaves it composited, which is the whole of the CLOSEISO fix and is asserted
+    // by `wm::closeiso_selftest` leg 1. So the `focus_changed(0)` above — which used to be what put
+    // this row under — does nothing to it, and legs 1 and 3 would be reading a VISIBLE row and
+    // proving nothing.
+    //
+    // The fix is not to weaken the exemption, it is to use the gesture the arc actually wired: an
+    // operator pressing this window's own minimise disc. `wm::minimise` is what that disc calls, and
+    // it is a DELIBERATE park, which `wm::above_shell` honours for furniture where it ignores the
+    // shell raise. The outcome token is asserted rather than discarded — `parked` means the row went
+    // down AND its owner is hidden, so a `declined` or an `already` from a future guard that started
+    // refusing kernel rows again fails here loudly instead of leaving legs 1-4 to fail obscurely.
+    let park = wm::minimise(w[2]);
+    let park_ok = park == "parked";
 
     // Leg 1 — the model. Ours are the three rows we just made; the live console/desktop rows are in
     // the table too, so the assertions are made about OUR ids rather than about the total.
@@ -1076,18 +1126,20 @@ pub fn selftest() {
     crate::arch::x86_64::syscall::user_input_set_active(saved_focus);
     wm::focus_changed(saved_focus);
 
-    let ok = model_ok && geom_ok && restore_ok && specific_ok && miss_ok && vacate_ok;
+    let ok = model_ok && geom_ok && restore_ok && specific_ok && miss_ok && vacate_ok && park_ok;
     let (px, py) = probe.unwrap_or((0, 0));
     let (lx, lw, lg) = layout.map(|l| (l.x, l.w, l.glyphs)).unwrap_or((0, 0, 0));
     if ok {
         serial_println!(
-            ":: DOCK: strip tiles={} at x={} w={} glyphs={}, probe=({},{}) model={} geom={} restore={} specific={} miss={} vacate={} :: PASS ::",
-            n, lx, lw, lg, px, py, model_ok, geom_ok, restore_ok, specific_ok, miss_ok, vacate_ok
+            ":: DOCK: strip tiles={} at x={} w={} glyphs={}, probe=({},{}) model={} geom={} restore={} specific={} miss={} vacate={} furniture park={}/{} :: PASS ::",
+            n, lx, lw, lg, px, py, model_ok, geom_ok, restore_ok, specific_ok, miss_ok, vacate_ok,
+            park, park_ok
         );
     } else {
         serial_println!(
-            ":: DOCK: strip tiles={} at x={} w={} glyphs={}, probe=({},{}) model={} geom={} restore={} specific={} miss={} vacate={} :: FAIL ::",
-            n, lx, lw, lg, px, py, model_ok, geom_ok, restore_ok, specific_ok, miss_ok, vacate_ok
+            ":: DOCK: strip tiles={} at x={} w={} glyphs={}, probe=({},{}) model={} geom={} restore={} specific={} miss={} vacate={} furniture park={}/{} :: FAIL ::",
+            n, lx, lw, lg, px, py, model_ok, geom_ok, restore_ok, specific_ok, miss_ok, vacate_ok,
+            park, park_ok
         );
     }
     rollup("selftest");
