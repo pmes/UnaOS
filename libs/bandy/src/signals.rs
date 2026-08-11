@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use crate::ontology::WeightedSkeleton;
-use crate::state::DispatchRecord;
+use crate::state::{DispatchRecord, LogLine, LogSource};
 
 /// SMessage (The Shard Message).
 /// The atomic unit of truth in UnaOS.
@@ -178,6 +178,15 @@ pub enum SMessage {
     // --- MATRIX (The Spatial Cortex) ---
     Matrix(MatrixEvent),
 
+    // --- CONSOLE (the system log viewer — macOS Console.app equivalent) ---
+    /// The Console log-viewer channel, owned by the `comscan` handler. Distinct
+    /// from the [`SMessage::Log`] PRODUCER message: `Log { .. }` is a component
+    /// emitting one line INTO the system; `Logs(..)` is the viewer's command +
+    /// render channel layered ON TOP of that feed. Mirrors the
+    /// [`SMessage::Matrix`] / [`SMessage::Principia`] sub-enum shape so a new
+    /// app surface adds one outer variant, not a spray of siblings.
+    Logs(LogEvent),
+
     // --- UI EVENTS (Migrated from gneiss_pal::types::Event) ---
     Input {
         target: String,
@@ -342,6 +351,36 @@ pub enum MatrixEvent {
     NodeSelected(PathBuf),
     /// Broadcasts an updated, flattened structural topology back to the UI
     TopologyMutated(Vec<(String, String, usize)>),
+}
+
+/// Console log-viewer events (the macOS `Console.app` model): the app is a
+/// SUBSCRIBER to the system log feed that maintains a bounded scrollback and
+/// publishes a viewable snapshot. Three commands flow view→handler and one
+/// render message flows handler→view; the `comscan` handler owns the ring in
+/// between. Mirrors [`MatrixEvent`] — a self-contained sub-enum whose matches
+/// stay local to its owner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LogEvent {
+    /// view→handler: set the text filter — a case-insensitive substring tested
+    /// against a record's `content`, `source`, and `level`. The empty string
+    /// clears it (every record passes).
+    LogFilter(String),
+    /// view→handler: choose which subsystem/source to show (the facet axis).
+    /// [`LogSource::All`] shows everything.
+    LogSource(LogSource),
+    /// view→handler: scroll-lock. `true` freezes the live tail — the ring keeps
+    /// ingesting new records, but no fresh [`LogEvent::LogTail`] is emitted on
+    /// ingest; `false` resumes and immediately re-emits the current snapshot.
+    LogPause(bool),
+    /// handler→view: the current bounded, filtered scrollback snapshot, plus the
+    /// since-boot eviction count and the pause flag. The single message the
+    /// Console vessel renders. Never consumed by the handler (it does not react
+    /// to its own output), so publisher and subscriber can share one bus.
+    LogTail {
+        lines: Vec<LogLine>,
+        dropped: u64,
+        paused: bool,
+    },
 }
 
 /// The trait that defines a "Nerve Ending" in the system.

@@ -1,0 +1,12 @@
+[package]
+name = "comscan"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+[dependencies]
+bandy = { path = "../../libs/bandy" }
+tokio = { version = "1.53", features = ["sync", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
