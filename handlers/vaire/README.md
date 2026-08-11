@@ -268,6 +268,137 @@ below, the prediction for the raw two-flip tree write, and the per-flip cost
 the bare harness is vaire's snapshot-per-sync + measured-from-birth design, both
 carried verbatim.
 
+## The repo Bolt (BOLT-2) — a git repository as a managed unit
+
+Everything above manages *one* dev tree. **BOLT-2** is the repo-manager unit
+kind: it turns an arbitrary git repository into a managed object, with the
+Bolt-1 invariants carried verbatim.
+
+- **The mirror** — `<bolt_root>/mirrors/<name>.git`, a bare `--mirror` clone.
+  Committed history only: a repo Bolt never reads the source's working tree, so
+  an untracked file cannot enter the bolt by construction.
+- **The ledger** — `<bolt_root>/ledger/<name>.ledger`, an **append-only,
+  hash-chained** record. Each entry carries the run stamp, every ref and its
+  object id, the credential findings, and its predecessor's hash; its own hash
+  covers all of that (collision-detecting SHA-1, via the `gix` the crate
+  already carries for reading repositories). There is no rewrite path in the
+  code — `BoltRoot` can only append.
+- **The credential floor** — the *same* default-deny patterns, honestly
+  re-scoped. A mirror carries whatever was committed, so a filter cannot
+  un-commit a key; what the floor does here is **audit and report, never
+  silently**. Every credential-shaped path in a mirrored head tree becomes a
+  finding, is written into the ledger entry, is covered by the entry hash
+  (scrubbing one breaks verification), and turns the bolt **Amber**.
+- **The one write surface** — every mutation goes through `BoltRoot`, built
+  solely from the manifest's `bolt_root`. There is no constructor accepting a
+  managed repository as a write destination, and both git invocations pull
+  *from* the source with the mirror as the target, so no command in the module
+  can write into a managed repo (pinned by a `0o555`-source test).
+
+### Verbs
+
+| Verb | What it does |
+| --- | --- |
+| `repo-plan` | The would-do plan. **Dry-run is the default** — `repo-weave` without `--apply` prints this. |
+| `repo-weave --apply` | Mirror each repo (clone or `fetch --prune`) and append one ledger entry per repo. |
+| `repo-verify [--deep]` | Pure-read integrity. `--deep` adds `git fsck --connectivity-only`. |
+| `repo-status` | The God view: Crystal Color per repo, plus source-vs-ledger drift. |
+| `repo-layout` | The host→UnaFS mapping, as data. |
+| `repo-ufit` | Check the bolt against the measured UnaFS v3 limits before any weave. |
+| `repo-uweave [<image>] [--apply]` | Weave the mirrors into a UnaFS v3 image as native objects. |
+
+These verbs take a **repo-bolt** manifest, so `--manifest <path>` is required —
+silently reading the dev-tree manifest would point a weave at the wrong tree,
+so it is refused by name.
+
+`verify` falsifies four distinct claims, each with a test that performs the
+real tamper: an **edited entry** (recorded hash no longer matches its
+contents), a **dropped entry** (a successor's `prev` points at nothing), a
+**missing object** (an oid the ledger recorded is absent from the mirror), and
+**ref drift** in either direction. Crystal: **Red** on any breach, **Amber**
+when intact but carrying unresolved credential findings or a source that has
+moved past the ledger, **Green** when intact and current.
+
+### UnaFS alignment — executable, not asserted
+
+`repo::unafs_view` projects a repo manifest into the `DevManifest` the VAIRE-3
+`usync` engine already consumes, so `repo-uweave` weaves a bolt's mirrors into
+a UnaFS v3 image **today**, with no new filesystem code: native objects, one
+root flip, one retained snapshot per weave, the same four `vaire.*` typed attrs
+per file, the same default-deny floor on the walk. `repo::unafs_layout` returns
+the mapping as data so it is test-pinned rather than prose:
+
+| repo-Bolt host artifact | UnaFS-native form |
+| --- | --- |
+| `mirrors/<name>.git/**` | a directory tree: `mkdir` per dir, one `create_files_batch` per parent dir |
+| each file's size/mtime/source | the four `vaire.size` / `vaire.mtime` / `vaire.src` / `vaire.sync` K6 attrs, folded into the creation inode |
+| one ledger entry `<stamp>` | a `vaire.repo.ledger.<stamp>` String attr on the unit root (the `vaire.summary.<stamp>` pattern) |
+| the ledger head | `vaire.repo.head` (the chain hash) on the unit root |
+| a credential finding | a `vaire.repo.cred.<n>` String attr — reported in the image itself |
+| `.vaire-repo-bolt` (layout v1) | a `vaire.repo.layout` Int attr on the image root |
+| one weave | one `snapshot_create(<stamp>, "vaire")` — a retained CoW root, which *strengthens* the chain: a hash can be checked against a real historical root via `open_snapshot`, not merely against a file the same process could rewrite |
+| Crystal Color | computed, never stored |
+
+**The honest boundary.** Host-native vaire cannot mount a *kernel* UnaFS
+volume: there is no host↔kernel bridge, and the crate's only host device is a
+file (`FileDevice`). "Utilizing UnaFS" here means the **image file** and the
+**format** — the same v3 on-disk layout, the same typed-attr and retained-root
+vocabulary a kernel mount reads. The bytes are the same bytes.
+
+### Feasibility: can UnaFS hold a git-shaped workload at scale?
+
+Measured, not argued. Harness:
+[`examples/unafs_repo_feasibility.rs`](examples/unafs_repo_feasibility.rs)
+(tempdir image, re-runnable, scale knobs `OBJECTS` / `STREAM_MB` / `REFS` /
+`IMAGE_MB`). The workload's *shape* is this monorepo, measured with
+`git cat-file --batch-all-objects`: **45,987 objects, 1.196 GB uncompressed**
+(9,971 blobs / 30,989 trees / 5,027 commits), **p50 = 559 B** with 70 % under
+1 KiB, **493 refs**, **33 packfiles / 51.81 MiB**.
+
+| Axis | Measured |
+| --- | --- |
+| 10,000 blobs, 422 MiB, 256-way fan-out | stage 5.03 s (0.503 ms/object), **ONE commit 20.7 ms**, 83.5 MiB/s, write amplification **1.42×** |
+| 52 MB packfile-shaped stream | write 49.3 MiB/s, read-back **1458 MiB/s**, 105 extents |
+| 493 refs rewritten, batched | 0.67 ms/ref in one flip |
+| one ref per flip | **25 ms/ref, 412 blocks/ref — 37× the batched cost** |
+| recursive walk, 10,494 files | 13.6 ms (1.29 ms per 1,000 entries) |
+| name lookup vs directory width | 0.005 ms @ 64 · 0.028 @ 512 · **0.214 @ 4096** — linear |
+| `fsck` over 150,292 blocks in use | 66.3 ms, clean, **0 leaked / 0 orphans**; `snapshot_create` 37.1 ms |
+
+**Verdict — feasible now for repository-sized bolts; two named extensions
+before UnaFS can hold a large repo's object store outright.** VAIRE-3's batch
+path already removed the commit-count problem (commit is 20.7 ms of a 5 s run),
+so the remaining cost is per-object staging, not the transaction. What binds:
+
+1. **~80 MiB single-file ceiling (hard).** An `Inode` — extent list included —
+   must serialize inside ONE 4 KiB block. Bisected: 75 MiB → 151 extents fine;
+   85 MiB → `InodeTooLarge(4100, 4096)`. A repacked monorepo is a *single*
+   ~52 MiB packfile today and growing, so this is the nearest wall. **Named
+   extension: extent-list indirection (or variable-length extents).**
+2. **2 GiB volume cap (hard).** `MAX_BLOCK_COUNT` (524,288) × 4 KiB, one
+   indirect refmap level. With 1.42× amplification and diverging snapshots this
+   monorepo is inside it, but not by much. **Named extension: a second refmap
+   level.**
+3. **No path index** (a shape constraint, not a defect) — lookup is a full `ls`
+   plus a linear scan, so git's 256-way fan-out is mandatory; a flat object
+   store would be quadratic.
+4. **Ref churn must be batched** — 412 blocks to write 41 bytes when each ref
+   gets its own flip.
+
+**What UnaFS gives that FAT or ext cannot:** per-object **typed attributes**
+(the ledger can live *in* the store rather than beside it), **CoW retained
+roots** (a snapshot per weave is structural, not a copy), and a **mark-and-sweep
+`fsck` with reachability** (0 leaked across 150,292 blocks in 66 ms) —
+repository integrity as a *filesystem property* instead of a convention. That
+is the case for the direction, and it is why the Destiny below is worth
+building toward.
+
+**The verdict shaped the code.** BOLT-2 keeps packfile handling on the host
+git/`gix` side — precisely where UnaFS hits its ceiling — and `repo-ufit` /
+`repo-uweave` check the measured limits **before** touching an image, so a bolt
+that cannot fit is refused with a reason and a true no-op, rather than failing
+halfway through a weave with an `InodeTooLarge` from three layers down.
+
 ## What is implemented today (STATUS / Crystal)
 
 - **The Bolt manifest** — `Manifest` registers managed units declaratively

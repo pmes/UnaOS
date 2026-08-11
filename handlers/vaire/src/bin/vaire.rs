@@ -25,6 +25,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use vaire::CrystalColor;
 use vaire::devtree::{self, DevManifest, ExcludeClass, PenumbraDelta};
+use vaire::repo::{self, RepoManifest, WeaveAction};
 use vaire::usync::{self, DEFAULT_IMAGE_MB, FileDisposition};
 
 const DEFAULT_MANIFEST: &str = "handlers/vaire/bolt.manifest.toml";
@@ -45,6 +46,7 @@ fn run() -> Result<()> {
 
     let mut manifest_path = PathBuf::from(DEFAULT_MANIFEST);
     let mut apply = false;
+    let mut deep = false;
     let mut size_mb = DEFAULT_IMAGE_MB;
     let mut image: Option<PathBuf> = None;
     let mut i = 1;
@@ -55,6 +57,7 @@ fn run() -> Result<()> {
                 manifest_path = PathBuf::from(args.get(i).context("--manifest needs a path")?);
             }
             "--apply" => apply = true,
+            "--deep" => deep = true,
             "--size-mb" => {
                 i += 1;
                 size_mb = args
@@ -77,13 +80,21 @@ fn run() -> Result<()> {
         Some("sync") => cmd_sync(&manifest_path, apply),
         Some("usync") => cmd_usync(&manifest_path, image, apply, size_mb),
         Some("ustatus") => cmd_ustatus(&manifest_path, image),
+        Some("repo-status") => cmd_repo_status(&manifest_path),
+        Some("repo-plan") => cmd_repo_plan(&manifest_path),
+        Some("repo-weave") => cmd_repo_weave(&manifest_path, apply),
+        Some("repo-verify") => cmd_repo_verify(&manifest_path, deep),
+        Some("repo-layout") => cmd_repo_layout(&manifest_path),
+        Some("repo-ufit") => cmd_repo_ufit(&manifest_path),
+        Some("repo-uweave") => cmd_repo_uweave(&manifest_path, image, apply, size_mb),
         Some("-h") | Some("--help") | None => {
             print_usage();
             Ok(())
         }
-        Some(other) => {
-            bail!("unknown command: {other} (try: status | snap | sync | usync | ustatus)")
-        }
+        Some(other) => bail!(
+            "unknown command: {other} (try: status | snap | sync | usync | ustatus | \
+             repo-status | repo-plan | repo-weave | repo-verify | repo-layout | repo-uweave)"
+        ),
     }
 }
 
@@ -103,11 +114,23 @@ fn print_usage() {
          \x20 vaire sync    [--manifest <path>] [--apply]\n\
          \x20 vaire usync   [<image>] [--manifest <path>] [--apply] [--size-mb <n>]\n\
          \x20 vaire ustatus [<image>] [--manifest <path>]\n\n\
+         REPO BOLTS (BOLT-2) — a git repository managed as a unit. These verbs take\n\
+         a REPO-bolt manifest, so --manifest <path> is required:\n\
+         \x20 vaire repo-status  --manifest <path>\n\
+         \x20 vaire repo-plan    --manifest <path>\n\
+         \x20 vaire repo-weave   --manifest <path> [--apply]\n\
+         \x20 vaire repo-verify  --manifest <path> [--deep]\n\
+         \x20 vaire repo-layout  --manifest <path>\n\
+         \x20 vaire repo-ufit    --manifest <path>\n\
+         \x20 vaire repo-uweave  [<image>] --manifest <path> [--apply] [--size-mb <n>]\n\n\
          SYNC is DRY-RUN by default; --apply writes (narino->40G) and SNAPs first.\n\
          USYNC weaves the penumbra into a UnaFS v3 image as native objects (DRY-RUN\n\
          by default; --apply writes + retains a snapshot). Image defaults under\n\
          ~/unaos-bench/vaire/.\n\
-         Default manifest: {DEFAULT_MANIFEST}"
+         REPO-WEAVE is DRY-RUN by default too; --apply mirrors and appends one\n\
+         hash-chained ledger entry per repo. REPO-UWEAVE weaves the bolt's mirrors\n\
+         into a UnaFS v3 image through the usync engine.\n\
+         Default manifest (dev-tree verbs only): {DEFAULT_MANIFEST}"
     );
 }
 
@@ -296,5 +319,214 @@ fn cmd_ustatus(manifest: &std::path::Path, image: Option<PathBuf>) -> Result<()>
             );
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Repo Bolts (BOLT-2)
+// ---------------------------------------------------------------------------
+
+/// Load a REPO-bolt manifest, refusing the dev-tree default: the two manifest
+/// kinds are different files, and silently reading the wrong one would point a
+/// weave at the wrong tree.
+fn load_repo_manifest(path: &std::path::Path) -> Result<RepoManifest> {
+    if path == std::path::Path::new(DEFAULT_MANIFEST) {
+        bail!(
+            "repo verbs need a REPO-bolt manifest: pass --manifest <path> \
+             (the default {DEFAULT_MANIFEST} is the dev-tree Bolt's)"
+        );
+    }
+    RepoManifest::load(path)
+}
+
+fn cmd_repo_status(manifest: &std::path::Path) -> Result<()> {
+    let m = load_repo_manifest(manifest)?;
+    println!("Repo Bolt: {}  (root {})", m.name, m.bolt_root.display());
+    for row in repo::status(&m)? {
+        println!(
+            "  - {} [{}]  entries={} last={} credentials={}{}",
+            row.name,
+            crystal_tag(row.crystal),
+            row.entries,
+            row.last_stamp.as_deref().unwrap_or("never"),
+            row.credentials,
+            if row.source_ahead { "  source:AHEAD" } else { "" }
+        );
+        for b in &row.breaches {
+            println!("      BREACH {b:?}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_repo_plan(manifest: &std::path::Path) -> Result<()> {
+    let m = load_repo_manifest(manifest)?;
+    let plan = repo::plan_weave(&m)?;
+    println!(
+        "REPO-WEAVE dry-run -> {} ({}). Pass --apply to write.\n",
+        plan.bolt.display(),
+        if plan.bolt_present {
+            "present"
+        } else {
+            "will be created"
+        }
+    );
+    print!("{}", plan.render());
+    Ok(())
+}
+
+fn cmd_repo_weave(manifest: &std::path::Path, apply: bool) -> Result<()> {
+    if !apply {
+        return cmd_repo_plan(manifest);
+    }
+    let m = load_repo_manifest(manifest)?;
+    let r = repo::weave(&m)?;
+    println!("REPO-WEAVE --apply {} -> {}", r.stamp, r.bolt.display());
+    for w in &r.repos {
+        match (&w.entry, w.action) {
+            (Some(e), action) => println!(
+                "  {:?}  {}: {} refs, {} credential findings, entry {}",
+                action,
+                w.name,
+                e.refs.len(),
+                e.credentials.len(),
+                &e.hash[..12.min(e.hash.len())]
+            ),
+            (None, WeaveAction::SourceUnreadable) => {
+                println!("  SKIP  {}: source unreadable (nothing recorded)", w.name)
+            }
+            (None, action) => println!("  {:?}  {}: no ledger entry", action, w.name),
+        }
+        if let Some(e) = &w.entry {
+            for c in &e.credentials {
+                println!("      CREDENTIAL in history: {} @ {}", c.path, c.reference);
+            }
+        }
+    }
+    println!("total credential findings: {}", r.credential_findings());
+    Ok(())
+}
+
+fn cmd_repo_verify(manifest: &std::path::Path, deep: bool) -> Result<()> {
+    let m = load_repo_manifest(manifest)?;
+    let mut intact = true;
+    for v in repo::verify(&m, deep)? {
+        println!(
+            "  - {} [{}]  entries={}  credentials={}",
+            v.name,
+            crystal_tag(v.crystal()),
+            v.entries,
+            v.credentials.len()
+        );
+        for b in &v.breaches {
+            intact = false;
+            println!("      BREACH {b:?}");
+        }
+    }
+    if !intact {
+        bail!("verification found integrity breaches (see above)");
+    }
+    println!(
+        "verify: chain, objects and refs intact{}",
+        if deep { " (deep: git fsck clean)" } else { "" }
+    );
+    Ok(())
+}
+
+fn cmd_repo_layout(manifest: &std::path::Path) -> Result<()> {
+    let m = load_repo_manifest(manifest)?;
+    println!("UnaFS layout mapping for repo Bolt '{}':", m.name);
+    for row in repo::unafs_layout(&m) {
+        println!("  {:<40} -> {}", row.host, row.native);
+    }
+    Ok(())
+}
+
+fn cmd_repo_ufit(manifest: &std::path::Path) -> Result<()> {
+    let m = load_repo_manifest(manifest)?;
+    let r = repo::unafs_readiness(&m)?;
+    println!(
+        "UnaFS v3 fit for '{}': {} files, {} MiB payload (volume cap {} MiB, \
+         single-file ceiling {} MiB)",
+        m.name,
+        r.files,
+        r.total_bytes / 1024 / 1024,
+        repo::UNAFS_VOLUME_CAP_BYTES / 1024 / 1024,
+        repo::UNAFS_MAX_FILE_BYTES / 1024 / 1024
+    );
+    if let Some((path, n)) = &r.widest_dir {
+        println!("  widest directory: {} ({n} entries)", path.display());
+    }
+    for w in &r.warnings {
+        println!("  note:    {w}");
+    }
+    for b in &r.blockers {
+        println!("  BLOCKER: {b}");
+    }
+    println!(
+        "  verdict: {}",
+        if r.fits() {
+            "FITS — repo-uweave can proceed"
+        } else {
+            "DOES NOT FIT — repo-uweave would be refused"
+        }
+    );
+    Ok(())
+}
+
+fn cmd_repo_uweave(
+    manifest: &std::path::Path,
+    image: Option<PathBuf>,
+    apply: bool,
+    size_mb: u64,
+) -> Result<()> {
+    let m = load_repo_manifest(manifest)?;
+    // Check the measured v3 limits BEFORE touching an image, so a run that
+    // cannot fit is a true no-op with a reason, not an InodeTooLarge from
+    // three layers down halfway through a weave.
+    let fit = repo::unafs_readiness(&m)?;
+    for w in &fit.warnings {
+        eprintln!("vaire: note: {w}");
+    }
+    if !fit.fits() {
+        for b in &fit.blockers {
+            eprintln!("vaire: BLOCKER: {b}");
+        }
+        bail!("repo-uweave refused: the bolt does not fit a UnaFS v3 volume (nothing written)");
+    }
+    let dm = repo::unafs_view(&m)?;
+    let image = match image {
+        Some(p) => p,
+        None => default_image()?,
+    };
+    let r = usync::usync(&dm, &image, apply, size_mb)?;
+    if r.applied {
+        println!(
+            "REPO-UWEAVE --apply -> {}{}",
+            r.image.display(),
+            if r.formatted {
+                "  (freshly formatted)"
+            } else {
+                ""
+            }
+        );
+    } else {
+        println!(
+            "REPO-UWEAVE dry-run -> {}. Pass --apply to write.",
+            r.image.display()
+        );
+    }
+    if let Some((name, generation)) = &r.snapshot {
+        println!("  snapshot retained: '{name}' (generation {generation})");
+    }
+    println!(
+        "summary: {} written, {} skipped, {} excluded, {} dirs, {} bytes",
+        r.files_written,
+        r.files_skipped,
+        r.excluded.len(),
+        r.dirs_created,
+        r.bytes_written
+    );
+    println!("BENCHMARK: {}", r.ledger_line());
     Ok(())
 }
