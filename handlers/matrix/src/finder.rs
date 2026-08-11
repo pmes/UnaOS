@@ -106,6 +106,14 @@ impl Finder {
     /// parent directories — a create validates its parent with `resolve` and
     /// appends a `bare_name`.
     pub fn resolve(&self, rel: &str) -> Result<PathBuf, FsOutcome> {
+        // WCK-REVIEW NIT: an absolute path is a caller error, not a root-relative
+        // request. Refuse it explicitly rather than silently re-anchoring under root
+        // (`open("/etc/passwd")` must read as a refusal, not as an in-root miss).
+        if rel.starts_with('/') {
+            return Err(FsOutcome::Denied {
+                reason: "absolute paths are not root-relative — refused".into(),
+            });
+        }
         let rel = rel.trim_start_matches('/');
         let mut acc = self.root.clone();
         if rel.is_empty() {
