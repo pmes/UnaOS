@@ -101,6 +101,13 @@ _feats=""
 # writable-.text map and gains two measuring lines. MUST be wired in builder/src/main.rs too — the x86
 # ESP carries the BUILDER's kernel, not this one. Pair it with nothing; it needs no other knob.
 [ -n "${UNAOS_WXNRO:-}" ] && _feats="${_feats}wxnro,"
+# SELFHOST-2: UNAOS_SELFHOST=1 arms the `selfhost` feature — the on-shard source verify + tar walk
+# (`crate::selfhost`: mount the program-source volume, sha256 SRC.TGZ against SRC.SHA, gunzip and
+# enumerate the tar). Rung 2 of the self-hosting line begun by SOURCE-ALONG. Read-only; it never
+# writes to media. Arch-neutral module, x86_64-only call site this arc. Default OFF => module and call
+# site vanish, image byte-identical. MUST be wired in builder/src/main.rs too — the x86 lanes boot the
+# BUILDER's kernel, not this one. Driven end to end by `./arroyo test-selfhost`.
+[ -n "${UNAOS_SELFHOST:-}" ] && _feats="${_feats}selfhost,"
 # WC-G/M3 (PAYGO): UNAOS_WCG_PAYGO=1 arms the `wcg-paygo` feature — the pay-as-you-go reshape of the
 # `[wc-g]` glass battery (x86_64 only). Pass 1 becomes lattice-sampled and says so on the wire
 # (`coverage=lattice16`); passes 2..4 keep FULL coverage but wait for 15 s of uptime, so the ~11.5 s
@@ -1981,6 +1988,53 @@ test_fat() {
     test_x86_64 "$secs"
 }
 
+# SELFHOST-2: the on-shard source-verify gate. `./arroyo test-selfhost [layout] [secs]`.
+#
+# This is the ONE lane that packs SOURCE-ALONG onto a FAT fixture, and it must: `test-fat` sets
+# UNAOS_NOSRC=1 precisely so its 96 MiB image stays enumerable byte for byte, so a gate that rode
+# `test-fat` would boot a kernel looking for a SRC.TGZ the fixture had just been told not to carry --
+# vacuous, and green while vacuous. Here SOURCE-ALONG is left ON for `esp_x86` and UNAOS_SRCFIXTURE=1
+# tells make-fat-img.sh to stage the pair onto the image, so the kernel under test reads a REAL
+# `git archive HEAD | gzip -9` of this very tree.
+#
+# The verdict is asserted HERE rather than left to the generic fault scan: a boot that never reached
+# the witness at all would pass a scan for the absence of faults. `-> PASS ::` on the SELFHOST line is
+# the positive claim, and the honest "nothing packed" line is failed explicitly so a silent
+# UNAOS_NOSRC leak cannot read as success.
+test_selfhost() {
+    local layout="${1:-sf}"
+    local secs="${2:-180}"
+    case "$layout" in part|gpt|p16|sf) ;; *) echo "usage: ./arroyo test-selfhost [part|gpt|p16|sf] [secs]"; exit 1;; esac
+    # RE-EXEC, and it is load-bearing. This script's knob->feature mapping (`_feats`, top of file) is
+    # evaluated ONCE at script load, before dispatch, so a knob exported from inside a lane function
+    # never reaches arroyo's OWN `cargo build`. That build runs LAST here (test_x86_64 rebuilds the
+    # kernel after the ESP is packaged) and its output is the kernel that boots — so an in-function
+    # export produced a builder banner reading `selfhost,...` over a booted kernel with the module
+    # compiled OUT, and a gate that could only ever report "not packed". Re-exec with the environment
+    # already set is the only way a lane can arm a knob for its own build.
+    if [ -z "${UNAOS_SELFHOST:-}" ] || [ -n "${UNAOS_NOSRC:-}" ]; then
+        exec env -u UNAOS_NOSRC UNAOS_SELFHOST=1 "$0" test-selfhost "$layout" "$secs"
+    fi
+    esp_x86
+    UNAOS_SRCFIXTURE=1 bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" "$layout"
+    export UNAOS_FATIMG="$layout"
+    test_x86_64 "$secs" || true    # verdict is the witness line below, not the absence of faults
+    local log="$SERIAL_LOG"
+    echo -e ""
+    if [ ! -s "$log" ]; then
+        echo -e "${COLOR_RED}❌ SELFHOST: ${log} is empty — the boot carries NO verdict${COLOR_RESET}"
+        exit 4
+    fi
+    awk '/SELFHOST:/' "$log" || true
+    if awk '/SELFHOST: src verified .* -> PASS ::/{f=1} END{exit !f}' "$log"; then
+        echo -e "${COLOR_GREEN}✅ SELFHOST: the shard verified and enumerated its own source tree${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}❌ SELFHOST: no 'src verified ... -> PASS ::' line in ${log}${COLOR_RESET}"
+        exit 1
+    fi
+    scan_serial_faults "$log"
+}
+
 # aarch64 ESP for the Raspberry Pi 4 (UEFI / Path A). Copy onto a FAT32 SD card alongside the
 # Tianocore RPi4 EDK2 firmware (RPI_EFI.fd + the Pi firmware blobs).
 esp_arm() {
@@ -3201,6 +3255,9 @@ case "${1:-}" in
     test-fat|test_fat)
         test_fat "${2:-part}" "${3:-30}"
         ;;
+    test-selfhost|test_selfhost|selfhost)
+        test_selfhost "${2:-sf}" "${3:-180}"
+        ;;
     kernel8|baremetal)
         kernel8
         ;;
@@ -3233,7 +3290,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
         exit 1
         ;;
 esac

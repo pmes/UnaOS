@@ -1079,6 +1079,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             // Once storage is up, mount + log the FAT volume geometry (one-shot).
             unaos_kernel::fs::fat::probe_once();
+            // SELFHOST-2 (x86, selfhost knob): verify the medium's own SRC.TGZ against SRC.SHA and
+            // walk the tar, one-shot. It belongs beside `probe_once` for the same reason that one
+            // does: it needs storage up and the volume lock free. Read-only throughout. Like the
+            // FATVERB witness below, it sits at ALL THREE storage-ready passes — which one a given
+            // x86 build reaches depends on its knobs, and this pass is the usbdebug one — with the
+            // latch inside making it speak exactly once.
+            #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
+            unaos_kernel::selfhost::verify_source_once();
             // SDHC-4b (x86, sdhcblk knob): once `sdhc::bring_up` has registered the INTERNAL SD card
             // under its own block handle, mount it READ-ONLY and emit the witness (one-shot). Runs
             // here rather than in the bring-up so the card lock is released — the same reason
@@ -1512,6 +1520,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
         // lock released; read_block re-locks it briefly, so there is no nested-lock hazard.
         unaos_kernel::fs::fat::probe_once();
+        // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
+        // the first loop site. This is the pass a headless `test`/`test-fat` boot reaches.
+        #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
+        unaos_kernel::selfhost::verify_source_once();
         // SDHC-4b (x86, sdhcblk knob): mount the INTERNAL SD card READ-ONLY once it has registered
         // under its own block handle, and emit the witness (one-shot). See the note at the other loop
         // site: it reads only and never becomes a second x86 FAT mutator.
@@ -4212,6 +4224,10 @@ fn x86_usb_pump(cpu: usize) {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI lock
         // released; `read_block` re-locks it briefly.
         unaos_kernel::fs::fat::probe_once();
+        // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
+        // the first loop site. This is the pass the GUI/desktop boot reaches, i.e. the metal boot.
+        #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
+        unaos_kernel::selfhost::verify_source_once();
         // DESKTOP-APP (wc knob): the deferred half of kernel-apps eviction move #1. `wcx::activate`
         // used to open a kernel-drawn demo window at the Kepler takeover seam; it now ARMS a launch
         // there and this pass performs it, putting `STAT.ELF` on the desktop as a real ring-3 process
