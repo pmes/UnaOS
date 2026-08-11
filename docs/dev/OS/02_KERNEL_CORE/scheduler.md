@@ -1491,6 +1491,76 @@ occurrences) — each line is the race observed **and absorbed**; before the fix
 each was a permanent strand. user-vug's barrier protocol was and is
 lost-wakeup-safe against a correct futex; nothing in the program changed.
 
+### A cooperative fixture cannot wait for its own launcher (x86, WINX7-GO)
+
+Not a kernel defect — a **fixture** defect, and the reason it is recorded here is
+that the shape generalises to every launcher/fixture pair on this arch.
+
+`sched::spawn_user_in_space` builds a **cooperative** ring-3 task
+(`preemptible = false`): the timer cannot evict it, and it releases its core only
+by blocking. WINX-7 placed its fixture on the **launcher's own core**
+(`meter_current_cpu()`), and the launcher then sat in a wait loop that had to
+grant the fixture focus and inject an input event *while the fixture polled for
+one*. The launcher could only run when the fixture blocked.
+
+The fixture's only block was the frame barrier — `FUTEX_WAIT` on `done`, which
+parks only when the parent's first load beats both workers' `lock xadd`. That is
+a coin flip. Lose it and the fixture ran window → spawns → barrier → 2,000,000
+non-yielding `SYS_INPUT_POLL`s → present → joins → exit without ever releasing
+the core; the launcher got **exactly one** loop iteration, taken before the
+window even existed, and then found `WINX7_DONE` already set. On the wire that is
+
+```
+:: WINX-7: … FAIL — witness=0xdf … parks=0 … injected=0 … done=1 ::
+```
+
+roughly **half of all runs** (measured: 11 FAIL / 23 verdict-bearing runs on
+clean trunk). `parks=0` and `injected=0` were never two bugs; they are the same
+missed interleave seen from both ends, and the verdict could not say so because
+nothing reported the launcher's own scheduling. The `[winx7-go]` line does now —
+`iters=1` is the starvation, `iters>=2 winseen_at=2 gorel=true` is health.
+
+The repair is a pair of **GO gates** (the U7x/DMG-REFUSE go-word idiom), each a
+word in the fixture's data page that only the launcher writes:
+
+- **Gate 1 (`+0x100C`)** holds the *parent* immediately after `SYS_WIN_CREATE`.
+  The blob never writes that word, so the `FUTEX_WAIT` is a park *by
+  construction* rather than by timing — which hands the launcher the CPU. The
+  launcher grants focus, injects, and only then plants `go = 1`, so the key is
+  already in the ring when the fixture takes its first poll.
+- **Gate 2 (`+0x1010`)** holds *both workers* just before their `lock xadd`. It
+  exists because gate 1 alone made the verdict's `parks >= 1` self-satisfying:
+  the GO park met it, so the *frame barrier* park — the assertion the test exists
+  for — was still incidental, and did not happen on **6 of 28** passing runs
+  (21%). With the workers gated, `done` is provably 0 when the parent reads it,
+  so the barrier park is deterministic too.
+
+The handshake that says "it is parked" is `sched::futex_waiters_on(key)`, the
+keyed twin of `futex_parked_total()`. Keyed matters: the global gauge is only
+correct here because of the same-core placement, so a placement change or a
+stray parker anywhere else could re-open the flake silently. As *evidence* that
+a park happened either gauge is useless (a park between two samples is
+invisible; that is what `futex_park_count` is for), but as a *handshake* the
+keyed one is exact, because the state is level-triggered — the fixture cannot
+leave the gate until the launcher opens it. Gate 2 waits on **three** keys: two
+waiters on gate 2 *and* one on `done`, so the parent has committed to the barrier
+park before the workers are allowed to arrive.
+
+The verdict gates on `barrier_parks = parks - 3` (the three gate parks are
+structural and are named rather than quietly inflating the number), on both
+gates' **provenance** being `handshake`, and on `iters >= 2 && winseen_at >= 1`.
+That last pair is the disease asserted directly: the eight witness bits can line
+up while the launcher was starved, and a failsafe-opened gate — the failsafe
+exists so a gate can never wedge — was otherwise indistinguishable on the wire
+from the healthy path, which made the insurance the one thing able to hide what
+it insured against.
+
+Two lessons for any future fixture on this arch: a cooperative ring-3 task must
+`SYS_YIELD` inside any spin that waits on another task (WINX-7's poll loop now
+yields every 4096 empty polls, at an unchanged 2,000,000-poll budget), and a
+launcher must never assume it will be scheduled concurrently with a fixture it
+placed on its own core.
+
 ### BSP scheduling + work stealing (aarch64, SMP-BAL)
 
 SCHED-3 balances at **spawn**, but a task's cost is unknown then and wake bursts

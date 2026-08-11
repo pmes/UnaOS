@@ -15878,7 +15878,9 @@ fn winx3_launcher(_demo_cpu: usize) {
 //
 // Window layout it assumes (the 4-page ring-3 program window):
 //   page 0 (+0x0000)  code, RX/RO          — this blob
-//   page 1 (+0x1000)  data, RW/NX          — [+0x1000] done counter, [+0x1004] magic A, [+0x1008] magic B
+//   page 1 (+0x1000)  data, RW/NX          — [+0x1000] done counter, [+0x1004] magic A, [+0x1008] magic B,
+//                                            [+0x100C] GO gate 1 (parent), [+0x1010] GO gate 2 (workers).
+//                                            Both gates are launcher-owned; see WINX7-GO below.
 //   page 2 (+0x2000)  RW/NX                — worker A's stack (grows down from +0x3000)
 //   page 3 (+0x3000)  RW/NX                — worker B's stack (from +0x3800), parent's (from +0x4000)
 // The same stack carve `user-vug` uses, so this fixture and the shipped program agree about the one
@@ -15917,6 +15919,33 @@ unaos_user_winx7:
     mov r13, rax                              // r13 = window id
     or r12, 1
 
+    // (0b) WINX7-GO gate 1 — park until the LAUNCHER releases us. `go` is scrubbed to 0 by
+    //      `winx7_build` and THIS BLOB NEVER WRITES IT, so the `FUTEX_WAIT` below is a park by
+    //      construction, not by timing. (Deliberately not "nothing in ring 3 can move it": a broken
+    //      thread-argument ABI delivering `arg = 2` would write the magic at `0x1004 + 2*4`, which
+    //      IS this word. That is a defect the run then FAILS on at bit4, not a way to pass — but the
+    //      weaker claim is the true one and it is what belongs here.)
+    //      It GUARANTEES the launcher runs. `spawn_user_in_space` builds a COOPERATIVE ring-3 task
+    //      (`preemptible = false`) on the launcher's OWN core, so the timer cannot evict it and the
+    //      launcher's wait loop only ever regains the CPU when this fixture blocks. Without a park
+    //      here the fixture ran window->spawns->barrier->poll->present->join->exit without once
+    //      releasing the core, the launcher got exactly ONE loop iteration (before the window even
+    //      existed), and focus was never granted, nothing was injected and bit5 could not be set:
+    //      `witness=0xdf parks=0 injected=0`.
+    //      The launcher plants `go` only after it has seen our window AND observed a task parked ON
+    //      THIS KEY, so by the time we resume, focus is ours and the injected key is in our ring.
+    //      Loop rather than a single wait: `-EAGAIN` (the value already moved) and a spurious wake
+    //      are both legal futex outcomes, and the re-read is the only correct answer to either.
+5:  mov eax, dword ptr [r15 + 0x100C]
+    test eax, eax
+    jnz 6f
+    lea rdi, [r15 + 0x100C]
+    xor rsi, rsi                              // FUTEX_WAIT
+    xor rdx, rdx                              // expected = 0
+    mov rax, 26
+    syscall
+    jmp 5b
+6:
     // (1) SYS_THREAD_SPAWN(worker, sp = base+0x3000, arg = 0, place = 0 — this core).
     lea rdi, [rip + unaos_user_winx7_worker]
     lea rsi, [r15 + 0x3000]
@@ -15944,6 +15973,18 @@ unaos_user_winx7:
     // (3) The FUTEX frame barrier: block until `done` reaches 2. Skipped unless BOTH spawns
     //     succeeded — a barrier whose target cannot be reached is the wedge itself, which is the
     //     VUGGUARD rule this fixture must not violate either.
+    //
+    //     WINX7-GO gate 2 is what makes THIS park deterministic, and it is the park the whole
+    //     witness exists for. Both workers park on `go2` (+0x1010) BEFORE their `lock xadd`, so
+    //     `done` is provably still 0 when we read it here and the `FUTEX_WAIT` below cannot be
+    //     raced into a `Mismatch`. The launcher releases `go2` only once it sees TWO waiters on
+    //     the `go2` key AND ONE on the `done` key — i.e. only once this park has actually
+    //     happened — so the ordering is closed on both sides rather than assumed.
+    //
+    //     Without gate 2 the barrier parked only when this load beat both workers' `lock xadd`,
+    //     which is a coin flip: 6 of 28 passing runs in the GR25 flake loop reported `parks=1`,
+    //     i.e. the GO park alone, with the barrier assertion silently not exercised. A gate that
+    //     the thing it guards can skip 21% of the time is not a gate.
     mov eax, r12d
     and eax, 6
     cmp eax, 6
@@ -15976,8 +16017,18 @@ unaos_user_winx7:
     test rax, rax
     jns 55f                                   // a non-negative return IS a packed event
     dec rbp
+    jz 60f
+    // WINX7-GO: this task is COOPERATIVE — the timer cannot evict it — so a bare spin here holds
+    // its core against every other task on that core, including the kernel launcher that is the
+    // only possible source of the event being waited for. Release the core every 4096 empty polls.
+    // With the GO gate above the first poll already succeeds, so this costs nothing on a healthy
+    // run; it exists so that a spin waiting on another task can never again be a hard starvation.
+    // rbp is callee-saved and survives both syscalls; the budget is unchanged at 2,000,000 polls.
+    test rbp, 4095
     jnz 50b
-    jmp 60f
+    mov rax, 4                                // SYS_YIELD
+    syscall
+    jmp 50b
 55: or r12, 32                                // bit5: a routed input event reached this process
 60:
     // (5) SYS_WIN_PRESENT(win).
@@ -16017,6 +16068,24 @@ unaos_user_winx7:
 unaos_user_winx7_worker:
     mov rbx, rdi                              // stash `arg` — rdi is about to be a syscall argument
     lea r15, [rip + unaos_user_winx7_blob_start]
+    // WINX7-GO gate 2 — park on `go2` BEFORE arriving, so the parent's frame barrier at (3) is
+    // reached with `done` provably still 0 and its `FUTEX_WAIT` is a park by construction rather
+    // than a coin flip. `go2` is scrubbed to 0 by `winx7_build` and neither this worker nor the
+    // parent writes it; the launcher releases it only after seeing BOTH workers parked here and the
+    // parent parked on `done`. This park is also the proof that a ring-3 THREAD (not just the
+    // process's first task) can park and be woken on a futex — which nothing else in the suite
+    // covers. Same loop shape and same reason as the parent's gate: `-EAGAIN` and spurious wakes
+    // are legal, so the value is re-read rather than trusted.
+2:  mov eax, dword ptr [r15 + 0x1010]
+    test eax, eax
+    jnz 3f
+    lea rdi, [r15 + 0x1010]
+    xor rsi, rsi                              // FUTEX_WAIT
+    xor rdx, rdx                              // expected = 0
+    mov rax, 26
+    syscall
+    jmp 2b
+3:
     // magic[arg] = 0xA5A5A5A5 — the store whose ADDRESS depends on `arg`, so a wrong argument writes
     // the wrong slot and the parent's bit4 check fails.
     lea rcx, [r15 + 0x1004]
@@ -16061,6 +16130,70 @@ const WINX7_WITNESS_ALL: u32 = 0xFF;
 /// idiom — x86 has no `SYS_REPORT`).
 const WINX7_TASK_NAME: &str = "winx7-app";
 
+/// WINX7-GO: window offsets of the fixture's two launcher-owned gate words, and of the `done`
+/// counter the frame barrier parks on (the launcher needs `done`'s KEY, never its value).
+///
+/// The U7x/DMG-REFUSE GO-word idiom: the launcher plants a value into the fixture's data page
+/// through the KERNEL identity alias, so the fixture never has to GUESS and the handshake needs no
+/// extra syscall surface. Gate 1 (`GO`) holds the PARENT right after `SYS_WIN_CREATE`; gate 2
+/// (`GO2`) holds both WORKERS just before their `lock xadd`, which is what makes the frame barrier
+/// a park by construction instead of a coin flip.
+const WINX7_GO_OFF: u64 = 0x100C;
+const WINX7_GO2_OFF: u64 = 0x1010;
+const WINX7_DONE_OFF: u64 = 0x1000;
+
+/// WINX7-GO: how the launcher opened a gate. `Handshake` is the only healthy provenance and the
+/// only one the verdict accepts — the other two mean the gate was opened on a timer rather than on
+/// the fixture's observed state, which is precisely the "it passed by luck" the whole arc removes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GoRel {
+    /// Not opened yet.
+    Pending,
+    /// Opened because the fixture was observed PARKED ON THAT KEY. The healthy path.
+    Handshake,
+    /// Opened by the in-loop iteration bound — the fixture never parked where it should have.
+    Failsafe,
+    /// Opened after the wait loop ended (deadline or fixture exit) so nothing is left wedged.
+    PostLoop,
+}
+
+impl GoRel {
+    fn label(self) -> &'static str {
+        match self {
+            GoRel::Pending => "pending",
+            GoRel::Handshake => "handshake",
+            GoRel::Failsafe => "failsafe",
+            GoRel::PostLoop => "postloop",
+        }
+    }
+}
+
+/// WINX7-GO: the futex key of a gate word in the fixture's address space — the RING-3 address the
+/// fixture passed to `SYS_FUTEX`, never the kernel alias, because that is what `futex_key` hashes.
+fn winx7_gate_key(slot: usize, off: u64) -> u64 {
+    crate::arch::sched::futex_key(slot, USER_BASE + off)
+}
+
+/// WINX7-GO: open one gate — publish `1` into the fixture's data page and wake the tasks parked on
+/// that word. `n` is how many waiters the gate holds (1 for the parent's gate, 2 for the workers').
+///
+/// The store goes through `slot_backing_ptr` (the same kernel identity alias `winx7_build` used to
+/// lay the blob down). The release fence between the store and the wake is what makes a parked task
+/// see `1` rather than the value it slept on; without it the fixture could be woken and re-park
+/// forever.
+///
+/// The caller must have established that `slot` is still the fixture's — see the
+/// `winx_slot_has_window` guard on the post-loop path, which is the one place where the fixture may
+/// already have exited and released the slot underneath us.
+fn winx7_release_gate(slot: usize, off: u64, n: usize) {
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        (backing.add(off as usize) as *mut u32).write_volatile(1);
+    }
+    core::sync::atomic::fence(Ordering::Release);
+    crate::arch::sched::futex_wake(winx7_gate_key(slot, off), n);
+}
+
 /// WINX-7: build the fixture's slot — allocate a private address space, scrub the program window, and
 /// copy the blob into its RX/RO code page through the kernel identity alias. The FB region is NOT
 /// pre-mapped; mapping it is `SYS_WIN_CREATE`'s job, and that it starts unmapped is part of what the
@@ -16090,7 +16223,7 @@ fn winx7_build() -> Option<U7xFix> {
 /// WINX-7 launcher + verdict. Chained after the WINX-3 loader witness, so the arc's four verb families
 /// are proved after the machinery they build on.
 ///
-/// The launcher does three things the fixture cannot do for itself:
+/// The launcher does four things the fixture cannot do for itself:
 ///   1. GRANTS IT FOCUS explicitly (`user_input_set_active`), rather than relying on the create-time
 ///      auto-grant. Both paths exist and both are correct, but a witness that depended on the implicit
 ///      one would silently stop testing input the day the focus policy changed.
@@ -16098,12 +16231,42 @@ fn winx7_build() -> Option<U7xFix> {
 ///      the shell's drain calls. QEMU delivers no USB HID at all, so a kernel-side injection is the
 ///      only way this leg can be witnessed headlessly, and routing it through the seam rather than
 ///      straight into the ring means the focus gate is on the tested path.
-///   3. WITNESSES THE PARK independently, through `futex_park_count()` — the count of `FUTEX_WAIT`s
-///      that actually blocked and were woken. Without it, a barrier that completed by luck (both
-///      workers finishing before the parent ever reached the wait) would be indistinguishable from a
-///      working futex. It is a COUNTER rather than a sample of the parked set, which the first cut
-///      used and which was flaky by construction: a park beginning and ending between two samples is
-///      invisible, so a perfectly healthy run could report "no park observed" purely on timing.
+///   3. WITNESSES THE PARKS independently, through `futex_park_count()` — the count of `FUTEX_WAIT`s
+///      that actually blocked and were woken. It is a COUNTER rather than a sample of the parked
+///      set, which the first cut used and which was flaky by construction: a park beginning and
+///      ending between two samples is invisible, so a perfectly healthy run could report "no park
+///      observed" purely on timing.
+///
+///      WHAT THE COUNT MEANS, precisely, because a bare `parks >= 1` no longer says anything the
+///      gates below do not already guarantee. A healthy run parks FOUR times: the parent on gate 1,
+///      each worker on gate 2, and the parent at the FRAME BARRIER — and `barrier_parks` on the
+///      `[winx7-go]` line reports that last group alone (`parks - 3`). The barrier park is the one
+///      this witness exists for, so it is the one the verdict gates on; the three gate parks are
+///      structural and are named as such rather than quietly inflating the number. (The barrier can
+///      legitimately park TWICE — one worker's `FUTEX_WAKE` releases the parent, which re-reads
+///      `done == 1` and parks again for the second — so the assertion is `>= 1`, i.e. `parks >= 4`.)
+///   4. RELEASES THE TWO GO GATES (WINX7-GO), each only once the fixture is observed PARKED ON THAT
+///      GATE'S OWN KEY (`futex_waiters_on`), and gate 1 only after focus is granted and a key is in
+///      the ring. That ordering is what makes the verdict deterministic, and it is a REPAIR: on
+///      clean trunk this leg failed roughly half of all runs with `witness=0xdf parks=0 injected=0`,
+///      and the `[winx7-go]` instrument named the interleave. `spawn_user_in_space` builds a
+///      COOPERATIVE ring-3 task (`preemptible = false`, the timer cannot evict it) and WINX-7 places
+///      it on the LAUNCHER'S OWN core (`meter_current_cpu()`), so the launcher's wait loop only ever
+///      regains the CPU when the fixture blocks. The fixture's only block was the frame barrier at
+///      (3), which parks only when the parent's first `done` load beats both workers' `lock xadd` —
+///      a coin flip. Lose it and the fixture ran window -> spawns -> barrier -> 2M non-yielding
+///      `SYS_INPUT_POLL`s -> present -> joins -> exit without once releasing the core; the launcher
+///      got exactly ONE iteration (`iters=1`, before the window existed), so focus was never
+///      granted, nothing was injected, bit5 could not be set and `parks` stayed 0. `injected=0` and
+///      `parks=0` were never two bugs — they are the same missed interleave seen from both ends. The
+///      kernel was correct throughout: cooperative tasks are documented as non-preemptible, and the
+///      futex, the input router and the thread verbs all did exactly what they promise.
+///
+///      Each gate records HOW it was opened (`GoRel`), and the verdict accepts only `handshake`. A
+///      gate opened by the iteration failsafe or by the post-loop sweep means the fixture was not
+///      where it was supposed to be, and on the wire those were previously indistinguishable from
+///      the healthy path — the failsafe existed precisely so the gate could never wedge, which made
+///      it the one thing that could hide the disease it was insuring against.
 // DMG-REFUSE: `demo_cpu` lost its leading underscore here — WINX-7 itself still places its fixture by
 // name rather than by core, but the DMG-REFUSE launcher chained off this function's tail does use it.
 fn winx7_launcher(demo_cpu: usize) {
@@ -16129,13 +16292,42 @@ fn winx7_launcher(demo_cpu: usize) {
         fix.cr3,
     );
 
-    // Wait for the fixture, granting focus once its window appears and injecting input while it polls.
-    // The futex park is counted kernel-side (`futex_park_count`), not sampled here.
+    // Wait for the fixture: grant focus once its window appears, inject input, then open the two GO
+    // gates it is parked on, each only once it is observed parked ON THAT GATE'S KEY. The futex
+    // parks are counted kernel-side (`futex_park_count`), never sampled here.
+    //
+    // WINX7-GO — the order is the whole point, and it is why this loop is no longer a race:
+    //   iter 1  the fixture has not run yet; nothing to do.
+    //   iter 2  the fixture has created its window and parked on gate 1 (which is what handed this
+    //           launcher the CPU — it is a COOPERATIVE ring-3 task on this very core, so the timer
+    //           cannot evict it). Focus is granted, a key is injected, gate 1 opens.
+    //   later   the fixture has spawned both workers, both have parked on gate 2, and the parent has
+    //           parked at the frame barrier on `done`. Only when ALL THREE of those are true does
+    //           gate 2 open — so the barrier park is a fact before the workers can arrive, not a
+    //           coin flip decided by whichever core happened to be quicker.
+    //
+    // The gate-2 condition deliberately reads THREE keys rather than trusting the workers alone. Two
+    // waiters on gate 2 says the workers are ready; one waiter on `done` says the parent has already
+    // committed to the park. Releasing on the first without the second would let the workers arrive
+    // before the parent read `done`, which is exactly the interleave gate 2 exists to remove.
     let deadline = crate::arch::ticks() + 10_000;
+    let go_key = winx7_gate_key(fix.slot, WINX7_GO_OFF);
+    let go2_key = winx7_gate_key(fix.slot, WINX7_GO2_OFF);
+    let done_key = winx7_gate_key(fix.slot, WINX7_DONE_OFF);
+    let waiters = crate::arch::sched::futex_waiters_on;
     let mut focused = false;
     let mut injected: u32 = 0;
+    let mut iters: u64 = 0;
+    let mut winseen_at: u64 = 0;
+    let mut gorel = GoRel::Pending;
+    let mut gorel_at: u64 = 0;
+    let mut go2rel = GoRel::Pending;
+    let mut go2rel_at: u64 = 0;
+    let lcpu = crate::arch::sched::meter_current_cpu();
     while WINX7_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < deadline {
+        iters += 1;
         if !focused && winx_slot_has_window(fix.slot) {
+            winseen_at = iters;
             user_input_set_active((fix.slot as u64) + 1);
             focused = true;
         }
@@ -16148,7 +16340,59 @@ fn winx7_launcher(demo_cpu: usize) {
                 injected += 1;
             }
         }
+        // Gate 1 — the parent. Opened on the keyed handshake, or by the iteration FAILSAFE if the
+        // fixture never parked there. The failsafe is not cosmetic: a gate the launcher could
+        // decline to open would be a wedge, and this fixture's own VUGGUARD rule forbids a barrier
+        // whose target cannot be reached. Its bound is orders of magnitude past the two iterations
+        // the healthy path needs, so it can never fire ahead of the handshake — and because the
+        // verdict now gates on the PROVENANCE, a failsafe open is reported as the defect it is
+        // rather than laundered into a pass.
+        if focused && gorel == GoRel::Pending {
+            if waiters(go_key) >= 1 {
+                gorel = GoRel::Handshake;
+            } else if iters > 4096 {
+                gorel = GoRel::Failsafe;
+            }
+            if gorel != GoRel::Pending {
+                gorel_at = iters;
+                winx7_release_gate(fix.slot, WINX7_GO_OFF, 1);
+            }
+        }
+        // Gate 2 — both workers, held until the parent is parked at the frame barrier.
+        if gorel != GoRel::Pending && go2rel == GoRel::Pending {
+            if waiters(go2_key) >= 2 && waiters(done_key) >= 1 {
+                go2rel = GoRel::Handshake;
+            } else if iters > 8192 {
+                go2rel = GoRel::Failsafe;
+            }
+            if go2rel != GoRel::Pending {
+                go2rel_at = iters;
+                winx7_release_gate(fix.slot, WINX7_GO2_OFF, 2);
+            }
+        }
         crate::arch::sched::yield_now();
+    }
+    // Both gates are opened on EVERY exit from the loop above, including the deadline one. A fixture
+    // left parked here would hold its address-space slot for the rest of the boot, and DMG-REFUSE
+    // (chained off this function's tail) needs two free slots.
+    //
+    // The `winx_slot_has_window` guard is load-bearing and is the reason this is not a bare `if
+    // !released`: the loop also ends when the fixture EXITS, and by then it has released its
+    // address-space slot — `slot_backing_ptr` would be aliasing memory that is no longer ours and
+    // may already have been handed to the next fixture. A slot with no window row is a slot that is
+    // gone. (The in-loop opens need no such guard: they run only under `focused`, which is set from
+    // a live window row, and the fixture is parked on our gate at that point by construction.)
+    if (gorel == GoRel::Pending || go2rel == GoRel::Pending) && winx_slot_has_window(fix.slot) {
+        if gorel == GoRel::Pending {
+            gorel = GoRel::PostLoop;
+            gorel_at = iters;
+            winx7_release_gate(fix.slot, WINX7_GO_OFF, 1);
+        }
+        if go2rel == GoRel::Pending {
+            go2rel = GoRel::PostLoop;
+            go2rel_at = iters;
+            winx7_release_gate(fix.slot, WINX7_GO2_OFF, 2);
+        }
     }
     let witness = WINX7_WITNESS.load(Ordering::Acquire);
     let killed = WINX7_KILLED.load(Ordering::Acquire);
@@ -16157,6 +16401,35 @@ fn winx7_launcher(demo_cpu: usize) {
     // The PARK count, not a sample of the parked set: a `FUTEX_WAIT` that blocked and was woken is
     // recorded when it returns, so a park of any duration is caught and a run cannot fail on timing.
     let parks = futex_park_count() - parks_before;
+    // WINX7-GO: three of those parks are the gates themselves (parent on gate 1, both workers on
+    // gate 2) and are guaranteed by construction, so they prove nothing about the frame barrier.
+    // Subtract them and what is left is the assertion this witness exists for. Saturating because a
+    // run in which the gates did not park is already failing on `gorel_by`, and an underflow panic
+    // in a verdict path would replace a readable FAIL with a boot that dies before printing it.
+    let barrier_parks = parks.saturating_sub(3);
+
+    // WINX7-GO: the launcher's own scheduling reality, on the wire. This line is the instrument the
+    // flake hunt was missing — the verdict reported `injected=0` but could not say WHY, and the
+    // answer turned out to be `iters=1`: the wait loop ran exactly once, before the fixture had even
+    // created its window, and never got the CPU again because a cooperative ring-3 task had it. A
+    // healthy run reads `iters>=2 winseen_at=2 gorel_by=handshake go2rel_by=handshake
+    // barrier_parks>=1`. `iters=1` says the starvation is back; a `failsafe`/`postloop` provenance
+    // says the fixture was not parked where it was supposed to be, which the old boolean `gorel`
+    // could not distinguish from health.
+    serial_println!(
+        "[winx7-go] lcpu={} iters={} winseen_at={} focused={} gorel_by={}@{} go2rel_by={}@{} injected={} parks={} barrier_parks={}",
+        lcpu,
+        iters,
+        winseen_at,
+        focused,
+        gorel.label(),
+        gorel_at,
+        go2rel.label(),
+        go2rel_at,
+        injected,
+        parks,
+        barrier_parks
+    );
 
     // Teardown proof: the fixture's exit freed its slot only after the LAST thread retired, which
     // retires its window rows and drops its FB leaves. A first-thread-frees bug shows up here as a
@@ -16187,26 +16460,41 @@ fn winx7_launcher(demo_cpu: usize) {
     let threads_ok = spawned - spawned_before == 2
         && joined - joined_before == 2
         && exited - exited_before == 2;
+    // The gates' PROVENANCE is part of the verdict, not decoration. A run whose gates were opened by
+    // the failsafe took the timer's word for where the fixture was, which is the same "passed by
+    // luck" this arc removed — and `iters`/`winseen_at` are gated for the same reason: the eight
+    // witness bits can line up while the launcher was starved, and that combination is exactly what
+    // shipped broken for the life of this fixture. Everything printed on `[winx7-go]` is now
+    // asserted here except `injected`, which the witness's bit5 already covers from the other side.
+    let handshakes_ok = gorel == GoRel::Handshake && go2rel == GoRel::Handshake;
+    let launcher_ok = iters >= 2 && winseen_at >= 1;
     if witness == WINX7_WITNESS_ALL
         && threads_ok
-        && parks >= 1
+        && barrier_parks >= 1
+        && handshakes_ok
+        && launcher_ok
         && presents >= 1
         && cleared
         && focus_released
         && killed == 0
     {
         serial_println!(
-            ":: WINX-7: ring-3 threads + futex + input — 2 threads under one CR3 spawned/arrived/joined, {} futex park(s) witnessed, thread-arg ABI verified, {} injected event(s) polled, {} present(s), focus released, teardown clean -> PASS ::",
-            parks, injected, presents
+            ":: WINX-7: ring-3 threads + futex + input — 2 threads under one CR3 spawned/arrived/joined, {} futex park(s) witnessed ({} at the frame barrier + 3 at the launcher's GO gates: parent, then both workers), thread-arg ABI verified, {} injected event(s) polled, {} present(s), focus released, teardown clean -> PASS ::",
+            parks, barrier_parks, injected, presents
         );
     } else {
         serial_println!(
-            ":: WINX-7: ring-3 threads + futex + input FAIL — witness={:#x} spawned={} joined={} exited={} parks={} presents={} injected={} cleared={} focus_released={} killed={} done={} (want {:#x}/2/2/2/>=1/>=1/>0/true/true/0/1) ::",
+            ":: WINX-7: ring-3 threads + futex + input FAIL — witness={:#x} spawned={} joined={} exited={} parks={} barrier_parks={} gorel_by={} go2rel_by={} iters={} winseen_at={} presents={} injected={} cleared={} focus_released={} killed={} done={} (want {:#x}/2/2/2/>=4/>=1/handshake/handshake/>=2/>=1/>=1/>0/true/true/0/1) ::",
             witness,
             spawned - spawned_before,
             joined - joined_before,
             exited - exited_before,
             parks,
+            barrier_parks,
+            gorel.label(),
+            go2rel.label(),
+            iters,
+            winseen_at,
             presents,
             injected,
             cleared,
