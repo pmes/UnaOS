@@ -3054,6 +3054,24 @@ fn owe_overlay_close() {
     owe_repaint();
 }
 
+/// WCPAR step 3 — abandon an overlay session THIS pass opened, without painting.
+///
+/// `wm::composite_inner`'s new decline path is a second caller with [`owe_overlay_close`]'s exact
+/// need. A pass that composed its windows and then lost the PRESENT gate has an open session, has put
+/// no pixel on the glass, and is by definition inside another core's present — so `adopt_overlay`,
+/// which is the session's only paying closer, is precisely what it may not run. Deferring the close
+/// to the next [`overlay_open`] and arming [`owe_repaint`] alongside is the same trade WEDGE-11 makes
+/// for a tail that could not claim the overlay: the mechanism is off for at most one pass, and the
+/// passes in between take CURSOR-3's whole-sprite bracket, which is always available and correct.
+///
+/// Sound without holding the overlay for [`owe_overlay_close`]'s reason, restated for this caller:
+/// the session that is open is OUR pass's — `overlay_open` admits one at a time — so no other pass
+/// can be relying on it, and the next successful claim is not concurrent with any holder.
+#[cold]
+pub(super) fn abandon_overlay() {
+    owe_overlay_close();
+}
+
 /// WEDGE-11 — see [`owe_overlay_close`]. Consumed by [`overlay_open`], under its own claim.
 static OVERLAY_CLOSE_OWED: AtomicBool = AtomicBool::new(false);
 
