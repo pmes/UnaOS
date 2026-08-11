@@ -31,11 +31,24 @@
 //! through `tabula::TabulaDocument` and broadcasts `SMessage::EditorLoad` so
 //! quartzite's editor pane renders it.
 //!
-//! A path may also be named on the command line, and `--console` opens a
-//! console/serial log (`UNAOS.LOG`, a `ttyUSB*.log` capture, a squawk `*.out`)
-//! in Tabula's read-only Console view — see `parse_args` and
-//! `handlers/tabula`'s `logview`. That case overrides the Layout's right pane,
-//! because a log's directory is not a `Layout::Code` project.
+//! A path may also be named on the command line. There are **no option flags**:
+//! opening a log is not a mode you type. A console/serial log (`UNAOS.LOG`, a
+//! `ttyUSB*.log` capture, a squawk `*.out`) is *name-routed* to Tabula's
+//! read-only Console view by `TabulaDocument::open`, so `una UNAOS.LOG` opens it
+//! read-only on its own. That case overrides the Layout's right pane, because a
+//! log's directory is not a `Layout::Code` project.
+//!
+//! The read-only treatment is **not an app policy**: on the shard a kernel
+//! flight-recorder log is owned by *root*, and the UnaFS ownership ACL
+//! (`acl-<lba>-<off>` rows carrying `owner`/`grants:*` — see `docs/SECURITY.md`)
+//! denies a user-owned vessel any write, full stop. The view only renders the
+//! record; `TabulaDocument::read_only` mirrors that filesystem fact for the host
+//! path, it does not invent it.
+//!
+//! Summoning the *newest* log without naming it is the **Console app's** job —
+//! a desktop tile backed by `comscan` (the future `ViewEntity::Console`), not a
+//! command-line flag. `tabula::default_console_log` is the discovery seam that
+//! tile reuses; `una` no longer wires it to any flag.
 
 #[allow(unused_imports)]
 use bandy::{SMessage, Synapse};
@@ -45,40 +58,36 @@ use std::sync::{Arc, RwLock};
 
 const APP_ID: &str = "org.unaos.UnaIDE";
 
-/// How the path on the command line should be opened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpenAs {
-    /// Decide from the name: logs to the Console view, everything else to the
-    /// editor. What a sidebar activation does too.
-    Auto,
-    /// `--console`: the read-only Console view, whatever the file is called.
-    Console,
-    /// `--edit`: the ordinary editable view, whatever the file is called.
-    /// The escape hatch for an operator's own `notes.log`, which name-based
-    /// routing would otherwise open read-only.
-    Edit,
-}
-
-/// Resolve the command line into `(workspace_root, file_to_open, how)`.
+/// Resolve the command line into `(workspace_root, file_to_open)`.
 ///
-/// Split out from `main` and free of any GUI dependency so the argument
-/// grammar — in particular the Console view's `--console` — is unit-testable.
-/// `--console` with no path resolves the newest console log Tabula can find
-/// (mounted volumes first, then the bench capture tree); failing to find one
-/// is an error rather than a silently empty window. `--edit PATH` is its
-/// inverse: open PATH editable even if it is named like a log.
+/// `una` takes at most one **positional** argument and **no option flags** —
+/// opening a log is a file you point the app at, not a mode you type. The
+/// grammar (GUI-free, so it is unit-testable):
+///
+///     una           -> (None, None)               workspace at the cwd
+///     una <dir>     -> (Some(dir), None)           workspace at <dir>
+///     una <file>    -> (Some(parent), Some(file))  open <file>, anchored beside it
+///
+/// How a named file opens is decided downstream by `TabulaDocument::open`:
+/// a console/serial log (`UNAOS.LOG`, `ttyUSB*.log`, squawk `*.out`) is
+/// name-routed to the read-only Console view; everything else opens editable.
+/// There is deliberately no flag to force either treatment — the log's
+/// read-only-ness comes from the file's ownership (root, on the shard), not
+/// from a command-line mode, and the "newest log with no name" summon belongs
+/// to the Console app tile, not to `una`'s argv.
 fn parse_args<I: IntoIterator<Item = String>>(
     args: I,
-) -> Result<(Option<std::path::PathBuf>, Option<std::path::PathBuf>, OpenAs), String> {
-    let mut console = false;
-    let mut edit = false;
+) -> Result<(Option<std::path::PathBuf>, Option<std::path::PathBuf>), String> {
     let mut positional: Option<String> = None;
 
     for arg in args {
         match arg.as_str() {
-            "--console" => console = true,
-            "--edit" => edit = true,
-            a if a.starts_with('-') => return Err(format!("unknown option {:?}", a)),
+            a if a.starts_with('-') => {
+                return Err(format!(
+                    "unknown option {:?} — `una` takes a PATH, not flags",
+                    a
+                ))
+            }
             a => {
                 if positional.is_some() {
                     return Err("at most one PATH may be given".to_string());
@@ -88,51 +97,23 @@ fn parse_args<I: IntoIterator<Item = String>>(
         }
     }
 
-    if console && edit {
-        return Err("--console and --edit are opposites; give one".to_string());
-    }
-
-    let open = if console {
-        match positional.map(std::path::PathBuf::from) {
-            Some(p) => p,
-            None => tabula::default_console_log().ok_or_else(|| {
-                "--console: no console log found — mount the shard's volume, or name a file"
-                    .to_string()
-            })?,
-        }
-    } else {
-        match positional.map(std::path::PathBuf::from) {
-            // A directory argument is a workspace root, not a file to open.
-            Some(p) if p.is_dir() => {
-                if edit {
-                    return Err("--edit needs a file, not a directory".to_string());
-                }
-                return Ok((Some(p), None, OpenAs::Auto));
+    match positional.map(std::path::PathBuf::from) {
+        None => Ok((None, None)),
+        // A directory argument is a workspace root, not a file to open.
+        Some(p) if p.is_dir() => Ok((Some(p), None)),
+        Some(p) => {
+            if !p.is_file() {
+                return Err(format!("{}: not a readable file", p.display()));
             }
-            Some(p) => p,
-            None => {
-                if edit {
-                    return Err("--edit needs a PATH".to_string());
-                }
-                return Ok((None, None, OpenAs::Auto));
-            }
+            // Anchor the workspace beside the file so the sidebar shows its
+            // neighbours.
+            let root = p
+                .parent()
+                .filter(|q| !q.as_os_str().is_empty())
+                .map(|q| q.to_path_buf());
+            Ok((root, Some(p)))
         }
-    };
-
-    if !open.is_file() {
-        return Err(format!("{}: not a readable file", open.display()));
     }
-    // Anchor the workspace beside the file so the sidebar shows its neighbours.
-    let root = open
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.to_path_buf());
-    let how = match (console, edit) {
-        (true, _) => OpenAs::Console,
-        (_, true) => OpenAs::Edit,
-        _ => OpenAs::Auto,
-    };
-    Ok((root, Some(open), how))
 }
 
 fn main() {
@@ -167,25 +148,25 @@ fn main() {
     let synapse = Synapse::new();
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // 1b. Command line. `una` takes at most one positional argument:
+    // 1b. Command line. `una` takes at most one positional argument and no
+    //     option flags:
     //
-    //       una                     — workspace at the cwd
-    //       una <dir>               — workspace at <dir>
-    //       una <file>              — workspace at the file's parent, file open
-    //       una --console [<file>]  — the Console view: <file>, or the newest
-    //                                 console log found on any mounted volume
-    //                                 or in the bench capture tree
-    //       una --edit <file>       — the editable view, even for a file
-    //                                 named like a log (`notes.log`)
+    //       una           — workspace at the cwd
+    //       una <dir>     — workspace at <dir>
+    //       una <file>    — workspace at the file's parent, file open
     //
-    //     A console log is not a workspace member — it lives on the shard's
-    //     FAT volume once the card is mounted, or in a capture directory — so
-    //     the flow is "open this path", not "browse to it in the sidebar".
-    let (root_arg, open_arg, open_as) = match parse_args(std::env::args().skip(1)) {
-        Ok(triple) => triple,
+    //     A named log opens read-only on its own: `TabulaDocument::open`
+    //     name-routes it to the Console view. A console log is not a workspace
+    //     member — it lives on the shard's FAT volume once the card is mounted,
+    //     or in a capture directory — so the flow is "open this path", not
+    //     "browse to it in the sidebar". Summoning the *newest* log with no
+    //     path is the Console app tile's job (comscan / `ViewEntity::Console`),
+    //     not a flag on `una`.
+    let (root_arg, open_arg) = match parse_args(std::env::args().skip(1)) {
+        Ok(pair) => pair,
         Err(msg) => {
             eprintln!("[UNA] {}", msg);
-            eprintln!("usage: una [--console | --edit] [PATH]");
+            eprintln!("usage: una [PATH]");
             std::process::exit(2);
         }
     };
@@ -226,21 +207,17 @@ fn main() {
     println!("[UNA] Context Spline: {:?} → Layout: {:?}", context.spline, layout);
     let mut workspace_state = elessar::workspace_for(layout, genesis_roots);
 
-    // 5b. An explicit `open` (a file argument, or `--console`) overrides the
-    //     Layout's choice of right pane: a console log lives on a mounted FAT
-    //     volume or in a capture directory, neither of which resolves to a
-    //     `Layout::Code` project, so the Editor has to be asked for. Seeding
-    //     `EditorState` here — rather than firing `EditorLoad` after
-    //     `UiReady` — puts the text in the FIRST frame.
+    // 5b. A named file overrides the Layout's choice of right pane: a console
+    //     log lives on a mounted FAT volume or in a capture directory, neither
+    //     of which resolves to a `Layout::Code` project, so the Editor has to
+    //     be asked for. Seeding `EditorState` here — rather than firing
+    //     `EditorLoad` after `UiReady` — puts the text in the FIRST frame.
     let initial_document = open_arg.as_ref().and_then(|path| {
-        // `--console` forces the log renderer even when the name does not say
-        // "log"; `--edit` forces the plain editor even when it does.
-        let opened = match open_as {
-            OpenAs::Console => tabula::TabulaDocument::load_log(path),
-            OpenAs::Edit => tabula::TabulaDocument::load(path),
-            OpenAs::Auto => tabula::TabulaDocument::open(path),
-        };
-        match opened {
+        // `open` name-routes: a log opens read-only in the Console view, any
+        // other file opens editable. There is no flag override — a log is
+        // read-only because it is not the viewer's to write, not because argv
+        // said so.
+        match tabula::TabulaDocument::open(path) {
             Ok(doc) => {
                 println!(
                     "[UNA] Opened {} ({} byte(s){})",
@@ -374,15 +351,16 @@ fn main() {
                             // the console so saves are visible. With no file
                             // loaded `save()` returns an error rather than
                             // panicking — that surfaces as a console line.
-                            // A console log is a record, not a draft: say so
-                            // plainly rather than letting the io error's
-                            // wording carry the explanation.
+                            // A console log is a record you do not own: say WHY
+                            // it cannot be written (root owns it; the shard's
+                            // ACL refuses, not this app) rather than letting the
+                            // io error's wording carry the explanation.
                             bandy::SMessage::EditorSaveRequest if document.read_only => {
                                 let name = document.path.as_ref()
                                     .map(|p| p.display().to_string())
                                     .unwrap_or_else(|| "<log>".to_string());
                                 synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(
-                                    format!("[una] {} is a console log view — read-only, not saved", name)));
+                                    format!("[una] {} is a kernel log, owned by root — read-only; the shard's ACL refuses writes, not this app", name)));
                             }
                             bandy::SMessage::EditorSaveRequest => {
                                 let line = match document.save() {
@@ -510,7 +488,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, OpenAs};
+    use super::parse_args;
     use std::path::PathBuf;
 
     fn args(v: &[&str]) -> Vec<String> {
@@ -529,57 +507,41 @@ mod tests {
 
     #[test]
     fn no_arguments_means_cwd_and_nothing_open() {
-        assert_eq!(parse_args(args(&[])).unwrap(), (None, None, OpenAs::Auto));
+        assert_eq!(parse_args(args(&[])).unwrap(), (None, None));
     }
 
     #[test]
     fn a_directory_is_a_workspace_root() {
         let d = scratch("dir");
         let got = parse_args(args(&[d.to_str().unwrap()])).unwrap();
-        assert_eq!(got, (Some(d.clone()), None, OpenAs::Auto));
+        assert_eq!(got, (Some(d.clone()), None));
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// A named log is a plain positional argument — no flag. It anchors the
+    /// workspace beside itself; the read-only Console treatment is decided
+    /// downstream by `TabulaDocument::open`, not by the argument grammar.
     #[test]
-    fn a_file_opens_and_anchors_the_workspace_beside_it() {
+    fn a_log_file_opens_and_anchors_the_workspace_beside_it() {
         let d = scratch("file");
         let f = d.join("UNAOS.LOG");
         std::fs::write(&f, b":: log ::\n").unwrap();
-        let (root, open, how) = parse_args(args(&[f.to_str().unwrap()])).unwrap();
+        let (root, open) = parse_args(args(&[f.to_str().unwrap()])).unwrap();
         assert_eq!(root.as_deref(), Some(d.as_path()));
         assert_eq!(open.as_deref(), Some(f.as_path()));
-        assert_eq!(how, OpenAs::Auto);
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// The `--console`/`--edit` flag ceremony is GONE: both are rejected as
+    /// unknown options, not accepted as modes.
     #[test]
-    fn console_with_an_explicit_path_opens_it() {
-        let d = scratch("console");
-        let f = d.join("ttyUSB0.log");
-        std::fs::write(&f, b"line\n").unwrap();
-        let (root, open, how) = parse_args(args(&["--console", f.to_str().unwrap()])).unwrap();
-        assert_eq!(root.as_deref(), Some(d.as_path()));
-        assert_eq!(open.as_deref(), Some(f.as_path()));
-        assert_eq!(how, OpenAs::Console);
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// The escape hatch: name-based routing sends `notes.log` to the read-only
-    /// Console view, and an operator who wrote that file needs a way back.
-    #[test]
-    fn edit_forces_the_editable_view_for_a_log_named_file() {
-        let d = scratch("edit");
+    fn the_old_console_and_edit_flags_are_rejected() {
+        let d = scratch("noflags");
         let f = d.join("notes.log");
         std::fs::write(&f, b"my own notes\n").unwrap();
-        let (root, open, how) = parse_args(args(&["--edit", f.to_str().unwrap()])).unwrap();
-        assert_eq!(root.as_deref(), Some(d.as_path()));
-        assert_eq!(open.as_deref(), Some(f.as_path()));
-        assert_eq!(how, OpenAs::Edit);
-        // The two flags are opposites and cannot both be given.
-        assert!(parse_args(args(&["--edit", "--console", f.to_str().unwrap()])).is_err());
-        // `--edit` needs something to edit.
-        assert!(parse_args(args(&["--edit"])).is_err());
-        assert!(parse_args(args(&["--edit", d.to_str().unwrap()])).is_err());
+        assert!(parse_args(args(&["--console"])).is_err());
+        assert!(parse_args(args(&["--console", f.to_str().unwrap()])).is_err());
+        assert!(parse_args(args(&["--edit", f.to_str().unwrap()])).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -37,10 +37,20 @@ pub struct TabulaDocument {
     /// True when `buffer` has unsaved edits relative to disk.
     pub dirty: bool,
     /// True when this document must never be written back — set for console
-    /// logs, whose buffer is a *rendering* of the file (padding trimmed,
-    /// control bytes made visible, possibly only the tail). Saving that text
-    /// over the log would destroy the record it came from, so `save()` refuses
-    /// and `set_buffer()` is inert.
+    /// logs. Two reasons stack, and the deeper one is not the app's:
+    ///
+    /// 1. **Ownership (the real denial).** On the shard a kernel flight-recorder
+    ///    log is owned by *root*; the UnaFS ownership ACL (`acl-<lba>-<off>`
+    ///    rows carrying `owner`/`grants:*`) refuses any write from a user-owned
+    ///    vessel — see `docs/SECURITY.md`. A user app *cannot* write it, flag or
+    ///    no flag. This bool mirrors that filesystem fact so the host viewer
+    ///    behaves the same way the metal filesystem would enforce.
+    /// 2. **Rendering fidelity.** The buffer is a *rendering* of the file
+    ///    (padding trimmed, control bytes made visible, possibly only the tail),
+    ///    so even for a log an operator *did* own, writing this text back would
+    ///    destroy the record it came from.
+    ///
+    /// `save()` refuses and `set_buffer()` is inert.
     pub read_only: bool,
 }
 
