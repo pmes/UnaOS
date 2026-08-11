@@ -84,6 +84,27 @@ pub mod selftest;
 #[cfg(any(feature = "installdemo", feature = "install_target", feature = "piinstall"))]
 pub mod install;
 
+// HASH: CRC-32/ISO-HDLC + SHA-256, arch-neutral and no_std. Lived at `install/hash.rs` until
+// SELFHOST-2 needed the same primitives without dragging the installer engine in behind
+// `installdemo`; `install` re-exports it, so every `crate::install::hash::…` call site is unchanged.
+// Compiled only for the features that consume it — no consumer, no code.
+#[cfg(any(
+    feature = "installdemo",
+    feature = "install_target",
+    feature = "piinstall",
+    feature = "selfhost"
+))]
+pub mod hash;
+
+// SELFHOST-2 (`selfhost` / UNAOS_SELFHOST=1): the source tree is READABLE ON THE SHARD — mount the
+// program-source volume, verify SRC.TGZ against SRC.SHA, then gunzip + tar-walk it and enumerate the
+// members, all streaming and strictly read-only. Rung 2 of the self-hosting line whose rung 1 is
+// SOURCE-ALONG (docs/dev/OS/10_INSTALL/source_along.md). Arch-neutral (it drives only `fs::fat` and
+// `hash`), so it compiles on both arches; the witness call site is x86_64-only this arc because the
+// packaged fixture is the x86 usb-storage image. DEFAULT OFF => module + call site vanish.
+#[cfg(feature = "selfhost")]
+pub mod selfhost;
+
 // FLIGHT-RECORDER: capture the serial boot log into a bounded ring and flush it to UNAOS.LOG on the
 // FAT boot volume, so a consumer who boots the vm-image with no serial capture can copy the log off
 // the image afterward. x86-only (the capture tap lives in arch/x86_64/serial.rs); aarch64 unaffected.

@@ -106,6 +106,16 @@ gmux_igd = []
 # so witness coverage is unchanged-green; the boot/media builds (`x86`/`arm`/`esp-*`/`kernel8`) leave it
 # off. Gates CALL SITES only — never the fixture bodies. See review/unaos-default-quiet-LANDING.md.
 witness = []
+# SELFHOST-2 (`UNAOS_SELFHOST=1`): the source tree is READABLE ON THE SHARD — `crate::selfhost` mounts
+# the program-source volume, verifies SRC.TGZ against the sha256 in SRC.SHA, then gunzips + tar-walks
+# it and enumerates the members (streaming both ends; strictly read-only, no write path to media).
+# Rung 2 of the self-hosting line begun by SOURCE-ALONG (docs/dev/OS/10_INSTALL/source_along.md).
+# Arch-neutral (drives only `fs::fat` + `crate::hash`), so it compiles on both arches; the witness
+# call site is x86_64-only this arc because the packaged fixture is the x86 usb-storage image
+# (`./arroyo test-selfhost`). Also pulls in `crate::hash`. DEFAULT OFF => the module, `crate::hash`
+# (absent the installer features) and the call site all vanish, and every image is byte-identical to
+# baseline. Kept in sync with arroyo AND builder/src/main.rs.
+selfhost = []
 # WXN-x86 M3b (THE ARM): PERFORM the W-clear on the kernel's executable pages, rather than only
 # measuring it. x86_64 only. DEFAULT OFF is load-bearing and not a convenience: with the knob off,
 # `memory::wxn_ro_stage` runs the identical extent derivation and the identical read-only census,

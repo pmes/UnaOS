@@ -27,7 +27,10 @@
 
 pub mod fat32;
 pub mod gpt;
-pub mod hash;
+// The checksum/digest primitives moved to the crate root (`crate::hash`) in SELFHOST-2 so the
+// source-verify walk can share ONE implementation instead of carrying a second copy. Re-exported
+// here so `crate::install::hash::{sha256, crc32, Sha256}` still resolves at every call site.
+pub use crate::hash;
 
 // INSTALL-SELF: the boot-device guard — the installer must never offer, select, or erase the device the
 // system booted from. Arch-neutral (it compares a FAT volume serial carried in `BootInfo` against the

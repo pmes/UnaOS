@@ -54,6 +54,11 @@ fn main() {
     // `armed=` field on the wire is what caught it, and it stays on the line for that reason.) Kept
     // in sync with arroyo.
     if std::env::var("UNAOS_WXNRO").is_ok() { feats.push("wxnro"); }
+    // SELFHOST-2: UNAOS_SELFHOST=1 arms `selfhost` — the on-shard SRC.TGZ verify + tar walk. The
+    // `test-selfhost` lane boots THIS build (the builder re-runs cargo itself), so a knob wired only
+    // in arroyo would light the `⚡ kernel features:` banner while the kernel under test carried no
+    // witness at all. Kept in sync with arroyo.
+    if std::env::var("UNAOS_SELFHOST").is_ok() { feats.push("selfhost"); }
     if std::env::var("UNAOS_SKIP_XHCI").is_ok() { feats.push("skip_xhci"); }
     if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
     // CLOCK-2: UNAOS_LOGTS=1 arms `logts` — a compact per-line timestamp prefix (monotonic ms → UTC
