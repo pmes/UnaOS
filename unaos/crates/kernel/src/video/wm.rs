@@ -141,17 +141,12 @@ pub const TITLE_CELL: usize = FONT_CELL * TITLE_SCALE;
 /// budget. They were separate copies, and they disagreed by one `GAP` — the threshold admitted
 /// strips the painter then gave a zero-glyph budget.
 ///
-/// ### CONSOLEWIN — it is THREE discs for every row, including two-disc furniture rows
-/// [`ctrls_for`] gives kernel furniture a two-control cluster, and this constant does not shrink for
-/// it. Two consequences, both deliberate and both in the SAFE direction:
-///
-///  * the caption on a furniture row starts one disc-plus-`GAP` further right than its cluster
-///    strictly needs — a uniform caption inset across every window on the panel, which is the more
-///    defensible look of the two and is why this is not merely tolerable;
-///  * the decline floor ([`CLUSTER_MIN_BOX_W`]) is one disc STRICTER than a two-disc cluster
-///    requires, so a furniture row that clears it certainly has room. The error cannot produce an
-///    overlapping cluster or a caption drawn under a disc; it can only decline a narrow furniture
-///    row that would in fact have fitted.
+/// ### NORMALWIN — it is THREE discs for every row, and now every row really has three
+/// [`ctrls_for`] returns the full [`CTRLS`] list for every row since Peter's *"3 normal buttons"*
+/// ruling, so this reserve is EXACT rather than merely conservative — the mismatch the two
+/// paragraphs this replaces documented (a three-disc reserve budgeted for a two-disc furniture
+/// cluster) no longer exists. The caption inset and the decline floor are the same number for the
+/// console as for an app, which is what "normal app window" means at the level of geometry.
 ///
 /// Not made row-dependent, and that is a scope judgement rather than an oversight. This constant is
 /// the source of [`CLUSTER_MIN_SRC_W`], which is the source of [`CLUSTER_MIN_BOX_W`], which is
@@ -1433,20 +1428,21 @@ pub fn close(id: WinId) -> bool {
 /// worth its two lines — it makes the console's survival a property of THIS function rather than a
 /// property of how the callers happen to compute an ASID.
 ///
-/// ### CONSOLEWIN — the geometric backstop is now in front of it, and the guard STAYS
-/// The paragraph this replaces argued the guard's worth from a live path into it: `close_box`
-/// declined only `owner_asid == 0`, so the console row was drawn WITH a close control and clicking
-/// it routed `wc_close_click(KERNEL_OWNER_CONSOLE)` straight here. That path has been closed twice
-/// since — first by CLOSEISO declining furniture in `controls` outright, and now by [`ctrls_for`],
-/// which gives furniture a minimise and a zoom disc and NO close disc, so `control_hit` cannot name
-/// `Ctrl::Close` for a kernel row at all.
+/// ### NORMALWIN — the console HAS a close disc again, and this refusal is why that is still safe
+/// Peter's 2026-08-11 ruling gives the console window all three normal buttons, so `control_hit` CAN
+/// name `Ctrl::Close` on a kernel row and the operator's press has to do something. It does not do
+/// it through here. x86's close arm branches on [`is_kernel_owner`] and calls [`close`] — the
+/// ID-SCOPED primitive, which reaps exactly the one row the operator pressed and nothing else —
+/// instead of `wc_close_click`'s owner sweep. So the disc is live and this function's blast radius
+/// is unchanged.
 ///
-/// The refusal is kept anyway, and its justification is now the stronger one: it is the STRUCTURAL
-/// half of a claim whose other half is geometry. A cluster composition is a painting decision and
-/// could be changed by an arc thinking about layout; "no owner-scoped close, from any caller, can
-/// take the console" must not depend on one. `closeiso_selftest` leg 3 aims `close_owner` straight
-/// at the furniture owner and asserts zero rows freed, which is a claim about THIS function and
-/// does not go through the router at all.
+/// That split is the whole design and it is deliberate: "close the window I clicked" and "reap every
+/// row this ASID holds" are different operations that happened to share a call. The second is the
+/// dangerous one (it is reached from process teardown, and it removes rows it was not handed the id
+/// of), and the console must never be inside its radius whatever the router does. `closeiso_selftest`
+/// leg 3 aims `close_owner` straight at the furniture owner and asserts zero rows freed — a claim
+/// about THIS function that does not go through the router at all, and one that stays true now that
+/// the router has a live close path.
 pub fn close_owner(owner_asid: u64) -> usize {
     // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`, and note that THIS is the path that matters most: it
     // is reached from `sched::exit` → `clear_handle_row`, which has already masked interrupts, so a
@@ -8761,26 +8757,36 @@ impl Ctrl {
 /// [`control_hit`] walks it, so a control that is drawn is a control that can be pressed.
 const CTRLS: [Ctrl; 3] = [Ctrl::Close, Ctrl::Minimise, Ctrl::Zoom];
 
-/// FACADE — **kernel furniture gets NO control cluster, on every build.** The console output is not a
-/// managed desktop citizen; it is plumbing behind the facade (Peter, 2026-08-11: *"stop trying to pin
-/// our console output to an application ... all this crispy stuff is supposed to be a facade"*).
+/// NORMALWIN — **the console window carries the SAME three controls every app window does.**
 ///
-/// The value is a name rather than a bare `false` so the fixtures (`ctrldecline_selftest` leg 5,
-/// `closeiso_selftest` leg 4) can keep asserting the contract against ONE symbol: *"furniture has
-/// exactly the cluster this build's `ctrls_for` promises"* — which is now "none, on every arch", so a
-/// leg that hard-coded "furniture has minimise and zoom" would red, and re-introducing the cluster (in
-/// [`ctrls_for`]) without flipping this const back would flip the legs FAIL. That coupling is the
-/// falsifier: a furniture-cluster on the console is the FORBID shape.
+/// **Peter's ruling, 2026-08-11 (supersedes the FACADE reading of the same day):** *"go back in git
+/// history when it still had the 3 normal buttons ... i said normal app."* The window the operator
+/// sees on the glass is a NORMAL APP WINDOW and gets a normal app window's chrome: close, minimise,
+/// zoom, in that order, in the same left-packed cluster at the same anchor. What the facade law
+/// governs is the RAW console/boot-log OUTPUT — the plumbing that reaches serial and `TERM_RING` and
+/// paints the panel before the compositor exists. That plumbing is untouched here and stays
+/// unmanaged. This constant is about the WINDOW, and the window is ordinary.
 ///
-/// ### Old law → new law (CONSOLEWIN reverted)
-/// The merged shellwin-a arc (CONSOLEWIN) gave the console a `[Minimise, Zoom]` cluster and this const
-/// was `cfg!(all(target_arch = "x86_64", feature = "wc"))` — true on x86, so the console drew two
-/// titlebar discs. That direction is the mistake this arc unwinds: chrome on the console makes it read
-/// as a managed window, and it is not one. The disc set (`CTRLS_FURNITURE`, deleted) is gone, and this
-/// const is `false` unconditionally. What the const was gated ON — "does this build have a dock to
-/// return a parked kernel row" — is no longer the question, because there is no minimise disc to park
-/// it with.
-pub const FURNITURE_HAS_CONTROLS: bool = false;
+/// The value is a name rather than a bare `true` so the fixtures (`ctrldecline_selftest` leg 5,
+/// `closeiso_selftest` leg 4) keep asserting the contract against ONE symbol: *"furniture has exactly
+/// the cluster this build's `ctrls_for` promises"* — which is now "the full three, on every arch". A
+/// leg that hard-coded either answer would be wrong on the other side of a future ruling, and
+/// narrowing the cluster in [`ctrls_for`] without flipping this const back flips those legs FAIL.
+/// That coupling is the falsifier, and it now points the other way: a console with FEWER buttons than
+/// an app is the FORBID shape.
+///
+/// ### Old law → new law, both directions, so the ledger reads straight
+///  * pre-shellwin-a (CLOSEISO): `controls` declined `is_kernel_owner` outright — no cluster at all.
+///    The decline was aimed at the CLOSE disc (`close_owner` refuses the kernel band) and took all
+///    three away to disarm one.
+///  * shellwin-a (CONSOLEWIN): `[Minimise, Zoom]` on builds with a dock — two of three, close still
+///    withheld, this const `cfg!(all(target_arch = "x86_64", feature = "wc"))`.
+///  * facade-console-1: back to none, this const `false`.
+///  * **this arc (NORMALWIN): all three, unconditionally.** No `cfg` — a control cluster is not an
+///    arch property, and the aarch64 fixtures assert the same contract as x86 rather than a
+///    dock-shaped exception. The close disc's ACTION is what needed a route, and it got one that
+///    does not widen `close_owner`'s blast radius (see [`close_owner`] and x86's close arm).
+pub const FURNITURE_HAS_CONTROLS: bool = true;
 
 /// CONSOLEWIN — **WHICH controls row `r` has**, in paint order and in hit order.
 ///
@@ -8790,42 +8796,38 @@ pub const FURNITURE_HAS_CONTROLS: bool = false;
 /// control that can be pressed — the property WMCTRL bought with a single list — it is merely a
 /// list per row rather than a list per system.
 ///
-/// ### FACADE — kernel furniture gets NO cluster, and that is the WHOLE of this row's rule
-/// The console output is plumbing behind the crispy facade, not a managed desktop citizen (Peter,
-/// 2026-08-11). A titlebar disc — close, minimise OR zoom — is exactly the affordance that makes a
-/// surface read as an app window, so kernel-owned rows get an EMPTY cluster on every build. Apps keep
-/// the full [`CTRLS`] list; furniture keeps none.
+/// ### NORMALWIN — EVERY row gets the SAME cluster, and that is the whole of the rule
+/// **Peter, 2026-08-11:** *"go back in git history when it still had the 3 normal buttons ... i said
+/// normal app."* The console window is a normal app window; a normal app window has close, minimise
+/// and zoom. There is no per-owner narrowing left, so this returns [`CTRLS`] for every row and the
+/// function survives as the ONE seam a future per-row composition would go through — `control_disc`
+/// takes the row's slot from here, and putting the list back behind a global `CTRLS` walk would
+/// re-open the WMCTRL defect (a painter and a hit test disagreeing about the cluster) the moment
+/// anyone wanted a narrowing again.
 ///
 /// ### Old law → new law
-/// The merged shellwin-a arc (CONSOLEWIN) gave furniture `&CTRLS_FURNITURE` = `[Minimise, Zoom]` on
-/// builds with a dock, on the argument that *"the console is a window now and the operator may take it
-/// off the glass"*. That premise — the console is a window — is the mistake being unwound: the console
-/// is NOT a window, so it is not given the buttons of one. The empty cluster is the pre-shellwin-a
-/// CLOSEISO behaviour, restored deliberately rather than as a fallback.
+/// Three predecessors, all narrowings, all now gone: CLOSEISO declined kernel rows a cluster
+/// entirely; shellwin-a (CONSOLEWIN) gave them `[Minimise, Zoom]`; facade-console-1 took it back to
+/// empty on the reading that the console *window* was plumbing. The operator's ruling separates the
+/// two things that reading conflated — the raw console OUTPUT is plumbing (unchanged: serial,
+/// `TERM_RING`, the pre-compositor panel path, and the panic path, none of which this touches), while
+/// the WINDOW on the glass is an app window. So the window gets an app window's buttons.
 ///
-/// The `close_owner` structural backstop (it refuses kernel-band rows) is UNCHANGED and still holds:
-/// nothing draws a close disc for furniture (there is no cluster to put it in), and nothing could reap
-/// the console even if a gesture named it. `wc_focus_key`'s note remains the reason the boot log's row
-/// is protected at all — *"fbcon's `KERNEL_OWNER_CONSOLE` row is a frozen boot-log snapshot after
-/// `fbcon::detach()` and the live prompt is the desktop layer"* — so losing the console's chrome costs
-/// the operator no prompt; the prompt is the layer underneath.
+/// ### What had to move with the close disc, and what deliberately did NOT
+/// A control that cannot act must not be painted, so restoring the close disc meant giving it a live
+/// action. It did NOT mean widening [`close_owner`], whose kernel-band refusal is the blast-radius
+/// guard on the one call that reaps rows it was not handed the id of — that refusal is UNCHANGED, and
+/// `closeiso_selftest` leg 3 still asserts it. The console's close disc is routed through `close(id)`
+/// instead, the id-scoped primitive, which names exactly the one row the operator pressed. See x86's
+/// `Ctrl::Close` arm in `wc_click_route_at`.
 ///
-/// ### DESIGNED, NOT LANDED — the rest of the unwind (collision zones)
-/// Removing the discs takes the buttons off the console but not the console off the desktop. The two
-/// remaining pieces live in predicates other in-flight arcs own and are deliberately NOT touched here:
-///  * the console's DOCK TILE — [`dock_scan`] enumerates kernel-owned rows, and `dock::selftest` pins
-///    the console as a parkable dock citizen. Removing it is the dock arcs' lane (occ_clip/strip).
-///  * [`above_shell`]'s `is_kernel_owner && z != PARKED_Z` arm keeps the console composited above the
-///    shell as a desktop citizen; dropping that arm (so a below-shell console stops compositing once
-///    the desktop is up) is shell-window-b's lane, which is simplifying the same predicate.
-/// See this arc's report for the old-law→new-law ledger of both.
-const fn ctrls_for(r: &Window) -> &'static [Ctrl] {
-    if is_kernel_owner(r.owner_asid) {
-        // FACADE — kernel furniture is plumbing, not a managed window: no titlebar cluster.
-        &[]
-    } else {
-        &CTRLS
-    }
+/// Minimise and zoom needed nothing: both already accept a kernel row (they refuse only `compat` and
+/// owner 0), shellwin-a's `PARKED_Z` term in [`above_shell`] is intact, and `dock_scan` still
+/// enumerates kernel-owned rows — which is why the dock is the parked console's way back, pinned by
+/// `dock::selftest`'s furniture-park leg and by x86-witness.spec's DOCK rule.
+const fn ctrls_for(_r: &Window) -> &'static [Ctrl] {
+    // NORMALWIN — one cluster, every row: the console is a normal app window (Peter, 2026-08-11).
+    &CTRLS
 }
 
 /// WMCTRL — **the bounding box `(x, y, diameter)` of ONE control disc**, or `None` for a row
@@ -8835,19 +8837,17 @@ const fn ctrls_for(r: &Window) -> &'static [Ctrl] {
 /// The painter calls this, [`control_hit`] calls this, and the fixture calls
 /// [`control_disc_rect`] which calls this. There is deliberately no second copy of the pitch.
 ///
-/// ### CONSOLEWIN — the index is the position in THIS ROW'S cluster, not in [`CTRLS`]
-/// `Ctrl::index` is the position in the full three-control list, and while every row had all three
-/// the two were the same number. Furniture has two ([`ctrls_for`]), and the difference is visible:
-/// reading the slot off `Ctrl::index` would put minimise at slot 1 and zoom at slot 2, leaving an
-/// empty disc-width HOLE at slot 0 where the close control would have been — a gap the operator
-/// reads as a missing button rather than as a cluster of two. The cluster is LEFT-PACKED instead:
-/// the row's controls occupy slots `0..n` in order, so the console's minimise disc sits exactly
-/// where an app's close disc sits.
+/// ### CONSOLEWIN — the slot is the position in THIS ROW'S cluster, not in [`CTRLS`]
+/// `Ctrl::index` (deleted) was the position in the full three-control list. Under NORMALWIN every
+/// row's cluster IS that list again, so the two numbers agree today — and the lookup stays keyed on
+/// the row anyway, because it is the seam a narrowing would come back through. Reading a slot off a
+/// fixed global position while `ctrls_for` returned something shorter is what would leave a
+/// disc-width HOLE at slot 0; LEFT-PACKING from the row's own list makes that unrepresentable rather
+/// than merely currently-absent.
 ///
 /// **A control the row does not have returns `None`, and that is what makes the composition total.**
-/// `close_box(console)` is `None`, so [`close_box_hit`] declines; `control_hit` walks the row's own
-/// list and can never name a control the painter did not draw. One `position` lookup over a
-/// two- or three-element list, on a path that already takes a table lock.
+/// `control_hit` walks the row's own list and can never name a control the painter did not draw. One
+/// `position` lookup over a three-element list, on a path that already takes a table lock.
 fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
     let slot = ctrls_for(r).iter().position(|&c| c == which)?;
     controls(r).map(|(cbx, cy, d)| (cbx + slot * (d + GAP), cy, d))
@@ -9109,24 +9109,21 @@ fn controls_declined_drain() {
 /// the floor — so they are now sized from [`CLUSTER_MIN_SRC_W`] under a `const` assertion instead
 /// of from a literal with a comment beside it.
 fn controls(r: &Window) -> Option<(usize, usize, usize)> {
-    // FACADE — **kernel furniture is declined a cluster HERE, owner-wide, as it was before shellwin-a.**
+    // NORMALWIN — **there is no owner-wide furniture decline any more.** Peter's ruling
+    // (2026-08-11): the console window is a normal app window, so it reaches the width test on the
+    // same terms every app row does, and clears it on the same terms — a console box is very nearly
+    // panel-wide, so the floor is never the binding constraint for the real row.
     //
-    // The console output is plumbing behind the crispy facade, not a managed desktop window (Peter,
-    // 2026-08-11), so it gets no titlebar cluster at all. [`ctrls_for`] already returns an EMPTY list
-    // for kernel-owned rows, so no disc is ever drawn; declining the cluster BOX here as well is the
-    // faithful pre-shellwin-a restore, and it keeps kernel-owned rows out of the width-decline witness
-    // below — the merged CONSOLEWIN arc let furniture reach that arm (and every narrow synthetic
-    // kernel fixture row therefore emitted a spurious `[wm] controls-declined` line); this returns
-    // that to silence.
-    //
-    // Old law → new law: shellwin-a moved the furniture decline OUT of here and into a per-CONTROL
-    // narrowing in `ctrls_for` so the console could keep minimise and zoom. That gave the console the
-    // buttons of a window, which is the direction this arc unwinds — the console is not a window. The
-    // owner-wide decline is back, and `close_owner`'s refusal of kernel-band rows is the unchanged
-    // structural backstop behind it.
+    // Old law → new law: CLOSEISO declined `is_kernel_owner` here (aimed at the close disc, taking
+    // all three); shellwin-a moved that into a per-CONTROL narrowing in `ctrls_for`; facade-console-1
+    // put the owner-wide decline back. All three are gone. The consequence worth naming, because it
+    // is visible in a capture: a NARROW kernel-owned row now reaches the CTRLWIT width arm and arms
+    // one `[wm] controls-declined` line, exactly as an app row does. The synthetic 32x8 kernel probe
+    // rows the click/dock batteries mint are the population that grows the line count; the growth is
+    // correct (those rows really have no cluster) and is not a rate-limit regression.
     //
     // `owner_asid == 0` is the shell/desktop row (CLICK-SHELL), which `hit_test` never names at all.
-    if r.compat || r.owner_asid == 0 || is_kernel_owner(r.owner_asid) {
+    if r.compat || r.owner_asid == 0 {
         return None;
     }
     let (bx, by, bw, _bh) = outer_box(r);
@@ -9174,13 +9171,13 @@ fn controls(r: &Window) -> Option<(usize, usize, usize)> {
         // ever costs a reader more than it tells them, the honest fix is to widen the fixture rows,
         // not to teach the kernel to lie about them.
         //
-        // FACADE — **kernel-owned rows never reach this arm.** The owner-wide decline above returns
-        // before the width test for every `is_kernel_owner` row, so no kernel furniture — the console,
-        // or the narrow synthetic fixture rows the click/dock batteries mint — can arm this latch. That
-        // is the pre-shellwin-a behaviour, restored: the merged CONSOLEWIN arc briefly let furniture
-        // reach here (per-CONTROL decline in `ctrls_for` instead of owner-wide here), which made every
-        // narrow kernel row emit a spurious `[wm] controls-declined` line. Only genuine ring-3 windows
-        // that asked for a surface and got a frame too narrow for a cluster reach this arm now.
+        // NORMALWIN — **kernel-owned rows DO reach this arm, and that is the point.** There is no
+        // owner-wide decline in front of the width test any more (Peter's ruling: the console window
+        // is a normal app window), so a kernel row is measured by exactly the rule an app row is. The
+        // real console row clears the floor by a wide margin — its box is nearly the panel — so the
+        // line it can emit is not about the console; it is about the narrow synthetic 32x8 kernel
+        // probe rows the click/dock batteries mint, which decline legitimately and say so. The
+        // CTRLWIT-REVIEW note above already argues why those lines are kept rather than filtered.
         //
         // The print itself is NOT here: this runs inside a `table()` critical section. It arms.
         let i = r.id as usize;
@@ -14254,17 +14251,19 @@ fn movevacate_selftest() {
 /// 3. **refuse** — [`close_owner`] aimed straight at the furniture owner frees ZERO rows and leaves
 ///    the row live. This is the structural half — no owner-scoped close, from any caller, can take
 ///    the console. It is called directly rather than through the router because that is the point:
-///    the claim must not depend on which controls the painter happens to draw. (The parenthetical
-///    this replaces said the path was reachable from a drawn close control. It has not been since
-///    CLOSEISO, and under CONSOLEWIN furniture's cluster explicitly omits `Ctrl::Close` — see
-///    [`ctrls_for`]. The refusal is the backstop behind that geometry, not a duplicate of it.)
+///    the claim must not depend on which controls the painter happens to draw. **NORMALWIN makes
+///    this leg load-bearing again rather than merely principled:** the console DOES have a close disc
+///    now, and pressing it must not reach this function. x86's close arm routes a kernel-owned row
+///    through [`close`] by id instead, so "no owner-scoped close can take the console" and "the
+///    operator can close the console window" are both true at once, and this leg is what holds the
+///    first of them while the router provides the second.
 ///
-/// ### CONSOLEWIN — legs 4-6: the console is a WINDOW, and the exemption is about intent
+/// ### NORMALWIN — legs 4-6: the console is a NORMAL APP WINDOW
 /// The three legs above are all about what happens to the console when the operator aims at
-/// something ELSE. This arc gives the console its own controls, so the fixture now also covers what
-/// happens when they aim AT it: it has minimise and zoom and no close (leg 4), a deliberate
-/// [`minimise`] actually takes it off the glass rather than being overruled by the exemption
-/// (leg 5), and `focus_changed(owner)` — the dock's restore primitive — brings it back (leg 6).
+/// something ELSE. These cover what happens when they aim AT it: it carries the full three-control
+/// cluster like any app (leg 4), a deliberate [`minimise`] actually takes it off the glass rather
+/// than being overruled by the desktop-citizen exemption (leg 5), and `focus_changed(owner)` — the
+/// dock's restore primitive — brings it back (leg 6).
 ///
 /// Legs 1 and 5 are the falsifying PAIR, and neither is redundant: leg 1 says this exact row
 /// survives a shell raise, leg 5 says the same row obeys a minimise. A predicate that ignores `z`
@@ -14365,29 +14364,28 @@ fn closeiso_selftest() {
     // to its unconditional `is_kernel_owner` form. That is the specific regression this arc can
     // cause, so it is the one the fixture forces.
     //
-    // 4. **has NO cluster, on any build.** FACADE: the console is plumbing, not a managed window, so
-    //    it carries no titlebar discs — no minimise, no zoom, no close. Read through
-    //    `control_disc_rect`, the painter's own accessor; every control answers `None`. This asserts
-    //    against [`FURNITURE_HAS_CONTROLS`] (now `false` unconditionally), so re-introducing the
-    //    cluster in `ctrls_for` without flipping the const back flips this leg FAIL — a console with
-    //    the buttons of a window is the FORBID shape.
+    // 4. **has the FULL THREE-control cluster, on every build.** NORMALWIN (Peter, 2026-08-11:
+    //    *"i said normal app"*): the console window is a normal app window, so it carries close,
+    //    minimise AND zoom. Read through `control_disc_rect`, the painter's own accessor; all three
+    //    answer `Some`. Asserted against [`FURNITURE_HAS_CONTROLS`] (now `true` unconditionally), so
+    //    a future narrowing in `ctrls_for` without flipping the const back flips this leg FAIL — a
+    //    console with FEWER buttons than an app is the FORBID shape now.
     // 5. **the park machinery still functions at the FUNCTION level.** `minimise` on the furniture row
     //    must report a real outcome (`parked`, owner now hidden), `above_shell` must call it hidden,
     //    and the panel at its content origin must read `DESKTOP_BG`. The gesture is applied here as a
-    //    direct `minimise` call, NOT a disc press — leg 4 proves there is no disc to press. This
-    //    exercises the underlying park/restore primitive, which is unchanged; the desktop-citizen
-    //    treatment that made a PARKED console meaningful (`above_shell`'s `is_kernel_owner` arm) is
-    //    removed in the designed follow-up (shell-window-b's lane), not here.
+    //    direct `minimise` call rather than a synthetic disc press: leg 4 already proves the disc is
+    //    there, and `control_hit`'s routing is x86's (`clickroute`) to pin, not this aarch64 leg's.
     // 6. **and the way back exists.** The restore primitive is `focus_changed(owner)`, applied here
-    //    directly. The console must come back visible and its pixels return.
-    // `noclose` is unconditional — no build gives furniture a close disc, and that is CLOSEISO's law.
-    // Against [`FURNITURE_HAS_CONTROLS`] so the leg reads the same on every arch: furniture has
-    // exactly the cluster the build promises, which is now "none" everywhere.
+    //    directly — the same call `dock`'s tile press makes. The console must come back visible and
+    //    its pixels return.
+    // Every disc is asserted against [`FURNITURE_HAS_CONTROLS`], so the leg reads the same on every
+    // arch: furniture has exactly the cluster the build promises, which is now "all three" everywhere.
     let ctrl_min = control_disc_rect(wk, Ctrl::Minimise).is_some();
     let ctrl_zoom = control_disc_rect(wk, Ctrl::Zoom).is_some();
-    let ctrl_noclose = control_disc_rect(wk, Ctrl::Close).is_none();
-    let ctrls_ok =
-        ctrl_min == FURNITURE_HAS_CONTROLS && ctrl_zoom == FURNITURE_HAS_CONTROLS && ctrl_noclose;
+    let ctrl_close = control_disc_rect(wk, Ctrl::Close).is_some();
+    let ctrls_ok = ctrl_min == FURNITURE_HAS_CONTROLS
+        && ctrl_zoom == FURNITURE_HAS_CONTROLS
+        && ctrl_close == FURNITURE_HAS_CONTROLS;
 
     let park = minimise(wk);
     let parked_hidden = {
@@ -14416,10 +14414,10 @@ fn closeiso_selftest() {
         && park_ok
         && back_ok;
     serial_println!(
-        "[wc-iso] close-iso base_k={} base_f={} closed={}/{} isolate={:#08x}/{} forced={:#08x}/{} table_visible={} refuse={}/{} ctrls min={} zoom={} noclose={} park={}/{:#08x}/{} restore={}/{:#08x}/{} -> {}",
+        "[wc-iso] close-iso base_k={} base_f={} closed={}/{} isolate={:#08x}/{} forced={:#08x}/{} table_visible={} refuse={}/{} ctrls min={} zoom={} close={} park={}/{:#08x}/{} restore={}/{:#08x}/{} -> {}",
         base_k, base_f, closed, closed_ok, got_k, iso_ok, got_f, forced_ok, table_ok,
         refused, refuse_ok,
-        ctrl_min, ctrl_zoom, ctrl_noclose,
+        ctrl_min, ctrl_zoom, ctrl_close,
         park, parked_px, park_ok,
         back_visible, back_px, back_ok,
         if ok { "PASS" } else { "FAIL" }
@@ -16114,15 +16112,15 @@ fn dock_tiles(rows: &[Window; MAX_WINDOWS]) -> usize {
 ///    not move. Without the latch the painter would put this line on the wire at frame rate.
 /// 4. **The row AT the floor keeps its cluster, and is silent.** The control for leg 1: without it,
 ///    a `controls` that had simply stopped returning `Some` would pass legs 1-3 outright.
-/// 5. **FACADE — furniture has NO cluster (no close, no minimise, no zoom), and is silent.** Three
-///    claims, and the leg has returned to the shape CLOSEISO gave it: kernel chrome has no cluster at
-///    all, by policy, because the console is plumbing behind the facade rather than a managed window.
-///    The merged CONSOLEWIN arc briefly made this a per-CONTROL claim ("furniture keeps minimise and
-///    zoom, loses close") and let the row reach the WIDTH arm; this arc reverts both — [`ctrls_for`]
-///    returns an empty list and [`controls`] declines the kernel band owner-wide before the width
-///    test. Asserted against [`FURNITURE_HAS_CONTROLS`] (now `false`), so restoring any disc flips the
-///    leg red. Silence means what it says: an owner-declined row never reaches the width arm, so a
-///    line here would be the cry-wolf the leg guards against.
+/// 5. **NORMALWIN — furniture has the FULL cluster (close, minimise and zoom), and is silent.** Three
+///    claims. Peter's ruling (*"3 normal buttons ... i said normal app"*) makes the console window an
+///    ordinary app window, so [`ctrls_for`] returns the full list for every row and [`controls`] no
+///    longer declines the kernel band owner-wide. Asserted against [`FURNITURE_HAS_CONTROLS`] (now
+///    `true`), so a re-narrowing flips the leg red. Silence now means what an APP row's silence means:
+///    the row is at the floor (`AT_W`) and has nothing to complain about — it reaches the width arm
+///    on the same terms as `ww` and passes it. That is a stronger claim than the owner-decline
+///    version, which could not distinguish "silent because it cleared the floor" from "silent because
+///    it returned before the test".
 /// 6. **And the furniture row is REAPED.** `close_owner` refuses the kernel band, so the teardown
 ///    sweep is structurally blind to `wf`; the reap is asserted by id instead, against the table.
 ///
@@ -16218,13 +16216,12 @@ pub fn ctrldecline_selftest() {
     // composite still has something to paint them for.
     {
         let mut t = table();
-        // FACADE — **`wf` is a WIDE furniture row (`AT_W`), and its silence is the OWNER decline.**
-        // [`controls`] declines a kernel-band owner before the width test (restored from CLOSEISO,
-        // reverting CONSOLEWIN's per-CONTROL narrowing), so `wf` never arms a decline line whatever its
-        // width — the owner arm returns first. `AT_W` is kept so `wf` is an ordinary wide furniture row
-        // rather than one that would ALSO trip the width arm if the owner decline were ever removed;
-        // the leg is back to "furniture is silent because it has no cluster at all", and `furn_ctrls`
-        // (against `FURNITURE_HAS_CONTROLS`) asserts that absence directly.
+        // NORMALWIN — **`wf` is a WIDE furniture row (`AT_W`), and its silence is the WIDTH test.**
+        // There is no owner-wide decline in front of the width arm any more, so `wf` is measured
+        // exactly as `ww` is and is quiet for exactly the same reason: it clears the floor. `AT_W` is
+        // therefore load-bearing rather than incidental — pinned under the floor, this row would
+        // legitimately arm a decline line and the `quiet` leg would red, which is the correct
+        // behaviour and is why the width is stated here rather than inherited from `FIX_W`.
         for (id, w) in [(wn, UNDER_W), (ww, AT_W), (wf, AT_W)] {
             if let Some(r) = row_mut(&mut t, id) {
                 r.w = w;
@@ -16248,35 +16245,36 @@ pub fn ctrldecline_selftest() {
     let after_rl = spoke_n();
     // Leg 4 — the row AT the floor keeps its cluster.
     let at_some = control_disc_rect(ww, Ctrl::Close).is_some();
-    // Leg 5 (FACADE) — **furniture has NO cluster: no close, no minimise, no zoom.** Three claims,
+    // Leg 5 (NORMALWIN) — **furniture has the FULL cluster: close, minimise AND zoom.** Three claims,
     // each able to fail on its own:
     //
-    //  * `furn_none` — no CLOSE disc. `ctrls_for` returns an EMPTY list for a kernel-owned row, so
-    //    `control_disc` answers `None`. This is the property CLOSEISO bought, and — after this arc
-    //    reverted CONSOLEWIN — the property the whole cluster now shares.
-    //  * `furn_ctrls` — NEITHER a minimise NOR a zoom disc. Asserted against [`FURNITURE_HAS_CONTROLS`]
-    //    (now `false`): `(furn_min.is_some() && furn_zoom.is_some()) == false`, i.e. the cluster is
-    //    absent. The regression this catches is a console handed the buttons of a window again — the
-    //    exact direction Peter called a mistake ("the console output is plumbing ... a facade").
-    //  * `furn_packed` — with no cluster, the honest claim is that there is no disc to place, so this
-    //    reduces to `furn_slot0.is_none()` (the `else` arm below). The left-pack geometry it used to
-    //    assert only exists where there IS a cluster; the leg tracks the gate, not one arch's answer.
-    let furn_none = control_disc_rect(wf, Ctrl::Close).is_none();
+    //  * `furn_close` — it HAS a close disc. `ctrls_for` returns the full [`CTRLS`] list for every
+    //    row since Peter's *"3 normal buttons ... i said normal app"* ruling, so `control_disc`
+    //    answers `Some`. This is the leg that was inverted by this arc, and it is the one an
+    //    accidental re-narrowing reds first.
+    //  * `furn_ctrls` — a minimise AND a zoom disc too. Asserted against [`FURNITURE_HAS_CONTROLS`]
+    //    (now `true`): `(furn_min.is_some() && furn_zoom.is_some()) == true`. The regression this
+    //    catches is a console quietly losing a button again.
+    //  * `furn_packed` — the cluster is LEFT-PACKED at the row's own anchor: slot 0 of the furniture
+    //    row's cluster sits at the same offset from its outer box as slot 0 of an app row's. Both
+    //    slot 0s are the CLOSE disc now, which is the strongest form of the claim — the two rows are
+    //    compared on the identical control rather than on whatever each happens to have first.
+    let furn_close = control_disc_rect(wf, Ctrl::Close).is_some();
     let (furn_min, furn_zoom) = (
         control_disc_rect(wf, Ctrl::Minimise),
         control_disc_rect(wf, Ctrl::Zoom),
     );
-    // FACADE — asserted against [`FURNITURE_HAS_CONTROLS`], the gate itself, so this leg makes the
+    // NORMALWIN — asserted against [`FURNITURE_HAS_CONTROLS`], the gate itself, so this leg makes the
     // same claim on every arch: *furniture has EXACTLY the cluster this build promises*, which is now
-    // "none" unconditionally. A future arc that handed a kernel row any disc (restoring the CONSOLEWIN
-    // cluster) flips this leg red unless it also flips the const — and flipping the const is the
-    // deliberate, reviewed act of making the console a window again. `both` rather than `either`: a
-    // half-built cluster is not a state `ctrls_for` can produce, so it must not be one this leg accepts.
+    // "all three" unconditionally. A future arc that took a disc off a kernel row flips this leg red
+    // unless it also flips the const — and flipping the const is the deliberate, reviewed act of
+    // making the console something other than a normal app window again. `both` rather than `either`:
+    // a half-built cluster is not a state `ctrls_for` can produce, so it must not be one this accepts.
     let furn_ctrls =
         (furn_min.is_some() && furn_zoom.is_some()) == FURNITURE_HAS_CONTROLS
             && furn_min.is_some() == furn_zoom.is_some();
-    // Slot 0 of `ww`'s cluster is its close disc; slot 0 of `wf`'s is its minimise disc. Compare the
-    // offset from each row's own outer box, so the two rows' PLACEMENT on the panel is irrelevant.
+    // Slot 0 of both rows' clusters is the CLOSE disc. Compare the offset from each row's own outer
+    // box, so the two rows' PLACEMENT on the panel is irrelevant.
     let slot0_off = |id: WinId, c: Ctrl| {
         match (control_disc_rect(id, c), info_box(id)) {
             (Some((cx, _, _)), Some(b)) => Some(cx.saturating_sub(b.0)),
@@ -16286,10 +16284,10 @@ pub fn ctrldecline_selftest() {
     // Captured, not re-derived at print time: leg 6 below REAPS `wf`, so a `slot0_off(wf, ..)` in
     // the verdict line would read `None` off a row that no longer exists and report the leg's own
     // teardown as its measurement.
-    let furn_slot0 = slot0_off(wf, Ctrl::Minimise);
-    // The left-pack claim only exists where there IS a cluster; on a no-dock build the honest
-    // assertion is that there is no disc to place. Same shape as `furn_ctrls`: the leg tracks the
-    // gate rather than one arch's answer.
+    let furn_slot0 = slot0_off(wf, Ctrl::Close);
+    // The left-pack claim only exists where there IS a cluster. Same shape as `furn_ctrls`: the leg
+    // tracks the gate rather than one arch's answer, so a future arc that flips the const back to a
+    // no-cluster law gets the honest "there is no disc to place" assertion without editing this.
     let furn_packed = if FURNITURE_HAS_CONTROLS {
         furn_slot0.is_some() && furn_slot0 == slot0_off(ww, Ctrl::Close)
     } else {
@@ -16313,7 +16311,7 @@ pub fn ctrldecline_selftest() {
         && fired == 1
         && after_rl == 1
         && at_some
-        && furn_none
+        && furn_close
         && furn_ctrls
         && furn_packed
         && quiet
@@ -16325,7 +16323,7 @@ pub fn ctrldecline_selftest() {
         // reads the same on an arch with a dock and one without, and one spec rule pins both.
         // `dockbuild=` says WHICH contract was in force, so a reader can tell a no-dock build's
         // `minzoom=true` (correctly no cluster) from x86's (minimise and zoom both present).
-        ":: WMCTRL: controls-declined — floor={} under bw={} none={} fired={} rl={} atfloor bw={} some={} furniture noclose={} minzoom={} packed={}/{:?} dockbuild={} silent={} reaped={} :: {} ::",
+        ":: WMCTRL: controls-declined — floor={} under bw={} none={} fired={} rl={} atfloor bw={} some={} furniture close={} minzoom={} packed={}/{:?} dockbuild={} silent={} reaped={} :: {} ::",
         CLUSTER_MIN_BOX_W,
         UNDER_W + 2 * BORDER,
         under_none,
@@ -16333,7 +16331,7 @@ pub fn ctrldecline_selftest() {
         after_rl,
         AT_W + 2 * BORDER,
         at_some,
-        furn_none,
+        furn_close,
         furn_ctrls,
         furn_packed,
         furn_slot0,

@@ -1929,6 +1929,39 @@ pub fn panel_console_window_open() -> wm::WinId {
     id
 }
 
+/// NORMALWIN — **the console window was CLOSED by the operator: stop routing presents at it.**
+///
+/// Peter's 2026-08-11 ruling makes the console window a normal app window with all three normal
+/// buttons, so the close disc is live and this is the console side of it. Called from x86's
+/// `wc_close_furniture` BEFORE `wm::close(id)` frees the row, so no present can be aimed at a slot
+/// that is mid-free.
+///
+/// ### What is dropped, and what deliberately is NOT
+/// Only [`CONSOLE_WIN`] is cleared, which is the single test every `route_present*` path takes
+/// first — after this they all return without touching `wm`. The glyph ROUTE stays installed:
+/// `c.win_fb` / `c.win_store` are left alone on purpose, so console text keeps landing in the
+/// cached-RAM surface. Tearing the route down instead would make [`FbCon::draw_fb`] fall back to the
+/// PANEL handle, and the panel belongs to the compositor — every subsequent console line would paint
+/// over the desktop. Writing into an unwatched store is the harmless direction of that choice; the
+/// text is on serial and in `TERM_RING` regardless, which is where the boot log actually lives.
+///
+/// The surface allocation therefore outlives the window, which is also what keeps this free of a
+/// use-after-free: `wm::close` explicitly does not touch the surface, and `store` is owned by
+/// `FbCon`, not by the table row.
+///
+/// Idempotent and id-checked: returns `true` only if `id` was in fact the routed console window, so
+/// a stale or foreign id cannot silently unroute the live console. The panic path clears the same
+/// cell independently ([`panic_screen`]) and is unaffected either way.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn panel_console_window_closed(id: wm::WinId) -> bool {
+    if id == wm::WIN_NONE {
+        return false;
+    }
+    CONSOLE_WIN
+        .compare_exchange(id, wm::WIN_NONE, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+}
+
 /// Repaint the screen as a panic backdrop (dark red) and home the cursor, so the panic message
 /// that follows is unmissable on hardware. Best-effort: `try_lock` to avoid hanging if the lock
 /// was held when the panic fired. Re-enables the serial mirror first (the GUI may have detached

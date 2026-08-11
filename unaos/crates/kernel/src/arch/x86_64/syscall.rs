@@ -5682,6 +5682,61 @@ fn wc_close_click(owner: u64) -> &'static str {
     bg_kill(pid, owner)
 }
 
+/// NORMALWIN — **the close disc on KERNEL FURNITURE: reap that ONE row, and nothing else.**
+///
+/// Peter's 2026-08-11 ruling (*"go back in git history when it still had the 3 normal buttons ... i
+/// said normal app"*) gives the console window an ordinary app window's chrome, which means an
+/// ordinary app window's CLOSE. This is the action behind that disc, and it is deliberately a
+/// different call from [`wc_close_click`]'s.
+///
+/// ### Why not `wc_close_click`
+/// Its first move is `wm::close_owner`, the blast-radius primitive: it removes every row an ASID
+/// holds, it is reached from process teardown as well as from this router, and it REFUSES the
+/// reserved kernel band by design (CLOSEISO, Boot AR: *"closing stat should not also close
+/// console!"*). Widening that refusal to make the disc work would trade a real structural guard for
+/// a gesture, and the guard is the one that keeps the operator's machine. `wm::close(id)` is the
+/// id-scoped twin with no refusal at all: it names exactly the row that was pressed, which is
+/// precisely the semantics of "close this window".
+///
+/// ### The two non-window effects, and why each is right
+///  * **Nothing is killed.** A kernel-band owner resolves to no process by arithmetic (user owners
+///    are `slot + 1` biased), so `wc_close_click`'s pid walk would fall out at `"noproc"` anyway.
+///    The settle token says so directly instead of arriving there through a search.
+///  * **The console's ROUTE is dropped** ([`crate::video::fbcon::panel_console_window_closed`]).
+///    `fbcon` presents into this row; leaving `CONSOLE_WIN` pointing at a freed table slot would
+///    have every subsequent console line ask the compositor to present a window that is gone. The
+///    surface itself is NOT freed and the glyph route is NOT torn down — text keeps landing in the
+///    cached-RAM store, which is what keeps `draw_fb` off the PANEL front buffer (a torn-down route
+///    falls back to the panel handle and would paint console text over the desktop). The raw
+///    plumbing is untouched by construction: serial, `TERM_RING` and the panic path
+///    (`panic_screen` clears `CONSOLE_WIN` itself and paints the panel) never went through the row.
+///
+/// Returns the settle token for the `[wm-act]` line. `"closed"` when the row went, `"norow"` when it
+/// did not — which a second press on a stale id would produce and which must not read as success.
+#[cfg(feature = "wc")]
+fn wc_close_furniture(win: crate::video::wm::WinId, owner: u64) -> &'static str {
+    // The route FIRST: `wm::close` composites before it returns, and a present routed at a row that
+    // is mid-free is the one ordering this function can get wrong.
+    let route = crate::video::fbcon::panel_console_window_closed(win);
+    let gone = crate::video::wm::close(win);
+    // The keyboard never belonged to a kernel row (`user_input_set_active` refuses the band), so
+    // there is no grant to revoke. `focus_changed(0)` is still owed if this row held the wm's focus:
+    // the shell is where furniture's focus goes on every other gesture in this router.
+    if crate::video::wm::focus_asid() == owner {
+        crate::video::wm::focus_changed(0);
+    }
+    #[cfg(feature = "witness")]
+    CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NOPROC_X86, Ordering::Release);
+    if CLOSE_LOG_COUNT_X86.load(Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
+        serial_println!(
+            "[wm-act] close-furniture win={} owner={:#x} closed={} route-dropped={} \
+             (id-scoped: close_owner is not involved)",
+            win, owner, gone, route
+        );
+    }
+    if gone { "closed" } else { "norow" }
+}
+
 /// WMDIRECT — the code of the most recent close-box settle. Witness-only; racy against a concurrent
 /// operator click, which no witness leg runs under.
 #[cfg(feature = "witness")]
@@ -5691,6 +5746,11 @@ pub fn wc_close_last_settle() -> u32 {
 
 #[cfg(not(feature = "wc"))]
 fn wc_close_click(_owner: u64) -> &'static str {
+    "nowc"
+}
+
+#[cfg(not(feature = "wc"))]
+fn wc_close_furniture(_win: crate::video::wm::WinId, _owner: u64) -> &'static str {
     "nowc"
 }
 
@@ -6321,8 +6381,8 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         //
         // Placed AHEAD of the kernel-furniture and focus-exempt arms deliberately: the console's
         // title bar is furniture too, and dragging it must work whether or not the row is a focus
-        // target. `close_box` already declines owner-0 rows, so the console has no close control to
-        // reach and the shell cannot be killed by a click.
+        // target. `wm::controls` still declines owner-0 rows, so the SHELL has no cluster and cannot
+        // be killed by a click; the console (a kernel-band owner) does have one — see the close arm.
         if let Some((win, owner, _z)) = crate::video::wm::hit_test(x, y) {
             // WMCTRL — **ONE question for the whole control cluster.** `control_hit` names WHICH of
             // the three discs the press landed on, from the same `control_disc` accessor the painter
@@ -6340,7 +6400,21 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                     // CLOSE — the press is CONSUMED (target DROP, so the release is dropped with
                     // it): the owner it would have been delivered to is being torn down.
                     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
-                    let settle = wc_close_click(owner);
+                    // NORMALWIN — **kernel furniture closes by ID, not by owner.** Peter's ruling
+                    // (2026-08-11) gives the console window all three normal buttons, so this arm is
+                    // now reachable for `KERNEL_OWNER_CONSOLE` and the press has to act. It does NOT
+                    // act through `wc_close_click`: that call's first move is `wm::close_owner`, the
+                    // blast-radius primitive that reaps every row an ASID holds and is also what
+                    // process teardown calls — it refuses the kernel band by design (CLOSEISO) and
+                    // that refusal stays. `wm::close(win)` reaps EXACTLY the row the operator
+                    // pressed, which is what "close this window" means and is all a furniture close
+                    // is entitled to. There is no process behind a kernel row, so there is nothing
+                    // to kill and no focus grant to hand back through an ASID that never held one.
+                    let settle = if crate::video::wm::is_kernel_owner(owner) {
+                        wc_close_furniture(win, owner)
+                    } else {
+                        wc_close_click(owner)
+                    };
                     if CLOSE_LOG_COUNT_X86.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
                         serial_println!(
                             "[wm-act] close win={} owner={:#x} at ({},{}) -> settle={}",
