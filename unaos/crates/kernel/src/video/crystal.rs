@@ -271,6 +271,31 @@ fn menu_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     Some((mx, my, MENU_W, MENU_H))
 }
 
+/// MENUFIT — **the dropdown's LIVE extent: its rect while the menu is open, `None` while it is not.**
+///
+/// The one accessor every other writer asks "where is the SHARD menu". The dropdown is a TRANSIENT
+/// surface and deliberately not a [`strip::TENANTS`] member (it takes no occlusion slot), so
+/// `strip::rects` does not report it and the desktop layer's whole-panel writes — `console::draw`
+/// opens every repaint with a `clear_screen` — flushed the shell's background straight over an open
+/// menu. `Screen::present_background` now subtracts this rect alongside the strips, which closes it.
+///
+/// Published from [`menu_rect`], the same function [`compose`] paints from and [`press_at`] hit-tests
+/// against, for the reason the SHELLDESK review gave when it recorded this defect: re-deriving the
+/// menu's geometry in `screen.rs` is precisely the drift the registry exists to prevent, so the fix
+/// is an accessor here, not a second copy there.
+///
+/// `None` while closed, so a boot that never opens the menu pays one relaxed load per desktop
+/// present and computes no geometry at all. It reports the rect from the instant [`open`] flips
+/// `OPEN`, which can be one composite before [`compose`] has PAINTED those pixels — the same bounded
+/// residual the strips carry, and bounded the same way: the desktop withholds rows the menu is about
+/// to own rather than rows it has stopped owning, and `compose` runs on the next composite.
+pub fn open_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
+    if !OPEN.load(Ordering::Relaxed) {
+        return None;
+    }
+    menu_rect(pw, ph)
+}
+
 /// The top of row `idx` as an offset from the menu's top edge, in px — border plus every earlier row.
 fn row_top(idx: usize) -> usize {
     let mut y = BORDER;

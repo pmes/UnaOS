@@ -1196,13 +1196,23 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
                 // to the minimum when the window is wider/taller than the panel.
                 let cw = r.w.saturating_mul(r.scale);
                 let ch = r.h.saturating_mul(r.scale);
+                //
+                // MENUFIT — the LOWER bound carries the top reservation and the upper bound does
+                // not carry the bottom one, and the asymmetry is the point. Dragging a window down
+                // over the instrument band leaves its title bar — and therefore the grip that drags
+                // it back — fully reachable, so that is the operator's business and PULSE-2
+                // deliberately governs only where the TILER puts a window. Dragging one UP under the
+                // bar is not the mirror of that: `wc_click_route_at` judges `crystal::press_at`
+                // ahead of every window arm, so the occluded title bar stops answering presses and
+                // the window can never be dragged out again. A clamp that can strand a window is a
+                // focus trap, so this bound refuses to create one. `max_y` takes the same floor
+                // because `clamp` PANICS when `min > max` and a small enough panel could otherwise
+                // invert the two.
+                let min_y = work_top(info.width, info.height) + TITLE_H + BORDER;
                 let max_x = info.width.saturating_sub(cw + BORDER).max(BORDER);
-                let max_y = info
-                    .height
-                    .saturating_sub(ch + BORDER)
-                    .max(TITLE_H + BORDER);
+                let max_y = info.height.saturating_sub(ch + BORDER).max(min_y);
                 r.x = x.clamp(BORDER, max_x);
-                r.y = y.clamp(TITLE_H + BORDER, max_y);
+                r.y = y.clamp(min_y, max_y);
                 r.pinned = true;
                 r.damage_all();
                 let after = outer_box(r);
@@ -9992,10 +10002,16 @@ fn zoom_scale(pw: usize, usable_h: usize, ph: usize, w: usize, h: usize) -> usiz
 /// Returns the outcome token the router prints on its `[wm-act]` line.
 ///
 /// ### The work area, and what a zoom is allowed to change
-/// The work area is the panel minus `ui_status::chrome_h` — the CPU pulse band and the status line —
-/// which is exactly the budget [`place`] already lays out against, read here rather than re-derived
-/// into a second copy. There is no top/left/right reservation on this system, so the rest of the
-/// panel is fair game.
+/// The work area is the panel minus the two vertical reservations — `ui_status::chrome_h` below (the
+/// CPU pulse band and the status line) and MENUFIT's [`work_top`] above (the desktop scene's
+/// furniture, i.e. the menu bar) — which is exactly the budget [`place`] lays out against, read here
+/// through the same two accessors rather than re-derived into a second copy. There is no left/right
+/// reservation on this system, so the full panel width is fair game.
+///
+/// MENUFIT — a maximised window is the case that made the top reservation urgent rather than merely
+/// correct: zoom pins the row, so a zoomed window whose title bar landed under the bar could not be
+/// dragged out from under it either, and the zoom disc that would restore it was itself one of the
+/// occluded pixels.
 ///
 /// A zoom changes only `scale`, `x` and `y`. It does NOT touch `w`/`h`/`stride`/`surf_len`: those
 /// describe the app's own surface, the app allocated them, and the kernel resizing them under a
@@ -10027,9 +10043,9 @@ pub fn zoom(id: WinId) -> &'static str {
     }
     let info = fb.info();
     let (pw, ph) = (info.width, info.height);
-    let usable_h = ph
-        .saturating_sub(crate::ui_status::chrome_h(ph))
-        .max(1);
+    // MENUFIT — `place`'s work area, read through `place`'s own two accessors.
+    let wtop = work_top(pw, ph);
+    let usable_h = work_h(pw, ph);
 
     let mut t = table();
     let (vacated, outcome) = match row_mut(&mut t, id) {
@@ -10058,10 +10074,14 @@ pub fn zoom(id: WinId) -> &'static str {
                     // Centre the OUTER box in the work area, then step in to the content origin —
                     // the coordinate the row actually stores. `saturating_sub` handles a surface
                     // whose chrome-inclusive box is larger than the work area (possible only when
-                    // `zoom_scale` already floored to 1): it pins to the top-left, which is where
-                    // `move_to`'s clamp would put it anyway.
+                    // `zoom_scale` already floored to 1): it pins to the work area's top-left, which
+                    // is where `move_to`'s clamp would put it anyway.
+                    //
+                    // MENUFIT — "the work area's top-left", not the panel's: the centring offset is
+                    // taken inside the work area and then translated down by `wtop`. At `wtop == 0`
+                    // this is the pre-MENUFIT expression unchanged.
                     r.x = pw.saturating_sub(ow) / 2 + BORDER;
-                    r.y = usable_h.saturating_sub(oh) / 2 + TITLE_H + BORDER;
+                    r.y = wtop + usable_h.saturating_sub(oh) / 2 + TITLE_H + BORDER;
                     // The tiler must leave it alone, exactly as an explicit `move_to` pins it.
                     r.pinned = true;
                     "zoomed"
@@ -15675,16 +15695,12 @@ fn create_inner(
         // overflow checks, so an unclamped origin would wrap in the geometry arithmetic).
         let cw = w.saturating_mul(scale);
         let ch = h.saturating_mul(scale);
+        // MENUFIT — and the same top bound, for the same reason: a `create_at` that lands a pinned
+        // row under the menu bar strands it exactly as a `move_to` would. See `move_to_inner`.
+        let min_y = work_top(info.width, info.height) + TITLE_H + BORDER;
         let max_x = info.width.saturating_sub(cw + BORDER).max(BORDER);
-        let max_y = info
-            .height
-            .saturating_sub(ch + BORDER)
-            .max(TITLE_H + BORDER);
-        Some((
-            x.clamp(BORDER, max_x),
-            y.clamp(TITLE_H + BORDER, max_y),
-            scale,
-        ))
+        let max_y = info.height.saturating_sub(ch + BORDER).max(min_y);
+        Some((x.clamp(BORDER, max_x), y.clamp(min_y, max_y), scale))
     });
     let mut t = table();
     let slot = match t.rows.iter().position(|r| !r.used) {
@@ -15906,6 +15922,40 @@ fn legibility_cap(ph: usize) -> usize {
         .max(1)
 }
 
+/// MENUFIT — **the WORK AREA's top edge**: the first panel row the window layer may lay out on.
+///
+/// This is `ui_status::top_chrome_h` and nothing else — the SHELLDESK accessor that reads the menu
+/// bar's own `strip_rect`, so the tiler learns where the furniture ends from the furniture, exactly
+/// as [`work_h`] learns the bottom from `ui_status::chrome_h`. No second copy of the arithmetic, and
+/// no rect re-derived here: the one-accessor law that keeps the desktop present, the erase clip and
+/// the window blit from drifting applies to the LAYOUT too.
+///
+/// `0` on aarch64 and on every x86 build without `wc` (`video::menubar` is not compiled there), and
+/// `0` at runtime whenever the shell has not enabled a bar or the bar declines the panel. Every
+/// caller below adds it as a plain offset, so a `0` answer leaves the layout it had before this
+/// existed — byte for byte, not merely pixel for pixel.
+fn work_top(pw: usize, ph: usize) -> usize {
+    crate::ui_status::top_chrome_h(pw, ph)
+}
+
+/// MENUFIT — **the work area's HEIGHT**: the panel less the furniture above it ([`work_top`]) and
+/// less the instrument chrome below it (`ui_status::chrome_h`, PULSE-2's reservation).
+///
+/// PULSE-2 gave the tiler a bottom reservation and the SHELLDESK review recorded the twin it was
+/// missing: with the bar enabled by default, `place`'s first row began at `y = GAP` = 12 while the
+/// bar owned rows 0..34, so ~22 rows of every first-row title bar — the close, minimise and zoom
+/// discs among them — sat under the strip. `occ_clip` withheld those pixels correctly and
+/// `wc_click_route_at` judges `crystal::press_at` ahead of every window arm, so the discs were
+/// neither visible nor clickable. The budget and the origin both move by this function's terms, which
+/// is what makes the window unreachable-by-construction case impossible rather than merely unlikely.
+///
+/// Never `0`: the callers divide by it.
+fn work_h(pw: usize, ph: usize) -> usize {
+    ph.saturating_sub(work_top(pw, ph))
+        .saturating_sub(crate::ui_status::chrome_h(ph))
+        .max(1)
+}
+
 /// Lay out every non-compat, non-pinned window: pick each one's integer scale, then pack the outer
 /// boxes left-to-right in id order, wrapping to a new row when the next box would run off the panel.
 /// Called whenever the window set changes, so the tiling stays deterministic (it depends only on the
@@ -15926,7 +15976,7 @@ fn legibility_cap(ph: usize) -> usize {
 /// midden's 24x16 readout goes 4x -> 7x (`ceil(148/24)`, box 168 px). Everything already wide enough
 /// is untouched — the 64x64 window stays 3x on the gate panel and 4x on the bench.
 fn place_scale(pw: usize, ph: usize, w: usize, h: usize) -> usize {
-    let usable_h = ph.saturating_sub(crate::ui_status::chrome_h(ph)).max(1);
+    let usable_h = work_h(pw, ph);
     (pw / 2 / w.max(1))
         .min(usable_h / 2 / h.max(1))
         .min(legibility_cap(ph))
@@ -16028,13 +16078,40 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
     //
     // Note the scale rule reads `usable_h` but `legibility_cap` still reads `ph` — the cap is a
     // function of panel DENSITY (how big a font pixel wants to be), not of the layout area.
-    let usable_h = ph
-        .saturating_sub(crate::ui_status::chrome_h(ph))
-        .max(1);
+    //
+    // MENUFIT — and the budget now has a TOP as well as a bottom. [`work_h`] is `ph` less BOTH
+    // reservations and `wtop` is where the work area starts; everything below adds `wtop` as a plain
+    // offset, so on a panel with no furniture above the window layer (`wtop == 0`) every expression
+    // here is the pre-MENUFIT expression unchanged.
+    let wtop = work_top(pw, ph);
+    let usable_h = work_h(pw, ph);
+
+    // MENUFIT witness. Fires only when the layout actually moved — `wtop != 0` is reachable on x86
+    // with `wc` and a bar the shell enabled, and nowhere else — and only when the reservation
+    // CHANGES, so a boot that creates and closes windows all day prints this once per distinct
+    // geometry rather than once per lifecycle event. The next boot must show `top=` equal to the
+    // bar's `y + h` and `cy0` at least that far down.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        static LAST_TOP: AtomicUsize = AtomicUsize::new(usize::MAX);
+        if wtop != 0 && LAST_TOP.swap(wtop, Relaxed) != wtop {
+            serial_println!(
+                "[wm] tile-top top={} usable_h={} cy0={} panel={}x{}",
+                wtop,
+                usable_h,
+                wtop + GAP + TITLE_H + BORDER,
+                pw,
+                ph
+            );
+        }
+    }
 
     let mut t = table();
     let mut cx = GAP;
-    let mut cy = GAP + TITLE_H + BORDER;
+    // MENUFIT — the first row's CONTENT origin starts one full chrome below the work area's top, so
+    // its OUTER box begins at `wtop + GAP`: a whole title bar, discs included, below the strip.
+    let mut cy = wtop + GAP + TITLE_H + BORDER;
     let mut row_h = 0usize;
     for i in 0..MAX_WINDOWS {
         let r = &t.rows[i];
@@ -16067,7 +16144,12 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         // the window is pulled back up so its box ends at the reservation. Two windows overlapping
         // each other is a legibility problem the operator can fix by closing one; a window over the
         // instrument panel silently breaks the one surface that is supposed to be always readable.
-        r.y = cy.min(usable_h.saturating_sub(bh));
+        //
+        // MENUFIT — the bound is the same bound, translated into the work area: `usable_h` is now the
+        // work area's HEIGHT rather than its bottom coordinate, so the bottom coordinate is
+        // `wtop + usable_h` and the clamp is written as `wtop + (usable_h - bh)`. At `wtop == 0` that
+        // reduces to the pre-MENUFIT expression character for character, degenerate case included.
+        r.y = cy.min(wtop.saturating_add(usable_h.saturating_sub(bh)));
         r.damage_all();
         if outer_box(r) != before && before.2 != 0 && before.3 != 0 {
             vacated[nv] = before;

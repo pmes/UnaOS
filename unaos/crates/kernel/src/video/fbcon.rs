@@ -1762,9 +1762,11 @@ const WIN_BOX_BUDGET_PX: usize = 4 * 1024 * 1024 / 4;
 /// CONSOLE-WINDOW — pick the console window's CONTENT extent for a `pw x ph` panel.
 ///
 /// Generous first, budgeted second, aligned last:
-///  1. start at 7/8 of the panel in each axis, less the bottom chrome `ui_status` owns (the tiler's
-///     PULSE-2 reservation does not apply to a pinned window, so the reservation is honoured here or
-///     not at all);
+///  1. start at 7/8 of the panel in each axis, less BOTH chromes `ui_status` owns — the bottom
+///     instrument band (PULSE-2) and, MENUFIT, the top furniture band (SHELLDESK's
+///     `top_chrome_h`). The tiler's reservations do not apply to a pinned window, so they are
+///     honoured here or not at all, and after SHELLDESK enabled the menu bar by default the top one
+///     was not: the frozen boot-log window's first rows composited under the bar;
 ///  2. shrink both axes together — aspect preserved, 15/16 at a time so no float is needed — until
 ///     the OUTER box fits [`WIN_BOX_BUDGET_PX`];
 ///  3. round down to whole glyph cells, so the console's grid tiles its surface exactly and no
@@ -1776,7 +1778,11 @@ const WIN_BOX_BUDGET_PX: usize = 4 * 1024 * 1024 / 4;
 /// generous default actually means once the present path is priced.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn win_content_extent(pw: usize, ph: usize, cell_w: usize, cell_h: usize) -> (usize, usize) {
-    let avail_h = ph.saturating_sub(crate::ui_status::chrome_h(ph)).max(1);
+    // MENUFIT — the work area's HEIGHT: panel less the top furniture, less the bottom instrument.
+    let avail_h = ph
+        .saturating_sub(crate::ui_status::top_chrome_h(pw, ph))
+        .saturating_sub(crate::ui_status::chrome_h(ph))
+        .max(1);
     let mut w = (pw * 7 / 8).max(cell_w);
     let mut h = (avail_h * 7 / 8).max(cell_h);
     // Outer box = content + chrome. Budget the box, not the content: the box is what gets staged.
@@ -1880,8 +1886,17 @@ pub fn panel_console_window_open() -> wm::WinId {
             return wm::WIN_NONE;
         }
     };
+    // MENUFIT — centred in the WORK AREA, not on the panel: the same two reservations
+    // `win_content_extent` sized against, translated so the offset is taken below the top furniture.
+    // At `top_chrome_h == 0` (aarch64, every x86 build without `wc`, and any boot whose shell has not
+    // enabled a bar) this is the pre-MENUFIT expression unchanged.
+    let wtop = crate::ui_status::top_chrome_h(pw, ph);
     let ox = pw.saturating_sub(ow) / 2;
-    let oy = ph.saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
+    let oy = wtop
+        + ph.saturating_sub(wtop)
+            .saturating_sub(crate::ui_status::chrome_h(ph))
+            .saturating_sub(oh)
+            / 2;
     // CLICK-X86 — owner [`wm::KERNEL_OWNER_CONSOLE`]: the console still belongs to the KERNEL, and
     // both properties owner 0 was chosen for hold unchanged — it is out of `focus_ring` (which skips
     // the reserved band) and out of `close_owner`'s reach (which refuses it). What changes is the

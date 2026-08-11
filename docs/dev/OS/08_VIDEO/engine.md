@@ -2095,6 +2095,158 @@ three latent conditions live on every operator boot; all three need files this a
    centring math (`ph - chrome_h(ph)`) is unaware of the top strip, so the frozen boot-log window's
    first rows are now composited under the bar.
 
+#### MENUFIT — the three SHELLDESK residuals, closed (2026-08-11)
+
+The three findings above, in the files SHELLDESK could not touch. All three are the same shape: a
+writer that knew about the panel's edges but not about the reservation the desktop scene had just
+taken from them, and in all three the fix is **read the extent from the owner's accessor and offset
+by it** — never re-derive the geometry at the consumer.
+
+**1. The tiler has a TOP reservation.** `wm` gains the twin of PULSE-2's budget as two functions:
+`work_top(pw, ph)` (= `ui_status::top_chrome_h`, itself `menubar::strip_rect`'s `y + h`) and
+`work_h(pw, ph)` (= `ph` less BOTH reservations). Five sites read them:
+
+| site | before | after |
+| --- | --- | --- |
+| `place_scale` | `ph - chrome_h` | `work_h` |
+| `place`'s origin | `cy = GAP + TITLE_H + BORDER` | `cy = work_top + GAP + TITLE_H + BORDER` |
+| `place`'s stack clamp | `cy.min(usable_h - bh)` | `cy.min(work_top + (work_h - bh))` |
+| `zoom`'s centring | `usable_h.saturating_sub(oh)/2 + …` | `work_top + work_h.saturating_sub(oh)/2 + …` |
+| `move_to_inner` / `create_inner` clamps | `y.clamp(TITLE_H + BORDER, max_y)` | `y.clamp(work_top + TITLE_H + BORDER, max_y)` |
+
+`usable_h` changes meaning from *the work area's bottom COORDINATE* to *the work area's HEIGHT*,
+which is why the clamp is rewritten as `work_top + (work_h - bh)` rather than `work_h - bh`. Every
+one of the five is a plain `+ work_top`, so at `work_top == 0` — all of aarch64, every x86 build
+without `wc`, and any boot whose shell has not enabled a bar — each expression reduces to the
+pre-MENUFIT expression character for character, degenerate saturating cases included. That is the
+property the aarch64 measurement below tests rather than asserts.
+
+**The clamp pair is deliberately ASYMMETRIC**, and the reason is a focus trap rather than tidiness.
+`move_to`'s upper bound still ignores the bottom chrome: a window dragged down over the instrument
+band keeps its title bar — and therefore the grip that drags it back — fully reachable, so where the
+OPERATOR puts a window is the operator's business and PULSE-2 governs only where the TILER puts one.
+Up is not the mirror of that. `wc_click_route_at` judges `crystal::press_at` ahead of every window
+arm, so a title bar under the bar stops answering presses entirely and the window can never be
+dragged out again. A clamp that can strand a window is a bug of a different class from a clamp that
+allows an ugly one, so the lower bound refuses to create one. (`max_y` takes the same floor as its
+`min`, because `clamp` PANICS when `min > max` and a small enough panel could otherwise invert them.)
+
+**The witness is `[wm] tile-top`**, emitted from `place` under `x86_64 + wc` when the reservation is
+non-zero AND has changed since the last emission — so a boot that opens and closes windows all day
+prints one line per distinct geometry, not one per lifecycle event. It carries `top=`, `usable_h=`,
+`cy0=` and `panel=`, which is enough to falsify the fix from a capture alone: `top` must equal the
+bar's own `y + h` and `cy0` must be at least `top + GAP + TITLE_H + BORDER`.
+
+**2. The crystal dropdown is subtracted by the desktop present.** `crystal::open_rect(pw, ph)` is
+the new public accessor — `menu_rect` when `OPEN`, `None` otherwise — and `Screen::present_background`
+appends it to the occluder set immediately after the `strip::rects` tail. It is NOT re-derived in
+`screen.rs`: the SHELLDESK review named that re-derivation as exactly the drift the registry exists
+to prevent, and the accessor is the same function `compose` paints from and `press_at` hit-tests
+against, so the three cannot disagree about where the menu is. `DESK_STRIP_MAX` becomes
+`strip::STRIP_MAX + 1` on x86-with-`wc`, the `+ 1` stated at the array that has to hold it rather
+than bought by promoting the menu to a `strip::TENANTS` member — a tenancy would spend a permanent
+occlusion slot on a surface that is absent for all but a few seconds of a boot. aarch64 is `0`
+either way and its `DESK_OCC_MAX` is unchanged.
+
+The residual is the strips' residual, and bounded the same way: the rect is reported from the instant
+`open` flips `OPEN`, which can be one composite before `compose` has painted those pixels. The
+desktop therefore withholds rows the menu is about to own — never rows it has stopped owning, which
+is the direction that would leave stale pixels — and `crystal::compose`'s dismissal `erase_rect` is
+what returns them.
+
+**3. `fbcon` reserves the top too.** `win_content_extent`'s `avail_h` subtracts both chromes, and the
+console window's `oy` centres inside the work area (`wtop + (ph - wtop - chrome_h - oh)/2`) instead
+of on the panel. Same `+ wtop` shape, same reduction at zero.
+
+##### What was NOT taken: the crystal as an `occ_clip` citizen
+
+The GR25 baton's cosmetic clip-citizen issue — a window compositing over an open menu — is **left
+open, deliberately**, because the accessor does not feed `occ_clip` cleanly and the brief's own
+condition ("if that widens the arc, note it and leave it") is met twice over:
+
+* **Capacity is const-asserted to the registry.** `wm::FURNITURE_MAX` carries
+  `const _: () = assert!(FURNITURE_MAX == strip::STRIP_MAX)` — STRIPFACTOR's guard that a tenant
+  added to the registry widens `OCC_MAX` by construction. The dropdown is deliberately not a tenant,
+  so admitting it means breaking that relation into "tenants plus transients", which re-sizes the
+  `OCC_MAX`-shaped arrays on the per-window blit hot path and rewrites the capacity prose the WCK5
+  and STRIPFACTOR ledgers rest on.
+* **It needs a dismissal repaint that does not exist.** `strip::erase_rect` paints `DESKTOP_BG` over
+  the vacated rect and damages nothing. The dock never exercises this because it never vacates. A
+  menu whose rows the windows beneath had been WITHHOLDING would, on dismissal, be replaced by
+  desktop background with no window re-damaged to repaint it — a hole in the window instead of a
+  menu, i.e. strictly worse than the cosmetic defect being fixed. Closing it properly needs the
+  `damage_intersecting` + `request_full_present` treatment `wm::reclaim` already gives vacated
+  window boxes, driven from `crystal::dismiss`.
+
+Both are real work in `wm.rs`'s clip capacity and in the crystal's dismissal path; neither belongs
+in a fit-and-reservation arc. Recorded here as the next arc's brief rather than half-done.
+
+##### What the next boot must show
+
+* `[wm] tile-top top=34 usable_h=… cy0=… panel=…` once, with `top` equal to the bar's `y + h` from
+  `[wc-x] menubar ENABLED … rect=`, and `cy0 >= top + 17`.
+* **First-row windows fully below the bar**, with the close/minimise/zoom discs the console-buttons
+  arc restored both visible and CLICKABLE — a press on a first-row window's close disc must reach
+  `[wm-act]` and not `crystal::press_at`. No window's outer box may begin above row 34.
+* **The SHARD menu survives desktop repaints while open**: open it from the crystal and run a command
+  that repaints the shell (any `console::draw`, i.e. any command at all). The dropdown must still be
+  on the glass afterwards, where before it was flushed within a frame by the whole-panel
+  `clear_screen`.
+* The console window's own top edge below the bar rather than under it.
+
+##### Gate results (2026-08-11, no QEMU — metal day)
+
+* `./arroyo check` — **green both arches**, 12 cfg legs (`x86-all`, `arm-pi`, `arm-tegra`,
+  `x86-vsyncpace`, `x86-mix-0..7`) all ✅, userspace x86_64 4/4 and aarch64 5/5, `midden_core` 12/12.
+* `UNAOS_WC=1 ./arroyo check` — same, green.
+* `UNAOS_WITNESS=1 UNAOS_WC=1 ./arroyo check` — same, green.
+* **Witness reachability, not merely compiled.** `UNAOS_WC=1 UNAOS_WITNESS=1 ./arroyo esp-x86`, banner
+  `kernel features: witness,ehcihid,kbdwit,sdhcblk,wc,smolnet`, then
+  `strings -a target/x86_64_esp/kernel.elf | awk '/tile-top/'` → `[wm] tile-top top=`. The format
+  string is in the image and was not folded away.
+
+##### aarch64 artifact identity — MEASURED, and the measurement had a confound to remove first
+
+The SHELLDESK review established that cfg arguments alone are insufficient (its own "byte for byte"
+claim cost aarch64 212 bytes of `.text`), so this arc's claim — that `+ work_top` is a no-op wherever
+`top_chrome_h` is compile-time `0` — is measured the same way: build the aarch64 bare-metal kernel at
+the base and at the arc tip and compare the loadable sections.
+
+Both revisions built with `--target aarch64-base.json --features baremetal,skip_xhci,witness,vugpar`
+(arroyo's `kernel8` recipe, `UNAOS_WITNESS=1 UNAOS_VUGPAR=1`), linked ELF at
+`target/aarch64-base/release/unaos-kernel`.
+
+| section | base `13d18bad` | arc tip | delta | bytes |
+| --- | --- | --- | --- | --- |
+| `.text.boot` | 76 | 76 | 0 | **identical** |
+| `.text` | 1 409 672 | 1 409 672 | 0 | **identical** |
+| `.rodata` | 242 604 | 242 604 | 0 | 75 differ (see below) |
+| `.data` | 37 880 | 37 880 | 0 | **identical** |
+| `.bss` | 7 271 600 | 7 271 600 | 0 | **identical** |
+
+**Not one instruction byte changed.** `.text` is identical by MD5, not merely by size, which is the
+strong form of the claim: every `work_top` term folded to zero and every expression the five call
+sites compile to is the expression that was there before.
+
+**The confound, and why it is not one.** The first pass built the two revisions in two different
+directories and found `.rodata` the same size with 75 bytes different — which could have been
+embedded build paths rather than a code delta, and "probably path noise" is not a measurement.
+Rebuilding the tip source in the BASE directory (patch applied, built, reverted) produced a
+byte-identical ELF to the tip build in its own worktree — the same MD5 — so this kernel's aarch64
+build is path-reproducible and the 75 bytes are genuinely the diff's.
+
+**What the 75 bytes are.** All 75 fall in 68 four-byte words at a 24-byte stride — the layout of
+`core::panic::Location` — every base value is a plausible source line, and the deltas are
+`{+6, +10, +16, +20, +21, +82}`. Those are exactly the arc's per-file line growth: `wm.rs` is
+`+112/-30` = **net +82**, `screen.rs` is `+23/-2` = **net +21**, and the smaller values are panic
+sites sitting BETWEEN two hunks of the same file. The string POINTERS are unchanged (they are eight
+bytes wide and none of them differ) — only the `line` fields moved. So the entire aarch64 delta is
+panic metadata recording where the source now sits, which is source-position bookkeeping and not
+codegen: it would be produced by adding comments alone.
+
+`crystal.rs`'s `+25` lines appear in no delta, which is the expected confirmation that the module is
+`x86_64 + wc` only and is not compiled into this artifact at all.
+
 #### Three smaller defects the same arc closes
 
 * **`create` now composites.** A window's kernel chrome reaches the panel when the row exists, not at the
