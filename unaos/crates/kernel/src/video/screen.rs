@@ -353,6 +353,23 @@ pub fn request_full_present() {
     FULL_PRESENT.store(true, core::sync::atomic::Ordering::Release);
 }
 
+/// SHELLDESK — how many FURNITURE strips the desktop present may have to subtract.
+///
+/// `strip::STRIP_MAX` where the registry exists, `0` where it does not — `video::strip` is compiled
+/// only on x86 with `wc`, so on aarch64 the desktop's occluder array is exactly the WC-I array it has
+/// always been and no arithmetic on this path changes.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+const DESK_STRIP_MAX: usize = super::strip::STRIP_MAX;
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+const DESK_STRIP_MAX: usize = 0;
+
+/// SHELLDESK — the desktop present's occluder capacity: every window box ([`super::wm::occluders`]
+/// fills at most `MAX_WINDOWS`) plus every furniture strip on the glass. Sized for the worst case and
+/// bounded at compile time, so a tenant added to the registry widens this array by construction
+/// rather than silently dropping an occluder — the same guard `wm::OCC_MAX` makes for the window-blit
+/// clip, restated on the desktop side because it is a second array with the same obligation.
+const DESK_OCC_MAX: usize = super::wm::MAX_WINDOWS + DESK_STRIP_MAX;
+
 /// WC-BBSYNC — "unarmed" for [`DESKTOP_BG_SEED`]. Every colour that reaches this path is an
 /// `0x00RRGGBB` triple (the top byte is unused on both the desktop and the compositor side), so
 /// `0xFFFF_FFFF` is outside the range a caller can legitimately pass and needs no second flag.
@@ -877,9 +894,110 @@ impl Screen {
         // this frame is subtracted against the same layout (a window that moves mid-present is
         // repainted by the mover's own composite either way). Empty on a windowless desktop, which is
         // every full-screen VUG frame and every gate boot before the window fixtures run.
-        let mut occ = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
-        let nocc = super::wm::occluders(&mut occ);
+        //
+        // SHELLDESK — **and the FURNITURE STRIPS, for the same reason and by the same rule.**
+        //
+        // WC-I subtracted the window layer because the desktop is beneath it. Furniture (the menu
+        // bar, the dock — `video::strip`'s tenants) is beneath NEITHER: `wm::composite_once` paints
+        // it after every window, and `wm::occ_clip` already withholds a window's own pixels where a
+        // strip stands, so on the window side furniture is a first-class occluder. The desktop side
+        // was the one writer in the system that still ignored it, and that is exactly the metal
+        // symptom this arc exists for: the shell owns the desktop layer and `console::draw` opens
+        // with a WHOLE-PANEL `clear_screen`, so every command the operator ran flushed the shell's
+        // background straight over the bar's 34 rows — and nothing repainted them, because
+        // `strip::compose_all` runs from a COMPOSITE and a desktop present is not one
+        // (`service_damage` returns without compositing when no window row is dirty). The bar was
+        // therefore erased within one frame of appearing, on a boot where every other witness read
+        // healthy. The dock was being erased by the same writes.
+        //
+        // Subtracting is the fix WC-I already argued for, not a new mechanism: the strip's pixels
+        // stop being desktop pixels for any interval, however short, so nothing has to notice the
+        // damage and repaint. A strip that goes ABSENT publishes no rect (`strip_rect` answers
+        // `None` the moment it is disabled), so its rows return to the desktop on the very next
+        // present, and its own dismissal erase (`strip::erase_rect`) is what clears the glass.
+        //
+        // The rect comes from `strip::rects` — the SAME registry walk `wm::erase_clip` and
+        // `wm::occ_clip` read, so the desktop, the erase and the window blit all answer "where is
+        // that strip" from one accessor and cannot drift. It is not free: the dock's hook counts its
+        // tiles through `wm::dock_scan`, i.e. one more bounded `MAX_WINDOWS` scan under the table
+        // lock, on a path that already takes it once for `occluders` — sequentially, never nested,
+        // and at desktop cadence (~20 Hz) against a present that is about to copy megabytes.
+        //
+        // Residual, stated: the geometry answers "the strip owns these rows" from the instant it is
+        // enabled, which can be one composite before the strip has actually PAINTED them, so a
+        // freshly enabled bar withholds its rows from the desktop for that interval. The alternative —
+        // subtracting only what the strip last painted — would have made the desktop and the window
+        // layer disagree about the strip's extent, which is the drift this registry exists to prevent.
+        //
+        // SHELLDESK REVIEW — the interval is bounded because the ENABLER COMPOSITES, and that had to
+        // be made true rather than assumed. The original note here claimed the enable at
+        // `wcx::activate` was "immediately followed by the console window's own `create`, which
+        // composites"; the order is the reverse — `panel_console_window_open` runs ABOVE the enable —
+        // and the row it mints is fbcon's frozen boot-log snapshot, which never damages again. With
+        // `wm::service_damage` declining to composite while no row is dirty, nothing was guaranteed to
+        // paint the withheld rows on a boot with no desktop app and no mouse. `wcx::activate` now
+        // composites at the enable seam, which is the bound this paragraph asserts.
+        //
+        // x86 + `wc` only — `video::strip` is not compiled on aarch64, where this is the WC-I array
+        // and the WC-I loop, byte for byte.
+        let mut occ = [(0usize, 0usize, 0usize, 0usize); DESK_OCC_MAX];
+        // SHELLDESK REVIEW — **and aarch64 REALLY IS the WC-I loop, which took a second arm to make
+        // true.** The single-arm version staged `occluders` into its own `wins` array and
+        // `copy_from_slice`'d it into `occ`, because `occluders` takes `&mut [_; MAX_WINDOWS]` and
+        // `occ` is `DESK_OCC_MAX` wide. On x86 that staging buys the furniture tail its room. On
+        // aarch64 `DESK_STRIP_MAX` is `0`, so `DESK_OCC_MAX == MAX_WINDOWS` and the two arrays are the
+        // SAME TYPE — the copy was pure overhead on a path the arm-pi bench build runs for every
+        // full-screen VUG present, and the doc above promised "the WC-I array and the WC-I loop, byte
+        // for byte". Measured: +212 bytes of aarch64 `.text` against the base, with `.data`/`.bss`
+        // unchanged and `Console::page_rows` identical at 0x78 — i.e. the whole delta was here.
+        // Written as two cfg arms, so the platform with no furniture fills `occ` in place exactly as
+        // it always did and the promise is kept by construction rather than by assertion.
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        let (nocc, nwin) = {
+            // `occluders` writes exactly `MAX_WINDOWS` slots; the furniture tail is appended after.
+            let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
+            let nw = super::wm::occluders(&mut wins);
+            occ[..nw].copy_from_slice(&wins[..nw]);
+            let mut n = nw;
+            let mut strips = [None; super::strip::STRIP_MAX];
+            let _ = super::strip::rects(self.info.width, self.info.height, &mut strips);
+            for s in strips.iter().flatten() {
+                if s.2 != 0 && s.3 != 0 && n < occ.len() {
+                    occ[n] = *s;
+                    n += 1;
+                }
+            }
+            (n, nw)
+        };
+        #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+        let (nocc, nwin) = {
+            // `DESK_OCC_MAX == wm::MAX_WINDOWS` here (no strip registry is compiled), so this is the
+            // WC-I call on the WC-I array, unchanged.
+            let n = super::wm::occluders(&mut occ);
+            (n, n)
+        };
         let occ = &occ[..nocc];
+        // SHELLDESK REVIEW — **the WINDOW PREFIX, and it is a separate slice on purpose.**
+        //
+        // `occ` is now windows-then-furniture, but WC-I's two witness calls below are about the WINDOW
+        // TABLE and nothing else: [`super::wm::occluders_aged`] re-reads `wm::occluders` — windows
+        // only, at most `MAX_WINDOWS` — and declares the snapshot STALE when the two disagree in
+        // length or content. Handed the widened slice it would compare `nwin + nstrips` against
+        // `nwin` and answer "stale" on **every** desktop present of every boot with a strip on the
+        // glass, which after this arc is every operator boot: `[wc-i] rollup … stale=` would saturate
+        // at the present count and the reading its own docs give it ("the layout moved under N
+        // presents") would be false N times out of N. The same slice decides `windowed`, so a
+        // windowless desktop with only a menu bar up would report `windowed_flushes>0` and flip the
+        // verdict from the honest `UNWITNESSED` to a vacuous `CLEAN`.
+        //
+        // Furniture cannot participate in that question even in principle — a strip is not a window
+        // table row, it cannot "enter" under the copy the way a `create` can, and its rect is
+        // published by an accessor the desktop and the clip both read. So the SUBTRACTION takes the
+        // whole set (that is this arc's fix) and the STALENESS PROBE takes the window prefix (that is
+        // WC-I's, unchanged). Two questions, two slices, one array.
+        // Read by the `witness` probes alone; a shipped build computes the slice and drops it.
+        #[cfg_attr(not(feature = "witness"), allow(unused_variables))]
+        let occ_win = &occ[..nwin];
         // VUG-FPS-2 witness: the merged rect count and the union bbox of all damage this frame. The
         // rects array still holds the pre-clear data (clear() only zeroed len), so read [0..n].
         {
@@ -908,7 +1026,9 @@ impl Screen {
         // handled the flush (>= 2 bands); false to fall through to the byte-identical serial path
         // (no free AP, or too little work to amortize the spawn/join).
         //
-        // WC-I: only when the window layer is EMPTY. The band workers copy whole clipped rects and
+        // WC-I: only when the occluder set is EMPTY — no window, and (SHELLDESK) no furniture strip
+        // either, since a strip is subtracted by the same walk and for the same reason. The band
+        // workers copy whole clipped rects and
         // know nothing about occluders; teaching them the subtraction would put the span walk on
         // three cores for no benefit, because the case that needs the subtraction (several windowed
         // apps on the panel) is also the case where the desktop's own damage is small — a status
@@ -972,8 +1092,12 @@ impl Screen {
                             Some((a, b, c, e)) => (a.min(d.x0), b.min(d.y0), c.max(x1), e.max(y1)),
                         });
                     }
-                    let (stale, intruded) = super::wm::occluders_aged(occ, bbox);
-                    super::wm::note_desktop_flush(!occ.is_empty(), stale, intruded);
+                    // SHELLDESK REVIEW — the WINDOW PREFIX. `occ` gates this whole path and must stay
+                    // the full set (the bands subtract nothing, so a furniture strip disqualifies
+                    // them exactly as a window does); the probe is a window-table question. See
+                    // `occ_win`'s note above.
+                    let (stale, intruded) = super::wm::occluders_aged(occ_win, bbox);
+                    super::wm::note_desktop_flush(!occ_win.is_empty(), stale, intruded);
                 }
                 return false;
             }
@@ -1114,8 +1238,9 @@ impl Screen {
         //    moved underneath and whose writes followed it there.
         #[cfg(feature = "witness")]
         {
-            let (stale, intruded) = super::wm::occluders_aged(occ, blit_bbox);
-            super::wm::note_desktop_flush(!occ.is_empty(), stale, intruded);
+            // SHELLDESK REVIEW — the WINDOW PREFIX, not the furniture-widened set. See `occ_win`.
+            let (stale, intruded) = super::wm::occluders_aged(occ_win, blit_bbox);
+            super::wm::note_desktop_flush(!occ_win.is_empty(), stale, intruded);
         }
         // Nothing is owed to WC-E's restore. (The previous note here claimed the `true` branch was
         // "kept live by the parallel path above" — that path returns `false` and, until this change,

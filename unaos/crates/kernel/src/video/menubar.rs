@@ -209,6 +209,32 @@ static LEDGER: strip::Ledger = strip::Ledger::new();
 static TOGGLES: AtomicU64 = AtomicU64::new(0);
 static OFF_PASSES: AtomicU64 = AtomicU64::new(0);
 
+/// SHELLDESK — **the COMPILED default, latched at the first mutation.**
+///
+/// [`selftest`]'s leg 1 ("absent by default") read [`ENABLED`] live, and its own comment named the
+/// condition that would break it: *"if a future shell enables the bar before the battery runs, this
+/// leg reds"*. The desktop shell now DOES enable the bar at desktop-ready (`wcx::activate`), so a
+/// live read would report the shell's decision instead of the build's default and the leg would
+/// answer a question nobody asked.
+///
+/// The claim the leg exists to defend is about the ARTIFACT — *the bar ships off; something has to
+/// turn it on* — so what is observed is the value [`ENABLED`] held the first time anything wrote it.
+/// `0` = never written (read the flag live, which is then still the initialiser), `1` = the default
+/// was OFF, `2` = the default was ON. It stays falsifiable in exactly the way the leg's own fault
+/// injection proved: building with `ENABLED` initialised to `true` makes the first `set_enabled`
+/// latch `2`, and the leg reds — whether or not a shell has since turned it off again.
+static DEFAULT_LATCH: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// SHELLDESK — was the bar OFF in the artifact? See [`DEFAULT_LATCH`].
+#[cfg(feature = "witness")]
+fn default_was_off() -> bool {
+    match DEFAULT_LATCH.load(Ordering::Relaxed) {
+        0 => !ENABLED.load(Ordering::Relaxed),
+        1 => true,
+        _ => false,
+    }
+}
+
 /// Turn the bar on or off at runtime. Returns the previous state.
 ///
 /// Turning it OFF is a full teardown: the next [`compose`] erases whatever rect the bar owned and
@@ -220,6 +246,15 @@ static OFF_PASSES: AtomicU64 = AtomicU64::new(0);
 /// a HUD band is the case this primitive exists for.
 pub fn set_enabled(on: bool) -> bool {
     let was = ENABLED.swap(on, Ordering::AcqRel);
+    // SHELLDESK — latch the COMPILED default before the first write can hide it. `compare_exchange`
+    // on the "never written" state, so only the first caller wins and a later toggle cannot rewrite
+    // history. See [`DEFAULT_LATCH`].
+    let _ = DEFAULT_LATCH.compare_exchange(
+        0,
+        if was { 2 } else { 1 },
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    );
     if was != on {
         TOGGLES.fetch_add(1, Ordering::Relaxed);
         // CRYSTAL — turning the bar OFF must tear down the SHARD menu, or its dropdown would outlive
@@ -620,9 +655,10 @@ pub fn rollup(scope: &str) {
 /// Six legs, each able to FAIL on its own. The fixture restores the bar to DISABLED before it
 /// returns, so it cannot leave the panel in a state the rest of the boot did not ask for.
 ///
-/// 1. **absent by default** — before anything is enabled, [`strip_rect`] is `None` and the registry
-///    does not count the bar. A bar that defaulted on would fail here, which is the whole of the
-///    direction's "absent by default".
+/// 1. **absent by default** — the ARTIFACT ships with the bar off ([`DEFAULT_LATCH`], observed at the
+///    first write rather than live, since the desktop shell enables the bar at desktop-ready), and a
+///    disabled bar's [`strip_rect`] is `None`. A bar that defaulted on would fail here, which is the
+///    whole of the direction's "absent by default".
 /// 2. **absent costs nothing on the CLIP** — with the bar off, `strip::rects` reports exactly the
 ///    strips that are actually on the glass, and the menubar slot is `None`. This is the leg that
 ///    says a disabled tenant consumes no occlusion capacity: it is not merely uncounted, its slot in
@@ -672,8 +708,17 @@ pub fn selftest() {
     // x86 selftest block, and nothing enables the bar on any boot path. `initial=` goes on the line so
     // a reader sees what was observed rather than trusting that claim — if a future shell enables the
     // bar before the battery runs, this leg reds and the line says why.
+    // SHELLDESK — the default is read from the LATCH, not from the live flag. The desktop shell
+    // enables the bar at desktop-ready (`wcx::activate`), which on a Kepler boot happens long before
+    // this battery runs; a live read would then report the SHELL's decision and call the artifact's
+    // default a defect. `initial=` on the line is still the live flag, so a reader sees both facts.
+    // The fault injection the original leg was hardened by still reds this: `ENABLED` initialised to
+    // `true` latches "default was ON" at the first write. And the "absent" half is now ESTABLISHED
+    // rather than assumed — the fixture turns the bar off itself, which is what makes legs 1-2
+    // meaningful on a boot that arrives here with the bar already on.
     let initial = enabled();
-    let default_off = !initial && strip_rect(pw, ph).is_none();
+    set_enabled(false);
+    let default_off = default_was_off() && strip_rect(pw, ph).is_none();
     let n_off = strip::rects(pw, ph, &mut slots);
     let clip_clean = slots[strip::MENUBAR_SLOT].is_none();
 
@@ -752,9 +797,9 @@ pub fn selftest() {
     //     `occclip_bar=N>0 occclip_bar_px=0` state the FORBID trips on — proven non-vacuous rather than
     //     trusted, WCK5's reverted probe computed instead of pinned.
     //
-    // Its own enable→probe→disable cycle: the bar is turned ON here (the main fixture already restored
-    // it to `saved` above) and turned OFF again at the end, so the gate's standing state — DEFAULT OFF
-    // — is unchanged and no later leg or boot sees the bar enabled.
+    // Its own enable→probe→restore cycle: the bar is turned ON here (the main fixture already restored
+    // it to `saved` above) and put back to `saved` at the end, so the standing state — DEFAULT OFF on
+    // a gate boot, ON once the desktop shell has asked for it — is exactly what it was on entry.
     #[cfg(target_arch = "x86_64")]
     {
         set_enabled(true);
@@ -778,10 +823,17 @@ pub fn selftest() {
             None => false,
         };
         let p = wm::occ_bar_probe(bar.unwrap_or((0, 0, 0, 0)), win);
-        // Restore to DEFAULT OFF before the verdict, so `restored` reads the standing state the rest of
-        // the boot depends on rather than the probe's transient enable.
-        set_enabled(false);
-        let restored = !enabled();
+        // Restore THE STATE THE BOOT ARRIVED IN before the verdict, so `restored` reads the standing
+        // state the rest of the boot depends on rather than the probe's transient enable.
+        //
+        // SHELLDESK — that state is `saved`, not `false`. It was an unconditional `set_enabled(false)`
+        // when the bar had no owner; now the desktop shell turns it on at desktop-ready, and a fixture
+        // that ended by switching the operator's menu bar off would have taken the bar off the glass
+        // for the rest of a metal boot — a witness with a side effect on the thing it witnesses. On a
+        // gate boot (no Kepler takeover, nothing enables the bar) `saved` IS `false` and this is the
+        // line it always was.
+        set_enabled(saved);
+        let restored = enabled() == saved;
 
         let fired = p.pop_prot > 0 && p.px_prot > 0;
         let forbid_trips = p.pop_fault > 0 && p.px_fault == 0;

@@ -512,6 +512,60 @@ pub fn activate_on(desc: SurfaceDesc) {
     }
     serial_println!("[wc-x] activate panel={}x{} console_win={}", pw, ph, cwin);
 
+    // SHELLDESK — **THE DESKTOP SHELL ASKS FOR ITS MENU BAR. This is the seam that means
+    // "desktop-ready" on x86.**
+    //
+    // Peter, metal Boot A: *"i cannot see the menu because a shell is still posing as the desktop"*.
+    // The bar was built as a default-off TENANT (`video::menubar` — "we will not always have a menu
+    // bar"), and the tenancy was never claimed: every `set_enabled(true)` in the tree was a FIXTURE's
+    // (`menubar::selftest`'s legs 3-4 and its MENUBAR-OCC probe, `crystal::selftest`), and each one
+    // restored the flag before it returned. A bar nothing enables is a bar the operator cannot see,
+    // however correct its geometry.
+    //
+    // Here, and not in `main.rs`'s render service or in `menubar`'s initialiser, for two reasons.
+    // The first is ownership: turning the bar on is a SHELL's decision, and this function is where
+    // the crispy desktop shell is brought up — a spatial shell that never runs this seam never gets a
+    // bar, which is the whole point of the tenancy. The second is ordering: everything the bar draws
+    // from (the panel geometry, the compositor, the window table it reads the focused caption out of)
+    // is live by this line, and every DECLINE arm above returns before it, so a boot that failed to
+    // bring the compositor up does not end with a strip on the glass and nothing beneath it.
+    //
+    // The bar's own witness (`[menubar] rollup …`) reports what it then paints; this line is the
+    // decision, so a capture separates "the shell never asked" from "the shell asked and the bar
+    // declined the panel" (`geometry` answers `None` below its floors, and says so there).
+    let bar_was = super::menubar::set_enabled(true);
+    serial_println!(
+        "[wc-x] menubar ENABLED panel={}x{} rect={:?} was={} (the desktop scene owns the top of the glass)",
+        pw,
+        ph,
+        super::menubar::strip_rect(pw, ph),
+        bar_was
+    );
+
+    // SHELLDESK REVIEW — **AND COMPOSITE, HERE, SO THE ROWS THE ENABLE JUST TOOK ARE PAINTED.**
+    //
+    // The enable has an immediate side effect on the DESKTOP layer: from this instant
+    // `Screen::present_background` subtracts the bar's rect, so those 34 rows stop being desktop
+    // pixels and only `strip::compose_all` — which runs from a COMPOSITE — can put anything in them.
+    // Until one runs, the band holds whatever the pre-enable glass held and nothing is coming to
+    // replace it.
+    //
+    // The arc's own residual argued this was bounded by "the console window's own `create`, which
+    // composites". It is not: `panel_console_window_open` ran ABOVE this line, so that composite is
+    // already spent, and the window it made is fbcon's `KERNEL_OWNER_CONSOLE` row — a FROZEN BOOT-LOG
+    // SNAPSHOT for the rest of the boot (see `arch::x86_64::syscall`'s `<F9>` note), which never
+    // damages again. `wm::service_damage` returns WITHOUT compositing when no row is dirty, so on a
+    // boot whose desktop app does not land and whose operator does not move the mouse there is no
+    // composite after this point at all: the bar would be enabled, its rows withheld from the desktop,
+    // and the bar never painted — the arc's exact symptom, reached by a new route.
+    //
+    // One pass, at the seam, closes it. Same call `wm::create` made two statements above, in the same
+    // context and on the same lock discipline, so this is a repetition of a proven-safe step rather
+    // than a new one; it is also the pass that makes the residual's "bounded by the next composite"
+    // true by construction instead of by hope. Costs one composite on a table holding one row.
+    wm::composite();
+    serial_println!("[wc-x] menubar PAINTED (composite at the enable seam)");
+
     // DESKTOP-APP — ARM the desktop's second window. It is a PROGRAM now, so it cannot be opened
     // from here; see the module docs for why this seam is structurally too early for a launch, and
     // [`desktop_app_service`] for the pass that performs it.
