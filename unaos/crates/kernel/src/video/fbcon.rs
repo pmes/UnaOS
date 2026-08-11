@@ -1129,13 +1129,27 @@ fn route_present_banded(owed_now: Owed, coalesce: bool) {
             ROUTE_BUSY.store(false, Ordering::Release);
             return;
         }
+        // NORMALWIN — **the RECYCLED-ID FENCE, and the console now needs it.** `id` was snapshotted
+        // from `CONSOLE_WIN` at the head of this function, outside any lock. Until this arc that
+        // snapshot could not go stale: nothing could close the console row (`close_owner` refuses the
+        // kernel band, and furniture carried no close disc), so the id named the same row forever.
+        // The close disc changes that — `wc_close_furniture` clears `CONSOLE_WIN` and then frees the
+        // row, and `wm::close` hands the slot straight back to the next `SYS_WIN_CREATE`. A print
+        // that stalled between the load above and this line would otherwise present a ring-3 app's
+        // window under the console's damage band, through the fence-FREE `expect_owner = None` path
+        // whose doc says kernel/furniture callers "have no recycle race". They do now, so this path
+        // carries the fence: `KERNEL_OWNER_CONSOLE` is the owner `panel_console_window_open` minted
+        // the row with, and a slot that has been re-issued to anyone else declines `NoRow` and takes
+        // the rows-go-back arm below. Same three outcomes as the `bool` verbs (`!= NoRow` is exactly
+        // their body), so nothing else here moves.
         Owed::Band(y0, y1) => {
             PACE_RAN.fetch_add(1, Ordering::Relaxed);
-            wm::present_rows(id, y0, y1)
+            wm::present_rows_outcome_owned(id, y0, y1, wm::KERNEL_OWNER_CONSOLE)
+                != wm::Presented::NoRow
         }
         Owed::Whole => {
             PACE_RAN.fetch_add(1, Ordering::Relaxed);
-            wm::present(id)
+            wm::present_outcome_owned(id, wm::KERNEL_OWNER_CONSOLE) != wm::Presented::NoRow
         }
     };
     if ok {
@@ -1927,6 +1941,39 @@ pub fn panel_console_window_open() -> wm::WinId {
     );
     route_present();
     id
+}
+
+/// NORMALWIN — **the console window was CLOSED by the operator: stop routing presents at it.**
+///
+/// Peter's 2026-08-11 ruling makes the console window a normal app window with all three normal
+/// buttons, so the close disc is live and this is the console side of it. Called from x86's
+/// `wc_close_furniture` BEFORE `wm::close(id)` frees the row, so no present can be aimed at a slot
+/// that is mid-free.
+///
+/// ### What is dropped, and what deliberately is NOT
+/// Only [`CONSOLE_WIN`] is cleared, which is the single test every `route_present*` path takes
+/// first — after this they all return without touching `wm`. The glyph ROUTE stays installed:
+/// `c.win_fb` / `c.win_store` are left alone on purpose, so console text keeps landing in the
+/// cached-RAM surface. Tearing the route down instead would make [`FbCon::draw_fb`] fall back to the
+/// PANEL handle, and the panel belongs to the compositor — every subsequent console line would paint
+/// over the desktop. Writing into an unwatched store is the harmless direction of that choice; the
+/// text is on serial and in `TERM_RING` regardless, which is where the boot log actually lives.
+///
+/// The surface allocation therefore outlives the window, which is also what keeps this free of a
+/// use-after-free: `wm::close` explicitly does not touch the surface, and `store` is owned by
+/// `FbCon`, not by the table row.
+///
+/// Idempotent and id-checked: returns `true` only if `id` was in fact the routed console window, so
+/// a stale or foreign id cannot silently unroute the live console. The panic path clears the same
+/// cell independently ([`panic_screen`]) and is unaffected either way.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn panel_console_window_closed(id: wm::WinId) -> bool {
+    if id == wm::WIN_NONE {
+        return false;
+    }
+    CONSOLE_WIN
+        .compare_exchange(id, wm::WIN_NONE, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
 }
 
 /// Repaint the screen as a panic backdrop (dark red) and home the cursor, so the panic message

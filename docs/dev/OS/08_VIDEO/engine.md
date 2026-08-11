@@ -9880,7 +9880,157 @@ Nothing here answers whether the DESKTOP (not the window chrome) wants the same
 semantic treatment, and the three blue `CONTROL_*` roles now have no consumer.
 Both wait on the kit becoming reachable (white-board Q4) and on the re-lift.
 
-## FACADE — the console is NOT a desktop window; it is plumbing (2026-08-11)
+## NORMALWIN — the console window IS a normal app window, with the three normal buttons (2026-08-11)
+
+**Peter's ruling, verbatim, and it supersedes the FACADE section below:** *"go
+back in git history when it still had the 3 normal buttons ... i said normal
+app."*
+
+The section below (FACADE, same day) collapsed two different things into one.
+The ruling separates them, and both halves are now law:
+
+1. **The RAW console / boot-log OUTPUT is plumbing.** Serial, `TERM_RING`, the
+   pre-compositor panel path and the panic path are behind the facade and are
+   never managed chrome. **Unchanged by this arc — not one line of it is
+   touched.** Do not resurrect boot-log chrome; that is not what this is.
+2. **The console WINDOW on the glass is an ordinary application window**, and
+   ordinary application windows have close, minimise and zoom. It gets all
+   three, in the same order, at the same anchor, with the same behaviour.
+
+### What landed
+
+| Seam | Before (facade-console-1) | After (this arc) |
+| --- | --- | --- |
+| `wm::ctrls_for` | `&[]` for `is_kernel_owner` rows | `&CTRLS` for **every** row (no per-owner arm left) |
+| `wm::controls` | declined the kernel band owner-wide, before the width test | no owner arm; kernel rows reach the width test exactly as app rows do |
+| `wm::FURNITURE_HAS_CONTROLS` | `false` | `true`, unconditionally (a cluster is not an arch property) |
+| `wm::close_owner` | refuses the kernel band | **unchanged — still refuses** |
+| x86 `Ctrl::Close` arm | `wc_close_click(owner)` for every row | `wc_close_furniture(win, owner)` for kernel-band rows |
+| `fbcon` | — | `panel_console_window_closed(id)` clears `CONSOLE_WIN` |
+
+### The three verbs, and what each rests on
+
+* **Close closes.** The disc is routed through `wm::close(id)` — the **id-scoped**
+  primitive — and *not* through `close_owner`. That distinction is the whole
+  design. `close_owner` is the blast-radius call: it reaps every row an ASID
+  holds, it is also what process teardown calls, and its kernel-band refusal is
+  the CLOSEISO guard won from Boot AR (*"closing stat should not also close
+  console!"*). Widening it to make a button work would have traded a structural
+  guard for a gesture. `wm::close(id)` names exactly the row the operator
+  pressed, which is precisely what "close this window" means.
+  `closeiso_selftest` leg 3 still asserts `close_owner(KERNEL_OWNER_CONSOLE) == 0`.
+
+  There is no process behind a kernel row (user owners are `slot + 1` biased and
+  can never land in the reserved band), so nothing is killed and the settle
+  token says `"closed"` / `"norow"` directly instead of arriving at `"noproc"`
+  through a pid search. `fbcon::panel_console_window_closed` runs **before** the
+  row is freed, so no present is ever aimed at a slot that is mid-free.
+
+  **The console's present path now carries the WCPAR recycled-id fence** (review
+  fix). `fbcon::route_present_banded` snapshots `CONSOLE_WIN` at its head, outside
+  any lock, and then presents that id further down. That snapshot could not go
+  stale before this arc — nothing could free a furniture row, so a cached kernel
+  id named the same window for the life of the boot, which is exactly why
+  `present_banded`'s `expect_owner` doc said kernel/furniture callers *"have no
+  recycle race"*. The close disc ends that: `wc_close_furniture` frees the row and
+  `wm::close` hands the slot straight back to the next `SYS_WIN_CREATE`, so a print
+  stalled across the gap would have presented a ring-3 app's window under the
+  console's damage band. That caller now uses
+  `present_rows_outcome_owned(.., KERNEL_OWNER_CONSOLE)` /
+  `present_outcome_owned(.., KERNEL_OWNER_CONSOLE)`; a re-issued slot declines
+  `NoRow` and takes the existing rows-go-back arm. The fence rule is restated on
+  `present_banded` in terms of the ID rather than the owner band: pass it whenever
+  the id was captured outside the lock the pass takes and something can free it in
+  the gap.
+
+  **The console's glyph route is deliberately NOT torn down.** Only `CONSOLE_WIN`
+  is cleared. `c.win_fb` / `c.win_store` stay installed, so console text keeps
+  landing in the cached-RAM surface. Tearing the route down would make
+  `FbCon::draw_fb` fall back to the **panel** handle — and the panel belongs to
+  the compositor, so every subsequent console line would paint over the desktop.
+  Writing into an unwatched store is the harmless direction of that choice, and
+  it is also what keeps the close free of a use-after-free: `wm::close` does not
+  touch surfaces, and the store is owned by `FbCon`, not by the table row.
+
+* **Minimise parks to the dock, and the dock brings it back.** Nothing new was
+  needed: `minimise` already accepts a kernel row (it refuses only `compat` and
+  owner 0), shellwin-a's `PARKED_Z` term in `above_shell` is intact on trunk, and
+  `dock_scan` still enumerates kernel-owned rows. The dock is the *only* way back
+  — `focus_ring_apps` filters the reserved band out of the `<TAB>` rotation — and
+  `wcx::activate` still declines the console window outright on a panel too
+  narrow to host a `MAX_WINDOWS` dock strip, so the disc cannot strand the row.
+  Pinned by `dock::selftest`'s furniture-park leg and by x86-witness.spec's
+  `furniture park=parked/true` rule, both unchanged.
+
+* **Zoom zooms.** Also unchanged: `zoom` refuses only `compat` and owner 0. The
+  console surface is far too large to magnify, so `zoom_scale` floors to 1 and
+  the effect is the re-centre-and-pin; the token is `zoomed` or
+  `zoomed-nochange` accordingly, which is the ordinary answer for any window
+  already at its maximum scale.
+
+### The falsifiers, and which way they now point
+
+Both fixtures assert against the single gate constant
+`wm::FURNITURE_HAS_CONTROLS`, so the claim is *"furniture has exactly the cluster
+this build promises"* and it reads the same on every arch:
+
+* `closeiso_selftest` leg 4 — `ctrls min=true zoom=true close=true` (the field was
+  `noclose=`; it is **renamed** so a stale spec pin reds instead of silently
+  passing).
+* `ctrldecline_selftest` leg 5 — `furniture close=true minzoom=true
+  packed=true/Some(..)`. `packed=` is stronger than before: slot 0 of the
+  furniture row's cluster and slot 0 of the app row's are **both the close disc**
+  now, so the left-pack claim compares the identical control on the two rows.
+  Its `silent=true` is stronger too — the furniture row is pinned AT the floor
+  and passes the width test rather than returning before it.
+
+Taking any disc back off a kernel row flips both legs FAIL unless the const is
+flipped with it, which is the deliberate reviewed act of un-ruling this.
+
+### One consequence worth expecting in a capture
+
+Narrow kernel-owned rows now reach the CTRLWIT width arm and arm one
+`[wm] controls-declined` line each, exactly as app rows do — the synthetic 32x8
+kernel probe rows the click/dock batteries mint are the population that grows the
+count. The growth is correct (those rows really have no cluster) and is not a
+rate-limit regression. The real console row clears the floor by a wide margin
+(its box is nearly the panel), so **`[wm] controls-declined` stays quiet for the
+console itself.**
+
+### Still open (not this arc)
+
+The console close is permanent for the boot: `panel_console_window_open` is
+idempotent behind `CONSOLE_WIN` and is reached from one one-shot latch in
+`wcx::activate`, so nothing re-mints the row once it is closed. Clearing
+`CONSOLE_WIN` leaves that re-open *possible* — the function would build a fresh
+surface and row — but no caller invokes it. A normal app's reopen route is the
+launcher, and the console has none; building one is the Console APP arc's lane
+(see below), not this one. Minimise → dock → tile-press is the reversible
+gesture today.
+
+**The close ACTION is x86-only, while the close DISC is unconditional.** `ctrls_for`
+and `FURNITURE_HAS_CONTROLS` carry no `cfg` — a cluster is not an arch property —
+but only `wc_click_route_at` (x86) branches on `is_kernel_owner` and routes to
+`wc_close_furniture`. aarch64's `clickroute` close arm still calls `wc_close_click`
+for every row, so a kernel-band row there would draw a close disc whose press hits
+`close_owner`'s refusal and does nothing (settle `noproc-selftest`). **Unreachable
+today**: `panel_console_window_open` is `#[cfg(all(target_arch = "x86_64", feature
+= "wc"))]`, so aarch64 has no live kernel-band row — the only ones it mints are
+`dock::selftest` / `ctrldecline_selftest` / `closeiso_selftest` fixtures, which
+press no disc through the router. It becomes a painted-but-inert control the moment
+aarch64 grows a console window, which violates this arc's own precondition (*"a
+control that cannot act must not be painted"*). Wiring the aarch64 arm is outside
+this arc's file lane; it must land with, or before, any aarch64 console window.
+
+## FACADE — the console is NOT a desktop window; it is plumbing (2026-08-11, SUPERSEDED in part)
+
+> **Superseded by NORMALWIN above (same day, later ruling).** Point 1 of this
+> section stands — the raw console/boot-log OUTPUT is plumbing behind the facade
+> and is never managed chrome. What is reversed is the conclusion drawn from it:
+> the console WINDOW does get a window's buttons, because Peter's later ruling is
+> that it *is* a normal app window. Read the table in NORMALWIN for the current
+> state of every seam this section describes. The prose below is kept as the
+> old-law half of the ledger.
 
 **Peter's correction, verbatim:** *"stop trying to pin our console output to an
 application. all this crispy stuff is supposed to be a facade."* The kernel

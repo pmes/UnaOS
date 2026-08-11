@@ -1264,32 +1264,39 @@ REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
 # ---      * four further looks at the same row keep it at one (`rl=1`) — the rate limit;
 # ---      * a row exactly AT the floor keeps its cluster (`some=true`) — the control, without which
 # ---        a `controls` that had simply stopped answering `Some` would pass the first three;
-# ---      * FACADE — kernel FURNITURE has NO cluster: no close, no minimise, no zoom
-# ---        (`furniture noclose=true minzoom=true packed=true/...`, where `minzoom=true` is the
-# ---        VERDICT "matches the build's promise of no cluster", not "both discs present"). The
-# ---        console output is plumbing behind the crispy facade, not a managed desktop window
-# ---        (Peter, 2026-08-11: "stop trying to pin our console output to an application ... a
-# ---        facade"), so it carries none of a window's titlebar buttons. `wm::ctrls_for` returns an
-# ---        EMPTY list for a kernel-owned row and `wm::controls` declines the kernel band owner-wide
-# ---        before the width test — the pre-shellwin-a CLOSEISO behaviour, restored.
-# ---        This REVERTS the merged CONSOLEWIN (shellwin-a) arc, which had briefly given furniture a
-# ---        per-CONTROL `[minimise, zoom]` cluster and let it reach the width arm (making every narrow
-# ---        kernel row emit a spurious decline line). On aarch64 there was never a dock and hence
-# ---        never a cluster, so this line's output is UNCHANGED by the revert — `minzoom=true
-# ---        packed=true/None`; the revert is the x86 behaviour, which no headless leg reaches (the
-# ---        console-window fixtures run only here, and here furniture always had none). The assertion
-# ---        is against `FURNITURE_HAS_CONTROLS` (now `false` on every arch), so re-introducing any
-# ---        disc flips this leg red — a console with the buttons of a window is the FORBID shape.
-# ---        `packed=true/None` is the honest no-cluster form: with no disc there is no slot to place.
+# ---      * NORMALWIN — kernel FURNITURE has the FULL cluster: close, minimise AND zoom
+# ---        (`furniture close=true minzoom=true packed=true/<offset>`, where `minzoom=true` is the
+# ---        VERDICT "matches the build's promise", i.e. both discs present). Peter's ruling
+# ---        (2026-08-11: "go back in git history when it still had the 3 normal buttons ... i said
+# ---        normal app") makes the console WINDOW an ordinary application window, so it carries an
+# ---        ordinary application window's titlebar buttons. `wm::ctrls_for` returns the full
+# ---        `[Close, Minimise, Zoom]` list for every row and `wm::controls` no longer declines the
+# ---        kernel band owner-wide. What the facade law still governs is the RAW console/boot-log
+# ---        OUTPUT — serial, TERM_RING, the pre-compositor panel path and the panic path — none of
+# ---        which goes through a window and none of which this touches.
+# ---        This SUPERSEDES facade-console-1 (which had reverted the cluster to none) and goes one
+# ---        disc further than shellwin-a/CONSOLEWIN (which gave `[minimise, zoom]` and withheld
+# ---        close). The close disc's ACTION is x86's `wc_close_furniture` — `wm::close(id)`, the
+# ---        id-scoped primitive — so `close_owner`'s kernel-band refusal (CLOSEISO, Boot AR) is
+# ---        UNCHANGED and still refuses; see `reaped=` below and `[wc-iso] refuse=`.
+# ---        The assertion is against `FURNITURE_HAS_CONTROLS` (now `true` on every arch — a cluster
+# ---        is not an arch property), so taking any disc back off flips this leg red.
+# ---        `packed=<offset>` is the left-pack claim: slot 0 of the furniture row's cluster sits at
+# ---        the same offset from its own outer box as slot 0 of the app row's, and both slot 0s are
+# ---        the CLOSE disc, so the two rows are compared on the identical control.
+# ---        `silent=true` also means more than it used to: the furniture row is pinned AT the floor
+# ---        and reaches the width arm exactly as the app row does, so its silence is "nothing to
+# ---        complain about" rather than "returned before the test was reached".
 # ---      * and that furniture row is REAPED (`reaped=true`). CLOSEISO makes `close_owner` refuse
-# ---        every kernel-band row, so the battery's teardown sweep is structurally blind to it and
-# ---        the leak guard could never have caught it leaking. The reap is asserted by id, against
-# ---        the table, which is the only place that can answer it.
+# ---        every kernel-band row — unchanged by this arc — so the battery's teardown sweep is
+# ---        structurally blind to it and the leak guard could never have caught it leaking. The reap
+# ---        is asserted by id (`wm::close`), against the table, which is the only place that can
+# ---        answer it, and it is the same primitive the operator's close disc now calls.
 # ---    `fired=` and `rl=` are PER-SLOT emission deltas, not a global total: this boot's earlier
 # ---    fixtures mint 32x8 rows that decline legitimately, and a global counter would have let one
 # ---    of them inflate the delta and red a kernel that was behaving perfectly.
 # ---    Every number is pinned, so the fixture's own SKIP line (window table full) cannot satisfy
 # ---    this rule and neither can its FAIL — the values are what make it a gate rather than a
 # ---    presence check.
-REQUIRE :: WMCTRL: controls-declined — floor=158 .* furniture noclose=true minzoom=true packed=true/.* silent=true reaped=true :: PASS ::
+REQUIRE :: WMCTRL: controls-declined — floor=158 .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
 FORBID :: WMCTRL: .* :: FAIL ::
