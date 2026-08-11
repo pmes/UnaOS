@@ -9991,11 +9991,16 @@ publications actually being made rather than assumed.
 
 **And the consequence, on the artifact that showed the symptom.** `occclip_dock_px` is `witness`-only
 and the metal image is built without `witness`, so the `[dock]` ledger carries a `clob=` counter —
-passes in which a window had painted over the strip, counted at the damage question. `paints=`
-conflates a MODEL change (a window opened, closed, was renamed) with a CLOBBER; during a sustained
-drag the model does not change at all, so before WCK5 every paint of a drag was a clobber. `clob=`
-should now be near-idle across a drag, and the on-glass falsification is Peter's eye: **drag any
-window across the strip and the strip must not blink.**
+passes in which the damage predicate said a window overlapped the strip, counted at the damage
+question. **⚠ WCK5-REVIEW CORRECTION:** `clob=` is NOT a fix signal. `clobbered` is `r.damaged &&
+above_shell(r) && boxes_overlap(outer_box(r), strip)` (wm.rs ~15333) — a DAMAGE+OVERLAP predicate
+WCK5 does not touch. A strip-crossing drag still damages the dragged window and still overlaps the
+strip every motion, so `clob=` stays lit exactly as before; what changed is that the repaint it
+triggers now redraws INTACT strip pixels (occ_clip withheld the window's chrome) instead of
+restoring corrupted ones. So `clob>0` during a drag is EXPECTED, not a regression. The real proof is
+`occclip_dock=N>0 occclip_dock_px>0` on a `witness` build (the strip columns the clip withheld), and
+the on-glass falsification is Peter's eye: **drag any window across the strip and the strip must not
+blink** — even while `clob=` is nonzero.
 
 ```
 [dock] live passes=1 paints=0 clob=0 rate=0/1k scan=1922740cyc/963us paint=0cyc/0us px/paint=0 ...
