@@ -623,6 +623,44 @@ pub struct Controller {
     /// once, in `bt_probe`'s selection, and read exactly once, in `bt_l4_att`.
     #[cfg(feature = "bt")]
     bt_acl: (u8, u8, u16, u16),
+    /// BT-C2 — the ACL bulk pipes' USB DATA TOGGLES, `(out, in)`, `false` = DATA0.
+    ///
+    /// THIS FIELD IS A BUG FIX, and it is worth saying which one. A bulk pipe's toggle belongs to
+    /// the ENDPOINT and persists for the life of the pipe — it is reset only by
+    /// `SET_CONFIGURATION`, a `CLEAR_FEATURE(ENDPOINT_HALT)`, or a port reset (USB 2.0 §5.8.5,
+    /// §9.4.5). It is NOT reset by anything happening at the Bluetooth layer. BT-L4 runs one ACL
+    /// exchange on the LE link and leaves both toggles at DATA1; BT-C2 then runs on the SAME two
+    /// endpoints, minutes of boot time and a whole classic page later. A BT-C2 that started from
+    /// DATA0 — which every reading of "a fresh link" suggests — would have its first OUT silently
+    /// discarded by the radio as a retransmission and its first IN mis-sequenced, and the capture
+    /// would show a speaker that accepted a channel request and never answered.
+    ///
+    /// So the toggles are carried on the controller, written by every ACL transaction that RETIRES
+    /// (a transaction that times out moves no data and advances nothing), and WITNESSED by BT-C2's
+    /// transport line, which prints where they came from. `(false, false)` until any ACL traffic
+    /// runs at all, which is correct: `SET_CONFIGURATION` left both pipes at DATA0.
+    ///
+    /// Gated on `btc`, not on `bt`: BT-C2 is the only READER. A `bt`-only build would write this
+    /// from `bt_l4_att` and never look at it, which is a dead field and warns as one — see
+    /// `bt_acl_tog_set`, where the write disappears in that build too.
+    #[cfg(feature = "btc")]
+    bt_acl_tog: (bool, bool),
+    /// BT-C2 — `HC_Total_Num_ACL_Data_Packets`, the controller's ACL buffer count, as read by BT-L1
+    /// (`HCI_Read_Buffer_Size`, 0x1005). 0 until L1 runs, and 0 is also the value a controller that
+    /// refused or malformed that command leaves behind — both mean "unknown", and BT-C2's transport
+    /// gate treats them identically.
+    ///
+    /// Why BT-C2 needs a number BT-L4 did not: L4 sent exactly ONE ACL packet, so the Core spec's
+    /// bound on unacknowledged host-to-controller packets (Vol 4 Part E §4.1.1) could not be
+    /// exceeded by construction and no accounting was needed. BT-C2 has one point — answering the
+    /// peer's `CONFIGURATION_REQUEST` while its own is still in flight — at which TWO packets may be
+    /// unacknowledged at once. That is still no accounting, but it is no longer free: it needs the
+    /// controller to have at least two buffers, and this is the field that says whether it does.
+    ///
+    /// Gated on `btc` for the same reason `bt_acl_tog` is: BT-C2's transport gate is its only
+    /// reader, so a `bt`-only build must not carry it.
+    #[cfg(feature = "btc")]
+    bt_acl_bufs: u16,
 }
 
 // Raw pointers to identity-mapped DMA memory; access is serialized by the EHCI_HID mutex.
@@ -1416,6 +1454,235 @@ const BT_C1_LINK_TYPE_ACL: u8 = 0x01;
 /// and a cancel, on runs where the controller was working correctly.
 #[cfg(feature = "btc")]
 const BT_C1_CONN_MS: u64 = 5600;
+
+// ================================ BT-C2 ==================================================
+//
+// BT-C2 — THE SIGNALLING ROAD. BT-C1 proved a BR/EDR ACL link can be established to the speaker
+// (Boot A: `Connection Complete status=0x00 handle=0x000b link_type=0x01`). An ACL link is a pipe,
+// not a service: nothing above it existed. This stage builds the first thing that does — an L2CAP
+// channel to the peer's AVDTP service, configured in both directions, and ONE `AVDTP_DISCOVER`
+// across it so the speaker names its own stream endpoints.
+//
+// IT STOPS THERE, on purpose. No codec capability query, no SET_CONFIGURATION, no OPEN, no START,
+// no SBC encoder, no media packets. The claim this arc may make is exactly: "an L2CAP channel to
+// PSM 0x0019 opened, and here is the list of stream endpoints the speaker published on it".
+//
+// WHY SDP IS SKIPPED, and it is a judgement rather than an omission. SDP would mean a SECOND L2CAP
+// channel (PSM 0x0001), an `SDP_ServiceSearchAttributeRequest` carrying a DES-encoded UUID list,
+// and a continuation-state-driven parser for a variably-typed data-element tree — a larger PDU
+// surface than everything else in this stage combined. What it would return is whether an
+// `AudioSink` (UUID 0x110B) record exists and which PSM it sits on. But **the AVDTP PSM is not
+// discovered, it is assigned**: 0x0019, fixed by Assigned Numbers, and every A2DP sink in
+// existence answers there. So the L2CAP `CONNECTION_RSP` on PSM 0x0019 answers the same question
+// SDP would, more directly and with fewer moving parts: a device with no AVDTP answers
+// `result=0x0002 (PSM not supported)`, which is a complete and honest negative. And the
+// `AVDTP_DISCOVER` response that follows lists the endpoints THAT ACTUALLY EXIST, which is
+// strictly more than an SDP record asserts. SDP is not ruled out for later — a real stack wants it
+// for AVRCP and for reading the sink's supported-features bitmask — it is ruled out HERE.
+//
+// (The brief that commissioned this stage named PSM 0x0017 for AVDTP signalling. 0x0017 is AVCTP,
+// the AV/C remote-control transport; AVDTP is 0x0019. The constant below is 0x0019 and the
+// discrepancy is recorded rather than silently corrected.)
+//
+// WHAT IT COSTS A BOOT: bounded by `BT_C2_STAGE_MS` (6 s) of wall clock on top of BT-C1, and only
+// on a boot that set `UNAOS_BTC=1` AND reached a live BR/EDR link. A boot whose page timed out
+// never enters this stage at all, and says so on one line.
+
+/// BT-C2 — L2CAP fixed CID 0x0001, the BR/EDR **signalling** channel (Bluetooth Core Vol 3 Part A
+/// §2.1, Table 2.1). The classic counterpart of the LE signalling CID 0x0005 that BT-L4 already
+/// names: every connection/configuration/disconnection PDU of this stage rides it, in both
+/// directions, and it exists for the life of the ACL link without being opened.
+#[cfg(feature = "btc")]
+const BT_L2CAP_CID_SIG: u16 = 0x0001;
+/// BT-C2 — PSM 0x0019 = AVDTP (Bluetooth Assigned Numbers, L2CAP PSM registry). This is the
+/// speaker's audio-transport signalling service. It is ODD-valued and its second-least-significant
+/// bit is clear, which is what Vol 3 Part A §4.2 requires of every BR/EDR PSM; a value violating
+/// that is refused by the peer's L2CAP before any service sees it.
+#[cfg(feature = "btc")]
+const BT_C2_PSM_AVDTP: u16 = 0x0019;
+/// BT-C2 — the LOCAL channel endpoint this stage allocates for the AVDTP channel. Dynamically
+/// allocated CIDs on BR/EDR start at 0x0040 (Vol 3 Part A §2.1: 0x0000 is null, 0x0001..0x003F are
+/// fixed/reserved), and this driver holds at most one L2CAP channel at a time, so the first
+/// dynamic CID is the only one it ever needs. It is echoed back by the peer in the
+/// `CONNECTION_RSP`'s Source CID field, which is how a response is matched to a request.
+#[cfg(feature = "btc")]
+const BT_C2_SCID: u16 = 0x0040;
+/// BT-C2 — L2CAP signalling command codes (Vol 3 Part A §4). Only the ones this stage sends or can
+/// receive are named; anything else that arrives is answered with `COMMAND_REJECT` and counted.
+#[cfg(feature = "btc")]
+const BT_L2CAP_CMD_REJECT: u8 = 0x01;
+#[cfg(feature = "btc")]
+const BT_L2CAP_CONN_REQ: u8 = 0x02;
+#[cfg(feature = "btc")]
+const BT_L2CAP_CONN_RSP: u8 = 0x03;
+#[cfg(feature = "btc")]
+const BT_L2CAP_CFG_REQ: u8 = 0x04;
+#[cfg(feature = "btc")]
+const BT_L2CAP_CFG_RSP: u8 = 0x05;
+#[cfg(feature = "btc")]
+const BT_L2CAP_DISC_REQ: u8 = 0x06;
+#[cfg(feature = "btc")]
+const BT_L2CAP_DISC_RSP: u8 = 0x07;
+#[cfg(feature = "btc")]
+const BT_L2CAP_ECHO_REQ: u8 = 0x08;
+#[cfg(feature = "btc")]
+const BT_L2CAP_INFO_REQ: u8 = 0x0A;
+#[cfg(feature = "btc")]
+const BT_L2CAP_INFO_RSP: u8 = 0x0B;
+/// BT-C2 — the MTU this stage proposes in its `CONFIGURATION_REQUEST`, i.e. the largest L2CAP SDU
+/// it is willing to RECEIVE on the AVDTP channel. **48 is the mandatory minimum for BR/EDR**
+/// (Vol 3 Part A §5.1), so no conforming peer may reject it — which is the whole reason it was
+/// chosen over a larger, negotiable number. It also lands far inside two hard limits this driver
+/// really has: `BT_ACL_BUF_MAX` (256 B of borrowed EP0 buffer) and the ACL IN endpoint's 64-byte
+/// max packet, so a maximum-sized SDU (48 + 4 L2CAP + 4 ACL = 56 B) still arrives in ONE bulk-IN
+/// transaction and needs no reassembly at all.
+///
+/// It is deliberately small: a later arc that streams SBC media will renegotiate upward on its own
+/// channel, and picking a streaming-sized MTU here would be sizing a pipe this arc never fills.
+#[cfg(feature = "btc")]
+const BT_C2_MTU: u16 = 48;
+/// BT-C2 — L2CAP configuration option types (Vol 3 Part A §5). Bit 7 of the type octet is the
+/// HINT bit: an option carrying it may be ignored wholesale by the responder, which is exactly what
+/// this stage does with it.
+#[cfg(feature = "btc")]
+const BT_L2CAP_OPT_MTU: u8 = 0x01;
+#[cfg(feature = "btc")]
+const BT_L2CAP_OPT_RFC: u8 = 0x04;
+#[cfg(feature = "btc")]
+const BT_L2CAP_OPT_HINT: u8 = 0x80;
+/// BT-C2 — AVDTP signal identifier 0x01 = `AVDTP_DISCOVER` (AVDTP 1.3 §8.6). The one signal this
+/// stage sends. Its response is a list of 2-byte Stream End Point entries; it takes no parameters,
+/// changes no state on the peer, and starts no stream — which is why it is the right first move
+/// and the right place to stop.
+#[cfg(feature = "btc")]
+const BT_AVDTP_SIG_DISCOVER: u8 = 0x01;
+/// BT-C2 — bounded wall-clock window, in ms, for ONE signalling response to arrive. L2CAP's own
+/// RTX timer has a minimum of 1 s (Vol 3 Part A §6.2.1), so a window shorter than that would give
+/// up while a conforming peer was still inside its permitted response time; 1500 ms sits just past
+/// it. Every wait in this stage is capped by this AND by what remains of `BT_C2_STAGE_MS`,
+/// whichever is smaller, so no sequence of slow answers can outrun the stage budget.
+#[cfg(feature = "btc")]
+const BT_C2_SIG_MS: u64 = 1500;
+/// BT-C2 — the HARD wall-clock cap on the whole stage, in ms, measured from its first line. Four
+/// round trips at `BT_C2_SIG_MS` each is 6 s, which is what this is; it is a cap and not a budget
+/// to be spent, and the ordinary path (Boot A's link answered its page in ~4 s, and a speaker's
+/// L2CAP responds in tens of ms) costs a small fraction of it. It exists so that a peer that
+/// accepts a channel and then goes quiet cannot extend the life of a live BR/EDR link — and the
+/// boot — indefinitely. The stage always reaches its teardown and BT-C1's `HCI_Disconnect` always
+/// runs after it.
+#[cfg(feature = "btc")]
+const BT_C2_STAGE_MS: u64 = 6000;
+/// BT-C2 — structural cap on ACL packets read across the WHOLE stage, on top of the wall-clock
+/// bound. The same second-bound reasoning as `BT_EVT_MAX`: a peer that streams packets fast enough
+/// to keep satisfying the per-read deadline must still not be able to spin this loop, and 48 is far
+/// more than the ~6 packets a correct exchange produces.
+#[cfg(feature = "btc")]
+const BT_C2_PKT_MAX: u32 = 48;
+/// BT-C2 — structural cap on ACL packets SENT across the whole stage. A correct exchange sends 5
+/// (connect req, our config req, our config rsp, AVDTP discover, disconnect req). The cap exists so
+/// that a peer which keeps re-issuing `CONFIGURATION_REQUEST` cannot make this host transmit
+/// without bound — and it is checked against the controller's own ACL buffer count, which BT-L1
+/// reads and this stage witnesses.
+#[cfg(feature = "btc")]
+const BT_C2_TX_MAX: u32 = 12;
+/// BT-C2 — how many host-to-controller ACL packets may be UNACKNOWLEDGED at once.
+///
+/// `BT_C2_TX_MAX` bounds the stage's total transmission; this bounds its depth, and they are
+/// different bounds for different reasons. The Core spec caps the host at
+/// `HC_Total_Num_ACL_Data_Packets` outstanding packets, tracked by the `Number Of Completed
+/// Packets` event (Vol 4 Part E §4.1.1) — an event this stage does NOT read, because it lands on
+/// the HCI event endpoint that BT-C1's waits are draining, not on the ACL pipe.
+///
+/// So there is no accounting, and the honest way to be safe without accounting is to keep the
+/// depth below any legal buffer count. 2 is what the exchange actually needs (the one moment where
+/// this host answers the peer's configuration request while its own is still in flight) and the
+/// transport gate independently refuses a controller reporting fewer than 2 buffers. Beyond this
+/// depth the stage does not guess — it declines to send and says so.
+#[cfg(feature = "btc")]
+const BT_C2_INFLIGHT_MAX: u32 = 2;
+/// BT-C2 — how many configuration options one `CONFIGURATION_REQUEST` may have PRINTED.
+///
+/// Not how many are decided on: every option is walked and every refusable one is printed whatever
+/// this cap says. This bounds the TRANSCRIPT. An L2CAP option is 2 bytes minimum, so a
+/// maximum-length request carries ~120 of them; at 115200 baud a ~200-byte witness line is ~17 ms
+/// of wall clock that no budget observes, and 120 of them is four seconds the stage cap cannot
+/// see. `serial_println!` is the one cost in this stage that is not bounded by a deadline, so it is
+/// bounded by a count instead.
+#[cfg(feature = "btc")]
+const BT_C2_OPT_PRINT_MAX: u32 = 8;
+/// BT-C2 — how many Stream End Points one `AVDTP_DISCOVER` response may have PRINTED, for exactly
+/// the reason above: a 48-byte MTU permits 23 SEP entries and a peer that ignores the negotiated
+/// MTU could declare far more. Every SEP is counted; the first `BT_C2_SEP_PRINT_MAX` are listed and
+/// the rest are summarised on one line. A real speaker publishes 2 to 6.
+#[cfg(feature = "btc")]
+const BT_C2_SEP_PRINT_MAX: usize = 16;
+
+/// BT-C2 — everything one L2CAP exchange must remember, in one place so the tally can print it.
+///
+/// The two toggles are NOT here: they live on the controller (`bt_acl_tog`), because they outlive
+/// the exchange — they belong to the USB pipe, which BT-L4 has already used on a different link.
+/// Everything in this struct, by contrast, is meaningless outside one channel's lifetime.
+#[cfg(feature = "btc")]
+#[derive(Default)]
+struct BtC2 {
+    /// ACL packets SENT (each one a complete L2CAP PDU; this stage never fragments).
+    tx: u32,
+    /// ACL packets sent since the last one was RECEIVED — the stage's stand-in for a credit count,
+    /// bounded by `BT_C2_INFLIGHT_MAX`. A packet arriving from the peer proves a round trip
+    /// completed and is the only evidence this stage has that the controller drained what it was
+    /// given; it is not a `Number Of Completed Packets` event and the tally does not pretend it is.
+    unacked: u32,
+    /// Bulk-IN TRANSACTIONS that carried bytes — **not** ACL packets. An ACL packet longer than the
+    /// endpoint's max packet arrives as several transactions and is counted once per transaction
+    /// (see `bt_c2_recv`'s reassembly). The tally prints it under that name so the two are not
+    /// confused; on the bench part, where every PDU of this stage fits one 64-byte transaction,
+    /// they happen to be equal.
+    rx: u32,
+    /// Zero-length bulk-IN packets. Counted apart from `rx` for BT-L4's reason: a ZLP proves the
+    /// pipe is being serviced and carries nothing, and lumping the two together would let "packets
+    /// arrived" fire on an empty pipe.
+    zlp: u32,
+    /// Packets identified and walked past — a foreign handle, a continuation fragment, a PDU on a
+    /// channel this stage does not own, or a signalling command it answered and moved on from.
+    stepped: u32,
+    /// The next signalling Identifier this host will use for a request of its own. Starts at 1:
+    /// 0x00 is reserved and a peer must reject it (Vol 3 Part A §4).
+    ident: u8,
+    /// The peer's channel endpoint for the AVDTP channel, learned from `CONNECTION_RSP`. 0 until
+    /// then, and 0 is not a legal CID, so it doubles as "no channel exists".
+    dcid: u16,
+    /// Has this host answered the peer's `CONFIGURATION_REQUEST` with a final (C-flag-clear)
+    /// response? Half of the two-way handshake that makes a channel OPEN.
+    peer_cfg_done: bool,
+    /// Did this host have to REFUSE the peer's configuration? Set when the peer asked for an L2CAP
+    /// mode this stage does not implement; the AVDTP exchange is skipped and the tally says why.
+    peer_cfg_refused: bool,
+    /// Has the peer accepted THIS host's `CONFIGURATION_REQUEST`? The other half.
+    our_cfg_done: bool,
+    /// Did the peer answer one of our requests with `COMMAND_REJECT`? A rejected request will never
+    /// be answered, so the wait for it is abandoned rather than run to its budget.
+    rejected: bool,
+    /// Did the peer tear the channel down itself (`DISCONNECTION_REQUEST`)? If so this host owes no
+    /// disconnection request of its own — the channel is already gone.
+    peer_closed: bool,
+}
+
+/// BT-C2 — what a bounded receive is waiting for. `Sig` names an L2CAP signalling command code on
+/// CID 0x0001; `Avdtp` means any PDU on the AVDTP channel this stage opened. Everything else that
+/// arrives is serviced or stepped over, exactly as `bt_l3_await` walks past events it did not ask
+/// for.
+#[cfg(feature = "btc")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BtC2Want {
+    Sig(u8),
+    Avdtp,
+    /// Wait until the peer's own `CONFIGURATION_REQUEST` has been answered. It is not a code to
+    /// match on, because the request is SERVICED inside the wait rather than returned to the
+    /// caller — this variant is what lets the wait stop the moment the servicing completed instead
+    /// of burning its whole window on a milestone already reached.
+    PeerConfig,
+}
+// ============================== end BT-C2 constants ======================================
 
 /// BT-L1 — reassembly cap for one HCI event that spans multiple event-endpoint packets. The event
 /// endpoint's max packet is 16 B (census: `IN1/int/16`), but an HCI event runs up to 2 + 255 B;
@@ -3862,6 +4129,14 @@ impl Controller {
                     let sco_len = rp[3];
                     let acl_num = (rp[4] as u16) | ((rp[5] as u16) << 8);
                     let sco_num = (rp[6] as u16) | ((rp[7] as u16) << 8);
+                    // BT-C2 — latch the ACL buffer count. Recorded only on the well-formed,
+                    // status-0x00 path: a refused or short reply leaves the field at 0, which is
+                    // the "unknown" BT-C2's transport gate refuses on. See `bt_acl_bufs`. Gated on
+                    // `btc` so a `bt`-only build carries neither the field nor this write.
+                    #[cfg(feature = "btc")]
+                    if status == 0 {
+                        self.bt_acl_bufs = acl_num;
+                    }
                     serial_println!(
                         ":: bt-l1: [{}] HCI_Read_Buffer_Size (0x1005) status={:#04x} acl_len={} acl_num={} sco_len={} sco_num={} == witness ::",
                         self.idx, status, acl_len, acl_num, sco_len, sco_num
@@ -5455,6 +5730,29 @@ impl Controller {
         Ok((moved, tok & QTD_DT != 0))
     }
 
+    /// BT-C2 — record an ACL pipe's data toggle after a transaction RETIRED. `out` selects the
+    /// direction; `tog` is the toggle the NEXT transaction on that pipe must carry.
+    ///
+    /// It exists as a method rather than four field assignments so that the whole thing — field,
+    /// write and all — vanishes in a `bt`-only build. See `bt_acl_tog` for what it is for and what
+    /// breaks without it.
+    #[cfg(feature = "bt")]
+    #[inline]
+    fn bt_acl_tog_set(&mut self, out: bool, tog: bool) {
+        #[cfg(feature = "btc")]
+        {
+            if out {
+                self.bt_acl_tog.0 = tog;
+            } else {
+                self.bt_acl_tog.1 = tog;
+            }
+        }
+        #[cfg(not(feature = "btc"))]
+        {
+            let _ = (out, tog);
+        }
+    }
+
     /// BT-L4 — read the peer's Battery Level over the live LE link, and witness every layer.
     ///
     /// Runs between `LE Connection Complete` and `HCI_Disconnect`, on a handle the caller has
@@ -5561,12 +5859,19 @@ impl Controller {
         ) {
             Ok((moved, next)) if moved as usize == pkt.len() => {
                 out_toggle = next;
+                // BT-C2 — the toggle belongs to the PIPE, not to this exchange. See `bt_acl_tog`:
+                // the next ACL traffic on this endpoint is BT-C2's, on a different link and a
+                // different transport, and it must continue from here.
+                self.bt_acl_tog_set(true, next);
                 serial_println!(
                     ":: bt-l4: [{}] ACL OUT{} SENT {}/{} bytes, next_toggle={} -> the ACL data endpoint ACCEPTED a bulk transaction. THE ASYNC-SCHEDULE QUESTION IS ANSWERED FOR BULK == witness ::",
                     self.idx, bulk_out, moved, pkt.len(), if out_toggle { "DATA1" } else { "DATA0" }
                 );
             }
-            Ok((moved, _)) => {
+            Ok((moved, next)) => {
+                // A SHORT transaction still RETIRED, so the pipe's toggle advanced even though the
+                // packet was useless. Recording it is what keeps BT-C2 in sync after a failure.
+                self.bt_acl_tog_set(true, next);
                 serial_println!(
                     ":: bt-l4: [{}] ACL OUT{} SHORT — {}/{} bytes moved. A partially written ACL packet is not a packet; the controller has been handed a fragment it cannot parse and this arc sends no more. NO response is awaited == witness ::",
                     self.idx, bulk_out, moved, pkt.len()
@@ -5625,10 +5930,12 @@ impl Controller {
                 // NOT seen "ACL packets arrive", and lumping them together would let that verdict
                 // fire on an empty pipe.
                 in_toggle = next;
+                self.bt_acl_tog_set(false, next); // BT-C2 — a ZLP retires and advances the toggle.
                 zlps += 1;
                 continue;
             }
             in_toggle = next;
+            self.bt_acl_tog_set(false, next); // BT-C2 — see `bt_acl_tog`.
             pkts += 1;
             let mut buf = [0u8; BT_ACL_BUF_MAX];
             let n = (got as usize).min(BT_ACL_BUF_MAX);
@@ -6215,6 +6522,17 @@ impl Controller {
             }
         }
 
+        // ---- 5c. BT-C2: THE SIGNALLING ROAD, ON A LINK THAT IS ABOUT TO BE RELEASED --------------
+        // Placed HERE and nowhere else, for exactly the reasons BT-L4 sits where it does on the LE
+        // side: after every path that can establish or recover a handle has run, so it can only
+        // ever run on a link this stage has proven live; and BEFORE the mandatory teardown, which
+        // it is structurally incapable of skipping — it returns unit, every path inside it is
+        // bounded by `BT_C2_STAGE_MS`, and the `if live` block below is conditional on nothing it
+        // does. The cost it adds to a boot that reaches here is bounded by that one constant.
+        if live {
+            self.bt_c2_l2cap(t, handle);
+        }
+
         // ---- 6. MANDATORY TEARDOWN: release a live link ------------------------------------------
         // `HCI_Disconnect` (0x0406) is link-type agnostic — the same command, the same Command
         // Status + Disconnection Complete pair, so BT-L3's teardown is reused verbatim rather than
@@ -6269,6 +6587,1290 @@ impl Controller {
         );
     }
     // ============================== end BT-C1 ================================================
+
+    // ================================ BT-C2 ==================================================
+
+    /// BT-C2 — how long the NEXT bounded wait may run: the smaller of one signalling window and
+    /// what remains of the whole stage. Every wait in this stage goes through here, which is what
+    /// makes `BT_C2_STAGE_MS` a real cap rather than a slogan — four slow answers cannot each spend
+    /// `BT_C2_SIG_MS` past the stage deadline.
+    ///
+    /// Returns 0 when the stage budget is spent, and a 0-cycle budget makes every read return
+    /// immediately, so the caller unwinds to its teardown rather than being trusted to check.
+    #[cfg(feature = "btc")]
+    fn bt_c2_window(t0: u64, cap: u64) -> u64 {
+        let el = crate::arch::now_cycles().wrapping_sub(t0);
+        cap.saturating_sub(el).min(Self::bt_l3_budget(BT_C2_SIG_MS))
+    }
+
+    /// BT-C2 — send ONE ACL packet carrying ONE complete L2CAP PDU on `cid`.
+    ///
+    /// The packet is built into the shared EP0 data buffer and handed to `bt_acl_txn`, exactly as
+    /// BT-L4's single ATT request was. The differences from L4 are the ones that matter for review:
+    ///
+    /// * **The toggle comes from the pipe, not from a fresh zero.** `self.bt_acl_tog.0` is where
+    ///   BT-L4 left it. See that field for the bug this prevents.
+    /// * **It never fragments.** A PDU that would not fit one bulk-OUT max-packet is REFUSED with a
+    ///   witness rather than split: this stage's largest send is 16 bytes against a 64-byte
+    ///   endpoint, so the refusal is unreachable on the bench part and is here so that a part with a
+    ///   smaller ACL endpoint gets an honest line instead of a truncated PDU on the air.
+    /// * **It is capped.** `BT_C2_TX_MAX` bounds how much this host may transmit across the whole
+    ///   stage, so a peer that keeps re-configuring cannot make it talk without bound.
+    ///
+    /// Returns whether the whole packet reached the controller.
+    #[cfg(feature = "btc")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_c2_send(
+        &mut self,
+        t: &Target,
+        handle: u16,
+        st: &mut BtC2,
+        cid: u16,
+        body: &[u8],
+        what: &str,
+    ) -> bool {
+        let (_, bulk_out, _, out_mps) = self.bt_acl;
+        if st.tx >= BT_C2_TX_MAX {
+            serial_println!(
+                ":: bt-c2: [{}] {} NOT SENT — the stage's transmit cap ({}) is spent. A correct exchange sends 5 packets; reaching this means the peer kept asking for something and this host declines to answer without bound == witness ::",
+                self.idx, what, BT_C2_TX_MAX
+            );
+            return false;
+        }
+        // REVIEW FIX 9 — the DEPTH bound, which is a different bound from the total above and is
+        // the one the Core spec actually imposes. The host may not exceed
+        // `HC_Total_Num_ACL_Data_Packets` unacknowledged packets (Vol 4 Part E §4.1.1), and the
+        // `Number Of Completed Packets` event that would let this stage COUNT them lands on the HCI
+        // event endpoint, which BT-C1's waits are draining and this stage never reads. So there is
+        // no accounting, and the substitute is a hard depth limit that no legal buffer count can be
+        // below: `BT_C2_INFLIGHT_MAX` = 2, with the transport gate independently refusing a
+        // controller that reports fewer than 2 buffers. `unacked` is cleared by any packet arriving
+        // from the peer — a round trip completed is not a completion event, and the tally says so
+        // rather than implying otherwise.
+        if st.unacked >= BT_C2_INFLIGHT_MAX {
+            serial_println!(
+                ":: bt-c2: [{}] {} NOT SENT — {} packet(s) are already unacknowledged and the depth limit is {}. This stage does not read Number Of Completed Packets, so beyond this depth it has NO accounting and will not guess; the controller reported {} ACL buffer(s) == witness ::",
+                self.idx, what, st.unacked, BT_C2_INFLIGHT_MAX, self.bt_acl_bufs
+            );
+            return false;
+        }
+        let total = body.len() + 8;
+        if total > out_mps as usize {
+            serial_println!(
+                ":: bt-c2: [{}] {} NOT SENT — the packet is {} bytes and the ACL OUT endpoint's max packet is {}. This stage does not fragment an L2CAP PDU across ACL packets, so a PDU that does not fit is refused rather than truncated == witness ::",
+                self.idx, what, total, out_mps
+            );
+            return false;
+        }
+        // ACL header: Handle(12b) | PB(2b) | BC(2b), then Data_Total_Length(2), little-endian.
+        // PB = 0b10. On an LE-U link `BT_ACL_PB_START_NONFLUSH` names it "first packet of a higher
+        // layer message"; on the ACL-U link this stage runs over, the same encoding means "first
+        // AUTOMATICALLY-FLUSHABLE packet" (Vol 4 Part E §5.4.2). It is the correct and the portable
+        // choice here: 0b00 (first NON-automatically-flushable) is legal only on a controller that
+        // declares support for it, and 0b11 belongs to AMP. BC = 0b00, point-to-point.
+        let hdr0 = (handle & 0x0FFF) | (BT_ACL_PB_START_NONFLUSH << 12);
+        let l2len = body.len() as u16;
+        let acl_len = l2len + 4;
+        let head: [u8; 8] = [
+            hdr0 as u8,
+            (hdr0 >> 8) as u8,
+            acl_len as u8,
+            (acl_len >> 8) as u8,
+            l2len as u8,
+            (l2len >> 8) as u8,
+            cid as u8,
+            (cid >> 8) as u8,
+        ];
+        for (i, &b) in head.iter().enumerate() {
+            self.data_buf.add(i).write(b);
+        }
+        for (i, &b) in body.iter().enumerate() {
+            self.data_buf.add(8 + i).write(b);
+        }
+        let tog = self.bt_acl_tog.0;
+        match self.bt_acl_txn(
+            t, bulk_out, false, out_mps, total as u32, tog,
+            Self::bt_l3_budget(BT_L4_TXN_MS),
+        ) {
+            Ok((moved, next)) if moved as usize == total => {
+                self.bt_acl_tog.0 = next;
+                st.tx += 1;
+                st.unacked += 1;
+                serial_println!(
+                    ":: bt-c2: [{}] -> OUT{} {} — handle={:#06x} pb=0b10(START, automatically-flushable) cid={:#06x} l2cap_len={} acl_len={} bytes={} toggle={}->{} tx={} unacked={}/{} == witness ::",
+                    self.idx, bulk_out, what, handle & 0x0FFF, cid, l2len, acl_len, total,
+                    if tog { "DATA1" } else { "DATA0" },
+                    if next { "DATA1" } else { "DATA0" },
+                    st.tx, st.unacked, BT_C2_INFLIGHT_MAX
+                );
+                true
+            }
+            Ok((moved, next)) => {
+                // The transaction RETIRED short, so the pipe's toggle advanced even though what
+                // went out was a fragment the controller cannot parse. Recording it keeps the next
+                // read in sync; nothing else about this packet is salvageable. It is counted
+                // against the depth limit too: the controller took bytes and owes a completion for
+                // them whether or not they parsed.
+                st.unacked += 1;
+                self.bt_acl_tog.0 = next;
+                serial_println!(
+                    ":: bt-c2: [{}] -> OUT{} {} SHORT — {}/{} bytes moved. A partially written ACL packet is not a packet == witness ::",
+                    self.idx, bulk_out, what, moved, total
+                );
+                false
+            }
+            Err(why) => {
+                serial_println!(
+                    ":: bt-c2: [{}] -> OUT{} {} FAILED ({}) — {}. The BR/EDR link is untouched and BT-C1's HCI_Disconnect below still runs == witness ::",
+                    self.idx, bulk_out, what, why,
+                    if why == "nodata" {
+                        "the transaction did not retire within its budget: the toggle did NOT advance and no bytes went out"
+                    } else {
+                        "the transaction reached the wire and the endpoint halted (the primitive printed its own bt-l4: line above — it is the shared ACL primitive's, and this line names which exchange it broke)"
+                    }
+                );
+                false
+            }
+        }
+    }
+
+    /// BT-C2 — read ONE COMPLETE ACL packet into `buf`, reassembling across USB transactions.
+    ///
+    /// Returns the total byte count of the packet (ACL header included), or `None` when the budget
+    /// expired, the endpoint halted, or the packet could not be assembled. `None` is NOT witnessed
+    /// on the ordinary expiry path — a bulk-IN with nothing to deliver NAKs until its deadline, and
+    /// that is the expected outcome of a poll, not an error. Everything else prints.
+    ///
+    /// WHY REASSEMBLY EXISTS HERE AND NOT IN BT-L4. L4's one exchange was 15 bytes out and a
+    /// sub-30-byte answer, both comfortably inside the 64-byte ACL endpoint, so "one bulk-IN is one
+    /// ACL packet" held by arithmetic. This stage negotiates an L2CAP MTU of 48, which makes its own
+    /// channel's largest packet 56 bytes and still safe — but the SIGNALLING channel's MTU is the
+    /// peer's business, and a peer is entitled to send a `CONFIGURATION_REQUEST` longer than one
+    /// USB max-packet. Treating a 64-byte first transaction as a whole packet would have parsed a
+    /// truncated PDU and reported the peer as malformed. The ACL header's own
+    /// `Data_Total_Length` is the authority, and it is read before anything else is believed.
+    #[cfg(feature = "btc")]
+    unsafe fn bt_c2_recv(
+        &mut self,
+        t: &Target,
+        st: &mut BtC2,
+        buf: &mut [u8; BT_ACL_BUF_MAX],
+        budget: u64,
+    ) -> Option<usize> {
+        let (bulk_in, _, in_mps, _) = self.bt_acl;
+        let t0 = crate::arch::now_cycles();
+        let mut have = 0usize;
+        let mut want = 0usize; // 0 until the ACL header has been read
+        loop {
+            if st.rx + st.zlp >= BT_C2_PKT_MAX {
+                serial_println!(
+                    ":: bt-c2: [{}] <- IN{} STOPPED — the stage's structural packet cap ({}) is spent; no further ACL read is made this stage == witness ::",
+                    self.idx, bulk_in, BT_C2_PKT_MAX
+                );
+                return None;
+            }
+            let el = crate::arch::now_cycles().wrapping_sub(t0);
+            if el >= budget {
+                if have != 0 {
+                    serial_println!(
+                        ":: bt-c2: [{}] <- IN{} INCOMPLETE — {} of {} declared bytes arrived before the window closed; a partial ACL packet is not decoded == witness ::",
+                        self.idx, bulk_in, have, want
+                    );
+                }
+                return None;
+            }
+            // A bulk-IN must be asked for in WHOLE max packets or the device babbles and the
+            // controller halts the pipe (BT-L4 review condition 3), so there must be a whole
+            // max-packet of room left before one is issued.
+            if BT_ACL_BUF_MAX - have < in_mps as usize {
+                serial_println!(
+                    ":: bt-c2: [{}] <- IN{} OVERRUN — {} bytes assembled and the declared packet is {}; the {}-byte buffer cannot take another {}-byte max-packet. The packet is abandoned undecoded == witness ::",
+                    self.idx, bulk_in, have, want, BT_ACL_BUF_MAX, in_mps
+                );
+                return None;
+            }
+            let tog = self.bt_acl_tog.1;
+            let (got, next) = match self.bt_acl_txn(
+                t, bulk_in, true, in_mps, in_mps as u32, tog, budget - el,
+            ) {
+                Ok(v) => v,
+                // "nodata" = the window expired with the transfer still active. Nothing arrived and
+                // nothing was lost: the toggle did not advance because no transaction retired.
+                Err(_) => return None,
+            };
+            self.bt_acl_tog.1 = next;
+            if got == 0 {
+                st.zlp += 1;
+                continue;
+            }
+            let n = got as usize;
+            for i in 0..n {
+                buf[have + i] = self.data_buf.add(i).read();
+            }
+            have += n;
+            st.rx += 1;
+            // A packet arriving from the peer is the only evidence this stage has that the
+            // controller drained what it was handed. It is NOT a `Number Of Completed Packets`
+            // event and is not treated as one — it simply releases the depth limit for the next
+            // send. See `BT_C2_INFLIGHT_MAX`.
+            st.unacked = 0;
+            if want == 0 {
+                if have < 4 {
+                    serial_println!(
+                        ":: bt-c2: [{}] <- IN{} RUNT {} byte(s) — an ACL header is 4; undecodable and abandoned == witness ::",
+                        self.idx, bulk_in, have
+                    );
+                    return None;
+                }
+                want = 4 + ((buf[2] as usize) | ((buf[3] as usize) << 8));
+            }
+            if have >= want {
+                // REVIEW FIX 11 — bytes past the ACL header's declared length are DROPPED, and
+                // that is now said out loud. It happens when a single bulk-IN carries more than
+                // one ACL packet back to back, which this stage cannot demultiplex (it reassembles
+                // by declared length and has no packet queue); the surplus is a PDU that will never
+                // be decoded, and the previous cut discarded it without leaving a trace.
+                if have > want {
+                    serial_println!(
+                        ":: bt-c2: [{}] <- IN{} carried {} byte(s) past the {} the ACL header declared. They are DISCARDED UNDECODED — most likely a second ACL packet in the same USB transaction, which this stage has no queue for. Anything the peer said in those bytes is lost to this capture == witness ::",
+                        self.idx, bulk_in, have - want, want
+                    );
+                    st.stepped += 1;
+                }
+                return Some(want.min(have));
+            }
+            serial_println!(
+                ":: bt-c2: [{}] <- IN{} SPANS TRANSACTIONS — {} of {} declared bytes so far (max packet {}); another bulk-IN is issued to complete the ACL packet == witness ::",
+                self.idx, bulk_in, have, want, in_mps
+            );
+        }
+    }
+
+    /// BT-C2 — answer the peer's `CONFIGURATION_REQUEST`, and say what it asked for.
+    ///
+    /// A BR/EDR L2CAP channel is not usable until BOTH directions are configured (Vol 3 Part A
+    /// §6.1.3, the CONFIG state) — this host's request accepted by the peer, and the peer's request
+    /// accepted by this host. Skipping the second half is the classic way to build a channel that
+    /// exists in the log and never carries a byte.
+    ///
+    /// WHAT IS ACCEPTED AND WHAT IS NOT. Every option is decoded and printed. Options that
+    /// constrain the PEER — MTU (its receive limit, i.e. our send limit), flush timeout, QoS,
+    /// FCS, extended window — are accepted as proposed, because a Basic-mode responder can honour
+    /// all of them by doing nothing. The one option that is NOT free is `RETRANSMISSION AND FLOW
+    /// CONTROL` (type 0x04): a mode byte other than 0x00 asks for Enhanced Retransmission,
+    /// Streaming or Flow Control mode, none of which this stage implements. Accepting it would mean
+    /// promising framing this host cannot produce, so it is REFUSED with `result=0x0003 (Rejected)`
+    /// and the stage stops before AVDTP rather than talking a protocol it does not speak.
+    ///
+    /// Options carrying the HINT bit (0x80) are ignored wholesale, which is exactly what the hint
+    /// bit means (Vol 3 Part A §5).
+    #[cfg(feature = "btc")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_c2_answer_config(
+        &mut self,
+        t: &Target,
+        handle: u16,
+        st: &mut BtC2,
+        ident: u8,
+        payload: &[u8],
+        t0: u64,
+        cap: u64,
+    ) {
+        if payload.len() < 4 {
+            serial_println!(
+                ":: bt-c2: [{}] <- CONFIGURATION_REQUEST MALFORMED — {} byte(s), 4 required for Destination CID + Flags; not answered == witness ::",
+                self.idx, payload.len()
+            );
+            return;
+        }
+        // REVIEW FIX 5 — the stage cap is re-checked HERE, before a single option line is emitted.
+        // `serial_println!` is synchronous and is NOT counted against `BT_C2_STAGE_MS`: at 115200
+        // baud a ~200-byte witness line costs ~17 ms of wall clock that no budget ever sees. A
+        // hostile or broken peer that sends a maximum-length option list therefore turns a 6-second
+        // cap into minutes of printing. The cap is consulted before printing, not only before
+        // waiting, and the print volume itself is bounded below.
+        if Self::bt_c2_window(t0, cap) == 0 {
+            serial_println!(
+                ":: bt-c2: [{}] <- CONFIGURATION_REQUEST ident={:#04x} ARRIVED AFTER THE STAGE CAP ({}ms) WAS SPENT — it is neither decoded nor answered, because decoding it means printing and printing is wall clock this stage no longer has == witness ::",
+                self.idx, ident, BT_C2_STAGE_MS
+            );
+            return;
+        }
+        let dcid = (payload[0] as u16) | ((payload[1] as u16) << 8);
+        let flags = (payload[2] as u16) | ((payload[3] as u16) << 8);
+        let cont = flags & 0x0001 != 0;
+        let ours = dcid == BT_C2_SCID;
+        let opts = &payload[4..];
+        serial_println!(
+            ":: bt-c2: [{}] <- CONFIGURATION_REQUEST ident={:#04x} dest_cid={:#06x}{} flags={:#06x}{} option_bytes={} == witness ::",
+            self.idx, ident, dcid,
+            if ours { "(this host's channel)" } else { "(NOT this host's channel — it is ANSWERED anyway so the peer's RTX timer does not stall, but it CANNOT configure a channel this host does not own, and the peer->host direction stays incomplete below)" },
+            flags,
+            if cont { "(CONTINUATION: more option bytes follow in a further request, so the channel is NOT configured by this one)" } else { "" },
+            opts.len()
+        );
+        // ---- walk the option list ---------------------------------------------------------------
+        // REVIEW FIX 5 — the walk is UNBOUNDED (it must be: a refusable option may sit anywhere in
+        // the list, so `refuse` has to see all of them) but the PRINTING is capped at
+        // `BT_C2_OPT_PRINT_MAX`. An L2CAP configuration option is 2 bytes minimum, so a
+        // maximum-length request carries ~120 of them and the previous cut would have emitted 120
+        // witness lines — around 47 KB of serial, roughly four seconds of wall clock, none of it
+        // visible to any budget. The decision is still made on every option; only the transcript is
+        // truncated, and the truncation says how much it dropped.
+        let mut off = 0usize;
+        let mut refuse = false;
+        let mut walked = 0u32;
+        let mut printed = 0u32;
+        while off + 2 <= opts.len() {
+            let raw = opts[off];
+            let ty = raw & !BT_L2CAP_OPT_HINT;
+            let hint = raw & BT_L2CAP_OPT_HINT != 0;
+            let olen = opts[off + 1] as usize;
+            if off + 2 + olen > opts.len() {
+                serial_println!(
+                    ":: bt-c2: [{}] <- config option type={:#04x} declares {} value byte(s) but only {} remain -> the option list is TRUNCATED and the walk stops here == witness ::",
+                    self.idx, ty, olen, opts.len() - off - 2
+                );
+                break;
+            }
+            let val = &opts[off + 2..off + 2 + olen];
+            walked += 1;
+            let mode = if ty == BT_L2CAP_OPT_RFC && !val.is_empty() { val[0] } else { 0 };
+            let bad = ty == BT_L2CAP_OPT_RFC && !hint && mode != 0x00;
+            if bad {
+                refuse = true;
+            }
+            // A refusable option is ALWAYS printed, whatever the cap: it is the one option whose
+            // bytes explain the verdict, and dropping it would leave a refusal with no evidence.
+            if printed < BT_C2_OPT_PRINT_MAX || bad {
+                printed += 1;
+                serial_println!(
+                    ":: bt-c2: [{}] <- config option {} — type={:#04x}{} len={} value=[{:02x} {:02x} {:02x} {:02x}]{} -> {} == witness ::",
+                    self.idx, walked, ty,
+                    if hint { "(HINT: may be ignored)" } else { "" },
+                    olen,
+                    val.first().copied().unwrap_or(0),
+                    val.get(1).copied().unwrap_or(0),
+                    val.get(2).copied().unwrap_or(0),
+                    val.get(3).copied().unwrap_or(0),
+                    match ty {
+                        BT_L2CAP_OPT_MTU if olen >= 2 => "(MTU: the peer's receive limit, i.e. the largest SDU this host may send it)",
+                        0x02 => "(FLUSH TIMEOUT: how long the peer's baseband may retransmit; nothing is required of this host)",
+                        0x03 => "(QUALITY OF SERVICE)",
+                        BT_L2CAP_OPT_RFC => "(RETRANSMISSION AND FLOW CONTROL: value[0] is the mode)",
+                        0x05 => "(FRAME CHECK SEQUENCE: applies to the retransmission modes, which this stage does not enter)",
+                        0x06 => "(EXTENDED FLOW SPEC)",
+                        0x07 => "(EXTENDED WINDOW SIZE)",
+                        _ => "(UNKNOWN OPTION TYPE)",
+                    },
+                    if bad {
+                        "REFUSED — a mode other than 0x00 (Basic) is asked for, and this stage implements Basic L2CAP only"
+                    } else if hint && ty == BT_L2CAP_OPT_RFC && mode != 0x00 {
+                        "IGNORED — a non-Basic mode arriving as a HINT is exactly what the hint bit permits a responder to drop"
+                    } else {
+                        "ACCEPTED AS PROPOSED"
+                    }
+                );
+            }
+            off += 2 + olen;
+        }
+        if walked > printed {
+            serial_println!(
+                ":: bt-c2: [{}] <- ...and {} further config option(s), DECIDED ON BUT NOT PRINTED (the transcript is capped at {} per request; a refusable option is always printed whatever the cap, so the verdict below is not hidden by this) == witness ::",
+                self.idx, walked - printed, BT_C2_OPT_PRINT_MAX
+            );
+        }
+        if off != opts.len() {
+            serial_println!(
+                ":: bt-c2: [{}] <- config option list has {} trailing byte(s) after {} decoded option(s); they are not decoded == witness ::",
+                self.idx, opts.len() - off, walked
+            );
+        }
+        // ---- the response ------------------------------------------------------------------------
+        // Source CID: the channel endpoint of the device that SENT the request, so that the peer
+        // can match this response to its own channel — i.e. the peer's CID, which this host learned
+        // as `dcid` from the CONNECTION_RSP. Flags echo the continuation bit. An empty option list
+        // on a success response means "accepted exactly as proposed".
+        //
+        // REVIEW FIX 1 — the refusal result is 0x0002 (REJECTED — no reason given), NOT 0x0003.
+        // 0x0003 is "failure — unknown options" (Vol 3 Part A §5.1 Table), which is a claim this
+        // host cannot make: it recognised the option perfectly well and declined to honour the mode
+        // inside it. The first cut sent 0x0003 while its own witness text said "REJECTED" and its
+        // own decode table on the receiving side said 0x0003 = UNKNOWN OPTIONS — the code
+        // contradicted itself across two functions, and a peer reading 0x0003 would have retried
+        // without the option instead of giving up.
+        let result: u16 = if refuse { 0x0002 } else { 0x0000 };
+        let peer = if st.dcid != 0 { st.dcid } else { dcid };
+        let body: [u8; 10] = [
+            BT_L2CAP_CFG_RSP,
+            ident,
+            0x06,
+            0x00,
+            peer as u8,
+            (peer >> 8) as u8,
+            flags as u8,
+            (flags >> 8) as u8,
+            result as u8,
+            (result >> 8) as u8,
+        ];
+        let sent = self.bt_c2_send(
+            t, handle, st, BT_L2CAP_CID_SIG, &body,
+            if refuse {
+                "CONFIGURATION_RESPONSE result=0x0002 (REJECTED — no reason given)"
+            } else {
+                "CONFIGURATION_RESPONSE result=0x0000 (accepted as proposed)"
+            },
+        );
+        if refuse {
+            st.peer_cfg_refused = true;
+        } else if sent && !cont && ours {
+            // Only a FINAL response (continuation clear) completes this direction. A continuation
+            // response is an acknowledgement that more is coming, not an agreement.
+            //
+            // REVIEW FIX 3 — and only a request naming THIS HOST'S CID configures this host's
+            // channel. The line above already prints "NOT this host's channel"; setting the flag
+            // anyway would have let a request for some other channel satisfy the OPEN condition for
+            // ours, which is the same class of defect as adopting a Connection Complete for an
+            // address BT-C1 did not page.
+            st.peer_cfg_done = true;
+        }
+        serial_println!(
+            ":: bt-c2: [{}] peer->host configuration {} — sent={} result={:#06x} continuation={} names_this_channel={} == witness ::",
+            self.idx,
+            if st.peer_cfg_refused { "REFUSED BY THIS HOST" } else if st.peer_cfg_done { "COMPLETE" } else { "NOT YET COMPLETE" },
+            sent, result, cont, ours
+        );
+    }
+
+    /// BT-C2 — wait, bounded, for one specific PDU, servicing whatever the peer sends meanwhile.
+    ///
+    /// This is `bt_l3_await`'s shape moved from the event endpoint to the ACL pipe, and it exists
+    /// for the same reason: the thing you asked for is rarely the next thing that arrives. A peer
+    /// that accepts an L2CAP channel typically sends its own `CONFIGURATION_REQUEST` and often an
+    /// `INFORMATION_REQUEST` before or between the responses this host is waiting for, and a wait
+    /// that treated them as "not my answer" would either time out or — worse — leave the peer's
+    /// RTX timer running on a request nobody ever answered.
+    ///
+    /// So peer-initiated signalling is ANSWERED here, inline, and only then stepped over:
+    /// `CONFIGURATION_REQUEST` gets a real decision (see `bt_c2_answer_config`),
+    /// `INFORMATION_REQUEST` gets an honest "not supported", `ECHO_REQUEST` gets an echo,
+    /// `DISCONNECTION_REQUEST` gets a response and ends the channel, and anything else gets
+    /// `COMMAND_REJECT`. A `COMMAND_REJECT` arriving FOR US ends the wait immediately: a rejected
+    /// request will never be answered, so running its budget out would be spending the stage's
+    /// clock on a certainty.
+    ///
+    /// MATCHING IS BY CID AND COMMAND CODE, NEVER BY IDENTIFIER, and that is deliberate: this stage
+    /// has exactly one request outstanding at a time, so a code on the right channel is
+    /// unambiguous, whereas matching on the Identifier this host chose would make a peer that
+    /// echoes the wrong one — which several embedded stacks do — look like silence. The Identifier
+    /// is still PRINTED on every decoded PDU, so a capture can check the echo even though the code
+    /// does not depend on it.
+    ///
+    /// Returns the length of the matched PDU's payload, which sits at `buf[12..]` for a signalling
+    /// match and at `buf[8..]` for an AVDTP one.
+    #[cfg(feature = "btc")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_c2_await(
+        &mut self,
+        t: &Target,
+        handle: u16,
+        st: &mut BtC2,
+        want: BtC2Want,
+        budget: u64,
+        buf: &mut [u8; BT_ACL_BUF_MAX],
+        t0_stage: u64,
+        cap: u64,
+    ) -> Option<usize> {
+        // REVIEW FIX 6 — a wait that was never made must not be reported as a wait that expired.
+        // `bt_c2_window` returns 0 once `BT_C2_STAGE_MS` is spent, and the previous cut returned
+        // `None` silently on that path — so every caller's "NO ... within the window" line blamed
+        // the peer for silence during a window that never opened. The distinction is said here,
+        // once, rather than trusted to five call sites.
+        if budget == 0 {
+            serial_println!(
+                ":: bt-c2: [{}] STAGE CAP SPENT ({}ms) — NO WAIT WAS MADE for this PDU. Nothing below this line is evidence about the peer: it was never listened for == witness ::",
+                self.idx, BT_C2_STAGE_MS
+            );
+            return None;
+        }
+        let t0 = crate::arch::now_cycles();
+        loop {
+            let el = crate::arch::now_cycles().wrapping_sub(t0);
+            if el >= budget {
+                return None;
+            }
+            let n = self.bt_c2_recv(t, st, buf, budget - el)?;
+            if n < 8 {
+                serial_println!(
+                    ":: bt-c2: [{}] <- ACL packet {} bytes — 8 are required for an ACL + L2CAP header; undecodable, stepped over == witness ::",
+                    self.idx, n
+                );
+                st.stepped += 1;
+                continue;
+            }
+            let rh = (buf[0] as u16) | ((buf[1] as u16) << 8);
+            let (rhandle, pb) = (rh & 0x0FFF, (rh >> 12) & 0b11);
+            let l2 = (buf[4] as u16) | ((buf[5] as u16) << 8);
+            let cid = (buf[6] as u16) | ((buf[7] as u16) << 8);
+            if rhandle != handle & 0x0FFF || pb == BT_ACL_PB_CONT {
+                serial_println!(
+                    ":: bt-c2: [{}] <- ACL handle={:#06x} pb={:#04b} cid={:#06x} l2cap_len={} -> {} stepped over == witness ::",
+                    self.idx, rhandle, pb, cid, l2,
+                    if pb == BT_ACL_PB_CONT {
+                        "a CONTINUATION fragment of an L2CAP PDU. This stage's own MTU is 48, so nothing it owns can be fragmented; a fragment here belongs to a channel it does not own and is named, not reassembled —"
+                    } else {
+                        "NOT this stage's connection handle (an ACL packet for some other link),"
+                    }
+                );
+                st.stepped += 1;
+                continue;
+            }
+            // The L2CAP length field is the authority for the payload, and it must fit what arrived.
+            let end = 8usize.saturating_add(l2 as usize).min(n);
+            let payload_len = end - 8;
+            if payload_len != l2 as usize {
+                serial_println!(
+                    ":: bt-c2: [{}] <- L2CAP cid={:#06x} declares {} payload byte(s) and only {} arrived -> TRUNCATED, stepped over == witness ::",
+                    self.idx, cid, l2, payload_len
+                );
+                st.stepped += 1;
+                continue;
+            }
+            // ---- the AVDTP channel ---------------------------------------------------------------
+            if cid == BT_C2_SCID {
+                if want == BtC2Want::Avdtp {
+                    return Some(payload_len);
+                }
+                serial_println!(
+                    ":: bt-c2: [{}] <- {} byte(s) on the AVDTP channel (cid={:#06x}) while awaiting a signalling PDU -> stepped over == witness ::",
+                    self.idx, payload_len, cid
+                );
+                st.stepped += 1;
+                continue;
+            }
+            if cid != BT_L2CAP_CID_SIG {
+                serial_println!(
+                    ":: bt-c2: [{}] <- L2CAP PDU on cid={:#06x}, which is neither the signalling channel ({:#06x}) nor this stage's channel ({:#06x}) -> stepped over == witness ::",
+                    self.idx, cid, BT_L2CAP_CID_SIG, BT_C2_SCID
+                );
+                st.stepped += 1;
+                continue;
+            }
+            // ---- the signalling channel ------------------------------------------------------------
+            if payload_len < 4 {
+                serial_println!(
+                    ":: bt-c2: [{}] <- signalling PDU {} byte(s) — a command header is 4 (Code, Identifier, Length); undecodable, stepped over == witness ::",
+                    self.idx, payload_len
+                );
+                st.stepped += 1;
+                continue;
+            }
+            let code = buf[8];
+            let ident = buf[9];
+            let siglen = ((buf[10] as usize) | ((buf[11] as usize) << 8)).min(payload_len - 4);
+            if want == BtC2Want::Sig(code) {
+                return Some(siglen);
+            }
+            match code {
+                BT_L2CAP_CMD_REJECT => {
+                    let reason = if siglen >= 2 {
+                        (buf[12] as u16) | ((buf[13] as u16) << 8)
+                    } else {
+                        0xFFFF
+                    };
+                    st.rejected = true;
+                    serial_println!(
+                        ":: bt-c2: [{}] <- COMMAND_REJECT ident={:#04x} reason={:#06x}{} -> the request this wait was for will NEVER be answered, so the wait ends here rather than running its budget out == witness ::",
+                        self.idx, ident, reason,
+                        match reason {
+                            0x0000 => " (COMMAND NOT UNDERSTOOD: the peer's L2CAP does not implement the command this host sent)",
+                            0x0001 => " (SIGNALLING MTU EXCEEDED: the PDU was longer than the peer's signalling MTU)",
+                            0x0002 => " (INVALID CID IN REQUEST: the peer does not know one of the CIDs named)",
+                            _ => "",
+                        }
+                    );
+                    return None;
+                }
+                BT_L2CAP_CFG_REQ => {
+                    let p_start = 12usize;
+                    let p_end = (p_start + siglen).min(n);
+                    let mut copy = [0u8; BT_ACL_BUF_MAX];
+                    let cl = p_end - p_start;
+                    copy[..cl].copy_from_slice(&buf[p_start..p_end]);
+                    self.bt_c2_answer_config(t, handle, st, ident, &copy[..cl], t0_stage, cap);
+                    st.stepped += 1;
+                }
+                BT_L2CAP_INFO_REQ => {
+                    let ity = if siglen >= 2 {
+                        (buf[12] as u16) | ((buf[13] as u16) << 8)
+                    } else {
+                        0
+                    };
+                    // InfoType(2) + Result(2). 0x0001 = NOT SUPPORTED, which is the true answer:
+                    // this host publishes no extended-feature mask and no fixed-channel map.
+                    let body: [u8; 8] = [
+                        BT_L2CAP_INFO_RSP, ident, 0x04, 0x00,
+                        ity as u8, (ity >> 8) as u8, 0x01, 0x00,
+                    ];
+                    serial_println!(
+                        ":: bt-c2: [{}] <- INFORMATION_REQUEST ident={:#04x} info_type={:#06x}{} == witness ::",
+                        self.idx, ident, ity,
+                        match ity {
+                            0x0001 => " (CONNECTIONLESS MTU)",
+                            0x0002 => " (EXTENDED FEATURES MASK)",
+                            0x0003 => " (FIXED CHANNELS SUPPORTED)",
+                            _ => "",
+                        }
+                    );
+                    self.bt_c2_send(
+                        t, handle, st, BT_L2CAP_CID_SIG, &body,
+                        "INFORMATION_RESPONSE result=0x0001 (NOT SUPPORTED — this host publishes no feature mask, and saying so is what keeps the peer's RTX timer from stalling)",
+                    );
+                    st.stepped += 1;
+                }
+                BT_L2CAP_ECHO_REQ => {
+                    let body: [u8; 4] = [BT_L2CAP_ECHO_REQ + 1, ident, 0x00, 0x00];
+                    serial_println!(
+                        ":: bt-c2: [{}] <- ECHO_REQUEST ident={:#04x} data_len={} == witness ::",
+                        self.idx, ident, siglen
+                    );
+                    self.bt_c2_send(
+                        t, handle, st, BT_L2CAP_CID_SIG, &body,
+                        "ECHO_RESPONSE (empty — the echo data is not returned, which the spec permits)",
+                    );
+                    st.stepped += 1;
+                }
+                BT_L2CAP_DISC_REQ if siglen >= 4 => {
+                    let d = (buf[12] as u16) | ((buf[13] as u16) << 8);
+                    let s = (buf[14] as u16) | ((buf[15] as u16) << 8);
+                    let body: [u8; 8] = [
+                        BT_L2CAP_DISC_RSP, ident, 0x04, 0x00,
+                        d as u8, (d >> 8) as u8, s as u8, (s >> 8) as u8,
+                    ];
+                    serial_println!(
+                        ":: bt-c2: [{}] <- DISCONNECTION_REQUEST ident={:#04x} dest_cid={:#06x} src_cid={:#06x} -> THE PEER IS CLOSING THE CHANNEL. It is answered, and this host owes no disconnection request of its own == witness ::",
+                        self.idx, ident, d, s
+                    );
+                    self.bt_c2_send(
+                        t, handle, st, BT_L2CAP_CID_SIG, &body,
+                        "DISCONNECTION_RESPONSE",
+                    );
+                    st.peer_closed = true;
+                    st.stepped += 1;
+                    return None;
+                }
+                // REVIEW FIX 8 — a RESPONSE that is not the one this wait asked for, identified by
+                // PARITY rather than by an enumeration of the codes this stage happens to know.
+                //
+                // L2CAP signalling codes are allocated in request/response pairs with the request
+                // EVEN and the response ODD (Vol 3 Part A §4: 0x02/0x03 connect, 0x04/0x05 config,
+                // 0x06/0x07 disconnect, 0x08/0x09 echo, 0x0A/0x0B information, and onward through
+                // 0x0C..0x19 for the create/move/flow-spec commands this stage does not implement).
+                // The previous cut listed the five response codes it knew by name, so every OTHER
+                // odd code — 0x0D, 0x0F, 0x11, 0x13, 0x17, 0x19 — fell through to the reject arm
+                // and got a COMMAND_REJECT sent for it. That is the exact thing the comment on that
+                // arm says must never happen: rejecting a response puts a PDU on the wire the peer
+                // has no transaction for. 0x01 (COMMAND_REJECT itself) is odd too and is handled
+                // above, before this arm is reached.
+                c if c & 1 == 1 => {
+                    serial_println!(
+                        ":: bt-c2: [{}] <- signalling RESPONSE code={:#04x} ident={:#04x} len={} -> an ODD signalling code is a RESPONSE (Vol 3 Part A §4 allocates request/response in even/odd pairs); not the one this wait asked for, so it is stepped over and NOT rejected — a COMMAND_REJECT answers a request, never a response == witness ::",
+                        self.idx, c, ident, siglen
+                    );
+                    st.stepped += 1;
+                }
+                other => {
+                    // Reason 0x0000 = Command not understood. Answering is not politeness: an
+                    // unanswered request keeps the peer's RTX timer running and it will retransmit,
+                    // which is how a signalling channel deadlocks against a silent host.
+                    let body: [u8; 6] = [BT_L2CAP_CMD_REJECT, ident, 0x02, 0x00, 0x00, 0x00];
+                    serial_println!(
+                        ":: bt-c2: [{}] <- signalling code={:#04x} ident={:#04x} len={} -> an EVEN code is a REQUEST, and not one this stage implements (or a request of a shape it could not decode, such as a short DISCONNECTION_REQUEST). It is rejected rather than ignored, because an unanswered request keeps the peer's RTX timer running == witness ::",
+                        self.idx, other, ident, siglen
+                    );
+                    self.bt_c2_send(
+                        t, handle, st, BT_L2CAP_CID_SIG, &body,
+                        "COMMAND_REJECT reason=0x0000 (command not understood)",
+                    );
+                    st.stepped += 1;
+                }
+            }
+            if st.peer_cfg_refused {
+                // This host has told the peer it cannot configure the channel. Nothing further is
+                // worth waiting for; the caller's teardown is what runs next.
+                return None;
+            }
+            if want == BtC2Want::PeerConfig && st.peer_cfg_done {
+                // The milestone this wait exists for was reached by the servicing above. Returning
+                // now rather than running the window out is what keeps `BT_C2_STAGE_MS` available
+                // to the exchanges that still have to happen.
+                return Some(0);
+            }
+        }
+    }
+
+    /// BT-C2 — open an L2CAP channel to the speaker's AVDTP service and ask it to name its stream
+    /// endpoints. The first thing above the BR/EDR link BT-C1 established.
+    ///
+    /// Runs on a handle BT-C1 has already proven live, and BEFORE the mandatory `HCI_Disconnect` —
+    /// exactly where BT-L4 sits on the LE side, and for the same two reasons: it can only ever run
+    /// on a proven link, and it is structurally incapable of skipping the teardown, because it
+    /// returns unit and the `if live` block that disconnects is conditional on nothing it does.
+    ///
+    /// THE SEQUENCE, and every PDU is printed in both directions:
+    ///
+    /// 1. `L2CAP_CONNECTION_REQ` (code 0x02) on CID 0x0001 — PSM 0x0019 (AVDTP), Source CID 0x0040.
+    /// 2. `L2CAP_CONNECTION_RSP` (0x03) — the deliverable of the first half. `result=0x0000` is a
+    ///    channel; `0x0001` is PENDING and is waited on once more; everything else is a refusal
+    ///    this stage names and stops on.
+    /// 3. `L2CAP_CONFIGURATION_REQ` (0x04) out, proposing MTU 48 — and the peer's own
+    ///    configuration request in, answered by `bt_c2_answer_config`. A channel is OPEN only when
+    ///    BOTH have succeeded.
+    /// 4. `AVDTP_DISCOVER` (signal 0x01) on the open channel, and the Stream End Point list that
+    ///    comes back — the deliverable of the second half.
+    /// 5. `L2CAP_DISCONNECTION_REQ` (0x06), unless the peer closed the channel first.
+    ///
+    /// WHAT IS NOT LEFT OUTSTANDING. The L2CAP channel is closed by this stage on every path it can
+    /// close it on; and where it cannot — an unanswered disconnection request, a halted pipe — the
+    /// `HCI_Disconnect` that BT-C1 issues immediately afterwards tears the whole ACL link down, and
+    /// an L2CAP channel cannot outlive the link it rides. That is the honest statement: this stage
+    /// can leave a channel unconfirmed, and it cannot leave one alive.
+    #[cfg(feature = "btc")]
+    unsafe fn bt_c2_l2cap(&mut self, t: &Target, handle: u16) {
+        let (bulk_in, bulk_out, in_mps, out_mps) = self.bt_acl;
+        let t0 = crate::arch::now_cycles();
+        let cap = Self::bt_l3_budget(BT_C2_STAGE_MS);
+        // ---- the transport gate -----------------------------------------------------------------
+        // Every reason C2 might be unreachable, on ONE line, before anything is sent — so a capture
+        // with no L2CAP traffic in it says why rather than merely lacking it. It is BT-L4's gate
+        // plus one term: the controller's ACL buffer count, which this stage needs because it has a
+        // moment with two packets unacknowledged (see `bt_acl_bufs`).
+        if bulk_in == 0
+            || bulk_out == 0
+            || in_mps == 0
+            || out_mps == 0
+            || !self.overlay_mode
+            || in_mps as usize > BT_ACL_BUF_MAX
+            || self.bt_acl_bufs < 2
+        {
+            serial_println!(
+                ":: bt-c2: [{}] L2CAP NOT ATTEMPTED — bulk_in=IN{}/{} bulk_out=OUT{}/{} overlay_mode={} acl_buffers={} buf_capacity={}; {}. NO ACL packet was sent and BT-C1's disconnect below is unaffected == witness ::",
+                self.idx, bulk_in, in_mps, bulk_out, out_mps, self.overlay_mode,
+                self.bt_acl_bufs, BT_ACL_BUF_MAX,
+                if !self.overlay_mode {
+                    "this controller executes FETCHED qTDs (chain mode) and has never been driven overlay-direct; the ACL transport BT-L4 built rests on the overlay-direct finding and does not extend to a chain path this arc has not built"
+                } else if self.bt_acl_bufs < 2 {
+                    "the controller reports fewer than two ACL buffers (or HCI_Read_Buffer_Size never returned one, which reads the same and is treated the same). This stage answers the peer's configuration request while its own is still in flight, so two host-to-controller packets may be unacknowledged at once, and a one-buffer controller would have the second silently dropped"
+                } else if bulk_in != 0 && in_mps as usize > BT_ACL_BUF_MAX {
+                    "the ACL IN endpoint's max packet exceeds the buffer this path borrows; a bulk-IN must be asked for in whole max-packets, so a short request is not an option and the stage is refused instead"
+                } else {
+                    "the claimed interface does not carry a usable ACL bulk pair, so there is no data transport to the link at all"
+                }
+            );
+            return;
+        }
+        let mut st = BtC2 { ident: 1, ..BtC2::default() };
+        let mut buf = [0u8; BT_ACL_BUF_MAX];
+        serial_println!(
+            ":: bt-c2: [{}] transport — BR/EDR handle={:#06x} ACL pair addr={} bulk_out=OUT{}/{}B bulk_in=IN{}/{}B acl_buffers={} start_toggle=(out {}, in {}){} stage_cap={}ms per_pdu_window={}ms packet_cap={} tx_cap={} == witness ::",
+            self.idx, handle & 0x0FFF, t.addr, bulk_out, out_mps, bulk_in, in_mps,
+            self.bt_acl_bufs,
+            if self.bt_acl_tog.0 { "DATA1" } else { "DATA0" },
+            if self.bt_acl_tog.1 { "DATA1" } else { "DATA0" },
+            if self.bt_acl_tog == (false, false) {
+                " (both DATA0: no ACL traffic has run on this pipe since SET_CONFIGURATION)"
+            } else {
+                " — CARRIED OVER FROM BT-L4's LE exchange. A bulk pipe's toggle belongs to the ENDPOINT and is not reset by a new Bluetooth link; starting from DATA0 here would have this host's first packet silently discarded as a retransmission"
+            },
+            BT_C2_STAGE_MS, BT_C2_SIG_MS, BT_C2_PKT_MAX, BT_C2_TX_MAX
+        );
+
+        // ---- 1. L2CAP_CONNECTION_REQUEST ---------------------------------------------------------
+        // Code(1) Identifier(1) Length(2)=4, then PSM(2) Source_CID(2). Little-endian throughout.
+        let req: [u8; 8] = [
+            BT_L2CAP_CONN_REQ,
+            st.ident,
+            0x04,
+            0x00,
+            BT_C2_PSM_AVDTP as u8,
+            (BT_C2_PSM_AVDTP >> 8) as u8,
+            BT_C2_SCID as u8,
+            (BT_C2_SCID >> 8) as u8,
+        ];
+        let conn_ident = st.ident;
+        st.ident = st.ident.wrapping_add(1).max(1);
+        if !self.bt_c2_send(
+            t, handle, &mut st, BT_L2CAP_CID_SIG, &req,
+            "CONNECTION_REQUEST psm=0x0019(AVDTP) scid=0x0040",
+        ) {
+            self.bt_c2_tally(t0, &st, "the CONNECTION_REQUEST never reached the controller");
+            return;
+        }
+        serial_println!(
+            ":: bt-c2: [{}] CONNECTION_REQUEST sent — ident={:#04x} psm={:#06x}(AVDTP, fixed by Assigned Numbers — this is why no SDP query precedes it) scid={:#06x}; awaiting CONNECTION_RESPONSE, window={}ms == witness ::",
+            self.idx, conn_ident, BT_C2_PSM_AVDTP, BT_C2_SCID, BT_C2_SIG_MS
+        );
+
+        // ---- 2. L2CAP_CONNECTION_RESPONSE --------------------------------------------------------
+        // Destination_CID(2) Source_CID(2) Result(2) Status(2). PENDING (0x0001) is answered by
+        // waiting once more and no further: a peer that stays pending is a peer that is deciding,
+        // and this stage's budget is not the place to wait out an authorisation prompt.
+        let mut open = false;
+        for round in 1..=2u32 {
+            let w = Self::bt_c2_window(t0, cap);
+            let Some(len) = self.bt_c2_await(t, handle, &mut st, BtC2Want::Sig(BT_L2CAP_CONN_RSP), w, &mut buf, t0, cap)
+            else {
+                serial_println!(
+                    ":: bt-c2: [{}] NO CONNECTION_RESPONSE (round {}) within the window{} — the channel does not exist and nothing was opened == witness ::",
+                    self.idx, round,
+                    if st.rejected { ", the peer having REJECTED the request outright" }
+                    else if st.peer_closed { ", the peer having closed the link's signalling first" }
+                    else { "" }
+                );
+                break;
+            };
+            if len < 8 {
+                serial_println!(
+                    ":: bt-c2: [{}] <- CONNECTION_RESPONSE SHORT ({} byte(s), 8 required for DCID+SCID+Result+Status) -> MALFORMED; no channel is claimed == witness ::",
+                    self.idx, len
+                );
+                break;
+            }
+            let d = (buf[12] as u16) | ((buf[13] as u16) << 8);
+            let s = (buf[14] as u16) | ((buf[15] as u16) << 8);
+            let result = (buf[16] as u16) | ((buf[17] as u16) << 8);
+            let status = (buf[18] as u16) | ((buf[19] as u16) << 8);
+            serial_println!(
+                ":: bt-c2: [{}] <- CONNECTION_RESPONSE ident={:#04x} dest_cid={:#06x} src_cid={:#06x}{} result={:#06x} status={:#06x} -> {} == witness ::",
+                self.idx, buf[9], d, s,
+                if s == BT_C2_SCID { "(this host's CID, echoed)" } else { "(NOT the CID this host sent — this response belongs to some other request)" },
+                result, status,
+                match result {
+                    0x0000 => "L2CAP CHANNEL ESTABLISHED. The signalling road to A2DP is open at the transport layer; it is not usable until both directions are configured, which is the next exchange",
+                    0x0001 => "PENDING — the peer has not decided yet (commonly an authorisation step on the device). One further response is waited for and no more",
+                    0x0002 => "PSM NOT SUPPORTED — this device does not publish an AVDTP service at all. That is a complete answer about the peer and says nothing against this host's L2CAP",
+                    0x0003 => "SECURITY BLOCK — the peer requires an authenticated and/or encrypted link before it will open this PSM. BT-C1's Connection Complete reported encryption=0x00 and this arc pairs with nothing, so THIS IS THE EXPECTED REFUSAL FROM A SPEAKER THAT INSISTS ON BONDING, and it names pairing (Secure Simple Pairing) as the next arc's prerequisite rather than leaving it to be guessed",
+                    0x0004 => "NO RESOURCES AVAILABLE — the peer has no channel to give right now, commonly because it is already streaming from another source",
+                    0x0006 => "INVALID SOURCE CID",
+                    0x0007 => "SOURCE CID ALREADY ALLOCATED — this host reused a CID the peer still holds from an earlier channel on this link",
+                    _ => "AN UNDEFINED RESULT — no channel is claimed on a code this stage cannot interpret",
+                }
+            );
+            if result == 0x0000 && s == BT_C2_SCID && d != 0 {
+                st.dcid = d;
+                open = true;
+                break;
+            }
+            if result != 0x0001 {
+                break;
+            }
+        }
+        if !open {
+            self.bt_c2_disconnect_if_open(t, handle, &mut st, &mut buf, t0, cap);
+            self.bt_c2_tally(t0, &st, "no L2CAP channel was established");
+            return;
+        }
+
+        // ---- 3. CONFIGURATION, both directions ---------------------------------------------------
+        // Vol 3 Part A §6.1.3: a channel enters OPEN only when the local device has accepted the
+        // peer's configuration AND the peer has accepted the local device's. Two independent
+        // handshakes, and this stage drives one and answers the other.
+        let cfg_ident = st.ident;
+        st.ident = st.ident.wrapping_add(1).max(1);
+        // Destination_CID(2) Flags(2)=0x0000 (no continuation), then one MTU option:
+        // Type(1)=0x01 Length(1)=0x02 Value(2)=the largest SDU this host will accept.
+        let cfg: [u8; 12] = [
+            BT_L2CAP_CFG_REQ,
+            cfg_ident,
+            0x08,
+            0x00,
+            st.dcid as u8,
+            (st.dcid >> 8) as u8,
+            0x00,
+            0x00,
+            BT_L2CAP_OPT_MTU,
+            0x02,
+            BT_C2_MTU as u8,
+            (BT_C2_MTU >> 8) as u8,
+        ];
+        if self.bt_c2_send(
+            t, handle, &mut st, BT_L2CAP_CID_SIG, &cfg,
+            "CONFIGURATION_REQUEST mtu=48",
+        ) {
+            serial_println!(
+                ":: bt-c2: [{}] CONFIGURATION_REQUEST sent — ident={:#04x} dest_cid={:#06x} flags=0x0000(no continuation) option=MTU({:#04x}) len=2 value={}(the BR/EDR mandatory minimum, so no conforming peer may refuse it, and a full-size SDU still fits ONE {}-byte bulk-IN) == witness ::",
+                self.idx, cfg_ident, st.dcid, BT_L2CAP_OPT_MTU, BT_C2_MTU, in_mps
+            );
+            // Await OUR configuration response. The peer's own CONFIGURATION_REQUEST commonly
+            // arrives first and is answered inside the wait, which is the whole reason the wait
+            // services rather than discards.
+            let w = Self::bt_c2_window(t0, cap);
+            match self.bt_c2_await(t, handle, &mut st, BtC2Want::Sig(BT_L2CAP_CFG_RSP), w, &mut buf, t0, cap) {
+                Some(len) if len >= 6 => {
+                    let s = (buf[12] as u16) | ((buf[13] as u16) << 8);
+                    let flags = (buf[14] as u16) | ((buf[15] as u16) << 8);
+                    let result = (buf[16] as u16) | ((buf[17] as u16) << 8);
+                    // REVIEW FIX 4 — the Source CID is CHECKED, not merely printed. It carries the
+                    // channel endpoint of the device that sent the request being answered, i.e.
+                    // this host's own CID, and it is how a response is matched to a channel. The
+                    // CONNECTION_RSP path has always tested it; this one printed it and believed
+                    // the result regardless, so a configuration response for SOME OTHER channel on
+                    // the same link would have satisfied this host's half of the OPEN condition.
+                    let ours = s == BT_C2_SCID;
+                    if result == 0x0000 && flags & 0x0001 == 0 && ours {
+                        st.our_cfg_done = true;
+                    }
+                    serial_println!(
+                        ":: bt-c2: [{}] <- CONFIGURATION_RESPONSE ident={:#04x} src_cid={:#06x}{} flags={:#06x} result={:#06x} -> {} == witness ::",
+                        self.idx, buf[9], s,
+                        if ours { "(this host's CID)" } else { "(NOT this host's CID — this response configures some other channel and does NOT complete this one, whatever its result says)" },
+                        flags, result,
+                        match result {
+                            0x0000 if flags & 0x0001 != 0 => "SUCCESS, but the CONTINUATION flag is set: the peer is answering in parts and this direction is not configured yet. This stage does not drive a multi-part configuration and stops here rather than claim one",
+                            0x0000 => "SUCCESS — this host's configuration is accepted, and the MTU it proposed stands",
+                            0x0001 => "UNACCEPTABLE PARAMETERS — the peer counter-proposes. A conforming peer cannot refuse the 48-byte mandatory minimum, so this is a surprise worth reading the option bytes for; adopting a counter-proposal and re-requesting is deliberately NOT done here, because one more negotiation round is a state machine this arc did not budget",
+                            0x0002 => "REJECTED (no reason given)",
+                            0x0003 => "UNKNOWN OPTIONS — the peer does not recognise the MTU option, which is mandatory, so its L2CAP is not conforming",
+                            0x0004 => "PENDING",
+                            0x0005 => "FLOW SPEC REJECTED",
+                            _ => "AN UNDEFINED RESULT",
+                        }
+                    );
+                }
+                Some(len) => serial_println!(
+                    ":: bt-c2: [{}] <- CONFIGURATION_RESPONSE SHORT ({} byte(s), 6 required) -> MALFORMED; this direction is NOT configured == witness ::",
+                    self.idx, len
+                ),
+                None => serial_println!(
+                    ":: bt-c2: [{}] NO CONFIGURATION_RESPONSE within the window{} — this host's direction is NOT configured == witness ::",
+                    self.idx,
+                    if st.rejected { ", the peer having answered COMMAND_REJECT" } else { "" }
+                ),
+            }
+        }
+        // The peer's request may still be outstanding — some stacks send theirs only after seeing
+        // ours answered. One further bounded wait, and it is a wait for a REQUEST, which the
+        // servicing path above answers as a side effect.
+        if !st.peer_cfg_done && !st.peer_cfg_refused && !st.peer_closed {
+            let w = Self::bt_c2_window(t0, cap);
+            if self.bt_c2_await(t, handle, &mut st, BtC2Want::PeerConfig, w, &mut buf, t0, cap).is_none()
+                && !st.peer_cfg_done
+            {
+                serial_println!(
+                    ":: bt-c2: [{}] NO CONFIGURATION_REQUEST from the peer within the window — the peer->host direction is NOT configured, so the channel is not OPEN and no AVDTP signal may be sent across it == witness ::",
+                    self.idx
+                );
+            }
+        }
+        // REVIEW FIX 2 — `peer_cfg_refused` is a TERM of the open condition, not a note beside it.
+        // Configuration is a sequence, not a single decision: a peer may send a first
+        // CONFIGURATION_REQUEST this host accepts (setting `peer_cfg_done`) and a second one
+        // asking for a retransmission mode this host refuses (setting `peer_cfg_refused` while
+        // `peer_cfg_done` stays true from the first). The previous cut then printed "OPEN. THE
+        // SIGNALLING ROAD TO A2DP EXISTS" and sent an AVDTP signal down a channel it had just told
+        // the peer it could not configure. A refusal is final for the channel, whatever preceded it.
+        let channel_open =
+            st.our_cfg_done && st.peer_cfg_done && !st.peer_cfg_refused && !st.peer_closed;
+        serial_println!(
+            ":: bt-c2: [{}] L2CAP channel state — scid={:#06x} dcid={:#06x} host->peer_configured={} peer->host_configured={} peer_refused_by_host={} peer_closed={} -> {} == witness ::",
+            self.idx, BT_C2_SCID, st.dcid, st.our_cfg_done, st.peer_cfg_done, st.peer_cfg_refused,
+            st.peer_closed,
+            if channel_open {
+                "OPEN. THE SIGNALLING ROAD TO A2DP EXISTS: an L2CAP channel to PSM 0x0019 on the speaker, configured in both directions, over the BR/EDR link BT-C1 paged for"
+            } else if st.peer_cfg_refused {
+                "NOT OPEN — THIS HOST REFUSED THE PEER'S CONFIGURATION. The peer asked for an L2CAP mode this stage does not implement; a refusal is final for the channel even if an earlier request was accepted, and NO AVDTP signal is sent across it"
+            } else {
+                "NOT OPEN. Both directions must be configured before a byte may be sent; the lines above say which half is missing, and NO AVDTP signal is sent"
+            }
+        );
+
+        // ---- 4. AVDTP_DISCOVER ---------------------------------------------------------------------
+        if channel_open {
+            self.bt_c2_avdtp_discover(t, handle, &mut st, &mut buf, t0, cap);
+        }
+
+        // ---- 5. TEARDOWN ----------------------------------------------------------------------------
+        self.bt_c2_disconnect_if_open(t, handle, &mut st, &mut buf, t0, cap);
+        self.bt_c2_tally(
+            t0, &st,
+            if channel_open { "the channel opened and was closed" } else { "the channel did not open" },
+        );
+    }
+
+    /// BT-C2 — one `AVDTP_DISCOVER` across the open channel, and the endpoint list it returns.
+    ///
+    /// AVDTP 1.3 §8.4.2 single-packet header, two octets:
+    ///   octet 0 = Transaction Label(4b) | Packet Type(2b) | Message Type(2b)
+    ///   octet 1 = RFA(2b) | Signal Identifier(6b)
+    /// Packet Type 0b00 is Single (the whole message in one packet), Message Type 0b00 is Command
+    /// and 0b10 is Response Accept, 0b11 Response Reject. Transaction Label 0 is used because this
+    /// stage has exactly one transaction outstanding at a time and a label only has to distinguish
+    /// concurrent ones.
+    ///
+    /// DISCOVER takes no parameters and changes nothing on the peer — it starts no stream, claims
+    /// no endpoint and negotiates no codec. That is precisely why it is where this arc stops: it is
+    /// the largest statement that can be made about the speaker's audio capability without touching
+    /// its state.
+    #[cfg(feature = "btc")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_c2_avdtp_discover(
+        &mut self,
+        t: &Target,
+        handle: u16,
+        st: &mut BtC2,
+        buf: &mut [u8; BT_ACL_BUF_MAX],
+        t0: u64,
+        cap: u64,
+    ) {
+        let cmd: [u8; 2] = [0x00, BT_AVDTP_SIG_DISCOVER];
+        if !self.bt_c2_send(
+            t, handle, st, st.dcid, &cmd,
+            "AVDTP_DISCOVER (label=0, packet_type=SINGLE, message_type=COMMAND, signal=0x01)",
+        ) {
+            return;
+        }
+        serial_println!(
+            ":: bt-c2: [{}] AVDTP_DISCOVER sent on cid={:#06x} — header=[{:02x} {:02x}] label=0 packet_type=0b00(SINGLE) message_type=0b00(COMMAND) signal={:#04x}; awaiting the Stream End Point list, window={}ms == witness ::",
+            self.idx, st.dcid, cmd[0], cmd[1], BT_AVDTP_SIG_DISCOVER, BT_C2_SIG_MS
+        );
+        let w = Self::bt_c2_window(t0, cap);
+        let Some(len) = self.bt_c2_await(t, handle, st, BtC2Want::Avdtp, w, buf, t0, cap) else {
+            serial_println!(
+                ":: bt-c2: [{}] NO AVDTP response within the window. The L2CAP channel is open and configured, so the transport is proven; what is missing is the peer's answer, and those are two different findings == witness ::",
+                self.idx
+            );
+            return;
+        };
+        if len < 2 {
+            serial_println!(
+                ":: bt-c2: [{}] <- AVDTP message {} byte(s) — a single-packet header is 2; undecodable == witness ::",
+                self.idx, len
+            );
+            return;
+        }
+        let h0 = buf[8];
+        let sig = buf[9] & 0x3F;
+        let (label, ptype, mtype) = (h0 >> 4, (h0 >> 2) & 0b11, h0 & 0b11);
+        if ptype != 0b00 {
+            serial_println!(
+                ":: bt-c2: [{}] <- AVDTP packet_type={:#04b} — this is a fragmented message (START/CONTINUE/END). This stage's MTU makes its own messages single-packet and it does not reassemble the peer's; the message is named and not decoded == witness ::",
+                self.idx, ptype
+            );
+            return;
+        }
+        // REVIEW FIX 11 — GENERAL REJECT IS TESTED BEFORE THE SIGNAL IDENTIFIER, because it does
+        // not carry one. AVDTP §8.4.2/§8.18: a General Reject answers a signal the peer does not
+        // implement, and in the pre-1.3 encoding — which is what a device that does not implement
+        // the signal is most likely speaking — the identifier octet is RFA and reads back as 0x00.
+        // The previous cut checked `sig != DISCOVER` first, so the General Reject arm below it
+        // could never be reached: the one response that says "this peer has no DISCOVER at all"
+        // was reported as "not the DISCOVER this host sent".
+        if mtype == 0b01 {
+            serial_println!(
+                ":: bt-c2: [{}] <- AVDTP GENERAL REJECT label={} signal_field={:#04x} -> the peer does not implement the DISCOVER signal at all. The channel and the transport are proven end to end; the service behind them is not what this host assumed == witness ::",
+                self.idx, label, sig
+            );
+            return;
+        }
+        if sig != BT_AVDTP_SIG_DISCOVER {
+            serial_println!(
+                ":: bt-c2: [{}] <- AVDTP signal={:#04x} label={} message_type={:#04b} -> not the DISCOVER this host sent == witness ::",
+                self.idx, sig, label, mtype
+            );
+            return;
+        }
+        match mtype {
+            0b10 => {
+                // Response Accept: a whole number of 2-byte SEP entries (AVDTP §8.6.2).
+                //   byte 0 = ACP_SEID(6b, bits 7..2) | In_Use(bit 1) | RFA(bit 0)
+                //   byte 1 = Media_Type(4b, bits 7..4) | TSEP(bit 3) | RFA(bits 2..0)
+                let list = &buf[10..8 + len];
+                let seps = list.len() / 2;
+                serial_println!(
+                    ":: bt-c2: [{}] <- AVDTP_DISCOVER RESPONSE ACCEPT label={} — {} payload byte(s) => {} Stream End Point(s){} -> THE SPEAKER NAMED ITS OWN STREAM ENDPOINTS. Signalling road proven end to end: bulk-OUT -> ACL -> L2CAP CID 0x0001 -> channel {:#06x} -> AVDTP -> bulk-IN == witness ::",
+                    self.idx, label, list.len(), seps,
+                    if list.len() % 2 != 0 { " (and ONE TRAILING BYTE: a SEP entry is exactly 2 bytes, so the list is malformed and the odd byte is not decoded)" } else { "" },
+                    st.dcid
+                );
+                // REVIEW FIX 5 — the SEP transcript is capped for the same reason the config
+                // option transcript is: `serial_println!` is wall clock no budget observes. Every
+                // SEP is COUNTED on the line above; the first `BT_C2_SEP_PRINT_MAX` are listed
+                // individually. A real speaker publishes 2 to 6.
+                for i in 0..seps.min(BT_C2_SEP_PRINT_MAX) {
+                    let (a, b) = (list[i * 2], list[i * 2 + 1]);
+                    let seid = a >> 2;
+                    let in_use = a & 0x02 != 0;
+                    let media = b >> 4;
+                    let sink = b & 0x08 != 0;
+                    serial_println!(
+                        ":: bt-c2: [{}] <- SEP {}/{} — seid={:#04x} in_use={} media_type={:#04x}({}) tsep={}{} raw=[{:02x} {:02x}] == witness ::",
+                        self.idx, i + 1, seps, seid, in_use, media,
+                        match media {
+                            0x00 => "AUDIO",
+                            0x01 => "VIDEO",
+                            0x02 => "MULTIMEDIA",
+                            _ => "RESERVED",
+                        },
+                        if sink { "SNK" } else { "SRC" },
+                        if media == 0x00 && sink && !in_use {
+                            " -> AN IDLE AUDIO SINK. THIS IS THE ENDPOINT A2DP PLAYBACK WOULD TARGET, and the next arc's GET_CAPABILITIES asks it which codecs it accepts"
+                        } else if media == 0x00 && sink {
+                            " -> an audio sink that is ALREADY IN USE: the speaker is streaming from another source, and this endpoint cannot be configured while it is"
+                        } else {
+                            ""
+                        },
+                        a, b
+                    );
+                }
+                if seps > BT_C2_SEP_PRINT_MAX {
+                    serial_println!(
+                        ":: bt-c2: [{}] <- ...and {} further Stream End Point(s), COUNTED BUT NOT LISTED (the transcript is capped at {} per response). A device publishing this many endpoints is itself the finding == witness ::",
+                        self.idx, seps - BT_C2_SEP_PRINT_MAX, BT_C2_SEP_PRINT_MAX
+                    );
+                }
+                if seps == 0 {
+                    serial_println!(
+                        ":: bt-c2: [{}] <- the DISCOVER response is EMPTY — the peer's AVDTP accepted the signal and published no endpoints at all. The transport is proven; what is absent is any stream endpoint to configure == witness ::",
+                        self.idx
+                    );
+                }
+            }
+            0b11 => {
+                let err = if len >= 3 { buf[10] } else { 0 };
+                serial_println!(
+                    ":: bt-c2: [{}] <- AVDTP_DISCOVER RESPONSE REJECT label={} error={:#04x}{} -> the peer's AVDTP ANSWERED. The transport is proven end to end; what it refused is the signal == witness ::",
+                    self.idx, label, err,
+                    match err {
+                        0x11 => " (BAD_HEADER_FORMAT)",
+                        0x31 => " (BAD_LENGTH)",
+                        _ => "",
+                    }
+                );
+            }
+            // 0b01 (General Reject) is handled ABOVE, before the signal-identifier test, because it
+            // carries no identifier to test. See the note there.
+            _ => serial_println!(
+                ":: bt-c2: [{}] <- AVDTP message_type={:#04b} label={} on the DISCOVER signal -> a COMMAND arriving where a response was awaited; not decoded == witness ::",
+                self.idx, mtype, label
+            ),
+        }
+    }
+
+    /// BT-C2 — close the L2CAP channel, if one is open and the peer has not already closed it.
+    ///
+    /// A `DISCONNECTION_REQUEST` that goes unanswered is NOT a leak: `HCI_Disconnect` runs
+    /// immediately after this stage returns and an L2CAP channel cannot outlive the ACL link it
+    /// rides. The request is still made, and its confirmation still waited for, because "the peer
+    /// agreed the channel is gone" and "the link was pulled out from under it" are different facts
+    /// and a capture is entitled to know which one happened.
+    #[cfg(feature = "btc")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_c2_disconnect_if_open(
+        &mut self,
+        t: &Target,
+        handle: u16,
+        st: &mut BtC2,
+        buf: &mut [u8; BT_ACL_BUF_MAX],
+        t0: u64,
+        cap: u64,
+    ) {
+        if st.dcid == 0 {
+            return;
+        }
+        if st.peer_closed {
+            serial_println!(
+                ":: bt-c2: [{}] no DISCONNECTION_REQUEST is owed — the peer closed the channel itself and this host answered it == witness ::",
+                self.idx
+            );
+            st.dcid = 0;
+            return;
+        }
+        let ident = st.ident;
+        st.ident = st.ident.wrapping_add(1).max(1);
+        let body: [u8; 8] = [
+            BT_L2CAP_DISC_REQ,
+            ident,
+            0x04,
+            0x00,
+            st.dcid as u8,
+            (st.dcid >> 8) as u8,
+            BT_C2_SCID as u8,
+            (BT_C2_SCID >> 8) as u8,
+        ];
+        if !self.bt_c2_send(
+            t, handle, st, BT_L2CAP_CID_SIG, &body,
+            "DISCONNECTION_REQUEST",
+        ) {
+            serial_println!(
+                ":: bt-c2: [{}] DISCONNECTION_REQUEST NOT SENT — the channel is left to BT-C1's HCI_Disconnect, which tears down the ACL link and every channel on it. Nothing survives the boot, and nothing is confirmed either == witness ::",
+                self.idx
+            );
+            return;
+        }
+        let w = Self::bt_c2_window(t0, cap);
+        match self.bt_c2_await(t, handle, st, BtC2Want::Sig(BT_L2CAP_DISC_RSP), w, buf, t0, cap) {
+            Some(len) if len >= 4 => {
+                let d = (buf[12] as u16) | ((buf[13] as u16) << 8);
+                let s = (buf[14] as u16) | ((buf[15] as u16) << 8);
+                serial_println!(
+                    ":: bt-c2: [{}] <- DISCONNECTION_RESPONSE ident={:#04x} dest_cid={:#06x} src_cid={:#06x} -> THE CHANNEL IS CLOSED BY AGREEMENT. The BR/EDR link BT-C1 holds is released on the line after this stage == witness ::",
+                    self.idx, buf[9], d, s
+                );
+                st.dcid = 0;
+            }
+            Some(len) => serial_println!(
+                ":: bt-c2: [{}] <- DISCONNECTION_RESPONSE SHORT ({} byte(s), 4 required) -> MALFORMED; the close is NOT confirmed, and BT-C1's HCI_Disconnect is what actually ends it == witness ::",
+                self.idx, len
+            ),
+            None => serial_println!(
+                ":: bt-c2: [{}] NO DISCONNECTION_RESPONSE within the window — the close is NOT confirmed. The request went out; BT-C1's HCI_Disconnect below removes the link and with it every channel, so nothing is left alive, only unconfirmed == witness ::",
+                self.idx
+            ),
+        }
+    }
+
+    /// BT-C2 — the end-of-stage tally, in the shape BT-C1's and BT-L3's are.
+    ///
+    /// REVIEW FIX 7 — `left_outstanding=` is COMPUTED from state, exactly as `bt_c1_tally`'s
+    /// three-arm match is. It used to be the literal text `left_outstanding=none` inside the format
+    /// string, which is worse than merely lazy: the must-not-appear grep grammar this subsystem
+    /// relies on is `awk '/left_outstanding=/ && !/=none/'`, and a field that cannot say anything
+    /// else pollutes that grammar with a guaranteed pass. A tally that can only report success is
+    /// the instrument-that-cannot-fail this codebase has already been bitten by three times.
+    ///
+    /// What it can report: an L2CAP channel this stage opened and could not confirm closed. It is
+    /// not "a live channel" — `bt_c1_page` releases the ACL link on the next line and no channel
+    /// outlives its link — but it IS a fact the arc did not establish, and naming it is the
+    /// difference between a clean run and an unverified one.
+    ///
+    /// REVIEW FIX 10 — the tally also witnesses the COUPLING to BT-C1's teardown. Every ACL packet
+    /// this stage sends causes the controller to emit a `Number Of Completed Packets` event on the
+    /// HCI event endpoint, and this stage never reads one. They queue. BT-C1's `HCI_Disconnect`
+    /// then looks for its `Disconnection Complete` through `bt_l3_await`, which walks past a capped
+    /// number of unwanted events within a bounded window — so a queue this stage filled can, in
+    /// principle, push that confirmation past the cap and make BT-C1 print its must-not-appear
+    /// "A LIVE BR/EDR LINK" for a reason that is about queue depth rather than about the link. The
+    /// count is printed here so a capture can test that reading instead of guessing at it.
+    #[cfg(feature = "btc")]
+    fn bt_c2_tally(&self, t0: u64, st: &BtC2, verdict: &str) {
+        let (elapsed, unit) = epace_fmt(crate::arch::now_cycles().wrapping_sub(t0));
+        serial_println!(
+            ":: bt-c2: [{}] C2 tally — elapsed={}{} acl_sent={} acl_in_transactions={} zero_length_packets={} stepped_over={} channel_dcid={:#06x} host_configured={} peer_configured={} peer_refused_by_host={} peer_closed={} rejected={} stage_cap={}ms -> {}. left_outstanding={} == witness ::",
+            self.idx, elapsed, unit, st.tx, st.rx, st.zlp, st.stepped, st.dcid,
+            st.our_cfg_done, st.peer_cfg_done, st.peer_cfg_refused, st.peer_closed, st.rejected,
+            BT_C2_STAGE_MS, verdict,
+            if st.dcid != 0 {
+                "AN L2CAP CHANNEL WHOSE CLOSE WAS NEVER CONFIRMED — no DISCONNECTION_RESPONSE was read for it. It is not alive (BT-C1 releases the ACL link on the next line and no channel outlives its link), but this arc did not witness it going"
+            } else {
+                "none"
+            }
+        );
+        serial_println!(
+            ":: bt-c2: [{}] C2->C1 coupling — this stage sent {} ACL packet(s) and read NO Number Of Completed Packets event for any of them; that many events are therefore queued on the HCI event endpoint ahead of BT-C1's teardown. bt_l3_await walks past up to {} unwanted events per wait, so a `bt-c1: … left_outstanding=A LIVE BR/EDR LINK` below with a Disconnect that was ACCEPTED is to be read as a QUEUE-DEPTH artefact of this stage first, and as a link failure only after that has been excluded == witness ::",
+            self.idx, st.tx, BT_EVT_MAX
+        );
+    }
+    // ============================== end BT-C2 ================================================
 
     /// BT-L2 — read LE Advertising Reports off the event endpoint for a BOUNDED wall-clock window
     /// and build the distinct-device table.
@@ -10153,6 +11755,13 @@ pub fn init() {
                         // BT-L4: no ACL pair until `bt_probe` claims a radio and records one.
                         #[cfg(feature = "bt")]
                         bt_acl: (0, 0, 0, 0),
+                        // BT-C2: both ACL pipes sit at DATA0 out of `SET_CONFIGURATION`, and no
+                        // ACL traffic has run yet.
+                        #[cfg(feature = "btc")]
+                        bt_acl_tog: (false, false),
+                        // BT-C2: the controller's ACL buffer count is unknown until BT-L1 reads it.
+                        #[cfg(feature = "btc")]
+                        bt_acl_bufs: 0,
                     };
                     // Firmware-stale detection BEFORE any schedule programming: probe 2 showed
                     // Apple EFI leaves PSE=1 behind (its pre-boot keyboard), which HSE-halts
