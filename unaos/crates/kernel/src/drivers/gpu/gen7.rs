@@ -1,23 +1,36 @@
-//! GEN7-3D rungs R0/R1 — Ivy Bridge GT2 render-engine reconnaissance, READ-ONLY.
+//! GEN7-3D rungs R1/R2 — Ivy Bridge GT2 render-engine reconnaissance and the GT power-well wake.
 //!
 //! Design of record: `~/unaos-bench/scratch/gr25/GEN7-3D-draft.md` (GR25). This module
-//! implements that ladder's **R1 leg only**: a read-only census that answers "is the GT
-//! window alive, is there a forcewake block where the draft guessed, what is in the GGTT,
-//! and where is stolen memory". It performs **zero MMIO writes and zero config writes**.
+//! implements two legs of that ladder:
+//!
+//! * **R1 (`recon`)** — a read-only census that answers "is the GT window alive, is there a
+//!   forcewake block where the draft guessed, what is in the GGTT, and where is stolen
+//!   memory". It performs **zero MMIO writes and zero config writes**.
+//! * **R2 (`wake`)** — the ladder's FIRST write. It drives the IVB-legal Sync-Flush
+//!   workaround path (draft §3.1 P2, IVB-V1P3 §1.1.10.9): write `INSTPM 0x2050 = 0x00010001`,
+//!   write `RCS_WAKE 0x2700 = 0`, poll `0x22AC[3:0] == 0` (bounded), then **re-park**
+//!   `INSTPM = 0x00010000` on every exit path. Its proof is the SAME 17-register GT battery
+//!   R1 read dark reading STRUCTURED/varying afterward — a dark→live transition on the
+//!   fourteen ring-block registers R2 never wrote. Three power-management writes, all
+//!   reversed in-rung, and **not one display register** among them.
 //!
 //! ## The structural promise
 //!
 //! **This module cannot black Peter's panel.** Two independent reasons, and both hold:
 //!
-//! 1. It writes nothing. Every access below is a `read_volatile` or a PCI config *read*.
-//!    ⚠ Stated precisely, because the loose version of this sentence was wrong: **reads
-//!    only, and the one display-block offset this file touches is read, never written.**
-//!    That offset is `PCH_PP_CONTROL` (`0xC7204`) — a South Display Engine Panel Power
-//!    Sequencer register, and unambiguously a display register. It is in the control frame
-//!    precisely *because* it is display-block: the PPS sits outside the GT power well, so
-//!    reading it separates "BAR0 is dead" from "the GT is dead". "No display register at
-//!    any offset" would be a false claim; "no display register is written" is the true one,
-//!    and it is the one that carries the safety argument.
+//! 1. R1 writes nothing; R2 writes only three GT **power-management** registers
+//!    (`INSTPM 0x2050`, `RCS_WAKE 0x2700`) and re-parks `INSTPM` before it returns — no GGTT
+//!    entry, no ring register, nothing in a display block. ⚠ Stated precisely, because the
+//!    loose version of this sentence was wrong: **the one display-block offset this file
+//!    touches is read, never written, in either rung.** That offset is `PCH_PP_CONTROL`
+//!    (`0xC7204`) — a South Display Engine Panel Power Sequencer register, and unambiguously
+//!    a display register. It is in the R1 control frame precisely *because* it is
+//!    display-block: the PPS sits outside the GT power well, so reading it separates "BAR0 is
+//!    dead" from "the GT is dead". "No display register at any offset" would be a false
+//!    claim; "no display register is written" is the true one, and it is the one that carries
+//!    the safety argument. R2's re-park is the mirror of this: the wake write is reversed on
+//!    every exit path (success, timeout, short-BAR0 refusal), so the GT is returned to the
+//!    exact RC6-eligible state firmware left it in.
 //! 2. Even a write could not reach the panel: the panel is the Kepler's on this machine
 //!    (`igpu.rs` ~778; Boot AS shows every iGPU pipe and plane reading `0x00000000`).
 //!
@@ -44,6 +57,19 @@
 //! guess. R1 is read-only by construction and therefore **cannot settle G1** — only the
 //! draft's R2 (the forcewake acquire, the first write in the ladder) can, and this rung
 //! exists to tell R2 whether it is worth flying and at which offsets.
+//!
+//! **Wall D for R2 (`wake`).** A zero-compare cannot prove a wake either, and R2 adds a
+//! sharper trap the read-only rung did not need: three of the seventeen battery registers
+//! (`INSTPM`, `RCS_WAKE`, `RENDER_IDLE_POLL`) are the ones R2 itself WRITES, so a dark→live
+//! transition on them proves only that the BAR0 window latched our write — not that the GT
+//! power well woke. The wake verdict's liveness count is therefore drawn from the FOURTEEN
+//! ring-block registers R2 never touches; a register we caused to change is not a witness.
+//! `gt-woke` requires the untouched fourteen to show real motion (≥2 gone structured, or any
+//! read-twice `varies`), mirroring R1's alive-side threshold so one stray latched bit cannot
+//! forge a wake. `wake-void` is reserved for the poll never clearing — a Sync-Flush
+//! workaround borrowed out of context failing tells us about the borrowing, not the GT
+//! (draft §3.1 P2). `gt-still-dark` — ack asserts, battery unchanged — is a real, surprising
+//! finding, not a failure to hide.
 //!
 //! ## Citation classes (draft §0)
 //!
@@ -780,4 +806,262 @@ pub unsafe fn recon(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) 
         }
     );
     serial_println!(":: gen7: recon end ::");
+}
+
+// ===================================================================================
+// R2 — the wake. The FIRST write in the GEN7 ladder.
+// ===================================================================================
+
+/// The 17-register GT battery — the SAME registers, in the SAME order, that R1's `probe`
+/// battery read dark (`gt_structured=0/17` on Boot B). R2 reads it twice, once BEFORE the
+/// wake and once while the wake is held, and the dark→live delta between the two columns is
+/// the verdict.
+///
+/// The fourth field is `touched`: `true` for the three registers R2 itself writes during the
+/// sequence (`INSTPM`, `RCS_WAKE`, `RENDER_IDLE_POLL` — the poll target). A dark→live
+/// transition on a `touched` register proves only that the BAR0 window latched our own write,
+/// so those three are **excluded from the wake verdict's liveness count** (Wall D for R2).
+/// The fourteen ring-block registers we never write are the honest witness: a zero→structured
+/// on one of them is engine life, not our footprint.
+const GT_BATTERY: &[(&str, &str, usize, bool)] = &[
+    ("rcs", "RING_CTL", g7regs::RCS_RING_CTL, false),
+    ("rcs", "RING_HEAD", g7regs::RCS_RING_HEAD, false),
+    ("rcs", "RING_TAIL", g7regs::RCS_RING_TAIL, false),
+    ("rcs", "RING_START", g7regs::RCS_RING_START, false),
+    ("rcs", "UHPTR", g7regs::RCS_UHPTR, false),
+    ("bcs", "RING_CTL", g7regs::BCS_RING_CTL, false),
+    ("bcs", "RING_HEAD", g7regs::BCS_RING_HEAD, false),
+    ("bcs", "RING_TAIL", g7regs::BCS_RING_TAIL, false),
+    ("bcs", "RING_START", g7regs::BCS_RING_START, false),
+    ("bcs", "UHPTR", g7regs::BCS_UHPTR, false),
+    ("vcs", "RING_CTL", g7regs::VCS_RING_CTL, false),
+    ("vcs", "RING_HEAD", g7regs::VCS_RING_HEAD, false),
+    ("vcs", "RING_TAIL", g7regs::VCS_RING_TAIL, false),
+    ("vcs", "RING_START", g7regs::VCS_RING_START, false),
+    ("gt", "INSTPM", g7regs::INSTPM, true),
+    ("gt", "RCS_WAKE", g7regs::RCS_WAKE, true),
+    ("gt", "RENDER_IDLE_POLL", g7regs::RENDER_IDLE_POLL, true),
+];
+
+const BATTERY_N: usize = 17;
+
+#[inline(always)]
+unsafe fn wr(bar0: usize, off: usize, v: u32) {
+    core::ptr::write_volatile((bar0 + off) as *mut u32, v);
+}
+
+/// One witnessed write: pre-read the target, write, post-read it, print all three. The
+/// post-read is the reversibility/latch evidence — on this part's mask-write registers a
+/// read returns the DATA bits with the mask field reading zero (IVB-V1P3 ~p.66, "Reads to
+/// this field returns zero"), so a healthy decode of `INSTPM=0x00010001` post-reads
+/// `0x00000001`, and the re-park post-reads `0x00000000`. A power-gated window post-reads
+/// `0x00000000` regardless — which is itself a reading, not a hang.
+unsafe fn witnessed_write(bar0: usize, name: &str, off: usize, val: u32, src: &str) {
+    let pre = rd(bar0, off);
+    wr(bar0, off, val);
+    let post = rd(bar0, off);
+    serial_println!(
+        ":: gen7: wake step name={} off={:06X} wrote={:08X} pre={:08X} post={:08X} src={} ::",
+        name,
+        off,
+        val,
+        pre,
+        post,
+        src
+    );
+}
+
+/// Read the whole battery once (each register twice), record values and per-register
+/// variance, and print one `col=` line per register. `label` is `pre` or `held`.
+unsafe fn read_battery(
+    bar0: usize,
+    label: &str,
+    v: &mut [u32; BATTERY_N],
+    varied: &mut [bool; BATTERY_N],
+) {
+    for (i, &(blk, name, off, touched)) in GT_BATTERY.iter().enumerate() {
+        let a = rd(bar0, off);
+        let b = rd(bar0, off);
+        v[i] = a;
+        varied[i] = a != b;
+        serial_println!(
+            ":: gen7: wake col={} blk={} name={} off={:06X} v0={:08X} v1={:08X} cls={} varies={} touched={} ::",
+            label,
+            blk,
+            name,
+            off,
+            a,
+            b,
+            Cls::of(a).name(),
+            if a != b { 1 } else { 0 },
+            if touched { 1 } else { 0 }
+        );
+    }
+}
+
+/// GEN7 rung R2 — wake the GT power well, and prove it on the registers that read dark.
+///
+/// Called from `igpu::init` immediately after `recon`, still BEFORE `bring_up_blt_ring`.
+/// This is the ladder's first write. The sequence is the IVB Sync-Flush workaround
+/// (draft §3.1 P2 / IVB-V1P3 §1.1.10.9, pp.70-71), which wakes the command streamer as a
+/// side effect of draining it — NOT a general forcewake protocol, and the module does not
+/// pretend it is one.
+///
+/// # Safety
+/// Same contract as `recon`: `bar0` is a live MMIO mapping of at least `bar0_size` bytes of
+/// the IGD's BAR0. R2 writes three GT power-management registers (`INSTPM`, `RCS_WAKE`) and
+/// re-parks `INSTPM`; it writes no GGTT entry, no ring register and no display register, and
+/// the re-park runs on every exit path.
+pub unsafe fn wake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
+    serial_println!(
+        ":: gen7: wake begin rung=R2 mode=write writes=3 bdf={}:{}.{} bar0_size={} ladder=GEN7-3D ::",
+        bus,
+        slot,
+        func,
+        bar0_size
+    );
+
+    // ---- Parachute, identical discipline to R1 ---------------------------------------
+    if bar0 == 0 {
+        serial_println!(":: gen7: r2 verdict=refused-no-bar0 — BAR0 unpublished; no write attempted ::");
+        serial_println!(":: gen7: wake end ::");
+        return;
+    }
+    // The highest offset R2 touches is BCS_UHPTR (0x22134). Refuse the whole rung — BEFORE
+    // any write — if the enumerated window does not cover the registers we would read and
+    // write, rather than reading/writing into whatever follows the mapping. This mirrors
+    // R1's `ggtt` short-BAR0 refusal and it is checked against the size we were GIVEN, not a
+    // literal we expect.
+    const MAX_OFF: usize = g7regs::BCS_UHPTR + 4;
+    if bar0_size < MAX_OFF {
+        serial_println!(
+            ":: gen7: r2 verdict=refused-bar0-too-small have={} need={} — no write attempted ::",
+            bar0_size,
+            MAX_OFF
+        );
+        serial_println!(":: gen7: wake end ::");
+        return;
+    }
+
+    // Bounded poll budget. A well that never acks is VOID, not a hang: after this many reads
+    // of 0x22AC with bits[3:0] still non-zero, the rung gives up, re-parks, and prints
+    // `verdict=wake-void`. Matches the iteration order-of-magnitude of `BltRing::submit`.
+    const POLL_MAX: u32 = 1_000_000;
+
+    // ---- Before column ----------------------------------------------------------------
+    let mut before = [0u32; BATTERY_N];
+    let mut before_var = [false; BATTERY_N];
+    read_battery(bar0, "pre", &mut before, &mut before_var);
+
+    // ---- The wake sequence (draft §3.1 P2 / IVB-V1P3 §1.1.10.9 pp.70-71) --------------
+    // Every write PINNED against IVB-V1P3 (the doc pinned in g7regs). The 0x00010001 /
+    // 0x00010000 form is the upper-16-as-write-enable-mask semantics pinned generically in
+    // the same volume ~p.66.
+    //
+    // Step 1 — INSTPM disable sequence: set data bit 0 (mask bit 16 arms it).
+    witnessed_write(bar0, "INSTPM_disable", g7regs::INSTPM, 0x0001_0001, "IVB-V1P3-1.1.10.9-p70");
+    // Step 2 — "Wake up CS but don't do anything".
+    witnessed_write(bar0, "RCS_WAKE_poke", g7regs::RCS_WAKE, 0x0000_0000, "IVB-V1P3-1.1.10.9-p71");
+
+    // Step 3 — poll 0x22AC[3:0] == 0 ("Guarantees render pipe is awake"), bounded.
+    let mut iters = 0u32;
+    let mut idle;
+    loop {
+        idle = rd(bar0, g7regs::RENDER_IDLE_POLL);
+        if idle & 0xF == 0 {
+            break;
+        }
+        iters += 1;
+        if iters >= POLL_MAX {
+            break;
+        }
+    }
+    let poll_ack = idle & 0xF == 0;
+    serial_println!(
+        ":: gen7: wake poll off={:06X} idle={:08X} idle_lo4={:X} iters={} max={} ack={} ::",
+        g7regs::RENDER_IDLE_POLL,
+        idle,
+        idle & 0xF,
+        iters,
+        POLL_MAX,
+        if poll_ack { 1 } else { 0 }
+    );
+
+    // ---- Held column — read the SAME battery while the wake is asserted ---------------
+    let mut held = [0u32; BATTERY_N];
+    let mut held_var = [false; BATTERY_N];
+    read_battery(bar0, "held", &mut held, &mut held_var);
+
+    // ---- Re-park — restore INSTPM = 0x00010000 (clear data bit 0 via mask bit 16) ------
+    // This runs on EVERY path that reached here (poll ack OR poll timeout): it is a
+    // straight-line write, not inside either branch. It returns INSTPM to the RC6-eligible
+    // state firmware left, so the GT may re-enter RC6; no display register is touched and the
+    // panel is the Kepler's regardless. The post-read is the reversal witness.
+    witnessed_write(bar0, "INSTPM_repark", g7regs::INSTPM, 0x0001_0000, "IVB-V1P3-1.1.10.9-p71");
+
+    // ---- The transition tally — Wall D: a value WE caused is not a witness -------------
+    // A register counts as "was dark" if its pre column was zero-or-ones AND did not vary,
+    // and "now live" if its held column is structured OR varied on the read-twice. A
+    // dark→live transition on a register we NEVER wrote (touched=false) is the honest
+    // signal; the three touched registers are counted in `trans_all` for completeness but
+    // never in the untouched liveness count the verdict rests on.
+    let mut trans_all = 0u32;
+    let mut trans_untouched = 0u32;
+    let mut untouched_struct = 0u32;
+    let mut untouched_varies = 0u32;
+    for (i, &(_blk, _name, _off, touched)) in GT_BATTERY.iter().enumerate() {
+        let was_dark = matches!(Cls::of(before[i]), Cls::Zero | Cls::AllOnes) && !before_var[i];
+        let now_struct = matches!(Cls::of(held[i]), Cls::Structured);
+        let now_live = now_struct || held_var[i];
+        if was_dark && now_live {
+            trans_all += 1;
+            if !touched {
+                trans_untouched += 1;
+                if now_struct {
+                    untouched_struct += 1;
+                }
+                if held_var[i] {
+                    untouched_varies += 1;
+                }
+            }
+        }
+    }
+
+    // ---- The rung verdict — named before the probe ran --------------------------------
+    //  wake-void      the poll never cleared within POLL_MAX  → a Sync-Flush workaround
+    //                 borrowed out of context failing tells us about the borrowing, not the
+    //                 GT (draft §3.1 P2). No wake reading is drawn.
+    //  gt-woke        poll acked AND the fourteen untouched ring registers show real motion
+    //                 (≥2 gone structured, or any read-twice varies) → the GT power well is
+    //                 awake and readable, proven on registers that were dark. STOP HERE.
+    //  gt-still-dark  poll acked but the untouched battery is unchanged → a real, surprising
+    //                 finding: the ack asserted (or 0x22AC was already zero, as a gated
+    //                 window reads) yet nothing lit. The forcewake block is elsewhere.
+    let verdict = if !poll_ack {
+        "wake-void"
+    } else if untouched_struct >= 2 || untouched_varies >= 1 {
+        "gt-woke"
+    } else {
+        "gt-still-dark"
+    };
+    serial_println!(
+        ":: gen7: r2 verdict={} trans_all={}/{} trans_untouched={}/14 struct={} varies={} poll_ack={} poll_iters={} rung=R2 wrote=3 reparked=1 ::",
+        verdict,
+        trans_all,
+        BATTERY_N,
+        trans_untouched,
+        untouched_struct,
+        untouched_varies,
+        if poll_ack { 1 } else { 0 },
+        iters
+    );
+    serial_println!(
+        ":: gen7: r2 next={} note=re-parked-INSTPM=0x00010000-no-display-register-touched ::",
+        match verdict {
+            "gt-woke" => "R3-ggtt-claim(read-only)-then-R4-ring-then-R5-MI_STORE_DATA_IMM",
+            "gt-still-dark" => "STOP-wake-acked-but-battery-dark-forcewake-block-is-elsewhere",
+            _ => "STOP-poll-never-cleared-sync-flush-wa-out-of-context-is-not-a-general-wake",
+        }
+    );
+    serial_println!(":: gen7: wake end ::");
 }
