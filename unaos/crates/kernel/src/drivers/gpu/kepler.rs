@@ -1469,6 +1469,30 @@ pub fn init(gpu: &GpuInfo) {
         let pgraph_status = mmio_read(bar0, regs::NV_PGRAPH_BASE);
         serial_println!("[NVIDIA] PGRAPH Engine Status (0x400000): 0x{:08X}. Requires firmware for full 2D/3D.", pgraph_status);
 
+        // ================== CE-LADDER — read-only, and it goes HERE ==================
+        // Copy-engine reconnaissance (`kepler_ce.rs`, design of record
+        // ~/unaos-bench/scratch/gr24/CE-LADDER-draft.md). Its placement is a contract,
+        // not a convenience:
+        //
+        //   * ABOVE every FECS access. The fifo leg below ends in the POKE ucode (which
+        //     deliberately poisons the unit) and the terminal 0x409504 write; the first
+        //     access to that offset wedges every later read for the boot (spec §5.4).
+        //     A ladder verdict collected after either would be void.
+        //   * PRE-SUBMIT, which is what makes its runlist rung sharp: nothing in the
+        //     runlist array is ours yet, so a populated slot is unambiguously the
+        //     FIRMWARE's — direct evidence of a non-PGRAPH runlist, obtained by
+        //     construction instead of by inference.
+        //   * INDEPENDENT of `nvidia-kepler-fifo`. A boot may run the reconnaissance
+        //     without building a channel at all.
+        //
+        // Read-only apart from the PRAMIN window base, which is no longer a hypothesis:
+        // Boot A's `bar1-identity` line proved that register, its 64 KiB granularity and
+        // the 0x700000 aperture in one shot. It is restored at every use and the restore is
+        // READ BACK — a restore that is written but never read is a success echo that
+        // cannot fail, and a failure VOIDs the affected verdict rather than passing quietly.
+        #[cfg(feature = "nvidia-kepler-ce")]
+        crate::drivers::gpu::kepler_ce::ladder(bar0, vram_size);
+
         // Recon Probe before any engine state modification
 
 // 8. Phase 4: 3D Foundation - PFIFO and Pushbuffer setup

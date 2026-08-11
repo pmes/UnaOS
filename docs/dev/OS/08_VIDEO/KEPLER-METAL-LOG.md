@@ -3,6 +3,106 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #43 (GR25 Boot A, capture `~/unaos-bench/capture/gr25-bootA/ttyUSB0.log`) — two ladder gates answered, and CE-LADDER armed
+
+Design of record for the copy-engine work: `~/unaos-bench/scratch/gr24/CE-LADDER-draft.md`
+(scratch). Citation classes below follow its §0: `[METAL]` observed on this GK107 in a named
+capture; `[TREE]` stated by repo code or docs; `[EXT-UNPINNED]` public-knowledge recollection
+with no document opened, usable only as a hypothesis under test.
+
+**⭐ R0 ANSWERED — the present half is 73 % of the compositor's blit, and the prize is real.**
+The `[comp2]` rollup now splits `blit_us` into its two costs [METAL]:
+
+```
+[ 805882ms] [comp2] rollup passes=2150 pass_us=5214 max_us=17077 … blit_us=5211
+            compose_us=1374 present_us=3832 … util_pct=99 rate=429.8/s span=5002ms
+```
+
+`present_us` is the back-buffer → VRAM copy — the only half a copy engine can take (a CE is a
+rectangular memory mover, not a scaler, and every window on this bench is scale-2 Retina). At
+~3.8 ms of a ~5.2 ms blit it is roughly **12x the draft's 300 µs stop threshold**, so the
+economic case that gates the whole ladder holds. Three consecutive late rollups sit within
+1.5 % of their mean (2.4 % min-to-max), so this is not a single-sample reading.
+
+**The ratio is phase-invariant, and the load phase must be stated with it.** The quoted line
+is steady state at **10 windows** (`[wc-g] win=10 seq=1 … @335649ms`). The early ~4-window
+rollups read `blit_us=3200 compose_us=875 present_us=2323` (`@88169ms`) — a much lighter
+load, and **the same split**: present is **72.6 %** early and **73.5 %** late. The absolute
+microseconds scale with window count; the fraction the CE could take does not. A citation
+that gave only the steady-state numbers would invite the reading that the prize is an
+artifact of a heavily loaded desktop, and it is not.
+
+**⭐ R4 ANSWERED — `IDENTITY`. A BAR1 offset IS a physical VRAM address on this part** [METAL]:
+
+```
+:: kepler: bar1-identity scratch_off=02015000 magic=CEA50BA5 bar1_rb=CEA50BA5
+           win_pre=00003FF0 win_want=00000201 win_rb=00000201 pramin_read=CEA50BA5
+           win_restored=Y ::
+:: kepler: bar1-identity VERDICT IDENTITY — … BAR1 offsets ARE physical VRAM addresses on
+           this part; every FIFO pointer in this driver is fine and the paged-BAR1 root
+           cause is CLOSED as a false alarm ::
+```
+
+This was the highest-risk open question in the study — the one that could have invalidated
+banked work — and it closes as a **false alarm**, which is a positive result, not a wasted
+boot. `inst_off >> 12` and `runlist_off >> 12` are the pages PFIFO fetches; the fence arc's
+ten eliminations were **not** measured through a broken pointer.
+
+The same line incidentally **pins three things the draft carried as `[EXT-UNPINNED]` (C9)**,
+because the authored magic arrived exactly where predicted:
+
+| Fact | Now |
+| --- | --- |
+| PRAMIN window base register `0x001700` | **[METAL]** — took `0x201`, read back `0x201`, restored |
+| Window granularity 64 KiB (`win = phys >> 16`) | **[METAL]** — the magic was found at `0x700000 + (off & 0xFFFF)` |
+| PRAMIN aperture at BAR0 `0x700000` | **[METAL]** — at least the first 64 KiB of it |
+
+Everything else in draft §3 (C1–C8) remains `[EXT-UNPINNED]` and untested on this silicon.
+
+**Standing wall, unchanged this boot:** `sched-status post-init err=00000002`,
+`DISCRIMINATOR pbdma{0,1,2} ch=00000000 (CHID=0 ACTIVE=0)`, and FENCE round 2 closed
+candidate 1 **by mechanism** — `FENCE ladder VERDICT MAPPED` proved the `(off & 0xffc) << 6`
+port rule reaches host `0xB00` from inside the falcon, so the port derivation was never the
+fault; ENGINE_STATUS is simply not falcon-writable, which extends refutation 7 to the falcon
+side. The `err=2` verdict itself stays VOID (the treatment was never applied).
+
+**Runlist array, as read after our own submit** [METAL]: `runlist-scan i=1 base_off=2278
+base=BAD0011F POISON`, `i=2 base_off=2280 base=00002013 len=00100003 OCCUPIED`, `i=3
+base_off=2288 … empty`, `verdict occupied_mask=4 alias_i2_base=match alias_i2_len=match`.
+Read strictly this **refutes the array-stride assumption at `0x2270`** — element 1 of that
+array does not exist. It did not find "no CE runlist"; it found "not there". And because it
+ran *after* our submit, the one occupied slot it could see was necessarily ours.
+
+### CE-LADDER: armed, UNFLOWN
+
+`drivers/gpu/kepler_ce.rs`, knob **`UNAOS_KEPLER_CE=1`** (feature `nvidia-kepler-ce`, implies
+`nvidia-kepler`, independent of `UNAOS_KEPLER_FIFO`). Called from `kepler::init` **above** the
+fifo leg, which puts it upstream of every FECS access — the POKE ucode deliberately poisons
+the unit and the terminal `0x409504` write closes the boot, so a verdict collected after
+either would be void — and makes its runlist rung read the array **pre-submit**, where a
+populated slot is unambiguously the firmware's.
+
+Read-only apart from the PRAMIN window base, which is metal-proven above and is saved,
+restored, **and read back after the restore**, at every use — a restore that is written but
+never read is a success echo that cannot fail, and a failure VOIDs the affected register's
+verdict rather than passing quietly. `+0x504` is excluded at every base by a `const _`
+assertion, not by a comment. Every rung is bracketed by a control read of `NV_PMC_BOOT_0`, so
+"the space is dead" is never reported as "the space is empty".
+
+| Rung | Witness family | What it decides |
+| --- | --- | --- |
+| R1 | `ce-ptop row` / `ce-ptop entry` / `ce-ptop verdict` / `ce-ptop VERDICT` | Whether a PTOP device-info table exists at `0x022700` (C6). `REFUTED-CLEANLY` = all poison; `AMBIGUOUS` = all zero with a held bracket; `PASS` = structured entries with a PRI candidate in the `0x104000` neighbourhood. The **raw dword is the datum**; the field decode is a separately-labelled hypothesis line. |
+| R2 | `ce-probe begin` / `ce-probe base=… VERDICT` / `ce-probe verdict` | Whether `0x104000/0x105000/0x106000` are alive and are falcons (C1/C2). `FALCON-REST` requires `cpuctl=0x10` **and** `dmactl=0x01` — the exact pair FECS shows on this chip — and opens draft §4.2 path 2 (a CE falcon as a bare DMA microcontroller, no PFIFO, no FECS wall). Each base carries its own bracket, because after a fault only the first datum is trustworthy. `NV_PMC_ENABLE` is recorded read-only; **no enable bit is guessed or written.** |
+| R3 | `ce-rlscan i=` / `ce-rlscan submit-pair` / `ce-rlscan verdict` / `ce-rlscan VERDICT` | The array at `0x2280 + i*8`, eight slots wide (C7), read pre-submit. Separates the three readings of bit 20 — `ID-FIELD` (we have been submitting to the wrong runlist id), `DISCRIMINATING` (bit 20 is commit-pending, and Boot A's `00100003` means the scheduler never consumed our runlist), `UNCONDITIONAL` (bit 20 stops being evidence permanently). Any populated slot is a **firmware-left runlist for another engine**, and its index is the id R6 needs. |
+| R5 | `ce-inst begin` / `ce-inst reg=` / `ce-inst dump` / `ce-inst pd-probe` / `ce-inst pde` / `ce-inst verdict` | Walks the firmware's own instance block through PRAMIN from the candidate pointers at `0x001704`/`0x001714` (C9). This is the **clean-room-legal RAMFC route**: observing our own hardware is Group-A white-box work and produces documentation we may implement against, which is how the standing UNAUDITED-constants debt gets discharged. `EMPTY`/`VOID`/`REFUSED` claim nothing; there is no fallback to "it probably looks like the one in `kepler.rs`". The `pd-probe` line answers C8 — a real page directory means CE addresses are virtual and R6 grows an era. |
+
+R6 (a CE channel) and beyond are **deliberately not implemented**: they are consumers of
+answers this boot does not have. `CE-LADDER end` prints all four rung outcomes on one line, so
+a silent ladder is distinguishable from a quiet pass.
+
+**Knob line for the next boot:** add `UNAOS_KEPLER_CE=1` alongside the existing Kepler knobs
+and confirm `nvidia-kepler-ce` appears in the `⚡ kernel features:` banner.
+
 ## Sitting #42 (GR6 self-run bench, UnaOS-gemini@a8efc15d-era, 2026-07-26, capture rmbp-gr6)
 
 **⭐ THE s41 RESIDUE QUESTION IS ANSWERED — `[wc-x] move-vacate win=3 … painted=true

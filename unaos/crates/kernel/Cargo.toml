@@ -11,6 +11,16 @@ nvidia-kepler = []
 nvidia-kepler-takeover = []
 nvidia-kepler-fifo = []
 nvidia-kepler-kdisp-hold = []
+# CE-LADDER: `UNAOS_KEPLER_CE=1` — read-only copy-engine reconnaissance on the GK107
+# (drivers/gpu/kepler_ce.rs), run from `kepler::init` BEFORE the fifo leg so it sits above
+# every FECS access and sees the runlist array pre-submit. Rungs R1 (PTOP device-info
+# sweep), R2 (CE PRI window probe), R3 (wide runlist scan), R5 (firmware instance-block walk
+# through PRAMIN). No device writes except the PRAMIN window base, which is metal-proven
+# (Boot A `bar1-identity`) and restored at every use. Implies `nvidia-kepler` so the module's
+# gate in gpu/mod.rs is self-sufficient; independent of `nvidia-kepler-fifo` on purpose — a
+# boot may run the reconnaissance without building a channel. DEFAULT OFF => module and call
+# site unlinked, media byte-identical. Kept in sync with arroyo AND builder/src/main.rs.
+nvidia-kepler-ce = ["nvidia-kepler"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/wcx.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in
