@@ -1264,25 +1264,23 @@ REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
 # ---      * four further looks at the same row keep it at one (`rl=1`) — the rate limit;
 # ---      * a row exactly AT the floor keeps its cluster (`some=true`) — the control, without which
 # ---        a `controls` that had simply stopped answering `Some` would pass the first three;
-# ---      * CONSOLEWIN — kernel FURNITURE has the two controls it is owed, not the one it is not,
-# ---        and the cluster is LEFT-PACKED (`furniture noclose=true minzoom=true packed=true/...`).
-# ---        This rule used to pin `furniture none=true`, on the law that kernel chrome had no
-# ---        cluster at all: `wm::controls` declined `is_kernel_owner` outright. That decline was
-# ---        aimed at the CLOSE disc (a control that cannot act must not be painted — `close_owner`
-# ---        refuses every kernel-band row) and it took all THREE controls away to disarm one, so
-# ---        the console could not be minimised either and the operator had a window they could not
-# ---        get off the glass. The decline is per-CONTROL now (`wm::ctrls_for`): furniture keeps
-# ---        minimise and zoom, and loses close alone.
-# ---        The fixture row moved with it, from UNDER the floor to AT it, and that is not cosmetic.
-# ---        Pinned narrow, the row declined for TWO reasons at once and the OWNER arm returned
-# ---        first — so the old `silent=true` was a claim about an arm the leg could not reach.
-# ---        Furniture declines on WIDTH now, exactly like an app row, so at the floor it keeps its
-# ---        cluster and its silence means what it says: a row with nothing to complain about.
-# ---        `packed=` is the leg a plausible wrong implementation fails — reading the layout slot
-# ---        off a fixed position in the full three-control list rather than off the row's own list
-# ---        puts minimise at slot 1 and leaves a disc-width HOLE where close would have been. It is
-# ---        pinned as an offset from the row's own outer box, so it is a claim about the cluster
-# ---        anchor and not a coincidence of two panels;
+# ---      * FACADE — kernel FURNITURE has NO cluster: no close, no minimise, no zoom
+# ---        (`furniture noclose=true minzoom=true packed=true/...`, where `minzoom=true` is the
+# ---        VERDICT "matches the build's promise of no cluster", not "both discs present"). The
+# ---        console output is plumbing behind the crispy facade, not a managed desktop window
+# ---        (Peter, 2026-08-11: "stop trying to pin our console output to an application ... a
+# ---        facade"), so it carries none of a window's titlebar buttons. `wm::ctrls_for` returns an
+# ---        EMPTY list for a kernel-owned row and `wm::controls` declines the kernel band owner-wide
+# ---        before the width test — the pre-shellwin-a CLOSEISO behaviour, restored.
+# ---        This REVERTS the merged CONSOLEWIN (shellwin-a) arc, which had briefly given furniture a
+# ---        per-CONTROL `[minimise, zoom]` cluster and let it reach the width arm (making every narrow
+# ---        kernel row emit a spurious decline line). On aarch64 there was never a dock and hence
+# ---        never a cluster, so this line's output is UNCHANGED by the revert — `minzoom=true
+# ---        packed=true/None`; the revert is the x86 behaviour, which no headless leg reaches (the
+# ---        console-window fixtures run only here, and here furniture always had none). The assertion
+# ---        is against `FURNITURE_HAS_CONTROLS` (now `false` on every arch), so re-introducing any
+# ---        disc flips this leg red — a console with the buttons of a window is the FORBID shape.
+# ---        `packed=true/None` is the honest no-cluster form: with no disc there is no slot to place.
 # ---      * and that furniture row is REAPED (`reaped=true`). CLOSEISO makes `close_owner` refuse
 # ---        every kernel-band row, so the battery's teardown sweep is structurally blind to it and
 # ---        the leak guard could never have caught it leaking. The reap is asserted by id, against

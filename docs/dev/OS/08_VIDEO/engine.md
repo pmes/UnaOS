@@ -9736,6 +9736,70 @@ line returns to `PASS`.
 Nothing here answers whether the DESKTOP (not the window chrome) wants the same
 semantic treatment, and the three blue `CONTROL_*` roles now have no consumer.
 Both wait on the kit becoming reachable (white-board Q4) and on the re-lift.
+
+## FACADE — the console is NOT a desktop window; it is plumbing (2026-08-11)
+
+**Peter's correction, verbatim:** *"stop trying to pin our console output to an
+application. all this crispy stuff is supposed to be a facade."* The kernel
+console output / boot-log is PLUMBING behind the crispy facade, not a managed
+desktop citizen. The merged WMCTRL/CONSOLEWIN direction — which gave the console
+window a control cluster, a dock tile, and a desktop-citizen compositing
+exemption — went the wrong way and is being unwound.
+
+### What landed here: the console has no control cluster
+
+`wm::ctrls_for` returns an EMPTY control list for a kernel-owned row, and
+`wm::controls` declines the kernel band owner-wide before its width test — the
+pre-shellwin-a CLOSEISO behaviour, restored. `FURNITURE_HAS_CONTROLS` is `false`
+unconditionally (was `cfg!(x86 && wc)`). The console therefore draws no titlebar
+discs: it is not a window, so it has none of a window's buttons. A window's
+`ctrls_for` is still the full `[Close, Minimise, Zoom]`; only kernel furniture is
+declined.
+
+The falsifier lives in the fixtures (`ctrldecline_selftest` leg 5,
+`closeiso_selftest` leg 4, both aarch64), which assert
+`control_disc_rect(furniture, {Close,Minimise,Zoom})` is `None` against
+`FURNITURE_HAS_CONTROLS`. Re-introducing any disc flips them FAIL. On aarch64
+there was never a dock and hence never a cluster, so those legs' output is
+unchanged by the revert; the change is the x86 behaviour (the console-window
+fixtures run only on aarch64, so x86's cluster was itself unwitnessed — the
+proof is by-contract through the shared gate constant).
+
+### What is designed, not landed (collision zones)
+
+Removing the discs takes the buttons off the console but not the console off the
+desktop. Two pieces remain, in predicates other in-flight arcs own, and are
+recorded here rather than half-applied:
+
+* **The desktop-citizen compositing exemption** (`above_shell`'s
+  `is_kernel_owner && z != PARKED_Z` arm, plus the matching furniture branch in
+  `focus_changed`'s shell arm). Dropping it makes a console at z=1 stop
+  compositing once the shell/desktop raises above it — on the panel at boot
+  (plumbing), not a window on the desktop once it is up. This is shell-window-b's
+  lane (it is simplifying the same predicate and deletes the `hidden[]` collect).
+  The CLOSEISO fear does not block it on x86: the live prompt is the desktop
+  layer, not this frozen boot-log snapshot row, so the snapshot falling below the
+  shell costs no prompt — the boot log survives in serial and `TERM_RING`.
+* **The dock tile** (`dock_scan` enumerates kernel-owned rows; `dock::selftest`
+  pins the console as a parkable dock citizen). Filtering the kernel band out of
+  the dock removes the tile. This is the dock arcs' lane, and it is not coherent
+  without the exemption removal above — a below-shell console with no dock tile
+  that is still composited is a worse intermediate than either end state, so the
+  two land together.
+
+The eventual end state is not minting the console as a `wm` row at all
+(`fbcon::panel_console_window_open` / `wcx::activate`): the boot console renders
+to the fbcon panel handle, and once the desktop is up the boot log lives only in
+serial + `TERM_RING`, which the Console APP (a sibling arc) subscribes to. That
+is sequenced after the two pieces above and after the Console APP.
+
+### Panic and boot-log are untouched — verified
+
+`panic_screen` clears `CONSOLE_WIN` first and paints the PANEL directly, so panic
+output never depends on the console being a window. Serial output, the boot-log
+stream and `TERM_RING` are unchanged. This arc removes only a window's chrome; it
+does not touch any plumbing.
+
 ## DOCK — every window has a way back (x86, 2026-08-09)
 
 **Peter's ruling, white board Q10, verbatim:** *"i guess mac has had the dock forever so we should
