@@ -732,6 +732,68 @@ pub fn selftest() {
         default_off, clip_clean, flush, member, floor_declines, floor_admits, dismissed, crystal_ok,
         if ok { "PASS" } else { "FAIL" }
     );
+
+    // ─── MENUBAR-OCC — the bar's WINDOW-BLIT occlusion protection, PROVEN able to fire ───────────────
+    //
+    // `wm::occ_clip` pushes this bar into every window's clip and the present folds the withheld pixels
+    // into `occclip_bar=`/`occclip_bar_px=` on `[drag-occ]`, FORBIDden degenerate by `x86-witness.spec`
+    // (`occclip_bar=N>0 occclip_bar_px=0`). That push is code-correct — the same `span_occ` formula the
+    // proven DOCK path uses — but the FORBID is VACUOUS on every boot: the bar is DEFAULT OFF, so no
+    // gate ever drags a window across the top strip and `occclip_bar` never leaves 0. "A witness that
+    // cannot fail is a defect", so this leg FIRES it, exactly as WCK5 fired the dock's (engine.md
+    // §WCK5): it ENABLES the bar, drives a synthetic window box across the top strip, and reads the
+    // pair `wm::occ_clip`'s own primitives produce for it.
+    //
+    // Two runs, from [`wm::occ_bar_probe`]:
+    //   * PROTECTED — the bar pushed into the clip, the span walk withholds its columns: `px_prot > 0`,
+    //     the window's chrome kept off the strip. This is the fired witness.
+    //   * FAULT — the strip still counted in the population but the clip walked empty (the span walk
+    //     publishes its columns): `px_fault == 0` with `pop_fault > 0`, the exact
+    //     `occclip_bar=N>0 occclip_bar_px=0` state the FORBID trips on — proven non-vacuous rather than
+    //     trusted, WCK5's reverted probe computed instead of pinned.
+    //
+    // Its own enable→probe→disable cycle: the bar is turned ON here (the main fixture already restored
+    // it to `saved` above) and turned OFF again at the end, so the gate's standing state — DEFAULT OFF
+    // — is unchanged and no later leg or boot sees the bar enabled.
+    #[cfg(target_arch = "x86_64")]
+    {
+        set_enabled(true);
+        let bar = strip_rect(pw, ph);
+        // A window box that CROSSES the top strip: y = 0, spanning well past BAR_H so it is not buried
+        // by the bar (a realistic dragged window is taller than the strip), and half the panel wide,
+        // inset so it sits inside the smallest suite panel (640x480) as well as the bench's.
+        let win = (pw / 4, 0usize, pw / 2, (BAR_H * 4).min(ph));
+        // Half-open overlap on both axes — the same test `wm::boxes_overlap` makes, inlined because
+        // that helper is private to `wm` and this is one comparison.
+        let crossed = match bar {
+            Some(b) => {
+                b.2 != 0
+                    && b.3 != 0
+                    && win.2 != 0
+                    && b.0 < win.0 + win.2
+                    && win.0 < b.0 + b.2
+                    && b.1 < win.1 + win.3
+                    && win.1 < b.1 + b.3
+            }
+            None => false,
+        };
+        let p = wm::occ_bar_probe(bar.unwrap_or((0, 0, 0, 0)), win);
+        // Restore to DEFAULT OFF before the verdict, so `restored` reads the standing state the rest of
+        // the boot depends on rather than the probe's transient enable.
+        set_enabled(false);
+        let restored = !enabled();
+
+        let fired = p.pop_prot > 0 && p.px_prot > 0;
+        let forbid_trips = p.pop_fault > 0 && p.px_fault == 0;
+        let occ_ok = crossed && fired && forbid_trips && restored;
+        serial_println!(
+            ":: MENUBAR-OCC: bar_enabled=true crossed={} occclip_bar={} occclip_bar_px={} \
+             forbid_bar={} forbid_bar_px={} forbid_trips_when_removed={} restored={} :: {} ::",
+            crossed, p.pop_prot, p.px_prot, p.pop_fault, p.px_fault, forbid_trips, restored,
+            if occ_ok { "PASS" } else { "FAIL" }
+        );
+    }
+
     rollup("selftest");
 }
 
