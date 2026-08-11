@@ -9836,6 +9836,23 @@ The ruling separates them, and both halves are now law:
   through a pid search. `fbcon::panel_console_window_closed` runs **before** the
   row is freed, so no present is ever aimed at a slot that is mid-free.
 
+  **The console's present path now carries the WCPAR recycled-id fence** (review
+  fix). `fbcon::route_present_banded` snapshots `CONSOLE_WIN` at its head, outside
+  any lock, and then presents that id further down. That snapshot could not go
+  stale before this arc — nothing could free a furniture row, so a cached kernel
+  id named the same window for the life of the boot, which is exactly why
+  `present_banded`'s `expect_owner` doc said kernel/furniture callers *"have no
+  recycle race"*. The close disc ends that: `wc_close_furniture` frees the row and
+  `wm::close` hands the slot straight back to the next `SYS_WIN_CREATE`, so a print
+  stalled across the gap would have presented a ring-3 app's window under the
+  console's damage band. That caller now uses
+  `present_rows_outcome_owned(.., KERNEL_OWNER_CONSOLE)` /
+  `present_outcome_owned(.., KERNEL_OWNER_CONSOLE)`; a re-issued slot declines
+  `NoRow` and takes the existing rows-go-back arm. The fence rule is restated on
+  `present_banded` in terms of the ID rather than the owner band: pass it whenever
+  the id was captured outside the lock the pass takes and something can free it in
+  the gap.
+
   **The console's glyph route is deliberately NOT torn down.** Only `CONSOLE_WIN`
   is cleared. `c.win_fb` / `c.win_store` stay installed, so console text keeps
   landing in the cached-RAM surface. Tearing the route down would make
@@ -9900,6 +9917,20 @@ surface and row — but no caller invokes it. A normal app's reopen route is the
 launcher, and the console has none; building one is the Console APP arc's lane
 (see below), not this one. Minimise → dock → tile-press is the reversible
 gesture today.
+
+**The close ACTION is x86-only, while the close DISC is unconditional.** `ctrls_for`
+and `FURNITURE_HAS_CONTROLS` carry no `cfg` — a cluster is not an arch property —
+but only `wc_click_route_at` (x86) branches on `is_kernel_owner` and routes to
+`wc_close_furniture`. aarch64's `clickroute` close arm still calls `wc_close_click`
+for every row, so a kernel-band row there would draw a close disc whose press hits
+`close_owner`'s refusal and does nothing (settle `noproc-selftest`). **Unreachable
+today**: `panel_console_window_open` is `#[cfg(all(target_arch = "x86_64", feature
+= "wc"))]`, so aarch64 has no live kernel-band row — the only ones it mints are
+`dock::selftest` / `ctrldecline_selftest` / `closeiso_selftest` fixtures, which
+press no disc through the router. It becomes a painted-but-inert control the moment
+aarch64 grows a console window, which violates this arc's own precondition (*"a
+control that cannot act must not be painted"*). Wiring the aarch64 arm is outside
+this arc's file lane; it must land with, or before, any aarch64 console window.
 
 ## FACADE — the console is NOT a desktop window; it is plumbing (2026-08-11, SUPERSEDED in part)
 

@@ -1129,13 +1129,27 @@ fn route_present_banded(owed_now: Owed, coalesce: bool) {
             ROUTE_BUSY.store(false, Ordering::Release);
             return;
         }
+        // NORMALWIN — **the RECYCLED-ID FENCE, and the console now needs it.** `id` was snapshotted
+        // from `CONSOLE_WIN` at the head of this function, outside any lock. Until this arc that
+        // snapshot could not go stale: nothing could close the console row (`close_owner` refuses the
+        // kernel band, and furniture carried no close disc), so the id named the same row forever.
+        // The close disc changes that — `wc_close_furniture` clears `CONSOLE_WIN` and then frees the
+        // row, and `wm::close` hands the slot straight back to the next `SYS_WIN_CREATE`. A print
+        // that stalled between the load above and this line would otherwise present a ring-3 app's
+        // window under the console's damage band, through the fence-FREE `expect_owner = None` path
+        // whose doc says kernel/furniture callers "have no recycle race". They do now, so this path
+        // carries the fence: `KERNEL_OWNER_CONSOLE` is the owner `panel_console_window_open` minted
+        // the row with, and a slot that has been re-issued to anyone else declines `NoRow` and takes
+        // the rows-go-back arm below. Same three outcomes as the `bool` verbs (`!= NoRow` is exactly
+        // their body), so nothing else here moves.
         Owed::Band(y0, y1) => {
             PACE_RAN.fetch_add(1, Ordering::Relaxed);
-            wm::present_rows(id, y0, y1)
+            wm::present_rows_outcome_owned(id, y0, y1, wm::KERNEL_OWNER_CONSOLE)
+                != wm::Presented::NoRow
         }
         Owed::Whole => {
             PACE_RAN.fetch_add(1, Ordering::Relaxed);
-            wm::present(id)
+            wm::present_outcome_owned(id, wm::KERNEL_OWNER_CONSOLE) != wm::Presented::NoRow
         }
     };
     if ok {

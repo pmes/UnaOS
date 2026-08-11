@@ -985,7 +985,13 @@ pub fn present_rows_outcome(id: WinId, sy0: usize, sy1: usize) -> Presented {
 /// WCPAR — [`present_outcome`] for the SYSCALL present path, carrying the recycled-id fence. `owner` is
 /// the presenting slot's wm owner id, captured under the window table lock the caller has now released;
 /// see [`present_banded`]'s `expect_owner` note for why this lets `sys_win_present` drop that lock
-/// before compositing. The furniture/kernel `present_outcome` above stays fence-free.
+/// before compositing.
+///
+/// NORMALWIN — **also the CONSOLE's present verb**, and not only the syscall layer's. `fbcon`'s
+/// `route_present_banded` snapshots `CONSOLE_WIN` outside any lock, which was raceless only while the
+/// console row could not be closed. The close disc makes it closable, so that caller passes
+/// [`KERNEL_OWNER_CONSOLE`] here. The fence-free `present_outcome` / `present` / `present_rows` above
+/// remain correct for furniture that owns its id for the life of the boot.
 pub fn present_outcome_owned(id: WinId, owner: u64) -> Presented {
     present_banded(id, None, Some(owner))
 }
@@ -1024,8 +1030,18 @@ pub fn present_rows(id: WinId, sy0: usize, sy1: usize) -> bool {
 /// owner no longer matches and the present is declined `NoRow` rather than compositing under the new
 /// owner's identity. The surface-lifetime half of the same race is unaffected — it is closed by the F4
 /// drain barrier (`close` drains in-flight `BlitGuard`s before the backing is dropped), which never
-/// depended on the outer table hold. `None` is every kernel/furniture caller: those mint no ring-3 id,
-/// have no recycle race, and take exactly the pre-WCPAR path.
+/// depended on the outer table hold.
+///
+/// NORMALWIN — **`None` is no longer "every kernel/furniture caller".** The old rule read *"those mint
+/// no ring-3 id, have no recycle race, and take exactly the pre-WCPAR path"*, and its premise was that
+/// a furniture id could not be freed: `close_owner` refuses the reserved band and furniture carried no
+/// close disc, so a kernel caller's cached id named the same row for the life of the boot. The
+/// console's close disc ends that for ONE caller — `fbcon::route_present_banded` reads `CONSOLE_WIN`
+/// outside any lock and `wc_close_furniture` can free that row underneath it — so that caller now
+/// passes `Some(KERNEL_OWNER_CONSOLE)`. The rule that replaces it is about the ID, not the band: pass
+/// the fence whenever the id was captured outside the lock this pass takes AND something can free it in
+/// the gap. `None` remains right for furniture whose row is created and presented under one lock, and
+/// for compat rows (owner 0, never presented through the syscall path by construction).
 fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<u64>) -> Presented {
     // WC-G — the surface as the OWNER declared it finished. Taken here and nowhere else: this is the
     // one moment the owner is provably not writing (it is parked inside `SYS_WIN_PRESENT`), so it is
