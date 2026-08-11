@@ -173,9 +173,13 @@ static NEXT_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
 static SPOKEN_WAITS: AtomicU32 = AtomicU32::new(0);
 static STAGE_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 
-/// Single-writer access pattern throughout: `service()` is called from the main loop's device-service
-/// pass, one core, one call site per boot path. `Relaxed` is the same ordering `wcx`'s storage wait
-/// uses for the same reason, and no other module reads these.
+/// Milliseconds since boot — the calibrated 1 kHz APIC timebase (`arch::ticks()` IS ms on x86; see
+/// its doc). A `u64` ms counter does not wrap in any uptime this machine will see, so the
+/// `now < NEXT_*` comparisons above need no wrap handling.
+///
+/// (Ordering note for the statics above: single-writer throughout — `service()` is called from the
+/// main loop's device-service pass, one core, one call site per boot path. `Relaxed` is the same
+/// ordering `wcx`'s storage wait uses for the same reason, and no other module reads them.)
 fn now_ms() -> u64 {
     crate::arch::ticks()
 }
@@ -190,9 +194,10 @@ fn now_ms() -> u64 {
 ///   USB-storage block device that enumerates asynchronously. Announce the deferral ONCE, poll
 ///   `block::program_source()` cheaply on every pass, and print a bounded heartbeat while it is
 ///   still absent so the capture can tell a live poll from a dead one (WIFI-REARM). On arrival,
-///   announce it and run the staging pass; a `Retry` outcome re-arms under a bounded budget, a
-///   `Settled` one runs arc 2 and parks. The state does NOT advance while the volume is missing, so
-///   a volume that appears at minute nine is still staged.
+///   announce it and run the staging pass; a `Retry` outcome re-arms under a bounded budget, and a
+///   terminal answer — `Settled`, or that budget exhausted — runs arc 2 and parks. The state does
+///   NOT advance while the volume is missing, so a volume that appears at minute nine is still
+///   staged.
 ///
 ///   `S_PARKED` — returns immediately, forever. Never panics, never blocks boot.
 pub fn service() {
@@ -222,13 +227,22 @@ pub fn service() {
                 return;
             }
             let n = STAGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
-            if DEFER_ANNOUNCED.load(Ordering::Relaxed) {
-                // Only on a boot that actually deferred. A boot that never waited prints no retry
-                // line, because it did not retry anything.
+            if n == 1 && DEFER_ANNOUNCED.load(Ordering::Relaxed) {
+                // Only on a boot that actually deferred, and only ONCE: this line reports an EVENT
+                // (the volume arrived), not an attempt. Printing it per attempt would put up to
+                // eight "APPEARED after waited=" lines with eight different `waited=` values in the
+                // capture, and a reader counting arrivals would count eight. Attempts 2..8 are
+                // already narrated by the `staging re-armed` line below and by `stage_attempt`'s own
+                // DEFERRED line, so nothing is lost.
+                //
+                // `n == 1` is the arrival because the counter only advances here, past the presence
+                // gate: the first attempt of the boot is by construction the first pass on which a
+                // handle was there to attempt against. A boot that never waited prints no line at
+                // all, because it did not resume anything.
                 let waited = now.saturating_sub(DEFER_SINCE_MS.load(Ordering::Relaxed));
                 serial_println!(
-                    ":: wifi: retry n={}/{} — program-source volume APPEARED after waited={}ms (handles={}) — resuming firmware staging ::",
-                    n, MAX_STAGE_ATTEMPTS, waited, crate::drivers::block::source_census()
+                    ":: wifi: program-source volume APPEARED after waited={}ms (handles={}) — resuming firmware staging at attempt n={}/{} ::",
+                    waited, crate::drivers::block::source_census(), n, MAX_STAGE_ATTEMPTS
                 );
             }
             match firmware::stage_attempt() {
@@ -255,9 +269,21 @@ pub fn service() {
                 }
                 firmware::StageOutcome::Settled => (),
             }
-            // Arc 2 runs HERE and only here — after a SETTLED staging pass, so `staged_count()` is
-            // final and arc 2's completeness gate reads a settled number rather than a race. It runs
-            // at most once per boot and the state moves to `S_PARKED` whatever it reports.
+            // Arc 2 runs HERE and only here, and the precondition is stated precisely because a
+            // reviewer will check it against the code: arc 2 runs once the staging pass has reached
+            // its TERMINAL answer for this boot — either `Settled`, or a `Retry` budget exhausted by
+            // the arm above. `staged_count()` is final in BOTH: the exhaustion arm is reached only
+            // from `Retry`, which by construction stages nothing (both of `stage_attempt`'s `Retry`
+            // returns sit above its `FW_SET` loop), so the count arc 2's completeness gate reads is
+            // 0 and cannot move afterwards — the state goes to `S_PARKED` on the next line.
+            //
+            // What is EXCLUDED is the non-terminal `Retry`, which returns above without reaching
+            // here: that is the case where another attempt is still coming and the count really is
+            // still moving. Pre-WIFI-REARM, `stage_once()` had no non-terminal outcome at all and
+            // arc 2 ran after every staging pass; the exhaustion path preserves exactly that
+            // behaviour for the case that used to be a single failed mount, and the re-armed path
+            // is the one that is newly held back. Arc 2 therefore runs at most once per boot, and
+            // never on a moving count.
             //
             // One consequence, stated rather than discovered: a boot where the program-source block
             // device never appears never reaches arc 2 at all — it waits in `S_WAIT_STORAGE`, now

@@ -129,7 +129,8 @@ classifies its own failure:
 | outcome | when | what the caller does |
 | --- | --- | --- |
 | `Settled` | the volume mounted and every role got its verdict — **or** the mount failed for a reason a later pass cannot change (`NotFat`, `Unsupported`, a corrupt chain) | prints nothing more; runs arc 2; parks |
-| `Retry(stage)` | mount or root-directory read failed with `NoDisk`/`Io`/`Busy` | backs off `STAGE_BACKOFF_MS` = 1 s, re-checks the handle from the top, re-attempts; up to `MAX_STAGE_ATTEMPTS` = 8 |
+| `Retry(stage)`, budget left | mount or root-directory read failed with `NoDisk`/`Io`/`Busy` | backs off `STAGE_BACKOFF_MS` = 1 s, re-checks the handle from the top, re-attempts; up to `MAX_STAGE_ATTEMPTS` = 8. Does **not** run arc 2 — the count is still moving |
+| `Retry(stage)`, budget spent | the 8th attempt also deferred | prints the give-up line; the deferral is now terminal, so `staged_count()` (0) is final; runs arc 2; parks |
 
 A volume that is not FAT now will not be FAT in two seconds, so those variants stay terminal;
 retrying them would be a spin dressed up as diligence. Both `Retry` arms sit **above** the
@@ -137,13 +138,20 @@ retrying them would be a spin dressed up as diligence. Both `Retry` arms sit **a
 that is a property of where the arms are, and it is why `STAGED` needs no reset between attempts.
 
 **4. The bound fails out loud.** Eight deferred attempts against a present handle print a named
-give-up line and then park. The failure mode of a bounded retry must be a printed line, never a quiet
-downgrade back to the silence this change exists to remove.
+give-up line, run arc 2 on the settled `staged_count()==0`, and park. The failure mode of a bounded
+retry must be a printed line, never a quiet downgrade back to the silence this change exists to
+remove.
 
 ### What deliberately did NOT change
 
-Arc 2 still runs only after a **settled** staging pass, and a boot whose volume never appears still
-never reaches arc 2 — it waits, now visibly. Releasing arc 2 on a timer was considered and rejected
+Arc 2 still runs only after the staging pass has reached its **terminal** answer for the boot — a
+`Settled` outcome, or the retry budget exhausted. Both leave `staged_count()` final before the
+completeness gate reads it (the exhaustion path stages nothing, by where the `Retry` arms sit), and
+the *non-terminal* `Retry` is the one case held back. Pre-WIFI-REARM there was no non-terminal
+outcome and arc 2 ran after every staging pass, so the exhaustion path preserves exactly the old
+behaviour for what used to be a single failed mount; nothing about arc 2's own gating was loosened.
+A boot whose volume never appears still never reaches arc 2 — it waits, now visibly. Releasing arc 2
+on a timer was considered and rejected
 for the two reasons the original call site records: it would put a backplane window write in a race
 with the pass that decides whether an upload may follow, and it would have arc 2's completeness gate
 read `staged_count()==0` as final on a boot where the volume then arrives. WIFI-REARM makes that wait
@@ -168,7 +176,7 @@ Storage appears late (the outcome the storage-lane arc is chasing):
 ```
 :: wifi: firmware staging deferred — … re-checking every pass, staging re-arms whenever it appears ::
 :: wifi: still deferred n=1/6 waited=10000ms — … the poll is LIVE ::
-:: wifi: retry n=1/8 — program-source volume APPEARED after waited=17431ms (handles=global=present sdhc=unbuilt) — resuming firmware staging ::
+:: wifi: program-source volume APPEARED after waited=17431ms (handles=global=present sdhc=unbuilt) — resuming firmware staging at attempt n=1/8 ::
 :: wifi: ucode STAGED … / firmware set COMPLETE 3/3 … (or the ABSENT/INCOMPLETE forms)
 :: wifi2: begin — arc 2: map BAR0, walk the EROM … ::
 … the normal arc-2 chain through its one `end` line …
@@ -177,15 +185,17 @@ Storage appears late (the outcome the storage-lane arc is chasing):
 Storage appears but its transport has not settled:
 
 ```
-:: wifi: retry n=1/8 — program-source volume APPEARED after waited=11002ms (handles=global=present sdhc=unbuilt) — resuming firmware staging ::
+:: wifi: program-source volume APPEARED after waited=11002ms (handles=global=present sdhc=unbuilt) — resuming firmware staging at attempt n=1/8 ::
 :: wifi: staging attempt DEFERRED at mount — program-source volume present but would not mount (block I/O error); nothing staged, re-attempting ::
 :: wifi: staging re-armed — attempt n=1/8 deferred at stage=mount, next attempt in 1000ms ::
-:: wifi: retry n=2/8 — … — resuming firmware staging ::
-… and either a staging verdict, or, after eight:
+:: wifi: staging attempt DEFERRED at mount — … ::
+:: wifi: staging re-armed — attempt n=2/8 deferred at stage=mount, next attempt in 1000ms ::
+… (the arrival line does NOT repeat — it reports the arrival, not the attempt; `n=` on the re-arm
+    lines is what counts the attempts) … and either a staging verdict, or, after eight:
 :: wifi: firmware NOT staged — 8 attempts all deferred at stage=mount against a present handle (handles=global=present sdhc=unbuilt); giving up staging for this boot ::
 ```
 
-A boot whose volume is present at the first check prints **no** `retry` line and stages on the pass
+A boot whose volume is present at the first check prints **no** arrival line and stages on the pass
 that saw it — the pre-WIFI-REARM timing, unchanged, because `NEXT_ATTEMPT_MS` is 0 until an attempt
 actually defers.
 
@@ -573,7 +583,7 @@ A `MISMATCH` on any field, or `cross-check=FAIL`, uses the same line shapes with
 ```
 :: wifi: firmware staging deferred — no program-source block device yet (the set lives on that FAT volume); re-checking every pass, staging re-arms whenever it appears ::
 :: wifi: still deferred n=1/6 waited=10000ms — no program-source volume yet (handles=global=absent sdhc=unbuilt); the poll is LIVE ::
-:: wifi: retry n=1/8 — program-source volume APPEARED after waited=17431ms (handles=global=present sdhc=unbuilt) — resuming firmware staging ::
+:: wifi: program-source volume APPEARED after waited=17431ms (handles=global=present sdhc=unbuilt) — resuming firmware staging at attempt n=1/8 ::
 :: wifi: ucode STAGED /B43/ucode29_mimo.fw bytes=94800 on source=global label='UNAOS' fp=0x1234abcd:0x0000f000 fnv1a=0xdeadbeef hdr=A type=0x75 ver=0x01 declared=94792 words=ok ::
 :: wifi: initvals STAGED /B43/ht0initvals29.fw bytes=3096 on source=global … ::
 :: wifi: bsinitvals STAGED /B43/ht0bsinitvals29.fw bytes=1224 on source=global … ::
@@ -625,7 +635,7 @@ Non-terminal notes (the pass continues and still ends in one verdict):
 * **Clean, no volume at all (Boot D's shape):** the census lines through `cross-check=PASS`, the
   `staging deferred` line, then up to six `still deferred n=k/6` heartbeats and silence. That silence
   is now the DOCUMENTED tail of a live poll rather than an unexplained one, and an arrival after it
-  still produces the `retry n=` line and a staging verdict.
+  still produces the `volume APPEARED` line and a staging verdict.
 * **Failure:** any `MISMATCH`, `cross-check=FAIL`, `REFUSED`, `REJECTED`, or `NOT staged` line, each
   carrying its own reason. A boot that prints no `wifi:` lines at all means the knob was not armed —
   check the `⚡ kernel features:` banner for `wifi`, and check `builder/src/main.rs` if the media was
@@ -803,7 +813,7 @@ document. No storage driver, video, bt or gen7 file is touched.
   reproduced that sha exactly.
 * **Reachability, not just compilation.** `strings` over the release-LTO
   `target/x86_64_esp/kernel.elf`: `:: wifi: ` counts **26** with `UNAOS_WIFI=1` (20 before this arc —
-  the six added are the heartbeat, the arrival/retry line, the re-arm line, the two staging-deferral
+  the six added are the heartbeat, the arrival line, the re-arm line, the two staging-deferral
   lines and the give-up line), and `wifi2:` counts **0** with `UNAOS_WIFI=1` alone and **50** with
   both knobs — unchanged from arc 2, so `wifi2` still emits nothing into an arc-1-only image. The
   arc-1 count is **26 in both** the `wifi` and the `wifi,wifi2` image. Banners read `…,wifi` and
@@ -819,17 +829,51 @@ the point of the arc. For the record:
 | `3bc0ead0`, knob off | `ac5d175981fab7e7…` | (no `wifi`) |
 | this arc, knob off | `ac5d175981fab7e7…` | (no `wifi`) |
 | `3bc0ead0`, `UNAOS_WIFI=1` | `8bdfff03ccaea25e…` | `…,wifi` |
-| this arc, `UNAOS_WIFI=1` | `56f5f04bd1d1d4ae…` | `…,wifi` |
-| this arc, `UNAOS_WIFI=1 UNAOS_WIFI2=1` | `fe971bb17d89e676…` | `…,wifi,wifi2` |
+| this arc, `UNAOS_WIFI=1` | `9320cc14bc7e22b7…` | `…,wifi` |
+| this arc, `UNAOS_WIFI=1 UNAOS_WIFI2=1` | `8b3f7e02f3199157…` | `…,wifi,wifi2` |
 
 One measured detail, recorded because it would otherwise look like a discrepancy in a later review:
-the armed shas move on a **comment-only** edit inside the module (an intermediate build of this arc
-gave `2b1d844323541fdb…`, and changing one word in a doc comment moved it to the value above). That
-is the `.llvm.` internal-symbol rehash the arc-2 gate section already measured, not a codegen change;
-the arc-1 witness count and the banner were identical across both. The knob-off sha did not move,
-which is the property that matters here.
+the armed shas move on a **comment-only** edit inside the module (intermediate builds of this arc
+gave `2b1d844323541fdb…` and `56f5f04bd1d1d4ae…`; the review round below moved them again). That is
+the `.llvm.` internal-symbol rehash the arc-2 gate section already measured, not a codegen change;
+the arc-1 witness count (26) and the banner were identical across every one of them. The knob-off
+sha did not move across ANY of them — including the review round — which is the property that
+matters here.
+
+### Review round
+
+The adversarial review re-ran all four `check` legs, re-measured the four shas above from scratch
+(all four of the arc's original values reproduced exactly, including `3bc0ead0`'s armed
+`8bdfff03ccaea25e…` and its 20-line `:: wifi: ` count), and re-verified the knob-off identity by the
+snapshot/`git apply -R`/rebuild route. Two defects were fixed, neither behavioural on the wire's
+happy path:
+
+1. **The arrival line printed once per attempt, not once per arrival.** It read
+   `retry n=k/8 — … volume APPEARED after waited=Xms`, and on an unsettled transport a capture would
+   carry up to eight of them with eight different `waited=` values — a reader counting arrivals
+   would have counted eight. It is now gated on `n == 1`, reworded to lead with the event, and the
+   attempt counter it used to carry is read off the `staging re-armed` lines, which already carry
+   `n=`. The string count is unchanged (26): the same format string, reordered.
+2. **The arc-2 precondition was documented as `Settled`-only, and the code does not enforce that.**
+   The exhausted-budget arm falls through to `bringup_once()`. The behaviour is right — an exhausted
+   budget IS a terminal answer, `staged_count()` is final at 0 because both `Retry` arms stage
+   nothing, and holding arc 2 back there would have *removed* the arc-2 witness from a boot where
+   `stage_once()` used to produce it — but the comment at the call site, this document's "what did
+   NOT change" paragraph, and the outcome table all claimed a stricter gate than the code has. All
+   three now state the real precondition: arc 2 runs on a TERMINAL staging answer, `Settled` or
+   budget-exhausted, and is held back only by the non-terminal `Retry`.
+
+Independently confirmed during the review, against the tree rather than the prose: all three
+`wifi::service()` call sites (`main.rs:1103`, `:1534`, `:4241`) sit inside persistent `loop {}`
+bodies, so the arc's central premise — that Boot D's poll really was live through those nine silent
+minutes — holds; the heartbeat is emitted from inside the `program_source().is_none()` arm and so
+cannot print unless that poll actually ran on that pass (it is a witness that can fail); the quiet
+branch past `MAX_SPOKEN_WAITS` stores no latch that touches the poll; the counter arithmetic yields
+exactly six heartbeats and `arch::ticks()` is a non-wrapping u64 ms counter; both `Retry` arms are
+above the `FW_SET` loop, so no retry can double-stage or resume a half-built set; and `bringup.rs`
+is untouched by the arc, so the `B43_SHM_UCODE` upload refusal is unchanged by construction.
 
 **Metal proof is Boot B**, and its falsifiable prediction is the chain in the WIFI-REARM section
 above: on a repeat of Boot D's no-storage shape the capture must carry six `still deferred n=k/6`
-heartbeats where Boot D carried nothing, and on a boot whose volume arrives the `retry n=` line must
+heartbeats where Boot D carried nothing, and on a boot whose volume arrives the `volume APPEARED` line must
 be followed by a staging verdict and the arc-2 chain.
