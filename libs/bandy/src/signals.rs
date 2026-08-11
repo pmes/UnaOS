@@ -3,8 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use crate::ontology::WeightedSkeleton;
-use crate::state::DispatchRecord;
+use crate::ontology::{Origin, WeightedSkeleton};
+use crate::state::{BrowseListing, DispatchRecord, FsOutcome, FsVerb};
 
 /// SMessage (The Shard Message).
 /// The atomic unit of truth in UnaOS.
@@ -342,6 +342,38 @@ pub enum MatrixEvent {
     NodeSelected(PathBuf),
     /// Broadcasts an updated, flattened structural topology back to the UI
     TopologyMutated(Vec<(String, String, usize)>),
+
+    // --- FINDER (the file-browser capability) ---
+    // Matrix is the all-asset manager; the Finder is a navigable CURSOR over
+    // the filesystem, distinct from the code-topology DAG above. Every verb is
+    // principal-stamped (`Origin`) so an in-kernel fulfilment runs with the
+    // invoker's grants, never ambient authority (ROADMAP message-security law).
+
+    /// UI → matrix: navigate the browse cursor to a directory (workspace-
+    /// relative; `""` = workspace root). Matrix answers with `DirListed`.
+    BrowseTo { principal: Origin, path: String },
+    /// Matrix → UI: the browse-view listing of the current directory — the flat
+    /// file list/grid the vessel renders (NOT the dependency DAG).
+    DirListed(BrowseListing),
+    /// UI → matrix: a Finder file verb. `arg` is the verb's second operand (new
+    /// name for `Rename`/`NewFolder`, destination dir for `Copy`/`Move`, unused
+    /// for `Open`/`Delete`). `confirmed` gates the destructive `Delete`:
+    /// `false` ⇒ matrix answers `FsOpResult { outcome: NeedsConfirm }`.
+    FileOp {
+        principal: Origin,
+        verb: FsVerb,
+        path: String,
+        arg: Option<String>,
+        confirmed: bool,
+    },
+    /// Matrix → UI: the outcome of a `FileOp`, principal-attributed. A read-only
+    /// volume surfaces here as `Denied`, loudly — never a silent no-op.
+    FsOpResult {
+        principal: Origin,
+        verb: FsVerb,
+        path: String,
+        outcome: FsOutcome,
+    },
 }
 
 /// The trait that defines a "Nerve Ending" in the system.

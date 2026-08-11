@@ -184,6 +184,106 @@ impl Default for AppState {
     }
 }
 
+// --- FINDER (the file-browser capability) ---
+//
+// The Finder is a NAVIGABLE CURSOR over the filesystem — a flat view of one
+// directory's immediate children — as distinct from the code-topology DAG
+// (`TopologyNode`), which is a recursive dependency graph. A Finder shows
+// files (including empty dirs, which the DAG genesis scan prunes); the DAG
+// shows structure. These types are the browse-view payload the vessel renders.
+
+/// What a browse entry is. Symlinks are reported via `BrowseEntry::is_symlink`
+/// on top of the kind of their *own* file type (never the target's — the
+/// Finder never follows a link to classify it).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum BrowseKind {
+    Dir,
+    File,
+    /// Neither a regular file nor a directory (fifo, socket, device, …).
+    Other,
+}
+
+/// One row in a Finder listing: a single directory child, identified by its
+/// workspace-relative `path` (the stable id used for navigation and file ops).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BrowseEntry {
+    /// Workspace-relative path (`/`-joined, root-relative). The op/nav id.
+    pub path: String,
+    /// Display name — the final path component.
+    pub name: String,
+    /// The entry's own file type (a symlink reports its link file type here,
+    /// classified WITHOUT following it).
+    pub kind: BrowseKind,
+    /// Size in bytes for regular files; `0` for directories and non-files.
+    pub size: u64,
+    /// True when the entry is a symlink. Shown for honesty but never descended.
+    pub is_symlink: bool,
+}
+
+/// The full browse-view state for one directory — the payload the vessel
+/// renders as a file list/grid. Distinct from `TopologyState`/`TopologyNode`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct BrowseListing {
+    /// Workspace-relative path of the directory shown (`""` = workspace root).
+    pub path: String,
+    /// Workspace-relative parent; `None` at the workspace root (ascent stops
+    /// there — the Finder never navigates above the anchored root).
+    pub parent: Option<String>,
+    /// Breadcrumb trail from root to `path`: `(segment_label, segment_rel_path)`
+    /// in order. The first segment is the workspace root itself (`("", "")`).
+    pub breadcrumbs: Vec<(String, String)>,
+    /// The directory's immediate children — directories first, then files,
+    /// each group alphabetical (matching the genesis scan's ordering).
+    pub entries: Vec<BrowseEntry>,
+}
+
+/// A Finder file verb. Attached to each `FileOp`/`FsOpResult` so every mutation
+/// is principal-attributable and self-describing on the bus.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FsVerb {
+    /// Open a file (resolve + validate; the vessel routes it to the editor).
+    Open,
+    /// Create a new directory `arg` inside the target directory `path`.
+    NewFolder,
+    /// Rename the target `path` to the bare name `arg` (same parent).
+    Rename,
+    /// Copy the target `path` into the directory `arg`.
+    Copy,
+    /// Move the target `path` into the directory `arg`.
+    Move,
+    /// Delete the target `path` (move-to-trash; requires confirmation).
+    Delete,
+}
+
+impl FsVerb {
+    /// Does this verb mutate the filesystem? (`Open` does not.)
+    pub fn is_write(self) -> bool {
+        !matches!(self, FsVerb::Open)
+    }
+}
+
+/// The result of a Finder file verb, principal-attributed on the bus.
+///
+/// The FAT-verb-law posture holds on the host too: a write that a read-only
+/// volume refuses surfaces as [`FsOutcome::Denied`] — loudly, never a silent
+/// no-op — exactly as the on-metal UnaFS/FAT verbs answer `-ENOTSUP` before
+/// touching the block path. `Error` is reserved for genuine failures that are
+/// not a policy refusal.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum FsOutcome {
+    /// The op completed; `path` is the resulting workspace-relative path (the
+    /// new name / destination / trash location).
+    Ok { path: String },
+    /// A destructive op (`Delete`) needs explicit confirmation first. The UI
+    /// re-issues the verb with `confirmed: true` to proceed.
+    NeedsConfirm,
+    /// The op was refused by policy: a read-only volume, a permission denial,
+    /// or a path that escapes the workspace root. The loud refusal.
+    Denied { reason: String },
+    /// The op failed at the filesystem layer for a non-policy reason.
+    Error { message: String },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TopologyNode {
     pub id: String,
