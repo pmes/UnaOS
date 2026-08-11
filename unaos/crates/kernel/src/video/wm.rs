@@ -3588,7 +3588,7 @@ fn composite_inner() -> CursorTail {
         // shared by the blit and by every witness that has to excuse what the blit withheld. Built
         // per window rather than once per pass because the set is relative to the painter; the scan
         // is `MAX_WINDOWS` rows against a call that is about to copy a box.
-        let clip = occ_clip(&rows, i, shell);
+        let clip = occ_clip(&rows, i, shell, fb.info().width, fb.info().height);
         // WC-D — the REFERENCE, taken BEFORE the blit. See `verify_reference` and the WCD-PRE section
         // of `verify_window`'s ledger for why it cannot be taken any later: the read-back's reference
         // used to be snapshotted from inside `verify_window`, which runs after `wcg::end` and
@@ -4332,7 +4332,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
             // bleed this arc removes. The verdict is already sealed by here (`retry=no` on the
             // `bad`/`moved` arm, or the `live` label) and nothing re-reads the glass afterwards, so
             // no instrument mistakes the no-op for a repair that happened.
-            &occ_clip_live(r),
+            &occ_clip_live(r, fb.info().width, fb.info().height),
         );
         return;
     }
@@ -4462,7 +4462,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
             // bleed this arc removes. The verdict is already sealed by here (`retry=no` on the
             // `bad`/`moved` arm, or the `live` label) and nothing re-reads the glass afterwards, so
             // no instrument mistakes the no-op for a repair that happened.
-            &occ_clip_live(r),
+            &occ_clip_live(r, fb.info().width, fb.info().height),
         );
 }
 
@@ -9842,6 +9842,79 @@ static DO_FILL_CLIP_DOCK_PX: core::sync::atomic::AtomicU64 = core::sync::atomic:
 /// the clip working; equality means every published row was whole.
 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
 static DO_FILL_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WCK5 — **the dock strip as [`occ_clip`] last built it**: `x`, `y`, `w`, `h`, with `w == 0`
+/// meaning `dock::Layout::for_panel` answered `None` and there is no strip to protect.
+///
+/// The WINDOW-blit twin of [`DO_DOCK_BOX`], and a SEPARATE static on purpose rather than a second
+/// reader of that one. `DO_DOCK_BOX` is published by [`erase_clip`], which runs only when a drain has
+/// boxes to publish; this is published by [`occ_clip`], which runs for every window of every pass. A
+/// gesture that erased nothing would read the drain's stale (or never-written) box and call it this
+/// path's answer, which is the class of borrowed-instrument error this repo keeps convicting. Two
+/// paths, two publications, and a capture in which they DISAGREE is itself a finding.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static OD_BOX: [core::sync::atomic::AtomicUsize; 4] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
+/// WCK5 — **window blits during this gesture whose clip CARRIED the strip.** The population term.
+///
+/// WCK4's D1 lesson, applied to the path D3 left open: a zero that cannot distinguish *"the clip held
+/// the dock and nothing crossed it"* from *"the dock was never in the clip"* is vacuous, and
+/// `occclip_dock_px` alone is exactly that zero. This counts the pushes — so
+/// `occclip_dock=0 occclip_dock_px=0` says no blit met the strip, while `occclip_dock=N>0` with
+/// `occclip_dock_px=0` says the strip was in N clips and withheld nothing, which on a drag across the
+/// foot of the panel is the defect rather than the fix.
+///
+/// A per-gesture sum, swapped at [`drag_report`] with the other totals — not a snapshot like
+/// [`DO_CLIP_N`], because the question here is "did the mechanism run during this gesture" rather
+/// than "what shape was the last drain's clip".
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static OD_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WCK5 — **panel pixels the WINDOW blits withheld specifically because of the dock strip** during
+/// this gesture. The term Peter's Boot B report has no counterpart for anywhere on the wire.
+///
+/// Derived the way [`DO_FILL_CLIP_DOCK_PX`] is, and for its reason: per row, the strip's columns
+/// inside the window's box MINUS the strip's columns that row actually PUBLISHED, summed over the
+/// real spans the blit emitted. So it is a measurement of the span walk rather than a restatement of
+/// two rectangles — a walk that leaked window chrome into the strip lowers this term at the same time
+/// as it puts pixels on the strip, and it cannot read healthy while the taskbar is being overwritten.
+///
+/// Folded UNCONDITIONALLY, not through [`dragocc_note`]: that path is gated on `dragocc_target`,
+/// which returns `None` for the dragged window itself, and the dragged window is precisely the one
+/// whose chrome crosses the strip in the reported symptom. A term that could not see the dragged
+/// window would have been blind to the whole defect.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static OD_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCK5 — [`OD_BOX`] on the wire, as `WxH+X+Y` or the literal `absent`.
+///
+/// The same distinction `dock=` draws and for the same reason — `0x0+0+0` is a rectangle and `absent`
+/// is the absence of one, and WCK4 exists because those two were indistinguishable. `dock=` draws it
+/// with two `serial_println!` arms; this one is a formatter because `[drag-occ]` already has two arms
+/// for `dock=`, and a second independent two-way choice would have made four copies of a
+/// twenty-field line — four places for a field to drift out of step.
+///
+/// Takes the width it was already read with, so the `w == 0` decision and the printed `w` are the
+/// same load; the remaining three are read here, which is [`DO_DOCK_BOX`]'s own D6 tolerance for a
+/// four-atomic box that is not a transaction.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+struct OccDockBox(usize);
+
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+impl core::fmt::Display for OccDockBox {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::sync::atomic::Ordering::Relaxed;
+        if self.0 == 0 {
+            return f.write_str("absent");
+        }
+        write!(
+            f,
+            "{}x{}+{}+{}",
+            self.0,
+            OD_BOX[3].load(Relaxed),
+            OD_BOX[0].load(Relaxed),
+            OD_BOX[1].load(Relaxed)
+        )
+    }
+}
 
 /// WCK4 — publish the dragged window's CURRENT box for the fills this drain is about to make.
 ///
@@ -10052,6 +10125,10 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
         let fovr = DO_FILL_OVER_PX.swap(0, Relaxed);
         let fruns = DO_FILL_RUNS.swap(0, Relaxed);
         let fdock = DO_FILL_CLIP_DOCK_PX.swap(0, Relaxed);
+        // WCK5 — the WINDOW-blit side of the same question, as a PAIR. Swapped with the gesture's
+        // other totals; the strip's geometry beside them is `load`-not-swap on `dock=`'s argument.
+        let odn = OD_N.swap(0, Relaxed);
+        let odpx = OD_PX.swap(0, Relaxed);
         // REVIEW (D1) — the clip's SHAPE, not a total: `load`, not `swap`, because these describe the
         // most recent drain rather than the gesture, and clearing them would make the next gesture's
         // opening report say the clip was empty when it was merely not rebuilt yet.
@@ -10102,16 +10179,22 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
         // the literal `absent`. Formatted through two arms rather than a sentinel, because `0x0+0+0`
         // is a rectangle and `absent` is the absence of one, and this arc exists because those two
         // were indistinguishable.
+        // WCK5 — `occdock=` is the strip as the WINDOW-blit clip saw it, spelled and formatted exactly
+        // as `dock=` is, and printed BESIDE it rather than merged with it. The two are published by
+        // different functions on different cadences (see [`OD_BOX`]), so a capture in which they
+        // disagree is a finding; a single field would have hidden that by construction.
+        let oddockw = OD_BOX[2].load(Relaxed);
         if dockw == 0 {
             serial_println!(
-                "[drag-occ] win={} owner={:#x} moves={} neigh={} neigh_px={} occ_px={} fill_px={} clip_px={} buried={} direct={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock=absent fillclip_dock_px={} -> {}",
+                "[drag-occ] win={} owner={:#x} moves={} neigh={} neigh_px={} occ_px={} fill_px={} clip_px={} buried={} direct={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock=absent fillclip_dock_px={} occdock={} occclip_dock={} occclip_dock_px={} -> {}",
                 id, owner, moves, mask.count_ones(), npx, opx, fpx, cpx, buried, direct,
                 fpub, fclip, fovr, fruns, clipn, fdock,
+                OccDockBox(oddockw), odn, odpx,
                 if clean { "CLEAN" } else { "BLEED" }
             );
         } else {
             serial_println!(
-                "[drag-occ] win={} owner={:#x} moves={} neigh={} neigh_px={} occ_px={} fill_px={} clip_px={} buried={} direct={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock={}x{}+{}+{} fillclip_dock_px={} -> {}",
+                "[drag-occ] win={} owner={:#x} moves={} neigh={} neigh_px={} occ_px={} fill_px={} clip_px={} buried={} direct={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock={}x{}+{}+{} fillclip_dock_px={} occdock={} occclip_dock={} occclip_dock_px={} -> {}",
                 id, owner, moves, mask.count_ones(), npx, opx, fpx, cpx, buried, direct,
                 fpub, fclip, fovr, fruns, clipn,
                 dockw,
@@ -10119,6 +10202,7 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
                 DO_DOCK_BOX[0].load(Relaxed),
                 DO_DOCK_BOX[1].load(Relaxed),
                 fdock,
+                OccDockBox(oddockw), odn, odpx,
                 if clean { "CLEAN" } else { "BLEED" }
             );
         }
@@ -10410,13 +10494,31 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 // changes — not that no aarch64 instruction does.
 /// WCK4 — how many boxes a clip can hold: every window, plus the dock strip.
 ///
-/// [`occ_clip`] can never fill more than `MAX_WINDOWS` (it is built from the window table and
-/// excludes the subject), so this is one box of headroom for that caller and an exact fit for
-/// [`erase_clip`], whose set is *every* on-glass window AND the dock — furniture that is not a
-/// window and therefore has no row to be found in. Sizing this at `MAX_WINDOWS` and dropping the
-/// overflow would have been a silent hole in exactly the direction the arc is closing: the box that
-/// did not fit is the box that gets published over.
+/// [`occ_clip`] can never fill more than `MAX_WINDOWS` (see [`OCC_CLIP_MAX`]), so this is one box of
+/// headroom for that caller and an exact fit for [`erase_clip`], whose set is *every* on-glass
+/// window AND the dock — furniture that is not a window and therefore has no row to be found in.
+/// Sizing this at `MAX_WINDOWS` and dropping the overflow would have been a silent hole in exactly
+/// the direction the arc is closing: the box that did not fit is the box that gets published over.
 const OCC_MAX: usize = MAX_WINDOWS + 1;
+
+/// WCK5 — **[`occ_clip`]'s own population bound, now that it carries the strip too.**
+///
+/// WC-K3 sized `occ_clip` against a `(z, id)` HALF-SPACE and against nothing else: at most every row
+/// but the subject, `MAX_WINDOWS - 1`, comfortably inside [`OCC_MAX`]. That headroom is what this arc
+/// spends. Adding the dock makes the worst case `MAX_WINDOWS - 1` windows plus one strip —
+/// `MAX_WINDOWS` — which is still one short of [`OCC_MAX`], so the array cannot overflow and the
+/// window loop's direct `boxes[n]` writes stay in bounds.
+///
+/// Asserted rather than asserted-in-prose, because the two facts that make it true live in different
+/// places: the `-1` is the `(z, id) <= (z, id)` self-exclusion in [`occ_clip`]'s loop, and the `+1` is
+/// [`OCC_MAX`]'s definition. A later arc that gives the compositor a SECOND piece of furniture — or
+/// that drops the self-exclusion — trips this at compile time instead of silently dropping the box
+/// that gets published over, which is the failure WCK4's own sizing note named.
+const OCC_CLIP_MAX: usize = (MAX_WINDOWS - 1) + 1;
+const _: () = assert!(
+    OCC_CLIP_MAX <= OCC_MAX,
+    "occ_clip's population (every row but the subject, plus the dock strip) must fit OccClip"
+);
 
 #[derive(Clone, Copy)]
 struct OccClip {
@@ -10624,8 +10726,60 @@ impl OccRows {
 ///
 /// Empty on every arch but x86 (see the ledger above [`OccClip`]), and empty whenever nothing
 /// overlaps, so the per-row work below is skipped outright for the topmost window of any stack.
+///
+/// ### WCK5 — AND THE DOCK STRIP IS IN IT, WITH NO `(z, id)` TERM AT ALL
+///
+/// **The defect (Peter, Boot B, attended): "dragging is worse for the taskbar now, it goes away
+/// dragging any window".** WCK4 closed the ERASE path and its `[drag-occ]` lines prove it holds —
+/// every gesture in `gr25-bootB` reads `fillover_px=0` with the strip IN the clip (`dock=340x52+1270+1736`,
+/// `fillclip_dock_px` nonzero whenever the drag crossed the strip). What WCK4 named as KNOWN GAP D3
+/// is what remained: THIS clip is built from TABLE rows, the dock is not a row, so a window whose
+/// `outer_box` overlaps the strip published its chrome and its corners straight over the strip on
+/// every composite, and `dock::compose`'s `clobbered` test repainted the strip at the TAIL of the same
+/// pass. Disappear and reappear, at motion rate — and DRAGGLIDE, by raising motion throughput, raised
+/// the rate at which it happens, which is why the same defect got worse from a change that touched
+/// no pixel of it.
+///
+/// **THE LAW: the strip is topmost by construction, so every window's clip carries it
+/// unconditionally.** The `(z, id)` half-space above is the right membership test between two
+/// WINDOWS, because the blit order is that key and a window may legitimately paint over anything
+/// below it. The dock is not in that order at all. [`composite_once`] runs
+/// `super::dock::compose()` AFTER `composite_inner` returns — *"the strip is the pass's LAST layer
+/// under the sprite: after every window, before the cursor tail"* — so whatever any window paints
+/// over the strip, the strip paints back within the same pass. There is no `z` at which a window is
+/// above it and therefore no half-space term to write: a window pixel inside the strip is a pixel
+/// with a lifetime of one composite tail, which is precisely the flicker. So the strip is admitted
+/// for every subject, tested only for overlap.
+///
+/// **The membership predicate for WINDOWS is untouched, which is the [`above_shell`] composition the
+/// SHELLWIN merge requires.** The strip is furniture and is admitted OUTSIDE the row loop, exactly as
+/// [`erase_clip`] admits it — so `above_shell`'s parked-console narrowing
+/// (`r.compat || r.z > shell || (is_kernel_owner(..) && r.z != PARKED_Z)`) governs precisely the rows
+/// it governed before this arc, and a parked console neither enters this set nor is protected by it.
+/// A row that is not on the glass still cannot occlude; the strip always is.
+///
+/// **Where the strip's geometry comes from, and why there is no second table lock.** The rect is
+/// `dock::Layout::for_panel` — the dock's own single source of tile arithmetic, the same call
+/// [`erase_clip`] makes — fed by [`dock_tiles`], which counts dock-addressable rows from the SNAPSHOT
+/// THIS PASS IS BLITTING FROM through [`dock_addressable`], the very predicate [`dock_scan`] uses.
+/// [`erase_clip`] can afford `dock_scan` and its `TABLE` acquisition because it runs once per drain;
+/// this runs once per window per pass, inside the blit loop, and the "no second table lock" rule in
+/// the ledger above is absolute here. The snapshot is also the RIGHT source, for the same reason the
+/// rows are: it is the geometry this pass is drawing against, and it is the tile count
+/// `dock::compose` will itself compute at the tail of this same pass.
+///
+/// **Capacity.** See [`OCC_CLIP_MAX`]: the strip spends the one box of headroom WC-K3 left and the
+/// total still fits [`OCC_MAX`], asserted at compile time. The strip goes in through
+/// [`OccClip::push`] rather than a direct write so that a future third piece of furniture is DECLINED
+/// rather than written past the end.
+///
+/// **x86 + `wc` only.** Off `wc` there is no dock — `wcx.rs` is the x86 panel path the knob gates —
+/// and off x86 this whole body is absent. On aarch64 the term is STRUCTURALLY absent, not merely
+/// empty: `super::dock` is never named, no `for_panel` runs, and the clip stays [`OccClip::none`], so
+/// every aarch64 blit below is pixel-identical to the pre-arc blit. `pw`/`ph` are the two arguments
+/// that arch pays and cannot use, on [`OccClip`]'s own "same pixels, not same bytes" boundary.
 #[allow(unused_variables, unused_mut)]
-fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32) -> OccClip {
+fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: usize) -> OccClip {
     let mut c = OccClip::none();
     #[cfg(target_arch = "x86_64")]
     {
@@ -10641,6 +10795,35 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32) -> OccClip {
             }
             c.boxes[c.n] = b;
             c.n += 1;
+        }
+        // WCK5 — the strip, admitted for every subject it meets. No `(z, id)`, for the reason in the
+        // ledger above: `composite_once` paints it after this whole loop has run.
+        #[cfg(feature = "wc")]
+        {
+            let rect = super::dock::Layout::for_panel(dock_tiles(rows), pw, ph).map(|l| l.rect());
+            // WCK4-D1's lesson, restated on this side: the strip's geometry goes on the wire whether
+            // or not there IS one, so `occclip_dock=0` beside a live strip is loud rather than silent.
+            // Published from the same `rect` the clip is built from, and BEFORE the overlap test — a
+            // subject that does not meet the strip must not be able to erase the fact that a strip
+            // exists.
+            #[cfg(feature = "witness")]
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                let (dx, dy, dw, dh) = rect.unwrap_or((0, 0, 0, 0));
+                OD_BOX[0].store(dx, Relaxed);
+                OD_BOX[1].store(dy, Relaxed);
+                OD_BOX[2].store(dw, Relaxed);
+                OD_BOX[3].store(dh, Relaxed);
+            }
+            if let Some(b) = rect {
+                if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) && c.push(b) {
+                    // WCK5 — one window blit whose clip CARRIED the strip. The population term for
+                    // `occclip_dock_px`: a gesture with `occclip_dock=0` withheld nothing because no
+                    // blit met the strip, which is a different statement from "the clip did not work".
+                    #[cfg(feature = "witness")]
+                    OD_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
     }
     c
@@ -10684,15 +10867,19 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32) -> OccClip {
 // taken from `dock::Layout::for_panel`, the dock's own single source of tile arithmetic, fed by
 // [`dock_scan`]'s tile count, so nothing here is a second copy of the strip's rectangle.
 //
-// **KNOWN GAP, deliberately left (review D3, a follow-up arc's).** This closes the ERASE path only.
-// [`occ_clip`] — the WINDOW blit path — has no dock term either, so a window whose blit crosses the
-// strip still publishes over it and the strip still repaints a pass later. That case is narrower
-// (`dock::compose`'s `clobbered` test is exactly "a window that meets my rect was damaged", so it
-// does heal, which is the flicker rather than the permanent hole this arc removes) and it is a
-// different predicate on a different path. Named here so the next reader of this ledger does not
-// mistake a residual strip flicker during a slow drag ACROSS the dock for a failure of the erase
-// clip: check `dock=` and `fillclip_dock_px=` first — if the strip was in the erase clip and pixels
-// were withheld there, the residual belongs to D3, not to this code.
+// **KNOWN GAP D3 — CLOSED BY WCK5, and the reading rule it left behind is still the right one.**
+// This function closes the ERASE path only. [`occ_clip`] — the WINDOW blit path — had no dock term
+// either, so a window whose blit crossed the strip published over it and the strip repainted at the
+// tail of the same pass: the flicker rather than the permanent hole this arc removes. Peter reported
+// exactly that on Boot B ("dragging is worse for the taskbar now"), with this arc's own witness
+// clearing the erase path on every gesture of the capture — `fillover_px=0`, `dock=340x52+1270+1736`,
+// `fillclip_dock_px` nonzero across the strip. [`occ_clip`] now carries the strip on the law that
+// `composite_once` paints the dock after every window; see its ledger.
+//
+// The triage rule stands, and now has both halves: a residual strip flicker is the ERASE's if
+// `dock=absent` or `fillclip_dock_px=0` while the drag crossed the strip, and the WINDOW BLIT's if
+// `occclip_dock=0` or `occclip_dock_px=0` under the same condition. Two paths, two pairs, and neither
+// zero can stand in for the other.
 //
 // **x86 only**, on [`OccClip`]'s wire-boundary argument: aarch64 gets [`OccClip::none`], `occ.n` is
 // 0, and every fill takes the whole-row branch — the pre-arc loop, publishing the SAME PIXELS at the
@@ -10791,13 +10978,17 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
 /// The shell position is read here rather than passed, for the same reason the rows are: this caller
 /// has no pass to inherit either from. A shell that moves between the two reads costs the repair the
 /// clip a neighbouring pass would have used, and the repair is idempotent.
+///
+/// WCK5 — `(pw, ph)` is passed rather than read, because the panel is the one thing this caller DOES
+/// inherit: [`verify_window`] holds the `fb` the repair is about to blit into, and re-locking
+/// `WRITER` here would be a nested acquisition inside the composite that already holds it.
 #[cfg(feature = "witness")]
-fn occ_clip_live(r: &Window) -> OccClip {
+fn occ_clip_live(r: &Window, pw: usize, ph: usize) -> OccClip {
     let t = table();
     let rows = t.rows;
     drop(t);
     match rows.iter().position(|q| q.used && q.id == r.id) {
-        Some(i) => occ_clip(&rows, i, shell_z()),
+        Some(i) => occ_clip(&rows, i, shell_z(), pw, ph),
         None => OccClip::none(),
     }
 }
@@ -12393,6 +12584,27 @@ fn stage_window(
     let dbox = dragocc_target(r);
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
     let (mut wrote_px, mut occ_px, mut clip_px) = (0u64, 0u64, 0u64);
+    // WCK5 — the strip as THIS clip holds it, read once for the whole present on `dbox`'s precedent:
+    // it is fixed for the pass, and reading it per row would be an atomic load inside the blit loop.
+    // `w == 0` means `for_panel` answered `None`, and then `odock_px` correctly stays 0 — which is
+    // the honest answer, and the reason `occclip_dock=` is on the wire beside it.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    let odockb = {
+        use core::sync::atomic::Ordering::Relaxed;
+        let dw = OD_BOX[2].load(Relaxed);
+        if dw == 0 {
+            None
+        } else {
+            Some((
+                OD_BOX[0].load(Relaxed),
+                OD_BOX[1].load(Relaxed),
+                dw,
+                OD_BOX[3].load(Relaxed),
+            ))
+        }
+    };
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    let mut odock_px = 0u64;
 
     // WC-K3 — ONCE PER PRESENT, not once per scanline (review, SHOULD-FIX 4). The occluder geometry
     // is fixed for the whole present, so both the sort and the two stack arrays are hoisted out of
@@ -12489,12 +12701,17 @@ fn stage_window(
                 {
                     wrote_px += bw as u64;
                     occ_px += span_occ(dbox, py, bx, bx + bw);
+                    // WCK5 — an EMPTY clip withheld nothing, so `odock_px` correctly gains nothing on
+                    // this branch. And it cannot silently swallow the strip: a window that meets the
+                    // strip always has the strip pushed into its clip, so `clip.n == 0` on a row that
+                    // covers the strip is a contradiction the `occclip_dock=` population term makes
+                    // visible rather than a zero that reads clean.
                 }
                 continue;
             }
             let ns = occ.spans(py, bx, bx + bw, &mut spans);
             #[cfg(all(feature = "witness", target_arch = "x86_64"))]
-            let mut row_written = 0u64;
+            let (mut row_written, mut row_dock_pub) = (0u64, 0u64);
             for &(sx0, sx1) in spans[..ns].iter() {
                 let off = (sx0 - bx) * bpp;
                 let len = (sx1 - sx0) * bpp;
@@ -12503,12 +12720,17 @@ fn stage_window(
                 {
                     row_written += (sx1 - sx0) as u64;
                     occ_px += span_occ(dbox, py, sx0, sx1);
+                    // WCK5 — the strip's columns this row PUBLISHED. Subtracted below from the
+                    // strip's columns the row COVERED, which is what makes `occclip_dock_px` a
+                    // reading of the span walk and not of two rectangles.
+                    row_dock_pub += span_occ(odockb, py, sx0, sx1);
                 }
             }
             #[cfg(all(feature = "witness", target_arch = "x86_64"))]
             {
                 wrote_px += row_written;
                 clip_px += bw as u64 - row_written;
+                odock_px += span_occ(odockb, py, bx, bx + bw).saturating_sub(row_dock_pub);
             }
         }
 
@@ -12524,6 +12746,13 @@ fn stage_window(
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
     if dbox.is_some() {
         dragocc_note(r.id, wrote_px, occ_px, clip_px);
+    }
+    // WCK5 — and fold the strip's withheld total UNCONDITIONALLY, outside that gate. See [`OD_PX`]:
+    // `dragocc_target` is `None` for the DRAGGED window, and the dragged window is the one whose
+    // chrome crosses the taskbar in the symptom this term exists to falsify.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    if odock_px > 0 {
+        OD_PX.fetch_add(odock_px, core::sync::atomic::Ordering::Relaxed);
     }
 
     // WC-K3 — `bytes` is the extent this present OWED, and on an occluded window that is now an upper
@@ -15334,7 +15563,7 @@ pub fn dock_scan(
         {
             clobbered = true;
         }
-        if r.compat || r.owner_asid == 0 {
+        if !dock_addressable(r) {
             continue;
         }
         out[n] = DockEntry {
@@ -15354,6 +15583,36 @@ pub fn dock_scan(
     // it would silently start shuffling tiles under the operator's hand.
     debug_assert!(out[..n].windows(2).all(|p| p[0].id < p[1].id));
     (n, clobbered)
+}
+
+/// WCK5 — **is `r` a row the dock gives a tile to?** Extracted from [`dock_scan`], not restated.
+///
+/// The membership rule is unchanged and its whole justification is in that function's ledger: live,
+/// non-`compat`, non-zero owner — the set [`focus_ring`] cycles, with kernel-owned rows deliberately
+/// IN because a dock that could not bring the console back would be missing the one window an
+/// operator most needs to reach. Note what is NOT here: `above_shell`. A hidden window still owns a
+/// tile (that tile is how it comes back); `DockEntry::visible` carries the answer instead.
+///
+/// It exists as a function because WCK5 gave [`occ_clip`] a second consumer of the tile COUNT, on a
+/// path that cannot take `dock_scan`'s `TABLE` lock. A predicate copied into that path would have
+/// been a second definition of which windows the strip is sized by — free to drift, and drifting
+/// silently, since the two would only disagree about the strip's WIDTH.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline]
+fn dock_addressable(r: &Window) -> bool {
+    r.used && !r.compat && r.owner_asid != 0
+}
+
+/// WCK5 — **how many tiles the dock would draw for this SNAPSHOT of the table**, lock-free.
+///
+/// [`dock_scan`]'s count, asked of rows a caller already holds. That is the whole difference and it
+/// is the point: [`occ_clip`] runs once per window per pass inside the blit loop, where a `TABLE`
+/// acquisition would be both a cost and a fresh interleave in a loop that deliberately takes none
+/// (see its ledger). The snapshot is also the RIGHT input — it is the geometry this pass is drawing
+/// against, and the count `dock::compose` will reach at the tail of the same pass.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn dock_tiles(rows: &[Window; MAX_WINDOWS]) -> usize {
+    rows.iter().filter(|r| dock_addressable(r)).count()
 }
 
 // ---- CTRLWIT fixture ---------------------------------------------------------------------------

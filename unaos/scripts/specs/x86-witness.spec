@@ -1208,6 +1208,22 @@ FORBID \[wc-k\] .*outside=[1-9]
 FORBID \[drag-occ\] .*-> BLEED
 FORBID \[wck4\] erase clip OVERFLOW
 
+# --- WCK5: THE STRIP'S WINDOW-BLIT PROTECTION, PINNED ----------------------------------------
+# --- WCK4 closed the ERASE path and left the WINDOW-blit path open (its own KNOWN GAP D3): a
+# --- window whose outer box overlapped the dock published its chrome over the strip on every
+# --- composite and `dock::compose` repainted the strip at the tail of the same pass —
+# --- disappear/reappear at motion rate, which is what Peter reported on Boot B. `occ_clip` now
+# --- carries the strip, and the pair on the wire is `occclip_dock=` (window blits whose clip HELD
+# --- the strip) and `occclip_dock_px=` (pixels those blits withheld because of it), beside
+# --- `occdock=` (the strip as that clip saw it, or `absent`).
+# ---
+# --- The rule below is the D1 lesson stated as a regex. A blit that had the strip in its clip and
+# --- withheld NOTHING is the defect, not the fix — either the span walk published the strip's
+# --- columns or the box went in degenerate. `occclip_dock=0` is NOT forbidden and must not be: a
+# --- gesture that stayed away from the foot of the panel legitimately never met the strip, which
+# --- is exactly why the count is on the wire beside the pixel total rather than instead of it.
+FORBID \[drag-occ\] .* occclip_dock=[1-9][0-9]* occclip_dock_px=0
+
 # --- CONSOLEWIN: THE CONSOLE'S WAY BACK, PINNED ON THE ARCH THAT HAS A CONSOLE ------------------
 # --- The x86 half of the console-as-window arc had no spec rule at all until this line, which is
 # --- the arch it actually ships on: `wm::ctrldecline_selftest` and `wm::closeiso_selftest` are
