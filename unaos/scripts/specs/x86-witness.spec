@@ -1269,9 +1269,13 @@ FORBID \[drag-occ\] .* bars=[0-9]/[0-9] bar=[1-9]
 # ---   * `floor=true/true`   — the panel floor declines below it AND admits above it, driven with
 # ---     synthetic geometry so neither direction can pass by accident.
 # ---   * `dismissed=true`    — turned off again, the bar erased what it owned and the slot is clear.
+# ---   * `crystal_ok=true`   — the brand CRYSTAL (Peter, "instead of an apple do a small crystal")
+# ---     is drawn at `crystal=WxH+X+Y` and sits wholly inside the bar, left of the title. A brand
+# ---     mark that could not be shown drawn would be unfalsifiable; this pins that it IS. The crystal
+# ---     is INERT this arc (part of the bar's `press=inert`); a crystal MENU is a later arc.
 # --- `clock=` is NOT pinned: it reads `unsynced` on a QEMU boot with no SNTP and `set` on one with
 # --- a civil anchor, and both are correct. Pinning it would red the gate on network configuration.
-REQUIRE :: MENUBAR: .* press=inert default_off=true clip_clean=true flush=true member=true floor=true/true dismissed=true :: PASS ::
+REQUIRE :: MENUBAR: .* press=inert default_off=true clip_clean=true flush=true member=true floor=true/true dismissed=true crystal_ok=true :: PASS ::
 FORBID :: MENUBAR: .* :: FAIL ::
 
 # --- CONSOLEWIN: THE CONSOLE'S WAY BACK, PINNED ON THE ARCH THAT HAS A CONSOLE ------------------

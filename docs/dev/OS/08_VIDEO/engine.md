@@ -10458,14 +10458,52 @@ exists for.
 
 Floors: `FLOOR_H = BAR_H + dock::STRIP_H + 2*PAD` (110 px — the bar must not crowd the dock off a
 short panel, and on a panel that can host only one the **dock** wins, because the dock is the
-console's only way back and the bar is a convenience) and `FLOOR_W = 4*PAD + 6*CELL` (144 px).
+console's only way back and the bar is a convenience) and `FLOOR_W = 4*PAD + CRYSTAL_W + 6*CELL`
+(160 px — the `+ CRYSTAL_W` term is the brand mark's own left slot, added when the crystal landed).
 
-**The clock is honest or absent.** `clock::unix_now()` is `None` until the civil clock is anchored
+**The clock is honest or absent.** `clock::try_unix_now()` is `None` until the civil clock is anchored
 this boot; a bar showing `00:00` or `--:--` would be furniture asserting a fact it does not have, so
 nothing is drawn and the witness says `clock=unsynced`. It is UTC — the kernel carries no timezone.
 
-**It is inert.** No press seam is registered, so a press falls through to whatever is behind it, and
-`press=inert` is on the witness line so a dead press is not misread as a routing defect.
+**It is inert.** No press seam is registered, so a press — the crystal included — falls through to
+whatever is behind it, and `press=inert` is on the witness line so a dead press is not misread as a
+routing defect.
+
+### The brand crystal — UnaOS's mark, where macOS puts its apple
+
+Peter, 2026-08-11: *"instead of an apple do a small crystal"*. UnaOS's identity is crystal — the whole
+handler set is crystal-named (geode, obsidian, quartzite, euclase, zircon, mica) — so the leftmost
+mark on the bar is a small faceted gem, not a fruit. `CRYSTAL_W`x`CRYSTAL_H` = 16x22, sized from
+`theme::CONTROL_BOX` so it reads as the same size-family as the window's traffic-light controls.
+
+It is drawn from the kit's OWN blue accent ramp — `theme::CONTROL_CLOSE`/`_MID`/`_ZOOM`, which
+`theme.rs` records as having had **no consumer** since `paint_window` moved to the semantic
+traffic-light set. The crystal gives those three lifted roles a purpose again; no palette is invented
+(the shared-source law holds). A brilliant-cut silhouette: a flat table at the top, a crown split into
+a shadowed left facet (`CONTROL_CLOSE`) and a lit right facet (`CONTROL_ZOOM`) with a high-contrast
+seam down the centre, a girdle line, and a `CONTROL_MID` pavilion tapering to the point — three facets
+and two facet lines, dense and minimal, all integer arithmetic (the disc/knurl idiom, no float).
+
+The title shifts right to `TITLE_X0 = PAD + CRYSTAL_W + PAD`, as macOS puts its app menus to the right
+of the logo. The crystal appears only when the bar is enabled (it is part of the default-off tenant),
+and it is **inert this arc** — part of the bar's `press=inert`; a crystal MENU (a press on the mark)
+is a later arc.
+
+Witness: the fixture's leg 7 asserts `crystal=WxH+X+Y` sits wholly inside the bar, left of the title,
+at the compiled size — a mark that could not be shown drawn would be unfalsifiable. `crystal_ok=true`
+is pinned on the `:: MENUBAR: … PASS ::` line, and the compiled dims ride the metal-visible `[menubar]`
+rollup as `crystal=16x22`. On glass the silhouette renders:
+
+```
+....####*****...      table + crown: # = CONTROL_CLOSE (shadow), * = CONTROL_ZOOM (light)
+..######*******.
+.#######********
+++++++++++++++++      girdle (widest row)
+.++++++++++++++.
+...+++++++++++..      pavilion: + = CONTROL_MID, tapering to
+.......+++......
+........+.......      the point
+```
 
 ### Witness, and the fault injection that caught a vacuous leg
 

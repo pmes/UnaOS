@@ -38,21 +38,33 @@
 //!
 //! # What it draws, this arc
 //!
-//! Inert chrome, and two facts:
+//! Inert chrome, a brand mark, and two facts:
 //!
 //! | element | source | colour |
 //! |---|---|---|
 //! | strip face | — | [`theme::CHROME_FACE`] under [`ceramic::shade`] |
 //! | bottom keyline | — | [`theme::FRAME_LINE`], 1 px |
 //! | top bevel | — | [`theme::BEVEL_LIGHT`], [`theme::BEVEL`] px |
-//! | title, left | the FOCUSED window's caption, via `wm::dock_scan` | [`theme::TITLE_TEXT_ACTIVE`] |
+//! | CRYSTAL, leftmost | UnaOS's brand mark (Peter, *"instead of an apple do a small crystal"*) | the kit's blue gem ramp, [`theme::CONTROL_CLOSE`]/`_MID`/`_ZOOM` |
+//! | title, left of crystal | the FOCUSED window's caption, via `wm::dock_scan` | [`theme::TITLE_TEXT_ACTIVE`] |
 //! | clock, right | [`crate::clock::try_unix_now`], UTC `HH:MM` | [`theme::TITLE_TEXT_INACTIVE`] |
 //!
 //! **It is INERT.** There is no press seam: this module registers nothing with the click router, so a
-//! press on the bar falls through to whatever is behind it. That is stated on the witness line
-//! (`press=inert`) so a dead press is not misread as a routing defect — it is the absence of a
-//! feature, not the failure of one. Opening menus is the protocol arc's job, and the design ledger at
-//! the foot of this file is what it will be built from.
+//! press on the bar — the crystal included — falls through to whatever is behind it. That is stated on
+//! the witness line (`press=inert`) so a dead press is not misread as a routing defect — it is the
+//! absence of a feature, not the failure of one. Opening menus is the protocol arc's job, and a
+//! crystal MENU (a press on the mark) is a later arc; the design ledger at the foot of this file is
+//! what both will be built from.
+//!
+//! # The crystal — UnaOS's mark, where macOS puts its apple
+//!
+//! A small faceted gem at the left edge, `CRYSTAL_W`x`CRYSTAL_H` (16x22), sized from
+//! [`theme::CONTROL_BOX`] so it reads as the same size-family as the window's traffic-light controls.
+//! It is drawn from the kit's OWN blue accent ramp — three facets lit from the top-right, the
+//! high-contrast seam down the crown reading as a facet edge — reusing three lifted roles `theme.rs`
+//! records as having no consumer since the controls went semantic. No palette is invented. It appears
+//! only when the bar is enabled (the bar is a default-off tenant; the crystal is part of it), and its
+//! geometry is on the witness (`crystal=WxH+X+Y`) so a capture can confirm the mark is DRAWN.
 //!
 //! # Density, not decoration — why the bar earns its 34 rows
 //!
@@ -93,6 +105,38 @@ const CLOCK_GLYPHS: usize = 5;
 /// the panel's full width for it, so there is no reason to truncate below what `wm` stores.
 const TITLE_GLYPHS: usize = wm::MAX_TITLE;
 
+// ---------------------------------------------------------------------------
+// The brand CRYSTAL — the leftmost mark, where macOS puts its logo.
+//
+// Peter's ruling, 2026-08-11: *"instead of an apple do a small crystal"*. UnaOS's identity is
+// crystal: the whole handler set is crystal-named (geode, obsidian, quartzite, euclase, zircon,
+// mica), so the brand mark is a faceted gem, not a fruit.
+//
+// It is drawn from the kit's OWN blue gem ramp — `theme::CONTROL_CLOSE`/`_MID`/`_ZOOM`, the accent
+// hue from darkest to lightest — which `theme.rs` records as having NO consumer since `paint_window`
+// moved to the semantic traffic-light set. The crystal gives those three lifted roles a purpose
+// again; no palette is invented (the shared-source law). Its size is `theme::CONTROL_BOX`-derived so
+// the mark reads as the same size-family as the window controls.
+// ---------------------------------------------------------------------------
+
+/// The crystal's height, px — a hair inside the control disc's `theme::CONTROL_BOX` (24) footprint,
+/// so the brand mark and the window's traffic-light controls read as one size family. `-2` gives the
+/// gem a touch more clearance in the bar than the disc has in a title bar (the disc's is the "tight"
+/// 5 px `theme.rs` flags; the crystal's is 6).
+const CRYSTAL_H: usize = theme::CONTROL_BOX - 2;
+
+/// The crystal's width, px — two-thirds of the control-disc diameter. A gem reads TALLER than wide, so
+/// the mark is narrower than the round controls at the same height family; `2/3` of 24 is 16.
+const CRYSTAL_W: usize = theme::CONTROL_BOX * 2 / 3;
+
+/// The crown's height, px — the upper region above the girdle, drawn as the two bright table facets;
+/// the pavilion (the rest) tapers to the point. Two-fifths, the classic brilliant-cut proportion.
+const CRYSTAL_CROWN_H: usize = CRYSTAL_H * 2 / 5;
+
+/// The title's left inset when the crystal is present: past the crystal and one more gap. macOS puts
+/// the logo leftmost and the app menus to its right; the caption takes that same slot here.
+const TITLE_X0: usize = strip::PAD + CRYSTAL_W + strip::PAD;
+
 /// The panel height below which the bar declines.
 ///
 /// DERIVED, and stated: the bar must not crowd the dock off the panel. The dock's own floor is
@@ -104,7 +148,11 @@ const FLOOR_H: usize = BAR_H + super::dock::STRIP_H + 2 * strip::PAD;
 
 /// The panel width below which the bar declines: both insets, the clock, and at least one glyph of
 /// title. Below it the bar would be a strip with nothing legible on it.
-const FLOOR_W: usize = 4 * strip::PAD + (CLOCK_GLYPHS + 1) * CELL;
+///
+/// The `+ CRYSTAL_W` term is the brand mark's own left slot: the crystal pushes the title inset right,
+/// so the floor that guarantees "crystal, one title glyph, and the clock all fit" grows by exactly the
+/// crystal's width. Still far below every suite panel (160 vs 640/1280/1920), so no gate declines.
+const FLOOR_W: usize = 4 * strip::PAD + CRYSTAL_W + (CLOCK_GLYPHS + 1) * CELL;
 
 const _: () = {
     // The caption must fit inside the bar it is centred in, or there is nothing to draw.
@@ -117,6 +165,22 @@ const _: () = {
     assert!(FLOOR_H <= 480);
     // The title must be representable in what `wm` actually stores.
     assert!(TITLE_GLYPHS <= wm::MAX_TITLE);
+
+    // The crystal must fit inside the bar with a bevel of clearance each side — the disc's own floor.
+    assert!(CRYSTAL_H + 2 * theme::BEVEL <= BAR_H);
+    // A gem needs a non-degenerate silhouette: a crown above the girdle and a pavilion below it, both
+    // with real height, and a width the facet split can halve.
+    assert!(CRYSTAL_CROWN_H > 0);
+    assert!(CRYSTAL_CROWN_H < CRYSTAL_H);
+    assert!(CRYSTAL_W >= 4);
+    // The crystal and the clock must not collide on the SMALLEST panel the bar draws on. The crystal
+    // occupies `[PAD, PAD + CRYSTAL_W)` and the clock `[FLOOR_W - PAD - CLOCK_GLYPHS*CELL, FLOOR_W - PAD)`;
+    // this is the gap between them staying positive, so a future metric change that would overlap them
+    // fails the BUILD rather than painting the gem over the time.
+    assert!(strip::PAD + CRYSTAL_W < FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL);
+    // The title, shifted past the crystal, must still leave room for at least one glyph before the
+    // clock on the floor panel.
+    assert!(TITLE_X0 + CELL <= FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL);
 };
 
 // ---------------------------------------------------------------------------
@@ -331,8 +395,8 @@ pub fn compose() -> bool {
         None => 0,
     };
     LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
-    LEDGER.tick("menubar", format_args!("press=inert toggles={} off_passes={}",
-        TOGGLES.load(Ordering::Relaxed), OFF_PASSES.load(Ordering::Relaxed)));
+    LEDGER.tick("menubar", format_args!("press=inert crystal={}x{} toggles={} off_passes={}",
+        CRYSTAL_W, CRYSTAL_H, TOGGLES.load(Ordering::Relaxed), OFF_PASSES.load(Ordering::Relaxed)));
 
     if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(rect) {
         return false;
@@ -365,11 +429,72 @@ pub fn compose() -> bool {
     true
 }
 
+/// The crystal's box-relative top-left in the bar: one [`strip::PAD`] from the left, centred
+/// vertically. THE ONE offset both the painter and [`crystal_box`] read, so the mark the fixture
+/// witnesses is the mark the painter drew.
+#[inline]
+fn crystal_offset(h: usize) -> (usize, usize) {
+    (strip::PAD, (h - CRYSTAL_H) / 2)
+}
+
+/// The crystal's rect on the PANEL, for the witness — `(x, y, w, h)`, absolute. A function of the bar
+/// rect and nothing else, so `crystal=WxH+X+Y` on the fixture line is falsifiable against where the
+/// painter put it.
+fn crystal_box(r: strip::Rect) -> (usize, usize, usize, usize) {
+    let (rx, ry, _w, h) = r;
+    let (ox, oy) = crystal_offset(h);
+    (rx + ox, ry + oy, CRYSTAL_W, CRYSTAL_H)
+}
+
+/// Half the crystal's silhouette width at box-relative row `v`, in px.
+///
+/// A brilliant-cut gem: the CROWN (rows `< CRYSTAL_CROWN_H`) widens from a narrow table at the top to
+/// the full girdle; the PAVILION (the rest) tapers from the girdle to the point at the bottom. Integer
+/// interpolation, no float — the same discipline the disc and knurl idioms use.
+#[inline]
+fn crystal_half(v: usize) -> usize {
+    let table = CRYSTAL_W / 4;
+    let girdle = CRYSTAL_W / 2;
+    if v < CRYSTAL_CROWN_H {
+        table + (girdle - table) * v / CRYSTAL_CROWN_H
+    } else {
+        let pav = CRYSTAL_H - CRYSTAL_CROWN_H;
+        girdle * (CRYSTAL_H - v) / pav
+    }
+}
+
+/// The crystal's facet colour at box-relative `(u, v)`, or `None` outside the silhouette.
+///
+/// Three facets from the kit's blue gem ramp, lit from the top-right: the crown's RIGHT face catches
+/// the light ([`theme::CONTROL_ZOOM`], lightest), its LEFT face is in shadow
+/// ([`theme::CONTROL_CLOSE`], darkest), and the pavilion below the girdle is the medium tone
+/// ([`theme::CONTROL_MID`]). The high-contrast CLOSE|ZOOM seam down the centre reads as the crown's
+/// facet edge; the colour change at the girdle reads as the girdle line. Two facet lines and a table,
+/// dense and minimal — a crystal at 16x22.
+#[inline]
+fn crystal_facet(u: usize, v: usize) -> Option<u32> {
+    if v >= CRYSTAL_H || u >= CRYSTAL_W {
+        return None;
+    }
+    let cx = CRYSTAL_W / 2;
+    let half = crystal_half(v);
+    let du = if u >= cx { u - cx } else { cx - u };
+    if du > half {
+        return None;
+    }
+    Some(if v < CRYSTAL_CROWN_H {
+        if u < cx { theme::CONTROL_CLOSE } else { theme::CONTROL_ZOOM }
+    } else {
+        theme::CONTROL_MID
+    })
+}
+
 /// Compose panel row `j` of the bar into `out[0..w]` as logical `0x00RRGGBB` colours.
 ///
-/// A field pass (face, bevel, keyline) then the two texts overlaid by index — the dock's shape, and
-/// for its reason: an overlay keeps the inner loop a handful of integer compares instead of a scan
-/// over every caption at every pixel. The bar is FLUSH, so there is no corner arithmetic at all.
+/// A field pass (face, bevel, keyline), then the brand CRYSTAL overlaid at the left edge, then the two
+/// texts overlaid by index — the dock's shape, and for its reason: an overlay keeps the inner loop a
+/// handful of integer compares instead of a scan over every caption at every pixel. The bar is FLUSH,
+/// so there is no corner arithmetic at all.
 fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     let (_, _, w, h) = r;
     // The material is anchored to the STRIP, not to the panel: index ceramic by the row's offset
@@ -388,6 +513,21 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         out[i] = fill;
     }
 
+    // The brand CRYSTAL, overlaid at the left. Drawn BEFORE the text early-return because the gem
+    // spans more rows than the glyph cell does — it is centred in the whole bar, not the text band.
+    let (cx0, cy0) = crystal_offset(h);
+    if j >= cy0 && j < cy0 + CRYSTAL_H {
+        let v = j - cy0;
+        for u in 0..CRYSTAL_W {
+            if let Some(c) = crystal_facet(u, v) {
+                let i = cx0 + u;
+                if i < w {
+                    out[i] = c;
+                }
+            }
+        }
+    }
+
     // The two texts share a baseline: vertically centred in the bar.
     let ty0 = (h - CELL) / 2;
     if j < ty0 || j >= ty0 + CELL {
@@ -399,10 +539,11 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         return;
     }
 
-    // Title, left, at one PAD. The focused window's caption; nothing when nothing is focused, which
-    // is an empty bar rather than a placeholder.
+    // Title, at [`TITLE_X0`] — past the crystal, as macOS puts its app menus to the right of the logo.
+    // The focused window's caption; nothing when nothing is focused, which is an empty bar rather than
+    // a placeholder.
     let cols = m.title_len.min(TITLE_GLYPHS);
-    draw_text(out, w, &m.title[..cols], strip::PAD, sy, scale, theme::TITLE_TEXT_ACTIVE);
+    draw_text(out, w, &m.title[..cols], TITLE_X0, sy, scale, theme::TITLE_TEXT_ACTIVE);
 
     // Clock, right, at one PAD from the far edge. Secondary ink: the title is what the operator is
     // reading, the clock is what they glance at.
@@ -446,7 +587,9 @@ pub fn rollup(scope: &str) {
         "menubar",
         scope,
         format_args!(
-            "press=inert toggles={} off_passes={}",
+            "press=inert crystal={}x{} toggles={} off_passes={}",
+            CRYSTAL_W,
+            CRYSTAL_H,
             TOGGLES.load(Ordering::Relaxed),
             OFF_PASSES.load(Ordering::Relaxed)
         ),
@@ -484,6 +627,10 @@ pub fn rollup(scope: &str) {
 /// 6. **dismissal is complete** — `set_enabled(false)` followed by a compose leaves the slot cleared,
 ///    i.e. the bar erased what it owned. A tenant that could be turned on but not off would leave a
 ///    strip on the glass that nothing on the panel could account for.
+/// 7. **the crystal is drawn, and inside the bar** — with the bar enabled, [`crystal_box`] is
+///    `CRYSTAL_W`x`CRYSTAL_H` and sits wholly within the bar rect (left of the title, top and bottom
+///    clear of the edges). A brand mark that could not be shown drawn would be unfalsifiable; this leg
+///    is the geometry a metal capture and the fixture both read as `crystal=WxH+X+Y`.
 #[cfg(feature = "witness")]
 pub fn selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -537,6 +684,22 @@ pub fn selftest() {
     let _ = compose();
     let dismissed = SLOT.packed() == 0;
 
+    // Leg 7 — the crystal is drawn, and inside the bar. `r` is the enabled rect (from leg 3); the
+    // crystal box must be the compiled size and sit wholly within it, left of the title inset.
+    let (cbx, cby, cbw, cbh) = r.map(crystal_box).unwrap_or((0, 0, 0, 0));
+    let crystal_ok = match r {
+        Some((brx, bry, brw, brh)) => {
+            cbw == CRYSTAL_W
+                && cbh == CRYSTAL_H
+                && cbx >= brx
+                && cbx + cbw <= brx + brw
+                && cby >= bry
+                && cby + cbh <= bry + brh
+                && cbx + cbw <= brx + TITLE_X0 // left of where the title begins
+        }
+        None => false,
+    };
+
     set_enabled(saved);
 
     let clock = match clock_hhmm() {
@@ -544,14 +707,15 @@ pub fn selftest() {
         None => "unsynced",
     };
     let ok = default_off && clip_clean && flush && member && floor_declines && floor_admits
-        && dismissed;
+        && dismissed && crystal_ok;
     let (rx, ry, rw, rh) = r.unwrap_or((0, 0, 0, 0));
     serial_println!(
         ":: MENUBAR: bar={}x{}+{}+{} panel={}x{} floor={}x{} strips={}->{} owned={:#x} clock={} \
-         initial={} press=inert default_off={} clip_clean={} flush={} member={} floor={}/{} \
-         dismissed={} :: {} ::",
-        rw, rh, rx, ry, pw, ph, FLOOR_W, FLOOR_H, n_off, n_on, owned, clock, initial,
-        default_off, clip_clean, flush, member, floor_declines, floor_admits, dismissed,
+         crystal={}x{}+{}+{} initial={} press=inert default_off={} clip_clean={} flush={} \
+         member={} floor={}/{} dismissed={} crystal_ok={} :: {} ::",
+        rw, rh, rx, ry, pw, ph, FLOOR_W, FLOOR_H, n_off, n_on, owned, clock,
+        cbw, cbh, cbx, cby, initial,
+        default_off, clip_clean, flush, member, floor_declines, floor_admits, dismissed, crystal_ok,
         if ok { "PASS" } else { "FAIL" }
     );
     rollup("selftest");
