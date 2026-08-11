@@ -12695,8 +12695,9 @@ fn create_inner(
     // WMMINW — **the floor reaches the BIRTH DEFAULT, not only the layout rules.** A create that
     // lands while the framebuffer is not ready publishes the row at `Window::empty`'s `scale = 1`
     // and NOTHING revisits it: the `place` below early-returns on `!is_ready()`, and `place` has
-    // exactly three call sites (`close`, `close_owner`, here), so a boot that creates a window
-    // before the panel is attached and then neither creates nor closes another leaves that row at
+    // four call sites (`close`, `close_owner`, here, and `retile_on_ready`), THREE of them window-
+    // lifecycle events — so before WMRETILE added the fourth, a boot that created a window before
+    // the panel was attached and then neither created nor closed another left that row at
     // `bw = w + 2*BORDER` — inside the band this arc closes — for the rest of the boot.
     //
     // The seed is [`cluster_min_scale`] and NOT the full [`min_width_scale`], because the bounded
@@ -12708,10 +12709,13 @@ fn create_inner(
     // unpinned and takes `place_scale`'s fit-bounded, stand-down-aware answer instead.
     //
     // Chosen over the two alternatives the review named. Re-tiling from the READINESS PATH is the
-    // better fix and is out of this arc's lane: `WRITER` is attached in `main.rs` (and re-attached
-    // there after the Kepler takeover, `main.rs:1873`), and `wm` has no readiness callback to hang
-    // a `place` + `reclaim` on — the hook belongs to whoever owns that path, and this comment is
-    // the record that it is owed. REFUSING the create until the panel is ready was rejected
+    // better fix, and WMRETILE has now PAID that debt: [`retile_on_ready`] is the callback `wm`
+    // lacked, and `main.rs` calls it at each `WRITER` attachment that can be preceded by a create
+    // (step 3's seed, and the tegra JD2 seed — the x86 step-0a seed runs before any window can
+    // exist). The seed below therefore holds a row only until the panel arrives, which is what it
+    // always claimed to do; note that the earlier form of this comment placed the second attachment
+    // "after the Kepler takeover" — it is the tegra JD1/JD2 block, and `kepler_display` does not
+    // touch `WRITER` at all. REFUSING the create until the panel is ready was rejected
     // outright: `create` succeeding before video is up is relied on across the boot, and a
     // fail-closed `WIN_NONE` there would trade a cosmetic band for a lost window.
     //
@@ -13107,6 +13111,145 @@ fn reclaim(vacated: &[(usize, usize, usize, usize)]) {
         damage_intersecting(x, y, w, h);
     }
     super::screen::request_full_present();
+}
+
+/// WMRETILE — **the one-shot RE-TILE on framebuffer readiness**, and the debt [`create_inner`]'s
+/// WMMINW note records as owed.
+///
+/// ### The hole this closes
+/// [`place`] early-returns on `!fb.is_ready()`, and it now has four call sites — [`close`],
+/// [`close_owner`], [`create_inner`] and this function — three of them window-lifecycle events. A
+/// window created before the panel is attached is therefore published UNPOSITIONED
+/// (`Window::empty`'s `x = 0`, `y = 0`) and with WMMINW's birth-default scale —
+/// [`cluster_min_scale`], which is the control-cluster floor alone, with no panel to bound it
+/// against — and before this existed NOTHING revisited it. If the boot then neither created nor
+/// closed another window, that row kept a fit-UNBOUNDED scale at the panel origin for the rest of
+/// the boot. Readiness is the missing fourth event, and this is it.
+///
+/// ### The candidate predicate is `x == 0`, and it is exact
+/// A row that has been through [`place`] has `r.x = cx + BORDER`, and `cx` starts at [`GAP`]
+/// (12) — so a tiled row's `x` is at least 17. A row moved by [`move_to_inner`] has
+/// `r.x = x.clamp(BORDER, max_x)`, so at least [`BORDER`] (5). A row born at a caller's origin
+/// (SPAWN-PLACE) takes the same clamp and is `pinned`, which [`place`] skips and which this
+/// excludes for the same reason. `x == 0` is therefore reachable by exactly one route — a row that
+/// has never been laid out against a real panel — and no post-layout path can forge it.
+///
+/// One wrinkle in the SPAWN-PLACE sentence, pre-existing and NOT changed here: a `create_at`
+/// issued before readiness resolves its origin to `None` (`create_inner`'s `placed` block returns
+/// early on `!is_ready()`), so the row is never `pinned` and its REQUESTED ORIGIN IS DISCARDED —
+/// it falls back to the tiler like any other. Such a row is therefore a candidate here, and this
+/// hook tiles it rather than honouring an origin nothing recorded. That is the pre-existing
+/// behaviour of a pre-ready `create_at`, made no better and no worse; the row at least ends up on
+/// the glass at a fit-bounded scale instead of at `(0,0)` unbounded.
+///
+/// This is deliberately NOT a new `Window` field. The predicate is a fact the table already
+/// carries, and a flag would be a second copy of it, free to disagree with the geometry it
+/// describes.
+///
+/// ### Exactly-once is self-latching, not a static
+/// The first successful call gives every candidate a real `x`, so a second call finds `n == 0` and
+/// returns before touching `place`. There is no latch to reset, and no readiness event can fire
+/// twice against the same rows — which also means a LATER readiness transition (a different
+/// surface, a different panel) is free to re-fire for rows created in ITS pre-ready window, exactly
+/// as it should. A one-shot `AtomicBool` would have made the second panel's rows permanently
+/// unplaceable.
+///
+/// ### It is a no-op on the common boot, and the emptiness is proven twice
+/// A boot with no pre-ready windows takes one `WRITER` read and one table scan and returns 0
+/// without calling [`place`], [`reclaim`] or [`composite`] — no damage is raised, no
+/// `request_full_present` is asked for, and the panel is not touched. On x86 that is EVERY boot:
+/// `WRITER` is seeded at `kernel_main` step 0a, before the heap, the scheduler or anything that
+/// could mint a window, so no x86 row can ever be pre-ready and this call cannot perturb an x86
+/// capture by so much as a serial line.
+///
+/// ### No drain barrier
+/// [`create_inner`]'s precedent and its argument, and it rests on exactly that: no row is freed
+/// and no surface unmapped, so there is nothing an in-flight blit could be reading that is about
+/// to disappear, and the [`composite`] below re-establishes every moved window over the erase.
+///
+/// A first draft claimed a STRONGER argument here — that the rows this moves have never been
+/// composited, so no snapshot of their old geometry can be in flight. That is false and has been
+/// removed. [`place`] re-tiles EVERY unpinned row, not only the candidates, so a row created on
+/// another core after the `WRITER` attach and before this call is both live on the panel and moved
+/// by the `place` below. The precedent's argument covers it; the invented one did not.
+///
+/// ### Known bounded gap (aarch64), deliberately not fixed here
+/// The candidate scan and the `place` are separate critical sections, and on aarch64 the readiness
+/// transition is not serialised against window creation on another core. A row created BETWEEN the
+/// scan and the `place` is laid out by that `place` (it is unpinned, so the tiler takes it) but is
+/// not counted in `n` and does not appear in the witness — the layout is right and the census
+/// undercounts. A row created between the `WRITER` attach and the scan is a candidate and is
+/// handled normally. Neither leaves a row unplaced, which is the property this exists to
+/// guarantee; closing the census gap would need the scan and the tile under one guard, and `place`
+/// takes the table lock itself. Recorded rather than fixed.
+///
+/// Returns how many rows were re-tiled; 0 when there was nothing to do.
+pub fn retile_on_ready() -> usize {
+    // Panel geometry first, and the guard dropped at the end of the statement — the same
+    // WRITER-before-TABLE, never-nested order `place` and `move_to_inner` keep, which is what makes
+    // the two lock orders unable to interleave into a cycle.
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        return 0;
+    }
+    let info = fb.info();
+
+    let mut ids = [WIN_NONE; MAX_WINDOWS];
+    let mut n = 0usize;
+    {
+        let t = table();
+        for r in t.rows.iter() {
+            // `compat` is exempt everywhere in the tiler (`compat_present` owns that row's scale and
+            // origin in its own critical section); `pinned` is the SPAWN-PLACE row `place` skips.
+            if r.used && !r.compat && !r.pinned && r.x == 0 {
+                ids[n] = r.id;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        return 0;
+    }
+
+    let (nv, moved) = place(WIN_NONE);
+    reclaim(&moved[..nv]);
+
+    // Read the answers back for the witness. A COUNT alone is not falsifiable — it says a re-tile
+    // happened but nothing about whether the result is the fit-bounded layout this exists to
+    // install. The claim is the SCALE, and the scale is only checkable against the SOURCE it was
+    // derived from, so each row reports `(w, h, scale)` and the reader can evaluate
+    // `place_scale(panel, w, h)` from the line alone — no witness build, no table dump. A survivor
+    // still carrying the unbounded birth default `cluster_min_scale(w)` where the panel cannot
+    // afford it is this hook having run and not worked.
+    //
+    // `(0, 0, 0)` is the VANISHED sentinel: the candidate scan and this read-back are separate
+    // critical sections, so a row closed in between has no entry to report. It is not a zero-scale
+    // window — no path can produce one (`place_scale` ends in `.max(1)`) — and reading it as one
+    // would convict the tiler of a defect that belongs to the clock.
+    let mut geom = [(0usize, 0usize, 0usize); MAX_WINDOWS];
+    {
+        let t = table();
+        for k in 0..n {
+            if let Some(r) = t.rows.iter().find(|r| r.used && r.id == ids[k]) {
+                geom[k] = (r.w, r.h, r.scale);
+            }
+        }
+    }
+    // Unconditional, not witness-gated, on CLOSEISO's terms: the build the operator is sitting in
+    // front of is the build with no witnesses, and this line only ever appears on a boot that
+    // actually created a window before its panel — a fact worth having in every capture that has
+    // it. Silent by construction on every other boot: the `n == 0` return above is above it.
+    serial_println!(
+        "[wm] retile-on-ready panel={}x{} rows={} ids={:?} wxh_scale={:?} (0,0,0)=vanished",
+        info.width,
+        info.height,
+        n,
+        &ids[..n],
+        &geom[..n],
+    );
+
+    composite();
+    n
 }
 
 // ---- CLICK-ROUTE witness -----------------------------------------------------------------------

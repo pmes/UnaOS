@@ -1192,6 +1192,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         unaos_kernel::video::init_panel(framebuffer_addr as usize, framebuffer_size, info);
 
+        // WMRETILE — the READINESS RE-TILE. `wm::place` early-returns on `!is_ready()` and has only
+        // window-lifecycle call sites (create/close/close_owner), so a window created before this
+        // point is published unpositioned and at WMMINW's fit-UNBOUNDED birth scale, and nothing
+        // ever revisits it. This is the missing fourth event: it gives every such row a real
+        // `place_scale` and a real origin, then reclaims the boxes the re-tile abandoned.
+        //
+        // Placed AFTER `init_panel` so the whole video surface is published before the layout reads
+        // it, and unconditional/un-gated for the same reason the WRITER seed at step 0a is: a row
+        // laid out against no panel is a general defect, not a compositor one.
+        //
+        // A no-op on every boot with no pre-ready rows — one WRITER read and one table scan, then
+        // return — which on x86 is EVERY boot, since step 0a seeds `WRITER` before anything can
+        // mint a window. It is silent there too: the witness sits behind the same early return.
+        unaos_kernel::video::wm::retile_on_ready();
+
         // UVUG-2: wire the SYS_FB_PRESENT seam to the real scan-out now that WRITER is initialized.
         // One registration call site; the hook centers a user program's presented off-screen surface
         // on the panel (see `video::screen::present_surface`). Same code on the baremetal and QEMU
@@ -1886,6 +1901,16 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // the same physical framebuffer (the x86/pi pattern); until the console takes over,
             // only fbcon draws.
             unaos_kernel::video::WRITER.lock().init(fb.base as usize, fb.len, fb.info);
+            // WMRETILE — the tegra twin of the readiness re-tile at step 3, and DEFENSIVE rather
+            // than required. `tegra_early_stop` diverges before `kernel_main` step 3 ever runs, so
+            // this is the only `WRITER` attachment the Orin boot reaches and the step-3 hook
+            // cannot stand in for it — but nothing can mint a pre-ready row here TODAY either: the
+            // heap and the scheduler both come up after this point, so the table is empty and the
+            // call returns 0 on every current Orin boot. It is here so that the Orin path does not
+            // silently regain the hole the moment window creation moves earlier than JD2, which is
+            // exactly the direction that path is growing. Same no-op-when-empty terms; see
+            // `wm::retile_on_ready`.
+            unaos_kernel::video::wm::retile_on_ready();
             serial_println!(
                 ":: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::"
             );
