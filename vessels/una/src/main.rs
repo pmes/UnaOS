@@ -351,16 +351,19 @@ fn main() {
                             // the console so saves are visible. With no file
                             // loaded `save()` returns an error rather than
                             // panicking — that surfaces as a console line.
-                            // A console log is a record you do not own: say WHY
-                            // it cannot be written (root owns it; the shard's
-                            // ACL refuses, not this app) rather than letting the
-                            // io error's wording carry the explanation.
+                            // A console log is a record: say WHY it is not
+                            // written, without the io error's wording. This
+                            // read-only view does not attempt the write — the
+                            // save never leaves the app — and on the shard the
+                            // log is root-owned, so the filesystem ACL would
+                            // refuse it there too. State both without claiming
+                            // an ACL acted on a write the view never issued.
                             bandy::SMessage::EditorSaveRequest if document.read_only => {
                                 let name = document.path.as_ref()
                                     .map(|p| p.display().to_string())
                                     .unwrap_or_else(|| "<log>".to_string());
                                 synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(
-                                    format!("[una] {} is a kernel log, owned by root — read-only; the shard's ACL refuses writes, not this app", name)));
+                                    format!("[una] {} is a kernel log — read-only; this view won't write it, and on the shard it is root-owned so the filesystem ACL would refuse the write as well", name)));
                             }
                             bandy::SMessage::EditorSaveRequest => {
                                 let line = match document.save() {
