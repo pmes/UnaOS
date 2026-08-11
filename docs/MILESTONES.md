@@ -10,6 +10,93 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## vaire track — 2026-08-11 (BOLT-2 — the repo Bolt, and the UnaFS repo-store feasibility verdict) 🔬
+
+### BOLT-2 — a git repository as a managed unit: verified mirror + hash-chained ledger 🔬 host-native (36 → 58 vaire tests), zero kernel surface
+
+**What it does.** vaire's second managed-unit kind, and its first genuinely *repo-manager* work
+(everything before BOLT-2 managed one dev tree). A **repo Bolt** turns a git repository into a
+managed object: an integrity-verified bare `--mirror` under `<bolt_root>/mirrors/<name>.git`, plus
+an **append-only, hash-chained ledger** at `<bolt_root>/ledger/<name>.ledger` recording every ref
+and object id per weave, chained with the collision-detecting SHA-1 `gix` already carries. Verbs:
+`repo-plan` (the dry-run default), `repo-weave --apply`, `repo-verify [--deep]`, `repo-status`,
+`repo-layout`, `repo-ufit`, `repo-uweave`. `verify` falsifies four distinct claims — an edited
+entry, a dropped entry (chain break), a recorded object missing from the mirror, and ref drift in
+either direction — and is pure-read: a verb that could rewrite what it audits would not be a
+verification. The Bolt-1 invariants carry verbatim: the **only** write surface is `BoltRoot`, built
+solely from `bolt_root`, and both git invocations pull *from* the source with the mirror as the
+target, so no path can write into a managed repository (test-pinned against a `0o555` source).
+**The chain is graded, not oversold.** The head is not anchored outside the
+ledger file, so BOLT-2 ships a tamper-evident *journal* against an editor, not a
+tamper-proof *log* against an adversary who owns the bolt root: a whole-tail
+rewrite (edit entry *k*, re-chain *k..n*) and a truncation to a valid prefix
+both verify Green. Both limits are pinned by their own tests so they cannot be
+forgotten, and the anchor that would close them (a retained CoW root holding the
+ledger, or a countersigned head kept off the bolt) is named as future work — the
+`vaire.repo.head` / `vaire.repo.ledger.<stamp>` rows of the UnaFS mapping are
+design targets with no code behind them yet.
+The default-deny credential floor is reused but honestly re-scoped: a mirror carries whatever was
+committed, so the floor **audits and reports** rather than skipping — every credential-shaped path
+in a mirrored head tree lands in the ledger entry, is covered by the entry hash (scrubbing one
+breaks verification), and turns the bolt Amber.
+
+**UnaFS alignment is executable, not asserted.** `repo::unafs_view` projects a repo manifest into
+the `DevManifest` the VAIRE-3 `usync` engine already consumes, so `repo-uweave` weaves a bolt's
+mirrors into a UnaFS v3 image today — native objects, one root flip, one retained snapshot per
+weave, the four `vaire.*` typed attrs per file — with **no new filesystem code**. `repo::unafs_layout`
+returns the host→native mapping as data so the claim is test-pinned rather than prose.
+
+**How it was tested.** `cargo test -p vaire` → **58 passed** (36 existing + 22 new), `cargo clippy
+-p vaire --all-targets` clean. All fixtures are tempdirs (the RIDER stands — no test reads
+`bolt.manifest.toml` or any real tree). Also fixes a **pre-existing baseline break**: `handlers/vaire`
+opted out of `gix`'s default features without re-adding `sha1`, leaving `gix_hash::Kind` variant-less
+— the crate did not compile at all before this arc.
+
+### The UnaFS repo-store feasibility study — measured, with a verdict 🔬
+
+**Question.** Can UnaFS hold a git-shaped workload at scale? Harness:
+`handlers/vaire/examples/unafs_repo_feasibility.rs` (tempdir image, re-runnable). Fixture shape is
+**this monorepo, measured**: 45,987 objects, 1.196 GB uncompressed (9,971 blobs / 30,989 trees /
+5,027 commits), p50 = 559 B with 70 % under 1 KiB, 493 refs, 33 packfiles / 51.81 MiB.
+
+| Axis | Measured |
+| --- | --- |
+| (a) 10,000 blobs, 422 MiB, 256-way fan-out | stage 5.03 s (0.503 ms/object), **ONE commit 20.7 ms**, 83.5 MiB/s, write amplification **1.42×** |
+| (a2) 52 MB packfile-shaped stream | write 49.3 MiB/s, read-back **1458 MiB/s** (page-cache warm — the extent path, not device bandwidth), 105 extents |
+| (b) 493 refs rewritten, batched | 0.67 ms/ref in one flip |
+| (b) one ref per flip | **25 ms/ref, 412 blocks/ref — 37× the batched cost** |
+| (c) recursive walk, 10,494 files | 13.6 ms (1.29 ms per 1,000 entries) |
+| (c) name lookup vs directory width | 0.005 ms @ 64 · 0.028 @ 512 · **0.214 @ 4096** — linear, no path index |
+| (d) `fsck` over 150,292 blocks in use | 66.3 ms, clean, **0 leaked / 0 orphans**; `snapshot_create` 37.1 ms |
+
+**Verdict: feasible now for repository-sized bolts, with two named UnaFS extensions before it can
+hold a large repo's object store outright.** The VAIRE-3 batch path already removed the commit-count
+problem — commit is 20.7 ms of a 5 s run, so the cost is per-object staging, not the transaction.
+What binds:
+
+1. **~80 MiB single-file ceiling (hard).** An `Inode` — extent list included — must serialize inside
+   ONE 4 KiB block. Bisected: 75 MiB → 151 extents fine; 85 MiB → `InodeTooLarge(4100, 4096)`. A
+   repacked monorepo is a *single* ~52 MiB packfile today and growing, so this is the nearest wall.
+   Needs extent-list indirection or variable-length extents.
+2. **2 GiB volume cap (hard).** `MAX_BLOCK_COUNT` (524,288) × 4 KiB, one indirect refmap level.
+   With 1.42× amplification and snapshots that diverge, this monorepo is inside it but not by much.
+   Needs a second refmap level.
+3. **No path index (shape constraint, not a defect).** Lookup is a full `ls` + linear scan, so git's
+   256-way fan-out is mandatory; a flat object store would be quadratic.
+4. **Ref churn must be batched** — 412 blocks to write 41 bytes when each ref gets its own flip.
+
+**What UnaFS gives that FAT/ext cannot**, and why the direction is right: per-object **typed
+attributes** (the ledger can live *in* the store rather than beside it), **CoW retained roots** (a
+snapshot per weave is structural, not a copy), and a **mark-and-sweep `fsck` with reachability**
+(0 leaked over 150,292 blocks in 66 ms) — repository integrity as a filesystem property instead of a
+convention. The verdict shaped the code: BOLT-2 keeps packfile handling on the host git/`gix` side —
+exactly where UnaFS hits its ceiling — and `repo-ufit` / `repo-uweave` check the measured limits
+**before** touching an image — against the volume the run will actually create (`--size-mb`,
+default 256 MiB), not merely the 2 GiB format cap — so an over-ceiling bolt is refused with a
+reason rather than failing halfway through a weave with an `InodeTooLarge` from three layers down.
+
+---
+
 ## R21 merge window — 2026-07-18 (post-sitting follow-ups + the metal verdicts of record)
 
 ### ORIN-NET-2 — controller-0 link + device recon via the DBI aperture (`UNAOS_PCIE2`) 🔬

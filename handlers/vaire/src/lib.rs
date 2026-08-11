@@ -32,6 +32,11 @@ use bandy::SMessage;
 /// The dev-tree Bolt (BOLT-1): STATUS / SNAP / SYNC of a source tree that must
 /// exist coherently on two drives, without the live-copy flip (SWITCH is arc 2).
 pub mod devtree;
+/// Repo Bolt (BOLT-2): a git repository managed as a unit — an
+/// integrity-verified bare mirror plus an append-only, hash-chained snapshot
+/// ledger, under the same default-deny credential floor, with an explicit
+/// (and executable) mapping onto native UnaFS objects. See the module docs.
+pub mod repo;
 /// UnaFS-native sync (VAIRE-2): the dev-tree woven into a UnaFS v3 image as
 /// native objects (typed attrs + retained-root snapshots), instrumented as the
 /// first-class UnaFS baseline benchmark. See the module docs.
