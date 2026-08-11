@@ -62,9 +62,27 @@
 //     first boot with the real set prints `hdr=A|B|unrecognized`, `type=`, `ver=`, `declared=` and an
 //     FNV-1a digest per file, and that capture is what corrects `bcm4331.md` §S4 and gates arc 2.
 //
-// ## Failure posture
-// Every file gets one line; the pass ends with exactly one terminal verdict, then parks. No retry,
-// no second mount, no panic. `mod.rs` calls `stage_once()` at most once per boot.
+// ## Failure posture — SETTLED vs DEFERRED, and why the difference is not cosmetic
+// Every file gets one line and the pass ends with exactly one terminal verdict. No panic.
+//
+// One pass is not always one boot's answer, and WIFI-REARM is the correction. The pass runs only
+// after `block::program_source()` reports a handle, but a registered handle is not a settled
+// transport: on the rMBP the USB stick's block device is published by the xHCI storage bring-up and
+// the first mount through it can still return `NoDisk`/`Io`/`Busy` while that transport finishes
+// coming up. Treating that as the boot's terminal answer spends the one attempt on a "not yet".
+//
+// So [`stage_attempt`] classifies its own failure instead of assuming it is final:
+//
+//   * **`Settled`** — the volume mounted and each role got its verdict, OR the mount failed for a
+//     reason a later pass cannot change (`NotFat`, `Unsupported`, a corrupt chain): a volume that is
+//     not FAT now will not be FAT in two seconds. One terminal verdict, printed here.
+//   * **`Retry(stage)`** — the mount, or the root-directory read, failed for a reason that CAN
+//     change (`NoDisk`, `Io`, `Busy`). Nothing was staged and nothing was printed as terminal; the
+//     caller re-attempts under its own bounded budget and prints the exhaustion line if it runs out.
+//
+// The `Retry` arms are reachable only BEFORE any role has been staged — both sit above the
+// `for spec in FW_SET` loop — so a retry can never double-stage a role or resume a half-built set.
+// That is a property of where the arms are, and it is why `STAGED` needs no reset between attempts.
 //
 // ## Sourcing (see the note in `mod.rs`)
 // File names, core revision and PHY type come from `bcm4331.md` §S4, which states its own sourcing
@@ -349,20 +367,54 @@ fn stage_role(fs: &FatFs, root: &[DirEntry], spec: &FwSpec, vol: &str) -> RoleRe
     RoleResult::Absent
 }
 
-/// Locate + validate + stage the firmware set. Called exactly once per boot, only after a
-/// program-source block device is present. Returns nothing: the witness IS the result.
-pub fn stage_once() {
+/// WIFI-REARM: whether a staging attempt produced this boot's answer, or only a "not yet".
+///
+/// Carries no data beyond that distinction on purpose: the DETAIL of what happened is already on the
+/// wire, printed by the attempt itself. A verdict enum that also carried the reason would be a second
+/// place for the same fact to be written, and the two spellings would drift.
+pub enum StageOutcome {
+    /// A terminal verdict was printed. The caller must not attempt again this boot.
+    Settled,
+    /// Nothing was staged and nothing terminal was printed, for a reason a later pass can change.
+    /// The `&'static str` names the stage that deferred, for the caller's retry line.
+    Retry(&'static str),
+}
+
+/// A [`FatError`] that a later pass could plausibly see differently.
+///
+/// `NoDisk`/`Io`/`Busy` are all statements about the TRANSPORT at this instant — the handle was
+/// registered, the read did not land. Every other variant is a statement about the MEDIA (not FAT,
+/// an unsupported geometry, a corrupt chain), and re-reading identical sectors cannot change it.
+/// Retrying those would be a spin dressed up as diligence.
+fn retryable(e: FatError) -> bool {
+    matches!(e, FatError::NoDisk | FatError::Io | FatError::Busy)
+}
+
+/// Locate + validate + stage the firmware set. Called only after a program-source block device is
+/// present, and at most [`crate::wifi`]'s bounded attempt budget of times per boot — see
+/// [`StageOutcome`] and the module note. The witness IS the result.
+pub fn stage_attempt() -> StageOutcome {
     let dirs = dirs_description();
 
     // FAT-verb law: reads follow the program source. See the module note.
     let fs = match fat::mount_program_source() {
         Ok(fs) => fs,
+        Err(e) if retryable(e) => {
+            // NOT the terminal line. The handle exists (the caller's gate just said so) and the
+            // transport did not answer, which is the signature of a device published a moment before
+            // its bring-up settled. Nothing has been staged, so re-attempting costs one mount.
+            serial_println!(
+                ":: wifi: staging attempt DEFERRED at mount — program-source volume present but would not mount ({}); nothing staged, re-attempting ::",
+                reason(e)
+            );
+            return StageOutcome::Retry("mount");
+        }
         Err(e) => {
             serial_println!(
                 ":: wifi: firmware NOT staged — program-source FAT volume would not mount ({}); searched {} ::",
                 reason(e), dirs
             );
-            return;
+            return StageOutcome::Settled;
         }
     };
     let (vol_id, clusters) = fs.volume_fingerprint();
@@ -373,12 +425,19 @@ pub fn stage_once() {
 
     let root = match fs.read_root() {
         Ok(r) => r,
+        Err(e) if retryable(e) => {
+            serial_println!(
+                ":: wifi: staging attempt DEFERRED at root-dir — mounted {} but the root directory did not read ({}); nothing staged, re-attempting ::",
+                vol, reason(e)
+            );
+            return StageOutcome::Retry("root-dir");
+        }
         Err(e) => {
             serial_println!(
                 ":: wifi: firmware NOT staged — root directory unreadable ({}) on {}; searched {} ::",
                 reason(e), vol, dirs
             );
-            return;
+            return StageOutcome::Settled;
         }
     };
 
@@ -418,4 +477,5 @@ pub fn stage_once() {
             if missing.is_empty() { "none (see REJECTED above)" } else { missing.as_str() },
         );
     }
+    StageOutcome::Settled
 }
