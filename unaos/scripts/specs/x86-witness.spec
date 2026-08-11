@@ -1266,13 +1266,22 @@ FORBID :: MENUBAR-OCC: .* :: FAIL ::
 # --- missing from the registry's walk would be erased on every drag while every other term on the
 # --- line read healthy. With one tenant `dock=` answered that; with two it does not.
 # ---
-# --- `bar=0` is REQUIRED, not merely tolerated, and that is the point: the menu bar is DEFAULT OFF,
-# --- so a boot that has not been told to enable it must show the bar owning no pixels. A nonzero
-# --- width here means something turned a strip on that nothing in this spec asked for. The
-# --- `bars=` term is deliberately spanned rather than pinned to a value — the dock is legitimately
+# --- `bar=0` WAS REQUIRED on the premise that nothing enables the bar. SHELLDESK (2026-08-11) ends
+# --- that premise: the crispy desktop shell asks for its menu bar at desktop-ready (`wcx::activate`,
+# --- witnessed by `[wc-x] menubar ENABLED`), so on any boot that reaches the Kepler takeover the bar
+# --- legitimately owns the top `BAR_H` rows and `bar=` is legitimately the panel width. Peter, metal
+# --- Boot A: *"i cannot see the menu because a shell is still posing as the desktop"* — a spec that
+# --- forbade the bar from owning pixels was pinning the defect.
+# ---
+# --- What replaces it is the same question asked where it is still falsifiable. `bar=` is spanned
+# --- (both readings are correct now, and which one a boot shows is decided by whether the desktop
+# --- shell came up), and the registry's own health — a strip that owns pixels while being ABSENT from
+# --- the walk, which is the erasure defect these terms exist for — is still pinned by `bars=`, by
+# --- `fillclip_dock_px=`, and by the two degenerate-pair FORBIDs above. `[wc-x] menubar ENABLED` is
+# --- what a capture reads to tell "the shell never asked" from "the shell asked and the bar declined".
+# --- The `bars=` term is deliberately spanned rather than pinned to a value — the dock is legitimately
 # --- absent while the window table is empty (`bars=0/2`) and legitimately present once it is not.
-REQUIRE \[drag-occ\] .* bars=[0-9]/[0-9] bar=0 fillclip_dock_px=
-FORBID \[drag-occ\] .* bars=[0-9]/[0-9] bar=[1-9]
+REQUIRE \[drag-occ\] .* bars=[0-9]/[0-9] bar=[0-9]+ fillclip_dock_px=
 
 # --- STRIPFACTOR: THE MENU BAR IS ABSENT BY DEFAULT, AND SAYS SO -------------------------------
 # --- `video/menubar.rs` is tenant #2 of the strip primitive and exists this arc to PROVE the
@@ -1281,8 +1290,11 @@ FORBID \[drag-occ\] .* bars=[0-9]/[0-9] bar=[1-9]
 # --- off unless something enables it at runtime.
 # ---
 # --- Six fields are load-bearing and all six are pinned on the PASS line, which already ANDs them:
-# ---   * `default_off=true`  — `strip_rect` is `None` before anything enables it. A bar that
-# ---     defaulted ON fails here, which is the whole of the direction's "absent by default".
+# ---   * `default_off=true`  — the ARTIFACT ships with the bar off. SHELLDESK moved this from a live
+# ---     read of the flag to a latch taken at the first write (`menubar::DEFAULT_LATCH`), because the
+# ---     desktop shell now enables the bar at desktop-ready and a live read would report the SHELL's
+# ---     decision instead of the build's default. A bar that defaulted ON still fails here — the
+# ---     latch records what the first writer FOUND — which is the whole of "absent by default".
 # ---   * `clip_clean=true`   — with the bar off, its slot in the registry's output is EMPTY, so it
 # ---     consumes no occlusion capacity. Not merely uncounted: absent.
 # ---   * `flush=true`        — when enabled the rect is (0,0,pw,BAR_H), corner to corner. A centred

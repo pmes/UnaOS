@@ -152,8 +152,27 @@ impl Console {
     /// same size.
     pub fn page_rows(pal: &TargetPal) -> usize {
         let m = pal.metrics();
-        let usable = (pal.height() as usize).saturating_sub(m.margin) / m.line_h;
+        // `top_y` already carries the page margin (SHELLDESK), so it replaces the bare `m.margin`
+        // this line used to subtract rather than adding to it.
+        let usable = (pal.height() as usize).saturating_sub(Self::top_y(pal)) / m.line_h;
         usable.saturating_sub(1).max(6)
+    }
+
+    /// SHELLDESK — **the shell's first row: the top of the glass MINUS the desktop scene's furniture.**
+    ///
+    /// The shell is a tenant of the desktop scene, not the scene itself. `crate::ui_status::top_chrome_h`
+    /// is the reservation (the menu bar's own rect, read from the bar), and `m.margin` is the page
+    /// margin the shell has always kept — so this is the old `m.margin` on every surface with no bar,
+    /// which is every aarch64 boot, every x86 build without `wc`, and every x86 boot whose shell has
+    /// not enabled one.
+    ///
+    /// Used by all three layout sites (the page budget, the prompt line, the full repaint) for the
+    /// reason the module header already gives: the full repaint and the per-keystroke fast path share
+    /// one derivation, or the prompt lands in two different places depending on which drew it.
+    fn top_y(pal: &TargetPal) -> usize {
+        let m = pal.metrics();
+        crate::ui_status::top_chrome_h(pal.width() as usize, pal.height() as usize)
+            .saturating_add(m.margin)
     }
 
     /// Rows of history shown above the prompt: everything that fits from `TOP` down, reserving the
@@ -169,7 +188,7 @@ impl Console {
         let m = pal.metrics();
         let rows = self.history_rows(pal);
         let shown = self.history.len().min(rows);
-        m.margin + shown * m.line_h
+        Self::top_y(pal) + shown * m.line_h
     }
 
     /// Draw the prompt + live input + cursor at `prompt_y`. Shared by the full repaint and the
@@ -196,7 +215,7 @@ impl Console {
         // Show the last `history_rows` lines (scroll the oldest off the top when full), top-down.
         let rows = self.history_rows(pal);
         let skip = self.history.len().saturating_sub(rows);
-        let mut y = m.margin;
+        let mut y = Self::top_y(pal);
         for line in self.history.iter().skip(skip) {
             pal.draw_text(m.margin, y, line, 0xAAAAAA);
             y += m.line_h;

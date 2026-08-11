@@ -353,6 +353,23 @@ pub fn request_full_present() {
     FULL_PRESENT.store(true, core::sync::atomic::Ordering::Release);
 }
 
+/// SHELLDESK — how many FURNITURE strips the desktop present may have to subtract.
+///
+/// `strip::STRIP_MAX` where the registry exists, `0` where it does not — `video::strip` is compiled
+/// only on x86 with `wc`, so on aarch64 the desktop's occluder array is exactly the WC-I array it has
+/// always been and no arithmetic on this path changes.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+const DESK_STRIP_MAX: usize = super::strip::STRIP_MAX;
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+const DESK_STRIP_MAX: usize = 0;
+
+/// SHELLDESK — the desktop present's occluder capacity: every window box ([`super::wm::occluders`]
+/// fills at most `MAX_WINDOWS`) plus every furniture strip on the glass. Sized for the worst case and
+/// bounded at compile time, so a tenant added to the registry widens this array by construction
+/// rather than silently dropping an occluder — the same guard `wm::OCC_MAX` makes for the window-blit
+/// clip, restated on the desktop side because it is a second array with the same obligation.
+const DESK_OCC_MAX: usize = super::wm::MAX_WINDOWS + DESK_STRIP_MAX;
+
 /// WC-BBSYNC — "unarmed" for [`DESKTOP_BG_SEED`]. Every colour that reaches this path is an
 /// `0x00RRGGBB` triple (the top byte is unused on both the desktop and the compositor side), so
 /// `0xFFFF_FFFF` is outside the range a caller can legitimately pass and needs no second flag.
@@ -877,8 +894,65 @@ impl Screen {
         // this frame is subtracted against the same layout (a window that moves mid-present is
         // repainted by the mover's own composite either way). Empty on a windowless desktop, which is
         // every full-screen VUG frame and every gate boot before the window fixtures run.
-        let mut occ = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
-        let nocc = super::wm::occluders(&mut occ);
+        //
+        // SHELLDESK — **and the FURNITURE STRIPS, for the same reason and by the same rule.**
+        //
+        // WC-I subtracted the window layer because the desktop is beneath it. Furniture (the menu
+        // bar, the dock — `video::strip`'s tenants) is beneath NEITHER: `wm::composite_once` paints
+        // it after every window, and `wm::occ_clip` already withholds a window's own pixels where a
+        // strip stands, so on the window side furniture is a first-class occluder. The desktop side
+        // was the one writer in the system that still ignored it, and that is exactly the metal
+        // symptom this arc exists for: the shell owns the desktop layer and `console::draw` opens
+        // with a WHOLE-PANEL `clear_screen`, so every command the operator ran flushed the shell's
+        // background straight over the bar's 34 rows — and nothing repainted them, because
+        // `strip::compose_all` runs from a COMPOSITE and a desktop present is not one
+        // (`service_damage` returns without compositing when no window row is dirty). The bar was
+        // therefore erased within one frame of appearing, on a boot where every other witness read
+        // healthy. The dock was being erased by the same writes.
+        //
+        // Subtracting is the fix WC-I already argued for, not a new mechanism: the strip's pixels
+        // stop being desktop pixels for any interval, however short, so nothing has to notice the
+        // damage and repaint. A strip that goes ABSENT publishes no rect (`strip_rect` answers
+        // `None` the moment it is disabled), so its rows return to the desktop on the very next
+        // present, and its own dismissal erase (`strip::erase_rect`) is what clears the glass.
+        //
+        // The rect comes from `strip::rects` — the SAME registry walk `wm::erase_clip` and
+        // `wm::occ_clip` read, so the desktop, the erase and the window blit all answer "where is
+        // that strip" from one accessor and cannot drift. It is not free: the dock's hook counts its
+        // tiles through `wm::dock_scan`, i.e. one more bounded `MAX_WINDOWS` scan under the table
+        // lock, on a path that already takes it once for `occluders` — sequentially, never nested,
+        // and at desktop cadence (~20 Hz) against a present that is about to copy megabytes.
+        //
+        // Residual, stated: the geometry answers "the strip owns these rows" from the instant it is
+        // enabled, which can be one composite before the strip has actually PAINTED them, so a
+        // freshly enabled bar withholds its rows from the desktop for that interval. Bounded by the
+        // next composite (on x86 the enable at `wcx::activate` is immediately followed by the console
+        // window's own `create`, which composites), and the alternative — subtracting only what the
+        // strip last painted — would have made the desktop and the window layer disagree about the
+        // strip's extent, which is the drift this registry exists to prevent.
+        //
+        // x86 + `wc` only — `video::strip` is not compiled on aarch64, where this is the WC-I array
+        // and the WC-I loop, byte for byte.
+        let mut occ = [(0usize, 0usize, 0usize, 0usize); DESK_OCC_MAX];
+        let nocc = {
+            // `occluders` writes exactly `MAX_WINDOWS` slots; the furniture tail is appended after.
+            let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
+            let nw = super::wm::occluders(&mut wins);
+            occ[..nw].copy_from_slice(&wins[..nw]);
+            let mut n = nw;
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+            {
+                let mut strips = [None; super::strip::STRIP_MAX];
+                let _ = super::strip::rects(self.info.width, self.info.height, &mut strips);
+                for s in strips.iter().flatten() {
+                    if s.2 != 0 && s.3 != 0 && n < occ.len() {
+                        occ[n] = *s;
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
         let occ = &occ[..nocc];
         // VUG-FPS-2 witness: the merged rect count and the union bbox of all damage this frame. The
         // rects array still holds the pre-clear data (clear() only zeroed len), so read [0..n].
@@ -908,7 +982,9 @@ impl Screen {
         // handled the flush (>= 2 bands); false to fall through to the byte-identical serial path
         // (no free AP, or too little work to amortize the spawn/join).
         //
-        // WC-I: only when the window layer is EMPTY. The band workers copy whole clipped rects and
+        // WC-I: only when the occluder set is EMPTY — no window, and (SHELLDESK) no furniture strip
+        // either, since a strip is subtracted by the same walk and for the same reason. The band
+        // workers copy whole clipped rects and
         // know nothing about occluders; teaching them the subtraction would put the span walk on
         // three cores for no benefit, because the case that needs the subtraction (several windowed
         // apps on the panel) is also the case where the desktop's own damage is small — a status

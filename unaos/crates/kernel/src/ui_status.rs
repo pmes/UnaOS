@@ -575,6 +575,42 @@ pub fn chrome_h(ph: usize) -> usize {
     band_h(ph).saturating_add(m.line_h)
 }
 
+/// SHELLDESK — **the TOP reservation: panel rows the desktop scene's furniture owns, which a
+/// screen-owning view must lay out below.**
+///
+/// The bottom counterpart is [`chrome_h`] and this is deliberately its twin: one function, no second
+/// copy of the arithmetic, and the number is READ FROM THE OWNER rather than restated — it is
+/// `video::menubar::strip_rect`'s own height, so a bar that is disabled, or that declines the panel
+/// on its floors, reserves nothing at all and the shell gets the whole glass back.
+///
+/// Why the shell has to know. The x86 render service draws `console::Console` into the desktop
+/// layer, and `Console::draw` opens with a whole-panel `clear_screen`: the shell's first act on every
+/// repaint is to claim every row on the panel. With the desktop present now withholding the strips'
+/// rows (`Screen::present_background`), text the shell laid out under the bar would be composed into
+/// the back buffer and never reach the glass — the shell would be writing lines into a region it
+/// cannot show. Reserving the rows is what makes "the desktop scene owns the top of the glass, the
+/// shell is a tenant below it" true for the LAYOUT as well as for the pixels.
+///
+/// `0` on aarch64 and on any x86 build without `wc` — `video::menubar` is not compiled there — so
+/// every non-x86-wc surface lays out exactly as it did before this arc.
+pub fn top_chrome_h(pw: usize, ph: usize) -> usize {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        if let Some((_x, y, _w, h)) = crate::video::menubar::strip_rect(pw, ph) {
+            // The bar is flush to the top edge, so the rows it costs a view below it are `y + h`.
+            // Written as the sum rather than as `h` so an inset strip (a future tenant, or a bar the
+            // geometry chose to float) reserves what it actually occupies.
+            return y.saturating_add(h);
+        }
+        0
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        let _ = (pw, ph);
+        0
+    }
+}
+
 /// The horizontal span `[x0, x1)` of the pulse band that is free of WC-F's reserved probe boxes.
 ///
 /// WC-F paints scan-out ground truth straight into the framebuffer at the tail of every composite, and

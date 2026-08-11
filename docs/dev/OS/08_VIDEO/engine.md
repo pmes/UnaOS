@@ -1984,6 +1984,58 @@ back above a shell that overtook it — hiding it would strand a full-screen app
 > z-order — flagged here rather than worked around, because every available workaround keys on something
 > coarser than ownership and would strand a full-screen app's output in some other state instead.
 
+#### SHELLDESK — the desktop scene owns the glass; the shell is a tenant on it (2026-08-11)
+
+**Peter, metal Boot A, verbatim:** *"i cannot see the menu because a shell is still posing as the
+desktop"*. Three facts made that true at once, and all three are properties of the SCENE rather than
+of the z-order:
+
+1. **Nothing ever claimed the tenancy.** `video::menubar` is a default-off tenant of `video::strip`
+   ("we will not always have a menu bar"), and `set_enabled(true)` had exactly one caller in the
+   tree — the fixture, which turned it off again. A bar nothing enables is a bar the operator cannot
+   see, however correct its geometry. `wcx::activate` now enables it as the last step of bringing the
+   crispy desktop up, and says so on the wire: `[wc-x] menubar ENABLED panel= rect= was=`. This is a
+   SHELL's decision by construction — a spatial shell that never runs that seam never gets a bar,
+   which is the whole point of the tenancy — and every DECLINE arm in `activate` returns before it,
+   so a boot that failed to bring the compositor up never leaves a strip on the glass with nothing
+   beneath it.
+2. **The desktop layer erased the furniture on every present.** WC-I taught `Screen::present_background`
+   to subtract the WINDOW layer's boxes from its own damage; furniture was never in that set. But
+   furniture is beneath neither layer — `composite_once` paints it after every window, and `occ_clip`
+   already withholds a window's pixels where a strip stands — so the desktop was the one writer in the
+   system still ignoring it. The shell owns the desktop layer and `console::Console::draw` opens with a
+   whole-panel `clear_screen`, so every command the operator ran flushed the shell's background over the
+   bar's 34 rows, and nothing repainted them: `strip::compose_all` runs from a COMPOSITE, and a desktop
+   present is not one (`service_damage` returns without compositing when no window row is dirty). The
+   bar was erased within a frame of appearing. **The desktop present now subtracts every furniture strip
+   as well as every window**, from `strip::rects` — the same registry walk `erase_clip` and `occ_clip`
+   read, so the three writers cannot drift about where a strip is. The dock had been losing the same
+   race and stops too.
+3. **The shell laid out over the reserved rows.** With the rows withheld, text the shell placed under
+   the bar would be composed into the back buffer and never reach the glass. `ui_status::top_chrome_h`
+   is the TOP reservation — the twin of `chrome_h`, read from `menubar::strip_rect` rather than
+   restated — and `Console`'s three layout sites (page budget, prompt line, full repaint) start at
+   `top_y = top_chrome_h + margin`. It is `0` wherever `video::menubar` is not compiled (all of
+   aarch64, every x86 build without `wc`) and wherever the shell has not enabled a bar, so those
+   surfaces lay out exactly as before.
+
+The scene model this leaves, in one line: **furniture owns the panel's edges, the window layer owns
+what is above the shell, and the shell owns the middle of the desktop layer** — with each writer's
+extent published by one accessor that every other writer reads.
+
+The bar is CLICKABLE as well as visible: `wc_click_route_at` judges `crystal::press_at` ahead of the
+dock and every window arm, so the SHARD menu opens from the mark. The bar itself remains `press=inert`.
+
+**What this arc did NOT do, deliberately.** The FACADE ledger's entry 2 — dropping the
+`is_kernel_owner && z != PARKED_Z` arm from `above_shell` and the matching furniture branch in
+`focus_changed`'s shell arm, so the console stops being a desktop citizen — is **not landed here**. The
+ledger ties it to entry 3 (the dock tile, `dock_scan`'s kernel-band filter) with a stated reason: a
+below-shell console that still has a dock tile, or a tile-less console that still composites, is a
+worse intermediate than either end state, so the two land together — and `dock.rs` is another arc's
+lane. Nor is the shell made a `wm` row (entry 6): `SHELL_Z` is still a bare `AtomicU32` naming the
+desktop layer's position, and the shell's pixels are still the desktop layer's pixels. What changed is
+what the shell is ALLOWED to own of that layer.
+
 #### Three smaller defects the same arc closes
 
 * **`create` now composites.** A window's kernel chrome reaches the panel when the row exists, not at the

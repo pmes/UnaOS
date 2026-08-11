@@ -512,6 +512,35 @@ pub fn activate_on(desc: SurfaceDesc) {
     }
     serial_println!("[wc-x] activate panel={}x{} console_win={}", pw, ph, cwin);
 
+    // SHELLDESK — **THE DESKTOP SHELL ASKS FOR ITS MENU BAR. This is the seam that means
+    // "desktop-ready" on x86.**
+    //
+    // Peter, metal Boot A: *"i cannot see the menu because a shell is still posing as the desktop"*.
+    // The bar was built as a default-off TENANT (`video::menubar` — "we will not always have a menu
+    // bar"), and the tenancy was never claimed: `set_enabled(true)` had exactly one caller in the
+    // tree, the fixture, which turned it off again. A bar nothing enables is a bar the operator
+    // cannot see, however correct its geometry.
+    //
+    // Here, and not in `main.rs`'s render service or in `menubar`'s initialiser, for two reasons.
+    // The first is ownership: turning the bar on is a SHELL's decision, and this function is where
+    // the crispy desktop shell is brought up — a spatial shell that never runs this seam never gets a
+    // bar, which is the whole point of the tenancy. The second is ordering: everything the bar draws
+    // from (the panel geometry, the compositor, the window table it reads the focused caption out of)
+    // is live by this line, and every DECLINE arm above returns before it, so a boot that failed to
+    // bring the compositor up does not end with a strip on the glass and nothing beneath it.
+    //
+    // The bar's own witness (`[menubar] rollup …`) reports what it then paints; this line is the
+    // decision, so a capture separates "the shell never asked" from "the shell asked and the bar
+    // declined the panel" (`geometry` answers `None` below its floors, and says so there).
+    let bar_was = super::menubar::set_enabled(true);
+    serial_println!(
+        "[wc-x] menubar ENABLED panel={}x{} rect={:?} was={} (the desktop scene owns the top of the glass)",
+        pw,
+        ph,
+        super::menubar::strip_rect(pw, ph),
+        bar_was
+    );
+
     // DESKTOP-APP — ARM the desktop's second window. It is a PROGRAM now, so it cannot be opened
     // from here; see the module docs for why this seam is structurally too early for a launch, and
     // [`desktop_app_service`] for the pass that performs it.
