@@ -2025,6 +2025,12 @@ What default-on costs is bounded and was already argued for in §10:
   > volume serial, fall back to the current global-then-`Sdhc` order when the serial is 0 or found
   > on neither handle (the same fail-open direction FRGUARD takes). Until then, the operating rule
   > for this machine is: do not insert a USB stick while programs are expected to load from `/fat`.
+  >
+  > **CLOSED by the `psrc-precedence` arc — see §13.** The precedence now consults FRGUARD's boot-
+  > medium verdict, the `:: PSRC: … ::` witness says which handle won and why, and the b43 staging
+  > path searches the non-preferred handle for any role the program source did not carry. The
+  > operating rule above is retired; the fail-open case it protected against is now named on the
+  > wire (`reason=serial-unproven verdict=unproven`) instead of being an unwritten bench habit.
 * **The card stays read-only because a default image has no `sdw`** — not because the FAT layer
   refuses. *(Review correction. An earlier wording of this bullet said "the FAT layer refuses every
   write to a `Sdhc` source, unconditionally". That was GR20's property and §11 — SDHC-4c — replaced
@@ -2140,3 +2146,288 @@ than `SKIPPED`, or a `:: FRGUARD: SUBSTITUTION …` line while the recorder is e
 If the mount still fails, `SDHCREG` reads `handle=built register=ok` and the finding is
 downstream — `NotFat` indicts the medium's BPB, `Io` indicts the driver. Either way Boot B does
 not need a Boot C to say which.
+
+---
+
+## 13. PSRC (GR26) — the program source follows the BOOT VOLUME, not the handle order
+
+§12.3 recorded a review finding rather than fixing it: *"that precedence is the wrong way round
+under the NEW premise, and this arc is what makes it reachable by default."* This section is that
+fix. Nothing in §12 is retracted; the `sdhcblk` flip stands, `register_sdhc` still leaves the global
+slot untouched, and `SDHCREG` still says so at the seam. What changes is one question's answer.
+
+### 13.1 The defect, restated in one sentence
+
+`publish_usb_geometry` claims the global `BLOCK_DEVICE` **unconditionally** on x86, and
+`program_source` preferred the global **unconditionally** — so on the bench rMBP, whose boot volume
+is the card in the internal slot, a USB stick inserted merely to CARRY files became the program
+source mid-boot. `/fat` would stop meaning the volume the machine booted from, and
+`bg /fat/VUG.ELF` would resolve against the stick.
+
+This is not hypothetical. It is the b43 workflow: `CLEAN_ROOM_POLICY.md` §4 says UnaOS ships no
+firmware, so the three blobs arrive on a stick the operator plugs in — which, under the old rule,
+silently retargeted every program load on the machine.
+
+### 13.2 The evidence was already in the kernel
+
+FRGUARD (GR21) refuses the WRITE half of exactly this substitution. It holds
+`BootInfo::boot_volume_serial` — `BS_VolID` read by the UEFI loader off LBA 0 of its own
+loaded-image device — and derives, once per global-slot claim, a verdict about where that volume
+actually is:
+
+| verdict | meaning |
+| --- | --- |
+| `BM_MATCH` | the global slot CARRIES the boot serial |
+| `BM_SUBSTITUTED` | the boot serial is on the `Sdhc` handle, not the global — a proven substitution |
+| `BM_UNPROVEN` | on neither handle: the boot medium is unreachable through the block layer |
+| `BM_UNKNOWN` | not yet derived for the current occupant |
+
+`program_source` simply did not consult it. Now it does.
+
+### 13.3 The rule
+
+1. **`reason=boot-serial`.** If the boot serial is non-zero AND the verdict positively locates the
+   boot volume on a handle AND that handle is still populated, that handle wins.
+   `BM_MATCH` → `Global`, `BM_SUBSTITUTED` → `Sdhc`.
+2. **`reason=fallback-order` / `reason=serial-unproven`.** Everything else keeps the historical
+   global-then-`Sdhc` ladder. That is: serial 0 (`verdict=disarmed`), serial on neither handle
+   (`verdict=unproven`), verdict not yet derived (`verdict=undecided`), and a verdict naming a
+   handle the registry no longer holds (`verdict=stale-handle`).
+
+Fail-open in the same direction FRGUARD takes, for the same reason: an unidentified or unreachable
+boot volume is a reason to SAY SO, not a reason to guess.
+
+**Every boot that already worked is unchanged.** A USB-booted machine derives `BM_MATCH` and arm 1
+returns the global — bit-identical to `info()`, the same slot, the same read path. The only boot
+whose answer moves is the one where the boot volume was positively found somewhere else.
+
+### 13.4 Cost, and why there is no new cache
+
+`program_source` runs per open — twenty-five shell FAT verbs, every exec probe, the desktop-app
+storage gate on each main-loop pass while it waits, the wifi staging poll. It must not read a
+sector and must not be callable into a masked deadlock.
+
+It does neither, because **the cache it needs already exists**. `BOOT_MEDIUM_VERDICT` is derived
+once, from an unmasked main-loop context (`flight_recorder::service`), precisely because deriving
+costs sector reads (`fat::volume_serials` walks LBA 0, the GPT spans and every MBR partition start);
+and `publish_usb_geometry` resets it to `BM_UNKNOWN` whenever a new device claims the global slot,
+precisely so a hot-plug cannot inherit the previous occupant's verdict. A SECOND cache here would
+duplicate that invalidation and manufacture the stale-handle hazard it was meant to avoid.
+
+The whole decision is two atomic loads on top of the two `Option` reads the function already did.
+
+**The one residual staleness is handled structurally, not by invalidation.**
+`unpublish_usb_geometry` deliberately does NOT reset the verdict — resetting it would turn a
+`BM_SUBSTITUTED` refusal into a fail-open and WEAKEN FRGUARD. So arm 1 wins only if the handle the
+verdict names is still `Some`; a verdict naming an empty slot falls through to arm 2 and prints
+`verdict=stale-handle`.
+
+**Is the verdict derived in time?** In exactly the case that needs it. `flight_recorder::service`
+returns early while `info()` is `None`, so a card-ONLY boot never derives at all — and that costs
+nothing, because with the global slot empty the fallback ladder already lands on `Sdhc`. The
+verdict only matters when BOTH handles are populated, which is precisely the state in which the
+recorder's gate passes and the derivation runs.
+
+**The residual window, stated (review, GR26).** The x86 ordering is fixed and favourable:
+`register_sdhc` runs synchronously inside `pci::init` (`sdhc::probe` → `bring_up`), while
+`publish_usb_geometry` runs from the main loop's deferred SCSI bring-up (`xhci::service_storage`,
+held until the enumeration queue drains). The card is therefore always registered first, and every
+poll-until-present consumer — `wifi::service`, `wcx::desktop_app_service`,
+`shell::fatverb_storage_witness` — resolved and parked on `Sdhc` at the first main-loop pass, long
+before a stick can arrive. What is NOT closed by construction is the INTRA-PASS window on the one
+pass where a stick claims the global: `service_storage` resets the verdict near the top of that
+pass and `flight_recorder::service` re-derives it at the bottom, so in between arm 2 runs with
+`verdict=undecided` and the ladder answers `Global`. A **per-call** consumer that resolves inside
+that window — a shell verb or an exec dispatched on exactly that pass — gets the stick for that one
+call. Bounded to a single pass, requires a hot-plug concurrent with the call, read-side only
+(FRGUARD still refuses the write), and visible in the capture as the transient
+`psrc=global … verdict=undecided` line. Closing it would cost either a sector read on the hot path
+or a second cache, both of which §13.4 rejects for stronger reasons.
+
+### 13.5 The witness: `:: PSRC: … ::`
+
+The census vocabulary of §12.2 is extended, not replaced — the line ends with the same
+`SourceCensus` rendering (`global=present sdhc=present`) every declining consumer already prints,
+so the decision and the handles it was made over read as one sentence.
+
+```
+:: PSRC: psrc=<global|sdhc|none> reason=<boot-serial|fallback-order|serial-unproven> verdict=<match|substituted|unproven|undecided|disarmed|stale-handle|unbuilt> boot_serial=0xXXXXXXXX handles=global=… sdhc=… ::
+```
+
+**Change-only, not once-only.** A per-call line would flood (per open); a once-only line would hide
+the exact event this arc exists for — the moment a stick claims the global and the preference has
+to refuse it. The latch stores the packed decision, so the wire carries one line per DISTINCT
+answer: a boot whose answer never changes prints once, a boot where a stick arrives prints the flip.
+
+**It cannot be vacuous.** It is emitted from `program_source` itself, which every program-loading
+consumer in the tree calls, and from BOTH cfg arms — an image without `sdhcblk` prints
+`reason=fallback-order verdict=unbuilt`, so "this build cannot substitute" is a sentence on the
+wire rather than an inference from silence (the exact inference §12.4 records as falsified).
+Strings-reachability on a built `esp-x86` kernel confirms all seven `verdict=` tokens and all three
+`reason=` tokens are in `.rodata`. **Read that gate for what it is (review, GR26):** presence in
+`.rodata` proves the arm was compiled, not that it can fire, and rustc interns overlapping literals
+(`unproven` shares storage with `serial-unproven`, `unbuilt` with ` sdhc=unbuilt`), so the token
+count is not a per-arm proof either. Per-arm reachability is the argument above, not the strings
+gate: in a default (`sdhcblk`) image `verdict=unbuilt` is compiled but **unreachable** — its only
+caller is the `#[cfg(not(sdhcblk))]` arm — and it is reachable only in an image built without the
+knob. The other six are each reachable in an `sdhcblk` image.
+
+*Note for the aarch64 lane:* the non-`sdhcblk` arm compiles on every target, so a Pi boot gains one
+`:: PSRC: psrc=global reason=fallback-order verdict=unbuilt … ::` line per distinct answer. Log
+only — the returned handle on that arm is byte-for-byte the pre-PSRC `info()` answer.
+
+### 13.6 The b43 staging path — the honest answer is "search the other handle too"
+
+With the preference in place, a machine booted from the card no longer mounts a stick as its
+program source. The firmware blobs live on that stick. So `wifi::firmware::stage_attempt` (the
+WIFI-REARM retry-aware entry that replaced `stage_once` on trunk; the two-volume search reconciles
+INTO it — see `firmware.rs`) — the one caller that would otherwise regress — now runs **two
+passes**:
+
+1. the program source (`block::program_source()`), then
+2. if the set is still incomplete, the OTHER populated handle
+   (`block::alternate_program_source()`), for the missing roles only.
+
+**Why widening is safe here and nowhere else:**
+
+* **Read-only.** This module writes no sector, so the substitution FRGUARD refuses — this system's
+  data landing on a medium it did not boot from — cannot arise.
+* **Additive, per role.** The second pass skips any role already staged, so the preferred volume
+  wins any file present on both. A second volume can ADD a missing image; it can never replace one.
+* **Same shape as the search already there.** The loader already walks three directories per volume
+  and three names per directory, for the same reason: firmware is a "wherever I can find it" read.
+* **Never silent.** Each `STAGED` line names its volume (`on source=… label=… fp=…`), and the
+  second pass announces itself (`searching the other populated handle (source=…) … READ-ONLY, and
+  a role already staged is never replaced`).
+
+The alternative — documenting "the blobs go on the card" — would mean "to try a firmware blob,
+re-flash your boot volume on another machine". That is a worse OS, and `CLEAN_ROOM_POLICY.md` §4's
+premise is that the user supplies the files at runtime, on whatever media they have.
+
+**Flagged for the integrator:** `wifi/firmware.rs` now carries a local `source_of_handle`, a copy of
+`fs::fat`'s private `source_of`. `fs/fat.rs` is outside this arc's lane, so publishing that mapping
+belongs to the FAT layer's own arc. The compiler enforces the load-bearing half: both matches are
+total over `BlockHandle`, so a fourth handle is a build error in both places, never a mis-route.
+
+### 13.7 The falsifiable metal predictions
+
+Both assume the §12.6 media and the bench rMBP (boot volume = the 60 GiB card, internal slot).
+
+**Boot B — card only, no stick.** The global slot is empty, so `flight_recorder::service` returns
+early and the verdict is never derived. Exactly ONE `PSRC` line for the whole boot, and it must be
+one of these two — the `:: FRGUARD: boot volume serial …` line printed at publish time says which:
+
+```
+:: PSRC: psrc=sdhc reason=serial-unproven verdict=undecided boot_serial=0x???????? handles=global=absent sdhc=present ::   (serial ARMED)
+:: PSRC: psrc=sdhc reason=fallback-order verdict=disarmed  boot_serial=0x00000000 handles=global=absent sdhc=present ::   (serial ABSENT)
+```
+
+`psrc=sdhc` is the load-bearing token either way, and `bg /fat/VUG.ELF` must load. No
+`:: FRGUARD: SUBSTITUTION …` and no `:: FRGUARD: Default slot … CARRIES …` line can appear: the
+derivation gate never opens.
+
+**Card + stick.** The card registers at PCI probe, long before xHCI enumerates, so the FIRST line is
+Boot B's. When the stick claims the global, `publish_usb_geometry` resets the verdict,
+`flight_recorder::service`'s gate opens, and `evaluate_boot_medium_once` runs. On the bench layout
+(MBR p1 FAT32 @ LBA 2048; the UEFI loader reads `BS_VolID` off the ESP partition's own LBA 0, and
+`volume_serials` walks every MBR partition start) the boot serial IS findable on the `Sdhc` handle,
+so the expected sequence is:
+
+```
+:: PSRC: psrc=sdhc reason=serial-unproven verdict=undecided boot_serial=0x???????? handles=global=absent sdhc=present ::
+:: FRGUARD: SUBSTITUTION — the boot volume serial 0x???????? is on the INTERNAL Sdhc card (blocks=124735488), not in the Default slot (blocks=N, … none of them ours); Default writes REFUSED ::
+:: PSRC: psrc=sdhc reason=boot-serial verdict=substituted boot_serial=0x???????? handles=global=present sdhc=present ::
+```
+
+That third line is the arc's whole claim: the stick is present, it owns the global slot, and `/fat`
+still means the card. `bg /fat/VUG.ELF` must load the card's VUG, not the stick's.
+
+**And the honest failure mode, named in advance.** If `evaluate_boot_medium_once` instead prints
+`found on NEITHER handle`, the verdict is `BM_UNPROVEN`, the fallback ladder runs, and the second
+line reads `psrc=global reason=serial-unproven verdict=unproven` — the stick DOES take over. That is
+the specified fail-open, not a bug in this arc, and the `FRGUARD` line above it says exactly why.
+The discriminator is whether the loader's `BS_VolID` matches a BPB `volume_serials` can reach; if
+Boot B shows `boot_serial=0x00000000`, this case is guaranteed and the finding is in the loader's
+`read_boot_volume_serial`, not here.
+
+**With the stick carrying the b43 blobs**, the same boot must additionally show the two-pass search:
+
+```
+:: wifi: firmware set incomplete on the program source (0/3) — searching the other populated handle (source=global) for the missing roles; READ-ONLY, and a role already staged is never replaced ::
+:: wifi: ucode STAGED /B43/ucode29_mimo.fw bytes=… on source=global label='…' fp=… ::
+:: wifi: firmware set COMPLETE 3/3 staged on source=sdhc … + source=global … ::
+```
+
+> **OPEN DEFECT — the bench timing still starves the second pass (review, GR26; MAJOR). Narrowed,
+> not closed, by the `psrc-reconcile` arc.** `wifi::service` (`wifi/mod.rs`) is a forward-only state
+> machine: it runs `bus::census()` on one main-loop pass, then calls the staging entry on the FIRST
+> pass where `block::program_source()` is `Some`, and (after the WIFI-REARM retry budget) parks. On
+> the bench machine the internal card is registered synchronously inside `pci::init`
+> (`register_sdhc`), i.e. before the main loop runs at all — so `program_source()` is already
+> `Some(Sdhc)` on main-loop pass 1 and the staging entry fires there. The USB stick's
+> `publish_usb_geometry` happens many passes later, from the deferred SCSI bring-up. At the moment
+> the staging entry runs, `alternate_program_source()` is therefore `None`, so the two-volume
+> search's pass 2 finds no alternate handle to try. The observable signature is
+> `:: wifi: firmware set INCOMPLETE 0/3 … on source=sdhc …` with **no** `searching the other
+> populated handle` line anywhere in the capture.
+>
+> **What the `psrc-reconcile` arc changed.** The two-volume search now lives INSIDE the WIFI-REARM
+> retry-aware entry (`firmware::stage_attempt`, not the pre-WIFI-REARM `stage_once`). So on any
+> configuration where BOTH handles are present at attempt time — a machine booted from the stick
+> (card registered early, so the alternate is already `Some` when the stick's staging entry runs),
+> or a re-attempt that happens to land after the stick enumerated — pass 2 fires correctly and the
+> widening is live. What remains dead is the *specific bench timing* above: card early, stick late,
+> and the staging entry settling (COMPLETE-or-INCOMPLETE on the card alone) before the stick's
+> handle appears.
+>
+> **The fix is de-risked but was judged more-than-small for a reconciliation arc, so it was NOT
+> landed here.** Its mechanism is now verified sound: on x86 the USB storage-ready edge
+> (`block::set_usb_ready` → `take_usb_ready`) is raised by `publish_usb_geometry` when the stick
+> enumerates, and it has **no x86 consumer** — its only consumer, `fat::piusb27_service`, is
+> `#[cfg(target_arch = "aarch64")]`, and `wifi` is `#[cfg(all(feature = "wifi", target_arch =
+> "x86_64"))]`, so the two live on disjoint arches and cannot race. `wifi::service` may therefore
+> consume that edge freely. The reason it is still deferred: doing it without regressing the two
+> invariants both arcs rest on — *exactly one terminal verdict*, and *arc 2 runs once on a final
+> count* — requires a new `StageOutcome` arm (an incomplete-but-alternate-still-expected "pending"
+> that prints no terminal line) plus a bounded second-handle wait in `wifi/mod.rs` that holds the
+> terminal verdict and arc 2 until the edge fires or a deadline expires. That is a real state-machine
+> feature, not a one-liner. Landing it hastily would either print a premature INCOMPLETE that a later
+> pass contradicts, or run arc 2 on a count a late stick then moves — the exact hazards WIFI-REARM
+> was built to prevent. `block.rs` and `wifi/firmware.rs` need no further change for it; the whole
+> fix is in `wifi/mod.rs` plus the one new outcome arm in `firmware.rs`.
+
+### 13.8 Gates
+
+`./arroyo check` green both arches; `UNAOS_WC=1 ./arroyo check` green (12 cfg legs). QEMU suites
+OFF by operator order (metal day). Strings-reachability verified on a built `esp-x86` kernel for
+every new witness arm, and on a `UNAOS_WIFI=1 ./arroyo esp-x86` kernel for the wifi two-pass arms
+(the `wifi` feature is opt-in, so a default `esp-x86` carries none of that module).
+
+Byte-identity where this file claims it: the diff touches only `program_source` and the new PSRC
+section. `read_block`, `write_block`, `read_blocks`, `write_blocks` and `publish_usb_geometry` are
+untouched — not one new statement, not one new `#[cfg]` — so §SDHC-4b's standing claim holds
+verbatim. FRGUARD's predicate, its verdict states and its refusal are unchanged; PSRC only READS
+the verdict FRGUARD already publishes.
+
+### 13.9 Reconciliation with WIFI-REARM (GR26, `psrc-reconcile`)
+
+The `wifi-rearm` arc landed on trunk BEFORE this arc merged, refactoring the same
+`wifi/firmware.rs` staging path into a retry-aware `stage_attempt() -> StageOutcome`
+(`Settled | Retry`) with a storage-wait heartbeat. The two wifi refactors conflicted; the
+`psrc-reconcile` arc merged both so neither regresses. The block-layer precedence
+(`program_source`/`alternate_program_source`/`psrc_witness`) and this section applied to trunk
+unchanged (the file was byte-identical to this arc's base). In `firmware.rs` the two-volume search
+(`stage_pass` over the program source, then the alternate handle) now runs INSIDE the retry-aware
+entry: a deferred mount on EITHER volume returns `Retry`, and the no-double-stage guarantee moved
+from "the `Retry` arms sit above the `FW_SET` loop" to "`stage_pass` skips any role already in
+`STAGED`", which holds across both volumes and across re-attempts. §13.7's bench-timing defect is
+narrowed (both passes fire whenever both handles are present at attempt time) but not closed, and
+its note now carries the verified fix mechanism.
+
+Reconcile gates, all green on trunk `13d18bad`: `./arroyo check`, `UNAOS_WC=1 ./arroyo check`,
+`UNAOS_WIFI=1 ./arroyo check`, and `UNAOS_WIFI=1 UNAOS_WIFI2=1 ./arroyo check`. Strings-reachability
+on a `UNAOS_WIFI=1 ./arroyo esp-x86` kernel confirms both the retry witnesses (`re-attempting`, the
+`still deferred … the poll is LIVE` heartbeat) and the two-volume witness (`searching the other
+populated handle`). Wifi-feature knob-off byte-identity: the default (wifi-off) `esp-x86`
+`kernel.elf` is bit-identical with the `firmware.rs`/`mod.rs` edits applied and reverted
+(`sha256 14ae8e95…`, snapshot + `git apply -R`, never `git stash`).

@@ -272,10 +272,13 @@ pub fn service() {
             // Arc 2 runs HERE and only here, and the precondition is stated precisely because a
             // reviewer will check it against the code: arc 2 runs once the staging pass has reached
             // its TERMINAL answer for this boot — either `Settled`, or a `Retry` budget exhausted by
-            // the arm above. `staged_count()` is final in BOTH: the exhaustion arm is reached only
-            // from `Retry`, which by construction stages nothing (both of `stage_attempt`'s `Retry`
-            // returns sit above its `FW_SET` loop), so the count arc 2's completeness gate reads is
-            // 0 and cannot move afterwards — the state goes to `S_PARKED` on the next line.
+            // the arm above. `staged_count()` is final in BOTH, but the reason is not "the count is
+            // 0": PSRC's two-volume `stage_attempt` can return `Retry` from its SECOND (alternate)
+            // volume after the first has already staged a role, so the exhaustion arm may be reached
+            // with a PARTIAL count. What makes the count final is not its value but that no further
+            // attempt runs — the state goes to `S_PARKED` on the next line, so `STAGED` cannot move
+            // after arc 2 reads it. A partial set is still `< FW_SET_LEN`, so arc 2's completeness
+            // gate refuses exactly as it would on 0.
             //
             // What is EXCLUDED is the non-terminal `Retry`, which returns above without reaching
             // here: that is the case where another attempt is still coming and the count really is
