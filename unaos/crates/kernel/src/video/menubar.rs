@@ -222,6 +222,12 @@ pub fn set_enabled(on: bool) -> bool {
     let was = ENABLED.swap(on, Ordering::AcqRel);
     if was != on {
         TOGGLES.fetch_add(1, Ordering::Relaxed);
+        // CRYSTAL — turning the bar OFF must tear down the SHARD menu, or its dropdown would outlive
+        // the crystal it hangs from with nothing left on the bar to dismiss it. Turning the bar ON
+        // does not open it; a menu is opened by a press, never by a toggle.
+        if !on {
+            super::crystal::dismiss_for_bar_off();
+        }
     }
     was
 }
@@ -444,6 +450,14 @@ fn crystal_box(r: strip::Rect) -> (usize, usize, usize, usize) {
     let (rx, ry, _w, h) = r;
     let (ox, oy) = crystal_offset(h);
     (rx + ox, ry + oy, CRYSTAL_W, CRYSTAL_H)
+}
+
+/// **The crystal's absolute rect on a `pw` x `ph` panel, or `None`** when the bar is absent (disabled
+/// or the panel cannot host it). THE accessor the SHARD menu ([`super::crystal`]) reads to hit-test a
+/// press on the mark and to anchor its dropdown — a function of [`strip_rect`] and [`crystal_box`]
+/// alone, so the box the menu opens from is the box the painter drew.
+pub fn crystal_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
+    strip_rect(pw, ph).map(crystal_box)
 }
 
 /// Half the crystal's silhouette width at box-relative row `v`, in px.

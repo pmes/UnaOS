@@ -663,7 +663,13 @@ pub fn rects(pw: usize, ph: usize, out: &mut [Option<Rect>; STRIP_MAX]) -> usize
 pub fn compose_all() -> bool {
     let a = super::dock::compose();
     let b = super::menubar::compose();
-    a | b
+    // CRYSTAL — the SHARD menu's dropdown is a TRANSIENT surface, not a registered strip tenant (it
+    // takes no occlusion slot), so it is not in `TENANTS`/`rects`; but its per-pass compose belongs
+    // exactly here, at the furniture tail, so it composites on top of the windows and beside the bar
+    // it hangs from. Cheap when closed: two relaxed atomics and a return. The `|` is still not `||`
+    // for the same reason — every furniture surface must get its damage test in every pass.
+    let c = super::crystal::compose();
+    a | b | c
 }
 
 // ---------------------------------------------------------------------------

@@ -10690,3 +10690,112 @@ keyed by `owner_asid` is that table's neighbour.
 And the renderer-agnosticism claim is falsifiable by construction: **the first protocol arc must land
 with no renderer at all** — registry, publish, get, pick, fixtures — and `menubar.rs` unchanged. If
 the protocol cannot be proven working without a bar drawing it, it was not renderer-agnostic.
+
+## CRYSTAL MENU — the SHARD menu, UnaOS's first LIVE menu (x86, 2026-08-11)
+
+`video/crystal.rs`. The crystal landed **inert** (a press on the mark fell through — `press=inert`);
+this arc makes it live. Clicking the crystal opens a dropdown, an item picks, an action fires. It is
+**not** the MENUP protocol above: that is the renderer-agnostic path an *app* publishes into, a larger
+later arc. This is the **system** menu — the one macOS hangs off its apple — and it is **kernel-owned
+end to end**: no app publishes it, no principal but the kernel authors it, and the items act on the
+machine, not on a focused program. Because publisher and actor are both the kernel, it needs none of
+the protocol's registry, wire encoding, or cross-principal pick delivery; it follows the protocol's
+*shape* only where it fits (a fixed tree addressed by identity, a pick that fires a named action, a
+witness that makes every item falsifiable).
+
+### The items — Peter's naming, LOCKED
+
+The machine is a **SHARD**; the bus carries **Shard Messages**. The menu reads:
+
+| # | item | action |
+|---|------|--------|
+| 0 | About This Shard | prints the Shard identity + version to the log — **REAL** |
+| 1 | — (separator) | — |
+| 2 | Sleep | honest **STUB** — `unimplemented: Sleep` (no ACPI S3 path) |
+| 3 | Restart | honest **STUB** — `unimplemented: Restart` (no reboot path) |
+| 4 | Shut Down | **REAL** — `acpi_power::poweroff` (ACPI S5 soft-off) |
+
+**A stub is not a no-op and not a fake success.** Sleep and Restart *render* as pickable rows — a row
+that could not be shown pickable would be unfalsifiable — and their pick prints one honest line naming
+the verb and that it is unimplemented. Peter sees on glass/serial that the item is a stub, not that
+the menu is broken. When each op lands (Restart via the 8042 pulse or `0xCF9`; Sleep via `\_S3_` read
+the way `scan_s5` reads `\_S5_`, plus a resume vector), its `Verb::real()` flips and its `fire` arm
+calls the op — the menu, the routing, and the fixture are unchanged.
+
+### The flow, and where it seams into the existing machinery
+
+* **Composite.** The dropdown is a **transient surface**, painted through `strip::paint` and erased
+  through `strip::erase_rect` — the same front-buffer row-run discipline every non-compositor painter
+  uses — from `crystal::compose`, which `strip::compose_all` calls at the furniture tail beside the
+  dock and bar. It is deliberately **not** a `strip::TENANTS` entry: a registered strip consumes an
+  occlusion slot (`wm::OCC_MAX`), and this surface is modal and momentary, not standing furniture.
+  Damage-driven via its own `strip::Slot`: an open menu whose rect is unchanged repaints nothing; a
+  dismissal erases the owned rect once. **Disclosed limit:** not being a clip citizen, a window moved
+  or closed *under* an open menu could clip it — which does not arise in practice because a click
+  outside the menu dismisses it before any such gesture begins.
+* **Click.** `crystal::press_at` is judged in `wc_click_route_at` **ahead of the dock and every window
+  arm** — an open dropdown is modal, composited on top of everything, so its press must be tested
+  before any layer beneath it; when closed, the only point it claims is the crystal box in the bar,
+  which the bar owns anyway. It declines every other point, so the dock and window arms are not
+  starved. Consumed with `CLICK_TARGET_DROP`, so the matching release is dropped — the dock/close
+  arms' own rule.
+* **Escape.** `crystal::key_escape` is judged in `wc_route_event` before `wc_focus_key`, exactly where
+  `<TAB>` is: a bare `Esc` while the menu is open dismisses it and is consumed; every other event, and
+  `Esc` with no menu up, falls through unchanged.
+* **Reachability.** The crystal is part of the menu bar, which is **default-off**. With the bar off
+  there is no crystal to click and `press_at` returns `false` everywhere; disabling the bar while the
+  menu is open tears it down (`menubar::set_enabled` → `crystal::dismiss_for_bar_off`).
+
+### Destructive-action discipline, and the Shut Down guard
+
+Shut Down and Restart end or interrupt the session. Per the safety model a destructive action is
+either confirmed or **clearly deliberate** — and a menu pick *is* deliberate (the operator opened the
+menu, moved to the item, pressed it) — so no second "really?" affordance is added this arc. What is
+guaranteed instead is that the destructive path fires on a **pick and nothing else**: opening,
+dismissing, or hovering never reaches `fire`. And the one action that halts the machine — Shut Down —
+has exactly one caller, the live press in `press_at`.
+
+⛔ **The guard against a test powering the bench off is structural.** The hit resolution is factored
+into a pure `item_at(rect, x, y) -> Option<Verb>` with **no side effect**, so the fixture proves that a
+press on the Shut Down row *resolves to* `Verb::ShutDown` without firing it. The fixture drives real
+presses only for the safe verbs (About, Sleep, Restart) and **never** at the Shut Down row. The
+`:: CRYSTAL-MENU: … PASS ::` line printing *after* every leg is itself the proof the machine stayed up
+— a gate that fired S5 would lose the serial tail.
+
+### Witness
+
+Live, on every open/dismiss/pick (all falsifiable):
+
+```
+:: SHARD-MENU: crystal_press=open menu=282x105+12+34 items=4 ::
+:: SHARD-MENU: crystal_pick verb=About action=real ::
+:: SHARD-MENU: crystal_press=dismiss reason=pick ::
+:: SHARD: about name=UnaOS shard=this version=0.1.0 ::
+:: SHARD-MENU: crystal_pick verb=Sleep action=stub ::
+:: SHARD: unimplemented: Sleep (no ACPI S3 suspend path) ::
+:: SHARD-MENU: crystal_press=dismiss reason=outside ::
+:: SHARD-MENU: crystal_press=dismiss reason=escape ::
+```
+
+The fixture (`crystal::selftest`, run from the click family in `syscall.rs` after `dock::selftest`),
+six legs each able to fail on its own:
+
+```
+:: CRYSTAL-MENU: menu=282x105+12+34 panel=1280x800 items=4 start_closed=true opened=true
+   placed=true resolve=true pick=true outside=true escape=true :: PASS ::
+```
+
+`resolve=true` is the leg that proves Shut Down is *reachable as a pick* — through the pure resolver,
+without firing it. `pick=true` is About+Sleep+Restart each firing and dismissing (the wire carries
+their real/stub lines); Shut Down is never driven. The dropdown geometry (`menu=282x105+12+34`) is a
+function of the crystal box and the bar rect alone, so a metal capture reads the same `open` line the
+fixture asserts.
+
+### What landed vs designed
+
+**Landed:** click→open→dismiss (outside + Escape), the four-item list rendered dense in the crispy
+palette, every item resolvable and pickable, About (real, prints identity), Sleep/Restart (honest
+stubs), and **Shut Down wired to the real `acpi_power::poweroff`** — guarded from firing in any gate.
+**Designed, at the foot of `crystal.rs`:** a hover highlight (needs the drag-motion path, a lane this
+arc does not touch), the crispy About *panel* (a second modal surface, the argument for a tiny shared
+modal-surface primitive), and making Sleep/Restart real.

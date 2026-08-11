@@ -100,6 +100,13 @@ pub mod strip;
 // one registry entry, one line of `strip::compose_all`, and this declaration.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod menubar;
+// CRYSTAL: the SHARD menu — UnaOS's first LIVE menu, hung off the brand crystal in the menu bar. A
+// kernel-owned SYSTEM menu (About This Shard · Sleep · Restart · Shut Down), not the renderer-agnostic
+// app menu PROTOCOL (whose design ledger lives at the foot of `menubar.rs`). The dropdown is a
+// transient surface composited through `strip::paint` at the tail beside the dock and bar; the click
+// arm lives in `arch/x86_64/syscall.rs::wc_click_route_at`. Same gate as `dock`/`strip`/`menubar`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod crystal;
 // CRISPY-PI theme const table — carried verbatim from hw-pi4 (single-author law: edits flow
 // through the pi4 seat from the taste-gate). Declared for INSTGUI's use; full chrome wiring
 // (wm/fbcon reading these instead of their own constants) remains the later lockstep arc.
