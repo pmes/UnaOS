@@ -1014,28 +1014,52 @@ build_user_stat_x86() {
 # here to override it; the two builds land in separate target subdirectories and never clobber each
 # other. The output keeps a distinct name (VUG-X86.ELF) because both arches' images share one
 # target/ directory and the staging steps pick the right one.
-build_user_vug_x86() {
+# VUGSCENE: one image of crates/user-vug, named by $1 (the target/ basename) and built with the cargo
+# features in $2. Three images come out of the same source — see the LOD_PIN note in crates/user-vug:
+#
+#   VUG-X86.ELF   (no features)  the ADAPTIVE detail ladder. The default; what the desktop launches.
+#   VUGC-X86.ELF  (pinlo)        level 0 forever — the CLASSIC wireframe, for a slow machine and for
+#                                keeping old fps baselines comparable.
+#   VUGX-X86.ELF  (pinhi)        the full shard forever, for measuring the heaviest frame this draws.
+#
+# `bg`/`run` take a path and no argv on either arch (shell.rs: `match args.first()`), so a build feature is
+# the only channel a pin can travel down. The three land on the media as VUG.ELF / VUGC.ELF / VUGX.ELF —
+# all 8.3-clean, all in the FAT root beside STAT.ELF and PULSE.ELF.
+#
+# `--target-dir` keeps the three cargo builds apart: the feature set is part of the fingerprint, so a shared
+# directory would rebuild (and relink) the whole crate on every call, and a stale artifact could be picked
+# up by the objcopy of the NEXT image if a build ever failed after the first.
+build_one_vug_x86() {
+    local out="$1" feats="$2"
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
-    echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 mini-vug static-ELF program (crates/user-vug → target/VUG-X86.ELF)...${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 mini-vug static-ELF program (crates/user-vug${feats:+ [$feats]} → target/${out})...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-vug"
+    local tdir="${WORKSPACE_DIR}/crates/user-vug/target/x86${feats:+-$feats}"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" \
+      --target-dir "$tdir" ${feats:+--features "$feats"}
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
-      "${WORKSPACE_DIR}/crates/user-vug/target/x86_64-unknown-none/release/user-vug" \
-      "${WORKSPACE_DIR}/target/VUG-X86.ELF"
+      "${tdir}/x86_64-unknown-none/release/user-vug" \
+      "${WORKSPACE_DIR}/target/${out}"
     # The same four checks the x86 STAT build makes. The e_machine one is the load-bearing addition
     # over the aarch64 build: the loader rejects a wrong-arch image, and staging an aarch64 VUG.ELF on
     # x86 media would be a confusing bench failure rather than an obvious build failure.
-    [ -s "${WORKSPACE_DIR}/target/VUG-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF missing/empty — x86 VUG build failed${COLOR_RESET}"; exit 1; }
-    local vmag; vmag="$(head -c 4 "${WORKSPACE_DIR}/target/VUG-X86.ELF" | od -An -tx1 | tr -d ' \n')"
-    [ "$vmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF does not start with the ELF magic; first 4 bytes = ${vmag}${COLOR_RESET}"; exit 1; }
-    local vmach; vmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/VUG-X86.ELF" | tr -d ' \n')"
-    [ "$vmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF e_machine is ${vmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
-    local vsz; vsz="$(wc -c < "${WORKSPACE_DIR}/target/VUG-X86.ELF" | tr -d ' ')"
-    [ "$vsz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF ${vsz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
-    echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 mini-vug program: VUG-X86.ELF (${vsz} B)${COLOR_RESET}"
+    [ -s "${WORKSPACE_DIR}/target/${out}" ] || { echo -e "${COLOR_RED}ERROR: ${out} missing/empty — x86 VUG build failed${COLOR_RESET}"; exit 1; }
+    local vmag; vmag="$(head -c 4 "${WORKSPACE_DIR}/target/${out}" | od -An -tx1 | tr -d ' \n')"
+    [ "$vmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: ${out} does not start with the ELF magic; first 4 bytes = ${vmag}${COLOR_RESET}"; exit 1; }
+    local vmach; vmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/${out}" | tr -d ' \n')"
+    [ "$vmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: ${out} e_machine is ${vmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    local vsz; vsz="$(wc -c < "${WORKSPACE_DIR}/target/${out}" | tr -d ' ')"
+    [ "$vsz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: ${out} ${vsz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 mini-vug program: ${out} (${vsz} B)${COLOR_RESET}"
+}
+
+build_user_vug_x86() {
+    build_one_vug_x86 VUG-X86.ELF  ""
+    build_one_vug_x86 VUGC-X86.ELF "pinlo"
+    build_one_vug_x86 VUGX-X86.ELF "pinhi"
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).

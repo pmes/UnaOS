@@ -2993,6 +2993,82 @@
     path never reaches (overlay is `detached || interactive`), and no `[vugfps]` line appears in either
     QEMU log.
 
+- **VUGSCENE (the shard, as real 3D geometry)** — an **app-only** arc: `crates/user-vug`, its `arroyo`
+  build function, the builder's media staging, and this doc. No kernel file, no `wm.rs`, no syscall path,
+  and — the point of the arc — **no pacing machinery of any kind**. Peter's ruling on metal was that a lone
+  vug reads 999 fps because its drawing is trivial: *"make the damn drawing more complex instead of
+  pacing."* So the renderer got heavier and nothing else changed; the fps the meter reports is the honest
+  rate of a frame that now costs something.
+
+  - **What it draws.** A solid, faceted SHARD — the brand mark as geometry rather than as a wireframe
+    outline. An elongated hexagonal bipyramid with irregular girdle radii and asymmetric apexes, so it
+    reads as a broken shard and not a jeweller's stone; one orbiting light; flat per-facet shading with a
+    hard specular kick as a facet sweeps the light. The palette is **read from the menu bar's crystal**
+    (`video/menubar.rs::crystal_facet` -> `theme::CONTROL_CLOSE`/`CONTROL_MID`/`CONTROL_ZOOM`), so the
+    crystal on a vug window and the crystal in the bar are the same object family by construction rather
+    than by coincidence.
+
+  - **How, and why that method.** The shard is CONVEX, so it is exactly the intersection of **18
+    half-spaces** — and that representation is the whole renderer. There is no vertex list, no face list
+    and no projection on this path: each screen sample is a ray, clipped against the 18 slabs, keeping the
+    last plane it entered through. Convexity makes that answer **exact** hidden-surface removal, which is
+    what buys the arc a z-buffer it could not have afforded (a 128x128 depth buffer is 32 KiB against a
+    16 KiB user window) and a depth sort it does not need. The surface stays 128x128 — that is
+    `FB_WIN_MAX_W/H`, one 64 KiB window slot, and the ABI ceiling, not a choice.
+
+  - **The ladder is ray density, and it adapts.** Level 0 is the classic wireframe, byte for byte; levels
+    1-3 cast one ray per 4x4 cell, per 2x2 cell and per pixel, so cost scales 1:4:16. The program reads
+    its OWN achieved rate off `fps_refresh` — the meter's existing one-second window on `SYS_GETINFO`
+    ticks, no new syscall and no second clock — and steps the level to fit: below 24/s it falls (two rungs
+    at once if it is far under, so calibration finishes in a second or two), above 55/s it climbs. Two
+    hysteresis mechanisms, because one is not enough: a wide dead band, and a **ceiling** pinned by any
+    step down that relaxes one rung only after 8 quiet windows. **Adaptation changes work per frame and
+    never rate** — there is no sleep in this program and this arc adds none.
+
+  - **The level is visible.** A third readout joins fps and clicks in the corner band, in the gem ramp's
+    lit tone, and every change prints `[vuglod] lvl=<L*1000 + rate>` on the wire — so "which level did
+    that boot run at?" is answered from the panel and from the capture, not inferred from the fps.
+
+  - **Pinned images for benchmarking.** `bg`/`run` take a path and no argv on either arch
+    (`shell.rs`: `match args.first()`), so a pin has no runtime channel to travel down; it is a cargo
+    feature, and `arroyo` links the same source three times. **VUG.ELF** (adaptive, the default and what
+    the desktop launches), **VUGC.ELF** (`pinlo` — level 0 forever, the classic pattern, byte-honest so
+    old fps baselines stay comparable), **VUGX.ELF** (`pinhi` — the full shard forever, for measuring the
+    heaviest frame this program can draw). All three are 8.3-clean and staged on both the ESP and the
+    x86 data volume beside `STAT.ELF`/`PULSE.ELF`.
+
+  - **The 300-frame checksum is untouched, and by construction rather than by luck.** The scene is gated
+    on `overlay` (`detached || interactive`) — the same predicate that already gates the fps overlay — so
+    the foreground/no-input path that the checksum witness runs on renders level 0, the unmodified
+    wireframe, in every one of the three images. The one shared routine that changed shape is `fsin`,
+    whose 256-entry table became a 64-entry quarter table to buy `.text`; it was verified **bit-identical
+    for all 256 inputs** against the table it replaces, so `pi4-regression.spec`'s
+    `UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c` still holds.
+
+  - **Size — again the constraint that shaped the patch.** `.text` must end at or below `0x2000`; one byte
+    past it and `.bss` moves a page and the image jumps 4096 bytes through the 16384-byte gate. The
+    baseline was `0x1fcd` (51 bytes of headroom) and the scene needed ~3 KiB. What paid for it, measured
+    at each step: the quarter sine table (-508), an edge-function rasteriser abandoned for the ray/convex
+    tracer (-2000 against the same feature set), dropping in-pixel supersampling for a fourth rung (-346),
+    `u16` sine and plane-offset tables (-54), packing each facet's colour once instead of three channels
+    (-12) — and, the largest single item, **`fsin` marked `#[inline(never)]` (-432)**, because six inlined
+    copies of a table lookup with a branch is what a quarter table costs if you let it inline. Two
+    counter-intuitive results worth recording: a blanket `#[inline(never)]` on the cold start-up routines
+    made the image **larger** (+132), and so did hand-folding the ray basis LLVM was already folding
+    (+68). `opt-level` moved `"s"` -> `"z"` and that is a requirement, not a preference: the same source is
+    9534 bytes of `.text` at `"s"` and 8023 at `"z"`. Final `.text`: **0x1f57 (8023) adaptive, 0x17d6
+    (6102) `pinlo`, 0x1e8e (7822) `pinhi`, 0x1e33 (7731) aarch64** — all four under the cliff, all three
+    x86 images 12568 B, unchanged from before the arc.
+
+  - **Gates:** `./arroyo check` and `UNAOS_WC=1 ./arroyo check` green both arches, `user-vug` green on
+    both targets; all three x86 images build and pass `arroyo`'s four loader checks (present, ELF magic,
+    `e_machine = 0x3e`, <= 16384 B). Metal day — no QEMU legs, by operator order. **Next boot should show:**
+    the shard on glass in the menu bar's blues, tumbling, with a glint crossing its facets; `[wcn] rate=`
+    and the on-window readout settling to an honest number **below 999** that falls as the level rises;
+    `[vuglod] lvl=` naming the rung the machine settled on within the first second or two; and per-core
+    load reflecting real rendering rather than an idle spin. `bg /fat/VUGX.ELF` beside it should read
+    slower still, and `bg /fat/VUGC.ELF` should reproduce the old wireframe rate exactly.
+
 ### x86_64 (branch `hw-rmbp`)
 
 - **HEADROOM** — the ring-3 ceilings, raised coherently (Boot AL). `USER_SLOTS`
