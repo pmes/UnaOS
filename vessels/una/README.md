@@ -30,6 +30,38 @@ feature set. Una is the code-project vessel:
   unrecognized directory resolves to `Layout::Comms` (Topology left, Stream
   right). The genesis tree that `matrix` scans becomes the left Topology.
 
+## Invocation
+
+```
+una                     # workspace at the cwd
+una <dir>               # workspace at <dir>
+una <file>              # open <file>, workspace anchored at its parent
+una --console <file>    # open <file> in the read-only Console view, whatever it is named
+una --console           # open the newest console log Tabula can find
+una --edit <file>       # open <file> editable, even if it is named like a log
+```
+
+`--console` and `--edit` are opposites and cannot be combined; both force the
+treatment, overriding the name-based routing that a bare path (or a sidebar
+activation) uses. `--edit` exists because that routing is by filename: an
+operator's own `notes.log` would otherwise open read-only with no way back.
+
+A named file (or `--console`) **overrides** the Layout's choice of right pane:
+a console log lives on a mounted FAT volume or in a capture directory, neither
+of which resolves to a `Layout::Code` project, so the Editor is asked for
+explicitly and its `EditorState` is seeded before the first frame.
+
+`--console` is the Console app's first incarnation — Tabula opening a log,
+not a separate viewer. The log rendering rules (NUL padding, control bytes,
+size cap, read-only) live in `handlers/tabula`; see its
+[README](../../handlers/tabula/README.md). `--console` with no path resolves
+the newest log across mounted volumes and `~/unaos-bench/capture`; if there is
+none, `una` says so and exits rather than opening an empty window.
+
+Attempting Cmd+S on a Console view is refused by the document core and echoed
+to the console pane as `[una] <path> is a console log view — read-only, not
+saved`.
+
 ## Composed handlers
 
 Una binds the following handlers into a single workspace layout. Integration is
@@ -38,7 +70,7 @@ in bring-up; the table reflects current truth on the `UnaOS-unaide` branch.
 | Handler           | Role                                              | Status                                                                 |
 | ----------------- | ------------------------------------------------- | ---------------------------------------------------------------------- |
 | `handlers/matrix` | Files — workspace navigation, topology grafting.  | **Live.** Dependency wired; scans the genesis tree and serves the left Topology. |
-| `handlers/tabula` | Editor — document core, syntax highlighting.      | **Live (core).** Portable `TabulaDocument` core is wired; files load into the Editor pane. GTK view is feature-gated (`--features gtk`, off by default). |
+| `handlers/tabula` | Editor — document core, syntax highlighting, Console view. | **Live (core).** Portable `TabulaDocument` core is wired; files load into the Editor pane via `TabulaDocument::open`, which routes console/serial logs into the read-only Console view. GTK view is feature-gated (`--features gtk`, off by default). |
 | `handlers/midden` | Terminal — shell emulation, process management.   | Pure `Midden::execute()` core is ready; console pane wiring in flight (not yet a dependency). |
 | `handlers/aule`   | Builder — Cargo wrapper and task runner.          | Pure `Aule::forge()` / streamed-forge core is ready; not yet a dependency. |
 | `handlers/vaire`  | Version control — Git graph, diff view.           | Builds green on macOS (SMessage-ported); una integration pending.       |
