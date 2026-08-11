@@ -941,24 +941,40 @@ impl Screen {
         // x86 + `wc` only — `video::strip` is not compiled on aarch64, where this is the WC-I array
         // and the WC-I loop, byte for byte.
         let mut occ = [(0usize, 0usize, 0usize, 0usize); DESK_OCC_MAX];
+        // SHELLDESK REVIEW — **and aarch64 REALLY IS the WC-I loop, which took a second arm to make
+        // true.** The single-arm version staged `occluders` into its own `wins` array and
+        // `copy_from_slice`'d it into `occ`, because `occluders` takes `&mut [_; MAX_WINDOWS]` and
+        // `occ` is `DESK_OCC_MAX` wide. On x86 that staging buys the furniture tail its room. On
+        // aarch64 `DESK_STRIP_MAX` is `0`, so `DESK_OCC_MAX == MAX_WINDOWS` and the two arrays are the
+        // SAME TYPE — the copy was pure overhead on a path the arm-pi bench build runs for every
+        // full-screen VUG present, and the doc above promised "the WC-I array and the WC-I loop, byte
+        // for byte". Measured: +212 bytes of aarch64 `.text` against the base, with `.data`/`.bss`
+        // unchanged and `Console::page_rows` identical at 0x78 — i.e. the whole delta was here.
+        // Written as two cfg arms, so the platform with no furniture fills `occ` in place exactly as
+        // it always did and the promise is kept by construction rather than by assertion.
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
         let (nocc, nwin) = {
             // `occluders` writes exactly `MAX_WINDOWS` slots; the furniture tail is appended after.
             let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
             let nw = super::wm::occluders(&mut wins);
             occ[..nw].copy_from_slice(&wins[..nw]);
             let mut n = nw;
-            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-            {
-                let mut strips = [None; super::strip::STRIP_MAX];
-                let _ = super::strip::rects(self.info.width, self.info.height, &mut strips);
-                for s in strips.iter().flatten() {
-                    if s.2 != 0 && s.3 != 0 && n < occ.len() {
-                        occ[n] = *s;
-                        n += 1;
-                    }
+            let mut strips = [None; super::strip::STRIP_MAX];
+            let _ = super::strip::rects(self.info.width, self.info.height, &mut strips);
+            for s in strips.iter().flatten() {
+                if s.2 != 0 && s.3 != 0 && n < occ.len() {
+                    occ[n] = *s;
+                    n += 1;
                 }
             }
             (n, nw)
+        };
+        #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+        let (nocc, nwin) = {
+            // `DESK_OCC_MAX == wm::MAX_WINDOWS` here (no strip registry is compiled), so this is the
+            // WC-I call on the WC-I array, unchanged.
+            let n = super::wm::occluders(&mut occ);
+            (n, n)
         };
         let occ = &occ[..nocc];
         // SHELLDESK REVIEW — **the WINDOW PREFIX, and it is a separate slice on purpose.**

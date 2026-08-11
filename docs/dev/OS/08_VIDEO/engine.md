@@ -2057,6 +2057,16 @@ Four defects were fixed on this branch. Two were in the arc's own code:
   move the mouse would have held the bar enabled, its rows withheld from the desktop, and the bar
   never painted. `wcx::activate` now composites at the enable seam (`[wc-x] menubar PAINTED`).
 
+* **aarch64 was NOT "the WC-I loop, byte for byte", as the code claimed.** To append the furniture
+  tail the occluder walk staged `wm::occluders` into its own array and `copy_from_slice`'d it into the
+  wider one — necessary on x86, pure overhead on aarch64, where `DESK_STRIP_MAX` is `0`, the two
+  arrays are the same type, and `present_background` is the arm-pi bench build's full-screen VUG
+  present. **Measured** rather than argued: building the aarch64 lib at `3bc0ead0` and at the arc tip
+  with `witness,baremetal,vugpar` gave `.text` 1 662 397 → 1 662 609, **+212 bytes**, with `.data`
+  (57 478) and `.bss` (6 313 958) unchanged and `Console::page_rows` identical at `0x78` — so the
+  whole delta was this copy, not the console layout change. Split into two cfg arms; the platform with
+  no furniture fills the array in place as it always did, and `.text` comes back to 1 662 401 (**+4**).
+
 Two were in the spec: the `bar=0` FORBID was dropped without replacing the relation it carried, so the
 prose's claim that registry health "is still pinned by `bars=`" was unbacked — `FORBID … bars=0/[0-9]
 bar=[1-9]` states the relation instead of the value and holds under both readings; and two paragraphs
