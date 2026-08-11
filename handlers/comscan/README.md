@@ -55,6 +55,16 @@ bridge (`libs/quartzite/src/tetra.rs`); wiring the variant and its GTK/AppKit
 widget belongs with the vessel arc, out of this handler's lane. The handler,
 events, state, and tests have landed; the on-glass widget is the follow-up.
 
+**This tile is how you summon the Console — not a command-line flag.** The
+correct way to open a log is a desktop tile that summons this app, the way
+macOS opens `Console.app`; it is emphatically not `una --console`. Those flags
+have been removed (a Unix-style flag to open a log is the wrong idiom for a
+spatial facade OS). Until the `ViewEntity::Console` tile lands, the static-file
+stand-in is `handlers/tabula`'s `logview` renderer, reached read-only by opening
+a log path in `una` (`una <log>`); the newest-log discovery seam the tile will
+reuse is `tabula::default_console_log`. The live/tailing feed here is the richer,
+metal-facing successor to that static view.
+
 Proofs live in `tests/console.rs` (bounded scrollback, live tail, pause/resume,
 text + source filters, the `serve` bus round-trip) and in the `kat_logs_*`
 golden KATs in `libs/bandy/tests/smessage_kats.rs` (the frozen wire shape).

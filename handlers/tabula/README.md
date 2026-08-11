@@ -56,10 +56,17 @@ specific ways. Each is handled:
 | Invalid UTF-8 | A byte mangled on the cable must not cost the whole file. | Decoded lossily; `LogText::lossy` records that it happened. |
 | Unbounded size | The recorder is MBs-capable and a bench capture grows all session. | Loads are capped at `DEFAULT_MAX_BYTES` (4 MiB) keeping the **tail**, with a `:: TABULA: log truncated …` banner naming the elided and kept byte counts. The cap is applied to the log, *after* the padding trim, so a reservation cannot spend the budget on its own zeros; the kept region is advanced to the next line break only when that leaves something to show, so a single enormous line still opens (mid-line) instead of rendering as an empty buffer. |
 
-A log document is **read-only by construction**: its buffer is a *rendering*
-of the file, not the file, so writing it back would destroy the record.
-`TabulaDocument::read_only` is set, `set_buffer` is inert, and `save()` returns
-`PermissionDenied`.
+A log document is **read-only by construction**, and the deeper reason is
+*ownership*, not a rendering nicety. On the shard the kernel flight recorder
+writes `UNAOS.LOG` as **root**; the UnaFS ownership ACL (`acl-<lba>-<off>` rows
+carrying `owner`/`grants:*` — see [`docs/SECURITY.md`](../../docs/SECURITY.md))
+refuses any write from a user-owned vessel, full stop. A user app *cannot* write
+that log, so an app-level "editable" mode for it would be a lie.
+`TabulaDocument::read_only` **mirrors** that filesystem fact for the host viewer:
+it is set, `set_buffer` is inert, and `save()` returns `PermissionDenied`. (The
+rendering fidelity point still stands on top — the buffer is a *rendering* of the
+file, padding trimmed and control bytes made visible, so writing it back would
+destroy the record even for a log an operator did own.)
 
 The API in `src/logview.rs`:
 
@@ -82,24 +89,29 @@ call — it routes log paths to `load_log` and everything else to `load`.
 
 ### Operator flow
 
-The `una` vessel exposes this as:
+The `una` vessel exposes this with **no flags** — a log is a path you open, not
+a mode you type:
 
 ```
-una <file>              # open any file, workspace anchored beside it
-una --console <file>    # open a named file in the Console view, whatever it is called
-una --console           # open the newest log Tabula can find
-una --edit <file>       # open <file> editable, even if it is named like a log
+una <file>     # open any file, workspace anchored beside it
 ```
 
-…and activating a `.log` / `UNAOS.LOG` / `*.out` in una's sidebar takes the
-same path. `--console` with an explicit path is what reads a shard's flight
-recorder after the card is mounted on the host; `--console` bare is the
-"just show me the console" affordance.
+A `.log` / `UNAOS.LOG` / `*.out` path routes through `TabulaDocument::open` to
+the read-only Console view; anything else opens editable. Activating one in
+una's sidebar takes the same path. This is what reads a shard's flight recorder
+after the card is mounted on the host.
 
-`--edit` is the escape hatch out of name-based routing: an operator's own
-`notes.log` is a file they wrote, and `--edit` opens it in the ordinary
-editable view. Sidebar activation has no per-file override yet — that needs a
-read-only flag in `bandy`'s `EditorState`, which is outside this handler.
+There is deliberately no `--edit` escape hatch: name-based routing sends a log to
+the read-only view because a log *is* read-only — on the shard it is root-owned
+and the ACL denies writes (above), so "open it editable" is not a capability the
+filesystem grants. An operator's own `notes.log` that they truly own is the
+narrow edge this trades away; it is worth it not to pretend the app decides
+writability.
+
+Opening the **newest** log without naming a file is not `una`'s job either — it
+belongs to the Console app tile (`handlers/comscan`, the future
+`ViewEntity::Console`). The discovery seam it reuses lives here:
+`default_console_log()` (below). `una` no longer wires that to any flag.
 
 ### Tests
 
