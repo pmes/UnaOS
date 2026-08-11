@@ -243,6 +243,11 @@ fn main() {
     if std::env::var("UNAOS_KEPLER").is_ok() { feats.push("nvidia-kepler"); }
     if std::env::var("UNAOS_KEPLER_TAKEOVER").is_ok() { feats.push("nvidia-kepler-takeover"); }
     if std::env::var("UNAOS_KEPLER_FIFO").is_ok() { feats.push("nvidia-kepler-fifo"); }
+    // CE-LADDER: UNAOS_KEPLER_CE=1 arms the read-only copy-engine reconnaissance
+    // (drivers/gpu/kepler_ce.rs). THIS list is what reaches the kernel binary for MEDIA
+    // builds — a knob wired into arroyo alone would ship the ladder DISABLED while the
+    // banner claims it is on (the s42/INSTGUI and WXN-M3b failure). Kept in sync with arroyo.
+    if std::env::var("UNAOS_KEPLER_CE").is_ok() { feats.push("nvidia-kepler-ce"); }
     if std::env::var("UNAOS_KDISP_HOLD").is_ok() { feats.push("nvidia-kepler-kdisp-hold"); }
     // WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/wcx.rs) — activated
     // at the END of the Kepler takeover seam, after `fbcon::panel_console_resume`. x86_64-only
