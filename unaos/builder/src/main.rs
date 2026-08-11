@@ -275,6 +275,12 @@ fn main() {
     // unaos_ivb rides the same knob: it adds the teardown-trace fields to the SHARED BootInfo
     // struct, so kernel and bootloader must agree on it (see the bootloader build below).
     if std::env::var("UNAOS_IVB").is_ok() { feats.push("intel-ivb"); feats.push("unaos_ivb"); }
+    // GEN7-3D: UNAOS_IVB3D=1 arms the Ivy Bridge render-engine reconnaissance rung R1
+    // (drivers/gpu/gen7.rs) — READ-ONLY, zero MMIO/config writes, no display register.
+    // Kept in sync with arroyo's mapping: the builder REBUILDS the kernel for media, so a
+    // knob armed only in arroyo ships the rung absent while the banner says otherwise —
+    // the s42/INSTGUI failure, and the reason this leg is not optional.
+    if std::env::var("UNAOS_IVB3D").is_ok() { feats.push("gen7"); }
     // GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the integrated GPU with an
     // unwind-stack restore on the same call stack (round 13 removed the timed auto-revert).
     // Kept in sync with arroyo's mapping — the builder rebuilds the kernel, so a knob

@@ -553,6 +553,21 @@ pub fn init(gpu: &GpuInfo) {
             }
         }
 
+        // GEN7-3D rung R1 — read-only render-engine reconnaissance (UNAOS_IVB3D).
+        // Placed HERE, above `bring_up_blt_ring`, deliberately: the rung's GGTT census must
+        // see FIRMWARE's page tables, not ours. `bring_up_blt_ring` writes a GGTT PTE when
+        // it does not refuse, and a census taken after it would be reading our own footprint
+        // and calling it a finding. Read-only, and it cannot black the panel: it writes
+        // nothing. (Precisely: reads only. It does touch ONE display-block offset —
+        // PCH_PP_CONTROL, read as a control-frame witness because the PPS sits outside the
+        // GT power well — and it never writes it.)
+        //
+        // The cfg is `all(target_arch = "x86_64", feature = "gen7")`, not `feature` alone:
+        // that pair is what makes "gen7 emits not one byte of aarch64 code" a property of
+        // the SOURCE, and it is what `arroyo`'s `arm_features` strip comment asserts.
+        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
+        super::gen7::recon(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func);
+
         // BLT ring bring-up. SEAT FIXUP (review round 2): an ACCELERATOR must degrade, never kill
         // the boot — every refusal below breaks out of this block, the ring simply never comes up,
         // `blitter_*` return false, and the CPU path carries the console exactly as before this
