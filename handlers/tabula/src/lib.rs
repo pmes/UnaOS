@@ -43,6 +43,9 @@ pub enum EditorMode {
 pub struct TabulaView {
     pub view: SourceView,
     container: ScrolledWindow,
+    /// The mode this view was built in — kept so `load_file` can restore the
+    /// view after `load_log` has put it in the read-only Console treatment.
+    mode: EditorMode,
 }
 
 #[cfg(feature = "gtk")]
@@ -85,7 +88,11 @@ impl TabulaView {
             .vexpand(true)
             .build();
 
-        Self { view, container }
+        Self {
+            view,
+            container,
+            mode,
+        }
     }
 
     pub fn widget(&self) -> Widget {
@@ -107,6 +114,20 @@ impl TabulaView {
             .buffer()
             .downcast::<sourceview5::Buffer>()
             .unwrap();
+
+        // Undo what a previous `load_log` did to this view: the Console
+        // treatment is per-file, and a view that opened a log once must not
+        // stay uneditable for every source file after it. A view built in
+        // `EditorMode::Log` was uneditable to begin with and stays that way.
+        if !matches!(self.mode, EditorMode::Log) {
+            self.view.set_editable(true);
+            self.view.set_wrap_mode(match self.mode {
+                EditorMode::Prose => gtk4::WrapMode::WordChar,
+                _ => gtk4::WrapMode::None,
+            });
+            self.view
+                .set_monospace(!matches!(self.mode, EditorMode::Prose));
+        }
 
         // Auto-detect language based on extension
         if let Some(ext) = path.extension().and_then(|s| s.to_str()) {

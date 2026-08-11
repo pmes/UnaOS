@@ -36,9 +36,15 @@ feature set. Una is the code-project vessel:
 una                     # workspace at the cwd
 una <dir>               # workspace at <dir>
 una <file>              # open <file>, workspace anchored at its parent
-una --console <file>    # open a console/serial log in the read-only Console view
+una --console <file>    # open <file> in the read-only Console view, whatever it is named
 una --console           # open the newest console log Tabula can find
+una --edit <file>       # open <file> editable, even if it is named like a log
 ```
+
+`--console` and `--edit` are opposites and cannot be combined; both force the
+treatment, overriding the name-based routing that a bare path (or a sidebar
+activation) uses. `--edit` exists because that routing is by filename: an
+operator's own `notes.log` would otherwise open read-only with no way back.
 
 A named file (or `--console`) **overrides** the Layout's choice of right pane:
 a console log lives on a mounted FAT volume or in a capture directory, neither

@@ -45,22 +45,39 @@ use std::sync::{Arc, RwLock};
 
 const APP_ID: &str = "org.unaos.UnaIDE";
 
-/// Resolve the command line into `(workspace_root, file_to_open)`.
+/// How the path on the command line should be opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAs {
+    /// Decide from the name: logs to the Console view, everything else to the
+    /// editor. What a sidebar activation does too.
+    Auto,
+    /// `--console`: the read-only Console view, whatever the file is called.
+    Console,
+    /// `--edit`: the ordinary editable view, whatever the file is called.
+    /// The escape hatch for an operator's own `notes.log`, which name-based
+    /// routing would otherwise open read-only.
+    Edit,
+}
+
+/// Resolve the command line into `(workspace_root, file_to_open, how)`.
 ///
 /// Split out from `main` and free of any GUI dependency so the argument
 /// grammar — in particular the Console view's `--console` — is unit-testable.
 /// `--console` with no path resolves the newest console log Tabula can find
 /// (mounted volumes first, then the bench capture tree); failing to find one
-/// is an error rather than a silently empty window.
+/// is an error rather than a silently empty window. `--edit PATH` is its
+/// inverse: open PATH editable even if it is named like a log.
 fn parse_args<I: IntoIterator<Item = String>>(
     args: I,
-) -> Result<(Option<std::path::PathBuf>, Option<std::path::PathBuf>), String> {
+) -> Result<(Option<std::path::PathBuf>, Option<std::path::PathBuf>, OpenAs), String> {
     let mut console = false;
+    let mut edit = false;
     let mut positional: Option<String> = None;
 
     for arg in args {
         match arg.as_str() {
             "--console" => console = true,
+            "--edit" => edit = true,
             a if a.starts_with('-') => return Err(format!("unknown option {:?}", a)),
             a => {
                 if positional.is_some() {
@@ -69,6 +86,10 @@ fn parse_args<I: IntoIterator<Item = String>>(
                 positional = Some(a.to_string());
             }
         }
+    }
+
+    if console && edit {
+        return Err("--console and --edit are opposites; give one".to_string());
     }
 
     let open = if console {
@@ -82,9 +103,19 @@ fn parse_args<I: IntoIterator<Item = String>>(
     } else {
         match positional.map(std::path::PathBuf::from) {
             // A directory argument is a workspace root, not a file to open.
-            Some(p) if p.is_dir() => return Ok((Some(p), None)),
+            Some(p) if p.is_dir() => {
+                if edit {
+                    return Err("--edit needs a file, not a directory".to_string());
+                }
+                return Ok((Some(p), None, OpenAs::Auto));
+            }
             Some(p) => p,
-            None => return Ok((None, None)),
+            None => {
+                if edit {
+                    return Err("--edit needs a PATH".to_string());
+                }
+                return Ok((None, None, OpenAs::Auto));
+            }
         }
     };
 
@@ -96,7 +127,12 @@ fn parse_args<I: IntoIterator<Item = String>>(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.to_path_buf());
-    Ok((root, Some(open)))
+    let how = match (console, edit) {
+        (true, _) => OpenAs::Console,
+        (_, true) => OpenAs::Edit,
+        _ => OpenAs::Auto,
+    };
+    Ok((root, Some(open), how))
 }
 
 fn main() {
@@ -139,15 +175,17 @@ fn main() {
     //       una --console [<file>]  — the Console view: <file>, or the newest
     //                                 console log found on any mounted volume
     //                                 or in the bench capture tree
+    //       una --edit <file>       — the editable view, even for a file
+    //                                 named like a log (`notes.log`)
     //
     //     A console log is not a workspace member — it lives on the shard's
     //     FAT volume once the card is mounted, or in a capture directory — so
     //     the flow is "open this path", not "browse to it in the sidebar".
-    let (root_arg, open_arg) = match parse_args(std::env::args().skip(1)) {
-        Ok(pair) => pair,
+    let (root_arg, open_arg, open_as) = match parse_args(std::env::args().skip(1)) {
+        Ok(triple) => triple,
         Err(msg) => {
             eprintln!("[UNA] {}", msg);
-            eprintln!("usage: una [--console] [PATH]");
+            eprintln!("usage: una [--console | --edit] [PATH]");
             std::process::exit(2);
         }
     };
@@ -195,7 +233,14 @@ fn main() {
     //     `EditorState` here — rather than firing `EditorLoad` after
     //     `UiReady` — puts the text in the FIRST frame.
     let initial_document = open_arg.as_ref().and_then(|path| {
-        match tabula::TabulaDocument::open(path) {
+        // `--console` forces the log renderer even when the name does not say
+        // "log"; `--edit` forces the plain editor even when it does.
+        let opened = match open_as {
+            OpenAs::Console => tabula::TabulaDocument::load_log(path),
+            OpenAs::Edit => tabula::TabulaDocument::load(path),
+            OpenAs::Auto => tabula::TabulaDocument::open(path),
+        };
+        match opened {
             Ok(doc) => {
                 println!(
                     "[UNA] Opened {} ({} byte(s){})",
@@ -463,10 +508,9 @@ fn main() {
     });
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::parse_args;
+    use super::{parse_args, OpenAs};
     use std::path::PathBuf;
 
     fn args(v: &[&str]) -> Vec<String> {
@@ -485,14 +529,14 @@ mod tests {
 
     #[test]
     fn no_arguments_means_cwd_and_nothing_open() {
-        assert_eq!(parse_args(args(&[])).unwrap(), (None, None));
+        assert_eq!(parse_args(args(&[])).unwrap(), (None, None, OpenAs::Auto));
     }
 
     #[test]
     fn a_directory_is_a_workspace_root() {
         let d = scratch("dir");
         let got = parse_args(args(&[d.to_str().unwrap()])).unwrap();
-        assert_eq!(got, (Some(d.clone()), None));
+        assert_eq!(got, (Some(d.clone()), None, OpenAs::Auto));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -501,9 +545,10 @@ mod tests {
         let d = scratch("file");
         let f = d.join("UNAOS.LOG");
         std::fs::write(&f, b":: log ::\n").unwrap();
-        let (root, open) = parse_args(args(&[f.to_str().unwrap()])).unwrap();
+        let (root, open, how) = parse_args(args(&[f.to_str().unwrap()])).unwrap();
         assert_eq!(root.as_deref(), Some(d.as_path()));
         assert_eq!(open.as_deref(), Some(f.as_path()));
+        assert_eq!(how, OpenAs::Auto);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -512,9 +557,29 @@ mod tests {
         let d = scratch("console");
         let f = d.join("ttyUSB0.log");
         std::fs::write(&f, b"line\n").unwrap();
-        let (root, open) = parse_args(args(&["--console", f.to_str().unwrap()])).unwrap();
+        let (root, open, how) = parse_args(args(&["--console", f.to_str().unwrap()])).unwrap();
         assert_eq!(root.as_deref(), Some(d.as_path()));
         assert_eq!(open.as_deref(), Some(f.as_path()));
+        assert_eq!(how, OpenAs::Console);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The escape hatch: name-based routing sends `notes.log` to the read-only
+    /// Console view, and an operator who wrote that file needs a way back.
+    #[test]
+    fn edit_forces_the_editable_view_for_a_log_named_file() {
+        let d = scratch("edit");
+        let f = d.join("notes.log");
+        std::fs::write(&f, b"my own notes\n").unwrap();
+        let (root, open, how) = parse_args(args(&["--edit", f.to_str().unwrap()])).unwrap();
+        assert_eq!(root.as_deref(), Some(d.as_path()));
+        assert_eq!(open.as_deref(), Some(f.as_path()));
+        assert_eq!(how, OpenAs::Edit);
+        // The two flags are opposites and cannot both be given.
+        assert!(parse_args(args(&["--edit", "--console", f.to_str().unwrap()])).is_err());
+        // `--edit` needs something to edit.
+        assert!(parse_args(args(&["--edit"])).is_err());
+        assert!(parse_args(args(&["--edit", d.to_str().unwrap()])).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
