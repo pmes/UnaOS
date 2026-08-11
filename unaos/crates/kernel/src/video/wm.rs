@@ -8222,6 +8222,22 @@ fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
 /// `bw >= CLUSTER_MIN_BOX_W` is exactly `w * scale >= CLUSTER_MIN_SRC_W`. 158 px at the current
 /// metrics. It existed as an inline sum in one place and as prose in three; the witness below puts
 /// it on the wire, so it needs a single symbol that cannot drift from the test that uses it.
+///
+/// ### WMMINW — what the tiler's first column now rests on
+/// Since [`min_width_scale`] makes this a FLOOR on every laid-out box rather than merely a threshold
+/// the painter tests, `place`'s wrap rule inherits an assumption worth stating: its test is
+/// `cx + bw > pw && cx > GAP`, so the FIRST column never wraps — a box wider than the panel is left
+/// where it is and runs off the right edge. Every tiled box is now at least `CLUSTER_MIN_BOX_W`
+/// wide, so the tiler's first column is on-panel exactly when
+///
+/// ```text
+/// pw > CLUSTER_MIN_BOX_W + GAP     = 158 + 12 = 170 px
+/// ```
+///
+/// which no panel this kernel runs on comes near failing: the smallest is the 640x480 QEMU gate
+/// surface, 3.8x the bound, and the bench panels are 1920 and 2880. It is recorded because it is an
+/// assumption the floor CREATED — before it, a narrow panel simply got narrow windows — and a future
+/// embedded surface under 170 px wide would break the tiler rather than the clamp.
 pub const CLUSTER_MIN_BOX_W: usize = 2 * BORDER + CLUSTER_MIN_SRC_W;
 
 /// CTRLWIT — the decline witness's per-window state. `UNSEEN -> PENDING -> SPOKEN`, and the id is
@@ -8609,10 +8625,15 @@ pub fn minimise(id: WinId) -> &'static str {
 /// large panel a small surface will NOT fill the work area, because filling it would mean a
 /// nearest-neighbour blow-up past what the kit calls legible. Zoom means "as large as this system is
 /// willing to draw it", not "stretched to the glass".
+///
+/// WMMINW — and it is [`fit_scale`] under the cap, then the MINIMUM-WIDTH floor. A maximised window
+/// with no control cluster would be the absurd case of the band this arc closes: the floor can only
+/// ever raise a scale, and here it is raising one that the fit rule has already bounded, so the
+/// `min`/`max` order is not a race between two policies — the floor is itself capped by the fit.
 fn zoom_scale(pw: usize, usable_h: usize, ph: usize, w: usize, h: usize) -> usize {
-    let sw = pw.saturating_sub(2 * BORDER) / w.max(1);
-    let sh = usable_h.saturating_sub(TITLE_H + 2 * BORDER) / h.max(1);
-    sw.min(sh).min(legibility_cap(ph)).max(1)
+    fit_scale(pw, usable_h, w, h)
+        .min(legibility_cap(ph))
+        .max(min_width_scale(pw, usable_h, w, h))
 }
 
 /// WMCTRL — **ZOOM `id`: maximise to the work area, or restore the placement it had before.**
@@ -11982,6 +12003,35 @@ fn create_inner(
     row.z = z;
     row.damage_all();
     row.compat = compat;
+    // WMMINW — **the floor reaches the BIRTH DEFAULT, not only the layout rules.** A create that
+    // lands while the framebuffer is not ready publishes the row at `Window::empty`'s `scale = 1`
+    // and NOTHING revisits it: the `place` below early-returns on `!is_ready()`, and `place` has
+    // exactly three call sites (`close`, `close_owner`, here), so a boot that creates a window
+    // before the panel is attached and then neither creates nor closes another leaves that row at
+    // `bw = w + 2*BORDER` — inside the band this arc closes — for the rest of the boot.
+    //
+    // The seed is [`cluster_min_scale`] and NOT the full [`min_width_scale`], because the bounded
+    // form needs a panel and there is not one yet: with no framebuffer there is no glass for the
+    // window to run off, and no pass can composite the row until one exists. It is bounded in the
+    // only way available — `ceil(CLUSTER_MIN_SRC_W / w)`, at most `CLUSTER_MIN_SRC_W` itself for a
+    // 1-px-wide surface — and it is SUPERSEDED, not merely trusted: the moment any layout pass runs
+    // against a real panel (this function's own `place`, or the next create or close) the row is
+    // unpinned and takes `place_scale`'s fit-bounded, stand-down-aware answer instead.
+    //
+    // Chosen over the two alternatives the review named. Re-tiling from the READINESS PATH is the
+    // better fix and is out of this arc's lane: `WRITER` is attached in `main.rs` (and re-attached
+    // there after the Kepler takeover, `main.rs:1873`), and `wm` has no readiness callback to hang
+    // a `place` + `reclaim` on — the hook belongs to whoever owns that path, and this comment is
+    // the record that it is owed. REFUSING the create until the panel is ready was rejected
+    // outright: `create` succeeding before video is up is relied on across the boot, and a
+    // fail-closed `WIN_NONE` there would trade a cosmetic band for a lost window.
+    //
+    // Compat rows are exempt for the same reason they are exempt everywhere else in this arc: they
+    // draw no chrome, `controls` declines them by policy, and `compat_present` overwrites this
+    // field with the caller's own scale in its second critical section.
+    if !compat {
+        row.scale = cluster_min_scale(w);
+    }
     row.title_len = title.len().min(MAX_TITLE);
     row.title[..row.title_len].copy_from_slice(&title[..row.title_len]);
     // SPAWN-PLACE — the row is born at its final geometry and PINNED, so the `place` below skips it
@@ -12132,9 +12182,17 @@ const GAP: usize = super::theme::GAP;
 /// window is one of several and wants to be as *readable* as it can be.
 ///
 /// Effect on the existing witness geometry (nothing here perturbs a checksum — `cksum` is FNV over the
-/// SOURCE `surf_len`, which no scale change touches): on the 640x480 gate panel the 128x128 window stays
-/// 1x and the 64x64 stays 3x, both already under the cap; on the 1920x1200 bench panel the 128x128 window
+/// SOURCE `surf_len`, which no scale change touches): on the 640x480 gate panel the 128x128 window sits
+/// at 1x and the 64x64 at 3x, both already under the cap; on the 1920x1200 bench panel the 128x128 window
 /// stays 4x, the 64x64 comes down 9x → 4x, and the 24x16 comes down 37x → 4x.
+///
+/// WMMINW — **and this cap is no longer the last word.** [`place_scale`] applies the control-cluster
+/// width floor AFTER it, and the floor may raise a scale this function has just lowered — deliberately,
+/// because a window too narrow to carry its close/minimise/zoom controls is a worse defect than a
+/// blocky upscale. Two of the four numbers above move as a result: the gate panel's 128x128 window
+/// lands at 2x (1x gave a 138-px box, inside the band the floor closes) and the bench panel's 24x16
+/// readout at 7x rather than this cap's 4x (`ceil(148/24)` = 7, a 168-px box). The other two are
+/// already wide enough at the cap and are untouched. See [`min_width_scale`].
 fn legibility_cap(ph: usize) -> usize {
     crate::ui::SCALE_MAX
         .saturating_mul(crate::ui::Metrics::for_height(ph).scale)
@@ -12149,17 +12207,93 @@ fn legibility_cap(ph: usize) -> usize {
 ///
 /// Scale rule: the largest integer factor whose scaled surface fits half the panel width and half its
 /// height — big enough that a 32x32 surface is legible on a 1920-wide panel, small enough that two
-/// windows sit side-by-side — **capped by [`legibility_cap`]**. Never 0.
+/// windows sit side-by-side — **capped by [`legibility_cap`]**, and then **raised if it is under the
+/// control-cluster width floor** ([`min_width_scale`]). Never 0.
 /// The tiler's SCALE RULE, factored out so [`spawn_geometry`] answers with the layout's own value
-/// rather than a second copy of it: the largest integer factor whose scaled surface fits half the
-/// panel width and half the layout area's height, capped by [`legibility_cap`], never 0. `usable_h`
-/// is derived here exactly as [`place`] derives it (PULSE-2's bottom-chrome reservation).
+/// rather than a second copy of it. `usable_h` is derived here exactly as [`place`] derives it
+/// (PULSE-2's bottom-chrome reservation).
+///
+/// WMMINW — the rule is therefore no longer "fit, then cap": it is **fit, cap, THEN FLOOR**, and the
+/// floor is the only one of the three that can raise the answer. On the 640x480 gate panel the
+/// 128x128 window goes 1x -> 2x (its box was 138 px, inside the band); on the 1920x1200 bench panel
+/// midden's 24x16 readout goes 4x -> 7x (`ceil(148/24)`, box 168 px). Everything already wide enough
+/// is untouched — the 64x64 window stays 3x on the gate panel and 4x on the bench.
 fn place_scale(pw: usize, ph: usize, w: usize, h: usize) -> usize {
     let usable_h = ph.saturating_sub(crate::ui_status::chrome_h(ph)).max(1);
     (pw / 2 / w.max(1))
         .min(usable_h / 2 / h.max(1))
         .min(legibility_cap(ph))
         .max(1)
+        // WMMINW — the minimum-width floor, applied LAST so it wins over both the fit rule and the
+        // legibility cap. `w.max(1)` for the same reason every other term here carries it: a zero
+        // width reaches this function through `spawn_geometry`, and `ceil(148/0)` would otherwise
+        // be answered `148`. See [`min_width_scale`].
+        .max(min_width_scale(pw, usable_h, w.max(1), h.max(1)))
+}
+
+/// WMMINW — the largest integer upscale whose CHROME-INCLUSIVE outer box still fits a `pw x usable_h`
+/// work area, never 0. Factored out of [`zoom_scale`] because the minimum-width floor needs the same
+/// question answered ("how big may this window get before it leaves the glass?") and a second copy of
+/// it would be a second chance for the two to disagree.
+fn fit_scale(pw: usize, usable_h: usize, w: usize, h: usize) -> usize {
+    let sw = pw.saturating_sub(2 * BORDER) / w.max(1);
+    let sh = usable_h.saturating_sub(TITLE_H + 2 * BORDER) / h.max(1);
+    sw.min(sh).max(1)
+}
+
+/// WMMINW — the smallest integer upscale at which a `w`-wide SOURCE reaches the control-cluster
+/// floor: `ceil(CLUSTER_MIN_SRC_W / w)`, never 0.
+///
+/// `ceil` and not `floor`, because the floor is a `>=`: at `w = 32` the exact quotient is 4.625 and
+/// scale 4 gives a 128-px content strip, 20 px short of [`CLUSTER_MIN_SRC_W`]. Rounding down here
+/// would leave the window one step inside the very band this exists to close.
+fn cluster_min_scale(w: usize) -> usize {
+    CLUSTER_MIN_SRC_W.div_ceil(w.max(1)).max(1)
+}
+
+/// WMMINW — **the MINIMUM WINDOW WIDTH, as a scale floor.** Peter's ruling, 2026-08-11: no window is
+/// laid out narrower than [`CLUSTER_MIN_BOX_W`] (158 px at the current metrics), so the band in which
+/// a window silently loses its whole titlebar control cluster CANNOT EXIST.
+///
+/// ### Why a scale floor rather than a width clamp
+/// A window's outer box is `w * scale + 2*BORDER`, and `w` is the APP's surface: the kernel resizing
+/// it under a running program would be a read past a mapping (the same argument [`zoom`] makes for
+/// leaving `w`/`h`/`stride` alone). `scale` is the kernel's own number and the only one it may move,
+/// so the floor is expressed there — `w * scale >= CLUSTER_MIN_SRC_W` is exactly
+/// `bw >= CLUSTER_MIN_BOX_W`, the `2*BORDER` cancelling on both sides.
+///
+/// ### It wins over the legibility cap
+/// Applied with a `max` after [`legibility_cap`], so a small surface is drawn BIGGER than the cap
+/// would like rather than losing its close, minimise and zoom controls — an affordance the operator
+/// cannot reach is a worse legibility defect than a blocky upscale.
+///
+/// ### An UNREACHABLE floor is NO floor — it is not a smaller floor
+/// For a surface thin and tall enough that no on-glass scale reaches [`CLUSTER_MIN_SRC_W`] source
+/// pixels of width (32x300 on a 1920x1200 panel: the height caps the scale at 3 and the box at
+/// 106 px, while the cluster wants 5), the clamp STANDS DOWN and returns 1 — it does not fall back
+/// to [`fit_scale`].
+///
+/// The first cut wrote `cluster_min_scale(w).min(fit_scale(..))`, and the review convicted it: a
+/// `min` does not stand down, it REPLACES the unreachable floor with the full-panel-fit maximiser,
+/// and the `max` at both call sites then promotes the window to it. That 32x300 surface went scale
+/// 1 -> 3, an outer box of 42x344 -> 106x944 — 84 % of the work area, `legibility_cap` defeated —
+/// and STILL no control cluster, because 106 < 158. The window ends up neither narrow nor
+/// controlled: the trade this doc claimed to make ("no cluster, or mostly off the panel") was not
+/// the trade the code made, which was "no cluster AND mostly the panel", for nothing.
+///
+/// So the unreachable case leaves the layout exactly as it was before this clamp existed.
+///
+/// ### The witness is now the regression tripwire
+/// [`controls`]'s decline arm stays exactly as it is, and with the stand-down above a
+/// `[wm] controls-declined` line means precisely one thing: **the surface is unsatisfiable** — no
+/// scale that keeps it on the glass can carry a cluster. Any decline for a window whose surface
+/// COULD have been floored (a panel with room for `ceil(CLUSTER_MIN_SRC_W / w)`) is the signal that
+/// this clamp has been bypassed or broken. (The CTRLWIT fixture reaches the arm on purpose: it pins
+/// `r.w`/`r.scale` directly under the table guard, below every path this floor lives in, so it still
+/// drives the witness to a verdict.)
+fn min_width_scale(pw: usize, usable_h: usize, w: usize, h: usize) -> usize {
+    let c = cluster_min_scale(w);
+    if c <= fit_scale(pw, usable_h, w, h) { c } else { 1 }
 }
 
 fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]) {
