@@ -2090,7 +2090,7 @@ is the same defect as a witness that cannot fail.
 | --- | --- |
 | `pack -> 0`, `moves` a handful then flat, `remig 0`, `win=1` off 19.1/s | **PASS** — spread, and settled rather than oscillating |
 | `pack=0` **and** `packseen` near 0, `win=1` still 19.1/s | **REFUTED.** No packing at the census *or* across millions of pass observations. Go to the yield-spin barrier: the TIME feed already reads c0/c5 at 2–3 % where the EVENT feed reads 99 % |
-| `pack=0` but `packseen/passes` materially non-zero | the packing is real and **transient** — sub-census, forming and clearing inside a frame. Neither repair can hold a queue that is empty whenever it is looked at; this is a barrier/wake-latency story |
+| `pack=0` but `packseen/passes` materially non-zero, rate unchanged | the packing is real and **transient** — sub-census, forming and clearing inside a frame. Neither the floor nor the pin can hold a queue that is empty whenever it is looked at; this is a barrier/wake-latency story, **not a placement one** |
 | `pack>=1`, `spare>=1`, packed core's `pinned` > 0 | **the fix FAILED.** Post-fix a ring-3 thread is steal-eligible, so a pinned task on a packed core is either a kernel task that legitimately named that core (check the name on `[schedx86] load`) or a ring-3 path that does not go through `spawn_user_thread`. Find which before touching anything else |
 | `pack>=1`, `spare>=1`, `pinned=0`, `decl i:` climbing | the **idle-floor guard** is holding the packing: ready-holding cores keep going idle between peek and lock and re-raising their floor. Working as specified, and declining a move that would have helped. Tuning, not a defect — the change would be to admit a depth-1 steal once the thief has been idle more than one pass |
 | `decl f:` climbing | the same guard one step earlier. With the per-victim floor in force `f` can only fire when *every* ready-holding core is at `PRIO_IDLE` with depth 1. It does **not** mean "the old floor hid it" — that diagnosis is unreachable now |
@@ -2114,6 +2114,16 @@ across three consecutive intervals:
 
 None of these can be evaluated from a single sample, which is why all three are stated as
 sustained deltas.
+
+**⚠ Boot A: ALL THREE LEGS FIRE, and that is unread.** Measured over one 11.25 s steady-state window
+(793 259 → 804 512 ms) of `~/unaos-bench/capture/gr25-bootA/ttyUSB0.log`: `remig/moves` ≈ **1.0**
+(> 0.5), `moves` ≈ **157/s** (> 100/s), `Δcr3sw/Δmoves` ≈ **16.3** (≈ 2 expected). Ten desktop vugs is
+not the "steady state" the criterion was written against and the sustained-across-three-intervals test
+has not been applied, so this is **not** a revert call — but it does mean the churn criterion and the
+transient-packing row above **select the same Boot A signature**, and the `[wpace]`-side arc that cited
+that row (userspace.md § VUGSPIN) has since **withdrawn** its conviction on load-invariance grounds. Any
+next reader scoring that row against this capture must score the churn criterion beside it; neither is
+convicted, and treating row 3 as a unique selection is the specific mistake already made once.
 
 **Naming the moves.** `STEAL_LOG_COUNT` is reset at each `storm_census` boundary. The cap of
 24 named migrations per boot was generous when a boot produced one steal; with the corrector

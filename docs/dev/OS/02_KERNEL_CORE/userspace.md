@@ -2526,7 +2526,9 @@
     bit lives in the info page, so becoming visible touches no ring at all).
   - **The workers had to go too.** A vug is one parent and TWO workers, and the workers yield-polled
     `PHASE` for the release direction — two thirds of the residue by headcount. They now **spin then
-    park**: `WORKER_SPIN_YIELDS` (4096) passes of the original poll, then `futex_wait` on `PHASE`, with
+    park**: `WORKER_SPIN_YIELDS` (4096 as landed here; **cut to 64 by VUGSPIN below**, whose Boot A
+    arithmetic falsified this constant's sizing premise — the spin-then-park SHAPE described in this bullet
+    is unchanged) passes of the original poll, then `futex_wait` on `PHASE`, with
     every parent-side `PHASE` store followed by a wake. The spin is not conservatism. The first cut made
     this a bare park on the symmetry argument that the ARRIVAL direction has always been a real futex on
     the same QEMU; `kernel8-test` then FAILED with `:: EXEC-UVUG: … did not exit in time ::` and all
@@ -2827,6 +2829,158 @@
     `UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c` unchanged — VUG.ELF is byte-identical
     (comment-only edit), and the scheduler changes alter only when placement is re-asked and which
     bucket a wake visits, never any value that reaches a surface.
+
+- **VUGSPIN (the worker spin was the frame rate, and the meter was never on the wire)** — an **app-only**
+  arc on `crates/user-vug/src/main.rs`, convicted from Boot A
+  (`~/unaos-bench/capture/gr25-bootA/ttyUSB0.log`) after Peter's metal report: *"the fps is total bs now
+  and smp is still not fluid"*.
+
+  - **The brief's premise did not survive the capture, and that is recorded first.** The arc was briefed
+    on `[spread] pack=0 spare=7`, `steal=2/~1.5M` and *"exactly ONE runnable thread in rqp all boot"*.
+    That is an EARLY-BOOT sample, before the vugs launch. At the times the vugs are actually running the
+    same capture reads `[spread] pack=0 spare=2..5`, six or seven runnable threads, and
+    `steal=74272/2675999`. There are also **nine to ten windows on the wire, not one**: `[wpace] win=1`
+    and `win=2` sit at 19.6/s and 17.4/s while `win=0` and `win=3..8` run 46–63/s from the same binary.
+    Any reading of this arc that starts from "one thread, idle machine" is reading the wrong five seconds.
+
+  - **⚠ THE CONVICTION WAS WITHDRAWN UNDER REVIEW. Recorded, not deleted.** This arc first convicted the
+    yield-spin worker barrier of causing the 19.6/s frame rate, citing the table row below. **The capture
+    refutes it, and the refuting number is in the same log.** The frame period is **LOAD-INVARIANT**:
+
+    | sample | windows | machine | `[wcn] win=3` |
+    | --- | --- | --- | --- |
+    | 43 916 ms | 2 | every core 0–3 %, **~1 980 sw/s** | `rate=19.2/s gap=52..52ms` |
+    | 804 512 ms | 10 | cores 60–85 %, **~1.45 M sw/s** | `rate=19.6/s gap=51..51ms` |
+
+    **A 731× change in machine load moved the period from 52 ms to 51 ms — it got 2 % FASTER**, and it is
+    flat to the millisecond across all 112 `[wcn] win=3` samples spanning the whole boot. A self-sustaining
+    spin collapse lengthens the frame as load rises; this does the opposite. Note further that
+    `51 ms / 16 667 µs = 3.06` — **three panel frames almost exactly** — which is the signature of a
+    cadence lock in the present/composite path, not of a scheduler or spin equilibrium. The arc's own
+    falsification row ("rate unchanged → REFUTED, next suspect the compositor") was answered by this
+    capture before the next boot, which is the outcome a falsifier is for.
+
+  - **Primary suspect is now the COMPOSITOR, and the evidence is already on the wire.** `[wcn]` shows
+    `comp` far above `att`: win=10 reads `att=253 comp=1858`, `comp_rate=365/s` against a 49.7/s present
+    rate — **every window is recomposited on every other window's present**, ~450–500 full composites/s
+    on a 60 Hz panel. That is a `video/wm.rs` arc and was deliberately not attempted here.
+
+  - **The table row that was cited, and why it does not select uniquely (review D4).**
+    `packseen/passes = 272154/2675999` ≈ **10.2 %** with `pack=0` at almost every census and the rate
+    unchanged does match this row of the table in `sched.rs` (mirror in `scheduler.md`), verbatim:
+
+    > | `pack=0` but `packseen/passes` materially non-zero, rate unchanged | the packing is real and
+    > TRANSIENT — sub-census, forming and clearing inside a frame. Neither the floor nor the pin can hold
+    > a queue that is empty whenever it is looked at; this is a barrier/wake-latency story, not a
+    > placement one. |
+
+    But **the CHURN criterion fires on the same window, on all three of its numeric legs** — `remig/moves`
+    ≈ 1.0 (threshold > 0.5), `moves` ≈ **157/s** (threshold > 100/s), `Δcr3sw/Δmoves` ≈ **16.3** (threshold
+    ~2). So `steal_floor` churn is a LIVE COMPETING DIAGNOSIS for the same signature, and row 3 is not a
+    unique selection. Neither is convicted here.
+
+  - **What the switch arithmetic does and does not say.** Summing per-core `sw` deltas from
+    `[schedx86] load` over one 11.25 s window gives **1.45 M context switches/s** on eight cores against
+    `[spread] cr3sw` of 2 550/s, so 99.8 % never change address space. That places them inside some
+    address space's own threads and bounds the yield loops **as a class** — it does **not** separate the
+    worker release-poll from the parent's `BARRIER_SPIN_YIELDS` spin, and nothing in the capture does.
+    Against `[wpace] rollup rate ≈ 450/s` that is ~3 200 switches per presented frame, i.e. **~1 600
+    passes per worker per frame — 39 % of the 4096 budget, never reached, so a worker on the bench never
+    parks.** Read that as an upper bound on this loop's share.
+
+  - **Two OPPOSITE slow-window shapes, not one (review D2).** They must not be lumped:
+    `[wcn] win=3` (asid `0x2`) is flat — 19.6/s, `gap=51..51ms`, zero jitter all boot. `[wcn] win=4`
+    (asid `0x3`) is the opposite — 15.2–21.7/s with `gap=8..204ms`, heavy jitter. All nine vugs are
+    identical 128×128 windows from one binary with identical placement, and **nothing yet identified
+    distinguishes asid `0x2`**. A single mechanism that explains both shapes has not been found; any next
+    arc should treat them as two observations, not two samples of one.
+
+  - **⚠ `[wcn] win=` and `[wpace] win=` are DIFFERENT NAMESPACES (review D3).** `[wcn]` enumerates every
+    live window including the console (`win=1 asid=0xffffff01`, composites only); `[wpace]` indexes the
+    window-id table. On Boot A the offset is **`wcn = wpace + 2`** — `[wcn] win=3 asid=0x2` and
+    `[wpace] win=1` are the same window, both 19.6/s. Pair `[vugfps]` against `[wpace]` only; it carries
+    the program's own `SYS_WIN_CREATE` handle, which is the `[wpace]` index. Re-derive the offset per
+    boot rather than assuming 2.
+
+  - **Fix (waste and instrument hygiene, NOT fluidity): `WORKER_SPIN_YIELDS` 4096 → 64**, sized the way
+    `BARRIER_SPIN_YIELDS` already is — as a LATENCY threshold, not a rate. It is justified independently
+    of the withdrawn conviction: spinning ~1 600 times to wait for an event is waste whether or not it is
+    the bottleneck, and a budget too large to reach hides the park it is supposed to fall back on. The
+    spin **still exists**: VUGPAUSE-2 recorded that a *bare* `futex_wait` here failed the 300-frame
+    checksum run on raspi4b with all three tasks parked at the kill, and that result convicted a budget of
+    **zero**, not a small one.
+    - **⚠ Say plainly what 64 does on the bench (review D8).** On a 51 ms frame a worker exhausts 64
+      passes long before the release arrives, so **every worker now parks and is woken once per frame, BY
+      DESIGN** — two futex round trips per frame instead of ~1 600 yields, on a machine with idle cores to
+      dispatch to. The inherited claim that "the rendering path never gets past the spin" is therefore
+      **QEMU-scoped** from here on: true on an unloaded fixture machine, false on the bench. If the next
+      boot shows the slow windows getting *slower*, this trade is the first thing to re-examine.
+
+  - **Fix (truth, part 1): a failed present is no longer counted as a frame.** `frame += 1`,
+    `presented = true` and `presented_overlay` ran unconditionally, immediately after the branch that had
+    just established `SYS_WIN_PRESENT` returned a negative errno. Both are lies about the panel: `frame`
+    is the numerator of the VUGFPS readout ("counts frames PRESENTED"), so a failing present inflated the
+    on-window fps by exactly the failure rate; and `presented = true` would let the VUGPAUSE idle
+    predicate SKIP the very frame that would have repaired the window. Both now sit on the success path.
+    Deliberately a guard and **not** a `continue` — skipping the iteration would skip the exit block with
+    it, so a window whose presents had started failing would stop answering ESC.
+    - **⚠ And the exit budgets had to move off `frame` with it (review D5).** `INTERACTIVE_CAP` and
+      `AUTO_FRAMES` both read `frame`, so freezing `frame` on failure would freeze the DEADLINE too: a run
+      whose presents had all started failing would never terminate — `:: EXEC-UVUG: … did not exit in
+      time ::` on any fixture leg where the present path breaks, a hang introduced by a fix for a lie.
+      A separate `attempts` counter now clocks the budgets; it counts present ATTEMPTS, which is exactly
+      what `frame` meant here before. The two are equal on every healthy run, so the 300-frame checksum
+      path is bit-identical; they diverge only in the failure case, where each is the right quantity for
+      its own job — `frame` for the meter, `attempts` for the deadline.
+
+  - **Fix (truth, part 2): `[vugfps] wf=` — the panel's number reaches the wire.** GR24 fixed this
+    readout's arithmetic (ABIFREEZE D1: VUG-X86.ELF divided by 250 on a 1 kHz kernel, four times too low)
+    and the next sitting still called the shown fps wrong. That could not be settled from a capture for a
+    structural reason: **the program had never printed the number it draws.** It now emits
+    `[vugfps] wf=<win*1000 + shown>` whenever the displayed digits CHANGE (`v != fps` — free rate-limiting,
+    and strictly more informative than a period: a window holding a steady rate goes quiet rather than
+    repeating itself once a second into a log with ten vugs in it). Decode `win = wf / 1000`,
+    `shown = wf % 1000`; `shown` carries the same 999 clamp `draw_num` applies to the painted digits, so
+    the packing cannot collide.
+
+  - **The falsifier table for the next boot.** `shown` and `[wpace] win=N rate=` measure the same event
+    and are the same quantity by construction (`frame` advances only on a successful present, which is
+    exactly what `wpace_note_present` counts):
+
+    | next boot shows | reading |
+    | --- | --- |
+    | `shown` far from `[wpace] win=N rate=` | **the disagreement is the finding**, and the first time it could be one. The count is shared by construction, so a gap means presents the kernel never saw or saw twice. This is the question the arc set out to answer. |
+    | `shown ≈ [wpace] rate`, rate still ~19.6/s, `gap` still ~51 ms | **EXPECTED** — the meter is honest and the frame rate was never the spin. Hand off to the compositor arc; do not re-touch `WORKER_SPIN_YIELDS`. |
+    | `shown ≈ [wpace] rate` and the slow windows have RISEN | the spin was costing more than this arc credited it with. Welcome, but it does not restore the withdrawn conviction — the load-invariance above still has to be explained. |
+    | the slow windows have gone SLOWER | the 64-pass budget's park-per-frame trade (D8) is not paying on the bench. Re-examine `WORKER_SPIN_YIELDS` first. |
+    | `sw` deltas still summing to ~1.4 M/s with `cr3sw` flat | the worker poll was not the switch source. The parent's `BARRIER_SPIN_YIELDS` is the other half of the class the 99.8 % figure bounds, and it was not changed. |
+    | `[wcn] win=3` still flat at `gap=51..51` while `win=4` still jitters `8..204` | the two shapes (D2) are still unexplained and still opposite; a single-mechanism theory is still wrong. |
+
+  - **A witness that was dropped because it could not fail.** An earlier cut carried `frames=` beside
+    `shown=`. It is not the clock check it looked like: `shown = Δframe * TICK_HZ / dt` and the refresh
+    fires at `dt >= TICK_HZ`, so `shown ≈ frames` is an **algebraic identity that holds however wrong
+    `TICK_HZ` is** — under the exact D1 bug GR24 fixed, the refresh simply fired four times a second and
+    `shown` still equalled `frames`. The only real check on this program's clock is the kernel's number
+    beside it.
+
+  - **Size — the constraint that shaped the patch, measured rather than guessed.** VUG-X86.ELF's `.text`
+    was `0x1fcd` of a `0x2000` page — **51 bytes of headroom** — past which `.bss` moves up a page and the
+    ELF file grows by 4096 **in one step**. That cliff, not code size, is why a second label/number pair
+    on the witness line is unaffordable (every variant cost 16736 B against a 16384 B limit) and why the
+    two fields are packed into one decimal. It was paid for by collapsing `say` and `sayn` onto one `emit`
+    body. **Net `.text` is `0x1fcd` — byte-for-byte the baseline figure**, with the whole arc (new witness,
+    the `attempts` counter, the meter guard) paid for out of that one collapse, and both ELFs are 12568 B, the
+    same as before the arc. Note for the next reader: the build script's printed file size overstates the
+    real footprint (section headers plus page padding); the LOADable memory here is ~12.4 KiB of the
+    16 KiB window. Check trims with `readelf -lW` against the `0x2000` line, not against that number.
+
+  - **Gates:** `./arroyo check` and `UNAOS_WC=1 ./arroyo check` green both arches, `user-vug` green on
+    both targets; `./arroyo kernel8-test` **MBENCH PASS 105/105, 0 forbidden hits** with
+    `UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c` unchanged — the checksum is the exact witness
+    that a bare park broke, so it is what licenses the spin change; `./arroyo test` MISSION SUCCESS. The
+    `[vugfps]` line cannot perturb the checksum run: it rides `fps_refresh`, which the foreground auto
+    path never reaches (overlay is `detached || interactive`), and no `[vugfps]` line appears in either
+    QEMU log.
 
 ### x86_64 (branch `hw-rmbp`)
 
