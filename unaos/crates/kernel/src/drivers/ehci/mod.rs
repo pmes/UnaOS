@@ -1199,6 +1199,22 @@ const BT_L3_DISC_MS: u64 = 600;
 /// legitimately emits Command Status, vendor events and (on the cancel path) a second meta event.
 #[cfg(feature = "bt")]
 const BT_L3_EVT_MAX: u32 = 16;
+/// BT-C1/INQUIRY — the structural event cap for the INQUIRY window only, and it is a different
+/// number because the inquiry asks a different question.
+///
+/// REVIEW FIX. Every other L3 wait listens for ONE named reply and treats a stream of other events
+/// as noise, so `BT_L3_EVT_MAX` = 16 is a generous ceiling there. The inquiry window is the exact
+/// opposite: the events it walks past ARE its payload, one or more `Inquiry Result`s per device per
+/// scan, repeating for 5.12 s across every device in the room. Sixteen events is a handful of
+/// devices in a quiet room and is reached in the first second of a busy one — and because the cap
+/// sets `st.blind`, the summary would then honestly but uselessly report `read_to_term=false` for a
+/// target that was about to answer. The cap that must bound this window is the WALL CLOCK
+/// (`BT_C1_INQUIRY_MS`), which it already does: `bt_l3_await` hands every read the window's
+/// REMAINING time, so no number of events can outlast it. This value is therefore set high enough
+/// that a real room reaches the deadline and not the counter, and it stays finite only so that a
+/// controller streaming zero-cost events cannot spin the loop.
+#[cfg(feature = "btc")]
+const BT_C1_INQUIRY_EVT_MAX: u32 = 128;
 
 // ---------------------------------------------------------------------------------------------
 // BT-L4 — ONE ATT read over the live LE link, and the transport question it had to answer first.
@@ -1479,6 +1495,22 @@ const BT_C1_PACKET_TYPE: u16 = 0x0018;
 /// which is the one outcome an experiment must not manufacture — so the fallback stays R2.
 #[cfg(feature = "btc")]
 const BT_C1_PSRM: u8 = 0x02;
+/// BT-C1 — the largest LEGAL `Page_Scan_Repetition_Mode`: **R2 (0x02)**. 0x03..0xFF are Reserved for
+/// Future Use in both `Create_Connection` (Vol 4 Part E §7.1.5) and `Inquiry Result` (§7.7.2).
+///
+/// REVIEW FIX, AND IT IS A RANGE CHECK ON RADIO-SUPPLIED BYTES. The harvested mode is one octet
+/// lifted straight out of an inquiry response — i.e. out of the air, from a packet nothing
+/// authenticated. An inquiry response is not attributable: any device may answer with any BD_ADDR,
+/// including the target's, and it chooses the psrm byte it reports. Passing an out-of-range value
+/// through to `Create_Connection` costs the whole stage: the controller rejects the command with
+/// Command Status 0x12 (Invalid HCI Command Parameters) and NO PAGE IS TRANSMITTED AT ALL, on both
+/// attempts — the arc's own payload path turned into a boot that pages nothing, over one bad byte.
+/// So a mode outside this range is refused and `BT_C1_PSRM` is paged instead. The response is still
+/// a harvest — the clock offset is independent and is kept — and the witness says on its own line
+/// that the mode specifically was rejected, because "harvested" and "harvested except the part that
+/// was garbage" are different claims.
+#[cfg(feature = "btc")]
+const BT_C1_PSRM_MAX: u8 = 0x02;
 /// BT-C1 — the FALLBACK `Clock_Offset` = 0x0000, used only when the inquiry did not hear the
 /// target. Bit 15 is the "offset valid" flag and it is CLEAR here: with no inquiry response there
 /// is no offset to declare, and declaring an invalid one valid would send the controller paging at
@@ -2232,9 +2264,17 @@ struct BtL3State {
     /// whether it is paging blind.
     #[cfg(feature = "btc")]
     inq_found: bool,
-    /// BT-C1/INQUIRY — the target's `Page_Scan_Repetition_Mode`, valid only when `inq_found`.
+    /// BT-C1/INQUIRY — the target's `Page_Scan_Repetition_Mode` AS REPORTED, valid only when
+    /// `inq_found`. Stored raw so the witness can print what the air actually said; whether it is
+    /// legal to PAGE with is `inq_psrm_ok`.
     #[cfg(feature = "btc")]
     inq_psrm: u8,
+    /// BT-C1/INQUIRY — the reported `Page_Scan_Repetition_Mode` was within `BT_C1_PSRM_MAX`, so the
+    /// page may carry it. REVIEW FIX: false with `inq_found` true is the real case this separates —
+    /// the target answered, its clock offset is good, and its mode byte was out of range and is
+    /// replaced by `BT_C1_PSRM`. See `BT_C1_PSRM_MAX` for what passing it through would have cost.
+    #[cfg(feature = "btc")]
+    inq_psrm_ok: bool,
     /// BT-C1/INQUIRY — the target's `Clock_Offset` AS REPORTED, i.e. with bit 15 clear. The page
     /// sets `BT_C1_CLOCK_OFFSET_VALID` on it; storing the raw value keeps the witness able to
     /// print what the air actually said.
@@ -2277,6 +2317,15 @@ struct BtL3State {
 /// WHAT IT REFUSES TO DO: it never partially decodes. A response whose 14 bytes do not all lie
 /// inside the event is not read at all, and `blind` is set — an inquiry that could not be fully
 /// walked must not be citable as "the target was not there".
+///
+/// EVERY BYTE HERE CAME OFF THE AIR AND NOTHING AUTHENTICATED IT. An inquiry response is not
+/// attributable to the device it names: any radio in range may answer with any BD_ADDR, including
+/// the target's, and it chooses the mode, class and offset it reports. Two consequences are handled
+/// rather than assumed. The LENGTHS are never trusted — `Num_Responses` is a claim, and each
+/// 14-byte record is bounds-checked against the event's own `Parameter_Total_Length` before it is
+/// read, so a lying count truncates the walk instead of running off the buffer. The VALUES are
+/// range-checked where the spec gives a range: see `BT_C1_PSRM_MAX`, which is the one field whose
+/// out-of-range value would have cost the whole stage.
 #[cfg(feature = "btc")]
 fn bt_c1_inquiry_harvest(idx: usize, pkt: &[u8], st: &mut BtL3State) {
     if pkt.is_empty() {
@@ -2347,6 +2396,11 @@ fn bt_c1_inquiry_harvest(idx: usize, pkt: &[u8], st: &mut BtL3State) {
         if ours && !st.inq_found {
             st.inq_found = true;
             st.inq_psrm = psrm;
+            // REVIEW FIX — the mode is checked against the spec's range HERE, at the point it comes
+            // off the air, and the raw byte is kept for the transcript either way. The clock offset
+            // needs no equivalent check: every one of its 15 value bits is legal, and bit 15 is the
+            // valid flag this host sets itself.
+            st.inq_psrm_ok = psrm <= BT_C1_PSRM_MAX;
             st.inq_clock_offset = clk;
         }
         if same_oui {
@@ -5353,7 +5407,17 @@ impl Controller {
             if el >= budget_cy {
                 return BtL3Await::Timeout;
             }
-            if here >= BT_L3_EVT_MAX {
+            // REVIEW FIX — the cap is per-`want`, because the inquiry window's payload IS the
+            // events it walks past. See `BT_C1_INQUIRY_EVT_MAX`. Under `bt` without `btc` the
+            // variant does not exist and this is `BT_L3_EVT_MAX` exactly, as before.
+            #[cfg(feature = "btc")]
+            let evt_cap = match want {
+                BtL3Want::InquiryEnd => BT_C1_INQUIRY_EVT_MAX,
+                _ => BT_L3_EVT_MAX,
+            };
+            #[cfg(not(feature = "btc"))]
+            let evt_cap = BT_L3_EVT_MAX;
+            if here >= evt_cap {
                 // The structural cap ended the wait while events were still arriving. The window
                 // was NOT read to term, so the absence of a latch below proves nothing.
                 st.blind = true;
@@ -6730,7 +6794,18 @@ impl Controller {
         // harvest inside `bt_l3_await`. A `Timeout` here means neither ending arrived inside a
         // window that is LONGER than the inquiry length written above — which, exactly as on the
         // page path, is a statement about this controller and not about the room.
-        if inquiring {
+        // REVIEW FIX — the target may already have been harvested by a response the CommandStatus
+        // wait above walked past (that wait returns on the first Command Status and decodes
+        // everything else on the way, and on its Timeout/short-event paths it decodes a whole
+        // window of them). `InquiryEnd` is satisfied by `st.inq_found`, but only ON AN EVENT — with
+        // nothing further on the wire this window would sit out its full `BT_C1_INQUIRY_MS` for an
+        // answer it already has. The early exit is the point of the stage, so take it here too.
+        if inquiring && st.inq_found {
+            serial_println!(
+                ":: bt-c1: [{}] inquiry ENDED EARLY — the target was already harvested before the listening window opened (its response arrived while the CommandStatus above was outstanding), so no listening time is spent at all. The controller is still INQUIRING and the cancel below is what leaves that state == witness ::",
+                self.idx
+            );
+        } else if inquiring {
             match self.bt_l3_await(
                 e,
                 toggle,
@@ -6828,13 +6903,25 @@ impl Controller {
         // in it; the room is silent; or the inquiry never ran to term and establishes nothing.
         let (psrm, clk, found) = if st.inq_found {
             (
-                st.inq_psrm,
+                // REVIEW FIX — an out-of-range mode is REFUSED, not paged. `BT_C1_PSRM_MAX` says
+                // what passing it through would have cost; the line below names the substitution.
+                if st.inq_psrm_ok {
+                    st.inq_psrm
+                } else {
+                    BT_C1_PSRM
+                },
                 st.inq_clock_offset | BT_C1_CLOCK_OFFSET_VALID,
                 true,
             )
         } else {
             fallback
         };
+        if st.inq_found && !st.inq_psrm_ok {
+            serial_println!(
+                ":: bt-c1: [{}] inquiry psrm REJECTED — the response for this BD_ADDR reported Page_Scan_Repetition_Mode={:#04x}, which is Reserved for Future Use (legal range 0x00..={:#04x}). Paging with it would have been answered CommandStatus 0x12 (Invalid HCI Command Parameters) and NO train would have gone out, so {:#04x}(R2) is substituted. THE CLOCK OFFSET IS UNAFFECTED and is still the peer's own — this page is aligned but not mode-sized. An inquiry response is unauthenticated: any device may answer under any BD_ADDR, so a byte out of range here is either a broken peer or a spoofed one == witness ::",
+                self.idx, st.inq_psrm, BT_C1_PSRM_MAX, BT_C1_PSRM
+            );
+        }
         serial_println!(
             ":: bt-c1: [{}] inquiry summary — responses={} target_found={} same_oui_seen={} read_to_term={} -> {} == witness ::",
             self.idx, st.inq_responses, st.inq_found, st.inq_oui_seen, !st.blind,
@@ -6856,7 +6943,9 @@ impl Controller {
             match psrm { 0x00 => "R0", 0x01 => "R1", 0x02 => "R2", _ => "RESERVED" },
             clk,
             if clk & BT_C1_CLOCK_OFFSET_VALID != 0 { "SET = valid" } else { "clear = NOT valid" },
-            if found {
+            if found && !st.inq_psrm_ok {
+                "THE PEER'S OWN CLOCK OFFSET, BUT THIS HOST'S FALLBACK MODE — the response carried an out-of-range Page_Scan_Repetition_Mode and it was refused (its own line is above). The train starts on the peer's clock phase and is sized for the worst case"
+            } else if found {
                 "THE PEER'S OWN INQUIRY RESPONSE — the controller can now start its page train on the peer's clock phase and size it to the peer's real scan interval, which is the whole difference between this arc and the one Boot D flew"
             } else {
                 "THIS HOST'S FALLBACK GUESSES — no inquiry response for this address was harvested, so the page below is the same blind page Boot D made and its timeout carries the same weight"
@@ -6912,6 +7001,10 @@ impl Controller {
         // latch that would catch it during the page.
         let (psrm, clock_offset, from_inquiry) =
             self.bt_c1_inquiry(t, intf, e, toggle, armed, &mut st, &mut seen, &mut asm);
+        // REVIEW FIX — latched here because `st.inq_psrm_ok` is about to be shared with the page's
+        // own waits, and the page-parameters line below must not call a substituted mode
+        // "HARVESTED". See `BT_C1_PSRM_MAX`.
+        let psrm_harvested = st.inq_psrm_ok;
 
         // ---- 1. bound what a dead speaker costs the boot ---------------------------------------
         // Vol 4 Part E §7.3.16. Written BEFORE the page, because it is the page's own deadline.
@@ -6971,8 +7064,10 @@ impl Controller {
             BT_C1_PACKET_TYPE,
             psrm,
             match psrm { 0x00 => "R0", 0x01 => "R1", 0x02 => "R2", _ => "RESERVED" },
-            if from_inquiry {
+            if from_inquiry && psrm_harvested {
                 "HARVESTED from the peer's own inquiry response"
+            } else if from_inquiry {
+                "this host's conservative fallback — the peer answered but reported an out-of-range mode, refused above"
             } else {
                 "this host's conservative fallback — the inquiry did not hear this address"
             },

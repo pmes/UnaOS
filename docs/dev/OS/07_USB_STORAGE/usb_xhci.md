@@ -6892,6 +6892,26 @@ Design notes that are decisions rather than details:
   `Inquiry Complete`, or the target answering. `BT_C1_INQUIRY_LEN` (5.12 s) is paid in full only on
   a boot that does *not* hear the target — which is exactly the boot where the listening time has to
   be defensible.
+- **The harvested fields are unauthenticated, and the mode is range-checked.** An inquiry response
+  is not attributable to the device it names: any radio in range may answer with any BD_ADDR,
+  including the target's, and it supplies the `Page_Scan_Repetition_Mode` and `Clock_Offset` this
+  host then pages with. Both are therefore treated as hostile input. Lengths are never trusted —
+  `Num_Responses` is a claim, and each 14-byte record is bounds-checked against the event's own
+  `Parameter_Total_Length`, so a lying count truncates the walk (and sets `blind`) instead of
+  running off the buffer. The mode is range-checked against `BT_C1_PSRM_MAX` (0x02): `0x03..0xFF`
+  are Reserved for Future Use, and paging with one would be answered Command Status `0x12` (Invalid
+  HCI Command Parameters) with **no train transmitted at all** — one bad byte turning the arc's own
+  payload path into a boot that pages nothing. An out-of-range mode is refused, `BT_C1_PSRM` is
+  substituted, the clock offset is kept (it is independent, and all 15 of its value bits are legal),
+  and a witness line says the mode specifically was rejected. The clock offset needs no equivalent
+  check; a wrong one costs a missed page, which is the outcome the stage already reports.
+- **The inquiry window has its own event cap** (`BT_C1_INQUIRY_EVT_MAX`, 128) rather than L3's
+  `BT_L3_EVT_MAX` of 16. Every other L3 wait listens for one named reply and treats other events as
+  noise; the inquiry window's payload *is* the events it walks past. Sixteen is a handful of devices
+  in a quiet room and is reached in the first second of a busy one — and because hitting the cap
+  sets `blind`, the summary would have reported `read_to_term=false` for a target that was about to
+  answer. The wall clock (`BT_C1_INQUIRY_MS`) is the real bound and always was: every read is handed
+  the window's remaining time, so no number of events can outlast it.
 - **The address itself is now cross-checked.** `BT_L3_PEER_ADDR_BYTES` was read off an LE
   advertisement, and a dual-mode device need not page under the address it advertises. The inquiry
   answers on classic, so its result list is the first evidence this project has gathered about which
