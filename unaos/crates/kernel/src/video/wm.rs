@@ -2159,6 +2159,36 @@ impl OccSnap {
         self.n
     }
 
+    /// WC-K3 REVIEW (SHOULD-FIX 2) — WIDEN THIS EXCUSE TO COVER WHAT THE BLIT ACTUALLY WITHHELD.
+    ///
+    /// The clip is built from the pass's table SNAPSHOT; this snapshot is taken LIVE, once before the
+    /// blit and once at read-back. An occluder that moves or closes between the snapshot and the
+    /// read-back is therefore absent here and present in the clip — so `draw_window` withheld those
+    /// spans, the panel still holds whatever was under them, and WC-D would read stale pixels inside
+    /// a verified rect and print `-> FAIL`. That is a failure class this arc would have MANUFACTURED,
+    /// and it is not a real one: the pixels are unwritten by design, and the mover's own composite
+    /// repaints them.
+    ///
+    /// The excuse must therefore never be narrower than the clip. Deduplicated, so in the steady
+    /// state — nothing moved, the two sets agree — this adds nothing and `occ=n0/n1` does not move;
+    /// it widens exactly on the race it exists for. Bounded by the array: both populations are live
+    /// windows, so the union cannot exceed [`MAX_WINDOWS`] except transiently, and the break makes
+    /// that fail-closed (a box not absorbed is a pixel still chargeable, never one wrongly excused).
+    /// Module-private (unlike its siblings, which `wcg` calls): `OccClip` is this module's own type
+    /// and a `pub` method taking it would leak a private type into `OccSnap`'s public surface.
+    fn absorb(&mut self, c: &OccClip) {
+        for &b in c.boxes[..c.n].iter() {
+            if self.n >= MAX_WINDOWS {
+                break;
+            }
+            if self.boxes[..self.n].contains(&b) {
+                continue;
+            }
+            self.boxes[self.n] = b;
+            self.n += 1;
+        }
+    }
+
     /// Does any occluder box cover panel pixel `(x, y)`? A mismatching pixel that a higher window
     /// covers is that window's pixel, not the blit's to answer. Saturating add mirrors [`outer_box`]:
     /// an absurd box clips rather than wrapping into one that would silently stop being hittable.
@@ -2199,6 +2229,19 @@ fn occluders_above(z: u32, id: u32) -> OccSnap {
         snap.n += 1;
     }
     snap
+}
+
+/// WC-K3 — the read-back's excuse set: [`occluders_above`] UNIONED with the clip the blit obeyed.
+///
+/// One call site's worth of logic, named once so all four excuse points (WC-G's `begin` and `end`,
+/// WC-D's pre-blit and read-back snapshots) cannot drift apart — a widened excuse at one of them and
+/// a bare `occluders_above` at another is the same manufactured `FAIL`, just harder to find. See
+/// [`OccSnap::absorb`].
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn occ_excuse(z: u32, id: u32, clip: &OccClip) -> OccSnap {
+    let mut s = occluders_above(z, id);
+    s.absorb(clip);
+    s
 }
 
 /// WC-I — how did this present's occluder snapshot AGE while the desktop was copying?
@@ -3380,6 +3423,10 @@ fn composite_inner() -> CursorTail {
     // FOCUS-HL: one snapshot per pass, for the same reason `shell` is one snapshot per pass — every
     // window in this pass is judged against a single focus owner, so no pass can draw two highlights.
     let focus = focus_asid();
+    // WC-K3 — publish the live drag's geometry for the occludee witness, from the same snapshot this
+    // pass blits from. One relaxed store on a pass with no drag live.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    dragocc_pass(&rows);
 
     // WEDGE-2 `<F8>` (owner core) / `<f8>` (a concurrent core) — the guard is HELD, the damage set is
     // closed and ordered, and the back-to-front BLIT LOOP is next. The pairing is what makes this
@@ -3422,6 +3469,11 @@ fn composite_inner() -> CursorTail {
             wcn_note_below(rows[i].id);
             continue;
         }
+        // WC-K3 — the windows stacked above this one, from THIS pass's snapshot, computed ONCE and
+        // shared by the blit and by every witness that has to excuse what the blit withheld. Built
+        // per window rather than once per pass because the set is relative to the painter; the scan
+        // is `MAX_WINDOWS` rows against a call that is about to copy a box.
+        let clip = occ_clip(&rows, i, shell);
         // WC-D — the REFERENCE, taken BEFORE the blit. See `verify_reference` and the WCD-PRE section
         // of `verify_window`'s ledger for why it cannot be taken any later: the read-back's reference
         // used to be snapshotted from inside `verify_window`, which runs after `wcg::end` and
@@ -3436,7 +3488,7 @@ fn composite_inner() -> CursorTail {
         // charged to `[wc-g] us=` — manufacturing a `slow=yes` tear report out of this witness's own
         // cost. WC-G's bracket must still contain the copy and nothing else.
         #[cfg(feature = "witness")]
-        let wcd_ref = verify_reference(&fb, &rows[i], bands[i]);
+        let wcd_ref = verify_reference(&fb, &rows[i], bands[i], &clip);
         // WC-G — bracket the blit. `begin` must be the last thing before `draw_window` and `end` the
         // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
         // and "as the copy left it", and anything inserted between them widens the interval they
@@ -3450,7 +3502,8 @@ fn composite_inner() -> CursorTail {
             rows[i].surf,
             rows[i].surf_len,
             rows[i].compat,
-            occluders_above(rows[i].z, rows[i].id),
+            // WC-K3 — the excuse, widened to whatever the blit is about to withhold.
+            occ_excuse(rows[i].z, rows[i].id, &clip),
         );
         #[cfg(all(feature = "witness", not(target_arch = "x86_64")))]
         let wcg_probe = super::wcg::begin(rows[i].id, rows[i].surf, rows[i].surf_len, rows[i].compat);
@@ -3522,6 +3575,7 @@ fn composite_inner() -> CursorTail {
             // dragged in by the occlusion closure and for every whole-box present, which is every
             // caller that predates this arc.
             bands[i],
+            &clip,
         );
         #[cfg(feature = "witness")]
         if let Some(p) = wcg_probe {
@@ -3530,7 +3584,7 @@ fn composite_inner() -> CursorTail {
             // carried in the probe. x86 only; aarch64 keeps the eight-argument call.
             #[cfg(target_arch = "x86_64")]
             super::wcg::end(
-                p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale, occluders_above(r.z, r.id),
+                p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale, occ_excuse(r.z, r.id, &clip),
             );
             #[cfg(not(target_arch = "x86_64"))]
             super::wcg::end(p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale);
@@ -3549,7 +3603,7 @@ fn composite_inner() -> CursorTail {
         // meantime no longer matters: the reference was frozen before the blit.
         #[cfg(feature = "witness")]
         if let Some(vr) = wcd_ref {
-            verify_window(&fb, &rows[i], vr);
+            verify_window(&fb, &rows[i], vr, &clip);
         }
         // WC-N — pixels on glass for this window id. The only writer of `comp`.
         #[cfg(feature = "witness")]
@@ -3822,7 +3876,8 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 /// `ram_indep=no` means something wrote the panel under the verdict. What it is not, and now says it is not,
 /// is an independent statement about whether the pixels reached the memory the scan-out reads.
 #[cfg(feature = "witness")]
-fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
+#[allow(unused_variables)]
+fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccClip) {
     let info = fb.info();
     let VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
@@ -3836,7 +3891,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     // hole WCD-PRE already names for a source that moves mid-read — those pixels are not on the glass
     // to be read. x86 only; see [`OccSnap`].
     #[cfg(target_arch = "x86_64")]
-    let occ_after = occluders_above(r.z, r.id);
+    let occ_after = occ_excuse(r.z, r.id, clip);
 
     // WCD-PRE — the per-pixel liveness question, asked only of pixels that already disagree. `want` was
     // frozen before the blit; if the SOURCE no longer holds that value, this pixel's reference moved
@@ -4143,7 +4198,25 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         // The repair redraw still runs: this window's pixels were overwritten under us, and putting
         // them back is exactly what it is for.
         let focus = focus_asid();
-        draw_window(fb, r, focus != 0 && focus == r.owner_asid, None, false, false, None);
+        draw_window(
+            fb,
+            r,
+            focus != 0 && focus == r.owner_asid,
+            None,
+            false,
+            false,
+            None,
+            // WC-K3 — the repair redraw is a blit like any other and must not publish a pixel a
+            // higher window owns; no pass snapshot here, so the set is taken live.
+            //
+            // REVIEW (NIT 7) — AND IT CAN LEGITIMATELY NO-OP. If a higher window now buries this one
+            // outright, `draw_window` returns without writing, which is the correct repair: every
+            // pixel WC-D found overwritten belongs to that window, and repainting them would be the
+            // bleed this arc removes. The verdict is already sealed by here (`retry=no` on the
+            // `bad`/`moved` arm, or the `live` label) and nothing re-reads the glass afterwards, so
+            // no instrument mistakes the no-op for a repair that happened.
+            &occ_clip_live(r),
+        );
         return;
     }
     if live {
@@ -4255,7 +4328,25 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     // repaint on the one-shot verify pass per window; the cost of the other guess is an erased arrow.
     // FBCON-DMG: `None` — the WHOLE box. This is a REPAIR of whatever the invalidate above dropped,
     // not a present of what a caller declared changed, so it has no band and must not borrow one.
-    draw_window(fb, r, focus != 0 && focus == r.owner_asid, None, false, false, None);
+    draw_window(
+            fb,
+            r,
+            focus != 0 && focus == r.owner_asid,
+            None,
+            false,
+            false,
+            None,
+            // WC-K3 — the repair redraw is a blit like any other and must not publish a pixel a
+            // higher window owns; no pass snapshot here, so the set is taken live.
+            //
+            // REVIEW (NIT 7) — AND IT CAN LEGITIMATELY NO-OP. If a higher window now buries this one
+            // outright, `draw_window` returns without writing, which is the correct repair: every
+            // pixel WC-D found overwritten belongs to that window, and repainting them would be the
+            // bleed this arc removes. The verdict is already sealed by here (`retry=no` on the
+            // `bad`/`moved` arm, or the `live` label) and nothing re-reads the glass afterwards, so
+            // no instrument mistakes the no-op for a repair that happened.
+            &occ_clip_live(r),
+        );
 }
 
 /// WC-D — the reference half of the verdict: the SOURCE bytes, the rect they cover, and the surface
@@ -4317,10 +4408,12 @@ struct VerifyRef {
 /// that has visible rows; burning a window's only verdict on a transient would be the same class of mistake
 /// as the false FAIL this arc exists to close.
 #[cfg(feature = "witness")]
+#[allow(unused_variables)]
 fn verify_reference(
     fb: &super::FrameBuffer,
     r: &Window,
     band: Option<(usize, usize)>,
+    clip: &OccClip,
 ) -> Option<VerifyRef> {
     // FOCUS-VIS — `presented`, so the one-shot is not claimed by the create-time composite of a blank
     // surface. `compat` rows have no chrome and no owner to verify against; `id < 32` is the latch width.
@@ -4445,7 +4538,7 @@ fn verify_reference(
     // snapshot, so it describes the same instant the source bytes were frozen at; [`verify_window`]
     // unions it with a read-back-time snapshot to excuse a window that moved between the two.
     #[cfg(target_arch = "x86_64")]
-    let occ_before = occluders_above(r.z, r.id);
+    let occ_before = occ_excuse(r.z, r.id, clip);
     Some(VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
         #[cfg(target_arch = "x86_64")] occ_before })
@@ -8968,6 +9061,159 @@ static DRAG_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 #[cfg(feature = "witness")]
 static DRAG_FLASH_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// ---- WC-K3: the OCCLUDEE witness ---------------------------------------------------------------
+//
+// **The gap this closes, stated as the reason the bleed shipped.** `[drag] … flash_px=0 -> ONCE`
+// measures ONE window — the dragged one — and one quantity: erased pixels inside the box that window
+// now occupies. Peter's Boot AS bleed is a different window's pixels (`STAT.ELF`) landing on top of
+// the dragged one, so every term of that line stayed green while the panel was visibly wrong. A
+// witness that cannot see the reported symptom is not evidence about it, and `flash_px=0` was read as
+// if it were for two arcs.
+//
+// So this counts the NEIGHBOURS: panel pixels a gesture published for windows other than the one
+// being dragged, and — the verdict term — how many of those landed inside the dragged window's own
+// box while their painter sat BELOW it. That is the bleed as a number.
+//
+// **It is not a tautology against the clip, and the distinction is the point.** The clip subtracts a
+// per-window occluder set taken from the pass's table snapshot; `occ_px` is tested against the DRAGGED
+// window's live box, at the moment of the write, in the present loop. Any path that reaches the panel
+// without consulting the clip — the pre-WC-H direct fallback, a `compat` row, a band whose spans were
+// computed wrong, a future caller that forgets the argument — writes pixels this counter still sees.
+// `direct=` names the one such path that exists today so it cannot hide inside a zero.
+/// WC-K3 — the dragged window's outer box for THIS pass: `x`, `y`, `w`, `h`. `w == 0` means no drag
+/// is live (or its row has gone), and every term below stays where it is.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_BOX: [core::sync::atomic::AtomicUsize; 4] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
+/// WC-K3 — the dragged window's `(z, id)`, packed `z << 32 | id`, so a painter can ask whether it is
+/// BELOW the drag with one relaxed load and the same key the blit order uses.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_ZID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WC-K3 — ids (bit per id, `id < 32`) that painted a neighbour pixel during this gesture.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_NEIGH_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// WC-K3 — panel pixels this gesture published for windows other than the dragged one.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_NEIGH_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WC-K3 — THE VERDICT TERM: of those, pixels that landed inside the dragged window's box, published
+/// by a window stacked below it. The bleed. Must be 0.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_OCC_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WC-K3 — pixels the clip SUPPRESSED for those same windows. The mechanism's own denominator: a
+/// gesture whose neighbours were genuinely occluded and whose `clip_px` is 0 has a clip that never
+/// ran, and its `occ_px=0` proves nothing.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_CLIP_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WC-K3 — presents an occluded neighbour took on the UNCLIPPED direct path (`stage_window`
+/// declined). Those pixels bypass the clip entirely, so the count is part of the verdict rather than
+/// a footnote.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_DIRECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WC-K3 — presents of an occluded neighbour the whole-window skip declined outright.
+///
+/// Counted for the same reason `clip_px` is: a BURIED neighbour never reaches the span loop, so
+/// without this term the loudest case the arc fixes — a window wholly under the one being dragged —
+/// would report `neigh=0 clip_px=0` and read exactly like a gesture over empty desktop. The two
+/// denominators together are what let a reader tell "nothing was occluded" from "occlusion was
+/// handled".
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_BURIED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WC-K3 — THE SECOND VERDICT TERM: `DESKTOP_BG` pixels the drain's staged fill published inside the
+/// dragged window's box. The coalesced erase reaching under its own occluder, which is the mechanism
+/// the arc convicted and the one no existing counter could see. See the ledger in [`stage_fill`].
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DO_FILL_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WC-K3 — publish the dragged window's geometry for the pass that is about to blit.
+///
+/// Called from [`composite_inner`] once per pass, from the same `rows` snapshot the blit loop draws
+/// from, so the box the counters test against is the box this pass is drawing around. A concurrent
+/// core's pass overwrites it with its own answer; the terms are per-gesture totals and a one-pass
+/// disagreement about a window that is moving anyway cannot manufacture a nonzero `occ_px` out of
+/// pixels nobody wrote.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dragocc_pass(rows: &[Window; MAX_WINDOWS]) {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    let id = DRAG_WIN.load(Acquire);
+    let found = if id == WIN_NONE {
+        None
+    } else {
+        rows.iter().find(|r| r.used && r.id == id)
+    };
+    match found {
+        Some(r) => {
+            let b = outer_box(r);
+            DO_BOX[0].store(b.0, Relaxed);
+            DO_BOX[1].store(b.1, Relaxed);
+            DO_BOX[2].store(b.2, Relaxed);
+            DO_BOX[3].store(b.3, Relaxed);
+            DO_ZID.store(((r.z as u64) << 32) | r.id as u64, Relaxed);
+        }
+        None => DO_BOX[2].store(0, Relaxed),
+    }
+}
+
+/// WC-K3 — is `r` a window whose pixels the live drag would OCCLUDE? `Some(box)` hands back the
+/// dragged window's box to test writes against; `None` means there is nothing to charge (no drag,
+/// `r` IS the drag, or `r` is stacked above it and legitimately paints over it).
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dragocc_target(r: &Window) -> Option<(usize, usize, usize, usize)> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let w = DO_BOX[2].load(Relaxed);
+    if w == 0 {
+        return None;
+    }
+    let zid = DO_ZID.load(Relaxed);
+    let (dz, did) = ((zid >> 32) as u32, zid as u32);
+    if r.id == did || (r.z, r.id) > (dz, did) {
+        return None;
+    }
+    let b = (
+        DO_BOX[0].load(Relaxed),
+        DO_BOX[1].load(Relaxed),
+        w,
+        DO_BOX[3].load(Relaxed),
+    );
+    if !boxes_overlap(b, outer_box(r)) {
+        return None;
+    }
+    Some(b)
+}
+
+/// WC-K3 — how many pixels of the panel-row run `[x0, x1)` at row `y` landed inside `d`.
+///
+/// The verdict term's kernel, and the whole of its independence: it is asked of the bytes a `blit`
+/// just published, against the dragged window's box, with no reference to the [`OccClip`] that chose
+/// the run. Zero when no drag is live.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn span_occ(d: Option<(usize, usize, usize, usize)>, y: usize, x0: usize, x1: usize) -> u64 {
+    let Some((dx, dy, dw, dh)) = d else {
+        return 0;
+    };
+    if y < dy || y >= dy + dh {
+        return 0;
+    }
+    let a = x0.max(dx);
+    let b = x1.min(dx + dw);
+    if b <= a {
+        0
+    } else {
+        (b - a) as u64
+    }
+}
+
+/// WC-K3 — fold one occluded neighbour's present into the gesture's totals.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dragocc_note(id: WinId, written: u64, occ: u64, clipped: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if id < 32 {
+        DO_NEIGH_MASK.fetch_or(1u32 << id, Relaxed);
+    }
+    DO_NEIGH_PX.fetch_add(written, Relaxed);
+    DO_OCC_PX.fetch_add(occ, Relaxed);
+    DO_CLIP_PX.fetch_add(clipped, Relaxed);
+}
+
 /// DRAGFLICK — record one motion's erase against the live drag, if there is one.
 ///
 /// Gated on `DRAG_WIN == id` — the DRAGGED window, not merely "a drag is live" (review condition:
@@ -9042,6 +9288,50 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
         flash,
         if ok { "ONCE" } else { "FLASH" }
     );
+    // WC-K3 — THE OCCLUDEE LINE. A separate line rather than four more fields on `[drag]`, because
+    // the two answer different questions about different windows and the x86-witness spec reads
+    // `[drag]`'s wire; adding to it would move a gate another seat owns. Emitted unconditionally
+    // beside `[drag]` (same `moves == 0` silence above), so a gesture that bled is never a MISSING
+    // line — a witness whose absence and whose clean verdict look the same is no witness.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mask = DO_NEIGH_MASK.swap(0, Relaxed);
+        let npx = DO_NEIGH_PX.swap(0, Relaxed);
+        let opx = DO_OCC_PX.swap(0, Relaxed);
+        let cpx = DO_CLIP_PX.swap(0, Relaxed);
+        let direct = DO_DIRECT.swap(0, Relaxed);
+        let buried = DO_BURIED.swap(0, Relaxed);
+        let fpx = DO_FILL_PX.swap(0, Relaxed);
+        // REVIEW (NIT 6) — RETIRE THE BOX WITH THE GESTURE. `dragocc_pass` only zeroes `DO_BOX` when a
+        // pass actually RUNS with no drag live, and between two gestures there may be none — so every
+        // present in the gap kept charging the finished drag's geometry, and the next gesture's report
+        // opened with pixels that belonged to nobody's drag. Cleared here because this is the one site
+        // both ends of a gesture (`drag_end`, `drag_cancel`, and `drag_forget`/`drag_forget_owner`
+        // through the latter) pass through, immediately after the terms it feeds have been swapped out.
+        DO_BOX[2].store(0, Relaxed);
+        // `occ_px` is a window publishing over its occluder; `fill_px` is the coalesced desktop erase
+        // doing the same thing (review SHOULD-FIX 3), and it is in the verdict because it is the
+        // mechanism the arc convicted — a gesture that flashed desktop colour across the console must
+        // not read CLEAN. `direct` is the population the clip cannot reach, and a nonzero one is an
+        // unclipped publish whether or not this gesture happened to catch its pixels. All three are
+        // FORBIDs. `clip_px` and `buried` are deliberately NOT in the verdict: they are the
+        // mechanism's denominators, and a gesture over empty desktop legitimately has neither.
+        let clean = opx == 0 && fpx == 0 && direct == 0;
+        serial_println!(
+            "[drag-occ] win={} owner={:#x} moves={} neigh={} neigh_px={} occ_px={} fill_px={} clip_px={} buried={} direct={} -> {}",
+            id,
+            owner,
+            moves,
+            mask.count_ones(),
+            npx,
+            opx,
+            fpx,
+            cpx,
+            buried,
+            direct,
+            if clean { "CLEAN" } else { "BLEED" }
+        );
+    }
 }
 /// WMDIRECT — `[wm-act]` lines emitted, against [`WM_ACT_LOG_MAX`]. The begin/end/close lines are
 /// human-rate by construction (a hand cannot grab faster than serial can print), but the CANCEL arm
@@ -9287,6 +9577,245 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
         && b.0 < a.0.saturating_add(a.2)
         && a.1 < b.1.saturating_add(b.3)
         && b.1 < a.1.saturating_add(a.3)
+}
+
+// ---- WC-K3: the occluder clip ------------------------------------------------------------------
+//
+// **The defect (Peter, Boot AS, attended): "the stat window flashes over the TOP of the console
+// window it sits under".** A drag's `defer_erase` queue overflows (`MAX_DEFER` is eight, one motion
+// contributes up to four boxes) and the overflow COALESCES into unions that reach well beyond the
+// slivers the window actually vacated — Boot AS read `erase_px_pm` at 22106 against a 7592 baseline.
+// `drain_deferred` then re-damages every window the enlarged union meets, and `damage_intersecting`
+// marks each of them `damage_all()`: a five-pixel exposure at the edge of a neighbour costs that
+// neighbour a WHOLE-BOX repaint.
+//
+// The pass that follows is correct at its END — it blits ascending `(z, id)`, so the occluder lands
+// last — but it blits STRAIGHT TO GLASS with no back buffer for the panel as a whole, and
+// `[comp2]` measures a pass at 2279..2839 us on the bench. So for milliseconds the panel really does
+// hold the occludee's entire window, painted over its occluder, before the occluder is repainted on
+// top. That interval IS the bleed the operator sees, and no amount of re-ordering removes it: the
+// pixels are written, published, and then taken back.
+//
+// **The cure is to never write them.** A pixel of a window that a higher-`(z, id)` window covers is
+// not that window's pixel to publish — the pass will overwrite it in the same breath — so the blit
+// skips it. What reaches the panel is exactly the occludee's VISIBLE region, which is what the
+// enlarged union genuinely exposed, and the flash has nothing left to be made of. Coalescing is left
+// alone: it is sound (a union only ever repaints more desktop) and `coalesced=` still reports it.
+//
+// **x86 only, and the arch gate is a wire boundary rather than a scoping convenience** — the same
+// boundary GR21/WCD-OCC drew for [`OccSnap`]. `wm.rs` is shared with aarch64, whose `[wc-d]`/`[wc-g]`
+// read-backs have no occluder excuse at all: clipping there would leave the pi4 regression spec
+// reading occluder pixels inside a verified rect and calling them corruption. On x86 the excuse
+// already exists and this clip is built from a SUBSET of `occluders_above`'s population, so the
+// pixels the blit declines to write are a subset of the pixels the read-back declines to charge. On
+// aarch64 [`occ_clip`] returns the empty set and every blit below is PIXEL-IDENTICAL to the pre-arc
+// blit — the same runs, at the same offsets, from the same buffer.
+//
+// **"Pixel-identical", not "byte for byte", and the review was right to separate them.** The first
+// cut of this ledger claimed the latter, which is a claim about the BINARY and is false: the clip is
+// a parameter on two non-inlined boundaries, so aarch64 pays the argument even though it can never
+// hold a box. It is passed by REFERENCE for that reason (392 bytes copied per blit, twice, on an
+// arch that provably has nothing to say), and what the arch gate buys is that no aarch64 pixel
+// changes — not that no aarch64 instruction does.
+#[derive(Clone, Copy)]
+struct OccClip {
+    boxes: [(usize, usize, usize, usize); MAX_WINDOWS],
+    n: usize,
+}
+
+/// WC-K3 — [`OccClip`] with its boxes sorted by left edge, ready for the row walk.
+///
+/// **Why a second type instead of sorting inside the row loop (review, SHOULD-FIX 4).** The first
+/// cut built a `cov` array and insertion-sorted it PER SCANLINE, and allocated the span array per
+/// scanline too: ~400 bytes of stack initialisation and an O(n²) sort repeated for every row of
+/// every occluded present, which on a full-height console box is ~5.8 MB of memset per pass — the
+/// same order as the blit the clip exists to make cheaper. The geometry is fixed for the whole
+/// present, so the sort belongs to the present.
+///
+/// Sorted by `x0`, which is what lets [`Self::spans`] emit gaps in one forward pass with no
+/// per-row state beyond a cursor. Rows are filtered by each box's own `[y0, y1)` as the walk goes,
+/// so the ORDER is precomputed while the row-dependent part stays exact.
+struct OccRows {
+    /// `(x0, x1, y0, y1)` — half-open on both axes, clipped to the present's column range.
+    iv: [(usize, usize, usize, usize); MAX_WINDOWS],
+    n: usize,
+}
+
+impl OccClip {
+    /// Nothing above: the topmost window's clip, and every window's clip on aarch64.
+    const fn none() -> Self {
+        Self {
+            boxes: [(0, 0, 0, 0); MAX_WINDOWS],
+            n: 0,
+        }
+    }
+
+    /// Is `b` contained OUTRIGHT in one occluder box? The whole-window skip's test, kept to a single
+    /// box on purpose: a union test would have to be asked per row, and the cheap conservative answer
+    /// ("not provably invisible") costs only the ordinary per-row clip below, which is exact.
+    fn buries(&self, b: (usize, usize, usize, usize)) -> bool {
+        b.2 != 0
+            && b.3 != 0
+            && self.boxes[..self.n].iter().any(|&(ox, oy, ow, oh)| {
+                ox <= b.0
+                    && oy <= b.1
+                    && ox.saturating_add(ow) >= b.0 + b.2
+                    && oy.saturating_add(oh) >= b.1 + b.3
+            })
+    }
+
+    /// ONCE PER PRESENT: the occluder boxes clipped to the column range `[x0, x1)` and sorted by
+    /// left edge, with the ones that cannot meet this present's columns dropped outright.
+    ///
+    /// The insertion sort is over at most `MAX_WINDOWS` entries, and it runs once for a present that
+    /// is about to copy a box — not once per row, which is what SHOULD-FIX 4 convicted.
+    fn prepare(&self, x0: usize, x1: usize) -> OccRows {
+        let mut o = OccRows {
+            iv: [(0, 0, 0, 0); MAX_WINDOWS],
+            n: 0,
+        };
+        for &(ox, oy, ow, oh) in self.boxes[..self.n].iter() {
+            if ow == 0 || oh == 0 {
+                continue;
+            }
+            let a = ox.max(x0);
+            let b = ox.saturating_add(ow).min(x1);
+            if b <= a {
+                continue;
+            }
+            let e = (a, b, oy, oy.saturating_add(oh));
+            let mut k = o.n;
+            while k > 0 && o.iv[k - 1].0 > a {
+                o.iv[k] = o.iv[k - 1];
+                k -= 1;
+            }
+            o.iv[k] = e;
+            o.n += 1;
+        }
+        o
+    }
+}
+
+impl OccRows {
+    /// The x-intervals of panel row `y`, inside `[x0, x1)`, that NO occluder covers — ascending and
+    /// disjoint. Returns how many were written to `out`.
+    ///
+    /// At most `n` covered intervals produce at most `n + 1` gaps, which is why `out` is sized
+    /// `MAX_WINDOWS + 1`. `out` is the CALLER's buffer, hoisted out of its row loop: this function
+    /// allocates nothing and initialises nothing per row. One forward pass, no sort — [`prepare`]
+    /// ordered the boxes by `x0`, so a box that starts left of the cursor can only extend it, and
+    /// gaps fall out in order.
+    ///
+    /// [`prepare`]: OccClip::prepare
+    fn spans(
+        &self,
+        y: usize,
+        x0: usize,
+        x1: usize,
+        out: &mut [(usize, usize); MAX_WINDOWS + 1],
+    ) -> usize {
+        let mut n = 0usize;
+        let mut cur = x0;
+        for &(a, b, gy0, gy1) in self.iv[..self.n].iter() {
+            // Row filter, asked per row because it is the only row-dependent term. Half-open in `y`,
+            // matching `boxes_overlap` and `OccClip::buries`.
+            if y < gy0 || y >= gy1 {
+                continue;
+            }
+            if a > cur {
+                out[n] = (cur, a);
+                n += 1;
+            }
+            if b > cur {
+                cur = b;
+            }
+            if cur >= x1 {
+                break;
+            }
+        }
+        if cur < x1 {
+            out[n] = (cur, x1);
+            n += 1;
+        }
+        n
+    }
+}
+
+/// WC-K3 — the clip for `rows[i]`, built from the pass's OWN table snapshot.
+///
+/// Population is a SUBSET of [`occluders_above`]'s, restated against the snapshot the blit loop
+/// already holds: live, non-`compat`, **above the shell**, and stacked after `rows[i]` under the very
+/// key `composite_inner` sorts the blit order by (`(z, id) > (z, id)`).
+///
+/// ### REVIEW BLOCKER — `above_shell` IS TESTED, and the first cut's claim that it was implied was
+/// wrong in the one direction that leaves a permanent mark on the panel
+///
+/// That claim read [`above_shell`] as `r.z > shell`. It is not: it is
+/// `r.compat || is_kernel_owner(r.owner_asid) || r.z > shell`, and the CONSOLE is
+/// `KERNEL_OWNER_CONSOLE` at `z == 1` for the life of the boot. So the console composites whatever
+/// the shell is doing, while every user window sits at `z >= 2` and entered its clip — including
+/// user windows the shell arm had just HIDDEN and erased to `DESKTOP_BG`.
+///
+/// The concrete failure: a close-click raises the shell (`focus_changed(0)`), whose shell arm erases
+/// every user window's box to desktop colour and leaves it undrawn. The console's next repaint then
+/// withheld the spans under those boxes — spans nothing was going to paint, because their windows are
+/// below the shell and the blit loop declines them — leaving a desktop-coloured hole in the console
+/// that no later pass repairs, because the console is not damaged again and the hidden windows never
+/// draw. That is the CLOSEISO "the console must always survive" symptom, arriving through a clip.
+///
+/// The test restores the invariant the clip needs and never had: **every box in this set belongs to a
+/// window that is on the glass** — either already (it was not damaged this pass) or by the end of it
+/// (it was, and `(z, id)` orders it after us). A window the pass will not draw cannot be handed a
+/// pixel, so it must not be in the set. Narrowing only; `occ_clip ⊆ occluders_above` still holds,
+/// which is what keeps the read-back's excuse a superset of what the blit withholds.
+///
+/// **No second table lock.** `occluders_above` takes one because it runs for the witness, outside the
+/// loop's snapshot. This runs per blit on the shipping path, and a lock acquisition there would be
+/// both a cost and a fresh interleave; the snapshot is also the RIGHT source, because it is the
+/// geometry this pass is drawing against.
+///
+/// Empty on every arch but x86 (see the ledger above [`OccClip`]), and empty whenever nothing
+/// overlaps, so the per-row work below is skipped outright for the topmost window of any stack.
+#[allow(unused_variables, unused_mut)]
+fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32) -> OccClip {
+    let mut c = OccClip::none();
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (z, id) = (rows[i].z, rows[i].id);
+        let me = outer_box(&rows[i]);
+        for r in rows.iter() {
+            if !r.used || r.compat || !above_shell(r, shell) || (r.z, r.id) <= (z, id) {
+                continue;
+            }
+            let b = outer_box(r);
+            if b.2 == 0 || b.3 == 0 || !boxes_overlap(me, b) {
+                continue;
+            }
+            c.boxes[c.n] = b;
+            c.n += 1;
+        }
+    }
+    c
+}
+
+/// WC-K3 — [`occ_clip`] for a caller that holds no pass snapshot: WC-D's repair redraw.
+///
+/// Takes the table lock, which is exactly what [`occluders_above`] does one line away in the same
+/// region of `composite_inner`, and for the same reason — the repair runs outside the blit loop's
+/// snapshot. Witness-gated with its callers: the shipping path always has a snapshot.
+///
+/// The shell position is read here rather than passed, for the same reason the rows are: this caller
+/// has no pass to inherit either from. A shell that moves between the two reads costs the repair the
+/// clip a neighbouring pass would have used, and the repair is idempotent.
+#[cfg(feature = "witness")]
+fn occ_clip_live(r: &Window) -> OccClip {
+    let t = table();
+    let rows = t.rows;
+    drop(t);
+    match rows.iter().position(|q| q.used && q.id == r.id) {
+        Some(i) => occ_clip(&rows, i, shell_z()),
+        None => OccClip::none(),
+    }
 }
 
 /// DRAGFLICK — the area of `a ∩ b`, in pixels. Zero when they do not meet.
@@ -9828,6 +10357,7 @@ fn draw_window(
     may_overlay: bool,
     bracketed: bool,
     band: Option<(usize, usize)>,
+    clip: &OccClip,
 ) -> bool {
     // `stride`/`scale` are divisors below and `surf_len` bounds the reads, so all four are checked
     // here rather than trusted from the row.
@@ -9845,6 +10375,27 @@ fn draw_window(
     // claiming 10000x10000 would spin ~1e8 clipped pokes per present, from syscall context.
     let bw = bw.min(pw - bx);
     let bh = bh.min(ph - by);
+    // WC-K3 — BURIED OUTRIGHT: one window above this one contains its whole panel-clipped box, so
+    // every pixel this call would publish is a pixel the same pass (or the panel already) gives to
+    // that window. Publishing them costs a full compose and a full present and puts the occludee's
+    // frame on the glass for the length of the pass — the bleed, in its largest form. Skipped, with
+    // the damage flag already consumed by the caller: that is correct, because every event that can
+    // UNCOVER this window re-damages it from the vacated box (`move_to_inner`, `minimise`, `close` →
+    // `reclaim`, `focus_changed`), and the repaint that follows reads the source surface rather than
+    // trusting whatever survived on the panel.
+    //
+    // REVIEW — `!r.compat` is part of the test, and it keeps a compat row's behaviour exactly what it
+    // was. A compat row IS the full-screen present path; [`above_shell`] exempts it unconditionally
+    // for a reason (it cannot be raised back), `stage_window` declines it outright, and it is excluded
+    // from every clip SET already. Letting the skip apply to it would be the one place this arc
+    // changed the full-screen path, on an arm nothing else in the arc touches.
+    if !r.compat && clip.buries((bx, by, bw, bh)) {
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        if dragocc_target(r).is_some() {
+            DO_BURIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        return false;
+    }
     // CRISPYWIRE-REVIEW — a note on what this clip means for the chrome that `paint_window` draws
     // from `bw`/`bh` rather than from the row.
     //
@@ -9883,9 +10434,33 @@ fn draw_window(
             (y0, y1)
         }
     };
-    let staged =
-        stage_window(fb, r, bx, by, bw, bh, dy0, dy1, pw, ph, focused, offer, &mut overlaid);
+    let staged = stage_window(
+        fb,
+        r,
+        bx,
+        by,
+        bw,
+        bh,
+        dy0,
+        dy1,
+        pw,
+        ph,
+        focused,
+        offer,
+        &mut overlaid,
+        clip,
+    );
     if !staged {
+        // WC-K3 — the pre-WC-H direct path is UNCLIPPED, and that is stated on the wire rather than
+        // argued away. `paint_window` writes pixel by pixel through `put_pixel`, and asking the clip
+        // per pixel would be the one place its cost stopped being free; the whole-box skip above is
+        // what covers this path for the case that matters (buried outright). A partially occluded
+        // neighbour that lands here still publishes over its occluder, so the drag witness counts the
+        // present as `direct=` and the gesture reads `-> BLEED` — the residual names itself.
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        if dragocc_target(r).is_some() {
+            DO_DIRECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         paint_window(fb, r, 0, 0, bx, by, bw, bh, pw, ph, focused, false);
     }
     // CURSOR-4 — this window has just painted its clipped outer box. If it did NOT compose the
@@ -10716,6 +11291,7 @@ fn stage_window(
     focused: bool,
     cur: Option<super::cursor::Plan>,
     overlaid: &mut bool,
+    clip: &OccClip,
 ) -> bool {
     if r.compat {
         // Not a decline: compat rows are out of scope by design (see `draw_window`), and counting
@@ -10798,6 +11374,22 @@ fn stage_window(
     #[cfg(feature = "witness")]
     let (mut compose_cyc, mut present_cyc) = (0u64, 0u64);
 
+    // WC-K3 — the occludee witness's per-present accumulators. `dbox` is the LIVE drag's box (see
+    // `dragocc_target`), read once here rather than per row: it is the independent yardstick the
+    // verdict is measured against, and it comes from a different source than the `clip` this loop
+    // subtracts, which is what keeps `occ_px` from being an assertion about itself.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    let dbox = dragocc_target(r);
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    let (mut wrote_px, mut occ_px, mut clip_px) = (0u64, 0u64, 0u64);
+
+    // WC-K3 — ONCE PER PRESENT, not once per scanline (review, SHOULD-FIX 4). The occluder geometry
+    // is fixed for the whole present, so both the sort and the two stack arrays are hoisted out of
+    // the row loop: `occ` holds the boxes ordered by left edge, `spans` is the row walk's scratch and
+    // is overwritten in place. Neither is touched at all on the `clip.n == 0` fast path.
+    let occ = clip.prepare(bx, bx + bw);
+    let mut spans = [(0usize, 0usize); MAX_WINDOWS + 1];
+
     let fb_row = info.stride * bpp;
     // WC-M — one band per turn. `band` is the box-relative row the buffer currently holds.
     // FBCON-DMG — it starts at the damaged range's first row and stops at its last, instead of
@@ -10869,9 +11461,44 @@ fn stage_window(
         // Present: one bulk copy per row. This is the whole of what the scan-out can catch
         // mid-flight, and it is the same primitive and the same shape as
         // `Screen::present_background`'s damage-rect flush.
+        //
+        // WC-K3 — and the row is now emitted as its UNOCCLUDED SPANS. `clip.n == 0` is the unchanged
+        // loop, byte for byte, and it is the branch every aarch64 present and every topmost window
+        // takes; otherwise each row is copied as the one-to-few sub-slices no higher window covers.
+        // The primitive is identical (`fb.blit` of a contiguous run at the panel's stride), so the
+        // tear-free contract is unchanged — a span is as atomic as a row was. What changes is only
+        // which bytes are published, and the bytes withheld are bytes the pass is about to overwrite
+        // from the window that owns them.
         for y in 0..rows {
             let src = y * row_bytes;
-            fb.blit((by + band + y) * fb_row + bx * bpp, &stage[src..src + row_bytes]);
+            let py = by + band + y;
+            if clip.n == 0 {
+                fb.blit(py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
+                #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+                {
+                    wrote_px += bw as u64;
+                    occ_px += span_occ(dbox, py, bx, bx + bw);
+                }
+                continue;
+            }
+            let ns = occ.spans(py, bx, bx + bw, &mut spans);
+            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            let mut row_written = 0u64;
+            for &(sx0, sx1) in spans[..ns].iter() {
+                let off = (sx0 - bx) * bpp;
+                let len = (sx1 - sx0) * bpp;
+                fb.blit(py * fb_row + sx0 * bpp, &stage[src + off..src + off + len]);
+                #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+                {
+                    row_written += (sx1 - sx0) as u64;
+                    occ_px += span_occ(dbox, py, sx0, sx1);
+                }
+            }
+            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            {
+                wrote_px += row_written;
+                clip_px += bw as u64 - row_written;
+            }
         }
 
         #[cfg(feature = "witness")]
@@ -10882,6 +11509,19 @@ fn stage_window(
         band += rows;
     }
 
+    // WC-K3 — fold this present into the live gesture's totals, if it was a neighbour of one.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    if dbox.is_some() {
+        dragocc_note(r.id, wrote_px, occ_px, clip_px);
+    }
+
+    // WC-K3 — `bytes` is the extent this present OWED, and on an occluded window that is now an upper
+    // bound rather than an identity: the row loop above withholds the spans a higher window covers,
+    // so the panel received `bytes - (clip_px * bpp)` of it. Left as the owed extent deliberately —
+    // it is the number `[wc-h]`'s cost readings and `x86-witness.spec` are calibrated against, and
+    // moving a gate's wire is not this arc's to do. The withheld half is reported where it belongs,
+    // as `clip_px=` on `[drag-occ]`.
+    //
     // `bytes` is what REACHED THE PANEL, not what the buffer held — on a WC-M-banded present that is
     // the whole box, and it is the number that says banding happened at all (a `-> BUFFERED` line
     // whose `bytes=` exceeds `MAX_STAGE_BYTES` could not have been staged before WC-M).
@@ -11094,6 +11734,47 @@ fn stage_fill(
     // WC-H's tear-free argument rests on, whatever the timings say.
     let mut contig = x * bpp + row_bytes <= fb_row;
     let mut prev = usize::MAX;
+    // WC-K3 REVIEW (SHOULD-FIX 3) — THE ERASE'S OWN PUBLISH INSIDE THE DRAGGED WINDOW'S BOX.
+    //
+    // `occ_px` watches the window blits and cannot see this loop, and this loop is the arc's own
+    // convicted mechanism: the coalesced union reaches under the dragged window, and `DESKTOP_BG`
+    // lands there at the head of the pass, milliseconds before the window is repainted over it. So a
+    // gesture could flash desktop colour across the console and still print `-> CLEAN`. `flash_px`
+    // does not cover it either — WC-K2r's note above `move_note_erase` says exactly why: it counts
+    // what was HANDED OVER, and coalescing is where the request and the paint part company.
+    //
+    // Kept as its own term rather than folded into `occ_px` so the two mechanisms stay
+    // distinguishable on the wire: `occ_px` is a window publishing over its occluder, `fill_px` is
+    // the desktop fill doing it. They have different cures and a reader must not have to guess which
+    // one a nonzero verdict names.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    let fbox = {
+        // No painter to compare against here — the fill belongs to no window — so the test is simply
+        // "did this desktop row land inside the dragged window's box". `dragocc_target` needs a row;
+        // the box is read directly for that reason.
+        //
+        // ONE PASS STALE, and in the harmless direction. `drain_deferred` runs at the HEAD of
+        // `composite_inner`, ahead of the table snapshot that `dragocc_pass` publishes from, so this
+        // reads the box the previous pass established — the dragged window one motion report ago,
+        // which is a few pixels away. A drag step is small and the term is a per-gesture total, so
+        // the effect is a handful of pixels at the leading edge of the first fill; it cannot turn a
+        // gesture that flashed nothing into a nonzero reading, and the first pass of a gesture (box
+        // still cleared from the last one) is simply not charged.
+        use core::sync::atomic::Ordering::Relaxed;
+        let dw = DO_BOX[2].load(Relaxed);
+        if dw == 0 {
+            None
+        } else {
+            Some((
+                DO_BOX[0].load(Relaxed),
+                DO_BOX[1].load(Relaxed),
+                dw,
+                DO_BOX[3].load(Relaxed),
+            ))
+        }
+    };
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    let mut fill_px = 0u64;
     for r in 0..h {
         let off = (y + r) * fb_row + x * bpp;
         if prev != usize::MAX && off != prev + fb_row {
@@ -11101,6 +11782,14 @@ fn stage_fill(
         }
         prev = off;
         fb.blit(off, &stage[..row_bytes]);
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        {
+            fill_px += span_occ(fbox, y + r, x, x + w);
+        }
+    }
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    if fill_px > 0 {
+        DO_FILL_PX.fetch_add(fill_px, core::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "witness")]
