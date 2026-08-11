@@ -3701,24 +3701,37 @@ impl XhciController {
 
                                             let rel = slot.mouse_is_relative;
                                             let buttons = data_data[0];
-                                            let (last_a, last_b) = if rel {
+                                            // DRAGGLIDE — the motion is DECIDED here and PUSHED
+                                            // below, paired with this report's button edge, so the
+                                            // reorder that puts a release edge ahead of its own
+                                            // lift is told which lift is its own rather than
+                                            // inferring it from arrival order. On the rMBP this
+                                            // controller and the EHCI trackpad produce
+                                            // concurrently, and a foreign motion landing between
+                                            // two separate pushes would aim the swap at the wrong
+                                            // entry — the ~1px hop, back, reporting success.
+                                            let (last_a, last_b, motion) = if rel {
                                                 // HID BOOT mouse: byte0 = buttons, byte1 = dx:i8, byte2 = dy:i8
                                                 // (byte3 = wheel, ignored). Signed relative deltas — sign-extend
                                                 // i8 -> i32 and emit only on actual motion.
                                                 let dx = data_data[1] as i8 as i32;
                                                 let dy = data_data[2] as i8 as i32;
-                                                if dx != 0 || dy != 0 {
-                                                    crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
-                                                }
-                                                (dx, dy)
+                                                let m = if dx != 0 || dy != 0 {
+                                                    Some(crate::pal::Event::Mouse { x: dx, y: dy })
+                                                } else {
+                                                    None
+                                                };
+                                                (dx, dy, m)
                                             } else {
                                                 // usb-tablet / absolute pointer: byte1-2 = X, byte3-4 = Y (0..32767).
                                                 let x = (data_data[1] as u16) | ((data_data[2] as u16) << 8);
                                                 let y = (data_data[3] as u16) | ((data_data[4] as u16) << 8);
-                                                if x != 0 || y != 0 {
-                                                    crate::pal::push_event(crate::pal::Event::MouseAbsolute { x: x as i32, y: y as i32 });
-                                                }
-                                                (x as i32, y as i32)
+                                                let m = if x != 0 || y != 0 {
+                                                    Some(crate::pal::Event::MouseAbsolute { x: x as i32, y: y as i32 })
+                                                } else {
+                                                    None
+                                                };
+                                                (x as i32, y as i32, m)
                                             };
                                             // `slot` (the shared borrow) is no longer read past here;
                                             // the &mut self accesses below are the count bump + re-arm.
@@ -3736,11 +3749,22 @@ impl XhciController {
                                             // the same correct release edge (a fix, not a risk —
                                             // EHCI keeps its own emit).
                                             let prev_btn = self.slots[slot_id as usize].mouse_prev_buttons;
-                                            if buttons != prev_btn {
-                                                #[cfg(feature = "usbdebug")]
+                                            let edge = buttons != prev_btn;
+                                            #[cfg(feature = "usbdebug")]
+                                            if edge {
                                                 serial_println!("[hidkeys] button {:#04x} -> {:#04x} slot={}", prev_btn, buttons, slot_id);
-                                                crate::pal::push_event(crate::pal::Event::Button(buttons));
                                             }
+                                            // DRAGGLIDE — ONE report, ONE push (see the motion
+                                            // decode above). Unconditional on there being an edge:
+                                            // a motion-only report still goes through this seam.
+                                            crate::pal::push_pointer_report(
+                                                motion,
+                                                if edge {
+                                                    Some(crate::pal::Event::Button(buttons))
+                                                } else {
+                                                    None
+                                                },
+                                            );
                                             self.slots[slot_id as usize].mouse_prev_buttons = buttons;
 
                                             // UI1-MOUSE M1: bounded serial mouse-witness — first report

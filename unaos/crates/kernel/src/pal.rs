@@ -732,6 +732,28 @@ impl EventQueue {
     fn len(&self) -> usize {
         self.head.wrapping_sub(self.tail) % QUEUE_SIZE
     }
+
+    /// DRAGGLIDE — put the just-pushed release BUTTON ahead of the MOTION immediately behind it.
+    ///
+    /// The two newest entries only, and only in the one shape this is written for: a pointer motion
+    /// followed by a `Button`. Answers whether the swap happened, because the caller publishes that
+    /// as the per-gesture witness bit.
+    fn swap_release_ahead_of_lift(&mut self) -> bool {
+        if self.len() < 2 {
+            return false;
+        }
+        let last = (self.head + QUEUE_SIZE - 1) % QUEUE_SIZE;
+        let prev = (self.head + QUEUE_SIZE - 2) % QUEUE_SIZE;
+        let shape = matches!(self.buffer[last], Event::Button(_))
+            && matches!(
+                self.buffer[prev],
+                Event::Mouse { .. } | Event::MouseAbsolute { .. }
+            );
+        if shape {
+            self.buffer.swap(last, prev);
+        }
+        shape
+    }
 }
 
 lazy_static! {
@@ -837,9 +859,79 @@ static RELEASE_EDGES_PENDING: core::sync::atomic::AtomicU32 = core::sync::atomic
 /// the count and the consumption the same event by construction.
 static PREV_BTN_MASK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// DRAGGLIDE — **the lift motion must not be drained BEFORE the release edge it belongs to.**
+///
+/// Every HID pointer path in this kernel decodes one report into, in this order, an `Event::Mouse` /
+/// `Event::MouseAbsolute` for the report's dx/dy (pushed only when nonzero) and then an
+/// `Event::Button` for a mask change. On the RELEASE report that means the lift's own last fraction
+/// of travel is queued AHEAD of the release edge, and any consumer that treats "a motion drained
+/// while a release edge is still queued" as pre-release hand travel — which is exactly what the drag
+/// tail must now do to kill the glide — would steer the window by it. That motion is the ~1px the
+/// DRAGSETTLE arc removed and metal confirmed gone; it must not come back.
+///
+/// So the producer puts the edge in front of its own lift, here, at the one seam every pointer path
+/// already passes. Ordering the two events *relative to each other* is a producer decision (they came
+/// out of one report; nothing downstream can reconstruct that), and it is made where the report's
+/// structure is still knowable rather than guessed at from the drain.
+///
+/// **Which lift, decided by the DECODE SITE and not by inference.** Every production pointer path
+/// pushes its report through [`push_pointer_report`], which carries both events into the ring under
+/// one lock and tells the reorder, as a fact, whether this button has its own lift behind it
+/// ([`LiftHint`]). The sequence-and-time heuristic below survives only as the [`LiftHint::Unknown`]
+/// fallback, for a bare `Button` pushed by something that is not a decoded report — a selftest, a
+/// synthesiser, a future producer. In every case the SHAPE test in
+/// [`EventQueue::swap_release_ahead_of_lift`] has the last word: it is what stops a
+/// Button-behind-Button (a secondary release sitting between a primary press and its release) from
+/// being swapped, and what keeps the `Unknown` sequence comparison honest before any motion has ever
+/// been pushed.
+///
+/// **The residue that remains, and the direction it is biased in.** On the `Unknown` path a release
+/// with no lift of its own can still hoist the edge over the PREVIOUS event's motion if that motion
+/// is the immediately preceding push and landed inside [`LIFT_ADJACENCY_MS`], ending the drag one
+/// report of hand travel early. The opposite error — declining a swap that was owed — lets the lift
+/// steer the window, which is the ~1px hop DRAGSETTLE removed and metal confirmed gone. Both are
+/// bounded by a single report's dx/dy and neither is a jump, but the second is the one Peter would
+/// recognise, so the slack is sized to make MISSES impossible rather than false swaps impossible.
+/// `swap=` on the `[dragrel]` line makes the choice visible on a capture rather than a matter of
+/// trust.
+///
+/// **This latch is a WITNESS BIT, not a control input** — nothing in the kernel branches on it; the
+/// `[dragrel]` line and `wmdirect_selftest` are its only readers. It is global rather than
+/// per-gesture, so with two pointers live (the rMBP's EHCI pad and an xHCI mouse) a release from the
+/// OTHER device between a gesture's press and its release overwrites it, and `swap=` then describes
+/// that device's report rather than the dragged gesture's. The reorder itself is unaffected — it is
+/// decided per push, under the lock, from the pushing report's own hint — so the misreport costs a
+/// capture one ambiguous field and costs the window nothing.
+static RELEASE_EDGE_REORDERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DRAGGLIDE — count of STORED pushes, so "the immediately preceding push" is an exact test.
+static PUSH_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRAGGLIDE — [`PUSH_SEQ`] as of the last STORED pointer-motion push.
+static MOTION_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRAGGLIDE — `ms()` as of the last STORED pointer-motion push.
+static MOTION_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGGLIDE — how far apart a motion and a release button may be pushed and still be read as ONE
+/// report (see [`RELEASE_EDGE_REORDERED`]).
+///
+/// Sized from both sides. It must exceed the jitter WITHIN a service pass — the two pushes are
+/// microseconds apart, but `ms()` is a 1 kHz tick and can roll over between them, and an interrupt
+/// can land in the gap — or a swap that was owed is missed and the lift steers the window. It must
+/// stay well under one HID report interval (~8 ms at 125 Hz; the rMBP's internal pad is slower still)
+/// or a motion from the PREVIOUS report is mistaken for this report's lift. 2 ms clears a tick
+/// boundary with a whole tick to spare and is a quarter of the interval it must not reach.
+const LIFT_ADJACENCY_MS: u64 = 2;
+
 /// DRAGSETTLE — release edges queued and not yet drained (see [`RELEASE_EDGES_PENDING`]).
 pub fn release_edge_pending() -> u32 {
     RELEASE_EDGES_PENDING.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// DRAGGLIDE — whether the LIVE gesture's release edge was reordered ahead of its own lift motion
+/// (see [`RELEASE_EDGE_REORDERED`]). Cleared by the next primary PRESS, so it reads per gesture.
+pub fn release_edge_reordered() -> bool {
+    RELEASE_EDGE_REORDERED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// DRAGSETTLE — a router drained one release edge. Saturating, because the counter is advisory: a
@@ -853,7 +945,34 @@ pub fn note_release_edge_drained() {
     );
 }
 
-pub fn push_event(event: Event) {
+/// DRAGGLIDE — what the PRODUCER knows about the lift motion belonging to a `Button` it is pushing.
+///
+/// The reorder in [`push_locked`] has to answer "is the entry behind this release edge the SAME HID
+/// REPORT's lift?" — and only the decode site knows. This carries that answer instead of guessing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiftHint {
+    /// This button is being pushed as one report together with a motion, and that motion was STORED.
+    /// The entry behind the edge is that lift, by construction — swap, no heuristic.
+    Paired,
+    /// This report carried NO motion of its own (or the ring dropped it). Whatever is behind the edge
+    /// belongs to an earlier report and must NOT be jumped — no swap, and no heuristic either, which
+    /// is the whole reason a decode site says so explicitly.
+    NoLift,
+    /// The caller is not a paired pointer report (a selftest, a synthesiser, any future producer that
+    /// pushes a bare `Button`). Fall back to the adjacency heuristic.
+    Unknown,
+}
+
+/// The body of [`push_event`], with the ring lock already held.
+///
+/// DRAGSETTLE — the ring push and the pending-release accounting happen under the SAME
+/// interrupt-free section. Review defect this closes: with the `fetch_add` outside it, a drain could
+/// pop the release and saturating-sub the count BEFORE the producer had added it, leaving a phantom
+/// `pend=1` with nothing queued — which costs the next gesture a full grace and a `level-late` end.
+///
+/// DRAGGLIDE — the REORDER joins them, and it must: it reads the two newest ring entries and the
+/// push-adjacency record, both of which a concurrent producer would move under it.
+fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let is_ptr = matches!(
         event,
@@ -865,13 +984,24 @@ pub fn push_event(event: Event) {
     } else if is_key {
         EVQ_PUSH_KEY.fetch_add(1, Relaxed);
     }
-    // DRAGSETTLE — the ring push and the pending-release accounting happen under the SAME
-    // interrupt-free section. Review defect this closes: with the `fetch_add` outside it, a drain
-    // could pop the release and saturating-sub the count BEFORE the producer had added it, leaving a
-    // phantom `pend=1` with nothing queued — which costs the next gesture a full grace and a
-    // `level-late` end.
-    let stored = crate::arch::without_interrupts(|| {
-        let stored = EVENT_QUEUE.lock().push(event);
+    let stored = {
+        let stored = q.push(event);
+        // DRAGGLIDE — the adjacency record. The sequence is bumped on EVERY push, stored or not:
+        // review defect this closes — with the bump conditional on `stored`, an event the full ring
+        // dropped left the push BEFORE it looking adjacent to the push AFTER it, manufacturing
+        // exactly the false adjacency the record exists to rule out (a dropped lift would hand the
+        // PREVIOUS report's motion to the swap). `MOTION_SEQ` is still only written for motions that
+        // were actually stored — an entry that is not in the ring can neither be the lift nor sit
+        // behind the edge.
+        let seq = PUSH_SEQ.fetch_add(1, Relaxed);
+        if stored && matches!(event, Event::Mouse { .. } | Event::MouseAbsolute { .. }) {
+            MOTION_SEQ.store(seq, Relaxed);
+            // The clock is read HERE and in the release arm below, not once per `push_event`:
+            // `arch::ms()` is a 64-bit division on aarch64 (CNTVCT / (CNTFRQ/1000)), and this seam
+            // carries every keystroke and timer event on both arches. Only pointer traffic can ever
+            // consult the stamp, so only pointer traffic pays for it.
+            MOTION_MS.store(crate::arch::ms(), Relaxed);
+        }
         if let Event::Button(mask) = event {
             let prev = PREV_BTN_MASK.swap(mask, Relaxed);
             if prev & 0x01 != 0 && mask & 0x01 == 0 {
@@ -881,22 +1011,93 @@ pub fn push_event(event: Event) {
                 // one occasion the belt is the only end there is.
                 if stored {
                     RELEASE_EDGES_PENDING.fetch_add(1, core::sync::atomic::Ordering::Release);
+                    // DRAGGLIDE — and it goes AHEAD of its own lift motion (see
+                    // [`RELEASE_EDGE_REORDERED`]). The producer's own answer first; the heuristic
+                    // only when there is no producer to ask.
+                    let adjacent = match lift {
+                        LiftHint::Paired => true,
+                        LiftHint::NoLift => false,
+                        LiftHint::Unknown => {
+                            MOTION_SEQ.load(Relaxed) == seq.wrapping_sub(1)
+                                && crate::arch::ms().wrapping_sub(MOTION_MS.load(Relaxed))
+                                    <= LIFT_ADJACENCY_MS
+                        }
+                    };
+                    // The SHAPE test is the last word in every case, including `Paired`: it is what
+                    // stops a Button-behind-Button (a secondary release landing between a primary
+                    // press and its release) from being swapped, and what keeps the `Unknown`
+                    // sequence comparison honest before any motion has ever been pushed
+                    // (`MOTION_SEQ` still 0, when it can match by accident).
+                    let swapped = adjacent && q.swap_release_ahead_of_lift();
+                    RELEASE_EDGE_REORDERED
+                        .store(swapped, core::sync::atomic::Ordering::Release);
                 }
             } else if prev & 0x01 == 0 && mask & 0x01 != 0 {
                 // A primary PRESS opens a new gesture: whatever release was still counted belongs to
                 // a gesture that is over, and carrying it forward would hold the next drag for the
                 // whole grace.
                 RELEASE_EDGES_PENDING.store(0, core::sync::atomic::Ordering::Release);
+                RELEASE_EDGE_REORDERED.store(false, core::sync::atomic::Ordering::Release);
             }
         }
         stored
-    });
+    };
     if !stored {
         if is_ptr {
             EVQ_DROP_PTR.fetch_add(1, Relaxed);
         } else if is_key {
             EVQ_DROP_KEY.fetch_add(1, Relaxed);
         }
+    }
+    stored
+}
+
+pub fn push_event(event: Event) {
+    crate::arch::without_interrupts(|| {
+        let mut q = EVENT_QUEUE.lock();
+        push_locked(&mut q, event, LiftHint::Unknown);
+    });
+}
+
+/// DRAGGLIDE — **push ONE HID pointer report as ONE thing.**
+///
+/// Every pointer decode site in this kernel produces at most two events from a single report: the
+/// report's dx/dy (only when nonzero) and a `Button` (only on a mask change). Pushed separately they
+/// are two independent trips through the ring lock, and the reorder that must put a release edge in
+/// front of its own lift then has to INFER that the two belong together. That inference is not sound
+/// on this machine: the rMBP runs an EHCI trackpad and an xHCI port as concurrent producers, so a
+/// foreign `Mouse` from the other controller can land in the gap microseconds apart — inside any
+/// time window worth having — and the swap fires on the WRONG entry, hoisting the real lift AHEAD of
+/// the edge where the drag tail's lead branch steers the window by it. That is the ~1px DRAGSETTLE
+/// removed, returning with `swap=1` reporting success.
+///
+/// So the pairing is made at the decode site, where it is a fact rather than a guess, and this is
+/// the seam that carries it: one lock, both events, [`LiftHint::Paired`] for the button. A report
+/// with no motion of its own passes `motion: None` and the button is judged [`LiftHint::NoLift`] —
+/// equally a fact, and the case a heuristic gets WRONG in the other direction (it would hoist the
+/// edge over the previous report's motion and end the drag a report early).
+///
+/// `wmdirect_selftest` drives this same function for the same reason, one layer up: it asserts an
+/// EXACT resting coordinate, and a consumer popping the lift out of the gap made it read the very
+/// ~1px it exists to forbid — measured at one run in 25 of the wc QEMU gate before this landed.
+pub fn push_pointer_report(motion: Option<Event>, button: Option<Event>) {
+    match (motion, button) {
+        (None, None) => {}
+        (Some(m), None) => push_event(m),
+        (None, Some(b)) => crate::arch::without_interrupts(|| {
+            let mut q = EVENT_QUEUE.lock();
+            push_locked(&mut q, b, LiftHint::NoLift);
+        }),
+        (Some(m), Some(b)) => crate::arch::without_interrupts(|| {
+            let mut q = EVENT_QUEUE.lock();
+            // A lift the ring DROPPED is not behind the edge, so the pairing claim dies with it.
+            let hint = if push_locked(&mut q, m, LiftHint::Unknown) {
+                LiftHint::Paired
+            } else {
+                LiftHint::NoLift
+            };
+            push_locked(&mut q, b, hint);
+        }),
     }
 }
 

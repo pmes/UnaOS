@@ -8604,8 +8604,9 @@ the edge — it was standing in front of it, and the lift it applied is the ~1 p
    lift's cost, which is what the operator sees). A grab-and-let-go with no motion between the edges
    settles at its own grab point.
 
-**The witness.** `[dragrel] win= end= settle= release= stale= post= pend= wait= -> CLEAN|DIRTY`, one
-line per gesture end, from both end paths, immediately before the `wm` call that clears the gesture.
+**The witness.** `[dragrel] win= end= settle= release= stale= lead= swap= post= pend= wait= ->
+CLEAN|DIRTY`, one line per gesture end, from both end paths, immediately before the `wm` call that
+clears the gesture. (`lead=` and `swap=` were added by DRAGGLIDE below.)
 `end=` names the path (`edge` = the delivered release; `level` = the belt with no edge queued;
 `level-late` = the belt firing past the deadline). `stale=` is `release - settle`: **the motion that
 arrived after the button read up**, i.e. exactly what the old code applied to the window and this
@@ -8628,18 +8629,199 @@ stream rather than beside it. `end=level-late` recurring names a consumer eating
 
 **The gate.** `wmdirect_selftest` leg 9, reported as `settle=` on the `[wm-act] direct` line. It
 reproduces the release order through the real seams — `pal::push_event` produces, `pal::next_event`
-drains, each popped event goes through `wc_route_event` + `wc_route_tail`. **Two** of its three
-conjuncts are red on the shipping code: the drag is still live after the lift motion is routed
-(`held`), and the row rests at the +24 the hand steered to rather than the +27 the lift left the
-arrow at (`rest`). The third, that the queued edge is what ends it (`ended`), is vacuously true
-pre-fix — the belt had already ended the gesture — and is kept only to pin *which* path did the
-ending in combination with `held`. In-tree QEMU prints
-`[dragrel] win=1 end=edge settle=(451,307) release=(454,310) stale=(3,3) post=0 pend=0 wait=0ms -> CLEAN`
-for that leg — the dropped lift, named.
+drains, each event goes through `wc_route_event` + `wc_route_tail`. Its load-bearing conjunct against
+the pre-DRAGSETTLE code is `rest`: the row rests at the +24 the hand steered to rather than the +27
+the lift left the arrow at. (DRAGGLIDE re-cut the rest of the leg; see below.)
 
 **Metal watch-list.** Every gesture in a capture should print `end=edge`, with `end=level` surviving
-only for genuinely lost releases and `end=level-late` not at all. `stale=` is the measurement of the
-old defect and is expected to be small and nonzero on a trackpad.
+only for genuinely lost releases and `end=level-late` not at all.
+
+**Metal verdict (Boot A, GR25).** Confirmed on both counts — the ~1 px hop gone, every gesture
+`end=edge` — and it produced the next complaint, which DRAGGLIDE answers.
+
+## DRAGGLIDE — the wait must not go deaf (2026-08-11)
+
+`arch/x86_64/syscall.rs`, `pal.rs`. Peter's Boot A verdict on DRAGSETTLE: the hop is gone and
+`[dragrel]` reads `end=edge` CLEAN throughout, but the window now **glides to a landing** — it comes
+visibly to rest *before* the hand lets go.
+
+**The cause is the wait's side effect.** DRAGSETTLE's tail returns without steering while
+`release_edge_pending() > 0`, and that `return` DROPS the motion. From the instant a release is
+queued until the drain pops it, every motion the tail sees is discarded — while the drain, which
+moves the cursor *before* it reaches the tail, keeps advancing the arrow. Those motions are not
+post-release slop: the queue is FIFO and the edge is behind them, so by construction they were
+produced with the button physically down. They are the last inches of the gesture, and the window is
+denied them. On a drain running behind a 125 Hz pointer that is a backlog of whole reports — which is
+what the GR25 capture's `stale=` up to `(-7,16)` was measuring all along.
+
+**Two halves, and neither is correct alone.**
+
+ * **The consumer (`wc_drag_motion`).** A motion drained while a release edge is still queued now
+   STEERS and is recorded as the settle, exactly as it would have with the button still down. The
+   wait keeps its job — only the edge may END the gesture — and loses its side effect. The grace
+   deadline is deliberately *not* restarted by a lead motion, or a hand that kept moving after an
+   edge some other consumer ate would hold the belt off for the rest of the boot.
+ * **The producer (`pal::push_event`).** Steering with every pre-edge motion would include the
+   release report's OWN lift dx/dy, which every HID path pushes *ahead* of its `Button` — i.e. it
+   would put the ~1 px straight back. So the producer puts the release edge in front of its own lift,
+   in the ring, at the one seam every pointer path already passes. Ordering two events that came out
+   of one report is a producer decision; nothing downstream can reconstruct which report a queued
+   motion belonged to.
+
+**Which lift, decided by the decode site.** Inferring that a queued motion and a queued button came
+out of the same report is not sound on this machine: the rMBP runs an EHCI trackpad and an xHCI port
+as *concurrent* producers, so a foreign `Mouse` from the other controller can land between the two
+pushes microseconds apart — inside any time window worth having — and the swap then fires on the
+wrong entry, hoisting the real lift AHEAD of the edge where the lead branch steers the window by it.
+That is the ~1 px returning with `swap=1` reporting success.
+
+So all six production decode sites (`ehci/mod.rs` ×3, `xhci/mod.rs`) now push their report through
+`pal::push_pointer_report(motion, button)`: one lock, both events, and the reorder is *told* whether
+this button has its own lift behind it (`LiftHint::Paired`) or none at all (`LiftHint::NoLift` — a
+report with zero dx/dy, which a heuristic gets wrong in the other direction by hoisting the edge over
+the previous report's motion). The sequence-and-time heuristic survives only as the `Unknown`
+fallback, for a bare `Button` pushed by something that is not a decoded report. In every case the
+SHAPE test has the last word — it is what stops a Button-behind-Button (a secondary release between a
+primary press and its release) from being swapped.
+
+**The residue that remains.** On the `Unknown` path a release with no lift of its own can still hoist
+the edge over the previous event's motion if that motion is the immediately preceding push and landed
+within `LIFT_ADJACENCY_MS` (2 ms), ending the drag one report of hand travel early. The opposite
+error — declining a swap that was owed — lets the lift steer, which is the hop Peter just confirmed
+gone, so the slack is sized to make **misses** impossible rather than false swaps impossible. Both
+are bounded by one report's dx/dy and neither is a jump.
+
+**Arch note: none of this is x86-gated.** `push_pointer_report`, the reorder and the adjacency record
+live in `pal.rs`, so aarch64 gets the reordered stream too. That is correct rather than incidental —
+a release edge ahead of its own lift is the right order for any consumer — and it is deliberately not
+cfg-split, because a queue that behaves differently per arch is a worse thing to own than a swap
+aarch64 does not currently read. The one cost worth naming is the clock: `arch::ms()` on aarch64 is a
+64-bit division (`CNTVCT / (CNTFRQ/1000)`), so it is read only where the stamp can matter — on a
+stored pointer *motion*, and on the `Unknown` release arm — never once per `push_event`, which would
+have charged every keystroke and timer event on both arches for a pointer-only mechanism.
+
+**The lead settle is trusted for 32 ms, not for the whole grace (`LEAD_TRUST_MS`).** A motion drained
+while the edge is queued was produced with the button down *by queue order*, but that reasoning has a
+shelf life: it holds while the edge is a drain tick behind — a backlog measured in milliseconds — and
+not for the full 120 ms `RELEASE_EDGE_GRACE_MS`, which is sized for an edge some other consumer ATE.
+Without the bound, an `end=level-late` gesture would walk its settle along with the hand for up to
+120 ms *past* the release and come to rest well beyond where the operator let go — with `stale=`
+reading `(0,0)` throughout, because `stale` is measured against the settle that code just moved.
+Past the trust window the motions still steer (the window keeps following, so no glide returns) but
+they stop moving the settle, and the belt ends the gesture where the hand actually was. `lead=` keeps
+counting across both regimes.
+
+**The witness.** Two fields on `[dragrel]`. `lead=` counts motions steered while the release edge was
+queued — the hand travel the window used to be denied, and the glide's own measurement. `swap=` is 1
+when `pal` reordered this gesture's edge ahead of its own lift. Expected shape after the fix:
+
+```
+[dragrel] win=3 end=edge settle=(1606,376) release=(1606,376) stale=(0,0) lead=3 swap=1 post=0 pend=0 wait=4ms -> CLEAN
+```
+
+`stale=(0,0)` is now the *expected* reading on an ordinary gesture, not a suspicious one: the lift is
+still queued behind the edge when the line prints, so the cursor has not yet been moved by it.
+
+*What refutes the fix.* The operator still sees the window settle early while `lead=0` on every
+gesture — the window was never denied a motion, the backlog diagnosis is wrong, and the search moves
+to the mover or to the drain's own latency. `lead=` nonzero with `stale=` still large — the lead
+motions are counted but are not reaching the window. `swap=0` everywhere with `lead=` nonzero — the
+producer half never fires, the lift is being steered with, and the ~1 px is back.
+
+**The gate.** `wmdirect_selftest` leg 10, reported as `lead=` on the `[wm-act] direct` line, plus the
+re-cut leg 9. Leg 10 drives a gesture that moves +12 with the button down and then lifts on a report
+carrying its own +24, through the same `pal::push_pointer_report` seam the HID decode sites use;
+`rest` asserts the row comes to rest at +12.
+That is **red on the pre-DRAGGLIDE tail**, which drops both motions and ends the gesture at the grab
+point (verified by reinstating the `return`: `lead=false`), and `swap_ok` is **red on a producer
+without the reorder** (verified by forcing the swap off: `settle=false lead=false`). Leg 10 asserts
++12 and not +24 deliberately — a window ending at +24 would be the hop, not a fix.
+
+**Both legs also close a flake that predates this arc.** `EVENT_QUEUE` is shared with the live x86
+drain, so a leg that asserts *which event the fixture itself popped* is asserting about scheduling.
+At trunk tip `cf40c37c` the pre-DRAGGLIDE leg 9 did exactly that and failed three times in ~60 runs
+(`~/unaos-bench/scratch/winx7flake/`, `pre/serial-019`, `pre/serial-021`, `post/serial-010`). The
+failing captures name the interleave: **no `[dragrel]` line for the leg at all and no `drag-end`,
+with the drag left LIVE until a later leg's close cancelled it.** The live drain had taken one of the
+fixture's own events; the fixture then routed the lift as if it were the edge and reset
+`CLICK_PREV_MASK` on the way out, so when the drain finally reached the real `Button(0)` it saw no
+1→0 transition against that zeroed mask, took no release arm, and neither drained the pending count
+nor ended the gesture. A stranded drag then poisons whatever leg runs next.
+
+That strand mechanism is not *removed* by anything here — a release edge routed against a
+`CLICK_PREV_MASK` that no longer holds its press still takes no release arm, and that is the correct
+reading of a mask edge. What changed is that the fixture no longer manufactures the condition, and
+that `ended` now fails loudly when a gesture is left live instead of the next leg inheriting it.
+
+So the legs now assert only what no competing consumer can change: the latch `pal` sets at PUSH time,
+and the state the window system is left in after `drain_until_drag_ends` — a wait that keeps draining
+until the gesture is over or a 50 ms deadline expires. The deadline is measured in milliseconds and
+not in spins because the events can be *invisible* for a while rather than merely late:
+`pump_usb_into_gui`'s re-circulating PEEK holds the whole ring in a buffer and re-pushes it, cycling
+at ~250 Hz, and during that window the ring reads EMPTY while the leg's gesture is still live. A spin
+COUNT budget was the first cut and it was short by an order of magnitude — `lead=false` with the
+leg's own `Button(0)` still in flight, its `[dragrel]` line eventually printing after a later leg had
+already cancelled the drag. 50 ms clears the peek cycle and stays well short of
+`RELEASE_EDGE_GRACE_MS`, so the belt cannot fire inside the wait and take the ending away from the
+edge the leg is asserting about. It weakens nothing: a gesture that genuinely never ends still reads
+`ended=false` when the deadline expires.
+
+The grab checks are best-effort about *who popped* for the same reason: if the live drain takes a
+leg's press it routes it through `wc_click_route` at the cursor the leg just placed on the title
+strip, which starts the same drag. The claim is that a title-strip press leaves a live drag on the
+probe row, not that the fixture won the pop.
+
+**And a report must enter the ring as one thing** — which is now true in production, not just in the
+fixture. The measurement that forced it was the fixture's: one run in 25 of the wc QEMU gate,
+`settle=false` with the row at +27 instead of +24 and `lead=1` on the leg's own line, because a
+consumer had taken the lift out of the gap between the two pushes and the edge arrived alone with
+nothing to get in front of. The same gap exists on hardware between two concurrent HID controllers,
+so the fix went to the decode sites rather than to the fixture; see *Which lift, decided by the
+decode site* above.
+
+### OPEN — two routers can interleave a gesture's routing, and the lift can still be steered
+
+**Not a fixture artifact, and it is written here rather than patched in a review pass.** Both x86
+drains — `main.rs`'s BSP GUI loop (`:1672`/`:1796`) and the SCHED-X86 render service (`:4393`/`:4458`)
+— pop from the one `EVENT_QUEUE` and route through the one `wc_route_event` + `wc_route_tail` chain.
+Popping is serialised by the ring lock; **routing is not**. So this order is reachable:
+
+1. consumer A pops the lead motion;
+2. consumer B pops the release edge (which the DRAGGLIDE reorder correctly placed ahead of the lift);
+3. A routes its motion, then pops and routes the LIFT — while `pend` still reads nonzero, because B
+   has not routed the edge yet;
+4. the lift takes the lead branch, moves the settle, and the window comes to rest a lift past the
+   release. That is the ~1 px, back.
+
+The drag tail cannot tell that from a legitimate lead motion: at routing time the queued-edge count
+is the only thing it has, and it is nonzero in both cases. Measured in QEMU at 3 runs in 25 with both
+drains live, `[dragrel] ... lead=2 swap=1` on a gesture that has exactly one lead motion.
+
+The clean fix is to make the count mean "still in the ring" — decrement `RELEASE_EDGES_PENDING` at
+POP rather than at route — which closes the window exactly, since a popped edge can no longer be
+overtaken. It also costs the `end=level-late` diagnostic its meaning (an edge eaten by another
+consumer would become indistinguishable from an edge that never arrived), so it wants its own
+accounting for "popped but not yet routed" and its own arc. **Not done here.**
+
+What IS done here: `DRAG_LAST_LEAD` latches the finished gesture's lead count, and legs 9 and 10
+report `skip` on a run whose count shows the interleave — so the gate never fails a correct kernel
+and never silently passes a broken one. `settle=skip` / `lead=skip` on a `[wm-act] direct` line means
+exactly this, and a run of them means the interleave is common on that machine.
+
+**Reading leg 10's own `[dragrel]` in a QEMU log — a fixture artifact, not a verdict.** Because two
+consumers race for one synthetic gesture, the leg's line comes out one of two ways across runs:
+`end=edge … stale=(0,0) lead=1` (the fixture drained the whole sequence itself) or `end=level …
+stale=(12,12) lead=1` followed by a stray `win=0 end=edge` (the other consumer took the edge and
+decremented the pending count, so the leg's remaining lift reached the belt, and the edge arm printed
+an instant after the belt had cleared the gesture). **Both settle at +12 and the leg passes in both**,
+which is the point: the settle is recorded by the lead motion, so either ending lands the window in
+the same place. On metal there is one drain per report and this fork does not arise — a `win=0` line
+in a *hardware* capture would be a real finding.
+
+**Metal watch-list.** `end=edge` and `swap=1` on essentially every gesture; `lead=` nonzero on any
+gesture where the drain was running behind the hand; `stale=` at or near `(0,0)`. A recurring
+`swap=0` on gestures that also show `lead=` nonzero is the one combination that means the ~1 px is
+back.
 
 ## PAPER — the kit's content-surface texture, ported to integer Q16 (2026-08-09)
 
