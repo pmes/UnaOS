@@ -925,16 +925,23 @@ impl Screen {
         //
         // Residual, stated: the geometry answers "the strip owns these rows" from the instant it is
         // enabled, which can be one composite before the strip has actually PAINTED them, so a
-        // freshly enabled bar withholds its rows from the desktop for that interval. Bounded by the
-        // next composite (on x86 the enable at `wcx::activate` is immediately followed by the console
-        // window's own `create`, which composites), and the alternative — subtracting only what the
-        // strip last painted — would have made the desktop and the window layer disagree about the
-        // strip's extent, which is the drift this registry exists to prevent.
+        // freshly enabled bar withholds its rows from the desktop for that interval. The alternative —
+        // subtracting only what the strip last painted — would have made the desktop and the window
+        // layer disagree about the strip's extent, which is the drift this registry exists to prevent.
+        //
+        // SHELLDESK REVIEW — the interval is bounded because the ENABLER COMPOSITES, and that had to
+        // be made true rather than assumed. The original note here claimed the enable at
+        // `wcx::activate` was "immediately followed by the console window's own `create`, which
+        // composites"; the order is the reverse — `panel_console_window_open` runs ABOVE the enable —
+        // and the row it mints is fbcon's frozen boot-log snapshot, which never damages again. With
+        // `wm::service_damage` declining to composite while no row is dirty, nothing was guaranteed to
+        // paint the withheld rows on a boot with no desktop app and no mouse. `wcx::activate` now
+        // composites at the enable seam, which is the bound this paragraph asserts.
         //
         // x86 + `wc` only — `video::strip` is not compiled on aarch64, where this is the WC-I array
         // and the WC-I loop, byte for byte.
         let mut occ = [(0usize, 0usize, 0usize, 0usize); DESK_OCC_MAX];
-        let nocc = {
+        let (nocc, nwin) = {
             // `occluders` writes exactly `MAX_WINDOWS` slots; the furniture tail is appended after.
             let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
             let nw = super::wm::occluders(&mut wins);
@@ -951,9 +958,30 @@ impl Screen {
                     }
                 }
             }
-            n
+            (n, nw)
         };
         let occ = &occ[..nocc];
+        // SHELLDESK REVIEW — **the WINDOW PREFIX, and it is a separate slice on purpose.**
+        //
+        // `occ` is now windows-then-furniture, but WC-I's two witness calls below are about the WINDOW
+        // TABLE and nothing else: [`super::wm::occluders_aged`] re-reads `wm::occluders` — windows
+        // only, at most `MAX_WINDOWS` — and declares the snapshot STALE when the two disagree in
+        // length or content. Handed the widened slice it would compare `nwin + nstrips` against
+        // `nwin` and answer "stale" on **every** desktop present of every boot with a strip on the
+        // glass, which after this arc is every operator boot: `[wc-i] rollup … stale=` would saturate
+        // at the present count and the reading its own docs give it ("the layout moved under N
+        // presents") would be false N times out of N. The same slice decides `windowed`, so a
+        // windowless desktop with only a menu bar up would report `windowed_flushes>0` and flip the
+        // verdict from the honest `UNWITNESSED` to a vacuous `CLEAN`.
+        //
+        // Furniture cannot participate in that question even in principle — a strip is not a window
+        // table row, it cannot "enter" under the copy the way a `create` can, and its rect is
+        // published by an accessor the desktop and the clip both read. So the SUBTRACTION takes the
+        // whole set (that is this arc's fix) and the STALENESS PROBE takes the window prefix (that is
+        // WC-I's, unchanged). Two questions, two slices, one array.
+        // Read by the `witness` probes alone; a shipped build computes the slice and drops it.
+        #[cfg_attr(not(feature = "witness"), allow(unused_variables))]
+        let occ_win = &occ[..nwin];
         // VUG-FPS-2 witness: the merged rect count and the union bbox of all damage this frame. The
         // rects array still holds the pre-clear data (clear() only zeroed len), so read [0..n].
         {
@@ -1048,8 +1076,12 @@ impl Screen {
                             Some((a, b, c, e)) => (a.min(d.x0), b.min(d.y0), c.max(x1), e.max(y1)),
                         });
                     }
-                    let (stale, intruded) = super::wm::occluders_aged(occ, bbox);
-                    super::wm::note_desktop_flush(!occ.is_empty(), stale, intruded);
+                    // SHELLDESK REVIEW — the WINDOW PREFIX. `occ` gates this whole path and must stay
+                    // the full set (the bands subtract nothing, so a furniture strip disqualifies
+                    // them exactly as a window does); the probe is a window-table question. See
+                    // `occ_win`'s note above.
+                    let (stale, intruded) = super::wm::occluders_aged(occ_win, bbox);
+                    super::wm::note_desktop_flush(!occ_win.is_empty(), stale, intruded);
                 }
                 return false;
             }
@@ -1190,8 +1222,9 @@ impl Screen {
         //    moved underneath and whose writes followed it there.
         #[cfg(feature = "witness")]
         {
-            let (stale, intruded) = super::wm::occluders_aged(occ, blit_bbox);
-            super::wm::note_desktop_flush(!occ.is_empty(), stale, intruded);
+            // SHELLDESK REVIEW — the WINDOW PREFIX, not the furniture-widened set. See `occ_win`.
+            let (stale, intruded) = super::wm::occluders_aged(occ_win, blit_bbox);
+            super::wm::note_desktop_flush(!occ_win.is_empty(), stale, intruded);
         }
         // Nothing is owed to WC-E's restore. (The previous note here claimed the `true` branch was
         // "kept live by the parallel path above" — that path returns `false` and, until this change,

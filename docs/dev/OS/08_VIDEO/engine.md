@@ -2036,6 +2036,55 @@ lane. Nor is the shell made a `wm` row (entry 6): `SHELL_Z` is still a bare `Ato
 desktop layer's position, and the shell's pixels are still the desktop layer's pixels. What changed is
 what the shell is ALLOWED to own of that layer.
 
+##### Review round (2026-08-11) — what was fixed here, and what the enable EXPOSED elsewhere
+
+Four defects were fixed on this branch. Two were in the arc's own code:
+
+* **The WC-I staleness probe was handed the widened occluder set.** `wm::occluders_aged` re-reads
+  `wm::occluders` — the window table, and only that — and calls the snapshot STALE when the two
+  disagree. Fed windows-plus-furniture it compares `nwin + nstrips` against `nwin` and answers "stale"
+  on *every* desktop present of every boot with a strip up, which after this arc is every operator
+  boot: `[wc-i] rollup … stale=` saturates at the present count and its documented reading ("the
+  layout moved under N presents") becomes false N times out of N. The same slice decided `windowed`,
+  so a windowless desktop with a bar would have reported `windowed_flushes>0` and turned the honest
+  `UNWITNESSED` verdict into a vacuous `CLEAN`. The subtraction now takes the whole set and the
+  staleness probe takes the window prefix (`occ_win`) — two questions, two slices, one array.
+* **Nothing was guaranteed to paint the rows the enable took.** The residual's bound was stated as
+  "the enable is immediately followed by the console window's own `create`, which composites"; the
+  order is the reverse — `panel_console_window_open` runs *above* the enable — and the row it mints is
+  fbcon's frozen boot-log snapshot, which never damages again. With `service_damage` declining to
+  composite while no row is dirty, a boot whose desktop app does not land and whose operator does not
+  move the mouse would have held the bar enabled, its rows withheld from the desktop, and the bar
+  never painted. `wcx::activate` now composites at the enable seam (`[wc-x] menubar PAINTED`).
+
+Two were in the spec: the `bar=0` FORBID was dropped without replacing the relation it carried, so the
+prose's claim that registry health "is still pinned by `bars=`" was unbacked — `FORBID … bars=0/[0-9]
+bar=[1-9]` states the relation instead of the value and holds under both readings; and two paragraphs
+still described the bar as unconditionally DEFAULT OFF and the MENUBAR-OCC probe as ending in a
+`disable` rather than a restore.
+
+**What the enable exposes outside this lane, unfixed and stated.** Turning the bar on by default makes
+three latent conditions live on every operator boot; all three need files this arc does not own.
+
+1. **The tiler has no TOP reservation.** `place`'s `usable_h` subtracts `ui_status::chrome_h` (the
+   BOTTOM chrome) and its `cy` starts at `GAP + TITLE_H + BORDER`, so a first-row window's outer box
+   begins at y = `GAP` = 12 while the bar owns rows 0..34. `occ_clip` correctly withholds those
+   pixels, so ~22 of the title bar's 34 rows — including the close/minimise discs — sit under the bar,
+   and `wc_click_route_at` judges `crystal::press_at` ahead of every window arm, so they are not
+   clickable there either. The fix is the twin of PULSE-2's: `top_chrome_h` into `place`'s origin and
+   into `usable_h`. `video/wm.rs`, another arc's lane.
+2. **The crystal dropdown is not subtracted by the desktop present.** It is a TRANSIENT surface, not a
+   `strip::TENANTS` member (deliberately — it takes no occlusion slot), so `strip::rects` does not
+   report it and `present_background` does not withhold its rows. It hangs from the bar into the
+   middle of the desktop layer, which is exactly the region the shell's whole-panel `clear_screen`
+   flushes. This arc makes the SHARD menu reachable on every boot for the first time, which converts
+   a latent exposure into the ordinary path. Closing it needs a public rect accessor on
+   `video/crystal.rs` — out of lane, and the honest fix, since re-deriving the menu's geometry in
+   `screen.rs` is precisely the drift the registry exists to prevent.
+3. **The console window's own geometry reserves only the bottom chrome.** `fbcon`'s sizing and
+   centring math (`ph - chrome_h(ph)`) is unaware of the top strip, so the frozen boot-log window's
+   first rows are now composited under the bar.
+
 #### Three smaller defects the same arc closes
 
 * **`create` now composites.** A window's kernel chrome reaches the panel when the row exists, not at the

@@ -1231,9 +1231,11 @@ FORBID \[wck4\] erase clip OVERFLOW
 # --- is the defect, not the fix — either the span walk published the strip's columns or the box
 # --- went in degenerate. `occclip_dock=0` / `occclip_bar=0` are NOT forbidden and must not be: a
 # --- gesture that stayed away from a strip's edge legitimately never met it, which is exactly why
-# --- the count is on the wire beside the pixel total rather than instead of it. The menu bar is
-# --- DEFAULT OFF, so `occclip_bar=0` is the standing reading — the FORBID guards the case a shell
-# --- has enabled the bar and a window is then dragged across the top.
+# --- the count is on the wire beside the pixel total rather than instead of it. The bar ships DEFAULT
+# --- OFF, so `occclip_bar=0` is the standing reading on a gate boot; SHELLDESK (2026-08-11) makes the
+# --- desktop shell enable it at desktop-ready, so on a boot that reaches the Kepler takeover the
+# --- guarded case — a window dragged across a LIVE top strip — is the ordinary one rather than the
+# --- hypothetical one, and the FORBID is guarding traffic instead of waiting for it.
 FORBID \[drag-occ\] .* occclip_dock=[1-9][0-9]* occclip_dock_px=0
 FORBID \[drag-occ\] .* occclip_bar=[1-9][0-9]* occclip_bar_px=0
 
@@ -1255,8 +1257,12 @@ FORBID \[drag-occ\] .* occclip_bar=[1-9][0-9]* occclip_bar_px=0
 # ---     still counted in the population but the clip walked EMPTY (the span walk published its
 # ---     columns), collapsing the pixel total to 0 — the exact `occclip_bar=N>0 occclip_bar_px=0`
 # ---     state the FORBID trips on, so it is proven non-vacuous rather than trusted.
-# ---   * `restored=true` — the leg's enable→probe→disable cycle left the bar DEFAULT OFF, so nothing
-# ---     later in the boot sees it enabled. x86 + witness only (the primitives are `target_arch`-gated).
+# ---   * `restored=true` — the leg's enable→probe→RESTORE cycle put the bar back to the state the
+# ---     battery ARRIVED in, so nothing later in the boot sees a state the probe invented. SHELLDESK
+# ---     changed this from an unconditional `set_enabled(false)`, which on an operator boot would have
+# ---     switched the shell's menu bar off for the rest of the boot — a witness with a side effect on
+# ---     the thing it witnesses. On a gate boot nothing has enabled the bar and the restored state is
+# ---     still OFF. x86 + witness only (the primitives are `target_arch`-gated).
 REQUIRE :: MENUBAR-OCC: bar_enabled=true crossed=true occclip_bar=[1-9][0-9]* occclip_bar_px=[1-9][0-9]* forbid_bar=[1-9][0-9]* forbid_bar_px=0 forbid_trips_when_removed=true restored=true :: PASS ::
 FORBID :: MENUBAR-OCC: .* :: FAIL ::
 
@@ -1282,6 +1288,19 @@ FORBID :: MENUBAR-OCC: .* :: FAIL ::
 # --- The `bars=` term is deliberately spanned rather than pinned to a value — the dock is legitimately
 # --- absent while the window table is empty (`bars=0/2`) and legitimately present once it is not.
 REQUIRE \[drag-occ\] .* bars=[0-9]/[0-9] bar=[0-9]+ fillclip_dock_px=
+# --- SHELLDESK REVIEW — and the DEGENERATE PAIR the spanned `bar=` would otherwise stop catching.
+# --- Spanning `bar=` was right (both readings are now legitimate), but it left the prose's claim that
+# --- "the registry's own health is still pinned by `bars=`" unbacked: with the old FORBID gone, NO
+# --- rule on this line related the two terms, and `bars=` alone cannot say a strip owns pixels while
+# --- the walk missed it. This states the relation instead of the value. `erase_clip` writes both from
+# --- ONE walk of `strip::rects` in one statement block — `bars=` is the count of PRESENT slots and
+# --- `bar=` is `furn[MENUBAR_SLOT].map(|r| r.2)` — so `bar>0` implies that slot was `Some`, which
+# --- implies `bars>=1`. `bars=0/N` beside a bar owning pixels is therefore impossible in a healthy
+# --- build and is precisely the erasure defect these terms exist for: a strip on the glass that the
+# --- registry's walk does not know about is erased on every drag while every other term reads clean.
+# --- It holds under BOTH readings — a gate boot (`bars=0/2 bar=0`) and an operator boot (`bars=2/2
+# --- bar=<panel width>`) both pass — so it constrains the mechanism, not the scenario.
+FORBID \[drag-occ\] .* bars=0/[0-9] bar=[1-9]
 
 # --- STRIPFACTOR: THE MENU BAR IS ABSENT BY DEFAULT, AND SAYS SO -------------------------------
 # --- `video/menubar.rs` is tenant #2 of the strip primitive and exists this arc to PROVE the
