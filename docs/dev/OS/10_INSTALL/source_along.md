@@ -120,7 +120,29 @@ the Pi card) gets an honest line and no verdict, never a fault:
 ```
 
 Every other outcome — a stamp without a payload, a sha mismatch, a decode or walk failure, a member
-under `target/` — ends `-> FAIL ::` and names which claim broke.
+under `target/`, a root directory that could not be read at all — ends `-> FAIL ::` and names which
+claim broke. Only `NotFound` on **both** lookups takes the quiet "not packed" line: a volume whose
+directory is unreadable must not be reported as a volume that is merely empty, or the witness cannot
+fail on a broken medium.
+
+### What the payload is trusted for
+
+`SRC.TGZ` is an **untrusted input**. It is a file on a FAT volume; anyone who can write to the boot
+medium can replace it. Two consequences the decoder is built around, and one that is out of scope:
+
+* **Memory is bounded by construction** — 32 KiB DEFLATE window, one 512-byte tar block, no buffer
+  that grows with output. Nothing in the pipe is proportional to the decompressed size.
+* **Work is bounded by declaration** — `inflate::MAX_OUTPUT` (512 MiB, ~17x the current 30.3 MB
+  tree). Streaming bounds memory, not time: DEFLATE expands up to ~1032:1, and a *valid* 948 KiB
+  gzip of zeros decodes to exactly 1 GB with a trailer CRC and ISIZE that both check out, so no
+  downstream claim can reject it. Since `verify_source_once` is a synchronous call inside a
+  storage-service pass, an unbounded decode reads on the wire as a device-service loop that stopped.
+  Over the budget the walk stops with `decompressed output exceeded the 512 MiB budget -> FAIL`.
+* **The stamp is integrity, not authenticity.** `SRC.SHA` sits beside `SRC.TGZ` on the same volume
+  and is not signed. The four claims above catch *corruption* — a payload that no longer matches the
+  stamp that was packed with it — and cannot catch *substitution*, because an attacker who can write
+  one file can write both. Authenticating the pair is a separate rung and wants a key the shard
+  carries, not a hash the medium carries.
 
 **Gate:** `./arroyo test-selfhost [part|gpt|p16|sf] [secs]`. It is the one lane that packs
 SOURCE-ALONG *onto* a FAT fixture, and it has to be: `test-fat` sets `UNAOS_NOSRC=1` precisely so its

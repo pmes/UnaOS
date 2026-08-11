@@ -14,6 +14,9 @@
 //     holds one 512-byte block. The only sizeable allocation here is the mandatory 32 KiB DEFLATE
 //     history window, plus the per-block Huffman tables.
 //
+// Streaming bounds MEMORY, not WORK, and the input is untrusted — see [`MAX_OUTPUT`] for the second
+// bound, which is the one that keeps a compression bomb from turning a service pass into a stall.
+//
 // The Huffman decoder is the canonical count/symbol form from RFC 1951 §3.2.2 (the "puff" shape):
 // decode bit-by-bit, comparing against the running count of codes of each length. It is not the
 // fastest possible decoder — a real one would use a lookup table — but it is short enough to audit
@@ -43,9 +46,30 @@ pub enum InflateError {
     BadDistance,
     /// The gzip trailer's CRC-32 or ISIZE disagrees with what we actually produced.
     TrailerMismatch,
+    /// The stream tried to produce more than [`MAX_OUTPUT`] bytes — see that constant.
+    OutputBudget,
     /// The sink refused a byte (the tar walker rejecting a malformed member).
     SinkRejected,
 }
+
+/// The hard ceiling on decompressed output, and the one bound this decoder needs that RFC 1951 does
+/// not give it.
+///
+/// MEMORY was never the exposure: nothing here accumulates with output (32 KiB window, one 512-byte
+/// tar block, no growing buffer), and that property is what the module header claims. WORK was. The
+/// input is an untrusted file — anyone who can write to the boot volume stages it — and DEFLATE's
+/// maximum expansion is ~1032:1, so a *valid* stream can ask for effectively unbounded decoding from
+/// a small file. Measured on the host harness with the identical sources: a 948 KiB gzip of zeros
+/// (`head -c 1000000000 /dev/zero | gzip -9`) inflates to exactly 1 GB and every byte of it is
+/// honestly produced — trailer CRC and ISIZE both check out, so no downstream claim can reject it.
+/// At the fixture's own ~9 MiB the same ratio buys ~9.4 GB. `verify_source_once` is a synchronous,
+/// non-yielding call inside a storage-service pass, so "unbounded decode" reads on the wire as a
+/// device-service loop that stopped.
+///
+/// 512 MiB is ~17x the current payload (30.3 MB at base `3bc0ead0`) — deliberately generous, because
+/// a ceiling that a growing tree grows into becomes a false FAIL, and the tree only grows. It is a
+/// falsifiable claim either way: over it, the walk stops and says so by name.
+pub const MAX_OUTPUT: u64 = 512 * 1024 * 1024;
 
 /// A pull source of compressed bytes. `next()` returns `None` at end of input.
 pub trait ByteSource {
@@ -235,6 +259,11 @@ impl<'a, K: Sink> Window<'a, K> {
 
     #[inline]
     fn emit(&mut self, b: u8) -> Result<(), InflateError> {
+        // The output budget, enforced at the ONE place every produced byte passes through — literal,
+        // back-reference and stored-block bytes all land here, so there is no second path to miss.
+        if self.produced >= MAX_OUTPUT {
+            return Err(InflateError::OutputBudget);
+        }
         self.buf[self.pos] = b;
         self.pos = (self.pos + 1) & (WINDOW - 1);
         self.produced += 1;
@@ -483,6 +512,7 @@ pub fn inflate_reason(e: InflateError) -> &'static str {
         InflateError::BadSymbol => "undecodable symbol",
         InflateError::BadDistance => "back-reference past the window",
         InflateError::TrailerMismatch => "gzip trailer crc/isize mismatch",
+        InflateError::OutputBudget => "decompressed output exceeded the 512 MiB budget",
         InflateError::SinkRejected => "tar walk rejected the stream",
     }
 }

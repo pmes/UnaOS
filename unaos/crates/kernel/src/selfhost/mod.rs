@@ -232,11 +232,32 @@ fn run() {
     let tgz = fs.find_in_root("SRC.TGZ");
     let shafile = fs.find_in_root("SRC.SHA");
 
+    // ABSENT is not the same as UNREADABLE, and only `NotFound` may take the quiet arm. `find_in_root`
+    // reads the root directory, so it also returns `Io` / `BadChain` / `Unsupported` — and a volume
+    // whose directory could not be read returns those for BOTH lookups, which the old `(Err, Err)`
+    // catch-all reported as "SOURCE-ALONG not packed on this medium". That is the honest-absence line:
+    // a real read failure on a medium that IS carrying the pair would have read as nothing to do, and
+    // the boot would carry no verdict at all rather than a fault. A witness that reports a broken
+    // volume as an empty one cannot fail.
+    let hard_error = [tgz.as_ref().err(), shafile.as_ref().err()]
+        .into_iter()
+        .flatten()
+        .find(|e| !matches!(e, FatError::NotFound))
+        .copied();
+    if let Some(e) = hard_error {
+        serial_println!(
+            ":: SELFHOST: root directory of {} unreadable ({}) — cannot tell an absent payload from a broken volume -> FAIL ::",
+            fs.source_name(),
+            fat_reason(e)
+        );
+        return;
+    }
+
     let (tgz, shafile) = match (tgz, shafile) {
         (Ok(t), Ok(s)) => (t, s),
         (Err(_), Err(_)) => {
-            // A UNAOS_NOSRC medium (the FAT fixtures, vm-image, the Pi card) legitimately carries
-            // neither file. Honest, not a fault.
+            // Both NotFound by the check above. A UNAOS_NOSRC medium (the FAT fixtures, vm-image,
+            // the Pi card) legitimately carries neither file. Honest, not a fault.
             serial_println!(
                 ":: SELFHOST: no SRC.TGZ/SRC.SHA on {} — SOURCE-ALONG not packed on this medium ::",
                 fs.source_name()

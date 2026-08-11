@@ -144,7 +144,12 @@ impl TarWalk {
         match typeflag {
             b'0' | 0 => {
                 self.census.files += 1;
-                self.census.bytes += size;
+                // SATURATING, not `+=`: `size` comes from a 12-byte octal field on an untrusted
+                // header and can legally parse to ~2^36 per member, so a handful of hostile members
+                // overflow a u64 sum. Release builds carry no overflow checks, so `+=` would WRAP —
+                // and a wrapped `bytes=` on a PASS line is a false number in a witness. Saturating
+                // is monotone, so an absurd total stays absurd and visibly so.
+                self.census.bytes = self.census.bytes.saturating_add(size);
                 if self.first_name.is_none() {
                     self.first_name = Some(name);
                 }
