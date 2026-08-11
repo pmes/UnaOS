@@ -10685,6 +10685,43 @@ capture immediately. The lines above are from a later, deliberately-snapshotted 
 (`~/unaos-bench/scratch/stripfactor/final-bench-geom.log`); the identification is exact, the earlier
 loss is the miss.
 
+### MENUBAR-OCC — the `occclip_bar` FORBID, proven able to fire
+
+STRIPFACTOR generalised WCK5's window-blit strip protection to both strips: `occ_clip` pushes the menu
+bar into every window's clip and the present folds the withheld pixels into `occclip_bar=` /
+`occclip_bar_px=` on `[drag-occ]`, with `x86-witness.spec` FORBIDding the degenerate
+`occclip_bar=N>0 occclip_bar_px=0`. The push is code-correct — its `span_occ` formula is identical to
+the proven dock path — but the FORBID was **vacuous**: the bar is DEFAULT OFF, so no boot ever drags a
+window across the top strip and `occclip_bar` never left 0. A FORBID whose guarded field has never been
+seen move cannot falsify — the standing law "a witness that cannot fail is a defect."
+
+`menubar::selftest`'s MENUBAR-OCC leg closes that gap the way WCK5 closed the dock's (§WCK5 above),
+self-contained. WCK5 fired the dock's counter by temporarily pinning `dock::Layout::for_panel`'s `y`
+to 100 — putting the strip under the gate's own windows — reading `occclip_dock_px` nonzero, and
+reverting the diff. The bar's leg **computes the identical probe** rather than pinning-and-reverting:
+it enables the bar, synthesises a window box that crosses the top strip, and runs `occ_clip`'s OWN
+primitives (`OccClip::push`/`prepare`, `OccRows::spans`, `span_occ` — the present's exact arithmetic,
+in `wm::occ_bar_probe`) over two configurations:
+
+```
+:: MENUBAR-OCC: bar_enabled=true crossed=true occclip_bar=1 occclip_bar_px=<nonzero>
+   forbid_bar=1 forbid_bar_px=0 forbid_trips_when_removed=true restored=true :: PASS ::
+```
+
+* **PROTECTED** (`occclip_bar=1 occclip_bar_px=N>0`) — the bar in the clip, the span walk WITHHELD the
+  strip's columns from the crossing window. The fired witness the boot-time FORBID needed to have seen
+  move: the window's chrome kept off the strip, measured as the span walk rather than as two rectangles.
+* **FAULT** (`forbid_bar=1 forbid_bar_px=0`, `forbid_trips_when_removed=true`) — the strip still counted
+  in the population but the clip walked EMPTY, i.e. the span walk publishes its columns. That collapses
+  the pixel total to 0 while the population stays nonzero — the exact `occclip_bar=N>0 occclip_bar_px=0`
+  state the FORBID trips on, so the FORBID is proven non-vacuous rather than trusted.
+* `restored=true` — the leg's enable→probe→disable cycle left the bar DEFAULT OFF; nothing later in the
+  boot sees it enabled.
+
+x86 + `witness` only: `occ_bar_probe` and the primitives it drives are `target_arch`-gated, exactly as
+`occclip_bar` itself is. The leg does not touch `composite_inner` or `occ_clip`'s push logic — it drives
+those primitives from the fixture, proving them, not changing them.
+
 ### MENUP — the menu PROTOCOL, designed, not implemented
 
 The full design ledger is at the foot of `video/menubar.rs`. Its shape, in brief:

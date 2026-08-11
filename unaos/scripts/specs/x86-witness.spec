@@ -1237,6 +1237,29 @@ FORBID \[wck4\] erase clip OVERFLOW
 FORBID \[drag-occ\] .* occclip_dock=[1-9][0-9]* occclip_dock_px=0
 FORBID \[drag-occ\] .* occclip_bar=[1-9][0-9]* occclip_bar_px=0
 
+# --- STRIPFACTOR × WCK5: THE occclip_bar FORBID IS PROVEN ABLE TO FIRE --------------------------
+# --- The `occclip_bar=` FORBID above guards the menu bar, but the bar is DEFAULT OFF, so no boot
+# --- ever drags a window across the top strip and `occclip_bar` never leaves 0 on `[drag-occ]` —
+# --- the guarded field has never been seen nonzero, and a FORBID that cannot see its field move is
+# --- vacuous. `menubar::selftest`'s MENUBAR-OCC leg closes that: it ENABLES the bar, drives a
+# --- synthetic window box across the top strip, and runs `occ_clip`'s OWN primitives
+# --- (`OccClip::push`/`prepare`, `OccRows::spans`, `span_occ`) — the present's exact arithmetic —
+# --- to read the pair the compositor would fold. WCK5 fired the DOCK equivalent by pinning
+# --- `for_panel`'s y to 100 under the gate's windows and reverting; this computes the identical
+# --- probe rather than pinning-and-reverting.
+# ---
+# ---   * `occclip_bar=N>0 occclip_bar_px=N>0` — PROTECTED: the bar in the clip, the span walk
+# ---     withheld the strip's columns from the crossing window. The fired witness the boot-time
+# ---     FORBID needs to have seen move.
+# ---   * `forbid_bar=N>0 forbid_bar_px=0` with `forbid_trips_when_removed=true` — FAULT: the strip
+# ---     still counted in the population but the clip walked EMPTY (the span walk published its
+# ---     columns), collapsing the pixel total to 0 — the exact `occclip_bar=N>0 occclip_bar_px=0`
+# ---     state the FORBID trips on, so it is proven non-vacuous rather than trusted.
+# ---   * `restored=true` — the leg's enable→probe→disable cycle left the bar DEFAULT OFF, so nothing
+# ---     later in the boot sees it enabled. x86 + witness only (the primitives are `target_arch`-gated).
+REQUIRE :: MENUBAR-OCC: bar_enabled=true crossed=true occclip_bar=[1-9][0-9]* occclip_bar_px=[1-9][0-9]* forbid_bar=[1-9][0-9]* forbid_bar_px=0 forbid_trips_when_removed=true restored=true :: PASS ::
+FORBID :: MENUBAR-OCC: .* :: FAIL ::
+
 # --- STRIPFACTOR: THE REGISTRY'S SHAPE IS ON THE WIRE -------------------------------------------
 # --- `bars=present/total` and `bar=` were added to `[drag-occ]` beside the existing `dock=` for the
 # --- reason `dock=` itself exists: `fillover_px` can only see boxes that ARE in the clip, so a strip

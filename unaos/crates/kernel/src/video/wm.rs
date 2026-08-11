@@ -11074,6 +11074,97 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
     c
 }
 
+/// STRIPFACTOR × WCK5 — **the menu bar's `occclip_bar` pair, PROVEN able to fire**, the four numbers
+/// the [`MENUBAR-OCC`](super::menubar) fixture reads. Witness + x86 only.
+///
+/// # Why this exists
+///
+/// `occ_clip` pushes the menu bar into every window's clip and the present loop folds the withheld
+/// pixels into [`OB_N`]/[`OB_PX`], published on `[drag-occ]` as `occclip_bar=`/`occclip_bar_px=` and
+/// FORBIDden degenerate (`occclip_bar=N>0 occclip_bar_px=0`) by `x86-witness.spec`. The push is
+/// CODE-CORRECT — its `span_occ` formula is identical to the proven dock path — but its witness is
+/// **vacuous**: the bar is DEFAULT OFF, so no gate ever drags a window across the top strip and every
+/// boot reads `occclip_bar=0`. A FORBID that has never seen its guarded field nonzero cannot falsify.
+///
+/// This closes that gap the way WCK5 closed the dock's, but self-contained. WCK5 temporarily pinned
+/// `dock::Layout::for_panel`'s `y` to 100 — putting the strip under the gate's own windows — read
+/// `occclip_dock_px` nonzero on the live `[drag-occ]` line, and reverted the diff (engine.md §WCK5).
+/// Here the identical probe is DRIVEN rather than pinned-and-reverted: the SAME primitives the present
+/// walks — [`OccClip::push`], [`OccClip::prepare`], [`OccRows::spans`], [`span_occ`] — are run against
+/// a synthetic window box that crosses the bar, so the numbers are the present's own arithmetic, not a
+/// restatement of two rectangles.
+///
+/// # The two runs
+///
+///  * **PROTECTED** — the bar pushed into the clip exactly as `occ_clip` pushes it (`boxes_overlap`
+///    then [`OccClip::push`], counted iff it lands, as `OB_N` counts it). The span walk WITHHOLDS the
+///    bar's columns, so `px_prot > 0`: the columns the window's chrome would have published over the
+///    strip, withheld. This is the fired witness — `occclip_bar=N>0 occclip_bar_px>0`.
+///  * **FAULT** — the population still counts the bar (`pop_fault == pop_prot`: the registry still
+///    lists it) but the clip is walked EMPTY, i.e. the span walk publishes the strip's columns. That
+///    is precisely the leak the spec names — "either the span walk published the strip's columns or
+///    the box went in degenerate" — and it collapses `px_fault` to 0 while `pop_fault` stays nonzero:
+///    the exact `occclip_bar=N>0 occclip_bar_px=0` state the FORBID trips on. The fixture asserts this
+///    reproduces, so the FORBID is proven non-vacuous rather than trusted.
+///
+/// The `win` box is the present's box `(x, y, w, h)`; `bar` is the strip's rect from
+/// `menubar::strip_rect`. Rows outside the bar's `[y0, y1)` contribute 0 through [`span_occ`], so a
+/// window that merely touches the strip's edge and one that buries it both read honestly.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+pub(crate) struct OccBarProbe {
+    /// Window blits whose clip CARRIED the bar — the `occclip_bar` population, both runs identical.
+    pub pop_prot: u64,
+    /// Pixels the PROTECTED span walk withheld because of the bar — `occclip_bar_px`, must be > 0.
+    pub px_prot: u64,
+    /// The population under the fault — equal to `pop_prot`: the strip is still nominally protected.
+    pub pop_fault: u64,
+    /// Pixels the FAULT span walk withheld — must be 0, tripping `occclip_bar=N>0 occclip_bar_px=0`.
+    pub px_fault: u64,
+}
+
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+pub(crate) fn occ_bar_probe(
+    bar: (usize, usize, usize, usize),
+    win: (usize, usize, usize, usize),
+) -> OccBarProbe {
+    let (bx, by, bw, bh) = win;
+    let mut spans = [(0usize, 0usize); OCC_MAX + 1];
+
+    // PROTECTED — the bar in the clip, the present's exact idiom (occ_clip's push, the row loop's
+    // `span_occ(obarb, …)` reading of the emitted spans).
+    let mut clip = OccClip::none();
+    let pop_prot =
+        if bar.2 != 0 && bar.3 != 0 && boxes_overlap(win, bar) && clip.push(bar) { 1u64 } else { 0 };
+    let occ = clip.prepare(bx, bx + bw);
+    let mut px_prot = 0u64;
+    for py in by..by.saturating_add(bh) {
+        let ns = occ.spans(py, bx, bx + bw, &mut spans);
+        let mut row_pub = 0u64;
+        for &(sx0, sx1) in spans[..ns].iter() {
+            row_pub += span_occ(Some(bar), py, sx0, sx1);
+        }
+        px_prot += span_occ(Some(bar), py, bx, bx + bw).saturating_sub(row_pub);
+    }
+
+    // FAULT — the strip is counted (pop unchanged) but the clip is EMPTY, so the walk publishes its
+    // columns: `row_pub` equals the covered total every row and `px_fault` collapses to 0. This is the
+    // `span walk published the strip's columns` leak the FORBID exists to catch, computed rather than
+    // pinned-and-reverted as WCK5 did for the dock.
+    let empty = OccClip::none();
+    let occ_f = empty.prepare(bx, bx + bw);
+    let mut px_fault = 0u64;
+    for py in by..by.saturating_add(bh) {
+        let ns = occ_f.spans(py, bx, bx + bw, &mut spans);
+        let mut row_pub = 0u64;
+        for &(sx0, sx1) in spans[..ns].iter() {
+            row_pub += span_occ(Some(bar), py, sx0, sx1);
+        }
+        px_fault += span_occ(Some(bar), py, bx, bx + bw).saturating_sub(row_pub);
+    }
+
+    OccBarProbe { pop_prot, px_prot, pop_fault: pop_prot, px_fault }
+}
+
 // ---- WCK4: the erase's own clip ----------------------------------------------------------------
 //
 // **The defect (Peter, Boot A, attended): "dragging windows makes the taskbar disappear and
