@@ -2852,43 +2852,27 @@ pub fn composite() {
     composite_once();
     #[cfg(target_arch = "x86_64")]
     {
-        use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-        if COMP_GATE
-            .compare_exchange(false, true, AcqRel, Relaxed)
-            .is_err()
-        {
-            // DECLINED. This pass composites nothing and — crucially — CLEARS NOTHING: it never
-            // reached the table snapshot, so every `damaged` flag it would have consumed is still
-            // set and belongs to the holder's next round. `COMP_PENDING` is the only thing published.
-            COMP_PENDING.store(true, Release);
-            #[cfg(feature = "witness")]
-            WCSER_DECLINED.fetch_add(1, Relaxed);
-            // `wm::erase` takes the sprite down and leaves the composite that follows to put it back.
-            // That contract predates WC-I and a decline may not break it, so a declined pass still
-            // discharges the sprite duty — but it DEFERS it rather than performing it.
-            //
-            // REVIEW CONDITION 3 — `owe_repaint`, NOT `ensure_drawn`.
-            //
-            // We are, by definition, inside another core's CURSOR-1 bracket: the holder took the
-            // sprite down before its first window pixel and does not put it back until its last
-            // `draw_window`/`verify_window` has returned, and it holds no `SPRITE` lock across those
-            // blits. `ensure_drawn` here is therefore an UNSERIALISED SPRITE WRITER INTO A
-            // HALF-COMPOSITED STACK: it draws the arrow over rows the holder is still rewriting, and
-            // — worse, because it outlives the frame — it captures its save-under FROM those
-            // half-composited pixels, so the next undraw restores garbage to the panel. That is a
-            // per-pixel bleed with exactly the shape of AQ's `[wc-d] moved=` reading.
-            //
-            // `owe_repaint` is the strictly stronger duty taken one pass later (WEDGE-9's own words):
-            // it writes nothing now, and the holder's tail — which runs OUTSIDE the `BlitGuard`, on
-            // a finished stack, holding `SPRITE` — repaints the whole sprite. Same guarantee, correct
-            // bracket. The alternative shape (`ensure_drawn` only when `COMP_GATE` reads false) is
-            // strictly worse: that load is a race by construction, since the holder can release
-            // between the load and the draw.
-            super::cursor::owe_repaint();
-            return;
-        }
-        #[cfg(feature = "witness")]
-        WCSER_ENTERED.fetch_add(1, Relaxed);
+        use core::sync::atomic::Ordering::{AcqRel, Acquire};
+        // WCPAR STEP 3 — THE GATE IS NO LONGER TAKEN HERE.
+        //
+        // Until this arc `COMP_GATE` was acquired at this point and held across the whole of
+        // `composite_once`, so a second core reaching a present while another was compositing
+        // declined the ENTIRE pass — compose included. That was the last of the three serialisations
+        // §8's WCPAR names, and it is what made `[wcn] rate=` load-invariant at `19.6/s`: N vugs
+        // shared one composite pipe and each got `1/N` of it.
+        //
+        // `composite_once` now runs unconditionally and gates only its PRESENT half from the inside
+        // (see [`composite_inner`]). Every core that reaches a present composes immediately, in
+        // parallel, into its own [`STAGE`] entry; only the `STAGE`→panel blits queue, and they queue
+        // on a hold that is a run of bulk row copies rather than a whole scale-`n` upscale.
+        //
+        // The decline that used to live here has moved to the gate's new site, where it is a decline
+        // of the PRESENT and not of the pass. It is a strictly harder case than the one it replaces —
+        // the old decliner had not yet reached the table snapshot and so "CLEARED NOTHING", while the
+        // new one has already consumed the damage flags — and `composite_inner` discharges it by
+        // putting that damage BACK on the table before it publishes `COMP_PENDING`. Everything below
+        // this comment is therefore unchanged in purpose: `COMP_PENDING` still means "a pass was
+        // turned away with work outstanding", and this loop is still what services it.
         composite_once();
         // Service what was declined while we held the gate. Each round is a FULL pass — its own
         // snapshot, its own upward closure, its own back-to-front order and its own cursor tail — so
@@ -2946,44 +2930,94 @@ pub fn composite() {
             }
             rounds += 1;
             #[cfg(feature = "witness")]
-            WCSER_RERUNS.fetch_add(1, Relaxed);
+            WCSER_RERUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             composite_once();
         }
-        COMP_GATE.store(false, Release);
         // THE LOST WAKEUP, closed. A decliner that publishes `COMP_PENDING` after our last `swap`
-        // and before the release above would otherwise leave its damage on the table with no core
-        // committed to drawing it, and on a static desktop no later present would arrive to find it.
-        // One re-acquisition attempt; a failure here means somebody else now holds the gate and will
-        // run the same loop we just did.
+        // would otherwise leave its damage on the table with no core committed to drawing it, and on
+        // a static desktop no later present would arrive to find it.
+        //
+        // WCPAR STEP 3 — the `COMP_GATE` re-acquisition that used to guard this block is GONE, and
+        // its absence is not a weakening. It was there to make exactly one core take the extra pass
+        // while the gate meant "one whole composite at a time"; the gate now means "one PRESENT at a
+        // time", so holding it here would say nothing about who is composing and would only move the
+        // pass's own internal acquisition outward again. What bounds this block is what always
+        // bounded it: it runs at most once, it consumes `COMP_PENDING` with a `swap` so two cores
+        // cannot both act on one wakeup, and the pass it starts serialises its own present.
+        //
         // …and a masked holder does not take this pass either (review condition 1): it is the
         // fourth composite the arithmetic above accounts for. `COMP_PENDING` remains set for an
         // unmasked holder or `service_damage` to service.
-        if !masked
-            && COMP_PENDING.load(Acquire)
-            && COMP_GATE
-                .compare_exchange(false, true, AcqRel, Relaxed)
-                .is_ok()
-        {
-            if COMP_PENDING.swap(false, AcqRel) {
-                let dmg = any_damaged();
-                let owed = deferred_owed();
-                if dmg || owed {
-                    // WC-K2r — same rescue count, same reason; this is the other gate that consumes
-                    // the wakeup, and a fix applied to only one of them would leave the defect on the
-                    // rarer path, which is the one a static desktop actually takes.
-                    #[cfg(feature = "witness")]
-                    if !dmg && owed {
-                        super::wcg::erase_wakeup_rescue();
-                    }
-                    #[cfg(feature = "witness")]
-                    WCSER_RERUNS.fetch_add(1, Relaxed);
-                    composite_once();
+        if !masked && COMP_PENDING.load(Acquire) && COMP_PENDING.swap(false, AcqRel) {
+            let dmg = any_damaged();
+            let owed = deferred_owed();
+            if dmg || owed {
+                // WC-K2r — same rescue count, same reason; this is the other gate that consumes
+                // the wakeup, and a fix applied to only one of them would leave the defect on the
+                // rarer path, which is the one a static desktop actually takes.
+                #[cfg(feature = "witness")]
+                if !dmg && owed {
+                    super::wcg::erase_wakeup_rescue();
                 }
+                #[cfg(feature = "witness")]
+                WCSER_RERUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                composite_once();
             }
-            COMP_GATE.store(false, Release);
         }
     }
 }
+
+/// WCPAR step 3 — THE PRESENT GATE, try-only.
+///
+/// This is [`COMP_GATE`] in its narrowed role. Before this arc it admitted one whole `composite_once`
+/// at a time; it now admits one core at a time to the half of the pass that writes the glass — the
+/// `STAGE`→panel row copies, in ascending z-order, plus the furniture strips and the cursor tail that
+/// follow them. The compose half runs outside it, on every core at once.
+///
+/// Try, never spin, for the reason it always was: `composite` is reached IRQ-masked from
+/// `sched::exit → close_owner` and from both present chains, so a blocking acquisition would be a
+/// wedge. What a failure means has changed — see the abandon path in [`composite_inner`].
+/// `census` says whether this acquisition is a PASS asking to present. `[wcser]`'s `entered`/
+/// `declined` are read as a population of passes — that is what its ledger promises and what
+/// `declined_pct` divides by — so the deferred-erase drain's own short hold at the head of a pass
+/// takes the gate with `census: false` and stays out of that population. It is real gate traffic and
+/// it is not hidden: a drain that cannot publish leaves its boxes queued, which `[wc-k] defers=` and
+/// `deferred_owed`'s rescue counters already report from the side that owns the fact.
+#[cfg(target_arch = "x86_64")]
+fn present_gate_try(census: bool) -> bool {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
+    let got = COMP_GATE
+        .compare_exchange(false, true, AcqRel, Relaxed)
+        .is_ok();
+    let _ = census;
+    #[cfg(feature = "witness")]
+    if census {
+        if got {
+            WCSER_ENTERED.fetch_add(1, Relaxed);
+        } else {
+            WCSER_DECLINED.fetch_add(1, Relaxed);
+        }
+    }
+    got
+}
+
+/// WCPAR step 3 — release the present gate. See [`present_gate_try`].
+#[cfg(target_arch = "x86_64")]
+fn present_gate_release() {
+    COMP_GATE.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// WCPAR step 3 — aarch64 has never had a compositor gate (see the module ledger above
+/// [`COMP_GATE`] for the argument), so the present gate is vacuously held there and every call site
+/// folds away. This is what keeps the aarch64 pass byte-equivalent across the phase split.
+#[cfg(not(target_arch = "x86_64"))]
+fn present_gate_try(_census: bool) -> bool {
+    true
+}
+
+/// WCPAR step 3 — see [`present_gate_try`].
+#[cfg(not(target_arch = "x86_64"))]
+fn present_gate_release() {}
 
 /// WCSER — is any live row still asking to be drawn? One table acquisition, no framebuffer access.
 ///
@@ -3027,7 +3061,12 @@ fn composite_once() {
     // only place this widening changed arithmetic.
     #[cfg(feature = "witness")]
     let c2_t0 = crate::arch::now_cycles();
-    let mut tail = composite_inner();
+    // WCPAR step 3 — the pass now reports TWO things: what it owes the sprite, and whether it holds
+    // the present gate. Everything below this line writes the glass — the furniture strips and every
+    // cursor tail — so a pass that could not take the gate must run none of it, and `composite_inner`
+    // has already discharged its sprite duty pixel-free before returning `presented: false`.
+    let out = composite_inner();
+    let mut tail = out.tail;
     // DOCK — the strip is the pass's LAST layer under the sprite: after every window, before the
     // cursor tail. Two lines, and both of them gated to the arch and knob the dock exists on.
     //
@@ -3047,7 +3086,7 @@ fn composite_once() {
     // registry entry rather than a second line here, and neither can short-circuit the other's
     // damage test. A disabled tenant returns on one relaxed load.
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-    if super::strip::compose_all() && tail == CursorTail::Untouched {
+    if out.presented && super::strip::compose_all() && tail == CursorTail::Untouched {
         tail = CursorTail::Repaint;
     }
     #[cfg(feature = "witness")]
@@ -3055,12 +3094,29 @@ fn composite_once() {
     // CURSOR-7 — read BEFORE the tail runs, so a repaint the tail is already going to do is not
     // duplicated, and a pass that would otherwise have done nothing at all is upgraded.
     let dirty = super::cursor::take_present_dirty();
+    // WCPAR step 3 — a pass that never took the present gate must not spend this wakeup. It is
+    // consumed by the `take_present_dirty` above whether we can act on it or not, so it is handed
+    // straight back as the deferred duty `owe_repaint` exists to carry: the next pass's tail — which
+    // runs on a finished stack, inside the gate, holding `SPRITE` — performs the repaint. Dropping it
+    // here would leave an arrow that a concurrent present wrote over with nothing coming to mend it,
+    // which is the CURSOR-7 defect this flag was added to close.
+    if !out.presented && dirty {
+        super::cursor::owe_repaint();
+    }
     if dirty && tail == CursorTail::Untouched {
         tail = CursorTail::Repaint;
     }
-    #[cfg(feature = "witness")]
-    note_cursor_tail(tail);
-    match tail {
+    // WCPAR step 3 — the tail is GLASS WORK and runs only inside the present gate. A pass that could
+    // not take the gate skips the whole block; its sprite duty was discharged pixel-free inside
+    // `composite_inner` (`owe_repaint`, or `abandon_overlay` for a session it opened), which is the
+    // same deferral REVIEW CONDITION 3 has required of a declined pass since WCSER. The COMPOSITE-2
+    // ledger below is deliberately OUTSIDE this branch: a declined pass still paid for a full
+    // compose, and a `pass_us` that could not see that cost would under-report the very contention
+    // this arc's readers are looking for.
+    if out.presented {
+        #[cfg(feature = "witness")]
+        note_cursor_tail(tail);
+        match tail {
         CursorTail::Adopt => {
             // `adopt_overlay` is the ONLY closer of the overlay session, so `Adopt` is never
             // downgraded — a pass that skipped it would leak the session and lock the whole overlay
@@ -3082,6 +3138,11 @@ fn composite_once() {
         }
         CursorTail::Repaint => super::cursor::repaint(),
         CursorTail::Untouched => super::cursor::ensure_drawn(),
+        }
+        // WCPAR step 3 — THE LAST GLASS WRITE OF THE PASS HAS LANDED. Released here and not one
+        // statement earlier: the strip compose and the cursor tail above both paint the panel, and
+        // they are as much part of the single-glass back-to-front order as the window blits are.
+        present_gate_release();
     }
     // COMPOSITE-2 — close the ledger: the tail interval is sprite work, the whole interval is the
     // pass. One `now_cycles` read serves both accounts.
@@ -3140,9 +3201,107 @@ enum CursorTail {
     Adopt,
 }
 
+/// WCPAR step 3 — what [`composite_inner`] reports to [`composite_once`].
+///
+/// `tail` is what the pass owes the sprite, unchanged. `presented` is new and it is the gate's state
+/// on return: `true` means this pass HOLDS the present gate and the caller owes the glass tail and
+/// the release; `false` means the pass never took it, has written no pixel, and has already handed
+/// its sprite duty forward pixel-free.
+struct PassOutcome {
+    tail: CursorTail,
+    presented: bool,
+}
+
+/// WCPAR step 3 — leave the pass WITHOUT the present gate, discharging every duty pixel-free.
+///
+/// This is the decline path in its new position. It is a strictly harder case than the pre-arc
+/// decline, which turned away before the table snapshot and therefore "CLEARED NOTHING": this one has
+/// already consumed the damage flags and, on the abandon path in [`composite_inner`], has already put
+/// them back. What is left is the sprite, and the rule is REVIEW CONDITION 3's, unchanged:
+///
+/// **`owe_repaint`, NEVER `ensure_drawn`.** We are by definition inside another core's present: the
+/// holder is blitting a half-composited stack and holds no `SPRITE` lock while it does. A sprite
+/// write from here would land over rows the holder is still rewriting AND would capture its
+/// save-under from those half-composited pixels, so the next undraw restores garbage. `owe_repaint`
+/// writes nothing now and makes the next pass's tail — which runs on a finished stack, inside the
+/// gate, holding `SPRITE` — repaint the whole sprite. Same guarantee, correct bracket.
+///
+/// A pass that opened an OVERLAY SESSION owes more than a repaint: `adopt_overlay` is the sole closer
+/// of that session and it paints, so it cannot run here. `cursor::abandon_overlay` is the pixel-free
+/// equivalent WEDGE-11 already built for a tail that could not claim the overlay — it defers the
+/// close to the next `overlay_open` and arms `owe_repaint` alongside — and the session is switched
+/// off for at most one pass rather than for the boot. `Adopt` is therefore not DOWNGRADED here; it is
+/// deferred whole, which is the one thing CURSOR-3's ledger permits in place of running it.
+fn abandon_pass(disturbed: bool, session: bool, deferred: bool) -> PassOutcome {
+    let _ = (disturbed, deferred);
+    if session {
+        super::cursor::abandon_overlay();
+    } else {
+        // Unconditional, exactly as the pre-arc decline was: `wm::erase` takes the sprite down and
+        // leaves the composite that follows to put it back, and a pass that turns away may not break
+        // that contract on the argument that IT did not disturb anything.
+        super::cursor::owe_repaint();
+    }
+    PassOutcome {
+        tail: CursorTail::Untouched,
+        presented: false,
+    }
+}
+
+/// WCPAR step 3 — finish a pass that has reached an EARLY EXIT outside the present gate.
+///
+/// The drain barrier and the not-ready framebuffer both return before the pass has composed
+/// anything, but they can still owe the sprite a tail (the deferred-erase drain may have taken it
+/// down). The tail is glass work, so it needs the gate: take it if it is free, and fall back to the
+/// pixel-free deferral otherwise.
+///
+/// On aarch64 [`present_gate_try`] is a vacuous `true`, so this is `tail_of` with a `presented: true`
+/// beside it — the pre-arc behaviour, evaluated identically.
+fn finish_ungated(disturbed: bool, session: bool, deferred: bool) -> PassOutcome {
+    if present_gate_try(true) {
+        PassOutcome {
+            tail: tail_of(disturbed, session, deferred),
+            presented: true,
+        }
+    } else {
+        abandon_pass(disturbed, session, deferred)
+    }
+}
+
 /// The composite pass proper. Private so the cursor bracket above cannot be bypassed — every caller
 /// (including this module's own teardown paths) goes through [`composite`].
-fn composite_inner() -> CursorTail {
+///
+/// ### WCPAR step 3 — the pass is two phases, and only the second one is serialised
+///
+/// **Phase A (no gate).** The deferred-erase drain, the cursor bracket, the `WRITER` read, the table
+/// snapshot, the upward occlusion closure, the back-to-front ordering, and then the COMPOSE of as
+/// many of this pass's windows as fit in this core's [`STAGE`] arena. Not one byte of it reaches the
+/// panel: `paint_window` and `cursor::compose_into` write into the core's own RAM, which the scan-out
+/// never observes. Several cores run this at once, which is the arc.
+///
+/// **Phase B (present gate held).** The `STAGE`→panel blits, in ascending z-order with ties by id,
+/// followed in [`composite_once`] by the furniture strips and the cursor tail. Every glass write in
+/// the pass is in here, so the single-glass back-to-front invariant is exactly as strong as it was
+/// when the gate covered the whole pass — the gate did not get weaker, the region under it got
+/// smaller.
+///
+/// **The snapshot is carried, not re-derived.** `rows`, `dirty`, `bands`, `order`, `shell` and
+/// `focus` are taken ONCE, in Phase A, and Phase B reads those same locals; the window set Phase B
+/// presents is by construction the closure Phase A composed. The one thing Phase B recomputes is
+/// [`occ_clip`], and only because a `[OccClip; MAX_WINDOWS]` array is kilobytes of composite-path
+/// stack: it is a PURE function of `(&rows, i, shell, pw, ph)`, every argument of which is a Phase A
+/// local that nothing between the phases can write, so the recomputation is the identity and cannot
+/// diverge. It is not a second look at the table.
+///
+/// **What a lost gate costs.** Phase A's work is thrown away and the damage it consumed is put BACK
+/// on the table before `COMP_PENDING` is published, so nothing is dropped — see the abandon path
+/// below. That is the price of composing speculatively, and it is the right trade: for a scale-`n`
+/// window the compose dominates the present, so the gate is free far more often than it is busy.
+///
+/// **aarch64 is untouched.** The split is `target_arch = "x86_64"` throughout; on aarch64 the staging
+/// prefix is empty by construction, every window takes the unsplit [`draw_window`], and
+/// [`present_gate_try`] is a vacuous `true`. The pass that runs there is the pass that ran before.
+fn composite_inner() -> PassOutcome {
     // COMPOSITE-2 — the pre-pass (drain + cursor bracket) clock opens here. Band-free for the reason
     // `composite`'s clock is: this interval runs before the table snapshot that produces `bands` at
     // all, so no band is even in scope here, let alone one this reading could be narrowed by.
@@ -3219,10 +3378,49 @@ fn composite_inner() -> CursorTail {
     // not when it painted, for MUST-FIX 1's reason: a drain whose boxes all re-defer has still
     // undrawn, and an `Untouched` tail there would leave the pointer missing for as long as the
     // contention lasts.
+    //
+    // ### WCPAR step 3 — THE DRAIN TAKES THE PRESENT GATE FOR ITSELF
+    //
+    // The drain is the one part of the pre-pass that WRITES THE GLASS (`stage_fill` → the desktop
+    // fill's bulk row copies), and both of its placement constraints are ordering constraints against
+    // the rest of the PRE-pass: it must run before the cursor bracket (CURSOR-5/P64) and before the
+    // dirty-set snapshot (WC-L), and both are still satisfied here. What it may not do is write the
+    // panel while another core is presenting, so it takes the present gate for the length of its own
+    // publish and releases it immediately.
+    //
+    // A busy gate SKIPS the drain rather than deferring the pass: the queue keeps its boxes, `DEFER_N`
+    // stays non-zero, and `COMP_PENDING` is published so the re-run loop and the `deferred_owed`
+    // rescue paths come back for them. That is the same "the box waits for a pass that can publish
+    // it" answer `stage_fill`'s own `DECL_LOCK` has always given, one level out.
+    //
+    // Two gate holds per pass rather than one is the honest cost of the split, and the ordering it
+    // gives up is bounded: a desktop fill is the BOTTOM layer over a box no live row intersects (that
+    // is the erase queue's admission rule), so a window present landing between our fill and our
+    // window blits paints above it in z-order regardless. What it cannot do is interleave two
+    // WINDOWS' rows, which is the bleed WCSER convicted, and Phase B's single hold still forbids that
+    // outright.
     {
         let fb = *super::WRITER.lock();
+        // aarch64 has no gate to take, so this is the pre-arc statement verbatim.
+        #[cfg(not(target_arch = "x86_64"))]
         if fb.is_ready() && drain_deferred(&fb) {
             disturbed = true;
+        }
+        // `deferred_owed()` is `drain_deferred`'s OWN fast-path predicate (`DEFER_N != 0`), asked one
+        // level out so that the overwhelming majority of passes — the ones with an empty erase queue —
+        // neither touch the gate nor appear in `[wcser]`'s census. Without it every pass would post a
+        // spurious `entered=`/`declined=` and the period's reading would be about the drain rather
+        // than about the presents it is read for.
+        #[cfg(target_arch = "x86_64")]
+        if fb.is_ready() && deferred_owed() {
+            if present_gate_try(false) {
+                if drain_deferred(&fb) {
+                    disturbed = true;
+                }
+                present_gate_release();
+            } else {
+                COMP_PENDING.store(true, core::sync::atomic::Ordering::Release);
+            }
         }
     }
 
@@ -3447,7 +3645,7 @@ fn composite_inner() -> CursorTail {
         // WC-N — a pass that produced no pixels for any window. See `WCN_ABORTED`.
         #[cfg(feature = "witness")]
         wcn_note_pass(false);
-        return tail_of(disturbed, session, deferred);
+        return finish_ungated(disturbed, session, deferred);
     }
 
     // F4 — the drain barrier. Register this composite as in-flight WHILE STILL HOLDING the table
@@ -3469,7 +3667,7 @@ fn composite_inner() -> CursorTail {
             // than after the early return is what makes the abort count exact.
             #[cfg(feature = "witness")]
             wcn_note_pass(false);
-            return tail_of(disturbed, session, deferred);
+            return finish_ungated(disturbed, session, deferred);
         }
         let mut dirty = [false; MAX_WINDOWS];
         // FBCON-DMG — the band travels with the dirty flag and is cleared with it, in the SAME
@@ -3617,7 +3815,131 @@ fn composite_inner() -> CursorTail {
     // the sprite, and its plan is the one `OVERLAY` ends up holding — which is the window the
     // operator is pointing at.
     let mut overlaid = false;
-    for &i in order.iter() {
+
+    // ============================ WCPAR step 3 — PHASE A: COMPOSE ==============================
+    //
+    // Back-to-front over the pass's own order, composing each window into this core's [`STAGE`]
+    // arena and putting NOTHING on the panel. No global lock is held: the arena is per-core, the
+    // table guard is already dropped, and the present gate is not taken until this loop has ended.
+    // Several cores run this concurrently — that is the arc.
+    //
+    // **The staged set is a PREFIX of `order`, and it has to be.** Phase B blits the staged windows
+    // and then the unstaged ones; that is the correct back-to-front order if and only if every staged
+    // window is below every unstaged one. So the first window that cannot be staged ENDS the phase —
+    // `break`, never `continue` — and it and everything above it take the unsplit [`draw_window`]
+    // under the gate, which is the pre-arc path verbatim. A window with nothing to paint at all
+    // (`ComposeOutcome::Nothing`: degenerate row, off-panel, buried outright) is not a boundary: it
+    // paints nothing in Phase B either, from the same pure [`window_extent`] derivation.
+    //
+    // The common pass is ONE window — a vug presenting its own frame, with an occlusion closure that
+    // drags in nothing because vugs rarely overlap — and it stages whole, at exactly the memory the
+    // per-core buffer already used before this arc. A multi-window pass stages what fits under
+    // [`MAX_STAGE_BYTES`]; the full-panel console, which WC-M bands through the buffer one strip at a
+    // time, is never staged and never was going to be.
+    #[cfg(target_arch = "x86_64")]
+    let mut staged: [Option<StagedWin>; MAX_WINDOWS] = [const { None }; MAX_WINDOWS];
+    // The arena guard is held from here THROUGH Phase B's staged prefix. It must be: the composed
+    // bytes have to survive the gate acquisition, and a core that let go in between could be
+    // preempted and re-enter its own entry (which is exactly what `try_lock` has guarded since WCPAR
+    // step 1). `try_lock` and not `lock` for the same reason as ever — a contended entry means this
+    // core is already composing, and the answer is the unsplit path, not a wait.
+    #[cfg(target_arch = "x86_64")]
+    let mut arena_guard = stage_for_core().try_lock();
+    #[cfg(target_arch = "x86_64")]
+    if let Some(arena) = arena_guard.as_mut() {
+        #[cfg(feature = "witness")]
+        let _inflight = WcparInflight::enter();
+        let mut base = 0usize;
+        for (k, &i) in order.iter().enumerate() {
+            if !rows[i].used || !dirty[i] {
+                continue;
+            }
+            // FOCUS-VIS — the same test Phase B applies, and applied here SILENTLY: `wcn_note_below`
+            // is the compositor's end of a per-window fact and must be emitted exactly once per pass,
+            // so it stays where it was, in Phase B.
+            if !above_shell(&rows[i], shell) {
+                continue;
+            }
+            // The witness one-shots cannot straddle the phase boundary — see `super::wcg::armed`.
+            // A window either of them may still fire for ends the staging prefix and takes the
+            // unsplit path, where both brackets keep the exact interval they have always had.
+            if !stage_eligible(&rows[i]) {
+                break;
+            }
+            let clip = occ_clip(&rows, i, shell, fb.info().width, fb.info().height);
+            match draw_window_compose(
+                &fb,
+                &rows[i],
+                i,
+                // FOCUS-HL: the pass's one focus snapshot, read here exactly as Phase B reads it.
+                focus != 0 && focus == rows[i].owner_asid,
+                plan,
+                // `stage_eligible` has already excluded every window an instrument would exclude, so
+                // a staged window is always one the overlay may be offered to.
+                true,
+                bands[i],
+                &clip,
+                arena,
+                base,
+            ) {
+                ComposeOutcome::Staged(sw) => {
+                    base += sw.row_bytes * (sw.dy1 - sw.dy0);
+                    staged[k] = Some(sw);
+                }
+                ComposeOutcome::Nothing => continue,
+                ComposeOutcome::Unsplittable => break,
+            }
+        }
+    }
+
+    // ==================== WCPAR step 3 — THE PRESENT GATE, AND THE ABANDON ======================
+    //
+    // Everything below this line writes the glass. One core at a time, in ascending z-order, ties by
+    // id: the single-glass back-to-front invariant, on the same gate that used to cover the whole
+    // pass.
+    //
+    // A FAILURE HERE IS THE HARD CASE, and it is why this arc could not be a two-line move of the
+    // acquisition. The pre-arc decline turned away before the table snapshot and so "CLEARED
+    // NOTHING"; this one has already consumed every `damaged` flag it closed over. Dropping the pass
+    // now would silently lose those repaints on a desktop where no later present is coming.
+    //
+    // So the damage goes BACK. The `BlitGuard` is dropped first — re-taking the table inside the
+    // guard window would put a blocking acquisition into the F4 drain barrier's wait set, and that
+    // barrier's termination argument depends on that set being exactly what it is — and the rows are
+    // re-damaged WHOLE-BOX (`dmg_y0 = dmg_y1 = 0`), which is the conservative direction and the same
+    // promotion the upward closure already performs on every window it drags in. Rows are matched by
+    // ID, so a slot recycled since the snapshot is left alone rather than damaged under a new owner's
+    // identity — the step-2 owner fence's rule, applied to the return path.
+    //
+    // Then `COMP_PENDING`, which is what `composite`'s re-run loop and `service_damage` consume, and
+    // then the pixel-free sprite discharge in [`abandon_pass`].
+    if !present_gate_try(true) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            drop(arena_guard);
+        }
+        drop(_blit);
+        {
+            let mut t = table();
+            for (i, r) in t.rows.iter_mut().enumerate() {
+                if dirty[i] && r.used && r.id == rows[i].id {
+                    r.damaged = true;
+                    r.dmg_y0 = 0;
+                    r.dmg_y1 = 0;
+                }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        COMP_PENDING.store(true, core::sync::atomic::Ordering::Release);
+        // WC-N — the pass reached no window. Counted as an abort, which is what it is: the damage is
+        // back on the table and a later pass draws it.
+        #[cfg(feature = "witness")]
+        wcn_note_pass(false);
+        return abandon_pass(disturbed, session, deferred);
+    }
+
+    // ============================ WCPAR step 3 — PHASE B: PRESENT ==============================
+    for (_k, &i) in order.iter().enumerate() {
         if !rows[i].used || !dirty[i] {
             continue;
         }
@@ -3637,7 +3959,74 @@ fn composite_inner() -> CursorTail {
         // shared by the blit and by every witness that has to excuse what the blit withheld. Built
         // per window rather than once per pass because the set is relative to the painter; the scan
         // is `MAX_WINDOWS` rows against a call that is about to copy a box.
+        //
+        // WCPAR step 3 — RE-DERIVED, NOT RE-READ. This is the same call Phase A made, on the same
+        // `rows` snapshot, the same `shell`, and the same panel geometry — all Phase A locals that
+        // nothing between the phases can write. `occ_clip` is pure, so this is the identity; it is
+        // recomputed rather than carried only because `[OccClip; MAX_WINDOWS]` is kilobytes of stack
+        // on the composite path. No second look at the window table happens between the phases.
         let clip = occ_clip(&rows, i, shell, fb.info().width, fb.info().height);
+        // WCPAR step 3 — THE STAGED PREFIX. This window's pixels are already composed, in this core's
+        // arena, from this pass's snapshot; all that is left is to put them on the glass in z-order
+        // and run the post-blit sprite bookkeeping. No source surface is read here, no instrument
+        // bracket is open (`stage_eligible` excluded every window that could have one), and the
+        // `stage_flush`/`wcn_note_drawn` pair is emitted at the same point in the pass as ever.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(sw) = staged[_k] {
+            // The staged record carries the row index Phase A composed from. `order` is a pure
+            // function of the snapshot and neither phase re-sorts it, so this is the identity — kept
+            // as a debug assertion because the one thing that would make the split unsound is
+            // presenting one window's composed bytes under another window's identity, and this is
+            // the cheapest possible statement of "that did not happen".
+            debug_assert_eq!(sw.i, i, "WCPAR-3: staged/present row mismatch");
+            if let Some(arena) = arena_guard.as_mut() {
+                overlaid |= draw_window_present(
+                    &fb,
+                    &rows[i],
+                    &sw,
+                    plan,
+                    // CURSOR-7/15 — the same `bracketed` question the unsplit path asks.
+                    disturbed || deferred,
+                    &clip,
+                    arena,
+                );
+                #[cfg(feature = "witness")]
+                super::wcg::stage_flush(rows[i].id);
+                #[cfg(feature = "witness")]
+                {
+                    wcn_note_drawn(rows[i].id, !seed[i]);
+                    WCPAR_SPLIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // WCPAR step 3 — REACHABILITY, ONCE PER BOOT. `[wcpar]`'s rollup drains per span
+                    // and is silent on a quiet one, so a boot whose split ran only outside a printed
+                    // span reads identically to a boot where it never ran at all. This line closes
+                    // that: its ABSENCE from a capture is the falsification that the phase split is
+                    // dead code on that boot, and it is the line a gate should look for. One
+                    // `serial_println!`, latched, outside every bracket that could be charged for it.
+                    if !WCPAR_SPLIT_FIRST.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                        serial_println!(
+                            "[wcpar] split-first win={} cpu={} box={}x{} rows={}",
+                            rows[i].id,
+                            stage_pool_index(),
+                            sw.bw,
+                            sw.bh,
+                            sw.dy1 - sw.dy0
+                        );
+                    }
+                }
+                drawn += 1;
+                continue;
+            }
+        }
+        // WCPAR step 3 — the first UNSTAGED window ends the prefix, so the arena is released here:
+        // the unsplit `stage_window` below takes this core's [`STAGE`] entry with its own `try_lock`
+        // and would decline into the tearing direct path if we were still holding it. Assigning
+        // `None` drops the guard; every window from here up is unsplit, so nothing reclaims it.
+        #[cfg(target_arch = "x86_64")]
+        {
+            arena_guard = None;
+            #[cfg(feature = "witness")]
+            WCPAR_FALLBACK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         // WC-D — the REFERENCE, taken BEFORE the blit. See `verify_reference` and the WCD-PRE section
         // of `verify_window`'s ledger for why it cannot be taken any later: the read-back's reference
         // used to be snapshotted from inside `verify_window`, which runs after `wcg::end` and
@@ -3860,7 +4249,13 @@ fn composite_inner() -> CursorTail {
     }
     let _ = drawn;
     let _ = overlaid;
-    tail_of(disturbed, session, deferred)
+    // WCPAR step 3 — the gate is still HELD. `composite_once` owes the furniture strips, the cursor
+    // tail and the release, in that order, because all three are glass work and belong inside the
+    // same hold as the window blits above.
+    PassOutcome {
+        tail: tail_of(disturbed, session, deferred),
+        presented: true,
+    }
 }
 
 /// CURSOR-3 — what the pass owes the sprite, from the two facts the pass records.
@@ -5862,19 +6257,38 @@ static SIDEBYSIDE_WITNESSED: core::sync::atomic::AtomicBool =
 // paper over on every frame. If metal ever shows a real `WEDGED`, the token form of (a) is the
 // starting point, with a threshold argued from that boot's `[comp2] max_us`.
 //
-// WCPAR SEAM (design: `engine.md` §8 "WCPAR — parallel per-core composite"). This gate is WHY open
-// vugs fall into the load-invariant `[wcn] rate=19.6/s gap=51..51ms` ceiling: it serialises the WHOLE
-// composite pass (compose AND present), so N vugs share one composite pipe and each gets 1/N of it —
-// the queue Peter's "spread the vugs across cores" ask is about. The gate exists for a REAL and
-// irreducible reason on the PRESENT half — the single front buffer and the cross-window back-to-front
-// blit order (the `A.lower … B.upper … A.upper` bleed this arc's ledger convicts). WCPAR does NOT
-// remove it: it narrows what runs under it. The expensive COMPOSE half (surface → per-core `STAGE`,
-// the scale-2 upscale, `[wc-h] compose_us`) is per-window independent and moves OUT to run in
-// parallel per core; only the `STAGE`→panel present stays serial here, in z-order, keeping
-// tear-freedom (`[wc-h]`/`[wc-k]` -> TEAR-FREE) byte-for-byte. Landing that requires restructuring
-// `composite_inner` into a parallel-compose / serial-present split, which reads `occ_clip`,
-// `above_shell`/`SHELL_Z` and `ctrls_for` — three predicates under concurrent edit — so it is a
-// FOLLOW-ON arc after those land, not this one. See the `STAGE` static for step 1's per-core seam.
+// ⚠ WCPAR STEP 3 — THIS IS NOW A **PRESENT** GATE, AND EVERYTHING ABOVE IS WRITTEN ABOUT THE PASS
+// GATE IT USED TO BE. The ledger above is kept because its arguments are still the governing ones —
+// try-never-spin, no stale-holder breaker, the `service_damage` backstop, the masked-holder rule —
+// and every one of them applies unchanged to the narrower region. What changed is the REGION.
+//
+// Until step 3 this gate was acquired in `composite` and held across the whole of `composite_once`,
+// compose included, and that is WHY open vugs fell into the load-invariant `[wcn] rate=19.6/s
+// gap=51..51ms` ceiling: N vugs shared one composite pipe and each got 1/N of it — the queue Peter's
+// "spread the vugs across cores" ask is about.
+//
+// It is now taken by [`present_gate_try`] from inside `composite_inner`, AFTER the compose phase, and
+// released by `composite_once` after the cursor tail. What runs under it is every glass write the
+// pass makes and nothing else: the `STAGE`→panel row copies in ascending z-order (ties by id), the
+// furniture strips, and the sprite tail. The reason the gate exists is untouched — the single front
+// buffer and the cross-window back-to-front blit order, the `A.lower … B.upper … A.upper` bleed this
+// ledger convicts — and it is exactly as strong over that region as it was over the whole pass. The
+// expensive COMPOSE half (surface → per-core `STAGE`, the scale-`n` upscale, `[wc-h] compose_us`) is
+// per-window independent and now runs OUTSIDE it, on every core with a present in flight.
+//
+// TWO CONSEQUENCES A READER OF THIS GATE HAS TO KNOW:
+//
+//   * `[wcser] declined=` NO LONGER MEANS "a pass composited nothing". A decliner has now already
+//     composed and already consumed the table's damage flags, so it puts that damage BACK (whole-box,
+//     by row id, with the `BlitGuard` dropped first) before it publishes `COMP_PENDING`. The
+//     abandon path in `composite_inner` is the whole of that argument.
+//   * The deferred-erase DRAIN takes and releases this gate for its own publish, at the head of the
+//     pass, because it is the one pre-pass step that writes the glass and it must keep its ordering
+//     against the cursor bracket (CURSOR-5) and the dirty-set snapshot (WC-L). That is two holds per
+//     draining pass; see the drain block in `composite_inner` for why the ordering it gives up is
+//     bounded and why it is not the WCSER bleed.
+//
+// See the `STAGE` static for step 1's per-core pool, which is the substrate this rests on.
 #[cfg(target_arch = "x86_64")]
 static COMP_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -5917,6 +6331,22 @@ const COMP_RERUN_MAX: u32 = 2;
 /// interleaving their blits with another core's, per 5 s. Non-zero proves the concurrency the
 /// `[comp2]` utilisation arithmetic could only infer; a fall to zero would mean the fleet stopped
 /// overlapping, not that the gate stopped working (`entered` is the denominator that separates them).
+///
+/// ⚠ WCPAR STEP 3 — WHAT A `declined` COSTS HAS CHANGED, AND THE NUMBER SHOULD BE READ DIFFERENTLY.
+/// The gate is now taken AFTER the compose (see [`present_gate_try`]), so a decliner has already
+/// composed its windows and already consumed the table's damage flags. It puts that damage back and
+/// republishes `COMP_PENDING`, so nothing is lost — but the work IS lost, which the pre-arc decline
+/// (which turned away before the table snapshot and did nothing at all) did not pay for.
+///
+/// So `declined` is no longer free, and a boot where it climbs toward `entered` is a boot where cores
+/// are composing speculatively and throwing it away — the signature of a present half that has become
+/// the bottleneck, which is the opposite of what step 3 predicts and is worth investigating rather
+/// than celebrating. The healthy shape is `declined` small against `entered`, because for a scale-`n`
+/// window the compose dominates the present and the gate is therefore free most of the time.
+///
+/// Both counters count PASSES ONLY. The deferred-erase drain's short hold at the head of a pass takes
+/// the gate with `census: false` and is deliberately absent from this population — see
+/// [`present_gate_try`].
 ///
 /// `reruns` is the SECOND reading, and review condition 4 gave it a job: it is the liveness proof for
 /// the re-run machinery, which the `!masked` guard reaches only from the unmasked lanes. Expected
@@ -5990,27 +6420,98 @@ fn wcser_emit(scope: &str, span: u64) {
 /// the flow arc asks for: with the pool landed, a composite runs on whatever core its present arrived
 /// on, so a fleet of vugs distributes its staging across cores instead of every stage funnelling through
 /// one shared buffer. `cores>1` on this line, against a shared-buffer world that could only ever stage
-/// on one, is the direct reading that the per-core pool is being exercised — and it is the necessary
-/// precondition for the true-simultaneous compose the deferred `COMP_GATE` split (design §8, step 3)
-/// will unlock. Witness-only; the pool itself is arch-neutral and unconditional.
+/// on one, is the direct reading that the per-core pool is being exercised. It was the necessary
+/// precondition for step 3's true-simultaneous compose, which has since landed; `cmax=` on the same
+/// line is the term that measures that. Witness-only; the pool itself is arch-neutral and unconditional.
 #[cfg(feature = "witness")]
 static WCPAR_STAGE_CPU: [core::sync::atomic::AtomicU64; STAGE_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; STAGE_CPUS];
+
+/// WCPAR step 3 — cores INSIDE Phase A right now. The `cmax` reading's source.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static WCPAR_INFLIGHT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCPAR step 3 — high-water mark of [`WCPAR_INFLIGHT`] since the last rollup, drained by
+/// [`wcpar_emit`]. **This counter can read 1 and frequently should**: one present source means one
+/// core in Phase A, which is the honest answer in the scripted QEMU fixture and on an idle boot. It
+/// is `>1` only when two cores are genuinely composing at the same instant, which before step 3 was
+/// impossible by construction — `COMP_GATE` covered the compose — and is now the arc's direct witness.
+#[cfg(feature = "witness")]
+static WCPAR_CMAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCPAR step 3 — windows presented from the per-core arena (composed OFF the present gate).
+#[cfg(feature = "witness")]
+static WCPAR_SPLIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCPAR step 3 — has the split path run at all this boot? Latches the `[wcpar] split-first` line.
+#[cfg(feature = "witness")]
+static WCPAR_SPLIT_FIRST: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// WCPAR step 3 — windows Phase A could NOT stage, which therefore composed and presented UNDER the
+/// present gate: a live WC-G/WC-D battery, a compat row, or a box WC-M has to band. The denominator
+/// that makes `split=` readable — a boot with `split=0 fallback=N` has never exercised the split at
+/// all, whatever `cmax=` says.
+///
+/// Structurally 0 on aarch64, and that is the correct reading rather than a hole: the phase split is
+/// x86-only, so no window there is ever "fallen back" from a Phase A that does not run. `total=` and
+/// `c0..c7` are that arch's whole `[wcpar]` reading, exactly as they were before this arc.
+#[cfg(feature = "witness")]
+static WCPAR_FALLBACK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCPAR step 3 — RAII occupancy count for Phase A, so `cmax` measures cores that were composing at
+/// the SAME INSTANT rather than cores that composed at some point in the span.
+///
+/// Two relaxed RMWs on a path that is about to run a scale-`n` upscale. The `fetch_max` reads the
+/// count INCLUDING this core, taken at entry: a core that arrives while another is mid-compose
+/// publishes 2 whether or not the first core is still there when it leaves, which is the correct
+/// direction for a high-water mark. Dropped at the end of Phase A, before the gate is attempted, so
+/// the count never includes a core that is merely queued to present.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+struct WcparInflight;
+
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+impl WcparInflight {
+    fn enter() -> Self {
+        use core::sync::atomic::Ordering::Relaxed;
+        let n = WCPAR_INFLIGHT.fetch_add(1, Relaxed) + 1;
+        WCPAR_CMAX.fetch_max(n, Relaxed);
+        Self
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+impl Drop for WcparInflight {
+    fn drop(&mut self) {
+        WCPAR_INFLIGHT.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// WCPAR — the per-core stage census, on the `[wcn]` rollup cadence and span. Prints each core's stage
 /// count and how many DISTINCT cores staged this span (`cores=`), so a reader sees the pool spreading
 /// compose across cores at a glance. Silent on a span where nothing staged, like its `[wcn]`/`[wcser]`
 /// siblings — a period with no compositing is idleness, not a signal.
 ///
-/// ⚠ WCPAR-REVIEW: `cores>` here counts DISTINCT cores that staged a compose OVER THE SPAN — NOT cores
-/// composing SIMULTANEOUSLY. On x86 `stage_window`/`stage_fill` are reached only through
-/// `composite_inner`, which still runs under `COMP_GATE`, so two cores never compose at the same instant
-/// yet — steps 1-2 dropped the WINDOWS hold (read `[rtwit] windows_max_us` falling), but the
-/// simultaneous-compose spread awaits the deferred step 3 that narrows `COMP_GATE` to the present only.
-/// Do NOT falsify against `[wcser] declined=`: that counts `COMP_GATE` compare-exchange failures, which
-/// this arc does not touch and will not move; the cross-core STAGE decline it seems to promise did not
-/// exist on x86 (COMP_GATE already serialised the compose). The true flow falsification — `[wcn] rate=`
-/// above 19.6/s AND wall-span < Σ`compose_us` on a multi-vug boot — is a step-3 signal.
+/// ⚠ WCPAR-REVIEW: `cores=` counts DISTINCT cores that staged a compose OVER THE SPAN — NOT cores
+/// composing SIMULTANEOUSLY. It could not have meant the latter before step 3, because
+/// `composite_inner` ran whole under `COMP_GATE`. **`cmax=` is the term that answers the
+/// simultaneity question**, and it is a direct measurement rather than an inference: it is the
+/// high-water mark of cores inside Phase A at the same instant, sampled by [`WcparInflight`] on entry.
+///
+/// **What each term can honestly read, and where.** In the scripted `UNAOS_WC=1 ./arroyo test`
+/// fixture there is a SINGLE present source, so `cores=1` and `cmax=1` are the CORRECT readings and
+/// the gate asserts nothing stronger — a fixture that cannot produce two concurrent presents cannot
+/// witness two concurrent composes, and a witness printed there that read `cmax=2` would be lying.
+/// `cmax=1` is also what a genuinely idle multi-core boot reads. The falsification this line exists
+/// for is a MULTI-VUG BENCH BOOT: `cmax>1` is the direct witness that step 3's phase split does what
+/// it claims, and it is corroborated by `[wcn] rate=` rising above `19.6/s` AND diverging between
+/// windows, with a wall span below Σ`compose_us` from `[wc-h]`. None of those three is available in
+/// QEMU and none of them is asserted there.
+///
+/// `split=`/`unsplit=` are the population the `cmax` reading is drawn from: windows presented from
+/// the arena (Phase A composed them off the gate) against windows that took the unsplit path under it
+/// (a live WC-G/WC-D battery, a compat row, or a box WC-M has to band). A boot whose `split=` is 0 has
+/// never exercised the split at all, whatever `cmax` says, so the pair is what makes `cmax` readable.
 #[cfg(feature = "witness")]
 fn wcpar_emit(span: u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -6024,6 +6525,9 @@ fn wcpar_emit(span: u64) {
             cores += 1;
         }
     }
+    let cmax = WCPAR_CMAX.swap(0, Relaxed);
+    let split = WCPAR_SPLIT.swap(0, Relaxed);
+    let fallback = WCPAR_FALLBACK.swap(0, Relaxed);
     if total == 0 {
         return;
     }
@@ -6032,8 +6536,11 @@ fn wcpar_emit(span: u64) {
     // pre-pool world, or a single-vug boot) reads `cores=1`, and a spread fleet reads its true width.
     let max = counts.iter().copied().max().unwrap_or(0);
     serial_println!(
-        "[wcpar] cores={} total={} max={} c0={} c1={} c2={} c3={} c4={} c5={} c6={} c7={} span={}ms",
+        "[wcpar] cores={} cmax={} split={} fallback={} total={} max={} c0={} c1={} c2={} c3={} c4={} c5={} c6={} c7={} span={}ms",
         cores,
+        cmax,
+        split,
+        fallback,
         total,
         max,
         counts[0],
@@ -11851,13 +12358,14 @@ const MAX_STAGE_BYTES: usize = 4 * 1024 * 1024;
 /// tracks the largest vug that core staged); only a core that stages the full-panel console reaches the
 /// [`MAX_STAGE_BYTES`] cap, and only if that core actually stages it.
 ///
-/// WHAT IS STILL DESIGN, NOT LANDED: `COMP_GATE` still serialises the whole `composite_once` on x86, so
-/// two cores' PASSES do not yet overlap from the present path — the pool removes the compose-vs-compose
-/// decline and lets the compositing WORK spread across cores over time, but the phase split that would
-/// let two composes run truly simultaneously (step 3: narrow `COMP_GATE` to the z-ordered present only)
-/// is deferred, because it restructures `composite_inner`'s blit loop and its WC-G/WC-D/CURSOR
-/// brackets — the file's most delicate tear-freedom machinery — and cannot land safely in one pass.
-/// See `engine.md` §8 for the sequencing.
+/// WCPAR STEP 3 HAS SINCE LANDED, AND THIS BUFFER IS WHAT IT RESTS ON. `COMP_GATE` no longer covers
+/// `composite_once`; it is taken after the compose (see [`present_gate_try`]), so two cores' composes
+/// now genuinely run at the same instant, each into its own entry here. What that changed about THIS
+/// static is how one entry is used within a pass rather than anything about the pool: a pass
+/// bump-allocates an ARENA inside its core's entry so several windows' composed rows can coexist until
+/// the present gate is taken, and the guard is held across both phases rather than per window. The
+/// ceiling is unmoved — [`MAX_STAGE_BYTES`] now bounds the arena total, which is checked explicitly in
+/// [`stage_window`], so the split costs no memory. See [`StagePhase`] and `engine.md` §8.
 ///
 /// The per-entry invariants are exactly the old buffer's: zero-initialised, written only through
 /// `put_pixel` (3 of 4 bytes, pad stays 0), grown with `try_reserve` so exhaustion returns to the
@@ -11869,6 +12377,107 @@ const STAGE_CPUS: usize = crate::ui_status::PSTRIP_MAX_CPUS;
 const _: () = assert!(STAGE_CPUS == 8, "wcpar_emit prints c0..c7; widen it if STAGE_CPUS changes");
 static STAGE: [Mutex<alloc::vec::Vec<u8>>; STAGE_CPUS] =
     [const { Mutex::new(alloc::vec::Vec::new()) }; STAGE_CPUS];
+
+/// WCPAR step 3 — WHICH HALF OF THE PASS A [`stage_window`] CALL IS RUNNING.
+///
+/// [`stage_window`] has always been two phases in one function: **compose** (`paint_window` +
+/// `cursor::compose_into` into the per-core back layer — every scattered `put_pixel` of the scale-`n`
+/// upscale) and **present** (one bulk `copy_nonoverlapping` per row, the only part the scan-out can
+/// catch mid-flight). Until this arc they always ran back to back, per WC-M band, under one gate.
+///
+/// Step 3 splits them so the compose half can run on several cores at once while only the present
+/// half is serialised. This enum is how the one function serves both shapes without a second copy of
+/// the row loop or of its witness accounting — a duplicate would drift, and the accounting is what
+/// `[wc-h]`, `[drag-occ]` and `occclip_*` are read from.
+///
+/// * `Both` — the pre-WCPAR-3 behaviour, verbatim: compose a band, present it, next band. This is
+///   what **every aarch64 present takes** (the phase split is x86-only, see [`composite_inner`]) and
+///   what x86 falls back to for any window Phase A could not park in the arena.
+/// * `ComposeOnly` — Phase A. Compose the whole span into the caller's arena at `base` and write no
+///   pixel to the panel. Requires a single WC-M band (`chunk_rows >= span`); a box that would have to
+///   be banded declines here and takes `Both` under the present gate instead, exactly as it does
+///   today.
+/// * `PresentOnly` — Phase B. Blit the bytes `ComposeOnly` left at `base`, in the caller's z-order,
+///   under the present gate. Reads the arena and the panel; never the window's source surface.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StagePhase {
+    Both,
+    #[cfg(target_arch = "x86_64")]
+    ComposeOnly,
+    #[cfg(target_arch = "x86_64")]
+    PresentOnly,
+}
+
+impl StagePhase {
+    /// Does this call run the compose half (`paint_window` + the sprite offer)?
+    #[inline]
+    fn composes(self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self != StagePhase::PresentOnly
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            true
+        }
+    }
+    /// Does this call run the present half (the bulk row copies onto the glass)?
+    #[inline]
+    fn presents(self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self != StagePhase::ComposeOnly
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            true
+        }
+    }
+}
+
+/// WCPAR step 3 — one window's composed artifact, parked in this core's [`STAGE`] arena between
+/// Phase A and Phase B of the same pass.
+///
+/// Everything the present half needs is captured here at compose time, from the pass's ONE table
+/// snapshot, so Phase B re-reads no row field and cannot present a geometry Phase A did not compose.
+/// The occlusion clip is the single exception and it is deliberate: see the `occ_clip` re-derivation
+/// note in [`composite_inner`]'s Phase B.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct StagedWin {
+    /// Row index into the pass's `rows` snapshot. The identity Phase B presents under.
+    i: usize,
+    /// Byte offset of this window's composed rows inside the core's arena.
+    base: usize,
+    /// Panel-space box, already clipped to the panel by `draw_window`.
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+    /// Box-relative row range this present owes (FBCON-DMG's band, or the whole box).
+    dy0: usize,
+    dy1: usize,
+    /// Bytes per composed row — `bw * bytes_per_pixel`.
+    row_bytes: usize,
+    /// Cycles the compose half spent, carried so `[wc-h]`'s `compose_us`/`present_us` pair still
+    /// reports one present's two halves rather than two half-presents.
+    compose_cyc: u64,
+    /// Did the compose take the cursor overlay into this window's layer? Phase B owes
+    /// `cursor::overlay_uncover` for every drawn window that did NOT.
+    overlaid: bool,
+    /// Was this window drawn with the focus highlight? Diagnostic only — kept so the staged record
+    /// is a complete description of what was composed.
+    focused: bool,
+}
+
+/// WCPAR step 3 — the calling core's arena high-water mark for the pass in flight, so a second
+/// window's compose lands after the first's instead of over it.
+///
+/// Reset at the head of every Phase A. Purely a bump pointer: the arena is the core's own [`STAGE`]
+/// entry, held across both phases by the guard [`composite_inner`] takes, so nothing else can be
+/// interleaved into it.
+#[cfg(target_arch = "x86_64")]
+const STAGE_ARENA_CAP: usize = MAX_STAGE_BYTES;
 
 /// WCPAR — the calling core's entry in the [`STAGE`] pool. `meter_current_cpu()` is the same reading
 /// the pstrip and `[wcn]`'s census already use; a core index at or beyond the pool (more physical cores
@@ -11977,27 +12586,33 @@ static FALLBACK_FIXTURE: core::sync::atomic::AtomicBool =
 /// fail-safe direction: the fallback is the path taken when the back layer is unavailable, it is
 /// already the expensive regime, and a whole-box repaint there can only over-paint, never leave a
 /// stale glyph. The cache clean at the tail follows whichever extent actually ran.
-#[allow(clippy::too_many_arguments)]
-fn draw_window(
+/// WCPAR step 3 — THE ONE DERIVATION OF WHAT A PRESENT WILL PAINT.
+///
+/// Split out of [`draw_window`] verbatim, because after this arc there are three callers of it and
+/// they must not be able to disagree: the unsplit [`draw_window`] (every aarch64 present, and x86's
+/// gated fallback), Phase A's [`draw_window_compose`], and Phase B's [`draw_window_present`]. The
+/// geometry Phase B blits has to be the geometry Phase A composed; the cheapest way to guarantee
+/// that is for there to be only one expression of it.
+///
+/// Returns `(bx, by, bw, bh, dy0, dy1)` — the panel-clipped outer box and the box-relative row range
+/// this present owes — or `None` when there is nothing to paint (degenerate row, off-panel origin,
+/// buried outright, or a band that misses the clipped box).
+fn window_extent(
     fb: &super::FrameBuffer,
     r: &Window,
-    focused: bool,
-    cur: Option<super::cursor::Plan>,
-    may_overlay: bool,
-    bracketed: bool,
     band: Option<(usize, usize)>,
     clip: &OccClip,
-) -> bool {
+) -> Option<(usize, usize, usize, usize, usize, usize)> {
     // `stride`/`scale` are divisors below and `surf_len` bounds the reads, so all four are checked
     // here rather than trusted from the row.
     if r.surf == 0 || r.w == 0 || r.h == 0 || r.scale == 0 || r.stride < 4 || r.surf_len == 0 {
-        return false;
+        return None;
     }
     let info = fb.info();
     let (pw, ph) = (info.width, info.height);
     let (bx, by, bw, bh) = outer_box(r);
     if bx >= pw || by >= ph {
-        return false;
+        return None;
     }
     // F6 — clip the outer box to the panel BEFORE any loop runs over it. `put_pixel`/`fill_rect`
     // clip per pixel, which keeps the writes safe but still ITERATES the full extent: a window
@@ -12023,7 +12638,7 @@ fn draw_window(
         if dragocc_target(r).is_some() {
             DO_BURIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
-        return false;
+        return None;
     }
     // CRISPYWIRE-REVIEW — a note on what this clip means for the chrome that `paint_window` draws
     // from `bw`/`bh` rather than from the row.
@@ -12042,11 +12657,6 @@ fn draw_window(
     // if a window ever does exceed the panel, is to pass the unclipped extent alongside the clipped
     // one and key the edge chrome off the former — not to widen this clip.
 
-    // WC-H — compose off-screen and present the box as contiguous rows. Returns false when the
-    // back-layer is unavailable (compat row, over-cap geometry, another core holding it, or the
-    // allocator declining), in which case the direct path below runs exactly as it always has.
-    let mut overlaid = false;
-    let offer = if may_overlay { cur } else { None };
     // FBCON-DMG — the band, as BOX-RELATIVE rows. `damaged_box` does the source→panel conversion and
     // the clip to the box; subtracting `by` puts it in the coordinate `stage_window`'s loop counts in.
     // An empty result means this pass's damage falls entirely outside the panel-clipped box, which is
@@ -12058,11 +12668,44 @@ fn draw_window(
             let y0 = dby.max(by).saturating_sub(by);
             let y1 = (dby.saturating_add(dbh)).min(by + bh).saturating_sub(by);
             if y1 <= y0 {
-                return false;
+                return None;
             }
             (y0, y1)
         }
     };
+    Some((bx, by, bw, bh, dy0, dy1))
+}
+
+/// Paint one window onto the panel: compose it into the back layer and present it, or — when the back
+/// layer is unavailable — paint it straight into the scan-out.
+///
+/// WCPAR step 3 — this is the UNSPLIT present, `StagePhase::Both`. It is what every aarch64 pass
+/// runs (the phase split is x86-only) and what an x86 pass runs, under the present gate, for any
+/// window Phase A could not park in its arena. Its body is unchanged by this arc: the geometry moved
+/// out to [`window_extent`] and the post-blit sprite bookkeeping to [`draw_window_post`], both
+/// verbatim, so that the split paths cannot express a different present than this one does.
+#[allow(clippy::too_many_arguments)]
+fn draw_window(
+    fb: &super::FrameBuffer,
+    r: &Window,
+    focused: bool,
+    cur: Option<super::cursor::Plan>,
+    may_overlay: bool,
+    bracketed: bool,
+    band: Option<(usize, usize)>,
+    clip: &OccClip,
+) -> bool {
+    let Some((bx, by, bw, bh, dy0, dy1)) = window_extent(fb, r, band, clip) else {
+        return false;
+    };
+    let info = fb.info();
+    let (pw, ph) = (info.width, info.height);
+    // WC-H — compose off-screen and present the box as contiguous rows. Returns false when the
+    // back-layer is unavailable (compat row, over-cap geometry, another core holding it, or the
+    // allocator declining), in which case the direct path below runs exactly as it always has.
+    let mut overlaid = false;
+    let offer = if may_overlay { cur } else { None };
+    let mut cyc = 0u64;
     let staged = stage_window(
         fb,
         r,
@@ -12078,6 +12721,11 @@ fn draw_window(
         offer,
         &mut overlaid,
         clip,
+        StagePhase::Both,
+        None,
+        0,
+        0,
+        &mut cyc,
     );
     if !staged {
         // WC-K3 — the pre-WC-H direct path is UNCLIPPED, and that is stated on the wire rather than
@@ -12092,6 +12740,36 @@ fn draw_window(
         }
         paint_window(fb, r, 0, 0, bx, by, bw, bh, pw, ph, focused, false);
     }
+    draw_window_post(fb, cur, overlaid, bracketed, staged, bx, by, bw, bh, dy0, dy1)
+}
+
+/// WCPAR step 3 — WHAT A WINDOW OWES ONCE ITS PIXELS ARE ON THE GLASS.
+///
+/// Split out of [`draw_window`] verbatim. Every line of it is a consequence of the blit having
+/// LANDED — the cursor coverage this window's pixels invalidated, the present-over-sprite repair it
+/// arms, the cache clean over the rows it wrote and the COMPOSITE-2 extent ledger — so under the
+/// phase split it belongs to Phase B and runs for the split path at exactly the point it runs for
+/// the unsplit one: immediately after the last row of this window reaches the panel, inside the
+/// present gate and inside the `BlitGuard` window.
+///
+/// `staged` is what the present path answered, and it selects the flushed extent exactly as before:
+/// the band on a staged banded present, the whole box on the direct fallback (which ignores the
+/// band). Returns `overlaid` unchanged, so the caller's back-to-front `overlaid |=` fold is untouched.
+#[allow(clippy::too_many_arguments)]
+fn draw_window_post(
+    fb: &super::FrameBuffer,
+    cur: Option<super::cursor::Plan>,
+    overlaid: bool,
+    bracketed: bool,
+    staged: bool,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+    dy0: usize,
+    dy1: usize,
+) -> bool {
+    let info = fb.info();
     // CURSOR-4 — this window has just painted its clipped outer box. If it did NOT compose the
     // sprite into that box (direct path, instrument exclusion, compat row, contended plan lock, or
     // an unreadable layer) then every sprite pixel inside it is the window's now, and the coverage a
@@ -12239,6 +12917,189 @@ fn draw_window(
     // rows, which is the whole point of composing them into the layer rather than poking them into
     // the front afterwards. Nothing extra is written to the front buffer on this path.
     overlaid
+}
+
+/// WCPAR step 3, PHASE A — compose one window into this core's arena and put NO pixel on the glass.
+///
+/// Returns the receipt Phase B presents from, or `None` when this window cannot be split: nothing to
+/// paint at all ([`window_extent`]), or a box [`stage_window`] declined to stage in one WC-M band
+/// (over-cap geometry, a heap that would not grow, a compat row). A `None` is not a failure — the
+/// caller stops staging there and hands this window and every window above it to the unsplit
+/// [`draw_window`] under the present gate, which is the pre-arc path verbatim.
+///
+/// **This function holds no global lock and writes no shared state.** That is the whole of the arc:
+/// the scale-`n` upscale, which is the expensive half of a present and the half that dominates for a
+/// window-sized box, now runs on as many cores as have presents in flight.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn draw_window_compose(
+    fb: &super::FrameBuffer,
+    r: &Window,
+    i: usize,
+    focused: bool,
+    cur: Option<super::cursor::Plan>,
+    may_overlay: bool,
+    band: Option<(usize, usize)>,
+    clip: &OccClip,
+    arena: &mut alloc::vec::Vec<u8>,
+    base: usize,
+) -> ComposeOutcome {
+    let Some((bx, by, bw, bh, dy0, dy1)) = window_extent(fb, r, band, clip) else {
+        return ComposeOutcome::Nothing;
+    };
+    let info = fb.info();
+    let (pw, ph) = (info.width, info.height);
+    let mut overlaid = false;
+    let offer = if may_overlay { cur } else { None };
+    let mut compose_cyc = 0u64;
+    let ok = stage_window(
+        fb,
+        r,
+        bx,
+        by,
+        bw,
+        bh,
+        dy0,
+        dy1,
+        pw,
+        ph,
+        focused,
+        offer,
+        &mut overlaid,
+        clip,
+        StagePhase::ComposeOnly,
+        Some(arena),
+        base,
+        0,
+        &mut compose_cyc,
+    );
+    if !ok {
+        return ComposeOutcome::Unsplittable;
+    }
+    ComposeOutcome::Staged(StagedWin {
+        i,
+        base,
+        bx,
+        by,
+        bw,
+        bh,
+        dy0,
+        dy1,
+        row_bytes: bw * info.bytes_per_pixel,
+        compose_cyc,
+        overlaid,
+        focused,
+    })
+}
+
+/// WCPAR step 3 — what Phase A made of one window, and whether the staging prefix survives it.
+#[cfg(target_arch = "x86_64")]
+enum ComposeOutcome {
+    /// Composed and parked in the arena. Phase B presents it from there.
+    Staged(StagedWin),
+    /// Nothing to paint — a degenerate row, an off-panel origin, a box buried outright, or a band
+    /// that misses the clipped box. Phase B reaches the same verdict from the same pure
+    /// [`window_extent`] call, so the prefix is NOT broken by one of these.
+    Nothing,
+    /// This window cannot be split: [`stage_window`] declined it (over-cap geometry that WC-M would
+    /// have to band, a heap that would not grow, a compat row). It and every window above it take the
+    /// unsplit [`draw_window`] under the present gate, so the prefix ends here.
+    Unsplittable,
+}
+
+/// WCPAR step 3 — may this window be composed in Phase A?
+///
+/// `false` sends it (and everything above it) down the unsplit path. Two reasons, and both are about
+/// keeping an instrument's bracket honest rather than about the pixels:
+///
+/// * **A compat row** is the full-screen legacy present. [`stage_window`] declines it by design and
+///   `above_shell` exempts it unconditionally; it has never been a staged present and is not one now.
+/// * **A live WC-G or WC-D battery.** Both instruments bracket the blit from BEFORE the source read
+///   to AFTER the glass read-back, which the phase split separates by a gate acquisition — see
+///   `super::wcg::armed` for why widening them instead would be a defect. Both are budgeted per
+///   window id and spend out within the first handful of passes, so this excludes the early passes of
+///   a boot and nothing after them.
+///
+/// In a non-witness build neither instrument exists and this is `!r.compat`.
+#[cfg(target_arch = "x86_64")]
+fn stage_eligible(r: &Window) -> bool {
+    if r.compat {
+        return false;
+    }
+    #[cfg(feature = "witness")]
+    {
+        // WC-D's one-shot latch, READ and not claimed — `verify_reference` is what claims it, and it
+        // runs on the unsplit path this test routes the window to.
+        if r.presented
+            && r.id < 32
+            && VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & (1u32 << r.id) == 0
+        {
+            return false;
+        }
+        if super::wcg::armed(r.id, r.compat, r.surf, r.surf_len) {
+            return false;
+        }
+    }
+    true
+}
+
+/// WCPAR step 3, PHASE B — put one composed window on the glass, under the present gate.
+///
+/// Reads the arena and the panel; never the window's source surface, which is why the composed
+/// artifact is immune to anything the owner does to its surface between the two phases. The row
+/// range, the box and the arena offset all come from the `StagedWin` Phase A wrote, so this call
+/// cannot present an extent the compose did not produce.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn draw_window_present(
+    fb: &super::FrameBuffer,
+    r: &Window,
+    sw: &StagedWin,
+    cur: Option<super::cursor::Plan>,
+    bracketed: bool,
+    clip: &OccClip,
+    arena: &mut alloc::vec::Vec<u8>,
+) -> bool {
+    let info = fb.info();
+    let (pw, ph) = (info.width, info.height);
+    // `overlaid` is Phase A's answer and is passed through: the sprite was composed into these bytes
+    // in RAM, so it is on the glass the moment they land. A `PresentOnly` call composes nothing and
+    // would otherwise report `false`, which would send `draw_window_post` down the
+    // `overlay_uncover` arm and retire coverage this window is in fact carrying.
+    let mut overlaid = sw.overlaid;
+    let mut cyc = 0u64;
+    let ok = stage_window(
+        fb,
+        r,
+        sw.bx,
+        sw.by,
+        sw.bw,
+        sw.bh,
+        sw.dy0,
+        sw.dy1,
+        pw,
+        ph,
+        sw.focused,
+        // No offer: the compose half already made it (or declined it) in Phase A, and this call runs
+        // no compose. Passing the plan again could only re-offer it.
+        None,
+        &mut overlaid,
+        clip,
+        StagePhase::PresentOnly,
+        Some(arena),
+        sw.base,
+        sw.compose_cyc,
+        &mut cyc,
+    );
+    // A `PresentOnly` call cannot decline — every test that could have is in the compose half, and
+    // Phase A passed all of them for this window. `debug_assert` rather than a branch: if it ever
+    // does, the window is simply absent from the glass this pass and its damage was consumed, which
+    // is a defect worth failing a debug build over rather than papering over with a direct repaint
+    // (that repaint would be the tearing path, taken while the pass believed itself tear-free).
+    debug_assert!(ok, "WCPAR-3: a PresentOnly stage declined");
+    draw_window_post(
+        fb, cur, overlaid, bracketed, ok, sw.bx, sw.by, sw.bw, sw.bh, sw.dy0, sw.dy1,
+    )
 }
 
 /// WC-M — [`super::FrameBuffer::fill_rect`] with a vertical origin that may lie ABOVE the
@@ -12924,6 +13785,21 @@ fn stage_window(
     cur: Option<super::cursor::Plan>,
     overlaid: &mut bool,
     clip: &OccClip,
+    // WCPAR step 3 — which half (or both) of the staged present this call runs. `Both` is the
+    // pre-arc behaviour and is what every aarch64 caller passes.
+    phase: StagePhase,
+    // WCPAR step 3 — the caller's arena and this window's byte offset in it, when the caller is
+    // driving the split and therefore holds the core's [`STAGE`] entry across both phases. `None`
+    // means "take the entry yourself and use it from byte 0", which is every pre-arc call.
+    arena: Option<&mut alloc::vec::Vec<u8>>,
+    base: usize,
+    // WCPAR step 3 — cycles the compose half already spent, for a `PresentOnly` call completing a
+    // present whose compose ran in Phase A. Zero on every other path, so `[wc-h]`'s two halves keep
+    // summing to the one present they describe.
+    compose_carry: u64,
+    // WCPAR step 3 — cycles this call's compose half spent, for a `ComposeOnly` call whose caller
+    // must carry them to Phase B. Untouched on every other path.
+    out_cyc: &mut u64,
 ) -> bool {
     if r.compat {
         // Not a decline: compat rows are out of scope by design (see `draw_window`), and counting
@@ -12949,8 +13825,15 @@ fn stage_window(
     //
     // Armed on the composite WC-D is about to verify — the same predicate `composite_inner` tests
     // afterwards — so the fixture and the verification cannot land in different passes.
+    //
+    // WCPAR step 3 — `phase.composes()`, so only a call that is actually about to compose can spend
+    // the fixture. A `PresentOnly` call is completing a present Phase A already composed: sending it
+    // to the direct path would drop the composed rows on the floor, and the window would simply not
+    // reach the glass. Phase A never stages a window with a live WC-D latch anyway (see
+    // `stage_eligible`), so this is belt and braces on an arm that is already unreachable — kept
+    // because "a `PresentOnly` call must never decline" is the property the split rests on.
     #[cfg(feature = "witness")]
-    {
+    if phase.composes() {
         if r.presented && r.id < 32 {
             let bit = 1u32 << r.id;
             if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit == 0
@@ -12983,22 +13866,64 @@ fn stage_window(
     if chunk_rows == 0 {
         decline!(super::wcg::DECL_CAP);
     }
+    // WCPAR step 3 — a SPLIT present must fit in ONE band. The whole point of Phase A is that every
+    // composed byte is still in RAM when Phase B takes the present gate, and WC-M's banding is
+    // precisely the case where it is not: band 0 has to reach the glass before band 1 may reuse the
+    // buffer. A box that would have to be banded therefore declines the split here and is composed
+    // and presented by a `Both` call under the gate — which is today's behaviour for it, unchanged.
+    // The only geometry this reaches is the full-panel console; every window-sized box is one band.
+    #[cfg(target_arch = "x86_64")]
+    if phase != StagePhase::Both && chunk_rows < span {
+        decline!(super::wcg::DECL_CAP);
+    }
     let need = row_bytes * chunk_rows;
-    let mut stage = match stage_for_core().try_lock() {
-        Some(g) => g,
-        None => decline!(super::wcg::DECL_LOCK),
+    // WCPAR step 3 — the arena, and who owns the lock on it.
+    //
+    // A pre-arc call takes this core's [`STAGE`] entry itself and uses it from byte 0 — the `None`
+    // arm, and the only arm aarch64 ever compiles. A split call is handed the entry by
+    // [`composite_inner`], which holds it across BOTH phases (it must: the composed bytes have to
+    // survive the gate acquisition, and a core that lost its guard in between could be preempted and
+    // re-enter its own entry) and bump-allocates `base` for each window it parks there.
+    //
+    // `try_lock` on the `None` arm is unchanged and still guards single-core re-entry, per WCPAR
+    // step 1: the cross-core contention it used to arbitrate has been gone since the pool landed.
+    let mut own_guard;
+    let stage: &mut alloc::vec::Vec<u8> = match arena {
+        Some(v) => v,
+        None => {
+            own_guard = match stage_for_core().try_lock() {
+                Some(g) => g,
+                None => decline!(super::wcg::DECL_LOCK),
+            };
+            &mut *own_guard
+        }
     };
     // R0 / rtwit — STAGE max-hold. Declared after the guard so it drops first, timing the
     // acquire→release span (the stage fill/flush). No-op inline shim when `rtwit` is off.
     let _sh = crate::rtwit::hold(crate::rtwit::Lock::Stage);
-    if stage.len() < need {
-        let add = need - stage.len();
+    // WCPAR step 3 — `base + need`, not `need`: the arena holds this pass's earlier windows below
+    // `base` and they must survive until Phase B has blitted them. `base` is 0 on every unsplit call,
+    // so this is the pre-arc bound verbatim there.
+    let need_end = base + need;
+    // WCPAR step 3 — AND THE PER-CORE MEMORY CEILING IS UNMOVED BY THE SPLIT. Before this arc the
+    // buffer was sized to the largest single box its core staged, bounded by `MAX_STAGE_BYTES`
+    // because `chunk_rows` capped one band to it. With an arena the pass's windows are laid out
+    // side by side, so that per-band cap no longer bounds the TOTAL — this does. A window that would
+    // push the core's buffer past the ceiling declines the split and takes the unsplit path under the
+    // gate, which is exactly what a window that could not be staged has always done. So step 3 costs
+    // no memory at all: it changes how the same [`MAX_STAGE_BYTES`] are used, not how many there are.
+    #[cfg(target_arch = "x86_64")]
+    if phase != StagePhase::Both && need_end > STAGE_ARENA_CAP {
+        decline!(super::wcg::DECL_CAP);
+    }
+    if stage.len() < need_end {
+        let add = need_end - stage.len();
         // `try_reserve` + `resize`: an exhausted heap returns here instead of panicking from present
         // context. The buffer only ever grows, so a steady window size allocates exactly once.
         if stage.try_reserve(add).is_err() {
             decline!(super::wcg::DECL_ALLOC);
         }
-        stage.resize(need, 0);
+        stage.resize(need_end, 0);
     }
 
     // WC-M — the two halves are now accumulated ACROSS bands rather than read off one pair of
@@ -13077,6 +14002,11 @@ fn stage_window(
         #[cfg(feature = "witness")]
         let b0 = crate::arch::now_cycles();
 
+        // WCPAR step 3 — THE COMPOSE HALF. Runs on `Both` and `ComposeOnly`; a `PresentOnly` call
+        // skips it because Phase A already left these exact bytes at `base`. Nothing in here touches
+        // the panel — every write lands in `layer`, which is a view onto the core's own RAM — which
+        // is the whole reason this half needs no serialisation.
+        if phase.composes() {
         // The back layer: same pixel format and bytes/pixel as the panel (so the composed bytes ARE
         // the panel's bytes and the present is a straight copy), but its own stride — the box width,
         // with no panel margin — which is what makes each row a single contiguous run. WC-M: its
@@ -13084,7 +14014,10 @@ fn stage_window(
         // already performed now also fences the compose to the rows this buffer holds.
         let mut layer = super::FrameBuffer::new();
         layer.init(
-            stage.as_mut_ptr() as usize,
+            // WCPAR step 3 — `base`, this window's slot in the arena. Safe indexing rather than
+            // pointer arithmetic: the `resize` above guarantees `base + rows * row_bytes` bytes, so
+            // the slice cannot be empty and the address is the slot's first byte.
+            stage[base..].as_mut_ptr() as usize,
             rows * row_bytes,
             unaos_boot_info::FrameBufferInfo {
                 width: bw,
@@ -13129,6 +14062,7 @@ fn stage_window(
                 note_cursor_overlay(&c);
             }
         }
+        } // WCPAR step 3 — end of the compose half.
 
         #[cfg(feature = "witness")]
         let b1 = crate::arch::now_cycles();
@@ -13144,8 +14078,14 @@ fn stage_window(
         // tear-free contract is unchanged — a span is as atomic as a row was. What changes is only
         // which bytes are published, and the bytes withheld are bytes the pass is about to overwrite
         // from the window that owns them.
+        // WCPAR step 3 — THE PRESENT HALF, and the ONLY half that writes the glass. Runs on `Both`
+        // and `PresentOnly`; a `ComposeOnly` call skips it and leaves the bytes for Phase B. Every
+        // caller that reaches this loop is inside the present gate, which is what makes the
+        // cross-window back-to-front order on the single front buffer well defined — the invariant
+        // WCSER convicted the absence of, unchanged by the split.
+        if phase.presents() {
         for y in 0..rows {
-            let src = y * row_bytes;
+            let src = base + y * row_bytes;
             let py = by + band + y;
             if clip.n == 0 {
                 fb.blit(py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
@@ -13188,13 +14128,40 @@ fn stage_window(
                 obar_px += span_occ(obarb, py, bx, bx + bw).saturating_sub(row_bar_pub);
             }
         }
+        } // WCPAR step 3 — end of the present half.
 
         #[cfg(feature = "witness")]
         {
-            compose_cyc += b1.saturating_sub(b0);
-            present_cyc += crate::arch::now_cycles().saturating_sub(b1);
+            // WCPAR step 3 — each half charges only the interval it ran. A `ComposeOnly` call has
+            // `b1` immediately after its compose and adds a near-zero `present_cyc`; a `PresentOnly`
+            // call skipped the compose so `b1 - b0` is the skipped branch and its `compose_cyc` is
+            // the carry Phase A handed it. The pair therefore still sums to ONE present's two halves,
+            // which is the property `[wc-h]` and `[comp2]`'s decomposition are read on.
+            if phase.composes() {
+                compose_cyc += b1.saturating_sub(b0);
+            }
+            if phase.presents() {
+                present_cyc += crate::arch::now_cycles().saturating_sub(b1);
+            }
         }
         band += rows;
+    }
+    #[cfg(feature = "witness")]
+    {
+        compose_cyc += compose_carry;
+        *out_cyc = compose_cyc;
+    }
+    #[cfg(not(feature = "witness"))]
+    {
+        let _ = (compose_carry, &mut *out_cyc);
+    }
+    // WCPAR step 3 — a `ComposeOnly` call has put nothing on the glass and owes none of the
+    // per-present bookkeeping below: the witness folds, the census and `stage_note` all describe a
+    // COMPLETED present, and Phase B's `PresentOnly` call is the one that completes it. Returning
+    // `true` here means "composed, and parked at `base`" — the caller's `StagedWin` is the receipt.
+    #[cfg(target_arch = "x86_64")]
+    if phase == StagePhase::ComposeOnly {
+        return true;
     }
 
     // WC-K3 — fold this present into the live gesture's totals, if it was a neighbour of one.

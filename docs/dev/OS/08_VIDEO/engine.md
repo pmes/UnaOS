@@ -3359,10 +3359,10 @@ chains holding `IrqGuard + WINDOWS`, so a blocking acquisition would be a wedge.
 period: `entered=`/`declined=`/`reruns=`, with `-> SOLO` when nothing was ever declined and
 `-> WEDGED` (`entered=0 declined=N`) when a holder took the gate and never released.
 
-### WCPAR — parallel per-core composite (steps 1–2 LANDED; step 3 the compose/present split still DESIGN)
+### WCPAR — parallel per-core composite (steps 1–3 LANDED)
 
-> **STATUS (GR25, this arc).** Steps 1 and 2 of the design below are now IN THE CODE. The design text
-> is kept verbatim under it because it is the reasoning the landing rests on; this block is what changed.
+> **STATUS (GR25).** All three steps of the design below are now in the code. The design text is kept
+> verbatim under it because it is the reasoning the landing rests on; this block is what changed.
 >
 > * **Step 1 — per-core `STAGE` pool: LANDED.** `static STAGE: Mutex<Vec<u8>>` is now
 >   `static STAGE: [Mutex<Vec<u8>>; STAGE_CPUS]` (`STAGE_CPUS = ui_status::PSTRIP_MAX_CPUS = 8`), indexed
@@ -3384,24 +3384,100 @@ period: `entered=`/`declined=`/`reruns=`, with `-> SOLO` when nothing was ever d
 >   is unchanged. IRQs stay masked across the composite (per-core; no cross-core serialization); only the
 >   shared spinlock is released early. This is the flow arc's *first* serialization removed — two cores
 >   presenting different windows no longer queue on one spinlock for the length of each other's composite.
-> * **Step 3 — split `composite_inner` into parallel-compose / serial-present: STILL DESIGN.** `COMP_GATE`
->   still serialises the whole `composite_once` on x86, so two cores' PASSES do not yet run their composes
->   *simultaneously* from the present path — steps 1–2 remove the buffer contention and the outer-lock
->   queue and let the compositing WORK spread across cores over time, but the true-simultaneous compose
->   needs the phase split, and that restructures the blit loop's WC-G/WC-D/CURSOR brackets (the file's
->   most delicate tear-freedom machinery) and cannot land safely in the same pass. Deferred, honestly:
->   an intact compositor with two of three serializations gone beats a broken one with all three.
-> * **Witness — `[wcpar]`.** A per-core stage census rides the `[wcn]`/`[wcser]` rollup cadence:
->   `[wcpar] cores=N total=… max=… c0..c7=… span=…ms`. `cores>1` is the direct reading that the pool
->   spread compose off the one shared buffer; read against the falling cross-core `DECL_LOCK` share of
->   `[wcser] declined=`. In the scripted `UNAOS_WC=1 ./arroyo test` fixture (a single present source) it
->   correctly reads `cores=1` and attributes the stage to the one core that ran it; a multi-vug bench
->   boot is where `cores>1` and the rate rising off `19.6/s` are expected.
+> * **Step 3 — parallel-compose / serial-present: LANDED (this arc).** `composite_inner` is now two
+>   phases, x86 only.
 >
-> **Gates (this arc):** `./arroyo check` both arches green; `UNAOS_WC=1` and `UNAOS_WITNESS=1 UNAOS_WC=1`
-> check green; `UNAOS_WC=1 ./arroyo test` — WINX-7, wm-act and DMG-REFUSE PASS, **no `torn=yes`**;
-> `kernel8-test` 105/105 at both 640×480 and 1920×1200. Tear-freedom — the gate that matters most — is
-> untouched: `COMP_GATE` and the z-ordered present are exactly as they were.
+>   **Phase A (no gate)** runs the deferred-erase drain, the cursor bracket, the `WRITER` read, the table
+>   snapshot, the upward occlusion closure, the back-to-front ordering, and then COMPOSES this pass's
+>   windows into the calling core's `STAGE` entry. Not one byte of it reaches the panel — `paint_window`
+>   and `cursor::compose_into` write into per-core RAM the scan-out never observes — so it needs no
+>   serialization and several cores run it at once.
+>
+>   **Phase B (present gate held)** blits those bytes to the panel in ascending z-order, ties by id,
+>   followed by the furniture strips and the cursor tail in `composite_once`. Every glass write in the
+>   pass is inside this one hold.
+>
+>   `COMP_GATE` is unchanged as a mechanism and keeps its name; what changed is **where it is taken**.
+>   It is no longer acquired in `composite()` around the whole pass — it is acquired by
+>   `present_gate_try()` from inside `composite_inner`, after the compose, and released after the tail.
+>   The single-glass back-to-front invariant, the one-bulk-copy-per-row discipline and the tear-freedom
+>   brackets are exactly as strong: **the gate did not get weaker, the region under it got smaller.**
+> * **What the split does NOT cover, and why that is deliberate.** The staged set is a **prefix** of the
+>   pass's z-order — Phase B blits staged windows and then unstaged ones, which is correct back-to-front
+>   only if every staged window is below every unstaged one — so the first window that cannot be staged
+>   ends Phase A, and it and everything above it take the unsplit `draw_window` under the gate, verbatim
+>   as before. Three things end the prefix: a box WC-M has to band through the buffer (the full-panel
+>   console, which was never a single-band stage), a compat row, and a window whose WC-G or WC-D battery
+>   may still fire. That last one is an instrument-integrity choice, not a performance one: WC-G's
+>   bracket runs from before the source read to after the glass read-back, which the phase split
+>   separates by a gate acquisition, and widening it would put the gate wait inside `us=` — the timing
+>   verdict a `slow=yes` tear report is drawn from. Both batteries are budgeted per window id and spend
+>   out in the first handful of passes, so this excludes the opening of a boot and nothing after it.
+>   `wcg::armed()` is the new non-consuming peek that answers it.
+> * **Memory is unmoved.** The per-core buffer is still capped at `MAX_STAGE_BYTES` (4 MiB). The arena
+>   is a bump allocation inside that same buffer, and a window that would push past the ceiling declines
+>   the split and takes the unsplit path. Step 3 changes how those bytes are used, not how many there are.
+> * **A lost present gate is the hard case, and it is closed explicitly.** The pre-arc decline turned
+>   away before the table snapshot and so "cleared nothing". The new one has already consumed the
+>   damage flags, so before it publishes `COMP_PENDING` it puts that damage **back**: `BlitGuard` dropped
+>   first (re-taking the table inside the guard window would add a blocking acquisition to the F4 drain
+>   barrier's wait set, and that barrier's termination argument depends on that set), rows re-damaged
+>   whole-box — the conservative direction, and the same promotion the upward closure already performs —
+>   and matched by row id so a slot recycled since the snapshot is left alone. The sprite duty is then
+>   discharged pixel-free: `owe_repaint()`, or `cursor::abandon_overlay()` for a pass that had opened an
+>   overlay session (WEDGE-11's deferred close, so `Adopt` is deferred whole rather than downgraded).
+>   `ensure_drawn` is never taken on this path — REVIEW CONDITION 3, unchanged.
+> * **The drain takes the gate for its own publish.** `drain_deferred` is the one pre-pass step that
+>   writes the glass, and both of its ordering constraints are against the rest of the pre-pass (before
+>   the cursor bracket, CURSOR-5; before the dirty-set snapshot, WC-L), so it stays where it is and takes
+>   a short separate hold. A busy gate skips the drain rather than deferring the pass — the boxes stay
+>   queued and `deferred_owed`'s rescue paths come back for them. Two holds per draining pass is the
+>   honest cost; the ordering it gives up is bounded, because a desktop fill is the bottom layer over a
+>   box no live row intersects, and what it cannot do is interleave two *windows'* rows, which is the
+>   WCSER bleed and which Phase B's single hold still forbids outright.
+> * **aarch64 is behaviourally untouched.** The split is `target_arch = "x86_64"` throughout: there the
+>   staging prefix is empty by construction, every window takes the unsplit `draw_window`, and
+>   `present_gate_try()` is a vacuous `true` that folds away. The geometry and post-blit derivations were
+>   factored out of `draw_window` into `window_extent` and `draw_window_post` so the split paths cannot
+>   express a different present than the unsplit one — both moves are verbatim.
+> * **Witness — `[wcpar]`, widened.** The line now reads
+>   `[wcpar] cores=N cmax=N split=N fallback=N total=… max=… c0..c7=… span=…ms`.
+>   `cores=` is unchanged and still counts DISTINCT cores that staged over the span. **`cmax=` is the new
+>   term and it is the simultaneity measurement**: the high-water mark of cores inside Phase A at the
+>   same instant. `split=`/`fallback=` are the population it is read against — windows presented from the
+>   arena versus windows that took the unsplit path — so a boot with `split=0` has not exercised the
+>   split at all, whatever `cmax` says. A one-shot `[wcpar] split-first win=N cpu=N box=WxH rows=N`
+>   fires the first time a window is presented from the arena; **its absence from a capture is the
+>   falsification that the phase split is dead code on that boot**, and it exists because the rollup is
+>   silent on a quiet span and would otherwise make "ran outside a printed span" and "never ran" look
+>   identical. On aarch64 `cmax`/`split`/`fallback` are structurally 0 and `total=`/`c0..c7` remain that
+>   arch's whole reading.
+>
+> **Gates (this arc).** Type gates: `./arroyo check` green both arches, `UNAOS_WC=1 ./arroyo check`
+> green, `UNAOS_WITNESS=1 UNAOS_WC=1 ./arroyo check` green. Reachability, on the BUILT witness kernel
+> rather than the banner: `strings target/x86_64_esp/kernel.elf` carries `[wcpar] cores=`, ` cmax=`,
+> ` split=`, ` fallback=` and `[wcpar] split-first win=`, so the widened census and the one-shot are in
+> the image and not folded away. The same `strings` on `target/pi_baremetal/kernel8.img` shows
+> `split-first` **absent** — the x86 gate holds at link level, which is the arch-gating claim checked
+> rather than asserted.
+>
+> QEMU behavioural gates were run before this arc's close and are recorded here as evidence, not as the
+> standing gate (the behavioural gate for this landing is a metal boot): `UNAOS_WC=1 ./arroyo test` —
+> WINX-7, wm-act and DMG-REFUSE PASS, **zero `torn=yes`**, all four `[wc-h]`/`[wc-k]` rollups
+> `-> TEAR-FREE`, and `[wcpar] split-first win=1 cpu=3 box=650x76 rows=76` proving the split path live;
+> `kernel8-test` 105/105 at both 640×480 and 1920×1200. Later re-runs of `kernel8-test` on a host at
+> load ≥20 (parallel worktree sessions) produced host-load artifacts — `[wc-h] … torn=1 …
+> maxpresent_us=8535 -> AT-RISK`, and one truncated 1914-line capture — and were not chased further.
+> Those are timing artifacts of an oversubscribed emulator, not readings of the compositor.
+>
+> **What QEMU shows, and what waits for a bench boot.** The scripted fixture is a SINGLE present source,
+> so `cores=1 cmax=1` there is the CORRECT reading and nothing stronger is asserted — a fixture that
+> cannot produce two concurrent presents cannot witness two concurrent composes. What it does prove is
+> that the new path is live and tear-free: `[wcpar] split-first win=1 cpu=3 box=650x76 rows=76` fires,
+> and every tear-freedom rollup stays `-> TEAR-FREE` with no `torn=yes`. The falsification below —
+> `cmax>1`, two vugs' `[wcn] rate=` above `19.6/s` **and diverging**, and a wall span under
+> Σ`compose_us` — is a multi-vug **bench-metal** reading and is not available in emulation. It is
+> deliberately not faked here.
 
 **The observation (Boot B, GR25).** With the pacer merged out (`vugfree`, `a38697af`), open vugs still
 fall into a *predetermined* cadence — `[wcn] win=3 rate=19.6/s gap=51..51ms`, and `win=9` reads the
@@ -3494,10 +3570,12 @@ the top of §8:** the sibling arcs (`taskbar-D3`/`wck5`, `shell-window-b`/strip,
 since landed and the region is clear, so steps 1 and 2 landed here. Step 1 no longer waits for a
 throughput payoff — it is the necessary substrate for step 3 and it removes the cross-core `DECL_LOCK`
 decline in its own right — and step 2 (the `WINDOWS`-hold shrink) touches only `syscall.rs` and the
-present entrypoints, colliding with none of the three predicates above. **What remains for the follow-on
-arc is step 3 alone:** the phase split of `composite_inner` into parallel-compose / serial-present, which
-narrows `COMP_GATE` to the z-ordered present. It now owns `composite_inner` end-to-end with no concurrent
-editor of `occ_clip`/`SHELL_Z`/`ctrls_for`, exactly as the sequencing recommendation intended.
+present entrypoints, colliding with none of the three predicates above. **SUPERSEDED AGAIN by the STATUS
+block:** step 3 has since landed, in the follow-on arc this paragraph anticipated and on exactly the
+footing it described — that arc owned `composite_inner` end-to-end with no concurrent editor of
+`occ_clip`/`SHELL_Z`/`ctrls_for`. Of the three predicates, `occ_clip` is the one the phase split has to
+be careful with, and it is: Phase B re-derives it as a pure function of the ONE table snapshot Phase A
+took, never from a second look at the table.
 
 **Falsification (what a real WCPAR landing must show).** Two, and both must hold:
 
@@ -3509,14 +3587,14 @@ editor of `occ_clip`/`SHELL_Z`/`ctrls_for`, exactly as the sequencing recommenda
   that buys throughput by relaxing the present gate has reintroduced exactly the WCSER bleed and is
   wrong regardless of the rate it posts.
 
-> **What steps 1–2 already satisfy, and what waits for step 3.** Tear-freedom is *verified now*:
-> `COMP_GATE` and the z-ordered present are untouched, and every gate this arc ran shows no `torn=yes`.
-> The rate half is *partially* delivered: releasing the `WINDOWS` hold removes the outer-lock queue two
-> presents used to serialise on, and the per-core pool removes the compose-vs-compose decline, so the
-> `[wcpar] cores=` census can read `>1` and presents no longer block a full composite on one spinlock.
-> But the *simultaneous-compose* signal — `[wcn] rate=` above `19.6/s` AND a wall span below Σ
-> `compose_us` — needs `COMP_GATE` narrowed to the present only (step 3); until then two cores' composes
-> still take turns under the gate. That is the honest boundary of this landing.
+> **Where the falsification stands after step 3.** Tear-freedom is *verified now*, and it is the half
+> that emulation can settle: the present gate and the z-ordered present are exactly as strong, and every
+> gate run shows no `torn=yes` with all `[wc-h]`/`[wc-k]` rollups `-> TEAR-FREE`. The rate half is now
+> *structurally* delivered — `COMP_GATE` no longer covers the compose, so two cores' composes no longer
+> take turns — but **delivered is not measured**. The measurement needs a multi-vug bench boot and reads
+> `cmax>1` on `[wcpar]`, `[wcn] rate=` above `19.6/s` and diverging between windows, and a wall span
+> below Σ`compose_us`. None of those three is reachable in the single-source QEMU fixture and none is
+> claimed from it. That is the honest boundary of this landing.
 
 ## 9. CRISPY-PI — the theme table (`video/theme.rs`)
 
