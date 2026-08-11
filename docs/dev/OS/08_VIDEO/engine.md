@@ -3432,9 +3432,21 @@ period: `entered=`/`declined=`/`reruns=`, with `-> SOLO` when nothing was ever d
 >   the cursor bracket, CURSOR-5; before the dirty-set snapshot, WC-L), so it stays where it is and takes
 >   a short separate hold. A busy gate skips the drain rather than deferring the pass — the boxes stay
 >   queued and `deferred_owed`'s rescue paths come back for them. Two holds per draining pass is the
->   honest cost; the ordering it gives up is bounded, because a desktop fill is the bottom layer over a
->   box no live row intersects, and what it cannot do is interleave two *windows'* rows, which is the
->   WCSER bleed and which Phase B's single hold still forbids outright.
+>   honest cost; what the second hold cannot do is interleave two *windows'* rows, which is the WCSER
+>   bleed and which Phase B's single hold still forbids outright.
+>
+>   **REVIEW (wcpar-step3) — the load-bearing reason is the co-located `erase_clip`, not "a box no live
+>   row intersects".** That phrasing was wrong: live rows routinely intersect a queued erase box, which
+>   is exactly why `drain_deferred` builds an `erase_clip` from the table and hands it to every
+>   `stage_fill`. What makes the separate hold safe is that the clip is built and the fills are
+>   published *inside the same hold*, so no present can land between them: a window already on the glass
+>   is in the clip and is withheld, and a window created after the clip cannot yet have reached the
+>   glass, because its present must take the gate we are holding and therefore lands *after* our fill,
+>   above it in z-order. `damage_intersecting` then re-damages what the fill painted over. The one
+>   genuinely new interleave is against a *concurrent* core's open overlay session, whose compose
+>   (Phase A) now runs off the gate while our `undraw_within_nosession` writes glass — and that is the
+>   population CURSOR-5's generation bump was built for, which `wm::erase` and the pointer's own
+>   `repaint` already belonged to before this arc.
 > * **aarch64 is behaviourally untouched.** The split is `target_arch = "x86_64"` throughout: there the
 >   staging prefix is empty by construction, every window takes the unsplit `draw_window`, and
 >   `present_gate_try()` is a vacuous `true` that folds away. The geometry and post-blit derivations were

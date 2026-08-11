@@ -3232,6 +3232,14 @@ struct PassOutcome {
 /// close to the next `overlay_open` and arms `owe_repaint` alongside — and the session is switched
 /// off for at most one pass rather than for the boot. `Adopt` is therefore not DOWNGRADED here; it is
 /// deferred whole, which is the one thing CURSOR-3's ledger permits in place of running it.
+/// REVIEW (wcpar-step3) — AND `deferred` IS DROPPED ON PURPOSE, which the ledger above did not say.
+/// `tail_of` would have answered `Settle` for a pass that took CURSOR-11/15's deferral, and `Settle`
+/// runs `settle_pending_locked`, which READS AND WRITES THE PANEL — so it is glass work and is exactly
+/// as forbidden here as `Adopt` is. Dropping it is safe rather than merely necessary: `defer_common`
+/// writes no pixel and only marks `Sprite::pend`, the arrow is still on the glass, and the settle
+/// verdicts each pending pixel against the LIVE front whenever it does run — so carrying the set into
+/// a later pass costs nothing that the whole-sprite refresh `owe_repaint` arms below does not already
+/// cover. That is the same trade `defer_common`'s own WEDGE-9 `Busy` arm makes.
 fn abandon_pass(disturbed: bool, session: bool, deferred: bool) -> PassOutcome {
     let _ = (disturbed, deferred);
     if session {
@@ -3823,13 +3831,21 @@ fn composite_inner() -> PassOutcome {
     // table guard is already dropped, and the present gate is not taken until this loop has ended.
     // Several cores run this concurrently — that is the arc.
     //
-    // **The staged set is a PREFIX of `order`, and it has to be.** Phase B blits the staged windows
-    // and then the unstaged ones; that is the correct back-to-front order if and only if every staged
-    // window is below every unstaged one. So the first window that cannot be staged ENDS the phase —
-    // `break`, never `continue` — and it and everything above it take the unsplit [`draw_window`]
-    // under the gate, which is the pre-arc path verbatim. A window with nothing to paint at all
-    // (`ComposeOutcome::Nothing`: degenerate row, off-panel, buried outright) is not a boundary: it
-    // paints nothing in Phase B either, from the same pure [`window_extent`] derivation.
+    // **The staged set is a PREFIX of `order`, and it has to be.** So the first window that cannot be
+    // staged ENDS the phase — `break`, never `continue` — and it and everything above it take the
+    // unsplit [`draw_window`] under the gate, which is the pre-arc path verbatim. A window with
+    // nothing to paint at all (`ComposeOutcome::Nothing`: degenerate row, off-panel, buried outright)
+    // is not a boundary: it paints nothing in Phase B either, from the same [`window_extent`]
+    // derivation on the same locals, and `staged_nothing` is what keeps Phase B from mistaking it for
+    // one.
+    //
+    // REVIEW (wcpar-step3) — WHY the prefix, stated correctly. It is NOT a z-order requirement: Phase
+    // B walks `order` ONCE and blits each window in place, staged or not, so the back-to-front order
+    // is `order`'s and cannot invert whatever the staged set looks like. The prefix is an ARENA
+    // requirement — the bump allocator's guard is released at the first unstaged window so that
+    // window's own `stage_window` can `try_lock` this core's entry, and once released nothing
+    // reclaims it. Two overlapping windows therefore cannot swap z here under any interleaving; what
+    // a non-prefix staged set would cost is the arena, not the order.
     //
     // The common pass is ONE window — a vug presenting its own frame, with an occlusion closure that
     // drags in nothing because vugs rarely overlap — and it stages whole, at exactly the memory the
@@ -3838,6 +3854,19 @@ fn composite_inner() -> PassOutcome {
     // time, is never staged and never was going to be.
     #[cfg(target_arch = "x86_64")]
     let mut staged: [Option<StagedWin>; MAX_WINDOWS] = [const { None }; MAX_WINDOWS];
+    // REVIEW (wcpar-step3) — order slots Phase A resolved to `ComposeOutcome::Nothing`.
+    //
+    // The prose above is right that a `Nothing` window is not a z-order boundary, but the Phase B loop
+    // as written made it an ARENA boundary: `staged[k]` is `None` for such a window, so Phase B fell
+    // into the "first unstaged window ends the prefix" block, dropped the arena guard, and every
+    // window ABOVE it — all of them already composed, in RAM, at their bump offsets — found
+    // `arena_guard == None` and re-composed from source under the present gate. Correct pixels,
+    // silently no split, and `[wcpar] split=`/`fallback=` reporting the opposite of what happened. A
+    // dirty window that is buried outright, or whose FBCON-DMG band misses its clipped box, is a
+    // routine occupant of the middle of a multi-window pass, so this is the common case rather than a
+    // corner. Marked here and skipped over in Phase B's arena release.
+    #[cfg(target_arch = "x86_64")]
+    let mut staged_nothing = [false; MAX_WINDOWS];
     // The arena guard is held from here THROUGH Phase B's staged prefix. It must be: the composed
     // bytes have to survive the gate acquisition, and a core that let go in between could be
     // preempted and re-enter its own entry (which is exactly what `try_lock` has guarded since WCPAR
@@ -3845,6 +3874,17 @@ fn composite_inner() -> PassOutcome {
     // core is already composing, and the answer is the unsplit path, not a wait.
     #[cfg(target_arch = "x86_64")]
     let mut arena_guard = stage_for_core().try_lock();
+    // R0 / rtwit — THE STAGE HOLD, measured where it is actually taken.
+    //
+    // REVIEW (wcpar-step3) — `stage_window`'s own ruler now arms only when `stage_window` takes the
+    // lock itself (see there). This is the split path's hold and it is the one that matters: it runs
+    // from Phase A's first compose, through the present-gate acquisition, to the last staged blit.
+    // Declared after `arena_guard` so it drops BEFORE it, which is the same acquire→release span the
+    // pre-arc ruler timed. No-op inline shim when `rtwit` is off.
+    #[cfg(target_arch = "x86_64")]
+    let mut _arena_hold = arena_guard
+        .as_ref()
+        .map(|_| crate::rtwit::hold(crate::rtwit::Lock::Stage));
     #[cfg(target_arch = "x86_64")]
     if let Some(arena) = arena_guard.as_mut() {
         #[cfg(feature = "witness")]
@@ -3866,7 +3906,9 @@ fn composite_inner() -> PassOutcome {
             if !stage_eligible(&rows[i]) {
                 break;
             }
-            let clip = occ_clip(&rows, i, shell, fb.info().width, fb.info().height);
+            // `census: false` — Phase A puts no pixel on the glass, and `OD_N`/`OB_N` are a
+            // population of BLITS. See `occ_clip`.
+            let clip = occ_clip(&rows, i, shell, fb.info().width, fb.info().height, false);
             match draw_window_compose(
                 &fb,
                 &rows[i],
@@ -3886,7 +3928,10 @@ fn composite_inner() -> PassOutcome {
                     base += sw.row_bytes * (sw.dy1 - sw.dy0);
                     staged[k] = Some(sw);
                 }
-                ComposeOutcome::Nothing => continue,
+                ComposeOutcome::Nothing => {
+                    staged_nothing[k] = true;
+                    continue;
+                }
                 ComposeOutcome::Unsplittable => break,
             }
         }
@@ -3916,6 +3961,8 @@ fn composite_inner() -> PassOutcome {
     if !present_gate_try(true) {
         #[cfg(target_arch = "x86_64")]
         {
+            // R0 / rtwit — close the STAGE ruler before the guard it measures, as everywhere else.
+            _arena_hold = None;
             drop(arena_guard);
         }
         drop(_blit);
@@ -3964,8 +4011,17 @@ fn composite_inner() -> PassOutcome {
         // `rows` snapshot, the same `shell`, and the same panel geometry — all Phase A locals that
         // nothing between the phases can write. `occ_clip` is pure, so this is the identity; it is
         // recomputed rather than carried only because `[OccClip; MAX_WINDOWS]` is kilobytes of stack
-        // on the composite path. No second look at the window table happens between the phases.
-        let clip = occ_clip(&rows, i, shell, fb.info().width, fb.info().height);
+        // on the composite path. No second look at the window TABLE happens between the phases.
+        //
+        // REVIEW (wcpar-step3) — "pure" is not quite true and the difference is worth stating rather
+        // than papering over: the dock arm derives its rect from `dock_tiles(rows)`, a Phase A local,
+        // but the menu-bar arm calls `menubar::strip_rect`, which is a LIVE `ENABLED` load. A bar
+        // toggled between the phases therefore gives Phase B a different clip from Phase A's. That is
+        // benign in both directions and in the RIGHT direction: the clip is what the PRESENT withholds,
+        // so the fresher answer is the correct one to blit under, and the extent Phase B paints is
+        // carried in `StagedWin` rather than re-derived, so no geometry can diverge. What it is NOT is
+        // a witness event — hence `census: true` here and `false` in Phase A.
+        let clip = occ_clip(&rows, i, shell, fb.info().width, fb.info().height, true);
         // WCPAR step 3 — THE STAGED PREFIX. This window's pixels are already composed, in this core's
         // arena, from this pass's snapshot; all that is left is to put them on the glass in z-order
         // and run the post-blit sprite bookkeeping. No source surface is read here, no instrument
@@ -4021,8 +4077,17 @@ fn composite_inner() -> PassOutcome {
         // the unsplit `stage_window` below takes this core's [`STAGE`] entry with its own `try_lock`
         // and would decline into the tearing direct path if we were still holding it. Assigning
         // `None` drops the guard; every window from here up is unsplit, so nothing reclaims it.
+        //
+        // REVIEW (wcpar-step3) — `staged_nothing` EXEMPTS a window Phase A composed to nothing. Such a
+        // window is unstaged because it has no pixels, not because the prefix ended: the unsplit
+        // `draw_window` below reaches the same `window_extent` verdict, paints nothing, and never
+        // touches this core's [`STAGE`] entry — so releasing the arena for it would strand every
+        // window above it on the gated path with its composed bytes already in RAM. It is also not a
+        // `fallback=`: nothing fell back, because nothing was presented.
         #[cfg(target_arch = "x86_64")]
-        {
+        if !staged_nothing[_k] {
+            // R0 / rtwit — the ruler closes with the guard it measures.
+            _arena_hold = None;
             arena_guard = None;
             #[cfg(feature = "witness")]
             WCPAR_FALLBACK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -11498,7 +11563,27 @@ impl OccRows {
 /// every aarch64 blit below is pixel-identical to the pre-arc blit. `pw`/`ph` are the two arguments
 /// that arch pays and cannot use, on [`OccClip`]'s own "same pixels, not same bytes" boundary.
 #[allow(unused_variables, unused_mut)]
-fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: usize) -> OccClip {
+///
+/// WCPAR step 3 — `census` IS WHETHER THIS CALL BELONGS TO A BLIT.
+///
+/// [`OD_N`]/[`OB_N`] are documented as *"window blits whose clip CARRIED the strip"* — a population of
+/// BLITS, and the denominator `occclip_dock_px`/`occclip_bar_px` are read against (and that
+/// `x86-witness.spec`'s degeneracy FORBID is written on). The phase split gave this function a second
+/// caller per window per pass: Phase A needs the clip to derive the extent it composes, and it puts no
+/// pixel on the glass. Counting there would have made `occclip_dock=`/`occclip_bar=` read up to twice
+/// their true population on every pass that stages, while the `_px` terms — folded once, from the one
+/// present — stayed right. So Phase A passes `false` and is silent; every caller that is about to blit
+/// passes `true`. Phase B visits a SUPERSET of the windows Phase A does (it applies the same
+/// `used`/`dirty`/`above_shell` guards and no others), so nothing is lost by the silence.
+fn occ_clip(
+    rows: &[Window; MAX_WINDOWS],
+    i: usize,
+    shell: u32,
+    pw: usize,
+    ph: usize,
+    census: bool,
+) -> OccClip {
+    let _ = census;
     let mut c = OccClip::none();
     #[cfg(target_arch = "x86_64")]
     {
@@ -11526,7 +11611,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             // subject that does not meet the strip must not be able to erase the fact that a strip
             // exists.
             #[cfg(feature = "witness")]
-            {
+            if census {
                 use core::sync::atomic::Ordering::Relaxed;
                 let (dx, dy, dw, dh) = rect.unwrap_or((0, 0, 0, 0));
                 OD_BOX[0].store(dx, Relaxed);
@@ -11535,7 +11620,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
                 OD_BOX[3].store(dh, Relaxed);
             }
             if let Some(b) = rect {
-                if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) && c.push(b) {
+                if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) && c.push(b) && census {
                     // WCK5 — one window blit whose clip CARRIED the strip. The population term for
                     // `occclip_dock_px`: a gesture with `occclip_dock=0` withheld nothing because no
                     // blit met the strip, which is a different statement from "the clip did not work".
@@ -11562,7 +11647,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             // not enabled the bar, so this arm costs one atomic per window and pushes nothing.
             let bar = super::menubar::strip_rect(pw, ph);
             #[cfg(feature = "witness")]
-            {
+            if census {
                 use core::sync::atomic::Ordering::Relaxed;
                 let (bx0, by0, bw0, bh0) = bar.unwrap_or((0, 0, 0, 0));
                 OB_BOX[0].store(bx0, Relaxed);
@@ -11571,7 +11656,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
                 OB_BOX[3].store(bh0, Relaxed);
             }
             if let Some(b) = bar {
-                if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) && c.push(b) {
+                if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) && c.push(b) && census {
                     #[cfg(feature = "witness")]
                     OB_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
@@ -11869,7 +11954,9 @@ fn occ_clip_live(r: &Window, pw: usize, ph: usize) -> OccClip {
     let rows = t.rows;
     drop(t);
     match rows.iter().position(|q| q.used && q.id == r.id) {
-        Some(i) => occ_clip(&rows, i, shell_z(), pw, ph),
+        // `census: true` — this clip belongs to `verify_window`'s repair BLIT, which is exactly the
+        // population `OD_N`/`OB_N` count. Pre-arc behaviour, unchanged.
+        Some(i) => occ_clip(&rows, i, shell_z(), pw, ph, true),
         None => OccClip::none(),
     }
 }
@@ -12597,12 +12684,20 @@ static FALLBACK_FIXTURE: core::sync::atomic::AtomicBool =
 /// Returns `(bx, by, bw, bh, dy0, dy1)` — the panel-clipped outer box and the box-relative row range
 /// this present owes — or `None` when there is nothing to paint (degenerate row, off-panel origin,
 /// buried outright, or a band that misses the clipped box).
+///
+/// REVIEW (wcpar-step3) — `census` is [`occ_clip`]'s flag, for [`DO_BURIED`]'s sake. A window this
+/// returns `None` for is visited by BOTH phases (Phase A `continue`s past it; Phase B reaches it as an
+/// unstaged window and calls [`draw_window`], which asks again), so counting the buried verdict on
+/// both would double `[drag-occ] buried=` — a `neigh`/`buried` denominator pair whose whole job is to
+/// let a reader tell "nothing was occluded" from "occlusion was handled". Phase A passes `false`.
 fn window_extent(
     fb: &super::FrameBuffer,
     r: &Window,
     band: Option<(usize, usize)>,
     clip: &OccClip,
+    census: bool,
 ) -> Option<(usize, usize, usize, usize, usize, usize)> {
+    let _ = census;
     // `stride`/`scale` are divisors below and `surf_len` bounds the reads, so all four are checked
     // here rather than trusted from the row.
     if r.surf == 0 || r.w == 0 || r.h == 0 || r.scale == 0 || r.stride < 4 || r.surf_len == 0 {
@@ -12635,7 +12730,7 @@ fn window_extent(
     // changed the full-screen path, on an arm nothing else in the arc touches.
     if !r.compat && clip.buries((bx, by, bw, bh)) {
         #[cfg(all(feature = "witness", target_arch = "x86_64"))]
-        if dragocc_target(r).is_some() {
+        if census && dragocc_target(r).is_some() {
             DO_BURIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         return None;
@@ -12695,7 +12790,8 @@ fn draw_window(
     band: Option<(usize, usize)>,
     clip: &OccClip,
 ) -> bool {
-    let Some((bx, by, bw, bh, dy0, dy1)) = window_extent(fb, r, band, clip) else {
+    // `census: true` — the unsplit present is a blit, and this is the pre-arc counting site.
+    let Some((bx, by, bw, bh, dy0, dy1)) = window_extent(fb, r, band, clip, true) else {
         return false;
     };
     let info = fb.info();
@@ -12944,7 +13040,9 @@ fn draw_window_compose(
     arena: &mut alloc::vec::Vec<u8>,
     base: usize,
 ) -> ComposeOutcome {
-    let Some((bx, by, bw, bh, dy0, dy1)) = window_extent(fb, r, band, clip) else {
+    // `census: false` — Phase A blits nothing, and Phase B asks this same question again for a
+    // window that composes to `Nothing`. See `window_extent`.
+    let Some((bx, by, bw, bh, dy0, dy1)) = window_extent(fb, r, band, clip, false) else {
         return ComposeOutcome::Nothing;
     };
     let info = fb.info();
@@ -13872,9 +13970,17 @@ fn stage_window(
     // buffer. A box that would have to be banded therefore declines the split here and is composed
     // and presented by a `Both` call under the gate — which is today's behaviour for it, unchanged.
     // The only geometry this reaches is the full-panel console; every window-sized box is one band.
+    //
+    // REVIEW (wcpar-step3) — a plain `return false`, NOT `decline!`. `stage_decline` is `[wc-h]`'s
+    // "the back layer was unavailable for this present" breakdown, and this is not that: the present
+    // is about to happen, under the gate, through this very function on a `Both` call that will not
+    // reach this test. Counting here would put a PHANTOM `DECL_CAP` on the wire for every banded box
+    // — once from Phase A and then the real verdict (or none) from Phase B — and `[wc-h]`'s decline
+    // breakdown is read as a per-present population. The split's own refusals have their own term:
+    // `[wcpar] fallback=`.
     #[cfg(target_arch = "x86_64")]
     if phase != StagePhase::Both && chunk_rows < span {
-        decline!(super::wcg::DECL_CAP);
+        return false;
     }
     let need = row_bytes * chunk_rows;
     // WCPAR step 3 — the arena, and who owns the lock on it.
@@ -13888,6 +13994,19 @@ fn stage_window(
     // `try_lock` on the `None` arm is unchanged and still guards single-core re-entry, per WCPAR
     // step 1: the cross-core contention it used to arbitrate has been gone since the pool landed.
     let mut own_guard;
+    // R0 / rtwit — STAGE max-hold, AND IT BELONGS TO WHOEVER TOOK THE LOCK.
+    //
+    // REVIEW (wcpar-step3) — this used to be an unconditional `let _sh` right below the acquisition,
+    // which is exactly right while every call takes its own guard. On the split path this call takes
+    // NO lock — `composite_inner` holds the entry across both phases — so an unconditional ruler here
+    // would report the body of one `stage_window` call as the STAGE hold while the REAL hold, which
+    // now spans Phase A, the present-gate acquisition and all of Phase B, went unmeasured. A ruler
+    // that stops covering the worst case exactly where the arc lengthens it cannot falsify anything,
+    // so it is armed on the `None` arm only and `composite_inner` arms its own over the arena guard.
+    //
+    // Declaration order is load-bearing (`own_guard`, then this, then `stage`): locals drop in
+    // reverse, so the ruler still closes immediately BEFORE the guard releases the lock.
+    let mut _sh = None;
     let stage: &mut alloc::vec::Vec<u8> = match arena {
         Some(v) => v,
         None => {
@@ -13895,12 +14014,10 @@ fn stage_window(
                 Some(g) => g,
                 None => decline!(super::wcg::DECL_LOCK),
             };
+            _sh = Some(crate::rtwit::hold(crate::rtwit::Lock::Stage));
             &mut *own_guard
         }
     };
-    // R0 / rtwit — STAGE max-hold. Declared after the guard so it drops first, timing the
-    // acquire→release span (the stage fill/flush). No-op inline shim when `rtwit` is off.
-    let _sh = crate::rtwit::hold(crate::rtwit::Lock::Stage);
     // WCPAR step 3 — `base + need`, not `need`: the arena holds this pass's earlier windows below
     // `base` and they must survive until Phase B has blitted them. `base` is 0 on every unsplit call,
     // so this is the pre-arc bound verbatim there.
@@ -13912,9 +14029,12 @@ fn stage_window(
     // push the core's buffer past the ceiling declines the split and takes the unsplit path under the
     // gate, which is exactly what a window that could not be staged has always done. So step 3 costs
     // no memory at all: it changes how the same [`MAX_STAGE_BYTES`] are used, not how many there are.
+    // REVIEW (wcpar-step3) — `return false`, not `decline!`, for the `chunk_rows < span` test's
+    // reason: a window that will not fit in the arena beside its predecessors is a window the SPLIT
+    // refuses, not a present the back layer refused. Phase B stages it from byte 0 on a `Both` call.
     #[cfg(target_arch = "x86_64")]
     if phase != StagePhase::Both && need_end > STAGE_ARENA_CAP {
-        decline!(super::wcg::DECL_CAP);
+        return false;
     }
     if stage.len() < need_end {
         let add = need_end - stage.len();
