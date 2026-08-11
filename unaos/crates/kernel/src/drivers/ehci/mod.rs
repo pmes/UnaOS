@@ -791,6 +791,55 @@ const BT_LE_SUBEVT_ADV_REPORT: u8 = 0x02;
 /// discovery for linear boot time; the constant is here so that trade is a one-line decision.
 #[cfg(feature = "bt")]
 const BT_L2_SCAN_MS: u64 = 500;
+/// BT-L2/BT-L3 — how many receive windows of `BT_L2_SCAN_MS` may be run before the stage gives up
+/// on selecting a peer. **4**, i.e. at most 2 s of listening, and only when the earlier windows
+/// selected nobody: a window that selects a peer is the last one run, so a present device costs
+/// exactly what it always did.
+///
+/// BOOT AS IS THE MEASUREMENT THAT SET THIS. Two LE runs in the SAME boot, with the speaker
+/// confirmed in pairing mode: run 1 read `considered=0 matched=0` (nothing connectable entered the
+/// table at all) and run 2 read `considered=2 matched=1` and connected. One 500 ms window is
+/// therefore a coin flip at that range — the target was last heard at -97 dBm, where its reports
+/// are intermittent — and the witness for run 1 said so itself: "the honest next step is another
+/// window, not a change to the filter". Nothing about the FILTERS is changed here; what changes is
+/// how long the radio is asked to listen.
+///
+/// WHAT THE RETRIES ARE, precisely, so no capture over-reads them: the scan is NOT re-enabled
+/// between windows. It is enabled once, stays continuous (window==interval), and each retry is
+/// another bounded READ of the event endpoint. So these are CONTIGUOUS segments of one listen,
+/// not independent trials — except for the gap in which the previous segment's witness lines are
+/// printed on a 115200 serial line, during which reports queue in the controller and may be lost.
+/// Segmenting buys a per-window table and a per-window verdict (which is what makes the retry
+/// falsifiable) at the price of those gaps; it does not buy statistical independence and the
+/// summary line does not claim any.
+///
+/// EACH WINDOW STARTS WITH AN EMPTY DEVICE TABLE, and that is a real limitation, stated where the
+/// decision is: the merge that lets a Local Name arriving in a LATER report attach to a device
+/// first heard without one operates WITHIN one window only. It does not accrete across windows. A
+/// device that advertises its shortened name in window 1 and its complete name in window 3 is two
+/// independent judgements, not one merged one. With the ADDRESS rule armed (the current build) this
+/// costs nothing — the address is carried in every report and the name is never consulted — but a
+/// future name-filter build wanting cross-window merging must carry the table out of the drain, and
+/// this constant is where that trade is recorded. For the same reason the summary's
+/// `totals considered=` and `totals matched=` are SUMS OVER WINDOWS: one device heard connectably
+/// in three windows contributes 3, not 1. They measure how much the filter chain had to judge, not
+/// how many distinct devices exist — `max_devices_in_a_window` is the closest thing to the latter
+/// on that line, and the per-window rollups are where distinct counts live.
+///
+/// WHAT THE WHOLE STAGE COSTS, corrected against the serial line: 4 x 500 ms is 2 s of LISTENING,
+/// but the windows are separated by their own witness prose. The per-window lines that repeat are
+/// on the order of 2 kB and serial at 115200 moves ~1 kB per 90 ms, so the three extra windows add
+/// roughly 0.75 s of printing on top of the 1.5 s of extra listening — call it **~2.8 s of wall
+/// clock for the worst-case LE stage**, against 500 ms + one window's prose when a peer is selected
+/// on the first window. That printing time is also the gap in which reports queue in the controller
+/// unread; both facts are the price of a per-window verdict.
+///
+/// WHY IT STILL TERMINATES HONESTLY: the budget is a hard cap of 4 windows, and the final verdict
+/// after the last one is the same NOT SELECTED prose as before, now qualified by how long the
+/// radio actually listened. A device that is genuinely absent reads absent — it just takes 2 s to
+/// say so instead of 500 ms.
+#[cfg(feature = "bt")]
+const BT_L2_SCAN_ATTEMPTS: u32 = 4;
 /// BT-L2 — cap on DISTINCT devices held in the scan table (and therefore on witness lines). Bench
 /// rooms with a dozen live radios are ordinary; 16 covers that with slack. Reports for a
 /// seventeenth distinct address are COUNTED and the rollup says the table truncated — silent
@@ -1228,9 +1277,11 @@ const BT_L4_PKT_MAX: u32 = 8;
 //     device performs inquiry scan and page SCAN — i.e. whether others can find and page US.
 //     Paging OUT needs none of it, and enabling it would make this machine discoverable on the
 //     bench, which is a state change nobody asked for.
-//   * `HCI_Write_Page_Timeout` (Vol 4 Part E §7.3.16) IS written, and for a boot-cost reason. The
-//     reset default is 0x2000 = 5.12 s, which a powered-off speaker would spend in full on every
-//     boot that arms this knob. `BT_C1_PAGE_TIMEOUT` shortens it; see there.
+//   * `HCI_Write_Page_Timeout` (Vol 4 Part E §7.3.16) IS written, so that the deadline the page
+//     runs under is a value this arc CHOSE and PRINTED rather than whatever the part reset to. It
+//     now writes the spec's own reset default (0x2000 = 5.12 s) — it used to shorten it to 1.28 s
+//     for boot cost, and Boot AS showed that shortening cutting off a page train to a speaker that
+//     was demonstrably page-scanning. See `BT_C1_PAGE_TIMEOUT`.
 //   * No inquiry is run, so the peer's page-scan repetition mode is unknown and the conservative
 //     value is sent (see `BT_C1_PSRM`).
 //   * No pairing, no authentication, no encryption. A speaker already bonded to this machine's
@@ -1255,16 +1306,63 @@ const BT_HCI_CREATE_CONN_CANCEL: u16 = 0x0408;
 /// (the timeout, in 0.625 ms slots); returns status(1). Vol 4 Part E §7.3.16.
 #[cfg(feature = "btc")]
 const BT_HCI_WRITE_PAGE_TIMEOUT: u16 = 0x0C18;
-/// BT-C1 — the page timeout this arc writes: 0x0800 = 2048 slots x 0.625 ms = **1.28 s**.
+/// BT-C1 — the page timeout this arc writes: 0x2000 = 8192 slots x 0.625 ms = **5.12 s**, the
+/// spec's own reset default (Vol 4 Part E §7.3.16; range 0x0001..0xFFFF).
 ///
-/// The reset default is 0x2000 (5.12 s), and it is spent IN FULL whenever the peer is off, out of
-/// range, or not page-scanning — which on a bench is most boots. 1.28 s is the classic-Bluetooth
-/// value a page train needs to be given a fair chance (a full R2 page train is nominally 2.56 s of
-/// scanning on the PEER's side, but the paging side retransmits continuously, so a device that is
-/// scanning at all is normally reached well inside a second) and it caps what a dead speaker costs
-/// the boot. The spec range is 0x0001..0xFFFF; this is comfortably inside it.
+/// IT WAS 0x0800 (1.28 s), AND BOOT AS CONVICTED THAT VALUE. Both classic runs of that boot ended
+/// `Connection Complete status=0x04 PAGE TIMEOUT` at ~1280 ms — i.e. the page was cut off at
+/// exactly the deadline written here — against a speaker that was CONFIRMED in pairing mode and
+/// therefore page-scanning. The old prose argued that "a device that is scanning at all is normally
+/// reached well inside a second"; the measurement says otherwise for this peer, and the measurement
+/// wins.
+///
+/// THE ARITHMETIC THE OLD VALUE GOT WRONG. Page-scan coverage is the peer's business, not ours: a
+/// BR/EDR device in R2 scans its page-scan window once per page-scan INTERVAL, and the interval is
+/// commonly 1.28 s (0x0800 slots) with 2.56 s permitted. The paging side must transmit its page
+/// train long enough to overlap one of those scans, and the R2 train is nominally 2.56 s of paging
+/// before the peer can be assumed unreachable. A 1.28 s deadline can therefore expire BEFORE the
+/// train has covered a single guaranteed scan instant — it manufactured false negatives, which is
+/// the one outcome an experiment must not manufacture (the same argument `BT_C1_PSRM` already made
+/// for the repetition mode, applied to the deadline it is paged under).
+///
+/// WHAT IT COSTS, stated plainly: a powered-off speaker now costs 5.12 s per attempt instead of
+/// 1.28 s. That is real, and it is paid ONLY by a boot that sets `UNAOS_BTC=1` — an opt-in bench
+/// experiment whose entire purpose is to find out whether the speaker can be reached. A default
+/// boot contains no page code at all.
 #[cfg(feature = "btc")]
-const BT_C1_PAGE_TIMEOUT: u16 = 0x0800;
+const BT_C1_PAGE_TIMEOUT: u16 = 0x2000;
+/// BT-C1 — how many `HCI_Create_Connection` attempts the stage may make: **2**.
+///
+/// A RETRY IS SPENT ON EXACTLY ONE ANSWER — `Connection Complete` with status 0x04 (PAGE TIMEOUT)
+/// for the address we paged, which is "the peer never answered the train". Every other outcome
+/// ends the stage on the first attempt, and deliberately:
+///   * a LINK (status 0x00) — the stage has what it came for;
+///   * a REFUSAL (0x0D/0x0E/0x0F, 0x05, ...) — the speaker ANSWERED. It is present and reachable;
+///     paging it again would not change its mind and would hide a perfectly good result behind a
+///     second identical one;
+///   * a Command Status refusal, a malformed event, a timeout of our own window, or an unreadable
+///     endpoint — these are facts about THIS HOST's controller or transport, and repeating a page
+///     the local side mishandled measures nothing about the air;
+///   * an OUTSTANDING page — the mandatory cancel runs, and a second page on top of an unresolved
+///     one is exactly the state the teardown exists to prevent.
+///
+/// WHY A RETRY IS WORTH ANYTHING AT ALL, given the timeout above is already a full train: a page
+/// train and a peer's page-scan schedule are independent clocks, and a peer that has just been
+/// power-cycled into pairing mode is also servicing inquiry scan and (for a speaker) reconnection
+/// attempts to hosts it remembers. A second train samples a different phase of that schedule.
+///
+/// THE BOUND, counted properly rather than quoted as the paging time alone: 2 attempts x 5.12 s is
+/// ~10.3 s of PAGING, but the stage also spends 2 x `BT_C1_CONN_MS` (5600 ms) of host window — the
+/// controller's Page Timeout normally lands first, so these overlap the paging rather than adding
+/// to it — plus 2 x `BT_L3_CMD_MS` waiting for Command Status, 2 x a cancel round trip, and up to
+/// one `hw_wait_budget()` (~1.1 s) if `HCI_Write_Page_Timeout` itself goes unanswered. **The
+/// bounded worst case for the whole classic stage is therefore ~12.4 s**, not the ~10.2 s an
+/// earlier draft of this comment quoted; with the LE stage's repeat scan in front of it the worst
+/// boot is ~15 s. All of it is paid only by a boot that set `UNAOS_BTC=1`, and all of it sits on
+/// the SYNCHRONOUS EHCI walk — which is what must change before Bluetooth is ever default-on. The
+/// tally prints `pages_attempted=` so the capture always says how many trains were actually spent.
+#[cfg(feature = "btc")]
+const BT_C1_PAGE_ATTEMPTS: u32 = 2;
 /// BT-C1 — `Packet_Type` for the page: **DM1 (0x0008) | DH1 (0x0010) = 0x0018**, and nothing else.
 ///
 /// The field is a bitmap of the baseband packet types the link MAY use (Vol 4 Part E §7.1.5), and
@@ -1310,11 +1408,14 @@ const BT_EVT_CONN_COMPLETE: u8 = 0x03;
 #[cfg(feature = "btc")]
 const BT_C1_LINK_TYPE_ACL: u8 = 0x01;
 /// BT-C1 — bounded wall-clock window, in ms, for the `Connection Complete` after the page is
-/// accepted. Sized to sit just past `BT_C1_PAGE_TIMEOUT` (1.28 s): the controller answers with a
-/// Page Timeout status (0x04) of its own accord when the timeout expires, and a window that closed
-/// FIRST would report "no answer" on a boot where the controller was about to say exactly why.
+/// accepted. Sized to sit just past `BT_C1_PAGE_TIMEOUT` (now 5.12 s => 5600 ms here): the
+/// controller answers with a Page Timeout status (0x04) of its own accord when the timeout expires,
+/// and a window that closed FIRST would report "no answer" on a boot where the controller was about
+/// to say exactly why. THE TWO MOVE TOGETHER — raising the page timeout without raising this would
+/// have turned every page into a self-inflicted "NO Connection Complete", i.e. an OUTSTANDING page
+/// and a cancel, on runs where the controller was working correctly.
 #[cfg(feature = "btc")]
-const BT_C1_CONN_MS: u64 = 1600;
+const BT_C1_CONN_MS: u64 = 5600;
 
 /// BT-L1 — reassembly cap for one HCI event that spans multiple event-endpoint packets. The event
 /// endpoint's max packet is 16 B (census: `IN1/int/16`), but an HCI event runs up to 2 + 255 B;
@@ -1470,6 +1571,37 @@ enum BtEvt {
     ///   STILL ARMED (see `bt_read_full_event`). That is the ordinary pre-armed hand-off: the
     ///   disable's `bt_hci_command_ex` consumes the outstanding transfer instead of arming over it.
     Stop,
+}
+
+/// BT-L2 — what ONE receive window returned, so the repeat-scan loop can summarise the windows it
+/// ran without re-deriving anything the drain already knew.
+///
+/// Every field is a COUNT FROM THAT WINDOW ALONE — nothing here accumulates. The summary line adds
+/// them up itself, and prints the per-window row as well as the total, because the discriminating
+/// evidence is in the shape of the sequence: reports in every window and never the target is a
+/// different fact from zero reports in every window.
+#[cfg(feature = "bt")]
+#[derive(Clone, Copy, Default)]
+struct BtScanRound {
+    /// The drain ended on a halted event endpoint (`BtEvt::Stop`). Terminal for the loop: a halted
+    /// endpoint cannot be read again, so a further window would measure nothing.
+    halted: bool,
+    /// The peer this window selected, if any. `Some` ends the loop.
+    peer: Option<([u8; 6], u8)>,
+    /// DISTINCT addresses that entered this window's table.
+    devices: u32,
+    /// Advertising reports demodulated in this window (PDUs, not devices — duplicate filtering is
+    /// off). THIS is the receive-depth number.
+    reports: u32,
+    /// Devices that were connectable AND carried an address type the create command accepts, i.e.
+    /// candidates the filter chain actually judged.
+    considered: u32,
+    /// Candidates that passed every filter.
+    matched: u32,
+    /// MEASURED length of this window in ms (the same number its rollup line prints), so the
+    /// summary can add up what the radio really listened for rather than multiplying the nominal
+    /// constant. Reads 0 on an uncalibrated TSC — the same signature the rollup carries.
+    elapsed_ms: u64,
 }
 
 /// BT-L2 — one distinct device seen during the scan window.
@@ -4195,8 +4327,9 @@ impl Controller {
         ) {
             Some(0) => {
                 serial_println!(
-                    ":: bt-l2: [{}] scan ENABLED — passive, filter_duplicates={} (OFF: every advertising PDU this radio demodulates is reported, so reports= is RECEIVE DEPTH and not a device count), bounded window={}ms == witness ::",
-                    self.idx, BT_LE_SCAN_FILTER_DUP, BT_L2_SCAN_MS
+                    ":: bt-l2: [{}] scan ENABLED — passive, filter_duplicates={} (OFF: every advertising PDU this radio demodulates is reported, so reports= is RECEIVE DEPTH and not a device count), bounded window={}ms x up to {} windows (the scan is enabled ONCE and stays on; a retry is another READ, not another enable), so the worst case this stage adds is {}ms of listening and the best case is {}ms == witness ::",
+                    self.idx, BT_LE_SCAN_FILTER_DUP, BT_L2_SCAN_MS, BT_L2_SCAN_ATTEMPTS,
+                    BT_L2_SCAN_MS * BT_L2_SCAN_ATTEMPTS as u64, BT_L2_SCAN_MS
                 );
                 (true, true)
             }
@@ -4231,10 +4364,30 @@ impl Controller {
         let mut ep_halted = false;
         // BT-L3 — the peer the drain picked, if any. `None` whenever the drain did not run.
         let mut peer: Option<([u8; 6], u8)> = None;
+        // REPEAT SCAN — up to `BT_L2_SCAN_ATTEMPTS` receive windows, and NO further command is
+        // issued between them: the scan was enabled once above and stays enabled, so each pass is
+        // another bounded read of the same continuous scan. See `BT_L2_SCAN_ATTEMPTS` for what that
+        // does and does not buy (contiguous segments with print gaps, NOT independent trials).
+        //
+        // The loop stops on the FIRST of: a peer selected (the stage has what it came for and a
+        // present device costs exactly one window, as before), a halted event endpoint (nothing
+        // further can be read, and reading it is what `BtEvt::Stop` forbids), or the attempt cap.
+        // There is no early "the room is empty" exit: an empty window is precisely the case the
+        // retries exist for.
+        let mut rounds = [BtScanRound::default(); BT_L2_SCAN_ATTEMPTS as usize];
+        let mut windows_run = 0u32;
         if drain {
-            let (h, p) = self.bt_le_drain(e, toggle, armed);
-            ep_halted = h;
-            peer = p;
+            for i in 0..BT_L2_SCAN_ATTEMPTS {
+                let r = self.bt_le_drain(e, toggle, armed, i + 1);
+                rounds[i as usize] = r;
+                windows_run = i + 1;
+                ep_halted = r.halted;
+                peer = r.peer;
+                if peer.is_some() || r.halted {
+                    break;
+                }
+            }
+            self.bt_l2_repeat_summary(&rounds[..windows_run as usize], peer, ep_halted);
         }
 
         // ---- 6. HCI_LE_Set_Scan_Enable(disable) — the mandatory exit --------------------------
@@ -4302,9 +4455,17 @@ impl Controller {
                 ":: bt-l3: [{}] connect NOT ATTEMPTED — a peer was selected but the entry conditions do not hold (event_endpoint_halted={} scan_off_confirmed={}); NO HCI_LE_Create_Connection was issued, so nothing is outstanding == witness ::",
                 self.idx, ep_halted, scan_off_confirmed
             ),
-            None => serial_println!(
-                ":: bt-l3: [{}] connect NOT ATTEMPTED — no connectable peer was selected during the scan window; NO HCI_LE_Create_Connection was issued, so nothing is outstanding == witness ::",
+            // `windows_run == 0` is NOT "the room was empty" — it is "no window ever ran", which
+            // happens when the enable was refused or left unconfirmed. Saying "no peer was
+            // selected in 0 windows" and pointing at a summary that was never printed would be a
+            // witness claiming evidence it does not have.
+            None if windows_run == 0 => serial_println!(
+                ":: bt-l3: [{}] connect NOT ATTEMPTED — NO RECEIVE WINDOW RAN AT ALL: the drain was never entered because the scan enable was refused or unconfirmed (its own bt-l2 line above says which), so there is no repeat-scan summary and NOTHING here is evidence about the air. NO HCI_LE_Create_Connection was issued, so nothing is outstanding == witness ::",
                 self.idx
+            ),
+            None => serial_println!(
+                ":: bt-l3: [{}] connect NOT ATTEMPTED — no connectable peer was selected in any of the {} receive window(s) that ran (of {} budgeted); the repeat-scan summary above says whether that was silence on the air or a room heard without the target in it. NO HCI_LE_Create_Connection was issued, so nothing is outstanding == witness ::",
+                self.idx, windows_run, BT_L2_SCAN_ATTEMPTS
             ),
         }
     }
@@ -5673,22 +5834,47 @@ impl Controller {
             (BT_C1_CLOCK_OFFSET >> 8) as u8,
             BT_C1_ALLOW_ROLE_SWITCH,
         ];
+        // ---- THE PAGE ATTEMPT LOOP -------------------------------------------------------------
+        // At most `BT_C1_PAGE_ATTEMPTS` trains, and a second one is spent on exactly one answer:
+        // `Connection Complete` status=0x04 (PAGE TIMEOUT) for the address we paged. See the
+        // constant for why every other outcome — link, refusal, local-side failure, or an
+        // OUTSTANDING page — ends the stage on the attempt that produced it. `outstanding` is the
+        // hard interlock: the loop never begins a second page while the first is unresolved,
+        // because an unresolved page is what the mandatory cancel below exists for.
+        let mut pages = 0u32; // page trains actually put on the air (Command Status ACCEPTED or unknown)
+        let mut page_timeouts = 0u32; // attempts that ended in an explicit status=0x04 for OUR address
+        let mut attempts_run = 0u32;
+        for attempt in 1..=BT_C1_PAGE_ATTEMPTS {
+        attempts_run = attempt;
         serial_println!(
-            ":: bt-c1: [{}] page parameters — peer={} packet_type={:#06x}(DM1|DH1, basic rate, one slot) psrm={:#04x}(R2, conservative: no inquiry was run) clock_offset={:#06x}(bit15 clear = NOT valid) allow_role_switch={:#04x}(the peer may take the link) reserved=0x00; NO Write_Scan_Enable is issued — Vol 4 Part E §7.3.18 governs INBOUND inquiry/page scan and paging out needs none of it, while enabling it would make this machine discoverable == witness ::",
-            self.idx,
+            ":: bt-c1: [{}] page parameters — attempt={}/{} peer={} packet_type={:#06x}(DM1|DH1, basic rate, one slot) psrm={:#04x}(R2, conservative: no inquiry was run) clock_offset={:#06x}(bit15 clear = NOT valid) allow_role_switch={:#04x}(the peer may take the link) reserved=0x00 page_timeout={}ms(written above) conn_window={}ms; NO Write_Scan_Enable is issued — Vol 4 Part E §7.3.18 governs INBOUND inquiry/page scan and paging out needs none of it, while enabling it would make this machine discoverable == witness ::",
+            self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
             core::str::from_utf8(&text).unwrap_or("??:??:??:??:??:??"),
-            BT_C1_PACKET_TYPE, BT_C1_PSRM, BT_C1_CLOCK_OFFSET, BT_C1_ALLOW_ROLE_SWITCH
+            BT_C1_PACKET_TYPE, BT_C1_PSRM, BT_C1_CLOCK_OFFSET, BT_C1_ALLOW_ROLE_SWITCH,
+            (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000, BT_C1_CONN_MS
         );
         if !self.bt_hci_send(t, intf, BT_HCI_CREATE_CONN, &cp) {
             serial_println!(
-                ":: bt-c1: [{}] HCI_Create_Connection (0x0405) NOT SENT — the EP0 control-OUT failed (its own line is above). The command never reached the radio, so no page is outstanding and no cancel is owed == witness ::",
-                self.idx
+                ":: bt-c1: [{}] HCI_Create_Connection (0x0405) attempt={}/{} NOT SENT — the EP0 control-OUT failed (its own line is above). The command never reached the radio, so no page is outstanding and no cancel is owed. NO further attempt is made: an EP0 that refused the write is a fact about this host's transport, and repeating it measures nothing about the air == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS
             );
-            self.bt_c1_tally(t0, seen, 0, 0, disconnected, cancels, live, outstanding);
-            return;
+            break;
         }
         // FROM THIS INSTANT the controller may be paging.
+        //
+        // `pages` IS NOT INCREMENTED HERE, and the review that moved it is right: the EP0 write
+        // having succeeded says the command reached the radio, NOT that a page train went on the
+        // air. A controller that answers Command Status 0x01 (UNKNOWN-CMD — this arc's own witness
+        // text anticipates exactly that on a part whose ROM lacks Create_Connection), 0x0C or 0x12
+        // never starts paging, and counting it as a train would put `pages_on_air=1` and
+        // `pages_attempted=1` in the capture for a boot in which nothing was ever transmitted.
+        // The increment now happens where paging is either CONFIRMED (Command Status 0x00) or
+        // genuinely UNKNOWN (no Command Status, or an endpoint that stopped being readable) —
+        // the same two states `outstanding` already treats as "the controller MAY be paging".
         outstanding = true;
+        // THIS attempt's answer, not the running total — the retry decision below must not be able
+        // to fire on an earlier attempt's Page Timeout.
+        let mut this_page_timed_out = false;
 
         // ---- 3. Command Status for 0x0405 -------------------------------------------------------
         let mut accepted = false;
@@ -5703,6 +5889,7 @@ impl Controller {
                 let s = asm[2];
                 if s == 0x00 {
                     accepted = true;
+                    pages += 1; // CONFIRMED on the air by the controller's own status
                     serial_println!(
                         ":: bt-c1: [{}] HCI_Create_Connection (0x0405) -> CommandStatus status={:#04x} -> ACCEPTED, the controller is now PAGING {} == witness ::",
                         self.idx, s, core::str::from_utf8(&text).unwrap_or("??")
@@ -5721,14 +5908,24 @@ impl Controller {
                     );
                 }
             }
-            BtL3Await::Timeout => serial_println!(
-                ":: bt-c1: [{}] HCI_Create_Connection (0x0405) -> NO CommandStatus within {}ms — the command went out on EP0 and the controller MAY be paging, so it is treated as OUTSTANDING and the cancel below runs == witness ::",
-                self.idx, BT_L3_CMD_MS
-            ),
-            BtL3Await::Stop => serial_println!(
-                ":: bt-c1: [{}] HCI_Create_Connection (0x0405) -> event endpoint became UNREADABLE before any CommandStatus. The page is treated as OUTSTANDING; the cancel below is SENT on EP0 (which the halt did not touch) and its reply is not read == witness ::",
-                self.idx
-            ),
+            // COUNTED AS A TRAIN, conservatively and for the same reason the page is treated as
+            // OUTSTANDING on these two paths: the command went out and the controller MAY be
+            // paging. Undercounting here would let a capture read "no train was ever sent" over a
+            // radio that is in fact paging — the more dangerous of the two errors.
+            BtL3Await::Timeout => {
+                pages += 1;
+                serial_println!(
+                    ":: bt-c1: [{}] HCI_Create_Connection (0x0405) -> NO CommandStatus within {}ms — the command went out on EP0 and the controller MAY be paging, so it is treated as OUTSTANDING (and counted in pages_on_air) and the cancel below runs == witness ::",
+                    self.idx, BT_L3_CMD_MS
+                );
+            }
+            BtL3Await::Stop => {
+                pages += 1;
+                serial_println!(
+                    ":: bt-c1: [{}] HCI_Create_Connection (0x0405) -> event endpoint became UNREADABLE before any CommandStatus. The page is treated as OUTSTANDING (and counted in pages_on_air); the cancel below is SENT on EP0 (which the halt did not touch) and its reply is not read == witness ::",
+                    self.idx
+                );
+            }
         }
 
         // ---- 4. Connection Complete (event 0x03) -------------------------------------------------
@@ -5775,9 +5972,16 @@ impl Controller {
                             self.idx, h, asm[11]
                         );
                     } else {
+                        // THE ONE ANSWER A RETRY IS SPENT ON — and it is counted only when the
+                        // event is about the address we paged (`ours`), because a Page Timeout for
+                        // some other address is not our page's answer at all.
+                        if s == 0x04 && ours {
+                            page_timeouts += 1;
+                            this_page_timed_out = true;
+                        }
                         serial_println!(
-                            ":: bt-c1: [{}] Connection Complete (0x03) — status={:#04x} -> NOT CONNECTED{}. The page RESOLVED (the controller left the paging state to send this), so no cancel is owed == witness ::",
-                            self.idx, s,
+                            ":: bt-c1: [{}] Connection Complete (0x03) — attempt={}/{} status={:#04x} -> NOT CONNECTED{}. The page RESOLVED (the controller left the paging state to send this), so no cancel is owed == witness ::",
+                            self.idx, attempt, BT_C1_PAGE_ATTEMPTS, s,
                             match s {
                                 0x04 => " (PAGE TIMEOUT: the speaker did not answer the page train within the timeout written above — it is off, out of range, or not page-scanning. THIS IS THE ORDINARY RESULT FOR A POWERED-OFF SPEAKER and says nothing against the radio)",
                                 0x05 => " (AUTHENTICATION FAILURE)",
@@ -5797,9 +6001,22 @@ impl Controller {
                         self.idx, len
                     );
                 }
+                // THE INDICTMENT IS CONDITIONAL ON THE CLOCK. `bt_l3_budget` falls back to a fixed
+                // CYCLE count when `tsc_hz() == 0` — about a quarter of `hw_wait_budget()`, i.e.
+                // ~0.27 s on the bench part, NOT the 5600 ms this constant names. On such a run the
+                // window closed FIRST and "the controller should have reported a Page Timeout and
+                // did not" would be an accusation built entirely out of a number that was never
+                // waited. The window actually waited is printed either way.
                 BtL3Await::Timeout => serial_println!(
-                    ":: bt-c1: [{}] NO Connection Complete within {}ms — longer than the {}ms page timeout written above, so the controller should have reported a Page Timeout of its own accord and did not. The page is OUTSTANDING and MUST be cancelled == witness ::",
-                    self.idx, BT_C1_CONN_MS, (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000
+                    ":: bt-c1: [{}] NO Connection Complete — window_nominal={}ms tsc_calibrated={} page_timeout_written={}ms. {} The page is OUTSTANDING and MUST be cancelled == witness ::",
+                    self.idx, BT_C1_CONN_MS,
+                    crate::arch::x86_64::apic::tsc_hz() != 0,
+                    (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000,
+                    if crate::arch::x86_64::apic::tsc_hz() != 0 {
+                        "The window that ran is LONGER than the page timeout written above, so the controller should have reported a Page Timeout of its own accord and did not — that is an indictment of the controller."
+                    } else {
+                        "THE TSC IS UNCALIBRATED, so this window was a fixed cycle-count fallback (~0.27s at 2.3GHz), NOT the nominal ms above and SHORTER than the page timeout written. NOTHING is indicted here: the controller was very probably still paging when this window closed."
+                    }
                 ),
                 BtL3Await::Stop => serial_println!(
                     ":: bt-c1: [{}] event endpoint became UNREADABLE while awaiting Connection Complete — the page is OUTSTANDING and the cancel is SENT UNREAD below == witness ::",
@@ -5807,6 +6024,52 @@ impl Controller {
                 ),
             }
         }
+
+        // ---- 4a. THE RETRY DECISION, witnessed either way ---------------------------------------
+        // FOUR CONDITIONS, and each one is a state the loop must not page over:
+        //   * `this_page_timed_out` — the peer never answered THIS train. The only answer a second
+        //     train can improve on;
+        //   * `!outstanding` — the page resolved. A second Create_Connection while the controller
+        //     is still paging is the state the mandatory cancel exists to prevent;
+        //   * `!live` and no latched handle — a link exists; paging again would page a device this
+        //     stage is already holding, and the teardown below is what it owes instead;
+        //   * attempts remain in the budget.
+        let retry = this_page_timed_out
+            && !outstanding
+            && !live
+            && st.classic_handle.is_none()
+            && attempt < BT_C1_PAGE_ATTEMPTS;
+        if retry {
+            serial_println!(
+                ":: bt-c1: [{}] PAGE TIMEOUT on attempt={}/{} -> RETRYING. Nothing is outstanding (the controller resolved the page itself) and no link is held, so one more page train goes on the air. A train and the peer's page-scan schedule are independent clocks: the second train samples a different phase of it, and if the speaker is simply not scanning this costs one more {}ms and says so == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
+                (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000
+            );
+        } else {
+            break;
+        }
+        } // ---- end of the page attempt loop -----------------------------------------------------
+
+        // ---- 4b'. THE PAGE SUMMARY — the whole sequence, in one line ----------------------------
+        // The per-attempt lines are each honest about one train. This one is about the sequence,
+        // and it is what a capture must read before concluding anything about the speaker: a
+        // PAGE TIMEOUT on every train of a longer, repeated page is a much stronger statement than
+        // the single 1.28 s train Boot AS cut short. It cannot be produced by the retry logic —
+        // every count in it is incremented by an event the controller sent.
+        serial_println!(
+            ":: bt-c1: [{}] page summary — attempts_run={}/{} pages_on_air={} page_timeouts={} page_timeout_each={}ms conn_window_each={}ms -> {} == witness ::",
+            self.idx, attempts_run, BT_C1_PAGE_ATTEMPTS, pages, page_timeouts,
+            (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000, BT_C1_CONN_MS,
+            if live || st.classic_handle.is_some() {
+                "REACHED — a BR/EDR link was established; the teardown below is what this stage owes for it"
+            } else if page_timeouts >= BT_C1_PAGE_ATTEMPTS {
+                "NOT REACHED, AND THE PEER NEVER ANSWERED ANY TRAIN. Every attempt in the budget ended in an explicit Page Timeout for this BD_ADDR, each one a full-length train, so this is no longer the short-deadline artefact Boot AS produced at 1280ms. The ordinary readings are: the speaker is off, out of range, or not page-scanning (already connected to another host, or past its pairing window). What it does NOT show is a page cut short by this host"
+            } else if page_timeouts > 0 {
+                "NOT REACHED — a Page Timeout was seen, and the sequence stopped before the budget was spent. The attempt line that ended it says why (a link, a refusal, or a local-side failure); read that line, not this count"
+            } else {
+                "NOT REACHED, AND NOT FOR WANT OF LISTENING TIME — no attempt ended in a Page Timeout at all. The answer came from this host's own side or from a peer that responded with something else; the attempt lines above carry it, and no amount of extra page time would change it"
+            }
+        );
 
         // ---- 4b. reconcile the latch before any cancel is considered -----------------------------
         if !live {
@@ -5971,7 +6234,12 @@ impl Controller {
         // `established` is read BEFORE the teardown clears `live` — the old expression
         // (`disconnected > 0 || live`) was the same number by accident on every path and would
         // have started lying the moment a second link could be adopted.
-        self.bt_c1_tally(t0, seen, 1, established, disconnected, cancels, live, outstanding);
+        // `pages` is the number of page trains the controller either confirmed or may have put on
+        // the air — 0 when the EP0 write was refused AND 0 when the controller refused the command
+        // with a nonzero Command Status (nothing was transmitted in either case), and up to
+        // `BT_C1_PAGE_ATTEMPTS` when the peer never answered. It used to be the literal 1, which
+        // was true only while one attempt was all this stage could make.
+        self.bt_c1_tally(t0, seen, pages, established, disconnected, cancels, live, outstanding);
     }
 
     /// BT-C1 — the end-of-stage tally, in the shape BT-L3's is: `left_outstanding=` reads `none` on
@@ -6011,6 +6279,11 @@ impl Controller {
     /// room costs exactly `BT_L2_SCAN_MS` and no more — and the one transfer left armed when the
     /// window expires is handed forward (`armed`) to the disable command rather than abandoned.
     ///
+    /// ONE CALL IS ONE WINDOW. The stage may run up to `BT_L2_SCAN_ATTEMPTS` of them (see there),
+    /// so "an empty room costs exactly `BT_L2_SCAN_MS`" is now per call: the STAGE's drain cost in
+    /// an empty room is up to `BT_L2_SCAN_ATTEMPTS * BT_L2_SCAN_MS`, and a room containing the
+    /// target costs one window, because a selected peer ends the loop.
+    ///
     /// WHAT L2 COSTS, stated as a bound and not as the happy path: the DRAIN is capped at
     /// `BT_L2_SCAN_MS`, but the commands around it are not. Each of the five bring-up commands and
     /// the mandatory disable reads its CommandComplete on the full `hw_wait_budget()` (~1.1 s at
@@ -6023,9 +6296,15 @@ impl Controller {
     /// so a per-report print would make the instrument change what it measures. The table is
     /// collected first and witnessed after, which also lets a name arriving in a later report be
     /// attached to a device first heard without one.
-    /// Returns whether the drain ended on a HALTED event endpoint (`BtEvt::Stop` from
-    /// `QTD_ERR_MASK`). The caller needs that fact to decide whether the mandatory scan-disable may
-    /// read its own `CommandComplete` — see `BtEvt::Stop`.
+    /// Returns a `BtScanRound` for THIS window — among its fields, whether the drain ended on a
+    /// HALTED event endpoint (`BtEvt::Stop` from `QTD_ERR_MASK`). The caller needs that fact both
+    /// to decide whether the mandatory scan-disable may read its own `CommandComplete` (see
+    /// `BtEvt::Stop`) and to stop the repeat-scan loop: a halted endpoint cannot be read again, so
+    /// a further window would measure nothing.
+    ///
+    /// `attempt` is 1-based and is PRINTED, not acted on — this function's behaviour is identical
+    /// on every window except that the constant peer-rule line is emitted only on the first. The
+    /// retry decision belongs entirely to the caller.
     ///
     /// BT-L3 — also returns the PEER L3 will try to connect to: `(address, address type)`, chosen
     /// AFTER the window from the merged device table by the selection pass below. `None` when
@@ -6044,7 +6323,8 @@ impl Controller {
         e: &BtEvtEp,
         toggle: &mut bool,
         armed: &mut bool,
-    ) -> (bool, Option<([u8; 6], u8)>) {
+        attempt: u32,
+    ) -> BtScanRound {
         // Window in TSC units. `tsc_hz()` is 0 only if calibration failed or ran too early.
         //
         // UNCALIBRATED FALLBACK, stated honestly: with `tsc_hz() == 0` there is no cycles->time
@@ -6487,8 +6767,9 @@ impl Controller {
 
         // ---- witness: the rollup --------------------------------------------------------------
         serial_println!(
-            ":: bt-l2: [{}] LE scan rollup — window={}ms(nominal {}ms) distinct_devices={} adv_reports={} events={} non_adv_events={} malformed={} multi_report_events={}(extra_reports_not_decoded={}) {} == witness ::",
-            self.idx, elapsed, BT_L2_SCAN_MS, ndev, reports, events, other, malformed, multi, extra,
+            ":: bt-l2: [{}] LE scan rollup — attempt={}/{} window={}ms(nominal {}ms) distinct_devices={} adv_reports={} events={} non_adv_events={} malformed={} multi_report_events={}(extra_reports_not_decoded={}) {} == witness ::",
+            self.idx, attempt, BT_L2_SCAN_ATTEMPTS,
+            elapsed, BT_L2_SCAN_MS, ndev, reports, events, other, malformed, multi, extra,
             if dropped > 0 {
                 "table TRUNCATED at the cap — further distinct addresses were heard and are NOT listed"
             } else {
@@ -6512,8 +6793,8 @@ impl Controller {
         // Filter_Duplicates=on this line could not have been written — the count was capped at one
         // per device by the parameter itself.
         serial_println!(
-            ":: bt-l2: [{}] LE scan receive depth — filter_duplicates is OFF, so adv_reports={} counts PDUs demodulated, not devices. Expected for a discoverable/pairing advertiser (20-100ms interval) over {}ms: 5-25 reports. Expected for a background advertiser (1.28s interval): ~0.4, i.e. usually zero. A device known to be pairing that yields 0-2 reports is a RECEIVE deficit; a device on a slow interval yielding 0 is arithmetic == witness ::",
-            self.idx, reports, BT_L2_SCAN_MS
+            ":: bt-l2: [{}] LE scan receive depth — attempt={}/{} filter_duplicates is OFF, so adv_reports={} counts PDUs demodulated, not devices. Expected for a discoverable/pairing advertiser (20-100ms interval) over {}ms: 5-25 reports. Expected for a background advertiser (1.28s interval): ~0.4, i.e. usually zero. A device known to be pairing that yields 0-2 reports is a RECEIVE deficit; a device on a slow interval yielding 0 is arithmetic. THIS LINE IS ONE WINDOW: the repeat-scan summary at the end of the stage sums every window run and is the number to read against a KNOWN-PRESENT device == witness ::",
+            self.idx, attempt, BT_L2_SCAN_ATTEMPTS, reports, BT_L2_SCAN_MS
         );
         if dropped > 0 {
             serial_println!(
@@ -6537,8 +6818,8 @@ impl Controller {
             // construction here: both mask writes above returned status 0x00 and are witnessed, or
             // this drain never ran. So zero means nothing was heard, not that nothing was routed.
             serial_println!(
-                ":: bt-l2: [{}] LE scan found ZERO devices. Both the Event Mask (LE Meta, bit 61) and the LE Event Mask (Advertising Report, bit 1) were written and CONFIRMED above, so this is silence on the air across the {}ms measured (nominal {}ms) — not a masked event stream. Nor is it a channel-coverage artefact: the three PRIMARY advertising channels (37/38/39) are not host-selectable — HCI_LE_Set_Host_Channel_Classification (0x2014) classifies DATA channels 0-36 only, and this arc never issues it, so the scanner's primary-channel rotation is the controller's and is complete by construction. A bounded window is not a survey: devices advertising slower than it can be missed ::",
-                self.idx, elapsed, BT_L2_SCAN_MS
+                ":: bt-l2: [{}] LE scan found ZERO devices in attempt={}/{}. Both the Event Mask (LE Meta, bit 61) and the LE Event Mask (Advertising Report, bit 1) were written and CONFIRMED above, so this is silence on the air across the {}ms measured (nominal {}ms) — not a masked event stream. Nor is it a channel-coverage artefact: the three PRIMARY advertising channels (37/38/39) are not host-selectable — HCI_LE_Set_Host_Channel_Classification (0x2014) classifies DATA channels 0-36 only, and this arc never issues it, so the scanner's primary-channel rotation is the controller's and is complete by construction. A bounded window is not a survey: devices advertising slower than it can be missed ::",
+                self.idx, attempt, BT_L2_SCAN_ATTEMPTS, elapsed, BT_L2_SCAN_MS
             );
         }
         // BT-L3 — witness the PICK before anything is done with it, so a capture always shows which
@@ -6551,6 +6832,13 @@ impl Controller {
         // The three arms are the three arms of the precedence chain, in order, so the line names
         // which one actually ran — a capture must never leave the reader to infer it from the
         // constants in a build they cannot see.
+        //
+        // ONCE PER STAGE, not once per window. The rule is a compile-time constant: repeating a
+        // ~1 kB line for every retry would say nothing new and would cost ~90 ms of serial time
+        // per repetition — time the radio spends with nobody reading its event endpoint, i.e. the
+        // gap the repeat-scan constant's doc warns about. The per-window verdict below still names
+        // the armed rule, so no window is left ambiguous.
+        if attempt == 1 {
         if let Some(want) = BT_L3_PEER_ADDR {
             let txt = bt_addr_render_msb(&want);
             serial_print!(
@@ -6577,6 +6865,7 @@ impl Controller {
             ),
         }
         }
+        } // end `attempt == 1` — the rule line is printed once per stage
         // Review conditions (btaddr adoption): the NOT SELECTED prose below must not claim more
         // than the table can prove. This asks the one question the address filter makes cheap —
         // did the target's six bytes appear AT ALL, connectable or not — because the selection
@@ -6592,15 +6881,15 @@ impl Controller {
         }
         match peer {
             Some((a, ty)) => serial_println!(
-                ":: bt-l3: [{}] peer SELECTED addr={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={} — heard advertising connectably (ADV_IND, Event_Type 0x00) and passed every filter; considered={} matched={} == witness ::",
+                ":: bt-l3: [{}] peer SELECTED addr={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={} — heard advertising connectably (ADV_IND, Event_Type 0x00) and passed every filter; attempt={}/{} considered={} matched={} == witness ::",
                 self.idx, a[5], a[4], a[3], a[2], a[1], a[0],
                 if ty == 0x00 { "public" } else { "random" },
-                considered, matched
+                attempt, BT_L2_SCAN_ATTEMPTS, considered, matched
             ),
             None => {
                 serial_print!(
-                    ":: bt-l3: [{}] peer NOT SELECTED — no device passed the filters: rule=",
-                    self.idx
+                    ":: bt-l3: [{}] peer NOT SELECTED in attempt={}/{} — no device passed the filters: rule=",
+                    self.idx, attempt, BT_L2_SCAN_ATTEMPTS
                 );
                 // Name the ARMED rule and its target, not a constant that may not have been read.
                 match BT_L3_PEER_ADDR {
@@ -6638,7 +6927,7 @@ impl Controller {
                         // statement about the air: nothing connectable was heard AT ALL inside the
                         // window. Boot AR heard this device at -97dBm, which is intermittent by
                         // nature, so with the speaker ON this is the expected shape of a MISS.
-                        "considered=0 WITH THE ADDRESS RULE ARMED IS EVIDENCE ABOUT THE AIR, NOT ABOUT THE FILTER: no connectable advertiser of any address entered the table, so nothing was rejected — the 500ms window simply overlapped no advertisement. The target was last heard at -97dBm, at which range its reports are intermittent; the honest next step is another window, not a change to the filter"
+                        "considered=0 WITH THE ADDRESS RULE ARMED IS EVIDENCE ABOUT THE AIR, NOT ABOUT THE FILTER: no connectable advertiser of any address entered the table, so nothing was rejected — this window simply overlapped no advertisement. The target was last heard at -97dBm, at which range its reports are intermittent. THE ANOTHER-WINDOW STEP THIS TEXT USED TO ASK FOR IS NOW AUTOMATIC: if windows remain in the budget the stage opens the next one, and the repeat-scan summary at the end of the stage is what says whether the sequence ever heard anything"
                     } else if BT_L3_PEER_ADDR.is_some() {
                         "the room was heard and the target was not in it: the table was not capped, the target's six bytes appear nowhere in it (connectable or otherwise), and every device above carries its own l3= verdict — address-mismatch for the connectable ones, not-connectable for the rest. The ordinary reading is that the target is OFF or out of range"
                     } else {
@@ -6647,7 +6936,92 @@ impl Controller {
                 );
             }
         }
-        (halted, peer)
+        BtScanRound {
+            halted,
+            peer,
+            devices: ndev as u32,
+            reports,
+            considered,
+            matched,
+            elapsed_ms: elapsed,
+        }
+    }
+
+    /// BT-L2/BT-L3 — the REPEAT-SCAN SUMMARY: one line for the whole sequence of receive windows.
+    ///
+    /// WHY IT EXISTS AS A SEPARATE WITNESS. Each window already prints its own verdict, and each of
+    /// those is honest about ONE window — which is exactly the reading that misled Boot AS, where
+    /// the same boot produced `considered=0` and `considered=2 matched=1` five hundred milliseconds
+    /// apart. The question a capture must be able to answer is about the SEQUENCE: did this radio
+    /// ever demodulate anything, and how long did it listen before saying no.
+    ///
+    /// THE DISCRIMINATION IT IS BUILT FOR, and the thing that makes it falsifiable: a RECEIVE
+    /// DEFICIT and a QUIET ROOM produce different totals. Zero reports across every window means
+    /// the radio heard nothing from ANY device for the whole listen — on a bench with any live BLE
+    /// device present that indicts the receive path. A nonzero report total with no match means the
+    /// receiver demonstrably works and the target specifically was not there (or not connectable);
+    /// no amount of extra listening would be the fix, and this line says so rather than inviting
+    /// another window. Neither verdict can be produced by the retry logic itself: both are read off
+    /// counts the drain collected before any retry decision was made.
+    #[cfg(feature = "bt")]
+    fn bt_l2_repeat_summary(
+        &self,
+        rounds: &[BtScanRound],
+        peer: Option<([u8; 6], u8)>,
+        halted: bool,
+    ) {
+        let mut total_reports = 0u32;
+        let mut total_considered = 0u32;
+        let mut total_matched = 0u32;
+        let mut total_ms = 0u64;
+        let mut max_devices = 0u32;
+        for r in rounds.iter() {
+            total_reports = total_reports.saturating_add(r.reports);
+            total_considered = total_considered.saturating_add(r.considered);
+            total_matched = total_matched.saturating_add(r.matched);
+            total_ms = total_ms.saturating_add(r.elapsed_ms);
+            if r.devices > max_devices {
+                max_devices = r.devices;
+            }
+        }
+        // THE UNCALIBRATED SIGNATURE, carried through instead of printed as a measurement. With
+        // `tsc_hz() == 0` every window's `elapsed` is 0 (the rollups read `window=0ms`), so the sum
+        // is 0 — and `listened=0ms(MEASURED)` over windows that demonstrably ran is a lie of
+        // exactly the kind these witnesses exist to prevent. Windows that ran with a zero sum can
+        // only mean the clock, never the listening.
+        let uncalibrated = total_ms == 0 && !rounds.is_empty();
+        serial_print!(
+            ":: bt-l2: [{}] LE repeat-scan summary — windows_run={}/{} window_nominal={}ms listened={}ms{} per_window[attempt reports/devices/considered/matched]=",
+            self.idx, rounds.len(), BT_L2_SCAN_ATTEMPTS, BT_L2_SCAN_MS, total_ms,
+            if uncalibrated {
+                "(TSC UNCALIBRATED — this zero is the CLOCK, not the listening: tsc_hz()==0, so every window above also reads window=0ms and each ran on the fixed cycle-count fallback instead of a wall-clock budget. No duration on this line may be read as milliseconds)"
+            } else {
+                "(MEASURED, sum of the windows; the serial gaps between them are NOT listening and are NOT counted)"
+            }
+        );
+        for (i, r) in rounds.iter().enumerate() {
+            serial_print!(
+                "[{} {}/{}/{}/{}]",
+                i + 1, r.reports, r.devices, r.considered, r.matched
+            );
+        }
+        serial_println!(
+            " totals reports={} considered={} matched={} max_devices_in_a_window={} -> {} == witness ::",
+            total_reports, total_considered, total_matched, max_devices,
+            if halted {
+                "ENDED EARLY — the event endpoint halted, so the remaining windows were never run. Every count above is evidence about the ENDPOINT's lifetime, not about the air, and no absence may be concluded from this run"
+            } else if peer.is_some() {
+                if rounds.len() > 1 {
+                    "PEER SELECTED, AND NOT ON THE FIRST WINDOW — the earlier window(s) heard nothing that matched. A single window would have MISSED this device on this boot, which is the receive-depth claim measured rather than argued"
+                } else {
+                    "PEER SELECTED ON THE FIRST WINDOW — no retry was needed and none was spent"
+                }
+            } else if total_reports == 0 {
+                "NO PEER, AND NOTHING WAS DEMODULATED AT ALL: zero advertising PDUs from ANY device across every window. In a room with any live BLE device this indicts the RECEIVE PATH (or a scan that is not really running); in a genuinely empty room it is the correct answer. The per-window rollups above are how those two are told apart, and this run cannot distinguish them on its own — it can only report that the whole listen, not one unlucky window, was silent"
+            } else {
+                "NO PEER, BUT THE RECEIVER DEMONSTRABLY WORKS: advertising PDUs were demodulated from other devices across these windows, so silence on the wire is NOT the explanation and more windows are not the fix. The target was absent, not advertising connectably, or too weak to demodulate — its own per-window verdict above says which of those the table can support"
+            }
+        );
     }
 
     /// BT-L0 — build + link the periodic QH for the HCI event endpoint. Same QH shape and same
