@@ -609,38 +609,42 @@ fn present_rows(win: u64, y0: u32, y1: u32) -> u64 {
 type Fx = i32;
 const ONE: Fx = 1 << 16;
 
-/// sin(theta) in Q16.16, theta in brads (256 brads = one turn). Verbatim from vug.rs::SIN.
-static SIN: [Fx; 256] = [
-    0, 1608, 3216, 4821, 6424, 8022, 9616, 11204, 12785, 14359, 15924, 17479, 19024, 20557, 22078,
-    23586, 25080, 26558, 28020, 29466, 30893, 32303, 33692, 35062, 36410, 37736, 39040, 40320,
-    41576, 42806, 44011, 45190, 46341, 47464, 48559, 49624, 50660, 51665, 52639, 53581, 54491,
-    55368, 56212, 57022, 57798, 58538, 59244, 59914, 60547, 61145, 61705, 62228, 62714, 63162,
-    63572, 63944, 64277, 64571, 64827, 65043, 65220, 65358, 65457, 65516, 65536, 65516, 65457,
-    65358, 65220, 65043, 64827, 64571, 64277, 63944, 63572, 63162, 62714, 62228, 61705, 61145,
-    60547, 59914, 59244, 58538, 57798, 57022, 56212, 55368, 54491, 53581, 52639, 51665, 50660,
-    49624, 48559, 47464, 46341, 45190, 44011, 42806, 41576, 40320, 39040, 37736, 36410, 35062,
-    33692, 32303, 30893, 29466, 28020, 26558, 25080, 23586, 22078, 20557, 19024, 17479, 15924,
-    14359, 12785, 11204, 9616, 8022, 6424, 4821, 3216, 1608, 0, -1608, -3216, -4821, -6424, -8022,
-    -9616, -11204, -12785, -14359, -15924, -17479, -19024, -20557, -22078, -23586, -25080, -26558,
-    -28020, -29466, -30893, -32303, -33692, -35062, -36410, -37736, -39040, -40320, -41576, -42806,
-    -44011, -45190, -46341, -47464, -48559, -49624, -50660, -51665, -52639, -53581, -54491, -55368,
-    -56212, -57022, -57798, -58538, -59244, -59914, -60547, -61145, -61705, -62228, -62714, -63162,
-    -63572, -63944, -64277, -64571, -64827, -65043, -65220, -65358, -65457, -65516, -65536, -65516,
-    -65457, -65358, -65220, -65043, -64827, -64571, -64277, -63944, -63572, -63162, -62714, -62228,
-    -61705, -61145, -60547, -59914, -59244, -58538, -57798, -57022, -56212, -55368, -54491, -53581,
-    -52639, -51665, -50660, -49624, -48559, -47464, -46341, -45190, -44011, -42806, -41576, -40320,
-    -39040, -37736, -36410, -35062, -33692, -32303, -30893, -29466, -28020, -26558, -25080, -23586,
-    -22078, -20557, -19024, -17479, -15924, -14359, -12785, -11204, -9616, -8022, -6424, -4821,
-    -3216, -1608,
+/// VUGSCENE — the sine table, as a QUARTER TURN. `SIN[0..64]` (0..89 degrees) verbatim from the 256-entry
+/// table this replaces; the other three quadrants are reconstructed by [`fsin`] from the two symmetries
+/// `sin(180-x) = sin(x)` and `sin(180+x) = -sin(x)`, which are EXACT on this table (verified entry by
+/// entry against the full 256 before the trim — every one of the 256 reconstructions is bit-identical, so
+/// the deterministic auto path's 300-frame checksum is untouched by construction). Entries are `u16`,
+/// which every one of them fits; the 65th, sin(90) == 1.0 == 0x10000, is the one value that does not and
+/// is returned by the branch in [`fsin`] instead of costing the table a 32-bit element width.
+///
+/// WHY: `.rodata` lives in the `.text` segment here, and this program links against a HARD `.text` ceiling
+/// of 0x2000 (see the SIZE note above `futex_wait`) — one byte past it and `.bss` moves a page, the image
+/// grows 4096 bytes in one step, and `arroyo` rejects it. The full table was 1024 of those bytes for 256
+/// entries of which only 65 are independent. This is 260, and the ~764 bytes it returns are what paid for
+/// the solid-shard renderer below.
+static SIN: [u16; 64] = [
+    0, 1608, 3216, 4821, 6424, 8022, 9616, 11204, 12785, 14359,
+    15924, 17479, 19024, 20557, 22078, 23586, 25080, 26558, 28020, 29466,
+    30893, 32303, 33692, 35062, 36410, 37736, 39040, 40320, 41576, 42806,
+    44011, 45190, 46341, 47464, 48559, 49624, 50660, 51665, 52639, 53581,
+    54491, 55368, 56212, 57022, 57798, 58538, 59244, 59914, 60547, 61145,
+    61705, 62228, 62714, 63162, 63572, 63944, 64277, 64571, 64827, 65043,
+    65220, 65358, 65457, 65516,
 ];
 
-#[inline(always)]
+/// sin(theta) in Q16.16, theta in brads, reconstructed from the quarter table. Bit-identical to the old
+/// 256-entry lookup for every one of the 256 inputs.
+#[inline(never)]
 fn fsin(brad: i32) -> Fx {
-    SIN[(brad & 0xFF) as usize]
+    let i = (brad & 0xFF) as usize;
+    let (j, neg) = if i < 128 { (i, false) } else { (i - 128, true) };
+    let j = if j > 64 { 128 - j } else { j };
+    let v = if j == 64 { ONE } else { SIN[j] as Fx };
+    if neg { -v } else { v }
 }
 #[inline(always)]
 fn fcos(brad: i32) -> Fx {
-    SIN[((brad + 64) & 0xFF) as usize]
+    fsin(brad + 64)
 }
 #[inline(always)]
 fn fmul(a: Fx, b: Fx) -> Fx {
@@ -674,6 +678,292 @@ fn crystal_vertices() -> [(Fx, Fx, Fx); 14] {
     }
     v[13] = (0, -APEX, 0); // bottom apex
     v
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// VUGSCENE — THE SHARD, AS REAL 3D GEOMETRY.
+//
+// Peter's ruling on metal: a lone vug reads 999 fps because its drawing is trivial — "make the damn
+// drawing more complex instead of pacing". Nothing here paces anything. There is no sleep, no frame
+// budget and no rate target in this program, and this arc adds none; what it adds is WORK, so that the
+// number the meter reports is the honest rate of a frame that costs something.
+//
+// WHY A SHARD AND NOT A CUBE OR A TORUS: the machine is a SHARD and the crystal is its mark — the menu
+// bar draws the same gem at 16x22 (`video/menubar.rs::crystal_facet`). This renderer's palette is READ
+// FROM THAT MARK: `theme::CONTROL_CLOSE` (0x3D5F92) is the facet in shadow, `theme::CONTROL_ZOOM`
+// (0x92AAC9) the facet in full light, and `CONTROL_MID` falls out of the interpolation between them. The
+// crystal on a vug window and the crystal in the menu bar are the same object family by construction.
+//
+// WHAT IT DRAWS. An elongated hexagonal bipyramid with IRREGULAR facets — the six girdle radii differ and
+// the two apexes are asymmetric, so it reads as a broken shard rather than a jeweller's stone. 18 facets,
+// one orbiting light, FLAT per-facet shading (the facet is the unit of shading — crisp planes, no
+// smoothing, the low-poly look the ruling asked for) with a hard specular kick as a facet sweeps past the
+// light angle.
+//
+// HOW IT IS RENDERED, AND WHY THIS METHOD. The shard is a CONVEX solid, so it is exactly the intersection
+// of 18 half-spaces — and that representation is the whole renderer:
+//
+//   * THE SOLID IS ITS OWN GEOMETRY. [`PN`]/[`PD`] are the 18 outward unit normals and plane offsets,
+//     derived offline from the shard's 14 vertices and verified to bound every one of them. There is no
+//     vertex list, no face list, no projection and no per-frame setup beyond 18 dot products.
+//   * EACH SAMPLE IS A RAY. [`trace`] clips the sample's ray against the 18 slabs and keeps the last plane
+//     it entered through — the standard analytic ray/convex-polyhedron intersection. The answer is EXACT
+//     hidden-surface removal, which is what convexity buys: no z-buffer (there is no memory for one — a
+//     128x128 depth buffer is 32 KiB against a 16 KiB user window) and no depth sort.
+//   * THE COST IS REAL AND IT IS THE POINT. 18 planes x (one dot product plus one division) per sample is
+//     genuine rendering arithmetic, not padding, and it is where the honest frame time comes from.
+//
+// THE LADDER IS RAY DENSITY. Level 1 casts one ray per 4x4 cell of pixels and fills the cell; level 2 one
+// per 2x2; level 3 one per pixel. Cost scales 1:4:16, which is the range an adaptive ladder needs, and the
+// top rung is real quality rather than invented cost: the compositor UPSCALES this 128x128 surface onto a
+// 1920x1200 panel, so every facet edge is magnified and a resolved edge is the difference the eye sees.
+//
+// THE FLOOR RUNG IS THE CLASSIC WIREFRAME, byte for byte — level 0 is [`render_wire`], the program's
+// original drawing, unmoved and unedited. That keeps the old fps baselines comparable, and it is what the
+// deterministic auto path renders (it is PINNED to level 0 — see `_start`), so the 300-frame surface
+// checksum 0xe68285b85121ac7c that `scripts/specs/pi4-regression.spec` asserts is untouched.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+const NP: usize = 18;
+
+/// The shard, as 18 outward-facing half-spaces: a point is inside iff `dot(PN[i], p) <= PD[i]` for every
+/// `i`. Six crown facets, six girdle facets, six pavilion facets.
+///
+/// GENERATED, NOT HAND-WRITTEN. The numbers come from the 14-vertex shard (an elongated hexagonal
+/// bipyramid with per-girdle-vertex radius scales `[64, 50, 70, 55, 74, 58]/64` and a bottom apex at 0.62
+/// of the top one) by cross-producting each facet's edges and normalising; every one of the 14 vertices
+/// then satisfies every one of the 18 inequalities to within rounding, which is the check that the table
+/// really does describe a closed convex solid. Anyone changing the shard regenerates BOTH tables and
+/// re-runs that check — a table that does not bound the solid makes [`trace`] return nonsense rather than
+/// fail, which is the failure mode worth being loud about.
+///
+/// Normals are Q0.15 (`i16`, 1.0 == 32767) purely for `.text`: `.rodata` lives in the text segment and
+/// this program links against a hard 0x2000 ceiling (see the SIZE note above `futex_wait`). [`pn`]
+/// widens them back to Q16.16 at the one place they are read.
+static PN: [i16; NP * 3] = [
+    19952, 18778, 17971, 7397, 19036, 25624, -24678, 19960, 8142,
+    -24890, 20132, -6991, 5230, 20633, -24912, 21278, 20027, -14827,
+    24347, 0, 21930, 9088, 0, 31481, -31117, 0, 10267,
+    -31546, 0, -8861, 6733, 0, -32068, 26884, 0, -18733,
+    12007, -28505, 10815, 4413, -28645, 15287, -14272, -29117, 4709,
+    -14313, -29200, -4020, 2958, -29435, -14090, 12279, -29150, -8556,
+];
+/// Plane offsets in Q16.16, one per normal above. `u16`, which every one of them fits — see [`PN`]
+/// for why a table in this program is measured in bytes.
+static PD: [u16; NP] = [
+    50703, 51399, 53894, 54358, 55710, 54074, 38956, 39760, 42788,
+    43378, 45152, 43016, 47718, 47952, 48743, 48882, 49275, 48797,
+];
+
+/// Facet `i`'s outward unit normal, widened from Q0.15 to Q16.16.
+#[inline(always)]
+fn pn(i: usize) -> (Fx, Fx, Fx) {
+    // UNCHECKED: `i < NP` at every call site and the table is `NP * 3` long. This is read 18 times per
+    // traced ray, so the bounds checks would be both the innermost branch in the program and `.text` the
+    // 0x2000 ceiling has no room for.
+    unsafe {
+        let p = PN.as_ptr().add(i * 3);
+        ((*p as Fx) << 1, (*p.add(1) as Fx) << 1, (*p.add(2) as Fx) << 1)
+    }
+}
+
+/// The detail ladder's top rung. Level 0 is the classic wireframe; 1..=3 are the shard at rising ray
+/// density (see [`LOD_BLK`]).
+const LOD_MAX: u32 = 3;
+/// Pixels per traced CELL at level `lod`: `1 << (LOD_MAX - lod)`, so level 1 casts one ray per 4x4 cell
+/// and fills it, level 2 one per 2x2, level 3 one per pixel. Cost scales 1:4:16. Every value divides 64
+/// (the worker band height) and 128 (the surface width), so a cell never straddles a band boundary or the
+/// right edge.
+#[inline(always)]
+fn lod_blk(lod: u32) -> i32 {
+    1 << (LOD_MAX - lod)
+}
+
+/// How much larger the shard is drawn than the wireframe's inherited framing — see [`scene_setup`].
+const SCENE_ZOOM: Fx = 2;
+
+/// The gem ramp, read from the menu bar's crystal — `theme::CONTROL_CLOSE` to `theme::CONTROL_ZOOM`.
+static GEM: [(i32, i32); 3] = [(0x3D, 0x92), (0x5F, 0xAA), (0x92, 0xC9)];
+
+/// Per-frame, per-facet state published by the parent and read by the workers: the plane's offset measured
+/// from THIS frame's eye (the numerator [`trace`] needs), and the facet's shaded colour ALREADY PACKED as
+/// the pixel the surface wants, so a traced cell is one load and one store.
+static mut FC: [Fx; NP] = [0; NP];
+static mut FCOL: [u32; NP] = [0; NP];
+/// The frame's ray basis in the SHARD's own frame — the object-space images of the world x, y and z axes —
+/// and the image-plane distance. Published with the same release/acquire edge on `PHASE` that already
+/// publishes `PX`/`PY`, so a worker that has acquired the frame has acquired these too.
+static mut RB: [(Fx, Fx, Fx); 3] = [(0, 0, 0); 3];
+static mut RDZ: Fx = 0;
+/// The detail level the workers must render THIS frame.
+static LOD: AtomicU32 = AtomicU32::new(0);
+
+/// Apply the INVERSE of the frame's rotation to `v` — the transpose of `Rx(ax) * Ry(ay)`, which carries a
+/// world-space direction into the shard's own frame.
+///
+/// Doing it this way round is the arc's central economy: the shard never moves. Three basis vectors and
+/// one eye per frame put the whole scene in object space, where the 18 planes are CONSTANTS — so a frame
+/// costs 18 dot products of setup rather than a transform per facet, and the ray loop reads a static table.
+#[inline(always)]
+fn inv_rot(v: (Fx, Fx, Fx), sy: Fx, cy: Fx, sx: Fx, cx: Fx) -> (Fx, Fx, Fx) {
+    let (x, y, z) = v;
+    let y1 = fmul(y, cx) + fmul(z, sx);
+    let z1 = fmul(z, cx) - fmul(y, sx);
+    (fmul(x, cy) + fmul(z1, sy), y1, fmul(z1, cy) - fmul(x, sy))
+}
+
+#[inline(always)]
+fn dot3(a: (Fx, Fx, Fx), b: (Fx, Fx, Fx)) -> Fx {
+    fmul(a.0, b.0) + fmul(a.1, b.1) + fmul(a.2, b.2)
+}
+
+/// Per frame, in the PARENT, before the workers are released: build the ray basis, then shade all 18
+/// facets against the orbiting light.
+///
+/// `lt` is the light's orbit angle in brads, advanced once per frame by the caller so a glint SWEEPS
+/// across the facets rather than sitting wherever the tumble happens to leave it. Frame-based like the
+/// idle tumble, so it needs no clock and cannot drift against the picture.
+#[inline(never)]
+fn scene_setup(ay: i32, ax: i32, dist: Fx, lt: i32) {
+    let (sy, cy) = (fsin(ay), fcos(ay));
+    let (sx, cx) = (fsin(ax), fcos(ax));
+    // The eye sits at world (0, 0, -dist) — the same camera the wireframe projection uses.
+    let eye = inv_rot((0, 0, -dist), sy, cy, sx, cx);
+    // The light rides a tilted orbit; the constants are the unit form of (sin, 0.5, cos), whose length is
+    // 1.118 — so 0.894 and 0.447 in Q16.16.
+    let lo = inv_rot(
+        (fmul(fsin(lt), 58598), 29294, fmul(fcos(lt), 58598)),
+        sy, cy, sx, cx,
+    );
+    unsafe {
+        let rb = &mut *core::ptr::addr_of_mut!(RB);
+        rb[0] = inv_rot((ONE, 0, 0), sy, cy, sx, cx);
+        rb[1] = inv_rot((0, ONE, 0), sy, cy, sx, cx);
+        rb[2] = inv_rot((0, 0, ONE), sy, cy, sx, cx);
+        // The image plane, in the same "pixel" units the wireframe projection uses — `FOCAL * dist` is
+        // exactly that path's scale, and SCENE_ZOOM is the one place the two differ.
+        //
+        // WHY THEY DIFFER. The wireframe's framing was inherited from a 32x32 compat surface and leaves the
+        // crystal occupying about 40x48 px of 128x128 — eight per cent of the surface, which is the right
+        // choice for an outline (the lines are the picture, and they need room to read) and the wrong one
+        // for a solid the compositor is about to blow up onto a 1920x1200 panel. The shard is drawn at
+        // SCENE_ZOOM so it fills its window: more of the frame is the object, which is both the deliberate
+        // look and, not incidentally, more rays that hit something.
+        RDZ = FOCAL * SCENE_ZOOM * dist;
+        let mut i = 0usize;
+        while i < NP {
+            let n = pn(i);
+            *(&mut *core::ptr::addr_of_mut!(FC)).get_unchecked_mut(i) = *PD.get_unchecked(i) as Fx - dot3(n, eye);
+            // Lambert against the orbiting light, plus a hard specular kick: the top half of the diffuse
+            // range remapped to 0..1 and raised to the fourth power, so a facet glints only as it sweeps
+            // through the light and the glint has an edge rather than a bloom.
+            let diff = dot3(n, lo).clamp(0, ONE);
+            let t = (diff - ONE / 2).max(0) * 2;
+            let t2 = fmul(t, t);
+            let spec = fmul(t2, t2);
+            let mut c: u32 = 0xFF;
+            let mut k = 0usize;
+            while k < 3 {
+                let (a, b) = *GEM.get_unchecked(k);
+                let v = a + (((b - a) * diff) >> 16);
+                c = (c << 8) | (v + (((255 - v) * spec) >> 16)) as u32;
+                k += 1;
+            }
+            *(&mut *core::ptr::addr_of_mut!(FCOL)).get_unchecked_mut(i) = c;
+            i += 1;
+        }
+    }
+}
+
+/// Trace one ray against the shard. `d` is the ray direction in the shard's own frame, unnormalised — the
+/// slab test is scale-invariant, which is why nothing here needs a square root. Returns the facet index
+/// hit, or `NP` for a miss.
+///
+/// Slab clipping: for each plane, `t = (PD - dot(n, eye)) / dot(n, d)`, with the numerator already folded
+/// into `FC` by [`scene_setup`]. A negative denominator means the ray is ENTERING that half-space, so its
+/// `t` is a lower bound and the LAST such plane is the surface the ray meets; a positive one is an upper
+/// bound. The ray misses when the bounds cross. A denominator near zero is a ray parallel to the plane —
+/// a miss outright if the eye is on the outside of it, ignorable otherwise.
+///
+/// `t` is formed with a 24-bit shift rather than 16: the comparisons are what decide which facet a pixel
+/// belongs to, and at 16 bits the quotient lands around 1e3, which is not enough resolution to separate
+/// two nearly-tangent planes at a silhouette.
+#[inline(never)]
+unsafe fn trace(d: (Fx, Fx, Fx)) -> usize {
+    let fc = &*core::ptr::addr_of!(FC);
+    let mut tn: i64 = i64::MIN / 4;
+    let mut tf: i64 = i64::MAX / 4;
+    let mut hit = NP;
+    let mut i = 0usize;
+    while i < NP {
+        let den = dot3(pn(i), d);
+        let num = *fc.get_unchecked(i);
+        if den > -16 && den < 16 {
+            if num < 0 {
+                return NP; // parallel, and the eye is outside this plane — the ray never enters
+            }
+        } else {
+            let t = ((num as i64) << 24) / den as i64;
+            if den < 0 {
+                if t > tn {
+                    tn = t;
+                    hit = i;
+                }
+            } else if t < tf {
+                tf = t;
+            }
+        }
+        i += 1;
+    }
+    // Crossed bounds mean the ray passes outside the solid; `tn <= 0` means the solid is behind the eye.
+    // Both are tested ONCE, after the loop: an early exit inside it would put a branch under every plane
+    // of every ray to save arithmetic on the rays that miss, which is the wrong trade in both directions.
+    if tn > tf || tn <= 0 {
+        return NP;
+    }
+    hit
+}
+
+/// Render one worker's band of the SOLID shard at detail level `lod` (1..=`LOD_MAX`).
+///
+/// One pass, no clear: every traced cell is either shard or backdrop, and a cell is filled with the one
+/// colour its ray returned.
+unsafe fn render_solid(surf: *mut u8, y_lo: i32, y_hi: i32, lod: u32) {
+    let blk = lod_blk(lod);
+    let half = blk * (ONE / 2); // the cell's centre, in Q16.16 pixels
+    let rb = &*core::ptr::addr_of!(RB);
+    let (ux, uy, uz) = (rb[0], rb[1], rb[2]);
+    let dz = RDZ;
+    let fcol = &*core::ptr::addr_of!(FCOL);
+    let mut by = y_lo;
+    while by < y_hi {
+        let py = SH * ONE / 2 - (by * ONE + half);
+        let mut bx = 0i32;
+        while bx < SW {
+            let px = bx * ONE + half - SW * ONE / 2;
+            // The world-space ray through this cell's centre, carried into the shard's frame by the
+            // published basis. Unnormalised on purpose — the slab test is scale-invariant.
+            let d = (
+                fmul(px, ux.0) + fmul(py, uy.0) + fmul(dz, uz.0),
+                fmul(px, ux.1) + fmul(py, uy.1) + fmul(dz, uz.1),
+                fmul(px, ux.2) + fmul(py, uy.2) + fmul(dz, uz.2),
+            );
+            let h = trace(d);
+            let c = if h < NP { *fcol.get_unchecked(h) } else { BG };
+            let mut fy = by;
+            while fy < by + blk {
+                let row = surf.add((fy as usize) * STRIDE) as *mut u32;
+                let mut fx = bx;
+                while fx < bx + blk {
+                    row.add(fx as usize).write_volatile(c);
+                    fx += 1;
+                }
+                fy += 1;
+            }
+            bx += blk;
+        }
+        by += blk;
+    }
 }
 
 /// The 30 wireframe edges (vertex index pairs).
@@ -832,9 +1122,23 @@ unsafe fn draw_line(surf: *mut u8, mut x0: i32, mut y0: i32, x1: i32, y1: i32, y
     }
 }
 
+/// Render one worker's band for a frame, at whatever detail level the parent published for it.
+///
+/// VUGSCENE: the dispatch is the WHOLE of the ladder as far as a worker is concerned — level 0 is the
+/// classic wireframe (below, unchanged), every other level is the solid shard. Read once per band, so a
+/// level change lands on a frame boundary and never inside one.
+unsafe fn render_band(surf: *mut u8, y_lo: i32, y_hi: i32) {
+    let lod = LOD.load(Ordering::Acquire);
+    if lod > 0 {
+        render_solid(surf, y_lo, y_hi, lod);
+        return;
+    }
+    render_wire(surf, y_lo, y_hi)
+}
+
 /// Render one worker's band for a frame: clear the band to BG, then draw every crystal edge clipped to
 /// the band from the shared projected coordinates.
-unsafe fn render_band(surf: *mut u8, y_lo: i32, y_hi: i32) {
+unsafe fn render_wire(surf: *mut u8, y_lo: i32, y_hi: i32) {
     // Clear the band.
     let mut y = y_lo;
     while y < y_hi {
@@ -1332,6 +1636,79 @@ const FPS_BOX_W: i32 = 3 * 6 + 3;
 const CLICK_X: i32 = FPS_BOX_W + 3;
 /// CLICK-PLAIN: click-counter digits — cool cyan, so the two numbers in the corner never read as one.
 const CLICK_C: u32 = 0xFF6C_D8E8;
+/// VUGSCENE: the detail-level readout sits third in the same band, in the gem ramp's lit tone — the
+/// number belongs to the crystal, so it is drawn in the crystal's colour.
+const LOD_X: i32 = CLICK_X + FPS_BOX_W + 3;
+const LOD_C: u32 = 0xFF92_AAC9;
+
+// ---------------------------------------------------------------------------------------------
+// VUGSCENE — THE ADAPTIVE DETAIL LADDER.
+//
+// The ruling: full scene on a machine that can carry it, stepped down on one that cannot, the classic
+// cheap pattern as the floor. Adaptation changes WORK PER FRAME and never the rate — there is no sleep
+// anywhere in this program and this arc adds none. The rate is whatever the chosen work costs.
+//
+// THE CLOCK IS THE METER'S OWN. `fps_refresh` already closes a one-second window off `SYS_GETINFO`'s tick
+// field (the only ring-3-reachable clock on either arch) and returns frames-per-second; the ladder
+// consumes exactly that number, on exactly that window, and adds NO syscall and no second time source.
+// That also means the meter contract is untouched: the ladder reads the meter, it does not write it.
+//
+// HYSTERESIS, in two parts, because one is not enough:
+//   * A DEAD BAND. Step down below `LOD_DOWN`, step up only above `LOD_UP`, and the gap between them is
+//     wide enough that no single level can sit on both edges.
+//   * A CEILING WITH A COOL-DOWN. A step down PINS the ceiling at the level it fell to, so the ladder
+//     cannot immediately climb back into the level that just failed and oscillate there. The ceiling
+//     relaxes by one rung only after `CALM_WINDOWS` consecutive quiet seconds — long enough that a
+//     recovery is a real change in the machine and not the gap between two frames.
+// A machine that is far too slow drops TWO rungs in one window (levels cost ~L^2, so one rung at a time
+// would crawl), which is what keeps the calibration inside the couple of seconds the ruling asked for.
+const LOD_DOWN: u32 = 24;
+const LOD_UP: u32 = 55;
+const CALM_WINDOWS: u32 = 8;
+
+/// VUGSCENE — THE MANUAL PIN, for benchmarking, and the reason it is a BUILD feature rather than a flag.
+///
+/// `bg`/`run` take a path and nothing else (`shell.rs`: `match args.first()`), so there is no argv channel
+/// into an EL0 program on either arch — a runtime flag would have had to invent one. The pin is therefore
+/// a cargo feature, and `arroyo` builds the same source three times into three staged images:
+///
+///   * `VUG.ELF`  — no feature: the ADAPTIVE ladder. The default, and what the desktop launches.
+///   * `VUGC.ELF` — `pinlo`:  level 0 forever, i.e. the CLASSIC pattern, byte-honest, for a slow machine
+///                  and for keeping old fps baselines comparable.
+///   * `VUGX.ELF` — `pinhi`:  level `LOD_MAX` forever — the full scene, no adaptation, for measuring the
+///                  heaviest frame this program can draw.
+///
+/// A pin never reaches the deterministic auto path: `_start` forces level 0 whenever the overlay is off,
+/// which is exactly the foreground/no-input path the 300-frame checksum witness runs on, so all three
+/// images produce checksum 0xe68285b85121ac7c on the fixture legs.
+#[cfg(feature = "pinlo")]
+const LOD_PIN: Option<u32> = Some(0);
+#[cfg(feature = "pinhi")]
+const LOD_PIN: Option<u32> = Some(LOD_MAX);
+#[cfg(not(any(feature = "pinlo", feature = "pinhi")))]
+const LOD_PIN: Option<u32> = None;
+
+/// One window's worth of adaptation. `ceil` and `calm` are the hysteresis state; the return is the level
+/// the NEXT frame renders at.
+fn lod_adapt(lod: u32, rate: u32, ceil: &mut u32, calm: &mut u32) -> u32 {
+    if rate < LOD_DOWN && lod > 0 {
+        let d = if rate * 4 < LOD_DOWN { 2 } else { 1 };
+        let nl = lod - d.min(lod);
+        *ceil = nl;
+        *calm = 0;
+        return nl;
+    }
+    if rate > LOD_UP && lod < *ceil {
+        *calm = 0;
+        return lod + 1;
+    }
+    *calm += 1;
+    if *calm >= CALM_WINDOWS && *ceil < LOD_MAX {
+        *ceil += 1;
+        *calm = 0;
+    }
+    lod
+}
 
 /// FBCON-DMG: the exact SOURCE rows `draw_hud` touches — the half-open band `[HUD_Y0, HUD_Y1)`.
 ///
@@ -1433,9 +1810,15 @@ fn emit(label: &[u8], v: u32, tail: &[u8]) {
 /// A wrapper rather than two calls at each site, and that is a SIZE decision (see the SIZE note): the
 /// overlay is drawn from two places, and hoisting the pair behind one two-argument call removes a whole
 /// set of argument setup (offset + colour, twice) from each of them.
-unsafe fn draw_hud(surf: *mut u8, fps: u32, clicks: u32) {
+unsafe fn draw_hud(surf: *mut u8, fps: u32, clicks: u32, lod: u32) {
     draw_num(surf, fps, 0, FPS_C);
     draw_num(surf, clicks, CLICK_X, CLICK_C);
+    // VUGSCENE: the third readout is the DETAIL LEVEL the ladder settled on. It is on the panel and not
+    // only on the wire because "which level did that boot run at?" is a question an operator asks while
+    // looking at the window, and a level the eye can read is what makes an fps number interpretable.
+    // PINNED builds draw it in the gloss white the theme reserves for a highlight, so a pinned run is
+    // never mistaken for an adaptive one that happened to settle there.
+    draw_num(surf, lod, LOD_X, if LOD_PIN.is_some() { 0xFFFF_FFFF } else { LOD_C });
 }
 
 /// Fold the kernel tick clock into the displayed fps, refreshing at most once per second. `ticks`/`mark`
@@ -1710,6 +2093,17 @@ pub extern "C" fn _start() -> ! {
     }
 
     let vbase = crystal_vertices();
+    // VUGSCENE: the shard's own geometry, and the facet normals derived from it. Both are start-up work —
+    // the 24 square roots run once, here, and never inside a frame.
+    // VUGSCENE ladder state. It starts at the TOP rung and falls: an optimistic start means a machine that
+    // can carry the full scene never spends a window climbing to it, and a machine that cannot is measured
+    // and stepped down inside the first second or two.
+    let mut lod: u32 = LOD_PIN.unwrap_or(LOD_MAX);
+    let mut lod_ceil: u32 = LOD_MAX;
+    let mut lod_calm: u32 = 0;
+    // The light's own orbit angle, advanced per frame so a glint SWEEPS across the facets rather than
+    // sitting wherever the tumble happens to put it. Frame-based like the tumble, so it needs no clock.
+    let mut lt: i32 = 0;
 
     // Interactive/auto state.
     let mut ay: i32 = 0;
@@ -1946,7 +2340,7 @@ pub extern "C" fn _start() -> ! {
                 let v = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame, win as u32);
                 if v != fps || fi.clicks > 0 {
                     fps = v;
-                    unsafe { draw_hud(surf, fps, clicks) };
+                    unsafe { draw_hud(surf, fps, clicks, lod) };
                     // FBCON-DMG: this is the one present in the program whose damage is genuinely a BAND.
                     // Nothing rendered this pass — the frame path did not run — and the only writer since
                     // the last present was `draw_hud` immediately above, whose extent is `[HUD_Y0, HUD_Y1)`
@@ -1985,7 +2379,21 @@ pub extern "C" fn _start() -> ! {
         // VUGGUARD: the release is conditional on there being someone to release. With `live == 0` the
         // phase word is nobody's signal, and storing to it would be the only remaining way for this
         // program to advertise a frame it is rendering entirely by itself.
-        project(&vbase, ay, ax, dist);
+        // VUGSCENE: the level THIS frame renders at, decided here and published before the release store
+        // so every worker and the parent's inline raster agree on it.
+        //
+        // `overlay` is the gate, and it is the SAME predicate that already gates the fps overlay, for the
+        // same reason: the foreground/no-input path is the deterministic auto path, and its 300-frame
+        // surface checksum (0xe68285b85121ac7c, asserted by `pi4-regression.spec`) is a fact about the
+        // classic wireframe. Forcing level 0 there keeps that byte-identical on every build, pinned or not.
+        let flod = if overlay { lod } else { 0 };
+        LOD.store(flod, Ordering::Release);
+        lt = (lt + 2) & 0xFF;
+        if flod > 0 {
+            scene_setup(ay, ax, dist, lt);
+        } else {
+            project(&vbase, ay, ax, dist);
+        }
         if live > 0 {
             DONE.store(0, Ordering::Relaxed);
             PHASE.store(frame + 1, Ordering::Release); // 1-based; never PHASE_EXIT (frame < cap)
@@ -2094,8 +2502,22 @@ pub extern "C" fn _start() -> ! {
         // box — one more readout, drawn every frame the fps readout is, so an ack is on the panel within
         // one frame of the click that earned it.
         if overlay {
+            // VUGSCENE: a closed measurement window is what the ladder runs on, and `fps_frame` moving is
+            // exactly the signal that one closed — `fps_refresh` re-marks it only when it refreshes. Reading
+            // the mark rather than comparing the returned rate is what makes the trigger correct when a
+            // window happens to close on the same number it opened with.
+            let mark = fps_frame;
             fps = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame, win as u32);
-            unsafe { draw_hud(surf, fps, clicks) };
+            if fps_frame != mark && LOD_PIN.is_none() {
+                let nl = lod_adapt(lod, fps, &mut lod_ceil, &mut lod_calm);
+                if nl != lod {
+                    lod = nl;
+                    // One line per change, and changes are bounded by the ladder itself — this is how a
+                    // boot's level is recovered from a capture rather than inferred from the fps alone.
+                    sayn(b"[vuglod] lvl=", lod * 1000 + fps.min(999));
+                }
+            }
+            unsafe { draw_hud(surf, fps, clicks, flod) };
         }
 
         // --- present ---

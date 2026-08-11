@@ -441,12 +441,24 @@ fn main() {
     // WINX-7: the x86 EL0 mini-vug (crates/user-vug, built by arroyo's build_user_vug_x86 to
     // target/VUG-X86.ELF), staged as VUG.ELF exactly like STAT.ELF above and for the same reasons —
     // un-suffixed on the volume so `bg /fat/VUG.ELF` reads the same on both arches.
-    let vug_elf = target_dir.join("VUG-X86.ELF");
-    if vug_elf.exists() {
-        std::fs::copy(&vug_elf, esp_dir.join("VUG.ELF")).unwrap();
-        println!("   WINX: copied VUG.ELF onto the ESP (bg /fat/VUG.ELF)");
-    } else {
-        println!("   WINX: target/VUG-X86.ELF absent — ESP has no VUG.ELF (run via ./arroyo esp-x86)");
+    //
+    // VUGSCENE: THREE images, not one. `crates/user-vug` is built three times from the same source —
+    // adaptive (VUG.ELF), pinned to the classic wireframe (VUGC.ELF) and pinned to the full shard
+    // (VUGX.ELF) — because `bg`/`run` carry a path and no argv, so a benchmarking pin has nowhere else to
+    // live. All three names are 8.3-clean and go in the FAT root beside STAT.ELF/PULSE.ELF. Absent images
+    // are skipped exactly as the single one always was.
+    for (src, dst) in [
+        ("VUG-X86.ELF", "VUG.ELF"),
+        ("VUGC-X86.ELF", "VUGC.ELF"),
+        ("VUGX-X86.ELF", "VUGX.ELF"),
+    ] {
+        let vug_elf = target_dir.join(src);
+        if vug_elf.exists() {
+            std::fs::copy(&vug_elf, esp_dir.join(dst)).unwrap();
+            println!("   WINX: copied {dst} onto the ESP (bg /fat/{dst})");
+        } else {
+            println!("   WINX: target/{src} absent — ESP has no {dst} (run via ./arroyo esp-x86)");
+        }
     }
 
     // PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse, built by arroyo's build_user_pulse_x86 to
@@ -501,6 +513,10 @@ fn main() {
         (target_dir.join("hello.bin"), "HELLO.BIN"),
         (target_dir.join("STAT-X86.ELF"), "STAT.ELF"),
         (target_dir.join("VUG-X86.ELF"), "VUG.ELF"),
+        // VUGSCENE: the two PINNED vug images ride the data volume too — the pin exists for benchmarking,
+        // and a benchmark that cannot be launched from the volume the kernel actually reads is no pin.
+        (target_dir.join("VUGC-X86.ELF"), "VUGC.ELF"),
+        (target_dir.join("VUGX-X86.ELF"), "VUGX.ELF"),
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
     ] {
         if src.exists() {
