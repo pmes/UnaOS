@@ -709,13 +709,62 @@ static mut PX: [i32; 14] = [0; 14]; // projected pixel X per vertex
 static mut PY: [i32; 14] = [0; 14]; // projected pixel Y per vertex
 
 const PHASE_EXIT: u32 = u32::MAX;
-/// VUGPAUSE-2: `SYS_YIELD` passes a worker spends polling `PHASE` before it parks on it. Sized to be
-/// unreachable on the rendering path — a worker waits one projection plus one present between frames, a
-/// handful of passes even on a loaded machine — and trivially reachable on the idle path, where the parent
-/// stops releasing frames entirely. Erring long is the safe direction: an over-long spin costs an idling
-/// vug a few milliseconds of yielding ONCE per idle interval, while too short a spin puts a park/wake pair
-/// in the middle of every rendered frame, which is the shape that failed the checksum run.
-const WORKER_SPIN_YIELDS: u32 = 4096;
+/// VUGPAUSE-2: `SYS_YIELD` passes a worker spends polling `PHASE` before it parks on it.
+///
+/// ⚠ VUGSPIN — 4096 -> 64 AS WASTE-REMOVAL AND INSTRUMENT HYGIENE. **NOT a frame-rate conviction.**
+///
+/// An earlier draft of this note convicted this loop of causing the 19.6/s frame rate. **That conviction
+/// was WITHDRAWN under review, and the refutation is recorded here rather than deleted**, because the
+/// number that refutes it is the same one that motivates the change.
+///
+/// WHAT IS TRUE — the budget is genuinely wasted. Boot A
+/// (`~/unaos-bench/capture/gr25-bootA/ttyUSB0.log`), summing per-core `sw` deltas in `[schedx86] load`
+/// over one 11.25 s window, gives **1.45 M context switches/s** on eight cores, against `[spread] cr3sw`
+/// of 2 550/s over the same window. Against `[wpace] rollup rate ≈ 450/s` that is ~3 200 switches per
+/// presented frame, i.e. **~1 600 passes of this loop per worker per frame — 39 % of the 4096 budget,
+/// which is never reached, so a worker on the bench NEVER parks here.** The old sizing premise is quoted
+/// verbatim because it is the part that is false: *"a worker waits one projection plus one present
+/// between frames, a handful of passes even on a loaded machine"*. Sixteen hundred is not a handful.
+/// Spinning 1 600 times to wait for an event is waste whether or not it is the bottleneck, and
+/// `SYS_YIELD` is only cheap when the core has nothing else to run.
+///
+/// ⚠ THE ATTRIBUTION IS AN UPPER BOUND, STATED NOT SHOWN. 99.8 % of those switches do not change `cr3`,
+/// which places them inside SOME address space's own threads. That bounds the yield loops as a class; it
+/// does NOT separate this loop from the parent's `BARRIER_SPIN_YIELDS` spin, and nothing in the capture
+/// does. Read "~1 600 per worker per frame" as an upper bound on this loop's share.
+///
+/// WHY IT IS NOT THE FRAME RATE — **the period is LOAD-INVARIANT**, which a congestion collapse cannot be:
+///
+///   * at 43 916 ms: two windows, every core 0–3 %, **~1 980 switches/s** — and `[wcn] win=3` reads
+///     `rate=19.2/s gap=52..52ms`.
+///   * at 804 512 ms: ten windows, cores 60–85 %, **~1.45 M switches/s** — and the same window reads
+///     `rate=19.6/s gap=51..51ms`.
+///
+/// **A 731x change in machine load moved the frame period from 52 ms to 51 ms — it got 2 % FASTER.** A
+/// self-sustaining spin collapse would lengthen the frame as load rose; this does the opposite, and it is
+/// flat to the millisecond across 112 `[wcn]` samples spanning the whole boot. Note also `51 ms / 16 667 us
+/// = 3.06` — three panel frames almost exactly. That is the signature of a CADENCE LOCK in the
+/// present/composite path, not of a scheduler or spin equilibrium. The primary suspect is the compositor:
+/// `[wcn]` shows `comp` far above `att` (win=10: `att=253 comp=1858`, `comp_rate=365/s`), i.e. every
+/// window is recomposited on every other window's present. That investigation is a `wm.rs` arc and is
+/// deliberately NOT attempted here.
+///
+/// So this is sized the way `BARRIER_SPIN_YIELDS` already is — as a LATENCY threshold, not a rate — and
+/// the honest claim for it is: less waste, and an instrument that no longer hides a park behind a budget
+/// too large to reach.
+///
+/// ⚠ WHAT 64 ACTUALLY MEANS ON THE BENCH, SAID PLAINLY. On a 51 ms frame a worker exhausts 64 passes long
+/// before the release arrives, so **every worker now parks and is woken once per frame, BY DESIGN**. That
+/// is the intended trade: two futex round trips per frame instead of ~1 600 yields, on a machine with idle
+/// cores to dispatch to. The "the rendering path never gets past the spin" claim in `uvug_worker` is
+/// therefore **QEMU-SCOPED** from here on — true on an unloaded fixture machine, false on the bench.
+///
+/// WHAT IS DELIBERATELY NOT CHANGED: the spin still EXISTS. `uvug_worker` records that a pure
+/// `futex_wait` here failed the 300-frame checksum run on raspi4b with all three tasks parked at the kill.
+/// That result convicted a BARE park (budget 0), not a small one, and 64 passes keeps the release
+/// direction off the park on any unloaded machine — which is every fixture and battery leg. The checksum
+/// witness passing at 64 is what licenses the value.
+const WORKER_SPIN_YIELDS: u32 = 64;
 /// VUG-PACE: the PARENT's mirror of `WORKER_SPIN_YIELDS` — `SYS_YIELD` passes the frame barrier spends
 /// polling `DONE` before it parks on it. Two orders smaller than the worker's on purpose: this budget is
 /// spent EVERY frame on a healthy run rather than once per idle interval, so it is sized as a latency
@@ -827,6 +876,14 @@ extern "C" fn uvug_worker(arg: usize) -> ! {
         // a worker waits only for the parent's projection and present. The park is reached ONLY when the
         // parent has stopped releasing frames altogether, which is exactly the VUGPAUSE/VUGMIN idle this
         // arc is about, and it is reached once per idle interval rather than once per frame.
+        //
+        // ⚠ VUGSPIN (review D8): THE PARAGRAPH ABOVE IS NOW QEMU-SCOPED, and is kept because its ARGUMENT
+        // (why the release direction cannot be a bare park) still stands. Its CLAIM — "the rendering path
+        // never gets past them", "reached once per idle interval rather than once per frame" — was written
+        // for a 4096-pass budget on an unloaded fixture machine. At 64 passes on a 51 ms bench frame, every
+        // worker exhausts the spin and PARKS ONCE PER FRAME, by design: two futex round trips beat ~1600
+        // yields when there are idle cores to dispatch to. Read this paragraph as true of the fixture legs
+        // and false of the bench; see `WORKER_SPIN_YIELDS` for the measurement and the trade.
         //
         // Lost-wakeup-safe: `futex_wait` compares `PHASE` against the value just read, under the same
         // bucket lock the parent's `wake_phase` takes, so a release landing between the load and the wait
@@ -1321,17 +1378,45 @@ unsafe fn draw_num(surf: *mut u8, fps: u32, x0: i32, color: u32) {
     }
 }
 
+/// VUGSPIN (review D6): [`say`]'s twin for the BRACKETED-TAG witnesses, which end in a bare newline
+/// rather than ` ::`.
+///
+/// Three sites emit that shape — `[vugpause] idle engaged`, `[vugmin] idle engaged`, and `[vuglife]
+/// budget waived` — and each carried its own inline `Buf` chain before this arc; `[vugfps]` is the
+/// fourth and would have been a fourth copy. The wire format of every folded line is byte-identical to
+/// what it emitted before: only the duplication is gone.
+fn sayn(label: &[u8], v: u32) {
+    emit(label, v, b"\n")
+}
+
 /// CLICK-PLAIN: one `:: UVUG: <label><n> ::` witness line.
 ///
 /// Three call sites emit exactly this shape (`pause=` from SPACE, `click n=` from a delivered click,
 /// `pause=` again from the LAYER 2 hunk), and a `Buf` plus four `put`s inlined three times is the kind of
 /// duplication this program cannot afford (see the SIZE note). The trailing ` ::\n` is folded in here
 /// because every caller wants it — the label is the only thing that varies.
+///
+/// VUGSPIN: the body itself now lives in [`emit`], which `sayn` shares. This function's contract — label,
+/// number, ` ::` terminator — is unchanged, and so is every byte its three callers put on the wire.
 fn say(label: &[u8], v: u32) {
+    emit(label, v, b" ::\n")
+}
+
+/// VUGSPIN: the ONE `Buf` chain every `<label><number><tail>` witness in this program goes through.
+///
+/// `say` and `sayn` were two copies of this body differing only in the trailing bytes, and this program
+/// links into a hard 16 KiB `USER_REGION_SIZE` window whose x86 image sits flush against a page boundary
+/// in `.text` — baseline `0x1fcd` of `0x2000`, i.e. **51 bytes of headroom**, past which the `.bss` segment
+/// moves up a page and the ELF grows by 4096 in one step. Collapsing the duplicate is what bought the
+/// `[vugfps]` witness its room. Measured, not assumed: every trim in this area was checked with
+/// `readelf -lW target/VUG-X86.ELF` against that `0x2000` line, not against the file size the build script
+/// prints (the file carries section headers and page padding, so it overstates the real footprint — the
+/// LOADable memory here is ~12.4 KiB of the 16 KiB window).
+fn emit(label: &[u8], v: u32, tail: &[u8]) {
     let mut b = Buf::new();
     b.put(label);
     b.put_dec(v);
-    b.put(b" ::\n");
+    b.put(tail);
     b.flush();
 }
 
@@ -1353,7 +1438,52 @@ unsafe fn draw_hud(surf: *mut u8, fps: u32, clicks: u32) {
 /// keeps its once-per-second refresh alive. Because `frame` does not advance while idled, the quotient
 /// falls to 0 — the readout tells the truth (this vug is presenting nothing) instead of freezing on the
 /// last rate it happened to be running at.
-fn fps_refresh(ticks: &mut u64, mark: &mut u32, fps: u32, frame: u32) -> u32 {
+///
+/// ⚠ VUGSPIN — `[vugfps] wf=` PUTS THE PANEL'S NUMBER ON THE WIRE, because until this arc it was NOT
+/// COMPARABLE TO ANYTHING.
+///
+/// GR24 fixed this readout's ARITHMETIC (ABIFREEZE D1 — see [`TICK_HZ`]: VUG-X86.ELF divided by 250 on a
+/// 1 kHz kernel and drew a figure four times too low), and the next metal sitting still reported the shown
+/// fps as wrong. That could not be settled from a capture, and the reason was structural rather than
+/// arithmetic: **this program had never printed the number it draws.** The kernel prints `[wpace] win=N
+/// rate=` (presents the pacer counted) and `[wcn] win=N rate=`/`comp_rate=` (presents attempted /
+/// composites that reached the panel); the vug printed its digits on a 128 px window and nowhere else.
+/// "The meter disagrees with the wire" was not a finding anyone could make — there was no meter on the
+/// wire to disagree with.
+///
+/// ⚠ PAIR IT ONLY AGAINST `[wpace]`, NEVER DIRECTLY AGAINST `[wcn]` (review D3). The two kernel blocks
+/// number windows in DIFFERENT namespaces: `[wcn]` enumerates every live window including the console
+/// (`win=1 asid=0xffffff01`, which only ever composites), while `[wpace]` indexes the window-id table.
+/// On Boot A the offset is **`wcn = wpace + 2`** — `[wcn] win=3 asid=0x2` and `[wpace] win=1` are the same
+/// window, both reading 19.6/s. The `win` this program emits is its own `SYS_WIN_CREATE` handle, which is
+/// the `[wpace]` index; comparing it to a `[wcn] win=` of the same number reads the wrong window. Verify
+/// the offset per boot rather than assuming 2 — it depends on what else is on the panel.
+///
+/// `shown` and `[wpace] win=N rate=` measure the SAME EVENT and are now the same quantity BY
+/// CONSTRUCTION: `frame` advances only on a present that returned success (see the present site), which
+/// is exactly what `wpace_note_present` counts. So on the next boot:
+///
+///   * they AGREE → the readout is honest, and any remaining complaint about the panel is about the
+///     frames themselves, not the meter. That is what this arc predicts.
+///   * they DISAGREE → **the disagreement is the finding**, and it is the first time it could be one.
+///
+/// `wf` PACKS TWO FIELDS INTO ONE DECIMAL: `win = wf / 1000`, `shown = wf % 1000`. `shown` is clamped to
+/// 999 by the same clamp `draw_num` applies to the digits it paints, so the packing cannot collide. This
+/// is a SIZE decision forced by the linker and not a style one — see [`emit`] for the measured page-cliff
+/// that makes a second label/number pair unaffordable here.
+///
+/// EMITTED ON CHANGE, not on a timer, and that costs nothing: `fps` is already the previously displayed
+/// value, so `v != fps` is free rate-limiting that is also strictly more informative than a period would
+/// be — every change in the digits on the panel appears on the wire, and a window holding a steady rate
+/// goes quiet instead of repeating itself once a second into a log with ten vugs in it.
+///
+/// A THIRD FIELD WAS CONSIDERED AND REJECTED ON ITS MERITS, not only for size. An earlier cut carried
+/// `frames=` beside `shown=` as a claimed CLOCK check. It is not one: `shown = Δframe * TICK_HZ / dt` and
+/// the refresh fires at `dt >= TICK_HZ`, so `shown ≈ frames` is an ALGEBRAIC IDENTITY that holds however
+/// wrong `TICK_HZ` is. Under the exact D1 bug GR24 fixed, the refresh simply fired four times a second
+/// and `shown` still equalled `frames`. A witness that reads the same on both sides of the bug it exists
+/// to catch cannot fail. The only real check on this program's clock is the KERNEL's number beside it.
+fn fps_refresh(ticks: &mut u64, mark: &mut u32, fps: u32, frame: u32, win: u32) -> u32 {
     let now = getinfo_ticks();
     if now > *ticks {
         let dt = (now - *ticks) as u32;
@@ -1362,6 +1492,9 @@ fn fps_refresh(ticks: &mut u64, mark: &mut u32, fps: u32, frame: u32) -> u32 {
             let v = ((frame.wrapping_sub(*mark) as u64 * TICK_HZ as u64 + (dt / 2) as u64) / dt as u64) as u32;
             *ticks = now;
             *mark = frame;
+            if v != fps {
+                sayn(b"[vugfps] wf=", win * 1000 + v.min(999));
+            }
             return v;
         }
     } else if now != 0 && now < *ticks {
@@ -1608,6 +1741,9 @@ pub extern "C" fn _start() -> ! {
     let mut min_witnessed = false;
 
     let mut frame: u32 = 0;
+    // REVIEW D5: present attempts — the DEADLINE clock, kept separate from `frame` (the METER clock, which
+    // counts only presents the panel accepted). Equal on every healthy run; see the present site.
+    let mut attempts: u32 = 0;
     loop {
         // --- input (polled EVERY frame for the program's whole life) ---
         let fi = drain_input(&mut held, &mut drag);
@@ -1775,11 +1911,7 @@ pub extern "C" fn _start() -> ! {
             };
             if !*latch {
                 *latch = true;
-                let mut ib = Buf::new();
-                ib.put(tag);
-                ib.put_dec(frame);
-                ib.put(b"\n");
-                ib.flush();
+                sayn(tag, frame);
             }
             // ESC is honoured from the idle loop exactly as from a rendered frame.
             if exit_key {
@@ -1803,7 +1935,7 @@ pub extern "C" fn _start() -> ! {
             // ack would sit in the surface, unpresented, until a digit happened to change. `fi.clicks`
             // is the frame's own count, so this fires once per click and nothing else keeps it awake.
             if !hidden && overlay {
-                let v = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame);
+                let v = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame, win as u32);
                 if v != fps || fi.clicks > 0 {
                     fps = v;
                     unsafe { draw_hud(surf, fps, clicks) };
@@ -1954,7 +2086,7 @@ pub extern "C" fn _start() -> ! {
         // box — one more readout, drawn every frame the fps readout is, so an ack is on the panel within
         // one frame of the click that earned it.
         if overlay {
-            fps = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame);
+            fps = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame, win as u32);
             unsafe { draw_hud(surf, fps, clicks) };
         }
 
@@ -1971,14 +2103,52 @@ pub extern "C" fn _start() -> ! {
         // frame a syscall that can only fail. The banded verb belongs on the idle HUD path above, where the
         // damage is 11 rows; here the honest answer is the one this line already gives.
         let rc = unsafe { sys1(SYS_WIN_PRESENT, win) };
+        // REVIEW D5: present ATTEMPTS — the deadline clock for both exit budgets below. This is what
+        // `frame` counted before the meter fix, and it advances whether or not the panel took the frame.
+        attempts = attempts.wrapping_add(1);
         if rc >> 63 != 0 {
             stall_witness(&W_PRESENT, frame, b"present rc=", (rc as i64).unsigned_abs() as u32);
+            // VUGSPIN — A FAILED PRESENT IS NOT A FRAME, and until now it was counted as one twice over.
+            //
+            // The three lines below used to run unconditionally, immediately after a branch that had just
+            // established the present FAILED. Both consequences are lies about the panel, and they are
+            // the two the brief for this arc names:
+            //
+            //   * `frame` is the numerator of the VUGFPS readout, and its docstring says it "counts
+            //     frames PRESENTED". A present that returned a negative errno put nothing on the panel,
+            //     so counting it inflated the on-window fps by exactly the failure rate — the meter
+            //     reporting frames the eye never received, which is the one thing it exists not to do.
+            //   * `presented = true` tells the VUGPAUSE idle predicate "the panel is showing this
+            //     surface". After a failed present it is not, and the predicate would then be entitled to
+            //     SKIP the very frame that would have repaired the window — a lost present promoted into
+            //     a stuck one.
+            //
+            // Both are now on the success path only. The failure path keeps the witness and re-renders
+            // the same state next frame, which is the honest recovery: `presented` stays false, so the
+            // idle predicate cannot engage, so the next frame renders and presents again.
+            //
+            // A GUARD AND NOT A `continue`, deliberately. Skipping the rest of the iteration would skip
+            // the EXIT block below with it, so a window whose presents had started failing would stop
+            // answering ESC — a lost present promoted into an unclosable window, which is a worse defect
+            // than the one being fixed. The frame budget and the exit key are evaluated on every
+            // iteration whatever the panel did.
+            //
+            // ⚠ REVIEW D5 — AND THAT IS ALSO WHY THE EXIT BUDGETS MOVED OFF `frame` TO `attempts`.
+            // Holding `frame` still on failure is right for the METER and wrong for a DEADLINE: both caps
+            // below used to read `frame`, so a run whose presents had all started failing would freeze the
+            // budget and never terminate — `:: EXEC-UVUG: … did not exit in time ::` on any fixture leg
+            // where the present path breaks, which is a hang introduced by a fix for a lie. `attempts`
+            // counts PRESENT ATTEMPTS and so advances whatever the panel did, which is exactly what
+            // `frame` used to mean here. On any healthy run the two are equal, so the 300-frame checksum
+            // path is bit-identical; they diverge only in the failure case, where each is now the right
+            // quantity for its own job.
+        } else {
+            // VUGPAUSE: this is now the surface the panel is showing — record what produced it, so the
+            // next frame can tell whether it would draw anything different.
+            presented = true;
+            presented_overlay = overlay;
+            frame += 1;
         }
-        // VUGPAUSE: this is now the surface the panel is showing — record what produced it, so the next
-        // frame can tell whether it would draw anything different.
-        presented = true;
-        presented_overlay = overlay;
-        frame += 1;
 
         // --- exit conditions ---
         if interactive {
@@ -1991,20 +2161,16 @@ pub extern "C" fn _start() -> ! {
             // and keep tumbling until ESC or `kill`. The witness is one-shot — `budget_waived` latches —
             // because the test is true on every frame after the cap, and a per-frame line would drown
             // the serial log it exists to be found in.
-            if frame >= INTERACTIVE_CAP {
+            if attempts >= INTERACTIVE_CAP {
                 if !detached {
                     break;
                 }
                 if !budget_waived {
                     budget_waived = true;
-                    let mut wb = Buf::new();
-                    wb.put(b"[vuglife] budget waived (interactive) frames=");
-                    wb.put_dec(frame);
-                    wb.put(b"\n");
-                    wb.flush();
+                    sayn(b"[vuglife] budget waived (interactive) frames=", frame);
                 }
             }
-        } else if !detached && frame >= AUTO_FRAMES {
+        } else if !detached && attempts >= AUTO_FRAMES {
             // No input has ever arrived (QEMU): the deterministic auto path ends at 300 frames — the
             // surface at that frame is what the checksum witness asserts. VUG-BG: a DETACHED launch skips
             // this cap entirely and tumbles until it is killed. The two are disjoint by construction —
