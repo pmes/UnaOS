@@ -782,8 +782,8 @@ A green `./arroyo check` means the lattice agreed — that is the test passing,
 not a formality. **A bare `./arroyo check` DOES evaluate these assertions**, with
 no knob required: `kepler.rs` is behind the `nvidia-kepler` feature, but
 `check_both` runs `check_kernel_cfg`, and two legs of `KERNEL_CFG_MATRIX` —
-`x86-all` and `x86-nopace` — carry that feature. Breaking a single image byte
-turns `x86-all`, `x86-nopace` and `x86-mix-0` red on a plain `check`.
+`x86-all` and `x86-vsyncpace` — carry that feature. Breaking a single image byte
+turns `x86-all`, `x86-vsyncpace` and `x86-mix-0` red on a plain `check`.
 
 That was not always true, and the history is worth keeping because it is the
 reason to state the current fact precisely. The ECHO lattice landed at

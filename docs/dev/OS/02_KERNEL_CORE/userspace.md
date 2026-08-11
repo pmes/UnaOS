@@ -2945,7 +2945,18 @@
 
   - **The falsifier table for the next boot.** `shown` and `[wpace] win=N rate=` measure the same event
     and are the same quantity by construction (`frame` advances only on a successful present, which is
-    exactly what `wpace_note_present` counts):
+    exactly what `wpace_note_present` counts).
+
+    ⚠ **GR25 (VSYNC-PACE r3) changed what the right-hand side MEANS, and the table below still reads
+    correctly only if you check `[wpace] mode=` first.** The present pacer is now opt-in and the shipped
+    desktop is unpaced, so `[wpace] win=N rate=` is the program's own rate rather than a 60-ish ceiling.
+    The pairing itself is unaffected — `wpace_note_present` moved from `pace_advance` into the present
+    verbs precisely so it keeps counting on an unpaced boot — so row 1 is still the finding it was, and
+    row 2's "rate still ~19.6/s" is still the EXPECTED reading for the slow windows (those windows read
+    `paced=0 slept=0ms` on Boot B and were never slept, so removing the sleep cannot move them). The
+    FAST windows, however, are no longer capped, so a `shown`/`rate` pair in the low hundreds is the new
+    healthy shape there and must not be read against this table's 19.6 figure. See
+    `docs/dev/OS/08_VIDEO/engine.md` "VSYNC-PACE r3".
 
     | next boot shows | reading |
     | --- | --- |

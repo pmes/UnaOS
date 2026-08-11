@@ -191,8 +191,16 @@
 //
 // VSYNC-PACE (GR22, x86) — THE CLAUSE BELOW IS NOW HALF FALSE, AND THE HALF THAT DIED IS THE KERNEL'S.
 // "…and none in the kernel's present path either" held until GR22. On x86 with the window compositor
-// armed (`wc`, i.e. every desktop boot, unless `UNAOS_NOPACE=1`), `SYS_WIN_PRESENT` and
-// `SYS_WIN_PRESENT_ROWS` now SLEEP the caller to the panel's 16667 µs frame boundary before compositing.
+// armed (`wc`), `SYS_WIN_PRESENT` and `SYS_WIN_PRESENT_ROWS` SLEPT the caller to the panel's 16667 µs
+// frame boundary before compositing.
+//
+// ⚠ VSYNC-PACE r3 (GR25) RESTORED THE CLAUSE. The pacer is now OPT-IN (`UNAOS_VSYNCPACE=1`); the
+// polarity inverted and the default desktop is UNPACED again, so on a shipped boot there is no fps
+// target in this program AND none in the kernel's present path either — the original clause, true again.
+// A present returns as soon as its composite is done and this loop runs at whatever rate the machine can
+// give it. Everything from here to the end of this block describes the ARMED build only; read it as the
+// `UNAOS_VSYNCPACE=1` regime, not the shipped one, and see `docs/dev/OS/08_VIDEO/engine.md`
+// "VSYNC-PACE r3" for why. The `[vugfps] wf=` meter is unchanged and is now free to read the real rate.
 //
 // That is a different thing from an fps target in this program, and the distinction is the reason the
 // clause below is amended rather than deleted. An fps target is a TUNING CONSTANT: it has to be guessed,

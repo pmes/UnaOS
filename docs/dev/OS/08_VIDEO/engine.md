@@ -5303,11 +5303,14 @@ spread — are bench readings.
 
 * **`gapmin == gapmax` on a busy vug is the finding.** It would mean the rate is paced, not earned,
   and the next question is by what — the present syscall, the drain barrier, or the app's own loop.
-  **Amended by VSYNC-PACE (GR22), x86 only.** On a `wc` boot without `UNAOS_NOPACE=1` the answer to
-  "by what" is now *known*: the present syscall, deliberately. A collapse onto `gap=16..17ms` with
-  `rate≈60/s` is the pacer working and is the HEALTHY signature there, not a finding. The rule keeps
-  its full original force on aarch64, on every `UNAOS_NOPACE=1` boot, and for any collapse onto a
-  value that is **not** the panel frame — a vug pinned at 30.7/s is still somebody else's ceiling.
+  **Amended by VSYNC-PACE (GR22), x86 only** — and ⚠ **the amendment was RETIRED as a default by
+  VSYNC-PACE r3 (GR25).** Under GR22 the answer to "by what" was known on a paced boot: the present
+  syscall, deliberately, so a collapse onto `gap=16..17ms` with `rate≈60/s` was the pacer working and
+  the HEALTHY signature there. The pacer is now **opt-in** (`UNAOS_VSYNCPACE=1`), so on a shipped boot
+  **the original rule is back in full force on x86 too**: a fleet pinned to the panel frame is a finding
+  again, because nothing in the present path is supposed to be putting it there. Check `[wpace] mode=`
+  before applying either reading. The rule always kept its full force on aarch64 and for any collapse
+  onto a value that is **not** the panel frame — a vug pinned at 30.7/s is still somebody else's ceiling.
 * **`comp` far above `att` across the fleet** means the tiling has the windows overlapping enough that
   every present costs several blits. That is a placement problem wearing a performance costume.
   **Superseded as a diagnosis by WCN-CAUSE (GR25)** — `drg=` now says how much of `comp - att` the
@@ -5491,6 +5494,12 @@ follow the conviction, not precede it. Census first.
 
 ### VSYNC-PACE — presents are paced to the panel, in the kernel (x86)
 
+> ⚠ **SUPERSEDED AS A DEFAULT BY VSYNC-PACE r3 (GR25), BELOW.** The pacer described in this section and
+> in r2 is now **opt-in** (`UNAOS_VSYNCPACE=1`); the shipped desktop presents unrestricted. Everything
+> here remains accurate *for the armed build* and is kept because r3's argument is only legible against
+> it. Do not read a rate figure from this section against a post-GR25 capture without checking
+> `[wpace] mode=` first.
+
 **P, Boots AL/AN/AO.** *"they are not all running the same fps … fall back to their predetermined
 fps"* / *"fps still all over"*. Boot AO's eight vugs ran **55.8–100.5 presents/s** each, every one of
 them `parked=0`, `comp == att`, on a panel whose `[wc-h]` frame is `frame_us=16667`.
@@ -5547,14 +5556,23 @@ panel, and identical for every client.
 Compiled only under `wc`, so every headless gate and every non-compositor boot runs the pre-arc
 present path exactly — which is what keeps the fixture batteries, whose ring-3 witnesses present in
 tight bounded loops, unperturbed. aarch64 is untouched: nothing here leaves `arch/x86_64/`, and
-`arroyo`'s `arm_features` strips `nopace` so Pi and Jetson media stay byte-identical either way.
+`arroyo`'s `arm_features` strips `vsyncpace` (GR22: `nopace`) so Pi and Jetson media stay byte-identical
+either way — verified at the r3 landing by building `kernel8.img` with and without the arc's diff:
+`12a77d61dba7cacb…`, identical.
 
-`UNAOS_NOPACE=1` **disables** the pacer. The negative polarity is deliberate: a desktop that renders
-frames the panel cannot scan out is burning CPU for nothing, so waste-free is the right default and an
-opt-in knob would leave the shipped configuration the wasteful one. What the hatch is *for* is the
-archive — `[wc-g]`, `[wc-d]`, `[wcn]` and `[vugmin]` were calibrated against an unpaced path, and
-their GR16–GR21 rate figures are *headroom* measurements ("how fast can this fleet present"), a
-question the pacer answers by fiat. `UNAOS_NOPACE=1` restores that measurement mode exactly.
+~~`UNAOS_NOPACE=1` **disables** the pacer.~~ ⚠ **THE KNOB AND ITS POLARITY BOTH CHANGED IN GR25.** It is
+now `UNAOS_VSYNCPACE=1` and it **arms** the pacer; unset — the shipped configuration — nothing sleeps.
+The GR22 argument for the old polarity is preserved verbatim so the change is legible: *"a desktop that
+renders frames the panel cannot scan out is burning CPU for nothing, so waste-free is the right default
+and an opt-in knob would leave the shipped configuration the wasteful one."* See r3 below for why that
+reasoning does not survive contact with what the operator actually asked for.
+
+What arming it is *for* is unchanged in substance: `[wc-g]`, `[wc-d]`, `[wcn]` and `[vugmin]` were
+calibrated against an unpaced path, and their GR16–GR21 rate figures are *headroom* measurements ("how
+fast can this fleet present"). The pacer answers that question by fiat instead of measuring it. Post-GR25
+the default answers it by measurement again, and `UNAOS_VSYNCPACE=1` is how a boot asks for the
+vsync-cadence comparison explicitly. `[wpace] mode=` names which regime any capture was taken under, so
+the two can never be silently compared again.
 
 #### `[wpace]` — the pacer's own witness
 
@@ -5564,10 +5582,15 @@ produce the same `[wcn]` line. `[wpace]` reports the pacer's own actions, on `[w
 dirty-paced so an idle desktop is silent). `witness`-gated, like every other window witness.
 
 ```
-[wpace] win=<id> pres=<n> paced=<n> slept=<n>ms rate=<x.y>/s frame_us=16667
-[wpace] rollup wins=<n> pres=<n> paced=<n> slept=<n>ms focus=<n> resync=<n>
-        rate=<x.y>/s span=<n>ms -> <PACING|HEADROOM>
+[wpace] win=<id> pres=<n> mode=<free|vsync> paced=<n> slept=<n>ms rate=<x.y>/s frame_us=16667
+[wpace] rollup wins=<n> pres=<n> paced=<n> slept=<n>ms focus=<n> resync=<n> overrun=<n>
+        rate=<x.y>/s span=<n>ms -> <FORBID|LATCHED|PACING|FREE|HEADROOM>
 ```
+
+⚠ **GR25 added `mode=` and two verdicts, and widened the block's cfg gate from the pacer's to the
+witness's** so it speaks on an unpaced boot — see r3. On `mode=free`, `paced`/`slept`/`focus`/`resync`/
+`overrun` are zero *by construction* (the incrementing code is not linked) and `rate=` is the program's
+own, not a ceiling.
 
 `paced` is presents this pacer delayed; `slept` the ms it delayed them by; `focus` the input-latency
 exemptions taken; `resync` the cadence restarts caused by a client that could not keep up. The
@@ -5596,7 +5619,9 @@ evidence the pacer works.
 * **`BPACE gui=` is boot-time**, emitted before the desktop exists, so it must be *unaffected*. A
   moved `gui` total on a paced boot is a finding about the arc's blast radius, not about the panel.
 * **Do not compare a paced boot's `[wcn]`/`[wc-g]` rates with a pre-GR22 capture.** Re-take the
-  baseline with `UNAOS_NOPACE=1` or the comparison is between two different questions.
+  baseline with the pacer disarmed or the comparison is between two different questions. ⚠ **GR25
+  inverted the knob**: the disarmed baseline is now simply the default build, and `UNAOS_VSYNCPACE=1` is
+  what re-takes the *paced* one. `[wpace] mode=` tells you which any given capture is.
 
 ---
 
@@ -5658,6 +5683,172 @@ banked forever.
 The safety valve is now **counted**: `[wpace] rollup … overrun=` and a new verdict `LATCHED` that
 outranks both `PACING` and `HEADROOM`. Non-zero is a live defect, not a slow machine. `overrun=0`
 is the pass condition.
+
+---
+
+### VSYNC-PACE r3 — unrestricted is the default; the pacer becomes opt-in (GR25)
+
+**P, GR25:** *"fps is made up/forced to run a certain speed rather than running unrestricted as does the
+load across cores."*
+
+#### Boot B is the proof, and it is the pacer's own witness that convicts it
+
+```
+[wpace] win=3 pres=311 paced=311 slept=4615ms rate=62.1/s frame_us=16667
+[wpace] rollup ... pres=1830 paced=1682 slept=20772ms ... rate=365.7/s span=5003ms -> PACING
+```
+
+**Every present delayed.** 4615 ms of a 5009 ms span spent asleep *inside the syscall*. The residual
+~394 ms carried all 311 frames — **1.27 ms of real work per frame** — so the program was idle by decree
+92% of the time, and `62.1/s` was the pacer's ceiling reported under the program's name. `[vugfps]
+wf=3063` agreed with it to within a frame, which is exactly the problem: GR24 made the meter honest, and
+an honest meter reporting a fabricated quantity is still a fabricated number on the panel.
+
+#### Why the GR22 argument does not survive
+
+Both of its premises are *true*. Neither one licenses the sleep.
+
+| GR22 premise | why it does not decide the question |
+|---|---|
+| "Nothing above the panel rate is ever seen" | A fact about the **beam**, not about the program. It says the extra composites do not reach an eye. It does not say the kernel may stop a program doing work it asked to do — and on this machine that work *is* the load an operator watches land across cores. |
+| "The spread **is** the complaint" | A reading of what Peter wanted, and GR25 corrected the reading. The complaint was never that the numbers differed. It was that they were not the machine's own. Clamping made every window read the *same* fictional number, which is the failure the complaint now names. |
+
+#### The audit: what the pacer actually protected
+
+A sleep is sometimes load-bearing, so this was checked rather than assumed:
+
+* **Not the compositor's serialization.** WCSER owns one-pass-at-a-time. That lock is correct with or
+  without a pacer and does not need callers slowed to stay correct.
+* **Not the hidden-window runaway.** That is **PRESSURE-1** (`present_backpressure`) — a separate
+  mechanism on a separate path, and **untouched by this arc**. An app that ignores `WIN_PRESENT_HIDDEN`
+  is still capped at ~1000 suppressed presents/s per slot. That cap is a whole-system availability
+  property and it stays.
+* **Not a serial storm.** `[wpace]`/`[wcn]` are rollup-paced on their own 5 s compare-exchange claim.
+
+What it protected was **CPU cycles from being spent on invisible pixels**. That is a policy, and it is
+not the kernel's to set by fiat on a machine whose operator has said otherwise.
+
+#### The mechanism chosen: neither a drop nor a refusal
+
+Both replacements on the table were **rejected**, for the same reason: **the composite is already the
+back-pressure.** A visible present does real work under `WINDOWS`; the syscall returns when that work is
+done; so the arrival rate is bounded by what the machine can actually composite — by physics, measured
+per boot, with no constant in it. That mechanism was here all along, underneath the sleep.
+
+* A **drop/coalesce** returns *without* the work. It uncouples the program's rate from the machine's,
+  lets a 500 fps caller spin the syscall path unboundedly, and **hides the load Peter asked to see**. It
+  also needs a deferred-composite queue to mean "newest frame wins" at all — and that queue is
+  `pal.rs`'s, outside this arc's lane.
+* An **EWOULDBLOCK-style refusal** is worse on the same axis, and GR22 already measured why: a refused
+  client re-enters its loop and presents again immediately, converting wasted composites into a wasted
+  spin. It frees no CPU and costs an ABI change.
+
+So the default path **adds nothing — it removes a sleep**. `present_pace` is `{}`; a present is the
+composite plus the return.
+
+#### What changed, mechanically
+
+| piece | before | after |
+|---|---|---|
+| cargo feature | `nopace` (pacer default **ON**) | `vsyncpace` (pacer default **OFF**) |
+| knob | `UNAOS_NOPACE=1` disables | `UNAOS_VSYNCPACE=1` **arms** |
+| `present_pace` / `pace_advance` / `pace_reset` / `pace_focus_arrival` | linked on every `wc` boot | linked only under `vsyncpace`; empty stubs otherwise |
+| `wpace_note_present` call site | inside `pace_advance` (pacer-gated) | inside the two present verbs (unconditional), under the same ownership proof |
+| `[wpace]` cfg gate | `wc + nopace-off + witness` | `wc + witness` — **it speaks on both regimes** |
+| `[wpace]` line | `pres= paced= slept= rate= frame_us=` | `pres= mode= paced= slept= rate= frame_us=` |
+| verdicts | `LATCHED > PACING > HEADROOM` | `FORBID > LATCHED > PACING > FREE > HEADROOM` |
+| `x86-all` cfg leg | held the **armed** polarity | holds the **disarmed** polarity (it is the shipped leg); `x86-vsyncpace` is the armed twin |
+
+The witness move is the load-bearing one. `wpace_note_present` counts an event that happens on every
+boot; leaving it inside the pacer would have taken the whole `[wpace]` block silent on exactly the
+configuration this arc installs, and a witness that speaks only in the regime the arc *removed* cannot
+report the regime the arc *added*.
+
+**`FREE` is deliberately not spelled `HEADROOM`.** `HEADROOM` asserts that a fleet was under the panel
+rate *with a pacer watching*; `FREE` asserts that no pacer exists. Folding one into the other would let
+an entire regime change hide inside a verdict the archive already carries.
+
+**`FORBID` is the new impossible-shape detector**, the counterpart to r2's `overrun=0`: `mode=free` with
+non-zero `paced` or `slept`. On that build `wpace_note_paced` is not linked, so nothing can increment
+either counter. A non-zero reading means the counters are being written by something that is not the
+pacer, or that a `vsyncpace` build is mislabelling itself as free. **Zero is the pass condition.**
+
+#### The opt-in that could not be built, and its design
+
+A per-**window** opt-in is the right long-run shape — one program wanting vsync cadence should not
+require a differently-built kernel. It was not built, and the reason is a hard boundary rather than a
+scheduling one: `SYS_WIN_PRESENT(win)` is a **one-argument verb**, there is **no present-flags seam in
+`una-abi`**, and the ABI is frozen. This arc does not widen it unilaterally.
+
+**Proposed encoding, for whoever owns the ABI arc.** Do *not* widen `30`, for the reason its own
+declaration already gives (`SYS_WIN_PRESENT_ROWS` took a new number, 33, rather than widening 30 in
+place). Prefer a **new, additive, per-window verb** — a window *attribute*, not a present flag:
+
+```
+SYS_WIN_PACE(win, mode) -> 0 / -errno      # mode: 0 = free (default), 1 = vsync
+```
+
+* **An attribute, not a per-present flag.** Pacing is a property of the surface's relationship to the
+  beam and does not change frame to frame; a flag on every present would be re-sent 300 times a second
+  to say the same thing, and would have to be carried identically by `30` *and* `33` or the cadence
+  would be escapable by switching to banded presents.
+* **Ownership-gated exactly as the present verbs are** (`-EBADF` / `-EACCES`, in that order), and reset
+  by `pace_reset` on row recycle so a new tenant never inherits the previous one's regime.
+* **`-ENOSYS` is a valid answer** and every client must already tolerate it (the aarch64 / older-kernel
+  path), which makes the verb free to adopt incrementally.
+* The kernel side is nearly free: `WIN_PACE_MODE[id]` beside the existing `WIN_PACE_DUE_US[id]`, tested
+  at the top of `present_pace`. `[wpace] mode=` is **already emitted per window** precisely so that when
+  this lands the log format does not change shape a second time.
+
+Until then, `UNAOS_VSYNCPACE=1` is the build-level stand-in.
+
+#### The 51 ms windows: evidence, and a hand-off — NOT this arc's fix
+
+Boot B's slow windows are locked to ~3 frame periods, and **the pacer is not what is doing it**:
+
+```
+[wcn] win=3 asid=0x2 att=98 comp=98  rate=19.6/s comp_rate=19.6/s gap=51..51ms q=3.1..3.1 drg=0  dout=98 dkpx=60368
+[wcn] win=9 asid=0x8 att=98 comp=196 rate=19.6/s comp_rate=39.2/s gap=51..51ms q=3.1..3.1 drg=98 dout=0
+[wpace] win=1 pres=99 paced=0 slept=0ms rate=19.6/s        # ← the SAME window; wcn = wpace + 2 on this boot
+```
+
+`paced=0 slept=0ms`. **Those windows were never slept.** They arrive 51 ms apart on their own, so
+removing the sleep cannot speed them up — and that is the arc's own sharpest falsifier (below). The
+census names the cause instead: `win=9` runs **`comp = 2 × att`** with `drg=98` present-chained
+recomposites, and `win=3` carries `dout=98` with `dkpx=60368`. Every present is dragging a second
+composite behind it, and that composite is charged synchronously into the presenting task's syscall.
+~51 ms per present is what two composites cost at that geometry.
+
+**That is `composite_inner`, which belongs to another arc.** Landed here as evidence only; nothing in
+that region was edited. The r3 default makes the finding *sharper*, not weaker: once nothing sleeps,
+`gap=51..51ms` has exactly one remaining owner.
+
+#### Metal watch-list (VSYNC-PACE r3)
+
+* **`[wpace] ... mode=free ... -> FREE` on every block.** `mode=vsync` on an unarmed boot means the knob
+  leaked into the media build; `-> FORBID` means the counters are being written by something that is not
+  the pacer. Both are live defects.
+* **`slept=0ms` forever.** A non-zero `slept=` on a `mode=free` window is the r3 FORBID-shape — grep for
+  it, it cannot happen by construction.
+* **The fast windows rise, and `[vugfps]` rises with them.** Boot B's win=3 spent 1.27 ms of real work
+  per frame, so a whole core of headroom is ~**790 presents/s**. Seven vugs will not each get a whole
+  core, and the `WINDOWS` lock serializes the composites, so the honest prediction is **low hundreds/s
+  per window, several hundred aggregate** — not 62. `[vugfps] wf=` must track `[wpace] win= rate=` the
+  whole way up (they count the same event by construction); a divergence is a meter bug and the first
+  boot that can show one.
+* **`[wcn] gap=` on the fast windows collapses below 16 ms** and `q=` drops under 1.0. The WC-N
+  watch-list's "healthy signature" of `gap=16..17ms` was a *paced* signature and is now stale — do not
+  read a sub-frame gap as a fault.
+* **THE ARC'S OWN FALSIFIER: the slow windows must NOT move.** `[wcn] win=3`/`win=9` must still read
+  ~19.6/s with `gap=51..51ms`. If they rise, the pacer *was* implicated in the 51 ms after all and the
+  census reading above — `paced=0 slept=0ms`, which says it was not — is wrong, which would mean the
+  counters are lying. If they fall, removing the sleep cost the loaded windows something (most likely
+  `WINDOWS` contention from the now-unrestricted fast windows), and that is a real regression to report
+  rather than a success to bank.
+* **`SCHED: load` and `[schedx86] load` must RISE**, and that is the intended outcome, not a fault. It is
+  the whole of *"the load across cores"* — cycles that were being slept away are now being spent.
+* **PRESSURE-1 must be unmoved.** A hidden app is still capped at ~1000 suppressed presents/s per slot.
+  If a hidden window's rate climbs past that, the arc broke a mechanism it did not intend to touch.
 
 ---
 
