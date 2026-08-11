@@ -15,7 +15,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 pub mod document;
+pub mod logview;
 pub use document::TabulaDocument;
+pub use logview::{default_console_log, is_log_path, LogText};
 
 #[cfg(feature = "gtk")]
 use gtk4::prelude::*;
@@ -91,6 +93,15 @@ impl TabulaView {
     }
 
     pub fn load_file(&self, path: &Path) {
+        // Console/serial logs take the log path: NUL padding trimmed, escape
+        // sequences stripped, control bytes made visible, tail-capped — and
+        // the view goes read-only so the rendering can never be saved back
+        // over the record.
+        if crate::logview::is_log_path(path) {
+            self.load_log(path);
+            return;
+        }
+
         let buffer = self
             .view
             .buffer()
@@ -123,6 +134,29 @@ impl TabulaView {
                 "// UNAOS: FAILED TO LOAD {:?}\n// ERROR: {}",
                 path, e
             )),
+        }
+    }
+
+    /// The Console view: render a console/serial log into this view,
+    /// read-only, monospace, no highlighting.
+    ///
+    /// `load_file` routes here on its own for log paths; call it directly to
+    /// force the log treatment on a file whose name does not say "log".
+    pub fn load_log(&self, path: &Path) {
+        let buffer = self
+            .view
+            .buffer()
+            .downcast::<sourceview5::Buffer>()
+            .unwrap();
+        buffer.set_language(None::<&sourceview5::Language>);
+
+        self.view.set_monospace(true);
+        self.view.set_editable(false);
+        self.view.set_wrap_mode(gtk4::WrapMode::WordChar);
+
+        match crate::logview::load_log(path) {
+            Ok(log) => buffer.set_text(&log.text),
+            Err(e) => buffer.set_text(&format!(":: TABULA: cannot read {:?} — {} ::\n", path, e)),
         }
     }
 }

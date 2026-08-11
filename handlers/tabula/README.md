@@ -20,7 +20,8 @@ The public API lives in `src/lib.rs`:
   - `Code(String)` — monospace, line numbers, no wrapping; the `String` is a
     GtkSourceView language ID used for syntax highlighting.
   - `Prose` — proportional font, word wrapping, page margins.
-  - `Log` — monospace, read-only, word wrapping (intended for log views).
+  - `Log` — monospace, read-only, word wrapping (the Console view's shape;
+    `load_log` puts a view into it regardless of the mode it was built with).
 - **`TabulaView`** — wraps a `sourceview5::View` inside a `ScrolledWindow`.
   - `TabulaView::new(mode)` — builds the view for the given `EditorMode` with
     auto-indent enabled.
@@ -28,11 +29,78 @@ The public API lives in `src/lib.rs`:
     in a host layout.
   - `load_file(&Path)` — reads a file into the buffer and selects a highlighting
     language from the file **extension**. On a read error it writes the failure
-    message into the buffer instead of panicking.
+    message into the buffer instead of panicking. **Log paths are routed to
+    `load_log` automatically** (see below).
+  - `load_log(&Path)` — the Console view: renders a console/serial log
+    read-only, monospace, unhighlighted.
 
 Language detection in `load_file` is extension-based (`.rs`, `.toml`, `.md`,
 `.py`, `.js`/`.ts`, `.json`, `.c`/`.h`/`.cpp`; otherwise plain text). Content
 sniffing / magic-byte detection is not implemented.
+
+## The Console view
+
+Tabula's first incarnation of "the Console" is the editor itself, opened on a
+log. There is no separate viewer and no new `ViewEntity`: the operator's flow
+is *open this file*, and the log path in `src/logview.rs` makes that safe.
+
+UnaOS logs are not ordinary text, so opening one naively is wrong in three
+specific ways. Each is handled:
+
+| Hazard | Why it exists | What Tabula does |
+| --- | --- | --- |
+| Trailing NUL padding | The kernel flight recorder reserves `UNAOS.LOG` at a **fixed** 256 KiB + 512 and writes the capture as its prefix (`unaos/crates/kernel/src/flight_recorder.rs`), so most of the file is zero padding. | Trimmed before decoding; the count is reported in `LogText::padding_bytes`. |
+| Interior control bytes | Serial captures carry stray C0 bytes — this is why the house rule is to inspect logs with `awk`, not `grep`. A real 256 KiB `UNAOS.LOG` on this bench carries 21 of them. | Rendered as Unicode Control Pictures (`␀`, `␛`, `␡`): visible, counted, and inert. CR/CRLF normalise to LF; tabs and newlines pass through; ANSI CSI/OSC escape sequences are stripped. |
+| Invalid UTF-8 | A byte mangled on the cable must not cost the whole file. | Decoded lossily; `LogText::lossy` records that it happened. |
+| Unbounded size | The recorder is MBs-capable and a bench capture grows all session. | Loads are capped at `DEFAULT_MAX_BYTES` (4 MiB) keeping the **tail**, advanced to the next line break, with a `:: TABULA: log truncated …` banner naming the elided byte count. |
+
+A log document is **read-only by construction**: its buffer is a *rendering*
+of the file, not the file, so writing it back would destroy the record.
+`TabulaDocument::read_only` is set, `set_buffer` is inert, and `save()` returns
+`PermissionDenied`.
+
+The API in `src/logview.rs`:
+
+- `is_log_path(&Path)` — a console/serial log by name: anything containing
+  `.log` (so `UNAOS.LOG`, `s73-UNAOS.LOG.saved`, `ttyUSB0.log`) plus squawk
+  `*.out` transcripts.
+- `sanitize(&[u8]) -> LogText` — pure; every rule above, no I/O.
+- `load_log(path)` / `load_log_capped(path, max_bytes)` — read + sanitize.
+- `console_log_roots()` / `newest_log_in(&[PathBuf])` / `default_console_log()`
+  — discovery: every removable mount point (`/run/media/*/*`, `/media/*/*`,
+  `/mnt/*`) plus `~/unaos-bench/capture`, newest first. Only direct children of
+  a root are considered.
+
+On `TabulaDocument`: `open(path)` is the single entry point a vessel should
+call — it routes log paths to `load_log` and everything else to `load`.
+
+### Operator flow
+
+The `una` vessel exposes this as:
+
+```
+una <file>              # open any file, workspace anchored beside it
+una --console <file>    # open a named log in the Console view
+una --console           # open the newest log Tabula can find
+```
+
+…and activating a `.log` / `UNAOS.LOG` / `*.out` in una's sidebar takes the
+same path. `--console` with an explicit path is what reads a shard's flight
+recorder after the card is mounted on the host; `--console` bare is the
+"just show me the console" affordance.
+
+### Tests
+
+`tests/console_view.rs` runs against **real captured bytes** — slices of this
+bench's `UNAOS.LOG` and an FTDI capture, control bytes included, provenance in
+`tests/fixtures/README.md`. The unit tests in `logview.rs` pin each rule
+individually.
+
+### Not this arc
+
+Live follow (tail -f behaviour), level/source filtering, and log **structure**
+(the `LogRecord` triple) are `handlers/comscan`'s `LogViewState`. This is the
+static-file incarnation only.
 
 ## How it is meant to plug into the bus
 
