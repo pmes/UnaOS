@@ -3343,6 +3343,128 @@ find `DESKTOP_BG` byte-for-byte at 5/5 and 3/3 — the staged fill lands the ide
 * The cursor over a closing window: the sprite must reappear after the fill, never be erased into the
   desktop and never leave a stale patch — the `undraw`/composite bracket is the thing being watched.
 
+### WCSER — one composite pass on the panel at a time (`COMP_GATE`)
+
+The compositor has no thread: `composite()` is called once per present, from the presenting task's own
+core. Until WCSER nothing stopped two of them running at once, and two whole-stack passes that each
+close their damage upward and blit **back-to-front** can interleave `A.lower … B.upper … A.upper`,
+putting the lower window's pixels on top of the upper one for the length of one blit — a bleed at the
+fleet's present rate. `[comp2]` convicted it by arithmetic (Boot AQ: `passes=1807 × pass_us=3997 =
+7.22 s` of pass time inside a `5.00 s` wall span — 144% utilisation, so ≥2 cores were inside
+`composite` at once, in steady state). WCSER closes it with a **non-blocking try-gate**,
+`static COMP_GATE: AtomicBool` (`wm.rs`): the first pass in wins and composites; a second pass CASes
+false→true, loses, composites nothing, clears nothing, publishes `COMP_PENDING`, and returns. Try,
+never spin — `composite` is reached IRQ-masked from `sched::exit → close_owner` and from both present
+chains holding `IrqGuard + WINDOWS`, so a blocking acquisition would be a wedge. `[wcser]` reports the
+period: `entered=`/`declined=`/`reruns=`, with `-> SOLO` when nothing was ever declined and
+`-> WEDGED` (`entered=0 declined=N`) when a holder took the gate and never released.
+
+### WCPAR — parallel per-core composite (DESIGN; the seam is landed, the restructure is not)
+
+**The observation (Boot B, GR25).** With the pacer merged out (`vugfree`, `a38697af`), open vugs still
+fall into a *predetermined* cadence — `[wcn] win=3 rate=19.6/s gap=51..51ms`, and `win=9` reads the
+same `19.6/s`. `gap=51ms` is **three panel frames**, and the rate is **load-invariant**: nine windows
+present no faster *and no slower per window* than three. That is not a target being hit; it is a
+**queue**. Every present composites the whole affected stack synchronously and *one at a time,
+system-wide*, so N vugs share one composite pipe and each gets `1/N` of it — the exact opposite of
+Peter's ask, which is that "vug should auto-pace dividing across cores evenly in the vugs as they're
+opened."
+
+**The two serializations, named.** A present does not just contend on `COMP_GATE`; it also holds the
+outermost lock across the whole composite:
+
+1. **`WINDOWS`, held across the composite** (`sys_win_present`, `syscall.rs`). The ownership check, the
+   geometry snapshot AND `wc_shim::present → wm::present_banded → composite()` all run under one
+   IRQ-masked hold of the window-table spinlock — *deliberately*, because dropping it before the
+   composite opens a TOCTOU: ids are recycled slot aliases (`id = slot + 1`, no generation), so a
+   `close`+`create` pair on other cores could recycle the id in the gap and land the caller's pixels
+   under a new owner's identity. Every present on every core therefore queues on `WINDOWS` for the
+   duration of its *composite*, not just its validation.
+2. **`COMP_GATE`** (WCSER, above) serializes `composite_once` among all callers regardless of
+   `WINDOWS` — the second, back-to-front-ordering reason.
+
+**The shared resources that force SOLO — the honest diagnosis.** Two, and they gate *different halves*
+of the pass:
+
+* **The single front buffer (the panel glass) + the cross-window back-to-front blit order.** This is
+  what `COMP_GATE` exists for (module ledger above `COMP_GATE`, `wm.rs`). It constrains the **present**
+  half — the `STAGE`→panel bulk row-copy *and* the z-order the windows are copied in. Two passes
+  writing overlapping regions in opposite interleavings bleed; this is irreducible on one glass.
+* **The single shared `STAGE` scratch (`static STAGE: Mutex<Vec<u8>>`, `wm.rs`).** One RAM back layer,
+  taken with `try_lock`; a second composer that cannot get it DECLINEs (`DECL_LOCK`) and falls to the
+  pre-WC-H *tearing* direct path. This constrains the **compose** half: two concurrent composes cannot
+  share one buffer, so today they either serialize or degrade to tearing.
+
+**The split the code already measures.** `stage_window` (`wm.rs`) is already two phases, and `[wc-h]`
+already times them separately per window: **compose** (`compose_us` = surface → `STAGE`, the expensive
+scale-2 upscale — every scattered per-pixel write) and **present** (`present_us` = `STAGE` → panel, one
+bulk `copy_nonoverlapping` per row). This is the WC-H tear-free discipline; on the bench WC-K measured
+`present_us ≈ 4× compose_us` for large *fills*, but for a **scale-2 window** the arithmetic inverts —
+compose is `scale²` bounded-pokes per source pixel and dominates. **Compose is per-window independent
+and parallelizable; present must stay serialized for tear-freedom.** That is the whole of WCPAR's
+thesis, and it is on the wire, not asserted.
+
+**The design.**
+
+1. **Per-core `STAGE` pool.** Replace `static STAGE: Mutex<Vec<u8>>` with a per-CPU array
+   (`[Mutex<Vec<u8>>; MAX_CPUS]`, `MAX_CPUS = 8` as in `ui_status::PSTRIP_MAX_CPUS`) indexed by
+   `crate::arch::sched::meter_current_cpu()`. Each core composes into its **private** RAM buffer, so
+   the `DECL_LOCK` decline (compose-vs-compose, or compose-vs-erase across cores) disappears and N
+   composes can run at once with no shared buffer to race. This is the one piece of WCPAR that touches
+   *only* the STAGE/buffer machinery — its three lock sites (`stage_window` @ the `STAGE.try_lock`,
+   `stage_fill`'s fast-path probe, and `stage_fill`'s stage) — and collides with nothing in flight.
+   **Cost:** up to 8 lazily-grown buffers instead of one; each grows only to the largest box *its* core
+   composes, so a fleet of small vugs stays cheap and only a core that stages the full-panel console
+   reaches the 4 MiB cap.
+2. **Shrink the `WINDOWS` hold to a snapshot.** `sys_win_present` must take `WINDOWS` only long enough
+   to validate ownership and copy out the row's identity+geometry+damage into a `Copy` snapshot, then
+   **release** it and compose from the snapshot. The TOCTOU it closes today is preserved by validating
+   a **generation/identity token** in the snapshot at present time rather than by holding the lock
+   across the blit — the same shape `move_to_inner`'s `expect_owner` already uses to close the
+   recycled-id window without a long hold.
+3. **Split `composite_inner` into compose (parallel) and present (serial).** Phase A: each participating
+   core composes its window's clipped box into its per-core `STAGE`, in parallel, holding no global
+   lock. Phase B: a lightweight **present-lock** (the role `COMP_GATE` plays today, kept) serializes the
+   `STAGE`→panel blits *in z-order*, so the single-glass back-to-front invariant is untouched.
+
+**Tear-freedom under parallelism — the correctness argument.** WC-H/WC-K tear-freedom is a property of
+the **present** half: each panel row reaches the glass in one bulk copy, and the cross-window order is
+back-to-front. WCPAR moves *only compose* off the serial path; compose writes exclusively into per-core
+RAM the scan-out never observes, so it cannot introduce a seam. Phase B keeps the identical present
+discipline under the identical serial gate, so `[wc-h]`/`[wc-k]` `-> TEAR-FREE` must hold unchanged.
+The bleed WCSER convicted (`A.lower … B.upper … A.upper`) is a *present*-order interleave and Phase B's
+serial z-ordered present is exactly what forbids it — WCPAR does not relax that gate, it narrows what
+runs *under* it.
+
+**Why this arc landed the DESIGN and not the restructure — the collision map.** Steps 2–3 restructure
+`composite_inner`, which reads the three predicates three other arcs are editing **right now**, and
+this lane may not touch any of them:
+
+| in-flight arc | predicate | why WCPAR's phase-split touches it |
+|---|---|---|
+| `taskbar-D3` | `occ_clip` / `OccClip::prepare` | the upward occlusion closure that Phase A must snapshot per window before releasing `WINDOWS` |
+| `shell-window-b` | `above_shell` / `focus` / `z` / `SHELL_Z` | the z-order Phase B blits in, and the membership test for who composes |
+| `console-close` | `ctrls_for` | chrome extent drawn inside the per-window compose |
+
+A four-way edit of `composite_inner` across these would collide at merge by construction. **The safe,
+non-colliding increment (step 1's seam) is documented in-code** at `COMP_GATE` and at the `STAGE`
+static so the follow-on arc finds it where the code lives; the per-core pool itself is **not landed**,
+because it delivers none of Peter's throughput goal while `COMP_GATE` still serializes the whole pass,
+and reserving per-core multi-MiB buffers for an unexploited path is cost without benefit until steps
+2–3 land. **Sequencing recommendation for the integrator:** land `taskbar-D3`, `shell-window-b` and
+`console-close` first; then a single WCPAR arc owns `composite_inner` end-to-end (per-core pool +
+snapshot-release + phase split) with no concurrent editor of `occ_clip`/`SHELL_Z`/`ctrls_for`.
+
+**Falsification (what a real WCPAR landing must show).** Two, and both must hold:
+
+* **Rates rise AND diverge.** Two vugs on a multi-core boot must read `[wcn] rate=` *above* `19.6/s`
+  and, as cores absorb them, must stop reading the *same* rate — lockstep at a load-invariant cadence
+  is the queue signature this arc names. A wall-clock span that shrinks below the sum of per-window
+  `compose_us` (from `[wc-h]`) is the direct witness that composes ran concurrently.
+* **Tear-freedom holds.** `[wc-h]`/`[wc-k]` must stay `-> TEAR-FREE` with no new `torn=yes`; a WCPAR
+  that buys throughput by relaxing the present gate has reintroduced exactly the WCSER bleed and is
+  wrong regardless of the rate it posts.
+
 ## 9. CRISPY-PI — the theme table (`video/theme.rs`)
 
 The Crispy desktop theme now exists kernel-side as a `const` table:

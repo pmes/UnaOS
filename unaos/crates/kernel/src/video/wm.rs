@@ -5812,6 +5812,20 @@ static SIDEBYSIDE_WITNESSED: core::sync::atomic::AtomicBool =
 // happens, and a wedge is a fault in `composite_once` — a bug to fix at the source, not a state to
 // paper over on every frame. If metal ever shows a real `WEDGED`, the token form of (a) is the
 // starting point, with a threshold argued from that boot's `[comp2] max_us`.
+//
+// WCPAR SEAM (design: `engine.md` §8 "WCPAR — parallel per-core composite"). This gate is WHY open
+// vugs fall into the load-invariant `[wcn] rate=19.6/s gap=51..51ms` ceiling: it serialises the WHOLE
+// composite pass (compose AND present), so N vugs share one composite pipe and each gets 1/N of it —
+// the queue Peter's "spread the vugs across cores" ask is about. The gate exists for a REAL and
+// irreducible reason on the PRESENT half — the single front buffer and the cross-window back-to-front
+// blit order (the `A.lower … B.upper … A.upper` bleed this arc's ledger convicts). WCPAR does NOT
+// remove it: it narrows what runs under it. The expensive COMPOSE half (surface → per-core `STAGE`,
+// the scale-2 upscale, `[wc-h] compose_us`) is per-window independent and moves OUT to run in
+// parallel per core; only the `STAGE`→panel present stays serial here, in z-order, keeping
+// tear-freedom (`[wc-h]`/`[wc-k]` -> TEAR-FREE) byte-for-byte. Landing that requires restructuring
+// `composite_inner` into a parallel-compose / serial-present split, which reads `occ_clip`,
+// `above_shell`/`SHELL_Z` and `ctrls_for` — three predicates under concurrent edit — so it is a
+// FOLLOW-ON arc after those land, not this one. See the `STAGE` static for step 1's per-core seam.
 #[cfg(target_arch = "x86_64")]
 static COMP_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -11262,6 +11276,17 @@ const MAX_STAGE_BYTES: usize = 4 * 1024 * 1024;
 /// colour bytes of a 4-byte pixel and never the pad byte — so pad bytes stay 0 for the life of the
 /// buffer, and the rows copied to the front carry the same zero pad `Screen`'s back buffer has
 /// always presented.
+///
+/// WCPAR SEAM (design: `engine.md` §8 "WCPAR — parallel per-core composite"). This ONE shared buffer
+/// is the shared resource that forces the COMPOSE half of the pass to be serial: two concurrent
+/// composes cannot share it, so the loser DECLINEs (`DECL_LOCK`) into the tearing direct path. The
+/// parallelism step 1 is to make this a per-CPU pool — `[Mutex<Vec<u8>>; MAX_CPUS]` indexed by
+/// `crate::arch::sched::meter_current_cpu()` — so each core composes into a private buffer and N
+/// composes run at once. It is NOT landed here: while `COMP_GATE` still serialises the whole pass a
+/// per-core pool buys no throughput and only reserves memory, and the consumer that would exploit it
+/// (the compose/present phase split in `composite_inner`) collides with three in-flight arcs
+/// (`occ_clip`, `above_shell`/`SHELL_Z`, `ctrls_for`). The three `STAGE` lock sites to convert are
+/// here, `stage_window`'s `STAGE.try_lock`, and `stage_fill`'s two.
 static STAGE: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
 
 /// WC-H — whether the one-shot fallback fixture has been spent. See the fixture block in
