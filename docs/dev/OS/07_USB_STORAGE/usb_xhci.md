@@ -6413,7 +6413,10 @@ audio. Playing sound through it requires the Classic stack:
 
 - `HCI_Write_Inquiry_Mode(0x02)` + `HCI_Inquiry` (GIAC `0x9E8B33`) to discover, draining
   `Inquiry Result` (0x02) / `with RSSI` (0x22) / `Extended Inquiry Result` (0x2F), with
-  `HCI_Inquiry_Cancel` (0x0402) on every exit path.
+  `HCI_Inquiry_Cancel` (0x0402) on every exit path. **BUILT — see §26**, which is where this
+  sketch got cashed and where it got corrected: the inquiry is what supplies the page's
+  `Page_Scan_Repetition_Mode` and `Clock_Offset`, and `HCI_Write_Inquiry_Mode` turned out **not**
+  to be needed (§26.3).
 - **The event mask must be widened again**: Inquiry Complete (bit 0) and Inquiry Result (bit 1)
   are inside L1's reset default, and Inquiry Result with RSSI (bit 33) is too — but **Extended
   Inquiry Result is bit 46, outside the `0x00001FFFFFFFFFFF` default**, so EIR (where a friendly
@@ -6771,9 +6774,9 @@ starting clean, a re-run leaks no HCI state and double-arms no scan.
 **3. Honest bounding.** A re-trigger is **one more bounded chain**, not a background storm: the LE
 scan window, plus (under `btc`) up to `BT_C1_PAGE_ATTEMPTS` page trains of `page_timeout` each — the
 same shape the boot run's merged 4-window / 2-attempt bound already pays. Worst case added per
-trigger in a quiet room is that one chain's wall-clock (dominated by the two ~5.12 s page trains,
-≈12.4 s classic), witnessed on the `bt-l2`/`bt-c1` lines it emits, then it returns and the service
-loop resumes. A trigger in a quiet room bounded-fails exactly like the boot run.
+trigger in a quiet room is that one chain's wall-clock (dominated by the two ~5.12 s page trains —
+≈12.4 s classic when this was written, **≈18.6 s since §26 put an inquiry in front of the page**),
+witnessed on the `bt-l2`/`bt-c1` lines it emits, then it returns and the service loop resumes. A trigger in a quiet room bounded-fails exactly like the boot run.
 
 **4. Gated as today.** `bt` for the chord/request/re-trigger, `btc` for the classic page and the
 `bt_left_link` latch; default behaviour is unchanged except that the chain is now *also* reachable
@@ -6805,6 +6808,167 @@ the re-page rather than a permanent "already connected"; every re-trigger carrie
 `ACL toggle resync` lines proving the DATA0 match; and a press in a quiet room bounded-fails exactly
 like boot. The two SHOULD-FIX defects the escape hatch and the resync close are each therefore
 provable from a single Boot C capture, on the exact scenario the arc exists for.
+
+---
+
+## 26. BT-PAGE — the page was aiming blind: inquiry first, then page (`UNAOS_BTC=1`, 2026-08-11)
+
+### 26.1 The ground fact, and why it is not the speaker's
+
+Boot D (`~/unaos-bench/capture/gr26-bootD/ttyUSB0.log`, `bt-c1` lines [3817..14064 ms]) ran two full
+5.12 s page trains at the MEGABOOM and got `Connection Complete status=0x04` (PAGE TIMEOUT) for
+both. **Peter confirmed the speaker was in pairing mode for the whole of that boot.** A device in
+pairing mode is page-scanning *and* inquiry-scanning, so two full trains against it are not a fact
+about the speaker.
+
+The `bt-c1` witness of the day headlined the opposite reading — *"it is off, out of range, or not
+page-scanning … THIS IS THE ORDINARY RESULT FOR A POWERED-OFF SPEAKER"* — and a reader following
+that prose would have closed the investigation on a wrong cause. §26.4 is what replaced it.
+
+Two further facts from the capture history bound the problem:
+
+- **The page is not broken; it is intermittent.** `~/unaos-bench/capture/gr25-bootA/ttyUSB0.log`
+  shows this exact configuration REACHING the speaker — `Connection Complete status=0x00
+  handle=0x000b … BR/EDR LINK ESTABLISHED` at 11899 ms — but only on **attempt 2 of 2**, after the
+  first train timed out. gr25-bootB and gr26-bootD then got 2/2 timeouts. A path that succeeds on a
+  random-looking subset of trains is a path with an alignment problem, not a dead one.
+- **"Boot AS connected the MEGABOOM" is about LE, not classic.** The `gr24-bootAS` connection at
+  2377 ms is `bt-l3`'s `LE Connection Complete`; that flight's `UNAOS_BTC` was not armed. The
+  classic runs in that capture's second session both timed out at the then-1280 ms deadline. The
+  BT-C1 source comments cited "Boot AS" as the classic contrast case; that citation was wrong and
+  is corrected in-source to gr25-bootA.
+
+### 26.2 What the page was missing
+
+`HCI_Create_Connection` carries two fields whose only legitimate source is an inquiry:
+
+| Field | Boot D sent | Where it should come from |
+|---|---|---|
+| `Page_Scan_Repetition_Mode` | `0x02` (R2) — a guess | the peer's `Inquiry Result` |
+| `Clock_Offset` | `0x0000`, bit 15 **clear** = "not valid" | the peer's `Inquiry Result`, with bit 15 **set** |
+
+With the clock offset absent the controller cannot start its page train on the peer's clock phase;
+it must sweep for it. With the repetition mode guessed it must size the train for the worst case.
+That is precisely the shape of a page that reaches a listening device only when the phases happen
+to line up — i.e. gr25-bootA's second train.
+
+### 26.3 The sequence, before and after
+
+```
+BEFORE (Boot D)                         AFTER (this arc)
+                                        HCI_Inquiry(GIAC, 5.12s, unlimited)   0x0401
+                                          <- Inquiry Result(s)  0x02 / 0x22 / 0x2F
+                                             harvest psrm + clock_offset for the target
+                                          <- Inquiry Complete   0x01   (or early exit on target)
+                                        HCI_Inquiry_Cancel                    0x0402  (if not complete)
+HCI_Write_Page_Timeout 0x2000           HCI_Write_Page_Timeout 0x2000
+HCI_Create_Connection                   HCI_Create_Connection
+  psrm=0x02 (guess)                       psrm=<harvested>       (fallback 0x02)
+  clock_offset=0x0000 (invalid)           clock_offset=<harvested>|0x8000  (fallback 0x0000)
+```
+
+Design notes that are decisions rather than details:
+
+- **`HCI_Inquiry_Cancel` is mandatory, not tidiness.** A controller still in the Inquiry state
+  answers `Create_Connection` with Command Status `0x0C` (Command Disallowed). An inquiry left
+  running would make the page fail for a local-side reason a capture would read as the speaker's
+  fault, so the cancel runs on every path where `Inquiry Complete` was not read — including the
+  paths where the event endpoint went unreadable, since it rides EP0 and a halt does not touch EP0.
+- **Bit 15 of `Clock_Offset` is a named constant** (`BT_C1_CLOCK_OFFSET_VALID`). An `Inquiry Result`
+  reports the offset with that bit clear; paging without setting it makes the controller ignore the
+  offset entirely, which is indistinguishable in a capture from never having harvested one.
+- **The three result shapes are decoded separately.** `Inquiry Result` (0x02) spends two bytes on
+  Reserved and none on RSSI; `Inquiry Result with RSSI` (0x22) and the fixed part of
+  `Extended Inquiry Result` (0x2F) spend one on each. The per-response stride is 14 in all three, so
+  a decoder that got the shape wrong would still walk the list correctly and read a **wrong clock
+  offset** off every entry — the worst kind of wrong, because the resulting page fails exactly like
+  an unaligned one.
+- **`HCI_Write_Inquiry_Mode` is NOT issued**, contrary to the sketch in §23.6. The reset mode
+  (`0x00`, standard `Inquiry Result`) already carries both fields this arc needs, and mode `0x02`
+  would additionally require widening the event mask for Extended Inquiry Result at bit 46. EIR
+  carries a friendly *name*, which is not what a page needs; the decoder accepts 0x2F defensively in
+  case a part sends it anyway.
+- **The early exit is what bounds the good case.** The wait ends on whichever comes first: an
+  `Inquiry Complete`, or the target answering. `BT_C1_INQUIRY_LEN` (5.12 s) is paid in full only on
+  a boot that does *not* hear the target — which is exactly the boot where the listening time has to
+  be defensible.
+- **The address itself is now cross-checked.** `BT_L3_PEER_ADDR_BYTES` was read off an LE
+  advertisement, and a dual-mode device need not page under the address it advertises. The inquiry
+  answers on classic, so its result list is the first evidence this project has gathered about which
+  BD_ADDR the speaker actually pages under. Every response is printed; one sharing the target's
+  three-byte OUI without matching in full is flagged. **It is not paged** — the address rule is
+  Peter's (white board Q14) and this arc does not widen it — it is reported.
+
+### 26.4 The witness, and the prose that was wrong
+
+`bt-c1` gains three lines before the page (`inquiry parameters`, one `inquiry result` per response,
+`inquiry summary` + `page fields`), and the page's own lines now report which values they carried:
+
+```
+:: bt-c1: [N] inquiry parameters — lap=0x9E8B33(GIAC ...) inquiry_length=0x04(=5120ms) ... == witness ::
+:: bt-c1: [N] inquiry result — addr=.. psrm=0x..(R.) clock_offset=0x.... class_of_device=...... [rssi=-..dBm] event=0x..(..) -> .. == witness ::
+:: bt-c1: [N] inquiry summary — responses=N target_found=.. same_oui_seen=.. read_to_term=.. -> .. == witness ::
+:: bt-c1: [N] page fields — psrm=0x..(R.) clock_offset=0x....(bit15 ..) source=.. == witness ::
+:: bt-c1: [N] page parameters — ... psrm=0x..(R., HARVESTED from the peer's own inquiry response) clock_offset=0x....(bit15 SET = VALID ...) ... == witness ::
+:: bt-c1: [N] page summary — ... aligned_by_inquiry=.. -> .. == witness ::
+:: bt-c1: [N] C1 tally — ... inquiry_responses=N page_aligned_by_inquiry=.. pages_attempted=.. ... == witness ::
+```
+
+The `inquiry summary` verdict is the line that separates four cases the old capture collapsed into
+one: the target answered; the room is busy and the target is not in it; the room is silent (which
+indicts *this host's* receive path as much as the room); or the inquiry did not run to term and
+establishes nothing.
+
+**The prose change.** Both PAGE-TIMEOUT readings were rewritten so our-side causes carry equal
+weight with the peer's, and neither is presented as the headline:
+
+- with a harvested response, the peer-side readings are **excluded by evidence** — the inquiry heard
+  the address, so "off / out of range / not scanning" is not available to a reader at all;
+- without one, the line states the readings as a set of equal weight (no harvested offset, a
+  possibly-wrong address, or the peer's own state) and points at the `inquiry summary` as the thing
+  that tells them apart, rather than at the reader's prior.
+
+The `page summary`'s old "the short-deadline artefact Boot AS produced at 1280 ms" contrast was
+also removed: per §26.1 that citation was wrong, and the honest contrast is gr25-bootA.
+
+### 26.5 Cost
+
+The classic stage's bounded worst case moves from **≈12.4 s to ≈18.6 s** (`BT_C1_INQUIRY_MS` 5600 ms
+plus two `BT_L3_CMD_MS` round trips), and with the LE stage's repeat scan in front of it the worst
+boot is ≈21 s. All of it is paid only by a boot that set `UNAOS_BTC=1`. The good case is much
+shorter and is the point: an inquiry that hears the target exits early and the page it then makes is
+aligned, so the run that ends in a link on the **first** train is what this buys.
+
+`Ctrl+Alt+B` (§25) is unchanged and now more useful: a re-trigger re-runs the whole chain, so a
+speaker put into pairing mode *after* boot is inquiry-scanning at the moment the chord fires.
+
+### 26.6 What metal must verify (Boot B)
+
+QEMU has no Bluetooth radio, so the stage is compile-only there; `strings` on a `UNAOS_BTC=1`
+kernel shows every new witness (`inquiry parameters`, `inquiry summary`, `page fields`,
+`HCI_Inquiry_Cancel (0x0402)`, `page_aligned_by_inquiry`, `THE PEER-SIDE READINGS ARE EXCLUDED`) and
+a default build shows none. The falsifiable outcomes on metal, ranked:
+
+1. **The arc works.** `inquiry summary … target_found=true`, then `page parameters … psrm=0x..
+   (HARVESTED …) clock_offset=0x….(bit15 SET = VALID …)`, then `Connection Complete … status=0x00
+   … BR/EDR LINK ESTABLISHED` on **attempt 1/2** — where gr25-bootA needed two trains and Boot D got
+   none. `C1 tally … page_aligned_by_inquiry=true pages_attempted=1 links_established=1`.
+2. **Aligned and still refused.** `target_found=true` and a PAGE TIMEOUT anyway. The peer-side
+   readings are then excluded by the capture itself, and the remaining candidates are the harvested
+   offset ageing between inquiry and page, this controller's page train, or the transport. This is
+   the outcome that would send the next arc at the controller.
+3. **The address is wrong.** `target_found=false same_oui_seen=true` with an `inquiry result` line
+   naming a Logitech/UE-OUI address that is not `88:c6:26:cc:2d:3c`. That address is then the next
+   arc's whole brief, and Boot D's timeouts were never about reachability.
+4. **The target is not on classic.** `target_found=false same_oui_seen=false responses>0` — the
+   radio and receive path are proven by the other devices, and what is unproven is that this BD_ADDR
+   is on the air on classic at all.
+5. **`responses=0`.** A GIAC inquiry heard nothing in a populated room. That indicts this host's
+   receive path at least as much as the room, and the `inquiry summary` says so.
+
+The refutation that outranks all of them is unchanged from §22: **HID dead after `bt-c1` = the
+endpoint invariant broke.** This arc adds no `bt_arm_read` call site — every read goes through the
+existing `bt_l3_await`, whose `armed` threading is what preserves the invariant by construction.
 
 ---
 
