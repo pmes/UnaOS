@@ -437,6 +437,15 @@ _feats=""
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
+# GEN7-3D: UNAOS_IVB3D=1 arms the Ivy Bridge RENDER-ENGINE reconnaissance rung R1
+# (drivers/gpu/gen7.rs) — a READ-ONLY census of the pinned RCS/BCS/VCS ring blocks, the
+# hypothesised forcewake/GTFIFO offsets, the GGTT, and GGC/BDSM. Zero MMIO writes, zero
+# config writes, no display register touched: this rung cannot black the panel and its
+# media is NOT single-use. `gen7` implies `intel-ivb` (it needs the BAR0 window igpu::init
+# publishes), but the env knob is mapped independently so R1 can be armed without arming
+# anything else. Kept in sync with builder/src/main.rs — a knob armed here but missing
+# there ships the feature DISABLED on MEDIA while the banner claims it is on.
+[ -n "${UNAOS_IVB3D:-}" ] && _feats="${_feats}gen7,"
 # GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the INTEGRATED GPU with an unwind-stack
 # restore on the same call stack — no dwell, no timer (drivers/gpu/igpu.rs; round 13 removed the
 # timed auto-revert). ⛔ SINGLE-USE TEST MEDIA — the knob is baked into the image and
@@ -679,6 +688,22 @@ arm_features() {
     # for zero observable change. Stripped => the x86 track can arm (or disarm) the present pacer without
     # touching Pi or Jetson media at all.
     f="${f//,nopace,/,}"
+    # GEN7-3D R1 (GR25) rides the same strip, for the same reason and by the same mechanism as
+    # `bcmarecon` above: `drivers/gpu/gen7.rs` carries a file-level `#![cfg(target_arch =
+    # "x86_64")]` and its single call site is gated `all(target_arch = "x86_64", feature = "gen7")`,
+    # so `gen7` emits not one byte of aarch64 CODE — but an enabled feature is hashed into cargo's
+    # `-Cmetadata` fingerprint, so leaving it in would shift every aarch64 media hash between a
+    # default build and a `UNAOS_IVB3D=1` one for zero observable change. Note `gen7` IMPLIES
+    # `intel-ivb`, which predates this policy and is NOT stripped, so stripping `gen7` alone is the
+    # whole delta.
+    #
+    # ⚠ Review of 055c0e58 caught this comment being load-bearing and FALSE: the call site was
+    # gated on the FEATURE only, so an aarch64 build with `gen7` enabled would have tried to call
+    # into a file whose `#![cfg]` had deleted it — the strip was a BUILD REQUIREMENT masquerading as
+    # a hash-stability nicety, and the comment said the opposite. The call site is now arch-gated
+    # too, which makes this paragraph true as written and demotes the strip back to what every other
+    # entry here is: fingerprint hygiene, not a load-bearing dependency.
+    f="${f//,gen7,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -1408,7 +1433,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,gen7"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the

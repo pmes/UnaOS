@@ -44,6 +44,19 @@ nopace = []
 instgui = ["wc", "installdemo"]
 intel-ivb = []
 unaos_ivb = ["unaos-boot-info/unaos_ivb"]
+# GEN7-3D R1: the Ivy Bridge render-engine reconnaissance rung (`UNAOS_IVB3D=1`, mapped in
+# `arroyo` and `builder/src/main.rs` — all three legs, per the knob-wiring law). Implies
+# `intel-ivb` because the rung consumes the BAR0 window `igpu::init` maps and publishes.
+#
+# READ-ONLY: the rung performs zero MMIO writes and zero config writes, so unlike `gmux_igd`
+# the media is NOT single-use and no boot from an armed stick changes machine state. It
+# cannot black the panel — it writes nothing, and the panel belongs to the Kepler anyway.
+#
+# DEFAULT OFF => `drivers/gpu/gen7.rs` is not compiled, the call site in `igpu::init`
+# vanishes, and no `:: gen7:` token exists in the image (strings-verifiable, which is the
+# gate that matters here — QEMU has no Ivy Bridge IGD and proves nothing about any rung).
+# See ~/unaos-bench/scratch/gr25/GEN7-3D-draft.md §5 rungs R0/R1.
+gen7 = ["intel-ivb"]
 # GMUX-IGD: arm the display-mux switch to the INTEGRATED GPU (`UNAOS_GMUX_IGD=1`, already mapped in
 # `arroyo` and `builder/src/main.rs` since ce5c6f49 — this entry is the third leg those two assumed
 # existed). x86_64-only, and only reachable on an `unaos_ivb` build that printed PROTOCOL PROVEN.
