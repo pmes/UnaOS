@@ -249,7 +249,14 @@ _feats=""
 # off there is no handle for it, so the default x86 image cannot reach its own boot volume. GR26
 # Boot D is the conviction: `[sdhc] … CARD IDENTIFIED`, three ADMA/PIO windows matched, MBR p0
 # type=0x0b verified — and then `handles=global=absent sdhc=unbuilt` at every consumer, `bg /fat/VUG.ELF`
-# with nothing to open. Default-on costs a READ-ONLY third handle and no global-slot change.
+# with nothing to open. Default-on costs a third handle and no global-slot change.
+# REVIEW CORRECTION (GR26): "READ-ONLY at the FAT layer, unconditionally" above is GR20's property and
+# SDHC-4c SUPERSEDED it — `write_sector`/`write_sectors` now admit a span inside the reserved extent
+# (fs/sdhc4c.rs). What keeps a DEFAULT image read-only on the card is the absence of `sdw` (still
+# opt-in, unchanged by this flip): no `sdw` => no CMD24 ladder in the image, so `write_block_sdhc` is
+# the refusing stub and `sdhc4c_write_verify` is the SKIP stub. Note the widened meaning of the OTHER
+# knob: UNAOS_SDW=1 alone now also arms `sdhcblk`, so an `sdw` build reaches the SDHC-4c reserve pass
+# on the internal card without a second knob, which before this flip it did not.
 # UNAOS_SDHCBLK=1 is still accepted and still means "on", so existing playbooks keep working.
 # Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
 # disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).

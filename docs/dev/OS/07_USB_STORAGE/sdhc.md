@@ -1921,10 +1921,16 @@ arc would otherwise inherit as proven.
   inside one `sdhc_probe_once` call with one write per boot — but the moment a service loop writes
   repeatedly, a hot-swap makes the extent point at a different medium. Close it the way
   `flight_recorder.rs`'s FRSTAMP does before that arc lands.
-- **cfg blind spot.** `sdhcblk` and `sdw` are carried by exactly one leg (`x86-all`) and it carries
-  BOTH, so `all(sdhcblk, not(sdw))` — the write-refusal arm and this module's skip arm — is
-  type-checked by zero legs of `./arroyo check`. It compiles clean by hand and is exercised by the
-  QEMU fixture; either add an `x86-sdhcblk-nosdw` leg or read that polarity as fixture-covered only.
+- **~~cfg blind spot~~ — CLOSED, and re-measured in GR26.** The claim was: `sdhcblk` and `sdw` are
+  carried by exactly one NAMED leg (`x86-all`) and it carries BOTH, so `all(sdhcblk, not(sdw))` —
+  the write-refusal arm and this module's skip arm — is type-checked by zero legs. That is true of
+  `KERNEL_CFG_MATRIX` and FALSE of `./arroyo check`, which also runs the derived GATE-CFG-MIX legs.
+  Measured on the BOOT-STORAGE tip by dumping `build_cfg_legs`: **`x86-mix-2` carries `sdhcblk`
+  without `sdw`** (and `x86-mix-3/4/6` carry neither, `x86-mix-0/5/7` carry both). No
+  `x86-sdhcblk-nosdw` leg is needed. This matters more after BOOT-STORAGE than before it, because
+  `all(sdhcblk, not(sdw))` is now the DEFAULT SHIPPING x86 polarity rather than a knob combination.
+  Note the mix legs are INDEX-DERIVED from `[features]` order, so this is a measurement of one tree,
+  not a standing guarantee — re-dump it if a feature is added or renamed.
 - **The bench card carries no reserved file.** Boot AO's root listing has 11 entries and no
   `UNALOG.BIN`, so the first metal boot of this build takes the honest-refusal path
   (`permit=UNARMED (absent from the card's root directory)`) and writes nothing. Staging the file
@@ -2003,9 +2009,33 @@ What default-on costs is bounded and was already argued for in §10:
 * **Nothing claims the global slot.** `register_sdhc` publishes a THIRD handle and says so in
   its own witness (`global BLOCK_DEVICE untouched`).
 * **`program_source` puts the global FIRST.** On any boot where a stick enumerates, the answer
-  is bit-identical to `info()` and the `Sdhc` arm is never reached.
-* **The FAT layer refuses every write to a `Sdhc` source**, unconditionally, with a one-shot
-  witness (§10.3 / `flight_recorder.rs` §SINGLE FAT WRITER).
+  is bit-identical to `info()` and the `Sdhc` arm is never reached — which is what makes the flip a
+  strict superset of every boot that already worked.
+
+  > **Review finding, recorded not fixed — that precedence is the wrong way round under the NEW
+  > premise, and this arc is what makes it reachable by default.** On the machine the flip exists
+  > for, the boot volume is the internal card and the global slot is empty. `publish_usb_geometry`
+  > claims the global UNCONDITIONALLY on x86, so any USB stick an operator inserts merely to READ
+  > becomes the program source mid-boot, and `/fat` silently stops meaning the volume the machine
+  > booted from — `bg /fat/VUG.ELF` would resolve against the stick. Before this arc there was no
+  > `Sdhc` handle to displace, so the state did not exist. FRGUARD already refuses the WRITE half of
+  > exactly this scenario (`BM_SUBSTITUTED`; Boot AI-2, `docs/SECURITY.md`), which means the kernel
+  > HOLDS the evidence needed — `BootInfo::boot_volume_serial` — and `program_source` does not
+  > consult it. The fix is its own arc, not a review edit: prefer the handle carrying the boot
+  > volume serial, fall back to the current global-then-`Sdhc` order when the serial is 0 or found
+  > on neither handle (the same fail-open direction FRGUARD takes). Until then, the operating rule
+  > for this machine is: do not insert a USB stick while programs are expected to load from `/fat`.
+* **The card stays read-only because a default image has no `sdw`** — not because the FAT layer
+  refuses. *(Review correction. An earlier wording of this bullet said "the FAT layer refuses every
+  write to a `Sdhc` source, unconditionally". That was GR20's property and §11 — SDHC-4c — replaced
+  it: `write_sector`/`write_sectors` admit a span that lies inside the reserved extent
+  (`fs::sdhc4c::permit_write`).* The gate that is actually load-bearing here is `sdw`, which this arc
+  does NOT flip and which stays opt-in: without it the image contains no CMD24 ladder, so
+  `block::write_block_sdhc` is the refusing stub (`no `sdw` feature … no CMD24 ladder`) and
+  `FatFs::sdhc4c_write_verify` is the SKIP stub. **What the flip does widen is the meaning of
+  `UNAOS_SDW=1`:** it now implies `sdhcblk` too, so an `sdw` build reaches the SDHC-4c reserve pass
+  on the internal card without the second knob GR20 required. That is a knob an operator sets
+  deliberately to write the card, so it is a widening to record, not a hazard to fix here.
 * **FRGUARD fails OPEN.** `default_writable()` refuses in exactly one state — `BM_SUBSTITUTED`,
   where the boot volume serial was POSITIVELY located on the other handle. `BM_UNKNOWN` and
   `BM_UNPROVEN` both allow writes. On the QEMU harness the verdict is `BM_UNPROVEN` and the
@@ -2090,9 +2120,22 @@ And the census must FLIP at every consumer that declined on Boot D: `handles=glo
 sdhc=present`. `global=absent` is expected and correct (no USB stick on this machine); it is
 `sdhc=unbuilt` → `sdhc=present` that is this arc's whole claim. `bg /fat/VUG.ELF` must load.
 
-What must NOT appear under any outcome: a `:: SDHCBLK: FAT write REFUSED …` line (nothing in
-this build writes through the FAT layer to that card, so it firing means a caller this analysis
-missed), or a `:: FRGUARD: SUBSTITUTION …` line while the recorder is expected to work.
+**Also expected, and NOT a defect** *(review correction — the first version of this section omitted
+them, and an analyst reading it would have met unpredicted lines)*: default-on compiles SDHC-4c, so
+the reserve pass runs on this boot. Boot AO's root listing has 11 entries and no `UNALOG.BIN`
+(§11.6), so the honest-refusal path is what should print — a `:: SDHC4C-ROOT: …` census, a
+`permit=UNARMED … absent from the root directory …` disarm, and the closing tally. Nothing is
+written. If the host HAS staged `UNALOG.BIN` since, the pass arms and then prints `:: SDHC4C:
+in-place write SKIPPED … this build carries no `sdw` feature …` with `cmd24=0`, which is still
+nothing written.
+
+What must NOT appear under any outcome *(review correction: the first version of this list named
+`:: SDHCBLK: FAT write REFUSED …`, a string that exists nowhere in the tree — an unfalsifiable
+tripwire. These are the strings the code can actually emit)*: `:: SDHCBLK: WRITE refused — this
+build carries no `sdw` feature …` or `:: SDHC4C: permit REFUSED at …` (either means something tried
+to write the card through a caller this analysis missed — the SKIP stub above returns before the
+block layer, so neither can fire on the reserve pass), a `:: SDHC4C: in-place write` verdict other
+than `SKIPPED`, or a `:: FRGUARD: SUBSTITUTION …` line while the recorder is expected to work.
 
 If the mount still fails, `SDHCREG` reads `handle=built register=ok` and the finding is
 downstream — `NotFat` indicts the medium's BPB, `Io` indicts the driver. Either way Boot B does
