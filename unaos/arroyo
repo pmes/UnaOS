@@ -345,16 +345,22 @@ _feats=""
 # commonly 1.28 s and an R2 train is nominally 2.56 s, so the short deadline manufactured false
 # negatives. A retry is spent on exactly ONE answer, Connection Complete status=0x04 for that
 # BD_ADDR; a link, a refusal, a local-side failure or an unresolved page all end the stage there.
-# WHAT IT COSTS A BOOT THAT SETS IT, honestly: ~10.3 s of paging for two unanswered trains, ~12.4 s
-# for the whole classic stage bounded (2x5600 ms host Connection-Complete windows, 2x300 ms
-# Command-Status waits, 2x300 ms cancels, plus up to ~1.1 s if Write_Page_Timeout itself goes
-# unanswered), and ~15 s for the worst boot with the LE stage's repeat scan included. BOTH BT KNOBS
+# SINCE GR26 (bt-page) THE STAGE OPENS WITH AN HCI_Inquiry — a GIAC BROADCAST, not merely the
+# directed page below: up to 5.12 s of general inquiry to harvest the target's own page-scan
+# repetition mode and clock offset (validated — an RFU psrm off the air is substituted, witnessed),
+# cancelled the moment the target answers, then the page goes out ALIGNED. This paragraph is where
+# air-side transmissions are justified, so state it plainly: a UNAOS_BTC=1 boot transmits a general
+# inquiry every boot, and any device in range may log it. WHAT IT COSTS A BOOT THAT SETS IT,
+# honestly: worst case ~18.6 s for the classic stage with the target never heard (5.6 s inquiry
+# window + 2x5600 ms Connection-Complete windows + Command-Status/cancel waits), ~21 s for the worst
+# boot with the LE stage's repeat scan included; the inquiry exits early the instant the target
+# answers, so the ordinary paired-speaker boot pays ~1-2 s of it. BOTH BT KNOBS
 # DEFAULT OFF, and this whole path runs on the SYNCHRONOUS EHCI walk — it must be made asynchronous
 # before Bluetooth is ever default-on, because these are seconds of boot spent blocking.
 # NO Write_Scan_Enable is issued: §7.3.18 governs INBOUND inquiry/page scan and paging out needs
 # none of it. Its own knob and NOT part of UNAOS_BT because a page is a directed transmission that
-# makes an audible noise on the speaker — a boot that did not ask for one must be incapable of
-# issuing one. Implies `btc = ["bt"]` in Cargo.toml, so setting this alone arms the whole BT stack.
+# makes an audible noise on the speaker (and the inquiry above is a broadcast) — a boot that did
+# not ask for either must be incapable of issuing them. Implies `btc = ["bt"]` in Cargo.toml, so setting this alone arms the whole BT stack.
 # x86_64 only; stripped from aarch64 builds by `arm_features` below. Default OFF => the page code,
 # its constants and the classic Connection-Complete latch unlinked, media byte-identical. Kept in
 # sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
