@@ -1095,6 +1095,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // throwaway console and mutates nothing (its write leg targets an unresolvable name).
             #[cfg(all(target_arch = "x86_64", feature = "witness"))]
             unaos_kernel::shell::fatverb_storage_witness();
+            // WIFI-1 (wifi knob): the Broadcom/bcma firmware-load path — see the note at the second
+            // loop site. Sits at all THREE storage-ready passes, like `fatverb_storage_witness`,
+            // because which pass a given x86 build reaches depends on its knobs; the forward-only
+            // state machine inside makes it speak exactly once. Read-only in arc 1.
+            #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
+            unaos_kernel::wifi::service();
             // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under
             // /fs/usb and emit the witness (aarch64 Pi path; runs with the xHCI lock released).
             #[cfg(target_arch = "aarch64")]
@@ -1502,6 +1508,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // exactly once. Mutates nothing.
         #[cfg(all(target_arch = "x86_64", feature = "witness"))]
         unaos_kernel::shell::fatverb_storage_witness();
+        // WIFI-1 (wifi knob): the Broadcom/bcma firmware-load path. Runs the PCI-config census once,
+        // then — because the blob lives on the FAT volume the USB-storage device serves, which
+        // enumerates asynchronously above — waits here for that device and stages the blob exactly
+        // once. Forward-only and terminal: after one attempt it parks, so this costs a relaxed atomic
+        // load per iteration for the rest of the boot. Read-only in arc 1 (no MMIO, no device write).
+        // Like `fatverb_storage_witness` above, it sits at all THREE storage-ready passes this file
+        // carries, because which pass a given x86 build reaches depends on its knobs.
+        #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
+        unaos_kernel::wifi::service();
         // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under /fs/usb
         // and emit the witness (aarch64 Pi path; runs here with the xHCI lock released, like probe_once).
         #[cfg(target_arch = "aarch64")]
@@ -4194,6 +4209,11 @@ fn x86_usb_pump(cpu: usize) {
         // exactly once. Mutates nothing.
         #[cfg(all(target_arch = "x86_64", feature = "witness"))]
         unaos_kernel::shell::fatverb_storage_witness();
+        // WIFI-1 (wifi knob): the Broadcom/bcma firmware-load path — see the note at the second loop
+        // site. Third of the three storage-ready passes; the forward-only state machine inside makes
+        // it speak exactly once whichever pass a given build reaches. Read-only in arc 1.
+        #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
+        unaos_kernel::wifi::service();
         // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial on growth.
         #[cfg(feature = "witness")]
         unaos_kernel::bootlog::service_serial_dump();
