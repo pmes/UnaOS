@@ -6419,7 +6419,8 @@ audio. Playing sound through it requires the Classic stack:
   Inquiry Result is bit 46, outside the `0x00001FFFFFFFFFFF` default**, so EIR (where a friendly
   name arrives without a separate `HCI_Remote_Name_Request`) needs the mask extended exactly as L2
   extended it for LE Meta at bit 61.
-- Then the actual work: ACL link, L2CAP, SDP, AVDTP, and an SBC encoder for A2DP.
+- Then the actual work: ACL link, L2CAP, SDP, AVDTP, and an SBC encoder for A2DP. (The ACL link is
+  BT-C1; L2CAP and AVDTP signalling are BT-C2, §24. SDP is skipped, with reasons, in §24.2.)
 
 That last line is the whole point. Discovery is a rung; **A2DP is a stack**, and it is a much
 larger road than the L0-L3 ladder that precedes it. It is named here so the size of it is a
@@ -6439,6 +6440,263 @@ unable to find this speaker.
 
 The refutation that outranks the rest is unchanged from §22: **HID dead after `bt-l2` = the
 endpoint invariant broke** — though this arc adds no `bt_arm_read` call site to break it.
+
+---
+
+## 24. BT-C2 — the signalling road: an L2CAP channel and one AVDTP DISCOVER (`UNAOS_BTC=1`, 2026-08-11)
+
+### 24.1 Where C2 sits
+
+BT-C1 proved the transport. On Boot A (`~/unaos-bench/capture/gr25-bootA/ttyUSB0.log`) the second
+page train reached the speaker:
+
+```
+:: bt-c1: [1] Connection Complete (0x03) — status=0x00 handle=0x000b peer=88:c6:26:cc:2d:3c
+             link_type=0x01(ACL) encryption=0x00 -> BR/EDR LINK ESTABLISHED
+:: bt-c1: [1] page summary — attempts_run=2/2 pages_on_air=2 page_timeouts=1 -> REACHED
+```
+
+An ACL link is a pipe, not a service; nothing above it existed. BT-C2 builds the first thing that
+does, and it runs in exactly the position BT-L4 occupies on the LE side — inside `bt_c1_page`,
+after every path that can establish or recover a handle, and **before** the mandatory
+`HCI_Disconnect`. It returns unit, so it is structurally incapable of skipping the teardown.
+
+The stage claim, stated so it can be falsified: *an L2CAP channel to PSM 0x0019 opened and was
+configured in both directions, and here is the list of stream endpoints the speaker published on
+it.* No codec negotiation, no `SET_CONFIGURATION`, no `OPEN`, no `START`, no encoder, no media.
+
+### 24.2 SDP is skipped, and why that is a judgement rather than an omission
+
+The conventional order is SDP first: open a channel to PSM 0x0001, send an
+`SDP_ServiceSearchAttributeRequest` for `AudioSink` (UUID 0x110B), and read the PSM out of the
+returned protocol descriptor list. That is a continuation-state-driven parser over a variably-typed
+data-element tree — a larger PDU surface than everything else in this stage combined.
+
+**The AVDTP PSM is not discovered, it is assigned**: 0x0019, fixed by Assigned Numbers. So the
+`CONNECTION_RSP` on PSM 0x0019 answers the same question SDP would, more directly: a device with no
+AVDTP answers `result=0x0002 (PSM not supported)`, which is a complete negative. And the
+`AVDTP_DISCOVER` response that follows lists the endpoints that *actually exist*, which is strictly
+more than an SDP record asserts. SDP is not ruled out — a real stack wants it for AVRCP and for the
+sink's supported-features bitmask — it is ruled out *here*.
+
+(The brief that commissioned this stage named PSM **0x0017** for AVDTP signalling. 0x0017 is AVCTP,
+the AV/C remote-control transport; AVDTP is **0x0019**. The code carries 0x0019.)
+
+### 24.3 The PDU plan, and the witness for each step
+
+Every PDU is printed in both directions. Outbound lines carry `-> OUT<ep>`, inbound lines `<-`.
+
+| # | PDU | Direction | Witness line |
+|---|-----|-----------|--------------|
+| 1 | `L2CAP_CONNECTION_REQ` (0x02), PSM 0x0019, SCID 0x0040 | out | `-> OUT2 CONNECTION_REQUEST psm=0x0019(AVDTP) scid=0x0040 …` |
+| 2 | `L2CAP_CONNECTION_RSP` (0x03) | in | `<- CONNECTION_RESPONSE ident= dest_cid= src_cid= result= status= -> …` |
+| 3 | `L2CAP_CONFIGURATION_REQ` (0x04), MTU option = 48 | out | `CONFIGURATION_REQUEST sent — … option=MTU(0x01) len=2 value=48 …` |
+| 4 | `L2CAP_CONFIGURATION_RSP` (0x05) | in | `<- CONFIGURATION_RESPONSE … result= -> SUCCESS/…` |
+| 5 | peer's `L2CAP_CONFIGURATION_REQ` | in | `<- CONFIGURATION_REQUEST ident= dest_cid= flags= option_bytes=` + one line per option |
+| 6 | `L2CAP_CONFIGURATION_RSP` | out | `-> OUT2 CONFIGURATION_RESPONSE result=0x0000 …` |
+| — | channel state | — | `L2CAP channel state — scid= dcid= host->peer_configured= peer->host_configured= -> OPEN / NOT OPEN` |
+| 7 | `AVDTP_DISCOVER` (signal 0x01) | out | `AVDTP_DISCOVER sent on cid= — header=[00 01] label=0 packet_type=0b00(SINGLE) …` |
+| 8 | `AVDTP_DISCOVER` response | in | `<- AVDTP_DISCOVER RESPONSE ACCEPT label= — N Stream End Point(s)` + `<- SEP i/N — seid= in_use= media_type= tsep=` |
+| 9 | `L2CAP_DISCONNECTION_REQ` (0x06) | out | `-> OUT2 DISCONNECTION_REQUEST` |
+| 10 | `L2CAP_DISCONNECTION_RSP` (0x07) | in | `<- DISCONNECTION_RESPONSE … -> THE CHANNEL IS CLOSED BY AGREEMENT` |
+
+Steps 3–6 are two **independent** handshakes. A BR/EDR channel enters the OPEN state only when the
+local device has accepted the peer's configuration *and* the peer has accepted the local device's
+(Core Vol 3 Part A §6.1.3). Driving only the first half is the classic way to build a channel that
+exists in the log and never carries a byte, so the `L2CAP channel state` line prints every flag and
+the AVDTP signal is not sent unless all of them agree.
+
+The open condition is `our_cfg_done && peer_cfg_done && !peer_cfg_refused && !peer_closed`, and the
+third term is not decoration. Configuration is a *sequence*: a peer may send a first request this
+host accepts and a second asking for a retransmission mode it refuses, leaving `peer_cfg_done` true
+from the first and `peer_cfg_refused` true from the second. Without that term the stage would print
+"OPEN. THE SIGNALLING ROAD TO A2DP EXISTS" and send AVDTP down a channel it had just told the peer
+it could not configure. Both configuration paths also check the **CID**: a request or response
+naming a channel this host does not own is answered (so the peer's RTX timer does not stall) but
+cannot complete this channel's half of the handshake.
+
+`bt_c2_await` services peer-initiated signalling inline rather than discarding it — a
+`CONFIGURATION_REQUEST` gets a real decision, an `INFORMATION_REQUEST` gets an honest
+`result=0x0001 (not supported)`, an `ECHO_REQUEST` gets an echo, a `DISCONNECTION_REQUEST` gets a
+response, and any other **request** gets `COMMAND_REJECT`. An unanswered request keeps the peer's
+RTX timer running and it will retransmit; that is how a signalling channel deadlocks against a
+silent host.
+
+Requests and responses are told apart by **parity**, not by an enumeration: Vol 3 Part A §4
+allocates signalling codes in request/response pairs with the request even and the response odd
+(0x02/0x03, 0x04/0x05, … through 0x18/0x19). Any odd code is a response and is stepped over,
+never rejected — a `COMMAND_REJECT` answers a request, never a response. Listing only the response
+codes the stage happens to implement would have sent rejects for 0x0D, 0x0F, 0x11, 0x13, 0x17 and
+0x19.
+
+Matching is by **CID and command code, never by Identifier**. This stage has one request
+outstanding at a time, so a code on the right channel is unambiguous, whereas matching on the
+Identifier this host chose would make a peer that echoes the wrong one — which several embedded
+stacks do — look like silence. The Identifier is printed on every decoded PDU regardless, so a
+capture can still check the echo.
+
+**MTU = 48** is chosen because it is the BR/EDR mandatory minimum (§5.1), so no conforming peer may
+refuse it — and because a full-size SDU (48 + 4 L2CAP + 4 ACL = 56 B) still arrives in one 64-byte
+bulk-IN. A streaming arc renegotiates upward on its own channel.
+
+**What is refused.** The peer's configuration is accepted option by option. Everything that
+constrains the *peer* — MTU, flush timeout, QoS, FCS, extended window — is accepted as proposed,
+because a Basic-mode responder honours it by doing nothing. The exception is `RETRANSMISSION AND
+FLOW CONTROL` (type 0x04) with a mode byte other than 0x00: that asks for Enhanced Retransmission,
+Streaming or Flow Control mode, none of which this stage implements, so it is answered
+**`result=0x0002` (Rejected — no reason given)** and the stage stops before AVDTP rather than
+promising framing it cannot produce. Options carrying the HINT bit (0x80) are ignored wholesale,
+which is what the hint bit means.
+
+`0x0002` and not `0x0003`: `0x0003` is *failure — unknown options*, a claim this host cannot make,
+since it recognised the option perfectly well and declined the mode inside it. A peer reading
+`0x0003` would retry without the option instead of giving up.
+
+### 24.4 The data-toggle bug this arc had to fix first
+
+A bulk pipe's USB data toggle belongs to the **endpoint** and persists for the life of the pipe: it
+is reset by `SET_CONFIGURATION`, `CLEAR_FEATURE(ENDPOINT_HALT)` or a port reset (USB 2.0 §5.8.5,
+§9.4.5), and by nothing happening at the Bluetooth layer.
+
+BT-L4 runs one ACL exchange on the **LE** link and leaves both toggles at DATA1. BT-C2 then runs on
+**the same two endpoints**, a whole classic page later. A BT-C2 that started from DATA0 — which
+every reading of "a fresh link" suggests — would have its first OUT silently discarded by the radio
+as a retransmission and its first IN mis-sequenced, and the capture would have shown a speaker that
+accepted a channel request and never answered.
+
+The toggles are therefore carried on the controller (`bt_acl_tog`), written by every ACL
+transaction that **retires** (a transaction that times out moves no data and advances nothing), and
+witnessed by the C2 transport line, which says where they came from:
+
+```
+:: bt-c2: [1] transport — BR/EDR handle=0x000b ACL pair addr=7 bulk_out=OUT2/64B bulk_in=IN2/64B
+              acl_buffers=6 start_toggle=(out DATA1, in DATA1) — CARRIED OVER FROM BT-L4's LE
+              exchange … stage_cap=6000ms per_pdu_window=1500ms packet_cap=48 tx_cap=12
+```
+
+`bt_acl_tog` and `bt_acl_bufs` are gated on `btc`, not on `bt`, because BT-C2 is their only reader —
+and `bt_acl_tog_set` exists so the *write* disappears in a `bt`-only build too.
+
+One recorded negative, because it is a fact about the tooling this codebase leans on: **rustc's
+`dead_code` lint does NOT flag a field that is only ever assigned.** A controlled two-file
+experiment confirms it — a field set only in a struct literal warns `field is never read`, and the
+same field assigned once through `self.f = v` does not. So a `bt`-only build with these fields
+gated on `bt` produced *no* warning either before or after the gating change. The gating is right
+on its merits; the compiler was never going to catch it being wrong. Write-only state is invisible
+to the lint, which is the same blind spot as an instrument that cannot fail.
+
+### 24.5 Budgets, and what the stage can cost a boot
+
+| Bound | Value | What it bounds |
+|---|---|---|
+| `BT_C2_SIG_MS` | 1500 ms | one signalling response. L2CAP's RTX minimum is 1 s (§6.2.1), so a shorter window would give up inside a conforming peer's permitted response time |
+| `BT_C2_STAGE_MS` | 6000 ms | the **whole stage**, from its first line. Every wait takes `min(SIG_MS, remaining)`, so no sequence of slow answers outruns it |
+| `BT_C2_PKT_MAX` | 48 | ACL packets read across the stage — the second bound, so a chatty peer cannot spin a loop whose per-read deadline keeps being met |
+| `BT_C2_TX_MAX` | 12 | ACL packets sent in **total**. A correct exchange sends 5 |
+| `BT_C2_INFLIGHT_MAX` | 2 | ACL packets **unacknowledged at once** — the depth bound, see below |
+| `BT_C2_OPT_PRINT_MAX` | 8 | config options *printed* per request (all are decided on) |
+| `BT_C2_SEP_PRINT_MAX` | 16 | stream endpoints *printed* per response (all are counted) |
+| `BT_L4_TXN_MS` | (shared) | one bulk-OUT token retiring |
+
+**The two print caps bound the one cost in this stage that no deadline observes.**
+`serial_println!` is synchronous: at 115200 baud a ~200-byte witness line is ~17 ms of wall clock
+that `BT_C2_STAGE_MS` never sees. A maximum-length `CONFIGURATION_REQUEST` carries ~120 options and
+a peer ignoring the negotiated MTU could declare far more SEPs, so an uncapped transcript turns a
+6-second stage into minutes of printing — a denial of service against the boot, driven entirely by
+the peer. Every option is still *decided on* and every SEP still *counted*; only the transcript is
+truncated, and each truncation says how much it dropped. A refusable option is printed whatever the
+cap, so a refusal is never left without its evidence. `bt_c2_answer_config` also re-checks the
+stage cap **before printing**, not only before waiting.
+
+**Depth versus total.** The Core spec caps the host at `HC_Total_Num_ACL_Data_Packets`
+unacknowledged packets (Vol 4 Part E §4.1.1), tracked by `Number Of Completed Packets` — an event
+this stage never reads, because it lands on the HCI event endpoint BT-C1 is draining. So there is
+no accounting, and the substitute is a hard depth limit no legal buffer count can be below: 2, with
+the transport gate independently refusing a controller reporting fewer than 2 buffers. A packet
+arriving from the peer clears the counter; that is a completed round trip, not a completion event,
+and the tally does not pretend otherwise. Past the limit the stage declines to send and says so.
+
+Nothing is left alive, and the reason is structural rather than careful: an L2CAP channel lives
+inside an ACL link, and `bt_c1_page` releases that link unconditionally on the next line. What C2
+*can* leave behind is an **unconfirmed close**, and `left_outstanding=` is computed from state to
+say so — not a literal in the format string. That distinction matters because the must-not-appear
+grep grammar is `awk '/left_outstanding=/ && !/=none/'`, and a field that can only ever print
+`none` is an instrument that cannot fail.
+
+**The C2 → C1 coupling is witnessed, not assumed.** Every packet C2 sends queues a
+`Number Of Completed Packets` event that nobody reads, ahead of BT-C1's `HCI_Disconnect` looking
+for its `Disconnection Complete` through `bt_l3_await` — which walks past a *capped* number of
+unwanted events per wait. A queue C2 filled can therefore push that confirmation past the cap and
+make BT-C1 print its must-not-appear `A LIVE BR/EDR LINK` for a reason about queue depth rather
+than about the link. The `C2->C1 coupling` line prints the count so a capture can test that reading
+first and blame the link only after excluding it.
+
+The transport gate is BT-L4's plus one term — `acl_buffers >= 2`, read by BT-L1 from
+`HCI_Read_Buffer_Size` and latched on the controller. C2 has one moment (answering the peer's
+configuration request while its own is still in flight) at which two host-to-controller packets may
+be unacknowledged, and a one-buffer controller would have the second silently dropped. Boot A
+reports `acl_num=6`.
+
+Reassembly exists here and did not in BT-L4: L4's exchange fit one 64-byte max packet by
+arithmetic, but the **signalling** channel's MTU is the peer's business and a
+`CONFIGURATION_REQUEST` may exceed one USB transaction. The ACL header's `Data_Total_Length` is the
+authority, and it is read before anything else is believed.
+
+### 24.6 How the stage degrades
+
+Every refusal keeps BT-C1's verdicts unchanged and its `HCI_Disconnect` unconditional.
+
+| Observation | Reading |
+|---|---|
+| no `bt-c2:` lines at all | the page never reached a link; C1's `page summary` says why |
+| `L2CAP NOT ATTEMPTED` | the transport gate refused — chain mode, no ACL bulk pair, or `acl_buffers < 2`. The line names which |
+| `CONNECTION_RESPONSE … result=0x0002` | the device publishes no AVDTP service. A complete answer about the peer |
+| `CONNECTION_RESPONSE … result=0x0003` | **security block.** C1 reported `encryption=0x00` and this arc pairs with nothing, so this is the expected refusal from a speaker that insists on bonding — and it names Secure Simple Pairing as the next arc's prerequisite rather than leaving it to be guessed |
+| `CONNECTION_RESPONSE … result=0x0004` | no resources: commonly already streaming from another source |
+| `L2CAP channel state … NOT OPEN` | a configuration direction is missing or was refused; the four flags say which |
+| `STAGE CAP SPENT … NO WAIT WAS MADE` | the 6-second stage budget ran out before this PDU was awaited. **Nothing after it is evidence about the peer** — it was never listened for. Without this line the caller's "NO … within the window" would blame the peer for silence during a window that never opened |
+| `NOT SENT — N packet(s) are already unacknowledged` | the depth limit held. This host will not transmit past a bound it cannot verify |
+| `NO AVDTP response within the window` | the channel is open and configured, so the transport is proven and the peer's answer is what is missing. Two different findings, and the line separates them |
+| `AVDTP_DISCOVER RESPONSE REJECT` / `GENERAL REJECT` | the peer's AVDTP answered. Transport proven end to end; the signal is what it refused |
+
+### 24.7 What metal must verify (Boot B)
+
+QEMU has no Bluetooth radio, so this stage is **compile-only** off the bench: `./arroyo check` and
+`UNAOS_WC=1 ./arroyo check` type-check it, and `strings` proves the witness text is present with
+`UNAOS_BTC=1` and absent without it. Nothing else about it can be exercised without the speaker.
+
+Ranked, falsifiable:
+
+1. **The decisive line** — `<- CONNECTION_RESPONSE … result=0x0000` followed by
+   `L2CAP channel state … -> OPEN`. That is the arc's whole claim.
+2. **`start_toggle=(out DATA1, in DATA1)` on the transport line.** If the run reached BT-L4 and this
+   prints DATA0, the toggle carry-over is broken and every conclusion below it is void.
+3. **`AVDTP_DISCOVER RESPONSE ACCEPT` with at least one `media_type=0x00 tsep=SNK` SEP.** The
+   endpoint the next arc configures. `in_use=true` on all of them means the speaker is streaming
+   from another source.
+4. **`result=0x0003 (SECURITY BLOCK)`** is a *successful* run of this stage in the sense that
+   matters: it proves the L2CAP request reached the peer's service layer and returns a specific,
+   actionable reason. It converts the next arc from "codec negotiation" into "pairing first".
+5. **`C2 tally … left_outstanding=none`**, and BT-C1's own `C1 tally … left_outstanding=none`
+   unchanged behind it. A C2 that broke C1's teardown is the must-not-appear condition — and if C1
+   *does* report a live link, read the `C2->C1 coupling` line above it before concluding anything:
+   the unread completion events C2 queued are the competing explanation.
+6. **HID alive after `bt-c2`.** This stage adds no `bt_arm_read` call site, but it is the first code
+   to drive the ACL bulk pipes repeatedly, and the shared EP0 data buffer is what it builds packets
+   in. A dead trackpad after these lines indicts the buffer sharing.
+
+### 24.8 The arc after this one
+
+`AVDTP_GET_CAPABILITIES` / `GET_ALL_CAPABILITIES` (signals 0x02 / 0x0C) on a discovered sink SEID,
+to read its Media Codec capability — for A2DP that is the SBC capability block (sampling
+frequencies, channel modes, block length, subbands, allocation method, bitpool range). Then
+`SET_CONFIGURATION` (0x03), `OPEN` (0x06), a **second** L2CAP channel on PSM 0x0019 for the media
+transport, `START` (0x07), and an SBC encoder feeding RTP-framed media packets.
+
+Two things that arc must budget for that this one did not: **pairing**, if the `CONNECTION_RSP`
+comes back `0x0003`; and **flow control**, because a media stream is the first thing this driver
+will send that can exceed `HC_Total_Num_ACL_Data_Packets` and therefore the first that needs the
+`Number Of Completed Packets` event read rather than walked past.
 
 ---
 
