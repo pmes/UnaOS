@@ -1579,12 +1579,17 @@ an arm falling through.
 
 ### 10.4 The knob, the witnesses, and how each says NO
 
-`UNAOS_SDHCBLK=1` → cargo feature `sdhcblk`, wired in `unaos/arroyo` (mapping + the aarch64
-strip + the `x86-all` `KERNEL_CFG_MATRIX` leg) and in `unaos/builder/src/main.rs` — a knob
-wired into arroyo alone ships the backend disabled while the `⚡ kernel features:` banner
-claims it is on (the s42/INSTGUI and WXN-M3b lesson). Default OFF, and off means the enum
-variants do not exist, no registry slot or entry point is compiled, and the registration call
-site in `sdhc::bring_up` is unlinked.
+`sdhcblk` is a cargo feature wired in `unaos/arroyo` (mapping + the aarch64 strip + the
+`x86-all` `KERNEL_CFG_MATRIX` leg) and in `unaos/builder/src/main.rs` — a knob wired into
+arroyo alone ships the backend disabled while the `⚡ kernel features:` banner claims it is on
+(the s42/INSTGUI and WXN-M3b lesson).
+
+> **BOOT-STORAGE (GR26): the polarity is now DEFAULT-ON.** It was `UNAOS_SDHCBLK=1`, opt-in,
+> from GR20 until GR26. It is now on unless `UNAOS_NOSDHCBLK=1` is set. `UNAOS_SDHCBLK=1` is
+> still accepted and still means "on", so existing playbooks keep working. See §12 for the boot
+> that forced the change. Everything below about what OFF means still describes
+> `UNAOS_NOSDHCBLK=1` exactly: the enum variants do not exist, no registry slot or entry point
+> is compiled, and the registration call site in `sdhc::bring_up` is unlinked.
 
 Registration is the LAST thing `bring_up` does, after `verify_read`, `verify_multiblock`,
 `adma2_smoke`, `verify_adma_ab` and `write_selftest`. That ordering is the point: registration
@@ -1595,7 +1600,7 @@ Three distinguishable silences, which is what makes the witness falsifiable:
 
 | observation | means |
 |---|---|
-| no `:: SDHCBLK:` line at all | `register_sdhc` never ran — no card identified. The `[sdhc]` bring-up lines above say why. |
+| no `:: SDHCBLK:` line at all | `register_sdhc` published nothing. **Read `:: SDHCREG: … ::`, not the silence** — see the correction below. |
 | `registered …` then `no FAT volume … (NotFat)` | the card is readable but carries no BPB this reader accepts. The `:: PART: mbr-raw handle=sdhc …` census printed just above is the medium's own bytes. |
 | `registered …` then `no FAT volume … (Io)` | the registry has the card but a read of LBA 0 failed — which CONTRADICTS the bring-up read witnesses, and is a finding about the driver, not the medium. |
 | `registered …` with `blocks=0` | impossible: `register_sdhc` refuses a zero-block card and says so instead of publishing a device every later bound check would reject. |
@@ -1926,3 +1931,169 @@ arc would otherwise inherit as proven.
   is a prerequisite for exercising the interesting path — and clusters 2+ are already occupied, so
   the staged file will NOT start at cluster 2 and the extent will not be `[216..344)`. Read the
   first cluster K off the host before the boot; the extent is `[216 + (K-2)*4 .. +128)`.
+
+---
+
+## 12. BOOT-STORAGE (GR26) — the opt-in default made the boot volume unreachable
+
+### 12.1 The observation: a fully verified card that no filesystem could see
+
+GR26 Boot D, bench rMBP, capture `~/unaos-bench/capture/gr26-bootD/ttyUSB0.log` (read with
+`awk`, not `grep`). The machine now boots from a SINGLE SD card in its INTERNAL slot — one
+FAT32 volume carrying both the `esp` and `data` trees at its root. The operator ran
+`bg /fat/VUG.ELF` and it failed: no VUG.
+
+The SDHCI driver had done everything right. In 21 ms it took the card from CMD0 to a verified
+geometry and then spent 60 ms proving it could read it:
+
+```
+[  14712ms] [sdhc] bdf 3:0.1 CARD IDENTIFIED — 124735488 blocks, block-addressed, csd v2
+[  14715ms] [sdhc] verify mbr p0 type=0x0b start=2048 count=124733440 end=124735488 fits-capacity=1
+[  14750ms] [sdhc-ab] verdict windows=3 match=3/3 — adma2 agrees with the pio control byte-for-byte
+```
+
+A 60 GiB SDXC card, block-addressed, CSD v2, an MBR whose single FAT32-LBA partition fits the
+CSD capacity, and three ADMA-vs-PIO windows — LBA 0, mid-card, and the last eight blocks —
+matching byte-for-byte. Then, from every consumer in the boot, for the next seven minutes:
+
+```
+[  14775ms] :: wifi: firmware staging deferred — no program-source block device yet …
+[  32333ms] :: WINX-2: no FAT volume on any program-source handle (handles=global=absent sdhc=unbuilt) …
+[  46113ms] [wc-x] desktop-app DECLINE reason=no-storage … waited=30000ms handles=global=absent sdhc=unbuilt
+[  46113ms] :: [midden] exec-probe "VUG.ELF" -> NO VOLUME (NoDisk; handles=global=absent sdhc=unbuilt)
+```
+
+### 12.2 The conviction
+
+One word, printed by `SourceCensus`: **`sdhc=unbuilt`**.
+
+`drivers/block.rs` §APPLOAD renders that field in three deliberately distinguishable ways —
+`sdhc=present` (a card registered), `sdhc=absent` (the feature is in the image, nothing
+registered), `sdhc=unbuilt` (**no `sdhcblk` in this image**, so the handle does not exist to be
+consulted). Only the `#[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]` arm of
+`source_census` can produce `unbuilt`. The image carried no `sdhcblk`, therefore the
+
+```rust
+#[cfg(feature = "sdhcblk")]
+{ … crate::drivers::block::register_sdhc(num_blocks, block_addressed); }
+```
+
+call site at the tail of `sdhc::bring_up` was not compiled, therefore `SDHC_BLOCK_DEVICE` did
+not exist, therefore `program_source()` had nothing to return and every consumer above declined
+correctly. `storage_slot=0` on the xHCI side is the other half and is not a defect: there is no
+USB stick on this machine any more, so the global handle is legitimately empty.
+
+The chain stopped at the BUILD, not at the driver. Nothing in the driver, the block layer, the
+partition decode or the FAT reader was wrong.
+
+### 12.3 The fix: the polarity, because the premise expired
+
+GR20 chose opt-in on an argument stated verbatim in `arroyo`: *"this machine BOOTS from a USB
+card reader, so the stick is `BLOCK_DEVICE`"*. Under that premise the internal card was a
+SECOND, optional source and opt-in was right.
+
+That premise is gone. The bench rMBP boots from the internal slot, which makes that reader the
+ONLY program source on the machine — and with the knob off there is no handle for it, so the
+DEFAULT x86 image is one that cannot reach its own boot volume. So `sdhcblk` is now default-on
+(`UNAOS_NOSDHCBLK=1` opts out), inverted in **both** places the "kept in sync" law names:
+`unaos/arroyo` and `unaos/builder/src/main.rs`.
+
+What default-on costs is bounded and was already argued for in §10:
+
+* **Nothing claims the global slot.** `register_sdhc` publishes a THIRD handle and says so in
+  its own witness (`global BLOCK_DEVICE untouched`).
+* **`program_source` puts the global FIRST.** On any boot where a stick enumerates, the answer
+  is bit-identical to `info()` and the `Sdhc` arm is never reached.
+* **The FAT layer refuses every write to a `Sdhc` source**, unconditionally, with a one-shot
+  witness (§10.3 / `flight_recorder.rs` §SINGLE FAT WRITER).
+* **FRGUARD fails OPEN.** `default_writable()` refuses in exactly one state — `BM_SUBSTITUTED`,
+  where the boot volume serial was POSITIVELY located on the other handle. `BM_UNKNOWN` and
+  `BM_UNPROVEN` both allow writes. On the QEMU harness the verdict is `BM_UNPROVEN` and the
+  recorder is untouched, which the suite now prints on every run.
+
+### 12.4 The witness: `:: SDHCREG: … ::`
+
+The GR20 witness table (§10.4) had a bullet that Boot D falsified outright:
+
+> *no line at all → `register_sdhc` never ran, i.e. no card was identified*
+
+Boot D identified a 60 GiB card, verified it three ways, parsed its MBR — and printed no line,
+because the call site was compiled out. The inference from silence was wrong, and the only
+evidence anywhere in 421 seconds of capture was one word inside a census emitted by a DIFFERENT
+subsystem thirty seconds later, whose reading required knowing that `unbuilt` and `absent` are
+different sentences.
+
+So the seam that decides it now says so at the seam. `sdhc::bring_up` prints, from **both** cfg
+arms, on its unconditional tail:
+
+```
+:: SDHCREG: handle=built register=ok blocks=N addressing=block — the internal card IS a program source this boot ::
+:: SDHCREG: handle=built register=REFUSED blocks=0 … — the internal card is NOT a program source this boot ::
+:: SDHCREG: handle=UNBUILT (no `sdhcblk` in this image) blocks=N — the card was identified and read-verified, but NO block handle exists to publish it under … ::
+```
+
+**It cannot be vacuous.** It sits on the tail of `bring_up`, so it prints on every boot that
+identifies a card at all; its three renderings are distinguishable; and each is reachable —
+`register_sdhc` returns `false` on a zero-block card, and `UNAOS_NOSDHCBLK=1` still builds the
+third. `fs/fat.rs`'s falsified doc bullet has been corrected to point here.
+
+**It is also the discriminator for the next boot.** With the knob default-on, a boot that still
+cannot reach `/fat` reads `handle=built register=ok` here and the question has moved downstream
+to `:: SDHCBLK: no FAT volume … ::`, which already separates `NotFat` (the card carries no BPB
+this reader accepts — with the `:: PART: mbr-raw handle=sdhc …` census above it as the raw
+bytes) from `Io` (a read of LBA 0 failed, contradicting the bring-up witnesses). Three layers,
+three sentences, no re-flight needed to learn which one said no.
+
+### 12.5 Gates
+
+`./arroyo check` green both arches; `UNAOS_WC=1 ./arroyo check` green (12 cfg legs — both
+`sdhcblk` polarities still type-check, since only `x86-all` carries the feature). `./arroyo
+test` green, and it now exercises the path end to end by default:
+
+```
+:: SDHCREG: handle=built register=ok blocks=32768 addressing=byte — the internal card IS a program source this boot ::
+:: SDHCBLK: registered internal SD card as block handle Sdhc — blocks=32768 (16 MiB) addressing=byte (global BLOCK_DEVICE untouched) ::
+:: SDHCBLK: FAT mounted READ-ONLY on the internal SD card (16 MiB): FAT16 vol@LBA0 …
+:: FRGUARD: boot volume serial 0xfabe1afd found on NEITHER handle … writes ALLOWED (guard DISARMED) ::
+```
+
+`./arroyo test-fat sf 300` green including the three legs whose metal twins failed on Boot D —
+`WINX-2` (STAT.ELF), `WINX-8` (VUG.ELF) and `PULSE-W` (PULSE.ELF) all `-> PASS`, plus `U11m2`.
+
+**Coverage limit, named:** the QEMU `Sdhc` fixture is a FAT16 SUPERFLOPPY at LBA 0; the metal
+card is MBR-partitioned FAT32 (p0 type=0x0b @ 2048). The combination *MBR × `Sdhc` source* is
+therefore fixture-uncovered. It is covered compositionally — `mount_source`'s partition/BPB
+ladder is source-agnostic and is exercised on MBR by `test-fat part`, while the `Sdhc` read
+dispatch is exercised by the superfloppy above — but the composition itself is proven only on
+metal. (`test-fat part` cannot run inside the agent sandbox: `make-fat-img.sh` needs `sfdisk`,
+which is present on the host and absent from the sandbox. Pre-existing, unrelated to this arc.)
+
+### 12.6 The falsifiable metal prediction — GR26 Boot B
+
+Same card, same slot, media built from this tip with no storage knob set at all. The log must
+contain, in this order:
+
+```
+[sdhc] bdf 3:0.1 CARD IDENTIFIED — 124735488 blocks, block-addressed, csd v2
+:: SDHCREG: handle=built register=ok blocks=124735488 addressing=block — the internal card IS a program source this boot ::
+:: SDHCBLK: registered internal SD card as block handle Sdhc — blocks=124735488 (60906 MiB) addressing=block (global BLOCK_DEVICE untouched) ::
+:: PART: mbr handle=sdhc slot=1 type=0x0b … start=2048 count=124733440 end=124735488 ACCEPT ::
+:: SDHCBLK: FAT mounted READ-ONLY on the internal SD card (60906 MiB): FAT32 vol@LBA2048 …
+:: SDHCBLK: sdhc root directory (N entries) ::   ← must list VUG.ELF, STAT.ELF, PULSE.ELF
+```
+
+`124735488`, `2048`, `124733440` and `124735488` are Boot D's own readings, not estimates — a
+different value in any of them falsifies either this arc or the Boot D parse, and the
+`mbr-raw` census printed above the verdict says which.
+
+And the census must FLIP at every consumer that declined on Boot D: `handles=global=absent
+sdhc=present`. `global=absent` is expected and correct (no USB stick on this machine); it is
+`sdhc=unbuilt` → `sdhc=present` that is this arc's whole claim. `bg /fat/VUG.ELF` must load.
+
+What must NOT appear under any outcome: a `:: SDHCBLK: FAT write REFUSED …` line (nothing in
+this build writes through the FAT layer to that card, so it firing means a caller this analysis
+missed), or a `:: FRGUARD: SUBSTITUTION …` line while the recorder is expected to work.
+
+If the mount still fails, `SDHCREG` reads `handle=built register=ok` and the finding is
+downstream — `NotFat` indicts the medium's BPB, `Io` indicts the driver. Either way Boot B does
+not need a Boot C to say which.

@@ -161,8 +161,19 @@ fn main() {
     // backend disabled while the `⚡ kernel features:` banner claimed it was on (s42/INSTGUI, WXN-M3b).
     // The failure would be quiet in the worst way here: no `:: SDHCBLK: registered … ::` line and no
     // mount witness reads exactly like "no card was identified", which is a different finding.
-    // Kept in sync with arroyo's mapping.
-    if std::env::var("UNAOS_SDHCBLK").is_ok() { feats.push("sdhcblk"); }
+    //
+    // BOOT-STORAGE (GR26): DEFAULT-ON, opted out with UNAOS_NOSDHCBLK=1. The opt-in default was a
+    // GR20 decision taken when the rMBP booted from a USB card reader and the internal slot was a
+    // second, optional source. That premise is gone: the bench machine now boots from a SINGLE SD
+    // card in its INTERNAL slot, so the internal reader is the ONLY program source there is, and an
+    // opt-in knob makes the default x86 image one that cannot reach its own boot volume. GR26 Boot D
+    // is the conviction — the card was identified, read-verified 3/3 windows and MBR-checked, and
+    // then every consumer printed `handles=global=absent sdhc=unbuilt` and declined, because THIS
+    // line had not fired. Turning it on costs a READ-ONLY third handle: `register_sdhc` never touches
+    // the global slot, `fs::fat` refuses every write to a `Sdhc` source, and `default_writable`'s
+    // substitution guard fails OPEN in all but the positively-proven case. Kept in sync with arroyo's
+    // mapping.
+    if std::env::var("UNAOS_NOSDHCBLK").is_err() { feats.push("sdhcblk"); }
     // PCI-CENSUS (GR20): UNAOS_PCICENSUS=1 arms the complete READ-ONLY PCI enumeration witness
     // (arch/x86_64/pci.rs::full_census) — one `[PCI-CENSUS]` line per function present, plus a
     // capability dump per network-class function. THIS list is what reaches the kernel binary for
