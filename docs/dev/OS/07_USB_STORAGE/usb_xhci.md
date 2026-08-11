@@ -6700,6 +6700,114 @@ will send that can exceed `HC_Total_Num_ACL_Data_Packets` and therefore the firs
 
 ---
 
+## 25. BT-RETRY — the bring-up chain is re-triggerable, not one-shot at boot (`UNAOS_BT`/`UNAOS_BTC`, 2026-08-11)
+
+**The architecture gap, from Boot B metal.** Every stage above (BT-L0 through BT-C2) ran exactly
+once, inline on the synchronous EHCI enumeration walk, at 2–13 s of boot. That is the *only* time
+the chain ran. On Boot B Peter rebooted the MEGABOOM *after* our boot had completed: our single
+LE-scan + classic-page chain had already fired and finished (`bt-l2` selected the speaker by address
+at 2308 ms, `bt-c1` paged twice and `PAGE TIMEOUT`'d both, then nothing), so a speaker that becomes
+page-scannable a minute later is never paged again — and it pairs to a phone instead. **You cannot
+ask a user to reboot the machine to pair a speaker.** This section makes the chain re-runnable on
+demand, post-boot. It is the *first half* of the BT-C2 review's "make it async before default-on":
+the chain is now re-invocable; moving it *off* the synchronous service pass is the second half.
+
+**The factoring.** `bt_probe` was one monolith: selection/census (no wire traffic) followed by the
+wire chain (`HCI_Reset` → version → L1 → LE scan → L3 connect → C1 page → C2 → quiesce). The wire
+chain is now `bt_bringup_wire(t, intf, e)`, with two call sites:
+- **boot path** — `bt_probe` runs selection once, records the claimed radio in `Controller::bt_radio`
+  (`Target` + interface + event-EP mps — all that a re-run needs; the radio stays configured and the
+  event QH stays linked for the life of the boot), then calls the wire chain;
+- **post-boot** — `bt_retrigger` reconstructs the event endpoint (`bt_evt_ep_current`, which rebuilds
+  the `BtEvtEp` view of the already-linked slot **without re-arming it** — the QH is spliced into the
+  periodic list exactly once, `bt_evt_armed`) and calls the *same* wire chain.
+
+**1. The trigger: a keyboard chord, `Ctrl+Alt+B`.** Detected edge-triggered in
+`decode_boot_keyboard` (keycode `0x05` present now, absent last report, with Ctrl and Alt held). It
+is the one input affordance a spatial OS with no menu bar has today; `Ctrl+Alt+b` resolves to no
+printable character, so the chord types nothing. It only *records* the request in a module atomic
+(`BT_RETRIGGER_PENDING`); the chain runs in the **drain** at the end of `service_ehci_hid`, under the
+`EHCI_HID` lock the decode path already holds — decoupled so the source (a keyboard, possibly on a
+different EHCI function) and the radio need not be the same controller. **Idempotent:** the store
+does not stack (newest source wins, one chain per drain), and while a chain runs the synchronous
+service pass is blocked, so no second press is even decoded. The two alternatives — a periodic
+re-scan timer (bounded, "open the pairing menu" cadence) and a dock/shell affordance — are deferred:
+the first needs a timer hook and a back-off policy, the second needs a dock that does not exist yet.
+
+**2. State machine — safe to re-enter.** Two declines, each witnessed and each falsifiable:
+- **no radio** claimed on any controller → the drain reports it and runs nothing;
+- **mid-flight** (`bt_chain_busy`, set at `bt_bringup_wire` entry, cleared on every exit) → decline,
+  do not start a second chain. This is the guard the async half will lean on; under today's
+  synchronous model it cannot be observed true (the chain runs to completion in one pass), and the
+  code says so.
+
+**The stale-link ESCAPE HATCH — not a decline, and this matters.** `bt_left_link = Some` marks a
+classic link a prior run left up (the MUST-NOT-APPEAR `left_outstanding` case: `bt_c1_page` finished
+with `live` still true). It is written only at `bt_c1_page`'s end and would be cleared by nothing but
+a reboot — so treating it as a permanent "already connected, do not re-page" is *exactly* the failure
+this arc exists to abolish: a speaker powered off **ungracefully** leaves the `HCI_Disconnect`
+unconfirmed, `live` stays true, the latch wedges `Some`, and when the user powers the speaker back on
+and presses the chord they would get "already connected" forever — "reboot the machine to pair a
+speaker." Instead, on `Some` the re-trigger runs a **reboot-free escape**: resync the event toggle,
+attempt a best-effort `HCI_Disconnect` on the stale handle, then clear the latch **unconditionally**
+and fall through to re-page. Whether the link was still live (torn down now — no double-connect) or
+already dead (the disconnect fails and re-paging is exactly right), the outcome is: latch cleared,
+chain runs. Witnessed on the `STALE LINK … reboot-FREE escape` line, so a capture proves the recovery.
+
+**Device-toggle resync — the boot path's free lunch a re-trigger has to pay for.** Each run resets
+its **host-side** software toggles: the event endpoint's per-run `toggle` starts DATA0, and C2 reads
+`bt_acl_tog`. On the boot path the `SET_CONFIGURATION` right before the chain also resets the
+**device-side** endpoint toggles to DATA0 (USB 2.0 §9.4.5), so both sides agree. A re-trigger issues
+no `SET_CONFIGURATION`, so the device's *sticky* toggles sit wherever the boot run left them while the
+host restarts at DATA0 — and on an odd parity the first post-retrigger IN is dropped by the device as
+a duplicate, the bounded wait expires, and the chain reads as a **dead radio, intermittently**
+(parity-dependent, the worst kind to diagnose). So `bt_retrigger` issues `ClearFeature(ENDPOINT_HALT)`
+on the event IN endpoint and on the ACL bulk IN/OUT pair — each resets the device toggle to DATA0 —
+and resets `bt_acl_tog` to `(DATA0, DATA0)` to match. Both sides now provably start DATA0, with no
+dependence on unspecified device reset behaviour. Witnessed on the `event-EP toggle resync` and `ACL
+toggle resync` lines. With the toggles resynced, the `armed` state re-minted, and the C1/C2 teardown
+starting clean, a re-run leaks no HCI state and double-arms no scan.
+
+**3. Honest bounding.** A re-trigger is **one more bounded chain**, not a background storm: the LE
+scan window, plus (under `btc`) up to `BT_C1_PAGE_ATTEMPTS` page trains of `page_timeout` each — the
+same shape the boot run's merged 4-window / 2-attempt bound already pays. Worst case added per
+trigger in a quiet room is that one chain's wall-clock (dominated by the two ~5.12 s page trains,
+≈12.4 s classic), witnessed on the `bt-l2`/`bt-c1` lines it emits, then it returns and the service
+loop resumes. A trigger in a quiet room bounded-fails exactly like the boot run.
+
+**4. Gated as today.** `bt` for the chord/request/re-trigger, `btc` for the classic page and the
+`bt_left_link` latch; default behaviour is unchanged except that the chain is now *also* reachable
+post-boot. QEMU has no Bluetooth, so the chain itself is **compile-only** there (present and reachable
+— `strings` shows the `bt-retry:` witnesses in a `bt`/`btc` build and none in a default build — but
+never exercised); the chord's routing is what a fixture can reach.
+
+**Witness format** (`bt-retry:` prefix — a metal capture proves the re-trigger fired, what it
+recovered, and that the DATA0 resync happened):
+```
+EHCI-HID: BT pairing chord (Ctrl+Alt+B) — requesting Bluetooth re-trigger == witness ::
+:: bt-retry: [N] src=1 STALE LINK handle=0x0.. — best-effort teardown before re-paging -> ...; the latch is CLEARED either way, so this is a reboot-FREE escape ... ::   (only when a link was left up)
+:: bt-retry: [N] event-EP toggle resync — ClearFeature(ENDPOINT_HALT) on IN.. -> CONFIRMED (device toggle now DATA0 ...) == witness ::
+:: bt-retry: [N] ACL toggle resync — ClearFeature(ENDPOINT_HALT) on bulk_in=IN.. bulk_out=OUT.. confirmed=2/2, host bt_acl_tog reset to (DATA0,DATA0) ... ::
+:: bt-retry: [N] src=1 FIRING — re-running the boot bring-up chain against the radio claimed at boot (addr=..) ... ::
+:: bt-retry: [N] src=1 COMPLETE — the chain returned; the bt-l2 scan summary and (under btc) the bt-c1 page summary above are its outcome == witness ::
+```
+plus the two declines: `DECLINED — a bring-up chain is already in flight`, and `request src=1 but NO
+controller claimed a radio at boot`. The stale-link line is the reboot-free escape (§2); the two
+resync lines are the DATA0 device/host toggle match a re-trigger must issue in place of the boot
+path's `SET_CONFIGURATION`.
+
+**What Boot C proves.** Peter reboots the speaker mid-session — after our boot's single chain has
+already page-timed-out — and presses `Ctrl+Alt+B`. The chord line, then a fresh `bt-retry: FIRING`,
+a fresh `bt-c1` page train against the now-page-scannable MEGABOOM, and either a BR/EDR link or
+another bounded timeout — none of which existed on the boot path a minute earlier. If the boot run
+had left a link up, the capture shows the `STALE LINK … reboot-FREE escape` line clearing it before
+the re-page rather than a permanent "already connected"; every re-trigger carries its `event-EP` /
+`ACL toggle resync` lines proving the DATA0 match; and a press in a quiet room bounded-fails exactly
+like boot. The two SHOULD-FIX defects the escape hatch and the resync close are each therefore
+provable from a single Boot C capture, on the exact scenario the arc exists for.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).

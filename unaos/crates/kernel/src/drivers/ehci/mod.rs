@@ -661,10 +661,50 @@ pub struct Controller {
     /// reader, so a `bt`-only build must not carry it.
     #[cfg(feature = "btc")]
     bt_acl_bufs: u16,
+    /// BT-RETRY — the coordinates a post-boot re-trigger needs to re-run the bring-up chain
+    /// (`bt_bringup_wire`) against the radio this controller already claimed at boot: the device
+    /// `Target`, its HCI interface number, and the event endpoint's max packet size. The event QH
+    /// itself was spliced into the periodic list exactly once (`bt_arm_events`/`bt_evt_armed`) and
+    /// is REUSED, not re-armed — so nothing here needs to describe it beyond the mps a fresh read
+    /// is sized from. `None` until `bt_probe` claims a radio; a controller with no radio never
+    /// re-triggers, and the drain in `service_ehci_hid` skips it.
+    #[cfg(feature = "bt")]
+    bt_radio: Option<BtRadio>,
+    /// BT-RETRY — a bring-up chain is running on this controller RIGHT NOW. `bt_retrigger` checks
+    /// it and DECLINES rather than starting a second overlapping chain. Under the current
+    /// synchronous service model a chain runs to completion inside one `service_ehci_hid` pass, so
+    /// this can only be observed true by a re-entrant caller on the same stack — it is the guard the
+    /// async half (the BT-C2 review's "make it async before default-on") will lean on, set at
+    /// `bt_bringup_wire`'s entry and cleared on every exit so the invariant holds for both callers.
+    #[cfg(feature = "bt")]
+    bt_chain_busy: bool,
+    /// BT-RETRY — a classic BR/EDR link handle a chain run LEFT outstanding (`bt_c1_page` finished
+    /// with `live` still true: the teardown did not confirm the release — the MUST-NOT-APPEAR
+    /// condition). Normally `None`: every chain quiesces and the C1/C2 teardown releases what it
+    /// established, so `bt_c1_page` writes `None` here on every correct path. When it is `Some`, a
+    /// re-trigger reports "already connected" and does NOT page — re-paging a link still held is
+    /// exactly the double-connect the teardown discipline exists to prevent.
+    #[cfg(feature = "btc")]
+    bt_left_link: Option<u16>,
 }
 
 // Raw pointers to identity-mapped DMA memory; access is serialized by the EHCI_HID mutex.
 unsafe impl Send for Controller {}
+
+/// BT-RETRY — everything a post-boot re-trigger needs to re-drive `bt_bringup_wire` against a radio
+/// claimed at boot, without re-enumerating or re-arming its event endpoint. `Target` is `Copy`, so
+/// the whole record is; it is written once in `bt_probe`'s claim and read once per re-trigger.
+#[cfg(feature = "bt")]
+#[derive(Clone, Copy)]
+struct BtRadio {
+    target: Target,
+    intf: u8,
+    /// The HCI event interrupt-IN endpoint NUMBER (no direction bit). Needed post-boot to issue
+    /// `ClearFeature(ENDPOINT_HALT)` on it, which resets the DEVICE-side data toggle to DATA0 —
+    /// the re-trigger's stand-in for the `SET_CONFIGURATION` the boot path gets for free.
+    evt_ep: u8,
+    evt_mps: u16,
+}
 
 /// BT-L0 — `HCI_Reset`: OGF 0x03 (Controller & Baseband) / OCF 0x0003 => opcode 0x0C03. Zero
 /// parameters. A ROM-level command: it answers before any Broadcom patchram (`.hcd`) blob is
@@ -3942,6 +3982,30 @@ impl Controller {
             return true;
         }
         let Some(e) = self.bt_arm_events(t, evt_ep, evt_mps) else { return true };
+        // BT-RETRY — remember this radio's re-runnable coordinates so a post-boot chord can drive
+        // the SAME bring-up chain again. The event QH is spliced into the periodic list exactly
+        // once (`bt_arm_events`/`bt_evt_armed`), so a re-trigger REUSES it and never re-arms it;
+        // every command below rides EP0 + this already-linked event slot. Written here, on the
+        // boot path, after selection claimed the radio and the event endpoint is up — the one
+        // place all four facts are known and true.
+        self.bt_radio = Some(BtRadio { target: *t, intf, evt_ep, evt_mps });
+        self.bt_bringup_wire(t, intf, &e);
+        true
+    }
+
+    /// BT-RETRY — the WIRE half of `bt_probe`, factored out so it has two call sites: the boot
+    /// enumeration path (`bt_probe`, once) and the post-boot re-trigger (`bt_retrigger`, on
+    /// demand). It owns everything from the first HCI command to the closing quiesce; the
+    /// selection/census that precedes it runs ONLY on the boot path, because a re-trigger reuses
+    /// the already-claimed radio. `e` is the event endpoint — armed once by the boot path and
+    /// reconstructed unchanged by the re-trigger (`bt_evt_ep_current`), never re-armed. Every STOP
+    /// path quiesces and returns, exactly as the inline chain did before this factoring.
+    #[cfg(feature = "bt")]
+    #[allow(clippy::too_many_lines)]
+    unsafe fn bt_bringup_wire(&mut self, t: &Target, intf: u8, e: &BtEvtEp) {
+        // BT-RETRY: this chain now owns the radio for its duration. The flag is the async half's
+        // re-entrancy guard; it is set here for BOTH callers and cleared on EVERY exit below.
+        self.bt_chain_busy = true;
         let mut toggle = false; // DTC=1 on the QH: software owns the toggle; first IN is DATA0.
         // THE ONE `armed` FLAG for this radio, threaded through every L0/L1/L2 command. It says
         // whether an interrupt-IN transfer is outstanding on the event endpoint; nothing may
@@ -3958,7 +4022,7 @@ impl Controller {
         let mut reset_ok = false;
         let mut ver_ok = false;
         let mut rp = [0u8; 16];
-        match self.bt_hci_command(t, intf, &e, &mut toggle, BT_HCI_RESET, &[], &mut rp, &mut armed) {
+        match self.bt_hci_command(t, intf, e, &mut toggle, BT_HCI_RESET, &[], &mut rp, &mut armed) {
             Some(n) if n >= 1 => {
                 reset_ok = rp[0] == 0;
                 serial_println!(
@@ -3983,8 +4047,9 @@ impl Controller {
                     ":: bt-l0: [{}] HCI_Reset (0x0C03) -> NO-RESPONSE (bounded wait expired) — L0 STOP: no further HCI command is issued on this radio (armed={}), and the event endpoint is quiesced ::",
                     self.idx, armed
                 );
-                self.bt_quiesce_events(&e);
-                return true;
+                self.bt_quiesce_events(e);
+                self.bt_chain_busy = false;
+                return;
             }
         }
 
@@ -3997,7 +4062,7 @@ impl Controller {
         // artefact, or by a hopeful default — it can only come off the radio.
         let mut rp2 = [0u8; 16];
         match self.bt_hci_command(
-            t, intf, &e, &mut toggle, BT_HCI_READ_LOCAL_VERSION, &[], &mut rp2, &mut armed,
+            t, intf, e, &mut toggle, BT_HCI_READ_LOCAL_VERSION, &[], &mut rp2, &mut armed,
         ) {
             Some(n) if n >= 9 => {
                 ver_ok = rp2[0] == 0;
@@ -4084,7 +4149,7 @@ impl Controller {
             // smaller.
             let mut rp = [0u8; 68];
             let Some(n) = self.bt_hci_command(
-                t, intf, &e, &mut toggle, opcode, params, &mut rp, &mut armed,
+                t, intf, e, &mut toggle, opcode, params, &mut rp, &mut armed,
             ) else {
                 // Bounded wait expired: name the command and STOP the L1 sequence. Not a hang,
                 // not forced — the event path or a firmware gate is the suspect (see predictions).
@@ -4230,7 +4295,7 @@ impl Controller {
                 self.idx
             );
         } else {
-            self.bt_le_scan(t, intf, &e, &mut toggle, &mut armed);
+            self.bt_le_scan(t, intf, e, &mut toggle, &mut armed);
         }
 
         // ---- BT-C1: the classic page, and only if this boot asked for one ----------------------
@@ -4261,7 +4326,7 @@ impl Controller {
                     self.idx
                 );
             } else {
-                self.bt_c1_page(t, intf, &e, &mut toggle, &mut armed);
+                self.bt_c1_page(t, intf, e, &mut toggle, &mut armed);
             }
         }
 
@@ -4269,8 +4334,166 @@ impl Controller {
         // boot and any later `arm_interrupt_ep` chains correctly behind it — the same state a
         // retired `dead` endpoint leaves), but its transfer is deactivated so the controller
         // stops issuing INs against a device nothing is reading.
-        self.bt_quiesce_events(&e);
-        true
+        self.bt_quiesce_events(e);
+        self.bt_chain_busy = false;
+    }
+
+    /// BT-RETRY — reconstruct the event endpoint the boot path armed, WITHOUT re-arming it. The
+    /// event QH is spliced into the periodic list exactly once for the life of the boot (see
+    /// `bt_arm_events`/`bt_evt_armed`); a re-trigger therefore rebuilds only the `BtEvtEp` view of
+    /// that already-linked slot (pointers into the pool + their DMA phys) and hands it back for a
+    /// fresh `bt_arm_read`. Returns `None` if no radio ever armed the slot or the slot fails its
+    /// phys/alignment contract — the same refusals `bt_arm_events` makes, minus the QH splice.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_evt_ep_current(&mut self, mps: u16) -> Option<BtEvtEp> {
+        if !self.bt_evt_armed {
+            return None;
+        }
+        let mps = mps.min(INT_BUF_LEN as u16);
+        if mps == 0 {
+            return None;
+        }
+        let slot = &mut (*self.pool()).bt_slot;
+        let (qh, qtd, buf) = (
+            &mut slot.qh as *mut Qh,
+            &mut slot.qtd as *mut Qtd,
+            slot.buf.0.as_mut_ptr(),
+        );
+        let (Some(_qh_phys), Some(qtd_phys), Some(buf_phys)) =
+            (phys_of(qh, 32), phys_of(qtd, 32), phys_of(buf, INT_BUF_ALIGN))
+        else {
+            return None;
+        };
+        // `_qh_phys` is checked for the contract but discarded: the QH is already linked, so this
+        // path re-splices nothing.
+        Some(BtEvtEp { qh, qtd, qtd_phys, buf, buf_phys, mps })
+    }
+
+    /// BT-RETRY — resync the DEVICE-side data toggles to DATA0 for a re-triggered chain, via
+    /// `ClearFeature(ENDPOINT_HALT)` (USB 2.0 §9.4.5 resets the endpoint's toggle to DATA0). The
+    /// boot path gets this for free from the `SET_CONFIGURATION` it issues right before the chain;
+    /// a re-trigger issues none, so without this the device's sticky toggles sit wherever the boot
+    /// run left them while the host restarts every chain at DATA0 — the event endpoint's per-run
+    /// software `toggle`, and (under btc) `bt_acl_tog` which C2 reads. On an odd parity the first
+    /// post-retrigger IN is dropped by the device as a duplicate, the bounded wait expires, and the
+    /// chain reads as a dead radio INTERMITTENTLY. `with_acl` covers the ACL bulk pair too, resetting
+    /// the host `bt_acl_tog` to `(DATA0, DATA0)` so both sides provably match before C2. Returns
+    /// whether the event-EP clear confirmed. Every clear is witnessed so a capture can PROVE the
+    /// DATA0 resync happened (or that it failed, rather than a silent desync).
+    #[cfg(feature = "bt")]
+    unsafe fn bt_resync_device_toggles(&mut self, radio: &BtRadio, with_acl: bool) -> bool {
+        // ClearFeature(ENDPOINT_HALT): bmRequestType 0x02 (host->device | standard | endpoint),
+        // bRequest 0x01, wValue 0x0000 (ENDPOINT_HALT), wIndex = endpoint address, no data stage.
+        let evt_in = (radio.evt_ep | 0x80) as u16;
+        let er = self.control(&radio.target, 0x02, 0x01, 0x0000, evt_in, 0, false).is_ok();
+        serial_println!(
+            ":: bt-retry: [{}] event-EP toggle resync — ClearFeature(ENDPOINT_HALT) on IN{} -> {} (device toggle now DATA0, matching the host's per-run DATA0 start) == witness ::",
+            self.idx, radio.evt_ep,
+            if er {
+                "CONFIRMED"
+            } else {
+                "NOT CONFIRMED (the EP0 control-OUT failed; the chain below may read the first event at the wrong parity and STOP — that failure is now witnessed, not silent)"
+            }
+        );
+        #[cfg(feature = "btc")]
+        if with_acl {
+            let (bin, bout, _, _) = self.bt_acl;
+            let mut acl_ok = 0u32;
+            if bin != 0
+                && self.control(&radio.target, 0x02, 0x01, 0x0000, (bin | 0x80) as u16, 0, false).is_ok()
+            {
+                acl_ok += 1;
+            }
+            if bout != 0
+                && self.control(&radio.target, 0x02, 0x01, 0x0000, bout as u16, 0, false).is_ok()
+            {
+                acl_ok += 1;
+            }
+            self.bt_acl_tog = (false, false);
+            serial_println!(
+                ":: bt-retry: [{}] ACL toggle resync — ClearFeature(ENDPOINT_HALT) on bulk_in=IN{} bulk_out=OUT{} confirmed={}/2, host bt_acl_tog reset to (DATA0,DATA0) so C2 and the device agree == witness ::",
+                self.idx, bin, bout, acl_ok
+            );
+        }
+        #[cfg(not(feature = "btc"))]
+        let _ = with_acl;
+        er
+    }
+
+    /// BT-RETRY — the post-boot entry point. Re-runs the SAME bounded bring-up chain
+    /// (`bt_bringup_wire`: scan -> select -> page -> C1 -> C2 -> teardown) against the radio this
+    /// controller claimed at boot, on demand rather than only once. Declines, each witnessed and
+    /// each falsifiable:
+    ///   * no radio claimed on this controller -> nothing to run (the drain skips it before here);
+    ///   * a chain already in flight (`bt_chain_busy`) -> do not start a second.
+    /// A classic link left up from an earlier run (`bt_left_link` = `Some`) is NOT a permanent
+    /// decline — that would be the very "reboot to pair a speaker" this arc exists to abolish (a
+    /// speaker powered off ungracefully leaves the disconnect unconfirmed, so the latch would wedge
+    /// forever). Instead it is a reboot-FREE ESCAPE HATCH: best-effort teardown of the stale handle,
+    /// then the latch is cleared UNCONDITIONALLY and the chain re-pages — whether the link was still
+    /// live (torn down now, no double-connect) or already dead (the disconnect fails and re-paging
+    /// is exactly right). Then the device toggles are resynced to DATA0 and one bounded chain fires.
+    /// Added wall-clock cost is that one chain: the LE scan window plus, under `btc`, up to
+    /// `BT_C1_PAGE_ATTEMPTS` page trains of `page_timeout` each — the same bound the boot run pays.
+    #[cfg(feature = "bt")]
+    unsafe fn bt_retrigger(&mut self, source: u32) {
+        let Some(radio) = self.bt_radio else {
+            return;
+        };
+        if self.bt_chain_busy {
+            serial_println!(
+                ":: bt-retry: [{}] src={} DECLINED — a bring-up chain is already in flight on this controller; not starting a second == witness ::",
+                self.idx, source
+            );
+            return;
+        }
+        let Some(e) = self.bt_evt_ep_current(radio.evt_mps) else {
+            serial_println!(
+                ":: bt-retry: [{}] src={} ABORTED — the event endpoint could not be reconstructed (no armed slot, or it failed the phys/alignment contract); no chain ran == witness ::",
+                self.idx, source
+            );
+            return;
+        };
+        // ESCAPE HATCH — a stale left-up classic link must not decline forever. Resync the event
+        // toggle first so the recovery disconnect's reads land at the right parity, attempt a
+        // best-effort teardown, then clear the latch UNCONDITIONALLY and fall through to re-page.
+        #[cfg(feature = "btc")]
+        if let Some(h) = self.bt_left_link {
+            self.bt_resync_device_toggles(&radio, false);
+            let mut toggle = false;
+            let mut armed = false;
+            let mut seen = 0u32;
+            let mut st = BtL3State::default();
+            let mut asm = [0u8; BT_EVT_ASM_MAX];
+            let ok = self.bt_l3_disconnect(
+                &radio.target, radio.intf, &e, &mut toggle, &mut armed, h, &mut seen, &mut st,
+                &mut asm,
+            );
+            serial_println!(
+                ":: bt-retry: [{}] src={} STALE LINK handle={:#06x} — best-effort teardown before re-paging -> {}; the latch is CLEARED either way, so this is a reboot-FREE escape and the chain re-pages below == witness ::",
+                self.idx, source, h,
+                if ok {
+                    "disconnect CONFIRMED (the link was still live and is now released — no double-connect)"
+                } else {
+                    "NOT confirmed (the handle is likely dead — the speaker was powered off ungracefully; re-paging is exactly right)"
+                }
+            );
+            self.bt_quiesce_events(&e);
+            self.bt_left_link = None;
+        }
+        // TOGGLE RESYNC (fix): the boot path's SET_CONFIGURATION zeroed the device toggles; a
+        // re-trigger issues none, so do it explicitly for the event endpoint AND the ACL pair
+        // before the chain reads the first event.
+        self.bt_resync_device_toggles(&radio, true);
+        serial_println!(
+            ":: bt-retry: [{}] src={} FIRING — re-running the boot bring-up chain against the radio claimed at boot (addr={}); this is one MORE bounded chain, not a background storm, and its cost is the bt-l2/bt-c1 windows below == witness ::",
+            self.idx, source, radio.target.addr
+        );
+        self.bt_bringup_wire(&radio.target, radio.intf, &e);
+        serial_println!(
+            ":: bt-retry: [{}] src={} COMPLETE — the chain returned; the bt-l2 scan summary and (under btc) the bt-c1 page summary above are its outcome == witness ::",
+            self.idx, source
+        );
     }
 
     /// BT-L2 — issue one LE bring-up command and witness its status.
@@ -6558,6 +6781,11 @@ impl Controller {
         // `BT_C1_PAGE_ATTEMPTS` when the peer never answered. It used to be the literal 1, which
         // was true only while one attempt was all this stage could make.
         self.bt_c1_tally(t0, seen, pages, established, disconnected, cancels, live, outstanding);
+        // BT-RETRY: latch whether this run LEFT a live classic link (the MUST-NOT-APPEAR case:
+        // `live` still true here means the teardown above did not confirm the release). On every
+        // correct path this writes `None`, so a later re-trigger re-pages as normal; when it writes
+        // `Some`, the re-trigger reports "already connected" and refuses to page a link still held.
+        self.bt_left_link = if live { Some(handle) } else { None };
     }
 
     /// BT-C1 — the end-of-stage tally, in the shape BT-L3's is: `left_outstanding=` reads `none` on
@@ -10533,6 +10761,29 @@ unsafe fn decode_boot_keyboard(
         *slot = report[2 + i];
     }
 
+    // BT-RETRY — THE PAIRING CHORD. Ctrl+Alt+B, edge-triggered: keycode 0x05 ('b') present in THIS
+    // report and absent from the previous one (the same press-edge test the character loop below
+    // uses), while both a Ctrl bit (LeftCtrl 0x01 / RightCtrl 0x10) and an Alt bit (LeftAlt 0x04 /
+    // RightAlt 0x40) are held. On that edge, request a re-run of the Bluetooth bring-up chain — the
+    // one input affordance a spatial OS with no menu bar has today. It only RECORDS the request; the
+    // drain in `service_ehci_hid` runs the chain under the lock. Ctrl+Alt+b resolves to no printable
+    // character, so `hid_key_ascii` returns 0 for it and the loop below emits nothing for this key —
+    // the chord types nothing. Gated on `bt`: a non-Bluetooth build has no chord and no request path.
+    #[cfg(feature = "bt")]
+    {
+        const CHORD_KEY_B: u8 = 0x05;
+        let ctrl = modifiers & 0x11 != 0;
+        let alt = modifiers & 0x44 != 0;
+        let b_down_now = cur_keys.contains(&CHORD_KEY_B);
+        let b_was_down = prev_keys.contains(&CHORD_KEY_B);
+        if ctrl && alt && b_down_now && !b_was_down {
+            serial_println!(
+                "EHCI-HID: BT pairing chord (Ctrl+Alt+B) — requesting Bluetooth re-trigger == witness ::"
+            );
+            bt_request_retrigger(1);
+        }
+    }
+
     // DBLSTROKE: PRESS EDGES, NOT LEVELS. `prev_keys` is still the PREVIOUS report here (it is
     // rewritten at the end of this function), so `!prev_keys.contains(&keycode)` is exactly "this
     // keycode went down in THIS report". A keycode the previous report already carried is a RESTATED
@@ -11791,6 +12042,14 @@ pub fn init() {
                         // BT-C2: the controller's ACL buffer count is unknown until BT-L1 reads it.
                         #[cfg(feature = "btc")]
                         bt_acl_bufs: 0,
+                        // BT-RETRY: no radio claimed, no chain running, no link left up until a
+                        // boot-path `bt_probe` (and, for the link, `bt_c1_page`) says otherwise.
+                        #[cfg(feature = "bt")]
+                        bt_radio: None,
+                        #[cfg(feature = "bt")]
+                        bt_chain_busy: false,
+                        #[cfg(feature = "btc")]
+                        bt_left_link: None,
                     };
                     // Firmware-stale detection BEFORE any schedule programming: probe 2 showed
                     // Apple EFI leaves PSE=1 behind (its pre-boot keyboard), which HSE-halts
@@ -12201,6 +12460,26 @@ pub fn init() {
     );
 }
 
+/// BT-RETRY — a post-boot request to re-run the Bluetooth bring-up chain, set by an input source
+/// (the keyboard chord below tags itself `1`) and drained once per `service_ehci_hid` pass. `0`
+/// means no request. The store is idempotent: pressing the chord repeatedly before a drain does not
+/// stack — the newest source wins and exactly one chain runs per drain. It lives here, decoupled
+/// from any one controller, because the source (a keyboard, possibly on a different EHCI function)
+/// and the radio need not be the same controller.
+#[cfg(feature = "bt")]
+static BT_RETRIGGER_PENDING: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// BT-RETRY — record a re-trigger request from input source `source` (nonzero). Called from the
+/// boot-keyboard decode on the pairing chord's DOWN edge; the drain in `service_ehci_hid` picks it
+/// up. Deliberately does no work itself: the chain must run under the `EHCI_HID` lock, which the
+/// decode path already holds, so the actual re-run is deferred to the drain rather than re-entered
+/// here.
+#[cfg(feature = "bt")]
+fn bt_request_retrigger(source: u32) {
+    BT_RETRIGGER_PENDING.store(source, core::sync::atomic::Ordering::SeqCst);
+}
+
 /// Main-loop service hook (the EHCI analogue of `service_hubs`): poll every armed HID endpoint,
 /// decode + deliver completed reports, re-arm. Cheap when nothing completed.
 pub fn service_ehci_hid() {
@@ -12208,5 +12487,28 @@ pub fn service_ehci_hid() {
     let Some(ctrls) = g.as_mut() else { return };
     for c in ctrls.iter_mut() {
         unsafe { c.service() };
+    }
+    // BT-RETRY: drain a pending re-trigger AFTER the service pass, still under the `EHCI_HID` lock,
+    // so the chain runs serialized against every controller's service exactly as the boot chain did.
+    // One chain per pass; the first controller that claimed a radio owns it.
+    #[cfg(feature = "bt")]
+    {
+        let src = BT_RETRIGGER_PENDING.swap(0, core::sync::atomic::Ordering::SeqCst);
+        if src != 0 {
+            let mut serviced = false;
+            for c in ctrls.iter_mut() {
+                if c.bt_radio.is_some() {
+                    unsafe { c.bt_retrigger(src) };
+                    serviced = true;
+                    break;
+                }
+            }
+            if !serviced {
+                serial_println!(
+                    ":: bt-retry: request src={} but NO controller claimed a radio at boot — there is no chain to re-run == witness ::",
+                    src
+                );
+            }
+        }
     }
 }
