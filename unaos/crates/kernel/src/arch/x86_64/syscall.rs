@@ -5025,6 +5025,7 @@ pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // gate here would leave exactly that build with a drag `<TAB>` cannot escape.
     if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE {
         crate::video::wm::drag_cancel("focus-key");
+        drag_settle_disarm();
     }
     // WEDGE-2 `<F2>` — the ring was read and a destination chosen; the focus PRIMITIVE is next.
     crate::wedge2::mark("<F2>");
@@ -5518,20 +5519,81 @@ pub fn wc_drag_motion() {
     // again. That residue is harmless by construction — a drag that is not being steered moves no
     // window — and the FIRST report that could do harm is also the one that ends it. The operator's
     // escape from the state in the meantime is `<TAB>`, which cancels (see `wc_focus_key`).
+    // DRAGSETTLE — **THE BELT MAY NOT STEER, AND IT MAY NOT JUMP THE EDGE.** Two defects lived in
+    // the three lines this replaces, and a GR24 capture shows both: every gesture in it ends
+    // `release-level` and the delivered-release arm never fires once, while the window lands about a
+    // pixel off where the hand let go.
+    //
+    // The mechanism is an ORDERING one, not a lost report. `note_buttons` publishes the LEVEL the
+    // instant a report is decoded, in the service pass; the `Event::Button` carrying the same
+    // release goes through `pal`'s QUEUE and is judged a drain tick later. The release report also
+    // carries the lift's own dx/dy, pushed as an `Event::Mouse` AHEAD of that button. So the drain
+    // pops the lift motion first, moves the cursor by it, reaches this tail, reads a level that is
+    // ALREADY up — and the old code steered the window to the post-lift cursor and cancelled. By the
+    // time the real release edge arrived the drag was gone, so `wc_click_route_at`'s arm found
+    // nothing to end. The belt was not the safety net under the edge; it was standing in front of it.
+    //
+    // Both halves are addressed here and neither weakens the net:
+    //  * **Wait for an edge that is in flight.** `pal::release_edge_pending()` is nonzero only while
+    //    a release edge is queued and undrained. While it is, this returns without steering and
+    //    without ending — the edge is a drain tick away and it ends the gesture with the settle
+    //    below. When no edge is coming (the report was superseded before it was read, the CLICK-3
+    //    loss the belt exists for), the count is zero and the belt fires exactly as it always did.
+    //  * **A deadline, so the wait cannot become the wedge.** An edge queued and then popped by some
+    //    consumer other than the router would otherwise hold the belt off forever — the one failure
+    //    (a drag outliving the hand) this whole mechanism exists to prevent. After
+    //    `RELEASE_EDGE_GRACE_MS` of the level reading up, the belt fires anyway and says so
+    //    (`end=level-late`, and `release-late` on the `[wm-act]` line).
+    //
+    //    **It is not a wall clock, and inherits the LIMIT above verbatim.** The deadline is only
+    //    ever EVALUATED here, and here only runs on a pointer report — so the guarantee it makes is
+    //    "no more than `RELEASE_EDGE_GRACE_MS` of FURTHER REPORTS", not "no more than 120 ms". A
+    //    hand that lets go and goes perfectly still leaves the drag live exactly as it did before
+    //    this arc, on the same reasoning: an unsteered drag moves no window, the first report that
+    //    could do harm is also the one that ends it, and `<TAB>` is the escape in the meantime.
+    //  * **End where the hand WAS, not where it has since gone.** The settle point is the last
+    //    pointer position observed with the button DOWN, recorded unthrottled below, so it is
+    //    neither short of the release (the throttle's cost, which is why the old code sampled live)
+    //    nor past it (the lift's cost, which is the ~1px the operator sees).
     if !crate::pal::cursor::button_down() {
-        let (x, y) = click_pointer_pos();
-        crate::video::wm::drag_motion(x, y);
-        crate::video::wm::drag_cancel("release-level");
+        let now = crate::arch::ticks();
+        let held = DRAG_LEVEL_UP_MS.load(Ordering::Relaxed);
+        if held == 0 {
+            DRAG_LEVEL_UP_MS.store(now.max(1), Ordering::Relaxed);
+        }
+        let waited = if held == 0 { 0 } else { now.wrapping_sub(held) };
+        let pend = crate::pal::release_edge_pending();
+        if pend != 0 && waited < RELEASE_EDGE_GRACE_MS {
+            return;
+        }
+        // The two belt endings are DIFFERENT FACTS and get different reasons on both wires. `level`
+        // is the belt doing the job it was built for: no edge was ever queued, so the release report
+        // was superseded before it could be read. `late` is the belt firing past its deadline with
+        // an edge still counted as in flight — that edge was queued and then eaten by something
+        // other than the router, which is a defect in the drain, not in the pad. A capture that
+        // cannot tell those apart cannot tell a lossy endpoint from a lossy consumer.
+        let late = pend != 0;
+        let (sx, sy) = drag_settle_point();
+        drag_settle_apply(sx, sy);
+        dragrel_witness(if late { "level-late" } else { "level" }, sx, sy, pend);
+        crate::video::wm::drag_cancel(if late { "release-late" } else { "release-level" });
+        drag_settle_disarm();
         return;
     }
+    // The button is down in BOTH views. Record the position unthrottled — the throttle exists to cap
+    // composites, not to lose the operator's last inch — and steer under it.
+    let (x, y) = click_pointer_pos();
+    DRAG_DOWN_X.store(x, Ordering::Relaxed);
+    DRAG_DOWN_Y.store(y, Ordering::Relaxed);
+    DRAG_DOWN_VALID.store(true, Ordering::Release);
+    DRAG_LEVEL_UP_MS.store(0, Ordering::Relaxed);
     let now = crate::arch::ticks();
     let last = DRAG_MOTION_LAST_MS.load(Ordering::Relaxed);
     if now.wrapping_sub(last) < DRAG_MOTION_MS {
         return;
     }
     DRAG_MOTION_LAST_MS.store(now, Ordering::Relaxed);
-    let (x, y) = click_pointer_pos();
-    crate::video::wm::drag_motion(x, y);
+    drag_steer_apply(x, y);
 }
 
 #[cfg(not(feature = "wc"))]
@@ -5544,6 +5606,178 @@ pub fn wc_drag_motion() {}
 const DRAG_MOTION_MS: u64 = 16;
 #[cfg(feature = "wc")]
 static DRAG_MOTION_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+// --- DRAGSETTLE (metal defect: the drop shifts the window ~1px, and the release EDGE never fires) --
+//
+// The settle point of a gesture is the last pointer position seen with the button DOWN — not the
+// live cursor at end time. Recorded here rather than in `wm` on purpose: `wm::drag_motion` is the
+// mover and knows nothing about which pointer report it came from, while this file owns every call
+// site a real x86 gesture takes (the routing tail and the release arm of `wc_click_route_at`).
+//
+// Unconditional on the `wc` feature, unlike the throttle above: `wc_click_route_at`'s release arm is
+// compiled in every build, so the settle it reads must be too.
+
+/// DRAGSETTLE — last pointer X observed with the primary button DOWN during the live gesture.
+static DRAG_DOWN_X: AtomicI32 = AtomicI32::new(0);
+/// DRAGSETTLE — last pointer Y observed with the primary button DOWN during the live gesture.
+static DRAG_DOWN_Y: AtomicI32 = AtomicI32::new(0);
+/// DRAGSETTLE — whether [`DRAG_DOWN_X`]/[`DRAG_DOWN_Y`] describe the LIVE gesture.
+///
+/// Cleared by the two paths that END a gesture in this file (the release arm and the belt) and by
+/// `<TAB>`. It is NOT cleared by the teardown cancels inside `wm` itself — a window closed under the
+/// hand goes `close_owner` -> `drag_forget_owner` -> `drag_cancel`, which this file never sees, and
+/// leaves the flag set over dead coordinates. Harmless by construction rather than by luck: the
+/// coordinates are only ever READ while `drag_active()` names a live window, and the only way back
+/// into that state is `drag_begin`, whose call site re-seeds them ([`drag_settle_arm`]).
+static DRAG_DOWN_VALID: AtomicBool = AtomicBool::new(false);
+/// DRAGSETTLE — `ticks()` when the button LEVEL first read up during the live gesture; 0 = it reads
+/// down (or no gesture). The clock the grace deadline below is measured on.
+static DRAG_LEVEL_UP_MS: AtomicU64 = AtomicU64::new(0);
+/// DRAGSETTLE — steering motions applied to the live gesture after the level read up.
+///
+/// **A CONCURRENCY TRIPWIRE, and stated as one rather than sold as the arc's evidence.** Review
+/// condition: this reads 0 on the fixed build *and on the pre-fix build*, because the only code that
+/// can increment it is reached from the branch that has just read `button_down() == true` — the old
+/// defect took the CANCEL path, not the steer path, so it never passed through here. The single
+/// window in which it can genuinely fire is a release landing between that read and the apply below,
+/// on another core or in the HID interrupt.
+///
+/// So it is worth keeping and worth nothing as diagnosis: it catches a FUTURE steering caller added
+/// to this file that forgets the level, and it catches that narrow race. The falsifiable content of
+/// the `[dragrel]` line is `end=` and `stale=`, not this field, and `engine.md` says so.
+static DRAG_POST_MOTIONS: AtomicU32 = AtomicU32::new(0);
+
+/// DRAGSETTLE — how long the belt waits for a release EDGE that `pal` says is queued before ending
+/// the gesture on the level alone. Long enough that an ordinary drain tick (a frame) is never
+/// jumped, short enough that "the window is still following my hand" is not a state an operator can
+/// perceive. The wait steers nothing, so its whole cost is when the window comes to rest.
+#[cfg(feature = "wc")]
+const RELEASE_EDGE_GRACE_MS: u64 = 120;
+
+/// DRAGSETTLE — `[dragrel]` lines emitted, against [`DRAGREL_LOG_MAX`]. One per gesture end and a
+/// hand cannot let go faster than serial can print, but the budget is stated rather than assumed.
+static DRAGREL_LOG: AtomicU64 = AtomicU64::new(0);
+const DRAGREL_LOG_MAX: u64 = 256;
+
+/// DRAGSETTLE — arm the settle for a gesture that has just begun, at its grab point.
+///
+/// Seeded rather than left invalid so that a grab-and-let-go with no motion in between settles at
+/// the grab point instead of falling back to the live cursor (which by then carries the lift).
+fn drag_settle_arm(x: i32, y: i32) {
+    DRAG_DOWN_X.store(x, Ordering::Relaxed);
+    DRAG_DOWN_Y.store(y, Ordering::Relaxed);
+    DRAG_LEVEL_UP_MS.store(0, Ordering::Relaxed);
+    DRAG_POST_MOTIONS.store(0, Ordering::Relaxed);
+    DRAG_DOWN_VALID.store(true, Ordering::Release);
+}
+
+/// DRAGSETTLE — where the live gesture should come to rest: the last position the hand was at with
+/// the button still down, or the live cursor if no such position was ever recorded (a drag begun by
+/// something other than the chrome arm — the selftest drives exactly that path).
+fn drag_settle_point() -> (i32, i32) {
+    if DRAG_DOWN_VALID.load(Ordering::Acquire) {
+        (
+            DRAG_DOWN_X.load(Ordering::Relaxed),
+            DRAG_DOWN_Y.load(Ordering::Relaxed),
+        )
+    } else {
+        click_pointer_pos()
+    }
+}
+
+/// DRAGSETTLE — apply one STEERING motion, re-reading the level at the moment of the apply.
+///
+/// The re-read is the tripwire described on [`DRAG_POST_MOTIONS`], and its reachability is stated
+/// there honestly: on both the fixed and the pre-fix build it is 0, because the caller has just
+/// tested the same level. It fires for a release that lands in the gap (another core, the HID
+/// interrupt), and for any steering caller added here later that skips the level test.
+#[cfg(feature = "wc")]
+fn drag_steer_apply(x: i32, y: i32) {
+    if !crate::pal::cursor::button_down() {
+        DRAG_POST_MOTIONS.fetch_add(1, Ordering::Relaxed);
+    }
+    crate::video::wm::drag_motion(x, y);
+}
+
+/// DRAGSETTLE — apply the FINAL motion of a gesture. Not a steer: the level reads up by definition
+/// on this path, so it must not be counted against the sentinel above.
+fn drag_settle_apply(x: i32, y: i32) {
+    crate::video::wm::drag_motion(x, y);
+}
+
+/// DRAGSETTLE — **the one line that says how a gesture ended and whether the drop was clean.**
+///
+/// Emitted from BOTH end paths, immediately before the `wm` call that clears the gesture, so the
+/// `[dragrel]` line always precedes its own `[drag]`/`[wm-act]` pair in a capture.
+///
+/// ```text
+/// [dragrel] win=3 end=edge settle=(1606,376) release=(1607,377) stale=(1,1) post=0 pend=0 wait=4ms -> CLEAN
+/// ```
+///
+///  * `end=` — **which path ended it.** `edge` = the delivered release `Event::Button`, carrying the
+///    operator's own let-go. `level` = the belt, with no edge queued (a release report superseded
+///    before it was read — the CLICK-3 loss). `level-late` = the belt fired with an edge still
+///    counted as queued, i.e. something other than the router popped it and the deadline expired.
+///  * `settle=` — the panel point the window was finally steered to.
+///  * `release=` — the live cursor at end time.
+///  * `stale=` — `release - settle`: **the motion that arrived after the button read up**, which is
+///    exactly what the old code applied to the window and this code drops. It is the measurement,
+///    not a verdict.
+///  * `post=` — the concurrency tripwire described on [`DRAG_POST_MOTIONS`]. It reads 0 on this
+///    build **and would have read 0 on the broken one**, so it is not evidence for or against the
+///    fix; it is a regression sentinel, and `-> DIRTY` is its alarm, not the arc's verdict.
+///  * `pend=` / `wait=` — release edges queued but undrained at end time, and how long the belt had
+///    been holding for one.
+///
+/// **What refutes what — and it is `end=` and `stale=` that carry it, not `post=`.**
+///  * `end=edge` on the ordinary gestures, with the window resting at `settle=`, is the fix working.
+///  * `end=level` on EVERY gesture refutes the ordering diagnosis: the edge is not being beaten to
+///    the punch, it is not arriving at all, and the search moves back into the HID service pass.
+///  * `stale=(0,0)` on every gesture while the operator still sees the window jump refutes the
+///    stale-motion hypothesis for the ~1px entirely — the shift is then in the mover
+///    (`move_to_inner`'s clamp) or in the erase, not in this path.
+///  * `stale=` of many pixels rather than one or two says motion reports were still queued when the
+///    level flipped: the settle is then short of the release by that much, and the level needs to
+///    travel IN the event stream rather than beside it.
+///  * `end=level-late` recurring says something other than the router is eating release edges.
+fn dragrel_witness(how: &str, sx: i32, sy: i32, pend: u32) {
+    if DRAGREL_LOG.fetch_add(1, Ordering::Relaxed) >= DRAGREL_LOG_MAX {
+        return;
+    }
+    // Measured from the level, not from the end path, so both arms report the same quantity: how
+    // long the button had read up when the gesture was finally ended. `0` on the edge arm means the
+    // release edge arrived without a single motion report in front of it.
+    let up = DRAG_LEVEL_UP_MS.load(Ordering::Relaxed);
+    let waited = if up == 0 {
+        0
+    } else {
+        crate::arch::ticks().wrapping_sub(up)
+    };
+    let (rx, ry) = click_pointer_pos();
+    let post = DRAG_POST_MOTIONS.load(Ordering::Relaxed);
+    serial_println!(
+        "[dragrel] win={} end={} settle=({},{}) release=({},{}) stale=({},{}) post={} pend={} wait={}ms -> {}",
+        crate::video::wm::drag_active(),
+        how,
+        sx,
+        sy,
+        rx,
+        ry,
+        rx - sx,
+        ry - sy,
+        post,
+        pend,
+        waited,
+        if post == 0 { "CLEAN" } else { "DIRTY" }
+    );
+}
+
+/// DRAGSETTLE — the gesture is over: forget its settle so the next one cannot inherit it.
+fn drag_settle_disarm() {
+    DRAG_DOWN_VALID.store(false, Ordering::Release);
+    DRAG_LEVEL_UP_MS.store(0, Ordering::Relaxed);
+    DRAG_POST_MOTIONS.store(0, Ordering::Relaxed);
+}
 
 /// WMDIRECT — **THE X86 EVENT-ROUTING CHAIN, AS ONE FUNCTION.** Both x86 drains (the BSP GUI loop
 /// and the SCHED-X86 render service) called an identical three-line `if/else if/else` inline; this
@@ -5799,6 +6033,10 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                 }
                 crate::video::wm::focus_changed(owner);
                 let how = if crate::video::wm::drag_begin(win, x, y) {
+                    // DRAGSETTLE — the grab point is the gesture's first settle point, so a
+                    // grab-and-let-go with no motion between the edges rests exactly where it was
+                    // grabbed rather than wherever the lift left the cursor.
+                    drag_settle_arm(x, y);
                     "drag"
                 } else {
                     "chrome"
@@ -5895,9 +6133,27 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         // Ahead of the target test, and unconditional on it: the drag's press was consumed with
         // target DROP, so the arm below already answers `true` for it — this only has to make sure
         // the gesture is finished before that answer is given.
+        //
+        // DRAGSETTLE — and it settles at the point the hand was at while the button was still DOWN,
+        // NOT at `(x, y)`. `(x, y)` is the live cursor, and by the time this edge is drained the
+        // release report's own lift delta has already been popped off the queue as an `Event::Mouse`
+        // and applied to it: sampling here moves the window that last inch AFTER the operator let
+        // go, which is the ~1px shift on the drop. The recorded point is maintained unthrottled by
+        // `wc_drag_motion`, so taking it costs nothing in reach — it is not the last THROTTLED
+        // position, it is the last position, full stop.
+        //
+        // DRAGSETTLE — the edge is accounted for FIRST, and unconditionally on there being a drag:
+        // a release that lands on something else must still clear the count, or the belt would hold
+        // off the NEXT gesture waiting for an edge that has already been and gone. Ahead of the
+        // witness too, so `pend=` reads "another release is queued behind this one" rather than
+        // always counting the edge that is being served.
+        crate::pal::note_release_edge_drained();
         if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE {
-            crate::video::wm::drag_motion(x, y);
+            let (sx, sy) = drag_settle_point();
+            drag_settle_apply(sx, sy);
+            dragrel_witness("edge", sx, sy, crate::pal::release_edge_pending());
             crate::video::wm::drag_end();
+            drag_settle_disarm();
         }
         // RELEASE edge — follow the press, or drop. Never hit-tested: the release belongs to whoever
         // received the press, not to whatever the pointer has since been dragged over.
@@ -6194,6 +6450,10 @@ static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; crate::video::wm::FIX_W * crate
 ///     fixture-only luxury and the drag that never ended on glass passed leg 3 every time.
 ///  8. **tabcancel** (DRAGREL) — `<TAB>` while a drag is live cancels it. The operator escape from a
 ///     window that is following the pointer with nothing visible to let go of.
+///  9. **settle** (DRAGSETTLE) — the release arrives in its REAL order (level, then the lift motion
+///     on the queue, then the button edge), and the belt neither jumps the queued edge nor lets the
+///     lift move the window. Catches the shape a GR24 capture shows end to end: every gesture ending
+///     `release-level` while the delivered-release arm never fires, and the drop a pixel off.
 ///
 /// Self-cleaning: the probe rows are closed and the input focus restored.
 #[cfg(all(feature = "witness", feature = "wc"))]
@@ -6382,6 +6642,104 @@ pub fn wmdirect_selftest() {
         None => false,
     };
 
+    // Leg 9 — DRAGSETTLE, **THE ORDER A REAL RELEASE ARRIVES IN**, and the two things the shipping
+    // code got wrong about it. A release report publishes the button LEVEL inside the service pass
+    // and QUEUES its `Event::Button`; the same report's lift dx/dy is queued AHEAD of that button.
+    // So the drain sees: motion, then edge — with the level already reading up for both. On that
+    // order the old tail ended the gesture at the first motion, steering the window by the lift, and
+    // the release arm found nothing left to end. A GR24 capture is that shape end to end: every
+    // gesture `end=release-level`, the delivered-release arm never once, the drop a pixel off.
+    //
+    // Driven through the REAL seams, not around them: `pal::push_event` is the producer every HID
+    // path uses (it is what arms the pending count), `pal::next_event` is the drain, and each popped
+    // event goes through `wc_route_event` + `wc_route_tail` exactly as both drains call them.
+    //
+    // **TWO of the conjuncts below are red on the pre-fix code, and the third is not** — said plainly
+    // because "three independent places" was the first draft's claim and it was an overclaim:
+    //  * `held` — after the lift motion is routed, the drag is STILL LIVE. The old belt had already
+    //    cancelled it here, so this conjunct alone is red on the shipping code. **Load-bearing.**
+    //  * `rest` — the row comes to rest at the +24 the hand steered to, NOT the +27 the lift left the
+    //    arrow at. Red on the shipping code, which applied the lift. This is the ~1px, magnified to
+    //    3 px so a fixture can name it. **Load-bearing.**
+    //  * `ended` — the queued edge is what ends it. VACUOUSLY TRUE pre-fix: the belt had already
+    //    ended the gesture, so `drag_active()` was `WIN_NONE` either way. Kept because it pins WHICH
+    //    path did the ending in combination with `held`, not because it can fail on its own.
+    let settle_ok = match {
+        // Re-place the row at the setup origin: eight legs have moved it, and this leg asserts an
+        // EXACT resting coordinate, so it must start from a placement the panel is known to accept
+        // rather than from wherever the fixture left it.
+        wm::move_to(w, ox, oy);
+        wm::info(w)
+    } {
+        Some(i) => {
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            user_input_set_active(OWNER_O);
+            wm::focus_changed(OWNER_O);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            // No edge in flight to begin with: the counter is global and a previous leg's routed
+            // `Button(0)` (leg 3's, leg 4's) never went through `push_event`, so it could only be
+            // left standing by a real HID release earlier in the boot. Cleared explicitly rather
+            // than assumed, and bounded so a wedged counter cannot spin the fixture.
+            for _ in 0..8 {
+                if crate::pal::release_edge_pending() == 0 {
+                    break;
+                }
+                crate::pal::note_release_edge_drained();
+            }
+            crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
+            crate::pal::cursor::set_button_level(true);
+            // The PRESS goes through `push_event` too, and it has to: `pal` tracks its own previous
+            // button mask and counts only the PRIMARY 1 -> 0 transition, so a release whose press
+            // never passed the producer is a 0 -> 0 and arms nothing. Caught by this leg the moment
+            // that rule landed — the fixture was pressing straight into the router, and the release
+            // it then pushed was, correctly, not counted as an edge in flight. Popped and then routed
+            // through `wc_click_route_at` with the point SUPPLIED rather than through
+            // `wc_route_event`, on the same rule every other leg here follows: QEMU has no pointer,
+            // and the grab needs an exact title-strip pixel that an absolute-coordinate round trip
+            // could round off the strip.
+            crate::pal::push_event(Event::Button(1));
+            let press = crate::pal::next_event();
+            let press_ok = matches!(press, Some(Event::Button(1)));
+            let grabbed =
+                press_ok && wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
+            // Steer 24 px with the button still down. The throttle may or may not admit the move
+            // itself — that is why the leg asserts the RESTING place and not this intermediate one:
+            // the settle point is recorded unthrottled, so the gesture reaches +24 either way.
+            let steer = Event::MouseAbsolute {
+                x: hid(px + 24, pw),
+                y: hid(py + 24, ph),
+            };
+            let _ = wc_route_event(steer);
+            wc_route_tail(steer);
+            // THE RELEASE REPORT, in its real order: level first (the parse path publishes it before
+            // it pushes anything), then the lift motion, then the button edge.
+            crate::pal::cursor::set_button_level(false);
+            crate::pal::push_event(Event::MouseAbsolute {
+                x: hid(px + 27, pw),
+                y: hid(py + 27, ph),
+            });
+            crate::pal::push_event(Event::Button(0));
+            let lift = crate::pal::next_event();
+            let lift_ok = matches!(lift, Some(Event::MouseAbsolute { .. }));
+            if let Some(e) = lift {
+                let _ = wc_route_event(e);
+                wc_route_tail(e);
+            }
+            let held = wm::drag_active() == w;
+            let edge = crate::pal::next_event();
+            let edge_ok = matches!(edge, Some(Event::Button(0)));
+            if let Some(e) = edge {
+                let _ = wc_route_event(e);
+                wc_route_tail(e);
+            }
+            let ended = wm::drag_active() == wm::WIN_NONE;
+            let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 24, i.y + 24));
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            grabbed && lift_ok && held && edge_ok && ended && rest
+        }
+        None => false,
+    };
+
     // ---- WMCTRL legs ------------------------------------------------------------------------
     //
     // **The defect these exist to catch, stated so they can fail on it.** `controls` returns the
@@ -6554,18 +6912,20 @@ pub fn wmdirect_selftest() {
         && dragdead_ok
         && level_ok
         && tabcancel_ok
+        && settle_ok
         && close_ok.unwrap_or(true)
         && ctrlgeom_ok.unwrap_or(true)
         && zoom_ok.unwrap_or(true)
         && minim_ok.unwrap_or(true);
     serial_println!(
-        "[wm-act] direct partition={} grab={} route={} content={} level={} tabcancel={} close={} dragdead={} ctrlgeom={} zoom={} minimise={} from=({},{}) to=({},{}) -> {}",
+        "[wm-act] direct partition={} grab={} route={} content={} level={} tabcancel={} settle={} close={} dragdead={} ctrlgeom={} zoom={} minimise={} from=({},{}) to=({},{}) -> {}",
         partition_ok,
         grab_ok,
         route_ok,
         content_ok,
         level_ok,
         tabcancel_ok,
+        settle_ok,
         match close_ok {
             Some(v) => if v { "true" } else { "false" },
             None => "skip",
