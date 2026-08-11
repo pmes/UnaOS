@@ -469,6 +469,58 @@ impl Default for EditorState {
     }
 }
 
+/// One log record as the Console viewer holds it: the same triple the
+/// `SMessage::Log` producer message carries, plus a monotonic `seq` the
+/// scrollback ring assigns on ingest so a view can anchor/dedupe without
+/// comparing content. `level` is the severity tag (e.g. "info"/"warn"/"error"),
+/// `source` the emitting subsystem (the facet axis), `content` the text.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LogLine {
+    pub seq: u64,
+    pub level: String,
+    pub source: String,
+    pub content: String,
+}
+
+/// Which log stream the Console viewer shows. On HOST every record arrives as
+/// an `SMessage::Log` on the bus, so a source is a FILTER over that one feed,
+/// not a second transport. On METAL the same selector chooses the kernel
+/// `TERM_RING` feed (see `unaos/crates/kernel/src/termring.rs`); the ring-3 app
+/// is unchanged — only the ingest edge swaps. `All` = every record;
+/// `Subsystem(name)` = only records whose `source` equals `name`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum LogSource {
+    All,
+    Subsystem(String),
+}
+
+impl Default for LogSource {
+    fn default() -> Self {
+        LogSource::All
+    }
+}
+
+/// Backing state for the Console log viewer — the macOS `Console.app`
+/// equivalent, owned by the `comscan` handler. This is the DESIGNED render seam
+/// for a future `ViewEntity::Console(LogViewState)`; it is a standalone struct
+/// today because `ViewEntity` is matched exhaustively in the Qt/GTK tetra
+/// bridge (`libs/quartzite/src/tetra.rs`), so wiring the variant belongs with
+/// the vessel widget that renders it, not with this handler arc.
+///
+/// `lines` is the already-filtered scrollback snapshot the view draws;
+/// `filter`/`source` are the active query; `paused` is scroll-lock (the tail is
+/// frozen — the ring keeps ingesting, the view stops moving); `dropped` is the
+/// count of records the bounded ring has evicted since boot, so a truncated
+/// view is VISIBLY truncated (the same counted-loss honesty `termring` keeps).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LogViewState {
+    pub lines: Vec<LogLine>,
+    pub filter: String,
+    pub source: LogSource,
+    pub paused: bool,
+    pub dropped: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ViewEntity {
     Topology(TopologyState),

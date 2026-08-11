@@ -29,9 +29,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bandy::ontology::WeightedSkeleton;
-use bandy::signals::{MatrixEvent, PrefValue, PrincipiaCommand, SMessage};
+use bandy::signals::{LogEvent, MatrixEvent, PrefValue, PrincipiaCommand, SMessage};
 use bandy::state::{
-    BrowseEntry, BrowseKind, BrowseListing, DispatchRecord, FsOutcome, FsVerb,
+    BrowseEntry, BrowseKind, BrowseListing, DispatchRecord, FsOutcome, FsVerb, LogLine, LogSource,
 };
 use bandy::Origin;
 
@@ -649,6 +649,42 @@ kat!(
 );
 kat!(kat_ui_ready, SMessage::UiReady, r#""UiReady""#);
 
+// --- LOGS (the Console log-viewer sub-enum) ----------------------------------
+kat!(
+    kat_logs_filter,
+    SMessage::Logs(LogEvent::LogFilter("gpu".to_string())),
+    r#"{"Logs":{"LogFilter":"gpu"}}"#
+);
+kat!(
+    kat_logs_source_all,
+    SMessage::Logs(LogEvent::LogSource(LogSource::All)),
+    r#"{"Logs":{"LogSource":"All"}}"#
+);
+kat!(
+    kat_logs_source_subsystem,
+    SMessage::Logs(LogEvent::LogSource(LogSource::Subsystem("kernel".to_string()))),
+    r#"{"Logs":{"LogSource":{"Subsystem":"kernel"}}}"#
+);
+kat!(
+    kat_logs_pause,
+    SMessage::Logs(LogEvent::LogPause(true)),
+    r#"{"Logs":{"LogPause":true}}"#
+);
+kat!(
+    kat_logs_tail,
+    SMessage::Logs(LogEvent::LogTail {
+        lines: vec![LogLine {
+            seq: 1,
+            level: "info".to_string(),
+            source: "net".to_string(),
+            content: "link up".to_string(),
+        }],
+        dropped: 2,
+        paused: false,
+    }),
+    r#"{"Logs":{"LogTail":{"lines":[{"seq":1,"level":"info","source":"net","content":"link up"}],"dropped":2,"paused":false}}}"#
+);
+
 // --- COMPLETENESS GUARD ------------------------------------------------------
 //
 // Exhaustive matches over the message vocabulary, with NO wildcard arm.
@@ -708,6 +744,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::TriggerUpload(_) => "TriggerUpload",
         SMessage::Principia(_) => "Principia",
         SMessage::Matrix(_) => "Matrix",
+        SMessage::Logs(_) => "Logs",
         SMessage::Input { .. } => "Input",
         SMessage::TemplateAction(_) => "TemplateAction",
         SMessage::NavSelect(_) => "NavSelect",
@@ -768,6 +805,15 @@ fn matrix_variant_name(e: &MatrixEvent) -> &'static str {
     }
 }
 
+fn logevent_variant_name(e: &LogEvent) -> &'static str {
+    match e {
+        LogEvent::LogFilter(_) => "LogFilter",
+        LogEvent::LogSource(_) => "LogSource",
+        LogEvent::LogPause(_) => "LogPause",
+        LogEvent::LogTail { .. } => "LogTail",
+    }
+}
+
 #[test]
 fn completeness_guard_matches_are_exhaustive() {
     // The real guard is at compile time: the matches above have no wildcard
@@ -785,6 +831,10 @@ fn completeness_guard_matches_are_exhaustive() {
     assert_eq!(
         matrix_variant_name(&MatrixEvent::FocusSector("euclase".to_string())),
         "FocusSector"
+    );
+    assert_eq!(
+        logevent_variant_name(&LogEvent::LogPause(true)),
+        "LogPause"
     );
 }
 

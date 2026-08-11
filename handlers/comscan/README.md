@@ -3,10 +3,61 @@
 The hardware I/O and signal handler for UnaOS: a bridge between the workspace
 and external hardware over serial, GPIO, Bluetooth, and software-defined radio.
 
-**Status: design-stage (not yet implemented).** This document describes the
-intended design. There is no implementation crate yet — no `Cargo.toml`, no
-`ignite(...)` entry point, no source. The behavior below is a specification, not
-a description of working code.
+**Status: partially implemented.** The crate now exists (`Cargo.toml`, `src/`,
+`ignite(...)`), and its **first landed capability is the Console app** — the
+system log viewer described under [The Console app](#the-console-app-macos-consoleapp-equivalent)
+below. The serial / GPIO / Bluetooth / SDR scope in the next sections remains
+**design-stage**: a specification, not working code.
+
+## The Console app (macOS `Console.app` equivalent)
+
+Comscan is the telemetry/serial handler, and the OS's log viewer belongs here:
+a ring-3 program that **subscribes to the system log feed**, keeps a bounded
+scrollback, and publishes a filtered, tailing view for a vessel to render. This
+is the correct model for reading logs — the kernel console is plumbing behind
+the facade, not a desktop window to manage; the app is a *subscriber*, never a
+pinned raw console.
+
+**The log feed — host vs metal.** The ring-3 app is transport-agnostic; only the
+ingest edge swaps:
+
+- **Host (today).** Every component that logs fires a
+  `bandy::SMessage::Log { level, source, content }` onto the Synapse bus — the
+  same bus every other host-native handler already reads. The Console app
+  subscribes to that one feed; there is no separate log daemon.
+- **Metal (the swap).** The kernel's `TERM_RING`
+  (`unaos/crates/kernel/src/termring.rs`) is the console-output stream. Over a
+  real kernel, each drained `TERM_RING` line becomes one `LogView::on_log(..)`
+  call in place of an `SMessage::Log`. Nothing else changes — the same swap the
+  matrix Finder documented for its FAT↔UnaFS backing.
+
+**Bounded scrollback.** `logview::LogView` holds at most `cap` records in a ring
+(`DEFAULT_SCROLLBACK` = 4096). It is **drop-OLDEST** — the opposite of
+`TERM_RING`, which is a transport and drops the newest. A scrollback must keep
+showing the present, so on overflow it evicts the oldest line and **counts the
+eviction** (`dropped`), so a truncated view is visibly truncated — the same
+counted-loss honesty `termring` keeps.
+
+**Command / render contract** (`bandy::LogEvent`, carried under
+`SMessage::Logs`), distinct from the `SMessage::Log` producer message:
+
+- view→handler: `LogFilter(String)` (case-insensitive substring over
+  content/source/level; empty clears), `LogSource(LogSource)` (facet by
+  subsystem; `All` shows everything), `LogPause(bool)` (scroll-lock — the ring
+  keeps ingesting, the view freezes).
+- handler→view: `LogTail { lines, dropped, paused }` — the single bounded,
+  filtered snapshot the vessel draws.
+
+**The vessel view is DESIGNED, not wired.** `bandy::state::LogViewState` is the
+render seam for a future `ViewEntity::Console(LogViewState)`. It is a standalone
+struct today because `ViewEntity` is matched exhaustively in the Qt/GTK tetra
+bridge (`libs/quartzite/src/tetra.rs`); wiring the variant and its GTK/AppKit
+widget belongs with the vessel arc, out of this handler's lane. The handler,
+events, state, and tests have landed; the on-glass widget is the follow-up.
+
+Proofs live in `tests/console.rs` (bounded scrollback, live tail, pause/resume,
+text + source filters, the `serve` bus round-trip) and in the `kat_logs_*`
+golden KATs in `libs/bandy/tests/smessage_kats.rs` (the frozen wire shape).
 
 ## Responsibility
 

@@ -14,6 +14,7 @@ members = [
     "libs/euclase",
     "handlers/vein",
     "handlers/matrix",
+    "handlers/comscan",
     "handlers/vaire",
     "handlers/aule",
     "handlers/tabula",
