@@ -26,6 +26,15 @@ either direction — and is pure-read: a verb that could rewrite what it audits 
 verification. The Bolt-1 invariants carry verbatim: the **only** write surface is `BoltRoot`, built
 solely from `bolt_root`, and both git invocations pull *from* the source with the mirror as the
 target, so no path can write into a managed repository (test-pinned against a `0o555` source).
+**The chain is graded, not oversold.** The head is not anchored outside the
+ledger file, so BOLT-2 ships a tamper-evident *journal* against an editor, not a
+tamper-proof *log* against an adversary who owns the bolt root: a whole-tail
+rewrite (edit entry *k*, re-chain *k..n*) and a truncation to a valid prefix
+both verify Green. Both limits are pinned by their own tests so they cannot be
+forgotten, and the anchor that would close them (a retained CoW root holding the
+ledger, or a countersigned head kept off the bolt) is named as future work — the
+`vaire.repo.head` / `vaire.repo.ledger.<stamp>` rows of the UnaFS mapping are
+design targets with no code behind them yet.
 The default-deny credential floor is reused but honestly re-scoped: a mirror carries whatever was
 committed, so the floor **audits and reports** rather than skipping — every credential-shaped path
 in a mirrored head tree lands in the ledger entry, is covered by the entry hash (scrubbing one
@@ -53,7 +62,7 @@ opted out of `gix`'s default features without re-adding `sha1`, leaving `gix_has
 | Axis | Measured |
 | --- | --- |
 | (a) 10,000 blobs, 422 MiB, 256-way fan-out | stage 5.03 s (0.503 ms/object), **ONE commit 20.7 ms**, 83.5 MiB/s, write amplification **1.42×** |
-| (a2) 52 MB packfile-shaped stream | write 49.3 MiB/s, read-back **1458 MiB/s**, 105 extents |
+| (a2) 52 MB packfile-shaped stream | write 49.3 MiB/s, read-back **1458 MiB/s** (page-cache warm — the extent path, not device bandwidth), 105 extents |
 | (b) 493 refs rewritten, batched | 0.67 ms/ref in one flip |
 | (b) one ref per flip | **25 ms/ref, 412 blocks/ref — 37× the batched cost** |
 | (c) recursive walk, 10,494 files | 13.6 ms (1.29 ms per 1,000 entries) |
@@ -82,8 +91,9 @@ snapshot per weave is structural, not a copy), and a **mark-and-sweep `fsck` wit
 (0 leaked over 150,292 blocks in 66 ms) — repository integrity as a filesystem property instead of a
 convention. The verdict shaped the code: BOLT-2 keeps packfile handling on the host git/`gix` side —
 exactly where UnaFS hits its ceiling — and `repo-ufit` / `repo-uweave` check the measured limits
-**before** touching an image, so an over-ceiling bolt is refused with a reason rather than failing
-halfway through a weave with an `InodeTooLarge` from three layers down.
+**before** touching an image — against the volume the run will actually create (`--size-mb`,
+default 256 MiB), not merely the 2 GiB format cap — so an over-ceiling bolt is refused with a
+reason rather than failing halfway through a weave with an `InodeTooLarge` from three layers down.
 
 ---
 

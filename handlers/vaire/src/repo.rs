@@ -20,8 +20,37 @@
 //! * **The ledger** — `<bolt_root>/ledger/<name>.ledger`, an append-only chain
 //!   of entries. Each entry records the run stamp, every ref and its object id,
 //!   the credential findings, and the hash of the previous entry; its own hash
-//!   covers all of that. Editing or dropping any historical entry breaks the
-//!   chain and [`verify`] says so and names the entry.
+//!   covers all of that. Editing, dropping or reordering a historical entry
+//!   *without re-chaining its successors* breaks the chain, and [`verify`] says
+//!   so and names the entry. See the graded threat model below for what that
+//!   does and does not buy.
+//!
+//! # What the chain is worth (graded honestly)
+//!
+//! **The chain head is not anchored to anything outside the ledger file.** That
+//! bounds the claim precisely:
+//!
+//! * **Caught** — an entry edited in place (its hash no longer covers its
+//!   contents); an entry dropped or reordered mid-chain (a successor's `prev`
+//!   stops matching); a `cred` line scrubbed; a hash that is not a well-formed
+//!   SHA-1 (the collision-detector marker); and — via the *mirror* checks
+//!   rather than the chain — a recorded object gone missing or a ref that
+//!   drifted. Each of these is falsified by a test.
+//! * **NOT caught** — a **whole-tail rewrite**. `LedgerEntry::new` is
+//!   deterministic and public, so anyone with write access to the ledger file
+//!   can edit entry *k*, recompute the hashes of *k..n*, and produce a chain
+//!   [`verify`] calls Green. Likewise a **truncation to a valid prefix**: the
+//!   surviving entries still chain, and dropping the newest is invisible
+//!   whenever the mirror's refs did not move between the dropped entries (the
+//!   common case for a scheduled weave). Both limits are pinned by tests.
+//!
+//! So: this is a **tamper-evident journal against an editor, not a tamper-proof
+//! log against an adversary who owns the bolt root.** Making it the latter
+//! needs an anchor the same writer cannot rewrite — a countersigned head kept
+//! off the bolt, or the retained-CoW-root route named in the UnaFS mapping
+//! below (which is *not yet wired*: nothing in this module writes
+//! `vaire.repo.head`, and [`unafs_view`] weaves `mirrors/` only, so the ledger
+//! is not in the image and no snapshot anchors it today).
 //! * **The credential floor** — the *same* [`crate::devtree::ExcludeRules`]
 //!   default-deny patterns. A mirror carries whatever was committed, so a
 //!   floor cannot retroactively un-commit a key; what it can do — and what this
@@ -59,11 +88,19 @@
 //! | --- | --- |
 //! | `mirrors/<name>.git/**` | a directory tree: `mkdir` per dir, one `create_files_batch` per parent dir |
 //! | each mirrored file's size/mtime/source | the four `vaire.size` / `vaire.mtime` / `vaire.src` / `vaire.sync` K6 typed attrs, folded into the file's creation inode |
-//! | one ledger entry `<stamp>` | a `vaire.repo.ledger.<stamp>` String attr on the unit-root inode (the `vaire.summary.<stamp>` pattern) |
-//! | the ledger head | `vaire.repo.head` (the chain hash) on the unit root |
-//! | a credential finding | a `vaire.repo.cred.<n>` String attr — reported in the image itself, never silent |
-//! | the ledger's tamper-evidence | strengthened, not replaced: `snapshot_create(<stamp>, "vaire")` retains the *whole tree* at that stamp as an immutable CoW root, so a chain hash can be checked against a real historical root via `open_snapshot` rather than against a file the same process could rewrite |
+//! | one ledger entry `<stamp>` | *(planned)* a `vaire.repo.ledger.<stamp>` String attr on the unit-root inode (the `vaire.summary.<stamp>` pattern) |
+//! | the ledger head | *(planned)* `vaire.repo.head` (the chain hash) on the unit root |
+//! | a credential finding | *(planned)* a `vaire.repo.cred.<n>` String attr — reported in the image itself, never silent |
+//! | the ledger's tamper-evidence | *(planned)* `snapshot_create(<stamp>, "vaire")` retains the whole tree at that stamp as an immutable CoW root, so a chain hash could be checked against a real historical root via `open_snapshot` rather than against a file the same process can rewrite |
 //! | Crystal Color | computed, never stored (it is a function of live truth) |
+//!
+//! **Implemented today vs planned.** The two rows above the marker — the
+//! mirror's directory tree and the four per-file typed attrs — are what
+//! [`unafs_view`] + `usync` actually write; the retained snapshot per run is
+//! real too, but it retains the *mirrors*, not the ledger. Every row marked
+//! *(planned)* is a named design target with no code behind it yet:
+//! [`unafs_layout`] returns the mapping as inspectable data, which pins the
+//! table's shape, not its implementation status.
 //!
 //! The honest boundary: host-native vaire cannot mount a *kernel* UnaFS volume
 //! — there is no host↔kernel bridge today, and the crate's only host device is
@@ -354,9 +391,22 @@ fn chain_hash(bytes: &[u8]) -> String {
         Ok(id) => id.to_hex().to_string(),
         // The only failure mode is a detected SHA-1 collision attempt. Refusing
         // to produce a hash at all would lose the entry; emit a loud, distinct,
-        // never-valid marker so `verify` can never call such a chain clean.
-        Err(_) => "collision-detected".repeat(3),
+        // never-valid marker instead. The recompute check alone cannot catch it
+        // (a recompute would produce the same marker), so [`verify`] also
+        // checks the SHA-1 SHAPE of every stored hash — see `is_sha1_hex`.
+        Err(_) => COLLISION_MARKER.to_string(),
     }
+}
+
+/// The never-valid hash emitted when the collision detector fires. It is not a
+/// 40-hex SHA-1, which is exactly what makes [`verify`] refuse it.
+pub const COLLISION_MARKER: &str = "collision-detected-collision-detected";
+
+/// Is this a well-formed SHA-1 hex digest? A stored `hash` that is not one can
+/// never have come from a clean [`chain_hash`], however self-consistent the
+/// rest of the entry is.
+fn is_sha1_hex(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// The entry being accumulated while parsing, before its `hash` line closes it.
@@ -713,7 +763,7 @@ pub fn verify(m: &RepoManifest, deep: bool) -> Result<Vec<VerifyReport>> {
         // 1. The chain: each entry's own hash, then its link to its predecessor.
         let mut prev_hash = GENESIS.to_string();
         for e in &entries {
-            if e.recomputed_hash() != e.hash {
+            if !is_sha1_hex(&e.hash) || e.recomputed_hash() != e.hash {
                 breaches.push(Breach::EntryTampered {
                     stamp: e.stamp.clone(),
                 });
@@ -874,6 +924,18 @@ pub fn status(m: &RepoManifest) -> Result<Vec<RepoBoltStatus>> {
 pub fn unafs_view(m: &RepoManifest) -> Result<DevManifest> {
     let bolt = m.bolt();
     let mirrors = bolt.resolve(Path::new("mirrors"))?;
+    // A single quote cannot be carried by a TOML literal string. Refuse it —
+    // stripping it would silently project a DIFFERENT path than the manifest
+    // named, which is exactly the class of mistake a projection must not make.
+    for s in [
+        m.name.as_str(),
+        &m.bolt_root.to_string_lossy(),
+        &mirrors.to_string_lossy(),
+    ] {
+        if s.contains('\'') {
+            bail!("refusing to project a repo Bolt whose name or path contains a quote: {s:?}");
+        }
+    }
     let toml = format!(
         "name = {}\n\
          live = 'narino'\n\
@@ -890,8 +952,9 @@ pub fn unafs_view(m: &RepoManifest) -> Result<DevManifest> {
     Ok(dm)
 }
 
-/// TOML single-quoted literal string, with the one character it cannot hold
-/// rejected rather than mangled.
+/// TOML single-quoted literal string. Callers reject the one character it
+/// cannot hold before they get here (see [`unafs_view`]); this is the last
+/// line of defence and must never be reached with a quote in `s`.
 fn toml_str(s: &str) -> String {
     debug_assert!(!s.contains('\''), "path contains a quote: {s}");
     format!("'{}'", s.replace('\'', ""))
@@ -926,8 +989,8 @@ pub fn unafs_layout(m: &RepoManifest) -> Vec<LayoutMapping> {
         rows.push(LayoutMapping {
             host: format!("ledger/{}.ledger (entry <stamp>)", r.name),
             native: format!(
-                "vaire.repo.ledger.<stamp> String attr on the /{}.git unit root; \
-                 head chain hash in vaire.repo.head",
+                "(planned, not yet written) vaire.repo.ledger.<stamp> String attr on the \
+                 /{}.git unit root; head chain hash in vaire.repo.head",
                 r.name
             ),
         });
@@ -958,6 +1021,12 @@ pub const UNAFS_VOLUME_CAP_BYTES: u64 = 524_288 * 4096;
 /// 75 MiB → 151 extents, fine; 85 MiB → `InodeTooLarge(4100, 4096)`. A
 /// fragmented volume will fail earlier, so this is a ceiling, not a promise.
 /// (Harness: `examples/unafs_repo_feasibility.rs`.)
+///
+/// Two reasons the real margin is thinner than the bisect: the harness wrote
+/// that packfile with **no attributes**, while the path this gates ([`crate::usync`])
+/// folds four `vaire.*` attrs — including `vaire.src`, a full absolute host
+/// path — into the same 4 KiB inode, and a fragmented volume yields shorter
+/// extents. Treat 75 MiB as the optimistic bound, not headroom.
 pub const UNAFS_MAX_FILE_BYTES: u64 = 75 * 1024 * 1024;
 
 /// Directory width past which a name lookup gets expensive: UnaFS has no path
@@ -997,6 +1066,20 @@ impl Readiness {
 /// soft one, and a repo manager that discovers them halfway through a weave —
 /// as an `InodeTooLarge` from three layers down — is not a manager.
 pub fn unafs_readiness(m: &RepoManifest) -> Result<Readiness> {
+    unafs_readiness_for(m, UNAFS_VOLUME_CAP_BYTES)
+}
+
+/// [`unafs_readiness`] against the volume the caller will actually create.
+///
+/// The format's 2 GiB cap is the *ceiling*, not the size of the image a run
+/// asks for — `repo-uweave` defaults to a 256 MiB image. Checking a 900 MiB
+/// bolt against the cap and then formatting 256 MiB would report FITS and fail
+/// inside the weave, which is precisely the outcome this check exists to
+/// prevent, so the applying verb passes its own size in. `volume_bytes` is
+/// clamped to [`UNAFS_VOLUME_CAP_BYTES`] — a larger image is refused by the
+/// format itself.
+pub fn unafs_readiness_for(m: &RepoManifest, volume_bytes: u64) -> Result<Readiness> {
+    let volume_bytes = volume_bytes.min(UNAFS_VOLUME_CAP_BYTES);
     let bolt = m.bolt();
     let mirrors = bolt.resolve(Path::new("mirrors"))?;
     let mut r = Readiness {
@@ -1020,21 +1103,22 @@ pub fn unafs_readiness(m: &RepoManifest) -> Result<Readiness> {
         ));
     }
     // Payload alone is not the whole cost: measured write amplification on a
-    // git-shaped mix is ~1.4x, and every retained snapshot that diverges adds
-    // more. Call it at half the cap rather than at the cap.
-    if r.total_bytes.saturating_mul(3) / 2 >= UNAFS_VOLUME_CAP_BYTES {
+    // git-shaped mix is 1.42x, and every retained snapshot that diverges adds
+    // more. Budget 1.5x — the measured amplification rounded up, with no
+    // snapshot headroom beyond it.
+    if r.total_bytes.saturating_mul(3) / 2 >= volume_bytes {
         r.blockers.push(format!(
-            "{} MiB of mirror payload against a {} MiB v3 volume cap (×~1.4 measured \
-             write amplification, before snapshots diverge)",
+            "{} MiB of mirror payload against a {} MiB v3 volume (×1.5 budget for the \
+             1.42× measured write amplification, before snapshots diverge)",
             r.total_bytes / 1024 / 1024,
-            UNAFS_VOLUME_CAP_BYTES / 1024 / 1024
+            volume_bytes / 1024 / 1024
         ));
-    } else if r.total_bytes * 4 >= UNAFS_VOLUME_CAP_BYTES {
+    } else if r.total_bytes.saturating_mul(4) >= volume_bytes {
         r.warnings.push(format!(
-            "{} MiB of payload is over a quarter of the {} MiB volume cap — snapshot \
+            "{} MiB of payload is over a quarter of the {} MiB volume — snapshot \
              headroom is finite",
             r.total_bytes / 1024 / 1024,
-            UNAFS_VOLUME_CAP_BYTES / 1024 / 1024
+            volume_bytes / 1024 / 1024
         ));
     }
     if let Some((path, n)) = &r.widest_dir

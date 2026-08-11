@@ -189,7 +189,12 @@ and wrapped with host I/O by the userspace `libs/fs/unafs`.
   integrity-verified bare mirror plus an append-only, hash-chained ledger of
   every ref per weave, under the same default-deny credential floor (re-scoped
   honestly: a mirror carries what was committed, so the floor **audits and
-  reports**, and a finding is covered by the entry hash). All Bolt-1 invariants
+  reports**, and a finding is covered by the entry hash). The chain is graded
+  honestly: with no anchor outside the ledger file it is tamper-*evident*
+  against an editor, not tamper-*proof* — a whole-tail rewrite and a truncation
+  to a valid prefix both verify Green, and both are pinned by tests until an
+  anchor (a retained CoW root holding the ledger, or an off-bolt countersigned
+  head) lands. All Bolt-1 invariants
   carry verbatim — one write surface, sources read-only, dry-run default.
   `repo::unafs_view` projects a repo Bolt into the `DevManifest` the VAIRE-3
   `usync` engine consumes, so the native weave is executable today rather than

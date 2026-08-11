@@ -85,7 +85,7 @@ fn run() -> Result<()> {
         Some("repo-weave") => cmd_repo_weave(&manifest_path, apply),
         Some("repo-verify") => cmd_repo_verify(&manifest_path, deep),
         Some("repo-layout") => cmd_repo_layout(&manifest_path),
-        Some("repo-ufit") => cmd_repo_ufit(&manifest_path),
+        Some("repo-ufit") => cmd_repo_ufit(&manifest_path, size_mb),
         Some("repo-uweave") => cmd_repo_uweave(&manifest_path, image, apply, size_mb),
         Some("-h") | Some("--help") | None => {
             print_usage();
@@ -93,7 +93,8 @@ fn run() -> Result<()> {
         }
         Some(other) => bail!(
             "unknown command: {other} (try: status | snap | sync | usync | ustatus | \
-             repo-status | repo-plan | repo-weave | repo-verify | repo-layout | repo-uweave)"
+             repo-status | repo-plan | repo-weave | repo-verify | repo-layout | repo-ufit | \
+             repo-uweave)"
         ),
     }
 }
@@ -121,7 +122,7 @@ fn print_usage() {
          \x20 vaire repo-weave   --manifest <path> [--apply]\n\
          \x20 vaire repo-verify  --manifest <path> [--deep]\n\
          \x20 vaire repo-layout  --manifest <path>\n\
-         \x20 vaire repo-ufit    --manifest <path>\n\
+         \x20 vaire repo-ufit    --manifest <path> [--size-mb <n>]\n\
          \x20 vaire repo-uweave  [<image>] --manifest <path> [--apply] [--size-mb <n>]\n\n\
          SYNC is DRY-RUN by default; --apply writes (narino->40G) and SNAPs first.\n\
          USYNC weaves the penumbra into a UnaFS v3 image as native objects (DRY-RUN\n\
@@ -339,6 +340,14 @@ fn load_repo_manifest(path: &std::path::Path) -> Result<RepoManifest> {
     RepoManifest::load(path)
 }
 
+/// The image size a repo verb will actually create, in bytes, clamped to the
+/// v3 format cap (a larger request cannot be formatted anyway).
+fn volume_bytes(size_mb: u64) -> u64 {
+    size_mb
+        .saturating_mul(1024 * 1024)
+        .min(repo::UNAFS_VOLUME_CAP_BYTES)
+}
+
 fn cmd_repo_status(manifest: &std::path::Path) -> Result<()> {
     let m = load_repo_manifest(manifest)?;
     println!("Repo Bolt: {}  (root {})", m.name, m.bolt_root.display());
@@ -442,15 +451,17 @@ fn cmd_repo_layout(manifest: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_repo_ufit(manifest: &std::path::Path) -> Result<()> {
+fn cmd_repo_ufit(manifest: &std::path::Path, size_mb: u64) -> Result<()> {
     let m = load_repo_manifest(manifest)?;
-    let r = repo::unafs_readiness(&m)?;
+    let volume_bytes = volume_bytes(size_mb);
+    let r = repo::unafs_readiness_for(&m, volume_bytes)?;
     println!(
-        "UnaFS v3 fit for '{}': {} files, {} MiB payload (volume cap {} MiB, \
-         single-file ceiling {} MiB)",
+        "UnaFS v3 fit for '{}': {} files, {} MiB payload (target volume {} MiB of a \
+         {} MiB cap, single-file ceiling {} MiB)",
         m.name,
         r.files,
         r.total_bytes / 1024 / 1024,
+        volume_bytes / 1024 / 1024,
         repo::UNAFS_VOLUME_CAP_BYTES / 1024 / 1024,
         repo::UNAFS_MAX_FILE_BYTES / 1024 / 1024
     );
@@ -483,8 +494,10 @@ fn cmd_repo_uweave(
     let m = load_repo_manifest(manifest)?;
     // Check the measured v3 limits BEFORE touching an image, so a run that
     // cannot fit is a true no-op with a reason, not an InodeTooLarge from
-    // three layers down halfway through a weave.
-    let fit = repo::unafs_readiness(&m)?;
+    // three layers down halfway through a weave. The check is against the
+    // volume THIS run will create (`--size-mb`), not merely the format cap —
+    // otherwise a bolt bigger than the image would still be waved through.
+    let fit = repo::unafs_readiness_for(&m, volume_bytes(size_mb))?;
     for w in &fit.warnings {
         eprintln!("vaire: note: {w}");
     }

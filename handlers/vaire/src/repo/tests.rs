@@ -348,6 +348,120 @@ fn a_never_woven_bolt_reports_ledger_empty_not_an_error() {
     assert!(v.breaches.contains(&Breach::MirrorMissing));
 }
 
+/// The honest limit of an unanchored chain, pinned rather than assumed away.
+///
+/// A hash chain is tamper-EVIDENT only against a party who cannot recompute it.
+/// Nothing outside the ledger file anchors its head, so an attacker holding
+/// write access to the file can edit a historical entry and re-chain every
+/// successor — `verify` then reports Green. This test exists so the limit is a
+/// measured fact in the suite, not a sentence someone can quietly delete.
+#[test]
+fn a_whole_tail_rewrite_is_not_detected_the_chain_head_is_unanchored() {
+    let src = tempfile::tempdir().unwrap();
+    seed_repo(src.path(), &[("a.txt", "alpha\n")]);
+    let bolt_dir = tempfile::tempdir().unwrap();
+    let bolt_root = bolt_dir.path().join("bolt");
+    let m = mk_manifest(&bolt_root, &[("alpha", src.path())]);
+    weave(&m).unwrap();
+    fs::write(src.path().join("b.txt"), "beta\n").unwrap();
+    git(src.path(), &["add", "-A"]);
+    git(src.path(), &["commit", "-q", "-m", "second"]);
+    weave(&m).unwrap();
+
+    // Rewrite entry 1's history (drop its recorded refs) and re-chain entry 2
+    // onto the forged hash, exactly as `LedgerEntry::new` would.
+    let path = bolt_root.join("ledger/alpha.ledger");
+    let entries = read_ledger(&path).unwrap();
+    assert_eq!(entries.len(), 2);
+    let forged_first = LedgerEntry::new(
+        entries[0].stamp.clone(),
+        entries[0].repo.clone(),
+        GENESIS.to_string(),
+        Vec::new(), // the history this entry recorded, erased
+        Vec::new(),
+    );
+    let rechained_second = LedgerEntry::new(
+        entries[1].stamp.clone(),
+        entries[1].repo.clone(),
+        forged_first.hash.clone(),
+        entries[1].refs.clone(),
+        entries[1].credentials.clone(),
+    );
+    fs::write(
+        &path,
+        format!("{}{}", forged_first.render(), rechained_second.render()),
+    )
+    .unwrap();
+
+    let v = &verify(&m, false).unwrap()[0];
+    assert!(
+        v.is_intact(),
+        "KNOWN LIMIT: an unanchored chain cannot detect a whole-tail rewrite; \
+         if this ever fails, an anchor landed and the docs must be regraded. \
+         breaches: {:?}",
+        v.breaches
+    );
+}
+
+/// The second half of the same limit: dropping trailing entries leaves a valid
+/// prefix. It is caught only when the mirror still carries the refs the newest
+/// surviving entry does not — i.e. by the ref-drift check, not by the chain.
+#[test]
+fn a_truncation_to_a_valid_prefix_is_caught_only_by_ref_drift() {
+    let src = tempfile::tempdir().unwrap();
+    seed_repo(src.path(), &[("a.txt", "alpha\n")]);
+    let bolt_dir = tempfile::tempdir().unwrap();
+    let bolt_root = bolt_dir.path().join("bolt");
+    let m = mk_manifest(&bolt_root, &[("alpha", src.path())]);
+    weave(&m).unwrap();
+    // A no-op weave: the source did not move, so entry 2 records what entry 1
+    // did. This is the common case for a scheduled weave.
+    weave(&m).unwrap();
+
+    let path = bolt_root.join("ledger/alpha.ledger");
+    let entries = read_ledger(&path).unwrap();
+    assert_eq!(entries.len(), 2);
+    fs::write(&path, entries[0].render()).unwrap();
+
+    let v = &verify(&m, false).unwrap()[0];
+    assert!(
+        v.is_intact(),
+        "KNOWN LIMIT: a tail truncation to a valid prefix leaves no chain \
+         evidence; breaches: {:?}",
+        v.breaches
+    );
+    assert_eq!(v.entries, 1, "an entry vanished and the chain still verifies");
+}
+
+#[test]
+fn a_hash_that_is_not_a_sha1_is_a_breach_not_a_clean_chain() {
+    // `chain_hash` emits a never-valid marker when the collision detector
+    // fires. Because `recomputed_hash` would emit the same marker, the marker
+    // alone cannot be caught by the recompute check — the shape check is what
+    // catches it.
+    let src = tempfile::tempdir().unwrap();
+    seed_repo(src.path(), &[("a.txt", "alpha\n")]);
+    let bolt_dir = tempfile::tempdir().unwrap();
+    let bolt_root = bolt_dir.path().join("bolt");
+    let m = mk_manifest(&bolt_root, &[("alpha", src.path())]);
+    weave(&m).unwrap();
+
+    let path = bolt_root.join("ledger/alpha.ledger");
+    let entries = read_ledger(&path).unwrap();
+    let mut e = entries[0].clone();
+    e.hash = COLLISION_MARKER.to_string();
+    fs::write(&path, e.render()).unwrap();
+
+    let v = &verify(&m, false).unwrap()[0];
+    assert!(
+        v.breaches
+            .iter()
+            .any(|b| matches!(b, Breach::EntryTampered { .. })),
+        "a hash that is not a 40-hex SHA-1 must never verify; breaches: {:?}",
+        v.breaches
+    );
+}
+
 #[test]
 fn a_truncated_ledger_is_rejected_by_the_parser() {
     let err = parse_ledger("entry 20260811T000000Z\nrepo alpha\nprev 0\n").unwrap_err();

@@ -203,11 +203,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let back = fs
         .read_data(pack, 0, 4 * 1024 * 1024)
         .map_err(|e| format!("read_data: {e:?}"))?;
+    let read_ms = ms(t.elapsed());
     println!(
-        "      sequential read-back of 4 MiB: {:8.1} ms ({:.1} MiB/s), {} B correct",
-        ms(t.elapsed()),
-        4.0 / (ms(t.elapsed()) / 1000.0),
+        "      sequential read-back of 4 MiB: {read_ms:8.1} ms ({:.1} MiB/s), {} B correct",
+        4.0 / (read_ms / 1000.0),
         back.len()
+    );
+    println!(
+        "      NOTE: that read is PAGE-CACHE WARM (the image file was just\n\
+         \x20           written by this process); it measures the UnaFS extent path,\n\
+         \x20           not device bandwidth. The WRITE figures above are durable:\n\
+         \x20           every `commit` calls FileDevice::flush => File::sync_all."
     );
 
     // ---------------------------------------------------------------------

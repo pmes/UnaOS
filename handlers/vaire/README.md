@@ -282,7 +282,10 @@ Bolt-1 invariants carried verbatim.
   object id, the credential findings, and its predecessor's hash; its own hash
   covers all of that (collision-detecting SHA-1, via the `gix` the crate
   already carries for reading repositories). There is no rewrite path in the
-  code — `BoltRoot` can only append.
+  code — `BoltRoot` can only append. **Graded honestly:** the chain head is not
+  anchored outside the ledger file, so this is a tamper-evident *journal*
+  against an editor, not a tamper-proof *log* against an adversary who owns the
+  bolt root — see "What the chain is worth" below.
 - **The credential floor** — the *same* default-deny patterns, honestly
   re-scoped. A mirror carries whatever was committed, so a filter cannot
   un-commit a key; what the floor does here is **audit and report, never
@@ -315,9 +318,34 @@ so it is refused by name.
 real tamper: an **edited entry** (recorded hash no longer matches its
 contents), a **dropped entry** (a successor's `prev` points at nothing), a
 **missing object** (an oid the ledger recorded is absent from the mirror), and
-**ref drift** in either direction. Crystal: **Red** on any breach, **Amber**
-when intact but carrying unresolved credential findings or a source that has
-moved past the ledger, **Green** when intact and current.
+**ref drift** in either direction. A fifth check refuses any stored hash that
+is not a well-formed 40-hex SHA-1 (the collision detector's marker is
+self-consistent under recompute, so shape is what catches it). Crystal:
+**Red** on any breach, **Amber** when intact but carrying unresolved credential
+findings or a source that has moved past the ledger, **Green** when intact and
+current.
+
+### What the chain is worth
+
+A hash chain is tamper-evident only against a party who cannot recompute it,
+and **nothing outside the ledger file anchors its head**. That bounds the claim
+exactly:
+
+- **Caught** (each falsified by a test): an entry edited in place; an entry
+  dropped or reordered mid-chain; a `cred` line scrubbed; a hash that is not a
+  SHA-1; a recorded object missing from the mirror; ref drift either way.
+- **NOT caught** (both pinned by tests, so the limit cannot be quietly
+  forgotten): a **whole-tail rewrite** — `LedgerEntry::new` is deterministic
+  and public, so anyone with write access to the file can edit entry *k* and
+  re-chain *k..n* into something `verify` calls Green; and a **truncation to a
+  valid prefix** — the survivors still chain, and dropping the newest entries
+  is invisible whenever the mirror's refs did not move between them (the common
+  case for a scheduled weave).
+
+Closing that needs an anchor the same writer cannot rewrite: a countersigned
+head kept off the bolt, or the retained-CoW-root route in the mapping below —
+which is **not wired today** (nothing writes `vaire.repo.head`, and
+`repo-uweave` weaves `mirrors/` only, so the ledger is not even in the image).
 
 ### UnaFS alignment — executable, not asserted
 
@@ -332,12 +360,18 @@ the mapping as data so it is test-pinned rather than prose:
 | --- | --- |
 | `mirrors/<name>.git/**` | a directory tree: `mkdir` per dir, one `create_files_batch` per parent dir |
 | each file's size/mtime/source | the four `vaire.size` / `vaire.mtime` / `vaire.src` / `vaire.sync` K6 attrs, folded into the creation inode |
-| one ledger entry `<stamp>` | a `vaire.repo.ledger.<stamp>` String attr on the unit root (the `vaire.summary.<stamp>` pattern) |
-| the ledger head | `vaire.repo.head` (the chain hash) on the unit root |
-| a credential finding | a `vaire.repo.cred.<n>` String attr — reported in the image itself |
-| `.vaire-repo-bolt` (layout v1) | a `vaire.repo.layout` Int attr on the image root |
-| one weave | one `snapshot_create(<stamp>, "vaire")` — a retained CoW root, which *strengthens* the chain: a hash can be checked against a real historical root via `open_snapshot`, not merely against a file the same process could rewrite |
+| one ledger entry `<stamp>` | *(planned)* a `vaire.repo.ledger.<stamp>` String attr on the unit root (the `vaire.summary.<stamp>` pattern) |
+| the ledger head | *(planned)* `vaire.repo.head` (the chain hash) on the unit root |
+| a credential finding | *(planned)* a `vaire.repo.cred.<n>` String attr — reported in the image itself |
+| `.vaire-repo-bolt` (layout v1) | *(planned)* a `vaire.repo.layout` Int attr on the image root |
+| one weave | one `snapshot_create(<stamp>, "vaire")` — a retained CoW root. *(Planned:* extending it to retain the **ledger** would strengthen the chain, since a hash could then be checked against a real historical root via `open_snapshot`. Today the snapshot retains the mirrors only.*)* |
 | Crystal Color | computed, never stored |
+
+Rows marked *(planned)* are design targets with **no code behind them yet**:
+`repo::unafs_layout` returns the mapping as inspectable data, which pins the
+table's shape, not its implementation status. What `repo-uweave` writes today
+is the mirror tree, the four per-file typed attrs, and one retained snapshot
+per run.
 
 **The honest boundary.** Host-native vaire cannot mount a *kernel* UnaFS
 volume: there is no host↔kernel bridge, and the crate's only host device is a
@@ -358,7 +392,7 @@ Measured, not argued. Harness:
 | Axis | Measured |
 | --- | --- |
 | 10,000 blobs, 422 MiB, 256-way fan-out | stage 5.03 s (0.503 ms/object), **ONE commit 20.7 ms**, 83.5 MiB/s, write amplification **1.42×** |
-| 52 MB packfile-shaped stream | write 49.3 MiB/s, read-back **1458 MiB/s**, 105 extents |
+| 52 MB packfile-shaped stream | write 49.3 MiB/s, read-back **1458 MiB/s** (page-cache warm — the extent path, not device bandwidth), 105 extents |
 | 493 refs rewritten, batched | 0.67 ms/ref in one flip |
 | one ref per flip | **25 ms/ref, 412 blocks/ref — 37× the batched cost** |
 | recursive walk, 10,494 files | 13.6 ms (1.29 ms per 1,000 entries) |
