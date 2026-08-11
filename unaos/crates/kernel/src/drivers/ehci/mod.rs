@@ -9504,9 +9504,6 @@ impl Controller {
                                     idx, buttons, dx, dy
                                 );
                             }
-                            if dx != 0 || dy != 0 {
-                                crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
-                            }
                             // CLICK-1 (metal verdict): emit ONE `Event::Button` per button-DOWN
                             // edge (0x00 -> 0x01 on this pad) — the click observable: a click
                             // while vug/pulse runs exits the demo like a keystroke. Release
@@ -9517,15 +9514,32 @@ impl Controller {
                             // DRAGREL: and ONE more on the release edge (buttons == 0x00 here), so a
                             // gesture whose end matters — a title-bar drag — has an event that says
                             // so. The press half above is untouched.
+                            //
+                            // DRAGGLIDE: this report's motion and its button edge go in as ONE
+                            // thing (`push_pointer_report`), so the reorder that puts a release
+                            // edge ahead of its own lift KNOWS which lift is its own instead of
+                            // inferring it. THIS pad is half of why: it and an xHCI mouse are
+                            // concurrent producers, and a foreign motion landing between two
+                            // separate pushes would send the swap at the wrong entry.
                             let (press, release) = e.note_buttons(buttons, idx);
+                            crate::pal::push_pointer_report(
+                                if dx != 0 || dy != 0 {
+                                    Some(crate::pal::Event::Mouse { x: dx, y: dy })
+                                } else {
+                                    None
+                                },
+                                if press || release {
+                                    Some(crate::pal::Event::Button(buttons))
+                                } else {
+                                    None
+                                },
+                            );
                             if press {
-                                crate::pal::push_event(crate::pal::Event::Button(buttons));
                                 serial_println!(
                                     ":: EHCI-HID: [{}] trackpad click (button-down edge, buttons={:#04x}) == witness ::",
                                     idx, buttons
                                 );
                             } else if release {
-                                crate::pal::push_event(crate::pal::Event::Button(buttons));
                                 serial_println!(
                                     ":: EHCI-HID: [{}] trackpad release (button-up edge, buttons={:#04x}) == witness ::",
                                     idx, buttons
@@ -9537,21 +9551,28 @@ impl Controller {
                         // Relative axes (a mouse) → pal::Event::Mouse; absolute (tablet / trackpad)
                         // → MouseAbsolute — the SAME pointer-event path the xHCI HID stack delivers.
                         let (x, y, buttons, fingers) = decode_report_pointer(report, &l);
-                        if l.relative {
-                            if x != 0 || y != 0 {
-                                crate::pal::push_event(crate::pal::Event::Mouse { x, y });
-                            }
-                        } else if x != 0 || y != 0 {
-                            crate::pal::push_event(crate::pal::Event::MouseAbsolute { x, y });
-                        }
                         // CLICK-1: primary-button DOWN edge → one Button event (same semantic as
                         // the trackpad path above).
                         // DRAGREL: plus the release edge, same semantic as the trackpad path above.
+                        // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad
+                        // path above).
                         let btn = (buttons & 0xFF) as u8;
                         let (press, release) = e.note_buttons(btn, idx);
-                        if press || release {
-                            crate::pal::push_event(crate::pal::Event::Button(btn));
-                        }
+                        let motion = if x == 0 && y == 0 {
+                            None
+                        } else if l.relative {
+                            Some(crate::pal::Event::Mouse { x, y })
+                        } else {
+                            Some(crate::pal::Event::MouseAbsolute { x, y })
+                        };
+                        crate::pal::push_pointer_report(
+                            motion,
+                            if press || release {
+                                Some(crate::pal::Event::Button(btn))
+                            } else {
+                                None
+                            },
+                        );
                         if e.reports == 1 || e.reports % 32 == 0 {
                             serial_println!(
                                 ":: EHCI-HID: [{}] report-pointer {} reports, last {} x={} y={} buttons={:#04x} fingers={} == witness ::",
@@ -9589,15 +9610,23 @@ impl Controller {
                     }
                 } else if e.is_rel_mouse && len >= 3 {
                     let (dx, dy) = (report[1] as i8 as i32, report[2] as i8 as i32);
-                    if dx != 0 || dy != 0 {
-                        crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
-                    }
                     // CLICK-1: boot-mouse buttons live in report[0]; primary DOWN edge → Button.
                     // DRAGREL: and the primary UP edge, same as the other two pointer paths.
+                    // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad path
+                    // above).
                     let (press, release) = e.note_buttons(report[0], idx);
-                    if press || release {
-                        crate::pal::push_event(crate::pal::Event::Button(report[0]));
-                    }
+                    crate::pal::push_pointer_report(
+                        if dx != 0 || dy != 0 {
+                            Some(crate::pal::Event::Mouse { x: dx, y: dy })
+                        } else {
+                            None
+                        },
+                        if press || release {
+                            Some(crate::pal::Event::Button(report[0]))
+                        } else {
+                            None
+                        },
+                    );
                     if e.reports == 1 || e.reports % 32 == 0 {
                         serial_println!(
                             ":: EHCI-HID: [{}] mouse {} reports, last dx={} dy={} buttons={:#04x} == witness ::",
