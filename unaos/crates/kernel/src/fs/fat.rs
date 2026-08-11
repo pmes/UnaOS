@@ -3652,8 +3652,13 @@ pub fn probe_once() {
 /// `flight_recorder.rs` §SINGLE FAT WRITER for why that is load-bearing rather than merely modest.
 ///
 /// It is able to say NO in three distinguishable ways, which is the point of printing all of them:
-/// * no line at all → `register_sdhc` never ran, i.e. no card was identified (the `[sdhc]` bring-up
-///   lines above it in the log say why);
+/// * no line at all → `register_sdhc` did not publish a device. BOOT-STORAGE (GR26): this bullet
+///   used to read "i.e. no card was identified", and that inference was WRONG — GR26 Boot D
+///   identified a 60 GiB card, verified three ADMA-vs-PIO windows against it and parsed its MBR,
+///   and still printed no line here, because the image carried no `sdhcblk` and the call site was
+///   compiled out. Do not read the silence: read `:: SDHCREG: … ::`, which `sdhc::bring_up` now
+///   emits from both cfg arms and which names `handle=built register=ok/REFUSED` vs
+///   `handle=UNBUILT` directly;
 /// * `no FAT volume … (NotFat)` → the card is readable but carries no BPB this reader accepts. The
 ///   `:: PART: mbr-raw handle=sdhc …` census that `mount_source` emits just above is the raw evidence;
 /// * `no FAT volume … (Io)` → the registry has the card but a read of LBA 0 failed, which contradicts

@@ -161,8 +161,32 @@ fn main() {
     // backend disabled while the `⚡ kernel features:` banner claimed it was on (s42/INSTGUI, WXN-M3b).
     // The failure would be quiet in the worst way here: no `:: SDHCBLK: registered … ::` line and no
     // mount witness reads exactly like "no card was identified", which is a different finding.
+    //
+    // BOOT-STORAGE (GR26): DEFAULT-ON, opted out with UNAOS_NOSDHCBLK=1. The opt-in default was a
+    // GR20 decision taken when the rMBP booted from a USB card reader and the internal slot was a
+    // second, optional source. That premise is gone: the bench machine now boots from a SINGLE SD
+    // card in its INTERNAL slot, so the internal reader is the ONLY program source there is, and an
+    // opt-in knob makes the default x86 image one that cannot reach its own boot volume. GR26 Boot D
+    // is the conviction — the card was identified, read-verified 3/3 windows and MBR-checked, and
+    // then every consumer printed `handles=global=absent sdhc=unbuilt` and declined, because THIS
+    // line had not fired. Turning it on costs a READ-ONLY third handle: `register_sdhc` never touches
+    // the global slot, and `default_writable`'s substitution guard fails OPEN in all but the
+    // positively-proven case.
+    //
+    // REVIEW CORRECTION (GR26): an earlier wording of this comment said "`fs::fat` refuses every
+    // write to a `Sdhc` source". That was GR20's property and SDHC-4c REPLACED it — `fs/fat.rs`'s
+    // write path now admits a span that lies inside the reserved extent (`fs::sdhc4c::permit_write`,
+    // fat.rs:705-709/836-853), and `drivers/block.rs` §SDHC-4c says so at the seam. What actually
+    // makes a DEFAULT image read-only on the card is the absence of `sdw`, which is unchanged by
+    // this flip and still opt-in: without it the image carries no CMD24 ladder at all, so
+    // `block::write_block_sdhc` is the refusing stub (`no `sdw` feature … no CMD24 ladder`,
+    // block.rs:1276-1285) and `FatFs::sdhc4c_write_verify` is the SKIP stub (fat.rs:4155-4163). Say
+    // it that way round, because the two statements fail differently: `UNAOS_SDW=1` alone now also
+    // arms `sdhcblk`, which it did not before this flip, so an `sdw` build reaches the SDHC-4c
+    // reserve pass on the internal card without a second knob.
+    //
     // Kept in sync with arroyo's mapping.
-    if std::env::var("UNAOS_SDHCBLK").is_ok() { feats.push("sdhcblk"); }
+    if std::env::var("UNAOS_NOSDHCBLK").is_err() { feats.push("sdhcblk"); }
     // PCI-CENSUS (GR20): UNAOS_PCICENSUS=1 arms the complete READ-ONLY PCI enumeration witness
     // (arch/x86_64/pci.rs::full_census) — one `[PCI-CENSUS]` line per function present, plus a
     // capability dump per network-class function. THIS list is what reaches the kernel binary for

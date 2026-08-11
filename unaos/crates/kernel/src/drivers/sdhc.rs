@@ -3397,11 +3397,46 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
     // path THIS boot has already exercised and reported on. The block layer's GLOBAL device (the USB
     // stick this machine boots from) is not touched — see `drivers::block` §SDHC-4b for why this is a
     // third handle and not a value of the backend selector.
+    //
+    // BOOT-STORAGE (GR26) — SDHCREG, the registration verdict, printed from BOTH cfg arms.
+    //
+    // Until this arc the compiled-out arm was SILENT, and `fs::fat::sdhc_probe_once`'s own doc
+    // asserted the inverse of the truth: "no line at all → `register_sdhc` never ran, i.e. no card
+    // was identified". Boot D falsified that in one capture. The card WAS identified — CMD2/CMD3,
+    // CSD v2, 124735488 blocks, three ADMA-vs-PIO windows matching byte-for-byte, MBR p0 type=0x0b
+    // verified against the CSD capacity — and the boot still offered no program source, because the
+    // image carried no `sdhcblk`. The only evidence of that anywhere in 421 seconds of log was the
+    // word `unbuilt` inside a census printed by a DIFFERENT subsystem thirty seconds later, and
+    // reading it required knowing that `sdhc=unbuilt` and `sdhc=absent` are different sentences.
+    //
+    // So the seam that decides it now says so at the seam. This line cannot be vacuous: it is on the
+    // unconditional tail of `bring_up`, so it prints on every boot that identifies a card at all,
+    // and its three renderings (`handle=built register=ok`, `handle=built register=REFUSED`,
+    // `handle=UNBUILT`) are distinguishable and each reachable — `register_sdhc` returns false on a
+    // zero-block card, and `UNAOS_NOSDHCBLK=1` still builds the third rendering. It is also the
+    // discriminator for the NEXT boot: with the knob now default-on, a boot that still fails to
+    // reach `/fat` reads `handle=built register=ok` here and moves the question downstream to
+    // `:: SDHCBLK: no FAT volume … ::`, which already separates NotFat from Io.
     #[cfg(feature = "sdhcblk")]
     {
         let block_addressed = CARD.lock().as_ref().map(|c| c.block_addressing).unwrap_or(false);
-        crate::drivers::block::register_sdhc(num_blocks, block_addressed);
+        let registered = crate::drivers::block::register_sdhc(num_blocks, block_addressed);
+        serial_println!(
+            ":: SDHCREG: handle=built register={} blocks={} addressing={} — the internal card {} \
+             a program source this boot ::",
+            if registered { "ok" } else { "REFUSED" },
+            num_blocks,
+            if block_addressed { "block" } else { "byte" },
+            if registered { "IS" } else { "is NOT" }
+        );
     }
+    #[cfg(not(feature = "sdhcblk"))]
+    serial_println!(
+        ":: SDHCREG: handle=UNBUILT (no `sdhcblk` in this image) blocks={} — the card was identified \
+         and read-verified, but NO block handle exists to publish it under, so the internal reader \
+         offers NO program source this boot (build without UNAOS_NOSDHCBLK=1 to publish it) ::",
+        num_blocks
+    );
     true
 }
 
