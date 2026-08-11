@@ -949,7 +949,7 @@ pub fn close_compat() -> bool {
 /// thing the panel gets back is a full repaint from the LATEST surface content, not from whatever the
 /// last composited frame happened to be. Nothing is deferred here; a pass is skipped, not owed.
 pub fn present(id: WinId) -> bool {
-    present_banded(id, None) != Presented::NoRow
+    present_banded(id, None, None) != Presented::NoRow
 }
 
 /// PRESSURE-1 — what a present actually DID, for the one caller that has to charge for it.
@@ -979,12 +979,25 @@ pub enum Presented {
 /// PRESSURE-1: [`present`], reporting which of the three outcomes it took. Same pass, same order, same
 /// witnesses — the only difference is what the caller is told.
 pub fn present_outcome(id: WinId) -> Presented {
-    present_banded(id, None)
+    present_banded(id, None, None)
 }
 
 /// PRESSURE-1: [`present_rows`], reporting which of the three outcomes it took.
 pub fn present_rows_outcome(id: WinId, sy0: usize, sy1: usize) -> Presented {
-    present_banded(id, Some((sy0, sy1)))
+    present_banded(id, Some((sy0, sy1)), None)
+}
+
+/// WCPAR — [`present_outcome`] for the SYSCALL present path, carrying the recycled-id fence. `owner` is
+/// the presenting slot's wm owner id, captured under the window table lock the caller has now released;
+/// see [`present_banded`]'s `expect_owner` note for why this lets `sys_win_present` drop that lock
+/// before compositing. The furniture/kernel `present_outcome` above stays fence-free.
+pub fn present_outcome_owned(id: WinId, owner: u64) -> Presented {
+    present_banded(id, None, Some(owner))
+}
+
+/// WCPAR — [`present_rows_outcome`] for the SYSCALL banded present path, carrying the same fence.
+pub fn present_rows_outcome_owned(id: WinId, sy0: usize, sy1: usize, owner: u64) -> Presented {
+    present_banded(id, Some((sy0, sy1)), Some(owner))
 }
 
 /// FBCON-DMG — present `id`, declaring only SOURCE rows `[sy0, sy1)` of its surface damaged.
@@ -1000,13 +1013,25 @@ pub fn present_rows_outcome(id: WinId, sy0: usize, sy1: usize) -> Presented {
 ///
 /// Returns `false` if `id` names no live window.
 pub fn present_rows(id: WinId, sy0: usize, sy1: usize) -> bool {
-    present_banded(id, Some((sy0, sy1))) != Presented::NoRow
+    present_banded(id, Some((sy0, sy1)), None) != Presented::NoRow
 }
 
 /// The body both present verbs share. `band` is `None` for a whole-box present, which is
 /// byte-for-byte the pre-FBCON-DMG [`present`]; see that function's docs for VUGMIN-B and WC-N,
 /// neither of which this arc touches.
-fn present_banded(id: WinId, band: Option<(usize, usize)>) -> Presented {
+///
+/// WCPAR — `expect_owner` is the recycled-id fence that lets the SYSCALL present path (`sys_win_present`
+/// / `sys_win_present_rows`) release the outer window table BEFORE this pass runs, instead of holding
+/// it across the whole composite for the reason `syscall.rs` documents. When `Some(exp)`, the row is
+/// resolved and its `owner_asid` compared to `exp` (the presenting slot's wm owner id, captured under
+/// the window table lock the caller just released) UNDER THIS MODULE'S OWN table lock, before a pixel
+/// is marked damaged: if a `close`+`create` pair recycled `id` to a different window in the gap, the
+/// owner no longer matches and the present is declined `NoRow` rather than compositing under the new
+/// owner's identity. The surface-lifetime half of the same race is unaffected — it is closed by the F4
+/// drain barrier (`close` drains in-flight `BlitGuard`s before the backing is dropped), which never
+/// depended on the outer table hold. `None` is every kernel/furniture caller: those mint no ring-3 id,
+/// have no recycle race, and take exactly the pre-WCPAR path.
+fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<u64>) -> Presented {
     // WC-G — the surface as the OWNER declared it finished. Taken here and nowhere else: this is the
     // one moment the owner is provably not writing (it is parked inside `SYS_WIN_PRESENT`), so it is
     // the only honest baseline for the `app` leg. The identity is captured under the table lock and
@@ -1021,6 +1046,18 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>) -> Presented {
         let mut t = table();
         let owner = match row_mut(&mut t, id) {
             Some(r) => {
+                // WCPAR — the recycled-id fence, taken before this row is touched. A mismatch means the
+                // caller validated ownership of `id`, released its table, and the id was recycled to a
+                // different owner in the gap; declining `NoRow` here is what makes releasing the outer
+                // table across the composite safe. Compat rows carry owner 0 and are never presented
+                // through the syscall path (`expect_owner` is `None` for them by construction).
+                if let Some(exp) = expect_owner {
+                    if r.owner_asid != exp {
+                        #[cfg(feature = "witness")]
+                        WCN_STALE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        return Presented::NoRow;
+                    }
+                }
                 match band {
                     // A band the surface does not contain is not narrowed to the part that fits —
                     // it means the caller and the row disagree about the geometry, and the only
@@ -5948,6 +5985,63 @@ fn wcser_emit(scope: &str, span: u64) {
     );
 }
 
+/// WCPAR — per-CPU count of window composes that reached the [`STAGE`] pool, since the last rollup.
+/// Indexed by [`stage_pool_index`], drained (swap) by [`wcpar_emit`]. This is the concurrency witness
+/// the flow arc asks for: with the pool landed, a composite runs on whatever core its present arrived
+/// on, so a fleet of vugs distributes its staging across cores instead of every stage funnelling through
+/// one shared buffer. `cores>1` on this line, against a shared-buffer world that could only ever stage
+/// on one, is the direct reading that the per-core pool is being exercised — and it is the necessary
+/// precondition for the true-simultaneous compose the deferred `COMP_GATE` split (design §8, step 3)
+/// will unlock. Witness-only; the pool itself is arch-neutral and unconditional.
+#[cfg(feature = "witness")]
+static WCPAR_STAGE_CPU: [core::sync::atomic::AtomicU64; STAGE_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; STAGE_CPUS];
+
+/// WCPAR — the per-core stage census, on the `[wcn]` rollup cadence and span. Prints each core's stage
+/// count and how many DISTINCT cores staged this span (`cores=`), so a reader sees the pool spreading
+/// compose across cores at a glance. Silent on a span where nothing staged, like its `[wcn]`/`[wcser]`
+/// siblings — a period with no compositing is idleness, not a signal.
+///
+/// It reads `[wcser] declined=` as its companion, not a field it repeats: the flow-arc falsification is
+/// `cores>1` HERE rising while the cross-core `DECL_LOCK` share of `[wcser] declined=` falls, because a
+/// second core that used to lose the one shared buffer now composes into its own.
+#[cfg(feature = "witness")]
+fn wcpar_emit(span: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut counts = [0u64; STAGE_CPUS];
+    let mut total = 0u64;
+    let mut cores = 0u32;
+    for (i, c) in counts.iter_mut().enumerate() {
+        *c = WCPAR_STAGE_CPU[i].swap(0, Relaxed);
+        total = total.saturating_add(*c);
+        if *c > 0 {
+            cores += 1;
+        }
+    }
+    if total == 0 {
+        return;
+    }
+    // The per-core breakdown as a compact bracketed run, so a reader can see WHICH cores carried the
+    // fleet, not just how many. `max` names the busiest core's share — a fleet pinned to one core (the
+    // pre-pool world, or a single-vug boot) reads `cores=1`, and a spread fleet reads its true width.
+    let max = counts.iter().copied().max().unwrap_or(0);
+    serial_println!(
+        "[wcpar] cores={} total={} max={} c0={} c1={} c2={} c3={} c4={} c5={} c6={} c7={} span={}ms",
+        cores,
+        total,
+        max,
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+        counts[5],
+        counts[6],
+        counts[7],
+        span
+    );
+}
+
 /// F4 — number of composites that have snapshotted the table and may still be blitting from the
 /// surfaces they snapshotted. Teardown drains this to zero before it returns.
 static BLIT_ACTIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -8135,6 +8229,11 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // is contention. x86 only, for the reason the gate itself is.
     #[cfg(target_arch = "x86_64")]
     wcser_emit(scope, span);
+    // WCPAR — the per-core stage census rides the same cadence and span, directly under `[wcser]` whose
+    // `declined=` it reads against: `cores>1` here while the cross-core `DECL_LOCK` share falls is the
+    // flow-arc's positive reading that the per-core pool spread compose off the one shared buffer. Both
+    // arches stage, so unlike `[wcser]` (x86 gate only) this is unconditional.
+    wcpar_emit(span);
     // FLICKER-2 — stored only when a block actually went on the wire, so `burst_last` names the most
     // recent REAL burst rather than the last silent early-out. On metal this is dominated by the
     // IRQ-masked UART time of the lines above (plus any staged backlog the winning core drained);
@@ -11456,7 +11555,11 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
     // takes the lock itself. Another core can win it in between, in which case the boxes re-defer
     // normally and the only cost is one wasted pass with the sprite bracket taken. That race is
     // benign in the direction that matters: it can cost a repaint, never skip one.
-    if STAGE.try_lock().is_none() {
+    //
+    // WCPAR — this core's OWN pool entry, the one `stage_fill` below will take from the same core.
+    // Probing a different core's entry would be meaningless: it is not the buffer this drain composes
+    // through.
+    if stage_for_core().try_lock().is_none() {
         return false;
     }
     let (boxes, n) = {
@@ -11632,17 +11735,58 @@ const MAX_STAGE_BYTES: usize = 4 * 1024 * 1024;
 /// buffer, and the rows copied to the front carry the same zero pad `Screen`'s back buffer has
 /// always presented.
 ///
-/// WCPAR SEAM (design: `engine.md` §8 "WCPAR — parallel per-core composite"). This ONE shared buffer
-/// is the shared resource that forces the COMPOSE half of the pass to be serial: two concurrent
-/// composes cannot share it, so the loser DECLINEs (`DECL_LOCK`) into the tearing direct path. The
-/// parallelism step 1 is to make this a per-CPU pool — `[Mutex<Vec<u8>>; MAX_CPUS]` indexed by
-/// `crate::arch::sched::meter_current_cpu()` — so each core composes into a private buffer and N
-/// composes run at once. It is NOT landed here: while `COMP_GATE` still serialises the whole pass a
-/// per-core pool buys no throughput and only reserves memory, and the consumer that would exploit it
-/// (the compose/present phase split in `composite_inner`) collides with three in-flight arcs
-/// (`occ_clip`, `above_shell`/`SHELL_Z`, `ctrls_for`). The three `STAGE` lock sites to convert are
-/// here, `stage_window`'s `STAGE.try_lock`, and `stage_fill`'s two.
-static STAGE: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
+/// WCPAR — the per-CPU compose pool (design: `engine.md` §8 "WCPAR — parallel per-core composite",
+/// step 1, now LANDED). This used to be ONE shared buffer, and that one buffer was the shared resource
+/// that forced the COMPOSE half of the pass to be serial across cores: two concurrent composes could
+/// not share it, so the loser DECLINEd (`DECL_LOCK`) into the tearing direct path — the compose-vs-
+/// compose (and compose-vs-erase) contention the census still reports.
+///
+/// It is now a per-CPU array indexed by [`stage_pool_index`] (`crate::arch::sched::meter_current_cpu()`
+/// clamped to the pool), so each core composes into its PRIVATE buffer and N cores compose at once with
+/// no shared buffer to race. `try_lock` is kept, not because two cores contend on one entry any more —
+/// they cannot, each has its own — but because a single core can still re-enter its own entry (a
+/// desktop-flush drain that itself defers, or any future reentrant compose): the `try_lock` there
+/// declines to the direct path exactly as before, so the reentrancy contract is unchanged while the
+/// cross-core contention is gone.
+///
+/// COST, and why it is bounded (design §8): up to [`STAGE_CPUS`] buffers instead of one, each grown
+/// lazily to the largest box ITS core composes. A fleet of small vugs stays cheap (each core's buffer
+/// tracks the largest vug that core staged); only a core that stages the full-panel console reaches the
+/// [`MAX_STAGE_BYTES`] cap, and only if that core actually stages it.
+///
+/// WHAT IS STILL DESIGN, NOT LANDED: `COMP_GATE` still serialises the whole `composite_once` on x86, so
+/// two cores' PASSES do not yet overlap from the present path — the pool removes the compose-vs-compose
+/// decline and lets the compositing WORK spread across cores over time, but the phase split that would
+/// let two composes run truly simultaneously (step 3: narrow `COMP_GATE` to the z-ordered present only)
+/// is deferred, because it restructures `composite_inner`'s blit loop and its WC-G/WC-D/CURSOR
+/// brackets — the file's most delicate tear-freedom machinery — and cannot land safely in one pass.
+/// See `engine.md` §8 for the sequencing.
+///
+/// The per-entry invariants are exactly the old buffer's: zero-initialised, written only through
+/// `put_pixel` (3 of 4 bytes, pad stays 0), grown with `try_reserve` so exhaustion returns to the
+/// direct path rather than panicking from present context.
+const STAGE_CPUS: usize = crate::ui_status::PSTRIP_MAX_CPUS;
+// WCPAR — `wcpar_emit` prints exactly eight per-core counts (`c0..c7`); keep that in step with the pool
+// width so a change to `PSTRIP_MAX_CPUS` fails the build here rather than silently dropping cores off
+// the census line.
+const _: () = assert!(STAGE_CPUS == 8, "wcpar_emit prints c0..c7; widen it if STAGE_CPUS changes");
+static STAGE: [Mutex<alloc::vec::Vec<u8>>; STAGE_CPUS] =
+    [const { Mutex::new(alloc::vec::Vec::new()) }; STAGE_CPUS];
+
+/// WCPAR — the calling core's entry in the [`STAGE`] pool. `meter_current_cpu()` is the same reading
+/// the pstrip and `[wcn]`'s census already use; a core index at or beyond the pool (more physical cores
+/// than pstrip tracks) folds onto the last entry, which only costs those high cores a shared buffer —
+/// correct, just less parallel — and never an out-of-bounds.
+#[inline]
+fn stage_pool_index() -> usize {
+    crate::arch::sched::meter_current_cpu().min(STAGE_CPUS - 1)
+}
+
+/// WCPAR — the [`STAGE`] entry this core composes into.
+#[inline]
+fn stage_for_core() -> &'static Mutex<alloc::vec::Vec<u8>> {
+    &STAGE[stage_pool_index()]
+}
 
 /// WC-H — whether the one-shot fallback fixture has been spent. See the fixture block in
 /// [`stage_window`]: it forces exactly one non-compat composite onto the direct path so WC-D's
@@ -12743,7 +12887,7 @@ fn stage_window(
         decline!(super::wcg::DECL_CAP);
     }
     let need = row_bytes * chunk_rows;
-    let mut stage = match STAGE.try_lock() {
+    let mut stage = match stage_for_core().try_lock() {
         Some(g) => g,
         None => decline!(super::wcg::DECL_LOCK),
     };
@@ -13016,6 +13160,12 @@ fn stage_window(
         use core::sync::atomic::Ordering::Relaxed;
         C2_STG_COMPOSE_CYC.fetch_add(compose_cyc, Relaxed);
         C2_STG_PRESENT_CYC.fetch_add(present_cyc, Relaxed);
+        // WCPAR — this window staged on THIS core's pool entry. Counted here, past every `decline!`
+        // (which returns before the band loop), so the census counts composes that actually reached the
+        // per-core buffer — the same "the pool is being used, and by which core" question the line
+        // answers. `stage_pool_index()` is stable across the composite: it runs IRQ-masked, so no
+        // migration between the lock above and this count.
+        WCPAR_STAGE_CPU[stage_pool_index()].fetch_add(1, Relaxed);
     }
     #[cfg(feature = "witness")]
     super::wcg::stage_note(
@@ -13119,7 +13269,7 @@ fn stage_fill(
     if row_bytes == 0 || row_bytes > MAX_STAGE_BYTES {
         drop_fill!(DEFER_CAP);
     }
-    let mut stage = match STAGE.try_lock() {
+    let mut stage = match stage_for_core().try_lock() {
         Some(g) => g,
         None => defer!(DEFER_LOCK),
     };

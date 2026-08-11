@@ -3689,18 +3689,26 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
 /// WINX-1: `SYS_WIN_PRESENT(win)` -> 0, or a negative errno. Damage-mark + composite the caller's
 /// window. Ownership-gated (`-EBADF` unresolvable, `-EACCES` another process's live window).
 ///
-/// LOCK SPAN — the ownership check, the geometry snapshot AND the present run under ONE continuous hold
-/// of the window table lock, for the reason the aarch64 twin documents: resolving the row, dropping the
-/// lock, then presenting would leave a real window in which a close+create pair on other cores recycles
-/// this id to a DIFFERENT process, and the composite would land the caller's pixels under the new
-/// owner's window identity. Holding across the composite is what makes the id the compositor is handed
-/// provably still the id we validated. The cost is a bounded blit inside an IRQ-masked spinlock, bounded
-/// by the 64 KiB surface cap.
+/// LOCK SPAN — WCPAR SHRUNK THIS. The ownership check and the geometry+id snapshot run under the window
+/// table lock; the lock is then RELEASED and the composite runs OUTSIDE it. Before WCPAR the whole
+/// composite ran under one continuous hold, deliberately, because resolving the row, dropping the lock,
+/// then presenting leaves a window in which a `close`+`create` pair on other cores recycles this id to a
+/// DIFFERENT process and the composite lands under the new owner's identity. That TOCTOU is now closed
+/// WITHOUT the long hold: the `+1`-biased slot is carried into `wc_shim::present` as the expected wm
+/// `owner`, and `wm::present_banded` re-checks it against the resolved row under the compositor's OWN
+/// table lock before marking a pixel — a recycled id no longer matches and is declined. The other half
+/// of the race, the surface being unmapped mid-blit, was never the outer hold's job: it is closed by the
+/// F4 drain barrier (`wm::close` drains in-flight `BlitGuard`s before `win_close_slot`'s backing is
+/// dropped), which is unchanged. What the shrink BUYS: two cores presenting different windows no longer
+/// serialise on this one spinlock for the duration of each other's ~milliscale composite — the flow
+/// arc's first serialization (`engine.md` §8, "WINDOWS held across the composite"). IRQs stay masked
+/// across the composite as before (per-core, so no cross-core serialization); only the shared spinlock
+/// is released early.
 ///
-/// LOCK ORDER: `WINDOWS` is the OUTERMOST lock; `video::wm`'s own state is acquired strictly inside it
-/// (`wc_shim::present` is called with `WINDOWS` held, never the reverse). The reverse edge does not
-/// exist by construction — neither `video/wm.rs` nor `video/screen.rs` references the syscall layer, so
-/// nothing under `wm` can call back into a window verb.
+/// LOCK ORDER: `WINDOWS` is still the OUTERMOST lock and `video::wm`'s state is still acquired only
+/// after it (never the reverse); WCPAR narrows the span of the hold, it does not invert the order. The
+/// reverse edge does not exist by construction — neither `video/wm.rs` nor `video/screen.rs` references
+/// the syscall layer, so nothing under `wm` can call back into a window verb.
 fn sys_win_present(win: u64) -> i64 {
     let slot = match win_caller_slot() {
         Ok(v) => v,
@@ -3714,43 +3722,47 @@ fn sys_win_present(win: u64) -> i64 {
     // holding the outermost compositor lock. Read-only against this window's pace state; the state is
     // ADVANCED inside the guarded block below, only once ownership has been proven.
     present_pace(slot, id);
-    // PRESSURE-1: the lock span is unchanged and ends HERE. The back-pressure below can sleep, and
-    // sleeping under `WINDOWS` with IF masked would park the outermost compositor lock on a task the
-    // scheduler will not run for a millisecond — every other window on the machine behind it. So the
-    // outcome leaves the guarded block as a value and the charge is applied outside it.
+    // PRESSURE-1: the back-pressure below can sleep, and sleeping under `WINDOWS` with IF masked would
+    // park the outermost compositor lock on a task the scheduler will not run for a millisecond — every
+    // other window on the machine behind it. So the outcome leaves the guarded block as a value and the
+    // charge is applied outside it.
     let outcome = {
         let _irq = IrqGuard::mask_save();
-        let t = WINDOWS.lock();
-        // R0 / rtwit — WINDOWS (outermost compositor lock) max-hold. Declared after the guard so it
-        // drops first, timing the acquire→release span. Measurement only; a no-op inline shim when
-        // `rtwit` is off. ⚠ COLLISION: this present path is being restructured by the in-flight
-        // parallel-composite arc; this is the single allowed "timestamp read + fetch_max" hook and
-        // touches no logic — if that arc replaces the single WINDOWS lock, this field measures
-        // whatever hold survives it.
-        let _wh = crate::rtwit::hold(crate::rtwit::Lock::Windows);
-        if t[id].owner == WIN_OWNER_FREE {
-            return EBADF;
-        }
-        if t[id].owner != slot {
-            return EACCES;
-        }
-        let e = t[id];
-        FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
-        // VSYNC-PACE r3: the `[wpace]` present count, HERE and not inside `pace_advance` — it counts an
-        // event that happens on every boot, while the pacer is compiled only under `vsyncpace`. Same
-        // placement rule as the deadline: inside the ownership proof, so a slot cannot inflate another
-        // slot's window. One relaxed atomic.
-        wpace_note_present(id);
-        // VSYNC-PACE: the deadline moves only for a present that PASSED the ownership gate, so no slot
-        // can push another slot's window into the future. Two atomics and one `arch::ms()` register
-        // read; no call leaves the crate and nothing here can block. UNPACED BUILD: `{}`.
-        pace_advance(id);
-        let o = wc_shim::present(e.wm_id);
-        // R0 / rtwit — close the WINDOWS hold timer BEFORE the guard so it measures exactly the
-        // acquire→release span, not the block tail after the lock is dropped.
-        drop(_wh);
-        drop(t);
-        o
+        // WCPAR — the window table is held ONLY for the ownership proof, the snapshot and the pace/count
+        // bookkeeping; it is dropped before the composite so two cores' presents no longer serialise on
+        // it. The recycle TOCTOU the old long hold closed is now closed by the `owner` fence carried
+        // into `wc_shim::present` (the `+1`-biased slot, re-checked against the resolved row inside the
+        // compositor's own table lock). See the LOCK SPAN note above.
+        let wm_id;
+        {
+            let t = WINDOWS.lock();
+            // R0 / rtwit — WINDOWS max-hold. WCPAR shrank this hold from the whole composite to just the
+            // ownership proof + snapshot, so the timer now measures that SHRUNK span (windows_max should
+            // read far below the old ~19ms full-composite hold — that drop is the two arcs working
+            // together). Declared after the guard so it drops first; a no-op inline shim when rtwit off.
+            let _wh = crate::rtwit::hold(crate::rtwit::Lock::Windows);
+            if t[id].owner == WIN_OWNER_FREE {
+                return EBADF;
+            }
+            if t[id].owner != slot {
+                return EACCES;
+            }
+            wm_id = t[id].wm_id;
+            FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+            // VSYNC-PACE r3: the `[wpace]` present count, HERE and not inside `pace_advance` — it counts
+            // an event that happens on every boot, while the pacer is compiled only under `vsyncpace`.
+            // Same placement rule as the deadline: inside the ownership proof, so a slot cannot inflate
+            // another slot's window. One relaxed atomic.
+            wpace_note_present(id);
+            // VSYNC-PACE: the deadline moves only for a present that PASSED the ownership gate, so no
+            // slot can push another slot's window into the future. Two atomics and one `arch::ms()`
+            // register read; no call leaves the crate and nothing here can block. UNPACED BUILD: `{}`.
+            pace_advance(id);
+        } // `_wh` drops (before `t`), then WINDOWS released — the composite below runs without it.
+        // WCPAR — the `+1`-biased slot is the wm `owner` this window was created under (`sys_win_create`
+        // passes `slot + 1`); the compositor declines the present if the resolved row no longer carries
+        // it, which is the recycled-id fence that makes releasing the lock above safe.
+        wc_shim::present(wm_id, (slot as u64) + 1)
     };
     // VSYNC-PACE: the witness rollup, OUTSIDE the guard — see `wpace_emit` for why a serial burst may not
     // run under the outermost compositor lock.
@@ -4566,9 +4578,10 @@ fn wpace_tick() {}
 /// carries for the `-ENOSYS` case (older kernel / aarch64) catches this one too — so an explicit error
 /// costs a correct picture nothing and buys a debuggable one. `y0` needs no separate bound: `y0 < y1 <= h`.
 ///
-/// LOCK SPAN and LOCK ORDER are `sys_win_present`'s, unchanged and for the same reasons: the ownership
-/// check, the geometry snapshot and the present run under ONE continuous hold of `WINDOWS`, which is the
-/// OUTERMOST lock, with `video::wm`'s state acquired strictly inside it.
+/// LOCK SPAN and LOCK ORDER are `sys_win_present`'s, and WCPAR shrank both verbs the same way: the
+/// ownership check, the band range check and the id snapshot run under `WINDOWS` (still the OUTERMOST
+/// lock, `video::wm`'s state still acquired only after it), then the lock is RELEASED and the composite
+/// runs outside it under the `owner` recycled-id fence. See `sys_win_present`'s LOCK SPAN note.
 fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
     let slot = match win_caller_slot() {
         Ok(v) => v,
@@ -4587,37 +4600,41 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
     // masked would park every other window on the machine behind this one.
     let outcome = {
         let _irq = IrqGuard::mask_save();
-        let t = WINDOWS.lock();
-        // R0 / rtwit — WINDOWS max-hold on the BANDED present path (see `sys_win_present`; same
-        // collision note applies).
-        let _wh = crate::rtwit::hold(crate::rtwit::Lock::Windows);
-        if t[id].owner == WIN_OWNER_FREE {
-            return EBADF;
-        }
-        if t[id].owner != slot {
-            return EACCES;
-        }
-        let e = t[id];
-        // The range check runs against THIS row's surface height, read under the same hold that validated the
-        // ownership — so the `h` the band is judged against is provably the `h` of the window being presented.
-        if y1 <= y0 || y1 > e.h as u64 {
-            return EINVAL;
-        }
-        // The same counter the whole-box verb bumps: this IS a present that reached the compositor, and the
-        // headless witness must not go blind on a window that switched to banded presents.
-        FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
-        // VSYNC-PACE r3: the `[wpace]` present count, for `sys_win_present`'s reason — a banded present is
-        // a present, and the witness must not go blind on a client that switched to damage bands.
-        wpace_note_present(id);
-        // VSYNC-PACE: and the same deadline, advanced under the same proof of ownership. The band is
-        // deliberately NOT a discount — the panel scans the whole frame either way, so a banded present
-        // consumes exactly one frame slot, as a whole-box one does.
-        pace_advance(id);
-        let o = wc_shim::present_rows(e.wm_id, y0 as usize, y1 as usize);
-        // R0 / rtwit — close the WINDOWS hold timer before the guard (see `sys_win_present`).
-        drop(_wh);
-        drop(t);
-        o
+        // WCPAR — the window table is held ONLY for the ownership proof, the band range check, the
+        // snapshot and the pace/count bookkeeping; it is released before the composite. Same recycled-id
+        // fence as `sys_win_present` — the `+1`-biased slot re-checked inside the compositor's table.
+        let wm_id;
+        {
+            let t = WINDOWS.lock();
+            // R0 / rtwit — WINDOWS max-hold on the BANDED present path, measuring WCPAR's shrunk hold
+            // (see `sys_win_present`). Declared after the guard so it drops first; no-op shim when off.
+            let _wh = crate::rtwit::hold(crate::rtwit::Lock::Windows);
+            if t[id].owner == WIN_OWNER_FREE {
+                return EBADF;
+            }
+            if t[id].owner != slot {
+                return EACCES;
+            }
+            // The range check runs against THIS row's surface height, read under the same hold that
+            // validated the ownership — so the `h` the band is judged against is provably the `h` of the
+            // window being presented.
+            if y1 <= y0 || y1 > t[id].h as u64 {
+                return EINVAL;
+            }
+            wm_id = t[id].wm_id;
+            // The same counter the whole-box verb bumps: this IS a present that reached the compositor,
+            // and the headless witness must not go blind on a window that switched to banded presents.
+            FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+            // VSYNC-PACE r3: the `[wpace]` present count, for `sys_win_present`'s reason — a banded
+            // present is a present, and the witness must not go blind on a client that switched to
+            // damage bands.
+            wpace_note_present(id);
+            // VSYNC-PACE: and the same deadline, advanced under the same proof of ownership. The band is
+            // deliberately NOT a discount — the panel scans the whole frame either way, so a banded
+            // present consumes exactly one frame slot, as a whole-box one does.
+            pace_advance(id);
+        } // `_wh` drops (before `t`), then WINDOWS released.
+        wc_shim::present_rows(wm_id, y0 as usize, y1 as usize, (slot as u64) + 1)
     };
     // VSYNC-PACE: as the whole-box verb, and outside the guard for the same reason.
     wpace_tick();
@@ -4692,28 +4709,36 @@ mod wc_shim {
         wm::create(owner, surf, surf_len, w, h, stride, &title)
     }
 
-    /// `video::wm::present` — damage-mark and run the compositor pass. Called with `WINDOWS` held.
+    /// `video::wm::present` — damage-mark and run the compositor pass.
+    ///
+    /// WCPAR — called with `WINDOWS` RELEASED (was: held across the whole composite). `owner` is the
+    /// presenting slot's wm owner id (`slot + 1`, the same `+1`-biased value [`create`] passed as the
+    /// wm `owner`), captured under the window table lock the caller has already dropped; the compositor
+    /// re-checks it against the resolved row's `owner_asid` before compositing, so a `close`+`create`
+    /// that recycled `id` in the gap is declined rather than composited under a new owner. See
+    /// `sys_win_present`'s lock-span note and `wm::present_banded`'s `expect_owner`.
     ///
     /// PRESSURE-1: reports wm's OUTCOME rather than nothing, because the syscall layer above has to
     /// charge for a declined present. `WIN_NONE` — the compositor refused this window a row, which a
     /// headless run does for every window — is `NoRow`, never `Suppressed`: it is not back-pressure,
     /// and charging for it would throttle every app on a machine with no panel.
-    pub fn present(id: WinId) -> wm::Presented {
+    pub fn present(id: WinId, owner: u64) -> wm::Presented {
         if id == WIN_NONE {
             return wm::Presented::NoRow;
         }
-        wm::present_outcome(id)
+        wm::present_outcome_owned(id, owner)
     }
 
     /// FBCON-DMG: `video::wm::present_rows` — the same pass, damage-marking only SOURCE rows
-    /// `[sy0, sy1)`. Called with `WINDOWS` held, exactly like [`present`]. The band has already been
-    /// validated against this row's surface height by `sys_win_present_rows`, so wm's own whole-box
-    /// degrade is unreachable from the syscall path — it stays as wm's contract with its other callers.
-    pub fn present_rows(id: WinId, sy0: usize, sy1: usize) -> wm::Presented {
+    /// `[sy0, sy1)`. WCPAR: called with `WINDOWS` RELEASED and carrying the same `owner` fence as
+    /// [`present`]. The band has already been validated against this row's surface height by
+    /// `sys_win_present_rows`, so wm's own whole-box degrade is unreachable from the syscall path — it
+    /// stays as wm's contract with its other callers.
+    pub fn present_rows(id: WinId, sy0: usize, sy1: usize, owner: u64) -> wm::Presented {
         if id == WIN_NONE {
             return wm::Presented::NoRow;
         }
-        wm::present_rows_outcome(id, sy0, sy1)
+        wm::present_rows_outcome_owned(id, sy0, sy1, owner)
     }
 
     /// `video::wm::close`. Runs a drain barrier, so every caller invokes it with `WINDOWS` RELEASED.
