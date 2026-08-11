@@ -176,31 +176,163 @@ pub fn usb_info() -> Option<BlockDeviceInfo> {
 // [`program_source`] below is that question, asked ONCE, in the block layer, so no consumer has to
 // carry a `#[cfg]` to get it right.
 //
-// ### PRECEDENCE, and why it is this way round
+// ### PRECEDENCE — PSRC (GR26): the BOOT VOLUME wins; the handle ORDER is only the fallback
 //
-// GLOBAL first, Sdhc only as a fallback. This is the whole compatibility argument and it is worth
-// stating flatly: on any boot where the global handle is populated — every boot that has ever run
-// this code, every boot from a USB stick, every Pi boot where `register_sd` claimed the global —
-// `program_source` returns EXACTLY what `info()` returned, from the same slot, read through the same
-// path. No existing boot changes behaviour, because on an existing boot the fallback arm is never
-// reached. The internal card is consulted only in the case that used to have no answer at all.
+// The original rule was "GLOBAL first, Sdhc only as a fallback", justified by the premise that this
+// machine boots from a USB card reader, so the global slot IS the boot volume. `sdhc.md` §12.3
+// recorded the review finding that killed that premise: the bench rMBP now boots from the INTERNAL
+// slot, `sdhcblk` is default-on, and `publish_usb_geometry` claims the global UNCONDITIONALLY on
+// x86. So a USB stick inserted merely to CARRY files — the b43 firmware blobs, this week, for real —
+// would claim the global mid-boot and, under the old rule, silently become the program source:
+// `/fat` would stop meaning the volume the machine booted from and `bg /fat/VUG.ELF` would resolve
+// against the stick.
 //
-// The precedence is also the correct one on the merits, not merely the safe one: the global handle
-// is whatever the active backend selected as THE device, and a machine that has both a boot stick
-// and an internal card should keep loading its programs off the volume the rest of the system is
-// already bound to. A card in the reader is a second source, never a preemption.
+// FRGUARD already refuses the WRITE half of exactly that substitution (`BM_SUBSTITUTED`, Boot AI-2,
+// `docs/SECURITY.md`). The kernel therefore already HOLDS the evidence — `BootInfo::boot_volume_serial`,
+// published here by `set_boot_volume_serial` — and the old `program_source` simply did not consult it.
+// This is that consultation.
 //
-// The `Usb` handle is deliberately NOT in the ladder. It exists so the Pi can reach a stick while
-// the microSD owns the global; on x86 the stick IS the global, so including it here would either be
-// a duplicate of the global arm or would let a Pi program load silently retarget. One fallback,
-// named, is the whole change.
+// The rule, in order:
+//
+//   1. **boot-serial.** If the FRGUARD verdict POSITIVELY locates the boot volume on a handle, and
+//      that handle is still populated, that handle wins. `BM_MATCH` -> `Global`, `BM_SUBSTITUTED` ->
+//      `Sdhc`. This is the only arm that can differ from the pre-PSRC answer, and it differs in
+//      exactly one direction: away from a medium this kernel did not boot from.
+//   2. **fallback-order / serial-unproven.** Everything else keeps the historical ladder — global,
+//      then `Sdhc`. That covers a boot serial of 0 (the loader could not identify the medium; the
+//      disarmed sentinel), a serial found on NEITHER handle (`BM_UNPROVEN` — the QEMU harness, and
+//      any machine booting from a device the block layer has no driver for), a verdict not yet
+//      derived, and a verdict whose named handle has since been retracted. Same fail-open direction
+//      FRGUARD takes, for the same reason: an unidentified or unreachable boot volume is a reason to
+//      SAY SO, not a reason to guess.
+//
+// ### Why this is cheap on the hot path, and why it adds no cache
+//
+// `program_source` is consulted per open — the shell's twenty-five FAT verbs, every exec probe, the
+// desktop-app storage gate on each main-loop pass while it waits, the wifi staging poll. It must not
+// read a sector, and it must not be callable into a masked deadlock.
+//
+// It does neither, because **the cache it needs already exists**: `BOOT_MEDIUM_VERDICT`. FRGUARD
+// derives it ONCE, from an unmasked main-loop context (`flight_recorder::service`), precisely because
+// deriving costs sector reads that cannot happen inside `write_block`; and `publish_usb_geometry`
+// resets it to `BM_UNKNOWN` whenever a new device claims the global slot, precisely so a hot-plug
+// cannot inherit the previous occupant's verdict. That is the same freshness property a preference
+// cache would need, already paid for and already metal-exercised. Adding a SECOND cache here would
+// duplicate the invalidation and create the stale-handle hazard it was meant to avoid — two caches
+// that can disagree about which disk is in the slot is strictly worse than one.
+//
+// So the whole decision is two relaxed-cost atomic loads plus the two `Option` reads the function
+// already performed. No sector I/O, no new lock, no new state.
+//
+// The one residual staleness — a verdict naming a handle that has since been RETRACTED
+// (`unpublish_usb_geometry` deliberately does not reset the verdict, because resetting it would turn
+// a `BM_SUBSTITUTED` refusal into a fail-open and WEAKEN FRGUARD) — is handled structurally rather
+// than by invalidation: arm 1 only wins if the named handle is still `Some`. A verdict that names an
+// empty slot falls through to arm 2 and says `verdict=stale-handle` on the wire.
+//
+// ### Is the verdict derived in time?
+//
+// It is derived in exactly the case that needs it, and the race that looks available is empty.
+// `flight_recorder::service` returns early while `info()` is `None`, so on a card-ONLY boot the
+// verdict is never derived at all — and that costs nothing, because with the global slot empty the
+// fallback ladder already lands on `Sdhc`. The verdict only matters when BOTH handles are populated,
+// which is precisely the state in which the flight recorder's gate passes and the derivation runs.
+//
+// There IS a residual window, and it is stated rather than argued away (review, GR26). Ordering on
+// x86 is fixed: `register_sdhc` runs synchronously inside `pci::init` (`sdhc::probe` -> `bring_up`),
+// while `publish_usb_geometry` runs from the main loop's deferred SCSI bring-up
+// (`xhci::service_storage`, held until the enumeration queue drains). So the card is always
+// registered FIRST, and every poll-until-present consumer — `wifi::service`, `wcx::desktop_app_service`,
+// `shell::fatverb_storage_witness` — resolved and parked on `Sdhc` at the first main-loop pass, long
+// before any stick arrives. What remains is the INTRA-PASS window on the one pass where a stick
+// claims the global: `service_storage` resets the verdict to `BM_UNKNOWN` near the top of the pass
+// and `flight_recorder::service` re-derives it at the bottom, so between those two points arm 2 runs
+// with `verdict=undecided` and the ladder answers `Global` — the stick. A per-call consumer that
+// resolves inside that window (a shell verb or an exec dispatched on exactly that pass) gets the
+// stick for that one call. It is bounded to a single main-loop pass, it requires a hot-plug
+// concurrent with the call, it is read-side only (FRGUARD still refuses the write), and the `PSRC`
+// witness prints the transient `psrc=global … verdict=undecided` line, so the capture shows it. It
+// is NOT closed by construction, and closing it would cost either a sector read on the hot path or a
+// second cache — both of which this section rejects for stronger reasons.
+//
+// ### The `Usb` handle is still deliberately NOT in the ladder
+//
+// It exists so the Pi can reach a stick while the microSD owns the global; on x86 the stick IS the
+// global, so including it here would either duplicate the global arm or let a Pi program load
+// silently retarget.
 
-/// APPLOAD: the block device a program should be loaded from, with the HANDLE it was found under —
-/// `None` only when there is genuinely nowhere to look.
+/// PSRC: handle codes for the change-only witness latch.
+const PSRC_H_NONE: u8 = 0;
+const PSRC_H_GLOBAL: u8 = 1;
+const PSRC_H_SDHC: u8 = 2;
+/// PSRC: reason codes — the three-token vocabulary `sdhc.md` §12.3 named.
+const PSRC_R_BOOT_SERIAL: u8 = 0;
+const PSRC_R_FALLBACK_ORDER: u8 = 1;
+const PSRC_R_SERIAL_UNPROVEN: u8 = 2;
+/// PSRC: the underlying FRGUARD state, so `reason=fallback-order` and `reason=serial-unproven` each
+/// stay falsifiable instead of collapsing four distinct causes into one word.
+const PSRC_V_MATCH: u8 = 0;
+const PSRC_V_SUBSTITUTED: u8 = 1;
+const PSRC_V_UNPROVEN: u8 = 2;
+const PSRC_V_UNDECIDED: u8 = 3;
+const PSRC_V_DISARMED: u8 = 4;
+const PSRC_V_STALE_HANDLE: u8 = 5;
+const PSRC_V_UNBUILT: u8 = 6;
+
+/// PSRC: the last decision this boot PRINTED, packed as `handle | reason<<2 | verdict<<4`, plus a
+/// `has-printed` bit so the very first decision is never mistaken for a repeat of code 0.
 ///
-/// Precedence: the global [`BLOCK_DEVICE`] if it is registered, else (x86 + `sdhcblk`) the internal
-/// SD card under [`SDHC_BLOCK_DEVICE`]. See the section note above for why the global comes first and
-/// why that makes this a strict superset of [`info`] rather than a change to any existing boot.
+/// Change-only rather than once-only on purpose. `program_source` runs per open, so a per-call line
+/// would flood; but a once-only line would hide the event this arc exists for — the moment a stick
+/// claims the global and the preference has to REFUSE it. Latching on the decision means the wire
+/// carries one line per distinct answer, which is the falsifiable minimum: a boot where the answer
+/// never changes prints once, and a boot where a stick arrives prints the flip.
+static PSRC_LAST: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+/// PSRC: emit the decision line if (and only if) it differs from the last one printed.
+///
+/// Pure logging: it takes each registry slot's lock briefly through [`source_census`] and changes
+/// nothing, so it is safe from any context `program_source` itself is safe from.
+fn psrc_witness(handle: u8, reason: u8, verdict: u8, serial: u32) {
+    let code: u16 = 0x100 | (handle as u16) | ((reason as u16) << 2) | ((verdict as u16) << 4);
+    if PSRC_LAST.swap(code, core::sync::atomic::Ordering::Relaxed) == code {
+        return;
+    }
+    let psrc = match handle {
+        PSRC_H_GLOBAL => "global",
+        PSRC_H_SDHC => "sdhc",
+        _ => "none",
+    };
+    let reason_s = match reason {
+        PSRC_R_BOOT_SERIAL => "boot-serial",
+        PSRC_R_SERIAL_UNPROVEN => "serial-unproven",
+        _ => "fallback-order",
+    };
+    let verdict_s = match verdict {
+        PSRC_V_MATCH => "match",
+        PSRC_V_SUBSTITUTED => "substituted",
+        PSRC_V_UNPROVEN => "unproven",
+        PSRC_V_UNDECIDED => "undecided",
+        PSRC_V_DISARMED => "disarmed",
+        PSRC_V_STALE_HANDLE => "stale-handle",
+        PSRC_V_UNBUILT => "unbuilt",
+        // Not constructible: every caller passes one of the seven constants above. Rendered rather
+        // than `unreachable!()` so a witness can never be the thing that panics a boot.
+        _ => "?",
+    };
+    serial_println!(
+        ":: PSRC: psrc={} reason={} verdict={} boot_serial=0x{:08x} handles={} ::",
+        psrc, reason_s, verdict_s, serial, source_census()
+    );
+}
+
+/// APPLOAD / PSRC: the block device a program should be loaded from, with the HANDLE it was found
+/// under — `None` only when there is genuinely nowhere to look.
+///
+/// Precedence: the handle the FRGUARD verdict positively locates the BOOT VOLUME on, if it is still
+/// populated; else the historical ladder — the global [`BLOCK_DEVICE`], then (x86 + `sdhcblk`) the
+/// internal SD card under [`SDHC_BLOCK_DEVICE`]. See the PSRC section note above for the rule, its
+/// cost argument, and why it adds no cache of its own.
 ///
 /// The returned handle is not decoration: the three handles are served by DIFFERENT read paths
 /// (`read_block` goes through the backend selector, `read_block_sdhc` bypasses it into the SDHCI
@@ -208,14 +340,103 @@ pub fn usb_info() -> Option<BlockDeviceInfo> {
 /// commands. `fs::fat::mount_program_source` is the intended consumer and it maps this handle
 /// straight onto the matching `fs::fat::BlockSource`.
 pub fn program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
-    if let Some(dev) = info() {
-        return Some((dev, BlockHandle::Global));
-    }
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-    if let Some(dev) = sdhc_info() {
-        return Some((dev, BlockHandle::Sdhc));
+    {
+        use core::sync::atomic::Ordering;
+        let glob = info();
+        let card = sdhc_info();
+        let serial = BOOT_VOLUME_SERIAL.load(Ordering::Acquire);
+        let verdict = BOOT_MEDIUM_VERDICT.load(Ordering::Acquire);
+
+        // --- Arm 1: the boot volume was POSITIVELY located, and its handle is still populated.
+        if serial != 0 {
+            if verdict == BM_MATCH {
+                if let Some(dev) = glob {
+                    psrc_witness(PSRC_H_GLOBAL, PSRC_R_BOOT_SERIAL, PSRC_V_MATCH, serial);
+                    return Some((dev, BlockHandle::Global));
+                }
+            } else if verdict == BM_SUBSTITUTED {
+                if let Some(dev) = card {
+                    psrc_witness(PSRC_H_SDHC, PSRC_R_BOOT_SERIAL, PSRC_V_SUBSTITUTED, serial);
+                    return Some((dev, BlockHandle::Sdhc));
+                }
+            }
+        }
+
+        // --- Arm 2: the historical global-then-Sdhc ladder, with the cause named.
+        let (reason, vstate) = if serial == 0 {
+            (PSRC_R_FALLBACK_ORDER, PSRC_V_DISARMED)
+        } else {
+            match verdict {
+                BM_UNPROVEN => (PSRC_R_SERIAL_UNPROVEN, PSRC_V_UNPROVEN),
+                BM_UNKNOWN => (PSRC_R_SERIAL_UNPROVEN, PSRC_V_UNDECIDED),
+                // BM_MATCH / BM_SUBSTITUTED that fell through arm 1: the verdict names a handle the
+                // registry no longer holds (a disconnect retracted it without resetting the verdict —
+                // see the note above on why FRGUARD must not reset it there).
+                _ => (PSRC_R_FALLBACK_ORDER, PSRC_V_STALE_HANDLE),
+            }
+        };
+        if let Some(dev) = glob {
+            psrc_witness(PSRC_H_GLOBAL, reason, vstate, serial);
+            return Some((dev, BlockHandle::Global));
+        }
+        if let Some(dev) = card {
+            psrc_witness(PSRC_H_SDHC, reason, vstate, serial);
+            return Some((dev, BlockHandle::Sdhc));
+        }
+        psrc_witness(PSRC_H_NONE, reason, vstate, serial);
+        None
     }
-    None
+    // No `Sdhc` handle exists in this image, so there is no precedence to decide and no boot serial
+    // published to decide it with: the ladder is one rung long. The witness still fires — a build
+    // that cannot substitute should SAY that it cannot, rather than leaving a reader to infer it
+    // from the absence of a line (the exact inference `sdhc.md` §12.4 records as falsified).
+    #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+    {
+        let glob = info();
+        psrc_witness(
+            if glob.is_some() { PSRC_H_GLOBAL } else { PSRC_H_NONE },
+            PSRC_R_FALLBACK_ORDER,
+            PSRC_V_UNBUILT,
+            0,
+        );
+        glob.map(|dev| (dev, BlockHandle::Global))
+    }
+}
+
+/// PSRC: the OTHER populated program-source handle — the one [`program_source`] did NOT choose.
+///
+/// `None` when there is no second populated handle (the overwhelmingly common case: one disk).
+///
+/// This exists for exactly one caller and one class of read. `wifi::firmware` stages user-supplied
+/// b43 blobs, and those blobs live wherever the OPERATOR put them — which, in the workflow this arc
+/// was written during, is a USB stick carried to a machine whose boot volume is the internal card.
+/// Making the preference above authoritative for that read would mean "to try a firmware blob,
+/// re-flash your boot card", which is a worse OS. The firmware search is READ-ONLY, its whole job is
+/// "find a user-supplied file wherever it is" (it already walks three directories per volume for the
+/// same reason), and none of the hazards the preference closes — `/fat` meaning the wrong volume for
+/// an exec, a write landing on a foreign medium — apply to it.
+///
+/// Nothing else should use this. A caller that means "the volume this system is bound to" wants
+/// [`program_source`], and a caller that means a SPECIFIC disk wants [`lookup`] with a
+/// [`BlockDeviceId`].
+pub fn alternate_program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
+    match program_source()?.1 {
+        BlockHandle::Global => {
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            {
+                sdhc_info().map(|d| (d, BlockHandle::Sdhc))
+            }
+            #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+            {
+                None
+            }
+        }
+        // `program_source` never returns `Usb` (see its precedence note); mapped for totality.
+        BlockHandle::Usb => None,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockHandle::Sdhc => info().map(|d| (d, BlockHandle::Global)),
+    }
 }
 
 /// APPLOAD: what [`program_source`] LOOKED AT, for the witness lines that report its `None`.

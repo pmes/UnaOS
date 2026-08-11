@@ -15,12 +15,17 @@
 // the loader stages the whole set and its terminal verdict is all-present or names what is missing.
 //
 // ## Where the files must be
-// The loader reads through `fat::mount_program_source()`: the global block device when one is
-// registered, else (x86 + `sdhcblk`) the card in the internal SD reader. That is the FAT-verb law —
-// a "wherever I can find it" read FOLLOWS THE PROGRAM SOURCE — and firmware is exactly that class of
-// read. Reaching for `mount()` instead would find nothing on a machine booted from the internal
-// reader, where the program-bearing volume is mounted and the global handle is empty at the same
-// time.
+// The loader reads the PROGRAM SOURCE first — `block::program_source()`, which since PSRC (GR26)
+// prefers the handle carrying the boot-volume serial and falls back to the historical global-then-
+// `Sdhc` order. That is the FAT-verb law — a "wherever I can find it" read FOLLOWS THE PROGRAM
+// SOURCE — and firmware is exactly that class of read. Reaching for `mount()` instead would find
+// nothing on a machine booted from the internal reader, where the program-bearing volume is mounted
+// and the global handle is empty at the same time.
+//
+// **PSRC (GR26) — and then the OTHER populated handle, for any role still missing.** See
+// [`stage_attempt`]'s doc for the argument. The short form: these blobs are user-supplied and travel
+// on whichever medium the user plugged in, this module writes no sector, and a role already staged is
+// never replaced — so widening the search here costs nothing the preference was protecting.
 //
 // Directories, in order: the volume root, then `/B43/`, then `/FIRMWARE/`. Within each directory each
 // file is tried by its canonical b43 name first, then by an 8.3 alias — the canonical names are
@@ -73,16 +78,27 @@
 //
 // So [`stage_attempt`] classifies its own failure instead of assuming it is final:
 //
-//   * **`Settled`** — the volume mounted and each role got its verdict, OR the mount failed for a
-//     reason a later pass cannot change (`NotFat`, `Unsupported`, a corrupt chain): a volume that is
-//     not FAT now will not be FAT in two seconds. One terminal verdict, printed here.
-//   * **`Retry(stage)`** — the mount, or the root-directory read, failed for a reason that CAN
-//     change (`NoDisk`, `Io`, `Busy`). Nothing was staged and nothing was printed as terminal; the
-//     caller re-attempts under its own bounded budget and prints the exhaustion line if it runs out.
+//   * **`Settled`** — every volume that was tried mounted and each role got its verdict, OR a mount
+//     failed for a reason a later pass cannot change (`NotFat`, `Unsupported`, a corrupt chain): a
+//     volume that is not FAT now will not be FAT in two seconds. One terminal verdict, printed here.
+//   * **`Retry(stage)`** — a mount, or a root-directory read, failed for a reason that CAN change
+//     (`NoDisk`, `Io`, `Busy`). Nothing terminal was printed; the caller re-attempts under its own
+//     bounded budget and prints the exhaustion line if it runs out.
 //
-// The `Retry` arms are reachable only BEFORE any role has been staged — both sit above the
-// `for spec in FW_SET` loop — so a retry can never double-stage a role or resume a half-built set.
-// That is a property of where the arms are, and it is why `STAGED` needs no reset between attempts.
+// ## PSRC (GR26) meets WIFI-REARM — where the no-double-stage guarantee now lives
+// Pre-PSRC, both `Retry` arms sat ABOVE the `for spec in FW_SET` loop, so a retry was by construction
+// reachable only before any role had been staged: that placement was the whole no-double-stage
+// argument. PSRC widens the search to a SECOND volume ([`stage_pass`] over the program source, then
+// the alternate handle), so a `Retry` can now be returned by the alternate volume AFTER the program
+// source already staged one or two roles — the arm-placement argument no longer holds on its own.
+//
+// The guarantee is preserved by a stronger mechanism that PSRC brought with it: [`stage_pass`] skips
+// any role already present in `STAGED` (`with_staged(...).is_some()`), on every volume and every
+// re-attempt. So a role staged on volume 1 is never restaged on volume 2, and a role staged on
+// attempt N is never restaged on attempt N+1. `STAGED` still needs no reset between attempts — not
+// because a retry stages nothing (it may now resume a half-built set on purpose), but because the
+// per-role skip makes resuming idempotent. The `Retry` return still prints nothing terminal, so the
+// "exactly one terminal verdict" rule holds across the whole two-volume, multi-attempt search.
 //
 // ## Sourcing (see the note in `mod.rs`)
 // File names, core revision and PHY type come from `bcm4331.md` §S4, which states its own sourcing
@@ -390,31 +406,72 @@ fn retryable(e: FatError) -> bool {
     matches!(e, FatError::NoDisk | FatError::Io | FatError::Busy)
 }
 
-/// Locate + validate + stage the firmware set. Called only after a program-source block device is
-/// present, and at most [`crate::wifi`]'s bounded attempt budget of times per boot — see
-/// [`StageOutcome`] and the module note. The witness IS the result.
-pub fn stage_attempt() -> StageOutcome {
-    let dirs = dirs_description();
+/// One volume's worth of the search. Returns `(staged, rejected)` for the roles it filled on THIS
+/// volume; roles already staged by an earlier pass — OR an earlier ATTEMPT — are skipped, so a
+/// second volume (or a re-attempt after a deferral) can only ever ADD to the set and can never
+/// re-stage or shadow an image already held. That per-role skip is the no-double-stage guarantee
+/// after PSRC widened the search past a single volume — see the module note.
+///
+/// `vol` is the fingerprint string the witness lines quote, built by the caller so both passes name
+/// their volume in the same vocabulary.
+fn stage_pass(fs: &FatFs, root: &[DirEntry], vol: &str, dirs: &str) -> (usize, usize) {
+    let mut staged = 0usize;
+    let mut rejected = 0usize;
+    for spec in FW_SET {
+        if with_staged(spec.role, |_| ()).is_some() {
+            continue; // filled by an earlier volume/attempt — first volume wins, per role
+        }
+        match stage_role(fs, root, spec, vol) {
+            RoleResult::Staged => staged += 1,
+            RoleResult::Rejected => rejected += 1,
+            RoleResult::Absent => serial_println!(
+                ":: wifi: {} ABSENT — none of {} in {} on {} ::",
+                spec.role, names_description(spec), dirs, vol
+            ),
+        }
+    }
+    (staged, rejected)
+}
 
-    // FAT-verb law: reads follow the program source. See the module note.
-    let fs = match fat::mount_program_source() {
+/// The outcome of mounting and searching ONE volume — the reconciliation of PSRC's `(usize, usize,
+/// String)` tuple with WIFI-REARM's `StageOutcome`.
+enum VolOutcome {
+    /// Mounted, root read, and searched. `(rejected_here, volume-description)`.
+    Searched(usize, String),
+    /// The mount or the root-directory read failed for a reason a later pass CAN change
+    /// (`NoDisk`/`Io`/`Busy`). Nothing was staged from this volume and nothing terminal was printed;
+    /// the attempt is a "not yet". Carries the stage name for the caller's retry line. A deferred
+    /// mount is a `Retry` whether it is the program source or the alternate: the set is not settled
+    /// until every volume it could reach has been genuinely tried.
+    Deferred(&'static str),
+    /// The mount or root read failed for a reason a later pass CANNOT change (`NotFat`,
+    /// `Unsupported`, a corrupt chain). A NON-TERMINAL per-volume line was printed; this volume
+    /// contributes nothing, but the OTHER volume may still carry files, so the search continues and
+    /// the caller still prints exactly one terminal verdict. Carries a volume-description for the
+    /// searched-list.
+    Unusable(String),
+}
+
+/// Mount one source and run [`stage_pass`] on it, naming the volume for the witnesses.
+fn stage_volume(src: fat::BlockSource, dirs: &str, label: &str) -> VolOutcome {
+    let fs = match fat::mount_source(src) {
         Ok(fs) => fs,
         Err(e) if retryable(e) => {
-            // NOT the terminal line. The handle exists (the caller's gate just said so) and the
-            // transport did not answer, which is the signature of a device published a moment before
-            // its bring-up settled. Nothing has been staged, so re-attempting costs one mount.
+            // NOT a terminal line. The handle exists and the transport did not answer — the
+            // signature of a device published a moment before its bring-up settled. Nothing was
+            // staged from this volume, so re-attempting costs one mount.
             serial_println!(
-                ":: wifi: staging attempt DEFERRED at mount — program-source volume present but would not mount ({}); nothing staged, re-attempting ::",
-                reason(e)
+                ":: wifi: staging attempt DEFERRED at mount — {} volume present but would not mount ({}); nothing staged from it, re-attempting ::",
+                label, reason(e)
             );
-            return StageOutcome::Retry("mount");
+            return VolOutcome::Deferred("mount");
         }
         Err(e) => {
             serial_println!(
-                ":: wifi: firmware NOT staged — program-source FAT volume would not mount ({}); searched {} ::",
-                reason(e), dirs
+                ":: wifi: firmware NOT staged from the {} volume — would not mount ({}); searched {} ::",
+                label, reason(e), dirs
             );
-            return StageOutcome::Settled;
+            return VolOutcome::Unusable(alloc::format!("source={} (unmountable)", src.name()));
         }
     };
     let (vol_id, clusters) = fs.volume_fingerprint();
@@ -422,60 +479,153 @@ pub fn stage_attempt() -> StageOutcome {
         "source={} label='{}' fp={:#010x}:{:#010x}",
         fs.source_name(), fs.label(), vol_id, clusters
     );
-
     let root = match fs.read_root() {
         Ok(r) => r,
         Err(e) if retryable(e) => {
             serial_println!(
-                ":: wifi: staging attempt DEFERRED at root-dir — mounted {} but the root directory did not read ({}); nothing staged, re-attempting ::",
-                vol, reason(e)
+                ":: wifi: staging attempt DEFERRED at root-dir — mounted the {} volume {} but the root directory did not read ({}); nothing staged from it, re-attempting ::",
+                label, vol, reason(e)
             );
-            return StageOutcome::Retry("root-dir");
+            return VolOutcome::Deferred("root-dir");
         }
         Err(e) => {
             serial_println!(
-                ":: wifi: firmware NOT staged — root directory unreadable ({}) on {}; searched {} ::",
-                reason(e), vol, dirs
+                ":: wifi: firmware NOT staged from the {} volume — root directory unreadable ({}) on {}; searched {} ::",
+                label, reason(e), vol, dirs
+            );
+            return VolOutcome::Unusable(vol);
+        }
+    };
+    let (_staged, rejected) = stage_pass(&fs, &root, &vol, dirs);
+    VolOutcome::Searched(rejected, vol)
+}
+
+/// Locate + validate + stage the firmware set. Called only after a program-source block device is
+/// present, and at most [`crate::wifi`]'s bounded attempt budget of times per boot — see
+/// [`StageOutcome`] and the module note. The witness IS the result.
+///
+/// ## PSRC (GR26): two volumes, in preference order — and why this read is the exception
+///
+/// The block layer's [`crate::drivers::block::program_source`] now prefers the handle carrying the
+/// BOOT VOLUME serial, so on the bench machine (boot volume = the internal SD card) a USB stick
+/// inserted merely to carry files no longer becomes the program source. That is the right rule for
+/// `/fat`, for every exec, and for every write — and it would be the WRONG rule applied alone here,
+/// because the b43 blobs are USER-SUPPLIED files that the user carries on exactly such a stick.
+/// UnaOS ships no firmware (`CLEAN_ROOM_POLICY.md` §4); the honest reading of "the user placed the
+/// files on the media" is that the media is whichever one they plugged in.
+///
+/// So this pass searches the program source FIRST and, only if the set is still incomplete, the
+/// other populated handle. It is safe to widen precisely here and nowhere else:
+///
+///   * **Read-only.** This module never writes a sector, so the substitution FRGUARD refuses —
+///     writing this system's data to a medium it did not boot from — cannot arise.
+///   * **Additive, per role.** [`stage_pass`] skips a role already staged, so the preferred volume
+///     always wins any file that exists on both. A second volume can add a missing image; it can
+///     never replace one.
+///   * **Same shape as the search this loader already does.** It already tries three directories per
+///     volume and three names per directory for the same reason. A second volume is one more rung on
+///     a ladder that exists because firmware is a "wherever I can find it" read.
+///
+/// ## PSRC meets WIFI-REARM
+///
+/// The two-volume search runs INSIDE the retry-aware entry. A `Deferred` from EITHER volume becomes
+/// a `Retry` (the transport for that handle had not settled); the caller re-attempts and, because
+/// [`stage_pass`] skips roles already in `STAGED`, the re-attempt resumes the half-built set without
+/// double-staging. A mounted-but-incomplete volume is NOT terminal on its own — the terminal verdict
+/// below is printed only after BOTH the program source and (if the set is still short) the alternate
+/// have been tried on this attempt.
+///
+/// The witness names the volume each image came from (`on source=… label=… fp=…`), so a capture
+/// always says which medium fed the radio — the widening is never silent.
+pub fn stage_attempt() -> StageOutcome {
+    let dirs = dirs_description();
+
+    // Pass 1 — the program source. FAT-verb law: reads follow it. See the module note.
+    let (vol, mut rejected) = match crate::drivers::block::program_source() {
+        Some((_, h)) => match stage_volume(source_of_handle(h), &dirs, "program-source") {
+            VolOutcome::Deferred(stage) => return StageOutcome::Retry(stage),
+            VolOutcome::Searched(rej, vol) => (vol, rej),
+            VolOutcome::Unusable(vol) => (vol, 0),
+        },
+        None => {
+            // The caller gates on `program_source().is_some()`, so this arm is defensive.
+            serial_println!(
+                ":: wifi: firmware NOT staged — no program-source block device; searched {} ::", dirs
             );
             return StageOutcome::Settled;
         }
     };
 
-    let mut staged = 0usize;
-    let mut rejected = 0usize;
-    let mut missing = String::new();
-    for spec in FW_SET {
-        match stage_role(&fs, &root, spec, &vol) {
-            RoleResult::Staged => staged += 1,
-            RoleResult::Rejected => rejected += 1,
-            RoleResult::Absent => {
-                if !missing.is_empty() {
-                    missing.push_str(", ");
-                }
-                missing.push_str(spec.role);
-                missing.push('(');
-                missing.push_str(&names_description(spec));
-                missing.push(')');
-                serial_println!(
-                    ":: wifi: {} ABSENT — none of {} in {} on {} ::",
-                    spec.role, names_description(spec), dirs, vol
-                );
+    // Pass 2 — the OTHER populated handle, only for roles still missing. See the doc note above.
+    let mut alt_vol = String::new();
+    if staged_count() < FW_SET.len() {
+        if let Some((_, handle)) = crate::drivers::block::alternate_program_source() {
+            let src = source_of_handle(handle);
+            serial_println!(
+                ":: wifi: firmware set incomplete on the program source ({}/{}) — searching the other \
+                 populated handle (source={}) for the missing roles; READ-ONLY, and a role already \
+                 staged is never replaced ::",
+                staged_count(), FW_SET.len(), src.name()
+            );
+            match stage_volume(src, &dirs, "alternate") {
+                // A deferred alternate mount is still a Retry: not settled until BOTH volumes were
+                // tried. Pass 1's staged roles persist in `STAGED`, so the re-attempt skips them.
+                VolOutcome::Deferred(stage) => return StageOutcome::Retry(stage),
+                VolOutcome::Searched(rej, v) => { rejected += rej; alt_vol = v; }
+                VolOutcome::Unusable(v) => { alt_vol = v; }
             }
         }
     }
 
-    // Exactly one terminal verdict, whatever happened above.
+    let searched = if alt_vol.is_empty() {
+        vol
+    } else {
+        alloc::format!("{} + {}", vol, alt_vol)
+    };
+
+    // Exactly one terminal verdict, read from the authoritative `STAGED` set (not a per-attempt
+    // counter — the set may have been built across the two passes above and across earlier attempts).
+    let staged = staged_count();
     if staged == FW_SET.len() {
         serial_println!(
             ":: wifi: firmware set COMPLETE {}/{} staged on {} — held in kernel memory, NOT pushed to the core (no MMIO, no device write); arc 2 owns bcma core bring-up ::",
-            staged, FW_SET.len(), vol
+            staged, FW_SET.len(), searched
         );
     } else {
+        let mut missing = String::new();
+        for spec in FW_SET {
+            if with_staged(spec.role, |_| ()).is_some() {
+                continue;
+            }
+            if !missing.is_empty() {
+                missing.push_str(", ");
+            }
+            missing.push_str(spec.role);
+            missing.push('(');
+            missing.push_str(&names_description(spec));
+            missing.push(')');
+        }
         serial_println!(
             ":: wifi: firmware set INCOMPLETE {}/{} staged ({} rejected) on {} — missing: {} — parked, radio stays down ::",
-            staged, FW_SET.len(), rejected, vol,
+            staged, FW_SET.len(), rejected, searched,
             if missing.is_empty() { "none (see REJECTED above)" } else { missing.as_str() },
         );
     }
     StageOutcome::Settled
+}
+
+/// PSRC: the [`fat::BlockSource`] that reads a given block-layer handle.
+///
+/// `fs::fat` keeps a private `source_of` doing exactly this for `mount_program_source`. It is
+/// deliberately NOT reused here: `fs/fat.rs` is outside this arc's lane, and publishing its private
+/// mapping is a change that belongs to the FAT layer's own arc. **Flagged for the integrator:** the
+/// two must stay in step, and the compiler enforces the harder half — both matches are total over
+/// `BlockHandle`, so a fourth handle is a build error in both places, not a silent mis-route.
+fn source_of_handle(handle: crate::drivers::block::BlockHandle) -> fat::BlockSource {
+    match handle {
+        crate::drivers::block::BlockHandle::Global => fat::BlockSource::Default,
+        crate::drivers::block::BlockHandle::Usb => fat::BlockSource::Usb,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        crate::drivers::block::BlockHandle::Sdhc => fat::BlockSource::Sdhc,
+    }
 }
