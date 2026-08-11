@@ -6103,6 +6103,14 @@ fn drag_settle_disarm() {
 /// against this call and [`wc_route_tail`], not against a transcription of them — the failure this
 /// closes is a witness that tests the API while the path a pointer report actually takes is inert.
 pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event {
+    // CRYSTAL — Escape dismisses an open SHARD menu, and is addressed to the window system exactly as
+    // `<TAB>` is, so it is judged in the same place: before either router or a focused app can swallow
+    // it. It consumes ONLY a bare `Esc` while the menu is open; every other event, and `Esc` with no
+    // menu up, falls straight through to the chain below unchanged.
+    #[cfg(feature = "wc")]
+    if crate::video::crystal::key_escape(raw) {
+        return crate::pal::Event::Unknown;
+    }
     if wc_focus_key(raw) {
         crate::pal::Event::Unknown
     } else if wc_click_route(raw) {
@@ -6217,6 +6225,18 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
     if mask & !prev != 0 {
         // PRESS edge.
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
+        // CRYSTAL — **judged FIRST, ahead of the dock and every window arm.** The SHARD menu, when
+        // open, is a modal dropdown composited on top of everything, so its press must be tested
+        // before any layer beneath it; when closed, the only point it claims is the crystal box in
+        // the menu bar, which the bar owns anyway (the bar composites above the windows). It declines
+        // every other point (`false`), so the dock and window arms are not starved. Consumed with the
+        // target set to DROP so the matching RELEASE is dropped rather than delivered into whatever
+        // holds focus — the rule the dock, close and chrome arms below already follow.
+        #[cfg(feature = "wc")]
+        if crate::video::crystal::press_at(x, y) {
+            CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+            return true;
+        }
         // DOCK — **judged before EVERY window arm, because the dock is composited on top of them.**
         //
         // `wm::hit_test` knows nothing of the strip: it answers from the window table, and a window
@@ -16028,6 +16048,14 @@ fn winx_launcher(demo_cpu: usize) {
     // (that IS its verdict) and would otherwise change which owner the routing legs start from.
     #[cfg(all(feature = "witness", feature = "wc"))]
     crate::video::dock::selftest();
+    // CRYSTAL — the SHARD menu fixture. Runs after `dock::selftest` (which runs `menubar::selftest`),
+    // so the bar tenant it enables is already proven present and flush. It enables the bar itself,
+    // opens the menu off the crystal, resolves every item, fires the SAFE picks, and dismisses three
+    // ways, restoring the bar to its prior state — and it NEVER drives a press at the Shut Down row,
+    // so no gate can power the machine off (the PASS line printing after every leg is that guard's
+    // own proof). See `crystal::selftest`.
+    #[cfg(all(feature = "witness", feature = "wc"))]
+    crate::video::crystal::selftest();
     // WMDIRECT — third and last of the click family, and deliberately last: it MOVES a row (a drag
     // is a `move_to`, which pins the row against the tiler) and closes it under a live drag, so it
     // is the most disruptive of the three. Running it after the other two means neither of them can
