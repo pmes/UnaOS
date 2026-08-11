@@ -1199,6 +1199,22 @@ const BT_L3_DISC_MS: u64 = 600;
 /// legitimately emits Command Status, vendor events and (on the cancel path) a second meta event.
 #[cfg(feature = "bt")]
 const BT_L3_EVT_MAX: u32 = 16;
+/// BT-C1/INQUIRY — the structural event cap for the INQUIRY window only, and it is a different
+/// number because the inquiry asks a different question.
+///
+/// REVIEW FIX. Every other L3 wait listens for ONE named reply and treats a stream of other events
+/// as noise, so `BT_L3_EVT_MAX` = 16 is a generous ceiling there. The inquiry window is the exact
+/// opposite: the events it walks past ARE its payload, one or more `Inquiry Result`s per device per
+/// scan, repeating for 5.12 s across every device in the room. Sixteen events is a handful of
+/// devices in a quiet room and is reached in the first second of a busy one — and because the cap
+/// sets `st.blind`, the summary would then honestly but uselessly report `read_to_term=false` for a
+/// target that was about to answer. The cap that must bound this window is the WALL CLOCK
+/// (`BT_C1_INQUIRY_MS`), which it already does: `bt_l3_await` hands every read the window's
+/// REMAINING time, so no number of events can outlast it. This value is therefore set high enough
+/// that a real room reaches the deadline and not the counter, and it stays finite only so that a
+/// controller streaming zero-cost events cannot spin the loop.
+#[cfg(feature = "btc")]
+const BT_C1_INQUIRY_EVT_MAX: u32 = 128;
 
 // ---------------------------------------------------------------------------------------------
 // BT-L4 — ONE ATT read over the live LE link, and the transport question it had to answer first.
@@ -1360,8 +1376,16 @@ const BT_L4_PKT_MAX: u32 = 8;
 //     now writes the spec's own reset default (0x2000 = 5.12 s) — it used to shorten it to 1.28 s
 //     for boot cost, and Boot AS showed that shortening cutting off a page train to a speaker that
 //     was demonstrably page-scanning. See `BT_C1_PAGE_TIMEOUT`.
-//   * No inquiry is run, so the peer's page-scan repetition mode is unknown and the conservative
-//     value is sent (see `BT_C1_PSRM`).
+//   * `HCI_Inquiry` (Vol 4 Part E §7.1.1) IS run first, and Boot D is why. A page carries two
+//     fields that only an inquiry can supply — `Page_Scan_Repetition_Mode` and `Clock_Offset` —
+//     and paging without them means guessing R2 and declaring the offset invalid, which makes
+//     the controller build the longest, least-aligned page train there is. A device in PAIRING
+//     MODE is INQUIRY-scanning as well as page-scanning, so the inquiry is the one transmission
+//     that such a device is guaranteed to be listening for. See `bt_c1_inquiry`.
+//   * If the inquiry does NOT hear the target, the page still goes out on the conservative
+//     values (see `BT_C1_PSRM`, `BT_C1_CLOCK_OFFSET`) — a page that was never tried proves
+//     nothing — but the capture then carries the far stronger finding that the address this
+//     host pages was not on the air on CLASSIC at all.
 //   * No pairing, no authentication, no encryption. A speaker already bonded to this machine's
 //     BD_ADDR may accept the link outright; one that is not may refuse it, and a refusal is a
 //     perfectly good witnessed answer.
@@ -1433,10 +1457,16 @@ const BT_C1_PAGE_TIMEOUT: u16 = 0x2000;
 /// ~10.3 s of PAGING, but the stage also spends 2 x `BT_C1_CONN_MS` (5600 ms) of host window — the
 /// controller's Page Timeout normally lands first, so these overlap the paging rather than adding
 /// to it — plus 2 x `BT_L3_CMD_MS` waiting for Command Status, 2 x a cancel round trip, and up to
-/// one `hw_wait_budget()` (~1.1 s) if `HCI_Write_Page_Timeout` itself goes unanswered. **The
-/// bounded worst case for the whole classic stage is therefore ~12.4 s**, not the ~10.2 s an
-/// earlier draft of this comment quoted; with the LE stage's repeat scan in front of it the worst
-/// boot is ~15 s. All of it is paid only by a boot that set `UNAOS_BTC=1`, and all of it sits on
+/// one `hw_wait_budget()` (~1.1 s) if `HCI_Write_Page_Timeout` itself goes unanswered — and, as of
+/// the inquiry arc, the inquiry in front of it: `BT_C1_INQUIRY_MS` (5600 ms) plus two
+/// `BT_L3_CMD_MS` round trips, ~6.2 s, and only on a boot where the target never answers it. **The
+/// bounded worst case for the whole classic stage is therefore ~18.6 s**, not the ~12.4 s this
+/// comment quoted before the inquiry existed and not the ~10.2 s an earlier draft quoted; with the
+/// LE stage's repeat scan in front of it the worst boot is ~21 s. THE GOOD CASE IS MUCH SHORTER
+/// AND IS THE POINT: an inquiry that hears the target exits early, and the page it then makes is
+/// aligned to the peer's clock rather than sweeping for it, so it is the run that ends in a link
+/// on the FIRST train that this arc is buying. All of it is paid only by a boot that set
+/// `UNAOS_BTC=1`, and all of it sits on
 /// the SYNCHRONOUS EHCI walk — which is what must change before Bluetooth is ever default-on. The
 /// tally prints `pages_attempted=` so the capture always says how many trains were actually spent.
 #[cfg(feature = "btc")]
@@ -1452,22 +1482,50 @@ const BT_C1_PAGE_ATTEMPTS: u32 = 2;
 /// from a `Change_Connection_Packet_Type`, which is a different arc's problem.
 #[cfg(feature = "btc")]
 const BT_C1_PACKET_TYPE: u16 = 0x0018;
-/// BT-C1 — `Page_Scan_Repetition_Mode` = **R2 (0x02)**, the conservative assumption.
+/// BT-C1 — the FALLBACK `Page_Scan_Repetition_Mode`: **R2 (0x02)**, used only when the inquiry
+/// did not hear the target.
 ///
 /// The field tells the controller how the PEER page-scans, so it can size the page train (Vol 2
-/// Part B §8.3.3). It is normally taken from an inquiry result; this arc runs no inquiry, so it is
-/// a guess, and the two guesses fail differently: assuming a mode with MORE scanning than the peer
-/// really does (R0/R1 when it is R2) may under-page and miss a device that was reachable, while
-/// assuming R2 when it is really R0 only spends page attempts that were not needed. Over-paging
-/// costs time inside a timeout this arc already shortened; under-paging costs a FALSE NEGATIVE,
-/// which is the one outcome an experiment must not manufacture.
+/// Part B §8.3.3). It is supposed to be taken from an INQUIRY RESULT, and as of this arc it is —
+/// `bt_c1_inquiry` harvests the peer's real value and the page carries it. This constant is what
+/// the page falls back to when no inquiry response for this BD_ADDR arrived, and the two guesses
+/// fail differently: assuming a mode with MORE scanning than the peer really does (R0/R1 when it
+/// is R2) may under-page and miss a device that was reachable, while assuming R2 when it is
+/// really R0 only spends page attempts that were not needed. Under-paging costs a FALSE NEGATIVE,
+/// which is the one outcome an experiment must not manufacture — so the fallback stays R2.
 #[cfg(feature = "btc")]
 const BT_C1_PSRM: u8 = 0x02;
-/// BT-C1 — `Clock_Offset` = 0x0000. Bit 15 is the "offset valid" flag and it is CLEAR here: no
-/// inquiry has been run, so no offset is known, and declaring an invalid one valid would send the
-/// controller paging at the wrong clock phase.
+/// BT-C1 — the largest LEGAL `Page_Scan_Repetition_Mode`: **R2 (0x02)**. 0x03..0xFF are Reserved for
+/// Future Use in both `Create_Connection` (Vol 4 Part E §7.1.5) and `Inquiry Result` (§7.7.2).
+///
+/// REVIEW FIX, AND IT IS A RANGE CHECK ON RADIO-SUPPLIED BYTES. The harvested mode is one octet
+/// lifted straight out of an inquiry response — i.e. out of the air, from a packet nothing
+/// authenticated. An inquiry response is not attributable: any device may answer with any BD_ADDR,
+/// including the target's, and it chooses the psrm byte it reports. Passing an out-of-range value
+/// through to `Create_Connection` costs the whole stage: the controller rejects the command with
+/// Command Status 0x12 (Invalid HCI Command Parameters) and NO PAGE IS TRANSMITTED AT ALL, on both
+/// attempts — the arc's own payload path turned into a boot that pages nothing, over one bad byte.
+/// So a mode outside this range is refused and `BT_C1_PSRM` is paged instead. The response is still
+/// a harvest — the clock offset is independent and is kept — and the witness says on its own line
+/// that the mode specifically was rejected, because "harvested" and "harvested except the part that
+/// was garbage" are different claims.
+#[cfg(feature = "btc")]
+const BT_C1_PSRM_MAX: u8 = 0x02;
+/// BT-C1 — the FALLBACK `Clock_Offset` = 0x0000, used only when the inquiry did not hear the
+/// target. Bit 15 is the "offset valid" flag and it is CLEAR here: with no inquiry response there
+/// is no offset to declare, and declaring an invalid one valid would send the controller paging at
+/// the wrong clock phase. When the inquiry DOES answer, the page sends the harvested offset with
+/// `BT_C1_CLOCK_OFFSET_VALID` set — see `bt_c1_inquiry`.
 #[cfg(feature = "btc")]
 const BT_C1_CLOCK_OFFSET: u16 = 0x0000;
+/// BT-C1 — bit 15 of `Create_Connection`'s `Clock_Offset`: **Clock_Offset_Valid_Flag** (Vol 4
+/// Part E §7.1.5). An `Inquiry Result` reports the offset with this bit CLEAR — the field there is
+/// data, not a flag — so a harvested offset must have it SET before it is paged with, or the
+/// controller ignores the offset entirely and pages as if none were known. Getting this wrong is
+/// indistinguishable in a capture from having no offset at all, which is why it is a named
+/// constant rather than an inline `| 0x8000`.
+#[cfg(feature = "btc")]
+const BT_C1_CLOCK_OFFSET_VALID: u16 = 0x8000;
 /// BT-C1 — `Allow_Role_Switch` = 0x01: the peer MAY become master of this link. Peripherals that
 /// expect to run their own piconet (speakers commonly do, so they can hold several sources) refuse
 /// or drop links they are not allowed to take over, so refusing the switch is a way to fail a page
@@ -1494,6 +1552,123 @@ const BT_C1_LINK_TYPE_ACL: u8 = 0x01;
 /// and a cancel, on runs where the controller was working correctly.
 #[cfg(feature = "btc")]
 const BT_C1_CONN_MS: u64 = 5600;
+
+// ---------------------------------------------------------------------------------------------
+// BT-C1/INQUIRY — the step Boot D proved was missing.
+//
+// BOOT D IS THE GROUND FACT THIS EXISTS FOR. Peter confirmed the MEGABOOM was in PAIRING MODE for
+// the whole of that boot, and both page trains still ended `Connection Complete status=0x04`
+// (PAGE TIMEOUT) at [8940ms] and [14064ms]. Two full 5.12 s trains at a device that was
+// demonstrably listening is not a fact about the speaker; it is a fact about the page.
+//
+// WHAT THE PAGE WAS MISSING. `HCI_Create_Connection` carries two fields whose only legitimate
+// source is an inquiry:
+//   * `Page_Scan_Repetition_Mode` — how often the peer opens a page-scan window. Guessed R2.
+//   * `Clock_Offset` — the peer's native clock phase relative to ours, which is what lets the
+//     controller start its page train ON the peer's hop sequence instead of sweeping for it.
+//     Guessed 0x0000 with the valid flag CLEAR, i.e. "I know nothing".
+// With both unknown the controller must build the longest, least-aligned train the spec allows
+// and hope it overlaps a scan window. That is exactly the shape of a page that times out against
+// a listening device.
+//
+// WHY INQUIRY IS THE RIGHT INSTRUMENT AND NOT A LONGER PAGE. A device in pairing mode is
+// INQUIRY-scanning as well as page-scanning — that is what pairing mode IS — and inquiry scan is
+// the mode a discoverable device services most eagerly. An inquiry is also the only transmission
+// here that asks a question of the WHOLE ROOM rather than of one address, so a boot where the
+// inquiry hears nothing at all and a boot where it hears six devices but not this one are two
+// different findings, and the old capture could not tell them apart.
+//
+// AND IT IS A CROSS-CHECK ON THE ADDRESS ITSELF. `BT_L3_PEER_ADDR_BYTES` was read off an LE
+// advertisement. An LE address and a BR/EDR address need not be the same address, and a great
+// many dual-mode devices publish two that differ. An inquiry answers on CLASSIC, so its result
+// list is the first evidence this project has ever gathered about which BD_ADDR the speaker
+// actually pages under. `bt_c1_inquiry` therefore prints EVERY response, and flags any that
+// shares the target's three-byte OUI without matching it in full.
+//
+// WHAT IT COSTS: `BT_C1_INQUIRY_LEN` x 1.28 s of air time, paid once, only on a boot that set
+// `UNAOS_BTC=1`, and it is spent BEFORE the page rather than on top of it — a page that now
+// starts aligned is the thing it buys.
+// ---------------------------------------------------------------------------------------------
+
+/// BT-C1 — `HCI_Inquiry`: OGF 0x01 (Link Control) / OCF 0x0001 => opcode 0x0401. Five parameter
+/// bytes: LAP(3) Inquiry_Length(1) Num_Responses(1). Answers with a **Command Status**; the real
+/// results are `Inquiry Result` events, terminated by `Inquiry Complete` (0x01). Vol 4 Part E
+/// §7.1.1.
+#[cfg(feature = "btc")]
+const BT_HCI_INQUIRY: u16 = 0x0401;
+/// BT-C1 — `HCI_Inquiry_Cancel`: OGF 0x01 / OCF 0x0002 => opcode 0x0402. No parameters; returns
+/// status(1) in a Command Complete. Vol 4 Part E §7.1.2.
+///
+/// IT IS MANDATORY, not tidiness. A controller in the Inquiry state answers `Create_Connection`
+/// with Command Status 0x0C (Command Disallowed) — so an inquiry this stage cut short without
+/// cancelling would make the page that follows fail for a reason that has nothing to do with the
+/// air, and the capture would read it as the speaker's fault. The cancel runs on every path where
+/// `Inquiry Complete` was not read, including the paths where the event endpoint went unreadable
+/// (it rides EP0, which a halt does not touch).
+#[cfg(feature = "btc")]
+const BT_HCI_INQUIRY_CANCEL: u16 = 0x0402;
+/// BT-C1 — the **GIAC**, General Inquiry Access Code, LAP 0x9E8B33, written LSB-first on the wire
+/// (Bluetooth Assigned Numbers, "Inquiry Access Codes"). This is the LAP every discoverable device
+/// inquiry-scans for. The LIAC (0x9E8B00) is the limited-discovery variant and is deliberately NOT
+/// used: a speaker sitting in pairing mode is generally discoverable, not limited-discoverable,
+/// and inquiring on the LIAC would produce a silence that means nothing.
+#[cfg(feature = "btc")]
+const BT_C1_INQUIRY_LAP: [u8; 3] = [0x33, 0x8B, 0x9E];
+/// BT-C1 — `Inquiry_Length` = **4**, in units of 1.28 s => **5.12 s** of inquiry (Vol 4 Part E
+/// §7.1.1; range 0x01..0x30).
+///
+/// THE FLOOR IS SET BY THE PEER, NOT BY US. A BR/EDR device inquiry-scans on an interval commonly
+/// as long as 2.56 s, and the inquiring side hops a 32-frequency train that must overlap one of
+/// those windows; the conventional figure for a reliable single-device discovery is ~10.24 s
+/// (0x08) and for a "is it there at all" probe ~5.12 s. Four units is the shorter of those, chosen
+/// because this stage EXITS EARLY the instant the target answers (see `bt_c1_inquiry`) — the full
+/// 5.12 s is paid only on a boot that does not hear it, which is precisely the boot where the
+/// listening time has to be defensible.
+#[cfg(feature = "btc")]
+const BT_C1_INQUIRY_LEN: u8 = 0x04;
+/// BT-C1 — `Num_Responses` = **0x00 = unlimited**. Capping it would end the inquiry at the first
+/// device to answer, and the first device to answer is very unlikely to be the target: the whole
+/// diagnostic value of this stage is the FULL list of what is on the air on classic. The stage's
+/// own early exit on the target is what bounds it in the good case, and `BT_C1_INQUIRY_MS` bounds
+/// it in every other.
+#[cfg(feature = "btc")]
+const BT_C1_INQUIRY_MAX_RESP: u8 = 0x00;
+/// BT-C1 — bounded host window, in ms, for the inquiry to end. Sized to sit just past
+/// `BT_C1_INQUIRY_LEN` x 1280 ms (5120 ms => 5600 ms here), for the same reason `BT_C1_CONN_MS`
+/// sits past the page timeout: the controller sends `Inquiry Complete` of its own accord when the
+/// inquiry length expires, and a window that closed FIRST would report "no answer" on a boot where
+/// the controller was about to say exactly what it heard. THE TWO MOVE TOGETHER.
+#[cfg(feature = "btc")]
+const BT_C1_INQUIRY_MS: u64 = 5600;
+/// BT-C1 — HCI event code 0x01 = `Inquiry Complete`. One parameter, Status(1) => 3 bytes on the
+/// wire. Enabled by bit 0 of the event mask L1 already wrote.
+#[cfg(feature = "btc")]
+const BT_EVT_INQUIRY_COMPLETE: u8 = 0x01;
+/// BT-C1 — HCI event code 0x02 = `Inquiry Result`. Num_Responses(1) then N x 14 bytes:
+/// BD_ADDR(6) Page_Scan_Repetition_Mode(1) Reserved(2) Class_Of_Device(3) Clock_Offset(2).
+#[cfg(feature = "btc")]
+const BT_EVT_INQUIRY_RESULT: u8 = 0x02;
+/// BT-C1 — HCI event code 0x22 = `Inquiry Result with RSSI`. Num_Responses(1) then N x 14 bytes:
+/// BD_ADDR(6) Page_Scan_Repetition_Mode(1) Reserved(1) Class_Of_Device(3) Clock_Offset(2) RSSI(1).
+/// The stride is 14 in both shapes; what moves is the Clock_Offset, which sits one byte EARLIER
+/// here because the Reserved field lost a byte to the RSSI. Decoding one shape with the other's
+/// offsets yields a plausible-looking wrong clock phase, which is the worst kind of wrong, so the
+/// two are decoded separately and the witness names which arrived.
+#[cfg(feature = "btc")]
+const BT_EVT_INQUIRY_RESULT_RSSI: u8 = 0x22;
+/// BT-C1 — HCI event code 0x2F = `Extended Inquiry Result`. Always exactly ONE response; the
+/// fixed part has the same layout as `Inquiry Result with RSSI` and is followed by 240 bytes of
+/// EIR data, which this stage does not decode (the name walk is BT-L2's job and it does it on LE).
+/// Note that the reset event mask does not enable this event, so it is decoded defensively rather
+/// than expected.
+#[cfg(feature = "btc")]
+const BT_EVT_EXT_INQUIRY_RESULT: u8 = 0x2F;
+/// BT-C1 — how many inquiry responses may be PRINTED. Every response is decoded and counted; this
+/// caps only the transcript, because printing is wall clock spent inside a window that is also
+/// listening. A response matching the target, or sharing its OUI, is printed whatever the cap —
+/// the two findings this stage exists to surface can never be hidden by it.
+#[cfg(feature = "btc")]
+const BT_C1_INQ_PRINT_MAX: u32 = 8;
 
 // ================================ BT-C2 ==================================================
 //
@@ -2009,6 +2184,16 @@ enum BtL3Want {
     LeMeta(u8),
     /// Any event with this event code.
     Evt(u8),
+    /// BT-C1 — the inquiry is OVER, by either of the two things that can end it: an
+    /// `Inquiry Complete` (0x01) from the controller, or the target answering.
+    ///
+    /// IT IS ONE `want` AND NOT TWO WAITS because the two outcomes are mutually exclusive in time
+    /// and a wait that asked for only one of them would run its whole window out on the other.
+    /// Uniquely among the variants it consults `BtL3State`: the inquiry harvest runs on every
+    /// response BEFORE the match is computed, so `st.inq_found` is already true on the very packet
+    /// that carried the target and the wait returns on it rather than one event later.
+    #[cfg(feature = "btc")]
+    InquiryEnd,
 }
 
 /// BT-L3 — outcome of one bounded `bt_l3_await`.
@@ -2074,6 +2259,198 @@ struct BtL3State {
     /// rest of the boot, with a tally line saying nothing is outstanding.
     #[cfg(feature = "btc")]
     classic_handle: Option<u16>,
+    /// BT-C1/INQUIRY — the target answered an inquiry, and `inq_psrm`/`inq_clock_offset` are its
+    /// OWN values rather than this arc's guesses. This is the flag the page reads to decide
+    /// whether it is paging blind.
+    #[cfg(feature = "btc")]
+    inq_found: bool,
+    /// BT-C1/INQUIRY — the target's `Page_Scan_Repetition_Mode` AS REPORTED, valid only when
+    /// `inq_found`. Stored raw so the witness can print what the air actually said; whether it is
+    /// legal to PAGE with is `inq_psrm_ok`.
+    #[cfg(feature = "btc")]
+    inq_psrm: u8,
+    /// BT-C1/INQUIRY — the reported `Page_Scan_Repetition_Mode` was within `BT_C1_PSRM_MAX`, so the
+    /// page may carry it. REVIEW FIX: false with `inq_found` true is the real case this separates —
+    /// the target answered, its clock offset is good, and its mode byte was out of range and is
+    /// replaced by `BT_C1_PSRM`. See `BT_C1_PSRM_MAX` for what passing it through would have cost.
+    #[cfg(feature = "btc")]
+    inq_psrm_ok: bool,
+    /// BT-C1/INQUIRY — the target's `Clock_Offset` AS REPORTED, i.e. with bit 15 clear. The page
+    /// sets `BT_C1_CLOCK_OFFSET_VALID` on it; storing the raw value keeps the witness able to
+    /// print what the air actually said.
+    #[cfg(feature = "btc")]
+    inq_clock_offset: u16,
+    /// BT-C1/INQUIRY — total responses decoded across every inquiry-result event of the run. This
+    /// is what separates "the room is silent on classic" from "the room is busy and the target is
+    /// not in it", which the pre-inquiry capture could not distinguish at all.
+    #[cfg(feature = "btc")]
+    inq_responses: u32,
+    /// BT-C1/INQUIRY — a device answered whose first three address bytes are the target's OUI but
+    /// whose full address is not the target's. On a dual-mode device that is the classic signature
+    /// of a BR/EDR address adjacent to the LE address this host harvested, and it is the single
+    /// most useful thing this stage can find short of the target itself.
+    #[cfg(feature = "btc")]
+    inq_oui_seen: bool,
+    /// BT-C1/INQUIRY — an `Inquiry Complete` was seen, so the controller has LEFT the Inquiry
+    /// state and no `Inquiry_Cancel` is owed. False means the cancel must run.
+    #[cfg(feature = "btc")]
+    inq_complete: bool,
+    /// BT-C1/INQUIRY — how many responses have been printed, against `BT_C1_INQ_PRINT_MAX`.
+    #[cfg(feature = "btc")]
+    inq_printed: u32,
+}
+
+/// BT-C1/INQUIRY — decode ONE event, and if it is an inquiry result, harvest every response in it.
+///
+/// It is a free function rather than a method because it is called from inside `bt_l3_await`'s
+/// read loop, where `self` is already borrowed for the read; `idx` is the only thing it wants from
+/// the controller, and it wants it purely to label the lines.
+///
+/// THREE EVENT SHAPES, DECODED SEPARATELY BECAUSE THEY DISAGREE ABOUT WHERE THE CLOCK OFFSET IS.
+/// `Inquiry Result` (0x02) spends two bytes on Reserved and none on RSSI; `Inquiry Result with
+/// RSSI` (0x22) and the fixed part of `Extended Inquiry Result` (0x2F) spend one on each. The
+/// per-response stride is 14 in all three, so a decoder that got the shape wrong would still walk
+/// the list correctly and read a WRONG CLOCK OFFSET off every entry — a page built on that offset
+/// starts at the wrong clock phase and times out exactly like a page with no offset at all. There
+/// is no way to catch that from a capture afterwards, so the offsets are written out per shape.
+///
+/// WHAT IT REFUSES TO DO: it never partially decodes. A response whose 14 bytes do not all lie
+/// inside the event is not read at all, and `blind` is set — an inquiry that could not be fully
+/// walked must not be citable as "the target was not there".
+///
+/// EVERY BYTE HERE CAME OFF THE AIR AND NOTHING AUTHENTICATED IT. An inquiry response is not
+/// attributable to the device it names: any radio in range may answer with any BD_ADDR, including
+/// the target's, and it chooses the mode, class and offset it reports. Two consequences are handled
+/// rather than assumed. The LENGTHS are never trusted — `Num_Responses` is a claim, and each
+/// 14-byte record is bounds-checked against the event's own `Parameter_Total_Length` before it is
+/// read, so a lying count truncates the walk instead of running off the buffer. The VALUES are
+/// range-checked where the spec gives a range: see `BT_C1_PSRM_MAX`, which is the one field whose
+/// out-of-range value would have cost the whole stage.
+#[cfg(feature = "btc")]
+fn bt_c1_inquiry_harvest(idx: usize, pkt: &[u8], st: &mut BtL3State) {
+    if pkt.is_empty() {
+        return;
+    }
+    // `Inquiry Complete` is what says the controller has LEFT the Inquiry state. Latched here and
+    // nowhere else, because this is the only place every event of the run passes through, and the
+    // cancel decision downstream is a decision about controller state rather than about the air.
+    if pkt[0] == BT_EVT_INQUIRY_COMPLETE {
+        st.inq_complete = true;
+        return;
+    }
+    let rssi = match pkt[0] {
+        BT_EVT_INQUIRY_RESULT => false,
+        BT_EVT_INQUIRY_RESULT_RSSI | BT_EVT_EXT_INQUIRY_RESULT => true,
+        _ => return,
+    };
+    if pkt.len() < 3 {
+        st.blind = true;
+        return;
+    }
+    // An Extended Inquiry Result carries exactly one response by definition (Vol 4 Part E §7.7.38)
+    // whatever its Num_Responses field claims; trusting the field there would walk 240 bytes of
+    // EIR data as if they were further responses.
+    let n = if pkt[0] == BT_EVT_EXT_INQUIRY_RESULT {
+        1
+    } else {
+        pkt[2] as usize
+    };
+    for i in 0..n {
+        let off = 3 + i * 14;
+        if off + 14 > pkt.len() {
+            // The event declared more responses than it carried. Nothing partial is read, and the
+            // run can no longer claim to have seen the whole list.
+            st.blind = true;
+            serial_println!(
+                ":: bt-c1: [{}] inquiry result declares {} response(s) and carries {} — response {} does not fit. It is NOT decoded, and this inquiry can no longer be cited as a complete list of the room == witness ::",
+                idx, n, pkt.len().saturating_sub(3) / 14, i + 1
+            );
+            return;
+        }
+        let r = &pkt[off..off + 14];
+        let addr = [r[0], r[1], r[2], r[3], r[4], r[5]];
+        let psrm = r[6];
+        // THE ONE FIELD THE SHAPES DISAGREE ABOUT — see the docblock.
+        let (cod, clk, rssi_db) = if rssi {
+            (
+                [r[8], r[9], r[10]],
+                (r[11] as u16) | ((r[12] as u16) << 8),
+                Some(r[13] as i8),
+            )
+        } else {
+            (
+                [r[9], r[10], r[11]],
+                (r[12] as u16) | ((r[13] as u16) << 8),
+                None,
+            )
+        };
+        st.inq_responses += 1;
+        let ours = bt_addr_eq(&addr, &BT_L3_PEER_ADDR_BYTES);
+        // The OUI is the top three bytes of the MSB-first rendering, which is the LAST three of
+        // the wire order. A device sharing it is from the same vendor, and on a dual-mode part is
+        // very commonly the SAME PHYSICAL DEVICE under its other address.
+        let same_oui = !ours
+            && addr[3] == BT_L3_PEER_ADDR_BYTES[3]
+            && addr[4] == BT_L3_PEER_ADDR_BYTES[4]
+            && addr[5] == BT_L3_PEER_ADDR_BYTES[5];
+        if ours && !st.inq_found {
+            st.inq_found = true;
+            st.inq_psrm = psrm;
+            // REVIEW FIX — the mode is checked against the spec's range HERE, at the point it comes
+            // off the air, and the raw byte is kept for the transcript either way. The clock offset
+            // needs no equivalent check: every one of its 15 value bits is legal, and bit 15 is the
+            // valid flag this host sets itself.
+            st.inq_psrm_ok = psrm <= BT_C1_PSRM_MAX;
+            st.inq_clock_offset = clk;
+        }
+        if same_oui {
+            st.inq_oui_seen = true;
+        }
+        // The transcript cap never hides the two findings this stage exists for.
+        if st.inq_printed >= BT_C1_INQ_PRINT_MAX && !ours && !same_oui {
+            continue;
+        }
+        st.inq_printed += 1;
+        let text = bt_addr_render_msb(&addr);
+        // The line is emitted in three pieces because the RSSI is OPTIONAL and this kernel has no
+        // float formatting: an `Inquiry Result` (0x02) carries no RSSI at all, and printing a
+        // placeholder for it would put a number in the capture that the air never supplied.
+        serial_print!(
+            ":: bt-c1: [{}] inquiry result — addr={} psrm={:#04x}({}) clock_offset={:#06x} class_of_device={:02x}{:02x}{:02x}",
+            idx,
+            core::str::from_utf8(&text).unwrap_or("??:??:??:??:??:??"),
+            psrm,
+            match psrm {
+                0x00 => "R0",
+                0x01 => "R1",
+                0x02 => "R2",
+                _ => "RESERVED",
+            },
+            clk,
+            cod[2],
+            cod[1],
+            cod[0]
+        );
+        if let Some(d) = rssi_db {
+            if d < 0 {
+                serial_print!(" rssi=-{}dBm", -(d as i32) as u32);
+            } else {
+                serial_print!(" rssi={}dBm", d as u32);
+            }
+        }
+        serial_println!(
+            " event={:#04x}({}) -> {} == witness ::",
+            pkt[0],
+            if rssi { "with RSSI" } else { "standard" },
+            if ours {
+                "THIS IS THE TARGET. Its Page_Scan_Repetition_Mode and Clock_Offset are harvested and the page below carries them, so the page is no longer built on guesses"
+            } else if same_oui {
+                "SAME VENDOR OUI AS THE TARGET, DIFFERENT ADDRESS. The target address was read off an LE advertisement, and a dual-mode device need not page under the address it advertises — this is the shape that would produce. It is NOT paged (the address rule is Peter's, and this arc does not widen it); it is reported so the next arc has the evidence"
+            } else {
+                "not the target; counted, and reported because a busy room and a silent one are different findings"
+            }
+        );
+    }
 }
 
 pub static EHCI_HID: Mutex<Option<Vec<Controller>>> = Mutex::new(None);
@@ -4486,7 +4863,7 @@ impl Controller {
         // before the chain reads the first event.
         self.bt_resync_device_toggles(&radio, true);
         serial_println!(
-            ":: bt-retry: [{}] src={} FIRING — re-running the boot bring-up chain against the radio claimed at boot (addr={}); this is one MORE bounded chain, not a background storm, and its cost is the bt-l2/bt-c1 windows below == witness ::",
+            ":: bt-retry: [{}] src={} FIRING — re-running the boot bring-up chain against the radio claimed at boot (addr={}); this is one MORE bounded chain, not a background storm, and its cost is the bt-l2/bt-c1 windows below (under btc that now includes the INQUIRY, which is the point of a re-trigger: a speaker put into pairing mode after boot is inquiry-scanning NOW, and this chain is what asks) == witness ::",
             self.idx, source, radio.target.addr
         );
         self.bt_bringup_wire(&radio.target, radio.intf, &e);
@@ -5030,7 +5407,17 @@ impl Controller {
             if el >= budget_cy {
                 return BtL3Await::Timeout;
             }
-            if here >= BT_L3_EVT_MAX {
+            // REVIEW FIX — the cap is per-`want`, because the inquiry window's payload IS the
+            // events it walks past. See `BT_C1_INQUIRY_EVT_MAX`. Under `bt` without `btc` the
+            // variant does not exist and this is `BT_L3_EVT_MAX` exactly, as before.
+            #[cfg(feature = "btc")]
+            let evt_cap = match want {
+                BtL3Want::InquiryEnd => BT_C1_INQUIRY_EVT_MAX,
+                _ => BT_L3_EVT_MAX,
+            };
+            #[cfg(not(feature = "btc"))]
+            let evt_cap = BT_L3_EVT_MAX;
+            if here >= evt_cap {
                 // The structural cap ended the wait while events were still arriving. The window
                 // was NOT read to term, so the absence of a latch below proves nothing.
                 st.blind = true;
@@ -5080,6 +5467,14 @@ impl Controller {
                 continue; // zero-length packet: not an event
             }
             let pkt = &asm[..len];
+            // ---- BT-C1/INQUIRY: THE HARVEST, AND IT RUNS BEFORE THE MATCH ---------------------
+            // Deliberately ahead of `hit`: `BtL3Want::InquiryEnd` is satisfied BY the harvest
+            // finding the target, so the harvest has to have run on this packet before the match
+            // is computed. Every other `want` is unaffected — the function returns the same event
+            // it always did, and an inquiry-result event walked past by some other wait is now
+            // decoded instead of discarded, which is strictly more information for the same reads.
+            #[cfg(feature = "btc")]
+            bt_c1_inquiry_harvest(self.idx, pkt, st);
             // Command Status: EventCode(1)=0x0F Param_Total_Length(1)=4 Status(1)
             //   Num_HCI_Command_Packets(1) Command_Opcode(2, LE)  => opcode at [4..6].
             // Command Complete: EventCode(1)=0x0E Param_Total_Length(1)
@@ -5097,6 +5492,11 @@ impl Controller {
                 }
                 BtL3Want::LeMeta(sub) => pkt[0] == BT_EVT_LE_META && len >= 3 && pkt[2] == sub,
                 BtL3Want::Evt(code) => pkt[0] == code,
+                // The inquiry is over when the controller says so, or when the thing the inquiry
+                // was FOR has answered. `st.inq_found` was set by the harvest above, on this very
+                // packet if this is the one that carried the target.
+                #[cfg(feature = "btc")]
+                BtL3Want::InquiryEnd => pkt[0] == BT_EVT_INQUIRY_COMPLETE || st.inq_found,
             };
             if hit {
                 return BtL3Await::Got(len);
@@ -6288,6 +6688,272 @@ impl Controller {
 
     // ================================ BT-C1 ==================================================
 
+    /// BT-C1/INQUIRY — ASK THE ROOM, so the page that follows is aimed rather than swept.
+    ///
+    /// Returns `(page_scan_repetition_mode, clock_offset_field, harvested)`. On `harvested == true`
+    /// both values are the TARGET'S OWN, read off its inquiry response, and the clock offset
+    /// already carries `BT_C1_CLOCK_OFFSET_VALID`. On `false` they are `BT_C1_PSRM` and
+    /// `BT_C1_CLOCK_OFFSET` — the same guesses Boot D paged on — and the page still goes out,
+    /// because a page that was never tried proves nothing about the air.
+    ///
+    /// THE STAGE ALWAYS LEAVES THE CONTROLLER OUT OF THE INQUIRY STATE. That is the one invariant
+    /// here and it is not cosmetic: a controller still inquiring answers `HCI_Create_Connection`
+    /// with Command Status 0x0C (Command Disallowed), so an inquiry left running would make the
+    /// page below fail for a local-side reason that a capture would read as the speaker's fault.
+    /// `Inquiry Complete` leaves it; so does an accepted `HCI_Inquiry_Cancel`; and on the paths
+    /// where neither can be confirmed the stage says so on its own line rather than assuming.
+    #[cfg(feature = "btc")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_c1_inquiry(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+        st: &mut BtL3State,
+        seen: &mut u32,
+        asm: &mut [u8],
+    ) -> (u8, u16, bool) {
+        let fallback = (BT_C1_PSRM, BT_C1_CLOCK_OFFSET, false);
+        let params = [
+            BT_C1_INQUIRY_LAP[0],
+            BT_C1_INQUIRY_LAP[1],
+            BT_C1_INQUIRY_LAP[2],
+            BT_C1_INQUIRY_LEN,
+            BT_C1_INQUIRY_MAX_RESP,
+        ];
+        serial_println!(
+            ":: bt-c1: [{}] inquiry parameters — lap=0x9E8B33(GIAC, the LAP every discoverable device inquiry-scans for) inquiry_length={:#04x}(={}ms) num_responses={:#04x}(unlimited) host_window={}ms; the target is {}, and a device in PAIRING MODE is inquiry-scanning as well as page-scanning, which is why this runs BEFORE the page and not instead of it == witness ::",
+            self.idx, BT_C1_INQUIRY_LEN, BT_C1_INQUIRY_LEN as u32 * 1280,
+            BT_C1_INQUIRY_MAX_RESP, BT_C1_INQUIRY_MS,
+            core::str::from_utf8(&bt_addr_render_msb(&BT_L3_PEER_ADDR_BYTES))
+                .unwrap_or("??:??:??:??:??:??")
+        );
+        if !self.bt_hci_send(t, intf, BT_HCI_INQUIRY, &params) {
+            serial_println!(
+                ":: bt-c1: [{}] HCI_Inquiry (0x0401) NOT SENT — the EP0 control-OUT failed (its own line is above). No inquiry is running and no cancel is owed; the page below falls back to psrm={:#04x}(R2) clock_offset={:#06x}(NOT valid) and is a WEAKER experiment for it == witness ::",
+                self.idx, BT_C1_PSRM, BT_C1_CLOCK_OFFSET
+            );
+            return fallback;
+        }
+        // FROM THIS INSTANT the controller may be inquiring — the same "may" `outstanding` carries
+        // for the page, and it is what decides whether a cancel is owed on every path below.
+        let mut inquiring = true;
+        match self.bt_l3_await(
+            e,
+            toggle,
+            armed,
+            BtL3Want::CmdStatus(BT_HCI_INQUIRY),
+            Self::bt_l3_budget(BT_L3_CMD_MS),
+            seen,
+            st,
+            asm,
+        ) {
+            BtL3Await::Got(len) if len >= 3 => {
+                let s = asm[2];
+                if s == 0x00 {
+                    serial_println!(
+                        ":: bt-c1: [{}] HCI_Inquiry (0x0401) -> CommandStatus status={:#04x} -> ACCEPTED, the controller is now INQUIRING == witness ::",
+                        self.idx, s
+                    );
+                } else {
+                    inquiring = false;
+                    serial_println!(
+                        ":: bt-c1: [{}] HCI_Inquiry (0x0401) -> CommandStatus status={:#04x} -> REFUSED{} — the controller did NOT enter the Inquiry state, so no cancel is owed and no results can arrive. The page below falls back to psrm={:#04x}(R2) clock_offset={:#06x}(NOT valid) == witness ::",
+                        self.idx, s,
+                        match s {
+                            0x01 => " (UNKNOWN-CMD: this controller's ROM has no Inquiry — that would be a firmware boundary, not an air fact)",
+                            0x0C => " (COMMAND DISALLOWED: the controller is already in a state that forbids inquiry)",
+                            _ => "",
+                        },
+                        BT_C1_PSRM, BT_C1_CLOCK_OFFSET
+                    );
+                }
+            }
+            BtL3Await::Got(len) => {
+                st.blind = true;
+                serial_println!(
+                    ":: bt-c1: [{}] HCI_Inquiry (0x0401) -> CommandStatus SHORT-EVENT ({} bytes, 6 required) -> MALFORMED. The controller is treated as INQUIRING and the cancel below runs == witness ::",
+                    self.idx, len
+                );
+            }
+            BtL3Await::Timeout => serial_println!(
+                ":: bt-c1: [{}] HCI_Inquiry (0x0401) -> NO CommandStatus within {}ms — the command went out on EP0 and the controller MAY be inquiring, so it is treated as INQUIRING and the cancel below runs == witness ::",
+                self.idx, BT_L3_CMD_MS
+            ),
+            BtL3Await::Stop => serial_println!(
+                ":: bt-c1: [{}] HCI_Inquiry (0x0401) -> event endpoint became UNREADABLE before any CommandStatus. The controller is treated as INQUIRING; the cancel below is SENT on EP0 (which the halt did not touch) and its reply is not read == witness ::",
+                self.idx
+            ),
+        }
+
+        // ---- the listening window ---------------------------------------------------------------
+        // ONE wait, not a loop: `BtL3Want::InquiryEnd` is satisfied by whichever of the two endings
+        // comes first, and every response that goes past on the way is decoded and printed by the
+        // harvest inside `bt_l3_await`. A `Timeout` here means neither ending arrived inside a
+        // window that is LONGER than the inquiry length written above — which, exactly as on the
+        // page path, is a statement about this controller and not about the room.
+        // REVIEW FIX — the target may already have been harvested by a response the CommandStatus
+        // wait above walked past (that wait returns on the first Command Status and decodes
+        // everything else on the way, and on its Timeout/short-event paths it decodes a whole
+        // window of them). `InquiryEnd` is satisfied by `st.inq_found`, but only ON AN EVENT — with
+        // nothing further on the wire this window would sit out its full `BT_C1_INQUIRY_MS` for an
+        // answer it already has. The early exit is the point of the stage, so take it here too.
+        if inquiring && st.inq_found {
+            serial_println!(
+                ":: bt-c1: [{}] inquiry ENDED EARLY — the target was already harvested before the listening window opened (its response arrived while the CommandStatus above was outstanding), so no listening time is spent at all. The controller is still INQUIRING and the cancel below is what leaves that state == witness ::",
+                self.idx
+            );
+        } else if inquiring {
+            match self.bt_l3_await(
+                e,
+                toggle,
+                armed,
+                BtL3Want::InquiryEnd,
+                Self::bt_l3_budget(BT_C1_INQUIRY_MS),
+                seen,
+                st,
+                asm,
+            ) {
+                BtL3Await::Got(_) => {
+                    if st.inq_found {
+                        serial_println!(
+                            ":: bt-c1: [{}] inquiry ENDED EARLY — the target answered, so the remaining listening time is not spent. The controller is still INQUIRING and the cancel below is what leaves that state == witness ::",
+                            self.idx
+                        );
+                    } else {
+                        serial_println!(
+                            ":: bt-c1: [{}] Inquiry Complete (0x01) status={:#04x} — the controller ran the full {}ms and has LEFT the Inquiry state of its own accord; no cancel is owed == witness ::",
+                            self.idx,
+                            if asm.len() > 2 { asm[2] } else { 0xFF },
+                            BT_C1_INQUIRY_LEN as u32 * 1280
+                        );
+                    }
+                }
+                BtL3Await::Timeout => serial_println!(
+                    ":: bt-c1: [{}] NO Inquiry Complete — window_nominal={}ms tsc_calibrated={} inquiry_length={}ms. {} The controller is treated as INQUIRING and the cancel below runs == witness ::",
+                    self.idx, BT_C1_INQUIRY_MS,
+                    crate::arch::x86_64::apic::tsc_hz() != 0,
+                    BT_C1_INQUIRY_LEN as u32 * 1280,
+                    if crate::arch::x86_64::apic::tsc_hz() != 0 {
+                        "The window that ran is LONGER than the inquiry length, so the controller should have ended the inquiry of its own accord and did not — that is an indictment of the controller, not of the room."
+                    } else {
+                        "THE TSC IS UNCALIBRATED, so this window was a fixed cycle-count fallback (~0.27s at 2.3GHz), NOT the nominal ms above and far SHORTER than the inquiry length. NOTHING is indicted here and NOTHING about the room is established: the controller was very probably still inquiring when this window closed."
+                    }
+                ),
+                BtL3Await::Stop => serial_println!(
+                    ":: bt-c1: [{}] event endpoint became UNREADABLE while awaiting Inquiry Complete — no result list was read to term, so this inquiry establishes NOTHING about the room. The cancel is SENT UNREAD below == witness ::",
+                    self.idx
+                ),
+            }
+        }
+
+        // ---- leave the Inquiry state, always -----------------------------------------------------
+        if inquiring && !st.inq_complete {
+            if !self.bt_hci_send(t, intf, BT_HCI_INQUIRY_CANCEL, &[]) {
+                serial_println!(
+                    ":: bt-c1: [{}] HCI_Inquiry_Cancel (0x0402) NOT SENT — the EP0 control-OUT failed (its own line is above). THE CONTROLLER MAY STILL BE INQUIRING, and a page issued into that state is answered CommandStatus 0x0C (Command Disallowed) by the controller itself. If the page below reports 0x0C, read it HERE and not as an air fact == witness ::",
+                    self.idx
+                );
+            } else {
+                match self.bt_l3_await(
+                    e,
+                    toggle,
+                    armed,
+                    BtL3Want::CmdComplete(BT_HCI_INQUIRY_CANCEL),
+                    Self::bt_l3_budget(BT_L3_CMD_MS),
+                    seen,
+                    st,
+                    asm,
+                ) {
+                    BtL3Await::Got(len) if len >= 6 => serial_println!(
+                        ":: bt-c1: [{}] HCI_Inquiry_Cancel (0x0402) -> CmdComplete status={:#04x} -> {} == witness ::",
+                        self.idx, asm[5],
+                        match asm[5] {
+                            0x00 => "WITHDRAWN — the controller has left the Inquiry state and the page below may proceed",
+                            // 0x0C here means the controller was NOT inquiring, which is the state
+                            // the cancel wanted anyway. It is not a failure and must not read as one.
+                            0x0C => "COMMAND DISALLOWED — the controller was NOT in the Inquiry state, which is the state this cancel wanted. Nothing is outstanding",
+                            _ => "NONZERO — the withdrawal is not confirmed; if the page below reports CommandStatus 0x0C, this line is why",
+                        }
+                    ),
+                    BtL3Await::Got(len) => {
+                        st.blind = true;
+                        serial_println!(
+                            ":: bt-c1: [{}] HCI_Inquiry_Cancel (0x0402) -> CmdComplete SHORT-EVENT ({} bytes, 6 required) -> MALFORMED; the Inquiry state is NOT confirmed left == witness ::",
+                            self.idx, len
+                        );
+                    }
+                    BtL3Await::Timeout => serial_println!(
+                        ":: bt-c1: [{}] HCI_Inquiry_Cancel (0x0402) SENT but NO CmdComplete within {}ms. The EP0 write, which is what withdraws the inquiry, was made; what is missing is the confirmation == witness ::",
+                        self.idx, BT_L3_CMD_MS
+                    ),
+                    BtL3Await::Stop => serial_println!(
+                        ":: bt-c1: [{}] HCI_Inquiry_Cancel (0x0402) SENT UNREAD — the event endpoint is unreadable, so no CmdComplete is claimed == witness ::",
+                        self.idx
+                    ),
+                }
+            }
+        }
+
+        // ---- THE INQUIRY SUMMARY — and it is the line that reads Boot D's result --------------
+        // Read this BEFORE any page verdict below. It is what separates the four cases the old
+        // capture collapsed into one: the target answered; the room is busy and the target is not
+        // in it; the room is silent; or the inquiry never ran to term and establishes nothing.
+        let (psrm, clk, found) = if st.inq_found {
+            (
+                // REVIEW FIX — an out-of-range mode is REFUSED, not paged. `BT_C1_PSRM_MAX` says
+                // what passing it through would have cost; the line below names the substitution.
+                if st.inq_psrm_ok {
+                    st.inq_psrm
+                } else {
+                    BT_C1_PSRM
+                },
+                st.inq_clock_offset | BT_C1_CLOCK_OFFSET_VALID,
+                true,
+            )
+        } else {
+            fallback
+        };
+        if st.inq_found && !st.inq_psrm_ok {
+            serial_println!(
+                ":: bt-c1: [{}] inquiry psrm REJECTED — the response for this BD_ADDR reported Page_Scan_Repetition_Mode={:#04x}, which is Reserved for Future Use (legal range 0x00..={:#04x}). Paging with it would have been answered CommandStatus 0x12 (Invalid HCI Command Parameters) and NO train would have gone out, so {:#04x}(R2) is substituted. THE CLOCK OFFSET IS UNAFFECTED and is still the peer's own — this page is aligned but not mode-sized. An inquiry response is unauthenticated: any device may answer under any BD_ADDR, so a byte out of range here is either a broken peer or a spoofed one == witness ::",
+                self.idx, st.inq_psrm, BT_C1_PSRM_MAX, BT_C1_PSRM
+            );
+        }
+        serial_println!(
+            ":: bt-c1: [{}] inquiry summary — responses={} target_found={} same_oui_seen={} read_to_term={} -> {} == witness ::",
+            self.idx, st.inq_responses, st.inq_found, st.inq_oui_seen, !st.blind,
+            if st.inq_found {
+                "THE TARGET ANSWERED ON CLASSIC. It is powered, in range, and inquiry-scanning, so a Page Timeout below can NOT be read as 'the speaker is off or out of range' — those readings are excluded by this line. The page carries the peer's own psrm and clock offset"
+            } else if st.blind {
+                "THE INQUIRY DID NOT RUN TO TERM — an event was truncated, an endpoint stopped, or a structural cap ended a wait early. The absence of the target here is NOT evidence of its absence from the room, and nothing below may cite it"
+            } else if st.inq_oui_seen {
+                "THE TARGET DID NOT ANSWER, BUT A DEVICE SHARING ITS VENDOR OUI DID. The prime reading is that this host is paging the wrong address: the target BD_ADDR was harvested from an LE advertisement, and a dual-mode device need not page under the address it advertises"
+            } else if st.inq_responses > 0 {
+                "THE TARGET DID NOT ANSWER, AND THE ROOM IS NOT SILENT. This inquiry heard other devices, so the radio, the antenna and the receive path are all working; what is unproven is that this BD_ADDR is on the air on CLASSIC at all"
+            } else {
+                "THE INQUIRY HEARD NOTHING AT ALL. No device in the room answered a GIAC inquiry, which is a statement about THIS HOST's receive path at least as much as about the room — a working controller in a populated room normally hears something"
+            }
+        );
+        serial_println!(
+            ":: bt-c1: [{}] page fields — psrm={:#04x}({}) clock_offset={:#06x}(bit15 {}) source={} == witness ::",
+            self.idx, psrm,
+            match psrm { 0x00 => "R0", 0x01 => "R1", 0x02 => "R2", _ => "RESERVED" },
+            clk,
+            if clk & BT_C1_CLOCK_OFFSET_VALID != 0 { "SET = valid" } else { "clear = NOT valid" },
+            if found && !st.inq_psrm_ok {
+                "THE PEER'S OWN CLOCK OFFSET, BUT THIS HOST'S FALLBACK MODE — the response carried an out-of-range Page_Scan_Repetition_Mode and it was refused (its own line is above). The train starts on the peer's clock phase and is sized for the worst case"
+            } else if found {
+                "THE PEER'S OWN INQUIRY RESPONSE — the controller can now start its page train on the peer's clock phase and size it to the peer's real scan interval, which is the whole difference between this arc and the one Boot D flew"
+            } else {
+                "THIS HOST'S FALLBACK GUESSES — no inquiry response for this address was harvested, so the page below is the same blind page Boot D made and its timeout carries the same weight"
+            }
+        );
+        (psrm, clk, found)
+    }
+
     /// BT-C1 — PAGE the speaker on BR/EDR, and always let go. The first step toward A2DP audio.
     ///
     /// `HCI_Create_Connection` (0x0405) establishes a classic ACL link to a named BD_ADDR. That is
@@ -6327,6 +6993,19 @@ impl Controller {
         let mut cancels = 0u32;
         let t0 = crate::arch::now_cycles();
 
+        // ---- 0. ASK THE ROOM FIRST -------------------------------------------------------------
+        // The two fields a page cannot invent — `Page_Scan_Repetition_Mode` and `Clock_Offset` —
+        // come from here or they are guesses. It shares this function's `st`, `seen` and `asm` on
+        // purpose: one `events_read` count for the whole stage, one `blind`/`stopped` verdict, and
+        // an inbound `Connection Complete` arriving during the inquiry is latched by the same
+        // latch that would catch it during the page.
+        let (psrm, clock_offset, from_inquiry) =
+            self.bt_c1_inquiry(t, intf, e, toggle, armed, &mut st, &mut seen, &mut asm);
+        // REVIEW FIX — latched here because `st.inq_psrm_ok` is about to be shared with the page's
+        // own waits, and the page-parameters line below must not call a substituted mode
+        // "HARVESTED". See `BT_C1_PSRM_MAX`.
+        let psrm_harvested = st.inq_psrm_ok;
+
         // ---- 1. bound what a dead speaker costs the boot ---------------------------------------
         // Vol 4 Part E §7.3.16. Written BEFORE the page, because it is the page's own deadline.
         let mut rp = [0u8; 8];
@@ -6358,10 +7037,12 @@ impl Controller {
             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
             BT_C1_PACKET_TYPE as u8,
             (BT_C1_PACKET_TYPE >> 8) as u8,
-            BT_C1_PSRM,
+            // HARVESTED, or the fallback — `bt_c1_inquiry` said which on its own line above, and
+            // the page-parameters line below says it again on every attempt.
+            psrm,
             0x00,
-            BT_C1_CLOCK_OFFSET as u8,
-            (BT_C1_CLOCK_OFFSET >> 8) as u8,
+            clock_offset as u8,
+            (clock_offset >> 8) as u8,
             BT_C1_ALLOW_ROLE_SWITCH,
         ];
         // ---- THE PAGE ATTEMPT LOOP -------------------------------------------------------------
@@ -6377,10 +7058,26 @@ impl Controller {
         for attempt in 1..=BT_C1_PAGE_ATTEMPTS {
         attempts_run = attempt;
         serial_println!(
-            ":: bt-c1: [{}] page parameters — attempt={}/{} peer={} packet_type={:#06x}(DM1|DH1, basic rate, one slot) psrm={:#04x}(R2, conservative: no inquiry was run) clock_offset={:#06x}(bit15 clear = NOT valid) allow_role_switch={:#04x}(the peer may take the link) reserved=0x00 page_timeout={}ms(written above) conn_window={}ms; NO Write_Scan_Enable is issued — Vol 4 Part E §7.3.18 governs INBOUND inquiry/page scan and paging out needs none of it, while enabling it would make this machine discoverable == witness ::",
+            ":: bt-c1: [{}] page parameters — attempt={}/{} peer={} packet_type={:#06x}(DM1|DH1, basic rate, one slot) psrm={:#04x}({}, {}) clock_offset={:#06x}(bit15 {}) allow_role_switch={:#04x}(the peer may take the link) reserved=0x00 page_timeout={}ms(written above) conn_window={}ms; NO Write_Scan_Enable is issued — Vol 4 Part E §7.3.18 governs INBOUND inquiry/page scan and paging out needs none of it, while enabling it would make this machine discoverable == witness ::",
             self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
             core::str::from_utf8(&text).unwrap_or("??:??:??:??:??:??"),
-            BT_C1_PACKET_TYPE, BT_C1_PSRM, BT_C1_CLOCK_OFFSET, BT_C1_ALLOW_ROLE_SWITCH,
+            BT_C1_PACKET_TYPE,
+            psrm,
+            match psrm { 0x00 => "R0", 0x01 => "R1", 0x02 => "R2", _ => "RESERVED" },
+            if from_inquiry && psrm_harvested {
+                "HARVESTED from the peer's own inquiry response"
+            } else if from_inquiry {
+                "this host's conservative fallback — the peer answered but reported an out-of-range mode, refused above"
+            } else {
+                "this host's conservative fallback — the inquiry did not hear this address"
+            },
+            clock_offset,
+            if clock_offset & BT_C1_CLOCK_OFFSET_VALID != 0 {
+                "SET = VALID, so the controller starts its train on the peer's clock phase instead of sweeping for it"
+            } else {
+                "clear = NOT valid, so the controller must sweep"
+            },
+            BT_C1_ALLOW_ROLE_SWITCH,
             (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000, BT_C1_CONN_MS
         );
         if !self.bt_hci_send(t, intf, BT_HCI_CREATE_CONN, &cp) {
@@ -6513,7 +7210,18 @@ impl Controller {
                             ":: bt-c1: [{}] Connection Complete (0x03) — attempt={}/{} status={:#04x} -> NOT CONNECTED{}. The page RESOLVED (the controller left the paging state to send this), so no cancel is owed == witness ::",
                             self.idx, attempt, BT_C1_PAGE_ATTEMPTS, s,
                             match s {
-                                0x04 => " (PAGE TIMEOUT: the speaker did not answer the page train within the timeout written above — it is off, out of range, or not page-scanning. THIS IS THE ORDINARY RESULT FOR A POWERED-OFF SPEAKER and says nothing against the radio)",
+                                // THE PROSE THAT BOOT D FALSIFIED. This arm used to headline "it
+                                // is off, out of range, or not page-scanning ... THIS IS THE
+                                // ORDINARY RESULT FOR A POWERED-OFF SPEAKER". On Boot D the
+                                // speaker was CONFIRMED in pairing mode by the operator and both
+                                // trains timed out anyway, and on gr25-bootA a page with these
+                                // same parameters REACHED it on attempt 2/2 — so the peer-side
+                                // reading was not merely unlucky, it was wrong, and it was the
+                                // first thing a reader saw. Our-side causes now carry equal
+                                // weight, and the inquiry summary above is what decides between
+                                // them rather than the reader's prior.
+                                0x04 if from_inquiry => " (PAGE TIMEOUT: the peer did not answer the train inside the timeout written above. THE PEER-SIDE READINGS ARE EXCLUDED — the inquiry above heard this exact BD_ADDR, so it is powered, in range and scanning. What remains is OURS: the harvested clock offset may have aged out of the controller's tolerance between the inquiry and the page, the page train may not have overlapped a scan window, or this controller's paging is at fault)",
+                                0x04 => " (PAGE TIMEOUT: the peer did not answer the train inside the timeout written above. THE READINGS ARE OF EQUAL WEIGHT AND THIS LINE RANKS NONE OF THEM. Ours: this page carried NO harvested clock offset and a guessed page-scan repetition mode, so the controller had to sweep for the peer's clock phase rather than start on it — the same configuration reached this speaker on gr25-bootA only on its SECOND train, which is what an unaligned page looks like. Also ours: the BD_ADDR paged here was read off an LE advertisement and need not be the address this device pages under. Theirs: it is off, out of range, already connected to another host, or past its pairing window. Read the inquiry summary above before choosing — it is what tells these apart)",
                                 0x05 => " (AUTHENTICATION FAILURE)",
                                 0x08 => " (CONNECTION TIMEOUT)",
                                 0x0D | 0x0E | 0x0F => " (CONNECTION REJECTED: the peer refused — limited resources, security, or an unacceptable BD_ADDR. A speaker bonded to another host commonly answers this)",
@@ -6587,13 +7295,20 @@ impl Controller {
         // the single 1.28 s train Boot AS cut short. It cannot be produced by the retry logic —
         // every count in it is incremented by an event the controller sent.
         serial_println!(
-            ":: bt-c1: [{}] page summary — attempts_run={}/{} pages_on_air={} page_timeouts={} page_timeout_each={}ms conn_window_each={}ms -> {} == witness ::",
+            ":: bt-c1: [{}] page summary — attempts_run={}/{} pages_on_air={} page_timeouts={} page_timeout_each={}ms conn_window_each={}ms aligned_by_inquiry={} -> {} == witness ::",
             self.idx, attempts_run, BT_C1_PAGE_ATTEMPTS, pages, page_timeouts,
-            (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000, BT_C1_CONN_MS,
+            (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000, BT_C1_CONN_MS, from_inquiry,
             if live || st.classic_handle.is_some() {
                 "REACHED — a BR/EDR link was established; the teardown below is what this stage owes for it"
+            } else if page_timeouts >= BT_C1_PAGE_ATTEMPTS && from_inquiry {
+                "NOT REACHED, AND THE PEER-SIDE EXPLANATIONS ARE EXCLUDED. The inquiry above heard this exact BD_ADDR answer on classic, so it is powered, in range and scanning; every train after that still went unanswered, and both trains carried the peer's OWN page-scan repetition mode and clock offset. Nothing about the speaker explains this. The remaining candidates are all ours: the harvested clock offset ageing between inquiry and page, this controller's page train, or this host's transport"
             } else if page_timeouts >= BT_C1_PAGE_ATTEMPTS {
-                "NOT REACHED, AND THE PEER NEVER ANSWERED ANY TRAIN. Every attempt in the budget ended in an explicit Page Timeout for this BD_ADDR, each one a full-length train, so this is no longer the short-deadline artefact Boot AS produced at 1280ms. The ordinary readings are: the speaker is off, out of range, or not page-scanning (already connected to another host, or past its pairing window). What it does NOT show is a page cut short by this host"
+                // THE OLD TEXT HEADLINED THE PEER, AND BOOT D SHOWED THAT READING WRONG. It also
+                // cited Boot AS as the contrast case; the history says Boot AS never ran a classic
+                // page under btc at all on the flight that connected — the connection there was an
+                // LE link. The honest contrast case is gr25-bootA, where THESE parameters reached
+                // this speaker on the second train.
+                "NOT REACHED, AND THE PEER NEVER ANSWERED ANY TRAIN — but read the inquiry summary above before reading that as the speaker's fault. Every attempt in the budget ended in an explicit Page Timeout for this BD_ADDR, each one a full-length train, so no page was cut short by this host. THE READINGS ARE OF EQUAL WEIGHT. Ours: no inquiry response for this address was harvested, so both trains ran with a GUESSED page-scan repetition mode and NO clock offset, and the controller had to sweep for the peer's clock phase — this same configuration reached this speaker on gr25-bootA only on its second train, so an unaligned page failing twice is an expected outcome and not a discovery. Ours: the address paged was read off an LE advertisement and a dual-mode device need not page under the address it advertises. Theirs: off, out of range, already connected to another host, or past its pairing window"
             } else if page_timeouts > 0 {
                 "NOT REACHED — a Page Timeout was seen, and the sequence stopped before the budget was spent. The attempt line that ended it says why (a link, a refusal, or a local-side failure); read that line, not this count"
             } else {
@@ -6780,7 +7495,10 @@ impl Controller {
         // with a nonzero Command Status (nothing was transmitted in either case), and up to
         // `BT_C1_PAGE_ATTEMPTS` when the peer never answered. It used to be the literal 1, which
         // was true only while one attempt was all this stage could make.
-        self.bt_c1_tally(t0, seen, pages, established, disconnected, cancels, live, outstanding);
+        self.bt_c1_tally(
+            t0, seen, pages, established, disconnected, cancels, live, outstanding,
+            st.inq_responses, from_inquiry,
+        );
         // BT-RETRY: latch whether this run LEFT a live classic link (the MUST-NOT-APPEAR case:
         // `live` still true here means the teardown above did not confirm the release). On every
         // correct path this writes `None`, so a later re-trigger re-pages as normal; when it writes
@@ -6802,11 +7520,19 @@ impl Controller {
         cancels: u32,
         live: bool,
         outstanding: bool,
+        // Inquiry responses decoded this run — the count that separates a silent room from a busy
+        // one, and the first number to read when a page timed out.
+        inq_responses: u32,
+        // Whether the page carried the peer's own psrm/clock offset rather than this host's
+        // guesses. A `pages_attempted` with this false is a WEAKER experiment and the tally says
+        // so on its own line rather than leaving a reader to infer it.
+        inq_aligned: bool,
     ) {
         let (elapsed, unit) = epace_fmt(crate::arch::now_cycles().wrapping_sub(t0));
         serial_println!(
-            ":: bt-c1: [{}] C1 tally — elapsed={}{} events_read={} pages_attempted={} links_established={} disconnections_confirmed={} cancels_issued={} left_outstanding={} == witness ::",
-            self.idx, elapsed, unit, events, pages, completed, disconnected, cancels,
+            ":: bt-c1: [{}] C1 tally — elapsed={}{} events_read={} inquiry_responses={} page_aligned_by_inquiry={} pages_attempted={} links_established={} disconnections_confirmed={} cancels_issued={} left_outstanding={} == witness ::",
+            self.idx, elapsed, unit, events, inq_responses, inq_aligned,
+            pages, completed, disconnected, cancels,
             match (live, outstanding) {
                 (false, false) => "none",
                 (true, _) => "A LIVE BR/EDR LINK — the teardown was not confirmed. THIS IS THE MUST-NOT-APPEAR CONDITION",
