@@ -8556,6 +8556,91 @@ the window body, `[drag] … -> ONCE`, and `erase_px_pm` in the low thousands. `
 is the revert; a *trail* left behind is the opposite failure and points at the partition, not at the
 erase.
 
+## DRAGSETTLE — the drop lands where the hand let go (2026-08-11)
+
+`arch/x86_64/syscall.rs`, `pal.rs`. Two metal complaints, one cause: the operator's reported *"the
+mouse doesn't let go perfectly"* — a window that shifts about a pixel on the drop — and a GR24
+capture (`gr24-bootAS`) in which **every** gesture ends `end=release-level` and the delivered-release
+arm of `wc_click_route_at` never fires once.
+
+**The cause is an ORDERING race between two carriers of the same fact, not a lost report.** A
+release report publishes the button LEVEL (`pal::cursor::set_button_level`) inside the HID service
+pass, the instant the report is decoded. The `Event::Button` carrying the same release goes through
+`pal`'s event QUEUE and is judged a drain tick later — and the same report's *lift* dx/dy is pushed
+as an `Event::Mouse` **ahead** of that button. So a drain sees: lift motion, then edge, with the
+level already reading up for both. The routing tail (`wc_drag_motion`) consulted the level alone, so
+on the lift motion it steered the window to the post-lift cursor and cancelled the gesture; by the
+time the release edge arrived there was no drag left to end. The belt was not the safety net under
+the edge — it was standing in front of it, and the lift it applied is the ~1 px.
+
+**Three changes, none of which removes the belt.**
+
+ * **`pal::release_edge_pending()`** — release edges queued by `push_event` and not yet drained by a
+   router. Nonzero means "an edge is coming"; the tail then neither steers nor ends, and the edge
+   ends the gesture a tick later. Counted only when the ring actually stored the event, and reset by
+   the next press, so a dropped edge (the CLICK-3 loss the belt exists for) leaves the count at zero
+   and the belt fires exactly as before. `pal` keeps its **own** previous-mask byte and counts only
+   the PRIMARY 1→0 transition — the same edge `wc_click_route_at` consumes. Counting the raw mask
+   property instead (the first cut) desynchronised producer from consumer on any device that pushes a
+   `Button` for a non-primary change: a right-click left an uncollectable residue, and a secondary
+   press on a title bar armed a phantom pending release *for its own press*, holding that drag for
+   the whole grace. The count and the push also share one interrupt-free section with the ring push,
+   so a drain cannot decrement ahead of the increment.
+ * **A deadline (`RELEASE_EDGE_GRACE_MS = 120`).** An edge queued and then popped by some consumer
+   other than the router would otherwise hold the belt off forever — a drag outliving the hand, the
+   one failure this whole mechanism exists to prevent. After 120 ms of the level reading up the belt
+   fires anyway and says so on both wires: `end=level-late` on `[dragrel]`, and the distinct reason
+   `release-late` on `[wm-act]`, so a capture can tell a lossy ENDPOINT (`release-level` — the pad's
+   report was superseded) from a lossy CONSUMER (`release-late` — the edge was queued and eaten).
+
+   **It is not a wall clock.** The deadline is only ever evaluated inside `wc_drag_motion`, which
+   runs off pointer reports, so what it bounds is *further reports*, not elapsed time. A hand that
+   lets go and then goes perfectly still leaves the drag live exactly as it did before this arc —
+   the same documented LIMIT the belt always carried: an unsteered drag moves no window, the first
+   report that could do harm is also the one that ends it, and `<TAB>` is the escape meanwhile.
+ * **The settle point.** Both end paths now come to rest at the last pointer position observed with
+   the button DOWN, recorded unthrottled by the tail, instead of sampling the live cursor. Not short
+   of the release (the throttle's cost, which is why the old code sampled live) and not past it (the
+   lift's cost, which is what the operator sees). A grab-and-let-go with no motion between the edges
+   settles at its own grab point.
+
+**The witness.** `[dragrel] win= end= settle= release= stale= post= pend= wait= -> CLEAN|DIRTY`, one
+line per gesture end, from both end paths, immediately before the `wm` call that clears the gesture.
+`end=` names the path (`edge` = the delivered release; `level` = the belt with no edge queued;
+`level-late` = the belt firing past the deadline). `stale=` is `release - settle`: **the motion that
+arrived after the button read up**, i.e. exactly what the old code applied to the window and this
+code drops — the measurement, not a verdict.
+
+`post=` is **not evidence about this arc and must not be read as any**. It counts steering motions
+applied after the level read up, and it reads 0 on this build *and would have read 0 on the broken
+one* — the old defect took the cancel path, not the steer path, so it never passed the counter. It
+is a regression sentinel for a future steering caller in that file, plus the narrow race of a release
+landing between the level read and the apply. `-> DIRTY` is its alarm, not the arc's verdict.
+
+*What refutes what — carried by `end=` and `stale=`.* `end=edge` on the ordinary gestures, with the
+window resting at `settle=`, is the fix working. `end=level` on **every** gesture refutes the
+ordering diagnosis — the edge is not being beaten to the punch, it is not arriving at all, and the
+search moves back into the HID service pass. `stale=(0,0)` everywhere while the operator still sees
+the shift refutes the stale-motion hypothesis for the ~1 px entirely, and the shift is then in the
+mover (`move_to_inner`'s clamp) or the erase. A `stale=` of many pixels rather than one or two says
+motion reports were still queued when the level flipped, and the level needs to travel *in* the event
+stream rather than beside it. `end=level-late` recurring names a consumer eating release edges.
+
+**The gate.** `wmdirect_selftest` leg 9, reported as `settle=` on the `[wm-act] direct` line. It
+reproduces the release order through the real seams — `pal::push_event` produces, `pal::next_event`
+drains, each popped event goes through `wc_route_event` + `wc_route_tail`. **Two** of its three
+conjuncts are red on the shipping code: the drag is still live after the lift motion is routed
+(`held`), and the row rests at the +24 the hand steered to rather than the +27 the lift left the
+arrow at (`rest`). The third, that the queued edge is what ends it (`ended`), is vacuously true
+pre-fix — the belt had already ended the gesture — and is kept only to pin *which* path did the
+ending in combination with `held`. In-tree QEMU prints
+`[dragrel] win=1 end=edge settle=(451,307) release=(454,310) stale=(3,3) post=0 pend=0 wait=0ms -> CLEAN`
+for that leg — the dropped lift, named.
+
+**Metal watch-list.** Every gesture in a capture should print `end=edge`, with `end=level` surviving
+only for genuinely lost releases and `end=level-late` not at all. `stale=` is the measurement of the
+old defect and is expected to be small and nonzero on a trackpad.
+
 ## PAPER — the kit's content-surface texture, ported to integer Q16 (2026-08-09)
 
 `video/paper.rs`. The Crispy kit's `content_surface.Paper` block — the one part of

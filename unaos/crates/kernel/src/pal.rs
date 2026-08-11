@@ -807,6 +807,52 @@ pub fn event_queue_stats() -> (u64, u64, u64, u64, u64) {
     )
 }
 
+/// DRAGSETTLE — **release EDGES that were queued and have not yet been drained by the router.**
+///
+/// The belt in [`cursor::button_down`] is published by the HID parse path the instant a report is
+/// decoded, but the `Event::Button` that carries the same release travels through this QUEUE and is
+/// judged one drain tick later. So on every ordinary release the LEVEL reads up while the EDGE is
+/// still in flight, and any consumer that samples the level alone will act first and leave the edge
+/// arm dead — which is exactly what a GR24 capture shows (every gesture ends `release-level`, the
+/// delivered-release arm never once).
+///
+/// This counter is the ordering the level cannot carry on its own: nonzero means "a release edge is
+/// coming, wait for it"; zero means "no edge is coming, the belt is the only end there will be".
+/// It is not a substitute for the belt and it cannot wedge one on — the consumer pairs it with a
+/// deadline (see `RELEASE_EDGE_GRACE_MS` in the x86 router), so an edge that is queued and then
+/// eaten by some other pop still ends the gesture, only later.
+static RELEASE_EDGES_PENDING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// DRAGSETTLE — the button mask of the last `Event::Button` this seam PUSHED, so the count above is
+/// made on the same EDGE its consumer decrements on.
+///
+/// Review defect this closes: the first cut counted on the raw mask property `mask & 0x01 == 0`,
+/// while the only decrementer (`wc_click_route_at`'s release arm) fires on any bit going 1 -> 0
+/// against its OWN previous mask. xHCI pushes a `Button` on any mask change, so the two disagreed on
+/// real input in two ways that both mattered: a right-click with the primary already up counted a
+/// release nothing would ever consume (a residue surviving until the next primary press), and a
+/// SECONDARY-button press on a title bar — which does start a drag, since the press arm arms on any
+/// NEW bit — armed a phantom pending release for its own PRESS, holding that drag for the whole
+/// grace and ending it `level-late`. Tracking the primary transition here, in the producer, makes
+/// the count and the consumption the same event by construction.
+static PREV_BTN_MASK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// DRAGSETTLE — release edges queued and not yet drained (see [`RELEASE_EDGES_PENDING`]).
+pub fn release_edge_pending() -> u32 {
+    RELEASE_EDGES_PENDING.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// DRAGSETTLE — a router drained one release edge. Saturating, because the counter is advisory: a
+/// selftest that drives the router directly (no `push_event`) must not be able to push it negative,
+/// and an edge popped by some consumer other than the router simply ages out against the deadline.
+pub fn note_release_edge_drained() {
+    let _ = RELEASE_EDGES_PENDING.fetch_update(
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Acquire,
+        |n| Some(n.saturating_sub(1)),
+    );
+}
+
 pub fn push_event(event: Event) {
     use core::sync::atomic::Ordering::Relaxed;
     let is_ptr = matches!(
@@ -819,7 +865,32 @@ pub fn push_event(event: Event) {
     } else if is_key {
         EVQ_PUSH_KEY.fetch_add(1, Relaxed);
     }
-    let stored = crate::arch::without_interrupts(|| EVENT_QUEUE.lock().push(event));
+    // DRAGSETTLE — the ring push and the pending-release accounting happen under the SAME
+    // interrupt-free section. Review defect this closes: with the `fetch_add` outside it, a drain
+    // could pop the release and saturating-sub the count BEFORE the producer had added it, leaving a
+    // phantom `pend=1` with nothing queued — which costs the next gesture a full grace and a
+    // `level-late` end.
+    let stored = crate::arch::without_interrupts(|| {
+        let stored = EVENT_QUEUE.lock().push(event);
+        if let Event::Button(mask) = event {
+            let prev = PREV_BTN_MASK.swap(mask, Relaxed);
+            if prev & 0x01 != 0 && mask & 0x01 == 0 {
+                // The PRIMARY release edge, and the only thing counted: exactly the edge
+                // `wc_click_route_at` consumes. Counted only if the ring took it — an edge dropped by
+                // a full ring will never be drained, and holding the belt off for it would cost the
+                // one occasion the belt is the only end there is.
+                if stored {
+                    RELEASE_EDGES_PENDING.fetch_add(1, core::sync::atomic::Ordering::Release);
+                }
+            } else if prev & 0x01 == 0 && mask & 0x01 != 0 {
+                // A primary PRESS opens a new gesture: whatever release was still counted belongs to
+                // a gesture that is over, and carrying it forward would hold the next drag for the
+                // whole grace.
+                RELEASE_EDGES_PENDING.store(0, core::sync::atomic::Ordering::Release);
+            }
+        }
+        stored
+    });
     if !stored {
         if is_ptr {
             EVQ_DROP_PTR.fetch_add(1, Relaxed);
