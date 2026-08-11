@@ -206,6 +206,20 @@ fn main() {
     // only; no config write, no register write, no MMIO. Default OFF => module + call sites
     // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WIFI").is_ok() { feats.push("wifi"); }
+    // WIFI-2 (GR25): UNAOS_WIFI2=1 arms arc 2 — the WRITE rungs (src/wifi/bringup.rs). Maps BAR0,
+    // moves the backplane window selector cfg:0x80 onto ChipCommon and then onto the enumeration ROM,
+    // walks the core table from our own reads, cross-checks the d11 core against four metal boots and
+    // against the two config registers firmware left behind, reads the core + wrapper state and
+    // re-measures bcm4331.md §S3's enable rule (a no-op on this machine, and the branch that is not
+    // makes only the REVERSIBLE half — reset is never asserted). The microcode upload is refused at a
+    // named UNKNOWN (§S4 gives no value for the B43_SHM_UCODE routing selector, and the source that
+    // does is off-limits for src/wifi/). Implies `wifi`. The builder wiring is not optional and is
+    // exposed in exactly the direction the census was: media built here re-derives the x86 feature set
+    // from ITS OWN env, so a knob wired only in arroyo ships arc 2 disabled while the banner claims it
+    // is on — and a bring-up that silently did not run is indistinguishable on the wire from a radio
+    // that would not answer. Default OFF => module unlinked, media byte-identical to the arc-1 build.
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_WIFI2").is_ok() { feats.push("wifi2"); }
     // BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". Lifts the
     // EHCI hub-walk depth cap 2 -> 3 to reach the HCI controller behind the FULL-SPEED Broadcom hub
     // `0a5c:4500`, and — in the SAME change, because either alone is wrong — fixes the
