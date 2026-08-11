@@ -568,6 +568,17 @@ pub fn init(gpu: &GpuInfo) {
         #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
         super::gen7::recon(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func);
 
+        // GEN7-3D rung R2 — the wake (UNAOS_IVB3D). The FIRST write in the ladder: three MMIO
+        // writes to the IVB Sync-Flush workaround path (INSTPM 0x2050, RCS_WAKE 0x2700), a
+        // bounded poll of 0x22AC, then re-park INSTPM to 0x00010000 on every exit path. Placed
+        // AFTER `recon` — so the R1 GGTT census still read firmware's page tables, not a
+        // post-wake state — and BEFORE `bring_up_blt_ring`. It writes no GGTT entry, no ring
+        // register and no display register; the panel is the Kepler's, and the wake write is
+        // reversed in-rung, so R2 cannot black Peter's screen. Its proof is the same
+        // 17-register GT battery R1 read dark reading structured/varying afterward.
+        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
+        super::gen7::wake(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func);
+
         // BLT ring bring-up. SEAT FIXUP (review round 2): an ACCELERATOR must degrade, never kill
         // the boot — every refusal below breaks out of this block, the ring simply never comes up,
         // `blitter_*` return false, and the CPU path carries the console exactly as before this
