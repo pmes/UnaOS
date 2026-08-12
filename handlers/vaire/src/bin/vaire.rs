@@ -343,7 +343,7 @@ fn load_repo_manifest(path: &std::path::Path) -> Result<RepoManifest> {
 }
 
 /// The image size a repo verb will actually create, in bytes, clamped to the
-/// v3 format cap (a larger request cannot be formatted anyway).
+/// format cap (a larger request cannot be formatted anyway).
 fn volume_bytes(size_mb: u64) -> u64 {
     size_mb
         .saturating_mul(1024 * 1024)

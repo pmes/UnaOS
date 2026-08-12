@@ -41,16 +41,33 @@ pub const MAGIC: [u8; 5] = *b"UNAFS";
 ///   truncate — so the bump is an INCOMPAT marker, not a soft hint. Fresh
 ///   volumes format as v4; spilling is refused on a mounted v3 volume, which
 ///   keeps every v3 inode byte-identical and mountable by old readers.
-pub const VERSION: u32 = 4;
+/// * 5 — adds a SECOND REFCOUNT-MAP LEVEL: when the volume needs more than
+///   [`REFMAP_LEAVES_PER_INDEX`] refmap leaves (i.e. it is larger than
+///   [`MAX_BLOCK_COUNT_ONE_LEVEL`] blocks = 2 GiB), the root's `refmap_block`
+///   points at an index-of-indexes whose entries are MID index blocks, each
+///   holding up to 512 leaf pointers. The level is a PURE FUNCTION of the
+///   volume geometry (leaves ≤ 512 ⇔ one level), so a v5 volume of ≤ 2 GiB is
+///   laid out identically to v4 — only the version stamp differs — and no
+///   root-record field changes. The bump is an INCOMPAT marker for the same
+///   reason v4's was: a pre-v5 reader pointed at a two-level index would
+///   misread mid pointers as leaf pointers. v3/v4 volumes (whose geometry
+///   guarantees one level) mount and read exactly as before.
+pub const VERSION: u32 = 5;
 
 /// The oldest on-disk version this build still mounts. A v3 volume mounts
-/// read/write but never spills (it has no v4 inodes and gains none), so old
-/// images keep working while new images that could contain a spilled inode are
-/// stamped v4 and REJECTED by pre-indirection readers — detected, not misread.
+/// read/write but never spills (it has no v4 inodes and gains none), and no
+/// v3/v4 volume can need the second refmap level (their geometry is capped at
+/// one level), so old images keep working while new images that need the new
+/// structures are stamped and REJECTED by older readers — detected, not
+/// misread.
 pub const MIN_SUPPORTED_VERSION: u32 = 3;
 
 /// First version whose format admits spilled (indirect) extent lists.
 pub const VERSION_EXTENT_SPILL: u32 = 4;
+
+/// First version whose format admits a second refcount-map level (volumes
+/// larger than [`MAX_BLOCK_COUNT_ONE_LEVEL`] blocks).
+pub const VERSION_REFMAP_TREE: u32 = 5;
 
 /// Reserved logical inode ids (stable across every mutation — Fork-1 verdict:
 /// inode ids are LOGICAL; the inode map carries id → current physical block).
@@ -68,13 +85,26 @@ pub const RECLAIM_INODE_ID: u64 = 4;
 /// First logical inode id handed to user objects.
 pub const FIRST_USER_INODE_ID: u64 = 5;
 
-/// Largest volume the v1 map structure addresses: the refcount-map index is
-/// ONE 4096 B block of leaf pointers (512 leaves × 1024 u32 counts/leaf =
-/// 524,288 blocks = 2 GiB). Enforced at format AND mount — a bigger volume is
-/// a clean [`SuperblockError::Geometry`], never a slice panic. Growing this is
-/// a second indirect level (a format change, its own KAT-recutting arc).
-pub const MAX_BLOCK_COUNT: u64 =
-    (BLOCK_SIZE / 8) * (BLOCK_SIZE / 4); // 512 leaf ptrs × 1024 refs/leaf
+/// Refmap leaf (or mid-index) pointers per 4096 B index block (u64 each).
+pub const REFMAP_LEAVES_PER_INDEX: u64 = BLOCK_SIZE / 8;
+
+/// Largest volume ONE refmap level addresses: the refcount-map index is one
+/// 4096 B block of leaf pointers (512 leaves × 1024 u32 counts/leaf =
+/// 524,288 blocks = 2 GiB). A volume at or under this uses the single-level
+/// layout regardless of version — which is what keeps a small v5 volume
+/// byte-identical to v4 apart from the version stamp.
+pub const MAX_BLOCK_COUNT_ONE_LEVEL: u64 =
+    REFMAP_LEAVES_PER_INDEX * (BLOCK_SIZE / 4); // 512 leaf ptrs × 1024 refs/leaf
+
+/// Largest volume the map structure addresses at all: TWO refmap levels
+/// (v5+) — one index-of-indexes block of 512 mid pointers, each mid block
+/// holding 512 leaf pointers (512 × 512 × 1024 refs = 268,435,456 blocks =
+/// 1 TiB). Enforced at format AND mount — a bigger volume is a clean
+/// [`SuperblockError::Geometry`], never a slice panic. The next walls past
+/// this are not format walls: the in-RAM map (8 bytes/block across the two
+/// views) and the whole-map rewrite each commit grow linearly with the
+/// volume, so a third level should arrive together with an incremental map.
+pub const MAX_BLOCK_COUNT: u64 = REFMAP_LEAVES_PER_INDEX * MAX_BLOCK_COUNT_ONE_LEVEL;
 
 #[derive(Error, Debug)]
 pub enum SuperblockError {
@@ -134,6 +164,15 @@ impl Superblock {
         self.version >= VERSION_EXTENT_SPILL
     }
 
+    /// Whether this volume's refcount map uses the TWO-LEVEL index tree — a
+    /// pure function of the geometry (more leaves than one index block
+    /// holds), never of the version: a v5 volume of ≤ 2 GiB is single-level
+    /// and byte-identical to v4. [`validate`](Self::validate) guarantees
+    /// two-level geometry only ever passes on a v5+ volume.
+    pub fn refmap_two_level(&self) -> bool {
+        self.block_count > MAX_BLOCK_COUNT_ONE_LEVEL
+    }
+
     /// Serialize the Superblock to bytes, ensuring it fits in Block 0.
     pub fn to_bytes(&self) -> Result<Vec<u8>, SuperblockError> {
         let bytes = crate::codec::serialize(self)?;
@@ -186,12 +225,22 @@ impl Superblock {
         if self.block_count < 3 {
             return Err(SuperblockError::Geometry("volume too small"));
         }
-        // The v1 map structure (one indirect level) addresses at most
+        // The map structure (two indirect levels, v5+) addresses at most
         // MAX_BLOCK_COUNT blocks; a bigger volume must fail HERE, cleanly —
-        // the commit path would otherwise run its refmap index off one block.
+        // the commit path would otherwise run its refmap index tree off its
+        // blocks.
         if self.block_count > MAX_BLOCK_COUNT {
             return Err(SuperblockError::Geometry(
-                "volume exceeds the refcount-map structure (one indirect level)",
+                "volume exceeds the refcount-map structure (two indirect levels)",
+            ));
+        }
+        // A pre-v5 volume's format has only ONE refmap level (one index block
+        // of leaf pointers): geometry past that cap describes a volume the
+        // pre-v5 code never wrote — refuse it rather than misread mid
+        // pointers as leaf pointers.
+        if self.version < VERSION_REFMAP_TREE && self.block_count > MAX_BLOCK_COUNT_ONE_LEVEL {
+            return Err(SuperblockError::Geometry(
+                "volume exceeds one refmap level (pre-v5 format)",
             ));
         }
 

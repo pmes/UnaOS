@@ -439,12 +439,31 @@ is per-object staging, not the transaction. What binds:
    2 GiB volume cap (point 2), not the inode.** The v4 bump is an incompat marker
    — a v3-only reader rejects a spill-capable volume rather than silently
    truncating a spilled inode; v3 volumes stay inline-only and mount unchanged.
-2. **2 GiB volume cap (hard) — now the nearest structural wall.**
-   `MAX_BLOCK_COUNT` (524,288) × 4 KiB, one indirect refmap level. With 1.42×
-   amplification and diverging snapshots this monorepo is inside it, but not by
-   much — and with the single-file ceiling lifted, this is the next limit a
-   growing object store meets. **Named extension: a second refmap level (its own
-   format-versioning arc).**
+2. **2 GiB volume cap — LIFTED (v5, second refmap level).** The old wall: the
+   refcount-map index was ONE 4 KiB block of leaf pointers (512 leaves ×
+   1024 refs = 524,288 blocks = 2 GiB, refused cleanly past it). The v5 format
+   adds a second index level — the root's refmap block becomes an
+   index-of-indexes of mid blocks, each carrying 512 leaf pointers — raising
+   `MAX_BLOCK_COUNT` to 268,435,456 blocks = **1 TiB**. The level is a pure
+   function of the geometry: a volume of ≤ 2 GiB keeps the single-level layout
+   (a fresh small v5 image differs from v4 only in the version stamp), v3/v4
+   volumes mount and read bit-perfect, and a boundary test writes and remounts
+   real data across the old 2 GiB line (`tests/refmap_two_level.rs`). The bump
+   is an incompat marker like v4's: a pre-v5 reader refuses two-level geometry
+   rather than misreading mid pointers as leaves. Two honest caveats remain
+   PERF walls, not format walls: the mounted refmap lives whole in RAM
+   (8 B/block over its two views) and is rewritten whole each commit, so a
+   1 TiB image costs ~2 GiB of mount RAM and ~1 GiB of map rewrite per commit
+   — a repo-sized store (tens of GiB) is comfortable; a third level should
+   arrive with an incremental map. **In-kernel** the wall is the 256 MiB
+   kernel heap: at 8 B/block the refmap alone consumes it at 32 GiB of
+   volume, so the practical in-kernel mountable ceiling is on the order of
+   ~16 GiB (leaving heap for everything else) — a bigger card is refused
+   with a clean `AllocRefused`, never an OOM panic (the RefMap constructors
+   and fsck's rebuild vec allocate fallibly). Hardening follow-up (v4-parity
+   gap, pre-existing): mount validates refmap mid/leaf pointer BOUNDS but
+   not uniqueness or overlap with blocks 0/1 — a hostile volume with
+   duplicate pointers deserves its own refusal arc.
 3. **No path index** (a shape constraint, not a defect) — lookup is a full `ls`
    plus a linear scan, so git's 256-way fan-out is mandatory; a flat object
    store would be quadratic.

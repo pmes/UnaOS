@@ -1193,9 +1193,14 @@ pub fn unafs_layout(m: &RepoManifest) -> Vec<LayoutMapping> {
 // UnaFS readiness — the measured limits, enforced before a native weave
 // ---------------------------------------------------------------------------
 
-/// A v3 volume's hard size cap: `MAX_BLOCK_COUNT` (524,288) × 4 KiB = 2 GiB.
-/// One indirect refmap level; a bigger store needs a second.
-pub const UNAFS_VOLUME_CAP_BYTES: u64 = 524_288 * 4096;
+/// The volume's hard size cap: `MAX_BLOCK_COUNT` (268,435,456) × 4 KiB =
+/// 1 TiB — the v5 second refmap level (the feasibility study's second named
+/// extension, now landed) lifted the old one-level 2 GiB wall. Note the
+/// remaining SOFT wall the format does not remove: the mounted refmap lives
+/// whole in RAM (8 bytes/block across its two views) and is rewritten whole
+/// each commit, so treat multi-hundred-GiB images as measured-before-woven,
+/// not free.
+pub const UNAFS_VOLUME_CAP_BYTES: u64 = 268_435_456 * 4096;
 
 /// The measured single-file ceiling. An `Inode` — extent list included — must
 /// serialize inside ONE 4 KiB block, so a file's *extent count* is the binding
@@ -1253,7 +1258,7 @@ pub fn unafs_readiness(m: &RepoManifest) -> Result<Readiness> {
 
 /// [`unafs_readiness`] against the volume the caller will actually create.
 ///
-/// The format's 2 GiB cap is the *ceiling*, not the size of the image a run
+/// The format's cap is the *ceiling*, not the size of the image a run
 /// asks for — `repo-uweave` defaults to a 256 MiB image. Checking a 900 MiB
 /// bolt against the cap and then formatting 256 MiB would report FITS and fail
 /// inside the weave, which is precisely the outcome this check exists to

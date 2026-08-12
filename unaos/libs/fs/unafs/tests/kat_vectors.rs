@@ -83,15 +83,18 @@ where
 // =============================================================================
 
 #[test]
-fn kat_superblock_v4() {
-    // v4 = the extent-list-indirection format bump. The ONLY byte that moves
-    // from the v3 golden is the version field (03 → 04): the layout is
+fn kat_superblock_v5() {
+    // v5 = the second-refmap-level format bump (volumes past 2 GiB). Exactly
+    // like the v3 → v4 recut, the ONLY byte that moves from the previous
+    // golden is the version field (04 → 05): the superblock layout is
     // otherwise identical, and the bump is the incompat marker that stops a
-    // v3-only reader silently truncating a spilled inode.
+    // pre-v5 reader misreading a two-level refmap index. (A v5 volume of
+    // ≤ 2 GiB keeps the single-level index, so its every OTHER byte matches
+    // what v4 would have written.)
     let sb = Superblock::new(4096);
     kat(
         &sb,
-        "554e4146530400000000100000001000000000000001000000000000000200000000000000",
+        "554e4146530500000000100000001000000000000001000000000000000200000000000000",
     );
     // The real disk write path (to_bytes) must equal the golden too.
     assert_eq!(sb.to_bytes().unwrap(), enc(&sb));
@@ -100,7 +103,7 @@ fn kat_superblock_v4() {
     let sb_b = Superblock::new(u64::MAX / 4096);
     kat(
         &sb_b,
-        "554e4146530400000000100000ffffffffffff0f0001000000000000000200000000000000",
+        "554e4146530500000000100000ffffffffffff0f0001000000000000000200000000000000",
     );
 }
 
