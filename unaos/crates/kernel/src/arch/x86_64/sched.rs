@@ -4548,6 +4548,7 @@ fn steal_floor(victim: usize) -> usize {
 // | `f` [`STEAL_D_FLOOR`] | ready tasks existed, none reached its victim's floor | the floor (fixed above) |
 // | `p` [`STEAL_D_PINNED`] | a victim qualified, every ready task on it was pinned, cooperative-excluded, or COOLING | the pin contract / VUGSPREAD-COOL |
 // | `d` [`STEAL_D_DRAIN`] | the victim drained between the peek and the lock | benign raciness |
+// | `i` [`STEAL_D_IDLEFLOOR`] | the victim held work but had gone IDLE, raising its own floor | the idle-floor ping-pong guard (Review F10) |
 //
 // VUGSPREAD-COOL folds into `p` on purpose: a task passed over only because it migrated within
 // `STEAL_COOLDOWN_MS` leaves `steal_one` empty-handed exactly as a pinned one does, so the pass-level
@@ -4557,9 +4558,10 @@ fn steal_floor(victim: usize) -> usize {
 // is this brake working.
 //
 // The arithmetic is checkable ON THE WIRE, which is what stops the set from quietly losing a case:
-// `e + f + p + d + moves == passes`, and `t` sits outside `passes` because `STEAL_PASSES` is bumped
-// after the thief exclusion. A capture where those do not add up means a path was added without a
-// counter, and the witness is lying rather than merely incomplete.
+// `e + f + p + d + i + moves == passes` (`i` = `STEAL_D_IDLEFLOOR`, the Review-F10 idle-floor path,
+// emitted as `i:` on the `decl=` line — see below), and `t` sits outside `passes` because
+// `STEAL_PASSES` is bumped after the thief exclusion. A capture where those do not add up means a
+// path was added without a counter, and the witness is lying rather than merely incomplete.
 /// Review F10 — `d` was ONE counter covering two different events, which contradicted the
 /// disjointness the table claims. A victim whose queue is EMPTY when the lock is taken drained under
 /// a race (benign, and says nothing about policy); a victim holding `0 < len < floor` did NOT drain
