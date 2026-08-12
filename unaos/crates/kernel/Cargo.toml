@@ -1092,6 +1092,7 @@ fdt = "0.1.5"
 # knob-off builds on BOTH arches never compile it (byte-identical). Lives in the shared [dependencies]
 # (not an arch-gated block) because the demo now targets x86/virt AND aarch64/virt AND aarch64/tegra.
 rast = { path = "../rast", optional = true }
+noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "bold", "size_16", "unicode-basic-latin"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # BeFS-K3: the native UnaFS filesystem, no_std core only (on-disk types, codec,

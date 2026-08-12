@@ -158,16 +158,17 @@ const ROWS: [Row; 5] = [
 // Metrics — all derived, none guessed
 // ---------------------------------------------------------------------------
 
-/// The glyph cell the menu draws text in — [`wm::TITLE_CELL`], the same 16 px the bar caption and the
-/// dock tiles resolve to, so a kit text-size change moves all of them together.
-const CELL: usize = wm::TITLE_CELL;
-
-/// The integer scale the 8-px font is replicated at — [`wm::TITLE_SCALE`].
-const SCALE: usize = wm::TITLE_SCALE;
+/// The glyph advance and cell height the menu draws text in — [`wm::TITLE_CELL_W`] /
+/// [`wm::TITLE_CELL_H`], the same face metrics the bar caption and the dock tiles resolve to, so a
+/// face change moves all of them together. FONT (GR27): the shared anti-aliased face's cell is not
+/// square, so the two axes are named separately (the old square `CELL` and its `SCALE` are retired
+/// with the 1-bit bitmap they described).
+const CELL_W: usize = wm::TITLE_CELL_W;
+const CELL_H: usize = wm::TITLE_CELL_H;
 
 /// An item row's height, px: the glyph cell plus 8 px of clearance split top and bottom, so a 16 px
 /// glyph sits with 4 px of air above and below in a 24 px row. Pinned by the const-assert below.
-const ITEM_H: usize = CELL + 8;
+const ITEM_H: usize = CELL_H + 8;
 
 /// A separator row's height, px — a thin band carrying one keyline, centred.
 const SEP_H: usize = 7;
@@ -206,7 +207,7 @@ const fn menu_height() -> usize {
 }
 
 /// The menu's width, px: both borders, both insets, and the widest label.
-const MENU_W: usize = 2 * BORDER + 2 * PADX + max_label_glyphs() * CELL;
+const MENU_W: usize = 2 * BORDER + 2 * PADX + max_label_glyphs() * CELL_W;
 
 /// The menu's height, px.
 const MENU_H: usize = menu_height();
@@ -227,7 +228,7 @@ const ITEM_COUNT: usize = item_count();
 
 const _: () = {
     // The row height must clear the glyph it centres, or the label is cut.
-    assert!(ITEM_H >= CELL);
+    assert!(ITEM_H >= CELL_H);
     assert!(ITEM_H == 24);
     // The separator band must hold its keyline with air either side.
     assert!(SEP_H >= 3);
@@ -666,41 +667,17 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
         }
         // An item: its label, vertically centred in the row, at PADX from the inner edge.
         Some(_) => {
-            let vpad = (ITEM_H - 8 * SCALE) / 2;
+            let vpad = (ITEM_H - CELL_H) / 2;
             let gtop = top + vpad;
-            if j < gtop || j >= gtop + 8 * SCALE {
+            if j < gtop || j >= gtop + CELL_H {
                 return;
             }
-            let sy = (j - gtop) / SCALE;
-            if sy >= 8 {
-                return;
-            }
+            let sy = j - gtop;
+            // FONT (GR27) — the shared anti-aliased face, blended over the row fill the loop above
+            // painted (RAM scratch — the blend's read is cached). Regular weight: menu items are
+            // body text, not a caption.
             let label = ROWS[row].label.as_bytes();
-            draw_text(out, w, label, BORDER + PADX, sy, SCALE, theme::TITLE_TEXT_ACTIVE);
-        }
-    }
-}
-
-/// Overlay one scaled row of an ASCII byte string at `x0`, in `ink` — the bar's glyph loop, kept
-/// local because it is six lines and the strip primitive has no opinion about text.
-fn draw_text(out: &mut [u32], w: usize, s: &[u8], x0: usize, sy: usize, scale: usize, ink: u32) {
-    for (c, &b) in s.iter().enumerate() {
-        let ch = if (0x20..0x7f).contains(&b) { b } else { b' ' };
-        let bits = font8x8::legacy::BASIC_LEGACY[ch as usize][sy];
-        if bits == 0 {
-            continue;
-        }
-        let gx = x0 + c * CELL;
-        for rx in 0..8usize {
-            if bits & (1 << rx) == 0 {
-                continue;
-            }
-            for sx in 0..scale {
-                let i = gx + rx * scale + sx;
-                if i < w {
-                    out[i] = ink;
-                }
-            }
+            super::font::draw_row(out, w, label, BORDER + PADX, sy, theme::TITLE_TEXT_ACTIVE, false);
         }
     }
 }

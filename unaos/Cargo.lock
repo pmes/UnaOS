@@ -164,6 +164,12 @@ name = "net"
 version = "0.1.0"
 
 [[package]]
+name = "noto-sans-mono-bitmap"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f102c477fd4ec864c149803bf606ecc23bc9329602ec0f99073a728abf454abc"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -422,6 +428,7 @@ dependencies = [
  "linked_list_allocator",
  "midden_core",
  "net",
+ "noto-sans-mono-bitmap",
  "rast",
  "smoltcp",
  "spin 0.12.1",
