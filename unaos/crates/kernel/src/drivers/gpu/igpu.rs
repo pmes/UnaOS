@@ -589,9 +589,25 @@ pub fn init(gpu: &GpuInfo) {
         // under each hold. Placed AFTER `wake` (which re-parks INSTPM on every exit path, so R3
         // starts from firmware's state) and still BEFORE `bring_up_blt_ring`. It writes at most
         // two GT power-management registers, no ring register, no GGTT entry and no display
-        // register; the panel is the Kepler's, so R3 cannot black Peter's screen.
+        // register; the panel is the Kepler's, so R3 cannot black Peter's screen. R3 returns
+        // its wake verdict as a `GtWake` so R4 branches on real evidence.
         #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
-        super::gen7::forcewake(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func);
+        let gt_wake = super::gen7::forcewake(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func);
+
+        // GEN7-3D rung R4 — the GGTT claim (UNAOS_IVB3D). It reads R3's `GtWake` verdict and
+        // branches on TWO gates. The read-only recon (RCS ring registers + GGTT window census)
+        // runs on any reachable wake. The ONE reversible PTE round-trip (write, read back the
+        // 0->pte transition, verify no neighbour smeared, restore the whole neighbourhood to zero
+        // and re-read) is attempted ONLY on a CONFIRMED wake (`Woke`/`LiveAlready`): an ack-less
+        // `WokeNoAck` gets the recon but the write is withheld (`claim-gated-on-ack`), and a
+        // `Dark` GT gets the recon and writes nothing (`gated-on-wake`) — the outcome Boot D's
+        // `gt-still-dark` makes most likely. Placed AFTER `forcewake` and still BEFORE
+        // `bring_up_blt_ring`. On the confirmed-wake branch it touches at most three GGTT PTE
+        // slots, all in a window it first read as zero and all restored to zero, and frees its
+        // scratch page only once that reversal verifies; it writes no ring register and no
+        // display register, so R4 cannot black Peter's screen either.
+        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
+        super::gen7::claim(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
 
         // BLT ring bring-up. SEAT FIXUP (review round 2): an ACCELERATOR must degrade, never kill
         // the boot — every refusal below breaks out of this block, the ring simply never comes up,
