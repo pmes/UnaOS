@@ -11672,10 +11672,18 @@ selftests) spend a handful of those lines before the operator's first gesture. A
 rates the cap outlasts any bench sitting; a capture whose gesture count approaches it should read
 absence-of-`park`-lines late in the log as budget exhaustion, not as proof of no park.
 
-KNOWN / QUEUED (review note, no code this arc): the process SELF-EXIT teardown
-(`memory::free_user_space_by_cr3` → `clear_handle_row`/`win_close_slot`) never releases
-`FOCUS_ASID`, so an app that exits while focused leaves a stale focus a slot-recycled successor can
-inherit; `wm::focus_release(owner)` is the right primitive for that path and it is a follow-up arc.
+CLOSED (follow-up arc, GR27): the process SELF-EXIT teardown
+(`memory::free_user_space_by_cr3` → `clear_handle_row`/`win_close_slot`) never released
+`FOCUS_ASID`, so an app that exited while focused left a stale focus a slot-recycled successor
+(owner = `slot + 1`, generation-less) inherited. `free_user_space_by_cr3` now calls
+`wm::focus_release((slot + 1), …)` immediately after `win_close_slot` — the keyboard half was
+already covered there (`clear_handle_row` → `user_input_revoke_slot`); this is the missing wm half.
+Lock-safe by the order `win_close_slot` already exercises: nothing is held at that point in the
+teardown, and the owner's rows are already reaped so the release is a pure CAS (no composite).
+`focus_release` now takes a static `route` token for its `[wm-act] focus-release` line —
+`route=close-box` / `route=close-furniture` / `route=self-exit` — so a capture can tell an
+operator's close from the teardown wire; the close paths still release before they kill, so their
+teardown arrives with the CAS already missed and emits nothing.
 
 cfg-fold: all of it is x86 `wc`-path code (`wc_close_*`, the x86 present verbs) plus arch-neutral
 `wm.rs` additions with no behavior change off the new call sites; aarch64 and wc-off builds are

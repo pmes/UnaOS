@@ -2458,7 +2458,12 @@ pub fn focus_changed(asid: u64) {
 ///
 /// The keyboard half of "focus back to the shell" (`user_input_set_active(0)`) is the syscall
 /// layer's and stays where it was — this verb is only the wm half.
-pub fn focus_release(owner: u64) {
+///
+/// `route` is the caller's name for itself on the `[wm-act]` line (`route=close-box`,
+/// `route=close-furniture`, `route=self-exit`), a static token so the witness can tell WHICH path
+/// released an orphaned focus — the self-exit teardown wire (the CLOSE-TEARDOWN follow-up) is
+/// distinguishable from an operator's close click without costing a second line or an allocation.
+pub fn focus_release(owner: u64, route: &'static str) {
     use core::sync::atomic::Ordering;
     if owner == 0
         || FOCUS_ASID
@@ -2479,7 +2484,7 @@ pub fn focus_release(owner: u64) {
             }
         }
     }
-    wm_act("focus-release", WIN_NONE, owner, "shell-raise=skipped siblings=untouched", 0, 0);
+    wm_act("focus-release", WIN_NONE, owner, route, 0, 0);
     if any {
         composite();
     }

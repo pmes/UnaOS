@@ -1003,6 +1003,25 @@ pub fn free_user_space_by_cr3(cr3: u64) {
             // the used-flag release, or a concurrent `alloc_user_space` could claim the slot and its
             // first `SYS_WIN_CREATE` would land on the previous tenant's live window rows.
             super::syscall::win_close_slot(s);
+            // CLOSE-TEARDOWN follow-up: release the wm FOCUS HIGHLIGHT if this dying slot held it —
+            // the wm half of the focus handback the SELF-EXIT path never made. `clear_handle_row`
+            // above revoked the KEYBOARD grant (`user_input_revoke_slot`), but `FOCUS_ASID` is wm's
+            // own word and only `focus_release` may drop it: without this, an app that exits while
+            // focused leaves the highlight naming a dead ASID, and — the ids being generation-less
+            // `slot + 1` — the slot's NEXT tenant inherits a focus it never earned. The close-click
+            // path already releases before it kills, so its teardown arrives here with the CAS
+            // already missed and this is a no-op; the route token tells the two apart on the wire.
+            //
+            // Lock-safe from this context by the same argument as `win_close_slot`'s: nothing is
+            // held here (the `SLOT_USED` claim is an atomic, not a lock), and `win_close_slot` has
+            // already released `WINDOWS` before its `wm::close` calls run their drain barrier and
+            // composite — `focus_release` takes the same wm table (and composites only if the owner
+            // still has rows, which `win_close_slot` just guaranteed it does not), so it follows a
+            // lock order this path already exercises every teardown.
+            crate::video::wm::focus_release(
+                (s as u64) + 1,
+                "route=self-exit shell-raise=skipped siblings=untouched",
+            );
             unsafe { clear_slot_fb(s) };
             SLOT_USED[s].store(false, Ordering::Release);
             // SMPBAL-X86: the RECYCLE point. `clear_slot_fb` above already bumped, but state that

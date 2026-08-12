@@ -892,6 +892,51 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    // LAUNCH-DRAW (GR27): the FIRST present happens NOW, on the launch instant — before the
+    // measurement window has seen a single frame. Until this arc, the first paint was gated on
+    // `filled` (a full `REFRESH_MS` = 250 ms of samples), so launching pulse bought the operator
+    // ~300 ms of blank glass while the sampler's first window ran ON the launch path; the
+    // launch-stall arc flagged that hitch after WCD-CHUNK removed the bigger one under it.
+    //
+    // What this frame may honestly say is exactly "the meter is here, nothing measured yet":
+    // chrome, border, core labels and UNLIT tracks (every segment `METER_DIM`, the resting shade),
+    // with the verdict cells left blank. Deliberately NOT `park`/`run`/a percent and NOT the
+    // PULSE-ALIVE breath — each of those is a claim about the machine, and none has been measured
+    // (the two-source rule: no invented numbers). The SAMPLER IS UNTOUCHED: the ring still fills
+    // over `WINDOW_SLOTS` frames, the first measured paint still lands at ~250 ms, and the
+    // `first-window` witness still spans a full `REFRESH_MS` with the same deltas as before — only
+    // the blank-glass gap moved off the launch instant.
+    unsafe {
+        fill_rect(surf, 0, 0, SW, SH, BG);
+        fill_rect(surf, 0, 0, SW, 1, FRAME_C);
+        fill_rect(surf, 0, SH - 1, SW, 1, FRAME_C);
+        fill_rect(surf, 0, 0, 1, SH, FRAME_C);
+        fill_rect(surf, SW - 1, 0, 1, SH, FRAME_C);
+        let mut y = 4;
+        let mut c = 0usize;
+        while c < prev.ncpu {
+            let (d, n) = digits_of(c as u64 + 1);
+            let mut lbl = [b' '; 2];
+            let mut i = 0usize;
+            while i < n && i < 2 {
+                lbl[2 - n + i] = b'0' + d[i];
+                i += 1;
+            }
+            draw_text(surf, &lbl, 3, y + text_dy, METER_LABEL);
+            let mut bx = bar_x;
+            let mut s = 0i32;
+            while s < PULSE_SEGS {
+                fill_rect(surf, bx, y, seg_w, seg_h, METER_DIM);
+                bx += seg_w + gap;
+                s += 1;
+            }
+            y += row_h;
+            c += 1;
+        }
+    }
+    // Same non-fatal contract as the loop's present: a refusal must not end a monitor.
+    let _ = unsafe { sys1(SYS_WIN_PRESENT, win) };
+
     let mut load = [PARKED; MAX_CPUS]; // the MEASURED verdict — text cell, serial witness, bar case
     let mut disp = [0u32; MAX_CPUS]; // PULSEFLUID: the display-smoothed percent, Q8, BAR ONLY
     let mut disp_live = [false; MAX_CPUS]; // has `disp[c]` a percent to ramp from, or must it snap?
