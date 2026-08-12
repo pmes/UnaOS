@@ -217,7 +217,15 @@ impl<D: BlockDevice> UnaFS<D> {
             let pb = self.imap_ref()[id as usize];
             let inode = self.read_inode(id)?;
             Self::bump_block(pb, block_count, &mut counts);
+            // `read_inode` reconstructs a spilled inode, so `chunks` already
+            // covers its overflow DATA blocks. The INDIRECT index blocks that
+            // hold the overflow extent list are inode metadata outside `chunks`
+            // — bump them too, or fsck would call them leaked and repair free
+            // live extent-list storage.
             for e in &inode.chunks {
+                Self::bump_extent(e, block_count, &mut counts);
+            }
+            for e in &self.inode_index_extents_at(pb)? {
                 Self::bump_extent(e, block_count, &mut counts);
             }
             for extents in inode.large_attributes.values() {

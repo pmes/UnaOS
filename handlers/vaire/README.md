@@ -419,20 +419,32 @@ Measured, not argued. Harness:
 | name lookup vs directory width | 0.005 ms @ 64 · 0.028 @ 512 · **0.214 @ 4096** — linear |
 | `fsck` over 150,292 blocks in use | 66.3 ms, clean, **0 leaked / 0 orphans**; `snapshot_create` 37.1 ms |
 
-**Verdict — feasible now for repository-sized bolts; two named extensions
-before UnaFS can hold a large repo's object store outright.** VAIRE-3's batch
-path already removed the commit-count problem (commit is 20.7 ms of a 5 s run),
-so the remaining cost is per-object staging, not the transaction. What binds:
+**Verdict — feasible now for repository-sized bolts; the single-file ceiling is
+lifted, leaving the 2 GiB volume cap as the one named extension before UnaFS can
+hold a large repo's object store outright.** VAIRE-3's batch path already removed
+the commit-count problem (commit is 20.7 ms of a 5 s run), so the remaining cost
+is per-object staging, not the transaction. What binds:
 
-1. **~80 MiB single-file ceiling (hard).** An `Inode` — extent list included —
-   must serialize inside ONE 4 KiB block. Bisected: 75 MiB → 151 extents fine;
-   85 MiB → `InodeTooLarge(4100, 4096)`. A repacked monorepo is a *single*
-   ~52 MiB packfile today and growing, so this is the nearest wall. **Named
-   extension: extent-list indirection (or variable-length extents).**
-2. **2 GiB volume cap (hard).** `MAX_BLOCK_COUNT` (524,288) × 4 KiB, one
-   indirect refmap level. With 1.42× amplification and diverging snapshots this
-   monorepo is inside it, but not by much. **Named extension: a second refmap
-   level.**
+1. **~80 MiB single-file ceiling — LIFTED (v4, extent-list indirection).** The
+   old wall: an `Inode` — extent list included — had to serialize inside ONE
+   4 KiB block (bisected: 75 MiB → 151 extents fine; 85 MiB →
+   `InodeTooLarge(4100, 4096)`; the inline limit is ~168 extents). The v4 format
+   removes it: when the extent list overflows the inode block, the leading
+   extents stay inline (byte-identical fast path) and the remainder SPILLS to
+   indirect blocks (`unafs::inode::IndirectTrailer`), validated by `fsck` for
+   reachability and leak-freedom. A file of 4,000+ extents round-trips
+   byte-identically today (`tests/extent_indirection.rs`); because the indirect
+   INDEX is itself extent-coalesced, a contiguously-allocated overflow imposes no
+   practical extent cap, so **the binding limit for a single file is now the
+   2 GiB volume cap (point 2), not the inode.** The v4 bump is an incompat marker
+   — a v3-only reader rejects a spill-capable volume rather than silently
+   truncating a spilled inode; v3 volumes stay inline-only and mount unchanged.
+2. **2 GiB volume cap (hard) — now the nearest structural wall.**
+   `MAX_BLOCK_COUNT` (524,288) × 4 KiB, one indirect refmap level. With 1.42×
+   amplification and diverging snapshots this monorepo is inside it, but not by
+   much — and with the single-file ceiling lifted, this is the next limit a
+   growing object store meets. **Named extension: a second refmap level (its own
+   format-versioning arc).**
 3. **No path index** (a shape constraint, not a defect) — lookup is a full `ls`
    plus a linear scan, so git's 256-way fan-out is mandatory; a flat object
    store would be quadratic.
@@ -448,10 +460,12 @@ is the case for the direction, and it is why the Destiny below is worth
 building toward.
 
 **The verdict shaped the code.** BOLT-2 keeps packfile handling on the host
-git/`gix` side — precisely where UnaFS hits its ceiling — and `repo-ufit` /
-`repo-uweave` check the measured limits **before** touching an image, so a bolt
-that cannot fit is refused with a reason and a true no-op, rather than failing
-halfway through a weave with an `InodeTooLarge` from three layers down.
+git/`gix` side, and `repo-ufit` / `repo-uweave` check the measured limits
+**before** touching an image, so a bolt that cannot fit is refused with a reason
+and a true no-op, rather than failing halfway through a weave from three layers
+down. (The single-file `InodeTooLarge` wall that first motivated those guards is
+lifted as of the v4 format — extent-list indirection above; the guards now bind
+on the 2 GiB volume cap.)
 
 ## What is implemented today (STATUS / Crystal)
 
