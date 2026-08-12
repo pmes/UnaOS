@@ -62,12 +62,27 @@
 //! The dropdown is painted through [`super::strip::paint`] and erased through [`super::strip::erase_rect`]
 //! — the same front-buffer row-run discipline every non-compositor painter uses — from [`compose`],
 //! which [`super::strip::compose_all`] calls at the composite tail beside the dock and the bar. It is
-//! deliberately **not** a `strip::TENANTS` entry: a registered strip consumes an occlusion slot
-//! (`wm::OCC_MAX`), and this surface is modal and momentary, not standing furniture. The consequence,
-//! disclosed rather than designed away: the dropdown is not in `wm::erase_clip`, so a window moved or
-//! closed UNDER an open menu could clip it. In practice a click outside the menu dismisses it before
-//! any such gesture can begin, so the overlap does not arise; a future arc that wants menus to survive
-//! background repaints would promote this to a clip citizen.
+//! deliberately **not** a `strip::TENANTS` entry: a registered strip consumes a PERMANENT occlusion
+//! slot, and this surface is modal and momentary, not standing furniture.
+//!
+//! # MENU-OCC — a first-class occluder while open, without a tenancy
+//!
+//! Being transient does NOT mean unprotected. While the menu is open it is topmost by construction —
+//! [`super::wm::composite_once`] paints [`compose`] at the pass TAIL, after every window — so a window
+//! whose blit crosses the dropdown must WITHHOLD its columns or it overwrites the menu mid-frame (the
+//! Boot C defect, "menubar menu gets overwritten"). Two clip paths carry the menu, on opposite sides
+//! of the compositor:
+//!
+//! * **The DESKTOP present** ([`super::screen::present_background`]) subtracts [`open_rect`] directly,
+//!   so the shell's whole-panel `clear_screen` cannot flush the menu.
+//! * **The WINDOW blit** ([`super::wm::occ_clip`]) now pushes [`open_rect`] into every window's clip,
+//!   through a DEDICATED transient occluder slot (`wm::MENU_OCC_MAX`) rather than a strip tenancy — so
+//!   no permanent slot is spent and `wm::FURNITURE_MAX == strip::STRIP_MAX` stays true, while a window
+//!   moved or dragged under the open menu is clipped against it.
+//!
+//! On DISMISS, [`repaint_vacated`] gives the erased rect the `damage_intersecting` + full-present
+//! treatment [`super::wm::reclaim`] gives a vacated window box, so the windows that had been withholding
+//! those rows repaint them cleanly instead of leaving a `DESKTOP_BG` hole.
 //!
 //! # It is only reachable when the bar is enabled
 //!
@@ -507,6 +522,30 @@ pub fn key_escape(ev: crate::pal::Event) -> bool {
 // The composite seam — a transient surface through the strip painter
 // ---------------------------------------------------------------------------
 
+/// **MENU-OCC dismiss repaint — hand a just-vacated dropdown rect back to its OWNERS.**
+///
+/// The open menu is an [`wm::occ_clip`] citizen (§`MENU_OCC_MAX`): every window under it WITHHELD the
+/// dropdown's rows while it was open, so [`strip::erase_rect`]'s `DESKTOP_BG` does not restore those
+/// windows or the desktop content beneath — it stamps a HOLE over them, exactly the "menu-dismiss hole"
+/// the SHELLDESK review recorded (a window would show desktop background until it next repainted on its
+/// own). [`wm::damage_intersecting`] marks every window overlapping the vacated rect dirty and
+/// [`super::screen::request_full_present`] asks the desktop layer to repaint its own rows — the same
+/// `damage_intersecting` + full-present pair [`wm::reclaim`] gives a vacated WINDOW box, driven here by
+/// the dismissal.
+///
+/// Runs from [`compose`] at the composite TAIL, where `composite_inner` has already returned and the
+/// window-table lock is released, so the damage lock is taken cleanly. The residual is one frame of
+/// `DESKTOP_BG` before the owners repaint — the bounded vacate residual the strips already carry, in
+/// the safe direction (a hole that fills, never stale menu pixels that linger).
+fn repaint_vacated(r: strip::Rect) {
+    let (x, y, w, h) = r;
+    if w == 0 || h == 0 {
+        return;
+    }
+    wm::damage_intersecting(x, y, w, h);
+    super::screen::request_full_present();
+}
+
 /// **Paint or erase the dropdown.** Called from [`super::strip::compose_all`] at the composite tail.
 ///
 /// Returns `true` iff it painted or erased (the caller then owes the sprite a `Repaint`, as every
@@ -518,11 +557,13 @@ pub fn key_escape(ev: crate::pal::Event) -> bool {
 /// framebuffer, and no allocation.
 pub fn compose() -> bool {
     if !OPEN.load(Ordering::Relaxed) {
-        // Closed. Owe the pixels of a menu just dismissed, once.
+        // Closed. Owe the pixels of a menu just dismissed, once — and hand them back to their OWNERS.
         if SLOT.packed() != 0 {
             let r = SLOT.rect();
             SLOT.clear();
-            return strip::erase_rect(r);
+            let painted = strip::erase_rect(r);
+            repaint_vacated(r);
+            return painted;
         }
         return false;
     }
@@ -553,7 +594,9 @@ pub fn compose() -> bool {
         if SLOT.packed() != 0 {
             let old = SLOT.rect();
             SLOT.clear();
-            return strip::erase_rect(old);
+            let painted = strip::erase_rect(old);
+            repaint_vacated(old);
+            return painted;
         }
         return false;
     };
@@ -784,6 +827,41 @@ pub fn selftest() {
     let esc_consumed = key_escape(crate::pal::Event::Key(0x1b));
     let esc_ok = esc_consumed && !OPEN.load(Ordering::Acquire);
 
+    // Leg 7 — MENU-OCC: the open dropdown is a first-class OCCLUDER. A window whose blit crosses it
+    // must have the menu's columns WITHHELD, or the dropdown is overwritten mid-frame (Boot C,
+    // operator: "menubar menu gets overwritten"). The occlusion is the present's own arithmetic —
+    // [`wm::occ_menu_probe`] delegates to the proven [`wm::occ_bar_probe`], run against a synthetic
+    // window that crosses the OPEN menu: the PROTECTED walk withholds the menu's columns (`px_prot>0`)
+    // and the FAULT walk (clip empty) collapses to `px_fault==0`, so the leg is falsifiable rather
+    // than trusted. Meaningful only on x86 + `wc`, where [`wm::occ_clip`] pushes the menu; off that
+    // arch there is no window-blit occlusion path to protect and the leg trivially holds.
+    open(pw, ph);
+    let menu_occ_ok;
+    #[cfg(target_arch = "x86_64")]
+    {
+        menu_occ_ok = match menu_rect(pw, ph) {
+            Some((mx, my, mw, mh)) => {
+                // A window box crossing the whole dropdown: its columns, spanning past it top and bottom.
+                let win = (mx, my.saturating_sub(20), mw, mh + 40);
+                let p = wm::occ_menu_probe((mx, my, mw, mh), win);
+                let leg = p.pop_prot > 0 && p.px_prot > 0 && p.px_fault == 0;
+                serial_println!(
+                    ":: MENU-OCC: menu={}x{}+{}+{} win={}x{}+{}+{} occ={} occ_px={} fault_px={} :: {} ::",
+                    mw, mh, mx, my, win.2, win.3, win.0, win.1,
+                    p.pop_prot, p.px_prot, p.px_fault,
+                    if leg { "PASS" } else { "FAIL" }
+                );
+                leg
+            }
+            None => false,
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        menu_occ_ok = true;
+    }
+    dismiss("menu-occ");
+
     // Restore: ensure closed, and put the bar back the way we found it.
     dismiss("selftest");
     menubar::set_enabled(saved_bar);
@@ -795,12 +873,13 @@ pub fn selftest() {
         && resolve_ok
         && pick_ok
         && outside_ok
-        && esc_ok;
+        && esc_ok
+        && menu_occ_ok;
     serial_println!(
         ":: CRYSTAL-MENU: menu={}x{}+{}+{} panel={}x{} items={} start_closed={} opened={} \
-         placed={} resolve={} pick={} outside={} escape={} :: {} ::",
+         placed={} resolve={} pick={} outside={} escape={} menu_occ={} :: {} ::",
         rw, rh, rx, ry, pw, ph, ITEM_COUNT,
-        start_closed, opened, placed, resolve_ok, pick_ok, outside_ok, esc_ok,
+        start_closed, opened, placed, resolve_ok, pick_ok, outside_ok, esc_ok, menu_occ_ok,
         if ok { "PASS" } else { "FAIL" }
     );
     rollup("selftest");
