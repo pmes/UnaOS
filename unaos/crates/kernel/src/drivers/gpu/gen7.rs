@@ -2529,3 +2529,669 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
     );
     serial_println!(":: gen7: r4 end ::");
 }
+
+// ===================================================================================
+// R5 — the first EXECUTED command. Map a ring, submit MI_STORE_DATA_IMM, read the
+// sentinel back, tear everything down.
+// ===================================================================================
+//
+// ## What R5 is, in one paragraph
+//
+// R4 proved a GGTT slot can be claimed and released reversibly. R5 is the ladder's first
+// rung that asks the GT to *do* something: it claims TWO GGTT slots via the exact R4b path
+// (a ring page and a target page), maps a minimal RCS ring through the first, writes one
+// `MI_STORE_DATA_IMM` into it that stores a sentinel DWord to the second's GGTT address,
+// programs `RING_START`/`RING_HEAD`/`RING_TAIL`/`RING_CTL`, advances the tail, and polls the
+// head pointer AND the target DWord under a bounded budget. Execution is proven the only way
+// Wall D allows: the sentinel is a specific value only the GT's store could have put in the
+// target page, read back through the target page's own CPU mapping. Then the ring is disabled
+// (confirmed by readback), every touched GGTT PTE is restored to its captured entry image
+// (per R4b) and re-read, and both pages are **leaked, never freed** — the same rule R4b's
+// review fixed, because no GGTT TLB-invalidation rung exists yet, so a translation the GT
+// cached during the hold could outlive a free and DMA into reused heap.
+//
+// ## Sources — every encoding PINNED against the IVB PRM the module already cites
+//
+// Intel OpenSource HD Graphics PRM, Vol 1 Part 3 (Ivy Bridge, IHD-OS-V1 Pt 3 - 05 12), the
+// SAME document `g7regs` pins the ring registers against:
+//   * `MI_STORE_DATA_IMM` — §1.2.17, pp.186-187. DW0: Command Type[31:29]=0, MI Command
+//     Opcode[28:23]=0x20, Use Global GTT[22], DWord Length[9:0] = "Total Length - 2, excludes
+//     DWord(0,1)". A single-DWord store is 4 DWords (DW0 header, DW1 reserved MBZ, DW2
+//     Address[31:2], DW3 Data), so DWord Length = 2. Bit 22 MUST be 1 here: the doc says the
+//     command "must be executing from a privileged (secure) batch buffer" to use the global
+//     GTT, and a ring buffer is privileged. So DW0 = 0x10400002.
+//   * `MI_NOOP` — §1.2.12, p.180. DW0: Type=0, Opcode=0, Identification-Number-Register-Write-
+//     Enable[22]=0 => 0x00000000. Used to pad the ring to a QWord boundary (its documented use).
+//   * `RING_BUFFER_CONTROL` — §1.1.11.4, pp.78-79. Bit 0 Ring Buffer Enable; bits[20:12] Buffer
+//     Length, "U9-1 in 4 KB pages - 1" (value 0 = 1 page = 4 KB); RCS bits[2:1] are Reserved MBZ
+//     (Automatic Report Head Pointer is BlitterCS/VideoCS only). A single-page enabled ring is
+//     therefore 0x00000001.
+//   * `RING_BUFFER_START` — §1.1.11.3, p.77. Bits[31:12] the 4 KB-aligned GGTT address, and
+//     **"Address bits 31 down to 29 must be zero"** — a hard placement constraint. R4's
+//     `CLAIM_FIRST=0x40000` maps to GGTT 0x40000000 (bit 30 set) and would VIOLATE it, so R5
+//     places its own ring below slot 0x20000; see `R5_RING_SLOT`.
+//   * `RING_BUFFER_TAIL` — §1.1.11.1, p.75. Bits[20:3] Tail Offset, "points to the QWord past
+//     the last valid QWord" — so the tail must be 8-byte (QWord) aligned, and all DWords below
+//     it must be valid instructions (MI_NOOP padding is valid).
+//   * `RING_BUFFER_HEAD` — §1.1.11.2, p.76. Bits[31:21] Wrap Count, bits[20:2] Head Offset. The
+//     GT advances the head as it parses until it reaches the tail; head-offset mask = 0x1FFFFC,
+//     the same mask the tree's BLT ring already uses (`igpu.rs` ~734), retired to a pin here.
+//
+// No offset or encoding in this rung comes from Linux `i915` or Mesa `i965` — the clean-room
+// line §0 draws and R3's header restates. Every value above is from the Intel PRM, by section
+// and page.
+//
+// ## Two caveats stated on the wire, not buried
+//
+// 1. **The render ring's first enable wants more than R5 gives it.** RING_BUFFER_CONTROL's own
+//    programming notes (p.79) say that on a first enable "coming out of boot ... SW should set
+//    the Force Wakeup bit" AND "dispatch workload (dummy) to initialize render engine with
+//    default state". R5 sets up a bare ring with no default context, no PIPE_CONTROL, no PPGTT
+//    programming. So a `head-stuck` outcome is an EXPECTED, honest result on this part, not a
+//    failure to hide — it means "the CS did not parse our ring", which is a finding. R5 does
+//    NOT re-acquire forcewake: R3 owns that register and releases it on every exit path
+//    (R4's "forcewake released here" note), and re-implementing the acquire in R5 would
+//    duplicate the code the lane keeps in one place and cross into R3's lane. The verdict
+//    handles a well-released GGTT the same way R4 does — `void`, not "dead".
+// 2. **Gated is the expected outcome on THIS machine.** Boot D's R2 `gt-still-dark` and the
+//    likely R3 `fw-no-ack` mean `wake` arrives `Dark`, R5 writes nothing, and reports
+//    `verdict=gated-on-wake`. The write path only opens on a `write_ok()` wake — the same
+//    stricter gate R4's PTE round-trip uses. This rung cannot black the panel for the same two
+//    reasons every rung above it cannot: it writes no display register (only GGTT PTEs it first
+//    read as unowned, plus the four RCS ring registers), and the panel is the Kepler's anyway
+//    (`igpu.rs` ~778, Boot AS). A GT fault parks the CS; it does not touch scanout.
+//
+// ## Reversibility — two PTEs into a verified-unowned window, ring disabled, pages leaked
+//
+// The only writes R5 makes are on the `write_ok()` branch: two GGTT PTEs (ring + target), each
+// into a slot it first read as unowned (all-zero, or the four-leg-confirmed scratch-fill of
+// R4b), plus the four RCS ring registers. On teardown it disables the ring (RING_CTL=0, proven
+// by readback that bit 0 cleared), zeroes RING_START/HEAD/TAIL, restores both PTEs and their
+// neighbours to the captured entry image, and re-reads to prove it. The two pages are LEAKED
+// (a one-shot 8 KiB boot-time cost) because no TLB-invalidation rung exists to guarantee the GT
+// holds no cached translation to them — the exact rule R4b's review established for its
+// scratch-fill free. No clock, no RC6/RPS policy, no voltage/frequency request, nothing in a
+// display block.
+
+/// R5's two-slot claim window. Chosen LOW on purpose: `RING_BUFFER_START` (§1.1.11.3, p.77)
+/// requires the ring's GGTT address bits [31:29] to be zero, so the ring slot must be below
+/// `0x20000000 / 4096 = 0x20000`. Slot `0x10000` maps to GGTT `0x10000000` (bits[31:29]=0, legal)
+/// and sits in the firmware scratch-fill region R1/R4b observed from slot 0x10000 up, so the R4b
+/// unowned-shape test applies unchanged. The target slot is the neighbour above it.
+const R5_RING_SLOT: usize = 0x10000; // GGTT 0x10000000 — satisfies RING_START bits[31:29]==0
+const R5_TGT_SLOT: usize = 0x10001; // GGTT 0x10001000 — the MI_STORE_DATA_IMM destination
+
+/// The sentinel the store writes, and the value the target page is seeded with first so that a
+/// hit is a real transition, not a pre-existing pattern. Neither may collide with a GGTT PTE
+/// image (both are non-PTE-shaped: bit 0 semantics are irrelevant in a data page, and these are
+/// deliberately un-round so `landed`/`sentinel-hit` cannot be forged by a zeroed or filled page).
+const R5_SENTINEL: u32 = 0x5EED_1234;
+const R5_TGT_SEED: u32 = 0xDEAD_0000;
+
+/// MI commands, PINNED (IVB-V1P3, sections/pages in the header block above).
+const MI_STORE_DATA_IMM_DW0: u32 = 0x1040_0002; // §1.2.17 p.186: type0|opcode0x20<<23|GGTT bit22|len2
+const MI_NOOP: u32 = 0x0000_0000; // §1.2.12 p.180
+
+/// RING_BUFFER_CONTROL value for a single 4 KB page, enabled. §1.1.11.4 p.78: bit0 enable,
+/// bits[20:12]=0 => 1 page.
+const RCS_RING_CTL_1PAGE_EN: u32 = 0x0000_0001;
+
+/// RING_BUFFER_HEAD offset mask, bits[20:2] (§1.1.11.2 p.76) — same mask the tree's BLT ring uses.
+const RING_HEAD_OFF_MASK: u32 = 0x001F_FFFC;
+
+/// Distant GGTT probe slots for R5's scratch-fill globality leg (R4b leg 4), far outside the
+/// two-slot window and above the low firmware-framebuffer slots. All in-array, highest clear of
+/// the last slot. Distinct from R4's set only in that they avoid R5's own window.
+const R5_FAR_PROBE: [usize; 6] = [0x20000, 0x30000, 0x40000, 0x50000, 0x60000, 0x7FFF0];
+
+/// GEN7 rung R5 — map a ring, submit one MI_STORE_DATA_IMM, prove execution on the sentinel,
+/// tear it all down reversibly.
+///
+/// Called from `igpu::init` immediately after `claim` (R4) and still BEFORE `bring_up_blt_ring`,
+/// taking R3's `GtWake` verdict so it self-gates on the same `write_ok()` evidence R4's PTE
+/// round-trip uses.
+///
+/// # Safety
+/// Same contract as `recon`/`wake`/`forcewake`/`claim`: `bar0` is a live MMIO mapping of at least
+/// `bar0_size` bytes of the IGD's BAR0. R5 writes, ONLY on a `write_ok()` wake, at most two GGTT
+/// PTEs (both restored + re-read) and the four RCS ring registers (all zeroed on teardown, ring
+/// disable proven by readback). It writes no display register; its two scratch pages are leaked,
+/// never freed, so no GT-cached translation can outlive them onto reused heap.
+pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, wake: GtWake) {
+    serial_println!(
+        ":: gen7: r5 begin rung=R5 wake={} reachable={} write_ok={} bdf={}:{}.{} bar0_size={} ladder=GEN7-3D ::",
+        wake.name(),
+        if wake.reachable() { 1 } else { 0 },
+        if wake.write_ok() { 1 } else { 0 },
+        bus,
+        slot,
+        func,
+        bar0_size
+    );
+
+    // ---- Parachutes, identical discipline to R1-R4 ------------------------------------
+    if bar0 == 0 {
+        serial_println!(":: gen7: r5 verdict=refused-no-bar0 — BAR0 unpublished; no read or write attempted ::");
+        serial_println!(":: gen7: r5 next=STOP-bar0-unpublished-fix-igpu-init-mapping-first note=no-ggtt-or-ring-touched ::");
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
+
+    const GTT_BASE: usize = 0x200000; // igpu::regs::GTT_BASE — [EXT-UNPINNED], as R1/R4 carry it
+    const SLOTS: usize = 524_288;
+    // Highest byte R5 reads/writes: the neighbour above the target slot, and the ring/target
+    // registers reach RCS_RING_CTL (0x0203C). Refuse — before any read of the window and any
+    // write — if the window runs off the derived array or off the enumerated BAR0. Checked
+    // against the size we were GIVEN, not a literal, exactly as R4's guard is.
+    let win_next_slot = R5_TGT_SLOT + 1; // the neighbour above the target
+    let win_end_off = GTT_BASE + (win_next_slot + 1) * 4;
+    if win_next_slot >= SLOTS || bar0_size < win_end_off || bar0_size < g7regs::RCS_RING_CTL + 4 {
+        serial_println!(
+            ":: gen7: r5 verdict=refused-bar0-too-small have={} need={} next_slot={} slots={} — the derived GGTT window or ring block does not fit; no read claimed ::",
+            bar0_size,
+            win_end_off,
+            win_next_slot,
+            SLOTS
+        );
+        serial_println!(":: gen7: r5 next=STOP-window-out-of-range-refit-R5_RING_SLOT/TGT note=no-ggtt-or-ring-touched ::");
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
+
+    // ---- Read-only RCS ring-register census, BOTH branches ----------------------------
+    // The four registers R5 will (on the write branch) program. R3 released forcewake, so on a
+    // woke GT they may still read dark; the reading is reported, never assumed.
+    let mut ring = Tally::default();
+    probe(bar0, "rcs", "RING_START", g7regs::RCS_RING_START, "IVB-PINNED", &mut ring);
+    probe(bar0, "rcs", "RING_CTL", g7regs::RCS_RING_CTL, "IVB-PINNED", &mut ring);
+    probe(bar0, "rcs", "RING_HEAD", g7regs::RCS_RING_HEAD, "IVB-PINNED", &mut ring);
+    probe(bar0, "rcs", "RING_TAIL", g7regs::RCS_RING_TAIL, "IVB-PINNED", &mut ring);
+    serial_println!(
+        ":: gen7: r5 ring-census n={} structured={} zero={} allones={} varies={} note=the-four-RCS-submission-registers-before-any-write ::",
+        ring.n,
+        ring.structured,
+        ring.zero,
+        ring.allones,
+        ring.varies
+    );
+
+    // ---- Read-only census of the two-slot window + neighbours, BOTH branches ----------
+    // The claim is only safe if the ring slot, the target slot, and both bracketing neighbours
+    // are unowned. Two unowned shapes pass, exactly as R4b: all-zero, or the four-leg-confirmed
+    // firmware scratch-fill.
+    let ring_off = GTT_BASE + R5_RING_SLOT * 4;
+    let tgt_off = GTT_BASE + R5_TGT_SLOT * 4;
+    let prev_off_g = GTT_BASE + (R5_RING_SLOT - 1) * 4;
+    let next_off_g = GTT_BASE + (R5_TGT_SLOT + 1) * 4;
+    let ring_pre_img = rd(bar0, ring_off);
+    let tgt_pre_img = rd(bar0, tgt_off);
+    let prev_nb = rd(bar0, prev_off_g);
+    let next_nb = rd(bar0, next_off_g);
+    let fill = ring_pre_img;
+    let uniform = tgt_pre_img == fill && prev_nb == fill && next_nb == fill;
+    let all_zero = fill == 0 && uniform;
+    serial_println!(
+        ":: gen7: r5 window ring_slot={} tgt_slot={} ring_pre={:08X} tgt_pre={:08X} prev={:08X} next={:08X} fill={:08X} uniform={} all_zero={} base={:06X} base_pin=unpinned ::",
+        R5_RING_SLOT,
+        R5_TGT_SLOT,
+        ring_pre_img,
+        tgt_pre_img,
+        prev_nb,
+        next_nb,
+        fill,
+        if uniform { 1 } else { 0 },
+        if all_zero { 1 } else { 0 },
+        GTT_BASE
+    );
+
+    // ---- R4b — is the non-empty window the FIRMWARE SCRATCH-FILL? (read-only, BOTH branches)
+    // Identical four-leg test to R4: uniform incl. neighbours; valid-PTE shape (with the >4 GiB
+    // extended-bit screen); frame == BDSM base read from the host bridge THIS boot; and six
+    // distant probe slots agreeing so a locally-uniform buffer cannot impersonate the fill.
+    let uniform_nonzero = uniform && fill != 0;
+    let bdsm = crate::arch::pci::read_config_32(0, 0, 0, 0xB0);
+    let bdsm_base = bdsm & 0xFFF0_0000;
+    let fill_wellformed = (fill & 1) != 0 && (fill & 0xFFFF_F000) != 0 && (fill & 0xF0) == 0;
+    let fill_is_bdsm = (fill >> 12) == (bdsm_base >> 12);
+    let mut far_probed = 0u32;
+    let mut far_match = 0u32;
+    let mut far_first_bad: i64 = -1;
+    let mut far_first_bad_pte = 0u32;
+    if uniform_nonzero {
+        for &s in R5_FAR_PROBE.iter() {
+            let off = GTT_BASE + s * 4;
+            if off + 4 > bar0_size {
+                continue; // skipping counts AGAINST the fill: fill_global demands all six
+            }
+            far_probed += 1;
+            let pte = rd(bar0, off);
+            if pte == fill {
+                far_match += 1;
+            } else if far_first_bad < 0 {
+                far_first_bad = s as i64;
+                far_first_bad_pte = pte;
+            }
+        }
+    }
+    let fill_global = far_probed as usize == R5_FAR_PROBE.len() && far_match == far_probed;
+    let scratch_fill = uniform_nonzero && fill_wellformed && fill_is_bdsm && fill_global;
+    if uniform_nonzero {
+        serial_println!(
+            ":: gen7: r5 fill-check fill={:08X} bdsm={:08X} bdsm_base={:08X} wellformed={} frame_is_bdsm={} far_match={}/{} far_probed={} far_first_bad_slot={} far_first_bad_pte={:08X} scratch_fill={} src=METAL/BootAb dec=derived-this-boot ::",
+            fill,
+            bdsm,
+            bdsm_base,
+            if fill_wellformed { 1 } else { 0 },
+            if fill_is_bdsm { 1 } else { 0 },
+            far_match,
+            R5_FAR_PROBE.len(),
+            far_probed,
+            far_first_bad,
+            far_first_bad_pte,
+            if scratch_fill { 1 } else { 0 }
+        );
+    }
+
+    // ---- Branch on R3's verdict -------------------------------------------------------
+    if !wake.reachable() {
+        // DARK branch — the read-only recon, writes NOTHING. The outcome Boot D's R2
+        // `gt-still-dark` makes most likely. Loud on purpose: R5 read the ring block and the
+        // window through the closed well and is gated on the wake.
+        serial_println!(
+            ":: gen7: r5 verdict=gated-on-wake wake={} ring_structured={}/{} all_zero={} scratch_fill={} writes=0 note=R3-did-not-wake-the-GT-no-ring-armed-behind-a-closed-well ::",
+            wake.name(),
+            ring.structured,
+            ring.n,
+            if all_zero { 1 } else { 0 },
+            if scratch_fill { 1 } else { 0 }
+        );
+        serial_println!(
+            ":: gen7: r5 next=STOP-gated-on-forcewake-GEN7-vs-Kepler-decision-goes-to-Peter-with-R2-gt-still-dark-and-R3-fw-no-ack note=no-ring-armed ::"
+        );
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
+    if !wake.write_ok() {
+        // WokeNoAck — reachable enough to READ, but the ack never asserted. First-ever ring
+        // arm on live silicon is not justified by an ack-less wake, exactly as R4 withholds
+        // its PTE round-trip. Recon ran; the ring is not armed.
+        serial_println!(
+            ":: gen7: r5 verdict=exec-gated-on-ack wake={} all_zero={} scratch_fill={} ring_structured={}/{} writes=0 note=ack-less-wake-recon-ran-but-first-ring-arm-withheld-for-want-of-a-confirmed-ack ::",
+            wake.name(),
+            if all_zero { 1 } else { 0 },
+            if scratch_fill { 1 } else { 0 },
+            ring.structured,
+            ring.n
+        );
+        serial_println!(
+            ":: gen7: r5 next=STOP-wake-unconfirmed-no-ack-confirm-the-ack-register-before-arming-a-ring note=no-ring-armed ::"
+        );
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
+
+    // WRITE branch — a CONFIRMED wake. The window must be verified unowned before any write; an
+    // owned window is refused, never overwritten (draft §5 refusal law). A uniform non-zero
+    // window that FAILED a fill leg is its own loud park — the fill hypothesis was falsified by
+    // a read.
+    if !all_zero && !scratch_fill {
+        if uniform_nonzero {
+            serial_println!(
+                ":: gen7: r5 verdict=fill-hypothesis-refuted fill={:08X} bdsm_base={:08X} wellformed={} frame_is_bdsm={} far_match={}/{} writes=0 note=window-uniform-but-a-fill-leg-said-NO-treat-as-owned-never-overwrite ::",
+                fill,
+                bdsm_base,
+                if fill_wellformed { 1 } else { 0 },
+                if fill_is_bdsm { 1 } else { 0 },
+                far_match,
+                R5_FAR_PROBE.len()
+            );
+            serial_println!(":: gen7: r5 next=STOP-uniform-window-is-not-the-derived-scratch-fill-park-and-report note=no-ring-armed ::");
+        } else {
+            serial_println!(
+                ":: gen7: r5 verdict=range-owned-refused ring_pre={:08X} tgt_pre={:08X} prev={:08X} next={:08X} writes=0 note=something-owns-the-two-slot-window-never-overwrite-a-populated-PTE ::",
+                ring_pre_img,
+                tgt_pre_img,
+                prev_nb,
+                next_nb
+            );
+            serial_println!(":: gen7: r5 next=STOP-candidate-window-owned-choose-another-R5_RING_SLOT note=no-ring-armed ::");
+        }
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
+    let base_img: u32 = if all_zero { 0 } else { fill };
+    let mode = if all_zero { "empty" } else { "scratch-fill" };
+
+    // ---- Allocate the two real pages (ring + target), translate, guard --------------------
+    let layout = Layout::from_size_align(4096, 4096).unwrap();
+    let ring_page = alloc_zeroed(layout);
+    if ring_page.is_null() {
+        serial_println!(":: gen7: r5 verdict=alloc-failed which=ring writes=0 note=ring-page-alloc-returned-null-nothing-written ::");
+        serial_println!(":: gen7: r5 next=STOP-no-ring-page note=no-ring-armed ::");
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
+    let tgt_page = alloc_zeroed(layout);
+    if tgt_page.is_null() {
+        // ring_page is LEAKED, not freed: nothing has mapped it into the GGTT yet, but the
+        // module's rule is refuse-on-any-doubt and a bare 4 KiB boot-time leak is the safe side.
+        serial_println!(":: gen7: r5 verdict=alloc-failed which=target writes=0 note=target-page-alloc-returned-null-ring-page-leaked-nothing-written ::");
+        serial_println!(":: gen7: r5 next=STOP-no-target-page note=no-ring-armed ::");
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
+    let Some(ring_phys64) = crate::arch::memory::translate(ring_page as u64) else {
+        serial_println!(":: gen7: r5 verdict=virt-unmapped which=ring va={:016X} writes=0 note=ring-page-not-mapped-pages-leaked-nothing-written ::", ring_page as usize);
+        serial_println!(":: gen7: r5 next=STOP-ring-va-unmapped note=no-ring-armed ::");
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    };
+    let Some(tgt_phys64) = crate::arch::memory::translate(tgt_page as u64) else {
+        serial_println!(":: gen7: r5 verdict=virt-unmapped which=target va={:016X} writes=0 note=target-page-not-mapped-pages-leaked-nothing-written ::", tgt_page as usize);
+        serial_println!(":: gen7: r5 next=STOP-target-va-unmapped note=no-ring-armed ::");
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    };
+    let ring_phys = ring_phys64 as usize;
+    let tgt_phys = tgt_phys64 as usize;
+    // Gen7 GGTT PTEs carry extended physical bits 39:32 in PTE bits 7:4, which this rung does not
+    // program (draft G6) — refuse anything above 4 GiB, same guard as R4 and the tree's ring.
+    if ring_phys >= 0x1_0000_0000 || tgt_phys >= 0x1_0000_0000 {
+        serial_println!(":: gen7: r5 verdict=phys-above-4g ring_phys={:016X} tgt_phys={:016X} writes=0 note=extended-PTE-bits-not-programmed-pages-leaked-nothing-written ::", ring_phys, tgt_phys);
+        serial_println!(":: gen7: r5 next=STOP-scratch-phys-above-4g note=no-ring-armed ::");
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
+    let ring_pte = (ring_phys as u32) | 1; // valid bit — draft G6
+    let tgt_pte = (tgt_phys as u32) | 1;
+    // R4b indistinctness refusal: a PTE equal to the entry image makes its transition
+    // unwitnessable. Checked for BOTH slots — an instrument that cannot say NO is a Wall D defect.
+    if ring_pte == base_img || tgt_pte == base_img {
+        serial_println!(
+            ":: gen7: r5 verdict=pte-indistinct mode={} ring_pte={:08X} tgt_pte={:08X} base_img={:08X} writes=0 note=transition-unwitnessable-pages-leaked-nothing-written ::",
+            mode,
+            ring_pte,
+            tgt_pte,
+            base_img
+        );
+        serial_println!(":: gen7: r5 next=STOP-pte-equals-entry-image note=no-ring-armed ::");
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
+    // RING_BUFFER_START constraint (§1.1.11.3, p.77): the ring's GGTT address bits[31:29] MUST be
+    // zero. `R5_RING_SLOT` is chosen to satisfy this, but it is load-bearing and PINNED, so it is
+    // VERIFIED on the wire rather than trusted — a future edit to the slot that broke it would
+    // park here, not silently program an illegal RING_START.
+    let ring_gtt_addr = (R5_RING_SLOT * 4096) as u32;
+    let tgt_gtt_addr = (R5_TGT_SLOT * 4096) as u32;
+    if ring_gtt_addr & 0xE000_0000 != 0 {
+        serial_println!(
+            ":: gen7: r5 verdict=ring-addr-illegal ring_gtt_addr={:08X} note=RING_START-requires-bits-31:29-zero-IVB-V1P3-1.1.11.3-p77-pick-a-lower-slot writes=0 ::",
+            ring_gtt_addr
+        );
+        serial_println!(":: gen7: r5 next=STOP-ring-address-violates-RING_START-31:29-zero note=no-ring-armed ::");
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
+
+    // ---- Pre-write gate: re-read the four touched slots against a fresh baseline ----------
+    // The window was verified unowned above; the touched slots are re-read here so any drift
+    // between census and claim means the window changed under us and the write is REFUSED —
+    // park, never improvise past a diverging read.
+    let ring_slot_pre = rd(bar0, ring_off);
+    let tgt_slot_pre = rd(bar0, tgt_off);
+    let prev_pre = rd(bar0, prev_off_g);
+    let next_pre = rd(bar0, next_off_g);
+    if ring_slot_pre != base_img || tgt_slot_pre != base_img || prev_pre != base_img || next_pre != base_img {
+        serial_println!(
+            ":: gen7: r5 verdict=entry-drifted mode={} ring_pre={:08X} tgt_pre={:08X} prev_pre={:08X} next_pre={:08X} base_img={:08X} writes=0 note=window-changed-between-census-and-claim-pages-leaked-nothing-written ::",
+            mode,
+            ring_slot_pre,
+            tgt_slot_pre,
+            prev_pre,
+            next_pre,
+            base_img
+        );
+        serial_println!(":: gen7: r5 next=STOP-entry-image-drifted-park-and-report note=no-ring-armed ::");
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
+
+    // ---- Build the ring contents through the ring page's CPU mapping ----------------------
+    // The ring page is CPU-writable directly (its heap VA); the GGTT PTE makes the SAME physical
+    // page GT-readable at `ring_gtt_addr`. Zero it first (redundant after alloc_zeroed, but the
+    // brief asks for it explicitly and it makes the MI_NOOP tail after the command an invariant,
+    // not a coincidence of the allocator). Then the single command + NOOP padding:
+    //   DW0 MI_STORE_DATA_IMM header, DW1 reserved(0), DW2 target GGTT address, DW3 sentinel,
+    //   DW4..7 MI_NOOP. 8 DWords = 32 bytes = QWord aligned, so the tail is legal (§1.1.11.1).
+    let ring_u32 = ring_page as *mut u32;
+    for i in 0..1024usize {
+        core::ptr::write_volatile(ring_u32.add(i), MI_NOOP);
+    }
+    core::ptr::write_volatile(ring_u32.add(0), MI_STORE_DATA_IMM_DW0);
+    core::ptr::write_volatile(ring_u32.add(1), 0x0000_0000); // DW1 reserved MBZ
+    core::ptr::write_volatile(ring_u32.add(2), tgt_gtt_addr); // DW2 Address[31:2], 4KB-aligned
+    core::ptr::write_volatile(ring_u32.add(3), R5_SENTINEL); // DW3 Data DWord 0
+    core::ptr::write_volatile(ring_u32.add(4), MI_NOOP);
+    core::ptr::write_volatile(ring_u32.add(5), MI_NOOP);
+    core::ptr::write_volatile(ring_u32.add(6), MI_NOOP);
+    core::ptr::write_volatile(ring_u32.add(7), MI_NOOP);
+    const RING_TAIL_BYTES: u32 = 8 * 4; // 8 DWords consumed; tail is the QWord-past-last (0x20)
+
+    // Seed the target page so a hit is a transition, not a pre-existing pattern. Read it back
+    // through its own CPU mapping under a fence so the seed is visible before the GT could store.
+    let tgt_u32 = tgt_page as *mut u32;
+    core::ptr::write_volatile(tgt_u32, R5_TGT_SEED);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    let tgt_seed_rb = core::ptr::read_volatile(tgt_u32 as *const u32);
+
+    // ---- Write the two GGTT PTEs (ring first, then target), read back under the hold ------
+    wr(bar0, ring_off, ring_pte);
+    wr(bar0, tgt_off, tgt_pte);
+    let ring_slot_held = rd(bar0, ring_off);
+    let tgt_slot_held = rd(bar0, tgt_off);
+    let prev_held = rd(bar0, prev_off_g);
+    let next_held = rd(bar0, next_off_g);
+    let ptes_landed = ring_slot_held == ring_pte && tgt_slot_held == tgt_pte;
+    let smear_held = prev_held != prev_pre || next_held != next_pre;
+    serial_println!(
+        ":: gen7: r5 claim mode={} ring_off={:06X} ring_pte={:08X} ring_held={:08X} tgt_off={:06X} tgt_pte={:08X} tgt_held={:08X} ptes_landed={} smear_held={} ring_phys={:016X} tgt_phys={:016X} ::",
+        mode,
+        ring_off,
+        ring_pte,
+        ring_slot_held,
+        tgt_off,
+        tgt_pte,
+        tgt_slot_held,
+        if ptes_landed { 1 } else { 0 },
+        if smear_held { 1 } else { 0 },
+        ring_phys,
+        tgt_phys
+    );
+
+    // ---- Arm the ring and submit --------------------------------------------------------
+    // Only if the PTEs actually landed and nothing smeared — arming a ring whose GGTT mapping
+    // did not take (a gated array on a woken GT, the R4 `claim-write-void` shape) would point
+    // the CS at garbage. `armed=0` here is an honest reading, not a failure to hide.
+    let mut armed = false;
+    let mut head_at_arm = 0u32;
+    let mut head_post = 0u32;
+    let mut iters = 0u32;
+    let mut cyc: u64 = 0;
+    let mut tgt_post = tgt_seed_rb;
+    let mut ctl_readback_en = 0u32;
+    if ptes_landed && !smear_held {
+        // Program order mirrors the tree's proven BLT bring-up (`igpu.rs` ~903-907): disable,
+        // set START, zero HEAD, zero TAIL, then enable. Head/Tail "must be properly programmed
+        // before it is enabled" (§1.1.11.4 p.78).
+        wr(bar0, g7regs::RCS_RING_CTL, 0);
+        wr(bar0, g7regs::RCS_RING_START, ring_gtt_addr);
+        wr(bar0, g7regs::RCS_RING_HEAD, 0);
+        wr(bar0, g7regs::RCS_RING_TAIL, 0);
+        wr(bar0, g7regs::RCS_RING_CTL, RCS_RING_CTL_1PAGE_EN);
+        ctl_readback_en = rd(bar0, g7regs::RCS_RING_CTL);
+        head_at_arm = rd(bar0, g7regs::RCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+        armed = true;
+        serial_println!(
+            ":: gen7: r5 ring-armed start={:08X} ctl_wrote={:08X} ctl_readback={:08X} ctl_enabled={} head_at_arm={:08X} tail_target={:08X} sentinel={:08X} tgt_gtt_addr={:08X} tgt_seed_rb={:08X} ::",
+            ring_gtt_addr,
+            RCS_RING_CTL_1PAGE_EN,
+            ctl_readback_en,
+            ctl_readback_en & 1,
+            head_at_arm,
+            RING_TAIL_BYTES,
+            R5_SENTINEL,
+            tgt_gtt_addr,
+            tgt_seed_rb
+        );
+
+        // Advance the tail — this is the submit. Then poll HEAD (masked) reaching the tail AND
+        // the sentinel landing, whichever first, under a bounded budget bracketed by rdtsc so
+        // `cyc=` turns the iteration count into a real number the first time this flies.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        wr(bar0, g7regs::RCS_RING_TAIL, RING_TAIL_BYTES);
+        const EXEC_POLL_MAX: u32 = 1_000_000;
+        let t0 = crate::arch::now_cycles();
+        loop {
+            head_post = rd(bar0, g7regs::RCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+            tgt_post = core::ptr::read_volatile(tgt_u32 as *const u32);
+            if head_post == RING_TAIL_BYTES || tgt_post == R5_SENTINEL {
+                break;
+            }
+            iters += 1;
+            if iters >= EXEC_POLL_MAX {
+                break;
+            }
+        }
+        cyc = crate::arch::now_cycles().wrapping_sub(t0);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        tgt_post = core::ptr::read_volatile(tgt_u32 as *const u32);
+    }
+
+    // ---- The exec verdict — every arm named before the rung ran -------------------------
+    //  claim-write-void  a PTE did not land (GGTT gated on a woken GT, well released) or the
+    //                    store smeared a neighbour → the ring was never armed. Honest, not dead.
+    //  sentinel-hit      the target DWord reads the sentinel AND the head reached the tail →
+    //                    the GT PARSED our ring and EXECUTED the store. The first executed
+    //                    command in the ladder. STOP HERE, this is the win.
+    //  sentinel-hit-head-stuck  the store landed but the head never reached the tail → the
+    //                    store executed yet the CS did not retire the whole ring; a partial,
+    //                    surprising, real finding.
+    //  sentinel-miss     the head reached the tail but the target still holds the seed → the CS
+    //                    advanced past the command without the store taking effect (privilege,
+    //                    coherency, or a mis-encoded address); a finding, not a null.
+    //  head-stuck        the head never reached the tail and no sentinel → the CS did not parse
+    //                    our ring, the EXPECTED outcome for a bare ring with no default context
+    //                    (the §1.1.11.4 p.79 programming-note caveat coming true).
+    let head_done = head_post == RING_TAIL_BYTES;
+    let head_moved = armed && head_post != head_at_arm;
+    let sentinel_hit = tgt_post == R5_SENTINEL;
+    let exec_verdict = if !armed {
+        "claim-write-void"
+    } else if sentinel_hit && head_done {
+        "sentinel-hit"
+    } else if sentinel_hit {
+        "sentinel-hit-head-stuck"
+    } else if head_done {
+        "sentinel-miss"
+    } else if head_moved {
+        "head-stuck-partial"
+    } else {
+        "head-stuck"
+    };
+    serial_println!(
+        ":: gen7: r5 exec verdict={} armed={} head_at_arm={:08X} head_post={:08X} head_done={} head_moved={} tail={:08X} tgt_seed={:08X} tgt_post={:08X} sentinel={:08X} sentinel_hit={} iters={} cyc={} ctl_enabled={} ::",
+        exec_verdict,
+        if armed { 1 } else { 0 },
+        head_at_arm,
+        head_post,
+        if head_done { 1 } else { 0 },
+        if head_moved { 1 } else { 0 },
+        RING_TAIL_BYTES,
+        tgt_seed_rb,
+        tgt_post,
+        R5_SENTINEL,
+        if sentinel_hit { 1 } else { 0 },
+        iters,
+        cyc,
+        ctl_readback_en & 1
+    );
+
+    // ---- Teardown — ring disabled (proven), PTEs restored (proven), pages leaked ----------
+    // Disable the ring and PROVE bit 0 cleared by readback — a ring left enabled over a GGTT
+    // page we are about to stop tracking is exactly the DMA-into-reused-heap hazard the leak
+    // rule guards, so "disabled" is verified, never asserted. Zero START/HEAD/TAIL too so the
+    // register block is back to its default (0x00000000) reset image.
+    wr(bar0, g7regs::RCS_RING_CTL, 0);
+    let ctl_off = rd(bar0, g7regs::RCS_RING_CTL);
+    wr(bar0, g7regs::RCS_RING_TAIL, 0);
+    wr(bar0, g7regs::RCS_RING_HEAD, 0);
+    wr(bar0, g7regs::RCS_RING_START, 0);
+    let ring_disabled = ctl_off & 1 == 0;
+
+    // Restore both PTE slots and their neighbours to the captured entry image (the neighbour
+    // writes are identities — each was gate-verified equal to `base_img`), then re-read all four
+    // to prove the neighbourhood is back. Restore is not assumed.
+    wr(bar0, prev_off_g, base_img);
+    wr(bar0, ring_off, base_img);
+    wr(bar0, tgt_off, base_img);
+    wr(bar0, next_off_g, base_img);
+    let ring_post = rd(bar0, ring_off);
+    let tgt_post_pte = rd(bar0, tgt_off);
+    let prev_post = rd(bar0, prev_off_g);
+    let next_post = rd(bar0, next_off_g);
+    let ptes_restored =
+        ring_post == base_img && tgt_post_pte == base_img && prev_post == base_img && next_post == base_img;
+    let smear_post = prev_post != prev_pre || next_post != next_pre;
+    let restored = ring_disabled && ptes_restored && !smear_post;
+    serial_println!(
+        ":: gen7: r5 teardown restored={} ring_disabled={} ctl_off={:08X} ring_post={:08X} tgt_post={:08X} prev_post={:08X} next_post={:08X} base_img={:08X} smear_post={} leaked=2 note=pages-leaked-no-GGTT-TLB-invalidation-rung-exists-yet-per-R4b-rule ::",
+        if restored { 1 } else { 0 },
+        if ring_disabled { 1 } else { 0 },
+        ctl_off,
+        ring_post,
+        tgt_post_pte,
+        prev_post,
+        next_post,
+        base_img,
+        if smear_post { 1 } else { 0 }
+    );
+
+    // The two scratch pages are LEAKED, never freed — the R4b rule: with no GGTT TLB-invalidation
+    // rung, a translation the GT cached to either page during the hold could outlive a free and
+    // DMA into reused kernel heap. 8 KiB, boot-once, refuse-on-any-doubt. `ring_page`/`tgt_page`
+    // deliberately fall out of scope without a `dealloc`; `layout` is dropped harmlessly.
+    let _ = (ring_page, tgt_page, layout);
+
+    // MMIO writes, counted honestly (not a fabricated constant): 2 claim PTEs + 4 restore PTEs
+    // (target/ring + both neighbours) + 4 teardown ring-register zeros (CTL/TAIL/HEAD/START), and
+    // when the ring was armed, +6 for the arm (CTL=0, START, HEAD, TAIL, CTL=enable, TAIL=advance).
+    // Ring-page/target-page stores are CPU-memory writes, not MMIO, and are excluded — the same
+    // convention R4's `writes=` uses (it counts GGTT/register writes, not the scratch page).
+    let mmio_writes: u32 = 2 + 4 + 4 + if armed { 6 } else { 0 };
+    serial_println!(
+        ":: gen7: r5 verdict={} mode={} wake={} armed={} restored={} mmio_writes={} note=one-MI_STORE_DATA_IMM-ring-direct-ring-disabled-and-PTEs-restored-no-display-register-touched ::",
+        exec_verdict,
+        mode,
+        wake.name(),
+        if armed { 1 } else { 0 },
+        if restored { 1 } else { 0 },
+        mmio_writes
+    );
+    serial_println!(
+        ":: gen7: r5 next={} note=first-executed-command-attempt-ring-torn-down-pages-leaked ::",
+        match exec_verdict {
+            "sentinel-hit" =>
+                "R6-a-real-batch-buffer-MI_BATCH_BUFFER_START-and-a-PIPE_CONTROL-flush-the-GT-executes",
+            "sentinel-hit-head-stuck" =>
+                "STOP-store-executed-but-head-did-not-retire-investigate-CS-arbitration-before-R6",
+            "sentinel-miss" =>
+                "STOP-head-retired-but-no-store-check-privilege-and-MI_STORE_DATA_IMM-address-encoding",
+            "claim-write-void" =>
+                "STOP-GGTT-gated-with-well-released-R6-must-hold-forcewake-around-the-ring-arm",
+            _ =>
+                "STOP-CS-did-not-parse-the-bare-ring-a-default-render-context-is-needed-first-per-1.1.11.4-p79",
+        }
+    );
+    serial_println!(":: gen7: r5 end ::");
+}

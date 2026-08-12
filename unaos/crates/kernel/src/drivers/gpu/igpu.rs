@@ -609,6 +609,22 @@ pub fn init(gpu: &GpuInfo) {
         #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
         super::gen7::claim(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
 
+        // GEN7-3D rung R5 — the first EXECUTED command (UNAOS_IVB3D). It reads R3's `GtWake`
+        // verdict and self-gates on the same `write_ok()` evidence R4's PTE round-trip uses. On a
+        // CONFIRMED wake it claims TWO GGTT slots via the R4b path (a ring page + a target page),
+        // maps a minimal RCS ring, submits one MI_STORE_DATA_IMM (IVB-V1P3 §1.2.17 p.186) that
+        // stores a sentinel to the target page's GGTT address, and proves execution by reading the
+        // sentinel back through the target page's own CPU mapping. Then it disables the ring
+        // (proven by CTL readback), restores both PTEs and their neighbours to their entry images
+        // and re-reads, and LEAKS both pages (no GGTT TLB-invalidation rung exists yet — the R4b
+        // rule). On a `Dark`/`WokeNoAck` wake it runs the read-only recon and writes nothing
+        // (`gated-on-wake` / `exec-gated-on-ack`) — the outcome Boot D's `gt-still-dark` makes most
+        // likely. Placed AFTER `claim` and still BEFORE `bring_up_blt_ring`. It writes at most two
+        // GGTT PTEs and the four RCS ring registers (all zeroed on teardown), no display register,
+        // so R5 cannot black Peter's screen; a GT fault parks the CS, it does not touch scanout.
+        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
+        super::gen7::execute(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
+
         // BLT ring bring-up. SEAT FIXUP (review round 2): an ACCELERATOR must degrade, never kill
         // the boot — every refusal below breaks out of this block, the ring simply never comes up,
         // `blitter_*` return false, and the CPU path carries the console exactly as before this
