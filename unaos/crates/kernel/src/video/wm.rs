@@ -1053,6 +1053,12 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     // VUGMIN-B — is the presenting owner hidden? Read under the same guard that marks the row, so the
     // answer and the mark are taken against one table state.
     let skip;
+    // WPACE-PANEL — is this row exempt from the present pacer? Kernel furniture (the console, the
+    // shell, the desktop — anything in the reserved owner band) and the compat row (owner 0)
+    // composite on every present exactly as before; only ring-3 presents are panel-paced. Read in
+    // the same table acquisition as the damage mark, like `skip`.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    let pace_exempt;
     {
         let mut t = table();
         let owner = match row_mut(&mut t, id) {
@@ -1093,6 +1099,13 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
                 return Presented::NoRow;
             }
         };
+        // WPACE-PANEL — `owner == 0` is the compat row (never presented through the syscall path,
+        // and `present_background`'s whole-panel cadence is its own pacing); the kernel band is the
+        // console/shell/desktop furniture the brief exempts by name.
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        {
+            pace_exempt = owner == 0 || is_kernel_owner(owner);
+        }
         skip = owner_hidden(&t, owner, SHELL_Z.load(core::sync::atomic::Ordering::Acquire));
     }
     #[cfg(feature = "witness")]
@@ -1118,10 +1131,277 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
         }
         return Presented::Suppressed;
     }
+    // WPACE-PANEL — coalesce this present into the current panel frame if the same window already
+    // composited inside it. The row is ALREADY marked damaged and `presented` above, so nothing is
+    // dropped: the accumulated damage rides the next pass — the same window's first present past
+    // the frame edge, any other caller's composite, or the service drain ([`pace_service`]), which
+    // bounds the wait to one frame. The presenting task is NEVER slept or blocked here: a coalesced
+    // present returns `Composited` immediately (the damage is committed and a pass inside the frame
+    // is guaranteed), so the syscall layer treats it exactly like a present whose composite ran.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    if !pace_admit(id, pace_exempt) {
+        #[cfg(feature = "witness")]
+        wcn_tick();
+        return Presented::Composited;
+    }
     composite();
     #[cfg(feature = "witness")]
     wcn_tick();
     Presented::Composited
+}
+
+// ---- WPACE-PANEL — the panel-locked present pacer (x86 + `wc`) ----------------------------------
+//
+// ### The defect (GR27 Boot A, ~/unaos-bench/capture/gr27-bootA/ttyUSB0.log)
+// User vugs present at 233–453/s on a 60 Hz panel (`[wcn] win=3 att=2268 rate=453.9/s`). Every one
+// of those presents runs a full composite through `COMP_GATE`, which is SERIAL on x86, so a 450/s
+// storm starves the interactive paths — "window dragging performance is shot" (operator, on glass).
+// The panel can scan out at most ~60 of those frames; the other ~390 composites per second bought
+// pixels no operator could ever see, at the direct expense of the composites an operator was
+// waiting on.
+//
+// ### The law this implements (operator amendment, 2026-08-11, on 999 fps metal)
+// *Pace presents to the PANEL's refresh by default — the sin was arbitrary-rate sleeping, not
+// panel-locking.* The GR26 pacer was removed because it slept the renderer inside the syscall at a
+// rate the OS invented (`[wpace] paced=311 slept=4615ms` — every present delayed). This pacer keeps
+// the half that was right and discards the half that was the sin:
+//
+//  * **the app is never slept** — a present arriving inside the current frame of the same window's
+//    last COMPOSITED present returns immediately. Its damage is already committed to the row
+//    (`damage_rows`/`damage_all` ran before the decision), so consecutive coalesced presents
+//    ACCUMULATE damage and the next pass composites the union once;
+//  * **the panel still gets every frame** — a window's first present past the frame edge composites
+//    in present context exactly as before (so a steady stream self-paces to the panel with no help),
+//    and a stream that STOPS mid-frame is drained by [`pace_service`] on the device-service pass,
+//    which bounds a deferred present's time-to-glass to one frame plus one service tick (~1 ms);
+//  * **nothing else is paced** — kernel furniture (console/shell/desktop) and the compat row are
+//    exempt at the decision, and drag-driven composites (`move_to_inner`) never pass through
+//    `present_banded` at all, so the interactive paths this pacer exists to protect are untouched.
+//
+// ### Namespace note
+// `pace_*` slots are `id - 1`, i.e. the `[wcn] win=` namespace — NOT the `[wpace] win=` namespace
+// the (default-off) `vsyncpace` syscall pacer prints, which indexes the syscall window-id table
+// (historically `wcn = wpace + 2`). The `[wpace] … mode=panel` lines this module emits carry
+// `asid=` so a capture can join them against `[wcn]` without guessing; `mode=` separates the two
+// emitters on the wire, per the standing rule that `[wpace] mode=` names the pacing regime a
+// capture was taken under.
+//
+// ### Slot recycling, and why `close` is not touched
+// A recycled slot inherits the dead window's `PACE_LAST_CYC` stamp, so a new tenant's very first
+// present can be coalesced into the tail of a frame it never presented in. That is a one-frame,
+// once-per-recycle delay bounded by the same drain as every other deferral, and accepting it keeps
+// this pacer entirely out of the close/reclaim/park paths (owned by a parallel arc).
+
+/// WPACE-PANEL — the panel frame, in microseconds, for the witness line and the `tsc_hz` fallback.
+/// The same 60 Hz constant `[wc-h]`/`[wc-g]` already print as `frame_us=16667`; the bench panel and
+/// the built-in rMBP panel both scan out at 60 Hz. If a panel with a different rate ever matters,
+/// this becomes a query of the display driver — one constant, one place.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+const PACE_FRAME_US: u64 = 16_667;
+
+/// WPACE-PANEL — `now_cycles()` at each window's last present-driven (or drain-driven) composite.
+/// `0` = never composited under the pacer, which admits the first present unconditionally. rdtsc,
+/// not `arch::ms()`: the APIC ms clock is advanced only by the BSP and stalls under masked holders
+/// (the WCSER ledger measured ~123 ms of loss in one syscall), and a pacer reading a stalled clock
+/// coalesces forever.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_LAST_CYC: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// WPACE-PANEL — one bit per slot: a present was coalesced and its damage has not yet been claimed
+/// by a pass this pacer knows about. The idle test [`pace_service`] runs at ~1 kHz is one relaxed
+/// load of this word. Over-set is safe (a drain that finds no damage is one gate probe and out);
+/// under-set is not, which is why the bit is set BEFORE the coalesced present returns.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_PENDING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+const _: () = assert!(MAX_WINDOWS <= 32); // PACE_PENDING is one u32 bitmask
+
+/// WPACE-PANEL — the panel frame in rdtsc cycles, or `0` while the TSC is uncalibrated (pre-
+/// `apic::calibrate`, i.e. the first ~116 ms of boot), during which the pacer stands aside and
+/// every present composites — the pre-pacer behaviour, on a boot phase with no vug storm to pace.
+/// `tsc_hz / 60` IS 16.67 ms; deriving it from the rate rather than multiplying out
+/// [`PACE_FRAME_US`] keeps the frame exact instead of 999 cycles short per frame.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline]
+fn pace_frame_cycles() -> u64 {
+    crate::arch::apic::tsc_hz() / 60
+}
+
+/// WPACE-PANEL — the decision, taken after the damage mark and before [`composite`]. Returns `true`
+/// when this present should composite now (frame edge, exempt row, or pacer disengaged) and `false`
+/// when it was coalesced into the frame in flight. Never blocks, never sleeps: every path is a
+/// bounded handful of atomic operations.
+///
+/// The frame-edge claim is a compare-exchange on the window's own stamp, so exactly ONE of N racing
+/// presents of the same window composites per frame edge; the losers coalesce onto the winner's
+/// pass, which is the correct outcome (their damage is already in the row the winner is about to
+/// snapshot — over-coalescing here loses nothing, and [`pace_service`] backstops the frame bound).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn pace_admit(id: WinId, exempt: bool) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    if exempt {
+        return true;
+    }
+    let slot = (id as usize).wrapping_sub(1);
+    if slot >= MAX_WINDOWS {
+        return true;
+    }
+    let frame = pace_frame_cycles();
+    if frame == 0 {
+        return true; // TSC uncalibrated: free mode, exactly the pre-pacer path
+    }
+    let now = crate::arch::now_cycles();
+    let last = PACE_LAST_CYC[slot].load(Relaxed);
+    if last == 0 || now.wrapping_sub(last) >= frame {
+        if PACE_LAST_CYC[slot]
+            .compare_exchange(last, now, Relaxed, Relaxed)
+            .is_ok()
+        {
+            // This pass will carry any damage a coalesced present left behind, so the pending bit
+            // comes down with it — cleared BEFORE the composite, so a present coalescing on another
+            // core DURING our pass re-raises it and is re-drained rather than lost.
+            PACE_PENDING.fetch_and(!(1u32 << slot), Relaxed);
+            #[cfg(feature = "witness")]
+            WPACE_PACED[slot].fetch_add(1, Relaxed);
+            return true;
+        }
+        // Lost the frame-edge race: a concurrent present of this same window claimed the frame and
+        // its pass is (or will be) compositing the shared row. Fall through to coalesce.
+    }
+    PACE_PENDING.fetch_or(1u32 << slot, Relaxed);
+    #[cfg(feature = "witness")]
+    WPACE_COALESCED[slot].fetch_add(1, Relaxed);
+    false
+}
+
+/// WPACE-PANEL — the TAIL DRAIN: give a coalesced present a taker that is not a present.
+///
+/// The steady-storm case needs no help — the same window's next present past the frame edge
+/// composites the accumulated damage. The case this exists for is the stream that STOPS mid-frame:
+/// its final present was coalesced, no later present is coming, and without a drain the window's
+/// last frame would sit in its surface until some unrelated pass happened by (`service_damage`
+/// rides `Screen::flush`, whose idle cadence is the status strip's ~1/s — visibly late). This is
+/// the same liveness structure the deferred-erase queue has (WC-L), with the same class of taker.
+///
+/// Called from `wcx::desktop_app_service` — the `wc`-gated body on `x86_usb_pump`'s ~1 kHz
+/// device-service pass — so a deferred present reaches glass within one frame plus one service
+/// tick. Main-loop context, never IRQ, unmasked: exactly the context `composite` already runs in
+/// from `service_damage` and the paygo taker, and the WCSER re-run loop treats it as an unmasked
+/// holder. Idle cost is one relaxed load; pending-but-not-due costs one `tsc_hz` read and a
+/// bounded scan of [`MAX_WINDOWS`] stamps, no locks.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn pace_service() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let pend = PACE_PENDING.load(Relaxed);
+    if pend == 0 {
+        return;
+    }
+    let frame = pace_frame_cycles();
+    let now = crate::arch::now_cycles();
+    let mut due = 0u32;
+    for slot in 0..MAX_WINDOWS {
+        if pend & (1u32 << slot) == 0 {
+            continue;
+        }
+        // `frame == 0` (TSC lost calibration — cannot happen after boot, but the honest degraded
+        // answer) drains immediately rather than never.
+        if frame == 0 || now.wrapping_sub(PACE_LAST_CYC[slot].load(Relaxed)) >= frame {
+            due |= 1u32 << slot;
+        }
+    }
+    if due == 0 {
+        return; // the frame in flight has not ended; the next pass (~1 ms) re-asks
+    }
+    // Claim before compositing, for pace_admit's reason inverted: a present that coalesces on
+    // another core after this claim re-raises its bit and the NEXT pass drains it — one frame is
+    // still one frame. The stamp is advanced too, so a due window that keeps presenting does not
+    // double-composite at the drain and the frame edge within the same frame.
+    PACE_PENDING.fetch_and(!due, Relaxed);
+    for slot in 0..MAX_WINDOWS {
+        if due & (1u32 << slot) != 0 {
+            PACE_LAST_CYC[slot].store(now, Relaxed);
+            #[cfg(feature = "witness")]
+            WPACE_TAIL[slot].fetch_add(1, Relaxed);
+        }
+    }
+    // One pass covers every due window: `composite` snapshots ALL damaged rows. A window whose
+    // coalesced damage some other pass already consumed costs this pass nothing — `composite_once`
+    // finds no damage and returns.
+    composite();
+    // Re-arm any due slot whose damage is STILL standing. The pass above can be DECLINED on
+    // `COMP_GATE` against a masked holder whose table snapshot predated the coalesced damage; the
+    // standing machinery then leaves `COMP_PENDING` for `service_damage` (~1 s idle cadence) or the
+    // next present — neither of which is frame-paced. Re-raising the bit puts the drain back on
+    // this lane: the stamp written above means the slot re-matures one frame from now, so a
+    // stranded frame costs one extra frame, not one second. A bit re-raised because a concurrent
+    // present re-marked the row mid-pass is exactly right too (that damage is a new frame owed).
+    // One table acquisition at drain rate (≤ 60/s while anything coalesces), no framebuffer access.
+    {
+        let t = table();
+        let mut rearm = 0u32;
+        for slot in 0..MAX_WINDOWS {
+            if due & (1u32 << slot) != 0 && t.rows[slot].used && t.rows[slot].damaged {
+                rearm |= 1u32 << slot;
+            }
+        }
+        if rearm != 0 {
+            PACE_PENDING.fetch_or(rearm, Relaxed);
+        }
+    }
+}
+
+/// WPACE-PANEL witness — presents that composited in present context under the pacer (frame-edge
+/// admissions of pace-eligible rows). Exempt rows are not counted on either counter: their line is
+/// `[wcn]`'s, unchanged.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+static WPACE_PACED: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// WPACE-PANEL witness — presents absorbed into the frame in flight (returned immediately, damage
+/// accumulated). The storm's measure: Boot A's `win=3` should read `coalesced ≈ 6.5 × paced`.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+static WPACE_COALESCED: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// WPACE-PANEL witness — tail composites [`pace_service`] ran for this window: coalesced damage
+/// whose stream stopped and which the service drain, not a present, put on glass. A steady storm
+/// reads `tail=0`; every non-zero tail is a frame the pre-pacer code would have shown no later
+/// than this one but at 7× the pass cost.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+static WPACE_TAIL: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// WPACE-PANEL witness — drain the pacer's counters and print, one line per window with traffic, on
+/// `[wcn]`'s cadence and from its emitter (the same claim, the same span). Drained with `swap` like
+/// every counter in this block, so a straddling present moves between spans without being lost.
+///
+/// `win=` here is the `[wcn]` namespace and `asid=` is printed so a capture can join the two
+/// without the historical `wcn = wpace + 2` guesswork; `mode=panel` names this emitter against the
+/// (default-off) `vsyncpace` syscall pacer's `mode=` values on the same tag.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+fn wpace_emit(ident: &[(u64, bool, bool, u32); MAX_WINDOWS]) {
+    use core::sync::atomic::Ordering::Relaxed;
+    for slot in 0..MAX_WINDOWS {
+        let paced = WPACE_PACED[slot].swap(0, Relaxed);
+        let coalesced = WPACE_COALESCED[slot].swap(0, Relaxed);
+        let tail = WPACE_TAIL[slot].swap(0, Relaxed);
+        if paced == 0 && coalesced == 0 && tail == 0 {
+            continue;
+        }
+        let (asid, live, _, _) = ident[slot];
+        serial_println!(
+            "[wpace] win={} asid={:#x} live={} mode=panel paced={} coalesced={} tail={} frame_us={}",
+            slot + 1,
+            asid,
+            if live { "yes" } else { "no" },
+            paced,
+            coalesced,
+            tail,
+            PACE_FRAME_US
+        );
+    }
 }
 
 /// Move `id`'s content origin to `(x, y)` on the panel, clamped on BOTH bounds so the window (with
@@ -8257,6 +8537,12 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // is contention. x86 only, for the reason the gate itself is.
     #[cfg(target_arch = "x86_64")]
     wcser_emit(scope, span);
+    // WPACE-PANEL — the present pacer's ledger rides the same cadence, directly under `[wcser]`
+    // whose `declined=` it is the cure for: `coalesced=` climbing while `declined=` falls is the
+    // pacer converting gate contention into absorbed presents. Same identity snapshot as the
+    // `[wcn]` lines above, so `asid=` is judged against one table state.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    wpace_emit(&ident);
     // WCPAR — the per-core stage census rides the same cadence and span, directly under `[wcser]` whose
     // `declined=` it reads against: `cores>1` here while the cross-core `DECL_LOCK` share falls is the
     // flow-arc's positive reading that the per-core pool spread compose off the one shared buffer. Both

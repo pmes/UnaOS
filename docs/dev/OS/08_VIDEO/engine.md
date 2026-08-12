@@ -11529,3 +11529,84 @@ images are byte-identical base-vs-arc (verified by `objcopy -O binary` + `cmp`),
 are unchanged. This is the same 2.5D landing rung the vug SHARD scene and the menu-bar crystal share:
 one crystal across boot, idle demo, and brand mark. Full 3D rotation of the shard at boot (a per-frame
 re-march of the spectrum fans) is the next rung, deferred for the pre-heap frame budget.
+
+## WPACE-PANEL — the panel-locked present pacer (x86 `wc`, GR27)
+
+**The standing amendment (operator, 2026-08-11, on 999 fps metal):** *pace presents to the PANEL's
+refresh by default — the sin was arbitrary-rate sleeping, not panel-locking.* This supersedes the
+VSYNC-PACE r3 default (free-running presents) as policy while keeping every part of r3's argument
+that was about the *sleep*: the GR26 pacer was removed because it parked the presenting task inside
+the syscall at a rate the OS invented (`[wpace] paced=311 slept=4615ms` — 92% of the program's time
+spent asleep by decree). WPACE-PANEL restores panel-locking with **no sleep anywhere in it**.
+
+### The defect it answers (GR27 Boot A)
+
+User vugs presented at 233–453/s on a 60 Hz panel (`[wcn] win=3 att=2268 rate=453.9/s`). Every
+present ran a full composite through `COMP_GATE`, which is serial on x86, so the storm starved the
+interactive paths — "window dragging performance is shot" (operator, on glass). The panel can scan
+out ~60 of those frames a second; the other ~390 composites/s bought pixels no eye could see, at the
+direct cost of the composites an operator was waiting on.
+
+### The mechanism (`wm.rs`: `pace_admit` / `pace_service`; drain hook in `wcx.rs`)
+
+A present is **coalesced, never slept**. In `present_banded`, after the row is marked damaged and
+`presented` (unchanged), the pacer asks one question: has this window already composited inside the
+current panel frame (16 667 µs, measured in rdtsc cycles as `tsc_hz / 60`)?
+
+* **Frame edge** — the present claims the frame with a compare-exchange on the window's own stamp
+  (`PACE_LAST_CYC[slot]`) and composites in present context, exactly the pre-pacer path. Of N racing
+  presents of one window, exactly one composites per edge.
+* **Inside the frame** — the present returns `Composited` immediately. Its damage is already
+  committed to the row, so consecutive coalesced presents accumulate and the next pass composites
+  the union once. The presenting task is never blocked: the coalesced path is a handful of relaxed
+  atomics. A pending bit (`PACE_PENDING`, one u32 bitmask over `MAX_WINDOWS`) is raised before the
+  return.
+* **The tail** — a stream that stops mid-frame still reaches glass within one frame:
+  `wm::pace_service`, called from `wcx::desktop_app_service` on `x86_usb_pump`'s ~1 kHz
+  device-service pass (the PAYGO-TERM taker's lane, same unmasked main-loop context `composite`
+  already runs in), drains any pending window whose frame has ended. Idle cost is one relaxed load
+  per pass. Worst-case time-to-glass for a deferred present: one frame plus one service tick.
+* **GR25's drop/coalesce objection, answered.** r3 rejected coalescing because it "needs a
+  deferred-composite queue to mean newest-frame-wins". It does not here: the window's *surface* is
+  the newest frame by construction (the app draws in place; damage is a union), so the pass that
+  ends the frame composites exactly what a per-frame present would have shown. Nothing is queued,
+  nothing is dropped, no `pal.rs` machinery is involved.
+
+### What is not paced
+
+* **Kernel furniture** — the console, the shell and the desktop (`is_kernel_owner`) and the compat
+  row (owner 0) are exempt at the decision; their presents composite unconditionally as before.
+* **Drag-driven composites** — `move_to_inner`'s pass never goes through `present_banded`; the
+  interactive path the pacer exists to protect is untouched.
+* **Hidden owners** — VUGMIN-B's suppression runs *before* the pacer, so a hidden present neither
+  stamps nor pends (unchanged).
+* **aarch64 and `wc`-off x86** — every piece is `cfg(all(target_arch = "x86_64", feature = "wc"))`;
+  both fold to the pre-pacer code.
+* **Pre-calibration boot** — `tsc_hz() == 0` (first ~116 ms) disengages the pacer entirely.
+
+Slot recycling note: a recycled window id inherits the dead tenant's frame stamp, so a new window's
+first present can be coalesced into a frame it never presented in — a one-frame, once-per-recycle
+delay, drained by the same tail. Accepting it keeps the pacer entirely out of the close/reclaim/park
+paths (owned by a parallel GR27 arc).
+
+### The witness
+
+`[wpace] win=N asid=0x… live=… mode=panel paced=… coalesced=… tail=… frame_us=16667` — one line per
+window with pacer traffic, on `[wcn]`'s rollup cadence from `wcn_emit`, drained with `swap` like
+every counter in that block. `witness`-gated; the mechanism itself is not.
+
+* `paced=` — presents that composited in present context (frame-edge admissions);
+* `coalesced=` — presents absorbed into the frame in flight (returned immediately, damage
+  accumulated);
+* `tail=` — composites `pace_service` ran for damage whose stream stopped. A steady storm reads
+  `tail=0`.
+* `mode=panel` names this emitter and regime, per the standing rule that `[wpace] mode=` says which
+  pacing regime a capture was taken under. **Namespace:** these lines carry the `[wcn] win=`
+  namespace (wm ids) — *not* the syscall pacer's `[wpace] win=` table (historically
+  `wcn = wpace + 2`) — and print `asid=` so a capture joins them against `[wcn]` without guessing.
+  The default-off `vsyncpace` syscall pacer and its `[wpace] pres=`/`rollup` lines are unchanged.
+
+Prediction for the next metal boot (falsifiable): Boot A's `win=3` (453.9/s free) reads
+`paced+tail ≈ 60/s` with `coalesced ≈ 6.5 × paced`, `[wcn] comp_rate` for that window falls to
+~60/s while `att` stays at the program's own rate (the load stays visible — the program still runs
+unrestricted and its presents are still counted), and `[wcser] declined=` falls with it.
