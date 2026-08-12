@@ -1282,16 +1282,21 @@ pub unsafe fn wake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
 // regardless (`igpu.rs` ~778, Boot AS).
 
 /// What R3 concluded about the GT power well, handed to R4 so it branches on a real verdict
-/// rather than re-deriving one. R4's entire safety argument is that it does **not** write GGTT
-/// PTEs behind a closed well, and `reachable()` is the single gate on the one write path in the
-/// rung: `Dark` — the outcome Boot D's `gt-still-dark` makes most likely — routes R4 to a
-/// read-only recon that still produces a verdict.
+/// rather than re-deriving one. R4's safety rests on TWO gates, not one: `reachable()` decides
+/// whether the read-only recon runs at all (`Dark` — the outcome Boot D's `gt-still-dark` makes
+/// most likely — is the arm that writes nothing and reports `gated-on-wake`), and the stricter
+/// `write_ok()` decides whether the single reversible GGTT write is attempted. The write is
+/// withheld on anything short of a **confirmed** wake: this is the first-ever GGTT write on live
+/// silicon, so `WokeNoAck` — reachable enough to READ, but its ack never asserted — gets the
+/// recon and NO write.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GtWake {
-    /// R3 saw the well open: an ack transition AND real battery motion (`gt-woke`).
+    /// R3 saw the well open: an ack transition AND real battery motion (`gt-woke`). Write-eligible.
     Woke,
     /// The battery lit under a hold whose ack never asserted (`gt-woke-noack`): the GT block is
-    /// reachable, the ack register is simply not where we looked.
+    /// reachable, the ack register is simply not where we looked. Recon runs; the GGTT write is
+    /// WITHHELD (`reachable()` but not `write_ok()`) — an ack-less wake is too uncertain to
+    /// justify the first write on live silicon.
     WokeNoAck,
     /// The battery was already live before any write (`gt-live-already`, G1 false on this part):
     /// the well was never closed.
@@ -1302,11 +1307,19 @@ pub enum GtWake {
 }
 
 impl GtWake {
-    /// May R4 attempt its one reversible GGTT write? Only on positive R3 evidence that the GT
-    /// block is reachable. `Dark` is a hard no — that is the structural promise that a closed
-    /// well is never written behind, expressed as a single boolean the write path is gated on.
+    /// May R4 run its read-only recon (ring census + GGTT window census)? True on any positive
+    /// R3 evidence the GT block is reachable. `Dark` is a hard no — the recon still runs its
+    /// verdict, but through the closed well, and NO write is attempted behind it.
     fn reachable(self) -> bool {
         matches!(self, GtWake::Woke | GtWake::WokeNoAck | GtWake::LiveAlready)
+    }
+    /// May R4 attempt its one reversible GGTT write? Stricter than `reachable()`: only on a
+    /// **confirmed** wake — `Woke` (ack transition + battery motion) or `LiveAlready` (the well
+    /// was never closed). `WokeNoAck` is deliberately EXCLUDED: the battery moved but the ack
+    /// never asserted, and the first-ever GGTT write on live silicon is not justified by an
+    /// ack-less wake. The recon still runs on `WokeNoAck`; only the PTE round-trip is withheld.
+    fn write_ok(self) -> bool {
+        matches!(self, GtWake::Woke | GtWake::LiveAlready)
     }
     fn name(self) -> &'static str {
         match self {
@@ -1963,17 +1976,24 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
 // safely?" (§5), sharpened by the GR26 brief into a rung that **reads R3's verdict and
 // branches**, so it is correct whether or not the forcewake acquire opened the well.
 //
-// ## The two branches, and why each is decisive
+// ## The branches, and why each is decisive
 //
-//  * **R3 woke the GT (`GtWake::reachable()`).** R4 reads the RCS ring block (identifying the
-//    four registers command submission will program — G3, IVB-PINNED), verifies a candidate
-//    GGTT window is entirely unowned (every pre-image and both bracketing neighbours read
-//    zero), and then performs ONE reversible PTE round-trip on the first slot: write a
-//    well-formed PTE, read back the `0 → pte` transition, check the neighbours did not smear,
-//    restore the whole touched neighbourhood to zero, and re-read to prove it. This is the
-//    draft's read-only refusal law (§5, "refuse any range whose pre-images are not all zero")
-//    plus the single write the GR26 brief asks for — a real dark→live→dark transition on a
-//    page-table entry, under R3's exact discipline (entry image, reversible, restore-verify).
+//  * **R3 CONFIRMED the wake (`GtWake::write_ok()` — `Woke` or `LiveAlready`).** R4 reads the
+//    RCS ring block (identifying the four registers command submission will program — G3,
+//    IVB-PINNED), verifies a candidate GGTT window is entirely unowned (every pre-image and both
+//    bracketing neighbours read zero), and then performs ONE reversible PTE round-trip on the
+//    first slot: write a well-formed PTE, read back the `0 → pte` transition, check the
+//    neighbours did not smear, restore the whole touched neighbourhood to zero, and re-read to
+//    prove it. This is the draft's read-only refusal law (§5, "refuse any range whose pre-images
+//    are not all zero") plus the single write the GR26 brief asks for — a real dark→live→dark
+//    transition on a page-table entry, under R3's exact discipline (entry image, reversible,
+//    restore-verify).
+//  * **R3 reached the GT but did NOT confirm the wake (`GtWake::WokeNoAck`).** The battery moved
+//    (so the recon runs and reports its readings), but the ack never asserted. This is the
+//    least-certain write-enabling arm and this is the FIRST-EVER GGTT write on live silicon, so
+//    the PTE round-trip is WITHHELD: R4 runs the identical read-only census and reports
+//    `verdict=claim-gated-on-ack` loudly, writing nothing. Max-conservatism (GR26 review): the
+//    write waits for a confirmed ack, and the boot SAYS so rather than skipping silently.
 //  * **R3 did NOT wake the GT (`GtWake::Dark`).** This is the outcome Boot D's R2
 //    `gt-still-dark` makes most likely, and R4 must not blindly write GGTT PTEs behind a
 //    closed well. So it runs the IDENTICAL read-only census — the ring block and the candidate
@@ -2163,9 +2183,30 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
         return;
     }
 
-    // WOKE branch — R3 produced positive evidence the GT block is reachable. The window must
-    // be verified unowned before a single write; an owned window is refused, never overwritten
-    // (draft §5 refusal law).
+    // WRITE-ELIGIBILITY gate (GR26 review, max-conservatism). The recon above ran for every
+    // reachable arm — but the PTE round-trip requires a CONFIRMED wake, not merely a reachable
+    // one. `WokeNoAck` (the battery moved, the ack never asserted) is the least-certain
+    // write-enabling arm, and this is the FIRST-EVER GGTT write on live silicon, so the write is
+    // withheld for want of an ack. The verdict is distinct and loud — the boot SAYS the write was
+    // gated on the ack, never silently skipped — and the recon's readings above still stand.
+    if !wake.write_ok() {
+        serial_println!(
+            ":: gen7: r4 verdict=claim-gated-on-ack wake={} range_empty={} ring_structured={}/{} writes=0 note=ack-less-wake-recon-ran-but-first-GGTT-write-withheld-for-want-of-a-confirmed-ack ::",
+            wake.name(),
+            if range_empty { 1 } else { 0 },
+            ring.structured,
+            ring.n
+        );
+        serial_println!(
+            ":: gen7: r4 next=STOP-wake-unconfirmed-no-ack-R5-must-confirm-the-ack-register-before-the-first-GGTT-write note=no-ggtt-written ::"
+        );
+        serial_println!(":: gen7: r4 end ::");
+        return;
+    }
+
+    // WOKE branch — R3 produced a CONFIRMED wake (`write_ok()`). The window must be verified
+    // unowned before a single write; an owned window is refused, never overwritten (draft §5
+    // refusal law).
     if !range_empty {
         serial_println!(
             ":: gen7: r4 verdict=range-owned-refused first_nonzero_slot={} first_nonzero_pte={:08X} prev={:08X} next={:08X} writes=0 note=something-owns-the-window-pick-another-never-overwrite-a-populated-PTE ::",
