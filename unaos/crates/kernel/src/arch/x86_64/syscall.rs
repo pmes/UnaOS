@@ -5706,7 +5706,7 @@ fn wc_close_click(owner: u64) -> &'static str {
     // which a close-box press never establishes by itself). A close must never park a sibling.
     // `focus_release` clears the highlight iff this owner held it, and touches nothing else; the
     // owner-held-focus guard lives inside it (a CAS), so it is called unconditionally.
-    crate::video::wm::focus_release(owner);
+    crate::video::wm::focus_release(owner, "route=close-box shell-raise=skipped siblings=untouched");
     // `wm` owners for user rows are `slot + 1`-biased and `Proc::slot` is stored with the SAME bias
     // (see that field), so the owner IS the key — no arithmetic, and therefore no bias to get wrong.
     // Kernel furniture (`is_kernel_owner`) and owner 0 can never match a live row and fall out here.
@@ -5781,7 +5781,10 @@ fn wc_close_furniture(win: crate::video::wm::WinId, owner: u64) -> &'static str 
     // there is no grant to revoke. The wm focus, if this row held it, is dropped through
     // `focus_release` — NOT `focus_changed(0)`, whose shell arm parks every surviving window
     // (CLOSE-TEARDOWN: a close must never park a sibling; see `wc_close_click`).
-    crate::video::wm::focus_release(owner);
+    crate::video::wm::focus_release(
+        owner,
+        "route=close-furniture shell-raise=skipped siblings=untouched",
+    );
     #[cfg(feature = "witness")]
     CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NOPROC_X86, Ordering::Release);
     if CLOSE_LOG_COUNT_X86.load(Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
