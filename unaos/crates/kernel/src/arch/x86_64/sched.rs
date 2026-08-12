@@ -329,11 +329,16 @@ pub struct Task {
     /// per-steal witness prints it, and [`STEAL_REMIGS`] counts the steals that found it already
     /// non-zero — so the churn question survives past `STEAL_LOG_MAX`, on the rollup, rather than
     /// going quiet exactly when a long run would start to answer it.
+    ///
+    /// Since GR27 it is also POLICY input: [`steal_cooldown_ms`] scales the re-steal cooldown by it,
+    /// and it deliberately NEVER resets — see the decay argument in the [`STEAL_COOLDOWN_MS`] doc
+    /// block for why the recency gate makes decay unnecessary and a wake-side reset actively harmful.
     migrations: u32,
     /// VUGSPREAD-COOL: `arch::ms()` at this task's LAST migration (`0` = never migrated). The
-    /// ping-pong brake for the RUNNING-victim floor reads it: a task stolen less than
-    /// [`STEAL_COOLDOWN_MS`] ago is left where it is, so a freshly-stolen vug runs at least one
-    /// scheduling quantum on its new home before another idle core may yank it back.
+    /// ping-pong brake for the RUNNING-victim floor reads it: a task stolen less than its
+    /// escalating cooldown window ago ([`steal_cooldown_ms`], base [`STEAL_COOLDOWN_MS`], scaled by
+    /// this task's own `migrations` history) is left where it is, so a freshly-stolen vug runs on
+    /// its new home before another idle core may yank it back — longer each time it is re-stolen.
     ///
     /// Denominated in `ms()`, NOT `now_cycles()`, on purpose — the stamp is written by one thief core
     /// and read by another, and `rdtsc` is per-core (the same cross-core hazard the `busy_pct` contract
@@ -1697,9 +1702,11 @@ impl RunQueue {
     ///     its lifetime, and core 0 is the sole advancer of the global ms-clock. `pick_cpu` encodes
     ///     the same rule for PLACEMENT; it has to be repeated here because a later migration is a
     ///     placement decision that `pick_cpu` never sees.
-    ///   * VUGSPREAD-COOL — a task that migrated within `STEAL_COOLDOWN_MS` is left where it is, so it
-    ///     runs a few quanta on its new home before another idle core yanks it back. This is the
-    ///     RUNNING-victim ping-pong brake; each skip bumps [`STEAL_COOL_SKIP`]. A task whose only
+    ///   * VUGSPREAD-COOL — a task that migrated within its ESCALATING cooldown window
+    ///     ([`steal_cooldown_ms`]: `STEAL_COOLDOWN_MS << min(migrations, cap)`, 32…256 ms) is left
+    ///     where it is, so it runs on its new home before another idle core yanks it back — longer
+    ///     each time it is re-stolen, until the window outlasts the wake/block cadence and it settles.
+    ///     This is the RUNNING-victim ping-pong brake; each skip bumps [`STEAL_COOL_SKIP`]. A task whose only
     ///     obstacle was the cooldown is passed over exactly like a pinned one, so an empty return still
     ///     reads as `p`/[`STEAL_D_PINNED`] at the pass level — see that counter's doc.
     ///
@@ -1717,8 +1724,13 @@ impl RunQueue {
                 }
                 // VUGSPREAD-COOL — refuse a re-steal inside the cooldown window. `migrate_ms == 0`
                 // (never migrated) always clears it, so the first corrective steal is never delayed.
+                // The window ESCALATES with the task's own migration history (`steal_cooldown_ms`):
+                // Boot B proved a flat window only stretches the ping-pong's period; see the
+                // `STEAL_COOLDOWN_MS` doc block for the wire evidence and the escalation shape.
                 #[cfg(not(feature = "rtpi"))]
-                if t.migrate_ms != 0 && now_ms.saturating_sub(t.migrate_ms) < STEAL_COOLDOWN_MS {
+                if t.migrate_ms != 0
+                    && now_ms.saturating_sub(t.migrate_ms) < steal_cooldown_ms(t.migrations)
+                {
                     STEAL_COOL_SKIP.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
@@ -1732,7 +1744,7 @@ impl RunQueue {
                 // otherwise create. (Knob-off, the `not(rtpi)` branch above is vug-storm's exact code.)
                 #[cfg(feature = "rtpi")]
                 if t.migrate_ms != 0
-                    && now_ms.saturating_sub(t.migrate_ms) < STEAL_COOLDOWN_MS
+                    && now_ms.saturating_sub(t.migrate_ms) < steal_cooldown_ms(t.migrations)
                     && sched_prio(t.as_ref()) <= t.priority
                 {
                     STEAL_COOL_SKIP.fetch_add(1, Ordering::Relaxed);
@@ -5236,16 +5248,59 @@ static STEAL_REMIGS: AtomicU64 = AtomicU64::new(0);
 // so a later vug CLOSE frees exactly one core with nothing left to steal — the survivors keep their
 // homes instead of being re-grabbed, which is the close-spike's scheduler half.
 //
-// `STEAL_COOLDOWN_MS` is bench-tuned to a handful of scheduling quanta (the calibrated tick is 1 kHz,
-// so this is ~16 quanta): long enough to break the ~0.5 ms re-steal cadence Boot C measured, short
-// enough that a one-time post-close rebalance is delayed imperceptibly (and post-close there is
-// usually nothing to steal at all). It is deliberately NOT a rate cap on the renderer — the vug still
-// presents unbounded; only the SCHEDULER's re-placement of its task is damped.
+// GR27 Boot B (gr27-bootA/ttyUSB0.log, six-vug storm) measured the FLAT 16 ms window failing the
+// settlement promise above: `remig=92162` of `moves=92184` (99.98% re-migrations, ~540/s sustained),
+// `cool=` climbing LINEARLY 25 920 → 631 339 (~3.3k refused re-steals per second), while `[spread]`
+// held `pack=4-5` WITH `spare=1-2` for ~170 s — the exact machine-wide defect the census doc names.
+// A flat window cannot settle this ping-pong; it only stretches its period. Every task exits the
+// window with its history erased — as stealable as a never-moved one — so the fleet replays the same
+// re-steal cycle at a 16 ms cadence forever, and "cool climbing while remig stays flat" (the old
+// health reading) turns out to be satisfiable by a brake that refuses six re-steals and then serves
+// the seventh, endlessly.
+//
+// The brake therefore ESCALATES PER TASK: the window is
+// `STEAL_COOLDOWN_MS << min(Task::migrations, STEAL_COOLDOWN_ESC_CAP)` — 32, 64, 128, 256, 256… ms
+// for the 1st, 2nd, 3rd, 4th, 5th+ re-steal ([`steal_cooldown_ms`]). A task that keeps getting
+// re-stolen earns an exponentially longer residency on each new home until, at 256 ms (~256 quanta),
+// the wake/block cadence that drives the ping-pong can no longer outrun the window and the task
+// simply stays. The FIRST steal is still free (`migrate_ms == 0` clears the test before the window
+// is even computed), so genuine spreading is untouched, exactly as before.
+//
+// `Task::migrations` is deliberately NEVER reset (the decay question, decided): the gate is
+// RECENCY-based — `migrate_ms` older than the capped 256 ms window clears it no matter how large the
+// count — so a long-settled task is always immediately stealable and history alone can never strand
+// a task on a bad core; a genuine topology change (a vug CLOSE freeing a core) sees every settled
+// survivor as stealable on the first pass. Resetting the count on the wake-side push would be
+// actively harmful: the ping-pong cycle IS block → wake → push → re-steal, so every re-steal the
+// escalation exists to refuse is preceded by exactly such a push, and a reset there would zero the
+// history each time around the loop — reproducing the flat window with extra steps.
+//
+// The base stays bench-tuned to a handful of scheduling quanta (the calibrated tick is 1 kHz): long
+// enough to break the ~0.5 ms re-steal cadence Boot C measured, short enough that a one-time
+// post-close rebalance is delayed imperceptibly. It is deliberately NOT a rate cap on the renderer —
+// the vug still presents unbounded; only the SCHEDULER's re-placement of its task is damped.
 const STEAL_COOLDOWN_MS: u64 = 16;
 
-/// VUGSPREAD-COOL: per-task steal candidates SKIPPED because they migrated within `STEAL_COOLDOWN_MS`.
-/// The brake's activity, and the direct counterweight to `STEAL_REMIGS`: a healthy post-fix capture
-/// reads this CLIMBING while `remig` stays near flat — the ping-pong being refused rather than served.
+/// VUGSPREAD-COOL: escalation cap for [`steal_cooldown_ms`] — `16 << 4 = 256` ms is the terminal
+/// window. Chosen so the worst case stays imperceptible (a quarter-second residency floor, paid only
+/// by a task already re-stolen four times) while being far beyond the wake/block cadence that drives
+/// the ping-pong (~0.5–16 ms), so escalation terminates the cycle rather than stretching it.
+const STEAL_COOLDOWN_ESC_CAP: u32 = 4;
+
+/// VUGSPREAD-COOL: the per-task ESCALATING cooldown window — how long a task with `migrations` past
+/// moves must sit on its current home before `steal_one` may take it again. See the doc block on
+/// [`STEAL_COOLDOWN_MS`] for the Boot B evidence that a flat window merely stretches the ping-pong,
+/// and for why `migrations` never decays (the recency gate bounds the whole mechanism at 256 ms).
+#[inline]
+fn steal_cooldown_ms(migrations: u32) -> u64 {
+    STEAL_COOLDOWN_MS << migrations.min(STEAL_COOLDOWN_ESC_CAP)
+}
+
+/// VUGSPREAD-COOL: per-task steal candidates SKIPPED because they migrated within their ESCALATED
+/// window (`steal_cooldown_ms`, GR27 — 16ms doubling per re-steal to a 256ms cap). Boot B proved the
+/// old health reading backwards: a flat brake reads cool= CLIMBING (3.3k/s) while remig ALSO climbs
+/// (~540/s) — refusing and serving the same ping-pong. A healthy post-escalation capture reads
+/// cool= NEAR-FLAT after the settle transient, with remig/moves collapsed toward zero.
 /// A side counter like `STEAL_REMIGS`, outside the `e+f+p+d+i+moves == passes` invariant (a cooled
 /// task that leaves `steal_one` empty-handed still lands on `p`/[`STEAL_D_PINNED`], whose doc now names
 /// this case); this counts the per-task SKIPS inside the walk, which that pass-level tally cannot see.
@@ -5410,8 +5465,9 @@ fn try_steal(cpu: usize) -> bool {
         STEAL_REMIGS.fetch_add(1, Ordering::Relaxed);
     }
     // VUGSPREAD-COOL — stamp the migration so the next idle core's `steal_one` leaves this task on its
-    // new home for `STEAL_COOLDOWN_MS`. Same `now_ms` the cooldown test above read, under the pop's
-    // own lock where the Box is exclusively owned (the `migrations` discipline).
+    // new home for its escalating cooldown window (`steal_cooldown_ms`, now scaled by the `migrations`
+    // bump just above). Same `now_ms` the cooldown test above read, under the pop's own lock where the
+    // Box is exclusively owned (the `migrations` discipline).
     task.migrate_ms = now_ms;
     // Review F16 — attribute the move to the repair(s) that made it possible. Both, or neither, or
     // one: a vug worker packed behind its parent scores both, and that is the honest answer.

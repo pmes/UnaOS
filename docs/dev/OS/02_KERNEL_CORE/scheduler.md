@@ -2219,7 +2219,8 @@ revert criterion above prescribes restoring `steal_floor` to the constant `STEAL
 stop the churn, but it also throws away the depth-1 rebalance this whole section exists to add — a
 parent+worker packed on one core with idle cores beside it would once again sit unbalanced. Instead,
 `Task::migrate_ms` stamps `arch::ms()` at each migration and `RunQueue::steal_one` refuses to take a
-task that migrated less than `STEAL_COOLDOWN_MS` (16 ms, ~16 quanta) ago:
+task that migrated less than its cooldown window ago (16 ms flat when this section was written —
+escalated per-task since GR27 Boot B, 16→256 ms doubling per re-steal; see the GR27 section below):
 
 - The **first** steal of any task is never delayed — a never-migrated task carries `migrate_ms == 0`,
   which always clears the window — so the depth-1 rebalance VUGSPREAD added fires exactly as before.
@@ -2250,6 +2251,52 @@ from ≈ 1.0 toward 0 and `cool=` climbs in its place; `moves` goes flat after t
 occupancy that a close does not disturb (the freed core simply goes idle, the survivors hold their
 homes). A boot where `remig` stays ≈ 1.0 with `cool=0` means the stamp or the read is dead — the brake
 is not firing — and is the falsification this witness exists for.
+
+### The flat cooldown was scored and failed: the brake now escalates (x86_64, GR27 Boot B)
+
+**Boot B is the next boot, and the reading is mixed in the way that matters.** GR27 Boot B
+(`~/unaos-bench/capture/gr27-bootA/ttyUSB0.log`, the vug-storm slice) shows the brake firing —
+`cool=` climbed 25 920 → 631 339, ~3.3 k refused re-steals per second — while STILL failing the
+settlement promise: `remig=92162` of `moves=92184` (99.98 % re-migrations, ~540/s sustained) and
+`[spread]` held `pack=4-5` **with** `spare=1-2` for ~170 s (61 121 ms `pack=5 spare=1`; 169 727 ms
+`pack=5 spare=2`; 223 758 ms `pack=4 spare=2`), with `pinned=0` throughout. So the stamp and the read
+are alive, and the falsifier row above ("`remig` ≈ 1.0 with `cool=0`") does not fire — the defect is
+in the WINDOW'S SHAPE. A flat 16 ms window does not settle a ping-pong; it stretches its period: every
+task exits the window with its history erased, as stealable as a never-moved one, so the fleet replays
+the same re-steal cycle at a 16 ms cadence indefinitely. "`cool=` climbing while `remig` stays flat"
+turned out to be satisfiable by a brake that refuses six re-steals and then serves the seventh, forever.
+
+**The fix is a per-task ESCALATING window.** `steal_cooldown_ms(migrations)` in
+`arch/x86_64/sched.rs` computes `STEAL_COOLDOWN_MS << min(Task::migrations, STEAL_COOLDOWN_ESC_CAP)`
+with base 16 ms and cap 4 — i.e. 32, 64, 128, 256, 256… ms for the 1st, 2nd, 3rd, 4th, 5th+
+re-steal. Each re-steal a task suffers earns it an exponentially longer residency on its next home,
+until at 256 ms (~256 quanta at the 1 kHz tick) the wake/block cadence that drives the ping-pong
+(~0.5–16 ms) can no longer outrun the window and the task stays put. Preserved exactly: the FIRST
+steal of any task is free (`migrate_ms == 0` clears the test before the window is computed), so the
+depth-1 rebalance VUGSPREAD added is untouched; the rtpi priority-boost exemption (a boosted lock
+holder is always stealable) is untouched; and knob-off the `not(rtpi)` branch remains the vug-storm
+code with only the window widened.
+
+**The decay question, decided: `Task::migrations` never resets.** The gate is RECENCY-based — a
+`migrate_ms` older than the capped 256 ms window clears it regardless of how large the count has
+grown — so a long-settled task is always immediately stealable and history alone can never strand a
+task on a bad core: a genuine topology change (a vug CLOSE freeing a core) sees every settled
+survivor as stealable on the first pass, and only a *second* re-steal within a quarter second pays
+the escalated window. Resetting the count on the wake-side push was considered and rejected as
+actively harmful: the ping-pong cycle IS block → wake → push → re-steal, so every re-steal the
+escalation exists to refuse is preceded by exactly such a push — a reset there would zero the
+history each time around the loop and reproduce the flat window with extra steps.
+
+**Expected wire signature next boot, as falsifiers.** On the next vug storm: `remig/moves` collapses
+toward zero mid-workload (each task can be re-stolen at most ~4 times before its window outlasts the
+cadence, so re-migrations are a bounded settling transient, not a sustained rate); `pack>=1` WITH
+`spare>=1` closes after the transient instead of co-existing for minutes; `cool=` stops climbing
+linearly — it rises during settling and then goes near-flat, because a settled fleet has depth 0
+everywhere and `steal_one` is no longer even walking candidates to refuse. A boot where `remig`
+keeps climbing at hundreds per second, or where `pack`+`spare` co-existence persists past a few
+seconds of storm with `pinned=0`, refutes the escalation shape itself — the next lever is the cap or
+the base, and the revert criterion above (restore `steal_floor` to `STEAL_MIN_DEPTH`) still stands
+behind it, unchanged in its numbers.
 
 **Naming the moves.** `STEAL_LOG_COUNT` is reset at each `storm_census` boundary. The cap of
 24 named migrations per boot was generous when a boot produced one steal; with the corrector
