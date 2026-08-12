@@ -182,6 +182,16 @@ pub mod termring;
 // so the hooks in `pal.rs`, `video/wm.rs`, `arch/x86_64/{syscall,mod}.rs` stay `#[cfg]`-free. Pure
 // measurement: changes no scheduling/locking/present behaviour. Knob: `UNAOS_RTWIT=1`.
 pub mod rtwit;
+// R1 / rtpi: the PRIORITY-INHERITANCE witness — `[rtpi]` (donation events, max priority jump,
+// transitive-chain depth, live leak gauge). Unlike `rtwit` (a pure ruler declared unconditionally),
+// the mechanism this witnesses CHANGES scheduling and every one of its call sites is
+// `#[cfg(feature = "rtpi")]`-gated, so the module has NO knob-off consumer — declaring it only under
+// `rtpi` keeps a knob-off build free of even the shim's symbols, which is what makes the unarmed
+// kernel BIT-identical (its `.text`/`.rodata`/`.data` and the relocated pointers in `.data.rel.ro`
+// are all unchanged, not merely functionally inert). Within the feature the real impl is still
+// x86-only; an aarch64 `rtpi` build gets the inline shim. Knob: `UNAOS_RTPI=1`.
+#[cfg(feature = "rtpi")]
+pub mod rtpi;
 
 pub fn init() {
     arch::init();

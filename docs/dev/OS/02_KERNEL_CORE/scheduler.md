@@ -2425,8 +2425,28 @@ Combined-boot evidence (one kernel running SMP + USB + net + video):
   preemptive SMP scheduler on all four Pi 4 cores, GIC-driven off the per-core
   generic timer PPI (`TIMER_INTID = 30`), with work stealing, priority aging and
   EL0 tasks. Most of the sections above this one are aarch64 work.
-- **No priority inheritance** on `Mutex` (assessed as large/thorny under CPU
-  pinning; deliberately deferred).
+- ~~**No priority inheritance** on `Mutex` (assessed as large/thorny under CPU
+  pinning; deliberately deferred).~~ **Retired by R1 / rtpi (`UNAOS_RTPI=1`,
+  x86_64).** The sleeping `Mutex` now runs a minimal, soft-RT **priority
+  inheritance** protocol so a low-priority holder cannot be preempted by
+  mid-priority tasks while a strictly-higher task blocks on the lock (bounded
+  priority inversion). Three moves (see the "R1 / rtpi" block in
+  `arch/x86_64/sched.rs`): (1) *acquire-time donation* — a blocker raises the
+  holder's effective priority to its own, propagated **transitively** down a
+  chain of holders via `Task::blocked_on`; (2) *handoff inheritance* — the task
+  that wins a contended acquire inherits the max priority still parked on the
+  lock (`Mutex::waiters_max`), so a FIFO handoff to a lower waiter over a higher
+  one does not reopen the inversion; (3) *revert on the last release*
+  (`Task::pi_held` → 0 clears `Task::donated`), leak-free by construction. The
+  boost is read by every placement/preemption site through `sched_prio` =
+  `max(base, donated)`. Only the owner-tracked sleeping `Mutex` participates —
+  the counting `Semaphore`, futex and the IRQ-masked `spin::Mutex`es are out of
+  scope (no single owner / non-blocking / non-preemptible). **DEFAULT OFF**: the
+  PI fields do not exist and `Mutex::lock` takes its original single-`wait()`
+  path, so an unarmed build is byte-identical. Witness: the `[rtpi]` rollup
+  (`inherits` / `max_jump` / `chain_max` / live `active` leak gauge) plus
+  rate-limited `[rtpi] inherit …` traces, reading zero honestly when no
+  inversion occurs (`src/rtpi.rs`).
 - **APIC timer is uncalibrated** (~1 ms/tick on QEMU); a CPUID 0x15 / TSC-
   deadline calibration is future work.
 - **`RwLock` reader starvation is unbounded** (condvar-blocked tasks do not age),

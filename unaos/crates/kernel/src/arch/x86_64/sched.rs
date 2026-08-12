@@ -353,6 +353,28 @@ pub struct Task {
     /// eligibility, and giving this field any authority would quietly recreate the two-class
     /// distinction the arc removed.
     hint_placed: bool,
+
+    // ── R1 / rtpi: PRIORITY-INHERITANCE state (feature-gated so a knob-off `Task` is byte-identical) ──
+    /// The DONATED priority floor currently boosting this task, or 0 for none. The task's EFFECTIVE
+    /// scheduling priority is `max(priority, donated)` (see [`sched_prio`]). Set by a higher-priority
+    /// task that blocks on a `Mutex` this task holds (`pi_donate`), and by a task that inherits its
+    /// waiters' priority when it acquires a contended `Mutex` (`Mutex::lock`). Reverted to 0 when the
+    /// task releases its LAST PI lock (`pi_held` reaches 0). Atomic because a donor on another CPU
+    /// raises it lock-free — unlike `effective_level`, which stays owning-CPU-only; `donated` is the
+    /// ONE priority field a remote CPU may write, exactly as `priority` is the one it may read.
+    #[cfg(feature = "rtpi")]
+    donated: AtomicU8,
+    /// If this task is BLOCKED on a PI `Mutex`, the address of that `Mutex`'s `owner` field (an
+    /// `AtomicU64`, type-erased across the generic `Mutex<T>`), else 0. It is how `pi_donate` walks a
+    /// TRANSITIVE chain: from a blocked holder to the lock it waits on, to that lock's owner, and on.
+    /// Set just before parking in `Mutex::lock`, cleared the instant the park returns.
+    #[cfg(feature = "rtpi")]
+    blocked_on: AtomicU64,
+    /// How many PI `Mutex`es this task currently holds. Incremented on acquire, decremented on
+    /// release; when it reaches 0 the task's `donated` reverts to base (leak-free by construction —
+    /// the outermost release always clears the boost). Owning-task-only, but atomic for uniformity.
+    #[cfg(feature = "rtpi")]
+    pi_held: AtomicU8,
 }
 
 impl Task {
@@ -366,6 +388,20 @@ impl Task {
     fn is_cooperative_user(&self) -> bool {
         self.user_entry != 0 && !self.preemptible
     }
+}
+
+/// R1 / rtpi — a task's EFFECTIVE scheduling priority: the base `priority` raised by any inherited
+/// (`donated`) floor. This is the number every placement / preemption decision consumes, so a task
+/// that has inherited a blocked higher-priority waiter's urgency is enqueued, dispatched and
+/// protected-from-preemption at the inherited level, not its base.
+///
+/// KNOB-OFF BYTE-IDENTITY: this exists ONLY in the `rtpi` build. Each of its four call sites is
+/// `#[cfg]`-paired with the original `task.priority` expression the site used before this arc, so a
+/// knob-off build's source — and therefore its codegen — is token-for-token the pre-arc scheduler.
+#[cfg(feature = "rtpi")]
+#[inline]
+fn sched_prio(task: &Task) -> u8 {
+    core::cmp::max(task.priority, task.donated.load(Ordering::Relaxed))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1580,6 +1616,13 @@ impl RunQueue {
     /// (that is `requeue`, which preserves promotion progress).
     fn push(&mut self, mut task: Box<Task>) {
         task.wait_ticks = 0;
+        // R1 / rtpi: enqueue at the EFFECTIVE (inheritance-aware) priority, so a boosted holder that
+        // becomes runnable lands above the mid-priority tasks it must not sit behind. The knob-off arm
+        // is the pre-arc expression verbatim (`sched_prio` exists only in the `rtpi` build), so an
+        // unarmed build is byte-identical here.
+        #[cfg(feature = "rtpi")]
+        let level = (sched_prio(&task) as usize).min(NUM_PRIORITIES - 1);
+        #[cfg(not(feature = "rtpi"))]
         let level = (task.priority as usize).min(NUM_PRIORITIES - 1);
         task.effective_level = level as u8;
         self.levels[level].push_back(task);
@@ -1593,6 +1636,12 @@ impl RunQueue {
     /// decays below its own priority and, absent contention, settles back at base within a few
     /// dispatches (strict priority restored). Resets the aging clock for the new level.
     fn requeue(&mut self, mut task: Box<Task>) {
+        // R1 / rtpi: the decay floor is the EFFECTIVE priority, so a boosted holder preempted
+        // mid-critical-section re-enqueues at (at least) its inherited level rather than decaying
+        // toward its base and back under the mid-priority tasks. Knob-off arm is the pre-arc verbatim.
+        #[cfg(feature = "rtpi")]
+        let base = (sched_prio(&task) as usize).min(NUM_PRIORITIES - 1);
+        #[cfg(not(feature = "rtpi"))]
         let base = (task.priority as usize).min(NUM_PRIORITIES - 1);
         let cur = (task.effective_level as usize).min(NUM_PRIORITIES - 1);
         let level = cur.saturating_sub(1).max(base);
@@ -1651,7 +1700,24 @@ impl RunQueue {
                 }
                 // VUGSPREAD-COOL — refuse a re-steal inside the cooldown window. `migrate_ms == 0`
                 // (never migrated) always clears it, so the first corrective steal is never delayed.
+                #[cfg(not(feature = "rtpi"))]
                 if t.migrate_ms != 0 && now_ms.saturating_sub(t.migrate_ms) < STEAL_COOLDOWN_MS {
+                    STEAL_COOL_SKIP.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                // R1 / rtpi — the same cooldown, with ONE exemption: a PRIORITY-BOOSTED holder
+                // (`donated > priority` — a strictly-higher task is blocked on a lock it holds) is
+                // ALWAYS stealable, cooldown or not. Holding such a task on a saturated home for up to
+                // `STEAL_COOLDOWN_MS` is a bounded priority-inversion window — precisely what this arc
+                // exists to close — so an idle core must be free to pull it and run the critical
+                // section out, releasing the high-priority waiter. VUGSPREAD-COOL's ping-pong brake and
+                // priority inheritance thus compose without reopening the inversion the cooldown would
+                // otherwise create. (Knob-off, the `not(rtpi)` branch above is vug-storm's exact code.)
+                #[cfg(feature = "rtpi")]
+                if t.migrate_ms != 0
+                    && now_ms.saturating_sub(t.migrate_ms) < STEAL_COOLDOWN_MS
+                    && t.donated.load(Ordering::Relaxed) <= t.priority
+                {
                     STEAL_COOL_SKIP.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
@@ -1734,6 +1800,37 @@ impl RunQueue {
     }
     fn len(&self) -> usize {
         self.levels.iter().map(VecDeque::len).sum()
+    }
+
+    /// R1 / rtpi — RELOCATE a specific READY task UP to `level` for priority inheritance. Finds the
+    /// Box whose task identity matches `ptr` across all levels; if it sits BELOW `level`, removes and
+    /// re-inserts it at `level` (updating `effective_level` to match, the same invariant `age`
+    /// keeps). Returns `true` iff the task was found (whether or not it needed moving).
+    ///
+    /// Runs under this queue's own lock (the DONOR may be on another CPU — the same cross-CPU-under-
+    /// the-victim's-lock discipline `try_steal` uses), so touching `effective_level` here is sound
+    /// exactly as the thief's `push` is. A task NOT found is one that raced out of the queue (got
+    /// dispatched, blocked, or stolen); the donor's `donated` write already stands, so its next
+    /// enqueue re-levels it — no relocation is lost, only deferred. O(ready tasks), off the hot path
+    /// (only a lock-contention donation reaches here).
+    #[cfg(feature = "rtpi")]
+    fn pi_relocate(&mut self, ptr: *const Task, level: usize) -> bool {
+        let level = level.min(NUM_PRIORITIES - 1);
+        for l in 0..NUM_PRIORITIES {
+            if let Some(pos) = self.levels[l]
+                .iter()
+                .position(|t| core::ptr::eq(t.as_ref() as *const Task, ptr))
+            {
+                if l >= level {
+                    return true; // already at or above the target level — nothing to do
+                }
+                let mut task = self.levels[l].remove(pos).expect("pi_relocate: pos/remove mismatch");
+                task.effective_level = level as u8;
+                self.levels[level].push_back(task);
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1993,6 +2090,12 @@ fn spawn_inner(
         migrations: 0,
         migrate_ms: 0,
         hint_placed: false,
+        #[cfg(feature = "rtpi")]
+        donated: AtomicU8::new(0),
+        #[cfg(feature = "rtpi")]
+        blocked_on: AtomicU64::new(0),
+        #[cfg(feature = "rtpi")]
+        pi_held: AtomicU8::new(0),
     });
 
     // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`.
@@ -2219,6 +2322,12 @@ fn spawn_user_inner(
         migrations: 0,
         migrate_ms: 0,
         hint_placed: false,
+        #[cfg(feature = "rtpi")]
+        donated: AtomicU8::new(0),
+        #[cfg(feature = "rtpi")]
+        blocked_on: AtomicU64::new(0),
+        #[cfg(feature = "rtpi")]
+        pi_held: AtomicU8::new(0),
     });
     // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`.
     #[cfg(feature = "wedge2")]
@@ -2469,6 +2578,12 @@ pub fn spawn_user_thread(
         migrate_ms: 0,
         // VUGSPREAD (review F16): this core came from ring 3's `place` argument. Attribution only.
         hint_placed: true,
+        #[cfg(feature = "rtpi")]
+        donated: AtomicU8::new(0),
+        #[cfg(feature = "rtpi")]
+        blocked_on: AtomicU64::new(0),
+        #[cfg(feature = "rtpi")]
+        pi_held: AtomicU8::new(0),
     });
     // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`. Same idiom as every
     // other enqueue site (`spawn_inner` / `spawn_user_inner` / `make_ready`) — no new lock ORDER is
@@ -2927,6 +3042,11 @@ fn pick_cpu(requested: usize, cooperative_user: bool, name: &'static str) -> usi
 /// side instead, where it costs an idle core's spare cycles rather than a waking task's latency.
 fn make_ready(task: Box<Task>) {
     let target = task.cpu as usize;
+    // R1 / rtpi: poke at the EFFECTIVE priority so a woken boosted holder preempts a mid-priority
+    // task on its target core. Knob-off arm is the pre-arc `task.priority` verbatim — byte-identical.
+    #[cfg(feature = "rtpi")]
+    let prio = sched_prio(&task);
+    #[cfg(not(feature = "rtpi"))]
     let prio = task.priority;
     debug_assert!(target < MAX_CPUS, "make_ready: cpu out of range");
     task.state.store(STATE_READY, Ordering::Release);
@@ -3660,6 +3780,166 @@ pub fn futex_waiters_on(key: u64) -> usize {
 }
 
 // ---------------------------------------------------------------------------------------------
+// R1 / rtpi — PRIORITY INHERITANCE on the sleeping Mutex
+// ---------------------------------------------------------------------------------------------
+//
+// THE INVERSION x86 HAD. The scheduler runs strict priority + round-robin + anti-starvation aging,
+// but NO priority inheritance (`scheduler.md` §5, and `Mutex` below). So a LOW-priority task holding
+// a sleeping `Mutex` a HIGH-priority task needs can be preempted by ANY number of MID-priority tasks:
+// the high task then waits for the low holder PLUS every mid task that runs in front of it — the
+// wait is bounded only by the mid population, i.e. UNBOUNDED priority inversion. `[rtwit]` (R0) now
+// measures exactly that lock-hold tail; this rung bounds it.
+//
+// THE PROTOCOL (minimal, soft-RT — the shape the BEOS-SMP-FLOW R3 rung names). Only the sleeping
+// `Mutex` participates (it is the one owner-tracked blocking lock; the counting `Semaphore`, futex,
+// and the IRQ-masked `spin::Mutex`es in `video/wm.rs` are out of scope — a counting sem has no single
+// owner, and a spinlock holder runs IF=0 and cannot be preempted at all). Two moves and a revert:
+//
+//   1. ACQUIRE-TIME DONATION (`pi_donate`, from a blocker in `Mutex::lock`). When a task blocks on a
+//      held `Mutex`, it raises the CURRENT holder's effective priority to its own — so the holder
+//      out-ranks the mid tasks and runs the critical section out. If the holder is itself BLOCKED on
+//      a second `Mutex`, the boost PROPAGATES down that chain (TRANSITIVE inheritance) via the
+//      holder's `blocked_on` link. Bounded by `PI_CHAIN_MAX` so a (buggy) lock cycle still terminates.
+//   2. HANDOFF INHERITANCE (`Mutex::lock`, on acquiring a contended lock). The task that WINS a
+//      contended lock inherits the max priority still parked on it (`waiters_max`), so a FIFO wake
+//      that hands the lock to a lower waiter while a higher one still waits does not reopen the
+//      inversion — whoever holds is boosted by whoever waits.
+//   3. REVERT (`Mutex`'s guard `Drop`). Releasing the LAST held PI lock (`pi_held` hits 0) reverts
+//      `donated` to base — leak-free by construction: the outermost release always clears the boost.
+//      A task that holds several PI locks keeps the max boost until its last release (a bounded,
+//      documented over-hold, never a permanent leak); `waiters_max` is a per-lock hint reset on the
+//      next uncontended acquire, so a stale-high value self-clears within one critical section.
+//
+// EFFECT ON THE SCHEDULER. The boost is a write to `Task::donated`; every placement/preemption site
+// reads `sched_prio` = max(base, donated). A boosted holder is therefore (a) enqueued/decayed at the
+// inherited level (`RunQueue::push`/`requeue`), (b) dispatched publishing the inherited `current_prio`
+// so a remote waker cannot preempt it (dispatch site), (c) relocated UP in place if it is sitting
+// READY when the donation lands (`RunQueue::pi_relocate`), and (d) if RUNNING, its core's
+// `current_prio` is bumped so a mid wake declines to preempt. All under the existing best-effort
+// `current_prio` contract (the periodic timer always re-evaluates; a momentarily stale read only
+// varies preemption latency, never loses work).
+//
+// KNOB-OFF: the entire block is `#[cfg(feature = "rtpi")]`; the `Task`/`Mutex` PI fields do not exist
+// and `Mutex::lock` takes its original single-`wait()` path, so an unarmed build is byte-identical.
+
+/// R1 / rtpi — cap on transitive-inheritance chain length, so a (buggy) lock cycle terminates rather
+/// than spinning. A real holder chain is a handful deep; the sleeping `Mutex` is used for a few
+/// kernel structures (`Channel`, `RwLock`), so this is comfortably over any legitimate depth.
+#[cfg(feature = "rtpi")]
+const PI_CHAIN_MAX: u32 = 8;
+
+/// R1 / rtpi — the current task on this CPU as a raw pointer, or null off a scheduled context (the
+/// BSP/idle path). Mirrors `Semaphore::wait`'s own `current` read; the caller runs IF=0.
+#[cfg(feature = "rtpi")]
+#[inline]
+fn pi_current() -> *mut Task {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    SCHED[cpu].current.load(Ordering::Acquire) as *mut Task
+}
+
+/// R1 / rtpi — DONATE `prio` down a chain of `Mutex` holders, starting at `owner_field` (the address
+/// of a `Mutex`'s `owner: AtomicU64`). Raises each holder's `donated` to at least `prio`, applies the
+/// raise to that holder's live scheduling state, and — if the holder is itself BLOCKED on another PI
+/// `Mutex` — follows `blocked_on` to that lock's owner and repeats (transitive), bounded by
+/// `PI_CHAIN_MAX`. A no-op when the lock is free (`owner == 0`) or the holder already out-ranks
+/// `prio` (the boost already propagated). Best-effort and lock-free except for the READY relocation,
+/// which is taken under the holder's run-queue lock — the same cross-CPU discipline as `try_steal`.
+///
+/// SAFETY: an `owner != 0` names a task that HOLDS a `MutexGuard`, and a task cannot reach `exit()`
+/// while a guard is live on its stack, so every holder walked here is alive; likewise each
+/// `blocked_on` hop lands on another live holder or 0. Only the holder's ATOMIC and IMMUTABLE fields
+/// (`donated`, `state`, `priority`, `blocked_on`) are touched through the raw pointer — never the
+/// owning-CPU-only `cpu`/`effective_level`/`wait_ticks`; the running core and run-queue are found by
+/// pointer IDENTITY (`pi_bump_running` / `pi_relocate_scan`), which is race-free regardless of a
+/// concurrent migration. The caller's IF may be 1, so the run-queue-lock scan masks interrupts (the
+/// WEDGE-4 `<W1>` hazard, exactly as `pick_cpu` does).
+#[cfg(feature = "rtpi")]
+fn pi_donate(mut owner_field: u64, prio: u8, mut depth: u32) {
+    while owner_field != 0 && depth <= PI_CHAIN_MAX {
+        // `owner_field` points at a `Mutex`'s `owner` AtomicU64. Read the current holder.
+        let holder = unsafe { (*(owner_field as *const AtomicU64)).load(Ordering::Acquire) } as *mut Task;
+        if holder.is_null() {
+            return; // lock became free between the block and here — nothing to boost.
+        }
+        let h = unsafe { &*holder };
+        let base = h.priority;
+        let old = h.donated.fetch_max(prio, Ordering::AcqRel);
+        let eff_before = core::cmp::max(base, old);
+        if prio <= eff_before {
+            return; // holder already at/above the donated level — the boost already propagated.
+        }
+        // We raised this holder's effective priority from `eff_before` to `prio`.
+        let newly_active = eff_before == base; // crossed from unboosted to boosted
+        crate::rtpi::note_inherit(eff_before, prio, depth, newly_active);
+
+        // Apply the raise to the holder's LIVE scheduling state. `donated` is already raised (the
+        // correctness guarantee — the holder re-enqueues boosted no matter what); the steps below
+        // ACCELERATE that so a holder sitting RUNNING/READY right now is protected immediately.
+        match h.state.load(Ordering::Acquire) {
+            STATE_RUNNING => {
+                // Running somewhere: bump THAT core's published priority so a mid-priority wake
+                // declines to preempt it. Find the core by identity (race-free), not `h.cpu`.
+                pi_bump_running(holder, prio);
+                return; // a running task is not blocked on anything — chain ends here.
+            }
+            STATE_READY => {
+                // Ready in some run queue: relocate it UP so it out-ranks the mid tasks now, not
+                // only on its next enqueue. Located by identity under each queue's lock.
+                pi_relocate_scan(holder, prio);
+                return; // a ready task is not blocked — chain ends here.
+            }
+            STATE_BLOCKED => {
+                // Blocked on another PI lock: `donated` is now raised (so it enqueues boosted when it
+                // wakes), and the boost must PROPAGATE to whoever holds the lock IT waits on.
+                let next = h.blocked_on.load(Ordering::Acquire);
+                if next == 0 {
+                    return; // parked on a non-PI wait (sem/futex/sleep) — no owner to follow.
+                }
+                owner_field = next;
+                depth += 1;
+                continue;
+            }
+            _ => return, // FINISHED / transient — nothing to do.
+        }
+    }
+}
+
+/// R1 / rtpi — if `holder` is the task currently RUNNING on some core, raise that core's published
+/// `current_prio` to `prio` so a remote mid-priority wake declines to preempt the boosted holder.
+/// Found by IDENTITY (`SCHED[c].current == holder`) so a migration cannot mislead it: if the task
+/// isn't running anywhere right now, this is a harmless no-op (its `donated` is already raised).
+/// Pure atomic loads/`fetch_max` — no lock, no interrupt-mask needed.
+#[cfg(feature = "rtpi")]
+#[inline]
+fn pi_bump_running(holder: *mut Task, prio: u8) {
+    let target = holder as u64;
+    for c in 0..MAX_CPUS {
+        if SCHED[c].current.load(Ordering::Acquire) == target {
+            SCHED[c].current_prio.fetch_max(prio, Ordering::AcqRel);
+            return;
+        }
+    }
+}
+
+/// R1 / rtpi — find `holder` in whatever run queue it sits in and relocate it UP to `prio`'s level.
+/// Scans by IDENTITY under each queue's own lock (the cross-CPU-under-the-owner's-lock discipline
+/// `try_steal` uses), one lock at a time, all inside `without_interrupts` — the caller's IF may be
+/// 1, and holding a run-queue lock while preempted would wedge that core's `run()` at IF=0 (the
+/// WEDGE-4 `<W1>` hazard `pick_cpu` masks against). Not-found = the task raced out of the queue
+/// (dispatched/blocked/stolen); its raised `donated` re-levels it on its next enqueue.
+#[cfg(feature = "rtpi")]
+#[inline]
+fn pi_relocate_scan(holder: *mut Task, prio: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for c in 0..MAX_CPUS {
+            if RUN_QUEUES[c].lock().pi_relocate(holder, prio as usize) {
+                return;
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
 // Mutex<T> — a sleeping mutual-exclusion lock (a binary semaphore guarding owned data)
 // ---------------------------------------------------------------------------------------------
 
@@ -3675,6 +3955,19 @@ pub fn futex_waiters_on(key: u64) -> usize {
 pub struct Mutex<T> {
     sem: Semaphore,
     data: UnsafeCell<T>,
+    /// R1 / rtpi: the task that currently holds the permit as a raw `*mut Task` (0 = free). Written
+    /// by the acquirer (uncontended fast path, or after a blocked wake) and cleared on release; read
+    /// by a blocking higher-priority task to donate its priority (`pi_donate`). Type-erased so
+    /// `Task::blocked_on` can point at it across the generic `Mutex<T>`.
+    #[cfg(feature = "rtpi")]
+    owner: AtomicU64,
+    /// R1 / rtpi: the max effective priority of tasks currently blocked on this lock — the value a
+    /// task inherits when it WINS a contended acquire (handoff inheritance), so a FIFO wake to a
+    /// lower waiter over a still-waiting higher one does not reopen the inversion. A per-lock hint,
+    /// reset to 0 on the next uncontended acquire, so a stale-high value self-clears within one
+    /// critical section (documented in the PI block above).
+    #[cfg(feature = "rtpi")]
+    waiters_max: AtomicU8,
 }
 
 // SAFETY: the single semaphore permit guarantees at most one task holds the guard — hence at most
@@ -3689,6 +3982,10 @@ impl<T> Mutex<T> {
         Mutex {
             sem: Semaphore::new(1),
             data: UnsafeCell::new(value),
+            #[cfg(feature = "rtpi")]
+            owner: AtomicU64::new(0),
+            #[cfg(feature = "rtpi")]
+            waiters_max: AtomicU8::new(0),
         }
     }
 
@@ -3705,12 +4002,130 @@ impl<T> Mutex<T> {
     /// scheduled task `wait()` cannot block and so does not acquire, so we panic rather than hand
     /// out an unbacked guard. (A sleeping mutex is meaningless off a scheduler context anyway — a
     /// boot-path caller that is not a task must not block.)
+    #[cfg(not(feature = "rtpi"))]
     pub fn lock(&self) -> MutexGuard<'_, T> {
         assert!(
             self.sem.wait(),
             "Mutex::lock() called off a scheduled task (a sleeping mutex needs a scheduler context)"
         );
         MutexGuard { mutex: self, _not_send: PhantomData }
+    }
+
+    /// R1 / rtpi — the priority-inheritance-aware acquire. Same contract and same guard as the
+    /// knob-off `lock` above; the difference is entirely in what happens on CONTENTION:
+    ///   * uncontested (`try_wait` takes the permit): record ownership, no donation.
+    ///   * contested (about to block): DONATE this task's effective priority to the current holder
+    ///     chain (`pi_donate`), link `blocked_on` for transitive donors, then park in `sem.wait()`.
+    ///   * on waking with the permit: clear `blocked_on`, take ownership, and INHERIT the max
+    ///     priority still parked on this lock (`waiters_max`) so a handoff to a lower waiter over a
+    ///     higher one does not reopen the inversion.
+    /// The `sem.wait()`/permit semantics are IDENTICAL to the knob-off path; only the surrounding
+    /// bookkeeping differs, so lost-wakeup safety is exactly as before.
+    #[cfg(feature = "rtpi")]
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        let me = pi_current();
+        if self.sem.try_wait() {
+            // Uncontested: took the permit without blocking. Record ownership; no inversion here.
+            self.pi_acquire_uncontended(me);
+            return MutexGuard { mutex: self, _not_send: PhantomData };
+        }
+        // Contested: we are going to block. Donate to the holder chain BEFORE parking so the holder
+        // out-ranks the mid-priority tasks and runs its critical section out.
+        self.pi_on_block(me);
+        assert!(
+            self.sem.wait(),
+            "Mutex::lock() called off a scheduled task (a sleeping mutex needs a scheduler context)"
+        );
+        // Woken with the permit: we are the new holder.
+        self.pi_acquire_after_block(me);
+        MutexGuard { mutex: self, _not_send: PhantomData }
+    }
+
+    /// R1 / rtpi — record ownership after an UNCONTESTED acquire (the `try_wait` fast path). No task
+    /// waits, so reset the `waiters_max` hint. Null `me` (an off-task boot-path caller taking a free
+    /// permit — permitted, as in the knob-off path) skips the per-task bookkeeping.
+    #[cfg(feature = "rtpi")]
+    #[inline]
+    fn pi_acquire_uncontended(&self, me: *mut Task) {
+        self.waiters_max.store(0, Ordering::Release);
+        self.owner.store(me as u64, Ordering::Release);
+        if !me.is_null() {
+            unsafe { (*me).pi_held.fetch_add(1, Ordering::AcqRel) };
+        }
+    }
+
+    /// R1 / rtpi — donate to the holder chain just before parking on a contended lock, and link
+    /// `blocked_on` so a later transitive donor can follow us. No-op for a null `me` (an off-task
+    /// caller cannot block anyway — the `sem.wait()` assert catches it).
+    #[cfg(feature = "rtpi")]
+    #[inline]
+    fn pi_on_block(&self, me: *mut Task) {
+        if me.is_null() {
+            return;
+        }
+        let p = sched_prio(unsafe { &*me });
+        self.waiters_max.fetch_max(p, Ordering::AcqRel);
+        let owner_field = &self.owner as *const AtomicU64 as u64;
+        unsafe { (*me).blocked_on.store(owner_field, Ordering::Release) };
+        pi_donate(owner_field, p, 1);
+    }
+
+    /// R1 / rtpi — take ownership after waking with the permit, and inherit the max priority still
+    /// parked on this lock (handoff inheritance). We are running on our own core, so a raise also
+    /// bumps this core's published `current_prio` so a mid-priority wake declines to preempt us.
+    #[cfg(feature = "rtpi")]
+    #[inline]
+    fn pi_acquire_after_block(&self, me: *mut Task) {
+        if me.is_null() {
+            self.owner.store(0, Ordering::Release);
+            return;
+        }
+        unsafe {
+            (*me).blocked_on.store(0, Ordering::Release);
+            (*me).pi_held.fetch_add(1, Ordering::AcqRel);
+            self.owner.store(me as u64, Ordering::Release);
+            // Handoff inheritance: adopt the queue's max waiting priority if it out-ranks us.
+            let wm = self.waiters_max.load(Ordering::Acquire);
+            let base = (*me).priority;
+            let old = (*me).donated.fetch_max(wm, Ordering::AcqRel);
+            let eff_before = core::cmp::max(base, old);
+            if wm > eff_before {
+                crate::rtpi::note_inherit(eff_before, wm, 0, eff_before == base);
+                let cpu = percpu::this_cpu().cpu_index as usize;
+                if cpu < MAX_CPUS {
+                    SCHED[cpu].current_prio.fetch_max(wm, Ordering::AcqRel);
+                }
+            }
+        }
+    }
+
+    /// R1 / rtpi — the release-side bookkeeping, run just BEFORE the permit is posted (from the guard
+    /// `Drop`, and from `Condvar::wait`, which `forget`s the guard and posts raw). Clears ownership,
+    /// and if this was the task's LAST held PI lock reverts its inherited priority to base — leak-free
+    /// by construction. A no-op inline shim when `rtpi` is off, so both call sites stay `#[cfg]`-free.
+    #[cfg(feature = "rtpi")]
+    #[inline]
+    fn pi_release(&self) {
+        let me = pi_current();
+        self.owner.store(0, Ordering::Release);
+        if me.is_null() {
+            return;
+        }
+        unsafe {
+            let prev = (*me).pi_held.fetch_sub(1, Ordering::AcqRel);
+            if prev <= 1 {
+                // Released our last PI lock: revert to base (no leak — the outermost release clears it).
+                let had = (*me).donated.swap(0, Ordering::AcqRel);
+                if had != 0 {
+                    crate::rtpi::note_revert();
+                    // Lower this core's published priority back to base — we are running here.
+                    let cpu = percpu::this_cpu().cpu_index as usize;
+                    if cpu < MAX_CPUS {
+                        SCHED[cpu].current_prio.store((*me).priority, Ordering::Release);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3740,6 +4155,11 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
+        // R1 / rtpi: revert any inherited priority (and clear ownership) BEFORE handing off the
+        // permit, so the woken next holder observes a consistent lock. `#[cfg]`-gated (not a shim
+        // call) so a knob-off build carries none of the PI symbols and stays bit-identical.
+        #[cfg(feature = "rtpi")]
+        self.mutex.pi_release();
         self.mutex.sem.post();
     }
 }
@@ -3884,6 +4304,12 @@ impl Condvar {
             //     re-enable interrupts — preserving "every switch-away is IF=0" into (j). It is the
             //     one sanctioned post-under-another-primitive-lock (cv.locked -> mutex.sem.locked);
             //     see the module header.
+            // R1 / rtpi: this `forget`+raw-post is the ONE mutex release that bypasses the guard
+            // `Drop`, so the PI revert must run here too or the boost/ownership would leak across a
+            // condvar wait. Atomics only (no UART), safe under the condvar lock. `#[cfg]`-gated so a
+            // knob-off build stays bit-identical.
+            #[cfg(feature = "rtpi")]
+            mutex.pi_release();
             mutex.sem.post();
             debug_assert!(
                 !x86_64::instructions::interrupts::are_enabled(),
@@ -4911,6 +5337,11 @@ fn run() -> ! {
                 // remote waker/spawner can tell whether a newly-ready task should preempt us.
                 SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
                 SCHED[cpu].need_resched.store(false, Ordering::Relaxed);
+                // R1 / rtpi: publish the EFFECTIVE priority so a remote waker cannot preempt a running
+                // boosted holder with a mid-priority task. Knob-off arm is the pre-arc verbatim.
+                #[cfg(feature = "rtpi")]
+                SCHED[cpu].current_prio.store(sched_prio(&task), Ordering::Release);
+                #[cfg(not(feature = "rtpi"))]
                 SCHED[cpu].current_prio.store(task.priority, Ordering::Release);
 
                 let raw = Box::into_raw(task);

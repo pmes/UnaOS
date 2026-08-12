@@ -13,6 +13,16 @@ default = []
 # x86_64-only in effect (the real impl is gated on `target_arch = "x86_64"`; the shim covers aarch64).
 # Enable via `UNAOS_RTWIT=1`. Kept in sync with arroyo.
 rtwit = []
+# R1 / rtpi: PRIORITY INHERITANCE on the x86 sleeping `Mutex` (arch::x86_64::sched), plus its
+# `[rtpi]` witness (donation events, max priority jump, transitive-chain depth, live leak gauge).
+# Unlike `rtwit` (a pure ruler), this CHANGES scheduling behaviour: while a strictly-higher task
+# blocks on a `Mutex`, the holder inherits the blocker's priority (transitively) until release, so
+# mid-priority tasks cannot preempt the critical section (bounded priority inversion). DEFAULT OFF
+# => the `Task`/`Mutex` PI fields do not exist, `Mutex::lock` takes its original single-`wait()`
+# path, and every witness hook is an empty inline shim — so the boot is BYTE-IDENTICAL to the
+# pre-arc scheduler (see `src/rtpi.rs` and the PI block in `arch/x86_64/sched.rs`). x86_64-only in
+# effect. Enable via `UNAOS_RTPI=1`. Kept in sync with arroyo AND builder/src/main.rs.
+rtpi = []
 # Cleanroom GPU driver features
 nvidia-kepler = []
 nvidia-kepler-takeover = []
