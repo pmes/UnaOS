@@ -267,7 +267,7 @@ fn image_drive(
     println!("\n--- FORENSIC REPORT ---");
     println!("Time Elapsed: {:.2?}", duration);
     println!("Bytes Copied: {}", file_size);
-    println!("SHA-256 Hash: {:x}", result);
+    println!("SHA-256 Hash: {}", hex::encode(result));
     println!("-----------------------");
 
     Ok(())

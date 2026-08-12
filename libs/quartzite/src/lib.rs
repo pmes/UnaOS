@@ -120,6 +120,18 @@ impl Backend {
     pub fn new<F>(_app_id: &str, _bootstrap: F) -> Self {
         Backend
     }
+    /// Headless no-op mirror of the GTK/macOS tetra-vessel constructor, so
+    /// vessels that summon a tetra UI (aether-shell) still type-check on
+    /// backends without a glass layer.
+    pub fn new_tetra_vessel(
+        _app_id: &str,
+        _title: &str,
+        _content_size: (f64, f64),
+        _tetra_node: crate::tetra::TetraNode,
+        _synapse: bandy::Synapse,
+    ) -> Self {
+        Backend
+    }
     pub fn run(&self) {}
 }
 
