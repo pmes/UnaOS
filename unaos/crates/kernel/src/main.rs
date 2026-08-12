@@ -4351,6 +4351,93 @@ fn desktop_owns_backdrop() -> bool {
     false
 }
 
+/// SHELLWIN — allocate the live SHELL's compositor-window surface and register its `wm` row.
+///
+/// SHELLNOTDESK took the interactive shell off the desktop backdrop so the crispy scene owns the glass,
+/// but that left the operator with no shell to type `bg /fat/VUG.ELF` into — the keystroke path had no
+/// backdrop console to reach. This gives the shell a WINDOW of its own: a kernel-owned managed row, the
+/// same machinery [`unaos_kernel::video::fbcon::panel_console_window_open`] mints for the frozen
+/// boot-log console, over a cached-RAM surface the render service drives a `Screen`/`Console` on.
+///
+/// The row's owner is [`unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP`] — kernel furniture: hittable so
+/// a click reaches it, out of `focus_ring`/`close_owner` so it is not a teardown victim, and routed by
+/// the click router's kernel-owner arm (`wc_click_route_at`) to RAISE the row and hand the keyboard
+/// back to the shell (`user_input_set_active(0)`). Focus at the shell is exactly the state in which a
+/// keystroke reaches the render service's `Event::Key` arm, which is where it is routed into this
+/// window's console.
+///
+/// Returns the surface store — the caller MUST keep it alive for the row's life, since the row holds a
+/// raw pointer into it — the `FrameBuffer` over that store, and the window id. `None` when the panel is
+/// unusably small or the allocation fails; the desktop then comes up with no shell window and the
+/// keystroke path stays inert (the caller logs it).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn open_shell_window(
+    pw: usize,
+    ph: usize,
+) -> Option<(
+    alloc::vec::Vec<u8>,
+    unaos_kernel::video::FrameBuffer,
+    unaos_kernel::video::wm::WinId,
+)> {
+    use unaos_kernel::video::wm;
+    // A terminal-sized window: roughly half the panel, floored so a small gate surface still yields a
+    // usable box and clamped so the outer box (surface + chrome) fits the work area under the menu bar.
+    let wtop = unaos_kernel::ui_status::top_chrome_h(pw, ph);
+    let workh = ph.saturating_sub(wtop);
+    let cw = (pw / 2).clamp(320, pw.max(320));
+    let ch = (workh / 2).clamp(200, workh.max(200));
+    let stride = cw * 4;
+    let len = ch.checked_mul(stride)?;
+    if cw == 0 || ch == 0 || len == 0 {
+        return None;
+    }
+    let mut store: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if store.try_reserve_exact(len).is_err() {
+        serial_println!("[shellwin] DECLINE reason=alloc len={}", len);
+        return None;
+    }
+    store.resize(len, 0);
+    let mut surf_fb = unaos_kernel::video::FrameBuffer::new();
+    // `Bgr` + 4 bytes, matching the console window: `put_pixel` stores b,g,r at bytes 0,1,2 and leaves
+    // byte 3 zero — the little-endian `0x00RRGGBB` word `wm::draw_window` reads. Same bytes, no convert.
+    surf_fb.init(
+        store.as_mut_ptr() as usize,
+        len,
+        unaos_boot_info::FrameBufferInfo {
+            width: cw,
+            height: ch,
+            stride: cw,
+            bytes_per_pixel: 4,
+            pixel_format: unaos_boot_info::PixelFormat::Bgr,
+        },
+    );
+    surf_fb.fill_screen(wm::DESKTOP_BG);
+
+    // SPAWN-PLACE — size the outer box before any row exists, then pin the row low in the work area so
+    // it does not sit exactly over the centred boot-log console. `create_at` composites the row before
+    // it returns (no first-frame jump), reading the `DESKTOP_BG` fill above until the caller renders the
+    // prompt into it.
+    let (_scale, ow, oh) = wm::spawn_geometry(cw, ch)?;
+    let ox = pw.saturating_sub(ow) / 2;
+    let oy = wtop + workh.saturating_sub(oh) * 3 / 4;
+    let id = wm::create_at(
+        wm::KERNEL_OWNER_DESKTOP,
+        surf_fb.base(),
+        len,
+        cw as u32,
+        ch as u32,
+        stride as u32,
+        b"shell",
+        ox + wm::BORDER,
+        oy + wm::TITLE_H + wm::BORDER,
+    );
+    if id == wm::WIN_NONE {
+        serial_println!("[shellwin] DECLINE reason=create-failed");
+        return None;
+    }
+    Some((store, surf_fb, id))
+}
+
 /// SCHED-X86: the RENDER service — the interactive OS as a scheduled kernel task, and the sole owner
 /// of every pixel. Builds its own `Screen`/`TargetPal`/`Console` over the framebuffer the BSP left in
 /// `WRITER` (and detached fbcon from), paints the first frame, then blocks on `GUI_CHANNEL_X86` and
@@ -4391,12 +4478,67 @@ fn x86_render_service(cpu: usize) {
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
     let mut console = unaos_kernel::console::Console::new();
 
+    // SHELLWIN — the live shell's OWN compositor window (crispy desktop only). Built here so its
+    // `Screen`/`TargetPal`/`Console` live for the service's life alongside the panel's `pal`, and for
+    // the same reason: a persistent `TargetPal` borrows its `Screen`, so both are flat locals (a per-
+    // keystroke `TargetPal::new` would also spam the once-per-surface `:: UI1:` line). Off the crispy
+    // desktop (pre-takeover, or `open_shell_window` declining) `shell_id` stays `WIN_NONE` and the
+    // dummy surface is never drawn — the keystroke path falls to the backdrop `console` exactly as
+    // before. Folded to nothing on `wc`-off x86 and (via the enclosing fn's `cfg`) on aarch64.
+    // `_shell_store` is bound but never read again ON PURPOSE: the `wm` row holds a raw pointer into
+    // its heap buffer, and keeping it as a live local (the render service never returns) keeps that
+    // allocation from being freed for the row's life. Underscore-prefixed so it needs no `mut` and
+    // raises no unused warning; the empty `Vec` on the non-window paths costs nothing.
+    #[cfg(feature = "wc")]
+    let (_shell_store, mut shell_screen, mut shell_console, shell_id) = {
+        let empty = || {
+            (
+                alloc::vec::Vec::new(),
+                unaos_kernel::video::Screen::new(unaos_kernel::video::FrameBuffer::new()),
+                unaos_kernel::console::Console::new(),
+                unaos_kernel::video::wm::WIN_NONE,
+            )
+        };
+        if desktop {
+            let info = front_fb.info();
+            match open_shell_window(info.width, info.height) {
+                Some((store, fb, id)) => {
+                    let mut con = unaos_kernel::console::Console::new();
+                    con.mark_in_window();
+                    (store, unaos_kernel::video::Screen::new(fb), con, id)
+                }
+                None => empty(),
+            }
+        } else {
+            empty()
+        }
+    };
+    #[cfg(feature = "wc")]
+    let mut shell_pal = unaos_kernel::pal::TargetPal::new(&mut shell_screen);
+    #[cfg(feature = "wc")]
+    let mut shell_dirty = false;
+
     if desktop {
         serial_println!(
             "[shelldesk] backdrop=crispy-scene shell=off-glass bg={:08X} core={}",
             unaos_kernel::video::wm::DESKTOP_BG,
             cpu
         );
+        // SHELLWIN — paint the first prompt into the shell window's surface and composite it, so the
+        // operator sees a live, focusable shell on the crispy desktop from the first frame.
+        #[cfg(feature = "wc")]
+        if shell_id != unaos_kernel::video::wm::WIN_NONE {
+            shell_console.draw(&mut shell_pal);
+            shell_pal.render();
+            unaos_kernel::video::wm::present(shell_id);
+            serial_println!(
+                "[shellwin] backdrop=crispy-scene shell=window win={} surf={}x{} core={} == witness ::",
+                shell_id,
+                shell_pal.width(),
+                shell_pal.height(),
+                cpu
+            );
+        }
     } else {
         console.draw(&mut pal);
     }
@@ -4454,17 +4596,39 @@ fn x86_render_service(cpu: usize) {
                     let consumed = unaos_kernel::video::instgui::consume_key(c);
                     #[cfg(not(all(feature = "wc", feature = "instgui")))]
                     let consumed = false;
-                    // SHELLNOTDESK — on the crispy desktop the text shell is NOT the desktop, so a
-                    // keystroke that reached this arm (not consumed by the installer dialog, and not
-                    // routed to a focused window by `wc_route_event` upstream) has no backdrop shell to
-                    // type into: it is dropped rather than repainted onto the scene. Off the crispy
-                    // desktop the shell still owns the panel and handles the key exactly as before.
-                    if !consumed && !desktop {
-                        // `handle_key` answers `true` when the command took the whole screen. The BSP
-                        // loop used that to stop DRAINING, and so do we — a command that owns the panel
-                        // must not have the rest of the burst painted over it before it is presented.
-                        if handle_key(c, &mut console, &mut pal) {
-                            break;
+                    // SHELLWIN — route the keystroke to its home. A key reaches this arm only when
+                    // `wc_route_event` did NOT hand it to a focused ring-3 window (that app has no key
+                    // here) and the installer dialog did not consume it — i.e. the keyboard belongs to
+                    // the SHELL (`user_input_active() == 0`). On the crispy desktop the shell is now a
+                    // compositor WINDOW, so the key is dispatched into that window's own console and
+                    // surface; the backdrop scene is never typed on. Off the crispy desktop (pre-
+                    // takeover, wc-off, aarch64) the shell is still the desktop layer and `handle_key`
+                    // drives the backdrop `console` exactly as before. `handle_key` answers `true` when
+                    // the command took the whole screen — the BSP loop used that to stop DRAINING, and
+                    // so do we, so the rest of the burst is not painted over it before it is presented.
+                    if !consumed {
+                        #[cfg(feature = "wc")]
+                        {
+                            if desktop {
+                                // On the crispy desktop the key never falls to the backdrop console
+                                // (the shell is off the glass); it goes to the shell WINDOW, or is
+                                // dropped if the window failed to open (logged at bring-up).
+                                if shell_id != unaos_kernel::video::wm::WIN_NONE {
+                                    let took = handle_key(c, &mut shell_console, &mut shell_pal);
+                                    shell_dirty = true;
+                                    if took {
+                                        break;
+                                    }
+                                }
+                            } else if handle_key(c, &mut console, &mut pal) {
+                                break;
+                            }
+                        }
+                        #[cfg(not(feature = "wc"))]
+                        {
+                            if handle_key(c, &mut console, &mut pal) {
+                                break;
+                            }
                         }
                     }
                 }
@@ -4544,6 +4708,19 @@ fn x86_render_service(cpu: usize) {
         // Present: flush the damaged region of the back buffer to the framebuffer. A no-op when
         // nothing was drawn, so a pure cursor pass (front-buffer sprite) costs almost nothing.
         pal.render();
+
+        // SHELLWIN — flush the shell window's surface and composite it ONCE per drained burst, the same
+        // drain-then-present-once discipline the backdrop above follows: `handle_key` drew into the
+        // shell's cached-RAM back buffer as keys arrived, `render()` copies the damaged rows into the
+        // window surface, and `wm::present` composites that surface over the crispy backdrop (the panel
+        // flush above already subtracted the window's box from its own damage, so nothing painted over
+        // it). After the backdrop present, so the shell window lands on top of the scene.
+        #[cfg(feature = "wc")]
+        if shell_dirty {
+            shell_pal.render();
+            unaos_kernel::video::wm::present(shell_id);
+            shell_dirty = false;
+        }
 
         // SCHED-X86 depth witness. `sent - recv` is the LIVE occupancy of the 64-slot channel, and it
         // is the number that separates "the render task is keeping up" from "the render task is
