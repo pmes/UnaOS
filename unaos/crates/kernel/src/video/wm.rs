@@ -4069,8 +4069,14 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     let info = fb.info();
     let VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
-        #[cfg(target_arch = "x86_64")] occ_before } = vr;
+        #[cfg(target_arch = "x86_64")] occ_before,
+        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))] full_rows } = vr;
     let wi = r.id as usize;
+    // WCD-CHUNK — the chunk's gate-held wall clock opens here, before the first probe, so
+    // `hold_max_us=` on the terminal line bounds everything a launch-instant present paid for this
+    // witness: both read-back passes plus the attribution walks between them.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let t_chunk0 = crate::arch::now_cycles();
     // GR21/WCD-OCC — the occluder set as of the READ-BACK (post-blit). Taken once, here, before the
     // multi-second glass read the passes run, so the table lock it briefly holds never overlaps that
     // read. Unioned with `occ_before` per pixel below: a mismatching pixel covered by EITHER snapshot
@@ -4135,7 +4141,17 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         }
     };
 
-    let pass = |fb: &super::FrameBuffer| {
+    // WCD-CHUNK — `r1` is the one-past-last row THIS invocation may walk, and `bounded` arms the
+    // time stop. The first read-back runs bounded and reports how far it actually got (`rows_done`);
+    // the second re-walks EXACTLY those rows unbounded, so the two passes always adjudicate the same
+    // rect. On every build without the chunking (aarch64, x86 without `wcg-paygo`) `bounded` is dead
+    // and `rows_done == r1` by construction — the closure is the old whole-range walk, byte for byte.
+    let pass = |fb: &super::FrameBuffer, r1: usize, bounded: bool| {
+        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+        let t_pass0 = crate::arch::now_cycles();
+        #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+        let _ = bounded;
+        let mut rows_done = r1;
         // WCD-SPRITE — re-read per pass, not once for both: the two read-backs are seconds apart and
         // AR's arrow arrived in the gap between them.
         let sprite_enter = super::cursor::live_box_relaxed();
@@ -4156,7 +4172,23 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         // console's blit is not the writer being adjudicated. x86 only.
         #[cfg(target_arch = "x86_64")]
         let mut occluded = 0usize;
-        for row in row0..row1 {
+        for row in row0..r1 {
+            // WCD-CHUNK — the time stop. Whole rows only (checked between rows, never mid-row, so a
+            // `scale x scale` upscale cell is always probed whole), and at least one row per chunk
+            // (`row > row0`) so a chunk always makes progress and the cursor cannot wedge. The bound
+            // is WALL time, deliberately: on metal a probe through the Kepler BAR costs ~1.06 us and
+            // a chunk stops after a row or two; under QEMU the same probes are RAM reads and one
+            // chunk closes a whole box — so the gates never wait on the drip and the bench never
+            // holds `COMP_GATE` past [`WCD_CHUNK_US`] per pass.
+            #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+            if bounded
+                && row > row0
+                && super::wcg::cycles_to_us(crate::arch::now_cycles().saturating_sub(t_pass0))
+                    >= WCD_CHUNK_US
+            {
+                rows_done = row;
+                break;
+            }
             // WC-D/PAYGO — the lattice's per-row phase. A full pass (`step == 1`) starts at column 0 and
             // advances by one, which is the `for col in 0..cols` loop this was before, exactly. A sampled
             // pass rotates its first column by one per row, so over any `step` consecutive rows every
@@ -4236,19 +4268,30 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         }
         #[cfg(target_arch = "x86_64")]
         {
-            (checked, bad, moved, nonzero, first, first_moved, occluded, sprite_px)
+            (rows_done, checked, bad, moved, nonzero, first, first_moved, occluded, sprite_px)
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            (checked, bad, moved, nonzero, first, first_moved, sprite_px)
+            (rows_done, checked, bad, moved, nonzero, first, first_moved, sprite_px)
         }
     };
 
+    // WCD-CHUNK — the time stop arms for the STAGE-2 read-back only; stage 1 keeps its whole-band
+    // single-pass shape (see the stage line in [`verify_reference`]'s cursor block).
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let chunked = running == WCD_ST_FULL_RUN;
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let chunked = false;
     #[cfg(target_arch = "x86_64")]
-    let (checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, occ_cache, spr_cache) =
-        pass(fb);
+    let (rows_done, checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, occ_cache, spr_cache) =
+        pass(fb, row1, chunked);
     #[cfg(not(target_arch = "x86_64"))]
-    let (checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, spr_cache) = pass(fb);
+    let (rows_done, checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, spr_cache) =
+        pass(fb, row1, chunked);
+    // WCD-CHUNK — from here on, `row1` IS the rows the first pass actually walked: the invalidate,
+    // the second pass, the `band=` field, the interlock rect and the cursor all describe the chunk,
+    // not the ask. A no-op rebind on every build without the chunking (`rows_done == row1` there).
+    let row1 = rows_done;
 
     // Discard, never clean — see the doc comment. Bare `IVAC` is what makes `bad_ram` able to fail.
     // WCD-BAND: the extent follows the verified rows, not the whole window, so a banded verdict
@@ -4269,9 +4312,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     let ram_indep = cfg!(target_arch = "aarch64");
 
     #[cfg(target_arch = "x86_64")]
-    let (_, bad_ram, moved_ram, _, first_ram, firstmv_ram, occ_ram, spr_ram) = pass(fb);
+    let (_, _, bad_ram, moved_ram, _, first_ram, firstmv_ram, occ_ram, spr_ram) =
+        pass(fb, row1, false);
     #[cfg(not(target_arch = "x86_64"))]
-    let (_, bad_ram, moved_ram, _, first_ram, firstmv_ram, spr_ram) = pass(fb);
+    let (_, _, bad_ram, moved_ram, _, first_ram, firstmv_ram, spr_ram) = pass(fb, row1, false);
     // `cksum` is the `[wc-c]` FNV over the SOURCE slot, carried here so a verdict is content-aware: without
     // it a blank surface blitted faithfully onto a blank rect is a PASS indistinguishable from a verified
     // crystal. `nonzero` is the same question asked of the DESTINATION. `cksum_pre` is the same FNV taken at
@@ -4380,7 +4424,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
             #[cfg(feature = "wcg-paygo")]
             {
                 let (since_ms, clock, _) = super::wcg::paygo_clock();
-                wcd_paygo_note(r.id, wi, "sealed", "UNPAID", since_ms, clock);
+                wcd_paygo_note(r.id, wi, "sealed", "UNPAID", since_ms, clock, None);
             }
         }
         // The repair redraw still runs: this window's pixels were overwritten under us, and putting
@@ -4407,6 +4451,61 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         );
         return;
     }
+    // WCD-CHUNK — bank this chunk, and decide whether it CLOSES the box.
+    //
+    // A clean chunk that did not reach the box's last row prints NOTHING and hands the reference
+    // back: the cursor advances, the counts are banked, and the next admitted composite resumes the
+    // walk. The cumulative verdict speaks once, when the closing chunk lands, with the banked sums —
+    // so the wire keeps its one PASS per stage and every gate pattern its shape. A chunk whose
+    // verdict is exceptional (FAIL, LIVE — and the teardown abort, which already returned above)
+    // keeps today's behaviour exactly: it prints immediately, chunk-local, with `band=` naming the
+    // rows it actually walked, and it closes the battery the way one bad verdict always has.
+    //
+    // No repair redraw on the silent path, deliberately: the redraw below exists to restore what the
+    // aarch64 `IVAC` may have dropped, and the chunking (this whole block) compiles only on x86,
+    // where there is no invalidate to repair after. The closing chunk still runs it, as today.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let (checked, nonzero, occluded, sprite_px, stable, band) = if !chunked {
+        (checked, nonzero, occluded, sprite_px, stable, band)
+    } else {
+        use core::sync::atomic::Ordering::Relaxed;
+        let hold_us =
+            super::wcg::cycles_to_us(crate::arch::now_cycles().saturating_sub(t_chunk0));
+        WCD_CHUNKS[wi].fetch_add(1, Relaxed);
+        WCD_HOLD_MAX_US[wi].fetch_max(hold_us, Relaxed);
+        if !stable {
+            WCD_ACC_UNSTABLE[wi].store(1, Relaxed);
+        }
+        let acc_checked = WCD_ACC_CHECKED[wi].fetch_add(checked as u32, Relaxed) + checked as u32;
+        let acc_nonzero = WCD_ACC_NONZERO[wi].fetch_add(nonzero as u32, Relaxed) + nonzero as u32;
+        let acc_occ = WCD_ACC_OCC[wi].fetch_add(occluded as u32, Relaxed) + occluded as u32;
+        let acc_spr = WCD_ACC_SPRITE[wi].fetch_add(sprite_px as u32, Relaxed) + sprite_px as u32;
+        if ok && !live {
+            // Clean chunk: the cursor moves. Progress also re-arms the service taker's liveness
+            // bound — [`PAYGO_SVC_TRIES`] caps marks WITHOUT progress (its anti-wedge purpose),
+            // and a battery that now takes a box in tens of chunks would exhaust a fixed cap of
+            // 16 while doing exactly what it was asked to.
+            WCD_CUR[wi].store(row1 as u32, Relaxed);
+            PAYGO_SVC_TRIES[wi].store(0, Relaxed);
+            if row1 < full_rows {
+                wcd_release(wi, running);
+                return;
+            }
+            // The closing chunk: the verdict line carries the whole battery's sums, and covers the
+            // whole box (`band=none`) because the cursor walked it contiguously from row 0.
+            (
+                acc_checked as usize,
+                acc_nonzero as usize,
+                acc_occ as usize,
+                acc_spr as usize,
+                stable && WCD_ACC_UNSTABLE[wi].load(Relaxed) == 0,
+                BandFmt(None),
+            )
+        } else {
+            // Exceptional verdict: chunk-local numbers, chunk-local band — the defect's own rows.
+            (checked, nonzero, occluded, sprite_px, stable, band)
+        }
+    };
     if live {
         // WCD-PRE — every disagreement was explained by a reference that moved, so nothing is chargeable
         // to the blit, but the rect was not fully adjudicated either. Report the fact instead, with the
@@ -4577,6 +4676,11 @@ struct VerifyRef {
     /// legitimately owns is counted `occluded=`, not `bad=`. x86 only; see [`OccSnap`].
     #[cfg(target_arch = "x86_64")]
     occ_before: OccSnap,
+    /// WCD-CHUNK — the box's whole visible row extent at admission, so the read-back can tell "this
+    /// chunk closed the BOX" (the cursor reached this) from "this chunk closed its band". Chunking
+    /// exists only where the deferral policy does.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    full_rows: usize,
 }
 
 /// WC-D — capture the read-back's reference, from the composite loop, BEFORE `draw_window` runs.
@@ -4671,6 +4775,55 @@ fn verify_reference(
         }
     };
 
+    // WCD-CHUNK — resume at the CURSOR. The read-back below is time-bounded (see [`WCD_CHUNK_US`]),
+    // so one admitted pass may cover only a prefix of `row0..row1`; the cursor is where the previous
+    // chunk stopped, and coverage stays CONTIGUOUS from row 0 — which is what lets the closing
+    // chunk's cumulative verdict claim the whole box without any chunk map. Three gates keep that
+    // true: a present whose rows sit entirely below the cursor offers nothing new and declines; one
+    // whose band starts ABOVE the cursor would leave a hole and declines too (whole-box presents —
+    // every launch present, every `paygo_service` mark — always contain the cursor, so progress and
+    // termination ride on them); and a cursor at or past the box's whole extent means the box SHRANK
+    // under a part-paid battery, which closes it as PAID rather than wedging it — every row the box
+    // still has was walked, and `-> UNPAID` silence is the convicted shape this module forbids.
+    // STAGE 2 ONLY, and that is a semantic line, not a cost call. Stage 1's lattice verdict has
+    // always been "the band this present offered, once" — band-clipped, immediate, closed on its
+    // first pass — and the x86 gate REQUIREs its line early in the boot. Chunking it would quietly
+    // promote it to "the whole box, cumulatively", whose termination then depends on presents that
+    // contain the cursor row — a dependency a band-only presenter (the routed console presents
+    // 0..64-row bands for stretches) never satisfies for stage 1, because `paygo_service`'s
+    // whole-box rescue only reaches DECLINED (stage-2) windows. Stage 1 is also the small term on
+    // the launch instant — ~78 ms against stage 2's ~1.26 s on Boot Ab — so it keeps today's shape
+    // to the byte, and the time stop below never arms for it.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let (row0, banded) = if running != WCD_ST_FULL_RUN {
+        (row0, banded)
+    } else {
+        let cur = WCD_CUR[i].load(core::sync::atomic::Ordering::Relaxed) as usize;
+        if cur >= row1 {
+            if cur >= rows && row1 == rows {
+                wcd_commit(i, running, 1);
+                wcd_complete(r.id, i);
+            } else {
+                wcd_unwind(i, running);
+            }
+            return None;
+        }
+        if cur < row0 {
+            wcd_unwind(i, running);
+            return None;
+        }
+        if cur == 0 {
+            // First chunk of a stage: this stage's banked sums start clean. Single-writer — the
+            // state machine admits one reference at a time — so plain stores.
+            WCD_ACC_CHECKED[i].store(0, core::sync::atomic::Ordering::Relaxed);
+            WCD_ACC_NONZERO[i].store(0, core::sync::atomic::Ordering::Relaxed);
+            WCD_ACC_OCC[i].store(0, core::sync::atomic::Ordering::Relaxed);
+            WCD_ACC_SPRITE[i].store(0, core::sync::atomic::Ordering::Relaxed);
+            WCD_ACC_UNSTABLE[i].store(0, core::sync::atomic::Ordering::Relaxed);
+        }
+        (cur, banded || cur > 0)
+    };
+
     // WC-D/PAYGO — stage-appropriate, and with the EFFECTIVE step: a sampled pass claims only the
     // first-verdict latch and leaves the terminal one for the deferred pass, while a full pass — including
     // a lattice that collapsed above — closes the battery outright. See [`wcd_admit`].
@@ -4729,7 +4882,8 @@ fn verify_reference(
     let occ_before = occ_excuse(r.z, r.id, clip);
     Some(VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
-        #[cfg(target_arch = "x86_64")] occ_before })
+        #[cfg(target_arch = "x86_64")] occ_before,
+        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))] full_rows: rows })
 }
 
 /// WC-D — `band=` on the wire: `none` for a whole-box verdict, `y0..y1` in SOURCE rows for a banded one.
@@ -5234,6 +5388,75 @@ static WCD_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
 static WCD_LASTROLL: [core::sync::atomic::AtomicU64; WCD_IDS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; WCD_IDS];
 
+/// WCD-CHUNK — the launch-stall fix (GR27), and the invariant it encodes: no composite pass may hold
+/// `COMP_GATE` — IRQs masked, on the presenting app's own core — for an unbounded glass read-back.
+///
+/// Boot Ab (metal, 2026-08-12) measured the stage-2 full-coverage verdict of a freshly launched
+/// 128x128 @ 6x window at ~1.26 s: 589 824 panel probes x 2 read-back passes through the Kepler BAR
+/// at ~1.06 us/probe, taken INSIDE the launching app's own present, one pass after the first-window
+/// focus grant. That read-back WAS the operator's launch pause: `[launchpace]` had already
+/// exonerated storage (8.8 ms), `[comp2]` charged the pass `blit_us=1 258 942` max against
+/// `compose_us + present_us = 7 311`, `[vugfps] wf=1` landed the instant the verify line did
+/// (442 109 -> 442 114 ms), and the six-vug storm ran six such verdicts back to back at an exact
+/// ~1 252 ms cadence (345 419 .. 352 164 ms). The deferral gate could not defer it: `paygo_clock`
+/// measures since KERNEL entry, so it takes the cost off the boot burst and leaves it on every
+/// launch after 15 s of uptime — which is all of them.
+///
+/// The STAGE-2 verdict is therefore paid in CHUNKS (stage 1 keeps its band-clipped single pass —
+/// the small term, ~78 ms on Boot Ab, and the shape the gates REQUIRE early; see the stage line in
+/// [`verify_reference`]). Each admitted pass walks the glass from a per-id resume cursor for at
+/// most this many microseconds per read-back pass (whole source rows, at least one), banks the
+/// clean counts, hands the reference back, and the next admitted composite resumes where it
+/// stopped. The verdict line prints ONCE, cumulative, when the cursor closes the box — one PASS on
+/// the wire, exactly as before — and any exceptional chunk (FAIL, LIVE, teardown abort) prints
+/// immediately with `band=` naming the rows it walked, closing the battery the way one bad verdict
+/// always has. 2 000 us: an eighth of a 60 Hz frame per pass, twice per chunk (plus one source
+/// row's overshoot — the stop is checked between rows), so a launch-instant present pays ~4-10 ms
+/// of witness instead of ~1.26 s, and the `[rtwit]` tail stops being a picture of this instrument.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+const WCD_CHUNK_US: u64 = 2_000;
+
+/// WCD-CHUNK — per-id: the next SOURCE row the running stage's read-back resumes at. Advanced only
+/// by a clean banked chunk; an aborted or declined chunk re-walks the same rows. Reset by the
+/// stage-1 -> stage-2 transition in [`wcd_commit`] and by the recycle in `create_inner`.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_CUR: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+
+/// WCD-CHUNK — per-id telemetry for the terminal PAID line: `chunks=` and `hold_max_us=`. THE
+/// FALSIFIER for the launch-stall fix: Boot Ab measured the unchunked hold at ~1.26 s on the wire,
+/// so the next metal boot's `hold_max_us` must sit two orders of magnitude below that (a few
+/// thousand us, per [`WCD_CHUNK_US`] plus one row's overshoot) or the fix did not land. Reset at
+/// recycle only — the pair describes the tenant's whole stage-2 battery.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_CHUNKS: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_HOLD_MAX_US: [core::sync::atomic::AtomicU64; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; WCD_IDS];
+
+/// WCD-CHUNK — per-id banked sums for the cumulative terminal verdict: silent clean chunks add
+/// their `checked`/`nonzero`/`occluded`/`sprite_px` here (their `bad`/`moved` are zero — that is
+/// what kept them silent) and the closing chunk prints the totals. `WCD_ACC_UNSTABLE` carries the
+/// AND for the PASS line's `stable=`: any chunk whose interlock read unstable makes the cumulative
+/// line say so. Single-writer by construction (one outstanding reference per id), so `Relaxed`
+/// throughout; reset by the first chunk of each stage (cursor at 0).
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_ACC_CHECKED: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_ACC_NONZERO: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_ACC_OCC: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_ACC_SPRITE: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_ACC_UNSTABLE: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+
 /// WC-D — the per-id verdict progression, as ONE atomic per window.
 ///
 /// ### Why a state machine replaced the pair of bitmasks
@@ -5544,7 +5767,7 @@ fn paygo_at_close(id: WinId) {
     if wcd_pending(i) && said & 2 == 0 {
         PAYGO_CLOSE_SAID[i].fetch_or(2, core::sync::atomic::Ordering::Relaxed);
         let (since_ms, clock, _) = super::wcg::paygo_clock();
-        wcd_paygo_note(id, i, "closed", "UNSPENT", since_ms, clock);
+        wcd_paygo_note(id, i, "closed", "UNSPENT", since_ms, clock, None);
     }
     // AND THE WIRE IS SHUT, on both halves, whichever way each of them got here — paid in full above
     // (`state=complete … -> PAID`), closed unspent just now, or never owed anything at all. All three
@@ -5600,6 +5823,9 @@ fn wcd_commit(i: usize, running: u32, step: usize) {
             VERIFIED_FULL.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
             WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
         } else {
+            // WCD-CHUNK — stage 2 walks the box from the top; the cursor is stage-scoped state and
+            // this transition is where a stage ends with another owed.
+            WCD_CUR[i].store(0, core::sync::atomic::Ordering::Relaxed);
             WCD_STATE[i].store(WCD_ST_FULL, core::sync::atomic::Ordering::Release);
         }
         let _ = running;
@@ -5680,7 +5906,7 @@ fn wcd_decline(id: u32, i: usize, since_ms: u64, clock: &'static str) {
         return;
     }
     if WCD_SAID[i].swap(1, core::sync::atomic::Ordering::AcqRel) == 0 {
-        wcd_paygo_note(id, i, "waiting", "DEFERRED", since_ms, clock);
+        wcd_paygo_note(id, i, "waiting", "DEFERRED", since_ms, clock, None);
         return;
     }
     let last = WCD_LASTROLL[i].load(core::sync::atomic::Ordering::Relaxed);
@@ -5699,7 +5925,7 @@ fn wcd_decline(id: u32, i: usize, since_ms: u64, clock: &'static str) {
     {
         return;
     }
-    wcd_paygo_note(id, i, "waiting", "DEFERRED", since_ms, clock);
+    wcd_paygo_note(id, i, "waiting", "DEFERRED", since_ms, clock, None);
 }
 
 /// WC-D/PAYGO — the policy's own line: what regime this window is in, how much it has declined, and
@@ -5711,27 +5937,57 @@ fn wcd_decline(id: u32, i: usize, since_ms: u64, clock: &'static str) {
 /// so one reader rule serves both — `taken=`/`budget=` count the window's STAGES, of which there are
 /// two, and `taken=` counts stages CLOSED rather than lines printed, because a collapsed lattice
 /// closes both in one full-coverage verdict.
+/// WCD-CHUNK — `chunks` rides only the COMPLETE line ([`wcd_complete`] passes `Some`): the pair is
+/// meaningless before the battery closes, and inserting it on the `waiting` line would break the
+/// x86-witness gate's DEFERRED pattern, whose `since_entry_ms= clock= taken=` run is matched
+/// contiguously. The insertion point — between `clock=` and `taken=` — sits under that same gate's
+/// `state=complete .*taken=` span, so the PAID pattern is untouched.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-fn wcd_paygo_note(id: u32, i: usize, state: &str, verdict: &str, since_ms: u64, clock: &str) {
+fn wcd_paygo_note(
+    id: u32,
+    i: usize,
+    state: &str,
+    verdict: &str,
+    since_ms: u64,
+    clock: &str,
+    chunks: Option<(u32, u64)>,
+) {
     // `taken=` off the STATE cell, not off the published bitmasks. A recycle clears those between a
     // claim and its print (slot 3 recycles seven times in the s73 capture, and a deferred stage-2
     // straddles a recycle by construction), which is how a `-> PAID` could read `taken=0`. The state
     // cell is reset by the same recycle, so it cannot disagree with itself.
     let taken = wcd_taken(i);
     let emit = WCD_EMIT[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-    serial_println!(
-        "[wc-d] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget=2 -> {}",
-        id,
-        state,
-        emit,
-        WCD_LATTICE_N,
-        WCD_DEFERRED[i].load(core::sync::atomic::Ordering::Relaxed),
-        super::wcg::PAYGO_DEFER_MS,
-        since_ms,
-        clock,
-        taken,
-        verdict
-    );
+    match chunks {
+        None => serial_println!(
+            "[wc-d] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget=2 -> {}",
+            id,
+            state,
+            emit,
+            WCD_LATTICE_N,
+            WCD_DEFERRED[i].load(core::sync::atomic::Ordering::Relaxed),
+            super::wcg::PAYGO_DEFER_MS,
+            since_ms,
+            clock,
+            taken,
+            verdict
+        ),
+        Some((n, hold_max_us)) => serial_println!(
+            "[wc-d] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} chunks={} hold_max_us={} taken={} budget=2 -> {}",
+            id,
+            state,
+            emit,
+            WCD_LATTICE_N,
+            WCD_DEFERRED[i].load(core::sync::atomic::Ordering::Relaxed),
+            super::wcg::PAYGO_DEFER_MS,
+            since_ms,
+            clock,
+            n,
+            hold_max_us,
+            taken,
+            verdict
+        ),
+    }
     // Re-armed from AFTER the serial write, deliberately — see [`WCD_LASTROLL`].
     WCD_LASTROLL[i].store(crate::arch::now_cycles(), core::sync::atomic::Ordering::Relaxed);
 }
@@ -5742,7 +5998,11 @@ fn wcd_paygo_note(id: u32, i: usize, state: &str, verdict: &str, since_ms: u64, 
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 fn wcd_complete(id: u32, i: usize) {
     let (since_ms, clock, _) = super::wcg::paygo_clock();
-    wcd_paygo_note(id, i, "complete", "PAID", since_ms, clock);
+    // WCD-CHUNK — the falsifier rides the terminal: how many chunks the battery took and the worst
+    // single gate-held wall any of them imposed. See [`WCD_CHUNKS`].
+    let chunks = WCD_CHUNKS[i].load(core::sync::atomic::Ordering::Relaxed);
+    let hold = WCD_HOLD_MAX_US[i].load(core::sync::atomic::Ordering::Relaxed);
+    wcd_paygo_note(id, i, "complete", "PAID", since_ms, clock, Some((chunks, hold)));
 }
 
 /// WC-D/PAYGO — the `coverage=` marker, inserted between `checked=` and `bad_cache=`: an INSERTION,
@@ -14817,6 +15077,13 @@ fn create_inner(
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
         {
             PAYGO_CLOSE_SAID[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
+            // WCD-CHUNK — the cursor and its telemetry travel with the battery they describe: a new
+            // tenant's read-back starts at row 0, and its `chunks=`/`hold_max_us=` must not inherit
+            // a predecessor's. The banked sums (`WCD_ACC_*`) need no reset here — the first chunk of
+            // each stage clears them, and a recycle puts the cursor at 0, which IS that condition.
+            WCD_CUR[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
+            WCD_CHUNKS[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
+            WCD_HOLD_MAX_US[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
             super::wcg::paygo_recycle(id as usize);
             // PAYGO-TERM — and so is the TAKER's budget. `PAYGO_SVC_TRIES` bounds how many times the
             // service-pass taker will mark THIS window before giving up on it, and `PAYGO_SVC_NOTED`
