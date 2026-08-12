@@ -474,7 +474,8 @@ static SHELL_Z: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 /// in the resting colours; shell focus (`0`) therefore highlights nothing, which is the honest reading
 /// — no app has the keyboard.
 ///
-/// Set only by [`focus_changed`], and read only by the composite pass, which snapshots it once so a
+/// Set by [`focus_changed`] and cleared by [`focus_release`] (CLOSE-TEARDOWN, the close paths'
+/// narrow drop-to-shell), and read only by the composite pass, which snapshots it once so a
 /// single pass judges every window against one focus owner. `0` is also the initial value, so a boot
 /// that never changes focus draws exactly the resting chrome it always did.
 static FOCUS_ASID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1846,6 +1847,12 @@ pub fn focus_changed(asid: u64) {
     // Boxes of windows this call pushed BELOW the shell — the pixels the console is about to own.
     let mut hidden = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut nhidden = 0usize;
+    // CLOSE-TEARDOWN — of those, the rows that genuinely LEAVE the glass (`!above_shell` under the
+    // new z), as (id, owner): every park is named on the wire with its cause, so the next capture
+    // can falsify "a close parked a sibling" instead of inferring it. Collected under the guard,
+    // emitted after it (this file's standing rule: nothing is called out from under `TABLE`).
+    let mut parked = [(WIN_NONE, 0u64); MAX_WINDOWS];
+    let mut nparked = 0usize;
     // FV-EXEMPT — of those boxes, how many belong to a row that [`above_shell`] says is STILL VISIBLE.
     // That number ought to be zero by the definition of the set, and it is not: see the shell arm.
     let mut exempt = 0usize;
@@ -1883,7 +1890,11 @@ pub fn focus_changed(asid: u64) {
             // the panel stops showing them at once rather than at the desktop's next flush.
             let z = t.next_z;
             t.next_z = t.next_z.wrapping_add(1).max(1);
-            SHELL_Z.store(z, Ordering::Release);
+            // CLOSE-TEARDOWN r2 — the OLD shell z, taken in the same swap that publishes the new one:
+            // the park witness below names only rows THIS raise takes off the glass, and "was on the
+            // glass" is a claim against the shell position the operator was just looking at. A plain
+            // store would lose it.
+            let prev_shell = SHELL_Z.swap(z, Ordering::AcqRel);
             newz = z;
             for r in t.rows.iter_mut() {
                 if r.used && r.z < z {
@@ -1946,6 +1957,17 @@ pub fn focus_changed(asid: u64) {
                     // so a future exemption added there is carried automatically.
                     if above_shell(r, z) {
                         exempt += 1;
+                    } else if above_shell(r, prev_shell) {
+                        // CLOSE-TEARDOWN r2 — this row was ON the glass under the OLD shell z and is
+                        // leaving it under the new one: THIS raise's park, name it (emitted after the
+                        // guard drops). The qualification is load-bearing: this loop visits every
+                        // `r.z < z` row, which includes rows parked minutes ago by `minimise` or an
+                        // earlier TAB — re-naming those `cause=shell-raise` on every gesture would
+                        // both mislabel them and burn the lifetime `[wm-act]` budget fleet-wide per
+                        // raise. A row already below `prev_shell` (or at `PARKED_Z`) is not parked by
+                        // this gesture and is not named by it.
+                        parked[nparked] = (r.id, r.owner_asid);
+                        nparked += 1;
                     }
                     hidden[nhidden] = outer_box(r);
                     nhidden += 1;
@@ -2009,6 +2031,17 @@ pub fn focus_changed(asid: u64) {
     // framebuffer and the sprite; a `<F5>` with no `<F6>` puts the death there rather than in the
     // composite pass.
     crate::wedge2::mark("<F5>");
+    // CLOSE-TEARDOWN — every park is named with its cause, on the same bounded `[wm-act]` budget the
+    // rest of the gesture vocabulary shares. That budget is [`WM_ACT_LOG_MAX`] = 256 lines for the
+    // WHOLE BOOT (a lifetime cap, not a rate), and on a witness build the boot fixtures spend some of
+    // it before the operator's first gesture — the r2 qualification above (only rows THIS raise takes
+    // off the glass) is what keeps a raise from billing the whole fleet against it every time.
+    // `cause=shell-raise` here can only mean the operator's own whole-table gesture (TAB-to-shell /
+    // desktop click) now that the close paths take [`focus_release`] instead: a `park` line inside a
+    // close's teardown window is the regression this witness exists to catch.
+    for &(pid, powner) in parked[..nparked].iter() {
+        wm_act("park", pid, powner, "cause=shell-raise", 0, 0);
+    }
     if nhidden > 0 {
         // Desktop colour under the vacated boxes, console TEXT over it at the desktop's next present.
         // Splitting it that way is what keeps the response instant without this path needing a
@@ -2065,6 +2098,66 @@ pub fn focus_changed(asid: u64) {
     // pure marker at the return site. A chain the wedge kills mid-flight leaves the claim set, which
     // costs nothing: that core is not coming back.
     crate::wedge2::chain_exit();
+}
+
+/// CLOSE-TEARDOWN — **drop the wm focus a CLOSE orphaned, WITHOUT the shell raise.**
+///
+/// ### The defect this replaces (GR27 Boot A, operator on glass)
+/// *"closing a window causes the other open vug stat pulse windows to minimize SOMETIMES."* The
+/// close paths (`wc_close_click` / `wc_close_furniture`) used `focus_changed(0)` to return an
+/// orphaned focus to the shell — and `focus_changed(0)` is the SHELL ARM: it mints a fresh
+/// [`SHELL_Z`] above EVERY surviving window, erases their boxes to [`DESKTOP_BG`], stops them
+/// compositing, and [`vugmin_scan`] publishes `hidden=true` to every surviving owner. On the glass
+/// that is every sibling minimised by a gesture aimed at one window. "SOMETIMES" is exact: the
+/// close-box press does not focus first, so the arm fired only when the closed window's owner
+/// already held `FOCUS_ASID` (the operator had clicked INTO it before closing it) — Boot A's close
+/// burst at 423–451 s never tripped it (zero `[wc-fv] focus shell` lines), while GR26 Boot AR's
+/// close did (`close_owner` → `[wc-fv] focus shell z=38 hidden=1`, the CLOSEISO wire).
+///
+/// The shell arm is the correct semantics for the gesture it was built for — TAB-to-the-shell, a
+/// deliberate whole-table statement. A close is not that statement: **a close must never park a
+/// sibling.** This verb is the narrow replacement — it clears the focus HIGHLIGHT and nothing else.
+///
+/// ### What it does, exhaustively
+///  * CAS [`FOCUS_ASID`] from `owner` to `0` (the shell). A miss means the closed owner did not
+///    hold focus, and the whole call is a no-op — same guard the callers used to place around
+///    `focus_changed(0)`, folded inside so no caller can forget it.
+///  * Re-damages any window the departing owner still holds, so surviving chrome sheds the
+///    highlight colours. On the close path the owner's rows are already reaped and this finds
+///    nothing; it exists for a future caller that releases focus without closing.
+///
+/// ### What it deliberately does NOT do
+///  * No [`SHELL_Z`] bump — survivors keep their z, keep compositing, stay on the glass.
+///  * No [`vugmin_publish`] — nobody's hidden bit moves; every surviving vug keeps running.
+///  * No erase, no `request_full_present` — no sibling pixel is touched.
+///
+/// The keyboard half of "focus back to the shell" (`user_input_set_active(0)`) is the syscall
+/// layer's and stays where it was — this verb is only the wm half.
+pub fn focus_release(owner: u64) {
+    use core::sync::atomic::Ordering;
+    if owner == 0
+        || FOCUS_ASID
+            .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    // The departing owner's surviving rows (if any) repaint in resting chrome — the same
+    // "loser repaints" rule `focus_changed`'s `prev` block applies.
+    let mut any = false;
+    {
+        let mut t = table();
+        for r in t.rows.iter_mut() {
+            if r.used && !r.compat && r.owner_asid == owner {
+                r.damage_all();
+                any = true;
+            }
+        }
+    }
+    wm_act("focus-release", WIN_NONE, owner, "shell-raise=skipped siblings=untouched", 0, 0);
+    if any {
+        composite();
+    }
 }
 
 /// FOCUS-VIS — whether `r` composites at all, i.e. whether it sits ABOVE the shell in the one z-order
@@ -9386,6 +9479,11 @@ pub fn minimise(id: WinId) -> &'static str {
     };
     let hid = owner_hidden(&t, owner, shell);
     drop(t);
+    // CLOSE-TEARDOWN — the deliberate park, named with its cause on the same `[wm-act]` budget the
+    // shell arm's `cause=shell-raise` lines use, so EVERY park in a capture carries a cause and an
+    // unexplained one cannot hide. (The router's `[wm-act] minimise ... settle=` line names the
+    // gesture; this one names the park itself, uniformly with the incidental kind.)
+    wm_act("park", id, owner, "cause=minimise", 0, 0);
     // VUGMIN-B — outside the guard, on this module's standing convention for this seam.
     vugmin_publish(owner, hid);
     // The vacate epilogue, identical to `move_to_inner`'s and load-bearing for the same reasons:
