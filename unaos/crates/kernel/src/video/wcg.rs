@@ -1571,36 +1571,6 @@ fn budget_left(i: usize) -> bool {
     TAKEN[i].load(Ordering::Relaxed) < SAMPLES
 }
 
-/// WCPAR step 3 — MAY [`begin`] STILL FIRE FOR THIS WINDOW? Asked WITHOUT spending anything.
-///
-/// The compositor's phase split composes a window into a per-core buffer in Phase A and blits it in
-/// Phase B, with the present gate taken in between. This module's bracket cannot straddle that: `end`
-/// reads the SOURCE surface back ("the surface as the copy left it") and then walks the GLASS, so it
-/// has to run after the blit, while `begin`'s `t0` has to start before the copy — and `us=`, which is
-/// the timing verdict a `slow=yes` tear report is drawn from, would then contain the gate wait.
-/// Widening a bracket until it measures something other than what it names is how an instrument
-/// starts lying, so instead the compositor sends any window this returns `true` for down the UNSPLIT
-/// path, where `begin`/`end` keep the exact interval they have always had.
-///
-/// Deliberately OVER-approximate. It answers the budget and the eligibility, not PAYGO's per-pass
-/// deferral gate ([`paygo_open`]), because that gate is a property of the moment rather than of the
-/// window and asking it here would consume its accounting. So a window whose budget is live but whose
-/// PAYGO gate happens to be shut is refused the split for that pass. The cost of a false `true` is
-/// one window composed under the gate instead of beside it; the cost of a false `false` would be a
-/// widened bracket, which is why the bias runs this way.
-///
-/// One relaxed load in the steady state, and the answer goes to `false` for good once a window's four
-/// samples are spent — so a boot's fully-instrumented windows take the unsplit path early and the
-/// split path for the rest of the boot.
-#[cfg(feature = "witness")]
-pub fn armed(id: u32, compat: bool, surf: usize, surf_len: usize) -> bool {
-    let i = id as usize;
-    if compat || surf == 0 || surf_len == 0 || i >= IDS {
-        return false;
-    }
-    budget_left(i)
-}
-
 /// Record the app-side frame at `SYS_WIN_PRESENT` entry — the checksum of what the owner declared
 /// finished, taken while the owner is parked inside the syscall and provably not writing. Called
 /// from `wm::present`, after the table lock is dropped and before the composite.
