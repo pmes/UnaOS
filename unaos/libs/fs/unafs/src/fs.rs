@@ -236,7 +236,9 @@ impl<D: BlockDevice> UnaFS<D> {
     // Lifecycle
     // =====================================================================
 
-    /// Format the device with a new (K8, version 3) UnaFS filesystem.
+    /// Format the device with a new (K8, version 4) UnaFS filesystem. Version 4
+    /// is spill-capable: a file whose extent list overflows its inode block
+    /// spills to indirect blocks (see [`crate::inode::IndirectTrailer`]).
     pub fn format(mut device: D, size_mb: u64) -> Result<Self, FileSystemError> {
         let blocks_from_size = (size_mb * 1024 * 1024) / BLOCK_SIZE;
         let mut block_count = device.block_count();
@@ -668,7 +670,8 @@ impl<D: BlockDevice> UnaFS<D> {
 
     /// Read an Inode by LOGICAL id.
     pub fn read_inode(&mut self, id: u64) -> Result<Inode, FileSystemError> {
-        Self::read_inode_via(&mut self.device, &self.imap, id)
+        let bc = self.superblock.block_count;
+        Self::read_inode_via(&mut self.device, bc, &self.imap, id)
     }
 
     /// Read an Inode by LOGICAL id, resolving the id through an EXPLICIT inode
@@ -677,37 +680,194 @@ impl<D: BlockDevice> UnaFS<D> {
     /// [`SnapshotView`] (`imap` == the snapshot's frozen map) — one code path,
     /// no parallel read logic. `device`/`imap` are borrowed as disjoint fields
     /// so a `&mut self` caller can pass `&mut self.device` and `&self.imap`.
-    fn read_inode_via(device: &mut D, imap: &[u64], id: u64) -> Result<Inode, FileSystemError> {
+    ///
+    /// A SPILLED inode is reconstructed here: its overflow extents are read from
+    /// the indirect blocks and appended to `chunks`, so the returned inode
+    /// carries its COMPLETE extent list and every consumer above this layer is
+    /// oblivious to the split.
+    fn read_inode_via(
+        device: &mut D,
+        block_count: u64,
+        imap: &[u64],
+        id: u64,
+    ) -> Result<Inode, FileSystemError> {
+        let (inode, _index) = Self::read_inode_full_via(device, block_count, imap, id)?;
+        Ok(inode)
+    }
+
+    /// Like [`read_inode_via`](Self::read_inode_via) but also returns the
+    /// inode's INDIRECT INDEX extents (empty for an inline inode). Reachability
+    /// (fsck) and snapshot enumeration need the index blocks — they are
+    /// in-use metadata a naive extent walk would miss and report as leaked.
+    fn read_inode_full_via(
+        device: &mut D,
+        block_count: u64,
+        imap: &[u64],
+        id: u64,
+    ) -> Result<(Inode, ExtentList), FileSystemError> {
         let pb = imap.get(id as usize).copied().unwrap_or(0);
         if pb == 0 {
             return Err(FileSystemError::NotFound);
         }
         let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
         device.read_block(pb, &mut block)?;
-        let inode = Inode::from_bytes(&block)?;
+        let (inode, index) = Self::reconstruct_inode(device, block_count, &block)?;
         if inode.id != id {
             return Err(FileSystemError::CorruptVolume("inode id mismatch"));
         }
-        Ok(inode)
+        Ok((inode, index))
     }
 
-    /// CoW-write an Inode: fresh block, remap, release the old block.
-    fn write_inode(&mut self, inode: &Inode) -> Result<(), FileSystemError> {
-        let bytes = inode.to_bytes()?;
+    /// Turn a raw 4096 B inode block into (full inode, indirect index extents).
+    /// For an inline inode the index is empty and `chunks` is complete as
+    /// decoded. For a spilled inode the overflow extent list is read back from
+    /// the indirect blocks (bounded against the volume span, BEFS-HARDEN) and
+    /// appended to `chunks`; the index extents are returned for refcount
+    /// accounting. Takes only the device + span, so both the live mount and the
+    /// snapshot walk (which has no inode map, only a physical block) can call it.
+    fn reconstruct_inode(
+        device: &mut D,
+        block_count: u64,
+        block: &[u8],
+    ) -> Result<(Inode, ExtentList), FileSystemError> {
+        let (mut inode, trailer) = Inode::decode_block(block)?;
+        let index = match trailer {
+            None => ExtentList::new(),
+            Some(t) => {
+                if t.magic != crate::inode::INODE_SPILL_MAGIC {
+                    return Err(FileSystemError::CorruptVolume("indirect trailer magic"));
+                }
+                let overflow_bytes = Self::read_from_extents_via(
+                    device,
+                    block_count,
+                    &t.index,
+                    0,
+                    t.overflow_len,
+                    t.overflow_len,
+                )?;
+                let overflow: ExtentList = crate::codec::deserialize(&overflow_bytes)?;
+                inode.chunks.extend(overflow);
+                if inode.chunks.len() as u64 != t.total_extents {
+                    return Err(FileSystemError::CorruptVolume("indirect extent count"));
+                }
+                t.index
+            }
+        };
+        Ok((inode, index))
+    }
+
+    /// Read the INDIRECT INDEX extents of the inode at physical block `pb`
+    /// (empty if inline). Used to release an inode's indirect blocks when its
+    /// block is dropped (CoW rewrite or unlink), so the extent list's overflow
+    /// storage is never leaked.
+    pub(crate) fn inode_index_extents_at(&mut self, pb: u64) -> Result<ExtentList, FileSystemError> {
         let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
-        block[..bytes.len()].copy_from_slice(&bytes);
-        let nb = self.alloc_block()?;
-        self.write_fresh(nb, &block)?;
+        self.device.read_block(pb, &mut block)?;
+        let (_inode, trailer) = Inode::decode_block(&block)?;
+        Ok(trailer.map(|t| t.index).unwrap_or_default())
+    }
+
+    /// CoW-write an Inode: fresh block, remap, release the old block (and any
+    /// indirect blocks the old version owned).
+    ///
+    /// If the inode's full extent list fits one block it is written inline,
+    /// byte-identical to the pre-indirection format. Otherwise — on a
+    /// spill-capable (v4) volume — the leading extents stay inline and the
+    /// overflow spills to freshly allocated indirect blocks described by a
+    /// trailer appended after the inode's bytes. On a v3 volume an oversized
+    /// inode is rejected `InodeTooLarge`, exactly as before.
+    fn write_inode(&mut self, inode: &Inode) -> Result<(), FileSystemError> {
         let idx = inode.id as usize;
         if idx >= self.imap.len() {
             return Err(FileSystemError::CorruptVolume("inode id beyond map"));
         }
         let old = self.imap[idx];
+
+        let block = self.encode_inode_block(inode)?;
+        let nb = self.alloc_block()?;
+        self.write_fresh(nb, &block)?;
+
         if old != 0 {
+            // Release the previous version's indirect blocks (if any), then the
+            // inode block itself — the standard CoW decref of the old record.
+            let old_index = self.inode_index_extents_at(old)?;
+            self.decref_extents(&old_index);
             self.refmap.decref(old);
         }
         self.imap[idx] = nb;
         Ok(())
+    }
+
+    /// Build the 4096 B on-disk image of an inode, spilling its extent-list
+    /// overflow to indirect blocks when it will not fit inline. Allocates and
+    /// writes the indirect blocks as a side effect (they join the transaction).
+    fn encode_inode_block(&mut self, inode: &Inode) -> Result<Vec<u8>, FileSystemError> {
+        // Fast path: the whole inode fits one block → inline, unchanged bytes.
+        match inode.to_bytes() {
+            Ok(bytes) => {
+                let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
+                block[..bytes.len()].copy_from_slice(&bytes);
+                Ok(block)
+            }
+            Err(InodeError::InodeTooLarge(_, _)) => {
+                if !self.superblock.spill_capable() {
+                    // v3 volume: no spill format is declared — reject as before.
+                    return Err(InodeError::InodeTooLarge(0, BLOCK_SIZE).into());
+                }
+                self.encode_spilled_inode_block(inode)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Encode a spilled inode: keep the leading extents inline, serialize the
+    /// overflow into indirect blocks, and append the [`IndirectTrailer`].
+    fn encode_spilled_inode_block(
+        &mut self,
+        inode: &Inode,
+    ) -> Result<Vec<u8>, FileSystemError> {
+        let k = inode.inline_extent_count()?;
+        if k >= inode.chunks.len() {
+            // The inode is oversized for a reason other than extent count
+            // (e.g. attributes) — spilling extents cannot help.
+            return Err(InodeError::InodeTooLarge(0, BLOCK_SIZE).into());
+        }
+
+        // Serialize the overflow extents and write them to fresh indirect
+        // blocks; the coalescing allocator makes `index` a few extents when the
+        // blocks land contiguously.
+        let overflow: ExtentList = inode.chunks[k..].to_vec();
+        let overflow_bytes = crate::codec::serialize(&overflow)?;
+        let index = self.allocate_and_write_extents(&overflow_bytes)?;
+
+        let trailer = crate::inode::IndirectTrailer {
+            magic: crate::inode::INODE_SPILL_MAGIC,
+            total_extents: inode.chunks.len() as u64,
+            overflow_len: overflow_bytes.len() as u64,
+            index: index.clone(),
+        };
+
+        let mut stub = inode.clone();
+        stub.chunks.truncate(k);
+        let inode_bytes = crate::codec::serialize(&stub)?;
+        let trailer_bytes = crate::codec::serialize(&trailer)?;
+
+        if inode_bytes.len() + trailer_bytes.len() > BLOCK_SIZE as usize {
+            // The index fragmented past the reserve — undo the just-written
+            // indirect blocks so nothing leaks, and fail gracefully.
+            self.decref_extents(&index);
+            return Err(InodeError::InodeTooLarge(
+                inode_bytes.len() + trailer_bytes.len(),
+                BLOCK_SIZE,
+            )
+            .into());
+        }
+
+        let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
+        block[..inode_bytes.len()].copy_from_slice(&inode_bytes);
+        block[inode_bytes.len()..inode_bytes.len() + trailer_bytes.len()]
+            .copy_from_slice(&trailer_bytes);
+        Ok(block)
     }
 
     /// Allocate the next logical inode id and CoW-write a fresh inode there.
@@ -912,7 +1072,7 @@ impl<D: BlockDevice> UnaFS<D> {
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>, FileSystemError> {
-        let inode = Self::read_inode_via(device, imap, inode_id)?;
+        let inode = Self::read_inode_via(device, block_count, imap, inode_id)?;
         Self::read_from_extents_via(device, block_count, &inode.chunks, offset, length, inode.size)
     }
 
@@ -1046,7 +1206,7 @@ impl<D: BlockDevice> UnaFS<D> {
         imap: &[u64],
         inode_id: u64,
     ) -> Result<Vec<DirEntry>, FileSystemError> {
-        let inode = Self::read_inode_via(device, imap, inode_id)?;
+        let inode = Self::read_inode_via(device, block_count, imap, inode_id)?;
         if inode.kind != FileKind::Directory {
             return Err(FileSystemError::NotADirectory);
         }
@@ -1395,7 +1555,7 @@ impl<D: BlockDevice> UnaFS<D> {
         inode_id: u64,
         key: &str,
     ) -> Result<Option<AttributeValue>, FileSystemError> {
-        let inode = Self::read_inode_via(device, imap, inode_id)?;
+        let inode = Self::read_inode_via(device, block_count, imap, inode_id)?;
 
         if let Some(val) = inode.attributes.get(key) {
             return Ok(Some(val.clone()));
@@ -1463,6 +1623,11 @@ impl<D: BlockDevice> UnaFS<D> {
         self.decref_extents(&inode.chunks);
         let pb = self.imap.get(inode_id as usize).copied().unwrap_or(0);
         if pb != 0 {
+            // Release the inode's indirect (extent-spill) blocks before the
+            // inode block itself — otherwise a spilled file's overflow storage
+            // would leak on unlink.
+            let index = self.inode_index_extents_at(pb)?;
+            self.decref_extents(&index);
             self.refmap.decref(pb);
         }
         self.imap_clear(inode_id);
@@ -1773,8 +1938,13 @@ impl<D: BlockDevice> UnaFS<D> {
                 blocks.push(inode_pb);
                 let mut ib = alloc::vec![0u8; BLOCK_SIZE as usize];
                 self.device.read_block(inode_pb, &mut ib)?;
-                let inode = Inode::from_bytes(&ib)?;
+                // Reconstruct so a SPILLED inode contributes its overflow DATA
+                // blocks (in the completed `chunks`) and its INDIRECT index
+                // blocks — a snapshot references every block its root reaches,
+                // and missing either would let a later drop free live storage.
+                let (inode, index) = Self::reconstruct_inode(&mut self.device, block_count, &ib)?;
                 Self::push_extent_blocks(&inode.chunks, block_count, &mut blocks)?;
+                Self::push_extent_blocks(&index, block_count, &mut blocks)?;
                 for extents in inode.large_attributes.values() {
                     Self::push_extent_blocks(extents, block_count, &mut blocks)?;
                 }
@@ -2344,7 +2514,7 @@ impl<'a, D: BlockDevice> SnapshotView<'a, D> {
 
     /// Read an inode AS OF the snapshot (size, kind, attributes at snapshot time).
     pub fn read_inode(&mut self, inode_id: u64) -> Result<Inode, FileSystemError> {
-        UnaFS::<D>::read_inode_via(self.device, &self.imap, inode_id)
+        UnaFS::<D>::read_inode_via(self.device, self.block_count, &self.imap, inode_id)
     }
 
     /// List a directory AS OF the snapshot.

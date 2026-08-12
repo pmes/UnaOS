@@ -31,8 +31,26 @@ use thiserror::Error;
 
 /// The Magic Number for UnaFS: "UNAFS" in ASCII.
 pub const MAGIC: [u8; 5] = *b"UNAFS";
-/// The current version of the filesystem (3 = the K8 copy-on-write format).
-pub const VERSION: u32 = 3;
+/// The current version of the filesystem written at format time.
+///
+/// * 3 — the K8 copy-on-write format (extent lists are inline-only: a file
+///   whose inode does not fit one 4096 B block is rejected `InodeTooLarge`).
+/// * 4 — adds EXTENT-LIST INDIRECTION: an overflowing extent list spills to
+///   indirect blocks (see [`crate::inode::IndirectTrailer`]). A v4 volume may
+///   therefore contain a spilled inode that a v3-only reader would silently
+///   truncate — so the bump is an INCOMPAT marker, not a soft hint. Fresh
+///   volumes format as v4; spilling is refused on a mounted v3 volume, which
+///   keeps every v3 inode byte-identical and mountable by old readers.
+pub const VERSION: u32 = 4;
+
+/// The oldest on-disk version this build still mounts. A v3 volume mounts
+/// read/write but never spills (it has no v4 inodes and gains none), so old
+/// images keep working while new images that could contain a spilled inode are
+/// stamped v4 and REJECTED by pre-indirection readers — detected, not misread.
+pub const MIN_SUPPORTED_VERSION: u32 = 3;
+
+/// First version whose format admits spilled (indirect) extent lists.
+pub const VERSION_EXTENT_SPILL: u32 = 4;
 
 /// Reserved logical inode ids (stable across every mutation — Fork-1 verdict:
 /// inode ids are LOGICAL; the inode map carries id → current physical block).
@@ -108,6 +126,14 @@ impl Superblock {
         }
     }
 
+    /// Whether this volume's format admits spilled (indirect) extent lists.
+    /// A mounted v3 volume returns `false`, so an oversized inode is rejected
+    /// exactly as before rather than silently spilling into a format the volume
+    /// does not declare.
+    pub fn spill_capable(&self) -> bool {
+        self.version >= VERSION_EXTENT_SPILL
+    }
+
     /// Serialize the Superblock to bytes, ensuring it fits in Block 0.
     pub fn to_bytes(&self) -> Result<Vec<u8>, SuperblockError> {
         let bytes = crate::codec::serialize(self)?;
@@ -125,7 +151,10 @@ impl Superblock {
         if sb.magic != MAGIC {
             return Err(SuperblockError::InvalidMagic);
         }
-        if sb.version != VERSION {
+        // Accept a RANGE: a v3 volume mounts (inline-only), a v4 volume mounts
+        // with indirection. A future version is rejected — a v4-era build must
+        // never guess at a layout it does not know.
+        if sb.version < MIN_SUPPORTED_VERSION || sb.version > VERSION {
             return Err(SuperblockError::InvalidVersion(sb.version));
         }
         if sb.block_size as u64 != BLOCK_SIZE {

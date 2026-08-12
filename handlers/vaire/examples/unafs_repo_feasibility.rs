@@ -27,7 +27,9 @@
 //!
 //! Scale knobs (env): `OBJECTS` (default 10000), `STREAM_MB` (default 52 — the
 //! monorepo's real total packfile size), `REFS` (default 493 — its real ref
-//! count), `IMAGE_MB` (default 1024; the v3 format caps a volume at 2 GiB).
+//! count), `IMAGE_MB` (default 1024; the format caps a volume at 2 GiB — this is
+//! now the binding structural wall, the single-file ceiling having been lifted
+//! by v4 extent-list indirection).
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -195,9 +197,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         inode.size
     );
     println!(
-        "      NOTE: an Inode must serialize inside ONE 4096 B block, and each\n\
-         \x20           extent costs ~24 B — so the extent count is the hard scaling\n\
-         \x20           limit for a large file, not the volume size."
+        "      NOTE: as of the v4 format an Inode's extent list is no longer\n\
+         \x20           capped at one 4096 B block — an overflowing list SPILLS to\n\
+         \x20           indirect blocks (unafs::inode::IndirectTrailer), lifting the\n\
+         \x20           old ~80 MiB single-file ceiling. The binding structural\n\
+         \x20           limit for a large file is now the 2 GiB volume cap\n\
+         \x20           (MAX_BLOCK_COUNT, one refmap level), not the extent count."
     );
     let t = Instant::now();
     let back = fs
