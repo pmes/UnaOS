@@ -5798,7 +5798,7 @@ impl Controller {
                     );
                 }
                 BtL3Await::Timeout => serial_println!(
-                    ":: bt-l3: [{}] NO LE Connection Complete within {}ms — the controller is still INITIATING. The ordinary reading is that the peer stopped advertising between the scan and the create. The create is OUTSTANDING and MUST be cancelled == witness ::",
+                    ":: bt-l3: [{}] NO LE Connection Complete within {}ms — the controller is still INITIATING. The readings are co-equal: OURS — this create's initiating window overlapped none of the peer's advertising intervals, or the address we are initiating to came from a source that names a different device; THEIRS — the peer stopped advertising between the scan and the create. The create is OUTSTANDING and MUST be cancelled == witness ::",
                     self.idx, BT_L3_CONN_MS
                 ),
                 BtL3Await::Stop => serial_println!(
@@ -7279,7 +7279,7 @@ impl Controller {
             && attempt < BT_C1_PAGE_ATTEMPTS;
         if retry {
             serial_println!(
-                ":: bt-c1: [{}] PAGE TIMEOUT on attempt={}/{} -> RETRYING. Nothing is outstanding (the controller resolved the page itself) and no link is held, so one more page train goes on the air. A train and the peer's page-scan schedule are independent clocks: the second train samples a different phase of it, and if the speaker is simply not scanning this costs one more {}ms and says so == witness ::",
+                ":: bt-c1: [{}] PAGE TIMEOUT on attempt={}/{} -> RETRYING. Nothing is outstanding (the controller resolved the page itself) and no link is held, so one more page train goes on the air. The reason to spend a second train is OURS: a train and the peer's page-scan schedule are independent clocks, this train's phase and its page-scan-repetition-mode/clock-offset alignment need not have overlapped the peer's scan window, and the next train samples a different phase. If it too times out the readings are co-equal — an unaligned page on our side, or a peer not scanning on theirs — and this costs one more {}ms to tell them apart == witness ::",
                 self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
                 (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000
             );
@@ -9485,9 +9485,9 @@ impl Controller {
                         // nature, so with the speaker ON this is the expected shape of a MISS.
                         "considered=0 WITH THE ADDRESS RULE ARMED IS EVIDENCE ABOUT THE AIR, NOT ABOUT THE FILTER: no connectable advertiser of any address entered the table, so nothing was rejected — this window simply overlapped no advertisement. The target was last heard at -97dBm, at which range its reports are intermittent. THE ANOTHER-WINDOW STEP THIS TEXT USED TO ASK FOR IS NOW AUTOMATIC: if windows remain in the budget the stage opens the next one, and the repeat-scan summary at the end of the stage is what says whether the sequence ever heard anything"
                     } else if BT_L3_PEER_ADDR.is_some() {
-                        "the room was heard and the target was not in it: the table was not capped, the target's six bytes appear nowhere in it (connectable or otherwise), and every device above carries its own l3= verdict — address-mismatch for the connectable ones, not-connectable for the rest. The ordinary reading is that the target is OFF or out of range"
+                        "the room was heard and the target was not in it: the table was not capped, the target's six bytes appear nowhere in it (connectable or otherwise), and every device above carries its own l3= verdict — address-mismatch for the connectable ones, not-connectable for the rest. The readings are co-equal and this line ranks none: OURS — this listen window overlapped none of the target's advertising intervals, or the six bytes we match came from a source that names a different device; THEIRS — the target is off or out of range. The repeat-scan summary at the end of the stage is what tells a one-window miss from a genuine absence"
                     } else {
-                        "The ordinary reading with a name filter armed is that the named device is OFF or OUT OF RANGE; the per-device l3= verdicts above say which of the two the room looked like"
+                        "With a name filter armed and nothing matched, the readings are co-equal and this line ranks none: OURS — this listen window overlapped none of the named device's advertising intervals; THEIRS — the named device is off or out of range. The per-device l3= verdicts above say what the room did carry"
                     }
                 );
             }
