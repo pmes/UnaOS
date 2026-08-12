@@ -455,7 +455,15 @@ is per-object staging, not the transaction. What binds:
    (8 B/block over its two views) and is rewritten whole each commit, so a
    1 TiB image costs ~2 GiB of mount RAM and ~1 GiB of map rewrite per commit
    — a repo-sized store (tens of GiB) is comfortable; a third level should
-   arrive with an incremental map.
+   arrive with an incremental map. **In-kernel** the wall is the 256 MiB
+   kernel heap: at 8 B/block the refmap alone consumes it at 32 GiB of
+   volume, so the practical in-kernel mountable ceiling is on the order of
+   ~16 GiB (leaving heap for everything else) — a bigger card is refused
+   with a clean `AllocRefused`, never an OOM panic (the RefMap constructors
+   and fsck's rebuild vec allocate fallibly). Hardening follow-up (v4-parity
+   gap, pre-existing): mount validates refmap mid/leaf pointer BOUNDS but
+   not uniqueness or overlap with blocks 0/1 — a hostile volume with
+   duplicate pointers deserves its own refusal arc.
 3. **No path index** (a shape constraint, not a defect) — lookup is a full `ls`
    plus a linear scan, so git's 256-way fan-out is mandatory; a flat object
    store would be quadratic.

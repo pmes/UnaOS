@@ -42,10 +42,24 @@
 //! block of mid pointers, each mid block holding up to 512 leaf pointers
 //! (cap: 512 × 512 × 1024 = 1 TiB).
 
+use crate::storage::Error as StorageError;
 use alloc::vec::Vec;
 
 /// Refcount entries per 4096 B leaf block (u32 counts).
 pub const REFS_PER_LEAF: u64 = crate::storage::BLOCK_SIZE / 4;
+
+/// Reserve a zero-filled `Vec<u32>` of `n` entries FALLIBLY. The map's views
+/// scale with the volume (4 B/block each), and since the v5 cap lift a view
+/// can run to a gibibyte — an infallible `vec![0u32; n]` here is the
+/// SHELLWIN-OOM disease: a large card would panic the kernel at mount/format
+/// instead of being refused. Failure is a clean [`StorageError::AllocRefused`].
+fn try_zeroed(n: usize) -> Result<Vec<u32>, StorageError> {
+    let mut v: Vec<u32> = Vec::new();
+    v.try_reserve_exact(n)
+        .map_err(|_| StorageError::AllocRefused(n as u64 * 4))?;
+    v.resize(n, 0);
+    Ok(v)
+}
 
 /// The refcount map: `current` vs `frozen` (see module docs).
 pub struct RefMap {
@@ -66,26 +80,46 @@ pub struct RefMap {
 }
 
 impl RefMap {
-    /// A fresh, all-free map for `block_count` blocks (format path).
-    pub fn new(block_count: u64) -> Self {
-        Self {
-            current: alloc::vec![0u32; block_count as usize],
-            frozen: alloc::vec![0u32; block_count as usize],
+    /// A fresh, all-free map for `block_count` blocks (format path). FALLIBLE:
+    /// both views are try-reserved, so a volume too big for the running
+    /// system's heap (the kernel installer path reaches this) is a clean
+    /// `Err`, never an OOM abort.
+    pub fn try_new(block_count: u64) -> Result<Self, StorageError> {
+        let n = usize::try_from(block_count)
+            .map_err(|_| StorageError::AllocRefused(block_count))?;
+        Ok(Self {
+            current: try_zeroed(n)?,
+            frozen: try_zeroed(n)?,
             block_count,
             hint: 0,
-        }
+        })
     }
 
     /// Adopt counts loaded from disk (mount path): both views start equal —
-    /// the loaded map IS the committed tree.
-    pub fn from_counts(mut counts: Vec<u32>, block_count: u64) -> Self {
-        counts.resize(block_count as usize, 0);
-        Self {
-            frozen: counts.clone(),
+    /// the loaded map IS the committed tree. FALLIBLE: the second view is a
+    /// full copy of the first, and the kernel mount path reaches this with a
+    /// disk-derived size — the copy must be refused cleanly, not aborted,
+    /// when the heap cannot serve it (the caller try-reserved only `counts`).
+    pub fn try_from_counts(mut counts: Vec<u32>, block_count: u64) -> Result<Self, StorageError> {
+        let n = usize::try_from(block_count)
+            .map_err(|_| StorageError::AllocRefused(block_count))?;
+        if n > counts.len() {
+            counts
+                .try_reserve_exact(n - counts.len())
+                .map_err(|_| StorageError::AllocRefused(n as u64 * 4))?;
+        }
+        counts.resize(n, 0);
+        let mut frozen: Vec<u32> = Vec::new();
+        frozen
+            .try_reserve_exact(n)
+            .map_err(|_| StorageError::AllocRefused(n as u64 * 4))?;
+        frozen.extend_from_slice(&counts);
+        Ok(Self {
+            frozen,
             current: counts,
             block_count,
             hint: 0,
-        }
+        })
     }
 
     /// First-fit allocate: the lowest block free in BOTH views. Marks it

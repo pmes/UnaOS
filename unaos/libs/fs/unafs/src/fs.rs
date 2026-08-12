@@ -264,7 +264,7 @@ impl<D: BlockDevice> UnaFS<D> {
         let zero = alloc::vec![0u8; BLOCK_SIZE as usize];
         device.write_block(ROOT_BLOCK, &zero)?;
 
-        let mut refmap = RefMap::new(block_count);
+        let mut refmap = RefMap::try_new(block_count)?;
         // Pin the static blocks: superblock + root area.
         refmap.incref(0);
         refmap.incref(ROOT_BLOCK);
@@ -495,7 +495,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 counts.push(c);
             }
         }
-        let refmap = RefMap::from_counts(counts, block_count);
+        let refmap = RefMap::try_from_counts(counts, block_count)?;
 
         Ok(LoadedState {
             root,
