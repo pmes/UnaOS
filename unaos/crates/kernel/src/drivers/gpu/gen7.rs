@@ -119,7 +119,9 @@
 // R4's reversible GGTT claim allocates a single 4 KiB scratch page, translates it to a
 // physical frame, and programs a PTE that maps it — the same allocator and translate walk
 // `igpu::bring_up_blt_ring` uses for the ring page, so the PTE value is a real address, not a
-// fabricated constant. The page is freed before `claim` returns.
+// fabricated constant. The page is freed before `claim` returns — but ONLY once the GGTT
+// neighbourhood is proven restored to zero; if the reversal does not verify the page is leaked,
+// never handed back to the allocator while a PTE might still map it.
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 
 /// Register offsets into BAR0 (GTTMMADR) of BDF `0:2.0`, each tagged with its pin status.
@@ -2237,8 +2239,19 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
     let next_post = rd(bar0, next_off);
     let restored = slot_post == 0 && prev_post == 0 && next_post == 0;
     let smear_post = prev_post != prev_pre || next_post != next_pre;
+    let clean = restored && !smear_held && !smear_post;
 
-    dealloc(page, layout);
+    // The scratch frame returns to the allocator ONLY when the neighbourhood is proven back to
+    // zero and nothing smeared. A GGTT PTE that still mapped this frame after a free would hand
+    // the GT a DMA path into reused kernel heap — so if the reversal did not verify we LEAK the
+    // page (a one-shot, boot-time 4 KiB cost) rather than surrender a possibly-mapped frame.
+    // This is the rung's own refuse-on-any-doubt discipline applied to its single free.
+    let freed = if clean {
+        dealloc(page, layout);
+        true
+    } else {
+        false
+    };
 
     serial_println!(
         ":: gen7: r4 claim target_off={:06X} slot={} phys={:016X} pte={:08X} slot_pre={:08X} slot_held={:08X} slot_post={:08X} landed={} restored={} ::",
@@ -2280,12 +2293,14 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
         "claim-roundtrip-ok"
     };
     serial_println!(
-        ":: gen7: r4 verdict={} wake={} landed={} restored={} smear={} writes=2 reversible=1 rung=R4 note=forcewake-released-by-R3-GGTT-claim-ran-with-well-not-held ::",
+        ":: gen7: r4 verdict={} wake={} landed={} restored={} smear={} writes=4 slots=3 freed={} reversible={} rung=R4 note=forcewake-released-by-R3-GGTT-claim-ran-with-well-not-held-page-freed-only-when-reversal-verified ::",
         verdict,
         wake.name(),
         if landed { 1 } else { 0 },
         if restored { 1 } else { 0 },
-        if smear_held || smear_post { 1 } else { 0 }
+        if smear_held || smear_post { 1 } else { 0 },
+        if freed { 1 } else { 0 },
+        if clean { 1 } else { 0 }
     );
     serial_println!(
         ":: gen7: r4 next={} note=one-PTE-round-trip-restored-and-verified-no-display-register-touched ::",
