@@ -79,6 +79,39 @@ impl core::fmt::Display for CortexError {
 
 impl std::error::Error for CortexError {}
 
+/// Why a frame could not be presented: the no-texture outcomes of
+/// [`wgpu::Surface::get_current_texture`]. wgpu 30 replaced the old
+/// `SurfaceError` result with the `CurrentSurfaceTexture` enum;
+/// [`Cortex::acquire`] flattens it back into a `Result` over this type so
+/// per-frame consumers keep the `?`-shaped skip-this-frame path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentError {
+    /// A timeout was encountered acquiring the next frame; skip and retry.
+    Timeout,
+    /// The window is occluded (minimized/covered); skip until visible.
+    Occluded,
+    /// The surface changed under the configuration; reconfigure and retry.
+    Outdated,
+    /// The surface was lost and needs recreating.
+    Lost,
+    /// A validation error was raised inside the acquire.
+    Validation,
+}
+
+impl core::fmt::Display for PresentError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "surface frame acquire timed out"),
+            Self::Occluded => write!(f, "surface is occluded"),
+            Self::Outdated => write!(f, "surface configuration is outdated"),
+            Self::Lost => write!(f, "surface was lost"),
+            Self::Validation => write!(f, "surface acquire raised a validation error"),
+        }
+    }
+}
+
+impl std::error::Error for PresentError {}
+
 pub struct Cortex<'a> {
     pub instance: Instance,
     pub surface: Surface<'a>,
@@ -169,6 +202,9 @@ impl<'a> Cortex<'a> {
                 power_preference: PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: Some(&surface),
+                // Not exposed to untrusted content — no fingerprinting bucket
+                // needed; keep the adapter's true limits.
+                apply_limit_buckets: false,
             })
             .await
             .map_err(CortexError::NoAdapter)?;
@@ -196,6 +232,9 @@ impl<'a> Cortex<'a> {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            // Auto is valid for every supported format; the sRGB-format
+            // preference above already carries the color-managed intent.
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: width.max(1),
             height: height.max(1),
             present_mode: spec.present_mode,
@@ -215,6 +254,21 @@ impl<'a> Cortex<'a> {
         })
     }
 
+    /// Acquire the current swapchain texture, flattening wgpu's
+    /// `CurrentSurfaceTexture` into a `Result`. A `Suboptimal` texture is
+    /// still a texture — render it; the next `configure` catches up.
+    pub fn acquire(&self) -> Result<wgpu::SurfaceTexture, PresentError> {
+        use wgpu::CurrentSurfaceTexture as C;
+        match self.surface.get_current_texture() {
+            C::Success(t) | C::Suboptimal(t) => Ok(t),
+            C::Timeout => Err(PresentError::Timeout),
+            C::Occluded => Err(PresentError::Occluded),
+            C::Outdated => Err(PresentError::Outdated),
+            C::Lost => Err(PresentError::Lost),
+            C::Validation => Err(PresentError::Validation),
+        }
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.config.width = width;
@@ -225,8 +279,8 @@ impl<'a> Cortex<'a> {
 }
 
 fn new_instance() -> Instance {
-    Instance::new(&InstanceDescriptor {
+    Instance::new(InstanceDescriptor {
         backends: Backends::VULKAN | Backends::METAL, // Legacy is dead to us.
-        ..Default::default()
+        ..InstanceDescriptor::new_without_display_handle()
     })
 }
