@@ -12,6 +12,42 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## vaire track — 2026-08-11 (BOLT-2 — the repo Bolt, and the UnaFS repo-store feasibility verdict) 🔬
 
+### BOLT-2 anchor — the ledger head is now pinned in a retained CoW root 🔬 host-native (+5 vaire tests), zero kernel surface
+
+**What it does.** Closes the MAJOR the BOLT-2 review graded but left open: the
+hash-chained ledger's head was **unanchored**, so a writer who owns
+`<bolt_root>/ledger/<name>.ledger` could rewrite entry *k*, re-chain *k..n*, and
+`verify` still returned Green (or truncate to a valid prefix — invisible when the
+mirror's refs did not move). `repo-uweave --apply` (`repo::weave_into_image`) now
+pins the ledger head `(count, head_hash)` into the UnaFS image's retained CoW
+root as `vaire.repo.head.<name>`, riding the same one snapshot the mirror weave
+takes; `repo-verify <image>` (`repo::verify_anchored`) reads it back through
+`open_snapshot` and rejects a ledger that no longer agrees. A **whole-tail
+rewrite** trips the head-hash, a **truncation** trips the count, a **full
+reorder** trips the head-hash — all three now caught, and a *missing* anchor is
+itself a breach (`AnchorMissing`) so an unanchored chain never passes the
+anchored path silently. The write seam is `usync::usync_with_root_attrs` (an
+image-root-attr set folded before the run's single flip); the read seam is
+`usync::read_retained_root_attr` (newest snapshot, as-of the retained root).
+
+**The residual trust, stated precisely.** The anchor is only as trustworthy as
+the **image artifact**. The CoW machinery makes an in-place edit of a retained
+root infeasible (it breaks the retained tree's refcounts, which `fsck` flags), so
+a surgical single-generation re-stamp is out; but a party who *also* owns the
+image file can discard it and format a fresh image whose sole retained root
+matches a forged ledger. So this is a genuine **anchor**, not a tamper-*proof*
+log — keep the image out of the ledger writer's reach (a separate host, or
+read-only/off-box media) and the two tamper classes are caught. Tamper-*proof*
+against an adversary who owns everything needs a countersignature whose key never
+touches the bolt, which is a larger change than this seam.
+
+**How it was tested.** `cargo test -p vaire` green; the two failing-by-design
+limit tests (`a_whole_tail_rewrite_is_not_detected…`,
+`…caught_only_by_ref_drift`) are rewritten as passing detection tests
+(`…caught_by_the_image_anchor`), plus a full-reorder test, a clean-anchor Green
+test, and a missing-anchor breach test. All fixtures are tempdirs (the RIDER
+stands). Lane: `handlers/vaire/**` + its docs.
+
 ### BOLT-2 — a git repository as a managed unit: verified mirror + hash-chained ledger 🔬 host-native (36 → 58 vaire tests), zero kernel surface
 
 **What it does.** vaire's second managed-unit kind, and its first genuinely *repo-manager* work
@@ -26,15 +62,17 @@ either direction — and is pure-read: a verb that could rewrite what it audits 
 verification. The Bolt-1 invariants carry verbatim: the **only** write surface is `BoltRoot`, built
 solely from `bolt_root`, and both git invocations pull *from* the source with the mirror as the
 target, so no path can write into a managed repository (test-pinned against a `0o555` source).
-**The chain is graded, not oversold.** The head is not anchored outside the
-ledger file, so BOLT-2 ships a tamper-evident *journal* against an editor, not a
-tamper-proof *log* against an adversary who owns the bolt root: a whole-tail
-rewrite (edit entry *k*, re-chain *k..n*) and a truncation to a valid prefix
-both verify Green. Both limits are pinned by their own tests so they cannot be
-forgotten, and the anchor that would close them (a retained CoW root holding the
-ledger, or a countersigned head kept off the bolt) is named as future work — the
-`vaire.repo.head` / `vaire.repo.ledger.<stamp>` rows of the UnaFS mapping are
-design targets with no code behind them yet.
+**The chain is graded, not oversold.** As BOLT-2 first shipped, the head was not
+anchored outside the ledger file, so the bare chain was a tamper-evident
+*journal* against an editor, not a tamper-proof *log* against a writer who owns
+the bolt root: a whole-tail rewrite (edit entry *k*, re-chain *k..n*) and a
+truncation to a valid prefix both verified Green, each pinned by its own test.
+**Those two holes are now closed** by the follow-on anchor (see the *BOLT-2
+anchor* entry above): `repo-uweave --apply` pins the head in a retained CoW root
+(`vaire.repo.head.<name>`) and `repo-verify <image>` checks it, so both tamper
+classes are caught — down to trusting the image artifact. The `vaire.repo.head`
+row of the UnaFS mapping is now wired; `vaire.repo.ledger.<stamp>` remains a
+named design target.
 The default-deny credential floor is reused but honestly re-scoped: a mirror carries whatever was
 committed, so the floor **audits and reports** rather than skipping — every credential-shaped path
 in a mirrored head tree lands in the ledger entry, is covered by the entry hash (scrubbing one

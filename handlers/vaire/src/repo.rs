@@ -27,30 +27,37 @@
 //!
 //! # What the chain is worth (graded honestly)
 //!
-//! **The chain head is not anchored to anything outside the ledger file.** That
-//! bounds the claim precisely:
+//! The bare chain, checked by [`verify`], is tamper-evident only against a party
+//! who cannot recompute it. [`verify_anchored`] adds the anchor that closes the
+//! gap. The two grades:
 //!
-//! * **Caught** — an entry edited in place (its hash no longer covers its
-//!   contents); an entry dropped or reordered mid-chain (a successor's `prev`
-//!   stops matching); a `cred` line scrubbed; a hash that is not a well-formed
-//!   SHA-1 (the collision-detector marker); and — via the *mirror* checks
-//!   rather than the chain — a recorded object gone missing or a ref that
-//!   drifted. Each of these is falsified by a test.
-//! * **NOT caught** — a **whole-tail rewrite**. `LedgerEntry::new` is
-//!   deterministic and public, so anyone with write access to the ledger file
-//!   can edit entry *k*, recompute the hashes of *k..n*, and produce a chain
-//!   [`verify`] calls Green. Likewise a **truncation to a valid prefix**: the
-//!   surviving entries still chain, and dropping the newest is invisible
-//!   whenever the mirror's refs did not move between the dropped entries (the
-//!   common case for a scheduled weave). Both limits are pinned by tests.
+//! * **[`verify`] alone (chain-internal)** — catches an entry edited in place
+//!   (its hash no longer covers its contents); an entry dropped or reordered
+//!   mid-chain (a successor's `prev` stops matching); a `cred` line scrubbed; a
+//!   hash that is not a well-formed SHA-1 (the collision-detector marker); and —
+//!   via the *mirror* checks rather than the chain — a recorded object gone
+//!   missing or a ref that drifted. It does **not** catch a **whole-tail
+//!   rewrite** (`LedgerEntry::new` is deterministic and public, so a writer can
+//!   edit entry *k*, recompute *k..n*, and produce a self-consistent chain) or a
+//!   **truncation to a valid prefix** (the survivors still chain). Both limits
+//!   are pinned by tests.
+//! * **[`verify_anchored`] (with the image anchor)** — [`weave_into_image`]
+//!   pins the ledger head `(count, head_hash)` into the UnaFS image's retained
+//!   CoW root as `vaire.repo.head.<name>`. `verify_anchored` reads it back and
+//!   rejects a ledger that no longer agrees: a whole-tail rewrite changes the
+//!   head hash, a truncation changes the count, a full reorder changes the head
+//!   hash — all three now DETECTED, each pinned by a test. A missing anchor is
+//!   itself a breach, so an unanchored chain never passes this path silently.
 //!
-//! So: this is a **tamper-evident journal against an editor, not a tamper-proof
-//! log against an adversary who owns the bolt root.** Making it the latter
-//! needs an anchor the same writer cannot rewrite — a countersigned head kept
-//! off the bolt, or the retained-CoW-root route named in the UnaFS mapping
-//! below (which is *not yet wired*: nothing in this module writes
-//! `vaire.repo.head`, and [`unafs_view`] weaves `mirrors/` only, so the ledger
-//! is not in the image and no snapshot anchors it today).
+//! **The residual trust is the image artifact.** The CoW machinery makes an
+//! in-place edit of a retained root infeasible, but a party who also owns the
+//! image *file* can discard it and format a fresh image whose sole retained root
+//! matches a forged ledger. So this is a genuine **anchor**, not a tamper-*proof*
+//! log: tamper-evidence reduces to the image's integrity as an artifact — keep
+//! it out of the ledger writer's reach (a separate host, or read-only/off-box
+//! media) and the two classes above are caught. Making it tamper-*proof* against
+//! an adversary who owns everything needs a countersignature whose key never
+//! touches the bolt — a larger change than this seam. See [`weave_into_image`].
 //! * **The credential floor** — the *same* [`crate::devtree::ExcludeRules`]
 //!   default-deny patterns. A mirror carries whatever was committed, so a
 //!   floor cannot retroactively un-commit a key; what it can do — and what this
@@ -89,16 +96,19 @@
 //! | `mirrors/<name>.git/**` | a directory tree: `mkdir` per dir, one `create_files_batch` per parent dir |
 //! | each mirrored file's size/mtime/source | the four `vaire.size` / `vaire.mtime` / `vaire.src` / `vaire.sync` K6 typed attrs, folded into the file's creation inode |
 //! | one ledger entry `<stamp>` | *(planned)* a `vaire.repo.ledger.<stamp>` String attr on the unit-root inode (the `vaire.summary.<stamp>` pattern) |
-//! | the ledger head | *(planned)* `vaire.repo.head` (the chain hash) on the unit root |
+//! | the ledger head | **wired**: [`weave_into_image`] writes `vaire.repo.head.<name>` = `"<count> <head_hash>"` on the image root, CoW-retained by the weave's snapshot; [`verify_anchored`] reads it back via `open_snapshot` and rejects a rewritten or truncated ledger |
 //! | a credential finding | *(planned)* a `vaire.repo.cred.<n>` String attr — reported in the image itself, never silent |
-//! | the ledger's tamper-evidence | *(planned)* `snapshot_create(<stamp>, "vaire")` retains the whole tree at that stamp as an immutable CoW root, so a chain hash could be checked against a real historical root via `open_snapshot` rather than against a file the same process can rewrite |
+//! | the ledger's tamper-evidence | **wired**: `snapshot_create(<stamp>, "vaire")` retains the head anchor at that stamp as an immutable CoW root, so the live head is checked against a real retained root via `open_snapshot` rather than against a file the same writer can rewrite (residual trust: the image artifact — see [`weave_into_image`]) |
 //! | Crystal Color | computed, never stored (it is a function of live truth) |
 //!
-//! **Implemented today vs planned.** The two rows above the marker — the
-//! mirror's directory tree and the four per-file typed attrs — are what
-//! [`unafs_view`] + `usync` actually write; the retained snapshot per run is
-//! real too, but it retains the *mirrors*, not the ledger. Every row marked
-//! *(planned)* is a named design target with no code behind it yet:
+//! **Implemented today vs planned.** The mirror's directory tree and the four
+//! per-file typed attrs are what [`unafs_view`] + `usync` write; the retained
+//! snapshot per run is real too. The two rows marked **wired** are the head
+//! anchor: [`weave_into_image`] rides that same snapshot to retain
+//! `vaire.repo.head.<name>`, and [`verify_anchored`] checks the live ledger
+//! against it — so the snapshot now retains the *ledger head* as well as the
+//! mirrors. The rows still marked *(planned)* — the per-entry and per-finding
+//! attrs — are named design targets with no code behind them yet;
 //! [`unafs_layout`] returns the mapping as inspectable data, which pins the
 //! table's shape, not its implementation status.
 //!
@@ -505,6 +515,63 @@ pub fn read_ledger(path: &Path) -> Result<Vec<LedgerEntry>> {
 }
 
 // ---------------------------------------------------------------------------
+// The head anchor — the chain head pinned OUTSIDE the ledger file
+// ---------------------------------------------------------------------------
+
+/// The anchored head of a ledger chain: how many entries it holds, and the hash
+/// of its newest entry.
+///
+/// A hash chain is tamper-EVIDENT only against a party who cannot recompute it.
+/// [`LedgerEntry::new`] is deterministic and public, so a writer who owns the
+/// ledger file can rewrite a historical entry and re-chain every successor (a
+/// *whole-tail rewrite*), or drop the newest entries (a *truncation to a valid
+/// prefix*), and the surviving file still chains — [`verify`] alone calls it
+/// Green. Pinning this `(count, head)` pair somewhere the ledger writer cannot
+/// forge is what closes both holes: a tail rewrite changes `head`, a truncation
+/// changes `count`, and either disagrees with the anchor. See
+/// [`weave_into_image`] for where it is pinned and what residual trust remains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadAnchor {
+    /// The number of entries in the chain.
+    pub count: usize,
+    /// The newest entry's hash, or [`GENESIS`] for an empty chain.
+    pub head: String,
+}
+
+impl HeadAnchor {
+    /// The head of a parsed chain.
+    pub fn of(entries: &[LedgerEntry]) -> Self {
+        HeadAnchor {
+            count: entries.len(),
+            head: entries
+                .last()
+                .map(|e| e.hash.clone())
+                .unwrap_or_else(|| GENESIS.to_string()),
+        }
+    }
+
+    /// The stored form carried in the image attr: `"<count> <head_hash>"`.
+    pub fn render(&self) -> String {
+        format!("{} {}", self.count, self.head)
+    }
+
+    /// Parse the stored form; `None` if it is malformed (which a verifier must
+    /// treat as a mismatch, never as an absent anchor).
+    pub fn parse(s: &str) -> Option<Self> {
+        let (count, head) = s.split_once(' ')?;
+        Some(HeadAnchor {
+            count: count.parse().ok()?,
+            head: head.to_string(),
+        })
+    }
+}
+
+/// The image-root attr key that carries repo `name`'s anchored ledger head.
+pub fn anchor_key(name: &str) -> String {
+    format!("vaire.repo.head.{name}")
+}
+
+// ---------------------------------------------------------------------------
 // Plan / weave
 // ---------------------------------------------------------------------------
 
@@ -713,6 +780,17 @@ pub enum Breach {
     RefDrift { reference: String, detail: String },
     /// `git fsck` rejected the mirror (deep check only).
     FsckFailed { detail: String },
+    /// No head anchor was found for this repo in the image — no image, no
+    /// retained root, or the anchor attr was never written. Without it the
+    /// chain head is unanchored and a whole-tail rewrite cannot be caught, so
+    /// [`verify_anchored`] treats a missing anchor as a breach rather than a
+    /// silent pass.
+    AnchorMissing,
+    /// The image's retained head anchor disagrees with the live ledger — the
+    /// ledger file was rewritten (a whole-tail rewrite changes the head hash)
+    /// or truncated (a tail truncation changes the entry count) after it was
+    /// anchored.
+    AnchorMismatch { detail: String },
 }
 
 /// The verification result for one repo.
@@ -855,6 +933,53 @@ pub fn verify(m: &RepoManifest, deep: bool) -> Result<Vec<VerifyReport>> {
     Ok(reports)
 }
 
+/// Verify every managed repo AND check each ledger head against the anchor
+/// [`weave_into_image`] pinned in `image`. This is the tamper-EVIDENT path.
+///
+/// [`verify`] alone is chain-internal: it catches an in-place edit, a mid-chain
+/// drop/reorder, a scrubbed finding, and — via the mirror — a missing object or
+/// ref drift, but it *cannot* catch a whole-tail rewrite or a truncation to a
+/// valid prefix, because both leave a self-consistent chain. The image anchor
+/// closes exactly those two: the live head `(count, hash)` is compared against
+/// the CoW-retained `(count, hash)`, and a rewrite (hash) or truncation (count)
+/// disagrees. A missing anchor is itself a breach ([`Breach::AnchorMissing`]) —
+/// an unanchored chain is not tamper-evident, and this path says so rather than
+/// passing.
+///
+/// Residual trust: the IMAGE ARTIFACT (see [`weave_into_image`]).
+pub fn verify_anchored(m: &RepoManifest, image: &Path, deep: bool) -> Result<Vec<VerifyReport>> {
+    let bolt = m.bolt();
+    let mut reports = verify(m, deep)?;
+    for (r, report) in m.repos.iter().zip(reports.iter_mut()) {
+        let live = HeadAnchor::of(&read_ledger(&bolt.ledger_file(&r.name)?)?);
+        match crate::usync::read_retained_root_attr(image, &anchor_key(&r.name))? {
+            None => report.breaches.push(Breach::AnchorMissing),
+            Some(stored) => match HeadAnchor::parse(&stored) {
+                Some(anchor) if anchor == live => {}
+                Some(anchor) => report.breaches.push(Breach::AnchorMismatch {
+                    detail: format!(
+                        "anchored {} entries head {}, ledger now {} entries head {}",
+                        anchor.count,
+                        short_hash(&anchor.head),
+                        live.count,
+                        short_hash(&live.head)
+                    ),
+                }),
+                None => report.breaches.push(Breach::AnchorMismatch {
+                    detail: format!("anchor attr is malformed: {stored:?}"),
+                }),
+            },
+        }
+    }
+    Ok(reports)
+}
+
+/// A hash prefix for human-readable breach detail (never used for comparison —
+/// [`verify_anchored`] compares the full hashes).
+fn short_hash(h: &str) -> &str {
+    &h[..h.len().min(12)]
+}
+
 /// The God-view row for one repo Bolt.
 #[derive(Debug, Clone)]
 pub struct RepoBoltStatus {
@@ -952,6 +1077,54 @@ pub fn unafs_view(m: &RepoManifest) -> Result<DevManifest> {
     Ok(dm)
 }
 
+/// Weave the bolt's mirrors into `image` AND anchor each repo's ledger head in
+/// the image's retained CoW root — the write half of the tamper-evidence path.
+///
+/// After a host [`weave`] has appended the ledger entries, this projects the
+/// bolt through [`unafs_view`], weaves the mirrors via [`crate::usync`], and —
+/// riding the SAME single retained snapshot that run takes — stamps
+/// `vaire.repo.head.<name>` = `"<count> <head_hash>"` on the image root for each
+/// repo. [`verify_anchored`] then reads that anchor back and rejects a ledger
+/// that no longer agrees with it. The workflow is a pair: `weave` then
+/// `weave_into_image`, each run re-pinning the head to the just-appended entry.
+///
+/// # What is now DETECTED (each pinned by a test)
+///
+/// * a **whole-tail rewrite** — re-chaining `k..n` changes the newest hash, so
+///   the anchored `head` disagrees;
+/// * a **truncation to a valid prefix** — dropping the newest entries changes
+///   the `count`, so the anchored `count` disagrees;
+/// * a **full reorder + re-chain** — a reordered chain has a different newest
+///   hash, so the anchored `head` disagrees.
+///
+/// # Residual trust (the honest boundary)
+///
+/// The anchor is only as trustworthy as the **image artifact**. The CoW machinery
+/// makes an in-place edit of a retained root infeasible (it would break the
+/// retained tree's refcounts, which `fsck` flags), so an attacker cannot
+/// surgically re-stamp one generation's anchor. But an attacker who also owns
+/// the image *file* can discard it and format a fresh image whose sole retained
+/// root matches a forged ledger. Tamper-evidence therefore reduces to the image's
+/// integrity as an artifact: keep it out of the ledger writer's reach — a
+/// separate host, or read-only/off-box media — and the two tamper classes above
+/// are caught. This is a genuine anchor, not a tamper-*proof* log; making it the
+/// latter needs a countersignature whose key never touches the bolt, which is a
+/// larger change than this seam.
+pub fn weave_into_image(
+    m: &RepoManifest,
+    image: &Path,
+    size_mb: u64,
+) -> Result<crate::usync::SyncReport> {
+    let bolt = m.bolt();
+    let dm = unafs_view(m)?;
+    let mut root_attrs = BTreeMap::new();
+    for r in &m.repos {
+        let entries = read_ledger(&bolt.ledger_file(&r.name)?)?;
+        root_attrs.insert(anchor_key(&r.name), HeadAnchor::of(&entries).render());
+    }
+    crate::usync::usync_with_root_attrs(&dm, image, true, size_mb, &root_attrs)
+}
+
 /// TOML single-quoted literal string. Callers reject the one character it
 /// cannot hold before they get here (see [`unafs_view`]); this is the last
 /// line of defence and must never be reached with a quote in `s`.
@@ -990,7 +1163,16 @@ pub fn unafs_layout(m: &RepoManifest) -> Vec<LayoutMapping> {
             host: format!("ledger/{}.ledger (entry <stamp>)", r.name),
             native: format!(
                 "(planned, not yet written) vaire.repo.ledger.<stamp> String attr on the \
-                 /{}.git unit root; head chain hash in vaire.repo.head",
+                 /{}.git unit root",
+                r.name
+            ),
+        });
+        rows.push(LayoutMapping {
+            host: format!("ledger/{}.ledger (head)", r.name),
+            native: format!(
+                "vaire.repo.head.{} = '<count> <head_hash>' String attr on the image root, \
+                 CoW-retained by the weave's snapshot — the tamper anchor verify_anchored \
+                 checks (written by weave_into_image)",
                 r.name
             ),
         });
