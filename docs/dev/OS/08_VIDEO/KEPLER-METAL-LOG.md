@@ -82,26 +82,49 @@ the unit and the terminal `0x409504` write closes the boot, so a verdict collect
 either would be void — and makes its runlist rung read the array **pre-submit**, where a
 populated slot is unambiguously the firmware's.
 
-Read-only apart from the PRAMIN window base, which is metal-proven above and is saved,
-restored, **and read back after the restore**, at every use — a restore that is written but
-never read is a success echo that cannot fail, and a failure VOIDs the affected register's
-verdict rather than passing quietly. `+0x504` is excluded at every base by a `const _`
-assertion, not by a comment. Every rung is bracketed by a control read of `NV_PMC_BOOT_0`, so
-"the space is dead" is never reported as "the space is empty".
+Read-only apart from **two** writes, both reversible and restore-verified: (1) the PRAMIN
+window base (R5), metal-proven above; and, **new this arc (GR26, `kepler-ce-r2`)**, (2) R2b's
+single authored-magic write to a confirmed-live CE falcon's `CC_SCRATCH[0]` (`+0x800`). Each
+is saved, restored, **and read back after the restore** — a restore written but never read is
+a success echo that cannot fail, and a failure VOIDs the affected register's verdict rather
+than passing quietly. `+0x504` is excluded at every base by a `const _` assertion, not by a
+comment, and a second `const _` proves R2b's write target is `+0x800` and never `+0x118`
+(`DMATRFCMD`, the Boot AS accidental-DMA finding the draft flagged for safety review). Every
+rung is bracketed by a control read of `NV_PMC_BOOT_0`, so "the space is dead" is never
+reported as "the space is empty".
 
 | Rung | Witness family | What it decides |
 | --- | --- | --- |
 | R1 | `ce-ptop row` / `ce-ptop entry` / `ce-ptop verdict` / `ce-ptop VERDICT` | Whether a PTOP device-info table exists at `0x022700` (C6). `REFUTED-CLEANLY` = all poison; `AMBIGUOUS` = all zero with a held bracket; `PASS` = structured entries with a PRI candidate in the `0x104000` neighbourhood. The **raw dword is the datum**; the field decode is a separately-labelled hypothesis line. |
-| R2 | `ce-probe begin` / `ce-probe base=… VERDICT` / `ce-probe verdict` | Whether `0x104000/0x105000/0x106000` are alive and are falcons (C1/C2). `FALCON-REST` requires `cpuctl=0x10` **and** `dmactl=0x01` — the exact pair FECS shows on this chip — and opens draft §4.2 path 2 (a CE falcon as a bare DMA microcontroller, no PFIFO, no FECS wall). Each base carries its own bracket, because after a fault only the first datum is trustworthy. `NV_PMC_ENABLE` is recorded read-only; **no enable bit is guessed or written.** |
+| R2 | `ce-probe begin` / `ce-probe base=… VERDICT` / `ce-probe verdict` | Whether `0x104000/0x105000/0x106000` are alive and are falcons (C1/C2). `FALCON-REST` requires `cpuctl=0x10` **and** `dmactl=0x01` — the exact pair FECS shows on this chip — and opens draft §4.2 path 2 (a CE falcon as a bare DMA microcontroller, no PFIFO, no FECS wall). The first FALCON-REST base is handed to R2b as its write target. Each base carries its own bracket, because after a fault only the first datum is trustworthy. `NV_PMC_ENABLE` is recorded read-only; **no enable bit is guessed or written.** |
+| **R2b** | `ce-r2 SKIPPED` / `ce-r2 base=… VERDICT` (ARMED / REJECTED / REST-MOVED / NOT-RESTORED / VOID) | **The campaign's FIRST copy-engine WRITE.** Self-gated: fires ONLY when R2 named a FALCON-REST base this same boot, and re-verifies `cpuctl=0x10 && dmactl=0x01` with a fresh read at write time. Writes a high-entropy magic (`CE5AA502`-class, **never `0x2`** — draft §4.4) to that base's `CC_SCRATCH[0]`, reads it back, restores the captured entry value, reads the restore back. `ARMED` = the magic latched and the entry restored → the CE latches authored state and a copy has a proven-live, writable target. `REJECTED` = a falcon at rest that did not hold the write → C2's writability half refuted. `SKIPPED` = no falcon base this boot (the expected first-flight arm; nothing is written). This is the largest reversible step reachable without a runlist id or an audited RAMFC layout, and it discharges draft §4.4's mandate to re-assert the falcon port rule at a CE base with a proper magic. |
 | R3 | `ce-rlscan i=` / `ce-rlscan submit-pair` / `ce-rlscan verdict` / `ce-rlscan VERDICT` | The array at `0x2280 + i*8`, eight slots wide (C7), read pre-submit. Separates the three readings of bit 20 — `ID-FIELD` (we have been submitting to the wrong runlist id), `DISCRIMINATING` (bit 20 is commit-pending, and Boot A's `00100003` means the scheduler never consumed our runlist), `UNCONDITIONAL` (bit 20 stops being evidence permanently). Any populated slot is a **firmware-left runlist for another engine**, and its index is the id R6 needs. |
 | R5 | `ce-inst begin` / `ce-inst reg=` / `ce-inst dump` / `ce-inst pd-probe` / `ce-inst pde` / `ce-inst verdict` | Walks the firmware's own instance block through PRAMIN from the candidate pointers at `0x001704`/`0x001714` (C9). This is the **clean-room-legal RAMFC route**: observing our own hardware is Group-A white-box work and produces documentation we may implement against, which is how the standing UNAUDITED-constants debt gets discharged. `EMPTY`/`VOID`/`REFUSED` claim nothing; there is no fallback to "it probably looks like the one in `kepler.rs`". The `pd-probe` line answers C8 — a real page directory means CE addresses are virtual and R6 grows an era. |
 
-R6 (a CE channel) and beyond are **deliberately not implemented**: they are consumers of
-answers this boot does not have. `CE-LADDER end` prints all four rung outcomes on one line, so
-a silent ladder is distinguishable from a quiet pass.
+A genuine VRAM→VRAM copy (draft R7) and a CE channel (draft R6) remain **deliberately not
+implemented**: they are consumers of answers this boot does not have (a CE runlist id from
+R1/R3, an audited instance-block layout from R5, or the CE falcon's UNKNOWN internal datapath
+map). R2b is scoped precisely to stop short of them while still taking a real, reversible
+step — proving the target latches an authored write, which every copy path needs first.
+`CE-LADDER end` prints all five rung outcomes (`r1_ptop` / `r2_ce_probe` / `r3_rlscan` /
+`r5_inst` / `r2b_arm`) on one line, so a silent ladder is distinguishable from a quiet pass.
+
+**Falsification story for the next boot.** With `UNAOS_KEPLER_CE=1`, the `ce-probe` verdict
+decides R2b's fate in the same capture:
+* If any CE base reports `FALCON-REST`, `ce-r2 base=… VERDICT` must read `ARMED` (magic
+  latched, entry restored) or `REJECTED` (falcon at rest that did not hold the write) — a
+  real, decisive datum either way, and the `landed=` / `restored=` fields on the `ce-r2`
+  line show the transition. `ARMED` is the first proof a Kepler copy engine accepts authored
+  state on this silicon.
+* If no base is a falcon (the likely first-flight outcome — the CE bases are unproven until
+  this same boot's `ce-probe` speaks), `ce-r2 SKIPPED` prints and **nothing is written**; the
+  boot is exactly as read-only as the recon-only ladder. A witness that reports `ARMED`
+  without a `landed=Y` transition, or on a `SKIPPED` boot, would be a defect.
 
 **Knob line for the next boot:** add `UNAOS_KEPLER_CE=1` alongside the existing Kepler knobs
-and confirm `nvidia-kepler-ce` appears in the `⚡ kernel features:` banner.
+and confirm `nvidia-kepler-ce` appears in the `⚡ kernel features:` banner. R2b rides the same
+knob; no new knob is added (the CE write is gated at runtime on the same-boot FALCON-REST
+verdict, not on a separate feature).
 
 ## Sitting #42 (GR6 self-run bench, UnaOS-gemini@a8efc15d-era, 2026-07-26, capture rmbp-gr6)
 
