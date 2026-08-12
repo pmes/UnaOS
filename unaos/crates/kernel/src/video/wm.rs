@@ -16685,7 +16685,19 @@ fn dock_addressable(r: &Window) -> bool {
 /// against, and the count `dock::compose` will reach at the tail of the same pass.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn dock_tiles(rows: &[Window; MAX_WINDOWS]) -> usize {
-    rows.iter().filter(|r| dock_addressable(r)).count()
+    let n = rows.iter().filter(|r| dock_addressable(r)).count();
+    // SHELLPIN (integrator, GR27) — mirror `dock::pin_shell`: with no live KERNEL_OWNER_DESKTOP
+    // row the dock paints one extra pinned `shell` tile, and this count is what `occ_clip` sizes
+    // the strip's blit clip from — one tile narrow and a drag across the pin clobbers it for a
+    // pass. Same cap as `pin_shell`: a full table pins nothing, so no +1 (a +1 there would make
+    // the clip one tile WIDER than the painted strip — the inverse defect).
+    if n < MAX_WINDOWS
+        && !rows.iter().any(|r| r.used && r.owner_asid == KERNEL_OWNER_DESKTOP)
+    {
+        n + 1
+    } else {
+        n
+    }
 }
 
 // ---- CTRLWIT fixture ---------------------------------------------------------------------------
