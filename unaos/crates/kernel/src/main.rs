@@ -4530,7 +4530,13 @@ fn x86_render_service(cpu: usize) {
         if shell_id != unaos_kernel::video::wm::WIN_NONE {
             shell_console.draw(&mut shell_pal);
             shell_pal.render();
-            unaos_kernel::video::wm::present(shell_id);
+            // SHELLWIN — owner-fenced for consistency with the drain-loop present below (the shell
+            // window is a closable `KERNEL_OWNER_DESKTOP` row); harmless here since the row was just
+            // created, but it keeps every present of this id on the one recycled-id-safe verb.
+            let _ = unaos_kernel::video::wm::present_outcome_owned(
+                shell_id,
+                unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
+            );
             serial_println!(
                 "[shellwin] backdrop=crispy-scene shell=window win={} surf={}x{} core={} == witness ::",
                 shell_id,
@@ -4718,7 +4724,22 @@ fn x86_render_service(cpu: usize) {
         #[cfg(feature = "wc")]
         if shell_dirty {
             shell_pal.render();
-            unaos_kernel::video::wm::present(shell_id);
+            // SHELLWIN — the OWNER-FENCED present, not the fence-free `present`. The shell window is
+            // `KERNEL_OWNER_DESKTOP`, and `wm::controls`/`ctrls_for` give every non-compat, non-owner-0
+            // row a live close/minimise/zoom cluster — so an operator CAN close it (the kernel-furniture
+            // close arm reaps the row by id) or minimise it (parked below `SHELL_Z`). `shell_id` is a
+            // recycled slot alias with no generation, so a fence-free `present(shell_id)` after a close
+            // would composite whatever row later took the slot. `present_outcome_owned` declines a slot
+            // whose owner is no longer `KERNEL_OWNER_DESKTOP` (`NoRow`) and suppresses a parked one
+            // (`Suppressed`) — the same recycled-id fence `fbcon` uses for the closable console window
+            // (NORMALWIN). NOTE (review, flagged to the integrator): this closes the compositor hazard,
+            // but the operator can still close/minimise their only shell with no reopen route; the
+            // complete fix — denying `KERNEL_OWNER_DESKTOP` furniture a control cluster — is a `wm.rs`
+            // (`ctrls_for`) change outside this arc's lane.
+            let _ = unaos_kernel::video::wm::present_outcome_owned(
+                shell_id,
+                unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
+            );
             shell_dirty = false;
         }
 
