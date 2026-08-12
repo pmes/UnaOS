@@ -4484,6 +4484,26 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 #[cfg(feature = "witness")]
 #[allow(unused_variables)]
 fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccClip) {
+    // COMP2-WCD — charge everything this function does to [`C2_WCD_CYC`], on EVERY exit path (the
+    // teardown abort, the silent banked chunk, the verdicts), so `[comp2] wcd_us=` can name this
+    // witness on the wire when a pass's `blit_us` spikes. A drop guard rather than per-exit charges:
+    // the abort arm and the banked-chunk arm both `return` mid-function, and a counter that missed
+    // them would exonerate exactly the passes it exists to convict. The span deliberately includes
+    // the repair redraw and the verdict's own UART time — the question the field answers is "how
+    // much of this pass was WC-D", not "how much was probes". GR27 Boot B: the shell reopen's
+    // stage-1 lattice verdict (79 470 probes x 2 read-back passes through the panel BAR) was a
+    // single max_us=302134 composite pass that read as a 20x panel-bandwidth collapse in `[comp2]`
+    // — `blit_us=154550` against `compose_us+present_us=10389` — and nothing on the wire named it.
+    struct WcdClock(u64);
+    impl Drop for WcdClock {
+        fn drop(&mut self) {
+            C2_WCD_CYC.fetch_add(
+                crate::arch::now_cycles().saturating_sub(self.0),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+    let _wcd_clock = WcdClock(crate::arch::now_cycles());
     let info = fb.info();
     let VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
@@ -4694,22 +4714,47 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         }
     };
 
-    // WCD-CHUNK — the time stop arms for the STAGE-2 read-back only; stage 1 keeps its whole-band
-    // single-pass shape (see the stage line in [`verify_reference`]'s cursor block).
+    // WCD-CHUNK — `chunked` selects the stage-2 CUMULATIVE machinery only (the resume cursor, the
+    // banked sums, the one closing verdict). The TIME STOP is armed for EVERY read-back now —
+    // stage 1 included — which is WCD-CLIP1 (GR27 Boot B): the stage-1 exemption rested on "stage 1
+    // is the small term, ~78 ms on Boot Ab", and that premise was measured on a 128x128 window. On
+    // a panel-scale window it is false by an order of magnitude: the 1440x883 shell's stage-1
+    // lattice verdict is 79 470 probes x 2 read-back passes at ~1.9 us/probe ≈ 302 ms, held under
+    // `COMP_GATE` with IRQs masked inside the reopening present ([comp2] max_us=302134,
+    // [flick2] down_max=300ms -> SLOW), and the boot-log console's is 500-760 ms. Every window
+    // CREATE pays it — including every dock reopen, whose recycled id resets [`WCD_STATE`].
+    //
+    // Stage 1 keeps its single-pass, verdict-now shape: no cursor, no banking, no termination
+    // dependency on later presents (the objections that kept it unchunked). The stop simply CLIPS
+    // the verdict to the rows the budget covered, and `band=` says so on the wire — the same
+    // honesty WCD-BAND already applies when a banded present narrows the ask. Stage 2's chunked
+    // full-coverage walk still adjudicates the whole box afterwards, so no coverage is lost to the
+    // clip, only deferred to the stage that was built to pay for it incrementally. On QEMU the
+    // probes are RAM-fast and the stop never fires, so the regression wire is byte-identical.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let chunked = running == WCD_ST_FULL_RUN;
     #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
     let chunked = false;
+    // WCD-CLIP1 — the ask, kept so the clip below can be told from a full walk. `chunked` still
+    // feeds the banking arm; `true` here is what arms the time stop for stage 1 as well (dead on
+    // every build without the chunking, where `pass` ignores its `bounded` argument).
+    let row1_ask = row1;
     #[cfg(target_arch = "x86_64")]
     let (rows_done, checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, occ_cache, spr_cache) =
-        pass(fb, row1, chunked);
+        pass(fb, row1, true);
     #[cfg(not(target_arch = "x86_64"))]
     let (rows_done, checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, spr_cache) =
-        pass(fb, row1, chunked);
+        pass(fb, row1, true);
     // WCD-CHUNK — from here on, `row1` IS the rows the first pass actually walked: the invalidate,
     // the second pass, the `band=` field, the interlock rect and the cursor all describe the chunk,
     // not the ask. A no-op rebind on every build without the chunking (`rows_done == row1` there).
     let row1 = rows_done;
+    // WCD-CLIP1 — a walk the time stop cut is a BANDED verdict whatever the present declared: the
+    // rows past the cursor were not adjudicated, and a `band=none` line over them would claim a
+    // clearance nothing bought. Also closes a pre-existing gap in stage 2: the FIRST chunk of a
+    // box at most [`WCD_CHUNK_ROWS_MAX`] rows tall entered with `banded=false`, so a FAIL inside it
+    // printed `band=none` while having walked only the rows the stop allowed.
+    let banded = banded || row1 < row1_ask;
 
     // Discard, never clean — see the doc comment. Bare `IVAC` is what makes `bad_ram` able to fail.
     // WCD-BAND: the extent follows the verified rows, not the whole window, so a banded verdict
@@ -5215,15 +5260,21 @@ fn verify_reference(
     // termination ride on them); and a cursor at or past the box's whole extent means the box SHRANK
     // under a part-paid battery, which closes it as PAID rather than wedging it — every row the box
     // still has was walked, and `-> UNPAID` silence is the convicted shape this module forbids.
-    // STAGE 2 ONLY, and that is a semantic line, not a cost call. Stage 1's lattice verdict has
-    // always been "the band this present offered, once" — band-clipped, immediate, closed on its
-    // first pass — and the x86 gate REQUIREs its line early in the boot. Chunking it would quietly
-    // promote it to "the whole box, cumulatively", whose termination then depends on presents that
-    // contain the cursor row — a dependency a band-only presenter (the routed console presents
-    // 0..64-row bands for stretches) never satisfies for stage 1, because `paygo_service`'s
-    // whole-box rescue only reaches DECLINED (stage-2) windows. Stage 1 is also the small term on
-    // the launch instant — ~78 ms against stage 2's ~1.26 s on Boot Ab — so it keeps today's shape
-    // to the byte, and the time stop below never arms for it.
+    // THE CURSOR is STAGE 2 ONLY, and that is a semantic line, not a cost call. Stage 1's lattice
+    // verdict has always been "the band this present offered, once" — band-clipped, immediate,
+    // closed on its first pass — and the x86 gate REQUIREs its line early in the boot. Making it
+    // CUMULATIVE would quietly promote it to "the whole box", whose termination then depends on
+    // presents that contain the cursor row — a dependency a band-only presenter (the routed
+    // console presents 0..64-row bands for stretches) never satisfies for stage 1, because
+    // `paygo_service`'s whole-box rescue only reaches DECLINED (stage-2) windows.
+    //
+    // WCD-CLIP1 (GR27 Boot B) — the TIME STOP, however, now arms for stage 1 too, WITHOUT the
+    // cursor: a stopped stage-1 walk closes its verdict immediately over the rows it reached, with
+    // `band=` naming them (see the clip note at the `pass` call in [`verify_window`]). The old
+    // exemption also leaned on "stage 1 is the small term, ~78 ms on Boot Ab" — measured on a
+    // 128x128 window; a panel-scale window's stage-1 lattice verdict is 300-760 ms under
+    // `COMP_GATE`, paid on every window create and every dock reopen, and was Boot B's 20x
+    // "panel bandwidth collapse" in `[comp2]`.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let (row0, row1, banded) = if running != WCD_ST_FULL_RUN {
         (row0, row1, banded)
@@ -5855,9 +5906,13 @@ static WCD_LASTROLL: [core::sync::atomic::AtomicU64; WCD_IDS] =
 /// measures since KERNEL entry, so it takes the cost off the boot burst and leaves it on every
 /// launch after 15 s of uptime — which is all of them.
 ///
-/// The STAGE-2 verdict is therefore paid in CHUNKS (stage 1 keeps its band-clipped single pass —
-/// the small term, ~78 ms on Boot Ab, and the shape the gates REQUIRE early; see the stage line in
-/// [`verify_reference`]). Each admitted pass walks the glass from a per-id resume cursor for at
+/// The STAGE-2 verdict is therefore paid in CHUNKS. Stage 1 keeps its single-pass verdict-now
+/// shape (the shape the gates REQUIRE early; see the stage line in [`verify_reference`]) but is
+/// TIME-BOUNDED by the same stop since WCD-CLIP1: "~78 ms on Boot Ab" was a 128x128 window, and a
+/// panel-scale window's stage-1 walk is 300-760 ms — Boot B's shell-reopen freeze. A stopped
+/// stage-1 walk closes immediately over the rows it reached, `band=` naming them; stage 2's
+/// cursor walk buys the whole box afterwards. Each admitted stage-2 pass walks the glass from a
+/// per-id resume cursor for at
 /// most this many microseconds per read-back pass (whole source rows, at least one), banks the
 /// clean counts, hands the reference back, and the next admitted composite resumes where it
 /// stopped. The verdict line prints ONCE, cumulative, when the cursor closes the box — one PASS on
@@ -8088,6 +8143,17 @@ static C2_DMG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// area of. Never used as a denominator; it exists so the line can be read against itself.
 #[cfg(feature = "witness")]
 static C2_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMP2-WCD — cycles spent inside [`verify_window`] this span: the WC-D witness's glass read-back
+/// (both passes), its attribution walks, its repair redraw and its verdict UART, charged by a drop
+/// guard so every exit path pays. Printed as `wcd_us=`, a TOTAL for the span like `straddle_us`
+/// (a per-pass mean would dilute a one-pass spike by the span's healthy passes, and a spike is the
+/// only thing the field exists to name). GR27 Boot B is the motivating capture: a shell-reopen
+/// span read `passes=2 pass_us=154766 max_us=302134` — a 20x "bandwidth collapse" that was really
+/// one stage-1 verify — and no field on the line said so. Now the collapsed regime names its
+/// cause: `wcd_us` ≈ the spike convicts the witness; `wcd_us` ≈ 0 with the same spike convicts
+/// the compositor.
+#[cfg(feature = "witness")]
+static C2_WCD_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // ---- COMP2-SPLIT — the two halves of `blit_us`, because only one of them is offloadable ----------
 //
@@ -8284,6 +8350,13 @@ static C2_STRADDLE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// terminal, `rate=` still last-but-one), because it is the correction term a reader needs in hand
 /// when reading `util_pct`. The analyzer's position is unchanged: it parses no field of this line.
 ///
+/// COMP2-WCD — `wcd_us` is inserted immediately AFTER `straddle_us` under the same rule (`span=`
+/// terminal, `rate=` last-but-one). It is a TOTAL like its neighbour, and it is the residual's
+/// biggest single explanation when it fires: a verify pass lands in `blit_us` but in neither half
+/// of COMP2-SPLIT's pair, so a span whose `blit_us` dwarfs `compose_us + present_us` is either the
+/// direct fallback or this witness — and this field is what says which. `tools/serial-analyzer.py`
+/// still parses no field of this line.
+///
 /// COMP2-SPLIT — `compose_us` and `present_us` are inserted immediately AFTER `blit_us` under the
 /// same rule (`span=` terminal, `rate=` last-but-one). Adjacency is the point rather than a
 /// preference: they are a DECOMPOSITION of `blit_us`, their residual against it is the instrument's
@@ -8318,6 +8391,10 @@ fn comp2_emit(span: u64) {
     let bytes = C2_BYTES.swap(0, Relaxed);
     let dmg_px = C2_DMG_PX.swap(0, Relaxed);
     let box_px = C2_BOX_PX.swap(0, Relaxed);
+    // COMP2-WCD — drained with the sweep; a verify only ever runs inside a pass, so the
+    // `passes == 0` discard below can lose at most the sliver of a pass straddling the drain,
+    // which is the standing property of every counter this early return already discards.
+    let wcd_cyc = C2_WCD_CYC.swap(0, Relaxed);
     if passes == 0 {
         return;
     }
@@ -8369,7 +8446,7 @@ fn comp2_emit(span: u64) {
             .saturating_div(span_us)
     };
     serial_println!(
-        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} compose_us={} present_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} straddle_us={} util_pct={} rate={}.{}/s span={}ms",
+        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} compose_us={} present_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} straddle_us={} wcd_us={} util_pct={} rate={}.{}/s span={}ms",
         passes,
         us(pass_cyc),
         super::wcg::cycles_to_us(max_cyc),
@@ -8393,6 +8470,9 @@ fn comp2_emit(span: u64) {
         // COMP2-STRADDLE — a TOTAL for the span, not a per-pass mean: it is the correction term for
         // the PREVIOUS line's `util_pct`, and a mean would not add to anything.
         super::wcg::cycles_to_us(straddle_cyc),
+        // COMP2-WCD — also a TOTAL: the field exists to name a one-pass spike, and a mean would
+        // dilute it by the span's healthy passes. See [`C2_WCD_CYC`].
+        super::wcg::cycles_to_us(wcd_cyc),
         util_pct,
         passes.saturating_mul(10_000) / span.max(1) / 10,
         passes.saturating_mul(10_000) / span.max(1) % 10,
