@@ -1890,7 +1890,11 @@ pub fn focus_changed(asid: u64) {
             // the panel stops showing them at once rather than at the desktop's next flush.
             let z = t.next_z;
             t.next_z = t.next_z.wrapping_add(1).max(1);
-            SHELL_Z.store(z, Ordering::Release);
+            // CLOSE-TEARDOWN r2 — the OLD shell z, taken in the same swap that publishes the new one:
+            // the park witness below names only rows THIS raise takes off the glass, and "was on the
+            // glass" is a claim against the shell position the operator was just looking at. A plain
+            // store would lose it.
+            let prev_shell = SHELL_Z.swap(z, Ordering::AcqRel);
             newz = z;
             for r in t.rows.iter_mut() {
                 if r.used && r.z < z {
@@ -1953,9 +1957,15 @@ pub fn focus_changed(asid: u64) {
                     // so a future exemption added there is carried automatically.
                     if above_shell(r, z) {
                         exempt += 1;
-                    } else {
-                        // CLOSE-TEARDOWN — this row is leaving the glass. Name it (emitted after
-                        // the guard drops).
+                    } else if above_shell(r, prev_shell) {
+                        // CLOSE-TEARDOWN r2 — this row was ON the glass under the OLD shell z and is
+                        // leaving it under the new one: THIS raise's park, name it (emitted after the
+                        // guard drops). The qualification is load-bearing: this loop visits every
+                        // `r.z < z` row, which includes rows parked minutes ago by `minimise` or an
+                        // earlier TAB — re-naming those `cause=shell-raise` on every gesture would
+                        // both mislabel them and burn the lifetime `[wm-act]` budget fleet-wide per
+                        // raise. A row already below `prev_shell` (or at `PARKED_Z`) is not parked by
+                        // this gesture and is not named by it.
                         parked[nparked] = (r.id, r.owner_asid);
                         nparked += 1;
                     }
@@ -2022,10 +2032,13 @@ pub fn focus_changed(asid: u64) {
     // composite pass.
     crate::wedge2::mark("<F5>");
     // CLOSE-TEARDOWN — every park is named with its cause, on the same bounded `[wm-act]` budget the
-    // rest of the gesture vocabulary shares. `cause=shell-raise` here can only mean the operator's
-    // own whole-table gesture (TAB-to-shell / desktop click) now that the close paths take
-    // [`focus_release`] instead: a `park` line inside a close's teardown window is the regression
-    // this witness exists to catch.
+    // rest of the gesture vocabulary shares. That budget is [`WM_ACT_LOG_MAX`] = 256 lines for the
+    // WHOLE BOOT (a lifetime cap, not a rate), and on a witness build the boot fixtures spend some of
+    // it before the operator's first gesture — the r2 qualification above (only rows THIS raise takes
+    // off the glass) is what keeps a raise from billing the whole fleet against it every time.
+    // `cause=shell-raise` here can only mean the operator's own whole-table gesture (TAB-to-shell /
+    // desktop click) now that the close paths take [`focus_release`] instead: a `park` line inside a
+    // close's teardown window is the regression this witness exists to catch.
     for &(pid, powner) in parked[..nparked].iter() {
         wm_act("park", pid, powner, "cause=shell-raise", 0, 0);
     }

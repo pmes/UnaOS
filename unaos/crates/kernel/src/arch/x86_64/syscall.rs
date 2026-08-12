@@ -5656,10 +5656,15 @@ pub const CLOSE_SETTLE_KILLED_X86: u32 = 2;
 ///    Idempotent against the teardown's own `close_owner`, which will find zero rows. It also
 ///    cancels a drag of any of those rows (`wm::drag_forget_owner`), which is what makes "close a
 ///    window you are mid-drag of" leave no dangling gesture.
-/// 2. **Focus next** — if the closed owner held the keyboard it goes back to the SHELL, through the
-///    one focus primitive, in the canonical order (`user_input_set_active(0)` then
-///    `wm::focus_changed(0)`) — the same state a TAB-to-shell or a desktop-miss click leaves.
-///    Without it the keyboard would keep addressing a process that is about to be dead.
+/// 2. **Focus next** — in two halves, and the split is CLOSE-TEARDOWN's point. The KEYBOARD half:
+///    if the closed owner held it, `user_input_set_active(0)` hands it back to the shell, so
+///    keystrokes stop addressing a process that is about to be dead. The WM half:
+///    `wm::focus_release(owner)` — a CAS that drops the focus highlight iff this owner held it,
+///    and nothing else. Deliberately NOT `focus_changed(0)`: that is the SHELL ARM, which raises
+///    `SHELL_Z` over every surviving window, erases their boxes and publishes `hidden=true` to
+///    every owner — so closing a FOCUSED window minimised every sibling on the glass (GR27 Boot A).
+///    A close must never park a sibling; the whole-table park stays owned by the gestures that
+///    mean it (TAB-to-shell, the desktop-miss click).
 /// 3. **Kill last** — [`bg_kill`], the EXISTING and metal-proven x86 kill path, ASID-scoped through
 ///    the pid it resolves below. No second teardown is written here.
 ///

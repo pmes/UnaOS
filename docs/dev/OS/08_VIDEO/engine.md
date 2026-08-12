@@ -11554,11 +11554,25 @@ terminally,** for a `NoRow` against a REAL wm id: the row was reaped or recycled
 never name a row again (a new `SYS_WIN_CREATE` mints a new handle), and `EBADF` is the same "this
 handle names nothing" the verb already speaks on an out-of-range or freed id. **The error return IS
 the close notification**: there is no other channel from the wm to a ring-3 owner (the close-box
-kill is one, but only for the killed), and a render loop that checks `rc >> 63` — the contract every
-in-tree client already carries — now stops on the first post-close frame. The reject is also free
-for the compositor by construction: `wm::present_banded` declines under its own table probe before a
-pixel is marked, so a misbehaving app that ignores `-EBADF` costs one short table hold per call and
-zero compose work. The one `NoRow` that stays a `0` success is `wm_id == WIN_NONE` — the HEADLESS
+kill is one, but only for the killed).
+
+**What the notification does and does not buy, against the SHIPPED clients** (review M1: no shipped
+client stops on it, and that is their own documented policy, not an oversight). `user-vug`'s render
+loop checks `rc >> 63`, latches a `[uvug9] stall … phase=present rc=9` witness, keeps the failed
+frame off its fps meter and `presented` false — and deliberately guards-rather-than-continues so its
+EXIT block still runs: it witnesses its window's death and keeps re-presenting so ESC stays live.
+`user-pulse` (~:1079), `user-stat` (~:471) and `user-blob`'s midden (~:446) discard the return with
+`let _ =` ("a persistent present error is visible as a frozen window the operator can `kill`"). So
+the truthful claim is: the signal now exists on the wire and a client that WANTS to stop can; none
+does today, and teaching them to treat `-EBADF`-on-present as terminal is the clients' own
+follow-up. An ignorer's kernel-side signature is a GROWING `stale=` in the `[wcn]` rollup — both
+decline arms of `wm::present_banded` bump `WCN_STALE` under the same table hold that declined them
+(the no-row arm at the row probe itself; the recycled-id fence arm immediately after the row
+resolves, before any damage mark) — and each ignored present costs the compositor one short table
+hold and ZERO compose work, because the decline precedes any pixel being marked. The residual rate
+is bounded by the client's own frame pacing (the vug's barrier/sleep loop — ~200–260 att/s on
+Boot A), not by the kernel: the vsyncpace pacer does not exist on a shipped boot and this path adds
+no sleep. The one `NoRow` that stays a `0` success is `wm_id == WIN_NONE` — the HEADLESS
 case, where the compositor refused a row at create (no panel) and the window is a legitimate
 draw-only surface; erroring there would fail every program on a machine with no glass.
 `present_backpressure`'s `NoRow` arm therefore now serves exactly that headless population.
@@ -11595,12 +11609,28 @@ remains one deliberate whole-table statement.
 
 * `cause=minimise` — the deliberate park, from `wm::minimise` itself (the router's
   `[wm-act] minimise … settle=` line names the gesture; this names the park, uniformly).
-* `cause=shell-raise` — the incidental kind, one line per row the shell arm actually takes off the
-  glass (`!above_shell` under the new z; exempt furniture and compat rows are not parks and are not
-  named). Post-fix, a `park … cause=shell-raise` inside a close's teardown window is the regression
-  signature; the next capture falsifies instead of infers.
+* `cause=shell-raise` — the incidental kind, one line per row THIS raise actually takes off the
+  glass: `above_shell` under the OLD shell z (captured in the same swap that publishes the new one)
+  AND `!above_shell` under the new. The qualification is load-bearing (review M2): the shell arm's
+  collection loop visits every `r.z < newz` row, which includes rows parked minutes ago by
+  `minimise` or an earlier TAB — naming those again on every gesture would mislabel them and bill
+  the whole fleet against the budget per raise. Exempt furniture and compat rows are not parks and
+  are not named.
 * `[wm-act] focus-release owner=0x.. … shell-raise=skipped siblings=untouched` marks the new narrow
   path taking effect where `focus shell` lines used to follow a close.
+
+Post-fix, a `park … cause=shell-raise` inside a close's teardown window is the regression
+signature; the next capture falsifies instead of infers — **within the witness's budget**: the
+`[wm-act]` vocabulary shares one `WM_ACT_LOG_MAX = 256`-line cap for the WHOLE BOOT (a lifetime
+budget, not a rate), and on a `UNAOS_WITNESS=1` build the boot fixtures (dock/closeiso/focus-vis
+selftests) spend a handful of those lines before the operator's first gesture. At operator gesture
+rates the cap outlasts any bench sitting; a capture whose gesture count approaches it should read
+absence-of-`park`-lines late in the log as budget exhaustion, not as proof of no park.
+
+KNOWN / QUEUED (review note, no code this arc): the process SELF-EXIT teardown
+(`memory::free_user_space_by_cr3` → `clear_handle_row`/`win_close_slot`) never releases
+`FOCUS_ASID`, so an app that exits while focused leaves a stale focus a slot-recycled successor can
+inherit; `wm::focus_release(owner)` is the right primitive for that path and it is a follow-up arc.
 
 cfg-fold: all of it is x86 `wc`-path code (`wc_close_*`, the x86 present verbs) plus arch-neutral
 `wm.rs` additions with no behavior change off the new call sites; aarch64 and wc-off builds are
