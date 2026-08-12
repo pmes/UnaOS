@@ -493,6 +493,15 @@ _feats=""
 # inline shim and a zero-sized HoldTimer, so the boot is byte-inert on the hot path. Emits one `[rtwit]`
 # rollup line per ~5 s from the x86 render-service witness gate. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_RTWIT:-}" ] && _feats="${_feats}rtwit,"
+# R1 / RTPI: UNAOS_RTPI=1 arms PRIORITY INHERITANCE on the x86 sleeping `Mutex` (arch::x86_64::sched)
+# plus its `[rtpi]` witness. Unlike RTWIT (a pure ruler), this CHANGES scheduling: while a strictly-
+# higher task blocks on a `Mutex`, the holder inherits the blocker's priority (transitively) until
+# release, so mid-priority tasks cannot preempt the critical section — bounded priority inversion.
+# x86_64-only in effect. DEFAULT OFF => the PI `Task`/`Mutex` fields do not exist, `Mutex::lock` takes
+# its original single-`wait()` path, and every witness hook is an inline shim, so the boot is byte-
+# identical to the pre-arc scheduler. Emits one `[rtpi]` rollup line per ~5 s from the x86 render-
+# service witness gate (plus rate-limited `[rtpi] inherit …` traces). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_RTPI:-}" ] && _feats="${_feats}rtpi,"
 # VSYNC-PACE r3: UNAOS_VSYNCPACE=1 ARMS the kernel-side present pacer (`vsyncpace`). ⚠ THE POLARITY IS
 # INVERTED from GR22's `UNAOS_NOPACE` — the pacer is now DEFAULT OFF. Unset (the shipped configuration),
 # `SYS_WIN_PRESENT`/`SYS_WIN_PRESENT_ROWS` return as soon as the composite is done and a ring-3 program

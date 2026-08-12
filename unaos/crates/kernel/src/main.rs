@@ -4781,6 +4781,13 @@ fn x86_render_service(cpu: usize) {
             // `[rtwit]` line (input→present max/p99, per-lock max holds, max interrupt-mask span,
             // ruler overhead) and resets every per-span slot. A no-op inline shim when `rtwit` is off.
             unaos_kernel::rtwit::rollup();
+            // R1 / rtpi: the PRIORITY-INHERITANCE witness rollup, riding the same ~5 s gate. Emits
+            // `[rtpi] inherits=<n> max_jump=<lvl> chain_max=<d> active=<gauge>` (0 / `--` honestly
+            // when no inversion occurred) plus the span's rate-limited `[rtpi] inherit …` traces.
+            // `#[cfg]`-gated (not a shim call) so a knob-off kernel carries none of its symbols and
+            // stays bit-identical.
+            #[cfg(feature = "rtpi")]
+            unaos_kernel::rtpi::rollup();
         }
     }
 }
