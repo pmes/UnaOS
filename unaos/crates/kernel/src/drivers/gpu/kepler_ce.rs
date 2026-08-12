@@ -38,21 +38,30 @@
 //! | R0 present/compose split | ANSWERED [METAL Boot A] — lives in `video/wm.rs`, not here |
 //! | R1 PTOP device-info sweep | **here**, read-only |
 //! | R2 CE PRI window probe | **here**, read-only |
+//! | R2b first CE WRITE (arm) | **here** — one authored-magic scratch write, self-gated on R2's FALCON-REST verdict, entry-captured + restored + read back |
 //! | R3 runlist scan (wide) | **here**, read-only |
 //! | R4 BAR1-identity | ANSWERED [METAL Boot A] — `kepler.rs`, see [`R4_RESULT`] |
 //! | R5 firmware instance-block walk | **here**, one metal-proven window write, restored |
-//! | R6+ CE channel / first copy | NOT here. Those are CONSUMERS of R1/R2/R3/R5 answers |
+//! | R7+ genuine byte copy / CE channel | NOT here. Those are CONSUMERS of R1/R2/R3/R5/R2b answers |
 //!
-//! R6 and beyond are gated by the draft §5 on facts this boot does not yet have (a CE
-//! runlist id, an audited instance-block layout). Building a consumer against an unknown is
-//! how the PGRAPH channel spent eleven boots; this module ships the probe and stops.
+//! R2b is the campaign's FIRST copy-engine write, scoped down from "submit a bounded copy"
+//! because a genuine byte copy needs the CE datapath method encoding — a fact only a CE
+//! channel (draft R6, gated on an unflown runlist id + an unaudited RAMFC layout) or the CE
+//! falcon datapath map (UNKNOWN) can give. R2b instead proves the necessary precondition of
+//! any copy — that a confirmed-live CE PRI window latches an authored write — reversibly.
+//! R7 and a real channel are gated by the draft §5 on facts this boot does not yet have.
+//! Building a consumer against an unknown is how the PGRAPH channel spent eleven boots; this
+//! module takes the largest reversible step and stops.
 //!
 //! # Parachute discipline
 //!
-//! * **No device writes** except the PRAMIN window base, which is metal-proven (R4, Boot A)
-//!   and is saved, restored, **and read back after the restore**, at every use. A restore
-//!   that is written but never read is a success echo that cannot fail; a failure is
-//!   counted, surfaced on the `ce-inst` lines, and VOIDs the register's verdict.
+//! * **Two device writes, both reversible and restore-verified, everything else read-only:**
+//!   (1) the PRAMIN window base (R5), metal-proven (R4, Boot A), saved + restored + **read
+//!   back** at every use; (2) R2b's SINGLE authored-magic write to a CE falcon's
+//!   `CC_SCRATCH[0]` (`+0x800`), which fires ONLY behind a same-boot FALCON-REST verdict, is
+//!   entry-captured, restored, and read back, and touches no datapath/enable/clock/fifo
+//!   register. A restore written but never read is a success echo that cannot fail; a
+//!   failure is counted, surfaced on the witness line, and VOIDs that rung's verdict.
 //! * **`0x504` is never read at any base.** The first access to a falcon's `+0x504` wedges
 //!   every later read in that unit for the boot (spec §5.4). A `const _` assertion below
 //!   proves the offset table cannot contain it.
@@ -123,6 +132,36 @@ const _: () = {
 const FALCON_REST_CPUCTL: u32 = 0x0000_0010;
 /// `DMACTL.REQUIRE_CTX` set at rest [TREE, spec §2].
 const FALCON_REST_DMACTL: u32 = 0x0000_0001;
+
+/// Named falcon-block offsets R2b (the first CE write) touches or re-verifies, **[TREE]**
+/// (spec §2, proven on FECS/GPCCS on this chip). Named consts, not literals at the write
+/// site, so the safety assertions below can prove what R2b may and may not reach.
+///
+/// * `CPUCTL`/`DMACTL` — read only, to RE-VERIFY the FALCON-REST gate at write time.
+/// * `CC0` = `CC_SCRATCH[0]` — the ONE register R2b writes. Spec §3.2 proved falcon IO for
+///   `0x800/0x804` on this silicon with an authored magic (`A55E7A55`), so it is the single
+///   safest first-write target: plain scratch, no datapath, no side effect.
+const FALCON_CPUCTL_OFF: usize = 0x100;
+const FALCON_DMACTL_OFF: usize = 0x10C;
+const FALCON_CC0_OFF: usize = 0x800;
+
+/// The R2b authored magics. **High-entropy, and NEITHER is `0x00000002`** — draft §4.4's
+/// standing mandate after the Boot AS `0x118` finding: "the next port experiment must assert
+/// a high-entropy magic, not `CHAN_VALID`'s bit pattern." The ALT exists so that on the
+/// (astronomically unlikely) boot where the scratch already holds the primary magic, the
+/// write is still a REAL change and `landed` cannot be a success echo of an unchanged word.
+const CE_ARM_MAGIC: u32 = 0xCE5A_A502;
+const CE_ARM_MAGIC_ALT: u32 = 0x5AA5_CE10;
+
+// Compile-time proof that R2b's write target is the scratch register and NOT one of the two
+// forbidden offsets: `0x504` (first touch wedges the unit, spec §5.4) and `0x118`
+// (`DMATRFCMD` — the Boot AS accidental-DMA finding the draft flagged FOR SAFETY REVIEW,
+// §4.4). A comment would not have stopped the three sittings §5.4 cost; an assertion does.
+const _: () = {
+    assert!(FALCON_CC0_OFF != 0x504, "R2b may never write +0x504 (poison, spec §5.4)");
+    assert!(FALCON_CC0_OFF != 0x118, "R2b may never write +0x118 DMATRFCMD (draft §4.4)");
+    assert!(FALCON_CC0_OFF == 0x800, "R2b writes CC_SCRATCH[0] and nothing else");
+};
 
 /// Host runlist controls. `0x2270/0x2274` is the pair this driver submits to [TREE,
 /// `kepler.rs`]. `0x2280 + i*8` is the array shape the draft's C7 proposes
@@ -388,7 +427,10 @@ fn r1_ptop(bar0: usize) -> &'static str {
 /// * AMBIGUOUS — all zeros. Candidate explanation is a clear `NV_PMC_ENABLE` bit, and the
 ///   bit number is supposed to come from R1's reset field. **No blind PMC_ENABLE write is
 ///   made here** — pull 28's ban on unproven writes is in force.
-fn r2_ce_probe(bar0: usize) -> &'static str {
+/// Returns `(rollup_token, first_falcon_base)`. The second element is the target R2b's write
+/// is self-gated on: `Some(base)` only when that base read the exact FALCON-REST pair this
+/// boot, `None` otherwise. R2b writes to no base this rung did not just confirm live.
+fn r2_ce_probe(bar0: usize) -> (&'static str, Option<usize>) {
     let pmc_en = unsafe { mmio_read(bar0, regs::NV_PMC_ENABLE) };
     serial_println!(
         ":: kepler: ce-probe begin bases={} pmc_enable={:08X} — recorded read-only so a later boot can correlate an ABSENT base with an enable bit. NO PMC_ENABLE WRITE IS MADE: the bit number must come from R1's reset field, not from a guess (pull 28) ::",
@@ -399,6 +441,7 @@ fn r2_ce_probe(bar0: usize) -> &'static str {
     let mut present = 0usize;
     let mut absent = 0usize;
     let mut ambiguous = 0usize;
+    let mut falcon_base: Option<usize> = None;
 
     for &base in CE_BASES.iter() {
         // Its OWN bracket, per base — a fault at base N must not be allowed to explain
@@ -468,7 +511,10 @@ fn r2_ce_probe(bar0: usize) -> &'static str {
             "ABSENT-PARTIAL — the base's first dword is structured but a LATER offset faulted, and the probe stopped at that offset. A window that is partly nonexistent is not a unit; nothing about falcon-ness is claimed, and the read_n field above names where it stopped"
         } else if cpuctl == Some(FALCON_REST_CPUCTL) && dmactl == Some(FALCON_REST_DMACTL) {
             falcon += 1;
-            "FALCON-REST — cpuctl=0x10 AND dmactl=0x01, the exact documented rest pair FECS shows on this chip. C2 CONFIRMED at this base: the unit exists and is a falcon, and draft §4.2 path 2 (CE falcon as a bare DMA microcontroller, no PFIFO) opens"
+            if falcon_base.is_none() {
+                falcon_base = Some(base);
+            }
+            "FALCON-REST — cpuctl=0x10 AND dmactl=0x01, the exact documented rest pair FECS shows on this chip. C2 CONFIRMED at this base: the unit exists and is a falcon, and draft §4.2 path 2 (CE falcon as a bare DMA microcontroller, no PFIFO) opens. R2b will take this base as its authored-write target"
         } else if vals[..read_n].iter().any(|&v| v != 0 && v != 0xFFFFFFFF) {
             present += 1;
             "PRESENT-NOT-FALCON — the whole window read without a fault and carries structured values that are not the falcon rest pattern. The unit exists and is not a falcon; C2 is half-refuted and path 2 closes for this base"
@@ -480,11 +526,141 @@ fn r2_ce_probe(bar0: usize) -> &'static str {
     }
 
     serial_println!(
-        ":: kepler: ce-probe verdict bases={} falcon={} present={} absent={} ambiguous={} ::",
-        CE_BASES.len(), falcon, present, absent, ambiguous
+        ":: kepler: ce-probe verdict bases={} falcon={} present={} absent={} ambiguous={} arm_target={} ::",
+        CE_BASES.len(), falcon, present, absent, ambiguous,
+        match falcon_base { Some(b) => b, None => 0 }
     );
 
-    if falcon > 0 { "falcon" } else if present > 0 { "present" } else if absent == CE_BASES.len() { "absent" } else { "ambiguous" }
+    let token = if falcon > 0 { "falcon" } else if present > 0 { "present" } else if absent == CE_BASES.len() { "absent" } else { "ambiguous" };
+    (token, falcon_base)
+}
+
+// ===========================================================================
+// R2b — the FIRST copy-engine WRITE (the largest reversible step this boot)
+// ===========================================================================
+
+/// Write a high-entropy authored magic to a confirmed-live CE falcon's scratch, read it
+/// back, and restore the captured entry value — the campaign's first CE write.
+///
+/// # Why this, and not a byte copy
+///
+/// The brief's R2 is "the first actual copy-engine operation." A genuine VRAM→VRAM copy
+/// (draft R7) needs the CE datapath method encoding, which needs ONE of two things this boot
+/// does not have:
+/// * a PFIFO channel on a CE runlist (draft R6) — gated on a CE runlist id (R1/R3, UNFLOWN)
+///   and an audited instance-block layout (R5, UNFLOWN; the constants in `kepler.rs` are
+///   still UNAUDITED), and it drags in `nvidia-kepler-fifo`; or
+/// * the CE falcon's internal datapath register map — UNKNOWN (draft §4.2 path 2 blocker a),
+///   and its one documented DMA command register `+0x118` is the very offset Boot AS may have
+///   hit by accident and the draft flagged FOR SAFETY REVIEW (§4.4).
+///
+/// Both are gated behind facts only the read-only recon above can produce. Per the brief's
+/// escape hatch — "scope R2 to the largest reversible step and document what the next rung
+/// needs" — R2b is that step: the operation that is BOTH a real register state transition
+/// AND the mandatory precondition of any copy submission — prove the CE PRI window LATCHES
+/// an authored write. It also discharges draft §4.4's standing mandate to re-assert the
+/// falcon port rule at a CE base with a high-entropy magic rather than `CHAN_VALID`'s `0x2`.
+///
+/// # Safety envelope — every clause a STOP-tripwire the draft names
+///
+/// * **Self-gated.** Fires only when `r2_ce_probe` reported FALCON-REST at `falcon_base` THIS
+///   boot, and re-verifies `cpuctl==0x10 && dmactl==0x01` with a fresh read immediately
+///   before the write. `None` ⇒ nothing is written and the boot stays exactly as read-only
+///   as the recon-only ladder. This is the expected first-flight arm, because the CE bases
+///   are entirely unproven until this same boot's `ce-probe` speaks.
+/// * **One register.** Touches `+0x800` (`CC_SCRATCH[0]`) ONLY — never `+0x504` (poison),
+///   never `+0x118` (`DMATRFCMD`), never any enable/clock/reset/fifo register. The `const _`
+///   above proves the target at compile time. No datapath command is issued.
+/// * **Entry-image capture + restore-verify.** The pre-value is saved, restored, and the
+///   restore is READ BACK. A restore written but never read is a success echo that cannot
+///   fail; a failed restore is `NOT-RESTORED`, never a quiet pass.
+/// * **Bracketed** by `NV_PMC_BOOT_0`; a moved bracket VOIDs the verdict.
+///
+/// # Readings (the witness reads a REAL state transition; it cannot pass on a dead base)
+///
+/// * `SKIPPED` — no FALCON-REST base this boot. Nothing written.
+/// * `REST-MOVED` — the rest pair did not re-verify at write time. Nothing written.
+/// * `ARMED` — the magic was written, read back EQUAL (the transition `entry → magic`), and
+///   the entry value restored and verified. The CE latches authored state; a copy has a
+///   proven-live, writable target. **This is the pass, and it required a real change.**
+/// * `REJECTED` — a falcon at rest that did NOT hold the magic. C2's writability half is
+///   refuted here; the window answers reads but does not latch a write.
+/// * `NOT-RESTORED` / `VOID` — the restore did not read back, or the bracket moved.
+fn r2b_ce_arm(bar0: usize, falcon_base: Option<usize>) -> &'static str {
+    let base = match falcon_base {
+        Some(b) => b,
+        None => {
+            serial_println!(
+                ":: kepler: ce-r2 SKIPPED — r2_ce_probe named no FALCON-REST base this boot, so there is no proven-live target and NOTHING is written. The ladder stays as read-only as the recon-only pass; R2b arms only behind a same-boot FALCON-REST verdict (draft §5: no consumer against an unknown) ::"
+            );
+            return "skipped";
+        }
+    };
+
+    let br = Bracket::open(bar0);
+
+    // Re-verify the FALCON-REST gate with a FRESH read at write time. The gate is not
+    // inherited from a value read microseconds ago in another rung; it is re-established
+    // here, immediately before the only write this module makes to a CE base.
+    let cpuctl = unsafe { mmio_read(bar0, base + FALCON_CPUCTL_OFF) };
+    let dmactl = unsafe { mmio_read(bar0, base + FALCON_DMACTL_OFF) };
+    if cpuctl != FALCON_REST_CPUCTL || dmactl != FALCON_REST_DMACTL {
+        let (pre, post, ctl) = br.close(bar0);
+        serial_println!(
+            ":: kepler: ce-r2 base={:06X} REST-MOVED cpuctl={:08X} dmactl={:08X} — the FALCON-REST gate did not re-verify at write time (rest pair is cpuctl=00000010 dmactl=00000001); NOTHING is written ctl_pre={:08X} ctl_post={:08X} ctl={} ::",
+            base, cpuctl, dmactl, pre, post, ctl
+        );
+        return "rest-moved";
+    }
+
+    // Entry-image capture of the ONE register R2b touches.
+    let entry = unsafe { mmio_read(bar0, base + FALCON_CC0_OFF) };
+    // Pick a magic that is guaranteed DIFFERENT from the entry value, so `landed` can never
+    // be a success echo of an already-equal word (spec §4.2's "merely-plausible value" trap).
+    let magic = if entry == CE_ARM_MAGIC { CE_ARM_MAGIC_ALT } else { CE_ARM_MAGIC };
+
+    // The write, then the readback that IS the state transition.
+    unsafe { mmio_write(bar0, base + FALCON_CC0_OFF, magic) };
+    let observed = unsafe { mmio_read(bar0, base + FALCON_CC0_OFF) };
+
+    // Restore the captured entry value FIRST, then READ THE RESTORE BACK. Restore before
+    // report — an unrestored scratch silently perturbs the unit for every later reader.
+    unsafe { mmio_write(bar0, base + FALCON_CC0_OFF, entry) };
+    let restored_rb = unsafe { mmio_read(bar0, base + FALCON_CC0_OFF) };
+
+    let (pre, post, ctl) = br.close(bar0);
+    let held = ctl == "held";
+    let landed = observed == magic;
+    let restored = restored_rb == entry;
+
+    serial_println!(
+        ":: kepler: ce-r2 base={:06X} reg={:03X} entry={:08X} magic={:08X} observed={:08X} restored_rb={:08X} landed={} restored={} ctl_pre={:08X} ctl_post={:08X} ctl={} ::",
+        base, FALCON_CC0_OFF, entry, magic, observed, restored_rb,
+        if landed { "Y" } else { "N" }, if restored { "Y" } else { "N" }, pre, post, ctl
+    );
+
+    // ⛔ THE BRACKET GATES THE VERDICT, and a broken restore outranks a landed write: leaving
+    // the unit perturbed is a worse outcome than a copy target that did not latch.
+    let verdict = if !held {
+        "VOID — the NV_PMC_BOOT_0 bracket MOVED across the write; the readback is uninterpretable and NO state transition is claimed"
+    } else if !restored {
+        "NOT-RESTORED — the authored magic was written but the entry value did NOT read back after the restore. CC_SCRATCH[0] is left perturbed at this base; the reversibility claim is BROKEN and the next rung must treat this base as dirty"
+    } else if landed {
+        "ARMED — the high-entropy magic was written to the CE falcon's CC_SCRATCH[0], read back EQUAL, and the captured entry value restored and verified. The copy engine LATCHES authored state: draft §4.4's port rule is re-established at a CE base with a proper magic (not 0x2), and a copy submission now has a proven-live, writable target. This is the campaign's FIRST copy-engine write, and it required a real entry->magic transition"
+    } else {
+        "REJECTED — the base re-verified as a falcon at rest but did NOT hold the authored magic (observed != magic). C2's writability half is refuted at this base: the window answers reads yet does not latch a write, so it is not plain scratch and the copy path needs a different entry than CC_SCRATCH"
+    };
+    serial_println!(":: kepler: ce-r2 base={:06X} VERDICT {} ::", base, verdict);
+
+    if !held {
+        "void"
+    } else if !restored {
+        "not-restored"
+    } else if landed {
+        "armed"
+    } else {
+        "rejected"
+    }
 }
 
 // ===========================================================================
@@ -884,20 +1060,27 @@ fn r5_inst_walk(bar0: usize, vram_size: usize) -> &'static str {
 /// and NOTHING about any rung. Do not cite emulation for a line in this file.
 pub fn ladder(bar0: usize, vram_size: usize) {
     serial_println!(
-        ":: kepler: CE-LADDER begin knob=UNAOS_KEPLER_CE rungs=R1,R2,R3,R5 — READ-ONLY except the PRAMIN window base, which is metal-proven (Boot A), restored at every use and read back to verify the restore. R0=ANSWERED(present_us~73% of blit, Boot A) R4={} ::",
+        ":: kepler: CE-LADDER begin knob=UNAOS_KEPLER_CE rungs=R1,R2,R3,R5,R2b — READ-ONLY except (a) the PRAMIN window base, metal-proven (Boot A), restored+read-back at every use, and (b) R2b's SINGLE authored-magic write to a CE scratch, which fires ONLY behind a same-boot FALCON-REST verdict and is entry-captured, restored, and read back. R0=ANSWERED(present_us~73% of blit, Boot A) R4={} ::",
         R4_RESULT
     );
 
     let r1 = r1_ptop(bar0);
-    let r2 = r2_ce_probe(bar0);
+    let (r2, r2_falcon_base) = r2_ce_probe(bar0);
     let r3 = r3_runlist_scan(bar0);
     let r5 = r5_inst_walk(bar0, vram_size);
+
+    // R2b — the first CE WRITE — goes LAST, after every read-only rung. Two reasons, both
+    // §5.4 ordering law: (1) a boot's reconnaissance is complete and banked before the
+    // campaign's first write, so a write-induced fault cannot contaminate any read above it;
+    // (2) it is self-gated on r2_ce_probe's FALCON-REST base, captured above and consumed
+    // here, so it never writes to a base this boot did not just confirm live.
+    let r2b = r2b_ce_arm(bar0, r2_falcon_base);
 
     // A rollup that always prints. A probe whose absence cannot be distinguished from a
     // quiet pass is an instrument that cannot fire, and this repo has convicted three of
     // those. If the ladder ran, this line exists.
     serial_println!(
-        ":: kepler: CE-LADDER end r1_ptop={} r2_ce_probe={} r3_rlscan={} r5_inst={} — next gate: R6 (a CE channel) is WITHHELD until r1/r2 name a CE runlist id and r5 yields an audited instance-block layout ::",
-        r1, r2, r3, r5
+        ":: kepler: CE-LADDER end r1_ptop={} r2_ce_probe={} r3_rlscan={} r5_inst={} r2b_arm={} — next gate: a genuine VRAM->VRAM copy (draft R7) is WITHHELD until r2b reports ARMED (a writable CE target), r1/r3 name a CE runlist id, and r5 yields an audited instance-block layout OR the CE falcon datapath map is derived ::",
+        r1, r2, r3, r5, r2b
     );
 }
