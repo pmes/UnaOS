@@ -4383,6 +4383,14 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
 /// so a capture never has to guess which spelling was typed.
 #[cfg(target_arch = "x86_64")]
 fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
+    // LAUNCHPACE: time each storage phase of a program launch (mount → directory walk → cluster-chain
+    // read) so a bench capture can CONVICT where a launch stall actually lives, rather than infer it
+    // from the coarse `BGRUN`/`BAREXEC` "loaded N bytes" line — that line prints only after all three
+    // phases and breaks out none of them. The operator's "~1 s pause when I start vug or pulse" runs
+    // exactly this path, and the three sub-costs have very different fixes (a re-mount cache, a
+    // directory-index cache, a batched read), so the witness has to separate them before any of them
+    // is touched. Emitted once, on the SUCCESSFUL read, in `now_cycles()` (rdtsc) units converted to µs.
+    let t_entry = crate::arch::now_cycles();
     // Cap = the ring-3 window the loader will map into; a file at or under it may still be rejected by
     // the loader, but this is the hard read ceiling — we never read past it.
     let cap = crate::arch::syscall::user_window_size();
@@ -4414,6 +4422,7 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
             return None;
         }
     };
+    let t_mount = crate::arch::now_cycles();
     let de = match resolve_path(&fs, &normalize_path(&cwd_path(), rel)) {
         Ok(Resolved::Root) => {
             console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, path));
@@ -4425,6 +4434,7 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
             return None;
         }
     };
+    let t_resolve = crate::arch::now_cycles();
     if de.is_dir {
         console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, path));
         return None;
@@ -4445,6 +4455,7 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
         console.println(&alloc::format!("{}: {}: read failed ({:?}, -EIO)", verb, path, e));
         return None;
     }
+    let t_read = crate::arch::now_cycles();
     if bytes.len() != de.size as usize {
         // FATREAD-1 was exactly this class of silent mismatch (a doubled read that pushed
         // STAT.ELF/VUG.ELF past the window). Say NO out loud rather than hand the loader a short or
@@ -4473,7 +4484,35 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
             return None;
         }
     }
+    // LAUNCHPACE: the storage-phase breakdown for this launch. `mount_us` is the per-launch FAT re-mount
+    // (sector-0 read + MBR/GPT decode + BPB parse — suspect: repeated every launch, never cached);
+    // `dirwalk_us` is the root-directory scan that `resolve_path` runs to find the entry; `read_us` is
+    // the cluster-chain read of the image itself (the MULTIBLK batched path). `total_us` is the whole
+    // synchronous cost this launch imposes on its caller's core — and on x86 the shell runs on the
+    // RENDER core (`x86_render_service`), so this total is time the panel is not composing. The window
+    // create and first present that follow are on the app's own core and carry their own `wc-a`/`wc-h`
+    // witnesses; this line owns the storage half.
+    serial_println!(
+        "[launchpace] verb={} bytes={} mount_us={} dirwalk_us={} read_us={} total_us={}",
+        verb,
+        bytes.len(),
+        cyc_to_us(t_mount.saturating_sub(t_entry)),
+        cyc_to_us(t_resolve.saturating_sub(t_mount)),
+        cyc_to_us(t_read.saturating_sub(t_resolve)),
+        cyc_to_us(t_read.saturating_sub(t_entry)),
+    );
     Some(bytes)
+}
+
+/// LAUNCHPACE: rdtsc cycle delta → microseconds, at the rate `apic::calibrate` measured against the
+/// ACPI PM timer. Mirrors `video::wcg::cycles_to_us` (private there); the fallback rate matches, so a
+/// witness printed before calibration is honest-but-approximate rather than a divide-by-zero. x86 only,
+/// because the only caller ([`read_el0_image`]'s x86 twin) is.
+#[cfg(target_arch = "x86_64")]
+fn cyc_to_us(dt: u64) -> u64 {
+    let hz = crate::arch::apic::tsc_hz();
+    let hz = if hz == 0 { 1_250_000_000 } else { hz };
+    dt.saturating_mul(1_000_000) / hz
 }
 
 #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
