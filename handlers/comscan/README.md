@@ -48,22 +48,29 @@ counted-loss honesty `termring` keeps.
 - handler→view: `LogTail { lines, dropped, paused }` — the single bounded,
   filtered snapshot the vessel draws.
 
-**The vessel view is DESIGNED, not wired.** `bandy::state::LogViewState` is the
-render seam for a future `ViewEntity::Console(LogViewState)`. It is a standalone
-struct today because `ViewEntity` is matched exhaustively in the Qt/GTK tetra
-bridge (`libs/quartzite/src/tetra.rs`); wiring the variant and its GTK/AppKit
-widget belongs with the vessel arc, out of this handler's lane. The handler,
-events, state, and tests have landed; the on-glass widget is the follow-up.
+**The vessel view is WIRED (GR26).** `bandy::state::LogViewState` is the render
+seam, and `bandy::state::ViewEntity::Console(LogViewState)` is now a first-class
+pane. `LogView::view_state()` snapshots this handler's scrollback into that
+payload; the Qt/GTK tetra bridge (`libs/quartzite/src/tetra.rs`) converts it —
+`ConsoleTetra::from_log_view` — running every line through Tabula's log
+sanitizer, so a stray control byte off the cable is *shown* (as a Control
+Picture), never obeyed. The GTK render (`libs/quartzite/src/platforms/gtk/
+console_view.rs`) is a read-only, monospace, live view: it seeds from the
+snapshot and follows the feed, re-rendering on each `SMessage::Logs(LogTail)`
+this handler publishes. Read-only by ownership — the pane has no input field and
+the log is root-owned on the shard; the view only renders records.
 
-**This tile is how you summon the Console — not a command-line flag.** The
-correct way to open a log is a desktop tile that summons this app, the way
-macOS opens `Console.app`; it is emphatically not `una --console`. Those flags
-have been removed (a Unix-style flag to open a log is the wrong idiom for a
-spatial facade OS). Until the `ViewEntity::Console` tile lands, the static-file
-stand-in is `handlers/tabula`'s `logview` renderer, reached read-only by opening
-a log path in `una` (`una <log>`); the newest-log discovery seam the tile will
-reuse is `tabula::default_console_log`. The live/tailing feed here is the richer,
-metal-facing successor to that static view.
+**Summoned facade-natively — not a command-line flag.** The Console opens on a
+gesture, the way macOS opens `Console.app`; it is emphatically not `una
+--console` (those flags were removed — a Unix-style flag to open a log is the
+wrong idiom for a spatial facade OS). `una` ignites this handler (the live feed)
+and wires the summon: **Ctrl+`** on the host window pops the read-only Console
+window that follows the feed (`quartzite::install_console_summon` /
+`open_console_window`). A shell tile/menu that wants the same effect fires the
+same summon. For opening a specific *named* log read-only, the static-file path
+is still `handlers/tabula`'s `logview` renderer, reached with `una <log>`; the
+newest-log discovery seam is `tabula::default_console_log`. The live/tailing feed
+here is the richer, metal-facing successor to that static view.
 
 Proofs live in `tests/console.rs` (bounded scrollback, live tail, pause/resume,
 text + source filters, the `serve` bus round-trip) and in the `kat_logs_*`

@@ -501,11 +501,11 @@ impl Default for LogSource {
 }
 
 /// Backing state for the Console log viewer — the macOS `Console.app`
-/// equivalent, owned by the `comscan` handler. This is the DESIGNED render seam
-/// for a future `ViewEntity::Console(LogViewState)`; it is a standalone struct
-/// today because `ViewEntity` is matched exhaustively in the Qt/GTK tetra
-/// bridge (`libs/quartzite/src/tetra.rs`), so wiring the variant belongs with
-/// the vessel widget that renders it, not with this handler arc.
+/// equivalent, owned by the `comscan` handler. This is the render seam the
+/// [`ViewEntity::Console`] pane carries: `comscan::LogView::view_state()`
+/// snapshots the live scrollback into this struct, and the Qt/GTK tetra bridge
+/// (`quartzite::tetra::ConsoleTetra::from_log_view`) renders it read-only,
+/// sanitizing each line through Tabula.
 ///
 /// `lines` is the already-filtered scrollback snapshot the view draws;
 /// `filter`/`source` are the active query; `paused` is scroll-lock (the tail is
@@ -526,6 +526,23 @@ pub enum ViewEntity {
     Topology(TopologyState),
     Stream(StreamState),
     Editor(EditorState),
+    /// The **Console app** (the macOS `Console.app` equivalent): a read-only,
+    /// live view of the system log scrollback, backed by `comscan`'s
+    /// [`LogViewState`]. This is the render seam the standalone [`LogViewState`]
+    /// note above reserved — a vessel composes this pane and the Qt/GTK tetra
+    /// bridge (`libs/quartzite/src/tetra.rs`) renders it.
+    ///
+    /// **Read-only by ownership, not by app policy.** On the shard the kernel
+    /// flight-recorder log is owned by *root*, and the UnaFS ownership ACL
+    /// denies a user-owned vessel any write; this pane only *renders* records,
+    /// it never writes them, so a mutation was never the view's to make. Every
+    /// line is run through Tabula's log sanitizer before it reaches glass, so a
+    /// stray control byte off the cable is shown (as a Control Picture), never
+    /// obeyed.
+    ///
+    /// Summoned facade-natively (a tile/gesture), **never** a command-line flag
+    /// — the `--console` flag ceremony was removed on purpose.
+    Console(LogViewState),
     Empty,
 }
 

@@ -206,6 +206,7 @@ pub mod tetra_eval;
 pub mod button;
 pub mod text_field;
 pub mod image_view;
+pub mod console_view;
 // pub mod spline;
 // pub mod mega_bar;
 // pub mod types;

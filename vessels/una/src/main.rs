@@ -46,9 +46,12 @@
 //! path, it does not invent it.
 //!
 //! Summoning the *newest* log without naming it is the **Console app's** job —
-//! a desktop tile backed by `comscan` (the future `ViewEntity::Console`), not a
-//! command-line flag. `tabula::default_console_log` is the discovery seam that
-//! tile reuses; `una` no longer wires it to any flag.
+//! a facade-native summon backed by `comscan` and rendered through
+//! `ViewEntity::Console`, not a command-line flag. `una` ignites `comscan` (the
+//! live log feed) and wires the summon gesture (Ctrl+`), which opens the
+//! read-only Console window that follows that feed. `tabula::default_console_log`
+//! remains the discovery seam for opening the newest *named* log; `una` no
+//! longer wires it to any flag.
 
 #[allow(unused_imports)]
 use bandy::{SMessage, Synapse};
@@ -160,8 +163,8 @@ fn main() {
     //     member — it lives on the shard's FAT volume once the card is mounted,
     //     or in a capture directory — so the flow is "open this path", not
     //     "browse to it in the sidebar". Summoning the *newest* log with no
-    //     path is the Console app tile's job (comscan / `ViewEntity::Console`),
-    //     not a flag on `una`.
+    //     path is the Console app's job (comscan / `ViewEntity::Console`, wired
+    //     to the Ctrl+` gesture below), not a flag on `una`.
     let (root_arg, open_arg) = match parse_args(std::env::args().skip(1)) {
         Ok(pair) => pair,
         Err(msg) => {
@@ -183,6 +186,18 @@ fn main() {
     let matrix_root_arc = absolute_workspace_root_arc.clone();
     let matrix_handle = rt.spawn(async move {
         matrix::ignite(matrix_synapse, matrix_root_arc).await;
+    });
+
+    // 3b. Ignite the Console app capability (comscan): subscribe to the system
+    //     log feed (`SMessage::Log`), keep a bounded drop-oldest scrollback, and
+    //     publish a filtered, tailing `SMessage::Logs(LogTail)` for the Console
+    //     window to render. This is the LIVE feed the summoned Console pane
+    //     follows; without it the pane would open empty. The window itself is
+    //     summoned facade-natively (the Ctrl+` gesture, wired below) — the
+    //     `--console` flag ceremony is gone.
+    let console_synapse = synapse.clone();
+    let console_handle = rt.spawn(async move {
+        comscan::ignite(console_synapse, comscan::DEFAULT_SCROLLBACK).await;
     });
 
     // 4. Shared app state (no cortex — just the anchored root).
@@ -462,8 +477,15 @@ fn main() {
         )
     };
 
+    // The Console summon: a facade-native gesture (Ctrl+`) on the host window
+    // pops the read-only, live system-log window — the Console app on glass. Not
+    // a flag; a summon. A shell tile/menu that wants the same effect fires
+    // `quartzite::open_console_window` directly.
+    #[cfg(not(target_os = "macos"))]
+    let summon_synapse = synapse.clone();
     #[cfg(not(target_os = "macos"))]
     let bootstrap = move |window: &NativeWindow| -> quartzite::BootstrapPayload {
+        quartzite::install_console_summon(window, summon_synapse.clone());
         spline.bootstrap(
             window,
             event_tx.clone(),
@@ -486,6 +508,7 @@ fn main() {
     rt.block_on(async {
         let _ = brain_loop_handle.await;
         matrix_handle.abort();
+        console_handle.abort();
     });
 }
 

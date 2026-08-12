@@ -14,6 +14,9 @@ macos = []
 [dependencies]
 gneiss_pal = { path = "../gneiss_pal" }
 bandy = { path = "../bandy" }
+# The Console pane runs every log line through Tabula's control-byte sanitizer
+# before it reaches glass. Default-features is the pure `sanitize` core (no GTK).
+tabula = { path = "../../handlers/tabula", default-features = false }
 async-channel = "2.5"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }

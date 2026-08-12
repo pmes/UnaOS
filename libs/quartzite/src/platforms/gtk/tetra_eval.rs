@@ -29,6 +29,9 @@ pub fn eval_tetra(node: TetraNode, synapse: Synapse) -> NativeView {
         TetraNode::Surface { id } => {
             super::image_view::bootstrap_image_surface(&id, synapse)
         }
+        TetraNode::Console(console) => {
+            super::console_view::bootstrap_console(&console, synapse)
+        }
         _ => {
             let container = Box::new(Orientation::Horizontal, 0);
             container.into()
