@@ -165,7 +165,7 @@ pub fn record(tag: &'static str) {
         ORIGIN.store(c, Ordering::Relaxed);
     }
     r.slots[n] = (c, tag);
-    r.len = n + 1;
+    r.len = n + 1; #[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))] { drop(r); crate::splash::advance(tag); } // SPLASH-ALIVE: one boot-crystal frame per milestone (see splash.rs). Inlined on THIS line so no physical line is added — shifting following fns would change their panic Location line-numbers in the loadable image, breaking byte-identity of the gated-off (usbdebug/bootlog/witness) media. drop(r) frees the ring's leaf mutex before the paint's MMIO.
 }
 
 /// Record the start (`done == false`) or the end (`done == true`) of one root port's enumeration.
