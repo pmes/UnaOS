@@ -11392,3 +11392,34 @@ stubs), and **Shut Down wired to the real `acpi_power::poweroff`** — guarded f
 **Designed, at the foot of `crystal.rs`:** a hover highlight (needs the drag-motion path, a lane this
 arc does not touch), the crispy About *panel* (a second modal surface, the argument for a tiny shared
 modal-surface primitive), and making Sleep/Restart real.
+
+## SPLASH-ALIVE — the boot crystal breathes (x86, 2026-08-11)
+
+`splash.rs`'s crystal-cluster boot splash (SPLASH-2: a Dark-Side-of-the-Moon refraction — a white
+beam entering a faceted shard and dispersing into a spectrum by real per-wavelength Snell's law,
+Q16.16, pre-heap, no float/alloc) was drawn **once**, statically. SPLASH-ALIVE makes it *live* over
+the boot wait: a fixed-point light source (a 32-entry cosine LUT) sweeps 11.25°/frame, specular
+glints crawl the shards' facet edges and twinkle as facets turn toward the light, and the beam-entry
+facet throbs on a triangle pulse — "glinting that looks alive."
+
+**Frame driver — milestone-borrowed, no wall-clock of its own.** The pre-heap single-threaded
+bring-up has no yield point for a TSC frame loop and the APIC timer is a different lane, so the
+animation advances one cheap frame per `bootpace::record` milestone. The M4 xHCI subdivision stamps
+~13 times through `pci::init`, so the crystal is liveliest exactly where the boot *sits* longest.
+Each frame is kilopixels of facet-edge `put_pixel` (never a `fill_screen`) and borrows a stamp that
+already happened, so BPACE `gui=` is unchanged.
+
+**Seamlessness and safety.** `advance("gui")` latches the animation off permanently, recorded on both
+handoff paths strictly before `fbcon::detach` and the desktop's first paint — no glint frame can land
+over the desktop (the SPLASH-SEAMLESS "jolting flash" property holds). The hook drops the bootpace
+ring mutex before the paint's MMIO, never re-enters `record`, and `try_lock`-bails an SPLASH_FB
+already held; a panic still repaints its own screen via `fbcon::panic_screen`. Each frame repaints
+the whole facet edge before laying the glint, so a milestone firing mid-locus can never ghost.
+
+**Media byte-identity.** The whole animation is `#[cfg(not(any(usbdebug, bootlog, witness)))]` and
+appended at the file foot; the `bootpace::record` hook is inlined on the existing `r.len = n + 1;`
+line so no downstream panic `Location` line-number shifts. The witness/usbdebug/bootlog loadable
+images are byte-identical base-vs-arc (verified by `objcopy -O binary` + `cmp`), so test/bench media
+are unchanged. This is the same 2.5D landing rung the vug SHARD scene and the menu-bar crystal share:
+one crystal across boot, idle demo, and brand mark. Full 3D rotation of the shard at boot (a per-frame
+re-march of the spectrum fans) is the next rung, deferred for the pre-heap frame budget.
