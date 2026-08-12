@@ -18,23 +18,28 @@
 //! INHERITS the blocker's priority (transitively down a chain of holders), so mid-priority tasks
 //! can no longer preempt the critical section; the inversion is bounded to ONE hold.
 //!
-//! ## The instruments (all per ~5 s rollup span, resets each line)
-//! 1. **`inherits`** — donation EVENTS this span: each time a holder's effective priority was raised
-//!    by a blocker (the fast path where the holder was already at/above the blocker does NOT count).
-//!    Reads `0` honestly when no inversion occurred — a machine with no contention prints
-//!    `inherits=0`, not a fabricated number.
-//! 2. **`max_jump`** — the largest single priority JUMP donated this span, in levels
-//!    (`to − from`). The tail: the worst inversion inheritance had to correct. `--` when
-//!    `inherits==0`.
-//! 3. **`chain_max`** — the deepest TRANSITIVE chain walked this span (1 = direct holder, 2 = the
-//!    holder was itself blocked on a second lock, …). Proves transitive inheritance is live and how
-//!    deep it reached. `--` when `inherits==0`.
-//! 4. **`active`** — a LIVE gauge (NOT per-span): how many tasks currently carry a non-zero donated
-//!    priority right now. It is the leak witness: at idle, with no lock held under contention, it
-//!    MUST read `0`. A persistent non-zero `active` with `inherits=0` for many spans is a priority
-//!    leak and the instrument is built to make exactly that visible.
+//! ## Where the donation lives (reclamation safety)
+//! The inherited floor is stored on the LONG-LIVED lock (a per-`Mutex` `boost`), never on the
+//! holder's `Task` (which `run()` frees the instant it exits). A donor therefore only touches lock
+//! control blocks, never a `Task` — closing the cross-CPU use-after-free a Task-targeted design has.
+//! The holder's effective priority folds in the `boost` of every lock it holds.
 //!
-//! Plus a rate-limited per-event trace `[rtpi] inherit c{from}->c{to} depth={d}` for the first
+//! ## The instruments (all per ~5 s rollup span, resets each line)
+//! 1. **`inherits`** — donation EVENTS this span: each time a blocked task raised a lock's inherited
+//!    `boost` (the fast path where the lock already carried a `>=` boost does NOT count). Reads `0`
+//!    honestly when no inversion occurred — a machine with no contention prints `inherits=0`.
+//! 2. **`max_jump`** — the largest single priority JUMP a lock's boost took this span, in levels
+//!    (`new − old`). The tail: the worst inversion inheritance had to correct. `--` when
+//!    `inherits==0`.
+//! 3. **`chain_max`** — the deepest TRANSITIVE chain walked this span (1 = the lock the blocker waits
+//!    on directly, 2 = its holder was itself blocked on a second lock, …). Proves transitive
+//!    inheritance is live and how deep it reached. `--` when `inherits==0`.
+//! 4. **`active`** — a LIVE gauge (NOT per-span): how many LOCKS currently carry a non-zero `boost`
+//!    (are contended-and-boosted) right now. It is the leak witness: because a lock's boost is reset
+//!    the instant its last blocked waiter leaves (`nwait == 0`), at idle it MUST read `0`. A
+//!    persistent non-zero `active` with `inherits=0` for many spans is the leak the gauge exposes.
+//!
+//! Plus a rate-limited per-event trace `[rtpi] inherit c{old}->c{new} depth={d}` for the first
 //! `TRACE_MAX` donations of each span, so a boot shows the actual inheritance events, not only the
 //! rollup totals.
 //!
@@ -58,41 +63,44 @@
 mod imp {
     use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering::Relaxed};
 
-    /// Donation events (a holder's effective priority actually raised) this span.
+    /// Donation events (a lock's inherited `boost` actually raised) this span.
     static INHERITS: AtomicU64 = AtomicU64::new(0);
-    /// Largest single priority jump (`to - from`, in levels) donated this span.
+    /// Largest single priority jump (`new - old`, in levels) donated this span.
     static MAX_JUMP: AtomicU64 = AtomicU64::new(0);
     /// Deepest transitive chain walked this span (1 = direct holder).
     static CHAIN_MAX: AtomicU64 = AtomicU64::new(0);
-    /// LIVE gauge: tasks currently carrying a non-zero donated priority. The leak witness; persists
-    /// across spans. Signed so an accounting bug reads negative (visible) rather than wrapping huge.
+    /// LIVE gauge: LOCKS currently carrying a non-zero inherited `boost` (a contended, boosted lock).
+    /// The leak witness; persists across spans. Because the boost lives on the long-lived lock and is
+    /// reset the instant its last blocked waiter leaves (`nwait == 0`), at idle this MUST read 0 — a
+    /// persistent non-zero with `inherits=0` for many spans is the leak the gauge exists to expose.
+    /// Signed so an accounting bug reads negative (visible) rather than wrapping huge.
     static ACTIVE: AtomicI64 = AtomicI64::new(0);
     /// Per-span trace budget for the `[rtpi] inherit …` event lines.
     const TRACE_MAX: u32 = 32;
     static TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
-    /// Record one donation event: a holder at effective level `from` was raised to `to` (levels),
-    /// `depth` hops down the transitive holder chain (1 = the lock's direct holder). `newly_active`
-    /// is true iff this raise took the holder from unboosted (effective == base) to boosted — used
-    /// to keep the `active` leak gauge a clean count of currently-boosted tasks.
+    /// Record one donation event: a lock's inherited `boost` was raised from level `old` to `new`,
+    /// `depth` hops down the transitive holder chain (1 = the lock the blocker waits on directly).
     #[inline]
-    pub fn note_inherit(from: u8, to: u8, depth: u32, newly_active: bool) {
+    pub fn note_inherit(old: u8, new: u8, depth: u32) {
         INHERITS.fetch_add(1, Relaxed);
-        MAX_JUMP.fetch_max(to.saturating_sub(from) as u64, Relaxed);
+        MAX_JUMP.fetch_max(new.saturating_sub(old) as u64, Relaxed);
         CHAIN_MAX.fetch_max(depth as u64, Relaxed);
-        if newly_active {
-            ACTIVE.fetch_add(1, Relaxed);
-        }
         if TRACE_COUNT.fetch_add(1, Relaxed) < TRACE_MAX {
-            serial_println!("[rtpi] inherit c{}->c{} depth={}", from, to, depth);
+            serial_println!("[rtpi] inherit c{}->c{} depth={}", old, new, depth);
         }
     }
 
-    /// Record that a task's donated priority was reverted to base (it released its last PI lock, so
-    /// it no longer carries a boost). Decrements the live `active` gauge. Called once per boosted
-    /// task that fully reverts.
+    /// A lock's `boost` crossed 0 → positive (it acquired its first blocked waiter). Bumps the live
+    /// `active` gauge of currently-boosted locks.
     #[inline]
-    pub fn note_revert() {
+    pub fn note_boost_begin() {
+        ACTIVE.fetch_add(1, Relaxed);
+    }
+
+    /// A lock's `boost` was reset to 0 (its last blocked waiter left). Drops the live `active` gauge.
+    #[inline]
+    pub fn note_boost_end() {
         ACTIVE.fetch_sub(1, Relaxed);
     }
 
@@ -129,11 +137,13 @@ mod imp {
 #[cfg(not(all(feature = "rtpi", target_arch = "x86_64")))]
 mod imp {
     #[inline(always)]
-    pub fn note_inherit(_from: u8, _to: u8, _depth: u32, _newly_active: bool) {}
+    pub fn note_inherit(_old: u8, _new: u8, _depth: u32) {}
     #[inline(always)]
-    pub fn note_revert() {}
+    pub fn note_boost_begin() {}
+    #[inline(always)]
+    pub fn note_boost_end() {}
     #[inline(always)]
     pub fn rollup() {}
 }
 
-pub use imp::{note_inherit, note_revert, rollup};
+pub use imp::{note_boost_begin, note_boost_end, note_inherit, rollup};
