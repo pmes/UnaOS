@@ -38,6 +38,11 @@
 //!    (are contended-and-boosted) right now. It is the leak witness: because a lock's boost is reset
 //!    the instant its last blocked waiter leaves (`nwait == 0`), at idle it MUST read `0`. A
 //!    persistent non-zero `active` with `inherits=0` for many spans is the leak the gauge exposes.
+//!    One BENIGN residue is possible: a donor following a momentarily stale `owner_waits` uplink can
+//!    boost a lock that has already gone idle, stranding that boost (and one `active` count) until
+//!    the lock's NEXT waiterless acquire clears it — so a small `active > 0` with `inherits=0` that
+//!    drains on subsequent lock traffic is that residue, not a leak. The leak signature is `active`
+//!    that never drains.
 //!
 //! Plus a rate-limited per-event trace `[rtpi] inherit c{old}->c{new} depth={d}` for the first
 //! `TRACE_MAX` donations of each span, so a boot shows the actual inheritance events, not only the
