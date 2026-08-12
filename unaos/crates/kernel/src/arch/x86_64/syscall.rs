@@ -3856,6 +3856,18 @@ fn present_backpressure(slot: usize, outcome: crate::video::wm::Presented) -> i6
             SLOT_HIDDEN_PRESENTS[slot].store(0, Ordering::Relaxed);
             0
         }
+        Presented::Coalesced => {
+            // WPACE-PANEL — the present was absorbed into the panel frame in flight: the damage is
+            // committed but NO GLASS HAS CHANGED YET, so the rtwit ruler is NOT closed here — it
+            // closes at the composite that actually carries the damage (the window's frame-edge
+            // present via the arm above, or `wm::pace_service`'s tail drain, which calls
+            // `note_present_composited` itself). Closing on this arm would under-report the
+            // input→glass tail by up to a frame plus a service tick. Everything else is
+            // `Composited`'s: same return, same hidden-counter reset — the window is visible and
+            // presenting.
+            SLOT_HIDDEN_PRESENTS[slot].store(0, Ordering::Relaxed);
+            0
+        }
         Presented::Suppressed => {
             let n = SLOT_HIDDEN_PRESENTS[slot].fetch_add(1, Ordering::Relaxed) + 1;
             if n > HIDDEN_PRESENT_GRACE {

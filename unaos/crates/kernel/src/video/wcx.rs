@@ -635,6 +635,14 @@ pub fn desktop_app_service() {
     use core::sync::atomic::Ordering;
     static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+    // WPACE-PANEL — the present pacer's tail drain rides this pass, for PAYGO-TERM's exact reason:
+    // this is the `wc`-gated body the ~1 kHz device-service task calls on EVERY pass (the one-shot
+    // below early-returns; this must run ahead of it), and a coalesced present whose stream stopped
+    // needs a taker that is not a present. One relaxed load per pass when nothing is pending; a due
+    // drain is an ordinary unmasked composite, the same call `service_damage` and the paygo taker
+    // already make from this lane. See `wm::pace_service`.
+    super::wm::pace_service();
+
     // Not armed = the activation never completed. Cheapest test first, and it is the one that is
     // false on every boot without the Kepler takeover.
     if !DESKTOP_APP_ARMED.load(Ordering::Acquire) {
