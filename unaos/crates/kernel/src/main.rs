@@ -4485,12 +4485,14 @@ fn x86_render_service(cpu: usize) {
     // desktop (pre-takeover, or `open_shell_window` declining) `shell_id` stays `WIN_NONE` and the
     // dummy surface is never drawn — the keystroke path falls to the backdrop `console` exactly as
     // before. Folded to nothing on `wc`-off x86 and (via the enclosing fn's `cfg`) on aarch64.
-    // `_shell_store` is bound but never read again ON PURPOSE: the `wm` row holds a raw pointer into
+    // `_shell_store` is bound but never read ON PURPOSE: the `wm` row holds a raw pointer into
     // its heap buffer, and keeping it as a live local (the render service never returns) keeps that
-    // allocation from being freed for the row's life. Underscore-prefixed so it needs no `mut` and
-    // raises no unused warning; the empty `Vec` on the non-window paths costs nothing.
+    // allocation from being freed for the row's life. Underscore-prefixed so it raises no unused
+    // warning; the empty `Vec` on the non-window paths costs nothing. Every binding is `mut` since
+    // SHELLPIN: the dock's pinned shell tile can ask this service to REOPEN a closed shell window,
+    // which rebinds the whole tuple (see the reopen arm below the drain loop).
     #[cfg(feature = "wc")]
-    let (_shell_store, mut shell_screen, mut shell_console, shell_id) = {
+    let (mut _shell_store, mut shell_screen, mut shell_console, mut shell_id) = {
         let empty = || {
             (
                 alloc::vec::Vec::new(),
@@ -4703,6 +4705,65 @@ fn x86_render_service(cpu: usize) {
             }
         }
 
+        // SHELLWIN-REOPEN — service the dock's pinned shell tile (SHELLPIN, `video/dock.rs`). The
+        // press that latched the request was routed INSIDE the drain above (`wc_route_event` ->
+        // `wc_click_route_at` -> `dock::press_at`), so by this line the flag is set and the reopen
+        // lands in the same burst — no extra wakeup, no new event variant, the channel untouched.
+        //
+        // Two arms, one live shell window max:
+        //  * the row is still alive under its owner (the scan-to-press race, or a parked shell) —
+        //    RAISE it through the same pair the click router's furniture arm uses, never a second
+        //    window. `focus_changed` also un-parks (fresh top-of-stack z), so a minimised shell
+        //    comes back through this arm too.
+        //  * the row is gone (the operator closed their only shell) — rebuild it through the SAME
+        //    fallible path bring-up used: `open_shell_window` (`try_reserve_exact` decline ->
+        //    `[shellwin] DECLINE`) and `Screen::direct` (NEVER `Screen::new` for a window surface —
+        //    its infallible second back buffer is the exact allocation that OOM-panicked GR26's
+        //    metal boot). The whole tuple is rebound: the old store's Vec is freed by the
+        //    assignment (its row is already reaped, so no raw pointer outlives it), the new
+        //    `TargetPal` re-borrows the new `Screen` (one fresh `:: UI1:` line per reopen, the
+        //    once-per-surface rule kept), and `shell_id` now routes keystrokes to the NEW window.
+        //    `user_input_set_active(0)` hands the keyboard back so the first keystroke after the
+        //    reopen lands in the reopened shell.
+        // A DECLINE leaves the old (dead) id in place: presents stay fenced off by
+        // `present_outcome_owned` and the pinned tile stays on the dock for another try.
+        #[cfg(feature = "wc")]
+        if desktop && unaos_kernel::video::dock::take_shell_reopen() {
+            use unaos_kernel::video::wm;
+            if shell_id != wm::WIN_NONE && wm::owner_of(shell_id) == Some(wm::KERNEL_OWNER_DESKTOP) {
+                unaos_kernel::arch::x86_64::syscall::user_input_set_active(0);
+                wm::focus_changed(wm::KERNEL_OWNER_DESKTOP);
+                serial_println!("[shellwin] reopen route=dock already-live win={} raised", shell_id);
+            } else {
+                let info = front_fb.info();
+                match open_shell_window(info.width, info.height) {
+                    Some((store, fb, id)) => {
+                        _shell_store = store;
+                        shell_console = unaos_kernel::console::Console::new();
+                        shell_console.mark_in_window();
+                        shell_screen = unaos_kernel::video::Screen::direct(fb);
+                        shell_pal = unaos_kernel::pal::TargetPal::new(&mut shell_screen);
+                        shell_id = id;
+                        // First frame, exactly as bring-up: prompt into the surface, flush, one
+                        // owner-fenced present so the reopened shell is on glass before the next
+                        // event arrives.
+                        shell_console.draw(&mut shell_pal);
+                        shell_pal.render();
+                        let _ = unaos_kernel::video::wm::present_outcome_owned(
+                            id,
+                            unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
+                        );
+                        unaos_kernel::arch::x86_64::syscall::user_input_set_active(0);
+                        shell_dirty = false;
+                        serial_println!("[shellwin] reopen win={} route=dock == witness ::", id);
+                    }
+                    // The decline reason (`alloc`/`create-failed`) is already on the wire from
+                    // `open_shell_window`; nothing was torn down, nothing to roll back.
+                    None => {}
+                }
+            }
+        }
+
         // CURSOR-HIDE: restore the pixels under the sprite once when the auto-hide delay expires
         // (reappearance is instant — the pointer arms above stamp the activity clock before drawing).
         let cursor_vis = unaos_kernel::pal::cursor::visible();
@@ -4737,10 +4798,10 @@ fn x86_render_service(cpu: usize) {
             // would composite whatever row later took the slot. `present_outcome_owned` declines a slot
             // whose owner is no longer `KERNEL_OWNER_DESKTOP` (`NoRow`) and suppresses a parked one
             // (`Suppressed`) — the same recycled-id fence `fbcon` uses for the closable console window
-            // (NORMALWIN). NOTE (review, flagged to the integrator): this closes the compositor hazard,
-            // but the operator can still close/minimise their only shell with no reopen route; the
-            // complete fix — denying `KERNEL_OWNER_DESKTOP` furniture a control cluster — is a `wm.rs`
-            // (`ctrls_for`) change outside this arc's lane.
+            // (NORMALWIN). The close is no longer a one-way trip: the dock PINS a permanent shell
+            // tile (SHELLPIN, `video/dock.rs`) whose press latches a reopen request this loop
+            // services below — the reopen route the GR27 review note asked for, per the standing
+            // rule ("closeable means build the reopen route, not withhold the button").
             let _ = unaos_kernel::video::wm::present_outcome_owned(
                 shell_id,
                 unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,

@@ -134,6 +134,31 @@
 //! arithmetic to drift — the law crispywire established after `controls` and `paint_window` disagreed
 //! by one `GAP`. [`selftest`] asserts the two agree by driving a synthetic press at a tile centre
 //! that [`Layout`] itself computed and checking WHICH window came back.
+//!
+//! # SHELLPIN — the shell's tile is PERMANENT, and it is the shell's reopen route (GR27)
+//!
+//! The live shell is a closeable `wm::KERNEL_OWNER_DESKTOP` window (SHELLWIN, `main.rs`), and the
+//! standing rule is *"closeable means build the reopen route, not withhold the button"*. The route is
+//! the task bar, by the operator's direction — apps do not open from the SHARD menu — so the dock
+//! PINS the shell: when no live row carries `KERNEL_OWNER_DESKTOP`, [`pin_shell`] appends one
+//! synthetic tile (caption `shell`, id [`SHELL_PIN_ID`], pip in the minimised ink) to the scanned
+//! model, in [`compose`], [`press_at`] and [`strip_rect`] alike, so the painter, the router and the
+//! occlusion registry see the same strip. A press on it does not raise anything — there is no row —
+//! it latches a REOPEN REQUEST ([`take_shell_reopen`]) that the render service (`main.rs`) services
+//! at the tail of the same event burst, rebuilding the window through the same fallible
+//! `open_shell_window` + `Screen::direct` machinery bring-up uses. While the shell row is LIVE the
+//! model is unchanged (its real tile raises through the ordinary kernel-owner press arm), so the
+//! dock is byte-identical to the pre-SHELLPIN dock on every boot until the operator closes the shell.
+//!
+//! ⚠ **A bounded occlusion residual, disclosed (integrator note).** `wm::occ_clip`'s per-window-blit
+//! dock term is fed by `wm::dock_tiles` — a lock-free count of dock-addressable ROWS, which cannot
+//! see the pinned tile — so while the shell is closed the blit clip protects a strip one tile
+//! NARROWER than the one painted. A window dragged across the pinned tile's columns overwrites them
+//! for one pass; the dock's own clobber condition (`dock_scan` against `SLOT.rect()`, the painted
+//! rect) detects it and repaints — the pre-WCK5 self-heal, bounded to the closed-shell state. The
+//! erase clip and the desktop present are NOT affected (both read [`strip_rect`], which pins). The
+//! complete fix is one term in `wm::dock_tiles` (`+1` when no row is `KERNEL_OWNER_DESKTOP`); `wm.rs`
+//! is outside this arc's lane, so it is flagged rather than taken.
 
 use super::{ceramic, strip, theme, wm};
 
@@ -326,7 +351,50 @@ impl Layout {
 // State
 // ---------------------------------------------------------------------------
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+/// SHELLPIN — the pinned shell tile's synthetic window id.
+///
+/// Real ids are `1..=wm::MAX_WINDOWS` and `wm::WIN_NONE` is 0 — which is also [`PRESSED`]'s idle
+/// value, so a pinned tile carrying `WIN_NONE` would paint PRESSED on every quiet pass. `u32::MAX`
+/// collides with neither and can never name a live row, which is the point: a press that resolves to
+/// this id has nothing to raise and is the reopen request instead.
+const SHELL_PIN_ID: wm::WinId = wm::WinId::MAX;
+
+/// SHELLPIN — the reopen request, latched by [`press_at`] on the pinned tile and consumed by the
+/// render service (`main.rs`) with [`take_shell_reopen`] at the tail of the same event burst. A
+/// `swap` on both sides, so a double press before service is one reopen, not two — the "one live
+/// shell window max" rule, enforced at the latch as well as at the service.
+static SHELL_REOPEN: AtomicBool = AtomicBool::new(false);
+
+/// SHELLPIN — take (and clear) a pending shell-reopen request. See [`SHELL_REOPEN`].
+pub fn take_shell_reopen() -> bool {
+    SHELL_REOPEN.swap(false, Ordering::AcqRel)
+}
+
+/// SHELLPIN — append the PERMANENT shell tile to a scanned model, iff no live row already carries
+/// `wm::KERNEL_OWNER_DESKTOP` (one live shell window max — a live shell's REAL tile is its raise
+/// route and a second tile would be a second shell). Returns the new count. Applied by every reader
+/// of the model — [`compose`], [`press_at`], [`strip_rect`] — so painter, router and occlusion
+/// registry cannot disagree about the tile count.
+fn pin_shell(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+    if n >= wm::MAX_WINDOWS
+        || rows[..n].iter().any(|r| r.owner_asid == wm::KERNEL_OWNER_DESKTOP)
+    {
+        return n;
+    }
+    let mut e = wm::DockEntry::empty();
+    e.id = SHELL_PIN_ID;
+    e.owner_asid = wm::KERNEL_OWNER_DESKTOP;
+    e.title[..5].copy_from_slice(b"shell");
+    e.title_len = 5;
+    // `visible: false` — the closed shell is OFF the panel, so the pip takes the minimised ink
+    // (`theme::SCROLL_THUMB`), which is the honest state and the same read a parked window gives.
+    e.visible = false;
+    e.focused = false;
+    rows[n] = e;
+    n + 1
+}
 
 /// STRIPFACTOR — the tenant's registry hook: **the dock's rect on this panel, or `None`.**
 ///
@@ -339,6 +407,8 @@ pub fn strip_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     let mut tiles = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
     // A zero rect asks the damage question nothing; only the tile count is wanted here.
     let (n, _) = wm::dock_scan(&mut tiles, (0, 0, 0, 0));
+    // SHELLPIN — the registry must report the strip the painter will paint, pinned tile included.
+    let n = pin_shell(&mut tiles, n);
     Layout::for_panel(n, pw, ph).map(|l| l.rect())
 }
 
@@ -445,6 +515,9 @@ pub fn compose() -> bool {
     // Ask `wm` for the tile model AND the damage question in ONE table scan: "were any of the
     // windows that intersect the strip I last painted damaged in the pass that just ran?"
     let (n, clobbered) = wm::dock_scan(&mut rows, SLOT.rect());
+    // SHELLPIN — the permanent shell tile, appended before the signature so a shell close (the row
+    // vanishing, the pin appearing) is a MODEL change and repaints on its own.
+    let n = pin_shell(&mut rows, n);
     // WCK5 — one relaxed add on the pass that was clobbered, and nothing at all on the quiet pass.
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
@@ -700,6 +773,8 @@ pub fn press_at(x: i32, y: i32) -> bool {
     let (px, py) = (x as usize, y as usize);
     let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
     let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
+    // SHELLPIN — the router routes over the same pinned model the painter drew.
+    let n = pin_shell(&mut rows, n);
     let (pw, ph) = {
         let fb = *super::WRITER.lock();
         if !fb.is_ready() {
@@ -719,6 +794,18 @@ pub fn press_at(x: i32, y: i32) -> bool {
         return true; // the dock's own background: consumed, raises nothing.
     };
     let r = rows[t];
+    // SHELLPIN — the pinned tile names no row: nothing to raise, nothing to focus yet. Latch the
+    // reopen request for the render service (which owns the shell's Console/Screen/window id and is
+    // the one place a reopen can rebind them), and consume the press. Focus hand-back
+    // (`user_input_set_active(0)`) happens at the reopen itself, keyed to the NEW window.
+    if r.id == SHELL_PIN_ID {
+        SHELL_REOPEN.store(true, Ordering::Release);
+        serial_println!(
+            "[dock] press at ({},{}) tile={}/{} shell=pin -> reopen requested",
+            x, y, t, n
+        );
+        return true;
+    }
     let was_hidden = !r.visible;
     PRESSED.store(r.id, Ordering::Release);
     if crate::video::wm::is_kernel_owner(r.owner_asid) {
