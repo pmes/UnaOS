@@ -2421,6 +2421,51 @@ latent OOM panic that QEMU cannot catch. `Screen::new` still allocates infallibl
 correct for the boot-time PANEL screen (no display without it); any *window*-surface `Screen` must
 use `direct` (or a future fallible constructor) — never crash the machine to deliver a feature.
 
+#### SHELLWIN REOPEN — the pinned dock tile is the shell's way back (GR27, 2026-08-12)
+
+**The gap.** The shell window carries the normal control cluster, so the operator could close (or
+minimise) their only shell and lose it until reboot — the SHELLWIN review flagged it. The standing
+rule is *"closeable means build the reopen route, not withhold the button"*, and the operator's
+direction fixed the route: **the task bar, not the SHARD menu** (apps do not open from that menu) —
+the shell is PINNED to the dock permanently.
+
+* **The pinned tile (SHELLPIN, `video/dock.rs`).** `pin_shell` appends one synthetic tile (caption
+  `shell`, sentinel id `SHELL_PIN_ID = u32::MAX`, pip in the minimised ink) to the scanned model iff
+  no live row carries `wm::KERNEL_OWNER_DESKTOP`. Applied identically in `compose`, `press_at` and
+  `strip_rect`, so painter, router and the occlusion registry (erase clip, desktop present) see the
+  same strip. While the shell row is LIVE the model is unchanged: its real tile raises/focuses
+  through the ordinary kernel-owner press arm (`user_input_set_active(0)` + `focus_changed`), which
+  also un-parks a minimised shell. So the dock is byte-identical to before until the shell closes.
+* **The request seam.** A press on the pinned tile names no row; it latches `SHELL_REOPEN`
+  (consumed via `dock::take_shell_reopen`) and prints `[dock] press … shell=pin -> reopen
+  requested`. The press is routed inside the render service's own drain (`wc_route_event` →
+  `wc_click_route_at` → `dock::press_at`), so the service picks the flag up at the tail of the SAME
+  burst — no new event variant, no channel traffic, no extra wakeup.
+* **The reopen (`x86_render_service`, `main.rs`).** Two arms, one live shell window max. If the id
+  is still owned by `KERNEL_OWNER_DESKTOP` (scan-to-press race, or parked), it is raised, never
+  duplicated. Otherwise the window is rebuilt through the SAME fallible path as bring-up:
+  `open_shell_window` (`try_reserve_exact` decline → `[shellwin] DECLINE reason=alloc`) and
+  `Screen::direct` (never `Screen::new` for a window surface — the SHELLWIN-OOM rule above). The
+  whole shell tuple is rebound — store, `Screen`, `TargetPal` (one fresh `:: UI1:` line per
+  surface), `Console` (`mark_in_window`), and `shell_id` — so keystrokes route to the NEW window;
+  `user_input_set_active(0)` hands the keyboard back at the reopen. A DECLINE leaves the dead id in
+  place (presents stay owner-fenced) and the pinned tile on the dock for another try.
+* **Witness.** `[shellwin] reopen win=<id> route=dock == witness ::` on success;
+  `[shellwin] reopen route=dock already-live win=<id> raised` on the raise arm; the existing
+  `[shellwin] DECLINE` lines on failure.
+* **⚠ Bounded residual, flagged to the integrator.** `wm::occ_clip`'s per-window-blit dock term is
+  fed by `wm::dock_tiles` (a lock-free ROW count that cannot see the pinned tile), so while the
+  shell is closed the blit clip protects a strip one tile narrower than painted; a window dragged
+  across the pinned tile clobbers it for one pass and the dock's own clobber condition repaints it.
+  The complete fix is one term in `wm::dock_tiles` (+1 when no row is `KERNEL_OWNER_DESKTOP`) —
+  `wm.rs` is owned by concurrent arcs, so it is flagged rather than taken.
+
+**Gate results (2026-08-12).** `./arroyo check` and `UNAOS_WITNESS=1 UNAOS_WC=1 ./arroyo check`
+green both arches; `UNAOS_WC=1 ./arroyo esp-x86` then
+`strings -a target/x86_64_esp/kernel.elf | grep 'shellwin] reopen'` → both reopen lines present
+(reachable, not merely compiled). aarch64 / wc-off fold away: `dock.rs` is not compiled there and
+the reopen arm is `#[cfg(feature = "wc")]` inside the x86-only render service.
+
 #### Three smaller defects the same arc closes
 
 * **`create` now composites.** A window's kernel chrome reaches the panel when the row exists, not at the
