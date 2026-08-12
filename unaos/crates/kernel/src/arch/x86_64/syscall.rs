@@ -5567,6 +5567,18 @@ static CLICK_PRESS_TARGET: AtomicU64 = AtomicU64::new(CLICK_TARGET_DROP);
 static CLICK_PRESSES: AtomicU64 = AtomicU64::new(0);
 static CLICK_DELIVERED: AtomicU64 = AtomicU64::new(0);
 
+/// CLICK-REPRESS: stationary re-presses this router RECOVERED — a `Button(1)` whose primary bit was
+/// already set in [`CLICK_PREV_MASK`] because a RELEASE was polled-over and never reached this seam.
+/// Every one of these was a click SILENTLY DROPPED before this arc (Boot C: "clicks won't keep
+/// flowing — I have to move the mouse then click again"). Read the `[clickrepress]` witness below.
+static CLICK_REPRESS_X86: AtomicU64 = AtomicU64::new(0);
+
+/// CLICK-REPRESS: witness-line budget. A recovered re-press is a hand gesture and so human-rate by
+/// construction, but the cap is stated rather than assumed — a button that re-reports "down" after
+/// every quiet gap must not be able to bury the wire, exactly as [`CLOSE_LOG_MAX_X86`] guards the
+/// close line. The recovery itself is uncapped; only the serial line is.
+const CLICK_REPRESS_LOG_MAX_X86: u64 = 128;
+
 /// CLICK-X86: `(presses, delivered)` — every press edge the router judged, and how many of them were
 /// addressed to a ring-3 ring. The difference is the count of presses that belonged to the shell.
 pub fn click_stats() -> (u64, u64) {
@@ -6328,8 +6340,40 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
     };
     let prev = CLICK_PREV_MASK.swap(mask as u32, Ordering::Relaxed) as u8;
     let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
-    if mask & !prev != 0 {
-        // PRESS edge.
+    // CLICK-REPRESS — **a stationary re-press the level latch would otherwise swallow** (Boot C, the
+    // operator: "clicks won't keep flowing — I have to move the mouse then click again").
+    //
+    // `prev` is this router's own level latch, and it goes STALE the same way the HID `prev_buttons`
+    // latch did before CLICK-3. The trackpad is serviced at frame rate — orders of magnitude slower
+    // than its report interval — so a RELEASE that lands in the gap between two service passes is
+    // superseded by the pad's next level report and never reaches this seam. `prev` then stays
+    // primary-down for good, every subsequent stationary press fails the `mask & !prev` edge test
+    // below, and the click is dropped HERE, silently, with no `[clickroute]` line at all. Boot C's
+    // capture is the proof: 43 HID down-edges, 29 releases (14 polled-over), 31 routed presses.
+    //
+    // A wiggle "fixes" it only as a side effect: a motion report carries the button UP, which is what
+    // finally lets the HID release arm emit the missed `Button(0)` and clear this latch. That is the
+    // whole of the "move then click" workaround, and it is the symptom, not a second mechanism.
+    //
+    // The recovery is CLICK-3's, one layer up and on the identical contract: every pointer producer
+    // emits a `Button` ONLY on a genuine edge and de-dups a hold (EHCI's 120 ms quiet gate in
+    // `note_buttons`; xHCI on the down edge alone), so an identical PRIMARY-DOWN mask RE-REPORTED to
+    // this seam is a NEW press, never a hold. It is routed through the same press body — and
+    // `CLICK_PREV_MASK` is already `mask` from the swap above, so no consumer downstream ever sees the
+    // stale latch. A first press (`prev` primary-clear) still takes the ordinary edge test, and a
+    // multi-button change always moves the mask, so `mask == prev` isolates exactly the re-press.
+    let repress = mask & 0x01 != 0 && mask == prev;
+    if repress {
+        let n = CLICK_REPRESS_X86.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= CLICK_REPRESS_LOG_MAX_X86 {
+            serial_println!(
+                "[clickrepress] recovered stationary re-press mask={:#04x} at ({},{}) total={} == witness ::",
+                mask, x, y, n
+            );
+        }
+    }
+    if mask & !prev != 0 || repress {
+        // PRESS edge (or a recovered stationary re-press — see CLICK-REPRESS above).
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
         // CRYSTAL — **judged FIRST, ahead of the dock and every window arm.** The SHARD menu, when
         // open, is a modal dropdown composited on top of everything, so its press must be tested
