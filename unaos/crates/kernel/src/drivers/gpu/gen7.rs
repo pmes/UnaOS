@@ -2222,7 +2222,10 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
     let uniform_nonzero = uniform && fill != 0 && prev_nb == fill && next_nb == fill;
     let bdsm = crate::arch::pci::read_config_32(0, 0, 0, 0xB0);
     let bdsm_base = bdsm & 0xFFF0_0000;
-    let fill_wellformed = (fill & 1) != 0 && (fill & 0xFFFF_F000) != 0;
+    // REVIEW (R4b): bits 7:4 of a Gen7 PTE carry physical address 39:32 — a >4 GiB fill frame
+    // whose LOW 32 bits happen to match BDSM must not pass `fill_is_bdsm` (which compares only
+    // bits 31:12). Screening them here keeps the two legs consistent with the R1 census classifier.
+    let fill_wellformed = (fill & 1) != 0 && (fill & 0xFFFF_F000) != 0 && (fill & 0xF0) == 0;
     let fill_is_bdsm = (fill >> 12) == (bdsm_base >> 12);
     // Distant probes: far outside [CLAIM_FIRST, CLAIM_FIRST+COUNT], above the low slots the
     // firmware maps to its framebuffer (R1: slots 0..4096 carry incrementing frames; slot
@@ -2451,7 +2454,11 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
     // the GT a DMA path into reused kernel heap — so if the reversal did not verify we LEAK the
     // page (a one-shot, boot-time 4 KiB cost) rather than surrender a possibly-mapped frame.
     // This is the rung's own refuse-on-any-doubt discipline applied to its single free.
-    let freed = if clean {
+    // REVIEW (R4b): in scratch-fill mode the page is LEAKED even on a clean reversal — no GGTT
+    // TLB invalidation is issued by this rung, so a GT translation cached during the hold could
+    // in principle outlive a free and DMA into reused heap. 4 KiB, boot-once, refuse-on-any-doubt.
+    // Empty mode keeps the free it always had (same exposure as before this rung).
+    let freed = if clean && range_empty {
         dealloc(page, layout);
         true
     } else {
