@@ -4116,7 +4116,16 @@ impl<T> Mutex<T> {
             if prev <= 1 {
                 // Released our last PI lock: revert to base (no leak — the outermost release clears it).
                 let had = (*me).donated.swap(0, Ordering::AcqRel);
-                if had != 0 {
+                // The `active` gauge counts tasks whose EFFECTIVE priority was actually raised above
+                // base — exactly `note_inherit`'s `newly_active` condition (`eff_before == base` with a
+                // strictly higher donation). `donated` is monotonic-up until this swap, so `had > base`
+                // iff the boost ever crossed above base, i.e. iff this task was counted. Reverting on a
+                // bare `had != 0` over-fires: a donor whose priority is `<= base` (an ordinary LOWER
+                // waiter blocking on a higher-priority holder) still writes a sub-base floor through the
+                // unconditional `fetch_max` in `pi_donate` / `pi_acquire_after_block`, and that raise is
+                // NOT counted (`prio <= eff_before` returns before `note_inherit`). Counting its revert
+                // drives `active` NEGATIVE, masking a real leak — the one thing the gauge exists to show.
+                if had > (*me).priority {
                     crate::rtpi::note_revert();
                     // Lower this core's published priority back to base — we are running here.
                     let cpu = percpu::this_cpu().cpu_index as usize;
