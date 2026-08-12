@@ -5296,9 +5296,11 @@ fn steal_cooldown_ms(migrations: u32) -> u64 {
     STEAL_COOLDOWN_MS << migrations.min(STEAL_COOLDOWN_ESC_CAP)
 }
 
-/// VUGSPREAD-COOL: per-task steal candidates SKIPPED because they migrated within `STEAL_COOLDOWN_MS`.
-/// The brake's activity, and the direct counterweight to `STEAL_REMIGS`: a healthy post-fix capture
-/// reads this CLIMBING while `remig` stays near flat — the ping-pong being refused rather than served.
+/// VUGSPREAD-COOL: per-task steal candidates SKIPPED because they migrated within their ESCALATED
+/// window (`steal_cooldown_ms`, GR27 — 16ms doubling per re-steal to a 256ms cap). Boot B proved the
+/// old health reading backwards: a flat brake reads cool= CLIMBING (3.3k/s) while remig ALSO climbs
+/// (~540/s) — refusing and serving the same ping-pong. A healthy post-escalation capture reads
+/// cool= NEAR-FLAT after the settle transient, with remig/moves collapsed toward zero.
 /// A side counter like `STEAL_REMIGS`, outside the `e+f+p+d+i+moves == passes` invariant (a cooled
 /// task that leaves `steal_one` empty-handed still lands on `p`/[`STEAL_D_PINNED`], whose doc now names
 /// this case); this counts the per-task SKIPS inside the walk, which that pass-level tally cannot see.

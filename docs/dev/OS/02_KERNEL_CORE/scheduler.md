@@ -2219,7 +2219,8 @@ revert criterion above prescribes restoring `steal_floor` to the constant `STEAL
 stop the churn, but it also throws away the depth-1 rebalance this whole section exists to add — a
 parent+worker packed on one core with idle cores beside it would once again sit unbalanced. Instead,
 `Task::migrate_ms` stamps `arch::ms()` at each migration and `RunQueue::steal_one` refuses to take a
-task that migrated less than `STEAL_COOLDOWN_MS` (16 ms, ~16 quanta) ago:
+task that migrated less than its cooldown window ago (16 ms flat when this section was written —
+escalated per-task since GR27 Boot B, 16→256 ms doubling per re-steal; see the GR27 section below):
 
 - The **first** steal of any task is never delayed — a never-migrated task carries `migrate_ms == 0`,
   which always clears the window — so the depth-1 rebalance VUGSPREAD added fires exactly as before.
