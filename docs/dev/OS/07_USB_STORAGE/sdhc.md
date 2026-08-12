@@ -2358,43 +2358,39 @@ Boot B shows `boot_serial=0x00000000`, this case is guaranteed and the finding i
 :: wifi: firmware set COMPLETE 3/3 staged on source=sdhc … + source=global … ::
 ```
 
-> **OPEN DEFECT — the bench timing still starves the second pass (review, GR26; MAJOR). Narrowed,
-> not closed, by the `psrc-reconcile` arc.** `wifi::service` (`wifi/mod.rs`) is a forward-only state
-> machine: it runs `bus::census()` on one main-loop pass, then calls the staging entry on the FIRST
-> pass where `block::program_source()` is `Some`, and (after the WIFI-REARM retry budget) parks. On
-> the bench machine the internal card is registered synchronously inside `pci::init`
-> (`register_sdhc`), i.e. before the main loop runs at all — so `program_source()` is already
-> `Some(Sdhc)` on main-loop pass 1 and the staging entry fires there. The USB stick's
-> `publish_usb_geometry` happens many passes later, from the deferred SCSI bring-up. At the moment
-> the staging entry runs, `alternate_program_source()` is therefore `None`, so the two-volume
-> search's pass 2 finds no alternate handle to try. The observable signature is
+> **RESOLVED — WIFI-REACH (GR26) landed the second-handle wait.** The defect below is the
+> card-early / stick-late bench timing this section predicted; it is now closed in
+> `wifi/mod.rs` + `wifi/firmware.rs`, exactly as scoped in the deferral note that used to stand here.
+> The original analysis is retained for the record.
+>
+> **The defect (as predicted).** `wifi::service` (`wifi/mod.rs`) is a forward-only state machine: it
+> runs `bus::census()` on one main-loop pass, then calls the staging entry on the FIRST pass where
+> `block::program_source()` is `Some`. On the bench machine the internal card is registered
+> synchronously inside `pci::init` (`register_sdhc`), before the main loop runs at all — so
+> `program_source()` is already `Some(Sdhc)` on main-loop pass 1 and the staging entry fires there,
+> while the USB stick's `publish_usb_geometry` happens many passes later from the deferred SCSI
+> bring-up. Pre-WIFI-REACH, `alternate_program_source()` was therefore `None` at that first attempt,
+> the two-volume search's pass 2 found no alternate, and the module printed a terminal INCOMPLETE and
+> ran arc 2 an epoch before the stick could be looked at — signature
 > `:: wifi: firmware set INCOMPLETE 0/3 … on source=sdhc …` with **no** `searching the other
 > populated handle` line anywhere in the capture.
 >
-> **What the `psrc-reconcile` arc changed.** The two-volume search now lives INSIDE the WIFI-REARM
-> retry-aware entry (`firmware::stage_attempt`, not the pre-WIFI-REARM `stage_once`). So on any
-> configuration where BOTH handles are present at attempt time — a machine booted from the stick
-> (card registered early, so the alternate is already `Some` when the stick's staging entry runs),
-> or a re-attempt that happens to land after the stick enumerated — pass 2 fires correctly and the
-> widening is live. What remains dead is the *specific bench timing* above: card early, stick late,
-> and the staging entry settling (COMPLETE-or-INCOMPLETE on the card alone) before the stick's
-> handle appears.
->
-> **The fix is de-risked but was judged more-than-small for a reconciliation arc, so it was NOT
-> landed here.** Its mechanism is now verified sound: on x86 the USB storage-ready edge
-> (`block::set_usb_ready` → `take_usb_ready`) is raised by `publish_usb_geometry` when the stick
-> enumerates, and it has **no x86 consumer** — its only consumer, `fat::piusb27_service`, is
-> `#[cfg(target_arch = "aarch64")]`, and `wifi` is `#[cfg(all(feature = "wifi", target_arch =
-> "x86_64"))]`, so the two live on disjoint arches and cannot race. `wifi::service` may therefore
-> consume that edge freely. The reason it is still deferred: doing it without regressing the two
-> invariants both arcs rest on — *exactly one terminal verdict*, and *arc 2 runs once on a final
-> count* — requires a new `StageOutcome` arm (an incomplete-but-alternate-still-expected "pending"
-> that prints no terminal line) plus a bounded second-handle wait in `wifi/mod.rs` that holds the
-> terminal verdict and arc 2 until the edge fires or a deadline expires. That is a real state-machine
-> feature, not a one-liner. Landing it hastily would either print a premature INCOMPLETE that a later
-> pass contradicts, or run arc 2 on a count a late stick then moves — the exact hazards WIFI-REARM
-> was built to prevent. `block.rs` and `wifi/firmware.rs` need no further change for it; the whole
-> fix is in `wifi/mod.rs` plus the one new outcome arm in `firmware.rs`.
+> **The fix (WIFI-REACH).** `firmware::stage_attempt` takes a `commit` flag and gains a third
+> outcome, `StageOutcome::Pending`: incomplete, with no second handle present to search, printing
+> nothing terminal. On that outcome `wifi::service` moves `S_WAIT_STORAGE` → a new `S_WAIT_ALT` state
+> and HOLDS arc 2 and the terminal verdict until either the USB storage-ready edge fires
+> (`block::take_usb_ready()`, which has no other x86 consumer — its only consumer
+> `fat::piusb27_service` is `#[cfg(target_arch = "aarch64")]`, so the two live on disjoint arches and
+> cannot race) or a bounded deadline (`ALT_WAIT_MS` = 30 s) expires. On the edge the two-volume
+> search re-runs with the stick as the alternate and settles COMPLETE; on the deadline a committing
+> attempt (`commit == true`, which never returns `Pending`) forces the honest INCOMPLETE and arc 2
+> refuses on the starved count exactly as before. Both invariants hold by construction — exactly one
+> terminal verdict (the committing attempt always prints it; `Pending` prints nothing), and arc 2
+> runs once on a final count (only from `finish_and_park`, never on a `Pending`/`Retry`). The state
+> machine stays strictly forward-only: `S_START` → `S_WAIT_STORAGE` → `S_WAIT_ALT` → `S_PARKED`. The
+> upload refusal at `B43_SHM_UCODE` is untouched. `block.rs` needed no change (the edge already
+> existed); the whole fix is in `wifi/mod.rs` plus the one new outcome arm in `firmware.rs`. The
+> expected capture with the stick carrying the blobs is in `wifi_bcma.md` (WIFI-REACH section).
 
 ### 13.8 Gates
 

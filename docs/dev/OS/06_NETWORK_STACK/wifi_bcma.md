@@ -131,6 +131,7 @@ classifies its own failure:
 | `Settled` | the volume mounted and every role got its verdict — **or** the mount failed for a reason a later pass cannot change (`NotFat`, `Unsupported`, a corrupt chain) | prints nothing more; runs arc 2; parks |
 | `Retry(stage)`, budget left | mount or root-directory read failed with `NoDisk`/`Io`/`Busy` | backs off `STAGE_BACKOFF_MS` = 1 s, re-checks the handle from the top, re-attempts; up to `MAX_STAGE_ATTEMPTS` = 8. Does **not** run arc 2 — the count is still moving |
 | `Retry(stage)`, budget spent | the 8th attempt also deferred | prints the give-up line; the deferral is now terminal, so `staged_count()` (0) is final; runs arc 2; parks |
+| `Pending` (WIFI-REACH) | every volume present was searched, the set is incomplete, and **no second handle** existed to search | prints nothing terminal; moves to `S_WAIT_ALT` and holds arc 2 for a late second volume — see below |
 
 A volume that is not FAT now will not be FAT in two seconds, so those variants stay terminal;
 retrying them would be a spin dressed up as diligence. Both `Retry` arms sit **above** the
@@ -199,6 +200,81 @@ A boot whose volume is present at the first check prints **no** arrival line and
 that saw it — the pre-WIFI-REARM timing, unchanged, because `NEXT_ATTEMPT_MS` is 0 until an attempt
 actually defers.
 
+## WIFI-REACH — the SECOND-handle wait, so a late stick is actually searched
+
+WIFI-REARM waits for the FIRST volume, the program source. PSRC then widened the firmware search to a
+SECOND volume — the other populated handle — so that b43 blobs the user carries on a USB stick are
+found even when the boot volume is the internal card. But that second pass only fires when BOTH
+handles are present at attempt time, and on the bench they are not: the internal SD card is registered
+synchronously inside `pci::init`, before the main loop runs, so `program_source()` is already
+`Some(Sdhc)` on main-loop pass 1 and the staging entry fires there — while the USB stick enumerates
+many passes later, from the deferred SCSI bring-up. At that first attempt `alternate_program_source()`
+is `None`, pass 2 finds no alternate, and the pre-WIFI-REACH code printed a terminal INCOMPLETE and
+ran arc 2 an epoch before the stick could be looked at. That is the OPEN DEFECT `sdhc.md` §13.7 named
+(card-early / stick-late), and WIFI-REACH closes it.
+
+**The mechanism.** `stage_attempt` takes a `commit` flag and gains a third outcome:
+
+| outcome | when | what the caller does |
+| --- | --- | --- |
+| `Pending` | `commit == false`, the set is incomplete, and **no** alternate handle was present to search | prints nothing terminal; `service` moves `S_WAIT_STORAGE` → `S_WAIT_ALT` and holds arc 2 |
+
+On the committing attempt (`commit == true`) the verdict is FORCED — COMPLETE or INCOMPLETE — so
+`Pending` is never the last word. In `S_WAIT_ALT` the module holds until either:
+
+* the **USB storage-ready edge** fires — `block::set_usb_ready()` is raised by
+  `publish_usb_geometry` when the stick enumerates, and `block::take_usb_ready()` consumes it. That
+  edge has NO other x86 consumer (its only consumer, `fat::piusb27_service`, is
+  `#[cfg(target_arch = "aarch64")]`, and `wifi` is x86-only), so the two live on disjoint arches and
+  cannot race — `wifi::service` consumes it freely. On the edge the two-volume search re-runs, now
+  with the stick as the alternate, and settles; or
+* a **bounded deadline** `ALT_WAIT_MS` = 30 s expires — past the ~34 s at which Boot D's xHCI had
+  already reported it enumerated nothing — at which point the committing attempt forces the honest
+  INCOMPLETE and arc 2 runs on the (still starved) count, refusing exactly as before.
+
+The state machine stays strictly forward-only: `S_START` → `S_WAIT_STORAGE` → `S_WAIT_ALT` →
+`S_PARKED`, no step back, no path out of `S_PARKED`. The two invariants both prior arcs rest on hold
+by construction: **exactly one terminal verdict** (the committing attempt always prints it, `Pending`
+prints nothing) and **arc 2 runs once on a final count** (only from `finish_and_park`, never on a
+`Pending`/`Retry` that is still moving). The upload refusal at `B43_SHM_UCODE` in arc 2 (R7) is
+untouched — WIFI-REACH changes only WHEN the terminal verdict is reached, never what arc 2 does.
+
+### Expected witness chain — the bench, stick carrying the blobs
+
+The whole point of the arc: dropping the three blobs on a USB stick and booting from the card now
+finds and stages them, no re-flash of the boot card.
+
+```
+:: wifi: radio SELECTED 04:00.0 … cross-check=PASS … ::
+:: wifi: ucode ABSENT — none of ucode29_mimo.fw|UCODE29.FW|B43.FW in /, /B43/, /FIRMWARE/ on source=sdhc … ::
+:: wifi: initvals ABSENT — … on source=sdhc … ::
+:: wifi: bsinitvals ABSENT — … on source=sdhc … ::
+:: wifi: firmware set INCOMPLETE on the program source and NO second populated handle present yet — HELD up to 30000ms for a late-publishing volume (e.g. a USB stick carrying the b43 set); terminal verdict and arc 2 DEFERRED until its storage-ready edge fires or the deadline expires ::
+:: wifi: second-handle wait n=1/6 — set still incomplete, no alternate handle yet (handles=global=absent sdhc=present); ~20000ms until the terminal verdict is forced ::
+:: wifi: second-handle wait — USB storage-ready edge fired (handles=global=present sdhc=present); re-running the two-volume firmware search for the missing roles ::
+:: wifi: firmware set incomplete on the program source (0/3) — searching the other populated handle (source=global) for the missing roles; READ-ONLY, and a role already staged is never replaced ::
+:: wifi: ucode STAGED /B43/ucode29_mimo.fw bytes=… on source=global label='…' fp=… ::
+:: wifi: initvals STAGED … on source=global … ::
+:: wifi: bsinitvals STAGED … on source=global … ::
+:: wifi: firmware set COMPLETE 3/3 staged on source=sdhc … + source=global … ::
+:: wifi2: begin — arc 2: map BAR0, walk the EROM … ::
+… the normal arc-2 chain through its one `end` line …
+```
+
+If the stick never appears, the hold heartbeats to the deadline and then commits the honest verdict:
+
+```
+:: wifi: firmware set INCOMPLETE on the program source and NO second populated handle present yet — HELD up to 30000ms … ::
+:: wifi: second-handle wait n=1/6 — … ~20000ms until the terminal verdict is forced ::
+… up to n=6/6 or the deadline …
+:: wifi: firmware set INCOMPLETE 0/3 staged (0 rejected) on source=sdhc … — missing: ucode(…), initvals(…), bsinitvals(…) — parked, radio stays down ::
+:: wifi2: begin … ::  (arc 2 refuses on the starved count, exactly as before)
+```
+
+A boot where BOTH handles are already present at the first attempt (e.g. booted from the stick, card
+registered early) never enters `S_WAIT_ALT` — pass 2 fires on the first attempt and the verdict is
+terminal there. `Pending` is specific to the incomplete / no-second-handle-yet case.
+
 ## The knobs
 
 `UNAOS_WIFI=1` arms the `wifi` Cargo feature (arc 1). Default **OFF** — the module and its three call
@@ -214,7 +290,7 @@ to isolate a regression — without arming a single write.
 | Place | Entry |
 | --- | --- |
 | `unaos/crates/kernel/Cargo.toml` | `wifi2 = ["wifi"]` |
-| `unaos/crates/kernel/src/wifi/mod.rs` | `#[cfg(feature = "wifi2")] pub mod bringup;` + the one call, after a SETTLED `stage_attempt()` |
+| `unaos/crates/kernel/src/wifi/mod.rs` | `#[cfg(feature = "wifi2")] pub mod bringup;` + the one call, from `finish_and_park` — reached only on a terminal `stage_attempt` outcome, never on `Pending`/`Retry` |
 | `unaos/arroyo` (feature mapping) | `UNAOS_WIFI2=1` → `wifi2` **alone** — the Cargo implication pulls `wifi` in, and pushing both would put a duplicate in the comma list the `arm_features` strip rewrites textually |
 | `unaos/arroyo` (`arm_features`) | stripped for aarch64, same argument as `wifi`'s |
 | `unaos/arroyo` (`KERNEL_CFG_MATRIX`) | appended to the `x86-all` leg |
@@ -224,15 +300,17 @@ The builder wiring is not optional, for the reason §4 gives and this arc inheri
 bring-up that silently did not run is indistinguishable on the wire from a radio that would not
 answer — and that is precisely the conclusion the ladder's next decision would then rest on.
 
-**Where arc 2 runs, and the one boot it never reaches.** `bringup_once()` is called from inside the
-same forward-only step as the staging pass, immediately after a `Settled` `stage_attempt()`, so
-`staged_count()` is settled before the completeness gate reads it. A `Retry` outcome does NOT reach
-arc 2 — the count is still moving. The consequence, stated rather than discovered later: a boot where
-the program-source block device never appears waits in `S_WAIT_STORAGE` and never reaches arc 2 at
-all. Since WIFI-REARM that wait is visible (the heartbeats above) rather than silent, and the
-alternative — walking the backplane on a timer while storage is still enumerating — is still refused,
-because it would put a window write in a race with the very pass that decides whether an upload may
-follow.
+**Where arc 2 runs, and the one boot it never reaches.** `bringup_once()` is called from
+`finish_and_park`, the shared terminal of `S_WAIT_STORAGE` and `S_WAIT_ALT`, reached only on a
+`Settled` outcome or a `Retry` budget exhausted — so `staged_count()` is final before the
+completeness gate reads it. Neither a `Retry` (count still moving) nor WIFI-REACH's `Pending` (a
+second volume may still arrive) reaches arc 2. The consequence, stated rather than discovered later:
+a boot where the program-source block device never appears waits in `S_WAIT_STORAGE` and never
+reaches arc 2 at all; a boot where the program source is short and a second handle never appears
+waits in `S_WAIT_ALT` up to `ALT_WAIT_MS` and then commits its INCOMPLETE. Since WIFI-REARM/REACH
+those waits are visible (the heartbeats above) rather than silent, and the alternative — walking the
+backplane on a timer while storage is still enumerating — is still refused, because it would put a
+window write in a race with the very pass that decides whether an upload may follow.
 
 Arc 1's own wiring, unchanged:
 
