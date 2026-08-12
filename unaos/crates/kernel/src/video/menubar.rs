@@ -49,12 +49,14 @@
 //! | title, left of crystal | the FOCUSED window's caption, via `wm::dock_scan` | [`theme::TITLE_TEXT_ACTIVE`] |
 //! | clock, right | [`crate::clock::try_unix_now`], UTC `HH:MM` | [`theme::TITLE_TEXT_INACTIVE`] |
 //!
-//! **It is INERT.** There is no press seam: this module registers nothing with the click router, so a
-//! press on the bar — the crystal included — falls through to whatever is behind it. That is stated on
-//! the witness line (`press=inert`) so a dead press is not misread as a routing defect — it is the
-//! absence of a feature, not the failure of one. Opening menus is the protocol arc's job, and a
-//! crystal MENU (a press on the mark) is a later arc; the design ledger at the foot of this file is
-//! what both will be built from.
+//! **The bar's one press target is the CRYSTAL.** This module still registers nothing with the click
+//! router itself; the SHARD menu ([`super::crystal`]) claims the crystal box through the router's
+//! menu-band arm, and every other point on the bar falls through to whatever is behind it. The
+//! witness line says so (`press=crystal`) — it read `press=inert` from the arc when the bar had no
+//! press seam at all, and that stale word survived into GR27, where it was read as "press routing
+//! latched off" during an investigation whose real defect was elsewhere. A witness term must track
+//! the code it describes. Opening APP menus is still the protocol arc's job; the design ledger at
+//! the foot of this file is what it will be built from.
 //!
 //! # The crystal — UnaOS's mark, where macOS puts its apple
 //!
@@ -439,7 +441,7 @@ pub fn compose() -> bool {
         None => 0,
     };
     LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
-    LEDGER.tick("menubar", format_args!("press=inert crystal={}x{} toggles={} off_passes={}",
+    LEDGER.tick("menubar", format_args!("press=crystal crystal={}x{} toggles={} off_passes={}",
         CRYSTAL_W, CRYSTAL_H, TOGGLES.load(Ordering::Relaxed), OFF_PASSES.load(Ordering::Relaxed)));
 
     if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(rect) {
@@ -616,7 +618,7 @@ pub fn rollup(scope: &str) {
         "menubar",
         scope,
         format_args!(
-            "press=inert crystal={}x{} toggles={} off_passes={}",
+            "press=crystal crystal={}x{} toggles={} off_passes={}",
             CRYSTAL_W,
             CRYSTAL_H,
             TOGGLES.load(Ordering::Relaxed),
@@ -750,7 +752,7 @@ pub fn selftest() {
     let (rx, ry, rw, rh) = r.unwrap_or((0, 0, 0, 0));
     serial_println!(
         ":: MENUBAR: bar={}x{}+{}+{} panel={}x{} floor={}x{} strips={}->{} owned={:#x} clock={} \
-         crystal={}x{}+{}+{} initial={} press=inert default_off={} clip_clean={} flush={} \
+         crystal={}x{}+{}+{} initial={} press=crystal default_off={} clip_clean={} flush={} \
          member={} floor={}/{} dismissed={} crystal_ok={} :: {} ::",
         rw, rh, rx, ry, pw, ph, FLOOR_W, FLOOR_H, n_off, n_on, owned, clock,
         cbw, cbh, cbx, cby, initial,
