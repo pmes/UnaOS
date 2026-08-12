@@ -1000,6 +1000,12 @@ pub fn selftest() {
     // the table too, so the assertions are made about OUR ids rather than about the total.
     let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
     let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
+    // SHELLPIN — the fixture routes over the PINNED model, because the router does (the module's
+    // founding law: painter and router share the accessor, and this fixture is what asserts it).
+    // On a witness gate no KERNEL_OWNER_DESKTOP row exists (wcx never activates without a Kepler),
+    // so the raw count is one tile short of the strip press_at lays out: every boundary shifts, the
+    // probe centre lands off its tile — and can land ON the pin tile, latching a spurious reopen.
+    let n = pin_shell(&mut rows, n);
     let mine: [Option<usize>; 3] = [
         rows[..n].iter().position(|r| r.id == w[0]),
         rows[..n].iter().position(|r| r.id == w[1]),
