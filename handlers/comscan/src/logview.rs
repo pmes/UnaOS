@@ -31,7 +31,7 @@
 //! bounds are hard — the ring never grows past its cap — and both count what
 //! they drop so a truncated view says so.
 
-use bandy::state::{LogLine, LogSource};
+use bandy::state::{LogLine, LogSource, LogViewState};
 use bandy::LogEvent;
 use std::collections::VecDeque;
 
@@ -148,6 +148,24 @@ impl LogView {
     /// The filtered scrollback snapshot, oldest→newest, that the view renders.
     pub fn snapshot(&self) -> Vec<LogLine> {
         self.ring.iter().filter(|l| self.matches(l)).cloned().collect()
+    }
+
+    /// Snapshot this view as a serializable [`LogViewState`] — the payload a
+    /// `bandy::state::ViewEntity::Console` pane carries. This is the seam that
+    /// composes the Console app *onto glass*: a vessel takes this snapshot,
+    /// wraps it in `ViewEntity::Console`, and the Qt/GTK tetra bridge
+    /// (`quartzite::tetra::ConsoleTetra::from_log_view`) renders it read-only,
+    /// running each line through Tabula's sanitizer. The `lines` are the same
+    /// filtered scrollback [`snapshot`](Self::snapshot) the `LogTail` carries,
+    /// so what a subscriber renders live and what a fresh pane opens with agree.
+    pub fn view_state(&self) -> LogViewState {
+        LogViewState {
+            lines: self.snapshot(),
+            filter: self.filter.clone(),
+            source: self.source.clone(),
+            paused: self.paused,
+            dropped: self.dropped,
+        }
     }
 
     /// The render message for the bus: the filtered snapshot plus the honest

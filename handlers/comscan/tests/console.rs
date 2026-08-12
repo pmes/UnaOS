@@ -142,6 +142,31 @@ fn source_select_facets_by_subsystem() {
     assert_eq!(v.snapshot().len(), 3);
 }
 
+/// `view_state` is the Console-pane snapshot the vessel wraps in
+/// `ViewEntity::Console`. It must agree with the live tail: the SAME filtered
+/// lines, and the same eviction/pause/filter/source state — so a freshly
+/// summoned pane and a live subscriber never disagree about what the log says.
+#[test]
+fn view_state_snapshot_agrees_with_the_live_tail() {
+    let cap = 4;
+    let mut v = LogView::new(cap);
+    for i in 0..(cap + 3) {
+        v.ingest("info", if i % 2 == 0 { "kernel" } else { "net" }, format!("line-{i}"));
+    }
+    v.set_source(LogSource::Subsystem("kernel".into()));
+    v.set_paused(true);
+
+    let vs = v.view_state();
+    // The lines match the filtered snapshot exactly.
+    assert_eq!(vs.lines, v.snapshot());
+    assert!(vs.lines.iter().all(|l| l.source == "kernel"));
+    // Bounded-ring honesty and the active query ride along.
+    assert_eq!(vs.dropped, v.dropped());
+    assert!(vs.paused);
+    assert_eq!(vs.source, LogSource::Subsystem("kernel".into()));
+    assert_eq!(vs.filter, "");
+}
+
 // ── Bus round-trip through `serve` ──────────────────────────────────────────
 
 /// Pull LogTails off `rx` until one arrives whose lines satisfy `want`, or time

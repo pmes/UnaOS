@@ -5931,6 +5931,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sourceview5",
+ "tabula",
  "tokio",
 ]
 
@@ -7896,6 +7897,7 @@ dependencies = [
  "async-channel",
  "aule",
  "bandy",
+ "comscan",
  "elessar",
  "glib",
  "gneiss_pal",
