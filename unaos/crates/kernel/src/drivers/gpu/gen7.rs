@@ -24,6 +24,18 @@
 //!   release **verified against the entry value**, and re-reads the same 17-register battery
 //!   under each hold. It writes **two registers at most, one at a time**, both in the GT
 //!   power/PM block, neither in a ring block, neither in a display block.
+//! * **R4 (`claim`)** — the GGTT-claim / ring-buffer-address rung. It reads R3's verdict and
+//!   branches: if R3 woke the GT it reads the RCS ring block, verifies a candidate GGTT
+//!   window is entirely unowned (every pre-image zero), and then performs **one reversible
+//!   PTE round-trip** — write a well-formed PTE (a real translated scratch page, not a magic
+//!   number) into the first slot of the verified-empty window, read back the `0 → pte`
+//!   transition, verify the neighbours did not smear, restore the whole touched
+//!   neighbourhood to zero and verify it. If R3 did NOT wake the GT (`Dark` — the outcome
+//!   Boot D's `gt-still-dark` makes most likely) it writes **nothing**: it runs the identical
+//!   read-only census and reports `verdict=gated-on-wake` loudly, so the rung still produces a
+//!   verdict and moves the GEN7-vs-Kepler question rather than silently doing nothing behind a
+//!   closed well. The one write path is gated on `GtWake::reachable()`; a closed well is never
+//!   written behind.
 //!
 //! ## The structural promise
 //!
@@ -32,8 +44,11 @@
 //! 1. R1 writes nothing; R2 writes only three GT **power-management** registers
 //!    (`INSTPM 0x2050`, `RCS_WAKE 0x2700`) and re-parks `INSTPM` before it returns; R3 writes
 //!    only the two **forcewake request** registers (`0x0A188`, `0x1300B0`) and releases each
-//!    back to its entry value in the same rung — no GGTT
-//!    entry, no ring register, nothing in a display block. ⚠ Stated precisely, because the
+//!    back to its entry value in the same rung. R4 writes **at most three GGTT PTEs** — and
+//!    only on the woke branch, only into a window every slot of which it first read as zero,
+//!    and all three restored to zero and re-read before it returns; on the dark branch R4
+//!    writes nothing at all. No rung writes a GGTT entry that was not zero, a ring register,
+//!    or anything in a display block. ⚠ Stated precisely, because the
 //!    loose version of this sentence was wrong: **the one display-block offset this file
 //!    touches is read, never written, in either rung.** That offset is `PCH_PP_CONTROL`
 //!    (`0xC7204`) — a South Display Engine Panel Power Sequencer register, and unambiguously
@@ -100,6 +115,12 @@
 // without an import, exactly as in `igpu.rs` next door — importing it makes the name
 // ambiguous with the macro-namespace prelude entry.
 #![cfg(target_arch = "x86_64")]
+
+// R4's reversible GGTT claim allocates a single 4 KiB scratch page, translates it to a
+// physical frame, and programs a PTE that maps it — the same allocator and translate walk
+// `igpu::bring_up_blt_ring` uses for the ring page, so the PTE value is a real address, not a
+// fabricated constant. The page is freed before `claim` returns.
+use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 
 /// Register offsets into BAR0 (GTTMMADR) of BDF `0:2.0`, each tagged with its pin status.
 ///
@@ -1258,6 +1279,43 @@ pub unsafe fn wake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
 // request is made, and nothing in a display block is written — the panel is the Kepler's
 // regardless (`igpu.rs` ~778, Boot AS).
 
+/// What R3 concluded about the GT power well, handed to R4 so it branches on a real verdict
+/// rather than re-deriving one. R4's entire safety argument is that it does **not** write GGTT
+/// PTEs behind a closed well, and `reachable()` is the single gate on the one write path in the
+/// rung: `Dark` — the outcome Boot D's `gt-still-dark` makes most likely — routes R4 to a
+/// read-only recon that still produces a verdict.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GtWake {
+    /// R3 saw the well open: an ack transition AND real battery motion (`gt-woke`).
+    Woke,
+    /// The battery lit under a hold whose ack never asserted (`gt-woke-noack`): the GT block is
+    /// reachable, the ack register is simply not where we looked.
+    WokeNoAck,
+    /// The battery was already live before any write (`gt-live-already`, G1 false on this part):
+    /// the well was never closed.
+    LiveAlready,
+    /// No wake — `fw-no-ack` / `fw-acked-gt-dark` / `both-req-preheld` / any R3 refusal. The GT
+    /// block is gated (or its state is unknown), and R4 must not write behind it.
+    Dark,
+}
+
+impl GtWake {
+    /// May R4 attempt its one reversible GGTT write? Only on positive R3 evidence that the GT
+    /// block is reachable. `Dark` is a hard no — that is the structural promise that a closed
+    /// well is never written behind, expressed as a single boolean the write path is gated on.
+    fn reachable(self) -> bool {
+        matches!(self, GtWake::Woke | GtWake::WokeNoAck | GtWake::LiveAlready)
+    }
+    fn name(self) -> &'static str {
+        match self {
+            GtWake::Woke => "gt-woke",
+            GtWake::WokeNoAck => "gt-woke-noack",
+            GtWake::LiveAlready => "gt-live-already",
+            GtWake::Dark => "dark",
+        }
+    }
+}
+
 /// The always-on / power-frame registers R3 reads in **every** column. None of these is in
 /// `GT_BATTERY`, and R3 writes exactly two of them (the two request registers), which is why
 /// each row carries whether it is a written row.
@@ -1579,7 +1637,11 @@ unsafe fn try_candidate(
 /// registers `0x0A188` and `0x1300B0` — one candidate at a time, releasing each in-rung and
 /// verifying the release against the entry value. It writes no ring register, no GGTT entry
 /// and no display register.
-pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
+///
+/// Returns the wake reading as a `GtWake` so R4 (`claim`) branches on R3's real verdict rather
+/// than re-deriving one. The two parachutes return `GtWake::Dark` — a refused rung has, by
+/// definition, no evidence the well is open, and R4's write path must stay closed on it.
+pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) -> GtWake {
     serial_println!(
         ":: gen7: r3 begin rung=R3 mode=write cands=2 bdf={}:{}.{} bar0_size={} ladder=GEN7-3D ::",
         bus,
@@ -1592,7 +1654,7 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
     if bar0 == 0 {
         serial_println!(":: gen7: r3 verdict=refused-no-bar0 — BAR0 unpublished; no write attempted ::");
         serial_println!(":: gen7: r3 end ::");
-        return;
+        return GtWake::Dark;
     }
     // The highest offset R3 touches is RENFW_ACK (0x1300B4); the battery reaches BCS_UHPTR
     // (0x22134). Checked against the size we were GIVEN, before any write, exactly as R2's
@@ -1606,7 +1668,7 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
             MAX_OFF
         );
         serial_println!(":: gen7: r3 end ::");
-        return;
+        return GtWake::Dark;
     }
 
     // Bounded ack budget. Deliberately smaller than R2's `POLL_MAX`: R3 may run this poll
@@ -1872,4 +1934,370 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
         }
     );
     serial_println!(":: gen7: r3 end ::");
+
+    // Hand R4 the wake reading. The mapping is the verdict ladder above, condensed to the one
+    // distinction R4 acts on: is the GT block reachable enough to attempt a single reversible
+    // GGTT write, or must R4 stay read-only? `gt-woke` / `gt-woke-noack` / `gt-live-already`
+    // are the three arms with positive evidence of a reachable GT; everything else — including
+    // `fw-acked-gt-dark` (the well acked but the ring block stayed gated) — is `Dark`.
+    match verdict {
+        "gt-woke" => GtWake::Woke,
+        "gt-woke-noack" => GtWake::WokeNoAck,
+        "gt-live-already" => GtWake::LiveAlready,
+        _ => GtWake::Dark,
+    }
+}
+
+// ===================================================================================
+// R4 — the GGTT claim. The read-only-then-reversible setup toward command submission.
+// ===================================================================================
+//
+// ## What R4 is, in one paragraph
+//
+// The ring the render/blitter engine reads its commands from lives in the GGTT (draft G5:
+// engine-visible addresses are GGTT offsets), so the first thing any command-submission path
+// needs is a GGTT page it may safely own. R4 answers "can we claim a GGTT page, reversibly,
+// on this part?" It is the rung the draft calls "R4 (drafted as R3) — can we claim GGTT pages
+// safely?" (§5), sharpened by the GR26 brief into a rung that **reads R3's verdict and
+// branches**, so it is correct whether or not the forcewake acquire opened the well.
+//
+// ## The two branches, and why each is decisive
+//
+//  * **R3 woke the GT (`GtWake::reachable()`).** R4 reads the RCS ring block (identifying the
+//    four registers command submission will program — G3, IVB-PINNED), verifies a candidate
+//    GGTT window is entirely unowned (every pre-image and both bracketing neighbours read
+//    zero), and then performs ONE reversible PTE round-trip on the first slot: write a
+//    well-formed PTE, read back the `0 → pte` transition, check the neighbours did not smear,
+//    restore the whole touched neighbourhood to zero, and re-read to prove it. This is the
+//    draft's read-only refusal law (§5, "refuse any range whose pre-images are not all zero")
+//    plus the single write the GR26 brief asks for — a real dark→live→dark transition on a
+//    page-table entry, under R3's exact discipline (entry image, reversible, restore-verify).
+//  * **R3 did NOT wake the GT (`GtWake::Dark`).** This is the outcome Boot D's R2
+//    `gt-still-dark` makes most likely, and R4 must not blindly write GGTT PTEs behind a
+//    closed well. So it runs the IDENTICAL read-only census — the ring block and the candidate
+//    window's pre-images — and reports `verdict=gated-on-wake` loudly, writing nothing. The
+//    rung still produces a verdict (what the GGTT and ring registers read through the closed
+//    well) and moves the GEN7-vs-Kepler question, rather than being a witness that silently
+//    does nothing.
+//
+// ## Wall D, and the honesty of the transition witness
+//
+// A powered-down or gated GGTT window may read `0x00000000` for everything (draft §4.4). So
+// the write path's success is NOT "we wrote a PTE" — it is `slot_held == pte`, a specific
+// non-zero value only our write could have put there, read back from a slot whose pre-image we
+// verified was zero. If the GGTT is gated even on a woken GT (the well is held for the render
+// domain but the GGTT needs it too, or R3 released it — see below), `slot_held` stays zero,
+// `landed=0`, and the rung prints `verdict=claim-write-void` — an honest reading, not a
+// success. The neighbour-smear check is the tree's own (`igpu.rs` ~869-885), reused verbatim
+// in intent: a store that bleeds into an adjacent PTE is a silent corruption, so "unchanged"
+// is verified on both the held and the restored reads, never asserted.
+//
+// ## Forcewake is RELEASED here, deliberately, and the rung says so
+//
+// R3 releases both forcewake requests on every exit path (its reversibility contract), so R4
+// runs with the well NOT held. That is the correct test: the GGTT PTE array (GTTMMADR, BAR0 +
+// 2 MiB) is documented as memory-interface state, and Intel's own CHV note scopes the
+// well-alive requirement to "access outside shadow register space" — GGTT PTEs are plausibly
+// inside it. So the EXPECTED woke-branch result is `claim-roundtrip-ok` with the well released.
+// If instead the round-trip is `claim-write-void`, that is a real finding — the GGTT needs the
+// well held — and it reassigns the write into the wake's scope for R5, rather than being
+// mistaken for a dead engine. Either way R4 does not re-hold forcewake: acquiring it is R3's
+// job and re-implementing it here would duplicate the exact code the lane keeps in one place.
+//
+// ## Reversibility — three PTEs, all into a verified-zero window, all restored
+//
+// The only writes R4 ever makes are on the woke branch, into a window it first read as
+// entirely zero, and they are undone before the rung returns: it writes the PTE to the target
+// slot and (on the restore) zero to the target and both neighbours — every one of which was
+// verified zero at entry, so writing zero to a neighbour is an identity, and writing the PTE
+// then zero to the target is a clean undo. The final read of all three proves `restored`. No
+// clock, no RC6/RPS policy, no voltage/frequency request, and nothing in a display block is
+// written — the panel is the Kepler's regardless (`igpu.rs` ~778, Boot AS).
+
+/// The candidate GGTT window R4 inspects and (on the woke branch) claims one slot of.
+///
+/// `CLAIM_FIRST` is a slot well inside the derived 524288-entry array and clear of the low
+/// slots firmware tends to populate; `CLAIM_COUNT` is a ring page plus a scratch-surface
+/// margin, matching the draft's "large enough for a ring (1 page) AND for a scratch surface
+/// (say 64 pages)". The choice is only ever decisive because it is REFUSED unless every
+/// pre-image in the window — and both bracketing neighbours — reads zero: an owned window is
+/// named and skipped, never overwritten.
+const CLAIM_FIRST: usize = 0x40000; // slot 262144 — mid-array; an R1 GGTT-census sample point
+const CLAIM_COUNT: usize = 64; // 1 ring page + 63 scratch pages
+
+/// GEN7 rung R4 — inspect the GGTT and, if R3 woke the GT, claim one page reversibly.
+///
+/// Called from `igpu::init` immediately after `forcewake` (R3) and still BEFORE
+/// `bring_up_blt_ring`, taking R3's `GtWake` verdict so it branches on real evidence.
+///
+/// # Safety
+/// Same contract as `recon` / `wake` / `forcewake`: `bar0` is a live MMIO mapping of at least
+/// `bar0_size` bytes of the IGD's BAR0. R4 writes at most three GGTT PTEs, only when
+/// `wake.reachable()`, only into a window every slot of which it first read as zero, and it
+/// restores all three to zero and re-reads before returning. It writes no ring register and no
+/// display register.
+pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, wake: GtWake) {
+    serial_println!(
+        ":: gen7: r4 begin rung=R4 wake={} reachable={} bdf={}:{}.{} bar0_size={} ladder=GEN7-3D ::",
+        wake.name(),
+        if wake.reachable() { 1 } else { 0 },
+        bus,
+        slot,
+        func,
+        bar0_size
+    );
+
+    // ---- Parachutes, identical discipline to R1/R2/R3 ---------------------------------
+    if bar0 == 0 {
+        serial_println!(":: gen7: r4 verdict=refused-no-bar0 — BAR0 unpublished; no read or write attempted ::");
+        serial_println!(":: gen7: r4 next=STOP-bar0-unpublished-fix-igpu-init-mapping-first note=no-ggtt-touched ::");
+        serial_println!(":: gen7: r4 end ::");
+        return;
+    }
+
+    // `GTT_BASE = 0x200000` is [EXT-UNPINNED], carried from `igpu::regs::GTT_BASE` exactly as
+    // R1 carries it; the wire says `base_pin=unpinned` for the same reason it does there.
+    const GTT_BASE: usize = 0x200000; // igpu::regs::GTT_BASE — [EXT-UNPINNED]
+    const SLOTS: usize = 524_288;
+    // The highest byte R4 reads or writes is the neighbour AFTER the last claimed slot. Refuse
+    // — before any read of the window and any write — if the window runs off the derived array
+    // or off the enumerated BAR0, checked against the size we were GIVEN, not a literal.
+    let win_last_slot = CLAIM_FIRST + CLAIM_COUNT; // inclusive: the "next" neighbour
+    let win_end_off = GTT_BASE + (win_last_slot + 1) * 4;
+    if win_last_slot >= SLOTS || bar0_size < win_end_off {
+        serial_println!(
+            ":: gen7: r4 verdict=refused-bar0-too-small have={} need={} last_slot={} slots={} — the derived GGTT window does not fit; no GGTT reading claimed ::",
+            bar0_size,
+            win_end_off,
+            win_last_slot,
+            SLOTS
+        );
+        serial_println!(":: gen7: r4 next=STOP-ggtt-window-out-of-range-refit-CLAIM_FIRST/COUNT note=no-ggtt-touched ::");
+        serial_println!(":: gen7: r4 end ::");
+        return;
+    }
+
+    // ---- Identify the ring buffer registers (G3, IVB-PINNED), read-only, BOTH branches ----
+    // These are the four registers command submission will program (RING_START holds the GGTT
+    // address of the ring; RING_CTL bit 0 enables it). R3 released forcewake, so on the woke
+    // branch they may still read dark — the reading is reported, never assumed. `probe` reads
+    // each twice and classifies, so a `varies=1` here would itself be proof of a running ring.
+    let mut ring = Tally::default();
+    probe(bar0, "rcs", "RING_START", g7regs::RCS_RING_START, "IVB-PINNED", &mut ring);
+    probe(bar0, "rcs", "RING_CTL", g7regs::RCS_RING_CTL, "IVB-PINNED", &mut ring);
+    probe(bar0, "rcs", "RING_HEAD", g7regs::RCS_RING_HEAD, "IVB-PINNED", &mut ring);
+    probe(bar0, "rcs", "RING_TAIL", g7regs::RCS_RING_TAIL, "IVB-PINNED", &mut ring);
+    serial_println!(
+        ":: gen7: r4 ring verdict n={} structured={} zero={} allones={} varies={} note=ring-lives-in-GGTT-these-are-the-submission-registers ::",
+        ring.n,
+        ring.structured,
+        ring.zero,
+        ring.allones,
+        ring.varies
+    );
+
+    // ---- Read-only census of the candidate window, BOTH branches --------------------------
+    // Every pre-image is read. Only NON-zero slots are printed individually (the ones that
+    // decide the refusal — an owned window must name which slots are owned); the common
+    // all-zero window is summarised. The two bracketing neighbours are read too: a claim is
+    // only safe if the slots on either side of the window are also unowned.
+    let mut zeros = 0u32;
+    let mut nonzero = 0u32;
+    let mut first_nonzero_slot: i64 = -1;
+    let mut first_nonzero_pte = 0u32;
+    for k in 0..CLAIM_COUNT {
+        let s = CLAIM_FIRST + k;
+        let pte = rd(bar0, GTT_BASE + s * 4);
+        if pte == 0 {
+            zeros += 1;
+        } else {
+            nonzero += 1;
+            if first_nonzero_slot < 0 {
+                first_nonzero_slot = s as i64;
+                first_nonzero_pte = pte;
+            }
+            serial_println!(
+                ":: gen7: r4 ggtt owned slot={} off={:06X} pte={:08X} pfn={:05X} ::",
+                s,
+                GTT_BASE + s * 4,
+                pte,
+                pte >> 12
+            );
+        }
+    }
+    let prev_nb = rd(bar0, GTT_BASE + (CLAIM_FIRST - 1) * 4);
+    let next_nb = rd(bar0, GTT_BASE + (CLAIM_FIRST + CLAIM_COUNT) * 4);
+    let range_empty = nonzero == 0 && prev_nb == 0 && next_nb == 0;
+    serial_println!(
+        ":: gen7: r4 ggtt-claim first={} count={} zeros={} nonzero={} prev={:08X} next={:08X} first_nonzero_slot={} range_empty={} base={:06X} base_pin=unpinned ::",
+        CLAIM_FIRST,
+        CLAIM_COUNT,
+        zeros,
+        nonzero,
+        prev_nb,
+        next_nb,
+        first_nonzero_slot,
+        if range_empty { 1 } else { 0 },
+        GTT_BASE
+    );
+
+    // ---- Branch on R3's verdict -----------------------------------------------------------
+    if !wake.reachable() {
+        // DARK branch — the read-only recon, and it writes NOTHING. This is the arm Boot D's
+        // R2 `gt-still-dark` makes most likely. The verdict is loud on purpose: the rung read
+        // the GGTT and the ring registers through the closed well and it is GATED on the wake,
+        // which is a finding that moves the GEN7-vs-Kepler question, not a null.
+        serial_println!(
+            ":: gen7: r4 verdict=gated-on-wake wake={} ring_structured={}/{} range_empty={} writes=0 note=R3-did-not-wake-the-GT-no-GGTT-write-attempted-behind-a-closed-well ::",
+            wake.name(),
+            ring.structured,
+            ring.n,
+            if range_empty { 1 } else { 0 }
+        );
+        serial_println!(
+            ":: gen7: r4 next=STOP-gated-on-forcewake-GEN7-vs-Kepler-decision-goes-to-Peter-with-R2-gt-still-dark-and-R3-fw-no-ack note=no-ggtt-touched ::"
+        );
+        serial_println!(":: gen7: r4 end ::");
+        return;
+    }
+
+    // WOKE branch — R3 produced positive evidence the GT block is reachable. The window must
+    // be verified unowned before a single write; an owned window is refused, never overwritten
+    // (draft §5 refusal law).
+    if !range_empty {
+        serial_println!(
+            ":: gen7: r4 verdict=range-owned-refused first_nonzero_slot={} first_nonzero_pte={:08X} prev={:08X} next={:08X} writes=0 note=something-owns-the-window-pick-another-never-overwrite-a-populated-PTE ::",
+            first_nonzero_slot,
+            first_nonzero_pte,
+            prev_nb,
+            next_nb
+        );
+        serial_println!(":: gen7: r4 next=STOP-candidate-window-owned-choose-another-CLAIM_FIRST note=no-ggtt-written ::");
+        serial_println!(":: gen7: r4 end ::");
+        return;
+    }
+
+    // ---- The reversible claim — one PTE round-trip, real page, restore-verified -----------
+    // A real translated scratch page so the PTE is a genuine address (no fabricated constant),
+    // exactly as `igpu::bring_up_blt_ring` builds the ring PTE.
+    let layout = Layout::from_size_align(4096, 4096).unwrap();
+    let page = alloc_zeroed(layout);
+    if page.is_null() {
+        serial_println!(":: gen7: r4 verdict=claim-alloc-failed writes=0 note=scratch-page-alloc-returned-null-nothing-written ::");
+        serial_println!(":: gen7: r4 next=STOP-no-scratch-page note=no-ggtt-written ::");
+        serial_println!(":: gen7: r4 end ::");
+        return;
+    }
+    let Some(phys64) = crate::arch::memory::translate(page as u64) else {
+        dealloc(page, layout);
+        serial_println!(":: gen7: r4 verdict=claim-virt-unmapped va={:016X} writes=0 note=scratch-page-not-mapped-nothing-written ::", page as usize);
+        serial_println!(":: gen7: r4 next=STOP-scratch-va-unmapped note=no-ggtt-written ::");
+        serial_println!(":: gen7: r4 end ::");
+        return;
+    };
+    let phys = phys64 as usize;
+    // Gen7 GGTT PTEs carry extended physical bits 39:32 in PTE bits 7:4, which this claim does
+    // not program (draft G6) — refuse, do not truncate, anything above 4 GiB. Same guard as the
+    // tree's ring bring-up (`igpu.rs` ~841).
+    if phys >= 0x1_0000_0000 {
+        dealloc(page, layout);
+        serial_println!(":: gen7: r4 verdict=claim-phys-above-4g phys={:016X} writes=0 note=extended-PTE-bits-not-programmed-nothing-written ::", phys);
+        serial_println!(":: gen7: r4 next=STOP-scratch-phys-above-4g note=no-ggtt-written ::");
+        serial_println!(":: gen7: r4 end ::");
+        return;
+    }
+    let pte = (phys as u32) | 1; // valid bit — draft G6, the exact form the tree writes
+    let target_off = GTT_BASE + CLAIM_FIRST * 4;
+    let prev_off = target_off - 4;
+    let next_off = target_off + 4;
+
+    // Entry images. The whole window is verified zero, but re-read the three touched slots
+    // here so the transition is measured against a fresh baseline, not a stale one.
+    let slot_pre = rd(bar0, target_off);
+    let prev_pre = rd(bar0, prev_off);
+    let next_pre = rd(bar0, next_off);
+
+    // Write the PTE, then read back the target and both neighbours under the hold.
+    wr(bar0, target_off, pte);
+    let slot_held = rd(bar0, target_off);
+    let prev_held = rd(bar0, prev_off);
+    let next_held = rd(bar0, next_off);
+    // The transition witness: a specific non-zero value only our write could have put in a slot
+    // whose pre-image was zero. A gated GGTT reads back zero and this is 0 — `landed=0`.
+    let landed = slot_held == pte && slot_pre == 0;
+    let smear_held = prev_held != prev_pre || next_held != next_pre;
+
+    // Restore: write zero to the target (undo) and to both neighbours (identity — each was
+    // verified zero at entry), then re-read all three to prove the neighbourhood is back.
+    wr(bar0, prev_off, 0);
+    wr(bar0, target_off, 0);
+    wr(bar0, next_off, 0);
+    let slot_post = rd(bar0, target_off);
+    let prev_post = rd(bar0, prev_off);
+    let next_post = rd(bar0, next_off);
+    let restored = slot_post == 0 && prev_post == 0 && next_post == 0;
+    let smear_post = prev_post != prev_pre || next_post != next_pre;
+
+    dealloc(page, layout);
+
+    serial_println!(
+        ":: gen7: r4 claim target_off={:06X} slot={} phys={:016X} pte={:08X} slot_pre={:08X} slot_held={:08X} slot_post={:08X} landed={} restored={} ::",
+        target_off,
+        CLAIM_FIRST,
+        phys,
+        pte,
+        slot_pre,
+        slot_held,
+        slot_post,
+        if landed { 1 } else { 0 },
+        if restored { 1 } else { 0 }
+    );
+    serial_println!(
+        ":: gen7: r4 claim-neighbours prev_off={:06X} prev_pre={:08X} prev_held={:08X} prev_post={:08X} next_off={:06X} next_pre={:08X} next_held={:08X} next_post={:08X} smear_held={} smear_post={} ::",
+        prev_off,
+        prev_pre,
+        prev_held,
+        prev_post,
+        next_off,
+        next_pre,
+        next_held,
+        next_post,
+        if smear_held { 1 } else { 0 },
+        if smear_post { 1 } else { 0 }
+    );
+
+    // Verdict — every arm named before the rung ran. A smear is convicted even though it was
+    // cleaned up: a GGTT store that bleeds into a neighbour is a silent corruption nothing may
+    // be built on. `claim-write-void` is the honest reading of a woken GT whose GGTT is still
+    // gated with the well released — the finding the "forcewake released here" note names.
+    let verdict = if smear_held || smear_post {
+        "claim-smear"
+    } else if !landed {
+        "claim-write-void"
+    } else if !restored {
+        "claim-restore-dirty"
+    } else {
+        "claim-roundtrip-ok"
+    };
+    serial_println!(
+        ":: gen7: r4 verdict={} wake={} landed={} restored={} smear={} writes=2 reversible=1 rung=R4 note=forcewake-released-by-R3-GGTT-claim-ran-with-well-not-held ::",
+        verdict,
+        wake.name(),
+        if landed { 1 } else { 0 },
+        if restored { 1 } else { 0 },
+        if smear_held || smear_post { 1 } else { 0 }
+    );
+    serial_println!(
+        ":: gen7: r4 next={} note=one-PTE-round-trip-restored-and-verified-no-display-register-touched ::",
+        match verdict {
+            "claim-roundtrip-ok" =>
+                "R5-map-the-ring-page-and-submit-MI_STORE_DATA_IMM-into-a-GGTT-scratch-dword",
+            "claim-write-void" =>
+                "STOP-GGTT-gated-with-well-released-R5-must-hold-forcewake-around-the-claim",
+            "claim-restore-dirty" =>
+                "STOP-restore-did-not-verify-do-not-build-on-an-unproven-reversal",
+            _ => "STOP-GGTT-write-smeared-a-neighbour-do-not-submit-a-ring-through-this-array",
+        }
+    );
+    serial_println!(":: gen7: r4 end ::");
 }
