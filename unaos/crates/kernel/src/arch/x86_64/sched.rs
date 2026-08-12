@@ -330,6 +330,20 @@ pub struct Task {
     /// non-zero — so the churn question survives past `STEAL_LOG_MAX`, on the rollup, rather than
     /// going quiet exactly when a long run would start to answer it.
     migrations: u32,
+    /// VUGSPREAD-COOL: `arch::ms()` at this task's LAST migration (`0` = never migrated). The
+    /// ping-pong brake for the RUNNING-victim floor reads it: a task stolen less than
+    /// [`STEAL_COOLDOWN_MS`] ago is left where it is, so a freshly-stolen vug runs at least one
+    /// scheduling quantum on its new home before another idle core may yank it back.
+    ///
+    /// Denominated in `ms()`, NOT `now_cycles()`, on purpose — the stamp is written by one thief core
+    /// and read by another, and `rdtsc` is per-core (the same cross-core hazard the `busy_pct` contract
+    /// and `pick_cpu`'s `live=0` note guard against); `ms()` (`APIC_TICKS`) is globally coherent, so
+    /// `ms() - migrate_ms` is a sound cross-core elapsed. Written by the thief at step 3 of the steal,
+    /// under the pop's own lock where it owns the Box exclusively (same discipline as `migrations`);
+    /// read under the victim's lock in [`RunQueue::steal_one`]. A NEVER-migrated task carries `0`, and
+    /// `ms() - 0` is always past the cooldown, so the FIRST corrective steal of any task is never
+    /// delayed — only a re-steal within the window is.
+    migrate_ms: u64,
     /// VUGSPREAD (review F16): this task's core came from a RING-3 PLACEMENT HINT — the `place`
     /// argument of `SYS_THREAD_SPAWN`, resolved by the kernel to an index. True for exactly the
     /// population that the pin contract used to freeze and this arc released; false for every kernel
@@ -1020,13 +1034,13 @@ struct LineBuf {
 /// | --- | --- |
 /// | `"[spread] pack=8 spare=8 rqp=["` | 29 |
 /// | 8 x `",1/<20 digits>/<20 digits>"` — comma, `1`, `/`, ready, `/`, pinned = 44 | 352 |
-/// | `"] steal=<20>/<20> m1=<20> mh=<20> remig=<20> packseen=<20> cr3sw=<20>"` | 180 |
+/// | `"] steal=<20>/<20> m1=<20> mh=<20> remig=<20> cool=<20> packseen=<20> cr3sw=<20>"` | 206 |
 /// | `" decl=t:<20> e:<20> f:<20> p:<20> d:<20> i:<20>"` | 144 |
 /// | `" cores=8/NNN <CAPPED>"` | 21 |
-/// | **total** | **726** |
+/// | **total** | **752** |
 ///
-/// 768 would have left 42 bytes — headroom too thin to add a field without re-deriving this, which
-/// is exactly the situation the original note was written to avoid. **1024** restores ~298 bytes.
+/// 768 would have left 16 bytes — thinner still (VUGSPREAD-COOL added `cool=<20>`), which is exactly
+/// why the cap sits at **1024**, leaving ~272 bytes of headroom.
 /// The cost is 256 more bytes of a 16 KiB kernel stack, on a witness path that allocates nothing and
 /// is never nested. [`LineBuf`] reports overflow on the wire regardless, so the bound is belt and
 /// braces either way — but a bound that is quietly one field from binding is not a bound.
@@ -1348,12 +1362,13 @@ fn emit_spread_witness(n: usize, seen: usize) {
     let (moves, passes) = steal_counters();
     let _ = write!(
         w,
-        "] steal={}/{} m1={} mh={} remig={} packseen={} cr3sw={}",
+        "] steal={}/{} m1={} mh={} remig={} cool={} packseen={} cr3sw={}",
         moves,
         passes,
         STEAL_M_DEPTH1.load(Ordering::Relaxed),
         STEAL_M_HINT.load(Ordering::Relaxed),
         STEAL_REMIGS.load(Ordering::Relaxed),
+        STEAL_COOL_SKIP.load(Ordering::Relaxed),
         PACK_SEEN.load(Ordering::Relaxed),
         CR3_SWITCHES.load(Ordering::Relaxed),
     );
@@ -1609,20 +1624,38 @@ impl RunQueue {
     /// priority on the thief. Benign for the ring-3 fleet this arc places (they re-age in ms),
     /// stated so nobody reads a stolen task's level reset as a scheduler bug.
     ///
-    /// TWO filters, and both are load-bearing:
+    /// THREE filters, and all three are load-bearing:
     ///   * `steal_ok` — the pin contract (`Task::steal_ok`). Render / input / usb-pump and every
     ///     fixture named a core, so they are skipped and left exactly where they were placed.
     ///   * cooperative ring-3 onto core 0 — a task with RFLAGS.IF clear in ring 3 masks the timer for
     ///     its lifetime, and core 0 is the sole advancer of the global ms-clock. `pick_cpu` encodes
     ///     the same rule for PLACEMENT; it has to be repeated here because a later migration is a
     ///     placement decision that `pick_cpu` never sees.
+    ///   * VUGSPREAD-COOL — a task that migrated within `STEAL_COOLDOWN_MS` is left where it is, so it
+    ///     runs a few quanta on its new home before another idle core yanks it back. This is the
+    ///     RUNNING-victim ping-pong brake; each skip bumps [`STEAL_COOL_SKIP`]. A task whose only
+    ///     obstacle was the cooldown is passed over exactly like a pinned one, so an empty return still
+    ///     reads as `p`/[`STEAL_D_PINNED`] at the pass level — see that counter's doc.
+    ///
+    /// `now_ms` is `arch::ms()`, read ONCE by the caller and threaded in: it is globally coherent
+    /// (`APIC_TICKS`), so comparing it against each task's `migrate_ms` is a sound cross-core elapsed,
+    /// and reading it once keeps every candidate in this walk judged against one instant.
     ///
     /// O(ready tasks) worst case, and off the switch hot path — only an idle core with an empty queue
     /// ever calls it.
-    fn steal_one(&mut self, thief_cpu: usize) -> Option<Box<Task>> {
+    fn steal_one(&mut self, thief_cpu: usize, now_ms: u64) -> Option<Box<Task>> {
         for level in self.levels.iter_mut() {
             let pos = level.iter().position(|t| {
-                t.steal_ok && !(thief_cpu == 0 && t.is_cooperative_user())
+                if !t.steal_ok || (thief_cpu == 0 && t.is_cooperative_user()) {
+                    return false;
+                }
+                // VUGSPREAD-COOL — refuse a re-steal inside the cooldown window. `migrate_ms == 0`
+                // (never migrated) always clears it, so the first corrective steal is never delayed.
+                if t.migrate_ms != 0 && now_ms.saturating_sub(t.migrate_ms) < STEAL_COOLDOWN_MS {
+                    STEAL_COOL_SKIP.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                true
             });
             if let Some(pos) = pos {
                 return level.remove(pos);
@@ -1958,6 +1991,7 @@ fn spawn_inner(
         kill: None,
         steal_ok,
         migrations: 0,
+        migrate_ms: 0,
         hint_placed: false,
     });
 
@@ -2183,6 +2217,7 @@ fn spawn_user_inner(
         kill,
         steal_ok,
         migrations: 0,
+        migrate_ms: 0,
         hint_placed: false,
     });
     // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`.
@@ -2431,6 +2466,7 @@ pub fn spawn_user_thread(
         kill: None,
         steal_ok,
         migrations: 0,
+        migrate_ms: 0,
         // VUGSPREAD (review F16): this core came from ring 3's `place` argument. Attribution only.
         hint_placed: true,
     });
@@ -4510,13 +4546,22 @@ fn steal_floor(victim: usize) -> usize {
 // | `t` [`STEAL_D_THIEF`] | the thief is the render or service core | neither — an expected refusal |
 // | `e` [`STEAL_D_EMPTY`] | no other dispatching core held ANY ready task | the machine really was unpacked |
 // | `f` [`STEAL_D_FLOOR`] | ready tasks existed, none reached its victim's floor | the floor (fixed above) |
-// | `p` [`STEAL_D_PINNED`] | a victim qualified, every ready task on it was pinned or excluded | the pin contract |
+// | `p` [`STEAL_D_PINNED`] | a victim qualified, every ready task on it was pinned, cooperative-excluded, or COOLING | the pin contract / VUGSPREAD-COOL |
 // | `d` [`STEAL_D_DRAIN`] | the victim drained between the peek and the lock | benign raciness |
+// | `i` [`STEAL_D_IDLEFLOOR`] | the victim held work but had gone IDLE, raising its own floor | the idle-floor ping-pong guard (Review F10) |
+//
+// VUGSPREAD-COOL folds into `p` on purpose: a task passed over only because it migrated within
+// `STEAL_COOLDOWN_MS` leaves `steal_one` empty-handed exactly as a pinned one does, so the pass-level
+// tally cannot separate them and the conservation law stays intact. The per-task SKIP is counted
+// separately by [`STEAL_COOL_SKIP`] (`cool=` on `[spread]`), which is the reading that DOES distinguish
+// "refused a re-steal" from "nothing was stealable" — and the term whose rise, against a flat `remig`,
+// is this brake working.
 //
 // The arithmetic is checkable ON THE WIRE, which is what stops the set from quietly losing a case:
-// `e + f + p + d + moves == passes`, and `t` sits outside `passes` because `STEAL_PASSES` is bumped
-// after the thief exclusion. A capture where those do not add up means a path was added without a
-// counter, and the witness is lying rather than merely incomplete.
+// `e + f + p + d + i + moves == passes` (`i` = `STEAL_D_IDLEFLOOR`, the Review-F10 idle-floor path,
+// emitted as `i:` on the `decl=` line — see below), and `t` sits outside `passes` because
+// `STEAL_PASSES` is bumped after the thief exclusion. A capture where those do not add up means a
+// path was added without a counter, and the witness is lying rather than merely incomplete.
 /// Review F10 — `d` was ONE counter covering two different events, which contradicted the
 /// disjointness the table claims. A victim whose queue is EMPTY when the lock is taken drained under
 /// a race (benign, and says nothing about policy); a victim holding `0 < len < floor` did NOT drain
@@ -4580,6 +4625,43 @@ static CR3_SWITCHES: AtomicU64 = AtomicU64::new(0);
 /// near zero; a thrashing one drives the two up together. Without it, "moves went up" is not
 /// evidence of anything.
 static STEAL_REMIGS: AtomicU64 = AtomicU64::new(0);
+
+// ── VUGSPREAD-COOL: THE RUNNING-VICTIM PING-PONG BRAKE ──────────────────────────────────────────
+//
+// `steal_floor` lowered the RUNNING victim's floor to 1 so an idle core takes one task off a core
+// that is running one and queueing another. That is the correct one-shot on an UNDER-loaded board
+// (a vug parent time-sharing with idle cores). On a SATURATED board it is a churn engine, and Boot C
+// measured exactly that: `remig=750397/750418` — 99.997% of steals were RE-migrations of the same
+// handful of vugs — driving `cr3sw=14073209` whole-TLB flushes, while six cores already sat at 99%.
+// Stealing cannot improve an all-busy board; every one of those moves was work thrown away, and it
+// smeared each vug's compose across a rotating set of cores (the uneven `[wcpar]`/pulse reading).
+//
+// The mechanism the VUGSPREAD idle-floor guard does NOT reach: a vug BLOCKS briefly inside
+// `SYS_WIN_PRESENT`, its home core's queue empties, that core steals a neighbour, the vug unblocks
+// and re-queues home — now home is over-subscribed and a third idle core steals it back. The guard
+// covers an IDLE victim; here the victim is RUNNING (floor 1) and the churn is driven by THIEVES
+// going transiently idle. The brake is therefore per-TASK recency, not per-victim depth: a task
+// stolen less than `STEAL_COOLDOWN_MS` ago is left where it is, so it runs at least a few quanta on
+// its new home before another core may take it. The FIRST steal of any task is never delayed
+// (`migrate_ms == 0`), so genuine spreading is untouched; only the immediate re-steal is refused,
+// which is the ping-pong and nothing else. A settled fleet reaches one-vug-per-core and STAYS there,
+// so a later vug CLOSE frees exactly one core with nothing left to steal — the survivors keep their
+// homes instead of being re-grabbed, which is the close-spike's scheduler half.
+//
+// `STEAL_COOLDOWN_MS` is bench-tuned to a handful of scheduling quanta (the calibrated tick is 1 kHz,
+// so this is ~16 quanta): long enough to break the ~0.5 ms re-steal cadence Boot C measured, short
+// enough that a one-time post-close rebalance is delayed imperceptibly (and post-close there is
+// usually nothing to steal at all). It is deliberately NOT a rate cap on the renderer — the vug still
+// presents unbounded; only the SCHEDULER's re-placement of its task is damped.
+const STEAL_COOLDOWN_MS: u64 = 16;
+
+/// VUGSPREAD-COOL: per-task steal candidates SKIPPED because they migrated within `STEAL_COOLDOWN_MS`.
+/// The brake's activity, and the direct counterweight to `STEAL_REMIGS`: a healthy post-fix capture
+/// reads this CLIMBING while `remig` stays near flat — the ping-pong being refused rather than served.
+/// A side counter like `STEAL_REMIGS`, outside the `e+f+p+d+i+moves == passes` invariant (a cooled
+/// task that leaves `steal_one` empty-handed still lands on `p`/[`STEAL_D_PINNED`], whose doc now names
+/// this case); this counts the per-task SKIPS inside the walk, which that pass-level tally cannot see.
+static STEAL_COOL_SKIP: AtomicU64 = AtomicU64::new(0);
 
 /// SMPBAL-X86: rate limit for the per-steal witness — the first `STEAL_LOG_MAX` migrations are named
 /// on the wire, then it goes quiet. The cumulative `steal=` field on the `[schedx86] load` line keeps
@@ -4697,6 +4779,9 @@ fn try_steal(cpu: usize) -> bool {
     // must not be the number attribution is scored on (review F16 wants moves the OLD floor would
     // have refused, and only the locked read can say whether this was one).
     let victim_depth: usize;
+    // VUGSPREAD-COOL — one coherent `ms()` reading for both the cooldown test inside `steal_one` and
+    // the migration stamp at step 3, so the task this steal takes is judged and stamped at one instant.
+    let now_ms = crate::arch::ms();
     let stolen = {
         // WEDGE-4: this is a REMOTE run-queue acquisition, new on this arch, so it goes through the
         // same bounded-spin wrapper as the dispatcher's own — otherwise it would be the one
@@ -4711,7 +4796,7 @@ fn try_steal(cpu: usize) -> bool {
             short = Some(len == 0);
             None
         } else {
-            vq.steal_one(cpu)
+            vq.steal_one(cpu, now_ms)
         }
     };
     let Some(mut task) = stolen else {
@@ -4736,6 +4821,10 @@ fn try_steal(cpu: usize) -> bool {
     if mig > 1 {
         STEAL_REMIGS.fetch_add(1, Ordering::Relaxed);
     }
+    // VUGSPREAD-COOL — stamp the migration so the next idle core's `steal_one` leaves this task on its
+    // new home for `STEAL_COOLDOWN_MS`. Same `now_ms` the cooldown test above read, under the pop's
+    // own lock where the Box is exclusively owned (the `migrations` discipline).
+    task.migrate_ms = now_ms;
     // Review F16 — attribute the move to the repair(s) that made it possible. Both, or neither, or
     // one: a vug worker packed behind its parent scores both, and that is the honest answer.
     if victim_depth == 1 {
