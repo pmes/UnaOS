@@ -4335,6 +4335,22 @@ fn x86_input_service(cpu: usize) {
     }
 }
 
+/// SHELLNOTDESK — does the crispy desktop compositor own the backdrop on this build/boot?
+///
+/// True only on x86-`wc` once [`unaos_kernel::video::wcx::activate`] has taken the panel. When it is
+/// true the render service paints the CRISPY SCENE as the desktop layer and keeps the live text shell
+/// off the glass — the shell is not the desktop, it is plumbing behind the facade. On a `wc`-off x86
+/// build (and, by the caller's own `cfg`, aarch64 never reaches here) it is a compile-time `false`,
+/// so the shell keeps painting the desktop exactly as before — the whole change folds away.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn desktop_owns_backdrop() -> bool {
+    unaos_kernel::video::wcx::is_active()
+}
+#[cfg(all(target_arch = "x86_64", not(feature = "wc")))]
+fn desktop_owns_backdrop() -> bool {
+    false
+}
+
 /// SCHED-X86: the RENDER service — the interactive OS as a scheduled kernel task, and the sole owner
 /// of every pixel. Builds its own `Screen`/`TargetPal`/`Console` over the framebuffer the BSP left in
 /// `WRITER` (and detached fbcon from), paints the first frame, then blocks on `GUI_CHANNEL_X86` and
@@ -4358,10 +4374,32 @@ fn x86_render_service(cpu: usize) {
     // goes to a cached-RAM back buffer; render() flushes only the damaged region.
     let front_fb = *unaos_kernel::video::WRITER.lock();
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
+
+    // SHELLNOTDESK — is the crispy desktop up? Captured ONCE: `wcx::activate` runs during PCI
+    // enumeration, long before this task is spawned, and never releases the latch on the success
+    // path, so the answer is stable for the life of the render service.
+    //
+    // On the crispy desktop the SCENE owns the backdrop — painted into the desktop layer here, before
+    // the first present — and the live text shell is kept off the glass (it survives in serial and
+    // `TERM_RING` for the Console app, per the facade law). Off the crispy desktop (a pre-takeover
+    // boot, a `wc`-off x86 build) the shell is still the desktop and draws exactly as it always did.
+    let desktop = desktop_owns_backdrop();
+    if desktop {
+        screen.paint_desktop_scene();
+    }
+
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
     let mut console = unaos_kernel::console::Console::new();
 
-    console.draw(&mut pal);
+    if desktop {
+        serial_println!(
+            "[shelldesk] backdrop=crispy-scene shell=off-glass bg={:08X} core={}",
+            unaos_kernel::video::wm::DESKTOP_BG,
+            cpu
+        );
+    } else {
+        console.draw(&mut pal);
+    }
     pal.render();
     // The falsifiable pair to the spawn-site line: this one is printed by the task ITSELF, after it
     // has built the panel surface and presented a frame. Spawned is not dispatched (the WINX-2/WINX-3
@@ -4416,7 +4454,12 @@ fn x86_render_service(cpu: usize) {
                     let consumed = unaos_kernel::video::instgui::consume_key(c);
                     #[cfg(not(all(feature = "wc", feature = "instgui")))]
                     let consumed = false;
-                    if !consumed {
+                    // SHELLNOTDESK — on the crispy desktop the text shell is NOT the desktop, so a
+                    // keystroke that reached this arm (not consumed by the installer dialog, and not
+                    // routed to a focused window by `wc_route_event` upstream) has no backdrop shell to
+                    // type into: it is dropped rather than repainted onto the scene. Off the crispy
+                    // desktop the shell still owns the panel and handles the key exactly as before.
+                    if !consumed && !desktop {
                         // `handle_key` answers `true` when the command took the whole screen. The BSP
                         // loop used that to stop DRAINING, and so do we — a command that owns the panel
                         // must not have the rest of the burst painted over it before it is presented.
