@@ -282,10 +282,12 @@ Bolt-1 invariants carried verbatim.
   object id, the credential findings, and its predecessor's hash; its own hash
   covers all of that (collision-detecting SHA-1, via the `gix` the crate
   already carries for reading repositories). There is no rewrite path in the
-  code — `BoltRoot` can only append. **Graded honestly:** the chain head is not
-  anchored outside the ledger file, so this is a tamper-evident *journal*
-  against an editor, not a tamper-proof *log* against an adversary who owns the
-  bolt root — see "What the chain is worth" below.
+  code — `BoltRoot` can only append. **Graded honestly:** the bare chain
+  (`repo-verify`) is tamper-evident against an *editor*; the chain head is now
+  also **anchored** in a UnaFS image's retained CoW root (`repo-uweave --apply`
+  writes it, `repo-verify <image>` checks it), which closes the whole-tail
+  rewrite and truncation holes — down to trusting the image artifact. See "What
+  the chain is worth" below.
 - **The credential floor** — the *same* default-deny patterns, honestly
   re-scoped. A mirror carries whatever was committed, so a filter cannot
   un-commit a key; what the floor does here is **audit and report, never
@@ -308,7 +310,8 @@ Bolt-1 invariants carried verbatim.
 | `repo-status` | The God view: Crystal Color per repo, plus source-vs-ledger drift. |
 | `repo-layout` | The host→UnaFS mapping, as data. |
 | `repo-ufit` | Check the bolt against the measured UnaFS v3 limits before any weave. |
-| `repo-uweave [<image>] [--apply]` | Weave the mirrors into a UnaFS v3 image as native objects. |
+| `repo-uweave [<image>] [--apply]` | Weave the mirrors into a UnaFS v3 image as native objects, and (on `--apply`) **anchor each ledger head** in the image's retained root. |
+| `repo-verify [<image>] [--deep]` | With an image, also check the ledger head against its retained anchor (the tamper-evident path). |
 
 These verbs take a **repo-bolt** manifest, so `--manifest <path>` is required —
 silently reading the dev-tree manifest would point a weave at the wrong tree,
@@ -327,25 +330,39 @@ current.
 
 ### What the chain is worth
 
-A hash chain is tamper-evident only against a party who cannot recompute it,
-and **nothing outside the ledger file anchors its head**. That bounds the claim
-exactly:
+A hash chain is tamper-evident only against a party who cannot recompute it.
+There are two grades, and the second is now wired.
 
-- **Caught** (each falsified by a test): an entry edited in place; an entry
-  dropped or reordered mid-chain; a `cred` line scrubbed; a hash that is not a
-  SHA-1; a recorded object missing from the mirror; ref drift either way.
-- **NOT caught** (both pinned by tests, so the limit cannot be quietly
-  forgotten): a **whole-tail rewrite** — `LedgerEntry::new` is deterministic
-  and public, so anyone with write access to the file can edit entry *k* and
-  re-chain *k..n* into something `verify` calls Green; and a **truncation to a
-  valid prefix** — the survivors still chain, and dropping the newest entries
-  is invisible whenever the mirror's refs did not move between them (the common
-  case for a scheduled weave).
+**`repo-verify` (bare chain, chain-internal).** Catches — each falsified by a
+test — an entry edited in place; an entry dropped or reordered mid-chain; a
+`cred` line scrubbed; a hash that is not a SHA-1; a recorded object missing from
+the mirror; ref drift either way. It does **not** catch a **whole-tail rewrite**
+(`LedgerEntry::new` is deterministic and public, so a writer can edit entry *k*
+and re-chain *k..n* into a self-consistent chain) or a **truncation to a valid
+prefix** (the survivors still chain, and dropping the newest entries is
+invisible whenever the mirror's refs did not move between them — the common case
+for a scheduled weave).
 
-Closing that needs an anchor the same writer cannot rewrite: a countersigned
-head kept off the bolt, or the retained-CoW-root route in the mapping below —
-which is **not wired today** (nothing writes `vaire.repo.head`, and
-`repo-uweave` weaves `mirrors/` only, so the ledger is not even in the image).
+**`repo-verify <image>` (anchored).** `repo-uweave --apply` pins the ledger head
+`(count, head_hash)` into the UnaFS image's retained CoW root as
+`vaire.repo.head.<name>`; `repo-verify <image>` reads it back through
+`open_snapshot` and rejects a ledger that no longer agrees. A whole-tail rewrite
+changes the head hash, a truncation changes the count, a full reorder changes
+the head hash — **all three are now caught**, each pinned by a test, and a
+*missing* anchor is itself a breach (`AnchorMissing`) so an unanchored chain
+never passes silently.
+
+**The residual trust is the image artifact.** The CoW machinery makes an
+in-place edit of a retained root infeasible (it would break the retained tree's
+refcounts, which `fsck` flags), so an attacker cannot surgically re-stamp one
+generation's anchor. But a party who *also* owns the image file can discard it
+and format a fresh image whose sole retained root matches a forged ledger. So
+this is a genuine **anchor**, not a tamper-*proof* log: tamper-evidence reduces
+to the image's integrity as an artifact — keep it out of the ledger writer's
+reach (a separate host, or read-only/off-box media) and the two classes above
+are caught. Making it tamper-*proof* against an adversary who owns everything
+needs a countersignature whose key never touches the bolt — a larger change than
+this seam.
 
 ### UnaFS alignment — executable, not asserted
 
@@ -361,17 +378,20 @@ the mapping as data so it is test-pinned rather than prose:
 | `mirrors/<name>.git/**` | a directory tree: `mkdir` per dir, one `create_files_batch` per parent dir |
 | each file's size/mtime/source | the four `vaire.size` / `vaire.mtime` / `vaire.src` / `vaire.sync` K6 attrs, folded into the creation inode |
 | one ledger entry `<stamp>` | *(planned)* a `vaire.repo.ledger.<stamp>` String attr on the unit root (the `vaire.summary.<stamp>` pattern) |
-| the ledger head | *(planned)* `vaire.repo.head` (the chain hash) on the unit root |
+| the ledger head | **wired**: `vaire.repo.head.<name>` = `"<count> <head_hash>"` on the image root, CoW-retained by the weave's snapshot; `verify_anchored` reads it back via `open_snapshot` and rejects a rewritten/truncated ledger |
 | a credential finding | *(planned)* a `vaire.repo.cred.<n>` String attr — reported in the image itself |
 | `.vaire-repo-bolt` (layout v1) | *(planned)* a `vaire.repo.layout` Int attr on the image root |
-| one weave | one `snapshot_create(<stamp>, "vaire")` — a retained CoW root. *(Planned:* extending it to retain the **ledger** would strengthen the chain, since a hash could then be checked against a real historical root via `open_snapshot`. Today the snapshot retains the mirrors only.*)* |
+| one weave | one `snapshot_create(<stamp>, "vaire")` — a retained CoW root, which now retains the **head anchor** as well as the mirrors, so the live head is checked against a real retained root via `open_snapshot` rather than against a file the same writer can rewrite |
 | Crystal Color | computed, never stored |
 
-Rows marked *(planned)* are design targets with **no code behind them yet**:
-`repo::unafs_layout` returns the mapping as inspectable data, which pins the
-table's shape, not its implementation status. What `repo-uweave` writes today
-is the mirror tree, the four per-file typed attrs, and one retained snapshot
-per run.
+Rows marked *(planned)* are design targets with **no code behind them yet**;
+the **wired** head-anchor row is written by `repo-uweave --apply`
+(`repo::weave_into_image`) and checked by `repo-verify <image>`
+(`repo::verify_anchored`). `repo::unafs_layout` returns the mapping as
+inspectable data, which pins the table's shape, not its implementation status.
+What `repo-uweave --apply` writes today is the mirror tree, the four per-file
+typed attrs, the head anchor on the image root, and one retained snapshot per
+run.
 
 **The honest boundary.** Host-native vaire cannot mount a *kernel* UnaFS
 volume: there is no host↔kernel bridge, and the crate's only host device is a

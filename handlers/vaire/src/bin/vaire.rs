@@ -83,7 +83,7 @@ fn run() -> Result<()> {
         Some("repo-status") => cmd_repo_status(&manifest_path),
         Some("repo-plan") => cmd_repo_plan(&manifest_path),
         Some("repo-weave") => cmd_repo_weave(&manifest_path, apply),
-        Some("repo-verify") => cmd_repo_verify(&manifest_path, deep),
+        Some("repo-verify") => cmd_repo_verify(&manifest_path, image, deep),
         Some("repo-layout") => cmd_repo_layout(&manifest_path),
         Some("repo-ufit") => cmd_repo_ufit(&manifest_path, size_mb),
         Some("repo-uweave") => cmd_repo_uweave(&manifest_path, image, apply, size_mb),
@@ -120,7 +120,7 @@ fn print_usage() {
          \x20 vaire repo-status  --manifest <path>\n\
          \x20 vaire repo-plan    --manifest <path>\n\
          \x20 vaire repo-weave   --manifest <path> [--apply]\n\
-         \x20 vaire repo-verify  --manifest <path> [--deep]\n\
+         \x20 vaire repo-verify  [<image>] --manifest <path> [--deep]\n\
          \x20 vaire repo-layout  --manifest <path>\n\
          \x20 vaire repo-ufit    --manifest <path> [--size-mb <n>]\n\
          \x20 vaire repo-uweave  [<image>] --manifest <path> [--apply] [--size-mb <n>]\n\n\
@@ -130,7 +130,9 @@ fn print_usage() {
          ~/unaos-bench/vaire/.\n\
          REPO-WEAVE is DRY-RUN by default too; --apply mirrors and appends one\n\
          hash-chained ledger entry per repo. REPO-UWEAVE weaves the bolt's mirrors\n\
-         into a UnaFS v3 image through the usync engine.\n\
+         into a UnaFS v3 image through the usync engine and, on --apply, anchors\n\
+         each ledger head in the image's retained root. REPO-VERIFY with an image\n\
+         checks the ledger head against that anchor (the tamper-evident path).\n\
          Default manifest (dev-tree verbs only): {DEFAULT_MANIFEST}"
     );
 }
@@ -416,10 +418,24 @@ fn cmd_repo_weave(manifest: &std::path::Path, apply: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_repo_verify(manifest: &std::path::Path, deep: bool) -> Result<()> {
+fn cmd_repo_verify(
+    manifest: &std::path::Path,
+    image: Option<PathBuf>,
+    deep: bool,
+) -> Result<()> {
     let m = load_repo_manifest(manifest)?;
+    // With an image, verify through the ANCHORED path: the ledger head is
+    // checked against the CoW-retained anchor, which catches a whole-tail
+    // rewrite or a truncation the bare chain cannot. Without one, verify is
+    // chain-internal only — tamper-evident against an editor, not against a
+    // writer who owns the ledger file.
+    let anchored = image.is_some();
+    let reports = match &image {
+        Some(img) => repo::verify_anchored(&m, img, deep)?,
+        None => repo::verify(&m, deep)?,
+    };
     let mut intact = true;
-    for v in repo::verify(&m, deep)? {
+    for v in reports {
         println!(
             "  - {} [{}]  entries={}  credentials={}",
             v.name,
@@ -435,10 +451,18 @@ fn cmd_repo_verify(manifest: &std::path::Path, deep: bool) -> Result<()> {
     if !intact {
         bail!("verification found integrity breaches (see above)");
     }
-    println!(
-        "verify: chain, objects and refs intact{}",
-        if deep { " (deep: git fsck clean)" } else { "" }
-    );
+    if anchored {
+        println!(
+            "verify: chain, objects, refs AND image anchor intact{}",
+            if deep { " (deep: git fsck clean)" } else { "" }
+        );
+    } else {
+        println!(
+            "verify: chain, objects and refs intact{} \
+             (chain-internal only — pass an image to check the head anchor)",
+            if deep { " (deep: git fsck clean)" } else { "" }
+        );
+    }
     Ok(())
 }
 
@@ -507,12 +531,19 @@ fn cmd_repo_uweave(
         }
         bail!("repo-uweave refused: the bolt does not fit a UnaFS v3 volume (nothing written)");
     }
-    let dm = repo::unafs_view(&m)?;
     let image = match image {
         Some(p) => p,
         None => default_image()?,
     };
-    let r = usync::usync(&dm, &image, apply, size_mb)?;
+    // On --apply, weave through the anchoring path so the ledger head is pinned
+    // in the image's retained root (checkable by `repo-verify <image>`). The
+    // dry-run stays a pure projection preview — it writes nothing.
+    let r = if apply {
+        repo::weave_into_image(&m, &image, size_mb)?
+    } else {
+        let dm = repo::unafs_view(&m)?;
+        usync::usync(&dm, &image, false, size_mb)?
+    };
     if r.applied {
         println!(
             "REPO-UWEAVE --apply -> {}{}",

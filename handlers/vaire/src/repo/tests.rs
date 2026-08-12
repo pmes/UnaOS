@@ -348,15 +348,14 @@ fn a_never_woven_bolt_reports_ledger_empty_not_an_error() {
     assert!(v.breaches.contains(&Breach::MirrorMissing));
 }
 
-/// The honest limit of an unanchored chain, pinned rather than assumed away.
-///
-/// A hash chain is tamper-EVIDENT only against a party who cannot recompute it.
-/// Nothing outside the ledger file anchors its head, so an attacker holding
-/// write access to the file can edit a historical entry and re-chain every
-/// successor — `verify` then reports Green. This test exists so the limit is a
-/// measured fact in the suite, not a sentence someone can quietly delete.
+/// A whole-tail rewrite is invisible to the bare chain but caught by the image
+/// anchor. `verify` alone still calls the re-chained ledger Green — the honest
+/// chain-internal limit — while `verify_anchored` rejects it, because the
+/// anchored head hash no longer matches the rewritten chain's head. (Was
+/// `a_whole_tail_rewrite_is_not_detected_the_chain_head_is_unanchored`: the
+/// anchor landed, so the graded limit is now a caught tamper.)
 #[test]
-fn a_whole_tail_rewrite_is_not_detected_the_chain_head_is_unanchored() {
+fn a_whole_tail_rewrite_is_caught_by_the_image_anchor() {
     let src = tempfile::tempdir().unwrap();
     seed_repo(src.path(), &[("a.txt", "alpha\n")]);
     let bolt_dir = tempfile::tempdir().unwrap();
@@ -367,6 +366,16 @@ fn a_whole_tail_rewrite_is_not_detected_the_chain_head_is_unanchored() {
     git(src.path(), &["add", "-A"]);
     git(src.path(), &["commit", "-q", "-m", "second"]);
     weave(&m).unwrap();
+
+    // Pin the honest head into a UnaFS image — the anchor lives OUTSIDE the
+    // ledger file, and the attacker below rewrites only the ledger.
+    let img_dir = tempfile::tempdir().unwrap();
+    let img = img_dir.path().join("anchor.img");
+    weave_into_image(&m, &img, 32).unwrap();
+    assert!(
+        verify_anchored(&m, &img, false).unwrap()[0].is_intact(),
+        "a clean weave + anchor verifies"
+    );
 
     // Rewrite entry 1's history (drop its recorded refs) and re-chain entry 2
     // onto the forged hash, exactly as `LedgerEntry::new` would.
@@ -393,21 +402,30 @@ fn a_whole_tail_rewrite_is_not_detected_the_chain_head_is_unanchored() {
     )
     .unwrap();
 
-    let v = &verify(&m, false).unwrap()[0];
+    // The bare chain is still self-consistent — the honest chain-internal limit.
     assert!(
-        v.is_intact(),
-        "KNOWN LIMIT: an unanchored chain cannot detect a whole-tail rewrite; \
-         if this ever fails, an anchor landed and the docs must be regraded. \
-         breaches: {:?}",
+        verify(&m, false).unwrap()[0].is_intact(),
+        "the re-chained tail is a valid chain; only the anchor can catch it"
+    );
+    // The anchor catches it: the rewritten head hash disagrees with the pin.
+    let v = &verify_anchored(&m, &img, false).unwrap()[0];
+    assert!(!v.is_intact());
+    assert_eq!(v.crystal(), CrystalColor::Red);
+    assert!(
+        v.breaches
+            .iter()
+            .any(|b| matches!(b, Breach::AnchorMismatch { .. })),
+        "a whole-tail rewrite must fail the anchor; breaches: {:?}",
         v.breaches
     );
 }
 
-/// The second half of the same limit: dropping trailing entries leaves a valid
-/// prefix. It is caught only when the mirror still carries the refs the newest
-/// surviving entry does not — i.e. by the ref-drift check, not by the chain.
+/// A truncation to a valid prefix is invisible to the bare chain (the survivors
+/// still chain, and the mirror's refs did not move between the dropped entries)
+/// but caught by the anchor's count. (Was
+/// `a_truncation_to_a_valid_prefix_is_caught_only_by_ref_drift`.)
 #[test]
-fn a_truncation_to_a_valid_prefix_is_caught_only_by_ref_drift() {
+fn a_truncation_to_a_valid_prefix_is_caught_by_the_image_anchor() {
     let src = tempfile::tempdir().unwrap();
     seed_repo(src.path(), &[("a.txt", "alpha\n")]);
     let bolt_dir = tempfile::tempdir().unwrap();
@@ -415,22 +433,139 @@ fn a_truncation_to_a_valid_prefix_is_caught_only_by_ref_drift() {
     let m = mk_manifest(&bolt_root, &[("alpha", src.path())]);
     weave(&m).unwrap();
     // A no-op weave: the source did not move, so entry 2 records what entry 1
-    // did. This is the common case for a scheduled weave.
+    // did. This is the common scheduled-weave case, where a dropped tail leaves
+    // no ref-drift evidence for the bare chain.
     weave(&m).unwrap();
+
+    let img_dir = tempfile::tempdir().unwrap();
+    let img = img_dir.path().join("anchor.img");
+    weave_into_image(&m, &img, 32).unwrap();
 
     let path = bolt_root.join("ledger/alpha.ledger");
     let entries = read_ledger(&path).unwrap();
     assert_eq!(entries.len(), 2);
     fs::write(&path, entries[0].render()).unwrap();
 
-    let v = &verify(&m, false).unwrap()[0];
+    // The surviving prefix chains AND matches the mirror, so `verify` alone is
+    // intact...
     assert!(
-        v.is_intact(),
-        "KNOWN LIMIT: a tail truncation to a valid prefix leaves no chain \
-         evidence; breaches: {:?}",
+        verify(&m, false).unwrap()[0].is_intact(),
+        "a valid prefix leaves no chain or ref-drift evidence"
+    );
+    // ...but the anchored count (2) no longer matches the ledger (1).
+    let v = &verify_anchored(&m, &img, false).unwrap()[0];
+    assert!(!v.is_intact());
+    assert_eq!(v.entries, 1, "an entry vanished and the bare chain still verifies");
+    assert!(
+        v.breaches
+            .iter()
+            .any(|b| matches!(b, Breach::AnchorMismatch { .. })),
+        "a truncation must fail the anchor count; breaches: {:?}",
         v.breaches
     );
-    assert_eq!(v.entries, 1, "an entry vanished and the chain still verifies");
+    assert_eq!(v.crystal(), CrystalColor::Red);
+}
+
+/// A full reorder + re-chain of the whole ledger changes the newest hash, so
+/// the anchor catches it (defense in depth: when the mirror also moved, ref
+/// drift catches it too — the anchor is the independent pin on the head).
+#[test]
+fn a_full_reorder_is_caught_by_the_image_anchor() {
+    let src = tempfile::tempdir().unwrap();
+    seed_repo(src.path(), &[("a.txt", "alpha\n")]);
+    let bolt_dir = tempfile::tempdir().unwrap();
+    let bolt_root = bolt_dir.path().join("bolt");
+    let m = mk_manifest(&bolt_root, &[("alpha", src.path())]);
+    weave(&m).unwrap();
+    fs::write(src.path().join("b.txt"), "beta\n").unwrap();
+    git(src.path(), &["add", "-A"]);
+    git(src.path(), &["commit", "-q", "-m", "second"]);
+    weave(&m).unwrap();
+
+    let img_dir = tempfile::tempdir().unwrap();
+    let img = img_dir.path().join("anchor.img");
+    weave_into_image(&m, &img, 32).unwrap();
+
+    // Swap the two entries' order and re-chain from GENESIS: a valid chain of a
+    // different shape, hence a different head.
+    let path = bolt_root.join("ledger/alpha.ledger");
+    let entries = read_ledger(&path).unwrap();
+    let new_first = LedgerEntry::new(
+        entries[1].stamp.clone(),
+        entries[1].repo.clone(),
+        GENESIS.to_string(),
+        entries[1].refs.clone(),
+        entries[1].credentials.clone(),
+    );
+    let new_second = LedgerEntry::new(
+        entries[0].stamp.clone(),
+        entries[0].repo.clone(),
+        new_first.hash.clone(),
+        entries[0].refs.clone(),
+        entries[0].credentials.clone(),
+    );
+    fs::write(
+        &path,
+        format!("{}{}", new_first.render(), new_second.render()),
+    )
+    .unwrap();
+
+    let v = &verify_anchored(&m, &img, false).unwrap()[0];
+    assert!(
+        v.breaches
+            .iter()
+            .any(|b| matches!(b, Breach::AnchorMismatch { .. })),
+        "a reordered chain must fail the anchor; breaches: {:?}",
+        v.breaches
+    );
+    assert_eq!(v.crystal(), CrystalColor::Red);
+}
+
+/// A clean weave + anchor verifies through the anchored path, and the anchor is
+/// really CoW-retained: reading it back through `verify_anchored` sees the
+/// pinned head, not a live-root value a later op could have moved.
+#[test]
+fn a_clean_weave_verifies_through_the_anchor() {
+    let src = tempfile::tempdir().unwrap();
+    seed_repo(src.path(), &[("a.txt", "alpha\n")]);
+    let bolt_dir = tempfile::tempdir().unwrap();
+    let bolt_root = bolt_dir.path().join("bolt");
+    let m = mk_manifest(&bolt_root, &[("alpha", src.path())]);
+    weave(&m).unwrap();
+
+    let img_dir = tempfile::tempdir().unwrap();
+    let img = img_dir.path().join("anchor.img");
+    weave_into_image(&m, &img, 32).unwrap();
+
+    // The anchor round-trips: the stored attr equals the live head.
+    let stored = crate::usync::read_retained_root_attr(&img, &anchor_key("alpha"))
+        .unwrap()
+        .expect("the weave wrote a head anchor");
+    let live = HeadAnchor::of(&read_ledger(&bolt_root.join("ledger/alpha.ledger")).unwrap());
+    assert_eq!(HeadAnchor::parse(&stored), Some(live));
+
+    let v = &verify_anchored(&m, &img, true).unwrap()[0];
+    assert!(v.is_intact(), "breaches: {:?}", v.breaches);
+    assert_eq!(v.crystal(), CrystalColor::Green);
+}
+
+/// An unanchored chain never passes the anchored path silently: with no image
+/// (or no retained anchor), `verify_anchored` records `AnchorMissing`, so a
+/// caller cannot mistake "no anchor" for "verified".
+#[test]
+fn a_missing_anchor_is_a_breach_not_a_silent_pass() {
+    let src = tempfile::tempdir().unwrap();
+    seed_repo(src.path(), &[("a.txt", "alpha\n")]);
+    let bolt_dir = tempfile::tempdir().unwrap();
+    let bolt_root = bolt_dir.path().join("bolt");
+    let m = mk_manifest(&bolt_root, &[("alpha", src.path())]);
+    weave(&m).unwrap();
+
+    // A path that was never woven into an image.
+    let img = bolt_dir.path().join("absent.img");
+    let v = &verify_anchored(&m, &img, false).unwrap()[0];
+    assert!(v.breaches.contains(&Breach::AnchorMissing));
+    assert_eq!(v.crystal(), CrystalColor::Red);
 }
 
 #[test]

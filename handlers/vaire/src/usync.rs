@@ -287,6 +287,23 @@ fn now_secs() -> u64 {
 /// when it exists) and touches nothing. `apply == true` formats the image if
 /// absent, weaves the tree, stamps typed attrs, and retains a snapshot.
 pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result<SyncReport> {
+    usync_with_root_attrs(m, image, apply, size_mb, &BTreeMap::new())
+}
+
+/// [`usync`], plus a set of String attrs stamped on the IMAGE ROOT inode before
+/// the run's single flip, so they ride the SAME retained snapshot the sync
+/// takes. This is the write half of the repo-Bolt head anchor
+/// ([`crate::repo::weave_into_image`]): the ledger head `(count, hash)` lands in
+/// a CoW-retained root, where the ledger-file writer cannot silently rewrite it.
+/// On a dry-run (`apply == false`) the attrs are ignored — a dry-run writes
+/// nothing, by construction.
+pub fn usync_with_root_attrs(
+    m: &DevManifest,
+    image: &Path,
+    apply: bool,
+    size_mb: u64,
+    root_attrs: &BTreeMap<String, String>,
+) -> Result<SyncReport> {
     let ledger = PhaseLedger::default();
     let run_stamp = devtree::utc_stamp(SystemTime::now());
     let (items, excluded) = scan(m, &ledger)?;
@@ -462,6 +479,15 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
             set_str(&mut fs, unit_id, "vaire.unit", &m.name)?;
             set_str(&mut fs, unit_id, "vaire.githead", &git_head(root))?;
             set_str(&mut fs, unit_id, "vaire.run", &run_stamp)?;
+        }
+    }
+    // Anchor attrs on the IMAGE ROOT — set BEFORE the flip and the snapshot
+    // below, so they are captured by this run's retained CoW root (the
+    // tamper-anchor the repo Bolt reads back via `read_retained_root_attr`).
+    if !root_attrs.is_empty() {
+        let _p = ledger.probe(&ledger.attrs);
+        for (key, value) in root_attrs {
+            set_str(&mut fs, root_id, key, value)?;
         }
     }
     // THE one flip: this single commit lands the whole staged tree — every
@@ -651,6 +677,42 @@ pub fn ustatus(m: &DevManifest, image: &Path) -> Result<UStatus> {
         image_objects,
         live_files: live_items.len(),
     })
+}
+
+/// Read one String attr of the IMAGE ROOT **as of the newest retained
+/// snapshot** — the tamper-anchor read path.
+///
+/// The value is returned from a [`unafs::SnapshotView`], i.e. the root attr the
+/// CoW machinery retained at snapshot time, not the mutable live root. Editing
+/// it in place is not possible without rewriting the retained tree and breaking
+/// its refcounts (which `git fsck`/`unafs fsck` would flag); this is what lets a
+/// repo Bolt pin its ledger head where the ledger-file writer cannot reach.
+///
+/// Returns `Ok(None)` when the image is absent, holds no retained root, or the
+/// newest root carries no such attr.
+pub fn read_retained_root_attr(image: &Path, key: &str) -> Result<Option<String>> {
+    if !image.exists() {
+        return Ok(None);
+    }
+    let device = FileDevice::open_read_only(image).context("open image read-only")?;
+    let mut fs =
+        FileSystem::mount(device).map_err(|e| anyhow::anyhow!("mount image (ro): {e:?}"))?;
+    let index = fs
+        .snapshot_index()
+        .map_err(|e| anyhow::anyhow!("read snapshot index: {e:?}"))?;
+    let newest = match index.iter().map(|s| s.generation).max() {
+        Some(g) => g,
+        None => return Ok(None),
+    };
+    let root_id = fs.root_inode();
+    let mut view = fs
+        .open_snapshot(newest)
+        .map_err(|e| anyhow::anyhow!("open snapshot {newest}: {e:?}"))?;
+    match view.get_attribute(root_id, key) {
+        Ok(Some(AttributeValue::String(v))) => Ok(Some(v)),
+        Ok(_) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("read snapshot root attr {key}: {e:?}")),
+    }
 }
 
 /// Recursively count (files, total file bytes, all objects) under a dir inode.
