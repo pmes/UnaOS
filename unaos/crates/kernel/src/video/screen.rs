@@ -489,6 +489,13 @@ pub struct Screen {
     /// screen and bytes/frame can never drop — the number that explains the ~3.5 MB/frame plateau.
     last_union_w: usize,
     last_union_h: usize,
+    /// SHELLWIN-OOM — single-buffer mode: `back` IS `front` (both handles point at the same
+    /// cached-RAM window surface) and `back_store` is empty. Draws land directly in the surface the
+    /// compositor reads, [`flush`] owes no copy (the two pointers are EQUAL, so the row copy would
+    /// be UB by `copy_nonoverlapping`'s contract) and none of the panel-global machinery (cursor
+    /// bracket, WC-I subtraction, `wm::service_damage`) — this screen's front is a WINDOW surface,
+    /// not the panel, and presentation is the caller's explicit `wm` present.
+    direct: bool,
 }
 
 impl Screen {
@@ -544,6 +551,47 @@ impl Screen {
             last_flush_rects: 0,
             last_union_w: 0,
             last_union_h: 0,
+            direct: false,
+        }
+    }
+
+    /// SHELLWIN-OOM — build a SINGLE-buffered screen directly over a cached-RAM WINDOW surface.
+    ///
+    /// Why this exists: the GR26 metal panic. `open_shell_window` allocated its ~5 MB surface store
+    /// FALLIBLY and succeeded — then the render service wrapped that surface in `Screen::new`, whose
+    /// `vec![0u8; len]` allocated a SECOND ~5 MB back buffer INFALLIBLY on a heap the STAGE pool had
+    /// already squeezed, and `handle_alloc_error` painted the panel at desktop-ready
+    /// (gr26-bootC, [19555ms], `memory allocation of 5086080 bytes failed` — 14 ms after win=2's
+    /// first present). Double-buffering was pure waste there to begin with: the "front" is cached
+    /// RAM the compositor composites FROM, not the panel, so drawing into it directly loses nothing
+    /// the copy provided. This constructor allocates NOTHING — the OOM point does not move, it
+    /// ceases to exist.
+    ///
+    /// Contract: `front` must be a cached-RAM surface (a `wm` window store), never the panel — every
+    /// draw through this screen writes it immediately, and [`flush`] intentionally skips the
+    /// write-only-VRAM presentation machinery. A composite that interleaves with a partial draw can
+    /// read half-painted glyphs for one frame; the caller's own present after the draw corrects it,
+    /// and the alternative was 2× the surface in heap.
+    pub fn direct(front: FrameBuffer) -> Self {
+        let info = front.info();
+        Self {
+            front,
+            back_store: Vec::new(),
+            // FrameBuffer is Copy: the same base/len/layout as `front`, so `put_pixel`/`fill_rect`
+            // and `read_back_pixel` (CURSOR-SAVE-UNDER) all operate on the one real surface.
+            back: front,
+            info,
+            damage: {
+                let mut ds = DamageSet::empty();
+                ds.set_single(Damage { x0: 0, y0: 0, x1: info.width, y1: info.height });
+                ds
+            },
+            last_flush_bytes: 0,
+            last_flush_bands: 1,
+            last_flush_rects: 0,
+            last_union_w: 0,
+            last_union_h: 0,
+            direct: true,
         }
     }
 
@@ -815,6 +863,21 @@ impl Screen {
     /// `TOUCHED_SINCE_DRAW` is untouched: a present landing under a live sprite still arms the
     /// repair through `note_present_over_sprite`, and it now has a live sprite to arm it for.
     pub fn flush(&mut self) {
+        // SHELLWIN-OOM — single-buffer mode: every draw already landed in the one real surface, so
+        // there is no back→front copy to perform (the pointers are equal — the row copy would be UB)
+        // and no panel present to bracket: this front is a WINDOW surface the compositor reads on
+        // the caller's explicit `wm` present, so the cursor bracket and the window-layer repair
+        // below belong to the PANEL screen, not to this one. Damage still clears so the accounting
+        // witnesses stay truthful (nothing was flushed).
+        if self.direct {
+            self.damage.clear();
+            self.last_flush_bytes = 0;
+            self.last_flush_bands = 1;
+            self.last_flush_rects = 0;
+            self.last_union_w = 0;
+            self.last_union_h = 0;
+            return;
+        }
         // FLICKER-3 — the CURSOR-13 bracket is owed only when this present can actually REACH the
         // sprite. It used to be unconditional: every desktop present — chiefly the status strip's
         // per-core load bars, a one-line band at the panel bottom repainting about once a second —

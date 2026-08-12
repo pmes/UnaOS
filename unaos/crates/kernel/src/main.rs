@@ -4494,7 +4494,7 @@ fn x86_render_service(cpu: usize) {
         let empty = || {
             (
                 alloc::vec::Vec::new(),
-                unaos_kernel::video::Screen::new(unaos_kernel::video::FrameBuffer::new()),
+                unaos_kernel::video::Screen::direct(unaos_kernel::video::FrameBuffer::new()),
                 unaos_kernel::console::Console::new(),
                 unaos_kernel::video::wm::WIN_NONE,
             )
@@ -4505,7 +4505,12 @@ fn x86_render_service(cpu: usize) {
                 Some((store, fb, id)) => {
                     let mut con = unaos_kernel::console::Console::new();
                     con.mark_in_window();
-                    (store, unaos_kernel::video::Screen::new(fb), con, id)
+                    // SHELLWIN-OOM — `direct`, NOT `new`: `Screen::new` double-buffers, and its
+                    // infallible `vec![0u8; len]` of a second surface-sized (~5 MB) back buffer is
+                    // the exact allocation that OOM-panicked GR26's metal boot at desktop-ready,
+                    // 14 ms after this window's first present. The surface store above is the one
+                    // buffer this window needs; `direct` adds zero.
+                    (store, unaos_kernel::video::Screen::direct(fb), con, id)
                 }
                 None => empty(),
             }

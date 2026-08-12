@@ -2388,6 +2388,39 @@ green; `UNAOS_WC=1 ./arroyo esp-x86` then `strings -a target/x86_64_esp/kernel.e
 render service and `open_shell_window` is `#[cfg(all(x86_64, wc))]`; `Console::in_window` defaults
 `false`. The arm build and the wc-off x86 build fold to the pre-arc behaviour exactly.
 
+#### SHELLWIN-OOM — the metal panic, the real allocation, and the single-buffer fix (GR27, 2026-08-11)
+
+**What metal showed (gr26-bootC capture, the first SHELLWIN boot).** At desktop-ready the kernel
+panicked: `memory allocation of 5086080 bytes failed` (`handle_alloc_error`) at `[19555ms]` — 14 ms
+after win=2 (the shell window, 1440x883x4 = 5,086,080 bytes exactly) presented its first frame CLEAN
+through `wm::create_at`. QEMU never reached this: the metal heap at desktop-ready is far tighter
+(the per-core WCPAR STAGE pool alone grows lazily toward ~32 MB of a ~48 MB heap).
+
+**The convicted allocation was NOT the surface store.** `open_shell_window`'s ~5 MB store was
+already fallible (`try_reserve_exact` → `[shellwin] DECLINE reason=alloc`) and it SUCCEEDED — the
+window presented. The abort came one step later in `x86_render_service`, where the surface was
+wrapped in `Screen::new`, whose back buffer is an infallible `vec![0u8; len]` — a SECOND
+surface-sized allocation, and the one the heap refused. Every fallibility audit had stopped at the
+allocation the arc added and missed the one the constructor it reused performs.
+
+**The fix removes the allocation instead of making it fallible (`Screen::direct`).** Double-buffering
+was waste on this path: a `Screen`'s front/back split exists to keep intermediate paint off the
+*panel* (write-only VRAM, damage-driven flush). The shell window's "front" is a cached-RAM `wm`
+surface the compositor composites FROM — so the shell now draws straight into it.
+`Screen::direct(front)` aliases `back = front`, allocates nothing (`back_store` stays empty), and
+`flush` reduces to damage-clear + stats: the pointers are equal, so the row copy would violate
+`copy_nonoverlapping`'s contract, and the cursor bracket / WC-I subtraction / `wm::service_damage`
+tail all belong to the PANEL screen, not a window surface. Presentation remains the caller's
+explicit owner-fenced `wm` present. Total shell cost drops from ~10 MB to the one ~5 MB store the
+panicking boot proved fits. Trade-off accepted: a composite that interleaves with a partial draw can
+read half-painted glyphs for one frame; the very next present corrects it, and the alternative was
+2x the surface in heap on the OOM path.
+
+**Standing rule this writes down.** An infallible multi-MB allocation on the desktop-ready path is a
+latent OOM panic that QEMU cannot catch. `Screen::new` still allocates infallibly and that is
+correct for the boot-time PANEL screen (no display without it); any *window*-surface `Screen` must
+use `direct` (or a future fallible constructor) — never crash the machine to deliver a feature.
+
 #### Three smaller defects the same arc closes
 
 * **`create` now composites.** A window's kernel chrome reaches the panel when the row exists, not at the
