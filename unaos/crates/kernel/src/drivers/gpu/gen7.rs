@@ -26,11 +26,15 @@
 //!   power/PM block, neither in a ring block, neither in a display block.
 //! * **R4 (`claim`)** — the GGTT-claim / ring-buffer-address rung. It reads R3's verdict and
 //!   branches: if R3 woke the GT it reads the RCS ring block, verifies a candidate GGTT
-//!   window is entirely unowned (every pre-image zero), and then performs **one reversible
-//!   PTE round-trip** — write a well-formed PTE (a real translated scratch page, not a magic
-//!   number) into the first slot of the verified-empty window, read back the `0 → pte`
-//!   transition, verify the neighbours did not smear, restore the whole touched
-//!   neighbourhood to zero and verify it. If R3 did NOT wake the GT (`Dark` — the outcome
+//!   window is entirely unowned, and then performs **one reversible PTE round-trip** — write
+//!   a well-formed PTE (a real translated scratch page, not a magic number) into the first
+//!   slot of the verified-unowned window, read back the `entry → pte` transition, verify the
+//!   neighbours did not smear, restore the whole touched neighbourhood to its captured entry
+//!   images and verify it. "Unowned" has TWO proven shapes (R4b, Boot Ab): every pre-image
+//!   zero, OR every pre-image the **firmware scratch-fill** — one identical valid PTE whose
+//!   frame is the BDSM stolen-memory base read from the host bridge THIS boot, uniform across
+//!   the window, both neighbours, and six distant probe slots. A window that is neither is
+//!   owned and refused. If R3 did NOT wake the GT (`Dark` — the outcome
 //!   Boot D's `gt-still-dark` makes most likely) it writes **nothing**: it runs the identical
 //!   read-only census and reports `verdict=gated-on-wake` loudly, so the rung still produces a
 //!   verdict and moves the GEN7-vs-Kepler question rather than silently doing nothing behind a
@@ -45,10 +49,11 @@
 //!    (`INSTPM 0x2050`, `RCS_WAKE 0x2700`) and re-parks `INSTPM` before it returns; R3 writes
 //!    only the two **forcewake request** registers (`0x0A188`, `0x1300B0`) and releases each
 //!    back to its entry value in the same rung. R4 writes **at most three GGTT PTEs** — and
-//!    only on the woke branch, only into a window every slot of which it first read as zero,
-//!    and all three restored to zero and re-read before it returns; on the dark branch R4
-//!    writes nothing at all. No rung writes a GGTT entry that was not zero, a ring register,
-//!    or anything in a display block. ⚠ Stated precisely, because the
+//!    only on the woke branch, only into a window every slot of which it first read as
+//!    unowned (all-zero, or the uniform derived firmware scratch-fill — R4b), and all three
+//!    restored to their captured entry images and re-read before it returns; on the dark
+//!    branch R4 writes nothing at all. No rung writes a GGTT entry it did not first prove
+//!    unowned, a ring register, or anything in a display block. ⚠ Stated precisely, because the
 //!    loose version of this sentence was wrong: **the one display-block offset this file
 //!    touches is read, never written, in either rung.** That offset is `PCH_PP_CONTROL`
 //!    (`0xC7204`) — a South Display Engine Panel Power Sequencer register, and unambiguously
@@ -120,8 +125,8 @@
 // physical frame, and programs a PTE that maps it — the same allocator and translate walk
 // `igpu::bring_up_blt_ring` uses for the ring page, so the PTE value is a real address, not a
 // fabricated constant. The page is freed before `claim` returns — but ONLY once the GGTT
-// neighbourhood is proven restored to zero; if the reversal does not verify the page is leaked,
-// never handed back to the allocator while a PTE might still map it.
+// neighbourhood is proven restored to its captured entry images; if the reversal does not
+// verify the page is leaked, never handed back to the allocator while a PTE might still map it.
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 
 /// Register offsets into BAR0 (GTTMMADR) of BDF `0:2.0`, each tagged with its pin status.
@@ -1980,14 +1985,43 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
 //
 //  * **R3 CONFIRMED the wake (`GtWake::write_ok()` — `Woke` or `LiveAlready`).** R4 reads the
 //    RCS ring block (identifying the four registers command submission will program — G3,
-//    IVB-PINNED), verifies a candidate GGTT window is entirely unowned (every pre-image and both
-//    bracketing neighbours read zero), and then performs ONE reversible PTE round-trip on the
-//    first slot: write a well-formed PTE, read back the `0 → pte` transition, check the
-//    neighbours did not smear, restore the whole touched neighbourhood to zero, and re-read to
-//    prove it. This is the draft's read-only refusal law (§5, "refuse any range whose pre-images
-//    are not all zero") plus the single write the GR26 brief asks for — a real dark→live→dark
-//    transition on a page-table entry, under R3's exact discipline (entry image, reversible,
-//    restore-verify).
+//    IVB-PINNED), verifies a candidate GGTT window is entirely unowned, and then performs ONE
+//    reversible PTE round-trip on the first slot: write a well-formed PTE, read back the
+//    `entry → pte` transition, check the neighbours did not smear, restore the whole touched
+//    neighbourhood to its captured entry images, and re-read to prove it. This is the draft's
+//    refusal law (§5) plus the single write the GR26 brief asks for — a real transition on a
+//    page-table entry, under R3's exact discipline (entry image, reversible, restore-verify).
+//
+// ## R4b — "unowned" has a second shape on this part (Boot Ab, gr27-bootA)
+//
+// Boot Ab parked the first cut at `range-owned-refused`: every slot in the window, both
+// neighbours, and every R1 census sample from slot 65536 up read the IDENTICAL `8BA00003`,
+// whose frame is exactly `bdsm_base=8BA00000` from the same boot's `dsm` line. That is the
+// firmware's whole-GGTT init — every entry pointed at the stolen-memory scratch page so no
+// stray translation ever walks into DRAM — and it means the all-zero emptiness test can never
+// pass on this machine: the zero-shaped "empty" simply does not occur. R4b therefore admits a
+// SECOND unowned shape, but only when four independent reads agree it is the firmware fill and
+// not somebody's buffer:
+//
+//  1. **Uniform** — all `CLAIM_COUNT` pre-images and both bracketing neighbours read one
+//     identical value (a single outlier makes the window owned and refused, as before);
+//  2. **Well-formed** — that value has the PTE valid bit set and a non-zero frame (the R1
+//     census invariant);
+//  3. **Derived, not remembered** — its frame equals `BDSM & 0xFFF00000` read from the host
+//     bridge (BDF 0:0.0, cfg 0xB0) THIS boot — the scratch page's address is taken from the
+//     hardware's own answer, never from Boot Ab's constant;
+//  4. **Global** — six distant probe slots, far outside the window and above the low
+//     firmware-framebuffer region, all read the same value. A locally-uniform buffer that
+//     happens to map the scratch page fails this leg and is refused (`fill-not-global`).
+//
+// Any failure of legs 2-4 on an otherwise-uniform window is its own loud verdict and a park —
+// never a fallthrough into the write. On the confirmed fill, the round-trip is IDENTICAL to
+// the empty-window one except the entry image is `fill` instead of zero: the pre-write gate
+// re-reads all three slots and refuses on any drift, the restore writes `fill` back (the
+// neighbour writes are identities — each was verified equal to `fill` at the gate), and the
+// reversal is proven by re-read before the scratch page is freed. One extra refusal is new:
+// if the allocated page's PTE would EQUAL the fill value, the transition is unwitnessable and
+// nothing is written (`claim-pte-indistinct`).
 //  * **R3 reached the GT but did NOT confirm the wake (`GtWake::WokeNoAck`).** The battery moved
 //    (so the recon runs and reports its readings), but the ack never asserted. This is the
 //    least-certain write-enabling arm and this is the FIRST-EVER GGTT write on live silicon, so
@@ -2006,8 +2040,9 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
 //
 // A powered-down or gated GGTT window may read `0x00000000` for everything (draft §4.4). So
 // the write path's success is NOT "we wrote a PTE" — it is `slot_held == pte`, a specific
-// non-zero value only our write could have put there, read back from a slot whose pre-image we
-// verified was zero. If the GGTT is gated even on a woken GT (the well is held for the render
+// value only our write could have put there (guaranteed distinct from the entry image), read
+// back from a slot whose pre-image the write gate verified. If the GGTT is gated even on a
+// woken GT (the well is held for the render
 // domain but the GGTT needs it too, or R3 released it — see below), `slot_held` stays zero,
 // `landed=0`, and the rung prints `verdict=claim-write-void` — an honest reading, not a
 // success. The neighbour-smear check is the tree's own (`igpu.rs` ~869-885), reused verbatim
@@ -2026,13 +2061,15 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
 // mistaken for a dead engine. Either way R4 does not re-hold forcewake: acquiring it is R3's
 // job and re-implementing it here would duplicate the exact code the lane keeps in one place.
 //
-// ## Reversibility — three PTEs, all into a verified-zero window, all restored
+// ## Reversibility — three PTEs, all into a verified-unowned window, all restored
 //
 // The only writes R4 ever makes are on the woke branch, into a window it first read as
-// entirely zero, and they are undone before the rung returns: it writes the PTE to the target
-// slot and (on the restore) zero to the target and both neighbours — every one of which was
-// verified zero at entry, so writing zero to a neighbour is an identity, and writing the PTE
-// then zero to the target is a clean undo. The final read of all three proves `restored`. No
+// entirely unowned (all-zero, or the confirmed scratch-fill — R4b), and they are undone before
+// the rung returns: it writes the PTE to the target slot and (on the restore) the captured
+// entry image to the target and both neighbours — every one of which was verified equal to
+// that image at the pre-write gate, so the neighbour writes are identities, and writing the
+// PTE then the entry image to the target is a clean undo. The final read of all three proves
+// `restored`. No
 // clock, no RC6/RPS policy, no voltage/frequency request, and nothing in a display block is
 // written — the panel is the Kepler's regardless (`igpu.rs` ~778, Boot AS).
 
@@ -2055,9 +2092,10 @@ const CLAIM_COUNT: usize = 64; // 1 ring page + 63 scratch pages
 /// # Safety
 /// Same contract as `recon` / `wake` / `forcewake`: `bar0` is a live MMIO mapping of at least
 /// `bar0_size` bytes of the IGD's BAR0. R4 writes at most three GGTT PTEs, only when
-/// `wake.reachable()`, only into a window every slot of which it first read as zero, and it
-/// restores all three to zero and re-reads before returning. It writes no ring register and no
-/// display register.
+/// `wake.reachable()`, only into a window every slot of which it first read as unowned
+/// (all-zero, or the four-leg-confirmed firmware scratch-fill — R4b), and it restores all
+/// three to their captured entry images and re-reads before returning. It writes no ring
+/// register and no display register.
 pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, wake: GtWake) {
     serial_println!(
         ":: gen7: r4 begin rung=R4 wake={} reachable={} bdf={}:{}.{} bar0_size={} ladder=GEN7-3D ::",
@@ -2119,17 +2157,33 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
     );
 
     // ---- Read-only census of the candidate window, BOTH branches --------------------------
-    // Every pre-image is read. Only NON-zero slots are printed individually (the ones that
-    // decide the refusal — an owned window must name which slots are owned); the common
-    // all-zero window is summarised. The two bracketing neighbours are read too: a claim is
+    // Every pre-image is read. Only OUTLIER slots are printed individually — slots that differ
+    // from the window's first image are the ones that decide a refusal (Boot Ab printed all 64
+    // identical scratch-fill lines under the old nonzero rule; a uniform window is one summary
+    // line now, whatever its value). The two bracketing neighbours are read too: a claim is
     // only safe if the slots on either side of the window are also unowned.
     let mut zeros = 0u32;
     let mut nonzero = 0u32;
     let mut first_nonzero_slot: i64 = -1;
     let mut first_nonzero_pte = 0u32;
+    let mut fill = 0u32; // the FIRST slot's image — the uniformity yardstick
+    let mut uniform = true; // every window slot reads exactly `fill`
     for k in 0..CLAIM_COUNT {
         let s = CLAIM_FIRST + k;
         let pte = rd(bar0, GTT_BASE + s * 4);
+        if k == 0 {
+            fill = pte;
+        } else if pte != fill {
+            uniform = false;
+            serial_println!(
+                ":: gen7: r4 ggtt outlier slot={} off={:06X} pte={:08X} pfn={:05X} fill={:08X} ::",
+                s,
+                GTT_BASE + s * 4,
+                pte,
+                pte >> 12,
+                fill
+            );
+        }
         if pte == 0 {
             zeros += 1;
         } else {
@@ -2138,20 +2192,13 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
                 first_nonzero_slot = s as i64;
                 first_nonzero_pte = pte;
             }
-            serial_println!(
-                ":: gen7: r4 ggtt owned slot={} off={:06X} pte={:08X} pfn={:05X} ::",
-                s,
-                GTT_BASE + s * 4,
-                pte,
-                pte >> 12
-            );
         }
     }
     let prev_nb = rd(bar0, GTT_BASE + (CLAIM_FIRST - 1) * 4);
     let next_nb = rd(bar0, GTT_BASE + (CLAIM_FIRST + CLAIM_COUNT) * 4);
     let range_empty = nonzero == 0 && prev_nb == 0 && next_nb == 0;
     serial_println!(
-        ":: gen7: r4 ggtt-claim first={} count={} zeros={} nonzero={} prev={:08X} next={:08X} first_nonzero_slot={} range_empty={} base={:06X} base_pin=unpinned ::",
+        ":: gen7: r4 ggtt-claim first={} count={} zeros={} nonzero={} prev={:08X} next={:08X} first_nonzero_slot={} range_empty={} fill={:08X} uniform={} base={:06X} base_pin=unpinned ::",
         CLAIM_FIRST,
         CLAIM_COUNT,
         zeros,
@@ -2160,8 +2207,70 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
         next_nb,
         first_nonzero_slot,
         if range_empty { 1 } else { 0 },
+        fill,
+        if uniform { 1 } else { 0 },
         GTT_BASE
     );
+
+    // ---- R4b — is the non-empty window the FIRMWARE SCRATCH-FILL? (read-only, BOTH branches)
+    // Boot Ab: the whole GGTT from slot 65536 up reads one identical `8BA00003` whose frame is
+    // the BDSM stolen-memory base — firmware's init fill, not ownership. Four legs, each a
+    // fresh read, each able to say NO (see the R4b section above): uniform incl. neighbours;
+    // valid-PTE shape (the R1 census invariant); frame == BDSM base read from the host bridge
+    // THIS boot (BDF 0:0.0 cfg 0xB0 — the R1e read, alive regardless of GT power); and six
+    // distant probe slots agreeing, so a locally-uniform buffer cannot impersonate the fill.
+    let uniform_nonzero = uniform && fill != 0 && prev_nb == fill && next_nb == fill;
+    let bdsm = crate::arch::pci::read_config_32(0, 0, 0, 0xB0);
+    let bdsm_base = bdsm & 0xFFF0_0000;
+    let fill_wellformed = (fill & 1) != 0 && (fill & 0xFFFF_F000) != 0;
+    let fill_is_bdsm = (fill >> 12) == (bdsm_base >> 12);
+    // Distant probes: far outside [CLAIM_FIRST, CLAIM_FIRST+COUNT], above the low slots the
+    // firmware maps to its framebuffer (R1: slots 0..4096 carry incrementing frames; slot
+    // 65536 already reads the fill). All in-array; the highest stays clear of the last slot.
+    const FAR_PROBE: [usize; 6] = [0x10000, 0x20000, 0x30000, 0x60000, 0x70000, 0x7FFF0];
+    let mut far_probed = 0u32;
+    let mut far_match = 0u32;
+    let mut far_first_bad: i64 = -1;
+    let mut far_first_bad_pte = 0u32;
+    if uniform_nonzero {
+        for &s in FAR_PROBE.iter() {
+            // Bounds-checked against the size we were GIVEN, like the window itself — the
+            // earlier refusal only covered the claim window. An out-of-range probe is skipped,
+            // and skipping COUNTS AGAINST the fill: `fill_global` demands all six probed.
+            let off = GTT_BASE + s * 4;
+            if off + 4 > bar0_size {
+                continue;
+            }
+            far_probed += 1;
+            let pte = rd(bar0, off);
+            if pte == fill {
+                far_match += 1;
+            } else if far_first_bad < 0 {
+                far_first_bad = s as i64;
+                far_first_bad_pte = pte;
+            }
+        }
+    }
+    let fill_global =
+        far_probed as usize == FAR_PROBE.len() && far_match == far_probed;
+    let scratch_fill =
+        uniform_nonzero && fill_wellformed && fill_is_bdsm && fill_global;
+    if uniform_nonzero {
+        serial_println!(
+            ":: gen7: r4 fill-check fill={:08X} bdsm={:08X} bdsm_base={:08X} wellformed={} frame_is_bdsm={} far_match={}/{} far_probed={} far_first_bad_slot={} far_first_bad_pte={:08X} scratch_fill={} src=METAL/BootAb dec=derived-this-boot ::",
+            fill,
+            bdsm,
+            bdsm_base,
+            if fill_wellformed { 1 } else { 0 },
+            if fill_is_bdsm { 1 } else { 0 },
+            far_match,
+            FAR_PROBE.len(),
+            far_probed,
+            far_first_bad,
+            far_first_bad_pte,
+            if scratch_fill { 1 } else { 0 }
+        );
+    }
 
     // ---- Branch on R3's verdict -----------------------------------------------------------
     if !wake.reachable() {
@@ -2206,19 +2315,39 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
 
     // WOKE branch — R3 produced a CONFIRMED wake (`write_ok()`). The window must be verified
     // unowned before a single write; an owned window is refused, never overwritten (draft §5
-    // refusal law).
-    if !range_empty {
-        serial_println!(
-            ":: gen7: r4 verdict=range-owned-refused first_nonzero_slot={} first_nonzero_pte={:08X} prev={:08X} next={:08X} writes=0 note=something-owns-the-window-pick-another-never-overwrite-a-populated-PTE ::",
-            first_nonzero_slot,
-            first_nonzero_pte,
-            prev_nb,
-            next_nb
-        );
-        serial_println!(":: gen7: r4 next=STOP-candidate-window-owned-choose-another-CLAIM_FIRST note=no-ggtt-written ::");
+    // refusal law). Two unowned shapes pass: all-zero, or the four-leg-confirmed scratch-fill
+    // (R4b). A uniform non-zero window that FAILED a fill leg is its own loud park — the fill
+    // hypothesis was falsified by a read, and improvising past that is exactly what the ladder
+    // forbids.
+    if !range_empty && !scratch_fill {
+        if uniform_nonzero {
+            serial_println!(
+                ":: gen7: r4 verdict=fill-hypothesis-refuted fill={:08X} bdsm_base={:08X} wellformed={} frame_is_bdsm={} far_match={}/{} writes=0 note=window-uniform-but-a-fill-leg-said-NO-treat-as-owned-never-overwrite ::",
+                fill,
+                bdsm_base,
+                if fill_wellformed { 1 } else { 0 },
+                if fill_is_bdsm { 1 } else { 0 },
+                far_match,
+                FAR_PROBE.len()
+            );
+            serial_println!(":: gen7: r4 next=STOP-uniform-window-is-not-the-derived-scratch-fill-park-and-report note=no-ggtt-written ::");
+        } else {
+            serial_println!(
+                ":: gen7: r4 verdict=range-owned-refused first_nonzero_slot={} first_nonzero_pte={:08X} prev={:08X} next={:08X} writes=0 note=something-owns-the-window-pick-another-never-overwrite-a-populated-PTE ::",
+                first_nonzero_slot,
+                first_nonzero_pte,
+                prev_nb,
+                next_nb
+            );
+            serial_println!(":: gen7: r4 next=STOP-candidate-window-owned-choose-another-CLAIM_FIRST note=no-ggtt-written ::");
+        }
         serial_println!(":: gen7: r4 end ::");
         return;
     }
+    // The image every touched slot held at entry and must hold again at exit: zero on the
+    // empty shape, the confirmed fill on the scratch shape.
+    let base_img: u32 = if range_empty { 0 } else { fill };
+    let mode = if range_empty { "empty" } else { "scratch-fill" };
 
     // ---- The reversible claim — one PTE round-trip, real page, restore-verified -----------
     // A real translated scratch page so the PTE is a genuine address (no fabricated constant),
@@ -2250,40 +2379,75 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
         return;
     }
     let pte = (phys as u32) | 1; // valid bit — draft G6, the exact form the tree writes
+    // R4b refusal: a PTE equal to the entry image makes the transition unwitnessable — the
+    // read-back could not distinguish "our write landed" from "nothing happened". Astronomically
+    // unlikely (the allocator would have to hand back the scratch page itself), but an
+    // instrument that cannot say NO is a Wall D defect, so it is checked, not assumed.
+    if pte == base_img {
+        dealloc(page, layout);
+        serial_println!(
+            ":: gen7: r4 verdict=claim-pte-indistinct mode={} pte={:08X} base_img={:08X} writes=0 note=transition-unwitnessable-nothing-written ::",
+            mode,
+            pte,
+            base_img
+        );
+        serial_println!(":: gen7: r4 next=STOP-pte-equals-entry-image note=no-ggtt-written ::");
+        serial_println!(":: gen7: r4 end ::");
+        return;
+    }
     let target_off = GTT_BASE + CLAIM_FIRST * 4;
     let prev_off = target_off - 4;
     let next_off = target_off + 4;
 
-    // Entry images. The whole window is verified zero, but re-read the three touched slots
-    // here so the transition is measured against a fresh baseline, not a stale one.
+    // Entry images — the PRE-WRITE GATE. The whole window was verified unowned above, but the
+    // three touched slots are re-read here so the transition is measured against a fresh
+    // baseline; any drift from the census reading means the window changed under us, and the
+    // write is REFUSED — park, never improvise past a diverging read.
     let slot_pre = rd(bar0, target_off);
     let prev_pre = rd(bar0, prev_off);
     let next_pre = rd(bar0, next_off);
+    if slot_pre != base_img || prev_pre != base_img || next_pre != base_img {
+        dealloc(page, layout);
+        serial_println!(
+            ":: gen7: r4 verdict=claim-entry-drifted mode={} slot_pre={:08X} prev_pre={:08X} next_pre={:08X} base_img={:08X} writes=0 note=window-changed-between-census-and-claim-nothing-written ::",
+            mode,
+            slot_pre,
+            prev_pre,
+            next_pre,
+            base_img
+        );
+        serial_println!(":: gen7: r4 next=STOP-entry-image-drifted-park-and-report note=no-ggtt-written ::");
+        serial_println!(":: gen7: r4 end ::");
+        return;
+    }
 
     // Write the PTE, then read back the target and both neighbours under the hold.
     wr(bar0, target_off, pte);
     let slot_held = rd(bar0, target_off);
     let prev_held = rd(bar0, prev_off);
     let next_held = rd(bar0, next_off);
-    // The transition witness: a specific non-zero value only our write could have put in a slot
-    // whose pre-image was zero. A gated GGTT reads back zero and this is 0 — `landed=0`.
-    let landed = slot_held == pte && slot_pre == 0;
+    // The transition witness: a specific value only our write could have put in a slot whose
+    // pre-image was gate-verified to be `base_img` (and `pte != base_img` is guaranteed above).
+    // A gated GGTT reads back the unchanged image and this is false — `landed=0`.
+    let landed = slot_held == pte;
     let smear_held = prev_held != prev_pre || next_held != next_pre;
 
-    // Restore: write zero to the target (undo) and to both neighbours (identity — each was
-    // verified zero at entry), then re-read all three to prove the neighbourhood is back.
-    wr(bar0, prev_off, 0);
-    wr(bar0, target_off, 0);
-    wr(bar0, next_off, 0);
+    // Restore: write the entry image to the target (undo) and to both neighbours (identity —
+    // each was gate-verified equal to `base_img`), then re-read all three to prove the
+    // neighbourhood is back.
+    wr(bar0, prev_off, base_img);
+    wr(bar0, target_off, base_img);
+    wr(bar0, next_off, base_img);
     let slot_post = rd(bar0, target_off);
     let prev_post = rd(bar0, prev_off);
     let next_post = rd(bar0, next_off);
-    let restored = slot_post == 0 && prev_post == 0 && next_post == 0;
+    let restored = slot_post == base_img && prev_post == base_img && next_post == base_img;
     let smear_post = prev_post != prev_pre || next_post != next_pre;
     let clean = restored && !smear_held && !smear_post;
 
     // The scratch frame returns to the allocator ONLY when the neighbourhood is proven back to
-    // zero and nothing smeared. A GGTT PTE that still mapped this frame after a free would hand
+    // its entry images and nothing smeared. A GGTT PTE that still mapped this frame after a
+    // free would hand
     // the GT a DMA path into reused kernel heap — so if the reversal did not verify we LEAK the
     // page (a one-shot, boot-time 4 KiB cost) rather than surrender a possibly-mapped frame.
     // This is the rung's own refuse-on-any-doubt discipline applied to its single free.
@@ -2295,7 +2459,7 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
     };
 
     serial_println!(
-        ":: gen7: r4 claim target_off={:06X} slot={} phys={:016X} pte={:08X} slot_pre={:08X} slot_held={:08X} slot_post={:08X} landed={} restored={} ::",
+        ":: gen7: r4 claim mode={mode} target_off={:06X} slot={} phys={:016X} pte={:08X} slot_pre={:08X} slot_held={:08X} slot_post={:08X} landed={} restored={} ::",
         target_off,
         CLAIM_FIRST,
         phys,
@@ -2334,8 +2498,9 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
         "claim-roundtrip-ok"
     };
     serial_println!(
-        ":: gen7: r4 verdict={} wake={} landed={} restored={} smear={} writes=4 slots=3 freed={} reversible={} rung=R4 note=forcewake-released-by-R3-GGTT-claim-ran-with-well-not-held-page-freed-only-when-reversal-verified ::",
+        ":: gen7: r4 verdict={} mode={} wake={} landed={} restored={} smear={} writes=4 slots=3 freed={} reversible={} rung=R4 note=forcewake-released-by-R3-GGTT-claim-ran-with-well-not-held-page-freed-only-when-reversal-verified ::",
         verdict,
+        mode,
         wake.name(),
         if landed { 1 } else { 0 },
         if restored { 1 } else { 0 },
@@ -2347,7 +2512,7 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
         ":: gen7: r4 next={} note=one-PTE-round-trip-restored-and-verified-no-display-register-touched ::",
         match verdict {
             "claim-roundtrip-ok" =>
-                "R5-map-the-ring-page-and-submit-MI_STORE_DATA_IMM-into-a-GGTT-scratch-dword",
+                "R5-map-the-ring-page-and-submit-MI_STORE_DATA_IMM-into-a-GGTT-scratch-dword-restoring-the-fill-on-teardown",
             "claim-write-void" =>
                 "STOP-GGTT-gated-with-well-released-R5-must-hold-forcewake-around-the-claim",
             "claim-restore-dirty" =>
