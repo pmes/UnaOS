@@ -10723,6 +10723,23 @@ const FURNITURE_MAX: usize = 2;
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 const _: () = assert!(FURNITURE_MAX == super::strip::STRIP_MAX);
 
+/// MENU-OCC — occluder slots for TRANSIENT modal surfaces that are NOT `strip::TENANTS` members.
+///
+/// Today this is exactly the SHARD dropdown ([`super::crystal::open_rect`]), open only while the
+/// operator holds the crystal menu. [`occ_clip`] pushes it into every window's clip on the same law
+/// the dock and bar ride — [`composite_once`] paints `crystal::compose` at the pass TAIL, after every
+/// window, so an open menu is topmost by construction and a window blit that crosses it must withhold
+/// its columns or the menu is overwritten mid-frame (Boot C, operator: "menubar menu gets
+/// overwritten").
+///
+/// It is a DEDICATED slot, deliberately SEPARATE from [`FURNITURE_MAX`], for the reason
+/// [`super::crystal`]'s ledger and the STRIPFACTOR note both give: registering the dropdown as a strip
+/// tenant would spend a PERMANENT occlusion slot on a surface absent for all but a few seconds of a
+/// boot, and it would break the `FURNITURE_MAX == strip::STRIP_MAX` relation the WCK5/STRIPFACTOR
+/// capacity prose rests on. Growing [`OCC_MAX`] by a NAMED transient slot — rather than widening the
+/// furniture count — is the honest admission the STRIPFACTOR note asked the next arc for.
+const MENU_OCC_MAX: usize = 1;
+
 /// WCK4 — how many boxes a clip can hold: every window, plus every furniture strip.
 ///
 /// [`occ_clip`] can never fill more than `MAX_WINDOWS - 1 + FURNITURE_MAX` (see [`OCC_CLIP_MAX`]), so
@@ -10738,7 +10755,14 @@ const _: () = assert!(FURNITURE_MAX == super::strip::STRIP_MAX);
 /// GENERALISES that push to every `strip::rects` rect, so the menu bar is protected on the same path.
 /// A tenant added to the registry without widening this binding fails the BUILD (the assert at
 /// [`OCC_CLIP_MAX`]), never the panel.
-const OCC_MAX: usize = MAX_WINDOWS + FURNITURE_MAX;
+///
+/// MENU-OCC — plus [`MENU_OCC_MAX`] transient slots for the modal surfaces that are not strip
+/// tenants (the SHARD dropdown). `erase_clip`'s worst case is still `MAX_WINDOWS + FURNITURE_MAX`
+/// (it does not carry the transient — the DESKTOP present subtracts the menu directly, see
+/// `Screen::present_background`), so the array keeps one box of headroom for it; `occ_clip`'s worst
+/// case grows by the menu to `MAX_WINDOWS - 1 + FURNITURE_MAX + MENU_OCC_MAX` and keeps its own one
+/// box of headroom too. Both terms are one below `OCC_MAX`.
+const OCC_MAX: usize = MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX;
 
 /// WCK5 × STRIPFACTOR — **[`occ_clip`]'s own population bound, now that it carries EVERY strip.**
 ///
@@ -10757,12 +10781,14 @@ const OCC_MAX: usize = MAX_WINDOWS + FURNITURE_MAX;
 /// published over — the failure WCK4's own sizing note named.
 ///
 /// Asserted rather than asserted-in-prose, because the facts that make it true live in different
-/// places: the `-1` is the `(z, id) <= (z, id)` self-exclusion in [`occ_clip`]'s loop, and the
-/// `FURNITURE_MAX` is the registry's capacity, `const`-asserted equal to `strip::STRIP_MAX`.
-const OCC_CLIP_MAX: usize = (MAX_WINDOWS - 1) + FURNITURE_MAX;
+/// places: the `-1` is the `(z, id) <= (z, id)` self-exclusion in [`occ_clip`]'s loop, the
+/// `FURNITURE_MAX` is the registry's capacity, `const`-asserted equal to `strip::STRIP_MAX`, and the
+/// `MENU_OCC_MAX` is the transient dropdown [`occ_clip`] now also pushes (MENU-OCC).
+const OCC_CLIP_MAX: usize = (MAX_WINDOWS - 1) + FURNITURE_MAX + MENU_OCC_MAX;
 const _: () = assert!(
     OCC_CLIP_MAX <= OCC_MAX,
-    "occ_clip's population (every row but the subject, plus every furniture strip) must fit OccClip"
+    "occ_clip's population (every row but the subject, plus every furniture strip and the open menu) \
+     must fit OccClip"
 );
 
 #[derive(Clone, Copy)]
@@ -11102,6 +11128,31 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
                     OB_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
+
+            // MENU-OCC — the SHARD dropdown, a THIRD occluder on the SAME law as the two strips:
+            // `composite_once` paints `crystal::compose` at the pass tail, after every window, so an
+            // open menu is topmost by construction and a window whose blit crosses it must withhold
+            // the menu's columns — otherwise the window paints over the dropdown mid-frame and the
+            // strip-tail repaint clobbers it back a pass later (Boot C, operator: "menubar menu gets
+            // overwritten"). Admitted for every subject it meets, no `(z, id)` term, exactly as the
+            // strips are.
+            //
+            // NOT witness-counted here: unlike the dock and bar the dropdown never opens during the
+            // headless gate's drags, so a `[drag-occ]` field for it would be permanently vacuous. Its
+            // falsifiable proof is `crystal::selftest`'s MENU-OCC leg, which drives the same primitives
+            // ([`OccClip::push`], [`prepare`], [`OccRows::spans`], [`span_occ`]) against a synthetic
+            // window that crosses the open menu — see [`occ_menu_probe`].
+            //
+            // The rect is [`super::crystal::open_rect`], the menu's own accessor, which returns `None`
+            // after one relaxed load on every boot with the menu closed — so this arm costs one atomic
+            // per window and pushes nothing until the operator opens the SHARD menu. Its slot is
+            // [`MENU_OCC_MAX`], reserved above; `c.push` cannot drop it (`OCC_CLIP_MAX` accounts for
+            // it and is `const`-asserted to fit `OCC_MAX`).
+            if let Some(b) = super::crystal::open_rect(pw, ph) {
+                if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) {
+                    let _ = c.push(b);
+                }
+            }
         }
     }
     c
@@ -11196,6 +11247,36 @@ pub(crate) fn occ_bar_probe(
     }
 
     OccBarProbe { pop_prot, px_prot, pop_fault: pop_prot, px_fault }
+}
+
+/// MENU-OCC — **the SHARD dropdown's occlusion probe, PROVEN able to fire**, on exactly the bar's
+/// terms. Witness + x86 only.
+///
+/// [`occ_clip`] now pushes the open menu ([`super::crystal::open_rect`]) into every window's clip on
+/// the same law the dock and bar ride, but — like the DEFAULT-OFF bar before [`occ_bar_probe`] — its
+/// witness on the live `[drag-occ]` line would be vacuous: no headless gate opens the menu during a
+/// drag, so no boot could read it nonzero. The occlusion arithmetic is furniture-agnostic:
+/// [`OccClip::push`] + [`OccClip::prepare`] + [`OccRows::spans`] + [`span_occ`] withhold ANY pushed
+/// rect's columns from a crossing blit, and the menu is pushed on identical terms, so its proof is the
+/// SAME probe against the menu's rect. This delegates to [`occ_bar_probe`] rather than re-deriving the
+/// span walk, so the two furniture kinds cannot drift in what "occluded" means.
+///
+/// `menu` is [`super::crystal::menu_rect`]'s rect; `win` is a window box that crosses it. The
+/// PROTECTED run reads `px_prot > 0` (the menu's columns the window's chrome would have published,
+/// withheld); the FAULT run walks the clip empty and reads `px_fault == 0` — the exact degenerate the
+/// bar's FORBID names, reproduced so the leg is non-vacuous rather than trusted.
+///
+/// Gated on `wc` as well as `witness`, unlike [`occ_bar_probe`]: its sole caller
+/// [`super::crystal::selftest`] lives in the `wc`-gated `crystal` module, so a `witness`-without-`wc`
+/// build would compile this with no caller. The delegation keeps [`occ_bar_probe`] used on that same
+/// leg only through the (also `wc`-gated) menu bar fixture, exactly as before this arc.
+#[cfg(all(feature = "witness", feature = "wc", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn occ_menu_probe(
+    menu: (usize, usize, usize, usize),
+    win: (usize, usize, usize, usize),
+) -> OccBarProbe {
+    occ_bar_probe(menu, win)
 }
 
 // ---- WCK4: the erase's own clip ----------------------------------------------------------------

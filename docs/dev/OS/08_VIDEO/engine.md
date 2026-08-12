@@ -2158,28 +2158,40 @@ what returns them.
 console window's `oy` centres inside the work area (`wtop + (ph - wtop - chrome_h - oh)/2`) instead
 of on the panel. Same `+ wtop` shape, same reduction at zero.
 
-##### What was NOT taken: the crystal as an `occ_clip` citizen
+##### MENU-OCC — the crystal IS an `occ_clip` citizen now (GR26, `menu-overwrite` arc)
 
-The GR25 baton's cosmetic clip-citizen issue — a window compositing over an open menu — is **left
-open, deliberately**, because the accessor does not feed `occ_clip` cleanly and the brief's own
-condition ("if that widens the arc, note it and leave it") is met twice over:
+The two holes this section deferred were the `menu-overwrite` arc's whole brief, and both are
+closed. The Boot C symptom the operator reported was blunter than "cosmetic": with a window under
+the open SHARD menu, a window blit that crossed the dropdown published over it and the strip tail
+clobbered it back a frame later — "menubar menu gets overwritten". Two changes, one per hole:
 
-* **Capacity is const-asserted to the registry.** `wm::FURNITURE_MAX` carries
-  `const _: () = assert!(FURNITURE_MAX == strip::STRIP_MAX)` — STRIPFACTOR's guard that a tenant
-  added to the registry widens `OCC_MAX` by construction. The dropdown is deliberately not a tenant,
-  so admitting it means breaking that relation into "tenants plus transients", which re-sizes the
-  `OCC_MAX`-shaped arrays on the per-window blit hot path and rewrites the capacity prose the WCK5
-  and STRIPFACTOR ledgers rest on.
-* **It needs a dismissal repaint that does not exist.** `strip::erase_rect` paints `DESKTOP_BG` over
-  the vacated rect and damages nothing. The dock never exercises this because it never vacates. A
-  menu whose rows the windows beneath had been WITHHOLDING would, on dismissal, be replaced by
-  desktop background with no window re-damaged to repaint it — a hole in the window instead of a
-  menu, i.e. strictly worse than the cosmetic defect being fixed. Closing it properly needs the
-  `damage_intersecting` + `request_full_present` treatment `wm::reclaim` already gives vacated
-  window boxes, driven from `crystal::dismiss`.
+* **The dropdown is a WINDOW-blit occluder, through a DEDICATED transient slot.** `occ_clip` now
+  pushes `crystal::open_rect(pw, ph)` into every window's clip after the two strips, on the identical
+  law (`composite_once` paints `crystal::compose` at the pass tail, after every window, so an open
+  menu is topmost by construction — no `(z, id)` term). The capacity was NOT solved by widening
+  `FURNITURE_MAX`: that stays `const`-asserted equal to `strip::STRIP_MAX`, because the dropdown is
+  not a strip tenant and a tenancy would spend a permanent occlusion slot on a surface absent for all
+  but a few seconds of a boot. Instead a new named `wm::MENU_OCC_MAX = 1` grows `OCC_MAX` and
+  `OCC_CLIP_MAX` by exactly one transient box — the "dedicated menu-occluder slot rather than widening
+  the furniture array" the deferral asked for. `erase_clip` does not carry the menu (its worst case is
+  unchanged); the DESKTOP present already subtracted it (`present_background`), so the two clip paths
+  now cover the menu on both sides of the compositor.
+* **Dismissal repaints by the owners.** `crystal::repaint_vacated`, called from `compose`'s two erase
+  branches right after `strip::erase_rect`, gives the vacated rect the `damage_intersecting` +
+  `request_full_present` pair `wm::reclaim` gives a vacated window box: every window overlapping the
+  erased rect is re-damaged and the desktop layer is asked to repaint its own rows, so the `DESKTOP_BG`
+  the erase stamped is replaced by the owners on the next composite rather than left as a hole. It runs
+  at the composite tail, where `composite_inner` has returned and the window-table lock is released, so
+  the damage lock is taken cleanly; `SLOT` is cleared before the call, so no repaint loop. The residual
+  is one bounded frame of `DESKTOP_BG` — a hole that fills, never stale menu pixels that linger.
 
-Both are real work in `wm.rs`'s clip capacity and in the crystal's dismissal path; neither belongs
-in a fit-and-reservation arc. Recorded here as the next arc's brief rather than half-done.
+**Falsifiable, not trusted.** Like the DEFAULT-OFF bar's `occclip_bar` FORBID, the menu's occlusion
+would read vacuous on the `[drag-occ]` line — no headless gate opens the menu during a drag — so the
+proof is `crystal::selftest`'s MENU-OCC leg driving the present's own primitives (`wm::occ_menu_probe`,
+delegating to the proven `occ_bar_probe`) against a synthetic window that crosses the open menu: the
+PROTECTED walk withholds the menu's columns (`px_prot > 0`), the FAULT walk (clip empty) collapses to
+`px_fault == 0`. It emits `:: MENU-OCC: … :: PASS ::` and folds `menu_occ=` into the `CRYSTAL-MENU`
+line; both strings are reachable in the `witness + wc` metal ELF (`strings -a … | grep MENU-OCC`).
 
 ##### What the next boot must show
 
