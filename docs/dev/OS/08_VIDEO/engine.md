@@ -11529,3 +11529,79 @@ images are byte-identical base-vs-arc (verified by `objcopy -O binary` + `cmp`),
 are unchanged. This is the same 2.5D landing rung the vug SHARD scene and the menu-bar crystal share:
 one crystal across boot, idle demo, and brand mark. Full 3D rotation of the shard at boot (a per-frame
 re-march of the spectrum fans) is the next rung, deferred for the pre-heap frame budget.
+
+## CLOSE-TEARDOWN — a close signals its own app and parks no sibling (x86, 2026-08-12)
+
+Two defects out of GR27 Boot A's close burst (`~/unaos-bench/capture/gr27-bootA/ttyUSB0.log`,
+closes at 423–451 s), both in the window-close teardown, fixed together.
+
+### Defect 1 — zombie presents: the app whose window died was answered `0` forever
+
+`wm::close`/`close_owner` reap the compositor row, but the syscall-side `WINDOWS` entry survives
+until the process teardown settles — and in that gap (or forever, for an owner that is not killed)
+every `SYS_WIN_PRESENT` resolved ownership, entered the compositor, was declined `Presented::NoRow`
+by `present_banded`'s row/fence probe… and then fell into `present_backpressure`'s SUCCESS arm and
+returned `0`. The app had **no signal its window died** and every reason to keep its render loop
+presenting; the declines showed up only as `stale=` in the `[wcn]` rollup (Boot A: `stale=2`/`stale=6`
+across the burst — modest there because the close-box also kills, so the storm self-terminated; an
+app that survives its window has no such stop). A reading note for the capture: the burst's
+`[wcn] win=5 … live=no att=892 rate=233.0/s comp=676` line is NOT the zombie storm on the wire —
+those counters are pre-close traffic drained at the next rollup with a post-close identity snapshot
+(`active=3827ms` ≈ exactly the span-start→close interval); the storm's true trace is `stale=`.
+
+**The fix** — both present verbs (`sys_win_present`, `sys_win_present_rows`) now answer **`-EBADF`,
+terminally,** for a `NoRow` against a REAL wm id: the row was reaped or recycled, this handle will
+never name a row again (a new `SYS_WIN_CREATE` mints a new handle), and `EBADF` is the same "this
+handle names nothing" the verb already speaks on an out-of-range or freed id. **The error return IS
+the close notification**: there is no other channel from the wm to a ring-3 owner (the close-box
+kill is one, but only for the killed), and a render loop that checks `rc >> 63` — the contract every
+in-tree client already carries — now stops on the first post-close frame. The reject is also free
+for the compositor by construction: `wm::present_banded` declines under its own table probe before a
+pixel is marked, so a misbehaving app that ignores `-EBADF` costs one short table hold per call and
+zero compose work. The one `NoRow` that stays a `0` success is `wm_id == WIN_NONE` — the HEADLESS
+case, where the compositor refused a row at create (no panel) and the window is a legitimate
+draw-only surface; erroring there would fail every program on a machine with no glass.
+`present_backpressure`'s `NoRow` arm therefore now serves exactly that headless population.
+
+### Defect 2 — spurious sibling park: closing a FOCUSED window minimised every survivor
+
+Operator, Boot A, on glass: *"closing a window causes the other open vug stat pulse windows to
+minimize SOMETIMES."* The mechanism, pinned: `wc_close_click` (and `wc_close_furniture`) handed an
+orphaned focus back with `wm::focus_changed(0)` — the SHELL ARM, which mints a fresh `SHELL_Z`
+above EVERY surviving window, collects and erases their boxes to `DESKTOP_BG`, stops them
+compositing (`above_shell` fails), and publishes `hidden=true` to every surviving owner through
+`vugmin_scan` → `vugmin_publish`. On the glass: one close, every sibling parked. "SOMETIMES" is
+exact and was the diagnostic: the close-box press does not focus first (`CLICK_TARGET_DROP`, no
+`focus_changed(owner)`), so the arm fired **only when the closed owner already held `FOCUS_ASID`**
+— i.e. the operator had clicked INTO the window before closing it. Boot A's burst closed unfocused
+windows and never tripped it (zero `[wc-fv] focus shell` lines outside the 39.6 s fixtures); GR26
+Boot AR's close did (`close_owner` → `[wc-fv] focus shell z=38 hidden=1`, the CLOSEISO wire — that
+arc exempted furniture from the sweep, this one stops the sweep being reachable from a close at
+all). The `[wcn] … parked=63936ms` line that first pointed here is, like defect 1's line, an
+accounting artifact — WC-N's `parked_ms` is an inter-present GAP accumulator, not a z-park — but
+the operator's report was real and the interleaving above is the only close-adjacent park writer.
+
+**The fix** — the close paths call the new `wm::focus_release(owner)` instead: a CAS of
+`FOCUS_ASID` from `owner` to `0` (no-op if the closed owner did not hold focus — the guard the
+callers used to write is folded inside), a re-damage of the departing owner's surviving rows so
+chrome sheds the highlight, and NOTHING else — no `SHELL_Z` bump, no erase, no `vugmin_publish`,
+no sibling touched. **A close never parks a sibling.** The shell arm itself is unchanged and still
+owned by the gestures that mean it (TAB-to-shell, the desktop-miss click): idling the whole fleet
+remains one deliberate whole-table statement.
+
+### The park witness — every park now names its cause
+
+`[wm-act] park win=N owner=0x.. at (0,0) -> cause=<why>` on the shared bounded `[wm-act]` budget:
+
+* `cause=minimise` — the deliberate park, from `wm::minimise` itself (the router's
+  `[wm-act] minimise … settle=` line names the gesture; this names the park, uniformly).
+* `cause=shell-raise` — the incidental kind, one line per row the shell arm actually takes off the
+  glass (`!above_shell` under the new z; exempt furniture and compat rows are not parks and are not
+  named). Post-fix, a `park … cause=shell-raise` inside a close's teardown window is the regression
+  signature; the next capture falsifies instead of infers.
+* `[wm-act] focus-release owner=0x.. … shell-raise=skipped siblings=untouched` marks the new narrow
+  path taking effect where `focus shell` lines used to follow a close.
+
+cfg-fold: all of it is x86 `wc`-path code (`wc_close_*`, the x86 present verbs) plus arch-neutral
+`wm.rs` additions with no behavior change off the new call sites; aarch64 and wc-off builds are
+unchanged.

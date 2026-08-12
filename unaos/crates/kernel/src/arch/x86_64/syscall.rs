@@ -3726,7 +3726,7 @@ fn sys_win_present(win: u64) -> i64 {
     // park the outermost compositor lock on a task the scheduler will not run for a millisecond — every
     // other window on the machine behind it. So the outcome leaves the guarded block as a value and the
     // charge is applied outside it.
-    let outcome = {
+    let (outcome, wm_id) = {
         let _irq = IrqGuard::mask_save();
         // WCPAR — the window table is held ONLY for the ownership proof, the snapshot and the pace/count
         // bookkeeping; it is dropped before the composite so two cores' presents no longer serialise on
@@ -3762,11 +3762,26 @@ fn sys_win_present(win: u64) -> i64 {
         // WCPAR — the `+1`-biased slot is the wm `owner` this window was created under (`sys_win_create`
         // passes `slot + 1`); the compositor declines the present if the resolved row no longer carries
         // it, which is the recycled-id fence that makes releasing the lock above safe.
-        wc_shim::present(wm_id, (slot as u64) + 1)
+        (wc_shim::present(wm_id, (slot as u64) + 1), wm_id)
     };
     // VSYNC-PACE: the witness rollup, OUTSIDE the guard — see `wpace_emit` for why a serial burst may not
     // run under the outermost compositor lock.
     wpace_tick();
+    // CLOSE-TEARDOWN — `NoRow` from a REAL wm id is TERMINAL: the compositor's row was reaped
+    // (operator close, teardown) or recycled to another owner, and this window handle will never
+    // name a row again — a new `SYS_WIN_CREATE` gets a new handle. Before this, `NoRow` fell into
+    // `present_backpressure`'s success arm and the app was answered `0` forever: an app whose
+    // window the operator closed had NO signal its window died and every reason to keep its render
+    // loop presenting (GR27 Boot A: the close burst's zombie presents landed here, `stale=` in the
+    // `[wcn]` rollup). `-EBADF` is that signal — the same "this handle names nothing" the verb
+    // already speaks — and the reject costs the compositor one table probe, no compose work
+    // (`wm::present_banded` declines before a pixel is marked). `wm_id == WIN_NONE` keeps the old
+    // answer: that is the HEADLESS case (the compositor refused a row at create, e.g. no panel),
+    // where the window is a legitimate draw-only surface and erroring would fail every program on
+    // a machine with no glass.
+    if outcome == crate::video::wm::Presented::NoRow && wm_id != crate::video::wm::WIN_NONE {
+        return EBADF;
+    }
     present_backpressure(slot, outcome)
 }
 
@@ -3825,7 +3840,9 @@ static SLOT_HIDDEN_PRESENTS: [AtomicU32; crate::arch::memory::USER_SLOTS] =
 /// never calls `SYS_INPUT_WAIT` is now capped at ~1,000 suppressed presents/s per slot.
 ///
 /// VISIBLE PRESENTS ARE NOT TOUCHED — same return (0), same path, same cost, and the counter is reset
-/// rather than read. Neither is `NoRow`: see `wc_shim::present`.
+/// rather than read. Neither is `NoRow` — which, CLOSE-TEARDOWN narrowed, can only be the HEADLESS
+/// case by the time it reaches here (`wm_id == WIN_NONE`): both present verbs return `-EBADF` before
+/// this function for a `NoRow` against a real wm id (a reaped/recycled row — see `sys_win_present`).
 fn present_backpressure(slot: usize, outcome: crate::video::wm::Presented) -> i64 {
     use crate::video::wm::Presented;
     match outcome {
@@ -4598,7 +4615,7 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
     // PRESSURE-1: the lock span ends here and the charge is applied outside it, for `sys_win_present`'s
     // reason — the back-pressure can sleep, and sleeping under the outermost compositor lock with IF
     // masked would park every other window on the machine behind this one.
-    let outcome = {
+    let (outcome, wm_id) = {
         let _irq = IrqGuard::mask_save();
         // WCPAR — the window table is held ONLY for the ownership proof, the band range check, the
         // snapshot and the pace/count bookkeeping; it is released before the composite. Same recycled-id
@@ -4634,10 +4651,16 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
             // present consumes exactly one frame slot, as a whole-box one does.
             pace_advance(id);
         } // `_wh` drops (before `t`), then WINDOWS released.
-        wc_shim::present_rows(wm_id, y0 as usize, y1 as usize, (slot as u64) + 1)
+        (wc_shim::present_rows(wm_id, y0 as usize, y1 as usize, (slot as u64) + 1), wm_id)
     };
     // VSYNC-PACE: as the whole-box verb, and outside the guard for the same reason.
     wpace_tick();
+    // CLOSE-TEARDOWN — same terminal answer as `sys_win_present`, same headless carve-out: a banded
+    // present against a reaped/recycled row is `-EBADF`, so a client that switched to damage bands
+    // learns its window died exactly as a whole-box client does.
+    if outcome == crate::video::wm::Presented::NoRow && wm_id != crate::video::wm::WIN_NONE {
+        return EBADF;
+    }
     present_backpressure(slot, outcome)
 }
 
@@ -5658,9 +5681,15 @@ fn wc_close_click(owner: u64) -> &'static str {
     if USER_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
         user_input_set_active(0);
     }
-    if crate::video::wm::focus_asid() == owner {
-        crate::video::wm::focus_changed(0);
-    }
+    // CLOSE-TEARDOWN — the wm half of the focus handback is `focus_release`, NOT `focus_changed(0)`.
+    // The latter is the SHELL ARM: it raises `SHELL_Z` over every surviving window, erases their
+    // boxes and publishes `hidden=true` to every owner — on the glass, closing a FOCUSED window
+    // minimised every sibling (GR27 Boot A operator: "closing a window causes the other open vug
+    // stat pulse windows to minimize SOMETIMES"; "sometimes" == only when `focus_asid() == owner`,
+    // which a close-box press never establishes by itself). A close must never park a sibling.
+    // `focus_release` clears the highlight iff this owner held it, and touches nothing else; the
+    // owner-held-focus guard lives inside it (a CAS), so it is called unconditionally.
+    crate::video::wm::focus_release(owner);
     // `wm` owners for user rows are `slot + 1`-biased and `Proc::slot` is stored with the SAME bias
     // (see that field), so the owner IS the key — no arithmetic, and therefore no bias to get wrong.
     // Kernel furniture (`is_kernel_owner`) and owner 0 can never match a live row and fall out here.
@@ -5732,11 +5761,10 @@ fn wc_close_furniture(win: crate::video::wm::WinId, owner: u64) -> &'static str 
     let route = crate::video::fbcon::panel_console_window_closed(win);
     let gone = crate::video::wm::close(win);
     // The keyboard never belonged to a kernel row (`user_input_set_active` refuses the band), so
-    // there is no grant to revoke. `focus_changed(0)` is still owed if this row held the wm's focus:
-    // the shell is where furniture's focus goes on every other gesture in this router.
-    if crate::video::wm::focus_asid() == owner {
-        crate::video::wm::focus_changed(0);
-    }
+    // there is no grant to revoke. The wm focus, if this row held it, is dropped through
+    // `focus_release` — NOT `focus_changed(0)`, whose shell arm parks every surviving window
+    // (CLOSE-TEARDOWN: a close must never park a sibling; see `wc_close_click`).
+    crate::video::wm::focus_release(owner);
     #[cfg(feature = "witness")]
     CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NOPROC_X86, Ordering::Release);
     if CLOSE_LOG_COUNT_X86.load(Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
