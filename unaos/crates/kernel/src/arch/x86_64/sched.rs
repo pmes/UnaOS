@@ -4160,7 +4160,21 @@ impl<T> Mutex<T> {
         x86_64::instructions::interrupts::without_interrupts(|| {
             let me = pi_current();
             if self.pi.nwait.load(Ordering::Acquire) == 0 {
-                pi_boost_reset(&self.pi); // no waiters ⇒ no inherited floor
+                // No waiters ⇒ no inherited floor. The load and the swap are not one atom
+                // (verify-round M2 residual): a waiter can land in the gap — its fetch_add is
+                // program-order before its donation, but nothing orders OUR load→swap window
+                // against it. So take the swap's answer, then re-check: if a waiter appeared,
+                // re-donate what the swap took. fetch_max re-pairs the gauge exactly as a fresh
+                // donation would (begin only on 0→boost), so the begin/end ledger stays exact.
+                let old = self.pi.boost.swap(0, Ordering::AcqRel);
+                if old > 0 {
+                    crate::rtpi::note_boost_end();
+                    if self.pi.nwait.load(Ordering::Acquire) > 0
+                        && self.pi.boost.fetch_max(old, Ordering::AcqRel) == 0
+                    {
+                        crate::rtpi::note_boost_begin();
+                    }
+                }
             }
             self.pi.owner.store(me as u64, Ordering::Release);
             if !me.is_null() {
@@ -4189,10 +4203,15 @@ impl<T> Mutex<T> {
             if me.is_null() {
                 return (me, 0u8);
             }
-            self.pi.nwait.fetch_add(1, Ordering::AcqRel);
             // Publish "I (a holder of these locks) am now blocked on `self.pi`" so a transitive
             // donor to one of the locks I hold follows the chain to the lock I wait on.
             pi_held_set_waits(me, self.pi.addr());
+            // AFTER the publish, and BEFORE the sched_prio read below (verify-round M3): the
+            // locked RMW is a full fence, so the uplink stores above cannot sit in the store
+            // buffer past the boost loads below — the SB interleaving where a donor misses the
+            // uplink AND we miss its donation is closed. M2's ordering need (nwait visible
+            // before our fetch_max donation in pi_donate) still holds: the donate is later.
+            self.pi.nwait.fetch_add(1, Ordering::AcqRel);
             // Recompute AFTER the uplink is visible (review M3), so a donation that landed on our
             // held locks before publication is folded into the priority we donate onward.
             (me, sched_prio(unsafe { &*me }))

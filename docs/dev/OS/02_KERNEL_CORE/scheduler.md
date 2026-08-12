@@ -2430,16 +2430,28 @@ Combined-boot evidence (one kernel running SMP + USB + net + video):
   x86_64).** The sleeping `Mutex` now runs a minimal, soft-RT **priority
   inheritance** protocol so a low-priority holder cannot be preempted by
   mid-priority tasks while a strictly-higher task blocks on the lock (bounded
-  priority inversion). Three moves (see the "R1 / rtpi" block in
-  `arch/x86_64/sched.rs`): (1) *acquire-time donation* — a blocker raises the
-  holder's effective priority to its own, propagated **transitively** down a
-  chain of holders via `Task::blocked_on`; (2) *handoff inheritance* — the task
-  that wins a contended acquire inherits the max priority still parked on the
-  lock (`Mutex::waiters_max`), so a FIFO handoff to a lower waiter over a higher
-  one does not reopen the inversion; (3) *revert on the last release*
-  (`Task::pi_held` → 0 clears `Task::donated`), leak-free by construction. The
-  boost is read by every placement/preemption site through `sched_prio` =
-  `max(base, donated)`. Only the owner-tracked sleeping `Mutex` participates —
+  priority inversion). The redesign's core rule (see the "R1 / rtpi" block in
+  `arch/x86_64/sched.rs`): donation state lives on the LONG-LIVED per-lock
+  control block (`PiCtl`, embedded in the `'static`-by-contract `Mutex`), never
+  on the transient `Task` — a `Task` pointer appears only as an IDENTITY TOKEN
+  (compared, never dereferenced cross-CPU), so the donor-loads/holder-exits/
+  donor-derefs use-after-free is structurally impossible. Three moves:
+  (1) *acquire-time donation* — a blocker raises each lock's `boost` down the
+  holder chain, propagated **transitively** via `PiCtl::owner_waits` (the
+  holder's own published uplink), accelerating holders by identity
+  (bump-if-running / relocate-if-ready); (2) *handoff inheritance* — the task
+  that wins a contended acquire inherits the lock's standing `boost`, so a
+  FIFO handoff to a lower waiter over a higher one does not reopen the
+  inversion; (3) *revert on the last release* — the last waiter out resets the
+  lock's `boost` (`nwait`-gated so a live donation is never destroyed),
+  leak-free by construction. The boost is read by every placement/preemption
+  site through `sched_prio` = max(base, max over held locks' `boost`), the
+  per-task `held` set capped at `PI_HELD_MAX` (overflow degrades to a missed
+  boost AND a severed transitive uplink for the dropped lock — bounded,
+  documented at the constant). All per-task bookkeeping runs under
+  `without_interrupts` so a task's self-identification (`pi_current`) cannot
+  be preempted-and-stolen mid-read (the GR27 review's B1).
+  Only the owner-tracked sleeping `Mutex` participates —
   the counting `Semaphore`, futex and the IRQ-masked `spin::Mutex`es are out of
   scope (no single owner / non-blocking / non-preemptible). **DEFAULT OFF**: the
   PI fields do not exist and `Mutex::lock` takes its original single-`wait()`
