@@ -254,22 +254,6 @@ impl SurfaceDesc {
 static ACTIVATED: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(ORIGIN_NONE);
 
-/// SHELLNOTDESK — has the crispy desktop compositor taken the panel?
-///
-/// True from the instant [`activate_on`] claims the compositor (and stays true — the claim is never
-/// released on the SUCCESS path; a late decline releases it, at which point there is no desktop) to
-/// the end of the boot. It is the render service's signal that **the crispy scene owns the backdrop
-/// and the text shell is no longer the desktop**: on x86-`wc` the desktop layer paints the scene, not
-/// the console, once this reads true.
-///
-/// A plain load of [`ACTIVATED`], not a second flag: unlike [`DESKTOP_APP_ARMED`] (which must survive
-/// a post-console decline that releases the latch) the backdrop question wants exactly what the latch
-/// says right now — if the compositor disowned the panel, the shell IS still the desktop and should
-/// keep painting it. Cheap enough to read every frame.
-pub fn is_active() -> bool {
-    ACTIVATED.load(core::sync::atomic::Ordering::Acquire) != ORIGIN_NONE
-}
-
 /// DESKTOP-APP — the program that IS the desktop's second window, by its 8.3 name in the root of the
 /// volume `crate::fs::fat::mount()` binds (on x86 always the USB mass-storage DATA volume — the ESP
 /// the firmware booted is unreachable after `ExitBootServices`, so `target/x86_64_data/` is the tree

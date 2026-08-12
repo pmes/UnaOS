@@ -598,32 +598,6 @@ impl Screen {
         self.mark_full();
     }
 
-    /// SHELLNOTDESK — paint the CRISPY DESKTOP SCENE across the whole desktop layer and arm a
-    /// full-panel present.
-    ///
-    /// This is the backdrop the compositor's windows sit on ONCE THE SHELL IS NO LONGER THE DESKTOP.
-    /// Before this arc the desktop layer held the live text shell (`console::Console::draw`'s
-    /// whole-panel `clear_screen` plus its history/prompt glyphs), so the operator's "wallpaper" was
-    /// shell text — *"the shell is still posing as the desktop"*. The render service now calls this
-    /// instead of `console.draw` on the crispy desktop, and the shell's pixels never reach the
-    /// backdrop.
-    ///
-    /// The scene today is the flat [`super::wm::DESKTOP_BG`] fill — the same colour the compositor put
-    /// on the glass at `wcx::activate` and the same one [`adopt_desktop_bg`] seeds a fresh `Screen`
-    /// with, so this agrees with both by construction. It is the SEAM the approved lake scene
-    /// (white-board A1) renders through later: a scene richer than a fill replaces the body of this
-    /// method and every caller keeps working, because the contract is "own the backdrop", not "fill
-    /// one colour". No window layer is touched — `present_background` composites the windows over
-    /// whatever this leaves in the back buffer, exactly as it did over the shell's clear.
-    ///
-    /// `x86_64`-only: the sole caller is `x86_render_service`, which does not exist on aarch64, so the
-    /// arm build never sees this method and stays byte-identical.
-    #[cfg(target_arch = "x86_64")]
-    pub fn paint_desktop_scene(&mut self) {
-        self.back.fill_screen(super::wm::DESKTOP_BG);
-        self.mark_full();
-    }
-
     /// Draw a Bresenham line into the back buffer and mark its bounding box damaged. Endpoints are
     /// signed; the surface clips per-pixel. The `vug` wireframe primitive.
     pub fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
