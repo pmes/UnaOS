@@ -35,8 +35,12 @@
 //! allocatable.
 //!
 //! On disk the map persists CoW like everything else: fresh leaf blocks of
-//! 1024 little-endian u32 counts + one fresh index block of leaf pointers per
-//! commit, reached from the root record (`fs.rs` owns that serialization).
+//! 1024 little-endian u32 counts + a fresh index per commit, reached from the
+//! root record (`fs.rs` owns that serialization). The index is ONE block of
+//! leaf pointers up to 512 leaves (volumes ≤ 2 GiB — the only shape v3/v4
+//! ever wrote); past that (v5+) it is a two-level tree: one index-of-indexes
+//! block of mid pointers, each mid block holding up to 512 leaf pointers
+//! (cap: 512 × 512 × 1024 = 1 TiB).
 
 use alloc::vec::Vec;
 
@@ -48,6 +52,17 @@ pub struct RefMap {
     current: Vec<u32>,
     frozen: Vec<u32>,
     block_count: u64,
+    /// First-fit SCAN CURSOR — a pure in-RAM accelerator with the invariant
+    /// "every index below `hint` is non-allocatable (used in `current` OR
+    /// `frozen`)". [`allocate`](Self::allocate) scans from here instead of 0,
+    /// which turns a sequential volume fill from O(n²) into O(n) — without it
+    /// a 2 GiB fill is ~1.4e11 scan steps. Allocation RESULTS are identical
+    /// to the plain lowest-free-in-both-views scan: anything that can free a
+    /// block below the cursor ([`decref`](Self::decref)) or change a view
+    /// wholesale ([`freeze`](Self::freeze), [`thaw`](Self::thaw),
+    /// [`set_counts`](Self::set_counts)) rewinds it, paying at most one
+    /// re-scan. Never serialized — no format impact.
+    hint: usize,
 }
 
 impl RefMap {
@@ -57,6 +72,7 @@ impl RefMap {
             current: alloc::vec![0u32; block_count as usize],
             frozen: alloc::vec![0u32; block_count as usize],
             block_count,
+            hint: 0,
         }
     }
 
@@ -68,18 +84,21 @@ impl RefMap {
             frozen: counts.clone(),
             current: counts,
             block_count,
+            hint: 0,
         }
     }
 
     /// First-fit allocate: the lowest block free in BOTH views. Marks it
     /// current-refcount 1. `None` when the volume is full.
     pub fn allocate(&mut self) -> Option<u64> {
-        for i in 0..self.block_count as usize {
+        for i in self.hint..self.block_count as usize {
             if self.current[i] == 0 && self.frozen[i] == 0 {
                 self.current[i] = 1;
+                self.hint = i + 1;
                 return Some(i as u64);
             }
         }
+        self.hint = self.block_count as usize;
         None
     }
 
@@ -95,6 +114,9 @@ impl RefMap {
     pub fn decref(&mut self, block: u64) {
         if let Some(c) = self.current.get_mut(block as usize) {
             *c = c.saturating_sub(1);
+            // The block may now be allocatable (if its frozen count is 0
+            // too): rewind the scan cursor so first-fit stays exact.
+            self.hint = self.hint.min(block as usize);
         }
     }
 
@@ -118,6 +140,9 @@ impl RefMap {
     /// transaction freed are genuinely reusable.
     pub fn freeze(&mut self) {
         self.frozen.copy_from_slice(&self.current);
+        // Blocks the retired tree held (current 0 / frozen 1) just became
+        // allocatable — rewind the scan cursor (one re-scan per commit).
+        self.hint = 0;
     }
 
     /// Discard the in-flight transaction: `current = frozen` (the committed
@@ -129,6 +154,7 @@ impl RefMap {
     /// consistent with every OTHER piece of in-RAM state before using it.
     pub fn thaw(&mut self) {
         self.current.copy_from_slice(&self.frozen);
+        self.hint = 0;
     }
 
     /// Number of leaf blocks the persisted map spans (a pure function of the
@@ -158,5 +184,6 @@ impl RefMap {
         for (i, c) in self.current.iter_mut().enumerate() {
             *c = counts.get(i).copied().unwrap_or(0);
         }
+        self.hint = 0;
     }
 }

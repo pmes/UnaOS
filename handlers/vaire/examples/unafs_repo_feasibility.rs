@@ -200,9 +200,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "      NOTE: as of the v4 format an Inode's extent list is no longer\n\
          \x20           capped at one 4096 B block — an overflowing list SPILLS to\n\
          \x20           indirect blocks (unafs::inode::IndirectTrailer), lifting the\n\
-         \x20           old ~80 MiB single-file ceiling. The binding structural\n\
-         \x20           limit for a large file is now the 2 GiB volume cap\n\
-         \x20           (MAX_BLOCK_COUNT, one refmap level), not the extent count."
+         \x20           old ~80 MiB single-file ceiling. And as of v5 the old 2 GiB\n\
+         \x20           volume cap is lifted too (second refmap level; MAX_BLOCK_COUNT\n\
+         \x20           is now 1 TiB) — the binding limits are the in-RAM refmap\n\
+         \x20           (8 B/block) and the whole-map rewrite per commit, both linear\n\
+         \x20           in volume size, not any structural wall a repo store meets."
     );
     let t = Instant::now();
     let back = fs

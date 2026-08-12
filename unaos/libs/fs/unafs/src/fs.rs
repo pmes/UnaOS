@@ -236,9 +236,13 @@ impl<D: BlockDevice> UnaFS<D> {
     // Lifecycle
     // =====================================================================
 
-    /// Format the device with a new (K8, version 4) UnaFS filesystem. Version 4
+    /// Format the device with a new (K8, version 5) UnaFS filesystem. Version 4+
     /// is spill-capable: a file whose extent list overflows its inode block
     /// spills to indirect blocks (see [`crate::inode::IndirectTrailer`]).
+    /// Version 5 admits volumes past 2 GiB (up to
+    /// [`crate::superblock::MAX_BLOCK_COUNT`] blocks = 1 TiB) via a second
+    /// refcount-map index level; a volume of ≤ 2 GiB stays single-level and
+    /// byte-identical to v4 apart from the version stamp.
     pub fn format(mut device: D, size_mb: u64) -> Result<Self, FileSystemError> {
         let blocks_from_size = (size_mb * 1024 * 1024) / BLOCK_SIZE;
         let mut block_count = device.block_count();
@@ -403,6 +407,12 @@ impl<D: BlockDevice> UnaFS<D> {
         }
 
         // ---- Refcount map ----
+        // The leaf count is a pure function of the geometry, and so is the
+        // index SHAPE: one block of leaf pointers up to 512 leaves (the only
+        // shape a v3/v4 volume can have — `Superblock::validate` caps their
+        // geometry at one level), a two-level tree past that (v5+): the root
+        // points at an index-of-indexes of MID blocks, each holding up to 512
+        // leaf pointers.
         let expected_leaves = block_count.div_ceil(crate::refmap::REFS_PER_LEAF);
         if root.refmap_leaves != expected_leaves {
             return Err(FileSystemError::CorruptVolume(
@@ -412,23 +422,62 @@ impl<D: BlockDevice> UnaFS<D> {
         if root.refmap_block == 0 || root.refmap_block >= block_count {
             return Err(FileSystemError::CorruptVolume("refmap index out of bounds"));
         }
-        if root.refmap_leaves > BLOCK_SIZE / 8 {
-            return Err(FileSystemError::CorruptVolume("refmap leaf count too large"));
+        let ptrs_per_index = BLOCK_SIZE / 8;
+        if root.refmap_leaves > ptrs_per_index * ptrs_per_index {
+            return Err(FileSystemError::CorruptVolume(
+                "refmap leaf count too large",
+            ));
         }
+        // Gather the leaf pointers through one or two index levels. Bounded:
+        // expected_leaves ≤ 512² by the guard above (and by MAX_BLOCK_COUNT).
+        let leaves_cap = usize::try_from(root.refmap_leaves)
+            .map_err(|_| StorageError::AllocRefused(root.refmap_leaves))?;
+        let mut leaf_ptrs: Vec<u64> = Vec::new();
+        leaf_ptrs
+            .try_reserve_exact(leaves_cap)
+            .map_err(|_| StorageError::AllocRefused(root.refmap_leaves))?;
         let mut refmap_blocks = alloc::vec![root.refmap_block];
         device.read_block(root.refmap_block, &mut index)?;
+        let read_ptr = |buf: &[u8], i: u64| {
+            u64::from_le_bytes(
+                buf[(i * 8) as usize..(i * 8 + 8) as usize]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        if root.refmap_leaves <= ptrs_per_index {
+            // Single level: the root's index block IS the leaf-pointer block.
+            for l in 0..root.refmap_leaves {
+                leaf_ptrs.push(read_ptr(&index, l));
+            }
+        } else {
+            // Two levels: the root's block holds MID pointers; each mid block
+            // holds this level's slice of leaf pointers.
+            let mids = root.refmap_leaves.div_ceil(ptrs_per_index);
+            let mut mid = alloc::vec![0u8; BLOCK_SIZE as usize];
+            for m in 0..mids {
+                let mp = read_ptr(&index, m);
+                if mp == 0 || mp >= block_count {
+                    return Err(FileSystemError::CorruptVolume(
+                        "refmap mid index out of bounds",
+                    ));
+                }
+                refmap_blocks.push(mp);
+                device.read_block(mp, &mut mid)?;
+                let lo = m * ptrs_per_index;
+                let hi = core::cmp::min(root.refmap_leaves, lo + ptrs_per_index);
+                for l in lo..hi {
+                    leaf_ptrs.push(read_ptr(&mid, l - lo));
+                }
+            }
+        }
         let count_cap =
             usize::try_from(block_count).map_err(|_| StorageError::AllocRefused(block_count))?;
         let mut counts: Vec<u32> = Vec::new();
         counts
             .try_reserve_exact(count_cap)
             .map_err(|_| StorageError::AllocRefused(block_count))?;
-        for l in 0..root.refmap_leaves {
-            let ptr = u64::from_le_bytes(
-                index[(l * 8) as usize..(l * 8 + 8) as usize]
-                    .try_into()
-                    .unwrap(),
-            );
+        for &ptr in &leaf_ptrs {
             if ptr == 0 || ptr >= block_count {
                 return Err(FileSystemError::CorruptVolume("refmap leaf out of bounds"));
             }
@@ -559,26 +608,59 @@ impl<D: BlockDevice> UnaFS<D> {
         // 3. Refcount map: allocate ALL its blocks first (allocation mutates
         //    the counts being persisted), then serialize. The leaf count is a
         //    pure function of the volume geometry, so it cannot change under
-        //    us mid-step.
+        //    us mid-step — and so is the index SHAPE: one block of leaf
+        //    pointers up to 512 leaves (the only shape v3/v4 geometry admits,
+        //    which keeps every pre-v5 volume byte-compatible), a two-level
+        //    tree past that (v5+; `Superblock::validate` version-gates the
+        //    geometry at format/mount).
         let refmap_leaves = self.refmap.leaf_count();
+        let ptrs_per_index = BLOCK_SIZE / 8;
         // Belt-and-braces twin of the imap guard above (and of
-        // `Superblock::validate`'s MAX_BLOCK_COUNT bound, which rejects such
-        // geometry at format/mount): the index is ONE block of leaf
-        // pointers — never run it off the buffer, error cleanly.
-        if refmap_leaves > BLOCK_SIZE / 8 {
+        // `Superblock::validate`'s MAX_BLOCK_COUNT bound): never run the
+        // index tree off its blocks, error cleanly.
+        if refmap_leaves > ptrs_per_index * ptrs_per_index {
             return Err(FileSystemError::NoSpace);
         }
+        let two_level = refmap_leaves > ptrs_per_index;
+        let mids = if two_level {
+            refmap_leaves.div_ceil(ptrs_per_index)
+        } else {
+            0
+        };
         let ref_index_block = self.alloc_block()?;
+        let mut ref_mid_blocks = Vec::with_capacity(mids as usize);
+        for _ in 0..mids {
+            ref_mid_blocks.push(self.alloc_block()?);
+        }
         let mut ref_leaf_blocks = Vec::with_capacity(refmap_leaves as usize);
         for _ in 0..refmap_leaves {
             ref_leaf_blocks.push(self.alloc_block()?);
         }
         // Every allocation is done: the counts are final. Serialize.
         let mut ref_index = alloc::vec![0u8; BLOCK_SIZE as usize];
-        for (l, &leaf_block) in ref_leaf_blocks.iter().enumerate() {
-            ref_index[l * 8..l * 8 + 8].copy_from_slice(&leaf_block.to_le_bytes());
-            let leaf = self.refmap.leaf_bytes(l as u64);
-            self.write_fresh(leaf_block, &leaf)?;
+        if two_level {
+            // Leaves first, then each mid block carries its slice of leaf
+            // pointers, then the top block carries the mid pointers.
+            for (l, &leaf_block) in ref_leaf_blocks.iter().enumerate() {
+                let leaf = self.refmap.leaf_bytes(l as u64);
+                self.write_fresh(leaf_block, &leaf)?;
+            }
+            for (m, &mid_block) in ref_mid_blocks.iter().enumerate() {
+                let mut mid = alloc::vec![0u8; BLOCK_SIZE as usize];
+                let lo = m * ptrs_per_index as usize;
+                let hi = core::cmp::min(ref_leaf_blocks.len(), lo + ptrs_per_index as usize);
+                for (i, &leaf_block) in ref_leaf_blocks[lo..hi].iter().enumerate() {
+                    mid[i * 8..i * 8 + 8].copy_from_slice(&leaf_block.to_le_bytes());
+                }
+                self.write_fresh(mid_block, &mid)?;
+                ref_index[m * 8..m * 8 + 8].copy_from_slice(&mid_block.to_le_bytes());
+            }
+        } else {
+            for (l, &leaf_block) in ref_leaf_blocks.iter().enumerate() {
+                ref_index[l * 8..l * 8 + 8].copy_from_slice(&leaf_block.to_le_bytes());
+                let leaf = self.refmap.leaf_bytes(l as u64);
+                self.write_fresh(leaf_block, &leaf)?;
+            }
         }
         self.write_fresh(ref_index_block, &ref_index)?;
         // (Written last among the fresh blocks so everything lands before
@@ -625,8 +707,9 @@ impl<D: BlockDevice> UnaFS<D> {
         let mut blocks = new_imap_blocks;
         blocks.insert(0, index_block);
         self.imap_blocks = blocks;
-        let mut rblocks = ref_leaf_blocks;
-        rblocks.insert(0, ref_index_block);
+        let mut rblocks = alloc::vec![ref_index_block];
+        rblocks.extend_from_slice(&ref_mid_blocks);
+        rblocks.extend_from_slice(&ref_leaf_blocks);
         self.refmap_blocks = rblocks;
         self.refmap.freeze();
 
