@@ -2195,6 +2195,62 @@ that row (userspace.md § VUGSPIN) has since **withdrawn** its conviction on loa
 next reader scoring that row against this capture must score the churn criterion beside it; neither is
 convicted, and treating row 3 as a unique selection is the specific mistake already made once.
 
+### The churn is now convicted, and the fix is a cooldown, not the revert (x86_64, VUGSPREAD-COOL)
+
+**Boot C settles the "unread" call.** `~/unaos-bench/capture/gr26-bootC/ttyUSB0.log`, a six-vug storm,
+holds the churn signature at full strength and SUSTAINED across the whole storm, not one window:
+`[spread]` reads `remig=750397/750418` (**≈ 1.0**, every steal a re-migration), `cr3sw` climbs to
+**14 073 209** whole-TLB flushes, and it does this while `[schedx86] load` shows **six cores at 99 %** —
+i.e. the fleet was ALREADY spread, and every one of those 750 k moves was work thrown away passing the
+same handful of vugs around. The operator-visible cost is two-fold: each vug's compose smears across a
+rotating set of cores (the uneven per-core reading), and a vug CLOSE frees a core whose idle pass
+immediately steals a survivor, co-locating it and destabilising the survivors' rates (the "close makes
+the others spike" report).
+
+The mechanism is the one the idle-floor guard does **not** reach. `steal_floor`'s running-victim floor
+of 1 is correct on an under-loaded board; on a saturated one the churn is driven by THIEVES, not
+victims: a vug blocks briefly inside `SYS_WIN_PRESENT`, its home core's queue empties, that core steals
+a neighbour, the vug unblocks and re-queues home — now home is over-subscribed and a third idle core
+steals it back. The guard covers an IDLE victim keeping its lone task; it says nothing about a task that
+was just moved being moved straight back.
+
+**The fix is a per-task migration cooldown, and it is preferred over the documented revert.** The
+revert criterion above prescribes restoring `steal_floor` to the constant `STEAL_MIN_DEPTH`. That would
+stop the churn, but it also throws away the depth-1 rebalance this whole section exists to add — a
+parent+worker packed on one core with idle cores beside it would once again sit unbalanced. Instead,
+`Task::migrate_ms` stamps `arch::ms()` at each migration and `RunQueue::steal_one` refuses to take a
+task that migrated less than `STEAL_COOLDOWN_MS` (16 ms, ~16 quanta) ago:
+
+- The **first** steal of any task is never delayed — a never-migrated task carries `migrate_ms == 0`,
+  which always clears the window — so the depth-1 rebalance VUGSPREAD added fires exactly as before.
+- Only the immediate RE-steal is refused, which is the ping-pong and nothing else. A storm settles to
+  one-vug-per-core within a transient of ~1–2 moves per task and then STAYS there, because a settled
+  fleet has depth 0 everywhere and nothing to steal.
+- A later vug CLOSE therefore frees exactly one core with nothing left to steal: the survivors keep
+  their homes instead of being re-grabbed. That is the scheduler half of the close-spike; it is not a
+  rate cap on the renderer (the vug still presents unbounded), only a damp on re-placement.
+
+**The new witness.** `steal_one`'s per-task skips are counted by `STEAL_COOL_SKIP` and printed as
+`cool=` on `[spread]`. It is the direct counterweight to `remig`: a healthy post-fix capture reads
+`cool=` CLIMBING while `remig` stays near flat — the ping-pong being REFUSED rather than served. A
+cooled task that leaves `steal_one` empty-handed still lands on `p`/`STEAL_D_PINNED` at the pass level,
+so the `e + f + p + d + i + moves == passes` conservation law is untouched; `cool=` is a side counter
+like `remig`, outside it.
+
+**What this fix does and does NOT even out.** With WCPAR step-3 (the parallel per-core compose) reverted
+on trunk, `COMP_GATE` serialises the whole compose again, so the per-core COMPOSE census (`[wcpar]`
+`c0..c7`) cannot be evened by any scheduler change — a serial compose lands on whichever core holds the
+gate, wherever the vug task runs. What the cooldown evens is the PER-CORE CPU LOAD / pulse (`[schedx86]
+load`, `sw=`): the vug TASKS settle one-per-core and stay, so the load reads even and a close leaves it
+even. Evening the compose census itself is deferred with step-3 (see `engine.md` §8).
+
+**Next boot's readings, as falsifiers.** On the next six-vug storm: `[spread]` `remig`/`moves` collapses
+from ≈ 1.0 toward 0 and `cool=` climbs in its place; `moves` goes flat after the settling transient;
+`cr3sw`'s delta per move falls back toward ~1; `[schedx86] load` shows the vug cores at a stable, even
+occupancy that a close does not disturb (the freed core simply goes idle, the survivors hold their
+homes). A boot where `remig` stays ≈ 1.0 with `cool=0` means the stamp or the read is dead — the brake
+is not firing — and is the falsification this witness exists for.
+
 **Naming the moves.** `STEAL_LOG_COUNT` is reset at each `storm_census` boundary. The cap of
 24 named migrations per boot was generous when a boot produced one steal; with the corrector
 able to see the packing, early-boot settling would burn the whole cap and the storm the arc
