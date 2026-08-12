@@ -2259,6 +2259,135 @@ codegen: it would be produced by adding comments alone.
 `crystal.rs`'s `+25` lines appear in no delta, which is the expected confirmation that the module is
 `x86_64 + wc` only and is not compiled into this artifact at all.
 
+#### SHELLNOTDESK — the crispy scene owns the backdrop; the live shell is off the glass (2026-08-11)
+
+**Peter, metal, emphatic and repeated:** *"SHELL IS STILL THE DESKTOP FOR FUCKS SAKE."* SHELLDESK
+made the menu bar visible and stopped the desktop present erasing furniture, but it deliberately left
+the core untouched — its own report: *"the console is still a desktop citizen"*. What the operator
+saw as the wallpaper was still the LIVE TEXT SHELL: `x86_render_service` builds a `console::Console`,
+`console.draw` opens with a whole-panel `clear_screen` and paints the prompt/history glyphs into the
+desktop layer (`screen::Screen`), and those glyphs ARE the backdrop the windows sit on. This arc
+makes the CRISPY DESKTOP SCENE the backdrop and takes the live shell off the glass.
+
+**The scene model, in one line:** on the crispy desktop the desktop layer paints the SCENE and the
+text shell is not the desktop — it is plumbing behind the facade (serial + `TERM_RING`, for the
+Console app to subscribe to). Off the crispy desktop (a pre-takeover boot, a `wc`-off x86 build,
+all of aarch64) nothing changes: the shell is still the desktop and draws exactly as before.
+
+**What landed — the shell/scene wiring, not the compose mechanism.** Three seams, all outside
+`composite_inner` and the present gate (the concurrent `flicker` arc's lane), all `x86_64`-scoped:
+
+* **`video::wcx::is_active()`** — a plain load of the `ACTIVATED` latch, `true` from the instant
+  `activate_on` claims the compositor to end of boot. It is the render service's signal that the
+  crispy desktop owns the backdrop. (Not a second flag like `DESKTOP_APP_ARMED`: the backdrop
+  question wants exactly what the latch says now — a compositor that disowned the panel leaves the
+  shell as the desktop, correctly.)
+* **`video::screen::Screen::paint_desktop_scene()`** — fills the desktop layer with the crispy scene
+  (today the flat `wm::DESKTOP_BG`, the same colour `wcx::activate` put on the glass and
+  `adopt_desktop_bg` seeds a fresh `Screen` with, so the three agree by construction) and arms a
+  full-panel present. It is the SEAM the approved lake scene (white-board A1) renders through later:
+  the contract is *own the backdrop*, not *fill one colour*, so a richer scene replaces the body and
+  every caller keeps working. `#[cfg(target_arch = "x86_64")]` — aarch64 never sees it.
+* **`x86_render_service`** captures `desktop_owns_backdrop()` once at task start (`wcx::activate` runs
+  during PCI enumeration, long before this task is spawned, so the answer is stable). When the crispy
+  desktop is up it paints the scene instead of `console.draw`, and it drops the shell's key path
+  (`handle_key`) — a keystroke that reached that arm was not consumed by the installer dialog and not
+  routed to a focused window by `wc_route_event` upstream, so there is no backdrop shell to type into
+  and it is dropped rather than repainted onto the scene. The witness is
+  `[shelldesk] backdrop=crispy-scene shell=off-glass bg= core=`, emitted once at bring-up.
+
+**What the next boot shows on glass:** the crispy scene (the `DESKTOP_BG` fill today) as the desktop
+backdrop, with the shell's prompt/history glyphs GONE from it; the menu bar still on top; the console
+window (fbcon's frozen boot-log snapshot) and the desktop app (STAT.ELF) as the windows over the
+scene. `<TAB>` to the shell (`focus_changed(0)`) now reveals the crispy scene over the windows — a
+coherent "show desktop" gesture — rather than a wall of shell text.
+
+**Deliberately NOT taken here, and why (recorded for the integrator to sequence).**
+
+* **The frozen boot-log console WINDOW's `above_shell` exemption (FACADE entry 2)** — the
+  `is_kernel_owner && z != PARKED_Z` arm and the matching furniture branch in `focus_changed`'s shell
+  arm — is left intact. The ledger ties it to entry 3 (the dock's kernel-band tile), which is
+  `dock.rs`'s lane; a below-shell console with no dock tile that still composites is a worse
+  intermediate than either end state, so the two land together. This arc does not touch `wm.rs` at
+  all, which is also why it is clean against the `flicker` revert.
+* **Making the live shell a WINDOW (FACADE entry 6)** — moving the prompt off the desktop layer onto
+  a `Window` row with its own surface — is NOT this arc. It lands in `screen.rs`'s present path (the
+  fill/clip machinery `flicker` owns) and in the render service's event model, and is not safely
+  separable from the `flicker` arc. The interim this arc ships is the sanctioned other half of the
+  brief: *the shell is removed from the backdrop entirely at desktop-ready*, so the crispy scene owns
+  the glass now, and the shell-as-window can follow after `flicker` lands.
+
+**Gate results (2026-08-11, no QEMU — metal day).**
+
+* `./arroyo check` — **green both arches**, 12 cfg legs (`x86-all`, `arm-pi`, `arm-tegra`,
+  `x86-vsyncpace`, `x86-mix-0..7`), userspace x86_64 4/4 and aarch64 5/5, `midden_core` 12/12.
+* `UNAOS_WC=1 ./arroyo check` — green; banner `kernel features: …,wc`.
+* `UNAOS_WITNESS=1 UNAOS_WC=1 ./arroyo check` — green; banner `witness,…,wc`.
+* **Witness reachability, not merely compiled.** `UNAOS_WC=1 ./arroyo esp-x86`, then
+  `strings -a target/x86_64_esp/kernel.elf | grep shelldesk` →
+  `[shelldesk] backdrop=crispy-scene shell=off-glass bg=`. The format string is in the image and was
+  not folded away.
+
+**aarch64 identity.** `wm.rs` is untouched (SHELL_Z, `above_shell`, `focus_changed` unchanged), so
+the arm compositor is byte-for-byte. `wcx` and its `is_active` are `x86_64 + wc` only.
+`paint_desktop_scene` and `desktop_owns_backdrop` are `#[cfg(target_arch = "x86_64")]`, so the arm
+build never sees them. The change reaches aarch64 as exactly nothing.
+
+#### SHELLWIN — the live shell becomes a typeable compositor window (FACADE entry 6, 2026-08-11)
+
+**The gap SHELLNOTDESK left, and this arc closes.** SHELLNOTDESK took the shell off the backdrop but
+also dropped the `handle_key` path on the crispy desktop (*"a keystroke here has no backdrop shell to
+type into"*). That shipped the desktop with the shell **unreachable**: typing did nothing, and the
+operator launches programs through the shell (`bg /fat/VUG.ELF`). This arc gives the shell a WINDOW of
+its own — off the backdrop (SHELLNOTDESK kept) **and** usable again.
+
+**The shell is now a kernel-owned compositor window, built on the console-window machinery.** The live
+prompt/history/input render into their OWN surface, not the desktop layer, and the crispy scene stays
+the backdrop.
+
+* **Creation (`open_shell_window`, `main.rs`, `x86_64 + wc`).** A cached-RAM surface (`Bgr`, heap
+  `Vec`) and a `wm::create_at` row owned by `wm::KERNEL_OWNER_DESKTOP` — the reserved kernel-furniture
+  band the CLICK-X86 note earmarked for *"the next piece of kernel-owned desktop furniture."* The same
+  pattern `fbcon::panel_console_window_open` mints for the frozen boot-log console: hittable, out of
+  `focus_ring`/`close_owner`, an occluder (`above_shell` is true for `is_kernel_owner && z != PARKED_Z`),
+  so the backdrop present (`screen::present_background`) subtracts its box and never paints over it, and
+  the menu bar still composites on top. Sized ~half the panel, pinned low in the work area so it does
+  not sit exactly over the centred console. **No `wm.rs` edit** — the owner constant and every verb
+  used already exist, so this is clean against the concurrent `wm.rs` arcs (occ_clip / owner-fence /
+  tiling).
+* **Focus.** No new focus concept. The click router's kernel-owner arm (`wc_click_route_at`) already
+  RAISES a kernel row under the hand and hands the keyboard back to the shell
+  (`user_input_set_active(0)`). Clicking the shell window therefore focuses the shell, which is exactly
+  the state (`user_input_active() == 0`) in which a keystroke reaches the render service's `Event::Key`
+  arm; `<TAB>` back from an app reaches the same state.
+* **Input routing (`x86_render_service`).** SHELLNOTDESK's `Event::Key` arm *dropped* the key on the
+  desktop. It now dispatches the key through the shared `handle_key` into the shell WINDOW's own
+  `Console`/`TargetPal` (a persistent pair over the shell surface, alongside the panel's), then flushes
+  the surface and `wm::present`s it once per drained burst — the same drain-then-present-once discipline
+  the backdrop follows. Off the crispy desktop (pre-takeover, wc-off, aarch64) the key still drives the
+  backdrop `console` exactly as before. So `bg /fat/VUG.ELF` runs on glass again.
+* **`console.rs` — `in_window`.** A windowed shell reserves NO menu-bar chrome inside its own surface
+  (the bar is desktop furniture that composites above every window). `Console::mark_in_window` drops
+  the `top_chrome_h` term from the layout; `false` on every backdrop/headless surface, so those stay
+  byte-for-byte.
+
+**Witness:** `[shellwin] backdrop=crispy-scene shell=window win= surf=x core= == witness ::`, emitted
+once at bring-up, plus `[shellwin] DECLINE reason=…` on an alloc/geometry/create failure (the desktop
+then comes up with no shell window and the keystroke path stays inert — logged, never silent).
+
+**What the next `wc` boot shows on glass:** the crispy scene as the backdrop; the shell as a focusable
+WINDOW titled `shell` that the operator can click to focus and type into (running `bg /fat/VUG.ELF`
+etc.); the frozen boot-log console window and STAT.ELF as the other windows; the menu bar on top.
+
+**Gate results (2026-08-11, no QEMU — metal day).** `./arroyo check` green both arches (12 legs,
+userspace 4/4 + 5/5, `midden_core` 12/12); `UNAOS_WC=1` and `UNAOS_WITNESS=1 UNAOS_WC=1 ./arroyo check`
+green; `UNAOS_WC=1 ./arroyo esp-x86` then `strings -a target/x86_64_esp/kernel.elf | grep shellwin`
+→ `[shellwin] backdrop=crispy-scene shell=window …` (reachable, not merely compiled).
+
+**aarch64 / wc-off identity.** The shell window is `#[cfg(feature = "wc")]` inside the `x86_64`-only
+render service and `open_shell_window` is `#[cfg(all(x86_64, wc))]`; `Console::in_window` defaults
+`false`. The arm build and the wc-off x86 build fold to the pre-arc behaviour exactly.
+
 #### Three smaller defects the same arc closes
 
 * **`create` now composites.** A window's kernel chrome reaches the panel when the row exists, not at the

@@ -34,6 +34,15 @@ pub struct Console {
     /// unchanged — the sink is inert unless a caller opts in. Platform-neutral by design: the
     /// serial-line FORMAT (and the `tegra:` marker) lives in the tegra-gated caller, not here.
     out_sink: Option<fn(&str)>,
+    /// SHELLWIN — this console renders into a compositor WINDOW surface, not the desktop backdrop.
+    ///
+    /// A window has no menu bar of its own — the bar is the desktop's furniture and composites above
+    /// every window — so a windowed shell must NOT reserve `top_chrome_h` rows at the top of its own
+    /// surface (that reservation exists to keep the BACKDROP shell clear of the desktop's bar). When
+    /// this is set, [`Self::top_y`] drops the chrome term and the prompt/history start one page margin
+    /// below the window's own top edge. `false` on every backdrop/headless surface (the desktop-layer
+    /// shell, aarch64, wc-off), so those stay byte-for-byte unchanged.
+    in_window: bool,
 }
 
 impl Console {
@@ -43,7 +52,15 @@ impl Console {
             session: UserSession::new(),
             history: alloc::vec::Vec::new(),
             out_sink: None,
+            in_window: false,
         }
+    }
+
+    /// SHELLWIN — mark this console as the tenant of a compositor WINDOW surface (see [`in_window`]).
+    /// The render service calls this on the shell-window console so its layout drops the desktop
+    /// menu-bar reservation; every backdrop/headless console leaves the default `false`.
+    pub fn mark_in_window(&mut self) {
+        self.in_window = true;
     }
 
     /// JD11: install a sink that receives each `println` line (in addition to the panel history).
@@ -152,9 +169,13 @@ impl Console {
     /// same size.
     pub fn page_rows(pal: &TargetPal) -> usize {
         let m = pal.metrics();
-        // `top_y` already carries the page margin (SHELLDESK), so it replaces the bare `m.margin`
-        // this line used to subtract rather than adding to it.
-        let usable = (pal.height() as usize).saturating_sub(Self::top_y(pal)) / m.line_h;
+        // DESKTOP semantics — the full-screen pager and the backdrop shell both reserve the desktop's
+        // menu-bar chrome. `selftest::Pager` calls this with no `Console` in hand, so it stays a free
+        // function computing the chrome-inclusive budget; the windowed shell uses the `&self`
+        // [`Self::history_rows`] path, which drops the chrome per [`in_window`].
+        let top = crate::ui_status::top_chrome_h(pal.width() as usize, pal.height() as usize)
+            .saturating_add(m.margin);
+        let usable = (pal.height() as usize).saturating_sub(top) / m.line_h;
         usable.saturating_sub(1).max(6)
     }
 
@@ -169,16 +190,27 @@ impl Console {
     /// Used by all three layout sites (the page budget, the prompt line, the full repaint) for the
     /// reason the module header already gives: the full repaint and the per-keystroke fast path share
     /// one derivation, or the prompt lands in two different places depending on which drew it.
-    fn top_y(pal: &TargetPal) -> usize {
+    fn top_y(&self, pal: &TargetPal) -> usize {
         let m = pal.metrics();
-        crate::ui_status::top_chrome_h(pal.width() as usize, pal.height() as usize)
-            .saturating_add(m.margin)
+        // SHELLWIN — a windowed shell reserves NO menu-bar chrome (the bar is desktop furniture that
+        // composites above every window). A backdrop shell keeps the reservation, so this is the old
+        // expression unchanged on every surface where [`in_window`] is `false`.
+        let chrome = if self.in_window {
+            0
+        } else {
+            crate::ui_status::top_chrome_h(pal.width() as usize, pal.height() as usize)
+        };
+        chrome.saturating_add(m.margin)
     }
 
     /// Rows of history shown above the prompt: everything that fits from `TOP` down, reserving the
-    /// last row for the prompt/input line itself.
+    /// last row for the prompt/input line itself. Computed from [`Self::top_y`] so a windowed shell
+    /// (no chrome) and a backdrop shell (chrome reserved) each get the budget for their own surface;
+    /// for a backdrop shell this is identical to [`Self::page_rows`] by construction.
     fn history_rows(&self, pal: &TargetPal) -> usize {
-        Self::page_rows(pal)
+        let m = pal.metrics();
+        let usable = (pal.height() as usize).saturating_sub(self.top_y(pal)) / m.line_h;
+        usable.saturating_sub(1).max(6)
     }
 
     /// The y of the prompt/input line: directly below the last shown history line (so on a fresh
@@ -188,7 +220,7 @@ impl Console {
         let m = pal.metrics();
         let rows = self.history_rows(pal);
         let shown = self.history.len().min(rows);
-        Self::top_y(pal) + shown * m.line_h
+        self.top_y(pal) + shown * m.line_h
     }
 
     /// Draw the prompt + live input + cursor at `prompt_y`. Shared by the full repaint and the
@@ -215,7 +247,7 @@ impl Console {
         // Show the last `history_rows` lines (scroll the oldest off the top when full), top-down.
         let rows = self.history_rows(pal);
         let skip = self.history.len().saturating_sub(rows);
-        let mut y = Self::top_y(pal);
+        let mut y = self.top_y(pal);
         for line in self.history.iter().skip(skip) {
             pal.draw_text(m.margin, y, line, 0xAAAAAA);
             y += m.line_h;
