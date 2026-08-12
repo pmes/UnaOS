@@ -493,7 +493,9 @@ set was dry-run through the ucode's header only: the initvals and bsinitvals ima
 then never examined by anything, and no verdict existed for a future upload to gate on. The rung
 validates the WHOLE set — one `set-validate` line per role (header verdict, type/ver bytes, payload
 geometry, be32 word count, digest, per-file `VALID|INVALID`), one cross-set line, one
-`set-validation verdict=` line. What is REQUIRED (a hard park on failure) is exactly what §S4 pins:
+`set-validation verdict=` line. What is REQUIRED (a hard park on failure) is what §S4 pins, plus
+one inference argued here (cross-file layout uniformity — one extraction produces one container;
+§S4 itself pins only the header record and the be32-word rule):
 every file satisfies one of `classify_header`'s two candidate layouts, every payload is a whole
 number of big-endian 32-bit words, and all three files satisfy the **same** layout (one extraction
 produces one container format, and the payload offset arc 3 feeds from is a function of the layout —
@@ -501,7 +503,10 @@ a set whose files disagree about their own container is corrupt, mixed, or miscl
 ADVISORY (reported, never gated on) is every relation whose expected value no source legal for this
 module records: the type-byte and version-byte relations, printed so the first boot with the real
 set pins them. An INVALID verdict is a **hard park** (`upload REFUSED reason=set-validation-failed`)
-that outranks gate 3 on purpose: the day the routing is pinned, this gate is what stands between a
+that outranks gate 3 on purpose: the day the routing is pinned, this gate is most of what stands between a
+corrupt set and a stream into the core — one named residual excepted: a layout-A set truncated
+IDENTICALLY across all three files classifies as a valid layout-B set (no legal magic can catch it);
+the §S4 UCODEREV-echo handshake after upload is the backstop for that case. It is a gate
 bad set and a stream into the core — never a blind push of unvalidated bytes. The fix for an
 INVALID is on the media: re-extract and re-stage (see "The bench round" below).
 

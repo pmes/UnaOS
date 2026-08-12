@@ -1333,7 +1333,11 @@ fn upload_gate(macctl: u32, w: &Writes) {
 
     // Gate 2 — WIFI-SETVAL: the set is on the media; validate ALL of it before anything else is
     // even discussed. A hard park here outranks the routing refusal below on purpose: the day the
-    // routing IS pinned, this gate is what stands between a corrupt or misclassified set and a
+    // routing IS pinned, this gate is most of what stands between a corrupt or misclassified set and a
+    // stream into the core — with one named residual it cannot see: a layout-A set whose files are
+    // all truncated/corrupted IDENTICALLY in their trailing bytes classifies as a valid layout-B set
+    // (no Group-A-legal magic exists to catch it; that is W3/W5's honesty). The §S4 handshake — the
+    // UCODEREV echo after upload — is the backstop that catches what this dry-run cannot. It is
     // stream into the core — never a blind push of unvalidated bytes.
     if !validate_set() {
         serial_println!(
@@ -1360,7 +1364,9 @@ fn upload_gate(macctl: u32, w: &Writes) {
 /// role, one cross-set line, one verdict line. Returns whether arc 3's upload may ever consume this
 /// set.
 ///
-/// What is REQUIRED (a hard park on failure) is exactly what `bcm4331.md` §S4 pins:
+/// What is REQUIRED (a hard park on failure) is what `bcm4331.md` §S4 pins, plus one
+/// inference argued here (cross-file layout uniformity — one extraction produces one container;
+/// §S4 itself pins only the header record and the be32-word rule):
 ///
 ///   * every file's header satisfies one of `classify_header`'s two self-consistent candidate
 ///     layouts — a file satisfying NEITHER cannot carry a whole-be32-word payload under any reading
