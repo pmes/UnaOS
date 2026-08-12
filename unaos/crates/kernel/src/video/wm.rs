@@ -969,6 +969,16 @@ pub enum Presented {
     /// `WIN_NONE`) lands here on every present, and charging for it would throttle every app on a
     /// machine with no panel.
     NoRow,
+    /// WPACE-PANEL — the row is live and visible, the damage is COMMITTED, and the pass is OWED
+    /// within the current panel frame (the same window already composited inside it): the present
+    /// was absorbed and the caller returned immediately. Distinct from [`Presented::Composited`]
+    /// for exactly one consumer — `present_backpressure` must NOT close the rtwit input→present
+    /// ruler on it, because no glass has changed yet; the ruler closes at the frame-edge or tail
+    /// composite that actually carries the damage (review MAJOR 2: a ruler closed on work not done
+    /// under-reports the tail by up to a frame plus a service tick, and the tail ruler is the
+    /// standing real-time law). Every other consumer treats it exactly as `Composited` — same
+    /// hidden-counter reset, same `!= NoRow` truth for the kernel callers.
+    Coalesced,
 }
 
 /// PRESSURE-1: [`present`], reporting which of the three outcomes it took. Same pass, same order, same
@@ -1108,12 +1118,32 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
         }
         skip = owner_hidden(&t, owner, SHELL_Z.load(core::sync::atomic::Ordering::Acquire));
     }
+    // WPACE-PANEL — the pace decision, taken BEFORE `wcg::on_present` (review MAJOR 1). A coalesced
+    // present must not run `on_present`: that call declares "the owner has finished this surface"
+    // (bumps `APP_SEQ`, stores `cks_app`), but a coalesced owner returns immediately and keeps
+    // drawing, so the later frame-edge/tail blit would read `own=yes` against a checksum the owner
+    // has since rewritten — false RACE-PRESENT verdicts on exactly the storm workload this pacer
+    // targets. Skipping it leaves the ADMITTED present's declaration standing: the frame-edge
+    // blit's `cks_app` matches the present that claimed the frame, and a pure tail blit reads
+    // `own=no`, the truthful classification (the compositor, not the owner, initiated that pass).
+    // Short-circuits on `skip`: a hidden owner's present is suppressed below and must neither stamp
+    // the frame nor raise a pending bit.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    let pace_go = skip || pace_admit(id, pace_exempt);
     #[cfg(feature = "witness")]
     if let Some((surf, surf_len)) = probe {
         // WC-G's checksum is the OWNER's declaration of its own surface and is independent of whether
         // those pixels reach the panel, so it is taken on the suppressed path too — dropping it would
-        // make the `app` leg disagree with itself the moment a window went behind the shell.
-        super::wcg::on_present(id, surf, surf_len);
+        // make the `app` leg disagree with itself the moment a window went behind the shell. NOT
+        // taken on the coalesced path — see the WPACE-PANEL note above: a coalesced present makes no
+        // finished-surface declaration, because its pixels reach the panel on a later pass.
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        let declared = pace_go;
+        #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+        let declared = true;
+        if declared {
+            super::wcg::on_present(id, surf, surf_len);
+        }
     }
     // WC-N — the ATTEMPT is recorded here, before the suppression branch, because an attempt is what
     // the owner did and it happened either way. `hidden` is the branch it took. Outside the table
@@ -1132,17 +1162,18 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
         return Presented::Suppressed;
     }
     // WPACE-PANEL — coalesce this present into the current panel frame if the same window already
-    // composited inside it. The row is ALREADY marked damaged and `presented` above, so nothing is
-    // dropped: the accumulated damage rides the next pass — the same window's first present past
-    // the frame edge, any other caller's composite, or the service drain ([`pace_service`]), which
-    // bounds the wait to one frame. The presenting task is NEVER slept or blocked here: a coalesced
-    // present returns `Composited` immediately (the damage is committed and a pass inside the frame
-    // is guaranteed), so the syscall layer treats it exactly like a present whose composite ran.
+    // composited inside it (the decision itself was taken above, ahead of `on_present`). The row is
+    // ALREADY marked damaged and `presented`, so nothing is dropped: the accumulated damage rides
+    // the next pass — the same window's first present past the frame edge, any other caller's
+    // composite, or the service drain ([`pace_service`]), which bounds the wait to one frame. The
+    // presenting task is NEVER slept or blocked here: a coalesced present returns `Coalesced`
+    // immediately (the damage is committed and a pass inside the frame is guaranteed), which every
+    // consumer treats as `Composited` except the rtwit ruler close — see [`Presented::Coalesced`].
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-    if !pace_admit(id, pace_exempt) {
+    if !pace_go {
         #[cfg(feature = "witness")]
         wcn_tick();
-        return Presented::Composited;
+        return Presented::Coalesced;
     }
     composite();
     #[cfg(feature = "witness")]
@@ -1278,8 +1309,11 @@ fn pace_admit(id: WinId, exempt: bool) -> bool {
 
 /// WPACE-PANEL — the TAIL DRAIN: give a coalesced present a taker that is not a present.
 ///
-/// The steady-storm case needs no help — the same window's next present past the frame edge
-/// composites the accumulated damage. The case this exists for is the stream that STOPS mid-frame:
+/// Under a steady storm this drain and the frame edge RACE for each frame, and the drain usually
+/// wins: it polls at ~1 ms against a ~2.2 ms mean inter-present gap (Boot A's 453/s), and a win
+/// restamps the window's frame, so most frames of a steady storm are tail-carried (`tail=` dominant,
+/// `paced=` the minority, the sum ≈ panel rate — see [`WPACE_TAIL`]). The case it EXISTS for is
+/// narrower than the case it serves: the stream that STOPS mid-frame —
 /// its final present was coalesced, no later present is coming, and without a drain the window's
 /// last frame would sit in its surface until some unrelated pass happened by (`service_damage`
 /// rides `Screen::flush`, whose idle cadence is the status strip's ~1/s — visibly late). This is
@@ -1330,6 +1364,14 @@ pub fn pace_service() {
     // coalesced damage some other pass already consumed costs this pass nothing — `composite_once`
     // finds no damage and returns.
     composite();
+    // rtwit (review MAJOR 2) — a tail drain is a frame ACTUALLY reaching glass, so the
+    // input→present ruler closes here, at real glass time. The coalesced return in
+    // `present_banded` deliberately does not close it (`Presented::Coalesced`), so without this
+    // call a storm's final frame — the one only the drain carries — would leave the proxy open
+    // across the following idle gap and report a false tail spike on the next present. No-op
+    // inline shim when `rtwit` is off; unmasked main-loop context, same as the syscall's own
+    // call site.
+    crate::rtwit::note_present_composited();
     // Re-arm any due slot whose damage is STILL standing. The pass above can be DECLINED on
     // `COMP_GATE` against a masked holder whose table snapshot predated the coalesced damage; the
     // standing machinery then leaves `COMP_PENDING` for `service_damage` (~1 s idle cadence) or the
@@ -1366,9 +1408,12 @@ static WPACE_COALESCED: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
 
 /// WPACE-PANEL witness — tail composites [`pace_service`] ran for this window: coalesced damage
-/// whose stream stopped and which the service drain, not a present, put on glass. A steady storm
-/// reads `tail=0`; every non-zero tail is a frame the pre-pacer code would have shown no later
-/// than this one but at 7× the pass cost.
+/// the service drain, not a present, put on glass. NOT rare (review MINOR): under a steady storm
+/// the ~1 kHz drain beats the next frame-edge present most frames and restamps on the win, so a
+/// storm reads TAIL-DOMINANT (Boot A's 453/s: expect `tail` ≈ two-thirds of frames, `paced` the
+/// rest); the robust reading is the SUM — `paced + tail ≈ panel rate`. Corollary worth reading off
+/// the capture deliberately: under a storm most composite load migrates off the presenting cores
+/// onto the USB-pump service lane, bounded at the panel rate.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
 static WPACE_TAIL: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];

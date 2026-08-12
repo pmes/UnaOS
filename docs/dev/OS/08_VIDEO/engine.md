@@ -11598,8 +11598,10 @@ every counter in that block. `witness`-gated; the mechanism itself is not.
 * `paced=` — presents that composited in present context (frame-edge admissions);
 * `coalesced=` — presents absorbed into the frame in flight (returned immediately, damage
   accumulated);
-* `tail=` — composites `pace_service` ran for damage whose stream stopped. A steady storm reads
-  `tail=0`.
+* `tail=` — composites `pace_service` ran for coalesced damage a present did not carry. Not rare:
+  under a steady storm the ~1 kHz drain and the frame edge race for each frame and the drain
+  usually wins (it polls at ~1 ms against Boot A's ~2.2 ms mean inter-present gap, and a win
+  restamps the frame), so a storm is TAIL-DOMINANT.
 * `mode=panel` names this emitter and regime, per the standing rule that `[wpace] mode=` says which
   pacing regime a capture was taken under. **Namespace:** these lines carry the `[wcn] win=`
   namespace (wm ids) — *not* the syscall pacer's `[wpace] win=` table (historically
@@ -11607,6 +11609,30 @@ every counter in that block. `witness`-gated; the mechanism itself is not.
   The default-off `vsyncpace` syscall pacer and its `[wpace] pres=`/`rollup` lines are unchanged.
 
 Prediction for the next metal boot (falsifiable): Boot A's `win=3` (453.9/s free) reads
-`paced+tail ≈ 60/s` with `coalesced ≈ 6.5 × paced`, `[wcn] comp_rate` for that window falls to
-~60/s while `att` stays at the program's own rate (the load stays visible — the program still runs
+**`paced + tail ≈ 60/s`** — that sum is the robust half of the prediction — with the split
+tail-dominant (`tail ≈ 40/s`, `paced ≈ 20/s`: the 1 kHz drain wins the frame-end race roughly
+two of three frames against a ~2.2 ms inter-present gap and restamps on the win) and
+`coalesced ≈ 390/s` (`≈ 6.5 ×` the sum). `[wcn] comp_rate` for that window falls to ~60/s while
+`att` stays at the program's own rate (the load stays visible — the program still runs
 unrestricted and its presents are still counted), and `[wcser] declined=` falls with it.
+Corollary, so the capture is not misread as "mechanism broken": under a storm most composite
+load MIGRATES to the USB-pump service lane (`pace_service`'s caller), bounded at the panel rate
+— a tail-dominant `[wpace]` line is the pacer working, not the drain misfiring.
+
+### Review fixes (same arc, second commit)
+
+* **WC-G honesty (MAJOR 1)** — the pace decision is taken *before* `wcg::on_present`, and a
+  coalesced present does not run it: `on_present` declares "the owner finished this surface"
+  (bumps `APP_SEQ`, stores `cks_app`), but a coalesced owner returns immediately and keeps
+  drawing, so the later frame-edge/tail blit would have read `own=yes` against a rewritten
+  surface — false RACE-PRESENT verdicts on exactly the storm workload. With the skip, the
+  frame-edge blit's `cks_app` matches the present that claimed the frame and a pure tail blit
+  reads `own=no`, the truthful classification.
+* **rtwit ruler (MAJOR 2)** — a coalesced present returns a new `Presented::Coalesced`, which
+  every consumer treats as `Composited` (same hidden-counter reset, same `!= NoRow` truth)
+  except `present_backpressure`, which does **not** close the `in2present` ruler on it — no
+  glass changed yet, and closing there under-reported MAX/p99 by up to a frame plus a service
+  tick. The ruler closes at real glass time: the frame-edge present's own `Composited` return,
+  or `pace_service`'s tail drain, which calls `rtwit::note_present_composited` after its
+  composite (also keeping the proxy from spanning an idle gap after a storm's final,
+  drain-carried frame and reporting a false spike).
