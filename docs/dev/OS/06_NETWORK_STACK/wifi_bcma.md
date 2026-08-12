@@ -480,7 +480,7 @@ that.
 
 ### Where arc 2 stops — a NAMED UNKNOWN, not an omission
 
-Two gates stand between arc 2 and the upload, and both are on the wire.
+Three gates stand between arc 2 and the upload, and all three are on the wire.
 
 **Gate 1 — the set.** Boot A staged 0/3. The upload obviously cannot run; the point worth stating is
 that **§S4's prologue is skipped with it**. That prologue asserts `RESET_CTL.RESET`, which clears
@@ -488,7 +488,29 @@ that **§S4's prologue is skipped with it**. That prologue asserts `RESET_CTL.RE
 successful upload restores a working state*. A destructive, unrecoverable write whose sole
 justification is an upload that cannot happen is not made.
 
-**Gate 2 — the routing selector, and it stands even with the set present.** §S4 describes the upload
+**Gate 2 — set validation (WIFI-SETVAL, GR27), dry-run, no device access.** Before it, a COMPLETE
+set was dry-run through the ucode's header only: the initvals and bsinitvals images were staged and
+then never examined by anything, and no verdict existed for a future upload to gate on. The rung
+validates the WHOLE set — one `set-validate` line per role (header verdict, type/ver bytes, payload
+geometry, be32 word count, digest, per-file `VALID|INVALID`), one cross-set line, one
+`set-validation verdict=` line. What is REQUIRED (a hard park on failure) is what §S4 pins, plus
+one inference argued here (cross-file layout uniformity — one extraction produces one container;
+§S4 itself pins only the header record and the be32-word rule):
+every file satisfies one of `classify_header`'s two candidate layouts, every payload is a whole
+number of big-endian 32-bit words, and all three files satisfy the **same** layout (one extraction
+produces one container format, and the payload offset arc 3 feeds from is a function of the layout —
+a set whose files disagree about their own container is corrupt, mixed, or misclassified). What is
+ADVISORY (reported, never gated on) is every relation whose expected value no source legal for this
+module records: the type-byte and version-byte relations, printed so the first boot with the real
+set pins them. An INVALID verdict is a **hard park** (`upload REFUSED reason=set-validation-failed`)
+that outranks gate 3 on purpose: the day the routing is pinned, this gate is most of what stands between a
+corrupt set and a stream into the core — one named residual excepted: a layout-A set truncated
+IDENTICALLY across all three files classifies as a valid layout-B set (no legal magic can catch it);
+the §S4 UCODEREV-echo handshake after upload is the backstop for that case. It is a gate
+bad set and a stream into the core — never a blind push of unvalidated bytes. The fix for an
+INVALID is on the media: re-extract and re-stage (see "The bench round" below).
+
+**Gate 3 — the routing selector, and it stands even with the set present and valid.** §S4 describes the upload
 as `SHM_CONTROL <- (B43_SHM_UCODE << 16) | 0` followed by a stream into `SHM_DATA`. **The numeric
 value of `B43_SHM_UCODE` appears in no source this module may use.** §S4 names the symbol, not the
 value; this tree carries only `SHM_ROUTE_SHARED = 0x0001` (the READ routing §S4a uses); no capture of
@@ -502,16 +524,18 @@ window actually selected. So R7 refuses at the selector, names the unknown, and 
 settle it: the value from a source legal for this module, or a metal probe that identifies the
 routing read-only.
 
-When the set IS complete, R7 still prints a **dry-run** line first — `hdr=`, `type=`, `ver=`,
-`declared=`, the payload offset, the payload byte count and its be32 word count. That line is what
-settles W3 (below) and is what arc 3 starts from. It makes no device access.
+When the set IS complete and valid, gate 2's `set-validate` lines are the dry-run — `hdr=`,
+`type=`, `ver=`, `declared=`, the payload offset, the payload byte count and its be32 word count,
+per role. Those lines are what settle W3 (below) and are what arc 3 starts from. They make no
+device access.
 
 ### Open UNKNOWNs after arc 2
 
 | # | Unknown | Probe |
 | --- | --- | --- |
-| W3 | The firmware container header layout — §S4's own record is internally inconsistent | Unchanged from arc 1, and still open because Boot A staged 0/3. Now readable from TWO lines on the first boot with the real set: arc 1's `STAGED … hdr=` and arc 2's `upload PREPARED(dry-run) … hdr= payload-offset=`. They share one `classify_header`, so they cannot disagree |
-| W5 | The `B43_SHM_UCODE` routing value | Not settleable by any boot of this code. See gate 2 |
+| W3 | The firmware container header layout — §S4's own record is internally inconsistent | Unchanged from arc 1, and still open because Boot A staged 0/3. Now readable from SIX lines on the first boot with the real set: arc 1's three `STAGED … hdr=` lines and gate 2's three `set-validate … hdr= payload-offset=` lines. They share one `classify_header`, so they cannot disagree |
+| W5 | The `B43_SHM_UCODE` routing value | Not settleable by any boot of this code. See gate 3 |
+| W6 | The initvals RECORD format — §S4 records "register init table" and nothing of its record structure | Not settleable by any boot of this code, and not in `bcm4331.md`. Gate 2 validates the initvals files' container and word geometry; PARSING the records (offset/width/value tuples for the PHY tables) waits on a Group-A-legal description. Named here so arc 3 does not discover it as a surprise |
 
 W4 — "does the tag-driven walk agree with the declared arities?" — is not listed as an unknown
 because it is not one the code waits on: every component line answers it with `arity=`.
@@ -621,6 +645,52 @@ Provenance is the user's: §S4 records the set as extracted from `broadcom-wl-5.
 
   The accept decision rests only on presence and bounds, so a file in either container — or neither —
   still stages, and says which.
+
+### The bench round — the exact files, and what the boot then does
+
+The set has never been staged on metal — every boot so far parked honestly at `INCOMPLETE 0/3`.
+This section is the whole remaining bench recipe: three files on a stick, one boot, and the loader
+consumes them and prints its verdict.
+
+**The files.** Exactly these three, produced by `b43-fwcutter` (the extractor every Linux
+distribution uses for this card) run against Broadcom's own binary driver, release
+`broadcom-wl-5.100.138` (the extraction §S4 records; the input inside that release is
+`linux/wl_apsta.o`):
+
+```
+b43-fwcutter -w <destdir> wl_apsta.o
+```
+
+Out of the many files the cutter emits into `<destdir>/b43/`, the loader wants these — and only
+these — matching `FW_SET` in `firmware.rs` name for name:
+
+| # | file (as fwcutter names it) | role | 8.3 alias if the volume has no VFAT long names |
+| --- | --- | --- | --- |
+| 1 | `ucode29_mimo.fw` | microcode (d11 core rev 29) | `UCODE29.FW` |
+| 2 | `ht0initvals29.fw` | register init table (HT-PHY + rev 29) | `HT0IV29.FW` |
+| 3 | `ht0bsinitvals29.fw` | band-switch init table (same selection) | `HT0BSI29.FW` |
+
+No PCM file — rev 29 does not use one. No other `ucodeNN`/`*initvals*` revision from the cutter's
+output is the right blob for this core, and staging a wrong-revision image is what §S4's handshake
+exists to catch. **OpenFWWF is not a substitute**: its one free image is the arch-5 family (core
+revs 5–10) and does not cover rev 29 (`bcm4331.md` §S4's decision box).
+
+**The layout.** A FAT-formatted USB stick, files in any ONE of the three searched directories —
+`/`, `/B43/`, `/FIRMWARE/` — so copying the cutter's whole `b43/` output directory to the stick's
+root works as-is (the match is case-insensitive, `b43/` ≡ `/B43/`). Long names need VFAT LFN
+entries (the reader supports them, PI-FS-3); on a plainly-formatted volume use the 8.3 aliases.
+The internal card also works — the search covers the program source first, then the other
+populated handle — but the stick is the shape WIFI-REACH was built for: card-early / stick-late,
+with a 30 s staging-gate hold for the late volume.
+
+**What the boot then does** (`UNAOS_WIFI=1 UNAOS_WIFI2=1`): arc 1 stages all three
+(`STAGED … hdr= … fnv1a=…` per file, then `firmware set COMPLETE 3/3`), and arc 2's gate 2 runs the
+full-set validation — three `set-validate` lines, the cross-set line, and the
+`set-validation verdict=` line. `verdict=VALID` settles W3 from six independent lines and parks at
+gate 3's `upload REFUSED reason=shm-ucode-routing-UNPINNED`, which is the EXPECTED park for this
+round: the capture is the deliverable. `verdict=INVALID` (or any `REJECTED` at staging) is a fact
+about the media — re-extract and re-stage; the loader never routes around a present-but-wrong
+file. `UNAOS_WIFI=1` alone runs the staging half only: `COMPLETE 3/3` and no arc 2.
 
 ## Open UNKNOWN and its metal probe
 
@@ -753,13 +823,23 @@ the pass ends in exactly one `end` line whatever happened.
 :: wifi2: end ok=1 stage=d11 d11=FOUND wrote-cfg80=6(selftest=2 moves=3 restore=1) wrote-cfg0xac=0(moves=0 restore=0) wrote-wrapper=0(enable=0 unwind=0) wrote-core-regs=0(audited — SHM_CONTROL, SHM_DATA, MACCTL and RADIO_CONTROL share this counter …) uploaded-bytes=0(audited) restore=MATCH elapsed=…ms ::
 ```
 
-With the set present, the two `upload SKIPPED` / `RESTORE` lines are preceded by:
+With the set present, the `upload SKIPPED` line is replaced by gate 2's validation rung and gate
+3's refusal (WIFI-SETVAL):
 
 ```
-:: wifi2: upload PREPARED(dry-run, no device access) ucode bytes=… hdr=A|B|unrecognized type=… ver=… declared=… payload-offset=… payload-bytes=… be32-words=… words-whole=… — … W3 … is settled by the hdr= field on this line ::
-:: wifi2: upload REFUSED reason=shm-ucode-routing-UNPINNED — … NOT guessed. What settles it: … ::
+:: wifi2: set-validate ucode bytes=… fnv1a=… hdr=A|B|unrecognized type=… ver=… declared=… payload-offset=… payload-bytes=… be32-words=… words-whole=… => VALID|INVALID — dry-run, NO device access; this is the exact stream arc 3 would push for this role ::
+:: wifi2: set-validate initvals bytes=… fnv1a=… hdr=… … => VALID|INVALID — … ::
+:: wifi2: set-validate bsinitvals bytes=… fnv1a=… hdr=… … => VALID|INVALID — … ::
+:: wifi2: set-validate cross layout-uniform=… (REQUIRED — …) type(initvals)==type(bsinitvals)=… type(ucode)!=type(initvals)=… ver-uniform=… (ADVISORY — no source legal for this module pins the expected type/ver values …) ::
+:: wifi2: set-validation verdict=VALID|INVALID — W3 … now gets THREE independent hdr= verdicts above … arc 3's upload is GATED on this verdict … ::
+:: wifi2: upload REFUSED reason=shm-ucode-routing-UNPINNED — … NOT guessed. What settles it: … ::                          (verdict=VALID)
+:: wifi2: upload REFUSED reason=set-validation-failed — HARD PARK: no byte of an unvalidated or ambiguous set is ever streamed at the core … re-extract the set with b43-fwcutter and re-stage the stick … ::   (verdict=INVALID)
 :: wifi2: upload NOT ATTEMPTED uploaded-bytes=0(audited) wrote-core-regs=0(audited — SHM_CONTROL, SHM_DATA, MACCTL and RADIO_CONTROL share this counter and no site in this file increments it) — the resident microcode is untouched and still running ::
 ```
+
+(`set-validate FAILED — the set reports COMPLETE but only N/3 roles are retrievable from the
+staging buffers` is the shape when `staged_count()` and the staging buffers disagree; that
+disagreement is itself the finding and it parks as INVALID does.)
 
 Refusal forms, each naming its own reason and each leaving the window where it found it:
 

@@ -175,24 +175,53 @@ pub fn with_staged<R>(role: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     STAGED.lock().iter().find(|s| s.role == role).map(|s| f(s.bytes.as_slice()))
 }
 
-/// The staged microcode's container verdict, as `(layout, type, ver, declared, len)`, or `None` when
-/// the `ucode` role did not stage. `None` while the set is COMPLETE is itself a finding, and arc 2
-/// prints it as one.
+/// One staged image's container verdict and geometry, for arc 2's SET-VALIDATION rung (WIFI-SETVAL).
 ///
-/// This exists so arc 2 does not re-derive the payload offset. W3 — `bcm4331.md` §S4's internally
-/// inconsistent header record — is still an open UNKNOWN, and two independent implementations of an
-/// unresolved rule is exactly how the loader's `hdr=` verdict and an uploader's payload offset come
-/// to disagree without either one looking wrong. One `classify_header`, both readers.
+/// Everything here is DERIVED from the staged bytes by this module's own `classify_header` and
+/// `fnv1a32` — arc 2 re-derives nothing. W3 — `bcm4331.md` §S4's internally inconsistent header
+/// record — is still an open UNKNOWN, and two independent implementations of an unresolved rule is
+/// exactly how the loader's `hdr=` verdict and a consumer's payload offset come to disagree without
+/// either one looking wrong. One `classify_header`, every reader.
+#[cfg(feature = "wifi2")]
+pub(crate) struct StagedHeader {
+    pub role: &'static str,
+    pub layout: &'static str,
+    pub kind: u8,
+    pub ver: u8,
+    /// Layout A's declared payload length. Meaningless unless `layout == "A"`.
+    pub declared: u32,
+    pub len: usize,
+    pub words_ok: bool,
+    pub digest: u32,
+}
+
+/// The header verdict of every staged member, in [`FW_SET`] order. A COMPLETE set yields
+/// [`FW_SET_LEN`] entries; fewer while `staged_count()` says COMPLETE is itself a finding, and arc
+/// 2's validation rung reports it as one.
 ///
 /// `wifi2`-gated, along with [`FW_SET_LEN`], so that an arc-1-only build's item set is unchanged: the
-/// census-and-staging image stays what it was, rather than "what it was, plus two accessors nothing
+/// census-and-staging image stays what it was, rather than "what it was, plus accessors nothing
 /// calls".
 #[cfg(feature = "wifi2")]
-pub(crate) fn ucode_header() -> Option<(&'static str, u8, u8, u32, usize)> {
-    with_staged("ucode", |b| {
-        let v = classify_header(b);
-        (v.layout, v.kind, v.ver, v.declared, b.len())
-    })
+pub(crate) fn set_headers() -> Vec<StagedHeader> {
+    let staged = STAGED.lock();
+    let mut out = Vec::new();
+    for spec in FW_SET {
+        if let Some(s) = staged.iter().find(|s| s.role == spec.role) {
+            let v = classify_header(&s.bytes);
+            out.push(StagedHeader {
+                role: s.role,
+                layout: v.layout,
+                kind: v.kind,
+                ver: v.ver,
+                declared: v.declared,
+                len: s.bytes.len(),
+                words_ok: v.words_ok,
+                digest: s.digest,
+            });
+        }
+    }
+    out
 }
 
 /// Short human reason for a [`FatError`] in the witness lines. A local twin of `fat::fat_reason`,

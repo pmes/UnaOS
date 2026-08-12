@@ -1303,10 +1303,20 @@ fn reach_d11(bus: u8, dev: u8, func: u8, bar0: u64, d: &D11, pre_win2: u32, w: &
     true
 }
 
-/// R7 — the microcode upload, and the two gates it does not pass.
+/// R7 — the microcode upload, and the three gates it does not pass.
 ///
 /// This function makes NO device access. It is the honest accounting of why arc 2 stops here, and it
 /// is written as code rather than as a comment so that a boot capture carries the reason.
+///
+/// WIFI-SETVAL (GR27) inserted gate 2 — full-set validation — between the completeness gate and the
+/// routing refusal. It is the consumption rung the loader could not perform even WITH the files
+/// present: before it, the initvals and bsinitvals images were staged and then never examined by
+/// anything, the dry-run covered the ucode alone, and no verdict existed for arc 3's upload to gate
+/// on. The rung is deliberately a DRY-RUN — the two facts that would let bytes move (the
+/// `B43_SHM_UCODE` routing value, gate 3, and the initvals RECORD format, which `bcm4331.md` §S4
+/// does not describe beyond "register init table") are both unpinned for this module, so the largest
+/// verifiable rung is validating the whole set against the facts §S4 DOES pin and recording the
+/// verdict the upload arc must consume.
 fn upload_gate(macctl: u32, w: &Writes) {
     let staged = super::firmware::staged_count();
     let want = super::firmware::FW_SET_LEN;
@@ -1321,38 +1331,112 @@ fn upload_gate(macctl: u32, w: &Writes) {
         return;
     }
 
-    // Gate 2 — the set is on the media, and the arc still stops, at a NAMED UNKNOWN.
+    // Gate 2 — WIFI-SETVAL: the set is on the media; validate ALL of it before anything else is
+    // even discussed. A hard park here outranks the routing refusal below on purpose: the day the
+    // routing IS pinned, this gate is most of what stands between a corrupt or misclassified set and a
+    // stream into the core — with one named residual it cannot see: a layout-A set whose files are
+    // all truncated/corrupted IDENTICALLY in their trailing bytes classifies as a valid layout-B set
+    // (no Group-A-legal magic exists to catch it; that is W3/W5's honesty). The §S4 handshake — the
+    // UCODEREV echo after upload — is the backstop that catches what this dry-run cannot. It is
+    // stream into the core — never a blind push of unvalidated bytes.
+    if !validate_set() {
+        serial_println!(
+            ":: wifi2: upload REFUSED reason=set-validation-failed — HARD PARK: no byte of an unvalidated or ambiguous set is ever streamed at the core, whatever the routing turns out to be, and the §S4 PROLOGUE (the reset that destroys the resident microcode) is skipped with it. The fix is on the media: re-extract the set with b43-fwcutter and re-stage the stick (see wifi_bcma.md, \"The bench round\") ::"
+        );
+        upload_not_attempted(w);
+        return;
+    }
+
+    // Gate 3 — the set is present AND valid, and the arc still stops, at a NAMED UNKNOWN.
     //
     // §S4's upload is `SHM_CONTROL <- (B43_SHM_UCODE << 16) | 0` then a stream into `SHM_DATA`. The
     // numeric value of that routing selector is in no source this module may use (see the file
     // header). §S4a's safety argument for touching SHM_CONTROL rests entirely on never writing the
     // data port — a wrong routing then costs a wrong number on a witness line. An upload inverts
     // that: a wrong routing streams tens of kilobytes into whatever bank was actually selected.
-    match super::firmware::ucode_header() {
-        Some((layout, kind, ver, declared, len)) => {
-            let payload_off: usize = match layout {
-                "A" => 8,
-                "B" => 4,
-                _ => 0,
-            };
-            serial_println!(
-                ":: wifi2: upload PREPARED(dry-run, no device access) ucode bytes={} hdr={} type={:#04x} ver={:#04x} declared={} payload-offset={} payload-bytes={} be32-words={} words-whole={} — this is the stream the upload WOULD push; W3 (bcm4331.md §S4's internally-inconsistent header record) is settled by the hdr= field on this line ::",
-                len, layout, kind, ver, declared, payload_off,
-                len.saturating_sub(payload_off), len.saturating_sub(payload_off) / 4,
-                ((len.saturating_sub(payload_off)) % 4 == 0) as u8,
-            );
-        }
-        None => serial_println!(
-            ":: wifi2: upload PREPARED(dry-run) — the set reports COMPLETE but the ucode role is not retrievable from the staging buffers; that disagreement is itself the finding ::"
-        ),
-    }
     serial_println!(
         ":: wifi2: upload REFUSED reason=shm-ucode-routing-UNPINNED — bcm4331.md §S4 names the selector B43_SHM_UCODE but records no VALUE for it; this tree carries only SHM_ROUTE_SHARED=0x0001 (the READ routing S4a uses) and no capture of ours has measured the ucode routing. The only source that carries it is b43 driver source, which CLEAN_ROOM_POLICY §2 puts off-limits for src/wifi/. A wrong routing on a READ costs a wrong number (§S4a); a wrong routing on a 90 KB STREAM into SHM_DATA writes that stream into whatever bank was selected. NOT guessed. What settles it: the value from a source legal for this module, or a metal probe that identifies the routing read-only ::"
     );
-    // The audited zeros are FIELDS, not literals. `core_regs` covers `SHM_CONTROL`, `SHM_DATA`,
-    // `MACCTL` and `RADIO_CONTROL` alike — they are all d11 core-window registers and this file has no
-    // write site for any of them — so one counter carries the whole claim and the compiler's
-    // reachability, not a reader's trust, is what keeps it at zero.
+    upload_not_attempted(w);
+}
+
+/// Gate 2 — WIFI-SETVAL: validate the COMPLETE staged set, dry-run, no device access. One line per
+/// role, one cross-set line, one verdict line. Returns whether arc 3's upload may ever consume this
+/// set.
+///
+/// What is REQUIRED (a hard park on failure) is what `bcm4331.md` §S4 pins, plus one
+/// inference argued here (cross-file layout uniformity — one extraction produces one container;
+/// §S4 itself pins only the header record and the be32-word rule):
+///
+///   * every file's header satisfies one of `classify_header`'s two self-consistent candidate
+///     layouts — a file satisfying NEITHER cannot carry a whole-be32-word payload under any reading
+///     of §S4's (internally inconsistent) header record;
+///   * every file's payload is a whole number of big-endian 32-bit words under its layout — §S4:
+///     "the payload is a stream of big-endian 32-bit words";
+///   * all three files satisfy the SAME layout. The payload offset arc 3 feeds from is a function
+///     of the layout, and one extraction produces one container format — a set whose files disagree
+///     about their own container is corrupt, mixed from two extractions, or misclassified, and
+///     every one of those parks.
+///
+/// What is ADVISORY (reported, never gated on) is every relation whose expected value no source
+/// legal for this module records: the type bytes and version bytes. They are printed so the first
+/// boot with the real set PINS them — the same metal-probe posture as W3 itself.
+fn validate_set() -> bool {
+    let hs = super::firmware::set_headers();
+    let want = super::firmware::FW_SET_LEN;
+    if hs.len() != want {
+        serial_println!(
+            ":: wifi2: set-validate FAILED — the set reports COMPLETE but only {}/{} roles are retrievable from the staging buffers; that disagreement is itself the finding ::",
+            hs.len(), want
+        );
+        return false;
+    }
+
+    let mut all_ok = true;
+    for h in &hs {
+        let recognized = h.layout == "A" || h.layout == "B";
+        let payload_off: usize = match h.layout {
+            "A" => 8,
+            "B" => 4,
+            _ => 0,
+        };
+        let ok = recognized && h.words_ok;
+        all_ok &= ok;
+        serial_println!(
+            ":: wifi2: set-validate {} bytes={} fnv1a={:#010x} hdr={} type={:#04x} ver={:#04x} declared={} payload-offset={} payload-bytes={} be32-words={} words-whole={} => {} — dry-run, NO device access; this is the exact stream arc 3 would push for this role ::",
+            h.role, h.len, h.digest, h.layout, h.kind, h.ver, h.declared, payload_off,
+            h.len.saturating_sub(payload_off), h.len.saturating_sub(payload_off) / 4,
+            h.words_ok as u8, if ok { "VALID" } else { "INVALID" },
+        );
+    }
+
+    let uniform = hs.iter().all(|h| h.layout == hs[0].layout);
+    all_ok &= uniform;
+    if let (Some(uc), Some(iv), Some(bs)) = (
+        hs.iter().find(|h| h.role == "ucode"),
+        hs.iter().find(|h| h.role == "initvals"),
+        hs.iter().find(|h| h.role == "bsinitvals"),
+    ) {
+        serial_println!(
+            ":: wifi2: set-validate cross layout-uniform={} (REQUIRED — one extraction produces one container format, and the payload offset is a function of the layout) type(initvals)==type(bsinitvals)={} type(ucode)!=type(initvals)={} ver-uniform={} (ADVISORY — no source legal for this module pins the expected type/ver values; the observed relations are reported so the first boot with the real set pins them, and nothing is gated on them) ::",
+            uniform as u8, (iv.kind == bs.kind) as u8, (uc.kind != iv.kind) as u8,
+            (uc.ver == iv.ver && iv.ver == bs.ver) as u8,
+        );
+    }
+
+    serial_println!(
+        ":: wifi2: set-validation verdict={} — W3 (bcm4331.md §S4's internally-inconsistent header record) now gets THREE independent hdr= verdicts above, one per file, all from the one classify_header; arc 3's upload is GATED on this verdict — a VALID here is its precondition, never its permission ::",
+        if all_ok { "VALID" } else { "INVALID" }
+    );
+    all_ok
+}
+
+/// The audited zeros are FIELDS, not literals. `core_regs` covers `SHM_CONTROL`, `SHM_DATA`,
+/// `MACCTL` and `RADIO_CONTROL` alike — they are all d11 core-window registers and this file has no
+/// write site for any of them — so one counter carries the whole claim and the compiler's
+/// reachability, not a reader's trust, is what keeps it at zero. One print site, shared by both
+/// terminal refusals, so the two exits cannot drift.
+fn upload_not_attempted(w: &Writes) {
     serial_println!(
         ":: wifi2: upload NOT ATTEMPTED uploaded-bytes={}(audited) wrote-core-regs={}(audited — SHM_CONTROL, SHM_DATA, MACCTL and RADIO_CONTROL share this counter and no site in this file increments it) — the resident microcode is untouched and still running ::",
         w.upload_bytes, w.core_regs
