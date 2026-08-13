@@ -3322,15 +3322,51 @@ pub fn count() -> usize {
 /// Encoding: `0` = nothing owed; otherwise `tail(1..=4) | dirty << 8`. All FOUR [`CursorTail`]
 /// arms encode (`Adopt`/`Settle`/`Repaint`/`Untouched`) — there is no arm that falls back to an
 /// inline cash, so the split covers the whole verdict space rather than a subset of it.
+/// ENGAGE (this arc) — **THE SPLIT WAS INERT, AND THIS IS WHERE.** As landed, this function's FIRST
+/// statement was `OWED_ARM.store(false)`, and [`composite_once`] opened by calling it. So on every
+/// present the order was: `present_surface_common` ARMS → the pass's `composite_once` immediately
+/// DISARMS (as a side effect of its stale cash) → the stash test at the bottom of that same pass
+/// read `false` → `cash_tail` ran inline, masked. `OWED_TAIL` was never once non-zero and the
+/// epilogue below always found `code == 0`. The masked-latency win the split exists for was never
+/// taken, and no witness could see that because nothing was stranded either.
+///
+/// The defect was an ORDERING one, not a logic one: the stale cash and the arm test are two
+/// different questions about two different passes, and the disarm belonged to neither the top of
+/// `composite_once` nor to the stale cash. It belongs HERE (the epilogue spends the arm its own
+/// present made) and to the pass's one-shot capture (`OWED_ARM.swap(false)` in `composite_once`).
+/// The stale cash — now [`cash_owed_stash`], called without touching the arm — CONSUMES ONLY THE
+/// PAST: at the top of a pass `OWED_TAIL` can hold nothing but a previous pass's stash, because
+/// this pass has not reached its own stash site yet.
 #[cfg(target_arch = "aarch64")]
 pub fn composite_tail_owed() {
-    // Disarm first: the present whose epilogue this is has finished, so any composite that runs
-    // before the next `composite_arm_owed` cashes inline. Ordering with the swap does not matter —
-    // both are single-location and the arm is a policy hint, never the verdict.
+    // THE EPILOGUE OWNS THE DISARM, and it is unconditional. This present is finished; whatever it
+    // armed is spent by now, so any composite that runs before the next `composite_arm_owed` cashes
+    // inline, which is trunk timing. `composite_once` will normally have taken the arm already (with
+    // a swap, for this pass); this store is what covers the present that armed and then never
+    // reached a pass at all — without it that arm would leak onto the next unrelated composite,
+    // which is the service-lane stash that measured the 9.2 s withhold.
     OWED_ARM.store(false, core::sync::atomic::Ordering::Relaxed);
+    let cashed = cash_owed_stash();
+    #[cfg(feature = "witness")]
+    if cashed {
+        OWED_CASH_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "witness"))]
+    let _ = cashed;
+}
+
+/// ENGAGE — take the stash if there is one and cash it; answer whether there was one.
+///
+/// The whole of the decode, shared by the two casher roles so they cannot drift: the EPILOGUE
+/// ([`composite_tail_owed`], unmasked, cashing the present's own pass) and the STALE cash (the top
+/// of [`composite_once`], masked, cashing a leftover). **It deliberately does not touch
+/// [`OWED_ARM`]** — that is exactly the clobber that made the split inert. The `swap(0)` is what
+/// makes a cash idempotent: two racing casher roles cannot both run the same tail.
+#[cfg(target_arch = "aarch64")]
+fn cash_owed_stash() -> bool {
     let code = OWED_TAIL.swap(0, core::sync::atomic::Ordering::AcqRel);
     if code == 0 {
-        return;
+        return false;
     }
     let dirty = code & 0x100 != 0;
     let tail = match code & 0xff {
@@ -3350,6 +3386,7 @@ pub fn composite_tail_owed() {
         #[cfg(feature = "witness")]
         c2_t1: OWED_C2_T1.load(core::sync::atomic::Ordering::Relaxed),
     });
+    true
 }
 
 /// M3 shrink 2 — the non-aarch64 entry point. See the aarch64 form above for the mechanism: on
@@ -3405,6 +3442,59 @@ static OWED_TAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32:
 static OWED_C2_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(all(target_arch = "aarch64", feature = "witness"))]
 static OWED_C2_T1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ENGAGE — THE ENGAGEMENT CENSUS, cumulative since boot, printed by [`owedtail_emit`] as
+/// `[wc-tail]`. It exists because the split's failure mode is SILENT: an inert split composites
+/// correctly, every pixel lands, every witness reads clean, and the only symptom is a latency win
+/// that is not being taken. `stash`/`cash` are the falsifier — before this arc they were provably
+/// `0`/`0` on every boot, and a boot with presents must now show both non-zero.
+///
+/// `stash` — passes that deferred their tail (armed presents). `cash` — epilogue cashes, the
+/// unmasked ones, which is the win. `stale` — leftovers consumed masked at the top of a later pass
+/// (the pathological path; a small number is fine, a number tracking `stash` means epilogues are
+/// not arriving). `inline` — passes that cashed in the mask because no epilogue was coming, i.e.
+/// the service lane, `erase`, `move_to` and the teardowns, on trunk timing exactly as intended.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_STASH_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_CASH_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_STALE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_INLINE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// ENGAGE — the census line, on the `[wcn]`/`[comp2]` rollup cadence and beside them deliberately:
+/// the engagement claim and the latency claim are read together or not at all. The counters are
+/// CUMULATIVE (loaded, never drained), so the last `[wc-tail]` in a capture is the whole boot's
+/// census and a single line answers the arc's question.
+///
+/// The verdict is not a gate directive, it is a reading: `ENGAGED` = the split is doing its job;
+/// `INERT` = nothing was ever stashed (the state this arc found); `STRANDED` = tails are being
+/// stashed but no epilogue is cashing them, which would be the 9.2 s withhold returning by another
+/// route and is the shape to watch for.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+fn owedtail_emit() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let stash = OWED_STASH_N.load(Relaxed);
+    let cash = OWED_CASH_N.load(Relaxed);
+    let stale = OWED_STALE_N.load(Relaxed);
+    let inline = OWED_INLINE_N.load(Relaxed);
+    let verdict = if stash == 0 {
+        "INERT"
+    } else if cash == 0 {
+        "STRANDED"
+    } else {
+        "ENGAGED"
+    };
+    serial_println!(
+        "[wc-tail] census stash={} cash={} stale={} inline={} -> {}",
+        stash,
+        cash,
+        stale,
+        inline,
+        verdict
+    );
+}
 
 pub fn composite() {
     #[cfg(not(target_arch = "x86_64"))]
@@ -3594,11 +3684,32 @@ struct Owed {
 /// That is what lets WCSER's re-run loop keep calling this in a loop: every round is still a full
 /// pass with its own inline cursor tail, exactly as the loop's correctness argument requires.
 fn composite_once() {
-    // The STALE cash, masked and first. Pathological only — a present whose caller never reached
-    // its unmasked epilogue, or one of this module's own non-syscall composites. Running it here
-    // bounds a tail's deferral at one pass; the swap makes a double cash impossible.
+    // ENGAGE — TAKE THE ARM ONCE, FOR THIS PASS, AND BEFORE ANYTHING ELSE CAN SPEND IT.
+    //
+    // This is the fix. `present_surface_common` armed a few instructions ago and its epilogue is a
+    // few instructions away; that arming is a fact about THIS pass and nothing between here and the
+    // stash test below may consume it. The old code reached the stash test through
+    // `composite_tail_owed`, whose disarm cleared the arming its own caller had just made — so the
+    // test always read `false` and the split never fired. A `swap` reads the decision and spends it
+    // in one operation: a second pass reaching here before the epilogue finds `false` and cashes
+    // inline, so one arming can never authorise two stashes.
     #[cfg(target_arch = "aarch64")]
-    composite_tail_owed();
+    let armed = OWED_ARM.swap(false, core::sync::atomic::Ordering::Relaxed);
+    // The STALE cash, masked and first — and it NO LONGER TOUCHES THE ARM. It consumes only the
+    // PAST: at this point in a pass `OWED_TAIL` can hold nothing but a PREVIOUS pass's stash, since
+    // this pass has not reached its own stash site. Pathological only — a present whose caller
+    // never reached its unmasked epilogue. Running it here bounds a tail's deferral at one pass;
+    // the swap inside makes a double cash impossible.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let cashed = cash_owed_stash();
+        #[cfg(feature = "witness")]
+        if cashed {
+            OWED_STALE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "witness"))]
+        let _ = cashed;
+    }
     let owed = composite_pass_half();
     // x86 (and anything not aarch64): cash inline, in the pass, as the trunk always has.
     #[cfg(not(target_arch = "aarch64"))]
@@ -3608,7 +3719,9 @@ fn composite_once() {
     // restored. Any other caller cashes inline, exactly as the trunk does. See
     // [`composite_arm_owed`] for the measurement that made this test necessary.
     #[cfg(target_arch = "aarch64")]
-    if !OWED_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+    if !armed {
+        #[cfg(feature = "witness")]
+        OWED_INLINE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         cash_tail(owed);
     } else {
         #[cfg(feature = "witness")]
@@ -3624,6 +3737,8 @@ fn composite_once() {
             CursorTail::Untouched => 4,
         } | if owed.dirty { 0x100 } else { 0 };
         OWED_TAIL.store(code, core::sync::atomic::Ordering::Release);
+        #[cfg(feature = "witness")]
+        OWED_STASH_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -9346,6 +9461,11 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // FLUID-3 — the wait ledger rides the same cadence and the same span.
     #[cfg(target_arch = "aarch64")]
     fluid3_emit(span);
+    // ENGAGE — the owed-tail engagement census rides the same cadence, directly under `[comp2]`
+    // whose `sprite_us`/`max_us` it qualifies: `[comp2]` says what a pass cost, `[wc-tail]` says
+    // whether the cost was paid masked or unmasked. Cumulative, so the last one is the boot.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    owedtail_emit();
     // WCSER — the serialisation ledger rides the same cadence and the same span, and sits directly
     // under the per-window `comp_rate=` lines it explains: a `comp_rate` far above `att_rate` with
     // `declined=0` is the occlusion closure doing its job, and the same reading with `declined` high

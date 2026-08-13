@@ -12140,6 +12140,137 @@ the mechanism rather than by scoping it. **Not touched here** — this arc's con
 cursor fix and nothing else, and re-enabling a deferral is a latency change that wants its own arc
 and its own gate. Flagged for the brief.
 
+> **RESOLVED** by the ENGAGE arc below (2026-08-13). The blockquote above is kept as the diagnosis
+> that found it, not as a description of the current tree.
+
+## ENGAGE — the owed-tail split engages; the stale cash consumes the past, not the present (aarch64, 2026-08-13)
+
+The defect CURSOR-VANISH flagged, fixed. It was an **ordering** bug, not a logic bug: every piece of
+`912de713` was correct in isolation and the interleaving was not.
+
+### The lifecycle, and where it broke
+
+The design has three roles and one flag:
+
+| role | site | duty |
+|---|---|---|
+| ARM | `present_surface_common` (`arch/aarch64/syscall.rs`) | "an unmasked epilogue is coming for this pass" |
+| STASH | bottom of `composite_once` | if armed, put the verdict in `OWED_TAIL` and leave the mask |
+| CASH | `composite_tail_owed`, from the two present epilogues after `drop(_irq)` | run the sprite tail unmasked |
+
+plus a fourth, defensive: the **stale cash** at the top of `composite_once`, which consumes a stash
+whose epilogue never arrived, bounding a deferral at one pass.
+
+The stale cash was implemented by calling `composite_tail_owed()` — the *epilogue* entry point,
+whose first statement is `OWED_ARM.store(false)`. So the disarm ran at the top of the very pass that
+was about to ask whether it was armed:
+
+```
+present_surface_common  ARM   OWED_ARM = true
+  composite_once
+    composite_tail_owed       OWED_ARM = false   <-- clobbers the arming just made FOR THIS PASS
+    composite_pass_half
+    if !OWED_ARM  ->  true    cash_tail inline, MASKED
+  epilogue
+    composite_tail_owed       OWED_TAIL == 0, nothing to do
+```
+
+`OWED_TAIL` was never once non-zero for the life of the split. Nothing was stranded, nothing was
+lost, every pixel landed — the mechanism was simply not running.
+
+### The interleaving fix
+
+The disarm belongs to two places and neither of them is the stale cash:
+
+* **the pass takes the arm ONCE, with a swap**, as its first act: `let armed = OWED_ARM.swap(false)`.
+  This reads the decision its caller made and spends it atomically, so a second pass reaching
+  `composite_once` before the epilogue finds `false` and cashes inline — one arming can never
+  authorise two stashes.
+* **the epilogue disarms unconditionally**, because it is the present's own arm to spend. This is
+  what covers a present that armed and then never reached a pass at all; without it that arm would
+  leak onto the next unrelated composite, which is precisely the service-lane stash that measured
+  the 9.2 s withhold.
+
+The decode moved to a new `cash_owed_stash() -> bool`, shared by both casher roles so they cannot
+drift, and **it does not touch `OWED_ARM`**. That is what makes the stale cash consume only the
+past: at the top of a pass, `OWED_TAIL` can hold nothing but a *previous* pass's stash, because this
+pass has not reached its own stash site yet. `swap(0)` still makes a cash idempotent.
+
+### The four populations, and what each now does
+
+| caller | arm | behaviour |
+|---|---|---|
+| `sys_fb_present` / `sys_win_present` | yes | stash → epilogue cashes **unmasked**. The win. |
+| service lane / `erase` / `move_to` / teardowns / IRQ-context damage | no | `armed == false` → `cash_tail` inline, masked. Trunk timing exactly, which is what keeps the 9.2 s withhold from returning. |
+| present whose task dies between `drop(_irq)` and the epilogue | yes | stash survives; the next composite's stale cash takes it, masked. |
+| x86 / any non-aarch64 | n/a | `composite_once` is still `composite_pass_half()` then `cash_tail(..)`, cfg'd; `OWED_ARM`/`OWED_TAIL` do not exist. WCSER's re-run loop is untouched. |
+
+**The residual, stated rather than papered over.** Row 3's backstop is the *next composite*, and
+`service_damage` is event-driven, not periodic — it returns without compositing when no row is dirty
+and `DEFER_N == 0`. On a fully idle desktop nothing composites, so a stranded stash would wait for
+the next real damage. It is bounded by that and by nothing else. The exposure is small (the gap is a
+handful of instructions in the same kernel frame, with IRQs restored, and a preemption there only
+delays the epilogue rather than skipping it) and the gate measures it directly: `stale=0` across
+both legs, i.e. it did not happen once in ~1700 stashes.
+
+### The witness — because the failure mode is silent
+
+An inert split composites correctly and every existing witness reads clean; the only symptom is a
+win not being taken. So the arc adds `[wc-tail]`, cumulative since boot, on the `[wcn]`/`[comp2]`
+rollup cadence and printed directly under `[comp2]` — that line says what a pass cost, this one says
+whether the cost was paid masked or unmasked:
+
+```
+[wc-tail] census stash=N cash=N stale=N inline=N -> ENGAGED | STRANDED | INERT
+```
+
+`INERT` (`stash == 0`) is the state this arc found and is now the falsifier. `STRANDED`
+(`stash > 0, cash == 0`) is the 9.2 s withhold returning by another route.
+
+### Numbers
+
+Armed leg, last census and last `[comp2]` of the boot:
+
+```
+[wc-tail] census stash=1384 cash=1383 stale=0 inline=101 -> ENGAGED
+[comp2] rollup passes=1116 pass_us=1372 max_us=7257 sprite_us=12 ... util_pct=13 span=11368ms
+```
+
+`cash` trailing `stash` by exactly one is a stash in flight at the instant the rollup printed, not a
+loss. `inline=101` is the non-present composite population on trunk timing, as designed.
+
+Latency, against `912de713`'s own message — the point being that engaging the split did **not**
+resurrect the withhold the arming-narrowing was built to cure:
+
+| reading | naive always-stash (the withhold) | `912de713` as landed (inert) | this arc (engaged) |
+|---|---|---|---|
+| `pass_us` | 17427 | 1810 | 1372 |
+| `max_us` | **9255978** | 12177 | **7257** |
+| `sprite_us` | 15168 | 9 | 12 |
+| `util_pct` | 96 | 20 | 13 |
+
+`max_us` is the field that convicted the withhold, and it *fell* — 12.2 ms to 7.3 ms. `sprite_us`
+rising 9 → 12 is expected and correct: on a deferred tail that interval now spans the unmasked gap
+by construction, so it is measuring the thing the split created.
+
+### Gates
+
+| leg | result |
+|---|---|
+| `./arroyo check` | x86_64 + aarch64 OK; 12/12 cfg-coverage legs; userspace x86_64 4/4, aarch64 5/5; `midden_core` 12/12 |
+| `UNAOS_WC=1 ./arroyo check` | green, same legs (`wm.rs` was touched — video law) |
+| `UNAOS_PIDESK=1 ./arroyo kernel8-test 300` | MBENCH **PASS 108/108**, 0 forbidden, 29299 lines; `[wc-tail] … -> ENGAGED` |
+| `./arroyo kernel8-test 210` (knob-off) | MBENCH **PASS 108/108**, 0 forbidden, 23214 lines; `[wc-tail] stash=1698 cash=1697 stale=0 inline=103 -> ENGAGED` |
+
+Both hosts quiet at launch (`pgrep -c qemu` = 0).
+
+**On byte-identity, honestly.** This arc does **not** claim it, and could not. The split is gated on
+`target_arch = "aarch64"`, not on `pidesk`, so making it engage changes knob-off behaviour by
+design — which the knob-off census above confirms (it engages there too, on the same presents). This
+is the same class as the v3d and ERET-SCRUB commits this file already records as legitimately moving
+the knob-off image. `wm.rs` is 17751 → 17871 lines, so the line-neutrality CURSOR-VANISH held itself
+to does not apply here either; the knob-off **gate** is the proof instead, and it is 108/108 clean.
+
 ### CRISPY CURSOR — the verdict is NO KIT ROLE, so nothing was authored
 
 PA38 also asked for the crispy pointer. There is nothing to lift, and this is a verdict rather than a
