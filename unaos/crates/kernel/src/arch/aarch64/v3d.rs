@@ -15213,6 +15213,31 @@ fn v3d85_firstkick_rung() {
     let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
     let fault =
         mmu_ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    // ── PI-V3D-95, the [v3d85r1] INSTRUMENT FIX. ────────────────────────────────────────────────
+    // boot11 (`emptyunarm`, v3d.md §49.10) is the defect's type specimen: this line printed
+    // `MMU_CTL=0x061d1c01 fault=1` and the verdict *"AN MMU FAULT LATCHED … Fix it before citing
+    // this rung"* — and then said NOTHING about what had faulted. `fault=1` and a raw CTL word are
+    // not a fault report: the violation witness pair (VIO_ADDR/VIO_ID) and its decode name the
+    // CLIENT and the VIRTUAL ADDRESS, and without them the sentence "fix it" tells a reader to fix
+    // something the line declines to identify. The detail did reach the wire on that boot, but only
+    // on a LATER line — the generic `clear_mmu_fault_latch("v3d85 post-kick")` helper, which prints
+    // the pair as a side effect of W1C-ing the latch away. So the one column the boot turned on
+    // lived on a different line, printed after the verdict that refused because of it, and owed to
+    // a helper whose job is hygiene rather than evidence. The lead that came out of boot11 — a PTB
+    // write violation at VA 0x70 under unprogrammed QMA/QMS, now PI-V3D-95's own rung — had to be
+    // reconstructed by a reader pairing two lines by hand.
+    //
+    // The fix is exactly that and nothing else: read the violation pair HERE, beside the CTL word
+    // it belongs to and BEFORE any clear, and print the decoded client and VA in R1's own columns.
+    // No verdict branch, no column meaning and no gate changes — every banked reading of this line
+    // stands unmoved; the fault branch simply now names the fault it is refusing on. The reads are
+    // read-only and the pair holds its value until the W1C at the end of the rung, so the capture
+    // point is sound.
+    let (vio_addr, vio_id) = (
+        mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ADDR),
+        mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ID),
+    );
+    let (vio_client, vio_va) = vio_decode(vio_id, vio_addr);
     let bfc_delta = bfc_after.wrapping_sub(bfc_pre);
     // PI-V3D-86 (WITSWEEP) — split `executed` into the two facts it was silently conflating. The M4
     // first-kick capture (boot8, 2026-08-02) printed "THE M4 DRAW RETIRED AS KICK #1" beside its own
@@ -15226,7 +15251,7 @@ fn v3d85_firstkick_rung() {
 
     // ── The R1 verdict. ─────────────────────────────────────────────────────────────────────────
     let verdict: &str = if fault != 0 {
-        "AN MMU FAULT LATCHED across the boot's first kick — instrument fault, not a first-kick verdict. Fix it before citing this rung; nothing here discriminates anything"
+        "AN MMU FAULT LATCHED across the boot's first kick — instrument fault, not a first-kick verdict. Fix it before citing this rung; nothing here discriminates anything. WHAT faulted is on THIS line and no longer on a later one: read the VIO_ADDR/VIO_ID pair and the decoded client @ VA columns above (PI-V3D-95). A PTB write violation under unprogrammed CT0QMA/CT0QMS is boot11's signature (v3d.md §49.10) and has its own rung now — [v3d95], UNAOS_V3D_UNARMCLOSE=1"
     } else if smp_n == 0 {
         "ZERO sampler ticks landed — the wait exited before the first ~1 ms tick, so the fetch columns are INCONCLUSIVE. The retire columns still stand on their own"
     } else if V3D85_VARIANT == V3d85Variant::EmptyUnarm {
@@ -15258,7 +15283,7 @@ fn v3d85_firstkick_rung() {
         "CT0CA advanced into the list then stalled before QEA on the boot's FIRST kick — the CLE fetches and chokes mid-list at the max-in-span offset. Read it against §48.1 before believing the offset: print the RAW word, not the wrapped difference"
     };
     serial_println!(
-        ":: V3D: [v3d85r1] first-kick verdict ({}) — retired={} FRDONE={} store-verified={} consumed={} frame-closed={} executed={} (executed = store-verified OR frame-closed OR consumed; CONSUMED means CT0CA reached QEA, FRAME-CLOSED means retired/FRDONE/BFC moved — the verdict prose below may only claim the one these columns support) | BFC {:#010x}->{:#010x} (Δ{}) RFC {:#010x}->{:#010x} (Δ{}) | PCS={:#010x} (BMACTIVE={} BMBUSY={} BMOOM={}) idled={} INT_STS={:#010x} waited={}us submit_sound={} | sampler samples={} in-span={} max-in-span={:#010x} vs QBA={:#010x} QEA={:#010x} | poison touched: tile-state={} of {}, pool={} of {} (drain completed={}) wrote-any={} | MMU_CTL={:#010x} fault={} — {} ::",
+        ":: V3D: [v3d85r1] first-kick verdict ({}) — retired={} FRDONE={} store-verified={} consumed={} frame-closed={} executed={} (executed = store-verified OR frame-closed OR consumed; CONSUMED means CT0CA reached QEA, FRAME-CLOSED means retired/FRDONE/BFC moved — the verdict prose below may only claim the one these columns support) | BFC {:#010x}->{:#010x} (Δ{}) RFC {:#010x}->{:#010x} (Δ{}) | PCS={:#010x} (BMACTIVE={} BMBUSY={} BMOOM={}) idled={} INT_STS={:#010x} waited={}us submit_sound={} | sampler samples={} in-span={} max-in-span={:#010x} vs QBA={:#010x} QEA={:#010x} | poison touched: tile-state={} of {}, pool={} of {} (drain completed={}) wrote-any={} | MMU_CTL={:#010x} fault={} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) VIO_ADDR={:#010x} VIO_ID={:#010x} (client {} @ VA {:#010x}; read here, before any W1C — PI-V3D-95) — {} ::",
         V3d85Tag,
         retired as u32, frdone as u32, store_verified as u32,
         consumed as u32, frame_closed as u32, executed as u32,
@@ -15274,6 +15299,10 @@ fn v3d85_firstkick_rung() {
         pool_scan.zeroed + pool_scan.overwritten, pool_scan.words,
         flush_done as u32, wrote_any as u32,
         mmu_ctl, (fault != 0) as u32,
+        (fault & V3D_MMU_CTL_PT_INVALID != 0) as u32,
+        (fault & V3D_MMU_CTL_WRITE_VIOLATION != 0) as u32,
+        (fault & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32,
+        vio_addr, vio_id, vio_client, vio_va,
         verdict
     );
     // PI-V3D-87 — the two discriminator verdicts, each stated in the terms its own variant moves and
