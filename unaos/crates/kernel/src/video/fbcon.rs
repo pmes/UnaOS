@@ -104,8 +104,12 @@ const CELL_H: usize = 8;
 /// cell, ~0.2 mm stroke) has never been on this glass. That is a bench judgement, not a code one,
 /// and this constant is the single knob that reverses it — everything downstream (cell size, grid,
 /// window extent, damage rows, the panic re-derive) is computed from it, never assumed.
-#[cfg(target_arch = "x86_64")]
-const PANEL_SCALE: usize = 2;
+///
+/// FONT (GR27) — the scale is RETIRED as the panel console's legibility knob: the takeover seam
+/// now arms the shared anti-aliased face (`video::font`, 7x16 cell — the SAME 16 px height the
+/// 2x cell drew, so the row arithmetic above still holds; columns roughly double). The whole
+/// ledger above stands as the record of how the 16 px height was chosen, and the open bench
+/// judgement transfers to the face unchanged; reversing it is `video::font::SIZE` now.
 
 const FG_DEFAULT: u32 = 0x00C0_C0C0; // light grey text
 const BG_DEFAULT: u32 = 0x0000_0000; // black background
@@ -147,7 +151,17 @@ impl<const N: usize> OpList<N> {
 
 /// Paint one glyph's foreground pixels at (cx, cy). Cells are background-clean when first
 /// reached (initial fill / post-newline band fill), so no per-cell clear is needed.
-fn draw_glyph(surf: &FrameBuffer, ch: u8, cx: usize, cy: usize, fg: u32, s: usize) {
+///
+/// FONT (GR27) — two faces, one invariant. When `aa` is set (the x86 PANEL/window console after
+/// the takeover seam) the glyph is the shared anti-aliased Noto face, alpha-composited against
+/// the KNOWN background `bg` — computed, never read, so the path stays write-only on VRAM and
+/// the same background-clean invariant carries the blend. When `aa` is clear (early boot, the
+/// aarch64 console, any pre-takeover x86 print) this is the font8x8 path, byte for byte.
+fn draw_glyph(surf: &FrameBuffer, ch: u8, cx: usize, cy: usize, fg: u32, bg: u32, s: usize, aa: bool) {
+    if aa {
+        crate::video::font::draw_glyph_fb(surf, ch, cx, cy, fg, bg, false);
+        return;
+    }
     let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
     // VPERF M4 (x86): hoist the per-pixel format decode out of the 8x8 bit loop — encode the
     // foreground once, poke pre-encoded 4-byte pixels (bounds checks stay per pixel).
@@ -182,10 +196,10 @@ fn draw_glyph(surf: &FrameBuffer, ch: u8, cx: usize, cy: usize, fg: u32, s: usiz
 
 /// Execute a planned op list against a surface. Touches ONLY pixels — no console state — so it is
 /// safe to run without the `FBCON` lock once the layout pass has reserved the cells.
-fn paint_ops(surf: &FrameBuffer, ops: &[Op], fg: u32, bg: u32, scale: usize) {
+fn paint_ops(surf: &FrameBuffer, ops: &[Op], fg: u32, bg: u32, scale: usize, aa: bool) {
     for op in ops {
         match *op {
-            Op::Glyph { ch, x, y } => draw_glyph(surf, ch, x, y, fg, scale),
+            Op::Glyph { ch, x, y } => draw_glyph(surf, ch, x, y, fg, bg, scale, aa),
             Op::Fill { y0, y1 } => surf.fill_rows(y0, y1, bg),
         }
     }
@@ -238,6 +252,10 @@ struct FbCon {
     /// Integer glyph magnification (1 = raw font8x8). Each set font bit paints a `scale`x`scale`
     /// block, so no font data or new asset is needed.
     scale: usize,
+    /// FONT (GR27) — draw with the shared anti-aliased face (`video::font`) instead of font8x8.
+    /// Armed only by the x86 `panel_console_resume` seam (where `PANEL_SCALE` used to arm); every
+    /// re-init clears it, so early boot and aarch64 keep the raw 8x8 path unchanged.
+    aa: bool,
     col: usize,
     row: usize,
     fg: u32,
@@ -269,6 +287,7 @@ impl FbCon {
             cell_w: CELL_W,
             cell_h: CELL_H,
             scale: 1,
+            aa: false,
             col: 0,
             row: 0,
             fg: FG_DEFAULT,
@@ -427,7 +446,7 @@ impl FbCon {
     fn write_byte(&mut self, b: u8) {
         let mut ops = OpList::<OPS_PER_BYTE>::new();
         self.plan_byte(b, &mut ops);
-        paint_ops(self.draw_fb(), ops.as_slice(), self.fg, self.bg, self.scale);
+        paint_ops(self.draw_fb(), ops.as_slice(), self.fg, self.bg, self.scale, self.aa);
     }
 
     /// Take the accumulated dirty band and reset it, for a caller that will flush it itself
@@ -517,6 +536,7 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
         c.cell_w = CELL_W;
         c.cell_h = CELL_H;
         c.scale = 1;
+        c.aa = false;
         c.col = 0;
         c.row = 0;
         c.fg = FG_DEFAULT;
@@ -1388,9 +1408,9 @@ impl PanelSink {
             #[cfg(not(feature = "wc"))]
             let routed = false;
             let band = c.take_dirty();
-            Some((*c.draw_fb(), c.fg, c.bg, c.scale, ops, band, routed))
+            Some((*c.draw_fb(), c.fg, c.bg, c.scale, c.aa, ops, band, routed))
         });
-        let Some((surf, fg, bg, scale, ops, band, routed)) = plan else {
+        let Some((surf, fg, bg, scale, aa, ops, band, routed)) = plan else {
             if !self.decided {
                 self.decided = true;
                 self.split = false;
@@ -1411,7 +1431,7 @@ impl PanelSink {
         self.decided = true;
         self.split = true;
         // UNMASKED, UNLOCKED: the expensive half.
-        paint_ops(&surf, ops.as_slice(), fg, bg, scale);
+        paint_ops(&surf, ops.as_slice(), fg, bg, scale, aa);
         if routed {
             // No direct front-buffer write on this path: the surface is cached RAM and `wm` owns
             // the panel.
@@ -1664,7 +1684,7 @@ pub fn attach_shadow() {
 /// photographed. It:
 ///   1. drops the cached-RAM shadow if one is attached, so drawing goes straight at the surface
 ///      the panel is scanning (no stale full-surface blit can resurrect the calibration pattern);
-///   2. re-scales the glyph cell to `PANEL_SCALE` (8x8 is ~0.8 mm on this panel — invisible, per
+///   2. re-homes the glyph cell on the anti-aliased face (8x8 font8x8 is ~0.8 mm on this panel — invisible, per
 ///      metal sitting #30) and recomputes the column/row grid;
 ///   3. clears the panel (removing the calibration pattern) and homes the cursor;
 ///   4. flips `PANEL_CONSOLE`, so every subsequent `serial_println!` mirrors onto the panel;
@@ -1702,10 +1722,16 @@ pub fn panel_console_resume() -> usize {
             }
             // (1) direct-VRAM from here on.
             c.shadow_store = None;
-            // (2) legible cell.
-            c.scale = PANEL_SCALE;
-            c.cell_w = CELL_W * PANEL_SCALE;
-            c.cell_h = CELL_H * PANEL_SCALE;
+            // (2) legible cell. FONT (GR27): the legibility knob used to be `PANEL_SCALE`
+            // magnifying the 1-bit 8x8 cell; the panel console now arms the shared anti-aliased
+            // face instead — the same 16 px cell height `PANEL_SCALE = 2` produced, with the
+            // face's own 7 px advance (more columns, same rows) and alpha edges against `bg`.
+            // Legibility at this size is the SAME open bench judgement the 16x16 cell carried;
+            // reversing it is `video::font::SIZE` (one constant) rather than this scale.
+            c.scale = 1;
+            c.aa = true;
+            c.cell_w = crate::video::font::CELL_W;
+            c.cell_h = crate::video::font::CELL_H;
             let info = c.fb.info();
             c.cols = (info.width / c.cell_w).max(1);
             c.rows = (info.height / c.cell_h).max(1);
@@ -1730,8 +1756,8 @@ pub fn panel_console_resume() -> usize {
     // first thing drawn, so seeing it on glass is the proof that glyph rendering reaches the panel.
     PANEL_CONSOLE.store(true, Ordering::Relaxed);
     serial_println!(
-        ":: fbcon: glyphs-active base={:08X} pitch={} cell={}x{} cols={} rows={} scale={} ::",
-        base, pitch, cell.0, cell.1, grid.0, grid.1, PANEL_SCALE
+        ":: fbcon: glyphs-active base={:08X} pitch={} cell={}x{} cols={} rows={} face=noto16-aa ::",
+        base, pitch, cell.0, cell.1, grid.0, grid.1
     );
     // (5) replay the boot-milestone ring.
     let mut buf = [(0u64, ""); crate::bootlog::capacity()];

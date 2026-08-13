@@ -104,28 +104,23 @@ pub const TITLE_H: usize = super::theme::TITLE_HEIGHT;
 /// between them. See [`paint_window`] for the layering.
 pub const BORDER: usize = super::theme::FRAME;
 
-/// The bitmap font's cell edge, in source pixels. A property of `font8x8`, not of the kit — the kit
-/// has no glyph-cell metric because it assumes a rasterizer. Named rather than spelled `8` at each
-/// use so [`TITLE_CELL`]'s derivation below reads as arithmetic instead of as two magic numbers.
-const FONT_CELL: usize = 8;
-
-/// CRISPYWIRE-REVIEW — the integer scale the 8-px font cell is drawn at so the caption lands as
-/// close to the kit's `metrics.text_px` as a BITMAP font can get.
+/// FONT (GR27) — the caption glyph's ADVANCE, in panel pixels: [`font::CELL_W`], the mono face's
+/// own metric. The unit every width budget (the caption painter's, [`controls`]'s decline
+/// threshold, the dock's tile sizing, the crystal menu's width) is counted in.
 ///
-/// The kit asks for 15 px of text. `font8x8` has one size, so the only honest freedom is an integer
-/// replication factor, and the nearest one is `round(TEXT_PX / FONT_CELL)` — written in integer
-/// arithmetic as `(TEXT_PX + FONT_CELL/2) / FONT_CELL`, floored at 1 so a small future `text_px`
-/// cannot erase the caption. At the kit's `15` that is `(15 + 4) / 8 = 2`, i.e. **16 px drawn for 15
-/// px asked**. Reaching 15 exactly needs a rasterizer the kernel does not have; the derivation is
-/// here, in code, so a kit change moves the caption instead of leaving a bare `2` behind.
-pub const TITLE_SCALE: usize = {
-    let s = (super::theme::TEXT_PX + FONT_CELL / 2) / FONT_CELL;
-    if s < 1 { 1 } else { s }
-};
+/// This retires `FONT_CELL`/`TITLE_SCALE`: the kit's `metrics.text_px = 15` used to be honoured
+/// by the nearest INTEGER replication of an 8-px 1-bit cell (16 px drawn for 15 asked — the
+/// "needs a rasterizer" note that lived here). The kernel now has pre-rasterized 16 px
+/// anti-aliased glyphs, so the cell is the FACE's, width and height separately, and the square
+/// `TITLE_CELL` is split into the two metrics it was conflating.
+pub const TITLE_CELL_W: usize = super::font::CELL_W;
 
-/// The drawn width (and height) of one caption glyph, in panel pixels — the unit both the caption
-/// painter's width budget and [`controls`]'s decline threshold are counted in.
-pub const TITLE_CELL: usize = FONT_CELL * TITLE_SCALE;
+/// FONT (GR27) — the caption glyph cell's HEIGHT, in panel pixels: [`font::CELL_H`] (16 — the
+/// same drawn height `TITLE_SCALE = 2` produced, so every vertical centring lands where it did).
+pub const TITLE_CELL_H: usize = super::font::CELL_H;
+// REVIEW (GR27 fonts): back the draw_title comment's "cell shorter than the strip" claim on every
+// arch (menubar's CELL_H<=BAR_H assert is x86+wc-only). draw_title clamps anyway, but assert it.
+const _: () = assert!(TITLE_CELL_H <= TITLE_H, "title glyph cell must fit the caption strip");
 
 /// CRISPYWIRE-REVIEW — the strip width the three-disc control cluster RESERVES, measured from the
 /// inner edge of the LEFT frame (WMCTRL, Peter 2026-08-09: the cluster is left-aligned, macOS-side;
@@ -161,16 +156,17 @@ const CTRL_RESERVE: usize = 3 * super::theme::CONTROL_BOX + 4 * GAP;
 /// at every scale, since `spawn_geometry`'s box width `w * scale + 2 * BORDER` is monotone in
 /// `scale`.
 ///
-/// [`controls`] declines a box narrower than `2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL`, and a
+/// [`controls`] declines a box narrower than `2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL_W`, and a
 /// window's box is `w * scale + 2 * BORDER`, so the `2*BORDER` cancels and the condition on the
-/// source width alone is `w >= GAP + CTRL_RESERVE + TITLE_CELL` — **148 px** at the current metrics
-/// (`12 + 120 + 16`), 112 before the size ruling.
+/// source width alone is `w >= GAP + CTRL_RESERVE + TITLE_CELL_W` — **139 px** at the current
+/// metrics (`12 + 120 + 7`; it was 148 when the glyph advance was the square 16 px bitmap cell),
+/// 112 before the size ruling.
 ///
 /// This exists because that threshold has now moved TWICE and both times a fixture surface was left
 /// behind it, turning a close-control gate into a silent SKIP (CRISPYWIRE sized one from 8 to 32,
 /// CRISPYWIRE-REVIEW from 96 to 128). Every fixture that needs a cluster sizes itself against this
 /// constant with a `const` assertion, so the third move fails the BUILD instead of the gate.
-pub const CLUSTER_MIN_SRC_W: usize = GAP + CTRL_RESERVE + TITLE_CELL;
+pub const CLUSTER_MIN_SRC_W: usize = GAP + CTRL_RESERVE + TITLE_CELL_W;
 
 /// A window identifier. Ids are `1..=MAX_WINDOWS`; `0` is never a valid window and is the
 /// fail-closed return for every operation that could not be satisfied.
@@ -9639,7 +9635,7 @@ fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
 ///
 /// It is [`CLUSTER_MIN_SRC_W`] plus the frame the SOURCE width does not include, so the two move
 /// together by construction: `bw = w * scale + 2*BORDER` for every non-compat row, hence
-/// `bw >= CLUSTER_MIN_BOX_W` is exactly `w * scale >= CLUSTER_MIN_SRC_W`. 158 px at the current
+/// `bw >= CLUSTER_MIN_BOX_W` is exactly `w * scale >= CLUSTER_MIN_SRC_W`. 149 px at the current
 /// metrics. It existed as an inline sum in one place and as prose in three; the witness below puts
 /// it on the wire, so it needs a single symbol that cannot drift from the test that uses it.
 ///
@@ -9651,7 +9647,7 @@ fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
 /// wide, so the tiler's first column is on-panel exactly when
 ///
 /// ```text
-/// pw > CLUSTER_MIN_BOX_W + GAP     = 158 + 12 = 170 px
+/// pw > CLUSTER_MIN_BOX_W + GAP     = 149 + 12 = 161 px
 /// ```
 ///
 /// which no panel this kernel runs on comes near failing: the smallest is the 640x480 QEMU gate
@@ -9864,8 +9860,8 @@ fn controls_declined_drain() {
 ///
 /// Every number here is a metric: [`BORDER`] is `theme::FRAME`, [`GAP`] is `theme::GAP`, the
 /// diameter is `theme::CONTROL_BOX`, and the vertical centring is against [`TITLE_H`] =
-/// `theme::TITLE_HEIGHT`. The single non-theme quantity is [`TITLE_CELL`], the drawn size of one
-/// caption glyph — a property of `font8x8` scaled to `theme::TEXT_PX`, not of the kit — and it
+/// `theme::TITLE_HEIGHT`. The single non-theme quantity is [`TITLE_CELL_W`], the advance of one
+/// caption glyph — a property of the shared face (`video::font`), not of the kit — and it
 /// appears only in the "is there room for a caption at all" test.
 ///
 /// ### CRISPYWIRE-REVIEW — the threshold now equals the painter's own budget
@@ -9876,8 +9872,8 @@ fn controls_declined_drain() {
 /// and everything the cluster reserves, is one whole glyph left?"*:
 ///
 /// ```text
-/// 2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL
-///   = 2*5    + 12  + 120          + 16        = 158 px
+/// 2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL_W
+///   = 2*5    + 12  + 120          + 7         = 149 px
 /// ```
 ///
 /// against the 102 the arithmetic used to produce (and the 106 the painter actually needed before a
@@ -13506,11 +13502,12 @@ fn paint_window(
         // CRISPYWIRE — the caption: inset one `GAP` from the frame, vertically centred in the
         // strip, and inked with the kit's focused/unfocused title text role.
         //
-        // CRISPYWIRE-REVIEW — drawn at `TITLE_SCALE`, so the caption honours `metrics.text_px`
-        // (15 px asked, 16 px drawn — the nearest integer scale of the 8-px bitmap cell; see
-        // `TITLE_SCALE` for the derivation and for why exact 15 needs a rasterizer). The centring
-        // is against the SCALED cell height, and the width budget is counted in scaled glyphs by
-        // `draw_title` itself, so both moved with it.
+        // FONT (GR27) — drawn with the shared anti-aliased face (`video::font`), BOLD, the weight
+        // macOS gives a window title. `TITLE_SCALE` and its "exact 15 needs a rasterizer" apology
+        // are retired: the kernel has a 16 px rasterized cell now, and the centring is against the
+        // face's real cell height. The glyph edges alpha-composite against the strip's own
+        // per-row gradient colour (`title_row_color`) — computed, never read back, so the caption
+        // stays write-only on every mapping (see `draw_title`).
         // WMCTRL — the caption starts AFTER the cluster now that the cluster is on the LEFT.
         // `CTRL_RESERVE` is exactly `GAP + cluster + GAP` — the inset from the frame, the discs, and
         // the separation from the text — so `BORDER + CTRL_RESERVE` is the first caption column, and
@@ -13521,10 +13518,11 @@ fn paint_window(
             dst,
             r,
             cap_x,
-            lby + BORDER as isize + (TITLE_H.saturating_sub(TITLE_CELL) / 2) as isize,
+            lby + BORDER as isize + (TITLE_H.saturating_sub(TITLE_CELL_H) / 2) as isize,
             bw.saturating_sub(2 * BORDER + GAP + ctrl_w),
             title_ink(focused),
-            TITLE_SCALE,
+            lby + BORDER as isize,
+            focused,
         );
     }
 
@@ -14522,22 +14520,25 @@ fn stage_fill(
     true
 }
 
-/// Draw the kernel's copy of the window title into the title strip, 8x8 glyphs, clipped to `max_w`
-/// pixels. Non-printable bytes render as a space, so a hostile title can only ever paint blanks.
+/// Draw the kernel's copy of the window title into the title strip, clipped to `max_w` pixels.
+/// Non-printable bytes render as a space (`font::glyph`'s containment), so a hostile title can
+/// only ever paint blanks.
 /// WC-M — `y` is SIGNED because a chunked stage paints the box into one row-band at a time and the
 /// title sits in the box's first rows, above every band but the first. Glyph rows landing above the
 /// destination are dropped; the rest are drawn at their true position, and `put_pixel` clips the
-/// bottom as it always did. For `y >= 0` — the direct path, and any stage that fits in one band —
-/// this is byte-for-byte the pre-WC-M loop.
+/// bottom as it always did.
 ///
 /// CRISPYWIRE — the ink is a PARAMETER, not a constant: Crispy carries two title-text roles
 /// (`title_text_active` / `title_text_inactive`) and the caller resolves which through
 /// [`title_ink`]. WC-A's single `CHROME_TITLE_FG` is gone.
 ///
-/// CRISPYWIRE-REVIEW — and the cell is drawn at `scale`, a nearest-integer replication of the 8-px
-/// bitmap toward the kit's `metrics.text_px` (see [`TITLE_SCALE`]). `max_w` stays in PANEL pixels
-/// and the column count divides by the SCALED cell, so a caller's budget means the same thing at
-/// every scale. `scale = 1` is byte-for-byte the pre-review loop.
+/// FONT (GR27) — the caption is the shared anti-aliased face (`video::font`), BOLD weight, and
+/// the `scale` parameter is retired with the 1-bit bitmap it replicated. Each covered pixel
+/// alpha-composites `ink` against the strip's OWN colour at that row — `ceramic::shade` over
+/// [`title_row_color`], the exact expression the strip fill above used — so the blend needs the
+/// two extra parameters (`strip_y0`, the strip's first row, and `focused`) and NO read-back:
+/// every write stays write-only on every mapping, WC/UC included. `max_w` stays in PANEL pixels;
+/// the column count divides by the face's advance.
 fn draw_title(
     fb: &super::FrameBuffer,
     r: &Window,
@@ -14545,31 +14546,31 @@ fn draw_title(
     y: isize,
     max_w: usize,
     ink: u32,
-    scale: usize,
+    strip_y0: isize,
+    focused: bool,
 ) {
-    let scale = scale.max(1); // a zero scale would draw nothing and divide by zero below
-    let cell = FONT_CELL * scale;
-    let cols = max_w / cell;
+    let cols = max_w / TITLE_CELL_W;
     for (i, &b) in r.title[..r.title_len].iter().enumerate() {
         if i >= cols {
             break;
         }
-        let ch = if (0x20..0x7f).contains(&b) { b } else { b' ' };
-        let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
-        for (ry, byte) in bitmap.iter().enumerate() {
-            // WC-M's clip, per SCALED row: each source row of the glyph now occupies `scale`
-            // destination rows, and each is dropped independently if it lands above the band.
-            for sy in 0..scale {
-                let dy = y + (ry * scale + sy) as isize;
-                if dy < 0 {
-                    continue;
-                }
-                for rx in 0..FONT_CELL {
-                    if byte & (1 << rx) != 0 {
-                        for sx in 0..scale {
-                            fb.put_pixel(x + i * cell + rx * scale + sx, dy as usize, ink);
-                        }
-                    }
+        for (ry, row) in super::font::glyph(b, true).iter().enumerate() {
+            // WC-M's clip, per row: a row landing above the band is dropped independently.
+            let dy = y + ry as isize;
+            if dy < 0 {
+                continue;
+            }
+            // The strip pixel this row sits on. Rows past the strip's height keep the last
+            // gradient stop — the glyph cell is const-asserted shorter than the strip, so this
+            // arm is form rather than expectation.
+            let j = (dy - strip_y0).max(0) as usize;
+            let bg = super::ceramic::shade(
+                title_row_color(j.min(TITLE_H - 1), TITLE_H, focused),
+                BORDER + j.min(TITLE_H - 1),
+            );
+            for (rx, &a) in row.iter().enumerate() {
+                if a != 0 {
+                    fb.put_pixel(x + i * TITLE_CELL_W + rx, dy as usize, super::font::blend(bg, ink, a));
                 }
             }
         }

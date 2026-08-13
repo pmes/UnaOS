@@ -43,8 +43,9 @@
 //! a goal.
 //!
 //! CRISPYWIRE-REVIEW adds [`TEXT_PX`] to that set: the window caption is drawn at the nearest
-//! integer scale of the 8-px bitmap cell toward it (`wm::TITLE_SCALE` = 2, so 16 px drawn for the
-//! 15 px asked). [`LINE_HEIGHT_PCT`] remains the one metric with no consumer — window captions are
+//! rasterized cell toward it — FONT (GR27): the shared anti-aliased face's 16 px cell
+//! (`wm::TITLE_CELL_H`; it was `TITLE_SCALE = 2` over the 8-px bitmap before the face landed, the
+//! same 16 px drawn for the 15 asked). [`LINE_HEIGHT_PCT`] remains the one metric with no consumer — window captions are
 //! a single line, so there is no inter-line distance for it to set.
 //!
 //! ### Still UN-WIRED — invented colours, next arc's scope
