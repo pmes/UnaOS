@@ -6000,10 +6000,17 @@ impl XhciController {
             *cbw_buf.add(9) = (data_len >> 8) as u8;
             *cbw_buf.add(10) = (data_len >> 16) as u8;
             *cbw_buf.add(11) = (data_len >> 24) as u8;
-            // bmCBWFlags: 0x80 = device->host (IN), else 0x00
+            // bmCBWFlags: 0x80 = device->host (IN), else 0x00. BOT 1.0 §5.1: bit 7 is Direction and
+            // bits 6..0 are Reserved and must be zero. Audited for the zero-length case
+            // (`Direction::None`, `dCBWDataTransferLength == 0`), where §5.1 has the device IGNORE
+            // bit 7: this emits a well-defined 0x00 — direction bit clear, reserved bits clear —
+            // and the `write_bytes` zero-fill above means the byte is never uninitialized. Both
+            // arms are conformant as written; no behavior change is owed.
             *cbw_buf.add(12) = if dir == Direction::In { 0x80 } else { 0x00 };
             *cbw_buf.add(13) = 0; // bCBWLUN
             *cbw_buf.add(14) = cdb.len() as u8; // bCBWCBLength
+            // `take(16)` is now a belt on top of `bot_transfer`'s §5.1 CBWCB gate, which refuses a
+            // CDB outside 1..=16 before this function is ever reached — truncation is unreachable.
             for (i, b) in cdb.iter().enumerate().take(16) {
                 *cbw_buf.add(15 + i) = *b;
             }
@@ -6039,12 +6046,21 @@ impl XhciController {
     pub fn bot_transfer(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32, dir: Direction)
         -> Result<BotResult, BotError>
     {
+        // CBWCB bound. USB Mass Storage Class Bulk-Only Transport 1.0 §5.1 defines `bCBWCBLength`
+        // as the valid length of the command block, 1..=16; the CBWCB field is 16 bytes and a
+        // longer CDB has nowhere on the wire to go. Refused HERE — the one entry every storage I/O
+        // path comes through — so the refusal happens before a CBW is built or a TRB is queued,
+        // exactly as `scsi_read10`'s `blocks == 0` bound refuses rather than truncates. A CDB the
+        // transport cannot carry is a caller error, never a silently shortened command.
+        if cdb.is_empty() || cdb.len() > 16 {
+            return Err(BotError::BadRequest);
+        }
         let out = self.bot_transfer_body(slot_id, cdb, data_phys, data_len, dir);
         if let Err(cause) = out {
             // `NoDevice` is raised before anything is built or queued (no rings, no endpoints, or a
-            // surrendered slot), and `BadRequest` never reaches this function at all — in neither
-            // case is there a ring to clean. Every OTHER error, from every path in the body, lands
-            // here exactly once.
+            // surrendered slot), and `BadRequest` reaches here only from the CBWCB gate above,
+            // which returns before the body is ever called — in neither case is there a ring to
+            // clean. Every OTHER error, from every path in the body, lands here exactly once.
             if !matches!(cause, BotError::NoDevice | BotError::BadRequest) {
                 self.bot_clean_rings(slot_id, cause);
             }
