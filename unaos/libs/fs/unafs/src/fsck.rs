@@ -152,7 +152,15 @@ impl<D: BlockDevice> UnaFS<D> {
         // would under-count shared blocks and a later snapshot drop could then
         // free a block another root still lives on).
         let count_map = self.reachability_counts()?;
-        let mut counts = alloc::vec![0u32; block_count as usize];
+        // Fallible: this vec is 4 B/block and fsck is kernel-reachable
+        // (`recover`) — same rule as the RefMap views (SHELLWIN-OOM).
+        let n = usize::try_from(block_count)
+            .map_err(|_| crate::storage::Error::AllocRefused(block_count))?;
+        let mut counts: Vec<u32> = Vec::new();
+        counts
+            .try_reserve_exact(n)
+            .map_err(|_| crate::storage::Error::AllocRefused(n as u64 * 4))?;
+        counts.resize(n, 0);
         for (&b, &n) in &count_map {
             if let Some(c) = counts.get_mut(b as usize) {
                 *c = n;
@@ -217,7 +225,15 @@ impl<D: BlockDevice> UnaFS<D> {
             let pb = self.imap_ref()[id as usize];
             let inode = self.read_inode(id)?;
             Self::bump_block(pb, block_count, &mut counts);
+            // `read_inode` reconstructs a spilled inode, so `chunks` already
+            // covers its overflow DATA blocks. The INDIRECT index blocks that
+            // hold the overflow extent list are inode metadata outside `chunks`
+            // — bump them too, or fsck would call them leaked and repair free
+            // live extent-list storage.
             for e in &inode.chunks {
+                Self::bump_extent(e, block_count, &mut counts);
+            }
+            for e in &self.inode_index_extents_at(pb)? {
                 Self::bump_extent(e, block_count, &mut counts);
             }
             for extents in inode.large_attributes.values() {

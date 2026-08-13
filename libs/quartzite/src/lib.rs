@@ -67,6 +67,12 @@ pub type NativeWindow = gtk4::ApplicationWindow;
 pub type NativeView = gtk4::Widget;
 #[cfg(all(target_os = "linux", feature = "gtk"))]
 pub use platforms::gtk::Backend;
+/// The Console-app summon (GTK): wire the Ctrl+` gesture that opens the live,
+/// read-only system-log window. A vessel calls this on its host window; a shell
+/// tile/menu can call [`platforms::gtk::console_view::open_console_window`]
+/// directly. Summoned facade-natively — never a command-line flag.
+#[cfg(all(target_os = "linux", feature = "gtk"))]
+pub use platforms::gtk::console_view::{install_console_summon, open_console_window};
 #[cfg(all(target_os = "linux", feature = "gtk"))]
 
 // --- Linux (*nix) / Qt ---
@@ -114,8 +120,26 @@ impl Backend {
     pub fn new<F>(_app_id: &str, _bootstrap: F) -> Self {
         Backend
     }
+    /// Headless no-op mirror of the GTK/macOS tetra-vessel constructor, so
+    /// vessels that summon a tetra UI (aether-shell) still type-check on
+    /// backends without a glass layer.
+    pub fn new_tetra_vessel(
+        _app_id: &str,
+        _title: &str,
+        _content_size: (f64, f64),
+        _tetra_node: crate::tetra::TetraNode,
+        _synapse: bandy::Synapse,
+    ) -> Self {
+        Backend
+    }
     pub fn run(&self) {}
 }
+
+/// No-op Console summon for backends without the GTK gesture layer (headless,
+/// Qt, Windows, macOS). Keeps the vessel wiring uniform across platforms; the
+/// live Console window is a GTK capability today.
+#[cfg(not(all(target_os = "linux", feature = "gtk")))]
+pub fn install_console_summon(_window: &NativeWindow, _synapse: bandy::Synapse) {}
 
 // -----------------------------------------------------------------------------
 // ASSET DEPLOYMENT & INITIALIZATION

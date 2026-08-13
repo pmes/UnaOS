@@ -25,7 +25,9 @@ use crate::arch::{acpi, apic, gdt, interrupts, percpu, sched, syscall};
 /// Physical page the trampoline is copied to and the AP starts executing at. Must be page-aligned
 /// and < 1 MiB (the SIPI vector is 8 bits: start address = vector << 12). 0x8000 is free
 /// conventional RAM in our UEFI memory map once boot services have exited.
-const TRAMPOLINE_ADDR: usize = 0x8000;
+/// `pub(super)` so `arch::memory`'s WXN sweep can spare exactly this page's 1 GiB region rather than
+/// hard-coding 0x8000 a second time — one constant, no drift if the SIPI vector is ever retargeted.
+pub(super) const TRAMPOLINE_ADDR: usize = 0x8000;
 /// SIPI vector byte that selects `TRAMPOLINE_ADDR` (0x8000 >> 12 = 0x08).
 const SIPI_VECTOR: u8 = (TRAMPOLINE_ADDR >> 12) as u8;
 
@@ -50,6 +52,157 @@ static ONLINE_APS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Snapshot of the online application-processor logical indices (excludes the BSP).
 pub fn online_aps() -> Vec<usize> {
     ONLINE_APS.lock().clone()
+}
+
+// ── WXN-x86 M1: the per-core NX witness ─────────────────────────────────────────────────────────
+//
+// WHY THIS EXISTS. `memory::wx_audit_report` reads EFER on the **BSP only** — one core, once. But NX
+// is per-core MSR state, and the identity map the sweep just NX'd is SHARED (every AP runs on the
+// BSP's CR3). A core whose EFER.NXE is clear ignores every one of those bits, so on that core the
+// whole refactor is vacuous — and the census line would still print `nxe=1`, because the census
+// asked the BSP. That is precisely the shape of instrument failure this track keeps paying for: a
+// protection nobody can see armed on the core that matters.
+//
+// The witness is two `fetch_or`s and one line. Each core ORs its own bit AFTER its `syscall::init()`
+// has armed EFER.NXE (APs from `ap_entry`, the BSP from `start_aps` — which the BSP is itself
+// executing, so it is reading its own live MSR, not a remembered one), and `start_aps` prints the
+// rollup once. `cores` is what SMP believes is online; `nxe` is how many of them proved it. They
+// must be equal, and a short mask names the offender by bit position.
+//
+// M1 PRINTS, it does not assert: the sweep has already happened by the time an AP can report, so a
+// panic here would kill a boot that a serial line diagnoses just as well. M3 (which flips `.text`
+// read-only and turns `kern_WX` into an asserted zero) is where this becomes a hard gate.
+//
+// `wp_mask` rides along because CR0.WP is the OTHER per-core bit the arc depends on and nothing in
+// this tree has ever printed it per core. On the rMBP the firmware leaves **WP=0** (QEMU leaves it
+// 1), which is why M1 does not set it: until M3 arms WP deliberately, a read-only PTE bit does NOT
+// bind ring 0 on metal. That does not weaken this milestone — NX enforcement is governed by
+// EFER.NXE and bit 63 alone and is completely independent of CR0.WP — but it does mean the RO half
+// of W^X is not yet real on metal, and a reader deserves that on the wire rather than in a design doc.
+static NXE_MASK: AtomicU64 = AtomicU64::new(0);
+static WP_MASK: AtomicU64 = AtomicU64::new(0);
+
+// WXN-x86 M3a: the per-core CR0 WITNESS. `WP_MASK` records a single BIT per core (bit `idx` set iff
+// that core's CR0.WP was 1); this records the WHOLE CR0 register the bit was read from, at that
+// core's own index. The masks alone let an analyzer count how many cores armed WP, but they carry
+// no reading it can cross-check a mask bit AGAINST: `wp_mask=0xFF` asserts eight cores armed, and
+// nothing on the wire lets a reader confirm bit 7 belongs to a core whose real CR0.WP is 1. Bit 0
+// (the BSP) is stated a second time by WXPROBE and the sweep, so it is cross-checkable; bits 1..7
+// (the APs) were not, because NO OTHER LINE reads an AP's CR0. This array is that missing reading —
+// each AP fills its own slot as it records (below), and the BSP publishes the whole array in ONE
+// line (`wxn_cores_report`) once every AP is up. `MAX_CPUS` entries, `.bss`-resident, zero-init.
+static CORE_CR0: [AtomicU64; gdt::MAX_CPUS] = [const { AtomicU64::new(0) }; gdt::MAX_CPUS];
+
+/// OR this core's `EFER.NXE` and `CR0.WP` into the witness masks, at bit `idx` (the logical CPU
+/// index), and store its FULL live CR0 into `CORE_CR0[idx]`. Reads two live registers on the core
+/// that calls it — never a cached or inherited value.
+fn wxn_record_core(idx: usize) {
+    const IA32_EFER: u32 = 0xC000_0080;
+    const EFER_NXE: u64 = 1 << 11;
+    const CR0_WP: u64 = 1 << 16;
+    if idx >= 64 {
+        return; // MAX_CPUS is 8; the guard is here so the shift can never be UB.
+    }
+    // SAFETY: reading IA32_EFER is a pure ring-0 MSR read with no side effects.
+    let efer = unsafe { x86_64::registers::model_specific::Msr::new(IA32_EFER).read() };
+    if efer & EFER_NXE != 0 {
+        NXE_MASK.fetch_or(1u64 << idx, Ordering::SeqCst);
+    }
+    // Read CR0 ONCE and use it for both the mask bit and the witness store, so the bit and the
+    // register it is cross-checked against can never come from two different reads.
+    let cr0 = x86_64::registers::control::Cr0::read_raw();
+    if cr0 & CR0_WP != 0 {
+        WP_MASK.fetch_or(1u64 << idx, Ordering::SeqCst);
+    }
+    // The per-core CR0 witness. Stored at `idx` (guarded to the array's length; the shift guard
+    // above is over 64, this is over MAX_CPUS) and BEFORE `ap_entry`'s `AP_ONLINE.fetch_add` — the
+    // SAME publication point that makes this core's WP_MASK bit visible to the BSP — so a bit the
+    // BSP can see set is a bit whose witness the BSP can also read. SeqCst pairs with the BSP's
+    // SeqCst `AP_ONLINE` load in `start_aps`, exactly as `WP_MASK` already does.
+    if idx < gdt::MAX_CPUS {
+        CORE_CR0[idx].store(cr0, Ordering::SeqCst);
+    }
+}
+
+/// Publish the per-core NX + WP witness. `cores` is the number of cores SMP believes are online
+/// (BSP included); the verdict is `PASS` only when every one of them proved BOTH bits on its own
+/// registers. Called from `start_aps` on every exit path — including the uniprocessor ones,
+/// because a witness that is absent from the capture you happen to be holding is worth nothing.
+///
+/// WXN-x86 M3a widened the PASS condition from `nxe == cores` to `nxe == cores && wp == cores`, in
+/// the same commit that arms CR0.WP in `syscall::init`. Before that commit `wp` was a REPORT (the
+/// bit was nobody's job, and on metal it read 0 on every core); from it, WP is the half of W^X that
+/// makes a read-only kernel page bind ring 0 at all, so a core that lacks it is a core on which
+/// M3b/M3c are vacuous — the exact class of silent, protection-shaped nothing this track keeps
+/// paying for. A firmware or CPU that refuses WP is now a boot-visible FAIL rather than a quiet
+/// regression.
+///
+/// The VERDICT TOKEN deliberately stays the bare word `PASS`. It would be tempting to rename it
+/// `PASS(nxe+wp)` so an old capture and a new one cannot be confused, but the line already carries
+/// that distinction in a field a reader can act on — `wp_mask=0x0 -> PASS` is unambiguously the
+/// pre-M3a era and `wp_mask=0xFF -> PASS` the post-M3a one — and `tools/serial-analyzer.py`
+/// (`if w['nxe']['verdict'] != 'PASS'`) matches the token exactly, so a rename would make every
+/// healthy boot report a fault in the one instrument that reads this wire.
+fn wxn_nxe_report(cores: u32) {
+    wxn_record_core(0); // the BSP, reading its own live EFER/CR0 right here.
+    let nxe = NXE_MASK.load(Ordering::SeqCst);
+    let wp = WP_MASK.load(Ordering::SeqCst);
+    let armed = nxe.count_ones();
+    let wp_armed = wp.count_ones();
+    serial_println!(
+        ":: WXAUDIT-NXE: cores={} nxe={} nxe_mask=0x{:X} wp={} wp_mask=0x{:X} -> {} ::",
+        cores,
+        armed,
+        nxe,
+        wp_armed,
+        wp,
+        if armed == cores && wp_armed == cores { "PASS" } else { "FAIL" }
+    );
+    // The per-core CR0 witness line, right after the census it cross-checks. One line, BSP-emitted.
+    wxn_cores_report(cores);
+}
+
+/// A `core::fmt::Write` sink over a fixed stack buffer — no heap, so the witness line costs nothing
+/// but the buffer's stack frame on the BSP. Writes past the end are silently dropped (the buffer is
+/// sized for MAX_CPUS 16-digit values with room to spare, so this cannot happen for a real CR0).
+struct CoreBuf {
+    buf: [u8; 320],
+    len: usize,
+}
+
+impl core::fmt::Write for CoreBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        let end = core::cmp::min(self.len + b.len(), self.buf.len());
+        self.buf[self.len..end].copy_from_slice(&b[..end - self.len]);
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// Publish the per-core CR0 witness in ONE serial line, BSP-emitted, from the array the APs filled.
+/// `cores` is the census's core count (BSP + online APs); the first `cores` slots of `CORE_CR0` are
+/// the ones those cores stored — the same publication ordering that makes `WP_MASK`'s bits valid,
+/// so every slot printed here is one the BSP has already observed. The line lets an analyzer
+/// cross-check each bit of `wp_mask` against bit 16 (CR0.WP) of the SAME core's real CR0 — closing
+/// the AP-bit gap the census masks could assert but not witness. It changes no state and no verdict.
+fn wxn_cores_report(cores: u32) {
+    use core::fmt::Write as _;
+    let n = core::cmp::min(cores as usize, gdt::MAX_CPUS);
+    let mut cb = CoreBuf { buf: [0u8; 320], len: 0 };
+    for i in 0..n {
+        let cr0 = CORE_CR0[i].load(Ordering::SeqCst);
+        // Comma-separated, no leading comma. Writing into a fixed buffer cannot fail meaningfully.
+        let _ = write!(cb, "{}0x{:X}", if i == 0 { "" } else { "," }, cr0);
+    }
+    let arr = core::str::from_utf8(&cb.buf[..cb.len]).unwrap_or("<utf8>");
+    serial_println!(
+        ":: WXAUDIT-CORES: n={} cr0=[{}] wp=0x{:X} nxe=0x{:X} ::",
+        n,
+        arr,
+        WP_MASK.load(Ordering::SeqCst),
+        NXE_MASK.load(Ordering::SeqCst),
+    );
 }
 
 // ── WITCORE: SCHED-X86 core placement ───────────────────────────────────────────────────────────
@@ -331,9 +484,36 @@ pub fn confirm_render_core(arg: usize) {
 // The real-mode -> long-mode trampoline. AT&T syntax; see the module comment for the design.
 // Every absolute reference is `TRAMP + (label - ap_trampoline_start)` so the assembled bytes
 // carry no relocations and are valid only after being copied to TRAMP (0x8000).
+//
+// `.pushsection`/`.popsection`, NOT `.section` — and the pair is a CORRECTNESS fix, not style.
+// rustc lowers every module-level `global_asm!` of a codegen unit into ONE assembly stream, in
+// item order, so the assembler's *current section* is state that LEAKS from one block to the
+// next. This block used a bare `.section .rodata` and never returned; the very next `global_asm!`
+// the x86 lane emits is `sched.rs`'s `switch_context`, which (correctly) declares no section of
+// its own and so was assembled into `.rodata`. It was then EXECUTED IN PLACE at ring 0 on every
+// task switch. WXN-x86 M2 convicted it on the first boot that marked non-executable everything
+// the ELF did not declare `PF_X`:
+//
+//     EXCEPTION: PAGE FAULT  err=PROTECTION_VIOLATION|INSTRUCTION_FETCH  rip=0x3D646C68
+//
+// — image offset 0x27C68, where `readelf -sW` shows `ap_trampoline_end` and `switch_context`
+// sharing one address. `memory.rs`'s M2 block carries the full account and flagged the fix here.
+//
+// The invariant this restores, and which every other `global_asm!` in the crate silently assumes:
+// **a block that changes the section must change it back.** `.popsection` restores whatever was
+// current on entry rather than asserting `.text`, so the block composes correctly wherever the
+// CGU partitioner places it — and the partitioning is not stable, which is exactly why the bug
+// caught only `sched.rs` in this build and could catch a different block in the next one.
+// `.code64` is restored explicitly for the same reason: the `.code16`/`.code32`/`.code64` mode is
+// GLOBAL assembler state that `.popsection` does not save. It already ends at `.code64` here (set
+// at `ap_lm_entry`), so the directive emits nothing today; it makes the block's exit state total
+// instead of accidental.
+//
+// The trampoline bytes themselves stay in `.rodata`, which is correct: they are never executed in
+// place — `start_aps` copies them to 0x8000 and the APs execute them there.
 core::arch::global_asm!(
     r#"
-.section .rodata
+.pushsection .rodata
 .balign 16
 .code16
 .global ap_trampoline_start
@@ -369,10 +549,35 @@ ap_pm_entry:
     movl   $(0x8000 + ap_param_cr3 - ap_trampoline_start), %ecx
     movl   (%ecx), %eax
     movl   %eax, %cr3
-    # Set EFER.LME (long mode enable, bit 8).
+    # Set EFER.LME (long mode enable, bit 8) AND EFER.NXE (no-execute enable, bit 11) => 0x900.
+    #
+    # WXN-x86 M1 — NXE here is a PREREQUISITE, not a hardening. With EFER.NXE clear, bit 63 of a
+    # paging-structure entry is not "ignored", it is RESERVED: any translation through an entry that
+    # carries it raises a reserved-bit #PF — for data reads and stack writes just as much as for
+    # instruction fetches. The moment `memory::wxn_pdpt_sweep` puts an NX bit anywhere in the shared
+    # identity map, an AP that entered paging with NXE=0 dies at its first access through an NX'd
+    # parent. Its own `syscall::init()` sets NXE, but that runs deep inside `ap_entry`, long AFTER
+    # paging is on — this closes exactly that window.
+    #
+    # WHERE it would actually die, named precisely, because the first version of this comment named
+    # the wrong place and a wrong model of "which accesses are at risk" is worth more than the fix is:
+    # the AP's first acts after CR0.PG are reading its parameter block at 0x8000+off and setting rsp
+    # to &AP_STACKS[i] — but 0x8000 is in GiB 0 and AP_STACKS is a `.bss` `static mut` inside the
+    # kernel image, and the sweep SPARES both of those GiBs, so neither walks an NX'd entry at all.
+    # The first NX'd parent an AP touches is `apic::init()`'s LAPIC store at 0xFEE00000 — GiB 3,
+    # which the sweep does NX (Boot V: `at=lapic lvl=2M`, so GiB 3 is a present, unspared table).
+    # By then `interrupts::init_idt()` has run, so with NXE=0 that store is a reserved-bit #PF that
+    # lands in the kernel's #PF handler: a page-fault panic on an AP, not a silent triple fault.
+    # The conclusion is unchanged and the fix is still mandatory — an AP that dies at apic::init is
+    # just as dead, any EARLIER access through an NX'd entry would fault pre-IDT and triple, and the
+    # walk is only correct with NXE set regardless. Only the mechanism was misdescribed.
+    #
+    # Unconditionally safe: `syscall::init()` hard-STOPs the BSP if CPUID.80000001h:EDX[20] (NX) is
+    # clear, and that runs from `arch::init` long before `start_aps`, so by the time any AP executes
+    # this instruction NX support has already been proven on this machine.
     movl   $0xC0000080, %ecx
     rdmsr
-    orl    $0x100, %eax
+    orl    $0x900, %eax
     wrmsr
     # Enable paging + protection (CR0.PG | CR0.PE) — activates long mode.
     movl   %cr0, %eax
@@ -421,6 +626,10 @@ ap_param_stack:  .quad 0
 ap_param_index:  .quad 0
 .global ap_trampoline_end
 ap_trampoline_end:
+# Restore the assembler state this block found: section (see the comment above — `switch_context`
+# is assembled immediately after this in the same stream) and code-size mode.
+.code64
+.popsection
 "#,
     options(att_syntax)
 );
@@ -468,6 +677,10 @@ pub extern "C" fn ap_entry(cpu_index: u64) -> ! {
     // U1a: this AP's SYSCALL/SYSRET MSRs + NX/SMEP (after its GDT + per-CPU data, before `sti`), so
     // a ring-3 task dispatched onto this AP can trap back in.
     syscall::init();
+    // WXN-x86 M1: this core's NX witness, taken the instant after `syscall::init` armed EFER.NXE and
+    // BEFORE the `AP_ONLINE` handshake — so no core can be advertised online without its bit in the
+    // mask, and `cores` vs `nxe` in the rollup line can never be out of step for handshake reasons.
+    wxn_record_core(idx);
 
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
     serial_println!("SMP: AP {} online (apic id {}).", idx, apic_id);
@@ -517,12 +730,14 @@ pub fn start_aps() {
         Some(t) => t,
         None => {
             serial_println!("SMP: no ACPI topology; staying uniprocessor.");
+            wxn_nxe_report(1);
             return;
         }
     };
     let apic_ids = topo.apic_ids();
     if apic_ids.len() <= 1 {
         serial_println!("SMP: 1 CPU; no APs to start.");
+        wxn_nxe_report(1);
         return;
     }
 
@@ -610,6 +825,9 @@ pub fn start_aps() {
         AP_ONLINE.load(Ordering::SeqCst) + 1,
         apic_ids.len()
     );
+    // WXN-x86 M1: the rollup, against the count SMP itself just published — so a core that came
+    // online without NXE shows as `cores > nxe` on the same screen as the count it contradicts.
+    wxn_nxe_report(AP_ONLINE.load(Ordering::SeqCst) + 1);
 
     // Publish the online AP indices so the scheduler can spawn work onto exactly the cores that
     // actually came up (not just "1..cpu_count").

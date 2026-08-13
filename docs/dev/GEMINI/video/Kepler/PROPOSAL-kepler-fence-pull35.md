@@ -31,8 +31,27 @@ This ensures the ledger survives a wedged boot.
 *Clarification on Ledger Mechanism*: The wrappers detect a violation and make it visible in every capture. They do not prevent a developer from bypassing them by calling `mmio_read` directly, but they guarantee that compliant calls will be strictly ordered and recorded. GPCCS (`0x41A000`) is explicitly out of scope for the FECS ledger, and `0x409500` will continue to be read independently.
 
 ### Ledger Output on Healthy vs Poisoned Boot
-- **Healthy Boot**: `504_read_touched=false`, `504_read_idx=none`. `504_write_touched=true`, `504_write_idx=N` (where N is the very last index, representing the terminal poke).
-- **Poisoned Boot**: `504_read_touched=true`, `504_read_idx=M` (where M < N, indicating an illegal read occurred earlier in the boot), explaining any subsequent `BADF1000` faults.
+*(Amended twice. The first amendment, written before the instrument flew, said a healthy boot
+shows `504_read_idx` at the terminal index. **Boot Z proved that wrong**, and the correct
+reading is below — the two fields have different sources and only one of them can see the
+falcon.)*
+
+**The two fields are not two views of one event.** `FECS_504_READ_INDEX` is set only inside
+`fecs_read`, so it records **host** reads exclusively. `FECS_504_READ_TOUCHED` is additionally
+stored by hand at `kepler.rs:1935`, immediately before the falcon core is armed, precisely
+because a falcon `iord` is invisible to the host-side wrapper. So:
+
+- **Healthy Boot (post-split): `504_read_touched=true` with `504_read_idx=none`.** That pair
+  means "the falcon touched `0x409504`, and no host read did" — which is exactly what the
+  ECHO/POKE split was built to achieve. Boot Z (metal, 2026-08-06) read
+  `accesses=528 first_offset=00002390 504_read_touched=true 504_read_idx=none
+  504_write_touched=true 504_write_idx=527`.
+- **Poisoned Boot: ANY numeric `504_read_idx`.** A number means a *host* read of `0x409504`
+  occurred at that access index — the defect pull-35 exists to catch. The index is not a
+  healthy value at any position, terminal or otherwise.
+- `504_write_idx=527` is the terminal host poke, and `accesses=528` places it last. Both the
+  falcon POKE and the terminal host poke touch `0x409504` in one boot, so a hang after the
+  write is attributable to either until they are read separately.
 
 ### Falcon-Side Read Outcome Table
 By seeding `CC_SCRATCH[1]` with a non-zero sentinel (`0xA5A50000`), the `host-ack` reading (`ack=...`) distinguishes four distinct states:
@@ -43,3 +62,16 @@ By seeding `CC_SCRATCH[1]` with a non-zero sentinel (`0xA5A50000`), the `host-ac
 
 ## 4. Falcon-Side Read (Carried Forward)
 The falcon-side read of `0x409504` inside the microcode via `iord` port `(0x14100)` remains intact and will execute natively.
+
+## 5. Milestone 3 — The Assertion (Decision Table)
+For the remaining untried hypotheses (3 and 4), the success criterion is pre-declared: **PFIFO channel validation stops refusing** (`err=2` goes away).
+
+### Hypothesis 3: CC_SCRATCH / ENGINE_TRIGGER (0xc08) Host Handshake Completing
+- **Worked**: Channel validation succeeds (`err=0`). We confirm that the host must complete the handshake with the Falcon (trigger write *and* response observed) for the channel to bind successfully.
+- **Did not work**: Channel validation fails (`err=2`). The handshake completion is not the missing requirement for channel validation.
+- **Instrument did not run**: The microcode never echoes or the host never receives the ack (e.g., `ucode-echo NO-ACK`), indicating a lower-level failure before the handshake could even be tested.
+
+### Hypothesis 4: DMACTL REQUIRE_CTX interacting with CHAN_CUR
+- **Worked**: Channel validation succeeds (`err=0`). We confirm that `DMACTL REQUIRE_CTX` must be correctly sequenced with `CHAN_CUR` for the channel to validate.
+- **Did not work**: Channel validation fails (`err=2`). The interaction between `REQUIRE_CTX` and `CHAN_CUR` is not the blocking factor.
+- **Instrument did not run**: Reaches a fault/hang before the `CHAN_CUR` binding or `REQUIRE_CTX` writes are executed, obscuring the result.

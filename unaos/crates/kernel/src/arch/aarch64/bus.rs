@@ -42,9 +42,9 @@
 // selftest's at-ceiling KAT); no_std; aarch64-only (declared under arch/aarch64; zero x86 surface).
 
 /// Frame magic: b"UBS1" — UnaOS Bus, wire v1.
-pub const BUS_MAGIC: [u8; 4] = *b"UBS1";
+pub use una_abi::BUS_MAGIC;
 /// Wire version. A bump is a protocol break (rule on it; never silent).
-pub const BUS_VERSION: u8 = 1;
+pub use una_abi::BUS_VERSION;
 
 /// Header length. Layout (little-endian):
 ///   0..4  magic  4..5 version  5..6 kind  6..7 verb  7..8 reserved(=0)
@@ -52,30 +52,30 @@ pub const BUS_VERSION: u8 = 1;
 /// REQUEST: status MUST be 0, principal MUST be all-zero (the kernel stamps it), verb ∈ {LS,CAT,CP},
 /// body = the verb's typed payload. REPLY: verb ECHOES the request verb, corr echoes, status = 0
 /// (body = the verb's typed output) or a negative errno (body MUST be empty).
-pub const BUS_HDR_LEN: usize = 52;
+pub use una_abi::BUS_HDR_LEN;
 /// HARD DECODE CEILING for the body — the max forced allocation per frame (see module doc).
-pub const BUS_BODY_MAX: usize = 4096;
+pub use una_abi::BUS_BODY_MAX;
 /// The whole-frame ceiling: header + max body.
-pub const BUS_FRAME_MAX: usize = BUS_HDR_LEN + BUS_BODY_MAX;
+pub use una_abi::BUS_FRAME_MAX;
 
 /// Frame kinds.
-pub const BUS_KIND_REQUEST: u8 = 1;
-pub const BUS_KIND_REPLY: u8 = 2;
+pub use una_abi::BUS_KIND_REQUEST;
+pub use una_abi::BUS_KIND_REPLY;
 
 /// Verbs. A reply echoes its request's verb.
 /// BANDY-1 read-side subset (ROADMAP §3b's first three):
-pub const BUS_VERB_LS: u8 = 1;
-pub const BUS_VERB_CAT: u8 = 2;
-pub const BUS_VERB_CP: u8 = 3;
+pub use una_abi::BUS_VERB_LS;
+pub use una_abi::BUS_VERB_CAT;
+pub use una_abi::BUS_VERB_CP;
 /// BANDY-2 write-side subset (ROADMAP §3b arc 2) — the DESTRUCTIVE verbs, fulfilled through the
 /// EXISTING FAT + ACL machinery under the invoker's stamped principal (syscall.rs), errno-mirrored:
 ///   * WRITE — create-or-truncate a root file with a typed content payload (sys_open(O_CREAT)+write twin);
 ///   * RM    — unlink a root file by name (sys_unlink twin — owner-only delete, durable ACL clear first);
 ///   * MV     — rename a root file in place (the fat.rs rename_entry twin — owner-only, ACL name re-bind).
 /// ADDITIVE to the frozen v1 layout: new verb tags + typed payloads, no header/ceiling change.
-pub const BUS_VERB_WRITE: u8 = 4;
-pub const BUS_VERB_RM: u8 = 5;
-pub const BUS_VERB_MV: u8 = 6;
+pub use una_abi::BUS_VERB_WRITE;
+pub use una_abi::BUS_VERB_RM;
+pub use una_abi::BUS_VERB_MV;
 
 /// The full set of valid verbs (both request and reply kinds). Kept as one predicate so the
 /// frozen `frame_parse` verb gate and the typed-body dispatch stay in lockstep.
@@ -89,7 +89,7 @@ pub fn verb_valid(verb: u8) -> bool {
 
 /// 8.3 name bound — mirrors syscall.rs MAX_NAME (the sys_open bound the equivalence witness
 /// holds cat/cp to).
-pub const BUS_NAME_MAX: usize = 12;
+pub use una_abi::BUS_NAME_MAX;
 
 /// A decoded frame header. `principal` is the raw 32-byte PrincipalRecord wire image, opaque here.
 #[derive(Clone, Copy, PartialEq, Eq)]

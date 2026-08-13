@@ -17,7 +17,13 @@
 // section first — because the kernel enters at offset 0 of the copied image.
 //
 // ABI (Linux-aarch64, shared with x86_64 per the userspace docs): x8 = syscall number, args x0..x5,
-// return in x0. Syscalls used: SYS_WRITE = 1 (fd, buf, len), SYS_EXIT = 2 (status). See syscall.rs.
+// return in x0. Syscalls used: SYS_WRITE (fd, buf, len), SYS_EXIT (status).
+//
+// ABIFREEZE: the two numbers are `const` OPERANDS fed from `una_abi`, not immediates typed into the
+// asm string. A raw `asm!` immediate cannot be a `use`d path, but a `const` operand can — so this
+// blob is frozen against the same table the kernel dispatches from rather than merely agreeing with
+// it today. The emitted instruction is byte-identical (`mov x8, #1` = 0xD2800028), which is what
+// `arroyo kernel8` asserts of the first four bytes of the objcopy'd image.
 
 use core::arch::naked_asm;
 
@@ -31,17 +37,19 @@ use core::arch::naked_asm;
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _start() -> ! {
     naked_asm!(
-        "mov x8, #1",            // SYS_WRITE
+        "mov x8, #{sys_write}",  // SYS_WRITE
         "mov x0, #1",            // fd = 1 (stdout)
         "adr x1, 0f",            // buf = the message (PC-relative -> its EL0 VA at run time)
         "mov x2, #(1f - 0f)",    // len = message length (assembled to an immediate)
         "svc #0",
-        "mov x8, #2",            // SYS_EXIT
+        "mov x8, #{sys_exit}",   // SYS_EXIT
         "mov x0, #0",            // status = 0
         "svc #0",
         "2: b 2b",               // sys_exit never returns; spin as a belt-and-braces guard
         "0: .ascii \"hello from EL0\\n\"",
         "1:",
+        sys_write = const una_abi::SYS_WRITE,
+        sys_exit = const una_abi::SYS_EXIT,
     );
 }
 

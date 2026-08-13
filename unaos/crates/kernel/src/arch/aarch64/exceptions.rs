@@ -774,7 +774,7 @@ extern "C" fn aarch64_el0_fault_handler() -> ! {
         crate::arch::hlt_loop();
     };
     // KEYSTAT: name the PID as well as the task name. The name alone is not an identity — every
-    // program launched with `bg` runs under the single literal `"bg-el0"` (`spawn_user_image_bg`),
+    // program launched with `bg` runs under the single literal `"bg-user"` (`spawn_user_image_bg`),
     // so with two `STAT.ELF` instances on the panel a fault line said only "one of them died" and
     // the operator's `kill <pid>` (answered "already exited") was the first and only evidence of
     // WHICH. The pid is the number `jobs` prints, the number `kill` takes, and the number the app

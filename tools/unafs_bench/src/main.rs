@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use anyhow::{Context, Result};
-use rand::Rng;
+use rand::RngExt;
 use std::fs;
 use std::time::Instant;
 use unafs::{AttributeValue, BLOCK_SIZE, FileDevice, FileSystem, cosine_similarity};
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
         num_inodes
     );
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let types = ["engram", "directive", "noise"];
 
     let start_time = Instant::now();
@@ -71,7 +71,7 @@ fn main() -> Result<()> {
 
         let mut vec_data = Vec::with_capacity(384);
         for _ in 0..384 {
-            vec_data.push(rng.gen_range(-1.0..1.0));
+            vec_data.push(rng.random_range(-1.0..1.0));
         }
 
         let type_str = types[i % 3].to_string();
@@ -150,7 +150,7 @@ fn main() -> Result<()> {
 
     let mut target_vec = Vec::with_capacity(384);
     for _ in 0..384 {
-        target_vec.push(rng.gen_range(-1.0..1.0));
+        target_vec.push(rng.random_range(-1.0..1.0));
     }
     let vec_str = format!("{:?}", target_vec);
 

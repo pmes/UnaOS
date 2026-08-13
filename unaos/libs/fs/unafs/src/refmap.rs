@@ -35,51 +35,104 @@
 //! allocatable.
 //!
 //! On disk the map persists CoW like everything else: fresh leaf blocks of
-//! 1024 little-endian u32 counts + one fresh index block of leaf pointers per
-//! commit, reached from the root record (`fs.rs` owns that serialization).
+//! 1024 little-endian u32 counts + a fresh index per commit, reached from the
+//! root record (`fs.rs` owns that serialization). The index is ONE block of
+//! leaf pointers up to 512 leaves (volumes ≤ 2 GiB — the only shape v3/v4
+//! ever wrote); past that (v5+) it is a two-level tree: one index-of-indexes
+//! block of mid pointers, each mid block holding up to 512 leaf pointers
+//! (cap: 512 × 512 × 1024 = 1 TiB).
 
+use crate::storage::Error as StorageError;
 use alloc::vec::Vec;
 
 /// Refcount entries per 4096 B leaf block (u32 counts).
 pub const REFS_PER_LEAF: u64 = crate::storage::BLOCK_SIZE / 4;
+
+/// Reserve a zero-filled `Vec<u32>` of `n` entries FALLIBLY. The map's views
+/// scale with the volume (4 B/block each), and since the v5 cap lift a view
+/// can run to a gibibyte — an infallible `vec![0u32; n]` here is the
+/// SHELLWIN-OOM disease: a large card would panic the kernel at mount/format
+/// instead of being refused. Failure is a clean [`StorageError::AllocRefused`].
+fn try_zeroed(n: usize) -> Result<Vec<u32>, StorageError> {
+    let mut v: Vec<u32> = Vec::new();
+    v.try_reserve_exact(n)
+        .map_err(|_| StorageError::AllocRefused(n as u64 * 4))?;
+    v.resize(n, 0);
+    Ok(v)
+}
 
 /// The refcount map: `current` vs `frozen` (see module docs).
 pub struct RefMap {
     current: Vec<u32>,
     frozen: Vec<u32>,
     block_count: u64,
+    /// First-fit SCAN CURSOR — a pure in-RAM accelerator with the invariant
+    /// "every index below `hint` is non-allocatable (used in `current` OR
+    /// `frozen`)". [`allocate`](Self::allocate) scans from here instead of 0,
+    /// which turns a sequential volume fill from O(n²) into O(n) — without it
+    /// a 2 GiB fill is ~1.4e11 scan steps. Allocation RESULTS are identical
+    /// to the plain lowest-free-in-both-views scan: anything that can free a
+    /// block below the cursor ([`decref`](Self::decref)) or change a view
+    /// wholesale ([`freeze`](Self::freeze), [`thaw`](Self::thaw),
+    /// [`set_counts`](Self::set_counts)) rewinds it, paying at most one
+    /// re-scan. Never serialized — no format impact.
+    hint: usize,
 }
 
 impl RefMap {
-    /// A fresh, all-free map for `block_count` blocks (format path).
-    pub fn new(block_count: u64) -> Self {
-        Self {
-            current: alloc::vec![0u32; block_count as usize],
-            frozen: alloc::vec![0u32; block_count as usize],
+    /// A fresh, all-free map for `block_count` blocks (format path). FALLIBLE:
+    /// both views are try-reserved, so a volume too big for the running
+    /// system's heap (the kernel installer path reaches this) is a clean
+    /// `Err`, never an OOM abort.
+    pub fn try_new(block_count: u64) -> Result<Self, StorageError> {
+        let n = usize::try_from(block_count)
+            .map_err(|_| StorageError::AllocRefused(block_count))?;
+        Ok(Self {
+            current: try_zeroed(n)?,
+            frozen: try_zeroed(n)?,
             block_count,
-        }
+            hint: 0,
+        })
     }
 
     /// Adopt counts loaded from disk (mount path): both views start equal —
-    /// the loaded map IS the committed tree.
-    pub fn from_counts(mut counts: Vec<u32>, block_count: u64) -> Self {
-        counts.resize(block_count as usize, 0);
-        Self {
-            frozen: counts.clone(),
+    /// the loaded map IS the committed tree. FALLIBLE: the second view is a
+    /// full copy of the first, and the kernel mount path reaches this with a
+    /// disk-derived size — the copy must be refused cleanly, not aborted,
+    /// when the heap cannot serve it (the caller try-reserved only `counts`).
+    pub fn try_from_counts(mut counts: Vec<u32>, block_count: u64) -> Result<Self, StorageError> {
+        let n = usize::try_from(block_count)
+            .map_err(|_| StorageError::AllocRefused(block_count))?;
+        if n > counts.len() {
+            counts
+                .try_reserve_exact(n - counts.len())
+                .map_err(|_| StorageError::AllocRefused(n as u64 * 4))?;
+        }
+        counts.resize(n, 0);
+        let mut frozen: Vec<u32> = Vec::new();
+        frozen
+            .try_reserve_exact(n)
+            .map_err(|_| StorageError::AllocRefused(n as u64 * 4))?;
+        frozen.extend_from_slice(&counts);
+        Ok(Self {
+            frozen,
             current: counts,
             block_count,
-        }
+            hint: 0,
+        })
     }
 
     /// First-fit allocate: the lowest block free in BOTH views. Marks it
     /// current-refcount 1. `None` when the volume is full.
     pub fn allocate(&mut self) -> Option<u64> {
-        for i in 0..self.block_count as usize {
+        for i in self.hint..self.block_count as usize {
             if self.current[i] == 0 && self.frozen[i] == 0 {
                 self.current[i] = 1;
+                self.hint = i + 1;
                 return Some(i as u64);
             }
         }
+        self.hint = self.block_count as usize;
         None
     }
 
@@ -95,6 +148,9 @@ impl RefMap {
     pub fn decref(&mut self, block: u64) {
         if let Some(c) = self.current.get_mut(block as usize) {
             *c = c.saturating_sub(1);
+            // The block may now be allocatable (if its frozen count is 0
+            // too): rewind the scan cursor so first-fit stays exact.
+            self.hint = self.hint.min(block as usize);
         }
     }
 
@@ -118,6 +174,9 @@ impl RefMap {
     /// transaction freed are genuinely reusable.
     pub fn freeze(&mut self) {
         self.frozen.copy_from_slice(&self.current);
+        // Blocks the retired tree held (current 0 / frozen 1) just became
+        // allocatable — rewind the scan cursor (one re-scan per commit).
+        self.hint = 0;
     }
 
     /// Discard the in-flight transaction: `current = frozen` (the committed
@@ -129,6 +188,7 @@ impl RefMap {
     /// consistent with every OTHER piece of in-RAM state before using it.
     pub fn thaw(&mut self) {
         self.current.copy_from_slice(&self.frozen);
+        self.hint = 0;
     }
 
     /// Number of leaf blocks the persisted map spans (a pure function of the
@@ -158,5 +218,6 @@ impl RefMap {
         for (i, c) in self.current.iter_mut().enumerate() {
             *c = counts.get(i).copied().unwrap_or(0);
         }
+        self.hint = 0;
     }
 }

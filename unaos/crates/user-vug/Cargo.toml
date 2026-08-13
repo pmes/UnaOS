@@ -26,7 +26,30 @@ path = "src/main.rs"
 
 # Tiny freestanding program: size-optimised, panic=abort (no unwinder in a no_std EL0 program), lto folds
 # the routines. No dependencies.
+# VUGSCENE: `opt-level = "z"` rather than `"s"`, and it is a REQUIREMENT rather than a preference. This
+# program links into a 4-page EL0 window whose `.text` may not pass 0x2000 — one byte over and `.bss` moves
+# a page, the image grows 4096 bytes in one step and `arroyo` refuses it (see the SIZE note in main.rs).
+# The solid-shard renderer measures 9534 bytes of `.text` at `"s"` and 8023 at `"z"`; only one of those
+# builds. Nothing in the frame loop is vectorisable here anyway — every surface write is volatile and the
+# ray loop is branch-bound — so what `"z"` costs in speed is small, and what it costs is in any case
+# reported honestly by the fps meter rather than hidden by it.
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 panic = "abort"
 lto = true
+
+# ABIFREEZE: the syscall ABI, imported rather than re-typed. This crate used to declare its own copy
+# of the numbers it happened to use; `una-abi` is now the single declaration, shared with both
+# kernels. It is `no_std`, has no dependencies of its own, and contains nothing but `const` — so it
+# contributes ZERO bytes to this image and the page/size budgets are unchanged.
+[dependencies]
+una-abi = { path = "../una-abi" }
+
+# VUGSCENE: the MANUAL PIN for the adaptive detail ladder. `bg`/`run` carry a path and no argv (shell.rs:
+# `match args.first()`), so there is no runtime channel into an EL0 program — the pin is a build feature and
+# `arroyo` links the same source three times. Default (no feature) = the adaptive ladder = VUG.ELF;
+# `pinlo` = level 0 forever, the classic pattern = VUGC.ELF; `pinhi` = LOD_MAX forever = VUGX.ELF.
+# Mutually exclusive by convention; `pinlo` wins if both are somehow set (cfg order in main.rs).
+[features]
+pinlo = []
+pinhi = []

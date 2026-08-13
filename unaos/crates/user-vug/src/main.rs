@@ -189,10 +189,39 @@
 // reason than pause's: a headless QEMU run has no HID, so nothing ever TABs to the shell, so nothing is
 // ever hidden. `kernel8-test`'s 300-frame checksum proves it both before and after.
 //
+// VSYNC-PACE (GR22, x86) — THE CLAUSE BELOW IS NOW HALF FALSE, AND THE HALF THAT DIED IS THE KERNEL'S.
+// "…and none in the kernel's present path either" held until GR22. On x86 with the window compositor
+// armed (`wc`), `SYS_WIN_PRESENT` and `SYS_WIN_PRESENT_ROWS` SLEPT the caller to the panel's 16667 µs
+// frame boundary before compositing.
+//
+// ⚠ VSYNC-PACE r3 (GR25) RESTORED THE CLAUSE. The pacer is now OPT-IN (`UNAOS_VSYNCPACE=1`); the
+// polarity inverted and the default desktop is UNPACED again, so on a shipped boot there is no fps
+// target in this program AND none in the kernel's present path either — the original clause, true again.
+// A present returns as soon as its composite is done and this loop runs at whatever rate the machine can
+// give it. Everything from here to the end of this block describes the ARMED build only; read it as the
+// `UNAOS_VSYNCPACE=1` regime, not the shipped one, and see `docs/dev/OS/08_VIDEO/engine.md`
+// "VSYNC-PACE r3" for why. The `[vugfps] wf=` meter is unchanged and is now free to read the real rate.
+//
+// That is a different thing from an fps target in this program, and the distinction is the reason the
+// clause below is amended rather than deleted. An fps target is a TUNING CONSTANT: it has to be guessed,
+// it is wrong on the next panel, and it has to be re-guessed in every program that ever opens a window —
+// and this program still has none, which is why it needed no change at all for the pacer to work. What
+// the kernel added is the PANEL'S PHYSICS: the beam publishes one frame every 16667 µs, so a second
+// present inside that interval is composited, paid for, and overwritten before anyone can see it. That
+// fact is known on the side of the seam that owns the panel and is identical for every client, so it
+// belongs there and nowhere else.
+//
+// Consequences for anyone reading this loop: on a paced x86 boot the loop's rate converges to ~60/s with
+// no code here doing anything about it, `[wcn] gap` collapses onto 16..17 ms (which the WC-N watch-list
+// used to call a finding and now calls the healthy signature there), and the VUGFPS overlay reads ~60
+// rather than the 55.8–100.5 scatter Boot AO measured. aarch64 is untouched — the Pi's plateau was and
+// remains the barrier story below, which is a different mechanism with a different fix.
+//
 // VUG-PACE — A VUG RUNS AT THE MACHINE'S SPEED, NOT THE SCHEDULER'S. P73: "there's a delay to a vug
 // speeding up when it's the only one running", and "vug still wants to go back to what it thinks its fps is
 // supposed to be even though it could run faster". There is no fps target in this program and never has
-// been — no sleep, no frame budget, no throttle, and none in the kernel's present path either. The plateau
+// been — no sleep, no frame budget, no throttle, and (see VSYNC-PACE above) none in the kernel's present
+// path either until GR22 put the PANEL's cadence there on x86. The plateau
 // was the FRAME BARRIER parking on its first pass: a park costs a wake plus a dispatch, dispatch latency
 // belongs to the run queue rather than to the spare CPU, and two arrivals per frame put two of those round
 // trips under every healthy frame. A floor made of dispatch latency does not fall when the machine empties
@@ -249,21 +278,28 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 // Syscall ABI (Linux-aarch64): x8 = number, args x0..x5, return in x0. The kernel SVC path preserves
 // every GPR except x0.
 // ---------------------------------------------------------------------------------------------
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
-const SYS_YIELD: u64 = 4;
-const SYS_GETINFO: u64 = 7;
-const SYS_THREAD_SPAWN: u64 = 21;
-const SYS_THREAD_EXIT: u64 = 22;
-const SYS_THREAD_JOIN: u64 = 23;
-const SYS_FUTEX: u64 = 26;
-const SYS_INPUT_POLL: u64 = 27;
+// ABIFREEZE: every number below is IMPORTED from `una_abi` — the ONE declaration, shared with both
+// kernels and with every other ring-3 program. This block used to be fourteen local `const`s that
+// nothing in the build compared against the dispatchers they were calling.
+use una_abi::{SYS_EXIT, SYS_WRITE, SYS_YIELD};
+/// VUGPARK-FALLBACK: `SYS_SLEEP_MS(ms)` — a real timed park on both arches (5 on each; see
+/// `arch/{aarch64,x86_64}/syscall.rs`). Used ONLY when `SYS_INPUT_WAIT` answers a negative, which
+/// today means the x86 dispatcher has no verb 28 and its default arm returned `-ENOSYS`.
+use una_abi::{
+    SYS_FUTEX, SYS_GETINFO, SYS_INPUT_POLL, SYS_SLEEP_MS, SYS_THREAD_EXIT, SYS_THREAD_JOIN,
+    SYS_THREAD_SPAWN,
+};
 // VUGPAUSE-2: the BLOCKING half of the input pair. Returns 0 once the ring may be non-empty; it does not
 // dequeue, so the ordinary `drain_input` at the top of the loop still sees every event.
-const SYS_INPUT_WAIT: u64 = 28;
+use una_abi::SYS_INPUT_WAIT;
 // WC-C: the WINDOW verbs replace the single-surface SYS_FB_MAP/SYS_FB_PRESENT compat pair.
-const SYS_WIN_CREATE: u64 = 29;
-const SYS_WIN_PRESENT: u64 = 30;
+use una_abi::{SYS_WIN_CREATE, SYS_WIN_PRESENT};
+// FBCON-DMG: `SYS_WIN_PRESENT_ROWS(win, y0, y1)` — a present that declares which SOURCE rows of this
+// program's own surface actually changed, so the compositor repaints only those. x86 only, for now; the
+// aarch64 kernel does not define 33 and answers `-ENOSYS` (-38) from its dispatcher's default arm, which
+// is why `present_rows` below carries a MANDATORY whole-box fallback rather than treating a failure as an
+// error. Additive: 30 is untouched and still the only present this program makes on aarch64.
+use una_abi::SYS_WIN_PRESENT_ROWS;
 
 // WITSWEEP — REGISTER-SURVIVAL INVARIANT (sys0..sys4): these stubs use `in("x1")`/`in("x2")`/
 // `in("x3")`/`in("x8")`, which PROMISES the compiler those registers hold their values across the
@@ -333,10 +369,14 @@ unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 
 // ── x86_64 stubs, GRAFTED AT MERGE ASSEMBLY from the x86 trunk's WINX-7/TEARDOWN-1 port
 // (UnaOS-gemini f36ab3d5) — my body, their ABI layer. TEARDOWN-1's discipline carried intact:
-// `syscall` destroys rcx (return RIP) and r11 (RFLAGS) so both are clobbered; the kernel's
-// sysretq scrubs rdi/rsi/rdx/r8/r9/r10, so every argument register is `inlateout(...) => _` and
-// r8/r9/r10 — scrubbed by the kernel, and named by no stub except `sys4` (where r10 carries the
-// fourth argument and is therefore already `inlateout`) — are declared `lateout` everywhere else.
+// `syscall` destroys rcx (return RIP) and r11 (RFLAGS) so both are clobbered. The kernel's
+// sysretq tail additionally scrubs SIX registers — rdi/rsi/rdx/r8/r9/r10 — to zero on EVERY
+// syscall return, unconditionally, regardless of how many arguments that syscall actually took.
+// So every stub here, no matter its arity, must declare all six: `inlateout(reg) a => _` for
+// whichever ones happen to carry that stub's own arguments, `lateout(reg) _` for the rest. A
+// stub that only names the registers it passes (the arity mistake this block used to make) still
+// lets the compiler believe an unnamed one — say `rdx` in a 2-argument stub — survives the
+// syscall; it does not, and reusing it after the call reads back zero.
 // The clobber list states the ABI the kernel actually implements, so the compiler reloads what
 // it must (declaring them `in(...)` once cost the second THREAD_SPAWN its entry pointer: the
 // kernel's scrubbed rdi=0 was validated and refused with -EFAULT).
@@ -347,6 +387,7 @@ unsafe fn sys0(n: u64) -> u64 {
     core::arch::asm!(
         "syscall",
         inlateout("rax") n => r,
+        lateout("rdi") _, lateout("rsi") _, lateout("rdx") _,
         lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
         options(nostack),
     );
@@ -360,6 +401,7 @@ unsafe fn sys1(n: u64, a0: u64) -> u64 {
         "syscall",
         inlateout("rax") n => r,
         inlateout("rdi") a0 => _,
+        lateout("rsi") _, lateout("rdx") _,
         lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
         options(nostack),
     );
@@ -374,6 +416,7 @@ unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
         inlateout("rax") n => r,
         inlateout("rdi") a0 => _,
         inlateout("rsi") a1 => _,
+        lateout("rdx") _,
         lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
         options(nostack),
     );
@@ -497,9 +540,67 @@ fn input_poll() -> u64 {
 }
 /// VUGPAUSE-2: block until this process's input ring may be non-empty. Never called from the rendering
 /// path — only from the idle path, where the alternative was `sys_yield` in a runnable spin.
-#[inline(always)]
+///
+/// VUGPARK-FALLBACK — THE RETURN VALUE IS NOW READ, BECAUSE ON x86 IT IS AN ERROR.
+///
+/// `SYS_INPUT_WAIT` (28) is implemented on aarch64 and NOT on x86_64: that dispatcher's default arm
+/// answers `-ENOSYS` (-38) having done nothing at all. Discarding the return therefore turned the one
+/// call this program makes to STOP burning a core into a no-op, and the idle path — a `continue` back
+/// to the top of the same loop — degenerated into a tight busy spin. Boot AJ measured what that costs
+/// once the compositor stops charging for a suppressed present: ~42,000 present attempts per second
+/// per hidden window, `comp_rate=0.0/s`, verdict `STARVED`.
+///
+/// So: check it, and on ANY negative fall back to a real timed park. `SYS_SLEEP_MS` exists on both
+/// arches and is a genuine tick sleep on metal, so the idle vug leaves the run queue either way. 16 ms
+/// is one frame at 60 Hz — long enough that the park is a park, short enough that a keystroke arriving
+/// the instant after the sleep begins is acted on within a frame, which is below the threshold at which
+/// a human calls an app unresponsive.
+///
+/// This is DELIBERATELY NOT the real fix. `SYS_INPUT_WAIT` on x86 (the aarch64 park + the router's wake
+/// seam) is a separate arc; when it lands, this call starts returning 0 and the fallback goes cold on
+/// its own with nothing to remove. Arch-neutral by construction: on aarch64 the syscall succeeds, the
+/// branch is never taken, and the observable behaviour of this program is exactly what it is today.
+///
+/// `#[inline(never)]`, AND IT IS LOAD-BEARING — this was `#[inline(always)]`. `VUG-X86.ELF` is gated at
+/// a hard 16384 bytes and `.text` sits within tens of bytes of the 8 KiB boundary at which `.bss` moves
+/// to the next page and the FILE grows by 4096 in one step (12568 -> 16664, i.e. straight through the
+/// ceiling). Measured, this arc's two hunks: `always` 8165 -> 8237 `.text`, over the boundary and the
+/// gate fails; `never` 8141, twenty-four bytes UNDER the untouched program. Same phenomenon the SIZE
+/// note above `futex_wait` records — the cost is inlining pressure in the frame loop, not the code
+/// written here. Nothing about correctness depends on it; the image ceiling does.
+#[inline(never)]
 fn input_wait() {
-    unsafe { sys0(SYS_INPUT_WAIT) };
+    /// One 60 Hz frame — the fallback park's period. See the note above.
+    const FALLBACK_PARK_MS: u64 = 16;
+    let rc = unsafe { sys0(SYS_INPUT_WAIT) };
+    if rc >> 63 != 0 {
+        unsafe { sys1(SYS_SLEEP_MS, FALLBACK_PARK_MS) };
+    }
+}
+
+/// FBCON-DMG: present SOURCE rows `[y0, y1)` of `win`, with the MANDATORY whole-box fallback.
+///
+/// Returns exactly what a present returns — 0, or a negative errno with bit 63 set — so every call site
+/// keeps checking the result the way it already does (`rc >> 63 != 0` -> `stall_witness`).
+///
+/// THE FALLBACK IS THE POINT, and its shape is deliberately the dullest one available: try the banded
+/// verb; on ANY negative return, fall through to the byte-for-byte call this program made before this
+/// function existed. Nothing is latched, nothing is remembered, no ordering changes, and nothing about
+/// what has been drawn depends on which branch ran. So on aarch64 — where 33 is undefined and the
+/// dispatcher's default arm answers `-ENOSYS` (-38) having done nothing else — the observable behaviour
+/// of this program is what it is today, plus one syscall that returns -38 and touches nothing. It is NOT
+/// an error path: an older kernel is not a failure, it is a kernel without this verb.
+///
+/// Rows are the SURFACE's own, not the panel's, and `[y0, y1)` is half-open. The kernel refuses an empty,
+/// inverted or over-tall band with `-EINVAL` rather than quietly widening it, so a mistake in a caller's
+/// damage arithmetic shows up as a whole-box present here (via this fallback) instead of hiding.
+#[inline(always)]
+fn present_rows(win: u64, y0: u32, y1: u32) -> u64 {
+    let rc = unsafe { sys3(SYS_WIN_PRESENT_ROWS, win, y0 as u64, y1 as u64) };
+    if rc >> 63 == 0 {
+        return rc;
+    }
+    unsafe { sys1(SYS_WIN_PRESENT, win) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -508,38 +609,42 @@ fn input_wait() {
 type Fx = i32;
 const ONE: Fx = 1 << 16;
 
-/// sin(theta) in Q16.16, theta in brads (256 brads = one turn). Verbatim from vug.rs::SIN.
-static SIN: [Fx; 256] = [
-    0, 1608, 3216, 4821, 6424, 8022, 9616, 11204, 12785, 14359, 15924, 17479, 19024, 20557, 22078,
-    23586, 25080, 26558, 28020, 29466, 30893, 32303, 33692, 35062, 36410, 37736, 39040, 40320,
-    41576, 42806, 44011, 45190, 46341, 47464, 48559, 49624, 50660, 51665, 52639, 53581, 54491,
-    55368, 56212, 57022, 57798, 58538, 59244, 59914, 60547, 61145, 61705, 62228, 62714, 63162,
-    63572, 63944, 64277, 64571, 64827, 65043, 65220, 65358, 65457, 65516, 65536, 65516, 65457,
-    65358, 65220, 65043, 64827, 64571, 64277, 63944, 63572, 63162, 62714, 62228, 61705, 61145,
-    60547, 59914, 59244, 58538, 57798, 57022, 56212, 55368, 54491, 53581, 52639, 51665, 50660,
-    49624, 48559, 47464, 46341, 45190, 44011, 42806, 41576, 40320, 39040, 37736, 36410, 35062,
-    33692, 32303, 30893, 29466, 28020, 26558, 25080, 23586, 22078, 20557, 19024, 17479, 15924,
-    14359, 12785, 11204, 9616, 8022, 6424, 4821, 3216, 1608, 0, -1608, -3216, -4821, -6424, -8022,
-    -9616, -11204, -12785, -14359, -15924, -17479, -19024, -20557, -22078, -23586, -25080, -26558,
-    -28020, -29466, -30893, -32303, -33692, -35062, -36410, -37736, -39040, -40320, -41576, -42806,
-    -44011, -45190, -46341, -47464, -48559, -49624, -50660, -51665, -52639, -53581, -54491, -55368,
-    -56212, -57022, -57798, -58538, -59244, -59914, -60547, -61145, -61705, -62228, -62714, -63162,
-    -63572, -63944, -64277, -64571, -64827, -65043, -65220, -65358, -65457, -65516, -65536, -65516,
-    -65457, -65358, -65220, -65043, -64827, -64571, -64277, -63944, -63572, -63162, -62714, -62228,
-    -61705, -61145, -60547, -59914, -59244, -58538, -57798, -57022, -56212, -55368, -54491, -53581,
-    -52639, -51665, -50660, -49624, -48559, -47464, -46341, -45190, -44011, -42806, -41576, -40320,
-    -39040, -37736, -36410, -35062, -33692, -32303, -30893, -29466, -28020, -26558, -25080, -23586,
-    -22078, -20557, -19024, -17479, -15924, -14359, -12785, -11204, -9616, -8022, -6424, -4821,
-    -3216, -1608,
+/// VUGSCENE — the sine table, as a QUARTER TURN. `SIN[0..64]` (0..89 degrees) verbatim from the 256-entry
+/// table this replaces; the other three quadrants are reconstructed by [`fsin`] from the two symmetries
+/// `sin(180-x) = sin(x)` and `sin(180+x) = -sin(x)`, which are EXACT on this table (verified entry by
+/// entry against the full 256 before the trim — every one of the 256 reconstructions is bit-identical, so
+/// the deterministic auto path's 300-frame checksum is untouched by construction). Entries are `u16`,
+/// which every one of them fits; the 65th, sin(90) == 1.0 == 0x10000, is the one value that does not and
+/// is returned by the branch in [`fsin`] instead of costing the table a 32-bit element width.
+///
+/// WHY: `.rodata` lives in the `.text` segment here, and this program links against a HARD `.text` ceiling
+/// of 0x2000 (see the SIZE note above `futex_wait`) — one byte past it and `.bss` moves a page, the image
+/// grows 4096 bytes in one step, and `arroyo` rejects it. The full table was 1024 of those bytes for 256
+/// entries of which only 65 are independent. This is 260, and the ~764 bytes it returns are what paid for
+/// the solid-shard renderer below.
+static SIN: [u16; 64] = [
+    0, 1608, 3216, 4821, 6424, 8022, 9616, 11204, 12785, 14359,
+    15924, 17479, 19024, 20557, 22078, 23586, 25080, 26558, 28020, 29466,
+    30893, 32303, 33692, 35062, 36410, 37736, 39040, 40320, 41576, 42806,
+    44011, 45190, 46341, 47464, 48559, 49624, 50660, 51665, 52639, 53581,
+    54491, 55368, 56212, 57022, 57798, 58538, 59244, 59914, 60547, 61145,
+    61705, 62228, 62714, 63162, 63572, 63944, 64277, 64571, 64827, 65043,
+    65220, 65358, 65457, 65516,
 ];
 
-#[inline(always)]
+/// sin(theta) in Q16.16, theta in brads, reconstructed from the quarter table. Bit-identical to the old
+/// 256-entry lookup for every one of the 256 inputs.
+#[inline(never)]
 fn fsin(brad: i32) -> Fx {
-    SIN[(brad & 0xFF) as usize]
+    let i = (brad & 0xFF) as usize;
+    let (j, neg) = if i < 128 { (i, false) } else { (i - 128, true) };
+    let j = if j > 64 { 128 - j } else { j };
+    let v = if j == 64 { ONE } else { SIN[j] as Fx };
+    if neg { -v } else { v }
 }
 #[inline(always)]
 fn fcos(brad: i32) -> Fx {
-    SIN[((brad + 64) & 0xFF) as usize]
+    fsin(brad + 64)
 }
 #[inline(always)]
 fn fmul(a: Fx, b: Fx) -> Fx {
@@ -573,6 +678,292 @@ fn crystal_vertices() -> [(Fx, Fx, Fx); 14] {
     }
     v[13] = (0, -APEX, 0); // bottom apex
     v
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// VUGSCENE — THE SHARD, AS REAL 3D GEOMETRY.
+//
+// Peter's ruling on metal: a lone vug reads 999 fps because its drawing is trivial — "make the damn
+// drawing more complex instead of pacing". Nothing here paces anything. There is no sleep, no frame
+// budget and no rate target in this program, and this arc adds none; what it adds is WORK, so that the
+// number the meter reports is the honest rate of a frame that costs something.
+//
+// WHY A SHARD AND NOT A CUBE OR A TORUS: the machine is a SHARD and the crystal is its mark — the menu
+// bar draws the same gem at 16x22 (`video/menubar.rs::crystal_facet`). This renderer's palette is READ
+// FROM THAT MARK: `theme::CONTROL_CLOSE` (0x3D5F92) is the facet in shadow, `theme::CONTROL_ZOOM`
+// (0x92AAC9) the facet in full light, and `CONTROL_MID` falls out of the interpolation between them. The
+// crystal on a vug window and the crystal in the menu bar are the same object family by construction.
+//
+// WHAT IT DRAWS. An elongated hexagonal bipyramid with IRREGULAR facets — the six girdle radii differ and
+// the two apexes are asymmetric, so it reads as a broken shard rather than a jeweller's stone. 18 facets,
+// one orbiting light, FLAT per-facet shading (the facet is the unit of shading — crisp planes, no
+// smoothing, the low-poly look the ruling asked for) with a hard specular kick as a facet sweeps past the
+// light angle.
+//
+// HOW IT IS RENDERED, AND WHY THIS METHOD. The shard is a CONVEX solid, so it is exactly the intersection
+// of 18 half-spaces — and that representation is the whole renderer:
+//
+//   * THE SOLID IS ITS OWN GEOMETRY. [`PN`]/[`PD`] are the 18 outward unit normals and plane offsets,
+//     derived offline from the shard's 14 vertices and verified to bound every one of them. There is no
+//     vertex list, no face list, no projection and no per-frame setup beyond 18 dot products.
+//   * EACH SAMPLE IS A RAY. [`trace`] clips the sample's ray against the 18 slabs and keeps the last plane
+//     it entered through — the standard analytic ray/convex-polyhedron intersection. The answer is EXACT
+//     hidden-surface removal, which is what convexity buys: no z-buffer (there is no memory for one — a
+//     128x128 depth buffer is 32 KiB against a 16 KiB user window) and no depth sort.
+//   * THE COST IS REAL AND IT IS THE POINT. 18 planes x (one dot product plus one division) per sample is
+//     genuine rendering arithmetic, not padding, and it is where the honest frame time comes from.
+//
+// THE LADDER IS RAY DENSITY. Level 1 casts one ray per 4x4 cell of pixels and fills the cell; level 2 one
+// per 2x2; level 3 one per pixel. Cost scales 1:4:16, which is the range an adaptive ladder needs, and the
+// top rung is real quality rather than invented cost: the compositor UPSCALES this 128x128 surface onto a
+// 1920x1200 panel, so every facet edge is magnified and a resolved edge is the difference the eye sees.
+//
+// THE FLOOR RUNG IS THE CLASSIC WIREFRAME, byte for byte — level 0 is [`render_wire`], the program's
+// original drawing, unmoved and unedited. That keeps the old fps baselines comparable, and it is what the
+// deterministic auto path renders (it is PINNED to level 0 — see `_start`), so the 300-frame surface
+// checksum 0xe68285b85121ac7c that `scripts/specs/pi4-regression.spec` asserts is untouched.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+const NP: usize = 18;
+
+/// The shard, as 18 outward-facing half-spaces: a point is inside iff `dot(PN[i], p) <= PD[i]` for every
+/// `i`. Six crown facets, six girdle facets, six pavilion facets.
+///
+/// GENERATED, NOT HAND-WRITTEN. The numbers come from the 14-vertex shard (an elongated hexagonal
+/// bipyramid with per-girdle-vertex radius scales `[64, 50, 70, 55, 74, 58]/64` and a bottom apex at 0.62
+/// of the top one) by cross-producting each facet's edges and normalising; every one of the 14 vertices
+/// then satisfies every one of the 18 inequalities to within rounding, which is the check that the table
+/// really does describe a closed convex solid. Anyone changing the shard regenerates BOTH tables and
+/// re-runs that check — a table that does not bound the solid makes [`trace`] return nonsense rather than
+/// fail, which is the failure mode worth being loud about.
+///
+/// Normals are Q0.15 (`i16`, 1.0 == 32767) purely for `.text`: `.rodata` lives in the text segment and
+/// this program links against a hard 0x2000 ceiling (see the SIZE note above `futex_wait`). [`pn`]
+/// widens them back to Q16.16 at the one place they are read.
+static PN: [i16; NP * 3] = [
+    19952, 18778, 17971, 7397, 19036, 25624, -24678, 19960, 8142,
+    -24890, 20132, -6991, 5230, 20633, -24912, 21278, 20027, -14827,
+    24347, 0, 21930, 9088, 0, 31481, -31117, 0, 10267,
+    -31546, 0, -8861, 6733, 0, -32068, 26884, 0, -18733,
+    12007, -28505, 10815, 4413, -28645, 15287, -14272, -29117, 4709,
+    -14313, -29200, -4020, 2958, -29435, -14090, 12279, -29150, -8556,
+];
+/// Plane offsets in Q16.16, one per normal above. `u16`, which every one of them fits — see [`PN`]
+/// for why a table in this program is measured in bytes.
+static PD: [u16; NP] = [
+    50703, 51399, 53894, 54358, 55710, 54074, 38956, 39760, 42788,
+    43378, 45152, 43016, 47718, 47952, 48743, 48882, 49275, 48797,
+];
+
+/// Facet `i`'s outward unit normal, widened from Q0.15 to Q16.16.
+#[inline(always)]
+fn pn(i: usize) -> (Fx, Fx, Fx) {
+    // UNCHECKED: `i < NP` at every call site and the table is `NP * 3` long. This is read 18 times per
+    // traced ray, so the bounds checks would be both the innermost branch in the program and `.text` the
+    // 0x2000 ceiling has no room for.
+    unsafe {
+        let p = PN.as_ptr().add(i * 3);
+        ((*p as Fx) << 1, (*p.add(1) as Fx) << 1, (*p.add(2) as Fx) << 1)
+    }
+}
+
+/// The detail ladder's top rung. Level 0 is the classic wireframe; 1..=3 are the shard at rising ray
+/// density (see [`LOD_BLK`]).
+const LOD_MAX: u32 = 3;
+/// Pixels per traced CELL at level `lod`: `1 << (LOD_MAX - lod)`, so level 1 casts one ray per 4x4 cell
+/// and fills it, level 2 one per 2x2, level 3 one per pixel. Cost scales 1:4:16. Every value divides 64
+/// (the worker band height) and 128 (the surface width), so a cell never straddles a band boundary or the
+/// right edge.
+#[inline(always)]
+fn lod_blk(lod: u32) -> i32 {
+    1 << (LOD_MAX - lod)
+}
+
+/// How much larger the shard is drawn than the wireframe's inherited framing — see [`scene_setup`].
+const SCENE_ZOOM: Fx = 2;
+
+/// The gem ramp, read from the menu bar's crystal — `theme::CONTROL_CLOSE` to `theme::CONTROL_ZOOM`.
+static GEM: [(i32, i32); 3] = [(0x3D, 0x92), (0x5F, 0xAA), (0x92, 0xC9)];
+
+/// Per-frame, per-facet state published by the parent and read by the workers: the plane's offset measured
+/// from THIS frame's eye (the numerator [`trace`] needs), and the facet's shaded colour ALREADY PACKED as
+/// the pixel the surface wants, so a traced cell is one load and one store.
+static mut FC: [Fx; NP] = [0; NP];
+static mut FCOL: [u32; NP] = [0; NP];
+/// The frame's ray basis in the SHARD's own frame — the object-space images of the world x, y and z axes —
+/// and the image-plane distance. Published with the same release/acquire edge on `PHASE` that already
+/// publishes `PX`/`PY`, so a worker that has acquired the frame has acquired these too.
+static mut RB: [(Fx, Fx, Fx); 3] = [(0, 0, 0); 3];
+static mut RDZ: Fx = 0;
+/// The detail level the workers must render THIS frame.
+static LOD: AtomicU32 = AtomicU32::new(0);
+
+/// Apply the INVERSE of the frame's rotation to `v` — the transpose of `Rx(ax) * Ry(ay)`, which carries a
+/// world-space direction into the shard's own frame.
+///
+/// Doing it this way round is the arc's central economy: the shard never moves. Three basis vectors and
+/// one eye per frame put the whole scene in object space, where the 18 planes are CONSTANTS — so a frame
+/// costs 18 dot products of setup rather than a transform per facet, and the ray loop reads a static table.
+#[inline(always)]
+fn inv_rot(v: (Fx, Fx, Fx), sy: Fx, cy: Fx, sx: Fx, cx: Fx) -> (Fx, Fx, Fx) {
+    let (x, y, z) = v;
+    let y1 = fmul(y, cx) + fmul(z, sx);
+    let z1 = fmul(z, cx) - fmul(y, sx);
+    (fmul(x, cy) + fmul(z1, sy), y1, fmul(z1, cy) - fmul(x, sy))
+}
+
+#[inline(always)]
+fn dot3(a: (Fx, Fx, Fx), b: (Fx, Fx, Fx)) -> Fx {
+    fmul(a.0, b.0) + fmul(a.1, b.1) + fmul(a.2, b.2)
+}
+
+/// Per frame, in the PARENT, before the workers are released: build the ray basis, then shade all 18
+/// facets against the orbiting light.
+///
+/// `lt` is the light's orbit angle in brads, advanced once per frame by the caller so a glint SWEEPS
+/// across the facets rather than sitting wherever the tumble happens to leave it. Frame-based like the
+/// idle tumble, so it needs no clock and cannot drift against the picture.
+#[inline(never)]
+fn scene_setup(ay: i32, ax: i32, dist: Fx, lt: i32) {
+    let (sy, cy) = (fsin(ay), fcos(ay));
+    let (sx, cx) = (fsin(ax), fcos(ax));
+    // The eye sits at world (0, 0, -dist) — the same camera the wireframe projection uses.
+    let eye = inv_rot((0, 0, -dist), sy, cy, sx, cx);
+    // The light rides a tilted orbit; the constants are the unit form of (sin, 0.5, cos), whose length is
+    // 1.118 — so 0.894 and 0.447 in Q16.16.
+    let lo = inv_rot(
+        (fmul(fsin(lt), 58598), 29294, fmul(fcos(lt), 58598)),
+        sy, cy, sx, cx,
+    );
+    unsafe {
+        let rb = &mut *core::ptr::addr_of_mut!(RB);
+        rb[0] = inv_rot((ONE, 0, 0), sy, cy, sx, cx);
+        rb[1] = inv_rot((0, ONE, 0), sy, cy, sx, cx);
+        rb[2] = inv_rot((0, 0, ONE), sy, cy, sx, cx);
+        // The image plane, in the same "pixel" units the wireframe projection uses — `FOCAL * dist` is
+        // exactly that path's scale, and SCENE_ZOOM is the one place the two differ.
+        //
+        // WHY THEY DIFFER. The wireframe's framing was inherited from a 32x32 compat surface and leaves the
+        // crystal occupying about 40x48 px of 128x128 — eight per cent of the surface, which is the right
+        // choice for an outline (the lines are the picture, and they need room to read) and the wrong one
+        // for a solid the compositor is about to blow up onto a 1920x1200 panel. The shard is drawn at
+        // SCENE_ZOOM so it fills its window: more of the frame is the object, which is both the deliberate
+        // look and, not incidentally, more rays that hit something.
+        RDZ = FOCAL * SCENE_ZOOM * dist;
+        let mut i = 0usize;
+        while i < NP {
+            let n = pn(i);
+            *(&mut *core::ptr::addr_of_mut!(FC)).get_unchecked_mut(i) = *PD.get_unchecked(i) as Fx - dot3(n, eye);
+            // Lambert against the orbiting light, plus a hard specular kick: the top half of the diffuse
+            // range remapped to 0..1 and raised to the fourth power, so a facet glints only as it sweeps
+            // through the light and the glint has an edge rather than a bloom.
+            let diff = dot3(n, lo).clamp(0, ONE);
+            let t = (diff - ONE / 2).max(0) * 2;
+            let t2 = fmul(t, t);
+            let spec = fmul(t2, t2);
+            let mut c: u32 = 0xFF;
+            let mut k = 0usize;
+            while k < 3 {
+                let (a, b) = *GEM.get_unchecked(k);
+                let v = a + (((b - a) * diff) >> 16);
+                c = (c << 8) | (v + (((255 - v) * spec) >> 16)) as u32;
+                k += 1;
+            }
+            *(&mut *core::ptr::addr_of_mut!(FCOL)).get_unchecked_mut(i) = c;
+            i += 1;
+        }
+    }
+}
+
+/// Trace one ray against the shard. `d` is the ray direction in the shard's own frame, unnormalised — the
+/// slab test is scale-invariant, which is why nothing here needs a square root. Returns the facet index
+/// hit, or `NP` for a miss.
+///
+/// Slab clipping: for each plane, `t = (PD - dot(n, eye)) / dot(n, d)`, with the numerator already folded
+/// into `FC` by [`scene_setup`]. A negative denominator means the ray is ENTERING that half-space, so its
+/// `t` is a lower bound and the LAST such plane is the surface the ray meets; a positive one is an upper
+/// bound. The ray misses when the bounds cross. A denominator near zero is a ray parallel to the plane —
+/// a miss outright if the eye is on the outside of it, ignorable otherwise.
+///
+/// `t` is formed with a 24-bit shift rather than 16: the comparisons are what decide which facet a pixel
+/// belongs to, and at 16 bits the quotient lands around 1e3, which is not enough resolution to separate
+/// two nearly-tangent planes at a silhouette.
+#[inline(never)]
+unsafe fn trace(d: (Fx, Fx, Fx)) -> usize {
+    let fc = &*core::ptr::addr_of!(FC);
+    let mut tn: i64 = i64::MIN / 4;
+    let mut tf: i64 = i64::MAX / 4;
+    let mut hit = NP;
+    let mut i = 0usize;
+    while i < NP {
+        let den = dot3(pn(i), d);
+        let num = *fc.get_unchecked(i);
+        if den > -16 && den < 16 {
+            if num < 0 {
+                return NP; // parallel, and the eye is outside this plane — the ray never enters
+            }
+        } else {
+            let t = ((num as i64) << 24) / den as i64;
+            if den < 0 {
+                if t > tn {
+                    tn = t;
+                    hit = i;
+                }
+            } else if t < tf {
+                tf = t;
+            }
+        }
+        i += 1;
+    }
+    // Crossed bounds mean the ray passes outside the solid; `tn <= 0` means the solid is behind the eye.
+    // Both are tested ONCE, after the loop: an early exit inside it would put a branch under every plane
+    // of every ray to save arithmetic on the rays that miss, which is the wrong trade in both directions.
+    if tn > tf || tn <= 0 {
+        return NP;
+    }
+    hit
+}
+
+/// Render one worker's band of the SOLID shard at detail level `lod` (1..=`LOD_MAX`).
+///
+/// One pass, no clear: every traced cell is either shard or backdrop, and a cell is filled with the one
+/// colour its ray returned.
+unsafe fn render_solid(surf: *mut u8, y_lo: i32, y_hi: i32, lod: u32) {
+    let blk = lod_blk(lod);
+    let half = blk * (ONE / 2); // the cell's centre, in Q16.16 pixels
+    let rb = &*core::ptr::addr_of!(RB);
+    let (ux, uy, uz) = (rb[0], rb[1], rb[2]);
+    let dz = RDZ;
+    let fcol = &*core::ptr::addr_of!(FCOL);
+    let mut by = y_lo;
+    while by < y_hi {
+        let py = SH * ONE / 2 - (by * ONE + half);
+        let mut bx = 0i32;
+        while bx < SW {
+            let px = bx * ONE + half - SW * ONE / 2;
+            // The world-space ray through this cell's centre, carried into the shard's frame by the
+            // published basis. Unnormalised on purpose — the slab test is scale-invariant.
+            let d = (
+                fmul(px, ux.0) + fmul(py, uy.0) + fmul(dz, uz.0),
+                fmul(px, ux.1) + fmul(py, uy.1) + fmul(dz, uz.1),
+                fmul(px, ux.2) + fmul(py, uy.2) + fmul(dz, uz.2),
+            );
+            let h = trace(d);
+            let c = if h < NP { *fcol.get_unchecked(h) } else { BG };
+            let mut fy = by;
+            while fy < by + blk {
+                let row = surf.add((fy as usize) * STRIDE) as *mut u32;
+                let mut fx = bx;
+                while fx < bx + blk {
+                    row.add(fx as usize).write_volatile(c);
+                    fx += 1;
+                }
+                fy += 1;
+            }
+            bx += blk;
+        }
+        by += blk;
+    }
 }
 
 /// The 30 wireframe edges (vertex index pairs).
@@ -616,13 +1007,62 @@ static mut PX: [i32; 14] = [0; 14]; // projected pixel X per vertex
 static mut PY: [i32; 14] = [0; 14]; // projected pixel Y per vertex
 
 const PHASE_EXIT: u32 = u32::MAX;
-/// VUGPAUSE-2: `SYS_YIELD` passes a worker spends polling `PHASE` before it parks on it. Sized to be
-/// unreachable on the rendering path — a worker waits one projection plus one present between frames, a
-/// handful of passes even on a loaded machine — and trivially reachable on the idle path, where the parent
-/// stops releasing frames entirely. Erring long is the safe direction: an over-long spin costs an idling
-/// vug a few milliseconds of yielding ONCE per idle interval, while too short a spin puts a park/wake pair
-/// in the middle of every rendered frame, which is the shape that failed the checksum run.
-const WORKER_SPIN_YIELDS: u32 = 4096;
+/// VUGPAUSE-2: `SYS_YIELD` passes a worker spends polling `PHASE` before it parks on it.
+///
+/// ⚠ VUGSPIN — 4096 -> 64 AS WASTE-REMOVAL AND INSTRUMENT HYGIENE. **NOT a frame-rate conviction.**
+///
+/// An earlier draft of this note convicted this loop of causing the 19.6/s frame rate. **That conviction
+/// was WITHDRAWN under review, and the refutation is recorded here rather than deleted**, because the
+/// number that refutes it is the same one that motivates the change.
+///
+/// WHAT IS TRUE — the budget is genuinely wasted. Boot A
+/// (`~/unaos-bench/capture/gr25-bootA/ttyUSB0.log`), summing per-core `sw` deltas in `[schedx86] load`
+/// over one 11.25 s window, gives **1.45 M context switches/s** on eight cores, against `[spread] cr3sw`
+/// of 2 550/s over the same window. Against `[wpace] rollup rate ≈ 450/s` that is ~3 200 switches per
+/// presented frame, i.e. **~1 600 passes of this loop per worker per frame — 39 % of the 4096 budget,
+/// which is never reached, so a worker on the bench NEVER parks here.** The old sizing premise is quoted
+/// verbatim because it is the part that is false: *"a worker waits one projection plus one present
+/// between frames, a handful of passes even on a loaded machine"*. Sixteen hundred is not a handful.
+/// Spinning 1 600 times to wait for an event is waste whether or not it is the bottleneck, and
+/// `SYS_YIELD` is only cheap when the core has nothing else to run.
+///
+/// ⚠ THE ATTRIBUTION IS AN UPPER BOUND, STATED NOT SHOWN. 99.8 % of those switches do not change `cr3`,
+/// which places them inside SOME address space's own threads. That bounds the yield loops as a class; it
+/// does NOT separate this loop from the parent's `BARRIER_SPIN_YIELDS` spin, and nothing in the capture
+/// does. Read "~1 600 per worker per frame" as an upper bound on this loop's share.
+///
+/// WHY IT IS NOT THE FRAME RATE — **the period is LOAD-INVARIANT**, which a congestion collapse cannot be:
+///
+///   * at 43 916 ms: two windows, every core 0–3 %, **~1 980 switches/s** — and `[wcn] win=3` reads
+///     `rate=19.2/s gap=52..52ms`.
+///   * at 804 512 ms: ten windows, cores 60–85 %, **~1.45 M switches/s** — and the same window reads
+///     `rate=19.6/s gap=51..51ms`.
+///
+/// **A 731x change in machine load moved the frame period from 52 ms to 51 ms — it got 2 % FASTER.** A
+/// self-sustaining spin collapse would lengthen the frame as load rose; this does the opposite, and it is
+/// flat to the millisecond across 112 `[wcn]` samples spanning the whole boot. Note also `51 ms / 16 667 us
+/// = 3.06` — three panel frames almost exactly. That is the signature of a CADENCE LOCK in the
+/// present/composite path, not of a scheduler or spin equilibrium. The primary suspect is the compositor:
+/// `[wcn]` shows `comp` far above `att` (win=10: `att=253 comp=1858`, `comp_rate=365/s`), i.e. every
+/// window is recomposited on every other window's present. That investigation is a `wm.rs` arc and is
+/// deliberately NOT attempted here.
+///
+/// So this is sized the way `BARRIER_SPIN_YIELDS` already is — as a LATENCY threshold, not a rate — and
+/// the honest claim for it is: less waste, and an instrument that no longer hides a park behind a budget
+/// too large to reach.
+///
+/// ⚠ WHAT 64 ACTUALLY MEANS ON THE BENCH, SAID PLAINLY. On a 51 ms frame a worker exhausts 64 passes long
+/// before the release arrives, so **every worker now parks and is woken once per frame, BY DESIGN**. That
+/// is the intended trade: two futex round trips per frame instead of ~1 600 yields, on a machine with idle
+/// cores to dispatch to. The "the rendering path never gets past the spin" claim in `uvug_worker` is
+/// therefore **QEMU-SCOPED** from here on — true on an unloaded fixture machine, false on the bench.
+///
+/// WHAT IS DELIBERATELY NOT CHANGED: the spin still EXISTS. `uvug_worker` records that a pure
+/// `futex_wait` here failed the 300-frame checksum run on raspi4b with all three tasks parked at the kill.
+/// That result convicted a BARE park (budget 0), not a small one, and 64 passes keeps the release
+/// direction off the park on any unloaded machine — which is every fixture and battery leg. The checksum
+/// witness passing at 64 is what licenses the value.
+const WORKER_SPIN_YIELDS: u32 = 64;
 /// VUG-PACE: the PARENT's mirror of `WORKER_SPIN_YIELDS` — `SYS_YIELD` passes the frame barrier spends
 /// polling `DONE` before it parks on it. Two orders smaller than the worker's on purpose: this budget is
 /// spent EVERY frame on a healthy run rather than once per idle interval, so it is sized as a latency
@@ -682,9 +1122,23 @@ unsafe fn draw_line(surf: *mut u8, mut x0: i32, mut y0: i32, x1: i32, y1: i32, y
     }
 }
 
+/// Render one worker's band for a frame, at whatever detail level the parent published for it.
+///
+/// VUGSCENE: the dispatch is the WHOLE of the ladder as far as a worker is concerned — level 0 is the
+/// classic wireframe (below, unchanged), every other level is the solid shard. Read once per band, so a
+/// level change lands on a frame boundary and never inside one.
+unsafe fn render_band(surf: *mut u8, y_lo: i32, y_hi: i32) {
+    let lod = LOD.load(Ordering::Acquire);
+    if lod > 0 {
+        render_solid(surf, y_lo, y_hi, lod);
+        return;
+    }
+    render_wire(surf, y_lo, y_hi)
+}
+
 /// Render one worker's band for a frame: clear the band to BG, then draw every crystal edge clipped to
 /// the band from the shared projected coordinates.
-unsafe fn render_band(surf: *mut u8, y_lo: i32, y_hi: i32) {
+unsafe fn render_wire(surf: *mut u8, y_lo: i32, y_hi: i32) {
     // Clear the band.
     let mut y = y_lo;
     while y < y_hi {
@@ -735,6 +1189,14 @@ extern "C" fn uvug_worker(arg: usize) -> ! {
         // parent has stopped releasing frames altogether, which is exactly the VUGPAUSE/VUGMIN idle this
         // arc is about, and it is reached once per idle interval rather than once per frame.
         //
+        // ⚠ VUGSPIN (review D8): THE PARAGRAPH ABOVE IS NOW QEMU-SCOPED, and is kept because its ARGUMENT
+        // (why the release direction cannot be a bare park) still stands. Its CLAIM — "the rendering path
+        // never gets past them", "reached once per idle interval rather than once per frame" — was written
+        // for a 4096-pass budget on an unloaded fixture machine. At 64 passes on a 51 ms bench frame, every
+        // worker exhausts the spin and PARKS ONCE PER FRAME, by design: two futex round trips beat ~1600
+        // yields when there are idle cores to dispatch to. Read this paragraph as true of the fixture legs
+        // and false of the bench; see `WORKER_SPIN_YIELDS` for the measurement and the trade.
+        //
         // Lost-wakeup-safe: `futex_wait` compares `PHASE` against the value just read, under the same
         // bucket lock the parent's `wake_phase` takes, so a release landing between the load and the wait
         // returns `Mismatch` instead of parking. Kill-safe: this is KILLBOUND's futex, the same one the
@@ -771,10 +1233,11 @@ extern "C" fn uvug_worker(arg: usize) -> ! {
 // ---------------------------------------------------------------------------------------------
 // Input decode (SYS_INPUT_POLL packed u64; see docs userspace.md ELF-5).
 // ---------------------------------------------------------------------------------------------
-const EV_KEYDOWN: u64 = 1;
-const EV_KEYUP: u64 = 2;
-const EV_MOUSE_REL: u64 = 3;
-const EV_BUTTON: u64 = 5;
+// ABIFREEZE: the packed-event type tags, imported from the crate the kernels pack them with.
+use una_abi::{
+    INPUT_EV_BUTTON as EV_BUTTON, INPUT_EV_KEY_DOWN as EV_KEYDOWN, INPUT_EV_KEY_UP as EV_KEYUP,
+    INPUT_EV_MOUSE_REL as EV_MOUSE_REL,
+};
 
 // Held-state bits.
 const H_YAW_L: u32 = 1 << 0;
@@ -793,12 +1256,26 @@ const H_PAUSE: u32 = 1 << 6;
 /// manual control, or holding the pause key would silently stop the idle tumble of an unpaused vug.
 const H_MOTION: u32 = H_YAW_L | H_YAW_R | H_PIT_U | H_PIT_D | H_ZOOM_IN | H_ZOOM_OUT;
 
+/// VUGPAUSE-KEYUP: has this program EVER been delivered an `EV_KEYUP`? One-way, 0 -> 1. It is the
+/// evidence that decides whether the REST of the held word can be trusted — see the note at the
+/// `H_PAUSE` toggle in `drain_input`.
+///
+/// It rides the held word instead of getting a static of its own because a static costs this program
+/// 4096 bytes — `.bss` gains a page, measured — and `VUG-X86.ELF` is built against a HARD 16384-byte
+/// EL0 user window that the 12568-byte binary has under 4 KiB of headroom in. A spare bit in a `u32`
+/// already passed by `&mut` everywhere it is needed costs nothing.
+///
+/// It is NOT a key bit and must never be treated as one: `key_bit` cannot return it, `H_MOTION`
+/// excludes it, and the ONE place that clears the word wholesale — `EV_BUTTON`'s hot-unplug net —
+/// preserves it explicitly. A click must not make this program forget what it learned about its
+/// keyboard.
+const H_SAW_KEYUP: u32 = 1 << 7;
+
 // HID-KEYS arrow C0 codes (see vug.rs), ESC, and CLICK-ONE's pause key.
-const K_RIGHT: u8 = 0x1C;
-const K_LEFT: u8 = 0x1D;
-const K_DOWN: u8 = 0x1E;
-const K_UP: u8 = 0x1F;
-const K_ESC: u8 = 0x1B;
+// ABIFREEZE: the arrow block's C0 codes are the kernel input router's, imported.
+use una_abi::{
+    KEY_DOWN as K_DOWN, KEY_ESC as K_ESC, KEY_LEFT as K_LEFT, KEY_RIGHT as K_RIGHT, KEY_UP as K_UP,
+};
 /// CLICK-ONE: SPACE toggles pause. Chosen because it is UNBOUND here — `key_bit` maps WASD/arrows,
 /// Q/E and the +/- family and nothing else, and ESC is handled ahead of it — so no existing gesture
 /// changes meaning. It is also the conventional pause key, and the xHCI table delivers it as plain
@@ -885,8 +1362,8 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
             break; // -EAGAIN: ring empty
         }
         fi.any = true;
-        let ty = (ev >> 48) & 0xFF;
-        let lo = ev & 0xFFFF_FFFF;
+        let ty = una_abi::input_ev_type(ev);
+        let lo = una_abi::input_ev_payload(ev);
         match ty {
             EV_KEYDOWN => {
                 let k = (lo & 0xFF) as u8;
@@ -897,6 +1374,31 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
                     // CLICK-ONE: SPACE toggles on the TRUE press edge — a bit that is not already set.
                     // Every later KeyDown for a key still down is a typematic repeat and is absorbed by
                     // the `|=` below, exactly as it always has been for the motion keys.
+                    //
+                    // VUGPAUSE-KEYUP — and the edge test is SUSPENDED while this program has never been
+                    // shown a release. Boot AJ is what that costs otherwise: the kernel's EHCI decoder
+                    // emitted presses only, so `H_PAUSE` was set by the first SPACE and NOTHING could
+                    // ever clear it (`EV_KEYUP` below is the sole writer that does). Pause latched on,
+                    // `frozen` latched on, and the vug had to be killed. The decoder is fixed in the
+                    // same arc, and this is the ring-3 half of the belt: an app should not be one
+                    // driver bug away from a state its operator cannot leave.
+                    //
+                    // WHY IT IS CONDITIONED ON `H_SAW_KEYUP` RATHER THAN JUST DELETING THE `!*held`
+                    // TERM. Deleting it would toggle pause 25 times a second on aarch64, where
+                    // `pal.rs`'s typematic engine SYNTHESISES a KeyDown every 40 ms under a resting
+                    // thumb — the exact reason the edge test was written (see `H_PAUSE`). One bit of
+                    // evidence tells the two worlds apart with no `cfg` and no guesswork: a program that
+                    // has received even ONE release is on a path whose releases work, so its held state
+                    // is true and the edge test is right; a program that has never received one cannot
+                    // trust `*held` at all, and a level-free toggle is strictly better than a wedge.
+                    // The bit is one-way — a keyboard that emits releases does not stop — so the
+                    // fallback ends for good at the first release and never oscillates.
+                    //
+                    // The suspension is implemented at the BOTTOM of this function rather than as a
+                    // second term here: retiring `H_PAUSE` from the held word once per drain is one
+                    // test-and-mask outside the event loop, and this program is 45 bytes of `.text`
+                    // from a hard 16 KiB image ceiling (see `H_SAW_KEYUP`). The behaviour differs only
+                    // for two SPACE presses inside ONE drain, which no human hand produces.
                     if b & !*held & H_PAUSE != 0 {
                         fi.pause_keys += 1;
                     }
@@ -904,6 +1406,10 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
                 }
             }
             EV_KEYUP => {
+                // VUGPAUSE-KEYUP: the evidence bit. Set from ANY release, mapped or not — the question
+                // it answers is "does this input path deliver releases at all?", which a release for a
+                // key this program does not bind answers just as well as one for a key it does.
+                *held |= H_SAW_KEYUP;
                 let k = (lo & 0xFF) as u8;
                 let b = key_bit(k);
                 if b != 0 {
@@ -924,8 +1430,11 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
                 // bool and an i32 through two.
                 if mask != 0 {
                     *drag = 1;
-                    // Press edge also clears held keys — the vug.rs hot-unplug net.
-                    *held = 0;
+                    // Press edge also clears held keys — the vug.rs hot-unplug net. VUGPAUSE-KEYUP:
+                    // every KEY bit goes, and the evidence bit stays. What the net exists to undo is a
+                    // key whose release never arrived; what this program has learned about whether
+                    // releases arrive AT ALL is not held state and a click is no evidence against it.
+                    *held &= H_SAW_KEYUP;
                 } else {
                     if *drag <= CLICK_THRESH {
                         fi.clicks += 1;
@@ -944,6 +1453,41 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
             }
             _ => {}
         }
+    }
+    // VUGPAUSE-KEYUP: on an input path that has never delivered a release, `H_PAUSE` is not allowed to
+    // persist past the drain that set it — nothing else would ever clear it, and a latched bit turns
+    // the press-edge test above into a one-way switch (Boot AJ: pause on, never off, kill the app).
+    // Retiring it here rather than suppressing the edge test per event costs one mask per drain and
+    // keeps the aarch64 typematic absorption exactly as it is: there, `H_SAW_KEYUP` is set by the first
+    // key release the operator ever makes, and this line stops firing for the rest of the run.
+    //
+    // THE ONE RESIDUE, and its true scope — stated rather than hidden, and NARROWER on one arch than
+    // the other for a reason worth knowing at a bench.
+    //
+    // Until the first release, a release-emitting path is indistinguishable from a release-less one,
+    // so a SPACE held past `DELAY_MS` (400 ms) as the VERY FIRST key of a run would see its
+    // synthesised repeats toggle pause. It costs one keystroke to leave and cannot recur — any
+    // release at all, of any key, ends it for the process's lifetime.
+    //
+    //   * On x86 it is unreachable in the launch flow, and that is a property of the kernel rather
+    //     than luck. `SYS_WIN_CREATE` grants focus to the first window while the shell is idle
+    //     (`:: wc-x86: input focus -> slot N (first window, shell was idle) ::`), and x86's
+    //     `user_input_set_active` deliberately does NOT drain `pal::EVENT_QUEUE`. So the RELEASE of
+    //     the Enter that launched the program — tens of milliseconds behind its press, well inside a
+    //     human key hold — routes into the freshly focused ring and sets this bit long before any
+    //     400 ms delay could expire. (Since the keyrepeat arc x86 runs the shared typematic
+    //     synthesiser too — its repeats land here and are absorbed by the same press-edge test.)
+    //   * On aarch64 — the arch where the repeat engine that makes this matter actually LIVES — that
+    //     mitigation does NOT transfer, and assuming it did would be the comfortable wrong answer.
+    //     `user_input_set_active` there drains and DISCARDS the pre-launch queue on purpose
+    //     (UVUG-8r2: `[uvug8] focus asid=N — discarded K pre-launch event(s) from EVENT_QUEUE`),
+    //     precisely so the launch keystroke is not mistaken for in-app interaction — and the
+    //     launching Enter's release is one of the events it throws away. So the first release this
+    //     program sees on the Pi is a genuinely in-app one, and the residue stands exactly as written
+    //     above: first key of the run, held past 400 ms, pause flickers and settles on the parity of
+    //     the repeat count. Bounded, self-ending, one tap to correct.
+    if *held & H_SAW_KEYUP == 0 {
+        *held &= !H_PAUSE;
     }
     fi
 }
@@ -1021,15 +1565,27 @@ fn stall_witness(latch: &AtomicU32, frame: u32, tail: &[u8], value: u32) {
 // The stagger observation (s1p: replacement vugs visibly outpace the originals) needs a PER-VUG
 // number, and the serial line cannot carry one per frame for six windows. So each vug measures and
 // draws its own rate in its top-left corner: frames presented per second, from `SYS_GETINFO`'s
-// `ticks` field (the 250 Hz scheduler tick — the only EL0-reachable clock; CNTVCT_EL0 is not
-// EL0-enabled). One getinfo per frame is one syscall beside the existing input poll; the displayed
-// value refreshes once per second, so the digits are readable rather than flickering.
+// `ticks` field — the only ring-3-reachable clock on either arch (CNTVCT_EL0 is not EL0-enabled).
+// ABIFREEZE D1: that field's RATE is per-arch (250 Hz scheduler tick on aarch64, 1 kHz on x86), which
+// is exactly what this code used to get wrong, so the divisor comes from `una_abi::GETINFO_TICK_HZ`
+// and not from a number written here. One getinfo per frame is one syscall beside the existing input
+// poll; the displayed value refreshes once per second — a real second on both arches now — so the
+// digits are readable rather than flickering.
 //
 // CHECKSUM DISCIPLINE: the overlay is drawn ONLY when `detached || interactive` — a desktop
 // (`bg`) or operator-driven vug. The FOREGROUND auto path (every fixture/battery leg, the QEMU
 // 300-frame checksum witness) takes neither branch and its surface stays byte-identical.
 // ---------------------------------------------------------------------------------------------
-const TICK_HZ: u32 = 250; // kernel scheduler tick rate (timer.rs TICK_HZ)
+/// ABIFREEZE (divergence D1): the rate of `SYS_GETINFO`'s `ticks` field — IMPORTED, because it is
+/// NOT the same number on both arches and this constant used to claim it was.
+///
+/// It read `const TICK_HZ: u32 = 250` with the comment "kernel scheduler tick rate", which is exactly
+/// right on aarch64 and wrong on x86, where the field is filled from `arch::ticks()` at
+/// `apic::TICK_HZ` = 1000 Hz (one tick per millisecond). VUG-X86.ELF therefore divided a one-second
+/// frame count by 250 and drew an fps figure FOUR TIMES TOO LOW on the panel — and refreshed it four
+/// times a second while the comment below still says "once per second". Neither kernel's clock moves
+/// (both are shipped behaviour); the divisor now comes from the ABI and is correct on either arch.
+const TICK_HZ: u32 = una_abi::GETINFO_TICK_HZ as u32;
 const FPS_C: u32 = 0xFFE8_C98A; // fps digits — warm amber, same as user-stat's pid
 
 /// 5x7 digit glyphs, one byte per row, bit 4 = leftmost column (verbatim from user-stat).
@@ -1063,7 +1619,8 @@ unsafe fn draw_digit(surf: *mut u8, d: usize, x: i32, y: i32, color: u32) {
     }
 }
 
-/// `SYS_GETINFO` -> the kernel's 250 Hz tick count, or 0 on error (a 0 delta just skips the update).
+/// `SYS_GETINFO` -> the kernel's tick count at `TICK_HZ` (250 Hz aarch64 / 1 kHz x86 — ABIFREEZE D1),
+/// or 0 on error (a 0 delta just skips the update).
 fn getinfo_ticks() -> u64 {
     let mut info = [0u64; 2]; // {pid, ticks}, #[repr(C)] — see kernel sys_getinfo
     let p = info.as_mut_ptr() as u64;
@@ -1079,6 +1636,90 @@ const FPS_BOX_W: i32 = 3 * 6 + 3;
 const CLICK_X: i32 = FPS_BOX_W + 3;
 /// CLICK-PLAIN: click-counter digits — cool cyan, so the two numbers in the corner never read as one.
 const CLICK_C: u32 = 0xFF6C_D8E8;
+/// VUGSCENE: the detail-level readout sits third in the same band, in the gem ramp's lit tone — the
+/// number belongs to the crystal, so it is drawn in the crystal's colour.
+const LOD_X: i32 = CLICK_X + FPS_BOX_W + 3;
+const LOD_C: u32 = 0xFF92_AAC9;
+
+// ---------------------------------------------------------------------------------------------
+// VUGSCENE — THE ADAPTIVE DETAIL LADDER.
+//
+// The ruling: full scene on a machine that can carry it, stepped down on one that cannot, the classic
+// cheap pattern as the floor. Adaptation changes WORK PER FRAME and never the rate — there is no sleep
+// anywhere in this program and this arc adds none. The rate is whatever the chosen work costs.
+//
+// THE CLOCK IS THE METER'S OWN. `fps_refresh` already closes a one-second window off `SYS_GETINFO`'s tick
+// field (the only ring-3-reachable clock on either arch) and returns frames-per-second; the ladder
+// consumes exactly that number, on exactly that window, and adds NO syscall and no second time source.
+// That also means the meter contract is untouched: the ladder reads the meter, it does not write it.
+//
+// HYSTERESIS, in two parts, because one is not enough:
+//   * A DEAD BAND. Step down below `LOD_DOWN`, step up only above `LOD_UP`, and the gap between them is
+//     wide enough that no single level can sit on both edges.
+//   * A CEILING WITH A COOL-DOWN. A step down PINS the ceiling at the level it fell to, so the ladder
+//     cannot immediately climb back into the level that just failed and oscillate there. The ceiling
+//     relaxes by one rung only after `CALM_WINDOWS` consecutive quiet seconds — long enough that a
+//     recovery is a real change in the machine and not the gap between two frames.
+// A machine that is far too slow drops TWO rungs in one window (levels cost ~L^2, so one rung at a time
+// would crawl), which is what keeps the calibration inside the couple of seconds the ruling asked for.
+const LOD_DOWN: u32 = 24;
+const LOD_UP: u32 = 55;
+const CALM_WINDOWS: u32 = 8;
+
+/// VUGSCENE — THE MANUAL PIN, for benchmarking, and the reason it is a BUILD feature rather than a flag.
+///
+/// `bg`/`run` take a path and nothing else (`shell.rs`: `match args.first()`), so there is no argv channel
+/// into an EL0 program on either arch — a runtime flag would have had to invent one. The pin is therefore
+/// a cargo feature, and `arroyo` builds the same source three times into three staged images:
+///
+///   * `VUG.ELF`  — no feature: the ADAPTIVE ladder. The default, and what the desktop launches.
+///   * `VUGC.ELF` — `pinlo`:  level 0 forever, i.e. the CLASSIC pattern, byte-honest, for a slow machine
+///                  and for keeping old fps baselines comparable.
+///   * `VUGX.ELF` — `pinhi`:  level `LOD_MAX` forever — the full scene, no adaptation, for measuring the
+///                  heaviest frame this program can draw.
+///
+/// A pin never reaches the deterministic auto path: `_start` forces level 0 whenever the overlay is off,
+/// which is exactly the foreground/no-input path the 300-frame checksum witness runs on, so all three
+/// images produce checksum 0xe68285b85121ac7c on the fixture legs.
+#[cfg(feature = "pinlo")]
+const LOD_PIN: Option<u32> = Some(0);
+#[cfg(feature = "pinhi")]
+const LOD_PIN: Option<u32> = Some(LOD_MAX);
+#[cfg(not(any(feature = "pinlo", feature = "pinhi")))]
+const LOD_PIN: Option<u32> = None;
+
+/// One window's worth of adaptation. `ceil` and `calm` are the hysteresis state; the return is the level
+/// the NEXT frame renders at.
+fn lod_adapt(lod: u32, rate: u32, ceil: &mut u32, calm: &mut u32) -> u32 {
+    if rate < LOD_DOWN && lod > 0 {
+        let d = if rate * 4 < LOD_DOWN { 2 } else { 1 };
+        let nl = lod - d.min(lod);
+        *ceil = nl;
+        *calm = 0;
+        return nl;
+    }
+    if rate > LOD_UP && lod < *ceil {
+        *calm = 0;
+        return lod + 1;
+    }
+    *calm += 1;
+    if *calm >= CALM_WINDOWS && *ceil < LOD_MAX {
+        *ceil += 1;
+        *calm = 0;
+    }
+    lod
+}
+
+/// FBCON-DMG: the exact SOURCE rows `draw_hud` touches — the half-open band `[HUD_Y0, HUD_Y1)`.
+///
+/// Derived from the painter, not guessed. `draw_hud` is two `draw_num` calls and nothing else; `draw_num`
+/// clears its backing box over `while y < 11` (rows 0..=10) and then stamps digits through `draw_digit`
+/// at `y = 2` with a 7-row glyph (rows 2..=8), which is strictly inside that clear. The two calls differ
+/// only in `x0`/colour, so their row extent is identical. Nothing else in this program writes rows 0..11
+/// on the HUD-only path. If `draw_num`'s clear height or `draw_digit`'s `y` origin ever moves, THIS
+/// CONSTANT MOVES WITH IT — an under-declared band leaves stale pixels on the panel.
+const HUD_Y0: u32 = 0;
+const HUD_Y1: u32 = 11;
 
 /// Draw a 1-3 digit readout (clamped to 999) at `x0` in the top band, over whatever the frame rendered.
 /// Runs in the PARENT, after the frame barrier and before the present, so no worker is writing.
@@ -1122,17 +1763,45 @@ unsafe fn draw_num(surf: *mut u8, fps: u32, x0: i32, color: u32) {
     }
 }
 
+/// VUGSPIN (review D6): [`say`]'s twin for the BRACKETED-TAG witnesses, which end in a bare newline
+/// rather than ` ::`.
+///
+/// Three sites emit that shape — `[vugpause] idle engaged`, `[vugmin] idle engaged`, and `[vuglife]
+/// budget waived` — and each carried its own inline `Buf` chain before this arc; `[vugfps]` is the
+/// fourth and would have been a fourth copy. The wire format of every folded line is byte-identical to
+/// what it emitted before: only the duplication is gone.
+fn sayn(label: &[u8], v: u32) {
+    emit(label, v, b"\n")
+}
+
 /// CLICK-PLAIN: one `:: UVUG: <label><n> ::` witness line.
 ///
 /// Three call sites emit exactly this shape (`pause=` from SPACE, `click n=` from a delivered click,
 /// `pause=` again from the LAYER 2 hunk), and a `Buf` plus four `put`s inlined three times is the kind of
 /// duplication this program cannot afford (see the SIZE note). The trailing ` ::\n` is folded in here
 /// because every caller wants it — the label is the only thing that varies.
+///
+/// VUGSPIN: the body itself now lives in [`emit`], which `sayn` shares. This function's contract — label,
+/// number, ` ::` terminator — is unchanged, and so is every byte its three callers put on the wire.
 fn say(label: &[u8], v: u32) {
+    emit(label, v, b" ::\n")
+}
+
+/// VUGSPIN: the ONE `Buf` chain every `<label><number><tail>` witness in this program goes through.
+///
+/// `say` and `sayn` were two copies of this body differing only in the trailing bytes, and this program
+/// links into a hard 16 KiB `USER_REGION_SIZE` window whose x86 image sits flush against a page boundary
+/// in `.text` — baseline `0x1fcd` of `0x2000`, i.e. **51 bytes of headroom**, past which the `.bss` segment
+/// moves up a page and the ELF grows by 4096 in one step. Collapsing the duplicate is what bought the
+/// `[vugfps]` witness its room. Measured, not assumed: every trim in this area was checked with
+/// `readelf -lW target/VUG-X86.ELF` against that `0x2000` line, not against the file size the build script
+/// prints (the file carries section headers and page padding, so it overstates the real footprint — the
+/// LOADable memory here is ~12.4 KiB of the 16 KiB window).
+fn emit(label: &[u8], v: u32, tail: &[u8]) {
     let mut b = Buf::new();
     b.put(label);
     b.put_dec(v);
-    b.put(b" ::\n");
+    b.put(tail);
     b.flush();
 }
 
@@ -1141,9 +1810,15 @@ fn say(label: &[u8], v: u32) {
 /// A wrapper rather than two calls at each site, and that is a SIZE decision (see the SIZE note): the
 /// overlay is drawn from two places, and hoisting the pair behind one two-argument call removes a whole
 /// set of argument setup (offset + colour, twice) from each of them.
-unsafe fn draw_hud(surf: *mut u8, fps: u32, clicks: u32) {
+unsafe fn draw_hud(surf: *mut u8, fps: u32, clicks: u32, lod: u32) {
     draw_num(surf, fps, 0, FPS_C);
     draw_num(surf, clicks, CLICK_X, CLICK_C);
+    // VUGSCENE: the third readout is the DETAIL LEVEL the ladder settled on. It is on the panel and not
+    // only on the wire because "which level did that boot run at?" is a question an operator asks while
+    // looking at the window, and a level the eye can read is what makes an fps number interpretable.
+    // PINNED builds draw it in the gloss white the theme reserves for a highlight, so a pinned run is
+    // never mistaken for an adaptive one that happened to settle there.
+    draw_num(surf, lod, LOD_X, if LOD_PIN.is_some() { 0xFFFF_FFFF } else { LOD_C });
 }
 
 /// Fold the kernel tick clock into the displayed fps, refreshing at most once per second. `ticks`/`mark`
@@ -1154,15 +1829,63 @@ unsafe fn draw_hud(surf: *mut u8, fps: u32, clicks: u32) {
 /// keeps its once-per-second refresh alive. Because `frame` does not advance while idled, the quotient
 /// falls to 0 — the readout tells the truth (this vug is presenting nothing) instead of freezing on the
 /// last rate it happened to be running at.
-fn fps_refresh(ticks: &mut u64, mark: &mut u32, fps: u32, frame: u32) -> u32 {
+///
+/// ⚠ VUGSPIN — `[vugfps] wf=` PUTS THE PANEL'S NUMBER ON THE WIRE, because until this arc it was NOT
+/// COMPARABLE TO ANYTHING.
+///
+/// GR24 fixed this readout's ARITHMETIC (ABIFREEZE D1 — see [`TICK_HZ`]: VUG-X86.ELF divided by 250 on a
+/// 1 kHz kernel and drew a figure four times too low), and the next metal sitting still reported the shown
+/// fps as wrong. That could not be settled from a capture, and the reason was structural rather than
+/// arithmetic: **this program had never printed the number it draws.** The kernel prints `[wpace] win=N
+/// rate=` (presents the pacer counted) and `[wcn] win=N rate=`/`comp_rate=` (presents attempted /
+/// composites that reached the panel); the vug printed its digits on a 128 px window and nowhere else.
+/// "The meter disagrees with the wire" was not a finding anyone could make — there was no meter on the
+/// wire to disagree with.
+///
+/// ⚠ PAIR IT ONLY AGAINST `[wpace]`, NEVER DIRECTLY AGAINST `[wcn]` (review D3). The two kernel blocks
+/// number windows in DIFFERENT namespaces: `[wcn]` enumerates every live window including the console
+/// (`win=1 asid=0xffffff01`, which only ever composites), while `[wpace]` indexes the window-id table.
+/// On Boot A the offset is **`wcn = wpace + 2`** — `[wcn] win=3 asid=0x2` and `[wpace] win=1` are the same
+/// window, both reading 19.6/s. The `win` this program emits is its own `SYS_WIN_CREATE` handle, which is
+/// the `[wpace]` index; comparing it to a `[wcn] win=` of the same number reads the wrong window. Verify
+/// the offset per boot rather than assuming 2 — it depends on what else is on the panel.
+///
+/// `shown` and `[wpace] win=N rate=` measure the SAME EVENT and are now the same quantity BY
+/// CONSTRUCTION: `frame` advances only on a present that returned success (see the present site), which
+/// is exactly what `wpace_note_present` counts. So on the next boot:
+///
+///   * they AGREE → the readout is honest, and any remaining complaint about the panel is about the
+///     frames themselves, not the meter. That is what this arc predicts.
+///   * they DISAGREE → **the disagreement is the finding**, and it is the first time it could be one.
+///
+/// `wf` PACKS TWO FIELDS INTO ONE DECIMAL: `win = wf / 1000`, `shown = wf % 1000`. `shown` is clamped to
+/// 999 by the same clamp `draw_num` applies to the digits it paints, so the packing cannot collide. This
+/// is a SIZE decision forced by the linker and not a style one — see [`emit`] for the measured page-cliff
+/// that makes a second label/number pair unaffordable here.
+///
+/// EMITTED ON CHANGE, not on a timer, and that costs nothing: `fps` is already the previously displayed
+/// value, so `v != fps` is free rate-limiting that is also strictly more informative than a period would
+/// be — every change in the digits on the panel appears on the wire, and a window holding a steady rate
+/// goes quiet instead of repeating itself once a second into a log with ten vugs in it.
+///
+/// A THIRD FIELD WAS CONSIDERED AND REJECTED ON ITS MERITS, not only for size. An earlier cut carried
+/// `frames=` beside `shown=` as a claimed CLOCK check. It is not one: `shown = Δframe * TICK_HZ / dt` and
+/// the refresh fires at `dt >= TICK_HZ`, so `shown ≈ frames` is an ALGEBRAIC IDENTITY that holds however
+/// wrong `TICK_HZ` is. Under the exact D1 bug GR24 fixed, the refresh simply fired four times a second
+/// and `shown` still equalled `frames`. A witness that reads the same on both sides of the bug it exists
+/// to catch cannot fail. The only real check on this program's clock is the KERNEL's number beside it.
+fn fps_refresh(ticks: &mut u64, mark: &mut u32, fps: u32, frame: u32, win: u32) -> u32 {
     let now = getinfo_ticks();
     if now > *ticks {
         let dt = (now - *ticks) as u32;
         if dt >= TICK_HZ {
-            // frames since last refresh, scaled to per-second at the 250 Hz tick.
+            // frames since last refresh, scaled to per-second at THIS arch's tick rate.
             let v = ((frame.wrapping_sub(*mark) as u64 * TICK_HZ as u64 + (dt / 2) as u64) / dt as u64) as u32;
             *ticks = now;
             *mark = frame;
+            if v != fps {
+                sayn(b"[vugfps] wf=", win * 1000 + v.min(999));
+            }
             return v;
         }
     } else if now != 0 && now < *ticks {
@@ -1370,6 +2093,17 @@ pub extern "C" fn _start() -> ! {
     }
 
     let vbase = crystal_vertices();
+    // VUGSCENE: the shard's own geometry, and the facet normals derived from it. Both are start-up work —
+    // the 24 square roots run once, here, and never inside a frame.
+    // VUGSCENE ladder state. It starts at the TOP rung and falls: an optimistic start means a machine that
+    // can carry the full scene never spends a window climbing to it, and a machine that cannot is measured
+    // and stepped down inside the first second or two.
+    let mut lod: u32 = LOD_PIN.unwrap_or(LOD_MAX);
+    let mut lod_ceil: u32 = LOD_MAX;
+    let mut lod_calm: u32 = 0;
+    // The light's own orbit angle, advanced per frame so a glint SWEEPS across the facets rather than
+    // sitting wherever the tumble happens to put it. Frame-based like the tumble, so it needs no clock.
+    let mut lt: i32 = 0;
 
     // Interactive/auto state.
     let mut ay: i32 = 0;
@@ -1409,6 +2143,9 @@ pub extern "C" fn _start() -> ! {
     let mut min_witnessed = false;
 
     let mut frame: u32 = 0;
+    // REVIEW D5: present attempts — the DEADLINE clock, kept separate from `frame` (the METER clock, which
+    // counts only presents the panel accepted). Equal on every healthy run; see the present site.
+    let mut attempts: u32 = 0;
     loop {
         // --- input (polled EVERY frame for the program's whole life) ---
         let fi = drain_input(&mut held, &mut drag);
@@ -1576,11 +2313,7 @@ pub extern "C" fn _start() -> ! {
             };
             if !*latch {
                 *latch = true;
-                let mut ib = Buf::new();
-                ib.put(tag);
-                ib.put_dec(frame);
-                ib.put(b"\n");
-                ib.flush();
+                sayn(tag, frame);
             }
             // ESC is honoured from the idle loop exactly as from a rendered frame.
             if exit_key {
@@ -1604,11 +2337,17 @@ pub extern "C" fn _start() -> ! {
             // ack would sit in the surface, unpresented, until a digit happened to change. `fi.clicks`
             // is the frame's own count, so this fires once per click and nothing else keeps it awake.
             if !hidden && overlay {
-                let v = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame);
+                let v = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame, win as u32);
                 if v != fps || fi.clicks > 0 {
                     fps = v;
-                    unsafe { draw_hud(surf, fps, clicks) };
-                    let rc = unsafe { sys1(SYS_WIN_PRESENT, win) };
+                    unsafe { draw_hud(surf, fps, clicks, lod) };
+                    // FBCON-DMG: this is the one present in the program whose damage is genuinely a BAND.
+                    // Nothing rendered this pass — the frame path did not run — and the only writer since
+                    // the last present was `draw_hud` immediately above, whose extent is `[HUD_Y0, HUD_Y1)`
+                    // by construction. So 11 of 128 source rows is the whole truth about what changed, and
+                    // repainting the other 117 is work the compositor was being asked to do for nothing,
+                    // once per second, for as long as a vug sits idled on an operator's desktop.
+                    let rc = present_rows(win, HUD_Y0, HUD_Y1);
                     if rc >> 63 != 0 {
                         stall_witness(&W_PRESENT, frame, b"present rc=", (rc as i64).unsigned_abs() as u32);
                     }
@@ -1640,7 +2379,21 @@ pub extern "C" fn _start() -> ! {
         // VUGGUARD: the release is conditional on there being someone to release. With `live == 0` the
         // phase word is nobody's signal, and storing to it would be the only remaining way for this
         // program to advertise a frame it is rendering entirely by itself.
-        project(&vbase, ay, ax, dist);
+        // VUGSCENE: the level THIS frame renders at, decided here and published before the release store
+        // so every worker and the parent's inline raster agree on it.
+        //
+        // `overlay` is the gate, and it is the SAME predicate that already gates the fps overlay, for the
+        // same reason: the foreground/no-input path is the deterministic auto path, and its 300-frame
+        // surface checksum (0xe68285b85121ac7c, asserted by `pi4-regression.spec`) is a fact about the
+        // classic wireframe. Forcing level 0 there keeps that byte-identical on every build, pinned or not.
+        let flod = if overlay { lod } else { 0 };
+        LOD.store(flod, Ordering::Release);
+        lt = (lt + 2) & 0xFF;
+        if flod > 0 {
+            scene_setup(ay, ax, dist, lt);
+        } else {
+            project(&vbase, ay, ax, dist);
+        }
         if live > 0 {
             DONE.store(0, Ordering::Relaxed);
             PHASE.store(frame + 1, Ordering::Release); // 1-based; never PHASE_EXIT (frame < cap)
@@ -1749,8 +2502,22 @@ pub extern "C" fn _start() -> ! {
         // box — one more readout, drawn every frame the fps readout is, so an ack is on the panel within
         // one frame of the click that earned it.
         if overlay {
-            fps = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame);
-            unsafe { draw_hud(surf, fps, clicks) };
+            // VUGSCENE: a closed measurement window is what the ladder runs on, and `fps_frame` moving is
+            // exactly the signal that one closed — `fps_refresh` re-marks it only when it refreshes. Reading
+            // the mark rather than comparing the returned rate is what makes the trigger correct when a
+            // window happens to close on the same number it opened with.
+            let mark = fps_frame;
+            fps = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame, win as u32);
+            if fps_frame != mark && LOD_PIN.is_none() {
+                let nl = lod_adapt(lod, fps, &mut lod_ceil, &mut lod_calm);
+                if nl != lod {
+                    lod = nl;
+                    // One line per change, and changes are bounded by the ladder itself — this is how a
+                    // boot's level is recovered from a capture rather than inferred from the fps alone.
+                    sayn(b"[vuglod] lvl=", lod * 1000 + fps.min(999));
+                }
+            }
+            unsafe { draw_hud(surf, fps, clicks, flod) };
         }
 
         // --- present ---
@@ -1758,15 +2525,60 @@ pub extern "C" fn _start() -> ! {
         // lost per-process slot, a torn-down surface) would present as an unexplained freeze — frames still
         // advancing here, nothing changing on screen, and the kernel's no-render cap firing on a program that
         // believed it was drawing. An error has bit 63 set (negative errno), exactly like an empty input poll.
+        //
+        // FBCON-DMG: WHOLE BOX HERE, deliberately, and this is not an oversight. The rendering path just ran
+        // the crystal across the FULL surface (the two workers own the top and bottom halves and between
+        // them write every row), so the damaged band IS `[0, SH)` and there is nothing to narrow. Declaring
+        // it through the banded verb would buy the compositor no work back and would cost every aarch64
+        // frame a syscall that can only fail. The banded verb belongs on the idle HUD path above, where the
+        // damage is 11 rows; here the honest answer is the one this line already gives.
         let rc = unsafe { sys1(SYS_WIN_PRESENT, win) };
+        // REVIEW D5: present ATTEMPTS — the deadline clock for both exit budgets below. This is what
+        // `frame` counted before the meter fix, and it advances whether or not the panel took the frame.
+        attempts = attempts.wrapping_add(1);
         if rc >> 63 != 0 {
             stall_witness(&W_PRESENT, frame, b"present rc=", (rc as i64).unsigned_abs() as u32);
+            // VUGSPIN — A FAILED PRESENT IS NOT A FRAME, and until now it was counted as one twice over.
+            //
+            // The three lines below used to run unconditionally, immediately after a branch that had just
+            // established the present FAILED. Both consequences are lies about the panel, and they are
+            // the two the brief for this arc names:
+            //
+            //   * `frame` is the numerator of the VUGFPS readout, and its docstring says it "counts
+            //     frames PRESENTED". A present that returned a negative errno put nothing on the panel,
+            //     so counting it inflated the on-window fps by exactly the failure rate — the meter
+            //     reporting frames the eye never received, which is the one thing it exists not to do.
+            //   * `presented = true` tells the VUGPAUSE idle predicate "the panel is showing this
+            //     surface". After a failed present it is not, and the predicate would then be entitled to
+            //     SKIP the very frame that would have repaired the window — a lost present promoted into
+            //     a stuck one.
+            //
+            // Both are now on the success path only. The failure path keeps the witness and re-renders
+            // the same state next frame, which is the honest recovery: `presented` stays false, so the
+            // idle predicate cannot engage, so the next frame renders and presents again.
+            //
+            // A GUARD AND NOT A `continue`, deliberately. Skipping the rest of the iteration would skip
+            // the EXIT block below with it, so a window whose presents had started failing would stop
+            // answering ESC — a lost present promoted into an unclosable window, which is a worse defect
+            // than the one being fixed. The frame budget and the exit key are evaluated on every
+            // iteration whatever the panel did.
+            //
+            // ⚠ REVIEW D5 — AND THAT IS ALSO WHY THE EXIT BUDGETS MOVED OFF `frame` TO `attempts`.
+            // Holding `frame` still on failure is right for the METER and wrong for a DEADLINE: both caps
+            // below used to read `frame`, so a run whose presents had all started failing would freeze the
+            // budget and never terminate — `:: EXEC-UVUG: … did not exit in time ::` on any fixture leg
+            // where the present path breaks, which is a hang introduced by a fix for a lie. `attempts`
+            // counts PRESENT ATTEMPTS and so advances whatever the panel did, which is exactly what
+            // `frame` used to mean here. On any healthy run the two are equal, so the 300-frame checksum
+            // path is bit-identical; they diverge only in the failure case, where each is now the right
+            // quantity for its own job.
+        } else {
+            // VUGPAUSE: this is now the surface the panel is showing — record what produced it, so the
+            // next frame can tell whether it would draw anything different.
+            presented = true;
+            presented_overlay = overlay;
+            frame += 1;
         }
-        // VUGPAUSE: this is now the surface the panel is showing — record what produced it, so the next
-        // frame can tell whether it would draw anything different.
-        presented = true;
-        presented_overlay = overlay;
-        frame += 1;
 
         // --- exit conditions ---
         if interactive {
@@ -1779,20 +2591,16 @@ pub extern "C" fn _start() -> ! {
             // and keep tumbling until ESC or `kill`. The witness is one-shot — `budget_waived` latches —
             // because the test is true on every frame after the cap, and a per-frame line would drown
             // the serial log it exists to be found in.
-            if frame >= INTERACTIVE_CAP {
+            if attempts >= INTERACTIVE_CAP {
                 if !detached {
                     break;
                 }
                 if !budget_waived {
                     budget_waived = true;
-                    let mut wb = Buf::new();
-                    wb.put(b"[vuglife] budget waived (interactive) frames=");
-                    wb.put_dec(frame);
-                    wb.put(b"\n");
-                    wb.flush();
+                    sayn(b"[vuglife] budget waived (interactive) frames=", frame);
                 }
             }
-        } else if !detached && frame >= AUTO_FRAMES {
+        } else if !detached && attempts >= AUTO_FRAMES {
             // No input has ever arrived (QEMU): the deterministic auto path ends at 300 frames — the
             // surface at that frame is what the checksum witness asserts. VUG-BG: a DETACHED launch skips
             // this cap entirely and tumbles until it is killed. The two are disjoint by construction —

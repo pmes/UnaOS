@@ -156,6 +156,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
+name = "midden_core"
+version = "0.1.0"
+
+[[package]]
 name = "net"
 version = "0.1.0"
 
@@ -382,6 +386,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c8352f8c05e47892e7eaf13b34abd76a7f4aeaf817b716e88789381927f199c"
 
 [[package]]
+name = "una-abi"
+version = "0.1.0"
+
+[[package]]
 name = "unafs"
 version = "0.1.0"
 dependencies = [
@@ -412,11 +420,13 @@ dependencies = [
  "font8x8",
  "lazy_static",
  "linked_list_allocator",
+ "midden_core",
  "net",
  "rast",
  "smoltcp",
  "spin 0.12.1",
  "uart_16550",
+ "una-abi",
  "unafs",
  "unaos-boot-info",
  "volatile 0.6.1",

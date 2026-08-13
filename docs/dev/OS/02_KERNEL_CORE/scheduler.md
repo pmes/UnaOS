@@ -322,7 +322,7 @@ ASID/parent-placement keyed and reads no band state.
 SPREAD-2 fixed how a *single* frame's work is divided. SPREAD-3 fixes the layer
 above it: where a *newly spawned* EL0 task is put in the first place.
 
-The measurement (P68, from the serial wire) was that `bg-el0` launches placed by
+The measurement (P68, from the serial wire) was that `bg-user` launches placed by
 `load-balanced EL0` did not spread at all — **27** landed on core 3, **18** on
 core 0, **8** on core 1, and essentially none on core 2, while sustained load
 read `c0=99% c3=99%` against `c1/c2 ≈ 80%`. Because the scheduler is no-migrate,
@@ -381,12 +381,12 @@ existing `policy:` field, so it stays one parseable line and the
 `SCHED: task '…' -> core N` prefix the pi4 spec matches on is unchanged:
 
 ```
-:: SCHED: task 'bg-el0' -> core 2 (policy: load-balanced EL0 residents=1, no-migrate) ::
+:: SCHED: task 'bg-user' -> core 2 (policy: load-balanced EL0 residents=1, no-migrate) ::
 ```
 
 `residents` is **inclusive** of the task just placed — the committed count on
 that core after this placement. The next attended boot therefore proves the
-accounting directly: successive `bg-el0` launches should walk the cores rather
+accounting directly: successive `bg-user` launches should walk the cores rather
 than repeating one, and `residents` should climb evenly across them instead of
 running up on a single core.
 
@@ -1308,6 +1308,76 @@ The clamp is deliberately left at 8 rather than lowered to 6: an operator asking
 for more than the machine has must get a *refusal that names the resource*, not
 a silently-lowered request that reads as if it were granted.
 
+### Fleet headroom, x86 (HEADROOM, Boot AL)
+
+**Everything above still describes aarch64 exactly, and no longer describes
+x86.** Boot AL took the reading the section above says is unavailable and found
+the ceiling was not one cap but three, stacked so that raising any one alone
+would have moved nothing:
+
+| constant | was | now (x86) | aarch64 | what it bounds |
+| --- | --- | --- | --- | --- |
+| `memory::USER_SLOTS` | 8 | **12** | 8 | concurrent ring-3 address spaces |
+| `syscall::MAX_PROCS` | 6 | **10** | 6 | live `Proc` rows (`<= USER_SLOTS - 2`) |
+| `syscall::NTHREAD` | 8 | **24** | 8 | joinable ring-3 thread handles, machine-wide |
+| `syscall::WIN_MAX` | 8 | **12** | 8 | global window ids |
+| `wm::MAX_WINDOWS` | 8 | **12** | 12 | compositor rows (arch-neutral) |
+| `sched::NFUTEX` | 16 | **64** | 64 | distinct futex keys with waiters parked |
+| `shell::BG_JOBS` | 8 | **12** | 12 | shell job rows (arch-neutral) |
+| `memory::FB_WIN_SLOTS` | 8 | 8 | 8 | windows ONE process may hold (`-EMFILE`) |
+
+**`NTHREAD` was the cap the operator could see.** With six vugs up, vugs 5 and 6
+logged `SYS_THREAD_SPAWN denied a=11 b=11 workers=0 -> inline raster`: eight rows
+at two workers per vug seats four vugs, and the two that fell back to inline
+raster ran at roughly **4x** the frame rate of the four with workers. A fleet of
+identical programs running at two speeds, with nothing in any program to explain
+it — the "predetermined fps" read off the panel for weeks was a table size.
+
+**`MAX_PROCS` was the cap the operator hit.** On a `wc` boot the desktop app
+(`STAT.ELF`) holds a row permanently and never exits, so six rows meant `storm`
+fleets capped at **five**.
+
+**`NFUTEX` was the cap that would have replaced them.** A vug holds *three* live
+keys while idle (`DONE`, `PHASE`, its input ring), so a ten-program fleet wants
+30 buckets against a pool of 16 — and the overflow is silent, because
+`TableFull` degrades every caller to a spin. x86 had simply never taken the
+raise aarch64 made at VUGPAUSE-2; without it, the `NTHREAD` cliff would have
+been traded for a futex cliff that looks identical from the panel.
+
+**The reserve did not move.** `MAX_PROCS <= USER_SLOTS - 2` now holds at
+*equality* (10 ≤ 10): the two-slot margin a foreground `run` and the launcher
+fixtures live on is exactly as wide as it was, and none of the new capacity was
+bought from it. `FB_WIN_SLOTS` deliberately did **not** follow `WIN_MAX` — the
+per-process window cap is unchanged at 8, which is what keeps the raise from
+costing 12 slots × 4 extra 64 KiB surface reservations (~3 MiB) for capacity no
+shipped program asks for. The `WIN_MAX == FB_WIN_SLOTS` assertion became
+`FB_WIN_SLOTS <= WIN_MAX`, and `sys_win_create`'s region-slot search was
+re-bounded to `FB_WIN_SLOTS` — left at `WIN_MAX` it would have handed out region
+slots 8..11 and walked off the end of the slot's FB region.
+
+**What the machine should now support**, and what the storm census grades it
+against: **8 vugs** all with `workers=2`, alongside the resident desktop app,
+with one `Proc` row still free for a foreground `run` and `user slots free >= 2`
+at the end of the burst. `storm 9` is the largest fleet that completes as asked
+on a `wc` boot; the tenth launch is the one the process table refuses.
+
+**The clamp is now derived, not written down.** It admits
+`proc_table_rows() + 2` — the same "two past the ceiling, so the refusal names
+the resource" margin the section above argues for, maintained as a *margin*
+rather than as the literal `8` it happened to equal when `MAX_PROCS` was 6. On
+aarch64 that evaluates to 8 and the arithmetic above is unchanged; on x86 it is
+12, so `storm 11`/`storm 12` are the requests that cannot succeed on an empty
+boot. The `storm` help line is built from the same call, so it can no longer
+quote a stale ceiling.
+
+**Cost.** One address-space slot is `USER_STATIC_SIZE` (0x85000 = 544 KiB) of
+`.bss` backing plus four 4 KiB page tables; 8 → 12 is **+2.14 MiB** of `.bss`
+(4.28 → 6.42 MiB). `.bss` is NOBITS, so the boot image on the ESP does not grow.
+Every other table in the list costs kilobytes or less. Against that: task count
+is the axis the placement arcs are measured on, and a full 8-vug fleet is now
+**24 tasks** (a vug is a triple) plus the desktop app, against four cores —
+where the aarch64 section above tops out at ~18.
+
 **The instrument.** What a storm run could not previously answer is "what breaks
 first as *n* grows", because every quantity that would name a ceiling rides a
 different clock — the `:: SCHED: load ::` train is timer-driven (~1 s windows,
@@ -1421,6 +1491,76 @@ occurrences) — each line is the race observed **and absorbed**; before the fix
 each was a permanent strand. user-vug's barrier protocol was and is
 lost-wakeup-safe against a correct futex; nothing in the program changed.
 
+### A cooperative fixture cannot wait for its own launcher (x86, WINX7-GO)
+
+Not a kernel defect — a **fixture** defect, and the reason it is recorded here is
+that the shape generalises to every launcher/fixture pair on this arch.
+
+`sched::spawn_user_in_space` builds a **cooperative** ring-3 task
+(`preemptible = false`): the timer cannot evict it, and it releases its core only
+by blocking. WINX-7 placed its fixture on the **launcher's own core**
+(`meter_current_cpu()`), and the launcher then sat in a wait loop that had to
+grant the fixture focus and inject an input event *while the fixture polled for
+one*. The launcher could only run when the fixture blocked.
+
+The fixture's only block was the frame barrier — `FUTEX_WAIT` on `done`, which
+parks only when the parent's first load beats both workers' `lock xadd`. That is
+a coin flip. Lose it and the fixture ran window → spawns → barrier → 2,000,000
+non-yielding `SYS_INPUT_POLL`s → present → joins → exit without ever releasing
+the core; the launcher got **exactly one** loop iteration, taken before the
+window even existed, and then found `WINX7_DONE` already set. On the wire that is
+
+```
+:: WINX-7: … FAIL — witness=0xdf … parks=0 … injected=0 … done=1 ::
+```
+
+roughly **half of all runs** (measured: 11 FAIL / 23 verdict-bearing runs on
+clean trunk). `parks=0` and `injected=0` were never two bugs; they are the same
+missed interleave seen from both ends, and the verdict could not say so because
+nothing reported the launcher's own scheduling. The `[winx7-go]` line does now —
+`iters=1` is the starvation, `iters>=2 winseen_at=2 gorel=true` is health.
+
+The repair is a pair of **GO gates** (the U7x/DMG-REFUSE go-word idiom), each a
+word in the fixture's data page that only the launcher writes:
+
+- **Gate 1 (`+0x100C`)** holds the *parent* immediately after `SYS_WIN_CREATE`.
+  The blob never writes that word, so the `FUTEX_WAIT` is a park *by
+  construction* rather than by timing — which hands the launcher the CPU. The
+  launcher grants focus, injects, and only then plants `go = 1`, so the key is
+  already in the ring when the fixture takes its first poll.
+- **Gate 2 (`+0x1010`)** holds *both workers* just before their `lock xadd`. It
+  exists because gate 1 alone made the verdict's `parks >= 1` self-satisfying:
+  the GO park met it, so the *frame barrier* park — the assertion the test exists
+  for — was still incidental, and did not happen on **6 of 28** passing runs
+  (21%). With the workers gated, `done` is provably 0 when the parent reads it,
+  so the barrier park is deterministic too.
+
+The handshake that says "it is parked" is `sched::futex_waiters_on(key)`, the
+keyed twin of `futex_parked_total()`. Keyed matters: the global gauge is only
+correct here because of the same-core placement, so a placement change or a
+stray parker anywhere else could re-open the flake silently. As *evidence* that
+a park happened either gauge is useless (a park between two samples is
+invisible; that is what `futex_park_count` is for), but as a *handshake* the
+keyed one is exact, because the state is level-triggered — the fixture cannot
+leave the gate until the launcher opens it. Gate 2 waits on **three** keys: two
+waiters on gate 2 *and* one on `done`, so the parent has committed to the barrier
+park before the workers are allowed to arrive.
+
+The verdict gates on `barrier_parks = parks - 3` (the three gate parks are
+structural and are named rather than quietly inflating the number), on both
+gates' **provenance** being `handshake`, and on `iters >= 2 && winseen_at >= 1`.
+That last pair is the disease asserted directly: the eight witness bits can line
+up while the launcher was starved, and a failsafe-opened gate — the failsafe
+exists so a gate can never wedge — was otherwise indistinguishable on the wire
+from the healthy path, which made the insurance the one thing able to hide what
+it insured against.
+
+Two lessons for any future fixture on this arch: a cooperative ring-3 task must
+`SYS_YIELD` inside any spin that waits on another task (WINX-7's poll loop now
+yields every 4096 empty polls, at an unchanged 2,000,000-poll budget), and a
+launcher must never assume it will be scheduled concurrently with a fixture it
+placed on its own core.
+
 ### BSP scheduling + work stealing (aarch64, SMP-BAL)
 
 SCHED-3 balances at **spawn**, but a task's cost is unknown then and wake bursts
@@ -1506,7 +1646,7 @@ kernel services and the BSP calls `sched::run_bsp(0)`.
 | --- | --- | --- |
 | `x86_usb_pump` | `online_aps().last()` | The xHCI service family, `fat::probe_once`, the boot-ledger / flight-recorder pumps, the witness probe ladder, `e1000::service_net`. Touches no pixel. `sleep_ticks(1)` ≈ 1 ms — the same floor the old `hlt()`-paced loop had. |
 | `x86_input_service` | `online_aps().last()` | Drains `pal::EVENT_QUEUE` and forwards every event over `GUI_CHANNEL_X86`. Paints nothing, routes nothing. Also emits the 250 ms `Event::Timer` pulse. |
-| `x86_render_service` | `online_aps().first()` | Every pixel: builds its own `Screen`/`TargetPal`/`Console`, runs `wc_click_route` → `el0_input_route` → `handle_key`, the cursor sprite, CURSOR-HIDE, `pal.render()`. The shell runs here. |
+| `x86_render_service` | `online_aps().first()` | Every pixel: builds its own `Screen`/`TargetPal`/`Console`, runs `wc_click_route` → `user_input_route` → `handle_key`, the cursor sprite, CURSOR-HIDE, `pal.render()`. The shell runs here. |
 
 **`run_bsp(cpu)`** takes the caller's index for parity with the aarch64 twin and
 asserts it against `percpu::this_cpu()`; the body is `run()` (x86's `run` derives
@@ -1554,7 +1694,9 @@ any MTRR type, so the MSR was the only missing piece.
 :: SCHED-X86: input task dispatched on core 7 ::
 :: SCHED-X86: render task dispatched on core 1 — panel owned by the scheduler ::
 :: SCHED-X86 PLACE-CHECK: actual=c1 arg=c1 published=c1 pool=5 collide=0 tier=exclusive verdict=PASS ::
+[schedx86] load-prejoin c0=-- c1=…% …                      (SCHEDLOAD-X86, once, at the handoff)
 [schedx86] depth sent=… recv=… inflight=… (render core 1)
+[schedx86] load c0=…% c1=…% c2=100%*(name) … sw=[…] q=[…]  (SCHEDLOAD-X86, every ~5 s)
 ```
 
 The spawn line and the three *dispatched* lines are deliberately separate: spawned
@@ -1595,21 +1737,590 @@ slack** — one AP failing INIT-SIPI-SIPI yields `PARTIAL`, not `FAIL`.
 Sites that DECLINE print the measured pool rather than a description of it, e.g.
 `:: U6gx: placement pool too small (aps=4 pool=2, need 3) — owner/grants demo skipped ::`.
 
-One placement site is deliberately **not** under this owner: `syscall::bg_place_cpu`,
-which starts `bg`/`run` programs on the caller's core — since SCHED-X86, the render
-core. That is not a rule-1 deadlock (the storage syscall handler is IF-masked and
-cannot be preempted holding `XHCI_CONTROLLER`); it is an operator-facing placement
-question — a foreground `run` degrades the panel for its duration — and it is open.
+One placement site was deliberately **not** under this owner: `syscall::bg_place_cpu`,
+which started `bg`/`run` programs on the caller's core — since SCHED-X86, the render
+core. That was never a rule-1 deadlock (the storage syscall handler is IF-masked and
+cannot be preempted holding `XHCI_CONTROLLER`); it was an operator-facing placement
+question — a foreground `run` degrades the panel for its duration — and it was open
+until SMPBAL-X86 (below), which makes it `CPU_AUTO`.
 
-**Expected at the bench, not fixed here:** the shell now runs inside
-`x86_render_service`, so `bg_place_cpu()`'s premise ("the caller's core is
-definitionally scheduling") finally holds and programs start — but they start on
-the **render** core, so a foreground `run` degrades the panel for its duration.
-That is a syscall-layer placement question. `sibling_online_cpu` also changes
-answer, by design: core 0 publishes `scheduler_rsp` from this loop, so WINX-7
-sibling placement may now pick it.
+`sibling_online_cpu` also changes answer, by design: core 0 publishes
+`scheduler_rsp` from this loop, so WINX-7 sibling placement may now pick it.
 
 The `rast` knob keeps the inline loop (its demo drives the BSP's local `screen`).
+
+### Per-core busy-TIME accounting + the always-on load witness (x86_64, SCHEDLOAD-X86)
+
+Until this arc, **no serial line on any x86 boot reported per-core load.** The only
+feed was `CPU_BUSY`/`CPU_IDLE`, and reaching it needed an operator: the `sched`/`ps`
+shell verb, or `PULSE.ELF` through `SYS_CPUPULSE(49)`. Every unattended capture in
+the archive is therefore silent about which cores were working — which is the reason
+this is the *first* arc of the SMP balancing campaign rather than a later one. A
+balancer landed without a load witness is unfalsifiable.
+
+`arch::x86_64::sched` now carries a per-core `CoreAccount` and a `core_load(cpu) ->
+CoreLoad` accessor mirroring the aarch64 contract. `run()` folds a measured **span**
+into a rolling ~250 ms window at the two sites that already bumped the event
+counters: `now_cycles()` (rdtsc) taken either side of `switch_context` (busy) and
+either side of `enable_and_hlt` (idle). `CPU_BUSY`/`CPU_IDLE` are untouched and keep
+all five of their consumers — they are a second instrument in a different currency,
+and the arc's cross-check is that the two agree about *which* cores are idle while
+disagreeing about the magnitudes.
+
+#### The per-core token has exactly three forms
+
+This is the instrument. Reading the line without reading this table gets it wrong.
+
+| form | meaning |
+| --- | --- |
+| `cN=NN%` | **MEASURED.** Every cycle in the number was folded from a real span over the window. |
+| `cN=100%*(name)` | **INFERRED.** No span was folded for this window; the value is deduced from a live `current` plus a fold age past a whole window. `name` is the task holding the core (clipped to 16 bytes, `+` if clipped). |
+| `cN=--` | **ABSENT.** No live measurement at all — the core never entered `run()`, or stopped folding with nothing executing. |
+
+`0%` is a measurement (this core folded spans; none were busy); `--` is the *absence*
+of one. Collapsing them would make an unaccounted core indistinguishable from a
+provably idle one, which is how an instrument ends up certifying the imbalance it was
+built to detect. `100%*` is that same argument one level up, and it matters more,
+because the inferred value is the extreme of the scale: without the marker an
+*inference* prints byte-for-byte as a *measurement*. The adversarial review caught the
+collapse in the first revision, and the QEMU trace shows exactly why it matters —
+`c2=100%*(zeolite-resolver)` (inferred, `sw[2]=20`) beside `c3=100%` (measured,
+`sw[3]=34,481,377`) on the same line. It also decides whether the PULSE-A cross-check
+can be scored at all: a core agreeing at 100 % via the pegged arm agrees for a reason
+near-identical to PULSE-A's own ("this core is dispatching"), i.e. structurally rather
+than evidentially.
+
+The anti-witness is asserted on the wire, once per boot: `run_bsp` emits
+`[schedx86] load-prejoin` one statement before entering `run()`, at the single instant
+when core 0 has never folded a span and every AP has. That line **must** read `c0=--`
+with at least one AP carrying a percent; `c0=0%` there refutes the instrument outright.
+Note what it does *not* claim: the x86 BSP **does** enter `run()` (`main.rs:1362`
+whenever `online.len() >= 2`), so `c0` reads `0%` on every steady line thereafter. The
+prejoin `--` describes one instant, not a permanent state.
+
+#### Design decisions, none of them ports
+
+* **Spans in TSC, freshness in milliseconds.** `CNTPCT` is system-global, so on
+  aarch64 one core may subtract another's timestamp. `rdtsc` is **per-core**, and
+  cross-core synchronization is a firmware property this kernel neither programs nor
+  verifies — a small negative skew wraps to ~2⁶⁴ and a small positive skew fabricates
+  a window of activity. So every quantity a *remote* reader evaluates uses
+  `arch::ms()` (globally coherent: core 0 alone advances `APIC_TICKS`), and only a
+  core's own self-measured spans are in cycles. The `CoreLoad` field is
+  `fold_age_ms`, not `fold_age_cyc`, for that reason.
+* **Age-on-read for the SELF row only.** The cross-core objection above does not apply
+  when the reader *is* the owning core, where the subtraction is the same same-core
+  `rdtsc` pair the fold already performs twice per dispatch — and it needs no fences,
+  because a core's scheduler loop runs only when no task is running on it, so there is
+  no concurrency to order. This matters because the witness is emitted from the render
+  task at the *end* of its pass, and that task's span is folded only when it later
+  blocks in `recv`: without the self arm, c1 reported its own load missing most of the
+  current pass every time, biased low by ~2× at exactly the sample point. Adding it
+  moved c1 from `0–1%` to `2–3%` in the QEMU battery.
+* **No cross-core age-on-read (PULSE-5); a pegged-core test instead.** For *remote*
+  cores PULSE-5's remedy still needs the ruled-out subtraction. The freeze it fixes is
+  real here too — the arc's own QEMU smoke caught a core printing `64%` then `--`,
+  having stopped folding because it was *inside* a task — so `core_load` instead reads
+  `SCHED[cpu].current != 0` together with a fold age past a full window and reports
+  100 %, marked `*`. Both inputs are globally coherent.
+* **No `PaddedUsize`.** Its justification is A72 LL/SC livelock, which does not exist
+  on x86. `CoreAccount` *is* `repr(align(128))` on its own merits — plain write-write
+  false sharing between neighbouring cores' slots on the dispatch path, at the 128-byte
+  effective granularity of Sandy/Ivy Bridge's adjacent-line prefetch.
+
+#### Documented limits — read these before balancing against these numbers
+
+1. **ISR-only load is invisible; it reads `0%`.** A busy span includes interrupt
+   handlers that fire *while a task is running*, but the idle arm charges the waking
+   handler to **idle**. So a core with an empty run queue that is saturated servicing
+   device IRQs reads `0%`. Not hypothetical: core 0 is the sole advancer of
+   `APIC_TICKS`, carries a strictly larger ISR share than any AP, has nothing pinned to
+   it, and will report `0%` on every line regardless of how much interrupt work it does.
+2. **The instrument CAN over-report, by one mechanism and one only.** `busy_pct`'s
+   partial-window blend fills the not-yet-elapsed remainder of the current window at the
+   last completed window's rate, so a core that was busy and has just gone idle decays
+   from its old percent to 0 across ~250 ms instead of dropping instantly. Bounded by
+   one window, always decaying, and it cannot fire for a core idle for a full window —
+   but **any refutation criterion of the form "a percent on a core PULSE-A shows at
+   `busy=0`" must tolerate it**, or it is a false-refutation trigger. (The alternative,
+   reporting `busy/elapsed` alone, is worse: right after a roll a single 2 ms busy
+   sample would print 100 %.) The missing sub-window term for *remote* cores can only
+   under-report, which is the safe direction; the blend is the exception.
+3. **A foreground shell command silences the witness.** `handle_key` holds
+   `SCREEN_APP_ACTIVE` for the whole of `dispatch_command`, during which
+   `x86_input_service` sends nothing into `GUI_CHANNEL_X86` and the render task is
+   blocked inside the command — so there is **no `depth` line and no `load` line** for
+   the duration. Use `bg` to observe a program's load, not a foreground `run`.
+4. **Two builds emit neither line.** Both require `run_bsp`, which the `rast` feature
+   and the `online.len() < 2` fallback (`main.rs:1363`, "GUI stays inline on the BSP")
+   both skip — and in those builds `x86_render_service` is never spawned either. A
+   silent capture from such a build is not a regression.
+5. **The column count is capped at `MAX_CPUS = 8`.** The bench rMBP is exactly 8
+   logical cores, i.e. zero headroom. When the cap binds, the line says so
+   (`cores=8/N <CAPPED>`) rather than silently reading as a shorter machine.
+
+The steady-state line rides the existing `[schedx86] depth` clock gate (~5 s) in
+`x86_render_service`, emitted after `pal.render()` — below the event-routing block,
+which is the focus-trap seam and is not to be perturbed by an instrument. Every
+`depth` line should be followed by exactly one `load` line.
+
+Two properties of the emit are load-bearing rather than stylistic. The per-core
+**snapshot is taken with interrupts masked**: `run_queue_len` acquires `RUN_QUEUES[c]`,
+a plain `spin::Mutex` with no IRQ masking whose own doc names it a WEDGE-4 `<W1>`
+hazard site, and this witness runs from a *preemptible* task on the render core.
+Unmasked it is a permanent silent self-deadlock waiting to happen — preempt the render
+task while it holds `RUN_QUEUES[1]`, and `run()` on the same core then needs that exact
+lock at IF=0 to requeue the very task holding it; nothing breaks the cycle, nothing
+panics, and since the witness is emitted *from* the dead task, nothing reports it. The
+masked section is bounded: ≤ 8 iterations of lock-free reads plus one non-nested
+run-queue acquisition each, no allocation, no UART, no other lock.
+
+The `serial_println!` is left **outside** that mask, and the reason matters because an
+earlier version of this paragraph gave a wrong one. It claimed the placement avoids
+"~8 ms of masked interrupts every 5 s" — false: `serial::_print` already wraps its
+entire write in `without_interrupts` (`serial.rs:105`), so that masked wire time is paid
+either way and nesting would change nothing measurable. The true reasons are that the
+snapshot is masked because `run_queue_len` *needs* it and the print does not, and that
+the print cannot re-open the wedge for a structural reason: `_print` takes `SERIAL1`
+with **`try_lock()`, never `lock()`**, defers to `serial_ring` when contended, and has a
+lock-free `raw_byte` panic hatch — so no core can block on the UART lock and no holder
+can be preempted into a cycle. The serial path is immune to this wedge by construction.
+
+The whole line is then composed into one stack buffer and handed to a **single**
+`serial_println!`: piecewise fragments would drop the UART lock between fields, and a
+witness another core can cut in half is not evidence.
+
+**A row counts as live for three independent reasons**, and the list is written out
+because losing one of them nearly printed the `--` token for the best-measured core on
+the machine. `tracked` is `live > 0 || pegged || fold_age_ms < 500 ms`: (1) we hold a
+measured in-flight span for it (the self row); (2) we can infer one (`pegged`, remote
+rows); (3) it folded a span recently. Gating `pegged` on `live == 0` — correct in
+itself, to make inference a remote-only fallback — briefly removed reason (1) from the
+predicate, and since `fold_age_ms` for the self row *is the current pass's duration*,
+any render pass reaching the emit ≥ 500 ms after its dispatch would have printed
+`c1=--` while a measured 100 % sat unused behind it. Boot AH's first render pass is
+237 ms against that 500 ms threshold. Anything added later that produces a percent must
+extend the list too.
+
+The pegged token's `(name)` is **best-effort**, not proven. `core_load` loads `current`
+before the name so the name is as-new-or-newer than the `current` that set `pegged`,
+which closes the stale direction; a remote dispatch landing between the two loads can
+still name a newer task, and the emit-side mask cannot help because the racing writer is
+another core. Read the `*` as evidence about the core and the name as a strong hint.
+
+Still open after this arc, in the order the campaign takes them: BSP-serial boot
+probing and band-parallel compositor flush. Placement and work stealing are the next
+section. `ui_status::live_permille`'s x86 arm still returns `None` and falls back to
+the event meter — wiring it to this feed so the panel strip and the serial line read
+one source is the survey's Arc-0 scope item 4, **deferred by the implementing session
+and awaiting the integrator's explicit accept**, not silently dropped.
+
+### Load-balanced placement + work stealing (x86_64, SMPBAL-X86)
+
+The measurement SCHEDLOAD-X86 exists to make finally got taken at the bench: six vug
+instances open on the rMBP, and the load line read one core pinned near 100 % with
+several workers flat at 0 %. Two mechanisms produced that, and this arc lands both
+halves plus the correctness fix migration forces.
+
+**Why the pile-up happened.** Every x86 spawn site named a core, and that decision was
+final — `make_ready` enqueued on `task.cpu` unconditionally, nothing re-placed at wake,
+and `run()`'s empty-queue arm went straight to `enable_and_hlt`. `bg_place_cpu` returned
+the caller's core, the caller is the shell, and since SCHED-X86 the shell *is*
+`x86_render_service`. So every program launched landed on the render core and stayed
+there, whatever the other seven cores were doing.
+
+**Placement — `CPU_AUTO`.** `sched::CPU_AUTO` (`usize::MAX`) is a sentinel `target_cpu`
+meaning "place me". `pick_cpu` checks the **pin contract first**: any other value is
+returned unchanged, so every pre-existing spawn site — render, input, usb-pump, the
+whole fixture ladder — is untouched and `SCHED-X86 PLACE-CHECK` keeps reading `PASS`
+with no exemption (and must not be given one; a `PLACE-CHECK` taught to tolerate
+migration cannot falsify what it was built for). For `CPU_AUTO` it scans the
+**dispatching** cores — `ONLINE_MASK`, set at the top of `run()`, which is the "is this
+core actually popping its queue" predicate `bg_place_cpu` has wanted since WINX-3 — and
+picks by (1) shallowest ready queue, (2) lowest SCHEDLOAD-X86 busy percent, (3) a
+rotating cursor. Three exclusions, of two different kinds:
+
+| # | excluded | kind | relaxes? |
+| --- | --- | --- | --- |
+| 1 | core 0, for a **cooperative** (IF=0) ring-3 task | correctness — it masks the timer for its lifetime and freezes the global ms-clock | **never** |
+| 2 | the **service** core | deadlock — `x86_usb_pump` holds the raw `XHCI_CONTROLLER` spinlock there, and a co-located preemptible task that also takes it (any ring-3 program touching storage) can preempt the holder then spin on a lock whose owner cannot run. This is `xhci_worker_cpu`'s rule, which DECLINES rather than co-locate | tier 2 |
+| 3 | the **render** core | performance — it owns the panel and hosts the shell, and it is the core the imbalance piled onto | tier 3 |
+
+Rules 2 and 3 relax in tiers mirroring `smp::worker_pool`'s
+`Exclusive`/`SvcShared`/`RenderShared`, so a machine with too few dispatching cores
+still places somewhere real. Rule 1 has no tier. `run_user_image` and `bg_place_cpu`
+now pass `CPU_AUTO`, which closes the open item above.
+
+**Correction — `try_steal`.** Placement is one guess made at spawn; stealing is what
+makes a wrong guess cheap. An idle core — one whose own queue came up empty — takes one
+eligible task off the deepest other queue instead of halting: peek depths, steal under
+the **victim's lock only** (re-checking depth), release, re-home `task.cpu`, push
+locally. One lock at a time, so no ordering hazard. `STEAL_MIN_DEPTH = 2` leaves the
+last ready task at home, which is what stops two idle cores ping-ponging a lone task.
+`steal_one` scans **LOW→HIGH** priority — take a core's background work, never its most
+urgent task. Neither the render core nor the service core steals — exclusions 2 and 3
+above, repeated here because a steal is a placement decision `pick_cpu` never sees — but
+both remain valid *victims*, since draining eligible work off them is the point.
+Exclusion 1 is likewise repeated in `steal_one`'s predicate.
+
+**Eligibility is the pin contract, and on x86 that includes ring-3 tasks.** `Task.steal_ok`
+is set once at spawn as `requested_cpu == CPU_AUTO`. aarch64 excludes EL0 tasks
+categorically; x86 does not need to, and the asymmetry is worth stating precisely
+because it is the reverse of what was expected. aarch64 cannot steal an EL0 task
+because three per-core residency tables keyed on `task.cpu` are mutated only at spawn,
+re-place and reap while its `try_steal` re-homes without transferring them — x86 has no
+such tables. There is no ASID, no per-`(core, slot)` table, no FPU/XSAVE state (the
+target builds `+soft-float` with SSE/AVX off), no FS base, and GS base is pure per-core
+state a migrated task correctly reads fresh. Everything per-task is re-derived at the
+single dispatch site: CR3, TSS.RSP0 and the SYSCALL kernel rsp. So `task.cpu` is a pure
+*policy* field here, and the whole aarch64 SPREAD-4…15 apparatus — margin, freshness
+gate, co-placement, recruit — is deliberately **not** ported. That layer exists solely
+because EL0 tasks there cannot be stolen, it ships a documented 4–10 migrations/sec/task
+churn cost, and its own file records three successive arcs of it being "correct on a
+saturated board and wrong on an idle one".
+
+**The TLB obligation — and why it ships in the same commit.** x86 has no broadcast
+invalidation and no shootdown IPI: `invlpg` and `mov cr3` are both core-local. Every
+user-TLB argument in `memory.rs` rested on an unwritten premise — *the only core that
+ever installs a given user CR3 is the core that will restore the kernel CR3 when that
+address space is torn down* — which held **only because tasks did not migrate**.
+Stealing falsifies it, and the failure is silent rather than a crash, because
+`slot_cr3(s)` is a fixed physical address reused by every tenant of that slot over the
+same backing frames:
+
+* *intra-tenant* — a task stolen away from core B, changing its own leaves elsewhere,
+  and stolen back, runs on B's stale entries if B dispatched nothing else meanwhile;
+* *cross-tenant* — a task migrates off B and exits elsewhere, so only that core
+  restores; the slot is freed and re-allocated at the same CR3 over the same frames, and
+  the **new** tenant dispatched on B runs under the **previous** tenant's cached
+  translations. That is stale W bits against the new ELF's W^X layout (a live W^X bypass
+  of the GR19 shape) plus reach into window-surface pages `clear_slot_fb` unmapped with
+  a local `invlpg` only.
+
+Both need only that core B dispatched nothing with a different CR3 in the interval,
+which is exactly the state `try_steal` runs in. The fix needs no IPI, because a core
+idling on a stale root cannot *consume* a stale user translation — the kernel half is
+identical in every slot PML4 and the kernel reaches user backing through identity
+aliases, never `USER_BASE`. So the reload is deferred to the dispatch that would use it:
+`memory::AS_GEN` is bumped by every user-leaf mutation (slot build, teardown/recycle,
+the ELF permission pass, every window map/unmap), `SchedCpu.cr3_gen` records the
+generation at which each core last validated its live CR3, and the dispatch site reloads
+CR3 unconditionally when the two differ instead of taking `switch_cr3_if_needed`'s skip.
+A full non-global flush on this hardware — nothing the kernel maps carries `PTE_GLOBAL`
+and firmware leaves CR4.PGE clear. Cost: one relaxed load per dispatch, one atomic add
+per mutation, at most one extra `mov cr3` per core per mutation. Deliberately *not*
+"make the reload unconditional for user targets", which would regress the U3.5 fast path
+the conditional exists for.
+
+**Witnesses.**
+
+```
+:: SCHEDPLACE-X86: '<name>' -> c<N> (q=<depth> load=<pct>% from c<caller>) ::   (first 24 auto-placements)
+:: [smpbal] steal '<name>' c<A>->c<B> ::                                       (first 24 migrations)
+[schedx86] load c0=…% … sw=[…] q=[…] steal=<moves>/<passes> asgen=<gen>/<reloads>  (every ~5 s)
+```
+
+`steal=` carries **both** terms, never just the count, because the ratio is the
+falsifier and the count alone is not. aarch64 paid for that lesson: a steal counter
+climbing at *dispatch* rate rather than at *idle-pass* rate means churn, not balance. A
+fleet in balance shows moves ≪ passes, with moves going flat while passes keep climbing.
+**`steal=0/<large>` is a healthy reading**, not a dead instrument: it says placement got
+it right and no core ever had backlog behind a running task. `passes = 0` is the dead
+reading.
+
+`asgen=` exists because the CR3-generation fix has no other falsifiable surface — a
+stale-TLB cross-tenant read is silent by construction, so the only thing observable
+about the mechanism is whether it *fires*. A generation climbing with window/launch
+activity while `reloads` stays at 0 means the dispatch site is not consulting it.
+
+**Limits, stated rather than discovered later.**
+
+1. **Sleepers are never touched.** A sleep deadline lives in the parking core's local
+   APIC tick domain and is not portable between cores. A sleeping task is not in a run
+   queue, so `try_steal` cannot reach it — and must not be "helpfully" taught to.
+2. **The steal takes a *remote* run-queue lock**, which is new on this arch. Both the
+   peek and the steal go through the WEDGE-4 bounded-spin wrapper on `wedge2` builds, so
+   `<W1>`/`<W2>` still see every acquisition. Land the first metal boots with
+   `UNAOS_WEDGE2=1`.
+3. **`<W1>` changes meaning slightly.** `wedge4`'s flag is set and cleared by the
+   captured core index, so it is still mechanically correct across a migration, but read
+   the token as "some core was mid-enqueue", not "this core was".
+4. **The load percent cannot see ISR load** (SCHEDLOAD-X86 limit 1), so a core saturated
+   servicing device interrupts with an empty queue reads 0 % and looks like a placement
+   candidate. That is unchanged by this arc and bounded by the fact that placement is
+   only a hint.
+5. **Two witness structures under feature gates would under-report across a migration**
+   and are left alone deliberately: `video/cursor.rs`'s overlay `owner_cpu` and
+   `wedge2::CHAIN_CORE` both compare an owner-core claim recorded earlier. Neither is
+   reachable in practice — the compositor task is explicitly placed, hence pinned — and
+   weakening either would retire a real falsifier.
+
+### The corrector that could not see the packing (x86_64, VUGSPREAD)
+
+**Symptom, Boot AS.** A vug held `[wpace] win=1 pres=96 paced=0 slept=0ms rate=19.1/s`
+for the whole capture — every present already late, never reaching the pacer's sleep —
+while the desktop on `win=0` held a clean `60.0/s` on the same wire. Present syscalls
+were not the cost (`[wc-h] maxpresent_us=4775` against a ~52 ms frame). The CPU-pulse
+census read `c0 busy/idle=61455/249 -> 99%`, `c5 -> 99%`, and `c3`/`c4` at exactly
+`0/250`: two cores pegged, two cores never dispatching a thing. And the corrective half
+of SMPBAL-X86 read `steal=1/4574483` — **one migration in four and a half million idle
+passes, over ten minutes, on a visibly lopsided machine.**
+
+**Three defects, all convicted from the source before the next boot.**
+
+1. **A ring-3 thread's core was treated as a pin.** `spawn_user_thread` set
+   `steal_ok = target_cpu == CPU_AUTO`, and its own comment observed — without alarm —
+   that `sys_thread_spawn` always names a core, so `steal_ok` was *always* false. The pin
+   contract exists so that render / input / usb-pump / fixtures, which name a core because
+   the core is part of their correctness, never migrate. A `SYS_THREAD_SPAWN` core is not
+   that: ring 3 passes `place ∈ {0 = my core, 1 = a sibling}`, a locality *hint* in the only
+   vocabulary the syscall has. Promoting it to a kernel guarantee made the parent process
+   movable and its own threads immovable, which was never a considered position. A vug is a
+   parent plus two workers and asks for one worker at `place=0` — so parent and worker
+   shared one core **by request, permanently, with nothing in the system able to undo it.**
+2. **"A sibling" meant "the same sibling, every time."** `sibling_online_cpu` returned the
+   first core matching its probe, in index order, with no reference to load. Every `place=1`
+   thread on the machine landed on the same low-numbered core.
+3. **The steal floor counted the wrong population.** `STEAL_MIN_DEPTH = 2` was justified as
+   "a core with one task is not loaded" — a true sentence attached to the wrong quantity. A
+   run queue holds only READY tasks; the executing one lives in `SCHED[cpu].current`. So a
+   floor of 2 *on the queue* means three runnable tasks before a core counts as loaded, and
+   the 2-on-1 packing sits at queue depth **one**. It was not missed by the corrector; it
+   was below the corrector's floor by construction.
+
+**The repairs, all in `arch/x86_64/sched.rs`.** A ring-3 thread is steal-eligible, full
+stop — it starts exactly where `sys_thread_spawn` asked and an idle core may correct it
+later, which is this arch's whole stated model. `sibling_online_cpu` now chooses among the
+eligible cores with `pick_cpu`'s key chain (shallowest queue, then lowest rolling busy
+percent, then the shared rotating cursor), deprioritising render/service in a two-step
+ladder rather than excluding them — excluding them outright would reintroduce the silent
+`bg_place_cpu` hang its probe exists to prevent. And the floor is asked of the *victim*:
+depth 1 suffices when the victim is running something (that is two runnable tasks), while a
+victim at `PRIO_IDLE` keeps the floor of 2, because that core is between tasks and about to
+dispatch the very task a thief would take — which is the ping-pong the constant was
+actually reaching for. The eligibility probe, the pin contract for named *kernel* spawns,
+the one-task-per-idle-pass rate bound and the `AS_GEN` TLB discharge are all unchanged.
+
+**`[spread]` — the placement witness.** One line, emitted from `emit_load_witness` so it
+rides that instrument's existing rate limit and adds no clock:
+
+```text
+[spread] pack=0 spare=3 rqp=[0/0/0,1/0/0,--,1/1/1,…] steal=4/812331 m1=3 mh=4 remig=0 packseen=12 cr3sw=91204 decl=t:0 e:812327 f:0 p:0 d:0 i:0
+```
+
+`rqp` is `running/ready/pinned` per core (`--` for a core that never entered `run()` — not
+an idle core, and the distinction is the same one `[schedx86] load` draws between a measured
+zero and an absent measurement). `pack` counts dispatching cores carrying `running + ready
+>= 2`; `spare` counts dispatching cores with nothing at all. **`pack >= 1` together with
+`spare >= 1` is the defect.** The column cap is carried onto this line too — a capped machine
+under-reports `pack` and over-reports `spare`, the one direction in which the witness could
+certify headroom that is not there.
+
+`decl=` breaks declined steals into disjoint reasons: `t` thief excluded, `e` nothing ready
+anywhere, `f` below floor at the peek, `p` all pinned, `d` a true drain (the victim's queue
+was **empty** under the lock), `i` the victim went **idle** between peek and lock and raised
+its own floor to 2. `d` and `i` are split deliberately: `i` is this arc's ping-pong guard
+firing and folding it into a race counter would hide the mechanism a reviewer most wants to
+audit.
+
+**Conservation law and its tolerance.** `e + f + p + d + i + moves == passes`, with `t`
+outside `passes`. The terms are sampled at slightly different instants from a live machine,
+so a residual of a **few** is skew and means nothing; a residual in the **thousands**, or one
+that grows with the capture, means a return path was added without a counter and every
+attribution below it is suspect. Score the magnitude, not the equality.
+
+**Attribution.** `m1` counts moves taken from a victim at ready-depth 1 — precisely what the
+old constant floor refused. `mh` counts moves of a task whose core came from a ring-3 hint —
+precisely what the old pin contract froze. They are independent, not exclusive: a vug worker
+packed behind its parent scores **both**, and that is the honest answer, since neither repair
+alone would have produced that move. What the pair does settle is the one-sided cases —
+`mh > 0` with `m1 == 0` means the pin was the whole story, `m1 > 0` with `mh == 0` means the
+floor was. Repair (2), `sibling_online_cpu`, leaves no trace in the steal path at all and is
+read off `rqp=` at launch and off `SCHEDPLACE-X86`, never off these.
+
+**`packseen`** is the high-rate companion to `pack`. The census samples every ~5 s from the
+render service, so packing that forms and clears inside a frame is invisible to it; `packseen`
+is evaluated on every steal pass — millions per capture — inside the peek loop that already
+holds the depth. A `pack=0` census standing beside a near-zero `packseen` is a real
+refutation; `pack=0` alone is only a quiet sample.
+
+**`cr3sw`** is the price tag. A migration lands a task on a core standing on another root, so
+the dispatch takes `switch_cr3_if_needed`'s reload — and on this hardware nothing kernel-mapped
+carries `PTE_GLOBAL` and firmware leaves CR4.PGE clear, so every one is a whole-TLB flush. It
+is not a migration counter (ordinary two-program alternation on one core takes that arm
+constantly), so read its **delta** against the `steal=` delta over the same interval.
+
+### Reading the next capture
+
+All three repairs are in force on the next boot, so the table below is what *that* machine can
+print. An earlier draft of it listed pre-fix diagnoses that a post-fix boot cannot reach, which
+is the same defect as a witness that cannot fail.
+
+| next boot shows | reading |
+| --- | --- |
+| `pack -> 0`, `moves` a handful then flat, `remig 0`, `win=1` off 19.1/s | **PASS** — spread, and settled rather than oscillating |
+| `pack=0` **and** `packseen` near 0, `win=1` still 19.1/s | **REFUTED.** No packing at the census *or* across millions of pass observations. Go to the yield-spin barrier: the TIME feed already reads c0/c5 at 2–3 % where the EVENT feed reads 99 % |
+| `pack=0` but `packseen/passes` materially non-zero, rate unchanged | the packing is real and **transient** — sub-census, forming and clearing inside a frame. Neither the floor nor the pin can hold a queue that is empty whenever it is looked at; this is a barrier/wake-latency story, **not a placement one** |
+| `pack>=1`, `spare>=1`, packed core's `pinned` > 0 | **the fix FAILED.** Post-fix a ring-3 thread is steal-eligible, so a pinned task on a packed core is either a kernel task that legitimately named that core (check the name on `[schedx86] load`) or a ring-3 path that does not go through `spawn_user_thread`. Find which before touching anything else |
+| `pack>=1`, `spare>=1`, `pinned=0`, `decl i:` climbing | the **idle-floor guard** is holding the packing: ready-holding cores keep going idle between peek and lock and re-raising their floor. Working as specified, and declining a move that would have helped. Tuning, not a defect — the change would be to admit a depth-1 steal once the thief has been idle more than one pass |
+| `decl f:` climbing | the same guard one step earlier. With the per-victim floor in force `f` can only fire when *every* ready-holding core is at `PRIO_IDLE` with depth 1. It does **not** mean "the old floor hid it" — that diagnosis is unreachable now |
+
+### The revert criterion, as a number
+
+"Climbing" is not a threshold against a baseline of one move in 4.5 million passes, so the
+criterion is numeric. Revert `steal_floor` to the constant `STEAL_MIN_DEPTH` — keeping the
+`spawn_user_thread` pin release, which is not implicated in churn — if **any** of these holds
+on a steady-state capture, measured as a delta over one `[spread]` interval and sustained
+across three consecutive intervals:
+
+- **`remig / moves > 0.5`** — more than half of all migrations are re-migrations, i.e. the
+  fleet is passing tasks around rather than placing them.
+- **`moves > 100/s`** — a settling fleet is a handful of moves *total*; a hundred a second is a
+  balancer oscillating. (Boot AS's whole ten minutes produced one.)
+- **`Δcr3sw / Δmoves` far above the `Δcr3sw / Δmoves` of the same workload before the change,
+  or `Δcr3sw` itself rising by more than ~2 per move** — each move should buy about one extra
+  whole-TLB flush; several means tasks are bouncing between cores that keep re-installing each
+  other's roots.
+
+None of these can be evaluated from a single sample, which is why all three are stated as
+sustained deltas.
+
+**⚠ Boot A: ALL THREE LEGS FIRE, and that is unread.** Measured over one 11.25 s steady-state window
+(793 259 → 804 512 ms) of `~/unaos-bench/capture/gr25-bootA/ttyUSB0.log`: `remig/moves` ≈ **1.0**
+(> 0.5), `moves` ≈ **157/s** (> 100/s), `Δcr3sw/Δmoves` ≈ **16.3** (≈ 2 expected). Ten desktop vugs is
+not the "steady state" the criterion was written against and the sustained-across-three-intervals test
+has not been applied, so this is **not** a revert call — but it does mean the churn criterion and the
+transient-packing row above **select the same Boot A signature**, and the `[wpace]`-side arc that cited
+that row (userspace.md § VUGSPIN) has since **withdrawn** its conviction on load-invariance grounds. Any
+next reader scoring that row against this capture must score the churn criterion beside it; neither is
+convicted, and treating row 3 as a unique selection is the specific mistake already made once.
+
+### The churn is now convicted, and the fix is a cooldown, not the revert (x86_64, VUGSPREAD-COOL)
+
+**Boot C settles the "unread" call.** `~/unaos-bench/capture/gr26-bootC/ttyUSB0.log`, a six-vug storm,
+holds the churn signature at full strength and SUSTAINED across the whole storm, not one window:
+`[spread]` reads `remig=750397/750418` (**≈ 1.0**, every steal a re-migration), `cr3sw` climbs to
+**14 073 209** whole-TLB flushes, and it does this while `[schedx86] load` shows **six cores at 99 %** —
+i.e. the fleet was ALREADY spread, and every one of those 750 k moves was work thrown away passing the
+same handful of vugs around. The operator-visible cost is two-fold: each vug's compose smears across a
+rotating set of cores (the uneven per-core reading), and a vug CLOSE frees a core whose idle pass
+immediately steals a survivor, co-locating it and destabilising the survivors' rates (the "close makes
+the others spike" report).
+
+The mechanism is the one the idle-floor guard does **not** reach. `steal_floor`'s running-victim floor
+of 1 is correct on an under-loaded board; on a saturated one the churn is driven by THIEVES, not
+victims: a vug blocks briefly inside `SYS_WIN_PRESENT`, its home core's queue empties, that core steals
+a neighbour, the vug unblocks and re-queues home — now home is over-subscribed and a third idle core
+steals it back. The guard covers an IDLE victim keeping its lone task; it says nothing about a task that
+was just moved being moved straight back.
+
+**The fix is a per-task migration cooldown, and it is preferred over the documented revert.** The
+revert criterion above prescribes restoring `steal_floor` to the constant `STEAL_MIN_DEPTH`. That would
+stop the churn, but it also throws away the depth-1 rebalance this whole section exists to add — a
+parent+worker packed on one core with idle cores beside it would once again sit unbalanced. Instead,
+`Task::migrate_ms` stamps `arch::ms()` at each migration and `RunQueue::steal_one` refuses to take a
+task that migrated less than its cooldown window ago (16 ms flat when this section was written —
+escalated per-task since GR27 Boot B, 16→256 ms doubling per re-steal; see the GR27 section below):
+
+- The **first** steal of any task is never delayed — a never-migrated task carries `migrate_ms == 0`,
+  which always clears the window — so the depth-1 rebalance VUGSPREAD added fires exactly as before.
+- Only the immediate RE-steal is refused, which is the ping-pong and nothing else. A storm settles to
+  one-vug-per-core within a transient of ~1–2 moves per task and then STAYS there, because a settled
+  fleet has depth 0 everywhere and nothing to steal.
+- A later vug CLOSE therefore frees exactly one core with nothing left to steal: the survivors keep
+  their homes instead of being re-grabbed. That is the scheduler half of the close-spike; it is not a
+  rate cap on the renderer (the vug still presents unbounded), only a damp on re-placement.
+
+**The new witness.** `steal_one`'s per-task skips are counted by `STEAL_COOL_SKIP` and printed as
+`cool=` on `[spread]`. It is the direct counterweight to `remig`: a healthy post-fix capture reads
+`cool=` CLIMBING while `remig` stays near flat — the ping-pong being REFUSED rather than served. A
+cooled task that leaves `steal_one` empty-handed still lands on `p`/`STEAL_D_PINNED` at the pass level,
+so the `e + f + p + d + i + moves == passes` conservation law is untouched; `cool=` is a side counter
+like `remig`, outside it.
+
+**What this fix does and does NOT even out.** With WCPAR step-3 (the parallel per-core compose) reverted
+on trunk, `COMP_GATE` serialises the whole compose again, so the per-core COMPOSE census (`[wcpar]`
+`c0..c7`) cannot be evened by any scheduler change — a serial compose lands on whichever core holds the
+gate, wherever the vug task runs. What the cooldown evens is the PER-CORE CPU LOAD / pulse (`[schedx86]
+load`, `sw=`): the vug TASKS settle one-per-core and stay, so the load reads even and a close leaves it
+even. Evening the compose census itself is deferred with step-3 (see `engine.md` §8).
+
+**Next boot's readings, as falsifiers.** On the next six-vug storm: `[spread]` `remig`/`moves` collapses
+from ≈ 1.0 toward 0 and `cool=` climbs in its place; `moves` goes flat after the settling transient;
+`cr3sw`'s delta per move falls back toward ~1; `[schedx86] load` shows the vug cores at a stable, even
+occupancy that a close does not disturb (the freed core simply goes idle, the survivors hold their
+homes). A boot where `remig` stays ≈ 1.0 with `cool=0` means the stamp or the read is dead — the brake
+is not firing — and is the falsification this witness exists for.
+
+### The flat cooldown was scored and failed: the brake now escalates (x86_64, GR27 Boot B)
+
+**Boot B is the next boot, and the reading is mixed in the way that matters.** GR27 Boot B
+(`~/unaos-bench/capture/gr27-bootA/ttyUSB0.log`, the vug-storm slice) shows the brake firing —
+`cool=` climbed 25 920 → 631 339, ~3.3 k refused re-steals per second — while STILL failing the
+settlement promise: `remig=92162` of `moves=92184` (99.98 % re-migrations, ~540/s sustained) and
+`[spread]` held `pack=4-5` **with** `spare=1-2` for ~170 s (61 121 ms `pack=5 spare=1`; 169 727 ms
+`pack=5 spare=2`; 223 758 ms `pack=4 spare=2`), with `pinned=0` throughout. So the stamp and the read
+are alive, and the falsifier row above ("`remig` ≈ 1.0 with `cool=0`") does not fire — the defect is
+in the WINDOW'S SHAPE. A flat 16 ms window does not settle a ping-pong; it stretches its period: every
+task exits the window with its history erased, as stealable as a never-moved one, so the fleet replays
+the same re-steal cycle at a 16 ms cadence indefinitely. "`cool=` climbing while `remig` stays flat"
+turned out to be satisfiable by a brake that refuses six re-steals and then serves the seventh, forever.
+
+**The fix is a per-task ESCALATING window.** `steal_cooldown_ms(migrations)` in
+`arch/x86_64/sched.rs` computes `STEAL_COOLDOWN_MS << min(Task::migrations, STEAL_COOLDOWN_ESC_CAP)`
+with base 16 ms and cap 4 — i.e. 32, 64, 128, 256, 256… ms for the 1st, 2nd, 3rd, 4th, 5th+
+re-steal. Each re-steal a task suffers earns it an exponentially longer residency on its next home,
+until at 256 ms (~256 quanta at the 1 kHz tick) the wake/block cadence that drives the ping-pong
+(~0.5–16 ms) can no longer outrun the window and the task stays put. Preserved exactly: the FIRST
+steal of any task is free (`migrate_ms == 0` clears the test before the window is computed), so the
+depth-1 rebalance VUGSPREAD added is untouched; the rtpi priority-boost exemption (a boosted lock
+holder is always stealable) is untouched; and knob-off the `not(rtpi)` branch remains the vug-storm
+code with only the window widened.
+
+**The decay question, decided: `Task::migrations` never resets.** The gate is RECENCY-based — a
+`migrate_ms` older than the capped 256 ms window clears it regardless of how large the count has
+grown — so a long-settled task is always immediately stealable and history alone can never strand a
+task on a bad core: a genuine topology change (a vug CLOSE freeing a core) sees every settled
+survivor as stealable on the first pass, and only a *second* re-steal within a quarter second pays
+the escalated window. Resetting the count on the wake-side push was considered and rejected as
+actively harmful: the ping-pong cycle IS block → wake → push → re-steal, so every re-steal the
+escalation exists to refuse is preceded by exactly such a push — a reset there would zero the
+history each time around the loop and reproduce the flat window with extra steps.
+
+**Expected wire signature next boot, as falsifiers.** On the next vug storm: `remig/moves` collapses
+toward zero mid-workload (each task can be re-stolen at most ~4 times before its window outlasts the
+cadence, so re-migrations are a bounded settling transient, not a sustained rate); `pack>=1` WITH
+`spare>=1` closes after the transient instead of co-existing for minutes; `cool=` stops climbing
+linearly — it rises during settling and then goes near-flat, because a settled fleet has depth 0
+everywhere and `steal_one` is no longer even walking candidates to refuse. A boot where `remig`
+keeps climbing at hundreds per second, or where `pack`+`spare` co-existence persists past a few
+seconds of storm with `pinned=0`, refutes the escalation shape itself — the next lever is the cap or
+the base, and the revert criterion above (restore `steal_floor` to `STEAL_MIN_DEPTH`) still stands
+behind it, unchanged in its numbers.
+
+**Naming the moves.** `STEAL_LOG_COUNT` is reset at each `storm_census` boundary. The cap of
+24 named migrations per boot was generous when a boot produced one steal; with the corrector
+able to see the packing, early-boot settling would burn the whole cap and the storm the arc
+exists for would report its moves as an uninterpretable increment on `steal=` — the one boot
+that could answer the question would be the one that could not. The cumulative totals are
+untouched by the reset; only the naming is renewed.
+
+**A migration's FP obligation, stated correctly.** The migration-soundness argument's FP bullet
+used to read "no FPU/XSAVE context exists anywhere in this kernel", which is false: x87/MMX is
+ring-3-reachable here (CR0.EM/TS are 0 out of INIT, and the U2.5 first-entry scrub in
+`user_task_trampoline` exists because of it). The correct, narrower statement is that **x87 is
+not per-task state in this scheduler at all** — nothing saves, restores or attributes the FP
+file to a task, so a ring-3 task already loses it to the next task on its own core and a
+migration is the same hazard on a different core, not a new one. What makes the omission
+tolerable is a **convention, not an enforcement**: userspace is built `+soft-float`, so no
+program in the tree keeps a value there across a preemption. A future ring-3 program compiled
+with hardware FP would need per-task save/restore — with or without stealing.
+
+**QEMU cannot gate this.** The behaviour is a function of core count, real dispatch timing
+and a frame-paced ring-3 fleet; `kernel8-test` is aarch64 and does not compile this file at
+all. The x86 legs prove the code type-checks and the witness is bounded; the placement
+behaviour itself is metal-only, and is stated so rather than dressed in a gate that cannot
+fail.
 
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
@@ -1761,13 +2472,60 @@ Combined-boot evidence (one kernel running SMP + USB + net + video):
   preemptive SMP scheduler on all four Pi 4 cores, GIC-driven off the per-core
   generic timer PPI (`TIMER_INTID = 30`), with work stealing, priority aging and
   EL0 tasks. Most of the sections above this one are aarch64 work.
-- **No priority inheritance** on `Mutex` (assessed as large/thorny under CPU
-  pinning; deliberately deferred).
+- ~~**No priority inheritance** on `Mutex` (assessed as large/thorny under CPU
+  pinning; deliberately deferred).~~ **Retired by R1 / rtpi (`UNAOS_RTPI=1`,
+  x86_64).** The sleeping `Mutex` now runs a minimal, soft-RT **priority
+  inheritance** protocol so a low-priority holder cannot be preempted by
+  mid-priority tasks while a strictly-higher task blocks on the lock (bounded
+  priority inversion). The redesign's core rule (see the "R1 / rtpi" block in
+  `arch/x86_64/sched.rs`): donation state lives on the LONG-LIVED per-lock
+  control block (`PiCtl`, embedded in the `'static`-by-contract `Mutex`), never
+  on the transient `Task` — a `Task` pointer appears only as an IDENTITY TOKEN
+  (compared, never dereferenced cross-CPU), so the donor-loads/holder-exits/
+  donor-derefs use-after-free is structurally impossible. Three moves:
+  (1) *acquire-time donation* — a blocker raises each lock's `boost` down the
+  holder chain, propagated **transitively** via `PiCtl::owner_waits` (the
+  holder's own published uplink), accelerating holders by identity
+  (bump-if-running / relocate-if-ready); (2) *handoff inheritance* — the task
+  that wins a contended acquire inherits the lock's standing `boost`, so a
+  FIFO handoff to a lower waiter over a higher one does not reopen the
+  inversion; (3) *revert on the last release* — the last waiter out resets the
+  lock's `boost` (`nwait`-gated so a live donation is never destroyed),
+  leak-free by construction. The boost is read by every placement/preemption
+  site through `sched_prio` = max(base, max over held locks' `boost`), the
+  per-task `held` set capped at `PI_HELD_MAX` (overflow degrades to a missed
+  boost AND a severed transitive uplink for the dropped lock — bounded,
+  documented at the constant). All per-task bookkeeping runs under
+  `without_interrupts` so a task's self-identification (`pi_current`) cannot
+  be preempted-and-stolen mid-read (the GR27 review's B1).
+  Only the owner-tracked sleeping `Mutex` participates —
+  the counting `Semaphore`, futex and the IRQ-masked `spin::Mutex`es are out of
+  scope (no single owner / non-blocking / non-preemptible). **DEFAULT OFF**: the
+  PI fields do not exist and `Mutex::lock` takes its original single-`wait()`
+  path, so an unarmed build is byte-identical. Witness: the `[rtpi]` rollup
+  (`inherits` / `max_jump` / `chain_max` / live `active` leak gauge) plus
+  rate-limited `[rtpi] inherit …` traces, reading zero honestly when no
+  inversion occurs (`src/rtpi.rs`).
 - **APIC timer is uncalibrated** (~1 ms/tick on QEMU); a CPUID 0x15 / TSC-
   deadline calibration is future work.
 - **`RwLock` reader starvation is unbounded** (condvar-blocked tasks do not age),
   and each condvar has a documented capacity precondition. These are recorded as
   preconditions rather than fixed.
+- ~~**x86_64 tasks never migrate, and placement is decided once at spawn.**~~ **Stale
+  — retired by SMPBAL-X86.** x86 now has `CPU_AUTO` placement over the dispatching
+  cores and idle-core work stealing, for kernel *and* ring-3 tasks. What it still does
+  **not** have, on purpose: no re-placement at wake (`rewake_place`), no service
+  priority band (`PRIO_SERVICE`/`spawn_prio` remain aarch64-only, so an operator-started
+  program is still a round-robin peer of the compositor wherever it lands), and none of
+  the aarch64 SPREAD-4…15 layer. Correction happens on the idle side only.
+- **No TLB-shootdown IPI on x86.** Cross-core staleness of *user* mappings is handled at
+  DISPATCH by the `AS_GEN` deferred-reload scheme (SMPBAL-X86), not by invalidation — and
+  dispatch is the scheme's boundary: a sibling ring-3 thread of the same process already
+  RUNNING on another core (shared `user_cr3`, placed by `sibling_online_cpu`) keeps stale
+  leaves for the rest of its quantum when a peer unmaps a user page (local `invlpg` only).
+  Pre-existing, not widened by this arc (threads are `steal_ok == false`), and OPEN.
+  Kernel-half mappings mutated after a slot's PML4 was built are a separate, pre-existing
+  question the scheme also does not address.
 
 ---
 

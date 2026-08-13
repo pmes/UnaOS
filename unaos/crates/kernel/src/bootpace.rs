@@ -165,7 +165,7 @@ pub fn record(tag: &'static str) {
         ORIGIN.store(c, Ordering::Relaxed);
     }
     r.slots[n] = (c, tag);
-    r.len = n + 1;
+    r.len = n + 1; #[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))] { drop(r); crate::splash::advance(tag); } // SPLASH-ALIVE: one boot-crystal frame per milestone (see splash.rs). Inlined on THIS line so no physical line is added — shifting following fns would change their panic Location line-numbers in the loadable image, breaking byte-identity of the gated-off (usbdebug/bootlog/witness) media. drop(r) frees the ring's leaf mutex before the paint's MMIO.
 }
 
 /// Record the start (`done == false`) or the end (`done == true`) of one root port's enumeration.
@@ -240,6 +240,15 @@ pub fn origin_hz() -> u64 {
     counter_hz()
 }
 
+/// The counter value of the `entry` stamp — the zero every `t=`/`since-entry` is measured from —
+/// or 0 when no stamp has been recorded yet. Exposed for the same reason as [`origin_hz`]: an
+/// out-of-module timestamp (the `logts` line prefix) must subtract the LEDGER's origin, not invent
+/// its own, or its absolute column disagrees with every BPACE/GPACE figure by the firmware+
+/// bootloader duration the raw counter includes.
+pub fn origin_cycles() -> u64 {
+    ORIGIN.load(Ordering::Relaxed)
+}
+
 /// Copy the buffered stamps (oldest→newest) into `out`, returning how many were written. Snapshots
 /// under the lock and releases it BEFORE the caller prints, so serial/FTDI I/O never runs while the
 /// ring is held.
@@ -311,6 +320,27 @@ static LAST_DUMPED_LEN: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// (`./arroyo esp-x86`) carries neither `witness` nor `usbdebug`, and a ledger that only exists in
 /// the builds nobody boots on hardware is not an instrument.
 pub fn service_dump() {
+    // CLOCK-X1 pay-as-you-go (GR18): deliver the deferred clock verdict. It rides HERE rather than
+    // at any of the three service-loop bodies because this function is the one call all three make
+    // ungated — the BSP GUI loop, the `usbdebug` loop and the SCHED-X86 `x86_usb_pump` task — so the
+    // witness reaches the media build that boots on the bench, which is the whole reason this
+    // ledger is ungated in the first place. One relaxed load per pass once the verdict has printed;
+    // the early-return below must NOT precede it, since the ledger stops growing long before the
+    // boot ends and the verdict would then never be delivered on a quiet boot.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::syscall::clock_x1_poll();
+
+    // PAYGO-TERM (GR18): the witness battery's service-pass taker, riding here for CLOCK-X1's exact
+    // reason and no other. A deferred `[wc-g]`/`[wc-d]` sample used to have only one taker — the next
+    // composite — and Boot V showed that is not a taker at all on a boot that goes idle: the last
+    // composite was at 13 776 ms against a 15 000 ms threshold, `x86_render_service` blocks on its
+    // event channel, and the console window sat `state=waiting` for the remaining 210 s. This is the
+    // hook that reaches every x86 service lane ungated, so a matured deferral gets taken whether or
+    // not anything is presenting. Self-throttled to 4 Hz; one relaxed load per pass otherwise. Folds
+    // to an empty fn without `witness` + `wcg-paygo`, and does not exist on aarch64.
+    #[cfg(target_arch = "x86_64")]
+    crate::video::wm::paygo_service();
+
     let mut buf = [(0u64, ""); CAP];
     let n = snapshot(&mut buf);
     if LAST_DUMPED_LEN.swap(n, Ordering::AcqRel) == n {
@@ -344,4 +374,9 @@ pub fn service_dump() {
         DROPPED.load(Ordering::Relaxed),
         hz
     );
+    // IGPU-BLT census rides the ledger emission (SEAT FIXUP, igpu pull-8 review round 2: the
+    // witness fn existed with no caller — the classic instrument that cannot fire). The ledger
+    // re-emits a few times per sit, so the counters arrive as a small time series for free.
+    #[cfg(all(target_arch = "x86_64", feature = "intel-ivb"))]
+    crate::drivers::gpu::igpu::print_blt_stats();
 }

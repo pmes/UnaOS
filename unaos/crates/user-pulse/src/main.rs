@@ -5,8 +5,48 @@
 //
 // PULSE-1: `PULSE.ELF` — the WINDOWED PULSE app. A static ELF64 EL0 program that creates one compositor
 // window and draws the kernel's BeOS-Pulse homage inside it: one segmented bar per core, `PULSE_SEGS`
-// segments, filled in proportion to that core's load over a ~4 Hz refresh window, with a text row per core
-// carrying the percent — or `park` for a core the machine is not scheduling.
+// segments, filled in proportion to that core's load over a 250 ms measurement window, with a text row per
+// core carrying the percent — or `park` for a core the machine is not scheduling.
+//
+// PULSEFLUID — WHY THE METERS MOVE SMOOTHLY NOW, AND WHAT THAT DID AND DID NOT CHANGE ABOUT THE
+// MEASUREMENT. Peter, on Boots AN/AO: "i feel like the pulse leds should be more fluid if you have so many
+// threads going". They were chunky for two independent reasons, and only one of them was about the data:
+//
+//   1. THE REPORTING RATE, not the measurement, was 4 Hz. The old loop slept 250 ms, sampled, painted, and
+//      threw the previous snapshot away — so a viewer saw a new number five times less often than the
+//      instrument could honestly produce one. `SYS_CPUPULSE` reports CUMULATIVE counters, not a
+//      per-second publication, so any pair of samples is a valid window: there is no kernel-side
+//      publication cadence to fix. The loop now samples every `FRAME_MS` = 50 ms and keeps the last
+//      `WINDOW_SLOTS` = 5 snapshots in a ring, so each frame's deltas still span a FULL 250 ms — the
+//      identical measurement window, recomputed 5x more often. This is oversampling, not interpolation:
+//      every painted percent is a real ratio of real counter deltas over a real 250 ms span. The window
+//      SLIDES, which also makes the printed number steadier, because consecutive frames share 4/5 of
+//      their evidence.
+//
+//   2. THE TRACK QUANTISED TO 10% and the breath stepped one whole segment at a time. `PULSE_SEGS` is 10,
+//      so the bar could only ever be at a multiple of 10% and a load walking 34% -> 46% moved the bar in
+//      one visible jerk. The leading segment is now BLENDED between `METER_DIM` and `METER_PURPLE` in
+//      proportion to the fractional part (Q8, so ~0.4% of a segment), which resolves the same measured
+//      value ~256x more finely without inventing any of it. The `RUNNING`/idle breath likewise travels as
+//      a continuous glow with a triangular falloff rather than hopping between segments.
+//
+// AND ONE THING THAT IS DISPLAY SMOOTHING, LABELLED AS SUCH. The BAR's fill is an exponential moving
+// average of the measured percents (`disp = (2*disp + measured)/3` per 50 ms frame, ~100 ms time
+// constant). That is a filter over real measurements — a rendering choice about how a bar catches up, not
+// a claim about the machine — and it is confined to the bar. The TEXT CELL and the serial first-window
+// witness both print the RAW measured percent, unfiltered, so the number an operator reads and the number
+// a headless gate parses are the measurement itself. The EMA is also RESET rather than ramped whenever a
+// core crosses between a percent and a `park`/`run` sentinel: a sentinel is not a load and must never be
+// averaged with one.
+//
+// PACING. The loop still SLEEPS (`SYS_SLEEP_MS`) between frames and never spins; 20 Hz on a 128x128
+// surface is one blocking syscall per 50 ms. `SYS_INPUT_WAIT` (28) is deliberately not used — it is
+// implemented on aarch64 only, and a monitor must repaint on a timer rather than on input anyway. What
+// keeps the 5x present rate from costing anything when nobody can see it is the VUGMIN hidden bit: the RO
+// info page's process-flags word (base + 0x4000, word 0x20, bit 1) says "every window this process owns is
+// hidden below the shell", and while it is set the loop keeps SAMPLING (so the window behind the first
+// visible frame is real) but skips the raster and the present entirely. That is strictly less compositor
+// work than the old 4 Hz loop did while hidden, which was to present regardless.
 //
 // WHY IT EXISTS. The kernel already has that instrument: the `pulse` shell verb (`vug::run_pulse`) takes
 // the WHOLE screen, runs inside the shell command, and draws every pixel in ring 0. As a full-screen mode
@@ -31,9 +71,12 @@
 //
 // THE BASELINE IS NOT A READING. The first sample is taken at startup and is a pure BASELINE: cumulative
 // counters with no window behind them. Painting it would show every core frozen-and-parked, which is an
-// artefact of the instrument rather than a fact about the machine. So the program SLEEPS one refresh
-// interval before its first refresh, and the first frame it ever presents already has a real window behind
-// it. (A counter that reads its own pre-run baseline as a live rate cannot falsify anything.)
+// artefact of the instrument rather than a fact about the machine. So the program SLEEPS a full
+// measurement window before its first PAINT — under PULSEFLUID that is `WINDOW_SLOTS` sample frames, whose
+// only job is to fill the history ring — and the first frame it ever presents already has a real 250 ms
+// window behind it, exactly as before. (A counter that reads its own pre-run baseline as a live rate
+// cannot falsify anything.) Nothing shortens this: a partly-filled ring would paint a 50 ms window while
+// the doc, the text cell and the witness all say 250 ms, which is the same class of lie.
 //
 // EXIT. ESC or `q` closes the window; otherwise it runs until `kill`, like its two siblings. This is
 // `VUG.ELF`'s idiom rather than the kernel monitor's "any key exits": as a full-screen shell mode, exiting
@@ -63,15 +106,19 @@
 //            below uses as an argument) — never a bare `in(...)`, which would promise the compiler a
 //            value the kernel has already zeroed.
 // ---------------------------------------------------------------------------------------------
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
-const SYS_SLEEP_MS: u64 = 5;
-const SYS_GETINFO: u64 = 7;
-const SYS_INPUT_POLL: u64 = 27;
-const SYS_WIN_CREATE: u64 = 29;
-const SYS_WIN_PRESENT: u64 = 30;
+// ABIFREEZE: the numbers are IMPORTED, not re-typed — `una_abi` is the one declaration, shared with
+// both kernels. See its divergence ledger for what the eight scattered copies had already cost.
+use una_abi::{
+    SYS_EXIT, SYS_GETINFO, SYS_INPUT_POLL, SYS_SLEEP_MS, SYS_WIN_CREATE, SYS_WIN_PRESENT, SYS_WRITE,
+};
 /// PULSE-1's own verb: fill a caller buffer with the per-core load sample (see `Pulse` below).
-const SYS_CPUPULSE: u64 = 49;
+///
+/// ABIFREEZE (divergence D2): 49 is reserved on BOTH arches but DISPATCHED only by the x86 kernel —
+/// the aarch64 dispatcher has no arm for it and answers `-ENOSYS`, despite the x86 declaration's own
+/// claim that the number was "minted on BOTH arches". `sample()` below already treats a negative
+/// return as "keep the previous picture", so PULSE.ELF degrades honestly on the Pi rather than
+/// drawing fabricated bars; that gap is now stated in one place instead of being invisible.
+use una_abi::SYS_CPUPULSE;
 
 #[cfg(target_arch = "aarch64")]
 mod sysabi {
@@ -119,11 +166,15 @@ mod sysabi {
 }
 
 /// x86_64 — U1b B1: the kernel's `sysretq` tail zeroes rdi/rsi/rdx/r8/r9/r10 before returning to ring
-/// 3, so every one of those six registers must be declared to the compiler as NOT surviving the
-/// `syscall` instruction: `inlateout(reg) a => _` for the ones carrying an argument, `lateout(reg) _`
-/// for the rest. A bare `in(reg)` promises rustc the register still holds its value afterward — a
-/// promise the kernel breaks — and the compiler is then free to reuse what it believes is a live
-/// value, which is undefined behaviour that surfaces only on real hardware, never in QEMU or `check`.
+/// 3, on EVERY syscall, unconditionally, regardless of how many arguments that syscall took. So every
+/// stub below — regardless of its own arity — must declare all six of those registers as NOT
+/// surviving the `syscall` instruction: `inlateout(reg) a => _` for whichever ones happen to carry
+/// that stub's own arguments, `lateout(reg) _` for the rest. Naming only the registers a given stub
+/// passes (and leaving the others unnamed) is the arity mistake this block used to make: the
+/// compiler is then free to believe an unnamed register — say `rdx` in a 2-argument stub — survives
+/// the call and reuse it, and it does not; it reads back zero. A bare `in(reg)` is worse still,
+/// promising rustc the register still holds its value afterward — a promise the kernel breaks — and
+/// that is undefined behaviour that surfaces only on real hardware, never in QEMU or `check`.
 #[cfg(target_arch = "x86_64")]
 mod sysabi {
     #[inline(always)]
@@ -133,6 +184,9 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
+                lateout("rdi") _,
+                lateout("rsi") _,
+                lateout("rdx") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 lateout("r8") _,
@@ -151,6 +205,8 @@ mod sysabi {
                 "syscall",
                 inlateout("rax") n => r,
                 inlateout("rdi") a0 => _,
+                lateout("rsi") _,
+                lateout("rdx") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 lateout("r8") _,
@@ -170,6 +226,7 @@ mod sysabi {
                 inlateout("rax") n => r,
                 inlateout("rdi") a0 => _,
                 inlateout("rsi") a1 => _,
+                lateout("rdx") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 lateout("r8") _,
@@ -231,6 +288,9 @@ static mut INFO: [u64; 2] = [0; 2];
 
 /// Read the kernel's (pid, ticks). Returns (0, 0) if the copy is refused, rather than exiting: a monitor
 /// that cannot learn its own pid can still draw honest bars.
+///
+/// The second element is in KERNEL TICKS, whose rate is per-arch — use [`getinfo_ms`], never the raw
+/// value, wherever a millisecond is meant.
 fn getinfo() -> (u64, u64) {
     let p = core::ptr::addr_of_mut!(INFO) as u64;
     if unsafe { sys1(SYS_GETINFO, p) } >> 63 != 0 {
@@ -240,6 +300,19 @@ fn getinfo() -> (u64, u64) {
         let i = &*core::ptr::addr_of!(INFO);
         (i[0], i[1])
     }
+}
+
+/// ABIFREEZE (divergence D1): the wall-clock read, in MILLISECONDS, on either arch.
+///
+/// `SYS_GETINFO`'s `ticks` field is NOT milliseconds everywhere, and this program used to assume it
+/// was: it named the raw value `ms` and fed it straight to `ms % BREATH_MS` against a 3000-ms period.
+/// That is right on x86 (1 kHz APIC tick == 1 ms) and wrong by 4x on aarch64 (250 Hz scheduler tick),
+/// where the liveness breath swept in 12 s instead of the 3 s its own comment promises. The kernels'
+/// clocks are shipped, metal-proven behaviour and neither moves; the rate now comes from
+/// `una_abi::GETINFO_TICK_HZ`, which is `cfg`-selected to match whichever kernel this image runs on.
+#[inline(always)]
+fn getinfo_ms() -> u64 {
+    una_abi::getinfo_ticks_to_ms(getinfo().1)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -257,8 +330,10 @@ fn getinfo() -> (u64, u64) {
 // >= `ncpu` is legal and means "the observer is on a core outside the meter's coverage"; nothing here
 // special-cases it, and the consequence is simply that no core takes the observer branch.
 // ---------------------------------------------------------------------------------------------
-const MAX_CPUS: usize = 16;
-const PULSE_WORDS: usize = 2 + MAX_CPUS * 2;
+// ABIFREEZE: the core cap and the word count are the KERNEL's, imported. They size the buffer the
+// kernel copies into, so a local copy of `16` here was a silent buffer-overrun waiting for the day
+// the ABI cap moved.
+use una_abi::{PULSE_MAX_CPUS as MAX_CPUS, PULSE_WORDS};
 static mut PULSE: [u64; PULSE_WORDS] = [0; PULSE_WORDS];
 
 /// One sampled window: `ncpu`, the observer's core, and the per-core cumulative counters.
@@ -300,6 +375,27 @@ const PARKED: u32 = u32::MAX;
 /// with no second measurement of how busy. Draws the liveness breath, prints `run` — a claim of life, never
 /// a claim of load.
 const RUNNING: u32 = u32::MAX - 1;
+
+/// PULSEFLUID: the sliding measurement window's history ring — the last [`WINDOW_SLOTS`] snapshots of the
+/// per-core cumulative counters, one written per successful sample. Slot `n % WINDOW_SLOTS` is read (the
+/// snapshot from `WINDOW_SLOTS` samples ago, i.e. exactly one 250 ms window back) and then overwritten
+/// with the current one, which is what lets a 5-deep ring express a sliding window with no copying.
+///
+/// It lives in `.bss` rather than on the stack because it is 1280 bytes and the EL0 stack is not the place
+/// for it; the data page has ~8 KiB of headroom below the info page at base + 0x4000.
+static mut HIST: [[(u64, u64); MAX_CPUS]; WINDOW_SLOTS] = [[(0, 0); MAX_CPUS]; WINDOW_SLOTS];
+
+/// PULSEFLUID: blend two opaque ARGB colours. `t` runs 0..=256 (Q8): 0 is `a`, 256 is `b`. Per-channel,
+/// alpha forced opaque — this surface has no transparency and a blended alpha would only be a way to
+/// produce an invisible pixel by arithmetic accident.
+#[inline(always)]
+fn lerp(a: u32, b: u32, t: u32) -> u32 {
+    let u = 256 - t;
+    let r = (((a >> 16) & 0xFF) * u + ((b >> 16) & 0xFF) * t) >> 8;
+    let g = (((a >> 8) & 0xFF) * u + ((b >> 8) & 0xFF) * t) >> 8;
+    let bl = ((a & 0xFF) * u + (b & 0xFF) * t) >> 8;
+    0xFF00_0000 | (r << 16) | (g << 8) | bl
+}
 
 /// The pure per-core display decision. `db`/`di` are one core's busy/idle tick DELTAS over the refresh
 /// window; `is_self` is whether that core is the one the observer sampled from.
@@ -458,17 +554,38 @@ unsafe fn draw_text(surf: *mut u8, s: &[u8], x: i32, y: i32, color: u32) {
     }
 }
 
+/// PULSEFLUID: the breath's sweep period — one traversal of the whole track. The old stepped breath moved
+/// one whole segment every 300 ms, which at `PULSE_SEGS` = 10 is this same 3 s traversal; the glow below
+/// covers the same ground at the same speed, continuously instead of in ten jerks.
+const BREATH_MS: u64 = 3000;
+
+/// PULSEFLUID: how far (Q8 segments) the breath glow reaches either side of its centre. 320 = 1.25
+/// segments, so the glow always spans two adjacent LEDs and the handoff between them is a cross-fade
+/// rather than a jump.
+const BREATH_SPAN_Q: i32 = 320;
+
+/// PULSEFLUID: the minimum Q8 segment-fill a NONZERO load may draw — 96/256 = 37.5% of the first LED.
+/// This is the sub-segment restatement of the old `if filled < 1 { filled = 1 }`: the law is that a live
+/// load must never round down to an unlit track. The old rule paid for it by inflating everything from 1%
+/// to 4% into a full segment; this floor is strictly nearer the truth AND still visibly lit.
+const MIN_LIT_Q: u32 = 96;
+
 /// One segmented pulse bar — `vug::draw_pulse_bar`'s three cases, in ARGB on our own surface. Returns the
 /// x just past the bar.
 ///
+/// `load` is the MEASURED verdict (`PARKED`, `RUNNING`, or a percent) and decides WHICH case applies.
+/// `disp_q` is PULSEFLUID's display-smoothed percent in Q8 (percent << 8) and decides only HOW FULL the
+/// track is drawn in the percent case — see the PULSEFLUID note in the file header for why exactly one of
+/// those two is a filter and why it touches nothing else.
+///
 ///   * `PARKED`  — every other segment `METER_PARKED`, the rest bare background: a BROKEN track. Visually
 ///     separable from an idle core's solid-dim track, so "never woken" never reads like "idle 0%".
-///   * `RUNNING` / 0 — the PULSE-ALIVE breath: one segment, swept along the bar by wall-clock time, lit
-///     `METER_BREATH`, the rest `METER_DIM`. An idle-but-scheduled core that drew an all-dim track read as
-///     dead on the bench panel; a breathing one reads alive. Not a load claim — the text still says 0%
-///     (or `run`).
-///   * a percent — `filled` segments in `METER_PURPLE` (any nonzero load lights at least one), the rest
-///     `METER_DIM`.
+///   * `RUNNING`, or a percent whose smoothed fill has decayed to nothing — the PULSE-ALIVE breath: a glow
+///     swept along the bar by wall-clock time, `METER_BREATH` at its centre, fading into `METER_DIM`. An
+///     idle-but-scheduled core that drew an all-dim track read as dead on the bench panel; a breathing one
+///     reads alive. Not a load claim — the text still says 0% (or `run`).
+///   * a percent — whole segments in `METER_PURPLE`, the LEADING segment blended between `METER_DIM` and
+///     `METER_PURPLE` by the fractional part, the rest `METER_DIM`.
 unsafe fn draw_pulse_bar(
     surf: *mut u8,
     x: i32,
@@ -477,6 +594,7 @@ unsafe fn draw_pulse_bar(
     seg_h: i32,
     gap: i32,
     load: u32,
+    disp_q: u32,
     ms: u64,
 ) -> i32 {
     let mut bx = x;
@@ -491,28 +609,47 @@ unsafe fn draw_pulse_bar(
         }
         return bx;
     }
-    if load == RUNNING || load == 0 {
-        let phase = ((ms / 300) % (PULSE_SEGS as u64)) as i32;
+    // `RUNNING` claims life and no load, so it never has a fill; a measured percent whose smoothed fill has
+    // decayed below a quarter of a percent has nothing left to draw either, and breathes instead.
+    let q = if load == RUNNING { 0 } else { disp_q };
+    if q < 64 {
+        // The glow's centre, in Q8 segment units, swept across the track once per `BREATH_MS`.
+        let phase = ((ms % BREATH_MS) * (PULSE_SEGS as u64) * 256 / BREATH_MS) as i32;
         let mut s = 0i32;
         while s < PULSE_SEGS {
-            let color = if s == phase { METER_BREATH } else { METER_DIM };
-            fill_rect(surf, bx, y, seg_w, seg_h, color);
+            let d = (s * 256 + 128 - phase).abs();
+            let t = if d >= BREATH_SPAN_Q {
+                0
+            } else {
+                (((BREATH_SPAN_Q - d) * 256) / BREATH_SPAN_Q) as u32
+            };
+            fill_rect(surf, bx, y, seg_w, seg_h, lerp(METER_DIM, METER_BREATH, t));
             bx += seg_w + gap;
             s += 1;
         }
         return bx;
     }
-    // Round to nearest segment, but never round a live load down to nothing.
-    let mut filled = (load as i32 * PULSE_SEGS + 50) / 100;
-    if filled < 1 {
-        filled = 1;
+    // Q8 segments = Q8 percent * PULSE_SEGS / 100. Never round a live load down to nothing (`MIN_LIT_Q`),
+    // never overrun the track.
+    let mut fq = q * PULSE_SEGS as u32 / 100;
+    if fq < MIN_LIT_Q {
+        fq = MIN_LIT_Q;
     }
-    if filled > PULSE_SEGS {
-        filled = PULSE_SEGS;
+    let full = (PULSE_SEGS as u32) << 8;
+    if fq > full {
+        fq = full;
     }
+    let whole = (fq >> 8) as i32;
+    let frac = fq & 0xFF;
     let mut s = 0i32;
     while s < PULSE_SEGS {
-        let color = if s < filled { METER_PURPLE } else { METER_DIM };
+        let color = if s < whole {
+            METER_PURPLE
+        } else if s == whole && frac != 0 {
+            lerp(METER_DIM, METER_PURPLE, frac)
+        } else {
+            METER_DIM
+        };
         fill_rect(surf, bx, y, seg_w, seg_h, color);
         bx += seg_w + gap;
         s += 1;
@@ -598,22 +735,41 @@ fn verdict_cell(load: u32) -> [u8; 4] {
 // ---------------------------------------------------------------------------------------------
 // Pacing + input.
 // ---------------------------------------------------------------------------------------------
-/// The refresh window: ~4 Hz. It is BOTH the repaint period and the delta window `classify` divides over,
-/// which is what makes the displayed percent a statement about a period a viewer can perceive. Faster would
-/// be a noisier instrument, not a better one; slower would lag a load spike off the panel.
-const REFRESH_MS: u64 = 250;
+/// PULSEFLUID: the FRAME period — the sleep between passes, and therefore both the sample rate and the
+/// repaint rate. 20 Hz. This used to be the same number as the measurement window, which is why the meters
+/// were chunky; the two are now separate quantities and only this one is a pacing choice.
+const FRAME_MS: u64 = 50;
+
+/// PULSEFLUID: how many frames the sliding measurement window spans. `FRAME_MS * WINDOW_SLOTS` is
+/// [`REFRESH_MS`], so the deltas `classify` divides still cover a full 250 ms — the window did not get
+/// shorter, it got recomputed more often.
+const WINDOW_SLOTS: usize = 5;
+
+/// The measurement window: 250 ms, unchanged. It is the delta window `classify` divides over, which is what
+/// makes the displayed percent a statement about a period a viewer can perceive. Shorter would be a noisier
+/// instrument, not a better one; longer would lag a load spike off the panel. It is no longer the repaint
+/// period — see [`FRAME_MS`].
+const REFRESH_MS: u64 = FRAME_MS * WINDOW_SLOTS as u64;
+
+/// PULSEFLUID: the display EMA's numerator — `disp = (2*disp + measured)/3` per frame, a ~100 ms time
+/// constant at [`FRAME_MS`]. Fast enough that a load step is on the panel within about two frames, slow
+/// enough that frame-to-frame sampling jitter does not strobe the leading LED. It smooths the BAR only.
+const EMA_KEEP: u32 = 2;
+/// PULSEFLUID: the display EMA's denominator (see [`EMA_KEEP`]).
+const EMA_DIV: u32 = 3;
 
 /// Frame at which the single `alive` line is printed — late enough to be real evidence of a program that
-/// kept looping, early enough for a headless witness to see it inside its window.
-const ALIVE_MARK: u64 = 8;
+/// kept looping, early enough for a headless witness to see it inside its window. PULSEFLUID rescaled it
+/// with the frame rate: 8 frames used to be 2 s of loop life and is now 400 ms, so 40 restores the meaning.
+const ALIVE_MARK: u64 = 40;
 
 /// UVUG-9: the per-frame cap on input events. An UNBOUNDED drain is a loop that can poll forever without
 /// ever reaching the present — the precise shape of the UVUG-9 freeze. Anything still queued waits one
-/// frame, which at this refresh is a quarter second.
+/// frame, which at [`FRAME_MS`] is 50 ms (it was a quarter second before PULSEFLUID, so the cap now costs
+/// five times less latency for the same protection).
 const INPUT_PER_FRAME: u32 = 8;
 
-const EV_KEYDOWN: u64 = 1;
-const K_ESC: u8 = 0x1B;
+use una_abi::{INPUT_EV_KEY_DOWN as EV_KEYDOWN, KEY_ESC as K_ESC};
 
 /// Drain up to `INPUT_PER_FRAME` events; true if the user asked to close the window (ESC or `q`). Every
 /// other event is consumed and ignored — this instrument has no controls.
@@ -625,7 +781,7 @@ fn wants_quit() -> bool {
         if ev >> 63 != 0 {
             break; // -EAGAIN: the ring is empty
         }
-        let kind = (ev >> 48) & 0xFF;
+        let kind = una_abi::input_ev_type(ev);
         if kind == EV_KEYDOWN {
             let k = (ev & 0xFF) as u8;
             if k == K_ESC || k == b'q' || k == b'Q' {
@@ -662,6 +818,12 @@ pub extern "C" fn _start() -> ! {
     // at base + 0x4000.
     let surf = (base + 0x5000) as *mut u8;
 
+    // VUGMIN: the process-flags word the kernel publishes in the RO info page (base + 0x4000, word 0x20;
+    // bit 1 = every window this process owns is hidden below the shell). Read AFTER `SYS_WIN_CREATE`,
+    // which is what maps that page. The page is EL0-RO for this process's whole life, so a `read_volatile`
+    // of a mapped word each frame costs less than the branch that consumes it.
+    let flags_p = unsafe { ((base + 0x4000) as *const u32).add(0x20 / 4) };
+
     let (pid, _t0) = getinfo();
 
     // The BASELINE sample. Not a reading: cumulative counters with no window behind them. If the verb is
@@ -685,6 +847,14 @@ pub extern "C" fn _start() -> ! {
     b.put_dec(prev.demo as u64);
     b.put(b" segs=");
     b.put_dec(PULSE_SEGS as u64);
+    // PULSEFLUID: the two pacing numbers, on the wire. They used to be one number and it was implicit;
+    // now that the measurement window and the frame period are different quantities, a capture that shows
+    // a percent must also say what span that percent covers and how often it was recomputed, or the
+    // reading cannot be checked against `[schedx86] load` after the fact.
+    b.put(b" win_ms=");
+    b.put_dec(REFRESH_MS);
+    b.put(b" frame_ms=");
+    b.put_dec(FRAME_MS);
     b.put(b" ::\n");
     b.flush();
 
@@ -710,8 +880,68 @@ pub extern "C" fn _start() -> ! {
     let text_x = bar_x + PULSE_SEGS * (seg_w + gap) + 2;
     let text_dy = if seg_h > 7 { (seg_h - 7) / 2 } else { 0 };
 
-    let mut load = [PARKED; MAX_CPUS];
+    // PULSEFLUID: prime every history slot with the BASELINE, so the first `WINDOW_SLOTS` frames read a
+    // snapshot that exists. Those frames are still not painted (see `filled` below) — priming makes the
+    // ring well-defined, it does not make a partial window paintable.
+    unsafe {
+        let h = &mut *core::ptr::addr_of_mut!(HIST);
+        let mut s = 0usize;
+        while s < WINDOW_SLOTS {
+            h[s] = prev.ticks;
+            s += 1;
+        }
+    }
+
+    // LAUNCH-DRAW (GR27): the FIRST present happens NOW, on the launch instant — before the
+    // measurement window has seen a single frame. Until this arc, the first paint was gated on
+    // `filled` (a full `REFRESH_MS` = 250 ms of samples), so launching pulse bought the operator
+    // ~300 ms of blank glass while the sampler's first window ran ON the launch path; the
+    // launch-stall arc flagged that hitch after WCD-CHUNK removed the bigger one under it.
+    //
+    // What this frame may honestly say is exactly "the meter is here, nothing measured yet":
+    // chrome, border, core labels and UNLIT tracks (every segment `METER_DIM`, the resting shade),
+    // with the verdict cells left blank. Deliberately NOT `park`/`run`/a percent and NOT the
+    // PULSE-ALIVE breath — each of those is a claim about the machine, and none has been measured
+    // (the two-source rule: no invented numbers). The SAMPLER IS UNTOUCHED: the ring still fills
+    // over `WINDOW_SLOTS` frames, the first measured paint still lands at ~250 ms, and the
+    // `first-window` witness still spans a full `REFRESH_MS` with the same deltas as before — only
+    // the blank-glass gap moved off the launch instant.
+    unsafe {
+        fill_rect(surf, 0, 0, SW, SH, BG);
+        fill_rect(surf, 0, 0, SW, 1, FRAME_C);
+        fill_rect(surf, 0, SH - 1, SW, 1, FRAME_C);
+        fill_rect(surf, 0, 0, 1, SH, FRAME_C);
+        fill_rect(surf, SW - 1, 0, 1, SH, FRAME_C);
+        let mut y = 4;
+        let mut c = 0usize;
+        while c < prev.ncpu {
+            let (d, n) = digits_of(c as u64 + 1);
+            let mut lbl = [b' '; 2];
+            let mut i = 0usize;
+            while i < n && i < 2 {
+                lbl[2 - n + i] = b'0' + d[i];
+                i += 1;
+            }
+            draw_text(surf, &lbl, 3, y + text_dy, METER_LABEL);
+            let mut bx = bar_x;
+            let mut s = 0i32;
+            while s < PULSE_SEGS {
+                fill_rect(surf, bx, y, seg_w, seg_h, METER_DIM);
+                bx += seg_w + gap;
+                s += 1;
+            }
+            y += row_h;
+            c += 1;
+        }
+    }
+    // Same non-fatal contract as the loop's present: a refusal must not end a monitor.
+    let _ = unsafe { sys1(SYS_WIN_PRESENT, win) };
+
+    let mut load = [PARKED; MAX_CPUS]; // the MEASURED verdict — text cell, serial witness, bar case
+    let mut disp = [0u32; MAX_CPUS]; // PULSEFLUID: the display-smoothed percent, Q8, BAR ONLY
+    let mut disp_live = [false; MAX_CPUS]; // has `disp[c]` a percent to ramp from, or must it snap?
     let mut frame: u64 = 0;
+    let mut samples: u64 = 0; // successful samples — the history ring's index, NOT the frame count
     let mut said_alive = false;
     let mut said_window = false;
     loop {
@@ -719,13 +949,25 @@ pub extern "C" fn _start() -> ! {
             break;
         }
 
-        // THE REFRESH WINDOW closes here: sleep first, THEN take the sample whose deltas span the sleep.
-        // The first frame therefore already has a real window behind it, and no frame is ever painted from
-        // the startup baseline.
-        sleep_ms(REFRESH_MS);
-        let (_pid, ms) = getinfo();
+        // THE FRAME closes here: sleep first, THEN take the sample. The MEASUREMENT window is the last
+        // `WINDOW_SLOTS` of these frames, so no frame is ever painted from the startup baseline and every
+        // painted frame's deltas span a full `REFRESH_MS`.
+        sleep_ms(FRAME_MS);
+        // ABIFREEZE D1: milliseconds, converted from the arch's own tick rate — NOT the raw `ticks`
+        // field, which is 250 Hz on aarch64 and 1 kHz on x86.
+        let ms = getinfo_ms();
         if let Some(now) = sample() {
-            let base_ticks = prev.ticks; // the window's opening snapshot, kept for the evidence line below
+            // The window's OPENING snapshot: the slot we are about to overwrite holds the counters from
+            // exactly `WINDOW_SLOTS` samples ago. Read it out, then store the current one in its place —
+            // a 5-deep ring expressing a sliding window with no copying.
+            let slot = (samples as usize) % WINDOW_SLOTS;
+            let base_ticks = unsafe {
+                let h = &mut *core::ptr::addr_of_mut!(HIST);
+                let old = h[slot];
+                h[slot] = now.ticks;
+                old
+            };
+            samples += 1;
             let mut c = 0usize;
             while c < now.ncpu {
                 let db = now.ticks[c].0.wrapping_sub(base_ticks[c].0);
@@ -739,7 +981,11 @@ pub extern "C" fn _start() -> ! {
             // rendered bars are invisible to a headless gate, so without it "the app drew something" and
             // "the app drew the RIGHT something" are indistinguishable. It also falsifies a garbled
             // payload — a wrong struct layout shows up here as absurd deltas, not as a plausible picture.
-            if !said_window {
+            //
+            // PULSEFLUID gates it on the ring being FULL, so it still describes a 250 ms window and is
+            // still emitted on the first frame this program paints. What it prints is the RAW measured
+            // delta and the RAW verdict — the display EMA below is not in this path and must never be.
+            if !said_window && samples >= WINDOW_SLOTS as u64 {
                 said_window = true;
                 // ONE LINE PER CORE, not one line for all of them. A single wide line is what the kernel's
                 // twin emits, and on a contended serial path it gets TORN: another core's writer lands in
@@ -781,6 +1027,70 @@ pub extern "C" fn _start() -> ! {
         // A refused sample leaves `load` exactly as it was: the last honest picture, held. It does not
         // decay to zeros, because 0% is a claim about the machine and we have not measured it.
 
+        // PULSEFLUID: has the ring seen a full `REFRESH_MS` yet? Until it has, this program paints nothing
+        // — see the BASELINE note in the header. A refused sample does not advance `samples`, so a stream
+        // of refusals cannot fake a full window into existence either.
+        let filled = samples >= WINDOW_SLOTS as u64;
+
+        // PULSEFLUID — THE DISPLAY EMA. Purely a rendering filter over the measured percents, and confined
+        // to `disp`, which only [`draw_pulse_bar`]'s fill reads. Two properties it must keep:
+        //
+        //   * A SENTINEL IS NOT A LOAD. `PARKED` and `RUNNING` are `u32::MAX`-adjacent answers meaning "no
+        //     percent is honest here". Feeding either into an average would produce an enormous fake load
+        //     AND would carry state across the boundary between "measured" and "not measured", so both
+        //     instead INVALIDATE the filter: the next real percent snaps rather than ramps.
+        //   * THE FIRST PERCENT SNAPS. Ramping a fresh core up from 0 would draw a rise that never
+        //     happened. `disp_live` is what distinguishes "converging towards a value" from "has no value".
+        //   * IT NEVER FOLDS AN UNDER-WINDOW SAMPLE. Review-caught: ungated, this ran on frames 1..4,
+        //     whose spans are 50/100/150/200 ms — so the FIRST bar anyone sees would have been an average
+        //     containing sub-`win_ms` measurements while the text cell, the witness and the start line all
+        //     said 250 ms. That is exactly the lie the header's baseline rule forbids, and it also defeated
+        //     "the first percent snaps" for the first *visible* frame. Gated on `filled`, the filter cannot
+        //     start before a real window exists.
+        if filled {
+            let mut c = 0usize;
+            while c < prev.ncpu {
+                match load[c] {
+                    PARKED | RUNNING => disp_live[c] = false,
+                    pct => {
+                        let target = pct << 8; // Q8 percent
+                        disp[c] = if disp_live[c] {
+                            (disp[c] * EMA_KEEP + target) / EMA_DIV
+                        } else {
+                            disp_live[c] = true;
+                            target
+                        };
+                    }
+                }
+                c += 1;
+            }
+        }
+
+        // VUGMIN: while every window this process owns is hidden below the shell, there is nothing for a
+        // raster or a present to accomplish — so do neither, and keep sampling. Skipping the present is
+        // what pays for the 5x frame rate: a hidden PULSE costs the compositor strictly less than it did
+        // at 4 Hz, and the frame it draws on becoming visible again is built from a window that never
+        // stopped being measured.
+        //
+        // `frame` counts LOOP PASSES, as it always has — not presents — so the `alive` line is emitted on
+        // the same schedule whether or not the window happens to be visible, and a hidden monitor still
+        // proves it is looping.
+        frame += 1;
+        if !said_alive && frame >= ALIVE_MARK {
+            said_alive = true;
+            let mut b = Buf::new();
+            b.put(b":: PULSE-A: alive pid=");
+            b.put_dec(pid);
+            b.put(b" frames=");
+            b.put_dec(frame);
+            b.put(b" ::\n");
+            b.flush();
+        }
+        let hidden = unsafe { flags_p.read_volatile() } & 2 != 0;
+        if hidden || !filled {
+            continue;
+        }
+
         unsafe {
             // Background + a 1 px border so the window's own bounds are readable against the compositor's
             // chrome at any upscale.
@@ -802,7 +1112,7 @@ pub extern "C" fn _start() -> ! {
                     i += 1;
                 }
                 draw_text(surf, &lbl, 3, y + text_dy, METER_LABEL);
-                draw_pulse_bar(surf, bar_x, y, seg_w, seg_h, gap, load[c], ms);
+                draw_pulse_bar(surf, bar_x, y, seg_w, seg_h, gap, load[c], disp[c], ms);
                 draw_text(surf, &verdict_cell(load[c]), text_x, y + text_dy, METER_LABEL);
                 y += row_h;
                 c += 1;
@@ -812,18 +1122,6 @@ pub extern "C" fn _start() -> ! {
         // Present. The return is checked but NOT fatal: a transient present error must not end a monitor,
         // and a persistent one is visible as a frozen window the operator can `kill`.
         let _ = unsafe { sys1(SYS_WIN_PRESENT, win) };
-
-        frame += 1;
-        if !said_alive && frame >= ALIVE_MARK {
-            said_alive = true;
-            let mut b = Buf::new();
-            b.put(b":: PULSE-A: alive pid=");
-            b.put_dec(pid);
-            b.put(b" frames=");
-            b.put_dec(frame);
-            b.put(b" ::\n");
-            b.flush();
-        }
     }
 
     let mut b = Buf::new();

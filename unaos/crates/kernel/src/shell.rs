@@ -25,6 +25,17 @@ use crate::fs::fat::{DirEntry, FatError, FatFs};
 use crate::vug;
 use crate::pal::TargetPal;
 
+// STORM-X86: the module that owns the user address-space slot POOL, aliased per-arch so the `storm`
+// verb's census can name the same fact on both. On aarch64 the pool (`SLOT_USED` + `USER_SLOTS`) is
+// built by the EL0 bring-up in `arch::boot`; on x86 it is the static PML4/PDPT/PD/PT + backing pool
+// in `arch::memory`, claimed by `alloc_user_space`. Same quantity, same denominator, different
+// owning module — an alias rather than a cfg-split at each use site, so the census line stays ONE
+// piece of source and the two arches cannot drift into printing different things.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+use crate::arch::boot as storm_slots;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::memory as storm_slots;
+
 /// JD4: the shell's current working directory as a NORMALIZED, CANONICAL absolute path
 /// ("/" = root, else "/DIR/SUB" in the on-disk 8.3 spelling). A path string, not a cached
 /// cluster: every command re-resolves it from the root, so a swapped or remounted card can
@@ -229,14 +240,275 @@ fn fs5_say(console: &mut Console, line: &str) {
     serial_println!(":: fs5: {} ::", line);
 }
 
+// ===================== FATVERB — the verbs find their volume ========================================
+//
+// Boot AR, second half. LAUNCH-AR moved the three EXEC legs (the `FatVolume::is_file` probe, the
+// `bare_exec` re-resolve, the `read_el0_image` load) from the default-handle `fat::mount` to
+// `fat::mount_program_source()`, because on a machine booted from the internal SD reader the global
+// `BLOCK_DEVICE` slot is EMPTY — `SDHCBLK` registers the card under its own handle and says so on
+// the wire. That fixed launching. It did not fix looking: Peter typed `ls` twice on that same boot
+// and got nothing, because the twenty-five FAT verbs in this file were all still asking the handle
+// that does not exist there. A shell where `ls` and `vug` disagree about which volume is the volume
+// is not a shell.
+//
+// So every verb binds the SAME handle the exec legs bind. The two helpers below are the only place
+// that binding is expressed, which is the point: the failure mode this arc closes is call sites
+// drifting apart, and twenty-five copies of `match fat::mount` is how they drifted.
+//
+// READ and WRITE are split because they are not the same question.
+//   * A read verb needs a volume. If it cannot get one it says so, naming the handles it was
+//     offered — the `exec-probe ... NO VOLUME (...; handles=...)` idiom, because a decline that
+//     cannot name what it inspected cannot be falsified by the capture it appears in.
+//   * A write verb needs a volume that ADMITS WRITES, and on the internal reader it will not get
+//     one: `Sdhc` is a read-only mount outside the reserved flight-recorder extent (SDHC-4c). Left
+//     ungated, `rm FOO` on that boot would walk a real directory mutation down to `write_sector`,
+//     collect `Unsupported` from the permit, and surface as a per-sector I/O error — or, worse for
+//     a multi-step verb like `write` (delete-then-recreate) or `mv`, get part-way. So the gate runs
+//     BEFORE the first mutation, refuses LOUDLY on both sinks, and names the volume, the reason and
+//     the census. It never silently no-ops.
+//
+// `mount_program_source()` is IDENTICAL to `mount()` on every configuration that already worked:
+// aarch64 and x86-without-`sdhcblk` have no second handle, and where a global device is registered
+// it still wins the precedence ladder. The behaviour only differs on the one boot shape that was
+// already broken.
+
+/// FATVERB: WHICH HANDLE A BINDING SITE ACTUALLY BOUND — recorded as a fact, not recomputed.
+///
+/// This exists because the first cut of the FATVERB witness was A==A and the adoption review said
+/// so: it compared `mount_program_source() + resolve` against `mount_program_source() + resolve`
+/// and would have passed with every read verb reverted to the old handle. The only way a fixture
+/// can tell "the verbs bind the program source" from "this expression binds the program source" is
+/// to observe what the VERBS DID, so each binding site stamps its answer here and the witness reads
+/// the stamps after driving a real verb.
+///
+/// The SEQ counters are the half that makes a revert visible. A leg that only compared the stamps
+/// would still pass against a stale pair left by some earlier call; requiring the counter to ADVANCE
+/// across the driven verb means a verb that no longer routes through these helpers fails the leg
+/// instead of inheriting somebody else's answer.
+///
+/// Plain relaxed atomics: this is an instrument, it is read only by the one-shot witness, and it is
+/// on the path of every file verb — it must cost nothing and must never introduce an ordering that
+/// the verbs would not otherwise have.
+mod bind {
+    /// Never asked.
+    pub const NONE: u8 = 0;
+    /// Asked; nothing mounted (the decline path).
+    pub const DECLINED: u8 = 1;
+    pub const GLOBAL: u8 = 2;
+    pub const USB: u8 = 3;
+    pub const SDHC: u8 = 4;
+    /// The write gate ADMITTED the volume.
+    pub const ADMITTED: u8 = 5;
+    /// The write gate REFUSED it as read-only.
+    pub const REFUSED_RO: u8 = 6;
+
+    pub fn of(fs: &crate::fs::fat::FatFs) -> u8 {
+        match fs.source_name() {
+            "global" => GLOBAL,
+            "usb" => USB,
+            _ => SDHC,
+        }
+    }
+
+    /// Only the x86 storage witness renders these; the verbs stamp and never read.
+    #[cfg(target_arch = "x86_64")]
+    pub fn name(code: u8) -> &'static str {
+        match code {
+            NONE => "never",
+            DECLINED => "declined",
+            GLOBAL => "global",
+            USB => "usb",
+            SDHC => "sdhc",
+            ADMITTED => "admitted",
+            REFUSED_RO => "refused-ro",
+            _ => "?",
+        }
+    }
+}
+
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering as BindOrd};
+
+/// The handle the READ verbs' binding site last bound, and how many times it has bound anything.
+static READ_BIND: AtomicU8 = AtomicU8::new(bind::NONE);
+static READ_BIND_SEQ: AtomicU32 = AtomicU32::new(0);
+/// The handle the EXEC PROBE (`FatVolume::is_file`) last bound. Independent producer, independent
+/// call path — this is the pair `fatverb_storage_witness` compares. x86 only: aarch64 never sets
+/// `Facts::exec`, so the probe is a constant `false` there and has no handle to stamp.
+#[cfg(target_arch = "x86_64")]
+static EXEC_BIND: AtomicU8 = AtomicU8::new(bind::NONE);
+#[cfg(target_arch = "x86_64")]
+static EXEC_BIND_SEQ: AtomicU32 = AtomicU32::new(0);
+/// What the WRITE gate last answered, and how many times it has answered.
+static WRITE_GATE: AtomicU8 = AtomicU8::new(bind::NONE);
+static WRITE_GATE_SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn stamp(cell: &AtomicU8, seq: &AtomicU32, code: u8) {
+    cell.store(code, BindOrd::Relaxed);
+    seq.fetch_add(1, BindOrd::Relaxed);
+}
+
+/// FATVERB: the write gate's answer, decided but not yet rendered. Split out from
+/// [`mount_write_volume`] so the witness can drive a real write verb and read the gate's recorded
+/// answer without a console, and so the rendering lives in exactly one place.
+enum WriteVolume {
+    /// The program source mounted and admits ordinary file mutation.
+    Admitted(FatFs),
+    /// It mounted and REFUSES: the handle's name, the volume label, the reason.
+    ReadOnly(&'static str, String, &'static str),
+    /// Nothing mounted at all.
+    NoVolume(FatError),
+}
+
+/// FATVERB: mount the volume a READ verb should act on — the program source, so `ls` and a bare
+/// name are looking at the same card. Stamps [`READ_BIND`] either way, including on the decline:
+/// "the read verbs asked and got nothing" is a different fact from "the read verbs never asked",
+/// and Boot AR's symptom was the first one.
+fn open_read_volume() -> Result<FatFs, FatError> {
+    match crate::fs::fat::mount_program_source() {
+        Ok(fs) => {
+            stamp(&READ_BIND, &READ_BIND_SEQ, bind::of(&fs));
+            Ok(fs)
+        }
+        Err(e) => {
+            stamp(&READ_BIND, &READ_BIND_SEQ, bind::DECLINED);
+            Err(e)
+        }
+    }
+}
+
+/// FATVERB: the WRITE gate. Mount the program source, then ask the BLOCK LAYER — through the one
+/// predicate `crate::fs::fat::BlockSource::write_veto`, which the VFS's `FatBackend::read_only`
+/// also forwards to — whether that source can be mutated at all. Runs before any directory entry,
+/// cluster chain or FAT sector has been touched.
+fn open_write_volume() -> WriteVolume {
+    let fs = match open_read_volume() {
+        Ok(fs) => fs,
+        Err(e) => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::DECLINED);
+            return WriteVolume::NoVolume(e);
+        }
+    };
+    match fs.write_veto() {
+        None => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::ADMITTED);
+            WriteVolume::Admitted(fs)
+        }
+        Some(why) => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::REFUSED_RO);
+            WriteVolume::ReadOnly(fs.source_name(), fs.label(), why)
+        }
+    }
+}
+
+// FATVERB: TWO SINKS, TWO LENGTHS — and that is deliberate, not laziness.
+//
+// The first cut printed one ~235-character line to both. The panel is 128–180 columns depending on
+// the scale metrics, so the census tail — the part that says WHICH handles existed, i.e. the whole
+// diagnostic — was clipped off the right edge and never reached the eye it was written for. Serial
+// has no such limit and a bench capture wants everything. So the operator gets a sentence and the
+// capture gets the forensics, and they carry the same verdict word (`REFUSED READ-ONLY`) so one is
+// greppable from the other.
+
+/// FATVERB: the read verbs' decline, on both sinks. Boot AR's symptom WAS a read decline — `ls`
+/// twice, nothing back — so the headless capture must carry it. Without the mirror a bench log
+/// cannot tell "the verb declined, and here is what it was offered" from "the keystroke never
+/// arrived", which is exactly the ambiguity that cost the first diagnosis.
+fn mount_read_volume(console: &mut Console, verb: &str) -> Option<FatFs> {
+    match open_read_volume() {
+        Ok(fs) => Some(fs),
+        Err(e) => {
+            console.println(&alloc::format!("{}: no FAT filesystem ({:?})", verb, e));
+            serial_println!(
+                ":: [fatverb] {} -> NO VOLUME ({:?}; handles={}) ::",
+                verb, e, crate::drivers::block::source_census()
+            );
+            None
+        }
+    }
+}
+
+/// FATVERB: the write verbs' gate, on both sinks. `None` means the caller has already been
+/// explained to and must return WITHOUT mutating anything.
+fn mount_write_volume(console: &mut Console, verb: &str) -> Option<FatFs> {
+    match open_write_volume() {
+        WriteVolume::Admitted(fs) => Some(fs),
+        WriteVolume::ReadOnly(source, label, why) => {
+            console.println(&alloc::format!("{}: REFUSED READ-ONLY ({})", verb, source));
+            serial_println!(
+                ":: [fatverb] {} -> REFUSED READ-ONLY (source={} label={} reason={}; handles={}) ::",
+                verb,
+                source,
+                if label.is_empty() { "-" } else { &label },
+                why,
+                crate::drivers::block::source_census()
+            );
+            None
+        }
+        WriteVolume::NoVolume(e) => {
+            console.println(&alloc::format!("{}: no FAT filesystem ({:?})", verb, e));
+            serial_println!(
+                ":: [fatverb] {} -> NO VOLUME ({:?}; handles={}) ::",
+                verb, e, crate::drivers::block::source_census()
+            );
+            None
+        }
+    }
+}
+
+// ===================== FATVERB — THE SOURCE LAW, ENFORCED BY THE COMPILER ==========================
+//
+// The arc's claim is "no FAT verb in this file binds the default handle any more". That was true the
+// day it landed and grep-true ever since, which is worth exactly nothing: the Boot AR defect WAS a
+// call site left behind, and the next one will arrive the same way — someone adds a verb, copies the
+// nearest neighbour, and the neighbour they copy is from a different file. A runtime witness cannot
+// catch that; it can only observe the verbs it happens to drive.
+//
+// So the law is checked where it can actually be violated — at compile time, over this file's own
+// source, on every `arroyo check` leg and every cfg combination. A re-introduced default-handle
+// mount here is a BUILD ERROR naming this comment, not a silent regression that waits for a bench.
+//
+// SCOPE, honestly. The needle is the path spelling `::mount` immediately followed by an empty
+// argument list — assembled below byte by byte, so that neither the needle nor this paragraph trips
+// the law it defines. That covers `crate::fs::fat::mount(…)` with no arguments and every
+// abbreviation of it that keeps the path separator. It does NOT catch a `use` import of the function
+// followed by a bare call: a determined evasion defeats it. This is a tripwire against the failure
+// that actually happens — a copied call site — not a sandbox. `mount_source` and
+// `mount_program_source` do not match, which is the point: those are the callers we want.
+//
+// Prose elsewhere in this file deliberately names the function without parentheses for the same
+// reason.
+const _: () = {
+    const SRC: &[u8] = include_bytes!("shell.rs");
+    const NEEDLE: [u8; 9] = [b':', b':', b'm', b'o', b'u', b'n', b't', b'(', b')'];
+    let mut i = 0usize;
+    let mut hits = 0usize;
+    while i + NEEDLE.len() <= SRC.len() {
+        // Cheap first-byte reject, then the full compare — keeps const-eval linear and fast over a
+        // file this size.
+        if SRC[i] == NEEDLE[0] {
+            let mut k = 0usize;
+            while k < NEEDLE.len() && SRC[i + k] == NEEDLE[k] {
+                k += 1;
+            }
+            if k == NEEDLE.len() {
+                hits += 1;
+            }
+        }
+        i += 1;
+    }
+    assert!(
+        hits == 0,
+        "FATVERB source law: shell.rs must not bind the default FAT handle. A file verb reads and \
+         writes the PROGRAM SOURCE, through mount_read_volume / mount_write_volume — see the FATVERB \
+         section. If you are only naming the function in prose, spell it without parentheses."
+    );
+};
+
 /// JD6 `touch`: ensure a 0-length file exists at `path` in ANY directory the shell can reach
 /// (create if absent; idempotent no-op if present). Rides the dir-aware `locate_in_dir` /
 /// `create_in_dir` twins — the parent may be the root or any subdirectory.
 fn fs_touch(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("touch: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "touch") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("touch: {}", msg)),
@@ -259,10 +531,7 @@ fn fs_touch(console: &mut Console, arg: &str) {
 /// in-place shrink primitive, and the directory-field publisher is private). A directory target is
 /// refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
 fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("write: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "write") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("write: {}", msg)),
@@ -310,10 +579,7 @@ fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
 /// (allocate + zero-fill + chain new clusters, directory `size` published LAST). A directory target
 /// is refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
 fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("append: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "append") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("append: {}", msg)),
@@ -354,10 +620,7 @@ fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
 /// missing-target error quietly (POSIX `rm -f`); a wrong-usage `-EISDIR` is still shown under `-f`.
 /// Rides the dir-aware locate_in_dir twin.
 fn fs_rm(console: &mut Console, arg: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rm") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         // JD14: `-f` is lenient about a missing target (POSIX `rm -f NOSUCH` is quiet). A missing
@@ -395,10 +658,7 @@ fn fs_rm(console: &mut Console, arg: &str, force: bool) {
 /// parent is a plain file → `-ENOTDIR` (both from `resolve_write_target`); volume or parent-dir full
 /// → `-ENOSPC`; a non-8.3 name → `-EINVAL`. The root itself as a target → `-EISDIR` (it always exists).
 fn fs_mkdir(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("mkdir: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "mkdir") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
         Err(msg) => return console.println(&alloc::format!("mkdir: {}", msg)),
@@ -433,10 +693,7 @@ fn fs_mkdir(console: &mut Console, arg: &str) {
 /// it and gets an honest `-ENOENT`, exactly the JD4 stale-cwd worst case (the cwd is a re-resolved path
 /// string, not a cached chain head). No corruption — `delete_located` is crash-safe.
 fn fs_rmdir(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rmdir: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rmdir") else { return };
     // Refuse the root explicitly, with the honest errno. `resolve_write_target` would report the "/"
     // path as `-EISDIR`, but the volume root is never a removable directory (it is unnameable and
     // cluster 0 is not freeable). This also covers `rmdir .` at the root and `rmdir ..` that pops to it.
@@ -492,10 +749,7 @@ fn fs_rmdir(console: &mut Console, arg: &str) {
 /// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel
 /// core); a future single-pass primitive could tighten that, tracked as a JD9 note.
 fn fs_cp(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "cp") else { return };
     // --- Resolve the SOURCE to a concrete file (a directory source is out of scope). ---
     let src_norm = normalize_path(&cwd_path(), src);
     let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
@@ -706,10 +960,7 @@ fn cp_tree(
 /// failing path + errno; nothing is rolled back (a partial tree is left on disk, crash-safe per the
 /// FATDIRS/JD6 ordering — the operator can `rmdir`/`rm` it).
 fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "cp") else { return };
     // --- Resolve the SOURCE. Root is refused; a file degrades to the plain file copy. ---
     let src_norm = normalize_path(&cwd_path(), src);
     let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
@@ -903,10 +1154,7 @@ fn force_remove_existing(
 /// `remove_dir` primitives JD6/JD7/JD9 already exercise and ledger, so it inherits their locking
 /// analysis unchanged (no new fat.rs surface, no new lock, no new namespace interaction).
 fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rm") else { return };
     // Refuse the root explicitly, with the honest errno, BEFORE any walk. `normalize_path` folds
     // `rm -r .` at the root and `rm -r ..` that pops to it into "/". The root refusal stands even
     // under `-f` — `rm -rf /` is a footgun the panel never honours (cluster 0 is unremovable).
@@ -980,10 +1228,7 @@ fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
 /// `move_entry` publishes the destination BEFORE `0xE5`ing the source, so a power-cut mid-move leaves
 /// a benign duplicate (two names, one chain), never a lost chain.
 fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("mv: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "mv") else { return };
     // --- Resolve the SOURCE to a concrete entry (file or dir). The volume root has no leaf name to
     //     move AS, so it is refused. ---
     let src_norm = normalize_path(&cwd_path(), src);
@@ -1120,10 +1365,7 @@ fn cat_render(console: &mut Console, fs: &FatFs, de: &DirEntry, canon: &str) {
 /// bounds the read and the heap. A directory or the root is `-EISDIR`. Every access rides the JD3
 /// wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel core.
 fn fs_head(console: &mut Console, arg: &str, n: u32) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("head: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "head") else { return };
     let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
         Ok(Resolved::Root) => return console.println("head: /: is a directory (-EISDIR)"),
         Ok(Resolved::Entry(de, canon)) => {
@@ -1187,10 +1429,7 @@ fn fs_head(console: &mut Console, arg: &str, n: u32) {
 /// note records the bound. A directory or the root is `-EISDIR`; an empty file prints nothing. Every
 /// access rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang.
 fn fs_tail(console: &mut Console, arg: &str, n: u32) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("tail: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "tail") else { return };
     let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
         Ok(Resolved::Root) => return console.println("tail: /: is a directory (-EISDIR)"),
         Ok(Resolved::Entry(de, canon)) => {
@@ -1320,7 +1559,9 @@ fn print_dir_listing(console: &mut Console, entries: &[DirEntry], long: bool) {
 // ---------------------------------------------------------------------------------------------
 // PI-SHELL-LS — `ls` on the Pi shell lists the NATIVE unafs volume (the SD-card partition), not FAT.
 //
-// The shared `ls`/`dir` arm rides `fat::mount()` — the x86 USB-storage backend. The Pi has no FAT
+// The shared `ls`/`dir` arm rides the FAT program source (FATVERB: `mount_read_volume`; before that
+// the default-handle `fat::mount`) — the x86 USB-storage backend, or the internal SD card when that is what booted us.
+// The Pi has no FAT
 // volume mounted (its native store is unafs; FAT on the SD card is only the firmware boot partition),
 // so on the board `ls` printed "ls: no FAT filesystem (...)". The unafs volume DOES work — it is the
 // very volume PI-NET-15 serves at `/fs/` (what Safari sees, K3HELLO.TXT et al.) via the same
@@ -1735,9 +1976,8 @@ fn ls_resolved(console: &mut Console, fs: &FatFs, path: &str, long: bool) {
 /// can share the exact resolve/print behaviour for a non-trailing-glob fall-through.
 #[cfg(not(target_arch = "aarch64"))]
 fn ls_path(console: &mut Console, arg: &str, long: bool) {
-    match crate::fs::fat::mount() {
-        Ok(fs) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg), long),
-        Err(e) => console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
+    if let Some(fs) = mount_read_volume(console, "ls") {
+        ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg), long);
     }
 }
 
@@ -1746,10 +1986,7 @@ fn ls_path(console: &mut Console, arg: &str, long: bool) {
 /// how a shell hands matched names to `ls`); no match is an honest "no match".
 #[cfg(not(target_arch = "aarch64"))]
 fn ls_globbed(console: &mut Console, arg: &str, long: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "ls") else { return };
     match glob_expand(&fs, arg) {
         Glob::Literal(p) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), &p), long),
         Glob::Matched { entries, .. } if entries.is_empty() =>
@@ -1763,10 +2000,7 @@ fn ls_globbed(console: &mut Console, arg: &str, long: bool) {
 /// directory match is skipped with the classic `-EISDIR` note; no match is an honest "no match". A
 /// glob confined to a non-trailing component falls through to a literal resolve (honest error).
 fn cat_globbed(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "cat") else { return };
     match glob_expand(&fs, arg) {
         Glob::Literal(p) => match resolve_path(&fs, &normalize_path(&cwd_path(), &p)) {
             Ok(Resolved::Root) => console.println("cat: /: is a directory (-EISDIR)"),
@@ -1826,10 +2060,7 @@ fn expand_sources(console: &mut Console, fs: &FatFs, verb: &str, sources: &[&str
 /// a file degrades to a plain delete). SNAPSHOT-safety holds through the recursion too: each concrete
 /// match is re-resolved by its canonical path, and a completed `rm -r` never touches a sibling's slot.
 fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "rm") else { return };
     for a in args {
         match glob_expand(&fs, a) {
             Glob::Literal(p) =>
@@ -1852,10 +2083,7 @@ fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool, force: bool
 /// can only land INTO a directory). Each source rides the existing `fs_cp` / `fs_cp_recursive` (the
 /// `FILE DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-copy.
 fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: bool, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "cp") else { return };
     let srcs = expand_sources(console, &fs, "cp", sources);
     if srcs.is_empty() {
         return; // every pattern was empty (each already reported "no match")
@@ -1877,10 +2105,7 @@ fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: boo
 /// (the `SRC DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-move — a wildcard move never
 /// invalidates its own list.
 fn mv_globbed(console: &mut Console, sources: &[&str], dst: &str, force: bool) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("mv: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_write_volume(console, "mv") else { return };
     let srcs = expand_sources(console, &fs, "mv", sources);
     if srcs.is_empty() {
         return;
@@ -1991,10 +2216,7 @@ fn find_walk(
 /// a FILE root degrades to a single self-match test (the POSIX shape — `find` a file tests that file);
 /// a mid-walk I/O error reports the path + errno with the partial hits/count already shown.
 fn fs_find(console: &mut Console, root_arg: &str, pat: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("find: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "find") else { return };
     let norm = normalize_path(&cwd_path(), root_arg);
     let mut stats = FindStats { matches: 0, dirs: 0 };
     match resolve_path(&fs, &norm) {
@@ -2073,10 +2295,7 @@ fn du_subtree(
 /// file bytes are real. A missing path is `-ENOENT`; a mid-walk read error reports the path + errno
 /// with the partial per-child lines and a total of what was tallied (honest partial).
 fn fs_du(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("du: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "du") else { return };
     let norm = normalize_path(&cwd_path(), arg);
     let (cluster, canon) = match resolve_path(&fs, &norm) {
         Ok(Resolved::Root) => (0u32, String::new()),
@@ -2168,10 +2387,7 @@ fn decode_attr(a: u8) -> String {
 /// reports the root honestly — it is a directory with NO directory entry of its own. Missing path is
 /// `-ENOENT`. Read-only; no glob (a metacharacter resolves literally → `-ENOENT`).
 fn fs_stat(console: &mut Console, arg: &str) {
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("stat: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "stat") else { return };
     // The volume root has no directory entry of its own — report it honestly, no slot.
     if normalize_path(&cwd_path(), arg) == "/" {
         console.println("  path:  /");
@@ -2245,10 +2461,7 @@ fn xd_rows(console: &mut Console, base: usize, data: &[u8]) {
 /// note is printed. off/len are parsed decimal or `0x`-hex by the caller.
 fn fs_xd(console: &mut Console, arg: &str, off: u32, len: usize) {
     const XD_MAX: usize = 4096;
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => return console.println(&alloc::format!("xd: no FAT filesystem ({:?})", e)),
-    };
+    let Some(fs) = mount_read_volume(console, "xd") else { return };
     let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
         Ok(Resolved::Root) => return console.println("xd: /: is a directory (-EISDIR)"),
         Ok(Resolved::Entry(de, canon)) => (de, canon),
@@ -2299,13 +2512,445 @@ impl History {
     }
 }
 
+// --- MIDDEN-M1: the seam between the kernel console and the shared shell core -----------------
+//
+// Three small pieces, and deliberately only three: what this build can do (`midden_facts`), how
+// the core asks "is that a file?" (`FatVolume`), and how a terminal message reaches the panel
+// (`render_message`). Everything else about what a command MEANS now lives in
+// `unaos/libs/sys/midden_core`, shared with the Ring 3 `midden` handler.
+
+/// Describe this build to the core.
+///
+/// The core carries no `#[cfg(target_arch)]` — a shell core that only tells the truth on one arch
+/// is not a shared core — so the facts are built here, at the single call site, with `cfg!` and
+/// `#[cfg]`. `proc_rows` is READ from the process table rather than written down (HEADROOM split
+/// the cap 10 on x86 / 6 on aarch64, and a help line naming a stale ceiling is worse than none).
+fn midden_facts() -> midden_core::Facts {
+    // The process verbs (`run`/`bg`/`jobs`/`kill`/`storm`) are registered on aarch64-baremetal and
+    // on x86; this mirrors the `#[cfg]` on their match arms exactly.
+    // `arch::syscall` itself is `baremetal`-gated on aarch64, so the cap must be read under the
+    // SAME condition that decides whether the verbs exist — a build with no process table has no
+    // storm cap to name, and 0 is the honest stand-in because `proc_verbs` is false beside it.
+    #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+    let (proc_verbs, proc_rows) = (true, crate::arch::syscall::proc_table_rows());
+    #[cfg(not(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64")))]
+    let (proc_verbs, proc_rows) = (false, 0usize);
+    midden_core::Facts {
+        aarch64: cfg!(target_arch = "aarch64"),
+        x86: cfg!(target_arch = "x86_64"),
+        v3d: cfg!(all(target_arch = "aarch64", feature = "v3d")),
+        proc_verbs,
+        proc_rows,
+        // BARE-NAME LAUNCH is x86-only today: `bare_exec` + `spawn_user_image_bg` off the FAT
+        // volume. With this false the core never probes the volume and never returns `Plan::Exec`,
+        // so an aarch64 build does exactly what it did before this crate existed.
+        exec: cfg!(target_arch = "x86_64"),
+    }
+}
+
+/// The core's one filesystem question, answered over the shell's real volume.
+///
+/// Not a filesystem trait: `is_file` is true iff the name resolves to a regular (non-directory)
+/// file from the shell's cwd, and that is all the resolver is allowed to know. Stateless like
+/// every other FAT verb — the volume is mounted per question, so a swapped card is picked up on
+/// the next command.
+struct FatVolume;
+
+impl midden_core::Volume for FatVolume {
+    /// APPLOAD/LAUNCH-AR: probe the PROGRAM SOURCE, not the default handle.
+    ///
+    /// This is the half of APPLOAD that was missed. `read_el0_image` was moved to
+    /// `mount_program_source()` because the global `BLOCK_DEVICE` cannot answer "where do
+    /// executables live" on a machine booted from the internal SD reader — `SDHCBLK` registers the
+    /// card as handle `Sdhc` and says so on the wire ("global BLOCK_DEVICE untouched"). But the
+    /// LOADER is not the first thing a bare name meets: the RESOLVER is, and it was left on
+    /// `mount()`. On Boot AR that asymmetry cost the operator the whole feature — `SDHCBLK` listed
+    /// `12568 VUG.ELF`, the operator typed `vug`, and this probe answered `false` through a handle
+    /// that does not exist, so the core never built `Plan::Exec` and the console said "Unknown
+    /// command" about a file the same boot had just printed.
+    ///
+    /// A probe and a load that disagree about WHICH volume is the volume can only ever produce
+    /// that shape, so they are now the same question asked of the same handle.
+    ///
+    /// FATVERB: it also STAMPS what it bound into [`EXEC_BIND`]. `fatverb_storage_witness` compares
+    /// that stamp against the one the read verbs leave, which is the only version of "the probe and
+    /// `ls` agree" that a reverted read verb can fail.
+    #[cfg(target_arch = "x86_64")]
+    fn is_file(&mut self, name: &str) -> bool {
+        let fs = match crate::fs::fat::mount_program_source() {
+            Ok(fs) => {
+                stamp(&EXEC_BIND, &EXEC_BIND_SEQ, bind::of(&fs));
+                fs
+            }
+            Err(e) => {
+                stamp(&EXEC_BIND, &EXEC_BIND_SEQ, bind::DECLINED);
+                // Loud, and able to fail: a resolver that answers "no such program" because it
+                // could not mount anything is indistinguishable, from the panel, from a typo. This
+                // line is the difference, and it names the handles that WERE available so the
+                // capture shows what the probe was offered rather than only what it concluded.
+                serial_println!(
+                    ":: [midden] exec-probe \"{}\" -> NO VOLUME ({:?}; handles={}) ::",
+                    name, e, crate::drivers::block::source_census()
+                );
+                return false;
+            }
+        };
+        matches!(
+            resolve_path(&fs, &normalize_path(&cwd_path(), name)),
+            Ok(Resolved::Entry(de, _)) if !de.is_dir
+        )
+    }
+    // aarch64 never sets `Facts::exec`, so the core never calls this. Answering `false` rather
+    // than reaching for unafs keeps the promise: no behaviour change on a build with no loader.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn is_file(&mut self, _name: &str) -> bool {
+        false
+    }
+}
+
+/// Render one `midden_core::Message` to the console — the Ring 0 half of "views are the only path
+/// to the user".
+///
+/// The core returns ONE string; the console is line-oriented, so this splits on `\n` and prints
+/// each line, which is byte-for-byte what the old per-line `console.println` calls did. `NoOp`
+/// prints nothing at all (not a blank line): silence is the message.
+fn render_message(console: &mut Console, msg: &midden_core::Message) {
+    if matches!(msg, midden_core::Message::NoOp) {
+        return;
+    }
+    for line in msg.text().split('\n') {
+        console.println(line);
+    }
+}
+
+/// MIDDEN-M1 WITNESS (witness battery): prove, headlessly and on BOTH arches, that the console's
+/// interpreter is the shared core and that extension-elided resolution works.
+///
+/// Why a fixture and not just the live line: the live `:: [midden] ... ::` witness needs a
+/// keystroke, and the headless QEMU gates type nothing. This drives the same `midden_core::plan`
+/// the prompt drives, over a synthetic volume, and asserts the four properties that would silently
+/// rot: a core verb is answered in-core, a host verb is routed (not swallowed), a bare name elides
+/// `.elf` to the on-disk spelling, and a verb still beats a program of the same stem. Each check
+/// prints in the uniform `:: TSTE: <name> -> PASS/FAIL ::` shape, so the boot-replay ring picks
+/// them up and `tste` lists them.
+///
+/// It can fail: every assertion compares against a literal expected value, and a FAIL line names
+/// what it got.
+#[cfg(feature = "witness")]
+pub fn midden_witness() {
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+
+    // A volume that is NOT the real one, and a build description that is NOT this build's: the
+    // fixture must prove the RESOLVER, on every arch, not the card in the slot or the `cfg` this
+    // kernel happens to carry. (`vug` is a verb on aarch64 and a program name on x86 — the fixture
+    // pins the x86 shape so the `.elf` elision is exercised on the Pi gate too, which is the only
+    // headless gate that runs today.)
+    const NAMES: &[&str] = &["VUG.ELF", "STAT.ELF", "README.TXT"];
+    let facts = midden_core::Facts {
+        x86: true,
+        exec: true,
+        proc_verbs: true,
+        proc_rows: midden_facts().proc_rows,
+        aarch64: false,
+        v3d: false,
+    };
+
+    // 1. dispatch — a core verb is answered by the core, with real text.
+    let mut vol = midden_core::NameList(NAMES);
+    let p = midden_core::plan("echo midden m1", &facts, &mut vol);
+    let ok = matches!(&p, midden_core::Plan::Say(m)
+        if m.kind() == "TerminalOutput" && m.text() == "midden m1");
+    verdict("midden.dispatch", ok, &alloc::format!("{:?}", p));
+
+    // 2. routing — a host verb comes back as Host with its args intact, never swallowed.
+    let mut vol = midden_core::NameList(NAMES);
+    let p = midden_core::plan("cat DOCS/README.TXT", &facts, &mut vol);
+    let ok = matches!(&p, midden_core::Plan::Host { verb, rest }
+        if verb == "cat" && rest == "DOCS/README.TXT");
+    verdict("midden.route", ok, &alloc::format!("{:?}", p));
+
+    // 3. resolve — the `.elf` the user did not type, elided against the on-disk name.
+    let mut vol = midden_core::NameList(NAMES);
+    let p = midden_core::plan("vug", &facts, &mut vol);
+    let ok = matches!(&p, midden_core::Plan::Exec { typed, name }
+        if typed == "vug" && name == "VUG.ELF");
+    verdict("midden.resolve", ok, &alloc::format!("{:?}", p));
+    if let midden_core::Plan::Exec { typed, name } = &p {
+        serial_println!(":: [midden] resolve \"{}\" -> {} ::", typed, name);
+    }
+
+    // 4. precedence — `stat` is a verb and STAT.ELF is on the volume; the verb wins. This is the
+    //    collision MIDDEN_CONVERGENCE §5 records, pinned here so a later "improvement" that lets a
+    //    program shadow a verb cannot land quietly.
+    let mut vol = midden_core::NameList(NAMES);
+    let p = midden_core::plan("stat FOO", &facts, &mut vol);
+    let ok = matches!(&p, midden_core::Plan::Host { verb, .. } if verb == "stat");
+    verdict("midden.precedence", ok, &alloc::format!("{:?}", p));
+
+    // The STORAGE legs used to sit here, and that was the defect the adoption review convicted.
+    // `midden_witness` runs at main.rs step 5, BEFORE `pci::init` and before the USB storage
+    // publish, so every storage leg read `handles=global=absent sdhc=absent` and passed on all-false
+    // inputs — vacuous on QEMU and on metal, forever. They now live in `fatverb_storage_witness`
+    // below, called from the storage-ready service pass beside `fat::probe_once`.
+}
+
+// ===================== FATVERB — the storage witness, after storage exists =========================
+
+/// FATVERB: one-shot latch. The service loop calls the witness every pass; it must speak once.
+#[cfg(target_arch = "x86_64")]
+static FATVERB_WITNESS_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// FATVERB: when the wait for a program source began (`arch::ticks()` ms, 0 = not yet waiting).
+#[cfg(target_arch = "x86_64")]
+static WITNESS_WAIT_SINCE_MS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// FATVERB: how long to wait for a block device before witnessing an empty census anyway. Same
+/// value and same reasoning as `video::wcx::STORAGE_WAIT_MS` — generous against the deferred SCSI
+/// bring-up on this bench, and the number matters far less than the wait terminating in a line.
+#[cfg(target_arch = "x86_64")]
+const STORAGE_WAIT_MS: u64 = 30_000;
+
+/// FATVERB: THE VERBS AND THE PROBE MUST BIND THE SAME HANDLE, AND A WRITE VERB MUST CONSULT THE GATE.
+///
+/// **Where this runs, and why that is the whole point.** The first cut put these legs in
+/// `midden_witness`, which fires at main.rs step 5 — before `pci::init`, before the xHCI storage
+/// publish, before `sdhc::bring_up`. The review's capture settled it: all three legs passed with
+/// `handles=global=absent sdhc=absent`, i.e. with every input false. A fixture whose inputs cannot
+/// be non-trivial is not quiet, it is dead. This one is called from the storage-ready service pass,
+/// immediately after `fat::probe_once()` / `sdhc_probe_once()` have run, so by the time it speaks
+/// the census names real handles and the questions have content.
+///
+/// **What makes each leg falsifiable.** Not comparing an expression with itself — the other half of
+/// the review. Each leg DRIVES A REAL VERB and reads the stamp that verb left behind:
+///
+/// * `fatverb.readvol` runs `ls_path`, the function the `ls`/`dir` dispatch arm calls, and then
+///   requires (a) that the read-verb binding counter ADVANCED across that call, and (b) that the
+///   handle it stamped equals the handle the exec probe stamped. Revert `ls_path` to the old
+///   default-handle `fat::mount` and (a) fails, because a reverted verb never reaches the recorder. Point the
+///   read helper at a different handle and (b) fails. Neither half can be satisfied by evaluating
+///   one expression twice, which is precisely what the first cut did.
+///
+/// * `fatverb.writegate` runs `fs_rm` against a name that cannot exist, and requires that the write
+///   gate's counter advanced and that its recorded answer matches the mounted source's veto. The
+///   probe name is deliberately unresolvable, so on a WRITABLE volume the verb gates through and
+///   then stops at `NotFound` — the fixture drives the real refusal path without ever creating,
+///   truncating or unlinking anything. On a READ-ONLY source the gate fires and the verb never
+///   reaches the directory at all, which is the property the arc exists to guarantee.
+///
+/// The verbs print to a THROWAWAY `Console` (heap-only, no panel, dropped on return), so the
+/// fixture's own output never lands on the operator's screen; the verbs' serial mirrors still reach
+/// the capture, which is where a bench reader wants them.
+///
+/// **Quiet, not vacuous, in QEMU.** Where the handles agree the stamps agree and the legs pass —
+/// but they pass on inputs that were free to differ, and the counters prove the verbs ran.
+#[cfg(target_arch = "x86_64")]
+pub fn fatverb_storage_witness() {
+    use core::sync::atomic::Ordering;
+    if FATVERB_WITNESS_DONE.load(Ordering::Acquire) {
+        return;
+    }
+    // BOUNDED WAIT FOR A PROGRAM SOURCE — the second half of "not vacuous", and it is not optional.
+    //
+    // Being called from the storage-ready pass is necessary but not sufficient: the pass begins
+    // running long before the deferred SCSI bring-up behind `service_storage` finishes, so a witness
+    // that latched on its FIRST call would fire with an empty census on exactly the configurations
+    // where storage is slow — which is the `midden_witness` failure again, one screen further down
+    // the boot. Measured on this host: the plain `./arroyo test` shape had `sdhc=present` on the
+    // first pass, and the `test-fat sf` shape had nothing at all, so the two differ and neither can
+    // be assumed.
+    //
+    // The shape is `wcx::desktop_app_service`'s, deliberately — including its law that the wait
+    // TERMINATES IN A LINE rather than in silence. A boot that genuinely never gets a block device
+    // must still emit these legs (a read verb with no volume is Boot AR's own symptom, and a spec
+    // REQUIRE must not go red because the machine had no card in it), so the deadline expires into
+    // the witness rather than out of it, and the census on the line says which it was.
+    if crate::drivers::block::program_source().is_none() {
+        let now = crate::arch::ticks();
+        let started = WITNESS_WAIT_SINCE_MS.load(Ordering::Relaxed);
+        if started == 0 {
+            WITNESS_WAIT_SINCE_MS.store(now.max(1), Ordering::Relaxed);
+            return;
+        }
+        if now.saturating_sub(started) < STORAGE_WAIT_MS {
+            return;
+        }
+        // Fall through: speak on an empty census, and say so below.
+    }
+    if FATVERB_WITNESS_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let waited = match WITNESS_WAIT_SINCE_MS.load(Ordering::Relaxed) {
+        0 => 0,
+        t => crate::arch::ticks().saturating_sub(t),
+    };
+
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+
+    // A name that resolves on no volume anyone will ever stage: the write leg must be able to run
+    // on a WRITABLE boot volume without mutating it, so the gate is what it exercises, not the
+    // directory. `$` is legal in a FAT 8.3 name, so this reaches the resolver rather than dying in
+    // path validation — the leg must test the gate, not the parser.
+    const NOSUCH: &str = "$FATVERB.$$$";
+    // The read probe: any name will do, because the leg asserts AGREEMENT about the handle, never
+    // presence of the file. `VUG.ELF` is used only so the exec probe's stamp comes from the same
+    // question `bare_exec` asks in anger.
+    const PROBE: &str = "VUG.ELF";
+
+    let census = crate::drivers::block::source_census();
+
+    // --- readvol -------------------------------------------------------------------------------
+    let exec_seq0 = EXEC_BIND_SEQ.load(BindOrd::Relaxed);
+    let mut v = FatVolume;
+    let _ = midden_core::Volume::is_file(&mut v, PROBE);
+    let exec_ran = EXEC_BIND_SEQ.load(BindOrd::Relaxed) > exec_seq0;
+    let exec_bound = EXEC_BIND.load(BindOrd::Relaxed);
+
+    let read_seq0 = READ_BIND_SEQ.load(BindOrd::Relaxed);
+    {
+        // The REAL read verb, exactly as the `ls`/`dir` dispatch arm invokes it.
+        let mut sink = Console::new();
+        ls_path(&mut sink, ".", false);
+    }
+    let read_ran = READ_BIND_SEQ.load(BindOrd::Relaxed) > read_seq0;
+    let read_bound = READ_BIND.load(BindOrd::Relaxed);
+
+    verdict(
+        "fatverb.readvol",
+        exec_ran && read_ran && exec_bound == read_bound,
+        &alloc::format!(
+            "exec_ran={} read_ran={} exec={} read={} handles={}",
+            exec_ran, read_ran, bind::name(exec_bound), bind::name(read_bound), census
+        ),
+    );
+
+    // --- writegate -----------------------------------------------------------------------------
+    // The independent side of the comparison: what the SOURCE says, read straight off the block
+    // layer's own predicate, before the verb runs.
+    let veto = crate::fs::fat::mount_program_source().ok().and_then(|fs| fs.write_veto());
+    let gate_seq0 = WRITE_GATE_SEQ.load(BindOrd::Relaxed);
+    {
+        // The REAL write verb. `force = true` so a hypothetical prompt cannot stall the boot.
+        let mut sink = Console::new();
+        fs_rm(&mut sink, NOSUCH, true);
+    }
+    let gate_ran = WRITE_GATE_SEQ.load(BindOrd::Relaxed) > gate_seq0;
+    let gate = WRITE_GATE.load(BindOrd::Relaxed);
+    let gate_agrees = match veto {
+        Some(_) => gate == bind::REFUSED_RO,
+        None => gate == bind::ADMITTED || gate == bind::DECLINED,
+    };
+    verdict(
+        "fatverb.writegate",
+        gate_ran && gate_agrees,
+        &alloc::format!(
+            "gate_ran={} gate={} veto={} handles={}",
+            gate_ran, bind::name(gate), veto.unwrap_or("none"), census
+        ),
+    );
+
+    // `waited` is the MEASUREMENT, not the threshold: a reader can tell "storage was there on the
+    // first pass" (0 ms) from "the deadline expired and this census is empty because nothing ever
+    // arrived" (>= the threshold), which is the difference between a quiet leg and a dead one.
+    serial_println!(
+        ":: [fatverb] storage witness: exec={} read={} gate={} waited={}ms handles={} ::",
+        bind::name(exec_bound), bind::name(read_bound), bind::name(gate), waited, census
+    );
+}
+
 /// Run one command. Returns `true` if the command took over the whole screen with its own
 /// graphics (e.g. `vug`), so the caller should NOT repaint the console over it.
 pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetPal) -> bool {
-    // Split command and args (simple whitespace split)
-    let mut parts = cmd_line.trim().split_whitespace();
-    let command = parts.next().unwrap_or("");
-    let args: Vec<&str> = parts.collect();
+    // MIDDEN-M1 — ONE INTERPRETER, AND IT IS MIDDEN'S.
+    //
+    // This function used to be a rival shell: it split the line itself, decided by `match` arm
+    // what counted as a command, wrote its own help text, and invented "Unknown command" in a
+    // `_ =>` fallthrough — none of it shared with `handlers/midden`, the shell handler that is
+    // supposed to BE the UnaOS shell. Two interpreters, two command tables, no shared line.
+    //
+    // Now the line goes to `midden_core::plan` first (unaos/libs/sys/midden_core — no_std,
+    // forbid(unsafe_code), the same shared-core convention as libs/fs/unafs and libs/sys/helm),
+    // and this function services what comes back:
+    //
+    //   Nothing  — empty line, nothing printed (the old `"" => {}` arm).
+    //   Say(msg) — the core answered in full (help/echo/ver/gneiss, and every refusal). We render
+    //              the `TerminalOutput`/`TerminalError` and return. THIS is the console rendering
+    //              a bandy-shaped terminal message, in Ring 0, off the shared core.
+    //   Exec     — a bare name resolved to a program on disk, `.elf` elided if the user left it
+    //              off (x86; see `bare_exec`). `ls` still shows STAT.ELF — elision is a lookup
+    //              rule, never a storage or display rule.
+    //   Host     — a verb the core knows but only the kernel can perform. The giant match below
+    //              is that service layer, and ONLY that: it no longer decides what a word means.
+    //
+    // What is still deferred is stated plainly rather than implied: the FAT/VFS/net/process verbs
+    // remain kernel-side implementations reached through `Plan::Host`. See
+    // docs/dev/USERLAND/MIDDEN_CONVERGENCE.md §2 for the split and what M2 moves.
+    let facts = midden_facts();
+    let mut vol = FatVolume;
+    let plan = midden_core::plan(cmd_line, &facts, &mut vol);
+
+    // WITNESS (must be able to fail): one line per dispatched line, naming the message the core
+    // produced. A line that never reached the core cannot print this, and a core that produced
+    // nothing prints `len=0` rather than a plausible number.
+    match &plan {
+        midden_core::Plan::Nothing => {}
+        midden_core::Plan::Say(msg) => serial_println!(
+            ":: [midden] cmd=\"{}\" -> {} len={} ::",
+            cmd_line.trim(), msg.kind(), msg.len()
+        ),
+        // LAUNCH-AR: `cmd=`-shaped, like its three siblings, and NOT the fixture's wording.
+        //
+        // This arm used to print `resolve "vug" -> VUG.ELF`, which is byte-for-byte the line
+        // `midden_witness` prints from its synthetic `NameList`. Reading Boot AR's capture, that
+        // made the ONE `resolve "vug" -> VUG.ELF` in the log look like proof the operator's launch
+        // had resolved, when it was the boot fixture talking and the operator's own line was the
+        // `TerminalError` two thousand lines later. A witness that cannot be told apart from a
+        // fixture is not a witness. Same `cmd="<line>" ->` prefix as `Say`/`Host` now, so the
+        // operator's dispatch is greppable as one family and the disposition is the tail.
+        midden_core::Plan::Exec { name, .. } => serial_println!(
+            ":: [midden] cmd=\"{}\" -> Exec {} ::", cmd_line.trim(), name
+        ),
+        midden_core::Plan::Host { verb, .. } => serial_println!(
+            ":: [midden] cmd=\"{}\" -> Host verb={} ::", cmd_line.trim(), verb
+        ),
+    }
+
+    let (verb, rest) = match plan {
+        midden_core::Plan::Nothing => return false,
+        midden_core::Plan::Say(msg) => {
+            render_message(console, &msg);
+            return false;
+        }
+        midden_core::Plan::Exec { typed, name } => {
+            #[cfg(target_arch = "x86_64")]
+            bare_exec(console, &typed, &name);
+            // No build outside x86 sets `Facts::exec`, so the core never hands this arm a plan
+            // there; the branch exists so the match is total and the day a loader arrives on
+            // another arch the compiler points here.
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = (&typed, &name);
+                console.println("Unknown command. Type 'help' for assistance.");
+            }
+            return false;
+        }
+        midden_core::Plan::Host { verb, rest } => (verb, rest),
+    };
+    let command: &str = &verb;
+    let args: Vec<&str> = rest.split_whitespace().collect();
 
     // The `vug` and `pulse` commands paint full-screen views; everything else leaves the
     // console visible. PI-APP-1: `v3d` blits the visible battery onto the live scanout, so it too
@@ -2324,63 +2969,6 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     let took_screen = false;
 
     match command {
-        "ver" | "version" => {
-            console.println("unaOS v0.1.0 (Kernel: Jules 1 / Cortex: Jules 6)");
-        },
-        "help" => {
-            console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
-            console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
-            console.println("FILES:    fatinfo (FAT geometry), ls [-l] [dir], cd [dir], pwd, cat <path>");
-            console.println("PAGING:   head <path> [n], tail <path> [n]  (first / last n lines, default 10)");
-            console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm [-r] [-f] <path>");
-            console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
-            console.println("VFS:      vfs write|append|rm|mkdir <path> [text]  (unified namespace: / native, /fat FAT)");
-            console.println("          rm -r <dir>  (recursively delete a directory tree; root refused)");
-            console.println("COPY:     cp [-f] <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
-            console.println("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
-            console.println("MOVE:     mv [-f] <src...> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
-            console.println("FLAGS:    default is no-clobber; -f = force overwrite (rm: quiet on missing), -n = no-clobber");
-            console.println("WILDCARD: * / ? in the last path component — ls/cat/rm/cp/mv expand it (e.g. rm *.TMP, cp *.TXT DOCS/)");
-            console.println("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
-            console.println("TREE:     find [root] <pattern>  (recursive glob search), du [dir]  (recursive size tally)");
-            console.println("          uptime  (seconds since boot; shows the wall clock when set)");
-            console.println("INSPECT:  stat <path>  (full on-disk detail), xd <path> [off] [len]  (bounded hexdump)");
-            #[cfg(target_arch = "aarch64")]
-            console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, absolute paths)");
-            #[cfg(target_arch = "aarch64")]
-            console.println("          utouch <path>, uwrite <path> <text>, umkdir <path>, urm <path>  (write-through)");
-            console.println("          usnaps, usnap <name>, usnapdrop <gen>  (retained roots / snapshots)");
-            #[cfg(target_arch = "aarch64")]
-            console.println("          usnapls <gen> [path], usnapcat <gen> <path>  (read a snapshot; current-ACL enforced)");
-            console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
-            console.println("          time  (shared civil clock: ISO-8601 UTC + source; unsynced until SNTP/setdate)");
-            // `pulse` draws through the aarch64-only `vug` module, so it is listed only where it can
-            // actually run — help text that advertises a verb the build cannot dispatch is worse than
-            // no help at all.
-            #[cfg(target_arch = "aarch64")]
-            console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
-            #[cfg(not(target_arch = "aarch64"))]
-            console.println("SMP:      sched (per-CPU run queues)");
-            #[cfg(target_arch = "aarch64")]
-            console.println("          top  (per-core load: recent busy%, ctx-switches, last task)");
-            // PI-APP-1: v3d-gated so the knob-off build's help text stays byte-identical to baseline.
-            #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
-            console.println("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
-            // BGRUN-1: background user-mode runs — the concurrent-apps line (windows coexist; TAB cycles).
-            #[cfg(feature = "baremetal")]
-            console.println("PROC:     run <path> (foreground), bg <path> (background), jobs (list+reap), kill <pid>");
-            // STORM-HEADROOM: the verb existed since P77 but was never listed, so the one command an
-            // attended bench uses to load the scheduler was discoverable only from the source. The
-            // cap is stated here because it is the first thing a `storm 8` reading needs.
-            #[cfg(feature = "baremetal")]
-            console.println("          storm [n]  (launch n vugs; n>6 is refused by the process table — serial carries the [storm] census)");
-            console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
-            console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
-            console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
-            console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
-            console.println("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
-            console.println("          get <ip> [port] [path]  (HTTP/1.0 GET)");
-        },
         "date" => {
             // JD17/CLOCK-3/PI-UI-3: show the kernel wall clock. The UNIFIED civil clock is the source of
             // truth: prefer the Unix anchor (an SNTP sync on the Pi — PI-NET-16 — or a `setdate` seed), so a
@@ -2450,16 +3038,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // Let's implement a clear method on Console.
             console.clear();
         },
-        "echo" => {
-            let content = args.join(" ");
-            console.println(&content);
-        },
         "panic" => {
             // Test the Exception Handler
             panic!("Manual Panic Requested by Architect!");
-        },
-        "gneiss" => {
-             console.println("Gneiss is Home.");
         },
         "usbinfo" => {
             for line in crate::drivers::xhci::usb_summary() {
@@ -2467,9 +3048,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "fatinfo" => {
-            match crate::fs::fat::mount() {
-                Ok(fs) => console.println(&fs.describe()),
-                Err(e) => console.println(&alloc::format!("fatinfo: no FAT filesystem ({:?})", e)),
+            if let Some(fs) = mount_read_volume(console, "fatinfo") {
+                console.println(&fs.describe());
             }
         },
         "ls" | "dir" => {
@@ -2503,8 +3083,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // JD4: change the shell's working directory. No argument (or `/`) returns to the
             // root. The stored cwd is the CANONICAL on-disk spelling of the resolved path.
             let path = normalize_path(&cwd_path(), args.first().copied().unwrap_or("/"));
-            match crate::fs::fat::mount() {
-                Ok(fs) => match resolve_path(&fs, &path) {
+            if let Some(fs) = mount_read_volume(console, "cd") {
+                match resolve_path(&fs, &path) {
                     Ok(Resolved::Root) => {
                         *CWD.lock() = None;
                         console.println("/");
@@ -2519,8 +3099,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         }
                     }
                     Err(msg) => console.println(&alloc::format!("cd: {}", msg)),
-                },
-                Err(e) => console.println(&alloc::format!("cd: no FAT filesystem ({:?})", e)),
+                }
             }
         },
         "pwd" => {
@@ -2531,15 +3110,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match args.first() {
                 None => console.println("usage: cat <path>"),
                 Some(name) if has_glob(name) => cat_globbed(console, name),
-                Some(name) => match crate::fs::fat::mount() {
-                    Ok(fs) => match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
-                        Ok(Resolved::Root) =>
-                            console.println("cat: /: is a directory (-EISDIR)"),
-                        Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
-                        Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
-                    },
-                    Err(e) => console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
-                },
+                Some(name) => {
+                    if let Some(fs) = mount_read_volume(console, "cat") {
+                        match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
+                            Ok(Resolved::Root) =>
+                                console.println("cat: /: is a directory (-EISDIR)"),
+                            Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
+                            Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
+                        }
+                    }
+                }
             }
         },
         "head" => {
@@ -2862,7 +3442,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // foreign volume-level path from the same surface. `vfs <op> <path>`.
             vfs_cmd(console, &args);
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
         "run" => {
             // EXEC-1: load an ELF64 user program off the VFS namespace and execute it in user mode, reporting its
             // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
@@ -2870,6 +3450,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // fixture. The bytes are read here (kernel mode/ASID 0) and handed to the kernel loader
             // (`run_user_image`), which maps them into a fresh per-task slot with per-segment W^X pages and
             // runs them under user mode + the fault-kill net. `run <path>`.
+            //
+            // X86RUN (GR20): also on x86, where the read side differs (there is no VFS namespace on
+            // this arch) but nothing else does — see `read_el0_image`'s x86 twin for the path rules.
+            // `run /fat/VUG.ELF` and `run VUG.ELF` both reach the DATA volume's root there.
             match args.first() {
                 None => console.println("usage: run <path>   (load + execute an ELF64 user program)"),
                 Some(&path) => run_program(console, path),
@@ -2963,9 +3547,19 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                                 let label = fs.label();
                                 let label = if label.is_empty() { String::from("-") } else { label };
                                 let vol_mib = fs.volume_bytes() / (1024 * 1024);
+                                // FATVERB: the posture is ASKED, not remembered. This line claimed
+                                // "(read-only)" from PIUSB-27, which USB-WRITE F3 retired when it
+                                // routed the `Usb` arm to the verified BOT WRITE(10) path — so
+                                // `diskinfo` had been telling the operator the stick could not be
+                                // written for as long as it could. One predicate now answers for the
+                                // VFS, the shell's write gate and this line.
+                                let posture = match fs.write_veto() {
+                                    None => "read-write",
+                                    Some(_) => "read-only",
+                                };
                                 fs5_say(console, &alloc::format!(
-                                    "USB FAT: {}  label {}  volume {} MiB  mounted /usb (read-only)",
-                                    kind, label, vol_mib));
+                                    "USB FAT: {}  label {}  volume {} MiB  mounted /usb ({})",
+                                    kind, label, vol_mib, posture));
                             }
                             Err(e) => fs5_say(console, &alloc::format!(
                                 "USB FAT: unmounted ({})", crate::fs::fat::fat_reason(e))),
@@ -3370,7 +3964,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
              crate::hlt_loop();
              crate::hlt_loop();
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
         "bg" => {
             // BGRUN-1: run a user program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
@@ -3383,7 +3977,14 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 }
             }
         },
-        #[cfg(feature = "baremetal")]
+        // STORM-X86 (Peter, Boot AL, rMBP): this arm was `#[cfg(feature = "baremetal")]` — a Pi-only
+        // gate — while the `bg`/`jobs`/`kill` arms on either side of it had already been widened to
+        // include x86. So `storm` at the x86 prompt fell through to "Unknown command" even though
+        // every mechanism it drives (the bg path, the process table, the slot pool) is live there.
+        // The gate now matches its neighbours exactly. `all(baremetal, aarch64)` is not a narrowing:
+        // `baremetal` is only ever set by the Pi legs (see `arroyo`), so the aarch64 build selects
+        // the identical arm it always did.
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
         "storm" => {
             // STORM-VERB (Peter, P77 sitting): launch a whole vug fleet in one command — `storm [n]`,
             // default 6, so an operator can raise a load storm without typing `bg /fat/VUG.ELF` six
@@ -3394,14 +3995,33 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             //
             // STORM-HEADROOM — WHAT ACTUALLY BOUNDS `n`. The sentence this replaces ("the job table
             // (8 slots) and PROCS-6's bg cap bound n") was true and useless: it named both bounds
-            // without saying which one BITES. The clamp below admits 8; `syscall::proc_table_rows()`
-            // is 6. So `storm 7` and `storm 8` cannot succeed as asked on ANY boot, empty or not —
-            // the seventh launch is refused by the process table, the loop stops, and the fleet that
-            // remains is the same fleet `storm 6` builds. The clamp stays at 8 deliberately: an
-            // operator who asks for more than the machine has must get a REFUSAL that names the
-            // resource, not a silently-lowered request that reads as if it were granted. The cap is
-            // not a knob — see the `MAX_PROCS` block in `arch::syscall` for why 6 is where the user
-            // slot reserve puts it, and treat moving it as an arc, not a tuning step.
+            // without saying which one BITES. The one that bites is the PROCESS TABLE, always: the
+            // job table is kept strictly above it and the user-slot pool keeps a 2-slot reserve
+            // above THAT, so `syscall::proc_table_rows()` is the first ceiling a growing fleet
+            // reaches, on either arch.
+            //
+            // THE CLAMP IS DERIVED, NOT WRITTEN DOWN. It admits `proc_table_rows() + 2` — two past
+            // the ceiling, deliberately, and that margin is the whole design: an operator who asks
+            // for more than the machine has must get a REFUSAL that names the resource, not a
+            // silently-lowered request that reads as if it were granted. It used to be the literal
+            // `8`, which was `6 + 2` at the time and became a lie the moment HEADROOM moved x86's
+            // `MAX_PROCS` to 10 (a `storm 9` would have been quietly served as `storm 8`). Deriving
+            // it means the margin, not the number, is what is maintained.
+            //
+            // WHAT THAT MEANS PER ARCH, recomputed:
+            //   * **aarch64** — `MAX_PROCS = 6`, so the clamp admits 8 and the arithmetic is
+            //     unchanged from STORM-X86: `storm 7`/`storm 8` cannot succeed as asked on ANY boot,
+            //     the SEVENTH launch is refused by the process table, and the fleet that remains is
+            //     the same fleet `storm 6` builds.
+            //   * **x86** — `MAX_PROCS = 10`, so the clamp admits 12 and `storm 11`/`storm 12` are
+            //     the requests that cannot succeed on an empty boot; the ELEVENTH launch is the one
+            //     the process table refuses. On a `wc` boot the desktop app holds a row permanently,
+            //     so the refusal arrives one earlier: the TENTH launch, i.e. `storm 9` is the
+            //     largest fleet that completes as asked and `storm 8` is the largest that still
+            //     leaves a row for a foreground `run`.
+            // The cap is not a knob — see the `MAX_PROCS` block in `arch::syscall` for why 10 is
+            // where the user-slot reserve puts it on x86, and treat moving it as an arc, not a
+            // tuning step. (HEADROOM was that arc.)
             //
             // WHY THE CENSUS SITS HERE. Every scheduler quantity that could name a ceiling already
             // exists, but on other clocks: the `:: SCHED: load ::` train is timer-driven (~1 s
@@ -3411,14 +4031,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // before the first launch, one `[storm] k=` line after each successful one, `post` after
             // the burst. That layout is what makes a WEDGE readable as well as a refusal: if the
             // fleet starves the shell, this verb stops printing, and the last `k=` on the wire names
-            // the launch it stopped after. Its silence proves nothing on its own — the timer-driven
-            // `:: SCHED: load ::` / `[pulse5]` / `[spin1]` lines are the instruments that survive a
-            // starved shell, and they are what a silent tail must be read against.
+            // the launch it stopped after. Its silence proves nothing on its own — and on x86 there
+            // is NO instrument that survives a starved shell (the `[schedx86] load` heartbeat runs
+            // on the same render-service task as this dispatch; on aarch64 the timer-driven
+            // `:: SCHED: load ::` / `[pulse5]` / `[spin1]` train does survive). A silent x86 tail
+            // is settled only by the next boot's slice, honestly.
             let n = args
                 .first()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(6)
-                .clamp(1, 8);
+                .clamp(1, crate::arch::syscall::proc_table_rows() + 2);
             // STORM-FATW: `fat` anywhere in the args arms the USB-traffic writer (below). A bare
             // `storm fat` keeps the default fleet of 6 (the non-numeric arg falls through the parse).
             let fatw = args.iter().any(|a| *a == "fat");
@@ -3434,16 +4056,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 let j = BG_JOBS.lock();
                 (j.iter().filter(|s| s.is_none()).count(), j.len())
             };
-            let slots_free = crate::arch::boot::user_slots_free();
+            let slots_free = storm_slots::user_slots_free();
             console.println(&alloc::format!(
                 "storm: n={} — {}/{} process rows free, {}/{} job rows, {}/{} user slots",
                 n, rows_free, rows, jobs_free, jobs_rows,
-                slots_free, crate::arch::boot::USER_SLOTS
+                slots_free, storm_slots::USER_SLOTS
             ));
             serial_println!(
                 ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} | user slots free={}/{} ::",
                 n, rows_free, rows_running, rows_exited, rows_orphaned, rows,
-                jobs_free, jobs_rows, slots_free, crate::arch::boot::USER_SLOTS
+                jobs_free, jobs_rows, slots_free, storm_slots::USER_SLOTS
             );
             crate::arch::sched::storm_census("pre");
             let mut launched = 0usize;
@@ -3460,7 +4082,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     serial_println!(
                         ":: STORM: REFUSED at launch {} of {} — fleet stands at {} | proc rows free={} running={} exited={} porphaned={} | user slots free={} ::",
                         launched + 1, n, launched, f, r, e, o,
-                        crate::arch::boot::user_slots_free()
+                        storm_slots::user_slots_free()
                     );
                     break;
                 }
@@ -3480,7 +4102,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 serial_println!(
                     ":: STORM: end | proc rows free={} running={} exited={} porphaned={} of {} | user slots free={}/{} ::",
                     f, r, e, o, crate::arch::syscall::proc_table_rows(),
-                    crate::arch::boot::user_slots_free(), crate::arch::boot::USER_SLOTS
+                    storm_slots::user_slots_free(), storm_slots::USER_SLOTS
                 );
             }
             // `post` is taken immediately, so its busy percents still carry the pre-burst window —
@@ -3493,18 +4115,33 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // WEDGE-8/F3 metal provocation (the fleet supplies preemption pressure; this supplies
             // the driver-claim traffic). See `storm_fat_writer` for the two legs and their honesty
             // rules. Armed AFTER the burst so the census lines above describe the fleet alone.
+            #[cfg(target_arch = "aarch64")]
             if fatw {
                 crate::arch::sched::spawn_auto("stormfatw", storm_fat_writer, 0);
                 console.println("storm: fat writer armed — watch :: STORM: fatw lines on serial");
             }
+            // STORM-X86: `fat` is PARSED on x86 and then REFUSED OUT LOUD. It is not silently
+            // dropped, because a silently-ignored arg is the worst of the three options — the
+            // operator gets the fleet, sees no `fatw` lines, and cannot tell "the writer ran and
+            // found nothing" from "the writer never existed". The refusal names the reason and the
+            // arch. `storm_fat_writer` stays where it is: it drives `BlockSource::Usb` through the
+            // Pi's `fs::fat` masked-RMW path against the xHCI loan, an aarch64+`baremetal` provocation
+            // (WEDGE-8/F3) with no x86 counterpart in this arc. Porting it is an arc of its own, not
+            // a cfg widening — dragging it over here would compile a writer aimed at a driver claim
+            // this arch does not hold, which is a fake instrument, not a feature.
+            #[cfg(target_arch = "x86_64")]
+            if fatw {
+                console.println("storm: `fat` refused — the USB-writer provocation is aarch64/baremetal-only (fleet launched without it)");
+                serial_println!(":: STORM: fatw REFUSED — aarch64/baremetal-only provocation, not ported to x86 ::");
+            }
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
         "jobs" => {
             // BGRUN-1: list background programs and REAP the exited ones (this verb is the reaper — a
             // PEXITED row stays claimed until it is polled here, and the table is bounded). `jobs`.
             bg_jobs(console);
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
         "kill" => {
             // BGRUN-1: kill a background program by pid (SKILL-1 underneath — ASID-scoped, so ELF-2
             // sibling threads die with it; unconfirmed kills park the row PORPHANED and settle at the
@@ -3514,9 +4151,31 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 Some(pid) => bg_kill_cmd(console, pid),
             }
         },
-        "" => {}, // Ignore empty enter
-        _ => {
-            console.println("Unknown command. Type 'help' for assistance.");
+        // MIDDEN-M1: this arm is a DRIFT NET, and as of this arc it is unreachable — deliberately.
+        //
+        // It no longer means "unknown word": the core already ruled on that, and an unknown word
+        // comes back as `Plan::Say(TerminalError)` and never arrives here. What could arrive is a
+        // word midden's table calls a verb that THIS build does not compile the machinery for —
+        // and that set is empty today, because every `Avail` in `HOST_VERBS` mirrors the `#[cfg]`
+        // on its arm below exactly (the review checked all 78 spellings arm by arm). So the table
+        // and the match agree, and nothing reaches this arm.
+        //
+        // It is kept because that agreement is a HAND-MAINTAINED invariant across two files. Add a
+        // verb to `HOST_VERBS` and forget its arm, or `#[cfg]`-narrow an arm without narrowing its
+        // `Avail`, and the drift lands HERE — as a sentence naming the verb, on the panel — rather
+        // than as a word that silently does nothing. Deleting the arm would make that same drift a
+        // non-exhaustive-match compile error only if the match were over an enum, and it is over
+        // `&str`; there is no compiler check to fall back on. Hence: unreachable by construction,
+        // retained as the net for the construction breaking.
+        //
+        // (No example is given on purpose. Every plausible one is wrong: `uls`/`top` on x86 are
+        // `Avail::Aarch64`/an arm that prints its own aarch64-only message, and `vug`'s `Avail`
+        // tracks the v3d cfg. If a real reachable case ever appears, it is a BUG in the table.)
+        other => {
+            console.println(&alloc::format!(
+                "{}: not available on this build (the verb exists; this kernel does not carry it)",
+                other
+            ));
         }
     }
 
@@ -3600,9 +4259,12 @@ fn parse_num(s: &str) -> Option<u64> {
 /// honest hot-plug posture (doc §6): absent → `/usb` is simply not in the table,
 /// so a `/usb/...` path falls through to the native root and resolves to a clean
 /// `-ENOENT`, never a panic. The USB volume is read through the xHCI `Usb` source
-/// and is **read-only by construction** (PIUSB-27): a `vfs write|append|rm|mkdir`
-/// at `/usb` returns `-ENOTSUP` (the FatBackend refuses writes on a non-Default
-/// source before touching the block layer). Rebuilt per invocation, so a stick
+/// and is **writable** since USB-WRITE F3, which routed the `Usb` arm to the
+/// verified BOT WRITE(10) path and retired PIUSB-27's blanket refusal. Whether a
+/// `vfs write|append|rm|mkdir` at `/usb` is admitted is decided by exactly one
+/// predicate — `fat::BlockSource::write_veto`, which `FatBackend::read_only`
+/// forwards to — so this note cannot drift from the code again the way its
+/// PIUSB-27 predecessor did. Rebuilt per invocation, so a stick
 /// hot-plugged (or ejected) between commands is picked up on the next `vfs`.
 /// EXEC-1: `run <path>` — load an ELF64 (or flat) user program off the VFS namespace and execute it in user mode,
 /// reporting its exit status. Reads the whole file through the same `MountTable` the `vfs` verb uses,
@@ -3616,7 +4278,38 @@ fn parse_num(s: &str) -> Option<u64> {
 /// EXEC-1/BGRUN-1: the shared read-and-precheck front of `run` and `bg` — stat + bound + read off the
 /// VFS, then the friendly ELF64/aarch64 pre-check (the kernel loader is the real gate; a flat blob
 /// passes through to the position-independent flat path). `verb` names the caller in every message.
-#[cfg(feature = "baremetal")]
+///
+/// # X86RUN (GR20) — why this is `baremetal`-OR-x86 rather than `baremetal`
+///
+/// `run`/`bg`/`jobs`/`kill` were written during the Pi arcs and their whole family — verbs, helpers,
+/// job table — carried `#[cfg(feature = "baremetal")]`, the **Pi-4 bare-metal** feature. On an x86
+/// build they were therefore absent from `dispatch_command`'s match and fell through to "Unknown
+/// command", so there was no operator-facing way to start a ring-3 program on the rMBP at all.
+///
+/// Nothing about that gate was load-bearing. The x86 kernel half was BUILT for these verbs and has
+/// been shipping for arcs: `arch::x86_64::syscall` carries `run_user_image`, `spawn_user_image_bg`,
+/// `bg_poll` and `bg_kill` (the WINX-2 twins of the aarch64 entries), whose own doc comments name
+/// "the synchronous shell `run <path>` entry", "the shell's `bg <path>` entry" and "run `jobs` to
+/// reap exited jobs". `arroyo` and `scripts/make-fat-img.sh` stage `STAT.ELF` / `VUG.ELF` /
+/// `PULSE.ELF` onto the x86 DATA volume with the comment "for `run`/`bg`", and the `esp-x86`
+/// operator text already warns that a mis-staged stick makes ``bg /fat/VUG.ELF`` report `-ENOENT`.
+/// The gate was an oversight of provenance, not a dependency.
+///
+/// TWO things genuinely differ on x86, and both are handled by the twin below rather than by
+/// forcing the aarch64 body to compile:
+///
+/// * **There is no VFS namespace.** `impl VfsBackend for FatBackend` and `NativeBackend` are
+///   `#[cfg(target_arch = "aarch64")]` (see `fs/vfs.rs`), which is why `vfs_cmd` already refuses on
+///   x86. So the x86 twin reads through the FAT-direct path the `cat` verb uses
+///   (FATVERB: `mount_read_volume` + `resolve_path` + the JD4 cwd — the same program-source handle
+///   this loader binds), which is the path Peter's `cat hello.txt`
+///   demonstrably exercises. `/fat/NAME` is accepted as an alias for that volume's root, because it
+///   is the form the packaging text tells the operator to type and the only FAT volume x86 mounts
+///   IS the DATA volume.
+/// * **The machine check.** The aarch64 body pre-checks `e_machine == 183`; x86 wants
+///   `EM_X86_64 = 62`. The kernel loader (`arch::x86_64::elf::validate_elf`) re-checks from scratch
+///   either way — this pre-check only sharpens the operator's error text.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
 fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::vfs::NodeKind;
     // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
@@ -3672,7 +4365,157 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
     Some(bytes)
 }
 
-#[cfg(feature = "baremetal")]
+/// X86RUN (GR20): the x86 twin of `read_el0_image` — same contract, same message shapes, same
+/// "every check can say NO" discipline, over the only file surface this arch has.
+///
+/// x86 has no VFS namespace (`fs/vfs.rs` gates both backend impls to aarch64, which is why `vfs_cmd`
+/// refuses here), so this reads through the FAT-direct path `cat` uses: the PROGRAM SOURCE
+/// (FATVERB — `cat` now binds `mount_program_source` through `mount_read_volume`, exactly as this
+/// loader does), which on x86 is the USB mass-storage DATA volume, or the internal SD card on a
+/// machine booted from the reader — never the UEFI boot volume the kernel cannot reach — resolved
+/// through the JD4 cwd exactly like every other file verb.
+///
+/// **`/fat` is accepted as an alias for that volume's root.** It is the form the packaging text tells
+/// the operator to type (`esp-x86` prints "…or `bg /fat/VUG.ELF` reports -ENOENT"), the form
+/// `scripts/make-fat-img.sh` documents for the staged `STAT.ELF`/`VUG.ELF`, and it costs nothing to
+/// honour because x86 mounts exactly one FAT volume. Both `run /fat/VUG.ELF` and `run VUG.ELF` (or
+/// `run /VUG.ELF`) therefore reach the same file, and the witness reports the CANONICAL on-disk path
+/// so a capture never has to guess which spelling was typed.
+#[cfg(target_arch = "x86_64")]
+fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
+    // LAUNCHPACE: time each storage phase of a program launch (mount → directory walk → cluster-chain
+    // read) so a bench capture can CONVICT where a launch stall actually lives, rather than infer it
+    // from the coarse `BGRUN`/`BAREXEC` "loaded N bytes" line — that line prints only after all three
+    // phases and breaks out none of them. The operator's "~1 s pause when I start vug or pulse" runs
+    // exactly this path, and the three sub-costs have very different fixes (a re-mount cache, a
+    // directory-index cache, a batched read), so the witness has to separate them before any of them
+    // is touched. Emitted once, on the SUCCESSFUL read, in `now_cycles()` (rdtsc) units converted to µs.
+    let t_entry = crate::arch::now_cycles();
+    // Cap = the ring-3 window the loader will map into; a file at or under it may still be rejected by
+    // the loader, but this is the hard read ceiling — we never read past it.
+    let cap = crate::arch::syscall::user_window_size();
+    // `/fat/NAME` -> `/NAME` (see the doc note). Case-insensitive, because FAT short names are.
+    let rel = {
+        let p = path;
+        if p.len() >= 4 && p[..4].eq_ignore_ascii_case("/fat") {
+            match p.as_bytes().get(4) {
+                None => "/",              // a bare `/fat` IS the volume root
+                Some(b'/') => &p[4..],    // `/fat/VUG.ELF` -> `/VUG.ELF`
+                Some(_) => p,             // `/fatty.bin` is a real name, not the alias
+            }
+        } else {
+            p
+        }
+    };
+    // APPLOAD: `mount_program_source` — this function's ENTIRE job is finding an executable, which is
+    // the one question the global handle alone cannot answer on a machine booted from the internal SD
+    // reader. `bg /fat/VUG.ELF` reported `-ENOENT` there while the card was mounted and the file
+    // listed. `/fat` stays the alias for "the one FAT volume this arch mounts"; which handle serves
+    // that volume is now the block layer's decision, not this call site's assumption.
+    let fs = match crate::fs::fat::mount_program_source() {
+        Ok(fs) => fs,
+        Err(e) => {
+            console.println(&alloc::format!(
+                "{}: no FAT filesystem ({:?}; handles={})",
+                verb, e, crate::drivers::block::source_census()
+            ));
+            return None;
+        }
+    };
+    let t_mount = crate::arch::now_cycles();
+    let de = match resolve_path(&fs, &normalize_path(&cwd_path(), rel)) {
+        Ok(Resolved::Root) => {
+            console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, path));
+            return None;
+        }
+        Ok(Resolved::Entry(de, _canon)) => de,
+        Err(msg) => {
+            console.println(&alloc::format!("{}: {}", verb, msg));
+            return None;
+        }
+    };
+    let t_resolve = crate::arch::now_cycles();
+    if de.is_dir {
+        console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, path));
+        return None;
+    }
+    if de.size == 0 {
+        console.println(&alloc::format!("{}: {}: empty file", verb, path));
+        return None;
+    }
+    if de.size as usize > cap {
+        console.println(&alloc::format!(
+            "{}: {}: {} bytes exceeds the {}-byte user window (-E2BIG)",
+            verb, path, de.size, cap
+        ));
+        return None;
+    }
+    let mut bytes = alloc::vec::Vec::new();
+    if let Err(e) = fs.read_file(&de, &mut bytes, cap) {
+        console.println(&alloc::format!("{}: {}: read failed ({:?}, -EIO)", verb, path, e));
+        return None;
+    }
+    let t_read = crate::arch::now_cycles();
+    if bytes.len() != de.size as usize {
+        // FATREAD-1 was exactly this class of silent mismatch (a doubled read that pushed
+        // STAT.ELF/VUG.ELF past the window). Say NO out loud rather than hand the loader a short or
+        // long image and let it report an unrelated reason.
+        console.println(&alloc::format!(
+            "{}: {}: short read — {} of {} bytes (-EIO)", verb, path, bytes.len(), de.size
+        ));
+        return None;
+    }
+    if bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F'] {
+        if bytes[4] != 2 {
+            console.println(&alloc::format!("{}: {}: not an ELF64 image (EI_CLASS != 2)", verb, path));
+            return None;
+        }
+        if bytes[5] != 1 {
+            console.println(&alloc::format!("{}: {}: not little-endian (EI_DATA != 1)", verb, path));
+            return None;
+        }
+        let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+        if machine != 62 {
+            // 62 = EM_X86_64. An aarch64 image (183) staged on x86 media lands here with a reason an
+            // operator can act on, instead of the loader's bare "not EM_X86_64".
+            console.println(&alloc::format!(
+                "{}: {}: not an x86-64 image (e_machine {} != 62)", verb, path, machine
+            ));
+            return None;
+        }
+    }
+    // LAUNCHPACE: the storage-phase breakdown for this launch. `mount_us` is the per-launch FAT re-mount
+    // (sector-0 read + MBR/GPT decode + BPB parse — suspect: repeated every launch, never cached);
+    // `dirwalk_us` is the root-directory scan that `resolve_path` runs to find the entry; `read_us` is
+    // the cluster-chain read of the image itself (the MULTIBLK batched path). `total_us` is the whole
+    // synchronous cost this launch imposes on its caller's core — and on x86 the shell runs on the
+    // RENDER core (`x86_render_service`), so this total is time the panel is not composing. The window
+    // create and first present that follow are on the app's own core and carry their own `wc-a`/`wc-h`
+    // witnesses; this line owns the storage half.
+    serial_println!(
+        "[launchpace] verb={} bytes={} mount_us={} dirwalk_us={} read_us={} total_us={}",
+        verb,
+        bytes.len(),
+        cyc_to_us(t_mount.saturating_sub(t_entry)),
+        cyc_to_us(t_resolve.saturating_sub(t_mount)),
+        cyc_to_us(t_read.saturating_sub(t_resolve)),
+        cyc_to_us(t_read.saturating_sub(t_entry)),
+    );
+    Some(bytes)
+}
+
+/// LAUNCHPACE: rdtsc cycle delta → microseconds, at the rate `apic::calibrate` measured against the
+/// ACPI PM timer. Mirrors `video::wcg::cycles_to_us` (private there); the fallback rate matches, so a
+/// witness printed before calibration is honest-but-approximate rather than a divide-by-zero. x86 only,
+/// because the only caller ([`read_el0_image`]'s x86 twin) is.
+#[cfg(target_arch = "x86_64")]
+fn cyc_to_us(dt: u64) -> u64 {
+    let hz = crate::arch::apic::tsc_hz();
+    let hz = if hz == 0 { 1_250_000_000 } else { hz };
+    dt.saturating_mul(1_000_000) / hz
+}
+
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn run_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
@@ -3680,7 +4523,13 @@ fn run_program(console: &mut Console, path: &str) {
     // Hand the bytes to the kernel loader: map into a fresh user slot, run co-located, wait (bounded 5 s) for
     // the program to exit or fault. The image length + entry are reported for the witness.
     let n = bytes.len();
+    // The two `run_user_image`s take the SAME 5-second bound in different units, deliberately and
+    // documented on both sides: aarch64's twin takes a CNTPCT span (`timer::cntfrq()` = 1 s), x86's
+    // takes plain milliseconds ("the arch-neutral unit the shell now passes").
+    #[cfg(target_arch = "aarch64")]
     let deadline = 5 * crate::arch::aarch64::timer::cntfrq();
+    #[cfg(target_arch = "x86_64")]
+    let deadline: u64 = 5_000;
     match crate::arch::syscall::run_user_image("shell-run", &bytes, deadline) {
         Ok((outcome, entry)) => {
             use crate::arch::syscall::RunOutcome;
@@ -3701,6 +4550,9 @@ fn run_program(console: &mut Console, path: &str) {
                         path, n, entry
                     );
                 }
+                // CLOSE-CLEAN exists only on aarch64: the x86 `RunOutcome` (WINX-2) has three
+                // variants, with no window-close arm, so this one is arch-gated rather than faked.
+                #[cfg(target_arch = "aarch64")]
                 RunOutcome::Closed => {
                     // CLOSE-CLEAN: the operator closed the window; the program's exit is clean.
                     console.println(&alloc::format!("run: {}: closed (window close box)", path));
@@ -3727,7 +4579,7 @@ fn run_program(console: &mut Console, path: &str) {
 
 /// BGRUN-1: one shell-side background job. The PATH is copied (bounded) so `jobs` can name it — the
 /// kernel row carries only the fixed task name. The pid is the durable key; asid rides for `kill`.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 struct BgJob {
     pid: u64,
@@ -3737,15 +4589,37 @@ struct BgJob {
 }
 
 /// BGRUN-1: the shell's job table. Bounded like every table in this kernel. LENS CORRECTION
-/// (round 1): the binding resource is the Proc table (`MAX_PROCS`), not the 8 user address-space
+/// (round 1): the binding resource is the Proc table (`MAX_PROCS`), not the user address-space
 /// slots — so the real ceiling is `MAX_PROCS - 1` bg jobs alongside one foreground `run`, and this
-/// table's full arm is reachable only if MAX_PROCS grows past it. 8 slots kept (harmless headroom).
-/// PROCS-6 raised the cap to 6: 6 bg jobs with no foreground `run` (5 with one), still under this
-/// table's 8 and under the compositor's 8 windows, so the full arm remains unreachable — kept anyway,
-/// because it is what makes an untrackable job impossible rather than merely unlikely.
-/// Shell access is single-task, but the Mutex keeps the invariant explicit rather than relying on it.
-#[cfg(feature = "baremetal")]
-static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);
+/// table's full arm is reachable only if MAX_PROCS grows past it. Rows are kept strictly ABOVE the
+/// Proc cap on purpose (harmless headroom): it is what makes an untrackable job impossible rather
+/// than merely unlikely.
+///
+/// HEADROOM — 8 -> 12 rows, because x86's `MAX_PROCS` went 6 -> 10 and 8 rows would no longer have
+/// been strictly above it. That is the whole reason for the raise; the arm still cannot be reached.
+/// The table is arch-neutral and so is the raise: aarch64 keeps `MAX_PROCS = 6`, so there it simply
+/// adds four rows that can never be claimed. The per-arch ceilings are now:
+///   * **x86** — 9 bg jobs with no foreground `run` (8 with one), see the eviction note below.
+///   * **aarch64** — 6 bg jobs with no foreground `run` (5 with one), unchanged by this arc.
+///
+/// ⚠ KERNEL-APPS EVICTION — **on a `wc` x86 boot the ceiling is one lower than a bare reading of
+/// `MAX_PROCS` says.** `video::wcx::desktop_app_service` launches the desktop app (`STAT.ELF`) at
+/// boot and it never exits, so it permanently holds one Proc row, one user slot, one `wm` window and
+/// one row of THIS table. With `MAX_PROCS = 10` the operator's budget on such a boot is therefore
+/// **9** bg jobs with no foreground `run` (8 with one) — which is exactly the fleet HEADROOM was
+/// sized for: `storm 8` plus the desktop app, with a row still free for a foreground `run`.
+///
+/// ⚠ **Shell access is NO LONGER single-task.** It used to be, and this note used to say so while
+/// keeping the Mutex "explicit rather than relying on it". The eviction added a second caller on a
+/// DIFFERENT core: `adopt_bg_job` runs from the device-service task (`x86_usb_pump`, service core)
+/// while the shell runs in `x86_render_service` (render core). The Mutex is now load-bearing — do
+/// not drop it. No live hazard today (the service-core call happens once, at boot, before an
+/// operator can type `jobs`), and cross-core contention on a raw `spin::Mutex` is bounded spin that
+/// progresses — the SCHED-X86 deadlock rule is about two preemptible takers on ONE core. But note
+/// that `bg_jobs` holds this lock across `console.println`, which on a `wc` build routes through the
+/// compositor: a future second cross-core caller could spin for the length of a repaint.
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+static BG_JOBS: spin::Mutex<[Option<BgJob>; 12]> = spin::Mutex::new([None; 12]);
 
 /// STORM-FATW: the bounded USB-traffic writer `storm [n] fat` arms — the driver-claim half of the
 /// WEDGE-8/F3 metal provocation (the vug fleet is the preemption half). Two legs, decided once at
@@ -3894,7 +4768,7 @@ fn storm_fat_writer(_: usize) {
 
 /// BGRUN-1: `bg <path>` — read the image, spawn it detached, record the job. The shell prompt is
 /// back the moment this returns; the program (and its window, if it creates one) keeps running.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_program(console: &mut Console, path: &str) -> bool {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
         return false;
@@ -3935,7 +4809,7 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
 
 /// BGRUN-1: `jobs` — list background jobs and reap the exited ones. This is the SOLE reaper for
 /// bg rows: an exited job's kernel row stays claimed (PEXITED) until it is polled here.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_jobs(console: &mut Console) {
     use crate::arch::syscall::BgPoll;
     let mut jobs = BG_JOBS.lock();
@@ -3967,6 +4841,9 @@ fn bg_jobs(console: &mut Console) {
                 serial_println!(":: BGRUN: jobs — pid={} exit=FAULT reaped ::", job.pid);
                 *slot = None;
             }
+            // CLOSE-CLEAN is an aarch64-only `BgPoll` variant (the x86 WINX-2 enum has four:
+            // Running / Exited / Faulted / Gone), so this arm is arch-gated rather than invented.
+            #[cfg(target_arch = "aarch64")]
             BgPoll::Closed => {
                 // CLOSE-CLEAN: the operator clicked the window's close box — a clean, asked-for
                 // exit. Reads like a normal completed job, never like a fault.
@@ -3987,29 +4864,218 @@ fn bg_jobs(console: &mut Console) {
     if !any {
         console.println("jobs: none");
     }
+    // The per-job lines above are panel-only except when they REAP (those already carry a witness).
+    // This one line makes the verb itself visible in a headless capture — otherwise a `jobs` with
+    // nothing to reap is indistinguishable on the wire from a keystroke that never arrived. Counted
+    // off the guard already held: `BG_JOBS` is a plain spinlock and re-locking here would deadlock.
+    let remaining = jobs.iter().flatten().count();
+    drop(jobs);
+    serial_println!(":: BGRUN: jobs — {} tracked job(s) after the sweep ::", remaining);
 }
 
-/// BGRUN-1: `kill <pid>` — kill a recorded background job (SKILL-1 underneath). The row is reaped by
-/// the next `jobs`; the table entry stays until then so the operator sees the outcome there.
-#[cfg(feature = "baremetal")]
+/// BGRUN-1: `kill <pid>` — kill a recorded background job (SKILL-1 underneath).
+///
+/// PROCREAP — this doc used to say "the row is reaped by the next `jobs`; the table entry stays until
+/// then", which contradicted the code three lines below it (which drops the entry) and, on x86, was the
+/// live half of the Boot AJ lockout: the x86 `bg_kill` only MARKED the row `PEXITED`, `jobs` is the
+/// sole reaper and reaps only what is still in `BG_JOBS`, so dropping the entry here orphaned the row
+/// for the rest of the boot. Three kills, three rows gone, no recovery short of reboot.
+///
+/// The premise is now TRUE on both arches: a CONFIRMED kill reaps the row IN PLACE inside `bg_kill`
+/// (aarch64 has since round 1; x86 as of this arc), so the entry dropped here names a row that is
+/// already free, and the operator's record of the outcome is THIS line rather than an uninformative
+/// `gone` from a later `jobs`. The witness carries the table accounting so a boot PROVES the transition
+/// instead of implying it.
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_kill_cmd(console: &mut Console, pid: u64) {
     let jobs = BG_JOBS.lock();
     let Some(job) = jobs.iter().flatten().find(|j| j.pid == pid).copied() else {
         console.println(&alloc::format!("kill: no background job with pid {} (see `jobs`)", pid));
+        // Mirrored so a headless capture can tell a REFUSED kill from a keystroke that never landed.
+        serial_println!(":: BGRUN: kill pid={} — no such background job ::", pid);
         return;
     };
     drop(jobs); // bg_kill yields while confirming; never hold the table lock across that.
     let verdict = crate::arch::syscall::bg_kill(job.pid, job.asid);
     console.println(&alloc::format!("kill: pid {}: {}", pid, verdict));
-    // Lens should-fix (c): a CONFIRMED kill reaps the row in place, so a later `jobs` could only say
-    // "gone" — drop the table entry here instead, so the operator's record of the outcome is THIS
-    // line ("killed — row reaped") rather than an uninformative gone.
     if verdict.starts_with("killed") {
+        // The kernel reaped the row; the shell's entry is now the only stale handle. Drop it.
         let mut jobs = BG_JOBS.lock();
         for slot in jobs.iter_mut() {
             if matches!(slot, Some(j) if j.pid == pid) {
                 *slot = None;
             }
+        }
+        drop(jobs);
+        // PROCREAP: the accounting is the point. A kill that claims to have freed a row and did not is
+        // exactly the defect this arc closes, and the old line ("kill pid=N — killed") could not tell
+        // the two apart on the wire. Read the table AFTER the reap: the free count must rise by one per
+        // kill, and a boot that launches and kills repeatedly must never see it drift down.
+        let (free, _running, _exited, _orphaned) = crate::arch::syscall::proc_table_headroom();
+        serial_println!(
+            ":: BGRUN: kill pid={} — {} ({}/{} free) ::",
+            pid, verdict, free, crate::arch::syscall::proc_table_rows()
+        );
+    } else {
+        serial_println!(":: BGRUN: kill pid={} — {} ::", pid, verdict);
+    }
+}
+
+/// BARE-EXEC (GR20): record a job in the shell's table under an arbitrary display name.
+///
+/// `bg_program` records the path it was handed; `bare_exec` records the CANONICAL on-disk path it
+/// resolved (so `jobs` shows `/VUG.ELF` after the operator typed `vug.elf`), which is why the table
+/// insert lives here rather than inline in one of them.
+///
+/// Returns false if the table is full; the caller must then say so rather than imply a live handle —
+/// an untracked job is one `jobs` could never reap and `kill` could never name.
+///
+/// Note what this does NOT change: the kernel `Proc` row and its `KillSwitch` are registered by
+/// `spawn_user_image_bg` itself, so `bg_kill`/`bg_poll` can always reach the pid. Only the shell's
+/// NAME for it comes from here.
+///
+/// `pub(crate)` since the kernel-apps eviction, for ONE second caller:
+/// [`crate::video::wcx::desktop_app_service`], which launches the desktop app at boot with nobody at
+/// the prompt to type `bg`. Registering it here is what keeps `jobs` and `kill` TRUTHFUL —
+/// `bg_kill_cmd` resolves a pid through this table and REFUSES one it cannot find, so an
+/// unregistered launch would be a running ring-3 program the operator can neither list nor stop.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
+    let mut jobs = BG_JOBS.lock();
+    let Some(free) = jobs.iter_mut().find(|s| s.is_none()) else {
+        return false;
+    };
+    let mut buf = [0u8; 32];
+    let nlen = name.len().min(32);
+    buf[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
+    *free = Some(BgJob { pid, asid: slot, name: buf, nlen: nlen as u8 });
+    true
+}
+
+/// BARE-EXEC (GR20, x86): run a program by TYPING ITS NAME — `vug.elf` at the prompt starts
+/// `VUG.ELF` off the FAT volume, in a window, with the prompt back immediately.
+///
+/// MIDDEN-M1: called from `dispatch_command`'s `Plan::Exec` arm, which `midden_core` produces only
+/// after `is_verb` said no. **Precedence is therefore absolute and needs no tie-break rule — a known
+/// verb always wins.** A file called `LS` on the volume is unreachable this way and that is correct;
+/// `run ./LS` names it explicitly.
+///
+/// # Resolution
+///
+/// `midden_core::resolve_exec` decides which SPELLING to load and hands it here as `name`; `typed`
+/// is what the user actually wrote, and every message quotes the one the reader recognises. The
+/// core tries the exact token first, then — and only for a bare leaf carrying no extension — the
+/// `.elf` suffix, so **`vug` finds `VUG.ELF`** with nobody typing the extension and without `ls`
+/// hiding it.
+///
+/// **On x86, `name` is NOT the on-disk spelling** and no caller may assume it is. `FatVolume`'s
+/// `is_file` walks FAT with `eq_ignore_ascii_case`, so the core's `vug.elf` probe matches the
+/// on-disk `VUG.ELF` and the core returns the string `"vug.elf"` — the resolver's upper-cased arm
+/// never fires here (it is there for the fixture's exact-match `NameList` and for a future
+/// case-sensitive `Volume`). The genuine on-disk 8.3 spelling appears one step below, as `canon`,
+/// which the re-resolve reads out of the directory entry; that is the name the serial refusal
+/// lines quote. Beneath that, this function performs the SAME resolution `cat` uses, verbatim:
+/// `fs::fat::mount_program_source()` (the handle the block layer names as the one executables live
+/// on — the USB mass-storage DATA volume, or the internal SD card when that is what booted us) +
+/// `normalize_path` against
+/// the JD4 cwd + `resolve_path`. That walk matches components with `eq_ignore_ascii_case`, so
+/// `vug.elf` already found `VUG.ELF` before the elision existed; the elision is what makes the
+/// *bare* `vug` work. `cd DOCS` then a bare name works for the same reason, since the cwd is
+/// applied first.
+///
+/// # Why background, and how the operator stops it
+///
+/// Launched through `spawn_user_image_bg` — the same call `winx8_launcher` makes — so a windowed
+/// program's window STAYS OPEN and the prompt returns. Unlike that witness, nothing kills it: a
+/// user-typed launch runs until it exits or the operator stops it with `kill <pid>`. The pid is
+/// printed on the launch line and the job is recorded in the shell's table, so `jobs` lists it and
+/// `kill` can reach it.
+///
+/// # Silence vs. refusal — where the boundary is
+///
+/// The core established that `name` is a real file before building `Plan::Exec`, so from here on
+/// this function OWNS the reply and every exit says why: not-an-ELF, wrong-arch, too-big,
+/// unreadable and spawn-rejected are all named. The one remaining `false` path is a volume that
+/// changed under us between the core's probe and this read (a card pulled mid-command) — an honest
+/// race, reported as such rather than as a typo. Nothing may end in silence.
+///
+/// The loader is untouched: the bytes go to `spawn_user_image_bg` exactly as `bg` sends them, so the
+/// per-segment W^X mapping, the ring-3 window bound and the fault-kill net are the same ones CFU-2's
+/// write gate is built on. This adds a way to CALL the loader, never a way to relax it.
+#[cfg(target_arch = "x86_64")]
+fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
+    // --- re-resolve the core's answer over the live volume ---------------------------------------
+    // The core probed through this same mount a moment ago; re-resolving costs one walk and closes
+    // the window where the card changed underneath. A miss here is a RACE, not a typo, and says so.
+    // LAUNCH-AR: the PROGRAM SOURCE, matching `FatVolume::is_file` above and `read_el0_image`
+    // below. All three legs of a bare-name launch — probe, re-resolve, read — now bind the same
+    // handle; the Boot AR failure was exactly what happens when they do not.
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+        console.println(&alloc::format!("{}: the volume went away before it could be started", typed));
+        serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: volume vanished after resolution ::", name, typed);
+        return false;
+    };
+    let canon = match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
+        Ok(Resolved::Entry(de, canon)) if !de.is_dir => canon,
+        _ => {
+            console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
+            serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
+            return false;
+        }
+    };
+    // --- loud from here: the name is a real file, so we owe an outcome --------------------------
+    // Every refusal below is mirrored to serial as well as the panel. The panel line is what the
+    // operator reads; the serial line is what a headless capture reads, and without it a bench log
+    // could not tell "refused, and here is why" from "the keystroke never arrived".
+    let Some(bytes) = read_el0_image(console, typed, name) else {
+        // read_el0_image named the reason on the panel (size / arch / read error).
+        serial_println!(":: BAREXEC: {} — REFUSED at the image read/pre-check (see the panel line) ::", canon);
+        return true;
+    };
+    if !(bytes.len() >= 4 && bytes[0..4] == [0x7F, b'E', b'L', b'F']) {
+        // The loader would otherwise take this down its FLAT-blob path and try to execute a text
+        // file as code. Contained (ring 3, fault-kill net) but useless and confusing, so refuse
+        // here: a bare name launches ELF programs, nothing else. `run <path>` still reaches the flat
+        // path for anyone who means it.
+        console.println(&alloc::format!(
+            "{}: not an executable (no ELF64 magic) — a bare name runs ELF programs only", typed
+        ));
+        serial_println!(
+            ":: BAREXEC: {} (typed '{}') — REFUSED: not an ELF64 image (no magic); {} bytes read ::",
+            canon, typed, bytes.len()
+        );
+        return true;
+    }
+    // The ELF64 / little-endian / EM_X86_64 pre-checks already ran inside `read_el0_image`, which
+    // named any of them; the kernel loader re-validates from scratch regardless.
+    let n = bytes.len();
+    match crate::arch::syscall::spawn_user_image_bg(&bytes) {
+        Ok((pid, slot, entry)) => {
+            if !adopt_bg_job(pid, slot, &canon) {
+                // Spawned but untrackable — kill it rather than leave a job `jobs` could never reap
+                // and `kill` could never name. Same rule `bg` follows, same reason.
+                let why = crate::arch::syscall::bg_kill(pid, slot);
+                console.println(&alloc::format!(
+                    "{}: job table full — spawned pid {} was killed ({})", typed, pid, why
+                ));
+                serial_println!(
+                    ":: BAREXEC: {} — job table full, pid={} killed ({}) ::", canon, pid, why
+                );
+                return true;
+            }
+            console.println(&alloc::format!(
+                "{}: started — pid {} (`jobs` lists it, `kill {}` stops it)", canon, pid, pid
+            ));
+            serial_println!(
+                ":: BAREXEC: {} (typed '{}') — loaded {} bytes, entry {:#x}, pid={} slot={} DETACHED, left RUNNING ::",
+                canon, typed, n, entry, pid, slot
+            );
+            true
+        }
+        Err(why) => {
+            console.println(&alloc::format!("{}: {}", typed, why));
+            serial_println!(":: BAREXEC: {} — rejected ({}) ::", canon, why);
+            true
         }
     }
 }
@@ -4093,7 +5159,8 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
         Some(&o) => o,
         None => {
             console.println("usage: vfs <write|append|rm|mkdir> <path> [text ...]");
-            console.println("  namespace: / = native UnaFS, /fat = FAT boot partition, /usb = USB stick (read-only)");
+            // FATVERB: not "(read-only)" — USB-WRITE F3 made the stick writable; see `diskinfo`.
+            console.println("  namespace: / = native UnaFS, /fat = FAT boot partition, /usb = USB stick");
             return;
         }
     };

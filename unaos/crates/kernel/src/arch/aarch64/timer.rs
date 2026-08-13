@@ -29,7 +29,13 @@ static LIVE: AtomicBool = AtomicBool::new(false);
 
 /// Target tick rate. 250 Hz gives a 4 ms heartbeat — frequent enough to be a responsive wake
 /// source, coarse enough that the per-tick handler cost is negligible.
-const TICK_HZ: u64 = 250;
+///
+/// PUBLIC because `SYS_GETINFO` hands this tick count to ring 3 raw, so the rate is ABI: the
+/// `const _: () = assert!(una_abi::GETINFO_TICK_HZ == super::timer::TICK_HZ)` beside `sys_getinfo`
+/// in `syscall.rs` is what stops a retune here from silently re-introducing the 4x unit bug in
+/// `user-vug`/`user-pulse` (una-abi's divergence ledger, D1). Retuning it is fine — retuning it
+/// WITHOUT moving `GETINFO_TICK_HZ` is now a compile error, which is the whole point.
+pub const TICK_HZ: u64 = 250;
 
 /// Monotonic timer ticks since the heartbeat started. Read via `arch::ticks()`.
 static TICKS: AtomicU64 = AtomicU64::new(0);

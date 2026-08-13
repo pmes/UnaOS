@@ -36,6 +36,22 @@ pub struct TabulaDocument {
     pub language: String,
     /// True when `buffer` has unsaved edits relative to disk.
     pub dirty: bool,
+    /// True when this document must never be written back — set for console
+    /// logs. Two reasons stack, and the deeper one is not the app's:
+    ///
+    /// 1. **Ownership (the real denial).** On the shard a kernel flight-recorder
+    ///    log is owned by *root*; the UnaFS ownership ACL (`acl-<lba>-<off>`
+    ///    rows carrying `owner`/`grants:*`) refuses any write from a user-owned
+    ///    vessel — see `docs/SECURITY.md`. A user app *cannot* write it, flag or
+    ///    no flag. This bool mirrors that filesystem fact so the host viewer
+    ///    behaves the same way the metal filesystem would enforce.
+    /// 2. **Rendering fidelity.** The buffer is a *rendering* of the file
+    ///    (padding trimmed, control bytes made visible, possibly only the tail),
+    ///    so even for a log an operator *did* own, writing this text back would
+    ///    destroy the record it came from.
+    ///
+    /// `save()` refuses and `set_buffer()` is inert.
+    pub read_only: bool,
 }
 
 impl Default for TabulaDocument {
@@ -52,6 +68,7 @@ impl TabulaDocument {
             buffer: String::new(),
             language: "txt".to_string(),
             dirty: false,
+            read_only: false,
         }
     }
 
@@ -88,18 +105,58 @@ impl TabulaDocument {
             buffer,
             language,
             dirty: false,
+            read_only: false,
         })
     }
 
+    /// Load a console/serial log for viewing: read-only, control-byte-safe,
+    /// size-capped. See [`crate::logview`] for exactly what is done to the
+    /// bytes and why.
+    pub fn load_log(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+        let rendered = crate::logview::load_log(path)?;
+        Ok(Self {
+            path: Some(path.to_path_buf()),
+            buffer: rendered.text,
+            language: "txt".to_string(),
+            dirty: false,
+            read_only: true,
+        })
+    }
+
+    /// Open any path the right way: console logs through [`Self::load_log`],
+    /// everything else through [`Self::load`]. This is the single entry point
+    /// a vessel should call when the operator activates a file.
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+        if crate::logview::is_log_path(path) {
+            Self::load_log(path)
+        } else {
+            Self::load(path)
+        }
+    }
+
     /// Replace the buffer contents, marking the document dirty.
+    ///
+    /// Inert on a read-only document: the view may still be editable in the
+    /// host toolkit, but a log's held state stays exactly what was read.
     pub fn set_buffer(&mut self, content: impl Into<String>) {
+        if self.read_only {
+            return;
+        }
         self.buffer = content.into();
         self.dirty = true;
     }
 
     /// Write the buffer to the bound path, clearing the dirty flag.
-    /// Errors if the document has no path.
+    /// Errors if the document has no path, or is read-only.
     pub fn save(&mut self) -> io::Result<()> {
+        if self.read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "document is read-only (console log view)",
+            ));
+        }
         let path = self.path.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "TabulaDocument has no path to save to")
         })?;

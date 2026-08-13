@@ -28,6 +28,7 @@ matrix = { path = "../../handlers/matrix" }
 tabula = { path = "../../handlers/tabula" }   # de-GTK'd (528c213); default features are GTK-free
 midden = { path = "../../handlers/midden" }   # console core (default features GTK-free)
 aule = { path = "../../handlers/aule" }       # forge streamer (String lines over mpsc)
+comscan = { path = "../../handlers/comscan" } # Console log viewer (bus-fed scrollback)
 # vaire = { path = "../../handlers/vaire" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

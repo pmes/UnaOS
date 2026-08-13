@@ -70,3 +70,87 @@ FORBID S6-witness FAIL
 FORBID S7-openany FAIL
 FORBID S8-write FAIL
 FORBID S9-grow FAIL
+
+# --- DMG-REFUSE: the SYS_WIN_PRESENT_ROWS(33) refusal arms (-EBADF / -EACCES / -EINVAL), 2026-08-04.
+# --- REQUIRE, not OPTIONAL: this witness is headless-complete — two inline ring-3 blobs, no block
+# --- device and no panel — so it runs on EVERY x86 QEMU boot, and its ABSENCE is a gate failure. That
+# --- is deliberate: a FORBID alone cannot catch silence, and a witness that can vanish quietly is the
+# --- exact defect that made the storage witnesses above untrustworthy. Uses the `— witness OK ::`
+# --- idiom, so it does NOT add to the `COUNT 22 -> PASS` above.
+# --- The third line is the loud-absence rule: every skip path in the launcher prints `NOT RUN`, and a
+# --- skip must fail the gate rather than pass it silently.
+# --- VERIFICATION PROVENANCE, stated because it is NOT complete: these three lines were proven against
+# --- a real capture with `mbench --replay` (green log -> exit 0; a deliberately-reddened log -> exit 1,
+# --- caught by the FORBID), but on the `./arroyo test` path, NOT `test-fat` — this host has no `mtools`,
+# --- so `make-fat-img.sh` aborts at `mcopy` before QEMU ever starts. The REQUIRE is sound by
+# --- construction (same kernel, same `witness` build; the launcher chains off `winx7_launcher` inside
+# --- `u8x_launcher`, which does NOT gate on a block device, so the FAT path runs a SUPERSET of the
+# --- chain) — but it has not been executed on this exact gate. First runner of `test-fat sf`: if this
+# --- line is the only red, suspect this note before suspecting the kernel.
+REQUIRE DMG-REFUSE:.*19/19 probes.*witness OK
+FORBID DMG-REFUSE FAIL
+FORBID DMG-REFUSE:.*NOT RUN
+
+# --- GR18 WXN-x86 / WXAUDIT: THE KNOB-INDEPENDENT HALF OF THE GR18 WITNESS ROUND ---------------
+# --- x86-witness.spec IS THE MASTER COPY of the eight directives below, and of the reasoning
+# --- behind each one (why the two WXN terminals earn their lines when the REQUIRE already
+# --- excludes them; why the WXAUDIT REQUIRE names its fields in ORIGINAL ORDER and stops at
+# --- `l3=`; why WXAUDIT-NXE gets no FORBID; why `LEAF NX-ONLY` is deliberately NOT widened into
+# --- the FBWC pattern yet). THE PATTERNS HERE ARE BYTE-IDENTICAL TO THAT FILE'S AND EDITS MUST BE
+# --- PAIRED — a regex that drifts between the two reads as "the metal gate and the QEMU gate
+# --- disagree about the map", which is the one thing this block exists to make impossible.
+# --- WHY THEY BELONG IN THIS FILE, which is the whole justification for the duplication. Every
+# --- other GR18 wire is knob-gated — SMC needs `UNAOS_SMC`, `[wc-g] paygo` needs `UNAOS_WCG_PAYGO`,
+# --- M8/igpu-blt need their own knobs — and x86-witness.spec's SCOPE says outright that it asserts
+# --- a paygo-armed, logts-prefixed, witness-armed boot AND NOTHING ELSE. These four wires are the
+# --- exception: `wxn_pdpt_sweep` (memory.rs) and `wx_audit_report` (memory.rs) are called
+# --- UNCONDITIONALLY from `arch::init` (arch/x86_64/mod.rs:46 and :50 — no `#[cfg]` on either the
+# --- functions or the call sites), and `wxn_nxe_report` (smp.rs:108) is called from `start_aps` on
+# --- EVERY exit path including the two uniprocessor ones. So a DEFAULT x86 build prints all four,
+# --- and until now the only spec in the tree that read any of them was one that a default build
+# --- cannot satisfy. That is a coverage hole shaped exactly like §10h's: the instrument is on every
+# --- boot and nothing goes red when it stops printing.
+# --- MINIMUM BUILD GENERATION — `32724cb4` (2026-08-06). These lines do not exist on an image built
+# --- before it (`a0a2d163` introduced the sweep and `WXAUDIT-NXE`; `32724cb4` added the `-> VACUOUS`
+# --- verdict, the WXAUDIT `l1/l2/l3` histogram and `WXN-FBWC`), so a replay of an older capture reds
+# --- them because the kernel could not print them, not because the boot was sick. This is a SECOND
+# --- scope axis on this file, orthogonal to the irqstorage knob split above.
+# --- VERIFICATION PROVENANCE, and it is stronger than the DMG-REFUSE note above rather than weaker.
+# --- All eight were replayed green against TWO metal rMBP captures (bootW / bootX, 2026-08-06) and
+# --- against a real x86 QEMU capture from THIS host — a `./arroyo test` run, kept as
+# --- `~/unaos-bench/scratch/qemu-x86-gr18.log` because `unaos/target/serial.log` is overwritten by
+# --- the next run (`:: WXN-x86: … wp=1 -> SWEPT ::`, `l1=0 l2=524281 l3=3584`, `cores=6 nxe=6 … -> PASS ::`,
+# --- `fb=0x80000000 lvl=2 … -> LEAF BIT-IDENTICAL ::`). The `test-fat sf` variant is still unproven
+# --- HERE for the same `mtools` reason, but the construction argument is far tighter than
+# --- DMG-REFUSE's: these four lines are emitted from `arch::init`, BEFORE the framebuffer fixture
+# --- chain, before `u8x_launcher`, before any block device exists. The FAT image cannot reach them.
+# --- Note on the COUNT above: `WXAUDIT-NXE`'s and `WXAUDIT-0`'s verdicts both end `-> PASS`, so they
+# --- do add to the `COUNT 22 -> PASS` tally — harmless, because mbench COUNT is `>= n`, never `== n`.
+REQUIRE :: WXN-x86: ehdr=0x[0-9A-F]+ img=\[0x[0-9A-F]+,0x[0-9A-F]+\) .*pdpt_seen=[0-9]+ nx_set=[0-9]+ .*residue_leaves=[0-9]+ .*wp=[0-9]+ -> SWEPT ::
+FORBID :: WXN-x86: .*-> VACUOUS ::
+FORBID :: WXN-x86: .*-> REFUSED
+REQUIRE :: WXAUDIT x86: leaves=[0-9]+ user=[0-9]+ user_WX=[0-9]+ kern_WX=[0-9]+ \([0-9]+ MiB\) tables=[0-9]+ nxe=[0-9]+ walk=[0-9]+kcyc l1=[0-9]+ l2=[0-9]+ l3=[0-9]+
+FORBID :: WXAUDIT x86: .* TRUNCATED ::
+REQUIRE :: WXAUDIT-NXE: cores=[0-9]+ nxe=[0-9]+ nxe_mask=0x[0-9A-F]+ wp=[0-9]+ wp_mask=0x[0-9A-F]+ -> PASS ::
+REQUIRE :: WXN-FBWC: fb=0x[0-9A-F]+ lvl=[0-9]+ e=0x[0-9A-F]{16} pat=[0-9]+ pcd=[0-9]+ pwt=[0-9]+ w=[0-9]+ fx=[0-9]+ -> LEAF BIT-IDENTICAL ::
+FORBID :: WXN-FBWC: .*-> SKIPPED ::
+
+# --- FATVERB (GR24) — the shell's file verbs bind the PROGRAM SOURCE, and a write verb asks first --
+# --- These two legs run from the storage-ready service pass, NOT with the other shell fixtures at
+# --- main.rs step 5: an earlier cut of them fired before `pci::init` and the USB publish and passed
+# --- on `handles=global=absent sdhc=absent`, i.e. on all-false inputs, which is dead rather than
+# --- quiet. Each leg DRIVES A REAL VERB (`ls_path`; `fs_rm` against an unresolvable name, so the
+# --- gate is exercised and nothing is mutated) and asserts the binding that verb STAMPED, requiring
+# --- the stamp counter to advance — so a verb that stops routing through the shared mount helpers
+# --- fails the leg instead of inheriting an earlier answer. Falsified both ways on this host
+# --- (2026-08-09): armed, both PASS; with `ls_path`/`fs_rm` bypassing the helpers,
+# --- `readvol -> FAIL (… read_ran=false read=never …)` and `writegate -> FAIL (gate_ran=false …)`.
+# --- SCOPE: `witness` only. They need no FAT image and no `sdhcblk` — the summary line's census
+# --- reads `sdhc=unbuilt` on this spec's build and the legs still carry content, because the
+# --- handle-agreement and counter halves are independent of which handles exist. The wait is
+# --- BOUNDED (30 s, wcx's threshold): a boot that never gets a block device still emits all three
+# --- lines with an empty census, so these REQUIREs cannot go red for want of a card.
+# --- MINIMUM BUILD GENERATION — the FATVERB commit (2026-08-09); older images cannot print them.
+REQUIRE :: TSTE: fatverb\.readvol -> PASS ::
+REQUIRE :: TSTE: fatverb\.writegate -> PASS ::
+REQUIRE :: \[fatverb\] storage witness: exec=[a-z-]+ read=[a-z-]+ gate=[a-z-]+ waited=[0-9]+ms handles=global=(present|absent) sdhc=(present|absent|unbuilt) ::

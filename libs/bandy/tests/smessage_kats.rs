@@ -29,8 +29,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bandy::ontology::WeightedSkeleton;
-use bandy::signals::{MatrixEvent, PrefValue, PrincipiaCommand, SMessage};
-use bandy::state::DispatchRecord;
+use bandy::signals::{LogEvent, MatrixEvent, PrefValue, PrincipiaCommand, SMessage};
+use bandy::state::{
+    BrowseEntry, BrowseKind, BrowseListing, DispatchRecord, FsOutcome, FsVerb, LogLine, LogSource,
+};
 use bandy::Origin;
 
 /// One golden KAT per serializable variant:
@@ -515,6 +517,60 @@ kat!(
     ])),
     r#"{"Matrix":{"TopologyMutated":[["a","crate",0],["b","fn",2]]}}"#
 );
+kat!(
+    kat_matrix_browse_to,
+    SMessage::Matrix(MatrixEvent::BrowseTo {
+        principal: Origin::LocalUser("peter".to_string()),
+        path: "handlers/matrix".to_string(),
+    }),
+    r#"{"Matrix":{"BrowseTo":{"principal":{"LocalUser":"peter"},"path":"handlers/matrix"}}}"#
+);
+kat!(
+    kat_matrix_dir_listed,
+    SMessage::Matrix(MatrixEvent::DirListed(BrowseListing {
+        path: "src".to_string(),
+        parent: Some(String::new()),
+        breadcrumbs: vec![(String::new(), String::new()), ("src".to_string(), "src".to_string())],
+        entries: vec![
+            BrowseEntry {
+                path: "src/sub".to_string(),
+                name: "sub".to_string(),
+                kind: BrowseKind::Dir,
+                size: 0,
+                is_symlink: false,
+            },
+            BrowseEntry {
+                path: "src/main.rs".to_string(),
+                name: "main.rs".to_string(),
+                kind: BrowseKind::File,
+                size: 42,
+                is_symlink: false,
+            },
+        ],
+    })),
+    r#"{"Matrix":{"DirListed":{"path":"src","parent":"","breadcrumbs":[["",""],["src","src"]],"entries":[{"path":"src/sub","name":"sub","kind":"Dir","size":0,"is_symlink":false},{"path":"src/main.rs","name":"main.rs","kind":"File","size":42,"is_symlink":false}]}}}"#
+);
+kat!(
+    kat_matrix_file_op,
+    SMessage::Matrix(MatrixEvent::FileOp {
+        principal: Origin::LocalUser("peter".to_string()),
+        verb: FsVerb::Rename,
+        path: "notes.md".to_string(),
+        arg: Some("renamed.md".to_string()),
+        confirmed: false,
+    }),
+    r#"{"Matrix":{"FileOp":{"principal":{"LocalUser":"peter"},"verb":"Rename","path":"notes.md","arg":"renamed.md","confirmed":false}}}"#
+);
+kat!(
+    kat_matrix_fs_op_result,
+    SMessage::Matrix(MatrixEvent::FsOpResult {
+        principal: Origin::LocalUser("peter".to_string()),
+        verb: FsVerb::Delete,
+        path: "notes.md".to_string(),
+        outcome: FsOutcome::Denied { reason: "read-only volume".to_string() },
+    }),
+    r#"{"Matrix":{"FsOpResult":{"principal":{"LocalUser":"peter"},"verb":"Delete","path":"notes.md","outcome":{"Denied":{"reason":"read-only volume"}}}}}"#
+);
 
 // --- UI EVENTS ---
 
@@ -593,6 +649,42 @@ kat!(
 );
 kat!(kat_ui_ready, SMessage::UiReady, r#""UiReady""#);
 
+// --- LOGS (the Console log-viewer sub-enum) ----------------------------------
+kat!(
+    kat_logs_filter,
+    SMessage::Logs(LogEvent::LogFilter("gpu".to_string())),
+    r#"{"Logs":{"LogFilter":"gpu"}}"#
+);
+kat!(
+    kat_logs_source_all,
+    SMessage::Logs(LogEvent::LogSource(LogSource::All)),
+    r#"{"Logs":{"LogSource":"All"}}"#
+);
+kat!(
+    kat_logs_source_subsystem,
+    SMessage::Logs(LogEvent::LogSource(LogSource::Subsystem("kernel".to_string()))),
+    r#"{"Logs":{"LogSource":{"Subsystem":"kernel"}}}"#
+);
+kat!(
+    kat_logs_pause,
+    SMessage::Logs(LogEvent::LogPause(true)),
+    r#"{"Logs":{"LogPause":true}}"#
+);
+kat!(
+    kat_logs_tail,
+    SMessage::Logs(LogEvent::LogTail {
+        lines: vec![LogLine {
+            seq: 1,
+            level: "info".to_string(),
+            source: "net".to_string(),
+            content: "link up".to_string(),
+        }],
+        dropped: 2,
+        paused: false,
+    }),
+    r#"{"Logs":{"LogTail":{"lines":[{"seq":1,"level":"info","source":"net","content":"link up"}],"dropped":2,"paused":false}}}"#
+);
+
 // --- COMPLETENESS GUARD ------------------------------------------------------
 //
 // Exhaustive matches over the message vocabulary, with NO wildcard arm.
@@ -652,6 +744,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::TriggerUpload(_) => "TriggerUpload",
         SMessage::Principia(_) => "Principia",
         SMessage::Matrix(_) => "Matrix",
+        SMessage::Logs(_) => "Logs",
         SMessage::Input { .. } => "Input",
         SMessage::TemplateAction(_) => "TemplateAction",
         SMessage::NavSelect(_) => "NavSelect",
@@ -705,6 +798,19 @@ fn matrix_variant_name(e: &MatrixEvent) -> &'static str {
         MatrixEvent::SectorFocused { .. } => "SectorFocused",
         MatrixEvent::NodeSelected(_) => "NodeSelected",
         MatrixEvent::TopologyMutated(_) => "TopologyMutated",
+        MatrixEvent::BrowseTo { .. } => "BrowseTo",
+        MatrixEvent::DirListed(_) => "DirListed",
+        MatrixEvent::FileOp { .. } => "FileOp",
+        MatrixEvent::FsOpResult { .. } => "FsOpResult",
+    }
+}
+
+fn logevent_variant_name(e: &LogEvent) -> &'static str {
+    match e {
+        LogEvent::LogFilter(_) => "LogFilter",
+        LogEvent::LogSource(_) => "LogSource",
+        LogEvent::LogPause(_) => "LogPause",
+        LogEvent::LogTail { .. } => "LogTail",
     }
 }
 
@@ -725,6 +831,10 @@ fn completeness_guard_matches_are_exhaustive() {
     assert_eq!(
         matrix_variant_name(&MatrixEvent::FocusSector("euclase".to_string())),
         "FocusSector"
+    );
+    assert_eq!(
+        logevent_variant_name(&LogEvent::LogPause(true)),
+        "LogPause"
     );
 }
 

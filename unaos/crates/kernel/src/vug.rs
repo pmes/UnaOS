@@ -400,6 +400,21 @@ fn drain_input(pal: &mut TargetPal) -> bool {
             // CLICK-1 (metal verdict): a trackpad/mouse click closes the full-screen demo through
             // the SAME exit path a keystroke takes — the on-metal click observable for the next
             // sitting (press the pad while vug runs; the demo exits to the console).
+            // DRAGREL — on x86 the PRESSED bit, not "any Button". The EHCI pointer paths now emit
+            // an event on the release edge too (a drag has to be able to end), and an unqualified
+            // match here would make the release of the very click that exited this demo count as a
+            // second exit for whatever ran next. The press is still the exit, unchanged.
+            //
+            // The split is ARCH-SHAPED because the release edge is: only the EHCI paths
+            // (`drivers/ehci/mod.rs`, reached exclusively through `arch/x86_64/pci.rs::ehci::init`)
+            // emit one. aarch64's pointer producer is xHCI, which still emits the DOWN edge only,
+            // so there is no release event on that arch for the guard to filter — and qualifying
+            // anyway would silently change aarch64 behaviour for a non-primary button report
+            // (0x02/0x04 exits the demo today) with no release-edge producer to justify it. So
+            // aarch64 keeps the original predicate, bit for bit.
+            #[cfg(target_arch = "x86_64")]
+            Event::Button(mask) if mask & 0x01 != 0 => return true,
+            #[cfg(not(target_arch = "x86_64"))]
             Event::Button(_) => return true,
             Event::Mouse { x, y } => crate::pal::cursor::move_rel(x, y, w, h),
             Event::MouseAbsolute { x, y } => crate::pal::cursor::set_abs(x, y, w, h),

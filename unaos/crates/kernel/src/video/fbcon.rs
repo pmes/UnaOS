@@ -86,10 +86,26 @@ const CELL_H: usize = 8;
 
 /// PANEL-CONSOLE glyph scale. The 2012 rMBP panel is 2880 px across ~286 mm (~0.1 mm/px), so an
 /// unscaled 8x8 cell is ~0.8 mm — metal (sitting #30) confirmed marks that small are simply not
-/// visible to the naked eye at bench distance. 4x gives a 32x32 px cell (~3.2 mm) with a 0.4 mm
-/// stroke — 90 columns x 56 rows (metal s34 verdict on 6x: "great, slightly large").
+/// visible to the naked eye at bench distance. 6x was tried and judged "great, slightly large"
+/// (metal s34); 4x — a 32x32 px cell, ~3.2 mm, 0.4 mm stroke — was then CONFIRMED legible on glass.
+///
+/// WHY IT IS NOW 2. Legibility stopped being the only constraint once the console became a WINDOW.
+/// The routed surface is 1312x736, so a 32x32 cell buys 41 columns by 23 rows = 943 characters —
+/// fewer than six of the compositor's own 110-200 character witness lines, i.e. the whole console is
+/// overwritten every ~6 printed lines. And a line that STRADDLES the row-ring wrap dirties
+/// `{row 22, row 0}`, over which `mark_rows`' min/max bounding box IS the whole surface: at 23 rows
+/// the console saturates its own damage band by construction, roughly every 23rd newline.
+///
+/// A 16x16 cell gives 82x46 = 3772 characters — 4x the capacity and half the wrap rate — and costs
+/// LESS to paint, not more: `draw_glyph` pokes `scale²` pixels per set font bit, so the same text is
+/// a quarter of the pixel work and each line's damage band is half as tall.
+///
+/// LEGIBILITY AT 2x IS UNPROVEN. 8x8 is known invisible and 32x32 is known good; 16x16 (~1.6 mm
+/// cell, ~0.2 mm stroke) has never been on this glass. That is a bench judgement, not a code one,
+/// and this constant is the single knob that reverses it — everything downstream (cell size, grid,
+/// window extent, damage rows, the panic re-derive) is computed from it, never assumed.
 #[cfg(target_arch = "x86_64")]
-const PANEL_SCALE: usize = 4;
+const PANEL_SCALE: usize = 2;
 
 const FG_DEFAULT: u32 = 0x00C0_C0C0; // light grey text
 const BG_DEFAULT: u32 = 0x0000_0000; // black background
@@ -519,6 +535,82 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
     crate::arch::memory::set_framebuffer_wc(fb_addr, fb_len as u64);
 }
 
+/// PANEL-QUIET (x86, PANEL-CONSOLE lane only) — the tags whose lines are written for `serial.log`
+/// and for nobody standing at the bench.
+///
+/// Two costs, and the second is the one that bites. The obvious one is capacity: the routed console
+/// holds 943 characters at `PANEL_SCALE = 4` and 3772 at 2, and one `[wc-h] rollup` line is several
+/// of its rows either way. The other is RE-ENTRANCY. These lines are emitted from inside the very
+/// composite that a console present asked for, so each one mirrors back into the console surface,
+/// gets merged into [`PEND`] by [`route_present_banded`], is then declined by the [`ROUTE_BUSY`]
+/// guard, and is carried by the NEXT present — widening a band that had just been made narrow. The
+/// compositor's own telemetry was inflating the damage it was reporting (see [`ROUTE_BUSY`]).
+///
+/// WHAT IS EXCLUDED, AND WHY EACH ONE. `[wc-g]` (per-present coherency probe), `[wc-h]` (per-present
+/// staging cost) and `[wc-d]` (per-window surface verify) all fire from within a present — they ARE
+/// the re-entrant family. `[wcn]` (window-census rollup) and `[schedx86]` (render-queue depth) are
+/// periodic telemetry with no on-glass reader. All five are serial-log instruments with spec
+/// REQUIREs behind them, and the wire keeps every one of them byte for byte: this policy governs the
+/// GLASS only, and the FTDI ring, `UNAOS.LOG` and the `tste` ring all tap upstream of here, in
+/// `arch::serial::_print`.
+///
+/// WHAT IS DELIBERATELY NOT EXCLUDED: `[wc-x]` — the console's own route / first-paint / decline
+/// announcements, which are exactly what a bench reader is looking FOR; `[fbcon]` and `[mirror]`,
+/// which announce mirror loss; boot milestones; every untagged line; and PANIC text.
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+const PANEL_MUTE_TAGS: [&[u8]; 5] = [b"[wc-g]", b"[wc-h]", b"[wc-d]", b"[wcn]", b"[schedx86]"];
+
+/// Bytes of a line's head the sniff needs in order to decide — the longest [`PANEL_MUTE_TAGS`] entry.
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+const TAG_SNIFF: usize = 10;
+
+/// PANEL-QUIET — capture just enough of a line's HEAD to test it against [`PANEL_MUTE_TAGS`].
+///
+/// A `fmt::Write` sink rather than a string compare, because `_print` is handed
+/// `core::fmt::Arguments` and the tag lives inside the format string's leading literal piece, which
+/// is not materialised anywhere. Nothing is allocated and nothing is retained — the sink is
+/// [`TAG_SNIFF`] bytes of stack — and it returns `Err` the instant it is full, which ABORTS the
+/// format walk instead of rendering the whole line a second time. Re-walking a prefix of `args` is
+/// free of consequence: `Arguments` is `Copy` and `_print` already hands the same value to two
+/// sinks.
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+struct TagSniff {
+    buf: [u8; TAG_SNIFF],
+    n: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+impl TagSniff {
+    fn new() -> Self {
+        TagSniff { buf: [0u8; TAG_SNIFF], n: 0 }
+    }
+
+    /// True when the head is a bracketed tag on the mute list. A line that does not START with `[`
+    /// can never match, so the common case costs one byte compare.
+    fn muted(&self) -> bool {
+        let head = &self.buf[..self.n];
+        if head.first() != Some(&b'[') {
+            return false;
+        }
+        PANEL_MUTE_TAGS.iter().any(|t| head.starts_with(t))
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+impl core::fmt::Write for TagSniff {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.n >= TAG_SNIFF {
+                // Decided. `Err` stops `write_fmt` walking the rest of the line.
+                return Err(core::fmt::Error);
+            }
+            self.buf[self.n] = b;
+            self.n += 1;
+        }
+        Ok(())
+    }
+}
+
 /// Mirror formatted output to the framebuffer (called from the serial `_print`). Lock-free of
 /// deadlock: interrupts are masked and the lock is `try_lock`ed, so a contended line just skips
 /// the screen (serial still has it) rather than spinning.
@@ -544,6 +636,30 @@ pub fn _print(args: core::fmt::Arguments) {
     if !PANIC_MIRROR.load(Ordering::Relaxed) && !PANEL_CONSOLE.load(Ordering::Relaxed) {
         tap.suppress();
         return;
+    }
+    // PANEL-QUIET (x86): the panel console is a bench-eye channel, not a second copy of the serial
+    // log. Once PANEL-CONSOLE has armed the mirror, the compositor's and scheduler's own telemetry
+    // is kept off the GLASS — see `PANEL_MUTE_TAGS` for the list and for the re-entrancy that makes
+    // this a damage fix and not just a legibility one.
+    //
+    // THE PANIC OVERRIDE IS PRESERVED TWICE OVER, and the two are independent on purpose (the same
+    // belt-and-braces `draw_fb` uses). Belt: the gate demands `PANIC_MIRROR` be CLEAR, so from
+    // `panic_screen` onwards not one line can be muted, whatever it says. Braces: the test is a
+    // POSITIVE match against a fixed tag list, so panic text — which carries none of those tags —
+    // could not be muted even if it reached here before the flag flipped.
+    //
+    // COUNTED, NEVER VANISHED: a muted line charges the tap `suppressed`, the ledger's term for
+    // "declined by policy" as opposed to lost, so `submitted == absorbed + dropped + suppressed`
+    // still holds exactly. This is also why the charge is here and not deeper: every exit from this
+    // function charges exactly once.
+    #[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+    if PANEL_CONSOLE.load(Ordering::Relaxed) && !PANIC_MIRROR.load(Ordering::Relaxed) {
+        let mut sniff = TagSniff::new();
+        let _ = core::fmt::Write::write_fmt(&mut sniff, args);
+        if sniff.muted() {
+            tap.suppress();
+            return;
+        }
     }
     // PANEL-DEFER (x86): mirror through the split layout/paint path when the draw target is VRAM
     // (no cached-RAM shadow) and we are not on the panic path. See `panel_mirror` for the invariant.
@@ -654,20 +770,34 @@ fn pend_merge(y0: usize, y1: usize) {
     }
 }
 
-/// FBCON-DMG — take everything owed. `None` means "the whole box"; `Some(band)` is a real band.
+/// FBCON-DMG — take everything owed, as the three-way answer [`Owed`] names.
+///
+/// FBCON-PACE widened the return: it used to be `Option<(usize, usize)>`, in which `None` meant BOTH
+/// "the whole box" and "nothing at all", and the caller could only act on the pessimistic reading.
+/// That was sound while every caller had just added something, and it is not once a sync point can
+/// arrive with a clean ledger — a whole-box repaint on behalf of a surface that did not change is
+/// 750 rows of work for no pixel. The distinction is made HERE because this is the only place that
+/// can still see it; after the swap-and-take, it is gone.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-fn pend_take() -> Option<(usize, usize)> {
+fn pend_take() -> Owed {
     let full = PEND_FULL.swap(false, Ordering::AcqRel);
     match PEND.try_lock() {
         Some(mut p) => {
             let band = (p.y0, p.y1);
             *p = Pending::EMPTY;
-            if full || band.1 <= band.0 { None } else { Some(band) }
+            if full {
+                Owed::Whole
+            } else if band.1 > band.0 {
+                Owed::Band(band.0, band.1)
+            } else {
+                Owed::Nothing
+            }
         }
         // Contended: the ledger may hold rows we cannot read. Present the whole box; anything still
         // recorded in there is then a superset of what is already on the glass, which costs one
-        // redundant band later and loses nothing.
-        None => None,
+        // redundant band later and loses nothing. NEVER `Nothing` — that is the one answer that
+        // could drop rows, and it is the answer this arm must not be allowed to give.
+        None => Owed::Whole,
     }
 }
 
@@ -675,36 +805,308 @@ fn pend_take() -> Option<(usize, usize)> {
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 static PEND_FULL: AtomicBool = AtomicBool::new(false);
 
+/// FBCON-PACE — what a routed call owes the compositor.
+///
+/// Three shapes, because "present the whole box", "present these rows" and "present whatever is
+/// already owed" are three different statements and only the first two used to be expressible. The
+/// third is what a sync point ([`console_flush`]) and a line that painted nothing both want: add
+/// nothing to the ledger, and do not invent a whole-box repaint for a surface that did not change.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[derive(Clone, Copy)]
+enum Owed {
+    /// The whole surface changed, or the caller does not know what changed.
+    Whole,
+    /// These SURFACE rows changed.
+    Band(usize, usize),
+    /// Nothing new.
+    Nothing,
+}
+
+/// FBCON-PACE — the present cadence, in Hz. One present per 60 Hz frame is the rate at which a
+/// panel can show a change at all; anything faster is work whose result is overwritten before it
+/// is scanned out. `wm`'s own `[wc-h]` rollup already prints `frame_us=16667` for the same reason,
+/// and this is that number expressed as the rate it is derived from.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+const PACE_HZ: u64 = 60;
+
+/// FBCON-PACE — `now_cycles()` at the END of the last present this seam issued; 0 = none yet.
+///
+/// Stamped at the END, not the start, on purpose: the guarantee is then "the console starts at most
+/// one present per frame period AFTER the previous one finished", which bounds the share of wall
+/// clock the console's presents can occupy no matter how long a present takes. Stamping at the start
+/// would bound the RATE but not the share.
+///
+/// A stale stamp (a re-init, a route torn down and rebuilt) degrades toward a LARGE delta, i.e.
+/// toward presenting — the same direction every other degradation in this module takes.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// FBCON-PACE census — presents this seam ISSUED (any urgency).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_RAN: AtomicU64 = AtomicU64::new(0);
+
+/// FBCON-PACE census — presents the pacing gate HELD, counting ONLY calls that had rows of their own
+/// to defer ([`Owed::Band`] / [`Owed::Whole`]). That is the count of coalesced LINES, which is what
+/// the name is read as; a service-hook pass that added nothing and was not yet due is `idle`, not
+/// held. See [`console_pace_census_once`] for the identity the four counters close.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// FBCON-PACE census — presents the [`ROUTE_BUSY`] re-entry guard declined. Counted for the first
+/// time here: it was the one decline in this file with no counter behind it, and a pacing gate that
+/// reports its own declines while a neighbouring one does not would be an invitation to misread the
+/// difference between the two.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_BUSY: AtomicU64 = AtomicU64::new(0);
+
+/// FBCON-PACE census — calls that owed nothing and presented nothing: a [`console_service`] pass on
+/// a clean or not-yet-due ledger, and a control-only print. Without it the identity does not close —
+/// the arm that wins the re-entry guard and finds [`Owed::Nothing`] was landing in no bucket at all,
+/// and it is the COMMON shape of the service hook.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_IDLE: AtomicU64 = AtomicU64::new(0);
+
+/// FBCON-PACE — one-shot latch for [`console_pace_census_once`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_CENSUS_DONE: AtomicBool = AtomicBool::new(false);
+
+/// FBCON-PACE — is a present DUE, i.e. has a frame period elapsed since the last one finished?
+///
+/// ### The clock discipline (the convicted bug class)
+///
+/// Only a DELTA between two `now_cycles()` readings is ever formed, and the budget is carried in
+/// CYCLES — `hz / PACE_HZ` — so nothing multiplies an absolute counter and nothing scales before it
+/// divides. `now_cycles()` on x86 is `rdtsc`, which counts from processor RESET: its absolute value
+/// includes firmware and means nothing as an uptime (the `wcg::since_entry_ms` note carries the full
+/// argument, and the two defects it names — measuring from reset, and scaling before dividing — are
+/// both structurally absent here rather than corrected).
+///
+/// ### Every degradation presents
+///
+/// * an UNCALIBRATED TSC (`tsc_hz() == 0`, before `apic::calibrate`) → due. A guessed rate would
+///   silently mis-time the gate; presenting is exactly today's per-line behaviour, so the
+///   pre-calibration boot is byte-for-byte unchanged. (Calibration lands long before the route is
+///   ever installed; this is a belt, not a live path.)
+/// * no present yet (`PACE_LAST == 0`) → due.
+/// * a reading taken on a core whose TSC is skewed behind ours → `wrapping_sub` yields a huge delta
+///   → due.
+/// * [`PANIC_MIRROR`] armed → due, unconditionally. See the PANIC PATH LAW note on
+///   [`route_present_banded`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn pace_due(now: u64) -> bool {
+    if PANIC_MIRROR.load(Ordering::Relaxed) {
+        return true;
+    }
+    let hz = crate::arch::apic::tsc_hz();
+    if hz == 0 {
+        return true;
+    }
+    let last = PACE_LAST.load(Ordering::Relaxed);
+    if last == 0 {
+        return true;
+    }
+    now.wrapping_sub(last) >= hz / PACE_HZ
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn route_present() {
-    route_present_banded(None)
+    route_present_banded(Owed::Whole, false)
 }
 
 /// FBCON-DMG — present the console window over SURFACE ROWS `[band.0, band.1)` only.
 ///
-/// The one call fbcon makes on the hot path. Same contract as [`route_present`] in every other
-/// respect: **call with the `FBCON` lock RELEASED and interrupts ENABLED.**
+/// The one call fbcon makes on the hot path, and the one that is PACED (see
+/// [`route_present_banded`]). Same contract as [`route_present`] in every other respect: **call with
+/// the `FBCON` lock RELEASED and interrupts ENABLED.**
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn route_present_rows(band: (usize, usize)) {
-    route_present_banded(Some(band))
+    route_present_banded(Owed::Band(band.0, band.1), true)
 }
 
-/// The body both routed presents share. `None` = whole box, which is what `clear`, the route's own
-/// first paint and the INSTGUI resume all want (they change the entire surface, or do not know what
-/// they changed).
+/// FBCON-PACE — a print that changed NOTHING on the surface. Owes no rows; still gives the pacing
+/// gate a chance to retire rows an earlier line left owed. Previously this case forced a whole-box
+/// present, which repainted 750 rows on behalf of a line that moved no pixel.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-fn route_present_banded(band: Option<(usize, usize)>) {
+fn route_present_pending() {
+    route_present_banded(Owed::Nothing, true)
+}
+
+/// FBCON-PACE — THE IDLE-LOOP SERVICE HOOK. Retire rows a held present left owed, **still paced**.
+///
+/// ### Why the bench lane needs it, and why it is not the forced flush
+///
+/// A held band is carried by the NEXT present, and on the print path the next present is the next
+/// print. When printing stops mid-burst the last band waits — after boot, potentially on operator
+/// action. [`detach`] is the backstop for GUI boots, and the metal bench lane **never detaches**:
+/// the `usbdebug` view keeps fbcon attached by design (`main.rs`, the USB-debug loop), which is
+/// exactly the lane the routed console runs on and the lane this arc's prediction is measured on.
+///
+/// So the `usbdebug` service loop calls this once per pass, beside `bootpace::service_dump`. The
+/// loop `hlt()`s and the x86 heartbeat is `apic::TICK_HZ` = 1 kHz, so a pass is at most ~1 ms out
+/// and **worst-case staleness of a held band is one frame period plus one pass, ≈ 17.7 ms** — the
+/// bound that replaces "until the next print".
+///
+/// It is deliberately the PACED call and not [`console_flush`]. A forced flush at the loop's 1 kHz
+/// cadence would present every held band within a millisecond, which is the pacing gate switched
+/// off for every line printed from inside the loop's own services — and those services (xHCI
+/// enumeration, storage, FTDI) are where a large share of the routed lines after
+/// `console-route first-paint` come from. Paced, this hook adds no present the gate would not
+/// already have allowed: it can only ever move a present EARLIER within the frame it was already
+/// going to happen in, so the predicted present count is unchanged.
+///
+/// Silent, and free on a clean ledger: `pend_take` answers `Owed::Nothing` and nothing is composited.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn console_service() {
+    route_present_banded(Owed::Nothing, true)
+}
+
+/// FBCON-PACE — a SYNC point: present everything owed NOW, whatever the pacing gate would say.
+///
+/// Called from [`detach`], the moment the GUI takes the panel and no further print will ever route,
+/// and from [`console_pace_census_once`] so its own line lands. `pub` so any end-of-boot caller can
+/// use it for the same reason. SILENT — the census used to live here and was split out, because a
+/// flush that is called once per service pass must not print once per service pass.
+///
+/// No-op unless the console is routed, and free on a clean ledger.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn console_flush() {
+    route_present_banded(Owed::Nothing, false)
+}
+
+/// FBCON-PACE — the pacing census, once per boot.
+///
+/// Emitted from a one-shot in the `usbdebug` service loop beside `xhci::log_summary_once`, i.e.
+/// after enumeration and after the boot burst this arc reshapes, so the numbers cover the burst.
+/// `[wc-x]` is not on [`PANEL_MUTE_TAGS`], so it reaches the glass as well as the wire.
+///
+/// THE IDENTITY THE LINE ASSERTS: `ran + held + busy + idle` is every call that reached the gate
+/// with a live route and an unsuspended console — one bucket per call, no call in two, no call in
+/// none. (Calls that return earlier are outside it by construction: no route, or the INSTGUI
+/// suspension, both of which are declines this arc did not author.)
+///   * `ran`  — a present was issued to `wm`.
+///   * `held` — the gate deferred rows THIS call added. The count of coalesced lines.
+///   * `busy` — the [`ROUTE_BUSY`] re-entry guard declined.
+///   * `idle` — the call added nothing and presented nothing: a service-hook pass on a clean or
+///     not-yet-due ledger, or a control-only print. Kept OUT of `held` deliberately — charging it
+///     there would inflate "lines coalesced" with calls that carried no line at all.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn console_pace_census_once() {
+    if CONSOLE_WIN.load(Ordering::Relaxed) == wm::WIN_NONE {
+        return;
+    }
+    if PACE_CENSUS_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // The census goes out BEFORE the flush, so its own glyphs are carried by the flush it describes
+    // rather than left owed behind it. The numbers therefore describe the run up to this line, which
+    // is what they claim.
+    serial_println!(
+        "[wc-x] console-pace ran={} held={} busy={} idle={} budget_us={} hz={}",
+        PACE_RAN.load(Ordering::Relaxed),
+        PACE_HELD.load(Ordering::Relaxed),
+        PACE_BUSY.load(Ordering::Relaxed),
+        PACE_IDLE.load(Ordering::Relaxed),
+        1_000_000 / PACE_HZ,
+        crate::arch::apic::tsc_hz()
+    );
+    console_flush();
+}
+
+/// The body every routed present shares.
+///
+/// ### FBCON-PACE — the console pays one present per FRAME, not one per LINE
+///
+/// GR17 measured what the routed console costs: every kernel serial line reaches `wm::present_rows`
+/// and buys its own banded compose+present. On boot 7 of the `rmbp-gr16-s73` capture that is 799
+/// routed lines between `[wc-x] console-route first-paint` and the end of boot, ~64 surface rows
+/// each (`[wc-h] span=64 compose_us=192 present_us=233`), ~6.6 µs/row — ~51k rows and ~0.34 s of
+/// boot spent presenting single console lines, with steady-state console throughput capped by the
+/// same figure.
+///
+/// The lines are not spread evenly: 764 of the 799 arrive within 17 ms of the line before them.
+/// Boot printing is bursty, and a burst repaints the same console faster than the panel can scan it
+/// out — every present but the last of each frame is work whose result is overwritten before anyone
+/// could see it.
+///
+/// So a banded present is now DEFERRED until a frame period has passed since the last one finished.
+/// The rows are not dropped: they are merged into [`PEND`] BEFORE the gate is tested, exactly as the
+/// two older declines ([`ROUTE_BUSY`], the INSTGUI suspension) already are, and the next present that
+/// runs carries them. FBCON-DMG built that ledger precisely so a decline could be safe; this arc is
+/// its third and first *deliberate* caller.
+///
+/// ### The three flush triggers
+///
+/// 1. **Time** — a frame period since the last present finished ([`pace_due`]). This is the trigger
+///    the hot path rides: it needs no timer, because the next print asks the question — and, on the
+///    lane where printing can stop, because the service loop asks it too ([`console_service`]).
+/// 2. **Urgency** — a caller that passes `coalesce = false` is never held: the route's own first
+///    paint, [`clear`], the INSTGUI resume, and the [`console_flush`] sync point.
+/// 3. **Panic** — [`pace_due`] returns `true` whenever [`PANIC_MIRROR`] is armed, so no panic output
+///    can ever wait on a pacing timer. That is the belt; the braces are that [`panic_screen`] clears
+///    [`CONSOLE_WIN`] before any panic byte is printed, so this function returns at its first line
+///    and panic text goes to the PANEL through [`FbCon::draw_fb`]'s own panic branch. Panic output
+///    depends on neither the compositor nor this gate, exactly as before.
+///
+/// ### Why the damage SPAN is deliberately NOT a fourth trigger
+///
+/// A span bound ("flush once the pending band gets large") reads like the natural companion to the
+/// time bound, and measurement says it is a cost, not a saving. The band is a bounding box capped by
+/// the surface height, so once a burst has saturated it the band CANNOT grow — from that moment
+/// further coalescing is free, and flushing on saturation only buys an extra whole-box present at
+/// ~5 ms each. Replaying boot 7's line timestamps: 57 presents / 24 180 rows with time alone, 78
+/// presents / 28 084 rows if saturation also flushed. Staleness is already bounded by the time
+/// trigger, which is the property a span bound would have been reached for.
+///
+/// ### How stale a held band can get
+///
+/// Bounded, and by a different bound on each lane.
+///   * **The `usbdebug` bench lane** — one frame period (the gate) plus one service-loop pass. The
+///     loop `hlt()`s against the 1 kHz x86 heartbeat (`apic::TICK_HZ`), so a pass is ~1 ms out and
+///     the bound is **≈ 17.7 ms**. See [`console_service`].
+///   * **GUI boots** — the next print, with [`detach`] as the backstop: it flushes before the GUI
+///     takes the panel, so nothing the console painted is left owed at the handoff.
+///   * **Panic** — zero. Trigger 3.
+///
+/// ### What `[wc-h] span=` means now, and why the censuses stay honest
+///
+/// `span=` used to be ONE console line's damage. It is now the union of every line since the last
+/// present, so the same wire word denotes a larger, rarer band — bands near the surface height on a
+/// boot burst, and single-line bands whenever printing is slower than a frame. `[wc-h]`'s
+/// `whole=`/`banded=` censuses count real presents either way and are the proof lines for this arc:
+/// `banded=` collapsing while the console keeps printing IS the feature working. (`wcg`'s own
+/// rollup doc is reconciled with both readings at its `banded=0` and `span=` notes.) Nothing becomes
+/// unobservable — every call that reaches the gate lands in exactly one of [`PACE_RAN`],
+/// [`PACE_HELD`], [`PACE_BUSY`] or [`PACE_IDLE`], reported by [`console_pace_census_once`], and the
+/// rows themselves are in [`PEND`], which no path in this file drops.
+///
+/// The `[wc-d]` reference discipline is untouched: WCD-PRE takes its reference from the composite
+/// loop before the blit, and the print hazard it exists for is a print that MERGES and DECLINES —
+/// which is what a held present does, and what the re-entry guard already did.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn route_present_banded(owed_now: Owed, coalesce: bool) {
     let id = CONSOLE_WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE {
         return;
     }
-    // OWE FIRST, DECLINE SECOND. Both returns below happen with the rows recorded, so neither can
-    // lose them. A whole-box caller saturates the ledger for the same reason.
-    match band {
-        Some((y0, y1)) => pend_merge(y0, y1),
-        None => PEND_FULL.store(true, Ordering::Release),
+    // OWE FIRST, DECLINE SECOND. Every return below happens with the rows recorded, so none can lose
+    // them. A whole-box caller saturates the ledger for the same reason.
+    match owed_now {
+        Owed::Band(y0, y1) => pend_merge(y0, y1),
+        Owed::Whole => PEND_FULL.store(true, Ordering::Release),
+        Owed::Nothing => {}
     }
     if CONSOLE_PRESENT_SUSPENDED.load(Ordering::Relaxed) {
+        return;
+    }
+    // FBCON-PACE: the gate. Rows stay owed; the next present carries them. The clock is read only on
+    // the coalescing path — a caller that will present regardless has no question to ask it.
+    if coalesce && !pace_due(crate::arch::now_cycles()) {
+        // `held` means "this call's own rows were deferred". A caller that brought no rows brought
+        // no line, so it is `idle` — see the identity on `console_pace_census_once`.
+        match owed_now {
+            Owed::Nothing => PACE_IDLE.fetch_add(1, Ordering::Relaxed),
+            _ => PACE_HELD.fetch_add(1, Ordering::Relaxed),
+        };
         return;
     }
     // Re-entry: see `ROUTE_BUSY`.
@@ -712,22 +1114,56 @@ fn route_present_banded(band: Option<(usize, usize)>) {
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
+        PACE_BUSY.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    // Everything owed, including bands from presents that declined earlier. FBCON-DMG's banded
-    // callee (`wm::present_rows`) is x86 re-land material (tier-3 sequencing) and absent from the
-    // merged wm.rs, so every owed band presents the whole box until callers and callee re-land
-    // together; the ledger still bounds WHEN presents happen, just not their height.
+    // Everything owed, including bands from presents that declined earlier.
     let owed = pend_take();
-    let ok = wm::present(id);
-    if !ok {
+    let ok = match owed {
+        // Nothing is owed at all — a sync point, or a line that moved no pixel, arriving on a clean
+        // ledger. There is no such thing as an honest whole-box present here: the surface has not
+        // changed. (`pend_take`'s CONTENDED arm answers `Whole`, never `Nothing`, so a ledger that
+        // MIGHT hold rows still repaints; degradation stays in the paint-MORE direction.)
+        Owed::Nothing => {
+            PACE_IDLE.fetch_add(1, Ordering::Relaxed);
+            ROUTE_BUSY.store(false, Ordering::Release);
+            return;
+        }
+        // NORMALWIN — **the RECYCLED-ID FENCE, and the console now needs it.** `id` was snapshotted
+        // from `CONSOLE_WIN` at the head of this function, outside any lock. Until this arc that
+        // snapshot could not go stale: nothing could close the console row (`close_owner` refuses the
+        // kernel band, and furniture carried no close disc), so the id named the same row forever.
+        // The close disc changes that — `wc_close_furniture` clears `CONSOLE_WIN` and then frees the
+        // row, and `wm::close` hands the slot straight back to the next `SYS_WIN_CREATE`. A print
+        // that stalled between the load above and this line would otherwise present a ring-3 app's
+        // window under the console's damage band, through the fence-FREE `expect_owner = None` path
+        // whose doc says kernel/furniture callers "have no recycle race". They do now, so this path
+        // carries the fence: `KERNEL_OWNER_CONSOLE` is the owner `panel_console_window_open` minted
+        // the row with, and a slot that has been re-issued to anyone else declines `NoRow` and takes
+        // the rows-go-back arm below. Same three outcomes as the `bool` verbs (`!= NoRow` is exactly
+        // their body), so nothing else here moves.
+        Owed::Band(y0, y1) => {
+            PACE_RAN.fetch_add(1, Ordering::Relaxed);
+            wm::present_rows_outcome_owned(id, y0, y1, wm::KERNEL_OWNER_CONSOLE)
+                != wm::Presented::NoRow
+        }
+        Owed::Whole => {
+            PACE_RAN.fetch_add(1, Ordering::Relaxed);
+            wm::present_outcome_owned(id, wm::KERNEL_OWNER_CONSOLE) != wm::Presented::NoRow
+        }
+    };
+    if ok {
+        // The frame window opens when the present FINISHES — see `PACE_LAST`. Not stamped on a
+        // failed present: the rows go back below, and a failure must not buy the retry a frame of
+        // delay.
+        PACE_LAST.store(crate::arch::now_cycles(), Ordering::Relaxed);
+    } else {
         // The row is gone (a panic tore the route down, or the window was closed underneath us).
         // Put the rows back rather than dropping them: if a route is ever re-established they are
         // still owed, and if it is not, nothing reads the ledger again.
-        if let Some((y0, y1)) = owed {
-            pend_merge(y0, y1);
-        } else {
-            PEND_FULL.store(true, Ordering::Release);
+        match owed {
+            Owed::Band(y0, y1) => pend_merge(y0, y1),
+            _ => PEND_FULL.store(true, Ordering::Release),
         }
     }
     if ok && !ROUTE_ANNOUNCED.swap(true, Ordering::Relaxed) {
@@ -748,6 +1184,29 @@ fn route_present() {}
 #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
 #[inline]
 fn route_present_rows(_band: (usize, usize)) {}
+
+/// No-op off the routed x86 path (see the x86 definition). There is no pacing gate to give a chance
+/// to, because there is no present.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[inline]
+fn route_present_pending() {}
+
+/// No-op off the routed x86 path (see the x86 definition). `detach` calls this on every arch; off
+/// the routed path there is nothing owed and nothing printed.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[inline]
+pub fn console_flush() {}
+
+/// No-op off the routed x86 path (see the x86 definition). The `usbdebug` service loop calls this
+/// on every arch and every build; off the routed path there is no ledger to service.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[inline]
+pub fn console_service() {}
+
+/// No-op off the routed x86 path (see the x86 definition). There is no pacing gate to report on.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[inline]
+pub fn console_pace_census_once() {}
 
 /// No-op off the wc path (see the x86 definition).
 #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
@@ -786,14 +1245,16 @@ fn print_masked(args: core::fmt::Arguments) {
     });
     // CONSOLE-WINDOW: outside the mask and the lock, per `route_present`'s contract. Not reached on
     // the panic path in any meaningful sense — `panic_screen` has already cleared `CONSOLE_WIN`.
-    // FBCON-DMG: the whole LINE's band, presented once. `None` is either "not routed" (where
-    // `route_present` is a no-op) or "routed and nothing to say", and the whole-box present is the
-    // honest answer to the second: this path has no per-chunk state to have accumulated.
+    // FBCON-DMG: the whole LINE's band, presented once. `None` is either "not routed" (where both
+    // calls are no-ops) or "routed and nothing to say".
+    // FBCON-PACE: the second of those used to force a WHOLE-BOX present — 750 rows on behalf of a
+    // line that moved no pixel. It now asks the pacing gate to retire whatever an earlier line left
+    // owed and adds nothing of its own; `pend_take` answering `Owed::Nothing` presents nothing at all.
     if drew {
         tap.absorb();
         match band {
             Some(b) => route_present_rows(b),
-            None => route_present(),
+            None => route_present_pending(),
         }
     } else if ready {
         // Lock taken, console not up yet. Declined by policy, not lost.
@@ -984,9 +1445,18 @@ impl PanelSink {
         if self.routed {
             if self.band.1 > self.band.0 {
                 route_present_rows(self.band);
+            } else {
+                // An empty band on a routed line means the bytes were `\r`/control only — no glyph
+                // moved, so this line owes no rows of its own.
+                //
+                // FBCON-PACE: it must still reach the gate. This is the DOMINANT routed print path,
+                // and returning here without asking would mean a run of control-only lines gave a
+                // band an earlier line left held no chance to retire — compounding staleness on the
+                // one path that prints most. `route_present_pending` adds nothing and presents only
+                // what is already owed and due, which is what `print_masked` and `milestone` do with
+                // the same case.
+                route_present_pending();
             }
-            // An empty band on a routed line means the bytes were `\r`/control only — no glyph moved,
-            // so there is nothing on the surface to present and no present is owed.
             self.band = (0, 0);
             self.routed = false;
         }
@@ -1042,9 +1512,12 @@ pub fn milestone(ms: u64, tag: &str) {
         });
         // CONSOLE-WINDOW: same contract as `print_masked` — present outside the lock and the mask.
         // FBCON-DMG: a milestone is one line, so it damages one cell row like any other.
+        // FBCON-PACE: paced like any other line. Milestones are seconds apart on any real boot, so
+        // the gate is due for every one of them in practice; the `None` arm presents nothing rather
+        // than the whole box, for the reason `print_masked` gives.
         match band {
             Some(b) => route_present_rows(b),
-            None => route_present(),
+            None => route_present_pending(),
         }
     }
     #[cfg(not(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "witness")))))]
@@ -1066,7 +1539,19 @@ impl core::fmt::Write for Sink<'_> {
 
 /// Hand the framebuffer to the GUI: stop mirroring serial output onto it. Call once the GUI has
 /// painted its first frame. Serial output is unaffected; panics re-enable the mirror.
+///
+/// FBCON-PACE — THE SYNC POINT ON THE BOOTS THAT REACH IT. This is the last moment a routed console
+/// line can reach glass: from the store below onwards `_print` returns at its first test and no
+/// further print will ever ask for a present. Anything the pacing gate is still holding is flushed
+/// FIRST, so the guarantee the gate makes ("a held band is carried by the next present") has a next
+/// present to be carried by even when the printing simply stops.
+///
+/// It is NOT the bench lane's backstop and must not be mistaken for one: the metal `usbdebug` view
+/// keeps fbcon attached and never calls this at all. That lane is served per pass by
+/// [`console_service`]. No-op unless the console is routed into a window, so aarch64 and every x86
+/// build without `wc` reach the store exactly as before.
 pub fn detach() {
+    console_flush();
     GUI_ACTIVE.store(true, Ordering::Relaxed);
 }
 
@@ -1188,8 +1673,23 @@ pub fn attach_shadow() {
 ///
 /// Returns the number of text rows painted by the replay. Gated to the Kepler-takeover call site,
 /// so no other boot path changes behaviour.
+///
+/// ### SECOND-IGNITION guard (M-a)
+///
+/// Steps 1 and 3 above write `c.full_fb()` — the PANEL handle — unconditionally. Once the console is
+/// a compositor window its glyphs belong in `c.win_fb`, and a second resume would clear the glass and
+/// re-home the grid underneath a live compositor. The `wcx` activation latch cannot reach that: it
+/// refuses the second ACTIVATION, and this function runs BEFORE the activation, from its own call
+/// site. So the skip lives here. On the Kepler path `CONSOLE_WIN` is still `wm::WIN_NONE` when this
+/// runs (resume, then activate — that is the seam's ordering law), so this guard cannot fire on any
+/// boot that exists today and the Kepler wire is unchanged.
 #[cfg(target_arch = "x86_64")]
 pub fn panel_console_resume() -> usize {
+    #[cfg(feature = "wc")]
+    if CONSOLE_WIN.load(Ordering::Relaxed) != wm::WIN_NONE {
+        serial_println!(":: fbcon: glyphs-active SKIP console-already-windowed ::");
+        return 0;
+    }
     let mut base = 0u64;
     let mut pitch = 0usize;
     let mut cell = (0usize, 0usize);
@@ -1262,9 +1762,11 @@ const WIN_BOX_BUDGET_PX: usize = 4 * 1024 * 1024 / 4;
 /// CONSOLE-WINDOW — pick the console window's CONTENT extent for a `pw x ph` panel.
 ///
 /// Generous first, budgeted second, aligned last:
-///  1. start at 7/8 of the panel in each axis, less the bottom chrome `ui_status` owns (the tiler's
-///     PULSE-2 reservation does not apply to a pinned window, so the reservation is honoured here or
-///     not at all);
+///  1. start at 7/8 of the panel in each axis, less BOTH chromes `ui_status` owns — the bottom
+///     instrument band (PULSE-2) and, MENUFIT, the top furniture band (SHELLDESK's
+///     `top_chrome_h`). The tiler's reservations do not apply to a pinned window, so they are
+///     honoured here or not at all, and after SHELLDESK enabled the menu bar by default the top one
+///     was not: the frozen boot-log window's first rows composited under the bar;
 ///  2. shrink both axes together — aspect preserved, 15/16 at a time so no float is needed — until
 ///     the OUTER box fits [`WIN_BOX_BUDGET_PX`];
 ///  3. round down to whole glyph cells, so the console's grid tiles its surface exactly and no
@@ -1276,7 +1778,11 @@ const WIN_BOX_BUDGET_PX: usize = 4 * 1024 * 1024 / 4;
 /// generous default actually means once the present path is priced.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn win_content_extent(pw: usize, ph: usize, cell_w: usize, cell_h: usize) -> (usize, usize) {
-    let avail_h = ph.saturating_sub(crate::ui_status::chrome_h(ph)).max(1);
+    // MENUFIT — the work area's HEIGHT: panel less the top furniture, less the bottom instrument.
+    let avail_h = ph
+        .saturating_sub(crate::ui_status::top_chrome_h(pw, ph))
+        .saturating_sub(crate::ui_status::chrome_h(ph))
+        .max(1);
     let mut w = (pw * 7 / 8).max(cell_w);
     let mut h = (avail_h * 7 / 8).max(cell_h);
     // Outer box = content + chrome. Budget the box, not the content: the box is what gets staged.
@@ -1301,8 +1807,8 @@ fn win_content_extent(pw: usize, ph: usize, cell_w: usize, cell_h: usize) -> (us
 /// `rows` grid; this call re-points the first at the window's surface and re-derives the second from
 /// the window's extent. `PANEL_SCALE` is untouched, so a glyph is the same size on glass it was —
 /// the window is composited at scale 1 (the surface is far too large for `wm`'s scale rule to
-/// magnify), so a surface pixel is a panel pixel and the console's own 4x cell is the whole of the
-/// magnification, exactly as before.
+/// magnify), so a surface pixel is a panel pixel and the console's own `PANEL_SCALE` cell is the
+/// whole of the magnification, exactly as before.
 ///
 /// ### Front-buffer discipline
 ///
@@ -1380,8 +1886,17 @@ pub fn panel_console_window_open() -> wm::WinId {
             return wm::WIN_NONE;
         }
     };
+    // MENUFIT — centred in the WORK AREA, not on the panel: the same two reservations
+    // `win_content_extent` sized against, translated so the offset is taken below the top furniture.
+    // At `top_chrome_h == 0` (aarch64, every x86 build without `wc`, and any boot whose shell has not
+    // enabled a bar) this is the pre-MENUFIT expression unchanged.
+    let wtop = crate::ui_status::top_chrome_h(pw, ph);
     let ox = pw.saturating_sub(ow) / 2;
-    let oy = ph.saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
+    let oy = wtop
+        + ph.saturating_sub(wtop)
+            .saturating_sub(crate::ui_status::chrome_h(ph))
+            .saturating_sub(oh)
+            / 2;
     // CLICK-X86 — owner [`wm::KERNEL_OWNER_CONSOLE`]: the console still belongs to the KERNEL, and
     // both properties owner 0 was chosen for hold unchanged — it is out of `focus_ring` (which skips
     // the reserved band) and out of `close_owner`'s reach (which refuses it). What changes is the
@@ -1441,6 +1956,39 @@ pub fn panel_console_window_open() -> wm::WinId {
     );
     route_present();
     id
+}
+
+/// NORMALWIN — **the console window was CLOSED by the operator: stop routing presents at it.**
+///
+/// Peter's 2026-08-11 ruling makes the console window a normal app window with all three normal
+/// buttons, so the close disc is live and this is the console side of it. Called from x86's
+/// `wc_close_furniture` BEFORE `wm::close(id)` frees the row, so no present can be aimed at a slot
+/// that is mid-free.
+///
+/// ### What is dropped, and what deliberately is NOT
+/// Only [`CONSOLE_WIN`] is cleared, which is the single test every `route_present*` path takes
+/// first — after this they all return without touching `wm`. The glyph ROUTE stays installed:
+/// `c.win_fb` / `c.win_store` are left alone on purpose, so console text keeps landing in the
+/// cached-RAM surface. Tearing the route down instead would make [`FbCon::draw_fb`] fall back to the
+/// PANEL handle, and the panel belongs to the compositor — every subsequent console line would paint
+/// over the desktop. Writing into an unwatched store is the harmless direction of that choice; the
+/// text is on serial and in `TERM_RING` regardless, which is where the boot log actually lives.
+///
+/// The surface allocation therefore outlives the window, which is also what keeps this free of a
+/// use-after-free: `wm::close` explicitly does not touch the surface, and `store` is owned by
+/// `FbCon`, not by the table row.
+///
+/// Idempotent and id-checked: returns `true` only if `id` was in fact the routed console window, so
+/// a stale or foreign id cannot silently unroute the live console. The panic path clears the same
+/// cell independently ([`panic_screen`]) and is unaffected either way.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn panel_console_window_closed(id: wm::WinId) -> bool {
+    if id == wm::WIN_NONE {
+        return false;
+    }
+    CONSOLE_WIN
+        .compare_exchange(id, wm::WIN_NONE, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
 }
 
 /// Repaint the screen as a panic backdrop (dark red) and home the cursor, so the panic message

@@ -494,10 +494,18 @@ static PULSE: Mutex<PulseState> = Mutex::new(PulseState {
 ///
 /// `sched::core_load(c).busy_pct_recent` is SCHED-5/SCHED-7's rolling ~250 ms CNTPCT accounting — the
 /// number `top` and the `SCHED: load` heartbeat report — so the instrument and the console are reading
-/// one feed. `None` means "no live number for this core": either the arch has no such accounting (x86)
-/// or SCHED-8's `tracked` flag says the core is not currently inside `run()` and its slot is a frozen
-/// snapshot. `None` sends the caller to the `meter_cpu_ticks` fallback, which is where VUG-HONESTY's
-/// PARKED decision lives — so this function never has to invent a load, and never gets the chance to.
+/// one feed. `None` means "no live number for this core": either this arch's arm is not wired to a
+/// busy-time feed, or SCHED-8's `tracked` flag says the core is not currently inside `run()` and its
+/// slot is a frozen snapshot. `None` sends the caller to the `meter_cpu_ticks` fallback, which is
+/// where VUG-HONESTY's PARKED decision lives — so this function never has to invent a load, and never
+/// gets the chance to.
+///
+/// SCHEDLOAD-X86 — "the arch has no such accounting (x86)" is no longer why the x86 arm returns
+/// `None`. `arch::x86_64::sched::core_load` now exists, with the same `busy_pct_recent`/`tracked`
+/// contract (spans in TSC, freshness in ms — see that module for why the two clocks differ), and it
+/// backs the always-on `[schedx86] load` serial witness. What is missing is only the WIRE: adopting
+/// it here so the panel strip and the console read one feed, which is the aarch64 lesson recorded at
+/// the top of this module and is a deliberate follow-up rather than part of that arc.
 ///
 /// Resolution note: the source is a percent, so its quantum is 10‰. That is coarser than the meter's
 /// 1‰ storage and deliberately not smoothed or interpolated here — a fabricated intermediate value is
@@ -565,6 +573,42 @@ pub fn band_h(ph: usize) -> usize {
 pub fn chrome_h(ph: usize) -> usize {
     let m = crate::ui::Metrics::for_height(ph);
     band_h(ph).saturating_add(m.line_h)
+}
+
+/// SHELLDESK — **the TOP reservation: panel rows the desktop scene's furniture owns, which a
+/// screen-owning view must lay out below.**
+///
+/// The bottom counterpart is [`chrome_h`] and this is deliberately its twin: one function, no second
+/// copy of the arithmetic, and the number is READ FROM THE OWNER rather than restated — it is
+/// `video::menubar::strip_rect`'s own height, so a bar that is disabled, or that declines the panel
+/// on its floors, reserves nothing at all and the shell gets the whole glass back.
+///
+/// Why the shell has to know. The x86 render service draws `console::Console` into the desktop
+/// layer, and `Console::draw` opens with a whole-panel `clear_screen`: the shell's first act on every
+/// repaint is to claim every row on the panel. With the desktop present now withholding the strips'
+/// rows (`Screen::present_background`), text the shell laid out under the bar would be composed into
+/// the back buffer and never reach the glass — the shell would be writing lines into a region it
+/// cannot show. Reserving the rows is what makes "the desktop scene owns the top of the glass, the
+/// shell is a tenant below it" true for the LAYOUT as well as for the pixels.
+///
+/// `0` on aarch64 and on any x86 build without `wc` — `video::menubar` is not compiled there — so
+/// every non-x86-wc surface lays out exactly as it did before this arc.
+pub fn top_chrome_h(pw: usize, ph: usize) -> usize {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        if let Some((_x, y, _w, h)) = crate::video::menubar::strip_rect(pw, ph) {
+            // The bar is flush to the top edge, so the rows it costs a view below it are `y + h`.
+            // Written as the sum rather than as `h` so an inset strip (a future tenant, or a bar the
+            // geometry chose to float) reserves what it actually occupies.
+            return y.saturating_add(h);
+        }
+        0
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        let _ = (pw, ph);
+        0
+    }
 }
 
 /// The horizontal span `[x0, x1)` of the pulse band that is free of WC-F's reserved probe boxes.

@@ -353,6 +353,71 @@ pub fn request_full_present() {
     FULL_PRESENT.store(true, core::sync::atomic::Ordering::Release);
 }
 
+/// SHELLDESK — how many FURNITURE surfaces the desktop present may have to subtract.
+///
+/// `strip::STRIP_MAX` where the registry exists, `0` where it does not — `video::strip` is compiled
+/// only on x86 with `wc`, so on aarch64 the desktop's occluder array is exactly the WC-I array it has
+/// always been and no arithmetic on this path changes.
+///
+/// MENUFIT — **plus one for the TRANSIENT**. The crystal's dropdown is not a `strip::TENANTS` member
+/// by design (it takes no occlusion slot on the per-window blit path), so `strip::rects` cannot
+/// report it and the `+ 1` cannot come from `STRIP_MAX`. It is stated here, at the one array that
+/// has to hold it, rather than by promoting the menu to a tenant — which would spend a permanent
+/// occlusion slot on a surface that is absent for all but a few seconds of a boot.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+const DESK_STRIP_MAX: usize = super::strip::STRIP_MAX + 1;
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+const DESK_STRIP_MAX: usize = 0;
+
+/// SHELLDESK — the desktop present's occluder capacity: every window box ([`super::wm::occluders`]
+/// fills at most `MAX_WINDOWS`) plus every furniture strip on the glass. Sized for the worst case and
+/// bounded at compile time, so a tenant added to the registry widens this array by construction
+/// rather than silently dropping an occluder — the same guard `wm::OCC_MAX` makes for the window-blit
+/// clip, restated on the desktop side because it is a second array with the same obligation.
+const DESK_OCC_MAX: usize = super::wm::MAX_WINDOWS + DESK_STRIP_MAX;
+
+/// WC-BBSYNC — "unarmed" for [`DESKTOP_BG_SEED`]. Every colour that reaches this path is an
+/// `0x00RRGGBB` triple (the top byte is unused on both the desktop and the compositor side), so
+/// `0xFFFF_FFFF` is outside the range a caller can legitimately pass and needs no second flag.
+const SEED_NONE: u32 = 0xFFFF_FFFF;
+
+/// WC-BBSYNC — the colour a newly-built [`Screen`]'s BACK buffer is born holding, once the window
+/// compositor has taken the panel. [`SEED_NONE`] means unarmed, which is every aarch64 build, every
+/// default x86 build, and every `wc` boot up to the instant `video::wcx::activate` clears the glass.
+///
+/// ### Why a latch, and why it is consumed HERE rather than set here
+///
+/// The two events are ~290 lines of `kernel_main` apart and in that order: the compositor activates
+/// from inside PCI enumeration (`kepler::init` -> `takeover_display`), and the desktop layer's
+/// `Screen` is not constructed until the GUI loop, long afterwards. So there is no `Screen` for
+/// activation to reach even in principle — the compositor can only record the colour it just put on
+/// the glass, and the desktop layer adopts it when it comes into existence.
+///
+/// What it fixes: `Screen::new` allocates its back store with `vec![0u8; len]` and arms FULL-PANEL
+/// damage, so a desktop layer born after a compositor takeover holds BLACK over a panel the
+/// compositor just painted `wm::DESKTOP_BG`, with the damage to carry that black to the glass already
+/// set. On the nominal path the first `console.draw` clears the back buffer before the first present
+/// and the black never ships — but that is a coincidence of two independently-declared constants
+/// (`console::Console::BG` and `wm::DESKTOP_BG`) happening to be the same number, and of no present
+/// falling between the construction and that first clear. Seeding the buffer makes the desktop layer
+/// agree with the glass BY CONSTRUCTION instead.
+///
+/// A back-buffer (cached RAM) fill, not a panel read-back: nothing here reads the framebuffer, so the
+/// write-only-VRAM discipline is untouched.
+static DESKTOP_BG_SEED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(SEED_NONE);
+
+/// WC-BBSYNC — record the desktop colour the compositor has just established on the glass, so every
+/// [`Screen`] built from here on starts its back buffer in agreement with it. Idempotent; the caller
+/// owns the colour (this module invents none).
+///
+/// Armed only by `video::wcx`, which is `cfg(all(target_arch = "x86_64", feature = "wc"))`. On
+/// aarch64 and on every non-`wc` x86 build there is no caller, the latch stays [`SEED_NONE`], and
+/// [`Screen::new`] pays exactly one relaxed-cost atomic load.
+pub fn adopt_desktop_bg(color: u32) {
+    DESKTOP_BG_SEED.store(color, core::sync::atomic::Ordering::Release);
+}
+
 /// WC-I — one step of the row-span walk that subtracts the window layer from a damage rect.
 ///
 /// Given the occluder boxes, a scanline `y`, a cursor `xs` and the rect's right edge `x1`, returns
@@ -365,7 +430,7 @@ pub fn request_full_present() {
 ///  * none does — the gap runs to the nearest occluder start to the right of `xs` on this row, or to
 ///    `x1` when there is none.
 ///
-/// Deliberately not a sorted-interval merge: `MAX_WINDOWS` is 8 and this runs per scanline of a
+/// Deliberately not a sorted-interval merge: `MAX_WINDOWS` is small (12 since the x86 headroom raise; the linear-scan argument holds) and this runs per scanline of a
 /// damage rect, so a linear scan over at most eight boxes beats building any structure, and it needs
 /// no allocation on a path that must not allocate.
 fn next_visible_span(
@@ -424,6 +489,13 @@ pub struct Screen {
     /// screen and bytes/frame can never drop — the number that explains the ~3.5 MB/frame plateau.
     last_union_w: usize,
     last_union_h: usize,
+    /// SHELLWIN-OOM — single-buffer mode: `back` IS `front` (both handles point at the same
+    /// cached-RAM window surface) and `back_store` is empty. Draws land directly in the surface the
+    /// compositor reads, [`flush`] owes no copy (the two pointers are EQUAL, so the row copy would
+    /// be UB by `copy_nonoverlapping`'s contract) and none of the panel-global machinery (cursor
+    /// bracket, WC-I subtraction, `wm::service_damage`) — this screen's front is a WINDOW surface,
+    /// not the panel, and presentation is the caller's explicit `wm` present.
+    direct: bool,
 }
 
 impl Screen {
@@ -449,6 +521,21 @@ impl Screen {
         let mut back_store = vec![0u8; len];
         let mut back = FrameBuffer::new();
         back.init(back_store.as_mut_ptr() as usize, len, info);
+        // WC-BBSYNC — adopt the desktop colour the compositor put on the glass, if one was recorded
+        // (see `DESKTOP_BG_SEED` for why the two events cannot be one call). Writes cached RAM
+        // through the back handle, which re-encodes per framebuffer layout exactly as every other
+        // back-buffer fill does; the front framebuffer is neither read nor written here. Unarmed on
+        // every other build, where this is one relaxed load and the zeroed `vec!` stands.
+        let seed = DESKTOP_BG_SEED.load(core::sync::atomic::Ordering::Acquire);
+        if seed != SEED_NONE {
+            back.fill_screen(seed);
+            serial_println!(
+                "[wc-x] backbuffer resync {}x{} (desktop bg {:08X})",
+                info.width,
+                info.height,
+                seed
+            );
+        }
         Self {
             front,
             back_store,
@@ -464,6 +551,47 @@ impl Screen {
             last_flush_rects: 0,
             last_union_w: 0,
             last_union_h: 0,
+            direct: false,
+        }
+    }
+
+    /// SHELLWIN-OOM — build a SINGLE-buffered screen directly over a cached-RAM WINDOW surface.
+    ///
+    /// Why this exists: the GR26 metal panic. `open_shell_window` allocated its ~5 MB surface store
+    /// FALLIBLY and succeeded — then the render service wrapped that surface in `Screen::new`, whose
+    /// `vec![0u8; len]` allocated a SECOND ~5 MB back buffer INFALLIBLY on a heap the STAGE pool had
+    /// already squeezed, and `handle_alloc_error` painted the panel at desktop-ready
+    /// (gr26-bootC, [19555ms], `memory allocation of 5086080 bytes failed` — 14 ms after win=2's
+    /// first present). Double-buffering was pure waste there to begin with: the "front" is cached
+    /// RAM the compositor composites FROM, not the panel, so drawing into it directly loses nothing
+    /// the copy provided. This constructor allocates NOTHING — the OOM point does not move, it
+    /// ceases to exist.
+    ///
+    /// Contract: `front` must be a cached-RAM surface (a `wm` window store), never the panel — every
+    /// draw through this screen writes it immediately, and [`flush`] intentionally skips the
+    /// write-only-VRAM presentation machinery. A composite that interleaves with a partial draw can
+    /// read half-painted glyphs for one frame; the caller's own present after the draw corrects it,
+    /// and the alternative was 2× the surface in heap.
+    pub fn direct(front: FrameBuffer) -> Self {
+        let info = front.info();
+        Self {
+            front,
+            back_store: Vec::new(),
+            // FrameBuffer is Copy: the same base/len/layout as `front`, so `put_pixel`/`fill_rect`
+            // and `read_back_pixel` (CURSOR-SAVE-UNDER) all operate on the one real surface.
+            back: front,
+            info,
+            damage: {
+                let mut ds = DamageSet::empty();
+                ds.set_single(Damage { x0: 0, y0: 0, x1: info.width, y1: info.height });
+                ds
+            },
+            last_flush_bytes: 0,
+            last_flush_bands: 1,
+            last_flush_rects: 0,
+            last_union_w: 0,
+            last_union_h: 0,
+            direct: true,
         }
     }
 
@@ -515,6 +643,32 @@ impl Screen {
 
     pub fn fill_screen(&mut self, color: u32) {
         self.back.fill_screen(color);
+        self.mark_full();
+    }
+
+    /// SHELLNOTDESK — paint the CRISPY DESKTOP SCENE across the whole desktop layer and arm a
+    /// full-panel present.
+    ///
+    /// This is the backdrop the compositor's windows sit on ONCE THE SHELL IS NO LONGER THE DESKTOP.
+    /// Before this arc the desktop layer held the live text shell (`console::Console::draw`'s
+    /// whole-panel `clear_screen` plus its history/prompt glyphs), so the operator's "wallpaper" was
+    /// shell text — *"the shell is still posing as the desktop"*. The render service now calls this
+    /// instead of `console.draw` on the crispy desktop, and the shell's pixels never reach the
+    /// backdrop.
+    ///
+    /// The scene today is the flat [`super::wm::DESKTOP_BG`] fill — the same colour the compositor put
+    /// on the glass at `wcx::activate` and the same one [`adopt_desktop_bg`] seeds a fresh `Screen`
+    /// with, so this agrees with both by construction. It is the SEAM the approved lake scene
+    /// (white-board A1) renders through later: a scene richer than a fill replaces the body of this
+    /// method and every caller keeps working, because the contract is "own the backdrop", not "fill
+    /// one colour". No window layer is touched — `present_background` composites the windows over
+    /// whatever this leaves in the back buffer, exactly as it did over the shell's clear.
+    ///
+    /// `x86_64`-only: the sole caller is `x86_render_service`, which does not exist on aarch64, so the
+    /// arm build never sees this method and stays byte-identical.
+    #[cfg(target_arch = "x86_64")]
+    pub fn paint_desktop_scene(&mut self) {
+        self.back.fill_screen(super::wm::DESKTOP_BG);
         self.mark_full();
     }
 
@@ -709,6 +863,21 @@ impl Screen {
     /// `TOUCHED_SINCE_DRAW` is untouched: a present landing under a live sprite still arms the
     /// repair through `note_present_over_sprite`, and it now has a live sprite to arm it for.
     pub fn flush(&mut self) {
+        // SHELLWIN-OOM — single-buffer mode: every draw already landed in the one real surface, so
+        // there is no back→front copy to perform (the pointers are equal — the row copy would be UB)
+        // and no panel present to bracket: this front is a WINDOW surface the compositor reads on
+        // the caller's explicit `wm` present, so the cursor bracket and the window-layer repair
+        // below belong to the PANEL screen, not to this one. Damage still clears so the accounting
+        // witnesses stay truthful (nothing was flushed).
+        if self.direct {
+            self.damage.clear();
+            self.last_flush_bytes = 0;
+            self.last_flush_bands = 1;
+            self.last_flush_rects = 0;
+            self.last_union_w = 0;
+            self.last_union_h = 0;
+            return;
+        }
         // FLICKER-3 — the CURSOR-13 bracket is owed only when this present can actually REACH the
         // sprite. It used to be unconditional: every desktop present — chiefly the status strip's
         // per-core load bars, a one-line band at the panel bottom repainting about once a second —
@@ -820,9 +989,125 @@ impl Screen {
         // this frame is subtracted against the same layout (a window that moves mid-present is
         // repainted by the mover's own composite either way). Empty on a windowless desktop, which is
         // every full-screen VUG frame and every gate boot before the window fixtures run.
-        let mut occ = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
-        let nocc = super::wm::occluders(&mut occ);
+        //
+        // SHELLDESK — **and the FURNITURE STRIPS, for the same reason and by the same rule.**
+        //
+        // WC-I subtracted the window layer because the desktop is beneath it. Furniture (the menu
+        // bar, the dock — `video::strip`'s tenants) is beneath NEITHER: `wm::composite_once` paints
+        // it after every window, and `wm::occ_clip` already withholds a window's own pixels where a
+        // strip stands, so on the window side furniture is a first-class occluder. The desktop side
+        // was the one writer in the system that still ignored it, and that is exactly the metal
+        // symptom this arc exists for: the shell owns the desktop layer and `console::draw` opens
+        // with a WHOLE-PANEL `clear_screen`, so every command the operator ran flushed the shell's
+        // background straight over the bar's 34 rows — and nothing repainted them, because
+        // `strip::compose_all` runs from a COMPOSITE and a desktop present is not one
+        // (`service_damage` returns without compositing when no window row is dirty). The bar was
+        // therefore erased within one frame of appearing, on a boot where every other witness read
+        // healthy. The dock was being erased by the same writes.
+        //
+        // Subtracting is the fix WC-I already argued for, not a new mechanism: the strip's pixels
+        // stop being desktop pixels for any interval, however short, so nothing has to notice the
+        // damage and repaint. A strip that goes ABSENT publishes no rect (`strip_rect` answers
+        // `None` the moment it is disabled), so its rows return to the desktop on the very next
+        // present, and its own dismissal erase (`strip::erase_rect`) is what clears the glass.
+        //
+        // The rect comes from `strip::rects` — the SAME registry walk `wm::erase_clip` and
+        // `wm::occ_clip` read, so the desktop, the erase and the window blit all answer "where is
+        // that strip" from one accessor and cannot drift. It is not free: the dock's hook counts its
+        // tiles through `wm::dock_scan`, i.e. one more bounded `MAX_WINDOWS` scan under the table
+        // lock, on a path that already takes it once for `occluders` — sequentially, never nested,
+        // and at desktop cadence (~20 Hz) against a present that is about to copy megabytes.
+        //
+        // Residual, stated: the geometry answers "the strip owns these rows" from the instant it is
+        // enabled, which can be one composite before the strip has actually PAINTED them, so a
+        // freshly enabled bar withholds its rows from the desktop for that interval. The alternative —
+        // subtracting only what the strip last painted — would have made the desktop and the window
+        // layer disagree about the strip's extent, which is the drift this registry exists to prevent.
+        //
+        // SHELLDESK REVIEW — the interval is bounded because the ENABLER COMPOSITES, and that had to
+        // be made true rather than assumed. The original note here claimed the enable at
+        // `wcx::activate` was "immediately followed by the console window's own `create`, which
+        // composites"; the order is the reverse — `panel_console_window_open` runs ABOVE the enable —
+        // and the row it mints is fbcon's frozen boot-log snapshot, which never damages again. With
+        // `wm::service_damage` declining to composite while no row is dirty, nothing was guaranteed to
+        // paint the withheld rows on a boot with no desktop app and no mouse. `wcx::activate` now
+        // composites at the enable seam, which is the bound this paragraph asserts.
+        //
+        // x86 + `wc` only — `video::strip` is not compiled on aarch64, where this is the WC-I array
+        // and the WC-I loop, byte for byte.
+        let mut occ = [(0usize, 0usize, 0usize, 0usize); DESK_OCC_MAX];
+        // SHELLDESK REVIEW — **and aarch64 REALLY IS the WC-I loop, which took a second arm to make
+        // true.** The single-arm version staged `occluders` into its own `wins` array and
+        // `copy_from_slice`'d it into `occ`, because `occluders` takes `&mut [_; MAX_WINDOWS]` and
+        // `occ` is `DESK_OCC_MAX` wide. On x86 that staging buys the furniture tail its room. On
+        // aarch64 `DESK_STRIP_MAX` is `0`, so `DESK_OCC_MAX == MAX_WINDOWS` and the two arrays are the
+        // SAME TYPE — the copy was pure overhead on a path the arm-pi bench build runs for every
+        // full-screen VUG present, and the doc above promised "the WC-I array and the WC-I loop, byte
+        // for byte". Measured: +212 bytes of aarch64 `.text` against the base, with `.data`/`.bss`
+        // unchanged and `Console::page_rows` identical at 0x78 — i.e. the whole delta was here.
+        // Written as two cfg arms, so the platform with no furniture fills `occ` in place exactly as
+        // it always did and the promise is kept by construction rather than by assertion.
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        let (nocc, nwin) = {
+            // `occluders` writes exactly `MAX_WINDOWS` slots; the furniture tail is appended after.
+            let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
+            let nw = super::wm::occluders(&mut wins);
+            occ[..nw].copy_from_slice(&wins[..nw]);
+            let mut n = nw;
+            let mut strips = [None; super::strip::STRIP_MAX];
+            let _ = super::strip::rects(self.info.width, self.info.height, &mut strips);
+            for s in strips.iter().flatten() {
+                if s.2 != 0 && s.3 != 0 && n < occ.len() {
+                    occ[n] = *s;
+                    n += 1;
+                }
+            }
+            // MENUFIT — the TRANSIENT, on exactly the strips' terms. The open SHARD menu hangs from
+            // the bar into the middle of the desktop layer, which is the region the shell's
+            // whole-panel `clear_screen` flushes on every repaint; SHELLDESK made the menu reachable
+            // on every boot for the first time, so what had been a latent exposure became the
+            // ordinary path. It is subtracted here and NOT re-derived here: `crystal::open_rect` is
+            // the menu's own accessor, answering `None` the moment the menu closes, so its rows
+            // return to the desktop on the very next present and the dropdown's own dismissal erase
+            // (`strip::erase_rect`, from `crystal::compose`) is what clears the glass — the same
+            // vacate contract the strips keep, obtained from the same kind of accessor.
+            if let Some(m) = super::crystal::open_rect(self.info.width, self.info.height) {
+                if m.2 != 0 && m.3 != 0 && n < occ.len() {
+                    occ[n] = m;
+                    n += 1;
+                }
+            }
+            (n, nw)
+        };
+        #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+        let (nocc, nwin) = {
+            // `DESK_OCC_MAX == wm::MAX_WINDOWS` here (no strip registry is compiled), so this is the
+            // WC-I call on the WC-I array, unchanged.
+            let n = super::wm::occluders(&mut occ);
+            (n, n)
+        };
         let occ = &occ[..nocc];
+        // SHELLDESK REVIEW — **the WINDOW PREFIX, and it is a separate slice on purpose.**
+        //
+        // `occ` is now windows-then-furniture, but WC-I's two witness calls below are about the WINDOW
+        // TABLE and nothing else: [`super::wm::occluders_aged`] re-reads `wm::occluders` — windows
+        // only, at most `MAX_WINDOWS` — and declares the snapshot STALE when the two disagree in
+        // length or content. Handed the widened slice it would compare `nwin + nstrips` against
+        // `nwin` and answer "stale" on **every** desktop present of every boot with a strip on the
+        // glass, which after this arc is every operator boot: `[wc-i] rollup … stale=` would saturate
+        // at the present count and the reading its own docs give it ("the layout moved under N
+        // presents") would be false N times out of N. The same slice decides `windowed`, so a
+        // windowless desktop with only a menu bar up would report `windowed_flushes>0` and flip the
+        // verdict from the honest `UNWITNESSED` to a vacuous `CLEAN`.
+        //
+        // Furniture cannot participate in that question even in principle — a strip is not a window
+        // table row, it cannot "enter" under the copy the way a `create` can, and its rect is
+        // published by an accessor the desktop and the clip both read. So the SUBTRACTION takes the
+        // whole set (that is this arc's fix) and the STALENESS PROBE takes the window prefix (that is
+        // WC-I's, unchanged). Two questions, two slices, one array.
+        // Read by the `witness` probes alone; a shipped build computes the slice and drops it.
+        #[cfg_attr(not(feature = "witness"), allow(unused_variables))]
+        let occ_win = &occ[..nwin];
         // VUG-FPS-2 witness: the merged rect count and the union bbox of all damage this frame. The
         // rects array still holds the pre-clear data (clear() only zeroed len), so read [0..n].
         {
@@ -851,7 +1136,9 @@ impl Screen {
         // handled the flush (>= 2 bands); false to fall through to the byte-identical serial path
         // (no free AP, or too little work to amortize the spawn/join).
         //
-        // WC-I: only when the window layer is EMPTY. The band workers copy whole clipped rects and
+        // WC-I: only when the occluder set is EMPTY — no window, and (SHELLDESK) no furniture strip
+        // either, since a strip is subtracted by the same walk and for the same reason. The band
+        // workers copy whole clipped rects and
         // know nothing about occluders; teaching them the subtraction would put the span walk on
         // three cores for no benefit, because the case that needs the subtraction (several windowed
         // apps on the panel) is also the case where the desktop's own damage is small — a status
@@ -894,6 +1181,34 @@ impl Screen {
                 if banded {
                     super::cursor::note_desktop_over_sprite();
                 }
+                // WC-I — this exit owes the intrusion probe too, and it is the exit that needs it
+                // MOST. The band workers perform no subtraction at all; the whole path is justified
+                // by `occ.is_empty()`, and `occ` is a snapshot. A window created between that read
+                // and the bands' writes gets whole clipped rects copied over it, with nothing
+                // subtracted and nothing counted. The bbox here is therefore the clipped damage
+                // itself, which IS what landed on the panel on this leg.
+                #[cfg(feature = "witness")]
+                {
+                    let mut bbox: Option<(usize, usize, usize, usize)> = None;
+                    for idx in 0..n {
+                        let d = self.damage.rects[idx];
+                        let x1 = d.x1.min(self.info.width);
+                        let y1 = d.y1.min(self.info.height);
+                        if d.x0 >= x1 || d.y0 >= y1 {
+                            continue;
+                        }
+                        bbox = Some(match bbox {
+                            None => (d.x0, d.y0, x1, y1),
+                            Some((a, b, c, e)) => (a.min(d.x0), b.min(d.y0), c.max(x1), e.max(y1)),
+                        });
+                    }
+                    // SHELLDESK REVIEW — the WINDOW PREFIX. `occ` gates this whole path and must stay
+                    // the full set (the bands subtract nothing, so a furniture strip disqualifies
+                    // them exactly as a window does); the probe is a window-table question. See
+                    // `occ_win`'s note above.
+                    let (stale, intruded) = super::wm::occluders_aged(occ_win, bbox);
+                    super::wm::note_desktop_flush(!occ_win.is_empty(), stale, intruded);
+                }
                 return false;
             }
         }
@@ -914,6 +1229,23 @@ impl Screen {
         let sprite_box = super::cursor::live_box_relaxed();
         #[cfg(feature = "witness")]
         let mut over_sprite = false;
+        // WC-I — the union of the spans this present ACTUALLY copies to glass, accumulated as they
+        // are copied. Not the damage set and not the clipped rects: the subtraction is why those
+        // three differ, and the only rectangle that can convict the desktop of writing into a window
+        // is the one describing what reached the panel. Four comparisons per span, witness builds
+        // only. Consumed by `wm::occluders_aged` after the loop.
+        #[cfg(feature = "witness")]
+        let mut blit_bbox: Option<(usize, usize, usize, usize)> = None;
+        // WCD-TEARDOWN — bracket the loop that actually copies background spans to glass, for
+        // `[wc-d]`'s panel-write interlock. The bracket is HERE, around the writes, and not around
+        // this function's `intruded` return value: that value has three exits and all three are
+        // `false` (there has been no `true` exit since WC-I made the subtraction exact), so a counter
+        // built on it could never leave zero — and it would have been the wrong question anyway,
+        // since the case that motivated it paints a VACATED box, where the subtraction succeeds
+        // against the current table. See `wm::PANEL_DESK_EPOCH` for the full ledger, including why
+        // `[wc-d]` prints this term rather than aborting on it.
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        let _desk = super::wm::DeskWriteGuard::enter();
         for idx in 0..n {
             let d = self.damage.rects[idx];
             let x1 = d.x1.min(self.info.width);
@@ -941,6 +1273,18 @@ impl Screen {
                         if off + seg <= self.back_store.len() {
                             self.front.blit(off, &self.back_store[off..off + seg]);
                             flushed += seg as u64;
+                            // WC-I — this span reached glass; fold it into the present's union.
+                            // Inside the length guard, so a span the bounds check rejected is not
+                            // claimed as a write.
+                            #[cfg(feature = "witness")]
+                            {
+                                blit_bbox = Some(match blit_bbox {
+                                    None => (xs, y, gap_end, y + 1),
+                                    Some((a, b, c, e)) => {
+                                        (a.min(xs), b.min(y), c.max(gap_end), e.max(y + 1))
+                                    }
+                                });
+                            }
                         }
                         // CURSOR-6 — did this surviving span land on the sprite? Latched, not
                         // counted per span: the unit that means something is "one desktop present
@@ -973,12 +1317,44 @@ impl Screen {
         if over_sprite {
             super::cursor::note_desktop_over_sprite();
         }
+        // WC-I — the intrusion probe, and the argument for why it is shaped the way it is.
+        //
+        // This call passed a LITERAL `false` from WC-I (`b72e55f4`) until now, which made
+        // `[wc-i] intrusions=` a structural zero for two weeks of captures: an instrument that could
+        // not fire, printing a constant a reader could mistake for evidence. WCD-TEARDOWN
+        // (`6f1225b9`) found the same rot from the other side and declined to build `[wc-d]`'s
+        // stability term on this function's return value, but left the counter standing.
+        //
+        // The literal was honest about one thing: the predicate it replaced IS a tautology. Every
+        // span the loop above copied was tested against `occ` before it was copied, so "did I write
+        // into a box I subtracted" cannot be true, and all three of this function's exits return
+        // `false` in consequence.
+        //
+        // What is NOT a tautology is the snapshot. `occ` was read once, at the top, and the window
+        // table is mutated from other cores for the whole length of this loop — a vug opening, a
+        // drag, a raise. A box that entered after the read was never subtracted from anything, so
+        // spans that landed on it are exactly the WC-I defect, arriving by race rather than by
+        // design. `occluders_aged` re-reads the table and asks that question against `blit_bbox`,
+        // the union of what actually reached glass.
+        //
+        // Two properties this deliberately keeps:
+        //  * **It changes no pixel.** The return value below stays `false` on every exit and the
+        //    probe feeds only the counter. The repair for this race is, as WC-I argued when it took
+        //    the snapshot, the mutator's own composite — a window that moved repaints itself. Wiring
+        //    the detection to `wm::repaint()` would make a witness build composite differently from
+        //    a shipped one, which is how instruments start lying in the other direction.
+        //  * **It does not restate `desk=`.** `PANEL_DESK_EPOCH` brackets this loop unconditionally
+        //    and without geometry, to date a scan-out read-back. This counts the subset whose layout
+        //    moved underneath and whose writes followed it there.
         #[cfg(feature = "witness")]
-        super::wm::note_desktop_flush(!occ.is_empty(), false);
-        // WC-I — the subtraction is exact: every span this loop copied was tested against the window
-        // layer, so no background pixel landed inside a window. Nothing is owed to WC-E's restore.
-        // (The `true` branch is kept live by the parallel path above, which returns its own `false`
-        // only because it runs exclusively when there are no occluders at all.)
+        {
+            // SHELLDESK REVIEW — the WINDOW PREFIX, not the furniture-widened set. See `occ_win`.
+            let (stale, intruded) = super::wm::occluders_aged(occ_win, blit_bbox);
+            super::wm::note_desktop_flush(!occ_win.is_empty(), stale, intruded);
+        }
+        // Nothing is owed to WC-E's restore. (The previous note here claimed the `true` branch was
+        // "kept live by the parallel path above" — that path returns `false` and, until this change,
+        // called nothing at all. There is no `true` exit and there has not been one since WC-I.)
         false
     }
 

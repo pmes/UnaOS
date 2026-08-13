@@ -40,6 +40,17 @@ pub unsafe fn takeover_display(
 ) -> Option<usize> {
     serial_println!(":: kdisp: begin-trace ::");
 
+    // Note: Five early return paths exist in this function. If an early return
+    // fires, the inner phase sum will not match the outer kdisp_takeover delta.
+    let mut t_last = crate::arch::ms();
+    macro_rules! kdisp_phase {
+        ($name:expr) => {
+            let t_now = crate::arch::ms();
+            serial_println!(":: kdisp: inner phase={} d={} ::", $name, t_now.wrapping_sub(t_last));
+            t_last = t_now;
+        }
+    }
+
     // ── PDISPLAY CAPS (0x610000) — version/class sanity check ──────────
     let caps = mmio_read(bar0, regs::NV_PDISPLAY_BASE + 0x0000);
     let version = caps & 0xFFFF;
@@ -195,6 +206,7 @@ pub unsafe fn takeover_display(
             for _ in 0..2_000_000 { core::hint::spin_loop(); }
         }
     }
+    kdisp_phase!("evo_core_passes");
 
     // Milestone 2: Known-value scan
     let mut hits = 0;
@@ -223,6 +235,7 @@ pub unsafe fn takeover_display(
     }
     let capped = if hits > 64 { "true" } else { "false" };
     serial_println!(":: kdisp: evo-scan done range=610000-613FFC hits={} capped={} ::", hits, capped);
+    kdisp_phase!("evo_scan");
 
     // ── Phase 2: Assembly Write + UPDATE Latch (Pull 11) ────────────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
@@ -324,6 +337,9 @@ pub unsafe fn takeover_display(
     let total_bytes = expected_height * pitch_bytes;
 
     // Step 1: Prepare surf2 (linear fill, placement-model probe)
+
+    kdisp_phase!("pre_blit_recon");
+
     for y in 0..expected_height {
         let band_idx = y / 16;
         // Band 0 gets a colour no other band uses, so "our row 0" is
@@ -380,6 +396,8 @@ pub unsafe fn takeover_display(
             core::ptr::write_volatile(target_ptr, final_color);
         }
     }
+    kdisp_phase!("blit");
+
     serial_println!(":: kdisp: fb-draw base={:08X} pitch={} rows={} bytes={:08X} ::", gop_vram_offset, pitch_bytes, expected_height, total_bytes);
 
     // Overlap check (intentional for fb-draw)
@@ -393,33 +411,45 @@ pub unsafe fn takeover_display(
         if surf2_bytes == gop_bytes { "exact" } else { "SIZE-MISMATCH" },
         gop_vram_offset, total_bytes, gop_vram_offset, gop_bytes);
 
-    // 5 s hold (standing length — Peter's camera calibration, s21)
-    serial_println!(":: kdisp: fb-draw hold begin (photo A — full panel calibration) ::");
-    for t in 1..=5 {
-        for _ in 0..60_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: fb-draw hold t={}s ::", t);
-        // Dump on the FIRST and LAST tick
-        if t == 1 || t == 5 {
-            serial_println!(":: kdisp: fb-draw reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
-                t,
-                mmio_read(bar0, 0x640460),
-                mmio_read(bar0, 0x640464),
-                mmio_read(bar0, 0x640468),
-                mmio_read(bar0, 0x64046C),
-                mmio_read(bar0, 0x640470));
-            serial_println!(":: kdisp: fb-draw reg-dump t={} armed={:08X} shadow={:08X} ::",
-                t, mmio_read(bar0, armed_reg), mmio_read(bar0, shadow_reg));
-            for off in (0x4B8..=0x4C8).step_by(4) {
-                serial_println!(":: kdisp: fb-draw reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
-            }
-            // Which head is actually live: the one whose vline/vblank advances.
-            for h in 0..4usize {
-                let vert = mmio_read(bar0, 0x610000 + 0x6000 + h * 0x800 + 0x340);
-                serial_println!(":: kdisp: fb-draw head-stat t={} h={} vert={:08X} ::", t, h, vert);
+    // 1.12 s hold (standing length — Peter's camera calibration, s21)
+    // Predictions with hold off: kepler=1521 -> ~400 ms, gui=3408 -> ~2290 ms — which would be the largest single boot win left on the machine.
+    #[cfg(feature = "nvidia-kepler-kdisp-hold")]
+    {
+        serial_println!(":: kdisp: fb-draw hold begin (photo A — full panel calibration) ::");
+        for t in 1..=5 {
+            for _ in 0..60_000_000 { core::hint::spin_loop(); }
+            serial_println!(":: kdisp: fb-draw hold t={}/5 (1.12s total) ::", t);
+            // Dump on the FIRST and LAST tick
+            if t == 1 || t == 5 {
+                serial_println!(":: kdisp: fb-draw reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
+                    t,
+                    mmio_read(bar0, 0x640460),
+                    mmio_read(bar0, 0x640464),
+                    mmio_read(bar0, 0x640468),
+                    mmio_read(bar0, 0x64046C),
+                    mmio_read(bar0, 0x640470));
+                serial_println!(":: kdisp: fb-draw reg-dump t={} armed={:08X} shadow={:08X} ::",
+                    t, mmio_read(bar0, armed_reg), mmio_read(bar0, shadow_reg));
+                for off in (0x4B8..=0x4C8).step_by(4) {
+                    serial_println!(":: kdisp: fb-draw reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
+                }
+                // Which head is actually live: the one whose vline/vblank advances.
+                for h in 0..4usize {
+                    let vert = mmio_read(bar0, 0x610000 + 0x6000 + h * 0x800 + 0x340);
+                    serial_println!(":: kdisp: fb-draw head-stat t={} h={} vert={:08X} ::", t, h, vert);
+                }
             }
         }
+        serial_println!(":: kdisp: fb-draw hold end ::");
     }
-    serial_println!(":: kdisp: fb-draw hold end ::");
+
+    #[cfg(feature = "nvidia-kepler-kdisp-hold")]
+    let hold_state = "ON";
+    #[cfg(not(feature = "nvidia-kepler-kdisp-hold"))]
+    let hold_state = "OFF";
+
+    kdisp_phase!("nvidia_kepler_kdisp_hold");
+    serial_println!(":: kdisp: inner phase kdisp_hold cfg_hold={} ::", hold_state);
 
     // Pull 20: Draw console-like glyph blocks using the true 16384 pitch
     for y in 64..72 {
@@ -435,6 +465,7 @@ pub unsafe fn takeover_display(
     serial_println!(":: kdisp: fbcon-probe drawn rows=8 ::");
 
     serial_println!(":: kdisp: fb-draw done ::");
+    kdisp_phase!("glyph_draw");
 
     // CONSOLE-ON-PANEL seam. The calibration pattern above has been drawn, held for its 5 s photo
     // window and probed; the surface is now free. Hand it to the kernel console: fbcon clears the
@@ -443,6 +474,7 @@ pub unsafe fn takeover_display(
     // this line — the draw, the hold, the register dumps — is untouched.
     let repainted = crate::video::fbcon::panel_console_resume();
     serial_println!(":: kdisp: console-repaint rows={} ::", repainted);
+    kdisp_phase!("panel_console_resume");
 
     // WC-X86 seam. Strictly AFTER the console resume above, and for the same reason the console
     // resume is strictly after the calibration draw: this is the first line at which the panel is
@@ -453,6 +485,15 @@ pub unsafe fn takeover_display(
     #[cfg(feature = "wc")]
     crate::video::wcx::activate();
 
+    #[cfg(feature = "wc")]
+    let wcx_state = "ON";
+    #[cfg(not(feature = "wc"))]
+    let wcx_state = "OFF";
+
+    kdisp_phase!("wcx_activate");
+    serial_println!(":: kdisp: inner phase wcx_activate cfg_wc={} ::", wcx_state);
+
+    let _ = t_last;
     // Completed fb-draw cycle: return the gop pointer so the late recap
     // (kepler.rs, printed inside the FTDI-ring window) can prove this leg ran.
     Some(gop_vram_offset)

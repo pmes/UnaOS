@@ -8,7 +8,10 @@
 #   ./arroyo arm           Build & boot aarch64
 #   ./arroyo test [secs]   Headless x86_64 run; serial captured to target/serial.log
 #   ./arroyo test-arm [s]  Headless aarch64 run; serial -> target/serial-arm.log
-#   ./arroyo check         Quick syntax check (both targets)
+#   ./arroyo check         Syntax check: kernel (both targets, default + cfg-gated feature legs,
+#                          including the x86 pairwise-mix legs — see GATE-CFG-MIX below)
+#                          + the ring-3 user-* crates
+#                          UNAOS_CFG_SWEEP=1 adds the per-feature x86 sweep (+78 legs, ~220 s)
 #   ./arroyo build         Build both targets (no QEMU)
 #   ./arroyo clean         Purge all build artifacts
 
@@ -93,11 +96,38 @@ _feats=""
 # ZERO `uvug7` strings and the witness cannot fire. Every boot now states its own witness build state on
 # the `:: AARCH64 build: witness=... ::` line, so absence is never mistaken for failure again.
 [ -n "${UNAOS_WITNESS:-}" ] && _feats="${_feats}witness,"
+# WXN-x86 M3b: UNAOS_WXNRO=1 arms the `wxnro` feature — the W-clear on the kernel's executable pages
+# (x86_64 only). OFF is not "the stage absent": `memory::wxn_ro_stage` runs either way and prints its
+# read-only census (`:: WXN-M3B-PRE: ... -> CENSUS ::`) plus a `would=`/`-> DRYRUN` result line; ON
+# turns that `would=` into `cleared=` and the kernel's `.text` read-only under the CR0.WP M3a armed.
+# Default OFF, so every existing build path (`test`, `x86`, `esp-x86`, the media builds) keeps today's
+# writable-.text map and gains two measuring lines. MUST be wired in builder/src/main.rs too — the x86
+# ESP carries the BUILDER's kernel, not this one. Pair it with nothing; it needs no other knob.
+[ -n "${UNAOS_WXNRO:-}" ] && _feats="${_feats}wxnro,"
+# SELFHOST-2: UNAOS_SELFHOST=1 arms the `selfhost` feature — the on-shard source verify + tar walk
+# (`crate::selfhost`: mount the program-source volume, sha256 SRC.TGZ against SRC.SHA, gunzip and
+# enumerate the tar). Rung 2 of the self-hosting line begun by SOURCE-ALONG. Read-only; it never
+# writes to media. Arch-neutral module, x86_64-only call site this arc. Default OFF => module and call
+# site vanish, image byte-identical. MUST be wired in builder/src/main.rs too — the x86 lanes boot the
+# BUILDER's kernel, not this one. Driven end to end by `./arroyo test-selfhost`.
+[ -n "${UNAOS_SELFHOST:-}" ] && _feats="${_feats}selfhost,"
+# WC-G/M3 (PAYGO): UNAOS_WCG_PAYGO=1 arms the `wcg-paygo` feature — the pay-as-you-go reshape of the
+# `[wc-g]` glass battery (x86_64 only). Pass 1 becomes lattice-sampled and says so on the wire
+# (`coverage=lattice16`); passes 2..4 keep FULL coverage but wait for 15 s of uptime, so the ~11.5 s
+# the battery used to take out of the boot is paid on a live desktop instead. Only the read-back is
+# reshaped: the four checksum legs run in full on every sampled pass and every FORBID stays armed for
+# the whole boot. Needs UNAOS_WITNESS to reach anything — `video/wcg.rs` is `witness`-gated — and
+# means nothing on aarch64. DEFAULT OFF => every `[wc-g]` line is byte-identical to the pre-M3 wire.
+# Kept in sync with builder/src/main.rs, which re-derives the x86 feature list from env and maps this
+# same variable (`UNAOS_WCG_PAYGO` -> `wcg-paygo`) — so the knob reaches the ESP a metal boot runs and
+# not only `check`. A knob wired into arroyo alone never reaches the boot media.
+[ -n "${UNAOS_WCG_PAYGO:-}" ] && _feats="${_feats}wcg-paygo,"
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
 # CLOCK-2: UNAOS_LOGTS=1 arms the `logts` feature — a compact timestamp prefix on each serial LINE
-# (monotonic ms → UTC after a civil anchor). UART byte-stream only; default OFF => serial byte-
-# identical (witness/mbench specs parse serial lines). Kept in sync with builder/src/main.rs.
+# (monotonic ms → UTC after a civil anchor). CLOCK-2b: the prefix covers the UART and both capture
+# transports (FTDI capture ring, UNAOS.LOG); default OFF => serial byte-identical (witness/mbench
+# specs parse serial lines). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_LOGTS:-}" ] && _feats="${_feats}logts,"
 # WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` breadcrumbs along the
 # TAB->focus-raise chain, written BEFORE each phase so a core that dies IRQ-masked mid-phase still
@@ -124,6 +154,10 @@ _feats=""
 # path: REQUEST SENSE (sense rewritten to UNIT ATTENTION) + the single sense-driven retry.
 # Both fire exactly once. Test-only; never on boot media.
 [ -n "${UNAOS_BOTFAULT:-}" ] && _feats="${_feats}botfaultinject,"
+# PFWIRE: force a fatal CPL-0 #PF from arch::init to prove the fault handlers drain diagnostics to the
+# wire (review §5/C2). BRICKS THE BOOT by design — test-only, never on media. Wired in builder/src/main.rs
+# too: this witness is exercised by the QEMU `test` path, whose kernel the builder re-derives from env.
+[ -n "${UNAOS_PFWIRE_SELFTEST:-}" ] && _feats="${_feats}pfwire_selftest,"
 # ONSET-2 (M3): UNAOS_BOTRING64=1 grows the storage slot's two BULK transfer rings 16 -> 64 TRBs
 # (wrap frequency and wrap positions change; nothing else does). Default-off so a normal boot is
 # byte-identical. It is a DIAGNOSTIC, not a fix — the metal evidence never convicted ring length —
@@ -179,6 +213,169 @@ _feats=""
 # the protocol machinery is gated by a known-key read; battery keys are metal-first. Default OFF =>
 # module + call sites unlinked, media byte-identical. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_SMC:-}" ] && _feats="${_feats}smc,"
+# WALK-QUIET (GR18): UNAOS_SMCWALK=1 restores the #KEY index walk's PER-NAME output. The walk always
+# runs under UNAOS_SMC and always prints its one-line summary (the GAP-1 sibling fix's per-boot
+# regression witness); this knob buys back the 493-line inventory dump, which Boot V measured at
+# ~3.5 s of displaced storage bring-up (SPACE ftdi= 177ms -> 1519ms) through the FTDI console drain.
+# Does NOT imply smc — without it the module is unlinked and this feature is inert. Default OFF.
+# Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_SMCWALK:-}" ] && _feats="${_feats}smcwalk,"
+# SDHC-4a: UNAOS_SDW=1 arms the WRITE path on the 2012 rMBP's BUILT-IN PCIe SD reader
+# (drivers/sdhc.rs) — one primitive, `write_block_512`, a polled single-block CMD24 mirroring the
+# metal-proven `drivers::emmc2` ladder. Milestones 1-3 wrote only the CONTROLLER; this is the first
+# build of this kernel in which a byte can reach the CARD, and `write_block_512` is `#[cfg]`-gated so
+# a default image contains no CMD24 command word at all. The boot self-test writes ONE sector it has
+# PROVEN is empty (five refusals: wp-switch / csd-perm-wp / csd-tmp-wp / gpt / inside-partition-N /
+# nonblank), verifies it, restores the original and verifies the restore. DISARMED it still runs the
+# read-only half and prints `:: sdhc: w1 armed=0 ... -> DRYRUN ::` naming the LBA it would have
+# written — so the question "would arming this build write, and where" is answered by a boot that
+# writes nothing. x86_64 only; aarch64 media byte-identical. Default OFF.
+# Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
+# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_SDW:-}" ] && _feats="${_feats}sdw,"
+# SDHC-4b (GR20): UNAOS_SDHCBLK=1 makes the INTERNAL SD card a real x86 BLOCK BACKEND, so `fs::fat` can
+# mount it. Boot AC identified the card and Boot AD wrote to it, but `drivers/block.rs` had two backends
+# and every SD arm in it is aarch64+baremetal (the Pi's EMMC2), so on x86 `read_block` has always meant
+# the USB stick. The card is published under a THIRD registry handle (`BlockHandle::Sdhc`), NOT as a new
+# backend-selector value: this machine BOOTS from a USB card reader, so the stick is `BLOCK_DEVICE`, and
+# a selector flip would re-point the flight recorder, `fat::probe_once`, the shell, unafs and the
+# installer at a different disk — and would lose the race anyway, since `publish_usb_geometry` claims the
+# global unconditionally on x86 and runs later. `read_block`/`write_block` gain not one statement.
+# READ-ONLY at the FAT layer, unconditionally: `flight_recorder.rs` §SINGLE FAT WRITER documents, with
+# A/B evidence, that a SECOND unsynchronised FAT/directory mutator on x86 (where `with_fat_lock` /
+# `with_dir_lock` are inert) cross-links chains and steals delete-witness snapshots, so a second
+# mountable volume must not become one — `write_sector`/`write_sectors` refuse a `Sdhc` source with a
+# one-shot witness. The witness is `:: SDHCBLK: FAT mounted READ-ONLY … ::` (or an honest `no FAT volume
+# … (NotFat)`), preceded by a `:: PART: mbr-raw handle=sdhc … ::` census of the card's own LBA 0.
+# Default OFF => the handle/source enum variants do not exist and no entry point is compiled; measured
+# knob-off against 3d4ba446 in one worktree, the x86 kernel's `.text` and `.rodata` are BYTE-IDENTICAL
+# and only 32 bytes of `.data.rel.ro` move — `core::panic::Location` line numbers in `fs/fat.rs`, shifted
+# by the 68 lines of comment and cfg'd code this arc inserted above them.
+# x86_64 only; aarch64 media byte-identical whichever way it points (stripped by arm_features below).
+# BOOT-STORAGE (GR26): DEFAULT-ON now, opted out with UNAOS_NOSDHCBLK=1. The "Default OFF" above was a
+# GR20 decision resting on a premise that has since expired: "this machine BOOTS from a USB card
+# reader, so the stick is BLOCK_DEVICE". The bench rMBP now boots from a SINGLE SD card in its
+# INTERNAL slot, which makes that reader the ONLY program source on the machine — and with the knob
+# off there is no handle for it, so the default x86 image cannot reach its own boot volume. GR26
+# Boot D is the conviction: `[sdhc] … CARD IDENTIFIED`, three ADMA/PIO windows matched, MBR p0
+# type=0x0b verified — and then `handles=global=absent sdhc=unbuilt` at every consumer, `bg /fat/VUG.ELF`
+# with nothing to open. Default-on costs a third handle and no global-slot change.
+# REVIEW CORRECTION (GR26): "READ-ONLY at the FAT layer, unconditionally" above is GR20's property and
+# SDHC-4c SUPERSEDED it — `write_sector`/`write_sectors` now admit a span inside the reserved extent
+# (fs/sdhc4c.rs). What keeps a DEFAULT image read-only on the card is the absence of `sdw` (still
+# opt-in, unchanged by this flip): no `sdw` => no CMD24 ladder in the image, so `write_block_sdhc` is
+# the refusing stub and `sdhc4c_write_verify` is the SKIP stub. Note the widened meaning of the OTHER
+# knob: UNAOS_SDW=1 alone now also arms `sdhcblk`, so an `sdw` build reaches the SDHC-4c reserve pass
+# on the internal card without a second knob, which before this flip it did not.
+# UNAOS_SDHCBLK=1 is still accepted and still means "on", so existing playbooks keep working.
+# Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
+# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -z "${UNAOS_NOSDHCBLK:-}" ] && _feats="${_feats}sdhcblk,"
+# PCI-CENSUS (GR20): UNAOS_PCICENSUS=1 arms the complete READ-ONLY PCI enumeration witness
+# (arch/x86_64/pci.rs::full_census) — one `[PCI-CENSUS]` line per function present on the machine,
+# plus a capability dump for every network-class function. Every other PCI walk in this kernel is
+# TARGETED (xHCI class triple, storage classes 0x01/0x08, display class 0x03, and a
+# `find_device(0x02, 0x00)` that returns the FIRST Ethernet-subclass function and stops), so until
+# this knob existed no capture enumerated the machine at all — which is why the question "what WiFi
+# part is in the 2012 rMBP" could not be answered from our own kernel. Config-space READS only: no
+# `write_config_*` anywhere in the block and no BAR sizing (that needs a write/restore dance on a
+# live decode window), so BARs are printed exactly as firmware assigned them. Bounded: the same
+# 256x32 MF-gated sweep the existing passes run, with a 128-line print cap that self-reports
+# `truncated=1`. Runs BEFORE the GPACE anchor, so the GPACE tiling is untouched and the census
+# reports its own `elapsed=`. x86_64 only; stripped from aarch64 builds by `arm_features` below.
+# Default OFF => function + call site unlinked, media byte-identical.
+# Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
+# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_PCICENSUS:-}" ] && _feats="${_feats}pcicensus,"
+# BCMA-RECON (GR20): UNAOS_BCMARECON=1 arms drivers/bcma.rs — STRICTLY READ-ONLY reconnaissance of
+# the Broadcom WiFi radio, the first arc of the native-BCM4331 path. It looks for PCI class 0x02
+# SUBCLASS 0x80 (the census established that the class-0x02 device this kernel has named on every
+# boot is the BCM57765 Ethernet MAC at subclass 0x00, and that `find_device(0x02, 0x00)` returns on
+# its first hit, so the radio has never been examined), maps BAR0, and reads the ChipCommon window:
+# chip id/rev/package/#cores/type, capabilities, the EROM backplane pointer, OTP status + which
+# subregions are programmed, and — when an SPROM is advertised — a 220-word shadow dump with a
+# plausibility verdict (unicast MAC + supported revision; the CRC-8 is deliberately NOT computed and
+# the line says so).
+#
+# It WRITES NOTHING. On a BCMA part behind PCIe, BAR0 shows exactly ONE backplane core at a time and
+# the selector is PCI config register 0x80 (BCMA_PCI_BAR0_WIN, what Linux's bcma_scan_switch_core
+# writes). Firmware parks it at the ChipCommon enumeration base, so the EROM, every other core, and
+# the PHY version register are all behind that one write — and each is emitted as an explicit
+# `REFUSED reg=cfg:0x80 …` witness naming the register and the address, never as a missing line.
+# Same for the 4331 SPROM ext-PA mux and the OTP read command (OTPP). Mapping BAR0 is a page-table
+# edit, not a device access. Bounded twice over (structural entry cap + a TSC deadline via
+# now_cycles/hw_wait_budget — never arch::ms(), whose APIC tick does not advance with interrupts
+# masked). x86_64 only; stripped from aarch64 builds by `arm_features` below.
+# Default OFF => module + call site unlinked, media byte-identical.
+# Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
+# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_BCMARECON:-}" ] && _feats="${_feats}bcmarecon,"
+# BCMA-S1 (GR20): UNAOS_BCMAS1=1 arms the WiFi path's FIRST WRITE — one PCI config write to cfg:0x80
+# (BCMA_PCI_BAR0_WIN) that points the BAR0 backplane window at ChipCommon (0x18000000), reads the
+# chip identity + EROM core list (moving the window once more to the EROM base), then RESTORES the
+# window to the RECORDED pre-image (0x18001000 on this machine, NOT the enumeration base 0x18000000 —
+# Boot AF). It rides on top of the recon: the `bcmaS1` cargo feature IMPLIES `bcmarecon`, so S0 runs
+# first and S1 reuses its device-find/BAR-map helpers and the existing x86-only module gate + call
+# site (no second gate in arch/x86_64/pci.rs). The write is issued ONLY against a Broadcom 4331 and
+# the unwind is proven before the state-changing write (a no-op self-test); QEMU models no BCM4331,
+# so there S1 stops at no-device and issues no write. x86_64 only; stripped from aarch64 by
+# arm_features below. Default OFF => no S1 code, media byte-identical. Kept in sync with
+# builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled while the
+# banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_BCMAS1:-}" ] && _feats="${_feats}bcmaS1,"
+# BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". The rMBP's BT
+# module is a two-device unit on EHCI: a Broadcom hub 0a5c:4500 (addr 5, depth 2, FULL SPEED) with
+# the HCI controller as its downstream child at depth 3, which our hub walk has never reached (cap
+# `depth >= 2`). The knob lifts that cap to 3 AND fixes the split-transaction TT computation in the
+# SAME change — a device below a NON-high-speed hub inherits the nearest HIGH-SPEED ancestor's TT
+# (USB 2.0 §11.14), not its immediate parent's; the Broadcom hub is full speed and owns no TT, so
+# lifting the cap alone would aim the splits at a translator that does not exist and the radio would
+# read as dead. Then: recognize interface class 0xE0/0x01/0x01, SET_CONFIGURATION, and issue
+# HCI_Reset (0x0C03) + HCI_Read_Local_Version_Information (0x1001) over the CONTROL endpoint
+# (bmRequestType 0x20), reading the replies off the INTERRUPT-IN event endpoint. Verdict =
+# Manufacturer_Name; Broadcom is 0x000F. NO bulk and NO async schedule anywhere in the path (this
+# Panther Point's async engine master-aborts — PROBE-14); every wait bounded, the event drain capped
+# structurally as well, so a mute radio costs a bounded delay and never a hung boot. The LE stage
+# above it now opens up to FOUR 500 ms receive windows when no peer is selected (one window when a
+# peer is found on the first, which is the ordinary case), so its drain bound is ~2 s of listening
+# and ~2.8 s of wall clock once the extra windows' witness prose is on the serial line. Implies
+# `ehcihid` (the code lives inside the x86-gated drivers/ehci/mod.rs). x86_64 only; stripped from
+# aarch64 builds by `arm_features` below. Default OFF => cap, TT fix, recognition arm and the whole
+# L0 sequence unlinked, media byte-identical. Kept in sync with builder/src/main.rs — a knob mapped
+# HERE and missing THERE ships the feature disabled while the banner claims it is on (the s42/INSTGUI
+# and WXN-M3b lesson).
+[ -n "${UNAOS_BT:-}" ] && _feats="${_feats}bt,"
+# BT-C1 (GR24): UNAOS_BTC=1 arms the first BR/EDR step toward A2DP audio — HCI_Create_Connection
+# (0x0405) PAGES Peter's speaker at the BD_ADDR in bt_name.rs, witnesses Connection Complete (event
+# 0x03) or the failure status, and releases the link (or cancels an unresolved page). Conservative
+# packet types (DM1|DH1), role switch allowed, page timeout WRITTEN AT THE SPEC RESET DEFAULT
+# 0x2000 = 5.12 s (Core Vol 4 Part E §7.3.16), and up to TWO page attempts. It used to shorten the
+# timeout to 1.28 s to protect boot time; Boot AS showed that shortening cutting off both trains at
+# exactly 1280 ms against a speaker confirmed to be in pairing mode — a peer's page-scan interval is
+# commonly 1.28 s and an R2 train is nominally 2.56 s, so the short deadline manufactured false
+# negatives. A retry is spent on exactly ONE answer, Connection Complete status=0x04 for that
+# BD_ADDR; a link, a refusal, a local-side failure or an unresolved page all end the stage there.
+# SINCE GR26 (bt-page) THE STAGE OPENS WITH AN HCI_Inquiry — a GIAC BROADCAST, not merely the
+# directed page below: up to 5.12 s of general inquiry to harvest the target's own page-scan
+# repetition mode and clock offset (validated — an RFU psrm off the air is substituted, witnessed),
+# cancelled the moment the target answers, then the page goes out ALIGNED. This paragraph is where
+# air-side transmissions are justified, so state it plainly: a UNAOS_BTC=1 boot transmits a general
+# inquiry every boot, and any device in range may log it. WHAT IT COSTS A BOOT THAT SETS IT,
+# honestly: worst case ~18.6 s for the classic stage with the target never heard (5.6 s inquiry
+# window + 2x5600 ms Connection-Complete windows + Command-Status/cancel waits), ~21 s for the worst
+# boot with the LE stage's repeat scan included; the inquiry exits early the instant the target
+# answers, so the ordinary paired-speaker boot pays ~1-2 s of it. BOTH BT KNOBS
+# DEFAULT OFF, and this whole path runs on the SYNCHRONOUS EHCI walk — it must be made asynchronous
+# before Bluetooth is ever default-on, because these are seconds of boot spent blocking.
+# NO Write_Scan_Enable is issued: §7.3.18 governs INBOUND inquiry/page scan and paging out needs
+# none of it. Its own knob and NOT part of UNAOS_BT because a page is a directed transmission that
+# makes an audible noise on the speaker (and the inquiry above is a broadcast) — a boot that did
+# not ask for either must be incapable of issuing them. Implies `btc = ["bt"]` in Cargo.toml, so setting this alone arms the whole BT stack.
+# x86_64 only; stripped from aarch64 builds by `arm_features` below. Default OFF => the page code,
+# its constants and the classic Connection-Complete latch unlinked, media byte-identical. Kept in
+# sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
+# while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_BTC:-}" ] && _feats="${_feats}btc,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -198,6 +395,55 @@ _feats=""
 # media is byte-identical to the pre-flip default whichever way this knob points. Kept in sync with
 # builder/src/main.rs (which produces only x86 media, so it pushes `smolnet` unconditionally-by-default).
 [ -z "${UNAOS_NOSMOLNET:-}" ] && _feats="${_feats}smolnet,"
+# WIFI-1: UNAOS_WIFI=1 arms the BCM4331 FIRMWARE-LOAD path — arc 1 of the association ladder
+# (crates/kernel/src/wifi/; the wider ladder is docs/dev/OS/06_NETWORK_STACK/bcm4331.md). Finds the
+# AirPort radio in PCI CONFIG space by class 0x02 / subclass **0x80** — NOT class alone, which selects
+# the BCM57765 Ethernet MAC at 3:0.0 and is why the radio went unexamined for the life of the project
+# (bcm4331.md §0) — and CROSS-CHECKS its identity (device/rev/subsys/BAR0/match-count) against the
+# values three metal boots pinned, printing MATCH or MISMATCH per field. STRICTLY read-only: no BAR
+# mapping, no MMIO, no register write, no bus-master, no cfg:0x80. Then locates the USER-SUPPLIED
+# firmware SET on the program-source FAT volume — ucode29_mimo.fw + ht0initvals29.fw +
+# ht0bsinitvals29.fw (bcm4331.md §S4, core rev 29 + HT PHY; 8.3 aliases accepted), searched in /,
+# /B43/, /FIRMWARE/ — bounds-validates each, classifies its container header (§S4's own record is
+# internally inconsistent: reported, never enforced) and stages the bytes for arc 2. UnaOS ships NO
+# firmware (docs/MANIFESTO/CLEAN_ROOM_POLICY.md §4, bcm4331.md §S4 option 1): a missing file prints
+# one honest ABSENT line naming what was looked for and where, and the pass ends in one terminal
+# verdict, then parks — no retry, no crash, radio stays down. Forward-only, at most one staging pass
+# per boot; the call sits at all THREE of main.rs's storage-ready loop passes. QEMU models no BCM4331,
+# so a QEMU run only ever witnesses the honest no-radio refusal; metal-first by construction. Arc 2
+# owns bcma core enumeration + the first device write, arc 3 association. x86_64-only and stripped by
+# arm_features, so arming it never shifts a Pi/Jetson media hash. Default OFF => module + call sites
+# vanish, media byte-identical. Kept in sync with builder/src/main.rs. See
+# docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+[ -n "${UNAOS_WIFI:-}" ] && _feats="${_feats}wifi,"
+# WIFI-2: UNAOS_WIFI2=1 arms arc 2 — the WRITE rungs (crates/kernel/src/wifi/bringup.rs). Maps BAR0's
+# two 4 KiB apertures, moves the backplane window selector cfg:0x80 onto ChipCommon and then onto the
+# enumeration ROM, walks the core table from our own reads (a TAG-driven parse, so the EROM's declared
+# port counts become an independent arity cross-check rather than the parse driver — the third of the
+# three defects bcm4331.md §S1b records cannot recur by construction), cross-checks the d11 core's
+# rev/base/master-wrapper against four metal boots AND against the two config registers Apple's
+# firmware left behind, then opens the core window and reads MACCTL/PHY_VER/TSF plus the wrapper's
+# IOCTL/IOST/RESET_CTL/RESET_ST and re-measures §S3's enable rule. On this machine the core arrives out
+# of reset and clocked, so that rung costs ZERO device writes; on the branch where it does not, only
+# the REVERSIBLE half is made (deassert RESET, set CLK with FGC clear, every other IOCTL bit left as
+# read) — reset is NEVER asserted, because asserting it clears MACCTL.PSM_RUN and destroys the
+# microcode the radio arrives running (§5 risk 4). Every device write carries a pre-read/write/
+# post-read witness triple, the cfg:0x80 pre-image is recorded and the restore path is self-tested
+# with an in-place no-op BEFORE the window moves, and the restore is MATCH-verified against the
+# RECORDED value (never against 0x18000000 — the pre-image on this machine is 0x18001000). The
+# microcode upload is REFUSED at a NAMED UNKNOWN: §S4 names the B43_SHM_UCODE routing selector but
+# records no value for it, this tree carries only the SHARED routing S4a reads through, and the one
+# source that carries it is b43 driver source — off-limits for src/wifi/ under CLEAN_ROOM_POLICY §2.
+# IMPLIES `wifi` (arc 2 reads arc 1's selection and its staged set); pushing it alone would build a
+# module whose two inputs do not exist. x86_64-only and stripped by arm_features below. QEMU models no
+# BCM4331, so a QEMU run only ever witnesses the honest refusal; metal-first by construction. Default
+# OFF => not one byte of arc 2 in the image, and a UNAOS_WIFI=1-only boot is byte-identical to the
+# census-and-staging boot arc 1 flew. Kept in sync with builder/src/main.rs. See
+# docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+# Pushed ALONE, not as `wifi,wifi2` — the Cargo implication above is what pulls `wifi` in, and pushing
+# both would put a duplicate `wifi` in the comma list on a `UNAOS_WIFI=1 UNAOS_WIFI2=1` build, which
+# is the shape the arm_features strip below rewrites textually.
+[ -n "${UNAOS_WIFI2:-}" ] && _feats="${_feats}wifi2,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 
@@ -211,19 +457,80 @@ _feats=""
 [ -n "${UNAOS_KEPLER:-}" ] && _feats="${_feats}nvidia-kepler,"
 [ -n "${UNAOS_KEPLER_TAKEOVER:-}" ] && _feats="${_feats}nvidia-kepler-takeover,"
 [ -n "${UNAOS_KEPLER_FIFO:-}" ] && _feats="${_feats}nvidia-kepler-fifo,"
+[ -n "${UNAOS_KDISP_HOLD:-}" ] && _feats="${_feats}nvidia-kepler-kdisp-hold,"
+# CE-LADDER: UNAOS_KEPLER_CE=1 arms the read-only copy-engine reconnaissance
+# (drivers/gpu/kepler_ce.rs) — R1 PTOP sweep, R2 CE PRI probe, R3 wide runlist scan, R5
+# firmware instance-block walk. Runs from kepler::init ABOVE the fifo leg, so it is upstream
+# of every FECS access and reads the runlist array PRE-SUBMIT. Implies nvidia-kepler; does
+# NOT require UNAOS_KEPLER_FIFO. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_KEPLER_CE:-}" ] && _feats="${_feats}nvidia-kepler-ce,"
 # WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/wcx.rs) — it activates
-# at the END of the Kepler takeover seam, reserves a provisional console band and opens one
-# kernel-drawn demo window. x86_64-only module; DEFAULT OFF => the module and its single call site
-# are unlinked, so every x86 and aarch64 artifact is byte-identical without it. Needs
-# UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with builder/src/main.rs.
+# at the END of the Kepler takeover seam, routes the console into a window, and ARMS the desktop app.
+# The desktop's second window is no longer kernel-drawn (kernel-apps eviction move #1): the seam
+# prints `[wc-x] desktop-app ARMED name=/STAT.ELF …` and `wcx::desktop_app_service`, called from the
+# SCHED-X86 device-service pass once storage is up, launches the shipped ring-3 STAT.ELF through the
+# same loader `bg`/BARE-EXEC use. STAT.ELF must be on the DATA volume (target/x86_64_data/), or the
+# boot prints one DECLINE line and continues with the console window alone. x86_64-only module;
+# DEFAULT OFF => the module, BOTH of its call sites, and the whole SLOT_NO_AUTOFOCUS focus-exemption
+# (its flag, the grant check in sys_win_create, the click-router arm and its ONE witness string —
+# the click arm prints nothing of its own, it reuses clickroute_witness's pre-existing `consume`
+# verdict, which the knob does not unlink) are unlinked. aarch64 stays BYTE-IDENTICAL.
+#
+# ⚠ x86 with the knob OFF is FUNCTIONALLY unchanged but NOT byte-identical after the kernel-apps
+# eviction, and the old wording here claimed otherwise. Measured, not reasoned: knob-off esp-x86
+# built at 38ae067e and at this arc, same worktree path, gives kernel.elf sha256 1205c2ec… vs
+# 0a929c50…. The delta is 56 bytes of symbol-string table and NINE bytes inside .text (which is the
+# same size, 925727 B, with no named function changing size) — relocated rodata immediates in
+# arch/x86_64/syscall.rs, whose anon-constant ordering moved when spawn_user_image_bg was refactored
+# into a wrapper over spawn_user_image_bg_inner. Nothing the knob gates is present; the module simply
+# was not left bit-for-bit undisturbed. Say "no feature code and no behaviour change", not
+# "byte-identical", for x86 from here on.
+#
+# Needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach the activation seam.
+# Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_WC:-}" ] && _feats="${_feats}wc,"
+# R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
+# (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only, never a mean; pure
+# measurement, changes no scheduling/locking/present behaviour. x86_64-only in effect (the real impl is
+# `target_arch = "x86_64"`-gated; aarch64 gets the inline shim). DEFAULT OFF => every hook is an empty
+# inline shim and a zero-sized HoldTimer, so the boot is byte-inert on the hot path. Emits one `[rtwit]`
+# rollup line per ~5 s from the x86 render-service witness gate. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_RTWIT:-}" ] && _feats="${_feats}rtwit,"
+# R1 / RTPI: UNAOS_RTPI=1 arms PRIORITY INHERITANCE on the x86 sleeping `Mutex` (arch::x86_64::sched)
+# plus its `[rtpi]` witness. Unlike RTWIT (a pure ruler), this CHANGES scheduling: while a strictly-
+# higher task blocks on a `Mutex`, the holder inherits the blocker's priority (transitively) until
+# release, so mid-priority tasks cannot preempt the critical section — bounded priority inversion.
+# x86_64-only in effect. DEFAULT OFF => the PI `Task`/`Mutex` fields do not exist, `Mutex::lock` takes
+# its original single-`wait()` path, and every witness hook is an inline shim, so the boot is byte-
+# identical to the pre-arc scheduler. Emits one `[rtpi]` rollup line per ~5 s from the x86 render-
+# service witness gate (plus rate-limited `[rtpi] inherit …` traces). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_RTPI:-}" ] && _feats="${_feats}rtpi,"
+# VSYNC-PACE r3: UNAOS_VSYNCPACE=1 ARMS the kernel-side present pacer (`vsyncpace`). ⚠ THE POLARITY IS
+# INVERTED from GR22's `UNAOS_NOPACE` — the pacer is now DEFAULT OFF. Unset (the shipped configuration),
+# `SYS_WIN_PRESENT`/`SYS_WIN_PRESENT_ROWS` return as soon as the composite is done and a ring-3 program
+# presents at whatever rate it can reach, with the cost showing up as load across cores. Set, they sleep
+# the caller to the panel's 16667 µs frame and every window with headroom converges to ~60/s. Knob unset
+# => not one byte of SLEEPING code is linked. The `[wpace]` witness speaks EITHER WAY (needs
+# UNAOS_WITNESS) and names the regime in `mode=`. Stripped from aarch64 by `arm_features` below.
+# Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_VSYNCPACE:-}" ] && _feats="${_feats}vsyncpace,"
 # INSTGUI: UNAOS_INSTGUI=1 opens the graphical installer dialog on the wc desktop (implies wc).
 [ -n "${UNAOS_INSTGUI:-}" ] && _feats="${_feats}instgui,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
-# GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the INTEGRATED GPU plus its timed
-# auto-revert (drivers/gpu/igpu.rs). ⛔ SINGLE-USE TEST MEDIA — the knob is baked into the image and
+# GEN7-3D: UNAOS_IVB3D=1 arms the Ivy Bridge RENDER-ENGINE reconnaissance rung R1
+# (drivers/gpu/gen7.rs) — a READ-ONLY census of the pinned RCS/BCS/VCS ring blocks, the
+# hypothesised forcewake/GTFIFO offsets, the GGTT, and GGC/BDSM. Zero MMIO writes, zero
+# config writes, no display register touched: this rung cannot black the panel and its
+# media is NOT single-use. `gen7` implies `intel-ivb` (it needs the BAR0 window igpu::init
+# publishes), but the env knob is mapped independently so R1 can be armed without arming
+# anything else. Kept in sync with builder/src/main.rs — a knob armed here but missing
+# there ships the feature DISABLED on MEDIA while the banner claims it is on.
+[ -n "${UNAOS_IVB3D:-}" ] && _feats="${_feats}gen7,"
+# GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the INTEGRATED GPU with an unwind-stack
+# restore on the same call stack — no dwell, no timer (drivers/gpu/igpu.rs; round 13 removed the
+# timed auto-revert). ⛔ SINGLE-USE TEST MEDIA — the knob is baked into the image and
 # nothing guards it across boots, so every boot from that stick switches the mux again. Re-flash
 # after the sitting. Without this line the feature exists in Cargo.toml but no gate can reach it:
 # `./arroyo check` type-checked only the DISARMED build, so "gate green" said nothing about the
@@ -397,6 +704,97 @@ arm_features() {
     # every aarch64 media hash between a default build and a `UNAOS_NOKBDWIT=1` one for zero
     # observable change. Stripped => aarch64 media are byte-identical either way.
     f="${f//,kbdwit,/,}"
+    # SDHC-4a rides the same strip, for the same reason: `drivers/sdhc.rs` is reached only from
+    # `arch/x86_64/pci.rs`, so `sdw` emits not one byte of aarch64 CODE — but leaving it enabled would
+    # shift every aarch64 media hash between a default build and a `UNAOS_SDW=1` one for zero
+    # observable change. Stripped => aarch64 media are byte-identical whichever way the x86 write arm
+    # points, which is the property that lets the x86 track arm a card-write knob without touching the
+    # Pi or Jetson media at all.
+    f="${f//,sdw,/,}"
+    # SDHC-4b rides the same strip: the registration call site is inside `drivers/sdhc.rs` (reached only
+    # from `arch/x86_64/pci.rs`) and every block/FAT arm the knob adds is gated
+    # `all(target_arch = "x86_64", feature = "sdhcblk")`, so `sdhcblk` emits not one byte of aarch64
+    # CODE — but an enabled feature is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in
+    # would shift every aarch64 media hash between a default build and a `UNAOS_SDHCBLK=1` one for zero
+    # observable change. Stripped => the x86 track can arm an internal-card block backend without
+    # touching the Pi or Jetson media at all.
+    f="${f//,sdhcblk,/,}"
+    # PCI-CENSUS (GR20) rides the same strip, for the same reason: `full_census` lives in
+    # `arch/x86_64/pci.rs`, so `pcicensus` emits not one byte of aarch64 CODE — but an enabled
+    # feature is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in would shift every
+    # aarch64 media hash between a default build and a `UNAOS_PCICENSUS=1` one for zero observable
+    # change. Stripped => the x86 track can arm a bus census without touching Pi or Jetson media.
+    f="${f//,pcicensus,/,}"
+    # BCMA-RECON (GR20) rides the same strip, for the same reason: `drivers/bcma.rs` is declared
+    # `#[cfg(all(target_arch = "x86_64", feature = "bcmarecon"))]` and is reached only from
+    # `arch/x86_64/pci.rs`, so `bcmarecon` emits not one byte of aarch64 CODE — but an enabled
+    # feature is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in would shift every
+    # aarch64 media hash between a default build and a `UNAOS_BCMARECON=1` one for zero observable
+    # change. Stripped => the x86 track can recon a radio without touching Pi or Jetson media.
+    f="${f//,bcmarecon,/,}"
+    # BCMA-S1 (GR20) rides the same strip, for the same reason and as a consequence of the same fact:
+    # `bcmaS1` implies `bcmarecon`, whose only code is the x86-gated `drivers/bcma.rs`, so `bcmaS1`
+    # emits not one byte of aarch64 CODE — but an enabled feature is hashed into cargo's `-Cmetadata`
+    # fingerprint, so leaving it in (or its implied `bcmarecon`, already stripped above) would shift
+    # every aarch64 media hash for zero observable change.
+    f="${f//,bcmaS1,/,}"
+    # WIFI-1 (GR25) rides the same strip, for the same reason and by the same mechanism as
+    # `bcmarecon` above: `src/wifi/` is declared `#[cfg(all(feature = "wifi", target_arch =
+    # "x86_64"))]` and all three main-loop call sites carry the same pair, so `wifi` emits not one
+    # byte of aarch64 CODE — but an enabled feature is hashed into cargo's `-Cmetadata` fingerprint,
+    # so leaving it in would shift every aarch64 media hash between a default build and a
+    # `UNAOS_WIFI=1` one for zero observable change. Stripped => the x86 track can arm the radio's
+    # firmware loader without touching Pi or Jetson media at all.
+    f="${f//,wifi,/,}"
+    # WIFI-2 (GR25) rides the same strip, for the same reason and as a consequence of the same fact:
+    # `wifi2` implies `wifi`, whose only code is the x86-gated `src/wifi/`, and `bringup.rs` is a
+    # sibling inside that same gate — so `wifi2` emits not one byte of aarch64 CODE. An enabled feature
+    # is still hashed into cargo's `-Cmetadata` fingerprint, so leaving it in would shift every
+    # Pi/Jetson media hash between a default build and a `UNAOS_WIFI2=1` one for zero observable
+    # change. Stripped BEFORE `wifi` would matter if the order were the other way round: `,wifi2,`
+    # does not contain `,wifi,` as a substring (the trailing comma is part of the pattern), so the
+    # `wifi` strip above cannot half-rewrite it and the two lines are order-independent.
+    f="${f//,wifi2,/,}"
+    # BT-L0 (GR21) rides the same strip, for the same reason and by the same mechanism as `kbdwit`
+    # above: every line `bt` gates lives in `drivers/ehci/mod.rs`, which is declared
+    # `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so `bt` emits not one byte of
+    # aarch64 CODE — but an enabled feature is hashed into cargo's `-Cmetadata` fingerprint, so
+    # leaving it in would shift every aarch64 media hash between a default build and a `UNAOS_BT=1`
+    # one for zero observable change. Note `bt` IMPLIES `ehcihid`, which is default-ON and is NOT
+    # stripped (it predates this policy and the Pi/Jetson media hashes are already computed with it
+    # present), so stripping `bt` alone is the whole delta.
+    f="${f//,bt,/,}"
+    # BT-C1 (GR24) rides the same strip, for the same reason and as a consequence of the same fact:
+    # `btc` implies `bt`, whose only code is inside the x86-gated `drivers/ehci/mod.rs`, so `btc`
+    # emits not one byte of aarch64 CODE — but an enabled feature is hashed into cargo's
+    # `-Cmetadata` fingerprint, so leaving it in (or its implied `bt`, stripped just above) would
+    # shift every aarch64 media hash between a default build and a `UNAOS_BTC=1` one for zero
+    # observable change. Stripped => the x86 track can page a speaker without touching Pi or Jetson
+    # media at all.
+    f="${f//,btc,/,}"
+    # VSYNC-PACE (GR22, polarity inverted GR25) rides the same strip, for the same reason: every line
+    # `vsyncpace` gates lives in `arch/x86_64/syscall.rs` and is additionally `wc`-gated (an x86-only
+    # feature), so `vsyncpace` emits not one byte of aarch64 CODE — but an enabled feature is hashed into
+    # cargo's `-Cmetadata` fingerprint, so leaving it in would shift every aarch64 media hash between a
+    # default build and a `UNAOS_VSYNCPACE=1` one for zero observable change. Stripped => the x86 track
+    # can arm (or disarm) the present pacer without touching Pi or Jetson media at all.
+    f="${f//,vsyncpace,/,}"
+    # GEN7-3D R1 (GR25) rides the same strip, for the same reason and by the same mechanism as
+    # `bcmarecon` above: `drivers/gpu/gen7.rs` carries a file-level `#![cfg(target_arch =
+    # "x86_64")]` and its single call site is gated `all(target_arch = "x86_64", feature = "gen7")`,
+    # so `gen7` emits not one byte of aarch64 CODE — but an enabled feature is hashed into cargo's
+    # `-Cmetadata` fingerprint, so leaving it in would shift every aarch64 media hash between a
+    # default build and a `UNAOS_IVB3D=1` one for zero observable change. Note `gen7` IMPLIES
+    # `intel-ivb`, which predates this policy and is NOT stripped, so stripping `gen7` alone is the
+    # whole delta.
+    #
+    # ⚠ Review of 055c0e58 caught this comment being load-bearing and FALSE: the call site was
+    # gated on the FEATURE only, so an aarch64 build with `gen7` enabled would have tried to call
+    # into a file whose `#![cfg]` had deleted it — the strip was a BUILD REQUIREMENT masquerading as
+    # a hash-stability nicety, and the comment said the opposite. The call site is now arch-gated
+    # too, which makes this paragraph true as written and demotes the strip back to what every other
+    # entry here is: fingerprint hygiene, not a load-bearing dependency.
+    f="${f//,gen7,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -477,6 +875,67 @@ fi
 
 # --- Build Functions ---
 
+# WXN-x86 SECTION GATE (x86_64 ONLY): no GLOBAL CODE symbol may live in `.rodata`.
+#
+# WHAT IT CATCHES. `global_asm!` blocks are concatenated per CODEGEN UNIT, not per file, so a block
+# that opens `.section .rodata` and never restores it leaves the section changed for whatever the
+# partitioner happens to append next — which may be another file's code entirely. That is exactly
+# how `switch_context` (sched.rs) came to be ASSEMBLED INTO `.rodata` behind smp.rs's AP trampoline:
+# `nm` typed it `R`, not `T`, and the kernel executed it out of a segment whose LOAD is `R` with no
+# `E`. Nothing in the tree said a word — it compiled, it linked, it booted, and every existing
+# witness stayed green.
+#
+# WHY A GATE AND NOT A BELT. A `.text` directive at the top of the victim block shields that one
+# block. This shields the CLASS: any file, any feature set, any future `global_asm!`. It also has to
+# exist before M3b can clear `X` from `.rodata` — the milestone is unsafe while code can land there.
+#
+# THE RULE. In the linked x86 kernel ELF, a GLOBAL symbol in `.rodata*` whose type is FUNC or NOTYPE
+# (i.e. code, or an assembler label that is not typed data) is a FAULT, unless it is one of the AP
+# trampoline's own labels — `ap_trampoline_*` / `ap_param_*` — which live in `.rodata` DELIBERATELY
+# (they are the 0xd8 blob `start_aps` copies to 0x8000 and the parameter cells beside it, and the
+# sweep's `gib_tramp=` accounting depends on where they are). GLOBAL `OBJECT` symbols are read-only
+# DATA and are none of this gate's business: `core`'s WHITESPACE_MAP is one and always has been.
+#
+# SCOPE: x86_64 only, by construction — this function is called from the x86 build path and from
+# `esp-x86`, never from the aarch64 or Pi ones. The aarch64 leaks the M3 review found
+# (`main.rs:33` `.text.boot`, `exceptions.rs:116` `.text.exception_vectors`) are the same class but
+# NOT the same rule: they leak into TEXT sections a linker script orders, so the assertion that
+# would catch them is about which symbol comes FIRST in `.text.boot`, not about `.rodata`. Out of
+# this lane; see docs and the pi track's brief.
+gate_x86_rodata_no_code() {
+    local elf="$1"
+    [ -f "$elf" ] || { echo -e "${COLOR_RED}ERROR: .rodata gate: ${elf} missing — the x86 kernel link produced no ELF${COLOR_RESET}"; exit 1; }
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local NM="$TOOLBIN/llvm-nm"
+    [ -x "$NM" ] || NM="$(command -v llvm-nm 2>/dev/null || true)"
+    # No silent downgrade: a gate that cannot read the ELF must fail the build, not wave it through.
+    [ -n "$NM" ] && [ -x "$NM" ] || { echo -e "${COLOR_RED}ERROR: .rodata gate: no llvm-nm (looked in ${TOOLBIN} and on PATH) — the gate could not run${COLOR_RESET}"; exit 1; }
+    # `nm --format=sysv` is the one format that prints the SECTION NAME beside the class, so the rule
+    # can be about `.rodata` itself rather than about nm's `R` letter (which covers every read-only
+    # section). Uppercase class = GLOBAL. Fields: Name|Value|Class|Type|Size|Line|Section.
+    local offenders
+    offenders="$("$NM" --defined-only --format=sysv "$elf" 2>/dev/null | awk -F'|' '
+        {
+            name = $1; class = $3; type = $4; sect = $7
+            gsub(/[ \t]/, "", class); gsub(/[ \t]/, "", type)
+            gsub(/^[ \t]+|[ \t]+$/, "", name); gsub(/^[ \t]+|[ \t]+$/, "", sect)
+            if (class != "R") next                       # GLOBAL read-only data symbols only
+            if (sect !~ /^\.rodata(\.|$)/) next
+            if (type != "FUNC" && type != "NOTYPE") next  # OBJECT = genuine read-only data
+            if (name ~ /^ap_trampoline_/ || name ~ /^ap_param_/) next
+            print name "  (" type ", " sect ")"
+        }' | sort -u)"
+    if [ -n "$offenders" ]; then
+        echo -e "${COLOR_RED}ERROR: .rodata gate: GLOBAL code symbol(s) assembled into .rodata in ${elf}:${COLOR_RESET}"
+        echo "$offenders" | sed 's/^/       /'
+        echo -e "${COLOR_RED}       A global_asm! block changed the section and did not change it back, so the${COLOR_RESET}"
+        echo -e "${COLOR_RED}       codegen unit appended the symbol(s) above into .rodata. Wrap the offending block${COLOR_RESET}"
+        echo -e "${COLOR_RED}       in .pushsection/.popsection (see arch/x86_64/smp.rs, the AP trampoline).${COLOR_RESET}"
+        exit 1
+    fi
+    echo -e "${COLOR_GREEN}✅ .rodata gate: no GLOBAL code symbol in .rodata (only the AP trampoline's own labels)${COLOR_RESET}"
+}
+
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -484,6 +943,7 @@ build_kernel_x86_64() {
       --target ../../x86_64-unaos.json \
       $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
+    gate_x86_rodata_no_code "${WORKSPACE_DIR}/target/x86_64-unaos/release/unaos-kernel"
     echo -e "${COLOR_GREEN}✅ x86_64 Kernel Built.${COLOR_RESET}"
 }
 
@@ -566,28 +1026,52 @@ build_user_stat_x86() {
 # here to override it; the two builds land in separate target subdirectories and never clobber each
 # other. The output keeps a distinct name (VUG-X86.ELF) because both arches' images share one
 # target/ directory and the staging steps pick the right one.
-build_user_vug_x86() {
+# VUGSCENE: one image of crates/user-vug, named by $1 (the target/ basename) and built with the cargo
+# features in $2. Three images come out of the same source — see the LOD_PIN note in crates/user-vug:
+#
+#   VUG-X86.ELF   (no features)  the ADAPTIVE detail ladder. The default; what the desktop launches.
+#   VUGC-X86.ELF  (pinlo)        level 0 forever — the CLASSIC wireframe, for a slow machine and for
+#                                keeping old fps baselines comparable.
+#   VUGX-X86.ELF  (pinhi)        the full shard forever, for measuring the heaviest frame this draws.
+#
+# `bg`/`run` take a path and no argv on either arch (shell.rs: `match args.first()`), so a build feature is
+# the only channel a pin can travel down. The three land on the media as VUG.ELF / VUGC.ELF / VUGX.ELF —
+# all 8.3-clean, all in the FAT root beside STAT.ELF and PULSE.ELF.
+#
+# `--target-dir` keeps the three cargo builds apart: the feature set is part of the fingerprint, so a shared
+# directory would rebuild (and relink) the whole crate on every call, and a stale artifact could be picked
+# up by the objcopy of the NEXT image if a build ever failed after the first.
+build_one_vug_x86() {
+    local out="$1" feats="$2"
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
-    echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 mini-vug static-ELF program (crates/user-vug → target/VUG-X86.ELF)...${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 mini-vug static-ELF program (crates/user-vug${feats:+ [$feats]} → target/${out})...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-vug"
+    local tdir="${WORKSPACE_DIR}/crates/user-vug/target/x86${feats:+-$feats}"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" \
+      --target-dir "$tdir" ${feats:+--features "$feats"}
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
-      "${WORKSPACE_DIR}/crates/user-vug/target/x86_64-unknown-none/release/user-vug" \
-      "${WORKSPACE_DIR}/target/VUG-X86.ELF"
+      "${tdir}/x86_64-unknown-none/release/user-vug" \
+      "${WORKSPACE_DIR}/target/${out}"
     # The same four checks the x86 STAT build makes. The e_machine one is the load-bearing addition
     # over the aarch64 build: the loader rejects a wrong-arch image, and staging an aarch64 VUG.ELF on
     # x86 media would be a confusing bench failure rather than an obvious build failure.
-    [ -s "${WORKSPACE_DIR}/target/VUG-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF missing/empty — x86 VUG build failed${COLOR_RESET}"; exit 1; }
-    local vmag; vmag="$(head -c 4 "${WORKSPACE_DIR}/target/VUG-X86.ELF" | od -An -tx1 | tr -d ' \n')"
-    [ "$vmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF does not start with the ELF magic; first 4 bytes = ${vmag}${COLOR_RESET}"; exit 1; }
-    local vmach; vmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/VUG-X86.ELF" | tr -d ' \n')"
-    [ "$vmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF e_machine is ${vmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
-    local vsz; vsz="$(wc -c < "${WORKSPACE_DIR}/target/VUG-X86.ELF" | tr -d ' ')"
-    [ "$vsz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF ${vsz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
-    echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 mini-vug program: VUG-X86.ELF (${vsz} B)${COLOR_RESET}"
+    [ -s "${WORKSPACE_DIR}/target/${out}" ] || { echo -e "${COLOR_RED}ERROR: ${out} missing/empty — x86 VUG build failed${COLOR_RESET}"; exit 1; }
+    local vmag; vmag="$(head -c 4 "${WORKSPACE_DIR}/target/${out}" | od -An -tx1 | tr -d ' \n')"
+    [ "$vmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: ${out} does not start with the ELF magic; first 4 bytes = ${vmag}${COLOR_RESET}"; exit 1; }
+    local vmach; vmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/${out}" | tr -d ' \n')"
+    [ "$vmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: ${out} e_machine is ${vmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    local vsz; vsz="$(wc -c < "${WORKSPACE_DIR}/target/${out}" | tr -d ' ')"
+    [ "$vsz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: ${out} ${vsz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 mini-vug program: ${out} (${vsz} B)${COLOR_RESET}"
+}
+
+build_user_vug_x86() {
+    build_one_vug_x86 VUG-X86.ELF  ""
+    build_one_vug_x86 VUGC-X86.ELF "pinlo"
+    build_one_vug_x86 VUGX-X86.ELF "pinhi"
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).
@@ -732,6 +1216,56 @@ launch_aarch64() {
         ${UNAOS_QEMU_EXTRA:-}
 }
 
+# ── FAULT-SCAN: the harness's ONE fault-pattern list ────────────────────────────────────────────
+# THE list. Every serial-log verdict in this script reads it — the `test` / `test-fat` / `test-arm`
+# legs below and battery's `_step` — so a pattern added here arms every gate at once and there is no
+# second, drifting copy to keep in sync. mbench.py carries the same idea as DEFAULT_FORBIDS (`-> FAIL`,
+# `FAIL ::`, `PANIC`) for the spec-replay path; this is its shell twin for the legs that run no spec.
+#
+# WHY IT EXISTS. `./arroyo test` used to print the serial log and exit 0 UNCONDITIONALLY. Artifacted on
+# a W^X falsification run: an injected defect PANICKED the boot, the log said `=== KERNEL PANIC ===`,
+# and the harness still exited 0 — the fault was only found because a human read the log. An exit
+# status that cannot go red is not a gate. The spec-runner side got this treatment at ad8b52aa
+# ("the abort is not a pass"); these legs did not, because they never scanned anything at all.
+#
+# The patterns, and why each one:
+#   -> FAIL          the project's PASS/FAIL verdict idiom (`:: NAME: … -> FAIL ::`).
+#   FAIL ::          the other spelling of the same verdict.
+#   FAIL —           FATIMG-CI: the WINX end-to-end verdicts spell failure `:: WINX-2: … FAIL — <why> ::`,
+#                    which matched NEITHER of the two above. The em-dash keeps it narrow enough not to
+#                    fire on prose that merely contains the word FAIL. This ALSO reconciles the
+#                    x86-fat.spec S5 note ("the S5 FAIL text evades arroyo's detector", seat fold
+#                    2026-07-11): the STOR-1 `— witness OK ::` family (S4-mf2 / S4-race / S5 / S6-witness
+#                    / S7-openany / S8-write / S9-grow) spells its failure `:: S6-witness FAIL — … ::`,
+#                    so it is caught HERE now. The spec's per-witness FORBIDs stay as they are — they
+#                    name the individual witness in the verdict table, which this scan does not.
+#   PANIC            `main.rs`'s `#[panic_handler]` prints `=== KERNEL PANIC ===` as its first line, on
+#                    both arches, through the raw lock-free serial path (so it reaches the wire even
+#                    when the dying core held the UART mutex). Bare, uppercase, matching mbench's
+#                    default set. No kernel print literal contains the word otherwise — verified.
+#   panicked at      the Rust `PanicInfo` Display line that FOLLOWS the banner and carries the source
+#                    location. Listed separately on purpose: it is what still names the fault if the
+#                    banner is ever lost to a truncated write, and it is the line the scan quotes.
+#   EXCEPTION:       any CPL-0 / EL1 fault diagnostic — x86 `EXCEPTION: PAGE FAULT` / `GENERAL PROTECTION
+#                    FAULT` / `DOUBLE FAULT` / `MACHINE CHECK`, and aarch64 `=== AARCH64 EXCEPTION: … ===`
+#                    (the substring covers both). Already the standing FORBID in rmbp-boot.spec,
+#                    round6-rmbp.spec and x86-fat.spec, so this only extends it to the specless legs.
+#                    Ring-3 / EL0 intentional faults do NOT print it — they print `:: RING-3 FAULT: …
+#                    KILLED — …` and `:: EL0 FAULT: … KILLED — …`, which this list deliberately does not
+#                    match: U1b's fault-isolation demo kills three tasks on every clean x86 boot.
+FAULT_PATTERNS='-> FAIL|FAIL ::|FAIL — |PANIC|panicked at |EXCEPTION:'
+
+# Scan a serial capture against FAULT_PATTERNS. Prints every offending line with its line number and
+# returns 1 if any matched, 0 on a clean log. awk, not grep: control bytes in the serial logs break grep.
+scan_serial_faults() { # $1 = log file, $2 = label used in the quoted lines
+    local logf="$1" lbl="${2:-serial}"
+    [ -f "$logf" ] || return 0
+    awk -v p="$FAULT_PATTERNS" -v lbl="$lbl" '
+        $0 ~ p { n++; if (n <= 20) printf("  ✖ %s:%d: %s\n", lbl, FNR, $0) }
+        END { if (n > 20) printf("  ✖ … and %d more matching line(s)\n", n - 20); exit (n ? 1 : 0) }
+    ' "$logf"
+}
+
 # Headless aarch64 run: serial -> target/serial-arm.log, self-terminates after N secs.
 test_aarch64() {
     local secs="${1:-20}"
@@ -761,6 +1295,17 @@ test_aarch64() {
     echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${logf}) ════════════${COLOR_RESET}"
     cat "$logf" 2>/dev/null || echo -e "${COLOR_RED}(no serial log produced)${COLOR_RESET}"
     echo -e "${COLOR_PURPLE}═══════════════════════════════════════════════════${COLOR_RESET}"
+
+    # FAULT-SCAN: this leg's EXIT STATUS now says what the log says (see FAULT_PATTERNS above).
+    if [ ! -s "$logf" ]; then
+        echo -e "${COLOR_RED}✖ test-arm: no serial bytes captured at ${logf} — QEMU produced nothing."
+        echo -e "  This run carries NO verdict: not a pass, not a regression. Exit 4.${COLOR_RESET}"
+        return 4
+    fi
+    if ! scan_serial_faults "$logf" "serial-arm.log"; then
+        echo -e "${COLOR_RED}❌ aarch64 test FAILED — the serial log carries fault text (lines above). Log at ${logf}${COLOR_RESET}"
+        return 1
+    fi
     echo -e "${COLOR_GREEN}✅ aarch64 test complete. Log at ${logf}${COLOR_RESET}"
 }
 
@@ -808,10 +1353,437 @@ test_x86_64() {
     echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${SERIAL_LOG}) ════════════${COLOR_RESET}"
     cat "$SERIAL_LOG" 2>/dev/null || echo -e "${COLOR_RED}(no serial log produced)${COLOR_RESET}"
     echo -e "${COLOR_PURPLE}═══════════════════════════════════════════════════${COLOR_RESET}"
+
+    # FAULT-SCAN: this leg's EXIT STATUS now says what the log says (see FAULT_PATTERNS above).
+    # `test-fat` ends by calling this function, so it inherits the same verdict.
+    if [ ! -s "$SERIAL_LOG" ]; then
+        echo -e "${COLOR_RED}✖ test: no serial bytes captured at ${SERIAL_LOG} — QEMU produced nothing."
+        echo -e "  This run carries NO verdict: not a pass, not a regression. Exit 4.${COLOR_RESET}"
+        return 4
+    fi
+    if ! scan_serial_faults "$SERIAL_LOG" "serial.log"; then
+        echo -e "${COLOR_RED}❌ x86_64 test FAILED — the serial log carries fault text (lines above). Log at ${SERIAL_LOG}${COLOR_RESET}"
+        return 1
+    fi
     echo -e "${COLOR_GREEN}✅ Test run complete. Full log saved at ${SERIAL_LOG}${COLOR_RESET}"
 }
 
 # --- Utility Functions ---
+
+# GATE-USER: the RING-3 crates under crates/user-* are each their OWN cargo workspace (every one of
+# them carries an empty `[workspace]` table, so the parent unaos workspace never drags a no_std/no_main
+# EL0 program into a host build). That isolation is correct for `cargo build`, but it silently made
+# `./arroyo check` a KERNEL-ONLY gate: nothing outside crates/kernel was ever compiled, so a session
+# could "gate" a userspace change on a green check that could not have gone red. The user crates were
+# only ever type-checked as a side effect of a MEDIA build (`kernel8` / `esp-x86` / the builder), which
+# is minutes of link+objcopy+staging away and is not what anyone runs before committing.
+#
+# This matrix closes that hole. One row per (crate, arch) pair the project GENUINELY ships — the arch
+# column is the load-bearing part, because these crates are not uniformly portable:
+#
+#   user-blob      aarch64 only. The flat EL0 hello/K2/midden blobs (4 [[bin]]s, all checked by the one
+#                  cargo invocation). Hand-written aarch64 asm; its x86 twin is a SEPARATE crate.
+#   user-blob-x86  x86_64 only. That twin — a naked x86 asm stream. Neither crate can build for the
+#                  other's arch and neither is meant to; forcing it would be an invented target.
+#   user-elf       aarch64 only. ELF-1 ships as ELFHELLO.ELF on the Pi media and has no x86 sibling —
+#                  there is no user-elf-x86.ld and no x86 build recipe anywhere in this script. Adding
+#                  one here would be inventing a product, not gating an existing one.
+#   user-pulse     BOTH. Arch-neutral above two syscall stubs; built as PULSE.ELF (aarch64) and
+#   user-stat      PULSE-X86.ELF (x86) — see build_user_pulse_x86 / build_user_aarch64. Same for the
+#   user-vug       STAT/VUG pair. These three USED to be exactly where a syscall-number or stub drift
+#                  between the two arches showed up, so both legs are checked. ABIFREEZE closed the
+#                  NUMBER half of that hiding place: every crate below now imports crates/una-abi
+#                  instead of re-declaring the table, so a number cannot differ between a caller and
+#                  the dispatcher it calls. The STUB half — register constraints, clobber lists, and
+#                  the per-arch `cfg` blocks around them — is still hand-written per crate and is
+#                  still exactly what these legs exist to catch.
+#
+# Fields (whitespace-separated; the 4th field runs to end-of-line):
+#   1 crate dir under crates/
+#   2 arch label (display only — the real arch comes from the target, field 3)
+#   3 cargo --target override, or `-` to take the crate's own .cargo/config.toml default. The aarch64
+#     legs use `-` because every crate's config.toml already defaults to ../../aarch64-base.json (as
+#     does user-blob-x86's, which defaults to x86_64-unknown-none.json); the x86 legs of the three
+#     dual-arch crates must override it explicitly, exactly as build_user_stat_x86 & friends do.
+#   4 RUSTFLAGS. Mirrored VERBATIM from each crate's media build recipe rather than left empty. `check`
+#     never invokes the linker, so the -T/-z flags are inert here — but RUSTFLAGS is part of cargo's
+#     fingerprint, so a check that passed DIFFERENT flags would invalidate the crate's target/ dir and
+#     force a full build-std recompile every time an operator alternated `check` and `kernel8`.
+#
+# -Z build-std comes from each crate's own .cargo/config.toml [unstable] table, so only
+# -Z json-target-spec is passed here (the .json target specs need it); NIGHTLY_FLAGS is a KERNEL
+# feature/flag set and deliberately does not apply.
+USER_CHECK_MATRIX=(
+  "user-blob-x86 x86_64  -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob-x86/user-blob-x86.ld"
+  "user-stat     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-vug      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-pulse    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
+  "user-elf      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-stat     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-vug      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-pulse    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+)
+
+# Type-check every USER_CHECK_MATRIX row whose arch label matches $1, and print one summary line in the
+# same shape as the kernel legs (`✅ userspace <arch> OK`).
+#
+# It does NOT stop at the first failure. A broken shared syscall stub typically breaks the same crate on
+# both arches and often two crates at once; aborting on the first would hand back one error per run and
+# cost a full round-trip per crate. Every failure is collected and NAMED, and the function returns 1 —
+# `set -e` at the top of this script then carries that straight out of check_both as a non-zero exit.
+check_user_arch() {
+    local _want="$1"
+    local _rc=0 _n=0 _failed=""
+    local _row _crate _arch _tgt _rustflags _targ_arg
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: userspace (${_want})...${COLOR_RESET}"
+    for _row in "${USER_CHECK_MATRIX[@]}"; do
+        read -r _crate _arch _tgt _rustflags <<< "$_row"
+        [ "$_arch" = "$_want" ] || continue
+        _n=$((_n + 1))
+        # `-` = take the crate's .cargo/config.toml default target; anything else is an explicit override.
+        _targ_arg=""
+        [ "$_tgt" = "-" ] || _targ_arg="--target $_tgt"
+        cd "$WORKSPACE_DIR/crates/$_crate"
+        # `|| _rc=...` keeps set -e from aborting the loop; the failure is recorded and reported below.
+        if RUSTFLAGS="$_rustflags" cargo +nightly check --release -Z json-target-spec $_targ_arg; then
+            echo -e "${COLOR_GREEN}  ✅ ${_crate} (${_arch})${COLOR_RESET}"
+        else
+            echo -e "${COLOR_RED}  ❌ ${_crate} (${_arch}) FAILED to compile${COLOR_RESET}"
+            _failed="${_failed} ${_crate}"
+            _rc=1
+        fi
+    done
+    cd "$WORKSPACE_DIR"
+    if [ "$_rc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ userspace ${_want} FAILED:${_failed}${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_GREEN}✅ userspace ${_want} OK (${_n} crates)${COLOR_RESET}"
+}
+
+# GATE-CFG: the DEFAULT feature set is a tiny fraction of this kernel. `[features]` in
+# crates/kernel/Cargo.toml carries 87 knobs plus `default = []`, so the two legs below compile only
+# (this count was stale at 78 when GR20's `bcmarecon` was added — the real count was already 82,
+# four other-lane knobs having landed without it being bumped; and it was stale AGAIN at 84 for
+# `sdhcblk` — the real count at that base was 85, `wxnro` having landed on `x86-all` without the
+# comment being bumped; it was re-counted to 86 after GR20's `bcmaS1` (which implies `bcmarecon`, so
+# it is one new knob, not two); RE-COUNTED here to 87 after GR21's `bt` — which implies the
+# already-present default-ON `ehcihid`, so it too is one new knob, not two, and 86 was found ACCURATE
+# on GR21's base rather than stale;
+# counted, not incremented, with
+# `awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+ *=/{print $1}' Cargo.toml`)
+# what survives with every knob off — and `$KERNEL_FEATURES` (the UNAOS_* → cargo-feature mapping at
+# the top of this script) adds knobs only when the OPERATOR sets them, which nobody does before a
+# commit. Everything behind a `#[cfg(feature = ...)]` was therefore NEVER type-checked by the gate.
+# That is not a theoretical hole. `video/wcg.rs` is declared `#[cfg(feature = "witness")] pub mod wcg;`
+# in video/mod.rs, and the project's DONE gate is "`./arroyo check` green for both arches" — so a
+# session could gate a change to wcg.rs on a check that could not have gone red. Measured directly: a
+# deliberate `let _x: u32 = "nope";` appended to wcg.rs left `./arroyo check` at EXIT 0, while the same
+# tree with `witness` armed failed at EXIT 101 and named the line. Same class as the GATE-USER hole
+# above, and wider — that one missed 5 small crates, this one missed most of the kernel.
+#
+# THE ARCH SPLIT IS NOT COSMETIC — it is forced, and both halves were measured, not assumed:
+#   * aarch64 board features on an x86 compile: HARD FAIL. `--target x86_64-unaos.json` with
+#     pi/baremetal/v3d/piusb/genet/nsspan/piinstall* armed produced ~20 errors (`unresolved import
+#     crate::drivers::emmc2`, `cannot find 'boot'/'aarch64' in 'arch'`, missing `arch::sched`/
+#     `arch::syscall` items). Those features name aarch64-only modules; arming them on x86 is an
+#     INVENTED configuration, not coverage.
+#   * `pi` + `tegra` together: HARD FAIL, and deliberately so — the kernel itself refuses with
+#     `error: kernel features 'pi' and 'tegra' are mutually exclusive — pick one board UART` (plus a
+#     duplicate `GICD_BASE`). They select different board UARTs/GIC bases. So there is NO single
+#     "everything on" aarch64 leg; two board legs are the minimum that covers both families.
+#   * x86-family features on an aarch64 compile: compiles GREEN but VACUOUS — `wc`/`instgui`/kepler/
+#     `smc`/`videobench`/`irqstorage`/`ehcihid`/`mtraw`/BENCH-RIDE etc. sit behind
+#     `target_arch = "x86_64"` module gates, so aarch64 emits nothing for them. Carrying them on the
+#     arm legs would buy zero coverage and cost a compile, so they are excluded ON EVIDENCE.
+#
+# COVERAGE ARGUMENT (why 3 legs + the 2 default legs are enough). The union of the three feature lists
+# below is MEANT to be exactly the `[features]` table minus `default`, so a knob added to Cargo.toml
+# without a leg here is a one-line diff to spot. MEASURED on the SDHC-4b tree (2026-08-07), and the
+# claim was stale: the table holds 86 knobs and the three legs' union holds 85 — the one uncovered
+# knob is `nvidia-kepler-kdisp-hold`, the same long-standing gap the GATE-CFG-MIX note below already
+# names and the derived `x86-strict` sweep already closes. Counted, never incremented (re-counted on
+# the BCMA-S1 tree, 2026-08-07; and AGAIN on the BT-L0 tree, GR21, where the table holds 87 and the
+# union 86, with `nvidia-kepler-kdisp-hold` still the sole gap): compare the `[features]` table
+# (minus `default`) against the union of the three leg feature lists below. `sdhcblk` (SDHC-4b),
+# `bcmaS1` (BCMA-S1) and `bt` (BT-L0) are all on `x86-all`, so no arc widens the gap.
+#
+# And the DEFAULT legs already compile the all-off state for both arches — so for every feature BOTH polarities of its `#[cfg]` are
+# type-checked, which is what makes the 61
+# `not(feature = "pi")` / 21 `not(feature = "tegra")` / 14 `not(feature = "baremetal")` sites in the
+# tree real coverage rather than an accident. The three default-ON features (`ehcihid`, `kbdwit`,
+# `smolnet`) and the negative knob `noportsw` are the one asymmetry worth stating: their opt-OUT state
+# has no `#[cfg(not(...))]` site anywhere in src/ (verified), so nothing is left unchecked.
+#
+# Fields (whitespace-separated, 3 of them; features must contain no spaces):
+#   1 leg label — printed on the ✅/❌ line and in the failure summary, so a red gate names the LEG
+#     and not just "the kernel".
+#   2 --target json, relative to crates/kernel (same form the default legs use).
+#   3 comma-separated cargo feature list.
+#
+# COST: these share the ordinary target/ dir on purpose. Cargo hashes the enabled-feature set into
+# each unit's `-Cmetadata`, so a differing feature set gets its OWN fingerprint + rlib and coexists
+# with the default legs' artifacts instead of evicting them — alternating `check` and a media build
+# does NOT thrash. Warm, all three legs are cache hits; cold-for-these-feature-sets they cost about
+# 3-6 s each on top of a warm dependency graph.
+KERNEL_CFG_MATRIX=(
+  # x86_64, every feature that emits x86 code. Covers (among others) wcg (witness) and its PAYGO
+  # reshape (wcg-paygo — an x86-only `#[cfg]` inside a witness-only module, so this is the ONLY leg
+  # that type-checks it at all), wcx + the fbcon
+  # CONSOLE-WINDOW route (wc), instgui, the Kepler trio, IVB/GMUX, VPERF (videobench/videocap), the
+  # EHCI family + KBDWIT, MTRAW + its inject sub-knob, STOR-1 (irqstorage), the BOT fault/ring
+  # experiments, BENCH-RIDE (therm/pcilink/vrom), SMC, the rasterizer and the installer engine.
+  # SDHC-4a: `sdw` is carried HERE and only here. Its gate is a real `#[cfg(feature = "sdw")]` on
+  # `drivers::sdhc::write_block_512` and on the armed half of the self-test, so without a leg that
+  # enables it the entire CMD24 ladder would be type-checked by nothing — the exact blind spot the
+  # coverage argument above exists to close. The default legs cover the disarmed polarity.
+  # `pfwire_selftest` (the forced fatal-#PF self-test) rides the same argument: its
+  # `#[cfg]` is type-checked by this leg alone. PCI-CENSUS (GR20) is APPENDED at the end for the
+  # same reason and by the same rule: `pcicensus` gates `full_census` + its two helpers + the call
+  # site in `arch/x86_64/pci.rs`, all x86-only, so this leg is the only one that type-checks them.
+  # WXN-x86 M3b (GR20) is APPENDED at the end for a slightly different reason: `wxnro` gates a
+  # `cfg!(...)` expression, not a `#[cfg]` item, so the DISARMED polarity of `wxn_ro_stage` is already
+  # type-checked by every leg. What this leg adds is the ARMED polarity — the constant folds the other
+  # way, which is the build the metal flight actually carries.
+  # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
+  # replacing the list instead of extending it.
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2"
+  # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
+  # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
+  # three-rung INSTALL-PI ladder. Cannot carry the tegra family — see the mutual-exclusion note above.
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm"
+  # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
+  # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
+  # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
+  # (the QEMU-virt virtio-net driver, which carries no board gate of its own and so type-checks here).
+  "arm-tegra   ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet"
+  # VSYNC-PACE (GR22; ⚠ POLARITY INVERTED GR25) — x86, compositor ON, present pacer ARMED. A leg of its
+  # own, and the reason is a hole: `vsyncpace` gates nothing unless `wc` is also set (the pacer lives
+  # inside the `wc` half of `arch/x86_64/syscall.rs`), so `wc` OFF + `vsyncpace` ON type-checks the same
+  # empty set the default legs already do. REVIEW C3 CORRECTION (kept, and it still applies with the
+  # names swapped): an earlier version of this comment claimed the pairwise-mix legs "never guarantee a
+  # leg with BOTH ON". That is FALSE — the reviewer reconstructed `build_cfg_legs` against the post-arc
+  # Cargo.toml and found mix legs already covering wc+pacer with witness both ways. This leg is kept as
+  # explicit belt-and-braces, named rather than derived, because the mix legs are INDEX-DERIVED from
+  # `[features]` order, so any claim of the form "config X is covered by x86-mix-N" is stale the moment
+  # a feature is added or renamed.
+  #
+  # ⚠ WHICH LEG IS THE SHIPPED ONE CHANGED WITH THE POLARITY. `x86-all` deliberately does NOT carry
+  # `vsyncpace` — it is the shipped-desktop leg and the shipped desktop is now UNPACED, so `x86-all`
+  # holds the pacer's DISARMED polarity under type-check. THIS leg is the armed twin, and it is the one
+  # that must be named explicitly now: the sleeping code has no other leg that compiles it with the
+  # witness on. Between them both polarities of every `#[cfg]` in the family are compiled.
+  "x86-vsyncpace ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,wc,witness,vsyncpace,ehcihid,smolnet"
+)
+
+# ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
+#
+# THE BLIND SPOT this closes. KERNEL_CFG_MATRIX above and the two DEFAULT legs in check_both between
+# them exercise exactly two points of the x86 feature cube: everything OFF (the default legs) and
+# everything ON (`x86-all`). Every configuration anyone actually boots is in the MIDDLE, and the
+# middle was never compiled. That is not theoretical either. The igpu lane's Flight 1 shipped a stray
+# `#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]` that bound to `pub fn init` in
+# `drivers/gpu/igpu.rs`, gating the entire iGPU probe entry point behind `gmux_igd`. The call site,
+# `arch/x86_64/pci.rs`, is gated on `intel-ivb`. So:
+#   * all features OFF  -> neither the definition nor the call site is compiled. GREEN.
+#   * all features ON   -> both are compiled, the call resolves. GREEN.
+#   * intel-ivb ON, gmux_igd OFF (the NORMAL rMBP build, and what the bench media carries)
+#                       -> E0425 `cannot find function 'init'`. RED — and nothing ran it.
+# Both required gates passed a branch that could not build the machine it was written for.
+#
+# THE DEFECT CLASS, stated precisely: a symbol that exists only under feature X is referenced from
+# code that is compiled under feature Y (or under no gate at all). Detecting it needs one compile in
+# which Y is ON and X is OFF. The ungated case (Y = nothing) is already covered — the DEFAULT legs
+# compile the all-off state. What was missing is the feature-vs-feature case.
+#
+# THE LEG-SELECTION RULE (why this many legs and not more). The full powerset is 2^39 and absurd.
+# Per-feature sweeps (each ON alone; each dropped from the full set) are linear — 2N = 78 legs, ~220 s
+# measured — which is too slow to sit in `check` on every edit. But complete coverage of the defect
+# class does not need N legs at all, it needs an ORDERED-PAIR covering array, and that is LOGARITHMIC:
+#
+#   Give feature i a distinct n-bit mask M_i, all masks of the SAME popcount n/2 (an antichain), and
+#   define leg j = { feature i : bit j of M_i is set }. For any two distinct features X != Y, M_X and
+#   M_Y are distinct sets of equal size, so neither contains the other, so some bit j is set in M_Y
+#   and clear in M_X. Leg j therefore has Y ON and X OFF. Every ordered pair is covered, by
+#   construction, with n legs — and n is the smallest integer with C(n, n/2) >= N, i.e. the PROVABLY
+#   MINIMAL number of legs for which such a family of masks exists at all. For today's N = 39 x86
+#   features that is n = 8. Verified empirically at authoring time: 0 uncovered ordered pairs of 1482.
+#
+# So the default gate pays 8 compiles (~23 s cold, measured) for complete pairwise cfg coverage of
+# the x86 feature cube. The `gmux_igd`/`intel-ivb` pair above is covered several times over.
+#
+# WHAT THIS DOES NOT COVER, stated honestly. Strength 2. A symbol under X referenced from code gated
+# on `all(feature = "Y", feature = "Z")` needs a leg with Y and Z on and X off; the covering array
+# guarantees that only for pairs, not triples. The `x86-drop-<feat>` sweep legs behind
+# UNAOS_CFG_SWEEP=1 close exactly that direction — each drops ONE feature with all 38 others ON, so
+# every conjunction of other features is compiled — at the cost of 39 more compiles.
+#
+# UNAOS_CFG_SWEEP=1 adds, on top of the 8 default mix legs:
+#   * `x86-only-<feat>`  — that feature ALONE (39 legs). Answers "does this feature stand up by
+#                          itself", and localizes: the mix legs prove a defect EXISTS but name a leg
+#                          carrying ~20 features; this names one.
+#   * `x86-drop-<feat>`  — the full x86 set MINUS that feature (39 legs). The strength-unbounded
+#                          direction described above.
+# Measured on the clean tree at authoring time: on-alone 39/39 green, leave-one-out 39/39 green,
+# ~220 s for the pair.
+#
+# THE FEATURE LIST IS DERIVED, NOT COPIED. A second hardcoded list would drift out of `[features]` —
+# and already had: `nvidia-kepler-kdisp-hold` is declared in crates/kernel/Cargo.toml and appears in
+# NO leg of KERNEL_CFG_MATRIX, so it had never been type-checked at all. So the universe is computed
+# every run as
+#       (every feature in crates/kernel/Cargo.toml's [features] table, minus `default`)
+#     - (the aarch64-only features, = what the arm-* legs above name and `x86-all` does not)
+# which makes Cargo.toml the single source of truth and puts a NEW feature under coverage the moment
+# it is declared. Corollary, and the rule for anyone adding a knob: a new feature is treated as x86
+# unless it is named on an arm-* leg. Declare an aarch64-only feature without adding it to arm-pi or
+# arm-tegra and these legs will try to compile it on x86 and the gate will go red naming it — which
+# is the intended forcing function, not a bug.
+
+# Emit the kernel's feature names, one per line, `default` excluded — read straight out of the
+# `[features]` table. Every entry in that table is a single `name = [...]` line; the guard in
+# x86_cfg_universe fails loudly if this parse ever returns an implausible count.
+kernel_feature_table() {
+    awk '
+        /^\[features\]/ { inf = 1; next }
+        /^\[/           { inf = 0 }
+        inf && /^[A-Za-z0-9_-]+[ \t]*=[ \t]*\[/ {
+            sub(/[ \t]*=.*/, "", $0)
+            if ($0 != "default") print $0
+        }
+    ' "$WORKSPACE_DIR/crates/kernel/Cargo.toml"
+}
+
+# The x86 sweep universe: the whole feature table minus the features the matrix marks aarch64-only.
+# Prints one feature per line. Returns 1 (and says why) if the Cargo.toml parse looks broken, so a
+# silently-empty universe can never masquerade as a green gate.
+x86_cfg_universe() {
+    local _all _armonly _x86all _f _n _row _leg _tgt _feats
+    _all="$(kernel_feature_table)"
+    _n=$(printf '%s\n' "$_all" | grep -c . || true)
+    if [ "$_n" -lt 40 ]; then
+        echo -e "${COLOR_RED}❌ kernel cfg coverage: parsed only ${_n} features from crates/kernel/Cargo.toml — [features] parse is broken${COLOR_RESET}" >&2
+        return 1
+    fi
+    # arm-only = named by an arm-* leg and NOT by x86-all.
+    _x86all=""; _armonly=""
+    for _row in "${KERNEL_CFG_MATRIX[@]}"; do
+        read -r _leg _tgt _feats <<< "$_row"
+        case "$_leg" in
+            x86-*) _x86all="${_x86all},${_feats}" ;;
+            arm-*) _armonly="${_armonly},${_feats}" ;;
+        esac
+    done
+    # `|| true` on every grep: a filter that removes the last line returns 1, and `set -e` would turn
+    # that into a silent abort of the whole gate instead of a verdict.
+    for _f in $(printf '%s\n' "$_armonly" | tr ',' '\n' | grep -v '^$' | sort -u); do
+        case ",${_x86all}," in *",${_f},"*) ;; *) _all="$(printf '%s\n' "$_all" | grep -vx "$_f" || true)" ;; esac
+    done
+    printf '%s\n' "$_all" | grep -v '^$' || true
+}
+
+# Fill KERNEL_CFG_MIX (always) and KERNEL_CFG_SWEEP (only under UNAOS_CFG_SWEEP=1) with rows in the
+# exact 3-field shape KERNEL_CFG_MATRIX uses: "label  target-json  comma,separated,features".
+KERNEL_CFG_MIX=()
+KERNEL_CFG_SWEEP=()
+build_cfg_legs() {
+    local _uni _N _n _c _m _bit _feats _i _f _full
+    local -a _U=() _MASK=()
+    _uni="$(x86_cfg_universe)" || return 1
+    while read -r _f; do [ -n "$_f" ] && _U+=("$_f"); done <<< "$_uni"
+    _N=${#_U[@]}
+
+    # Smallest n with C(n, n/2) >= N, found by counting the popcount-n/2 masks directly (n <= 10 here,
+    # so this is a few hundred iterations of integer arithmetic — free next to one cargo invocation).
+    _n=1
+    while :; do
+        _c=0
+        for ((_m = 0; _m < (1 << _n); _m++)); do
+            _bit=$_m; _i=0
+            while [ "$_bit" -ne 0 ]; do _i=$((_i + (_bit & 1))); _bit=$((_bit >> 1)); done
+            [ "$_i" -eq $((_n / 2)) ] && _c=$((_c + 1))
+        done
+        [ "$_c" -ge "$_N" ] && break
+        _n=$((_n + 1))
+    done
+    # The masks themselves, in increasing integer order, first N of them.
+    for ((_m = 0; _m < (1 << _n) && ${#_MASK[@]} < _N; _m++)); do
+        _bit=$_m; _i=0
+        while [ "$_bit" -ne 0 ]; do _i=$((_i + (_bit & 1))); _bit=$((_bit >> 1)); done
+        [ "$_i" -eq $((_n / 2)) ] && _MASK+=("$_m")
+    done
+
+    for ((_bit = 0; _bit < _n; _bit++)); do
+        _feats=""
+        for ((_i = 0; _i < _N; _i++)); do
+            (( (_MASK[_i] >> _bit) & 1 )) && _feats="${_feats},${_U[_i]}"
+        done
+        KERNEL_CFG_MIX+=("x86-mix-${_bit} ../../x86_64-unaos.json ${_feats#,}")
+    done
+
+    [ "${UNAOS_CFG_SWEEP:-0}" = "1" ] || return 0
+    _full="$(printf '%s,' "${_U[@]}")"; _full="${_full%,}"
+    for ((_i = 0; _i < _N; _i++)); do
+        KERNEL_CFG_SWEEP+=("x86-only-${_U[_i]} ../../x86_64-unaos.json ${_U[_i]}")
+    done
+    for ((_i = 0; _i < _N; _i++)); do
+        _feats="$(printf '%s\n' "$_full" | tr ',' '\n' | { grep -vx "${_U[_i]}" || true; } | tr '\n' ',')"
+        KERNEL_CFG_SWEEP+=("x86-drop-${_U[_i]} ../../x86_64-unaos.json ${_feats%,}")
+    done
+}
+
+# Type-check every KERNEL_CFG_MATRIX leg and print one summary line per leg, in the same shape as the
+# kernel and userspace legs above.
+#
+# Like check_user_arch it does NOT stop at the first failure: a broken shared helper typically breaks
+# more than one leg, and aborting on the first would hand back one leg per run — a full round-trip
+# each. Every failing leg is collected and NAMED (leg label + the crate that failed to compile), and
+# the function returns 1, which check_both turns into a non-zero exit for the whole gate.
+#
+# NOTE this deliberately does NOT consult $KERNEL_FEATURES. These legs are a FIXED coverage matrix:
+# if an operator's UNAOS_* environment could add to them, the gate would mean something different for
+# every operator, and "check green" would stop being a shared fact. The operator's own knob set is
+# already what the two default legs compile.
+#
+# The board matrix runs FIRST and the derived GATE-CFG-MIX legs behind it: the board legs are the ones
+# an edit is most likely to break, so their diagnostics stay at the top of the scrollback. A red mix
+# leg names the leg AND its exact `--features` string, because the label alone ("x86-mix-3") does not
+# tell you which configuration broke and the whole point of these legs is to name the configuration.
+check_kernel_cfg() {
+    local _rc=0 _n=0 _failed=""
+    local _row _leg _tgt _feats
+    local -a _rows=()
+    build_cfg_legs || return 1
+    _rows=("${KERNEL_CFG_MATRIX[@]}" "${KERNEL_CFG_MIX[@]}" "${KERNEL_CFG_SWEEP[@]}")
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: kernel cfg-gated coverage (${#_rows[@]} legs)...${COLOR_RESET}"
+    if [ "${UNAOS_CFG_SWEEP:-0}" != "1" ]; then
+        echo -e "${COLOR_CYAN}  (${#KERNEL_CFG_MATRIX[@]} board + ${#KERNEL_CFG_MIX[@]} x86 pairwise-mix; UNAOS_CFG_SWEEP=1 adds the per-feature sweep)${COLOR_RESET}"
+    fi
+    cd "$WORKSPACE_DIR/crates/kernel"
+    for _row in "${_rows[@]}"; do
+        read -r _leg _tgt _feats <<< "$_row"
+        _n=$((_n + 1))
+        echo -e "${COLOR_CYAN}  → ${_leg}${COLOR_RESET}"
+        # `if ... else` (not a bare command) so `set -e` cannot abort the loop before every leg has run.
+        if cargo +nightly check --release --target "$_tgt" $NIGHTLY_FLAGS --features "$_feats"; then
+            echo -e "${COLOR_GREEN}  ✅ ${_leg}${COLOR_RESET}"
+        else
+            echo -e "${COLOR_RED}  ❌ ${_leg} — unaos-kernel FAILED to compile${COLOR_RESET}"
+            # Name the CONFIGURATION, not just the leg. For the board legs the label already implies
+            # it; for a derived mix/sweep leg the feature string IS the finding — it is the thing the
+            # author has to reproduce, and reconstructing it from a label costs a round-trip.
+            echo -e "${COLOR_RED}     configuration: --target ${_tgt} --features ${_feats}${COLOR_RESET}"
+            _failed="${_failed} ${_leg}"
+            _rc=1
+        fi
+    done
+    cd "$WORKSPACE_DIR"
+    if [ "$_rc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ kernel cfg coverage FAILED (crate unaos-kernel), legs:${_failed}${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_GREEN}✅ kernel cfg coverage OK (${_n} legs)${COLOR_RESET}"
+}
 
 check_both() {
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: x86_64...${COLOR_RESET}"
@@ -827,6 +1799,60 @@ check_both() {
       $NIGHTLY_FLAGS $(arm_features)
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ aarch64 OK${COLOR_RESET}"
+
+    # GATE-CFG: the cfg-gated coverage legs, immediately behind the two DEFAULT kernel legs so all the
+    # kernel verdicts sit together in the scrollback. The default legs stay first and unchanged: they
+    # are what the operator's own UNAOS_* knobs compile, and they are the fastest way to a diagnostic
+    # for the edit that was just made. `_krc` carries a red leg past the userspace legs below, so a
+    # green userspace can never mask a broken feature-gated kernel.
+    local _krc=0
+    check_kernel_cfg || _krc=1
+
+    # GATE-USER: the ring-3 crates, per arch, AFTER the kernel legs. Ordering is deliberate — the kernel
+    # is what most edits touch, so its diagnostics stay at the top of the scrollback; and a userspace stub
+    # that disagrees with the kernel is easier to read once the kernel's own verdict is already in.
+    #
+    # Both legs run even if the first fails, for the same reason check_user_arch does not stop at its own
+    # first failure: one run should name every broken crate. `_urc` carries the verdict past the second
+    # leg so a green aarch64 can never mask a red x86_64.
+    local _urc=0
+    check_user_arch x86_64  || _urc=1
+    check_user_arch aarch64 || _urc=1
+
+    # GATE-CORE: the HOST unit tests of the shared no_std cores the kernel links. `midden_core` is
+    # the shell's one command table, parser and bare-name resolver (unaos/libs/sys/midden_core), and
+    # its assertions are the only thing standing between a table edit and a shell that quietly
+    # decides words differently — including the case rule, where `is_verb` disagreeing with the
+    # case-insensitive FAT walk means a dropped `LS.ELF` can be launched by typing `LS`.
+    #
+    # WHY IT BELONGS IN `check` AND NOT IN A README. These ran hand-only, and a suite that is listed
+    # as a gate in the docs but is not in any gate is exactly the vacuous instrument this tree keeps
+    # catching. The cost is ~1 s: the crate is `no_std` + `alloc`, has zero dependencies, and builds
+    # for the HOST here (the kernel legs above already proved it compiles for both targets).
+    #
+    # Root workspace, not `unaos/`: `midden_core` is a member of the repo-root `Cargo.toml`, the same
+    # convention as `libs/fs/unafs` and `libs/sys/helm`, so `-p` is resolved from `WORKSPACE_DIR/..`.
+    local _crc=0
+    echo -e "${COLOR_YELLOW}⚡ Host tests: shared cores (midden_core)...${COLOR_RESET}"
+    if (cd "$WORKSPACE_DIR/.." && cargo test -p midden_core); then
+        echo -e "${COLOR_GREEN}✅ midden_core tests OK${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}  ❌ midden_core host tests FAILED${COLOR_RESET}"
+        _crc=1
+    fi
+
+    if [ "$_urc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — userspace crates did not compile (see above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_krc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — cfg-gated kernel code did not compile (see above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_crc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a shared core's host tests did not pass (see above)${COLOR_RESET}"
+        return 1
+    fi
 }
 
 build_both() {
@@ -910,6 +1936,10 @@ esp_x86() {
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
+    # The media path does NOT go through build_kernel_x86_64 (the builder compiles the kernel
+    # itself), so the .rodata gate runs here too — on the STAGED image, which is the ELF the
+    # firmware actually loads. A gate that only covers the QEMU path is not a gate on the boot media.
+    gate_x86_rodata_no_code "${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf"
     pack_source_along "${WORKSPACE_DIR}/target/x86_64_esp"
     echo -e "${COLOR_GREEN}✅ x86 ESP: ${WORKSPACE_DIR}/target/x86_64_esp/ (incl. HELLO.BIN for the U2 loader)${COLOR_RESET}"
     local _kelf="${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf"
@@ -1014,6 +2044,53 @@ test_fat() {
     bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" "$layout"
     export UNAOS_FATIMG="$layout"
     test_x86_64 "$secs"
+}
+
+# SELFHOST-2: the on-shard source-verify gate. `./arroyo test-selfhost [layout] [secs]`.
+#
+# This is the ONE lane that packs SOURCE-ALONG onto a FAT fixture, and it must: `test-fat` sets
+# UNAOS_NOSRC=1 precisely so its 96 MiB image stays enumerable byte for byte, so a gate that rode
+# `test-fat` would boot a kernel looking for a SRC.TGZ the fixture had just been told not to carry --
+# vacuous, and green while vacuous. Here SOURCE-ALONG is left ON for `esp_x86` and UNAOS_SRCFIXTURE=1
+# tells make-fat-img.sh to stage the pair onto the image, so the kernel under test reads a REAL
+# `git archive HEAD | gzip -9` of this very tree.
+#
+# The verdict is asserted HERE rather than left to the generic fault scan: a boot that never reached
+# the witness at all would pass a scan for the absence of faults. `-> PASS ::` on the SELFHOST line is
+# the positive claim, and the honest "nothing packed" line is failed explicitly so a silent
+# UNAOS_NOSRC leak cannot read as success.
+test_selfhost() {
+    local layout="${1:-sf}"
+    local secs="${2:-180}"
+    case "$layout" in part|gpt|p16|sf) ;; *) echo "usage: ./arroyo test-selfhost [part|gpt|p16|sf] [secs]"; exit 1;; esac
+    # RE-EXEC, and it is load-bearing. This script's knob->feature mapping (`_feats`, top of file) is
+    # evaluated ONCE at script load, before dispatch, so a knob exported from inside a lane function
+    # never reaches arroyo's OWN `cargo build`. That build runs LAST here (test_x86_64 rebuilds the
+    # kernel after the ESP is packaged) and its output is the kernel that boots — so an in-function
+    # export produced a builder banner reading `selfhost,...` over a booted kernel with the module
+    # compiled OUT, and a gate that could only ever report "not packed". Re-exec with the environment
+    # already set is the only way a lane can arm a knob for its own build.
+    if [ -z "${UNAOS_SELFHOST:-}" ] || [ -n "${UNAOS_NOSRC:-}" ]; then
+        exec env -u UNAOS_NOSRC UNAOS_SELFHOST=1 "$0" test-selfhost "$layout" "$secs"
+    fi
+    esp_x86
+    UNAOS_SRCFIXTURE=1 bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" "$layout"
+    export UNAOS_FATIMG="$layout"
+    test_x86_64 "$secs" || true    # verdict is the witness line below, not the absence of faults
+    local log="$SERIAL_LOG"
+    echo -e ""
+    if [ ! -s "$log" ]; then
+        echo -e "${COLOR_RED}❌ SELFHOST: ${log} is empty — the boot carries NO verdict${COLOR_RESET}"
+        exit 4
+    fi
+    awk '/SELFHOST:/' "$log" || true
+    if awk '/SELFHOST: src verified .* -> PASS ::/{f=1} END{exit !f}' "$log"; then
+        echo -e "${COLOR_GREEN}✅ SELFHOST: the shard verified and enumerated its own source tree${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}❌ SELFHOST: no 'src verified ... -> PASS ::' line in ${log}${COLOR_RESET}"
+        exit 1
+    fi
+    scan_serial_faults "$log"
 }
 
 # aarch64 ESP for the Raspberry Pi 4 (UEFI / Path A). Copy onto a FAT32 SD card alongside the
@@ -2136,7 +3213,7 @@ show_menu() {
     echo -e "  ${COLOR_CYAN}1)${COLOR_RESET} Boot x86_64    (Build + QEMU GUI)"
     echo -e "  ${COLOR_CYAN}2)${COLOR_RESET} Boot aarch64   (Build + QEMU)"
     echo -e "  ${COLOR_CYAN}3)${COLOR_RESET} Test x86_64    (Headless, capture serial -> target/serial.log)"
-    echo -e "  ${COLOR_CYAN}4)${COLOR_RESET} Check          (Both targets)"
+    echo -e "  ${COLOR_CYAN}4)${COLOR_RESET} Check          (Both targets + cfg-gated feature legs + userspace)"
     echo -e "  ${COLOR_CYAN}5)${COLOR_RESET} Build          (Both targets)"
     echo -e "  ${COLOR_CYAN}6)${COLOR_RESET} Clean"
     echo -e "  ${COLOR_CYAN}q)${COLOR_RESET} Quit"
@@ -2162,12 +3239,16 @@ show_menu() {
 # 2026-07-11 alone): under battery load the best-effort console intermittently drops ONE
 # verdict line — always with ZERO explicit FAIL lines. On exactly that signature, re-run the
 # FAT chain once in isolation and let the appended re-run's verdicts stand; a log carrying any
-# real "-> FAIL"/"FAIL ::" line keeps its red (no retry). All output flows through _step's
-# capture, so the pattern + FAIL scans below see the COMBINED log (the PASS-line tally in the
-# summary inflates on a retry day — informational only, the retry announcement line explains).
+# FAULT_PATTERNS line keeps its red (no retry). All output flows through _step's
+# capture, so the pattern + FAULT_PATTERNS scans below see the COMBINED log (the PASS-line tally in
+# the summary inflates on a retry day — informational only, the retry announcement line explains).
+#
+# FAULT-SCAN: the retry gate reads THE shared list, not its own two-pattern copy. It has to: once
+# `test-fat` fails on its own fault scan, a PANIC would otherwise reach here, find no `-> FAIL` line,
+# be diagnosed as the console drop, and buy a spurious 200 s re-run of a boot already known to be dead.
 test_fat_drop_retry() { # $1 = the logfile _step is capturing (READ here, written via stdout)
     if "$0" test-fat sf 300; then return 0; fi
-    if ! awk 'BEGIN{f=0} /-> FAIL|FAIL ::/{f=1} END{exit f}' "$1"; then return 1; fi
+    if ! awk -v p="$FAULT_PATTERNS" 'BEGIN{f=0} $0 ~ p {f=1} END{exit f}' "$1"; then return 1; fi
     echo "battery: test-fat missed its verdict with ZERO FAIL lines — the ledgered console drop; ONE isolated re-run"
     UNAOS_FATIMG=sf "$0" test 200
 }
@@ -2176,9 +3257,18 @@ battery() {
     local t0=$SECONDS rc=0 results=""
     local blog_dir="target/battery"; mkdir -p "$blog_dir"
 
-    _step() { # name, expected-pattern (empty = rc only), logfile[:verdictfile], cmd...
+    _step() { # [--build] name, expected-pattern (empty = rc only), logfile[:verdictfile], cmd...
         # kernel8-test doesn't echo its serial log to stdout, so a step may name a separate
         # verdict file (logfile:verdictfile) — patterns are checked there instead.
+        #
+        # FAULT-SCAN `--build`: this step's verdict file is COMPILER OUTPUT, not a serial capture, so
+        # the fault scan below is skipped for it. FAULT_PATTERNS is a list of things a KERNEL says on
+        # the wire; a rustc diagnostic that happens to quote one of the source lines that PRINTS them
+        # (`serial_println!("EXCEPTION: PAGE FAULT")` and friends are real, greppable source text) would
+        # otherwise red a perfectly good build. These steps already carry the verdict that matters —
+        # their command's own exit status, which `check` and `esp-jetson` set correctly.
+        local faultscan=1
+        if [ "$1" = "--build" ]; then faultscan=0; shift; fi
         local name="$1" pattern="$2" logf="${3%%:*}" vf="${3#*:}"; shift 3
         echo -e "${COLOR_CYAN}⚡ battery: ${name}${COLOR_RESET}"
         if "$@" > "$logf" 2>&1; then local crc=0; else local crc=$?; fi
@@ -2187,13 +3277,13 @@ battery() {
         if [ -n "$pattern" ]; then
             awk -v p="$pattern" 'BEGIN{f=1} $0 ~ p {f=0} END{exit f}' "$vf" || ok=0
         fi
-        # Any explicit FAIL verdict line in a serial-backed step is a failure.
-        # FATIMG-CI: `FAIL —` is in the list because the WINX end-to-end verdicts spell their failure
-        # `:: WINX-2: ... FAIL — <reason> ::`, which matched NEITHER `-> FAIL` nor `FAIL ::`. Those are
-        # exactly the verdicts that carry the shipped `bg /fat/STAT.ELF` / `bg /fat/VUG.ELF` path, so a
-        # red one used to pass straight through this scan. The em-dash keeps the pattern narrow enough
-        # not to fire on prose that merely contains the word.
-        awk 'BEGIN{f=0} /-> FAIL|FAIL ::|FAIL — /{f=1} END{exit f}' "$vf" || ok=0
+        # Any fault line in a serial-backed step is a failure. FAULT-SCAN: the pattern set lives in the
+        # single FAULT_PATTERNS list (see above the test legs) — this scan used to carry its own copy of
+        # the three FAIL spellings and knew nothing about PANIC or EXCEPTION:, which is the same blind
+        # spot that let a panicked boot exit 0 from `./arroyo test`.
+        if [ "$faultscan" -eq 1 ]; then
+            awk -v p="$FAULT_PATTERNS" 'BEGIN{f=0} $0 ~ p {f=1} END{exit f}' "$vf" || ok=0
+        fi
         if [ "$ok" -eq 1 ]; then
             results="${results}  ✅ ${name}\n"
         else
@@ -2201,8 +3291,8 @@ battery() {
         fi
     }
 
-    _step "check (both arches)"        ""                    "$blog_dir/check.log"        "$0" check
-    _step "check (tegra)"              ""                    "$blog_dir/check-tegra.log"  env UNAOS_TEGRA=1 "$0" check
+    _step --build "check (both arches)"  ""                  "$blog_dir/check.log"        "$0" check
+    _step --build "check (tegra)"        ""                  "$blog_dir/check-tegra.log"  env UNAOS_TEGRA=1 "$0" check
     _step "x86 test 25 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-x86.log"     "$0" test 25
     _step "x86 test-fat sf 300"        "U11m2.*-> PASS"      "$blog_dir/test-fat.log"     test_fat_drop_retry "$blog_dir/test-fat.log"
     _step "arm virt v2 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-arm-v2.log"  "$0" test-arm 22
@@ -2245,7 +3335,7 @@ battery() {
     if awk 'BEGIN{f=1} /MBENCH TRUNCATED/{f=0} END{exit f}' "$blog_dir/kernel8.log" 2>/dev/null; then
         results="${results}       ↳ TRUNCATED (INCONCLUSIVE): the pi boot was CUT SHORT, not regressed — re-run before bisecting (${blog_dir}/kernel8.log)\n"
     fi
-    _step "esp-jetson (links)"         ""                    "$blog_dir/esp-jetson.log"   env UNAOS_TEGRA=1 "$0" esp-jetson
+    _step --build "esp-jetson (links)"   ""                  "$blog_dir/esp-jetson.log"   env UNAOS_TEGRA=1 "$0" esp-jetson
 
     local passes; passes=$(awk '/-> PASS|: PASS/{n++} END{print n+0}' "$blog_dir/test-fat.log" target/serial-pi.log 2>/dev/null || echo '?')
     echo -e "\n${COLOR_PURPLE}════════════ BATTERY SUMMARY ($(( SECONDS - t0 ))s) ════════════${COLOR_RESET}"
@@ -2300,6 +3390,9 @@ case "${1:-}" in
     test-fat|test_fat)
         test_fat "${2:-part}" "${3:-30}"
         ;;
+    test-selfhost|test_selfhost|selfhost)
+        test_selfhost "${2:-sf}" "${3:-180}"
+        ;;
     kernel8|baremetal)
         kernel8
         ;;
@@ -2332,7 +3425,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
         exit 1
         ;;
 esac

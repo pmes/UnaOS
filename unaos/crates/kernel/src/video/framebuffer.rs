@@ -210,14 +210,28 @@ impl FrameBuffer {
             return None;
         }
         let p = (self.base + offset) as *const u8;
-        // SAFETY: bounds-checked against `self.len` above; volatile so the read is not hoisted or
-        // folded with the stores the blit just performed.
-        let (a, b, c) = unsafe {
-            (
-                core::ptr::read_volatile(p),
-                core::ptr::read_volatile(p.add(1)),
-                core::ptr::read_volatile(p.add(2)),
-            )
+        // One 32-bit transaction instead of three 8-bit ones, where the pixel allows it. On
+        // cacheable RAM the cache made the three byte reads free, so nobody noticed; on a WC-mapped
+        // PCIe aperture every volatile u8 read is its own non-posted round trip (~976 ns measured,
+        // GR17 cost model), so every verify probe paid 3× for the same three bytes. Same bytes,
+        // same decode, same Some/None decisions: the wide path additionally requires 4-alignment
+        // and the fourth byte in-bounds, and falls back to the byte path at exactly those edges
+        // (unaligned base, truncated tail pixel) rather than ever changing an answer.
+        let (a, b, c) = if (self.base + offset) & 3 == 0 && offset + 4 <= self.len {
+            // SAFETY: 4-aligned and bounds-checked above; volatile for the same reason as the
+            // byte path.
+            let v = unsafe { core::ptr::read_volatile((self.base + offset) as *const u32) };
+            ((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8)
+        } else {
+            // SAFETY: bounds-checked against `self.len` above; volatile so the read is not hoisted
+            // or folded with the stores the blit just performed.
+            unsafe {
+                (
+                    core::ptr::read_volatile(p),
+                    core::ptr::read_volatile(p.add(1)),
+                    core::ptr::read_volatile(p.add(2)),
+                )
+            }
         };
         match self.info.pixel_format {
             PixelFormat::Rgb => Some(((a as u32) << 16) | ((b as u32) << 8) | c as u32),
@@ -327,6 +341,25 @@ impl FrameBuffer {
     /// Fill pixel rows `[y0, y1)` (clamped to the frame) with a colour.
     pub fn fill_rows(&self, y0: usize, y1: usize, color: u32) {
         let y_end = y1.min(self.info.height);
+        
+        #[cfg(all(target_arch = "x86_64", feature = "intel-ivb"))]
+        {
+            let gtt = crate::drivers::gpu::igpu::ACTIVE_SURF.load(core::sync::atomic::Ordering::Relaxed);
+            if gtt != 0 {
+                if crate::drivers::gpu::igpu::blitter_fill_rect(
+                    gtt,
+                    0,
+                    y0 as u16,
+                    self.info.width as u16,
+                    (y_end - y0) as u16,
+                    color,
+                    (self.info.stride * self.info.bytes_per_pixel) as u32
+                ) {
+                    return;
+                }
+            }
+        }
+
         // VPERF M4 (x86 only): word-wide band fill for full-4-byte-pixel formats — the format
         // decode and bounds checks hoisted to once per row instead of once per pixel. Writes
         // only the visible width (the stride gap stays untouched, like `put_pixel`).
@@ -525,6 +558,29 @@ impl FrameBuffer {
         let total = (self.info.height * row_bytes).min(self.len);
         if shift >= total {
             return;
+        }
+        
+        let cleared_from = self.info.height.saturating_sub(dy);
+        
+        #[cfg(all(target_arch = "x86_64", feature = "intel-ivb"))]
+        {
+            let gtt = crate::drivers::gpu::igpu::ACTIVE_SURF.load(core::sync::atomic::Ordering::Relaxed);
+            if gtt != 0 {
+                if crate::drivers::gpu::igpu::blitter_copy_rect(
+                    gtt,
+                    gtt,
+                    0,
+                    0,
+                    0,
+                    dy as u16,
+                    self.info.width as u16,
+                    cleared_from as u16,
+                    row_bytes as u32
+                ) {
+                    self.fill_rows(cleared_from, self.info.height, fill);
+                    return;
+                }
+            }
         }
         // VPERF (bench builds only): count the memmove payload, attributing the source read to
         // VRAM when this surface IS the real framebuffer (the uncached-PCIe read being measured).

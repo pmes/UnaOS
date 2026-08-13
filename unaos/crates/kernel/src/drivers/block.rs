@@ -153,6 +153,333 @@ pub fn usb_info() -> Option<BlockDeviceInfo> {
     *USB_BLOCK_DEVICE.lock()
 }
 
+// ===================== APPLOAD — "is there storage I can load a PROGRAM from?" =====================
+//
+// SDHC-4b gave the internal SD slot a THIRD handle ([`SDHC_BLOCK_DEVICE`]) and `register_sdhc` says
+// so verbatim: "(global BLOCK_DEVICE untouched)". That was deliberate and it stays — the point of
+// the third handle is that a card in the internal reader can never disturb the transport the boot
+// volume is being read through.
+//
+// The DEFECT that motivates this section is not in that decision; it is that every consumer asking a
+// DIFFERENT question — "is there any storage at all that I could load a program off?" — was written
+// against [`info`], which reads the GLOBAL handle and nothing else. So a machine booted from the
+// INTERNAL reader with no USB stick printed
+//
+//     :: SDHCBLK: 8472 STAT.ELF / 12568 VUG.ELF / 12568 PULSE.ELF ::
+//
+// (the card mounted, the programs listed, by name and by size) and then, in the same capture,
+//
+//     [wc-x] desktop-app DECLINE reason=no-storage … no block device ever enumerated
+//
+// while that card sat mounted. The registry was right; the question was asked of the wrong slot.
+//
+// [`program_source`] below is that question, asked ONCE, in the block layer, so no consumer has to
+// carry a `#[cfg]` to get it right.
+//
+// ### PRECEDENCE — PSRC (GR26): the BOOT VOLUME wins; the handle ORDER is only the fallback
+//
+// The original rule was "GLOBAL first, Sdhc only as a fallback", justified by the premise that this
+// machine boots from a USB card reader, so the global slot IS the boot volume. `sdhc.md` §12.3
+// recorded the review finding that killed that premise: the bench rMBP now boots from the INTERNAL
+// slot, `sdhcblk` is default-on, and `publish_usb_geometry` claims the global UNCONDITIONALLY on
+// x86. So a USB stick inserted merely to CARRY files — the b43 firmware blobs, this week, for real —
+// would claim the global mid-boot and, under the old rule, silently become the program source:
+// `/fat` would stop meaning the volume the machine booted from and `bg /fat/VUG.ELF` would resolve
+// against the stick.
+//
+// FRGUARD already refuses the WRITE half of exactly that substitution (`BM_SUBSTITUTED`, Boot AI-2,
+// `docs/SECURITY.md`). The kernel therefore already HOLDS the evidence — `BootInfo::boot_volume_serial`,
+// published here by `set_boot_volume_serial` — and the old `program_source` simply did not consult it.
+// This is that consultation.
+//
+// The rule, in order:
+//
+//   1. **boot-serial.** If the FRGUARD verdict POSITIVELY locates the boot volume on a handle, and
+//      that handle is still populated, that handle wins. `BM_MATCH` -> `Global`, `BM_SUBSTITUTED` ->
+//      `Sdhc`. This is the only arm that can differ from the pre-PSRC answer, and it differs in
+//      exactly one direction: away from a medium this kernel did not boot from.
+//   2. **fallback-order / serial-unproven.** Everything else keeps the historical ladder — global,
+//      then `Sdhc`. That covers a boot serial of 0 (the loader could not identify the medium; the
+//      disarmed sentinel), a serial found on NEITHER handle (`BM_UNPROVEN` — the QEMU harness, and
+//      any machine booting from a device the block layer has no driver for), a verdict not yet
+//      derived, and a verdict whose named handle has since been retracted. Same fail-open direction
+//      FRGUARD takes, for the same reason: an unidentified or unreachable boot volume is a reason to
+//      SAY SO, not a reason to guess.
+//
+// ### Why this is cheap on the hot path, and why it adds no cache
+//
+// `program_source` is consulted per open — the shell's twenty-five FAT verbs, every exec probe, the
+// desktop-app storage gate on each main-loop pass while it waits, the wifi staging poll. It must not
+// read a sector, and it must not be callable into a masked deadlock.
+//
+// It does neither, because **the cache it needs already exists**: `BOOT_MEDIUM_VERDICT`. FRGUARD
+// derives it ONCE, from an unmasked main-loop context (`flight_recorder::service`), precisely because
+// deriving costs sector reads that cannot happen inside `write_block`; and `publish_usb_geometry`
+// resets it to `BM_UNKNOWN` whenever a new device claims the global slot, precisely so a hot-plug
+// cannot inherit the previous occupant's verdict. That is the same freshness property a preference
+// cache would need, already paid for and already metal-exercised. Adding a SECOND cache here would
+// duplicate the invalidation and create the stale-handle hazard it was meant to avoid — two caches
+// that can disagree about which disk is in the slot is strictly worse than one.
+//
+// So the whole decision is two relaxed-cost atomic loads plus the two `Option` reads the function
+// already performed. No sector I/O, no new lock, no new state.
+//
+// The one residual staleness — a verdict naming a handle that has since been RETRACTED
+// (`unpublish_usb_geometry` deliberately does not reset the verdict, because resetting it would turn
+// a `BM_SUBSTITUTED` refusal into a fail-open and WEAKEN FRGUARD) — is handled structurally rather
+// than by invalidation: arm 1 only wins if the named handle is still `Some`. A verdict that names an
+// empty slot falls through to arm 2 and says `verdict=stale-handle` on the wire.
+//
+// ### Is the verdict derived in time?
+//
+// It is derived in exactly the case that needs it, and the race that looks available is empty.
+// `flight_recorder::service` returns early while `info()` is `None`, so on a card-ONLY boot the
+// verdict is never derived at all — and that costs nothing, because with the global slot empty the
+// fallback ladder already lands on `Sdhc`. The verdict only matters when BOTH handles are populated,
+// which is precisely the state in which the flight recorder's gate passes and the derivation runs.
+//
+// There IS a residual window, and it is stated rather than argued away (review, GR26). Ordering on
+// x86 is fixed: `register_sdhc` runs synchronously inside `pci::init` (`sdhc::probe` -> `bring_up`),
+// while `publish_usb_geometry` runs from the main loop's deferred SCSI bring-up
+// (`xhci::service_storage`, held until the enumeration queue drains). So the card is always
+// registered FIRST, and every poll-until-present consumer — `wifi::service`, `wcx::desktop_app_service`,
+// `shell::fatverb_storage_witness` — resolved and parked on `Sdhc` at the first main-loop pass, long
+// before any stick arrives. What remains is the INTRA-PASS window on the one pass where a stick
+// claims the global: `service_storage` resets the verdict to `BM_UNKNOWN` near the top of the pass
+// and `flight_recorder::service` re-derives it at the bottom, so between those two points arm 2 runs
+// with `verdict=undecided` and the ladder answers `Global` — the stick. A per-call consumer that
+// resolves inside that window (a shell verb or an exec dispatched on exactly that pass) gets the
+// stick for that one call. It is bounded to a single main-loop pass, it requires a hot-plug
+// concurrent with the call, it is read-side only (FRGUARD still refuses the write), and the `PSRC`
+// witness prints the transient `psrc=global … verdict=undecided` line, so the capture shows it. It
+// is NOT closed by construction, and closing it would cost either a sector read on the hot path or a
+// second cache — both of which this section rejects for stronger reasons.
+//
+// ### The `Usb` handle is still deliberately NOT in the ladder
+//
+// It exists so the Pi can reach a stick while the microSD owns the global; on x86 the stick IS the
+// global, so including it here would either duplicate the global arm or let a Pi program load
+// silently retarget.
+
+/// PSRC: handle codes for the change-only witness latch.
+const PSRC_H_NONE: u8 = 0;
+const PSRC_H_GLOBAL: u8 = 1;
+const PSRC_H_SDHC: u8 = 2;
+/// PSRC: reason codes — the three-token vocabulary `sdhc.md` §12.3 named.
+const PSRC_R_BOOT_SERIAL: u8 = 0;
+const PSRC_R_FALLBACK_ORDER: u8 = 1;
+const PSRC_R_SERIAL_UNPROVEN: u8 = 2;
+/// PSRC: the underlying FRGUARD state, so `reason=fallback-order` and `reason=serial-unproven` each
+/// stay falsifiable instead of collapsing four distinct causes into one word.
+const PSRC_V_MATCH: u8 = 0;
+const PSRC_V_SUBSTITUTED: u8 = 1;
+const PSRC_V_UNPROVEN: u8 = 2;
+const PSRC_V_UNDECIDED: u8 = 3;
+const PSRC_V_DISARMED: u8 = 4;
+const PSRC_V_STALE_HANDLE: u8 = 5;
+const PSRC_V_UNBUILT: u8 = 6;
+
+/// PSRC: the last decision this boot PRINTED, packed as `handle | reason<<2 | verdict<<4`, plus a
+/// `has-printed` bit so the very first decision is never mistaken for a repeat of code 0.
+///
+/// Change-only rather than once-only on purpose. `program_source` runs per open, so a per-call line
+/// would flood; but a once-only line would hide the event this arc exists for — the moment a stick
+/// claims the global and the preference has to REFUSE it. Latching on the decision means the wire
+/// carries one line per distinct answer, which is the falsifiable minimum: a boot where the answer
+/// never changes prints once, and a boot where a stick arrives prints the flip.
+static PSRC_LAST: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+/// PSRC: emit the decision line if (and only if) it differs from the last one printed.
+///
+/// Pure logging: it takes each registry slot's lock briefly through [`source_census`] and changes
+/// nothing, so it is safe from any context `program_source` itself is safe from.
+fn psrc_witness(handle: u8, reason: u8, verdict: u8, serial: u32) {
+    let code: u16 = 0x100 | (handle as u16) | ((reason as u16) << 2) | ((verdict as u16) << 4);
+    if PSRC_LAST.swap(code, core::sync::atomic::Ordering::Relaxed) == code {
+        return;
+    }
+    let psrc = match handle {
+        PSRC_H_GLOBAL => "global",
+        PSRC_H_SDHC => "sdhc",
+        _ => "none",
+    };
+    let reason_s = match reason {
+        PSRC_R_BOOT_SERIAL => "boot-serial",
+        PSRC_R_SERIAL_UNPROVEN => "serial-unproven",
+        _ => "fallback-order",
+    };
+    let verdict_s = match verdict {
+        PSRC_V_MATCH => "match",
+        PSRC_V_SUBSTITUTED => "substituted",
+        PSRC_V_UNPROVEN => "unproven",
+        PSRC_V_UNDECIDED => "undecided",
+        PSRC_V_DISARMED => "disarmed",
+        PSRC_V_STALE_HANDLE => "stale-handle",
+        PSRC_V_UNBUILT => "unbuilt",
+        // Not constructible: every caller passes one of the seven constants above. Rendered rather
+        // than `unreachable!()` so a witness can never be the thing that panics a boot.
+        _ => "?",
+    };
+    serial_println!(
+        ":: PSRC: psrc={} reason={} verdict={} boot_serial=0x{:08x} handles={} ::",
+        psrc, reason_s, verdict_s, serial, source_census()
+    );
+}
+
+/// APPLOAD / PSRC: the block device a program should be loaded from, with the HANDLE it was found
+/// under — `None` only when there is genuinely nowhere to look.
+///
+/// Precedence: the handle the FRGUARD verdict positively locates the BOOT VOLUME on, if it is still
+/// populated; else the historical ladder — the global [`BLOCK_DEVICE`], then (x86 + `sdhcblk`) the
+/// internal SD card under [`SDHC_BLOCK_DEVICE`]. See the PSRC section note above for the rule, its
+/// cost argument, and why it adds no cache of its own.
+///
+/// The returned handle is not decoration: the three handles are served by DIFFERENT read paths
+/// (`read_block` goes through the backend selector, `read_block_sdhc` bypasses it into the SDHCI
+/// driver), so a caller that reads without honouring the handle would issue the wrong transport's
+/// commands. `fs::fat::mount_program_source` is the intended consumer and it maps this handle
+/// straight onto the matching `fs::fat::BlockSource`.
+pub fn program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    {
+        use core::sync::atomic::Ordering;
+        let glob = info();
+        let card = sdhc_info();
+        let serial = BOOT_VOLUME_SERIAL.load(Ordering::Acquire);
+        let verdict = BOOT_MEDIUM_VERDICT.load(Ordering::Acquire);
+
+        // --- Arm 1: the boot volume was POSITIVELY located, and its handle is still populated.
+        if serial != 0 {
+            if verdict == BM_MATCH {
+                if let Some(dev) = glob {
+                    psrc_witness(PSRC_H_GLOBAL, PSRC_R_BOOT_SERIAL, PSRC_V_MATCH, serial);
+                    return Some((dev, BlockHandle::Global));
+                }
+            } else if verdict == BM_SUBSTITUTED {
+                if let Some(dev) = card {
+                    psrc_witness(PSRC_H_SDHC, PSRC_R_BOOT_SERIAL, PSRC_V_SUBSTITUTED, serial);
+                    return Some((dev, BlockHandle::Sdhc));
+                }
+            }
+        }
+
+        // --- Arm 2: the historical global-then-Sdhc ladder, with the cause named.
+        let (reason, vstate) = if serial == 0 {
+            (PSRC_R_FALLBACK_ORDER, PSRC_V_DISARMED)
+        } else {
+            match verdict {
+                BM_UNPROVEN => (PSRC_R_SERIAL_UNPROVEN, PSRC_V_UNPROVEN),
+                BM_UNKNOWN => (PSRC_R_SERIAL_UNPROVEN, PSRC_V_UNDECIDED),
+                // BM_MATCH / BM_SUBSTITUTED that fell through arm 1: the verdict names a handle the
+                // registry no longer holds (a disconnect retracted it without resetting the verdict —
+                // see the note above on why FRGUARD must not reset it there).
+                _ => (PSRC_R_FALLBACK_ORDER, PSRC_V_STALE_HANDLE),
+            }
+        };
+        if let Some(dev) = glob {
+            psrc_witness(PSRC_H_GLOBAL, reason, vstate, serial);
+            return Some((dev, BlockHandle::Global));
+        }
+        if let Some(dev) = card {
+            psrc_witness(PSRC_H_SDHC, reason, vstate, serial);
+            return Some((dev, BlockHandle::Sdhc));
+        }
+        psrc_witness(PSRC_H_NONE, reason, vstate, serial);
+        None
+    }
+    // No `Sdhc` handle exists in this image, so there is no precedence to decide and no boot serial
+    // published to decide it with: the ladder is one rung long. The witness still fires — a build
+    // that cannot substitute should SAY that it cannot, rather than leaving a reader to infer it
+    // from the absence of a line (the exact inference `sdhc.md` §12.4 records as falsified).
+    #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+    {
+        let glob = info();
+        psrc_witness(
+            if glob.is_some() { PSRC_H_GLOBAL } else { PSRC_H_NONE },
+            PSRC_R_FALLBACK_ORDER,
+            PSRC_V_UNBUILT,
+            0,
+        );
+        glob.map(|dev| (dev, BlockHandle::Global))
+    }
+}
+
+/// PSRC: the OTHER populated program-source handle — the one [`program_source`] did NOT choose.
+///
+/// `None` when there is no second populated handle (the overwhelmingly common case: one disk).
+///
+/// This exists for exactly one caller and one class of read. `wifi::firmware` stages user-supplied
+/// b43 blobs, and those blobs live wherever the OPERATOR put them — which, in the workflow this arc
+/// was written during, is a USB stick carried to a machine whose boot volume is the internal card.
+/// Making the preference above authoritative for that read would mean "to try a firmware blob,
+/// re-flash your boot card", which is a worse OS. The firmware search is READ-ONLY, its whole job is
+/// "find a user-supplied file wherever it is" (it already walks three directories per volume for the
+/// same reason), and none of the hazards the preference closes — `/fat` meaning the wrong volume for
+/// an exec, a write landing on a foreign medium — apply to it.
+///
+/// Nothing else should use this. A caller that means "the volume this system is bound to" wants
+/// [`program_source`], and a caller that means a SPECIFIC disk wants [`lookup`] with a
+/// [`BlockDeviceId`].
+pub fn alternate_program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
+    match program_source()?.1 {
+        BlockHandle::Global => {
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            {
+                sdhc_info().map(|d| (d, BlockHandle::Sdhc))
+            }
+            #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+            {
+                None
+            }
+        }
+        // `program_source` never returns `Usb` (see its precedence note); mapped for totality.
+        BlockHandle::Usb => None,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockHandle::Sdhc => info().map(|d| (d, BlockHandle::Global)),
+    }
+}
+
+/// APPLOAD: what [`program_source`] LOOKED AT, for the witness lines that report its `None`.
+///
+/// The defect this arc fixes was invisible for exactly one reason: the decline line asserted "no
+/// block device ever enumerated" when it had only ever consulted one of three slots. A refusal that
+/// cannot name what it inspected cannot be falsified by the capture it appears in. So every consumer
+/// that declines on an absent program source now prints this census beside the reason, and a future
+/// no-apps boot names its own cause instead of a boot-wide claim it never checked.
+///
+/// Every field can read either way on a real boot, and the three renderings are distinguishable:
+/// `sdhc=present` (a card registered), `sdhc=absent` (the feature is in, nothing registered),
+/// `sdhc=unbuilt` (no `sdhcblk` in this image, so the handle does not exist to be consulted).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SourceCensus {
+    /// The global [`BLOCK_DEVICE`] slot holds a device.
+    pub global: bool,
+    /// The internal-SD slot: `Some(true/false)` when this image carries the handle, `None` when it
+    /// does not — which is a different fact from "the handle is empty" and is printed differently.
+    pub sdhc: Option<bool>,
+}
+
+impl core::fmt::Display for SourceCensus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "global={}", if self.global { "present" } else { "absent" })?;
+        match self.sdhc {
+            Some(true) => write!(f, " sdhc=present"),
+            Some(false) => write!(f, " sdhc=absent"),
+            None => write!(f, " sdhc=unbuilt"),
+        }
+    }
+}
+
+/// APPLOAD: snapshot the handles [`program_source`] consults. Pure query — takes each slot's lock
+/// briefly and changes nothing, so it is safe to call from a decline path.
+pub fn source_census() -> SourceCensus {
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    let sdhc = Some(sdhc_info().is_some());
+    #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+    let sdhc = None;
+    SourceCensus { global: info().is_some(), sdhc }
+}
+
 /// INSTALL-SEL: which of the two registry handles a device row was read from. The block layer keeps
 /// two `Option<BlockDeviceInfo>` slots — the GLOBAL [`BLOCK_DEVICE`] (whatever the active backend is:
 /// the xHCI stick on x86, the microSD once `register_sd` has run on the Pi) and the dedicated USB
@@ -166,6 +493,12 @@ pub enum BlockHandle {
     /// The dedicated [`USB_BLOCK_DEVICE`] entry — read/written through [`read_block_usb`] /
     /// [`write_block_usb`], which bypass the backend selector.
     Usb,
+    /// SDHC-4b (x86, `sdhcblk` knob): the dedicated [`SDHC_BLOCK_DEVICE`] entry — the card in the
+    /// machine's INTERNAL SD slot, read through [`read_block_sdhc`] / [`read_blocks_sdhc`], which
+    /// bypass the backend selector exactly as the `Usb` pair does. See the SDHC-4b section below for
+    /// why it is a third handle and not a third value of the `BACKEND` selector.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    Sdhc,
 }
 
 /// INSTALL-SEL: a durable name for ONE block device, good across frames and across a registry change.
@@ -209,6 +542,8 @@ pub fn lookup(id: BlockDeviceId) -> Option<BlockDeviceInfo> {
     let cur = match id.handle {
         BlockHandle::Global => info(),
         BlockHandle::Usb => usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockHandle::Sdhc => sdhc_info(),
     };
     match cur {
         Some(d) if d.slot_id == id.slot_id && d.num_blocks == id.num_blocks => Some(d),
@@ -315,8 +650,13 @@ pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
 /// PIUSB-28: x86 / non-SD-capable targets — the USB stick is the default (boot) block backend, so it
 /// always claims the global `BLOCK_DEVICE` alongside the dedicated USB handle. Preserves the historical
 /// behavior on any target that never compiles the SD backend / BACKEND selector.
+///
+/// FRGUARD (GR21): a claim of the global slot INVALIDATES the boot-medium verdict — the next reader
+/// re-derives it against whatever now occupies the slot. See [`BOOT_MEDIUM_VERDICT`].
 #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
 pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    BOOT_MEDIUM_VERDICT.store(BM_UNKNOWN, core::sync::atomic::Ordering::Release);
     *BLOCK_DEVICE.lock() = Some(dev);
     *USB_BLOCK_DEVICE.lock() = Some(dev);
     USB_PUBLISH_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel); // PA35 race: every publish is a new generation
@@ -457,13 +797,31 @@ static SUBST_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// canonical backend is SD, a `Default` write with no registered SD returns `NotReady` and says so on serial
 /// once, producing an honest "no writable volume" boot instead of misdirected writes.
 ///
+/// FRGUARD (GR21): **that hazard also exists on x86, and a guard for it now exists there too.** SDHC-4b gave
+/// x86 an internal SD backend that registers as handle `Sdhc` and deliberately leaves `BLOCK_DEVICE` empty,
+/// so an x86 machine can boot with a canonical volume that is not the `Default` target — and Boot AI-2 proved
+/// the consequence on metal: the flight recorder created and wrote a 262 656-byte `/UNAOS.LOG` onto a card
+/// the operator hot-plugged to read, because that card was the first thing to claim the global slot. The x86
+/// arm of `default_writable` (below) closes it, keyed on the boot volume's identity as the UEFI loader
+/// reported it, rather than on this file's `BACKEND` selector, which x86 does not compile.
+///
+/// **The aarch64 arm has a gap this arc does NOT close, recorded in `docs/SECURITY.md`'s USBFALL row and
+/// in `docs/dev/OS/07_USB_STORAGE/usb_xhci.md` §11 so the Pi lane sees it:** the guard below is called
+/// only from [`write_block`], never from [`write_blocks`], so a `Default` MULTI-SECTOR FAT write
+/// (`fs/fat.rs::write_sectors`) bypasses USBFALL F1 entirely on `aarch64 + baremetal`. Pre-existing, real,
+/// and out of this arc's lane — the x86 arm guards both entry points.
+///
 /// Deliberately WRITES ONLY. Reads may still fall through to the BOT path — a read cannot corrupt the wrong
 /// device, and the USB mount has its own dedicated `read_block_usb` handle regardless.
 ///
-/// Deliberately `baremetal`-gated, NOT a blanket "xHCI writes are suspect" rule. On QEMU-virt aarch64
-/// (`test-arm`) and on x86 the SD backend is never compiled, xHCI IS the legitimate sole backend, and this
-/// function does not exist — those builds keep their pre-USBFALL write path byte-for-byte. The refusal is
-/// about substitution on a platform that has a canonical backend, not about xHCI.
+/// Deliberately gated to platforms that HAVE a canonical backend, NOT a blanket "xHCI writes are suspect"
+/// rule. On QEMU-virt aarch64 (`test-arm`) and on an x86 build without `sdhcblk` the SD backend is never
+/// compiled, xHCI IS the legitimate sole backend, and the refusal does not exist — those builds keep their
+/// pre-USBFALL write path byte-for-byte. The refusal is about substitution on a platform that has a
+/// canonical backend, not about xHCI.
+///
+/// FRGUARD (GR21): x86 + `sdhcblk` is now such a platform and has its own arm below. The line above used to
+/// say "and on x86", full stop; Boot AI-2 proved that premise dead.
 ///
 /// Byte-inert on a healthy SD boot: `BACKEND_SD` is set before the first FAT write, so this returns `Ok`
 /// without touching the console.
@@ -472,13 +830,245 @@ pub fn default_writable() -> bool {
     BACKEND.load(Ordering::Acquire) == BACKEND_SD
 }
 
-/// USBFALL F1: targets without the SD backend (x86, QEMU-virt aarch64) have no substitution to refuse — the
-/// enumerated device IS the canonical `Default` backend, so `Default` writes are available whenever the block
-/// layer has one at all. Constant `true` keeps `write_block` and every `read_only()` consumer byte-identical
-/// to pre-USBFALL there.
-#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+// ===================== FRGUARD (GR21) — is the Default slot the medium we BOOTED from? ==============
+//
+// R1 of this arc keyed the guard on CLAIM ORIGIN: boot port scan vs hot-plug edge. That predicate is
+// REFUTED by the bench's own capture and the kernel's own instrument. On the rMBP the mass-storage
+// device sits on port 5, a USB3 port whose link finishes training ~1.6 s after the 100 ms pre-scan
+// settle, so it MISSES the initial CCS scan and is recovered through the hot-plug path — on 30 boots
+// out of 30, without one exception:
+//
+//     xHCI: !! ccs-margin LATE port=5 t_seen_ms=1659 settle_ms=100 short_by_ms<=1559
+//           (missed the initial CCS scan; recovered via CSC; ...) result=CCSMARGIN-LATE
+//     xHCI: [Port 5] device connected (hot-plug); queuing for enumeration.
+//
+// The boot volume and the intruder arrive down the SAME path on this machine. The axis carried no
+// signal, and a guard built on it would have refused the flight recorder on every normal boot.
+//
+// The axis that DOES separate them is which volume the kernel booted FROM, and the handoff for it
+// already exists and is metal-proven: the UEFI loader reads `BS_VolID` off LBA 0 of its own
+// loaded-image device (`read_boot_volume_serial`, bootloader crate — LoadedImage -> DeviceHandle ->
+// BlockIO) and passes it in `BootInfo::boot_volume_serial`. INSTALL-SELF already consumes it to stop
+// the installer erasing the running system; this is the same identity asked a different question.
+//
+// So: a `Default` claimant may be WRITTEN only if it carries the boot volume's serial.
+//   * AH / AI-1 — booted from the 60 GB card in the USB reader, which IS the Default claimant. Match,
+//     writes allowed, byte-identical to trunk.
+//   * AI-2 — booted from that same 60 GB card moved to the INTERNAL slot; the Default claimant is the
+//     operator's 29 MiB Panasonic. Mismatch, writes refused. This is the defect.
+//   * The re-enumeration case R1 had to charge as a fail-closed cost now costs nothing: a boot stick
+//     that chirps and re-enumerates is still the same volume and still matches.
+//
+// The refusal is keyed on a PROOF, not on a failed identity test, and that distinction was forced by
+// running the gate rather than reasoning about it. The first version of this predicate refused
+// whenever the `Default` slot did not carry the boot serial. `UNAOS_SDHCBLK=1 ./arroyo test-fat`
+// showed what that costs:
+//
+//     :: FRGUARD: Default slot (blocks=196608) does NOT carry the boot volume serial 0xfabe1afd …
+//     :: FR: UNAOS.LOG NOT reserved …            <- 47 PASS -> 40 PASS, exit 1
+//
+// In the QEMU harness the boot ESP is deliberately a SEPARATE `ide-hd` and the kernel's `Default` is
+// the `usb-storage` stick ("The boot ESP stays on the separate ide-hd", builder/src/main.rs), so the
+// two can never match — and the kernel has no driver for the ESP, so the boot medium is not reachable
+// through the block layer at all. "Default is not the boot medium" is therefore a perfectly normal
+// state, not evidence of anything. (The same run also killed the assumption that QEMU has no `Sdhc`
+// handle: it registers an emulated 16 MiB card, so `sdhc_info()` is `Some` there too.)
+//
+// So the guard refuses only in the state where it can POSITIVELY locate the boot volume on the other
+// handle — `BM_SUBSTITUTED`. Everything else fails open:
+//
+//   * `sdhc_info().is_none()` — no canonical backend outside the global slot, nothing to substitute
+//     away from. Byte-identical to the pre-FRGUARD constant.
+//   * boot serial 0 — the loader could not identify the medium it booted from (a pre-guard loader, a
+//     non-FAT boot path, an unstamped formatter, aarch64). Announced once, then trunk behaviour.
+//   * `BM_UNPROVEN` — the serial is on neither handle. The QEMU case, and any machine booting from a
+//     device the block layer cannot see.
+//
+// The guard must never be the thing that silently kills the flight recorder; an unidentified or
+// unreachable boot volume is a reason to say so, not a reason to refuse. Same disarm direction
+// INSTALL-SELF takes on the same sentinel.
+
+/// FRGUARD: `BS_VolID` of the volume the kernel was loaded from, as the UEFI loader read it. 0 = absent
+/// (the disarmed sentinel). Published once from the kernel entry path before any storage exists.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+static BOOT_VOLUME_SERIAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Not yet derived for the current occupant of the global slot.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const BM_UNKNOWN: u8 = 0;
+/// The global slot carries the boot volume's serial: it IS the medium we booted from.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const BM_MATCH: u8 = 1;
+/// The global slot does NOT carry it, and the `Sdhc` handle DOES — the boot medium is positively
+/// located somewhere else, so a `Default` write is a proven substitution. The only refusing state.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const BM_SUBSTITUTED: u8 = 2;
+/// Neither handle carries the boot serial — the boot medium is not reachable through the block layer
+/// at all, so nothing here can prove a substitution. FAILS OPEN. This is the normal state for a
+/// machine that boots from a device the kernel has no driver for, which is exactly the QEMU harness:
+/// the boot ESP is a separate `ide-hd` and the kernel's `Default` is the `usb-storage` stick.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const BM_UNPROVEN: u8 = 3;
+
+/// FRGUARD: the cached verdict on the CURRENT occupant of the global slot. Deriving it costs sector
+/// READS (`fat::volume_serials` walks LBA 0, the GPT spans and every MBR partition start), which must
+/// never happen from inside `write_block` — that call can arrive masked, mid-FAT-RMW, with the xHCI
+/// loan already claimed. So the verdict is derived once from an unmasked main-loop context by
+/// [`evaluate_boot_medium_once`] and only READ on the write path. Reset to `BM_UNKNOWN` by
+/// [`publish_usb_geometry`], so a hot-plug that replaces the occupant forces a fresh derivation
+/// instead of inheriting the previous device's verdict.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+static BOOT_MEDIUM_VERDICT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(BM_UNKNOWN);
+
+/// FRGUARD: publish the boot volume serial from `BootInfo`. Called once from the kernel entry path,
+/// before storage is up, so nothing can read a half-initialised guard. Deliberately separate from
+/// `install::selfguard::set_boot_volume_serial`, which consumes the same field: that one is gated on
+/// the installer features and is absent from every bench/boot build, which is exactly why its
+/// `:: install: boot volume serial …` line appears ZERO times in the 30-boot capture. This one is not
+/// gated on the installer, so the guard's own input is on the wire on every boot it can affect.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn set_boot_volume_serial(serial: u32) {
+    BOOT_VOLUME_SERIAL.store(serial, core::sync::atomic::Ordering::Release);
+    if serial == 0 {
+        serial_println!(
+            ":: FRGUARD: boot volume serial ABSENT (0) — Default-write substitution guard DISARMED \
+             (the loader could not identify the medium it booted from; writes behave exactly as trunk) ::"
+        );
+    } else {
+        serial_println!(
+            ":: FRGUARD: boot volume serial=0x{:08x} — Default-write substitution guard ARMED ::",
+            serial
+        );
+    }
+}
+
+/// FRGUARD: the boot volume's `BS_VolID` as published by [`set_boot_volume_serial`], or 0 when the
+/// loader could not identify the medium it booted from (the disarmed sentinel).
+///
+/// SDHC-4c reads it for its reserve witness ONLY — the line names the boot serial and the card's
+/// volume serial side by side, so a capture shows whether the reserved extent lives on the medium
+/// this kernel booted from, and the FRGUARD verdict above can be read together with it. Nothing
+/// keys behaviour off this getter: SDHC-4c's bound is the LBA extent, not an identity test.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn boot_volume_serial() -> u32 {
+    BOOT_VOLUME_SERIAL.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// FRGUARD: derive the boot-medium verdict for the current global-slot occupant, at most once per
+/// claim. MUST be called from an unmasked, lock-free context — it issues sector reads. The x86 main
+/// loop's flight-recorder pass is the site that does so, ahead of every `Default` writer on that pass.
+///
+/// Idempotent and cheap after the first call (one relaxed load). Prints ONE line per derivation naming
+/// the serials on both sides, so "the guard armed and agreed" is a fact in the capture rather than an
+/// inference from silence.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn evaluate_boot_medium_once() {
+    use core::sync::atomic::Ordering;
+    if BOOT_MEDIUM_VERDICT.load(Ordering::Acquire) != BM_UNKNOWN {
+        return; // already derived for this occupant
+    }
+    let boot_serial = BOOT_VOLUME_SERIAL.load(Ordering::Acquire);
+    if boot_serial == 0 || sdhc_info().is_none() || info().is_none() {
+        return; // disarmed, or nothing to judge yet — `default_writable` handles these directly
+    }
+    let glob = info().map(|d| d.num_blocks).unwrap_or(0);
+    let canon = sdhc_info().map(|d| d.num_blocks).unwrap_or(0);
+    let on_default = crate::fs::fat::volume_serials(crate::fs::fat::BlockSource::Default);
+    if on_default.contains(&boot_serial) {
+        BOOT_MEDIUM_VERDICT.store(BM_MATCH, Ordering::Release);
+        serial_println!(
+            ":: FRGUARD: Default slot (blocks={}) CARRIES the boot volume serial 0x{:08x} — it is the \
+             medium this kernel booted from; writes ALLOWED (canonical Sdhc handle blocks={}) ::",
+            glob, boot_serial, canon
+        );
+        return;
+    }
+    // The global slot is not the boot medium. That alone is NOT enough to refuse: a machine can
+    // legitimately boot from a device the block layer cannot reach (no driver for it), in which case
+    // nothing here is a substitution and refusing would be a guess. Refuse only when the boot volume
+    // is POSITIVELY located on the other handle — that is a proof, not an absence of one.
+    let on_sdhc = crate::fs::fat::volume_serials(crate::fs::fat::BlockSource::Sdhc);
+    if on_sdhc.contains(&boot_serial) {
+        BOOT_MEDIUM_VERDICT.store(BM_SUBSTITUTED, Ordering::Release);
+        serial_println!(
+            ":: FRGUARD: SUBSTITUTION — the boot volume serial 0x{:08x} is on the INTERNAL Sdhc card \
+             (blocks={}), not in the Default slot (blocks={}, {} FAT volume(s), none of them ours); \
+             Default writes REFUSED ::",
+            boot_serial, canon, glob, on_default.len()
+        );
+    } else {
+        BOOT_MEDIUM_VERDICT.store(BM_UNPROVEN, Ordering::Release);
+        serial_println!(
+            ":: FRGUARD: boot volume serial 0x{:08x} found on NEITHER handle (Default blocks={} has \
+             {} FAT volume(s), Sdhc blocks={} has {}) — the boot medium is not reachable through the \
+             block layer, so no substitution can be proven; writes ALLOWED (guard DISARMED) ::",
+            boot_serial, glob, on_default.len(), canon, on_sdhc.len()
+        );
+    }
+}
+
+/// USBFALL F1 / FRGUARD (GR21): the x86 arm of the substitution guard. See the section comment above
+/// for why the predicate is what it is, and for the refuted one it replaces.
+///
+/// Deliberately WRITES ONLY, exactly as the aarch64 arm: reads still fall through to the BOT path,
+/// because a read cannot corrupt the wrong device, and the stick keeps its dedicated `read_block_usb`
+/// handle. Pure reads of two atomics — no locks, no sector I/O — so it is safe from any context a
+/// `write_block` can arrive in.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn default_writable() -> bool {
+    use core::sync::atomic::Ordering;
+    if sdhc_info().is_none() {
+        return true; // no canonical backend outside the global slot — nothing to substitute away from
+    }
+    if BOOT_VOLUME_SERIAL.load(Ordering::Acquire) == 0 {
+        return true; // boot medium unidentifiable — FAIL OPEN, announced once at publish time
+    }
+    // Exactly one state refuses: BM_SUBSTITUTED, where the boot volume was positively found on the
+    // other handle. BM_UNKNOWN (not yet derived) and BM_UNPROVEN (boot medium unreachable) both fail
+    // OPEN — the arc's law is that this guard never silently kills the recorder, and neither state is
+    // evidence of a substitution.
+    BOOT_MEDIUM_VERDICT.load(Ordering::Acquire) != BM_SUBSTITUTED
+}
+
+/// USBFALL F1: targets without ANY canonical backend outside the global slot (x86 without `sdhcblk`,
+/// QEMU-virt aarch64) have no substitution to refuse — the enumerated device IS the canonical `Default`
+/// backend, so `Default` writes are available whenever the block layer has one at all. Constant `true`
+/// keeps `write_block` and every `read_only()` consumer byte-identical to pre-USBFALL there.
+#[cfg(not(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "sdhcblk")
+)))]
 pub fn default_writable() -> bool {
     true
+}
+
+/// FRGUARD (GR21): one-shot latch for the x86 refusal witness — same shape as `SUBST_REFUSED`, so a
+/// retrying writer names the refusal once rather than per sector.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+static X86_SUBST_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// FRGUARD (GR21): the x86 twin of [`guard_default_write_backend`]. Fails CLOSED with `NotReady` and one
+/// falsifiable line naming both media, so a capture can tell "the guard fired" from "nothing tried to
+/// write". The witness prints the two geometries because that is what identified the substitution in the
+/// Boot AI-2 forensics: `blocks=124735488` internal vs `dev_blocks=60800` in the global slot.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+fn guard_default_write_backend() -> Result<(), BlockError> {
+    if default_writable() {
+        return Ok(());
+    }
+    if !X86_SUBST_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        let canon = sdhc_info().map(|d| d.num_blocks).unwrap_or(0);
+        let glob = info().map(|d| d.num_blocks).unwrap_or(0);
+        serial_println!(
+            ":: BLOCK: Default WRITE refused — the boot volume serial 0x{:08x} is on the internal \
+             Sdhc card (blocks={}), not in the Default slot (blocks={}); refusing to write this \
+             system's data to a medium it did not boot from (first, once) ::",
+            BOOT_VOLUME_SERIAL.load(core::sync::atomic::Ordering::Acquire),
+            canon,
+            glob
+        );
+    }
+    Err(BlockError::NotReady)
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
@@ -538,6 +1128,10 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     // USBFALL F1: fail CLOSED rather than substituting the USB stick for a missing SD card. See
     // `guard_default_write_backend` — compiled only where SD is the canonical backend (Pi bare-metal).
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    guard_default_write_backend()?;
+    // FRGUARD (GR21): the same refusal on x86 + `sdhcblk`, keyed on claim origin instead of the BACKEND
+    // selector. Not compiled at all without the knob, so the plain x86 write path is untouched.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     guard_default_write_backend()?;
 
     let dev = info().ok_or(BlockError::NotReady)?;
@@ -666,6 +1260,14 @@ pub fn read_blocks(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 /// path's callers — there is nothing to read first: this is the point where a full-sector overwrite
 /// stops costing a READ(10) it never used.
 pub fn write_blocks(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    // FRGUARD (GR21): the counted path needs the guard as much as the single-block one — `fs/fat.rs`'s
+    // `write_sectors` routes here, and that is the entry point the flight recorder's `write_grow` /
+    // `write_at` actually use. Guarding only `write_block` (as the aarch64 arm does today) would have
+    // left the Boot AI-2 write path wide open. The matching aarch64 gap is recorded in
+    // `docs/SECURITY.md` and `usb_xhci.md` §11 rather than here, so the Pi lane can find it.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    guard_default_write_backend()?;
+
     let dev = info().ok_or(BlockError::NotReady)?;
     let count = span_blocks(&dev, lba, buf.len())?;
 
@@ -737,6 +1339,212 @@ pub fn write_blocks_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
             Err(BlockError::Io)
         }
     }
+}
+
+// ===================== SDHC-4b — the internal SD card as a THIRD registry handle =====================
+//
+// Boot AC identified the card in the 2012 rMBP's built-in PCIe SD reader (`drivers/sdhc.rs`) and read
+// it three ways; Boot AD wrote one sector to it and restored it byte-for-byte. The driver therefore
+// has proven `read_block_512` / `read_blocks_512` (and, behind `sdw`, `write_block_512`) — but nothing
+// above the driver could reach them, because the block layer had exactly two backends and every SD arm
+// in it is `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]`, i.e. the Pi's EMMC2. On x86
+// `block::read_block` has always meant the USB stick and nothing else. This section is the seam that
+// lets FAT mount the internal card, and every decision in it is about NOT disturbing that stick.
+//
+// ### Why a third HANDLE and not a third value of `BACKEND`
+// Widening the selector was the obvious shape and it is the wrong one, for three independent reasons:
+//   1. **It would steal the boot volume.** On x86 the machine boots from a USB card reader, so the
+//      stick IS `BLOCK_DEVICE` and `block::info()` is what the flight recorder, `fs/fat.rs`'s
+//      `probe_once`, the shell, `fs/unafs.rs` and the installer all read. Flipping the selector to the
+//      internal card would silently re-point every one of them at a different disk — the failure the
+//      Pi paid for as PI-FS-2 (a 14 MiB reader's `num_blocks` clobbering the SD's global), in reverse.
+//   2. **The publish order makes it a race, not a choice.** `sdhc::probe` runs inside the x86 PCI
+//      probe; the xHCI stick enumerates later and `publish_usb_geometry` on this target claims the
+//      global UNCONDITIONALLY. A card registered into the global would simply be overwritten a second
+//      later, so the "selector" would decide nothing and would hide that it decided nothing.
+//   3. **Refusal beats precedence.** With a separate handle there is no precedence rule to get wrong:
+//      a caller that wants the internal card must NAME it. Nothing in the tree names it today except
+//      the read-only mount witness added by this arc, so every existing caller is untouched by
+//      construction rather than by a policy that has to keep being right.
+// The `Usb` handle is the proven precedent for exactly this (PIUSB-27 added it so the Pi could reach
+// the stick while the microSD owned the global), and this section mirrors it line for line.
+//
+// ### x86 `read_block` / `write_block` are not merely unchanged — they are untouched
+// There is no new statement anywhere in `read_block`, `write_block`, `read_blocks`, `write_blocks` or
+// `publish_usb_geometry`. Not one `#[cfg]`, not one branch. The whole SDHC path is additive entry
+// points plus one extra arm in the handle/source matches, and with the knob off the variant does not
+// exist and those matches are byte-identical to today's.
+//
+// ### SINGLE FAT WRITER (see `flight_recorder.rs`) — what this arc does and does not do about it
+// `fs/fat.rs`'s `with_fat_lock` / `with_dir_lock` are deliberately INERT on x86, so on this target the
+// tree's rule is "at most one FAT/directory MUTATOR". That rule was paid for in A/B-proven cross-linked
+// chains and stolen delete-witness snapshots, and it is why the flight recorder reserves `UNAOS.LOG`
+// once and thereafter only writes IN PLACE.
+//
+// This arc therefore adds a READER, not a writer:
+//   * the SDHC volume is mounted as a SEPARATE, by-value `FatFs` (`fs::fat::BlockSource::Sdhc`) with no
+//     state shared with the boot volume's mount — the `FatFs` is a plain value, and `ALLOC_HINT` (the
+//     only cross-volume global in `fs/fat.rs`) is documented advisory-only and is read by the
+//     ALLOCATOR, which a read-only mount never enters;
+//   * `fs::fat::write_sector` / `write_sectors` REFUSE a `Sdhc` source unconditionally, in every cfg,
+//     with a one-shot witness — the same blanket refusal PIUSB-27 shipped for `Usb`, which USB-WRITE
+//     later lifted in its own arc with its own witness ladder;
+//   * so no FAT entry, no directory sector and no data cluster of the internal card is ever written by
+//     this build, and the count of x86 FAT mutators is unchanged at one.
+// What would have to be true before anything may write through the FAT layer to this volume: either
+// `with_fat_lock`/`with_dir_lock` become REAL on x86 (they cannot mask IRQs across the `hlt`-driven BOT
+// pump, so this needs a different mechanism, not a flag flip), or the SDHC writer adopts the recorder's
+// reserve-once-then-write-in-place shape, which is not a FAT mutation after bootstrap. Neither is in
+// this arc, and until one of them holds, the refusal below is the whole safety argument.
+//
+// The BLOCK-layer write pair below is a different question and is answered differently: it is
+// `sdw`-gated (so a default image contains no CMD24 command word at all — SDHC-4a's property is
+// preserved), it is reachable only through `PartitionRange::write_block(s)` with an explicitly
+// `Sdhc`-handled range, and `fs/fat.rs` never calls `PartitionRange::write_block` (verified: the FAT
+// writers go straight to `write_sector`/`write_sectors`). It exists so the primitive is type-checked
+// through the block seam and available to the next arc, not so that anything in this one uses it.
+
+/// SDHC-4b: geometry of the card in the machine's internal SD slot, published by [`register_sdhc`]
+/// once `sdhc::bring_up` has identified it AND its read witnesses have run. Deliberately a THIRD slot
+/// alongside [`BLOCK_DEVICE`] and [`USB_BLOCK_DEVICE`]: nothing here ever claims the global, so the
+/// boot volume every existing caller reads through `info()` is untouched. `None` until registration.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub static SDHC_BLOCK_DEVICE: Mutex<Option<BlockDeviceInfo>> = Mutex::new(None);
+
+/// SDHC-4b: snapshot of the internal SD card's geometry, if one registered.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn sdhc_info() -> Option<BlockDeviceInfo> {
+    *SDHC_BLOCK_DEVICE.lock()
+}
+
+/// SDHC-4b: publish the internal SD card's geometry under the [`SDHC_BLOCK_DEVICE`] handle.
+///
+/// Called once, from `sdhc::bring_up`, AFTER the read witnesses (`verify_read`, `verify_multiblock`,
+/// `adma2_smoke`, `verify_adma_ab`) have run — so a registered card is one whose read path has already
+/// been exercised and reported on this boot, not merely one that answered CMD2/CMD3. That ordering is
+/// the point: the registry is the thing FAT trusts, so it should only ever name a card the log has
+/// already said something true about.
+///
+/// Returns whether the card was registered. It refuses a zero-block card rather than publishing a
+/// device every subsequent bound check would reject one call later — an instrument that can say NO.
+///
+/// `slot_id` is 0, the same sentinel `register_sd` stamps on the Pi's microSD: 0 is never a live xHCI
+/// device slot, so [`unpublish_usb_geometry`] (which matches on slot id and returns early on 0) can
+/// never retract this entry on a USB disconnect. Belt and braces — that function only ever touches the
+/// `Global` and `Usb` slots anyway.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn register_sdhc(num_blocks: u64, block_addressed: bool) -> bool {
+    if num_blocks == 0 {
+        serial_println!(
+            ":: SDHCBLK: REFUSED to register the internal SD card — num_blocks=0 (nothing to address) ::"
+        );
+        return false;
+    }
+    let dev = BlockDeviceInfo {
+        slot_id: 0,
+        block_size: SECTOR_BYTES as u32,
+        num_blocks,
+        vendor: *b"SD-SLOT ",
+        product: if block_addressed { *b"INTERNAL SDHC/XC" } else { *b"INTERNAL SDSC   " },
+    };
+    *SDHC_BLOCK_DEVICE.lock() = Some(dev);
+    let mib = num_blocks.saturating_mul(SECTOR_BYTES as u64) / (1024 * 1024);
+    serial_println!(
+        ":: SDHCBLK: registered internal SD card as block handle Sdhc — blocks={} ({} MiB) addressing={} \
+         (global BLOCK_DEVICE untouched) ::",
+        num_blocks, mib, if block_addressed { "block" } else { "byte" }
+    );
+    true
+}
+
+/// SDHC-4b: read one block (`lba`) from the internal SD card DIRECTLY through the SDHCI driver,
+/// bypassing the backend selector — the read twin of [`read_block_usb`]. Geometry (block size, bound)
+/// comes from [`SDHC_BLOCK_DEVICE`], re-read on every call as every other entry point does, and
+/// `sdhc::read_block_512` re-guards the LBA against the card's own `num_blocks` one layer down.
+/// Takes no xHCI lock at all, so it cannot interact with the boot volume's transport.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn read_block_sdhc(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = sdhc_info().ok_or(BlockError::NotReady)?;
+    if lba >= dev.num_blocks {
+        return Err(BlockError::BadLba);
+    }
+    crate::drivers::sdhc::read_block_512(lba, buf)
+}
+
+/// SDHC-4b: the counted twin of [`read_block_sdhc`] — `buf.len() / block_size` consecutive blocks in
+/// one call. Bounded by the shared [`span_blocks`] rules so they cannot drift between handles.
+///
+/// The cap those rules apply is [`MAX_BLOCKS_PER_OP`], which is the xHCI staging buffer's capacity and
+/// has nothing to do with the SDHCI path's own limit (`sdhc::MB_MAX_BLOCKS`, which `read_blocks_512`
+/// chunks against internally). Using the published block-layer cap here is deliberate and conservative:
+/// it is the number `fs/fat.rs` already chunks every source against, it is never larger than what the
+/// SD path can serve, and one cap for all handles is one rule to get right instead of three.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn read_blocks_sdhc(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = sdhc_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let n = crate::drivers::sdhc::read_blocks_512(lba, count, buf)?;
+    // A short counted read is an error, never a silent prefix — the same rule the xHCI counted forms
+    // enforce, and the one failure mode a filesystem above has no way to notice.
+    if n < buf.len() {
+        return Err(BlockError::Io);
+    }
+    Ok(buf.len())
+}
+
+/// SDHC-4b: one-shot latch so the refusal below names itself once instead of per retry.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", not(feature = "sdw")))]
+static SDHC_WRITE_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// SDHC-4b: write one block (`lba`) to the internal SD card through the SDHCI driver's polled
+/// single-block CMD24 (`sdhc::write_block_512`, SDHC-4a — metal-proven on Boot AD: `verify=IDENTICAL
+/// restore=IDENTICAL -> PASS`). The driver keeps its own three refusals (WP switch read live, CSD
+/// PERM_WRITE_PROTECT, CSD TMP_WRITE_PROTECT), so this entry point inherits them rather than
+/// re-implementing them.
+///
+/// **SDHC-4c (supersedes 4b's "not reachable from the FAT layer"):** `fs::fat::write_sector` /
+/// `write_sectors` now route a `Sdhc` source here — but ONLY after `fs::sdhc4c::permit_write` has
+/// admitted the span, i.e. only for LBAs inside the one reserved extent published at boot. Every
+/// other LBA on the card is refused above this function, before any card lock is taken. See
+/// `fs/sdhc4c.rs` for the writable set and the argument that it is closed. The other route,
+/// [`PartitionRange::write_block`] with an explicitly `Sdhc`-handled range, is still called by
+/// nothing in `fs/fat.rs`.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw"))]
+pub fn write_block_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let dev = sdhc_info().ok_or(BlockError::NotReady)?;
+    if lba >= dev.num_blocks {
+        return Err(BlockError::BadLba);
+    }
+    crate::drivers::sdhc::write_block_512(lba, buf)
+}
+
+/// SDHC-4b: without `sdw` there is no CMD24 command word in this image at all (SDHC-4a's property),
+/// so the honest answer is a refusal that says why — not a silent `Ok`, and not a call that could not
+/// link. Fails CLOSED, in the same direction as USBFALL F1's `guard_default_write_backend`.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", not(feature = "sdw")))]
+pub fn write_block_sdhc(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
+    if !SDHC_WRITE_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: SDHCBLK: WRITE refused — this build carries no `sdw` feature, so it contains no CMD24 \
+             ladder for the internal SD card (first, once) ::"
+        );
+    }
+    Err(BlockError::NotReady)
+}
+
+/// SDHC-4b: the counted twin of [`write_block_sdhc`]. The SDHCI driver exposes only the single-block
+/// CMD24 primitive, so this LOOPS it, sector by sector — byte-for-byte the same card traffic a
+/// per-sector caller produces, in the same order (exactly the shape `read_blocks`/`write_blocks` use
+/// for the Pi's `emmc2`). CMD25 (WRITE_MULTIPLE_BLOCK) would lift this with no change above the seam.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn write_blocks_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let dev = sdhc_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let bs = dev.block_size as usize;
+    for i in 0..count {
+        write_block_sdhc(lba + i as u64, &buf[i * bs..(i + 1) * bs])?;
+    }
+    Ok(())
 }
 
 // ===================== PARTITION — MBR decode + bounded partition ranges =====================
@@ -1013,6 +1821,10 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
     let bit: u8 = match handle {
         BlockHandle::Global => 1,
         BlockHandle::Usb => 2,
+        // SDHC-4b: its own latch bit, so the internal card's table is censused once on its own terms
+        // and can never be suppressed by (or suppress) the boot volume's census.
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockHandle::Sdhc => 4,
     };
     let prev = MBR_CENSUS_LATCH.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
     if prev & bit != 0 || sec.len() < SECTOR_BYTES {
@@ -1021,6 +1833,8 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
     let name = match handle {
         BlockHandle::Global => "global",
         BlockHandle::Usb => "usb",
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockHandle::Sdhc => "sdhc",
     };
 
     // --- RAW, before decoding anything: the signature word and the four 16-byte entries verbatim.
@@ -1134,6 +1948,8 @@ impl PartitionRange {
         match self.handle {
             BlockHandle::Global => read_block(abs, buf),
             BlockHandle::Usb => read_block_usb(abs, buf),
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockHandle::Sdhc => read_block_sdhc(abs, buf),
         }
     }
 
@@ -1143,6 +1959,11 @@ impl PartitionRange {
         match self.handle {
             BlockHandle::Global => write_block(abs, buf),
             BlockHandle::Usb => write_block_usb(abs, buf),
+            // SDHC-4b: the ONLY route to the internal card's write primitive in this arc. `fs/fat.rs`
+            // does not call `PartitionRange::write_block` (its writers go straight to `write_sector`),
+            // so no FAT mutation can arrive here; a deliberate caller holding an `Sdhc` range can.
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockHandle::Sdhc => write_block_sdhc(abs, buf),
         }
     }
 
@@ -1153,6 +1974,8 @@ impl PartitionRange {
         match self.handle {
             BlockHandle::Global => read_blocks(abs, buf),
             BlockHandle::Usb => read_blocks_usb(abs, buf),
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockHandle::Sdhc => read_blocks_sdhc(abs, buf),
         }
     }
 
@@ -1162,6 +1985,8 @@ impl PartitionRange {
         match self.handle {
             BlockHandle::Global => write_blocks(abs, buf),
             BlockHandle::Usb => write_blocks_usb(abs, buf),
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockHandle::Sdhc => write_blocks_sdhc(abs, buf),
         }
     }
 
@@ -1173,6 +1998,8 @@ impl PartitionRange {
         let dev = match self.handle {
             BlockHandle::Global => info(),
             BlockHandle::Usb => usb_info(),
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockHandle::Sdhc => sdhc_info(),
         }
         .ok_or(BlockError::NotReady)?;
         let bs = dev.block_size as usize;

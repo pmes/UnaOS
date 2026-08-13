@@ -46,10 +46,24 @@ fn main() {
     // U2/U4x..U6bx storage chain that cascades U7x..U6gx). Default OFF => a default boot reaches the shell with
     // the boot-honesty lines only. arroyo auto-sets + EXPORTS it for the battery commands; kept in sync with arroyo.
     if std::env::var("UNAOS_WITNESS").is_ok() { feats.push("witness"); }
+    // WXN-x86 M3b: UNAOS_WXNRO=1 arms `wxnro` — the W-clear on the kernel's executable pages. This
+    // line is not optional bookkeeping: the ESP the x86 boot paths actually carry is THIS build, not
+    // `arroyo`'s `build_kernel_x86_64` one, so a knob wired only in arroyo produces a media whose
+    // `:: WXN-M3B: … ::` line honestly reads `armed=0` on a run the operator armed. (That is exactly
+    // what the draft's first `UNAOS_WXNRO=1 ./arroyo test 60` printed, before this line existed — the
+    // `armed=` field on the wire is what caught it, and it stays on the line for that reason.) Kept
+    // in sync with arroyo.
+    if std::env::var("UNAOS_WXNRO").is_ok() { feats.push("wxnro"); }
+    // SELFHOST-2: UNAOS_SELFHOST=1 arms `selfhost` — the on-shard SRC.TGZ verify + tar walk. The
+    // `test-selfhost` lane boots THIS build (the builder re-runs cargo itself), so a knob wired only
+    // in arroyo would light the `⚡ kernel features:` banner while the kernel under test carried no
+    // witness at all. Kept in sync with arroyo.
+    if std::env::var("UNAOS_SELFHOST").is_ok() { feats.push("selfhost"); }
     if std::env::var("UNAOS_SKIP_XHCI").is_ok() { feats.push("skip_xhci"); }
     if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
-    // CLOCK-2: UNAOS_LOGTS=1 arms `logts` — a compact per-serial-line timestamp prefix (monotonic ms
-    // → UTC after a civil anchor). Kept in sync with arroyo; missing here would be silently dropped.
+    // CLOCK-2: UNAOS_LOGTS=1 arms `logts` — a compact per-line timestamp prefix (monotonic ms → UTC
+    // after a civil anchor) on the UART and both capture transports (FTDI capture ring, UNAOS.LOG).
+    // Kept in sync with arroyo; missing here would be silently dropped.
     if std::env::var("UNAOS_LOGTS").is_ok() { feats.push("logts"); }
     if std::env::var("UNAOS_PI").is_ok() { feats.push("pi"); }
     if std::env::var("UNAOS_USBDEBUG").is_ok() { feats.push("usbdebug"); }
@@ -65,6 +79,11 @@ fn main() {
     // UNAOS_BOTFAULT=1 injects ONE synthetic BOT failure (first WRITE(10), CSW stage) so the headless
     // suite exercises the xHCI BOT Reset Recovery path. Test-only; never on boot media.
     if std::env::var("UNAOS_BOTFAULT").is_ok() { feats.push("botfaultinject"); }
+    // UNAOS_PFWIRE_SELFTEST=1 forces a fatal CPL-0 #PF from arch::init to prove the fault handlers put
+    // their diagnostics on the wire (review §5/C2). BRICKS THE BOOT by design — test-only, never on
+    // media. Mapped here as well as in `arroyo` so the QEMU `test` kernel (re-derived from env here)
+    // actually compiles the witness in; a knob wired in arroyo alone would never reach it.
+    if std::env::var("UNAOS_PFWIRE_SELFTEST").is_ok() { feats.push("pfwire_selftest"); }
     // ONSET-2 (M3): UNAOS_BOTRING64=1 grows the storage slot's two BULK transfer rings 16 -> 64 TRBs
     // (the one-variable wrap/Link discriminator). Default OFF => byte-identical media. It remains a
     // knob because it is a diagnostic, not a fix. MAPPED HERE AS WELL AS IN `arroyo` ON PURPOSE: a
@@ -74,6 +93,10 @@ fn main() {
     // UNAOS_BOTCBWIOC is DELETED (2026-07-30): the CBW is awaited as its own stage in every build,
     // unconditionally, and no media can be produced with it off (usb_xhci.md §17).
     if std::env::var("UNAOS_BOTRING64").is_ok() { feats.push("botring64"); }
+    // GR17 pay-as-you-go wc-g battery (video/wcg.rs): lattice-sampled first pass + deferred full
+    // passes, x86-only paths, default OFF => byte-identical. Mapped here as well as in `arroyo`
+    // for the same reason as BOTRING64 above: a knob arroyo alone sets never reaches boot media.
+    if std::env::var("UNAOS_WCG_PAYGO").is_ok() { feats.push("wcg-paygo"); }
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }
@@ -122,6 +145,135 @@ fn main() {
     // driver; the QEMU isa-applesmc device is attached below under the same knob so the protocol
     // machinery is gated by a known-key read. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_SMC").is_ok() { feats.push("smc"); }
+    // WALK-QUIET (GR18): UNAOS_SMCWALK=1 restores the #KEY index walk's PER-NAME output. The walk and
+    // its one-line summary are always-on under `smc`; this buys back the 493-line inventory dump that
+    // Boot V measured at ~3.5 s of displaced storage bring-up. Does NOT imply `smc` — inert without
+    // it. Kept in sync with arroyo's mapping; a knob mapped there and missing HERE ships the feature
+    // disabled while the banner claims it is on.
+    if std::env::var("UNAOS_SMCWALK").is_ok() { feats.push("smcwalk"); }
+    // SDHC-4a: UNAOS_SDW=1 arms the CMD24 single-block WRITE path on the built-in PCIe SD reader
+    // (drivers/sdhc.rs). THIS list is what reaches the kernel binary for MEDIA builds — a knob mapped
+    // in arroyo but missing here ships the feature DISABLED while the operator believes it is armed,
+    // which for a WRITE arm is the most consequential version of that bug in the tree: the boot would
+    // print `armed=0 ... -> DRYRUN` on a run the operator armed, and (had the field not been on the
+    // wire) would have looked like a card that refused. The `armed=` field exists for exactly this,
+    // and it is what caught the same omission in WXN-M3b. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_SDW").is_ok() { feats.push("sdw"); }
+    // SDHC-4b (GR20): UNAOS_SDHCBLK=1 makes the INTERNAL SD card a real x86 block backend, published
+    // under its OWN registry handle (`BlockHandle::Sdhc`) so `fs::fat` can mount it READ-ONLY without
+    // the boot volume — the USB stick this machine boots from — moving at all. THIS list is what
+    // reaches the kernel binary for MEDIA builds, so a knob wired into arroyo alone would ship the
+    // backend disabled while the `⚡ kernel features:` banner claimed it was on (s42/INSTGUI, WXN-M3b).
+    // The failure would be quiet in the worst way here: no `:: SDHCBLK: registered … ::` line and no
+    // mount witness reads exactly like "no card was identified", which is a different finding.
+    //
+    // BOOT-STORAGE (GR26): DEFAULT-ON, opted out with UNAOS_NOSDHCBLK=1. The opt-in default was a
+    // GR20 decision taken when the rMBP booted from a USB card reader and the internal slot was a
+    // second, optional source. That premise is gone: the bench machine now boots from a SINGLE SD
+    // card in its INTERNAL slot, so the internal reader is the ONLY program source there is, and an
+    // opt-in knob makes the default x86 image one that cannot reach its own boot volume. GR26 Boot D
+    // is the conviction — the card was identified, read-verified 3/3 windows and MBR-checked, and
+    // then every consumer printed `handles=global=absent sdhc=unbuilt` and declined, because THIS
+    // line had not fired. Turning it on costs a READ-ONLY third handle: `register_sdhc` never touches
+    // the global slot, and `default_writable`'s substitution guard fails OPEN in all but the
+    // positively-proven case.
+    //
+    // REVIEW CORRECTION (GR26): an earlier wording of this comment said "`fs::fat` refuses every
+    // write to a `Sdhc` source". That was GR20's property and SDHC-4c REPLACED it — `fs/fat.rs`'s
+    // write path now admits a span that lies inside the reserved extent (`fs::sdhc4c::permit_write`,
+    // fat.rs:705-709/836-853), and `drivers/block.rs` §SDHC-4c says so at the seam. What actually
+    // makes a DEFAULT image read-only on the card is the absence of `sdw`, which is unchanged by
+    // this flip and still opt-in: without it the image carries no CMD24 ladder at all, so
+    // `block::write_block_sdhc` is the refusing stub (`no `sdw` feature … no CMD24 ladder`,
+    // block.rs:1276-1285) and `FatFs::sdhc4c_write_verify` is the SKIP stub (fat.rs:4155-4163). Say
+    // it that way round, because the two statements fail differently: `UNAOS_SDW=1` alone now also
+    // arms `sdhcblk`, which it did not before this flip, so an `sdw` build reaches the SDHC-4c
+    // reserve pass on the internal card without a second knob.
+    //
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_NOSDHCBLK").is_err() { feats.push("sdhcblk"); }
+    // PCI-CENSUS (GR20): UNAOS_PCICENSUS=1 arms the complete READ-ONLY PCI enumeration witness
+    // (arch/x86_64/pci.rs::full_census) — one `[PCI-CENSUS]` line per function present, plus a
+    // capability dump per network-class function. THIS list is what reaches the kernel binary for
+    // MEDIA builds: the builder re-derives the x86 feature set from env, so a knob wired into
+    // arroyo alone ships the census DISABLED while the `⚡ kernel features:` banner claims it is on
+    // — the s42/INSTGUI and WXN-M3b failure, and the one this arc is most exposed to, because a
+    // census that silently did not run is indistinguishable on the wire from a machine with
+    // nothing on its buses. Config reads only, no BAR sizing, bounded sweep. Default OFF =>
+    // function + call site unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_PCICENSUS").is_ok() { feats.push("pcicensus"); }
+    // BCMA-RECON (GR20): UNAOS_BCMARECON=1 arms drivers/bcma.rs — STRICTLY READ-ONLY recon of the
+    // Broadcom WiFi radio (class 0x02 / subclass 0x80), the first arc of the native-BCM4331 path.
+    // THIS list is what reaches the kernel binary for MEDIA builds: the builder re-derives the x86
+    // feature set from env, so a knob wired into arroyo alone ships the probe DISABLED while the
+    // `⚡ kernel features:` banner claims it is on (the s42/INSTGUI and WXN-M3b failure). This arc is
+    // as exposed to that bug as the census was, and in the same direction: a recon that silently did
+    // not run is indistinguishable on the wire from a machine with no radio in it — which is exactly
+    // the conclusion the whole path-A decision would then be built on. Config reads + BAR0 reads
+    // only; no config write, no register write, no BAR sizing. Default OFF => module + call site
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_BCMARECON").is_ok() { feats.push("bcmarecon"); }
+    // BCMA-S1 (GR20): UNAOS_BCMAS1=1 arms the WiFi path's FIRST WRITE — one PCI config write to
+    // cfg:0x80 (BCMA_PCI_BAR0_WIN) pointing the BAR0 window at ChipCommon, reading chip id + EROM,
+    // then RESTORING the recorded pre-image (never the assumed enumeration base). It rides on top of
+    // the recon: the `bcmaS1` cargo feature implies `bcmarecon`, so pushing `bcmaS1` alone here pulls
+    // in S0 and the x86-only module gate + call site. THIS list is what reaches the kernel binary for
+    // MEDIA builds, so a knob wired into arroyo alone would ship the write DISABLED while the banner
+    // claims it is on (the s42/INSTGUI and WXN-M3b failure) — as exposed as the census was and in the
+    // same direction. Default OFF => module + call site unlinked, media byte-identical. Kept in sync
+    // with arroyo's mapping.
+    if std::env::var("UNAOS_BCMAS1").is_ok() { feats.push("bcmaS1"); }
+    // WIFI-1 (GR25): UNAOS_WIFI=1 arms src/wifi/ — the BCM4331 FIRMWARE-LOAD path. Config-space
+    // identification of the AirPort radio (class 0x02 / subclass 0x80), cross-checked against the
+    // metal facts bcm4331.md §0 pinned, then the user-supplied firmware SET located, validated and
+    // staged off the program-source FAT volume. THIS list is what reaches the kernel binary for
+    // MEDIA builds: the builder re-derives the x86 feature set from env, so a knob wired into arroyo
+    // alone ships the loader DISABLED while the `⚡ kernel features:` banner claims it is on (the
+    // s42/INSTGUI and WXN-M3b failure, and the one bcm4331.md §4 calls "not optional"). This arc is
+    // exposed in the same direction as the recon: a loader that silently did not run is
+    // indistinguishable on the wire from media with no firmware on it. Config reads + FAT reads
+    // only; no config write, no register write, no MMIO. Default OFF => module + call sites
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_WIFI").is_ok() { feats.push("wifi"); }
+    // WIFI-2 (GR25): UNAOS_WIFI2=1 arms arc 2 — the WRITE rungs (src/wifi/bringup.rs). Maps BAR0,
+    // moves the backplane window selector cfg:0x80 onto ChipCommon and then onto the enumeration ROM,
+    // walks the core table from our own reads, cross-checks the d11 core against four metal boots and
+    // against the two config registers firmware left behind, reads the core + wrapper state and
+    // re-measures bcm4331.md §S3's enable rule (a no-op on this machine, and the branch that is not
+    // makes only the REVERSIBLE half — reset is never asserted). The microcode upload is refused at a
+    // named UNKNOWN (§S4 gives no value for the B43_SHM_UCODE routing selector, and the source that
+    // does is off-limits for src/wifi/). Implies `wifi`. The builder wiring is not optional and is
+    // exposed in exactly the direction the census was: media built here re-derives the x86 feature set
+    // from ITS OWN env, so a knob wired only in arroyo ships arc 2 disabled while the banner claims it
+    // is on — and a bring-up that silently did not run is indistinguishable on the wire from a radio
+    // that would not answer. Default OFF => module unlinked, media byte-identical to the arc-1 build.
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_WIFI2").is_ok() { feats.push("wifi2"); }
+    // BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". Lifts the
+    // EHCI hub-walk depth cap 2 -> 3 to reach the HCI controller behind the FULL-SPEED Broadcom hub
+    // `0a5c:4500`, and — in the SAME change, because either alone is wrong — fixes the
+    // split-transaction TT computation so a device below a non-high-speed hub inherits the nearest
+    // HIGH-SPEED ancestor's TT (USB 2.0 §11.14) instead of its immediate parent's. Then recognizes
+    // interface class 0xE0/0x01/0x01 and issues HCI_Reset (0x0C03) + HCI_Read_Local_Version (0x1001)
+    // over the CONTROL endpoint, reading the replies off the INTERRUPT-IN event endpoint. No bulk,
+    // no async schedule (PROBE-14: this Panther Point's async engine master-aborts); every wait
+    // bounded. `bt` implies `ehcihid`, which this list already pushes by default, so pushing `bt`
+    // alone is the whole delta. THIS list is what reaches the kernel binary for MEDIA builds, so a
+    // knob wired into arroyo alone would ship Bluetooth DISABLED while the banner claims it is on
+    // (the s42/INSTGUI and WXN-M3b failure). Default OFF => cap, TT fix and the whole L0 sequence
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_BT").is_ok() { feats.push("bt"); }
+    // BT-C1 (GR24): UNAOS_BTC=1 arms the first BR/EDR step toward A2DP audio — HCI_Create_Connection
+    // (0x0405) pages the speaker at the BD_ADDR in bt_name.rs, witnesses Connection Complete (event
+    // 0x03) or the failure status, and releases the link (or cancels an unresolved page). Its own
+    // knob, and NOT part of UNAOS_BT, because a page is a directed transmission that makes an
+    // audible noise on the speaker: a boot that did not ask for one must be structurally incapable
+    // of issuing one. `btc` implies `bt` in Cargo.toml, so pushing `btc` alone arms the whole BT
+    // stack. THIS list is what reaches the kernel binary for MEDIA builds, so a knob wired into
+    // arroyo alone would ship the page DISABLED while the banner claims it is on (the s42/INSTGUI
+    // and WXN-M3b failure). Default OFF => the page code and its constants unlinked, media
+    // byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_BTC").is_ok() { feats.push("btc"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature
@@ -134,11 +286,35 @@ fn main() {
     if std::env::var("UNAOS_KEPLER").is_ok() { feats.push("nvidia-kepler"); }
     if std::env::var("UNAOS_KEPLER_TAKEOVER").is_ok() { feats.push("nvidia-kepler-takeover"); }
     if std::env::var("UNAOS_KEPLER_FIFO").is_ok() { feats.push("nvidia-kepler-fifo"); }
+    // CE-LADDER: UNAOS_KEPLER_CE=1 arms the read-only copy-engine reconnaissance
+    // (drivers/gpu/kepler_ce.rs). THIS list is what reaches the kernel binary for MEDIA
+    // builds — a knob wired into arroyo alone would ship the ladder DISABLED while the
+    // banner claims it is on (the s42/INSTGUI and WXN-M3b failure). Kept in sync with arroyo.
+    if std::env::var("UNAOS_KEPLER_CE").is_ok() { feats.push("nvidia-kepler-ce"); }
+    if std::env::var("UNAOS_KDISP_HOLD").is_ok() { feats.push("nvidia-kepler-kdisp-hold"); }
     // WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/wcx.rs) — activated
     // at the END of the Kepler takeover seam, after `fbcon::panel_console_resume`. x86_64-only
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
     // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WC").is_ok() { feats.push("wc"); }
+    // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
+    // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
+    // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,
+    // byte-inert. This list reaches the KERNEL build for MEDIA, so a metal boot can arm the ruler.
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_RTWIT").is_ok() { feats.push("rtwit"); }
+    // R1 / RTPI: UNAOS_RTPI=1 arms PRIORITY INHERITANCE on the x86 sleeping `Mutex` plus its `[rtpi]`
+    // witness. Unlike RTWIT, this CHANGES scheduling — the holder of a contended `Mutex` inherits a
+    // blocked higher-priority task's priority (transitively) until release. x86_64-only in effect;
+    // DEFAULT OFF => PI fields absent, original `Mutex::lock` path, inline-shim witness => byte-identical
+    // media. This list reaches the KERNEL build for MEDIA, so a metal boot can arm it. Sync with arroyo.
+    if std::env::var("UNAOS_RTPI").is_ok() { feats.push("rtpi"); }
+    // VSYNC-PACE r3: UNAOS_VSYNCPACE=1 ARMS the kernel-side present pacer. ⚠ POLARITY INVERTED from
+    // GR22's UNAOS_NOPACE — the pacer is now DEFAULT OFF under `wc`, so an unmodified metal boot presents
+    // UNRESTRICTED and this knob is the opt-in that restores the vsync-cadence path. This list is what
+    // reaches the KERNEL build for MEDIA, so the knob has to be mapped here as well as in arroyo, or a
+    // metal boot could never be paced at all. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_VSYNCPACE").is_ok() { feats.push("vsyncpace"); }
     // INSTGUI: UNAOS_INSTGUI=1 opens the graphical installer dialog on the wc desktop. The cargo
     // feature implies `wc` + `installdemo`, but this list is what reaches the KERNEL build for
     // media, so the knob must be mapped here too (arroyo's own list only covers non-media paths —
@@ -154,8 +330,15 @@ fn main() {
     // unaos_ivb rides the same knob: it adds the teardown-trace fields to the SHARED BootInfo
     // struct, so kernel and bootloader must agree on it (see the bootloader build below).
     if std::env::var("UNAOS_IVB").is_ok() { feats.push("intel-ivb"); feats.push("unaos_ivb"); }
-    // GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the integrated GPU + timed
-    // auto-revert. Kept in sync with arroyo's mapping — the builder rebuilds the kernel, so a knob
+    // GEN7-3D: UNAOS_IVB3D=1 arms the Ivy Bridge render-engine reconnaissance rung R1
+    // (drivers/gpu/gen7.rs) — READ-ONLY, zero MMIO/config writes, no display register.
+    // Kept in sync with arroyo's mapping: the builder REBUILDS the kernel for media, so a
+    // knob armed only in arroyo ships the rung absent while the banner says otherwise —
+    // the s42/INSTGUI failure, and the reason this leg is not optional.
+    if std::env::var("UNAOS_IVB3D").is_ok() { feats.push("gen7"); }
+    // GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the integrated GPU with an
+    // unwind-stack restore on the same call stack (round 13 removed the timed auto-revert).
+    // Kept in sync with arroyo's mapping — the builder rebuilds the kernel, so a knob
     // armed in arroyo but missing HERE ships the feature DISABLED while every log line claims it is
     // on. That failure mode has already cost this project weeks on the kepler and igpu lanes.
     if std::env::var("UNAOS_GMUX_IGD").is_ok() { feats.push("gmux_igd"); }
@@ -269,12 +452,24 @@ fn main() {
     // WINX-7: the x86 EL0 mini-vug (crates/user-vug, built by arroyo's build_user_vug_x86 to
     // target/VUG-X86.ELF), staged as VUG.ELF exactly like STAT.ELF above and for the same reasons —
     // un-suffixed on the volume so `bg /fat/VUG.ELF` reads the same on both arches.
-    let vug_elf = target_dir.join("VUG-X86.ELF");
-    if vug_elf.exists() {
-        std::fs::copy(&vug_elf, esp_dir.join("VUG.ELF")).unwrap();
-        println!("   WINX: copied VUG.ELF onto the ESP (bg /fat/VUG.ELF)");
-    } else {
-        println!("   WINX: target/VUG-X86.ELF absent — ESP has no VUG.ELF (run via ./arroyo esp-x86)");
+    //
+    // VUGSCENE: THREE images, not one. `crates/user-vug` is built three times from the same source —
+    // adaptive (VUG.ELF), pinned to the classic wireframe (VUGC.ELF) and pinned to the full shard
+    // (VUGX.ELF) — because `bg`/`run` carry a path and no argv, so a benchmarking pin has nowhere else to
+    // live. All three names are 8.3-clean and go in the FAT root beside STAT.ELF/PULSE.ELF. Absent images
+    // are skipped exactly as the single one always was.
+    for (src, dst) in [
+        ("VUG-X86.ELF", "VUG.ELF"),
+        ("VUGC-X86.ELF", "VUGC.ELF"),
+        ("VUGX-X86.ELF", "VUGX.ELF"),
+    ] {
+        let vug_elf = target_dir.join(src);
+        if vug_elf.exists() {
+            std::fs::copy(&vug_elf, esp_dir.join(dst)).unwrap();
+            println!("   WINX: copied {dst} onto the ESP (bg /fat/{dst})");
+        } else {
+            println!("   WINX: target/{src} absent — ESP has no {dst} (run via ./arroyo esp-x86)");
+        }
     }
 
     // PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse, built by arroyo's build_user_pulse_x86 to
@@ -329,6 +524,10 @@ fn main() {
         (target_dir.join("hello.bin"), "HELLO.BIN"),
         (target_dir.join("STAT-X86.ELF"), "STAT.ELF"),
         (target_dir.join("VUG-X86.ELF"), "VUG.ELF"),
+        // VUGSCENE: the two PINNED vug images ride the data volume too — the pin exists for benchmarking,
+        // and a benchmark that cannot be launched from the volume the kernel actually reads is no pin.
+        (target_dir.join("VUGC-X86.ELF"), "VUGC.ELF"),
+        (target_dir.join("VUGX-X86.ELF"), "VUGX.ELF"),
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
     ] {
         if src.exists() {
@@ -342,8 +541,53 @@ fn main() {
         data_dir.join("hello.txt"),
         "Hello from UnaOS on real hardware!\nThis file was read off the FAT32 DATA volume by the in-kernel FAT reader.\n",
     ).unwrap();
+
+    // STOR-1 fixtures: scripts/make-fat-img.sh plants these for the QEMU single-stick FAT image, and
+    // the STOR-1 storage witnesses (arch/x86_64/syscall.rs) are calibrated against their exact bytes.
+    // On metal, the kernel's fs::fat::mount() binds the USB stick — i.e. THIS data volume, not the ESP
+    // — so a witness that reads a "non-staged on-disk file" needs that file physically here too, or it
+    // fails for a media reason (fixture absent) rather than a code reason. Byte-identical to the QEMU
+    // plant; see make-fat-img.sh's stage_contents() for the specification these mirror.
+
+    // STOR-1 S7: README.TXT, read dynamically off the pre-stage set. The witness (s7_openany_witness)
+    // only checks the file begins with this 16-byte PREFIX and is >= 16 bytes, so the exact trailing
+    // text is not witness-critical — kept byte-identical to make-fat-img.sh's `part` layout anyway.
+    std::fs::write(
+        data_dir.join("readme.txt"),
+        "UnaOS read-only FAT32/16 reader test volume (part layout).\n",
+    ).unwrap();
+
+    // U9x M2: SCRATCH.BIN — 1024 bytes of 0xEE (U9X_SCRATCH_FILL). Without this on-disk, the U9x fixture
+    // still passes in its M1 in-memory-only mode (SCRATCH_CLUSTER stays 0), but silently skips the M2
+    // disk-write-back proof — planting it here exercises the real path on metal instead of the fallback.
+    std::fs::write(data_dir.join("SCRATCH.BIN"), vec![0xEEu8; 1024]).unwrap();
+
+    // U10 GROW: GROW.BIN — 512 bytes of 0xC1 (U10_GROW_FILLER), exactly one 512-byte cluster. Same M1
+    // fallback caveat as SCRATCH.BIN above (GROW_CLUSTER stays 0 without a real on-disk file).
+    std::fs::write(data_dir.join("GROW.BIN"), vec![0xC1u8; 512]).unwrap();
+
+    // STOR-1 S8: S8W.BIN — 64 bytes of 0xA5 (the s8_write_witness SEED). NEVER a staged name
+    // (HELLO/SCRATCH/GROW.BIN) and NEVER README.TXT (S7 checks that file's prefix) — a dedicated
+    // dynamic-open RW target the witness overwrites in place, reads back, then restores, so the file
+    // stays pristine and idempotent across boots.
+    std::fs::write(data_dir.join("S8W.BIN"), vec![0xA5u8; 64]).unwrap();
+
+    // SINKHOLE-1/ZEOLITE-2: BLOCK.TXT — the DNS resolver's hosts-format blocklist, read via the same S7
+    // dynamic-open path. Absent, the resolver falls back to its compiled-in builtin list (not a hard
+    // fail) — planted here so metal exercises the real on-disk parse instead of the fallback. Byte-
+    // identical to make-fat-img.sh's heredoc.
+    std::fs::write(
+        data_dir.join("BLOCK.TXT"),
+        "# zeolite DNS sinkhole blocklist (hosts format)\n\
+         0.0.0.0 ads.example\n\
+         0.0.0.0 track.example   # inline comment tolerated\n\
+         \n\
+         ; semicolon comments and blank lines are skipped\n\
+         127.0.0.1 telemetry.example\n",
+    ).unwrap();
+
     println!(
-        "   WINX-7 PKG: data volume tree target/x86_64_data/ — {} (+ hello.txt)",
+        "   WINX-7 PKG: data volume tree target/x86_64_data/ — {} (+ hello.txt, readme.txt, SCRATCH.BIN, GROW.BIN, S8W.BIN, BLOCK.TXT)",
         if staged_data.is_empty() { "no EL0 artifacts built".to_string() } else { staged_data.join(", ") }
     );
 
@@ -652,9 +896,19 @@ fn main() {
     // Kept in sync with unaos/arroyo (UNAOS_NOSDHCI).
     if std::env::var("UNAOS_NOSDHCI").is_err() {
         let sd_image = target_dir.join("sdcard.img");
-        if !sd_image.exists() {
-            let f = std::fs::File::create(&sd_image).expect("failed to create target/sdcard.img");
-            f.set_len(16 * 1024 * 1024).expect("failed to size target/sdcard.img");
+        // SDHC-4c: the card image is no longer blank by default — it carries a FAT16 superfloppy
+        // with the host-staged reservation `UNALOG.BIN` on it, so the reserve/arm/write/read-back
+        // ladder actually EXECUTES under QEMU instead of being compiled and skipped. See
+        // `stage_sdhc4c_volume`. `UNAOS_SDCARD_BLANK=1` restores the old blank 16 MiB file, which
+        // is the fixture for the honest-refusal path (`no FAT volume ... permit=UNARMED`).
+        if std::env::var("UNAOS_SDCARD_BLANK").is_ok() {
+            if !sd_image.exists() {
+                let f = std::fs::File::create(&sd_image).expect("failed to create target/sdcard.img");
+                f.set_len(16 * 1024 * 1024).expect("failed to size target/sdcard.img");
+            }
+            println!("   SDHC-4c: UNAOS_SDCARD_BLANK — card image left BLANK (exercises the `no FAT volume` refusal)");
+        } else {
+            stage_sdhc4c_volume(&sd_image);
         }
         cmd.arg("-device").arg("sdhci-pci,id=sdhci0")
            .arg("-drive").arg(format!("if=none,id=sdcard0,format=raw,file={}", sd_image.display()))
@@ -721,4 +975,128 @@ fn main() {
         let mut child = cmd.spawn().unwrap();
         child.wait().unwrap();
     }
+}
+
+// ===================== SDHC-4c — the host-staged reservation, for QEMU =====================
+//
+// SDHC-4c's kernel side is ADOPT-ONLY: it locates a fixed-size, contiguous file that the HOST put
+// on the card's FAT volume, publishes that file's LBA extent as the only writable set on the
+// medium, and refuses everything else. That design has an obvious consequence for verification —
+// with a blank card image the arc's entire ladder (adopt, arm, self-test, write, read back) is
+// compiled and never runs, and "it skipped honestly" is not evidence that the interesting path
+// works. This function is the host half, so the ladder EXECUTES under `./arroyo test-fat`.
+//
+// The volume is written here in plain Rust rather than shelled out to `mkfs.vfat` + `mtools` for
+// two reasons. It removes a build dependency the sandbox does not always have. And, more usefully,
+// it fixes the geometry EXACTLY, so this builder can print the extent it just staged and the
+// kernel's `:: SDHC4C: reserve ... lba=[A..B) ::` witness can be compared against a number that was
+// computed independently, on the other side of the boot. A mismatch convicts the kernel's BPB
+// arithmetic or its chain walk; agreement is a real cross-check, not a tautology.
+//
+// GEOMETRY (16 MiB = 32768 sectors, FAT16 superfloppy at LBA 0, no partition table):
+//   bytes/sec 512, sec/clus 4 (2 KiB clusters), reserved 1, 2 FATs x 32 sectors, root dir 32 sectors
+//   first_data_sector = 1 + 2*32 + 32 = 97          => cluster 2 starts at LBA 97
+//   data sectors      = 32768 - 97 = 32671          => 8167 clusters (FAT16: 4085 <= n < 65525 OK)
+//   FAT capacity      = 32 * 512 / 2 = 8192 entries >= 8167 + 2                    OK
+//   UNALOG.BIN        = 65536 bytes = 32 clusters, laid down CONTIGUOUSLY at cluster 2
+//   => the reserved extent is LBA [97 .. 225), 128 sectors. That is the number to predict.
+const SD4C_TOTAL_SECTORS: u32 = 32768;
+const SD4C_SEC_PER_CLUS: u32 = 4;
+const SD4C_RESERVED: u32 = 1;
+const SD4C_NUM_FATS: u32 = 2;
+const SD4C_FAT_SECTORS: u32 = 32;
+const SD4C_ROOT_ENTRIES: u32 = 512; // 512 * 32 B = 16384 B = 32 sectors
+const SD4C_FIRST_CLUSTER: u32 = 2;
+const SD4C_RESERVE_BYTES: u32 = 64 * 1024;
+/// Bytes 3..11 of the boot sector (`BS_OEMName`). Doubles as this fixture's signature: an image
+/// already carrying it is left ALONE, so whatever the previous run's kernel wrote into the reserved
+/// file survives into the next boot. That is what makes "the record persisted across a reboot"
+/// observable under QEMU at all, and persistence is the entire point of the arc.
+const SD4C_OEM: &[u8; 8] = b"UNAOS4C ";
+
+fn stage_sdhc4c_volume(path: &std::path::Path) {
+    let root_dir_sectors = SD4C_ROOT_ENTRIES * 32 / 512;
+    let first_data_sector = SD4C_RESERVED + SD4C_NUM_FATS * SD4C_FAT_SECTORS + root_dir_sectors;
+    let clus_bytes = SD4C_SEC_PER_CLUS * 512;
+    let need_clusters = SD4C_RESERVE_BYTES.div_ceil(clus_bytes);
+    let extent_start = first_data_sector; // cluster 2 == the first data sector
+    let extent_end = extent_start + need_clusters * SD4C_SEC_PER_CLUS;
+
+    // Already staged by a previous run? Leave the DATA alone — see `SD4C_OEM`.
+    if let Ok(existing) = std::fs::read(path) {
+        if existing.len() == (SD4C_TOTAL_SECTORS as usize) * 512 && existing[3..11] == SD4C_OEM[..] {
+            println!(
+                "   SDHC-4c: card image already staged ({}) — reserved {} preserved, extent LBA [{}..{}) ({} sectors); a previous boot's record survives",
+                path.display(), "UNALOG.BIN", extent_start, extent_end, extent_end - extent_start
+            );
+            return;
+        }
+    }
+
+    let mut img = vec![0u8; (SD4C_TOTAL_SECTORS as usize) * 512];
+
+    // ---- boot sector (BPB) ----
+    let bs = &mut img[0..512];
+    bs[0] = 0xEB; bs[1] = 0x3C; bs[2] = 0x90; // BS_JmpBoot — the VBR discriminator parse_bpb demands
+    bs[3..11].copy_from_slice(SD4C_OEM);
+    bs[11..13].copy_from_slice(&512u16.to_le_bytes());          // BPB_BytsPerSec
+    bs[13] = SD4C_SEC_PER_CLUS as u8;                            // BPB_SecPerClus
+    bs[14..16].copy_from_slice(&(SD4C_RESERVED as u16).to_le_bytes()); // BPB_RsvdSecCnt
+    bs[16] = SD4C_NUM_FATS as u8;                                // BPB_NumFATs
+    bs[17..19].copy_from_slice(&(SD4C_ROOT_ENTRIES as u16).to_le_bytes()); // BPB_RootEntCnt
+    bs[19..21].copy_from_slice(&(SD4C_TOTAL_SECTORS as u16).to_le_bytes()); // BPB_TotSec16 (32768 fits)
+    bs[21] = 0xF8;                                               // BPB_Media (fixed disk)
+    bs[22..24].copy_from_slice(&(SD4C_FAT_SECTORS as u16).to_le_bytes()); // BPB_FATSz16
+    bs[24..26].copy_from_slice(&32u16.to_le_bytes());            // BPB_SecPerTrk (cosmetic)
+    bs[26..28].copy_from_slice(&2u16.to_le_bytes());             // BPB_NumHeads (cosmetic)
+    bs[36] = 0x80;                                               // BS_DrvNum
+    bs[38] = 0x29;                                               // BS_BootSig — VolID/VolLab present
+    bs[39..43].copy_from_slice(&0x4C43_3443u32.to_le_bytes());   // BS_VolID ("LC4C") — the witness prints it
+    bs[43..54].copy_from_slice(b"UNAOS SDHC4");                  // BS_VolLab (11 B, space padded)
+    bs[54..62].copy_from_slice(b"FAT16   ");                     // BS_FilSysType
+    bs[510] = 0x55; bs[511] = 0xAA;
+
+    // ---- the FATs: cluster 2..(2+need-1) is ONE contiguous chain, then EOC ----
+    let mut fat = vec![0u8; (SD4C_FAT_SECTORS as usize) * 512];
+    let put = |f: &mut [u8], i: u32, v: u16| {
+        let o = (i as usize) * 2;
+        f[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    };
+    put(&mut fat, 0, 0xFFF8); // media descriptor in entry 0
+    put(&mut fat, 1, 0xFFFF); // EOC in entry 1
+    for k in 0..need_clusters {
+        let c = SD4C_FIRST_CLUSTER + k;
+        let next = if k + 1 == need_clusters { 0xFFFF } else { (c + 1) as u16 };
+        put(&mut fat, c, next);
+    }
+    for n in 0..SD4C_NUM_FATS {
+        let off = ((SD4C_RESERVED + n * SD4C_FAT_SECTORS) as usize) * 512;
+        img[off..off + fat.len()].copy_from_slice(&fat);
+    }
+
+    // ---- root directory: one 8.3 entry, no LFN ----
+    let root_off = ((SD4C_RESERVED + SD4C_NUM_FATS * SD4C_FAT_SECTORS) as usize) * 512;
+    let de = &mut img[root_off..root_off + 32];
+    de[0..11].copy_from_slice(b"UNALOG  BIN"); // 8.3, space padded, no dot on disk
+    de[11] = 0x20;                             // ATTR_ARCHIVE — a plain file
+    de[26..28].copy_from_slice(&(SD4C_FIRST_CLUSTER as u16).to_le_bytes()); // DIR_FstClusLO
+    de[28..32].copy_from_slice(&SD4C_RESERVE_BYTES.to_le_bytes());          // DIR_FileSize
+
+    // ---- the reservation's own bytes: a recognisable fill, so a kernel write is VISIBLE ----
+    // 0xAA is not 0x00: a host-side `xxd` after the run distinguishes "the kernel wrote here" from
+    // "this sector was never touched", which zero-fill would not.
+    let data_off = (extent_start as usize) * 512;
+    let data_len = ((extent_end - extent_start) as usize) * 512;
+    for b in &mut img[data_off..data_off + data_len] {
+        *b = 0xAA;
+    }
+
+    std::fs::write(path, &img).expect("failed to write target/sdcard.img");
+    println!(
+        "   SDHC-4c: staged FAT16 card image ({}) — UNALOG.BIN cluster={} size={} contiguous, \
+         data@LBA{} => PREDICTED reserved extent LBA [{}..{}) ({} sectors); the kernel's \
+         `:: SDHC4C: reserve ...` witness must name exactly this",
+        path.display(), SD4C_FIRST_CLUSTER, SD4C_RESERVE_BYTES, first_data_sector,
+        extent_start, extent_end, extent_end - extent_start
+    );
 }

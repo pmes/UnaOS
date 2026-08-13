@@ -1,29 +1,76 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// INSTALL-CORE — self-contained, no_std checksum + digest primitives for the installer engine.
+// HASH — self-contained, no_std checksum + digest primitives.
 //
 // Two well-known algorithms, implemented here (not pulled from a crate, and deliberately NOT reaching
-// into the aarch64-private `sha256` in arch/aarch64/syscall.rs — the installer engine is arch-neutral,
-// so it carries its own copies):
+// into the aarch64-private `sha256` in arch/aarch64/syscall.rs — every consumer here is arch-neutral,
+// so this module carries its own copies):
 //   * CRC-32/ISO-HDLC (poly 0xEDB88320, reflected, init/xorout 0xFFFFFFFF) — the exact variant the
-//     UEFI GPT spec mandates for the header + partition-entry-array CRCs.
+//     UEFI GPT spec mandates for the header + partition-entry-array CRCs, and the same variant gzip
+//     stamps in its 8-byte trailer.
 //   * SHA-256 (FIPS 180-4) — the content fingerprint for the copy-and-verify primitive.
-// Both are verified against known-answer tests at witness time (see `mod.rs`).
+// Both are verified against known-answer tests at witness time (see `install/mod.rs`).
+//
+// SELFHOST-2 moved this file from `install/hash.rs` to the crate root so the source-verify walk can
+// reuse it without dragging the whole installer engine in behind `installdemo`. `install` re-exports
+// it (`pub use crate::hash;`), so every `crate::install::hash::…` call site is unchanged.
 
-/// CRC-32/ISO-HDLC over `data`. Bitwise (no static table — no_std, tiny, and this runs a handful of
-/// times per install, never in a hot loop). Matches the host `crc32fast::hash` the builder's
-/// `vm_image.rs` GPT writer uses, so an image written by either tool self-verifies against the other.
-pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
+/// CRC-32/ISO-HDLC lookup table, computed at compile time (poly 0xEDB88320, reflected).
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
             let mask = (crc & 1).wrapping_neg(); // 0xFFFFFFFF if LSB set, else 0
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            bit += 1;
         }
+        table[i] = crc;
+        i += 1;
     }
-    !crc
+    table
+};
+
+/// A streaming CRC-32/ISO-HDLC. The gzip trailer check in `selfhost::inflate` runs this over tens of
+/// megabytes of decompressed stream that is never buffered whole, so the digest has to be incremental
+/// the same way `Sha256` is.
+pub struct Crc32 {
+    crc: u32,
+}
+
+impl Crc32 {
+    pub fn new() -> Self {
+        Self { crc: 0xFFFF_FFFF }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        let mut crc = self.crc;
+        for &b in data {
+            crc = (crc >> 8) ^ CRC32_TABLE[((crc ^ b as u32) & 0xFF) as usize];
+        }
+        self.crc = crc;
+    }
+
+    pub fn finish(&self) -> u32 {
+        !self.crc
+    }
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// CRC-32/ISO-HDLC over `data`. Matches the host `crc32fast::hash` the builder's `vm_image.rs` GPT
+/// writer uses, so an image written by either tool self-verifies against the other.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut c = Crc32::new();
+    c.update(data);
+    c.finish()
 }
 
 // --- SHA-256 (FIPS 180-4) ---

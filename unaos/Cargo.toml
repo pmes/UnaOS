@@ -2,6 +2,10 @@
 members = [
     "builder", "crates/boot-info", "crates/bootloader",
     "crates/kernel",
+    # The frozen syscall ABI. A workspace member (the kernel depends on it) AND a path dependency of
+    # every `user-*` crate, each of which is its own workspace root — a path dep across workspaces is
+    # ordinary cargo, and it is what makes both sides of a syscall compile against the same literal.
+    "crates/una-abi",
     "crates/net",
     "crates/rast",
 ]

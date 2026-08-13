@@ -167,11 +167,31 @@ pub struct DmaPool {
     /// report path), not just the ≤ 64 B enumeration descriptors. Behaviour-neutral for the small
     /// reads — they simply do not use the extra room.
     pub data_buf: Buf256,
-    pub int_slots: [IntSlot; 4],
+    pub int_slots: [IntSlot; MAX_INT_EPS],
+    /// BT-L0 — the HCI **event** endpoint's own slot, OUTSIDE `int_slots`.
+    ///
+    /// MTFIX (Boot AN conviction): `bt_arm_events` used to take `int_slots[int_next]` and bump
+    /// `int_next`, so the radio's event endpoint spent one of the HID budget's slots for the whole
+    /// boot. On the rMBP the internal trackpad's vendor-multitouch interface is the LAST endpoint
+    /// enumerated, so it is the one that fell off the end: Boot AN logged
+    /// `static int-EP pool exhausted (4) — endpoint skipped` at 1860 ms, immediately before the
+    /// (unconditional, and therefore lying) `M1 armed vendor-multitouch` witness. The event
+    /// endpoint is read synchronously by the L0 sequence and never handed to `service()`, so it has
+    /// no business competing for a slot that `service()` drains — it gets its own.
+    ///
+    /// Knob-off (`bt` disabled) the field does not exist and `DmaPool`'s layout is unchanged.
+    #[cfg(feature = "bt")]
+    pub bt_slot: IntSlot,
 }
 
 pub const MAX_CONTROLLERS: usize = 2;
-pub const MAX_INT_EPS: usize = 4;
+/// HID interrupt endpoints armed per controller. MTFIX: 4 → 6. Boot AN's controller [1] armed
+/// exactly four (keyboard addr 6, boot-mouse addr 7, trackpad's boot-keyboard interface addr 9
+/// IN3, trackpad's vendor-multitouch addr 9 IN1) — a budget with ZERO margin, on the arm order
+/// that puts the internal trackpad last. Freeing the BT slot alone restores that exact fit; the
+/// headroom is what keeps one extra plugged-in HID device from starving the internal trackpad
+/// again. Cost is 2 static `IntSlot`s per controller in the kernel image.
+pub const MAX_INT_EPS: usize = 6;
 
 /// The pools (one per EHCI function; the 2012 rMBP has exactly two). Extra functions beyond
 /// MAX_CONTROLLERS are skipped with a trace by the caller.

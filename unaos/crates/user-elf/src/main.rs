@@ -17,7 +17,12 @@
 // permissions: the code page executes, and the read of the data page's message succeeds.
 //
 // ABI (Linux-aarch64): x8 = syscall number, args x0..x5, return in x0. Syscalls used:
-//   SYS_WRITE = 1 (fd, buf, len), SYS_REPORT = 3 (value), SYS_EXIT = 2 (status). See syscall.rs.
+//   SYS_WRITE (fd, buf, len), SYS_REPORT (value), SYS_EXIT (status).
+//
+// ABIFREEZE: those three numbers and the witness token are `const` OPERANDS out of `una_abi` rather
+// than immediates typed into the asm string — a raw immediate cannot be a `use`d path, a `const`
+// operand can. Byte-identical output; the kernel's `ELF1_WITNESS_TOKEN` is now literally the same
+// declaration this program reports.
 
 use core::arch::global_asm;
 
@@ -33,16 +38,16 @@ global_asm!(
 .section .text.entry,"ax",@progbits
 .globl _start
 _start:
-    mov  x8, #1                 // SYS_WRITE
+    mov  x8, #{sys_write}       // SYS_WRITE
     mov  x0, #1                 // fd = 1 (stdout)
     adr  x1, elf_msg            // buf = the message in the DATA segment (PC-relative)
     mov  x2, #19                // len = strlen("elf hello from EL0\n")
     svc  #0
     adr  x3, elf_bss            // reference the .bss tail so it is not GC'd (kept NOBITS => p_memsz>p_filesz)
-    mov  x8, #3                 // SYS_REPORT
-    movz x0, #0x1E              // witness token 0x1E
+    mov  x8, #{sys_report}      // SYS_REPORT
+    movz x0, #{elf1_token}      // the ELF-1 witness token
     svc  #0
-    mov  x8, #2                 // SYS_EXIT
+    mov  x8, #{sys_exit}        // SYS_EXIT
     mov  x0, #0                 // status = 0
     svc  #0
 0:  b 0b                        // sys_exit never returns; spin as a guard
@@ -56,7 +61,11 @@ elf_msg:
 .globl elf_bss
 elf_bss:
     .space 16                   // non-empty zero tail: exercises the loader's p_memsz>p_filesz zeroing
-"#
+"#,
+    sys_write = const una_abi::SYS_WRITE,
+    sys_report = const una_abi::SYS_REPORT,
+    sys_exit = const una_abi::SYS_EXIT,
+    elf1_token = const una_abi::ELF1_WITNESS_TOKEN,
 );
 
 // A no_std binary must define a panic handler; this routine never panics (the body is a single asm

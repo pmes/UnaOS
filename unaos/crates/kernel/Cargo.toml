@@ -6,10 +6,38 @@ license = "GPL-3.0-or-later"
 
 [features]
 default = []
+# R0 / rtwit: the WORST-CASE RULER. Arms the `[rtwit]` tail instruments (input→present latency,
+# per-lock max hold, max interrupt-mask span) — MAXes only, never a mean. Pure measurement: no
+# scheduling/locking/present behaviour changes. DEFAULT OFF => every hook degrades to an empty inline
+# shim and a zero-sized `HoldTimer`, so the boot is byte-inert on the hot path (see `src/rtwit.rs`).
+# x86_64-only in effect (the real impl is gated on `target_arch = "x86_64"`; the shim covers aarch64).
+# Enable via `UNAOS_RTWIT=1`. Kept in sync with arroyo.
+rtwit = []
+# R1 / rtpi: PRIORITY INHERITANCE on the x86 sleeping `Mutex` (arch::x86_64::sched), plus its
+# `[rtpi]` witness (donation events, max priority jump, transitive-chain depth, live leak gauge).
+# Unlike `rtwit` (a pure ruler), this CHANGES scheduling behaviour: while a strictly-higher task
+# blocks on a `Mutex`, the holder inherits the blocker's priority (transitively) until release, so
+# mid-priority tasks cannot preempt the critical section (bounded priority inversion). DEFAULT OFF
+# => the `Task`/`Mutex` PI fields do not exist, `Mutex::lock` takes its original single-`wait()`
+# path, and every witness hook is an empty inline shim — so the boot is BYTE-IDENTICAL to the
+# pre-arc scheduler (see `src/rtpi.rs` and the PI block in `arch/x86_64/sched.rs`). x86_64-only in
+# effect. Enable via `UNAOS_RTPI=1`. Kept in sync with arroyo AND builder/src/main.rs.
+rtpi = []
 # Cleanroom GPU driver features
 nvidia-kepler = []
 nvidia-kepler-takeover = []
 nvidia-kepler-fifo = []
+nvidia-kepler-kdisp-hold = []
+# CE-LADDER: `UNAOS_KEPLER_CE=1` — read-only copy-engine reconnaissance on the GK107
+# (drivers/gpu/kepler_ce.rs), run from `kepler::init` BEFORE the fifo leg so it sits above
+# every FECS access and sees the runlist array pre-submit. Rungs R1 (PTOP device-info
+# sweep), R2 (CE PRI window probe), R3 (wide runlist scan), R5 (firmware instance-block walk
+# through PRAMIN). No device writes except the PRAMIN window base, which is metal-proven
+# (Boot A `bar1-identity`) and restored at every use. Implies `nvidia-kepler` so the module's
+# gate in gpu/mod.rs is self-sufficient; independent of `nvidia-kepler-fifo` on purpose — a
+# boot may run the reconnaissance without building a channel. DEFAULT OFF => module and call
+# site unlinked, media byte-identical. Kept in sync with arroyo AND builder/src/main.rs.
+nvidia-kepler-ce = ["nvidia-kepler"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/wcx.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in
@@ -21,17 +49,62 @@ nvidia-kepler-fifo = []
 # is byte-identical. Enable via `UNAOS_WC=1` (needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach
 # the seam).
 wc = []
+# VSYNC-PACE r3: `UNAOS_VSYNCPACE=1` — the OPT-IN that ARMS the kernel-side present pacer.
+#
+# ⚠ THE POLARITY IS INVERTED FROM GR22's, DELIBERATELY, AND THIS COMMENT KEEPS THE OLD ARGUMENT SO THE
+# CHANGE IS LEGIBLE. The feature used to be `nopace` and the pacer was DEFAULT ON, justified by: "a
+# desktop that renders frames the panel cannot scan out is burning CPU for pixels no operator can see,
+# so waste-free is the right default and an opt-in knob would leave the shipped configuration the
+# wasteful one."
+#
+# That argument decides a question the OS is not entitled to decide FOR the program. P, GR25: *"fps is
+# made up/forced to run a certain speed rather than running unrestricted as does the load across
+# cores."* A present is a ring-3 program asking the machine to do work; the machine's answer is how
+# long the work takes, not a sleep chosen on the program's behalf. Boot B is the proof that the old
+# default was answering by fiat: `[wpace] win=3 pres=311 paced=311 slept=4615ms rate=62.1/s` — EVERY
+# present delayed, 4.6 s of a 5 s span spent asleep inside the syscall, and 62.1/s reported as though
+# it were the program's speed when it was the pacer's ceiling.
+#
+# So: DEFAULT OFF. A present returns as soon as its composite is done, at whatever rate the program can
+# reach, and the load shows up across cores where an operator can see it. See `arch/x86_64/syscall.rs`
+# (`present_pace`) and `docs/dev/OS/08_VIDEO/engine.md` "VSYNC-PACE r3" for why NEITHER a drop nor an
+# EWOULDBLOCK-style refusal replaced the sleep, and for the per-window opt-in ABI this build-level knob
+# stands in for until it exists.
+#
+# What arming it is FOR, unchanged from the old hatch's inverse: the pacer answers "what does this
+# fleet look like clamped to the panel" by fiat, and a boot that wants THAT question answered — a
+# vsync-cadence comparison, a power measurement — arms it explicitly. `[wpace] mode=` names which
+# regime any given capture was taken under, so the two are never confused again.
+#
+# `vsyncpace` is x86-only in effect (everything it gates lives in `arch/x86_64/syscall.rs`, and `wc` is
+# an x86 feature) and is STRIPPED from aarch64 builds by `arroyo`'s `arm_features`, so Pi and Jetson
+# media stay byte-identical whichever way it points.
+vsyncpace = []
 # INSTGUI: the graphical installer window (UNAOS_INSTGUI=1; requires wc + the x86 engine).
 instgui = ["wc", "installdemo"]
 intel-ivb = []
 unaos_ivb = ["unaos-boot-info/unaos_ivb"]
-# GMUX-IGD: the display-mux switch to the INTEGRATED GPU (`UNAOS_GMUX_IGD=1`). `arroyo` and
-# `builder/src/main.rs` have pushed this feature since ce5c6f49 while this — the third leg both
-# assumed existed — was missing, so the armed gate died on `does not contain this feature`
-# rather than compiling anything. Declared here so the knob resolves; NOTHING on trunk is gated
-# on it yet, so armed and disarmed trunk builds are byte-identical. The behaviour (the port
-# helpers, `RevertState`, and the arm block in `igpu::init()`) arrives with the igpu lane, which
-# replaces this comment with its own.
+# GEN7-3D R1: the Ivy Bridge render-engine reconnaissance rung (`UNAOS_IVB3D=1`, mapped in
+# `arroyo` and `builder/src/main.rs` — all three legs, per the knob-wiring law). Implies
+# `intel-ivb` because the rung consumes the BAR0 window `igpu::init` maps and publishes.
+#
+# READ-ONLY: the rung performs zero MMIO writes and zero config writes, so unlike `gmux_igd`
+# the media is NOT single-use and no boot from an armed stick changes machine state. It
+# cannot black the panel — it writes nothing, and the panel belongs to the Kepler anyway.
+#
+# DEFAULT OFF => `drivers/gpu/gen7.rs` is not compiled, the call site in `igpu::init`
+# vanishes, and no `:: gen7:` token exists in the image (strings-verifiable, which is the
+# gate that matters here — QEMU has no Ivy Bridge IGD and proves nothing about any rung).
+# See ~/unaos-bench/scratch/gr25/GEN7-3D-draft.md §5 rungs R0/R1.
+gen7 = ["intel-ivb"]
+# GMUX-IGD: arm the display-mux switch to the INTEGRATED GPU (`UNAOS_GMUX_IGD=1`, already mapped in
+# `arroyo` and `builder/src/main.rs` since ce5c6f49 — this entry is the third leg those two assumed
+# existed). x86_64-only, and only reachable on an `unaos_ivb` build that printed PROTOCOL PROVEN.
+# DEFAULT OFF => every port-writing helper, `RevertState`, and the arm block in `igpu::init()` vanish
+# and `read_gmux_trace()` is left exactly as trunk has it (inline closures, hard iteration cap, no
+# `arch::ms()`), so the disarmed build is behaviourally identical to baseline. See
+# docs/dev/GEMINI/video/iGUI/PROPOSAL-igpu-gmux-igd.md and RUNBOOK-gmux-igd.md — the media is
+# SINGLE-USE, every boot from an armed stick switches the mux again.
 gmux_igd = []
 # DEFAULT-QUIET (witness): gate the battery of EL0/kernel fixtures that RE-PROVE long-metal-confirmed
 # facts on every boot (x86: nmi-self-fire + canonical-guard + U1a/U1b/U2-0a/U3/U3.5 + the
@@ -43,6 +116,38 @@ gmux_igd = []
 # so witness coverage is unchanged-green; the boot/media builds (`x86`/`arm`/`esp-*`/`kernel8`) leave it
 # off. Gates CALL SITES only — never the fixture bodies. See review/unaos-default-quiet-LANDING.md.
 witness = []
+# SELFHOST-2 (`UNAOS_SELFHOST=1`): the source tree is READABLE ON THE SHARD — `crate::selfhost` mounts
+# the program-source volume, verifies SRC.TGZ against the sha256 in SRC.SHA, then gunzips + tar-walks
+# it and enumerates the members (streaming both ends; strictly read-only, no write path to media).
+# Rung 2 of the self-hosting line begun by SOURCE-ALONG (docs/dev/OS/10_INSTALL/source_along.md).
+# Arch-neutral (drives only `fs::fat` + `crate::hash`), so it compiles on both arches; the witness
+# call site is x86_64-only this arc because the packaged fixture is the x86 usb-storage image
+# (`./arroyo test-selfhost`). Also pulls in `crate::hash`. DEFAULT OFF => the module, `crate::hash`
+# (absent the installer features) and the call site all vanish, and every image is byte-identical to
+# baseline. Kept in sync with arroyo AND builder/src/main.rs.
+selfhost = []
+# WXN-x86 M3b (THE ARM): PERFORM the W-clear on the kernel's executable pages, rather than only
+# measuring it. x86_64 only. DEFAULT OFF is load-bearing and not a convenience: with the knob off,
+# `memory::wxn_ro_stage` runs the identical extent derivation and the identical read-only census,
+# prints `:: WXN-M3B-PRE: ... -> CENSUS ::` and then `would=` where an armed boot prints `cleared=`,
+# and writes NOTHING — it does not even open a `CR0.WP` window. The store itself is gated with
+# `cfg!(feature = ...)`, NOT `#[cfg]`, so it is COMPILED and type-checked in every leg of
+# `./arroyo check` whichever way the knob is set (GR19 paid for that lesson with a gate blind to
+# mixed knobs), and the `x86-all` cfg-matrix leg carries `wxnro` so the ARMED polarity is
+# type-checked too. Enable via `UNAOS_WXNRO=1` — in BOTH arroyo and builder, since the x86 ESP
+# carries the BUILDER's kernel. See arch/x86_64/memory.rs §WXN-x86 M3b and docs/SECURITY.md.
+wxnro = []
+# WC-G/M3 (PAYGO): reshape the `witness` build's `[wc-g]` glass battery so a boot does not pay for
+# all four passes at once. x86_64 only, and it changes only the READ-BACK: pass 1 becomes
+# lattice-sampled (every 16th source pixel per row, phase rotating one column per row) and marks
+# itself `coverage=lattice16` on the wire; passes 2..4 stay FULL coverage but are deferred until 15 s
+# of uptime, so the battery completes on a live desktop instead of inside the boot burst. The four
+# checksum legs are untouched and every FORBID stays armed the whole boot. A deferred pass does not
+# spend budget and never goes quiet — it prints `[wc-g] paygo … -> DEFERRED` and keeps an unbudgeted
+# `deferred=` census. Requires `witness` (the module is `#[cfg(feature = "witness")]`); DEFAULT OFF =>
+# every `[wc-g]` line is byte-identical to the pre-M3 wire and aarch64 is unaffected either way.
+# Enable via `UNAOS_WCG_PAYGO=1`. See video/wcg.rs §WC-G/M3.
+wcg-paygo = []
 # Skip xHCI/USB bring-up entirely (`pci::init`). For real-hardware video bring-up where the
 # firmware/SMM may still own the xHCI controller (this branch has no BIOS->OS handoff) and wedge
 # its reset handshake — the controller's status bits never flip, so the bounded-but-slow timeout
@@ -60,6 +165,13 @@ bootlog = []
 # unchanged. DEFAULT OFF => module + prefix path vanish and serial is byte-identical (witness/mbench
 # specs parse serial lines and must be unaffected). Enable via `UNAOS_LOGTS=1`.
 logts = []
+# PFWIRE self-test — proves the CPL-0 fault handlers put their diagnostics on the wire. It DELIBERATELY
+# provokes a fatal page fault and HALTS the boot (a witness for the `enter_panic_mode` fix, review §5/C2),
+# so it is a debug knob only: never on boot media, never in the regression battery. DEFAULT OFF => the
+# self-test and its `arch::init` call site vanish and every artifact is byte-identical. x86_64 only.
+# Enable via `UNAOS_PFWIRE_SELFTEST=1` (headless QEMU serial capture proves the faulting-address line
+# reaches serial even when this core dies holding SERIAL1). See arch/x86_64/serial.rs::pfwire_selftest.
+pfwire_selftest = []
 # Raspberry Pi 4 build: the BCM2711 PL011 is not at the QEMU `virt` MMIO address the aarch64 serial
 # hardcodes, so don't touch that UART (it would be RAM on the Pi) — rely on fbcon for on-screen
 # output, like the Mac. Enable via `UNAOS_PI=1`.
@@ -177,6 +289,46 @@ botring64 = []
 # unconditional — see usb_xhci.md §17 and the BOT-CBW block in drivers/xhci/mod.rs. It graduated
 # from experiment to fix on a two-boot metal A/B and there is deliberately no feature left that
 # could turn it back off.)
+# WIFI-1: the BCM4331 firmware-load path — arc 1 of the association ladder (`src/wifi/`; the wider
+# ladder is docs/dev/OS/06_NETWORK_STACK/bcm4331.md). Finds the AirPort radio in PCI CONFIG space by
+# class 0x02 / subclass **0x80** (class alone selects the BCM57765 Ethernet MAC — bcm4331.md §0) and
+# CROSS-CHECKS device/rev/subsys/BAR0/match-count against three metal boots, printing MATCH or
+# MISMATCH per field. Read-only: no BAR mapping, no MMIO, no register write, no bus-master. Then
+# locates the USER-SUPPLIED firmware SET on the program-source FAT volume (ucode29_mimo.fw +
+# ht0initvals29.fw + ht0bsinitvals29.fw per §S4, 8.3 aliases accepted, searched in /, /B43/,
+# /FIRMWARE/), bounds-validates each, classifies its container header (§S4's record is internally
+# inconsistent: reported, never enforced), and stages the bytes for arc 2. UnaOS ships no firmware
+# (CLEAN_ROOM_POLICY §4) — a missing file prints one honest ABSENT line and the pass ends in one
+# terminal verdict, then parks (no retry, no crash, radio stays down). Arc 2 owns bcma core
+# enumeration + the first device write; arc 3 owns association. Forward-only, at most one staging pass
+# per boot (the call sits at all THREE of main.rs's storage-ready loop passes, the
+# `fatverb_storage_witness` placement). x86_64-only and stripped by arroyo's `arm_features`. QEMU
+# models no BCM4331, so a QEMU run only ever witnesses the honest no-radio refusal. Default OFF =>
+# module + call sites vanish, byte-identical. Enable via `UNAOS_WIFI=1`. See
+# docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+wifi = []
+# WIFI-2: arc 2 of the same ladder — the WRITE rungs (`src/wifi/bringup.rs`). Maps BAR0 (two 4 KiB
+# apertures), moves the backplane window selector cfg:0x80 onto ChipCommon and then onto the
+# enumeration ROM, walks the core table from our own reads with a TAG-driven parse (the declared port
+# counts become an independent arity cross-check instead of the parse driver), cross-checks the d11
+# core's rev/base/master-wrapper against four metal boots AND against the two config registers Apple's
+# firmware left behind, opens the core window, reads MACCTL/PHY_VER/TSF and the wrapper's
+# IOCTL/IOST/RESET_CTL/RESET_ST, and re-measures bcm4331.md §S3's enable rule. On this machine the
+# core arrives enabled, so that rung costs ZERO device writes; on the branch where it does not, it
+# makes only the REVERSIBLE half (deassert RESET, set CLK with FGC clear, every other bit as read) —
+# it NEVER asserts reset, because asserting reset clears MACCTL.PSM_RUN and destroys the microcode the
+# radio arrives running (§5 risk 4). Every device write carries a pre-read/write/post-read witness
+# triple; cfg:0x80's pre-image is recorded, the restore path is self-tested with an in-place no-op
+# BEFORE the window moves, and the restore is MATCH-verified against the recorded value (never against
+# 0x18000000). The microcode upload is REFUSED at a named UNKNOWN — §S4 names the B43_SHM_UCODE
+# routing selector but records no value for it, and CLEAN_ROOM_POLICY §2 puts the only source that
+# carries it off-limits for src/wifi/. IMPLIES `wifi` (arc 2 reads the census's selection and the
+# staged set). x86_64-only and stripped by arroyo's arm_features. QEMU models no BCM4331, so a QEMU run
+# only ever witnesses the honest refusal at `no-radio-selected`; metal-first by construction. Default
+# OFF => not one byte of arc 2 in the image and the census-only boot is byte-identical to arc 1's.
+# Enable via `UNAOS_WIFI2=1`. Kept in sync with arroyo and builder/src/main.rs. See
+# docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+wifi2 = ["wifi"]
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +
@@ -248,6 +400,106 @@ ehcihid = ["ehciconfig"]
 # default-ON/negative-knob policy. x86_64-only (the `ehci` module is x86-gated), and `arroyo`'s
 # `arm_features` strips it from aarch64 compiles so aarch64 media stay byte-identical either way.
 kbdwit = []
+# BT-L0 (GR21): `UNAOS_BT=1` arms the first Bluetooth arc — "does the radio answer?", the direct
+# analogue of BCMA-S1, and nothing above it. On the 2012 rMBP the Bluetooth module is a TWO-DEVICE
+# unit on EHCI: a Broadcom hub `0a5c:4500` (addr 5, depth 2, FULL SPEED) with the HCI controller as
+# its single downstream child at depth 3. UnaOS has never enumerated that child, because the hub
+# walk is capped at `depth >= 2` — the radio has been present, powered and answering enumeration
+# for the life of the project while we declined to knock.
+#
+# The knob turns on THREE things that must land together:
+#   1. the hub-walk depth cap lifted 2 -> 3 (enough to bring up a hub AT depth 2);
+#   2. the TT-INHERITANCE FIX in `bring_up_hub` — a device below a hub that is NOT high speed
+#      inherits the nearest HIGH-SPEED ancestor's transaction translator (USB 2.0 §11.14), not its
+#      immediate parent's. The Broadcom hub trains at full speed and owns no TT; without this the
+#      split transactions would be aimed at `HubAddr=5`, which translates nothing, and the radio
+#      would read as DEAD rather than as mis-addressed. Lifting the cap without this fix produces a
+#      confident false negative, which is why they are one change and not two;
+#   3. the class-0xE0/0x01/0x01 (Wireless/RF/Bluetooth) recognition arm plus the L0 sequence:
+#      SET_CONFIGURATION, then `HCI_Reset` (0x0C03) and `HCI_Read_Local_Version_Information`
+#      (0x1001) over the CONTROL endpoint (bmRequestType 0x20, bRequest 0x00 — the Bluetooth USB
+#      transport, Core Vol 4 Part B), with the replies read off the INTERRUPT-IN event endpoint.
+#      The verdict is `Manufacturer_Name` — Broadcom is 0x000F, a value no code path of ours can
+#      fabricate.
+#
+# NO BULK, NO ASYNC SCHEDULE anywhere in this path, and that is a hard constraint rather than a
+# simplification: this Panther Point's async schedule master-aborts its first schedule fetch
+# (PROBE-14, 13 metal probes), and bulk conventionally rides async. The ACL bulk endpoints are
+# named in the witness and never touched. Every wait is bounded (`wait_bounded`'s TSC deadline)
+# and the event drain carries a second, structural cap, so a mute radio costs a bounded delay and
+# never a hung boot.
+#
+# Implies `ehcihid` — the entire implementation lives inside `drivers/ehci/mod.rs`, which is gated
+# on it; arming `bt` without it would ship a knob whose code does not exist. Default OFF => the
+# cap, the TT fix, the recognition arm, the L0 sequence, the `BtEvtEp` type and the `bt_parent`
+# field all vanish and a no-BT boot is byte-identical to trunk. The TT fix is a REAL BUG FIX that
+# wants to be UNGATED in a follow-up once metal has proven it (it can only ever change behaviour
+# below a non-high-speed hub — exactly the tier the depth cap has been hiding). x86_64-only (via
+# the `ehcihid` module gate), and stripped from aarch64 compiles by arroyo's `arm_features` so
+# aarch64 media stay byte-identical either way. Kept in sync with `unaos/arroyo` AND
+# `unaos/builder/src/main.rs` — a knob wired only in arroyo ships disabled while the banner claims
+# it is on (the s42/INSTGUI and WXN-M3b lesson).
+#
+# BT-L1 (GR22): the same knob now carries the first real command/event round-trips beyond the
+# version read, still strict bring-up (no pairing, no data). Through the armed event endpoint and
+# the existing control path, a small command TABLE runs after the L0 sequence: `HCI_Read_BD_ADDR`
+# (0x1009 — the radio's own MAC/identity), `HCI_Read_Buffer_Size` (0x1005 — ACL/SCO packet length
+# + count), `HCI_Read_Local_Supported_Features` (0x1003 — proves LE from byte-4 bit-6 of the LMP
+# mask rather than inferring it from the 4.0 version), `HCI_Read_Local_Supported_Commands` (0x1002)
+# and finally `HCI_Set_Event_Mask` (0x0C01 — the first WRITE, set to the reset default so it is
+# idempotent and witnessed by its CommandComplete status). Each command witnesses with the
+# `bt-l1:` prefix; a bounded-wait timeout is a clean STOP naming the command, never a hang. The one
+# structural addition is MULTI-PACKET EVENT REASSEMBLY in `bt_hci_command`: the event endpoint's
+# max packet is 16 B but `_Read_Local_Supported_Commands` returns a 70-byte event, so a whole event
+# is now gathered across several interrupt-IN packets (the data toggle advancing on each) before it
+# is parsed — the path L2 (LE scan) needs. No new endpoint is armed (mtfix's slot budget holds),
+# no async, no bulk; every command is a MANDATORY HCI command, so a status=0x01 (Unknown Command)
+# would be the clean-room/patchram boundary and is witnessed as such, not patched around.
+#
+# BT-L2 (GR22): the same knob now runs an **LE SCAN** after L1 — the first thing this radio does
+# that a person can see. Sequence, all through the already-armed event endpoint (no new endpoint,
+# so mtfix's slot budget is untouched): `HCI_Set_Event_Mask` (0x0C01) REWRITTEN to
+# 0x2000_1FFF_FFFF_FFFF, because L1's value is the spec reset default and the reset default does
+# NOT include LE Meta Event (bit 61) — every advertising report rides that bit, and without this
+# write a scan runs, hears everything and reports a silent, entirely wrong empty room;
+# `HCI_LE_Set_Event_Mask` (0x2001) for the Advertising Report sub-event; `HCI_LE_Set_Scan_Parameters`
+# (0x200B) passive, interval == window == 0x0060 (60 ms, continuous), own address public, accept-all
+# filter policy; `HCI_LE_Set_Scan_Enable` (0x200C) with filter_duplicates on. Advertising reports
+# (event 0x3E subevent 0x02) are then drained for a BOUNDED 500 ms wall-clock window and decoded to
+# address, address type, RSSI, event type and the Complete/Shortened Local Name AD structure; one
+# `bt-l2:` line per distinct device (cap 16, truncation stated, never silent) plus a rollup.
+# Scanning is DISABLED on every exit path that could have started it — including the unconfirmed
+# enable — because a radio left scanning burns power and floods the event endpoint for the rest of
+# the boot, on the same controller as the internal keyboard and trackpad. The scan starts only from
+# a fully confirmed base (L0 reset + version and every L1 row status 0x00, and LE claimed by the LMP
+# feature mask); anything else prints why and changes nothing. A status 0x01 (Unknown HCI Command)
+# on an LE command is the patchram/.hcd FIRMWARE BOUNDARY (docs/MANIFESTO/CLEAN_ROOM_POLICY.md):
+# witnessed and stopped at, never patched around. Boot cost is the 500 ms window plus ~5 control
+# transfers; x86-only, and `arm_features` strips the knob so aarch64 media stay byte-identical.
+bt = ["ehcihid"]
+# BT-C1 (GR24): `UNAOS_BTC=1` arms the FIRST BR/EDR step, and the first thing on this radio aimed at
+# AUDIO. Everything `bt` gates is Low Energy; A2DP is not — it runs over classic BR/EDR L2CAP, and
+# the first move toward it is to PAGE the speaker with `HCI_Create_Connection` (0x0405). This knob
+# adds exactly that one step and its teardown: page, witness `Connection Complete` (event 0x03) or
+# the failure status honestly, disconnect (or cancel an unresolved page). No SDP, no L2CAP channel,
+# no AVDTP, no audio, and no pairing.
+#
+# WHY IT IS ITS OWN KNOB AND NOT PART OF `bt`. A page is the loudest thing this project has ever put
+# on the air: a directed transmission at a named device that, on a speaker, ANSWERS AUDIBLY, and
+# that can take the device away from whatever it is paired to. Every LE stage is passive or bounded
+# to a device Peter named; this one makes noise in his room. So a boot that did not ask for a page
+# must be structurally incapable of issuing one — a compile-time property, not a runtime check.
+#
+# Prerequisites, with the Core spec sections: `HCI_Write_Scan_Enable` (Vol 4 Part E §7.3.18) is NOT
+# written — it governs INBOUND inquiry/page scan and paging out needs none of it, while enabling it
+# would make this machine discoverable. `HCI_Write_Page_Timeout` (§7.3.16) IS written, shortening
+# the 5.12 s reset default to 1.28 s so a powered-off speaker cannot cost the boot five seconds.
+# Gated additionally on the LMP feature mask NOT setting BR/EDR-Not-Supported.
+#
+# Implies `bt` (and through it `ehcihid`) — every line lives in the same x86-gated
+# `drivers/ehci/mod.rs`. Default OFF => the page code, its constants and the classic latch vanish.
+# x86_64 only; `arm_features` strips it so aarch64 media stay byte-identical.
+btc = ["bt"]
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
 # path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole
 # (zeolite), and the boot witnesses. Pulls in the x86-only smoltcp optional dependency and compiles
@@ -439,6 +691,126 @@ sdmmc_arm = ["sdmmc"]
 # zero MMIO; the full flow's first execution is the attended Orin sitting. See arch_arm64.md
 # §ORIN-INSTALL-1 and scripts/orin-sdmmc1-bench.md.
 install_target = ["sdmmc_arm"]
+
+# SDHC-4a (x86): the `UNAOS_SDW=1` write ARM for the 2012 rMBP's BUILT-IN PCIe SD reader
+# (drivers/sdhc.rs). Milestones 1-3 wrote only the CONTROLLER — the card was untouched end to end and
+# `arch/x86_64/pci.rs` calls the probe "the read-only SDHC census". This arm compiles in ONE primitive,
+# `write_block_512`: a polled single-block CMD24 mirroring the metal-proven `drivers::emmc2` ladder
+# (CMD24 -> R1 -> Buffer-Write-Ready -> 128 words -> Transfer-Complete -> DAT0 programming-busy ->
+# CMD13 verdict). PIO, never the ADMA2 engine: the file's DMA law ("DMA lands only in driver-owned
+# memory") protects HOST memory, and reversing the direction points a straggling descriptor at the
+# CARD, where no bounce buffer can help.
+#
+# Knob-OFF is byte-identical ON THE CARD, not merely in behaviour: `write_block_512` is `#[cfg]`-gated,
+# so no CMD24 command word exists anywhere in a default image. What the DEFAULT build DOES gain is the
+# self-test's read-only half — the scratch picker, its five refusals and a one-line `:: sdhc: w1 ...
+# -> DRYRUN ::` verdict naming the LBA an armed build would write. That is deliberate (the M3b lesson):
+# the `armed=` field on the wire is what catches a knob wired into `arroyo` but not into
+# `builder/src/main.rs`, and a dry run answers "would arming this write, and where" without writing.
+# x86_64 only; aarch64 media are byte-identical. See docs/dev/OS/07_USB_STORAGE/sdhc.md §SDHC-4a.
+sdw = []
+
+# SDHC-4b (GR20, x86): `UNAOS_SDHCBLK=1` makes the INTERNAL SD card a real block backend, so `fs::fat`
+# can mount it. Boot AC identified the card and Boot AD wrote to it, but nothing above `drivers/sdhc.rs`
+# could reach those primitives: `drivers/block.rs` has two backends and every SD arm in it is
+# `cfg(all(target_arch = "aarch64", feature = "baremetal"))` — the Pi's EMMC2 — so on x86 `read_block`
+# has always meant the USB stick and nothing else.
+#
+# The card is published as a THIRD registry handle (`BlockHandle::Sdhc` / `SDHC_BLOCK_DEVICE`), NOT as a
+# new value of the aarch64 `BACKEND` selector. That is the whole selection policy: the machine boots from
+# a USB card reader, so the stick IS `BLOCK_DEVICE`, and flipping a selector would re-point the flight
+# recorder, `fat::probe_once`, the shell, `fs/unafs.rs` and the installer at a different disk (the PI-FS-2
+# clobber, in reverse) — and would lose the race anyway, since `publish_usb_geometry` claims the global
+# unconditionally on x86 and runs after the PCI probe. With a separate handle there is no precedence rule
+# to get wrong: a caller must NAME the internal card, and nothing does except this arc's read-only mount
+# witness. `read_block`/`write_block` gain not one statement.
+#
+# READ-ONLY at the FAT layer, unconditionally, and that is not modesty — see `flight_recorder.rs`
+# §SINGLE FAT WRITER. `fs/fat.rs`'s `with_fat_lock`/`with_dir_lock` are INERT on x86, so a second
+# unsynchronised FAT/directory MUTATOR there is an A/B-proven corruption generator (cross-linked chains,
+# stolen delete-witness snapshots). A second mountable VOLUME must not quietly become one, so
+# `write_sector`/`write_sectors` refuse a `Sdhc` source with a one-shot witness and this build's count of
+# x86 FAT mutators stays at one. The block-layer write pair (`write_block_sdhc`) is additionally `sdw`-
+# gated, so a default image still contains no CMD24 command word, and it is reachable only through
+# `PartitionRange::write_block` — which `fs/fat.rs` never calls.
+#
+# Default OFF => the `BlockHandle::Sdhc`/`BlockSource::Sdhc` variants do not exist, no registry slot and
+# no entry point is compiled, and the registration call site in `sdhc::bring_up` is unlinked. MEASURED
+# rather than asserted (one worktree, one target dir, this tree vs 3d4ba446, no knobs on either): the
+# x86 kernel ELF's `.text` and `.rodata` are BYTE-IDENTICAL, 682479 and 91336 bytes. `.data.rel.ro`
+# differs in 32 bytes, every one of them a `core::panic::Location` LINE number shifted by 68 in the
+# 27-character path `crates/kernel/src/fs/fat.rs` — i.e. the doc comments and cfg'd code this arc
+# inserted ABOVE existing panic sites, and nothing else. Whichever way the knob points, aarch64 media
+# are byte-identical to each other (arroyo's `arm_features` strips it, like `sdw`/`pcicensus`).
+# x86_64 only. See docs/dev/OS/07_USB_STORAGE/sdhc.md §SDHC-4b.
+sdhcblk = []
+
+# PCI-CENSUS (GR20, x86): the `UNAOS_PCICENSUS=1` complete READ-ONLY PCI enumeration witness
+# (arch/x86_64/pci.rs::full_census). Every other PCI walk in this kernel is TARGETED — xHCI by class
+# triple, storage by class 0x01/0x08, display by class 0x03, and `find_device(0x02, 0x00)` which
+# returns the FIRST Ethernet-subclass function and stops — so no capture this project has ever taken
+# enumerates the machine. This pass prints one line per function present (bdf, vendor:device,
+# class/subclass/progif, revision, header type + MF bit, COMMAND/STATUS, subsystem id, IRQ line/pin,
+# and every non-zero BAR with its low-bit type decode; bridges print their primary/secondary/
+# subordinate bus numbers instead of a subsystem id), then dumps the capability list of every
+# network-class function via the existing `[PCI-PROBE]` diagnostic.
+#
+# READ-ONLY is a property of the code: the block contains no `write_config_*` call, and BARs are NOT
+# sized — sizing needs the write-all-ones/read/restore dance, which transiently moves a live device's
+# decode window mid-boot, so raw firmware-assigned values are printed instead and the header line
+# says so. Bounded: the same 256x32 sweep the two existing passes already run, MF-gated on the
+# function-0 header type, with a 128-line print cap that reports `truncated=1` when it is hit.
+#
+# Default OFF => the function, its helpers and its call site do not exist and media are
+# byte-identical. x86_64 only (the module is `arch/x86_64`), and stripped from aarch64 builds by
+# arroyo's `arm_features` so aarch64 media stay byte-identical whichever way this knob points.
+# Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs` — the builder rebuilds the x86
+# kernel from its own env list, so a knob wired only in arroyo ships disabled (the s42/INSTGUI and
+# WXN-M3b lesson).
+pcicensus = []
+
+# BCMA-RECON (GR20): `UNAOS_BCMARECON=1` arms `drivers/bcma.rs` — STRICTLY READ-ONLY reconnaissance
+# of the Broadcom WiFi radio in the 2012 rMBP, and the first arc of the native-BCM4331 path. It
+# writes nothing: PCI config-space READS (class 0x02 / **subclass 0x80** — the subclass
+# `find_device(0x02, 0x00)` structurally cannot match, which is how a radio sat unexamined in this
+# machine for the life of the project) plus MMIO READS through BAR0's ChipCommon window. Reports
+# chip id/rev/#cores, the EROM backplane pointer, SPROM presence + shadow dump with a plausibility
+# verdict, OTP status/programmed-subregions, and an explicit `REFUSED reg=…` line for every fact
+# that is behind a WRITE — the BAR0 backplane window (PCI cfg 0x80) gates the enumeration ROM, every
+# non-ChipCommon core, and the PHY version register, so one register is the whole boundary and the
+# witness names it rather than leaving a hole. Mapping BAR0 is a page-table edit, not a device
+# access (same seam as `sdhc::probe`). Bounded twice over: a structural entry cap on the EROM walk
+# and a TSC (`now_cycles`/`hw_wait_budget`) deadline, never `arch::ms()` — the APIC tick does not
+# advance with interrupts masked, and this probe runs inside `pci::init`.
+#
+# Default OFF => the module and its call site do not exist and media are byte-identical. x86_64 only,
+# and stripped from aarch64 builds by arroyo's `arm_features`. Kept in sync with `unaos/arroyo` AND
+# `unaos/builder/src/main.rs` — the builder rebuilds the x86 kernel from its own env list, so a knob
+# wired only in arroyo ships disabled (the s42/INSTGUI and WXN-M3b lesson).
+bcmarecon = []
+
+# BCMA-S1 (GR20): `UNAOS_BCMAS1=1` arms the WiFi path's FIRST WRITE — a single PCI config write to
+# `0x80` (`BCMA_PCI_BAR0_WIN`) that points the BAR0 backplane window at ChipCommon (`0x18000000`),
+# reads the chip identity + the EROM core list (moving the window once more to the EROM base), then
+# RESTORES the window to the pre-image it recorded. It rides ON TOP of the read-only recon, so this
+# knob IMPLIES `bcmarecon`: S0 runs first (its `REFUSED … window-elsewhere` line is its own
+# deliverable), then S1's `bcma-s1:` block. Implying `bcmarecon` is also what lets S1 reuse the
+# module's device-find and BAR-map helpers and share the existing x86-only module gate + call site
+# WITHOUT a second gate in `arch/x86_64/pci.rs`.
+#
+# The write is issued ONLY against a Broadcom 4331 (vendor 0x14e4 AND device 0x4331 must read back),
+# and the unwind is PROVEN before the state-changing write (a no-op self-test that writes the
+# pre-image to itself and reads it back). The RESTORE pushes the value it READ — never the assumed
+# enumeration base 0x18000000 — and witnesses MATCH/FAILED against that stored pre-image (Boot AF:
+# firmware left 0x18001000, not 0x18000000, so a "restore to 0x18000000" would silently move the
+# radio's window and look clean in the logs). QEMU models no BCM4331, so there S1 stops at
+# `no-device` and issues no write.
+#
+# Default OFF => no S1 code and no S1 witness strings; media byte-identical. x86_64 only (via the
+# `bcmarecon` module gate), stripped from aarch64 by arroyo's `arm_features`. Kept in sync with
+# `unaos/arroyo` AND `unaos/builder/src/main.rs` — the builder rebuilds the x86 kernel from its own
+# env list, so a knob wired only in arroyo ships disabled (the s42/INSTGUI and WXN-M3b lesson).
+bcmaS1 = ["bcmarecon"]
 
 # AARCH64-VNET: the `UNAOS_VNET=1` virtio-net-mmio driver on the QEMU `virt` machine + smoltcp bind
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. NET-4's
@@ -708,6 +1080,24 @@ nsspan = []
 # byte-identical. See unaos/docs/dev/OS/09_PLATFORM/smc_battery.md.
 smc = []
 
+# WALK-QUIET (GR18): restore the SMC #KEY index walk's PER-NAME output (`UNAOS_SMCWALK=1`).
+#
+# The walk itself is always-on under `smc` — it is the GAP-1 sibling fix's only exerciser, and its
+# one-line summary (`index walk done (N of M names)`) is a standing per-boot regression witness that
+# the fix has not re-wedged. What this knob buys back is the INVENTORY DUMP: one `idx N = KEY ` line
+# per name, 493 of them (~25 KB) on the 2012 rMBP. Boot V measured what that costs — the FTDI
+# console's drain of the block displaced storage bring-up from 11.4 s to 14.9 s (`SPACE ftdi=` 177 ms
+# -> 1519 ms) — for an inventory that does not change between boots and is already banked in the s73
+# capture. Arm it for a sitting that wants a fresh list; leave it off for every boot that is timing
+# something.
+#
+# Inert without `smc` (drivers/smc.rs is only compiled under that feature), so it is NOT declared as
+# implying it: an operator who sets `UNAOS_SMCWALK` alone gets no SMC driver, which is what asking for
+# a louder driver you did not arm should do. Default OFF => the per-name `serial_println!` and its
+# `from_utf8` vanish; the walk and the summary are unchanged. x86_64 only in practice, arch-neutral in
+# the feature graph. Kept in sync with arroyo + builder/src/main.rs.
+smcwalk = []
+
 # RAST-1 / RAST-TEGRA: the `rast` software-rasterizer demo (UNAOS_RAST=1). Pulls in the
 # platform-neutral `rast` crate and links the knob-gated spinning-cube demo (rast_demo.rs), presented
 # through the existing panel `Screen` path (call-never-edit). The `rast` crate is no_std and arch-
@@ -757,6 +1147,20 @@ linked_list_allocator = "0.10.6"
 font8x8 = { version = "0.3.1", default-features = false }
 cfg-if = "1.0.0"
 unaos-boot-info = { path = "../boot-info" }
+# ABIFREEZE: the syscall ABI, declared exactly once. `arch/x86_64/syscall.rs` and
+# `arch/aarch64/syscall.rs` both `use` their numbers/flags/layouts from here instead of
+# re-declaring them, and so does every `user-*` crate — so a number cannot mean two things
+# at once. no_std, no dependencies, nothing but `const`. See crates/una-abi/src/lib.rs.
+una-abi = { path = "../una-abi" }
+# MIDDEN-M1: the shell core. `unaos/libs/sys/midden_core` is the ONE command
+# table / parser / bare-name resolver, shared with the Ring 3 `midden` handler —
+# same convention as `libs/fs/unafs` and `libs/sys/helm`: a root-workspace
+# member pulled here as a path dep with `default-features = false` (its `std`
+# feature is host-only ceremony; the core itself is `no_std` + `alloc` and has
+# no dependencies at all). Arch-neutral on purpose: the kernel passes a
+# `midden_core::Facts` built with `cfg!()`, so ONE compiled core tells the truth
+# on x86 and aarch64 both.
+midden_core = { path = "../../libs/sys/midden_core", default-features = false }
 net = { path = "../net" }
 fdt = "0.1.5"
 # RAST-1 / RAST-TEGRA: platform-neutral (no_std, arch-agnostic) software rasterizer. `optional` so

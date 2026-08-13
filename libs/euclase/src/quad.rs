@@ -39,7 +39,7 @@
 //! byte-preserving for an untransformed frame, and filtering (when zoomed)
 //! happens in linear light.
 
-use crate::cortex::Cortex;
+use crate::cortex::{Cortex, PresentError};
 use crate::mat4::Mat4;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -126,7 +126,7 @@ impl TexturedQuad {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Facet_Quad_Pipeline_Layout"),
-            bind_group_layouts: &[&bind_layout],
+            bind_group_layouts: &[Some(&bind_layout)],
             immediate_size: 0,
         });
 
@@ -325,13 +325,13 @@ impl TexturedQuad {
     }
 
     /// Draw the quad into the cortex's current swapchain texture and present.
-    pub fn render(&self, cortex: &Cortex, clear: wgpu::Color) -> Result<(), wgpu::SurfaceError> {
-        let output = cortex.surface.get_current_texture()?;
+    pub fn render(&self, cortex: &Cortex, clear: wgpu::Color) -> Result<(), PresentError> {
+        let output = cortex.acquire()?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.render_to_view(&cortex.device, &cortex.queue, &view, clear);
-        output.present();
+        cortex.queue.present(output);
         Ok(())
     }
 }
@@ -405,15 +405,16 @@ mod tests {
     /// A windowless device, or `None` when the environment has no adapter
     /// (headless CI): the GPU tests then skip gracefully — and say so.
     fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = match pollster::block_on(instance.request_adapter(
             &wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
+                apply_limit_buckets: false,
             },
         )) {
             Ok(a) => a,
@@ -500,7 +501,7 @@ mod tests {
         device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("device poll failed");
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("mapped range failed");
         let mut out = Vec::with_capacity((width * height * 4) as usize);
         for row in 0..height {
             let start = (row * padded) as usize;

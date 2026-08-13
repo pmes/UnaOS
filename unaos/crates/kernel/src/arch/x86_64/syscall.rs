@@ -26,29 +26,41 @@ use core::sync::atomic::{
 };
 
 use spin::Mutex as SpinMutex;
-use x86_64::registers::control::Cr4;
+use x86_64::registers::control::{Cr0, Cr4};
 use x86_64::registers::model_specific::{LStar, Msr};
 use x86_64::VirtAddr;
 
 use crate::arch::percpu::{KERNEL_RSP_OFFSET, USER_RSP_OFFSET};
 
 // --- Syscall numbers (the tiny U1a subset; mirrors aarch64). ---
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
+use una_abi::SYS_WRITE;
+use una_abi::SYS_EXIT;
 // WINX-1: the PROCESS verbs x86 was missing, at their SHARED numbers (the aarch64 twins are
 // `sys_yield`/`sys_sleep_ms`/`sys_getinfo`). 3 (`SYS_REPORT`) and 6 (`SYS_GETPID`) stay unimplemented
 // here: x86 routes fixture witnesses BY TASK NAME through the `SYS_EXIT` arm (the u5x/u6x idiom), so it
 // has never needed `SYS_REPORT`, and nothing yet asks for a bare pid that `SYS_GETINFO` does not carry.
 // Their NUMBERS are reserved by the shared law regardless — an x86 caller of 3 or 6 falls to the
 // `-ENOSYS` default rather than colliding with something else.
-const SYS_YIELD: u64 = 4;
-const SYS_SLEEP_MS: u64 = 5;
-const SYS_GETINFO: u64 = 7;
+use una_abi::SYS_YIELD;
+use una_abi::SYS_SLEEP_MS;
+use una_abi::SYS_GETINFO;
 // WINX-1: the WINDOW verbs, at the shared numbers the aarch64 WC-B arc minted. 31 (`SYS_WIN_MOVE`) and
 // 32 (`SYS_WIN_CLOSE`) are reserved but not implemented this arc: nothing x86 runs asks to reposition or
 // explicitly retire a window, and a window is retired correctly at slot teardown (`win_close_slot`).
-const SYS_WIN_CREATE: u64 = 29;
-const SYS_WIN_PRESENT: u64 = 30;
+use una_abi::SYS_WIN_CREATE;
+use una_abi::SYS_WIN_PRESENT;
+// FBCON-DMG: `SYS_WIN_PRESENT_ROWS(win, y0, y1)` — the DAMAGE-CARRYING present. ADDITIVE: 30 keeps its
+// exact one-argument shape on both arches, because widening it in place is not safe. The dispatcher's own
+// note (see `syscall_dispatch`) records that a program which does not load an argument register "simply
+// passes junk to a verb that does not read it", and three of the four ring-3 stub sets declare rsi/rdx/r10
+// as `lateout` CLOBBERS they never write — so junk that happened to land in range would silently
+// UNDER-repaint an existing caller of 30. A new number cannot be reached by an old binary at all.
+//
+// 33 is the first number free on BOTH arches. The shared block runs 1..=32 and the aarch64 table ends
+// there (`const SYS_WIN_CLOSE: u64 = 32;`, arch/aarch64/syscall.rs:215) with nothing defined or reserved
+// above it; x86's own private block starts at 40 (`SYS_SOCKET`). Taking 33 keeps the ABI alignable — an
+// aarch64 twin can mint the same number later without moving anything.
+use una_abi::SYS_WIN_PRESENT_ROWS;
 // WINX-7: the THREAD verbs, at the shared numbers the aarch64 ELF-2 arc minted. Semantics are the
 // aarch64 twins', verbatim:
 //   SYS_THREAD_SPAWN(entry, sp, arg, place) -> thread handle >= 0 / -errno. A new ring-3 task under the
@@ -57,51 +69,62 @@ const SYS_WIN_PRESENT: u64 = 30;
 //   SYS_THREAD_JOIN(handle) -> 0 / -ESRCH. Block until that thread finishes, then reap its handle.
 //   SYS_THREAD_EXIT() — terminate the calling thread: post its completion (waking a joiner) and drop
 //     this task's hold on the shared address space (teardown only on the LAST thread).
-const SYS_THREAD_SPAWN: u64 = 21;
-const SYS_THREAD_EXIT: u64 = 22;
-const SYS_THREAD_JOIN: u64 = 23;
+use una_abi::SYS_THREAD_SPAWN;
+use una_abi::SYS_THREAD_EXIT;
+use una_abi::SYS_THREAD_JOIN;
 // WINX-7: SYS_FUTEX(uaddr, op, val) -> op-specific / -errno — the ring-3 wait/wake a userspace mutex or
 // frame barrier is built out of. `op`: 0 = WAIT (block iff `*uaddr == val`), 1 = WAKE (wake up to
 // `val` waiters; returns the count woken). 24/25 (`SYS_FB_MAP`/`SYS_FB_PRESENT`) stay reserved and
 // unimplemented on x86 — see the window-verb note above.
-const SYS_FUTEX: u64 = 26;
+use una_abi::SYS_FUTEX;
 /// WINX-7: `SYS_FUTEX` sub-ops (passed in the second argument). Shared with aarch64 by law.
-const FUTEX_WAIT: u64 = 0;
-const FUTEX_WAKE: u64 = 1;
+use una_abi::FUTEX_WAIT;
+use una_abi::FUTEX_WAKE;
 // WINX-7: SYS_INPUT_POLL() -> a packed input event (>= 0, bit 63 always clear) / -EAGAIN when the
 // caller's ring is empty. The delivery half of "a ring-3 app can be interactive": the kernel holds a
 // small per-process ring, the router fills the FOCUSED process's ring, and ring 3 drains its own
-// nonblocking. 28 is unassigned on both arches.
-const SYS_INPUT_POLL: u64 = 27;
+// nonblocking. 28 is `SYS_INPUT_WAIT`, its blocking half — see below.
+use una_abi::SYS_INPUT_POLL;
+// VUGPAUSE-2/x86: `SYS_INPUT_WAIT() -> 0 / -EINVAL` — the BLOCKING half of the pair. Block until the
+// CALLING process's input ring is (or may be) non-empty. Nothing is dequeued: the caller's ordinary
+// `SYS_INPUT_POLL` drain runs next and sees every event, which is what lets an app fold this in with
+// no restructuring. `-EINVAL` off the shared kernel window (no private slot) or off a schedulable
+// task.
+//
+// SHARED-NUMBER LAW: 28, no arguments, `0`/`-EINVAL`, identical to `arch/aarch64/syscall.rs`'s
+// `SYS_INPUT_WAIT` (const at its :192, dispatch at its :6190, handler at its :12976). `user-vug`'s
+// `input_wait()` is `sys0(SYS_INPUT_WAIT)` — one arch-neutral source line that until this commit fell
+// through this dispatcher's `_ => -38` on x86 and turned the designed park into a tight busy loop.
+use una_abi::SYS_INPUT_WAIT;
 // U4x: the process-model pair (same numbers as aarch64 U4). `sys_spawn` loads the fixed on-disk
 // program (`HELLO.BIN`) into a fresh slot, runs it ring-3 as a CHILD, and returns a small HANDLE
 // index into the caller's per-process handle table; `sys_wait(handle)` blocks until that child exits
 // and returns its status (or `-ECHILD` if the handle is not in the caller's table).
-const SYS_SPAWN: u64 = 8;
-const SYS_WAIT: u64 = 9;
+use una_abi::SYS_SPAWN;
+use una_abi::SYS_WAIT;
 // U5x: operate on the caller's OWN handle table as capabilities. `a0` selects the sub-op
 // (`CAP_OP_GRANT`/`CAP_OP_REVOKE`); the remaining args are op-specific (see `sys_cap`). GRANT mints a
 // new, rights-attenuated handle to the same target as a source handle the caller holds `CAP_GRANT` on;
 // REVOKE clears a handle the caller owns. The enforcement layer sits at the handle lookup
 // (`handle_resolve`). Same number as aarch64 U5.
-const SYS_CAP: u64 = 10;
+use una_abi::SYS_CAP;
 /// `SYS_CAP` sub-ops (in `a0`). GRANT: `a1`=source handle idx, `a2`=requested rights mask -> new handle
 /// idx (attenuated) or a negative errno. REVOKE: `a1`=handle idx to drop -> 0 or a negative errno.
-const CAP_OP_GRANT: u64 = 0;
-const CAP_OP_REVOKE: u64 = 1;
+use una_abi::CAP_OP_GRANT;
+use una_abi::CAP_OP_REVOKE;
 /// U7x: revoke a TRANSFER the caller previously made with `SYS_XFER` (`a1` = the transfer id SYS_XFER
 /// returned). Sender-only (the transfer RECORD is sender-owned); single-level — revoking a transfer makes
 /// the RECEIVED capability stale at its next `handle_resolve` (and discards it if still pending in the
 /// recipient's inbox), but does NOT cascade through further re-transfers (revocation TREES are deferred).
-const CAP_OP_XREVOKE: u64 = 2;
+use una_abi::CAP_OP_XREVOKE;
 // U6bx: REAL File handles — the object table's first resource syscalls on a non-Console kind (the
 // aarch64 pi4 U6b twin; same numbers). OPEN(name_ptr, name_len) looks the name up in the BSP-STAGED
 // file set — not the disk: the SYSCALL handler runs IF-masked and the xHCI BOT read pump `hlt()`s, so
 // an in-handler disk read would hang the core (see the STORAGE / IF NOTE at the pre-stage buffer) —
 // and mints a File handle carrying `CAP_READ`. READ(handle, buf, len) serves the staged bytes through
 // that handle, gated by File + `CAP_READ` at `handle_resolve` (the `sys_write` Console twin).
-const SYS_OPEN: u64 = 11;
-const SYS_READ: u64 = 12;
+use una_abi::SYS_OPEN;
+use una_abi::SYS_READ;
 // U7x: cross-process capability transfer — the FIRST cross-process op on the object table (the aarch64
 // pi4 U7 twin; same numbers). XFER(dest, src, req_rights) deposits an ATTENUATED copy of a capability
 // the caller holds into the recipient's per-SLOT transfer INBOX (the one deliberately cross-slot
@@ -112,14 +135,14 @@ const SYS_READ: u64 = 12;
 // CAP_OP_XREVOKE), RECV -> a handle index. x86 divergence: rows are keyed by address-space SLOT, and the
 // SHARED_ROW (the U1a/U1b/U2 kernel window, torn down never and owned by no single process) is refused
 // as a transfer endpoint — both XFER and RECV from a shared-window caller return -EACCES.
-const SYS_XFER: u64 = 13;
-const SYS_RECV: u64 = 14;
+use una_abi::SYS_XFER;
+use una_abi::SYS_RECV;
 // U9x: absolute seek on an open File descriptor (the aarch64 pi4 U9 twin; same number). SEEK(handle,
 // offset) -> the new absolute offset, or a negative errno. The CHECK requires a File handle carrying ANY
 // of `CAP_READ|CAP_WRITE`; an offset PAST the file's size is `-EINVAL` (seeking exactly TO size, the EOF
 // position, is legal). A later SYS_READ / File SYS_WRITE resumes from the seeked offset. No I/O — a pure
 // descriptor-state update, so it is IF-masked-handler-safe (the whole x86 staged-storage divergence).
-const SYS_SEEK: u64 = 15;
+use una_abi::SYS_SEEK;
 // U11x: CLOSE an open File — SYS_CLOSE(handle) -> `0`, or a negative errno (the aarch64 pi4 U11 twin; same
 // number). Frees the handle's open-file DESCRIPTOR (bumping its generation so a first-fit slot reuse can never
 // re-bind a lingering sibling file-id to a different file — the U9x revoke+reopen aliasing gap) and clears the
@@ -128,28 +151,28 @@ const SYS_SEEK: u64 = 15;
 // returns cleanly; a use-after-close is denied). No I/O — the x86 staged write-back happens at whole-task
 // teardown (`clear_files_row`), so like a revoke this drop DISCARDS any un-flushed dirty bytes (only teardown
 // persists; a future arc could make an explicit close enqueue the flush).
-const SYS_CLOSE: u64 = 17;
+use una_abi::SYS_CLOSE;
 // U10 M3: DELETE (unlink) the runtime-created file an open File+CAP_WRITE handle names — SYS_UNLINK(handle) -> 0,
 // or a negative errno (the aarch64 U10 twin; same number). Gated by the SAME single CAP_WRITE CHECK as write
 // (delete is a mutation). Marks the name gone for the row (a re-open is -ENOENT), invalidates ALL of this
 // process's descriptors for it (the U11x gen-tag mechanism — no stale reference), and enqueues the on-disk delete
 // (create+grow+delete replayed at the launcher's IF=1 drain, since the fixture's create/grow never persisted).
-const SYS_UNLINK: u64 = 16;
+use una_abi::SYS_UNLINK;
 // U10: SYS_OPEN `mode` bit1 — create the file if it is absent from the "volume" (the aarch64 U10 O_CREAT twin;
 // same encoding). bit0 = RW. `mode == 3` (O_CREAT | RW) is what the create/delete fixtures pass. A create is
 // inherently RW (you create to write it); higher bits (O_TRUNC/O_EXCL/O_APPEND) stay reserved this arc.
-const O_CREAT: u64 = 1 << 1;
+use una_abi::O_CREAT;
 // U6x: SYS_OPEN `mode` bit2 — opt an O_CREAT of a NEW name OUT of owned-by-default into world-access (the
 // aarch64 U6 twin; same encoding). Ignored on an open of an existing file (ownership is fixed at create) and
 // outside O_CREAT. Owned-by-default: a private create (no O_PUBLIC) records the creator as OWNER; O_PUBLIC
 // keeps the pre-U6 open-by-anyone behaviour. See `open_create_new` and the owner/grants block.
-const O_PUBLIC: u64 = 1 << 2;
+use una_abi::O_PUBLIC;
 // U6x: UnaFS owner/grants delegation — SYS_FGRANT(file_handle, child_handle, rights) -> 0, or a negative errno
 // (the aarch64 U6 twin; same number). The OWNER of a private created file grants (a CAP_READ|CAP_WRITE subset)
 // or revokes (rights == 0) access to another principal named OWNER-SCOPED by a `Child` handle the caller holds
 // (the SYS_XFER idiom — no raw pid/slot from ring 3). The grant is an ACL edge on the FILE (nothing delivered to
 // the grantee's table); the grantee opens the name and the SYS_OPEN ACL admits it. See `sys_fgrant`.
-const SYS_FGRANT: u64 = 18;
+use una_abi::SYS_FGRANT;
 // SOCK-2 (ROADMAP §1b): the UDP socket syscall family — the FIRST time ring 3 reaches the network.
 // A socket is a new object-table kind (`KIND_SOCKET`, already scaffolded as the U6bx/U9x kind
 // negative) whose value word is a persistent-`SocketSet` id; the handle is a capability exactly like a
@@ -183,13 +206,13 @@ const SYS_FGRANT: u64 = 18;
 // reference cannot pass, because a fixture that keeps the old immediate lands in an unrelated arm (or
 // `-ENOSYS`) and fails its verdict.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SOCKET: u64 = 40;
+use una_abi::SYS_SOCKET;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_BIND: u64 = 41;
+use una_abi::SYS_BIND;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SENDTO: u64 = 42;
+use una_abi::SYS_SENDTO;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_RECVFROM: u64 = 43;
+use una_abi::SYS_RECVFROM;
 // SOCK-3 (ROADMAP §1b): the TCP CLIENT socket syscalls — ring 3's first byte stream. A TCP socket is
 // minted by `SYS_SOCKET` with type SOCK_STREAM(1) (the same `KIND_SOCKET` capability, gen-fenced value
 // word). CONNECT(handle, msg_ptr, msg_len) active-opens to the peer in `msg`'s 8-byte
@@ -200,18 +223,18 @@ const SYS_RECVFROM: u64 = 43;
 // `CAP_WRITE`, recv needs `CAP_READ`, connect needs `CAP_WRITE` (a configuring authority, like bind).
 // x86-only, knob-on; aarch64 / knob-off never compile these arms (byte-identical).
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_CONNECT: u64 = 44;
+use una_abi::SYS_CONNECT;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SEND: u64 = 45;
+use una_abi::SYS_SEND;
 // `SYS_SOCK_RECV` (not `SYS_RECV` — 14 is the capability-transfer inbox recv) — the stream recv.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SOCK_RECV: u64 = 46;
+use una_abi::SYS_SOCK_RECV;
 // SOCK-6: TCP SERVER sockets — `SYS_LISTEN` arms a passive listener, `SYS_ACCEPT` polls for an inbound
 // connection and mints a fresh `KIND_SOCKET` handle for it (the ring 3 now ACCEPTS inbound TCP).
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_LISTEN: u64 = 47;
+use una_abi::SYS_LISTEN;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_ACCEPT: u64 = 48;
+use una_abi::SYS_ACCEPT;
 // PULSE-1: SYS_CPUPULSE(ptr) -> 0 / -EFAULT — the per-core load SAMPLE, copied out to ring 3. 49 is the
 // next free number in the shared space (48, `SYS_ACCEPT`, was the high-water mark on either arch), and the
 // number is minted on BOTH arches per the shared-numbering law even though only the x86 desktop ships an
@@ -224,7 +247,7 @@ const SYS_ACCEPT: u64 = 48;
 // percent could not tell an honest 0% from a FROZEN counter, which is the one distinction
 // `vug::classify_load` exists to preserve. Handing out `(busy, idle)` per core plus the observer's own core
 // index gives ring 3 every input that rule needs, and no fabricated ones.
-const SYS_CPUPULSE: u64 = 49;
+use una_abi::SYS_CPUPULSE;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -258,6 +281,9 @@ const EFER_SCE: u64 = 1 << 0; // SYSCALL/SYSRET enable
 const EFER_NXE: u64 = 1 << 11; // NX-bit enable
 // CR4 bit.
 const CR4_SMEP: u64 = 1 << 20;
+// CR0 bit. WXN-x86 M3a: with WP clear, a supervisor write IGNORES PTE.W — every read-only page
+// this arc creates would be advisory. See `init`.
+const CR0_WP: u64 = 1 << 16;
 // SFMASK: RFLAGS bits cleared on syscall entry — IF | TF | DF | AC. Interrupts stay OFF in the
 // handler; DF/AC/TF cleared so the kernel starts from an ABI-clean, deterministic RFLAGS.
 const SYSCALL_FLAG_MASK: u64 = 0x4_0700;
@@ -2112,8 +2138,30 @@ unsafe extern "C" {
 // task's kernel stack, saves the return frame (rcx/r11), shuffles the (rax, rdi, rsi, rdx) syscall
 // args into the C ABI's (rdi, rsi, rdx, rcx), dispatches, restores, and `sysretq`s back to ring 3.
 // SYS_EXIT never returns (it switches to the scheduler), so the restore tail runs only for
-// returning syscalls. Alignment: after loading rsp = kernel-stack top (16-aligned) the two pushes
+// returning syscalls. Alignment: after loading rsp = kernel-stack top (16-aligned) the FOUR pushes
 // leave rsp 16-aligned, so the `call` meets the SysV (rsp % 16 == 8)-at-entry rule.
+//
+// U4y — WHERE THE USER RSP LIVES. The saved user rsp is a PER-TASK value, so it is parked on the
+// TASK'S OWN KERNEL STACK, not in the per-CPU block. `PerCpuData::syscall_user_rsp` survives only
+// as a three-instruction scratch landing pad: SYSCALL leaves us with no free register (rax/rdi/rsi/
+// rdx/r10 carry args, rcx/r11 carry the return frame, rbx/rbp/r12-r15 are the user's to keep), so
+// the incoming rsp must go SOMEWHERE addressable before we can load the kernel stack — but it is
+// read back and pushed two instructions later, with IF=0 and no yield point in between, so nothing
+// can observe or overwrite it there.
+//
+// This is the U4x reasoning applied to the user twin. Holding the user rsp in the per-CPU slot
+// ACROSS the dispatch was a live corruption bug: a task that BLOCKS inside a syscall (SYS_YIELD ->
+// `sched::yield_now()`, futex wait, sleep) context-switches out with its user rsp still in the
+// shared slot; the next task to `sysretq` on that core then loaded the BLOCKED task's user rsp and
+// ran ring 3 on a stack it did not own, with frame slots at equal offsets aliasing between the two.
+// Observed on metal (boot s68): a parent's `movl $0x0, 0x10(%rsp)` zeroed the low half of a
+// worker's saved surface pointer, and the worker took `vec=14 err=0x7 cr2=0x10000000000` writing
+// through it. The scheduler's dispatch site re-installs TSS.RSP0 and `syscall_kernel_rsp` per task
+// (sched.rs, U4x) but has no way to re-install a user rsp it never captured — the fix has to be
+// here. The kernel stack is the right home because it is exactly what the switch preserves per
+// task: `switch_context` parks rsp in `Task::ctx_rsp` and the stack is a `Box<[u8]>` owned by the
+// `Task`, so the pushed value is untouched across any number of intervening tasks and is freed only
+// with the task itself.
 //
 // U1a does NOT preserve the user's rbx/rbp/r12-r15/rdi/... across a syscall (only rcx/r11, which
 // SYSRET requires); the demo blob loads fresh registers for its second syscall, so this is sound
@@ -2122,8 +2170,17 @@ core::arch::global_asm!(
     ".globl unaos_syscall_entry",
     "unaos_syscall_entry:",
     "swapgs",                       // GS -> this CPU's PerCpuData (parked in KERNEL_GS_BASE shadow)
-    "mov gs:[{uoff}], rsp",         // save the user rsp
-    "mov rsp, gs:[{koff}]",         // switch to this task's kernel stack top
+    "mov gs:[{uoff}], rsp",         // park the user rsp — SCRATCH ONLY, consumed 2 instructions below
+    "mov rsp, gs:[{koff}]",         // switch to this task's kernel stack top (16-aligned)
+    // U4y: move the user rsp off the shared per-CPU slot and onto THIS TASK'S kernel stack, so a
+    // syscall that blocks and resumes later cannot hand its user rsp to whatever task sysrets next.
+    // Two copies, not one: three saved qwords (user rsp, r11, rcx) would leave rsp ≡ 8 (mod 16) here
+    // and the `call` below would enter `dispatch` 16-aligned — the exact inverse of the SysV rule,
+    // and a silent misalignment that only shows up on the callee's first 16-byte SSE spill. The
+    // duplicate is the alignment pad; making it a second copy of the same value rather than junk
+    // means the tail can drop either slot and still be right.
+    "push qword ptr gs:[{uoff}]",   // user rsp, now PER-TASK (alignment pad copy)
+    "push qword ptr gs:[{uoff}]",   // user rsp, now PER-TASK (the copy the tail pops)
     "push r11",                     // save user RFLAGS  (SYSRET restores from r11)
     "push rcx",                     // save user RIP     (SYSRET restores from rcx); rsp now 16-aligned
     // WINX-7: FIVE C arguments now, not four. `SYS_THREAD_SPAWN(entry, sp, arg, place)` is the first
@@ -2139,8 +2196,8 @@ core::arch::global_asm!(
     "mov rsi, rdi",                 // arg0 -> 2nd C arg
     "mov rdi, rax",                 // number -> 1st C arg
     "call {dispatch}",              // rax = return value (or never returns: SYS_EXIT -> scheduler)
-    "pop rcx",                      // restore user RIP   (rsp now = kernel-stack top, 16-aligned)
-    "pop r11",                      // restore user RFLAGS
+    "pop rcx",                      // restore user RIP   (SYSRET's target)
+    "pop r11",                      // restore user RFLAGS; rsp now = ktop-16, 16-aligned
     // --- U1b B2: canonical-rcx guard (CVE-2012-0217 shape). A non-canonical SYSRET target #GPs at
     // CPL 0 *after* the user rsp is loaded, running the #GP handler on a user-controlled stack.
     // Refuse to sysret such an rcx. rdx is scratch here (a caller-saved leftover, scrubbed below
@@ -2161,7 +2218,11 @@ core::arch::global_asm!(
     "xor r8d, r8d",
     "xor r9d, r9d",
     "xor r10d, r10d",
-    "mov rsp, gs:[{uoff}]",         // restore the user rsp
+    // U4y: recover THIS task's own user rsp from THIS task's kernel stack. The two slots hold the
+    // same value; drop the pad and pop the other. The kernel stack is abandoned from here — the next
+    // entry reloads rsp from `syscall_kernel_rsp` (= ktop), so nothing below ktop is ever read again.
+    "add rsp, 8",                   // drop the alignment pad copy
+    "pop rsp",                      // restore the user rsp  (rsp <- [rsp], per POP r64 semantics)
     "swapgs",                       // GS -> user
     "sysretq",                      // -> ring 3: rip = rcx, rflags = r11, rax = return value
     // Non-canonical return RIP: still CPL 0, still on the kernel stack, GS = PerCpuData (the entry
@@ -2279,9 +2340,7 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
             let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
             if let Some(id) = crate::arch::sched::current_task_id(cpu) {
                 if let Some(i) = proc_find_running(id) {
-                    PROCS[i].status.store(U4X_KILLED_STATUS, Ordering::Release);
-                    PROCS[i].state.store(PEXITED, Ordering::Release);
-                    PROCS[i].done.post();
+                    proc_publish_exit(i, U4X_KILLED_STATUS);
                 }
             }
         }
@@ -2380,9 +2439,7 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
         if let Some(id) = crate::arch::sched::current_task_id(cpu) {
             if let Some(i) = proc_find_running(id) {
-                PROCS[i].status.store(EXEC_KILLED_STATUS, Ordering::Release);
-                PROCS[i].state.store(PEXITED, Ordering::Release);
-                PROCS[i].done.post();
+                proc_publish_exit(i, EXEC_KILLED_STATUS);
             }
         }
         return;
@@ -2400,8 +2457,16 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
     // wrong — a real WINX-7 bug, on its own counter. The most likely shape it would take is the
     // refcount defect: an address space freed under a still-running sibling, which faults the survivor
     // rather than returning a wrong bit. Not in PROCS, so the launcher times out to FAIL.
-    if name == EL0_THREAD_NAME || name == WINX7_TASK_NAME {
+    if name == USER_THREAD_NAME || name == WINX7_TASK_NAME {
         WINX7_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // DMG-REFUSE: both refusal-witness halves are register + inline-data only — their sole user stores
+    // are to their own RW data page and their own stack, and neither ever touches a surface. So a
+    // fault-kill means a window verb faulted a well-behaved program: a real bug, on its own counter,
+    // never the U1b `killed_unexpected` count. Not in PROCS, so the launcher times out to FAIL.
+    if name == "dmg-owner" || name == "dmg-probe" {
+        DMG_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
     // SOCK-2: the UDP round-trip fixture is register + inline-data only (its only user store is the recv
@@ -2523,6 +2588,10 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         // x86 panel, and a refused `wm::create` degrades to a surface with no compositor row.
         SYS_WIN_CREATE => sys_win_create(a0, a1),
         SYS_WIN_PRESENT => sys_win_present(a0),
+        // FBCON-DMG: the damage-carrying present, at its own number. x86-only for now — aarch64 does not
+        // define 33, so a ring-3 program that tries it there falls to that dispatcher's `_ => -38`
+        // (`-ENOSYS`) arm, which does nothing else, and the client's whole-box fallback covers it.
+        SYS_WIN_PRESENT_ROWS => sys_win_present_rows(a0, a1, a2),
         // WINX-7: threads, futex and input, at their shared cross-arch numbers. Unconditional (no
         // feature gate), for the same reason the process and window verbs are: they are core ring-3
         // surface that a windowed application is written against, not an optional subsystem. A
@@ -2536,6 +2605,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_THREAD_EXIT => sys_thread_exit(), // never returns
         SYS_FUTEX => sys_futex(a0, a1, a2),
         SYS_INPUT_POLL => sys_input_poll(),
+        SYS_INPUT_WAIT => sys_input_wait(),
         // PULSE-1: the per-core load sample. Unconditional for the same reason the window verbs are —
         // core ring-3 surface a monitoring app is written against, backed by a sampler that is always
         // compiled.
@@ -2655,9 +2725,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
             let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
             if let Some(id) = crate::arch::sched::current_task_id(cpu) {
                 if let Some(i) = proc_find_running(id) {
-                    PROCS[i].status.store(a0 as i32, Ordering::Release);
-                    PROCS[i].state.store(PEXITED, Ordering::Release);
-                    PROCS[i].done.post();
+                    proc_publish_exit(i, a0 as i32);
                     crate::arch::sched::exit(); // never returns
                 }
             }
@@ -2777,6 +2845,21 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
                     WINX7_WITNESS.store(a0 as u32, Ordering::Release);
                     WINX7_DONE.fetch_add(1, Ordering::AcqRel);
                 }
+                Some("dmg-probe") => {
+                    // DMG-REFUSE: the prober conveys its 19-probe sweep as a PACKED 57-bit status —
+                    // 3 bits per probe — so `a0` is stored WHOLE, not narrowed to u32 like every
+                    // bitmask fixture above it. Code 0 (never attempted) is the reset value, so a
+                    // fixture that died before probing reports 0 and grades as FAIL, never as a pass.
+                    DMG_PROBE_WITNESS.store(a0, Ordering::Release);
+                    DMG_DONE.fetch_add(1, Ordering::AcqRel);
+                }
+                Some("dmg-owner") => {
+                    // DMG-REFUSE: the owner half's 2-bit witness (created / released cleanly). It exists
+                    // only to hold a live window in a DIFFERENT address-space slot for the duration of
+                    // the prober's sweep — which is the only honest way to reach the -EACCES arm.
+                    DMG_OWNER_WITNESS.store(a0 as u32, Ordering::Release);
+                    DMG_DONE.fetch_add(1, Ordering::AcqRel);
+                }
                 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
                 Some("sock2-udp") => {
                     // SOCK-2: the UDP round-trip fixture conveys its 5-bit witness bitmask as its exit STATUS
@@ -2836,36 +2919,69 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 // goes through the identity-mapped window exactly as before (see docs/SECURITY.md CFU-1).
 // =============================================================================
 
-/// The access direction a ring-3 range is validated for. `Read` admits the WHOLE window including the
-/// read-only code page (page 0 is ring3-RX — a legal read source, e.g. a fixture's RO pattern constant
-/// or the DNS/console send buffer). `Write` requires the range to start PAST the code page
-/// (`USER_BASE + PAGE_SIZE`): page 0 is RO, so a kernel store there would fault under CR0.WP or corrupt
-/// W^X-protected code. This is the exact `sys_write`/`sys_sendto` (read) vs `sys_read`/`sys_recvfrom`
-/// (write) lower-bound split, unified.
+/// The access direction a ring-3 range is validated for. `Read` needs the range's pages to be present
+/// and ring-3-reachable (page 0 is ring3-RX — a legal read source, e.g. a fixture's RO pattern constant
+/// or the DNS/console send buffer). `Write` needs them to be present, ring-3-reachable AND actually
+/// WRITABLE in the live page tables, because a kernel store into a read-only ring-3 page either
+/// corrupts W^X-protected code (CR0.WP clear) or takes a fatal CPL-0 #PF (CR0.WP set). This is the
+/// `sys_write`/`sys_sendto` (read) vs `sys_read`/`sys_recvfrom` (write) split, unified.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum UserAccess {
     Read,
     Write,
 }
 
-/// The SINGLE ring-3 window predicate. Validate that `[ptr, ptr + len)` lies wholly inside the caller's
-/// user window (overflow-safe) and — for `Write` — past the read-only code page. Returns `Ok(())` or
-/// `Err(EFAULT)`. This is the exact predicate every site open-coded: `end = ptr.wrapping_add(len)`;
-/// `end < ptr` IS the wrap check (a range that wraps past u64::MAX has `end < ptr`); `ptr < LO` and
-/// `end > window_end` are the bounds. A `len == 0` range is in-bounds iff `ptr` itself is — matching the
-/// historical per-site behavior (the zero-length callers that must no-op — `sys_send`/`sys_sock_recv` —
-/// already `return 0` BEFORE reaching the check; the ones that don't — `sys_write` — validated a 0-len
-/// range against the window exactly like this, so a 0-len write with a below-window pointer is `-EFAULT`
-/// as before). `#[must_use]` so a caller cannot silently ignore the verdict.
+/// The SINGLE ring-3 access predicate. Validate that `[ptr, ptr + len)` lies wholly inside the caller's
+/// user window (overflow-safe) **and** that every page it touches really carries the permission this
+/// access direction needs, in the LIVE page tables. Returns `Ok(())` or `Err(EFAULT)`.
+///
+/// TWO STAGES, AND ONLY THE SECOND IS AUTHORITATIVE.
+///
+/// 1. **Bounds — the cheap pre-filter.** `end = ptr.wrapping_add(len)`; `end < ptr` IS the wrap check
+///    (a range that wraps past u64::MAX has `end < ptr`); `ptr < LO` and `end > window_end` are the
+///    window bounds. A `len == 0` range is in-bounds iff `ptr` itself is — matching the historical
+///    per-site behavior (the zero-length callers that must no-op — `sys_send`/`sys_sock_recv` — already
+///    `return 0` BEFORE reaching the check; the ones that don't — `sys_write` — validated a 0-len range
+///    against the window exactly like this, so a 0-len write with a below-window pointer is `-EFAULT` as
+///    before). The `Write` lower bound of `USER_BASE + PAGE_SIZE` is kept, but ONLY as a fast reject:
+///    page 0 is read-only in every layout `build_slot` produces, so skipping the walk for it costs
+///    nothing and changes no verdict. It is **not** a security claim, and it never was one.
+///
+/// 2. **Leaf permission — the gate.** `memory::user_range_leaf_ok` walks the live CR3 per page and
+///    folds U/W over the whole PML4→PT path. This is what decides.
+///
+/// **CFU-2 — why stage 2 had to be added.** Stage 1 alone excluded exactly ONE page from the write
+/// destination, which is the FLAT/U2 layout's assumption: one code page at the window base. The U3 ELF
+/// loader does not obey it. `elf.rs` applies permissions PER SEGMENT and
+/// `memory::protect_user_slot_range` clears `PTE_WRITABLE` on every page a non-`PF_W` segment covers,
+/// anywhere in the window. Two of the three x86 ring-3 programs already on the boot media have a first
+/// `R E` LOAD longer than a page — `VUG-X86.ELF` (memsz 0x1fe5) and `PULSE-X86.ELF` (memsz 0x13ec) — so
+/// for those slots `USER_BASE + 0x1000`, the FIRST address the old `Write` bound admitted, is a
+/// read-only EXECUTABLE ring-3 page. A ring-3 `sys_read`/`sys_recvfrom`/`sys_sock_recv`/`sys_read_file`
+/// with that buffer passed validation and `copy_to_user` stored into it: a ring-3-driven code-injection
+/// primitive with the kernel as the writer, silent wherever CR0.WP is clear (the rMBP firmware leaves it
+/// clear) and a ring-3-triggerable fatal CPL-0 #PF wherever it is set. SMAP would have caught it; this
+/// kernel deliberately does not enable SMAP (Ivy Bridge lacks it). Nothing in the fixture set exercised
+/// it, which is not the same thing as its being excluded by construction.
+///
+/// The walk is per page across the WHOLE range, not just the first: a range may straddle a writable
+/// leaf and a non-writable one, and a first-page check would still admit the tail.
+///
+/// `#[must_use]` so a caller cannot silently ignore the verdict.
 #[must_use]
 fn user_range_ok(ptr: u64, len: u64, access: UserAccess) -> Result<(), i64> {
     let lo = match access {
         UserAccess::Read => USER_BASE,                 // the RO code page is a legal read source
-        UserAccess::Write => USER_BASE + PAGE_SIZE,    // past page 0 — a kernel store must hit writable RW pages
+        UserAccess::Write => USER_BASE + PAGE_SIZE,    // fast reject only — page 0 is RO in every layout
     };
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let end = ptr.wrapping_add(len);
     if end < ptr || ptr < lo || end > window_end {
+        return Err(EFAULT);
+    }
+    // CFU-2: the authoritative gate. In-window is necessary, never sufficient — the live leaf decides.
+    let need_write = access == UserAccess::Write;
+    if !crate::arch::x86_64::memory::user_range_leaf_ok(ptr, len, need_write) {
         return Err(EFAULT);
     }
     Ok(())
@@ -2925,14 +3041,32 @@ fn copy_to_user(user_ptr: u64, src: &[u8]) -> Result<(), i64> {
 // liveness: before `apic::calibrate` runs, a tick is ~0.8 ms under QEMU, so a sleep runs proportionally
 // short — the documented degradation `arch::ms_to_ticks` already carries.
 
-/// WINX-1: `SYS_GETINFO`'s payload — the fixed `{pid, ticks}` struct copied out to ring 3. `#[repr(C)]`
-/// plain-old-data, field-for-field identical to the aarch64 `UserInfo`, so one arch-neutral ring-3
-/// program reads the same two little-endian u64s on either arch.
-#[repr(C)]
-struct UserInfo {
-    pid: u64,
-    ticks: u64,
-}
+/// WINX-1: `SYS_GETINFO`'s payload — the fixed `{pid, ticks}` struct copied out to ring 3. ABIFREEZE
+/// moved the declaration into `una_abi`, so it is now the SAME TYPE the aarch64 kernel and every
+/// ring-3 program use, rather than three `#[repr(C)]` declarations trusted to stay in step.
+///
+/// The `ticks` field's UNIT does not match aarch64's and never has (una-abi's divergence ledger D1):
+/// x86 fills it from `arch::ticks()` at `apic::TICK_HZ` = 1000 Hz, so one tick is one millisecond,
+/// while aarch64 fills it from its 250 Hz scheduler tick. That is shipped behaviour on both sides and
+/// this arc does not move it; what changed is that ring 3 now reads the rate from
+/// `una_abi::GETINFO_TICK_HZ` instead of hard-coding a guess.
+use una_abi::UserInfo;
+
+// ABIFREEZE (divergence D1): the ABI's declared tick rate MUST be the rate this kernel's heartbeat is
+// armed at, because `sys_getinfo` below hands ring 3 that tick count RAW.
+//
+// Without this line `una_abi::GETINFO_TICK_HZ` would be a fourth hand-copy of the number with no link
+// to the timer — and retuning `apic::TICK_HZ` would silently hand `user-vug` and `user-pulse` back the
+// exact 4x unit bug the freeze just removed, with nothing in any gate to catch it. The assert makes a
+// retune a COMPILE ERROR here until the ABI constant moves with it (verified by negative test on the
+// aarch64 twin: setting `timer::TICK_HZ` to 200 fails the build).
+//
+// Note it binds the ARMED rate, not the achieved one: `apic::TICK_HZ` is what `calibrate` aims the
+// divisor at. Before calibration the heartbeat runs on the fixed fallback count (~0.8 ms/tick under
+// QEMU), so the very earliest ticks of a boot are not exactly milliseconds. That is a pre-existing
+// property of the timebase, unchanged by this arc, and it is the same approximation
+// `arch::ms_to_ticks` already makes for `sched::sleep_ms`.
+const _: () = assert!(una_abi::GETINFO_TICK_HZ == crate::arch::apic::TICK_HZ);
 
 /// WINX-1: `SYS_GETINFO(user_ptr)` — write `{pid, ticks}` to the caller's buffer through the validated
 /// `copy_to_user` seam. Returns 0, or `-EFAULT` if the destination fails validation (outside the ring-3
@@ -2993,19 +3127,16 @@ fn sys_getinfo(user_ptr: u64) -> i64 {
 /// ring-3 program declares from this document — it is ABI, not an implementation detail, and it is
 /// deliberately NOT read from `vug::MAX_METER_CPUS` (that constant is the in-kernel meter's scratch cap and
 /// is free to change without breaking a shipped ring-3 binary). They happen to be equal today at 16.
-const PULSE_MAX_CPUS: usize = 16;
+use una_abi::PULSE_MAX_CPUS;
 
 /// PULSE-1: `SYS_CPUPULSE`'s payload. `#[repr(C)]` plain-old-data, no padding (all `u64`), so the byte
 /// layout is stable for the ring-3 program that reads it back: `ncpu` at 0, `demo` at 8, then
 /// `PULSE_MAX_CPUS` pairs of `(busy, idle)` cumulative tick counts, core-major — core `c`'s busy count at
 /// `16 + c*16`, its idle count at `24 + c*16`. 272 bytes total. Entries at or past `ncpu` are zeroed, never
 /// stale: a caller that trusts `ncpu` and one that scans the whole array agree.
-#[repr(C)]
-struct UserPulse {
-    ncpu: u64,
-    demo: u64,
-    ticks: [u64; PULSE_MAX_CPUS * 2],
-}
+/// ABIFREEZE: the struct itself now lives in `una_abi` — `user-pulse` reads these exact bytes back,
+/// so the layout is ABI and belongs with the number that returns it.
+use una_abi::UserPulse;
 
 /// PULSE-1: `SYS_CPUPULSE(user_ptr)` — write the per-core load sample to the caller's buffer through the
 /// validated `copy_to_user` seam. Returns 0, or `-EFAULT` if the destination fails validation (outside the
@@ -3063,8 +3194,10 @@ fn sys_sleep_ms(ms: u64) -> i64 {
 
 // =============================================================================================
 // WINX-1 — the WINDOW SURFACE/VERB SEAM. The x86 twin of the aarch64 WC-B block, wired to the SAME
-// arch-neutral compositor (`video::wm`), which has always been arch-neutral and until now had no x86
-// caller other than `video/wcx.rs`'s kernel-drawn demo window.
+// arch-neutral compositor (`video::wm`), which has always been arch-neutral and until this seam had
+// no x86 caller other than `video/wcx.rs`'s activation. (That activation's own windows were the
+// console and a kernel-drawn demo window; since the kernel-apps eviction only the console remains,
+// and the desktop's second window comes through THESE verbs like any other program's.)
 //
 // TWO INDICES, deliberately distinct (the aarch64 distinction, and it matters for the same reasons):
 //   * the WINDOW ID (0..WIN_MAX) — GLOBAL, what ring 3 passes to the verbs;
@@ -3092,10 +3225,24 @@ fn sys_sleep_ms(ms: u64) -> i64 {
 // (the U1a/U1b/U2 tasks, which have no private address space and therefore no FB region); those callers
 // get `-EINVAL`, the same refusal aarch64 gives ASID 0.
 
-/// WINX-1: the fixed window count. Matches `memory::FB_WIN_SLOTS` and the compositor's fixed table.
+/// WINX-1: the fixed GLOBAL window count — how many windows may be open across the whole machine.
 /// STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not raise it for a demo.
-const WIN_MAX: usize = 8;
-const _: () = assert!(WIN_MAX == crate::arch::x86_64::memory::FB_WIN_SLOTS);
+///
+/// HEADROOM — raised 8 -> 12, with `MAX_PROCS` 6 -> 10 and `USER_SLOTS` 8 -> 12. A window is the
+/// thing a launched program is FOR, so the global table has to be able to hold one per live process
+/// plus the console: 10 + 1 = 11, and 12 leaves a row of margin. Raising it alone would have been
+/// pointless (the process table would still refuse the 7th launch) and raising the others without it
+/// would have traded a `-EAGAIN` at spawn for an `-ENFILE` at the first `SYS_WIN_CREATE`.
+const WIN_MAX: usize = 12;
+/// HEADROOM: was `WIN_MAX == FB_WIN_SLOTS`. That equality was never the requirement — it was two
+/// caps that happened to share a value, and it silently made every per-address-space REGION SLOT
+/// index legal as a global window id and vice versa. The real requirement is one-directional and is
+/// what the raise had to preserve: a region slot allocated by `sys_win_create` is bounded by the
+/// candidate range this file scans, and it indexes `memory::slot_fb_win_*` which is sized
+/// `FB_WIN_SLOTS`. So `FB_WIN_SLOTS` may be smaller than `WIN_MAX` (a process may not open every
+/// window in the machine — that is `-EMFILE`) but never larger. See `memory::FB_WIN_SLOTS` for why
+/// the per-process cap stayed at 8 while the global one grew.
+const _: () = assert!(crate::arch::x86_64::memory::FB_WIN_SLOTS <= WIN_MAX);
 const _: () = assert!(WIN_MAX <= crate::video::wm::MAX_WINDOWS);
 
 /// WINX-1: one window table row. `owner == WIN_OWNER_FREE` means FREE. Unlike aarch64 — where ASID 0 is
@@ -3116,7 +3263,7 @@ struct WinEntry {
     wm_id: crate::video::wm::WinId,
 }
 
-/// WINX-1: the free-row sentinel. `usize::MAX` is not a reachable slot index (`USER_SLOTS` is 8).
+/// WINX-1: the free-row sentinel. `usize::MAX` is not a reachable slot index (`USER_SLOTS` is 12).
 const WIN_OWNER_FREE: usize = usize::MAX;
 
 impl WinEntry {
@@ -3199,9 +3346,144 @@ const FB_MAGIC: u32 = 0x4E49_5755;
 static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
     [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
 
+/// DESKTOP-APP: which slots are exempt from the FIRST-WINDOW focus grant in [`sys_win_create`].
+///
+/// ### The defect this exists to prevent, stated before the fix
+///
+/// `sys_win_create` gives input focus to any process that opens a window while `USER_INPUT_ACTIVE`
+/// is 0 — the minimum viable policy that makes a `bg`'d interactive app reachable at all, and it is
+/// right for every launch an OPERATOR asks for. The kernel-apps eviction introduced the first launch
+/// nobody asks for: `wcx::desktop_app_service` starts `STAT.ELF` at boot, as the compositor's
+/// furniture, and its window opens at a moment when the shell is by definition idle. Unqualified,
+/// that grant would fire on it — and `STAT.ELF` never calls `SYS_INPUT_POLL` (it is a paint loop with
+/// no input path at all), so the boot would end with the keyboard published to a program that cannot
+/// read it. Every keystroke would land in a ring nobody drains, and the prompt would be dead until
+/// the operator discovered `<TAB>`. The kernel-drawn window this replaces was `KERNEL_OWNER_DESKTOP`
+/// and was outside the focus ring by construction; keeping the desktop's furniture out of the
+/// keyboard's way is that property preserved across the eviction, not a new policy.
+///
+/// ### Why a slot flag and not a check at the call site
+///
+/// The launcher cannot set it after `spawn_user_image_bg` returns: the task is runnable the moment it
+/// is spawned and could reach `SYS_WIN_CREATE` first. So it is set INSIDE the spawn, in the same
+/// window as `SLOT_DETACHED` — after `load_program_common` has named the slot and before the task can
+/// run — which makes the exemption unraceable rather than probably-early-enough.
+///
+/// Narrow on purpose. It withholds the two gestures that would hand the keyboard to this window
+/// WITHOUT the operator naming it — the first-window grant here, and the raise-and-deliver click in
+/// [`wc_click_route_at`] (which the replaced kernel row also declined). `<TAB>` still reaches it:
+/// the row stays in `focus_ring_apps`, so the app is one keystroke away for anyone who wants it.
+/// Nothing here can take focus away from anyone.
+///
+/// ### `wc`-gated, and what that does and does not buy
+///
+/// The exemption exists for `video::wcx`'s desktop app, which does not exist without `UNAOS_WC=1`.
+/// The flag, both of its readers ([`slot_is_focus_exempt`] and [`owner_is_focus_exempt`]) and the
+/// spawn entry point are all gated, so a plain x86 kernel carries no static, no branch on the
+/// `SYS_WIN_CREATE` path, no arm in the click router and neither witness string — no feature code at
+/// all, and no behaviour change.
+///
+/// It does NOT buy byte-identity, and the claim was checked rather than assumed. Knob-off `esp-x86`
+/// built at the arc's base and at this commit, in the same worktree path, differs: 56 bytes of
+/// symbol-string table, plus NINE bytes inside a `.text` that is the same size (925727 B) with no
+/// named function changing size — relocated rodata immediates in this file, whose anon-constant
+/// ordering moved when `spawn_user_image_bg` became a wrapper over `spawn_user_image_bg_inner`.
+/// `arroyo`'s knob comment says so now; it used to claim byte-identity, and that would have been
+/// false. aarch64 IS byte-identical — no aarch64 file is touched at all.
+#[cfg(feature = "wc")]
+static SLOT_NO_AUTOFOCUS: [AtomicBool; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+
+/// DESKTOP-APP: is `slot` exempt from the first-window focus grant — and SAY SO if it is.
+///
+/// The witness line lives here rather than at the call site so both readers of the flag cannot drift
+/// apart in what they print. Note what this line is and is not evidence of (review F13): it fires on
+/// EVERY `SYS_WIN_CREATE` from an exempt slot, including ones where `USER_INPUT_ACTIVE != 0` and the
+/// grant would not have fired anyway. It is the ABSENCE of the paired
+/// `input focus -> slot N (first window, shell was idle)` that carries the load; quote them together.
+#[cfg(feature = "wc")]
+fn slot_is_focus_exempt(slot: usize) -> bool {
+    if !SLOT_NO_AUTOFOCUS[slot].load(Ordering::Acquire) {
+        return false;
+    }
+    serial_println!(
+        ":: wc-x86: input focus NOT granted to slot {} (desktop app — exempt from the first-window grant; <TAB> still reaches it) ::",
+        slot
+    );
+    true
+}
+#[cfg(not(feature = "wc"))]
+fn slot_is_focus_exempt(_slot: usize) -> bool {
+    false
+}
+
+/// DESKTOP-APP: is `owner` — a `wm` owner ASID, `slot + 1`-BIASED — an exempt slot's window?
+///
+/// The bias is the whole of the arithmetic here and it is the thing to get wrong: `wm` owners for
+/// user rows are `slot + 1` (see the CLICK-X86 note in `sys_win_create`), kernel furniture lives in a
+/// reserved band far above `USER_SLOTS`, and `0` means "nobody owns this row". Both of those are
+/// rejected before the subtraction, and the result is bounds-checked, so no owner value from the
+/// table can index outside the array.
+///
+/// Silent — unlike [`slot_is_focus_exempt`], which prints. The click router has its own witness
+/// (`clickroute_witness`) and reports this arm as `consume`, so a second line here would double-count
+/// the same gesture in the ledger.
+#[cfg(feature = "wc")]
+fn owner_is_focus_exempt(owner: u64) -> bool {
+    if owner == 0 || crate::video::wm::is_kernel_owner(owner) {
+        return false;
+    }
+    let slot = (owner - 1) as usize;
+    slot < crate::arch::memory::USER_SLOTS && SLOT_NO_AUTOFOCUS[slot].load(Ordering::Acquire)
+}
+#[cfg(not(feature = "wc"))]
+fn owner_is_focus_exempt(_owner: u64) -> bool {
+    false
+}
+
 /// WINX-7: the process-flags word's DETACHED bit, at info-page byte offset `0x20`. Bit 0, the same
 /// bit and the same offset the aarch64 info page uses, so one arch-neutral program reads it on both.
 const FB_FLAG_DETACHED: u32 = 1 << 0;
+
+/// VUGMIN/x86: bit 1 of the same word — every window this process owns is hidden below the shell's z,
+/// so nothing it renders can reach the panel. The aarch64 twin (`FB_FLAG_HIDDEN`) is the same bit at
+/// the same offset by the SHARED-LAYOUT law: `user-vug` reads `flags & 2` on both arches from one
+/// source line.
+///
+/// The difference from bit 0 that decides the whole shape below: bit 0 is fixed before the process
+/// runs, so the info-page write `sys_win_create` performs anyway is always in time. **Bit 1 changes
+/// under a running process**, and the info-page writers run only on create/map — which is exactly why
+/// x86 needed a SETTER that republishes, not merely a flag the create path folds in. Without one the
+/// bit is an unobservable atomic, which is what it was: `wm::vugmin_publish`'s x86 arm was
+/// `let _ = hidden;` and no hidden app on this arch has ever been told.
+const FB_FLAG_HIDDEN: u32 = 1 << 1;
+
+/// VUGMIN/x86: which slots are currently HIDDEN — every live, non-compat window they own sits below
+/// `video::wm`'s `SHELL_Z`. The x86 twin of aarch64's `HIDDEN_ASIDS`, kept as a per-slot
+/// `AtomicBool` array rather than a bitmask because that is the shape this file's other per-slot
+/// process flags already have (`SLOT_DETACHED`, `SLOT_NO_AUTOFOCUS`) and `USER_SLOTS` is 12.
+///
+/// `video::wm` owns the z-order that decides the answer; this module owns the flag and the info page.
+/// Fail-safe direction is aarch64's, and for aarch64's reason: an out-of-range owner reads back "not
+/// hidden", i.e. keeps rendering. A vug that idles when it should not is a vug that stops responding;
+/// a vug that renders when it could idle merely wastes what it wastes today.
+static SLOT_HIDDEN: [AtomicBool; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+
+/// VUGMIN/x86: the PROCESS-FLAGS word for `slot`, as published into its RO info page. Factored out
+/// because BOTH publishers must write the identical word — [`fb_info_write_flags`] on window create
+/// and [`set_hidden`] on every focus change — and a writer that rebuilt only its own bit would clear
+/// the other's on every store.
+fn fb_info_flags(slot: usize) -> u32 {
+    let mut f = 0;
+    if SLOT_DETACHED[slot].load(Ordering::Acquire) {
+        f |= FB_FLAG_DETACHED;
+    }
+    if SLOT_HIDDEN[slot].load(Ordering::Acquire) {
+        f |= FB_FLAG_HIDDEN;
+    }
+    f
+}
 
 /// WINX-7: publish slot `slot`'s process-flags word into its RO info page. Written through the KERNEL
 /// identity pointer — ring 3's alias of this page is read-only — and called from `sys_win_create`, which
@@ -3209,8 +3491,59 @@ const FB_FLAG_DETACHED: u32 = 1 << 0;
 /// it and never before.
 fn fb_info_write_flags(slot: usize) {
     let info = crate::arch::x86_64::memory::slot_fb_info_ptr(slot) as *mut u32;
-    let flags = if SLOT_DETACHED[slot].load(Ordering::Acquire) { FB_FLAG_DETACHED } else { 0 };
-    unsafe { info.add(0x20 / 4).write_volatile(flags) };
+    unsafe { info.add(0x20 / 4).write_volatile(fb_info_flags(slot)) };
+}
+
+/// VUGMIN/x86 SEAM: record whether owner `asid`'s windows are hidden below the shell, and PUBLISH it.
+/// Public because its callers are `video::wm`'s (`vugmin_publish`) — the arch twin of
+/// `arch::aarch64::syscall::set_hidden`, same name, same signature, same idempotence.
+///
+/// `asid` is a `wm` OWNER, i.e. `slot + 1`-biased on this arch (see the CLICK-X86 note in
+/// `sys_win_create`). Kernel furniture owners live far above `USER_SLOTS` and are rejected by the
+/// bound, as is owner 0.
+///
+/// **THE SETTER IS THE PUBLISHER.** See [`FB_FLAG_HIDDEN`] for why that is not a stylistic choice.
+/// Only the flags WORD is rewritten: the geometry fields belong to the info-page writers, which own
+/// the window table's view of them, and touching them here would race those writers for no reason. A
+/// `u32` store is single-copy-atomic on x86-64, so a concurrent ring-3 read sees the old value or the
+/// new one and never a tear.
+///
+/// Takes NO LOCK — two atomics and one `write_volatile` into per-slot kernel backing whose address is
+/// pure pointer arithmetic — which is the property `wm`'s "no calls out from under `TABLE`" note
+/// already asserts of this seam.
+///
+/// Writing a slot with no live window is harmless and deliberately unguarded: the backing is static
+/// and exists for the slot's whole life, and [`clear_hidden`] at the teardown funnel means a dead
+/// slot's word cannot outlive its owner.
+pub fn set_hidden(asid: u64, on: bool) {
+    if asid == 0 || asid > crate::arch::memory::USER_SLOTS as u64 {
+        return;
+    }
+    let slot = (asid - 1) as usize;
+    SLOT_HIDDEN[slot].store(on, Ordering::Release);
+    fb_info_write_flags(slot);
+    // VUGPAUSE-2/x86: an UNHIDE is a wake edge, and it is the one the ring cannot supply. A hidden app
+    // is by construction not the focused one, so nothing is routed to it; if it is parked in
+    // `sys_input_wait` the only thing that changed when it became visible again is the word written
+    // just above — which nothing wakes on. Without this the restore would wait for the backstop
+    // (~256 ms) or, if the tick is not live, forever. Ordered AFTER the info-page publish so the woken
+    // app's first read of the flags word already shows it visible and it does not immediately re-park.
+    if !on {
+        user_input_wake_edge(slot, "unhide");
+    }
+}
+
+/// VUGMIN/x86: clear `slot`'s hidden bit on teardown. Called from [`clear_handle_row`] beside the
+/// `SLOT_DETACHED` clear, under the identical rule and for the identical reason: SLOTS ARE RECYCLED,
+/// so without this a slot last used by a vug that was hidden when it died would hand its stale bit to
+/// the next tenant — which would come up already idling, having never been hidden at all. That is the
+/// worse of the two failure directions (a window that draws nothing), so it is closed at the funnel
+/// rather than at each launcher.
+fn clear_hidden(slot: usize) {
+    if slot < crate::arch::memory::USER_SLOTS {
+        SLOT_HIDDEN[slot].store(false, Ordering::Release);
+        fb_info_write_flags(slot);
+    }
 }
 
 /// WINX-1: `SYS_WIN_CREATE(w, h)` -> window id (0..WIN_MAX), or a negative errno.
@@ -3241,8 +3574,14 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     };
     let _irq = IrqGuard::mask_save();
     let mut t = WINDOWS.lock();
-    // Lowest-free REGION slot for this address space.
-    let rslot = match (0..WIN_MAX)
+    // Lowest-free REGION slot for this address space. HEADROOM: the CANDIDATE range is
+    // `FB_WIN_SLOTS` — the per-address-space cap, which is what `mem::slot_fb_win_surface_ptr` and
+    // `map_slot_fb_win` are sized by — while the SCAN that decides which candidates are taken runs
+    // over the whole global table (`WIN_MAX` rows, any of which could belong to this slot). The two
+    // were both `WIN_MAX` while the caps were equal; once `WIN_MAX` grew to 12 with `FB_WIN_SLOTS`
+    // at 8, a candidate range of `WIN_MAX` would have handed out region slot 8..11 and walked off
+    // the end of the slot's FB region — the `-EMFILE` this arm documents would never have fired.
+    let rslot = match (0..mem::FB_WIN_SLOTS)
         .find(|&r| !(0..WIN_MAX).any(|i| t[i].owner == slot && t[i].rslot as usize == r))
     {
         Some(r) => r,
@@ -3252,6 +3591,9 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
         Some(i) => i,
         None => return ENFILE,
     };
+    // VSYNC-PACE: a freshly allocated row starts with no cadence, so this window's first present is never
+    // delayed and it inherits nothing from the previous tenant of the id.
+    pace_reset(id);
     let mut e = WinEntry {
         owner: slot,
         rslot: rslot as u8,
@@ -3279,12 +3621,12 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // this verb negotiated) — never a recomputed `h * stride`. That distinction is wm's F1 extent
     // contract: `w`/`h`/`stride` are ring-3-influenced, `pages` comes from the mapping code, and it is
     // `surf_len` that bounds every source read the compositor performs.
-    // CLICK-X86 — the compositor owner is `slot + 1`, the SAME `+1` bias `EL0_INPUT_ACTIVE` carries,
+    // CLICK-X86 — the compositor owner is `slot + 1`, the SAME `+1` bias `USER_INPUT_ACTIVE` carries,
     // and for the same reason stated there: x86 slot 0 is a REAL address space, so an unbiased owner
     // of 0 is indistinguishable from wm's "nobody owns this row". Unbiased, the first program to
     // launch got a window that `hit_test` skipped (`owner_asid == 0`) and `focus_ring` skipped, i.e.
     // it could be neither clicked nor tabbed to — silently, and only for slot 0. Biased, the value
-    // `hit_test` returns is the value the router compares against `EL0_INPUT_ACTIVE` with no
+    // `hit_test` returns is the value the router compares against `USER_INPUT_ACTIVE` with no
     // conversion at the one seam that decides who receives a keystroke.
     e.wm_id = wc_shim::create(
         (slot as u64) + 1,
@@ -3305,23 +3647,36 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // WINX-7: if NOBODY currently has input focus, the process that just opened a window gets it.
     //
     // This is the minimum viable focus POLICY, and it is deliberately the weakest one that makes an
-    // interactive ring-3 app reachable at all. x86 has no focus-cycling key yet (the aarch64 WC-C TAB
-    // ring lives in that arch's router seam, which this arc does not have a twin of), so without some
-    // rule a program launched with `bg` would create a window, poll `SYS_INPUT_POLL` forever, and
-    // never receive a single event — indistinguishable from broken input.
+    // interactive ring-3 app reachable at all: without some rule a program launched with `bg` would
+    // create a window, poll `SYS_INPUT_POLL` forever, and never receive a single event —
+    // indistinguishable from broken input.
+    //
+    // WC-TAB/x86 has since supplied the focus RING this note called the follow-on arc (see
+    // `wc_focus_key`), and this rule is kept rather than replaced. The two do different jobs: the
+    // cycle moves focus that already exists, and this is what gives a freshly launched window a
+    // first grant with nothing pressed. What the cycle removes is the trap that made a weak GRANT
+    // rule dangerous — a grant that could never be given back.
     //
     // What makes "only when nobody has focus" the safe version: it can never STEAL focus. A second
     // windowed app launched behind a focused one does not take the keyboard from it, so a background
     // program cannot arrange to receive keystrokes aimed at the window in front of it — which is the
     // property the producer-side focus gate exists to guarantee. Focus returns to the shell when the
-    // holder's slot is torn down (`el0_input_revoke_slot`), so the next app launched after that one
-    // exits is focusable in turn. A real focus RING — click-to-focus, a reserved cycling key — is the
-    // follow-on arc, and it will replace this rule rather than build on it.
-    if EL0_INPUT_ACTIVE
-        .compare_exchange(0, (slot as u64) + 1, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+    // holder's slot is torn down (`user_input_revoke_slot`), so the next app launched after that one
+    // exits is focusable in turn — and, since WC-TAB/x86, without needing that exit at all.
+    //
+    // DESKTOP-APP — and it is qualified now, by exactly one slot flag. "Nobody has focus" is the
+    // shell's NORMAL state, so the grant fires on whatever windowed program happens to open first;
+    // that is right for a launch the operator asked for and wrong for the one the compositor asks
+    // for at boot. See [`SLOT_NO_AUTOFOCUS`] for the full argument. The CAS is skipped rather than
+    // undone: publishing focus and then taking it back would be a real transition the whole ledger
+    // would have to account for, and there is nothing here to take back. `slot_is_focus_exempt` is
+    // a `const false` on a non-`wc` build, so this reads as the unqualified original there.
+    if !slot_is_focus_exempt(slot)
+        && USER_INPUT_ACTIVE
+            .compare_exchange(0, (slot as u64) + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     {
-        clear_input_row(slot); // a fresh focus starts clean, exactly as `el0_input_set_active` does
+        clear_input_row(slot); // a fresh focus starts clean, exactly as `user_input_set_active` does
         serial_println!(":: wc-x86: input focus -> slot {} (first window, shell was idle) ::", slot);
     }
     serial_println!(
@@ -3334,18 +3689,26 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
 /// WINX-1: `SYS_WIN_PRESENT(win)` -> 0, or a negative errno. Damage-mark + composite the caller's
 /// window. Ownership-gated (`-EBADF` unresolvable, `-EACCES` another process's live window).
 ///
-/// LOCK SPAN — the ownership check, the geometry snapshot AND the present run under ONE continuous hold
-/// of the window table lock, for the reason the aarch64 twin documents: resolving the row, dropping the
-/// lock, then presenting would leave a real window in which a close+create pair on other cores recycles
-/// this id to a DIFFERENT process, and the composite would land the caller's pixels under the new
-/// owner's window identity. Holding across the composite is what makes the id the compositor is handed
-/// provably still the id we validated. The cost is a bounded blit inside an IRQ-masked spinlock, bounded
-/// by the 64 KiB surface cap.
+/// LOCK SPAN — WCPAR SHRUNK THIS. The ownership check and the geometry+id snapshot run under the window
+/// table lock; the lock is then RELEASED and the composite runs OUTSIDE it. Before WCPAR the whole
+/// composite ran under one continuous hold, deliberately, because resolving the row, dropping the lock,
+/// then presenting leaves a window in which a `close`+`create` pair on other cores recycles this id to a
+/// DIFFERENT process and the composite lands under the new owner's identity. That TOCTOU is now closed
+/// WITHOUT the long hold: the `+1`-biased slot is carried into `wc_shim::present` as the expected wm
+/// `owner`, and `wm::present_banded` re-checks it against the resolved row under the compositor's OWN
+/// table lock before marking a pixel — a recycled id no longer matches and is declined. The other half
+/// of the race, the surface being unmapped mid-blit, was never the outer hold's job: it is closed by the
+/// F4 drain barrier (`wm::close` drains in-flight `BlitGuard`s before `win_close_slot`'s backing is
+/// dropped), which is unchanged. What the shrink BUYS: two cores presenting different windows no longer
+/// serialise on this one spinlock for the duration of each other's ~milliscale composite — the flow
+/// arc's first serialization (`engine.md` §8, "WINDOWS held across the composite"). IRQs stay masked
+/// across the composite as before (per-core, so no cross-core serialization); only the shared spinlock
+/// is released early.
 ///
-/// LOCK ORDER: `WINDOWS` is the OUTERMOST lock; `video::wm`'s own state is acquired strictly inside it
-/// (`wc_shim::present` is called with `WINDOWS` held, never the reverse). The reverse edge does not
-/// exist by construction — neither `video/wm.rs` nor `video/screen.rs` references the syscall layer, so
-/// nothing under `wm` can call back into a window verb.
+/// LOCK ORDER: `WINDOWS` is still the OUTERMOST lock and `video::wm`'s state is still acquired only
+/// after it (never the reverse); WCPAR narrows the span of the hold, it does not invert the order. The
+/// reverse edge does not exist by construction — neither `video/wm.rs` nor `video/screen.rs` references
+/// the syscall layer, so nothing under `wm` can call back into a window verb.
 fn sys_win_present(win: u64) -> i64 {
     let slot = match win_caller_slot() {
         Ok(v) => v,
@@ -3355,19 +3718,962 @@ fn sys_win_present(win: u64) -> i64 {
         return EBADF;
     }
     let id = win as usize;
-    let _irq = IrqGuard::mask_save();
-    let t = WINDOWS.lock();
-    if t[id].owner == WIN_OWNER_FREE {
+    // VSYNC-PACE: pace to the panel BEFORE the lock is taken — this can sleep, and it must not sleep
+    // holding the outermost compositor lock. Read-only against this window's pace state; the state is
+    // ADVANCED inside the guarded block below, only once ownership has been proven.
+    present_pace(slot, id);
+    // PRESSURE-1: the back-pressure below can sleep, and sleeping under `WINDOWS` with IF masked would
+    // park the outermost compositor lock on a task the scheduler will not run for a millisecond — every
+    // other window on the machine behind it. So the outcome leaves the guarded block as a value and the
+    // charge is applied outside it.
+    let (outcome, wm_id) = {
+        let _irq = IrqGuard::mask_save();
+        // WCPAR — the window table is held ONLY for the ownership proof, the snapshot and the pace/count
+        // bookkeeping; it is dropped before the composite so two cores' presents no longer serialise on
+        // it. The recycle TOCTOU the old long hold closed is now closed by the `owner` fence carried
+        // into `wc_shim::present` (the `+1`-biased slot, re-checked against the resolved row inside the
+        // compositor's own table lock). See the LOCK SPAN note above.
+        let wm_id;
+        {
+            let t = WINDOWS.lock();
+            // R0 / rtwit — WINDOWS max-hold. WCPAR shrank this hold from the whole composite to just the
+            // ownership proof + snapshot, so the timer now measures that SHRUNK span (windows_max should
+            // read far below the old ~19ms full-composite hold — that drop is the two arcs working
+            // together). Declared after the guard so it drops first; a no-op inline shim when rtwit off.
+            let _wh = crate::rtwit::hold(crate::rtwit::Lock::Windows);
+            if t[id].owner == WIN_OWNER_FREE {
+                return EBADF;
+            }
+            if t[id].owner != slot {
+                return EACCES;
+            }
+            wm_id = t[id].wm_id;
+            FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+            // VSYNC-PACE r3: the `[wpace]` present count, HERE and not inside `pace_advance` — it counts
+            // an event that happens on every boot, while the pacer is compiled only under `vsyncpace`.
+            // Same placement rule as the deadline: inside the ownership proof, so a slot cannot inflate
+            // another slot's window. One relaxed atomic.
+            wpace_note_present(id);
+            // VSYNC-PACE: the deadline moves only for a present that PASSED the ownership gate, so no
+            // slot can push another slot's window into the future. Two atomics and one `arch::ms()`
+            // register read; no call leaves the crate and nothing here can block. UNPACED BUILD: `{}`.
+            pace_advance(id);
+        } // `_wh` drops (before `t`), then WINDOWS released — the composite below runs without it.
+        // WCPAR — the `+1`-biased slot is the wm `owner` this window was created under (`sys_win_create`
+        // passes `slot + 1`); the compositor declines the present if the resolved row no longer carries
+        // it, which is the recycled-id fence that makes releasing the lock above safe.
+        (wc_shim::present(wm_id, (slot as u64) + 1), wm_id)
+    };
+    // VSYNC-PACE: the witness rollup, OUTSIDE the guard — see `wpace_emit` for why a serial burst may not
+    // run under the outermost compositor lock.
+    wpace_tick();
+    // CLOSE-TEARDOWN — `NoRow` from a REAL wm id is TERMINAL: the compositor's row was reaped
+    // (operator close, teardown) or recycled to another owner, and this window handle will never
+    // name a row again — a new `SYS_WIN_CREATE` gets a new handle. Before this, `NoRow` fell into
+    // `present_backpressure`'s success arm and the app was answered `0` forever: an app whose
+    // window the operator closed had NO signal its window died and every reason to keep its render
+    // loop presenting (GR27 Boot A: the close burst's zombie presents landed here, `stale=` in the
+    // `[wcn]` rollup). `-EBADF` is that signal — the same "this handle names nothing" the verb
+    // already speaks — and the reject costs the compositor one table probe, no compose work
+    // (`wm::present_banded` declines before a pixel is marked). `wm_id == WIN_NONE` keeps the old
+    // answer: that is the HEADLESS case (the compositor refused a row at create, e.g. no panel),
+    // where the window is a legitimate draw-only surface and erroring would fail every program on
+    // a machine with no glass.
+    if outcome == crate::video::wm::Presented::NoRow && wm_id != crate::video::wm::WIN_NONE {
         return EBADF;
     }
-    if t[id].owner != slot {
-        return EACCES;
+    present_backpressure(slot, outcome)
+}
+
+/// PRESSURE-1: the non-error status a present returns when the compositor DECLINED it because every
+/// window the caller owns is hidden below the shell. Positive, so bit 63 is clear and it is
+/// unambiguously not an errno: every in-tree client already tests `rc >> 63` for failure and a client
+/// that only tests for failure keeps working unchanged. A caller that wants to be a good citizen can
+/// test for it and stop rendering; a caller that ignores it is throttled anyway, below.
+const WIN_PRESENT_HIDDEN: i64 = 1;
+
+/// PRESSURE-1: how many CONSECUTIVE suppressed presents a slot gets for free before each one costs it
+/// a tick. Reset by any present that actually composites, so this is per HIDE EPISODE, not per boot.
+///
+/// **Why there is a grace at all.** A window can be hidden between a frame's first and last present
+/// (the operator TABs mid-frame), and stalling a millisecond inside a present that was going to be the
+/// app's last before it noticed the bit would be a latency cost paid by a correct app for the
+/// compositor's timing. Eight was a whole frame's worth of banded presents on the measured client, and
+/// while hidden the counter never resets, so the grace is spent once per episode and every present
+/// after it is charged.
+///
+/// VSYNC-PACE CHANGED THIS ARITHMETIC (review C2), and the old sentence is left above only so the
+/// change is legible. `pace_advance` runs BEFORE `wc_shim::present`, so a suppressed present still
+/// advances the cadence: a hidden window that keeps presenting is now DOUBLE-SLEPT — up to a frame in
+/// `present_pace`, then PRESSURE-1's 1 ms — landing at ~58/s. So (a) eight suppressed presents now
+/// span eight PANEL FRAMES (~133 ms), not one, and the app is unthrottled by PRESSURE-1 for that
+/// window; (b) PRESSURE-1's measured ~1,000/s hidden cap becomes ~58/s. The system property still
+/// holds — the pacer caps the arrival rate before the charge ever matters, and it caps it harder —
+/// but any reading of GR21's hidden-present figures against a paced boot is comparing two different
+/// machines. The double sleep is INTENDED: a hidden app deserves both bounds.
+const HIDDEN_PRESENT_GRACE: u32 = 8;
+
+/// PRESSURE-1: what a charged suppressed present costs. One tick — the x86 timebase is 1 kHz, so
+/// `sleep_ms(1)` is exactly one tick — which caps an uncooperative hidden app at ~1,000 presents/s
+/// against the 42,000/s Boot AJ measured. Deliberately the smallest unit the scheduler has: the point
+/// is to restore SOME pacing to a path that had none, not to punish, and one tick is already a 42x
+/// reduction. The app is BLOCKED for it, so the core is released rather than spun.
+const HIDDEN_PRESENT_SLEEP_MS: u64 = 1;
+
+/// PRESSURE-1: per-slot count of consecutive presents the compositor declined.
+static SLOT_HIDDEN_PRESENTS: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+
+/// PRESSURE-1: charge `slot` for the present it just made, and give it the answer.
+///
+/// THE DEFECT, stated before the fix. `wm::present` suppresses a hidden owner's pass before
+/// `composite()` and returns — so on Boot AJ two vugs that presented 264 times a second while visible
+/// presented 42,000 times a second each once hidden, driving `comp_rate` to `0.0/s` and the rollup
+/// verdict to `STARVED` for four consecutive windows. Nothing reached the panel. The compositor's
+/// ACCEPT had been the only thing pacing those apps, and declining a present handed the pacing back to
+/// the app that was already misbehaving.
+///
+/// Commits 1 and 2 of this arc fix the COOPERATIVE path: the app is now told it is hidden and has a
+/// real park to sleep in. This is the part that does not depend on the app's cooperation, which is the
+/// point — "the compositor keeps running" is a whole-system availability property and should not be
+/// contingent on every ring-3 program being well written. An app that never reads the hidden bit and
+/// never calls `SYS_INPUT_WAIT` is now capped at ~1,000 suppressed presents/s per slot.
+///
+/// VISIBLE PRESENTS ARE NOT TOUCHED — same return (0), same path, same cost, and the counter is reset
+/// rather than read. Neither is `NoRow` — which, CLOSE-TEARDOWN narrowed, can only be the HEADLESS
+/// case by the time it reaches here (`wm_id == WIN_NONE`): both present verbs return `-EBADF` before
+/// this function for a `NoRow` against a real wm id (a reaped/recycled row — see `sys_win_present`).
+fn present_backpressure(slot: usize, outcome: crate::video::wm::Presented) -> i64 {
+    use crate::video::wm::Presented;
+    match outcome {
+        Presented::Composited | Presented::NoRow => {
+            // R0 / rtwit — a frame actually composited: close the input→present proxy for the oldest
+            // input pending since the previous present (see `crate::rtwit`). Called here, OUTSIDE the
+            // WINDOWS guard and the IRQ mask, so the ruler never lengthens the very hold it measures.
+            // `NoRow` also counts: it is a present that reached the compositor (the WINX-1 present
+            // counter treats it the same). No-op inline shim when `rtwit` is off.
+            crate::rtwit::note_present_composited();
+            SLOT_HIDDEN_PRESENTS[slot].store(0, Ordering::Relaxed);
+            0
+        }
+        Presented::Coalesced => {
+            // WPACE-PANEL — the present was absorbed into the panel frame in flight: the damage is
+            // committed but NO GLASS HAS CHANGED YET, so the rtwit ruler is NOT closed here — it
+            // closes at the composite that actually carries the damage (the window's frame-edge
+            // present via the arm above, or `wm::pace_service`'s tail drain, which calls
+            // `note_present_composited` itself). Closing on this arm would under-report the
+            // input→glass tail by up to a frame plus a service tick. Everything else is
+            // `Composited`'s: same return, same hidden-counter reset — the window is visible and
+            // presenting.
+            SLOT_HIDDEN_PRESENTS[slot].store(0, Ordering::Relaxed);
+            0
+        }
+        Presented::Suppressed => {
+            let n = SLOT_HIDDEN_PRESENTS[slot].fetch_add(1, Ordering::Relaxed) + 1;
+            if n > HIDDEN_PRESENT_GRACE {
+                // Called with `WINDOWS` released and the IRQ guard dropped — see `sys_win_present`.
+                // `sleep_ms` is a no-op outside a scheduled task, so this cannot hang a caller that
+                // has no scheduler to wake it.
+                crate::arch::sched::sleep_ms(HIDDEN_PRESENT_SLEEP_MS);
+            }
+            WIN_PRESENT_HIDDEN
+        }
     }
-    let e = t[id];
-    FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
-    wc_shim::present(e.wm_id);
-    drop(t);
-    0
+}
+
+// ---- VSYNC-PACE — the kernel-side present pacer, NOW OPT-IN ---------------------------------------
+//
+// ⚠ READ THIS BLOCK FIRST. Everything below the r3 heading describes code that is compiled ONLY under
+// `feature = "vsyncpace"` (`UNAOS_VSYNCPACE=1`). ON A SHIPPED BOOT NONE OF IT EXISTS: `present_pace` is
+// the empty stub and `SYS_WIN_PRESENT` returns as soon as its composite is done. The GR22 argument is
+// kept verbatim underneath because it is still the correct argument for the ARMED build, and because a
+// later reader has to be able to see what was decided and what un-decided it.
+//
+// ==================================================================================================
+// VSYNC-PACE r3 (GR25) — UNRESTRICTED IS THE DEFAULT
+// ==================================================================================================
+//
+// P, GR25: *"fps is made up/forced to run a certain speed rather than running unrestricted as does the
+// load across cores."*
+//
+// HE IS RIGHT, AND BOOT B'S CENSUS IS THE PROOF — the pacer was not measuring a rate, it was DECLARING
+// one, and then the witness reported the declaration as though it were a measurement:
+//
+//     [wpace] win=3 pres=311 paced=311 slept=4615ms rate=62.1/s frame_us=16667
+//     [wpace] rollup ... paced=311 slept=4615ms ... -> PACING
+//
+// EVERY present delayed. 4615 ms of a 5009 ms span spent asleep INSIDE the syscall. The remaining
+// ~394 ms carried all 311 frames — 1.27 ms of real work per frame — so the program was idle-by-decree
+// 92% of the time and "62.1/s" was the pacer's ceiling with the program's name on it. `[vugfps] wf=3063`
+// agreed, which is precisely the problem: the meter was honest about a number that was fiction.
+//
+// WHY THE GR22 ARGUMENT DOES NOT SURVIVE. Its two premises are both true and neither one licenses the
+// sleep:
+//
+//  1. "Nothing above the panel rate is ever seen" is a fact about the BEAM, not about the program. It
+//     says the extra composites do not reach an operator's eye. It does not say the kernel should stop
+//     the program from doing work it asked to do — a renderer that wants to run flat out is entitled to,
+//     and on this machine that is exactly how an operator sees the load land across cores.
+//  2. "The spread IS the complaint" was a reading of what Peter wanted, and GR25 corrected the reading.
+//     The complaint was never that the numbers differed; it was that they were not the machine's own.
+//     Clamping the top made every window read the SAME fictional number, which is the failure mode the
+//     complaint now names.
+//
+// WHAT THE PACER PROTECTED — the honest audit, because a sleep is sometimes load-bearing:
+//
+//   * NOT the compositor's serialization. `WCSER` owns one-pass-at-a-time; that lock is correct with or
+//     without a pacer and does not need callers slowed to stay correct.
+//   * NOT a hidden-window runaway. That is PRESSURE-1 (`present_backpressure`), a SEPARATE mechanism on
+//     a SEPARATE path, and it is UNTOUCHED by this arc. A hidden app that never reads `WIN_PRESENT_HIDDEN`
+//     is still capped at ~1000 suppressed presents/s per slot — that cap is a whole-system availability
+//     property and it stays.
+//   * NOT a serial storm. `[wpace]`/`[wcn]` are rollup-paced on their own 5 s claim.
+//
+// It protected CPU cycles from being spent on invisible pixels. That is a POLICY, and the policy is not
+// the kernel's to set by fiat on a machine whose operator has just said otherwise.
+//
+// THE MECHANISM CHOSEN, AND WHY IT IS NEITHER A DROP NOR A REFUSAL. The two replacements on the table
+// were drop/coalesce (newest frame wins) and an EWOULDBLOCK-style non-blocking refusal. BOTH WERE
+// REJECTED, and the reason is the same for both: THE COMPOSITE IS ALREADY THE BACK-PRESSURE. A visible
+// present does real work under `WINDOWS`; the syscall returns when that work is done, so the arrival
+// rate is bounded by what the machine can actually composite — by physics, measured, per boot, with no
+// constant in it. That is the honest mechanism, and it was here all along under the sleep.
+//
+//   * A DROP would make the present return WITHOUT the work, which uncouples the program's rate from the
+//     machine's and lets a 500 fps caller spin the syscall path unboundedly while HIDING the load Peter
+//     asked to see. It also needs a deferred-composite queue to mean "newest frame wins" at all, and
+//     that queue is `pal.rs`'s — outside this lane.
+//   * A REFUSAL is worse on the same axis and GR22 already measured why: a refused client re-enters its
+//     loop and presents again immediately, converting wasted composites into a wasted spin. It frees no
+//     CPU and costs an ABI change.
+//
+// So the default path adds NOTHING. It removes a sleep. `present_pace` is `{}` and the present is the
+// composite plus the return.
+//
+// WHAT THIS EXPOSES, STATED AS A PREDICTION RATHER THAN A CLAIM. With the sleep gone the `WINDOWS` lock
+// is contended by every presenting window instead of ~8% duty-cycled, so the new ceiling is the
+// compositor's serialized throughput, not the panel's frame. That is the RIGHT limiter — it is the
+// machine answering — but it is a NEW regime for `composite_inner`, and the arc that owns that file is
+// the one that gets to act on it. See the r3 census hand-off in `docs/dev/OS/08_VIDEO/engine.md`.
+//
+// THE OPT-IN. `UNAOS_VSYNCPACE=1` arms everything below, unchanged. A per-WINDOW opt-in is the right
+// long-run shape — one program wanting vsync cadence should not require a differently-built kernel — but
+// `SYS_WIN_PRESENT(win)` is a one-argument verb and there is no present-flags seam in `una-abi` to carry
+// the request. The ABI is FROZEN and this arc does not extend it unilaterally: the proposed encoding is
+// designed in the engine.md ledger and implemented by nobody yet. `[wpace] mode=` is already per-window
+// so that when the seam lands the witness needs no shape change.
+//
+// ==================================================================================================
+// GR22's original argument, kept — it is still why the ARMED build sleeps the way it does
+// ==================================================================================================
+//
+// THE DEFECT, stated before the fix. Boots AL/AN/AO, P: "they are not all running the same fps … fall
+// back to their predetermined fps" / "fps still all over". Boot AO's eight vugs ran 55.8–100.5
+// presents/s each, all `parked=0`, `comp == att`, on a panel whose frame is 16667 µs. Two facts follow
+// and they are the whole argument for this code:
+//
+//  1. NOTHING ABOVE THE PANEL RATE IS EVER SEEN. `wm`'s own witness treats 16667 µs as the frame; a
+//     present that lands inside a frame another present already claimed is composited, charged to the
+//     CPU, and then overwritten before the beam reaches it. A vug at 100/s spends ~40% of its render
+//     budget on pixels no operator can observe. That is not a tuning preference, it is waste with a
+//     proof.
+//  2. THE SPREAD *IS* THE COMPLAINT. The 55.8–100.5 scatter is real physics — dispatch latency and
+//     load variance, exactly what the VUG-PACE arc established for the barrier — but it is what reads
+//     to the operator as "all over". Clamping the top removes the scatter's visible half: every vug
+//     with headroom lands on the same number, and the ones genuinely short of a frame's work are the
+//     only ones left below it, which is the honest picture.
+//     ⚠ r3: THIS PREMISE WAS A MISREADING OF THE COMPLAINT. See the r3 block above.
+//
+// WHY THE KERNEL AND NOT THE APP. A per-app fps target is a tuning constant: it has to be guessed, it
+// is wrong on the next panel, and it has to be re-guessed in every program that ever opens a window.
+// The panel's frame interval is not a constant of that kind — it is the machine's physics, known on the
+// side of the seam that owns the panel, and it is the same answer for every client. Putting it here
+// means an unmodified ring-3 program converges to it with zero app changes, which is the test this
+// design had to pass: `user-vug` is not recompiled by this arc.
+//
+// THE SHAPE. `SYS_WIN_PRESENT` (and its banded twin) SLEEPS the caller until the window's next frame
+// boundary, then composites normally. The alternative — refusing the present and returning a
+// `Deferred` status — was rejected on measurement grounds: a client that is refused re-enters its loop
+// and presents again immediately, so a refusal converts wasted composites into a wasted spin and frees
+// no CPU at all. Sleeping is the only shape that hands the cycles back. The caller BLOCKS, so the core
+// is released rather than spun, and this mirrors PRESSURE-1's idiom rather than inventing new
+// machinery: a bounded `sleep_ms` on the syscall path, outside every lock.
+//
+// LATENCY. Worst case one frame — which is what "vsync" means, and is bounded by construction because
+// the deadline can never sit more than one frame ahead (see `pace_advance`). The one case where even
+// that is too much is the frame that answers an operator's input: see [`SLOT_FOCUS_SEQ`], which makes
+// the first present after a focus arrival unpaceable.
+
+/// VSYNC-PACE: the panel's frame interval in microseconds — 60 Hz, the rate every rMBP-class panel the
+/// x86 compositor drives reports and the rate `[wc-h] frame_us=16667` has printed since WC-G.
+///
+/// DUPLICATED, DELIBERATELY, from `video::wcg::FRAME_US`, and this is the one place in the arc where a
+/// constant is copied rather than shared. `video/wcg.rs` is `witness`-gated in its entirety: a
+/// production boot does not compile it, and the pacer must run on a production boot — a pacer that
+/// exists only in witness builds would mean the desktop Peter actually runs is the one configuration
+/// never paced. Hoisting the constant into `video/mod.rs` instead would put a shared-file edit in an
+/// arc whose whole aarch64 contract is that it makes none. So: two copies, cross-referenced in both
+/// directions, both meaning the same physical fact.
+///
+/// NOT A MEASUREMENT. The panel's real mode is not yet queried on x86 (the Kepler takeover publishes
+/// geometry, not timing), so this is the same constant `wcg` already reasons with. When a measured
+/// refresh arrives, this is the single site that consumes it.
+///
+/// ⚠ VSYNC-PACE r3 WIDENED THIS GATE past the pacer's, and it is not an oversight. `[wpace]` prints
+/// `frame_us=` on EVERY line, including on the shipped unpaced build where nothing sleeps — because the
+/// panel's frame is still the fact a reader measures the program's rate AGAINST. "`rate=310.0/s` on a
+/// `frame_us=16667` panel" is the whole r3 finding in one line, and dropping the denominator on exactly
+/// the builds that finding comes from would make it unstatable. So: linked whenever the pacer OR the
+/// witness needs it.
+#[cfg(all(
+    feature = "wc",
+    any(feature = "vsyncpace", feature = "witness")
+))]
+const PANEL_FRAME_US: u64 = 16_667;
+
+/// VSYNC-PACE r3 — THE CLOCK-GRANULARITY ALLOWANCE, and it is a MEASUREMENT of `arch::ms`, not a
+/// tuning knob. Review condition 2.
+///
+/// Every microsecond this pacer reads comes from `crate::arch::ms().saturating_mul(1000)`, so `now`
+/// is truncated to a whole millisecond while the deadline grid is exact to the microsecond. On a
+/// 16667 us frame the grid's offset within the millisecond cycles 667 → 334 → 1 → 668 …, which means
+/// a correctly-paced present routinely observes its own deadline sitting up to 999 us further ahead
+/// than real time actually is. That is not credit, drift, or a runaway; it is the resolution of the
+/// clock, and it is bounded by construction: `present_pace` sleeps `floor(wait_us / 1000)` ms, so
+/// what it leaves unslept is `wait_us mod 1000` ∈ [0, 999].
+///
+/// Both of the pacer's one-frame bounds are therefore stated as `PANEL_FRAME_US + PACE_SLACK_US`:
+/// tighter than that and the clock's own resolution reads as a fault (see `pace_advance`'s clamp and
+/// `present_pace`'s latch, which must agree — a clamp that admits a deadline the latch then refuses
+/// to sleep on would turn over-pacing into NO pacing).
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
+const PACE_SLACK_US: u64 = 1_000;
+
+/// VSYNC-PACE: per-window deadline — `arch::ms() * 1000` of the next frame boundary this window may
+/// present on. `0` is the "no cadence yet" sentinel: a fresh window, a recycled row, and a window whose
+/// slot has just been handed focus all read 0 and present IMMEDIATELY.
+///
+/// Indexed by the GLOBAL window id (the `WINDOWS` row index), not by slot, because pacing is a property
+/// of the surface the panel scans out: two windows owned by one process are two independent streams to
+/// the beam and each is entitled to its own frame slot.
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
+static WIN_PACE_DUE_US: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
+
+/// VSYNC-PACE: the focus generation each window has already honoured — the input-latency escape.
+///
+/// THE REFUTE THIS EXISTS TO SATISFY: *the pacer must never defer the present that carries the first
+/// frame after input focus.* A focus arrival is the one edge where a frame's worth of added latency is
+/// perceptible as sluggishness rather than as smoothness, because it is the frame the operator is
+/// actively waiting for. So [`user_input_set_active`] bumps the arriving slot's [`SLOT_FOCUS_SEQ`], and
+/// the first present from any window whose recorded generation is stale skips the sleep outright and
+/// re-arms the cadence from that instant.
+///
+/// Lock-free by construction, and that is why the generation is per SLOT rather than a sweep of the
+/// window table: `user_input_set_active` runs on the input/click path, and taking `WINDOWS` — the
+/// OUTERMOST compositor lock — from there would invent a lock edge this file does not have.
+///
+/// A hostile slot can call `SYS_WIN_PRESENT` on another slot's id and clobber that window's recorded
+/// generation. The whole effect is one extra un-paced frame, or one missed focus exemption, for a
+/// window it does not own; it cannot stall that window — but NOT for the reason an earlier draft of
+/// this comment gave (review C1). The deadline is NOT written exclusively inside the ownership-checked
+/// block: the focus-exemption branch in `present_pace` STORES 0 to `WIN_PACE_DUE_US[id]` outside any
+/// ownership check, for an id the caller may not own. The stall-immunity property survives because
+/// that store can only CLEAR a cadence, never push a deadline forward — clearing makes the next
+/// present immediate, which is the safe direction. The residual is real and bounded: a hostile slot
+/// can consume one focus exemption belonging to another slot's window, costing that window at most
+/// one frame.
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
+static WIN_PACE_SEQ: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
+
+/// VSYNC-PACE: per-slot focus generation, bumped on every focus ARRIVAL. Starts equal to every window's
+/// recorded generation (both 0), so the exemption fires on a real arrival and never on boot.
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
+static SLOT_FOCUS_SEQ: [AtomicU64; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+
+/// VSYNC-PACE: sleep the caller until window `id`'s next frame boundary, if it has already presented
+/// inside the current one. Called with NO lock held and IF unmasked.
+///
+/// The sleep is `wait_us / 1000` — a FLOOR, and the remainder is deliberately not slept for. The
+/// scheduler's wake granularity is one 1 kHz tick, so a requested sleep lands within a tick ON THE LATE
+/// side; flooring gives that latency somewhere to go and keeps the long-run rate on 60.0 rather than
+/// biasing it down to ~58. A sub-millisecond remainder therefore presents immediately, and the deadline
+/// arithmetic — which is exact in microseconds and never rounded — absorbs the phase.
+///
+/// ⚠ REVIEW CONDITION 2 — WHAT THAT PARAGRAPH LEFT OUT, because it was the whole bug. "The deadline
+/// arithmetic absorbs the phase" was only ever true of `pace_advance`'s two cadence ARMS; its CLAMP
+/// then threw the phase away again, on every frame, by capping the deadline at a millisecond-truncated
+/// `now + PANEL_FRAME_US`. The long-run rate this docstring claims to hold at 60.0 was in fact biased
+/// to ~62.5/s. The clamp now carries [`PACE_SLACK_US`], and with it the claim above is true as
+/// written — see `pace_advance` for the derivation and for the `[wpace]` reading that falsifies it.
+///
+/// BOUNDED, twice over: the deadline can never sit more than one frame plus one clock tick ahead
+/// (`pace_advance`'s clamp), and a reading that exceeds THAT is treated as a stale deadline and NOT
+/// slept on. So the maximum delay this function can impose is one panel frame plus one scheduler
+/// tick, whatever the clock does. Both bounds are `PANEL_FRAME_US + PACE_SLACK_US` and neither may be
+/// narrowed alone.
+///
+/// ⚠ VSYNC-PACE r3 — THIS BODY IS THE OPT-IN ONE. It is compiled only under `feature = "vsyncpace"`
+/// (`UNAOS_VSYNCPACE=1`). The DEFAULT `present_pace` is the empty stub further down, and a present on a
+/// shipped desktop therefore reaches `WINDOWS` with nothing between it and the composite. Everything
+/// above describes the sleeping build; nothing above describes what Peter boots.
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
+fn present_pace(slot: usize, id: usize) {
+    // The focus exemption, first: it must beat every other consideration, including a deadline that is
+    // legitimately in the future. `swap` publishes the generation and reads the old one in one step, so
+    // exactly one present per arrival takes the exemption however many cores race for it.
+    if let Some(seq_slot) = SLOT_FOCUS_SEQ.get(slot) {
+        let seq = seq_slot.load(Ordering::Acquire);
+        if WIN_PACE_SEQ[id].swap(seq, Ordering::Relaxed) != seq {
+            wpace_note_focus();
+            // Clear the deadline too: the cadence restarts from the frame the operator is waiting for,
+            // rather than resuming a phase set before the window had focus.
+            WIN_PACE_DUE_US[id].store(0, Ordering::Relaxed);
+            return;
+        }
+    }
+    let due = WIN_PACE_DUE_US[id].load(Ordering::Relaxed);
+    if due == 0 {
+        return; // no cadence yet — the first present of an episode is never delayed
+    }
+    let now = crate::arch::ms().saturating_mul(1000);
+    if now >= due {
+        return; // the frame boundary has already passed; this present is on time
+    }
+    let wait_us = due - now;
+    if wait_us > PANEL_FRAME_US.saturating_add(PACE_SLACK_US) {
+        // VSYNC-PACE r2 — THE LATCH, and why this arm is now COUNTED rather than silent.
+        //
+        // Boot AQ, `[wpace]`: four of eight windows read `paced=0` on a `frame_us=16667` panel while
+        // presenting at 37.9–78.9/s. A pacer that never sleeps and does not cap a window at the panel
+        // rate is not pacing; the wire said so and nothing read it, because this early return had no
+        // counter. The mechanism is a RUNAWAY, not a stale clock:
+        //
+        //   * `present_pace` deliberately does not sleep a sub-millisecond remainder (`ms == 0`
+        //     below), so a present can land up to 999 us BEFORE its own deadline.
+        //   * `pace_advance` then set `next = prev + PANEL_FRAME_US` unconditionally, measuring the
+        //     next deadline from the deadline we did not actually wait for rather than from now.
+        //   * The deadline therefore gains up to ~1 ms on real time per frame. After ~17 frames
+        //     (~0.3 s) it is a full frame ahead, `wait_us` exceeds `PANEL_FRAME_US`, and this arm
+        //     returns without sleeping — while `pace_advance` keeps pushing the deadline a further
+        //     frame ahead, because `now <= prev + PANEL_FRAME_US` is then trivially true.
+        //
+        // Once closed the latch never opens: the window presents un-paced at whatever rate its render
+        // loop can reach, for the rest of the boot. `pace_advance`'s clamp is the fix; this arm is the
+        // defence that must now be unreachable, and `[wpace] overrun=` is what says whether it is.
+        //
+        // REVIEW CONDITION 2 — the threshold carries [`PACE_SLACK_US`], and it MUST. A correctly
+        // paced client that renders fast presents again within a millisecond or two of its last one,
+        // so it observes `wait_us ≈ FRAME + (due mod 1000)` — up to 999 us over a bare `FRAME`. At
+        // the old threshold that healthy reading tripped this arm, and the window then presented
+        // un-paced. The bound here and `pace_advance`'s clamp are the SAME bound seen from the two
+        // ends; widening one without the other converts over-pacing into no pacing at all.
+        wpace_note_overrun();
+        return; // stale/implausible deadline — never sleep longer than one frame
+    }
+    let ms = wait_us / 1000;
+    if ms == 0 {
+        return; // inside the last millisecond of the frame — the tick cannot resolve it
+    }
+    // `sleep_ms` is a no-op outside a scheduled task, so this cannot hang a caller with no scheduler to
+    // wake it — the same property PRESSURE-1's charge relies on.
+    crate::arch::sched::sleep_ms(ms);
+    wpace_note_paced(id, ms);
+}
+
+/// VSYNC-PACE: move window `id`'s deadline on by one frame. Called from inside the `WINDOWS`-guarded
+/// block, with ownership already proven — see the call sites for why that placement is load-bearing.
+///
+/// CATCH UP, BUT NEVER BURST. If the window is at most one frame late the deadline advances from the
+/// PREVIOUS deadline, which is what keeps the cadence exactly 60.0/s across the ±1 ms the tick-granular
+/// sleep introduces. If it is further behind than that — a genuinely slow frame, a park, a window that
+/// stopped presenting for a second — the deadline resynchronises to NOW. Without the resync a window
+/// returning from a park would find a deadline far in the past and be allowed a burst of un-paced
+/// presents while the cadence walked forward one frame at a time; with it, the first present after the
+/// gap is on time and the second is a frame later.
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
+fn pace_advance(id: usize) {
+    let now = crate::arch::ms().saturating_mul(1000);
+    let prev = WIN_PACE_DUE_US[id].load(Ordering::Relaxed);
+    let next = if prev != 0 && now <= prev.saturating_add(PANEL_FRAME_US) {
+        prev.saturating_add(PANEL_FRAME_US)
+    } else {
+        // `prev == 0` is "no cadence yet" — the window's FIRST present of an episode — and is not a
+        // resynchronisation. Counting it as one would put a floor of 1 under `resync=` for every window
+        // that ever presents, which would blunt exactly the reading the counter exists for: `resync`
+        // climbing means clients are falling behind the panel, and a number that is never zero cannot
+        // say that. Measured, not reasoned: the first `[wpace]` block ever emitted read `resync=1` on a
+        // one-present fixture window, which is what caught this.
+        if prev != 0 {
+            wpace_note_resync();
+        }
+        now.saturating_add(PANEL_FRAME_US)
+    };
+    // VSYNC-PACE r2 — THE CLAMP. The deadline may never sit more than ONE frame ahead of now.
+    //
+    // Without it the cadence is measured from a deadline the caller may not have waited for: the
+    // sub-millisecond remainder in `present_pace` (`ms == 0`) lets a present land up to 999 us early,
+    // and `prev + PANEL_FRAME_US` then banks that remainder as credit. Once the deadline sits more
+    // than a frame ahead, `present_pace`'s `wait_us > PANEL_FRAME_US` guard stops sleeping
+    // ALTOGETHER and the deadline runs away for the rest of the boot.
+    //
+    // ⚠ REVIEW-CORRECTED MECHANISM. An earlier version of this comment said the credit "compounds —
+    // about a millisecond per frame — until after ~17 frames (~0.3 s)". That is NOT what this code
+    // does: the clock is MILLISECOND-GRANULAR (`arch::ms().saturating_mul(1000)`) against a 16667 us
+    // frame, so `due - now_at_present` cycles 667/334/1/668… and does not accumulate. The runaway
+    // arm fires when a window issues its next present WITHIN THE SAME MILLISECOND as an early one —
+    // abrupt and conditional on back-to-back presents, not gradual. And of Boot AQ's four `paced=0`
+    // windows, three (50.9, 37.9, 52.9/s) are BELOW 60/s where `paced=0` is exactly HEADROOM; only
+    // win=3 at 78.9/s was a genuine falsifier. The clamp is right either way — it is the mechanism
+    // story that was wrong, and a wrong story is what a later reader would reason from.
+    //
+    // `min` and not a resync, because the two arms above are still the right cadence source: a LATE
+    // present must keep measuring from `prev` (that is what holds the long-run rate at exactly 60.0
+    // across tick-granular sleeps), and only an EARLY one — the only case that can produce a deadline
+    // ahead of `now + PANEL_FRAME_US` — is capped.
+    //
+    // ⚠ REVIEW CONDITION 2 — THE CAP WAS ONE CLOCK TICK TOO TIGHT, AND IT FIRED EVERY FRAME.
+    //
+    // The old bound was `now + PANEL_FRAME_US` exactly, and the sentence above it claimed the cost was
+    // "at most the 999 us that was not slept, paid once". That is FALSE, and the mechanism is the
+    // review-corrected one two paragraphs up, followed one step further. In healthy steady state:
+    //
+    //   * `present_pace` sleeps `floor(wait_us / 1000)` ms, so the present lands `due mod 1000` us
+    //     EARLY — 667 us on the dominant phase of the 667/334/1 cycle.
+    //   * `now` here is `arch::ms() * 1000`, truncated, so `now < prev` by that same remainder.
+    //   * `next = prev + FRAME` is therefore `now + FRAME + 667`, which is MORE than one frame ahead
+    //     of `now` — so the cap won, on an ordinary correctly-paced early present, EVERY FRAME.
+    //   * Winning re-anchors the grid to the truncated `now`, discarding 667 us of period each time.
+    //     The effective period becomes ~16000 us and the ceiling ~62.5/s on a 60 Hz panel: not a
+    //     once-paid cost but a permanent per-frame bias, and one that reads as a HEALTHY `paced=`.
+    //
+    // The fix keeps the anti-latch protection intact and stops it firing on the healthy path, by
+    // stating the bound at the resolution the clock actually has (see [`PACE_SLACK_US`]): a deadline
+    // may sit one frame plus one clock tick ahead. That admits exactly the remainder `present_pace`
+    // declined to sleep — which cannot accumulate, because `next` advances by one frame while `now`
+    // advances by real time — and still hard-caps the runaway arm, which needs UNBOUNDED growth (two
+    // presents inside one millisecond gain a whole frame each). `present_pace`'s latch is widened by
+    // the same term in the same commit; the two bounds are one bound and must not drift apart.
+    //
+    // AR METAL PREDICTION, fast window, `[wpace] rollup`:
+    //   * `rate 60.0–60.9` with `overrun=0`  → CLEAN. The grid is preserved and the cap is dormant.
+    //   * `rate 61–63` with `overrun=0`      → the clamp is still over-pacing (this bug, unfixed or
+    //                                          under-widened): the cap is winning on the early path.
+    //   * `overrun > 0`                      → LATCHED. The cap failed to bound the deadline and
+    //                                          `present_pace` stopped sleeping; the runaway is back.
+    //   * `paced=0` with `rate > 60`         → unfixed: that window is not being paced at all.
+    let next = next.min(now.saturating_add(PANEL_FRAME_US).saturating_add(PACE_SLACK_US));
+    WIN_PACE_DUE_US[id].store(next, Ordering::Relaxed);
+    // ⚠ VSYNC-PACE r3 — `wpace_note_present` USED TO LIVE HERE AND MUST NOT. It counts PRESENTS, which
+    // happen on every boot; this function is the PACER, which is compiled only under `vsyncpace`. Left
+    // here, the whole `[wpace]` block would go silent on the shipped (unpaced) desktop — and a witness
+    // that speaks only in the regime the arc removed cannot report the regime the arc installed. The
+    // call now sits in the present verbs beside `pace_advance`, under the same ownership proof.
+}
+
+/// VSYNC-PACE: forget window `id`'s cadence. Called when a row is allocated and when it is retired, so a
+/// recycled id never inherits the previous tenant's phase — the same hygiene `clear_input_row` applies
+/// to a recycled input ring.
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
+fn pace_reset(id: usize) {
+    if id < WIN_MAX {
+        WIN_PACE_DUE_US[id].store(0, Ordering::Relaxed);
+        // Review C4: the SEQ must be reset with the deadline. Window ids are recycled, and a new
+        // tenant inheriting the previous one's focus generation would miss (or gain) exactly one
+        // input exemption — a one-frame artefact that would be invisible and unexplainable on the
+        // wire. Clearing both makes a recycled row indistinguishable from a fresh one.
+        WIN_PACE_SEQ[id].store(0, Ordering::Relaxed);
+    }
+}
+
+/// VSYNC-PACE: record that `slot` has just been handed input focus. See [`WIN_PACE_SEQ`] — this is the
+/// whole of the input-latency exemption's producer side, and it is one relaxed increment on a path that
+/// runs at human speed.
+#[cfg(all(feature = "wc", feature = "vsyncpace"))]
+fn pace_focus_arrival(slot: usize) {
+    if let Some(s) = SLOT_FOCUS_SEQ.get(slot) {
+        s.fetch_add(1, Ordering::Release);
+    }
+}
+
+// VSYNC-PACE: the OFF twins — ⚠ AND AS OF r3 THESE ARE THE SHIPPED BODIES, not the exceptional ones.
+// `wc` off (every headless gate, every non-compositor boot) OR `vsyncpace` unset (every desktop boot
+// Peter runs, unless he arms it) and not one byte of the pacer is linked — the present path is the
+// pre-GR22 path exactly: a present is the composite and the return, which is what
+// keeps the fixture batteries, whose ring-3 witnesses present in tight bounded loops, unperturbed.
+#[cfg(not(all(feature = "wc", feature = "vsyncpace")))]
+#[inline(always)]
+fn present_pace(_slot: usize, _id: usize) {}
+#[cfg(not(all(feature = "wc", feature = "vsyncpace")))]
+#[inline(always)]
+fn pace_advance(_id: usize) {}
+#[cfg(not(all(feature = "wc", feature = "vsyncpace")))]
+#[inline(always)]
+fn pace_reset(_id: usize) {}
+#[cfg(not(all(feature = "wc", feature = "vsyncpace")))]
+#[inline(always)]
+fn pace_focus_arrival(_slot: usize) {}
+
+// ---- VSYNC-PACE — `[wpace]`, the pacer's witness -------------------------------------------------
+//
+// A pacer that acts silently is unfalsifiable: "the fps converged" and "the vugs happened to slow down"
+// produce the same `[wcn]` line. `[wpace]` separates them by reporting the pacer's OWN actions —
+// how many presents it delayed, for how long, how many it exempted for focus, and how many times the
+// cadence had to resynchronise because the client could not keep up.
+//
+// SHAPE AND CADENCE are `[wcn]`'s, deliberately, so the two blocks can be read against each other in one
+// slice of the log: a fixed 5 s period, one compare-exchange claim per period, per-window lines for rows
+// with traffic plus one aggregate, and DIRTY-PACED — a period in which nothing presented prints nothing
+// at all, so an idle desktop stays silent.
+//
+// `witness`-gated, like every other window witness in the tree. The consequence, stated plainly: a
+// production (non-witness) boot paces silently. That is the house rule the whole `[wc-*]`/`[wcn]` family
+// already follows, and every metal boot in this round's captures is a witness build.
+//
+// HOW TO FALSIFY THE ARC FROM ONE BLOCK:
+//   * `paced=0` on every window while `[wcn] rate=` sits above 60/s — the pacer is not firing, and the
+//     convergence (if any) is somebody else's;
+//   * `slept_ms` summing to far less than `paced * 16` — the sleeps are being cut short (the tick is
+//     uncalibrated, or `sleep_ms` returned early);
+//   * `resync=` climbing with `paced=` near zero — the fleet is BELOW the panel rate and the pacer is a
+//     no-op, which is the correct behaviour for a loaded machine and must not be read as convergence;
+//   * `focus=0` across a session with focus changes — the input-latency exemption is dead code;
+//   * `overrun>0` (verdict `LATCHED`) — a deadline sat more than one frame (plus the clock tick
+//     `PACE_SLACK_US` allows) ahead of now, which `pace_advance`'s clamp makes impossible; the pacer
+//     has disabled itself for that window.
+//   * `rate` above ~61/s with `overrun=0` — the opposite failure, and the one review condition 2
+//     fixed: the clamp firing on every healthy early present, re-anchoring the grid to a truncated
+//     millisecond and biasing the ceiling to ~62.5/s. `60.0-60.9` is the clean reading.
+//
+// VSYNC-PACE r2 — THE FIRST OF THOSE FIRED AND WAS NOT READ. Boot AQ printed `paced=0` for windows
+// presenting at 37.9-78.9/s on a 16667 us panel, which is line one of this list verbatim. The cause was
+// the deadline runaway `pace_advance`'s clamp now closes; `overrun=` is the counter that would have
+// named it in one line, and its absence is why the block read as merely unimpressive rather than broken.
+
+/// VSYNC-PACE: the `[wpace]` rollup period, in ms. `[wcn]`'s, so the blocks interleave.
+#[cfg(all(feature = "wc", feature = "witness"))]
+const WPACE_ROLLUP_MS: u64 = 5000;
+
+/// VSYNC-PACE r3: which REGIME this kernel presents under, printed on every per-window line as `mode=`.
+///
+/// WHY IT IS ON THE WIRE AT ALL. Every `[wpace]` figure in the archive was taken under a pacer, and every
+/// one taken from here on will not be. A rate of 62/s means "the pacer's ceiling" in one regime and "the
+/// machine's answer" in the other, and NOTHING ELSE IN THE LINE DISTINGUISHES THEM — `paced=0 slept=0ms`
+/// reads identically on a free boot and on a paced boot whose fleet was slow (the old `HEADROOM`). A
+/// reader six months from now comparing two captures would have no way to tell which question each was
+/// answering. `mode=` is that way, and it costs six bytes a line.
+///
+/// PER-WINDOW PLACEMENT, ON PURPOSE, THOUGH IT IS A GLOBAL TODAY. The opt-in this arc could not build is
+/// per-WINDOW (see the r3 block above: `SYS_WIN_PRESENT` has no flags argument and `una-abi` is frozen).
+/// When that seam lands, `mode=` becomes a per-row fact and the line shape does not change — the log
+/// format is forward-compatible with the design rather than needing a second migration.
+#[cfg(all(feature = "wc", feature = "witness", feature = "vsyncpace"))]
+const WPACE_MODE: &str = "vsync";
+#[cfg(all(feature = "wc", feature = "witness", not(feature = "vsyncpace")))]
+const WPACE_MODE: &str = "free";
+
+/// VSYNC-PACE r3: true when NO pacing code is linked — the shipped regime. Drives the `FREE` verdict and,
+/// more importantly, the `FORBID` one: on this build `wpace_note_paced` does not exist, so `paced`/`slept`
+/// summing to anything but zero is a contradiction the block must name rather than average away. See the
+/// verdict ladder in [`wpace_emit`].
+#[cfg(all(feature = "wc", feature = "witness"))]
+const WPACE_FREE: bool = !cfg!(feature = "vsyncpace");
+
+/// VSYNC-PACE: per-window `[wpace]` accumulators — presents seen, presents delayed, ms slept.
+#[cfg(all(feature = "wc", feature = "witness"))]
+static WPACE_PRES: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
+#[cfg(all(feature = "wc", feature = "witness"))]
+static WPACE_PACED: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
+#[cfg(all(feature = "wc", feature = "witness"))]
+static WPACE_SLEPT_MS: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
+/// VSYNC-PACE: aggregate-only — focus exemptions taken, and cadence resynchronisations.
+#[cfg(all(feature = "wc", feature = "witness"))]
+static WPACE_FOCUS: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "wc", feature = "witness"))]
+static WPACE_RESYNC: AtomicU64 = AtomicU64::new(0);
+/// VSYNC-PACE r2: aggregate-only — presents that found a deadline more than one frame PLUS ONE CLOCK
+/// TICK ahead ([`PACE_SLACK_US`]; review condition 2 widened this arm and `pace_advance`'s clamp by
+/// the same term, and they must stay equal) and therefore refused to sleep. With that clamp in place
+/// this is unreachable by construction, so any non-zero reading is a live defect and not a slow
+/// machine: it means something wrote `WIN_PACE_DUE_US` past `now + PANEL_FRAME_US + PACE_SLACK_US`,
+/// which is the runaway that made Boot AQ's fastest windows read `paced=0`. Zero is the pass
+/// condition, and it is one half of a pair: `overrun=0` with `rate` above ~61 means the clamp is
+/// over-pacing rather than latching. See `pace_advance` for the full AR prediction table.
+#[cfg(all(feature = "wc", feature = "witness"))]
+static WPACE_OVERRUN: AtomicU64 = AtomicU64::new(0);
+/// VSYNC-PACE: `arch::ms()` at the last rollup, and the emit CLAIM.
+#[cfg(all(feature = "wc", feature = "witness"))]
+static WPACE_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(feature = "wc", feature = "witness"))]
+fn wpace_note_present(id: usize) {
+    WPACE_PRES[id].fetch_add(1, Ordering::Relaxed);
+}
+#[cfg(all(feature = "wc", feature = "vsyncpace", feature = "witness"))]
+fn wpace_note_paced(id: usize, ms: u64) {
+    WPACE_PACED[id].fetch_add(1, Ordering::Relaxed);
+    WPACE_SLEPT_MS[id].fetch_add(ms, Ordering::Relaxed);
+}
+#[cfg(all(feature = "wc", feature = "vsyncpace", feature = "witness"))]
+fn wpace_note_focus() {
+    WPACE_FOCUS.fetch_add(1, Ordering::Relaxed);
+}
+#[cfg(all(feature = "wc", feature = "vsyncpace", feature = "witness"))]
+fn wpace_note_resync() {
+    WPACE_RESYNC.fetch_add(1, Ordering::Relaxed);
+}
+#[cfg(all(feature = "wc", feature = "vsyncpace", feature = "witness"))]
+fn wpace_note_overrun() {
+    WPACE_OVERRUN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// VSYNC-PACE: the dirty-paced tick, called at the tail of every accepted present. A loser of the claim
+/// does not retry — the winner is emitting the same evidence.
+#[cfg(all(feature = "wc", feature = "witness"))]
+fn wpace_tick() {
+    let now = crate::arch::ms();
+    let last = WPACE_LAST_MS.load(Ordering::Relaxed);
+    let span = now.wrapping_sub(last);
+    if span < WPACE_ROLLUP_MS {
+        return;
+    }
+    if WPACE_LAST_MS
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    wpace_emit(span);
+}
+
+/// VSYNC-PACE: drain the accumulators and print. Counters are drained with `swap` so a present landing
+/// on another core mid-emit is carried into the NEXT window rather than lost — `[wcn]`'s rule, and what
+/// makes the per-window totals summable across a whole boot.
+///
+/// RUNS WITH NO LOCK HELD AND IF UNMASKED, and that placement is deliberate rather than incidental.
+/// [`wpace_tick`] is called from the present verbs AFTER the `WINDOWS`-guarded block has closed, not from
+/// `pace_advance` (which runs inside it): a 13-line serial burst under the OUTERMOST compositor lock with
+/// interrupts masked would park every window on the machine behind a UART at 115200 baud, which is the
+/// same failure PRESSURE-1's charge was moved out of the guard to avoid. The emit needs no table state —
+/// the accumulators are indexed by window id already — so there is nothing to pay for the hoist with.
+///
+/// ⚠ VSYNC-PACE r3 — THIS BLOCK SPEAKS ON BOTH REGIMES, and that is the point of widening its gate from
+/// the pacer's to the witness's. On the shipped (unpaced) desktop `paced`/`slept`/`focus`/`resync`/
+/// `overrun` are zero BY CONSTRUCTION — the code that increments them is not linked — so what remains is
+/// `pres` and `rate`, which is now the PROGRAM's rate rather than the pacer's ceiling. That is the number
+/// Peter asked for, and the block exists to put it on the wire.
+#[cfg(all(feature = "wc", feature = "witness"))]
+fn wpace_emit(span: u64) {
+    let mut t_pres = 0u64;
+    let mut t_paced = 0u64;
+    let mut t_slept = 0u64;
+    let mut rows: [(usize, u64, u64, u64); WIN_MAX] = [(0, 0, 0, 0); WIN_MAX];
+    let mut n = 0usize;
+    for i in 0..WIN_MAX {
+        let pres = WPACE_PRES[i].swap(0, Ordering::Relaxed);
+        let paced = WPACE_PACED[i].swap(0, Ordering::Relaxed);
+        let slept = WPACE_SLEPT_MS[i].swap(0, Ordering::Relaxed);
+        t_pres += pres;
+        t_paced += paced;
+        t_slept += slept;
+        if pres != 0 {
+            rows[n] = (i, pres, paced, slept);
+            n += 1;
+        }
+    }
+    let focus = WPACE_FOCUS.swap(0, Ordering::Relaxed);
+    let resync = WPACE_RESYNC.swap(0, Ordering::Relaxed);
+    let overrun = WPACE_OVERRUN.swap(0, Ordering::Relaxed);
+    if t_pres == 0 {
+        return; // dirty-paced: a period with no present traffic prints nothing at all
+    }
+    for &(i, pres, paced, slept) in rows.iter().take(n) {
+        // Tenths, for `[wcn]`'s reason: an integer /s truncates every honest sub-1 Hz rate to 0.
+        let rate = pres.saturating_mul(10_000) / span.max(1);
+        serial_println!(
+            "[wpace] win={} pres={} mode={} paced={} slept={}ms rate={}.{}/s frame_us={}",
+            i,
+            pres,
+            WPACE_MODE,
+            paced,
+            slept,
+            rate / 10,
+            rate % 10,
+            PANEL_FRAME_US
+        );
+    }
+    // The verdict names what the block PROVES, not what the arc hoped for. PACING: the pacer is delaying
+    // real presents. HEADROOM: presents are arriving but none needed delaying — the fleet is at or under
+    // the panel rate on its own, which is a correct outcome and NOT evidence the pacer works.
+    // VSYNC-PACE r2 — LATCHED outranks both. A period in which any present found its own deadline more
+    // than a frame ahead is a period in which the pacer disabled itself for that window, and reporting
+    // that as PACING (some other window slept) or HEADROOM (the fleet is slow) would bury the one fact
+    // that matters. Zero is the pass condition; see `WPACE_OVERRUN`.
+    //
+    // VSYNC-PACE r3 — TWO NEW VERDICTS, AND FORBID OUTRANKS EVERYTHING.
+    //
+    //   * FREE     — the shipped regime: `mode=free` and nothing was delayed. This is the PASS reading on
+    //                an unpaced boot, and it is deliberately NOT spelled `HEADROOM`. `HEADROOM` is a
+    //                statement about a fleet that was under the panel rate WITH A PACER WATCHING; `FREE`
+    //                is a statement that no pacer exists. Reading a `mode=free` period as `HEADROOM`
+    //                would let the whole regime change hide inside a verdict the archive already carries.
+    //   * FORBID   — `mode=free` with a NON-ZERO `paced` or `slept`. Unreachable by construction: on this
+    //                build `wpace_note_paced` is not linked, so nothing can increment either counter.
+    //                A non-zero reading therefore means the counters are being written by something that
+    //                is not the pacer, or that a `vsyncpace` build is mislabelling itself as free — either
+    //                way a live defect, and this is the FORBID-shape a reader greps for. Zero is the pass
+    //                condition, exactly as `overrun=0` is on the armed build.
+    let verdict = if WPACE_FREE && (t_paced > 0 || t_slept > 0) {
+        "FORBID"
+    } else if overrun > 0 {
+        "LATCHED"
+    } else if t_paced > 0 {
+        "PACING"
+    } else if WPACE_FREE {
+        "FREE"
+    } else {
+        "HEADROOM"
+    };
+    let arate = t_pres.saturating_mul(10_000) / span.max(1);
+    serial_println!(
+        "[wpace] rollup wins={} pres={} paced={} slept={}ms focus={} resync={} overrun={} rate={}.{}/s span={}ms -> {}",
+        n,
+        t_pres,
+        t_paced,
+        t_slept,
+        focus,
+        resync,
+        overrun,
+        arate / 10,
+        arate % 10,
+        span,
+        verdict
+    );
+}
+
+// VSYNC-PACE: the witness's OFF twins. TWO different gates, and the difference is not cosmetic — it is
+// what keeps the cfg-gated coverage legs warning-free, which is the only reason a dead stub would ever
+// be noticed. The FOUR `wpace_note_paced`/`_focus`/`_resync`/`_overrun` calls live inside the PACER's
+// bodies, so their stubs are needed on exactly one configuration: pacer ON, witness OFF. Giving them the
+// broad gate below would compile four uncallable functions on every `wc`-off leg and earn four
+// `never used` warnings per leg.
+//
+// ⚠ VSYNC-PACE r3 MOVED TWO FUNCTIONS ACROSS THIS LINE, and the move is the whole reason `[wpace]` still
+// speaks on a shipped boot. `wpace_tick` was already broad-gated because it is called from the present
+// verbs, which compile unconditionally. `wpace_note_present` NOW IS TOO, for the identical reason: r3
+// moved its call site out of `pace_advance` (pacer-gated) and into the verbs (unconditional). Both stubs
+// therefore key on the WITNESS gate alone — `not(all(wc, witness))` — and not on the pacer's. Keying
+// either of them on `vsyncpace` would compile a real body and a stub for the same configuration, or
+// neither, depending on which way the arm fell; the pacer's presence is no longer relevant to whether a
+// present is COUNTED.
+#[cfg(all(feature = "wc", feature = "vsyncpace", not(feature = "witness")))]
+#[inline(always)]
+fn wpace_note_paced(_id: usize, _ms: u64) {}
+#[cfg(all(feature = "wc", feature = "vsyncpace", not(feature = "witness")))]
+#[inline(always)]
+fn wpace_note_focus() {}
+#[cfg(all(feature = "wc", feature = "vsyncpace", not(feature = "witness")))]
+#[inline(always)]
+fn wpace_note_resync() {}
+#[cfg(all(feature = "wc", feature = "vsyncpace", not(feature = "witness")))]
+#[inline(always)]
+fn wpace_note_overrun() {}
+#[cfg(not(all(feature = "wc", feature = "witness")))]
+#[inline(always)]
+fn wpace_note_present(_id: usize) {}
+#[cfg(not(all(feature = "wc", feature = "witness")))]
+#[inline(always)]
+fn wpace_tick() {}
+
+/// FBCON-DMG: `SYS_WIN_PRESENT_ROWS(win, y0, y1)` -> 0, or a negative errno. The DAMAGE-CARRYING present:
+/// composite the caller's window declaring only SOURCE rows `[y0, y1)` of its own surface changed. Rows
+/// are the SURFACE's, not the panel's, and the half-open interval is the C convention `y1 == y0 + count`.
+///
+/// ADDITIVE, at its own number (33). `SYS_WIN_PRESENT(30)` is untouched on both arches and keeps its exact
+/// one-argument shape — see the number's declaration for why widening 30 in place could not be made safe.
+///
+/// GATING IS `sys_win_present`'S, VERBATIM, AND IN THE SAME ORDER: `win_caller_slot()` first, then
+/// `-EBADF` on an out-of-range id, `-EBADF` on a free row, `-EACCES` on another process's live window. A
+/// damage hint is not a weaker capability than a present, so it does not get a weaker check.
+///
+/// A BAD RANGE IS `-EINVAL`, NOT A SILENT WHOLE-BOX. `y1 <= y0` (empty or inverted) and `y1` past the
+/// window's surface height `h` are both refused outright. `video::wm::present_rows` does degrade such a
+/// band to the whole box internally, and that degrade is the right behaviour for the KERNEL callers it was
+/// written for — it is fail-safe, never fail-silent, in the sense that no pixel is left stale. But at the
+/// ABI it would be fail-SILENT in the sense that matters here: a ring-3 program with an off-by-one in its
+/// damage arithmetic would repaint correctly, at full cost, forever, and the syscall would answer `0` every
+/// time. The bug would be invisible in exactly the place the verb exists to make visible. Refusing tells
+/// the caller its arithmetic is wrong on the first frame, and the mandatory whole-box fallback every client
+/// carries for the `-ENOSYS` case (older kernel / aarch64) catches this one too — so an explicit error
+/// costs a correct picture nothing and buys a debuggable one. `y0` needs no separate bound: `y0 < y1 <= h`.
+///
+/// LOCK SPAN and LOCK ORDER are `sys_win_present`'s, and WCPAR shrank both verbs the same way: the
+/// ownership check, the band range check and the id snapshot run under `WINDOWS` (still the OUTERMOST
+/// lock, `video::wm`'s state still acquired only after it), then the lock is RELEASED and the composite
+/// runs outside it under the `owner` recycled-id fence. See `sys_win_present`'s LOCK SPAN note.
+fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
+    let slot = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if win >= WIN_MAX as u64 {
+        return EBADF;
+    }
+    let id = win as usize;
+    // VSYNC-PACE: same placement and the same reason as the whole-box verb — before the lock, because it
+    // can sleep. A banded present is a present: an app that switched to damage bands must not thereby
+    // escape the panel's cadence, or the pacer would be trivially opted out of by every optimised client.
+    present_pace(slot, id);
+    // PRESSURE-1: the lock span ends here and the charge is applied outside it, for `sys_win_present`'s
+    // reason — the back-pressure can sleep, and sleeping under the outermost compositor lock with IF
+    // masked would park every other window on the machine behind this one.
+    let (outcome, wm_id) = {
+        let _irq = IrqGuard::mask_save();
+        // WCPAR — the window table is held ONLY for the ownership proof, the band range check, the
+        // snapshot and the pace/count bookkeeping; it is released before the composite. Same recycled-id
+        // fence as `sys_win_present` — the `+1`-biased slot re-checked inside the compositor's table.
+        let wm_id;
+        {
+            let t = WINDOWS.lock();
+            // R0 / rtwit — WINDOWS max-hold on the BANDED present path, measuring WCPAR's shrunk hold
+            // (see `sys_win_present`). Declared after the guard so it drops first; no-op shim when off.
+            let _wh = crate::rtwit::hold(crate::rtwit::Lock::Windows);
+            if t[id].owner == WIN_OWNER_FREE {
+                return EBADF;
+            }
+            if t[id].owner != slot {
+                return EACCES;
+            }
+            // The range check runs against THIS row's surface height, read under the same hold that
+            // validated the ownership — so the `h` the band is judged against is provably the `h` of the
+            // window being presented.
+            if y1 <= y0 || y1 > t[id].h as u64 {
+                return EINVAL;
+            }
+            wm_id = t[id].wm_id;
+            // The same counter the whole-box verb bumps: this IS a present that reached the compositor,
+            // and the headless witness must not go blind on a window that switched to banded presents.
+            FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+            // VSYNC-PACE r3: the `[wpace]` present count, for `sys_win_present`'s reason — a banded
+            // present is a present, and the witness must not go blind on a client that switched to
+            // damage bands.
+            wpace_note_present(id);
+            // VSYNC-PACE: and the same deadline, advanced under the same proof of ownership. The band is
+            // deliberately NOT a discount — the panel scans the whole frame either way, so a banded
+            // present consumes exactly one frame slot, as a whole-box one does.
+            pace_advance(id);
+        } // `_wh` drops (before `t`), then WINDOWS released.
+        (wc_shim::present_rows(wm_id, y0 as usize, y1 as usize, (slot as u64) + 1), wm_id)
+    };
+    // VSYNC-PACE: as the whole-box verb, and outside the guard for the same reason.
+    wpace_tick();
+    // CLOSE-TEARDOWN — same terminal answer as `sys_win_present`, same headless carve-out: a banded
+    // present against a reaped/recycled row is `-EBADF`, so a client that switched to damage bands
+    // learns its window died exactly as a whole-box client does.
+    if outcome == crate::video::wm::Presented::NoRow && wm_id != crate::video::wm::WIN_NONE {
+        return EBADF;
+    }
+    present_backpressure(slot, outcome)
 }
 
 /// WINX-1: total `SYS_WIN_PRESENT` calls that reached the compositor — the headless witness's proof that
@@ -3397,6 +4703,8 @@ pub fn win_close_slot(s: usize) {
             if t[i].owner == s {
                 doomed[i] = t[i].wm_id;
                 t[i] = WinEntry::FREE;
+                // VSYNC-PACE: retire the cadence with the row — a recycled id must not inherit a phase.
+                pace_reset(i);
             }
         }
     }
@@ -3420,7 +4728,7 @@ mod wc_shim {
     /// concerned (its surface is mapped and its own), it simply has no compositor row, so presents are
     /// accounted and dropped. That is the fail-closed direction — nothing extra is exposed to ring 3 — and
     /// it keeps a headless run (no panel, `wm` never ready) from failing a program that only draws.
-    /// CLICK-X86: `owner` is the `+1`-BIASED slot (`slot + 1`), matching `EL0_INPUT_ACTIVE`, so that
+    /// CLICK-X86: `owner` is the `+1`-BIASED slot (`slot + 1`), matching `USER_INPUT_ACTIVE`, so that
     /// `wm::hit_test`'s answer is directly comparable with the input focus and slot 0's windows are
     /// not mistaken for wm's ownerless rows.
     pub fn create(
@@ -3436,11 +4744,36 @@ mod wc_shim {
         wm::create(owner, surf, surf_len, w, h, stride, &title)
     }
 
-    /// `video::wm::present` — damage-mark and run the compositor pass. Called with `WINDOWS` held.
-    pub fn present(id: WinId) {
-        if id != WIN_NONE {
-            wm::present(id);
+    /// `video::wm::present` — damage-mark and run the compositor pass.
+    ///
+    /// WCPAR — called with `WINDOWS` RELEASED (was: held across the whole composite). `owner` is the
+    /// presenting slot's wm owner id (`slot + 1`, the same `+1`-biased value [`create`] passed as the
+    /// wm `owner`), captured under the window table lock the caller has already dropped; the compositor
+    /// re-checks it against the resolved row's `owner_asid` before compositing, so a `close`+`create`
+    /// that recycled `id` in the gap is declined rather than composited under a new owner. See
+    /// `sys_win_present`'s lock-span note and `wm::present_banded`'s `expect_owner`.
+    ///
+    /// PRESSURE-1: reports wm's OUTCOME rather than nothing, because the syscall layer above has to
+    /// charge for a declined present. `WIN_NONE` — the compositor refused this window a row, which a
+    /// headless run does for every window — is `NoRow`, never `Suppressed`: it is not back-pressure,
+    /// and charging for it would throttle every app on a machine with no panel.
+    pub fn present(id: WinId, owner: u64) -> wm::Presented {
+        if id == WIN_NONE {
+            return wm::Presented::NoRow;
         }
+        wm::present_outcome_owned(id, owner)
+    }
+
+    /// FBCON-DMG: `video::wm::present_rows` — the same pass, damage-marking only SOURCE rows
+    /// `[sy0, sy1)`. WCPAR: called with `WINDOWS` RELEASED and carrying the same `owner` fence as
+    /// [`present`]. The band has already been validated against this row's surface height by
+    /// `sys_win_present_rows`, so wm's own whole-box degrade is unreachable from the syscall path — it
+    /// stays as wm's contract with its other callers.
+    pub fn present_rows(id: WinId, sy0: usize, sy1: usize, owner: u64) -> wm::Presented {
+        if id == WIN_NONE {
+            return wm::Presented::NoRow;
+        }
+        wm::present_rows_outcome_owned(id, sy0, sy1, owner)
     }
 
     /// `video::wm::close`. Runs a drain barrier, so every caller invokes it with `WINDOWS` RELEASED.
@@ -3460,7 +4793,7 @@ mod wc_shim {
 //
 // SHAPE. The kernel holds a small per-SLOT ring of packed events. The router — the shell's own event
 // drain, which is the single place every HID event on this arch passes through — offers each drained
-// event to `el0_input_route`, which forwards it into the FOCUSED process's ring or hands it back for
+// event to `user_input_route`, which forwards it into the FOCUSED process's ring or hands it back for
 // the shell to consume. Ring 3 drains its own ring nonblocking through `SYS_INPUT_POLL`. One producer
 // (the single router drain) and one consumer (the owning ring-3 task) per ring, so the ring is a
 // lock-free SPSC: free-running head/tail, occupancy = `tail - head`.
@@ -3483,11 +4816,11 @@ mod wc_shim {
 
 /// WINX-7 packed-event type tags (bits [55:48] of the packed u64). Shared with aarch64 by law, so one
 /// arch-neutral ring-3 program decodes the same wire form on both.
-const INPUT_EV_KEY_DOWN: u64 = 1; // a key PRESS   (payload[7:0] = ASCII / the C0 arrow codes)
-const INPUT_EV_KEY_UP: u64 = 2; // a key RELEASE (payload[7:0] = same)
-const INPUT_EV_MOUSE_REL: u64 = 3; // relative pointer motion  (payload[31:16] = dx, [15:0] = dy, i16)
-const INPUT_EV_MOUSE_ABS: u64 = 4; // absolute pointer position(payload[31:16] = x,  [15:0] = y,  i16)
-const INPUT_EV_BUTTON: u64 = 5; // a pointer button state    (payload[7:0] = button bitmask)
+use una_abi::INPUT_EV_KEY_DOWN; // a key PRESS   (payload[7:0] = ASCII / the C0 arrow codes)
+use una_abi::INPUT_EV_KEY_UP; // a key RELEASE (payload[7:0] = same)
+use una_abi::INPUT_EV_MOUSE_REL; // relative pointer motion  (payload[31:16] = dx, [15:0] = dy, i16)
+use una_abi::INPUT_EV_MOUSE_ABS; // absolute pointer position(payload[31:16] = x,  [15:0] = y,  i16)
+use una_abi::INPUT_EV_BUTTON; // a pointer button state    (payload[7:0] = button bitmask)
 
 /// Per-process input ring capacity. A power of two, because occupancy is `tail.wrapping_sub(head)`
 /// and the slot index is `& (CAP - 1)`.
@@ -3495,14 +4828,143 @@ const INPUT_RING_CAP: usize = 32;
 
 /// The per-process input rings, keyed by address-space SLOT. One producer (the router) + one consumer
 /// (the owning ring-3 task) per ring => lock-free SPSC.
-static EL0_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; crate::arch::memory::USER_SLOTS] =
+static USER_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; crate::arch::memory::USER_SLOTS] =
     [const { [const { AtomicU64::new(0) }; INPUT_RING_CAP] }; crate::arch::memory::USER_SLOTS];
 /// Consumer index (free-running; advanced by `sys_input_poll`). Real slot = `head & (CAP - 1)`.
-static EL0_INPUT_HEAD: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+static USER_INPUT_HEAD: [AtomicU32; crate::arch::memory::USER_SLOTS] =
     [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
-/// Producer index (free-running; advanced by `el0_input_push`). Occupancy = `tail - head`.
-static EL0_INPUT_TAIL: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+/// Producer index (free-running; advanced by `user_input_push`). Occupancy = `tail - head`.
+static USER_INPUT_TAIL: [AtomicU32; crate::arch::memory::USER_SLOTS] =
     [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+
+/// VUGPAUSE-2/x86: per-slot "this slot has a task parked in [`sys_input_wait`]" flag. Set immediately
+/// before the futex park, cleared immediately after it returns — and ALSO cleared on slot teardown by
+/// [`clear_input_parked`], because the park is a kill boundary the task can `exit()` out of
+/// (`sched::futex_wait`'s pre-park `task_kill_armed` refusal, and `kill_wake_parked`'s eviction of an
+/// already-parked one), so the clear on the normal path is not sufficient on its own.
+///
+/// **WHO MAY CLEAR THIS, and why the question is load-bearing.** The flag is a gate, not a hint:
+/// [`user_input_wake_edge`] returns early on a clear flag, so EVERY wake edge is gated on it. The
+/// aarch64 seat spent a bench session (P72) discovering that `clear_input_row` — which
+/// [`user_input_set_active`] calls on a focus ARRIVAL, i.e. exactly when a parked background app is
+/// being handed the keyboard — wiped the flag microseconds before the arrival's own wake read it. The
+/// arrival woke nobody, the unhide woke nobody, the press woke nobody, and the app was parked on a key
+/// nothing would ever name again: "once a vug goes into the background it is stopped and cannot be
+/// restarted". That defect is designed out here rather than reproduced: the invariant is SET by the
+/// parker before parking; CLEARED by the parker on return, or by slot teardown, and by nothing else.
+/// A stale-SET flag costs one wasted `futex_wake` per backstop period on a key with no waiters; a
+/// stale-CLEAR flag costs a task that never runs again. The two are traded in that direction on
+/// purpose, and [`user_input_wake_backstop`] does not consult it at all.
+static USER_INPUT_PARKED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+
+/// VUGPAUSE-2/x86: how many times a task has PARKED in [`sys_input_wait`], and how many waiters the
+/// wake seam has released. Cumulative for the boot; they drive the `[vugpause2]` witness and should
+/// track each other — a `blocked` that climbs while `wakes` stalls is an app going to sleep and not
+/// being woken, which is the exact failure this mechanism has to be able to report on itself.
+static USER_INPUT_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static USER_INPUT_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// VUGPAUSE-2/x86: per-slot count of NAMED-EDGE resumes (`focus` / `unhide`) this slot has taken.
+/// Exists only to pace [`user_input_wake_edge`]'s print on a power-of-two cadence. Per-slot rather
+/// than global because the question the line answers ("did THIS app resume, or is it stranded?") is
+/// per-slot: a global cadence would let a busy app's traffic silence a newly launched one's first
+/// resume. Cleared on teardown beside the park flag — the count paces a witness across one tenancy.
+static USER_INPUT_RESUMES: [AtomicU64; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+
+/// VUGPAUSE-2/x86: the synthetic futex key for `slot`'s input ring.
+///
+/// `sched::futex_key` builds a user key as `((slot + 1) << 56) | (uaddr & 0x00FF_FFFF_FFFF_FFFF)`,
+/// and `USER_SLOTS` is 12, so the tag byte a ring-3 program's key can carry is 1..=12 and bit 63 is
+/// free forever. Setting it puts every input key in a space no user word can name — which matters
+/// more than it looks, because the futex buckets are SHARED: a program that could forge an input key
+/// could wake (or, worse, park on) another process's ring. It cannot reach this space at all.
+///
+/// Non-zero by construction, which `futex_wait`/`futex_wake` both `debug_assert!`.
+#[inline]
+fn input_futex_key(slot: usize) -> u64 {
+    const _: () = assert!(
+        crate::arch::memory::USER_SLOTS < 128,
+        "input futex keys claim bit 63; a slot tag that reaches it would collide with a user key"
+    );
+    (1u64 << 63) | ((slot as u64) + 1)
+}
+
+/// VUGPAUSE-2/x86 WAKE SEAM: release every task parked in [`sys_input_wait`] on `slot`'s ring.
+/// Returns how many were woken (0 is the overwhelmingly common case — nobody is parked).
+///
+/// Called from THREE edges, and all three are needed for a blocked app to be as responsive as a
+/// polling one was:
+///   * [`user_input_push`] — the event itself. The latency-critical one: the router publishes TAIL and
+///     then wakes, so a keypress arriving while an app is idle re-readies it in the same pass the
+///     router runs in, not a poll period later.
+///   * [`user_input_set_active`] — a focus ARRIVAL. Focus does not enqueue anything (it RESETS the
+///     ring), so without this an app parked on an empty ring would sleep through being handed the
+///     keyboard.
+///   * [`set_hidden`]`(asid, false)` — an UNHIDE. The hidden bit lives in the info page, not in the
+///     ring, so nothing about becoming visible again touches TAIL. This is the edge that makes the
+///     VUGMIN idle exit-able, and it is ordered AFTER the info-page publish so a woken app's first
+///     read of the flags word already shows it visible.
+fn user_input_wake(slot: usize) -> usize {
+    user_input_wake_edge(slot, "")
+}
+
+/// VUGPAUSE-2/x86: [`user_input_wake`] with the EDGE named, for the wire.
+///
+/// A non-empty `edge` asks for a `[vugpause2] resume` line when this call actually releases someone.
+/// Only the two OPERATOR-RATE edges pass one — focus arrival and unhide, the pair that resumes a
+/// backgrounded app. The router's per-event push passes `""` and stays silent: it fires at
+/// mouse-motion rate and a line per event would be a flood.
+///
+/// The print is on a per-slot POWER-OF-TWO cadence (the 1st, 2nd, 4th, 8th, … resume prints), for the
+/// reason the aarch64 twin records from a real capture: one focus change fires several of these from
+/// inside the input path on several cores, and an unpaced line overran the UART mid-word and blocked
+/// the press path while it did. Every resume is still COUNTED in `USER_INPUT_WAKES`; the printed line
+/// carries `n=`, this slot's cumulative resume count, so a reader can subtract across two lines and
+/// know how many were elided.
+fn user_input_wake_edge(slot: usize, edge: &str) -> usize {
+    if slot >= crate::arch::memory::USER_SLOTS {
+        return 0;
+    }
+    if !USER_INPUT_PARKED[slot].load(Ordering::Acquire) {
+        return 0; // fast path: nobody has parked on this ring
+    }
+    let n = crate::arch::sched::futex_wake(input_futex_key(slot), usize::MAX);
+    if n != 0 {
+        USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
+        if !edge.is_empty() {
+            let seen = USER_INPUT_RESUMES[slot].fetch_add(1, Ordering::Relaxed) + 1;
+            if seen.is_power_of_two() {
+                serial_println!(
+                    "[vugpause2] resume slot={} edge={} woken={} n={}",
+                    slot, edge, n, seen
+                );
+            }
+        }
+    }
+    n
+}
+
+/// VUGPAUSE-2/x86 BACKSTOP: wake every parked input waiter, unconditionally. Called on a coarse
+/// cadence from the scheduler loop (`sched::run`), and it is a LIVENESS device, not a correctness one
+/// — the three wake edges above are what make the wait responsive.
+///
+/// **It does not consult [`USER_INPUT_PARKED`].** The aarch64 twin used to, and that turned P72's
+/// stale clear from a hiccup into a permanent strand: the one mechanism whose whole job is to be the
+/// net that catches a missed wake was itself gated on the same flag every missed wake had already gone
+/// through. A backstop that can be disabled by the bug it exists to survive is not a backstop. So it
+/// wakes all `USER_SLOTS` keys blind — 8 `futex_wake` calls per period, each a bounded scan of the
+/// bucket array, and a wake on a key with no waiters allocates nothing and readies nobody. Any future
+/// stale clear therefore costs an idle app one backstop period of latency, once, rather than its life.
+pub fn user_input_wake_backstop() {
+    for slot in 0..crate::arch::memory::USER_SLOTS {
+        let n = crate::arch::sched::futex_wake(input_futex_key(slot), usize::MAX);
+        if n != 0 {
+            USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+}
 
 /// The slot currently designated to RECEIVE input, `+1`-BIASED: 0 means "no ring-3 target — the shell
 /// owns the keyboard", and `s + 1` means slot `s` has focus.
@@ -3512,7 +4974,7 @@ static EL0_INPUT_TAIL: [AtomicU32; crate::arch::memory::USER_SLOTS] =
 /// (the WINX-1 fixture routinely does), so an unbiased 0 would silently mean "the first program to
 /// launch always has focus". This is the same reason `WinEntry` needs `WIN_OWNER_FREE` and `Proc`
 /// stores `slot + 1`.
-static EL0_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static USER_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 /// How many times a slot TEARDOWN revoked the live input focus — i.e. the dying slot *was* the
 /// focused one. Zero on a boot where no focused program ever exited; it climbs by one per focused
@@ -3523,20 +4985,20 @@ static EL0_FOCUS_REVOKES: AtomicU64 = AtomicU64::new(0);
 /// Router accounting: events actually DELIVERED into some process's ring, and events DROPPED because
 /// the target ring was full. The drop counter is the honest half — a full ring is a real event loss
 /// and must be countable, not silent.
-static EL0_INPUT_DELIVERED: AtomicU64 = AtomicU64::new(0);
-static EL0_INPUT_DROPPED: AtomicU64 = AtomicU64::new(0);
+static USER_INPUT_DELIVERED: AtomicU64 = AtomicU64::new(0);
+static USER_INPUT_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// WINX-7: the slot currently receiving input, `+1`-biased (0 = the shell). The read side of
-/// [`el0_input_set_active`], for the router and the witnesses.
-pub fn el0_input_active() -> u64 {
-    EL0_INPUT_ACTIVE.load(Ordering::Acquire)
+/// [`user_input_set_active`], for the router and the witnesses.
+pub fn user_input_active() -> u64 {
+    USER_INPUT_ACTIVE.load(Ordering::Acquire)
 }
 
 /// WINX-7: `(delivered, dropped, focus_revokes)` — the router's own accounting, for the witness line.
-pub fn el0_input_stats() -> (u64, u64, u64) {
+pub fn user_input_stats() -> (u64, u64, u64) {
     (
-        EL0_INPUT_DELIVERED.load(Ordering::Acquire),
-        EL0_INPUT_DROPPED.load(Ordering::Acquire),
+        USER_INPUT_DELIVERED.load(Ordering::Acquire),
+        USER_INPUT_DROPPED.load(Ordering::Acquire),
         EL0_FOCUS_REVOKES.load(Ordering::Acquire),
     )
 }
@@ -3558,7 +5020,7 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
         Event::Button(mask) => (INPUT_EV_BUTTON, mask as u64),
         Event::Timer | Event::None | Event::Unknown => return None,
     };
-    Some((ty << 48) | payload)
+    Some(una_abi::input_ev_pack(ty, payload))
 }
 
 /// Push a pre-packed event into `slot`'s ring — the SPSC producer half. DROP-NEWEST on a full ring, so
@@ -3566,18 +5028,23 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
 /// loses the events it could not have handled anyway, rather than having its next read silently
 /// replaced by a later one (which would corrupt a press/release pairing). `slot` is validated by the
 /// caller. Returns whether the event was queued.
-fn el0_input_push(slot: usize, packed: u64) -> bool {
-    let head = EL0_INPUT_HEAD[slot].load(Ordering::Acquire);
-    let tail = EL0_INPUT_TAIL[slot].load(Ordering::Relaxed); // the router is the sole producer
+fn user_input_push(slot: usize, packed: u64) -> bool {
+    let head = USER_INPUT_HEAD[slot].load(Ordering::Acquire);
+    let tail = USER_INPUT_TAIL[slot].load(Ordering::Relaxed); // the router is the sole producer
     if tail.wrapping_sub(head) >= INPUT_RING_CAP as u32 {
-        EL0_INPUT_DROPPED.fetch_add(1, Ordering::Relaxed);
+        USER_INPUT_DROPPED.fetch_add(1, Ordering::Relaxed);
         return false; // full — drop the newest
     }
-    EL0_INPUT_BUF[slot][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
+    USER_INPUT_BUF[slot][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
     // Publish the tail AFTER the slot store: the consumer's Acquire load of the tail is what makes
     // the payload visible to it, so the two stores must not be reordered.
-    EL0_INPUT_TAIL[slot].store(tail.wrapping_add(1), Ordering::Release);
-    EL0_INPUT_DELIVERED.fetch_add(1, Ordering::Relaxed);
+    USER_INPUT_TAIL[slot].store(tail.wrapping_add(1), Ordering::Release);
+    USER_INPUT_DELIVERED.fetch_add(1, Ordering::Relaxed);
+    // VUGPAUSE-2/x86: the latency-critical wake edge, and it must be AFTER the TAIL publish — the
+    // parked task's futex compares the tail word it slept on, so a wake issued before the store could
+    // find the value unchanged and re-park on an event that has already arrived. Unnamed edge (`""`
+    // via `user_input_wake`): this runs at mouse-motion rate and prints nothing.
+    user_input_wake(slot);
     true
 }
 
@@ -3586,8 +5053,8 @@ fn el0_input_push(slot: usize, packed: u64) -> bool {
 /// Returns `true` if the event was queued for a ring-3 app (the caller must NOT also give it to the
 /// shell), `false` if there is no focused ring-3 target, the event carries nothing deliverable, or the
 /// target ring was full. Single producer: exactly one drain loop may call this.
-pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
-    let active = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
+    let active = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     if active == 0 {
         return false; // the shell owns the keyboard
     }
@@ -3598,12 +5065,12 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
     let Some(packed) = pack_input(ev) else {
         return false;
     };
-    el0_input_push(slot, packed)
+    user_input_push(slot, packed)
 }
 
 /// WINX-7 ROUTER FOLD POINT (public, in-lane) — the ONE line the shell's event drain needs.
 ///
-/// Hands `ev` to [`el0_input_enqueue`] and reports the outcome AS AN EVENT, so a caller folds this in
+/// Hands `ev` to [`user_input_enqueue`] and reports the outcome AS AN EVENT, so a caller folds this in
 /// without restructuring its drain: the event comes back UNCHANGED when no ring-3 app took it (the shell
 /// handles it exactly as before), and comes back as `Event::Unknown` when a ring-3 ring consumed it.
 ///
@@ -3613,12 +5080,257 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
 /// first keystroke routed to a window and strand everything queued behind it. `Event::Unknown`
 /// already falls through every such loop's catch-all arm as a no-op, which is precisely the
 /// "swallowed, keep draining" semantics required.
-pub fn el0_input_route(ev: crate::pal::Event) -> crate::pal::Event {
-    if el0_input_enqueue(ev) {
+///
+/// ### CURSOR-VUG — a consumed POINTER report still moves the system arrow
+///
+/// `Event::Mouse`/`Event::MouseAbsolute` are packable, so before this arc a focused ring-3 app
+/// swallowed every pointer report whole: the shell's drain fell through its catch-all arm and
+/// `pal::cursor::move_rel` was never called again for as long as that app held focus. The arrow
+/// froze, auto-hid 1.5 s later, and was then taken off the panel by the next composite tail that
+/// bracketed its box — which over a PRESENTING window is within a frame and over a static desktop is
+/// never. That asymmetry is Peter's "vug blocks mouse cursor" exactly, and it is also why every
+/// cursor witness stops emitting at the moment a window is raised (`pal::cursor::rollup_tick` hangs
+/// off the same motion path). See [`crate::pal::cursor::track_routed`] for the full ledger.
+///
+/// The delivery decision is UNTOUCHED — the app receives the report, and the shell still sees
+/// `Event::Unknown`. Only the consumed branch tracks, so a report the router declined is moved by
+/// the drain exactly once, as it always was; a relative report can never be applied twice.
+pub fn user_input_route(ev: crate::pal::Event) -> crate::pal::Event {
+    if user_input_enqueue(ev) {
+        crate::pal::cursor::track_routed(&ev);
         crate::pal::Event::Unknown
     } else {
         ev
     }
+}
+
+/// WC-TAB/x86 — [`crate::video::wm::focus_ring`] with the KERNEL rows removed, which is what that
+/// helper's own contract already claims to return and what it actually returns only on aarch64.
+///
+/// `focus_ring` filters `used && !compat && owner_asid != 0`. On aarch64 that IS the app set: every
+/// row belongs to an EL0 ASID. On x86 it is not — `fbcon::panel_console_window_open` and `wcx`'s
+/// desktop demo create rows owned by `wm::KERNEL_OWNER_CONSOLE` / `KERNEL_OWNER_DESKTOP`, values
+/// far above `USER_SLOTS` that pass the `!= 0` test. Left in, the cycle would step onto one of them
+/// and `user_input_set_active` would REFUSE it (`slot >= USER_SLOTS`, an early return that publishes
+/// nothing), so TAB would raise the console, print a witness naming a focus that had not moved, and
+/// leave the keyboard exactly where it was — the trap intact behind a line saying otherwise.
+///
+/// Filtered HERE rather than in `wm`: kernel-owned rows exist only on this arch, so the divergence
+/// belongs on this side of the shared helper. (The narrowing in `focus_ring` itself would be a
+/// one-token edit and is the better long-term home; it is a shared-file change and not this arc's.)
+///
+/// Compacts in place and zeroes the tail, so the caller reads `ring[..n]` with no stale owner behind
+/// it. `out` is `focus_ring`'s own buffer type, so no second array is allocated anywhere.
+fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
+    let n = crate::video::wm::focus_ring(out);
+    let mut k = 0usize;
+    for i in 0..n {
+        let owner = out[i];
+        if crate::video::wm::is_kernel_owner(owner) {
+            continue;
+        }
+        out[k] = owner;
+        k += 1;
+    }
+    for e in out[k..n].iter_mut() {
+        *e = 0;
+    }
+    k
+}
+
+/// WC-TAB/x86 — the TAB focus-cycle, and the way out of the focus trap. Returns `true` when the
+/// window system CONSUMED the event: the caller must neither route it into a ring nor hand it to the
+/// console.
+///
+/// TAB is the COMPOSITOR's key, not the focused app's — the one keystroke the window system reserves
+/// for itself so that an operator can always reach the other window, or the shell, from an app that
+/// has taken the keyboard. Boot AH is the argument: a `vug.elf` started by BAREXEC held the last
+/// focus grant for 339 s of a perfectly healthy kernel (165 grants against 164 revokes — the missing
+/// revoke is the one `user_input_revoke_slot` never made, because a DETACHED job's slot is never torn
+/// down), and `kill <pid>` was ungated and unreachable. Reserving the key in the ROUTER rather than
+/// asking apps to forward it is the whole point: a per-app opt-in is no exit at all, since an app can
+/// hold focus hostage simply by not implementing it.
+///
+/// ### The ring, in x86's domain
+/// Slots, `+1`-BIASED, exactly as [`USER_INPUT_ACTIVE`] and `wm`'s window owners carry them — the
+/// bias is shared precisely so these are the SAME numbers at the seam that decides who receives a
+/// keystroke. So `{cur}` and `{next}` in the witness line below are `slot + 1`, and **0 is the SHELL**,
+/// not slot 0. (aarch64 prints bare ASIDs there; the line's shape is deliberately identical, its
+/// domain is not.)
+///
+/// The rotation is `n` window slots from [`focus_ring_apps`] in window-id order — a stable order an
+/// operator can predict, not a walk over a stack that reorders under them — plus ONE MORE: slot `n`
+/// is the SHELL. **That extra slot is what makes this an exit and not a trap.** Cycling only over the
+/// live apps is a closed loop; an operator who tabs into a window could never get the keyboard back.
+/// "No app has focus" is a position in the rotation, not an absence.
+///
+/// ### The guard keys on where focus IS (the aarch64 BGRUN-1 rule, adopted whole)
+///  * at the SHELL (`cur == 0`): consume TAB only if there is a window to enter (`n >= 1`).
+///  * in a WINDOW (`cur != 0`): ALWAYS consumable — the shell is a destination at any `n`, including
+///    `n == 0` (the focused app closed its own window; fall back to the shell rather than strand the
+///    keyboard in a slot with nothing on the panel).
+///
+/// A shared `n < 2` would re-weld the trap the moment a second window closed, which is the mistake
+/// that arc corrected on the other arch; there is no reason to ship it here first.
+///
+/// ### Both directions, one seam
+/// This is the largest structural divergence from aarch64 and it is a simplification, not a gap.
+/// There, `main.rs` calls the router only while `user_input_active() != 0`, so the shell half needed
+/// a second entry point (`wc_shell_focus_key`) on the shell's own drain. On x86 the drain calls
+/// `wc_click_route` + [`user_input_route`] on EVERY event regardless of focus — `user_input_enqueue`
+/// makes the focus test itself — so ONE interception placed ahead of that pair carries app -> shell
+/// and shell -> window alike. No shell-only entry point is needed and none is added; adding one would
+/// be a second predicate to keep in agreement with this one for no behaviour.
+///
+/// ### The SHELL slot is `focus_changed(0)`, not the console's window row
+/// Passed through untranslated, on `wc` builds too. The body carries the argument at the call; the
+/// short form is that fbcon's `KERNEL_OWNER_CONSOLE` row is a frozen boot-log snapshot after
+/// `fbcon::detach()` and the live prompt is the desktop layer, which is what `SHELL_Z` names.
+///
+/// ### Three consequences, flagged rather than hidden
+///  * The KeyUp is swallowed on the same predicate, and that is the ONE path here that consumes an
+///    event without printing (nothing moved, so there is nothing to report). Delivering a lone
+///    release for a press the app never saw is a fabricated edge. EHCI-KEYUP: this arm is now LIVE on
+///    the rMBP's INTERNAL keyboard too. It used to be unreachable there —
+///    `ehci::decode_boot_keyboard` emitted `Event::Key` only — and that gap is what Boot AJ's frozen
+///    vug was (a ring-3 held bit that nothing ever cleared). That decoder now diffs consecutive boot
+///    reports and pushes `Event::KeyUp`, so every TAB typed on the built-in keyboard produces a
+///    release edge that arrives HERE, on a later poll than its press. It is CONSUMED, not delivered:
+///    the drain maps a consumed event to `Event::Unknown`, whose match arm does nothing, so a stray
+///    TAB release cannot reach `handle_key` and put byte 9 into the console line editor. And on the
+///    one path that returns `false` for a release — `cur == 0 && n == 0`, the shell with no windows —
+///    the release still cannot leak: `Event::KeyUp` has no arm in either drain's match either.
+///    Unchanged on the xHCI path, which always emitted both.
+///  * A focus grant onto a slot torn down between the ring read and the publish is possible and is
+///    self-healing on the next press, not prevented. See the note at `user_input_set_active` below.
+///  * x86's [`user_input_set_active`] does NOT drain `pal::EVENT_QUEUE` — the aarch64 twin does, and
+///    that difference is deliberate there rather than an oversight here. So anything typed BEHIND the
+///    TAB survives into the new focus instead of being discarded. The exposure is near nil in practice
+///    (the input service drains the queue at ~1 kHz, so the backlog behind a human's TAB is empty) and
+///    closing it honestly is not a keybinding change: at the render-service seam the events in
+///    question are already off `EVENT_QUEUE` and inside `GUI_CHANNEL_X86`, which the syscall layer
+///    cannot reach, so a drain here would fix one seam and lie about the other.
+pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
+    const K_TAB: u8 = b'\t';
+    // ALLKEYS (GR21 F4/F5): this matcher binds a BARE Tab, and it can only ever see a bare one —
+    // `Event::Key` carries no modifier, so "require Tab with no modifiers" cannot be enforced here;
+    // it is enforced upstream in `xhci::hid_key_ascii`, which is the ONLY producer of byte 0x09.
+    // That fold suppresses Alt/GUI+Tab (so Cmd-Tab / Alt-Tab no longer reach this at all — a
+    // deliberate loss, named in the predictions file) and suppresses Ctrl-I, whose C0 fold would
+    // otherwise be 0x09 and silently invoke this focus switch. So `Event::Key(0x09)` here is now
+    // provably a physical Tab keypress and nothing else.
+    let down = match ev {
+        crate::pal::Event::Key(K_TAB) => true,
+        crate::pal::Event::KeyUp(K_TAB) => false,
+        _ => return false,
+    };
+    // WEDGE-2 `<F1>` — a TAB edge has been recognised and the chain begins. Emitted BEFORE
+    // `focus_ring`, which takes the window TABLE lock: a `<F1>` with no successor puts the death in
+    // the ring read, i.e. against `TABLE`. The tokens are carried over from aarch64 rather than left
+    // to that arch because three recorded silicon wedges crossed this exact seam, and x86 is the arch
+    // about to fly it. `focus_changed`'s own `<F4>`..`<F6>` are shared and already fire here, so
+    // without these four a wedge in the ring read or in the focus primitive would leave NO token at
+    // all on x86 where aarch64 would leave `<F1>` with no successor.
+    crate::wedge2::mark("<F1>");
+    let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
+    let n = focus_ring_apps(&mut ring);
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    if cur == 0 && n == 0 {
+        return false; // shell, no windows — TAB stays an ordinary key and reaches the console
+    }
+    if !down {
+        // THE ONE SILENT CONSUME, and it is deliberate. Nothing moved, so there is nothing for the
+        // witness to report; a `[wc-c]` line here would claim a transition that did not happen, and
+        // every reading of the ledger would double-count. Every OTHER path that returns `true` from
+        // this function moves focus and prints — see the note above the `serial_println!`.
+        return true; // swallow the release edge of a Tab whose press we consumed
+    }
+    let at = ring[..n].iter().position(|&o| o == cur);
+    let next = match at {
+        Some(i) if i + 1 == n => 0, // last window -> the shell
+        Some(i) => ring[i + 1],
+        // Focus is in no ring slot. Two distinct cases with one destination: the SHELL entering the
+        // rotation, and a focused app that owns no window of its own (or whose row went away under
+        // it) being rescued to the ring's head. Kept as one arm because the `n == 0` fallthrough
+        // below is what makes the indexing safe, and splitting them would hide that.
+        None if n > 0 => ring[0],
+        None => 0, // no windows at all -> the shell
+    };
+    // NO `next == cur` EARLY RETURN, and the omission is the point. It cannot arise today —
+    // `wm::focus_ring` dedupes by owner, ring entries are never 0, and the `cur == 0 && n == 0` guard
+    // above has already left — so as a guard it would be dead code; as a SILENT CONSUME it would be
+    // worse than dead, because the one way it could ever fire is a broken dedupe upstream, and that
+    // is exactly the case that must reach the wire instead of being swallowed. Left out, such a
+    // failure prints `[wc-c] focus tab-cycle N -> N`, which is a falsifier a boot can actually
+    // observe. The cost of letting it through is NOT free: `focus_changed` is idempotent, but
+    // `user_input_set_active` RESETS the target's ring by contract, so a spurious `N -> N` costs a
+    // redundant composite AND whatever queued input the focused app had not yet read. Paid only if
+    // the dedupe upstream is already broken — and then the wire evidence is worth the price.
+    //
+    // DRAGREL — **A FOCUS SWITCH CANCELS A LIVE DRAG.** Not a convenience: a drag steering a window
+    // the operator has just tabbed AWAY from is never what the gesture meant, and on metal it was
+    // the state the missed release left behind — the previous window silently following the pointer
+    // under the newly focused one, with no visible thing to let go of. `<TAB>` is the one input the
+    // operator always has, so it is also the escape. Placed BEFORE the focus primitive so the cancel
+    // is attributed to the window that was actually being dragged, and named `focus-key` so a
+    // capture can tell this end from the two release ends. NOT `wc`-gated, for the same reason
+    // `wc_click_route_at`'s drag arms are not: `drag_begin` is reachable in a plain build too, so a
+    // gate here would leave exactly that build with a drag `<TAB>` cannot escape.
+    if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE {
+        crate::video::wm::drag_cancel("focus-key");
+        drag_settle_disarm();
+    }
+    // WEDGE-2 `<F2>` — the ring was read and a destination chosen; the focus PRIMITIVE is next.
+    crate::wedge2::mark("<F2>");
+    // Focus moves through the ONE primitive, so the cycle inherits what already hangs off it: the
+    // incoming ring is reset, so a fresh focus starts clean.
+    //
+    // WHAT IT DOES NOT INHERIT: `user_input_set_active` validates RANGE only (`slot < USER_SLOTS`).
+    // It does not — and cannot cheaply — check that the slot is still LIVE, so a target torn down
+    // between the ring read above and this call is published anyway: the teardown's
+    // `user_input_revoke_slot` CAS names the dying slot's biased value, which does not match the
+    // focus still in place, so it clears nothing, and this store then points focus at a dead slot
+    // whose ring no process will ever drain. That is a fresh instance of the trap this arc removes,
+    // and the honest thing to say about it is that it is SELF-HEALING rather than prevented: the
+    // next TAB has `cur != 0`, which the BGRUN-1 guard makes always consumable, and the `None`
+    // arm above rescues it to the ring head or the shell. A liveness test here would not close the
+    // window either — it would be a check between the same two points, i.e. the same TOCTOU one
+    // instruction narrower — so the rescue is the mechanism, not a fallback for it.
+    user_input_set_active(next);
+    // WEDGE-2 `<F3>` — focus routing has moved; the VISIBLE half is next. This is the seam the three
+    // silicon wedges all crossed.
+    crate::wedge2::mark("<F3>");
+    // FOCUS-VIS — the other half of a focus change. `user_input_set_active` moves where KEYSTROKES go;
+    // this moves what the PANEL shows. P59 is what happens when only the first exists: the witness
+    // fires on every press and nothing on screen moves, so the newly focused window stays buried and
+    // the console stays covered — focus that cannot be seen is not focus.
+    //
+    // `next == 0` IS THE SHELL, AND IT IS PASSED THROUGH UNTRANSLATED — including on `wc`, where the
+    // first cut of this arc raised `KERNEL_OWNER_CONSOLE` instead on the theory that "on x86 the
+    // console is a window row". It is, and that row is not the console the operator types into. On
+    // the bench path `fbcon::detach()` runs at the SCHED-X86 handoff, `_print` returns at its first
+    // test from that store on, and fbcon's `KERNEL_OWNER_CONSOLE` row — opened earlier by
+    // `wcx::activate` — is a FROZEN BOOT-LOG SNAPSHOT for the rest of the boot. The live prompt is
+    // `console::Console` drawn through `TargetPal`/`Screen` inside `x86_render_service`: the DESKTOP
+    // layer, which is the layer `SHELL_Z` is. So `focus_changed(0)` is the correct call on this arch
+    // for the same reason it is on the other, and only its arm does the three things this gesture
+    // needs — bump `SHELL_Z` above every window, ERASE the vacated boxes (`nhidden` is filled in
+    // that branch alone), and `screen::request_full_present`, whose doc names TAB-to-the-shell as
+    // the single state it exists to repair. Raising the kernel row does none of them: it brings a
+    // dead snapshot to the front and leaves the live prompt buried and unrepainted.
+    crate::video::wm::focus_changed(next);
+    // WEDGE-2 `<F9>` — `focus_changed` RETURNED and this core is about to fall back into the input
+    // pump. A wire that reaches `<F9>` has exonerated the whole focus path for that press. The
+    // `[wc-c]` line below is the ordinary witness, but it takes the serial lock and is buffered
+    // behind it, so the TOKEN is what proves the return, not the line.
+    crate::wedge2::mark("<F9>");
+    serial_println!(
+        "[wc-c] focus tab-cycle {} -> {} (ring of {} + shell)",
+        cur,
+        next,
+        n
+    );
+    true
 }
 
 /// Reset a slot's input ring (head == tail == 0 => empty). Called on a focus change (a freshly
@@ -3630,8 +5342,8 @@ fn clear_input_row(slot: usize) {
     if slot >= crate::arch::memory::USER_SLOTS {
         return;
     }
-    EL0_INPUT_HEAD[slot].store(0, Ordering::Release);
-    EL0_INPUT_TAIL[slot].store(0, Ordering::Release);
+    USER_INPUT_HEAD[slot].store(0, Ordering::Release);
+    USER_INPUT_TAIL[slot].store(0, Ordering::Release);
 }
 
 /// WINX-7 FOCUS REGISTRATION (public, in-lane): designate which process receives input.
@@ -3641,15 +5353,36 @@ fn clear_input_row(slot: usize) {
 /// focus were aimed at that window, and delivering them to the new one is both wrong and, for a
 /// button, actively harmful (a release with no matching press is a fabricated click). Clearing focus
 /// leaves every ring alone — from then on events legitimately belong to the shell.
-pub fn el0_input_set_active(slot_plus1: u64) {
+pub fn user_input_set_active(slot_plus1: u64) {
     if slot_plus1 != 0 {
         let slot = (slot_plus1 - 1) as usize;
         if slot >= crate::arch::memory::USER_SLOTS {
             return; // not a real slot — refuse rather than publish a focus nobody can drain
         }
         clear_input_row(slot); // a fresh focus starts clean
+        // VSYNC-PACE: the input-latency exemption. The first present from any of this slot's windows
+        // after this point skips the pacer entirely — the frame that answers the operator's focus change
+        // is the one frame where a frame of added latency reads as sluggishness rather than smoothness.
+        // Before the focus word is published, so a present racing the store on another core sees the new
+        // generation at worst early, never late.
+        pace_focus_arrival(slot);
     }
-    EL0_INPUT_ACTIVE.store(slot_plus1, Ordering::Release);
+    USER_INPUT_ACTIVE.store(slot_plus1, Ordering::Release);
+    // VUGPAUSE-2/x86: a focus ARRIVAL is a wake edge, and it is the one the RING cannot supply — focus
+    // enqueues nothing, it RESETS the ring, so an app parked on an empty ring sees no TAIL movement
+    // when it is handed the keyboard. LAST, after the focus word is published, so the woken task
+    // re-polls against the new state rather than the old.
+    //
+    // `clear_input_row` above deliberately does NOT touch `USER_INPUT_PARKED` — that is the whole of
+    // the aarch64 P72 lesson this arch is built to not repeat; see the flag's doc.
+    //
+    // It fires while the app may still be HIDDEN (`wm::focus_changed` runs after this in the click
+    // router): the woken app re-reads its flags word, may find itself still hidden and re-park, and is
+    // then released again by the unhide edge in `set_hidden`. BOTH edges are needed; neither is
+    // redundant.
+    if slot_plus1 != 0 {
+        user_input_wake_edge((slot_plus1 - 1) as usize, "focus");
+    }
 }
 
 /// WINX-7: revoke input focus if the dying `slot` holds it, and reset its ring. Called from
@@ -3662,9 +5395,9 @@ pub fn el0_input_set_active(slot_plus1: u64) {
 /// windowed app would leave focus pointing at its own dead slot forever and every later keystroke
 /// would be enqueued into a ring with no consumer — the keyboard would appear to stop working with
 /// no message anywhere.
-fn el0_input_revoke_slot(slot: usize) {
+fn user_input_revoke_slot(slot: usize) {
     let biased = (slot as u64) + 1;
-    if EL0_INPUT_ACTIVE
+    if USER_INPUT_ACTIVE
         .compare_exchange(biased, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
@@ -3672,6 +5405,104 @@ fn el0_input_revoke_slot(slot: usize) {
         serial_println!(":: wc-x86: input focus revoked — slot {} torn down ::", slot);
     }
     clear_input_row(slot);
+}
+
+/// VUGPAUSE-2/x86: drop `slot`'s "a task is parked in [`sys_input_wait`]" flag, and its resume-print
+/// pacing count with it. EXACTLY ONE CALLER, and the restriction is the fix: [`clear_handle_row`],
+/// i.e. slot teardown.
+///
+/// The failure modes are not symmetric, which is why this is separated from the ring reset it would
+/// otherwise ride along with. A stale-SET flag costs one wasted `futex_wake` per backstop period on a
+/// key with no waiters. A stale-CLEAR flag costs a task that is parked forever — the flag is the only
+/// thing standing between every wake edge and the parked waiter, and a task that never runs again
+/// never re-sets it. So it may be cleared only by the parker itself (on the normal return from
+/// [`sys_input_wait`]) or by the one event that proves the parker is gone.
+fn clear_input_parked(slot: usize) {
+    if slot < crate::arch::memory::USER_SLOTS {
+        USER_INPUT_PARKED[slot].store(false, Ordering::Release);
+        USER_INPUT_RESUMES[slot].store(0, Ordering::Relaxed);
+    }
+}
+
+/// VUGPAUSE-2/x86: `SYS_INPUT_WAIT()` — block until the CALLING process's input ring is (or may be)
+/// non-empty. Returns 0 — it is a WAIT, not a read: nothing is dequeued, so the caller's ordinary
+/// [`sys_input_poll`] drain runs next and sees every event. `-EINVAL` off a private slot (the shared
+/// kernel window is not an input target, the same refusal the window verbs give it) or off a
+/// schedulable task.
+///
+/// ABI: syscall 28, no arguments, `0`/`-EINVAL` — byte-for-byte the aarch64 contract, so `user-vug`'s
+/// existing arch-neutral `input_wait()` call site simply starts working here with no ring-3 change.
+///
+/// ### Why this exists
+///
+/// VUGPAUSE and VUGMIN stopped an idle app from RENDERING; they did not stop it from RUNNING. The idle
+/// loop they left behind is `drain_input` + `SYS_YIELD`, a runnable spin that never parks and is
+/// therefore always in a run queue. On x86 it was worse than a spin: the call fell through the
+/// dispatcher's `_ => -38` and the call site discards its return, so the "park" was a bare loop
+/// iteration. That residue is this syscall's whole target.
+///
+/// The three deliberate properties:
+///   * SAME-TICK WAKE. The wake is issued by [`user_input_push`] itself, so the latency from "the
+///     router enqueued a keypress" to "the app is ready to run" is one `make_ready` — strictly better
+///     than the yield loop, which could not act until it was next dispatched.
+///   * KILL-SURVIVABLE. This is TEARDOWN-1's futex, not a new primitive, so a parked task inherits
+///     `futex_wait`'s pre-park `task_kill_armed` refusal and `kill_wake_parked`'s eviction of an
+///     already-parked target. An app blocked here is exactly as killable as one blocked in the frame
+///     barrier — which is the answer to "an unbounded futex_wait is an unkillable empty window".
+///   * BOUNDED ANYWAY. [`user_input_wake_backstop`] releases every parked waiter a few times a second,
+///     so any missed edge costs one period of latency rather than a strand.
+///
+/// **No liveness stamps here, unlike the aarch64 twin.** That one calls `gui_watchdog::note_progress`
+/// and stamps a takeover heartbeat, because on that arch `sys_input_poll` does too and both watchdogs
+/// measure an EL0 app's liveness in polls. This arch's `sys_input_poll` stamps neither, so a stamp
+/// here would be a coupling that exists on one side only — a park that fed a watchdog its poll never
+/// feeds. Mirroring `sys_input_poll` exactly is what keeps the pair consistent.
+fn sys_input_wait() -> i64 {
+    let Some(slot) = crate::arch::x86_64::memory::current_slot() else {
+        return EINVAL;
+    };
+    let head = USER_INPUT_HEAD[slot].load(Ordering::Relaxed); // this task is the sole consumer
+    let tail = USER_INPUT_TAIL[slot].load(Ordering::Acquire);
+    if head != tail {
+        return 0; // already has work — never park on a non-empty ring
+    }
+    // Park on the ring's TAIL word. `futex_wait` re-reads it under the bucket lock and refuses to park
+    // if it has moved, which closes the window between the load above and the park below. The address
+    // is KERNEL memory (the ring is kernel-side; ring 3 reaches it only through the two verbs), which
+    // `futex_wait` dereferences at CPL 0 under the caller's still-live CR3 — the higher half is mapped
+    // in every address space, so this is the same read it would make of a user word, minus the
+    // validation the syscall layer owes for user addresses and this address does not need.
+    USER_INPUT_PARKED[slot].store(true, Ordering::Release);
+    let n = USER_INPUT_BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Witness on a POWER-OF-TWO cadence (1, 2, 4, 8, …). An idle fleet parks thousands of times a
+    // minute, so a per-park line would be a flood and a one-shot line would say nothing about whether
+    // the mechanism kept working; a logarithmic cadence is bounded at ~40 lines for any conceivable
+    // boot and still shows the ratio moving. `wakes` beside `blocked` is the pair that matters.
+    if n & (n - 1) == 0 {
+        serial_println!(
+            "[vugpause2] blocked={} wakes={} slot={}",
+            n,
+            USER_INPUT_WAKES.load(Ordering::Relaxed),
+            slot
+        );
+    }
+    let key = input_futex_key(slot);
+    let uaddr = core::ptr::addr_of!(USER_INPUT_TAIL[slot]) as u64;
+    let r = crate::arch::sched::futex_wait(key, uaddr, tail);
+    USER_INPUT_PARKED[slot].store(false, Ordering::Release);
+    match r {
+        // Woken by a wake edge, or the ring moved under the compare (`Mismatch`) — either way the
+        // caller's next drain is the thing that decides, so both are simply "go look".
+        crate::arch::sched::FutexWait::Woken | crate::arch::sched::FutexWait::Mismatch => 0,
+        // Every bucket is busy with another key. Returning 0 degrades this syscall to a `SYS_YIELD`
+        // for that iteration — the pre-VUGPAUSE-2 behaviour, which is the right thing to fall back to.
+        crate::arch::sched::FutexWait::TableFull => 0,
+        // TEARDOWN-1: the caller has an ARMED kill and was refused the park; it is about to be retired
+        // at the syscall boundary on the way out. 0, exactly as `sys_futex`'s `FUTEX_WAIT` arm returns
+        // for the same outcome — the value is never observed by ring 3.
+        crate::arch::sched::FutexWait::Killed => 0,
+        crate::arch::sched::FutexWait::NoTask => EINVAL,
+    }
 }
 
 /// WINX-7: `SYS_INPUT_POLL()` — nonblocking dequeue of the next input event for the CALLING process.
@@ -3683,28 +5514,36 @@ fn el0_input_revoke_slot(slot: usize) {
 /// Relaxed and published Release AFTER the payload load — the mirror of the producer's ordering.
 ///
 /// NOT GATED ON FOCUS, deliberately. An unfocused app may drain whatever was queued while it DID have
-/// focus, which is what makes tabbing away and back lossless rather than a silent truncation; the gate
-/// that matters is on the PRODUCER side, where an unfocused app's ring stops filling in the first
-/// place. The distinction is that a program may always read what was already addressed to it, and may
-/// never receive what was addressed to somebody else.
+/// focus, rather than being silently truncated at the moment focus left; the gate that matters is on
+/// the PRODUCER side, where an unfocused app's ring stops filling in the first place. The distinction
+/// is that a program may always read what was already addressed to it, and may never receive what was
+/// addressed to somebody else.
+///
+/// **This is not "tabbing away and back is lossless", and it used to say so.** The claim was vacuous
+/// when written — x86 had no way to tab back — and WC-TAB/x86 made it reachable and false in the same
+/// stroke: [`user_input_set_active`] calls `clear_input_row` on the way IN, so a return of focus wipes
+/// whatever the app had not yet read. The window in which the unread tail survives is therefore
+/// between focus LEAVING and focus RETURNING, and a return closes it. That behaviour is the one to
+/// keep (a fresh focus starts clean, which is what stops a press/release pair from being split across
+/// a focus change); it is the sentence that had to move.
 fn sys_input_poll() -> i64 {
     let Some(slot) = crate::arch::x86_64::memory::current_slot() else {
         return EAGAIN;
     };
-    let head = EL0_INPUT_HEAD[slot].load(Ordering::Relaxed); // sole consumer
-    let tail = EL0_INPUT_TAIL[slot].load(Ordering::Acquire);
+    let head = USER_INPUT_HEAD[slot].load(Ordering::Relaxed); // sole consumer
+    let tail = USER_INPUT_TAIL[slot].load(Ordering::Acquire);
     if head == tail {
         return EAGAIN; // empty
     }
-    let packed = EL0_INPUT_BUF[slot][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
-    EL0_INPUT_HEAD[slot].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
+    let packed = USER_INPUT_BUF[slot][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
+    USER_INPUT_HEAD[slot].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
     packed as i64
 }
 
 /// CLICK-X86 witness read: how many events sit UNREAD in the ring of the `+1`-biased slot `active`.
 /// `0` for the shell slot and for anything outside the private-slot range (they have no ring). The
 /// selftest's only way to say "the press was DELIVERED" rather than "the router said it would be".
-pub fn el0_input_depth(active: u64) -> u32 {
+pub fn user_input_depth(active: u64) -> u32 {
     if active == 0 {
         return 0;
     }
@@ -3712,9 +5551,9 @@ pub fn el0_input_depth(active: u64) -> u32 {
     if slot >= crate::arch::memory::USER_SLOTS {
         return 0;
     }
-    EL0_INPUT_TAIL[slot]
+    USER_INPUT_TAIL[slot]
         .load(Ordering::Acquire)
-        .wrapping_sub(EL0_INPUT_HEAD[slot].load(Ordering::Acquire))
+        .wrapping_sub(USER_INPUT_HEAD[slot].load(Ordering::Acquire))
 }
 
 // =============================================================================================
@@ -3763,6 +5602,18 @@ static CLICK_PRESS_TARGET: AtomicU64 = AtomicU64::new(CLICK_TARGET_DROP);
 static CLICK_PRESSES: AtomicU64 = AtomicU64::new(0);
 static CLICK_DELIVERED: AtomicU64 = AtomicU64::new(0);
 
+/// CLICK-REPRESS: stationary re-presses this router RECOVERED — a `Button(1)` whose primary bit was
+/// already set in [`CLICK_PREV_MASK`] because a RELEASE was polled-over and never reached this seam.
+/// Every one of these was a click SILENTLY DROPPED before this arc (Boot C: "clicks won't keep
+/// flowing — I have to move the mouse then click again"). Read the `[clickrepress]` witness below.
+static CLICK_REPRESS_X86: AtomicU64 = AtomicU64::new(0);
+
+/// CLICK-REPRESS: witness-line budget. A recovered re-press is a hand gesture and so human-rate by
+/// construction, but the cap is stated rather than assumed — a button that re-reports "down" after
+/// every quiet gap must not be able to bury the wire, exactly as [`CLOSE_LOG_MAX_X86`] guards the
+/// close line. The recovery itself is uncapped; only the serial line is.
+const CLICK_REPRESS_LOG_MAX_X86: u64 = 128;
+
 /// CLICK-X86: `(presses, delivered)` — every press edge the router judged, and how many of them were
 /// addressed to a ring-3 ring. The difference is the count of presses that belonged to the shell.
 pub fn click_stats() -> (u64, u64) {
@@ -3786,8 +5637,679 @@ fn click_pointer_pos() -> (i32, i32) {
     crate::pal::cursor::pos(w, h)
 }
 
+/// WMDIRECT — `[wm-act]`/`[clickroute]` close lines emitted, against [`CLOSE_LOG_MAX_X86`]. The
+/// close box is a hand gesture and so is human-rate by construction, but the budget is stated rather
+/// than assumed: a stuck button re-reported at HID rate must not be able to bury the wire.
+static CLOSE_LOG_COUNT_X86: AtomicU64 = AtomicU64::new(0);
+const CLOSE_LOG_MAX_X86: u64 = 128;
+
+/// WMDIRECT — the settle code of the most recent close-box click, so the witness can assert WHICH
+/// arm of [`wc_close_click`] ran rather than only that the row went away. A code and not the string,
+/// because the string is `bg_kill`'s and is not a stable comparison key.
+///
+/// `0` none yet · `1` NOPROC (no live process behind the owner — closing the windows was the whole
+/// effect) · `2` a real `bg_kill` settle, whatever it said.
+#[cfg(feature = "witness")]
+static CLOSE_LAST_SETTLE_X86: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_NONE_X86: u32 = 0;
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_NOPROC_X86: u32 = 1;
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_KILLED_X86: u32 = 2;
+
+/// WMDIRECT / CLOSE-BOX (x86) — **the close click's whole effect: the windows go, then the process
+/// goes.** Called from [`wc_click_route_at`]'s close arm only, with the press already consumed.
+///
+/// ### The order, and why it is this order
+/// 1. **Windows first** — `wm::close_owner` removes EVERY row the owner holds (an app may own
+///    several windows and they close together), erases the vacated boxes, re-tiles and composites,
+///    so the operator's click is answered ON THE PANEL immediately rather than after a kill settles.
+///    Idempotent against the teardown's own `close_owner`, which will find zero rows. It also
+///    cancels a drag of any of those rows (`wm::drag_forget_owner`), which is what makes "close a
+///    window you are mid-drag of" leave no dangling gesture.
+/// 2. **Focus next** — in two halves, and the split is CLOSE-TEARDOWN's point. The KEYBOARD half:
+///    if the closed owner held it, `user_input_set_active(0)` hands it back to the shell, so
+///    keystrokes stop addressing a process that is about to be dead. The WM half:
+///    `wm::focus_release(owner)` — a CAS that drops the focus highlight iff this owner held it,
+///    and nothing else. Deliberately NOT `focus_changed(0)`: that is the SHELL ARM, which raises
+///    `SHELL_Z` over every surviving window, erases their boxes and publishes `hidden=true` to
+///    every owner — so closing a FOCUSED window minimised every sibling on the glass (GR27 Boot A).
+///    A close must never park a sibling; the whole-table park stays owned by the gestures that
+///    mean it (TAB-to-shell, the desktop-miss click).
+/// 3. **Kill last** — [`bg_kill`], the EXISTING and metal-proven x86 kill path, ASID-scoped through
+///    the pid it resolves below. No second teardown is written here.
+///
+/// ### Why calling `bg_kill` from the input path is safe on THIS arch
+/// The aarch64 twin deliberately does NOT reap (it settles the row instead), because a foreground
+/// `run_user_image` launcher there holds the row index across its wait and would double-free. x86's
+/// `bg_kill` closes that hazard IN ITSELF, and it is the reason this arc reuses it rather than
+/// inventing a settle: its REVIEW-1 claim is a won CAS into `PREAPING` plus a pid identity test, and
+/// `PREAPING` is the single token `proc_free`, `bg_poll(reap)` and the BGRUN-SCAV sweep all claim
+/// through. Exactly one of them can win, whichever core they run on, so this call cannot free a row
+/// another owner still holds. Nothing about the caller being the input pump changes that argument.
+///
+/// Returns the settle string `bg_kill` produced, for the witness line; `"noproc"` when the owner
+/// resolves to no live process (kernel furniture, a witness fixture, or an app that already exited),
+/// in which case closing the windows was the whole of the effect.
+#[cfg(feature = "wc")]
+fn wc_close_click(owner: u64) -> &'static str {
+    let closed = crate::video::wm::close_owner(owner);
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
+        user_input_set_active(0);
+    }
+    // CLOSE-TEARDOWN — the wm half of the focus handback is `focus_release`, NOT `focus_changed(0)`.
+    // The latter is the SHELL ARM: it raises `SHELL_Z` over every surviving window, erases their
+    // boxes and publishes `hidden=true` to every owner — on the glass, closing a FOCUSED window
+    // minimised every sibling (GR27 Boot A operator: "closing a window causes the other open vug
+    // stat pulse windows to minimize SOMETIMES"; "sometimes" == only when `focus_asid() == owner`,
+    // which a close-box press never establishes by itself). A close must never park a sibling.
+    // `focus_release` clears the highlight iff this owner held it, and touches nothing else; the
+    // owner-held-focus guard lives inside it (a CAS), so it is called unconditionally.
+    crate::video::wm::focus_release(owner, "route=close-box shell-raise=skipped siblings=untouched");
+    // `wm` owners for user rows are `slot + 1`-biased and `Proc::slot` is stored with the SAME bias
+    // (see that field), so the owner IS the key — no arithmetic, and therefore no bias to get wrong.
+    // Kernel furniture (`is_kernel_owner`) and owner 0 can never match a live row and fall out here.
+    let mut target: Option<u64> = None;
+    for pi in 0..MAX_PROCS {
+        if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING
+            && PROCS[pi].slot.load(Ordering::Acquire) as u64 == owner
+        {
+            let pid = PROCS[pi].pid.load(Ordering::Acquire);
+            // `pid == 0` is a claimed row mid-publish: a kill needs a tid to name, and the publish
+            // window is microseconds wide — the operator's next click lands after it.
+            if pid != 0 {
+                target = Some(pid);
+            }
+            break;
+        }
+    }
+    let Some(pid) = target else {
+        #[cfg(feature = "witness")]
+        CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NOPROC_X86, Ordering::Release);
+        if CLOSE_LOG_COUNT_X86.load(Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
+            serial_println!(
+                "[wm-act] close-box owner={:#x} closed={} window(s), no live process — nothing to kill",
+                owner, closed
+            );
+        }
+        return "noproc";
+    };
+    #[cfg(feature = "witness")]
+    CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_KILLED_X86, Ordering::Release);
+    bg_kill(pid, owner)
+}
+
+/// NORMALWIN — **the close disc on KERNEL FURNITURE: reap that ONE row, and nothing else.**
+///
+/// Peter's 2026-08-11 ruling (*"go back in git history when it still had the 3 normal buttons ... i
+/// said normal app"*) gives the console window an ordinary app window's chrome, which means an
+/// ordinary app window's CLOSE. This is the action behind that disc, and it is deliberately a
+/// different call from [`wc_close_click`]'s.
+///
+/// ### Why not `wc_close_click`
+/// Its first move is `wm::close_owner`, the blast-radius primitive: it removes every row an ASID
+/// holds, it is reached from process teardown as well as from this router, and it REFUSES the
+/// reserved kernel band by design (CLOSEISO, Boot AR: *"closing stat should not also close
+/// console!"*). Widening that refusal to make the disc work would trade a real structural guard for
+/// a gesture, and the guard is the one that keeps the operator's machine. `wm::close(id)` is the
+/// id-scoped twin with no refusal at all: it names exactly the row that was pressed, which is
+/// precisely the semantics of "close this window".
+///
+/// ### The two non-window effects, and why each is right
+///  * **Nothing is killed.** A kernel-band owner resolves to no process by arithmetic (user owners
+///    are `slot + 1` biased), so `wc_close_click`'s pid walk would fall out at `"noproc"` anyway.
+///    The settle token says so directly instead of arriving there through a search.
+///  * **The console's ROUTE is dropped** ([`crate::video::fbcon::panel_console_window_closed`]).
+///    `fbcon` presents into this row; leaving `CONSOLE_WIN` pointing at a freed table slot would
+///    have every subsequent console line ask the compositor to present a window that is gone. The
+///    surface itself is NOT freed and the glyph route is NOT torn down — text keeps landing in the
+///    cached-RAM store, which is what keeps `draw_fb` off the PANEL front buffer (a torn-down route
+///    falls back to the panel handle and would paint console text over the desktop). The raw
+///    plumbing is untouched by construction: serial, `TERM_RING` and the panic path
+///    (`panic_screen` clears `CONSOLE_WIN` itself and paints the panel) never went through the row.
+///
+/// Returns the settle token for the `[wm-act]` line. `"closed"` when the row went, `"norow"` when it
+/// did not — which a second press on a stale id would produce and which must not read as success.
+#[cfg(feature = "wc")]
+fn wc_close_furniture(win: crate::video::wm::WinId, owner: u64) -> &'static str {
+    // The route FIRST: `wm::close` composites before it returns, and a present routed at a row that
+    // is mid-free is the one ordering this function can get wrong.
+    let route = crate::video::fbcon::panel_console_window_closed(win);
+    let gone = crate::video::wm::close(win);
+    // The keyboard never belonged to a kernel row (`user_input_set_active` refuses the band), so
+    // there is no grant to revoke. The wm focus, if this row held it, is dropped through
+    // `focus_release` — NOT `focus_changed(0)`, whose shell arm parks every surviving window
+    // (CLOSE-TEARDOWN: a close must never park a sibling; see `wc_close_click`).
+    crate::video::wm::focus_release(
+        owner,
+        "route=close-furniture shell-raise=skipped siblings=untouched",
+    );
+    #[cfg(feature = "witness")]
+    CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NOPROC_X86, Ordering::Release);
+    if CLOSE_LOG_COUNT_X86.load(Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
+        serial_println!(
+            "[wm-act] close-furniture win={} owner={:#x} closed={} route-dropped={} \
+             (id-scoped: close_owner is not involved)",
+            win, owner, gone, route
+        );
+    }
+    if gone { "closed" } else { "norow" }
+}
+
+/// WMDIRECT — the code of the most recent close-box settle. Witness-only; racy against a concurrent
+/// operator click, which no witness leg runs under.
+#[cfg(feature = "witness")]
+pub fn wc_close_last_settle() -> u32 {
+    CLOSE_LAST_SETTLE_X86.load(Ordering::Acquire)
+}
+
+#[cfg(not(feature = "wc"))]
+fn wc_close_click(_owner: u64) -> &'static str {
+    "nowc"
+}
+
+#[cfg(not(feature = "wc"))]
+fn wc_close_furniture(_win: crate::video::wm::WinId, _owner: u64) -> &'static str {
+    "nowc"
+}
+
+/// WMDIRECT — **advance a live title-bar drag to the CURRENT pointer position.**
+///
+/// The one entry point the pointer path calls after it has moved the shared cursor state; a no-op
+/// (one acquire load) when no drag is live, which is every report on a boot where nobody grabbed a
+/// title bar. It reads the same `pal::cursor` position every other pointer consumer reads rather
+/// than re-deriving motion from the HID delta, so the window and the arrow can never disagree about
+/// where the hand is.
+///
+/// ### The throttle, and why the release is exempt
+/// A `move_to` is a table lock, a whole-box erase, a damage pass and a composite; a trackpad reports
+/// far faster than a panel can absorb that. So motion is admitted at most once per
+/// [`DRAG_MOTION_MS`], and the drag's FINAL position is applied unthrottled by the release edge in
+/// [`wc_click_route_at`] — otherwise the last few reports of a fast gesture would be dropped and the
+/// window would settle short of where the operator let go.
+///
+/// Locks: reads `WRITER` then the cursor lock (through `click_pointer_pos`), both released before
+/// `wm::drag_motion` takes the window table. No nesting, so no new lock order.
+#[cfg(feature = "wc")]
+pub fn wc_drag_motion() {
+    if crate::video::wm::drag_active() == crate::video::wm::WIN_NONE {
+        return;
+    }
+    // DRAGREL — **THE DRAG ENDS WHEN THE BUTTON IS UP, WHETHER OR NOT ITS EDGE ARRIVED.**
+    //
+    // The release arm in `wc_click_route_at` is the primary end: it carries the exact release
+    // position and is exempt from the throttle below. It is not sufficient on metal. The EHCI
+    // interrupt endpoint is armed for ONE report per service pass and a report is a LEVEL, so a
+    // release can be superseded before it is ever read (the CLICK-3 ledger in `drivers/ehci`
+    // documents that loss for presses; it costs a drag its ENTIRE END). A drag that outlives the
+    // hand is the worst failure this path has — the window then tracks the pointer for the rest of
+    // the boot, through focus changes, invisibly.
+    //
+    // So the tail asks the LEVEL, which every pointer report writes and no missed edge can falsify.
+    // Applied here rather than before the throttle: the final `drag_motion` is the same unthrottled
+    // settle the release arm performs, so the window lands where the hand actually is, and the
+    // distinct `release-level` reason on the `[wm-act]` line is what lets a capture say which of the
+    // two paths ended the gesture on real silicon.
+    //
+    // LIMIT, stated rather than papered over: the tail runs off POINTER REPORTS, so a drag whose
+    // release is lost and whose hand then goes perfectly still stays live until the pointer moves
+    // again. That residue is harmless by construction — a drag that is not being steered moves no
+    // window — and the FIRST report that could do harm is also the one that ends it. The operator's
+    // escape from the state in the meantime is `<TAB>`, which cancels (see `wc_focus_key`).
+    // DRAGSETTLE — **THE BELT MAY NOT STEER, AND IT MAY NOT JUMP THE EDGE.** Two defects lived in
+    // the three lines this replaces, and a GR24 capture shows both: every gesture in it ends
+    // `release-level` and the delivered-release arm never fires once, while the window lands about a
+    // pixel off where the hand let go.
+    //
+    // The mechanism is an ORDERING one, not a lost report. `note_buttons` publishes the LEVEL the
+    // instant a report is decoded, in the service pass; the `Event::Button` carrying the same
+    // release goes through `pal`'s QUEUE and is judged a drain tick later. The release report also
+    // carries the lift's own dx/dy, pushed as an `Event::Mouse` AHEAD of that button. So the drain
+    // pops the lift motion first, moves the cursor by it, reaches this tail, reads a level that is
+    // ALREADY up — and the old code steered the window to the post-lift cursor and cancelled. By the
+    // time the real release edge arrived the drag was gone, so `wc_click_route_at`'s arm found
+    // nothing to end. The belt was not the safety net under the edge; it was standing in front of it.
+    //
+    // Both halves are addressed here and neither weakens the net:
+    //  * **Wait for an edge that is in flight.** `pal::release_edge_pending()` is nonzero only while
+    //    a release edge is queued and undrained. While it is, this returns without steering and
+    //    without ending — the edge is a drain tick away and it ends the gesture with the settle
+    //    below. When no edge is coming (the report was superseded before it was read, the CLICK-3
+    //    loss the belt exists for), the count is zero and the belt fires exactly as it always did.
+    //  * **A deadline, so the wait cannot become the wedge.** An edge queued and then popped by some
+    //    consumer other than the router would otherwise hold the belt off forever — the one failure
+    //    (a drag outliving the hand) this whole mechanism exists to prevent. After
+    //    `RELEASE_EDGE_GRACE_MS` of the level reading up, the belt fires anyway and says so
+    //    (`end=level-late`, and `release-late` on the `[wm-act]` line).
+    //
+    //    **It is not a wall clock, and inherits the LIMIT above verbatim.** The deadline is only
+    //    ever EVALUATED here, and here only runs on a pointer report — so the guarantee it makes is
+    //    "no more than `RELEASE_EDGE_GRACE_MS` of FURTHER REPORTS", not "no more than 120 ms". A
+    //    hand that lets go and goes perfectly still leaves the drag live exactly as it did before
+    //    this arc, on the same reasoning: an unsteered drag moves no window, the first report that
+    //    could do harm is also the one that ends it, and `<TAB>` is the escape in the meantime.
+    //  * **End where the hand WAS, not where it has since gone.** The settle point is the last
+    //    pointer position observed with the button DOWN, recorded unthrottled below, so it is
+    //    neither short of the release (the throttle's cost, which is why the old code sampled live)
+    //    nor past it (the lift's cost, which is the ~1px the operator sees).
+    //
+    // DRAGGLIDE — **AND THE WAIT MAY NOT GO DEAF.** Peter's Boot A verdict on the code above: the
+    // 1 px hop is gone and every gesture ends `end=edge`, but the window now *glides to a landing* —
+    // it comes to rest visibly before the hand lets go.
+    //
+    // The mechanism is the wait itself. `return` here DROPS the motion. The level is published in the
+    // service pass and the edge travels the queue, so from the instant the release is queued until
+    // the drain pops it, EVERY motion this tail sees is discarded — while the drain, which moves the
+    // cursor before it reaches here, keeps advancing the arrow. Those discarded motions are not
+    // post-release slop: the queue is FIFO and the edge is behind them, so by construction they were
+    // produced BEFORE the release. They are the last inches of the gesture, and the window is denied
+    // them. On a drain running behind a 125 Hz pointer that is a backlog of reports, which is why the
+    // capture's `stale=` reaches (-7,16) — the window rests up to that far short of the hand.
+    //
+    // So the wait keeps its job (only the edge may END the gesture) and loses its side effect: a
+    // motion drained while a release edge is still queued STEERS, exactly as it would have with the
+    // button still down, and is recorded as the settle. The window follows the hand all the way to
+    // the release point and stops there.
+    //
+    // This is safe ONLY because of the producer-side reorder in `pal::push_event`
+    // (`RELEASE_EDGE_REORDERED`): the release report's OWN lift dx/dy is queued ahead of its button,
+    // and steering with it is precisely the ~1px DRAGSETTLE removed. `pal` now puts the edge in front
+    // of that motion, so every motion drained while `pend != 0` is from an earlier report. The two
+    // halves are one fix; neither is correct alone, and `swap=` on the `[dragrel]` line is how a
+    // capture says the producer half fired.
+    if !crate::pal::cursor::button_down() {
+        let now = crate::arch::ticks();
+        let held = DRAG_LEVEL_UP_MS.load(Ordering::Relaxed);
+        if held == 0 {
+            DRAG_LEVEL_UP_MS.store(now.max(1), Ordering::Relaxed);
+        }
+        let waited = if held == 0 { 0 } else { now.wrapping_sub(held) };
+        let pend = crate::pal::release_edge_pending();
+        if pend != 0 && waited < RELEASE_EDGE_GRACE_MS {
+            // DRAGGLIDE — a LEAD motion: produced before the release edge that is still queued behind
+            // it, so it is hand travel with the button physically down. Steer with it and record it.
+            //
+            // `DRAG_LEVEL_UP_MS` is deliberately NOT reset: the grace deadline must keep running, or
+            // a hand that keeps moving after an edge some other consumer ate would hold the belt off
+            // for the rest of the boot — the one failure this whole mechanism exists to prevent.
+            //
+            // **AND THE SETTLE IS TRUSTED FOR [`LEAD_TRUST_MS`], NOT FOR THE WHOLE GRACE.** Review
+            // defect this closes, on the one path where the old settle was already RIGHT: when an
+            // edge is queued and then eaten by some other consumer, the belt does not fire until the
+            // 120 ms grace expires (`end=level-late`). Recording every lead motion for that whole
+            // window would walk `DRAG_DOWN_*` along with the hand for up to 120 ms PAST the release
+            // — the window then settles well beyond where the operator let go, and `stale=` would
+            // read (0,0) while it happened, because `stale` is measured against the settle this very
+            // code moved. A drain backlog is MILLISECONDS; beyond that the level has been up too
+            // long for a motion to still be pre-release hand travel. So past the trust window the
+            // motions still STEER (the window keeps following, which is what kills the glide) but
+            // they no longer move the settle, and the belt ends the gesture where the hand actually
+            // was. `lead=` still counts them, so a capture can see the two regimes.
+            let (x, y) = click_pointer_pos();
+            if waited <= LEAD_TRUST_MS {
+                DRAG_DOWN_X.store(x, Ordering::Relaxed);
+                DRAG_DOWN_Y.store(y, Ordering::Relaxed);
+                DRAG_DOWN_VALID.store(true, Ordering::Release);
+            }
+            DRAG_LEAD_MOTIONS.fetch_add(1, Ordering::Relaxed);
+            let last = DRAG_MOTION_LAST_MS.load(Ordering::Relaxed);
+            if now.wrapping_sub(last) >= DRAG_MOTION_MS {
+                DRAG_MOTION_LAST_MS.store(now, Ordering::Relaxed);
+                // Not `drag_steer_apply`: the level reads up on this path BY DEFINITION, so counting
+                // it against the `post=` tripwire would make every gesture read DIRTY and retire the
+                // one sentinel that watches for a steer that forgot the level. `lead=` is its own
+                // field for its own reason.
+                crate::video::wm::drag_motion(x, y);
+            }
+            return;
+        }
+        // The two belt endings are DIFFERENT FACTS and get different reasons on both wires. `level`
+        // is the belt doing the job it was built for: no edge was ever queued, so the release report
+        // was superseded before it could be read. `late` is the belt firing past its deadline with
+        // an edge still counted as in flight — that edge was queued and then eaten by something
+        // other than the router, which is a defect in the drain, not in the pad. A capture that
+        // cannot tell those apart cannot tell a lossy endpoint from a lossy consumer.
+        let late = pend != 0;
+        let (sx, sy) = drag_settle_point();
+        drag_settle_apply(sx, sy);
+        dragrel_witness(if late { "level-late" } else { "level" }, sx, sy, pend);
+        crate::video::wm::drag_cancel(if late { "release-late" } else { "release-level" });
+        drag_settle_disarm();
+        return;
+    }
+    // The button is down in BOTH views. Record the position unthrottled — the throttle exists to cap
+    // composites, not to lose the operator's last inch — and steer under it.
+    let (x, y) = click_pointer_pos();
+    DRAG_DOWN_X.store(x, Ordering::Relaxed);
+    DRAG_DOWN_Y.store(y, Ordering::Relaxed);
+    DRAG_DOWN_VALID.store(true, Ordering::Release);
+    DRAG_LEVEL_UP_MS.store(0, Ordering::Relaxed);
+    let now = crate::arch::ticks();
+    let last = DRAG_MOTION_LAST_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < DRAG_MOTION_MS {
+        return;
+    }
+    DRAG_MOTION_LAST_MS.store(now, Ordering::Relaxed);
+    drag_steer_apply(x, y);
+}
+
+#[cfg(not(feature = "wc"))]
+pub fn wc_drag_motion() {}
+
+/// WMDIRECT — minimum spacing between drag repositions, in ms. ~60 Hz: fast enough that the window
+/// tracks the hand, slow enough that a trackpad sweep cannot queue more composites than the panel
+/// can retire.
+#[cfg(feature = "wc")]
+const DRAG_MOTION_MS: u64 = 16;
+#[cfg(feature = "wc")]
+static DRAG_MOTION_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+// --- DRAGSETTLE (metal defect: the drop shifts the window ~1px, and the release EDGE never fires) --
+//
+// The settle point of a gesture is the last pointer position seen with the button DOWN — not the
+// live cursor at end time. Recorded here rather than in `wm` on purpose: `wm::drag_motion` is the
+// mover and knows nothing about which pointer report it came from, while this file owns every call
+// site a real x86 gesture takes (the routing tail and the release arm of `wc_click_route_at`).
+//
+// Unconditional on the `wc` feature, unlike the throttle above: `wc_click_route_at`'s release arm is
+// compiled in every build, so the settle it reads must be too.
+
+/// DRAGSETTLE — last pointer X observed with the primary button DOWN during the live gesture.
+static DRAG_DOWN_X: AtomicI32 = AtomicI32::new(0);
+/// DRAGSETTLE — last pointer Y observed with the primary button DOWN during the live gesture.
+static DRAG_DOWN_Y: AtomicI32 = AtomicI32::new(0);
+/// DRAGSETTLE — whether [`DRAG_DOWN_X`]/[`DRAG_DOWN_Y`] describe the LIVE gesture.
+///
+/// Cleared by the two paths that END a gesture in this file (the release arm and the belt) and by
+/// `<TAB>`. It is NOT cleared by the teardown cancels inside `wm` itself — a window closed under the
+/// hand goes `close_owner` -> `drag_forget_owner` -> `drag_cancel`, which this file never sees, and
+/// leaves the flag set over dead coordinates. Harmless by construction rather than by luck: the
+/// coordinates are only ever READ while `drag_active()` names a live window, and the only way back
+/// into that state is `drag_begin`, whose call site re-seeds them ([`drag_settle_arm`]).
+static DRAG_DOWN_VALID: AtomicBool = AtomicBool::new(false);
+/// DRAGSETTLE — `ticks()` when the button LEVEL first read up during the live gesture; 0 = it reads
+/// down (or no gesture). The clock the grace deadline below is measured on.
+static DRAG_LEVEL_UP_MS: AtomicU64 = AtomicU64::new(0);
+/// DRAGSETTLE — steering motions applied to the live gesture after the level read up.
+///
+/// **A CONCURRENCY TRIPWIRE, and stated as one rather than sold as the arc's evidence.** Review
+/// condition: this reads 0 on the fixed build *and on the pre-fix build*, because the only code that
+/// can increment it is reached from the branch that has just read `button_down() == true` — the old
+/// defect took the CANCEL path, not the steer path, so it never passed through here. The single
+/// window in which it can genuinely fire is a release landing between that read and the apply below,
+/// on another core or in the HID interrupt.
+///
+/// So it is worth keeping and worth nothing as diagnosis: it catches a FUTURE steering caller added
+/// to this file that forgets the level, and it catches that narrow race. The falsifiable content of
+/// the `[dragrel]` line is `end=` and `stale=`, not this field, and `engine.md` says so.
+static DRAG_POST_MOTIONS: AtomicU32 = AtomicU32::new(0);
+
+/// DRAGGLIDE — motions STEERED into the live gesture while its release edge was queued but undrained.
+///
+/// **The glide's own measurement, and unlike `post=` it is falsifiable in both directions.** On the
+/// code this replaces every one of these motions was DROPPED, and the window rested that much short
+/// of where the hand let go; here each one steers. A capture where the operator still sees the window
+/// settle early while this reads 0 on every gesture refutes the backlog diagnosis outright — the
+/// window was never denied a motion, and the settle is short for some other reason. A capture where
+/// it reads high while `stale=` is large says the lead motions are arriving but not reaching the
+/// window (the throttle, or a mover that clamped).
+static DRAG_LEAD_MOTIONS: AtomicU32 = AtomicU32::new(0);
+
+/// DRAGGLIDE — [`DRAG_LEAD_MOTIONS`] as of the LAST gesture to end, kept across the disarm.
+///
+/// **It exists so a fixture can tell "the kernel got this wrong" from "two routers interleaved".**
+/// Both x86 drains (`main.rs`'s BSP GUI loop and the SCHED-X86 render service) pop from one ring and
+/// route through one chain, and popping is serialised while ROUTING is not: consumer A can pop the
+/// lead motion, consumer B pop the release edge, and A route its motion — and the lift behind that
+/// edge — before B routes the edge. The lift is then steered with, which is the ~1px, and no code in
+/// the drag tail can tell that from a legitimate lead motion, because at routing time `pend` still
+/// reads nonzero. The witness of it is a lead count higher than the gesture actually had.
+///
+/// The selftest legs read this to SKIP rather than fail on such a run. That is a fixture decision;
+/// the underlying interleave is a real property of a two-drain kernel and is written up in
+/// `engine.md` as an open item, not papered over here.
+static DRAG_LAST_LEAD: AtomicU32 = AtomicU32::new(0);
+
+/// DRAGGLIDE — the lead-motion count of the last gesture to end (see [`DRAG_LAST_LEAD`]).
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn drag_last_lead() -> u32 {
+    DRAG_LAST_LEAD.load(Ordering::Relaxed)
+}
+
+/// DRAGSETTLE — how long the belt waits for a release EDGE that `pal` says is queued before ending
+/// the gesture on the level alone. Long enough that an ordinary drain tick (a frame) is never
+/// jumped, short enough that "the window is still following my hand" is not a state an operator can
+/// perceive. The wait steers nothing, so its whole cost is when the window comes to rest.
+#[cfg(feature = "wc")]
+const RELEASE_EDGE_GRACE_MS: u64 = 120;
+
+/// DRAGGLIDE — how long after the button LEVEL reads up a drained motion may still be believed to be
+/// pre-release hand travel and allowed to move the SETTLE.
+///
+/// The lead branch exists because a motion drained while the release edge is queued was, by queue
+/// order, produced with the button down — but that reasoning has a shelf life. It holds while the
+/// edge is a drain tick behind, which is a backlog measured in milliseconds (a 125 Hz pointer and a
+/// frame-rate drain). It does NOT hold for the full `RELEASE_EDGE_GRACE_MS`: that window is sized for
+/// an edge some other consumer ATE, and a gesture sitting in it is no longer being told anything
+/// truthful by `pend`. 32 ms is two frames of backlog — several times any real drain lag, and a
+/// quarter of the grace, so the two regimes stay distinguishable on a capture.
+///
+/// Past it the motions still steer; they simply stop moving `DRAG_DOWN_*`. The window keeps
+/// following the hand (no glide) and the gesture still comes to rest where the hand let go.
+#[cfg(feature = "wc")]
+const LEAD_TRUST_MS: u64 = 32;
+
+/// DRAGSETTLE — `[dragrel]` lines emitted, against [`DRAGREL_LOG_MAX`]. One per gesture end and a
+/// hand cannot let go faster than serial can print, but the budget is stated rather than assumed.
+static DRAGREL_LOG: AtomicU64 = AtomicU64::new(0);
+const DRAGREL_LOG_MAX: u64 = 256;
+
+/// DRAGSETTLE — arm the settle for a gesture that has just begun, at its grab point.
+///
+/// Seeded rather than left invalid so that a grab-and-let-go with no motion in between settles at
+/// the grab point instead of falling back to the live cursor (which by then carries the lift).
+fn drag_settle_arm(x: i32, y: i32) {
+    DRAG_DOWN_X.store(x, Ordering::Relaxed);
+    DRAG_DOWN_Y.store(y, Ordering::Relaxed);
+    DRAG_LEVEL_UP_MS.store(0, Ordering::Relaxed);
+    DRAG_POST_MOTIONS.store(0, Ordering::Relaxed);
+    DRAG_LEAD_MOTIONS.store(0, Ordering::Relaxed);
+    DRAG_DOWN_VALID.store(true, Ordering::Release);
+}
+
+/// DRAGSETTLE — where the live gesture should come to rest: the last position the hand was at with
+/// the button still down, or the live cursor if no such position was ever recorded (a drag begun by
+/// something other than the chrome arm — the selftest drives exactly that path).
+fn drag_settle_point() -> (i32, i32) {
+    if DRAG_DOWN_VALID.load(Ordering::Acquire) {
+        (
+            DRAG_DOWN_X.load(Ordering::Relaxed),
+            DRAG_DOWN_Y.load(Ordering::Relaxed),
+        )
+    } else {
+        click_pointer_pos()
+    }
+}
+
+/// DRAGSETTLE — apply one STEERING motion, re-reading the level at the moment of the apply.
+///
+/// The re-read is the tripwire described on [`DRAG_POST_MOTIONS`], and its reachability is stated
+/// there honestly: on both the fixed and the pre-fix build it is 0, because the caller has just
+/// tested the same level. It fires for a release that lands in the gap (another core, the HID
+/// interrupt), and for any steering caller added here later that skips the level test.
+#[cfg(feature = "wc")]
+fn drag_steer_apply(x: i32, y: i32) {
+    if !crate::pal::cursor::button_down() {
+        DRAG_POST_MOTIONS.fetch_add(1, Ordering::Relaxed);
+    }
+    crate::video::wm::drag_motion(x, y);
+}
+
+/// DRAGSETTLE — apply the FINAL motion of a gesture. Not a steer: the level reads up by definition
+/// on this path, so it must not be counted against the sentinel above.
+fn drag_settle_apply(x: i32, y: i32) {
+    crate::video::wm::drag_motion(x, y);
+}
+
+/// DRAGSETTLE — **the one line that says how a gesture ended and whether the drop was clean.**
+///
+/// Emitted from BOTH end paths, immediately before the `wm` call that clears the gesture, so the
+/// `[dragrel]` line always precedes its own `[drag]`/`[wm-act]` pair in a capture.
+///
+/// ```text
+/// [dragrel] win=3 end=edge settle=(1606,376) release=(1606,376) stale=(0,0) lead=3 swap=1 post=0 pend=0 wait=4ms -> CLEAN
+/// ```
+///
+///  * `end=` — **which path ended it.** `edge` = the delivered release `Event::Button`, carrying the
+///    operator's own let-go. `level` = the belt, with no edge queued (a release report superseded
+///    before it was read — the CLICK-3 loss). `level-late` = the belt fired with an edge still
+///    counted as queued, i.e. something other than the router popped it and the deadline expired.
+///  * `settle=` — the panel point the window was finally steered to.
+///  * `release=` — the live cursor at end time.
+///  * `stale=` — `release - settle`: **the motion that arrived after the button read up and was not
+///    given to the window**. It is the measurement, not a verdict. Under DRAGSETTLE alone this was
+///    the whole discarded backlog (a GR24/GR25 capture reaches (-7,16)) and that backlog WAS the
+///    glide; under DRAGGLIDE those motions steer, so on an ordinary gesture the expected reading is
+///    `(0,0)` — the release report's own lift is still queued BEHIND the edge when this prints, so
+///    the cursor has not yet been moved by it.
+///  * `lead=` (DRAGGLIDE) — motions steered while the release edge was queued: the hand travel the
+///    window used to be denied. See [`DRAG_LEAD_MOTIONS`].
+///  * `swap=` (DRAGGLIDE) — 1 when `pal` put this gesture's release edge ahead of its own lift
+///    motion, 0 when the release report carried no motion to get in front of (or the adjacency test
+///    declined). It is the producer half of the fix reporting in: `lead=` high with `swap=0` on every
+///    gesture would mean the window is being steered by lift deltas and the ~1px is back.
+///  * `post=` — the concurrency tripwire described on [`DRAG_POST_MOTIONS`]. It reads 0 on this
+///    build **and would have read 0 on the broken one**, so it is not evidence for or against the
+///    fix; it is a regression sentinel, and `-> DIRTY` is its alarm, not the arc's verdict.
+///  * `pend=` / `wait=` — release edges queued but undrained at end time, and how long the belt had
+///    been holding for one.
+///
+/// **What refutes what — and it is `end=` and `stale=` that carry it, not `post=`.**
+///  * `end=edge` on the ordinary gestures, with the window resting at `settle=`, is the fix working.
+///  * `end=level` on EVERY gesture refutes the ordering diagnosis: the edge is not being beaten to
+///    the punch, it is not arriving at all, and the search moves back into the HID service pass.
+///  * `stale=(0,0)` on every gesture while the operator still sees the window jump refutes the
+///    stale-motion hypothesis for the ~1px entirely — the shift is then in the mover
+///    (`move_to_inner`'s clamp) or in the erase, not in this path.
+///  * `stale=` of many pixels rather than one or two says motion reports were still queued when the
+///    level flipped: the settle is then short of the release by that much, and the level needs to
+///    travel IN the event stream rather than beside it.
+///  * `end=level-late` recurring says something other than the router is eating release edges.
+///
+/// **What refutes the GLIDE fix specifically.**
+///  * The operator still sees the window come to rest before the hand lets go, while `lead=0` on
+///    every gesture — the window was never denied a motion, so the backlog is not what he is seeing
+///    and the search moves to the mover or to the drain's own latency.
+///  * `lead=` nonzero and `stale=` still large — the lead motions are being counted but not reaching
+///    the window: look at `DRAG_MOTION_MS` (the throttle admits ~60 Hz; the settle is unthrottled, so
+///    a large `stale=` here would mean the settle record itself is not being taken) or at a clamp in
+///    `move_to_inner`.
+///  * `swap=0` on every gesture with `lead=` nonzero — the producer half never fires, the lift is
+///    being steered with, and the ~1px DRAGSETTLE removed is back. Expect the drop to shift again.
+fn dragrel_witness(how: &str, sx: i32, sy: i32, pend: u32) {
+    if DRAGREL_LOG.fetch_add(1, Ordering::Relaxed) >= DRAGREL_LOG_MAX {
+        return;
+    }
+    // Measured from the level, not from the end path, so both arms report the same quantity: how
+    // long the button had read up when the gesture was finally ended. `0` on the edge arm means the
+    // release edge arrived without a single motion report in front of it.
+    let up = DRAG_LEVEL_UP_MS.load(Ordering::Relaxed);
+    let waited = if up == 0 {
+        0
+    } else {
+        crate::arch::ticks().wrapping_sub(up)
+    };
+    let (rx, ry) = click_pointer_pos();
+    let post = DRAG_POST_MOTIONS.load(Ordering::Relaxed);
+    let lead = DRAG_LEAD_MOTIONS.load(Ordering::Relaxed);
+    // Latched before the disarm that follows every call site, so a fixture can read it afterwards.
+    DRAG_LAST_LEAD.store(lead, Ordering::Relaxed);
+    serial_println!(
+        "[dragrel] win={} end={} settle=({},{}) release=({},{}) stale=({},{}) lead={} swap={} post={} pend={} wait={}ms -> {}",
+        crate::video::wm::drag_active(),
+        how,
+        sx,
+        sy,
+        rx,
+        ry,
+        rx - sx,
+        ry - sy,
+        lead,
+        u8::from(crate::pal::release_edge_reordered()),
+        post,
+        pend,
+        waited,
+        if post == 0 { "CLEAN" } else { "DIRTY" }
+    );
+}
+
+/// DRAGSETTLE — the gesture is over: forget its settle so the next one cannot inherit it.
+fn drag_settle_disarm() {
+    DRAG_DOWN_VALID.store(false, Ordering::Release);
+    DRAG_LEVEL_UP_MS.store(0, Ordering::Relaxed);
+    DRAG_POST_MOTIONS.store(0, Ordering::Relaxed);
+    DRAG_LEAD_MOTIONS.store(0, Ordering::Relaxed);
+}
+
+/// WMDIRECT — **THE X86 EVENT-ROUTING CHAIN, AS ONE FUNCTION.** Both x86 drains (the BSP GUI loop
+/// and the SCHED-X86 render service) called an identical three-line `if/else if/else` inline; this
+/// is that chain, named once.
+///
+/// The order is load-bearing and is documented at each callee:
+///  1. `wc_focus_key` — `<TAB>` is addressed to the WINDOW SYSTEM, not to any app, and must be
+///     judged before either router or a focused app swallows the only exit from its own window.
+///  2. `wc_click_route` — a pointer BUTTON is addressed by POSITION before it is delivered by FOCUS.
+///  3. `user_input_route` — everything else goes to whoever holds the keyboard.
+///
+/// Returns `Event::Unknown` (never `Event::None`) for a consumed event, because every drain on this
+/// arch treats `None` as end-of-queue.
+///
+/// **It exists as a function so the witness can drive the REAL chain.** `wmdirect_selftest` asserts
+/// against this call and [`wc_route_tail`], not against a transcription of them — the failure this
+/// closes is a witness that tests the API while the path a pointer report actually takes is inert.
+pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event {
+    // CRYSTAL — Escape dismisses an open SHARD menu, and is addressed to the window system exactly as
+    // `<TAB>` is, so it is judged in the same place: before either router or a focused app can swallow
+    // it. It consumes ONLY a bare `Esc` while the menu is open; every other event, and `Esc` with no
+    // menu up, falls straight through to the chain below unchanged.
+    #[cfg(feature = "wc")]
+    if crate::video::crystal::key_escape(raw) {
+        return crate::pal::Event::Unknown;
+    }
+    if wc_focus_key(raw) {
+        crate::pal::Event::Unknown
+    } else if wc_click_route(raw) {
+        crate::pal::Event::Unknown
+    } else {
+        user_input_route(raw)
+    }
+}
+
+/// WMDIRECT — **the drain's TAIL: what a pointer report owes the window system after the drain's own
+/// arms have run.** Today that is exactly one thing — steering a live title-bar drag.
+///
+/// Keyed on the RAW report and NOT on the routed outcome. `Event::Mouse`/`Event::MouseAbsolute` are
+/// PACKABLE, so a focused ring-3 app with room in its ring consumes every pointer report and the
+/// drain's pointer arms never run; a title-bar grab GUARANTEES that state, because the chrome arm of
+/// [`wc_click_route_at`] focuses the dragged window's own owner. Keyed on the outcome, the drag would
+/// be dead for every app window and alive only for the console and the focus-exempt desktop row.
+///
+/// Called AFTER the drain's `match`, so the shared `pal::cursor` position this reads is fresh on both
+/// branches — `pal::cursor::track_routed` applied it on the consumed branch (CURSOR-VUG), the
+/// `Mouse`/`MouseAbsolute` arms applied it on the declined one. Exactly one tick per report either
+/// way, so a relative report is never applied twice.
+pub fn wc_route_tail(raw: crate::pal::Event) {
+    if matches!(
+        raw,
+        crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. }
+    ) {
+        wc_drag_motion();
+    }
+}
+
 /// CLICK-X86 — **route a pointer button by POSITION rather than by focus.** The shell's event drain
-/// calls this on every event, BEFORE `el0_input_route`; non-`Button` events return `false` untouched.
+/// calls this on every event, BEFORE `user_input_route`; non-`Button` events return `false` untouched.
 ///
 /// Returns `true` when the event was CONSUMED and the caller must not deliver or forward it. Under
 /// CLICK-PLAIN that is only the arms with no app to deliver to (a press on kernel furniture or on the
@@ -3818,9 +6340,9 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
 /// Hit-test the point (`wm::hit_test` — the topmost visible window whose outer box contains it):
 ///
 ///  * **a window owned by a DIFFERENT address space than the focused one** — raise it to focus
-///    through the one focus primitive that exists (`el0_input_set_active` then `wm::focus_changed`,
+///    through the one focus primitive that exists (`user_input_set_active` then `wm::focus_changed`,
 ///    in that order), and then **DELIVER the press to it**. The wake half runs FIRST and in full, so
-///    by the time the caller pushes, `EL0_INPUT_ACTIVE` already names the raised owner and the press
+///    by the time the caller pushes, `USER_INPUT_ACTIVE` already names the raised owner and the press
 ///    lands in the ring of the window that was clicked. Click-to-focus, with no second focus path
 ///    invented for it.
 ///
@@ -3836,7 +6358,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
 ///    click landed on the kernel's furniture, which owns no address space and has no input ring. Two
 ///    things happen and they are separate: the row is RAISED (`focus_changed(owner)`, so the click
 ///    has a visible effect — the console comes to the front under the hand), and the KEYBOARD goes
-///    back to the shell (`el0_input_set_active(0)`), because the console is the shell's surface and
+///    back to the shell (`user_input_set_active(0)`), because the console is the shell's surface and
 ///    clicking it must be how the operator reaches it. The press itself is consumed: on x86 the shell
 ///    has no click consumer at all, so there is nothing to deliver it to, and re-addressing it after
 ///    the fact would split a pair whose press edge no consumer saw.
@@ -3865,15 +6387,237 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         return false;
     };
     let prev = CLICK_PREV_MASK.swap(mask as u32, Ordering::Relaxed) as u8;
-    let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
-    if mask & !prev != 0 {
-        // PRESS edge.
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    // CLICK-REPRESS — **a stationary re-press the level latch would otherwise swallow** (Boot C, the
+    // operator: "clicks won't keep flowing — I have to move the mouse then click again").
+    //
+    // `prev` is this router's own level latch, and it goes STALE the same way the HID `prev_buttons`
+    // latch did before CLICK-3. The trackpad is serviced at frame rate — orders of magnitude slower
+    // than its report interval — so a RELEASE that lands in the gap between two service passes is
+    // superseded by the pad's next level report and never reaches this seam. `prev` then stays
+    // primary-down for good, every subsequent stationary press fails the `mask & !prev` edge test
+    // below, and the click is dropped HERE, silently, with no `[clickroute]` line at all. Boot C's
+    // capture is the proof: 43 HID down-edges, 29 releases (14 polled-over), 31 routed presses.
+    //
+    // A wiggle "fixes" it only as a side effect: a motion report carries the button UP, which is what
+    // finally lets the HID release arm emit the missed `Button(0)` and clear this latch. That is the
+    // whole of the "move then click" workaround, and it is the symptom, not a second mechanism.
+    //
+    // The recovery is CLICK-3's, one layer up and on the identical contract: every pointer producer
+    // emits a `Button` ONLY on a genuine edge and de-dups a hold (EHCI's 120 ms quiet gate in
+    // `note_buttons`; xHCI on the down edge alone), so an identical PRIMARY-DOWN mask RE-REPORTED to
+    // this seam is a NEW press, never a hold. It is routed through the same press body — and
+    // `CLICK_PREV_MASK` is already `mask` from the swap above, so no consumer downstream ever sees the
+    // stale latch. A first press (`prev` primary-clear) still takes the ordinary edge test, and a
+    // multi-button change always moves the mask, so `mask == prev` isolates exactly the re-press.
+    let repress = mask & 0x01 != 0 && mask == prev;
+    if repress {
+        let n = CLICK_REPRESS_X86.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= CLICK_REPRESS_LOG_MAX_X86 {
+            serial_println!(
+                "[clickrepress] recovered stationary re-press mask={:#04x} at ({},{}) total={} == witness ::",
+                mask, x, y, n
+            );
+        }
+    }
+    if mask & !prev != 0 || repress {
+        // PRESS edge (or a recovered stationary re-press — see CLICK-REPRESS above).
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
+        // CRYSTAL — **judged FIRST, ahead of the dock and every window arm.** The SHARD menu, when
+        // open, is a modal dropdown composited on top of everything, so its press must be tested
+        // before any layer beneath it; when closed, the only point it claims is the crystal box in
+        // the menu bar, which the bar owns anyway (the bar composites above the windows). It declines
+        // every other point (`false`), so the dock and window arms are not starved. Consumed with the
+        // target set to DROP so the matching RELEASE is dropped rather than delivered into whatever
+        // holds focus — the rule the dock, close and chrome arms below already follow.
+        #[cfg(feature = "wc")]
+        if crate::video::crystal::press_at(x, y) {
+            CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+            return true;
+        }
+        // DOCK — **judged before EVERY window arm, because the dock is composited on top of them.**
+        //
+        // `wm::hit_test` knows nothing of the strip: it answers from the window table, and a window
+        // lying under the dock would take a press the operator can see landed on a dock tile. Asking
+        // the dock first is the same ordering rule the chrome arm below states for chrome — the
+        // painter that owns the pixel owns the press — applied to the layer above the window layer.
+        //
+        // Neither side can be starved. The dock declines every point outside its own strip
+        // (`Layout::contains`, the same accessor its painter draws from, corners included), so there
+        // is no point at which both this arm and a window arm answer "mine"; and the strip is
+        // auto-sized to its tiles and drawn only when there is at least one, so a bare desktop has no
+        // dock to swallow anything.
+        //
+        // Consumed, with the target set to DROP so the matching RELEASE is dropped rather than
+        // delivered into whatever holds focus after the raise — the rule the close and chrome arms
+        // below already follow for the same reason.
+        #[cfg(feature = "wc")]
+        if crate::video::dock::press_at(x, y) {
+            CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+            return true;
+        }
+        // WMDIRECT — **CHROME IS JUDGED BEFORE THE APP ARMS, AND THAT IS THE WHOLE ROUTING RULE.**
+        //
+        // *A press on a window's kernel-drawn chrome — close box, title strip, border — is an
+        // instruction to the WINDOW SYSTEM and is consumed here; a press on its content is the app's
+        // input and falls through to the arms below.*
+        //
+        // Neither side can be starved by the other, and neither claim is a policy:
+        //  * **The app cannot be starved of content clicks.** `wm::chrome_hit` is `outer_box` MINUS
+        //    `content_box` — a region the app's surface does not cover a pixel of. There is no point
+        //    at which both answers are "mine", so the WM cannot take a click the app could have had.
+        //  * **The WM cannot be locked out by a full-screen app.** `chrome_hit` declines COMPAT rows
+        //    (the `present_surface` shim draws no chrome, so the difference is empty) — a
+        //    full-screen app keeps its whole panel, and the WM's own reach into that state is `<TAB>`
+        //    and the desktop-miss arm, exactly as before this arc.
+        //
+        // Placed AHEAD of the kernel-furniture and focus-exempt arms deliberately: the console's
+        // title bar is furniture too, and dragging it must work whether or not the row is a focus
+        // target. `wm::controls` still declines owner-0 rows, so the SHELL has no cluster and cannot
+        // be killed by a click; the console (a kernel-band owner) does have one — see the close arm.
+        if let Some((win, owner, _z)) = crate::video::wm::hit_test(x, y) {
+            // WMCTRL — **ONE question for the whole control cluster.** `control_hit` names WHICH of
+            // the three discs the press landed on, from the same `control_disc` accessor the painter
+            // lays them out with, so a control that is drawn is a control that can be pressed and
+            // vice versa. Before this only CLOSE was wired, its hit box was the cluster's left
+            // anchor (i.e. the LEFTMOST disc), and the other two fell through to the title-bar drag
+            // below — so on the metal a press aimed at minimise killed the process.
+            //
+            // All three arms CONSUME the press: a control is an instruction to the window system,
+            // never app input. Close and minimise take `CLICK_TARGET_DROP` because the window the
+            // release would be delivered to is going away or going under; zoom does too, for the
+            // simpler reason that a control press has no release semantics at all.
+            match crate::video::wm::control_hit(win, x, y) {
+                Some(crate::video::wm::Ctrl::Close) => {
+                    // CLOSE — the press is CONSUMED (target DROP, so the release is dropped with
+                    // it): the owner it would have been delivered to is being torn down.
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    // NORMALWIN — **kernel furniture closes by ID, not by owner.** Peter's ruling
+                    // (2026-08-11) gives the console window all three normal buttons, so this arm is
+                    // now reachable for `KERNEL_OWNER_CONSOLE` and the press has to act. It does NOT
+                    // act through `wc_close_click`: that call's first move is `wm::close_owner`, the
+                    // blast-radius primitive that reaps every row an ASID holds and is also what
+                    // process teardown calls — it refuses the kernel band by design (CLOSEISO) and
+                    // that refusal stays. `wm::close(win)` reaps EXACTLY the row the operator
+                    // pressed, which is what "close this window" means and is all a furniture close
+                    // is entitled to. There is no process behind a kernel row, so there is nothing
+                    // to kill and no focus grant to hand back through an ASID that never held one.
+                    let settle = if crate::video::wm::is_kernel_owner(owner) {
+                        wc_close_furniture(win, owner)
+                    } else {
+                        wc_close_click(owner)
+                    };
+                    if CLOSE_LOG_COUNT_X86.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
+                        serial_println!(
+                            "[wm-act] close win={} owner={:#x} at ({},{}) -> settle={}",
+                            win, owner, x, y, settle
+                        );
+                    }
+                    clickroute_witness(x, y, win, owner, cur, "close", 0);
+                    return true;
+                }
+                Some(crate::video::wm::Ctrl::Minimise) => {
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    let settle = crate::video::wm::minimise(win);
+                    // The KEYBOARD follows the window off the panel. Without this the operator is
+                    // typing into something they can no longer see; with it the prompt comes back,
+                    // which is also the surface `<TAB>` — the way back to the parked window — is
+                    // reached from. `focus_changed(0)` is deliberately NOT called: that is the
+                    // SHELL arm, and it parks EVERY owner. Minimise is one window's gesture.
+                    if cur == owner {
+                        user_input_set_active(0);
+                    }
+                    if CLOSE_LOG_COUNT_X86.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
+                        serial_println!(
+                            "[wm-act] minimise win={} owner={:#x} at ({},{}) -> settle={}",
+                            win, owner, x, y, settle
+                        );
+                    }
+                    clickroute_witness(x, y, win, owner, cur, "minimise", 0);
+                    return true;
+                }
+                Some(crate::video::wm::Ctrl::Zoom) => {
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    // Raise and focus first, on the title-bar arm's own rule: pressing a control is
+                    // an interaction with the window, and a zoomed window that stayed behind another
+                    // one would be a maximise the operator cannot see the result of.
+                    if !crate::video::wm::is_kernel_owner(owner)
+                        && !owner_is_focus_exempt(owner)
+                        && owner != cur
+                    {
+                        user_input_set_active(owner);
+                    }
+                    crate::video::wm::focus_changed(owner);
+                    let settle = crate::video::wm::zoom(win);
+                    if CLOSE_LOG_COUNT_X86.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
+                        serial_println!(
+                            "[wm-act] zoom win={} owner={:#x} at ({},{}) -> settle={}",
+                            win, owner, x, y, settle
+                        );
+                    }
+                    clickroute_witness(x, y, win, owner, cur, "zoom", 0);
+                    return true;
+                }
+                None => {}
+            }
+            if crate::video::wm::chrome_hit(win, x, y) {
+                // TITLE BAR / BORDER — raise and focus through the SAME primitives the content arms
+                // use (no second focus mechanism), then, on the title strip only, grab the window.
+                // Kernel furniture and focus-exempt rows keep their own rule: raise the row, but
+                // hand the KEYBOARD to the shell rather than to a program with no input ring.
+                if crate::video::wm::is_kernel_owner(owner) || owner_is_focus_exempt(owner) {
+                    user_input_set_active(0);
+                } else if owner != cur {
+                    user_input_set_active(owner);
+                }
+                crate::video::wm::focus_changed(owner);
+                let how = if crate::video::wm::drag_begin(win, x, y) {
+                    // DRAGSETTLE — the grab point is the gesture's first settle point, so a
+                    // grab-and-let-go with no motion between the edges rests exactly where it was
+                    // grabbed rather than wherever the lift left the cursor.
+                    drag_settle_arm(x, y);
+                    "drag"
+                } else {
+                    "chrome"
+                };
+                clickroute_witness(x, y, win, owner, cur, how, 0);
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                return true;
+            }
+        }
         match crate::video::wm::hit_test(x, y) {
             // KERNEL FURNITURE — raise it, hand the keyboard to the shell, consume the press.
             Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => {
                 clickroute_witness(x, y, win, owner, cur, "consume", 0);
-                el0_input_set_active(0);
+                user_input_set_active(0);
+                crate::video::wm::focus_changed(owner);
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                true
+            }
+            // DESKTOP-APP FURNITURE — a USER row whose slot is exempt from the focus grant. Treated
+            // exactly like the kernel-furniture arm above, and placed above BOTH app arms so it
+            // fires whether or not the row already holds focus — which is what makes it furniture
+            // rather than a focus target that merely starts unfocused.
+            //
+            // ### Why this arm exists
+            //
+            // The row this replaced was `KERNEL_OWNER_DESKTOP` and took the FIRST arm: clicking the
+            // desktop's furniture raised it and handed the keyboard to the SHELL. Making that same
+            // furniture a ring-3 process moved it into the arm below, which does the opposite
+            // (`user_input_set_active(owner)`), so the identical operator gesture on the identical
+            // piece of desktop went from "a reliable way to get the prompt back" to "a reliable way
+            // to lose the keyboard to a program with no `SYS_INPUT_POLL` at all". Recoverable with
+            // `<TAB>`, but inverted and silent, and inverted against the very thing being evicted.
+            //
+            // [`SLOT_NO_AUTOFOCUS`] already names exactly the set this applies to — kernel-initiated
+            // launches, of which there is one — so the click path asks the same question the grant
+            // path asks instead of inventing a second notion of furniture. Nothing is made
+            // unreachable: the desktop app stays in `focus_ring_apps`, so `<TAB>` still gives it the
+            // keyboard for anyone who wants it to have it. What is withheld is only the gesture that
+            // used to mean the opposite.
+            Some((win, owner, _z)) if owner_is_focus_exempt(owner) => {
+                clickroute_witness(x, y, win, owner, cur, "consume", 0);
+                user_input_set_active(0);
                 crate::video::wm::focus_changed(owner);
                 CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                 true
@@ -3882,8 +6626,8 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
             Some((win, owner, _z)) if owner != cur => {
                 clickroute_witness(x, y, win, owner, cur, "raise+deliver", owner);
                 // The wake half, in order: the focus arrival first, then the raise. Only then does
-                // the caller push — and by then `EL0_INPUT_ACTIVE` is `owner`.
-                el0_input_set_active(owner);
+                // the caller push — and by then `USER_INPUT_ACTIVE` is `owner`.
+                user_input_set_active(owner);
                 crate::video::wm::focus_changed(owner);
                 // The release must follow the press into the SAME ring: record the raised owner, not
                 // the sentinel, so the pair is delivered whole.
@@ -3904,7 +6648,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                 // compat row is the only other thing that can.
                 if cur != 0 && !crate::video::wm::compat_live() {
                     clickroute_witness(x, y, crate::video::wm::WIN_NONE, 0, cur, "consume", 0);
-                    el0_input_set_active(0);
+                    user_input_set_active(0);
                     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                     true
                 } else {
@@ -3919,6 +6663,37 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
             }
         }
     } else if prev & !mask != 0 {
+        // WMDIRECT — a live drag ENDS on the release, and its FINAL position is applied here,
+        // unthrottled. `wc_drag_motion`'s ~60 Hz admission is what keeps a trackpad sweep from
+        // queueing more composites than the panel can retire, and its cost is that the last few
+        // reports of a fast gesture are dropped; without this line the window would settle wherever
+        // the last admitted report put it rather than where the operator let go.
+        //
+        // Ahead of the target test, and unconditional on it: the drag's press was consumed with
+        // target DROP, so the arm below already answers `true` for it — this only has to make sure
+        // the gesture is finished before that answer is given.
+        //
+        // DRAGSETTLE — and it settles at the point the hand was at while the button was still DOWN,
+        // NOT at `(x, y)`. `(x, y)` is the live cursor, and by the time this edge is drained the
+        // release report's own lift delta has already been popped off the queue as an `Event::Mouse`
+        // and applied to it: sampling here moves the window that last inch AFTER the operator let
+        // go, which is the ~1px shift on the drop. The recorded point is maintained unthrottled by
+        // `wc_drag_motion`, so taking it costs nothing in reach — it is not the last THROTTLED
+        // position, it is the last position, full stop.
+        //
+        // DRAGSETTLE — the edge is accounted for FIRST, and unconditionally on there being a drag:
+        // a release that lands on something else must still clear the count, or the belt would hold
+        // off the NEXT gesture waiting for an edge that has already been and gone. Ahead of the
+        // witness too, so `pend=` reads "another release is queued behind this one" rather than
+        // always counting the edge that is being served.
+        crate::pal::note_release_edge_drained();
+        if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE {
+            let (sx, sy) = drag_settle_point();
+            drag_settle_apply(sx, sy);
+            dragrel_witness("edge", sx, sy, crate::pal::release_edge_pending());
+            crate::video::wm::drag_end();
+            drag_settle_disarm();
+        }
         // RELEASE edge — follow the press, or drop. Never hit-tested: the release belongs to whoever
         // received the press, not to whatever the pointer has since been dragged over.
         let target = CLICK_PRESS_TARGET.load(Ordering::Acquire);
@@ -4014,7 +6789,7 @@ pub fn clickroute_selftest() {
     }
 
     // Biased slots, i.e. the values `SYS_WIN_CREATE` now hands the compositor and the values
-    // `EL0_INPUT_ACTIVE` carries — the whole point of the bias is that these are the SAME numbers.
+    // `USER_INPUT_ACTIVE` carries — the whole point of the bias is that these are the SAME numbers.
     const OWNER_A: u64 = 1; // slot 0
     const OWNER_B: u64 = 2; // slot 1
     // In the reserved kernel band, so `wm::is_kernel_owner` answers for it exactly as it does for the
@@ -4072,29 +6847,29 @@ pub fn clickroute_selftest() {
     ];
     let desktop_pt = corners.iter().copied().find(|&(x, y)| wm::hit_test(x, y).is_none());
 
-    let saved_focus = el0_input_active();
+    let saved_focus = user_input_active();
 
     // Leg 2/3 — focus on A, press over B. Delivered, not swallowed; the pair lands whole in B's ring.
-    el0_input_set_active(OWNER_A);
+    user_input_set_active(OWNER_A);
     wm::focus_changed(OWNER_A);
     CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     let press_consumed = wc_click_route_at(Event::Button(1), bpx, bpy);
-    let raised_ok = el0_input_active() == OWNER_B;
-    let deliver_ok = !press_consumed && raised_ok && el0_input_enqueue(Event::Button(1));
-    let depth_press = el0_input_depth(OWNER_B);
+    let raised_ok = user_input_active() == OWNER_B;
+    let deliver_ok = !press_consumed && raised_ok && user_input_enqueue(Event::Button(1));
+    let depth_press = user_input_depth(OWNER_B);
     let rel_consumed = wc_click_route_at(Event::Button(0), bpx, bpy);
-    let rel_ok = !rel_consumed && el0_input_enqueue(Event::Button(0));
-    let depth_rel = el0_input_depth(OWNER_B);
+    let rel_ok = !rel_consumed && user_input_enqueue(Event::Button(0));
+    let depth_rel = user_input_depth(OWNER_B);
     let depth_ok = depth_press == 1 && depth_rel == 2 && rel_ok;
 
     // Leg 4 — a press over KERNEL furniture, from a live app focus. Consumed; keyboard to the shell;
     // the raise is the row's own z-bump and `SHELL_Z` must not move.
-    el0_input_set_active(OWNER_A);
+    user_input_set_active(OWNER_A);
     wm::focus_changed(OWNER_A);
     let shell_z_before = wm::shell_z();
     let kernel_consumed = wc_click_route_at(Event::Button(1), kpx, kpy);
     let kernel_ok =
-        kernel_consumed && el0_input_active() == 0 && wm::shell_z() == shell_z_before;
+        kernel_consumed && user_input_active() == 0 && wm::shell_z() == shell_z_before;
 
     // Leg 6 — the release after a CONSUMED press is dropped, never delivered.
     let nofab_ok = wc_click_route_at(Event::Button(0), kpx, kpy);
@@ -4102,10 +6877,10 @@ pub fn clickroute_selftest() {
     // Leg 5 — a press over the bare desktop, from a live app focus.
     let desktop_ok = match desktop_pt {
         Some((x, y)) => {
-            el0_input_set_active(OWNER_A);
+            user_input_set_active(OWNER_A);
             wm::focus_changed(OWNER_A);
             let consumed = wc_click_route_at(Event::Button(1), x, y);
-            let ok = consumed && el0_input_active() == 0;
+            let ok = consumed && user_input_active() == 0;
             wc_click_route_at(Event::Button(0), x, y);
             Some(ok)
         }
@@ -4136,7 +6911,825 @@ pub fn clickroute_selftest() {
     wm::close(wa);
     wm::close(wb);
     wm::close(wk);
-    el0_input_set_active(saved_focus);
+    user_input_set_active(saved_focus);
+    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+    wm::focus_reset();
+}
+
+/// The WMDIRECT probe surface — 128x8 ARGB8888 (stride 512 B, 4096 B total). WIDER than the
+/// `clickroute` fixture's 8x8 on purpose: `wm::close_box` DECLINES a title strip too narrow to hold
+/// its control, and an 8-px-wide surface is under that at scale 1 — the close leg would have
+/// silently tested nothing on a small panel.
+///
+/// CRISPYWIRE — **re-sized against the CRISPY threshold, not left at the old one.** Crispy's title
+/// bar carries a cluster of three `control_box`-diameter discs at a `gap` pitch, so `wm::controls`
+/// declines a strip too narrow to hold the cluster and a caption glyph, against WC-A's 26. A 32-px
+/// surface gives `bw = 32*scale + 10`, which is below that at scale 1 and 2 — so the leg would have
+/// gone on reporting a skip on any panel whose scale rule landed there, and the arc would have
+/// shipped an untested close control.
+///
+/// CRISPYWIRE-REVIEW — **and the threshold moved, so this moved with it.** Two corrections raised
+/// it: the decline test had been one `GAP` short of the painter's own budget, and the caption's
+/// glyph doubled to 16 px when it started honouring `metrics.text_px`. The floor is now
+/// `2*FRAME + GAP + CTRL_RESERVE + TITLE_CELL` = `10 + 12 + 84 + 16` = **122 px**, and 96 px gave
+/// `96 + 10 = 106` — under it at scale 1. 128 px restores the invariant the sizing was chosen for:
+/// `128 + 10 = 138` clears 122 at scale 1 and therefore at every scale.
+///
+/// KNURL — **and the floor moved a third time, so the literal is gone.** Peter's size ruling took
+/// `theme::CONTROL_BOX` from 12 to 24 (*"window buttons are very small"*), taking the floor to
+/// 158 px, which 128 no longer clears — the close leg would have gone back to reporting a skip.
+/// The geometry is now `wm::FIX_W` x `wm::FIX_H`, sized from `wm::CLUSTER_MIN_SRC_W` under a
+/// `const` assertion in `wm.rs`, so the next metric move fails the build instead of the gate.
+#[cfg(all(feature = "witness", feature = "wc"))]
+#[repr(align(4))]
+struct WmdSurf([u32; crate::video::wm::FIX_W * crate::video::wm::FIX_H]);
+#[cfg(all(feature = "witness", feature = "wc"))]
+static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; crate::video::wm::FIX_W * crate::video::wm::FIX_H]);
+
+/// WMDIRECT — drain up to `max` queued events through the REAL routing chain.
+///
+/// **Why the legs below drain rather than pop-and-assert.** `EVENT_QUEUE` is shared, and the live
+/// x86 drain is running while this witness does: a leg that asserts *which event it itself pops* is
+/// asserting about scheduling. That is not a hypothesis — leg 9's first cut read
+/// `lift=None ... -> FAIL` on one run in four with every claim about the code true, because the live
+/// drain had taken the lift and routed it through this same chain a microsecond earlier. So the legs
+/// assert what no competing consumer can change: the latch `pal` set at PUSH time, and the state the
+/// window system is left in once the events have been routed — by whoever routed them.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn drain_and_route(max: usize) {
+    for _ in 0..max {
+        match crate::pal::next_event() {
+            Some(e) => {
+                let _ = wc_route_event(e);
+                wc_route_tail(e);
+            }
+            None => break,
+        }
+    }
+}
+
+/// WMDIRECT — drain until the live gesture is over, bounded by a DEADLINE rather than a spin count.
+///
+/// **A fixture cannot own `EVENT_QUEUE`, so it must not assert as though it did.** The events a leg
+/// pushes may be popped by the live x86 drain instead — which routes them through this same chain,
+/// so the outcome is identical — or held, briefly and invisibly, in `pump_usb_into_gui`'s
+/// re-circulating PEEK buffer, during which the ring reads EMPTY and the leg's own drain comes back
+/// with nothing while its gesture is still live. That peek cycles at ~250 Hz, so the wait has to be
+/// measured in milliseconds; a spin COUNT budget was the first cut and it was too short by an order
+/// of magnitude (`lead=false` with the leg's `Button(0)` still in flight, its `[dragrel]` line
+/// eventually printing after a later leg had already cancelled the drag).
+///
+/// [`WMD_DRAIN_MS`] is well past that cycle and well short of `RELEASE_EDGE_GRACE_MS`, so the belt
+/// cannot end the gesture inside the wait and steal the claim from the edge. It weakens nothing: a
+/// gesture that genuinely never ends still reads `ended=false` when the deadline expires.
+///
+/// **This is the flake a sibling arc measured at trunk tip cf40c37c** — three
+/// `[wm-act] direct ... settle=false -> FAIL` in ~60 runs. The pre-DRAGGLIDE leg's failing captures
+/// name the interleave: no `[dragrel]` line for the leg at all, no `drag-end`, and the drag left LIVE
+/// until a later leg's close cancelled it. On that code the fixture popped a foreign event in place
+/// of its own, routed the lift as if it were the edge, and then reset `CLICK_PREV_MASK` on the way
+/// out — so when the live drain finally reached the real `Button(0)` it saw no 1 -> 0 transition
+/// against that zeroed mask, took no release arm, and neither drained the pending count nor ended the
+/// gesture. A stranded drag then poisons whatever leg runs next.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn drain_until_drag_ends() {
+    let start = crate::arch::ticks();
+    loop {
+        drain_and_route(8);
+        if crate::video::wm::drag_active() == crate::video::wm::WIN_NONE {
+            return;
+        }
+        if crate::arch::ticks().wrapping_sub(start) >= WMD_DRAIN_MS {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// WMDIRECT — how long [`drain_until_drag_ends`] waits for a gesture's own events to come back
+/// through whichever consumer took them. Past `pump_usb_into_gui`'s ~4 ms peek cycle by an order of
+/// magnitude, and comfortably short of `RELEASE_EDGE_GRACE_MS` (120), so the belt cannot fire inside
+/// the wait and take the ending away from the edge the leg is asserting about.
+#[cfg(all(feature = "witness", feature = "wc"))]
+const WMD_DRAIN_MS: u64 = 50;
+
+/// WMDIRECT — the DIRECT-MANIPULATION witness: does a press on a window's CHROME reach the window
+/// system, does a press on its CONTENT still reach the app, and does a pointer report actually STEER
+/// a live drag through the path a real report takes?
+///
+/// Headless-drivable on `clickroute_selftest`'s idiom and for its reason: QEMU delivers no pointer,
+/// so every position is a PARAMETER and every claim is made against the window table.
+///
+/// ### It drives the ROUTED SEAM, not the API
+/// The `move` leg's first cut called `wm::drag_motion` directly. That asserted against `wm`'s API and
+/// printed `move=true` while the live drag was INERT: the drain's tick sat inside the
+/// `Event::Mouse` match arm, keyed on the POST-routing event, and `Event::Mouse` is packable — so a
+/// focused ring-3 app swallowed every report and the tick never ran. A title-bar grab guarantees that
+/// focus (the chrome arm focuses the dragged window's owner), so the verb the arc exists for was dead
+/// for every app window and the witness could not see it.
+///
+/// So the `route` leg drives [`wc_route_event`] + [`wc_route_tail`] — the SAME two functions both x86
+/// drains call — with a ring-3 owner focused and a synthetic `MouseAbsolute` report. It fails on the
+/// broken shape and passes on the fixed one, which is the only property that makes it a gate.
+///
+/// ### The legs, each a distinct failure direction
+///  1. **partition** — chrome and content disagree at the geometry layer. Catches a chrome rect that
+///     overlaps the content: the WM stealing clicks the app should have had.
+///  2. **grab** — a title-strip press is CONSUMED, moves focus to that window's owner, and starts a
+///     drag. Catches chrome falling through to the app arms.
+///  3. **route** — a pointer report pushed through the REAL routing chain, with the dragged app
+///     holding focus and its ring draining, RELOCATES the row; the release ends the drag and leaves
+///     the row PINNED. Catches the inert-drag defect above, and a WM still dragging after the hand
+///     let go.
+///  4. **content** — a press on the SAME window's content is NOT consumed. The other half of the
+///     partition, asserted through the router rather than the geometry.
+///  5. **close** — a press on the close box is CONSUMED, the row is GONE, and the settle is NOPROC
+///     (the fixture owner has no live process, so closing the windows is the whole effect). Covers
+///     `close_box_hit`'s routing arm, `wc_close_click`'s owner->pid resolution and its no-process
+///     arm; the `bg_kill` call itself is the one line here that stays metal-only, and the doc's
+///     watch-list says so.
+///  6. **dragdead** — a window closed mid-drag leaves `drag_active() == WIN_NONE`.
+///  7. **level** (DRAGREL) — the drag ends from the button LEVEL alone, with NO `Button` event
+///     routed at any point. This is the metal case: the release report can be dropped outright (one
+///     report per service pass, and a report is a level), so leg 3's routed `Button(0)` is a
+///     fixture-only luxury and the drag that never ended on glass passed leg 3 every time.
+///  8. **tabcancel** (DRAGREL) — `<TAB>` while a drag is live cancels it. The operator escape from a
+///     window that is following the pointer with nothing visible to let go of.
+///  9. **settle** (DRAGSETTLE / DRAGGLIDE) — the release report is PUSHED in its real order (level,
+///     then the lift motion, then the button edge) and comes back out with the EDGE FIRST, because
+///     `pal` reorders it there; the gesture ends at the point the hand steered to, and the lift —
+///     routed afterwards — moves nothing. Catches the shape a GR24 capture shows end to end (every
+///     gesture ending `release-level`, the delivered-release arm never firing, the drop a pixel off)
+///     and, through `swap_ok`, a producer that stopped reordering.
+/// 10. **lead** (DRAGGLIDE) — a motion produced BEFORE the release, drained while the release edge is
+///     still queued behind it, STEERS the window instead of being dropped, and the edge then ends the
+///     gesture there. Catches the glide: a window that comes to rest short of where the hand let go
+///     by however far the drain was running behind the pointer.
+///
+/// Self-cleaning: the probe rows are closed and the input focus restored.
+#[cfg(all(feature = "witness", feature = "wc"))]
+pub fn wmdirect_selftest() {
+    use crate::pal::Event;
+    use crate::video::wm;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let (pw, ph) = {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[wm-act] direct -> SKIP (framebuffer not ready)");
+            return;
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    if pw < 256 || ph < 256 {
+        serial_println!("[wm-act] direct -> SKIP (panel {}x{} too small)", pw, ph);
+        return;
+    }
+    // Biased slots, i.e. the values `SYS_WIN_CREATE` mints and `USER_INPUT_ACTIVE` carries. Both are
+    // REAL slot numbers (not the kernel band), because the `route` leg needs `user_input_enqueue` to
+    // accept a push for the focused owner — that is the packable-consume path it exists to drive.
+    const OWNER_D: u64 = 3; // slot 2
+    // A SECOND row, and it is not scenery. Every leg needs the probe row ABOVE the shell —
+    // `hit_test` skips anything `SHELL_Z` overtook — so the focus these legs park elsewhere must be a
+    // WINDOW's focus and never the shell's: `focus_changed(0)` raises `SHELL_Z` over the whole table
+    // and the probe point would resolve to no window. (Not a hypothesis: the first cut of this
+    // witness focused the shell and read `grab=false` with `[clickroute] press ... win=0` beside it.)
+    const OWNER_O: u64 = 4; // slot 3
+    let s = &raw const WMD_SURF as usize;
+    let len = core::mem::size_of_val(&WMD_SURF);
+    let w = wm::create(OWNER_D, s, len, wm::FIX_W as u32, wm::FIX_H as u32, wm::FIX_STRIDE as u32, b"wmd");
+    let wo = wm::create(OWNER_O, s, len, wm::FIX_W as u32, wm::FIX_H as u32, wm::FIX_STRIDE as u32, b"wmo");
+    if w == wm::WIN_NONE || wo == wm::WIN_NONE {
+        serial_println!("[wm-act] direct -> SKIP (window table full: d={} o={})", w, wo);
+        wm::close(w);
+        wm::close(wo);
+        return;
+    }
+    let saved_focus = user_input_active();
+    let (ox, oy) = (pw / 3, ph / 3 + wm::TITLE_H + wm::BORDER);
+    wm::move_to(w, ox, oy);
+    // Disjoint from the probe row by a whole panel third, so no raise can make `wo` own a probe point
+    // and turn the "different window" legs into "already focused" ones.
+    wm::move_to(wo, pw / 3, ph / 3 * 2 + wm::TITLE_H + wm::BORDER);
+    // Read the placement back rather than assuming it: `move_to` CLAMPS to the live panel.
+    let Some(inf) = wm::info(w) else {
+        serial_println!("[wm-act] direct -> SKIP (row vanished)");
+        wm::close(w);
+        wm::close(wo);
+        return;
+    };
+    // A title-strip point: one pixel inside the left border, mid-strip. WMCTRL moved the control
+    // cluster to the LEFT end of the strip, so this point is re-argued rather than inherited: the
+    // cluster is inset `BORDER + GAP` from the outer box and this point is `BORDER + 1` in, i.e. a
+    // whole `GAP` short of the first disc, so it is still unambiguously drag. A content point:
+    // inside the surface.
+    let tpx = (inf.x + 1) as i32;
+    let tpy = (inf.y - wm::TITLE_H / 2 - wm::BORDER) as i32;
+    let cpx = (inf.x + 1) as i32;
+    let cpy = (inf.y + 1) as i32;
+
+    // Leg 1 — the partition, asked of the geometry directly.
+    let partition_ok = wm::chrome_hit(w, tpx, tpy)
+        && wm::title_bar_hit(w, tpx, tpy)
+        && !wm::chrome_hit(w, cpx, cpy)
+        && !wm::title_bar_hit(w, cpx, cpy)
+        && wm::hit_test(tpx, tpy).map(|(id, _, _)| id) == Some(w);
+
+    // Leg 2 — the grab. Focus parked on the OTHER window, so this press must MOVE it.
+    user_input_set_active(OWNER_O);
+    wm::focus_changed(OWNER_O);
+    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+    // DRAGREL — the fixture must publish the pointer LEVEL a real press publishes, or leg 3's motion
+    // would reach a tail that reads "button up" and end the drag through the new belt instead of
+    // through the release EVENT it exists to test. Two legs, two paths, each driven honestly.
+    crate::pal::cursor::set_button_level(true);
+    let grab_consumed = wc_click_route_at(Event::Button(1), tpx, tpy);
+    let grab_ok = grab_consumed && wm::drag_active() == w && user_input_active() == OWNER_D;
+
+    // Leg 3 — THE ROUTED SEAM. Park the arrow at the grab point, then push a synthetic
+    // `MouseAbsolute` for a point 24 px away through `wc_route_event` + `wc_route_tail`, exactly as
+    // both drains do. `OWNER_D` holds focus (leg 2 put it there, which is what a real grab does) and
+    // its ring is empty, so the report is PACKED AND CONSUMED — `ev` comes back `Unknown` and the
+    // drain's pointer arms never run. That is precisely the state in which the pre-fix tick was
+    // unreachable, so this leg is `false` on the broken shape.
+    //
+    // `set_abs` takes HID space (0..=32767); the router's consume branch applies the same conversion
+    // through `pal::cursor::track_routed`, so the panel position the tail reads is derived by the
+    // shipping code and not by this witness.
+    let before = (inf.x, inf.y);
+    let hid = |v: i32, span: usize| -> i32 {
+        ((v as i64 * 32767) / (span.max(1) as i64 - 1).max(1)) as i32
+    };
+    crate::pal::cursor::set_abs(hid(tpx, pw), hid(tpy, ph), pw as i32, ph as i32);
+    let raw = Event::MouseAbsolute {
+        x: hid(tpx + 24, pw),
+        y: hid(tpy + 24, ph),
+    };
+    let routed = wc_route_event(raw);
+    let consumed_by_ring = matches!(routed, Event::Unknown);
+    wc_route_tail(raw);
+    let after = wm::info(w).map(|i| (i.x, i.y));
+    // The release ends the drag. It is a Button, so it goes through the click router as always.
+    crate::pal::cursor::set_button_level(false);
+    let rel_consumed = wc_click_route_at(Event::Button(0), tpx + 24, tpy + 24);
+    let route_ok = consumed_by_ring
+        && after.is_some()
+        && after != Some(before)
+        && rel_consumed
+        && wm::drag_active() == wm::WIN_NONE
+        && wm::is_pinned(w);
+
+    // Leg 4 — content still reaches the app. Re-derive the point: the row has MOVED.
+    let content_ok = match wm::info(w) {
+        Some(i) => {
+            let (px, py) = ((i.x + 1) as i32, (i.y + 1) as i32);
+            user_input_set_active(OWNER_O);
+            wm::focus_changed(OWNER_O);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            let consumed = wc_click_route_at(Event::Button(1), px, py);
+            wc_click_route_at(Event::Button(0), px, py);
+            !consumed && wm::drag_active() == wm::WIN_NONE
+        }
+        None => false,
+    };
+
+    // Leg 7 — DRAGREL, THE LEVEL PATH, WITH NO RELEASE EVENT ANYWHERE IN IT. Leg 3 ends its drag
+    // with a routed `Button(0)`; on metal that event can simply never arrive, and this leg is the
+    // one that proves the drag still ends. Grab the title strip, publish "button up" as the pointer
+    // LEVEL — the same store every EHCI report performs — then drive ONE motion report through the
+    // real tail. No `Button` is routed at any point.
+    //
+    // Falsifiable by construction: with the level consulted, the tail ends the drag; without it (or
+    // with the level left DOWN) the tail merely steers and `drag_active()` still names the window.
+    let level_ok = match wm::info(w) {
+        Some(i) => {
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            user_input_set_active(OWNER_O);
+            wm::focus_changed(OWNER_O);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            // The press publishes the level the same way a real pad does; the grab itself is the
+            // ordinary chrome arm.
+            crate::pal::cursor::set_button_level(true);
+            let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
+            // The hand lets go and the report carrying that edge is LOST. Only the level moves.
+            crate::pal::cursor::set_button_level(false);
+            let raw = Event::MouseAbsolute {
+                x: hid(px + 8, pw),
+                y: hid(py + 8, ph),
+            };
+            let routed = wc_route_event(raw);
+            wc_route_tail(raw);
+            let _ = routed;
+            let ended = wm::drag_active() == wm::WIN_NONE;
+            // Leave the router's press tracker as it was found — the press above is still
+            // outstanding, and a phantom press would make the NEXT leg's release drop.
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            grabbed && ended
+        }
+        None => false,
+    };
+
+    // Leg 8 — DRAGREL, the operator escape: `<TAB>` while a drag is live cancels it. Same shape as
+    // leg 7's grab, then one `Event::Key(0x09)` through `wc_focus_key` — the real chain's first arm.
+    let tabcancel_ok = match wm::info(w) {
+        Some(i) => {
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            user_input_set_active(OWNER_O);
+            wm::focus_changed(OWNER_O);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            crate::pal::cursor::set_button_level(true);
+            let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
+            let consumed = wc_focus_key(Event::Key(b'\t'));
+            let ended = wm::drag_active() == wm::WIN_NONE;
+            // Swallow the TAB's release edge, then unwind this leg's own fixture state.
+            let _ = wc_focus_key(Event::KeyUp(b'\t'));
+            crate::pal::cursor::set_button_level(false);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            grabbed && consumed && ended
+        }
+        None => false,
+    };
+
+    // Leg 9 — DRAGSETTLE, **THE ORDER A REAL RELEASE ARRIVES IN**, and the two things the shipping
+    // code got wrong about it. A release report publishes the button LEVEL inside the service pass
+    // and QUEUES its `Event::Button`; the same report's lift dx/dy is queued AHEAD of that button.
+    // So the drain sees: motion, then edge — with the level already reading up for both. On that
+    // order the old tail ended the gesture at the first motion, steering the window by the lift, and
+    // the release arm found nothing left to end. A GR24 capture is that shape end to end: every
+    // gesture `end=release-level`, the delivered-release arm never once, the drop a pixel off.
+    //
+    // Driven through the REAL seams, not around them: `pal::push_event` is the producer every HID
+    // path uses (it is what arms the pending count), `pal::next_event` is the drain, and each popped
+    // event goes through `wc_route_event` + `wc_route_tail` exactly as both drains call them.
+    //
+    // DRAGGLIDE re-cut this leg's back half, because the order the queue hands the release back in is
+    // the thing that changed: `pal::push_event` now puts a release edge AHEAD of its own lift motion.
+    // Which conjuncts carry what, against the pre-DRAGSETTLE code and against the pre-DRAGGLIDE
+    // producer:
+    //  * `swap_ok` — `pal` says it put this gesture's edge in front of its own lift. Read from the
+    //    latch the producer set at PUSH time, so no competing consumer can move it. Red on any
+    //    producer without the reorder. **Load-bearing.**
+    //  * `rest` — the row comes to rest at the +24 the hand steered to, NOT the +27 the lift left the
+    //    arrow at, and it is asserted after the gesture has ENDED rather than before. (Not after
+    //    every queued event: `drain_until_drag_ends` stops at the ending, so the lift may still be
+    //    in the ring — which is the point, since with the reorder it is BEHIND the edge and can no
+    //    longer reach a live drag.) Red on the original code, which applied the lift. This is the
+    //    ~1px, magnified to 3 px so a fixture can name it. **Load-bearing.**
+    //  * `ended` — the gesture is over once the queue has been drained out (`drain_until_drag_ends`).
+    //    Not independent (the belt would have ended it too, only later and elsewhere); it is `rest`
+    //    that says WHERE. It does catch one real shape, and that shape has been seen: a release edge
+    //    left in the ring with `CLICK_PREV_MASK` already zeroed strands the drag for the rest of the
+    //    boot, which is how the pre-DRAGGLIDE leg flaked at trunk.
+    let settle_ok = match {
+        // Re-place the row at the setup origin: eight legs have moved it, and this leg asserts an
+        // EXACT resting coordinate, so it must start from a placement the panel is known to accept
+        // rather than from wherever the fixture left it.
+        wm::move_to(w, ox, oy);
+        wm::info(w)
+    } {
+        Some(i) => {
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            user_input_set_active(OWNER_O);
+            wm::focus_changed(OWNER_O);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            // No edge in flight to begin with: the counter is global and a previous leg's routed
+            // `Button(0)` (leg 3's, leg 4's) never went through `push_event`, so it could only be
+            // left standing by a real HID release earlier in the boot. Cleared explicitly rather
+            // than assumed, and bounded so a wedged counter cannot spin the fixture.
+            for _ in 0..8 {
+                if crate::pal::release_edge_pending() == 0 {
+                    break;
+                }
+                crate::pal::note_release_edge_drained();
+            }
+            // DRAGGLIDE — and the RING is emptied too, bounded by its own capacity. This leg drives a
+            // gesture through the shared queue and then asserts an EXACT resting coordinate, so an
+            // event a boot selftest, the typematic injector or a real HID report left standing would
+            // be routed as part of the gesture and move the settle. Emptying first makes the leg
+            // answer about the code rather than about whatever the boot happened to leave behind.
+            //
+            // It is WITNESSED because on metal it eats real operator input: anything the hand did in
+            // the moment this selftest ran is discarded here, silently, and a boot where that count
+            // is not ~0 is a boot where the fixture took a keystroke or a click the operator meant.
+            let mut discarded = 0u32;
+            for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+                if crate::pal::next_event().is_none() {
+                    break;
+                }
+                discarded += 1;
+            }
+            if discarded != 0 {
+                serial_println!(
+                    "[wm-act] leg-drain discarded={} queued event(s) before the gesture",
+                    discarded
+                );
+            }
+            crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
+            crate::pal::cursor::set_button_level(true);
+            // The PRESS goes through `push_event` too, and it has to: `pal` tracks its own previous
+            // button mask and counts only the PRIMARY 1 -> 0 transition, so a release whose press
+            // never passed the producer is a 0 -> 0 and arms nothing. Caught by this leg the moment
+            // that rule landed — the fixture was pressing straight into the router, and the release
+            // it then pushed was, correctly, not counted as an edge in flight. Popped and then routed
+            // through `wc_click_route_at` with the point SUPPLIED rather than through
+            // `wc_route_event`, on the same rule every other leg here follows: QEMU has no pointer,
+            // and the grab needs an exact title-strip pixel that an absolute-coordinate round trip
+            // could round off the strip.
+            crate::pal::push_event(Event::Button(1));
+            // The pop is best-effort: if the live x86 drain took the press it routed it through
+            // `wc_click_route` at the LIVE CURSOR, which is not quite this leg's point — `set_abs`
+            // goes through the 0..32767 HID round trip and can come back a pixel off, and the strip
+            // point is `inf.x + 1`, one pixel inside the border, so a rounded press can miss the
+            // window entirely and start no drag. That is why every other leg supplies the point.
+            // So: take the press if it is still there, and if no drag is live afterwards — whoever
+            // popped it, however it rounded — re-assert with the EXACT pixel. The claim is that a
+            // title-strip press leaves a live drag on `w`, and it must not turn on who won a race.
+            if matches!(crate::pal::next_event(), Some(Event::Button(1))) {
+                let _ = wc_click_route_at(Event::Button(1), px, py);
+            }
+            if wm::drag_active() != w {
+                CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+                let _ = wc_click_route_at(Event::Button(1), px, py);
+            }
+            let grabbed = wm::drag_active() == w;
+            // Steer 24 px with the button still down. The throttle may or may not admit the move
+            // itself — that is why the leg asserts the RESTING place and not this intermediate one:
+            // the settle point is recorded unthrottled, so the gesture reaches +24 either way.
+            let steer = Event::MouseAbsolute {
+                x: hid(px + 24, pw),
+                y: hid(py + 24, ph),
+            };
+            let _ = wc_route_event(steer);
+            wc_route_tail(steer);
+            // THE RELEASE REPORT, pushed in the order the HID paths push it: level first (the parse
+            // path publishes it before it pushes anything), then the lift motion, then the button
+            // edge.
+            crate::pal::cursor::set_button_level(false);
+            // ONE report, pushed as one — through `push_pointer_report`, the SAME seam every HID
+            // decode site now uses. It holds the ring lock across both events, so no consumer can
+            // pop the lift out of the gap and leave the edge with nothing to get in front of, and
+            // the reorder is told which lift is its own rather than inferring it.
+            crate::pal::push_pointer_report(
+                Some(Event::MouseAbsolute {
+                    x: hid(px + 27, pw),
+                    y: hid(py + 27, ph),
+                }),
+                Some(Event::Button(0)),
+            );
+            let swap_ok = crate::pal::release_edge_reordered();
+            drain_until_drag_ends();
+            let ended = wm::drag_active() == wm::WIN_NONE;
+            let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 24, i.y + 24));
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            // This gesture has exactly one queued motion and it is the LIFT, which the reorder puts
+            // BEHIND the edge — so a clean run steers no lead motions at all. A nonzero count means
+            // the lift was routed while the edge was still counted as queued, i.e. two routers
+            // interleaved (see `DRAG_LAST_LEAD`). The leg cannot judge the kernel on that run.
+            // Gated on `swap_ok`, and that gate is load-bearing: a PRODUCER that stopped reordering
+            // makes the lift a lead motion too, so an ungated skip would swallow exactly the defect
+            // this leg exists to catch. `swap=1` says the ring WAS reordered — only then is an
+            // unexpected lead count evidence of the router interleave rather than of the fix.
+            if swap_ok && drag_last_lead() != 0 {
+                serial_println!(
+                    "[wm-act] settle -> SKIP (routing interleaved: lead={} on a gesture with none)",
+                    drag_last_lead()
+                );
+                None
+            } else {
+                Some(grabbed && swap_ok && ended && rest)
+            }
+        }
+        None => Some(false),
+    };
+
+    // Leg 10 — DRAGGLIDE, **THE WAIT MUST NOT GO DEAF**, which is the glide Peter reported off Boot A:
+    // the 1 px hop gone, every gesture `end=edge`, and the window coming to rest visibly before the
+    // hand let go.
+    //
+    // The shape, driven through the same real seams leg 9 uses. A gesture that moves +12 with the
+    // button down, then lifts on a report that carries its own +24 of travel. The producer queues
+    // [motion +12] [motion +24] [button 0] and the DRAGGLIDE reorder makes that
+    // [motion +12] [button 0] [motion +24]. So:
+    //   * the +12 drains while the edge is queued behind it — a LEAD motion, hand travel with the
+    //     button physically down, and it must STEER;
+    //   * the edge drains next and ends the gesture at that +12;
+    //   * the +24 lift drains last, after the gesture is over, and moves nothing.
+    //
+    // **What is red on the pre-fix code, said plainly.**
+    //   * `rest` — the row comes to rest at the +12 the LEAD motion steered to. On the pre-DRAGGLIDE
+    //     tail both queued motions are DROPPED while it waits for the edge, so the gesture ends at
+    //     the GRAB point and this reads `(i.x, i.y)`. **Red pre-fix**, and it is the glide itself —
+    //     the window resting short of where the hand let go — magnified to 12 px so a fixture can
+    //     name it. **Load-bearing, and the only conjunct here that is.**
+    //   * `swap_ok` — the producer half fired, so the +24 lift is behind the edge and cannot be
+    //     mistaken for lead travel. Red on a producer without the reorder. Shared with leg 9.
+    //   * `ended` — the gesture is over once the queue has been drained out. A sentinel, not
+    //     evidence: the belt would have ended it too.
+    //
+    // `rest` is asserted at +12 and not at +24 for a reason worth stating: +24 is the release
+    // report's OWN lift, and a window that ended there would be the ~1px hop back, not a fix.
+    let lead_ok = match {
+        wm::move_to(w, ox, oy);
+        wm::info(w)
+    } {
+        Some(i) => {
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            user_input_set_active(OWNER_O);
+            wm::focus_changed(OWNER_O);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            for _ in 0..8 {
+                if crate::pal::release_edge_pending() == 0 {
+                    break;
+                }
+                crate::pal::note_release_edge_drained();
+            }
+            // DRAGGLIDE — and the RING is emptied too, bounded by its own capacity. This leg drives a
+            // gesture through the shared queue and then asserts an EXACT resting coordinate, so an
+            // event a boot selftest, the typematic injector or a real HID report left standing would
+            // be routed as part of the gesture and move the settle. Emptying first makes the leg
+            // answer about the code rather than about whatever the boot happened to leave behind.
+            //
+            // It is WITNESSED because on metal it eats real operator input: anything the hand did in
+            // the moment this selftest ran is discarded here, silently, and a boot where that count
+            // is not ~0 is a boot where the fixture took a keystroke or a click the operator meant.
+            let mut discarded = 0u32;
+            for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+                if crate::pal::next_event().is_none() {
+                    break;
+                }
+                discarded += 1;
+            }
+            if discarded != 0 {
+                serial_println!(
+                    "[wm-act] leg-drain discarded={} queued event(s) before the gesture",
+                    discarded
+                );
+            }
+            crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
+            crate::pal::cursor::set_button_level(true);
+            crate::pal::push_event(Event::Button(1));
+            // Best-effort pop, then re-assert with the exact pixel if no drag came of it (see leg 9).
+            if matches!(crate::pal::next_event(), Some(Event::Button(1))) {
+                let _ = wc_click_route_at(Event::Button(1), px, py);
+            }
+            if wm::drag_active() != w {
+                CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+                let _ = wc_click_route_at(Event::Button(1), px, py);
+            }
+            let grabbed = wm::drag_active() == w;
+            // The last motion of the gesture, produced with the button still down and queued BEFORE
+            // the release. Pushed through the producer (not routed straight in) because the whole
+            // question is what the QUEUE hands back and in what order.
+            crate::pal::push_event(Event::MouseAbsolute {
+                x: hid(px + 12, pw),
+                y: hid(py + 12, ph),
+            });
+            // The release report: level, then its own lift travel and its edge as one indivisible
+            // pair (see leg 9).
+            crate::pal::cursor::set_button_level(false);
+            crate::pal::push_pointer_report(
+                Some(Event::MouseAbsolute {
+                    x: hid(px + 24, pw),
+                    y: hid(py + 24, ph),
+                }),
+                Some(Event::Button(0)),
+            );
+            let swap_ok = crate::pal::release_edge_reordered();
+            drain_until_drag_ends();
+            let ended = wm::drag_active() == wm::WIN_NONE;
+            let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 12, i.y + 12));
+            crate::pal::cursor::set_button_level(false);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            // Exactly ONE lead motion is the shape this leg drives: the +12, with the +24 lift
+            // behind the edge. Two means the lift was routed as a lead as well — the two-router
+            // interleave described on `DRAG_LAST_LEAD` — and the run cannot judge the kernel.
+            // Zero means the +12 never steered, which IS the glide and is a real failure.
+            // `swap_ok` gates the skip for the reason leg 9 states: without the reorder the lift is
+            // a lead motion as well, and skipping on that would hide the producer half's failure.
+            if swap_ok && drag_last_lead() > 1 {
+                serial_println!(
+                    "[wm-act] lead -> SKIP (routing interleaved: lead={} on a one-lead gesture)",
+                    drag_last_lead()
+                );
+                None
+            } else {
+                Some(grabbed && swap_ok && ended && rest)
+            }
+        }
+        None => Some(false),
+    };
+
+    // ---- WMCTRL legs ------------------------------------------------------------------------
+    //
+    // **The defect these exist to catch, stated so they can fail on it.** `controls` returns the
+    // CLUSTER's left anchor; `close_box` used to return it unchanged, so the CLOSE hit region was
+    // the LEFTMOST disc while the painter drew three. A press aimed at minimise killed a process on
+    // the metal. The three legs below assert that each disc answers for ITSELF and that neither of
+    // the other two is close — a leg that would have been RED on the shipping code, which is the
+    // only kind worth adding.
+    //
+    // `None` is a SKIP, on leg 5's rule: a strip too narrow for the cluster has no control to press,
+    // and a fixture that reported that as a failure would be reporting the geometry, not the wiring.
+    let disc_centre = |b: (usize, usize, usize)| ((b.0 + b.2 / 2) as i32, (b.1 + b.2 / 2) as i32);
+
+    // Leg 7 — GEOMETRY. The three discs are distinct, ordered left to right close/minimise/zoom, and
+    // `close_box_hit` accepts EXACTLY the close disc. The last three conjuncts are the metal bug.
+    let ctrlgeom_ok = match (
+        wm::control_disc_rect(w, wm::Ctrl::Close),
+        wm::control_disc_rect(w, wm::Ctrl::Minimise),
+        wm::control_disc_rect(w, wm::Ctrl::Zoom),
+    ) {
+        (Some(c), Some(m), Some(z)) => {
+            let (cx, cy) = disc_centre(c);
+            let (mx, my) = disc_centre(m);
+            let (zx, zy) = disc_centre(z);
+            Some(
+                c.0 < m.0
+                    && m.0 < z.0
+                    && wm::control_hit(w, cx, cy) == Some(wm::Ctrl::Close)
+                    && wm::control_hit(w, mx, my) == Some(wm::Ctrl::Minimise)
+                    && wm::control_hit(w, zx, zy) == Some(wm::Ctrl::Zoom)
+                    && wm::close_box_hit(w, cx, cy)
+                    && !wm::close_box_hit(w, mx, my)
+                    && !wm::close_box_hit(w, zx, zy),
+            )
+        }
+        _ => None,
+    };
+
+    // Leg 8 — ZOOM THROUGH THE ROUTER, both ways. Press the zoom disc: the press is consumed, the
+    // window is STILL ALIVE (the whole point — it must not route to close), and its placement
+    // changed. Press it again at its NEW position: the placement comes back to exactly what it was.
+    // The disc is re-read from `control_disc_rect` between presses because the window moved under
+    // it; re-deriving the point would test the fixture's arithmetic instead of the compositor's.
+    let zoom_ok = match (wm::info(w), wm::control_disc_rect(w, wm::Ctrl::Zoom)) {
+        (Some(g0), Some(b)) => {
+            let (zx, zy) = disc_centre(b);
+            user_input_set_active(OWNER_O);
+            wm::focus_changed(OWNER_O);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            let c1 = wc_click_route_at(Event::Button(1), zx, zy);
+            match (wm::info(w), wm::control_disc_rect(w, wm::Ctrl::Zoom)) {
+                (Some(g1), Some(b2)) => {
+                    let grew = (g1.x, g1.y, g1.scale) != (g0.x, g0.y, g0.scale);
+                    let (zx2, zy2) = disc_centre(b2);
+                    // Only press if the disc really is the topmost thing at that point — a zoomed
+                    // window can end up under the other probe row, and pressing through it would
+                    // test `wo`'s chrome, not this leg's.
+                    if wm::hit_test(zx2, zy2).map(|(id, _, _)| id) != Some(w) {
+                        Some(false)
+                    } else {
+                        CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+                        let c2 = wc_click_route_at(Event::Button(1), zx2, zy2);
+                        let back = wm::info(w)
+                            .map(|g2| (g2.x, g2.y, g2.scale) == (g0.x, g0.y, g0.scale))
+                            .unwrap_or(false);
+                        Some(c1 && c2 && grew && back)
+                    }
+                }
+                _ => Some(false),
+            }
+        }
+        _ => None,
+    };
+
+    // Leg 9 — MINIMISE THROUGH THE ROUTER, AND THE WAY BACK. Press the minimise disc: consumed, the
+    // window is STILL ALIVE (it must not route to close), and it is now BELOW the shell — which is
+    // what "parked" means on this system (`above_shell` is a strict `z > SHELL_Z`). Then `<TAB>`'s
+    // own primitive, `focus_changed(owner)`, must bring it back above the shell.
+    //
+    // **The restore half is not decoration.** A control that hides a window with no way back is
+    // worse than an inert one, and this is the assertion that the way back exists.
+    let minim_ok = match wm::control_disc_rect(w, wm::Ctrl::Minimise) {
+        Some(b) => {
+            let (mx, my) = disc_centre(b);
+            user_input_set_active(OWNER_D);
+            wm::focus_changed(OWNER_D);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            let consumed = wc_click_route_at(Event::Button(1), mx, my);
+            let alive = wm::info(w).is_some();
+            let parked = wm::info(w).map(|g| g.z <= wm::shell_z()).unwrap_or(false);
+            // The keyboard must have left with the window, or the operator is typing at something
+            // they cannot see.
+            let keys_left = user_input_active() == 0;
+            // THE WAY BACK — the same primitive `wc_focus_key` drives, on an owner the focus ring
+            // still contains (its filter has no z-order term).
+            wm::focus_changed(OWNER_D);
+            let restored = wm::info(w).map(|g| g.z > wm::shell_z()).unwrap_or(false);
+            Some(consumed && alive && parked && keys_left && restored)
+        }
+        None => None,
+    };
+
+    // Leg 6 — a window closed mid-drag leaves no live drag. Run BEFORE the close leg because it
+    // needs a row, and its own `wm::close` is the teardown it is asserting about.
+    let dragdead_ok = match wm::info(w) {
+        Some(i) => {
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
+            wm::close(w);
+            grabbed && wm::drag_active() == wm::WIN_NONE
+        }
+        None => false,
+    };
+
+    // Leg 5 — THE CLOSE BOX, through the router. A fresh row for it: leg 6 closed the first one.
+    // `OWNER_D` is a real slot with NO live Proc row, so `wc_close_click` must resolve no pid, take
+    // its no-process arm, and report NOPROC — while `close_owner` still removes the row, which is the
+    // "closing the windows was the whole effect" contract.
+    CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NONE_X86, Ordering::Release);
+    let wc = wm::create(OWNER_D, s, len, wm::FIX_W as u32, wm::FIX_H as u32, wm::FIX_STRIDE as u32, b"wmc");
+    let close_ok = if wc == wm::WIN_NONE {
+        None
+    } else {
+        wm::move_to(wc, ox, oy);
+        match wm::info(wc) {
+            // CRISPYWIRE — the close control's CENTRE, read back from `wm::close_box_rect` rather
+            // than re-derived here. The old copy of the arithmetic (a `TITLE_H`-sided square flush
+            // against the right border) was correct only for WC-A's invented square box; Crispy's
+            // control is a `control_box`-diameter DISC in a right-aligned cluster of three, and a
+            // fixture that kept computing the old point would have missed the disc and reported a
+            // SKIP — a leg that silently tests nothing. There is now exactly one owner of this
+            // geometry, and the fixture asks it.
+            Some(_i) => match wm::close_box_rect(wc) {
+                // The control was DECLINED (a strip too narrow for the cluster plus a caption).
+                // Reported as a skip, exactly as a missed hit-test would be.
+                None => None,
+                Some((cbx, cby, d)) => {
+                    let px = (cbx + d / 2) as i32;
+                    let py = (cby + d / 2) as i32;
+                    if !wm::close_box_hit(wc, px, py) {
+                        None
+                    } else {
+                        user_input_set_active(OWNER_O);
+                        wm::focus_changed(OWNER_O);
+                        CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+                        let consumed = wc_click_route_at(Event::Button(1), px, py);
+                        Some(
+                            consumed
+                                && wm::info(wc).is_none()
+                                && wc_close_last_settle() == CLOSE_SETTLE_NOPROC_X86,
+                        )
+                    }
+                }
+            },
+            None => None,
+        }
+    };
+
+    // WMCTRL — a skip-or-bool leg renders as `true`/`false`/`skip`, exactly as `close` does.
+    let leg = |v: Option<bool>| match v {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "skip",
+    };
+    let ok = partition_ok
+        && grab_ok
+        && route_ok
+        && content_ok
+        && dragdead_ok
+        && level_ok
+        && tabcancel_ok
+        && settle_ok.unwrap_or(true)
+        && lead_ok.unwrap_or(true)
+        && close_ok.unwrap_or(true)
+        && ctrlgeom_ok.unwrap_or(true)
+        && zoom_ok.unwrap_or(true)
+        && minim_ok.unwrap_or(true);
+    serial_println!(
+        "[wm-act] direct partition={} grab={} route={} content={} level={} tabcancel={} settle={} lead={} close={} dragdead={} ctrlgeom={} zoom={} minimise={} from=({},{}) to=({},{}) -> {}",
+        partition_ok,
+        grab_ok,
+        route_ok,
+        content_ok,
+        level_ok,
+        tabcancel_ok,
+        leg(settle_ok),
+        leg(lead_ok),
+        match close_ok {
+            Some(v) => if v { "true" } else { "false" },
+            None => "skip",
+        },
+        dragdead_ok,
+        leg(ctrlgeom_ok),
+        leg(zoom_ok),
+        leg(minim_ok),
+        before.0,
+        before.1,
+        after.map(|a| a.0).unwrap_or(0),
+        after.map(|a| a.1).unwrap_or(0),
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    wm::close(w); // idempotent — leg 6 already closed it on the path that reached it.
+    wm::close(wc);
+    wm::close(wo);
+    user_input_set_active(saved_focus);
     CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
     wm::focus_reset();
@@ -4163,7 +7756,24 @@ pub fn clickroute_selftest() {
 /// How many concurrently-tracked joinable ring-3 threads the kernel holds handles for. A small fixed
 /// pool (`user-vug` uses 2 per process); `-EAGAIN` when exhausted, after the scavenge below has had
 /// its chance. STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not raise it for a demo.
-const NTHREAD: usize = 8;
+///
+/// HEADROOM (Boot AL, rMBP) — raised 8 -> 24, and this was the cap the operator could actually SEE.
+/// With 6 vugs up, vugs 5 and 6 logged `SYS_THREAD_SPAWN denied a=11 b=11 workers=0 -> inline
+/// raster`: 8 rows / 2 workers per vug = 4 vugs served, and the two that fell back to inline raster
+/// ran at roughly 4x the frame rate of the four with workers. That split — a fleet of identical
+/// programs running at two different speeds with nothing in the program to explain it — is the
+/// "predetermined fps" that has been read off the panel for weeks. It is a table size.
+///
+/// WHY 24 AND NOT 20. `MAX_PROCS` is 10 and a vug takes 2 rows, so 20 is the exact fit and therefore
+/// the wrong number: a row is released by the owner's own voluntary `SYS_THREAD_JOIN`, so a KILLED
+/// program leaks its rows until the lazy scavenge below reclaims them — and the scavenge runs only
+/// under pressure, i.e. only after some later spawn has ALREADY been denied. At an exact fit, one
+/// killed vug means the next launch's second worker takes the `-EAGAIN` path, which is precisely the
+/// asymmetry this raise exists to remove. 24 is 20 plus two dead programs' worth of slack, so the
+/// scavenge stays the belt it was designed to be rather than the thing the steady state depends on.
+/// The cost is 16 more `Option<ThreadRec>` rows (~40 bytes each) behind one `SpinMutex` — under a
+/// kilobyte, and the only loop over it is the `position(is_none)` claim, bounded at 24.
+const NTHREAD: usize = 24;
 
 /// One live thread the kernel can be `SYS_THREAD_JOIN`ed on.
 struct ThreadRec {
@@ -4260,7 +7870,7 @@ fn sys_thread_spawn(entry: u64, sp: u64, arg: u64, place: u64) -> i64 {
     // and if the parent exited in that window an unretained slot would be freed under a live thread.
     crate::arch::sched::user_space_retain(cr3);
     let join = crate::arch::sched::spawn_user_thread(
-        EL0_THREAD_NAME,
+        USER_THREAD_NAME,
         entry,
         sp,
         arg as usize,
@@ -4319,7 +7929,7 @@ fn sys_thread_exit() -> i64 {
 /// The kernel-side name every ring-3 worker thread carries. Fixed (not derived from the program) for the
 /// same reason a window title is: it appears on the wire and in the fault-kill log, so it must not be
 /// anything ring 3 chose.
-const EL0_THREAD_NAME: &str = "el0-thread";
+const USER_THREAD_NAME: &str = "user-thread";
 
 /// WINX-7 thread accounting — successful spawns, completed joins, and thread exits. Global rather than
 /// per-slot: they exist to let a witness assert what happened on a boot, not to enforce anything.
@@ -5530,6 +9140,52 @@ pub fn init() {
         }
     }
 
+    // WXN-x86 M3a: arm CR0.WP on THIS core. WP is what makes PTE.W bind ring 0 at all — with it
+    // clear (bit 16), a CPL-0 store to a present, non-writable page succeeds silently, so every
+    // read-only kernel page M3b/M3c create would be bookkeeping rather than protection. It is
+    // PER-CORE state and nothing in this kernel has ever set it: the BSP inherits the firmware's
+    // value (Apple EFI leaves it CLEAR on the rMBP — Boot W: `wp=0 wp_mask=0x0`, all eight cores)
+    // and every AP arrives from reset with WP=0, which the trampoline's `orl $0x80000001, %eax`
+    // RMW preserves. QEMU's firmware leaves the BSP at WP=1 and its APs at 0 (`wp_mask=0x1` on a
+    // six-core run), so "the BSP has WP" was never a statement about either platform's APs.
+    //
+    // HERE, in the per-core control-register seat, for the same reason SCE/NXE/SMEP/DR7 are here:
+    // it is the one function both bring-up paths run (BSP from `arch::init`, each AP from
+    // `ap_entry`), it runs with interrupts masked, and on the BSP it precedes
+    // `memory::wxn_pdpt_sweep` by ten lines — so M1's and M2's `with_page_tables_writable` windows
+    // are exercised with WP genuinely armed on the very boot that arms it, in the safest place a
+    // first exercise could happen. RMW, never a whole-CR0 store: PE/MP/ET/NE/PG all live here.
+    //
+    // This commit is expected to be INERT. Arming WP can only change behaviour where a supervisor
+    // store meets a leaf with W=0, and this tree creates no such KERNEL leaf: every path in
+    // `memory.rs` that can omit `PTE_WRITABLE` is a ring-3 one (`map_user_page`, `build_slot`,
+    // `protect_user_slot_range`, `map_slot_fb_page`), M1's PDPT sweep and M2's extent split set NX
+    // and only NX, and metal Boot Z still audits the whole kernel executable extent as writable
+    // (`WXAUDIT x86: kern_WX=319` == M2's `keep_x=319`, and every `WXPROBE map:` leaf reads `w=1`).
+    // The first read-only KERNEL page is M3b's to create; this commit only makes such a page bind.
+    //
+    // THE RING-3 W=0 PAGES ARE EXCLUDED AT RUNTIME, BY A GATE — NOT BY CONSTRUCTION. Ring 3 does
+    // have W=0 pages and the kernel does store into ring-3 memory (`copy_to_user`), so that seam is
+    // the one place arming WP could turn a silent fault loud. It is tempting to say the seam's
+    // lower bound (`lo = USER_BASE + PAGE_SIZE` for `UserAccess::Write`) excludes those pages by
+    // construction. IT DOES NOT, and that sentence is the exact model that hid a live W^X bypass:
+    // the bound encodes the FLAT/U2 layout — one code page at the window base — while the U3 ELF
+    // loader clears `PTE_WRITABLE` per SEGMENT, anywhere in the window
+    // (`memory::protect_user_slot_range`). `VUG-X86.ELF` (first `R E` LOAD memsz 0x1fe5) and
+    // `PULSE-X86.ELF` (0x13ec) both leave page 1 read-only AND executable, so for those slots
+    // `USER_BASE + 0x1000` — the FIRST address that bound admits — is an RO+X ring-3 page.
+    // What actually excludes it is CFU-2: `user_range_ok` walks the LIVE CR3 per page across the
+    // whole range (`memory::user_range_leaf_ok`) and returns `-EFAULT` unless every leaf on every
+    // page folds W. The bound survives only as a fast reject, explicitly not a security claim.
+    // That runtime gate is why arming WP here cannot convert the old silent kernel-as-writer code
+    // injection into a ring-3-triggerable fatal CPL-0 #PF, and it is witnessed rather than assumed:
+    // `:: CFU2-WGATE ... -> PASS ::` (metal Boot Z) proves the seam refuses a write to the RO+X
+    // page, accepts one to a writable page, and refuses an RW->RO straddle whose head it accepts.
+    //
+    // The witness for THIS commit is `wp_mask` on the `WXAUDIT-NXE` line; the falsifier is a `#PF`
+    // with `CAUSED_BY_WRITE | PROTECTION_VIOLATION` naming its own writer's RIP.
+    unsafe { Cr0::write_raw(Cr0::read_raw() | CR0_WP) };
+
     // U2.5 Part 0-ii: clear DR7 once per CPU. The U2 #DB policy (interrupts.rs) resumes a CPL-0 #DB
     // whose RIP lands in the syscall-entry stub, on the assumption that RFLAGS.TF is the ONLY #DB
     // source there. A firmware-left hardware breakpoint (DR7 armed at boot) would violate that and
@@ -5768,60 +9424,247 @@ pub fn canonical_guard_selftest() {
     }
 }
 
-/// CLOCK-X1 (M3): a bounded, UNCOUNTED serial witness (`== witness ::`, not a `-> PASS` line, so it
-/// never shifts a fixture COUNT) proving the x86 wall-clock timebase is live. It is SILENT where the
-/// TSC path is honestly frozen — no invariant TSC or no calibration (`clock::uptime_secs()` is
-/// `None`) — so a machine without an invariant TSC prints nothing rather than a spurious verdict.
-/// When live it proves: (1) `monotonic()` returns `Some` (uptime is `Some`, freq nonzero);
-/// (2) two `rdtsc` reads are monotone and advancing (second ≥ first, and strictly greater across a
-/// bounded spin); (3) the wall-SECOND derivation `now()` uses to extend a seed advances — the exact
-/// mechanism JD17 documented as FROZEN on x86 — observed directly as `uptime` crossing a second
-/// within a bounded budget, or, if the run is too fast to cross one, reported as the raw cycle
-/// advance with the current uptime (the brief's tick-monotonicity + nonzero-freq fallback). It never
-/// seeds the global clock, so it leaves the operator's UNSET state untouched.
+// ── CLOCK-X1 pay-as-you-go state (GR18) ────────────────────────────────────────────────────────
+//
+// The witness is split across two moments: `clock_x1_witness()` SAMPLES at the step-4d scheduler
+// site (cheap, non-blocking) and `clock_x1_poll()` DELIVERS the verdict from the first service pass,
+// which is already seconds later. These four cells carry the sample between them. `u64::MAX` in
+// `CLOCK_X1_U1` is the disarmed sentinel — the witness never fires on a machine whose TSC path is
+// honestly frozen, and `uptime_secs()` can never legitimately read `u64::MAX` (it is
+// `rdtsc / tsc_hz`, and a 64-bit TSC at any real frequency cannot reach that in the life of the
+// machine), so the sentinel cannot be forged by a live clock.
+static CLOCK_X1_U1: AtomicU64 = AtomicU64::new(u64::MAX);
+/// `rdtsc` at the sample, for the monotonicity half of the proof.
+static CLOCK_X1_CY: AtomicU64 = AtomicU64::new(0);
+/// `arch::ticks()` (the 1 kHz local-APIC tick) at the sample. This is the second timebase the
+/// deferred form gains for free: the verdict cross-checks the deferral against a counter that is
+/// not the TSC. Not an *independent* one — both are armed off the same PM-timer denominator in
+/// `apic::calibrate`, so it convicts a DIFFERENTIALLY mis-armed heartbeat, not a bad PM reference
+/// (see `CLOCK_X1_SKEW_FLOOR_MS`).
+static CLOCK_X1_MS: AtomicU64 = AtomicU64::new(0);
+/// Set once the verdict (pass, NON-MONOTONE, or FROZEN) has been printed — the poll is one atomic
+/// load per service pass forever after. Claimed through `claim_clock_x1_verdict`, never by a bare
+/// store.
+static CLOCK_X1_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Take the right to print the one-and-only CLOCK-X1 verdict. A compare-exchange, not the
+/// check-then-set the first draft used: every x86 build alive today runs exactly one service loop,
+/// so the race cannot happen *yet* — but `bootpace::service_dump`, the function this rides in, uses
+/// `swap` on its own length for exactly this fragility, and a witness that can double-print under a
+/// future second service task is a witness that will one day be read twice.
+fn claim_clock_x1_verdict() -> bool {
+    CLOCK_X1_DONE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// How long the deferred verdict waits for the uptime second to advance before calling the clock
+/// FROZEN. The advance is owed within 1000 ms by construction; 3000 ms is three times the debt, so
+/// the deadline cannot fire on a healthy machine no matter how the sample straddles the edge, and
+/// still fires within one service pass of a genuinely frozen counter. Under a `tsc_hz` calibrated
+/// far too HIGH the uptime would crawl and this deadline would trip — that is a real defect the
+/// blocking form used to hide behind its benign "<1 s" fallback line, and it is now loud.
+///
+/// The poll applies the SAME 3-second budget to the TSC (`b - a >= tsc_hz * 3`) as a backstop, so
+/// the deadline does not depend on the health of the APIC tick alone. Without it, a boot where both
+/// timebases are dead leaves `elapsed_ms` pinned at 0 and the poll silent forever — the deadline
+/// measured by a counter whose death it exists to report.
+const CLOCK_X1_FROZEN_MS: u64 = 3000;
+
+// ── The TSC-vs-APIC cross-check, and exactly what it can convict ───────────────────────────────
+//
+// The verdict compares the TSC's millisecond view of the deferral against the APIC tick's. The
+// first draft compared WHOLE SECONDS with a flat ±2 s tolerance, which was wrong in both
+// directions and could not fire usefully at either end:
+//
+//   * too COARSE to convict. Measured deferrals run 2192–3620 ms on a default build and ~19.6 s on
+//     a compositor boot. At 3 s, a flat 2 s window means `tsc_hz` must be off by ~65 % before the
+//     check notices; a 10 % calibration error — the size that actually breaks an RTO or a settle —
+//     is invisible.
+//   * too TIGHT to be trusted over a long deferral. `apic::ticks()` counts INTERRUPTS, so it
+//     undercounts by the total time IF was masked, and the EHCI bring-up busy-spins masked by
+//     design. At a ~19.6 s deferral the loss is on the order of 2.5 s, which the old rule reported
+//     as SKEW — and §8e would then have blamed the calibration for a masked-tick artefact.
+//
+// Comparing in MILLISECONDS with a tolerance that scales fixes both: `FLOOR` covers the fixed
+// costs (whole-second truncation on `uptime`, the sample-to-sample serial print, one tick of
+// quantisation), and the `/DIV` term grows the window with the deferral so accumulated masked-tick
+// loss stays inside it. 200 ms + 5 % catches a 10 % `tsc_hz` error at any deferral over ~2 s while
+// tolerating ~5 % of masked time — comfortably above the ~2.5 s measured over 19.6 s.
+//
+// WHAT IT CANNOT SEE, and this is a real limit: `tsc_hz` and the APIC timer's `initcnt` are BOTH
+// derived from the same `pm_hz`/`elapsed_pm` denominator in `apic::calibrate`. A bad PM-timer
+// reference scales both by the identical factor, the two views stay in agreement, and the error is
+// provably undetectable here. What this check convicts is a DIFFERENTIAL error — one of the two
+// arms mis-derived while the other is right, the shape of the historical ~8× `FIXED_INITCNT`
+// heartbeat bug. It is a differentially-mis-armed-heartbeat detector, not a calibration oracle.
+/// Fixed part of the skew window, in milliseconds.
+const CLOCK_X1_SKEW_FLOOR_MS: u64 = 200;
+/// Divisor for the proportional part: `elapsed_ms / DIV` = 5 % of the deferral.
+const CLOCK_X1_SKEW_DIV: u64 = 20;
+
+/// CLOCK-X1 (M3) — SAMPLE half: an UNCOUNTED serial witness (`== witness ::`, not a `-> PASS` line,
+/// so it never shifts a fixture COUNT) proving the x86 wall-clock timebase is live. It is SILENT
+/// where the TSC path is honestly frozen — no invariant TSC or no calibration
+/// (`clock::uptime_secs()` is `None`) — so a machine without an invariant TSC prints nothing rather
+/// than a spurious verdict, and `clock_x1_poll()` stays disarmed for the whole boot.
+///
+/// The witness proves, across its two halves: (1) `monotonic()` returns `Some` (uptime is `Some`,
+/// freq nonzero) — HERE; (2) two `rdtsc` reads are monotone and advancing; (3) the wall-SECOND
+/// derivation `now()` uses to extend a seed advances — the exact mechanism JD17 documented as
+/// FROZEN on x86. (2) and (3) are delivered by `clock_x1_poll()`. It never seeds the global clock,
+/// so it leaves the operator's UNSET state untouched.
+///
+/// ── Why this half does not wait (GR18 pay-as-you-go) ───────────────────────────────────────────
+/// Until GR18 this function SPUN here until it saw `uptime` cross a whole second. The assertion was
+/// sound; the placement was the cost. `uptime_secs()` is `rdtsc / tsc_hz` and on x86 the TSC counts
+/// from CPU reset, so the phase of the next second edge relative to this call site is set by the
+/// firmware's POST duration — arbitrary, and unknowable to us. Eight metal boots
+/// (`rmbp-gr16-s73/ttyUSB0.log`) measured the wait as 18, 27, 105, 490, 607, 796, 910 and 976 ms:
+/// a uniform draw over the second, mean ~500 ms, worst ~1000 ms, paid at the one moment in boot
+/// when nothing else is in flight. It was the entire `BPACE: sched d=` delta (17 ms on the two
+/// lucky boots, 951–1066 ms on the unlucky ones — see bootpace.md §8d/§8e).
+///
+/// The pay-as-you-go form is §10h's shape applied to the clock: sample now, assert the advance at a
+/// checkpoint that is ALREADY past the edge. The first service pass is such a checkpoint on every
+/// x86 build — the earliest one is seconds after this line even on the leanest boot — so the wait
+/// costs zero and the same fact is proven. It is not a knob: nothing is optional here, the witness
+/// is simply paid later.
 pub fn clock_x1_witness() {
     // Frozen path: no invariant/calibrated TSC. `uptime_secs()` is `None` exactly when
-    // `clock::monotonic()` is `None`, so this is the honest silent gate.
+    // `clock::monotonic()` is `None`, so this is the honest silent gate — and it leaves the
+    // deferred half disarmed, which is why a machine with no invariant TSC prints NEITHER line.
     let u1 = match crate::clock::uptime_secs() {
         Some(u) => u,
         None => return,
     };
     let mhz = crate::arch::apic::tsc_hz() / 1_000_000;
 
-    // Monotone + advancing: two rdtsc reads across a bounded spin. The spin is a fixed iteration
-    // cap (not a wall-clock wait), so it can never hang the serial-less boot.
-    let a = crate::arch::now_cycles();
-    let mut spins = 0u64;
-    // Spin until either a wall second elapses (uptime advances) or a bounded iteration cap is hit,
-    // whichever comes first — deterministic and hang-proof under QEMU/TCG.
-    let mut u2 = u1;
-    while u2 == u1 && spins < 50_000_000 {
-        core::hint::spin_loop();
-        spins += 1;
-        u2 = crate::clock::uptime_secs().unwrap_or(u1);
-    }
-    let b = crate::arch::now_cycles();
-    let delta = b.wrapping_sub(a);
+    CLOCK_X1_CY.store(crate::arch::now_cycles(), Ordering::Relaxed);
+    CLOCK_X1_MS.store(crate::arch::ticks(), Ordering::Relaxed);
+    // Arm LAST: `clock_x1_poll` reads this cell first, so publishing it after the other two (with
+    // Release/Acquire) means a poll that sees the sample sees all of it.
+    CLOCK_X1_U1.store(u1, Ordering::Release);
 
-    if b < a {
-        // A backwards rdtsc would break the clock's monotonicity contract — surface it (uncounted).
-        serial_println!(":: CLOCK-X1: NON-MONOTONE rdtsc {} -> {} == witness ::", a, b);
+    // The armed line and the verdict line are a PAIR. A capture holding this line with no second
+    // `:: CLOCK-X1:` line is a boot that never reached a service pass — the same reading as a
+    // missing `:: BPACE:` ledger block, and it is stated here so the absence is legible rather than
+    // silent (bootpace.md §8e).
+    serial_println!(
+        ":: CLOCK-X1: TSC invariant, ~{} MHz; uptime {} s SAMPLED — second-advance DEFERRED to the first service pass (pay-as-you-go; a capture with no verdict line below never reached one) == witness ::",
+        mhz, u1
+    );
+}
+
+/// CLOCK-X1 — VERDICT half. Called from `bootpace::service_dump()`, i.e. once per pass of whichever
+/// service loop this x86 build runs (the BSP GUI loop, the `usbdebug` loop, or the SCHED-X86
+/// `x86_usb_pump` task — all three call it, ungated, which is why this site works on the media
+/// build that actually reaches the bench). Costs one relaxed load per pass once it has spoken.
+///
+/// **The two halves run on different CPUs, and every subtraction here is cross-core.** The sample
+/// is taken on the BSP inside step 4d; on a SCHED-X86 build this verdict runs in `x86_usb_pump`,
+/// pinned to the service core (core 7 on the bench). Subtracting `a` from a `rdtsc` read on another
+/// core is only meaningful because this kernel NEVER writes the TSC — there is no `wrmsr` to
+/// `IA32_TIME_STAMP_COUNTER` (0x10) or `IA32_TSC_ADJUST` (0xC000_0103) anywhere in the tree, and the
+/// APs are never offered a TSC sync step — so the firmware's power-on synchronisation across the
+/// package is what the APs inherit and keep. The verdict prints `core=N` so a future boot that
+/// breaks that invariant shows a skew attributable to a named core rather than to the clock. The
+/// APIC-tick half needs no such argument: `apic::ticks()` is one global counter driven by the BSP.
+///
+/// It prints exactly one of three lines, then never speaks again:
+///
+///   * the PASS verdict — byte-identical to the pre-GR18 text up to `advances)`, so every doc
+///     example and every human matcher still reads it, with a `[paygo: …]` clause appended that
+///     names the deferral and the cross-check;
+///   * `NON-MONOTONE` — the TSC or the derived uptime went BACKWARDS. This branch is tested BEFORE
+///     the frozen branch: as first written it sat behind `u2 <= u1`, which excludes it, so a
+///     backwards TSC printed `FROZEN — uptime still {u1}` and the regression was hidden behind a
+///     stale number. It now carries `a`, `b`, `u1` and `u2` so the direction is unambiguous;
+///   * `FROZEN` — the uptime second never advanced. This is NEW: the blocking form's iteration cap
+///     expired into a benign "<1 s" fallback line that claimed the witness had PASSED, so a
+///     genuinely frozen second derivation could not be told from a fast boot.
+///
+/// What the deferred form can no longer see, stated plainly: the blocking form observed the FIRST
+/// second transition, so it always reported `u1 -> u1+1`. Delivered at a service pass the advance
+/// may be several seconds, and an uptime that jumped FURTHER than wall time would once have shown
+/// up only as a surprising pair of numbers a reader had to notice. That loss is repaid by the
+/// millisecond cross-check below.
+pub fn clock_x1_poll() {
+    if CLOCK_X1_DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let u1 = CLOCK_X1_U1.load(Ordering::Acquire);
+    if u1 == u64::MAX {
+        return; // never armed: no invariant/calibrated TSC on this machine
+    }
+    let u2 = match crate::clock::uptime_secs() {
+        Some(u) => u,
+        None => u1, // cannot happen once armed (the gate is the same `monotonic()`); treat as frozen
+    };
+    let a = CLOCK_X1_CY.load(Ordering::Relaxed);
+    let b = crate::arch::now_cycles();
+    let elapsed_ms = crate::arch::ticks().wrapping_sub(CLOCK_X1_MS.load(Ordering::Relaxed));
+    let hz = crate::arch::apic::tsc_hz();
+    // The TSC's own view of the deferral, in milliseconds. This is the quantity the cross-check
+    // compares — NOT a whole-second count, which is far too coarse to convict (a 10 % `tsc_hz`
+    // error moves a 3-second deferral by 300 ms and rounds away entirely).
+    let tsc_ms = if hz >= 1000 {
+        b.wrapping_sub(a) / (hz / 1000)
+    } else {
+        0
+    };
+    // Cheap and safe here: this is a service-loop context with GS live on every online CPU.
+    let core = crate::arch::percpu::this_cpu().cpu_index;
+
+    // BACKWARDS first. Either counter running backwards is a monotonicity break, and it must be
+    // tested ahead of the frozen branch — `u2 <= u1` swallows `u2 < u1`, and the frozen line
+    // reports `u1`, which would print the PRE-regression second and hide the fault.
+    if u2 < u1 || b < a {
+        if claim_clock_x1_verdict() {
+            serial_println!(
+                ":: CLOCK-X1: NON-MONOTONE — rdtsc {} -> {}, uptime {} -> {} s (core={}); the clock's monotonicity contract is broken == witness ::",
+                a, b, u1, u2, core
+            );
+        }
         return;
     }
 
-    if u2 > u1 {
-        serial_println!(
-            ":: CLOCK-X1: TSC invariant, ~{} MHz; monotone (rdtsc +{}); uptime {}->{} s (JD17 x86-frozen clock now advances) == witness ::",
-            mhz, delta, u1, u2
-        );
-    } else {
-        // Too fast to cross a wall second within the cap: fall back to tick-monotonicity + nonzero
-        // freq (the brief's blessed fallback). A nonzero `delta` proves the counter advanced.
-        serial_println!(
-            ":: CLOCK-X1: TSC invariant, ~{} MHz; monotone (rdtsc +{} over {} spins, <1 s); uptime {} s == witness ::",
-            mhz, delta, spins, u1
-        );
+    if u2 == u1 {
+        // Frozen only once BOTH deadlines are past. The APIC deadline alone cannot survive the case
+        // it most needs to: if the tick is dead too, `elapsed_ms` stays 0 forever and this poll goes
+        // silent for the whole boot — the deadline would be measured by one of the counters whose
+        // death it exists to report. The TSC deadline is the independent backstop, and both figures
+        // are printed so "the APIC is dead as well" is legible rather than inferred.
+        if elapsed_ms >= CLOCK_X1_FROZEN_MS || (hz != 0 && b.wrapping_sub(a) >= hz * 3) {
+            if claim_clock_x1_verdict() {
+                serial_println!(
+                    ":: CLOCK-X1: FROZEN — uptime still {} s after {} ms APIC / {} ms TSC (rdtsc +{}, core={}); the JD17 second derivation does NOT advance == witness ::",
+                    u1, elapsed_ms, tsc_ms, b.wrapping_sub(a), core
+                );
+            }
+        }
+        return; // still inside the sampled second — say nothing, spend nothing, look again next pass
     }
+
+    if !claim_clock_x1_verdict() {
+        return;
+    }
+
+    // Cross-check the TSC's millisecond view of the deferral against the APIC tick's. See
+    // `CLOCK_X1_SKEW_*` for what this can and cannot convict, and why the tolerance scales.
+    let skew = tsc_ms.abs_diff(elapsed_ms) > CLOCK_X1_SKEW_FLOOR_MS + elapsed_ms / CLOCK_X1_SKEW_DIV;
+    serial_println!(
+        ":: CLOCK-X1: TSC invariant, ~{} MHz; monotone (rdtsc +{}); uptime {}->{} s (JD17 x86-frozen clock now advances) [paygo: deferred {} ms TSC / {} ms APIC, uptime +{} s, core={} — {}] == witness ::",
+        hz / 1_000_000,
+        b.wrapping_sub(a),
+        u1,
+        u2,
+        tsc_ms,
+        elapsed_ms,
+        u2 - u1,
+        core,
+        if skew { "SKEW" } else { "CONSISTENT" }
+    );
 }
 
 /// U2 Part-0a verdict (BSP-quiet, mirrors `await_verdict`): wait until the TF+SYSCALL fixture has
@@ -6112,6 +9955,26 @@ const U3_5_COTASK_STEPS: u32 = 8;
 /// NOT wedge the core (the co-task got CPU time via preemption).
 static U3_5_COTASK_PROGRESS: AtomicU32 = AtomicU32::new(0);
 
+/// U3.5 property (c): ring-3 timer IRQs the observation window must SEE before it accepts the
+/// counter reading — `3 * QUANTUM_TICKS`, i.e. at least three full quantum expiries.
+///
+/// This replaces a flat `ticks() + 100` sleep that was the single largest term in the witness build's
+/// `BPACE: sched d=155ms` (bootpace.md §11). The old window was a duration; the property is an EVENT
+/// COUNT, and stating it as one both costs less and proves more — "the counter climbed across at
+/// least three preemptions" instead of "the counter climbed over an interval in which some unknown
+/// number of preemptions happened". `IRQS_AT_RING3` ticks once per 1 kHz timer IRQ taken while the
+/// spinner is at CPL 3, so twelve of them is ~12 ms on a calibrated bench and the reading is 12x the
+/// clock's own granularity.
+///
+/// Floor, and why not lower: one quantum expiry proves a single resume, which a task that wedges
+/// immediately AFTER its first resume would also pass; three is the smallest count that requires the
+/// resume path to work repeatedly. The 100 ms deadline below is retained UNCHANGED as the bound, so a
+/// TCG/QEMU run that under-delivers ring-3 IRQs behaves exactly as it did before this trim.
+const U3_5_OBS_IRQS: u64 = 3 * crate::arch::sched::QUANTUM_TICKS as u64;
+/// Upper bound on the property-(c) observation window, in ms. Unchanged from the pre-trim constant —
+/// it was the whole window and is now only the deadline.
+const U3_5_OBS_BOUND_MS: u64 = 100;
+
 /// U3.5 kernel co-task pinned to the SPINNER'S core: take `U3_5_COTASK_STEPS` steps, sleeping between
 /// them so it time-shares the core with the preemptible spinner, then exit. Under cooperative ring 3
 /// this task would NEVER run (the spinner would hog the core forever); its completion is the proof the
@@ -6160,6 +10023,14 @@ pub fn u3_5_run_fixture(cpu: usize) {
     let irqs_before = crate::arch::interrupts::IRQS_AT_RING3.load(Ordering::Acquire);
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
 
+    // UPACE: this fixture is the WHOLE of the witness build's `BPACE: sched d=` residue (155–156 ms on
+    // every witness boot of `rmbp-gr16-s73/ttyUSB0.log`, and the ONLY line in the step-4d block whose
+    // two adjacent timestamps differ). §8e attributed that residue to "the ring-3 fixture ladder";
+    // the capture says otherwise — LOGWIT-1, SNTP-X86-GATE, DNS-X86-GATE, U1a, U1b, U2-0a and U3 all
+    // land on the SAME millisecond, and every one of the 155 ms sits between this line and the verdict
+    // below. So the fixture carries its own four-phase breakdown, at the resolution of the 1 kHz clock
+    // it already waits on. Cheap by construction: four `ticks()` reads and one line.
+    let t_enter = crate::arch::ticks();
     // Co-task first (queued at the spinner's priority), then the preemptible spinner — both on `cpu`.
     serial_println!(":: U3.5: preemptible-ring-3 demo — spinner + co-task on core {} ::", cpu);
     crate::arch::sched::spawn("u3.5-cotask", u3_5_cotask, 0, cpu, crate::arch::sched::PRIO_NORMAL);
@@ -6178,18 +10049,34 @@ pub fn u3_5_run_fixture(cpu: usize) {
         }
         core::hint::spin_loop();
     }
+    let t_armed = crate::arch::ticks();
 
-    // (c): the spinner is still running (not yet reaped). Sample its counter across a short bounded
-    // window and confirm it CLIMBED — forward progress over (necessarily several quanta of) preemptions
-    // proves each eviction was correctly resumed. The window spans many quanta at 1 kHz; the counter
-    // increments at CPU speed, so any live spinner grows it by a huge margin.
+    // (c): the spinner is still running (not yet reaped). Sample its counter across a bounded window
+    // and confirm it CLIMBED — forward progress over preemptions proves each eviction was correctly
+    // resumed.
+    //
+    // The window used to be a flat `ticks() + 100`: a fixed 100 ms sleep on the BSP, and (bootpace.md
+    // §11) the largest single term in `sched d=`. What property (c) actually needs is not a duration
+    // but a number of PREEMPTIONS to have happened between the two samples, so the window now WAITS
+    // FOR THAT EVENT — `U3_5_OBS_IRQS` further ring-3 timer IRQs — and keeps the 100 ms only as the
+    // deadline. It is strictly stronger: the pre-trim form could be satisfied by a window in which the
+    // spinner was never once evicted (the counter would climb anyway, and nothing checked), while this
+    // one cannot exit early unless the ring-3 IRQ counter moved by three quanta's worth. `obs_irqs` is
+    // printed so a short window is a readable number and not an inference.
     let progress_1 = read_counter();
-    let obs_deadline = crate::arch::ticks() + 100;
-    while crate::arch::ticks() < obs_deadline {
+    let irqs_obs_base = crate::arch::interrupts::IRQS_AT_RING3.load(Ordering::Acquire);
+    let obs_deadline = crate::arch::ticks() + U3_5_OBS_BOUND_MS;
+    let mut obs_irqs;
+    loop {
+        obs_irqs = crate::arch::interrupts::IRQS_AT_RING3.load(Ordering::Acquire) - irqs_obs_base;
+        if obs_irqs >= U3_5_OBS_IRQS || crate::arch::ticks() >= obs_deadline {
+            break;
+        }
         core::hint::spin_loop();
     }
     let progress_2 = read_counter();
     let resumed = progress_1 > 0 && progress_2 > progress_1;
+    let t_observed = crate::arch::ticks();
 
     // Reap the spinner via the scheduler (it never exits) and confirm it terminated within the bound.
     kill.request();
@@ -6198,6 +10085,7 @@ pub fn u3_5_run_fixture(cpu: usize) {
         core::hint::spin_loop();
     }
     let reaped = kill.is_reaped();
+    let t_reaped = crate::arch::ticks();
 
     let irqs = crate::arch::interrupts::IRQS_AT_RING3.load(Ordering::Acquire) - irqs_before;
     let cot = U3_5_COTASK_PROGRESS.load(Ordering::Acquire);
@@ -6213,11 +10101,30 @@ pub fn u3_5_run_fixture(cpu: usize) {
         );
     }
 
+    // UPACE line. `armed` is (a)+(b) — the co-task's `U3_5_COTASK_STEPS` sleeps, each of which must
+    // outwait the spinner's remaining quantum, so its floor is roughly `STEPS * QUANTUM_TICKS` ms and
+    // it is REAL WORK proving the DoS fix, not a wait to be trimmed. `observe` is property (c) and is
+    // the term the event-driven window shortened. `obs_irqs < U3_5_OBS_IRQS` alongside
+    // `observe=100ms` is the tripwire: the window hit its deadline instead of its event, which on
+    // metal means ring-3 IRQs stopped arriving and the PASS above rests on a weaker reading than it
+    // claims. On TCG that combination is expected and benign (`IRQS_AT_RING3` under-delivers, which is
+    // why the gate is `> 0` and not an exact count).
+    serial_println!(
+        ":: U3.5 pace: armed={}ms observe={}ms reap={}ms total={}ms (obs_irqs={}/{} steps={}) ::",
+        t_armed.saturating_sub(t_enter),
+        t_observed.saturating_sub(t_armed),
+        t_reaped.saturating_sub(t_observed),
+        t_reaped.saturating_sub(t_enter),
+        obs_irqs,
+        U3_5_OBS_IRQS,
+        U3_5_COTASK_STEPS,
+    );
+
     // Slot lifecycle: on the PASS path the scheduler's reap already restored the kernel CR3 + freed
     // the slot. On a reap TIMEOUT (`!reaped`), the spinner never self-exits (it never syscalls), so it
     // is still ALIVE and running under `cr3` — freeing that slot here would be unsafe (a later
     // `alloc_user_space` could rebuild a live address space underfoot) and could double-free against a
-    // late scheduler reap. Leaking one of the 8 slots is harmless: U3.5 is the LAST ring-3 fixture, and
+    // late scheduler reap. Leaking one of the 12 slots is harmless: U3.5 is the LAST ring-3 fixture, and
     // a timeout is already a hard FAIL. So we deliberately do NOT free here.
 }
 
@@ -6808,19 +10715,35 @@ fn openf_release(nameid: usize, can_block: bool) {
 /// in a launcher/IF=1 kernel task it masks for the lock hold and restores on release.
 struct IrqGuard {
     was_enabled: bool,
+    /// R0 / rtwit — TSC at the enabled→disabled transition, so this THIRD software mask primitive
+    /// feeds `irqmask_max` too (not just `IrqMask`/`without_interrupts`). Present only when the ruler
+    /// is armed; the struct is otherwise the plain `{ was_enabled }` it was. NOTE: on a SYSCALL path
+    /// IF is already 0 (SFMASK) so `was_enabled` is false and this times nothing — correct, because
+    /// the masking there is the syscall-entry SFMASK, not this guard (see the `rtwit` module's
+    /// SFMASK-gap note). It DOES time the IF=1 kernel-task uses (`ns_lock` from a launcher).
+    #[cfg(feature = "rtwit")]
+    t0: u64,
 }
 
 impl IrqGuard {
     fn mask_save() -> Self {
         let was_enabled = x86_64::instructions::interrupts::are_enabled();
         x86_64::instructions::interrupts::disable();
-        IrqGuard { was_enabled }
+        IrqGuard {
+            was_enabled,
+            #[cfg(feature = "rtwit")]
+            t0: crate::arch::now_cycles(),
+        }
     }
 }
 
 impl Drop for IrqGuard {
     fn drop(&mut self) {
         if self.was_enabled {
+            // R0 / rtwit — fold the outermost mask span before re-enabling (only the guard that
+            // masked from an enabled state times anything; a nested guard restores to "still masked").
+            #[cfg(feature = "rtwit")]
+            crate::rtwit::note_mask_span(crate::arch::now_cycles().wrapping_sub(self.t0));
             x86_64::instructions::interrupts::enable();
         }
     }
@@ -9290,6 +13213,29 @@ fn deriv_derive_from(row: usize, src: usize) -> Option<(u32, u64)> {
 const PFREE: u8 = 0; // entry unused
 const PRUNNING: u8 = 1; // claimed; a child is (or is about to be) running under `pid`
 const PEXITED: u8 = 2; // the child exited/was killed; `status` is valid, awaiting reap by sys_wait
+/// PROCREAP / REVIEW-1: a row a RELEASER holds exclusively while it settles — the transient claim
+/// token, and the thing that makes "who owns this row" answerable at all.
+///
+/// Three paths can release a row on x86 (`bg_poll(reap = true)`, `bg_kill`'s confirmed arm, and
+/// `proc_reserve`'s BGRUN-SCAV sweep), and until this state existed they claimed by CASing
+/// `PEXITED -> PRUNNING`. That is a sound mutual exclusion between the three, and it is NOT enough,
+/// because the winner then spends a multi-instruction span (a `try_wait` on a locked semaphore among
+/// it) with the row reading `PRUNNING` and STILL CARRYING THE OLD PID. A concurrent releaser that lost
+/// the CAS and fell back to identifying the row by pid would read that stale pid and conclude the row
+/// was still its own — and free a row the winner had already handed to a new tenant. The review caught
+/// exactly that window in `bg_kill`.
+///
+/// `PREAPING` closes it structurally rather than by narrowing it: a releaser claims into this state,
+/// clears the identity fields, and only THEN publishes the row's next state (`PRUNNING` for the sweep,
+/// which hands the row straight to a new tenant; `PFREE` via [`proc_free`] for the two reapers). The
+/// Release store that publishes the claim is therefore program-order-AFTER the identity clear, so any
+/// observer that Acquire-reads that published state is guaranteed NOT to see the old pid — which is
+/// what makes `bg_kill`'s identity test a fact rather than a torn read.
+///
+/// Nothing transitions out of `PREAPING` but its holder, so the claim is exclusive by construction.
+/// No path may treat such a row as live: it is neither a dispatchable child (`proc_find_running`), a
+/// waitable child (`proc_find_child`), nor a pollable/killable job.
+const PREAPING: u8 = 3;
 
 /// A spawned child's process control block. Static so it OUTLIVES the child's `Task` Box (freed on
 /// exit) and its slot teardown — the reap accounting must survive both. `done` is posted exactly once
@@ -9310,11 +13256,58 @@ struct Proc {
     /// Posted once by the child (SYS_EXIT or the kill path), awaited once by the parent's sys_wait. A
     /// scheduler-post wake, so sys_wait works under QEMU (unlike a timer-driven sleep).
     done: crate::arch::sched::Semaphore,
+    /// PROCREAP: true iff this row belongs to an OPERATOR-LAUNCHED BACKGROUND program — one spawned
+    /// through [`spawn_user_image_bg_inner`], whose only reaper is the shell (`jobs` ->
+    /// `bg_poll(reap = true)`, or `kill`). Set after the row is claimed and before the task can exist;
+    /// cleared by [`proc_free`] and by every fresh claim.
+    ///
+    /// It is the SCAVENGE PREDICATE, and it is not decoration. `proc_reserve`'s BGRUN-SCAV sweep
+    /// reclaims `PEXITED` rows that nobody will ever reap — but on x86 a `PEXITED` row is NOT
+    /// necessarily unowned: the U7x / U6gx / sock4 fixtures publish `PEXITED` on a launcher-PLANTED row
+    /// (deliberately, and with NO `done` permit posted — the launcher waits on counters) and then free
+    /// that row BY INDEX after their verdict. Scavenging one would hand a live index to a second owner.
+    /// A background program's row is the only kind whose reaper can go missing, so it is the only kind
+    /// the sweep may take. `run_user_image`'s row is excluded for the same reason: its caller holds the
+    /// index across the wait and frees it itself.
+    bg_owned: AtomicBool,
 }
 /// A small cap « USER_SLOTS: if it exhausts, sys_spawn returns -EAGAIN, never grows the slot pool.
-/// DIVERGENCE: aarch64 raised its own cap to 6 in PROCS-6 (background apps filling a panel); these
-/// tables are per-arch and the numbers are not required to track each other.
-const MAX_PROCS: usize = 4;
+///
+/// PROCREAP — raised 4 -> 6, matching aarch64's PROCS-6, so the operator can keep a panel of
+/// background programs and still launch. What the raise had to clear on THIS arch:
+///   * EVERY consumer is parametric. `proc_reserve`/`proc_free`/`proc_find_*`/`bg_poll`/`bg_kill` and
+///     the BGRUN-SCAV sweep are all `0..MAX_PROCS`; the semaphore reservations are `for p in &PROCS`.
+///     `BG_KILLS` is `[Option<BgKill>; MAX_PROCS]` and widens with it. There is no bitmap, no packed
+///     index and no fixed-width field keyed on the old 4.
+///   * ADDRESS SPACES still bind last. Each live row costs one ring-3 slot out of
+///     `memory::USER_SLOTS`, so the background rows must leave 2 for a foreground `run` and for the
+///     fixtures' scratch tenancies. The const block below asserts that margin rather than promising it.
+///   * WINDOWS fit: only ring-3 programs mint rows in `video::wm`, plus the console.
+///   * SHELL side fits: `shell::BG_JOBS` stays strictly above this cap.
+///   * KILL side needs nothing: x86 arms kills through a per-task `Arc<KillSwitch>`, not a fixed
+///     request table, so there is no aarch64-style `MAX_KILL_REQS` coupling to assert here.
+///
+/// HEADROOM (Boot AL, rMBP) — raised 6 -> 10, x86 only (aarch64 keeps PROCS-6). The number the
+/// operator meets is not this one: `video::wcx::desktop_app_service` launches `STAT.ELF` at boot and
+/// it never exits, so at 6 a `storm` fleet capped at **5**. The target is a fleet of 8 vugs with the
+/// desktop app still resident and a foreground `run` still possible — 8 + 1 = 9 rows in use, so 10.
+///
+/// EVERY TERM RE-DERIVED, not assumed:
+///   * `USER_SLOTS` 8 -> 12 keeps `MAX_PROCS <= USER_SLOTS - 2` at EQUALITY (10 <= 10), so the
+///     2-slot reserve is exactly as wide as it was, not narrowed to buy rows. That is deliberate:
+///     the reserve is what a foreground `run` and the fixture tenancies live on, and it is stated as
+///     an absolute 2, not a fraction.
+///   * `video::wm::MAX_WINDOWS` 8 -> 12 for the assertion below — 10 programs plus the console is 11.
+///   * `WIN_MAX` 8 -> 12 to match, or the global window table would refuse what the process table
+///     admits.
+///   * `NTHREAD` 8 -> 24, because a fleet whose programs cannot all get workers is a fleet running
+///     at two different speeds; see that constant.
+///   * `shell::BG_JOBS` 8 -> 12, restoring the "strictly above the cap" property this list claims.
+///   * `shell`'s `storm` clamp is now DERIVED from `proc_table_rows()`, so it cannot drift from this
+///     line again.
+/// Everything else was already parametric and needed no edit: the reserve/free/find/census loops,
+/// `BG_KILLS`, and the per-slot sidecar arrays.
+const MAX_PROCS: usize = 10;
 static PROCS: [Proc; MAX_PROCS] = [const {
     Proc {
         pid: AtomicU64::new(0),
@@ -9322,8 +13315,27 @@ static PROCS: [Proc; MAX_PROCS] = [const {
         state: AtomicU8::new(PFREE),
         slot: AtomicUsize::new(0),
         done: crate::arch::sched::Semaphore::new(0),
+        bg_owned: AtomicBool::new(false),
     }
 }; MAX_PROCS];
+
+/// PROCREAP: the cap's two structural neighbours, enforced at compile time rather than left to a
+/// comment. A row that cannot be given an address space can only ever hand back `-EAGAIN` from deeper
+/// in the launch, and a background row that cannot own a window is one the compositor would refuse.
+const _: () = {
+    // Strictly below, by the margin the doc above actually promises: two slots kept free so a
+    // foreground `run` and the fixtures' scratch tenancies can still get an address space with every
+    // background row occupied. `< USER_SLOTS` alone would permit 7, which satisfies the letter of
+    // "leaves slots free" while starving exactly the two callers that need one.
+    assert!(
+        MAX_PROCS <= crate::arch::memory::USER_SLOTS - 2,
+        "MAX_PROCS must leave 2 ring-3 slots free"
+    );
+    assert!(
+        MAX_PROCS <= crate::video::wm::MAX_WINDOWS,
+        "every bg program must be able to own a window"
+    );
+};
 
 /// Claim a FREE Proc entry, returning its index. The CAS on `state` (FREE->RUNNING) is the atomic
 /// ownership token; the pid=0 placeholder is overwritten with the real child pid (Release) by
@@ -9339,10 +13351,111 @@ fn proc_reserve() -> Option<usize> {
             PROCS[i].pid.store(0, Ordering::Release);
             PROCS[i].status.store(0, Ordering::Release);
             PROCS[i].slot.store(0, Ordering::Release);
+            PROCS[i].bg_owned.store(false, Ordering::Release);
+            return Some(i);
+        }
+    }
+    // BGRUN-SCAV (ported from `arch::aarch64::syscall::proc_reserve`): no FREE row. Before failing,
+    // reclaim a row belonging to a BACKGROUND program that has ALREADY EXITED and that nobody has
+    // reaped. BGRUN-1's stated position was that holding those rows is "honest: a shell that never runs
+    // `jobs` eventually gets 'process table full', not silent loss" — right about the STATUS, and wrong
+    // about the RECOVERY, because it assumed a handle always exists to reap through. Boot AJ proved it
+    // does not: three confirmed kills left three rows `PEXITED` forever and the operator ran out of
+    // launchable slots with no recovery short of reboot. The kill half of that is fixed at the source
+    // (`bg_kill` reaps in place now); this is the belt for any OTHER path that can orphan a row.
+    //
+    // The trade is explicit and it is the lesser loss: an unobserved EXIT STATUS is dropped (a later
+    // `jobs` prints `gone` for that pid rather than `exited N`), and in exchange a launch the machine
+    // has the resources to satisfy is not refused. Never silent — the reclaim prints.
+    //
+    // Two guards, both load-bearing:
+    //   * `bg_owned` — see the field's doc. A `PEXITED` row on x86 is not necessarily unowned; the
+    //     fixture launchers plant rows, publish `PEXITED` on them WITHOUT posting `done`, and free them
+    //     by INDEX after their verdict. Only a background row's reaper can go missing.
+    //   * the CAS `PEXITED -> PREAPING` — what makes this safe to race against `jobs` AND against a
+    //     concurrent `bg_kill`: the row is claimed by exactly ONE of the three, so the reap-once
+    //     invariant is preserved rather than weakened (a scavenged row's `jobs` entry takes the `Gone`
+    //     arm, which already exists for this case). The `done` permit is consumed for the same reason
+    //     `bg_poll(reap = true)` consumes it — a reused entry must start at zero permits — and with
+    //     `try_wait`, not `wait`: this must never park under a caller that may hold a lock, and a row
+    //     whose permit is somehow absent must cost a dropped permit, not the shell task.
+    for i in 0..MAX_PROCS {
+        if !PROCS[i].bg_owned.load(Ordering::Acquire) {
+            continue;
+        }
+        if PROCS[i]
+            .state
+            .compare_exchange(PEXITED, PREAPING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let stale_pid = PROCS[i].pid.load(Ordering::Acquire);
+            let stale_status = PROCS[i].status.load(Ordering::Acquire);
+            let _ = PROCS[i].done.try_wait();
+            PROCS[i].pid.store(0, Ordering::Release);
+            PROCS[i].status.store(0, Ordering::Release);
+            PROCS[i].slot.store(0, Ordering::Release);
+            PROCS[i].bg_owned.store(false, Ordering::Release);
+            // REVIEW-1: PUBLISH THE CLAIM LAST. Handing the row to its new tenant (`PRUNNING`) is a
+            // Release store placed strictly AFTER the identity above is erased, so a concurrent
+            // `bg_kill` that Acquire-observes this `PRUNNING` cannot then read the pid it was hunting.
+            // Publishing `PRUNNING` as the CAS target instead — which is what this did before the
+            // review — left the old pid readable for the whole span above, and that was the window in
+            // which a kill could free a row this sweep had already re-let.
+            PROCS[i].state.store(PRUNNING, Ordering::Release);
+            bg_kill_forget(stale_pid);
+            serial_println!(
+                ":: BGRUN-SCAV: process table full — reclaimed row {} from EXITED unreaped pid={} (status={} DISCARDED; `jobs` will read `gone`) ::",
+                i, stale_pid, stale_status
+            );
             return Some(i);
         }
     }
     None
+}
+
+/// PROCREAP: the operator string for a `proc_reserve` refusal, naming the state that actually caused
+/// it. `proc_reserve` has already run the BGRUN-SCAV sweep by the time a caller reaches this, so
+/// whatever the census reports is genuinely un-reclaimable right now — and the old message
+/// unconditionally advised `jobs`, which is a LIE once the sweep exists (if `jobs` could have freed a
+/// row, the sweep already did). Say what actually ran out.
+fn proc_table_full_reason() -> &'static str {
+    let (_, _, exited, _) = proc_table_headroom();
+    if exited > 0 {
+        // REVIEW-2 (F4): the old text named kernel fixtures as the cause. That is the LIKELY cause — the
+        // sweep has already taken every background corpse, so what remains is normally a launcher's
+        // planted row awaiting its verdict, which `jobs` cannot reap and never could — but this bucket
+        // also counts `PREAPING`, a row mid-release, and blaming fixtures for one would send a reader
+        // hunting the wrong subsystem. Say what is observable and let the state say the rest.
+        "process table full — no row is reclaimable: the rest are settling or held by kernel fixtures (`jobs` cannot reap these)"
+    } else {
+        "process table full — every row holds a live program (`kill <pid>` one, or wait for it to exit)"
+    }
+}
+
+/// PROCREAP: the `Proc` table's occupancy right now, as `(free, running, exited_unreaped, orphaned)`.
+/// Reads only; safe from any task. The tuple shape mirrors aarch64's `proc_table_headroom` so the
+/// shell can print the accounting without an arch gate — x86 has no `PORPHANED` state (kills are armed
+/// through a per-task `Arc<KillSwitch>`, never parked in a table), so the fourth field is always 0.
+pub fn proc_table_headroom() -> (usize, usize, usize, usize) {
+    let (mut free, mut running, mut exited) = (0usize, 0usize, 0usize);
+    for i in 0..MAX_PROCS {
+        match PROCS[i].state.load(Ordering::Acquire) {
+            PFREE => free += 1,
+            PRUNNING => running += 1,
+            // PEXITED, and PREAPING with it: a row mid-release is not free yet and is not running.
+            // `PREAPING` is held for a handful of instructions, so it can only ever bias a snapshot
+            // taken inside one — it never persists into an operator-visible census.
+            _ => exited += 1,
+        }
+    }
+    (free, running, exited, 0)
+}
+
+/// PROCREAP: the process-table cap — the denominator for [`proc_table_headroom`]. See the `MAX_PROCS`
+/// block for why it is 10 and why moving it is an arc, not a tuning step (HEADROOM raised it 6 -> 10;
+/// `shell`'s `storm` clamp is derived from THIS function so the two cannot drift apart again).
+pub const fn proc_table_rows() -> usize {
+    MAX_PROCS
 }
 
 /// Find the RUNNING Proc entry whose pid matches — the child-exit / child-kill lookup. Called with a
@@ -9358,15 +13471,60 @@ fn proc_find_running(pid: u64) -> Option<usize> {
 /// => the caller has no such child.
 fn proc_find_child(pid: u64) -> Option<usize> {
     (0..MAX_PROCS).find(|&i| {
-        PROCS[i].state.load(Ordering::Acquire) != PFREE
+        // REVIEW-1: `!= PFREE` would have admitted `PREAPING` — a row some releaser is settling, whose
+        // `done` permit is already spoken for. A `sys_wait` landing on one would park on a permit that
+        // will never come. A row being released is not a waitable child; only these two states are.
+        matches!(PROCS[i].state.load(Ordering::Acquire), PRUNNING | PEXITED)
             && PROCS[i].pid.load(Ordering::Acquire) == pid
     })
 }
 
 /// Release a Proc entry to FREE — after reaping in sys_wait, or unwinding a failed sys_spawn claim.
+/// PROCREAP / REVIEW-2 (F2): publish a row's terminal status — the ONE place `PEXITED` and the `done`
+/// permit are ordered against each other, because the correct order depends on WHO can consume the row.
+///
+/// THE HAZARD. Every releaser (`bg_poll(reap)`, `bg_kill`'s confirmed arm, the BGRUN-SCAV sweep) claims
+/// a row by CASing it out of `PEXITED` and then drains its permit with `try_wait`, which must not park —
+/// they can run under the shell's `BG_JOBS` spinlock. So a releaser that claims inside a
+/// `store(PEXITED)` .. `post()` gap drains nothing, frees the row, and the exiting task's `post()` then
+/// lands a permit on a row that has since been recycled; the next tenant's `sys_wait` returns early on a
+/// stranger's permit. The invariant every `try_wait` site assumes — and which `shell::bg_jobs`'s
+/// LOCK-ACROSS-REAP note already asserts in prose — is **`PEXITED` implies the permit is posted**.
+///
+/// WHY THIS IS NOT SIMPLY "POST FIRST EVERYWHERE". `sys_wait` waits on the permit and then, WITHOUT
+/// consulting `state`, reads the status and `proc_free`s the row. Posting before publishing would let it
+/// free the row before the exiting task's `state.store(PEXITED)` lands — stamping `PEXITED` onto a row
+/// that is now `PFREE` (which nothing recovers: `proc_reserve` claims only from `PFREE`, the sweep only
+/// when `bg_owned`, so it strands for the boot) or onto a new tenant's live `PRUNNING` row, which a
+/// reaper then frees under a running program. That is the round-1 mistake in a new costume: publishing a
+/// state word that another party frees against.
+///
+/// SO THE ORDER IS CHOSEN BY THE ROW'S CONSUMER, and the two sets are disjoint and provable:
+///   * `bg_owned` rows are claimable by the three releasers, and are reachable by `sys_wait` from NO
+///     path — a background pid is never installed in any slot's `HANDLES` row, and a handle is the only
+///     way `sys_wait` can name a child. POST FIRST, so the invariant holds exactly where it is needed.
+///   * every other row (a `sys_spawn` child, a foreground `run`, a fixture's planted row) is reachable
+///     only by an index- or handle-holding waiter and is claimable by NO releaser: the sweep requires
+///     `bg_owned`, and `bg_poll`/`bg_kill` resolve background pids. PUBLISH FIRST, which is `sys_wait`'s
+///     standing contract and the order this code has always had.
+///
+/// The `bg_owned` read is stable here: it is set before the task exists, and cleared only by a releaser,
+/// which must first claim the row out of `PEXITED` — a state this call has not published yet.
+fn proc_publish_exit(i: usize, status: i32) {
+    PROCS[i].status.store(status, Ordering::Release);
+    if PROCS[i].bg_owned.load(Ordering::Acquire) {
+        PROCS[i].done.post();
+        PROCS[i].state.store(PEXITED, Ordering::Release);
+    } else {
+        PROCS[i].state.store(PEXITED, Ordering::Release);
+        PROCS[i].done.post();
+    }
+}
+
 fn proc_free(i: usize) {
     PROCS[i].pid.store(0, Ordering::Release);
     PROCS[i].slot.store(0, Ordering::Release); // U7x: drop the pid->slot map with the entry
+    PROCS[i].bg_owned.store(false, Ordering::Release); // PROCREAP: never leave a stale scavenge permit
     PROCS[i].state.store(PFREE, Ordering::Release);
 }
 
@@ -9405,11 +13563,11 @@ static HANDLES: [[AtomicU64; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
 /// `CAP_READ`/`CAP_EXEC`/`CAP_REVOKE` round out the model (U8x: revoking a handle carrying `CAP_REVOKE`
 /// kills its derivation SUBTREE; a right-less revoke stays local — U5x's ownership semantics). Values are
 /// stable across arches (aarch64 U5 twin).
-const CAP_READ: u32 = 1 << 0; // 0x01
-const CAP_WRITE: u32 = 1 << 1; // 0x02
-const CAP_EXEC: u32 = 1 << 2; // 0x04
-const CAP_GRANT: u32 = 1 << 3; // 0x08
-const CAP_REVOKE: u32 = 1 << 4; // 0x10 (U8x: revoking a handle carrying this kills its derivation SUBTREE)
+use una_abi::CAP_READ; // 0x01
+use una_abi::CAP_WRITE; // 0x02
+use una_abi::CAP_EXEC; // 0x04
+use una_abi::CAP_GRANT; // 0x08
+use una_abi::CAP_REVOKE; // 0x10 (U8x: revoking a handle carrying this kills its derivation SUBTREE)
 // The rights are the distinct low 5 bits — a well-formed bitmask (each a single, non-overlapping bit,
 // which the attenuation check `req & !src` relies on). This const-assert verifies that and anchors every
 // CAP_* as used, so the model bit not yet exercised in Rust this arc (CAP_EXEC — held by no fixture, so
@@ -9640,11 +13798,26 @@ pub fn clear_handle_row(slot: usize) {
     // no consumer, which presents to the operator as the keyboard silently ceasing to work. The
     // generation bump above also retires this slot's thread-table rows for the lazy scavenge in
     // `sys_thread_spawn` — a killed threaded program leaks no rows permanently.
-    el0_input_revoke_slot(slot);
+    user_input_revoke_slot(slot);
+    // VUGPAUSE-2/x86: and the park flag — THE ONLY PLACE IT MAY BE CLEARED other than by the parker
+    // itself on its normal return. `user_input_revoke_slot` above resets the ring but must not touch
+    // this, because `clear_input_row` is shared with the focus-ARRIVAL path; see `USER_INPUT_PARKED`.
+    // Teardown is the one event that PROVES the parker is gone: it is the path a task killed inside
+    // `sched::futex_wait` exits through without ever reaching its own clear.
+    clear_input_parked(slot);
     // WINX-7: the detached mark is per-TENANT, not per-slot, so it must die with the tenant — a
     // foreground `run` landing in a slot a `bg` job just vacated must not inherit "I was detached"
     // and skip its own frame cap.
     SLOT_DETACHED[slot].store(false, Ordering::Release);
+    // VUGMIN/x86: and the hidden bit, on the same terms. A slot whose last tenant died while hidden
+    // must not hand that bit to the next one — see `clear_hidden`. This also rewrites the flags word,
+    // so the page a recycled slot exposes is already correct before its new tenant can read it.
+    clear_hidden(slot);
+    // DESKTOP-APP: per-TENANT for exactly the same reason — an operator-typed launch that lands in the
+    // slot the desktop app vacated must get the ordinary first-window grant, AND must not have its
+    // clicks consumed as furniture. Both readers of the flag depend on this clear.
+    #[cfg(feature = "wc")]
+    SLOT_NO_AUTOFOCUS[slot].store(false, Ordering::Release);
     for i in 0..NHANDLE {
         // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind),
         // then the rights and kind — so no intermediate state is ever a live handle with stale rights/kind.
@@ -11383,7 +15556,7 @@ const KILL_CONFIRM_MS: u64 = 2000;
 /// WINX-2: the task name a foreground `run` program is spawned under.
 const RUN_TASK_NAME: &str = "shell-run";
 /// WINX-2: the task name a background `bg` program is spawned under.
-const BG_TASK_NAME: &str = "bg-el0";
+const BG_TASK_NAME: &str = "bg-user";
 
 /// WINX-2: the outcome of [`run_user_image`] — the program exited with a status, was killed by the
 /// fault-kill net (a CONTAINED fault), or overran its deadline (still running / stuck, and then killed).
@@ -11463,7 +15636,9 @@ fn load_program_common(bytes: &[u8]) -> Result<(super::elf::Mapped, usize), &'st
         return Err("image larger than the 16 KiB user window");
     }
     let Some(pi) = proc_reserve() else {
-        return Err("process table full (run `jobs` to reap exited jobs)");
+        // PROCREAP: `proc_reserve` has already run the BGRUN-SCAV sweep, so this refusal names what is
+        // genuinely un-reclaimable rather than advising a `jobs` that cannot help.
+        return Err(proc_table_full_reason());
     };
     let mapped = match super::elf::map_image_into_slot(bytes) {
         Ok(m) => m,
@@ -11499,7 +15674,13 @@ pub fn run_user_image(
     let _ = name; // the task name is fixed (`RUN_TASK_NAME`) so the kill arm can match it
     let (mapped, pi) = load_program_common(bytes)?;
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
-    let cpu = crate::arch::sched::meter_current_cpu();
+    // SMPBAL-X86: a foreground `run` is load-balanced, not stuck on the caller's core. The caller is
+    // `x86_render_service` (the shell runs there since SCHED-X86), so `meter_current_cpu()` put every
+    // program on the RENDER core and a `run` degraded the panel for its whole duration — the open
+    // item at `scheduler.md`'s placement section. `CPU_AUTO` picks the shallowest dispatching queue,
+    // excludes the render core while any other core is dispatching, and marks the task steal-eligible
+    // so an idle core can correct the choice later.
+    let cpu = crate::arch::sched::CPU_AUTO;
     let pid = crate::arch::sched::spawn_user_preemptible(
         RUN_TASK_NAME,
         mapped.entry,
@@ -11557,20 +15738,56 @@ pub fn run_user_image(
 /// `(pid, slot, entry)`; the caller records the pid and reaps it later via [`bg_poll`], or stops it with
 /// [`bg_kill`]. Mirrors `run_user_image`'s front half exactly and diverges only in not waiting.
 ///
-/// The Proc row stays claimed after exit (PEXITED, `done` posted) until `bg_poll(reap = true)` consumes
-/// it — the `jobs` verb is the reaper. Rows are a bounded resource (`MAX_PROCS`), which is honest: a
-/// shell that never runs `jobs` eventually gets "process table full", not silent loss.
+/// The Proc row stays claimed after an ordinary exit (PEXITED, `done` posted) until
+/// `bg_poll(reap = true)` consumes it — the `jobs` verb is the reaper. A KILLED row does not wait for
+/// that: [`bg_kill`] reaps in place on a confirmed kill (PROCREAP), because the shell drops its
+/// `BG_JOBS` handle at the same moment and `jobs` could never reach the row again.
+///
+/// Rows are a bounded resource (`MAX_PROCS`), and the shortfall is no longer terminal: `proc_reserve`
+/// runs the BGRUN-SCAV sweep before refusing, reclaiming `bg_owned` rows that exited and were never
+/// reaped. So a shell that never runs `jobs` loses exit STATUSES, not launch capacity.
 pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
+    spawn_user_image_bg_inner(bytes, false)
+}
+
+/// DESKTOP-APP: [`spawn_user_image_bg`] for a launch NOBODY ASKED FOR — the compositor's own desktop
+/// app, started at boot by `video::wcx::desktop_app_service`.
+///
+/// Identical in every respect but one: the slot is marked [`SLOT_NO_AUTOFOCUS`] before the task can
+/// run, so the program's first `SYS_WIN_CREATE` does not take the keyboard off an idle shell. That
+/// module's doc carries the whole argument; the reason it is a separate ENTRY POINT rather than a
+/// flag the caller sets afterwards is that the task is runnable the instant it is spawned, so
+/// "afterwards" is a race the desktop app would sometimes lose.
+///
+/// Deliberately NOT a public policy knob for the shell: `bg`, `run` and BARE-EXEC are operator-driven
+/// launches and must keep the ordinary grant. This entry point exists for kernel-initiated launches
+/// and has exactly one caller — and it is `wc`-gated, because that caller is.
+#[cfg(feature = "wc")]
+pub fn spawn_user_image_bg_no_autofocus(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
+    spawn_user_image_bg_inner(bytes, true)
+}
+
+fn spawn_user_image_bg_inner(
+    bytes: &[u8],
+    no_autofocus: bool,
+) -> Result<(u64, u64, u64), &'static str> {
+    let _ = no_autofocus; // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
     let (mapped, pi) = load_program_common(bytes)?;
+    // PROCREAP: mark the row SCAVENGEABLE before the task can exist. This is the one launch path whose
+    // reaper is a shell HANDLE (`BG_JOBS`) rather than a held index, so it is the one path whose row can
+    // be orphaned by losing that handle — and therefore the only one BGRUN-SCAV may reclaim. See the
+    // `bg_owned` field doc for why a blanket sweep over `PEXITED` would be unsound on x86.
+    PROCS[pi].bg_owned.store(true, Ordering::Release);
     // WINX-7: mark the slot DETACHED before the task can run, so its first `SYS_WIN_CREATE` publishes
     // the flag and the program never observes a stale `false`. See `SLOT_DETACHED` for why a windowed
     // app needs to know it was backgrounded.
     SLOT_DETACHED[mapped.slot].store(true, Ordering::Release);
+    // DESKTOP-APP: the focus exemption, in the SAME pre-spawn window and for the same reason — the
+    // flag has to be true before the task exists, not before it gets around to opening a window.
+    #[cfg(feature = "wc")]
+    SLOT_NO_AUTOFOCUS[mapped.slot].store(no_autofocus, Ordering::Release);
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
-    // Place a bg job on a core chosen by the same round-robin the fixtures use rather than the shell's
-    // own: every `bg` launch runs from the same shell context, so pinning to `this_cpu` would stack every
-    // background program on one core (the aarch64 BG-SPREAD lesson). x86 has no CPU_AUTO, so this is the
-    // simple honest version — spread across the online cores by job count.
+    // SMPBAL-X86: load-balanced placement. See `bg_place_cpu`.
     let cpu = bg_place_cpu();
     let pid = crate::arch::sched::spawn_user_preemptible(
         BG_TASK_NAME,
@@ -11585,31 +15802,32 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
     Ok((pid, mapped.slot as u64, mapped.entry))
 }
 
-/// WINX-2: choose the core a background job starts on — the CALLER's core.
+/// WINX-2: choose the core a background job starts on. SMPBAL-X86: `CPU_AUTO` — the scheduler places
+/// it on the shallowest DISPATCHING run queue and marks it steal-eligible.
 ///
-/// This started as a round-robin over `0..meter_cpu_count()`, mirroring aarch64's BG-SPREAD intent
+/// The full history, because it is a two-defect sequence and both defects are instructive.
+///
+/// It started as a round-robin over `0..meter_cpu_count()`, mirroring aarch64's BG-SPREAD intent
 /// (every `bg` runs from the same shell context, so pinning to one core piles every background program
 /// onto it). That was WRONG and the WINX-3 witness caught it: `meter_cpu_count()` reports how many cores
 /// the METER knows about, which is not the same as how many are released into `run()` and actually
 /// dispatching. A job placed on a core that is online but not scheduling sits in that core's run queue
 /// forever — spawned, never dispatched, never exiting, and invisible except as a job that never starts.
 ///
-/// The caller's core is definitionally scheduling (we are running on it), so placement here is
-/// always-correct if not always-optimal. Spreading properly needs an "is this core dispatching"
-/// predicate that x86's scheduler does not expose yet (aarch64 gets this from `CPU_AUTO`, which picks by
-/// ready-queue depth among cores it knows are live). That predicate is the honest prerequisite for
-/// re-introducing spread, and it is a scheduler change, not a syscall-layer one.
+/// So it became `meter_current_cpu()`, the caller's own core, which is definitionally dispatching
+/// (we are running on it) — always-correct if not always-optimal. Then SCHED-X86 made the shell a
+/// scheduled task, and the caller became `x86_render_service`: every `bg` and every foreground `run`
+/// piled onto the RENDER core. That is the imbalance the bench measured with six vugs open — one core
+/// saturated, five at 0 % — and it was left open in the doc because fixing it honestly needed the
+/// missing "is this core dispatching" predicate, which is a scheduler change and not a syscall-layer
+/// one.
 ///
-/// SCHED-X86 — and "definitionally scheduling" was, until that arc, FALSE for the only caller that
-/// matters. The shell ran in the BSP's inline GUI loop, on a core that never popped its run queue, so
-/// every `bg`/`run` landed on core 0 and sat there: the metal capture showed 2 BGRUN spawns, zero
-/// `SYS_WIN_CREATE`, zero `:: SYSCALL:` witnesses, and both kills burning the full `KILL_CONFIRM_MS`.
-/// The shell is now the `x86_render_service` task, so this function's own premise finally holds and
-/// programs start. The consequence to expect at the bench: they start ON THE RENDER CORE, so a
-/// foreground `run` (whose `yield_now` wait loop interleaves with rendering) degrades the panel for
-/// its duration. That is a syscall-layer placement question, deliberately not fixed here.
+/// SMPBAL-X86 supplies exactly that predicate — `ONLINE_MASK`, set at the top of `run()` — so the
+/// spread this function originally wanted is finally safe to ask for. `CPU_AUTO` is that ask.
+/// Placement is only a hint: the task is also `steal_ok`, so if the guess is wrong an idle core
+/// corrects it within one idle pass.
 fn bg_place_cpu() -> usize {
-    crate::arch::sched::meter_current_cpu()
+    crate::arch::sched::CPU_AUTO
 }
 
 /// WINX-2: poll a background pid. With `reap` set, a `PEXITED` row is consumed here — the posted `done`
@@ -11619,17 +15837,40 @@ fn bg_place_cpu() -> usize {
 /// else — the pid is the key every other lookup uses.
 pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
     for pi in 0..MAX_PROCS {
-        if PROCS[pi].state.load(Ordering::Acquire) == PFREE {
+        // REVIEW-1: `PREAPING` skips too — a row another releaser is settling is already gone as far
+        // as this caller is concerned, and falling through would report it `Running`.
+        if !matches!(PROCS[pi].state.load(Ordering::Acquire), PRUNNING | PEXITED) {
             continue;
         }
         if PROCS[pi].pid.load(Ordering::Acquire) != pid {
             continue;
         }
         return match PROCS[pi].state.load(Ordering::Acquire) {
+            // REVIEW-2 (F3): name `PREAPING` explicitly. This is a SECOND load of `state` — the filter
+            // above cannot speak for it — so a row that a releaser claimed in between arrives here, and
+            // the catch-all would have called it `Running`. A row being released is `Gone`; the caller's
+            // next `jobs` would say so anyway, and a job reported running one line and gone the next is
+            // the kind of instrument disagreement that costs a bench session to chase.
+            PREAPING => BgPoll::Gone,
             PEXITED => {
                 let status = PROCS[pi].status.load(Ordering::Acquire);
                 if reap {
-                    let _ = PROCS[pi].done.wait();
+                    // PROCREAP: CLAIM the row before releasing it. Since BGRUN-SCAV exists, `PEXITED`
+                    // is no longer a state only this reaper acts on — a concurrent `proc_reserve` on
+                    // another core (the desktop-app service is one) may take the same row. The CAS is
+                    // the same one the sweep uses, so exactly one of the two frees it; a loser reports
+                    // `Gone`, which is what a scavenged row honestly is. `try_wait` (not `wait`) for
+                    // the same reason the sweep uses it: this runs with the shell's `BG_JOBS` spinlock
+                    // held, and a permit that is somehow absent must cost a dropped permit, never the
+                    // shell task.
+                    if PROCS[pi]
+                        .state
+                        .compare_exchange(PEXITED, PREAPING, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        return BgPoll::Gone;
+                    }
+                    let _ = PROCS[pi].done.try_wait();
                     proc_free(pi);
                     bg_kill_forget(pid);
                 }
@@ -11653,7 +15894,8 @@ pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
 pub fn bg_kill(pid: u64, _slot: u64) -> &'static str {
     let mut row: Option<usize> = None;
     for pi in 0..MAX_PROCS {
-        if PROCS[pi].state.load(Ordering::Acquire) != PFREE
+        // REVIEW-1: a `PREAPING` row is being released by someone else and is not a killable job.
+        if matches!(PROCS[pi].state.load(Ordering::Acquire), PRUNNING | PEXITED)
             && PROCS[pi].pid.load(Ordering::Acquire) == pid
         {
             row = Some(pi);
@@ -11681,12 +15923,64 @@ pub fn bg_kill(pid: u64, _slot: u64) -> &'static str {
     if !kill.is_reaped() {
         return "kill armed — the task retires at its next preemption";
     }
-    // Confirmed reaped. The scheduler dropped the task without running the SYS_EXIT accounting, so mark
-    // the row here — `jobs` must be able to reap it exactly like an ordinary exit.
+    // PROCREAP: confirmed reaped — so reap the ROW here too, in place. This used to publish `PEXITED`,
+    // post `done` and leave the reap to the next `jobs`; on Boot AJ that lost three rows for the whole
+    // boot, because `jobs` is keyed on the shell's `BG_JOBS` table and `bg_kill_cmd` drops the killed
+    // pid's entry the moment this returns "killed". The kill destroyed the only handle that could ever
+    // have reached the row. Marking a corpse for a reaper that has just been unhooked is not accounting,
+    // it is a leak — and this is the aarch64 twin's shape (`aarch64::syscall::bg_kill`'s `ok` arm,
+    // LENS MUST-FIX round 1), which has reaped in place since it was written.
+    //
+    // REVIEW-1 — THE RELEASE IS GATED ON A WON CAS, in both arms. The first cut of this gated the
+    // `proc_free` on a pid RE-READ after a failed CAS, and that was a torn guard: BGRUN-SCAV on another
+    // core could win the row and still be several instructions away from erasing its pid, so this read
+    // could match a row the sweep already owned and was re-letting. Two owners of one Proc row — the
+    // exact class of bug this arc exists to end, re-introduced by the fix for it.
+    //
+    // Note the shape a pure state CAS CANNOT have. Claiming the dispatch-boundary case with
+    // `CAS(PRUNNING -> …)` alone is not exclusive, because `state` does not carry identity: "my
+    // PRUNNING row" and "a row the sweep reclaimed and handed to a new tenant" are the same byte, and
+    // such a CAS would win against the new tenant just as happily. Identity has to enter the claim.
+    //
+    // Two arms, and what makes each one exclusive:
+    //   * PEXITED — the target got a real SYS_EXIT in inside the confirm window, so it posted its own
+    //     `done` permit. The CAS into `PREAPING` is the SAME claim BGRUN-SCAV and `bg_poll(reap)` use,
+    //     so exactly one of the three wins; drain the permit so a recycled row starts at zero.
+    //   * PRUNNING — the ordinary dispatch-boundary kill. The task never ran the SYS_EXIT accounting,
+    //     so NO permit was ever posted for this row and none is posted here. The identity test in
+    //     front of the claim is now a FACT and not a race, and it is `PREAPING` that makes it one: a
+    //     sweep publishes `PRUNNING` with a Release store placed after it erases the pid, so observing
+    //     `PRUNNING` here (the failed CAS above loads with Acquire) and then reading OUR pid proves the
+    //     sweep never took this row. And a row that is still ours cannot leave `PRUNNING` behind our
+    //     back — its task is provably retired (`kill.is_reaped()`), the sweep and `bg_poll` claim only
+    //     from `PEXITED`, `proc_reserve` only from `PFREE` — so the CAS that follows cannot lose. It
+    //     is the belt the review asked for, and the row's identity is the buckle.
+    let raced_exit = PROCS[pi]
+        .state
+        .compare_exchange(PEXITED, PREAPING, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    let claimed = raced_exit
+        || (PROCS[pi].pid.load(Ordering::Acquire) == pid
+            && PROCS[pi]
+                .state
+                .compare_exchange(PRUNNING, PREAPING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok());
+    if !claimed {
+        // Another core released this row between the kill's confirm and here — only BGRUN-SCAV can do
+        // that, and it prints when it does. The kill itself succeeded; the row is simply not ours to
+        // free, and saying so is the whole point.
+        bg_kill_forget(pid);
+        return "killed — the row was reclaimed on another core";
+    }
+    if raced_exit {
+        let _ = PROCS[pi].done.try_wait();
+    }
+    // Held exclusively as PREAPING from here: nothing transitions out of it but us, and `proc_free`
+    // clears the identity before publishing PFREE, so the row is never visible as free-and-identified.
     PROCS[pi].status.store(EXEC_KILLED_STATUS, Ordering::Release);
-    PROCS[pi].state.store(PEXITED, Ordering::Release);
-    PROCS[pi].done.post();
-    "killed"
+    proc_free(pi);
+    bg_kill_forget(pid); // `bg_kill_take` already consumed it; belt, and the reap path's twin
+    "killed, row reaped"
 }
 
 // =============================================================================================
@@ -11794,10 +16088,12 @@ unaos_user_winx:
     mov rdi, r13
     syscall
 
-    // (8) FAIL-CLOSED: present a window id this process never created. WIN_MAX-1 = 7 is in range but
-    //     free, so the ownership gate must answer -EBADF (-9), not 0.
+    // (8) FAIL-CLOSED: present a window id this process never created. WIN_MAX-1 = 11 is in range
+    //     but free, so the ownership gate must answer -EBADF (-9), not 0. HEADROOM: this literal
+    //     tracks `WIN_MAX` (8 -> 12) — left at 7 it would still have been in range and free, so the
+    //     probe would still have passed while no longer testing the row it names.
     mov rax, 30                               // SYS_WIN_PRESENT
-    mov rdi, 7
+    mov rdi, 11
     syscall
     cmp rax, -9                               // -EBADF
     jne 8f
@@ -11974,6 +16270,26 @@ fn winx_launcher(demo_cpu: usize) {
     crate::video::wm::hittest_selftest();
     #[cfg(feature = "witness")]
     clickroute_selftest();
+    // DOCK — fourth of the click family. It mints three rows of its own and drives `focus_changed(0)`,
+    // so it belongs here for the reason the two above do: after every one-shot per-window latch. It
+    // runs after `clickroute_selftest` rather than before because it leaves a raised window behind
+    // (that IS its verdict) and would otherwise change which owner the routing legs start from.
+    #[cfg(all(feature = "witness", feature = "wc"))]
+    crate::video::dock::selftest();
+    // CRYSTAL — the SHARD menu fixture. Runs after `dock::selftest` (which runs `menubar::selftest`),
+    // so the bar tenant it enables is already proven present and flush. It enables the bar itself,
+    // opens the menu off the crystal, resolves every item, fires the SAFE picks, and dismisses three
+    // ways, restoring the bar to its prior state — and it NEVER drives a press at the Shut Down row,
+    // so no gate can power the machine off (the PASS line printing after every leg is that guard's
+    // own proof). See `crystal::selftest`.
+    #[cfg(all(feature = "witness", feature = "wc"))]
+    crate::video::crystal::selftest();
+    // WMDIRECT — third and last of the click family, and deliberately last: it MOVES a row (a drag
+    // is a `move_to`, which pins the row against the tiler) and closes it under a live drag, so it
+    // is the most disruptive of the three. Running it after the other two means neither of them can
+    // inherit a pinned fixture or a re-tiled panel.
+    #[cfg(all(feature = "witness", feature = "wc"))]
+    wmdirect_selftest();
 }
 
 // =============================================================================================
@@ -12008,8 +16324,14 @@ fn winx2_launcher(_demo_cpu: usize) {
         return;
     }
     // Read the image exactly as the shell's x86 `bg` does: FAT boot partition, root directory, 8.3 name.
-    let Ok(fs) = crate::fs::fat::mount() else {
-        serial_println!(":: WINX-2: no FAT boot volume — STAT.ELF end-to-end witness skipped ::");
+    // APPLOAD: `mount_program_source` — the same ladder the shell's `bg` now walks, which is what
+    // "exactly as the shell's x86 `bg` does" was always claiming. The skip line carries the handle
+    // census because the old one asserted absence without naming what it had looked at.
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+        serial_println!(
+            ":: WINX-2: no FAT volume on any program-source handle (handles={}) — STAT.ELF end-to-end witness skipped ::",
+            crate::drivers::block::source_census()
+        );
         return;
     };
     let Ok(de) = fs.find_in_root("STAT.ELF") else {
@@ -12066,12 +16388,69 @@ fn winx2_launcher(_demo_cpu: usize) {
         crate::arch::sched::yield_now();
     }
 
+    // PROCREAP CENSUS — the `Proc` table BEFORE the kill. See the `row_freed` note below for why the
+    // `Gone` observation alone is not a reap proof, and why BOTH buckets are needed.
+    let (free_before, _, exited_before, _) = proc_table_headroom();
     // The kill IS part of the contract: STAT.ELF has no exit path, so this is the only way it stops.
     let verdict = bg_kill(pid, slot as u64);
-    let killed = verdict == "killed";
-    // Reap the row through the same call `jobs` makes, then confirm the pid is gone.
-    let reaped = matches!(bg_poll(pid, true), BgPoll::Faulted | BgPoll::Exited(_));
-    let gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+    // PROCREAP — `bg_kill` REAPS ITS OWN ROW since GR21, and this witness went on asserting the contract
+    // that change replaced. Boot AL, verbatim: `killed=false (killed, row reaped) reaped=false gone=true`.
+    // Every field of that line is the witness being wrong about a kill that worked: the exact-match on
+    // `"killed"` could not match the new verdict string, and the follow-up `bg_poll(pid, true)` was asking
+    // a row that `bg_kill` had already freed to be reaped a second time, which honestly answers `Gone`.
+    //
+    // The two verdicts that both mean CONFIRMED KILLED, ROW GONE — and why BOTH are accepted:
+    //   * `"killed, row reaped"` — `bg_kill` won the `PREAPING` claim and called `proc_free` itself.
+    //   * `"killed — the row was reclaimed on another core"` — `bg_kill` confirmed the reap
+    //     (`kill.is_reaped()` returned true, which is the kill's whole proof) and then lost the claim to
+    //     BGRUN-SCAV. The task is just as retired and the row is just as free; the only difference is
+    //     which core did the bookkeeping. Grading this one red would make the witness fail on a legal
+    //     scheduler interleave — a flaky gate, which is worse than no gate.
+    // EVERY other string `bg_kill` can return is a real failure and still grades red: "no such job
+    // (already reaped?)", "already exited — run `jobs` to reap it", "already killed — the kill is still
+    // armed…", "exited before the kill landed…" and "kill armed — the task retires at its next
+    // preemption" all mean this call did NOT confirm a reap.
+    let killed = verdict == "killed, row reaped"
+        || verdict == "killed — the row was reclaimed on another core";
+    // The reap proof is now the ROW ITSELF, observed and not created: `bg_poll` WITHOUT `reap`, so this
+    // reads the table rather than mutating it. `Gone` means no `PRUNNING`/`PEXITED` row carries this pid
+    // any more, and the kill above is the only thing that can have retired it. A row still `Running` (the
+    // kill did not land) or still `Exited` (a corpse nobody freed — the GR21 leak) fails here, so the
+    // witness keeps exactly the falsifying power the two-step version had.
+    let reaped = matches!(bg_poll(pid, false), BgPoll::Gone);
+    // REVIEW C2 — `Gone` IS NOT A FREED ROW. `bg_poll`'s scan filter admits only `PRUNNING`/`PEXITED`,
+    // so a row STUCK IN `PREAPING` — claimed by a releaser that never reached `proc_free` — falls
+    // through to the trailing `BgPoll::Gone`. That is the exact leak class this witness exists to catch
+    // (`MAX_PROCS` is 10; ten stuck rows and no program can ever launch again), and it would have graded
+    // GREEN on the `Gone` check alone.
+    //
+    // So take the CENSUS, the shell's own idiom at `shell::bg_kill_cmd` — "the free count must rise by
+    // one per kill, and a boot that launches and kills repeatedly must never see it drift down".
+    // `proc_table_headroom` counts `PREAPING` with the EXITED bucket, never with `free`, which is
+    // precisely what makes it able to say what `bg_poll` cannot.
+    //
+    // REVIEW C3 — THE FREE BUCKET ALONE CANNOT BE ATTRIBUTED, and the first cut of this check claimed it
+    // could ("this witness's own program is the only thing that retires between the two reads; nothing
+    // else in the launcher chain spawns here"). That was a false invariant with a live counterexample in
+    // this same tree: `video::wcx::desktop_app_service` (wcx.rs:514) runs on the DEVICE-SERVICE task and
+    // is gated on the same storage-enumeration event this launcher's `fat::mount()` is, so on a
+    // `UNAOS_WC` metal boot it can `proc_reserve` a row INSIDE `bg_kill`'s up-to-`KILL_CONFIRM_MS`
+    // confirm window. Kill frees one, launch takes one, net delta zero — and an `== free_before + 1`
+    // test would have printed a FALSE RED on a boot where everything worked. Boot AL is exactly that
+    // shape of boot.
+    //
+    // So assert the bucket that a concurrent SPAWN cannot move. `proc_table_headroom`'s catch-all
+    // (the `_ =>` arm) counts `PEXITED` **and** `PREAPING` as exited, while `proc_reserve` only ever
+    // takes a `PFREE` row into `PRUNNING`:
+    //   * a stalled reap — the row claimed into `PREAPING` and never `proc_free`d, the `MAX_PROCS`
+    //     exhaustion class this check exists for — lands in the exited bucket and raises it by one.
+    //     `exited_after == exited_before` is therefore the falsifying test, and it is the whole point.
+    //   * a concurrent desktop-app launch moves `free` down and `running` up, and leaves `exited`
+    //     untouched. It cannot mask a stall and cannot manufacture one.
+    // `free` is kept as a monotonic sanity bound (`>=`, not `==`): the count must never DRIFT DOWN
+    // across a kill, which is the drift `shell::bg_kill_cmd`'s census line watches for.
+    let (free_after, _, exited_after, _) = proc_table_headroom();
+    let row_freed = exited_after == exited_before && free_after >= free_before;
     // Teardown: the kill's address-space free retires the window rows and drops the FB leaves.
     let tdeadline = crate::arch::ticks() + 2_000;
     while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
@@ -12085,15 +16464,21 @@ fn winx2_launcher(_demo_cpu: usize) {
         crate::arch::sched::yield_now();
     }
 
-    if windowed && presents >= WINX2_MIN_PRESENTS && killed && reaped && gone && cleared {
+    if windowed && presents >= WINX2_MIN_PRESENTS && killed && reaped && row_freed && cleared {
         serial_println!(
-            ":: WINX-2: STAT.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents, killed + reaped, teardown clean -> PASS ::",
-            entry, presents
+            ":: WINX-2: STAT.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents, killed + row reaped by the kill (free {}->{}/{}, exited {}->{}), teardown clean -> PASS ::",
+            entry, presents, free_before, free_after, proc_table_rows(), exited_before, exited_after
         );
     } else {
+        // The FAIL fields are exactly what is asserted above — no `gone` any more, because the reap proof
+        // and the pid-is-gone proof are now one observation and printing them as two would suggest two
+        // independent checks. `verdict` stays: it is the string the `killed` decision was made on, and
+        // the census is printed as the raw before/after pair so a PREAPING stall is READABLE (row_gone
+        // true, row_freed false, free count flat) rather than inferable.
         serial_println!(
-            ":: WINX-2: STAT.ELF end-to-end FAIL — windowed={} presents={} killed={} ({}) reaped={} gone={} cleared={} (want true/>={}/true/true/true/true) ::",
-            windowed, presents, killed, verdict, reaped, gone, cleared, WINX2_MIN_PRESENTS
+            ":: WINX-2: STAT.ELF end-to-end FAIL — windowed={} presents={} killed={} (verdict={:?}) row_gone={} row_freed={} (free {}->{}/{} exited {}->{}) cleared={} (want true/>={}/true/true/true/true) ::",
+            windowed, presents, killed, verdict, reaped, row_freed,
+            free_before, free_after, proc_table_rows(), exited_before, exited_after, cleared, WINX2_MIN_PRESENTS
         );
     }
 }
@@ -12302,7 +16687,9 @@ fn winx3_launcher(_demo_cpu: usize) {
 //
 // Window layout it assumes (the 4-page ring-3 program window):
 //   page 0 (+0x0000)  code, RX/RO          — this blob
-//   page 1 (+0x1000)  data, RW/NX          — [+0x1000] done counter, [+0x1004] magic A, [+0x1008] magic B
+//   page 1 (+0x1000)  data, RW/NX          — [+0x1000] done counter, [+0x1004] magic A, [+0x1008] magic B,
+//                                            [+0x100C] GO gate 1 (parent), [+0x1010] GO gate 2 (workers).
+//                                            Both gates are launcher-owned; see WINX7-GO below.
 //   page 2 (+0x2000)  RW/NX                — worker A's stack (grows down from +0x3000)
 //   page 3 (+0x3000)  RW/NX                — worker B's stack (from +0x3800), parent's (from +0x4000)
 // The same stack carve `user-vug` uses, so this fixture and the shipped program agree about the one
@@ -12341,6 +16728,33 @@ unaos_user_winx7:
     mov r13, rax                              // r13 = window id
     or r12, 1
 
+    // (0b) WINX7-GO gate 1 — park until the LAUNCHER releases us. `go` is scrubbed to 0 by
+    //      `winx7_build` and THIS BLOB NEVER WRITES IT, so the `FUTEX_WAIT` below is a park by
+    //      construction, not by timing. (Deliberately not "nothing in ring 3 can move it": a broken
+    //      thread-argument ABI delivering `arg = 2` would write the magic at `0x1004 + 2*4`, which
+    //      IS this word. That is a defect the run then FAILS on at bit4, not a way to pass — but the
+    //      weaker claim is the true one and it is what belongs here.)
+    //      It GUARANTEES the launcher runs. `spawn_user_in_space` builds a COOPERATIVE ring-3 task
+    //      (`preemptible = false`) on the launcher's OWN core, so the timer cannot evict it and the
+    //      launcher's wait loop only ever regains the CPU when this fixture blocks. Without a park
+    //      here the fixture ran window->spawns->barrier->poll->present->join->exit without once
+    //      releasing the core, the launcher got exactly ONE loop iteration (before the window even
+    //      existed), and focus was never granted, nothing was injected and bit5 could not be set:
+    //      `witness=0xdf parks=0 injected=0`.
+    //      The launcher plants `go` only after it has seen our window AND observed a task parked ON
+    //      THIS KEY, so by the time we resume, focus is ours and the injected key is in our ring.
+    //      Loop rather than a single wait: `-EAGAIN` (the value already moved) and a spurious wake
+    //      are both legal futex outcomes, and the re-read is the only correct answer to either.
+5:  mov eax, dword ptr [r15 + 0x100C]
+    test eax, eax
+    jnz 6f
+    lea rdi, [r15 + 0x100C]
+    xor rsi, rsi                              // FUTEX_WAIT
+    xor rdx, rdx                              // expected = 0
+    mov rax, 26
+    syscall
+    jmp 5b
+6:
     // (1) SYS_THREAD_SPAWN(worker, sp = base+0x3000, arg = 0, place = 0 — this core).
     lea rdi, [rip + unaos_user_winx7_worker]
     lea rsi, [r15 + 0x3000]
@@ -12368,6 +16782,18 @@ unaos_user_winx7:
     // (3) The FUTEX frame barrier: block until `done` reaches 2. Skipped unless BOTH spawns
     //     succeeded — a barrier whose target cannot be reached is the wedge itself, which is the
     //     VUGGUARD rule this fixture must not violate either.
+    //
+    //     WINX7-GO gate 2 is what makes THIS park deterministic, and it is the park the whole
+    //     witness exists for. Both workers park on `go2` (+0x1010) BEFORE their `lock xadd`, so
+    //     `done` is provably still 0 when we read it here and the `FUTEX_WAIT` below cannot be
+    //     raced into a `Mismatch`. The launcher releases `go2` only once it sees TWO waiters on
+    //     the `go2` key AND ONE on the `done` key — i.e. only once this park has actually
+    //     happened — so the ordering is closed on both sides rather than assumed.
+    //
+    //     Without gate 2 the barrier parked only when this load beat both workers' `lock xadd`,
+    //     which is a coin flip: 6 of 28 passing runs in the GR25 flake loop reported `parks=1`,
+    //     i.e. the GO park alone, with the barrier assertion silently not exercised. A gate that
+    //     the thing it guards can skip 21% of the time is not a gate.
     mov eax, r12d
     and eax, 6
     cmp eax, 6
@@ -12400,8 +16826,18 @@ unaos_user_winx7:
     test rax, rax
     jns 55f                                   // a non-negative return IS a packed event
     dec rbp
+    jz 60f
+    // WINX7-GO: this task is COOPERATIVE — the timer cannot evict it — so a bare spin here holds
+    // its core against every other task on that core, including the kernel launcher that is the
+    // only possible source of the event being waited for. Release the core every 4096 empty polls.
+    // With the GO gate above the first poll already succeeds, so this costs nothing on a healthy
+    // run; it exists so that a spin waiting on another task can never again be a hard starvation.
+    // rbp is callee-saved and survives both syscalls; the budget is unchanged at 2,000,000 polls.
+    test rbp, 4095
     jnz 50b
-    jmp 60f
+    mov rax, 4                                // SYS_YIELD
+    syscall
+    jmp 50b
 55: or r12, 32                                // bit5: a routed input event reached this process
 60:
     // (5) SYS_WIN_PRESENT(win).
@@ -12441,6 +16877,24 @@ unaos_user_winx7:
 unaos_user_winx7_worker:
     mov rbx, rdi                              // stash `arg` — rdi is about to be a syscall argument
     lea r15, [rip + unaos_user_winx7_blob_start]
+    // WINX7-GO gate 2 — park on `go2` BEFORE arriving, so the parent's frame barrier at (3) is
+    // reached with `done` provably still 0 and its `FUTEX_WAIT` is a park by construction rather
+    // than a coin flip. `go2` is scrubbed to 0 by `winx7_build` and neither this worker nor the
+    // parent writes it; the launcher releases it only after seeing BOTH workers parked here and the
+    // parent parked on `done`. This park is also the proof that a ring-3 THREAD (not just the
+    // process's first task) can park and be woken on a futex — which nothing else in the suite
+    // covers. Same loop shape and same reason as the parent's gate: `-EAGAIN` and spurious wakes
+    // are legal, so the value is re-read rather than trusted.
+2:  mov eax, dword ptr [r15 + 0x1010]
+    test eax, eax
+    jnz 3f
+    lea rdi, [r15 + 0x1010]
+    xor rsi, rsi                              // FUTEX_WAIT
+    xor rdx, rdx                              // expected = 0
+    mov rax, 26
+    syscall
+    jmp 2b
+3:
     // magic[arg] = 0xA5A5A5A5 — the store whose ADDRESS depends on `arg`, so a wrong argument writes
     // the wrong slot and the parent's bit4 check fails.
     lea rcx, [r15 + 0x1004]
@@ -12485,6 +16939,70 @@ const WINX7_WITNESS_ALL: u32 = 0xFF;
 /// idiom — x86 has no `SYS_REPORT`).
 const WINX7_TASK_NAME: &str = "winx7-app";
 
+/// WINX7-GO: window offsets of the fixture's two launcher-owned gate words, and of the `done`
+/// counter the frame barrier parks on (the launcher needs `done`'s KEY, never its value).
+///
+/// The U7x/DMG-REFUSE GO-word idiom: the launcher plants a value into the fixture's data page
+/// through the KERNEL identity alias, so the fixture never has to GUESS and the handshake needs no
+/// extra syscall surface. Gate 1 (`GO`) holds the PARENT right after `SYS_WIN_CREATE`; gate 2
+/// (`GO2`) holds both WORKERS just before their `lock xadd`, which is what makes the frame barrier
+/// a park by construction instead of a coin flip.
+const WINX7_GO_OFF: u64 = 0x100C;
+const WINX7_GO2_OFF: u64 = 0x1010;
+const WINX7_DONE_OFF: u64 = 0x1000;
+
+/// WINX7-GO: how the launcher opened a gate. `Handshake` is the only healthy provenance and the
+/// only one the verdict accepts — the other two mean the gate was opened on a timer rather than on
+/// the fixture's observed state, which is precisely the "it passed by luck" the whole arc removes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GoRel {
+    /// Not opened yet.
+    Pending,
+    /// Opened because the fixture was observed PARKED ON THAT KEY. The healthy path.
+    Handshake,
+    /// Opened by the in-loop iteration bound — the fixture never parked where it should have.
+    Failsafe,
+    /// Opened after the wait loop ended (deadline or fixture exit) so nothing is left wedged.
+    PostLoop,
+}
+
+impl GoRel {
+    fn label(self) -> &'static str {
+        match self {
+            GoRel::Pending => "pending",
+            GoRel::Handshake => "handshake",
+            GoRel::Failsafe => "failsafe",
+            GoRel::PostLoop => "postloop",
+        }
+    }
+}
+
+/// WINX7-GO: the futex key of a gate word in the fixture's address space — the RING-3 address the
+/// fixture passed to `SYS_FUTEX`, never the kernel alias, because that is what `futex_key` hashes.
+fn winx7_gate_key(slot: usize, off: u64) -> u64 {
+    crate::arch::sched::futex_key(slot, USER_BASE + off)
+}
+
+/// WINX7-GO: open one gate — publish `1` into the fixture's data page and wake the tasks parked on
+/// that word. `n` is how many waiters the gate holds (1 for the parent's gate, 2 for the workers').
+///
+/// The store goes through `slot_backing_ptr` (the same kernel identity alias `winx7_build` used to
+/// lay the blob down). The release fence between the store and the wake is what makes a parked task
+/// see `1` rather than the value it slept on; without it the fixture could be woken and re-park
+/// forever.
+///
+/// The caller must have established that `slot` is still the fixture's — see the
+/// `winx_slot_has_window` guard on the post-loop path, which is the one place where the fixture may
+/// already have exited and released the slot underneath us.
+fn winx7_release_gate(slot: usize, off: u64, n: usize) {
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        (backing.add(off as usize) as *mut u32).write_volatile(1);
+    }
+    core::sync::atomic::fence(Ordering::Release);
+    crate::arch::sched::futex_wake(winx7_gate_key(slot, off), n);
+}
+
 /// WINX-7: build the fixture's slot — allocate a private address space, scrub the program window, and
 /// copy the blob into its RX/RO code page through the kernel identity alias. The FB region is NOT
 /// pre-mapped; mapping it is `SYS_WIN_CREATE`'s job, and that it starts unmapped is part of what the
@@ -12514,21 +17032,53 @@ fn winx7_build() -> Option<U7xFix> {
 /// WINX-7 launcher + verdict. Chained after the WINX-3 loader witness, so the arc's four verb families
 /// are proved after the machinery they build on.
 ///
-/// The launcher does three things the fixture cannot do for itself:
-///   1. GRANTS IT FOCUS explicitly (`el0_input_set_active`), rather than relying on the create-time
+/// The launcher does four things the fixture cannot do for itself:
+///   1. GRANTS IT FOCUS explicitly (`user_input_set_active`), rather than relying on the create-time
 ///      auto-grant. Both paths exist and both are correct, but a witness that depended on the implicit
 ///      one would silently stop testing input the day the focus policy changed.
-///   2. INJECTS an input event through the real `el0_input_enqueue` router seam — the same function
+///   2. INJECTS an input event through the real `user_input_enqueue` router seam — the same function
 ///      the shell's drain calls. QEMU delivers no USB HID at all, so a kernel-side injection is the
 ///      only way this leg can be witnessed headlessly, and routing it through the seam rather than
 ///      straight into the ring means the focus gate is on the tested path.
-///   3. WITNESSES THE PARK independently, through `futex_park_count()` — the count of `FUTEX_WAIT`s
-///      that actually blocked and were woken. Without it, a barrier that completed by luck (both
-///      workers finishing before the parent ever reached the wait) would be indistinguishable from a
-///      working futex. It is a COUNTER rather than a sample of the parked set, which the first cut
-///      used and which was flaky by construction: a park beginning and ending between two samples is
-///      invisible, so a perfectly healthy run could report "no park observed" purely on timing.
-fn winx7_launcher(_demo_cpu: usize) {
+///   3. WITNESSES THE PARKS independently, through `futex_park_count()` — the count of `FUTEX_WAIT`s
+///      that actually blocked and were woken. It is a COUNTER rather than a sample of the parked
+///      set, which the first cut used and which was flaky by construction: a park beginning and
+///      ending between two samples is invisible, so a perfectly healthy run could report "no park
+///      observed" purely on timing.
+///
+///      WHAT THE COUNT MEANS, precisely, because a bare `parks >= 1` no longer says anything the
+///      gates below do not already guarantee. A healthy run parks FOUR times: the parent on gate 1,
+///      each worker on gate 2, and the parent at the FRAME BARRIER — and `barrier_parks` on the
+///      `[winx7-go]` line reports that last group alone (`parks - 3`). The barrier park is the one
+///      this witness exists for, so it is the one the verdict gates on; the three gate parks are
+///      structural and are named as such rather than quietly inflating the number. (The barrier can
+///      legitimately park TWICE — one worker's `FUTEX_WAKE` releases the parent, which re-reads
+///      `done == 1` and parks again for the second — so the assertion is `>= 1`, i.e. `parks >= 4`.)
+///   4. RELEASES THE TWO GO GATES (WINX7-GO), each only once the fixture is observed PARKED ON THAT
+///      GATE'S OWN KEY (`futex_waiters_on`), and gate 1 only after focus is granted and a key is in
+///      the ring. That ordering is what makes the verdict deterministic, and it is a REPAIR: on
+///      clean trunk this leg failed roughly half of all runs with `witness=0xdf parks=0 injected=0`,
+///      and the `[winx7-go]` instrument named the interleave. `spawn_user_in_space` builds a
+///      COOPERATIVE ring-3 task (`preemptible = false`, the timer cannot evict it) and WINX-7 places
+///      it on the LAUNCHER'S OWN core (`meter_current_cpu()`), so the launcher's wait loop only ever
+///      regains the CPU when the fixture blocks. The fixture's only block was the frame barrier at
+///      (3), which parks only when the parent's first `done` load beats both workers' `lock xadd` —
+///      a coin flip. Lose it and the fixture ran window -> spawns -> barrier -> 2M non-yielding
+///      `SYS_INPUT_POLL`s -> present -> joins -> exit without once releasing the core; the launcher
+///      got exactly ONE iteration (`iters=1`, before the window existed), so focus was never
+///      granted, nothing was injected, bit5 could not be set and `parks` stayed 0. `injected=0` and
+///      `parks=0` were never two bugs — they are the same missed interleave seen from both ends. The
+///      kernel was correct throughout: cooperative tasks are documented as non-preemptible, and the
+///      futex, the input router and the thread verbs all did exactly what they promise.
+///
+///      Each gate records HOW it was opened (`GoRel`), and the verdict accepts only `handshake`. A
+///      gate opened by the iteration failsafe or by the post-loop sweep means the fixture was not
+///      where it was supposed to be, and on the wire those were previously indistinguishable from
+///      the healthy path — the failsafe existed precisely so the gate could never wedge, which made
+///      it the one thing that could hide the disease it was insuring against.
+// DMG-REFUSE: `demo_cpu` lost its leading underscore here — WINX-7 itself still places its fixture by
+// name rather than by core, but the DMG-REFUSE launcher chained off this function's tail does use it.
+fn winx7_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -12551,14 +17101,43 @@ fn winx7_launcher(_demo_cpu: usize) {
         fix.cr3,
     );
 
-    // Wait for the fixture, granting focus once its window appears and injecting input while it polls.
-    // The futex park is counted kernel-side (`futex_park_count`), not sampled here.
+    // Wait for the fixture: grant focus once its window appears, inject input, then open the two GO
+    // gates it is parked on, each only once it is observed parked ON THAT GATE'S KEY. The futex
+    // parks are counted kernel-side (`futex_park_count`), never sampled here.
+    //
+    // WINX7-GO — the order is the whole point, and it is why this loop is no longer a race:
+    //   iter 1  the fixture has not run yet; nothing to do.
+    //   iter 2  the fixture has created its window and parked on gate 1 (which is what handed this
+    //           launcher the CPU — it is a COOPERATIVE ring-3 task on this very core, so the timer
+    //           cannot evict it). Focus is granted, a key is injected, gate 1 opens.
+    //   later   the fixture has spawned both workers, both have parked on gate 2, and the parent has
+    //           parked at the frame barrier on `done`. Only when ALL THREE of those are true does
+    //           gate 2 open — so the barrier park is a fact before the workers can arrive, not a
+    //           coin flip decided by whichever core happened to be quicker.
+    //
+    // The gate-2 condition deliberately reads THREE keys rather than trusting the workers alone. Two
+    // waiters on gate 2 says the workers are ready; one waiter on `done` says the parent has already
+    // committed to the park. Releasing on the first without the second would let the workers arrive
+    // before the parent read `done`, which is exactly the interleave gate 2 exists to remove.
     let deadline = crate::arch::ticks() + 10_000;
+    let go_key = winx7_gate_key(fix.slot, WINX7_GO_OFF);
+    let go2_key = winx7_gate_key(fix.slot, WINX7_GO2_OFF);
+    let done_key = winx7_gate_key(fix.slot, WINX7_DONE_OFF);
+    let waiters = crate::arch::sched::futex_waiters_on;
     let mut focused = false;
     let mut injected: u32 = 0;
+    let mut iters: u64 = 0;
+    let mut winseen_at: u64 = 0;
+    let mut gorel = GoRel::Pending;
+    let mut gorel_at: u64 = 0;
+    let mut go2rel = GoRel::Pending;
+    let mut go2rel_at: u64 = 0;
+    let lcpu = crate::arch::sched::meter_current_cpu();
     while WINX7_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < deadline {
+        iters += 1;
         if !focused && winx_slot_has_window(fix.slot) {
-            el0_input_set_active((fix.slot as u64) + 1);
+            winseen_at = iters;
+            user_input_set_active((fix.slot as u64) + 1);
             focused = true;
         }
         if focused && injected < 64 {
@@ -12566,11 +17145,63 @@ fn winx7_launcher(_demo_cpu: usize) {
             // recognisable if it ever needs to be read off the wire. Injected repeatedly because the
             // fixture reaches its poll only after the barrier, and a single early injection would be
             // consumed by nothing (drop-newest on a full ring makes repetition harmless).
-            if el0_input_enqueue(crate::pal::Event::Key(b'k')) {
+            if user_input_enqueue(crate::pal::Event::Key(b'k')) {
                 injected += 1;
             }
         }
+        // Gate 1 — the parent. Opened on the keyed handshake, or by the iteration FAILSAFE if the
+        // fixture never parked there. The failsafe is not cosmetic: a gate the launcher could
+        // decline to open would be a wedge, and this fixture's own VUGGUARD rule forbids a barrier
+        // whose target cannot be reached. Its bound is orders of magnitude past the two iterations
+        // the healthy path needs, so it can never fire ahead of the handshake — and because the
+        // verdict now gates on the PROVENANCE, a failsafe open is reported as the defect it is
+        // rather than laundered into a pass.
+        if focused && gorel == GoRel::Pending {
+            if waiters(go_key) >= 1 {
+                gorel = GoRel::Handshake;
+            } else if iters > 4096 {
+                gorel = GoRel::Failsafe;
+            }
+            if gorel != GoRel::Pending {
+                gorel_at = iters;
+                winx7_release_gate(fix.slot, WINX7_GO_OFF, 1);
+            }
+        }
+        // Gate 2 — both workers, held until the parent is parked at the frame barrier.
+        if gorel != GoRel::Pending && go2rel == GoRel::Pending {
+            if waiters(go2_key) >= 2 && waiters(done_key) >= 1 {
+                go2rel = GoRel::Handshake;
+            } else if iters > 8192 {
+                go2rel = GoRel::Failsafe;
+            }
+            if go2rel != GoRel::Pending {
+                go2rel_at = iters;
+                winx7_release_gate(fix.slot, WINX7_GO2_OFF, 2);
+            }
+        }
         crate::arch::sched::yield_now();
+    }
+    // Both gates are opened on EVERY exit from the loop above, including the deadline one. A fixture
+    // left parked here would hold its address-space slot for the rest of the boot, and DMG-REFUSE
+    // (chained off this function's tail) needs two free slots.
+    //
+    // The `winx_slot_has_window` guard is load-bearing and is the reason this is not a bare `if
+    // !released`: the loop also ends when the fixture EXITS, and by then it has released its
+    // address-space slot — `slot_backing_ptr` would be aliasing memory that is no longer ours and
+    // may already have been handed to the next fixture. A slot with no window row is a slot that is
+    // gone. (The in-loop opens need no such guard: they run only under `focused`, which is set from
+    // a live window row, and the fixture is parked on our gate at that point by construction.)
+    if (gorel == GoRel::Pending || go2rel == GoRel::Pending) && winx_slot_has_window(fix.slot) {
+        if gorel == GoRel::Pending {
+            gorel = GoRel::PostLoop;
+            gorel_at = iters;
+            winx7_release_gate(fix.slot, WINX7_GO_OFF, 1);
+        }
+        if go2rel == GoRel::Pending {
+            go2rel = GoRel::PostLoop;
+            go2rel_at = iters;
+            winx7_release_gate(fix.slot, WINX7_GO2_OFF, 2);
+        }
     }
     let witness = WINX7_WITNESS.load(Ordering::Acquire);
     let killed = WINX7_KILLED.load(Ordering::Acquire);
@@ -12579,6 +17210,35 @@ fn winx7_launcher(_demo_cpu: usize) {
     // The PARK count, not a sample of the parked set: a `FUTEX_WAIT` that blocked and was woken is
     // recorded when it returns, so a park of any duration is caught and a run cannot fail on timing.
     let parks = futex_park_count() - parks_before;
+    // WINX7-GO: three of those parks are the gates themselves (parent on gate 1, both workers on
+    // gate 2) and are guaranteed by construction, so they prove nothing about the frame barrier.
+    // Subtract them and what is left is the assertion this witness exists for. Saturating because a
+    // run in which the gates did not park is already failing on `gorel_by`, and an underflow panic
+    // in a verdict path would replace a readable FAIL with a boot that dies before printing it.
+    let barrier_parks = parks.saturating_sub(3);
+
+    // WINX7-GO: the launcher's own scheduling reality, on the wire. This line is the instrument the
+    // flake hunt was missing — the verdict reported `injected=0` but could not say WHY, and the
+    // answer turned out to be `iters=1`: the wait loop ran exactly once, before the fixture had even
+    // created its window, and never got the CPU again because a cooperative ring-3 task had it. A
+    // healthy run reads `iters>=2 winseen_at=2 gorel_by=handshake go2rel_by=handshake
+    // barrier_parks>=1`. `iters=1` says the starvation is back; a `failsafe`/`postloop` provenance
+    // says the fixture was not parked where it was supposed to be, which the old boolean `gorel`
+    // could not distinguish from health.
+    serial_println!(
+        "[winx7-go] lcpu={} iters={} winseen_at={} focused={} gorel_by={}@{} go2rel_by={}@{} injected={} parks={} barrier_parks={}",
+        lcpu,
+        iters,
+        winseen_at,
+        focused,
+        gorel.label(),
+        gorel_at,
+        go2rel.label(),
+        go2rel_at,
+        injected,
+        parks,
+        barrier_parks
+    );
 
     // Teardown proof: the fixture's exit freed its slot only after the LAST thread retired, which
     // retires its window rows and drops its FB leaves. A first-thread-frees bug shows up here as a
@@ -12591,7 +17251,7 @@ fn winx7_launcher(_demo_cpu: usize) {
     let cleared = !winx_slot_has_window(fix.slot);
     // Focus must have returned to the shell when the slot was torn down. If it had not, every later
     // keystroke on this boot would be enqueued into a ring with no consumer.
-    let focus_released = el0_input_active() == 0;
+    let focus_released = user_input_active() == 0;
 
     // SERIAL SETTLE — see the note in `winx_launcher`: the UART writer drops lines on contention and
     // this verdict follows the compositor's close/erase burst from another core.
@@ -12609,26 +17269,41 @@ fn winx7_launcher(_demo_cpu: usize) {
     let threads_ok = spawned - spawned_before == 2
         && joined - joined_before == 2
         && exited - exited_before == 2;
+    // The gates' PROVENANCE is part of the verdict, not decoration. A run whose gates were opened by
+    // the failsafe took the timer's word for where the fixture was, which is the same "passed by
+    // luck" this arc removed — and `iters`/`winseen_at` are gated for the same reason: the eight
+    // witness bits can line up while the launcher was starved, and that combination is exactly what
+    // shipped broken for the life of this fixture. Everything printed on `[winx7-go]` is now
+    // asserted here except `injected`, which the witness's bit5 already covers from the other side.
+    let handshakes_ok = gorel == GoRel::Handshake && go2rel == GoRel::Handshake;
+    let launcher_ok = iters >= 2 && winseen_at >= 1;
     if witness == WINX7_WITNESS_ALL
         && threads_ok
-        && parks >= 1
+        && barrier_parks >= 1
+        && handshakes_ok
+        && launcher_ok
         && presents >= 1
         && cleared
         && focus_released
         && killed == 0
     {
         serial_println!(
-            ":: WINX-7: ring-3 threads + futex + input — 2 threads under one CR3 spawned/arrived/joined, {} futex park(s) witnessed, thread-arg ABI verified, {} injected event(s) polled, {} present(s), focus released, teardown clean -> PASS ::",
-            parks, injected, presents
+            ":: WINX-7: ring-3 threads + futex + input — 2 threads under one CR3 spawned/arrived/joined, {} futex park(s) witnessed ({} at the frame barrier + 3 at the launcher's GO gates: parent, then both workers), thread-arg ABI verified, {} injected event(s) polled, {} present(s), focus released, teardown clean -> PASS ::",
+            parks, barrier_parks, injected, presents
         );
     } else {
         serial_println!(
-            ":: WINX-7: ring-3 threads + futex + input FAIL — witness={:#x} spawned={} joined={} exited={} parks={} presents={} injected={} cleared={} focus_released={} killed={} done={} (want {:#x}/2/2/2/>=1/>=1/>0/true/true/0/1) ::",
+            ":: WINX-7: ring-3 threads + futex + input FAIL — witness={:#x} spawned={} joined={} exited={} parks={} barrier_parks={} gorel_by={} go2rel_by={} iters={} winseen_at={} presents={} injected={} cleared={} focus_released={} killed={} done={} (want {:#x}/2/2/2/>=4/>=1/handshake/handshake/>=2/>=1/>=1/>0/true/true/0/1) ::",
             witness,
             spawned - spawned_before,
             joined - joined_before,
             exited - exited_before,
             parks,
+            barrier_parks,
+            gorel.label(),
+            go2rel.label(),
+            iters,
+            winseen_at,
             presents,
             injected,
             cleared,
@@ -12637,6 +17312,631 @@ fn winx7_launcher(_demo_cpu: usize) {
             WINX7_DONE.load(Ordering::Acquire),
             WINX7_WITNESS_ALL
         );
+    }
+
+    // DMG-REFUSE: chain the SYS_WIN_PRESENT_ROWS refusal witness immediately after WINX-7, in program
+    // order on this one task — WINX-7's verdict has waited on its own teardown, so the window table is
+    // empty and two address-space slots are free. It runs BEFORE `winx8_launcher`/`pulsew_launcher`,
+    // which also create windows, so it never has to reason about their rows.
+    dmg_refuse_launcher(demo_cpu);
+}
+
+// =============================================================================================
+// DMG-REFUSE — the REFUSAL arms of `SYS_WIN_PRESENT_ROWS(33)`.
+//
+// WHY THIS EXISTS. The verb has three refusal arms — `-EBADF` (an out-of-range id, or a free row),
+// `-EACCES` (a live window owned by another slot) and `-EINVAL` (a malformed band). The `-EINVAL` arm
+// is the deliberate design choice of the whole FBCON-DMG commit: the syscall refuses a bad band rather
+// than silently degrading to a whole-box present, precisely so that a ring-3 damage bug is visible on
+// the first frame instead of costing full price forever. But the only client in the tree,
+// `crates/user-vug`, always passes the same constant band `(0, 11)` on a 128-row surface for a window
+// it owns — so until this fixture, NOTHING could reach any of the three arms, on QEMU or on metal. A
+// check nothing can trip proves nothing, and a refusal nothing can reach is not a protection, it is a
+// comment.
+//
+// SHAPE: TWO ring-3 slots, because `-EACCES` cannot be reached with one. `dmg-owner` creates a window
+// and parks; `dmg-probe` creates two windows of DIFFERENT heights and fires 19 probes at the verb,
+// packing a 3-bit result code per probe into its exit status. The launcher plants the owner's window
+// id and a provably-free id into the prober's data page (the U7x GO-word idiom), so the prober never
+// GUESSES an id — and the launcher computes what each probe SHOULD return from the live window table,
+// not from a constant, then re-reads that table after the prober is done to prove the ground truth did
+// not move underneath it.
+//
+// THE OWNERSHIP GATE IS NOT WEAKENED TO MAKE THIS TESTABLE. `-EACCES` is reached by ARRANGING the
+// situation — a second live ring-3 address space holding a window — which is the only honest way to
+// reach it and the reason this fixture is a pair rather than a single blob.
+//
+// EVERY REFUSAL IS PAIRED WITH AN ACCEPTING TWIN differing in exactly ONE field, which is what stops
+// the fixture from passing by construction:
+//   * P3 `(id_b0, 0, 33)` accepts on h=128 · P11 `(id_b1, 0, 33)` refuses on h=32 — the SAME band, so
+//     the bound is provably the WINDOW's own height and not a constant.
+//   * P0 `(id_b0, 0, 128)` accepts at exactly `y1 == h` · P7 `(id_b0, 0, 129)` refuses one past it.
+//   * P12/P13 refuse `-EACCES` on the owner's id · P0..P4 accept on the prober's own ids.
+// A verb that refused everything fails P0..P4 and P18; one that accepted everything fails all 13
+// refusals; one that returned a single constant errno fails at least two arms. There is no constant
+// return value that passes.
+//
+// ORDER IS WITNESSED, not assumed. P13 fires a MALFORMED band at another slot's window and must get
+// `-EACCES`, not `-EINVAL`; P15 fires a malformed band at a FREE row and must get `-EBADF`. Both prove
+// the ownership gate runs BEFORE the range check — which is the contract's explicit claim, and which
+// also means the range check cannot be used to probe another process's surface height.
+//
+// THE STRONGEST CONTROL IS KERNEL-SIDE AND THE FIXTURE CANNOT FORGE IT: `FB_PRESENT_COUNT` is bumped
+// only after ALL FOUR checks pass, and before the compositor shim. The launcher samples it around the
+// whole run and requires the delta to be EXACTLY 6 — the number of accepting probes. `dmg-owner`
+// deliberately presents zero times, so the delta is entirely the prober's. A refusal arm that returned
+// the right errno but still repainted would over-count; an accept that silently did nothing would
+// under-count. No return-code check can see either.
+//
+// PANEL-INDEPENDENT, so it runs in CI rather than only at the bench: headless, `wm::create` refuses and
+// `wm_id` is `WIN_NONE`, so the shim no-ops — but the syscall still returns 0 and still bumps the
+// counter. What this fixture proves is the ABI's refusal contract. It says NOTHING about whether the
+// compositor repaints only the banded rows; that is `video::wm::present_rows`, needs a real panel
+// (`UNAOS_WC=1` plus the Kepler takeover), and is not claimed by any line below.
+//
+// NOT PAINTED, deliberately: the fixture never writes its surfaces. `memory::clear_slot_fb` zeroes the
+// whole FB region on slot teardown, so a freshly allocated slot's surfaces are already zero and a
+// present of an unpainted surface can disclose nothing. Skipping the paint keeps ~10 lines of
+// hand-written assembly out of the blob, which is where this fixture is most likely to be wrong.
+//
+// x86-ONLY BY ADDRESS, not by feature: this whole file is behind `arch/mod.rs`'s
+// `cfg_if!(target_arch = "x86_64")`, so aarch64 never parses a byte of it. Syscall 33 is undefined
+// there and still answers from that dispatcher's `-ENOSYS` arm. The call site additionally inherits
+// `#[cfg(all(target_arch = "x86_64", feature = "witness"))]` from main.rs through the launcher chain.
+// =============================================================================================
+
+/// DMG-REFUSE: how many probes the prober fires. Must equal the table in the blob and `DMG_CODES`.
+const DMG_PROBES: usize = 19;
+
+/// DMG-REFUSE: the magic the launcher plants at the prober's param block. The prober refuses to run
+/// without it and exits with witness 0 — so "the launcher never planted" is loud, not a silent skip.
+const DMG_MAGIC: u64 = 0x444D_4752; // 'DMGR'
+
+/// DMG-REFUSE: the prober's param block, at the fixture's data page (window base + 0x3000) — the same
+/// offset the U7x GO word uses, and for the same reason (page 3 is the fixture's own RW data page, well
+/// clear of the stack which starts at +0x4000-16 and never descends 4 KiB).
+///   `+0x00` magic  ·  `+0x08` the owner's window id  ·  `+0x10` a provably-FREE window id
+///   `+0x18` (written BACK by the prober) its first window id  ·  `+0x20` its second window id
+const DMG_PARAM_OFF: usize = 0x3000;
+/// DMG-REFUSE: the owner's release word, at ITS data page +0x3000. The owner exits only when this goes
+/// nonzero, which the launcher does strictly AFTER the prober has finished — so the owner's window is
+/// provably live for the whole probe sweep.
+const DMG_GO_OFF: usize = 0x3000;
+
+/// DMG-REFUSE: the expected result CODE for each probe, in table order. The codes are the prober's own
+/// classification alphabet: 0 = NEVER ATTEMPTED, 1 = returned 0, 2 = `-EACCES`, 3 = `-EBADF`,
+/// 4 = `-EINVAL`, 5 = some other negative, 6 = some other non-zero positive.
+///
+/// 0 MEANING "NEVER ATTEMPTED" IS THE WHOLE ABSENCE STORY. It is also the reset value of the witness
+/// word, so a fixture that never spawned, or died at its first instruction, reports `0x0` — which
+/// disagrees with all 19 expectations and prints `first_bad=P0 got=0`. There is no bit pattern that
+/// means "pass" and is also the zero value, which is exactly the defect that made the storage
+/// witnesses untrustworthy on this project.
+const DMG_CODES: [u8; DMG_PROBES] = [
+    1, 1, 1, 1, 1, // P0..P4  accepts (legal bands on the prober's OWN windows)
+    4, 4, 4, 4, 4, 4, 4, // P5..P11  -EINVAL (bad ranges, incl. the per-window-height pair with P3)
+    2, 2, // P12,P13  -EACCES (the owner's live window; P13's band is malformed => ORDER proof)
+    3, 3, 3, 3, // P14..P17 -EBADF (a free row x2 => ORDER proof, then two out-of-range ids)
+    1, // P18  accept, LAST — the window still presents after all 13 refusals
+];
+
+/// DMG-REFUSE: how many probes expect a `0` return, i.e. the exact `FB_PRESENT_COUNT` delta the whole
+/// run must produce. Derived from `DMG_CODES` so it can never drift from the table.
+const DMG_ACCEPTS: u64 = {
+    let mut n = 0u64;
+    let mut i = 0;
+    while i < DMG_PROBES {
+        if DMG_CODES[i] == 1 {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+};
+
+/// DMG-REFUSE: `DMG_CODES` packed the way the prober packs its own observations — 3 bits per probe,
+/// probe `i` at bit `3*i`. 19 * 3 = 57 bits, so it fits a `u64` with room to spare.
+const DMG_EXPECT: u64 = {
+    let mut w = 0u64;
+    let mut i = 0;
+    while i < DMG_PROBES {
+        w |= (DMG_CODES[i] as u64) << (3 * i);
+        i += 1;
+    }
+    w
+};
+
+// DMG-REFUSE ring-3 fixtures. Register + inline-data only, position-independent (RIP-relative), the
+// WINX-1/U7x blob idiom. Both convey their witness as their `SYS_EXIT` status, routed BY NAME in the
+// `SYS_EXIT` arm (x86 has no `SYS_REPORT`).
+//
+// REGISTER DISCIPLINE, and it is load-bearing: `syscall` destroys RCX and R11 in HARDWARE, and this
+// kernel's sysret tail additionally scrubs rdi/rsi/rdx/r8-r10. Only rbx, rbp, r12-r15 (and rsp) survive
+// a syscall here — the same set WINX-1 and the U7x pair rely on. So every value that must live across a
+// probe is in r12-r15, and rcx/rdx/rdi/rsi are recomputed inside each iteration.
+//
+// `dmg-probe` register map:
+//   r12 = the 57-bit witness accumulator   r13 = the probe index i
+//   r14 = the probe table VA               r15 = the resolved-id array (on its own stack)
+//
+// THE PROBE TABLE IS DATA, NOT CODE. Each 24-byte entry is `(selector, y0, y1)` and the loop is a
+// single ~40-instruction body, so the 19 probes cost no assembly at all beyond the table. That is the
+// point: hand-written assembly is where this fixture is most likely to be wrong, and a table-driven
+// sweep collapses 19 chances to get it wrong into one. The selector indexes the id array the setup
+// builds on the stack, which is how a probe can name an id the fixture only learns at runtime:
+//   0 = the prober's 128x128 window   1 = the prober's 128x32 window   2 = the OWNER's window
+//   3 = a provably-free row           4 = 12 (== WIN_MAX, the first out-of-range id)
+//   5 = u64::MAX (a wildly out-of-range id)
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_dmg_blob_start
+unaos_user_dmg_blob_start:
+    .balign 16
+    .globl unaos_user_dmg_owner
+unaos_user_dmg_owner:
+    xor  r12d, r12d                           // witness = 0
+    lea  rbx, [rip + unaos_user_dmg_blob_start]
+    add  rbx, 0x3000                          // rbx = the GO word VA (own RW data page)
+
+    // (0) SYS_WIN_CREATE(128, 128). This window is the ENTIRE point of this half: it is the live
+    //     window owned by a DIFFERENT address-space slot that the prober's -EACCES probes need.
+    mov  rax, 29
+    mov  rdi, 128
+    mov  rsi, 128
+    syscall
+    test rax, rax
+    js   59f                                  // no window -> exit with an empty witness (loud)
+    or   r12, 1                               // bit0: created
+
+    // (1) Park until the launcher releases GO. SYS_SLEEP_MS is a real blocking sleep that deschedules,
+    //     so this half never hogs a core (unlike the U7x pair, whose GO spins forced a third AP) — which
+    //     is why this fixture needs no dedicated core and cannot deadlock the launcher's own polling.
+    //     Bounded: 3000 * 20ms = 60 s, far past the launcher's own deadlines.
+    mov  r13, 3000
+50: mov  rax, [rbx]
+    test rax, rax
+    jnz  58f
+    mov  rax, 5                               // SYS_SLEEP_MS
+    mov  rdi, 20
+    syscall
+    dec  r13
+    jnz  50b
+    jmp  59f                                  // never released -> exit WITHOUT bit1 (the launcher FAILs)
+58: or   r12, 2                               // bit1: released cleanly by the launcher
+59: mov  rax, 2                               // SYS_EXIT(witness)
+    mov  rdi, r12
+    syscall
+51: jmp  51b                                  // sys_exit never returns; guard
+
+    .balign 16
+    .globl unaos_user_dmg_probe
+unaos_user_dmg_probe:
+    xor  r12d, r12d                           // witness = 0 == every probe NEVER ATTEMPTED
+    lea  rbx, [rip + unaos_user_dmg_blob_start]
+    add  rbx, 0x3000                          // rbx = the param block VA
+
+    // (0) The planted magic. Without it the ids are garbage, so the only honest thing to do is refuse
+    //     to run and report a witness of 0 — which the launcher grades as FAIL, never as a pass.
+    mov  rax, [rbx]
+    mov  rdx, 0x444D4752
+    cmp  rax, rdx
+    jne  79f
+
+    // (1) SYS_WIN_CREATE(128, 128) -> the tall window. h = 128.
+    mov  rax, 29
+    mov  rdi, 128
+    mov  rsi, 128
+    syscall
+    test rax, rax
+    js   79f
+    mov  r13, rax                             // (temporarily) id_b0
+
+    // (2) SYS_WIN_CREATE(128, 32) -> the SHORT window. h = 32. Its whole reason for existing is P11:
+    //     the identical band that P3 accepts on h=128 must be refused here, which is the only way to
+    //     witness that the bound is read from THIS row rather than from a constant.
+    mov  rax, 29
+    mov  rdi, 128
+    mov  rsi, 32
+    syscall
+    test rax, rax
+    js   79f
+    mov  r14, rax                             // (temporarily) id_b1
+
+    // (3) Build the resolved-id array on our own stack. rsp starts at window base + 0x4000 - 16, and
+    //     the param block is at +0x3000, so 48 bytes of stack cannot collide with it.
+    sub  rsp, 48
+    mov  r15, rsp                             // r15 = id array base (survives syscalls)
+    mov  [r15 + 0], r13                       // sel 0 = the 128x128 window
+    mov  [r15 + 8], r14                       // sel 1 = the 128x32 window
+    mov  rax, [rbx + 8]
+    mov  [r15 + 16], rax                      // sel 2 = the OWNER's window (planted)
+    mov  rax, [rbx + 16]
+    mov  [r15 + 24], rax                      // sel 3 = a provably-free row (planted)
+    mov  qword ptr [r15 + 32], 12             // sel 4 = WIN_MAX, the first out-of-range id
+    mov  qword ptr [r15 + 40], -1             // sel 5 = u64::MAX, wildly out of range
+
+    // (4) Report our own ids BACK through the param block, so the launcher can cross-check them
+    //     against the live window table rather than trusting its own prediction.
+    mov  [rbx + 24], r13
+    mov  [rbx + 32], r14
+
+    lea  r14, [rip + unaos_user_dmg_table]    // r14 = table base (r13/r14 re-purposed from here)
+    xor  r13d, r13d                           // r13 = probe index i
+
+70: cmp  r13, 19
+    jae  78f
+    mov  rax, r13
+    imul rax, rax, 24                         // entry stride
+    add  rax, r14
+    mov  rcx, [rax + 0]                       // selector
+    mov  rdi, [r15 + rcx*8]                   // -> the resolved window id
+    mov  rsi, [rax + 8]                       // y0
+    mov  rdx, [rax + 16]                      // y1
+    mov  rax, 33                              // SYS_WIN_PRESENT_ROWS
+    syscall
+    // rax = rc. rcx and r11 are gone (hardware), rdi/rsi/rdx scrubbed — none are live across this.
+
+    // Classify rc into a 3-bit code in rdx.
+    test rax, rax
+    jz   71f
+    cmp  rax, -13
+    jz   72f
+    cmp  rax, -9
+    jz   73f
+    cmp  rax, -22
+    jz   74f
+    test rax, rax
+    js   75f
+    mov  edx, 6                               // some other NON-ZERO POSITIVE return
+    jmp  76f
+71: mov  edx, 1                               // returned 0
+    jmp  76f
+72: mov  edx, 2                               // -EACCES
+    jmp  76f
+73: mov  edx, 3                               // -EBADF
+    jmp  76f
+74: mov  edx, 4                               // -EINVAL
+    jmp  76f
+75: mov  edx, 5                               // some other NEGATIVE errno
+
+    // Pack: witness |= code << (3 * i). 3 * 18 = 54, so the shift never leaves the word.
+76: mov  rcx, r13
+    lea  rcx, [rcx + rcx*2]                   // rcx = 3*i; cl is the shift count
+    shl  rdx, cl
+    or   r12, rdx
+    inc  r13
+    jmp  70b
+
+78: add  rsp, 48
+79: mov  rax, 2                               // SYS_EXIT(witness)
+    mov  rdi, r12
+    syscall
+77: jmp  77b                                  // sys_exit never returns; guard
+
+    // ---- the probe table: 19 entries of (selector, y0, y1), read RIP-relative out of the RX-RO code
+    // ---- page. Kept in EXACT correspondence with `DMG_CODES` above; the launcher grades against that.
+    .balign 8
+unaos_user_dmg_table:
+    .quad 0, 0,   128                         // P0  accept — y1 == h exactly (the boundary that must NOT refuse)
+    .quad 0, 0,   1                           // P1  accept — the minimum legal band
+    .quad 0, 127, 128                         // P2  accept — the last row
+    .quad 0, 0,   33                          // P3  accept — 33 rows on h=128 (accepting twin of P11)
+    .quad 1, 0,   32                          // P4  accept — the full height of the SHORT window
+    .quad 0, 64,  64                          // P5  EINVAL — empty (y1 == y0)
+    .quad 0, 64,  32                          // P6  EINVAL — inverted
+    .quad 0, 0,   129                         // P7  EINVAL — one past h
+    .quad 0, 0,   -1                          // P8  EINVAL — y1 = u64::MAX (no truncation in the bound)
+    .quad 0, 128, 128                         // P9  EINVAL — at h, and empty
+    .quad 0, 128, 129                         // P10 EINVAL — wholly past h
+    .quad 1, 0,   33                          // P11 EINVAL — the SAME band P3 accepts, on h=32
+    .quad 2, 0,   11                          // P12 EACCES — the owner's live window, a VALID band
+    .quad 2, 64,  32                          // P13 EACCES — the owner's window, a MALFORMED band (ORDER)
+    .quad 3, 0,   11                          // P14 EBADF  — a free row, a valid band
+    .quad 3, 64,  32                          // P15 EBADF  — a free row, a malformed band (ORDER)
+    .quad 4, 0,   11                          // P16 EBADF  — id 12 == WIN_MAX, the first out-of-range id
+    .quad 5, 0,   11                          // P17 EBADF  — id u64::MAX
+    .quad 0, 0,   128                         // P18 accept — LAST: the window still presents after 13 refusals
+
+    .globl unaos_user_dmg_blob_end
+unaos_user_dmg_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_dmg_blob_start: u8;
+    static unaos_user_dmg_blob_end: u8;
+    static unaos_user_dmg_owner: u8;
+    static unaos_user_dmg_probe: u8;
+}
+
+/// DMG-REFUSE: the prober's packed 19-probe observation (its `SYS_EXIT` status, routed by name).
+static DMG_PROBE_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// DMG-REFUSE: the owner's 2-bit witness — bit0 it created its window, bit1 it was released cleanly.
+static DMG_OWNER_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// DMG-REFUSE: fixtures that reached their witness exit (want 2). Gates the launcher's reads.
+static DMG_DONE: AtomicU32 = AtomicU32::new(0);
+/// DMG-REFUSE: a fault-kill of either half. Both are well-behaved (register + inline data, and the only
+/// user stores are to their own RW data page and their own stack), so a kill is a real bug here.
+static DMG_KILLED: AtomicU32 = AtomicU32::new(0);
+/// DMG-REFUSE: the owner's full witness — created AND released cleanly.
+const DMG_OWNER_ALL: u32 = 0x3;
+
+/// DMG-REFUSE: build one fixture slot (the `u7x_build` shape) — allocate, scrub the whole program
+/// window (so no prior tenant's bytes can be mistaken for a planted param block or a released GO),
+/// copy the shared two-entry blob into the RX-RO code page through the identity alias, and return the
+/// run params for the requested entry symbol.
+fn dmg_build(entry_sym: *const u8) -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_dmg_blob_start as usize;
+    let bend = &raw const unaos_user_dmg_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "DMG-REFUSE blob does not fit in a code page");
+    let off = (entry_sym as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// DMG-REFUSE: the live window table, as two bitmaps — every OCCUPIED row, and the rows owned by slot
+/// `s`. This is the launcher's GROUND TRUTH: the expectation table is built from it and re-verified
+/// against it, so no probe is graded against a prediction.
+fn dmg_win_masks(s: usize) -> (u32, u32) {
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    let mut occ = 0u32;
+    let mut own = 0u32;
+    for i in 0..WIN_MAX {
+        if t[i].owner != WIN_OWNER_FREE {
+            occ |= 1 << i;
+            if t[i].owner == s {
+                own |= 1 << i;
+            }
+        }
+    }
+    (occ, own)
+}
+
+/// DMG-REFUSE: read probe `i`'s 3-bit code out of a packed witness word.
+fn dmg_code(w: u64, i: usize) -> u32 {
+    ((w >> (3 * i)) & 0x7) as u32
+}
+
+/// DMG-REFUSE launcher + verdict. Chained off `winx7_launcher`'s tail in program order.
+///
+/// Flow, and every step's failure prints a line carrying the literal `NOT RUN` rather than returning
+/// silently — a witness that can skip quietly is the defect this fixture exists to avoid:
+///   1. One-shot. Sample `FB_PRESENT_COUNT`. Require the window table to be EMPTY at entry (it is: the
+///      WINX-7 verdict waited on its own teardown, and the two later window witnesses run after us).
+///   2. Build + spawn `dmg-owner`; wait (bounded) until its window is really in the table, then read
+///      its row id KERNEL-SIDE. Pick `id_free` as the HIGHEST free row — `sys_win_create` allocates
+///      strictly lowest-first, so a high row cannot be handed to the prober while low rows are free.
+///   3. Build `dmg-probe`, PLANT `(magic, id_a, id_free)` into its data page, spawn it, wait for its
+///      witness exit.
+///   4. RE-READ the table before releasing the owner: `id_a` must still be the owner's and `id_free`
+///      must still be free, or the run is reported NOT RUN rather than graded — a fixture that cannot
+///      tell its own race from a kernel bug is worse than no fixture.
+///   5. Release the owner, wait for its exit and both slots' teardown, then grade.
+///
+/// SETTLE FLAG: `video::wcx::desktop_app_service` holds the desktop-app launch (bounded, out loud)
+/// until this witness has had its empty-table entry — Boot AL's launch at 13.257s beat the witness to
+/// row 1 (DMG entry 13.859s) and it printed NOT RUN for the first time in the capture. The flag is
+/// published on EVERY exit (the wrapper stores it after the body returns, NOT RUN paths included).
+///
+/// BORN SETTLED WITHOUT `witness`: the chain that reaches this launcher is witness-gated at its
+/// root — every `u6bx_probe_once` call site is `#[cfg(feature = "witness")]` — and there are three
+/// more shapes that never arrive even with `witness` on (no online AP; `u8x_build()` -> None;
+/// `winx7_build()` -> None, whose early return skips the tail chain). So the holder's termination
+/// argument is its BOUND, never this chain's reachability — and on a build that cannot run the
+/// witness at all (`./arroyo esp-x86` default: `wc` on, `witness` off) the flag starts `true` so the
+/// desktop app pays nothing for a fixture that cannot exist.
+pub static DMG_REFUSE_SETTLED: AtomicBool = AtomicBool::new(!cfg!(feature = "witness"));
+
+fn dmg_refuse_launcher(demo_cpu: usize) {
+    dmg_refuse_witness(demo_cpu);
+    DMG_REFUSE_SETTLED.store(true, Ordering::Release);
+}
+
+fn dmg_refuse_witness(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let presents_before = fb_present_count();
+    let (occ_entry, _) = dmg_win_masks(usize::MAX);
+    if occ_entry != 0 {
+        serial_println!(
+            ":: DMG-REFUSE: the window table was not empty at entry (occupied={:#04x}) — refusal witness NOT RUN ::",
+            occ_entry
+        );
+        return;
+    }
+
+    serial_println!(
+        ":: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refusal arms — two ring-3 slots, {} probes across -EBADF/-EACCES/-EINVAL and their accepting twins ::",
+        DMG_PROBES
+    );
+
+    // 2. The OWNER half. Its core: a sibling if the pool has one, else this demo's — neither half spins
+    //    (the owner blocks in SYS_SLEEP_MS, the prober runs straight through), so sharing cannot wedge.
+    let Some(owner) = dmg_build(&raw const unaos_user_dmg_owner) else {
+        serial_println!(
+            ":: DMG-REFUSE: no free address-space slot for the owner half — refusal witness NOT RUN ::"
+        );
+        return;
+    };
+    let owner_cpu = crate::arch::smp::worker_cpu(1).unwrap_or(demo_cpu);
+    crate::arch::sched::spawn_user_in_space("dmg-owner", owner.entry, owner.sp, owner_cpu, owner.cr3);
+
+    let odeadline = crate::arch::ticks() + 5000;
+    while !winx_slot_has_window(owner.slot) && crate::arch::ticks() < odeadline {
+        crate::arch::sched::yield_now();
+    }
+    let (occ_a, own_a) = dmg_win_masks(owner.slot);
+    if own_a.count_ones() != 1 {
+        serial_println!(
+            ":: DMG-REFUSE: the owner half never created exactly one window within 5000ms (occupied={:#04x} owned={:#04x}) — refusal witness NOT RUN ::",
+            occ_a, own_a
+        );
+        dmg_release_go(owner.slot);
+        return;
+    }
+    let id_a = own_a.trailing_zeros() as u64;
+    // The HIGHEST free row. `sys_win_create` scans lowest-first, so this row cannot be allocated to the
+    // prober's two windows while lower rows remain free — it is free at plant time and provably stays so.
+    let Some(id_free) = (0..WIN_MAX).rev().find(|&i| occ_a & (1 << i) == 0).map(|i| i as u64) else {
+        serial_println!(
+            ":: DMG-REFUSE: no free window row to probe -EBADF with (occupied={:#04x}) — refusal witness NOT RUN ::",
+            occ_a
+        );
+        dmg_release_go(owner.slot);
+        return;
+    };
+
+    // 3. The PROBER half, with the owner's id and the free id planted into its data page.
+    let Some(probe) = dmg_build(&raw const unaos_user_dmg_probe) else {
+        serial_println!(
+            ":: DMG-REFUSE: no free address-space slot for the prober half — refusal witness NOT RUN ::"
+        );
+        dmg_release_go(owner.slot);
+        return;
+    };
+    unsafe {
+        let p = crate::arch::memory::slot_backing_ptr(probe.slot).add(DMG_PARAM_OFF) as *mut u64;
+        core::ptr::write_volatile(p.add(1), id_a);
+        core::ptr::write_volatile(p.add(2), id_free);
+        // The magic LAST: it is the prober's proof that the ids beside it are real, so it must become
+        // visible only after they are. x86-TSO keeps these stores in program order.
+        core::ptr::write_volatile(p, DMG_MAGIC);
+    }
+    crate::arch::sched::spawn_user_in_space("dmg-probe", probe.entry, probe.sp, demo_cpu, probe.cr3);
+
+    let pdeadline = crate::arch::ticks() + 10_000;
+    while DMG_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < pdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = DMG_PROBE_WITNESS.load(Ordering::Acquire);
+    let presents = fb_present_count() - presents_before;
+
+    // The ids the prober says it was given, read back out of its own param block.
+    let (rep_b0, rep_b1) = unsafe {
+        let p = crate::arch::memory::slot_backing_ptr(probe.slot).add(DMG_PARAM_OFF) as *const u64;
+        (core::ptr::read_volatile(p.add(3)), core::ptr::read_volatile(p.add(4)))
+    };
+
+    // 4. GROUND TRUTH RE-READ, before the owner is released and while every window is still live.
+    let (occ_re, own_re) = dmg_win_masks(owner.slot);
+    // The two ids below are RING 3's report, so they are bound-checked BEFORE they reach a shift — a
+    // fixture bug must not become a kernel shift-overflow panic in the launcher that grades it.
+    let ground_ok = rep_b0 < WIN_MAX as u64
+        && rep_b1 < WIN_MAX as u64
+        && own_re == (1 << id_a)
+        && occ_re & (1 << id_free) == 0
+        && occ_re & (1 << rep_b0) != 0
+        && occ_re & (1 << rep_b1) != 0
+        && rep_b0 != id_a
+        && rep_b1 != id_a
+        && rep_b0 != rep_b1;
+    if !ground_ok {
+        serial_println!(
+            ":: DMG-REFUSE: the window table moved under the probe (id_a={} id_free={} b0={} b1={} entry={:#04x} recheck={:#04x} owned={:#04x}) — refusal witness NOT RUN ::",
+            id_a, id_free, rep_b0, rep_b1, occ_a, occ_re, own_re
+        );
+        dmg_release_go(owner.slot);
+        return;
+    }
+
+    // 5. Release the owner and collect both exits + the teardown proof.
+    dmg_release_go(owner.slot);
+    let vdeadline = crate::arch::ticks() + 8000;
+    while DMG_DONE.load(Ordering::Acquire) < 2 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let owner_witness = DMG_OWNER_WITNESS.load(Ordering::Acquire);
+    let killed = DMG_KILLED.load(Ordering::Acquire);
+
+    let tdeadline = crate::arch::ticks() + 4000;
+    while (winx_slot_has_window(owner.slot) || winx_slot_has_window(probe.slot))
+        && crate::arch::ticks() < tdeadline
+    {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = !winx_slot_has_window(owner.slot) && !winx_slot_has_window(probe.slot);
+
+    // Grade probe by probe, so a disagreement NAMES the probe rather than handing over a bitmask to
+    // decode by hand. `first_bad` is what makes deliberately breaking one expectation a cheap way to
+    // prove this witness can go red.
+    let mut first_bad = usize::MAX;
+    for i in 0..DMG_PROBES {
+        if dmg_code(witness, i) != DMG_CODES[i] as u32 {
+            first_bad = i;
+            break;
+        }
+    }
+
+    // SERIAL SETTLE — see `winx_launcher`: `serial::_print` drops lines on `try_lock` contention, and
+    // this verdict lands right after a compositor create/present/close burst printed from another core.
+    // Everything reported is already latched in locals, and both fixtures are gone, so yielding is free.
+    for _ in 0..64 {
+        crate::arch::sched::yield_now();
+    }
+
+    if first_bad == usize::MAX
+        && presents == DMG_ACCEPTS
+        && owner_witness == DMG_OWNER_ALL
+        && cleared
+        && killed == 0
+        && DMG_DONE.load(Ordering::Acquire) == 2
+    {
+        serial_println!(
+            ":: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refused every malformed band — {}/{} probes from two ring-3 slots agree: 6 legal bands returned 0, 7 bad ranges -EINVAL, 2 presents of another slot's LIVE window -EACCES, 4 free/out-of-range ids -EBADF; ownership is checked BEFORE the range (a malformed band on another slot's window is still -EACCES, on a free row still -EBADF), the height bound is the WINDOW's own (33 rows accepted on h=128, refused on h=32), the window still presented after all 13 refusals, and the present counter advanced by exactly {} — no refusal reached the compositor == expected — witness OK ::",
+            DMG_PROBES, DMG_PROBES, presents
+        );
+    } else {
+        let (got, want) = if first_bad == usize::MAX {
+            (0u32, 0u32)
+        } else {
+            (dmg_code(witness, first_bad), DMG_CODES[first_bad] as u32)
+        };
+        serial_println!(
+            ":: DMG-REFUSE FAIL — probes={:#018x} want={:#018x} first_bad=P{} got={} want_code={} ids=(a={} b0={} b1={} free={}) presents={} (want {}) owner_witness={:#x} (want {:#x}) done={}/2 killed={} cleared={} tables=(entry={:#04x} recheck={:#04x}) ::",
+            witness,
+            DMG_EXPECT,
+            if first_bad == usize::MAX { 255 } else { first_bad },
+            got,
+            want,
+            id_a,
+            rep_b0,
+            rep_b1,
+            id_free,
+            presents,
+            DMG_ACCEPTS,
+            owner_witness,
+            DMG_OWNER_ALL,
+            DMG_DONE.load(Ordering::Acquire),
+            killed,
+            cleared,
+            occ_a,
+            occ_re
+        );
+    }
+}
+
+/// DMG-REFUSE: release the owner half's park word (its window base + 0x3000), through the slot's
+/// identity backing — the `u7x_release_go` path, and sound for the same reason: x86-TSO means the
+/// parked fixture's next aliased load after its 20 ms sleep observes the store.
+fn dmg_release_go(slot: usize) {
+    unsafe {
+        let go = crate::arch::memory::slot_backing_ptr(slot).add(DMG_GO_OFF) as *mut u64;
+        core::ptr::write_volatile(go, 1);
     }
 }
 
@@ -12666,8 +17966,12 @@ fn winx8_launcher(_demo_cpu: usize) {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    let Ok(fs) = crate::fs::fat::mount() else {
-        serial_println!(":: WINX-8: no FAT volume on the block device — VUG.ELF end-to-end witness skipped ::");
+    // APPLOAD: see `winx2_launcher` — program source, not the global handle alone.
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+        serial_println!(
+            ":: WINX-8: no FAT volume on any program-source handle (handles={}) — VUG.ELF end-to-end witness skipped ::",
+            crate::drivers::block::source_census()
+        );
         return;
     };
     let Ok(de) = fs.find_in_root("VUG.ELF") else {
@@ -12723,10 +18027,22 @@ fn winx8_launcher(_demo_cpu: usize) {
 
     // The kill IS part of the contract for a `bg` vug: it was launched DETACHED, so it skips its frame
     // cap and tumbles until it is killed — which is the whole point of publishing that flag.
+    //
+    // PROCREAP + REVIEW C2 — the WINX-2 refresh, applied verbatim here, and it was NOT cosmetic on this
+    // witness: `bg_kill` has not returned the bare string `"killed"` since GR21 reaped the row in place,
+    // so `verdict == "killed"` was UNSATISFIABLE and the `-> PASS` arm below could never be reached on
+    // any boot. See `winx2_launcher` for the full reasoning on each of the three checks; the short form:
+    // both self-reaping verdicts mean confirmed-killed-and-row-gone, the reap is OBSERVED with a
+    // non-reaping `bg_poll` instead of asking a freed row to be reaped twice, and the `Proc` census
+    // closes the `PREAPING`-stall hole that `BgPoll::Gone` cannot see — asserted on the EXITED bucket,
+    // which a concurrent `desktop_app_service` spawn cannot move, never on `free` alone.
+    let (free_before, _, exited_before, _) = proc_table_headroom();
     let verdict = bg_kill(pid, slot as u64);
-    let killed = verdict == "killed";
-    let reaped = matches!(bg_poll(pid, true), BgPoll::Faulted | BgPoll::Exited(_));
-    let gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let killed = verdict == "killed, row reaped"
+        || verdict == "killed — the row was reclaimed on another core";
+    let reaped = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let (free_after, _, exited_after, _) = proc_table_headroom();
+    let row_freed = exited_after == exited_before && free_after >= free_before;
     let tdeadline = crate::arch::ticks() + 2_000;
     while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
         crate::arch::sched::yield_now();
@@ -12737,15 +18053,16 @@ fn winx8_launcher(_demo_cpu: usize) {
         crate::arch::sched::yield_now();
     }
 
-    if windowed && presents >= WINX8_MIN_PRESENTS && killed && reaped && gone && cleared {
+    if windowed && presents >= WINX8_MIN_PRESENTS && killed && reaped && row_freed && cleared {
         serial_println!(
-            ":: WINX-8: VUG.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents with {} ring-3 thread(s), killed + reaped, teardown clean -> PASS ::",
-            entry, presents, threads
+            ":: WINX-8: VUG.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents with {} ring-3 thread(s), killed + row reaped by the kill (free {}->{}/{}, exited {}->{}), teardown clean -> PASS ::",
+            entry, presents, threads, free_before, free_after, proc_table_rows(), exited_before, exited_after
         );
     } else {
         serial_println!(
-            ":: WINX-8: VUG.ELF end-to-end FAIL — windowed={} presents={} threads={} killed={} ({}) reaped={} gone={} cleared={} (want true/>={}/-/true/true/true/true) ::",
-            windowed, presents, threads, killed, verdict, reaped, gone, cleared, WINX8_MIN_PRESENTS
+            ":: WINX-8: VUG.ELF end-to-end FAIL — windowed={} presents={} threads={} killed={} (verdict={:?}) row_gone={} row_freed={} (free {}->{}/{} exited {}->{}) cleared={} (want true/>={}/-/true/true/true/true) ::",
+            windowed, presents, threads, killed, verdict, reaped, row_freed,
+            free_before, free_after, proc_table_rows(), exited_before, exited_after, cleared, WINX8_MIN_PRESENTS
         );
     }
 }
@@ -12769,9 +18086,16 @@ fn winx8_launcher(_demo_cpu: usize) {
 // =============================================================================================
 
 /// PULSE-1: how many presents PULSE.ELF must land before we accept it is really running its refresh loop
-/// rather than having created a window and wedged. The app repaints at `REFRESH_MS` = 250 ms and sleeps
-/// BEFORE its first sample (its baseline is deliberately never painted), so three presents is ~1 s of its
-/// life — which is why the deadline below is longer than WINX-8's.
+/// rather than having created a window and wedged. The app sleeps a full 250 ms measurement window before
+/// its first paint (its baseline is deliberately never painted) and then repaints at `FRAME_MS` = 50 ms
+/// since PULSEFLUID, so three presents is ~400 ms of its life — it used to be ~1 s, which is why the
+/// deadline below is longer than WINX-8's. The deadline is deliberately NOT tightened to match: it is a
+/// wedge detector, and a generous one costs nothing on a passing run.
+///
+/// One consequence worth stating because a future reader will otherwise re-derive it from a red gate: the
+/// app now skips its present entirely while the VUGMIN hidden bit is set. This witness spawns it via `bg`
+/// and never hides it, so the count still accrues; a variant of this fixture that hid the window would be
+/// asserting the opposite of PULSEFLUID's contract and must not be written.
 const PULSEW_MIN_PRESENTS: u64 = 3;
 
 /// PULSE-1: load `PULSE.ELF` off the mounted FAT volume and run the whole `bg` lifecycle on it.
@@ -12780,8 +18104,12 @@ fn pulsew_launcher(_demo_cpu: usize) {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    let Ok(fs) = crate::fs::fat::mount() else {
-        serial_println!(":: PULSE-W: no FAT volume on the block device — PULSE.ELF end-to-end witness skipped ::");
+    // APPLOAD: see `winx2_launcher` — program source, not the global handle alone.
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+        serial_println!(
+            ":: PULSE-W: no FAT volume on any program-source handle (handles={}) — PULSE.ELF end-to-end witness skipped ::",
+            crate::drivers::block::source_census()
+        );
         return;
     };
     let Ok(de) = fs.find_in_root("PULSE.ELF") else {
@@ -12835,10 +18163,17 @@ fn pulsew_launcher(_demo_cpu: usize) {
     // The kill is still ISSUED — a monitor with no frame cap and no timeout must not be left holding a slot
     // and a window row for the rest of the boot — but see the verdict note below for why its outcome is
     // REPORTED rather than ASSERTED here.
+    // PROCREAP — the same three observations WINX-2/WINX-8 assert, made here for the REPORT below. They
+    // are refreshed rather than left alone because a report that describes a contract the kernel no
+    // longer has is worse than no report: `verdict == "killed"` could not match `bg_kill`'s post-GR21
+    // self-reaping strings, so this line said `UNCONFIRMED` on every clean run.
+    let (free_before, _, exited_before, _) = proc_table_headroom();
     let verdict = bg_kill(pid, slot as u64);
-    let killed = verdict == "killed";
-    let reaped = matches!(bg_poll(pid, true), BgPoll::Faulted | BgPoll::Exited(_));
-    let gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let killed = verdict == "killed, row reaped"
+        || verdict == "killed — the row was reclaimed on another core";
+    let reaped = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let (free_after, _, exited_after, _) = proc_table_headroom();
+    let row_freed = exited_after == exited_before && free_after >= free_before;
     let tdeadline = crate::arch::ticks() + 2_000;
     while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
         crate::arch::sched::yield_now();
@@ -12857,14 +18192,17 @@ fn pulsew_launcher(_demo_cpu: usize) {
     // BEFORE its first present and `exit(2)`s on a refusal — a wrong number or a wrong payload layout
     // cannot produce presents, so `presents >= PULSEW_MIN_PRESENTS` IS the cross-boundary agreement proof.
     //
-    // The bg KILL/TEARDOWN leg is deliberately NOT part of this verdict. It is WINX-2's contract and it is
-    // RED at this commit's baseline in the IDENTICAL shape — `killed=false (kill armed — the task retires at
-    // its next preemption)`, with `reaped`/`gone`/`cleared` all false — for a sleeping ring-3 task that never
-    // reaches a kill boundary inside `KILL_CONFIRM_MS`. That is one defect, on a path this arc does not
-    // touch, already reported loudly by its own witness a few lines earlier in the same log. Asserting it
-    // again here would print one defect as two reds and make a second gate step permanently red without
-    // adding one bit of information. So the raw teardown state is put on the wire VERBATIM in its own line
-    // below — nothing is hidden, and the day WINX-2 goes green this line goes quiet with it.
+    // The bg KILL/TEARDOWN leg is deliberately NOT part of this verdict: it is WINX-2's contract, WINX-2
+    // asserts it a few lines earlier in the same log, and a sleeping ring-3 task that misses its kill
+    // boundary inside `KILL_CONFIRM_MS` is one defect that should print as one red, not two. So the raw
+    // teardown state goes on the wire VERBATIM in its own line below — nothing is hidden, and nothing is
+    // graded twice.
+    //
+    // (The earlier wording here predicted a specific baseline failure — `kill armed — the task retires at
+    // its next preemption`, everything false. That prediction is retired: the shape actually seen on Boot
+    // AL was `killed, row reaped` with the WITNESS misreading it, which is a different thing entirely and
+    // is what the refresh above fixes. A comment that names an expected failure string ages into a claim
+    // about the kernel, so this one now names only the structure of the decision.)
     if windowed && presents >= PULSEW_MIN_PRESENTS {
         serial_println!(
             ":: PULSE-W: PULSE.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents of per-core pulse bars sampled through SYS_CPUPULSE({}) -> PASS ::",
@@ -12872,18 +18210,22 @@ fn pulsew_launcher(_demo_cpu: usize) {
         );
     } else {
         serial_println!(
-            ":: PULSE-W: PULSE.ELF end-to-end FAIL — windowed={} presents={} (want true/>={}); kill='{}' reaped={} gone={} cleared={} ::",
-            windowed, presents, PULSEW_MIN_PRESENTS, verdict, reaped, gone, cleared
+            ":: PULSE-W: PULSE.ELF end-to-end FAIL — windowed={} presents={} (want true/>={}); kill={:?} row_gone={} row_freed={} (free {}->{}/{} exited {}->{}) cleared={} ::",
+            windowed, presents, PULSEW_MIN_PRESENTS, verdict, reaped, row_freed,
+            free_before, free_after, proc_table_rows(), exited_before, exited_after, cleared
         );
     }
     // The teardown observation. Not a verdict — see the note above. Reported unconditionally so the state is
     // never inferred from a silence, and worded so it cannot be mistaken for a second verdict on one defect.
-    if killed && reaped && gone && cleared {
-        serial_println!(":: PULSE-W: teardown observation — kill='{}' reaped/gone/cleared all true; the bg lifecycle leg (WINX-2's contract) is clean on this run ::", verdict);
+    if killed && reaped && row_freed && cleared {
+        serial_println!(
+            ":: PULSE-W: teardown observation — kill={:?}, the row is gone AND the Proc census is clean (free {}->{}/{}, exited {}->{}), window cleared; the bg lifecycle leg (WINX-2's contract) is clean on this run ::",
+            verdict, free_before, free_after, proc_table_rows(), exited_before, exited_after
+        );
     } else {
         serial_println!(
-            ":: PULSE-W: teardown observation — kill='{}' reaped={} gone={} cleared={}; UNCONFIRMED, and the WINX-2 witness above reports the same bg kill-boundary state at this baseline. Not asserted here: one defect, on a path this arc does not touch, is not counted twice ::",
-            verdict, reaped, gone, cleared
+            ":: PULSE-W: teardown observation — kill={:?} row_gone={} row_freed={} (free {}->{}/{} exited {}->{}) cleared={}; UNCONFIRMED, and the WINX-2 witness above asserts this same bg kill-boundary state. Not asserted here: one defect is not counted twice ::",
+            verdict, reaped, row_freed, free_before, free_after, proc_table_rows(), exited_before, exited_after, cleared
         );
     }
 }
@@ -14811,6 +20153,18 @@ fn u9x_read16(fc: u32, size: u32, off: u32) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// Bounded storage-readiness wait for the file-lifecycle battery (U9x -> U10 -> U10c -> U10d -> U11x ->
+/// CFU/CFU2-WGATE -> U11m2). The battery is chained SYNCHRONOUSLY off the storage-RELAXED U7x/U8x demo, so it
+/// can reach its storage gate BEFORE the FAT/block device has mounted: on metal the SDHC device is enumerated
+/// ~2.2 s but `block::info()` (the mounted device) settles ~12.6 s — within ~100 ms of the point the demo
+/// chain hits the gate. The old instant `is_none() -> return` could not tell "no block device (headless — skip
+/// cleanly)" from "not mounted YET (metal — must wait)" and silently dropped the whole battery, CFU2-WGATE
+/// included, on any late mount. This bound matches `u10x_run`'s primary `ticks()+5000` witness-wait idiom
+/// (1 calibrated tick == 1 ms); storage arrives ~100 ms after the gate so it is pure margin. On a genuinely
+/// device-less run the bound EXPIRES and the launcher skips cleanly — no hang, no panic — preserving the
+/// storage-independent control path, now WITH a witness rather than a silent drop.
+const FLC_STORAGE_WAIT_MS: u64 = 5000;
+
 /// U9x launcher + verdict (M2 — real disk write-back) — chained off `u8x_launcher` in program order. Flow:
 /// one-shot; skip silently with no block device (the control-path discipline). PRE-FLIGHT (gated on
 /// `HELLO_STAGED`, the BSP's FAT-present signal) captures SCRATCH.BIN's chain head + size + the pre-image bytes
@@ -14830,12 +20184,40 @@ fn u9x_read16(fc: u32, size: u32, off: u32) -> Option<[u8; 16]> {
 /// is the FIRST concurrent AP-side xHCI BOT I/O in the tree; the pump is BOUNDED (a 2000-iter timeout -> `Io`),
 /// so a failure is a LOUD verdict FAIL (`flushed=false`), never a hang — `test-fat sf` is its empirical proof.
 fn u9x_launcher(demo_cpu: usize) {
-    // One-shot (reached once via the U8x chain; guard defensively anyway).
     static DONE: AtomicBool = AtomicBool::new(false);
+    // Storage-readiness BOUNDED WAIT — resolved BEFORE the one-shot DONE swap below AND before the u10x
+    // chain-on (fall-through at the end of this fn), so the skip decision is made against a SETTLED storage
+    // state and the one-shot is never burned on a "not ready YET." (See `FLC_STORAGE_WAIT_MS` for the race.)
+    // Engages only when storage is absent at entry; when `block::info()` is already `Some` (the common metal /
+    // QEMU case) the whole block is skipped and the log is byte-for-byte unchanged. Reuses `u10x_run`'s
+    // `ticks()+N` witness-wait idiom.
+    if crate::drivers::block::info().is_none() {
+        serial_println!(
+            ":: U9x: block device not ready at the file-lifecycle gate — waiting (bounded {} ms) for storage ::",
+            FLC_STORAGE_WAIT_MS
+        );
+        let deadline = crate::arch::ticks() + FLC_STORAGE_WAIT_MS;
+        while crate::drivers::block::info().is_none() && crate::arch::ticks() < deadline {
+            crate::arch::sched::yield_now();
+        }
+        if crate::drivers::block::info().is_some() {
+            serial_println!(
+                ":: U9x: storage arrived during the bounded wait — file-lifecycle battery (U9x..CFU2-WGATE..U11m2) proceeding ::"
+            );
+        } else {
+            serial_println!(
+                ":: U9x: storage bound expired ({} ms) — no block device, file-lifecycle battery skipped cleanly (device-less control path) ::",
+                FLC_STORAGE_WAIT_MS
+            );
+        }
+    }
+    // One-shot (reached once via the U8x chain; guard defensively anyway).
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    // No block device -> keep the no-storage control path free of demo lines (mirrors every prior gate).
+    // Settled decision: still no block device -> keep the no-storage control path free of demo lines (mirrors
+    // every prior gate). The bounded wait above already gave storage its chance to appear, so on a device-less
+    // run we return here WITHOUT chaining u10x (exactly as before) — the storage-independent control path.
     if crate::drivers::block::info().is_none() {
         return;
     }
@@ -15999,6 +21381,76 @@ fn cfu_efault_witness() {
     }
 }
 
+/// **CFU-2 self-probe — the kernel→user WRITE gate, proved live and proved able to REFUSE.**
+///
+/// A protection nobody can see armed is a protection nobody can trust, and an instrument that can only
+/// print success proves nothing: a gate hard-wired to `Ok` and a gate hard-wired to `Err` would each
+/// satisfy half of this line, so the line reports BOTH halves and passes only on the conjunction.
+///
+/// WHAT IT BUILDS. A scratch address-space slot, reshaped into exactly the layout the old bounds-only
+/// validator could not see — the U3 ELF shape, not the FLAT/U2 one:
+///   * **page 1 → read-only + EXECUTABLE.** This is the tail of `VUG-X86.ELF`'s / `PULSE-X86.ELF`'s
+///     first `R E` LOAD (memsz 0x1fe5 / 0x13ec), produced here by the REAL loader primitive
+///     (`memory::protect_user_slot_range`), not by hand-writing a PTE. `USER_BASE + 0x1000` is the
+///     first address the old `UserAccess::Write` bound admitted, so this page IS the bypass.
+///   * **page 3 → read-only + NX**, so page 2 (RW) → page 3 (RO) is a straddle across a permission
+///     boundary inside the window.
+///
+/// WHAT IT ASSERTS, all five through the REAL `user_range_ok` seam, under the scratch slot's OWN CR3
+/// (installed IRQ-masked and restored in the same critical section, so nothing else observes it — the
+/// kernel half is shared into every slot PML4, so ring 0 keeps running normally under it):
+///   1. `ro_refused`    — a WRITE aimed at the RO+X page 1 is `-EFAULT`. **The defect, closed.**
+///   2. `rw_accepted`   — a WRITE aimed at the RW page 2 is accepted. The gate is not an always-fail.
+///   3. `head_ok`       — 8 bytes wholly inside page 2 are accepted…
+///   4. `straddle_ref`  — …but 16 bytes from the same start, crossing into RO page 3, are refused.
+///      (3)+(4) together are what a FIRST-PAGE-ONLY check cannot satisfy: same pointer, same direction,
+///      verdict decided by a page the pointer does not lie in.
+///   5. `ro_read_ok`    — a READ of the RO+X page 1 is still accepted. Proof the write gate did not
+///      over-tighten into the read direction, where a read-only page is a legal source.
+///
+/// The slot is released through the real teardown funnel; a later `alloc_user_space` re-runs
+/// `build_slot`, which rewrites all four leaves, so the reshape cannot outlive the probe. Uncounted by
+/// nothing — it prints the project's `-> PASS` / `-> FAIL ::` verdict idiom, so a regression trips
+/// `arroyo`'s FAULT_PATTERNS scan on its own.
+fn cfu2_wgate_witness() {
+    let Some(r) = crate::arch::memory::alloc_user_space() else {
+        serial_println!(":: CFU2-WGATE: no scratch address space — write-gate probe SKIPPED ::");
+        return;
+    };
+    // Reshape through the REAL ELF-loader primitive: page 1 RO+X (the VUG/PULSE first-LOAD tail),
+    // page 3 RO+NX (the far side of a straddle). W^X holds — neither is writable.
+    unsafe {
+        crate::arch::memory::protect_user_slot_range(r, 0x1000, 0x10, false, true);
+        crate::arch::memory::protect_user_slot_range(r, 0x3000, 0x10, false, false);
+    }
+    let probe_cr3 = crate::arch::memory::slot_cr3(r);
+    let saved_cr3 = crate::arch::memory::current_cr3();
+    // IRQ-masked: no preemption may observe (or be resumed under) the probe's CR3, and the scheduler's
+    // own dispatch-time CR3 install must not race the restore.
+    let (ro_refused, rw_accepted, head_ok, straddle_ref, ro_read_ok) =
+        crate::arch::without_interrupts(|| {
+            unsafe { crate::arch::memory::load_cr3(probe_cr3) };
+            let a = user_range_ok(USER_BASE + 0x1000, 8, UserAccess::Write).is_err();
+            let b = user_range_ok(USER_BASE + 0x2000, 8, UserAccess::Write).is_ok();
+            let c = user_range_ok(USER_BASE + 0x2FF8, 8, UserAccess::Write).is_ok();
+            let d = user_range_ok(USER_BASE + 0x2FF8, 16, UserAccess::Write).is_err();
+            let e = user_range_ok(USER_BASE + 0x1000, 8, UserAccess::Read).is_ok();
+            unsafe { crate::arch::memory::load_cr3(saved_cr3) };
+            (a, b, c, d, e)
+        });
+    crate::arch::memory::free_user_space_by_cr3(probe_cr3);
+    if ro_refused && rw_accepted && head_ok && straddle_ref && ro_read_ok {
+        serial_println!(
+            ":: CFU2-WGATE: kernel->user write validated against LIVE leaf W — RO+X page (U3 ELF shape, the VUG/PULSE bypass) REFUSED -EFAULT, RW page ACCEPTED, RW->RO straddle REFUSED while its in-page head is accepted, RO page still readable -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: CFU2-WGATE FAIL — ro_refused={} rw_accepted={} head_ok={} straddle_refused={} ro_read_ok={} (want all true) -> FAIL ::",
+            ro_refused, rw_accepted, head_ok, straddle_ref, ro_read_ok
+        );
+    }
+}
+
 #[cfg(feature = "irqstorage")]
 fn mf2_witness() {
     if !s4_sync_storage() {
@@ -16466,6 +21918,31 @@ fn s6_witness_launcher(demo_cpu: usize) {
 /// returning, so no held op or pending name can strand for the boot.
 fn u11m2_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
+    // Storage-readiness BOUNDED WAIT (the `u9x_launcher` shape) — resolved BEFORE the DONE swap. Defence in
+    // depth: in the normal chain u11m2 is reached AFTER u9x_launcher's own wait has already settled storage, so
+    // `block::info()` is already `Some` here and this whole block is skipped (log unchanged). It engages only if
+    // u11m2 is ever reached with storage still absent, and — like u9x — never burns the one-shot on a "not
+    // ready YET." This guards CFU2-WGATE (the CFU-2 W^X write-validation witness at cfu2_wgate_witness()).
+    if crate::drivers::block::info().is_none() {
+        serial_println!(
+            ":: U11m2: block device not ready at the CFU/unlink gate — waiting (bounded {} ms) for storage ::",
+            FLC_STORAGE_WAIT_MS
+        );
+        let deadline = crate::arch::ticks() + FLC_STORAGE_WAIT_MS;
+        while crate::drivers::block::info().is_none() && crate::arch::ticks() < deadline {
+            crate::arch::sched::yield_now();
+        }
+        if crate::drivers::block::info().is_some() {
+            serial_println!(
+                ":: U11m2: storage arrived during the bounded wait — CFU2-WGATE + cross-process unlink battery proceeding ::"
+            );
+        } else {
+            serial_println!(
+                ":: U11m2: storage bound expired ({} ms) — no block device, CFU/unlink battery skipped cleanly (device-less control path) ::",
+                FLC_STORAGE_WAIT_MS
+            );
+        }
+    }
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -16475,6 +21952,10 @@ fn u11m2_launcher(demo_cpu: usize) {
     // CFU-1: negative witness for the unified kernel/user copy seam — three out-of-window SYS_OPEN name
     // ranges each -EFAULT through the REAL dispatcher, no side effect (uncounted; knob-on AND knob-off).
     cfu_efault_witness();
+    // CFU-2: positive+negative witness for the LIVE-LEAF write gate — a scratch slot reshaped into the
+    // U3 ELF layout (RO+X page 1) proves the seam refuses the VUG/PULSE bypass and still accepts a real
+    // writable destination, per page across a straddle. Uncounted-free: it carries its own PASS/FAIL.
+    cfu2_wgate_witness();
     // STOR-1 S5: prove cross-process created-file reads serve LIVE shared backing (knob-on + FAT only). Runs
     // FIRST — DEFER.BIN and all wstage slots are free; it reuses DEFER.BIN and cleans up fully before phase 1
     // (idempotent self-heal + a post-cleanup OPENF/DYN_DELETED_G assert). SILENT skip off the knob-on FAT path.

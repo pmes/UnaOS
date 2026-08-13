@@ -75,6 +75,23 @@ stage_contents() {
     if [ -f "${S}/EFI/BOOT/BOOTX64.EFI" ]; then
         mv "${S}/EFI/BOOT/BOOTX64.EFI" "${S}/EFI/BOOT/BOOTX64.REM"
     fi
+    # SELFHOST-2: the SOURCE-ALONG pair, staged ONLY when the caller asks for it (UNAOS_SRCFIXTURE=1 —
+    # `./arroyo test-selfhost`). Every other lane through here sets UNAOS_NOSRC=1 and deliberately keeps
+    # the pair off, because these images are size-budgeted and their root directory is enumerated by
+    # tests; two extra root entries would move counts that other fixtures assert. Opt-in keeps those
+    # fixtures byte-stable while giving the source-verify gate a REAL payload to read.
+    if [ -n "${UNAOS_SRCFIXTURE:-}" ]; then
+        if [ -f "${ESP_DIR}/SRC.TGZ" ] && [ -f "${ESP_DIR}/SRC.SHA" ]; then
+            COPYFILE_DISABLE=1 cp "${ESP_DIR}/SRC.TGZ" "${S}/SRC.TGZ"
+            COPYFILE_DISABLE=1 cp "${ESP_DIR}/SRC.SHA" "${S}/SRC.SHA"
+            echo "    added SRC.TGZ ($(wc -c < "${ESP_DIR}/SRC.TGZ" | tr -d ' ') bytes) + SRC.SHA for the SELFHOST-2 verify"
+        else
+            echo "    ERROR: UNAOS_SRCFIXTURE=1 but ${ESP_DIR}/SRC.{TGZ,SHA} are absent —" >&2
+            echo "           the source-verify gate would boot against a payload-less image and read as 'not packed'." >&2
+            exit 1
+        fi
+    fi
+
     # A small text file for the `cat` milestone.
     printf 'hello from the UnaOS FAT reader\nthis file lives on a real FAT32 volume\n' > "${S}/hello.txt"
     printf 'UnaOS read-only FAT32/16 reader test volume (%s layout).\n' "$LAYOUT" > "${S}/readme.txt"

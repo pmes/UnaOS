@@ -105,7 +105,12 @@ pub(crate) const HID_SCANCODE_TO_ASCII: [(u8, u8); 104] = [
     (b'[', b'{'), // 0x2F
     (b']', b'}'), // 0x30
     (b'\\', b'|'), // 0x31
-    (0, 0),       // 0x32: Non-US # and ~
+    // ALLKEYS P2: HID usage 0x32 is "Keyboard Non-US # and ~" (HUT 1.12 §10, Keyboard/Keypad
+    // page). It is a PRINTABLE key — the extra key an ISO keyboard carries next to Return — and
+    // it sat at (0,0), so on any ISO layout that key was dead: no `Key` event, no glyph, nothing
+    // on the wire. The pair is the usage's own name, exactly as every other entry in this table
+    // takes its pair from the usage name (0x33 "; and :", 0x34 "' and \"", ...).
+    (b'#', b'~'), // 0x32: Non-US # and ~
     (b';', b':'), // 0x33
     (b'\'', b'"'), // 0x34
     (b'`', b'~'), // 0x35
@@ -149,10 +154,142 @@ pub(crate) const HID_SCANCODE_TO_ASCII: [(u8, u8); 104] = [
     (b'9', b'9'), // 0x61: Keypad 9
     (b'0', b'0'), // 0x62: Keypad 0
     (b'.', b'.'), // 0x63: Keypad .
-    (0, 0),       // 0x64: Non-US \ and |
+    // ALLKEYS P2: usage 0x64 is "Keyboard Non-US \ and |" — the second ISO-only printable key
+    // (bottom-left, beside Left Shift). Dead for the same reason 0x32 was. 0x65 Application
+    // (the "menu" key) and 0x66 Power stay (0,0) deliberately: they are COMMANDS, not
+    // characters, and this table's contract is "the character this key types".
+    (b'\\', b'|'), // 0x64: Non-US \ and |
     (0, 0),       // 0x65: Application
     (0, 0),       // 0x66: Power
     (b'=', b'='), // 0x67: Keypad =
+];
+
+/// ALLKEYS — HID boot-report modifier bitmask (byte 0), HUT 1.12 §8. Left half in bits 0..3,
+/// right half in bits 4..7, so each mask below covers BOTH the left and right key.
+pub(crate) const HID_MOD_CTRL: u8 = 0x11; // bit 0 LCtrl  | bit 4 RCtrl
+pub(crate) const HID_MOD_SHIFT: u8 = 0x22; // bit 1 LShift | bit 5 RShift
+pub(crate) const HID_MOD_ALT: u8 = 0x44; // bit 2 LAlt   | bit 6 RAlt (AltGr)
+pub(crate) const HID_MOD_GUI: u8 = 0x88; // bit 3 LGUI   | bit 7 RGUI (Cmd on Apple keyboards)
+
+/// ALLKEYS — the ONE place a HID usage plus a modifier byte plus the caps-lock state becomes the
+/// byte that goes into `pal::Event::Key`/`KeyUp`. Returns 0 for "this key produces no event".
+///
+/// It exists because that decision was previously written out four times — three inline copies in
+/// the xHCI event dispatch and one closure in the EHCI decoder — and the copies had already
+/// drifted: the EHCI one had no caps-lock term at all, which is exactly the defect Peter reported
+/// (the rMBP's INTERNAL keyboard is on EHCI, so on the bench machine Caps Lock did nothing). A
+/// shared table with unshared decode logic is not parity; this is.
+///
+/// THE RULES, and why each is what it is:
+///
+/// * **GUI (Cmd) and Alt suppress the key entirely.** `Event::Key` is a single `u8` with no
+///   modifier field, so a Cmd- or Alt-combo has no representation in the ABI. The pre-ALLKEYS
+///   behaviour was to ignore the modifier and deliver the BARE character, which is strictly worse
+///   than delivering nothing: Cmd-Q at the shell prompt typed a literal `q` into the command line,
+///   and Cmd-W typed `w`. Suppression is the honest encoding of "this kernel has no binding for
+///   that chord" and it is what stops an operator's muscle-memory chord from corrupting the line
+///   they are editing. (RIGHT Alt is AltGr on ISO layouts, where it is a CHARACTER modifier rather
+///   than a command one — see the deferral note in the arc's predictions file; producing the right
+///   character there needs a per-layout AltGr table this kernel does not have, and delivering the
+///   unmodified character for it was never correct either.)
+///
+/// * **Ctrl folds a letter to its C0 control code and suppresses everything else — INCLUDING the
+///   handful of letters whose fold would collide with a key that already has a consumer.** Ctrl-A..
+///   Ctrl-Z become 0x01..0x1A — the universal terminal encoding, and the reason `keycode - 0x03` is
+///   exact: usages 0x04..=0x1D are `a`..`z` in order, so 0x04-0x03 = 0x01 (Ctrl-A) through 0x1D-0x03
+///   = 0x1A (Ctrl-Z). Two collision classes are then carved back out, because `Event::Key` is one
+///   `u8` with no modifier field, so a consumer literally cannot tell a folded Ctrl-combo from the
+///   dedicated key that produces the same byte:
+///     - Ctrl with a NON-letter is suppressed: the classic codes (Ctrl-\ = 0x1C, Ctrl-] = 0x1D,
+///       Ctrl-^ = 0x1E, Ctrl-_ = 0x1F) land dead-on this table's arrow encoding at 0x1C..0x1F, and
+///       `user-vug` binds 0x1C as yaw-right.
+///     - Ctrl+letter folds landing on **0x08 / 0x09 / 0x0A / 0x0D** are suppressed too — these are
+///       Ctrl-H/I/J/M. Those four bytes are Backspace, Tab, LF and CR, which the console line
+///       editor (`main.rs::handle_key`) and the window compositor (`wc_focus_key`, bare Tab =
+///       switch focus) already bind from the DEDICATED keys. Left folded, Ctrl-I would silently
+///       invoke the WC focus switch and Ctrl-H/J/M would forge Backspace/Enter. The dedicated keys
+///       still deliver those bytes directly, so nothing is lost that the operator cannot type
+///       another way. This is the same principle as the arrow carve-out: the fold's output space is
+///       kept disjoint from the bytes real keys already own, because the ABI carries no modifier
+///       for a consumer to disambiguate on. (This is also why the fix lives in the FOLD and not in
+///       the matchers: `wc_focus_key`/`handle_key` receive only the `u8` and have no modifier state
+///       to check.)
+///
+/// * **Caps Lock inverts case for LETTERS ONLY**, and combines with Shift by XOR, so Shift while
+///   Caps is on gives lowercase — the behaviour of every other system. Applying caps to digits or
+///   symbols would wrongly turn `1` into `!`; that restriction is what `is_letter` guards.
+#[inline]
+pub(crate) fn hid_key_ascii(keycode: u8, modifiers: u8, caps: bool) -> u8 {
+    if (keycode as usize) >= HID_SCANCODE_TO_ASCII.len() {
+        return 0;
+    }
+    let is_letter = (0x04..=0x1D).contains(&keycode);
+    if modifiers & (HID_MOD_GUI | HID_MOD_ALT) != 0 {
+        return 0;
+    }
+    if modifiers & HID_MOD_CTRL != 0 {
+        if !is_letter {
+            return 0;
+        }
+        let c0 = keycode - 0x03;
+        // Carve out the folds that collide with dedicated-key bytes a consumer binds bare:
+        // 0x08 BS, 0x09 Tab (WC focus), 0x0A LF, 0x0D CR (Ctrl-H/I/J/M). See the doc above.
+        if matches!(c0, 0x08 | 0x09 | 0x0A | 0x0D) {
+            return 0;
+        }
+        return c0;
+    }
+    let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
+    let eff_shift = (modifiers & HID_MOD_SHIFT != 0) ^ (caps & is_letter);
+    if eff_shift { shifted } else { unshifted }
+}
+
+/// ALLKEYS — the byte a RELEASE edge resolves to. Same fold as [`hid_key_ascii`], except that it
+/// is not allowed to answer "no event" for a key that has any character identity at all.
+///
+/// THE ASYMMETRY IS THE POINT, AND IT IS A SAFETY PROPERTY. A boot report carries a LEVEL, so a
+/// release is inferred by diffing this report's held set against the last one — which means a
+/// release edge happens EXACTLY ONCE and can never be re-sent. A press that is wrongly suppressed
+/// costs one character. A release that is wrongly suppressed costs a key that is held FOREVER in
+/// every consumer that tracks held state, because nothing will ever tell it otherwise. That is
+/// Boot AJ's defect (`ehci::decode_boot_keyboard`'s header): `user-vug` clears a held bit only on a
+/// release, and a decoder that emitted none latched the vug's pause and steering on permanently.
+///
+/// Suppression rules (Alt/GUI, and Ctrl-with-a-non-letter) would have re-introduced exactly that,
+/// through a chord no one would think to test: press `w` bare — `Key(b'w')`, and the consumer sets
+/// its held bit. NOW press Cmd, still holding `w`. Release `w`. The release fold sees GUI set,
+/// returns 0, no `KeyUp` is emitted, and the vug pitches up forever. So on the release path a
+/// suppressed fold FALLS BACK to the shift-only byte, which is the same byte the original press
+/// produced (`w`/`W`, matched case-insensitively by every held-state consumer).
+///
+/// The release therefore ignores EVERY suppressing modifier — Ctrl, Alt, and GUI alike — and folds
+/// on Shift and Caps only. The first cut of this function short-circuited `if folded != 0 { return
+/// folded }` before applying the fallback, on the reasoning that "Ctrl-C's press and release are the
+/// same 0x03 and pair up." The adversarial review (GR21 F1) refuted it: that pairing holds ONLY when
+/// Ctrl is held across BOTH edges. Press `w` bare (`Key('w')`, held bit set), THEN press Ctrl, THEN
+/// release `w` — the release folded to `Ctrl-W` = 0x17, which is non-zero, so the short-circuit
+/// returned it and the shift-only fallback never ran; `key_bit(0x17)` is 0, the held bit is never
+/// cleared, and the vug pitches up forever. The exact Boot AJ stuck key, reached through the one
+/// modifier the fallback thought it could trust. Masking to Shift only removes the trap entirely.
+///
+/// The fallback can emit a `KeyUp` for which no `Key` was ever sent — Cmd-W or Ctrl-W pressed and
+/// released entirely under the modifier yields a lone `KeyUp('w')`. Harmless by construction:
+/// clearing a held bit that is already clear is a no-op, and no consumer treats `KeyUp` as an action
+/// trigger. Cost of the whole fix is only that Ctrl-C's `KeyUp` is `'c'` rather than 0x03, which
+/// nothing consumes. **Spurious release, safe; missing release, not.**
+#[inline]
+pub(crate) fn hid_key_release_ascii(keycode: u8, modifiers: u8, caps: bool) -> u8 {
+    hid_key_ascii(keycode, modifiers & HID_MOD_SHIFT, caps)
+}
+
+/// ALLKEYS — the three lock keys, as `(HID usage, LED bitmap bit)`. The bit numbering is the HID
+/// LED page's Output report (HUT 1.12 §11): bit 0 Num Lock, bit 1 Caps Lock, bit 2 Scroll Lock —
+/// the byte both decoders hand to SET_REPORT. Shared so the EHCI and xHCI toggle loops cannot
+/// disagree about which bit a key owns.
+pub(crate) const HID_LOCK_KEYS: [(u8, u8); 3] = [
+    (0x39, 0x02), // Caps Lock  -> LED bit 1
+    (0x53, 0x01), // Num Lock   -> LED bit 0
+    (0x47, 0x04), // Scroll Lock-> LED bit 2
 ];
 
 
@@ -1194,6 +1331,101 @@ pub const STORAGE_DATA_ALIGN: usize = 64 * 1024;
 /// The largest `blocks` count a single READ(10)/WRITE(10) may carry, i.e. what the staging buffer
 /// holds. The block layer publishes this to `fs/fat.rs` so callers chunk instead of guessing.
 pub const STORAGE_MAX_BLOCKS: u16 = (STORAGE_DATA_BYTES / 512) as u16;
+
+// ── SPACE — the storage bring-up phase accumulator ──────────────────────────────────────────────
+//
+// The BPACE ledger reads `stor-bringup d=219..223ms` and `stor-ready d=997..1020ms` on all eleven
+// metal boots of `rmbp-gr16-s73`, and neither number says what it is made of. This instrument
+// splits both, on the EPACE precedent (`drivers/ehci/mod.rs`): cycle accumulators per phase CLASS,
+// printed as one line at the end of the bring-up.
+//
+// It exists because the two classes it measures are NOT what their names imply, and no capture can
+// show that on its own:
+//
+//   * `stor-bringup`'s `d=` runs from `enum:p5-done`, so it charges STORAGE for everything the
+//     service ladder does between the enumeration queue draining and `service_storage` being
+//     reached. On x86 that is `service_ftdi` → `drain_ftdi`, which empties the boot-capture ring
+//     out a 115200-baud console ≤512 B at a time, AWAITING each bulk transfer. `wait=` is the whole
+//     gap and `ftdi=` is the part of it the console owns; they are printed together so the next
+//     capture confirms or refutes that attribution directly, instead of by arithmetic on a byte
+//     count after the fact.
+//   * `stor-ready`'s `d=` is the SCSI chain, and the `{}` view names which STAGE of it. One BOT
+//     transaction is up to three awaited stages (CBW / DATA / CSW). A per-command split alone would
+//     report `tur=1016ms` and leave open whether this driver polled sixteen times or the device
+//     held a single answer — the `{}` cut is what separates those, and they call for opposite fixes.
+//
+// The `[]` bracket is the PARTITION: disjoint classes that sum to the bring-up span. The `{}` view
+// is an OVERLAPPING cut of the same milliseconds (every BOT stage runs inside one of the `[]`
+// classes), printed in braces so the two cannot be added by accident — the same discipline, and for
+// the same reason, as EPACE's `{xfer/ass/act}`.
+//
+// Instrument honesty (the can-this-lie-while-looking-right check):
+//   * Same clock as the code under measurement — `now_cycles()`, converted at PRINT time by
+//     `cycles_per_ms()`, the exact helper `settle_ms` and every pump budget already use. A wrong
+//     calibration makes the waits and this report wrong TOGETHER, which keeps the ratios truthful.
+//   * `total=` is this instrument's own arm→done span and `sum=` is the `[]` classes added up. They
+//     must agree to within the print cost of this line; any gap is unattributed time and appears as
+//     a number rather than as a silent absence.
+//   * `wait=` is stamped at the ARM site (where `storage_pending_bringup` is set), not on entry to
+//     `service_storage`, so it reports the gap the boot actually paid rather than a subset of it.
+//     A bring-up that was never armed prints `wait=0ms(n=0)`, which is distinguishable from a fast
+//     one — the fallthrough cannot masquerade as a good reading.
+//   * The `{}` counters are gated on `SPACE_ACTIVE`, so they describe THIS bring-up and can never
+//     be read against the boot-long BOT totals: the instrument-baseline law.
+//   * It prints on the FAILURE path too (`result=SPACE-FAIL`), so a bring-up that died still says
+//     how far it got and what it paid on the way.
+const SP_WAIT: usize = 0;   // arm → `service_storage` body: the service ladder ahead of storage
+const SP_SETCFG: usize = 1; // SET_CONFIGURATION(1) on EP0
+const SP_TUR: usize = 2;    // the TEST UNIT READY loop (n = attempts actually made)
+const SP_SENSE: usize = 3;  // REQUEST SENSE, only on a non-Passed TUR
+const SP_INQ: usize = 4;    // INQUIRY
+const SP_RDCAP: usize = 5;  // READ CAPACITY(10)
+const SP_PUB: usize = 6;    // geometry publish + the port-link/knobs witnesses
+const N_SPACE: usize = 7;
+const SPACE_TAGS: [&str; N_SPACE] =
+    ["wait", "setcfg", "tur", "sense", "inq", "rdcap", "pub"];
+
+/// Per-class cycle accumulators for the storage bring-up (`[]` partition).
+static SPACE_CY: [AtomicU64; N_SPACE] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+/// Per-class entry counts, so a zero class is readable as "never ran" vs "ran and cost nothing".
+static SPACE_N: [AtomicU32; N_SPACE] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+];
+/// `now_cycles()` at the moment `storage_pending_bringup` was armed — the start of `wait` AND of
+/// `total`. Zero means the bring-up was reached without ever being armed.
+static SPACE_ARMED_AT: AtomicU64 = AtomicU64::new(0);
+/// Cycles `drain_ftdi` spent flushing the console ring WHILE a storage bring-up was pending, i.e.
+/// exactly the part of `wait` the console owns. Charged nowhere else, so it cannot absorb the
+/// ladder's other hooks.
+static SPACE_FTDI_CY: AtomicU64 = AtomicU64::new(0);
+/// Bulk-OUT transfers that flush cost, so `ftdi=` can be read against the ≤512 B chunking.
+static SPACE_FTDI_N: AtomicU32 = AtomicU32::new(0);
+/// True only between the start and the end of the SCSI bring-up. Gates the `{}` stage view so it
+/// describes this chain rather than the boot-long BOT totals.
+static SPACE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// `{}` — the OVERLAPPING per-stage cut of the same milliseconds. Never add these to the `[]` sum.
+static SPACE_CBW_CY: AtomicU64 = AtomicU64::new(0);
+static SPACE_CBW_N: AtomicU32 = AtomicU32::new(0);
+static SPACE_DATA_CY: AtomicU64 = AtomicU64::new(0);
+static SPACE_DATA_N: AtomicU32 = AtomicU32::new(0);
+static SPACE_CSW_CY: AtomicU64 = AtomicU64::new(0);
+static SPACE_CSW_N: AtomicU32 = AtomicU32::new(0);
+/// The single longest awaited stage of this bring-up, and which stage it was — the one reading that
+/// separates "the device held one answer" from "the driver made many calls".
+static SPACE_PEAK_CY: AtomicU64 = AtomicU64::new(0);
+static SPACE_PEAK_STAGE: AtomicU32 = AtomicU32::new(0);
+
+/// Close a span opened at `t0` into SPACE class `class`.
+#[inline]
+fn space_add(class: usize, t0: u64) {
+    SPACE_CY[class].fetch_add(
+        crate::arch::now_cycles().wrapping_sub(t0), Ordering::Relaxed);
+    SPACE_N[class].fetch_add(1, Ordering::Relaxed);
+}
 
 // --- MULTIBLK: M2 shape instrumentation ---
 //
@@ -2683,6 +2915,11 @@ impl XhciController {
                                     // synchronous BOT pump can run without re-entrancy).
                                     self.storage_slot = slot_id as u8;
                                     self.storage_pending_bringup = true;
+                                    // SPACE: the arm instant — the start of `wait` and of `total`.
+                                    // Stamped HERE and not on entry to `service_storage` because
+                                    // the gap between the two is precisely what this instrument
+                                    // exists to price.
+                                    SPACE_ARMED_AT.store(crate::arch::now_cycles(), Ordering::Relaxed);
                                     self.storage_note = "endpoints configured; SCSI bring-up pending";
                                     // Storage setup is done; move on to the next connected port.
                                     self.start_next_port();
@@ -3208,29 +3445,41 @@ impl XhciController {
                                         let vid = (desc_data[8] as u16) | ((desc_data[9] as u16) << 8);
                                     let pid = (desc_data[10] as u16) | ((desc_data[11] as u16) << 8);
 
-                                    serial_println!(">>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<");
-                                    serial_println!(">>> [CONTACT ESTABLISHED] SLOT {}", slot_id);
-                                    serial_println!(">>> VENDOR ID : [{:04x}]", vid);
-                                    serial_println!(">>> PRODUCT ID: [{:04x}]", pid);
-
-                                    // U2.5: persist idVendor/idProduct on the slot — but ONLY from a
-                                    // DEVICE descriptor (bDescriptorType 0x01). This same block also
-                                    // handles config-descriptor events, where desc_data[8..12] are
-                                    // interface/endpoint bytes, not vid/pid; guarding here keeps the
-                                    // FTDI's real 0403:6001 from being clobbered. The FT232's
-                                    // vendor-specific interface later keys on these to identify itself.
+                                    // U2.5: idVendor/idProduct are real ONLY in a DEVICE descriptor
+                                    // (bDescriptorType 0x01). This same block also handles
+                                    // config-descriptor events, where desc_data[8..12] are
+                                    // bMaxPower/interface bytes — a prior arc guarded the slot
+                                    // STATE here (keeping the FTDI's real 0403:6001 from being
+                                    // clobbered) but left the BANNER unguarded, so every device
+                                    // printed one true VID:PID and one fabricated pair per boot
+                                    // (the tell: "PID" 0004 with "VID" high byte 09 = a config
+                                    // descriptor misread; convicted byte-by-byte in bootpace §8g's
+                                    // follow-up). The banner and the class-code line now sit under
+                                    // the same guard: a config event prints its own honest line.
                                     if desc_data[1] == 0x01 {
+                                        serial_println!(">>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<");
+                                        serial_println!(">>> [CONTACT ESTABLISHED] SLOT {}", slot_id);
+                                        serial_println!(">>> VENDOR ID : [{:04x}]", vid);
+                                        serial_println!(">>> PRODUCT ID: [{:04x}]", pid);
                                         self.slots[slot_id as usize].vid = vid;
                                         self.slots[slot_id as usize].pid = pid;
+                                    } else {
+                                        serial_println!(
+                                            "xHCI: descriptor event slot {} type={:#04x} (not a device descriptor; no VID/PID banner)",
+                                            slot_id, desc_data[1]
+                                        );
                                     }
 
-                                    // UNA-22-HAUL: Inspect Class Code
+                                    // UNA-22-HAUL: Inspect Class Code — device-descriptor fields;
+                                    // meaningless on a config event, guarded for the same reason.
                                     let class_code = desc_data[4];
                                     let subclass = desc_data[5];
                                     let protocol = desc_data[6];
 
-                                    serial_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}",
-                                        class_code, subclass, protocol);
+                                    if desc_data[1] == 0x01 {
+                                        serial_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}",
+                                            class_code, subclass, protocol);
+                                    }
 
                                     if class_code == 0x08 { // 0x08 = Mass Storage (device-level)
                                         serial_println!("xHCI: >>> CARGO DETECTED (MASS STORAGE) <<<");
@@ -3480,24 +3729,37 @@ impl XhciController {
 
                                             let rel = slot.mouse_is_relative;
                                             let buttons = data_data[0];
-                                            let (last_a, last_b) = if rel {
+                                            // DRAGGLIDE — the motion is DECIDED here and PUSHED
+                                            // below, paired with this report's button edge, so the
+                                            // reorder that puts a release edge ahead of its own
+                                            // lift is told which lift is its own rather than
+                                            // inferring it from arrival order. On the rMBP this
+                                            // controller and the EHCI trackpad produce
+                                            // concurrently, and a foreign motion landing between
+                                            // two separate pushes would aim the swap at the wrong
+                                            // entry — the ~1px hop, back, reporting success.
+                                            let (last_a, last_b, motion) = if rel {
                                                 // HID BOOT mouse: byte0 = buttons, byte1 = dx:i8, byte2 = dy:i8
                                                 // (byte3 = wheel, ignored). Signed relative deltas — sign-extend
                                                 // i8 -> i32 and emit only on actual motion.
                                                 let dx = data_data[1] as i8 as i32;
                                                 let dy = data_data[2] as i8 as i32;
-                                                if dx != 0 || dy != 0 {
-                                                    crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
-                                                }
-                                                (dx, dy)
+                                                let m = if dx != 0 || dy != 0 {
+                                                    Some(crate::pal::Event::Mouse { x: dx, y: dy })
+                                                } else {
+                                                    None
+                                                };
+                                                (dx, dy, m)
                                             } else {
                                                 // usb-tablet / absolute pointer: byte1-2 = X, byte3-4 = Y (0..32767).
                                                 let x = (data_data[1] as u16) | ((data_data[2] as u16) << 8);
                                                 let y = (data_data[3] as u16) | ((data_data[4] as u16) << 8);
-                                                if x != 0 || y != 0 {
-                                                    crate::pal::push_event(crate::pal::Event::MouseAbsolute { x: x as i32, y: y as i32 });
-                                                }
-                                                (x as i32, y as i32)
+                                                let m = if x != 0 || y != 0 {
+                                                    Some(crate::pal::Event::MouseAbsolute { x: x as i32, y: y as i32 })
+                                                } else {
+                                                    None
+                                                };
+                                                (x as i32, y as i32, m)
                                             };
                                             // `slot` (the shared borrow) is no longer read past here;
                                             // the &mut self accesses below are the count bump + re-arm.
@@ -3515,11 +3777,22 @@ impl XhciController {
                                             // the same correct release edge (a fix, not a risk —
                                             // EHCI keeps its own emit).
                                             let prev_btn = self.slots[slot_id as usize].mouse_prev_buttons;
-                                            if buttons != prev_btn {
-                                                #[cfg(feature = "usbdebug")]
+                                            let edge = buttons != prev_btn;
+                                            #[cfg(feature = "usbdebug")]
+                                            if edge {
                                                 serial_println!("[hidkeys] button {:#04x} -> {:#04x} slot={}", prev_btn, buttons, slot_id);
-                                                crate::pal::push_event(crate::pal::Event::Button(buttons));
                                             }
+                                            // DRAGGLIDE — ONE report, ONE push (see the motion
+                                            // decode above). Unconditional on there being an edge:
+                                            // a motion-only report still goes through this seam.
+                                            crate::pal::push_pointer_report(
+                                                motion,
+                                                if edge {
+                                                    Some(crate::pal::Event::Button(buttons))
+                                                } else {
+                                                    None
+                                                },
+                                            );
                                             self.slots[slot_id as usize].mouse_prev_buttons = buttons;
 
                                             // UI1-MOUSE M1: bounded serial mouse-witness — first report
@@ -3596,7 +3869,6 @@ impl XhciController {
                                             // Byte 1: Reserved
                                             // Bytes 2-7: Key codes (up to 6 simultaneous keys)
                                             let modifiers = report[0];
-                                            let shift = (modifiers & 0x22) != 0; // L-Shift (bit 1) or R-Shift (bit 5)
                                             // HID-LED: current caps-lock LED state feeds the ascii case
                                             // logic so the lit LED and the typed case agree. Caps only
                                             // inverts case for the alphabetic keycodes (0x04..=0x1D =
@@ -3621,15 +3893,13 @@ impl XhciController {
                                                 if keycode == 0 { continue; } // No key
                                                 if keycode == 1 { continue; } // ErrorRollOver
 
-                                                if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
-                                                    let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
-                                                    let is_letter = (0x04..=0x1D).contains(&keycode);
-                                                    let eff_shift = shift ^ (caps & is_letter);
-                                                    let ascii = if eff_shift { shifted } else { unshifted };
-                                                    if ascii != 0 {
-                                                        serial_println!("xHCI: KEY: '{}' (scancode {:#x})", ascii as char, keycode);
-                                                        crate::pal::push_event(crate::pal::Event::Key(ascii));
-                                                    }
+                                                // ALLKEYS: one shared fold — table lookup, Ctrl/Alt/GUI
+                                                // policy, and shift^caps — so this decoder and EHCI's
+                                                // cannot disagree about what a key types.
+                                                let ascii = hid_key_ascii(keycode, modifiers, caps);
+                                                if ascii != 0 {
+                                                    serial_println!("xHCI: KEY: '{}' (scancode {:#x})", ascii as char, keycode);
+                                                    crate::pal::push_event(crate::pal::Event::Key(ascii));
                                                 }
                                             }
 
@@ -3646,16 +3916,11 @@ impl XhciController {
                                                 for i in 2..8 {
                                                     let keycode = report[i];
                                                     if keycode == 0 || keycode == 1 { continue; }
-                                                    if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
-                                                        let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
-                                                        let is_letter = (0x04..=0x1D).contains(&keycode);
-                                                        let eff_shift = shift ^ (caps & is_letter);
-                                                        let ascii = if eff_shift { shifted } else { unshifted };
-                                                        if ascii != 0 {
-                                                            held[hn] = ascii;
-                                                            hn += 1;
-                                                            if !prev_keys.contains(&keycode) { newest_press = ascii; }
-                                                        }
+                                                    let ascii = hid_key_ascii(keycode, modifiers, caps);
+                                                    if ascii != 0 {
+                                                        held[hn] = ascii;
+                                                        hn += 1;
+                                                        if !prev_keys.contains(&keycode) { newest_press = ascii; }
                                                     }
                                                 }
                                                 crate::pal::typematic_note_report(newest_press, &held[..hn]);
@@ -3670,16 +3935,13 @@ impl XhciController {
                                             for &keycode in prev_keys.iter() {
                                                 if keycode == 0 || keycode == 1 { continue; }
                                                 if cur_keys.contains(&keycode) { continue; } // still held
-                                                if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
-                                                    let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
-                                                    let is_letter = (0x04..=0x1D).contains(&keycode);
-                                                    let eff_shift = shift ^ (caps & is_letter);
-                                                    let ascii = if eff_shift { shifted } else { unshifted };
-                                                    if ascii != 0 {
-                                                        #[cfg(feature = "usbdebug")]
-                                                        serial_println!("[hidkeys] keyup '{}' (scancode {:#x}) slot={}", ascii as char, keycode, slot_id);
-                                                        crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
-                                                    }
+                                                // ALLKEYS: releases use the LIBERAL fold — a
+                                                // suppressed release strands a held key forever.
+                                                let ascii = hid_key_release_ascii(keycode, modifiers, caps);
+                                                if ascii != 0 {
+                                                    #[cfg(feature = "usbdebug")]
+                                                    serial_println!("[hidkeys] keyup '{}' (scancode {:#x}) slot={}", ascii as char, keycode, slot_id);
+                                                    crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
                                                 }
                                             }
 
@@ -3692,7 +3954,9 @@ impl XhciController {
                                             // never lighting; Num Lock (0x53, bit0) and Scroll Lock (0x47,
                                             // bit2) are toggled the same way for LED/state agreement.
                                             let mut leds_changed = false;
-                                            for &(usage, bit) in &[(0x39u8, 0x02u8), (0x53u8, 0x01u8), (0x47u8, 0x04u8)] {
+                                            // ALLKEYS: the (usage, LED bit) pairs now live beside the
+                                            // scancode table so the EHCI toggle loop uses the same three.
+                                            for &(usage, bit) in HID_LOCK_KEYS.iter() {
                                                 let pressed_now = cur_keys.contains(&usage);
                                                 let pressed_before = prev_keys.contains(&usage);
                                                 if pressed_now && !pressed_before {
@@ -8997,6 +9261,27 @@ impl XhciController {
     fn note_bot_pump(start: u64, budget: u64, route: u32, depth: u8, slot: u8) {
         let used = crate::arch::now_cycles().wrapping_sub(start);
         BOT_PUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+        // SPACE `{}` — the overlapping per-stage cut, collected ONLY while the bring-up chain is
+        // running. `BOT_LAST_STAGE` is stamped by `bot_transfer_once` immediately before it queues
+        // each stage's TRB, so it names the stage this wait belongs to. The peak carries its stage
+        // id with it: "one 1.0 s CSW" and "a thousand 1 ms CSWs" produce the same `csw=` total and
+        // demand opposite fixes, and the peak is the field that separates them.
+        if SPACE_ACTIVE.load(Ordering::Relaxed) {
+            let stage = BOT_LAST_STAGE.load(Ordering::Relaxed);
+            match stage {
+                3 => { SPACE_CBW_CY.fetch_add(used, Ordering::Relaxed);
+                       SPACE_CBW_N.fetch_add(1, Ordering::Relaxed); }
+                1 => { SPACE_DATA_CY.fetch_add(used, Ordering::Relaxed);
+                       SPACE_DATA_N.fetch_add(1, Ordering::Relaxed); }
+                2 => { SPACE_CSW_CY.fetch_add(used, Ordering::Relaxed);
+                       SPACE_CSW_N.fetch_add(1, Ordering::Relaxed); }
+                _ => {}
+            }
+            if used > SPACE_PEAK_CY.load(Ordering::Relaxed) {
+                SPACE_PEAK_CY.store(used, Ordering::Relaxed);
+                SPACE_PEAK_STAGE.store(stage, Ordering::Relaxed);
+            }
+        }
         // ONSET-2 (M2 witness 7): fold this wait into the log2-millisecond histogram.
         //
         // The capture carries only `sum`, `peak` and `n`, so it CANNOT answer whether the pace is
@@ -9223,7 +9508,10 @@ impl XhciController {
         // real silicon the endpoints stay inactive and every SCSI command fails (device never becomes
         // a block device). The HID and hub paths already SET_CONFIGURATION; storage did not.
         self.storage_note = "SET_CONFIGURATION";
-        match self.sync_control(slot, 0x00, 0x09, 1, 0, 0, 0, false) {
+        let t_setcfg = crate::arch::now_cycles();
+        let setcfg = self.sync_control(slot, 0x00, 0x09, 1, 0, 0, 0, false);
+        space_add(SP_SETCFG, t_setcfg);
+        match setcfg {
             Ok(1) => serial_println!("xHCI: storage SET_CONFIGURATION(1) OK (slot {})", slot),
             other => {
                 serial_println!("xHCI: storage SET_CONFIGURATION unexpected {:?} (slot {})", other, slot);
@@ -9240,16 +9528,30 @@ impl XhciController {
         // the new handler owns the runtime path only.
         BOT_SENSE_ACTIVE.store(true, Ordering::Relaxed);
         for attempt in 0..16 {
-            match self.scsi_test_unit_ready(slot) {
+            // SPACE: one span per ATTEMPT, so `tur=`'s `n=` is the attempt count. That is the field
+            // which decides how the total should be read: `tur=1016ms(n=1)` is a device holding one
+            // answer, `tur=1016ms(n=16)` is this loop spinning on a stick that never came ready, and
+            // only the first of those is a floor rather than a bug.
+            let t_tur = crate::arch::now_cycles();
+            let tur = self.scsi_test_unit_ready(slot);
+            space_add(SP_TUR, t_tur);
+            match tur {
                 Ok(CswStatus::Passed) => break,
-                Ok(_) => { let _ = self.scsi_request_sense(slot); }
+                Ok(_) => {
+                    let t_sense = crate::arch::now_cycles();
+                    let _ = self.scsi_request_sense(slot);
+                    space_add(SP_SENSE, t_sense);
+                }
                 Err(e) => { serial_println!("xHCI: TUR error {:?} (attempt {})", e, attempt); }
             }
         }
         BOT_SENSE_ACTIVE.store(false, Ordering::Relaxed);
 
         self.storage_note = "INQUIRY";
-        let (vendor, product) = self.scsi_inquiry(slot)?;
+        let t_inq = crate::arch::now_cycles();
+        let inq = self.scsi_inquiry(slot);
+        space_add(SP_INQ, t_inq);
+        let (vendor, product) = inq?;
         self.storage_note = "READ CAPACITY";
         // [piusb40] witness 2 — the post-wedge pipe control. Witness 1 says whether the reply bytes
         // reached DRAM; it says nothing about whether the bulk pipes are still alive afterwards,
@@ -9261,7 +9563,14 @@ impl XhciController {
         // Run ONCE, and never retried: the escalation ladder would reset the pipes, and a recovered
         // transport is exactly the state the necropsy line is trying to photograph. This costs the
         // failure path one round-trip and the success path nothing at all.
-        let (block_size, last_lba) = match self.scsi_read_capacity10(slot) {
+        //
+        // SPACE (merge): the timing brackets the READ CAPACITY transaction only — taken before
+        // the error arm below, so the failure path's control probe / port-cycle never inflates
+        // SP_RDCAP (same semantics as the pre-merge `space_add` + `?` ordering).
+        let t_rdcap = crate::arch::now_cycles();
+        let rdcap = self.scsi_read_capacity10(slot);
+        space_add(SP_RDCAP, t_rdcap);
+        let (block_size, last_lba) = match rdcap {
             Ok(v) => v,
             Err(e) => {
                 let ctl = self.scsi_inquiry(slot);
@@ -9310,6 +9619,8 @@ impl XhciController {
             }
         };
         let num_blocks = last_lba as u64 + 1;
+        // SPACE: everything from here to the end of the bring-up is the publish/witness tail.
+        let t_pub = crate::arch::now_cycles();
 
         let vendor_s = core::str::from_utf8(&vendor).unwrap_or("?").trim_end();
         let product_s = core::str::from_utf8(&product).unwrap_or("?").trim_end();
@@ -9355,7 +9666,54 @@ impl XhciController {
         serial_println!(
             ":: BOT: knobs ring_trbs={} {} {} {} {} result=KNOBS ::",
             BOT_RING_TRBS, BOT_RING_KNOB_TAG, BOT_CBWIOC_KNOB_TAG, BOT_ORDER_TAG, BOT_PUMP_TAG);
+        space_add(SP_PUB, t_pub);
         Ok(())
+    }
+
+    /// SPACE: print the one-line split of the storage bring-up. Called on BOTH exits of
+    /// `bring_up_storage` (see `service_storage`), so a chain that died still reports what it paid.
+    ///
+    /// `total=` is the arm→now span measured by this instrument alone; `sum=` adds the `[]` classes.
+    /// The two are printed side by side deliberately: they are independent readings of the same
+    /// interval, and a disagreement larger than this line's own print cost means one of them is
+    /// lying. `resid=` is `total - sum`, i.e. time inside the bring-up that no class claimed — a
+    /// number, never a silent absence.
+    fn space_report(ok: bool) {
+        let per_ms = Self::cycles_per_ms().max(1);
+        // Cycles → ms with the SAME helper the waits themselves use. `cycles_per_ms` falls back to a
+        // nominal rate when the timebase is uncalibrated, so this can be wrong — but it is then
+        // wrong in step with every settle and budget in this driver, which keeps the ratios honest.
+        let ms = |cy: u64| cy / per_ms;
+        let armed = SPACE_ARMED_AT.load(Ordering::Relaxed);
+        let total = if armed != 0 {
+            ms(crate::arch::now_cycles().wrapping_sub(armed))
+        } else {
+            0
+        };
+        let mut sum = 0u64;
+        for c in 0..N_SPACE {
+            sum += ms(SPACE_CY[c].load(Ordering::Relaxed));
+        }
+        let peak_stage = match SPACE_PEAK_STAGE.load(Ordering::Relaxed) {
+            1 => "data", 2 => "csw", 3 => "cbw", _ => "none",
+        };
+        serial_println!(
+            ":: SPACE: [{}={}ms(n={}) {}={}ms(n={}) {}={}ms(n={}) {}={}ms(n={}) {}={}ms(n={}) {}={}ms(n={}) {}={}ms(n={}) resid={}ms] {{cbw={}ms(n={}) data={}ms(n={}) csw={}ms(n={}) peak={}ms@{}}} ftdi={}ms(n={}) total={}ms sum={}ms per_ms={} result={} ::",
+            SPACE_TAGS[SP_WAIT], ms(SPACE_CY[SP_WAIT].load(Ordering::Relaxed)), SPACE_N[SP_WAIT].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_SETCFG], ms(SPACE_CY[SP_SETCFG].load(Ordering::Relaxed)), SPACE_N[SP_SETCFG].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_TUR], ms(SPACE_CY[SP_TUR].load(Ordering::Relaxed)), SPACE_N[SP_TUR].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_SENSE], ms(SPACE_CY[SP_SENSE].load(Ordering::Relaxed)), SPACE_N[SP_SENSE].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_INQ], ms(SPACE_CY[SP_INQ].load(Ordering::Relaxed)), SPACE_N[SP_INQ].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_RDCAP], ms(SPACE_CY[SP_RDCAP].load(Ordering::Relaxed)), SPACE_N[SP_RDCAP].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_PUB], ms(SPACE_CY[SP_PUB].load(Ordering::Relaxed)), SPACE_N[SP_PUB].load(Ordering::Relaxed),
+            total.saturating_sub(sum),
+            ms(SPACE_CBW_CY.load(Ordering::Relaxed)), SPACE_CBW_N.load(Ordering::Relaxed),
+            ms(SPACE_DATA_CY.load(Ordering::Relaxed)), SPACE_DATA_N.load(Ordering::Relaxed),
+            ms(SPACE_CSW_CY.load(Ordering::Relaxed)), SPACE_CSW_N.load(Ordering::Relaxed),
+            ms(SPACE_PEAK_CY.load(Ordering::Relaxed)), peak_stage,
+            ms(SPACE_FTDI_CY.load(Ordering::Relaxed)), SPACE_FTDI_N.load(Ordering::Relaxed),
+            total, sum, per_ms,
+            if ok { "SPACE" } else { "SPACE-FAIL" });
     }
 
     /// Main-loop hook: once storage finishes configuring, run the SCSI bring-up (in a
@@ -9478,18 +9836,40 @@ impl XhciController {
         self.storage_pending_bringup = false;
         if self.storage_slot == 0 { return; }
 
+        // SPACE: close `wait` — the ladder gap between this bring-up being ARMED (at the
+        // Configure-Endpoint completion, inside `poll_events`) and this body being reached. It is
+        // closed BEFORE the `stor-bringup` stamp below because the stamp is what currently absorbs
+        // it: BPACE measures `stor-bringup d=` from `enum:p5-done`, so the ledger charges storage
+        // for a gap storage did not spend. `wait=` and `ftdi=` together say who did.
+        if SPACE_ARMED_AT.load(Ordering::Relaxed) != 0 {
+            space_add(SP_WAIT, SPACE_ARMED_AT.load(Ordering::Relaxed));
+        }
         serial_println!("xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===");
         // BPACE: the SCSI bring-up chain begins. `d=` between this and `stor-ready` is the whole
         // TUR/INQUIRY/READ-CAPACITY negotiation — every one of whose stages is an awaited BOT
         // transaction, i.e. the phase the pump quantisation of §17.4 taxes hardest.
         crate::bootpace::record("stor-bringup");
-        match self.bring_up_storage() {
+        // SPACE: the `{}` per-stage view is scoped to exactly this chain. Armed here and disarmed on
+        // BOTH exits, so it can never be read against the boot-long BOT totals.
+        SPACE_ACTIVE.store(true, Ordering::Relaxed);
+        let brought_up = self.bring_up_storage();
+        SPACE_ACTIVE.store(false, Ordering::Relaxed);
+        match brought_up {
             Ok(()) => serial_println!("xHCI: storage ready."),
-            Err(e) => { serial_println!("xHCI: storage bring-up failed: {:?}", e); return; }
+            Err(e) => {
+                serial_println!("xHCI: storage bring-up failed: {:?}", e);
+                Self::space_report(false);
+                return;
+            }
         }
         // BPACE: reached only on SUCCESS — a failed bring-up returns above, so a ledger carrying
         // `stor-bringup` without `stor-ready` says the storage chain died rather than ran slowly.
         crate::bootpace::record("stor-ready");
+        // SPACE: printed AFTER the `stor-ready` stamp on purpose. This line's own serial cost would
+        // otherwise land inside `stor-ready d=`, and that number has to stay byte-comparable with
+        // every capture taken before this instrument existed — an instrument that moves the figure
+        // it reports on is the one failure mode this whole ledger is built to avoid.
+        Self::space_report(true);
 
         // PIUSB-35: decisive DMA-address witness. P45 refuted the cache theory (the LBA0 read still
         // returns all-zero with a Passed/residue=0 CSW even with PIUSB-34's clean-before-doorbell +
@@ -9967,7 +10347,22 @@ impl XhciController {
             if n == 0 {
                 break; // ring drained
             }
-            match self.ftdi_tx_stage(slot, out_dci, data_phys, n as u32) {
+            // SPACE: charge this awaited bulk-OUT to the console ONLY while a storage bring-up is
+            // already armed and waiting behind it. That is the exact overlap `wait=` is made of, and
+            // scoping it this way keeps the counter from absorbing the console's steady-state
+            // traffic — which is not on anyone's critical path and must not look as if it were.
+            let ftdi_t0 = if self.storage_pending_bringup {
+                Some(crate::arch::now_cycles())
+            } else {
+                None
+            };
+            let tx = self.ftdi_tx_stage(slot, out_dci, data_phys, n as u32);
+            if let Some(t0) = ftdi_t0 {
+                SPACE_FTDI_CY.fetch_add(
+                    crate::arch::now_cycles().wrapping_sub(t0), Ordering::Relaxed);
+                SPACE_FTDI_N.fetch_add(1, Ordering::Relaxed);
+            }
+            match tx {
                 Ok(1) | Ok(13) => self.ftdi_tx_total += n as u64,
                 Ok(_) => {
                     self.disable_ftdi_tx("bad completion code");
@@ -11309,6 +11704,9 @@ impl XhciController {
                 // context, next hook) — identical hand-off to the root path's async completion.
                 self.storage_slot = slot_id;
                 self.storage_pending_bringup = true;
+                // SPACE: the arm instant, same as the root path's — a hubbed stick pays the same
+                // ladder gap and must be measured by the same clock.
+                SPACE_ARMED_AT.store(crate::arch::now_cycles(), Ordering::Relaxed);
                 self.storage_note = "hub-downstream endpoints configured; SCSI bring-up pending";
                 serial_println!("xHCI: Endpoints Configured (Slot {}). Storage ready.", slot_id);
             }

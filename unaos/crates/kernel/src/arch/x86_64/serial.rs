@@ -39,7 +39,22 @@ lazy_static! {
 /// a stream of bogus `[serial] dropped N lines` markers about output that was never lost — fbcon
 /// mirrors every one of those lines to the framebuffer regardless. On a serial-less machine the UART
 /// path stays exactly what it always was: a no-op.
+///
+/// SERWIT-1D: it is also the CONFIGURATION the conservation law is asserted against. A line that this
+/// machine's 16550 never received because there is no 16550 is neither emitted nor lost, and calling it
+/// either one makes the ledger lie; see [`uart_absent`] and `serial_ring::DECLINED`.
 static UART_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// SERWIT-1D — has this machine been proven to have NO 16550 at 0x3F8?
+///
+/// `false` while the answer is still unknown (before the first `_print` resolves the lazy `SERIAL1`),
+/// which is the conservative reading: "unknown" must not license the weaker of the two configuration
+/// laws. `_print` runs long before any fixture, so by the time [`crate::serial_ring::serwit_verdict`]
+/// asks, the answer is settled and stays settled — `SERIAL1` is initialised once and never re-probed.
+#[inline]
+pub fn uart_absent() -> bool {
+    UART_STATE.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
 
 #[doc(hidden)]
 pub fn _print(args: ::core::fmt::Arguments) {
@@ -73,48 +88,100 @@ pub fn _print(args: ::core::fmt::Arguments) {
     // `lock`) is still the rule — a print from an IRQ-masked or fault context must not be able to
     // block on a console another core owns — but its failure branch is no longer a silent `drop`,
     // which is what let arbitrary verdict lines evaporate under load. See `crate::serial_ring`.
+    //
+    // SERWIT-1B: the one branch that was STILL lossy is a full ring, and `./arroyo test` reached it on
+    // every headless x86 run once that leg started reading its own log — `dropped=19..36` of 125 lines,
+    // tracking host load, with the conservation law otherwise perfect. It is a rate problem, not a
+    // size problem: a producer formats a line into a slot with one memcpy while the consumer pushes it
+    // through the 16550 a byte at a time, so five contending cores overflow ANY depth. The loop below
+    // is the missing backpressure. On a full ring the producer goes round again instead of discarding,
+    // and each turn is an attempt to make progress ITSELF — re-try the UART, and winning it drains the
+    // whole ring and writes this line intact — so the wait cannot livelock at the tail of a burst the
+    // way a pure wait-for-room would. It is HARD-BOUNDED for the same reason every other wait in this
+    // file is: a print arriving from an exception handler that interrupted THIS core inside its own
+    // locked region would otherwise spin on a holder that can never release. Past the bound the line
+    // is dropped exactly as before — counted, announced by the next drain, and still a SERWIT-1 FAIL.
+    // When the ring is not full the first turn IS the old code path, unchanged, and `spins` stays 0.
     interrupts::without_interrupts(|| {
-        if let Some(mut guard) = SERIAL1.try_lock() {
-            UART_STATE.store(if guard.is_some() { 1 } else { 2 }, Ordering::Relaxed);
-            if let Some(uart) = guard.as_mut() {
-                // Emit anyone else's deferred lines BEFORE our own, so deferral never reorders the
-                // wire (a line staged at t0 precedes a line written directly at t1 > t0), and so the
-                // ring is kept shallow — a ring that is drained on every uncontended print is a ring
-                // that essentially never reaches the full-and-must-drop state.
-                {
-                    let mut sink = |s: &str| {
-                        #[cfg(feature = "logts")]
-                        {
-                            let _ = crate::logts::PrefixWriter { inner: uart }.write_str(s);
-                        }
-                        #[cfg(not(feature = "logts"))]
-                        {
-                            let _ = uart.write_str(s);
-                        }
-                    };
-                    crate::serial_ring::drain(&mut sink);
+        let mut spins: u32 = 0;
+        loop {
+            if let Some(mut guard) = SERIAL1.try_lock() {
+                UART_STATE.store(if guard.is_some() { 1 } else { 2 }, Ordering::Relaxed);
+                if let Some(uart) = guard.as_mut() {
+                    // Emit anyone else's deferred lines BEFORE our own, so deferral never reorders the
+                    // wire (a line staged at t0 precedes a line written directly at t1 > t0), and so the
+                    // ring is kept shallow — a ring that is drained on every uncontended print is a ring
+                    // that essentially never reaches the full-and-must-drop state.
+                    {
+                        let mut sink = |s: &str| {
+                            #[cfg(feature = "logts")]
+                            {
+                                let _ = crate::logts::PrefixWriter { inner: uart }.write_str(s);
+                            }
+                            #[cfg(not(feature = "logts"))]
+                            {
+                                let _ = uart.write_str(s);
+                            }
+                        };
+                        crate::serial_ring::drain(&mut sink);
+                    }
+                    // CLOCK-2: with `logts`, prefix each serial LINE with a compact timestamp (monotonic
+                    // ms → UTC after a civil anchor exists). CLOCK-2b: the FTDI capture ring and the
+                    // flight recorder prefix their own streams too (see the taps below); fbcon and the
+                    // tste selftest ring still receive the raw `args`. OFF => identical.
+                    #[cfg(feature = "logts")]
+                    {
+                        let _ = crate::logts::PrefixWriter { inner: uart }.write_fmt(args);
+                    }
+                    #[cfg(not(feature = "logts"))]
+                    {
+                        let _ = uart.write_fmt(args);
+                    }
+                    crate::serial_ring::note_emitted();
+                } else {
+                    // No 16550 on this machine. Nothing was written, nothing was lost that fbcon and the
+                    // FTDI mirror below do not already carry — and there is no reason to keep a backlog
+                    // nobody will ever drain.
+                    //
+                    // SERWIT-1D: this outcome is DECLINED, and it is neither of the other two. It is not
+                    // `emitted` — no byte reached a 16550, because there is none — and calling it emitted
+                    // is the lie that `drain(|_| {})` used to tell, since `drain` charges `EMITTED` for
+                    // every line it consumes and this sink is `|_| {}`. Nor is it `dropped`: the line is
+                    // on the wire via the FTDI mirror, whose own conservation law is asserted separately
+                    // by SERWIT-2's `ftdi` tap. So it gets its own terminal state and its own counter.
+                    crate::serial_ring::note_declined();
+                    crate::serial_ring::discard_staged();
                 }
-                // CLOCK-2: with `logts`, prefix each serial LINE with a compact timestamp (monotonic
-                // ms → UTC after a civil anchor exists). Only the UART byte-stream is touched; the
-                // fbcon + capture-ring mirrors below still receive the raw `args`. OFF => identical.
-                #[cfg(feature = "logts")]
-                {
-                    let _ = crate::logts::PrefixWriter { inner: uart }.write_fmt(args);
-                }
-                #[cfg(not(feature = "logts"))]
-                {
-                    let _ = uart.write_fmt(args);
-                }
-                crate::serial_ring::note_emitted();
+                break;
+            } else if UART_STATE.load(Ordering::Relaxed) == 2 {
+                // SERWIT-1D: contended AND there is no 16550 — the branch that had no counter at all.
+                // Staging here would fill a ring nobody drains, so the line correctly goes nowhere on this
+                // transport; what was missing is the accounting for it. Un-counted, it left `SUBMITTED`
+                // with no matching term, which is precisely the shape of hole this whole module exists to
+                // make impossible. Checked BEFORE the stage attempt so this machine never back-pressures
+                // against a ring that has no consumer.
+                crate::serial_ring::note_declined();
+                break;
+            } else if crate::serial_ring::try_stage(args) {
+                // Contended, and the ring had room. Deferred rather than dropped; the next holder emits it
+                // intact and in order. This is the wait-free path and the overwhelmingly common one.
+                break;
+            } else if spins >= crate::serial_ring::BACKPRESSURE_SPINS {
+                // SERWIT-1B: the bound expired — a UART holder that has not released in a million turns is
+                // wedged or is this very core, and no amount of further waiting can help. Drop LOUDLY:
+                // counted in `DROPPED`, announced by the next drain as `[serial] dropped N lines`, and a
+                // SERWIT-1 FAIL. The law does not bend for the fix that was supposed to satisfy it.
+                crate::serial_ring::note_dropped();
+                break;
             } else {
-                // No 16550 on this machine. Nothing was written, nothing was lost that fbcon does not
-                // already carry — and there is no reason to keep a backlog nobody will ever drain.
-                crate::serial_ring::drain(|_| {});
+                // The ring is FULL. Go round: the next turn re-tries the UART (winning it drains all of it)
+                // and then the stage. `spin_loop` is a hint only — it takes nothing and yields nothing.
+                spins += 1;
+                core::hint::spin_loop();
             }
-        } else if UART_STATE.load(Ordering::Relaxed) != 2 {
-            // Contended. Defer rather than drop; if the ring is full the loss is COUNTED and the next
-            // drain announces it on the wire as `[serial] dropped N lines`.
-            crate::serial_ring::stage(args);
+        }
+        if spins > 0 {
+            crate::serial_ring::note_stalled(spins);
         }
     });
     // Mirror to the framebuffer console so diagnostics/panics are visible on hardware that has
@@ -221,4 +288,40 @@ pub fn raw_write_str(s: &str) {
 #[inline(never)]
 pub fn wedge2_raw_byte(byte: u8) {
     raw_byte(byte);
+}
+
+/// PFWIRE self-test — feature `pfwire_selftest`, armed by `UNAOS_PFWIRE_SELFTEST=1`.
+///
+/// **BRICKS THE BOOT BY DESIGN.** It deliberately provokes a fatal CPL-0 page fault to prove the
+/// `#PF` handler puts its diagnostics on the wire, so it is compiled out by default and must NEVER
+/// ride boot media or the regression battery (both leave the knob unset). Called from `arch::init`
+/// with IF=0, after `init_idt()` (the handler is installed) and after `wxn_pdpt_sweep()` — the exact
+/// interrupt-masked, kernel-context window an M3b wild write would fault in.
+///
+/// It forces the CONTENDED case, the only one that discriminates the fix. An *uncontended* CPL-0 #PF
+/// prints its address fine with or without `enter_panic_mode` — the handler's `serial_println!` wins
+/// `SERIAL1.try_lock()` and drains normally — so it cannot tell the two apart. Here we take `SERIAL1`
+/// and leak the guard, then fault while holding it. WITHOUT the fix the handler's four lines lose the
+/// `try_lock`, `try_stage` into a ring nobody will drain (this core is about to `hlt` with IF=0), and
+/// the machine is silent on serial. WITH the fix `enter_panic_mode()` has already switched `_print`
+/// to `RawUart`'s lock-free synchronous writes, so `EXCEPTION: PAGE FAULT` / `Accessed Address:` reach
+/// the wire regardless of the leaked lock. The wild store targets a canonical higher-half address the
+/// identity-mapped kernel never maps, so it is a not-present #PF (not a #GP), independent of the WXN map.
+#[cfg(feature = "pfwire_selftest")]
+pub fn pfwire_selftest() -> ! {
+    // Announced on the FREE lock, BEFORE we take it — this line lands in both the armed build and the
+    // fix-reverted comparison build, so the A/B reads it as the "we reached the test" marker.
+    serial_println!("PFWIRE-SELFTEST: forcing a CONTENDED CPL-0 #PF (SERIAL1 held); boot will halt");
+    // Take SERIAL1 and abandon the guard so the fault handler's `try_lock` is guaranteed to lose.
+    if let Some(g) = SERIAL1.try_lock() {
+        core::mem::forget(g);
+    }
+    // Canonical higher-half address the identity-mapped kernel never maps -> a clean not-present #PF.
+    const PFWIRE_WILD: u64 = 0xFFFF_DEAD_0000_0000;
+    unsafe {
+        core::ptr::write_volatile(PFWIRE_WILD as *mut u64, 0xB00B);
+    }
+    // Unreachable: the store above faults into `page_fault_handler`, which never returns. Kept so the
+    // `-> !` signature holds even if the optimizer cannot prove the store faults.
+    crate::hlt_loop()
 }

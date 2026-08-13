@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "una-abi"
+version = "0.1.0"
+
+[[package]]
 name = "user-blob"
 version = "0.1.0"
+dependencies = [
+ "una-abi",
+]

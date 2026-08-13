@@ -255,14 +255,26 @@ pub fn mono_ticks() -> Option<u64> {
 }
 
 /// CLOCK-2 — the lock-free-safe snapshot the serial log-timestamp prefix (`crate::logts`) reads on
-/// every line. Returns `(monotonic milliseconds since boot, current UTC Unix seconds if anchored)`.
-/// The monotonic part is fully lock-free (one counter read); the civil part uses `try_lock` and
-/// yields `None` if the anchor lock is momentarily contended — so this NEVER blocks or panics and is
-/// safe from early boot, IRQ-masked handlers, and any core. A `None` civil part simply keeps the
-/// prefix in its monotonic form for that one line.
+/// every line. Returns `(monotonic milliseconds since KERNEL ENTRY, current UTC Unix seconds if
+/// anchored)`. The monotonic part is fully lock-free (two atomic loads + one counter read); the
+/// civil part uses `try_lock` and yields `None` if the anchor lock is momentarily contended — so
+/// this NEVER blocks or panics and is safe from early boot, IRQ-masked handlers, and any core. A
+/// `None` civil part simply keeps the prefix in its monotonic form for that one line.
+///
+/// The mono leg subtracts `bootpace::origin_cycles()` — the `entry` stamp — rather than serving the
+/// raw counter: on x86 the raw TSC counts from processor RESET, so an unsubtracted prefix reads as
+/// "ms since power-on, firmware included" and disagrees with every BPACE/GPACE `t=` by seconds. A
+/// line printed before the origin exists (or before calibration) gets `None`, which the prefix
+/// renders as an explicit unknown rather than a fabricated zero.
 #[cfg(feature = "logts")]
 pub fn logts_now() -> (Option<u64>, Option<u64>) {
-    let mono_ms = monotonic().map(|(ticks, freq)| ticks.saturating_mul(1000) / freq);
+    let mono_ms = monotonic().and_then(|(ticks, freq)| {
+        let origin = crate::bootpace::origin_cycles();
+        if origin == 0 {
+            return None; // no `entry` stamp yet — "since entry" does not exist to measure
+        }
+        Some(ticks.wrapping_sub(origin).saturating_mul(1000) / freq)
+    });
     let unix = match UNIX_ANCHOR.try_lock() {
         Some(guard) => guard.as_ref().map(|a| {
             let elapsed = match monotonic() {
@@ -276,8 +288,20 @@ pub fn logts_now() -> (Option<u64>, Option<u64>) {
     (mono_ms, unix)
 }
 
+/// Remove the civil anchor entirely — witness-only, and it exists for exactly one caller: the
+/// `sntp-x86` fixture, whose live `set_anchor` test used to leave a CANNED July-22 anchor installed
+/// for the rest of the boot. That lie was load-bearing twice over: every FAT timestamp after ~1 s
+/// of uptime carried the canned date, and every `logts` prefix flipped to 1-second civil form —
+/// which is what degraded the GR16 s73 kepler breakdown to whole seconds. A fixture must not leave
+/// global state it fabricated; this is its cleanup path, not a general API.
+#[cfg(feature = "witness")]
+pub fn witness_clear_anchor() {
+    *UNIX_ANCHOR.lock() = None;
+}
+
 /// Anchor the civil clock to `unix_secs` (UTC), pairing it with `mono_now` (a `mono_ticks()` reading
-/// captured at the same instant) and tagging it with `source`. The ONLY writer of `UNIX_ANCHOR`.
+/// captured at the same instant) and tagging it with `source`. The ONLY writer of `UNIX_ANCHOR`
+/// (the witness-gated [`witness_clear_anchor`] above removes, never writes).
 /// Re-anchoring simply replaces the anchor — a fresh sync or operator correction wins.
 pub fn set_anchor(unix_secs: u64, mono_now: u64, source: ClockSource) {
     *UNIX_ANCHOR.lock() = Some(UnixAnchor { base_unix: unix_secs, anchor_ticks: mono_now, source });
@@ -288,6 +312,29 @@ pub fn set_anchor(unix_secs: u64, mono_now: u64, source: ClockSource) {
 /// non-hanging (the arch counter is free-running); frozen at `base_unix` where no counter is available.
 pub fn unix_now() -> Option<u64> {
     let guard = UNIX_ANCHOR.lock();
+    let a = guard.as_ref()?;
+    let elapsed = match monotonic() {
+        Some((ticks, freq)) => ticks.wrapping_sub(a.anchor_ticks) / freq,
+        None => 0, // no invariant/calibrated counter: frozen at the anchored value
+    };
+    Some(a.base_unix.saturating_add(elapsed))
+}
+
+/// [`unix_now`] for a caller that must NEVER block — the never-spin-in-composite rule.
+///
+/// The video compositor's furniture strips (`video/strip.rs`) compose at the tail of every present
+/// and take every lock with `try_lock`, declining rather than spinning, so a contended pass repaints
+/// on the next one. A clock read on that path must obey the same rule: `unix_now`'s `UNIX_ANCHOR.lock`
+/// would spin against a concurrent `set_anchor` (an SNTP sync or a `setdate`), and a spin inside a
+/// composite is exactly what that subsystem forbids.
+///
+/// Returns `None` for BOTH "never anchored" and "the anchor lock was momentarily contended", which
+/// the one caller (the menu bar's clock) renders identically as `unsynced` — a strip that cannot read
+/// the clock this pass simply draws no clock and repaints when it can, the same shape `logts_now`
+/// already uses for the same lock. A `None` here is therefore never a lie: it is the absence of a
+/// reading, not a fabricated time.
+pub fn try_unix_now() -> Option<u64> {
+    let guard = UNIX_ANCHOR.try_lock()?;
     let a = guard.as_ref()?;
     let elapsed = match monotonic() {
         Some((ticks, freq)) => ticks.wrapping_sub(a.anchor_ticks) / freq,
