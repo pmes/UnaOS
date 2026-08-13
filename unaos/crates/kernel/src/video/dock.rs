@@ -41,12 +41,21 @@
 //! exactly one launch path in this kernel (the shell's program source / `bg`), and this module does
 //! not add a second one. If launching ever belongs on the dock it arrives through that path.
 //!
-//! # x86 only, and gated
+//! # Two panels now, and gated on each (PI-DESK)
 //!
-//! `#[cfg(all(target_arch = "x86_64", feature = "wc"))]` at the `mod` declaration in
-//! [`super`]. aarch64 is byte-identical with this file present: it is not compiled there. The
-//! composite seam in `wm::composite_once` and the press seam in `arch::x86_64::syscall` carry the
-//! same gate, so a knob-off x86 build has neither.
+//! `#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature =
+//! "pidesk")))]` at the `mod` declaration in [`super`]. The composite seam in `wm::composite_once`
+//! and the press seam in each arch's `syscall.rs` carry the same gate, so a knob-off build of EITHER
+//! arch has neither — and a knob-off `kernel8.img` is byte-identical to the pre-arc image, measured.
+//!
+//! **The dock on the Pi is the dock, not a port of it.** One file, one tile model, one press rule.
+//! What crossing cost was a single seam — [`focus_set`]/[`focus_get`] below, because the keyboard
+//! designation lives in the per-arch syscall layer where the input rings are — and one line of the
+//! router, which both arches reach through ONE shared entry point in [`super::strip`] rather than
+//! through two copies of the ordering rule.
+//!
+//! Peter's Q10 ruling travels with it unchanged: **a window switcher, not an app launcher.** There is
+//! no app grid on the Pi either, and no second launch path was added to reach one.
 //!
 //! # Materials and metrics — every value is a Crispy role or a Crispy metric
 //!
@@ -161,6 +170,46 @@
 //! is outside this arc's lane, so it is flagged rather than taken.
 
 use super::{ceramic, strip, theme, wm};
+
+// ---------------------------------------------------------------------------
+// PI-DESK — the ONE arch seam this module carries
+// ---------------------------------------------------------------------------
+//
+// A tile press hands the KEYBOARD to the window it raised, and the keyboard designation lives in the
+// per-arch syscall layer (`USER_INPUT_ACTIVE`) because that is where the input rings are. Every other
+// line of this file is arithmetic over `wm` and the materials, and is arch-neutral by construction;
+// these two functions are the whole of what is not. They are seamed HERE, at the one call site each,
+// rather than by inventing a `crate::arch::user_input_*` re-export — the same shape `wm` uses for its
+// `wcx` reach, and it keeps the fact that the two arches have separate input tables visible instead of
+// papering over it.
+//
+// The contract is identical on both sides: `0` means the SHELL (a kernel-owned row has no input ring,
+// so the router's furniture rule hands the keyboard to the shell rather than to a program that cannot
+// read it), and any other value is an owning ASID.
+
+/// Designate `asid` as the keyboard's destination (`0` = the shell).
+#[inline]
+fn focus_set(asid: u64) {
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::syscall::user_input_set_active(asid);
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::syscall::user_input_set_active(asid);
+}
+
+/// The ASID the keyboard is currently designated to (`0` = the shell) — the read side of
+/// [`focus_set`], used by the fixture to save and restore the standing designation.
+#[cfg(feature = "witness")]
+#[inline]
+fn focus_get() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::x86_64::syscall::user_input_active()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::aarch64::syscall::user_input_active()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Metrics — every one a `theme` name, or derived from one with the derivation
@@ -809,9 +858,9 @@ pub fn press_at(x: i32, y: i32) -> bool {
     let was_hidden = !r.visible;
     PRESSED.store(r.id, Ordering::Release);
     if crate::video::wm::is_kernel_owner(r.owner_asid) {
-        crate::arch::x86_64::syscall::user_input_set_active(0);
+        focus_set(0);
     } else {
-        crate::arch::x86_64::syscall::user_input_set_active(r.owner_asid);
+        focus_set(r.owner_asid);
     }
     wm::focus_changed(r.owner_asid);
     PRESSED.store(wm::WIN_NONE, Ordering::Release);
@@ -946,7 +995,7 @@ pub fn selftest() {
     const OWNERS: [u64; 3] = [0xD0C1, 0xD0C2, OWNER_FURNITURE];
     const NAMES: [&[u8]; 3] = [b"dockA", b"dockB", b"dockC"];
 
-    let saved_focus = crate::arch::x86_64::syscall::user_input_active();
+    let saved_focus = focus_get();
     let mut w = [wm::WIN_NONE; 3];
     for k in 0..3 {
         w[k] = wm::create(
@@ -1056,7 +1105,7 @@ pub fn selftest() {
     }
     let rect_after = SLOT.packed();
     let vacate_ok = rect_before == 0 || rect_after != rect_before;
-    crate::arch::x86_64::syscall::user_input_set_active(saved_focus);
+    focus_set(saved_focus);
     wm::focus_changed(saved_focus);
 
     let ok = model_ok && geom_ok && restore_ok && specific_ok && miss_ok && vacate_ok && park_ok;

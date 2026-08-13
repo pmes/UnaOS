@@ -3664,11 +3664,11 @@ fn composite_pass_half() -> Owed {
     // would strand the overlay mechanism, and each already repaints the sprite from the finished
     // front, which is over the strip this call just painted.
     //
-    // STRIPFACTOR — one call for EVERY furniture strip, not one per tenant. `strip::compose_all`
-    // runs each registered tenant in registry order and ORs the results, so a second strip is a
-    // registry entry rather than a second line here, and neither can short-circuit the other's
-    // damage test. A disabled tenant returns on one relaxed load.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    // STRIPFACTOR — one call for EVERY furniture strip, not one per tenant; `strip::compose_all` runs each registered
+    // tenant in registry order and ORs the results, so a second strip is a registry entry rather than a second line here
+    // and neither can short-circuit the other's damage test (a disabled tenant returns on one relaxed load). PI-DESK — the
+    // aarch64 half of the gate below is the WHOLE of M2: same seam, same position, same `Repaint` upgrade, same layering.
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
     if super::strip::compose_all() && tail == CursorTail::Untouched {
         tail = CursorTail::Repaint;
     }
@@ -11741,7 +11741,7 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 /// only where the registry exists.
 const FURNITURE_MAX: usize = 2;
 
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK: two arch/knob pairs now
 const _: () = assert!(FURNITURE_MAX == super::strip::STRIP_MAX);
 
 /// MENU-OCC — occluder slots for TRANSIENT modal surfaces that are NOT `strip::TENANTS` members.
@@ -17332,7 +17332,7 @@ pub fn focus_reset() {
 ///
 /// A SNAPSHOT, never a handle, on [`info`]'s rule: re-read it after any mutating call. The caption is
 /// copied rather than borrowed because the table lock is released before the dock draws anything.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 #[derive(Clone, Copy)]
 pub struct DockEntry {
     /// Window id (`1..=MAX_WINDOWS`).
@@ -17351,7 +17351,7 @@ pub struct DockEntry {
     pub focused: bool,
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 impl DockEntry {
     /// A zeroed entry, for the caller's scratch array.
     pub const fn empty() -> Self {
@@ -17387,7 +17387,7 @@ impl DockEntry {
 ///
 /// Cost and locks: one `TABLE` acquisition, one bounded `MAX_WINDOWS` scan, no allocation, no nested
 /// lock, no new lock order — [`focus_ring`]'s and [`occluders`]'s shape exactly.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub fn dock_scan(
     out: &mut [DockEntry; MAX_WINDOWS],
     rect: (usize, usize, usize, usize),
@@ -17441,7 +17441,7 @@ pub fn dock_scan(
 /// path that cannot take `dock_scan`'s `TABLE` lock. A predicate copied into that path would have
 /// been a second definition of which windows the strip is sized by — free to drift, and drifting
 /// silently, since the two would only disagree about the strip's WIDTH.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 #[inline]
 fn dock_addressable(r: &Window) -> bool {
     r.used && !r.compat && r.owner_asid != 0

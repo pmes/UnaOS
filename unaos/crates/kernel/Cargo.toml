@@ -1120,6 +1120,26 @@ rast = ["dep:rast"]
 # byte-identical to baseline. See docs/dev/OS/08_VIDEO/rasterizer.md §4.
 pirast = ["rast"]
 
+# PI-DESK: the desktop FURNITURE family on the Pi 4 panel (UNAOS_PIDESK=1). Deliberately a THIN
+# feature on `pirast`'s own terms — it pulls in no dependency and declares no module of its own. What
+# it gates is the aarch64 half of four gates that were `all(target_arch = "x86_64", feature = "wc")`
+# and are now `any(all(x86_64, wc), all(aarch64, pidesk))`: `video::strip` (the furniture-strip
+# primitive — edge-anchored geometry, the staged row-run painter, the vacated-pixel erase, the damage
+# slot, the tenant registry), `video::dock` (the window switcher — Peter's white-board Q10 ruling: a
+# switcher, NOT an app launcher), `video::menubar` (the top strip, DEFAULT OFF at runtime), and
+# `video::crystal` (the SHARD system menu). The four were already arch-neutral in their arithmetic —
+# the materials they paint through (theme/paper/ceramic/knurl) are unconditional and render on the Pi
+# today — so what this feature buys is the compose seam in `wm::composite_once`, the dock's
+# table-scan API in `wm`, and the press route in `arch/aarch64/syscall.rs::wc_click_route`.
+#
+# The knob class is `pirast`'s (builder=0): the kernel8 feature list is CURATED (see `arroyo`'s
+# K8_FEATS block), so the arm lives there and NOT in `builder/src/main.rs` — builder produces the
+# x86/virt ESP media and never kernel8.img. Default OFF => not one of the four modules is compiled on
+# aarch64, no seam in `wm` or the click router exists, and kernel8.img is BYTE-IDENTICAL to baseline
+# (proven by sha256, not assumed). x86 is untouched in either direction: its half of every gate is
+# the `wc` term it always was.
+pidesk = []
+
 # INSTALL-CORE: the `UNAOS_INSTALLDEMO=1` storage-agnostic installer engine + its boot witness
 # (crates/kernel/src/install/). Arms a GPT writer + FAT32 formatter + extent content-verify against a
 # dedicated BLANK scratch disk the builder attaches over the usb-storage slot (the boot ESP is a

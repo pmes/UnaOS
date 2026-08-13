@@ -38,7 +38,14 @@
 //! | 1 | — (separator)     | —                                                               |
 //! | 2 | Sleep             | honest STUB — prints `unimplemented: Sleep` (no ACPI S3 path)    |
 //! | 3 | Restart           | honest STUB — prints `unimplemented: Restart` (no reboot path)   |
-//! | 4 | Shut Down         | REAL — [`crate::arch::acpi_power::poweroff`] (ACPI S5 soft-off)  |
+//! | 4 | Shut Down         | x86: REAL — [`crate::arch::acpi_power::poweroff`] (ACPI S5). aarch64: honest STUB |
+//!
+//! PI-DESK — **the RENDER and the HIT-TEST cross to aarch64 whole; two of the four ACTIONS do not,
+//! and the menu says so on the wire rather than pretending.** `About` is REAL on both arches. On the
+//! Pi, `Restart` and `Shut Down` join `Sleep` as honest stubs, each printing a line that names the
+//! missing mechanism by name (PSCI `SYSTEM_RESET` / `SYSTEM_OFF` need an EL3 secure monitor, and Pi 4
+//! bare-metal runs at EL2 with nothing behind the `smc`; the real Pi wiring is the BCM2711
+//! watchdog/`PM_RSTS` block, which is a driver arc). See [`fire`] for the full ledger.
 //!
 //! **A stub is not a no-op and not a fake success.** Sleep and Restart RENDER as pickable items — a
 //! menu item that could not be shown pickable would be unfalsifiable — and their pick prints one
@@ -400,10 +407,28 @@ pub fn dismiss_for_bar_off() {
 /// - `About`    — prints the Shard identity + version (REAL).
 /// - `Sleep`    — honest STUB: prints `unimplemented: Sleep`, no side effect.
 /// - `Restart`  — honest STUB: prints `unimplemented: Restart`, no side effect.
-/// - `ShutDown` — REAL: [`crate::arch::acpi_power::poweroff`], which does not return.
+/// - `ShutDown` — on x86, REAL: [`crate::arch::acpi_power::poweroff`], which does not return.
 ///
 /// ⛔ The fixture must NEVER call this with [`Verb::ShutDown`], and does not: it drives picks only for
 /// the safe verbs and proves Shut Down's routing through [`item_at`].
+///
+/// # PI-DESK — what Restart and Shut Down are on the Pi, and why they are NOT wired
+///
+/// The render and the hit-test cross to aarch64 whole; the ACTIONS do not, and the honest answer is
+/// stated on the wire rather than faked. `acpi_power::poweroff` is an x86 path (ACPI S5 through the
+/// PM1 control block) and has no aarch64 twin. The aarch64 twin *of the family* is PSCI —
+/// `SYSTEM_OFF` (0x8400_0008) and `SYSTEM_RESET` (0x8400_0009) through an `smc` — and this kernel does
+/// carry PSCI, but only in `arch/aarch64/smpprobe.rs`, only `CPU_ON`/`AFFINITY_INFO`/`FEATURES`, and
+/// only on the **Tegra** path where an EL3 secure monitor answers. `SYSTEM_OFF` is queried by
+/// `PSCI_FEATURES` there and, in that file's own words, *"never invoked"*.
+///
+/// The Pi 4 is the case that settles it: bare-metal BCM2711 boots to EL2 with **no EL3 firmware
+/// behind it**, so an `smc` is not a power call — it is an unhandled exception. There is nothing to
+/// route to. So both verbs print an `unimplemented:` line naming what is missing, exactly as `Sleep`
+/// already did on x86, and the menu remains fully live: it opens, it hit-tests, it dismisses, and
+/// `About` is REAL on both arches. Wiring these means a Pi power path (the watchdog/PM block for
+/// reset, `PM_RSTS` for halt) — a driver arc, not a menu arc, and named as the follow-up rather than
+/// smuggled in here.
 fn fire(verb: Verb) {
     match verb {
         Verb::About => {
@@ -419,14 +444,32 @@ fn fire(verb: Verb) {
             serial_println!(":: SHARD: unimplemented: Sleep (no ACPI S3 suspend path) ::");
         }
         Verb::Restart => {
+            #[cfg(target_arch = "x86_64")]
             serial_println!(":: SHARD: unimplemented: Restart (no reboot path) ::");
+            // PI-DESK — the same honest line, naming the aarch64 reason rather than the x86 one. See
+            // this function's header: PSCI SYSTEM_RESET needs an EL3 monitor the Pi does not have.
+            #[cfg(target_arch = "aarch64")]
+            serial_println!(
+                ":: SHARD: unimplemented: Restart (no PSCI SYSTEM_RESET — Pi 4 bare-metal runs at EL2 with no secure monitor; a BCM2711 watchdog reset is the wiring this needs) ::"
+            );
         }
         Verb::ShutDown => {
             // Deliberate and destructive: the operator opened the menu and pressed Shut Down. Say so
             // once, then hand off to the real ACPI S5 soft-off, which either powers the machine off
             // mid-instruction or parks in `hlt` with its own witness. Never returns.
-            serial_println!(":: SHARD: shut down — entering ACPI S5 soft-off ::");
-            crate::arch::acpi_power::poweroff();
+            #[cfg(target_arch = "x86_64")]
+            {
+                serial_println!(":: SHARD: shut down — entering ACPI S5 soft-off ::");
+                crate::arch::acpi_power::poweroff();
+            }
+            // PI-DESK — NOT wired, and it returns. `smpprobe.rs` carries PSCI SYSTEM_OFF as a
+            // FEATURES query it deliberately never invokes, and on the Pi there is no EL3 behind the
+            // `smc` to answer it at all. A verb that cannot act says so and leaves the machine
+            // running; it does not park the operator's desktop in a `wfi` to look decisive.
+            #[cfg(target_arch = "aarch64")]
+            serial_println!(
+                ":: SHARD: unimplemented: Shut Down (no PSCI SYSTEM_OFF — Pi 4 bare-metal runs at EL2 with no secure monitor; PM_RSTS/watchdog halt is the wiring this needs) ::"
+            );
         }
     }
 }

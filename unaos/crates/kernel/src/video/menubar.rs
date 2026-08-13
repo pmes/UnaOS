@@ -82,6 +82,15 @@
 //! asserting a fact it does not have. So the clock is simply **not drawn** while unsynced, the title
 //! keeps the width, and the witness says `clock=unsynced`. It is **UTC**: the kernel carries no
 //! timezone, and rendering local time would require inventing one.
+//!
+//! # PI-DESK — compiled on the Pi, and STILL DEFAULT OFF there
+//!
+//! The `mod` gate is now `any(all(x86_64, wc), all(aarch64, pidesk))`, so this tenant exists on the
+//! BCM2711 panel too. Nothing about its POLICY moved with it. Peter's direction — *"we will not
+//! always have a menu bar"* — is a runtime statement, and `ENABLED` still starts `false` on both
+//! arches: a Pi boot with `UNAOS_PIDESK=1` gets the dock strip and the SHARD menu machinery and NO
+//! top strip until something asks for one. Compiling a tenant is not enabling it, and this is the
+//! tenant that exists to keep that distinction visible.
 
 use super::{ceramic, strip, theme, wm};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};

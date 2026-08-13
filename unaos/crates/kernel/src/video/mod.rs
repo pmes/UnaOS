@@ -82,30 +82,42 @@ pub mod wcx;
 // and a press that raises and un-hides the window it names. Peter's ruling, white board Q10
 // (2026-08-09): "mac has had the dock forever so we should have a doc and all macos like
 // experience". A window switcher, not an app launcher — there is no app grid here and no second
-// launch path. Same gate as `wcx` (x86 panel path, `UNAOS_WC=1`): aarch64 does not compile it and a
-// knob-off x86 build carries neither the module nor its two seams.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+// launch path.
+//
+// PI-DESK — the gate is no longer `wcx`'s alone. It is **the x86 panel path (`UNAOS_WC=1`) OR the Pi
+// panel path (`UNAOS_PIDESK=1`)**, and the two halves are independent: a knob-off aarch64 build
+// compiles nothing here and its `kernel8.img` stays BYTE-IDENTICAL, and x86 keeps exactly the `wc`
+// term it always had. Nothing in this module became arch-neutral by being compiled on a second arch
+// — it already was, bar one reach into `arch::x86_64::syscall` for focus, which is seamed at its own
+// call site the way `wm` seams `wcx`. The same gate is on `strip`, `menubar` and `crystal` below.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub mod dock;
 // STRIPFACTOR: the furniture-strip PRIMITIVE — edge-anchored geometry with floors, the staged
 // row-run painter, the vacated-pixel erase, the damage slot, the cost ledger, and the TENANT
 // REGISTRY `wm::erase_clip` walks for occlusion citizenship. Peter's direction 2026-08-11: UnaOS is
 // a spatial game-engine OS and the desktop is one shell on it — "we will not always have a menu
 // bar" — so the kernel's contribution is the mechanism, not any particular strip. `dock` is tenant
-// #1 and `menubar` is tenant #2. Same gate as `dock`/`wcx`.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+// #1 and `menubar` is tenant #2. Same gate as `dock` (PI-DESK: x86+`wc` OR aarch64+`pidesk`).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub mod strip;
 // MENUBAR: the top strip — tenant #2 of `strip`, and DEFAULT OFF. Inert chrome plus the focused
 // window's caption and a UTC clock; a press falls through, because opening menus belongs to the
 // renderer-agnostic menu PROTOCOL whose design ledger is at the foot of that file. Deleting it costs
-// one registry entry, one line of `strip::compose_all`, and this declaration.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+// one registry entry, one line of `strip::compose_all`, and this declaration. Same gate as `dock`
+// (PI-DESK: x86+`wc` OR aarch64+`pidesk`) — and DEFAULT OFF stays default off on the Pi too: Peter's
+// "we will not always have a menu bar" is a runtime statement, and compiling the tenant does not
+// enable it.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub mod menubar;
 // CRYSTAL: the SHARD menu — UnaOS's first LIVE menu, hung off the brand crystal in the menu bar. A
 // kernel-owned SYSTEM menu (About This Shard · Sleep · Restart · Shut Down), not the renderer-agnostic
 // app menu PROTOCOL (whose design ledger lives at the foot of `menubar.rs`). The dropdown is a
 // transient surface composited through `strip::paint` at the tail beside the dock and bar; the click
-// arm lives in `arch/x86_64/syscall.rs::wc_click_route_at`. Same gate as `dock`/`strip`/`menubar`.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+// arm lives in `arch/x86_64/syscall.rs::wc_click_route_at` — and, since PI-DESK, in
+// `arch/aarch64/syscall.rs::wc_click_route`, both through the ONE shared router
+// [`strip::press_route`] rather than two copies of the ordering rule. Same gate as
+// `dock`/`strip`/`menubar` (x86+`wc` OR aarch64+`pidesk`).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub mod crystal;
 // CRISPY-PI theme const table — carried verbatim from hw-pi4 (single-author law: edits flow
 // through the pi4 seat from the taste-gate). Declared for INSTGUI's use; full chrome wiring
