@@ -2054,6 +2054,24 @@ pub struct XhciController {
     /// at all times except inside an escalation retry, where it is briefly
     /// `BOT_BUDGET_SCALE_ESCALATION` and restored immediately after.
     bot_budget_scale: u64,
+    /// [piusb41] PA36: set by `scsi_read_capacity10` when the geometry clamp REJECTS a reply
+    /// (phase-shifted/corrupt — a CSW tail where capacity bytes belong), consumed by
+    /// `bring_up_storage`'s error arm. `TransferError(u8)` carries completion codes and cannot
+    /// name this distinctly, and the port-cycle decision must wait for the post-wedge INQUIRY
+    /// control (the photograph must precede any pipe reset), so the clamp site records the fact
+    /// here instead of acting on it.
+    bot_geom_reject: bool,
+    /// [piusb41] S1Z: the most recent `bot_transfer_once` attempt ended in a zero-data CSW FOLD.
+    /// Read by `bot_rescue_clear` so a fold's own `Ok` return does not end the fold streak it
+    /// just joined (unconditional clearing made the PA34 two-fold trigger unfireable). Reset at
+    /// the top of every attempt and at bring-up start.
+    bot_txn_folded: bool,
+    /// [piusb41] S1Z: at least one fold has happened on the CURRENT bring-up. The widened
+    /// port-cycle trigger (fold + geometry-clamp reject = stuck reader) reads this latch instead
+    /// of the live streak, because the garbage-carrying READ CAPACITY completes as a transaction
+    /// — legitimately ending the streak — before its content ever reaches the clamp. Set at any
+    /// fold; cleared at bring-up start and when the trigger consumes it.
+    bot_fold_seen: bool,
 
     /// In-flight synchronous EP0 control transfer (hub bring-up). See `Ep0Pending`.
     ep0_pending: Option<Ep0Pending>,
@@ -2227,6 +2245,9 @@ impl XhciController {
             bot_rescue_stage: 0,
             bot_surrendered_slot: 0,
             bot_budget_scale: BOT_BUDGET_SCALE_FIRST,
+            bot_geom_reject: false,
+            bot_txn_folded: false,
+            bot_fold_seen: false,
             ep0_pending: None,
             last_control_len: 0,
             cmd_pending: None,
@@ -6732,6 +6753,11 @@ impl XhciController {
         // not drained, they are power-cycled; two consecutive folds is the stuck signature and the
         // rescue ladder's port-cycle rung is the one act that reaches device-internal state. The
         // re-enumeration it delegates gives the reader a cold BOT engine and bring-up a fresh run.
+        // [piusb41] S1Z: mark this attempt as a fold (so its own Ok return cannot end the streak
+        // it just joined) and latch fold-seen for the bring-up-scoped widened trigger (fold +
+        // geometry-clamp reject on one bring-up — consumed in `bring_up_storage`'s error arm).
+        self.bot_txn_folded = true;
+        self.bot_fold_seen = true;
         let streak = BOT_FOLD_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
         if streak >= 2 {
             BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
@@ -6826,6 +6852,11 @@ impl XhciController {
         let in_dci = ((in_addr & 0x0F) * 2) + 1;
         let out_dci = (out_addr & 0x0F) * 2;
 
+        // [piusb41] S1Z: this attempt has not folded (yet). The marker is what lets
+        // `bot_rescue_clear` distinguish a REAL completion (ends the fold streak) from the fold's
+        // own `Ok` return (IS the streak) — without it fold #1's completion-clear wiped the streak
+        // before fold #2 could increment it, and the PA34 two-fold trigger was vacuous.
+        self.bot_txn_folded = false;
         // PIUSB-38: latched when the data stage halts (STALL/Babble). It steers the status stage
         // into Reset Recovery: on a data-phase stall we still collect the CSW (resync), and if the
         // CSW itself fails we escalate to a full Bulk-Only Mass Storage Reset.
@@ -8659,9 +8690,15 @@ impl XhciController {
     fn bot_rescue_clear(&mut self, slot_id: u8) {
         self.bot_fail_streak = 0;
         self.bot_rescue_stage = 0;
-        // [piusb41] PA34: a fresh enumeration is a cold device state machine — the fold streak
-        // starts over with it, so a post-cycle device gets its clean two-strike allowance back.
-        BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
+        // [piusb41] PA34 + S1Z: a completed transaction ends the fold streak ONLY when it was a
+        // REAL completion — the fold's own `Ok` return is a member of the streak, not its end.
+        // Unconditional, this line made the PA34 two-fold trigger unfireable: fold #1 returned
+        // `Ok`, the caller's completion-clear ran this store, and fold #2's increment started
+        // from zero again. (The fresh-enumeration clean slate PA34 wanted lives explicitly in
+        // `bring_up_storage` now.)
+        if !self.bot_txn_folded {
+            BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
+        }
         if self.bot_surrendered_slot == slot_id {
             self.bot_surrendered_slot = 0;
         }
@@ -9097,6 +9134,9 @@ impl XhciController {
                     ":: PIUSB: [piusb41] READ CAPACITY reply REJECTED — block_size={} last_lba={:#010x} is not a sane sector geometry (want a power of two in 512..=4096) — phase-shifted or corrupt reply, no disk is minted from it ::",
                     block_size, last_lba
                 );
+                // [piusb41] PA36: recorded, not acted on — `bring_up_storage` decides after the
+                // post-wedge INQUIRY control has taken its photograph of the pipes.
+                self.bot_geom_reject = true;
                 return Err(BotError::TransferError(8));
             }
             Ok((block_size, last_lba))
@@ -9168,6 +9208,14 @@ impl XhciController {
         // BOT-RESCUE: a freshly enumerated disk inherits no escalation state, even if the
         // controller handed it a slot id a surrendered disk once held.
         self.bot_rescue_clear(slot);
+        // [piusb41] PA34 + S1Z: the fresh-enumeration clean slate, explicit and unconditional —
+        // a post-cycle device gets its two-strike allowance back, and this bring-up's fold latch
+        // starts unlit. (`bot_rescue_clear` can no longer be the home of these: its streak clear
+        // is conditioned on the fold marker, and at this point the marker still describes the
+        // PREVIOUS device's last transaction.)
+        BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
+        self.bot_fold_seen = false;
+        self.bot_txn_folded = false;
 
         // Put the device in the USB CONFIGURED state before touching its bulk endpoints. Real USB
         // Mass-Storage requires a SET_CONFIGURATION before its bulk IN/OUT endpoints become active;
@@ -9231,6 +9279,33 @@ impl XhciController {
                     } else {
                         "the pipes are dead from the wedge onward: whatever wedged 0x25 took the transport with it"
                     });
+                // [piusb41] PA36: the widened port-cycle trigger. PA36 arrived with the reader
+                // ALREADY stuck from power-on: bring-up saw ONE fold, then the next reply came
+                // phase-shifted and the geometry clamp rejected it — bring-up exited here and the
+                // two-fold streak trigger above never fired, leaving the stuck reader stuck for
+                // the whole boot. A fold followed by a clamp-reject on the SAME bring-up is the
+                // same stuck signature as fold+fold (the device is answering commands with
+                // re-manufactured/phase-shifted state, not data), and PA35's physical replug
+                // proved cold re-enumeration cures exactly this state. The publish-generations
+                // guard (8134a5cd) protects the resurrection from stale ladders. The photograph
+                // above is already taken, so acting on the pipes is now admissible.
+                // The latch, not the live streak: the garbage-carrying READ CAPACITY *completes*
+                // as a transaction before its content reaches the clamp, and a real completion
+                // legitimately ends the streak — so at this point the streak may already read 0
+                // on exactly the boot this trigger exists for. `bot_fold_seen` is scoped to this
+                // bring-up (set at any fold, cleared at bring-up start) and survives that wipe.
+                let geom = core::mem::take(&mut self.bot_geom_reject);
+                if geom && core::mem::take(&mut self.bot_fold_seen) {
+                    BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
+                    serial_println!(
+                        ":: BOT: [piusb41] fold + geometry-clamp reject on one bring-up — the widened stuck signature (PA36: a power-on-stuck reader folds once, then feeds the clamp garbage and exits before streak=2) — escalating to port power-cycle ::");
+                    let cycled = self.rescue_port_cycle(slot);
+                    serial_println!(
+                        ":: BOT: [piusb41] port power-cycle result={} — {} ::",
+                        cycled,
+                        if cycled { "device re-enumerates cold; bring-up re-runs on the fresh slot" }
+                        else { "cycle refused/failed — the surrender path owns what remains" });
+                }
                 return Err(e);
             }
         };
