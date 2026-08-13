@@ -1249,7 +1249,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // whole M6b..U7 fixture cascade is already spawned and running on the APs, holding ASIDs 1-8.
             typematic_selftest(); // UVUG-6: prove the dropped-KeyUp wedge is closed (report-level + guards)
             unaos_kernel::arch::serial::RX_READY.init(); // M5c: the RX-wake semaphore's waiter list
-            unaos_kernel::video::fbcon::detach();
+            unaos_kernel::video::fbcon::detach(); pi_rast_demo_maybe(); // PI-RAST demo (no-op unless UNAOS_PIRAST=1) on the SAME source line as the detach it rides, so the wire-in adds ZERO source lines ahead of any panic Location — the pi knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail; runs here because the panel is up, fbcon has just stopped mirroring, and the input/render service tasks below are not spawned yet (nothing else paints).
             // M5c: on metal, route + enable the PL011 RX interrupt (SPI 153) to the input core so the
             // input task is woken by the UART instead of polling. GICD config stays BSP-only (this is
             // global distributor state). A backstop task also periodically wakes the input service so
@@ -4943,3 +4943,78 @@ fn tegra_rast_demo_maybe() {
 #[cfg(all(feature = "tegra", not(feature = "rast"), target_arch = "aarch64"))]
 #[inline(always)]
 fn tegra_rast_demo_maybe() {}
+
+// ── PI-RAST ─────────────────────────────────────────────────────────────────────────────────────
+// The Pi 4 / BCM2711 panel wire-in of the `rast` software rasterizer — the Pi's first 3D pixels.
+// RAST-TEGRA is the precedent this follows: an aarch64 board with an INHERITED scanout. There is no
+// mode-set and no scanout reprogramming here either. The panel is whatever the VideoCore firmware
+// already gave us through the mailbox `init_framebuffer` (`video::WRITER`), and geometry is read
+// LIVE off that surface — never hardcoded. The bench Pi is 1920x1200 and QEMU raspi4b is 640x480;
+// both are just `screen.width()/height()` to this code, and `rast_demo::run` centers its fixed
+// 320x240 render on whatever it finds (and skips honestly if the panel is smaller than that).
+//
+// WHERE IT RIDES, and why that point and not the terminus. On aarch64/baremetal the boot core reaches
+// the GUI handoff block, detaches fbcon, spawns the `input` + `render` service tasks onto two APs and
+// then joins the scheduler (`run_bsp`). The demo is called on the DETACH LINE — after the panel is up
+// and fbcon has stopped mirroring serial onto it, and BEFORE any service task exists. So:
+//   * it cannot race bring-up (the mailbox framebuffer, the heap and the timer are all long up), and
+//   * it cannot fight the compositor (`render_service` is the panel's sole painter, and it has not
+//     been spawned yet — unlike the Orin, whose terminus IS the scheduler entry).
+// The demo's own `Screen` (a full-panel back buffer, ~9 MiB at 1920x1200) is scoped to this call and
+// DROPPED before those spawns, so the render task's identical shadow never coexists with it on the
+// 48 MiB metal heap. `rast_demo::run` is bounded (90 paced frames), so boot always reaches the shell;
+// `render_service` repaints the console over the cube the moment it starts.
+//
+// CALL-NEVER-EDIT on the shared surface: this touches only the public `Screen` API through
+// `rast_demo::run`, exactly as x86/virt and tegra do. It does not touch the compositor, `pal`,
+// `pal::cursor::SPRITE_OWNS_PAINT` (which stays false on aarch64), or anything in the V3D tree.
+// The helper lives HERE at the file tail and is CALLED on an existing source line, so the whole
+// wire-in adds zero source lines ahead of any panic `Location` literal — the constraint that keeps
+// the knob-off kernel8.img byte-identical to baseline.
+#[cfg(all(feature = "pi", feature = "pirast", target_arch = "aarch64"))]
+fn pi_rast_demo_maybe() {
+    // `FrameBuffer` is `Copy` — take a handle and release the WRITER lock immediately, the same way
+    // `render_service` does a few dozen lines below.
+    let front_fb = *unaos_kernel::video::WRITER.lock();
+    // Headless / no firmware framebuffer: nothing to draw on. Say so and return — never guess a size.
+    if front_fb.info().width == 0 || front_fb.info().height == 0 {
+        serial_println!(":: PI-RAST: no mailbox framebuffer (headless boot) — cube demo skipped ::");
+        return;
+    }
+    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    serial_println!(
+        ":: PI-RAST: BCM2711 mailbox panel {}x{} (live firmware geometry, inherited scanout) — software rasterizer cube, the Pi's first 3D pixels ::",
+        screen.width(),
+        screen.height()
+    );
+    let t0 = unaos_kernel::arch::ms();
+    unaos_kernel::rast_demo::run(&mut screen);
+    // Honest fps for the WHOLE Pi wire-in: measured wall clock across `Screen` construction, the
+    // render/present loop and its pacing — a strictly wider span than the `:: RAST:` line the shared
+    // demo prints for the loop alone, so the two are expected to differ slightly and both are real.
+    // `PI_RAST_FRAMES` mirrors `rast_demo::FRAMES` (see the constant's own note on keeping it true).
+    let elapsed = unaos_kernel::arch::ms().saturating_sub(t0).max(1);
+    let fps_x1000 = (PI_RAST_FRAMES as u64 * 1000 * 1000) / elapsed;
+    serial_println!(
+        ":: PI-RAST: {} frames in {} ms — {}.{:03} fps (software rasterizer, BCM2711 mailbox-fb present) ::",
+        PI_RAST_FRAMES,
+        elapsed,
+        fps_x1000 / 1000,
+        fps_x1000 % 1000
+    );
+}
+
+/// Frame count of the shared `rast_demo` loop, mirrored here so the PI-RAST fps line can report a
+/// rate rather than a bare duration without making `rast_demo`'s internals public. If the shared
+/// demo ever changes `FRAMES`, this constant must move with it — the `:: RAST:` line the shared demo
+/// prints one line earlier carries its OWN frame count, so a drift is visible on the wire (the two
+/// counts disagreeing in the same log) rather than silent.
+#[cfg(all(feature = "pi", feature = "pirast", target_arch = "aarch64"))]
+const PI_RAST_FRAMES: u32 = 90;
+
+// Knob-off pi build (the default, and every `./arroyo kernel8` that does not set UNAOS_PIRAST=1):
+// the wire-in compiles to nothing. `#[inline(always)]` on an empty body means the call on the detach
+// line emits zero instructions, so kernel8.img stays byte-identical to baseline.
+#[cfg(all(feature = "pi", not(feature = "pirast"), target_arch = "aarch64"))]
+#[inline(always)]
+fn pi_rast_demo_maybe() {}

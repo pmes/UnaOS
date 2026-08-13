@@ -1551,8 +1551,10 @@ KERNEL_CFG_MATRIX=(
   "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
-  # three-rung INSTALL-PI ladder. Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm"
+  # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
+  # only leg that type-checks its ARMED polarity, since `rast` alone leaves it compiled out).
+  # Cannot carry the tegra family — see the mutual-exclusion note above.
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -2737,6 +2739,21 @@ kernel8() {
     if [ -n "${UNAOS_PIINSTALL_CONFIRM:-}" ]; then
         K8_FEATS="${K8_FEATS},piinstall_confirm"
         echo -e "${COLOR_YELLOW}  • UNAOS_PIINSTALL_CONFIRM: Gate 3 — DESTRUCTIVE install (GPT→FAT32→payload→verify)${COLOR_RESET}"
+    fi
+    # PI-RAST: UNAOS_PIRAST=1 adds the `pirast` feature (which implies `rast`) — the platform-neutral
+    # software rasterizer's spinning-cube demo on the BCM2711 panel, the Pi's first 3D pixels. Draws
+    # through the INHERITED mailbox framebuffer (`video::WRITER`) with geometry read live, so it is
+    # correct at both the bench panel's 1920x1200 and QEMU raspi4b's 640x480; no mode-set, no scanout
+    # reprogramming, V3D untouched. Rides on the GUI-handoff detach line — panel up, compositor tasks
+    # not spawned yet — so it never races bring-up, and it is bounded (90 paced frames) so the boot
+    # always reaches the shell. K8_FEATS is CURATED (like UNAOS_LOGTS above), so the arm must be here
+    # or the feature never reaches the Pi image; `builder/src/main.rs` is deliberately NOT touched —
+    # builder makes the x86/virt ESP media, never kernel8.img (the same class as the V3D/PIUSB/GENET
+    # knobs, which carry no builder mapping either). OFF => the call site + the whole `rast` graph are
+    # unlinked and kernel8.img is byte-identical to baseline. See docs/dev/OS/08_VIDEO/rasterizer.md §4.
+    if [ -n "${UNAOS_PIRAST:-}" ]; then
+        K8_FEATS="${K8_FEATS},pirast"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PIRAST: software-rasterizer spinning cube on the BCM2711 panel (first 3D pixels on the Pi; 90 paced frames, then the shell repaints)${COLOR_RESET}"
     fi
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"

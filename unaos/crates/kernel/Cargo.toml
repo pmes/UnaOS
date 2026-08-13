@@ -1107,6 +1107,19 @@ smcwalk = []
 # See docs/dev/OS/08_VIDEO/rasterizer.md.
 rast = ["dep:rast"]
 
+# PI-RAST: the Pi 4 / BCM2711 panel wire-in of the SAME demo (UNAOS_PIRAST=1). Deliberately a THIN
+# feature — it only IMPLIES `rast`, so the dep gate and the `rast_demo` module gate stay exactly as
+# RAST-1/RAST-TEGRA left them and no shared `#[cfg]` site had to be widened (which is also why this
+# arc shifts no source line in `lib.rs`). What `pirast` alone gates is the single Pi call site,
+# `main.rs::pi_rast_demo_maybe()`: it runs the cube through the mailbox framebuffer's `Screen` right
+# after the boot's `fbcon::detach()` and BEFORE the input/render service tasks are spawned — panel up,
+# compositor not yet painting, so the demo can never race bring-up. The kernel8 feature list is
+# CURATED (see `arroyo`'s K8_FEATS block), so the arm lives there and NOT in `builder/src/main.rs`:
+# builder produces the x86/virt ESP media and never kernel8.img (the v3d/piusb/genet knob class).
+# Default OFF => the call site and the whole `rast` graph are unlinked and kernel8.img is
+# byte-identical to baseline. See docs/dev/OS/08_VIDEO/rasterizer.md §4.
+pirast = ["rast"]
+
 # INSTALL-CORE: the `UNAOS_INSTALLDEMO=1` storage-agnostic installer engine + its boot witness
 # (crates/kernel/src/install/). Arms a GPT writer + FAT32 formatter + extent content-verify against a
 # dedicated BLANK scratch disk the builder attaches over the usb-storage slot (the boot ESP is a
