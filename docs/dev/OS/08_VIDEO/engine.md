@@ -11795,3 +11795,93 @@ load MIGRATES to the USB-pump service lane (`pace_service`'s caller), bounded at
   or `pace_service`'s tail drain, which calls `rtwit::note_present_composited` after its
   composite (also keeping the proxy from spanning an idle gap after a storm's final,
   drain-carried frame and reporting a false spike).
+
+### WPACE-TEXT — the present-boundary shadow (GR27 round 2)
+
+**The defect (metal, GR27 round 2): text inside vug windows flickers under the pacer; the crystal
+itself looks fairly solid.** Both halves of that observation are the mechanism.
+
+*Why text, why now.* `user-vug`'s HUD painter (`draw_num`) is clear-then-redraw: it wipes its
+backing box to the background (`while y < 11`, one volatile row fill at a time) and then stamps the
+digits. Pre-pacer that never mattered, because every present composited **synchronously inside the
+owner's own `SYS_WIN_PRESENT`** — the one moment the owner is provably not writing (the same fact
+WC-G's `app`-leg checksum has always rested on). WPACE-PANEL changed who carries a storming
+window's pixels: a coalesced present returns immediately and the damage is carried by an
+**asynchronous** pass — the ~1 kHz tail drain (arbitrary app time; under a steady storm the
+*dominant* carrier, see `tail=`), or a frame-edge composite riding **another** window's present
+(`composite()` is global: it snapshots every damaged row, so window B's admitted present blits
+window A's coalesced damage at a time arbitrary with respect to A). Those blits read the **live**
+surface while the app — which returned instantly and kept drawing — is mid-draw of its *next*
+frame. Boot B's wire shows the exposure: vug renders ~150 wf internally and composites ~57/s, so
+nearly every blit that reaches glass is asynchronous. Land one between `draw_num`'s clear and its
+digit stamps and the readout is published blank — text flicker at a rate the eye tracks. The
+crystal body barely shows the same race because `render_solid` is **one-pass, no clear**: every
+traced cell is written exactly once with its final value, so a mid-draw read costs at worst a
+one-frame orientation seam, not a blank. The flicker is therefore *new with the pacer* and
+*selective for text*, which is exactly what the bench reported.
+
+*The fix: blit what the owner declared finished, never what it is drawing.* One shadow buffer per
+paced window (`PACE_SHADOW`, slot-pooled statics), refreshed by a bounded `memcpy` of the declared
+damage band at **every present** — i.e. only ever while the owner is parked in the syscall and the
+surface is quiescent — and read by the composite pass in place of the live surface
+(`pace_shadow_source` swaps the pass's row copy onto the buffer and holds the per-slot lock across
+the window's blit and its WC-G/WC-D witnesses). Every byte the panel sees was captured at a present
+boundary, so a torn glyph is impossible by construction, from any pass — tail drain, foreign
+frame-edge, and the drag-exposure repaints that could tear even pre-pacer. Chosen over
+blit-from-stage (the stage pool is per-core transient scratch shared by every window and by fills —
+persisting it per window *is* a shadow, plus a full compose per coalesced present, which is the
+storm cost the pacer exists to shed; the snapshot is a straight `memcpy` instead) and over
+"defer the read to the owner's next present" (strands the final frame of a stream that stops, the
+exact liveness case `pace_service` exists for).
+
+*The contended lock DEFERS; it does not read live (review MAJOR-1).* The composite pass takes the
+shadow with `try_lock`, and the miss case is where the earlier draft was wrong. A live fallback is
+sound only *at the try_lock instant*, not across the blit that follows it: if the pass misses
+because the owner is inside `pace_shadow_refresh`'s memcpy, that memcpy finishes in µs and the
+coalesced present returns immediately (no `COMP_GATE` park), so the owner can resume `draw_num`'s
+clear-then-redraw while this pass is still in `verify_reference`/`draw_window` — a live blit would
+land in the clear gap and publish the blank readout, a sub-Hz residual of the very flicker under
+exactly the storm the fix targets, plus a live read the two witnesses misjudge. So for a
+shadow-**valid** window a `try_lock` miss **defers**: `pace_shadow_source` returns `ShadowSrc::Defer`,
+the pass `continue`s past this window, and `pace_shadow_defer` re-raises its whole-box damage and
+`PACE_PENDING` bit so the ~1 ms tail drain re-attempts the blit next pass — by which time the
+µs-long refresh has released the lock. A blocking spin is explicitly rejected: an owner *preempted*
+mid-refresh would make the spin scheduling-length. The live fallback survives only for the honest
+arms — an exempt/never-coalesced window (live surface quiescent) and the OOM-declined degraded mode
+(no shadow exists to be stale).
+
+*The laws it keeps.*
+
+* **No app sleeps, and the pass never blocks on a present.** Both sides are lock-free of the
+  renderer: the refresh is a memcpy in present context under the per-slot lock; the pass takes that
+  lock with `try_lock` only, and a miss `continue`s (deferring the window to the drain) rather than
+  waiting. No path spins or parks.
+* **One composite per window per frame** — the pacer's admit/coalesce/tail structure is untouched;
+  this changes what a pass *reads*, and defers a contended window by one drain tick, never when an
+  admitted pass runs.
+* **Bounded memory, fallibly allocated (SHELLWIN-OOM).** Created on a window's first coalesced
+  present only (`try_reserve`; a window the pacer never defers allocates nothing), sized
+  `surf_len` (the full mapped slot — WC-G checksums and cache-maintains that length off whatever address it is handed), at most `MAX_WINDOWS` buffers. On OOM the window stays on the
+  live-read path — paced and correct, text may tear — and the decline is on the wire
+  (`[wpace] shadow-oom declines=N`). Validity is a per-slot bit cleared when the slot is re-issued
+  (`create_inner`), so no close path can leak a dead tenant's pixels to a new window.
+* **aarch64 and `wc`-off x86**: every piece is `cfg(all(target_arch = "x86_64", feature = "wc"))`;
+  both fold to the pre-fix code, bit for bit.
+
+*The trade, stated.* Every present of a shadowed window now pays one extra copy of its declared
+band (cached-RAM memcpy, tens of µs for a vug surface — against the full composite the same
+present paid pre-pacer, it is noise), and shadowed windows run one frame of *content* behind their
+own in-flight drawing (they always did on the async passes; now the lag is a clean frame instead
+of a torn one).
+
+*The witness / falsifier.* `[wpace]` grows `shdw=` (refresh copies this span; NOTE-5: it ticks only
+on a copy that moved bytes, so a degenerate empty band does not inflate it) and `defer=` (passes
+skipped for a contended shadow lock): healthy paced steady state reads `shdw ≈ paced + coalesced`
+with `defer` a small sub-Hz residual (each defer is one window costing one extra ~1 ms frame, never
+a torn glyph); `shdw=0` with `coalesced>0` means the shadow could not be created and the flicker is
+still possible (the `shadow-oom` line says why). The mechanism
+falsifier is WC-G's own classifier: the MAJOR-1 note above established that a pure tail blit reads
+`own=no` against a rewritten surface — with the shadow, the bytes a tail blit consumes are the
+bytes of a declared-finished frame, so RACE-PRESENT verdicts on paced vug windows should disappear
+from the capture, and the HUD digits should hold steady on glass. Either lying on the next metal
+boot falsifies the design, not the instrument.

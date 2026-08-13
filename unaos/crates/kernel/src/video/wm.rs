@@ -1066,6 +1066,15 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     // the same table acquisition as the damage mark, like `skip`.
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     let pace_exempt;
+    // WPACE-TEXT — the shadow-refresh source, captured under the same table acquisition as the
+    // damage mark: `(surf, stride, surf_len, sy0, sy1)`, where `[sy0, sy1)` is the band this
+    // present declared, resolved by the same rule `damage_rows`/`damage_all` just applied. Read
+    // here because the copy itself runs after the lock drops (a surface read is not something to
+    // hold the window table across — the WC-G probe above sets the precedent, and the same
+    // argument covers the lifetime: the owner is parked inside the present syscall, so its
+    // address space cannot be unmapped underneath the copy).
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    let pace_src;
     {
         let mut t = table();
         let owner = match row_mut(&mut t, id) {
@@ -1090,6 +1099,16 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
                     _ => r.damage_all(),
                 }
                 r.presented = true;
+                // WPACE-TEXT — the resolved band, by the exact rule the damage mark above applied:
+                // a valid `[y0, y1)` inside the surface is itself; anything else is the whole box.
+                #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+                {
+                    let (sy0, sy1) = match band {
+                        Some((y0, y1)) if y1 > y0 && y1 <= r.h => (y0, y1),
+                        _ => (0, r.h),
+                    };
+                    pace_src = (r.surf, r.stride, r.surf_len, sy0, sy1);
+                }
                 #[cfg(feature = "witness")]
                 if !r.compat {
                     probe = Some((r.surf, r.surf_len));
@@ -1127,6 +1146,21 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     // the frame nor raise a pending bit.
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     let pace_go = skip || pace_admit(id, pace_exempt);
+    // WPACE-TEXT — refresh this window's present-boundary shadow, NOW, while the owner is provably
+    // parked inside the syscall (the one moment the surface is quiescent — the same argument WC-G's
+    // `probe` rests on). A coalesced present's pixels reach the panel on a LATER, asynchronous pass
+    // (the ~1 kHz tail drain, or another window's frame-edge composite), and by then the owner is
+    // mid-draw of its NEXT frame — a live-surface read there catches a half-cleared glyph row, which
+    // is the GR27 metal text flicker. The shadow is the fix: every byte in it was copied at a
+    // present boundary, so the asynchronous blit composites a FINISHED frame by construction.
+    // Created lazily on the first coalesce (`!pace_go`), so a window the pacer never defers pays
+    // nothing; thereafter every present (admitted, coalesced, or suppressed) keeps it current with
+    // one bounded memcpy of the declared band. See [`pace_shadow_refresh`].
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    if !pace_exempt {
+        let (surf, stride, surf_len, sy0, sy1) = pace_src;
+        pace_shadow_refresh(id, surf, stride, surf_len, sy0, sy1, !pace_go);
+    }
     #[cfg(feature = "witness")]
     if let Some((surf, surf_len)) = probe {
         // WC-G's checksum is the OWNER's declaration of its own surface and is independent of whether
@@ -1391,6 +1425,248 @@ pub fn pace_service() {
     }
 }
 
+// ---- WPACE-TEXT — the present-boundary shadow (x86 + `wc`) --------------------------------------
+//
+// ### The defect (GR27 round 2, metal): text inside vug windows flickers under the pacer
+// `user-vug`'s HUD painter (`draw_num`) is CLEAR-THEN-REDRAW: it wipes its backing box to the
+// background and then stamps the digits. Pre-pacer, every present composited synchronously inside
+// the owner's own `SYS_WIN_PRESENT` — the one moment the owner is provably not writing — so the
+// compositor only ever read finished frames. WPACE-PANEL made the dominant carrier of a storming
+// window's damage ASYNCHRONOUS: the ~1 kHz tail drain (arbitrary app time) and frame-edge
+// composites riding another window's present. Those blits read the LIVE surface while the app is
+// mid-draw of its NEXT frame; land between the clear and the stamp and the readout blinks blank.
+// The crystal body barely shows it (`render_solid` is one-pass, every cell written once with its
+// final value — a mid-draw read is at worst a one-frame orientation seam); the text shows it hard,
+// because a half-drawn glyph row is BACKGROUND. WC-G predicted exactly this class: its review
+// established that a tail/frame-edge blit reads the surface the owner has since rewritten
+// (`own=no`).
+//
+// ### The fix: blit what the owner declared finished, never what it is drawing
+// One shadow per paced window, refreshed by a bounded memcpy at every present — i.e. only ever
+// while the owner is parked in the syscall and the surface is quiescent — and read by the
+// composite pass in place of the live surface. Every byte the panel sees was captured at a present
+// boundary, so a torn glyph is impossible by construction, from ANY pass (tail drain, foreign
+// frame-edge, drag-exposure repaints — the last of which could tear even pre-pacer). No app is
+// ever slept: the refresh is a memcpy of the declared band, and the pass side uses `try_lock`
+// with a provably-safe live fallback (contention means the owner is inside `pace_shadow_refresh`,
+// i.e. parked, i.e. the live surface is a finished frame at that instant).
+//
+// ### Memory (SHELLWIN-OOM rule)
+// Allocated FALLIBLY (`try_reserve`) on a window's first coalesced present only — a window the
+// pacer never defers allocates nothing — sized to `surf_len` (the full mapped slot: WC-G's
+// checksums and cache maintenance read that length off whatever address they are handed), bounded
+// by `MAX_WINDOWS` buffers total. On OOM the window simply stays on the live-read path (the pre-fix
+// regime: paced and correct, tearing text) and the decline is counted (`WPACE_SHDW_OOM`). The
+// buffers are slot-pooled statics, never freed: the validity bit is cleared when a slot is
+// re-issued (`create_inner`), and a stale-but-valid buffer for a dead row is unreachable because
+// the pass only reads rows that are `used`.
+
+/// WPACE-TEXT — the per-slot shadow buffers. All content access (fill and read) is under the
+/// per-slot lock, so a refresh can never realloc or write a buffer a pass is blitting from.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_SHADOW: [Mutex<alloc::vec::Vec<u8>>; MAX_WINDOWS] =
+    [const { Mutex::new(alloc::vec::Vec::new()) }; MAX_WINDOWS];
+
+/// WPACE-TEXT — one bit per slot: the shadow holds a full copy of the surface as of some present
+/// boundary. Set only by [`pace_shadow_refresh`] after a whole-surface fill; cleared when the slot
+/// is re-issued (see [`create_inner`]), which covers every close path with one line.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_SHADOW_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// WPACE-TEXT witness — shadow creations declined for want of heap. A nonzero count means some
+/// window is on the live-read (tearing-text) path; the wire says so instead of the operator's eyes.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+static WPACE_SHDW_OOM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WPACE-TEXT witness — refresh copies per slot, on the `[wpace]` line as `shdw=`. Zero on a line
+/// whose window never coalesced (no shadow exists) — that is the field saying "this window still
+/// composites its live surface, synchronously, and cannot tear". NOTE-5: counts only copies that
+/// moved bytes — a degenerate empty band ([`pace_shadow_refresh`]'s `off1 <= off0`) does not
+/// tick it, so `shdw` stays comparable to `paced + coalesced`.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+static WPACE_SHDW: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// WPACE-TEXT witness — passes DEFERRED for a contended shadow lock, per slot, on the `[wpace]`
+/// line as `defer=`. The MAJOR-1 residual made visible: a nonzero count is the drain and the
+/// owner's next present colliding on one window's shadow, each collision costing one window one
+/// extra ~1 ms frame — never a torn glyph, never a live read.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+static WPACE_SHDW_DEFER: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// WPACE-TEXT — refresh window `id`'s shadow from its (quiescent) surface. Called from
+/// [`present_banded`] only, i.e. with the owner parked in the present syscall; that parking is the
+/// entire correctness argument, so this function must never grow another caller that cannot make it.
+///
+/// `create` is "this present was coalesced": the first coalesce allocates (fallibly) and copies the
+/// whole readable extent; thereafter every present copies only the declared band `[sy0, sy1)` —
+/// prior bands were copied at their own presents, so the shadow is always the union of everything
+/// the owner has declared finished. A window that has no shadow and was not coalesced returns
+/// without touching the lock word beyond one load: the admitted present it belongs to composites
+/// synchronously from the live surface, which is quiescent right now — the pre-pacer path, safe.
+///
+/// The `lock()` (not `try_lock`) is deliberate and bounded: the only other holder is a composite
+/// pass blitting this same window's shadow, so the spin is at most one window's staged blit (plus
+/// its budgeted one-shot witnesses on the handful of passes that run them). That is a bounded
+/// busy-wait, not a sleep — the renderer is never parked — and it is paid only when the drain and
+/// the owner's next present actually collide on one window.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[allow(clippy::too_many_arguments)]
+fn pace_shadow_refresh(
+    id: WinId,
+    surf: usize,
+    stride: usize,
+    surf_len: usize,
+    sy0: usize,
+    sy1: usize,
+    create: bool,
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let slot = (id as usize).wrapping_sub(1);
+    if slot >= MAX_WINDOWS || surf == 0 || stride == 0 {
+        return;
+    }
+    let bit = 1u32 << slot;
+    let valid = PACE_SHADOW_OK.load(Relaxed) & bit != 0;
+    if !valid && !create {
+        return;
+    }
+    // The WHOLE mapped slot, not `h * stride`: the blit itself reads at most `h` rows at the row
+    // stride (F1), but WC-G's `blit`/`after`/`civac` checksums read — and its cache maintenance
+    // walks — `surf_len` bytes of whatever address they are handed, and after the swap that
+    // address is this buffer. Undersizing it would be an out-of-bounds read on every witness
+    // pass; sizing to `surf_len` also keeps `cks_blit` byte-comparable to the `cks_app` the
+    // owner's present declared over the same length.
+    if surf_len == 0 {
+        return;
+    }
+    let mut buf = PACE_SHADOW[slot].lock();
+    // NOTE-5 — count only copies that moved bytes, so `shdw` stays comparable to `paced +
+    // coalesced` and a degenerate empty band does not inflate it.
+    #[cfg_attr(not(feature = "witness"), allow(unused_variables))]
+    let copied;
+    if !valid {
+        if buf.len() < surf_len {
+            // SHELLWIN-OOM — fallible, from present context. A decline leaves the window on the
+            // live-read path: paced, correct, text may tear — strictly the pre-fix regime.
+            let add = surf_len - buf.len();
+            if buf.try_reserve(add).is_err() {
+                #[cfg(feature = "witness")]
+                WPACE_SHDW_OOM.fetch_add(1, Relaxed);
+                return;
+            }
+            buf.resize(surf_len, 0);
+        }
+        // First fill is the WHOLE extent, not the band: the pass reads any row the geometry
+        // reaches, and a band-only fill would put the allocator's zeros on the panel for every
+        // row outside the first present's declaration.
+        unsafe {
+            core::ptr::copy_nonoverlapping(surf as *const u8, buf.as_mut_ptr(), surf_len);
+        }
+        PACE_SHADOW_OK.fetch_or(bit, Relaxed);
+        copied = true;
+    } else {
+        let off0 = (sy0.saturating_mul(stride)).min(surf_len).min(buf.len());
+        let off1 = (sy1.saturating_mul(stride)).min(surf_len).min(buf.len());
+        if off1 > off0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (surf + off0) as *const u8,
+                    buf.as_mut_ptr().add(off0),
+                    off1 - off0,
+                );
+            }
+            copied = true;
+        } else {
+            copied = false;
+        }
+    }
+    #[cfg(feature = "witness")]
+    if copied {
+        WPACE_SHDW[slot].fetch_add(1, Relaxed);
+    }
+}
+
+/// WPACE-TEXT — the outcome of asking a window for its blit source. See [`pace_shadow_source`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+enum ShadowSrc {
+    /// The row's `surf` was swapped onto the shadow; the guard pins that buffer for the whole
+    /// blit and its bracketing witnesses. Composite from `r` unchanged.
+    Shadow(MutexGuard<'static, alloc::vec::Vec<u8>, SpinRelax>),
+    /// No shadow governs this window's pixels, and reading its LIVE surface is honest: an exempt
+    /// row (furniture/compat — never paced, present-synchronous), a window that has never been
+    /// coalesced (every composite of it runs inside its own present syscall, quiescent), or an
+    /// OOM-declined creation (the documented degraded mode — paced, text may tear). Composite
+    /// from `r` as-is.
+    Live,
+    /// A shadow is VALID for this window but its lock is held right now — the owner is inside
+    /// [`pace_shadow_refresh`]'s memcpy. Reading the live surface here would be UNSOUND: the
+    /// refresh completes in µs and the coalesced present returns without a `COMP_GATE` park, so
+    /// the owner can resume its clear-then-redraw while this pass is still in
+    /// `draw_window`/WC-G/WC-D — the exact torn-glyph the shadow exists to prevent, plus a
+    /// live-read the two witnesses would misjudge. The pass DEFERS this window (skips it and
+    /// re-raises its damage + `PACE_PENDING`), and the ~1 ms drain carries it next pass when the
+    /// µs-long refresh is done. Never a blocking spin: an owner PREEMPTED mid-refresh would make
+    /// the spin scheduling-length.
+    Defer,
+}
+
+/// WPACE-TEXT — decide a window's blit source: shadow, honest live, or defer. See [`ShadowSrc`]
+/// for why the three arms are exactly these and why the contended arm cannot fall back to live.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn pace_shadow_source(r: &mut Window) -> ShadowSrc {
+    use core::sync::atomic::Ordering::Relaxed;
+    if r.compat || r.owner_asid == 0 || is_kernel_owner(r.owner_asid) {
+        return ShadowSrc::Live;
+    }
+    let slot = (r.id as usize).wrapping_sub(1);
+    if slot >= MAX_WINDOWS || PACE_SHADOW_OK.load(Relaxed) & (1u32 << slot) == 0 {
+        // No shadow yet (never coalesced) — the live surface is quiescent, honest.
+        return ShadowSrc::Live;
+    }
+    // Shadow VALID from here on: a live read is only sound if we hold the lock. A miss DEFERS.
+    let g = match PACE_SHADOW[slot].try_lock() {
+        Some(g) => g,
+        None => return ShadowSrc::Defer,
+    };
+    // `surf_len`, not `h * stride`: WC-G's checksums and cache maintenance read the full mapped
+    // length off whatever `surf` they are handed — see [`pace_shadow_refresh`]'s sizing note. An
+    // OOM-declined buffer (shorter than the extent) is the honest live degraded mode, not a
+    // defer: the shadow bit is not set for it, so this branch is reached only if a valid shadow
+    // is somehow undersized, which the sizing invariant forbids — treat it as live defensively.
+    if r.surf_len == 0 || g.len() < r.surf_len {
+        return ShadowSrc::Live;
+    }
+    r.surf = g.as_ptr() as usize;
+    ShadowSrc::Shadow(g)
+}
+
+/// WPACE-TEXT — the contended-shadow deferral: re-raise this window's whole-box damage and its
+/// pacer pending bit so the ~1 ms tail drain ([`pace_service`]) re-attempts the blit next pass,
+/// by which time the µs-long refresh that held the lock has finished. Runs in the composite blit
+/// loop, which holds no table lock (the pass snapshotted and released it), so taking `table()`
+/// here is a fresh, un-nested acquisition — the same ordering `move_to`/`close` use when they
+/// re-damage. Whole box (`damage_all`), not the pass's band: conservative, and the next carrier
+/// re-derives its own band from the owner's presents in the interim.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn pace_shadow_defer(id: WinId) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let slot = (id as usize).wrapping_sub(1);
+    if slot >= MAX_WINDOWS {
+        return;
+    }
+    {
+        let mut t = table();
+        if let Some(r) = row_mut(&mut t, id) {
+            r.damage_all();
+        }
+    }
+    PACE_PENDING.fetch_or(1u32 << slot, Relaxed);
+    #[cfg(feature = "witness")]
+    WPACE_SHDW_DEFER[slot].fetch_add(1, Relaxed);
+}
+
 /// WPACE-PANEL witness — presents that composited in present context under the pacer (frame-edge
 /// admissions of pace-eligible rows). Exempt rows are not counted on either counter: their line is
 /// `[wcn]`'s, unchanged.
@@ -1429,20 +1705,39 @@ fn wpace_emit(ident: &[(u64, bool, bool, u32); MAX_WINDOWS]) {
         let paced = WPACE_PACED[slot].swap(0, Relaxed);
         let coalesced = WPACE_COALESCED[slot].swap(0, Relaxed);
         let tail = WPACE_TAIL[slot].swap(0, Relaxed);
-        if paced == 0 && coalesced == 0 && tail == 0 {
+        // WPACE-TEXT — `shdw=` is refresh copies this span, `defer=` is contended-shadow skips.
+        // Both are swapped unconditionally (before the traffic test) so their counters never
+        // straddle a span, and `defer` joins the traffic test so a window that only deferred this
+        // span still prints its line.
+        let shdw = WPACE_SHDW[slot].swap(0, Relaxed);
+        let defer = WPACE_SHDW_DEFER[slot].swap(0, Relaxed);
+        if paced == 0 && coalesced == 0 && tail == 0 && defer == 0 {
             continue;
         }
+        // Healthy paced steady state: `shdw ≈ paced + coalesced` (every non-suppressed present
+        // refreshes once a shadow exists); `shdw=0` with `coalesced>0` means the shadow could not
+        // be created (see the `shadow-oom` line) and this window's text can still tear. `defer=`
+        // is the MAJOR-1 residual: each is one window costing one extra ~1 ms frame, never a torn
+        // glyph.
         let (asid, live, _, _) = ident[slot];
         serial_println!(
-            "[wpace] win={} asid={:#x} live={} mode=panel paced={} coalesced={} tail={} frame_us={}",
+            "[wpace] win={} asid={:#x} live={} mode=panel paced={} coalesced={} tail={} shdw={} defer={} frame_us={}",
             slot + 1,
             asid,
             if live { "yes" } else { "no" },
             paced,
             coalesced,
             tail,
+            shdw,
+            defer,
             PACE_FRAME_US
         );
+    }
+    // WPACE-TEXT — the OOM decline count, its own line and only when nonzero: it is the one state
+    // in which the flicker this block exists to kill is still possible.
+    let oom = WPACE_SHDW_OOM.swap(0, Relaxed);
+    if oom > 0 {
+        serial_println!("[wpace] shadow-oom declines={} mode=panel", oom);
     }
 }
 
@@ -4079,6 +4374,27 @@ fn composite_inner() -> CursorTail {
         // per window rather than once per pass because the set is relative to the painter; the scan
         // is `MAX_WINDOWS` rows against a call that is about to copy a box.
         let clip = occ_clip(&rows, i, shell, fb.info().width, fb.info().height);
+        // WPACE-TEXT — blit from the present-boundary shadow when this window has one: `rw` is the
+        // pass's working copy of the row, with `surf` swapped onto the shadow buffer, and the guard
+        // pins that buffer (against refresh and refill) for the whole of the draw AND of the WC-G /
+        // WC-D witnesses around it — they must checksum the bytes the blit consumed, not whatever
+        // the owner writes next. Everything below this line reads `rw`, never `rows[i]`. On aarch64
+        // and `wc`-off x86 `rw` IS `rows[i]`, bit for bit.
+        #[allow(unused_mut)]
+        let mut rw = rows[i];
+        // WPACE-TEXT — three outcomes (see [`ShadowSrc`]): blit from the shadow (guard pins it
+        // across the draw and its witnesses), blit the honest live surface (no shadow, or the
+        // OOM degraded mode), or DEFER a valid-but-contended shadow — skip this window and let
+        // the ~1 ms drain carry it, never a live read that could tear.
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        let _shadow_pin = match pace_shadow_source(&mut rw) {
+            ShadowSrc::Shadow(g) => Some(g),
+            ShadowSrc::Live => None,
+            ShadowSrc::Defer => {
+                pace_shadow_defer(rows[i].id);
+                continue;
+            }
+        };
         // WC-D — the REFERENCE, taken BEFORE the blit. See `verify_reference` and the WCD-PRE section
         // of `verify_window`'s ledger for why it cannot be taken any later: the read-back's reference
         // used to be snapshotted from inside `verify_window`, which runs after `wcg::end` and
@@ -4093,7 +4409,7 @@ fn composite_inner() -> CursorTail {
         // charged to `[wc-g] us=` — manufacturing a `slow=yes` tear report out of this witness's own
         // cost. WC-G's bracket must still contain the copy and nothing else.
         #[cfg(feature = "witness")]
-        let wcd_ref = verify_reference(&fb, &rows[i], bands[i], &clip);
+        let wcd_ref = verify_reference(&fb, &rw, bands[i], &clip);
         // WC-G — bracket the blit. `begin` must be the last thing before `draw_window` and `end` the
         // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
         // and "as the copy left it", and anything inserted between them widens the interval they
@@ -4103,15 +4419,15 @@ fn composite_inner() -> CursorTail {
         // keeps the four-argument call and its byte-identical wire.
         #[cfg(all(feature = "witness", target_arch = "x86_64"))]
         let wcg_probe = super::wcg::begin(
-            rows[i].id,
-            rows[i].surf,
-            rows[i].surf_len,
-            rows[i].compat,
+            rw.id,
+            rw.surf,
+            rw.surf_len,
+            rw.compat,
             // WC-K3 — the excuse, widened to whatever the blit is about to withhold.
-            occ_excuse(rows[i].z, rows[i].id, &clip),
+            occ_excuse(rw.z, rw.id, &clip),
         );
         #[cfg(all(feature = "witness", not(target_arch = "x86_64")))]
-        let wcg_probe = super::wcg::begin(rows[i].id, rows[i].surf, rows[i].surf_len, rows[i].compat);
+        let wcg_probe = super::wcg::begin(rw.id, rw.surf, rw.surf_len, rw.compat);
         // CURSOR-3 — WHICH WINDOWS MAY CARRY THE SPRITE. WC-I's invariant "no verified pixel is ever
         // read with the sprite on the panel" is preserved here rather than weakened: this pass may
         // read this window's destination pixels back and compare them against its SOURCE surface —
@@ -4145,7 +4461,7 @@ fn composite_inner() -> CursorTail {
         // the read-back rather than of the latch.
         #[cfg(feature = "witness")]
         {
-            let r = &rows[i];
+            let r = &rw;
             if !r.compat && r.presented && r.id < 32 {
                 let bit = 1u32 << r.id;
                 if wcd_ref.is_some()
@@ -4166,8 +4482,8 @@ fn composite_inner() -> CursorTail {
         // keeps a compat row (owner ASID 0) from matching it by accident.
         overlaid |= draw_window(
             &fb,
-            &rows[i],
-            focus != 0 && focus == rows[i].owner_asid,
+            &rw,
+            focus != 0 && focus == rw.owner_asid,
             plan,
             may_overlay,
             // CURSOR-7 — `disturbed`, not `plan.is_some()`: the question the present-overlap test has
@@ -4184,7 +4500,7 @@ fn composite_inner() -> CursorTail {
         );
         #[cfg(feature = "witness")]
         if let Some(p) = wcg_probe {
-            let r = &rows[i];
+            let r = &rw;
             // GR21/WCD-OCC — the read-back-time occluder set, unioned in `end` with the pre-blit set
             // carried in the probe. x86 only; aarch64 keeps the eight-argument call.
             #[cfg(target_arch = "x86_64")]
@@ -4198,7 +4514,7 @@ fn composite_inner() -> CursorTail {
         // `wcg::end`: this emits to the serial UART, and inside the bracket it would be charged to
         // `[wc-g] us=`. See `wcg::stage_flush`.
         #[cfg(feature = "witness")]
-        super::wcg::stage_flush(rows[i].id);
+        super::wcg::stage_flush(rw.id);
         // WC-D — verify this window's blit against the scan-out, once per window id, from inside the pass
         // that drew it (the only place both the source surface and the destination rows are known).
         //
@@ -4208,7 +4524,7 @@ fn composite_inner() -> CursorTail {
         // meantime no longer matters: the reference was frozen before the blit.
         #[cfg(feature = "witness")]
         if let Some(vr) = wcd_ref {
-            verify_window(&fb, &rows[i], vr, &clip);
+            verify_window(&fb, &rw, vr, &clip);
         }
         // WC-N — pixels on glass for this window id. The only writer of `comp`.
         // WCN-CAUSE — `!seed[i]` is the cause: this row was not dirty at the table snapshot, so the
@@ -15610,6 +15926,15 @@ fn create_inner(
     let z = t.next_z;
     t.next_z = t.next_z.wrapping_add(1).max(1);
     let id = (slot + 1) as WinId;
+    // WPACE-TEXT — a re-issued slot must not inherit the dead tenant's shadow: the validity bit
+    // comes down here, under the same table lock that publishes the row, which is the single point
+    // every close path funnels through on its way to reuse. The buffer itself is not touched: it is
+    // pooled, and every access to its contents — including the whole-surface refill that precedes
+    // the bit going back up — is serialized by the per-slot lock, so even a pass that snapshotted
+    // the DEAD tenant's row moments ago and is still blitting its shadow cannot race the new
+    // tenant's fill (that pass holds the lock; the fill waits).
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    PACE_SHADOW_OK.fetch_and(!(1u32 << slot), core::sync::atomic::Ordering::Relaxed);
     let mut row = Window::empty();
     row.used = true;
     row.id = id;
