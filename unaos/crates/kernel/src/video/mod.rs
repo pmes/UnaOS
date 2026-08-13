@@ -320,3 +320,13 @@ pub fn init_edid(block: &[u8; 128], valid: bool, total_len: u16) {
         total_len
     );
 }
+
+// ── CONSWIN-PI / MENUBAR-PI ─────────────────────────────────────────────────────────────────────
+// The Pi's DESKTOP-READY seam — the aarch64 counterpart of `wcx`'s activation, and the module that
+// finally claims `menubar`'s tenancy on this arch. Declared at the FILE TAIL, not beside its sibling
+// tenants above, for the reason this track has proved twice over: a `mod` line inserted higher up
+// renumbers every panic `Location` recorded below it in this file, and those records live in the
+// loadable image whose knob-off byte-identity is the Pi track's standing proof. Nothing is below
+// this, so nothing moves. `pidesk` off is a compile-time absence and the image never contains it.
+#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+pub mod pidesk;

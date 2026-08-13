@@ -12781,7 +12781,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
     //
     // Reserved only while there is somewhere to go: with fewer than two windows in the focus ring the key
     // falls through and is delivered as an ordinary TAB, so a single-window app keeps a normal keyboard.
-    if wc_focus_key(ev) {
+    #[cfg(feature = "pidesk")] if crate::video::crystal::key_escape(ev) { return true; } if wc_focus_key(ev) { // MENUBAR-PI: <Esc> dismisses an OPEN SHARD menu, asked FIRST — x86 asks the identical question in the identical position (`wc_route_event`, ahead of `wc_focus_key`), because a modal surface must get the key before the focus ring does or Escape would TAB the desktop out from under an open menu. `key_escape` consumes ESC only while the menu is open, so every other boot is byte-alike. ⚠ ONE LINE, folded onto the `if` below: a line ADDED to this file renumbers every panic `Location` under it and breaks the knob-off `kernel8.img` byte-identity proof (PI-DESK's rule, and this file is named in it).
         return true;
     }
     // CLICK-ROUTE: the pointer's twin of the line above, and in the same place for the same reason —

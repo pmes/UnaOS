@@ -456,9 +456,9 @@ pub fn request_present_rect(x: usize, y: usize, w: usize, h: usize) {
 /// report it and the `+ 1` cannot come from `STRIP_MAX`. It is stated here, at the one array that
 /// has to hold it, rather than by promoting the menu to a tenant — which would spend a permanent
 /// occlusion slot on a surface that is absent for all but a few seconds of a boot.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
 const DESK_STRIP_MAX: usize = super::strip::STRIP_MAX + 1;
-#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
 const DESK_STRIP_MAX: usize = 0;
 
 /// SHELLDESK — the desktop present's occluder capacity: every window box ([`super::wm::occluders`]
@@ -1154,7 +1154,7 @@ impl Screen {
         // unchanged and `Console::page_rows` identical at 0x78 — i.e. the whole delta was here.
         // Written as two cfg arms, so the platform with no furniture fills `occ` in place exactly as
         // it always did and the promise is kept by construction rather than by assertion.
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
         let (nocc, nwin) = {
             // `occluders` writes exactly `MAX_WINDOWS` slots; the furniture tail is appended after.
             let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
@@ -1186,7 +1186,7 @@ impl Screen {
             }
             (n, nw)
         };
-        #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+        #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
         let (nocc, nwin) = {
             // `DESK_OCC_MAX == wm::MAX_WINDOWS` here (no strip registry is compiled), so this is the
             // WC-I call on the WC-I array, unchanged.

@@ -594,7 +594,7 @@ pub fn chrome_h(ph: usize) -> usize {
 /// `0` on aarch64 and on any x86 build without `wc` — `video::menubar` is not compiled there — so
 /// every non-x86-wc surface lays out exactly as it did before this arc.
 pub fn top_chrome_h(pw: usize, ph: usize) -> usize {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
     {
         if let Some((_x, y, _w, h)) = crate::video::menubar::strip_rect(pw, ph) {
             // The bar is flush to the top edge, so the rows it costs a view below it are `y + h`.
@@ -604,7 +604,7 @@ pub fn top_chrome_h(pw: usize, ph: usize) -> usize {
         }
         0
     }
-    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
     {
         let _ = (pw, ph);
         0

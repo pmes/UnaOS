@@ -12576,3 +12576,179 @@ gate leak. The proof owed is knob-off **210 green**, which it is. The `pidesk`-g
 the usual discipline regardless: `arch/aarch64/syscall.rs` and `main.rs` are both exactly
 **line-neutral** (22504 and 5032 lines, unchanged), each added line paid for by a line of prose
 compressed in the same file, so the gated arm cannot shift a panic `Location` in the knob-off build.
+
+## CONSWIN-PI / MENUBAR-PI — the console gets a window and the bar gets turned on (aarch64 `pidesk`, 2026-08-13)
+
+Two pieces of the desktop-parity campaign, both of which were x86-gated in the EXPERIENCE layer
+rather than for any hardware reason — which under Peter's ONE OS ruling makes them defects rather
+than platform differences. This arc lands both, and corrects a documented assessment that was right
+about its premise and wrong about what followed from it.
+
+### MENUBAR-PI — the tenancy was never claimed on either arch, and then it was claimed on only one
+
+`menubar::ENABLED` starts `false`, and PI-DESK recorded that as deliberate policy: *"the menu bar is
+DEFAULT OFF, on the Pi too… compiling a tenant is not enabling it."* That is still the right policy.
+What was missing is the other half of it — **something has to ask.**
+
+On x86 something does. SHELLDESK (`ca6094a2`, driven by Peter's metal Boot A: *"i cannot see the menu
+because a shell is still posing as the desktop"*) made `wcx::activate` the asker, and it is the ONLY
+live `set_enabled(true)` in the tree. The other three are `witness` fixtures — `menubar::selftest`'s
+legs 3-4, its MENUBAR-OCC probe, `crystal::selftest` — and every one of them restores the flag before
+it returns. On the Pi there was no asker at all, so the bar was compiled, composed (three relaxed
+atomics per pass) and permanently invisible.
+
+The fix is a Pi seam that asks, plus the two supports SHELLDESK proved the enable needs and which
+were left hard-gated to x86 when PI-DESK widened the tenants:
+
+| what | was | now |
+|---|---|---|
+| `ui_status::top_chrome_h` | `all(x86_64, wc)`, literal `0` elsewhere | widened — the Pi's tiler reserves the bar's rows through `wm::work_top` |
+| `screen.rs` `DESK_STRIP_MAX` + the `present_background` occluder arms | `all(x86_64, wc)` | widened — the desktop present SUBTRACTS every strip rect on the Pi too |
+
+That second one is load-bearing and is exactly Boot A's defect. The shell's `Console::draw` opens
+with a whole-panel `clear_screen`; without the subtraction the bar is erased within one frame of
+appearing, on a boot where every other witness reads healthy.
+
+### CONSWIN-PI — the console window, and the correction to PI-DESK M4
+
+PI-DESK M4 stopped here and named the blocker:
+
+> So opening a console window on the Pi today would window the **boot-log** console, which nothing
+> writes to after handoff: a correct window containing a frozen log.
+
+**The premise is exactly right and the inference does not hold, because x86 ships that window.** On
+x86's desktop lane the same row is, in `wcx.rs`'s own words, *"a FROZEN BOOT-LOG SNAPSHOT for the rest
+of the boot"* — the desktop's boot-log pane, and one of the two kernel windows an x86 desktop carries
+(the other being `main.rs`'s `open_shell_window`, a DIFFERENT window on a different path). A frozen
+boot-log console window is not a failure mode on either arch; it is the feature.
+
+M4's mechanical estimate was also accurate. The port is 49 `cfg` widenings in `fbcon.rs`
+(`all(x86_64, wc)` → `any(all(x86_64, wc), all(aarch64, pidesk))`), one widened `PANIC_MIRROR`, one
+widened `use alloc::vec::Vec`, one statement added to `draw_fb`'s aarch64 arm, and one new
+architectural seam — the pacing gate's clock RATE, which named `apic::tsc_hz` directly and now goes
+through `fbcon::pace_clock_hz` (CNTFRQ_EL0 on aarch64). Every degradation there returns `0`, and `0`
+means PRESENT, so a board whose rate cannot be read paces per line exactly as before pacing existed.
+No second implementation of anything: one `route_present_banded`, one `Pending`, one
+`panel_console_window_open`, two arches running the same bytes.
+
+The seam that calls it is `video/pidesk.rs` — the Pi's DESKTOP-READY point, the counterpart of
+`wcx::activate` and deliberately not a port of its body (the Kepler takeover, the backbuffer resync
+and the deferred desktop-app launch are x86 display-driver concerns with no Pi twin). What is shared
+is the decision SEQUENCE: panel, dock-hostability, console window, bar enable, composite.
+
+### The one place the sequence differs from x86, and the run that forced it
+
+`wcx`'s CONSOLEWIN law says a panel whose dock cannot host a full `MAX_WINDOWS` strip gets no console
+window, because the console carries a minimise disc and the dock is the only way back from that park.
+On x86 that check is a TOTAL decline — `activate` returns, and the bar thirty lines below never
+happens. Sound there: the console window is a precondition of the desktop being built around it.
+
+Not sound here, and the gate surface proved it rather than the argument. The first
+`UNAOS_PIDESK=1 ./arroyo kernel8-test` run of this arc printed
+
+```
+[pidesk] activate DECLINE reason=dock-cannot-host-full-strip panel=640x480 rows=12
+```
+
+and stopped — QEMU raspi4b's 640x480 cannot host a twelve-tile dock. The menu bar half of the arc
+would have been unwitnessed on the only surface the DONE gate runs, and invisible to any operator on
+a small panel, **for a reason that has nothing to do with menu bars**: the law's own justification is
+about one control on one window, and `menubar`'s floors are `const`-asserted to fit 640x480 precisely
+so no gate declines it. So the check now guards exactly what it argues about — the console window —
+and the bar follows either way. Nothing is weakened: a panel that cannot guarantee the dock still gets
+no console window, hence no minimise disc, hence nothing to strand.
+
+### THE LIVE CONSOLE — implemented, measured, and reverted with the evidence
+
+The brief asked whether the Pi's console could be LIVE rather than frozen, and there is a real
+argument that it can. `fbcon::detach()` exists so exactly one core writes the PANEL once the GUI owns
+it; a routed console does not write the panel (`draw_fb` hands back the window surface, which is
+kernel RAM no scan-out reads, and the pixels reach glass only through `wm`'s staged present). So the
+detach's reason is discharged by the routing, and the handoff can skip it.
+
+It was implemented — `pidesk::activate` returned `routed`, `main.rs`'s handoff line became
+`if !pidesk_activate_maybe() { fbcon::detach(); }` — and then measured, and **the argument is
+incomplete**. Discharging *who writes the panel* does not discharge *who drives the COMPOSITOR*. A
+routed console presents from PRINT context, on whatever core printed, and after the handoff the Pi
+prints from every core it has. At bench geometry that turned a 108/108 run into **97/108, 37 forbidden
+hits, 2063 lines scanned against the knob-off control's 6020**. The witness battery said so in its own
+words:
+
+```
+[wc-g] win=1 … us=38907 rectscan_us=10222 slow=yes -> BLIT
+[wc-g] win=1 … after=0x709b519dcf17ce25 slow=yes -> RACE-BLIT
+[wc-c] side-by-side windows=2 drawn=1
+[wc-d] verify win=3 … bad_ram=23104 … got=0x000000 want=0x20ff20 -> FAIL
+=== AARCH64 EXCEPTION: SYNCHRONOUS ===
+```
+
+A synchronous exception is not a pacing problem and would not have been fixed by tuning one.
+
+**And this is why x86's desktop lane detaches too.** The live routed console exists on x86 only on the
+`usbdebug` bench lane — no render service, no witness battery, effectively one service loop — while
+the lane an operator actually boots detaches unconditionally. That was not documented as a hazard
+anywhere. This arc rediscovered it from the other end, on the other arch, and the ledger in
+`pidesk.rs` is the first place either tree says WHY.
+
+So the real blocker is one layer below the one M4 named, and it applies to BOTH arches: **a console
+that presents from arbitrary print context is an unsynchronised compositor client.** The Pi ships the
+frozen window — parity, honestly achieved — and the fix is named rather than attempted: move the
+console's presents onto the RENDER core, one paced call per frame, through the `fbcon::console_service`
+hook that already exists for exactly this on x86's bench lane. That needs a line in the Pi render
+service, which is another lane's file this cycle.
+
+### Standing conflict: the arm-pi witness battery does not know about a kernel console row
+
+At bench geometry (`UNAOS_FBW=1920 UNAOS_FBH=1200`) the armed run is **104/108 with 17 forbidden
+hits**, and every one of them is a consequence of the console window EXISTING rather than of anything
+it does:
+
+* `[wc-c] side-by-side windows=2 drawn=1` — the console's 1306x780 box at (307,158) occludes one of
+  the two fixture windows on a 1920x1200 panel.
+* `[wc-j] vacate close_desktop=false (0/5)` — the vacated pixels reveal the CONSOLE, not the desktop.
+* `[wc-g] win=1 …` — **`win=1` is now the console**, not the fixture's window. The witness is
+  describing a different object than the spec's author meant.
+
+x86 already had to absorb this; `scripts/specs/x86-witness.spec:156` says so outright — *"win=1 is the
+console window on this bench"*. The arm-pi spec was written against a Pi desktop with no kernel console
+row and has not been. **No spec REQUIRE or FORBID was touched, weakened or re-worded by this arc** —
+reconciling them is a spec decision and belongs to the integrator, not to this seam. The 640x480 DONE
+gate is unaffected because the dock cannot host a full strip there, so no console window is minted and
+the battery sees the panel it was written for.
+
+### Byte-identity, and the discipline PI-DESK warned about
+
+Knob-off `kernel8.img` is **byte-identical** to the pre-arc baseline
+`27d782b5b7951ad19abb0ad8a9d05b79174f2d456c13a6ecaa361ae18170cc8b`, measured by sha256 against a build
+taken BEFORE the first edit.
+
+PI-DESK's rule — *a change to any file compiled into the knob-off image must be LINE-NEUTRAL, because
+panic `Location` records embed file line numbers* — held across five files this arc, and it shaped the
+code. `fbcon.rs` is **52 added / 52 removed** with every widening done in place, and its ONE new
+statement (`draw_fb`'s aarch64 routed branch) is written on the line it shares with `&self.fb`.
+`ui_status.rs` is 2/2, `screen.rs` 4/4. Everything genuinely new lives where nothing is below it:
+appended to `fbcon.rs`'s tail, appended to `video/mod.rs`'s tail, appended to `main.rs`'s tail, or in
+`video/pidesk.rs`, which is a new file and moves nothing. `main.rs`'s call site rides the existing
+`fbcon::detach()` line on the discipline PI-RAST established, and folds to the bare `detach()` when the
+knob is off because `pidesk_activate_maybe` is then `#[inline(always)] false`.
+
+### One more parity gap, closed in passing: `<Esc>` and the open menu
+
+PI-DESK M3 gave the Pi the click router's furniture arm (`strip::press_route`, ahead of every window
+arm), so the crystal has always been PRESSABLE on the Pi. What it did not give it was the key half:
+`crystal::key_escape` had one caller, x86's `wc_route_event`, asked ahead of `wc_focus_key`. The
+aarch64 router asked `wc_focus_key` first and nothing else, so on the Pi `<Esc>` fell through to the
+focus ring and could TAB the desktop out from under an open menu instead of closing it. The Pi now
+asks the identical question in the identical position. `key_escape` consumes `<Esc>` only while the
+menu is open, so every boot without one open is byte-alike, and the fix is one folded line — this
+file is named in PI-DESK's line-neutrality rule.
+
+### What is live on the Pi that was not before
+
+| | before | after |
+|---|---|---|
+| menu bar | compiled, composed, permanently invisible | **ENABLED at desktop bring-up**, `1920x34` on the bench panel / `640x34` on the gate surface, damage-driven repaints |
+| SHARD menu | pressable, but `<Esc>` fell through to the focus ring | pressable **and** dismissable; `About This Shard` is real on aarch64, `Sleep`/`Restart`/`Shut Down` print their honest `unimplemented:` lines (PSCI is not this arc) |
+| top reservation | `top_chrome_h` returned a literal `0` | the tiler reserves the bar's rows through `wm::work_top` |
+| desktop present | no strip subtraction compiled | subtracts every strip rect, so the shell's whole-panel clear cannot erase the bar |
+| console | boot log on the raw panel, gone at handoff | a **compositor window** — `1296x736`, `162x92` glyph cells, `KERNEL_OWNER_CONSOLE`, hittable, with the panic fallback armed — on any panel whose dock can host a full strip |

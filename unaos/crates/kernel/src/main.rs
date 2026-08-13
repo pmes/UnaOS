@@ -1278,7 +1278,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // whole M6b..U7 fixture cascade is already spawned and running on the APs, holding ASIDs 1-8.
             typematic_selftest(); // UVUG-6: prove the dropped-KeyUp wedge is closed (report-level + guards)
             unaos_kernel::arch::serial::RX_READY.init(); // M5c: the RX-wake semaphore's waiter list
-            unaos_kernel::video::fbcon::detach(); pi_rast_demo_maybe(); // PI-RAST demo (no-op unless UNAOS_PIRAST=1) on the SAME source line as the detach it rides, so the wire-in adds ZERO source lines ahead of any panic Location — the pi knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail; runs here because the panel is up, fbcon has just stopped mirroring, and the input/render service tasks below are not spawned yet (nothing else paints).
+            if !pidesk_activate_maybe() { unaos_kernel::video::fbcon::detach(); } pi_rast_demo_maybe(); // CONSWIN-PI: the DESKTOP-READY seam rides the detach line on the same zero-source-lines discipline PI-RAST established, and it GUARDS the detach — `pidesk_activate_maybe` answers true only when the console is ROUTED into a compositor window, and a routed console does not write the panel (`fbcon::draw_fb` hands back the window surface), so the one thing the detach exists to guarantee — exactly one core writing the panel — is already true and skipping it leaves the console window LIVE instead of freezing it at the handoff. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach(); pi_rast_demo_maybe();` it has always been. // PI-RAST demo (no-op unless UNAOS_PIRAST=1) on the SAME source line as the detach it rides, so the wire-in adds ZERO source lines ahead of any panic Location — the pi knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail; runs here because the panel is up, fbcon has just stopped mirroring, and the input/render service tasks below are not spawned yet (nothing else paints).
             // M5c: on metal, route + enable the PL011 RX interrupt (SPI 153) to the input core so the
             // input task is woken by the UART instead of polling. GICD config stays BSP-only (this is
             // global distributor state). A backstop task also periodically wakes the input service so
@@ -5039,3 +5039,38 @@ const PI_RAST_FRAMES: u32 = 90;
 #[cfg(all(feature = "pi", not(feature = "pirast"), target_arch = "aarch64"))]
 #[inline(always)]
 fn pi_rast_demo_maybe() {}
+
+// ── CONSWIN-PI / MENUBAR-PI ─────────────────────────────────────────────────────────────────────
+// The Pi's DESKTOP-READY wire-in. Called from the aarch64/baremetal GUI handoff, on the SAME source
+// line as the `fbcon::detach()` it guards, so the whole thing adds zero source lines ahead of any
+// panic `Location` literal — the knob-off byte-identity constraint PI-RAST and PI-V3D-1 established
+// on this track and which this arc keeps unbroken in five files.
+//
+// It GUARDS the detach rather than merely riding it, and that is the substance of the console half of
+// the arc. `fbcon::detach()` sets `GUI_ACTIVE`, after which `fbcon::_print` returns at its first test
+// and no kernel line reaches the console again by any path — which is why the PI-DESK M4 assessment
+// concluded a Pi console window "would frame a frozen log". The premise was right and the conclusion
+// does not follow, because the detach's REASON is discharged by the routing: it exists so that exactly
+// one core writes the panel once the GUI owns it, and a routed console writes kernel RAM, not the
+// panel (`FbCon::draw_fb` returns the window surface; the pixels reach glass only through `wm`'s
+// staged present). So when — and only when — the console was successfully routed, the handoff skips
+// the detach and the console window stays LIVE for the rest of the boot.
+//
+// Worth recording that this makes the Pi's console window BETTER than x86's rather than equal to it:
+// on x86's desktop lane the same row is, in `wcx.rs`'s own words, "a FROZEN BOOT-LOG SNAPSHOT for the
+// rest of the boot", because that lane detaches unconditionally. The live routed console exists on
+// x86 only on the `usbdebug` bench lane, which never detaches at all. Same code, three lanes, and the
+// Pi now runs it on the one that matters to an operator.
+#[cfg(all(target_arch = "aarch64", feature = "pidesk", feature = "baremetal"))]
+fn pidesk_activate_maybe() -> bool {
+    unaos_kernel::video::pidesk::activate()
+}
+
+// Knob-off (and every non-baremetal aarch64 build): the wire-in compiles to nothing. `#[inline(always)]`
+// on a body that is a constant `false` means the call site emits zero instructions and folds to the
+// bare `detach()` it has always been, so the image stays byte-identical.
+#[cfg(all(target_arch = "aarch64", not(all(feature = "pidesk", feature = "baremetal"))))]
+#[inline(always)]
+fn pidesk_activate_maybe() -> bool {
+    false
+}
