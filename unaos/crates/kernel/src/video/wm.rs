@@ -7119,6 +7119,38 @@ const DRAIN_STALL_SPINS: u64 = 1 << 27;
 static DRAIN_STALL_REPORTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// DRAINSTALL (PA38 metal) — spin iterations past which [`DrainBarrier::drain`] ABANDONS its wait.
+///
+/// **The wait is BOUNDED from here on, and this is the bound.** Eight times [`DRAIN_STALL_SPINS`],
+/// i.e. order 10^9 spin hints — several seconds of real time on the Pi, and four orders of magnitude
+/// past the handful of panel-clipped `memcpy`s the barrier is genuinely bounded against. Nothing
+/// healthy reaches it, the tripwire fires long before it, and the tripwire stays exactly as sharp.
+///
+/// ### Why a SPIN COUNT, when WEDGE-10's rule is a wall-clock deadline
+/// `cursor.rs`'s bounded waiters (`claim_bounded`, `overlay_claim_bounded`) refuse to spin without a
+/// measurable deadline, and they are right for their sites: pointer rate, 1-2 ms budgets, a spin
+/// count could not express either. This site is the opposite case on both axes. It runs IRQ-MASKED on
+/// the teardown path (`sched::exit` -> `clear_handle_row`), where a timer read is neither free nor
+/// trustworthy against a machine that may already be mid-wedge; and its budget is not milliseconds
+/// but "past every possibility of legitimate progress". The instrument this loop already carries —
+/// [`DRAIN_STALL_SPINS`] — is denominated in spins for that same reason, and a bound in the tripwire's
+/// own units is one number the reader can compare rather than two they must reconcile. What WEDGE-10
+/// forbids is an UNBOUNDED masked spin; a finite spin count terminates unconditionally, which is the
+/// property that matters.
+const DRAIN_ABANDON_SPINS: u64 = DRAIN_STALL_SPINS * 8;
+
+/// DRAINSTALL — drains that ABANDONED their wait. Unconditional (not witness-gated), on the same
+/// argument the `REFUSED furniture` line makes: a build without witnesses is the build the operator
+/// is sitting in front of, and an abandoned barrier is the one event on this path that can leave a
+/// stale rectangle on their panel. Published by [`wedge1_dwell_emit`] as `abandoned=`.
+static DRAIN_ABANDONED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAINSTALL — whether the abandon LINE has been printed, once per boot and globally, on the
+/// argument [`DRAIN_STALL_REPORTED`] makes. The COUNTER above is not rate-limited — only the line is
+/// — so a second abandonment is never invisible, it merely does not re-take the serial lock.
+static DRAIN_ABANDON_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 // ---- WEDGE-1r2 — the drain barrier's silence, made readable --------------------------------------
 //
 // **What this arc found, and it is a finding about an INSTRUMENT rather than about a mechanism.**
@@ -7376,6 +7408,47 @@ impl DrainBarrier {
                     DRAIN_PENDING.load(Ordering::Acquire),
                     spins
                 );
+            }
+            // DRAINSTALL (PA38 metal) — **THE WAIT ENDS.** Past this point the loop stops being a
+            // wait and becomes a hang, and PA38 measured what that costs: a core pinned at 99% with
+            // `DRAIN_PENDING` standing, every `composite_inner` taking its barrier early-return
+            // (`[sched6] composites=0/s`), EL0 totals frozen at 147369 while the service lane climbed
+            // — a live kernel behind a dead panel, unrecoverable without a power cycle.
+            //
+            // **What the barrier buys, and what it therefore costs to abandon — stated honestly,
+            // because this is the one edit in this arc that trades a protection for a bound.** The
+            // barrier exists so that no composite which snapshotted a row before the teardown cleared
+            // it can still be blitting from that row's surface when the caller returns. `close_owner`'s
+            // own note prices the failure exactly: *"today that would be a stale read, but under WC-B's
+            // per-ASID surface mappings it becomes a kernel abort mid-blit."* WC-B is not landed. So
+            // the cost of abandoning TODAY is a stale rectangle — one wrong frame, self-healing at the
+            // next present — and the cost of not abandoning was measured on PA38 as the whole machine.
+            //
+            // ⚠ **WC-B MUST REVISIT THIS.** When per-ASID surface mappings land, a stale read becomes
+            // a fault and this trade inverts. The abandon arm then needs an answer that is not "carry
+            // on" — the shape available is the one `cursor.rs` already uses for its own refusals: OWE
+            // the unsafe half rather than perform it. That work is not this arc's, and it is named
+            // here rather than left for the next reader to rediscover from a crash.
+            //
+            // The abandonment can never be silent. `DRAIN_ABANDONED` is unconditional and appears on
+            // every `[wedge1] dwell` line as `abandoned=`, whose verdict goes to `ABANDONED` — a
+            // reading the spec battery FORBIDS, so a boot that reaches this arm reds the gate instead
+            // of quietly shipping a stale frame.
+            if spins >= DRAIN_ABANDON_SPINS {
+                // Lock-free first, exactly as `<D!>` is: the fact that the bound was reached must
+                // survive a serial path that is itself the wedge.
+                crate::wedge2::mark("<D?>");
+                DRAIN_ABANDONED.fetch_add(1, Ordering::Relaxed);
+                if !DRAIN_ABANDON_REPORTED.swap(true, Ordering::Relaxed) {
+                    serial_println!(
+                        ":: [wedge1] DRAIN ABANDONED core={} blit_active={} pending={} spins={} == bounded-wait ::",
+                        crate::arch::sched::meter_current_cpu(),
+                        BLIT_ACTIVE.load(Ordering::Acquire),
+                        DRAIN_PENDING.load(Ordering::Acquire),
+                        spins
+                    );
+                }
+                break;
             }
         }
         #[cfg(feature = "witness")]
@@ -8799,14 +8872,24 @@ fn wedge1_dwell_emit(span: u64) {
     // A GAUGE — loaded, never drained. Draining it would report a stuck core once and then forget it,
     // which is the opposite of what a standing count is for.
     let in_spin = F4W_IN_SPIN.load(Relaxed);
+    // DRAINSTALL — a GAUGE like `in_spin`, loaded and never drained: an abandonment is a permanent
+    // fact about this boot (a stale rectangle was allowed onto the panel), not a per-window rate, and
+    // draining it would let the very next rollup read clean over it.
+    let abandoned = DRAIN_ABANDONED.load(Relaxed);
     // Lens fix (s1u): the quiet-window early-out must also test the spin evidence. The swaps above
     // have already drained `spun`/`spin_max`, so a drain that straddled the previous rollup boundary
     // (counted there as `drains`, its spin published here) would have its DWELL evidence silently
     // dropped by a `drains==0` return — banking QUIET for a window that measured a stall.
-    if drains == 0 && in_spin == 0 && spun == 0 && spin_max == 0 {
+    if drains == 0 && in_spin == 0 && spun == 0 && spin_max == 0 && abandoned == 0 {
         return;
     }
-    let verdict = if in_spin > 0 {
+    // DRAINSTALL — ABOVE `INFLIGHT`, and deliberately. An abandonment is the strongest thing this
+    // instrument can report: the bound was reached, the wait was given up, and the panel may hold a
+    // rectangle no longer backed by a live row. A window that has one may not be described by any
+    // milder verdict, however healthy the rest of its numbers look.
+    let verdict = if abandoned > 0 {
+        "ABANDONED"
+    } else if in_spin > 0 {
         "INFLIGHT"
     } else if spin_max >= DRAIN_DWELL_NOTE {
         "DWELL"
@@ -8830,13 +8913,15 @@ fn wedge1_dwell_emit(span: u64) {
         "QUIET"
     };
     serial_println!(
-        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} span={}ms -> {}",
+        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} bound={} abandoned={} span={}ms -> {}",
         drains,
         spun,
         spin_max,
         DRAIN_DWELL_NOTE,
         in_spin,
         if DRAIN_STALL_REPORTED.load(Relaxed) { "fired" } else { "silent" },
+        DRAIN_ABANDON_SPINS,
+        abandoned,
         span,
         verdict
     );

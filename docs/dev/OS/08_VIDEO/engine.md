@@ -5706,6 +5706,111 @@ proof, never a refutation of the mechanism.
 * A quiet `[wedge1]` still means **nothing about the barrier** unless `drains > 0`. That is the whole
   point of the verdict naming the scene.
 
+### DRAINSTALL — the tripwire finally caught one, and a refused close is what queued it (PA38 metal, 2026-08-12)
+
+**WEDGE-1's tripwire fired on the bench for the first time.** Peter clicked the close disc on one of
+two lingering kernel-furniture rows during a live PI-DESK desktop session. The wire, in order:
+
+```
+close_owner asid=0xffffff01 REFUSED furniture rows=1 ids=[1] — KERNEL FURNITURE IS NOT CLOSABLE
+!>:: [wedge1] DRAIN STALLED cortripwire ::
+[sched6] passes=2/s composites=0/s
+:: SCHED: load c0=0% c1=0% c2=0% c3=99% ::
+[prio] svc=328 el0=0 defer=9 agedin=18 /win (band>=2, totals svc=39123 el0=147369)
+```
+
+`el0=147369` never moves again while `svc` climbs; `[pstrip]` redraws fall to ~0; GENET, pulse and
+spread stay alive. **The panel is frozen and the kernel is not.** (The `!>` is the tail of `<D!>`,
+torn by interleave — the token arrived, its opening bytes did not, which is exactly the lossy-mark
+behaviour §WEDGE-1r2 designed for.)
+
+#### The chain, convicted
+
+1. **The disc should not have been clickable, and `controls()` says why it was.** `wm.rs`'s gate
+   declines only `r.compat || r.owner_asid == 0`; `FURNITURE_HAS_CONTROLS = true`, `ctrls_for(_r)`
+   ignores its row, and `control_hit`/`close_box_hit` are ownership-blind. Furniture and app windows
+   are pixel-identical in the title bar, deliberately (*"one cluster, every row: the console is a
+   normal app window"*, Peter, 2026-08-11).
+2. **aarch64 has no furniture route.** x86's `wc_click_route_at` sends kernel-band owners to
+   `wc_close_furniture` (close by ID). `arch/aarch64/syscall.rs` contains no `is_kernel_owner` arm at
+   all, so the click landed on `wc_close_click` → `wm::close_owner`, the blast-radius primitive.
+3. **`close_owner` refused, correctly, and returned 0 before raising any barrier.** Its `n == 0` early
+   return skips the drain, the reclaim and the tail composite. The refusal itself is clean.
+4. **`wc_close_click` then ran the teardown side effects anyway.** Neither guard below the
+   `close_owner` call is predicated on the close having happened, and `focus_asid()` can be
+   `0xffffff01` because `hit_test` does not filter kernel owners. So a close that removed **nothing**
+   executed `focus_changed(0)` — a full shell raise, which parks every user window below a fresh
+   `SHELL_Z`, `damage_all()`s them, publishes `hidden=true` fleet-wide through `vugmin_publish`,
+   queues N boxes onto `DEFER` via `erase`, and arms `request_full_present`. **This is precisely the
+   defect CLOSE-TEARDOWN already ruled on** (*"closing a window causes the other open vug stat pulse
+   windows to minimize SOMETIMES"*) — and its fix, `focus_release`, has **zero aarch64 callers**.
+5. **The queue then had no one to drain it.** Every window was parked and hidden, so no presenter was
+   left to drive a composite; `drain_deferred` bails outright while `DRAIN_PENDING != 0`.
+6. **A teardown raised the barrier and the wait never ended.** `DrainBarrier::drain` spun IRQ-masked
+   and *unbounded* on `BLIT_ACTIVE`. The blitter it waits for is **not** atomic w.r.t. the scheduler:
+   the `TableGuard`'s `IrqMask` is released the moment the registration block closes, and `composite()`
+   never re-masks, so on every non-syscall caller the guard window is a preemptible kernel task. The
+   termination argument (*"every member is running a bounded panel-clipped blit"*) assumes the member
+   **runs**; that was never proven, and under a starved EL0 it was false.
+7. **`DRAIN_PENDING` stood forever ⇒ every `composite_inner` took its barrier early-return.** That is
+   `composites=0/s` exactly, and the 99% core is the spin itself.
+
+#### The fix
+
+* **A refused close performs no teardown side effect.** `wc_close_click` returns `"furniture-refused"`
+  immediately when `is_kernel_owner(owner)` — above the focus drop and above `focus_changed(0)`. No
+  park, no fleet-wide hide, no `DEFER` entries, no `request_full_present`, no composite predicated on
+  a close that did not happen. One line, replacing one line: `arch/aarch64/syscall.rs` is compiled
+  into the knob-off `kernel8.img`, so its PANIC-`Location` line-neutrality rule binds.
+* **It also unwinds the CLOSE-FIX hop.** That retry loop re-enters only on `noproc-selftest`, and its
+  stated bound — *"every hop removes at least the hit row, so MAX_WINDOWS caps it structurally"* — is
+  **false for a REFUSED row**, which is removed by nothing. It terminated only incidentally, on the
+  `o2 != owner` guard plus `hit_test` determinism. A furniture close no longer reaches the tag.
+* **The drain's wait is now BOUNDED** at `DRAIN_ABANDON_SPINS = DRAIN_STALL_SPINS * 8` (order 10^9
+  spin hints, several seconds on the Pi). On expiry it emits `<D?>` lock-free, counts
+  `DRAIN_ABANDONED`, prints `:: [wedge1] DRAIN ABANDONED core=… blit_active=… pending=… spins=… ==
+  bounded-wait ::` once per boot, and breaks. **The tripwire is untouched and stays exactly as sharp.**
+* **Bound in spins, not wall clock, and that is a departure from WEDGE-10 with a reason.**
+  `cursor.rs`'s bounded waiters run at pointer rate on 1–2 ms budgets, where only a deadline works.
+  This site runs IRQ-masked on the teardown path, where a timer read is neither free nor trustworthy
+  against a machine that may already be mid-wedge, and its budget is *"past every possibility of
+  legitimate progress"*. The tripwire it backs is already denominated in spins. What WEDGE-10 forbids
+  is an **unbounded** masked spin; a finite count terminates unconditionally.
+
+#### ⚠ The trade, stated plainly — WC-B must revisit it
+
+Abandoning the barrier means a composite that snapshotted a cleared row may still blit from it.
+`close_owner`'s own note prices that: *"today that would be a stale read, but under WC-B's per-ASID
+surface mappings it becomes a kernel abort mid-blit."* **WC-B is not landed**, so today the cost is
+one stale rectangle that self-heals at the next present, against a measured cost of the whole machine.
+When WC-B lands this inverts, and the abandon arm needs the shape `cursor.rs` already uses for its own
+refusals: **owe** the unsafe half rather than perform it. Not this arc's work; named so the next reader
+does not rediscover it from a crash.
+
+#### What was NOT fixed, and why
+
+The UX defect that invited the click — a non-closable row **offering** a close disc — is left open on
+purpose. Both honest fixes leave this arc's lane: (a) an owner-wide decline in `controls()` reverses a
+standing ruling (CLOSEISO, shellwin-a and facade-console-1 each added it and each was removed, the last
+by Peter directly); (b) a *disabled* disc has nothing to render as — `theme.rs`'s `ROLES` table has 25
+entries and **no disabled/muted/inactive control role**, and the kit gap is already recorded in this
+document (*"No hover, disabled or pressed state for a title-bar control"*). Adding one is a kit re-lift
+behind the provenance rules, not a free edit. **The recommended next arc is (c): port x86's
+`wc_close_furniture` id-scoped arm to aarch64**, which makes the disc *work* instead of making it look
+broken, and is the option that matches the ruling that furniture is a normal window.
+
+#### Metal watch-list (DRAINSTALL)
+
+* `abandoned=` non-zero on any `[wedge1] dwell` line, or the verdict `-> ABANDONED`: the bound was
+  reached. The panel may hold a rectangle no longer backed by a live row. `abandoned` is a **gauge** —
+  loaded, never drained — so it cannot be aged out by the next quiet window.
+* `<D?>` on the wire with no `DRAIN ABANDONED` line after it: the bound was reached **and** the serial
+  path ate the report — read exactly as `<D!>` is read.
+* `settle=furniture-refused` on a `[clickroute] close=` line: the operator clicked an inert disc. One
+  per click, never a hop. Its presence is a UX finding, not a fault.
+* A `REFUSED furniture` line **followed by** a shell raise (`[wc-fv] focus shell`) would mean this fix
+  has regressed.
+
 ### WEDGE-2 — breadcrumbs, so the next wedge names its dying step
 
 WEDGE-1 ended with a request written into its own watch-list: *get a per-core heartbeat that survives

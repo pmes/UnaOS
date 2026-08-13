@@ -386,6 +386,28 @@ REQUIRE \[wc-c\] side-by-side windows=2 drawn=2
 REQUIRE \[wc-d\] verify win=.*bad_cache=0 bad_ram=0.*-> PASS
 FORBID \[wc-d\] verify .*-> FAIL
 
+# --- 4a-bis. DRAINSTALL (PA38 metal, 2026-08-12): the drain barrier's wait is BOUNDED, and reaching
+# ---    the bound is a FAULT, not a mode. `DrainBarrier::drain` abandons at DRAIN_ABANDON_SPINS and
+# ---    says so; abandoning means a composite may still be blitting from a row the teardown cleared,
+# ---    i.e. a stale rectangle the operator can see. It is deliberately unreachable in a healthy boot
+# ---    (the bound is 8x the WEDGE-1 tripwire, itself far past any panel-clipped memcpy), so a gate
+# ---    that trips these has caught a real wedge rather than load. Both spellings are armed because
+# ---    the rollup is witness-gated while the line is not — a knob-off boot can only show the line.
+# ---    NOT a REQUIRE: there is nothing to require, the healthy reading is silence. See
+# ---    docs/dev/OS/08_VIDEO/engine.md §DRAINSTALL.
+FORBID :: \[wedge1\] DRAIN ABANDONED
+FORBID \[wedge1\] dwell .*-> ABANDONED
+FORBID \[wedge1\] dwell .*abandoned=[1-9]
+
+# --- 4a-ter. DRAINSTALL, the other half: a REFUSED furniture close performs NO teardown side effect.
+# ---    The PA38 freeze was a refused close that still ran `focus_changed(0)` — a full shell raise
+# ---    that parked every window, published hidden=true fleet-wide and queued deferred erase boxes
+# ---    nothing was left to drain. `wc_close_click` now returns `furniture-refused` above both focus
+# ---    calls, so the refusal is inert. NOT expressible as a directive here: the regression is an
+# ---    ORDERED PAIR of lines (a refusal followed by a shell raise) and this spec matches per line,
+# ---    so a cross-line FORBID would be a directive that can never fire — worse than none. The
+# ---    guard is the code path plus §DRAINSTALL's metal watch-list, which names the pair to read for.
+
 # --- 4b. FOCUS-VIS: FOCUS IS VISIBLE, and the SHELL is in the z-order. Every other focus directive
 # ---    in this file reports KERNEL STATE — `[wc-c] focus tab-cycle` printed a correct rotation on
 # ---    the P59 bench for a panel that never changed, which is exactly the failure this catches.

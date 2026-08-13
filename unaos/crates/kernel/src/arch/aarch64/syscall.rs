@@ -13171,7 +13171,7 @@ pub fn wc_close_last_settle() -> u32 {
 /// FORBID plain `noproc` where only fixtures close, and an operator reading the log can tell a
 /// witness no-op from a click that killed nobody.
 fn wc_close_click(owner: u64) -> &'static str {
-    let closed = crate::video::wm::close_owner(owner);
+    let closed = crate::video::wm::close_owner(owner); if crate::video::wm::is_kernel_owner(owner) { return "furniture-refused"; } // DRAINSTALL (PA38): close_owner REFUSED every row — a close that removed NOTHING may perform no teardown side effect. Below this line are the two that made the freeze: the focus drop and `focus_changed(0)`, i.e. a FULL SHELL RAISE that parks every user window, publishes hidden=true fleet-wide, queues N deferred erase boxes on DEFER and arms request_full_present — all predicated on a close that did not happen. That is CLOSE-TEARDOWN's ruling ("closing a window causes the other open vug stat pulse windows to minimize"), whose fix `focus_release` has zero aarch64 callers. Returning HERE is also what unwinds the CLOSE-FIX hop: the retry loop re-enters only on `noproc-selftest`, and its stated bound ("every hop removes at least the hit row") is false for a REFUSED row. One line, line-NEUTRAL, per this file's PANIC-Location rule.
     if USER_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
         user_input_set_active(0);
     }
