@@ -2030,6 +2030,231 @@ pub fn k8c_snapread_selftest() {
     );
 }
 
+/// F2 scratch fixtures: created, renamed, stripped, unlinked — the volume is
+/// left exactly as found (self-cleaning, K2 idiom).
+const F2_SRC: &str = "F2SRC.TXT";
+const F2_DST: &str = "F2DST.TXT";
+const F2_OTHER: &str = "F2OTHER.TXT";
+const F2_SRC_PATH: &str = "/F2SRC.TXT";
+const F2_DST_PATH: &str = "/F2DST.TXT";
+const F2_PAYLOAD: &[u8] = b"F2: a rename moves a name, never the bytes.\n";
+
+/// F2-mutations witness (uncounted): prove the full mutation set — `rename`,
+/// `remove_attribute`, `unlink` — on the LIVE kernel mount, each a single
+/// atomic CoW transaction through the one IRQ-masked `with_unafs` hold, and
+/// each DURABLE across a genuine remount.
+///
+/// Sequence (7 bits):
+///   bit0 stage: create the scratch file with bytes + two typed attributes;
+///   bit1 RENAME durability: rename src -> dst, genuine remount, the OLD name
+///        is negative, the NEW name resolves to the SAME inode id, and the
+///        bytes are byte-identical (no data copy — the name moved, not the
+///        extents);
+///   bit2 collision REFUSED cleanly: a rename onto an existing name returns
+///        FileExists and disturbs NOTHING (both names still resolve);
+///   bit3 REMOVE_ATTRIBUTE: the targeted attribute is gone after a remount
+///        while the sibling attribute on the same inode is untouched;
+///   bit4 UNLINK durability: unlink + genuine remount — the name is negative
+///        and the stale inode id fails NotFound (never aliases another file);
+///   bit5 negative paths: a missing source refuses BOTH rename and unlink
+///        (NotFound) — refusals, not silent successes. (The IsADirectory
+///        refusal is pinned host-side, not here: the crate has no `rmdir`, so
+///        a directory made by this witness could never be cleaned up.)
+///   bit6 self-clean: the fresh mount is refcount-consistent (fsck) and no F2
+///        scratch name survives in the root.
+///
+/// Skips honestly on media without a unafs partition. Runs AFTER the K8
+/// witnesses, so its churn can never perturb their block accounting.
+pub fn f2_mutations_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    if let Err(e) = locate() {
+        serial_println!(":: F2-mutations: no unafs volume ({:?}) — skipped ::", e);
+        return;
+    }
+
+    let t0 = bench_ticks();
+    let mut w = 0u32;
+
+    // bit0: stage. Clear any stale scratch from an interrupted run first.
+    let staged = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let _ = fs.unlink(root, F2_SRC);
+        let _ = fs.unlink(root, F2_DST);
+        let _ = fs.unlink(root, F2_OTHER);
+        let id = match fs.create_file(root, String::from(F2_SRC)) {
+            Ok(id) => id,
+            Err(_) => return 0,
+        };
+        if fs.write_data(id, 0, F2_PAYLOAD).is_err() {
+            return 0;
+        }
+        if fs
+            .set_attribute(id, String::from("f2kind"), AttributeValue::String(String::from("scratch")))
+            .is_err()
+        {
+            return 0;
+        }
+        if fs
+            .set_attribute(id, String::from("f2keep"), AttributeValue::Int(1))
+            .is_err()
+        {
+            return 0;
+        }
+        // A second file, so the collision refusal below has a real target.
+        if fs.create_file(root, String::from(F2_OTHER)).is_err() {
+            return 0;
+        }
+        id
+    })
+    .unwrap_or(0);
+    if staged != 0 {
+        w |= 1 << 0;
+    }
+
+    // bit1: rename + genuine remount — same inode, same bytes, old name gone.
+    let renamed = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        fs.rename(root, F2_SRC, root, F2_DST).is_ok()
+    });
+    force_remount();
+    let rename_durable = matches!(renamed, Ok(true))
+        && with_unafs(|fs| {
+            let moved = match fs.resolve_path(F2_DST_PATH) {
+                Ok(id) => id,
+                Err(_) => return false,
+            };
+            let bytes_ok = match (fs.read_inode(moved), fs.read_data(moved, 0, F2_PAYLOAD.len() as u64)) {
+                (Ok(inode), Ok(data)) => inode.size == F2_PAYLOAD.len() as u64 && data == F2_PAYLOAD,
+                _ => false,
+            };
+            // The name moved, NOT the inode: the id is the one we staged.
+            moved == staged && bytes_ok && fs.resolve_path(F2_SRC_PATH).is_err()
+        })
+        .unwrap_or(false);
+    if rename_durable {
+        w |= 1 << 1;
+    }
+
+    // bit2: a rename onto an EXISTING name is refused, and nothing moves.
+    let collision_refused = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let refused = matches!(
+            fs.rename(root, F2_DST, root, F2_OTHER),
+            Err(FileSystemError::FileExists)
+        );
+        // Both names survive the refusal, untouched.
+        refused
+            && fs.resolve_path(F2_DST_PATH).is_ok()
+            && fs.resolve_path("/F2OTHER.TXT").is_ok()
+    })
+    .unwrap_or(false);
+    if collision_refused {
+        w |= 1 << 2;
+    }
+
+    // bit3: remove_attribute — the target goes, the sibling stays, durably.
+    let attr_removed = with_unafs(|fs| {
+        let id = match fs.resolve_path(F2_DST_PATH) {
+            Ok(id) => id,
+            Err(_) => return false,
+        };
+        fs.remove_attribute(id, "f2kind").is_ok()
+    })
+    .unwrap_or(false);
+    force_remount();
+    let attr_durable = attr_removed
+        && with_unafs(|fs| {
+            let id = match fs.resolve_path(F2_DST_PATH) {
+                Ok(id) => id,
+                Err(_) => return false,
+            };
+            let gone = matches!(fs.get_attribute(id, "f2kind"), Ok(None));
+            let kept = matches!(
+                fs.get_attribute(id, "f2keep"),
+                Ok(Some(AttributeValue::Int(1)))
+            );
+            gone && kept
+        })
+        .unwrap_or(false);
+    if attr_durable {
+        w |= 1 << 3;
+    }
+
+    // bit4: unlink + genuine remount — the name is negative and the STALE
+    // inode id fails NotFound (logical ids are never recycled).
+    let unlinked = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        fs.unlink(root, F2_DST).is_ok() && fs.unlink(root, F2_OTHER).is_ok()
+    });
+    force_remount();
+    let unlink_durable = matches!(unlinked, Ok(true))
+        && with_unafs(|fs| {
+            fs.resolve_path(F2_DST_PATH).is_err()
+                && fs.resolve_path(F2_SRC_PATH).is_err()
+                && fs.read_inode(staged).is_err()
+        })
+        .unwrap_or(false);
+    if unlink_durable {
+        w |= 1 << 4;
+    }
+
+    // bit5: negative paths — a missing source refuses BOTH rename and unlink.
+    // Refusals, never silent successes.
+    //
+    // The IsADirectory refusal is deliberately NOT exercised here: the crate
+    // has no `rmdir`, so any directory this witness created would leak into
+    // the root forever and break `k3_mount_selftest`'s no-unexpected-entry
+    // bit on every later boot. Self-cleaning outranks coverage — that refusal
+    // is pinned host-side instead, by the crate's
+    // `unlink_refuses_directories_and_missing_names`.
+    let negatives = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let rename_refused = matches!(
+            fs.rename(root, "F2GHOST.TXT", root, "F2REAL.TXT"),
+            Err(FileSystemError::NotFound)
+        );
+        let unlink_refused = matches!(fs.unlink(root, "F2GHOST.TXT"), Err(FileSystemError::NotFound));
+        rename_refused && unlink_refused
+    })
+    .unwrap_or(false);
+    if negatives {
+        w |= 1 << 5;
+    }
+
+    // bit6: self-clean — fsck consistent and no F2 scratch name in the root.
+    force_remount();
+    let clean = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let consistent = fs.fsck(false).map(|r| r.is_clean()).unwrap_or(false);
+        let no_leak = fs
+            .ls(root)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .all(|d| d.name != F2_SRC && d.name != F2_DST && d.name != F2_OTHER)
+            })
+            .unwrap_or(false);
+        consistent && no_leak
+    })
+    .unwrap_or(false);
+    if clean {
+        w |= 1 << 6;
+    }
+
+    let ticks = bench_ticks().wrapping_sub(t0);
+    let verdict = if w == 0x7f { "PASS" } else { "FAIL" };
+    serial_println!(
+        ":: F2-mutations: rename (durable, same inode, bytes intact) + collision refused + remove_attribute (sibling intact) + unlink (stale id NotFound) + negatives + self-clean {} [w={:#04x}] ticks={} ::",
+        verdict,
+        w,
+        ticks
+    );
+}
+
 // K9-MASKCUT WATCH (nsspan-gated, EOF so knob-off adds/moves nothing above): worst-case flip + block
 // count of a SINGLE ACL row persist through `native_acl_write_on`, captured across the K3/K5 fixtures.
 // `nsspan_report` (syscall.rs) emits these next to the per-site tick spans. Post-K9 `flips` = 1 (the

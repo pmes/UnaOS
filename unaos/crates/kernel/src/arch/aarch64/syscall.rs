@@ -15360,6 +15360,14 @@ pub fn u7_launcher(demo_cpu: usize) {
     // even for its owner. Runs AFTER k8b_snap_selftest, fully self-cleaning. Its own uncounted
     // `:: K8c-snapread: … PASS ::` line; honest skip on media without a unafs partition.
     crate::fs::unafs::k8c_snapread_selftest();
+    // F2: prove the full mutation set — `rename`, `remove_attribute`, `unlink` — on the live card,
+    // each ONE atomic CoW transaction through the single IRQ-masked mount and each durable across a
+    // genuine remount (rename moves the NAME, not the bytes: same inode id, identical payload;
+    // remove_attribute leaves the sibling attribute intact; unlink leaves the stale id NotFound).
+    // Runs AFTER the K8 witnesses so its churn can never perturb their block accounting, and is
+    // fully self-cleaning (it creates no directory — the crate has no rmdir). Its own uncounted
+    // `:: F2-mutations: … PASS ::` line; honest skip on media without a unafs partition.
+    crate::fs::unafs::f2_mutations_selftest();
     // K6: prove the U6 owner/grants ACL round-trips through the native unafs attribute volume (the
     // sidecar's successor) — forward+reverse codec, write+read+clear via the coherent mount. Runs
     // LAST, fully self-cleaning (leaves only the staged K3 fixtures). Its own uncounted

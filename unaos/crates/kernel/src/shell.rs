@@ -3283,6 +3283,25 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         #[cfg(target_arch = "aarch64")]
+        "umv" => {
+            // F2: rename or move a file/directory on the native unafs volume (`umv <src> <dst>`).
+            // `<dst>` names the target directly; an existing destination is refused (no implicit
+            // overwrite), as is moving a directory into its own descendant.
+            match (args.first().copied(), args.get(1).copied()) {
+                (Some(src), Some(dst)) => console.println(&unafs_verb_mv(src, dst)),
+                _ => console.println("usage: umv <src> <dst>"),
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "urmattr" => {
+            // F2: remove one typed attribute (`urmattr <path> <key>`). Value + every catalog index
+            // entry go in one transaction; a missing key is refused with AttributeNotFound.
+            match (args.first().copied(), args.get(1).copied()) {
+                (Some(path), Some(key)) => console.println(&unafs_verb_rmattr(path, key)),
+                _ => console.println("usage: urmattr <path> <key>"),
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
         "usnaps" => {
             // K8b: list retained snapshots (the on-disk snapshot index) on the native unafs volume.
             let out = crate::fs::unafs::with_unafs(|fs| match fs.snapshot_index() {
@@ -5360,6 +5379,53 @@ fn unafs_verb_rm(path: &str) -> String {
         Ok(Ok(())) => alloc::format!("urm: removed {}", path),
         Ok(Err(msg)) => alloc::format!("urm: {}: {}", path, msg),
         Err(e) => alloc::format!("urm: no unafs volume ({:?})", e),
+    }
+}
+
+/// `umv <src> <dst>`: rename OR move a file or directory (F2). `<dst>` names
+/// the TARGET path directly — `umv /A.TXT /B.TXT` renames in place, and
+/// `umv /A.TXT /D/B.TXT` moves it under `/D` with a new leaf. Deliberate
+/// divergence from POSIX: an existing `<dst>` is REFUSED (`FileExists`), never
+/// silently overwritten, and moving a directory into its own descendant is
+/// refused (`DirectoryLoop`). Both directory rewrites land in ONE CoW
+/// transaction, so there is no "in neither directory" window to crash into.
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_mv(src: &str, dst: &str) -> String {
+    let (sparent, sleaf) = match unafs_split(src) {
+        Some(pl) => pl,
+        None => return alloc::format!("umv: {}: invalid path", src),
+    };
+    let (dparent, dleaf) = match unafs_split(dst) {
+        Some(pl) => pl,
+        None => return alloc::format!("umv: {}: invalid path", dst),
+    };
+    match crate::fs::unafs::with_unafs(|fs| {
+        let spid = fs.resolve_path(sparent).map_err(|e| alloc::format!("{:?}", e))?;
+        let dpid = fs.resolve_path(dparent).map_err(|e| alloc::format!("{:?}", e))?;
+        fs.rename(spid, sleaf, dpid, dleaf)
+            .map_err(|e| alloc::format!("{:?}", e))
+    }) {
+        Ok(Ok(())) => alloc::format!("umv: {} -> {}", src, dst),
+        Ok(Err(msg)) => alloc::format!("umv: {}: {}", src, msg),
+        Err(e) => alloc::format!("umv: no unafs volume ({:?})", e),
+    }
+}
+
+/// `urmattr <path> <key>`: remove one typed attribute from a file or directory
+/// (F2). The inline or spilled value AND every catalog index entry for the
+/// (inode, key) pair go in ONE CoW transaction, so a removed attribute can
+/// never be returned by a later query. A key that is not present is refused
+/// with `AttributeNotFound` — never a silent no-op.
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_rmattr(path: &str, key: &str) -> String {
+    match crate::fs::unafs::with_unafs(|fs| {
+        let id = fs.resolve_path(path).map_err(|e| alloc::format!("{:?}", e))?;
+        fs.remove_attribute(id, key)
+            .map_err(|e| alloc::format!("{:?}", e))
+    }) {
+        Ok(Ok(())) => alloc::format!("urmattr: removed '{}' from {}", key, path),
+        Ok(Err(msg)) => alloc::format!("urmattr: {}: {}: {}", path, key, msg),
+        Err(e) => alloc::format!("urmattr: no unafs volume ({:?})", e),
     }
 }
 
