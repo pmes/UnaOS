@@ -106,14 +106,46 @@ pub struct Stat {
     pub size: u64,
 }
 
-/// One directory entry as the VFS presents it — a display name plus a kind.
+/// A wall-clock stamp as the VFS presents it — the fields a listing renders, and
+/// nothing else. VFS-owned on purpose: the FAT backend decodes its on-disk
+/// `DirEntry::mtime()` into this, so no FAT type crosses the trait boundary, and a
+/// backend whose medium carries no timestamp (native UnaFS) answers `None` rather
+/// than fabricating one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VfsTime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub min: u8,
+    pub sec: u8,
+}
+
+/// One directory entry as the VFS presents it — a display name, a kind, and the
+/// two listing facts a caller would otherwise have to go BEHIND the VFS to get.
 /// Backend-specific identity (FAT first-cluster, unafs inode id) is NOT exposed;
 /// the VFS is name-addressed, and re-resolution from the name is the contract
 /// (the same discipline the shell's FAT path cache already follows).
+///
+/// VFS-1 (adoption): `size`/`mtime` were added because the shell's `ls` could not
+/// be routed through the mount table without them — it would have had to keep its
+/// per-volume `pi_usb_ls_collect` / `pi_ls_collect` collectors purely to recover a
+/// size column, which is exactly the per-verb dispatch this layer exists to
+/// delete. `mtime` is `None` where the medium carries no stamp (native UnaFS),
+/// which the renderer shows as a dash rather than a fabricated date.
+///
+/// The `.`/`..` pseudo-entries are NOT presented: the mount table resolves paths
+/// lexically (`normalize_path` collapses `.` and pops `..` before a backend is
+/// ever consulted), so a dot entry in a listing is a FAT on-disk artifact with no
+/// meaning in this namespace. Both real backends filter them, and both of the
+/// shell collectors this arc deleted filtered them too — the behaviour is
+/// preserved, just moved to the one place that owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEnt {
     pub name: String,
     pub kind: NodeKind,
+    pub size: u64,
+    pub mtime: Option<VfsTime>,
 }
 
 /// The read-side surface every backend answers. `rel` is always a
@@ -587,9 +619,32 @@ impl VfsBackend for FatBackend {
         };
         Ok(entries
             .into_iter()
-            .map(|e| DirEnt {
-                name: e.name().to_string(),
-                kind: if e.is_dir { NodeKind::Dir } else { NodeKind::File },
+            .filter(|e| {
+                // The `.`/`..` on-disk artifacts are not names in this namespace (see `DirEnt`).
+                let n = e.name();
+                n != "." && n != ".."
+            })
+            .map(|e| {
+                let ts = e.mtime();
+                DirEnt {
+                    name: e.name().to_string(),
+                    kind: if e.is_dir { NodeKind::Dir } else { NodeKind::File },
+                    size: e.size as u64,
+                    // An all-zero on-disk stamp is FAT's "unset", not the year 1980 —
+                    // report absence honestly so the renderer dashes it.
+                    mtime: if ts.is_zero() {
+                        None
+                    } else {
+                        Some(VfsTime {
+                            year: ts.year,
+                            month: ts.month,
+                            day: ts.day,
+                            hour: ts.hour,
+                            min: ts.min,
+                            sec: ts.sec,
+                        })
+                    },
+                }
             })
             .collect())
     }
@@ -870,9 +925,22 @@ impl VfsBackend for NativeBackend {
             let entries = fs.ls(id).map_err(|_| VfsError::NotADirectory)?;
             Ok(entries
                 .into_iter()
+                .filter(|e| {
+                    // `.`/`..` are not names in this namespace (see `DirEnt`); `System` objects are
+                    // unafs's internal bookkeeping and were filtered by the shell collector this
+                    // arc deleted — the filter moves here rather than disappearing.
+                    e.name != "." && e.name != ".." && e.kind != ::unafs::FileKind::System
+                })
                 .map(|e| DirEnt {
                     name: e.name,
                     kind: native_kind(e.kind),
+                    // unafs holds size on the inode, not the directory entry, so the listing costs
+                    // one inode read per row — the same cost `pi_ls_collect` paid. A row whose
+                    // inode cannot be read reports 0 rather than failing the whole listing.
+                    size: fs.read_inode(e.inode_id).map(|i| i.size).unwrap_or(0),
+                    // unafs records no last-write time; §3 says a backend answers for its own
+                    // medium, so this is `None`, never a fabricated stamp.
+                    mtime: None,
                 })
                 .collect())
         })
@@ -1105,9 +1173,11 @@ impl VfsBackend for MockBackend {
         Ok(self
             .files
             .iter()
-            .map(|(n, _)| DirEnt {
+            .map(|(n, d)| DirEnt {
                 name: n.trim_start_matches('/').to_string(),
                 kind: NodeKind::File,
+                size: d.len() as u64,
+                mtime: None,
             })
             .collect())
     }
@@ -1447,4 +1517,137 @@ pub fn vfs3_usb_mount_witness() {
         create_ok,
         fat_ok
     );
+}
+
+// =========================================================================================
+// VFS-1 (adoption) routing witness — the seam's own battery.
+//
+// VFS-1's original witness proved the mount table resolves correctly in isolation, against two
+// in-RAM mocks. What it could not prove is the thing this adoption arc is actually about: that the
+// LIVE table the shell builds routes a real path to the real backend that owns it, and refuses the
+// paths it must refuse. These four legs are exactly the claims the routing seam makes, each
+// asserted against `MountTable::resolve` — the one resolver `ls`, `cat`, `run`, `bg` and `vfs` now
+// share.
+//
+// Uncounted `:: VFS-1: … ::` lines, in the idiom of the VFS-2/VFS-3 witnesses beside it. Every leg
+// degrades to an honest skip rather than a failure when its volume is absent, so a board with no SD
+// or no stick reports what it could not test instead of reporting a regression.
+// =========================================================================================
+
+/// VFS-1 (adoption): prove the LIVE mount table routes each namespace to the backend that owns it.
+///
+/// Legs:
+/// * **fat** — `/fat/…` resolves to the FAT backend with the mount prefix stripped.
+/// * **native** — a bare `/…` resolves to the native UnaFS backend, whole path intact.
+/// * **boundary** — `/fatty.bin` and `/usbfoo` are NATIVE names, not volume names: a prefix claims a
+///   path only at a component boundary (§3.1). This is the negative the seam most needs, because a
+///   naive `starts_with` — which is precisely what the shell's deleted `/usb` special-case used —
+///   gets it wrong and silently sends a native file to a FAT volume.
+/// * **ro** — a read-only backend refuses every mutating verb THROUGH THE TABLE with `Unsupported`.
+///   Asserted against a backend that implements no write methods, i.e. one that inherits the trait's
+///   default bodies: this is the guarantee the RO seams rest on (a backend does not have to
+///   remember to refuse — refusing is what it does unless it opts in), so it is proven at the seam
+///   rather than per read-only volume.
+#[cfg(target_arch = "aarch64")]
+pub fn vfs1_routing_witness() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // The table the shell's `vfs_mount_table()` builds, rebuilt here so the witness asserts the
+    // real namespace rather than a fixture of its own.
+    let mut mt = MountTable::new();
+    mt.mount("/", Box::new(NativeBackend::new("native")));
+    mt.mount("/fat", Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    let usb_present = crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok();
+    if usb_present {
+        mt.mount("/usb", Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
+    }
+
+    // --- leg 1: a /fat path reaches the FAT backend, prefix stripped. -------------------------
+    match mt.resolve("/fat/VUG.ELF") {
+        Ok((b, rel)) if b.volume_name() == "fat" && rel == "/VUG.ELF" => {
+            serial_println!(":: VFS-1: route /fat/VUG.ELF -> vol=fat rel=/VUG.ELF :: PASS ::");
+        }
+        Ok((b, rel)) => {
+            serial_println!(
+                ":: VFS-1: route /fat/VUG.ELF -> vol={} rel={} (want fat,/VUG.ELF) :: FAIL ::",
+                b.volume_name(), rel);
+            return;
+        }
+        Err(e) => {
+            serial_println!(":: VFS-1: route /fat/VUG.ELF -> {:?} :: FAIL ::", e);
+            return;
+        }
+    }
+
+    // --- leg 2: a bare path reaches the native UnaFS backend, whole path intact. ---------------
+    match mt.resolve("/K3HELLO.TXT") {
+        Ok((b, rel)) if b.volume_name() == "native" && rel == "/K3HELLO.TXT" => {
+            serial_println!(":: VFS-1: route /K3HELLO.TXT -> vol=native rel=/K3HELLO.TXT :: PASS ::");
+        }
+        Ok((b, rel)) => {
+            serial_println!(
+                ":: VFS-1: route /K3HELLO.TXT -> vol={} rel={} (want native,/K3HELLO.TXT) :: FAIL ::",
+                b.volume_name(), rel);
+            return;
+        }
+        Err(e) => {
+            serial_println!(":: VFS-1: route /K3HELLO.TXT -> {:?} :: FAIL ::", e);
+            return;
+        }
+    }
+
+    // --- leg 3: the boundary negatives — a prefix is not a substring. --------------------------
+    // `/usbfoo` is only meaningful to assert when /usb is actually bound; when the stick is absent
+    // the name trivially lands on native and proves nothing, so say which case was tested.
+    let mut boundary_ok = true;
+    for name in ["/fatty.bin", "/usbfoo"] {
+        match mt.resolve(name) {
+            Ok((b, rel)) if b.volume_name() == "native" && rel == name => {}
+            Ok((b, rel)) => {
+                serial_println!(
+                    ":: VFS-1: boundary {} -> vol={} rel={} (want native, verbatim) :: FAIL ::",
+                    name, b.volume_name(), rel);
+                boundary_ok = false;
+            }
+            Err(e) => {
+                serial_println!(":: VFS-1: boundary {} -> {:?} :: FAIL ::", name, e);
+                boundary_ok = false;
+            }
+        }
+    }
+    if !boundary_ok {
+        return;
+    }
+    serial_println!(
+        ":: VFS-1: boundary /fatty.bin,/usbfoo -> vol=native verbatim (usb bound={}) :: PASS ::",
+        usb_present);
+
+    // --- leg 4: the read-only seam refuses every mutating verb, through the table. -------------
+    // MockBackend implements the read side only, so it inherits the trait's default write bodies.
+    // That is the property under test: read-only is the DEFAULT posture, not something a backend
+    // has to remember to assert.
+    let mut ro = MountTable::new();
+    ro.mount("/ro", Box::new(MockBackend::foreign("ro", KERNEL_PRINCIPAL, true)));
+    let refusals = [
+        ("create", ro.create("/ro/NEW.TXT", NodeKind::File, KERNEL_PRINCIPAL).err()),
+        ("write", ro.write("/ro/a.txt", 0, b"x", KERNEL_PRINCIPAL).err()),
+        ("truncate", ro.truncate("/ro/a.txt", 0, KERNEL_PRINCIPAL).err()),
+        ("unlink", ro.unlink("/ro/a.txt", KERNEL_PRINCIPAL).err()),
+    ];
+    for (verb, err) in &refusals {
+        if !matches!(err, Some(VfsError::Unsupported)) {
+            serial_println!(
+                ":: VFS-1: ro-seam {} -> {:?} (want Unsupported) :: FAIL ::", verb, err);
+            return;
+        }
+    }
+    // The same backend still READS — a read-only volume is refused for writes, not disabled.
+    let read_ok = ro.read_dir("/ro").is_ok();
+    serial_println!(
+        ":: VFS-1: ro-seam create/write/truncate/unlink -> Unsupported, read still ok={} :: PASS ::",
+        read_ok);
 }

@@ -15370,6 +15370,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // `:: vfs2-fat: … ::` / `:: vfs2-native: … ::` lines; honest skip when the backing volume is absent.
     crate::fs::vfs::vfs2_fat_write_witness();
     crate::fs::vfs::vfs2_native_write_witness();
+    // VFS-1 (adoption): the routing battery for the seam every path verb now shares — /fat reaches
+    // the FAT backend, a bare path reaches native UnaFS, the boundary negatives (/fatty.bin,
+    // /usbfoo) stay native, and a read-only backend refuses every mutating verb through the table.
+    // Touches no disk except to read; its own uncounted `:: VFS-1: … ::` lines.
+    crate::fs::vfs::vfs1_routing_witness();
     // BANDY-1 M1: the bus v1 subset codec KATs — reply bodies proven byte-compatible with the
     // HOST serializer (tools/bandy-golden captures), native request header+payloads frozen,
     // decode fail-closed at the hard ceiling. Read-only, in-RAM (no disk, no card); its own
