@@ -11795,3 +11795,161 @@ load MIGRATES to the USB-pump service lane (`pace_service`'s caller), bounded at
   or `pace_service`'s tail drain, which calls `rtwit::note_present_composited` after its
   composite (also keeping the proxy from spanning an idle gap after a storm's final,
   drain-carried frame and reporting a false spike).
+
+## PI-DESK — the desktop furniture crosses to the Pi panel (aarch64 `pidesk`, 2026-08-12)
+
+The code named this arc before it was scheduled. `video/theme.rs`'s header called full chrome
+wiring *"the later lockstep arc"*, and the four furniture modules — `strip`, `dock`, `menubar`,
+`crystal` — all carried `#[cfg(all(target_arch = "x86_64", feature = "wc"))]` at their `mod`
+declaration while the MATERIALS they paint through (`theme`, `paper`, `ceramic`, `knurl`) were
+already arch-neutral, already unconditional, and already rendering on the metal Pi.
+
+This is that arc. The four gates are now
+
+```rust
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"),
+          all(target_arch = "aarch64", feature = "pidesk")))]
+```
+
+and the two halves are independent: x86 keeps exactly the `wc` term it always had, and a knob-off
+aarch64 build compiles none of it.
+
+### What crossed, and what it cost
+
+Very little, and that is the finding rather than the boast. `STRIPFACTOR` claimed the strip layer
+was a general mechanism expressed against `wm`'s arch-neutral API; PI-DESK is that claim being
+cashed. **M2 — the compose seam — is a single `cfg` widening** at the tail of `wm::composite_once`.
+Same position (after `composite_inner`, before the cursor tail), same `Repaint` upgrade, same
+layering the x86 comments specify: desktop, then windows, then the strip, then the sprite. There
+was no second composite path to write, because the front-buffer law (`WC-H`/`WC-K`/`WC-L`: compose
+in cached RAM, copy out as contiguous row runs) is one both arches already obey.
+
+Three arch seams were genuinely owed, and each is taken at its own call site — the way `wm` seams
+`wcx` — rather than by widening a shared API into a lowest common denominator:
+
+| seam | why it is not arch-neutral | what it does now |
+|---|---|---|
+| `strip::cycles_to_us` | `arch::now_cycles()` is arch-neutral; its RATE is not | reads CNTFRQ_EL0 on aarch64 (exact from the first instruction) instead of inheriting x86's uncalibrated-TSC 1.25 GHz guess — the difference between a `[dock] paint=` in microseconds and one ~23x short |
+| `dock::focus_set` / `focus_get` | the keyboard designation lives in the per-arch syscall layer, where the input rings are | one seam per arch; identical contract (`0` = shell) |
+| `crystal::fire`'s Restart / Shut Down | `acpi_power::poweroff` is an x86 path | honest `unimplemented:` lines on aarch64 — see below |
+
+`wm::FURNITURE_MAX == strip::STRIP_MAX` is now asserted on the Pi image too, so a tenant added to
+the registry without widening the erase clip fails the BUILD there rather than silently dropping an
+occluder on a non-witness artifact — the WCK4 hole, closed on the second panel as well as the first.
+
+### The rulings travel with the code
+
+* **The dock is a window SWITCHER, not an app launcher** (Peter, white board Q10). No app grid was
+  added on the Pi, and no second launch path.
+* **The menu bar is DEFAULT OFF, on the Pi too.** *"We will not always have a menu bar"* is a
+  runtime statement about policy, and compiling a tenant is not enabling it. A `UNAOS_PIDESK=1`
+  boot gets the dock strip and the SHARD menu machinery and **no top strip** until something asks
+  for one. `menubar` exists precisely to keep that distinction visible.
+* **Mechanism over policy.** What the kernel contributes is the strip PRIMITIVE and the tenant
+  registry; the desktop is one shell on a spatial game-engine OS, not the OS's identity.
+
+### M3 — clicks, and the extraction that was chosen over duplication
+
+The Pi has a live mouse (metal-confirmed), so `arch/aarch64/syscall.rs::wc_click_route` owed the two
+press arms `arch/x86_64/syscall.rs::wc_click_route_at` already carried. The brief allowed either a
+copy or an extraction. **Extraction**, and the reasoning is on the record:
+
+`video::strip::press_route(x, y) -> bool` — crystal first, then dock — now holds the ordering rule
+and its no-starvation argument, and **both arch routers call it**. The order is the INVERSE of
+`strip::compose_all`'s paint order, so it belongs beside that function, within one screen of it.
+Duplicated across two arch files edited by two lanes on two schedules it would be free to drift —
+and it would drift SILENTLY, because the symptom of a stale order is a press landing on the wrong
+layer and no gate asserts that. x86 behaviour is unchanged: same two surfaces, same order, same
+consume-and-drop, one call where there were two. What stays per-arch is what genuinely is — the
+edge detection, the press-target latch, the input rings.
+
+The click grammar is not relaxed by any of it. A furniture press is an instruction to the WINDOW
+SYSTEM, consumed with the target set to DROP exactly as the close and control arms are. A dock press
+**SELECTS** — raise, un-hide, hand over the keyboard — and acknowledges on the wire; it stops
+nothing, starts nothing, kills nothing. The strip's cut CORNERS decline through the painter's own
+`Layout::contains`, so a corner press falls through to the desktop-miss arm, per the crispywire
+review.
+
+### Crystal on the Pi: the render crosses whole, two of four actions do not
+
+`About This Shard` is REAL on both arches. On the Pi, `Restart` and `Shut Down` join `Sleep` as
+honest stubs, each printing a line that names the missing mechanism rather than faking a success or
+parking the machine to look decisive:
+
+```
+:: SHARD: unimplemented: Restart (no PSCI SYSTEM_RESET — Pi 4 bare-metal runs at EL2 with no
+   secure monitor; a BCM2711 watchdog reset is the wiring this needs) ::
+```
+
+The in-tree PSCI is `arch/aarch64/smpprobe.rs` — `CPU_ON` / `AFFINITY_INFO` / `FEATURES`, on the
+**Tegra** path where an EL3 secure monitor answers; `SYSTEM_OFF` is queried by `PSCI_FEATURES` there
+and, in that file's own words, *"never invoked"*. The Pi 4 settles it: bare-metal BCM2711 boots to
+EL2 with no EL3 firmware behind it, so an `smc` is not a power call, it is an unhandled exception.
+Wiring these means a Pi power driver (watchdog / `PM_RSTS`), which is a driver arc.
+
+### M4 — the console window: STOPPED, and why (the named follow-up)
+
+`fbcon::panel_console_window_open` is x86 + `wc`. The verdict is **not a small wiring job**, and the
+blocker is architectural rather than mechanical:
+
+* **Mechanically** it is close. The routed machinery — `route_present_banded`, the owed-rows ledger,
+  the pacing gate, the recycled-id fence — is already expressed against `wm::present_*_owned`,
+  `arch::now_cycles()` and plain atomics, all arch-neutral. `fbcon.rs` carries **42**
+  `all(x86_64, wc)` gates and 24 x86-only ones; widening the console-window subset (the `win_store`
+  / `win_fb` fields and their `FbCon::new` inits, `draw_fb`'s routed branch, `flush`'s band
+  hand-back, the `route_present*` family, `PANIC_MIRROR`) is tedious but not deep.
+* **Architecturally it has no consumer on the Pi, and that is the stopper.** On x86 the caller is
+  `wcx::activate`, the Kepler-takeover seam; the Pi has no `wcx` and no twin of it. Worse, the Pi
+  boot **detaches fbcon** at GUI handoff (`main.rs`, the `fbcon::detach()` on the PI-RAST line) and
+  the shell/midden console then paints through its own `Screen` over the front framebuffer, via
+  `screen::present_surface`'s compat row — *not through fbcon at all*. So opening a console window
+  on the Pi today would window the **boot-log** console, which nothing writes to after handoff: a
+  correct window containing a frozen log.
+
+What the Pi actually needs is the shell's `Screen` to become a compositor window — the compat-row
+path growing a real row — which is a different object on a different path from fbcon's route. That
+is the named follow-up. Honesty over completeness: the milestone is stopped and documented rather
+than half-wired.
+
+### Byte-identity, and the discipline it turned out to require
+
+Knob-off `kernel8.img` is **byte-identical** to the pre-arc baseline —
+`42355ca2a9be7748e8aff41a94615c86704053b12c35903d862f1ba8f0407342` — measured by sha256 against a
+build taken BEFORE the first edit, on the PI-RAST commit's discipline.
+
+It did not come free, and the reason is worth recording because it will catch the next arc:
+
+> The first cut of the `wm.rs` seam was `cfg`-only — not one line of executable code changed on the
+> knob-off path — and the hash still moved (`42355ca2…` → `1143ecc5…`). **Panic `Location` records
+> embed FILE LINE NUMBERS.** Eleven added *comment* lines in `wm.rs` shifted every location below
+> them.
+
+So: **a change to any file that is compiled into the knob-off image must be LINE-NEUTRAL.** Fit new
+prose into the line count already there; never add to it. This arc's `wm.rs` diff is 10 added / 10
+removed, and both `syscall.rs` files end at exactly the line count they started at (22488 aarch64,
+22254 x86). Files that are *not* compiled knob-off — `video/{strip,dock,menubar,crystal}.rs` — are
+free of the constraint. And the identity must be re-MEASURED after every such edit, not reasoned
+about; the note lives beside the knob in `arroyo`.
+
+### Gates
+
+| leg | result |
+|---|---|
+| `./arroyo check` | 12/12 cfg-coverage legs green (`pidesk` joins the `arm-pi` leg, which carries `witness` — so the dock/menubar/crystal FIXTURES type-check on aarch64) |
+| `UNAOS_WC=1 ./arroyo check` | 12/12 green (`wm.rs` was touched — video law) |
+| knob-off `./arroyo kernel8` | sha256 `42355ca2…`, byte-identical to baseline |
+| `UNAOS_PIDESK=1 ./arroyo kernel8` | builds; `dock` / `menubar` / `About This Shard` / `[strip] decline reason=not-word4` literals present in the image |
+| knob-off `./arroyo kernel8-test 210` | MBENCH **PASS 108/108** required witnesses, 0 forbidden, 13713 lines |
+| knob-on `./arroyo kernel8-test 210` | MBENCH **PASS 108/108**, 0 forbidden, 19015 lines |
+
+And the strip paints on the Pi panel path, at QEMU raspi4b's 640x480:
+
+```
+[dock] live passes=1228 paints=64 rate=52/1k scan=396cyc/6us paint=27552cyc/440us
+       px/paint=20647 clob=0 presses=0 raises=0 unhides=0
+```
+
+64 repaints across 1228 passes (52/1k) is the damage-driven model working, not a per-frame redraw;
+`paint=27552cyc` over a 62.5 MHz CNTVCT reads as 440 µs, which is the CNTFRQ seam above being right
+— on the old TSC guess the same paint would have been reported as ~22 µs. `presses=0` is QEMU
+having no pointer to drive; the press path's live proof is the bench Pi's mouse.
