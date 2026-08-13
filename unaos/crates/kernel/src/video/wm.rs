@@ -4730,7 +4730,18 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     // honesty WCD-BAND already applies when a banded present narrows the ask. Stage 2's chunked
     // full-coverage walk still adjudicates the whole box afterwards, so no coverage is lost to the
     // clip, only deferred to the stage that was built to pay for it incrementally. On QEMU the
-    // probes are RAM-fast and the stop never fires, so the regression wire is byte-identical.
+    // probes are RAM-fast and the stop never fires, so the regression wire is SPEC-identical and,
+    // on a fast host, byte-identical; a slow TCG host whose per-pass wall sits near `WCD_CHUNK_US`
+    // can trip the stop and print stage-1 lines as `band=0..N`, still spec-green because nothing
+    // anchors on `band=` (the REQUIREs match `coverage=` and the `-> PASS`/`-> FAIL` terminals).
+    //
+    // THE HONEST RESIDUAL, named rather than buried: a clip DEFERS the unwalked rows to stage 2,
+    // it does not verify them now. So a genuine blit defect below the clipped extent — roughly
+    // below row 12 of a panel-scale window at the metal probe rate — is INVISIBLE on the launch
+    // instant and stays so until this window's stage-2 battery matures: the deferral gate opens at
+    // 15 s of uptime, or a `paygo_service` whole-box mark / pay-at-close forces it earlier. That is
+    // the price of not holding `COMP_GATE` for a third of a second; it is the same deferral WC-D's
+    // stage split already accepted for the FULL verdict, now extended to the top-of-box rows too.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let chunked = running == WCD_ST_FULL_RUN;
     #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
@@ -4749,12 +4760,17 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     // the second pass, the `band=` field, the interlock rect and the cursor all describe the chunk,
     // not the ask. A no-op rebind on every build without the chunking (`rows_done == row1` there).
     let row1 = rows_done;
+    // WCD-CLIP1 — the distinct CLIP fact: the time stop cut this walk short of the rows it asked
+    // for. `banded` folds it in for the wire, but the terminal-vs-defer decision below needs it
+    // apart from a present that was banded for other reasons (a genuinely narrow damage band that
+    // the stop did NOT cut is a full verdict of what it promised; a stopped walk is not).
+    let clipped = row1 < row1_ask;
     // WCD-CLIP1 — a walk the time stop cut is a BANDED verdict whatever the present declared: the
     // rows past the cursor were not adjudicated, and a `band=none` line over them would claim a
     // clearance nothing bought. Also closes a pre-existing gap in stage 2: the FIRST chunk of a
     // box at most [`WCD_CHUNK_ROWS_MAX`] rows tall entered with `banded=false`, so a FAIL inside it
     // printed `band=none` while having walked only the rows the stop allowed.
-    let banded = banded || row1 < row1_ask;
+    let banded = banded || clipped;
 
     // Discard, never clean — see the doc comment. Bare `IVAC` is what makes `bad_ram` able to fail.
     // WCD-BAND: the extent follows the verified rows, not the whole window, so a banded verdict
@@ -4812,7 +4828,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     // WC-D/PAYGO — `checked` is the honest denominator and always was, but a denominator does not say WHY
     // it is small. This does, positionally, right beside the count it qualifies. Empty on every build but
     // an x86 `wcg-paygo` one, so the three lines below stay byte-identical elsewhere.
-    let coverage = wcd_coverage_note(step);
+    // WCD-CLIP1 — `clipped` is part of the derivation now: a collapsed lattice (`step == 1`) whose
+    // walk the stop CUT did not reach full coverage, so it must not print `coverage=full`. See
+    // [`wcd_coverage_note`].
+    let coverage = wcd_coverage_note(step, clipped);
     // WCD-TEARDOWN — close the panel-write window. Taken AFTER the last probe and before the first
     // print, so it covers exactly the interval the verdict rests on and nothing this function does
     // to the panel afterwards. x86 only; see the WCD-TEARDOWN ledger for why the arch gate is a
@@ -5065,15 +5084,27 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         );
     }
     // WC-D/PAYGO — the battery's terminal line, emitted right behind the verdict that closed it. `step ==
-    // 1` is exactly "this pass ran at full coverage", which is the condition `wcd_commit` sealed
-    // `VERIFIED_FULL` on, so the two cannot disagree about whether the window still owes a verdict. A
-    // sampled pass prints nothing here — its `coverage=lattice16` marker already says what it was, and the
-    // `state=waiting` census will speak from the first composite this window is declined on.
+    // 1` is "this pass ran at full HORIZONTAL coverage", and `full` adds "and reached the box's last
+    // row" — the pair is exactly the condition `wcd_commit` seals `VERIFIED_FULL` on, so the two cannot
+    // disagree about whether the window still owes a verdict. A sampled pass prints nothing here — its
+    // `coverage=lattice16` marker already says what it was, and the `state=waiting` census will speak
+    // from the first composite this window is declined on.
+    //
+    // WCD-CLIP1 — `full` demotes the one dishonest terminal: a COLLAPSED lattice (`step == 1`, a rect
+    // narrower than the step) whose STAGE-1 walk the time stop CUT short. Sealing it would close the
+    // battery over rows it never adjudicated (`coverage=full band=0..3 -> PASS` then `-> PAID`, the
+    // terminal-over-partial the module forbids). Instead it commits as a first verdict — no
+    // `VERIFIED_FULL`, no `-> PAID` — and stage 2's cursor walk buys the rest. An uncollapsed stage-1
+    // pass runs `step > 1` and already commits non-terminally, so this only ever fires for the collapse;
+    // a stage-2 pass reaches here only after its cursor closed the box (`row1 < full_rows` returns
+    // early), so `running == WCD_ST_FIRST_RUN` keeps it out. Geometrically near-unreachable (a rect
+    // narrow enough to collapse the lattice cannot burn 2 ms of probes), but the type system allows it.
     // WC-D — the verdict is published; advance the window and set the flags the rest of the module
     // reads. After the print, so a `[wc-a]`-ordering reader sees verdict-then-transition.
-    wcd_commit(wi, running, step);
+    let full = !(clipped && running == WCD_ST_FIRST_RUN && step == 1);
+    wcd_commit(wi, running, step, full);
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
-    if step == 1 {
+    if step == 1 && full {
         wcd_complete(r.id, wi);
     }
 
@@ -5298,7 +5329,9 @@ fn verify_reference(
                     WCD_ACC_OCC[i].load(Relaxed), surface_checksum(r),
                     if mv > 0 { "LIVE (unverifiable)" } else { "PASS" }
                 );
-                wcd_commit(i, running, 1);
+                // WCD-CLIP1 — `full = true`: this is a STAGE-2 close over every row the shrunk box
+                // still has, cumulative from row 0, so it legitimately earns the terminal state.
+                wcd_commit(i, running, 1, true);
                 wcd_complete(r.id, i);
             } else {
                 wcd_unwind(i, running);
@@ -6351,18 +6384,29 @@ fn wcd_cas(i: usize, from: u32, to: u32) -> bool {
 /// lattice correct rather than merely tolerable: a rect narrower than the step is walked at full
 /// coverage (see [`verify_reference`]), so it earned the terminal state on its first pass and must
 /// not be re-verified later to say the same thing again.
+///
+/// WCD-CLIP1 — `full` is what makes "walked at full coverage" a FACT rather than an inference from
+/// `step`. A collapsed lattice runs `step == 1` (the terminal condition) but a stage-1 pass the
+/// time stop CUT short did NOT reach the box's last row — so sealing `VERIFIED_FULL` + `DONE` on
+/// it terminally closes the battery over rows it never adjudicated, and stage 2 never runs to buy
+/// them. The caller passes `full == false` for exactly that case (`clipped && stage 1 && step ==
+/// 1`), which routes it through the stage-1→stage-2 transition below instead: a first verdict, no
+/// `VERIFIED_FULL`, cursor reset, stage 2 owed. Every other pass passes `full == true` and the
+/// behaviour is byte-for-byte what it was.
 #[cfg(feature = "witness")]
-fn wcd_commit(i: usize, running: u32, step: usize) {
+fn wcd_commit(i: usize, running: u32, step: usize, full: bool) {
     let bit = 1u32 << i;
     VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     {
-        if step == 1 {
+        if step == 1 && full {
             VERIFIED_FULL.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
             WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
         } else {
             // WCD-CHUNK — stage 2 walks the box from the top; the cursor is stage-scoped state and
-            // this transition is where a stage ends with another owed.
+            // this transition is where a stage ends with another owed. WCD-CLIP1 routes a clipped
+            // collapsed stage-1 pass here too, so its unwalked rows are owed to stage 2 rather than
+            // sealed away.
             WCD_CUR[i].store(0, core::sync::atomic::Ordering::Relaxed);
             WCD_STATE[i].store(WCD_ST_FULL, core::sync::atomic::Ordering::Release);
         }
@@ -6370,7 +6414,8 @@ fn wcd_commit(i: usize, running: u32, step: usize) {
     }
     #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
     {
-        let _ = (running, step);
+        // No chunking on this build, so no time stop and no clip: `full` is always true here.
+        let _ = (running, step, full);
         WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
     }
 }
@@ -6553,11 +6598,23 @@ fn wcd_complete(id: u32, i: usize) {
 /// Derived from the step the walk ACTUALLY used, never from the step that was asked for — see
 /// [`verify_reference`]'s collapse. A `coverage=` that misreports its own pass is worse than no
 /// marker at all.
+///
+/// WCD-CLIP1 — and from `clipped`, for the same reason. A collapsed lattice (`step == 1`, a rect
+/// narrower than the lattice step) that the time stop CUT short walked its columns fully but only a
+/// prefix of its rows, so `coverage=full` beside a `band=0..3` on an 8-row box is the exact
+/// self-contradiction the reviewer named. It prints `coverage=clipped` instead — the honest label
+/// for "full horizontal coverage of the rows this pass reached, and no more". Unreachable in
+/// practice (a rect narrow enough to collapse the lattice is far too small to burn 2 ms of probes),
+/// but the type system allows it and an honest marker costs one branch. A lattice pass (`step > 1`)
+/// that clips keeps `coverage=lattice16`: it was already partial-by-design and `band=` carries the
+/// row extent, so nothing there misreports.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 #[inline]
-fn wcd_coverage_note(step: usize) -> &'static str {
+fn wcd_coverage_note(step: usize, clipped: bool) -> &'static str {
     if step > 1 {
         " coverage=lattice16"
+    } else if clipped {
+        " coverage=clipped"
     } else {
         " coverage=full"
     }
@@ -6565,7 +6622,7 @@ fn wcd_coverage_note(step: usize) -> &'static str {
 
 #[cfg(all(feature = "witness", not(all(target_arch = "x86_64", feature = "wcg-paygo"))))]
 #[inline]
-fn wcd_coverage_note(_step: usize) -> &'static str {
+fn wcd_coverage_note(_step: usize, _clipped: bool) -> &'static str {
     ""
 }
 
@@ -8356,6 +8413,13 @@ static C2_STRADDLE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// of COMP2-SPLIT's pair, so a span whose `blit_us` dwarfs `compose_us + present_us` is either the
 /// direct fallback or this witness — and this field is what says which. `tools/serial-analyzer.py`
 /// still parses no field of this line.
+///
+/// ARCH — this line is `#[cfg(feature = "witness")]`, NOT arch-gated, so `wcd_us=` lands on the
+/// aarch64 `[comp2]` wire too. That is correct — `verify_window` runs on both arches and its glass
+/// read-back is a real per-pass cost on Pi 4 as much as on x86 — and it is a LINE-FORMAT change for
+/// the aarch64 wire, recorded here beside the x86 one because a Pi reader diffing the field list
+/// will see it. No `[comp2]`-anchored `pi4-regression.spec` pattern parses past `blit_us` by
+/// position, so the insertion moves nothing that gate matches.
 ///
 /// COMP2-SPLIT — `compose_us` and `present_us` are inserted immediately AFTER `blit_us` under the
 /// same rule (`span=` terminal, `rate=` last-but-one). Adjacency is the point rather than a
