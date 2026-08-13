@@ -526,11 +526,28 @@ FORBID \[wc-f\] twin -> SKIP
 # ---
 # ---    The REQUIREs assert the INSTRUMENT RAN, deliberately not what it found: the finding is the
 # ---    arc's output. The FORBIDs are the other half, and they are what the global summary was
-# ---    reaching for — "no suspect fired anywhere, ever". A FORBID needs no completeness claim: it
-# ---    catches a COHER/RACE/BLIT verdict in any window at any point in the boot, including one that
-# ---    appears long after every rollup has printed. CLEAN and CLEAN+SLOW stay green — the timing
-# ---    finding is this arc's result, not a regression. Witness-feature only.
-# ---    See docs/dev/OS/08_VIDEO/engine.md §WC-G.
+# ---    reaching for. They are NOT, however, "no suspect fired anywhere, ever" — that is the claim
+# ---    this comment used to make and it was an overclaim of exactly the kind the scope note above
+# ---    was written against. THE SPENT-BUDGET LAW: a witness whose budget is spent before its
+# ---    subject runs cannot falsify anything about what the subject did afterwards. Here the budget
+# ---    is 4 samples per window id (`SAMPLES` in wcg.rs) and it gates the SAMPLE ITSELF, not just
+# ---    the line: `begin` returns `None` once `TAKEN[i] >= SAMPLES`, `end` is reachable only with a
+# ---    `Probe` `begin` handed out, and W_COHER/W_RACE/W_BLIT are incremented ONLY inside `end`. So
+# ---    the fifth instrumented blit of a window takes no checksums, computes no verdict, and prints
+# ---    no line — and the rollup, which fires once at `n == SAMPLES`, reports those same four
+# ---    samples' counters and nothing later. `on_present`'s app-side checksum is gated the same way
+# ---    (`budget_left`), so even the RACE-PRESENT leg's input stops being collected.
+# ---    TRUE REACH, then: these three FORBIDs convict a COHER/RACE/BLIT verdict occurring in ANY of
+# ---    the eight window ids, at any point in the boot AT WHICH THAT WINDOW STILL HAS BUDGET — i.e.
+# ---    within its first four sampled blits. A coherency fault that begins on a window's fifth
+# ---    composite is invisible to this gate, and a green run is not evidence against it. What the
+# ---    FORBIDs do buy over a global summary is that they need no completeness claim about WHICH
+# ---    windows were sampled: any convicting line anywhere in the log fails the run.
+# ---    (This is the one asymmetry with `[wc-h]` below, where WC-H2 moved the tear census OUT of the
+# ---    budget gate; nothing equivalent is possible here, because a wc-g verdict IS the expensive
+# ---    64 KiB-checksum-plus-read-back work the budget exists to bound.)
+# ---    CLEAN and CLEAN+SLOW stay green — the timing finding is this arc's result, not a regression.
+# ---    Witness-feature only. See docs/dev/OS/08_VIDEO/engine.md §WC-G.
 REQUIRE \[wc-g\] win=.* fbbad=.* slow=.* ->
 REQUIRE \[wc-g\] rollup win=.* scope=window .*frame_us=.* ->
 FORBID \[wc-g\] .*-> COHER
@@ -550,8 +567,27 @@ FORBID \[wc-g\] .*-> BLIT
 # ---    which is the ONLY phase that can still tear. `torn=` compares THAT against the beam's time
 # ---    on the box (`rectscan_us`, computed exactly as WC-G computes it, with the same deliberate
 # ---    bias toward not reporting a tear). The FORBID on `AT-RISK` is the arc's real assertion: it
-# ---    fires if any window's present phase ever outruns the beam again — a regression back to the
-# ---    tearing regime, caught in any window at any point in the boot.
+# ---    fires if any window's present phase outruns the beam again — a regression back to the
+# ---    tearing regime.
+# ---
+# ---    ITS REACH, stated precisely, because the wc-g block above records the opposite case and the
+# ---    two must not be read as one rule. WC-H2 moved the tear test ABOVE the budget gate in
+# ---    `stage_note` — `H_TORN` is incremented on EVERY present, budget or no budget — and
+# ---    `stage_decline` does the same for `H_DECLINE`. `AT-RISK`/`UNSTAGED` are rollup verdicts
+# ---    drawn from those whole-boot totals, and `census_refresh` re-emits the `scope=window` rollup
+# ---    for the rest of the boot, so a tear that begins on a window's thousandth composite IS
+# ---    convictable here. That is the difference from `[wc-g]`, where the budget gates the sample
+# ---    itself.
+# ---    The spent-budget law still leaves two honest holes, and they are the ones to reach for if
+# ---    this gate ever passes over a panel that visibly tore: (1) NO ROLLUP, NO VERDICT — the
+# ---    `scope=window` line is latched on `H_TAKEN >= SAMPLES`, so a window that composites three
+# ---    times and stops never emits one, and its `torn` count is never read by anything; (2) THE
+# ---    REFRESH NEEDS A LATER FLUSH — `census_refresh` runs from `stage_flush`, behind a census-delta
+# ---    gate and a `CENSUS_PERIOD_US` (2 s) rate gate, so a window that STOPS compositing freezes on
+# ---    its last line (`age_ms=` is how a reader tells), and a tear in its final sub-2 s of activity
+# ---    can go unprinted. The per-sample `-> BUFFERED` lines carry `torn=` too but are budget-capped
+# ---    at `SAMPLES` per class, which is exactly why the verdict is pinned on the rollup and not on
+# ---    them.
 # ---
 # ---    WHY THE WC-G FORBIDS AND ITS `slow=` LEG ARE UNCHANGED. `[wc-g] us=` brackets the whole of
 # ---    `draw_window`, and WC-H did not change what that bracket means — it changed what the copy
@@ -922,7 +958,42 @@ REQUIRE \[pstrip\] rollup samples=[0-9]+ redraws=[0-9]+ skipped=[1-9]
 # ---    from "genuinely busy". The clean fix is a self-verdict in the emitter (a `paced=yes/no` computed
 # ---    against a stated criterion, or a cumulative since-boot ratio at the last rollup); until then this
 # ---    FORBID catches the collapse case, which is the defect shape the module was written against.
-FORBID \[pstrip\] rollup .*skipped=0 srcdelta=
+# ---
+# ---    THE PREDICTED FALSE RED ARRIVED (2026-08-12), and the pattern is sharpened by ONE field rather
+# ---    than dropped. Observed on a 210 s `kernel8-test` run under parallel-build host load, suite
+# ---    otherwise 107/107:
+# ---        [pstrip] rollup … skipped=0 srcdelta=26
+# ---    That is the paragraph above happening: 26 samples, 26 of them with source movement, every one
+# ---    of them honestly dirty. Nothing was unpaced.
+# ---    WHAT LICENSES THE SHARPENING is `srcdelta=`, which is ALREADY on the line and which the 2026-08-12
+# ---    green capture shows is not independent of `redraws` at all. Twenty rollups from that run, in order
+# ---    (samples/redraws/skipped/srcdelta):
+# ---        38/31/7/30  37/22/15/22  40/26/14/26  40/19/21/19  40/27/13/27  40/26/14/26  40/28/12/28
+# ---        40/23/17/23  40/22/18/22  38/28/10/28  39/35/4/35   39/29/10/29  40/29/11/29  40/31/9/31
+# ---        40/25/15/25  40/27/13/27  40/27/13/27  37/33/4/33   40/29/11/29  40/30/10/30
+# ---    `redraws == srcdelta` on nineteen of twenty (the first differs by the arm frame's forced paint).
+# ---    A second, independent 210 s run the same day reproduced the identity line for line — again
+# ---    nineteen of twenty, again the arm frame the only exception — with `skipped` down to 2 in its
+# ---    first window, which is the thin margin above measured again rather than assumed.
+# ---    The clock is unsynced headless, so the text hash never moves and the decay tail only ever paints
+# ---    on samples the source moved anyway: EMPIRICALLY `skipped = samples - srcdelta`. An honest
+# ---    `skipped=0` therefore always carries `srcdelta == samples`, i.e. srcdelta LARGE and non-zero —
+# ---    exactly the false red's shape, and exactly what a truncated final window makes possible at any
+# ---    sample count (which is why no numeric threshold on srcdelta is safe; only zero is).
+# ---    THE COLLAPSE CASE, on the other side, is redrawing from a cause that is NOT the source, and on
+# ---    the quiet panel the module's own note pins the source at rest: an idle core's per-mille "is a
+# ---    hard 0 and its length does not move". A breath sweep (or anything else) made dirty therefore
+# ---    prints `redraws == samples` with `srcdelta=0`. With srcdelta=0 the only honest redraw cause left
+# ---    is the status text at ~1/s against a 4/s sample rate, so an honest window would still skip about
+# ---    three samples in four. `skipped=0 srcdelta=0` is thus unreachable honestly and is the collapse
+# ---    signature exactly; the `samples=[1-9]` anchor additionally excludes a degenerate zero-sample
+# ---    rollup, which the old pattern would also have called a fault.
+# ---    WHAT IS GIVEN UP, stated plainly: a pacing collapse that lands on a boot whose source IS moving
+# ---    now escapes. That case was never separable — on a loaded boot the honest and the defective line
+# ---    are the same line, which is the residual the paragraph above already assigns to the emitter. The
+# ---    trade is a detector that is silent where it cannot tell, instead of one that convicts the honest
+# ---    reading; the emitter-side `paced=yes/no` remains the real fix and is still owed.
+FORBID \[pstrip\] rollup samples=[1-9][0-9]* redraws=[0-9]+ skipped=0 srcdelta=0
 # --- PULSE-3: THE SOURCE, not the pacing.
 # ---
 # ---    P64, attended, capture pi4-r23s1o. Three vugs held the cores at a sustained 99% and the
@@ -1190,7 +1261,15 @@ FORBID :: MAILBOX: BUSY
 # --- rulings: [wedge1] STRADDLE (deliberate non-pin, ruling owed), [storm] boot-baseline +
 # --- [spinhunt] load lines (pure census), [wc-h] fixture (absence-shaped). Adjacent findings
 # --- recorded in the landing report: [wc-g]/[wc-h] FORBID reach ends at sample-budget
-# --- exhaustion, narrower than the spec prose claims.
+# --- exhaustion, narrower than the spec prose claims. CLOSED prose-side (2026-08-12): the
+# --- claims were re-read against wcg.rs and rewritten in place. [wc-g] confirmed narrow — the
+# --- budget gates the SAMPLE (`begin` returns None past `TAKEN >= SAMPLES`; the verdict counters
+# --- are incremented only in `end`), so reach is a window's first four sampled blits, and the
+# --- "any point in the boot" sentence is gone. [wc-h] confirmed the OPPOSITE by WC-H2: `H_TORN`/
+# --- `H_DECLINE` count above the gate and `census_refresh` re-emits the rollup, so its reach is
+# --- whole-boot with two named holes (no rollup before the budget spends; the refresh freezes
+# --- when a window stops compositing). No directive changed — reach is an emitter property, and
+# --- the fix owed on the [wc-g] side is a wider budget or a cheap unbudgeted leg, not a pattern.
 # --- COUNT RE-SCOPES (2026-08-04, same day, follow-up) — the two COUNT-shaped items above are
 # --- CLOSED, each validated in both directions by log surgery on the live 91/91 capture:
 # ---   * `[pstrip] rollup skipped=` did NOT want a COUNT. Pacing is a universal over an
