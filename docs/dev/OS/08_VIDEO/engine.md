@@ -12699,12 +12699,21 @@ service, which is another lane's file this cycle.
 
 ### Standing conflict: the arm-pi witness battery does not know about a kernel console row
 
-At bench geometry (`UNAOS_FBW=1920 UNAOS_FBH=1200`) the armed run is **104/108 with 17 forbidden
+At bench geometry (`UNAOS_FBW=1920 UNAOS_FBH=1200`) the armed run is **104/108 with 13 forbidden
 hits**, and every one of them is a consequence of the console window EXISTING rather than of anything
-it does:
+it does. The `wc-d` line settles it beyond argument — the console window's box is
+`1306x780 at (307,158)`, and the fixture's first mismatching pixel is:
 
-* `[wc-c] side-by-side windows=2 drawn=1` — the console's 1306x780 box at (307,158) occludes one of
-  the two fixture windows on a 1920x1200 panel.
+```
+[wc-d] verify win=2 surf=128x128 … at (17,85) panel=1920x1200 checked=262144 bad_cache=0
+       bad_ram=97458 ram_indep=yes … first=(307,158) got=0x2d2b55 want=0xc3c3c3 -> FAIL
+```
+
+`first=(307,158)` **is the console box's origin, to the pixel.** The fixture is reading the console's
+chrome where it expected its own window's face: occlusion, not corruption — `bad_cache=0` and
+`ram_indep=yes` say the surface itself is intact. The other three read the same way:
+
+* `[wc-c] side-by-side windows=2 drawn=1` — the console covers one of the two fixture windows.
 * `[wc-j] vacate close_desktop=false (0/5)` — the vacated pixels reveal the CONSOLE, not the desktop.
 * `[wc-g] win=1 …` — **`win=1` is now the console**, not the fixture's window. The witness is
   describing a different object than the spec's author meant.
@@ -12752,3 +12761,49 @@ file is named in PI-DESK's line-neutrality rule.
 | top reservation | `top_chrome_h` returned a literal `0` | the tiler reserves the bar's rows through `wm::work_top` |
 | desktop present | no strip subtraction compiled | subtracts every strip rect, so the shell's whole-panel clear cannot erase the bar |
 | console | boot log on the raw panel, gone at handoff | a **compositor window** — `1296x736`, `162x92` glyph cells, `KERNEL_OWNER_CONSOLE`, hittable, with the panic fallback armed — on any panel whose dock can host a full strip |
+
+### Gates
+
+All QEMU legs run on a QUIET host (`pgrep -c qemu` = 0 immediately before each).
+
+| leg | result |
+|---|---|
+| `./arroyo check` | green (both arches) |
+| `UNAOS_WC=1 ./arroyo check` | green (`fbcon.rs` / `screen.rs` / `ui_status.rs` touched — video law) |
+| `UNAOS_PIDESK=1 ./arroyo kernel8-test 300` | MBENCH **PASS 108/108**, 0 forbidden, 25246 lines |
+| knob-off `./arroyo kernel8-test 210` | MBENCH **PASS 108/108**, 0 forbidden, 25120 lines |
+| knob-off `./arroyo kernel8` | sha256 `27d782b5b7951ad19abb0ad8a9d05b79174f2d456c13a6ecaa361ae18170cc8b` — **byte-identical** to the pre-arc baseline taken before the first edit |
+| `UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 300` | **104/108**, 13 forbidden, 40929 lines — the standing spec conflict above, every hit an occlusion/identity effect of the new kernel row |
+
+Line-neutrality of every file compiled into the knob-off image, from `git show --numstat`:
+
+```
+1  1   arch/aarch64/syscall.rs      (the <Esc> fold)
+2  2   ui_status.rs
+4  4   video/screen.rs
+126 54 video/fbcon.rs               (52/52 in place + 74 appended at the tail)
+36 1   main.rs                      (1/1 at the call site + 35 appended at the tail)
+10 0   video/mod.rs                 (appended at the tail)
+226 0  video/pidesk.rs              (new file)
+```
+
+And the bar and the console on the bench panel path:
+
+```
+[wc-x] console-window win=1 panel=1920x1200 surf=1296x736 box=1306x780 at (307,158)
+       cell=8x8 cols=162 rows=92
+[wc-x] console-route first-paint win=1 (glyphs -> window surface, damage-limited)
+[wc-x] console-window panic-fallback armed win=1 (panic paints the PANEL, not the window)
+[pidesk] menubar ENABLED panel=1920x1200 rect=Some((0, 0, 1920, 34)) was=false
+[pidesk] menubar PAINTED (composite at the enable seam)
+[menubar] live passes=412 paints=22 rate=53/1k scan=389cyc/6us paint=40618cyc/649us
+          px/paint=65280 press=inert crystal=16x22 toggles=1 off_passes=1
+```
+
+`toggles=1` is the tenancy being claimed exactly once, which is the whole of MENUBAR-PI; 22 repaints
+across 412 passes is the damage-driven model working rather than a per-frame redraw; `press=inert` is
+`menubar` itself having no press consumer (the crystal owns that, through `strip::press_route`), not a
+dead bar. On the 640x480 gate surface the same lines read `rect=Some((0, 0, 640, 34))` with no console
+window, per the narrowed dock law above.
+
+---
