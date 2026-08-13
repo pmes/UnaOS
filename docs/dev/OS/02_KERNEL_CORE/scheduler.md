@@ -2326,6 +2326,29 @@ fail.
 
 **SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.
 
+**Spawn-site ordering (U11-REAP ORDERING FIX).** A second U11-reap FAIL, deterministic under
+`UNAOS_PIDESK=1 UNAOS_PIRAST=1 ./arroyo kernel8-test 300` (107/108, byte-identical across runs), was
+*not* in the reaper or in the fs code the fixture exercises — it was **where the reaper was spawned**.
+The `spawn_auto("orphan-reaper", …)` call lived in the panel-service block, which runs **after**
+`pi_rast_demo_maybe()`, while the whole EL0 fixture cascade (U11-reap included) is already running on
+the APs. A teardown-orphaned chain queued by that fixture therefore waited on a service that did not
+exist yet, and U11-reap's bounded 5 s CHECKPOINT-3 poll passed only when the raster demo happened to
+finish inside it. The evidence is the log order: the reaper's `freed teardown-orphaned chain
+@cluster N` line lands **before** the verdict at 4.5 s of demo (PASS, by half a second) and **316
+lines after** it at 9.5 s (FAIL — then the chain is freed anyway, so nothing leaked). The
+`UNAOS_VUGPAR=1` control "fixed" the failure for the same reason in reverse: it shortened the demo
+back under the deadline.
+
+The fix moves the spawn to the `start_aps` block, immediately after the APs are released and before
+the fixture cascade — the first point in the boot at which a scheduled core exists, and the point at
+which the reaper's own doc comment already claimed it was spawned. Placement policy is unchanged
+(`spawn_auto`, load-balanced, SCHED-3b); at that point only the AP set is in `ONLINE_MASK`, so the
+reaper can never be placed on the not-yet-scheduling BSP, and it blocks on `REAPER_SEM` immediately,
+so an early spawn costs an idle task and no duty cycle. It is also no longer gated on
+`framebuffer_addr != 0` — a panel-less boot has teardown orphans too. The general rule the FAIL
+states: **the availability of a kernel service must not be a function of demo or panel composition.**
+The fixture's FORBID and its 5 s bound were left untouched; they were measuring honestly.
+
 ### The idle-desktop core wedge (aarch64, SPIN-1…8 / WEDGE-4…6)
 
 A reproducible single-core lockup on the Pi 4: open one window on an otherwise

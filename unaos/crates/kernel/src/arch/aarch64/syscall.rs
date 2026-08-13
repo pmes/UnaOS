@@ -5210,8 +5210,11 @@ fn deferred_free_pop() -> Option<u32> {
 }
 
 /// U11-M2b: the deferred-free REAPER — a forever kernel service task that closes M2a's teardown-last-close
-/// honest-scope gap. Spawned ONCE at boot (`main.rs`'s aarch64-baremetal service block, via `sched::spawn`) so
-/// it already exists before any orphan is queued — a lazily-spawned reaper would need a heap `Box<Task>` +
+/// honest-scope gap. Spawned ONCE at boot (`main.rs`'s aarch64-baremetal `start_aps` block, via
+/// `sched::spawn_auto`, immediately after the APs are released and BEFORE the EL0 fixture cascade that can
+/// orphan a chain) so it already exists before any orphan is queued — the U11-reap ordering fix: the earlier
+/// site, down in the panel-service block past `pi_rast_demo_maybe()`, left this invariant FALSE for the whole
+/// fixture cascade — a lazily-spawned reaper would need a heap `Box<Task>` +
 /// `RUN_QUEUES`, both illegal from the IRQ-masked teardown push. Each turn: pop one chain head (lock held only
 /// for the pop), RELEASE the lock, THEN `free_orphan_chain` (mount + all-FAT-copies free — block I/O, legal
 /// HERE: EL1, IRQs enabled, its own stack, never in teardown context). When the queue is empty it BLOCKS on

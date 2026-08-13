@@ -417,6 +417,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         unaos_kernel::arch::sched::start_aps(&online);
 
+        // U11-M2b (U11-REAP ORDERING FIX): the deferred-free REAPER is spawned HERE — the first point in
+        // the boot where a scheduled core exists — and NOT down in the panel-service block it used to live
+        // in. Its own doc comment states the invariant it depends on ("Spawned at BOOT ... so it already
+        // exists before any orphan is queued"), and the old site did not honour it: the panel block runs
+        // AFTER `pi_rast_demo_maybe()`, while the whole EL0 fixture cascade — U11-reap included — is
+        // already running on the APs. A teardown-orphaned chain queued by that fixture therefore waited on
+        // a service that did not exist yet, and U11-reap's bounded CHECKPOINT-3 poll passed only when the
+        // raster demo happened to finish inside it: 4.5 s of demo (PASS, by half a second) vs 9.5 s with
+        // `UNAOS_PIDESK=1 UNAOS_PIRAST=1` (deterministic FAIL, the chain freed 300+ lines after the
+        // verdict). Availability of a kernel service must not be a function of demo/panel composition.
+        // Placement is unchanged (`spawn_auto`, load-balanced, SCHED-3b); only ONLINE_MASK's AP set is
+        // registered at this point, so the reaper can never be placed on the not-yet-scheduling BSP. It
+        // blocks on `REAPER_SEM` until something is queued, so an early spawn costs an idle task and no
+        // duty cycle. Unconditional (no framebuffer gate): a panel-less boot has teardown orphans too.
+        unaos_kernel::arch::sched::spawn_auto(
+            "orphan-reaper",
+            unaos_kernel::arch::syscall::orphan_reaper,
+            0,
+        );
+
         // M6g Part B: probe the microSD (EMMC2 first, legacy SDHCI fallback) and register it as the block
         // backend. Synchronous, on the BSP, BEFORE the M6b demo — single-threaded mailbox use (the boot
         // framebuffer call is long done) and deterministic serial placement: its two lines land early,
@@ -1310,19 +1330,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 render_cpu,
                 unaos_kernel::arch::sched::PRIO_SERVICE,
             );
-            // U11-M2b: the deferred-free REAPER — a forever kernel service task that frees a cluster chain
-            // orphaned when a program EXITS holding the last cross-process open of an unlinked file (teardown
-            // is the last close, but block I/O is illegal there, so `clear_files_row` queues the chain head and
-            // the reaper frees it in this block-I/O-legal context). Spawned at BOOT — never lazily from the
-            // teardown push (which cannot allocate a `Box<Task>` or take `RUN_QUEUES`). SCHED-3b: now adopts
-            // load-balanced placement (spawn_auto) instead of pinned core. The old deterministic placement
-            // onto `online.get(1)` (or `input_cpu` fallback) caused c2=100% while c1=0%; load-balanced spreads
-            // it across least-loaded cores. Additive + aarch64-baremetal-scoped.
-            unaos_kernel::arch::sched::spawn_auto(
-                "orphan-reaper",
-                unaos_kernel::arch::syscall::orphan_reaper,
-                0,
-            );
+            // U11-M2b: the deferred-free REAPER used to be spawned HERE. It is not any more — it now goes up
+            // in the `start_aps` block, before the EL0 fixture cascade that can orphan a chain (see the
+            // U11-REAP ORDERING FIX comment at that call site for the deterministic FAIL this site caused).
+            // The summary line below still reports its load-balanced (SCHED-3b) scheduling: by this point the
+            // reaper has been placed, alongside the two panel services spawned just above.
             serial_println!(
                 ":: INPUT on core {} + RENDER on core {} + orphan-reaper load-balanced scheduled (OS on its own scheduler; BSP idle) ::",
                 input_cpu, render_cpu
