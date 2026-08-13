@@ -5580,3 +5580,277 @@ the CM block, so the piOS side lands in the same format both halves above are qu
 capture exists, the 41 nonzero sweep words with no piOS value — led by the seven unmapped
 core-CTL constants — remain unexamined territory, not excluded territory. `[v3d93]` and `[v3d94]`
 both stay in the tree as standing read-only instruments for any future state the block reaches.
+
+---
+
+### 49.18 The piOS settled-sweep diff — the firmware-side prong's data, and what it does to the frame-unit hypothesis (PI-V3D-95)
+
+§49.16 named the sitting ask and §49.17.2 made it the campaign's only open surface. The first of
+its three captures now exists.
+
+**The artifact.** `~/unaos-bench/capture/v3d-dump-pios-sweep-20260812.txt` — 163 lines, taken
+2026-08-12T21:11:34-06:00 on the bench Pi 4B under stock piOS, kernel `6.18.34+rpt-rpi-v8`, with
+`vc4` **and** `v3d` loaded (the precondition the script header states, met), `vcgencmd`
+`frequency(46) = frequency(1) = 500000992`. Windows: `hub[0x0,0x100)`, `mmuc[0x1000,0x1040)`,
+`mmu[0x1200,0x1240)`, `core0[0x4000,0x4A00)` — `[v3d76]`-identical — plus `CM[0xFE101000,+0x200)`.
+The state is **settled/idle-after-work**, not mid-bin.
+
+**Our side of the diff.** The `[v3d76]` settled wedged sweep of boot PA36 (2026-08-04, capture
+`~/unaos-bench/capture/pi4-r23s1x/ttyACM0.log`), and for the clock manager the `[v3d94]` half-B
+CM window dump of boot22/PA31 in the same capture. Our sweep is **bit-stable** between boot22 and
+PA36 across all 76 nonzero words except the three free-running PCTR outputs at core0
+`+0x688/+0x694/+0x698`, so nothing below is a one-boot artifact.
+
+**Method.** A mechanical join on physical address. A register absent from a sweep read zero (both
+tools print nonzero words only). Names come from the offset tables in
+`unaos/crates/kernel/src/arch/aarch64/v3d.rs` and nowhere else; an offset with no constant there is
+written `core0+0xNNN (undecoded)` and stays that way. Two offsets are named **by the CT0/CT1 `+4`
+mirror rule** this file already relies on for `CT1QBA`/`CT1QEA`/`CT1EA`, and are tagged INFERRED.
+
+**The counts.** In the four V3D windows: **37 identical**, **32 both-nonzero-but-different**,
+**1 piOS-only**, **7 ours-only**. In `CM[0x000,0x100)`: **40 identical of 43**, 3 divergent.
+`CM[0x100,0x200)` — 44 nonzero piOS words — is outside the window our instrument reads at all.
+
+#### 49.18.1 Class (a) — identical to our boot state
+
+Thirty-seven words match byte for byte. The corroborations the ask was taken to get:
+
+| register | offset | both sides | what it corroborates |
+|---|---|---|---|
+| `HUB_IDENT0..3` | hub `+0x08/0x0c/0x10/0x14` | `0x42554856` `0x000E1124` `0x00000100` `0x00000E00` | `[v3d60]` ident; ver 42, core/host counts, TFU/TSY/MSO/L3C bits |
+| `HUB_INT_MSK_STS` | hub `+0x5c` | `0x00000005` | `[v3d49]` hub mask policy |
+| `MMUC_CONTROL` | `+0x1000` | `0x00000001` | MMU cache enabled, no flush pending |
+| `MMU_CTL` | `+0x1200` | `0x060D0C01` | **`[v3d62]` MMU_CTL — the full fault policy is bit-identical to a working binner's** |
+| `MMU_ADDR_CAP` | `+0x1214` | `0x00000FFF` | cap configured identically |
+| `MMU_DEBUG_INFO` | `+0x1238` | `0x00000550` | va/pa width capability word (§49.2 act 7) |
+| `+0x1024…+0x103c`, `+0x123c` | mmuc/mmu | `0x4D4D5542` ×7, `0x4D4D5520` | fixed signature words ("BUMM"/" UMM"), identical |
+| `CORE0_IDENT0..2` | core0 `+0x00/0x04/0x08` | `0x04443356` `0x81001422` `0x40078121` | core ident |
+| `CORE0_MISCCFG` | core0 `+0x18` | `0x00000006` | §49.1's `MISCCFG`/`QRMAXCNT` row, re-confirmed on a third piOS capture |
+| `CORE0_INT_MSK_STS` | core0 `+0x5c` | `0x00FF0058` | **`[v3d49]` core mask policy** |
+| `CORE0_GMP_STATUS` | core0 `+0x800` | `0x00000030` | GMP idle-and-unarmed on both |
+| `CM_V3DCTL` / `CM_V3DDIV` | `0xFE101038` / `0x103C` | `0x000002D4` / `0x00001000` | **`[v3d94]` half B, boot22 — SRC=4 ENAB=1 KILL=0 BUSY=1, DIVI=1 DIVF=0, matched against a piOS whose binner works** |
+
+**The seven core-CTL constants are now MATCHED, and that territory closes.** §49.16 named
+core0 `+0x0c/+0x14/+0x20/+0x2c/+0x44/+0x80/+0x84` as the leading *unexamined* words — "unexamined
+territory, not excluded territory". All seven read identically on both sides
+(`0x00000078`, `0x00000FFF`, `0x00000001`, `0xFFFE0000`, `0x00000045`, `0x007F7F7F`,
+`0x0000FFFF`), joined by hub `+0x00/+0x04/+0x18` (`0x0000000F`, `0x00000045`, `0x00000002`) and
+`CORE0_L2TFLEND` (`0xFFFFFFFF`). They remain undecoded — the diff names no register — but they are
+**excluded as a divergence**, and no future rung may propose one of them as the missing write.
+
+**One identity that must not be read as corroboration.** `CORE0_CT0LC` (core0 `+0x120`) reads
+`0x00030000` on both sides. The July piOS dumps read `0x000E0000` idle and `0x2B6C0000` mid-render
+at the same offset, so this word is job-state, and tonight's match is a coincidence at the sample
+point. It is listed among the 37 for completeness and carries no weight.
+
+#### 49.18.2 Class (b) — piOS holds, we do not
+
+**This is the fold's headline: in the four V3D windows, class (b) is exactly one register.**
+
+| register | offset | piOS | ours | reading |
+|---|---|---|---|---|
+| `CORE0_BFC` | core0 `+0x134` | `0x00000003` | `0x00000000` (zero) | **bin frame count. This is the wall itself, stated as a register — an output, not an input.** piOS has closed three bin frames; we have closed none. Nothing follows from it about programming |
+| CM `+0x0c0` (undecoded) | `0xFE1010C0` | `0x00000040` | `0x00000000` (zero) | a CM slot outside the V3D pair; `+0x0c4` is the converse (class (c) below). Not a V3D register |
+
+That is the whole class. **Every pool, base, size and enable register piOS programs, we program.**
+Each register the sitting ask named as a candidate — the populated block at core0 `+0x108…+0x174`,
+`+0x148`/`+0x150`, `+0x120`, `+0x124`, `+0x300`/`+0x304`, `+0x800` — is **populated on our side
+too**, with a self-consistent value. They belong to the fourth class below, not to (b). The
+hypothesis that the PTB frame unit is missing a driver-programmed pool register visible from the
+ARM is **refuted at the register level by this capture**.
+
+The `CM[0x100,0x200)` half (44 nonzero piOS words, including a CTL/DIV-shaped pair at
+`+0x1c8`/`+0x1cc` carrying `0x000002D4`/`0x00001000`, the same values as the V3D slot) is **not**
+class (b): our instrument does not read that window at all. It is unread territory, and §49.18.5
+proposes the one-constant fix.
+
+#### 49.18.3 Class (c) — ours nonzero, piOS zero
+
+| register | offset | ours | reading |
+|---|---|---|---|
+| `CORE0_CT0CS` | core0 `+0x100` | `0x00000070` | `V3D85_CS_WEDGED` — our wedge signature. piOS idle is drained, so `0x0` there is expected |
+| `CORE0_PCS` | core0 `+0x130` | `0x00000001` | `BMACTIVE=1 BMBUSY=0` — an **open bin frame that will never close**. piOS holds no open frame |
+| `CORE0_PCTR_0_SRC_0_3` / `_4_7` | core0 `+0x660` / `+0x664` | `0x0B200A01` / `0x1D1C0D0C` | our own perfmon mux, armed by `[v3d63]`/`[v3d66]`. piOS attaches no perfmon on the common path (§49.2 act 15) |
+| `CORE0_PCTR` outputs | core0 `+0x688/+0x694/+0x698` | free-running | ditto; these are the only three words that move between our own boots |
+| CM `+0x0c4` (undecoded) | `0xFE1010C4` | `0x00001388` | see below |
+| CM `+0x028` (undecoded, CTL-shaped) | `0xFE101028` | `0x000002D4` (`ENAB=1 BUSY=1`) | **piOS reads `0x00000244` here — same SRC, `ENAB=0`, `BUSY=0`.** Its `+0x02c` DIV partner is `0x00001000` on both. A clock slot we (or the firmware, on our behalf) leave **running** and piOS leaves **off** |
+
+Class (c) is entirely our own instrumentation plus the wedge's own signature — with the single
+exception of CM `+0x028`. That word is the only asymmetry in the whole capture pointing at
+something *we* do that piOS does not, and its direction is "we enable more, not less". The slot is
+undecoded; nothing about the bin wall follows from it, and no rung below rests on it.
+
+#### 49.18.4 The fourth class — both populated, different values — and the arithmetic
+
+Thirty-two words are nonzero on both sides with different values. They are the registers the
+sitting ask expected to find in class (b), and they divide cleanly.
+
+*Job-state pointers (control lists).* Both sides hold a bin and a render control list; only the
+addresses and lengths differ.
+
+| register | offset | piOS | ours |
+|---|---|---|---|
+| `CT0QBA` / `CT0QEA` | `+0x160` / `+0x168` | `0x0139C000` / `0x0139C07C` (span 124 B) | `0x0034B000` / `0x0034B00E` (span 14 B) |
+| `CT0EA` | `+0x108` | `0x0139C07C` | `0x0034B00E` |
+| `CT0CA` | `+0x110` | `0x0139C07C` — **equals EA: consumed** | `0x0034B000` — **equals BA: not advanced** |
+| `CT1QBA` / `CT1QEA` | `+0x164` / `+0x16c` | `0x013D4000` / `0x013D4229` (span 553 B) | `0x0031E000` / `0x0031E06A` (span 106 B) |
+| `CT1EA` | `+0x10c` | `0x013D4229` | `0x0031E06A` |
+| `CT1CA` | `+0x114` | `0x013D4229` — consumed | `0x0031E06A` — **consumed** |
+| `CT1RA` (INFERRED, `+4` mirror of `CT0RA`) | `+0x11c` | `0x013D4228` = `CT1QEA − 1` | `0x0031E069` = `CT1QEA − 1` |
+| core0 `+0x1a8` / `+0x1ac` (undecoded) | | `0x0139C07C` / `0x013D4229` | `0x0034B00E` / `0x0031E06A` |
+
+Two structural facts fall straight out. `+0x1a8`/`+0x1ac` hold **exact copies of `CT0EA`/`CT1EA`**
+on both sides — a mirror pair, whatever it is called. And the CT0-versus-CT1 asymmetry on our side
+is the whole campaign in two rows: **our render thread consumed its list to the byte
+(`CT1CA == CT1QEA`) while our bin thread never left its list head (`CT0CA == CT0QBA`)** — §49.12's
+`rclct1` result and §49.13's wall, both visible in one settled sweep.
+
+*The pool block, and the arithmetic.* This is where the ask expected the answer, so the numbers are
+worked in full.
+
+| quantity | piOS | ours |
+|---|---|---|
+| `CT0QMA` (tile-alloc pool base, `+0x170`) | `0x0129A000` | `0x00328000` |
+| `CT0QMS` (pool size, `+0x174`) | `0x0008B000` = 556 KiB | `0x00008000` = 32 KiB |
+| pool end (`QMA+QMS`) | `0x01325000` | `0x00330000` |
+| `CT0QTS` (tile-state base \| ENABLE, `+0x15c`) | `0x01325002` → base `0x01325000`, ENABLE=1 | `0x00327002` → base `0x00327000`, ENABLE=1 |
+| `PTB_BPCA` (`+0x300`) | `0x012A6000` | `0x0032B000` |
+| `PTB_BPCS` (`+0x304`) | `0x0007F000` | `0x00005000` |
+| `PTB_BPOA` / `BPOS` (`+0x308`/`+0x30c`) | zero | zero |
+
+1. **The pool invariant holds exactly on both sides.** `BPCA + BPCS` = `QMA + QMS`:
+   piOS `0x012A6000 + 0x0007F000 = 0x01325000` ✓; ours `0x0032B000 + 0x00005000 = 0x00330000` ✓.
+   `BPCA` is a live allocation pointer into the pool the driver handed the PTB, on both sides.
+2. **Both `BPCA` offsets are Mesa's reservation formula, to the byte.** §30's `v3d_tile_alloc_sizes`
+   reading — `align(layers × tiles_x × tiles_y × 128, 4096) + 8192` — predicts ours at 1 tile as
+   `0x1000 + 0x2000 = 0x3000`, and `BPCA − QMA = 0x0032B000 − 0x00328000 = 0x3000` ✓ (the banked
+   `V3D56_EXPECTED_EMPTY_BPCA_ADVANCE`). piOS's `BPCA − QMA = 0x012A6000 − 0x0129A000 = 0xC000`,
+   which the same formula produces for `align(tiles × 128, 4096) = 0xA000`, i.e. **289–320 tiles**
+   — a frame-sized bin, from the same formula, on the same silicon. **The PTB's reservation stage
+   runs on our side exactly as it runs on piOS's.**
+3. **Overflow is unarmed on both.** `BPOA`/`BPOS` read zero on piOS with `vc4`+`v3d` loaded, as they
+   do for us — §49.1's overflow row confirmed a third time, now against a settled piOS.
+4. **The one *shape* difference in the whole block: tile-state placement.** piOS puts the tile-state
+   array at **exactly the pool end** (`CT0QTS` base `0x01325000` = `QMA+QMS`), contiguous above.
+   We put it **one page below the pool base** (`0x00327000` = `QMA − 0x1000`). Both are legal —
+   `CT0QTS` is an independent base — and this is the only structural, as opposed to numeric,
+   divergence the pool block contains.
+5. **The pool is 17.4× larger on piOS**, which is the frame-size difference and nothing more:
+   32 KiB is Mesa-legal for our one tile, and `[v3d71]` already ran a 544 KiB mainline-shaped pool
+   (§49.1, "Address geometry (mainline-like iovas, 544 KiB pool)" — **closed**).
+6. **These pool addresses are allocation-stable across piOS boots.** `CT0QMA`, `CT0QMS`, `CT0QTS`,
+   `BPCA` and `BPCS` are **byte-identical** to the 2026-07-29 idle dump, two weeks and a reboot
+   earlier, while the control lists moved. The pool and tile-state array are allocated once at
+   driver load from a fixed region; the `BPCA` cursor sits at its post-reservation rest position in
+   both idle captures. (July's mid-render dump shows the working values: pool `0x09BDF000`/
+   `0x00088000`, `BPCA 0x05BA9000` — an entirely different, per-job allocation.)
+
+*Counters and the wedge signature.*
+
+| register | offset | piOS | ours | note |
+|---|---|---|---|---|
+| `CORE0_CT0PC` | `+0x128` | `0x00000006` | `0x00000003` | primitive-list counter |
+| `CORE0_RFC` | `+0x138` | `0x00000003` | `0x00000007` | render frames — **we have retired more than piOS has** |
+| core0 `+0x124` (INFERRED `CT1LC`, `+4` mirror of `CT0LC`) | | `0x00000870` | `0x00000007` | |
+| core0 `+0x148` and `+0x150` (undecoded) | | `0x00960000` **both** | `0x00010000` **both** | a counter-shaped upper-16 field (150 vs 1), the same value at two offsets on each side. New territory — neither offset appears in the July curated dumps |
+| core0 `+0x68` (undecoded, read-only per `[v3d77a]`) | | `0x00000003` | `0x00010001` | **the wedge signature of §46, reproduced exactly**: piOS "fetching", ours bit16 set |
+| `MMU_PT_PA_BASE` | `+0x1204` | `0x0000E200` | `0x00000306` | each side's own page table |
+| `MMU_ILLEGAL_ADDR` | `+0x1230` | `0x8004003F` | `0x80000305` | ENABLE (bit 31) set on both; the address field is each side's scratch page. piOS read `0x8004028C` in July, so this field is not a configuration constant |
+| hub `+0x8c…+0xa8`, mmuc `+0x1004`/`+0x1014` | | larger | smaller | the `[v3d94]` half-A work counters. Two shape observations: `hub+0x8c` is **exactly 16×** `hub+0xa0` on **both** sides (1824/114 and 48/3), and `mmuc+0x1004` **equals** `hub+0xa0` exactly on both sides (`0x72` and `0x3`). Consistent with a beat/transaction pair on a 16-byte bus; a shape, not a name |
+
+#### 49.18.5 Verdict
+
+**The capture refutes its own hypothesis, and that is its value.** The two-pronged hunt's
+firmware-side prong was posed as: piOS's driver programs something the PTB frame unit needs that we
+leave unprogrammed, and the frame unit sits between thread-0 item-accept and pool-write. The diff
+answers it directly and negatively:
+
+1. **Class (b) inside the V3D register windows is one register, `CORE0_BFC`, and it is an output.**
+   There is no unprogrammed pool, base, size or enable register on our side.
+2. **The frame unit's inputs are all present, and the reservation stage demonstrably ran.** The
+   `BPCA+BPCS = QMA+QMS` invariant holds to the byte on both sides, and both `BPCA` offsets are the
+   Mesa reservation formula's value for their own frame size. Whatever the PTB fails to do on our
+   boots, it does **not** fail before reservation. The wall is strictly downstream of it — which is
+   a genuine narrowing of §49.13's "between item-accept and pool-write", from the whole interval to
+   its second half.
+3. **The V3D 4.2 pools a driver programs are exactly the three the CT0/PTB registers name** — the
+   tile-allocation pool (`CT0QMA`/`QMS`), the tile-state array (`CT0QTS`) and the overflow pool
+   (`BPOA`/`BPOS`). We program the first two; piOS leaves the third at zero exactly as we do. QPU
+   spilling memory is reached through the shader record and the uniform stream, not through a core
+   CTL register, and **no core0 register in either sweep carries a spill base** — so there is no
+   fourth pool register hiding in this window for us to have missed. Nothing in this file's own
+   offset tables or in either capture supports a "missing pool programming" reading.
+4. **The two remaining divergences in the pool block are shape, and both are already closed or
+   near-closed.** Pool size and mainline-like addresses are §49.1's `[v3d71]` row, **excluded
+   measured**. Tile-state placement (pool-end-contiguous vs one page below the base) is the single
+   untested shape, and `[v3d71]` came within `0x2000` of it — it is a weak candidate and is
+   presented as one.
+5. **The clock question is settled from both sides.** `CM_V3DCTL`/`CM_V3DDIV` read
+   `0x000002D4`/`0x00001000` on our wedged boots **and** on a piOS whose binner retires frames. The
+   V3D clock slot is programmed identically on a working and a broken block; §49.17.2's half-B
+   reading needed piOS to be more than a self-consistency check, and now it is one.
+
+**The honest limit, and it is the whole reason the ask had three parts.** This capture is a
+**settled** state. Both sides are quiescent in it: piOS has closed its frames and drained, we are
+wedged with `BMACTIVE=1` and nothing moving. Every pool-block register compared above is compared
+in the one state where neither side is doing anything, and a register the frame unit only holds
+*while a frame is open* would read the same on both sides here **whether or not it is the answer**.
+The two captures that can see an open frame — `--sweep` under `glxgears` and `--trigger ct0run`
+mid-bin — are **still outstanding**. One of three landed.
+
+#### 49.18.6 The next experiment
+
+**No programming rung is licensed by this diff, and the reason is the finding.** §49.17.2 rules
+that a "one more register" proposal owes an argument for why it is not already covered; this diff
+supplies the opposite — an argument that there is no such register. Proposing one now would mean
+re-opening §49.1's address-geometry row on evidence that closes it further. The next experiment is
+therefore a **measurement**, in two parts, and a programming rung held in reserve behind a stated
+trigger.
+
+**(A) Complete the capture ask — the decisive part, and it costs no kernel change.** Two piOS
+captures, same script, same box:
+
+```
+~/unaos-bench/tools/v3d-dump-pios.sh --sweep --label mid-render   # with glxgears -fullscreen running
+~/unaos-bench/tools/v3d-dump-pios.sh --trigger ct0run --label mid-bin
+```
+
+The mid-bin trigger is the one that decides. It is the only capture that shows the PTB frame unit's
+registers **with a bin frame open**, which is the exact state our wall lives in and the exact state
+tonight's file cannot represent. Concretely, it is the only way to learn what `CORE0_PCS`,
+`CT0CS`, `BPCA`/`BPCS`, core0 `+0x148`/`+0x150` and core0 `+0x68` hold on a **working** block
+mid-bin — five words for which we currently hold a wedged value and an idle value and no working
+open-frame value at all.
+
+**(B) `[v3d94]` half B, window widened — one constant, read-only, licensed by the diff.** The piOS
+capture covers `CM[0xFE101000, +0x200)`; our instrument reads `+0x100`. Widen it to `+0x200` and add
+the `+0x028` CTL/DIV slot to the decoded station line beside the V3D pair. This is a measurement
+rung against a window the comparison now covers and ours does not, so §49.17.2's bar on further
+rungs (which is a bar on *programming* proposals against a closed surface) does not apply. It stays
+read-only in the strict sense the section already states: no CM write, and no CM password constant
+exists anywhere in `v3d.rs`. Expected yield: the 44 unread piOS words become comparable, and the one
+class-(c) asymmetry the capture found (CM `+0x028` enabled for us, off for piOS) gets a decoded
+reading instead of a raw word. Gate: `./arroyo check` both arches, `kernel8-test` green, the
+`[v3d94]` strings present.
+
+**(C) Held in reserve — `UNAOS_V3D_POOLSHAPE`, and the trigger that would license it.** If, and only
+if, (A)'s mid-bin capture shows a core0 register holding a value on a working open frame that our
+wedged sweep does not hold, a programming rung becomes licensed. Its shape is fixed here so that it
+cannot later be widened by argument: feature `v3d_poolshape`, bare, default OFF, knob
+`UNAOS_V3D_POOLSHAPE=<variant>`, one variant per build in the `UNAOS_V3D_FIRSTKICK` grammar, an
+unrecognised value running inert and saying `recognised=0`. Two variants, and no third:
+
+| variant | change | licensed by |
+|---|---|---|
+| `tsda-above` | move the tile-state array to exactly `CT0QMA + CT0QMS`, piOS's contiguous layout to the byte, sizes and every other input unchanged | §49.18.4 item 4 — the one untested shape in the pool block. Weak, and named weak: `[v3d71]` placed it `0x2000` from that address and wedged |
+| *(reserved)* | whatever register the mid-bin capture names | (A) |
+
+Criterion: the existing PI-V3D-91 bin criterion, with `[v3d93]` and `[v3d56]` poison armed
+alongside; the verdict is `BFC` advance and `FLDONE`, and nothing weaker. **Not implemented in this
+arc** — this section is the fold and the proposal, and (A) decides whether (C) is ever built.
+
+**Standing.** The exclusion table gains no row from this section by itself; what it gains is the
+closure of §49.16's seven unexamined core-CTL constants (§49.18.1), which move from *unexamined* to
+**excluded measured**, and the retirement of the "missing pool programming" reading of the
+firmware-side prong (§49.18.5). The prong itself stays open, on the two captures that have not been
+taken.
