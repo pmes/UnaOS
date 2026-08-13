@@ -35,6 +35,7 @@
 extern crate alloc;
 
 pub mod adapter;
+pub mod btree;
 pub mod catalog;
 pub mod codec;
 pub mod fs;
@@ -54,6 +55,10 @@ pub mod warnlog;
 pub use adapter::{
     BlockAdapter, MemSectorDevice, Partition, PartitionScheme, PartitionSpan, PartitionTable,
     SECTOR_SIZE, SECTORS_PER_BLOCK, SectorDevice, SectorError, locate_unafs, parse_partitions,
+};
+pub use btree::{
+    AsciiFoldCmp, Btree, BtreeError, Cursor, DeviceStore, KeyCmp, LexCmp, Node, NodeKind,
+    NodeStore, TreeStats, U64Cmp,
 };
 pub use catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
 pub use fs::{
