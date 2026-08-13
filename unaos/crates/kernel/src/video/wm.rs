@@ -4520,6 +4520,32 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     #[cfg(target_arch = "x86_64")]
     let occ_after = occ_excuse(r.z, r.id, clip);
 
+    // ### WCD-LIVE — the source-read census, stated once so a future edit cannot re-open it
+    //
+    // The defect WCD-LIVE closed was a verdict that read the user-mutable SOURCE three independent
+    // times — pass 1, the post-`IVAC` pass 2, and the checksum inside the print — so `bad_cache` and
+    // `bad_ram` could differ purely because they had read different bytes, with no cache story
+    // required at all. Exactly THREE source reads survive, and each is a different question:
+    //
+    // 1. **The snapshot, `vr.want`** — the verdict's reference, and the ONLY read either pass
+    //    adjudicates against. Taken once, at one instant, by [`verify_reference`] on the correct side
+    //    of the blit (WCD-PRE). Both passes index the same frozen buffer, and WCD-CHUNK keeps them
+    //    adjudicating the same rect: the first read-back runs bounded and reports `rows_done`, the
+    //    second re-walks exactly those rows. A surviving `bad_cache != bad_ram` is therefore a real
+    //    statement about the DESTINATION — which is the only thing the two-pass design ever claimed.
+    // 2. **`source_px` below — deliberately LIVE, and the liveness detector itself.** This is not a
+    //    re-read of the reference; it is the comparison snapshot-vs-live that DEFINES `moved`. Freezing
+    //    it would delete the detector. It is asked only of a pixel that already disagrees, so a clean
+    //    blit never pays for it, and its answer is charged to `moved`, never to `bad`.
+    // 3. **`surface_checksum` in the print** — DIAGNOSTIC ONLY, never a verdict input; it is the
+    //    reason it may be live. `cksum`/`cksum_pre` answer "did the surface move at all" for a reader,
+    //    and WCD-PRE explains why a whole-surface bracket could not be a verdict input on a routed
+    //    console.
+    //
+    // WCD-SPRITE's live re-read of `cursor::live_box_relaxed()` is not on this list: it is a question
+    // about the DESTINATION's other writer, not about the reference, and it stays live for the reason
+    // its own ledger gives.
+    //
     // WCD-PRE — the per-pixel liveness question, asked only of pixels that already disagree. `want` was
     // frozen before the blit; if the SOURCE no longer holds that value, this pixel's reference moved
     // between the snapshot and now (a sibling app thread, or — on the routed console — `fbcon::_print`
@@ -5298,6 +5324,39 @@ fn verify_reference(
     // The reference is ours from here — `wcd_admit`'s CAS made this core the only holder — so every
     // return below prints, and every return below that does NOT publish a verdict must hand the
     // window back.
+    //
+    // WEDGE-12 (F6) — **the third masked allocation, enumerated here and deliberately NOT closed.**
+    // The R24 span audit listed two `ALLOCATOR` acquisitions inside `SYS_WIN_PRESENT`'s mask
+    // (`stage_window`'s and `stage_fill`'s); this is a third, and it reaches the global heap `Mutex`
+    // twice — once here and once when the `VerifyRef`'s `want` drops. WCD-PRE moved the snapshot from
+    // `verify_window` to this function, so the two acquisitions now sit on OPPOSITE sides of the blit,
+    // but both are still inside the same masked span: `verify_reference` and `verify_window` are both
+    // called from `composite_inner`, and on aarch64 the syscall path runs IRQ-masked end to end (see
+    // the header of `arch/aarch64/syscall.rs`). It is the same family shape as the two WEDGE-12
+    // removed.
+    //
+    // It is not closed the same way because its worst case is not bounded by anything `wm` owns.
+    // `stage_window`'s was: [`MAX_STAGE_BYTES`] capped it at 4 MiB whatever the panel, so a pre-size
+    // drops no work. This buffer is `(row1 - row0) * cols * 4` bytes, and the extent comes from the
+    // ROW's surface — `surf_len / stride` by `stride / 4`, clipped by WCD-BAND to the present's band.
+    // For an EL0 window that is the 64 KiB mapped-slot cap (`FB_WIN_SLOT_SIZE`, a 128x128 ARGB
+    // surface), but a KERNEL-created row carries whatever extent its creator passed:
+    // `fbcon::panel_console_window_open` (x86 + `wc`) presents a non-compat console window sized to
+    // the panel, i.e. a multi-megabyte whole-box snapshot, and nothing in `wm` bounds a future creator
+    // below that. Pre-sizing a static to 64 KiB would turn that window's `[wc-d]` verdict from
+    // PASS/FAIL into SKIP — capping the instrument rather than fixing the lock, which is the "silently
+    // drop work" outcome the milestone's own STOP rule names.
+    //
+    // ONE arm has since acquired a real bound, and only one: WCD-CHUNK's per-chunk cap clamps `row1`
+    // to `cur + WCD_CHUNK_ROWS_MAX` on an x86 `wcg-paygo` stage-2 pass (~336 KB worst case). That
+    // is x86-only, stage-2-only, and was taken for the launch-stall hold, not for this lock — stage 1,
+    // and every aarch64 verdict, still allocate the whole clipped rect.
+    //
+    // So it is reported rather than shipped. Two facts bound the exposure meanwhile: it is
+    // `witness`-gated (it never reaches flashable media), and it is at most one live buffer per
+    // admitted reference (`wcd_admit`'s CAS makes this core the only holder), not one per pass.
+    // Closing it properly means hoisting the snapshot out of the masked span, which is span
+    // restructuring — the owed-tail milestone's scope, not this one's.
     let mut want: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     if want.try_reserve_exact((row1 - row0) * cols).is_err() {
         serial_println!(
