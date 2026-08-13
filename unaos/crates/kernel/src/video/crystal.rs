@@ -333,6 +333,55 @@ pub fn open_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     menu_rect(pw, ph)
 }
 
+/// MENU-DRIVE / REVIEW — **does the SHARD menu owe a paint or an erase that only a composite can
+/// discharge?** The third term in [`super::wm::composite`]'s "is anything OWED" tests, beside
+/// `any_damaged` (a dirty window) and `deferred_owed` (a queued erase box).
+///
+/// Two relaxed loads, no lock — the same shape and cost as `deferred_owed`, and for the same reason:
+/// it runs on the re-run loop and the lost-wakeup gate of every present, on every core.
+///
+/// ### The gap it closes, and why the in-place retry could not
+///
+/// [`open`]/[`dismiss`] flip `OPEN` and then call `wm::composite()` themselves, with one verified
+/// retry. That retry recovers the case where the FIRST pass declined but the holder released before
+/// the second — but if a holder keeps `COMP_GATE` for milliseconds (a `[wc-d] verify` on a witness
+/// build holds it over a second), BOTH the pass and its retry decline, `COMP_PENDING` is published,
+/// and the holder runs its re-run loop. That loop is the guaranteed painter for a dirty window or a
+/// queued erase — but an open menu is NEITHER, so before this term the loop's `if !dmg && !owed`
+/// broke and the menu stayed open-in-state, invisible on glass: the exact pre-fix Boot B signature
+/// (`crystal_press=open`, no `[crystal]` rollup), reachable by Boot B's own gesture — close the last
+/// window (that close is the gate holder), then immediately press the crystal.
+///
+/// The condition is the paint contract [`compose`] itself acts on, read the other way round:
+///  * **OPEN and the slot is EMPTY** — the dropdown is in state but not yet on the panel: a PAINT is
+///    owed.
+///  * **CLOSED and the slot is NON-EMPTY** — the dropdown was dismissed but its pixels are still on
+///    the panel: an ERASE is owed.
+/// Either way the next `compose` discharges it; this makes the gate holder run that `compose`.
+pub fn paint_owed() -> bool {
+    let open = OPEN.load(Ordering::Relaxed);
+    let owns_pixels = SLOT.packed() != 0;
+    open != owns_pixels
+}
+
+/// MENU-DRIVE / REVIEW — count a composite the gate holder ran ONLY because the SHARD menu owed a
+/// paint or erase, and name the first one on the wire. The `wcg::erase_wakeup_rescue` precedent: a
+/// rescue is the mechanism working (not a FORBID), but it must be shown REACHABLE — a boot with
+/// `menu_rescues=0` never exercised the holder-paints-the-menu path, and one with `>0` is a boot
+/// where the pre-fix in-place retry would have stranded the menu.
+#[cfg(feature = "witness")]
+static MENU_RESCUES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")]
+pub fn menu_wakeup_rescue() {
+    let n = MENU_RESCUES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 {
+        serial_println!("[crystal] rollup scope=wakeup menu_rescues={} -> RESCUED", n);
+    }
+}
+#[cfg(not(feature = "witness"))]
+#[inline]
+pub fn menu_wakeup_rescue() {}
+
 /// The top of row `idx` as an offset from the menu's top edge, in px — border plus every earlier row.
 fn row_top(idx: usize) -> usize {
     let mut y = BORDER;
@@ -406,12 +455,13 @@ fn open(pw: usize, ph: usize) {
     // the following 30 s — zero passes, an invisible menu, "the crystal ignores clicks". Task
     // context only (the click router and the fixtures), so the composite is taken directly.
     super::wm::composite();
-    // The x86 gate may have DECLINED this pass into a concurrent holder whose strip tail had
-    // already run — and an open menu is neither a damaged row nor a deferred erase, so the holder's
-    // re-run test cannot see it (`any_damaged`/`deferred_owed` both miss it). The slot says whether
-    // the paint actually LANDED; one verified retry closes the common shape of that race. A menu
-    // still unpainted after it is a bounded residual: any later pass paints it, and the operator's
-    // next press drives another composite.
+    // BELT-AND-BRACES retry. The x86 gate may DECLINE this pass into a concurrent holder; the
+    // GUARANTEED painter is that holder, whose re-run loop and lost-wakeup gate now test
+    // [`paint_owed`] ([`super::wm::menu_paint_owed`]) alongside window damage and the erase queue —
+    // so a menu the holder held the gate through (a `[wc-d] verify` holds it over a second) is
+    // painted by the holder on release, not stranded. This immediate retry closes only the narrow
+    // window where the first pass declined but the holder has ALREADY released — cheaper than
+    // waiting for the holder's loop when no one is holding. The slot confirms the paint LANDED.
     if SLOT.packed() == 0 {
         super::wm::composite();
     }
@@ -434,9 +484,9 @@ fn dismiss(reason: &str) {
     // fixtures); a dismiss of a menu that never painted erases nothing (the slot is clear) and the
     // pass is one bounded walk.
     super::wm::composite();
-    // The mirrored verified retry — see [`open`]: a declined pass would leave the dropdown's owed
-    // pixels standing with no later pass committed to erasing them. The slot is non-zero exactly
-    // while an erase is owed.
+    // BELT-AND-BRACES retry — the mirror of [`open`]: [`paint_owed`] reports `!OPEN && SLOT!=0` as
+    // an owed ERASE, so the gate holder discharges a declined dismiss too; this closes only the
+    // already-released window. The slot is non-zero exactly while an erase is owed.
     if SLOT.packed() != 0 {
         super::wm::composite();
     }

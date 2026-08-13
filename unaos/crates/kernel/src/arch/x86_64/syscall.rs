@@ -5694,20 +5694,20 @@ fn clickband_selftest() {
     let out_hit = press((pw - 1) as i32, (ph / 2) as i32);
     let out_out = crate::video::crystal::last_press_outcome();
 
-    // Leg 3 — the dock band, at the strip's CENTRE (its corners are CUT — `strip::contains` under
-    // `STRIP_R` — so a corner press is a press on whatever is behind the dock, by design). Whether
-    // the centre pixel is background or a tile is the layout's business, not this leg's: either
-    // consumes, and the outcome word says which.
+    // Leg 3 — the dock band, at the strip's CENTRE. On an emptied dock the one tile there is the
+    // PINNED shell tile (the console's way back), so this press latches `SHELL_REOPEN` — and the
+    // SCHED-X86 render loop's `take_shell_reopen` (main.rs) races this selftest on another core and
+    // could win that latch mid-ladder, reopening a shell and moving focus before `wmdirect_selftest`
+    // runs: deterministic arming, probabilistic flake. So the latch is drained UNCONDITIONALLY the
+    // instant the press edge returns — before the outcome read and before the release — closing the
+    // window to nothing the render loop can service. The `band=dock` line and the outcome word
+    // (`shell-reopen`, the true routing result) are unaffected; only the side effect is disarmed.
     let (dock_hit, dock_out) = match crate::video::dock::strip_rect(pw, ph) {
         Some((dx, dy, dw, dh)) => {
-            let hit = press((dx + dw / 2) as i32, (dy + dh / 2) as i32);
-            let out = crate::video::dock::last_press_outcome();
-            // Drain a reopen the corner press may have latched on the PINNED shell tile — the render
-            // loop must never service a reopen no operator asked for.
-            if out == "shell-reopen" {
-                let _ = crate::video::dock::take_shell_reopen();
-            }
-            (hit, out)
+            let hit = wc_click_route_at(crate::pal::Event::Button(1), (dx + dw / 2) as i32, (dy + dh / 2) as i32);
+            let _ = crate::video::dock::take_shell_reopen();
+            let _ = wc_click_route_at(crate::pal::Event::Button(0), (dx + dw / 2) as i32, (dy + dh / 2) as i32);
+            (hit, crate::video::dock::last_press_outcome())
         }
         None => (false, "no-dock"),
     };
