@@ -11871,6 +11871,12 @@ fn present_surface_common(
     sum: u64,
 ) {
     let _ = size;
+    // M3 shrink 2 — ARM THE OWED-TAIL DEFERRAL. This body is the one place both present verbs go
+    // through, it composites IRQ-masked, and both of its callers cash the tail immediately after
+    // `drop(_irq)` with nothing between that can return early. Arming HERE rather than inside
+    // `composite` is what keeps every other aarch64 compositor caller on trunk timing — see
+    // `video::wm::composite_arm_owed`.
+    crate::video::wm::composite_arm_owed();
     FB_PRESENT_CHECKSUM.store(sum, Ordering::Release);
     FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
     // UVUG-8r2: bump the FOCUS-SCOPED present counter too — the one `run_user_image`'s suspension cap reads.

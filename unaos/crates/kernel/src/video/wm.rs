@@ -3292,15 +3292,119 @@ pub fn count() -> usize {
 /// [`composite_once`] is the pass this function used to be. Everything about it is unchanged; what is
 /// new is that on x86 it now runs under a non-blocking gate, so two cores can never interleave their
 /// back-to-front blits on the same glass.
-/// M3 shrink 2 — MERGE SHIM (resync of hw-pi4 onto the UnaOS-gemini trunk). The pi4 track split
-/// the composite into a masked pass that STASHES its cursor tail and this unmasked epilogue that
-/// cashes it (`51b3c77c` and earlier); the trunk compositor cashes the tail inline in
-/// [`composite_once`], so on this tree nothing is ever stashed and this is honestly a no-op. The
-/// aarch64 syscall epilogues (`sys_fb_present` / `sys_win_present`) still call it, and keeping
-/// the entry point is what lets them. Behavior equals the trunk everywhere (the tail runs, inside
-/// the mask); the masked-latency win of the split is DEFERRED, ledgered for its own re-land arc —
-/// see plans wip `pi4-owed-tail-reland`.
+/// M3 shrink 2 — THE OWED-TAIL SPLIT, RE-LANDED ON THE TRUNK COMPOSITOR (aarch64 only).
+///
+/// The pi4 track's original split (`51b3c77c`) divided the composite into a masked half that
+/// STASHES its cursor-tail verdict and an unmasked epilogue that CASHES it. The resync merge took
+/// the trunk file wholesale and left this entry point as a no-op shim; this is the re-land.
+///
+/// What is split, and where. [`composite_once`] is now two halves: [`composite_pass_half`] (the
+/// drain, the cursor bracket, the window loop, the strip, the CURSOR-7 upgrade and the
+/// `note_cursor_tail` witness) and [`cash_tail`] (the sprite tail proper, the COMPOSITE-2 ledger
+/// and the `controls_declined_drain` emission). On aarch64 the pass half stashes its verdict into
+/// [`OWED_TAIL`] and returns; this function — called from `sys_fb_present` / `sys_win_present`
+/// AFTER their `IrqGuard` has dropped — cashes it. The sprite work and the polled-UART decline
+/// drain therefore run OUTSIDE the mask, which is the whole latency win: on a present the masked
+/// span shrinks by exactly the tail.
+///
+/// **AARCH64 ONLY, and deliberately.** On x86 the pass runs under WCSER's `COMP_GATE` with a
+/// re-run loop that calls `composite_once` repeatedly; each of those rounds is a FULL pass, cursor
+/// tail included, and the loop's correctness argument depends on that. So on x86 (and on any arch
+/// that is not aarch64) `composite_once` still calls `cash_tail` inline, nothing is ever stashed,
+/// `OWED_TAIL` does not exist, and this function is compiled away to the same no-op the shim was.
+///
+/// **NOTHING IS LOST, AND NOTHING IS DEFERRED TWICE.** The pass half cashes a STALE owed tail
+/// FIRST (masked — pathological only: a present whose caller never reached the epilogue, or one of
+/// this module's own non-syscall composites). That bounds a tail's deferral at exactly one pass,
+/// which is `OVERLAY_CLOSE_OWED`'s shape. A cash is idempotent-by-swap: [`OWED_TAIL`] is taken
+/// with a `swap(0)`, so two racing cashers cannot both run the same tail.
+///
+/// Encoding: `0` = nothing owed; otherwise `tail(1..=4) | dirty << 8`. All FOUR [`CursorTail`]
+/// arms encode (`Adopt`/`Settle`/`Repaint`/`Untouched`) — there is no arm that falls back to an
+/// inline cash, so the split covers the whole verdict space rather than a subset of it.
+#[cfg(target_arch = "aarch64")]
+pub fn composite_tail_owed() {
+    // Disarm first: the present whose epilogue this is has finished, so any composite that runs
+    // before the next `composite_arm_owed` cashes inline. Ordering with the swap does not matter —
+    // both are single-location and the arm is a policy hint, never the verdict.
+    OWED_ARM.store(false, core::sync::atomic::Ordering::Relaxed);
+    let code = OWED_TAIL.swap(0, core::sync::atomic::Ordering::AcqRel);
+    if code == 0 {
+        return;
+    }
+    let dirty = code & 0x100 != 0;
+    let tail = match code & 0xff {
+        1 => CursorTail::Adopt,
+        2 => CursorTail::Settle,
+        3 => CursorTail::Repaint,
+        _ => CursorTail::Untouched,
+    };
+    cash_tail(Owed {
+        tail,
+        dirty,
+        // COMPOSITE-2 — the marks come from the stash, so `pass_us` spans the deferral gap: the
+        // stashed `t0` is the pass's own start, and the `end` read inside `cash_tail` is taken
+        // here, after the gap. See [`composite_pass_half`].
+        #[cfg(feature = "witness")]
+        c2_t0: OWED_C2_T0.load(core::sync::atomic::Ordering::Relaxed),
+        #[cfg(feature = "witness")]
+        c2_t1: OWED_C2_T1.load(core::sync::atomic::Ordering::Relaxed),
+    });
+}
+
+/// M3 shrink 2 — the non-aarch64 entry point. See the aarch64 form above for the mechanism: on
+/// this arch `composite_once` cashes its tail inline, so nothing is ever owed and this is a no-op.
+/// It exists so the shared syscall surface keeps one name.
+#[cfg(not(target_arch = "aarch64"))]
 pub fn composite_tail_owed() {}
+
+/// M3 shrink 2 — ARM THE DEFERRAL, for exactly the callers an epilogue is coming for.
+///
+/// **This is the one deliberate departure from the original split (`51b3c77c`)**, and it was
+/// measured rather than argued. The original stashed EVERY aarch64 pass and cashed only from the
+/// two present epilogues. On this tree the composite population is not just the presents — the
+/// service lane, `erase`, `move_to`, teardowns and IRQ-context damage service all composite too,
+/// and none of them has an epilogue. Their tails then sat stashed until the next pass's stale
+/// cash, which on an idle desktop is seconds away: the first re-land measured `[comp2]
+/// max_us=9255978` (9.2 s) and a mean `pass_us` of 17427 against 2518 before the split. That is
+/// not a wide reading, it is the arrow's `ensure_drawn`/`repaint` withheld for that long.
+///
+/// So the deferral is armed, by `present_surface_common`, on entry to the ONE body both
+/// `SYS_FB_PRESENT` and `SYS_WIN_PRESENT` run — the two paths that composite IRQ-masked and then
+/// call [`composite_tail_owed`] a few instructions later with IRQs restored. Every other caller
+/// finds the flag clear and cashes inline, which is trunk behaviour exactly. The arm cannot be
+/// stranded: at both call sites nothing between `present_surface_common` and the epilogue can
+/// return early, and the epilogue clears it unconditionally.
+///
+/// One relaxed store on the present path. Cross-core skew is harmless in both directions — a
+/// stashed tail is cashed by whichever epilogue arrives (the stash was always global), and a tail
+/// cashed inline is simply the trunk's timing.
+#[cfg(target_arch = "aarch64")]
+pub fn composite_arm_owed() {
+    OWED_ARM.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// M3 shrink 2 — see the aarch64 form. Nothing defers on this arch, so arming is a no-op.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn composite_arm_owed() {}
+
+/// M3 shrink 2 — is a cash coming? Set by [`composite_arm_owed`] on the present path, cleared by
+/// [`composite_tail_owed`]. A hint that selects the deferral, never part of the tail's verdict.
+#[cfg(target_arch = "aarch64")]
+static OWED_ARM: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// M3 shrink 2 — the stash. `0` = nothing owed; else `tail(1..=4) | dirty << 8`. Written with
+/// `Release` by the masked pass half and taken with an `AcqRel` swap by the casher, so the tail's
+/// verdict is published behind the pass's own writes and taken exactly once.
+#[cfg(target_arch = "aarch64")]
+static OWED_TAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// M3 shrink 2 — the stashed COMPOSITE-2 marks. `Relaxed`: they are witness arithmetic, ordered by
+/// [`OWED_TAIL`]'s release/acquire pair, and a torn reading of a cycle counter is a wrong number in
+/// a diagnostic, never a wrong composite.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_C2_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_C2_T1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn composite() {
     #[cfg(not(target_arch = "x86_64"))]
@@ -3467,10 +3571,73 @@ fn deferred_owed() -> bool {
     DEFER_N.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
+/// M3 shrink 2 — what the pass half owes the sprite, carried from [`composite_pass_half`] to
+/// [`cash_tail`] either directly (x86, inline) or through [`OWED_TAIL`] (aarch64, deferred).
+#[derive(Clone, Copy)]
+struct Owed {
+    tail: CursorTail,
+    /// CURSOR-7's `PRESENT_DIRTY`, consumed by the pass half and therefore its property to carry.
+    dirty: bool,
+    #[cfg(feature = "witness")]
+    c2_t0: u64,
+    #[cfg(feature = "witness")]
+    c2_t1: u64,
+}
+
+/// One composite pass. M3 shrink 2 split its body in two — see [`composite_tail_owed`] for the
+/// mechanism and the aarch64-only argument.
+///
+/// **THE X86 PATH IS UNCHANGED, BY CONSTRUCTION.** On any arch that is not aarch64 this function is
+/// `composite_pass_half()` immediately followed by `cash_tail(..)`, which is the trunk body with a
+/// function boundary drawn through the middle of it and nothing else: same statements, same order,
+/// same values. No stash exists to be read or written, and `composite_tail_owed` is a no-op there.
+/// That is what lets WCSER's re-run loop keep calling this in a loop: every round is still a full
+/// pass with its own inline cursor tail, exactly as the loop's correctness argument requires.
 fn composite_once() {
+    // The STALE cash, masked and first. Pathological only — a present whose caller never reached
+    // its unmasked epilogue, or one of this module's own non-syscall composites. Running it here
+    // bounds a tail's deferral at one pass; the swap makes a double cash impossible.
+    #[cfg(target_arch = "aarch64")]
+    composite_tail_owed();
+    let owed = composite_pass_half();
+    // x86 (and anything not aarch64): cash inline, in the pass, as the trunk always has.
+    #[cfg(not(target_arch = "aarch64"))]
+    cash_tail(owed);
+    // aarch64: stash and leave — but ONLY when a cash is actually coming, i.e. this pass is a
+    // present's, whose epilogue calls `composite_tail_owed` a few instructions from now with IRQs
+    // restored. Any other caller cashes inline, exactly as the trunk does. See
+    // [`composite_arm_owed`] for the measurement that made this test necessary.
+    #[cfg(target_arch = "aarch64")]
+    if !OWED_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        cash_tail(owed);
+    } else {
+        #[cfg(feature = "witness")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            OWED_C2_T0.store(owed.c2_t0, Relaxed);
+            OWED_C2_T1.store(owed.c2_t1, Relaxed);
+        }
+        let code: u32 = match owed.tail {
+            CursorTail::Adopt => 1,
+            CursorTail::Settle => 2,
+            CursorTail::Repaint => 3,
+            CursorTail::Untouched => 4,
+        } | if owed.dirty { 0x100 } else { 0 };
+        OWED_TAIL.store(code, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// M3 shrink 2 — the masked half of the pass: everything up to and including the tail VERDICT, and
+/// nothing that acts on it. On aarch64 this is all that runs inside the present's IRQ mask.
+fn composite_pass_half() -> Owed {
     // COMPOSITE-2 — the whole-pass clock. Starts before the inner pass (which self-reports its
     // sprite/wait/loop terms) and stops after the tail, so `pass_us` bounds everything a present
     // pays for its composite, including the tail's sprite work.
+    //
+    // M3 shrink 2 — and it keeps that meaning across the split: on aarch64 the mark below is
+    // STASHED with the verdict, so the stashed `t0` makes `pass_us` span the deferral gap too. The
+    // reading is still "what a present paid for its composite", now including the wait for its own
+    // epilogue; what shrank is the MASKED span, which `pass_us` was never the measure of.
     //
     // FBCON-DMG — a PASS clock takes no band, and not because one was unavailable to it. A pass
     // composites every dirty window plus everything the occlusion closure dragged in, each with its
@@ -3515,6 +3682,27 @@ fn composite_once() {
     }
     #[cfg(feature = "witness")]
     note_cursor_tail(tail);
+    // M3 shrink 2 — the verdict, and the end of the masked half. `note_cursor_tail` stays HERE and
+    // not in the cash: it is the census of what passes decided, and a deferred tail is still this
+    // pass's decision. Counting it at cash time would move a pass's line into whichever present
+    // happened to cash it.
+    Owed {
+        tail,
+        dirty,
+        #[cfg(feature = "witness")]
+        c2_t0,
+        #[cfg(feature = "witness")]
+        c2_t1,
+    }
+}
+
+/// M3 shrink 2 — the cashing half: the sprite tail, the COMPOSITE-2 ledger and the CTRLWIT drain.
+/// Runs inline on x86 (from [`composite_once`]) and unmasked on aarch64 (from
+/// [`composite_tail_owed`], in the syscall epilogue). Nothing here takes `TABLE`, and the tail's
+/// own sprite work has always run outside the `BlitGuard` window — which is why it can be deferred
+/// out of the mask at all.
+fn cash_tail(owed: Owed) {
+    let Owed { tail, dirty, .. } = owed;
     match tail {
         CursorTail::Adopt => {
             // `adopt_overlay` is the ONLY closer of the overlay session, so `Adopt` is never
@@ -3539,10 +3727,13 @@ fn composite_once() {
         CursorTail::Untouched => super::cursor::ensure_drawn(),
     }
     // COMPOSITE-2 — close the ledger: the tail interval is sprite work, the whole interval is the
-    // pass. One `now_cycles` read serves both accounts.
+    // pass. One `now_cycles` read serves both accounts. M3 shrink 2 — the two marks come from the
+    // `Owed` the pass half handed over (directly on x86, through the stash on aarch64), so on a
+    // deferred tail both intervals span the unmasked gap as well.
     #[cfg(feature = "witness")]
     {
         use core::sync::atomic::Ordering::Relaxed;
+        let (c2_t0, c2_t1) = (owed.c2_t0, owed.c2_t1);
         let end = crate::arch::now_cycles();
         let pass = end.saturating_sub(c2_t0);
         C2_SPRITE_CYC.fetch_add(end.saturating_sub(c2_t1), Relaxed);
