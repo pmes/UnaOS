@@ -11826,16 +11826,31 @@ storm cost the pacer exists to shed; the snapshot is a straight `memcpy` instead
 "defer the read to the owner's next present" (strands the final frame of a stream that stops, the
 exact liveness case `pace_service` exists for).
 
+*The contended lock DEFERS; it does not read live (review MAJOR-1).* The composite pass takes the
+shadow with `try_lock`, and the miss case is where the earlier draft was wrong. A live fallback is
+sound only *at the try_lock instant*, not across the blit that follows it: if the pass misses
+because the owner is inside `pace_shadow_refresh`'s memcpy, that memcpy finishes in µs and the
+coalesced present returns immediately (no `COMP_GATE` park), so the owner can resume `draw_num`'s
+clear-then-redraw while this pass is still in `verify_reference`/`draw_window` — a live blit would
+land in the clear gap and publish the blank readout, a sub-Hz residual of the very flicker under
+exactly the storm the fix targets, plus a live read the two witnesses misjudge. So for a
+shadow-**valid** window a `try_lock` miss **defers**: `pace_shadow_source` returns `ShadowSrc::Defer`,
+the pass `continue`s past this window, and `pace_shadow_defer` re-raises its whole-box damage and
+`PACE_PENDING` bit so the ~1 ms tail drain re-attempts the blit next pass — by which time the
+µs-long refresh has released the lock. A blocking spin is explicitly rejected: an owner *preempted*
+mid-refresh would make the spin scheduling-length. The live fallback survives only for the honest
+arms — an exempt/never-coalesced window (live surface quiescent) and the OOM-declined degraded mode
+(no shadow exists to be stale).
+
 *The laws it keeps.*
 
-* **No app sleeps.** The refresh is a memcpy in present context; the only lock is the per-slot
-  shadow lock, whose only other holder is a pass blitting that same window — a bounded busy-wait
-  of at most one window's staged blit, paid only on an actual collision, never a park.
-* **The pass never spins on a present.** The read side is `try_lock` with a provably-safe live
-  fallback: contention means the owner is *inside* `pace_shadow_refresh`, i.e. parked in the
-  syscall, i.e. the live surface is a finished frame at that instant.
+* **No app sleeps, and the pass never blocks on a present.** Both sides are lock-free of the
+  renderer: the refresh is a memcpy in present context under the per-slot lock; the pass takes that
+  lock with `try_lock` only, and a miss `continue`s (deferring the window to the drain) rather than
+  waiting. No path spins or parks.
 * **One composite per window per frame** — the pacer's admit/coalesce/tail structure is untouched;
-  this changes what a pass *reads*, never when it runs.
+  this changes what a pass *reads*, and defers a contended window by one drain tick, never when an
+  admitted pass runs.
 * **Bounded memory, fallibly allocated (SHELLWIN-OOM).** Created on a window's first coalesced
   present only (`try_reserve`; a window the pacer never defers allocates nothing), sized
   `surf_len` (the full mapped slot — WC-G checksums and cache-maintains that length off whatever address it is handed), at most `MAX_WINDOWS` buffers. On OOM the window stays on the
@@ -11851,9 +11866,12 @@ present paid pre-pacer, it is noise), and shadowed windows run one frame of *con
 own in-flight drawing (they always did on the async passes; now the lag is a clean frame instead
 of a torn one).
 
-*The witness / falsifier.* `[wpace]` grows `shdw=` (refresh copies this span): healthy paced
-steady state reads `shdw ≈ paced + coalesced`; `shdw=0` with `coalesced>0` means the shadow could
-not be created and the flicker is still possible (the `shadow-oom` line says why). The mechanism
+*The witness / falsifier.* `[wpace]` grows `shdw=` (refresh copies this span; NOTE-5: it ticks only
+on a copy that moved bytes, so a degenerate empty band does not inflate it) and `defer=` (passes
+skipped for a contended shadow lock): healthy paced steady state reads `shdw ≈ paced + coalesced`
+with `defer` a small sub-Hz residual (each defer is one window costing one extra ~1 ms frame, never
+a torn glyph); `shdw=0` with `coalesced>0` means the shadow could not be created and the flicker is
+still possible (the `shadow-oom` line says why). The mechanism
 falsifier is WC-G's own classifier: the MAJOR-1 note above established that a pure tail blit reads
 `own=no` against a rewritten surface — with the shadow, the bytes a tail blit consumes are the
 bytes of a declared-finished frame, so RACE-PRESENT verdicts on paced vug windows should disappear
