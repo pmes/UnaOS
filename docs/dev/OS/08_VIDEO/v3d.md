@@ -5942,3 +5942,258 @@ closure of §49.16's seven unexamined core-CTL constants (§49.18.1), which move
 **excluded measured**, and the retirement of the "missing pool programming" reading of the
 firmware-side prong (§49.18.5). The prong itself stays open, on the two captures that have not been
 taken.
+
+---
+
+### 49.19 The mid-bin capture — the frame-open register set, and the end of the register hunt (PI-V3D-96)
+
+§49.18.5 named the honest limit of the settled diff: every pool-block register was compared in the
+one state where neither side is doing anything, and "a register the frame unit only holds *while a
+frame is open* would read the same on both sides here whether or not it is the answer." §49.18.6(A)
+made the mid-bin trigger the decisive experiment. It has been taken.
+
+**The artifacts.** Three files, all in `~/unaos-bench/capture/`, all bench Pi 4B under stock piOS
+with `vc4`+`v3d` loaded:
+
+| file | time | kernel | state (per its own registers) |
+|---|---|---|---|
+| `v3d-dump-pios-sweep-20260812.txt` (**S1**) | 21:11:34 | `6.18.34+rpt-rpi-v8` | settled idle — `CT0CS`/`CT1CS` absent (zero), `PCS`=0, `BFC`=`RFC`=3 |
+| `v3d-dump-pios-sweep2-20260812.txt` (**S2**) | 23:31:25 | `6.18.39+rpt-rpi-v8` | **mid-render, not settled** — see below |
+| `v3d-dump-pios-ct0run-20260812.txt` | 23:32:32 | `6.18.39+rpt-rpi-v8` | triggered: a curated 66-register snapshot at **t0**, the same list at **t0+1ms**, then a wider **post-settle sweep (MS)** |
+
+`vcgencmd frequency(46)` = `500000992` in all three; S1 was taken with `core=frequency(1)=500000992`
+and S2 with `core=324883296`, which is the governor difference the ask expected. A reboot separates
+S1 from the other two (kernel `.34` → `.39`).
+
+#### 49.19.1 What instant was actually photographed — stated honestly, before any conclusion
+
+The trigger header reads:
+
+```
+TRIGGERED mid-bin: CT0CS=0x00000020 (CTRUN=1) CT0CA=0x012B60D3 QBA=0x012B6000 QEA=0x012B60D3
+                   in-span=False polls=3864
+```
+
+Three facts about that instant, each of which limits what the capture can be used for:
+
+1. **The poll caught `CTRUN=1` with `CT0CA` already at `QEA`.** The bin control list is 211 bytes
+   (`0x012B60D3 − 0x012B6000 = 0xD3`); the control thread had fetched all of it. `in-span=False` is
+   the script reporting exactly that — `CA` is not strictly inside `[QBA, QEA)`, it is *at* the end.
+   This is **not** a mid-list photograph. What a working CT0 holds while it is still walking a list
+   — `CT0CA` between `QBA` and `QEA`, `CT0CS` with `CTRUN=1` and `CA` in span — remains uncaptured.
+2. **By the time the snapshot's own read of `CT0CS` executed, it read `0x00000000`.** The poll loop
+   observed `0x20`; the register read a few microseconds later shows the control thread already
+   stopped. `CT0CS` in the t0 block is therefore a *post*-thread value, and the only witness to
+   `CTRUN=1` is the poll line itself.
+3. **But a bin frame was genuinely open at t0, and it closed inside the next millisecond.** `PCS` at
+   t0 is `0x00000001` — `BMACTIVE=1`, everything else clear — with `BFC=0x000000B8`. At t0+1ms
+   `PCS` is `0x00000000` and `BFC` is `0x000000B9`. The frame closed and the bin frame count
+   advanced, in the sample window. **This is a real open-bin-frame photograph, taken at the closing
+   edge of the frame** — control list consumed, frame not yet retired.
+
+That is the exact instant, and it is a useful one: it is the piOS state that stands where our wedge
+stands (`BMACTIVE=1`, frame open) with the one difference that piOS's frame then *closes*. It is not
+the instant that answers "what does the block hold while the PTB is mid-bin, list half-walked".
+
+**A second honesty correction, and it is a gift.** S2 is labelled `SETTLED-SWEEP` by the script, but
+its registers say otherwise: `CT1CS = 0x00000120` (`CTRUN=1`, `CTRTSD=1` under the INFERRED
+`CTNCS` decode) and `PCS = 0x00000004` (`RMACTIVE=1`). The post-settle sweep in the ct0run file
+(MS) reads the same two words identically. **S2 and MS are mid-*render* captures**, with a render
+frame open and the CT1 thread running. So the brief's "two settled states, diff them for governor
+noise" premise does not hold as stated — but the substitution is in our favour: S2/MS are
+effectively §49.18.6(A)'s *second* outstanding capture, the sweep under load, delivered unasked.
+The campaign now holds **three** pipeline states from piOS — settled (S1), mid-render (S2, MS) and
+mid-bin-closing (t0) — instead of two settled ones.
+
+Consequently the classification below uses **S1 = settled** and **S2/MS = mid-render** as the two
+comparison states, and reserves FRAME-OPEN for what only the t0 bin-open sample holds.
+
+**Window caveat.** The t0/settle blocks are a *curated* 66-register list, not a sweep. Offsets in
+the sweep windows that the curated list does not read have **no mid-bin value at all**: core0
+`+0x0c/+0x14/+0x20/+0x2c/+0x44/+0x68/+0x80/+0x84`, `+0x108`, `+0x11c`, `+0x124`, `+0x148`,
+`+0x150`, `+0x1a8`, `+0x1ac`, and the hub/MMUC work counters. Three of the five words §49.18.6
+named as decisive are delivered (`PCS`, `CT0CS`, `BPCA`/`BPCS`); **core0 `+0x148`/`+0x150` and
+core0 `+0x68` are not read at t0 and remain without a working open-frame value.** Conversely the
+ct0run file's sweep omits the `CM[0xFE101000,+0x200)` window entirely, so every CM row in an
+MS-vs-S1/S2 join is an artifact of the window, not a divergence; CM is compared S1-vs-S2 only.
+
+#### 49.19.2 (a) The triple-diff, classified
+
+Method as §49.18: mechanical join on physical address, a register absent from a sweep read zero,
+names from `unaos/crates/kernel/src/arch/aarch64/v3d.rs` and nowhere else, unnamed offsets stay
+`core0+0xNNN (undecoded)`. Classes:
+
+- **FRAME-OPEN** — differs in the mid-bin t0 sample and is *not* reachable in either settled or
+  mid-render state. This is the set the arc was taken to find.
+- **GOVERNOR/STATE-NOISE** — moves between S1 and S2, i.e. between two captures neither of which has
+  a bin frame open. Excluded from the frame-open set by construction.
+- **COUNTER** — a counter or job-state word that simply holds a different number.
+- **JOB-STATE POINTER** — a control-list or pool address, different per allocation by definition.
+
+**The frame-open table.**
+
+| register | offset | mid-bin t0 | t0+1ms | S1 settled | S2 mid-render | class | reading |
+|---|---|---|---|---|---|---|---|
+| `CORE0_PCS` | core0 `+0x130` | `0x00000001` | `0x00000000` | `0x00000000` | `0x00000004` | **FRAME-OPEN** | `BMACTIVE=1`, BMBUSY/RMACTIVE/RMBUSY/BMOOM clear. **Bit-identical to our wedged `PCS`.** S2's `0x4` is `RMACTIVE` — the render-side analogue |
+| `CORE0_GMP_STATUS` | core0 `+0x800` | `0x03030030` | `0x00000030` | `0x00000030` | `0x03000030` | **FRAME-OPEN** (bits 17:16 only) | `0x30` = `RD_ACTIVE\|WR_ACTIVE` on every capture including ours. Bits **24/25** are set in t0, S2 and MS but clear in S1 and in t0+1ms → activity, not bin-open. Bits **16/17** are set **only** in the mid-bin sample. Undecoded upper field; `GMP_CFG`/`GMP_TABLE_ADDR`/`GMP_VIO_*` are **zero at t0**, so the GMP is unarmed on piOS mid-frame exactly as it is on ours |
+| `CORE0_CT0CS` | core0 `+0x100` | `0x00000020` (poll) → `0x00000000` (snapshot) | `0x00000000` | `0x00000000` | `0x00000000` | **FRAME-OPEN** (poll line only) | `CTRUN=1` witnessed by the trigger, gone by the register read. Ours wedged: `0x00000070` |
+| `CORE0_CT1CS` | core0 `+0x104` | `0x00000000` | `0x00000000` | `0x00000000` | `0x00000120` | GOVERNOR/STATE-NOISE (render-open) | `CTRUN=1`, `CTRTSD=1`. Render thread live in S2/MS — the evidence S2 is not settled |
+| `CORE0_BFC` | core0 `+0x134` | `0x000000B8` | `0x000000B9` | `0x00000003` | `0x000000C1` | COUNTER | **advances by exactly 1 across the frame close.** The wall stated as a register, and the retire signal we never see |
+| `CORE0_RFC` | core0 `+0x138` | `0x000000B8` | `0x000000B8` | `0x00000003` | `0x000000BF` | COUNTER | unchanged across the bin close, as it must be |
+| `CORE0_CT0PC` | core0 `+0x128` | `0x00000006` | `0x00000006` | `0x00000006` | `0x0000003C` | GOVERNOR/STATE-NOISE | equal in t0 and S1, different in S2 — moves between non-bin states |
+| `CORE0_CT0LC` | core0 `+0x120` | `0x66B90000` | `0x66B90000` | `0x00030000` | `0x47C10000` | COUNTER | upper-16 list counter; differs in all three, non-monotonic (below) |
+| `MMU_ILLEGAL_ADDR` | `+0x1230` | `0x800403B3` | `0x800403B3` | `0x8004003F` | `0x800403B3` | GOVERNOR/STATE-NOISE | ENABLE (bit31) set everywhere; the address field is a per-boot scratch page — it moved with the reboot and then held |
+| `CT0QBA`/`QEA`/`CT0CA`, `CT1QBA`/`QEA`/`CT1CA` | `+0x160`/`+0x168`/`+0x110`, `+0x164`/`+0x16c`/`+0x114` | job at `0x012B6000` | same | job at `0x0139C000` | job at `0x02E8F000` | JOB-STATE POINTER | per-submission |
+| `CT0QMA`/`QMS`, `CT0QTS`, `PTB_BPCA`/`BPCS` | `+0x170`/`+0x174`, `+0x15c`, `+0x300`/`+0x304` | pool at `0x011DA000` | same | pool at `0x0129A000` | pool at `0x03297000` | JOB-STATE POINTER | arithmetic in §49.19.3 |
+| `PTB_BPOA`/`BPOS`/`BXCF` | `+0x308`/`+0x30c`/`+0x310` | **zero** | zero | zero | zero (absent) | *identical* | **overflow is unarmed on piOS even with a 570-tile bin frame open.** §49.1's overflow row, confirmed a fourth time and now in the one state that could have broken it |
+| `PCTR_0_EN`/`SRC_0_3`/`SRC_4_7` | `+0x650`/`+0x660`/`+0x664` | **zero** | zero | zero | zero | *identical* | piOS attaches no perfmon mid-frame either — §49.2 act 15, confirmed against an open frame |
+| `SLCACTL`, `L2TCACTL`, `L2TFLSTA` | `+0x24`/`+0x30`/`+0x34` | **zero** | zero | zero | zero | *identical* | no cache-control register is held asserted across a frame |
+| `CORE0_INT_MSK_STS` | `+0x5c` | `0x00FF0058` | `0x00FF0058` | `0x00FF0058` | `0x00FF0058` | *identical* | **`[v3d49]` mask policy is not changed for an open frame.** `INT_STS` reads zero at t0 and at +1ms |
+| `MISCCFG`, `IDENT0..2`, `L2TFLEND`, `MMU_CTL`, `MMU_PT_PA_BASE`, `MMUC_CONTROL`, `MMU_DEBUG_INFO`, hub `IDENT0..3`/`INT_MSK_STS` | — | identical to S1/S2 and (except `PT_PA_BASE`) to ours | | | | *identical* | no configuration word changes when a frame opens |
+| core0 `+0x148` | | **not read at t0** | — | `0x00960000` | `0x00750001` | GOVERNOR/STATE-NOISE | S2 sets bit0 for the first time in any capture; ours `0x00010000` |
+| core0 `+0x150` | | **not read at t0** | — | `0x00960000` | `0x00BD0000` | GOVERNOR/STATE-NOISE | MS also `0x00BD0000`; the S1 "same value at both offsets" coincidence does **not** survive |
+| core0 `+0x68` (undecoded, RO per `[v3d77a]`) | | **not read at t0** | — | `0x00000003` | `0x00000003` | *identical* | MS `0x00000003` too — the §46 wedge-signature word is constant across settled and mid-render on piOS. Ours: `0x00010001` |
+| core0 `+0x1a8` | | not read at t0 | — | `0x0139C07C` | `0x02E8F1F7` | JOB-STATE mirror | **equals `CT0CA` in S1, S2 and MS** — mirror confirmed on three captures |
+| core0 `+0x1ac` | | not read at t0 | — | `0x013D4229` | `0x1B532000` | *mirror refuted* | S1's `+0x1ac == CT1EA` does **not** hold in S2 (`0x1B532000` bears no relation to `CT1EA=0x02DA4229`) nor in MS (`0x02E90346` = `CT1CA + 1`). §49.18.4's mirror-pair claim survives for `+0x1a8` only |
+| core0 `+0x124` (INFERRED `CT1LC`), `+0x11c` (INFERRED `CT1RA`) | | not read at t0 | — | `0x00000870`, `0x013D4228` | `0x00002355`, `0x02DA41C5` | COUNTER / JOB-STATE | `+0x11c` = `CT1QEA − 0x64` in S2, `= CT1QEA − 1` in S1 — a live pointer, consistent with `CT1RA` |
+| hub `+0x68` | | not read at t0 | — | `0x00000000` | `0x00000002` | GOVERNOR/STATE-NOISE | new nonzero word under load (MS also `0x2`) |
+| hub `+0x84…+0xa8`, mmuc `+0x1004`/`+0x1014` | | not read at t0 | — | small | large | COUNTER | the `[v3d94]` half-A work counters. **Both §49.18.4 shape identities survive**: in S2, `hub+0x8c = 0x01540050 = 16 × 0x00154005 = 16 × hub+0xa0` exactly, and `mmuc+0x1004 = 0x00154005 = hub+0xa0` exactly. In MS the same two identities hold to within the sampling skew of a non-atomic read (`0x020404B0` vs `16 × 0x0020404C`; `0x0020404F` vs `0x0020404C`) |
+| `CM[0xFE101000,+0x200)` | | not swept in trigger mode | — | — | — | GOVERNOR-NOISE, 4 words | S1-vs-S2 only: `+0x00c` `0x1000`→`0x16E0`, `+0x02c`/`+0x034`/`+0x1cc` `0x1000`→`0x1560` — all four are DIV partners moving with `core=500MHz`→`324MHz`. **`CM_V3DCTL`/`CM_V3DDIV` (`+0x038`/`+0x03c`) are `0x000002D4`/`0x00001000` in both**, and `+0x028` is `0x00000244` in both. The V3D clock slot does not move with the governor; §49.18.3's `+0x028` asymmetry (ours `0x2D4`, piOS `0x244`) is confirmed stable across two piOS states |
+| `PM_GRAFX` `0xFE10010C`, `LEGACY_ASB_V3D_*` `0xFE00A008/00C/020`, `RPIVID_ASB_V3D_*` `0xFEC11008/100C` | | `0x00001040`, `0x5`/`0x5`/`0x62726467`, `0x4`/`0x8060` | `0x8050` at `0xFEC1100C` | **not swept** | **not swept** | UNCOMPARABLE | outside every sweep window. The one intra-file move is `RPIVID_ASB_V3D_M_CTRL` `0x8060`→`0x8050` between t0 and t0+1ms — an ASB master-bridge status bit that follows the frame close. Undecoded, and our instrument does not read this window at all |
+
+**Count.** Inside the comparable V3D windows, the mid-bin sample holds exactly **three** words that
+neither the settled nor the mid-render state holds: `PCS = 0x00000001`, `GMP_STATUS` bits 17:16, and
+the poll-line `CT0CS = 0x20`. Everything else that differs is a pointer, a counter, or a word that
+already moves between two frames-closed captures.
+
+**One more property of the counters, worth recording.** `BFC` reads `0xC1` in S2 at 23:31:25 and
+`0xB8` in the t0 snapshot 67 seconds later, with no reboot between them; `RFC` and `CT0LC` behave
+the same way. The counters **reset**, which is what a runtime-PM power-down of the V3D domain does.
+`BFC`/`RFC`/`CT0LC` are therefore not monotonic across an idle gap, and no future rung may treat a
+`BFC` value from one capture as a lower bound on another. Within a single capture — which is how
+`[v3d55]`/PI-V3D-91 use it — `BFC` Δ remains exactly the right instrument, and the t0→t0+1ms pair is
+the first direct observation of the Δ=1 we are trying to produce.
+
+#### 49.19.3 The arithmetic on the mid-bin pool
+
+| quantity | mid-bin t0 | S1 settled | S2 / MS mid-render | ours (wedged) |
+|---|---|---|---|---|
+| `CT0QMA` | `0x011DA000` | `0x0129A000` | `0x03297000` | `0x00328000` |
+| `CT0QMS` | `0x00038000` (224 KiB) | `0x0008B000` (556 KiB) | `0x00055000` (340 KiB) | `0x00008000` (32 KiB) |
+| pool end `QMA+QMS` | `0x01212000` | `0x01325000` | `0x032EC000` | `0x00330000` |
+| `PTB_BPCA` | `0x011EE000` | `0x012A6000` | `0x032A6000` | `0x0032B000` |
+| `PTB_BPCS` | `0x00024000` | `0x0007F000` | `0x00046000` | `0x00005000` |
+| `BPCA+BPCS` | `0x01212000` ✓ | `0x01325000` ✓ | `0x032EC000` ✓ | `0x00330000` ✓ |
+| `BPCA − QMA` | `0x14000` | `0xC000` | `0xF000` | `0x3000` |
+| implied tiles, `align(N×128,4096)+0x2000` | 545…**576** | 289…320 | 385…416 | 1…32 |
+| `CT0QTS` base | `0x012B9000` | `0x01325000` | `0x0EC67000` | `0x00327000` |
+| tile-state base − pool end | **`+0xA7000`** | **`0`** | **`+0x0B97B000`** | `−0x9000` |
+
+Four results, and the third is the important one.
+
+1. **The `BPCA + BPCS = QMA + QMS` invariant holds to the byte with a bin frame open.** It is not an
+   idle-state identity; it is the pool's structural invariant, live.
+2. **Mid-frame `BPCA` sits at exactly the Mesa reservation offset and nowhere past it.**
+   `0x14000 − 0x2000 = 0x12000`, and `1920×1200` at 64×64 tiles is `30 × 19 = 570` tiles →
+   `align(570 × 128, 4096) = 0x12000` **exactly** — the bench panel's own geometry, and the frame
+   size a full-screen client on this box produces. So on a working block, with a frame open and the
+   whole bin control list consumed, `BPCA` still reads *post-reservation, pre-advance* — the same
+   kind of value ours reads when wedged (`0x3000` = the 1-tile reservation, the banked
+   `V3D56_EXPECTED_EMPTY_BPCA_ADVANCE`). **`BPCA` does not discriminate a working open frame from
+   our wedged one.** It was one of the five words §49.18.6 wanted, and its answer is "no signal".
+3. **`tsda-above` is dead.** §49.18.4 item 4 built its one remaining shape candidate on S1's
+   `CT0QTS base == QMA + QMS`. Across three piOS captures that relationship is `0`, `+0xA7000` and
+   `+0x0B97B000`. **piOS does not place the tile-state array at the pool end; S1's contiguity was a
+   coincidence of one allocation.** The `tsda-above` variant of the reserved
+   `UNAOS_V3D_POOLSHAPE` knob is withdrawn — it would have been mirroring an accident.
+4. **Pool addresses are not allocation-stable after all.** §49.18.4 item 6 recorded `QMA`/`QMS`/
+   `QTS`/`BPCA`/`BPCS` as byte-identical across two idle captures two weeks apart. The reboot to
+   kernel `.39` moved all of them, and the mid-bin client holds a *different* pool again
+   (`0x011DA000`) from the one S2/MS show (`0x03297000`) at the same moment — two GL clients, two
+   pools, live simultaneously. The stability was per-boot, per-client, and carries no weight.
+
+#### 49.19.4 (b) The verdict — the frame-open set contains no input
+
+**Which frame-open registers are plausibly what our silicon lacks when thread 0 sits at
+item-accept? None of them, and the capture is unambiguous about why.**
+
+1. **`PCS` mid-bin on a working block is `0x00000001` — bit-identical to our wedged `PCS`.** This is
+   the single most decisive number in the file. §46 read our `BMACTIVE=1, BMBUSY=0` as a possible
+   pathology; it is not one. It is exactly what a healthy V3D holds with a bin frame open and its
+   control list consumed. The difference between piOS and us is not the value of `PCS` — it is that
+   one millisecond later piOS's `PCS` goes to `0` and `BFC` goes to `0xB9`, and ours never does.
+   **The wall is a missing transition, not a missing bit.**
+2. **The only frame-open bits in the entire ARM-visible V3D window are `GMP_STATUS[17:16]`, and they
+   are status.** `GMP_CFG`, `GMP_TABLE_ADDR`, `GMP_VIO_ADDR`, `GMP_VIO_TYPE` and
+   `GMP_VALID_LINES` all read **zero at t0** — piOS runs its frames with the global memory
+   protection unit unconfigured, exactly as we do (`[v3d76]`: `GMP_STATUS = 0x30`, everything else
+   zero). Bits 17:16 come up while a bin frame is open and go away when it closes; they are the
+   GMP's own activity indication for the traffic the frame generates. There is no GMP register to
+   mirror, because piOS programs none.
+3. **`CT0CS` `CTRUN` is a control-thread run bit that we already set and already observe.** Nothing
+   new.
+4. **Everything else the mid-bin sample could have carried, it carries at zero or identical.**
+   Overflow (`BPOA`/`BPOS`/`BXCF`) is unarmed with a 570-tile frame open. Perfmon is unattached.
+   No cache-control register is held. The interrupt mask is unchanged from settled. `MISCCFG`,
+   `MMU_CTL` and every ident word are constant. **The frame unit's ARM-visible state while a frame
+   is open is, to the bit, the state we already produce.**
+5. **§49.18.5's constraint stands and is now stronger.** The reservation stage runs identically —
+   the invariant holds mid-frame on piOS, and both sides' `BPCA` sit at the Mesa formula's value for
+   their own frame size. The wall is strictly downstream of reservation. What the mid-bin capture
+   adds is that it is also strictly downstream of *every register the ARM can read*: from the
+   ARM's side, a working block mid-frame and our wedged block are distinguishable only by `BFC`
+   advancing and `PCS` clearing — which are the wall's *effects*, not its causes.
+
+**The register hunt is over.** §49.17.2 closed the surface to "one more register" proposals and
+required any future one to argue it was not already covered. §49.18 refuted the missing-pool
+reading. This section removes the last hiding place the previous two left open — the "only visible
+while a frame is open" register — and finds three status bits and nothing writable. **There is no
+CPU-writable register, in any window either instrument reads, whose value distinguishes piOS's
+working bin frame from our wedged one.**
+
+#### 49.19.5 (c) The next rung — read-only telemetry means the answer is behavioral
+
+The brief's own fork applies: *if everything frame-open is read-only telemetry, say so and state
+what that means for the campaign.* Everything frame-open is read-only telemetry.
+
+**(A) No programming rung is proposed, and `UNAOS_V3D_POOLSHAPE` is withdrawn entirely.**
+§49.18.6(C) held the knob in reserve behind a stated trigger: "if, and only if, (A)'s mid-bin
+capture shows a core0 register holding a value on a working open frame that our wedged sweep does
+not hold". The trigger did not fire — the three words that qualify are `PCS` (which we already hold
+at the same value), `GMP_STATUS[17:16]` (read-only status of an unconfigured unit) and `CT0CS`
+`CTRUN` (which we already set). Its `tsda-above` variant is independently refuted by §49.19.3
+item 3. The knob is not built, and the reserved second variant has no register to name. **No new
+row is added to the exclusion table by a rung; the rows added are measurements.**
+
+**(B) The bunker prong is now the campaign's main line, not its alternative.** If the difference
+between a block that retires bin frames and one that does not is invisible in every ARM-readable
+register at the instant it matters, the difference is not in the register file the ARM writes. It is
+in what the VPU firmware does to the block that we do not — an initialisation sequence, an ASB or PM
+handshake, a clock/reset ordering, or a value written through a path the ARM does not see. That is
+`start4.elf` analysis, and the honest statement is that **the campaign's remaining probability mass
+sits there.** Two concrete, low-cost read-only measurements would sharpen the target before any
+disassembly begins:
+
+| measurement | what it reads | why it is licensed now |
+|---|---|---|
+| widen `[v3d94]` half B to `CM[0xFE101000,+0x200)` and decode the `+0x028` slot | the 44 CM words our instrument does not read, plus the one asymmetry §49.18.3 found (`+0x028` = `0x2D4` ours, `0x244` piOS, now confirmed stable across **two** piOS states) | unchanged from §49.18.6(B); it is a measurement against a window the comparison covers and ours does not. Gate: `./arroyo check` both arches, `kernel8-test` green, `[v3d94]` strings present |
+| add the **PM/ASB windows** to our sweep: `PM_GRAFX 0xFE10010C`, `LEGACY_ASB_V3D_S/M_CTRL 0xFE00A008/0x00C`, `RPIVID_ASB_V3D_S/M_CTRL 0xFEC11008/0x100C` | piOS mid-bin holds `0x00001040`, `0x5`/`0x5`, `0x4`/`0x8060`, and `RPIVID_ASB_V3D_M_CTRL` **moves `0x8060 → 0x8050` across the frame close** | **new territory, and the only window in the mid-bin file that our instrument cannot compare at all.** It is also the exact class of surface — power-domain and AXI-bridge handshake — that a firmware-behavioral difference would live in. Read-only, four extra words |
+
+The second row is the one this section actually recommends first. It is the only unread window left
+in the mid-bin capture, and a bridge-status bit that changes state precisely when a bin frame closes
+is the first thing in this campaign to correlate with the transition we cannot produce. It proves
+nothing by itself; it is the cheapest way to find out whether our block's ASB state at
+`START_TILE_BINNING` even resembles piOS's.
+
+**(C) Criterion, unchanged, for whatever eventually gets built.** The PI-V3D-91 bin criterion with
+`[v3d93]` and `[v3d56]` poison armed, and the verdict is `BFC` advance plus `FLDONE`, and nothing
+weaker. The t0→t0+1ms pair in this capture is the first time the campaign has seen that exact
+signature on the bench — `PCS 0x1 → 0x0`, `BFC 0xB8 → 0xB9` — and it is what the criterion is
+written to detect.
+
+**Standing.** `tsda-above` and the whole of `UNAOS_V3D_POOLSHAPE` move to **excluded measured**.
+`PCS = 0x1` as a wedge pathology moves to **excluded measured** — it is the healthy open-frame
+value. `BPCA` position as a discriminator moves to **excluded measured**. §49.18.6(A)'s three-part
+capture ask is **complete**: settled (S1), mid-render (S2/MS, by accident of labelling) and mid-bin
+(t0). The firmware-side prong closes on the register-comparison question with a negative answer, and
+what remains of it is behavioral.
