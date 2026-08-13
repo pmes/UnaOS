@@ -4512,36 +4512,14 @@ pub fn clear_handle_row(asid: u64) {
     //     windows the compositor has already reaped.
     //   * `close_owner` then `close_compat` — a belt-and-braces sweep for anything `win_close_asid` could not
     //     reach. `close_owner(asid)` catches a compositor row whose WC-B row was already freed by a racing
-    //     `sys_win_close` that had not yet run its `destroy`. `close_compat()` is the one WC-A explicitly
-    //     cannot reap on its own: the compat row is minted through the `SYS_FB_PRESENT` hook, whose signature
-    //     carries no ASID, so it has no owner for `close_owner` to match. Without this call it is IMMORTAL —
-    //     every later composite would re-blit whatever now lives in the dead surface's backing frame, i.e. the
-    //     next tenant of this slot's private memory, straight onto the panel.
-    // Both run with `WINDOWS` released (`win_close_asid` has returned), so their drain barriers cannot spin
-    // inside a lock a presenter is waiting on.
+    //     `sys_win_close` that had not yet run its `destroy`. `close_compat()` is the one WC-A cannot reap on
+    //     its own: the compat row is minted through the `SYS_FB_PRESENT` hook, whose signature carries no ASID,
+    //     so `close_owner` has no owner to match. Without it the row is IMMORTAL and every later composite
+    //     re-blits the dead surface's frame — the slot's next tenant's private memory — to the panel.
+    // Both run with `WINDOWS` released, so their drain barriers cannot spin inside a lock a presenter holds.
     crate::video::wm::close_owner(asid);
     crate::video::wm::close_compat();
-    // VUG-PARITY / CLOSE-TEARDOWN follow-up — release the wm FOCUS HIGHLIGHT if this dying ASID held
-    // it. The aarch64 twin of the x86 call in `memory::free_user_space_by_cr3`, missing on this arch
-    // until now, and NOT redundant with anything above it:
-    //
-    //   * The `USER_INPUT_ACTIVE` CAS earlier in this function is the KEYBOARD half — it stops the
-    //     router enqueueing to a dead slot. `FOCUS_ASID` is `video::wm`'s own word, only
-    //     `focus_release` may drop it, and nothing on this arch was dropping it.
-    //   * `close_owner`/`close_compat` reap the dying ASID's ROWS, not its focus.
-    //
-    // Without it, a vug that EXITS ON ITS OWN while focused (the ordinary case — `pulse` finishing,
-    // a vug returning from `main`, never an operator close click) leaves the highlight naming a dead
-    // ASID; window ids being generation-less `slot + 1`, the slot's NEXT tenant then comes up holding
-    // a focus it never earned, with the shell unable to take it back. The close-CLICK path releases
-    // before it kills, so its teardown arrives here with the CAS already missed and this is a no-op —
-    // the `route=` token is what tells the two apart on the `[wm-act]` wire, so it is the SAME token
-    // x86 uses rather than a new one, and one arch's capture stays readable against the other's.
-    //
-    // Placement mirrors x86 exactly: AFTER the rows are reaped, so `focus_release`'s "loser repaints"
-    // sweep finds none of this owner's rows and composites nothing on a teardown path. Lock-safe by
-    // the same argument the block above makes for its own calls — `WINDOWS` is released, and
-    // `focus_release` takes the `wm` table this path has already exercised.
+    // VUG-PARITY: the FOCUS half — a self-exit must not strand `FOCUS_ASID`. See PARITY.md §5.2.
     crate::video::wm::focus_release(asid, "route=self-exit shell-raise=skipped siblings=untouched");
 }
 

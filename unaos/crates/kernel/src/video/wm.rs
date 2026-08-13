@@ -1250,32 +1250,15 @@ static PACE_PENDING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 const _: () = assert!(MAX_WINDOWS <= 32); // PACE_PENDING is one u32 bitmask
 
-/// WPACE-PANEL — the panel frame in [`crate::arch::now_cycles`] units, or `0` while that timebase
-/// has no known rate, during which the pacer stands aside and every present composites — the
-/// pre-pacer behaviour, on a boot phase with no vug storm to pace. Deriving the frame from the RATE
-/// rather than multiplying out [`PACE_FRAME_US`] keeps the frame exact instead of 999 cycles short
-/// per frame.
-///
-/// VUG-PARITY — the one genuinely arch-specific line in this pacer, and the reason the rest of it
-/// ports unchanged. Both arches count in their own units and both expose that count as
-/// `arch::now_cycles()`; only the RATE is asked for differently:
-///
-///   * x86_64 — `apic::tsc_hz()`, which is `0` before `apic::calibrate` (the first ~116 ms of boot).
-///   * aarch64 — `CNTFRQ_EL0` via `timer::cntfrq()`, the generic timer's architectural rate. It is
-///     readable from reset and never uncalibrated, so the `0` arm is unreachable on the Pi rather
-///     than merely unusual — it stays because the DEGRADED answer (drain immediately, never
-///     coalesce) is the correct one for a rate we cannot trust, on either arch. `now_cycles` is
-///     CNTVCT_EL0 and `cntfrq` is CNTVCT's own rate, so the pair is exact here exactly as
-///     rdtsc/`tsc_hz` is on x86 — ~54 MHz on the Pi 4, ~62.5 MHz under QEMU, i.e. ~900k/~1.04M
-///     cycles per 60 Hz frame. Not the ms clock: `arch::ms()` is derived and coarser than a frame.
+/// WPACE-PANEL — the panel frame in [`crate::arch::now_cycles`] units, or `0` when that timebase has no trusted
+/// rate, during which the pacer stands aside and every present composites. VUG-PARITY: only the RATE is
+/// arch-specific — x86 `tsc_hz()`, `0` pre-calibrate; aarch64 CNTFRQ_EL0, CNTVCT's own rate. See PARITY §5.1.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 #[inline]
 fn pace_frame_cycles() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    let hz = crate::arch::apic::tsc_hz();
-    #[cfg(target_arch = "aarch64")]
-    let hz = crate::arch::timer::cntfrq();
-    hz / 60
+    #[cfg(target_arch = "x86_64")] let hz = crate::arch::apic::tsc_hz();
+    #[cfg(target_arch = "aarch64")] let hz = crate::arch::timer::cntfrq();
+    hz / 60 // VUG-PARITY: `hz` is bound by exactly one of the two arms above.
 }
 
 /// WPACE-PANEL — the decision, taken after the damage mark and before [`composite`]. Returns `true`
@@ -1337,24 +1320,12 @@ fn pace_admit(id: WinId, exempt: bool) -> bool {
 /// rides `Screen::flush`, whose idle cadence is the status strip's ~1/s — visibly late). This is
 /// the same liveness structure the deferred-erase queue has (WC-L), with the same class of taker.
 ///
-/// Called from the device-service pass on both arches, so a deferred present reaches glass within
-/// one frame plus one service tick:
-///
-///   * x86_64 — `wcx::desktop_app_service`, the `wc`-gated body on `x86_usb_pump`'s ~1 kHz pass.
-///   * aarch64 — `usb_pump` directly (VUG-PARITY). The Pi has no `wcx` — that module IS the x86
-///     panel path — so the drain rides the structural twin of the same lane: PIUSB-26's dedicated
-///     pump task, `sleep_ticks(1)` ≈ **4 ms** at the 250 Hz per-core tick. Coarser than x86's ~1 ms
-///     and deliberately still correct: the drain's job is to bound a coalesced frame's wait, and
-///     4 ms is well inside the 16.67 ms frame it is bounding, so the worst case is one frame plus
-///     4 ms rather than one frame plus 1 ms. Not the render service — that task BLOCKS on
-///     `GUI_CHANNEL` and is therefore off the run queue during exactly the input-idle stretch a
-///     stopped present stream leaves behind, which is the case this drain exists for.
-///
-/// Main-loop context, never IRQ, unmasked, on both: exactly the context `composite` already runs in
-/// from `service_damage` and the paygo taker, and the WCSER re-run loop treats it as an unmasked
-/// holder. The Pi's pump core is not the render core, so this composite cannot preempt-deadlock
-/// against a raw-spinlock holder the way a co-located taker would. Idle cost is one relaxed load;
-/// pending-but-not-due costs one rate read and a bounded scan of [`MAX_WINDOWS`] stamps, no locks.
+/// Called from the device-service pass on both arches, so a deferred present reaches glass within one frame
+/// plus one service tick: x86 `wcx::desktop_app_service` (~1 kHz); aarch64 BOTH entry points of the same lane
+/// (VUG-PARITY) — `usb_pump` (~4 ms) and the `input_service` poll-nap, since `usb_pump` is metal-only and QEMU
+/// raspi4b runs the latter alone. Never the render task: it BLOCKS on `GUI_CHANNEL` across exactly the idle a
+/// stopped stream leaves. Main-loop context, never IRQ, unmasked — where `composite` already runs from
+/// `service_damage`. Idle cost one relaxed load; a due pass costs one rate read + a `MAX_WINDOWS` scan, no locks.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub fn pace_service() {
     use core::sync::atomic::Ordering::Relaxed;
