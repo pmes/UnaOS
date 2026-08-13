@@ -620,8 +620,10 @@ pub fn init(gpu: &GpuInfo) {
         // rule). On a `Dark`/`WokeNoAck` wake it runs the read-only recon and writes nothing
         // (`gated-on-wake` / `exec-gated-on-ack`) — the outcome Boot D's `gt-still-dark` makes most
         // likely. Placed AFTER `claim` and still BEFORE `bring_up_blt_ring`. It writes at most two
-        // GGTT PTEs and the four RCS ring registers (all zeroed on teardown), no display register,
-        // so R5 cannot black Peter's screen; a GT fault parks the CS, it does not touch scanout.
+        // GGTT PTEs (pinned uncached-coherent encoding, clflushed) and the four RCS ring registers
+        // (drained to idle, disabled with the disable proven by readback, then restored to their
+        // captured entry images — never unmapped under a live ring), no display register, so R5
+        // cannot black Peter's screen; a GT fault parks the CS, it does not touch scanout.
         #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
         super::gen7::execute(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
 

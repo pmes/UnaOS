@@ -2601,17 +2601,32 @@ pub unsafe fn claim(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
 //    read as unowned, plus the four RCS ring registers), and the panel is the Kepler's anyway
 //    (`igpu.rs` ~778, Boot AS). A GT fault parks the CS; it does not touch scanout.
 //
-// ## Reversibility — two PTEs into a verified-unowned window, ring disabled, pages leaked
+// ## Reversibility — two PTEs into a verified-unowned window, ring drained-then-disabled, pages leaked
 //
-// The only writes R5 makes are on the `write_ok()` branch: two GGTT PTEs (ring + target), each
-// into a slot it first read as unowned (all-zero, or the four-leg-confirmed scratch-fill of
-// R4b), plus the four RCS ring registers. On teardown it disables the ring (RING_CTL=0, proven
-// by readback that bit 0 cleared), zeroes RING_START/HEAD/TAIL, restores both PTEs and their
-// neighbours to the captured entry image, and re-reads to prove it. The two pages are LEAKED
-// (a one-shot 8 KiB boot-time cost) because no TLB-invalidation rung exists to guarantee the GT
-// holds no cached translation to them — the exact rule R4b's review established for its
-// scratch-fill free. No clock, no RC6/RPS policy, no voltage/frequency request, nothing in a
-// display block.
+// The only writes R5 makes are on the `write_ok()` branch: two GGTT PTEs (ring + target, the
+// pinned uncached-coherent encoding `GGTT_PTE_VALID`), each into a slot it first read as unowned
+// (all-zero, or the four-leg-confirmed scratch-fill of R4b), plus the four RCS ring registers.
+// Teardown is ordered by proof, not by hope (review, MAJOR-2): it waits (bounded) for the ring to
+// drain to idle (HEAD==TAIL, §1.1.11.4 p.78's clean point), disables it (RING_CTL=0) and PROVES
+// bit 0 cleared by readback, restores the four ring registers to their CAPTURED ENTRY IMAGES (not
+// a blind zero) and re-reads them — but only once the ring is confirmed disabled, because writing
+// HEAD/START/TAIL under a live ring is UNDEFINED (§1.1.11.2 p.76). Only then does it restore the
+// two PTEs and their neighbours (the act that UNMAPS the pages) and re-read to prove it. If the
+// ring will NOT disable, it does the opposite of unmap: it LEAVES the PTEs claimed and parks loud
+// — unmapping a page a live engine may still DMA is the corruption this rung exists to avoid. The
+// two pages are LEAKED regardless (a one-shot 8 KiB boot-time cost) because no TLB-invalidation
+// rung exists to guarantee the GT holds no cached translation to them — the R4b rule. No clock, no
+// RC6/RPS policy, no voltage/frequency request, nothing in a display block.
+//
+// ## Cache coherency — the line R4's assumptions don't cross (review, MAJOR-1)
+//
+// R5 is the first rung where the GT CONSUMES what the CPU wrote and keeps running after we look
+// away, so "it's only a PTE readback" no longer covers it. Two defences: the GGTT PTEs use the
+// PINNED uncached-but-L3-coherent encoding (`GGTT_PTE_VALID`, IVB Vol1 Part2 §2.1.2.1 pp.6-7 —
+// L3CC=0 "still kept coherent with L3 content", LLCCC=0), and the CPU's ring/target writes are
+// `clflush`ed to the coherency point BEFORE the ring is enabled, so the CS can never fetch a stale
+// line and execute it as privileged commands. The target line is `clflush`ed again before each
+// sentinel read, so a stale cached copy cannot forge a `sentinel-miss` either.
 
 /// R5's two-slot claim window. Chosen LOW on purpose: `RING_BUFFER_START` (§1.1.11.3, p.77)
 /// requires the ring's GGTT address bits [31:29] to be zero, so the ring slot must be below
@@ -2643,6 +2658,60 @@ const RING_HEAD_OFF_MASK: u32 = 0x001F_FFFC;
 /// two-slot window and above the low firmware-framebuffer slots. All in-array, highest clear of
 /// the last slot. Distinct from R4's set only in that they avoid R5's own window.
 const R5_FAR_PROBE: [usize; 6] = [0x20000, 0x30000, 0x40000, 0x50000, 0x60000, 0x7FFF0];
+
+/// The Gen7 GGTT PTE R5 programs for its two pages, PINNED against IVB PRM Vol 1 Part 2,
+/// §2.1.2.1 "GTT Page Table Entries (PTEs)", pp.6-7 (IHD-OS-V1 Pt 2 - 05 12,
+/// https://kiwitree.net/~lina/intel-gfx-docs/prm/ivb/ivb_ihd_os_vol1_part2.pdf). The 1-DWord
+/// entry is: bit0 Valid; bit1 L3CC (L3 Cacheability Control) 0="not cacheable within L3" — and
+/// the doc's own note: "even if the surface is not cacheable in L3, it is still kept coherent
+/// with L3 content"; bit2 LLCCC (LLC Cacheability Control) 0="use cacheability controls from
+/// GTT entry" (i.e. not force-cached in LLC); bit3 GFDT 0=default; bits[11:4] phys[39:32] (MBZ
+/// for 32-bit); bits[31:12] phys[31:12].
+///
+/// MAJOR-1 fix (review): the earlier cut left bits[3:1]=0 with a comment that treated the field
+/// as unpinned/likely-reserved. It is neither — with this pin, `phys | VALID` is the DEFINED,
+/// least-cached, L3-coherent encoding (L3CC=0, LLCCC=0, GFDT=0). That is deliberately the safest
+/// setting for a page the CPU writes and the GT then fetches: the GT is not told to pull the
+/// line into its own caches, and the fabric keeps it coherent with L3 regardless — so combined
+/// with the CPU-side `clflush` below, the GT cannot fetch a stale line. It is also the exact
+/// encoding the tree's metal-proven BLT ring flies with (`igpu.rs` ~883, `phys | 1`), now retired
+/// from uncited to PINNED.
+const GGTT_PTE_VALID: u32 = 1; // bit0 Valid; bits[3:1]=000 = L3CC0/LLCCC0/GFDT0 (uncached, coherent)
+
+/// Write-back-and-invalidate one cache line containing `addr`, via `CLFLUSH`. PINNED against the
+/// Intel 64 & IA-32 SDM Vol 2A ("CLFLUSH — Flush Cache Line"): CLFLUSH "writes back and
+/// invalidates the cache line ... if the line is inconsistent with memory" across the coherency
+/// domain, and (SDM Vol 3A §11.4) is used to make CPU stores visible to a non-snooping DMA agent.
+/// R5 uses it in BOTH directions: to push the CPU's ring/target writes to the coherency point
+/// before the GT fetches them (MAJOR-1), and to invalidate a possibly-stale target line before
+/// reading the GT's sentinel store back. `CLFLUSH` on write-back memory is ordered only by a
+/// fencing instruction, so callers bracket a run of flushes with `MFENCE` (SDM Vol 2A note).
+///
+/// This is the minimal primitive the review asked for: `wbinvd` is rejected (it discards the
+/// WHOLE cache — far too big a hammer for two pages, and a latency spike on a live system), and
+/// `CLFLUSH` is line-granular. The x86 kernel had no cache-flush primitive (`video/wm.rs` ~4473
+/// explains why the compositor deliberately avoids one), so this local, cited helper is added
+/// rather than reaching for `wbinvd`.
+#[inline]
+unsafe fn clflush_line(addr: usize) {
+    core::arch::asm!("clflush [{}]", in(reg) addr, options(nostack, preserves_flags));
+}
+
+/// `CLFLUSH` every 64-byte line spanning `[base, base+len)`, MFENCE-bracketed so the whole run is
+/// ordered with respect to the subsequent MMIO `TAIL` write (or the following data read). 64 is
+/// the architectural cache-line size on this part (Ivy Bridge); flushing on that stride covers
+/// every line exactly once.
+#[inline]
+unsafe fn clflush_range(base: usize, len: usize) {
+    core::arch::asm!("mfence", options(nostack, preserves_flags));
+    let mut a = base & !63usize;
+    let end = base + len;
+    while a < end {
+        clflush_line(a);
+        a += 64;
+    }
+    core::arch::asm!("mfence", options(nostack, preserves_flags));
+}
 
 /// GEN7 rung R5 — map a ring, submit one MI_STORE_DATA_IMM, prove execution on the sentinel,
 /// tear it all down reversibly.
@@ -2701,18 +2770,25 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
     // ---- Read-only RCS ring-register census, BOTH branches ----------------------------
     // The four registers R5 will (on the write branch) program. R3 released forcewake, so on a
     // woke GT they may still read dark; the reading is reported, never assumed.
+    // The four registers R5 will (on the write branch) program are ALSO captured here as their
+    // ENTRY IMAGES — teardown restores them to exactly this state (MAJOR-2a fix), not to a blind
+    // zero. `probe` returns the first of its two reads, which is the entry value.
     let mut ring = Tally::default();
-    probe(bar0, "rcs", "RING_START", g7regs::RCS_RING_START, "IVB-PINNED", &mut ring);
-    probe(bar0, "rcs", "RING_CTL", g7regs::RCS_RING_CTL, "IVB-PINNED", &mut ring);
-    probe(bar0, "rcs", "RING_HEAD", g7regs::RCS_RING_HEAD, "IVB-PINNED", &mut ring);
-    probe(bar0, "rcs", "RING_TAIL", g7regs::RCS_RING_TAIL, "IVB-PINNED", &mut ring);
+    let ring_start_pre = probe(bar0, "rcs", "RING_START", g7regs::RCS_RING_START, "IVB-PINNED", &mut ring);
+    let ring_ctl_pre = probe(bar0, "rcs", "RING_CTL", g7regs::RCS_RING_CTL, "IVB-PINNED", &mut ring);
+    let ring_head_pre = probe(bar0, "rcs", "RING_HEAD", g7regs::RCS_RING_HEAD, "IVB-PINNED", &mut ring);
+    let ring_tail_pre = probe(bar0, "rcs", "RING_TAIL", g7regs::RCS_RING_TAIL, "IVB-PINNED", &mut ring);
     serial_println!(
-        ":: gen7: r5 ring-census n={} structured={} zero={} allones={} varies={} note=the-four-RCS-submission-registers-before-any-write ::",
+        ":: gen7: r5 ring-census n={} structured={} zero={} allones={} varies={} entry_start={:08X} entry_ctl={:08X} entry_head={:08X} entry_tail={:08X} note=the-four-RCS-submission-registers-and-their-entry-images-before-any-write ::",
         ring.n,
         ring.structured,
         ring.zero,
         ring.allones,
-        ring.varies
+        ring.varies,
+        ring_start_pre,
+        ring_ctl_pre,
+        ring_head_pre,
+        ring_tail_pre
     );
 
     // ---- Read-only census of the two-slot window + neighbours, BOTH branches ----------
@@ -2902,8 +2978,11 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
         serial_println!(":: gen7: r5 end ::");
         return;
     }
-    let ring_pte = (ring_phys as u32) | 1; // valid bit — draft G6
-    let tgt_pte = (tgt_phys as u32) | 1;
+    // PINNED encoding: valid + L3CC0/LLCCC0/GFDT0 (uncached, L3-coherent) — see `GGTT_PTE_VALID`
+    // and IVB Vol1 Part2 §2.1.2.1 pp.6-7. Paired with the `clflush_range` before submit, the GT
+    // cannot fetch a stale line through either PTE.
+    let ring_pte = (ring_phys as u32) | GGTT_PTE_VALID;
+    let tgt_pte = (tgt_phys as u32) | GGTT_PTE_VALID;
     // R4b indistinctness refusal: a PTE equal to the entry image makes its transition
     // unwitnessable. Checked for BOTH slots — an instrument that cannot say NO is a Wall D defect.
     if ring_pte == base_img || tgt_pte == base_img {
@@ -2978,12 +3057,27 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
     core::ptr::write_volatile(ring_u32.add(7), MI_NOOP);
     const RING_TAIL_BYTES: u32 = 8 * 4; // 8 DWords consumed; tail is the QWord-past-last (0x20)
 
-    // Seed the target page so a hit is a transition, not a pre-existing pattern. Read it back
-    // through its own CPU mapping under a fence so the seed is visible before the GT could store.
+    // Seed the target page so a hit is a transition, not a pre-existing pattern. Flush the line
+    // to the coherency point and re-read it, then VERIFY the seed is actually there (MINOR-2 fix):
+    // `sentinel-miss` is only falsifiable if we first proved the seed — not the sentinel — was in
+    // the target line before the GT ran. A seed that does not read back means the target page's
+    // own CPU mapping is broken, and arming a ring to store into it would be untestable; park
+    // BEFORE any MMIO write (no PTE has been programmed yet, so nothing needs restoring — the two
+    // pages are leaked, as everywhere in this rung).
     let tgt_u32 = tgt_page as *mut u32;
     core::ptr::write_volatile(tgt_u32, R5_TGT_SEED);
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    clflush_range(tgt_page as usize, 4096);
     let tgt_seed_rb = core::ptr::read_volatile(tgt_u32 as *const u32);
+    if tgt_seed_rb != R5_TGT_SEED {
+        serial_println!(
+            ":: gen7: r5 verdict=seed-unreadable tgt_seed_wrote={:08X} tgt_seed_rb={:08X} writes=0 note=target-page-CPU-mapping-did-not-read-back-the-seed-sentinel-miss-would-be-unfalsifiable-pages-leaked ::",
+            R5_TGT_SEED,
+            tgt_seed_rb
+        );
+        serial_println!(":: gen7: r5 next=STOP-target-page-not-coherent-do-not-arm note=no-ggtt-or-ring-touched ::");
+        serial_println!(":: gen7: r5 end ::");
+        return;
+    }
 
     // ---- Write the two GGTT PTEs (ring first, then target), read back under the hold ------
     wr(bar0, ring_off, ring_pte);
@@ -3010,9 +3104,13 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
     );
 
     // ---- Arm the ring and submit --------------------------------------------------------
-    // Only if the PTEs actually landed and nothing smeared — arming a ring whose GGTT mapping
-    // did not take (a gated array on a woken GT, the R4 `claim-write-void` shape) would point
-    // the CS at garbage. `armed=0` here is an honest reading, not a failure to hide.
+    // `ring_programmed` = we wrote the four RCS registers (so teardown must restore THEM, to the
+    // captured entry images). `armed` = the CTL enable bit actually READ BACK set (MINOR-1 fix):
+    // an enable that does not latch is a distinct finding (`enable-void`), not a silent fold into
+    // head-stuck, and it must NOT lead to a tail advance against a ring the HW does not consider
+    // enabled. Both gate on the PTEs having landed and nothing smearing — arming a ring whose GGTT
+    // mapping did not take (the R4 `claim-write-void` shape) would point the CS at garbage.
+    let mut ring_programmed = false;
     let mut armed = false;
     let mut head_at_arm = 0u32;
     let mut head_post = 0u32;
@@ -3021,19 +3119,29 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
     let mut tgt_post = tgt_seed_rb;
     let mut ctl_readback_en = 0u32;
     if ptes_landed && !smear_held {
+        // MAJOR-1: push the CPU's ring writes (and the seed) to the coherency point BEFORE the GT
+        // can fetch them. The GGTT PTEs are the uncached-but-L3-coherent encoding (`GGTT_PTE_VALID`),
+        // and this flush guarantees the ring page holds the real command stream in memory — so the
+        // CS cannot parse a stale line as privileged commands regardless of snoop behaviour. Done
+        // before the ring is even enabled, so no fetch can precede it.
+        clflush_range(ring_page as usize, 4096);
+        clflush_range(tgt_page as usize, 4096);
+
         // Program order mirrors the tree's proven BLT bring-up (`igpu.rs` ~903-907): disable,
         // set START, zero HEAD, zero TAIL, then enable. Head/Tail "must be properly programmed
         // before it is enabled" (§1.1.11.4 p.78).
+        ring_programmed = true;
         wr(bar0, g7regs::RCS_RING_CTL, 0);
         wr(bar0, g7regs::RCS_RING_START, ring_gtt_addr);
         wr(bar0, g7regs::RCS_RING_HEAD, 0);
         wr(bar0, g7regs::RCS_RING_TAIL, 0);
         wr(bar0, g7regs::RCS_RING_CTL, RCS_RING_CTL_1PAGE_EN);
         ctl_readback_en = rd(bar0, g7regs::RCS_RING_CTL);
+        armed = ctl_readback_en & 1 == 1;
         head_at_arm = rd(bar0, g7regs::RCS_RING_HEAD) & RING_HEAD_OFF_MASK;
-        armed = true;
         serial_println!(
-            ":: gen7: r5 ring-armed start={:08X} ctl_wrote={:08X} ctl_readback={:08X} ctl_enabled={} head_at_arm={:08X} tail_target={:08X} sentinel={:08X} tgt_gtt_addr={:08X} tgt_seed_rb={:08X} ::",
+            ":: gen7: r5 ring-armed armed={} start={:08X} ctl_wrote={:08X} ctl_readback={:08X} ctl_enabled={} head_at_arm={:08X} tail_target={:08X} sentinel={:08X} tgt_gtt_addr={:08X} tgt_seed_rb={:08X} ::",
+            if armed { 1 } else { 0 },
             ring_gtt_addr,
             RCS_RING_CTL_1PAGE_EN,
             ctl_readback_en,
@@ -3045,27 +3153,33 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
             tgt_seed_rb
         );
 
-        // Advance the tail — this is the submit. Then poll HEAD (masked) reaching the tail AND
-        // the sentinel landing, whichever first, under a bounded budget bracketed by rdtsc so
-        // `cyc=` turns the iteration count into a real number the first time this flies.
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        wr(bar0, g7regs::RCS_RING_TAIL, RING_TAIL_BYTES);
-        const EXEC_POLL_MAX: u32 = 1_000_000;
-        let t0 = crate::arch::now_cycles();
-        loop {
-            head_post = rd(bar0, g7regs::RCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+        // Advance the tail — this is the submit. ONLY if the enable latched (`armed`): advancing
+        // the tail of a ring the HW does not hold enabled would be an undefined poke at a register
+        // whose ring is off. Then poll HEAD (masked) reaching the tail AND the sentinel landing,
+        // whichever first, under a bounded budget bracketed by rdtsc. The target line is
+        // `clflush`ed each iteration before the read so a stale cached copy cannot fake a miss
+        // (MAJOR-1, read direction).
+        if armed {
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            wr(bar0, g7regs::RCS_RING_TAIL, RING_TAIL_BYTES);
+            const EXEC_POLL_MAX: u32 = 1_000_000;
+            let t0 = crate::arch::now_cycles();
+            loop {
+                head_post = rd(bar0, g7regs::RCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+                clflush_range(tgt_page as usize, 4);
+                tgt_post = core::ptr::read_volatile(tgt_u32 as *const u32);
+                if head_post == RING_TAIL_BYTES || tgt_post == R5_SENTINEL {
+                    break;
+                }
+                iters += 1;
+                if iters >= EXEC_POLL_MAX {
+                    break;
+                }
+            }
+            cyc = crate::arch::now_cycles().wrapping_sub(t0);
+            clflush_range(tgt_page as usize, 4);
             tgt_post = core::ptr::read_volatile(tgt_u32 as *const u32);
-            if head_post == RING_TAIL_BYTES || tgt_post == R5_SENTINEL {
-                break;
-            }
-            iters += 1;
-            if iters >= EXEC_POLL_MAX {
-                break;
-            }
         }
-        cyc = crate::arch::now_cycles().wrapping_sub(t0);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        tgt_post = core::ptr::read_volatile(tgt_u32 as *const u32);
     }
 
     // ---- The exec verdict — every arm named before the rung ran -------------------------
@@ -3083,11 +3197,18 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
     //  head-stuck        the head never reached the tail and no sentinel → the CS did not parse
     //                    our ring, the EXPECTED outcome for a bare ring with no default context
     //                    (the §1.1.11.4 p.79 programming-note caveat coming true).
+    //  claim-write-void  a PTE did not land or a neighbour smeared → the ring was never programmed.
+    //  enable-void       the four registers were programmed but RING_CTL bit0 did not read back
+    //                    set (MINOR-1) → the enable itself did not latch, distinct from the CS
+    //                    parsing nothing. The likeliest cause is forcewake released (R3's contract):
+    //                    on a gated GT the CTL write does not stick. `next` says so.
     let head_done = head_post == RING_TAIL_BYTES;
     let head_moved = armed && head_post != head_at_arm;
     let sentinel_hit = tgt_post == R5_SENTINEL;
-    let exec_verdict = if !armed {
+    let exec_verdict = if !ring_programmed {
         "claim-write-void"
+    } else if !armed {
+        "enable-void"
     } else if sentinel_hit && head_done {
         "sentinel-hit"
     } else if sentinel_hit {
@@ -3117,38 +3238,104 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
         ctl_readback_en & 1
     );
 
-    // ---- Teardown — ring disabled (proven), PTEs restored (proven), pages leaked ----------
-    // Disable the ring and PROVE bit 0 cleared by readback — a ring left enabled over a GGTT
-    // page we are about to stop tracking is exactly the DMA-into-reused-heap hazard the leak
-    // rule guards, so "disabled" is verified, never asserted. Zero START/HEAD/TAIL too so the
-    // register block is back to its default (0x00000000) reset image.
-    wr(bar0, g7regs::RCS_RING_CTL, 0);
-    let ctl_off = rd(bar0, g7regs::RCS_RING_CTL);
-    wr(bar0, g7regs::RCS_RING_TAIL, 0);
-    wr(bar0, g7regs::RCS_RING_HEAD, 0);
-    wr(bar0, g7regs::RCS_RING_START, 0);
-    let ring_disabled = ctl_off & 1 == 0;
+    // ---- Teardown — the rung is most exposed here, so every step is conditioned on proof -----
+    //
+    // (c) DRAIN THEN DISABLE. If the ring was actually enabled, wait — bounded — for it to reach
+    // idle (HEAD == TAIL) before disabling. §1.1.11.4 p.78 names that as the clean point: "If
+    // disabled and the ring head equals ring tail, all state currently loaded in hardware is
+    // considered invalid." Disabling is DEFINED regardless of pending work (same page: "It can be
+    // enabled or disabled regardless of whether there are valid instructions pending"), so a drain
+    // timeout is recorded, not fatal — we still disable, but we reach the proven-idle point first
+    // whenever one exists.
+    let mut ring_idle = true;
+    let mut drain_iters = 0u32;
+    if armed {
+        const DRAIN_MAX: u32 = 1_000_000;
+        loop {
+            let h = rd(bar0, g7regs::RCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+            if h == RING_TAIL_BYTES {
+                ring_idle = true;
+                break;
+            }
+            ring_idle = false;
+            drain_iters += 1;
+            if drain_iters >= DRAIN_MAX {
+                break;
+            }
+        }
+    }
 
-    // Restore both PTE slots and their neighbours to the captured entry image (the neighbour
-    // writes are identities — each was gate-verified equal to `base_img`), then re-read all four
-    // to prove the neighbourhood is back. Restore is not assumed.
-    wr(bar0, prev_off_g, base_img);
-    wr(bar0, ring_off, base_img);
-    wr(bar0, tgt_off, base_img);
-    wr(bar0, next_off_g, base_img);
-    let ring_post = rd(bar0, ring_off);
-    let tgt_post_pte = rd(bar0, tgt_off);
-    let prev_post = rd(bar0, prev_off_g);
-    let next_post = rd(bar0, next_off_g);
-    let ptes_restored =
-        ring_post == base_img && tgt_post_pte == base_img && prev_post == base_img && next_post == base_img;
-    let smear_post = prev_post != prev_pre || next_post != next_pre;
-    let restored = ring_disabled && ptes_restored && !smear_post;
+    // Disable and PROVE bit 0 cleared by readback — only touch RING_CTL if we actually programmed
+    // it. A never-programmed ring is trivially disabled and its registers hold their entry images
+    // untouched, so we must not write them.
+    let mut ctl_off = ring_ctl_pre;
+    let mut ring_disabled = true;
+    if ring_programmed {
+        wr(bar0, g7regs::RCS_RING_CTL, 0);
+        ctl_off = rd(bar0, g7regs::RCS_RING_CTL);
+        ring_disabled = ctl_off & 1 == 0;
+    }
+
+    // (a) RESTORE THE RING REGISTERS TO THEIR CAPTURED ENTRY IMAGES — not to a blind zero — and
+    // only when we programmed them AND the ring is confirmed disabled. "Writing the Head Offset
+    // while the RB is enabled is UNDEFINED" (§1.1.11.2 p.76), so restoring START/HEAD/TAIL under a
+    // still-enabled ring would be the exact undefined poke the rung must avoid. On this machine the
+    // entry images are all 0x00000000 (the ring block reads dark), so this restores the register
+    // block to precisely the state firmware left, whatever it was. RING_CTL is written last.
+    let mut ring_regs_restored = !ring_programmed; // vacuously true if we never wrote them
+    if ring_programmed && ring_disabled {
+        wr(bar0, g7regs::RCS_RING_TAIL, ring_tail_pre);
+        wr(bar0, g7regs::RCS_RING_HEAD, ring_head_pre);
+        wr(bar0, g7regs::RCS_RING_START, ring_start_pre);
+        wr(bar0, g7regs::RCS_RING_CTL, ring_ctl_pre);
+        let s = rd(bar0, g7regs::RCS_RING_START);
+        let c = rd(bar0, g7regs::RCS_RING_CTL);
+        let h = rd(bar0, g7regs::RCS_RING_HEAD);
+        let t = rd(bar0, g7regs::RCS_RING_TAIL);
+        ring_regs_restored = s == ring_start_pre && c == ring_ctl_pre
+            && (h & RING_HEAD_OFF_MASK) == (ring_head_pre & RING_HEAD_OFF_MASK)
+            && t == ring_tail_pre;
+        serial_println!(
+            ":: gen7: r5 ring-restore start={:08X}/{:08X} ctl={:08X}/{:08X} head={:08X}/{:08X} tail={:08X}/{:08X} ok={} ::",
+            s, ring_start_pre, c, ring_ctl_pre, h, ring_head_pre, t, ring_tail_pre,
+            if ring_regs_restored { 1 } else { 0 }
+        );
+    }
+
+    // (b) DO NOT UNMAP UNDER A LIVE RING. Only restore the GGTT PTEs — the act that unmaps the two
+    // pages — when the ring is confirmed disabled. If the CTL=0 readback still shows enable set,
+    // the GT could still be fetching through the ring's GGTT mapping, so we LEAVE the PTEs claimed
+    // (the pages are leaked either way) and park loud. Unmapping a page a live engine may DMA is
+    // the corruption this whole rung is built to avoid.
+    let mut ptes_restored = false;
+    let mut ring_post = ring_slot_held;
+    let mut tgt_post_pte = tgt_slot_held;
+    let mut prev_post = prev_held;
+    let mut next_post = next_held;
+    let mut smear_post = false;
+    if ring_disabled {
+        wr(bar0, prev_off_g, base_img);
+        wr(bar0, ring_off, base_img);
+        wr(bar0, tgt_off, base_img);
+        wr(bar0, next_off_g, base_img);
+        ring_post = rd(bar0, ring_off);
+        tgt_post_pte = rd(bar0, tgt_off);
+        prev_post = rd(bar0, prev_off_g);
+        next_post = rd(bar0, next_off_g);
+        ptes_restored =
+            ring_post == base_img && tgt_post_pte == base_img && prev_post == base_img && next_post == base_img;
+        smear_post = prev_post != prev_pre || next_post != next_pre;
+    }
+    let restored = ring_disabled && ring_regs_restored && ptes_restored && !smear_post;
     serial_println!(
-        ":: gen7: r5 teardown restored={} ring_disabled={} ctl_off={:08X} ring_post={:08X} tgt_post={:08X} prev_post={:08X} next_post={:08X} base_img={:08X} smear_post={} leaked=2 note=pages-leaked-no-GGTT-TLB-invalidation-rung-exists-yet-per-R4b-rule ::",
+        ":: gen7: r5 teardown restored={} ring_disabled={} ring_idle={} drain_iters={} ctl_off={:08X} ring_regs_restored={} ptes_unmapped={} ring_post={:08X} tgt_post={:08X} prev_post={:08X} next_post={:08X} base_img={:08X} smear_post={} leaked=2 note=pages-leaked-no-GGTT-TLB-invalidation-rung-exists-yet-per-R4b-rule ::",
         if restored { 1 } else { 0 },
         if ring_disabled { 1 } else { 0 },
+        if ring_idle { 1 } else { 0 },
+        drain_iters,
         ctl_off,
+        if ring_regs_restored { 1 } else { 0 },
+        if ring_disabled { 1 } else { 0 },
         ring_post,
         tgt_post_pte,
         prev_post,
@@ -3163,14 +3350,27 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
     // deliberately fall out of scope without a `dealloc`; `layout` is dropped harmlessly.
     let _ = (ring_page, tgt_page, layout);
 
-    // MMIO writes, counted honestly (not a fabricated constant): 2 claim PTEs + 4 restore PTEs
-    // (target/ring + both neighbours) + 4 teardown ring-register zeros (CTL/TAIL/HEAD/START), and
-    // when the ring was armed, +6 for the arm (CTL=0, START, HEAD, TAIL, CTL=enable, TAIL=advance).
-    // Ring-page/target-page stores are CPU-memory writes, not MMIO, and are excluded — the same
-    // convention R4's `writes=` uses (it counts GGTT/register writes, not the scratch page).
-    let mmio_writes: u32 = 2 + 4 + 4 + if armed { 6 } else { 0 };
+    // MMIO writes, counted honestly from the actual conditional path (not a fixed constant):
+    //   2 claim PTEs (always, past the seed gate) + 5 arm-program writes (CTL0/START/HEAD/TAIL/
+    //   CTLen, when ring_programmed) + 1 tail advance (when armed) + 1 teardown CTL=0 (when
+    //   ring_programmed) + 4 ring-register restores (when ring_programmed && ring_disabled) + 4
+    //   PTE restores (when ring_disabled). Ring/target CPU stores are memory, not MMIO, and are
+    //   excluded — the convention R4's `writes=` uses.
+    let mut mmio_writes: u32 = 2;
+    if ring_programmed {
+        mmio_writes += 5 + 1; // program + teardown CTL=0
+    }
+    if armed {
+        mmio_writes += 1; // tail advance
+    }
+    if ring_programmed && ring_disabled {
+        mmio_writes += 4; // ring-register restore
+    }
+    if ring_disabled {
+        mmio_writes += 4; // PTE restore
+    }
     serial_println!(
-        ":: gen7: r5 verdict={} mode={} wake={} armed={} restored={} mmio_writes={} note=one-MI_STORE_DATA_IMM-ring-direct-ring-disabled-and-PTEs-restored-no-display-register-touched ::",
+        ":: gen7: r5 verdict={} mode={} wake={} armed={} restored={} mmio_writes={} note=one-MI_STORE_DATA_IMM-ring-direct-clflushed-ring-disabled-at-idle-and-registers+PTEs-restored-to-entry-images-no-display-register-touched ::",
         exec_verdict,
         mode,
         wake.name(),
@@ -3178,8 +3378,12 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
         if restored { 1 } else { 0 },
         mmio_writes
     );
-    serial_println!(
-        ":: gen7: r5 next={} note=first-executed-command-attempt-ring-torn-down-pages-leaked ::",
+    // A teardown that could not disable the ring is a SAFETY finding that overrides the exec
+    // reading — the PTEs are left claimed under a possibly-live engine, and that is what the next
+    // boot must act on first.
+    let next = if ring_programmed && !ring_disabled {
+        "STOP-ring-would-not-disable-PTEs-LEFT-CLAIMED-under-a-live-ring-do-NOT-reuse-these-pages-investigate-forcewake-hold"
+    } else {
         match exec_verdict {
             "sentinel-hit" =>
                 "R6-a-real-batch-buffer-MI_BATCH_BUFFER_START-and-a-PIPE_CONTROL-flush-the-GT-executes",
@@ -3187,11 +3391,17 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
                 "STOP-store-executed-but-head-did-not-retire-investigate-CS-arbitration-before-R6",
             "sentinel-miss" =>
                 "STOP-head-retired-but-no-store-check-privilege-and-MI_STORE_DATA_IMM-address-encoding",
+            "enable-void" =>
+                "STOP-RING_CTL-enable-did-not-latch-likely-forcewake-released-R6-must-hold-forcewake-and-rearm",
             "claim-write-void" =>
                 "STOP-GGTT-gated-with-well-released-R6-must-hold-forcewake-around-the-ring-arm",
             _ =>
                 "STOP-CS-did-not-parse-the-bare-ring-a-default-render-context-is-needed-first-per-1.1.11.4-p79",
         }
+    };
+    serial_println!(
+        ":: gen7: r5 next={} note=first-executed-command-attempt-ring-torn-down-pages-leaked ::",
+        next
     );
     serial_println!(":: gen7: r5 end ::");
 }
