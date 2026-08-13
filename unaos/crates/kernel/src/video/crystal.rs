@@ -263,6 +263,27 @@ static DISMISSES: AtomicU64 = AtomicU64::new(0);
 static PICKS: AtomicU64 = AtomicU64::new(0);
 static LAST_VERB: AtomicU8 = AtomicU8::new(0xFF);
 
+/// CLICK-BAND — what the LAST consumed press did, for the router's `band=menu` witness line: the
+/// router sees only `true` from [`press_at`], and a band line that could not say WHAT the band did
+/// would name the band and nothing else. Written by every consuming arm of [`press_at`], read by
+/// [`last_press_outcome`] immediately after the call on the same task — no cross-core reader.
+static PRESS_OUTCOME: AtomicU8 = AtomicU8::new(0);
+const OUT_OPEN: u8 = 1;
+const OUT_PICK: u8 = 2;
+const OUT_KEPT: u8 = 3;
+const OUT_DISMISS: u8 = 4;
+
+/// CLICK-BAND — the last consumed press's outcome, as the witness word.
+pub fn last_press_outcome() -> &'static str {
+    match PRESS_OUTCOME.load(Ordering::Relaxed) {
+        OUT_OPEN => "open",
+        OUT_PICK => "pick",
+        OUT_KEPT => "kept-open",
+        OUT_DISMISS => "dismiss",
+        _ => "none",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Geometry — the dropdown rect, and the row layout inside it
 // ---------------------------------------------------------------------------
@@ -311,6 +332,55 @@ pub fn open_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     }
     menu_rect(pw, ph)
 }
+
+/// MENU-DRIVE / REVIEW — **does the SHARD menu owe a paint or an erase that only a composite can
+/// discharge?** The third term in [`super::wm::composite`]'s "is anything OWED" tests, beside
+/// `any_damaged` (a dirty window) and `deferred_owed` (a queued erase box).
+///
+/// Two relaxed loads, no lock — the same shape and cost as `deferred_owed`, and for the same reason:
+/// it runs on the re-run loop and the lost-wakeup gate of every present, on every core.
+///
+/// ### The gap it closes, and why the in-place retry could not
+///
+/// [`open`]/[`dismiss`] flip `OPEN` and then call `wm::composite()` themselves, with one verified
+/// retry. That retry recovers the case where the FIRST pass declined but the holder released before
+/// the second — but if a holder keeps `COMP_GATE` for milliseconds (a `[wc-d] verify` on a witness
+/// build holds it over a second), BOTH the pass and its retry decline, `COMP_PENDING` is published,
+/// and the holder runs its re-run loop. That loop is the guaranteed painter for a dirty window or a
+/// queued erase — but an open menu is NEITHER, so before this term the loop's `if !dmg && !owed`
+/// broke and the menu stayed open-in-state, invisible on glass: the exact pre-fix Boot B signature
+/// (`crystal_press=open`, no `[crystal]` rollup), reachable by Boot B's own gesture — close the last
+/// window (that close is the gate holder), then immediately press the crystal.
+///
+/// The condition is the paint contract [`compose`] itself acts on, read the other way round:
+///  * **OPEN and the slot is EMPTY** — the dropdown is in state but not yet on the panel: a PAINT is
+///    owed.
+///  * **CLOSED and the slot is NON-EMPTY** — the dropdown was dismissed but its pixels are still on
+///    the panel: an ERASE is owed.
+/// Either way the next `compose` discharges it; this makes the gate holder run that `compose`.
+pub fn paint_owed() -> bool {
+    let open = OPEN.load(Ordering::Relaxed);
+    let owns_pixels = SLOT.packed() != 0;
+    open != owns_pixels
+}
+
+/// MENU-DRIVE / REVIEW — count a composite the gate holder ran ONLY because the SHARD menu owed a
+/// paint or erase, and name the first one on the wire. The `wcg::erase_wakeup_rescue` precedent: a
+/// rescue is the mechanism working (not a FORBID), but it must be shown REACHABLE — a boot with
+/// `menu_rescues=0` never exercised the holder-paints-the-menu path, and one with `>0` is a boot
+/// where the pre-fix in-place retry would have stranded the menu.
+#[cfg(feature = "witness")]
+static MENU_RESCUES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")]
+pub fn menu_wakeup_rescue() {
+    let n = MENU_RESCUES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 {
+        serial_println!("[crystal] rollup scope=wakeup menu_rescues={} -> RESCUED", n);
+    }
+}
+#[cfg(not(feature = "witness"))]
+#[inline]
+pub fn menu_wakeup_rescue() {}
 
 /// The top of row `idx` as an offset from the menu's top edge, in px — border plus every earlier row.
 fn row_top(idx: usize) -> usize {
@@ -375,6 +445,26 @@ fn open(pw: usize, ph: usize) {
         ":: SHARD-MENU: crystal_press=open menu={}x{}+{}+{} items={} ::",
         mw, mh, mx, my, ITEM_COUNT
     );
+    // MENU-DRIVE (GR27 Boot B) — **an open menu must DRIVE the pass that paints it.** [`compose`]
+    // runs only from `wm::composite_once`'s strip tail, and every OTHER state-changing gesture
+    // (close, drag, zoom, minimise, a dock raise) runs a composite itself — this one did not. On the
+    // emptied late-boot desktop nothing else composites (the render lane blocks on its channel; the
+    // backdrop's timer flush carries no damage; `service_damage` returns with no damaged row), so
+    // the operator's crystal presses opened the menu IN STATE while the glass never changed: Boot B
+    // shows `crystal_press=open` at 300194 ms with no `[crystal]`/`[menubar]`/`[dock]` rollup for
+    // the following 30 s — zero passes, an invisible menu, "the crystal ignores clicks". Task
+    // context only (the click router and the fixtures), so the composite is taken directly.
+    super::wm::composite();
+    // BELT-AND-BRACES retry. The x86 gate may DECLINE this pass into a concurrent holder; the
+    // GUARANTEED painter is that holder, whose re-run loop and lost-wakeup gate now test
+    // [`paint_owed`] ([`super::wm::menu_paint_owed`]) alongside window damage and the erase queue —
+    // so a menu the holder held the gate through (a `[wc-d] verify` holds it over a second) is
+    // painted by the holder on release, not stranded. This immediate retry closes only the narrow
+    // window where the first pass declined but the holder has ALREADY released — cheaper than
+    // waiting for the holder's loop when no one is holding. The slot confirms the paint LANDED.
+    if SLOT.packed() == 0 {
+        super::wm::composite();
+    }
 }
 
 /// Dismiss the menu. Idempotent. The next [`compose`] erases whatever rect the dropdown owned — the
@@ -387,6 +477,19 @@ fn dismiss(reason: &str) {
     }
     DISMISSES.fetch_add(1, Ordering::Relaxed);
     serial_println!(":: SHARD-MENU: crystal_press=dismiss reason={} ::", reason);
+    // MENU-DRIVE — the mirrored half of [`open`]'s rule: the erase ([`compose`]'s closed path, which
+    // also hands the vacated rows back through [`repaint_vacated`]) runs only from a composite, and
+    // on a static desktop no other pass is coming — an on-glass dropdown would outlive its Escape.
+    // Every caller is task context (the click router, the Escape arm, `set_enabled(false)`, the
+    // fixtures); a dismiss of a menu that never painted erases nothing (the slot is clear) and the
+    // pass is one bounded walk.
+    super::wm::composite();
+    // BELT-AND-BRACES retry — the mirror of [`open`]: [`paint_owed`] reports `!OPEN && SLOT!=0` as
+    // an owed ERASE, so the gate holder discharges a declined dismiss too; this closes only the
+    // already-released window. The slot is non-zero exactly while an erase is owed.
+    if SLOT.packed() != 0 {
+        super::wm::composite();
+    }
 }
 
 /// **Public dismissal**, for [`super::menubar::set_enabled`]: turning the bar off must tear the menu
@@ -470,6 +573,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
                     Some(verb) => {
                         PICKS.fetch_add(1, Ordering::Relaxed);
                         LAST_VERB.store(verb.ord(), Ordering::Relaxed);
+                        PRESS_OUTCOME.store(OUT_PICK, Ordering::Relaxed);
                         serial_println!(
                             ":: SHARD-MENU: crystal_pick verb={} action={} ::",
                             verb.name(),
@@ -481,11 +585,15 @@ pub fn press_at(x: i32, y: i32) -> bool {
                     }
                     // Inside the menu but not on an item (separator / border / padding): swallow the
                     // press and keep the menu open, as a real menu does.
-                    None => true,
+                    None => {
+                        PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed);
+                        true
+                    }
                 };
             }
         }
         // A press anywhere outside the open menu dismisses it, and the click is spent doing so.
+        PRESS_OUTCOME.store(OUT_DISMISS, Ordering::Relaxed);
         dismiss("outside");
         return true;
     }
@@ -493,6 +601,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     // Closed: the only press we own is one on the crystal box itself.
     if let Some((cx, cy, cw, ch)) = menubar::crystal_box_abs(pw, ph) {
         if px >= cx && px < cx + cw && py >= cy && py < cy + ch {
+            PRESS_OUTCOME.store(OUT_OPEN, Ordering::Relaxed);
             open(pw, ph);
             return true;
         }

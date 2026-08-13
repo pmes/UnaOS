@@ -434,6 +434,24 @@ static LEDGER: strip::Ledger = strip::Ledger::new();
 static PRESSES_N: AtomicU64 = AtomicU64::new(0);
 static RAISES: AtomicU64 = AtomicU64::new(0);
 static UNHIDES: AtomicU64 = AtomicU64::new(0);
+
+/// CLICK-BAND — what the LAST consumed press did, for the router's `band=dock` witness line (the
+/// crystal's `PRESS_OUTCOME` twin; see `crystal.rs`). Written by every consuming arm of
+/// [`press_at`], read by [`last_press_outcome`] immediately after the call on the same task.
+static PRESS_OUTCOME: AtomicU64 = AtomicU64::new(0);
+const DOCK_OUT_BACKGROUND: u64 = 1;
+const DOCK_OUT_REOPEN: u64 = 2;
+const DOCK_OUT_RAISE: u64 = 3;
+
+/// CLICK-BAND — the last consumed press's outcome, as the witness word.
+pub fn last_press_outcome() -> &'static str {
+    match PRESS_OUTCOME.load(Ordering::Relaxed) {
+        DOCK_OUT_BACKGROUND => "background",
+        DOCK_OUT_REOPEN => "shell-reopen",
+        DOCK_OUT_RAISE => "raise",
+        _ => "none",
+    }
+}
 /// WCK5 — **passes in which a window had painted over the strip.** The repaint this arc is removing.
 ///
 /// `paints` conflates the two damage conditions: a MODEL change (a window opened, closed, was renamed
@@ -774,6 +792,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     }
     PRESSES_N.fetch_add(1, Ordering::Relaxed);
     let Some(t) = l.tile_at(px, py) else {
+        PRESS_OUTCOME.store(DOCK_OUT_BACKGROUND, Ordering::Relaxed);
         serial_println!("[dock] press at ({},{}) -> strip tiles={} raised=none", x, y, n);
         return true; // the dock's own background: consumed, raises nothing.
     };
@@ -783,6 +802,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     // the one place a reopen can rebind them), and consume the press. Focus hand-back
     // (`user_input_set_active(0)`) happens at the reopen itself, keyed to the NEW window.
     if r.id == SHELL_PIN_ID {
+        PRESS_OUTCOME.store(DOCK_OUT_REOPEN, Ordering::Relaxed);
         SHELL_REOPEN.store(true, Ordering::Release);
         serial_println!(
             "[dock] press at ({},{}) tile={}/{} shell=pin -> reopen requested",
@@ -790,6 +810,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
         );
         return true;
     }
+    PRESS_OUTCOME.store(DOCK_OUT_RAISE, Ordering::Relaxed);
     let was_hidden = !r.visible;
     PRESSED.store(r.id, Ordering::Release);
     if crate::video::wm::is_kernel_owner(r.owner_asid) {

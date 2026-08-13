@@ -3681,7 +3681,13 @@ pub fn composite() {
         while !masked && rounds < COMP_RERUN_MAX && COMP_PENDING.swap(false, AcqRel) {
             let dmg = any_damaged();
             let owed = deferred_owed();
-            if !dmg && !owed {
+            // MENU-DRIVE / REVIEW — the SHARD menu is a third thing a declined pass can owe, and one
+            // `any_damaged`/`deferred_owed` structurally cannot see (an open menu is no row and no
+            // queued box). Without it this loop's `!dmg && !owed` break stranded an open-in-state
+            // menu; with it the gate holder is the guaranteed painter and the crystal arc's in-place
+            // retry is belt-and-braces. `deferred_owed`'s cost and shape.
+            let menu = menu_paint_owed();
+            if !dmg && !owed && !menu {
                 break; // the decliner's damage was already absorbed by the round above
             }
             // WC-K2r — a pass taken ONLY because the erase queue was non-empty. Counted because the
@@ -3691,6 +3697,13 @@ pub fn composite() {
             #[cfg(feature = "witness")]
             if !dmg && owed {
                 super::wcg::erase_wakeup_rescue();
+            }
+            // MENU-DRIVE / REVIEW — the same rescue accounting for the menu term: a pass the holder
+            // ran ONLY because the menu owed a paint/erase. `menu` (not `!dmg && !owed && menu`) so a
+            // pass that carries a menu paint alongside window damage still records the menu was owed.
+            #[cfg(all(feature = "witness", feature = "wc"))]
+            if menu {
+                super::crystal::menu_wakeup_rescue();
             }
             rounds += 1;
             #[cfg(feature = "witness")]
@@ -3715,13 +3728,23 @@ pub fn composite() {
             if COMP_PENDING.swap(false, AcqRel) {
                 let dmg = any_damaged();
                 let owed = deferred_owed();
-                if dmg || owed {
+                // MENU-DRIVE / REVIEW — the menu term on the lost-wakeup gate too. A fix applied to
+                // only the loop above would leave the strand on the rarer path — and it is the one a
+                // STATIC desktop takes: the close-the-last-window gesture publishes `COMP_PENDING`
+                // after the loop's last `swap` exactly when there is no window left to make `dmg`
+                // true, which is Boot B's own sequence.
+                let menu = menu_paint_owed();
+                if dmg || owed || menu {
                     // WC-K2r — same rescue count, same reason; this is the other gate that consumes
                     // the wakeup, and a fix applied to only one of them would leave the defect on the
                     // rarer path, which is the one a static desktop actually takes.
                     #[cfg(feature = "witness")]
                     if !dmg && owed {
                         super::wcg::erase_wakeup_rescue();
+                    }
+                    #[cfg(all(feature = "witness", feature = "wc"))]
+                    if menu {
+                        super::crystal::menu_wakeup_rescue();
                     }
                     #[cfg(feature = "witness")]
                     WCSER_RERUNS.fetch_add(1, Relaxed);
@@ -3758,6 +3781,25 @@ fn any_damaged() -> bool {
 #[cfg(target_arch = "x86_64")]
 fn deferred_owed() -> bool {
     DEFER_N.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// MENU-DRIVE / REVIEW — is the SHARD dropdown owed a paint or an erase? The THIRD term in the "is
+/// anything OWED" tests, beside [`any_damaged`] and [`deferred_owed`]. The open menu is neither a
+/// dirty window nor a queued erase box, so without this term the gate holder's re-run loop would
+/// break on `!dmg && !owed` and strand an open-in-state menu with nothing committed to painting it
+/// — the exact residual the crystal arc's in-place retry could not close when a holder keeps the
+/// gate for milliseconds. `feature = "wc"` only, where the crystal (and this hazard) exist; a
+/// no-`wc` build has no menu and answers `false` on a bare load.
+#[cfg(target_arch = "x86_64")]
+fn menu_paint_owed() -> bool {
+    #[cfg(feature = "wc")]
+    {
+        super::crystal::paint_owed()
+    }
+    #[cfg(not(feature = "wc"))]
+    {
+        false
+    }
 }
 
 fn composite_once() {

@@ -1304,9 +1304,11 @@ FORBID \[drag-occ\] .* bars=0/[0-9] bar=[1-9]
 
 # --- STRIPFACTOR: THE MENU BAR IS ABSENT BY DEFAULT, AND SAYS SO -------------------------------
 # --- `video/menubar.rs` is tenant #2 of the strip primitive and exists this arc to PROVE the
-# --- primitive is generic — a one-tenant registry proves nothing. It is inert chrome (no press
-# --- seam: `press=inert` is on the line so a dead press is not read as a routing defect) and it is
-# --- off unless something enables it at runtime.
+# --- primitive is generic — a one-tenant registry proves nothing. Its ONE press target is the
+# --- crystal (`press=crystal` on the line — the SHARD menu's box, routed by the click router's
+# --- menu-band arm; the term read `press=inert` before `video/crystal.rs` existed, and the stale
+# --- word was mis-read in GR27 as a routing latch-off) and the bar is off unless something enables
+# --- it at runtime.
 # ---
 # --- Six fields are load-bearing and all six are pinned on the PASS line, which already ANDs them:
 # ---   * `default_off=true`  — the ARTIFACT ships with the bar off. SHELLDESK moved this from a live
@@ -1326,10 +1328,10 @@ FORBID \[drag-occ\] .* bars=0/[0-9] bar=[1-9]
 # ---   * `crystal_ok=true`   — the brand CRYSTAL (Peter, "instead of an apple do a small crystal")
 # ---     is drawn at `crystal=WxH+X+Y` and sits wholly inside the bar, left of the title. A brand
 # ---     mark that could not be shown drawn would be unfalsifiable; this pins that it IS. The crystal
-# ---     is INERT this arc (part of the bar's `press=inert`); a crystal MENU is a later arc.
+# ---     carries the SHARD menu (`video/crystal.rs`), whose own fixture prints `:: CRYSTAL-MENU:`.
 # --- `clock=` is NOT pinned: it reads `unsynced` on a QEMU boot with no SNTP and `set` on one with
 # --- a civil anchor, and both are correct. Pinning it would red the gate on network configuration.
-REQUIRE :: MENUBAR: .* press=inert default_off=true clip_clean=true flush=true member=true floor=true/true dismissed=true crystal_ok=true :: PASS ::
+REQUIRE :: MENUBAR: .* press=crystal default_off=true clip_clean=true flush=true member=true floor=true/true dismissed=true crystal_ok=true :: PASS ::
 FORBID :: MENUBAR: .* :: FAIL ::
 
 # --- CONSOLEWIN: THE CONSOLE'S WAY BACK, PINNED ON THE ARCH THAT HAS A CONSOLE ------------------
@@ -1358,3 +1360,14 @@ FORBID :: MENUBAR: .* :: FAIL ::
 # --- the line reds this rule instead of silently narrowing what it asserts.
 REQUIRE :: DOCK: strip tiles=.* model=true geom=true restore=true specific=true miss=true vacate=true furniture park=parked/true :: PASS ::
 FORBID :: DOCK: .* :: FAIL ::
+
+# --- CLICK-BAND: A CONSUMED FURNITURE PRESS SAYS SO ON THE ROUTER'S OWN WITNESS ------------------
+# --- GR27 Boot B: presses the crystal/dock arms consumed left NO `[clickroute]` row, so a band
+# --- press was indistinguishable on the wire from a press that never reached the router — the
+# --- mis-read the "menubar press inert" round was built on. `clickband_selftest` drives the LIVE
+# --- router (`wc_click_route_at`, not the `press_at` seams the other fixtures call directly) at the
+# --- crystal, at a point outside the open menu, and at the dock strip, and asserts one bounded
+# --- `band=` line per consumed press. `band_lines=3` is pinned: the count of lines OWED, so the
+# --- claim holds past the serial budget.
+REQUIRE :: CLICK-BAND: routed menu=true\(open\) outside=true\(dismiss\) dock=true\(.*\) band_lines=3 :: PASS ::
+FORBID :: CLICK-BAND: .* :: FAIL ::

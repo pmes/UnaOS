@@ -2024,7 +2024,10 @@ what is above the shell, and the shell owns the middle of the desktop layer** �
 extent published by one accessor that every other writer reads.
 
 The bar is CLICKABLE as well as visible: `wc_click_route_at` judges `crystal::press_at` ahead of the
-dock and every window arm, so the SHARD menu opens from the mark. The bar itself remains `press=inert`.
+dock and every window arm, so the SHARD menu opens from the mark. The bar's witness term is
+`press=crystal` — the crystal is its one press target. (Captures from before the SHARD-menu arc carry
+the older `press=inert`; a spec rule and the capture it grades must travel together, because the term
+tracks the code, not the boot.)
 
 **What this arc did NOT do, deliberately.** The FACADE ledger's entry 2 — dropping the
 `is_kernel_owner && z != PARKED_Z` arm from `above_shell` and the matching furniture branch in
@@ -11236,9 +11239,14 @@ console's only way back and the bar is a convenience) and `FLOOR_W = 4*PAD + CRY
 this boot; a bar showing `00:00` or `--:--` would be furniture asserting a fact it does not have, so
 nothing is drawn and the witness says `clock=unsynced`. It is UTC — the kernel carries no timezone.
 
-**It is inert.** No press seam is registered, so a press — the crystal included — falls through to
-whatever is behind it, and `press=inert` is on the witness line so a dead press is not misread as a
-routing defect.
+**Its one press target is the crystal.** The bar registers no press seam of its own, but the SHARD
+menu (`video/crystal.rs`) claims the crystal box through the click router's menu-band arm, so the
+witness term is `press=crystal`; every other point on the bar falls through to whatever is behind it.
+The term read `press=inert` in the arc that landed the bar as pure chrome, before the crystal carried
+a menu; the word was mis-read in GR27 as "press routing latched off" during an investigation whose
+real defect was that an open menu did not drive its own composite — the witness term must track the
+code it names, so it now reads `press=crystal`. Captures from before the SHARD-menu arc still carry
+`press=inert`, so a spec rule and the capture it grades must travel together.
 
 ### The brand crystal — UnaOS's mark, where macOS puts its apple
 
@@ -11257,8 +11265,8 @@ and two facet lines, dense and minimal, all integer arithmetic (the disc/knurl i
 
 The title shifts right to `TITLE_X0 = PAD + CRYSTAL_W + PAD`, as macOS puts its app menus to the right
 of the logo. The crystal appears only when the bar is enabled (it is part of the default-off tenant),
-and it is **inert this arc** — part of the bar's `press=inert`; a crystal MENU (a press on the mark)
-is a later arc.
+and it is the bar's one press target — a press on the mark opens the SHARD menu (`video/crystal.rs`),
+which is what the bar's `press=crystal` term names.
 
 Witness: the fixture's leg 7 asserts `crystal=WxH+X+Y` sits wholly inside the bar, left of the title,
 at the compiled size — a mark that could not be shown drawn would be unfalsifiable. `crystal_ok=true`
@@ -11279,9 +11287,9 @@ rollup as `crystal=16x22`. On glass the silhouette renders:
 ### Witness, and the fault injection that caught a vacuous leg
 
 ```
-:: MENUBAR: bar=1280x34+0+0 panel=1280x800 floor=144x110 strips=0->1 owned=0x220500 clock=unsynced
-   initial=false press=inert default_off=true clip_clean=true flush=true member=true
-   floor=true/true dismissed=true :: PASS ::
+:: MENUBAR: bar=1280x34+0+0 panel=1280x800 floor=160x110 strips=1->2 owned=0x220500 clock=unsynced
+   crystal=16x22+12+6 initial=false press=crystal default_off=true clip_clean=true flush=true
+   member=true floor=true/true dismissed=true crystal_ok=true :: PASS ::
 [drag-occ] … clipn=3 dock=340x52+470+736 bars=1/2 bar=0 fillclip_dock_px=0 -> CLEAN
 ```
 
@@ -11303,8 +11311,8 @@ The leg now observes the flag **before anything in the fixture mutates it**, and
 as `initial=`. Re-run under the same injected defect, three legs fire and the harness reds the run:
 
 ```
-:: MENUBAR: … initial=true press=inert default_off=false clip_clean=false flush=true member=false
-   floor=true/true dismissed=true :: FAIL ::
+:: MENUBAR: … initial=true press=crystal default_off=false clip_clean=false flush=true member=false
+   floor=true/true dismissed=true crystal_ok=true :: FAIL ::
 ```
 
 That injection also proved the registry→clip path is live rather than decorative: `clipn` went 3 → 4
@@ -11437,8 +11445,9 @@ the protocol cannot be proven working without a bar drawing it, it was not rende
 
 ## CRYSTAL MENU — the SHARD menu, UnaOS's first LIVE menu (x86, 2026-08-11)
 
-`video/crystal.rs`. The crystal landed **inert** (a press on the mark fell through — `press=inert`);
-this arc makes it live. Clicking the crystal opens a dropdown, an item picks, an action fires. It is
+`video/crystal.rs`. The crystal first landed **inert** (a press on the mark fell through — the bar's
+term was `press=inert`); this arc makes it live, and the bar's term is now `press=crystal`. Clicking
+the crystal opens a dropdown, an item picks, an action fires. It is
 **not** the MENUP protocol above: that is the renderer-agnostic path an *app* publishes into, a larger
 later arc. This is the **system** menu — the one macOS hangs off its apple — and it is **kernel-owned
 end to end**: no app publishes it, no principal but the kernel authors it, and the items act on the
