@@ -13361,10 +13361,7 @@ fn click_owner_is_fullscreen(asid: u64) -> bool {
 /// effect, not a side effect — it is the same z-order move `TAB`-to-shell has always made, and the
 /// same one FOCUS-VIS's "shell" leg asserts.
 ///
-/// The press itself is still CONSUMED (target [`CLICK_TARGET_DROP`], so the release is dropped with
-/// it). Focus moved; the click is not re-addressed to the console after the fact, because a
-/// press/release pair must not be split and the shell's `click1_dispatch` never saw the press edge.
-/// The operator's NEXT click is an ordinary shell click on the shell's own path.
+/// The press itself is still CONSUMED (target [`CLICK_TARGET_DROP`], so the release is dropped with it). Focus moved; the click is not re-addressed to the console after the fact, because a press/release pair must not be split and the shell's `click1_dispatch` never saw the press edge. The operator's NEXT click is an ordinary shell click on the shell's own path.
 ///
 /// ### CLICK-PLAIN — a FOCUS-CHANGING press is DELIVERED, after the focus moves (P75, bench)
 /// CLICK-SWALLOW (P73) consumed the focus-changing press instead of delivering it, on the rule "an app
@@ -13516,6 +13513,8 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 }
                 true
             }
+            // DRAG-PI M3 — CHROME (title strip / border) is judged AFTER the three controls and BEFORE every app arm, exactly as the x86 twin orders it: a press on kernel-drawn chrome is an instruction to the WINDOW SYSTEM and is consumed here, a press on content is the app's input and falls through. Neither starves the other — `chrome_hit` is `outer_box` MINUS `content_box`, a region the app's surface does not cover a pixel of, and it declines COMPAT rows so a full-screen app keeps its whole panel. FURNITURE follows x86's rule rather than inventing a Pi one: a kernel-band row (the console) IS draggable — its title bar is a grip like any other — but the KEYBOARD goes to the shell, because there is no ring behind a kernel owner to hand it to. `drag_begin` self-guards on `title_bar_hit`, so a press on a BORDER raises and consumes without minting a grab the geometry does not support; the gesture is steered by `wm::drag_route_tail` from the two drains and ended by the release edge below. The click grammar is untouched: this arm SELECTS and grabs, it stops nothing and starts nothing. ⚠ ONE-LINE shape and long prose are not style — this file is compiled into the knob-off `kernel8.img` and a line ADDED anywhere in it breaks that image's byte-identity proof (panic `Location` records embed line numbers), so this arm is 2 lines paid for by 2 removed below; the diff is line-NEUTRAL and must stay so.
+            #[cfg(feature = "pidesk")] Some((win, owner, _z)) if crate::video::wm::chrome_hit(win, x, y) => { if crate::video::wm::is_kernel_owner(owner) { user_input_set_active(0); } else if owner != cur { user_input_set_active(owner); } crate::video::wm::focus_changed(owner); let how = if crate::video::wm::drag_begin(win, x, y) { "drag" } else { "chrome" }; if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX { serial_println!("[clickroute] press chrome win={} owner={} at ({},{}) -> {}", win, owner, x, y, how); } CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true }
             Some((win, owner, _z)) if owner != cur => {
                 // The ONLY line this arc adds to serial, and only on the arm that changes behaviour:
                 // a click that MOVED focus. Human-rate by construction (one line per click that lands
@@ -13564,6 +13563,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
     } else if prev & !mask != 0 {
         // RELEASE edge — follow the press, or drop. Never hit-tested: the release belongs to whoever
         // received the press, not to whatever the pointer has since been dragged over.
+        #[cfg(feature = "pidesk")] if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_end(); } // DRAG-PI M3 — the button coming up ENDS the grab, and this is the primary end: it carries the delivered edge, so the window rests where the operator let go and `[drag]`/`[wm-act] drag-end` name the gesture's cost and outcome on the wire exactly as they do on x86. No belt against a LOST release here (x86's `release-level` tail exists for an EHCI endpoint that can supersede a report before it is read); the Pi's xHCI drain has not shown that loss, and inventing a second ending for a failure this arch has not demonstrated would be machinery with no evidence behind it. `drag_forget` still cancels on close, so a grab cannot outlive its window.
         let target = CLICK_PRESS_TARGET.load(Ordering::Acquire);
         target == CLICK_TARGET_DROP || target != cur
     } else {
@@ -14502,13 +14502,13 @@ fn wcb_launcher(_demo_cpu: usize) {
     // restores SHELL_Z/FOCUS_ASID, repaints), so nothing after it sees a changed table.
     #[cfg(feature = "witness")]
     crate::video::wm::hittest_selftest();
-    // CTRLWIT: the control-cluster DECLINE witness, right after the hit-test battery — it is the
-    // same shape of fixture (mints synthetic rows, reaps them, restores the panel) and it must run
-    // after every per-window one-shot above has been claimed, or its three probe rows would burn
-    // latches the arc's real windows are owed. It re-pins its rows at scale 1 so its verdict is a
-    // property of the compositor and not of the panel it happens to be running on.
+    // CTRLWIT: the control-cluster DECLINE witness, right after the hit-test battery — it is the same shape of fixture (mints synthetic rows, reaps them, restores the panel) and it must run after every per-window one-shot above has been claimed, or its three probe rows would burn latches the arc's real windows are owed. It re-pins its rows at scale 1 so its verdict is a property of the compositor and not of the panel it happens to be running on.
     #[cfg(feature = "witness")]
     crate::video::wm::ctrldecline_selftest();
+    // DRAG-PI M4: the drag COST witness, after the control battery for the same reason it sits after
+    // the hit-test one — it mints a row, drives it edge to edge twice and reaps it, so it must not run while another fixture's one-shots are still owed. It restores nothing because it takes nothing: `move_to` on its own row, and a grab it cancels itself.
+    #[cfg(all(feature = "witness", feature = "pidesk"))]
+    crate::video::wm::dragperf_selftest();
     // PAPER: the kit texture's determinism fixture, LAST — it neither mints a window nor reads the
     // panel, so it perturbs nothing above it, and its only side effect is generating the one tile
     // (which emits the unconditional `[paper]` wire line naming the checksum the verdict asserts).

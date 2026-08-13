@@ -12447,3 +12447,132 @@ originates there. `wm.rs` was held line-neutral regardless, because that file is
 | knob-off `./arroyo kernel8-test 210` | MBENCH **PASS 108/108**, 0 forbidden, 15413 lines |
 | knob-off `./arroyo kernel8` | sha256 `34a9c533…` — byte-identical to the `c28ef0d2` baseline |
 | armed `./arroyo kernel8` | sha256 `5c858c93…`; `chrome-truth` x5, `keyline_top`, `bevel_light`, `title_top`, `title_bot`, `face_left`, `title_grad`, `ceramic_pp`, `knurl_pp`, `paper_pp`, `paper_on`, `NOCLEAR` all present; **zero** `chrome-truth` strings in the knob-off image |
+
+---
+
+## DRAG-PI — the Pi 4 title-bar drag
+
+Peter, attended: *"I can barely drag a window across the screen."* The arc that answered it began by
+convicting the path, and the conviction was not the expected one.
+
+### The finding: there was no drag path on aarch64
+
+The brief assumed a slow drag — pointer report, router, drag state, `move_to` per delta. The middle
+link did not exist. Evidence, static and behavioural:
+
+* `wm::drag_begin` had exactly **one** caller in the tree, `arch/x86_64/syscall.rs`.
+* `wc_route_tail` (which steers a live grab) was called only under `#[cfg(target_arch = "x86_64")]`.
+* aarch64's `wc_click_route` returns early on any non-`Button` event, so `Event::Mouse` never reached
+  it at all; its press arms were furniture, close, minimise, zoom, raise-and-deliver, deliver and
+  desktop-miss — and no chrome arm. `arch/aarch64/syscall.rs` contained the substring `drag` zero
+  times.
+* The bench capture `pa38-freeze.log` (1920x1200, PIDESK, witness live — 478 `[comp2]` rollups) holds
+  **83** `[piusb24]` pointer lines and **zero** `[drag]` lines; the only `[wm-act]` verb in the whole
+  capture is `park`.
+
+So a title-bar press raised and focused the window and delivered the press to the app. The window
+never followed the hand. The defect was an absent feature, not a slow one.
+
+### What the cost would have been, and was
+
+Wiring the arm naively would have reproduced the reported symptom, because `move_to_inner` ended in
+an unconditional `screen::request_full_present()` — which sets the desktop damage set to the whole
+panel (`screen::mark_full`). At bench geometry that is 1920x1200x4 = **9 216 000 bytes per
+reposition**, against a `[comp2]` steady pass of `blit_us=2223 bytes_pp=1082253` — an 8.5x multiple
+of a step that was already the dominant cost. At a 125 Hz pointer with no pacing, ~2.4x
+oversubscribed against the 8 ms report period.
+
+### The three pieces, landed together
+
+| piece | where | what |
+|---|---|---|
+| **M1** extent | `video/screen.rs`, `video/wm.rs` | `request_present_rect` — the rect-scoped twin of `request_full_present`. The move path asks for (old box ∪ new box) instead of the panel. |
+| **M2** coalescing | `video/wm.rs` | `DRAG_MOTION_MS = 16` + `drag_motion_paced` — one reposition per frame period, consuming the latest position. |
+| **M3** the arm | `arch/aarch64/syscall.rs`, `main.rs` | chrome arm in `wc_click_route`; release edge ends the grab; `wm::drag_route_tail` steers from both drains. |
+| **M4** witness | `video/wm.rs` | `dragperf_selftest` — `[dragperf]`, the cost measured on the wire. |
+
+**M1's argument, stated because it is exact rather than heuristic.** A move changes desktop pixels
+only inside (old box ∪ new box): outside that union the function touches nothing — the row's origin
+is the only mutation, `erase` defers fills strictly inside `old - new`, and `damage_intersecting`
+reaches only rows overlapping the old box. So a present covering both boxes discharges exactly the
+duty the whole-panel one discharged. It is taken for **every** move including `SYS_WIN_MOVE`, since
+the argument is about extent and not about who asked.
+
+**The queue merges, it does not escalate.** The first cut escalated to a whole-panel request when the
+rect queue filled, which reads safe and is not: the queue drains only when the render task presents,
+and on an idle desktop that floor is the 1 Hz strip tick. M4 caught it on its first run — `reqs=96`
+for 24 moves, `px_per_move` of four whole panels, the narrowing inverted into a pessimisation exactly
+when it mattered. `request_present_rect` now unions, mirroring `DamageSet::add`; worst case is a
+loose superset, which is still a window rather than a panel.
+
+**M2 is coalescing, not throttling.** Nothing is dropped: every report still moves `pal::cursor`, and
+`drag_motion` reads the *current* cursor, so a declined pass costs the gesture nothing — the next
+admitted one moves the window to where the hand has since got to. `DRAG_MOTION_MS` lives in `wm.rs`
+with the argument attached; x86 keeps its own numerically-identical constant because its pacing is
+interleaved with the DRAGREL/DRAGSETTLE/DRAGGLIDE release-level belt, and that file is another lane's.
+
+**Furniture follows x86 rather than inventing a Pi rule:** a kernel-band row (the console) *is*
+draggable — its title bar is a grip like any other — but the keyboard goes to the shell, because
+there is no ring behind a kernel owner. `drag_begin` self-guards on `title_bar_hit`, so a press on a
+*border* raises and consumes without minting a grab the geometry does not support.
+
+### The numbers, measured
+
+`[dragperf]` reports the desktop repaint extent a reposition asks for. The `rects` side is measured
+at the shipped `move_to_inner` call site across a real edge-to-edge sweep; the `whole` side is
+labelled *analytic* on the wire because it is an identity, not a measurement — `request_full_present`
+set the damage to `{0, 0, width, height}`, one panel, by definition.
+
+| geometry | old (per move) | new (per move) | ratio |
+|---|---|---|---|
+| QEMU 640x480, box 330x60 | 307 200 px | **39 600 px** | 7.7x |
+| bench 1920x1200, box 650x76 | 2 304 000 px | **98 800 px** | 23.3x |
+
+39 600 = 2 x (330x60) and 98 800 = 2 x (650x76) — exactly the old box plus the new one, which is the
+mechanism reading back verbatim.
+
+The fixture's box is a thin one, so its ratio flatters the change. For a bench-*typical* window the
+same capture's `[comp2] box_px_pp` reads ~251 488–260 074 px, which puts the honest bench figure at
+2 304 000 / (2 x ~260 000) ≈ **4.4x** worst case, and ~8.8x once the queue's union folds the ~99%
+overlap of consecutive drag steps into one rect — which is where the original 8.5x projection landed.
+
+Pacer, driven at the bench's own 125 Hz for a 320 ms span: **admitted=20, coalesced=20** — 40 reports
+became 20 repositions, exactly `320 / DRAG_MOTION_MS`.
+
+Router arm, driven through the shipped `wc_click_route` with a real Button edge at the real cursor
+(the CLICK-PLAIN discipline — move the window under the pointer, never the pointer):
+
+```
+[clickroute] press chrome win=1 owner=3392 at (960,600) -> drag
+[dragperf] router press=chrome grabbed=true released=true -> PASS
+[drag] win=1 owner=0xd40 end=dragperf moves=19 composites=19 erase_rects=19 erase_px=5624
+       erase_px_pm=296 box_px_pm=49400 flash_px=0 admitted=19 coalesced=19 -> ONCE
+```
+
+`flash_px=0 -> ONCE` is DRAGFLICK's own verdict surviving the change: the narrowing did not cost the
+erase its extent discipline.
+
+### Gate
+
+`[dragperf]` is registered as a **FORBID** on the FAIL direction, not a REQUIRE. The fixture is
+`pidesk`-gated, so its line is present on the armed battery and absent from the knob-off one; a
+REQUIRE would red the knob-off gate for doing exactly what it should. The verdict is a conjunction —
+the move path must ask for strictly less than a panel AND the pacer must have folded reports — so
+either half regressing prints FAIL and reds the armed gate. The required count is unchanged at 108 on
+both batteries.
+
+| leg | result |
+|---|---|
+| `./arroyo check` | green (both arches, all cfg legs) |
+| `UNAOS_WC=1 ./arroyo check` | green (`wm.rs` was touched — video law) |
+| `UNAOS_PIDESK=1 ./arroyo kernel8-test 300` | MBENCH **PASS 108/108**, 0 forbidden, 27 077 lines |
+| bench geometry `UNAOS_FBW=1920 UNAOS_FBH=1200` | MBENCH **PASS 108/108**, 0 forbidden |
+| knob-off `./arroyo kernel8-test 210` | MBENCH **PASS 108/108**, 0 forbidden |
+
+**Byte identity is deliberately NOT claimed for this arc, and the reason is the arc.** M1 and M2 are
+unconditional improvements to `wm.rs`/`screen.rs` — the narrowing applies to every move on every
+arch, `SYS_WIN_MOVE` included — so the knob-off image legitimately moves. That is the change, not a
+gate leak. The proof owed is knob-off **210 green**, which it is. The `pidesk`-gated half was held to
+the usual discipline regardless: `arch/aarch64/syscall.rs` and `main.rs` are both exactly
+**line-neutral** (22504 and 5032 lines, unchanged), each added line paid for by a line of prose
+compressed in the same file, so the gated arm cannot shift a panic `Location` in the knob-off build.

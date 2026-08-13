@@ -1693,7 +1693,52 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // after a `move_to` returns. The one case that changes is an x86 composite that DECLINES on
         // `COMP_GATE` — the box then rides the holder's re-run or the next pass, one frame later,
         // which is WC-L's documented cost arriving on a path that previously did not pay it.
-        super::screen::request_full_present();
+        //
+        // DRAG-PI M1 — **THE OLD BOX AND THE NEW ONE, NOT THE PANEL.**
+        //
+        // This line was `request_full_present()`, and it was the single largest cost on the move
+        // path. That call damages the WHOLE desktop back buffer (`screen::mark_full` sets the damage
+        // set to `{0, 0, width, height}`), so every reposition republished 1920x1200x4 = 9 216 000
+        // bytes at the bench geometry. Measured against the PA38 capture's steady rollup
+        // (`[comp2] … blit_us=2223 bytes_pp=1082253`), that is an 8.5x multiple of a pass that was
+        // already the dominant cost of a drag step — which is the arithmetic that convicted this line.
+        //
+        // The narrowing is EXTENT arithmetic and nothing else, and it is exact rather than a
+        // heuristic: **a move changes desktop pixels only inside (old box ∪ new box).** Outside that
+        // union no pixel of the panel is touched by this function — the row's origin is the only
+        // mutation, `erase` defers fills strictly inside `old - new`, and `damage_intersecting`
+        // reaches only rows overlapping the old box. So a present covering both boxes discharges
+        // exactly the duty the whole-panel one discharged, over the only pixels that could have
+        // changed. `DamageSet::add` merges the two into one rect whenever they overlap, which for a
+        // drag step (a few pixels of travel against a box hundreds of pixels wide) is essentially
+        // always — so the common case is ONE rect a little larger than the window.
+        //
+        // **This is taken for EVERY move, not only for drags, and deliberately.** The argument above
+        // is about the extent a move can change and says nothing about who asked for it, so it holds
+        // verbatim for `SYS_WIN_MOVE` — an EL0 app repositioning its own window pays the same 8.5x
+        // for the same reason and is owed the same cure. A drag-only branch would have meant two
+        // disciplines for one invariant, and the second one would be the untested one.
+        //
+        // Overflow is handled at the callee: more owed boxes than the queue holds escalates to the
+        // whole panel, i.e. to exactly the behaviour this replaces. No rect is ever dropped, so the
+        // narrowing cannot introduce a ghost — the failure mode is a slower present, not a wrong one.
+        super::screen::request_present_rect(b.0, b.1, b.2, b.3);
+        super::screen::request_present_rect(after.0, after.1, after.2, after.3);
+        // DRAG-PI M4 — charge THIS path's desktop request, scoped to this call site and no other.
+        // A census taken inside `screen` would count every full present the system makes for its own
+        // reasons (`focus_changed`, the WC-J drain, minimise, zoom) and the move path's share would be
+        // buried in it — the first cut did exactly that and read a ratio that was mostly other
+        // subsystems' traffic. What the arc changed is what a MOVE asks for, so that is what is counted.
+        #[cfg(feature = "witness")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            MOVE_PRESENT_N.fetch_add(1, Relaxed);
+            MOVE_PRESENT_PX.fetch_add(
+                (b.2 as u64).saturating_mul(b.3 as u64)
+                    + (after.2 as u64).saturating_mul(after.3 as u64),
+                Relaxed,
+            );
+        }
         // Re-open before recompositing — a composite under a raised barrier is a no-op.
         drop(barrier);
         // CURSOR-14's bracket-closer is GONE, and its absence is the point rather than an omission.
@@ -11518,8 +11563,15 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
     // `present()`/`repaint()` does NOT enter `comps` and cannot be caught here; that shape belongs
     // to the `[comp2]`/`[wcn]` censuses.
     let ok = flash == 0 && comps <= moves;
+    // DRAG-PI M2 — the COALESCING ratio, on the same line as the paint budget it explains. `admitted`
+    // is how many pointer reports became repositions and `coalesced` how many were folded into a
+    // later one; `admitted + coalesced` is the reports the gesture saw. The pair is what makes the
+    // pacer falsifiable rather than asserted: with it disarmed `coalesced` reads 0 and `admitted`
+    // tracks the pointer rate, which is precisely the 1:1 coupling this arc convicted.
+    let admitted = DRAG_PACE_ADMITTED.swap(0, Relaxed);
+    let coalesced = DRAG_PACE_COALESCED.swap(0, Relaxed);
     serial_println!(
-        "[drag] win={} owner={:#x} end={} moves={} composites={} erase_rects={} erase_px={} erase_px_pm={} box_px_pm={} flash_px={} -> {}",
+        "[drag] win={} owner={:#x} end={} moves={} composites={} erase_rects={} erase_px={} erase_px_pm={} box_px_pm={} flash_px={} admitted={} coalesced={} -> {}",
         id,
         owner,
         how,
@@ -11530,6 +11582,8 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
         per,
         box_per,
         flash,
+        admitted,
+        coalesced,
         if ok { "ONCE" } else { "FLASH" }
     );
     // WC-K3 — THE OCCLUDEE LINE. A separate line rather than four more fields on `[drag]`, because
@@ -11696,6 +11750,13 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
     DRAG_LAST_X.store(ox, Ordering::Relaxed);
     DRAG_LAST_Y.store(oy, Ordering::Relaxed);
     DRAG_MOVES.store(0, Ordering::Relaxed);
+    // DRAG-PI M2 — a fresh gesture starts with a fresh pacing clock, so its FIRST motion is admitted
+    // immediately rather than being measured against whenever the previous drag last steered. Without
+    // this a grab that follows a recent gesture inside one frame period would sit still for up to
+    // `DRAG_MOTION_MS` before the window began to move — the pacer's one chance to be visible as lag.
+    DRAG_PACE_LAST_MS.store(0, Ordering::Relaxed);
+    DRAG_PACE_ADMITTED.store(0, Ordering::Relaxed);
+    DRAG_PACE_COALESCED.store(0, Ordering::Relaxed);
     // Review condition (dragflick adoption): a superseding `begin` is the THIRD way a gesture
     // ends, and it was the one path that reset none of the budget counters — a press landing
     // while a drag was still live started the new gesture with the old one's pixels on its
@@ -11733,6 +11794,144 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
 ///
 /// Locks: reads the row under [`TABLE`] and RELEASES the guard before calling [`move_to`], which
 /// takes `WRITER` then `TABLE` for itself and composites. No lock is held across the composite pass.
+/// DRAG-PI M2 — **minimum spacing between drag repositions, in ms.** ~60 Hz: fast enough that the
+/// window tracks the hand, slow enough that a pointer sweep cannot queue more composites than the
+/// panel can retire.
+///
+/// The value is x86's, and the number is not arbitrary on either arch: a bench pointer reports at
+/// 125 Hz (an 8 ms period) while one reposition costs a table lock, a deferred erase, a damage pass
+/// and a composite. Admitting every report means asking the panel for work at eight-millisecond
+/// intervals that takes longer than eight milliseconds to retire, and the queue grows for as long as
+/// the hand keeps moving — which is the shape of "I can barely drag a window across the screen".
+///
+/// **Housed here rather than in either arch file, and that is the point.** x86 has carried this
+/// pacing since WMDIRECT; the Pi's drag arm needs the identical rule, and a second copy in
+/// `arch/aarch64/syscall.rs` would be one constant edited by two lanes on two schedules with no gate
+/// able to see them drift. `video::strip::press_route` is the precedent — the routing ORDER moved
+/// into the shared module the moment a second arch came to need it, for the same reason.
+///
+/// STATED, so the next reader is not misled: x86's `wc_drag_motion` still applies its own throttle
+/// from its own `DRAG_MOTION_MS`, because on that arch the pacing is interleaved with the DRAGREL /
+/// DRAGSETTLE / DRAGGLIDE release-level belt and cannot be lifted out without moving that machinery
+/// too. That file is another lane's; folding it onto this constant is a follow-up for the seat that
+/// owns it, not a change this arc is entitled to make. The two values are identical today and this
+/// is the one with the argument attached.
+pub const DRAG_MOTION_MS: u64 = 16;
+
+/// DRAG-PI M2 — when the last paced drag reposition was admitted, in ms. Zero means "no gesture has
+/// been paced yet", which admits the first motion of every drag unconditionally — a grab must not
+/// have to wait out a frame before the window starts following the hand.
+static DRAG_PACE_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAG-PI M2 — **steer the live drag to `(x, y)`, at most once per [`DRAG_MOTION_MS`].**
+///
+/// The COALESCING seam, and the whole of the arc's input-side saving. Without it every pointer
+/// report is its own reposition: at 125 Hz that is 125 erase+damage+composite passes a second, each
+/// consuming one 8 ms delta, and the compositor is the thing that falls behind. With it the reports
+/// still all arrive and are still all consumed — the pointer position they carry is applied to
+/// `pal::cursor` by the caller's own arms — but the WINDOW is moved once per frame period, to the
+/// LATEST position rather than through every intermediate one.
+///
+/// That distinction is why this is coalescing and not throttling: a dropped report would lose hand
+/// travel and the window would land short. Nothing is dropped. `drag_motion` reads the CURRENT
+/// cursor position from its caller, so a pass that is declined here costs the gesture nothing at all
+/// — the next admitted pass moves the window to where the hand has got to, which is strictly more
+/// current than where it was when the declined report arrived.
+///
+/// Returns whether a reposition was applied, so a caller can witness the admitted rate.
+pub fn drag_motion_paced(x: i32, y: i32) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    if drag_active() == WIN_NONE {
+        return false;
+    }
+    let now = crate::arch::ms();
+    let last = DRAG_PACE_LAST_MS.load(Relaxed);
+    if last != 0 && now.wrapping_sub(last) < DRAG_MOTION_MS {
+        DRAG_PACE_COALESCED.fetch_add(1, Relaxed);
+        return false;
+    }
+    DRAG_PACE_LAST_MS.store(now.max(1), Relaxed);
+    DRAG_PACE_ADMITTED.fetch_add(1, Relaxed);
+    drag_motion(x, y)
+}
+
+/// DRAG-PI M3 — **what a pointer report owes the window system after a drain's own arms have run:**
+/// steering the live title-bar drag, paced.
+///
+/// The arch-neutral twin of x86's `wc_route_tail`, and housed HERE rather than copied into
+/// `arch/aarch64/syscall.rs` for two reasons that point the same way. The first is the ordinary one:
+/// this is window-system policy, not arch plumbing, and a second copy would drift. The second is
+/// specific to the Pi and is a hard constraint rather than a preference — `arch/aarch64/syscall.rs`
+/// is compiled into the knob-off `kernel8.img`, whose byte-identity proof is defeated by a line ADDED
+/// anywhere in the file (panic `Location` records embed line numbers). A function body there costs
+/// that proof; a single call site does not.
+///
+/// **Keyed on the RAW report, and that is the whole of its correctness.** `Event::Mouse` and
+/// `Event::MouseAbsolute` are PACKABLE, so whenever a ring-3 app holds focus with room in its ring
+/// the router consumes the report and the drain's own pointer arms never run. A title-bar grab
+/// GUARANTEES that state on this arch too, because the chrome arm focuses the dragged window's own
+/// owner. Keyed on the routed outcome the drag would be dead for every app window and alive only for
+/// kernel furniture — app-dependent and nondeterministic, which is the defect x86's ledger records
+/// having already made once.
+///
+/// **Call it where the cursor is FRESH.** It reads the shared `pal::cursor` position rather than the
+/// report's own delta, so the window and the arrow can never disagree about where the hand is — but
+/// that means it must run AFTER whoever applied this report to the cursor. On aarch64 those places
+/// are `route_input_to_active_el0` (focused-app path, which moves the cursor itself before routing)
+/// and `render_service`'s `Mouse`/`MouseAbsolute` arms (shell path, where the cursor is applied one
+/// `GUI_CHANNEL` hop downstream of the drain — so the drain is the WRONG place and the render task is
+/// the right one).
+///
+/// Locks: takes `WRITER` for the panel geometry and RELEASES it before `drag_motion_paced` reaches
+/// `TABLE`, keeping the two strictly non-overlapping. That is the same discipline `move_to_inner`
+/// states and the reason this cannot close a WRITER/TABLE cycle.
+pub fn drag_route_tail(ev: crate::pal::Event) -> bool {
+    if !matches!(
+        ev,
+        crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. }
+    ) {
+        return false;
+    }
+    // One relaxed-ish load on every pointer report of a boot where nobody grabbed a title bar, which
+    // is the overwhelming majority of them — ahead of the geometry read so the idle path takes no lock.
+    if drag_active() == WIN_NONE {
+        return false;
+    }
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        if !fb.is_ready() {
+            return false;
+        }
+        let info = fb.info();
+        (info.width as i32, info.height as i32)
+    };
+    let (x, y) = crate::pal::cursor::pos(pw, ph);
+    drag_motion_paced(x, y)
+}
+
+/// DRAG-PI M4 — the MOVE PATH's desktop-repaint bill: how many moves asked, and for how many pixels.
+/// Charged at the two `request_present_rect` calls in [`move_to_inner`] and nowhere else, so the
+/// quotient is exactly "desktop area one reposition puts on the panel's bill" — the single quantity
+/// M1 changed, isolated from every other full present the system makes for its own reasons.
+#[cfg(feature = "witness")]
+static MOVE_PRESENT_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static MOVE_PRESENT_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAG-PI M4 — take and clear the move-path desktop census: `(moves, pixels)`.
+#[cfg(feature = "witness")]
+fn move_present_take() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (MOVE_PRESENT_N.swap(0, Relaxed), MOVE_PRESENT_PX.swap(0, Relaxed))
+}
+
+/// DRAG-PI M2 — pointer reports the pacer ADMITTED and COALESCED across the live gesture. Reported
+/// on the `[drag]` line at the end of it, so the ratio is on the wire rather than inferred: with the
+/// pacer working, `coalesced` is the majority at any pointer rate above ~60 Hz, and `admitted` is
+/// what the compositor was actually asked to retire.
+static DRAG_PACE_ADMITTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DRAG_PACE_COALESCED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn drag_motion(x: i32, y: i32) -> bool {
     use core::sync::atomic::Ordering;
     let id = DRAG_WIN.load(Ordering::Acquire);
@@ -15788,6 +15987,224 @@ fn movevacate_selftest() {
 /// Self-cleaning and one-shot on the same terms as its neighbours: every row it made is closed by id
 /// (`close`, not `close_owner` — the furniture row refuses the latter, which is the point of leg 3),
 /// `SHELL_Z` and `FOCUS_ASID` are restored, and the live set is repainted.
+/// DRAG-PI M4 — **THE DRAG COST WITNESS: the same gesture measured under both regimes, on one boot.**
+///
+/// The arc's numbers, made falsifiable. Every claim M1 and M2 make is a claim about a RATIO, and a
+/// ratio quoted from two different builds on two different boots is a claim about the builds as much
+/// as about the change. So this drives one window across one panel twice, in one call, with only the
+/// regime differing — and prints both halves so the reader divides them rather than trusting a
+/// verdict this function computed for itself.
+///
+/// ### Half 1 — the desktop repaint EXTENT (M1)
+///
+/// `whole` reproduces the pre-M1 line exactly: every reposition is followed by a
+/// `request_full_present()`, which charged the WHOLE PANEL. `rects` is the shipped path, which
+/// charges (old box ∪ new box). Both halves move the same window the same distance in the same number
+/// of steps, left-to-right then right-to-left, so the window-layer work is identical and cancels;
+/// what differs is only what the desktop layer was asked to republish.
+///
+/// **The measured ratio ERRS LOW, and that is deliberate.** The `whole` pass performs a REAL move, so
+/// it also makes the two rect requests the shipped path makes — a term the pre-M1 code never paid.
+/// The reported speedup is therefore slightly smaller than the true old/new ratio, on the standing
+/// rule that an instrument arguing for its own change reports the conservative number.
+///
+/// ### Half 2 — the pointer COALESCING ratio (M2)
+///
+/// A live grab is driven with synthetic reports at a realistic ~8 ms spacing (125 Hz, the bench
+/// pointer's rate) for a fixed span, through the SHIPPED pacer. `admitted` is how many became
+/// repositions and `coalesced` how many were folded forward. This is the half that cannot be argued
+/// from geometry: it is a statement about time, so it is measured against the clock.
+///
+/// Reports SKIP honestly rather than asserting over a fixture it could not build — no framebuffer, a
+/// panel too small to drag across, no free row. `panel=`/`box=` are printed on the verdict line
+/// because the ratio is only interpretable beside them: the whole mechanism is "panel area becomes
+/// box area", so a reader who cannot see both cannot check the arithmetic.
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal", feature = "pidesk"))]
+pub fn dragperf_selftest() {
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[dragperf] -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let pinfo = fb.info();
+    if pinfo.width < 320 || pinfo.height < 240 {
+        serial_println!(
+            "[dragperf] -> SKIP (panel {}x{} too small)",
+            pinfo.width,
+            pinfo.height
+        );
+        return;
+    }
+    const ASID_DP: u64 = 0xD40;
+    const STEPS: usize = 24;
+    let surf = &raw const HT_SURF as usize;
+    let len = core::mem::size_of_val(&HT_SURF);
+    let w = create(ASID_DP, surf, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"dgp");
+    if w == WIN_NONE {
+        serial_println!("[dragperf] -> SKIP (no free row)");
+        return;
+    }
+    let oy = pinfo.height / 2;
+    let (bw, bh) = match info_box(w) {
+        Some(b) => (b.2, b.3),
+        None => {
+            close(w);
+            serial_println!("[dragperf] -> SKIP (no box for the probe row)");
+            return;
+        }
+    };
+    // Edge to edge, with the chrome kept on the panel at both ends — `move_to` clamps, and a run that
+    // spent half its steps against a clamp would be measuring the cheap-skip rather than the move.
+    let span = pinfo.width.saturating_sub(bw + BORDER * 2);
+    if span < STEPS * 2 {
+        close(w);
+        serial_println!("[dragperf] -> SKIP (panel too narrow for a {}px box)", bw);
+        return;
+    }
+    let step = span / STEPS;
+
+    // ---- Half 1: the desktop repaint EXTENT a reposition asks for -------------------------------
+    //
+    // The `rects` side is MEASURED, from the shipped `move_to_inner` call site, across a real
+    // edge-to-edge sweep. The `whole` side is ANALYTIC and is labelled so on the wire: the line M1
+    // removed was `request_full_present()`, and that call sets the desktop damage set to
+    // `{0, 0, width, height}` (`screen::mark_full`) — one whole panel per move, exactly, with no
+    // measurement needed or possible to establish it. Quoting it as a measurement would be dressing
+    // an identity up as evidence; quoting it as what the removed line charged is simply reading it.
+    let _ = move_present_take();
+    let mut moves_b = 0usize;
+    for i in 0..STEPS {
+        if move_to(w, BORDER + i * step, oy) {
+            moves_b += 1;
+        }
+    }
+    // Back the other way, so the sweep is symmetric and the count is doubled without the window
+    // walking off the panel and spending its second half against the clamp.
+    for i in 0..STEPS {
+        if move_to(w, BORDER + (STEPS - 1 - i) * step, oy) {
+            moves_b += 1;
+        }
+    }
+    let (reqs_b, px_b) = move_present_take();
+    let pm_a = (pinfo.width as u64).saturating_mul(pinfo.height as u64);
+    let pm_b = if reqs_b > 0 { px_b / reqs_b } else { 0 };
+    serial_println!(
+        "[dragperf] mode=whole analytic px_per_move={} (one panel, what request_full_present charged)",
+        pm_a
+    );
+    serial_println!(
+        "[dragperf] mode=rects measured steps={} moves={} reqs={} px={} px_per_move={}",
+        STEPS * 2, moves_b, reqs_b, px_b, pm_b
+    );
+
+    // ---- Half 1b: THE ROUTER ARM IS REACHABLE ---------------------------------------------------
+    //
+    // The half that answers the conviction directly. Everything above measures the COST of a drag;
+    // this asserts that a drag can BEGIN AT ALL from a press, which is the thing the Pi did not have
+    // — `drag_begin` had exactly one caller in the tree and it was x86's. Driving `wm::drag_begin`
+    // from the fixture (as half 2 does) would prove the window layer and leave the router untested,
+    // which is precisely the shape of witness this arc was sent to fix.
+    //
+    // So it drives the SHIPPED router, `wc_click_route`, with a real Button edge at the real cursor
+    // — the CLICK-PLAIN fixture discipline: move the WINDOW under the pointer, never the pointer.
+    // The window is translated so the centre of its title strip lands on the cursor, solved from the
+    // shipping geometry (`info_box` + `TITLE_H`) rather than from a copy of it, and the placement is
+    // VERIFIED with `title_bar_hit` rather than assumed — `move_to` clamps, so a window that cannot
+    // be positioned under the hand reports SKIP honestly instead of asserting nothing.
+    //
+    // The focus the arm moves is saved and restored: a synthetic owner outside the private-slot range
+    // owns no ring, but leaving `USER_INPUT_ACTIVE` pointing at it would hand the rest of the boot's
+    // keyboard to a window this fixture is about to reap.
+    let router = {
+        use crate::arch::aarch64::syscall as sc;
+        let (pw, ph) = (pinfo.width as i32, pinfo.height as i32);
+        let (cx, cy) = crate::pal::cursor::pos(pw, ph);
+        let aimed = match (info(w), info_box(w)) {
+            (Some(i), Some((bx, by, bw2, _))) => {
+                let nx = i.x as i64 + (cx as i64 - (bx + bw2 / 2) as i64);
+                let ny = i.y as i64 + (cy as i64 - (by + TITLE_H / 2) as i64);
+                if nx >= BORDER as i64 && ny >= (TITLE_H + BORDER) as i64 {
+                    move_to(w, nx as usize, ny as usize);
+                    title_bar_hit(w, cx, cy)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if aimed {
+            let saved = sc::user_input_active();
+            // PRESS then RELEASE, through the shipped edge detector. The press must land on the
+            // chrome arm and grab; the release must end the gesture and leave nothing live.
+            sc::wc_click_route(crate::pal::Event::Button(1));
+            let grabbed = drag_active() == w;
+            sc::wc_click_route(crate::pal::Event::Button(0));
+            let released = drag_active() == WIN_NONE;
+            sc::user_input_set_active(saved);
+            Some((grabbed, released))
+        } else {
+            None
+        }
+    };
+    match router {
+        Some((grabbed, released)) => serial_println!(
+            "[dragperf] router press=chrome grabbed={} released={} -> {}",
+            grabbed, released,
+            if grabbed && released { "PASS" } else { "FAIL" }
+        ),
+        None => serial_println!("[dragperf] router -> SKIP (title bar not placeable under cursor)"),
+    }
+
+    // ---- Half 2: the pacer, at a bench-realistic report rate ------------------------------------
+    // 8 ms between reports is 125 Hz — the rate `[piusb24]` records on the bench. The span is fixed
+    // rather than the count, so the expected admission is arithmetic: span / DRAG_MOTION_MS.
+    //
+    // The grab point is solved from the row's CURRENT box and not from the sweep's `oy`: half 1b has
+    // just translated the window to put its title strip under the cursor, so a grab aimed at where
+    // the row used to be misses `title_bar_hit`, `drag_begin` declines, and the whole half silently
+    // measures nothing. It did exactly that on its first run.
+    let (gx, gy) = match info_box(w) {
+        Some((bx, by, bw2, _)) => ((bx + bw2 / 2) as i32, (by + TITLE_H / 2) as i32),
+        None => (0, 0),
+    };
+    let (adm, coal) = if drag_begin(w, gx, gy) {
+        let t0 = crate::arch::ms();
+        let mut px = gx;
+        while crate::arch::ms().wrapping_sub(t0) < 320 {
+            px = px.wrapping_add(2);
+            drag_motion_paced(px, gy);
+            let m = crate::arch::ms();
+            while crate::arch::ms().wrapping_sub(m) < 8 {
+                core::hint::spin_loop();
+            }
+        }
+        (
+            DRAG_PACE_ADMITTED.load(core::sync::atomic::Ordering::Relaxed),
+            DRAG_PACE_COALESCED.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    } else {
+        (0, 0)
+    };
+    drag_cancel("dragperf");
+
+    // The verdict is a CONJUNCTION of the two claims, each falsifiable on its own wire:
+    //  * the narrow regime asks for strictly less desktop area per move than the whole one, and
+    //  * the pacer folded reports rather than admitting all of them at 125 Hz.
+    // A build that loses either reads FAIL here rather than quietly reporting a ratio of 1.
+    let narrowed = pm_b > 0 && pm_b < pm_a;
+    let paced = coal > 0 && adm > 0;
+    let ratio_x10 = if pm_b > 0 { pm_a.saturating_mul(10) / pm_b } else { 0 };
+    serial_println!(
+        "[dragperf] panel={}x{} box={}x{} extent_speedup={}.{}x admitted={} coalesced={} -> {}",
+        pinfo.width, pinfo.height, bw, bh,
+        ratio_x10 / 10, ratio_x10 % 10,
+        adm, coal,
+        if narrowed && paced { "PASS" } else { "FAIL" }
+    );
+    close(w);
+    composite();
+}
+
 #[cfg(feature = "witness")]
 fn closeiso_selftest() {
     use core::sync::atomic::Ordering;

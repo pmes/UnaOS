@@ -31,6 +31,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use spin::Mutex;
 use unaos_boot_info::FrameBufferInfo;
 
 use super::FrameBuffer;
@@ -351,6 +352,97 @@ static FULL_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 /// that erase when the desktop next runs.
 pub fn request_full_present() {
     FULL_PRESENT.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// DRAG-PI M1 — how many rect-scoped present requests may be owed at once before the queue gives up
+/// and escalates to a whole-panel one. Eight is two full move epilogues (each owes an old box and a
+/// new one) plus slack; the escalation is a correctness-preserving fallback, never a lost rect.
+const MAX_PRESENT_RECTS: usize = 8;
+
+/// DRAG-PI M1 — rect-scoped counterpart to [`FULL_PRESENT`]: the desktop-layer regions owed a
+/// repaint on the next present. Same ownership story as that flag and for the same reason — the
+/// `Screen` belongs to the render task and the compositor has no `&mut` to it — so the request
+/// crosses as data and the render task applies it against its own damage set.
+static PRESENT_RECTS: Mutex<([(usize, usize, usize, usize); MAX_PRESENT_RECTS], usize)> =
+    Mutex::new(([(0, 0, 0, 0); MAX_PRESENT_RECTS], 0));
+
+/// DRAG-PI M1 — **ask the desktop layer to repaint exactly this box on its next present.**
+///
+/// The narrow twin of [`request_full_present`], and the whole of the drag arc's desktop-side saving.
+/// A window move changes desktop pixels only inside (old box ∪ new box); `request_full_present`
+/// answered that with the WHOLE PANEL, which at the bench's 1920x1200 is 2 304 000 px re-derived to
+/// republish a few hundred thousand. This asks for the boxes that actually changed.
+///
+/// **It is not a weaker request, it is a narrower one.** The flag's job is to make the desktop
+/// re-derive content the window layer had been covering (console text, the status strip) — the
+/// `erase` deferral paints `DESKTOP_BG` there and only a desktop present restores what belongs
+/// underneath. That duty is per-pixel, so satisfying it over a superset of the changed pixels is
+/// exactly as sound as satisfying it over the panel, and cheaper by the ratio of the two areas.
+///
+/// Overflow MERGES rather than escalating or dropping, and the first cut of this function got that
+/// wrong in a way the M4 fixture caught on its first run. Escalating to a whole-panel request on a
+/// full queue reads as a safe fallback and is not one: the queue drains only when the render task
+/// presents, the compositor can reposition a window far faster than that, and on an otherwise idle
+/// desktop the render task's floor is the 1 Hz strip tick. So a drag overran the queue within a
+/// handful of moves and every request after that escalated — the fixture read `reqs=96` for 24 moves
+/// and `px_per_move` of four whole panels, i.e. the narrowing had inverted into a pessimisation
+/// exactly when it mattered most. Merging keeps the queue bounded with no such cliff: the worst a
+/// full queue can do is hand back a slightly loose superset, which is still a window rather than a
+/// panel. This mirrors `DamageSet::add`, deliberately — the consuming side already solves this exact
+/// problem and a second policy would be one more than the file can defend.
+///
+/// A rect is never dropped and never shrunk, so no ghost can be introduced by queue pressure.
+pub fn request_present_rect(x: usize, y: usize, w: usize, h: usize) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let (nx0, ny0, nx1, ny1) = (x, y, x + w, y + h);
+    let mut q = PRESENT_RECTS.lock();
+    let n = q.1;
+    // Union into the first rect this one already touches. Successive drag steps overlap by almost
+    // their whole area, so in the common case the queue never grows past the boxes of the windows
+    // actually being moved.
+    let mut merged = false;
+    for i in 0..n {
+        let (ex, ey, ew, eh) = q.0[i];
+        let (ex0, ey0, ex1, ey1) = (ex, ey, ex + ew, ey + eh);
+        if nx0 < ex1 && ex0 < nx1 && ny0 < ey1 && ey0 < ny1 {
+            let (ux0, uy0) = (ex0.min(nx0), ey0.min(ny0));
+            let (ux1, uy1) = (ex1.max(nx1), ey1.max(ny1));
+            q.0[i] = (ux0, uy0, ux1 - ux0, uy1 - uy0);
+            merged = true;
+            break;
+        }
+    }
+    if merged {
+        return;
+    }
+    if n < MAX_PRESENT_RECTS {
+        q.0[n] = (x, y, w, h);
+        q.1 = n + 1;
+    } else {
+        // Full and disjoint from every slot: fold into whichever slot's union grows by the least
+        // area, the same tie-break `DamageSet::add` uses when its own set is full.
+        let mut best = 0usize;
+        let mut best_growth = u64::MAX;
+        for i in 0..n {
+            let (ex, ey, ew, eh) = q.0[i];
+            let (ex0, ey0, ex1, ey1) = (ex, ey, ex + ew, ey + eh);
+            let (ux0, uy0) = (ex0.min(nx0), ey0.min(ny0));
+            let (ux1, uy1) = (ex1.max(nx1), ey1.max(ny1));
+            let growth = ((ux1 - ux0) as u64).saturating_mul((uy1 - uy0) as u64)
+                - (ew as u64).saturating_mul(eh as u64);
+            if growth < best_growth {
+                best_growth = growth;
+                best = i;
+            }
+        }
+        let (ex, ey, ew, eh) = q.0[best];
+        let (ex0, ey0, ex1, ey1) = (ex, ey, ex + ew, ey + eh);
+        let (ux0, uy0) = (ex0.min(nx0), ey0.min(ny0));
+        let (ux1, uy1) = (ex1.max(nx1), ey1.max(ny1));
+        q.0[best] = (ux0, uy0, ux1 - ux0, uy1 - uy0);
+    }
 }
 
 /// SHELLDESK — how many FURNITURE surfaces the desktop present may have to subtract.
@@ -972,8 +1064,23 @@ impl Screen {
         // is how the console comes back out from under a window layer that stopped drawing (see
         // `request_full_present`) — the back buffer already holds the right pixels; only the damage
         // that would carry them forward is missing.
+        // DRAG-PI M1 — the rect-scoped queue is drained in the SAME breath, and the full flag wins.
+        // Draining unconditionally (rather than only on the narrow branch) is what keeps a rect from
+        // outliving the present that already covered it: a whole-panel repaint satisfies every owed
+        // box by construction, so carrying them forward would buy a second present for pixels this
+        // one has just published.
+        let owed = {
+            let mut q = PRESENT_RECTS.lock();
+            let n = q.1;
+            q.1 = 0;
+            (q.0, n)
+        };
         if FULL_PRESENT.swap(false, core::sync::atomic::Ordering::AcqRel) {
             self.mark_full();
+        } else {
+            for &(x, y, w, h) in owed.0.iter().take(owed.1) {
+                self.mark(x, y, x + w, y + h);
+            }
         }
         let n = self.damage.len;
         self.damage.clear();

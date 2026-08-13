@@ -2803,10 +2803,7 @@ fn route_input_to_active_el0() -> usize {
         // "a machine with a real pointer has always armed it through the shell loop first (focus is the
         // shell at boot)". That premise is false whenever a user app takes focus BEFORE the first pointer
         // report of the boot — `run`/`bg` a windowed app, then touch the mouse — which is the ordinary
-        // desktop bring-up. In that state `has_reported()` is still false, so this block is skipped; the
-        // shell arms (`render_service`'s `Mouse` arm, the only OTHER `move_rel` caller on this arch) are
-        // unreachable because `pump_usb_into_gui` took the `user_input_active() != 0` branch; and nothing
-        // else in the kernel can ever set the latch. So the predicate could only become true through a
+        // desktop bring-up. In that state `has_reported()` is still false, so this block is skipped; the shell arms (`render_service`'s `Mouse` arm, the only OTHER `move_rel` caller on this arch) are unreachable because `pump_usb_into_gui` took the `user_input_active() != 0` branch; and nothing else in the kernel can ever set the latch. So the predicate could only become true through a
         // path the predicate itself had disabled: the pointer stayed dead — no motion, no sprite — until
         // the operator TAB'd focus back to the shell, at which point the shell drain armed it and the
         // cursor came alive for the rest of the boot (P67v2, bench).
@@ -2833,6 +2830,7 @@ fn route_input_to_active_el0() -> usize {
                 _ => {}
             }
         }
+        #[cfg(feature = "pidesk")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — STEER a live title-bar grab from the FOCUSED-APP drain, after the cursor keep-alive above has applied this report and before the event is routed onward. This is the path a grab actually takes: the chrome arm focuses the dragged window's own owner, so every subsequent pointer report arrives here and is PACKED into that app's ring — the shell drain never sees it. Keyed on the raw event inside `drag_route_tail`, so a non-pointer event and an idle boot both cost one match and one atomic load. Delivery is unchanged: the app still receives the report, exactly as it does today.
         if unaos_kernel::arch::aarch64::syscall::user_input_enqueue(ev) {
             routed += 1;
         }
@@ -3932,6 +3930,7 @@ fn render_service(_: usize) {
                     );
                     unaos_kernel::video::cursor::repaint();
                 }
+                #[cfg(feature = "pidesk")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — STEER a live grab from the SHELL path, and it has to be HERE rather than in the drain that forwarded this event. On this arch the shell's cursor is applied one `GUI_CHANNEL` hop downstream — by this very arm — so a tail call in `pump_usb_into_gui` would read the position as of the PREVIOUS report and the window would trail the arrow by one report for the whole gesture. The render task is where the cursor becomes current, so it is where the window is allowed to follow it. Reached for kernel-band and focus-exempt rows, whose chrome arm hands the keyboard to the shell.
             }
             unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
                 // Absolute report (0..=32767 HID space), same shared sprite. An unchanged position
@@ -3941,6 +3940,7 @@ fn render_service(_: usize) {
                     unaos_kernel::pal::cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
                     unaos_kernel::video::cursor::repaint();
                 }
+                #[cfg(feature = "pidesk")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — the absolute twin of the arm above, same reasoning and same seam.
             }
             // GUI-CLICK-1: a Button report carries no cursor motion — dispatch it against the shared
             // GUI model at the current sprite position (hit-test → deliver to the hit view). Press

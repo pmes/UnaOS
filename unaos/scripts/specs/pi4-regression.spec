@@ -1554,3 +1554,15 @@ REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
 # ---    presence check.
 REQUIRE :: WMCTRL: controls-declined — floor=158 .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
 FORBID :: WMCTRL: .* :: FAIL ::
+
+# --- DRAG-PI M4 — the drag COST witness (`[dragperf]`, wm::dragperf_selftest).
+# --- FORBID and not REQUIRE, deliberately. The fixture is `pidesk`-gated, so its line is present on
+# --- the armed battery and absent from the knob-off one; a REQUIRE would assert the desktop knob's
+# --- output against a build that does not carry the knob and would red the knob-off gate for doing
+# --- exactly what it is supposed to do. A FORBID on the FAIL direction costs nothing when the line is
+# --- absent (0 hits) and still catches a regression that turns the narrowing or the pacer off:
+# --- `dragperf_selftest`'s verdict is a conjunction — the shipped move path must ask for strictly
+# --- less desktop area per reposition than a whole panel AND the pacer must have folded reports —
+# --- so either half regressing prints FAIL here and reds the armed gate. The REQUIRED count is
+# --- unchanged at 108 on both batteries, which is the point.
+FORBID \[dragperf\] .* -> FAIL
