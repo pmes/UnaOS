@@ -973,6 +973,11 @@ pub static BOT_FOLD_STREAK: AtomicU64 = AtomicU64::new(0);
 /// clean boot, so any non-zero reading is itself the finding.
 pub static BOT_RESCUE_RESET_DEVICE: AtomicU64 = AtomicU64::new(0);
 pub static BOT_RESCUE_PORT_CYCLE: AtomicU64 = AtomicU64::new(0);
+/// [piusb41] Rung (b') attempts: the HUB-port power-cycle, the downstream twin of (b). Counted
+/// separately from the root rung because the two touch different hardware through different pipes —
+/// a root PORTSC write versus a hub-class request on another device's control endpoint — and a
+/// capture must be able to say which one a boot actually reached.
+pub static BOT_RESCUE_HUB_PORT_CYCLE: AtomicU64 = AtomicU64::new(0);
 pub static BOT_RESCUE_SURRENDER: AtomicU64 = AtomicU64::new(0);
 
 // --- BOT-PHASE (2026-07-29): the phase-desync witnesses ---
@@ -2018,6 +2023,18 @@ pub struct DeviceSlot {
     pub route_string: u32,
     pub route_depth: u8,
 
+    /// [piusb41] The IMMEDIATE parent hub of a downstream device: its slot id, and the hub's
+    /// downstream PORT NUMBER (1-based, as a hub-class `wIndex`) this device hangs off. Zero for a
+    /// root device, and zero is unambiguous — slot 0 is never a device and hub ports are 1-based.
+    ///
+    /// `route_string` alone cannot answer "which hub, which port": it is a path of 4-bit nibbles
+    /// with no slot ids in it, and the tail nibble is clamped at 15 for a hub with more than 15
+    /// ports. The BOT rescue ladder's hub-port power-cycle rung needs the pair EXACTLY (it drives a
+    /// class request at one named port), so it is recorded at enumeration rather than reconstructed.
+    /// Cleared in `reset_soft_state` so a recycled slot id cannot inherit a dead device's parent.
+    pub parent_hub_slot: u8,
+    pub parent_hub_port: u8,
+
     // Dedicated DMA buffers for Bulk-Only Transport (mass storage). Kept separate from
     // descriptor_buffer / data_buffer so a CBW can't clobber descriptors or HID reports.
     pub cbw_buffer: Option<*mut u8>,       // 31-byte Command Block Wrapper
@@ -2104,6 +2121,8 @@ impl DeviceSlot {
             is_downstream: false,
             route_string: 0,
             route_depth: 0,
+            parent_hub_slot: 0,
+            parent_hub_port: 0,
             cbw_buffer: None,
             csw_buffer: None,
             scsi_data_buffer: None,
@@ -2187,6 +2206,8 @@ impl DeviceSlot {
         self.is_downstream = false;
         self.route_string = 0;
         self.route_depth = 0;
+        self.parent_hub_slot = 0;
+        self.parent_hub_port = 0;
         self.bulk_in_ep = 0;
         self.bulk_out_ep = 0;
         self.storage_intf = 0;
@@ -8596,13 +8617,21 @@ impl XhciController {
         BOT_RESCUE_PORT_CYCLE.fetch_add(1, Ordering::Relaxed);
         let port = self.slots[slot_id as usize].port_id;
         let downstream = self.slots[slot_id as usize].is_downstream;
-        if port == 0 || port > self.max_ports || downstream {
+        if downstream {
             // A hub-downstream device's power is the HUB's to switch, via a class request on the
-            // hub's slot — a different pipe, and one this rung has no business reaching for while
-            // the device it would have to ask through may itself be the sick one.
+            // hub's slot — a different pipe, and PORTSC PP here would cut the whole hub. [piusb41]
+            // PA37 stopped at this line with `why=downstream-port-not-root`; the rung it named is
+            // now written, so hand off to it rather than refusing. `port` (the ROOT port the chain
+            // starts at) is deliberately NOT touched on this path.
             serial_println!(
-                ":: BOT: rescue stage=port-cycle slot={} port={} ok=no why={} ::",
-                slot_id, port, if downstream { "downstream-port-not-root" } else { "no-root-port" });
+                ":: BOT: rescue stage=port-cycle slot={} port={} ok=no why=downstream-port-not-root next=hub-port-cycle ::",
+                slot_id, port);
+            return self.rescue_hub_port_cycle(slot_id);
+        }
+        if port == 0 || port > self.max_ports {
+            serial_println!(
+                ":: BOT: rescue stage=port-cycle slot={} port={} ok=no why=no-root-port ::",
+                slot_id, port);
             return false;
         }
         // Preserve everything except the write-1-to-act bits; then drop PP.
@@ -8626,6 +8655,159 @@ impl XhciController {
             BOT_RESCUE_PORT_OFF_MS, BOT_RESCUE_PORT_ON_MS,
             before, off, after, (off >> 9) & 1, ccs, (after >> 1) & 1, (after >> 5) & 0xF,
             BOT_RESCUE_PORT_CYCLE.load(Ordering::Relaxed));
+        ccs != 0
+    }
+
+    /// [piusb41] BOT-RESCUE escalation (b'): the HUB-downstream twin of `rescue_port_cycle`.
+    ///
+    /// A device behind a hub has no PORTSC of its own — its VBUS is switched by the HUB, through
+    /// class requests aimed at ONE named downstream port on the hub's control pipe
+    /// (USB 2.0 §11.24.2): `ClearPortFeature(PORT_POWER)` then `SetPortFeature(PORT_POWER)`,
+    /// bmRequestType 0x23 (H2D, class, OTHER), feature selector 8, `wIndex` = the hub port number.
+    /// This is the exact request-building path `bring_up_hub` already uses to power the ports on at
+    /// bring-up; nothing new is invented here, only the OFF half and the aim.
+    ///
+    /// **Aim, and why it is safe on a shared hub.** The port number is the one RECORDED for this
+    /// slot at enumeration (`parent_hub_slot`/`parent_hub_port`, written in `enumerate_downstream`),
+    /// not one derived or guessed, and it is cross-checked against the slot's own route string
+    /// before a single request goes out: the route nibble for the parent's tier must equal this port
+    /// and the tier depth must be exactly one below this device's. A sibling on the same hub (the
+    /// bench mouse) sits on a DIFFERENT downstream port and is untouched — per-port power is exactly
+    /// what the hub-class feature switches. The hub itself is never reset, never re-configured, and
+    /// never powered off; `ClearPortFeature(PORT_POWER)` reaches one port only. If any active slot
+    /// other than this one claims the same (hub, port) pair — which would mean the recorded aim is
+    /// stale or aliased — the rung refuses rather than cut power under a live device.
+    ///
+    /// **Precondition: the hub's control pipe is healthy.** The rung has to ask THROUGH a device to
+    /// reach the sick one. An invalid/absent hub slot, or a control transfer that errors, is an
+    /// honest refusal (`why=hub-pipe-dead`) — not something to retry or work around.
+    ///
+    /// **Re-enumeration is DELEGATED**, exactly as the root rung delegates: dropping and restoring
+    /// port power makes the hub latch C_PORT_CONNECTION, which it reports on its Status Change
+    /// Endpoint; the settles below drain the event ring, so that interrupt-IN completion queues the
+    /// (hub, port) pair and the main loop's `service_hub_changes` -> `service_one_hub_change` does
+    /// the disconnect teardown and the fresh reset+enumerate. Nothing here open-codes a re-address,
+    /// and nothing here clears a change feature — clearing C_PORT_CONNECTION would erase the very
+    /// edge the delegated path re-enumerates on.
+    ///
+    /// Returns true if the hub reports a device connected on that port after the cycle.
+    fn rescue_hub_port_cycle(&mut self, slot_id: u8) -> bool {
+        BOT_RESCUE_HUB_PORT_CYCLE.fetch_add(1, Ordering::Relaxed);
+        let n = BOT_RESCUE_HUB_PORT_CYCLE.load(Ordering::Relaxed);
+        let (hub_slot, hub_port, route, depth) = {
+            let s = &self.slots[slot_id as usize];
+            (s.parent_hub_slot, s.parent_hub_port, s.route_string, s.route_depth)
+        };
+        if hub_slot == 0 || hub_port == 0 {
+            // Slot 0 is never a device and hub ports are 1-based, so this pair means "not recorded"
+            // — a device enumerated before this arc, or a root device that reached here in error.
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub=0 hubport=0 ok=no why=no-parent-hub n={} ::",
+                slot_id, n);
+            return false;
+        }
+        // The hub must be a live, configured hub with a usable control pipe and its own DMA buffer.
+        let (hub_ok, hub_nbr_ports, hub_depth, hub_speed, buf) = {
+            let h = &self.slots[hub_slot as usize];
+            let speed = unsafe {
+                if h.output_context.is_null() { 0 } else { (*(h.output_context as *const u32) >> 20) & 0xF }
+            };
+            (h.active && h.is_hub && h.ep0_ring.is_some() && !h.descriptor_buffer.is_null(),
+             h.hub_nbr_ports, h.route_depth, speed, h.descriptor_buffer as u64)
+        };
+        if !hub_ok {
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok=no why=hub-pipe-dead n={} ::",
+                slot_id, hub_slot, hub_port, n);
+            return false;
+        }
+        if hub_port > hub_nbr_ports {
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} nbrports={} ok=no why=hub-port-out-of-range n={} ::",
+                slot_id, hub_slot, hub_port, hub_nbr_ports, n);
+            return false;
+        }
+        // SAFETY CROSS-CHECK 1 — the recorded port must agree with the route this slot was ADDRESSED
+        // with. `bring_up_hub` builds a child's route as `hub_route | (min(port,15) << (4*hub_depth))`
+        // at depth `hub_depth+1`; re-derive that nibble and refuse on any disagreement. A stale or
+        // aliased pair fails here, before any power is switched.
+        let route_nibble_ok = hub_depth < 5
+            && depth == hub_depth + 1
+            && ((route >> (4 * hub_depth)) & 0xF) == (hub_port as u32).min(15);
+        if !route_nibble_ok {
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok=no why=port-not-ours route={:#x} depth={} hubdepth={} n={} ::",
+                slot_id, hub_slot, hub_port, route, depth, hub_depth, n);
+            return false;
+        }
+        // SAFETY CROSS-CHECK 2 — no OTHER live device may claim this same (hub, port). One port
+        // carries one device; a second claimant means the bookkeeping is wrong, and cutting power on
+        // a guess could darken a healthy sibling. Refuse instead.
+        if let Some(other) = (1..self.slots.len()).find(|&i| {
+            i != slot_id as usize
+                && self.slots[i].active
+                && self.slots[i].parent_hub_slot == hub_slot
+                && self.slots[i].parent_hub_port == hub_port
+        }) {
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok=no why=port-shared other={} n={} ::",
+                slot_id, hub_slot, hub_port, other, n);
+            return false;
+        }
+
+        // R22 lesson (see reset_downstream_port / bring_up_hub): a SuperSpeed hub's wPortStatus does
+        // NOT lay out like a USB2 hub's — PORT_POWER is bit 9 on SS and bit 8 on USB2, and the USB2
+        // speed bits do not apply on SS at all. Only CCS (bit 0) is common to both, so CCS is what
+        // the verdict is drawn from; the power bit is decoded speed-aware and printed as evidence
+        // only. The class REQUESTS are identical on both (feature selector 8 either way).
+        let is_ss = hub_speed >= 4;
+        let pp_bit = if is_ss { 9 } else { 8 };
+        // Read one port status word (GET_PORT_STATUS, 0xA3/0x00) without acknowledging anything.
+        let port_status = |me: &mut Self| -> Option<(u16, u16)> {
+            if me.sync_control(hub_slot, 0xA3, 0x00, 0, hub_port as u16, 4, buf, true).is_err() {
+                return None;
+            }
+            unsafe {
+                let p = buf as *const u8;
+                Some(((*p.add(0) as u16) | ((*p.add(1) as u16) << 8),
+                      (*p.add(2) as u16) | ((*p.add(3) as u16) << 8)))
+            }
+        };
+        let before = port_status(self).map(|s| s.0).unwrap_or(0xFFFF);
+
+        // OFF: ClearPortFeature(PORT_POWER) on this port only.
+        let off_res = self.sync_control(hub_slot, 0x23, 0x01, 8, hub_port as u16, 0, 0, false);
+        if !matches!(off_res, Ok(1)) {
+            // The pipe we must ask through did not answer. Power was never removed, but exit
+            // POWERED on every path regardless — best-effort SetPortFeature, then refuse honestly.
+            let _ = self.sync_control(hub_slot, 0x23, 0x03, 8, hub_port as u16, 0, 0, false);
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok=no why=hub-pipe-dead phase=off res={:?} n={} ::",
+                slot_id, hub_slot, hub_port, off_res, n);
+            return false;
+        }
+        self.settle_ms(BOT_RESCUE_PORT_OFF_MS);
+        let off = port_status(self).map(|s| s.0).unwrap_or(0xFFFF);
+
+        // ON: SetPortFeature(PORT_POWER) — the same request bring_up_hub issues at hub init.
+        let on_res = self.sync_control(hub_slot, 0x23, 0x03, 8, hub_port as u16, 0, 0, false);
+        self.settle_ms(BOT_RESCUE_PORT_ON_MS);
+        let (after, change) = port_status(self).unwrap_or((0xFFFF, 0));
+        if !matches!(on_res, Ok(1)) {
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok=no why=hub-pipe-dead phase=on res={:?} status={:#06x} n={} ::",
+                slot_id, hub_slot, hub_port, on_res, after, n);
+            return false;
+        }
+        // No change feature is cleared here: C_PORT_CONNECTION is the edge service_one_hub_change
+        // re-enumerates on, and it acknowledges the full wPortChange word itself once it has.
+        let ccs = after & 1;
+        serial_println!(
+            ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok={} link={} off_ms={} on_ms={} status={:#06x}->{:#06x}->{:#06x} change={:#06x} pp_off={} ccs={} route={:#x} depth={} n={} — power switched at the hub's own port; re-enum DELEGATED to the status-change path ::",
+            slot_id, hub_slot, hub_port, if ccs != 0 { "yes" } else { "no" },
+            if is_ss { "ss" } else { "usb2" },
+            BOT_RESCUE_PORT_OFF_MS, BOT_RESCUE_PORT_ON_MS,
+            before, off, after, change, (off >> pp_bit) & 1, ccs, route, depth, n);
         ccs != 0
     }
 
@@ -11600,6 +11782,15 @@ impl XhciController {
         if !self.address_downstream(slot_id, root_hub_port, route_string, depth, speed, tt_hub_slot, tt_port) {
             self.dispose_downstream_slot(slot_id as u8);
             return;
+        }
+        // [piusb41] Record the IMMEDIATE parent (hub slot + hub downstream port) the moment the slot
+        // exists. This is the ONE place a downstream slot is born, and the pair is not recoverable
+        // afterwards (route_string carries nibbles, not slot ids), so the rescue ladder's hub-port
+        // power-cycle rung would otherwise have nothing exact to aim a class request at.
+        {
+            let s = &mut self.slots[slot_id as usize];
+            s.parent_hub_slot = hub_slot;
+            s.parent_hub_port = port;
         }
         let buf = self.slots[slot_id as usize].descriptor_buffer as u64;
 
