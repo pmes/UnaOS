@@ -91,17 +91,28 @@ COMPLETE :: BANDY-RT:
 # ---    no FAT volume, ELFHELLO.ELF/VUG.ELF absent — so counting them would red a metal boot on a
 # ---    card that simply lacks the fixture. EXEC-UVUG is the same launcher shape (and its real
 # ---    assertion is the `UVUG: frames=300 … checksum=` REQUIRE below, which is sharper). SERWIT-2
-# ---    is excluded for a different and weaker reason, stated so it can be revisited: it has NO
-# ---    skip path (`mirror_verdict_once`, one-shot on main-loop entry, prints PASS or `FAIL ::`)
-# ---    and its FAIL is already convicted by the default `FAIL ::` FORBID, but its ABSENCE is not,
-# ---    and this arc had no UNAOS_SKIP_XHCI capture to prove the ftdi tap's presence is unconditional.
-# ---    Promoting it to a REQUIRE is the open ruling.
+# ---    stays excluded from the COUNT (its REQUIRE below is the sharper gate; counting it too is
+# ---    coverage arithmetic, the midden block's own argument).
+# ---    SERWIT-2 RULING EXECUTED (2026-08-13, S1Z; evidence: specs/serwit2-evidence.md): the
+# ---    skip_xhci capture the old comment waited for exists (witness printed at line 200 of
+# ---    14,666 with xHCI skipped — and arroyo's K8_FEATS hardcodes skip_xhci, so every pi4
+# ---    regression capture always was one). TWO PREMISES OF THE OLD COMMENT WERE FALSE, verified
+# ---    in source: the emitter prints `:: SERWIT-2: FAIL — balanced=… ::` (serial_ring.rs:1471) —
+# ---    `FAIL` followed by an em-dash, matching NEITHER default FORBID (`-> FAIL`, `FAIL ::`,
+# ---    mbench.py DEFAULT_FORBIDS) — so its FAIL was NOT convicted; and its absence never was.
+# ---    Hence the REQUIRE + dedicated FORBID pair below. The ftdi tap's conservation is honestly
+# ---    VACUOUS on a skip_xhci boot (submitted=0); the REQUIRE pins the verdict's presence, never
+# ---    per-tap traffic — do not extend it to `ftdi: submitted=[1-9]`, that reds every default boot.
 # ---    MAINTENANCE RULE, since the floor is now tight: a new fixture that prints `:: LABEL: … ->
 # ---    PASS ::` raises the measured count, and the floor must be raised with it in the same commit.
 # ---    FLOOR 23 -> 25 (2026-08-04, same day): the ERET-SCRUB pair prints the doubly-framed
 # ---    fixture-verdict form, so the maintenance rule above applies — two new fixtures, floor +2,
 # ---    same landing. Measured on the eret branch gate run: 93/93 with both new lines present.
 COUNT 25 :: (?!ELF1:|EXEC1:|EXEC-UVUG:|SERWIT-2:)[A-Za-z0-9_-]+: .*-> PASS ::
+
+# --- SERWIT-2: mirror-tap conservation (promoted 2026-08-13, see ruling block above) ----------
+REQUIRE :: SERWIT-2: mirror taps .*-> PASS ::
+FORBID :: SERWIT-2: FAIL —
 
 # --- scheduler capstone: all 6 sync primitives in one boot -------------------------
 COUNT 6 CAPSTONE \w+: PASS
