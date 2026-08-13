@@ -8740,12 +8740,26 @@ impl XhciController {
                 slot_id, hub_slot, hub_port, route, depth, hub_depth, n);
             return false;
         }
-        // SAFETY CROSS-CHECK 2 — no OTHER live device may claim this same (hub, port). One port
-        // carries one device; a second claimant means the bookkeeping is wrong, and cutting power on
-        // a guess could darken a healthy sibling. Refuse instead.
+        // SAFETY CROSS-CHECK 2 — no OTHER LIVE device may claim this same (hub, port). One port
+        // carries one device; a second live claimant means the bookkeeping is wrong, and cutting
+        // power on a guess could darken a healthy sibling. Refuse instead.
+        //
+        // [piusb41] PA38: "live" must mean what the REST of the driver means by it, not merely
+        // `active`. `bot_clean` (see its `skipped=` line) treats a slot with a null output context
+        // or a SURRENDERED slot as having no reachable ring and no possible further transfer — a
+        // corpse the driver has already stopped addressing. Such a slot cannot be a healthy sibling
+        // to darken, so it must not veto its successor's power cycle. On PA38 the coalesced-re-plug
+        // hole above left exactly that shape behind (surrendered slot 2 still claiming hub 1 port
+        // 2) and this check refused `port-shared` against it. The hole is closed above; this is the
+        // predicate saying the same thing, so no future path can resurrect the false positive. The
+        // genuinely-impossible-but-defended case is UNCHANGED: a second slot that is active, has an
+        // output context and is not surrendered still refuses, and a live sibling on a DIFFERENT
+        // port of the same hub never matched in the first place (the `parent_hub_port` term).
         if let Some(other) = (1..self.slots.len()).find(|&i| {
             i != slot_id as usize
                 && self.slots[i].active
+                && !self.slots[i].output_context.is_null()
+                && self.bot_surrendered_slot != i as u8
                 && self.slots[i].parent_hub_slot == hub_slot
                 && self.slots[i].parent_hub_port == hub_port
         }) {
@@ -11421,6 +11435,32 @@ impl XhciController {
                     "xHCI: HUB slot {} port {} connect ignored (hub at max USB tier depth {}).",
                     hub_slot, port, hub_depth);
             } else {
+                // [piusb41] PA38: a hub COALESCES change bits. If a downstream device drops and
+                // comes back between two status polls, the only thing left latched is
+                // C_PORT_CONNECTION with CCS=1 — this branch — and the disconnect half (M3 below)
+                // is never serviced. Enumerating straight through would leave the PREDECESSOR slot
+                // `active`, still holding this (hub, port) pair and a live DCBAA pointer, while the
+                // same physical device came up on a fresh slot: a leak, and a ghost claimant that
+                // made `rescue_hub_port_cycle`'s exclusivity check refuse `why=port-shared` against
+                // a corpse. (PA38 metal: reader 058f:6362 on hub 1 port 2 enumerated as slot 2,
+                // stuck and surrendered, then re-enumerated as slot 5 through THIS line with no
+                // disconnect ever serviced for port 2; slot 5's hub-port-cycle was then blocked by
+                // slot 2 and the disk was surrendered.) The root path already guards exactly this
+                // way in `start_next_port` ("deferred re-plug: disposed N stale slot(s)"); the hub
+                // path must too. `disconnect_hub_port` IS the M3 teardown, route-prefix scoped to
+                // this port's subtree, so sibling ports and other trees are provably untouched —
+                // and it is a no-op when nothing claims the port.
+                let stale = (1..self.slots.len()).any(|i| {
+                    self.slots[i].active
+                        && self.slots[i].parent_hub_slot == hub_slot
+                        && self.slots[i].parent_hub_port == port
+                });
+                if stale {
+                    serial_println!(
+                        "xHCI: HUB slot {} port {} connect: stale slot(s) still claim this port (coalesced re-plug) — tearing down before re-enumeration.",
+                        hub_slot, port);
+                    self.disconnect_hub_port(hub_slot, port);
+                }
                 serial_println!("xHCI: HUB slot {} port {} connect: resetting + enumerating downstream device.", hub_slot, port);
                 // reset_downstream_port issues CLEAR C_PORT_CONNECTION + SET PORT_RESET, awaits
                 // C_PORT_RESET (bounded/paced), clears it, and reads the trained speed.
@@ -11525,6 +11565,13 @@ impl XhciController {
             // must leave the block registry too, or the installer keeps listing it. Slot-id matched,
             // so only the slot that actually published geometry is retracted.
             crate::drivers::block::unpublish_usb_geometry(i as u8, crate::drivers::block::usb_publish_gen());
+            // [piusb41] PA38: mirror the root-port teardown — a slot that leaves takes its BOT
+            // escalation state with it. Without this, a surrendered hub-downstream disk's slot id
+            // stayed marked after teardown, so the next device the controller handed that id would
+            // have every transfer refused up front, and the id would go on reading as "surrendered"
+            // to the rescue ladder's liveness tests. The surrender binds to the disk that earned
+            // it, not to a number.
+            self.bot_rescue_clear(i as u8);
             if self.configuring_slot == i as u8 { self.configuring_slot = 0; }
             if self.ftdi_configuring_slot == i as u8 { self.ftdi_configuring_slot = 0; }
             if self.ftdi_slot == i as u8 {
