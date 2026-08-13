@@ -11252,6 +11252,22 @@ fn v3d94_cm_station(minimal: bool) {
         CM_BASE,
         CM_BASE + 0x200
     );
+    // §49.19's recommended first measurement — the PM/ASB words, the ONE window the piOS mid-bin
+    // capture reads that our instrument could not compare at all, and the only place a bit was
+    // seen to change state precisely as a bin frame closed (RPIVID_ASB_V3D_M_CTRL 0x8060→0x8050
+    // across piOS's BFC++ instant). Five single registers, read-only, printed in the SWEEP line
+    // format so they diff against the piOS files with no re-formatting. The legacy ASB pair is
+    // the home of the July "M_CTRL 0x4040" datum — read here by OUR instrument for the first time.
+    for (name, phys) in [
+        ("PM_GRAFX", 0xFE10_010Cusize),
+        ("LEGACY_ASB_V3D_S_CTRL", 0xFE00_A008),
+        ("LEGACY_ASB_V3D_M_CTRL", 0xFE00_A00C),
+        ("RPIVID_ASB_V3D_S_CTRL", 0xFEC1_1008),
+        ("RPIVID_ASB_V3D_M_CTRL", 0xFEC1_100C),
+    ] {
+        let v = mmio_read(phys, 0);
+        serial_println!("SWEEP phys={:#010x} val={:#010x} pmasb={}", phys, v, name);
+    }
 }
 
 /// PI-V3D-94 half A — the hub-traffic bracket (v3d.md §49.17). Gate-off prints one SKIPPED line
