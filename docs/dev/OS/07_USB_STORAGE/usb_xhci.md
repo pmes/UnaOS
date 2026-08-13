@@ -6992,6 +6992,103 @@ existing `bt_l3_await`, whose `armed` threading is what preserves the invariant 
 
 ---
 
+## 27. BT-SSP — Secure Simple Pairing: the link becomes a bond (`UNAOS_BTC=1`, 2026-08-12)
+
+§24's L2CAP attempt named its own successor: a speaker that answers `CONNECTION_RESPONSE` with
+result `0x0003` (SECURITY BLOCK) is demanding an authenticated, encrypted link before it will open
+the AVDTP PSM. This stage is that authentication — Secure Simple Pairing in the "just works"
+association model, run on the live BR/EDR handle §26's page just established, *before* the C2
+attempt on the same link, so one boot carries both arms of the SECURITY BLOCK experiment.
+
+### 27.1 The handshake, and why it is one dispatch loop
+
+After `HCI_Write_Simple_Pairing_Mode` (0x0C56, Vol 4 Part E §7.3.59) and an event-mask widening
+(§27.2), `HCI_Authentication_Requested` (0x0411, §7.1.15) starts a handshake whose event order
+belongs to the **controller**, not the host: `Link Key Request` (§7.7.23), `IO Capability
+Request`/`Response` (§7.7.40/41), `User Confirmation Request` (§7.7.42), `Simple Pairing Complete`
+(§7.7.45), `Link Key Notification` (§7.7.24), `Authentication Complete` (§7.7.6). A sequence of
+narrow waits would walk past — and lose — any family member arriving out of the assumed order
+(`bt_l3_await` discards non-matches), so the stage adds one want, `BtL3Want::SspAny`, that matches
+the whole family plus Command Status/Complete, and a dispatch loop answers each event as it
+arrives: no key held → `Link_Key_Request_Negative_Reply` (§7.1.11); IO capabilities →
+NoInputNoOutput, no OOB, MITM-not-required + dedicated bonding (§7.1.29 — the truth about a
+machine with no consent UI at boot, which resolves the model to Just Works per Vol 3 Part C
+§5.2.2.6); user confirmation → auto-accepted with the numeric value **printed**, so the capture
+shows what was accepted unseen (§7.1.30). After `Authentication Complete` status 0x00,
+`HCI_Set_Connection_Encryption` (0x0413, §7.1.16) is issued inline and the stage ends on the
+`Encryption Change` event (§7.7.8). Bounds: `BT_SSP_STAGE_MS` (8 s hard cap), a per-event window,
+and a structural turn cap — C1's mandatory disconnect runs after it on every path.
+
+Events outside the just-works flow are **parked, not improvised**: `PIN Code Request` (legacy
+fallback), `User Passkey Request`, `Remote OOB Data Request` are each witnessed with their raw
+event bytes, answered with the spec's negative reply (no invented PIN, no guessed passkey), and
+end the stage.
+
+**Operator note — HID pauses during pairing.** The whole BT chain runs inside one
+`service_ehci_hid` pass holding the EHCI_HID lock, and this stage's worst case is `BT_SSP_STAGE_MS`
+(8 s). During a pairing the internal keyboard and trackpad — serviced by that same lock — are
+therefore unresponsive for up to that window; a healthy just-works pairing spends a fraction of it,
+but a peer that engages and then stalls holds HID for the full cap. This is expected, not a hang,
+and clears the instant the stage reaches its tally. (It is the same lock-hold that blocks the link
+key from a synchronous filesystem write — §27.3.)
+
+### 27.2 The event mask, again
+
+The mask in force after §21 is the reset default plus LE Meta (bit 61) — and the reset default
+ends at bit 44, while the six SSP events live at bits 48..53. Without a new
+`HCI_Set_Event_Mask` the controller runs the pairing and tells the host *nothing*: the same
+clean, silent, entirely wrong shape as §21's missing bit 61. The stage writes
+`0x203F_1FFF_FFFF_FFFF` (default + SSP family + LE Meta) before requesting authentication, and
+leaves it in place under the same provenance note as L2's widening.
+
+### 27.3 The bond, and the persistence gap (honest)
+
+`Link Key Notification` delivers the bond: a 16-byte link key (type 0x04, unauthenticated
+combination — the just-works outcome), stored in `Controller::bt_ssp_key`. The key bytes are
+**withheld from the log on purpose** — a serial capture must not carry the bond secret. A
+re-triggered chain (`Ctrl+Alt+B`, §25) re-enters the stage with that key and answers the
+controller's `Link Key Request` positively (§7.1.10), so its authentication completes with **no
+second pairing** — the bond doing its job inside one session.
+
+**The gap:** a real bond survives power-off; this one cannot yet. The kernel's writable VFS rides
+USB mass storage serviced by this same driver under the EHCI_HID lock the BT chain already holds,
+so a store write from inside the chain would re-enter the lock. Until a deferred-write path (or a
+non-USB store) exists, every boot pairs afresh and the speaker accumulates one bond entry per
+boot. The Link Key Notification witness names this on the wire.
+
+### 27.4 What metal must verify (the next BT boot)
+
+`strings` on a `UNAOS_BTC=1` kernel shows the `bt-ssp:` family (38 lines: `stage=arm`,
+`stage=ssp-mode`, `stage=event-mask`, `stage=auth-request`, `stage=link-key-request`,
+`stage=io-cap-request`, `stage=io-cap-response`, `stage=user-confirm`, `stage=pairing`,
+`stage=link-key`, `stage=auth-complete`, `stage=encrypt`, `PARKED`, `SSP tally`); a default build
+shows none. The falsifiable outcomes, ranked:
+
+1. **The rung holds.** `stage=pairing … PAIRED`, `stage=link-key … STORED IN RAM`,
+   `stage=auth-complete … AUTHENTICATED`, `stage=encrypt … ENCRYPTED (E0 …)`, tally
+   `-> BONDED AND ENCRYPTED` — and then §24's `CONNECTION_RESPONSE` **without** result 0x0003:
+   the SECURITY BLOCK lifted by this stage on the same boot.
+2. **Bonded but still blocked.** Tally `BONDED AND ENCRYPTED` and C2 still reads 0x0003 — the
+   speaker wants something beyond authentication+encryption (or a fresh L2CAP attempt on a new
+   link), and that becomes the next brief.
+3. **The peer refuses the bond.** `Simple Pairing Complete status=0x05` — commonly a speaker
+   already bonded to another host and not in pairing mode. The re-trigger chord after putting it
+   in pairing mode is the second experiment, free.
+4. **A park fires.** `PIN Code Request` raw bytes = the controller ignored SSP mode; that indicts
+   the 0x0C56 write path or the part's ROM, not the peer.
+5. **Silence mid-handshake.** The `NO family event` witness names the last milestone reached;
+   a stall at `stage=auth-request` with the mask line REFUSED above it is the mask, not the air.
+
+The §22 refutation outranks all of these unchanged: **HID dead after `bt-ssp` = the endpoint
+invariant broke.** The stage adds no `bt_arm_read` call site; every read rides `bt_l3_await` and
+`bt_hci_command`, whose `armed` threading preserves the invariant by construction.
+
+What C3 (audio) still needs is not more security: AVDTP `SET_CONFIGURATION`/`OPEN`/`START` on the
+SEP §24 discovers, an SBC encoder, and the ACL data path at streaming rate — plus, eventually, the
+deferred-write path that turns this session bond into a persistent one.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).

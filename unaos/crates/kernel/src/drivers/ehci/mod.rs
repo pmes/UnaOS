@@ -686,6 +686,13 @@ pub struct Controller {
     /// exactly the double-connect the teardown discipline exists to prevent.
     #[cfg(feature = "btc")]
     bt_left_link: Option<u16>,
+    /// BT-SSP — the link key of the one peer this session has bonded with, or `None`. Written by
+    /// exactly one place (the `Link Key Notification` handler in `bt_ssp_pair`) and read by
+    /// exactly one (the `Link Key Request` handler, which is what turns a re-triggered chain's
+    /// authentication into a key lookup instead of a second pairing). RAM only — see `BtSspKey`
+    /// for why persisting it is not yet reachable from this path.
+    #[cfg(feature = "btc")]
+    bt_ssp_key: Option<BtSspKey>,
 }
 
 // Raw pointers to identity-mapped DMA memory; access is serialized by the EHCI_HID mutex.
@@ -1899,6 +1906,191 @@ enum BtC2Want {
 }
 // ============================== end BT-C2 constants ======================================
 
+// ============================== BT-SSP constants ==========================================
+// BT-SSP (GR27) — Secure Simple Pairing, "just works": the rung between BT-C1's transport link
+// and any A2DP stream. BT-C2's CONNECTION_RESPONSE result 0x0003 (SECURITY BLOCK) is a speaker
+// saying "authenticate and encrypt first"; this stage is that authentication. It runs as the
+// CENTRAL on the live handle BT-C1 just established, drives the SSP handshake to a LINK KEY and
+// an AUTHENTICATED link, then encrypts it — all before BT-C2's L2CAP attempt, so the same boot
+// answers whether the SECURITY BLOCK lifts. Gated on `btc` exactly as C1/C2 are: it can only run
+// on a link a `UNAOS_BTC=1` page produced.
+
+/// BT-SSP — `HCI_Write_Simple_Pairing_Mode`: OGF 0x03 / OCF 0x0056 => opcode 0x0C56
+/// (Vol 4 Part E §7.3.59). One parameter byte (0x01 = enabled); returns status(1). Without it the
+/// controller falls back to LEGACY (PIN-code) pairing on an authentication request — the
+/// `PIN Code Request` park below is what that fallback looks like when a controller refuses this.
+#[cfg(feature = "btc")]
+const BT_HCI_WRITE_SSP_MODE: u16 = 0x0C56;
+/// BT-SSP — `HCI_Authentication_Requested`: OGF 0x01 / OCF 0x0011 => opcode 0x0411
+/// (Vol 4 Part E §7.1.15). Connection_Handle(2); answered with Command STATUS, then the SSP event
+/// chain. This is the command that starts the whole handshake.
+#[cfg(feature = "btc")]
+const BT_HCI_AUTH_REQUESTED: u16 = 0x0411;
+/// BT-SSP — `HCI_Set_Connection_Encryption`: OGF 0x01 / OCF 0x0013 => opcode 0x0413
+/// (Vol 4 Part E §7.1.16). Connection_Handle(2) Encryption_Enable(1); Command Status, then an
+/// `Encryption Change` event. Issued only AFTER `Authentication Complete` status 0x00 — the spec
+/// forbids encrypting an unauthenticated BR/EDR link.
+#[cfg(feature = "btc")]
+const BT_HCI_SET_CONN_ENCRYPTION: u16 = 0x0413;
+/// BT-SSP — `HCI_Link_Key_Request_Reply`: OGF 0x01 / OCF 0x000B => opcode 0x040B
+/// (Vol 4 Part E §7.1.10). BD_ADDR(6) Link_Key(16); Command Complete echoes status + BD_ADDR.
+/// Sent when this session already HOLDS a key for the peer (a re-trigger after a completed
+/// pairing) — the authentication then completes without any SSP exchange at all.
+#[cfg(feature = "btc")]
+const BT_HCI_LINK_KEY_REPLY: u16 = 0x040B;
+/// BT-SSP — `HCI_Link_Key_Request_Negative_Reply`: OGF 0x01 / OCF 0x000C => opcode 0x040C
+/// (Vol 4 Part E §7.1.11). BD_ADDR(6). The honest answer on a first pairing: "no key held" is what
+/// makes the controller start the SSP public-key exchange instead of reusing a bond.
+#[cfg(feature = "btc")]
+const BT_HCI_LINK_KEY_NEG_REPLY: u16 = 0x040C;
+/// BT-SSP — `HCI_PIN_Code_Request_Negative_Reply`: OGF 0x01 / OCF 0x000E => opcode 0x040E
+/// (Vol 4 Part E §7.1.13). BD_ADDR(6). Sent only on the LEGACY-pairing park: a `PIN Code Request`
+/// means SSP is not in force on this link, this host holds no PIN, and inventing one (0000) would
+/// be a guess presented as a credential. The pairing is declined instead, and the witness says so.
+#[cfg(feature = "btc")]
+const BT_HCI_PIN_CODE_NEG_REPLY: u16 = 0x040E;
+/// BT-SSP — `HCI_IO_Capability_Request_Reply`: OGF 0x01 / OCF 0x002B => opcode 0x042B
+/// (Vol 4 Part E §7.1.29). BD_ADDR(6) IO_Capability(1) OOB_Data_Present(1)
+/// Authentication_Requirements(1); Command Complete echoes status + BD_ADDR.
+#[cfg(feature = "btc")]
+const BT_HCI_IO_CAP_REPLY: u16 = 0x042B;
+/// BT-SSP — `HCI_User_Confirmation_Request_Reply`: OGF 0x01 / OCF 0x002C => opcode 0x042C
+/// (Vol 4 Part E §7.1.30). BD_ADDR(6). THE "just works" auto-accept: with both sides
+/// NoInputNoOutput the association model has no numeric comparison to show anyone, and the spec's
+/// own IO-capability mapping (Vol 3 Part C §5.2.2.6) resolves it to Just Works — the confirmation
+/// event still arrives and the host answers yes. The witness prints the numeric value anyway,
+/// because a capture must show what was auto-accepted.
+#[cfg(feature = "btc")]
+const BT_HCI_USER_CONFIRM_REPLY: u16 = 0x042C;
+/// BT-SSP — `HCI_User_Passkey_Request_Negative_Reply`: OGF 0x01 / OCF 0x002F => opcode 0x042F
+/// (Vol 4 Part E §7.1.33). BD_ADDR(6). A passkey request against a host that declared
+/// NoInputNoOutput is a contradiction — this host has nowhere to read a passkey from and said so
+/// in its IO capability. Parked with the raw event bytes, declined, never guessed.
+#[cfg(feature = "btc")]
+const BT_HCI_USER_PASSKEY_NEG_REPLY: u16 = 0x042F;
+/// BT-SSP — `HCI_Remote_OOB_Data_Request_Negative_Reply`: OGF 0x01 / OCF 0x0033 => opcode 0x0433
+/// (Vol 4 Part E §7.1.35). BD_ADDR(6). This host declared OOB_Data_Present=0x00; an OOB request
+/// anyway is answered negatively, exactly as the declaration promised.
+#[cfg(feature = "btc")]
+const BT_HCI_REMOTE_OOB_NEG_REPLY: u16 = 0x0433;
+/// BT-SSP — the event mask this stage writes before `Authentication_Requested`, and WHY IT MUST.
+/// The mask in force when C1's link establishes is `BT_EVENT_MASK_LE` (the reset default plus LE
+/// Meta, bit 61) — and the reset default (events through bit 44) does NOT include the six SSP
+/// events, which live at bits 48..53 (bit = event_code - 1: IO Capability Request 0x31 => bit 48,
+/// IO Capability Response 0x32 => 49, User Confirmation Request 0x33 => 50, User Passkey Request
+/// 0x34 => 51, Remote OOB Data Request 0x35 => 52, Simple Pairing Complete 0x36 => 53 — octet 6 =
+/// 0x3F). Without this write the controller runs the pairing and TELLS THE HOST NOTHING: the IO
+/// Capability Request is never delivered, the controller times the handshake out, and the capture
+/// shows a clean, silent, entirely wrong "peer never engaged". Everything the LE mask enabled
+/// stays enabled (`Link Key Request` bit 22, `Link Key Notification` bit 23, `Authentication
+/// Complete` bit 5, `Encryption Change` bit 7 and `PIN Code Request` bit 21 are all inside the
+/// reset default already). Like L2's widening, this mask is LEFT IN PLACE afterwards — the SSP
+/// events only fire during a pairing this host itself requested, so there is no unsolicited
+/// traffic to narrow away, and the provenance note on `BT_EVENT_MASK_LE` applies here unchanged.
+#[cfg(feature = "btc")]
+const BT_EVENT_MASK_SSP: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x3F, 0x20];
+/// BT-SSP — IO_Capability 0x03 = NoInputNoOutput (Vol 4 Part E §7.1.29). The truth about this
+/// machine DURING BOOT: the compositor may exist but no consent UI does, so claiming a display
+/// or a yes/no button would promise an interaction this stage cannot deliver. NoInputNoOutput on
+/// either side resolves the association model to Just Works (Vol 3 Part C §5.2.2.6) — no MITM
+/// protection, which is what a speaker bond warrants and the auth-requirements byte admits.
+#[cfg(feature = "btc")]
+const BT_SSP_IO_CAP: u8 = 0x03;
+/// BT-SSP — OOB_Data_Present 0x00: no out-of-band pairing data is held for the peer.
+#[cfg(feature = "btc")]
+const BT_SSP_OOB: u8 = 0x00;
+/// BT-SSP — Authentication_Requirements 0x02 = MITM Protection Not Required, Dedicated Bonding
+/// (Vol 4 Part E §7.1.29, table). DEDICATED BONDING is the point of the stage: both sides store
+/// the resulting link key, which is what makes the NEXT connection authenticate without pairing.
+/// MITM is honestly NOT claimable — a NoInputNoOutput host cannot do numeric comparison, so
+/// requiring MITM here would fail every pairing this stage attempts. The key this produces is an
+/// Unauthenticated Combination Key (type 0x04/0x07), sufficient for A2DP.
+#[cfg(feature = "btc")]
+const BT_SSP_AUTH_REQ: u8 = 0x02;
+/// BT-SSP — HARD wall-clock cap on the whole stage, ms, measured from its first line. A real
+/// just-works pairing is public-key exchange plus link-manager traffic, hundreds of ms on this
+/// class of part; 8 s bounds a peer that engages and then stalls mid-handshake. Same cap-not-
+/// budget discipline as `BT_C2_STAGE_MS`: the ordinary path spends a fraction of it, and BT-C1's
+/// mandatory `HCI_Disconnect` always runs after this stage whatever it spends.
+#[cfg(feature = "btc")]
+const BT_SSP_STAGE_MS: u64 = 8000;
+/// BT-SSP — per-wait ceiling, ms, inside the stage cap (each wait gets `min` of this and the
+/// stage's remaining time). 2500 ms is generous for any single controller->host event of the
+/// handshake; it exists so ONE silent stretch is named by the wait that starved rather than
+/// consuming the whole stage.
+#[cfg(feature = "btc")]
+const BT_SSP_EVT_MS: u64 = 2500;
+/// BT-SSP — structural cap on dispatch-loop turns (each turn = one SSP-family event or one
+/// walked-past batch inside `bt_l3_await`). A correct first pairing is ~10 turns (status, link
+/// key request, its CmdComplete, IO cap request/reply-complete/response, user confirmation +
+/// complete, simple pairing complete, link key notification, auth complete, encrypt status,
+/// encryption change); 32 is the same second-bound reasoning as `BT_C2_PKT_MAX`.
+#[cfg(feature = "btc")]
+const BT_SSP_TURN_MAX: u32 = 32;
+/// BT-SSP — `Authentication Complete` event 0x06 (Vol 4 Part E §7.7.6): Status(1) Handle(2).
+#[cfg(feature = "btc")]
+const BT_EVT_AUTH_COMPLETE: u8 = 0x06;
+/// BT-SSP — `Encryption Change` event 0x08 (Vol 4 Part E §7.7.8): Status(1) Handle(2)
+/// Encryption_Enabled(1): 0x00 off, 0x01 on (E0 on BR/EDR), 0x02 on (AES-CCM).
+#[cfg(feature = "btc")]
+const BT_EVT_ENC_CHANGE: u8 = 0x08;
+/// BT-SSP — `PIN Code Request` event 0x16 (Vol 4 Part E §7.7.22): BD_ADDR(6). The LEGACY-pairing
+/// signature; under SSP mode it must not arrive, and its arrival is a PARK, not a stage.
+#[cfg(feature = "btc")]
+const BT_EVT_PIN_CODE_REQ: u8 = 0x16;
+/// BT-SSP — `Link Key Request` event 0x17 (Vol 4 Part E §7.7.23): BD_ADDR(6).
+#[cfg(feature = "btc")]
+const BT_EVT_LINK_KEY_REQ: u8 = 0x17;
+/// BT-SSP — `Link Key Notification` event 0x18 (Vol 4 Part E §7.7.24): BD_ADDR(6) Link_Key(16)
+/// Key_Type(1). THE BOND — the one artefact of the whole stage that outlives the link.
+#[cfg(feature = "btc")]
+const BT_EVT_LINK_KEY_NOTIFY: u8 = 0x18;
+/// BT-SSP — `IO Capability Request` event 0x31 (Vol 4 Part E §7.7.40): BD_ADDR(6).
+#[cfg(feature = "btc")]
+const BT_EVT_IO_CAP_REQ: u8 = 0x31;
+/// BT-SSP — `IO Capability Response` event 0x32 (Vol 4 Part E §7.7.41): BD_ADDR(6)
+/// IO_Capability(1) OOB_Data_Present(1) Authentication_Requirements(1) — the PEER's declaration.
+#[cfg(feature = "btc")]
+const BT_EVT_IO_CAP_RSP: u8 = 0x32;
+/// BT-SSP — `User Confirmation Request` event 0x33 (Vol 4 Part E §7.7.42): BD_ADDR(6)
+/// Numeric_Value(4, LE, 000000..999999).
+#[cfg(feature = "btc")]
+const BT_EVT_USER_CONFIRM_REQ: u8 = 0x33;
+/// BT-SSP — `User Passkey Request` event 0x34 (Vol 4 Part E §7.7.43): BD_ADDR(6). Park.
+#[cfg(feature = "btc")]
+const BT_EVT_USER_PASSKEY_REQ: u8 = 0x34;
+/// BT-SSP — `Remote OOB Data Request` event 0x35 (Vol 4 Part E §7.7.44): BD_ADDR(6). Park.
+#[cfg(feature = "btc")]
+const BT_EVT_REMOTE_OOB_REQ: u8 = 0x35;
+/// BT-SSP — `Simple Pairing Complete` event 0x36 (Vol 4 Part E §7.7.45): Status(1) BD_ADDR(6).
+#[cfg(feature = "btc")]
+const BT_EVT_SIMPLE_PAIRING_COMPLETE: u8 = 0x36;
+
+/// BT-SSP — one bonded peer's link key, held on the controller because it OUTLIVES the link: the
+/// entire value of a bond is the next connection, and a re-triggered chain (Ctrl+Alt+B) answers
+/// the controller's `Link Key Request` from here (`HCI_Link_Key_Request_Reply`), which completes
+/// authentication without a second pairing.
+///
+/// RAM ONLY, AND SAID SO ON THE WIRE. A real bond persists across power cycles; this one cannot
+/// yet. The kernel does have a writable VFS (`fs/vfs.rs` + unafs/FAT backends), but on this
+/// machine its storage rides USB mass storage serviced by THIS driver under the same EHCI_HID
+/// lock — a filesystem write from inside the BT chain (which runs inside `service_ehci_hid`)
+/// would re-enter the lock that is already held. Persisting the key therefore needs either a
+/// deferred write queued past the service pass or a non-USB store, and both are outside this
+/// arc. The Link Key Notification witness names the gap so no capture mistakes this for a
+/// persistent bond.
+#[cfg(feature = "btc")]
+#[derive(Clone, Copy)]
+struct BtSspKey {
+    /// Peer BD_ADDR in WIRE order (LSB first), as every HCI command wants it.
+    addr: [u8; 6],
+    key: [u8; 16],
+    /// Key_Type from the Link Key Notification, verbatim (0x04 = unauthenticated combination
+    /// P-192, 0x07 = unauthenticated combination P-256 — the just-works outcomes).
+    key_type: u8,
+}
+// ============================== end BT-SSP constants ======================================
+
 /// BT-L1 — reassembly cap for one HCI event that spans multiple event-endpoint packets. The event
 /// endpoint's max packet is 16 B (census: `IN1/int/16`), but an HCI event runs up to 2 + 255 B;
 /// the USB transport delivers it as ceil(len/mps) interrupt-IN transfers. 260 covers the largest
@@ -2194,6 +2386,15 @@ enum BtL3Want {
     /// that carried the target and the wait returns on it rather than one event later.
     #[cfg(feature = "btc")]
     InquiryEnd,
+    /// BT-SSP — ANY event of the pairing family: the six SSP events, the three link-key/PIN
+    /// events, `Authentication Complete`, `Encryption Change`, and every Command Status/Command
+    /// Complete. ONE want rather than a sequence of narrow ones, because the handshake's event
+    /// order is the CONTROLLER's choice, not this host's: a wait narrowed to the expected next
+    /// event would walk past — and lose — any member of the family that arrived out of the
+    /// expected order (`bt_l3_await` discards non-matches, and only Connection Completes are
+    /// latched). The dispatch loop in `bt_ssp_pair` is where each returned event is interpreted.
+    #[cfg(feature = "btc")]
+    SspAny,
 }
 
 /// BT-L3 — outcome of one bounded `bt_l3_await`.
@@ -5497,6 +5698,26 @@ impl Controller {
                 // packet if this is the one that carried the target.
                 #[cfg(feature = "btc")]
                 BtL3Want::InquiryEnd => pkt[0] == BT_EVT_INQUIRY_COMPLETE || st.inq_found,
+                // The pairing family, wholesale — see the variant's docblock for why it cannot
+                // be a sequence of narrow wants. `Connection Complete` (0x03) is deliberately NOT
+                // in the family: the latch below must keep seeing it.
+                #[cfg(feature = "btc")]
+                BtL3Want::SspAny => matches!(
+                    pkt[0],
+                    BT_EVT_CMD_STATUS
+                        | BT_EVT_CMD_COMPLETE
+                        | BT_EVT_AUTH_COMPLETE
+                        | BT_EVT_ENC_CHANGE
+                        | BT_EVT_PIN_CODE_REQ
+                        | BT_EVT_LINK_KEY_REQ
+                        | BT_EVT_LINK_KEY_NOTIFY
+                        | BT_EVT_IO_CAP_REQ
+                        | BT_EVT_IO_CAP_RSP
+                        | BT_EVT_USER_CONFIRM_REQ
+                        | BT_EVT_USER_PASSKEY_REQ
+                        | BT_EVT_REMOTE_OOB_REQ
+                        | BT_EVT_SIMPLE_PAIRING_COMPLETE
+                ),
             };
             if hit {
                 return BtL3Await::Got(len);
@@ -7186,7 +7407,7 @@ impl Controller {
                         live = true;
                         handle = h;
                         serial_println!(
-                            ":: bt-c1: [{}] Connection Complete (0x03) — status={:#04x} handle={:#06x} peer={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link_type={:#04x}(ACL) encryption={:#04x} -> BR/EDR LINK ESTABLISHED. This is the transport A2DP runs on; nothing above L2CAP is attempted and the link is released below == witness ::",
+                            ":: bt-c1: [{}] Connection Complete (0x03) — status={:#04x} handle={:#06x} peer={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link_type={:#04x}(ACL) encryption={:#04x} -> BR/EDR LINK ESTABLISHED. This is the transport A2DP runs on; SSP pairing (bt-ssp) and the L2CAP road (bt-c2) run on it below, and the link is then released == witness ::",
                             self.idx, s, h,
                             asm[10], asm[9], asm[8], asm[7], asm[6], asm[5],
                             asm[11], asm[12]
@@ -7468,6 +7689,13 @@ impl Controller {
         // bounded by `BT_C2_STAGE_MS`, and the `if live` block below is conditional on nothing it
         // does. The cost it adds to a boot that reaches here is bounded by that one constant.
         if live {
+            // BT-SSP FIRST: bond and encrypt the link, so the C2 attempt straight after it runs
+            // on an authenticated, ciphered transport — the SECURITY BLOCK experiment, both arms
+            // in one boot. Same structural guarantees as C2: unit return, every wait bounded
+            // (`BT_SSP_STAGE_MS`), and the teardown below is conditional on nothing it does. A
+            // re-triggered chain (Ctrl+Alt+B) re-enters here with the session's stored link key,
+            // which is what turns its authentication into a lookup instead of a second pairing.
+            self.bt_ssp_pair(t, intf, e, toggle, armed, handle, &mut seen, &mut st, &mut asm);
             self.bt_c2_l2cap(t, handle);
         }
 
@@ -7541,6 +7769,633 @@ impl Controller {
         );
     }
     // ============================== end BT-C1 ================================================
+
+    // ================================ BT-SSP =================================================
+
+    /// BT-SSP — how long the NEXT bounded wait may run: the smaller of one per-event window and
+    /// what remains of the whole stage, in CYCLES. `bt_c2_window`'s discipline, ported: every
+    /// wait goes through here, so `BT_SSP_STAGE_MS` is a real cap, and 0 makes the caller unwind
+    /// to its tally rather than being trusted to check a clock.
+    #[cfg(feature = "btc")]
+    fn bt_ssp_window(t0: u64, cap: u64) -> u64 {
+        let el = crate::arch::now_cycles().wrapping_sub(t0);
+        cap.saturating_sub(el).min(Self::bt_l3_budget(BT_SSP_EVT_MS))
+    }
+
+    /// BT-SSP — render up to 16 bytes of an event as hex for the PARK witnesses. A parked event
+    /// is one this stage refuses to interpret, so the capture gets the bytes themselves rather
+    /// than this host's paraphrase of them.
+    #[cfg(feature = "btc")]
+    fn bt_ssp_hex(pkt: &[u8]) -> ([u8; 47], usize) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let n = pkt.len().min(16);
+        let mut out = [b' '; 47];
+        for (i, &b) in pkt[..n].iter().enumerate() {
+            out[i * 3] = HEX[(b >> 4) as usize];
+            out[i * 3 + 1] = HEX[(b & 0x0F) as usize];
+        }
+        (out, if n == 0 { 0 } else { n * 3 - 1 })
+    }
+
+    /// BT-SSP — Secure Simple Pairing ("just works") on the live BR/EDR handle BT-C1 established,
+    /// then `Set_Connection_Encryption`. THE RUNG THIS ARC ADDS: C1 proved the transport, C2's
+    /// SECURITY BLOCK named the missing precondition, and this stage is that precondition — a
+    /// stored link key (the BOND) and a ciphered link, both witnessed per HCI round trip.
+    ///
+    /// Placed between C1's link-establishment and C2's L2CAP attempt, so a boot that pairs
+    /// immediately re-tests the SECURITY BLOCK on the same link. Structurally incapable of
+    /// skipping C1's mandatory teardown for the same reasons C2 is: returns unit, every wait is
+    /// bounded through `bt_ssp_window`, and the `if live` teardown below it is conditional on
+    /// nothing here.
+    ///
+    /// THE HANDSHAKE IS EVENT-DRIVEN AND THE ORDER IS THE CONTROLLER'S. After
+    /// `Authentication_Requested` is accepted, the controller asks the host questions (`Link Key
+    /// Request`, `IO Capability Request`, `User Confirmation Request`) and reports peer facts
+    /// (`IO Capability Response`, `Simple Pairing Complete`, `Link Key Notification`,
+    /// `Authentication Complete`) in an order this host must not assume — so one dispatch loop
+    /// awaits the whole family (`BtL3Want::SspAny`) and answers each event as it arrives. An
+    /// event outside the just-works flow (`PIN Code Request` = legacy fallback, `User Passkey
+    /// Request`, `Remote OOB Data Request`) is PARKED: witnessed with its raw bytes, answered
+    /// with the spec's negative reply, and the stage ends rather than improvises a credential.
+    ///
+    /// Shares `st`/`seen`/`asm` with BT-C1 on purpose, exactly as the inquiry does: one
+    /// events-read count for the boot's chain, one blind/stopped verdict, and a Connection
+    /// Complete arriving mid-pairing still lands in the same latch.
+    #[cfg(feature = "btc")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_ssp_pair(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+        handle: u16,
+        seen: &mut u32,
+        st: &mut BtL3State,
+        asm: &mut [u8],
+    ) {
+        let addr = BT_L3_PEER_ADDR_BYTES; // WIRE order (LSB first) — see `bt_name.rs`
+        let text = bt_addr_render_msb(&addr);
+        let peer = core::str::from_utf8(&text).unwrap_or("??:??:??:??:??:??");
+        let h = handle & 0x0FFF;
+        let t0 = crate::arch::now_cycles();
+        let cap = Self::bt_l3_budget(BT_SSP_STAGE_MS);
+        let held = matches!(self.bt_ssp_key, Some(k) if bt_addr_eq(&k.addr, &addr));
+
+        serial_println!(
+            ":: bt-ssp: [{}] stage=arm — handle={:#06x} peer={} io_capability={:#04x}(NoInputNoOutput: no consent UI exists during boot, so no display and no yes/no button is claimed) oob={:#04x}(none held) auth_requirements={:#04x}(MITM not required + DEDICATED BONDING — the key is the point; MITM is unclaimable without IO) session_key={} stage_cap={}ms per_event_window={}ms; C2's SECURITY BLOCK (result 0x0003) names authentication as the L2CAP road's precondition, and this stage is it == witness ::",
+            self.idx, h, peer, BT_SSP_IO_CAP, BT_SSP_OOB, BT_SSP_AUTH_REQ,
+            if held {
+                "HELD from a completed pairing this session — the Link Key Request below is answered from it and no SSP exchange runs"
+            } else {
+                "none — first pairing: Link_Key_Request_Negative_Reply, then the full SSP exchange"
+            },
+            BT_SSP_STAGE_MS, BT_SSP_EVT_MS
+        );
+
+        // ---- 1. HCI_Write_Simple_Pairing_Mode = enabled (Vol 4 Part E §7.3.59) ------------------
+        // BEFORE the authentication request, because the mode decides WHICH pairing the request
+        // starts: enabled => SSP, disabled => legacy PIN-code — and this host holds no PIN.
+        let mut rp = [0u8; 8];
+        match self.bt_hci_command(
+            t, intf, e, toggle, BT_HCI_WRITE_SSP_MODE, &[0x01], &mut rp, armed,
+        ) {
+            Some(n) if n >= 1 && rp[0] == 0x00 => serial_println!(
+                ":: bt-ssp: [{}] stage=ssp-mode — HCI_Write_Simple_Pairing_Mode (0x0C56) status=0x00 -> ENABLED; an authentication request on this link now runs Secure Simple Pairing, not legacy PIN pairing == witness ::",
+                self.idx
+            ),
+            Some(n) if n >= 1 => {
+                serial_println!(
+                    ":: bt-ssp: [{}] stage=ssp-mode — HCI_Write_Simple_Pairing_Mode (0x0C56) status={:#04x} -> REFUSED. Requesting authentication anyway would start a LEGACY pairing this host cannot answer (it holds no PIN), so the stage ends here and the link stays unauthenticated == witness ::",
+                    self.idx, rp[0]
+                );
+                self.bt_ssp_tally(t0, 0, st, held, false, None, false, None, false, None, false, None, false, None, false);
+                return;
+            }
+            _ => {
+                serial_println!(
+                    ":: bt-ssp: [{}] stage=ssp-mode — HCI_Write_Simple_Pairing_Mode (0x0C56) -> NO CmdComplete; the mode is UNKNOWN and an authentication request could start a legacy pairing, so the stage ends here == witness ::",
+                    self.idx
+                );
+                self.bt_ssp_tally(t0, 0, st, held, false, None, false, None, false, None, false, None, false, None, false);
+                return;
+            }
+        }
+
+        // ---- 2. widen the event mask to the SSP family (Vol 4 Part E §7.3.1) --------------------
+        // See `BT_EVENT_MASK_SSP` for the bit arithmetic and for why, without this, the pairing
+        // runs and the host is told nothing.
+        match self.bt_hci_command(
+            t, intf, e, toggle, BT_HCI_SET_EVENT_MASK, &BT_EVENT_MASK_SSP, &mut rp, armed,
+        ) {
+            Some(n) if n >= 1 && rp[0] == 0x00 => serial_println!(
+                ":: bt-ssp: [{}] stage=event-mask — HCI_Set_Event_Mask status=0x00 mask=0x203F_1FFF_FFFF_FFFF (reset default + SSP events bits 48..53 + LE Meta bit 61 carried from L2); the six SSP events can now reach this host == witness ::",
+                self.idx
+            ),
+            Some(n) if n >= 1 => {
+                serial_println!(
+                    ":: bt-ssp: [{}] stage=event-mask — HCI_Set_Event_Mask status={:#04x} -> REFUSED. With the SSP events masked the controller would pair in silence and the handshake would time out unanswered; the stage ends here rather than run blind == witness ::",
+                    self.idx, rp[0]
+                );
+                self.bt_ssp_tally(t0, 0, st, held, true, Some(false), false, None, false, None, false, None, false, None, false);
+                return;
+            }
+            _ => {
+                serial_println!(
+                    ":: bt-ssp: [{}] stage=event-mask — HCI_Set_Event_Mask -> NO CmdComplete; the mask state is UNKNOWN and the stage ends here rather than run a handshake it may never hear == witness ::",
+                    self.idx
+                );
+                self.bt_ssp_tally(t0, 0, st, held, true, None, false, None, false, None, false, None, false, None, false);
+                return;
+            }
+        }
+
+        // ---- 3. HCI_Authentication_Requested (Vol 4 Part E §7.1.15) -----------------------------
+        // Sent with `bt_hci_send`, NOT `bt_hci_command`: the answer is a Command STATUS followed
+        // by the event chain, and `bt_hci_command`'s CmdComplete drain would discard family events
+        // it does not recognise. From here on, every read goes through the SspAny dispatch loop.
+        if !self.bt_hci_send(t, intf, BT_HCI_AUTH_REQUESTED, &[h as u8, (h >> 8) as u8]) {
+            serial_println!(
+                ":: bt-ssp: [{}] stage=auth-request — HCI_Authentication_Requested (0x0411) NOT SENT — the EP0 control-OUT failed (its own line is above). No pairing was started == witness ::",
+                self.idx
+            );
+            self.bt_ssp_tally(t0, 0, st, held, true, Some(true), false, None, false, None, false, None, false, None, false);
+            return;
+        }
+        serial_println!(
+            ":: bt-ssp: [{}] stage=auth-request — HCI_Authentication_Requested (0x0411) sent for handle={:#06x}; awaiting the controller's event chain (Command Status first, then Link Key Request) == witness ::",
+            self.idx, h
+        );
+
+        // ---- 4. THE DISPATCH LOOP ----------------------------------------------------------------
+        let mut turns = 0u32;
+        let mut auth_req: Option<bool> = None; // Command Status for 0x0411
+        let mut key_from_store = false; // positive Link_Key_Request_Reply sent
+        let mut io_cap_replied = false;
+        let mut peer_io: Option<(u8, u8, u8)> = None;
+        let mut confirmed = false;
+        let mut pairing_ok: Option<bool> = None;
+        let mut key_stored = false;
+        let mut auth_ok: Option<bool> = None;
+        let mut enc_requested = false;
+        let mut enc_on: Option<u8> = None;
+        loop {
+            turns += 1;
+            if turns > BT_SSP_TURN_MAX {
+                serial_println!(
+                    ":: bt-ssp: [{}] TURN CAP — {} dispatch turns without the handshake resolving; a peer or controller replaying family events cannot spin this loop, and the stage ends structurally == witness ::",
+                    self.idx, BT_SSP_TURN_MAX
+                );
+                break;
+            }
+            let w = Self::bt_ssp_window(t0, cap);
+            if w == 0 {
+                serial_println!(
+                    ":: bt-ssp: [{}] STAGE CAP — {}ms spent without the handshake resolving; the stage ends and C1's teardown below is unaffected == witness ::",
+                    self.idx, BT_SSP_STAGE_MS
+                );
+                break;
+            }
+            let got = match self.bt_l3_await(e, toggle, armed, BtL3Want::SspAny, w, seen, st, asm) {
+                BtL3Await::Got(len) => len,
+                BtL3Await::Timeout => {
+                    serial_println!(
+                        ":: bt-ssp: [{}] NO family event within the window — last completed milestone: {}. The readings are co-equal: the peer's pairing agent may be waiting on ITS user (some devices require a button press to accept a new bond), or this handshake stalled. The stage ends; nothing is left half-answered on the wire because every question the controller asked was answered the turn it arrived == witness ::",
+                        self.idx,
+                        if enc_requested { "encryption requested" }
+                        else if auth_ok == Some(true) { "authentication complete" }
+                        else if key_stored { "link key stored" }
+                        else if pairing_ok.is_some() { "simple pairing complete" }
+                        else if confirmed { "user confirmation auto-accepted" }
+                        else if io_cap_replied { "IO capabilities exchanged" }
+                        else if auth_req == Some(true) { "authentication accepted by the controller" }
+                        else { "authentication requested" }
+                    );
+                    break;
+                }
+                BtL3Await::Stop => {
+                    serial_println!(
+                        ":: bt-ssp: [{}] event endpoint became UNREADABLE mid-handshake — no further pairing event can be read and the stage ends; C1's teardown commands still ride EP0 == witness ::",
+                        self.idx
+                    );
+                    break;
+                }
+            };
+            if got < 2 {
+                continue;
+            }
+            let evt = asm[0];
+            match evt {
+                // ---- Command Status: the controller accepting/refusing 0x0411 or 0x0413 --------
+                BT_EVT_CMD_STATUS if got >= 6 => {
+                    let s = asm[2];
+                    let op = (asm[4] as u16) | ((asm[5] as u16) << 8);
+                    if op == BT_HCI_AUTH_REQUESTED {
+                        auth_req = Some(s == 0x00);
+                        serial_println!(
+                            ":: bt-ssp: [{}] stage=auth-request — CommandStatus status={:#04x} -> {} == witness ::",
+                            self.idx, s,
+                            if s == 0x00 { "ACCEPTED, the controller is authenticating; its questions follow" }
+                            else { "REFUSED — no pairing is running and the stage ends" }
+                        );
+                        if s != 0x00 {
+                            break;
+                        }
+                    } else if op == BT_HCI_SET_CONN_ENCRYPTION {
+                        serial_println!(
+                            ":: bt-ssp: [{}] stage=encrypt — CommandStatus status={:#04x} -> {} == witness ::",
+                            self.idx, s,
+                            if s == 0x00 { "ACCEPTED, awaiting Encryption Change" }
+                            else { "REFUSED — the link stays plaintext and the stage ends on a bond without encryption" }
+                        );
+                        if s != 0x00 {
+                            break;
+                        }
+                    } else {
+                        serial_println!(
+                            ":: bt-ssp: [{}] CommandStatus for {:#06x} status={:#04x} while pairing — not this stage's command, stepped over == witness ::",
+                            self.idx, op, s
+                        );
+                    }
+                }
+                // ---- Command Complete: the controller's receipt for one of our replies ---------
+                BT_EVT_CMD_COMPLETE if got >= 6 => {
+                    let op = (asm[3] as u16) | ((asm[4] as u16) << 8);
+                    let s = asm[5];
+                    let name = match op {
+                        BT_HCI_LINK_KEY_REPLY => "Link_Key_Request_Reply",
+                        BT_HCI_LINK_KEY_NEG_REPLY => "Link_Key_Request_Negative_Reply",
+                        BT_HCI_IO_CAP_REPLY => "IO_Capability_Request_Reply",
+                        BT_HCI_USER_CONFIRM_REPLY => "User_Confirmation_Request_Reply",
+                        BT_HCI_PIN_CODE_NEG_REPLY => "PIN_Code_Request_Negative_Reply",
+                        BT_HCI_USER_PASSKEY_NEG_REPLY => "User_Passkey_Request_Negative_Reply",
+                        BT_HCI_REMOTE_OOB_NEG_REPLY => "Remote_OOB_Data_Request_Negative_Reply",
+                        _ => "",
+                    };
+                    if name.is_empty() {
+                        serial_println!(
+                            ":: bt-ssp: [{}] CmdComplete for {:#06x} while pairing — not this stage's reply, stepped over == witness ::",
+                            self.idx, op
+                        );
+                    } else {
+                        serial_println!(
+                            ":: bt-ssp: [{}] {} -> CmdComplete status={:#04x} -> {} == witness ::",
+                            self.idx, name, s,
+                            if s == 0x00 { "ACCEPTED" } else { "REFUSED — the controller rejected this host's answer; the handshake cannot proceed past it and the failure event that follows (or the window) ends the stage" }
+                        );
+                    }
+                }
+                // ---- Link Key Request: the bond lookup ------------------------------------------
+                BT_EVT_LINK_KEY_REQ if got >= 8 => {
+                    let ours = bt_addr_eq(&[asm[2], asm[3], asm[4], asm[5], asm[6], asm[7]], &addr);
+                    if !ours {
+                        serial_println!(
+                            ":: bt-ssp: [{}] Link Key Request for a BD_ADDR this stage is not pairing with — stepped over, unanswered (answering it would speak for a link this arc did not make) == witness ::",
+                            self.idx
+                        );
+                    } else if let Some(k) = self.bt_ssp_key.filter(|k| bt_addr_eq(&k.addr, &addr)) {
+                        let mut p = [0u8; 22];
+                        p[..6].copy_from_slice(&addr);
+                        p[6..].copy_from_slice(&k.key);
+                        let sent = self.bt_hci_send(t, intf, BT_HCI_LINK_KEY_REPLY, &p);
+                        key_from_store = sent;
+                        serial_println!(
+                            ":: bt-ssp: [{}] stage=link-key-request — the controller asked for a key and this session HOLDS one (type={:#04x}, from this boot's earlier pairing) -> HCI_Link_Key_Request_Reply {}; authentication should now complete WITHOUT an SSP exchange, which is the bond doing its job == witness ::",
+                            self.idx, k.key_type,
+                            if sent { "sent" } else { "NOT SENT — the EP0 control-OUT failed (its own line is above)" }
+                        );
+                        if !sent {
+                            break;
+                        }
+                    } else {
+                        let sent = self.bt_hci_send(t, intf, BT_HCI_LINK_KEY_NEG_REPLY, &addr);
+                        serial_println!(
+                            ":: bt-ssp: [{}] stage=link-key-request — no key is held for this peer -> HCI_Link_Key_Request_Negative_Reply {}; the controller now starts the SSP exchange (IO Capability Request follows) == witness ::",
+                            self.idx,
+                            if sent { "sent" } else { "NOT SENT — the EP0 control-OUT failed (its own line is above)" }
+                        );
+                        if !sent {
+                            break;
+                        }
+                    }
+                }
+                // ---- IO Capability Request: declare what this machine honestly is --------------
+                BT_EVT_IO_CAP_REQ if got >= 8 => {
+                    let ours = bt_addr_eq(&[asm[2], asm[3], asm[4], asm[5], asm[6], asm[7]], &addr);
+                    if !ours {
+                        serial_println!(
+                            ":: bt-ssp: [{}] IO Capability Request for a foreign BD_ADDR — stepped over, unanswered == witness ::",
+                            self.idx
+                        );
+                    } else {
+                        let mut p = [0u8; 9];
+                        p[..6].copy_from_slice(&addr);
+                        p[6] = BT_SSP_IO_CAP;
+                        p[7] = BT_SSP_OOB;
+                        p[8] = BT_SSP_AUTH_REQ;
+                        let sent = self.bt_hci_send(t, intf, BT_HCI_IO_CAP_REPLY, &p);
+                        io_cap_replied = sent;
+                        serial_println!(
+                            ":: bt-ssp: [{}] stage=io-cap-request — replied io={:#04x}(NoInputNoOutput) oob={:#04x} auth_req={:#04x}(no MITM, dedicated bonding){}; with NoInputNoOutput on this side the association model resolves to JUST WORKS whatever the peer declares (Vol 3 Part C §5.2.2.6) == witness ::",
+                            self.idx, BT_SSP_IO_CAP, BT_SSP_OOB, BT_SSP_AUTH_REQ,
+                            if sent { "" } else { " — NOT SENT, the EP0 control-OUT failed (its own line is above)" }
+                        );
+                        if !sent {
+                            break;
+                        }
+                    }
+                }
+                // ---- IO Capability Response: the peer's declaration, decoded -------------------
+                BT_EVT_IO_CAP_RSP if got >= 11 => {
+                    let ours = bt_addr_eq(&[asm[2], asm[3], asm[4], asm[5], asm[6], asm[7]], &addr);
+                    if ours {
+                        peer_io = Some((asm[8], asm[9], asm[10]));
+                    }
+                    serial_println!(
+                        ":: bt-ssp: [{}] stage=io-cap-response — peer{} declares io={:#04x}({}) oob={:#04x}({}) auth_req={:#04x}({}) == witness ::",
+                        self.idx,
+                        if ours { "" } else { " (FOREIGN BD_ADDR — recorded, not acted on)" },
+                        asm[8],
+                        match asm[8] {
+                            0x00 => "DisplayOnly",
+                            0x01 => "DisplayYesNo",
+                            0x02 => "KeyboardOnly",
+                            0x03 => "NoInputNoOutput",
+                            _ => "RESERVED",
+                        },
+                        asm[9],
+                        if asm[9] == 0x00 { "no OOB data" } else { "OOB data present" },
+                        asm[10],
+                        match asm[10] {
+                            0x00 => "no MITM, no bonding",
+                            0x01 => "MITM required, no bonding",
+                            0x02 => "no MITM, dedicated bonding",
+                            0x03 => "MITM required, dedicated bonding",
+                            0x04 => "no MITM, general bonding",
+                            0x05 => "MITM required, general bonding",
+                            _ => "RESERVED",
+                        }
+                    );
+                }
+                // ---- User Confirmation Request: the just-works auto-accept ---------------------
+                BT_EVT_USER_CONFIRM_REQ if got >= 12 => {
+                    let ours = bt_addr_eq(&[asm[2], asm[3], asm[4], asm[5], asm[6], asm[7]], &addr);
+                    if !ours {
+                        serial_println!(
+                            ":: bt-ssp: [{}] User Confirmation Request for a foreign BD_ADDR — stepped over, unanswered == witness ::",
+                            self.idx
+                        );
+                    } else {
+                        let num = (asm[8] as u32)
+                            | ((asm[9] as u32) << 8)
+                            | ((asm[10] as u32) << 16)
+                            | ((asm[11] as u32) << 24);
+                        let sent = self.bt_hci_send(t, intf, BT_HCI_USER_CONFIRM_REPLY, &addr);
+                        confirmed = sent;
+                        serial_println!(
+                            ":: bt-ssp: [{}] stage=user-confirm — numeric_value={:06} AUTO-ACCEPTED{} (just works: both sides declared no way to show or compare this number, so the spec's model accepts without MITM protection — printed so the capture shows exactly what was accepted unseen) == witness ::",
+                            self.idx, num,
+                            if sent { "" } else { ", except the reply was NOT SENT — the EP0 control-OUT failed (its own line is above)" }
+                        );
+                        if !sent {
+                            break;
+                        }
+                    }
+                }
+                // ---- Simple Pairing Complete ----------------------------------------------------
+                BT_EVT_SIMPLE_PAIRING_COMPLETE if got >= 9 => {
+                    let s = asm[2];
+                    let ours = bt_addr_eq(&[asm[3], asm[4], asm[5], asm[6], asm[7], asm[8]], &addr);
+                    if ours {
+                        pairing_ok = Some(s == 0x00);
+                    }
+                    serial_println!(
+                        ":: bt-ssp: [{}] stage=pairing — Simple Pairing Complete status={:#04x}{} -> {} == witness ::",
+                        self.idx, s,
+                        if ours { "" } else { " (FOREIGN BD_ADDR)" },
+                        match s {
+                            0x00 => "PAIRED — the SSP exchange succeeded; the Link Key Notification and Authentication Complete follow",
+                            0x05 => "AUTHENTICATION FAILURE — the peer rejected the pairing (commonly: its pairing window closed, or it refused a new bond while bonded to another host)",
+                            0x37 => "SSP NOT SUPPORTED BY HOST — the peer's host stack declined SSP",
+                            0x22 => "LMP RESPONSE TIMEOUT — the peer's link manager stopped answering mid-exchange",
+                            _ => "NOT PAIRED — the Authentication Complete that follows (or the window) carries the stage's verdict",
+                        }
+                    );
+                }
+                // ---- Link Key Notification: THE BOND --------------------------------------------
+                BT_EVT_LINK_KEY_NOTIFY if got >= 25 => {
+                    let ours = bt_addr_eq(&[asm[2], asm[3], asm[4], asm[5], asm[6], asm[7]], &addr);
+                    if !ours {
+                        serial_println!(
+                            ":: bt-ssp: [{}] Link Key Notification for a foreign BD_ADDR — NOT stored; a key for a link this arc did not make is not one it may hold == witness ::",
+                            self.idx
+                        );
+                    } else {
+                        let mut key = [0u8; 16];
+                        key.copy_from_slice(&asm[8..24]);
+                        let kt = asm[24];
+                        self.bt_ssp_key = Some(BtSspKey { addr, key, key_type: kt });
+                        key_stored = true;
+                        serial_println!(
+                            ":: bt-ssp: [{}] stage=link-key — Link Key Notification key_type={:#04x}({}) -> STORED IN RAM, THIS SESSION ONLY (key bytes withheld from the log on purpose — a serial capture must not carry the bond secret). THE PERSISTENCE GAP, honestly: a real bond survives power-off; this one cannot yet, because the kernel's writable VFS rides USB storage serviced by this same driver under the EHCI_HID lock this chain already holds, so a store write from here would re-enter it. Until a deferred-write path exists, every boot pairs afresh and the speaker accumulates one bond entry per boot == witness ::",
+                            self.idx, kt,
+                            match kt {
+                                0x00 => "combination key (legacy)",
+                                0x04 => "unauthenticated combination key, P-192 — the expected just-works outcome on a 4.0 controller",
+                                0x05 => "authenticated combination key, P-192",
+                                0x06 => "changed combination key",
+                                0x07 => "unauthenticated combination key, P-256 — the expected just-works outcome under Secure Connections",
+                                0x08 => "authenticated combination key, P-256",
+                                _ => "RESERVED",
+                            }
+                        );
+                    }
+                }
+                // ---- Authentication Complete: the handshake's verdict --------------------------
+                BT_EVT_AUTH_COMPLETE if got >= 5 => {
+                    let s = asm[2];
+                    let eh = ((asm[3] as u16) | ((asm[4] as u16) << 8)) & 0x0FFF;
+                    if eh != h {
+                        serial_println!(
+                            ":: bt-ssp: [{}] Authentication Complete for handle={:#06x} (not this stage's {:#06x}) — stepped over == witness ::",
+                            self.idx, eh, h
+                        );
+                    } else {
+                        auth_ok = Some(s == 0x00);
+                        serial_println!(
+                            ":: bt-ssp: [{}] stage=auth-complete — Authentication Complete status={:#04x} handle={:#06x} -> {} == witness ::",
+                            self.idx, s, eh,
+                            if s == 0x00 { "AUTHENTICATED — the link is bonded; encryption is requested next, because an authenticated-but-plaintext link still fails a speaker's SECURITY BLOCK" }
+                            else { "NOT AUTHENTICATED — the stage ends without a bond" }
+                        );
+                        if s != 0x00 {
+                            // A FAILURE AFTER REPLAYING THE STORED KEY MEANS THE BOND IS DEAD ON THE
+                            // PEER'S SIDE — it re-paired elsewhere, was factory-reset, or aged the
+                            // key out (Vol 4 Part E: a Link Key Request answered from a stale key
+                            // yields Authentication Complete 0x05/0x06). Keeping the key would wedge
+                            // EVERY later Ctrl+Alt+B re-trigger — replay dead key, fail, break, never
+                            // reach a fresh pairing — until a reboot. Discard it here so the next
+                            // re-trigger answers the Link Key Request negatively and pairs afresh,
+                            // which is the spec's Key-Missing recovery.
+                            if key_from_store {
+                                self.bt_ssp_key = None;
+                                serial_println!(
+                                    ":: bt-ssp: [{}] stage=auth-complete — the failure was against the SESSION-STORED link key, so the bond is dead on the peer's side (re-paired elsewhere, reset, or key aged out). The stored key is DISCARDED; the next Ctrl+Alt+B re-trigger will answer the Link Key Request negatively and pair afresh rather than replay a key that can only fail == witness ::",
+                                    self.idx
+                                );
+                            }
+                            break;
+                        }
+                        // ---- 5. Set_Connection_Encryption, inline: the authenticated link is the
+                        // precondition the spec puts on this command, and it exists RIGHT NOW.
+                        if !self.bt_hci_send(
+                            t, intf, BT_HCI_SET_CONN_ENCRYPTION, &[h as u8, (h >> 8) as u8, 0x01],
+                        ) {
+                            serial_println!(
+                                ":: bt-ssp: [{}] stage=encrypt — HCI_Set_Connection_Encryption (0x0413) NOT SENT — the EP0 control-OUT failed (its own line is above). The bond stands; the link stays plaintext == witness ::",
+                                self.idx
+                            );
+                            break;
+                        }
+                        enc_requested = true;
+                        serial_println!(
+                            ":: bt-ssp: [{}] stage=encrypt — HCI_Set_Connection_Encryption (0x0413) sent, enable={:#04x}; awaiting Command Status then Encryption Change == witness ::",
+                            self.idx, 0x01u8
+                        );
+                    }
+                }
+                // ---- Encryption Change: the stage's finish line ---------------------------------
+                BT_EVT_ENC_CHANGE if got >= 6 => {
+                    let s = asm[2];
+                    let eh = ((asm[3] as u16) | ((asm[4] as u16) << 8)) & 0x0FFF;
+                    if eh != h {
+                        serial_println!(
+                            ":: bt-ssp: [{}] Encryption Change for handle={:#06x} (not this stage's {:#06x}) — stepped over == witness ::",
+                            self.idx, eh, h
+                        );
+                    } else {
+                        enc_on = Some(if s == 0x00 { asm[5] } else { 0x00 });
+                        serial_println!(
+                            ":: bt-ssp: [{}] stage=encrypt — Encryption Change status={:#04x} handle={:#06x} enabled={:#04x} -> {} == witness ::",
+                            self.idx, s, eh, asm[5],
+                            if s == 0x00 && asm[5] == 0x01 { "ENCRYPTED (E0, the BR/EDR baseline cipher on this 4.0 part)" }
+                            else if s == 0x00 && asm[5] == 0x02 { "ENCRYPTED (AES-CCM — Secure Connections)" }
+                            else if s == 0x00 { "NOT ENCRYPTED — the controller reports the cipher off" }
+                            else { "NOT ENCRYPTED — the encryption request failed; the bond stands and the link stays plaintext" }
+                        );
+                        break;
+                    }
+                }
+                // ---- THE PARKS: events outside the just-works flow ------------------------------
+                // Each is witnessed with its raw bytes, answered with the spec's NEGATIVE reply
+                // (this host refuses to invent a PIN, a passkey, or OOB data it does not have),
+                // and ends the stage. The controller then fails the pairing cleanly on its own.
+                BT_EVT_PIN_CODE_REQ | BT_EVT_USER_PASSKEY_REQ | BT_EVT_REMOTE_OOB_REQ => {
+                    let (hex, hn) = Self::bt_ssp_hex(&asm[..got]);
+                    let (name, reply, reason) = match evt {
+                        BT_EVT_PIN_CODE_REQ => (
+                            "PIN Code Request (0x16)",
+                            BT_HCI_PIN_CODE_NEG_REPLY,
+                            "LEGACY pairing engaged despite SSP mode being enabled above — this host holds no PIN and will not guess one (0000 is a guess presented as a credential)",
+                        ),
+                        BT_EVT_USER_PASSKEY_REQ => (
+                            "User Passkey Request (0x34)",
+                            BT_HCI_USER_PASSKEY_NEG_REPLY,
+                            "a passkey was demanded from a host that declared NoInputNoOutput — a contradiction of the IO exchange above",
+                        ),
+                        _ => (
+                            "Remote OOB Data Request (0x35)",
+                            BT_HCI_REMOTE_OOB_NEG_REPLY,
+                            "OOB data was demanded although this host declared oob=0x00",
+                        ),
+                    };
+                    let sent = got >= 8
+                        && bt_addr_eq(&[asm[2], asm[3], asm[4], asm[5], asm[6], asm[7]], &addr)
+                        && self.bt_hci_send(t, intf, reply, &addr);
+                    serial_println!(
+                        ":: bt-ssp: [{}] PARKED — {} raw=[{}]: {}. Negative reply {:#06x} {}; the stage ends and the controller fails the pairing cleanly == witness ::",
+                        self.idx, name,
+                        core::str::from_utf8(&hex[..hn]).unwrap_or("??"),
+                        reason, reply,
+                        if sent { "sent" } else { "NOT SENT (foreign/short address, or the EP0 write failed — its own line is above)" }
+                    );
+                    break;
+                }
+                // ---- anything else the family matcher admitted but this loop does not know -----
+                _ => {
+                    let (hex, hn) = Self::bt_ssp_hex(&asm[..got]);
+                    serial_println!(
+                        ":: bt-ssp: [{}] PARKED — unexpected family event {:#04x} len={} raw=[{}]; not interpreted, not answered, and the stage continues to the next event == witness ::",
+                        self.idx, evt, got,
+                        core::str::from_utf8(&hex[..hn]).unwrap_or("??")
+                    );
+                }
+            }
+        }
+
+        self.bt_ssp_tally(
+            t0, turns, st, held, true, Some(true), key_from_store, auth_req, io_cap_replied,
+            peer_io.map(|p| p.0), confirmed, pairing_ok, key_stored, auth_ok,
+            matches!(enc_on, Some(0x01) | Some(0x02)),
+        );
+    }
+
+    /// BT-SSP — the end-of-stage tally, in the shape C1's and C2's are: every milestone named,
+    /// so a capture reads ONE line to know how far the handshake got and the per-stage lines
+    /// above it to know why it stopped there.
+    #[cfg(feature = "btc")]
+    #[allow(clippy::too_many_arguments)]
+    fn bt_ssp_tally(
+        &self,
+        t0: u64,
+        turns: u32,
+        st: &BtL3State,
+        key_was_held: bool,
+        mode_ok: bool,
+        mask_ok: Option<bool>,
+        key_from_store: bool,
+        auth_req: Option<bool>,
+        io_cap_replied: bool,
+        peer_io: Option<u8>,
+        confirmed: bool,
+        pairing_ok: Option<bool>,
+        key_stored: bool,
+        auth_ok: Option<bool>,
+        encrypted: bool,
+    ) {
+        let (elapsed, unit) = epace_fmt(crate::arch::now_cycles().wrapping_sub(t0));
+        serial_println!(
+            ":: bt-ssp: [{}] SSP tally — elapsed={}{} turns={} session_key_at_entry={} ssp_mode={} event_mask={} auth_request={} link_key_replied_from_store={} io_cap_replied={} peer_io={} user_confirm_auto_accepted={} pairing_complete={} link_key_stored={}(RAM, this session only) auth_complete={} encrypted={} blind={} stopped={} -> {} == witness ::",
+            self.idx, elapsed, unit, turns,
+            if key_was_held { "held" } else { "none" },
+            mode_ok,
+            match mask_ok { Some(v) => if v { "ok" } else { "refused" }, None => "not-reached" },
+            match auth_req { Some(true) => "accepted", Some(false) => "refused", None => "unanswered" },
+            key_from_store,
+            io_cap_replied,
+            peer_io.map(|v| match v {
+                0x00 => "DisplayOnly", 0x01 => "DisplayYesNo",
+                0x02 => "KeyboardOnly", 0x03 => "NoInputNoOutput", _ => "reserved",
+            }).unwrap_or("none"),
+            confirmed,
+            match pairing_ok { Some(true) => "ok", Some(false) => "FAILED", None => "none" },
+            key_stored,
+            match auth_ok { Some(true) => "ok", Some(false) => "FAILED", None => "none" },
+            encrypted, st.blind, st.stopped,
+            if encrypted && (key_stored || key_from_store) {
+                "BONDED AND ENCRYPTED — the SECURITY BLOCK's precondition is met on this very link, and the C2 attempt below is the test of it. What C3 (audio) still needs is not more security: AVDTP SET_CONFIGURATION/OPEN/START on the discovered SEP, an SBC encoder, and the ACL data path at streaming rate"
+            } else if auth_ok == Some(true) {
+                "BONDED, NOT ENCRYPTED — authentication completed but the cipher did not come up; a speaker's SECURITY BLOCK typically requires encryption, so C2 below is expected to still refuse"
+            } else if key_stored {
+                "KEY STORED, NOT AUTHENTICATED — the pairing produced a key but the authentication did not complete; the bond may still hold on the peer's side"
+            } else {
+                "NOT BONDED — the per-stage lines above name the step that stopped it"
+            }
+        );
+    }
+
+    // ============================== end BT-SSP ===============================================
 
     // ================================ BT-C2 ==================================================
 
@@ -8403,7 +9258,7 @@ impl Controller {
                     0x0000 => "L2CAP CHANNEL ESTABLISHED. The signalling road to A2DP is open at the transport layer; it is not usable until both directions are configured, which is the next exchange",
                     0x0001 => "PENDING — the peer has not decided yet (commonly an authorisation step on the device). One further response is waited for and no more",
                     0x0002 => "PSM NOT SUPPORTED — this device does not publish an AVDTP service at all. That is a complete answer about the peer and says nothing against this host's L2CAP",
-                    0x0003 => "SECURITY BLOCK — the peer requires an authenticated and/or encrypted link before it will open this PSM. BT-C1's Connection Complete reported encryption=0x00 and this arc pairs with nothing, so THIS IS THE EXPECTED REFUSAL FROM A SPEAKER THAT INSISTS ON BONDING, and it names pairing (Secure Simple Pairing) as the next arc's prerequisite rather than leaving it to be guessed",
+                    0x0003 => "SECURITY BLOCK — the peer requires an authenticated and/or encrypted link before it will open this PSM. READ THE bt-ssp SSP tally ABOVE THIS LINE, which ran on THIS SAME LINK moments ago: if it says NOT BONDED (SSP refused, or was never reachable), this refusal is EXPECTED and pairing was the missing precondition. But if it says BONDED AND ENCRYPTED, the block did NOT lift on an authenticated ciphered link, and THAT is the finding — the speaker wants something past authentication+encryption (a fresh L2CAP attempt on a new link, or a service this host has not offered), which is the next arc's brief rather than a re-run of this one",
                     0x0004 => "NO RESOURCES AVAILABLE — the peer has no channel to give right now, commonly because it is already streaming from another source",
                     0x0006 => "INVALID SOURCE CID",
                     0x0007 => "SOURCE CID ALREADY ALLOCATED — this host reused a CID the peer still holds from an earlier channel on this link",
@@ -12776,6 +13631,9 @@ pub fn init() {
                         bt_chain_busy: false,
                         #[cfg(feature = "btc")]
                         bt_left_link: None,
+                        // BT-SSP: no bond until a pairing's Link Key Notification stores one.
+                        #[cfg(feature = "btc")]
+                        bt_ssp_key: None,
                     };
                     // Firmware-stale detection BEFORE any schedule programming: probe 2 showed
                     // Apple EFI leaves PSE=1 behind (its pre-boot keyboard), which HSE-halts
