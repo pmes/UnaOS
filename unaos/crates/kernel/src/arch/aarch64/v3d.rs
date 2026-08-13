@@ -1131,6 +1131,20 @@ pub fn bringup(fb: Option<FbTarget>) {
         return;
     }
 
+    // ── PI-V3D-95: the unarmed-close-writes rung (v3d.md §49.10's queued question, §49.12.1). ───
+    // Same placement discipline as R1 above and for the same two reasons: CT0 is still virgin (M3
+    // is a CT1 frame), so the three tile-memory registers hold their bring-up residue, and the close
+    // being measured is the boot's FIRST. With the knob armed this is where the boot ENDS. Default
+    // OFF: without the feature the whole block is uncompiled. It sits AFTER the R1 block on purpose
+    // — if both knobs are armed, `[v3d85]` runs and returns and this one never runs, because one
+    // experiment per boot is the family's rule.
+    #[cfg(feature = "v3d_unarmclose")]
+    {
+        v3d95_unarmed_close_rung();
+        super::exceptions::serror_drain_request("v3d: [v3d95] unarmed-close-writes exit");
+        return;
+    }
+
     // ── M4: the first triangle. Bin one triangle on CT0, render it on CT1 (implicit tile list), then
     // CPU-verify inside/outside samples. M3's PASS above is the regression witness — M4 runs AFTER it,
     // in its own arena regions, and never touches M3's buffers. ATTENDED-METAL-UNVERIFIED (QEMU raspi4b
@@ -15325,5 +15339,228 @@ fn v3d85_firstkick_rung() {
     clear_mmu_fault_latch("v3d85 post-kick");
     serial_println!(
         ":: V3D: [v3d85] R-LADDER BOOT COMPLETE — one CT0 kick taken and nothing else. probe_job, the [v3d48] ladder, M4 and the whole visible battery were NOT run this boot, by design. Do not diff this capture line-for-line against a full deep boot; re-run without UNAOS_V3D_FIRSTKICK for that ::"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// PI-V3D-95 — WHERE DO UNARMED CLOSE WRITES GO? (v3d.md §49.10's queued rung, folded at §49.12.1)
+//
+// THE QUESTION, from the record. boot11 (`UNAOS_V3D_FIRSTKICK=emptyunarm`, v3d.md §49.10) kicked the
+// `empty` BIN list through the rcl-class submit — bare CT0QBA->CT0QEA, no CT0QMA, no CT0QMS, no
+// CT0QTS, no BPOS=0, no pre-kick L2T invalidate — and the frame CLOSED (`BFC` Δ1, `retired=1`). It
+// also latched an MMU fault across its own kick:
+//
+//     MMU fault-latch CLEARED (v3d85 post-kick) — was CTL=0x061d1c01
+//       (PT_INVALID=1 WRITE_VIOLATION=1 CAP_EXCEEDED=0)
+//       VIO_ADDR=0x0000000e VIO_ID=0x00000020 (client PTB @ VA 0x00000070)
+//
+// A WRITE VIOLATION and a PT_INVALID, charged to the PTB, at VA 0x70, on a boot where the two
+// tile-memory bases were deliberately never programmed — while the arena poison stayed fully intact
+// (`wrote-any=0`), i.e. nothing landed in the arena because the write did not go to the arena. The
+// doc's design note is quoted verbatim, and this rung is that note and nothing more:
+//
+//     "This deserves its own rung later: program nothing, close a frame, and read CT0QMA /
+//      CT0QMS / CT0QTS / the PTB's fault address across it to name where an unarmed close aims."
+//
+// PROGRAM NOTHING is the design, and it is followed literally: this rung writes no CT0QMA/QMS/QTS —
+// not the real bases, and not a scratch pair either. Programming a scratch base would answer a
+// DIFFERENT question ("does the close path follow a base we gave it?") and would destroy this one,
+// because the whole subject is what the close path aims at when those registers hold whatever
+// bring-up left in them. Their residual values are READ and printed instead, pre and post, so the
+// fault VA can be read against them: a VA derived from CT0QMA's residue is a different mechanism
+// from a fixed VA of 0x70, and only the pair of readings can tell them apart.
+//
+// THE piOS SWEEP INTERSECTION, named and NOT acted on. The settled piOS sweep-diff finding is that
+// piOS programs pool/base registers in the core0 +0x108..+0x174 window that this driver never
+// touches — a window that CONTAINS CT0QTS (+0x15c), CT0QMA (+0x170) and CT0QMS (+0x174), the three
+// registers this rung reads. That intersection is real and is stated here and in v3d.md §49.12.1 so
+// no reader has to rediscover it. It is NOT this rung's scope: programming any of those words is the
+// sweep-diff arc's proposal, and this rung stays a pure read of what an UNARMED close does.
+//
+// THE INSTRUMENT. The `[v3d62]` armed-policy fault catcher is REUSED rather than re-invented — it is
+// the one instrument in this file that can catch a refused write that still LANDS somewhere: it
+// clears the hub interrupt latch and seeds an unmapped scratch page with a sentinel before the kick,
+// then reports all three channels at wait-exit (MMU_CTL fault bits + the violation pair, the hub
+// interrupt half, and whether the sentinel survived). `v3d62_frame_witness` must be called BEFORE
+// any W1C of the latch, and it is.
+//
+// PLACEMENT AND SAFETY. The rung rides where `[v3d85]`'s does — after M3 (a CT1 frame; CT0 is still
+// virgin) and BEFORE `probe_job`, whose bin is the first CT0 kick of an ordinary boot — and then the
+// boot RETURNS, exactly as the first-kick family does. That placement is load-bearing twice over:
+// the three tile-memory registers still hold their bring-up residue (no kick of ours has written
+// them), and the close being measured is the boot's FIRST, so nothing accumulated is in front of it.
+// It also makes the standing knob-exclusion hazard structural rather than advisory: this rung
+// returns long before `[v3d75]`'s ENABLE_QPU send and `[v3d80]`/`[v3d81d]`'s DISPLAY_DONE sends are
+// reached, so an armed boot can never place this kick beside either. If `UNAOS_V3D_FIRSTKICK` is
+// armed too, `[v3d85]` runs and returns first and this rung never runs — one experiment per boot.
+
+/// PI-V3D-95 — the unarmed-close-writes rung. Default OFF; the whole body is uncompiled without
+/// `v3d_unarmclose`, so a knob-off image is byte-identical to one built without the arc.
+///
+/// Kick shape: byte-for-byte the `emptyunarm` variant's — the same `[v3d48]` Empty bin list from the
+/// same `build_bin_cl_content_geom(BinContent::Empty)` call at the same `OFF_PROBE_BIN_CL` address,
+/// published with a CPU `clean_range` only, submitted bare `CT0QBA` -> `CT0QEA`. Nothing about the
+/// submit is new; what is new is the station pair around it and the fault catcher armed across it.
+#[cfg(feature = "v3d_unarmclose")]
+fn v3d95_unarmed_close_rung() {
+    serial_println!(
+        ":: V3D: [v3d95] UNARMED-CLOSE-WRITES BOOT — READ THIS FIRST. UNAOS_V3D_UNARMCLOSE=1 arms exactly one CT0 kick, placed after M3 and BEFORE probe_job, and the boot then RETURNS: no [v3d48] ladder, no M4, no visible battery, no [v3d75]/[v3d80]/[v3d81] tails (which is also why this knob can never sit beside the QPU or DISPLAY_DONE sends). The kick is the `emptyunarm` shape byte for byte — the [v3d48] Empty BIN list through the rcl-class submit: NO CT0QMA, NO CT0QMS, NO CT0QTS, NO BPOS=0, NO pre-kick L2T invalidate, bare CT0QBA->CT0QEA with a CPU clean_range publish only. The question is v3d.md §49.10's: boot11 closed a frame under exactly this submit and latched a PTB WRITE_VIOLATION+PT_INVALID at VA 0x70, so WHERE DO THE WRITES OF AN UNARMED FRAME-CLOSE GO? This rung PROGRAMS NOTHING by design and READS the three tile-memory registers pre and post, with the [v3d62] fault catcher armed across the kick. The capture is deliberately short and MUST NOT be diffed line-for-line against a deep boot ::"
+    );
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down => {
+            serial_println!(
+                ":: V3D: [v3d95] SKIPPED — hub IDENT0 reads 0x00000000 (block absent/unpowered; the QEMU raspi4b signature). NO kick was issued and NO verdict is implied ::"
+            );
+            return;
+        }
+        V3dPresence::Poison(w) => {
+            serial_println!(
+                ":: V3D: [v3d95] SKIPPED — hub IDENT0 reads poison {:#010x} (open-bus / firmware fill, not a live register). NO kick was issued and NO verdict is implied ::",
+                w
+            );
+            return;
+        }
+    }
+
+    // ── The list: the `empty` arm's, verbatim. ──────────────────────────────────────────────────
+    let cl_len = build_bin_cl_content_geom(
+        OFF_PROBE_BIN_CL, OFF_SHADREC, 1, BinContent::Empty, TARGET_W, TARGET_H,
+    );
+    cache::clean_range(arena_phys() + OFF_PROBE_BIN_CL, cl_len);
+    let ba = (arena_phys() + OFF_PROBE_BIN_CL) as u32;
+    let ea = ba + cl_len as u32;
+    let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    let ts = (arena_phys() + OFF_TILESTATE) as u32;
+    if !arena_contains(ba as usize, cl_len)
+        || !arena_contains(tile_alloc as usize, BIN_TILEALLOC_BYTES)
+        || !arena_contains(ts as usize, TILE_STATE_BYTES)
+    {
+        serial_println!(
+            ":: V3D: [v3d95] range escapes the arena — refusing the kick (fail-closed). NOTHING was kicked and NO verdict is implied ::"
+        );
+        return;
+    }
+    decode_cl_packets("v3d95 unarmed close", OFF_PROBE_BIN_CL, cl_len);
+
+    // The `[v3d68]` evidence-integrity detectors: poison, never zero. Here they are pure NEGATIVE
+    // controls — the arena regions the close path would write IF it were armed. Intact poison plus a
+    // fault is the boot11 shape (the write left the arena); touched poison would say the close aimed
+    // at these very regions without having been told where they are.
+    v3d56_poison_region(OFF_TILESTATE, TILE_STATE_BYTES);
+    v3d56_poison_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+
+    // ── STATION PRE — the residue, before this driver writes ANY CT0 register this boot. ────────
+    let qma_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMA);
+    let qms_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMS);
+    let qts_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QTS);
+    serial_println!(
+        ":: V3D: [v3d95] tile-memory PRE (virgin — no CT0 kick and no CT0QMA/QMS/QTS write of ours in front of this read) — CT0QMA={:#010x} CT0QMS={:#010x} CT0QTS={:#010x} (ENABLE={}) | for reference the values an ARMED bin kick would have written: QMA={:#010x} QMS={:#010x} QTS={:#010x} — NOT written by this rung, by design. NOTE (v3d.md §49.16 sweep diff): piOS programs pool/base registers in the core0 +0x108..+0x174 window, which CONTAINS these three (+0x15c/+0x170/+0x174) and which this driver never touches; naming that intersection is in scope here, programming any of it is the sweep-diff arc's proposal and is NOT done ::",
+        qma_pre, qms_pre, qts_pre,
+        (qts_pre & V3D_CLE_CT0QTS_ENABLE != 0) as u32,
+        tile_alloc, BIN_TILEALLOC_BYTES as u32, ts | V3D_CLE_CT0QTS_ENABLE
+    );
+
+    // ── Arm the catcher, then the kick. ─────────────────────────────────────────────────────────
+    // `[v3d62]` first (it seeds the unmapped scratch page and clears the hub interrupt latch), then
+    // the MMU fault-latch W1C, so anything reported at wait-exit belongs to THIS kick.
+    v3d62_arm("v3d95 unarmed close");
+    clear_mmu_fault_latch("v3d95 pre-kick");
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let rfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
+    let bpca_pre = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
+    let arena_pre = v3d56_arena_digest();
+
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, ba);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, ea); // GO — bare submit, nothing armed
+    dsb();
+    let submit_sound = v3d54_submit_audit("v3d95 unarmed close", ba, ea, cl_len);
+    let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CTNCS_CTRUN, "CT0 v3d95 unarmed close");
+    let (sts, us, retired) = wait_fldone("v3d95 unarmed close", ba, ea);
+
+    // ── STATION POST — the same three registers, and the fault witness. ─────────────────────────
+    let qma_post = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMA);
+    let qms_post = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMS);
+    let qts_post = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QTS);
+    let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let fault =
+        mmu_ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    let vio_addr = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ADDR);
+    let vio_id = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ID);
+    let (client, va) = vio_decode(vio_id, vio_addr);
+    let tm_moved = qma_post != qma_pre || qms_post != qms_pre || qts_post != qts_pre;
+    serial_println!(
+        ":: V3D: [v3d95] tile-memory POST — CT0QMA {:#010x}->{:#010x} CT0QMS {:#010x}->{:#010x} CT0QTS {:#010x}->{:#010x} (ENABLE={}) moved={} — these are READ-ONLY on this boot, so any movement is the BLOCK writing its own tile-memory state across an unarmed close, which would be a finding in its own right ::",
+        qma_pre, qma_post, qms_pre, qms_post, qts_pre, qts_post,
+        (qts_post & V3D_CLE_CT0QTS_ENABLE != 0) as u32, tm_moved as u32
+    );
+    // The three fault-report channels, BEFORE any W1C — `v3d62_frame_witness` documents that order.
+    v3d62_frame_witness("v3d95 unarmed close");
+
+    // ── Evidence integrity: did anything land in the arena? ─────────────────────────────────────
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
+    let flush_done = wait_bit_clear(
+        V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS, "L2T write-back (v3d95 scan)",
+    );
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+    dsb();
+    cache::invalidate_range(arena_phys(), ARENA_BYTES);
+    dsb();
+    let ts_scan = v3d56_scan(ts, TILE_STATE_BYTES);
+    let pool_scan = v3d56_scan(tile_alloc, BIN_TILEALLOC_BYTES);
+    v3d56_emit_scan("v3d95 unarmed close", "tile-state", ts, &ts_scan, flush_done);
+    v3d56_emit_scan("v3d95 unarmed close", "tile-alloc pool", tile_alloc, &pool_scan, flush_done);
+    v3d56_emit_landing("v3d95 unarmed close", &arena_pre, &v3d56_arena_digest());
+    let wrote_any = ts_scan.zeroed + ts_scan.overwritten + pool_scan.zeroed + pool_scan.overwritten > 0;
+    ptb_frame_witness("v3d95 unarmed close", bfc_pre, rfc_pre, bpca_pre, tile_alloc);
+
+    let bfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
+    let frdone = sts & V3D_INT_FRDONE != 0;
+    let bfc_delta = bfc_after.wrapping_sub(bfc_pre);
+    let frame_closed = frdone || retired || bfc_delta != 0;
+
+    // ── The verdict. Every outcome pre-written, and each may claim only its own columns. ────────
+    let verdict: &str = if !submit_sound {
+        "THE SUBMIT DID NOT AUDIT SOUND — [v3d54] says the latched [BA,EA) is not the one intended, so nothing below is about an unarmed close. Re-take; no verdict"
+    } else if !frame_closed {
+        "NO FRAME CLOSED THIS BOOT, so the question was never put. boot11's premise is a frame that CLOSED under the unarmed submit (BFC Δ1, retired=1); this kick did not close one, so there is no close whose writes could have gone anywhere. NOT a retraction of boot11 and NOT a verdict on the writes — read [v3d87u]'s row-B instruction in v3d.md §49.10 and re-take both captures in one session"
+    } else if fault == 0 && !wrote_any {
+        "THE UNARMED CLOSE WROTE NOWHERE THIS INSTRUMENT CAN SEE — a frame CLOSED with no MMU fault, no arena byte touched (poison fully intact), and, per the [v3d62] line above, whatever it says about the catcher page. If the catcher is pristine too, then an unarmed close issues no memory write at all on this boot and boot11's PTB violation was NOT a property of closing unarmed — the hunt moves to what else differed on that boot. Read the [v3d62] channels before concluding: this branch only claims the two columns it names"
+    } else if fault != 0 && client == "PTB" {
+        "THE PTB IS THE CLIENT — an unarmed frame-close DOES issue a write, and the MMU refuses it. This is boot11's shape reproduced under the instrument built for it: read the VA column against the CT0QMA/CT0QMS residue printed at the PRE station. A VA that matches (or is an offset from) the residue means the close path FOLLOWS those never-programmed registers and writes wherever they happen to point — the tile-memory bases are load-bearing at close time, not merely at bin time. A VA that is fixed (0x70 again, independent of a different residue) means the aim is NOT derived from them and the address is structural. The arena poison says whether anything ALSO landed in memory we own, and the [v3d62] catcher page says whether the refused write landed anywhere at all"
+    } else if fault != 0 {
+        "A FAULT LATCHED BUT THE CLIENT IS NOT THE PTB — the close path is not the obvious author of this write. Read the client and VA columns and the [v3d62] channels: attribution belongs to whichever unit the VIO_ID names, and boot11's PTB reading is NOT reproduced by this boot"
+    } else {
+        "A FRAME CLOSED, NO FAULT LATCHED, AND ARENA BYTES MOVED — the unarmed close wrote into memory we own without the MMU objecting. Read the [v3d56] scan lines for WHICH region moved: the tile-state array and the pool are the regions an ARMED close writes, and the block reaching them with no CT0QMA/QMS/QTS programmed would mean those registers are not the only path to them"
+    };
+    serial_println!(
+        ":: V3D: [v3d95] unarmed-close verdict — frame-closed={} (retired={} FRDONE={} BFC {:#010x}->{:#010x} Δ{}) | submit_sound={} idled={} INT_STS={:#010x} waited={}us PCS={:#010x} (BMACTIVE={} BMBUSY={} BMOOM={}) | tile-memory PRE QMA={:#010x} QMS={:#010x} QTS={:#010x} POST-moved={} | MMU_CTL={:#010x} fault={} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) VIO_ADDR={:#010x} VIO_ID={:#010x} (client {} @ VA {:#010x}) | arena poison touched: tile-state={} of {}, pool={} of {} (drain completed={}) wrote-any={} — {} ::",
+        frame_closed as u32, retired as u32, frdone as u32, bfc_pre, bfc_after, bfc_delta,
+        submit_sound as u32, idled as u32, sts, us, pcs,
+        (pcs & V3D_PCS_BMACTIVE != 0) as u32,
+        (pcs & V3D_PCS_BMBUSY != 0) as u32,
+        (pcs & V3D_PCS_BMOOM != 0) as u32,
+        qma_pre, qms_pre, qts_pre, tm_moved as u32,
+        mmu_ctl, (fault != 0) as u32,
+        (fault & V3D_MMU_CTL_PT_INVALID != 0) as u32,
+        (fault & V3D_MMU_CTL_WRITE_VIOLATION != 0) as u32,
+        (fault & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32,
+        vio_addr, vio_id, client, va,
+        ts_scan.zeroed + ts_scan.overwritten, ts_scan.words,
+        pool_scan.zeroed + pool_scan.overwritten, pool_scan.words,
+        flush_done as u32, wrote_any as u32,
+        verdict
+    );
+
+    // Leave the field clean, exactly as every rung in this file does.
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    clear_mmu_fault_latch("v3d95 post-kick");
+    serial_println!(
+        ":: V3D: [v3d95] UNARMED-CLOSE BOOT COMPLETE — one CT0 kick taken and nothing else. probe_job, the [v3d48] ladder, M4 and the whole visible battery were NOT run this boot, by design. Re-run without UNAOS_V3D_UNARMCLOSE for a full boot ::"
     );
 }

@@ -4748,6 +4748,11 @@ the arena. This deserves its own rung later: **program nothing, close a frame, a
 also the first time this campaign has a *positive* MMU fault to work with rather than a silent
 nothing, and §26's hub-INT and §36's PTB-frame instruments both point at it.
 
+> **BUILT — see §49.12.1.** PI-V3D-95 is that rung, armed by `UNAOS_V3D_UNARMCLOSE=1` and default
+> OFF, and it carries the `[v3d85r1]` instrument fix this section also owed: the R1 line now prints
+> the violation pair and its decode in its own columns, so "fix it before citing this rung" names the
+> fault it is refusing on instead of leaving it to a later hygiene line.
+
 ---
 
 ### 49.11 The last split — `UNAOS_V3D_FIRSTKICK=rclhead126` (PI-V3D-88)
@@ -5187,6 +5192,89 @@ seeing it caught, and restoring; the full-knob `kernel8` build green once with `
 UNAOS_V3D_FIRSTKICK=rclct1`; `strings -a target/pi_baremetal/kernel8.img` shows the `[v3d89]` family
 and the raw `rclct1` value. QEMU raspi4b models no V3D, so there is no QEMU leg for this arc at all —
 the verdict is the attended metal boot.
+
+#### 49.12.1 The unarmed-close-writes rung, and the `[v3d85r1]` instrument fix (PI-V3D-95)
+
+Two items owed since §49.10 land together, because the second is what makes the first readable.
+
+**The `[v3d85r1]` instrument fix.** boot11 is the type specimen. The R1 line printed
+`MMU_CTL=0x061d1c01 fault=1` and the verdict *"AN MMU FAULT LATCHED across the boot's first kick —
+instrument fault, not a first-kick verdict. Fix it before citing this rung; nothing here
+discriminates anything"* — and then said **nothing about what had faulted**. `fault=1` beside a raw
+CTL word is not a fault report: the violation witness pair (`VIO_ADDR`/`VIO_ID`) and its decode name
+the client and the virtual address, and without them a line that tells its reader to *fix it*
+declines to identify what. The detail did reach that capture's wire, but only on a **later** line —
+the generic `clear_mmu_fault_latch("v3d85 post-kick")` helper, which prints the pair as a side effect
+of W1C-ing the latch away. So the one column the boot turned on lived on a different line, printed
+after the verdict that refused because of it, and owed to a helper whose job is hygiene rather than
+evidence; the lead below had to be reconstructed by a reader pairing two lines by hand.
+
+The fix is exactly that and nothing adjacent: `[v3d85r1]` now reads the violation pair **at verdict
+time, beside the CTL word it belongs to and before any clear**, and carries
+`VIO_ADDR=… VIO_ID=… (client … @ VA …)` plus the three decoded fault bits in its own columns; the
+fault branch points at them and at the rung below. **No verdict branch, no column meaning and no
+gate changes** — every banked reading of this line, and of the `[v3d87h]`/`[v3d87u]`/`[v3d89]` lines
+gated on it, stands unmoved.
+
+**The rung — `UNAOS_V3D_UNARMCLOSE=1` (`v3d_unarmclose`, bare feature, default OFF).** §49.10's
+queued question, built: *where do the writes of an unarmed frame-close go?* boot11 closed a bin frame
+through the rcl-class submit (`BFC` Δ1, `retired=1`) and latched `PT_INVALID=1 WRITE_VIOLATION=1`,
+`VIO_ID` client **PTB**, **VA `0x00000070`**, on a boot where `CT0QMA`/`CT0QMS` were deliberately
+never programmed — with the arena poison fully intact (`wrote-any=0`), so the write left the arena.
+
+`[v3d95]` follows §49.10's design note literally — *"program nothing, close a frame, and read
+`CT0QMA` / `CT0QMS` / `CT0QTS` / the PTB's fault address across it"*. It **programs nothing**: not the
+real bases and not a scratch pair either, because programming a scratch base answers a different
+question ("does the close path follow a base we gave it?") and destroys this one, whose whole subject
+is what the close aims at when those registers hold bring-up residue. The residue is **read** instead,
+pre and post, so the fault VA can be read against it — a VA derived from the residue means the close
+path follows the never-programmed registers, a fixed `0x70` under a different residue means the aim is
+structural. The `[v3d62]` armed-policy catcher is **reused, not re-invented** (hub interrupt latch
+cleared, unmapped scratch page seeded, all three channels reported at wait-exit before any W1C), so a
+refused write that still *lands* is caught rather than inferred; the `[v3d56]` poison regions ride as
+negative controls. The kick is the `emptyunarm` shape byte for byte, from the same builder call at the
+same address: bare `CT0QBA`→`CT0QEA`, CPU `clean_range` publish only, no `CT0QMA`/`QMS`/`QTS`, no
+`BPOS=0`, no pre-kick L2T invalidate.
+
+Placement is the first-kick family's: after M3 (a CT1 frame, so CT0 is still virgin and the three
+registers still hold their residue) and **before `probe_job`**, and the boot then returns. That also
+makes the standing knob-exclusion hazard **structural rather than advisory** — the boot ends long
+before `[v3d75]`'s `ENABLE_QPU` and `[v3d80]`/`[v3d81d]`'s `DISPLAY_DONE` sends are reached, so this
+rung can never sit beside either. With `UNAOS_V3D_FIRSTKICK` armed as well, `[v3d85]` runs and returns
+first and this rung stands down: one experiment per boot.
+
+**The §49.16 intersection, named and not acted on.** The settled piOS sweep found piOS programming
+pool/base registers in the core0 `+0x108..+0x174` window this driver never touches — a window that
+**contains** `CT0QTS` (`+0x15c`), `CT0QMA` (`+0x170`) and `CT0QMS` (`+0x174`), the three registers
+this rung reads. The rung states that intersection on its own wire and in this section, and programs
+**none** of it: doing so is the sweep-diff arc's proposal, not this one's.
+
+| outcome | reading |
+| --- | --- |
+| **fault latched, client `PTB`** | An unarmed close **does** issue a write and the MMU refuses it — boot11 reproduced under the instrument built for it. Read the VA against the `CT0QMA`/`CT0QMS` residue on the PRE station: matching (or offset from) the residue ⇒ the close path follows those never-programmed registers and the tile-memory bases are load-bearing at *close* time, not merely at bin time; a fixed `0x70` under different residue ⇒ the aim is structural. The poison columns say whether anything *also* landed in memory we own, and the `[v3d62]` catcher page whether the refused write landed anywhere at all |
+| **fault latched, client ≠ `PTB`** | The close path is not the author of this write; attribution belongs to whichever unit `VIO_ID` names, and boot11's PTB reading is **not** reproduced |
+| **no fault, poison intact** | The unarmed close wrote nowhere this instrument can see. If the `[v3d62]` catcher is pristine too, an unarmed close issues no memory write at all on this boot and boot11's violation was not a property of closing unarmed — the hunt moves to what else differed there |
+| **no fault, arena bytes moved** | The block reached the tile-state array or the pool with nothing programmed pointing at them — those registers are not the only path to those regions. Read the `[v3d56]` scans for which region moved |
+| **no frame closed** | The question was never put: boot11's premise is a close, and this kick did not make one. **Not** a retraction of boot11 and not a verdict — §49.10's row-B instruction applies (re-take both captures in one session) |
+| **submit not `SOUND`** | `[v3d54]` says the latched `[BA,EA)` is not the one intended; nothing below it is about an unarmed close. Re-take |
+
+**The boot.**
+
+```
+UNAOS_WITNESS=1 UNAOS_PIUSB=1 UNAOS_GENET=1 UNAOS_SMP7=1 UNAOS_NETTEST=1 UNAOS_V3D=1 \
+UNAOS_VUGPAR=1 UNAOS_V3D_UNARMCLOSE=1 ./arroyo kernel8
+```
+
+⚠ An armed boot deliberately produces a **short** capture missing every banked witness; label it and
+never diff it line-for-line against a deep boot.
+
+**Gate (host).** `./arroyo check` green on both arches (the `arm-pi` cfg leg carries `v3d_unarmclose`
+beside `v3d_firstkick`, so both the rung and the R1 fix are type-checked there); the knob-off
+`kernel8` image **byte-identical** to the pre-arc build, which is what "default OFF and fully
+uncompiled" means measured rather than asserted; the knob-on `kernel8` build green with
+`strings -a target/pi_baremetal/kernel8.img` showing the `[v3d95]` family; `./arroyo kernel8-test`
+green as a no-regression statement only. QEMU raspi4b models no V3D — the rung prints its hub-absent
+`[v3d95] SKIPPED` line there — so the verdict is the attended metal boot.
 
 **§49.14 — the VPU-side hunt: boot19 excludes the KMS overlay; PI-V3D-92 named (the domain-cycle
 experiment).** Boot18 left one named fabric divergence (`RPIVID ASB_V3D_M_CTRL` 0x4 vs piOS mid-bin

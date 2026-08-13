@@ -84,6 +84,11 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # the rcl list truncated after main-list packet n. PI-V3D-87's `rclhead` and `emptyunarm` are the two
 # discriminators that cut the last two candidates apart (v3d.md §49.10). The raw value rides the
 # `[v3d85]` header line, so a capture states its own variant.
+#
+# PI-V3D-95: UNAOS_V3D_UNARMCLOSE=1 is a plain arming knob (no value) for the `v3d_unarmclose`
+# feature — the `[v3d95]` unarmed-close-writes rung, which takes one `emptyunarm`-shaped CT0 kick
+# before probe_job and reads CT0QMA/CT0QMS/CT0QTS and the PTB fault address across the close without
+# programming any of them. See the kernel8 knob block below and v3d.md §49.12.1.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1556,7 +1561,7 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -2647,6 +2652,38 @@ kernel8() {
     if [ -n "${UNAOS_V3D_FIRSTKICK:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d_firstkick,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_FIRSTKICK=${UNAOS_V3D_FIRSTKICK}: the R-ladder — ONE CT0 kick before probe_job with R2/R3/R7 riding it, then bringup returns (⚠ short capture: no ladder, no M4, no battery — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-95: UNAOS_V3D_UNARMCLOSE=1 adds the `v3d_unarmclose` (+`v3d`) feature — the
+    # UNARMED-CLOSE-WRITES rung ([v3d95], docs/dev/OS/08_VIDEO/v3d.md §49.10's queued question,
+    # folded at §49.12.1). boot11 (`UNAOS_V3D_FIRSTKICK=emptyunarm`) CLOSED a bin frame through the
+    # rcl-class submit and latched an MMU fault across its own kick — PT_INVALID=1 WRITE_VIOLATION=1,
+    # client PTB, VA 0x00000070 — on a boot where CT0QMA/CT0QMS were deliberately never programmed,
+    # while the arena poison stayed fully intact. So the close path issued a write, the MMU refused
+    # it, and it did not land in memory we own: WHERE DO THE WRITES OF AN UNARMED FRAME-CLOSE GO?
+    # Armed, `bringup` takes EXACTLY ONE CT0 kick in the `emptyunarm` shape (the [v3d48] Empty BIN
+    # list, bare CT0QBA->CT0QEA, CPU clean_range publish only, NO CT0QMA/QMS/QTS, NO BPOS=0, NO
+    # pre-kick L2T invalidate), after M3 and BEFORE probe_job, and then RETURNS. The rung PROGRAMS
+    # NOTHING by design — the doc's design note verbatim — and instead READS CT0QMA/CT0QMS/CT0QTS
+    # pre and post plus the PTB's fault address across the close, so the VA can be read against the
+    # registers' bring-up residue: a VA derived from that residue means the close path follows those
+    # never-programmed registers, a fixed 0x70 means the aim is structural. The `[v3d62]` armed-policy
+    # fault catcher is REUSED across the kick (hub interrupt latch cleared, unmapped scratch page
+    # seeded), so a refused write that still LANDS is caught rather than inferred, and the arena
+    # poison detectors ride as negative controls.
+    # NOTE (§49.16 sweep diff): piOS programs pool/base registers in the core0 +0x108..+0x174 window
+    # — which CONTAINS CT0QTS/CT0QMA/CT0QMS (+0x15c/+0x170/+0x174) — and this driver never touches
+    # them. The rung NAMES that intersection on the wire and programs NONE of it; doing so is the
+    # sweep-diff arc's proposal, not this one's.
+    # Implies UNAOS_V3D. Never sits beside the QPU or DISPLAY_DONE sends, and structurally so: the
+    # boot returns long before [v3d75]/[v3d80]/[v3d81d] are reached. If UNAOS_V3D_FIRSTKICK is armed
+    # too, [v3d85] runs and returns first and this rung stands down — one experiment per boot.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it
+    # and NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D, so the
+    # rung prints its hub-absent SKIPPED line there and kernel8-test green means no regression and
+    # nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_UNARMCLOSE:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_UNARMCLOSE: the [v3d95] unarmed-close-writes rung — ONE unarmed CT0 kick before probe_job, tile-memory registers READ (never programmed) either side, [v3d62] catcher armed, then bringup returns (⚠ short capture — do not diff against a deep boot)${COLOR_RESET}"
     fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::

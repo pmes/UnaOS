@@ -1023,6 +1023,31 @@ v3d81_display = ["v3d81"]
 # a full deep boot; the rung says so on the wire, first line and last.
 v3d_firstkick = ["v3d"]
 
+# PI-V3D-95: the UNARMED-CLOSE-WRITES rung — v3d.md §49.10's queued question, built. boot11
+# (`UNAOS_V3D_FIRSTKICK=emptyunarm`) closed a bin frame through the rcl-class submit and latched an
+# MMU fault across its own kick: PT_INVALID=1 WRITE_VIOLATION=1, VIO_ID client PTB, VA 0x00000070,
+# on a boot where CT0QMA/CT0QMS were deliberately never programmed — with the arena poison fully
+# intact, so nothing landed in memory we own. The doc's design note is followed literally: PROGRAM
+# NOTHING, close a frame, and read CT0QMA/CT0QMS/CT0QTS and the PTB's fault address ACROSS it, so the
+# fault VA can be read against the registers' bring-up residue (a VA derived from the residue is a
+# different mechanism from a fixed 0x70). Programming a scratch base instead would answer a different
+# question and destroy this one. The `[v3d62]` armed-policy fault catcher is REUSED across the kick —
+# hub interrupt latch cleared, unmapped scratch page seeded — so a refused write that still LANDS is
+# caught rather than inferred. The rung rides where `[v3d85]`'s does: after M3 and BEFORE `probe_job`,
+# so CT0 is virgin and the three registers hold their residue, and the boot then RETURNS. That
+# placement also makes the standing knob-exclusion hazard structural: the boot ends long before
+# `[v3d75]`'s ENABLE_QPU and `[v3d80]`/`[v3d81d]`'s DISPLAY_DONE sends are reached, so this rung can
+# never sit beside them. If `UNAOS_V3D_FIRSTKICK` is armed too, `[v3d85]` runs first and returns and
+# this rung stands down — one experiment per boot. Default OFF and fully uncompiled when off, so a
+# knob-off image is byte-identical to one built without the arc. NOTE (§49.16): piOS programs
+# pool/base registers in the core0 +0x108..+0x174 window that contains these three registers and that
+# this driver never touches; the rung NAMES that intersection on the wire and programs none of it —
+# that is the sweep-diff arc's proposal. Enable via `UNAOS_V3D=1 UNAOS_V3D_UNARMCLOSE=1 UNAOS_PI=1
+# ./arroyo kernel8`. ⚠ an armed boot deliberately produces a SHORT capture missing every banked
+# witness; it must never be diffed line-for-line against a full deep boot.
+# See docs/dev/OS/08_VIDEO/v3d.md §49.12.1.
+v3d_unarmclose = ["v3d"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding
