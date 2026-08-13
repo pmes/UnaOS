@@ -5499,3 +5499,84 @@ armed strings with `[v3d93]` as the positive control that the proof discriminate
 converse control — the knob-off build carries the `hubcm-gate off` SKIPPED line and **none** of the
 armed banners. `kernel8-test` green (MBENCH 91/91) is a no-regression statement plus the QEMU CM
 reading above; the verdict on both halves is the attended metal boot.
+
+#### 49.17.2 The boot22 verdict — both halves answered, and the ARM-visible surface is CLOSED
+
+**§49.17 boot22 verdict (PA31 @225660f7, 2026-08-04) [booted, pi4-r23s1x boot22]: half A =
+Δ=0 ON ALL SIX; half B = CM ENAB AGREES, the clock is honestly running.** Both halves reproduced
+unchanged on every armed boot that followed on the same bench session (boots 23/PA32, 24/PA33,
+25/PA34 — three windows on that boot — and PA36): eight armed hub windows and eight CM stations,
+identical values throughout.
+
+*Half A — the hub is as dead as the core.* The six unmapped hub work-counters were snapshotted
+pre-submit and after the criterion's FLDONE backstop returned, around a criterion that wedged as
+everywhere else (`retired=0`, `BFC` Δ0, `PCS=0x00000001` with `BMACTIVE=1 BMBUSY=0 BMOOM=0`,
+`INT_STS=0x00000000`, `waited=500000us`), on a submission the `[v3d54]` audit called SOUND
+(`CT0QBA=0x0034b000 CT0QEA=0x0034b00e span=14`).
+
+| counter | address | pre | post | delta |
+|---|---|---|---|---|
+| `hub+0x8c` | `0xfec0008c` | `0x00000020` | `0x00000020` | +0 |
+| `hub+0x90` | `0xfec00090` | `0x0000009d` | `0x0000009d` | +0 |
+| `hub+0x94` | `0xfec00094` | `0x00001400` | `0x00001400` | +0 |
+| `hub+0xa0` | `0xfec000a0` | `0x00000002` | `0x00000002` | +0 |
+| `hub+0xa4` | `0xfec000a4` | `0x0000001f` | `0x0000001f` | +0 |
+| `hub+0xa8` | `0xfec000a8` | `0x00000140` | `0x00000140` | +0 |
+
+`counters=6 stepped=0 backwards=0`. This is §49.17's pre-written second row: **DEAD AT ITEM-ACCEPT
+EXTENDS TO THE HUB.** The one channel §49.16 found moving outside the §49.15 bracket does not move
+across the criterion window either — the core denies the work and the hub records none. No counter
+decremented, so the third row does not fire and §49.16's monotone reading of `+0x8c…+0xa8` survives
+intact; it is simply a channel that steps elsewhere in the boot and not here.
+
+*The bracket re-baseline on the same boot.* `[v3d93]` was armed alongside, as §49.17.1 recommends:
+`samples=348916 stations=16 | criterion retired=0 | moved=0`, `NEW=0`, `cle=0 ptb=0 fabric=0`,
+`CT0SYNC`/`CT1SYNC` `0x00000000` pre and post. That reproduces §49.15's boot21 reading
+(348,908 samples, sixteen stations, zero bits moved, `BPOS` held 0 — no memory request, no
+GMP/MMU/L2T event, the syncs at rest) on a different flash, so the wide-set closure is not a
+one-boot artifact.
+
+*Half B — the clock is honest, and the wall is not a gated clock.* The direct station read
+`CM_V3DCTL@0xfe101038=0x000002d4` (SRC=4, ENAB=1, KILL=0, BUSY=1, FLIP=0) and
+`CM_V3DDIV@0xfe10103c=0x00001000` (DIVI=1, DIVF=0 — divide-by-one, the slot passing its source
+through undivided), beside the firmware's own `GET_CLOCK_RATE=500000000 Hz` and
+`GET_CLOCK_STATE=0x00000001 (active=1)`. **The CM enable bit agrees with the firmware's active
+bit**, and the enabled-plus-busy pair is a direct reading rather than a report: the V3D clock is
+running on the boots this file's wedge verdicts were taken on. Nothing in §49's dead-block ladder
+is explained by a clock that was never turned on.
+
+*The INFERRED offsets, now corroborated from both sides.* §49.17 shipped `+0x038`/`+0x03C` as an
+inference with the window dump as its falsifier, and the two dumps answer it in opposite ways that
+agree. QEMU's CPRMAN model showed CTL/DIV-shaped pairs either side and **zero** at the V3D slot —
+the layout is where the inference put it. Metal showed `42 nonzero words in CM[0xfe101000,
+0xfe101100)`, with `0x0000636d` (`"cm"`) at `+0x000`/`+0x004` confirming the base decodes as the
+clock manager, CTL/DIV-shaped neighbours at `+0x008`/`+0x00c` and `+0x028`, and the V3D slot itself
+carrying a programmed CTL/DIV pair consistent with the granted rate. The fourth outcome row
+(whole window zero, INCONCLUSIVE) is excluded by measurement.
+
+*The honest limit on the §46.4 audit.* What was audited is the report **on the standard bringup
+path**, and there it is truthful. §46.4's instrument-lie entry was taken on the `v3d79_minimal`
+boot — firmware reporting the clock gated at 250 MHz while `CYCLE_COUNT` free-ran at ~499 MHz —
+and on that path half B still reads CM directly but prints no firmware column, because the two
+mailbox queries are the same read-only tags `[v3d55]` sends and `v3d79_minimal`'s whole
+discriminator is that bringup sends no mailbox tag at all. The ledger entry therefore stands
+unretracted; what boot22 adds is that the divergence is not a property of the hardware clock,
+which reads enabled and busy on every armed boot.
+
+**The closure, stated once.** With the KMS overlay excluded (boot19, §49.14), the domain cycle
+closing the mailbox family (boot20, §49.14), the sixteen-station bracket dead at item-accept
+(boot21 and boot22, §49.15), the hub delta at zero and the clock manager read honest (boot22,
+this section), **the ARM-visible V3D surface is CLOSED.** Every mapped register, every mailbox
+act, every fabric write, every observable station at poll rate, the one unmapped hub channel the
+sweep diff named, and the clock block behind all of it have now been read, and none of them
+carries the bin wall. No further kernel rung is proposed against this surface, and any future
+"one more register" proposal owes an argument for why it is not already covered above.
+
+**The one remaining prong is firmware-side.** It is the §49.16 sitting ask, unchanged and still
+outstanding: boot the bench Pi on stock piOS and capture `--sweep` at idle, `--sweep` under
+glxgears, and one `--trigger ct0run` mid-bin, then scp all three to `~/unaos-bench/capture/`. The
+script is staged at `~/unaos-bench/tools/v3d-dump-pios.sh` with `[v3d76]`-identical windows plus
+the CM block, so the piOS side lands in the same format both halves above are quoted in. Until that
+capture exists, the 41 nonzero sweep words with no piOS value — led by the seven unmapped
+core-CTL constants — remain unexamined territory, not excluded territory. `[v3d93]` and `[v3d94]`
+both stay in the tree as standing read-only instruments for any future state the block reaches.
