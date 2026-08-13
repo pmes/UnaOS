@@ -13027,22 +13027,108 @@ fn stage_worst_case(info: &unaos_boot_info::FrameBufferInfo) -> usize {
     area.min(MAX_STAGE_BYTES)
 }
 
+/// WEDGE-12 (M2) — rows of a SECONDARY core's pre-sized band on the small-heap arch. 64 is
+/// `WCD_CHUNK_ROWS_MAX`'s value, taken as precedent rather than as a reference: that constant is
+/// `x86_64` + `witness` + `wcg-paygo`-gated and does not exist on this build, but it is the same
+/// question answered for the same reason — how many rows of a panel are a bounded bite. See
+/// [`stage_secondary_target`] for why a secondary is pre-sized to a band and not to a panel.
+const STAGE_SECONDARY_ROWS: usize = 64;
+
+/// WEDGE-12 (M2) — the bytes ONE SECONDARY core's [`STAGE`] entry is pre-sized to, which is not
+/// the same question as [`stage_worst_case`], because the two arches do not have the same heap.
+///
+/// THE ARITHMETIC, written out (the reason this function exists at all):
+///
+///   * **x86_64 — full worst case.** [`allocator::HEAP_SIZE`](crate::allocator::HEAP_SIZE) is
+///     256 MiB there since GR27. The whole pool at its cap is [`STAGE_CPUS`] x
+///     [`MAX_STAGE_BYTES`] = 8 x 4 MiB = 32 MiB, i.e. 12.5% of the heap — and it is a ceiling the
+///     lazy path was already free to reach on its own (GR27's diagnosis was precisely that 8 pools
+///     growing toward the cap is the DESIGNED regime, and that 48 MiB was the artificial famine).
+///     Pre-sizing does not raise the peak; it moves it off the masked path.
+///   * **aarch64 — the banded bound.** The heap is 48 MiB and cannot be raised without moving the
+///     hand-placed region in `arch/aarch64/boot.rs` (out of lane, and a different arc). At the
+///     bench panel (1920x1200x4) `stage_worst_case` is the 4 MiB cap, so a full 4-core pre-size is
+///     4 x 4 MiB = 16 MiB — 33% of the whole heap, standing beside a ~9.2 MiB panel-sized back
+///     buffer and the wc-d verify snapshot. That is the shape of the GR27 x86 famine (48 MiB, a
+///     desktop, and every `try_reserve` declining), and taking it on the Pi to close a bounded
+///     defect would be trading a masked allocation for `DECL_ALLOC` on every path. The honest
+///     bound is therefore the BAND: [`STAGE_SECONDARY_ROWS`] x `row_bytes`, 480 KiB per secondary
+///     at 1920x1200 and 160 KiB at QEMU's 640x480 — 1.4 MiB and 480 KiB respectively for the
+///     Pi's three secondaries, under 3% of the heap either way.
+///
+/// WHAT THE BANDED ARM DOES AND DOES NOT BUY, stated plainly: a secondary present whose `need`
+/// (see [`stage_window`]) is within the band never grows under the mask; one larger still takes
+/// exactly one masked growth, then never again for that steady size. That is a reduction of the
+/// F-family exposure on secondaries, not its elimination — the elimination is entry 0's, and
+/// entry 0 is the core that runs the panel-sized composites.
+fn stage_secondary_target(info: &unaos_boot_info::FrameBufferInfo) -> usize {
+    let full = stage_worst_case(info);
+    #[cfg(target_arch = "x86_64")]
+    {
+        full
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let row_bytes = info.width.saturating_mul(info.bytes_per_pixel);
+        row_bytes.saturating_mul(STAGE_SECONDARY_ROWS).min(full)
+    }
+}
+
+/// WEDGE-12 (M2) — how many [`STAGE`] entries are worth pre-sizing: the cores that can ACTUALLY
+/// reach a staged present, capped at the pool width.
+///
+/// NOT a config constant, and deliberately not `meter_cpu_count()`: on aarch64 that is `NUM_CPUS`
+/// (a BSS-sizing bound) and on x86 it is `acpi::cpu_count()` (what the firmware TABLE names) —
+/// both would over-count a boot where a core failed to come up and pre-size an entry no core can
+/// ever index. The sources used here are what BRING-UP RECORDED:
+///
+///   * aarch64 baremetal — `smp::online_secondaries()`, the `CORE_READY` set each released
+///     Cortex-A72 publishes for itself, plus the BSP (which never joins the scheduler's
+///     `ONLINE_MASK` on the Pi: it stays the GUI/hardware-service core, and it is the core that
+///     stages presents). 4 on a healthy Pi; the metal 3-of-4 variance the pi4 regression spec
+///     documents reads honestly as 3, and the fourth entry simply keeps trunk's lazy growth.
+///   * x86_64 — `smp::online_aps()`, the APs that reached `ap_entry` and finished bring-up (the
+///     module's own comment: "actually came up (not just 1..cpu_count)"), plus the BSP.
+///   * every other aarch64 build (virt/tegra) — 1. Those secondaries park in WFI and never run a
+///     compositor pass, so an entry beyond the BSP's would be dead memory.
+///
+/// ORDERING, checked rather than assumed. Both bring-up publications precede
+/// `video::init_panel`, so this count is already FINAL at [`reserve_stage`] and no second,
+/// post-SMP reserve pass is needed: on aarch64 `smp::start_secondaries()` (main.rs, step 4a) and
+/// `sched::start_aps` (step 4c) both run several hundred lines above the `init_panel` call, and
+/// `start_secondaries` WAITS for each core's `CORE_READY` before returning; on x86
+/// `smp::start_aps()` publishes `ONLINE_APS` on the BSP, likewise above `init_panel`. A core that
+/// came up LATE (none does today) would cost only its own lazy first growth.
+fn live_core_count() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    let n = 1 + crate::arch::smp::online_aps().len();
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    let n = 1 + crate::arch::smp::online_secondaries().len();
+    #[cfg(all(target_arch = "aarch64", not(feature = "baremetal")))]
+    let n = 1usize;
+    n.clamp(1, STAGE_CPUS)
+}
+
 /// WEDGE-12 (merge port) — bytes entry 0 of the pool holds after [`reserve_stage`]; the census
 /// line's source and the contended-arm fallback answer.
 static STAGE_RESERVED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// WEDGE-12 (merge port, pi4 resync) — size the BSP's [`STAGE`] entry to [`stage_worst_case`] from
-/// an UNMASKED context, so the primary core's staged presents never grow the buffer under
-/// `SYS_WIN_PRESENT`'s IRQ mask (a masked acquisition of the global heap `Mutex` — the F-family
-/// shape). Called once from `video::init_panel`, IRQs live, heap up, no pass in flight.
+/// WEDGE-12 (M2) — size the [`STAGE`] entry of every LIVE core from an UNMASKED context, so a
+/// staged present never grows its buffer under `SYS_WIN_PRESENT`'s IRQ mask (a masked acquisition
+/// of the global heap `Mutex` — the F-family shape). Called once from `video::init_panel`, IRQs
+/// live, heap up, no pass in flight.
 ///
-/// SCOPE CUT, deliberate and ledgered: the pi4 track pre-sized its ONE shared stage buffer; the
-/// trunk's pool is per-core ([`STAGE_CPUS`] = 8), and pre-sizing every entry costs up to
-/// 8 x [`MAX_STAGE_BYTES`] = 32 MiB against a 48 MiB heap on the small-heap config. Entry 0 is
-/// therefore the one pre-sized — the BSP runs init and the early composites — and secondary cores
-/// keep the trunk's lazy banded growth (bounded: one allocation per steady window size per core,
-/// declining via `DECL_ALLOC` on exhaustion, never panicking). The per-core pre-size sized to the
-/// live core count belongs to the owed-tail/WEDGE-12 re-land arc.
+/// M1 (the merge port) pre-sized entry 0 only, because pre-sizing all [`STAGE_CPUS`] = 8 entries
+/// would cost 8 x [`MAX_STAGE_BYTES`] = 32 MiB against the small-heap config. M2 replaces the
+/// count rather than the cap: [`live_core_count`] entries are pre-sized, from what SMP bring-up
+/// RECORDED, and each secondary's target comes from [`stage_secondary_target`] — full worst case
+/// where the heap affords it (x86), the band where it does not (aarch64). Those two functions
+/// carry the core-count source and the heap arithmetic; this one carries the loop.
+///
+/// Entry 0 keeps [`stage_worst_case`] on both arches: the BSP is the core that runs init and the
+/// panel-sized composites, and it is the entry [`STAGE_RESERVED`] reports. An entry that comes up
+/// SHORT (heap exhausted) is not a failure mode — that core simply keeps trunk's lazy growth,
+/// declining via `DECL_ALLOC` on exhaustion, never panicking. The witness names the shortfall.
 ///
 /// `try_lock`, never `lock` — [`STAGE`]'s standing acquisition rule. Idempotent and grow-only.
 pub fn reserve_stage(info: &unaos_boot_info::FrameBufferInfo) -> usize {
@@ -13050,31 +13136,60 @@ pub fn reserve_stage(info: &unaos_boot_info::FrameBufferInfo) -> usize {
     if want == 0 {
         return 0;
     }
-    let Some(mut stage) = STAGE[0].try_lock() else {
-        return STAGE_RESERVED.load(core::sync::atomic::Ordering::Relaxed);
-    };
-    if stage.len() < want {
-        let add = want - stage.len();
-        // The one `try_reserve` on this path that runs unmasked by construction. An exhausted
-        // heap returns the shorter buffer rather than panicking; the pass's own declines report
-        // the shortfall honestly.
-        if stage.try_reserve(add).is_ok() {
-            stage.resize(want, 0);
+    let entries = live_core_count();
+    let secondary = stage_secondary_target(info);
+    // Per-entry outcome, folded into the census: `reserved` reached its target, `short` did not
+    // (including the entry a concurrent holder made us skip — nothing else can hold one of these
+    // this early, but the `try_lock` rule is not suspended for being early).
+    let (mut reserved, mut short) = (0usize, 0usize);
+    let mut got0 = STAGE_RESERVED.load(core::sync::atomic::Ordering::Relaxed);
+    for (cpu, entry) in STAGE.iter().enumerate().take(entries) {
+        let target = if cpu == 0 { want } else { secondary };
+        let Some(mut stage) = entry.try_lock() else {
+            short += 1;
+            continue;
+        };
+        if stage.len() < target {
+            let add = target - stage.len();
+            // The one `try_reserve` on this path that runs unmasked by construction. An exhausted
+            // heap leaves the shorter buffer rather than panicking; the pass's own declines report
+            // the shortfall honestly.
+            if stage.try_reserve(add).is_ok() {
+                stage.resize(target, 0);
+            }
+        }
+        let got = stage.len();
+        if cpu == 0 {
+            got0 = got;
+            STAGE_RESERVED.store(got, core::sync::atomic::Ordering::Relaxed);
+        }
+        if got >= target {
+            reserved += 1;
+        } else {
+            short += 1;
         }
     }
-    let got = stage.len();
-    STAGE_RESERVED.store(got, core::sync::atomic::Ordering::Relaxed);
+    // The two tallies exist FOR the census line below; a witness-off build (every flashable image)
+    // still counts them — three adds per boot — rather than carrying a second `cfg` inside the loop.
+    // This is their reader on that build, so the counting is not a warning.
+    #[cfg(not(feature = "witness"))]
+    let _ = (reserved, short);
     #[cfg(feature = "witness")]
     serial_println!(
-        "[wedge12] stage-reserve panel={}x{}x{} want={} got={} -> {}",
+        "[wedge12] stage-reserve panel={}x{}x{} want={} got={} entries={} reserved={} short={} \
+         secondary={} -> {}",
         info.width,
         info.height,
         info.bytes_per_pixel,
         want,
-        got,
-        if got >= want { "RESERVED" } else { "SHORT" }
+        got0,
+        entries,
+        reserved,
+        short,
+        secondary,
+        if short == 0 { "RESERVED" } else { "SHORT" }
     );
-    got
+    got0
 }
 
 /// WC-H — whether the one-shot fallback fixture has been spent. See the fixture block in

@@ -175,8 +175,12 @@ pub fn init_panel(base: usize, len: usize, info: FrameBufferInfo) {
     // become known, IRQs are live and no composite pass exists yet. `wm`'s staged presents run inside
     // `SYS_WIN_PRESENT`'s IRQ mask, so a buffer that grew on the pass would be a masked acquisition of
     // the global heap `Mutex` — the F1-F5 family defect with the widest-shared lock in the kernel.
-    // Growing it once, from here, is what lets the masked paths be allocation-free. See
-    // `wm::reserve_stage` for the bound and `[wedge12]` for the census.
+    // Growing it once, from here, is what lets the masked paths be allocation-free. WEDGE-12 M2:
+    // this now sizes ONE ENTRY PER LIVE CORE, not just the BSP's — which is sound at this call
+    // site precisely because SMP bring-up has already published its core set several hundred lines
+    // above (see `wm::live_core_count` for the ordering argument and the count's source,
+    // `wm::stage_secondary_target` for the per-arch heap arithmetic, and `[wedge12]` for the
+    // per-entry census).
     wm::reserve_stage(&info);
 }
 
