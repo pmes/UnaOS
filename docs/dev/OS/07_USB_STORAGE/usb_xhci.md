@@ -7024,13 +7024,21 @@ fallback), `User Passkey Request`, `Remote OOB Data Request` are each witnessed 
 event bytes, answered with the spec's negative reply (no invented PIN, no guessed passkey), and
 end the stage.
 
+**Operator note — HID pauses during pairing.** The whole BT chain runs inside one
+`service_ehci_hid` pass holding the EHCI_HID lock, and this stage's worst case is `BT_SSP_STAGE_MS`
+(8 s). During a pairing the internal keyboard and trackpad — serviced by that same lock — are
+therefore unresponsive for up to that window; a healthy just-works pairing spends a fraction of it,
+but a peer that engages and then stalls holds HID for the full cap. This is expected, not a hang,
+and clears the instant the stage reaches its tally. (It is the same lock-hold that blocks the link
+key from a synchronous filesystem write — §27.3.)
+
 ### 27.2 The event mask, again
 
 The mask in force after §21 is the reset default plus LE Meta (bit 61) — and the reset default
 ends at bit 44, while the six SSP events live at bits 48..53. Without a new
 `HCI_Set_Event_Mask` the controller runs the pairing and tells the host *nothing*: the same
 clean, silent, entirely wrong shape as §21's missing bit 61. The stage writes
-`0x2000_3FFF_FFFF_FFFF` (default + SSP family + LE Meta) before requesting authentication, and
+`0x203F_1FFF_FFFF_FFFF` (default + SSP family + LE Meta) before requesting authentication, and
 leaves it in place under the same provenance note as L2's widening.
 
 ### 27.3 The bond, and the persistence gap (honest)

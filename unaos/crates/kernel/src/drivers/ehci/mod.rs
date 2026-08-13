@@ -7890,7 +7890,7 @@ impl Controller {
             t, intf, e, toggle, BT_HCI_SET_EVENT_MASK, &BT_EVENT_MASK_SSP, &mut rp, armed,
         ) {
             Some(n) if n >= 1 && rp[0] == 0x00 => serial_println!(
-                ":: bt-ssp: [{}] stage=event-mask — HCI_Set_Event_Mask status=0x00 mask=0x2000_3FFF_FFFF_FFFF (reset default + SSP events bits 48..53 + LE Meta bit 61 carried from L2); the six SSP events can now reach this host == witness ::",
+                ":: bt-ssp: [{}] stage=event-mask — HCI_Set_Event_Mask status=0x00 mask=0x203F_1FFF_FFFF_FFFF (reset default + SSP events bits 48..53 + LE Meta bit 61 carried from L2); the six SSP events can now reach this host == witness ::",
                 self.idx
             ),
             Some(n) if n >= 1 => {
@@ -8230,6 +8230,21 @@ impl Controller {
                             else { "NOT AUTHENTICATED — the stage ends without a bond" }
                         );
                         if s != 0x00 {
+                            // A FAILURE AFTER REPLAYING THE STORED KEY MEANS THE BOND IS DEAD ON THE
+                            // PEER'S SIDE — it re-paired elsewhere, was factory-reset, or aged the
+                            // key out (Vol 4 Part E: a Link Key Request answered from a stale key
+                            // yields Authentication Complete 0x05/0x06). Keeping the key would wedge
+                            // EVERY later Ctrl+Alt+B re-trigger — replay dead key, fail, break, never
+                            // reach a fresh pairing — until a reboot. Discard it here so the next
+                            // re-trigger answers the Link Key Request negatively and pairs afresh,
+                            // which is the spec's Key-Missing recovery.
+                            if key_from_store {
+                                self.bt_ssp_key = None;
+                                serial_println!(
+                                    ":: bt-ssp: [{}] stage=auth-complete — the failure was against the SESSION-STORED link key, so the bond is dead on the peer's side (re-paired elsewhere, reset, or key aged out). The stored key is DISCARDED; the next Ctrl+Alt+B re-trigger will answer the Link Key Request negatively and pair afresh rather than replay a key that can only fail == witness ::",
+                                    self.idx
+                                );
+                            }
                             break;
                         }
                         // ---- 5. Set_Connection_Encryption, inline: the authenticated link is the
@@ -9243,7 +9258,7 @@ impl Controller {
                     0x0000 => "L2CAP CHANNEL ESTABLISHED. The signalling road to A2DP is open at the transport layer; it is not usable until both directions are configured, which is the next exchange",
                     0x0001 => "PENDING — the peer has not decided yet (commonly an authorisation step on the device). One further response is waited for and no more",
                     0x0002 => "PSM NOT SUPPORTED — this device does not publish an AVDTP service at all. That is a complete answer about the peer and says nothing against this host's L2CAP",
-                    0x0003 => "SECURITY BLOCK — the peer requires an authenticated and/or encrypted link before it will open this PSM. BT-C1's Connection Complete reported encryption=0x00 and this arc pairs with nothing, so THIS IS THE EXPECTED REFUSAL FROM A SPEAKER THAT INSISTS ON BONDING, and it names pairing (Secure Simple Pairing) as the next arc's prerequisite rather than leaving it to be guessed",
+                    0x0003 => "SECURITY BLOCK — the peer requires an authenticated and/or encrypted link before it will open this PSM. READ THE bt-ssp SSP tally ABOVE THIS LINE, which ran on THIS SAME LINK moments ago: if it says NOT BONDED (SSP refused, or was never reachable), this refusal is EXPECTED and pairing was the missing precondition. But if it says BONDED AND ENCRYPTED, the block did NOT lift on an authenticated ciphered link, and THAT is the finding — the speaker wants something past authentication+encryption (a fresh L2CAP attempt on a new link, or a service this host has not offered), which is the next arc's brief rather than a re-run of this one",
                     0x0004 => "NO RESOURCES AVAILABLE — the peer has no channel to give right now, commonly because it is already streaming from another source",
                     0x0006 => "INVALID SOURCE CID",
                     0x0007 => "SOURCE CID ALREADY ALLOCATED — this host reused a CID the peer still holds from an earlier channel on this link",
