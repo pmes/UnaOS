@@ -195,11 +195,33 @@ its "loser repaints" sweep finds nothing and composites nothing on a teardown pa
 placement x86 uses, with the **same** `route=self-exit …` token so one arch's capture stays readable
 against the other's.
 
-### 5.3 Byte-identity
+### 5.3 Byte-identity, and the line-neutral rule every parity port will hit
 
 Every aarch64 addition sits behind `pidesk`, which is default-OFF. With the knob off, not one of these
-bodies or call sites is compiled and `kernel8.img` is byte-identical to baseline — the discipline the
-`pidesk` feature was defined with, kept by construction rather than by assertion.
+bodies or call sites is compiled and `kernel8.img` is byte-identical to baseline.
+
+**That is not automatic, and it is the trap in this campaign.** `cfg`-gating your new code is *not*
+sufficient. `arroyo`'s PI-DESK block records the measurement: a `cfg`-only change to `wm.rs` still moved
+the knob-off hash (`42355ca2…` → `1143ecc5…`), because panic `Location` records embed **file line
+numbers** — eleven added *comment* lines shifted every location below them.
+
+So: **a change to a file compiled on the knob-off Pi image must be LINE-NEUTRAL.** Fit new prose into
+the line count already there; never add to it. The files that matter are the ones compiled knob-off —
+`wm.rs`, `main.rs`, `arch/aarch64/*.rs`, `fbcon.rs`, `screen.rs`, `framebuffer.rs`. The four `pidesk`
+furniture modules (`strip`/`dock`/`menubar`/`crystal`) are **not** compiled knob-off and are free of it.
+
+Practical consequences, learned on this arc:
+
+* **Put the rationale in this document, not in the source.** `docs/` is not compiled into `kernel8.img`,
+  so prose here is free; a paragraph at the call site is not. Leave a one-line pointer (`See PARITY.md
+  §x`) and write the argument here.
+* Fold added statements onto the line they follow — `pump_usb_into_gui(); #[cfg(…)] pace_service();` is
+  valid Rust and costs zero lines.
+* Reclaim lines by rewrapping *adjacent existing* comments without dropping their content, rather than
+  by deleting documentation.
+* **Re-measure, never reason.** `arroyo` says so explicitly, and it is right: build knob-off and compare
+  `sha256sum target/pi_baremetal/kernel8.img` against the pre-change image. Line-neutrality is
+  necessary, not provably sufficient.
 
 ---
 
