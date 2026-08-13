@@ -3715,10 +3715,10 @@ fn input_service(_: usize) {
                     gui_send(unaos_kernel::pal::Event::Timer);
                 }
             }
-            // PIUSB-23: pump xHCI + bridge decoded HID keys into GUI_CHANNEL each cooperative pass (QEMU raspi4b
-            // delivers no USB HID — cheap no-op; on metal it consumes the re-armed interrupt-IN completions
-            // enumerate()'s pump no longer services). VUG-PARITY drains WPACE here too — `usb_pump` is metal-only.
-            pump_usb_into_gui(); #[cfg(feature = "pidesk")] unaos_kernel::video::wm::pace_service();
+            // PIUSB-23: pump xHCI + bridge decoded HID keys into GUI_CHANNEL each cooperative pass
+            // (QEMU raspi4b delivers no USB HID, so this is a cheap no-op there; on metal it consumes
+            // the re-armed interrupt-IN completions the enumerate() pump no longer services).
+            pump_usb_into_gui();
             unaos_kernel::arch::sched::yield_now();
         }
     }
@@ -4086,7 +4086,7 @@ fn usb_pump(_: usize) {
     loop {
         unaos_kernel::arch::sched::sleep_ticks(1); // ~4 ms at the 250 Hz per-core tick
         let t0 = unaos_kernel::arch::now_cycles();
-        pump_usb_into_gui(); #[cfg(feature = "pidesk")] unaos_kernel::video::wm::pace_service();
+        pump_usb_into_gui();
         let dt = unaos_kernel::arch::now_cycles().wrapping_sub(t0);
         // Rate-limit the cost line to once every ~5 s (this loop runs ~250×/s).
         let now = unaos_kernel::arch::ms();
