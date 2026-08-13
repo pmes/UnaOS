@@ -444,6 +444,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
         unaos_kernel::drivers::emmc2::probe();
 
+        // ONECARD-PI: name the ONE medium this system runs from, immediately after the backend that
+        // serves it is registered — the card's geometry, its FAT program volume, its native volume's
+        // extent, and the USB census. Unconditional (not behind `witness`): the claim "UnaOS boots
+        // and runs from a single card" is a property of a DEFAULT boot, so a default boot is exactly
+        // the capture that has to carry its evidence. One line, reads only. See the function doc for
+        // why the audit produced a witness rather than a fix.
+        #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+        unaos_kernel::drivers::emmc2::onecard_witness();
+
         // PI-SHELL-LS (witness battery): prove the Pi shell's `ls` lists the native unafs volume — the
         // same store PI-NET-15 serves at `/fs/`. The verb is panel-only on the bench, so this exercises
         // the exact `pi_ls_collect` listing headlessly and emits the `:: ls1: /: ... ::` witness a

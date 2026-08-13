@@ -24,6 +24,7 @@ Cell values: **yes** (verified on that platform) · **no** (verified absent) · 
 | Cursor never vanishes | ? | yes | fix 2977899c; awaits next metal session to confirm |
 | Keyboard to shell | ? | yes | Pi: typematic + midden verbs on metal |
 | USB storage disk mint (incl. stuck-reader cure) | ? | partial | Pi: mint works after replug; hub-cycle rung refused port-shared once (ghost fix 7b87e045 unflown) |
+| Boots + runs from ONE card (no data card) | ? | yes | Pi: ONECARD witness + ELF1/EXEC1/K2/K3/K4 all off the internal card, no USB attached (QEMU raspi4b default) |
 | FAT read/write | ? | yes | Pi: midden write/rm/mv byte-exact on metal |
 | UnaFS mount + verbs (incl. umv/urmattr, snapshots) | ? | yes | Pi: fixtures green on metal boots; F2/F3 landed |
 | One path namespace (ls/cat/run agree) | ? | yes | VFS seam 4cd87124; QEMU witnesses |

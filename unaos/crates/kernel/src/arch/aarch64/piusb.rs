@@ -2192,6 +2192,15 @@ impl EnumWitness {
 //    early-exiting healthy pump emits as few as 3.
 const PIUSB43_MAX_PORTS: usize = 8; // VL805 exposes 5 root ports; clamp for the fixed arrays
 const PIUSB43_PERIODIC_CAP: u32 = 13; // 30 s / 2 s = 15 interior ticks; cap keeps the budget honest
+/// The enumeration pump's worst-case backstop, in seconds. Named rather than inlined because
+/// ONECARD-PI's EMPTY-PORTS exit reports the window it RELEASES, and a literal in two places is how
+/// that report drifts away from the deadline it describes.
+const PIUSB43_PUMP_BACKSTOP_S: u64 = 30;
+/// ONECARD-PI: how long the pump holds an apparently EMPTY bus before it stops waiting, in seconds.
+/// Several sample points at the 2 s cadence, so the exit rests on a series of PORTSC reads rather
+/// than one — see the exit's own note in `enumerate` for why root-port CCS settles this question
+/// long before enumeration would.
+const PIUSB43_NO_DEVICE_EXIT_S: u64 = 8;
 
 struct PortscWitness {
     /// xHCI operational base (CAP base + CAPLENGTH); PORTSC(n) at +0x400 + 0x10*(n-1).
@@ -2524,7 +2533,7 @@ pub fn enumerate() {
     //     keeping the console alive; a keyboard exits early at ARMED, storage after a short settle.
     let pump_start = super::timer::cntpct();
     let freq = super::timer::cntfrq();
-    let deadline = pump_start.wrapping_add(freq.saturating_mul(30)); // 30 s worst-case backstop
+    let deadline = pump_start.wrapping_add(freq.saturating_mul(PIUSB43_PUMP_BACKSTOP_S)); // worst-case backstop
     let storage_settle = freq.saturating_mul(6); // keyboard-up: let a hubbed MSC settle, then stop
     let mut armed: Option<(u8, u8)> = None;
     let mut armed_at: u64 = 0;
@@ -2640,6 +2649,55 @@ pub fn enumerate() {
                 enum_advanced = Some("keyboard armed, no mass storage within the settle window");
                 break; // keyboard up, no disk within the settle window — stop
             }
+        }
+        // ONECARD-PI: the EMPTY-PORTS exit. The two exits above are both "something happened"; until
+        // now the only way out of "nothing is plugged in" was the 30 s backstop below, and a Pi that
+        // needs no USB medium to boot is precisely the machine that reaches this loop with every
+        // port empty. Thirty seconds of boot spent re-reading five PORTSC words that have read
+        // CCS=0 CSC=0 since power-on is not caution; it is an unpaid cost carried over from a
+        // two-medium premise (a program/data stick beside the boot card) that this arc retires.
+        //
+        // The exit is keyed on the SAME evidence [`PortscWitness::verdict`] already uses for its
+        // NO-CCS-EVER branch — `saw_ccs` / `saw_csc`, accumulated by `sample()` from raw PORTSC
+        // reads — so it can claim nothing the verdict would not. It sets no `enum_advanced`: an
+        // empty bus is not an advance, and the verdict must still be free to print NO-CCS-EVER.
+        //
+        // Three conditions, each a reason rather than a threshold:
+        //
+        //   * `have_baseline` — the start sample landed, so the bitmasks mean something at all.
+        //   * `poison.is_none()` — a non-decoding BAR reads 0xffffffff and `sample()` refuses to
+        //     decode it, so CCS would be unset for a window that is DARK rather than EMPTY. That is
+        //     the one state in which silence is not evidence, and it keeps the full backstop.
+        //   * `saw_ccs == 0 && saw_csc == 0` — no port has shown a connect, or bounced through one
+        //     between samples, at any sample so far.
+        //
+        // Why the window is safe rather than merely short: CCS is an ELECTRICAL property of the
+        // port, set by the controller after connect debounce (~100–200 ms once PP is up), not a
+        // product of enumeration. A device slow to ENUMERATE — a hub, a stick behind a hub, a device
+        // that needs several address attempts — still asserts CCS on the ROOT port it is wired to
+        // within that debounce, and this reads root ports only. So an exit here means nothing is
+        // electrically attached to any root port, which no amount of further waiting changes.
+        // `NO_DEVICE_EXIT_S` spans several sample points at the 2 s cadence, so the decision rests
+        // on a series and not on a single read.
+        //
+        // A boot WITH a keyboard or a stick attached never reaches this branch — `saw_ccs` is set at
+        // the first sample that sees the connect — so the desktop path pays exactly what it paid.
+        if pw.have_baseline
+            && pw.poison.is_none()
+            && pw.saw_ccs == 0
+            && pw.saw_csc == 0
+            && super::timer::cntpct().wrapping_sub(pump_start)
+                >= freq.saturating_mul(PIUSB43_NO_DEVICE_EXIT_S)
+        {
+            serial_println!(
+                "{} enumerate: EMPTY-PORTS exit at {}s — all {} root ports read CCS=0 CSC=0 at every sample and no PORTSC read was poison, so no device is electrically attached; releasing the remaining {}s of the {}s backstop rather than re-reading an empty bus ::",
+                P,
+                PIUSB43_NO_DEVICE_EXIT_S,
+                ports,
+                PIUSB43_PUMP_BACKSTOP_S.saturating_sub(PIUSB43_NO_DEVICE_EXIT_S),
+                PIUSB43_PUMP_BACKSTOP_S
+            );
+            break;
         }
         // Wrap-safe deadline test (the ORIN pattern): elapsed past deadline once (now - deadline)
         // stays in the low half.

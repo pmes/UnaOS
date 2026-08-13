@@ -641,6 +641,84 @@ fn finish(card: SdCard) {
     crate::drivers::block::register_sd(info);
 }
 
+/// ONECARD-PI: name, once per boot, the SINGLE medium this system is running from.
+///
+/// ### Why a witness and not a fix
+///
+/// The audit this arc opened with looked for a USB dependency in the Pi's program-load path and did
+/// not find one. `program_source()` on `aarch64` has a one-rung ladder — the global `BLOCK_DEVICE`
+/// (`drivers::block::program_source`, the `not(all(x86_64, sdhcblk))` arm) — and it can never return
+/// `BlockHandle::Usb`. `register_sd` (called from [`finish`] above, synchronously on the BSP) flips
+/// `BACKEND` to `BACKEND_SD` long before xHCI enumerates, and the aarch64 `publish_usb_geometry`
+/// claims the global slot ONLY while `BACKEND != BACKEND_SD` — so a stick cannot displace the card
+/// in `/fat`. Every fixture that loads a program (ELF1, EXEC1, K2) mounts `BlockSource::Default`;
+/// K3/K4 read and write the native volume through `block::read_block`/`write_block`, i.e. the same
+/// card. The `/usb` mount is bound only when a stick is actually present (`shell::vfs_mount_table`).
+///
+/// What was missing was not a mechanism but a FACT ON THE WIRE. Nothing in a Pi capture said "this
+/// boot needed one medium"; a reader had to infer it from the absence of USB lines, which is exactly
+/// the inference `sdhc.md` §12.4 records as falsified on the x86 side. Absence of evidence was doing
+/// the work of evidence. So this prints the four fields that make the claim falsifiable in one line:
+/// the backend and its geometry, the FAT program volume, the native volume's extent, and the USB
+/// census. If a second medium ever became load-bearing, `usb=` would say so.
+///
+/// ### Placement and cost
+///
+/// Called from the aarch64 bare-metal boot sequence immediately after [`probe`], on the BSP, where
+/// the block backend has just been registered and the mailbox is idle. It reads: one FAT mount
+/// (LBA 0 + the BPB) and one MBR walk for the native span. Both are reads the boot performs anyway
+/// moments later, so this moves no work onto the boot path that was not already there, and it takes
+/// no lock the probe did not just release.
+///
+/// Strictly advisory: every outcome is a printed field, never an error and never a mount that
+/// outlives the call. A wrong witness can mislead a reader; it cannot change what gets mounted.
+/// Deliberately NOT shaped like a fixture verdict (no `-> PASS ::` tail), so it stays outside the
+/// `pi4-regression.spec` `COUNT 25` fixture census — this is a description of the medium, not a
+/// twenty-sixth thing that can pass.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn onecard_witness() {
+    let Some(dev) = crate::drivers::block::info() else {
+        serial_println!(
+            ":: ONECARD: no block device registered — no boot medium to name; every program-load path this boot will decline honestly ::"
+        );
+        return;
+    };
+    let mib = dev.num_blocks.saturating_mul(dev.block_size as u64) / (1024 * 1024);
+
+    // p1 — the FAT program volume. `mount()` is `BlockSource::Default`, which the `register_sd` above
+    // has just pointed at this card; it is the identical binding `/fat`, ELF1, EXEC1 and K2 use.
+    let fat = match crate::fs::fat::mount() {
+        Ok(fs) => {
+            let (vol_id, _clusters) = fs.volume_fingerprint();
+            let kind = match fs.kind() {
+                crate::fs::fat::FatKind::Fat16 => 16,
+                crate::fs::fat::FatKind::Fat32 => 32,
+            };
+            alloc::format!("FAT{} '{}' vol_id={:#010x}", kind, fs.label(), vol_id)
+        }
+        Err(e) => alloc::format!("unmountable ({})", crate::fs::fat::fat_reason(e)),
+    };
+
+    // p2 — the native volume. `locate` walks the same card's partition table by superblock magic.
+    let native = match crate::fs::unafs::locate() {
+        Ok(span) => alloc::format!("base_lba={} blocks={}", span.base_lba, span.block_count),
+        Err(e) => alloc::format!("absent ({:?})", e),
+    };
+
+    // The USB census. `usb_info()` is one mutex read of `USB_BLOCK_DEVICE` — no probe, no wait. At
+    // this point in the boot xHCI has not enumerated, so `absent` here is a statement about the boot
+    // SEQUENCE (nothing USB was needed to get this far), not a claim that none will ever appear.
+    let usb = match crate::drivers::block::usb_info() {
+        Some(u) => alloc::format!("present ({} blocks)", u.num_blocks),
+        None => alloc::string::String::from("absent"),
+    };
+
+    serial_println!(
+        ":: ONECARD: boot medium = SD backend, {} blocks ({} MiB) | p1 program volume {} | p2 native volume {} | usb={} — no second medium was consulted to reach this point ::",
+        dev.num_blocks, mib, fat, native, usb
+    );
+}
+
 /// Read one 512-byte block at `lba` into `buf` (>= 512 bytes) via a polled single-block CMD17. Returns
 /// the number of bytes copied (512) on success. Backs `drivers::block::read_block` on the SD backend.
 /// No cache maintenance: PIO into a normal kernel buffer, no DMA.
