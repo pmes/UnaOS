@@ -58,9 +58,14 @@
 //!  * **`ui_status.rs`** — the bottom instrument strip: `METER_DIM`, `METER_BREATH`, `METER_PARKED`
 //!    (lines 229/232/234) and the three VU colours `LED_GREEN` / `LED_AMBER` / `LED_RED` (727-729).
 //!    The LED ramp is arguably an instrument rather than chrome, which is itself a taste question.
-//!  * **`video/cursor.rs`** — the pointer sprite's `FILL` and `SHADOW` (lines 110/112).
+//!  * **`video/cursor.rs`** — the pointer sprite's `FILL`/`SHADOW` (110/112), duplicated verbatim in `pal.rs`'s `cursor` module (166-177).
+//!    ⛔ THE POINTER IS UN-THEMED, NOT MERELY UN-WIRED, AND THAT IS A VERDICT RATHER THAN A TODO (PA38): `kits/crispy/theme.json` and
+//!    `kit.json` define NO cursor/pointer/arrow role at all — `quartzite`'s `Palette`/`Metrics` carry none either (its `caret` is a
+//!    text-layout pen advance, not a pointer) and the kit's clean-room line disclaims imported cursors outright. There is nothing to
+//!    lift, so the 8x8 `ARROW` and its two colours stay INVENTED and no arc may quietly author a shape here: the pointer is a taste
+//!    question that belongs to Peter and closes with a KIT REVISION, not a kernel edit.
 //!
-//! See `docs/dev/OS/08_VIDEO/engine.md` §CRISPYWIRE.
+//! See `docs/dev/OS/08_VIDEO/engine.md` §CRISPYWIRE and §CURSOR-VANISH.
 //!
 //! A verdict change still edits THIS FILE ONLY: every consumer reads the names.
 //!
