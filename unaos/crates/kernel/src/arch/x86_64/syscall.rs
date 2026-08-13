@@ -6423,36 +6423,36 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
     if mask & !prev != 0 || repress {
         // PRESS edge (or a recovered stationary re-press — see CLICK-REPRESS above).
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
-        // CRYSTAL — **judged FIRST, ahead of the dock and every window arm.** The SHARD menu, when
-        // open, is a modal dropdown composited on top of everything, so its press must be tested
-        // before any layer beneath it; when closed, the only point it claims is the crystal box in
-        // the menu bar, which the bar owns anyway (the bar composites above the windows). It declines
-        // every other point (`false`), so the dock and window arms are not starved. Consumed with the
-        // target set to DROP so the matching RELEASE is dropped rather than delivered into whatever
-        // holds focus — the rule the dock, close and chrome arms below already follow.
-        #[cfg(feature = "wc")]
-        if crate::video::crystal::press_at(x, y) {
-            CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
-            return true;
-        }
-        // DOCK — **judged before EVERY window arm, because the dock is composited on top of them.**
+        // FURNITURE — **the crystal menu, then the dock, both ahead of EVERY window arm**, because
+        // both are composited on top of the window layer and the painter that owns the pixel owns the
+        // press. `wm::hit_test` knows nothing of either strip: it answers from the window table, and a
+        // window lying under the dock would take a press the operator can see landed on a dock tile.
+        // Asking furniture first is the chrome arm's own ordering rule, one layer up.
         //
-        // `wm::hit_test` knows nothing of the strip: it answers from the window table, and a window
-        // lying under the dock would take a press the operator can see landed on a dock tile. Asking
-        // the dock first is the same ordering rule the chrome arm below states for chrome — the
-        // painter that owns the pixel owns the press — applied to the layer above the window layer.
+        // Neither side can be starved. The crystal declines every point but the open dropdown and the
+        // crystal box in the bar (which the bar owns anyway); the dock declines every point outside
+        // its own strip (`Layout::contains`, the same accessor its painter draws from, corners
+        // included). So there is no point at which both this arm and a window arm answer "mine"; and
+        // the strip is auto-sized to its tiles and drawn only when there is at least one, so a bare
+        // desktop has no dock to swallow anything.
         //
-        // Neither side can be starved. The dock declines every point outside its own strip
-        // (`Layout::contains`, the same accessor its painter draws from, corners included), so there
-        // is no point at which both this arm and a window arm answer "mine"; and the strip is
-        // auto-sized to its tiles and drawn only when there is at least one, so a bare desktop has no
-        // dock to swallow anything.
+        // PI-DESK — this was TWO inline arms, one per surface, with that ordering rule and its
+        // no-starvation argument written out at length right here. Both moved WHOLE into
+        // [`crate::video::strip::press_route`] when the Pi's router came to need the identical seam,
+        // and the choice is stated rather than implied: the order is the INVERSE of
+        // `strip::compose_all`'s paint order, so it belongs beside that function — not duplicated
+        // across two arch files, edited by two lanes on two schedules, free to drift apart with no
+        // gate able to see it (the symptom of a stale order is a press landing on the wrong layer).
         //
-        // Consumed, with the target set to DROP so the matching RELEASE is dropped rather than
+        // **Nothing about this arch's behaviour changed**: same two surfaces, same order, same
+        // consume-and-drop, one call instead of two. What stays here is genuinely per-arch — the edge
+        // detection above, the press-target latch, and this file's input rings. (Line-NEUTRAL by
+        // construction; see the aarch64 twin for why that matters to the Pi's identity proof.)
+        // Consumed with the target set to DROP so the matching RELEASE is dropped rather than
         // delivered into whatever holds focus after the raise — the rule the close and chrome arms
         // below already follow for the same reason.
         #[cfg(feature = "wc")]
-        if crate::video::dock::press_at(x, y) {
+        if crate::video::strip::press_route(x, y) {
             CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
             return true;
         }

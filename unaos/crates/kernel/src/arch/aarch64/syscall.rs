@@ -13403,10 +13403,9 @@ fn click_owner_is_fullscreen(asid: u64) -> bool {
 /// delivered to; otherwise it is dropped. So a TAB (or an app exit) between press and release costs
 /// the release, never a fabricated one in a second app.
 ///
-/// Returns `true` when the event was CONSUMED and the caller must not deliver or forward it — since
-/// CLICK-PLAIN that is the MISS arm only (a press that moved focus to the shell). `false` means "carry
-/// on with your normal path", with whatever focus this call left in place: unchanged on a press to the
-/// already-focused window, and the newly RAISED owner on a press that moved focus to a window.
+/// Returns `true` when the event was CONSUMED and the caller must not deliver or forward it — the MISS arm (a press that moved focus to the shell), the close/control arms, and since PI-DESK the FURNITURE arm. `false` means "carry on with your normal path", with whatever focus this call left in place: unchanged on a press to the already-focused window, and the newly RAISED owner on a press that moved focus to a window.
+///
+/// ### PI-DESK — the FURNITURE arm, judged BEFORE every window arm. The crystal menu and the dock composite on TOP of the window layer (`wm::composite_once` paints `strip::compose_all` after the window loop), and the painter that owns the pixel owns the press. The `match` below answers from the window TABLE and knows nothing of either strip, so without that arm a window lying under the dock would take a press the operator can SEE landed on a tile. It calls the same [`crate::video::strip::press_route`] the x86 router does — ONE copy of the order, which is the inverse of the paint order and lives beside it; see that function for why neither arm can starve the other, and note that the strip's cut CORNERS decline (through its painter's own `contains`), so a corner press falls through to the desktop-miss arm, per the crispywire review. The grammar is unchanged by it: a furniture press is an instruction to the WINDOW SYSTEM, consumed with the target set to DROP exactly as the close and control arms are; a dock press SELECTS and acknowledges on the wire — it stops nothing, starts nothing, kills nothing. ⚠ The ONE-LINE shape of that arm, and this paragraph's long lines, are not style: `wm.rs` proved this arc that PANIC `Location` RECORDS EMBED LINE NUMBERS, so a line ADDED to any file compiled into the knob-off `kernel8.img` breaks its byte-identity proof — and this file is one. The arm is one line, paid for by one line removed here; the diff is line-NEUTRAL, and must stay so.
 ///
 /// Idempotent per edge: the mask tracker is swapped on entry, so a second call with the same mask sees
 /// no edge and answers `false`. The shell caller relies on that (it calls `user_input_enqueue`, which
@@ -13420,6 +13419,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
     if mask & !prev != 0 {
         // PRESS edge.
         let (x, y) = click_pointer_pos();
+        #[cfg(feature = "pidesk")] if crate::video::strip::press_route(x, y) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // PI-DESK: furniture before every window arm — see this fn's header
         match crate::video::wm::hit_test(x, y) {
             // CLOSE-BOX (P79) — checked FIRST, so the close box beats select. This is the ONE
             // point in the click grammar where a click ACTS: the box is explicit window FURNITURE

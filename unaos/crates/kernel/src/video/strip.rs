@@ -695,6 +695,55 @@ pub fn compose_all() -> bool {
     a | b | c
 }
 
+/// **The press seam: every furniture surface's press arm, in COMPOSITE-INVERSE order.** The twin of
+/// [`compose_all`], and the one place the furniture layer's routing rule lives.
+///
+/// Returns `true` iff the press was CONSUMED by furniture, in which case the caller must drop the
+/// matching RELEASE (store its DROP sentinel) and return without consulting the window table. `false`
+/// means no furniture claimed the point and the window arms get their say.
+///
+/// # Why this function exists at all (PI-DESK, and the extraction it chose)
+///
+/// The Pi has a live mouse, so the aarch64 router owed the same two arms x86's
+/// `wc_click_route_at` already carried. Two options: copy the arms, or extract them. Copying would
+/// have put the ORDERING RULE — the whole content of this seam — in two files that are edited by two
+/// different lanes on two different schedules, free to drift, and drifting SILENTLY (the symptom of a
+/// stale order is a press landing on the wrong layer, which no gate asserts). So the core is
+/// extracted here, arch-neutral, beside `compose_all` — because the order below is not a routing
+/// preference, it is the INVERSE of the paint order that function fixes, and the two belong within
+/// one screen of each other or they will disagree.
+///
+/// Both arch routers now call this and neither owns a copy. What stays per-arch is exactly what is
+/// per-arch: the edge detection, the press-target latch, and the input rings.
+///
+/// # The order, and why neither arm can starve the other
+///
+///  1. **CRYSTAL first**, ahead of the dock and every window arm. An OPEN dropdown is a modal surface
+///     composited at the pass tail, on top of everything, so its press must be judged before any
+///     layer beneath it. CLOSED, the only point it claims is the crystal box in the menu bar — which
+///     the bar owns anyway — and it declines every other point, so nothing below it is starved.
+///  2. **DOCK second**, still ahead of every window arm, because the dock is composited on top of
+///     them: `wm::hit_test` knows nothing of the strip, so a window lying under the dock would
+///     otherwise take a press the operator can see landed on a tile. The dock declines every point
+///     outside its own strip (`Layout::contains`, the SAME accessor its painter draws from — corners
+///     included, which is why a corner hit-tests as desktop), and the strip is auto-sized to its tiles
+///     and drawn only when there is at least one, so a bare desktop has no dock to swallow anything.
+///
+/// There is no point at which two arms both answer "mine". That is a property of the accessors, not a
+/// tie-break policy: each arm asks the same rect its own painter drew.
+///
+/// # The click grammar is NOT relaxed here
+///
+/// A furniture press is an instruction to the WINDOW SYSTEM, never app input — the same law the close
+/// and chrome arms follow — so it is consumed and its release is dropped rather than delivered into
+/// whatever holds focus after the raise. A dock press SELECTS (raises, un-hides, hands over the
+/// keyboard) and acknowledges on the wire; it does not stop, start or kill anything. Nothing in this
+/// seam touches a running program's execution.
+#[inline]
+pub fn press_route(x: i32, y: i32) -> bool {
+    super::crystal::press_at(x, y) || super::dock::press_at(x, y)
+}
+
 // ---------------------------------------------------------------------------
 // Compile-time sanity
 // ---------------------------------------------------------------------------
