@@ -118,6 +118,9 @@ pub const TITLE_CELL_W: usize = super::font::CELL_W;
 /// FONT (GR27) — the caption glyph cell's HEIGHT, in panel pixels: [`font::CELL_H`] (16 — the
 /// same drawn height `TITLE_SCALE = 2` produced, so every vertical centring lands where it did).
 pub const TITLE_CELL_H: usize = super::font::CELL_H;
+// REVIEW (GR27 fonts): back the draw_title comment's "cell shorter than the strip" claim on every
+// arch (menubar's CELL_H<=BAR_H assert is x86+wc-only). draw_title clamps anyway, but assert it.
+const _: () = assert!(TITLE_CELL_H <= TITLE_H, "title glyph cell must fit the caption strip");
 
 /// CRISPYWIRE-REVIEW — the strip width the three-disc control cluster RESERVES, measured from the
 /// inner edge of the LEFT frame (WMCTRL, Peter 2026-08-09: the cluster is left-aligned, macOS-side;
