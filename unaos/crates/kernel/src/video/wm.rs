@@ -1068,7 +1068,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     // shell, the desktop — anything in the reserved owner band) and the compat row (owner 0)
     // composite on every present exactly as before; only ring-3 presents are panel-paced. Read in
     // the same table acquisition as the damage mark, like `skip`.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
     let pace_exempt;
     {
         let mut t = table();
@@ -1113,7 +1113,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
         // WPACE-PANEL — `owner == 0` is the compat row (never presented through the syscall path,
         // and `present_background`'s whole-panel cadence is its own pacing); the kernel band is the
         // console/shell/desktop furniture the brief exempts by name.
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
         {
             pace_exempt = owner == 0 || is_kernel_owner(owner);
         }
@@ -1129,7 +1129,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     // `own=no`, the truthful classification (the compositor, not the owner, initiated that pass).
     // Short-circuits on `skip`: a hidden owner's present is suppressed below and must neither stamp
     // the frame nor raise a pending bit.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
     let pace_go = skip || pace_admit(id, pace_exempt);
     #[cfg(feature = "witness")]
     if let Some((surf, surf_len)) = probe {
@@ -1138,9 +1138,9 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
         // make the `app` leg disagree with itself the moment a window went behind the shell. NOT
         // taken on the coalesced path — see the WPACE-PANEL note above: a coalesced present makes no
         // finished-surface declaration, because its pixels reach the panel on a later pass.
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
         let declared = pace_go;
-        #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+        #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
         let declared = true;
         if declared {
             super::wcg::on_present(id, surf, surf_len);
@@ -1170,7 +1170,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     // presenting task is NEVER slept or blocked here: a coalesced present returns `Coalesced`
     // immediately (the damage is committed and a pass inside the frame is guaranteed), which every
     // consumer treats as `Composited` except the rtwit ruler close — see [`Presented::Coalesced`].
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
     if !pace_go {
         #[cfg(feature = "witness")]
         wcn_tick();
@@ -1182,7 +1182,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     Presented::Composited
 }
 
-// ---- WPACE-PANEL — the panel-locked present pacer (x86 + `wc`) ----------------------------------
+// ---- WPACE-PANEL — the panel-locked present pacer (x86 + `wc` / Pi 4 + `pidesk`) ----------------
 //
 // ### The defect (GR27 Boot A, ~/unaos-bench/capture/gr27-bootA/ttyUSB0.log)
 // User vugs present at 233–453/s on a 60 Hz panel (`[wcn] win=3 att=2268 rate=453.9/s`). Every one
@@ -1228,7 +1228,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
 /// The same 60 Hz constant `[wc-h]`/`[wc-g]` already print as `frame_us=16667`; the bench panel and
 /// the built-in rMBP panel both scan out at 60 Hz. If a panel with a different rate ever matters,
 /// this becomes a query of the display driver — one constant, one place.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 const PACE_FRAME_US: u64 = 16_667;
 
 /// WPACE-PANEL — `now_cycles()` at each window's last present-driven (or drain-driven) composite.
@@ -1236,7 +1236,7 @@ const PACE_FRAME_US: u64 = 16_667;
 /// not `arch::ms()`: the APIC ms clock is advanced only by the BSP and stalls under masked holders
 /// (the WCSER ledger measured ~123 ms of loss in one syscall), and a pacer reading a stalled clock
 /// coalesces forever.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 static PACE_LAST_CYC: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
 
@@ -1244,21 +1244,38 @@ static PACE_LAST_CYC: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
 /// by a pass this pacer knows about. The idle test [`pace_service`] runs at ~1 kHz is one relaxed
 /// load of this word. Over-set is safe (a drain that finds no damage is one gate probe and out);
 /// under-set is not, which is why the bit is set BEFORE the coalesced present returns.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 static PACE_PENDING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 const _: () = assert!(MAX_WINDOWS <= 32); // PACE_PENDING is one u32 bitmask
 
-/// WPACE-PANEL — the panel frame in rdtsc cycles, or `0` while the TSC is uncalibrated (pre-
-/// `apic::calibrate`, i.e. the first ~116 ms of boot), during which the pacer stands aside and
-/// every present composites — the pre-pacer behaviour, on a boot phase with no vug storm to pace.
-/// `tsc_hz / 60` IS 16.67 ms; deriving it from the rate rather than multiplying out
-/// [`PACE_FRAME_US`] keeps the frame exact instead of 999 cycles short per frame.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+/// WPACE-PANEL — the panel frame in [`crate::arch::now_cycles`] units, or `0` while that timebase
+/// has no known rate, during which the pacer stands aside and every present composites — the
+/// pre-pacer behaviour, on a boot phase with no vug storm to pace. Deriving the frame from the RATE
+/// rather than multiplying out [`PACE_FRAME_US`] keeps the frame exact instead of 999 cycles short
+/// per frame.
+///
+/// VUG-PARITY — the one genuinely arch-specific line in this pacer, and the reason the rest of it
+/// ports unchanged. Both arches count in their own units and both expose that count as
+/// `arch::now_cycles()`; only the RATE is asked for differently:
+///
+///   * x86_64 — `apic::tsc_hz()`, which is `0` before `apic::calibrate` (the first ~116 ms of boot).
+///   * aarch64 — `CNTFRQ_EL0` via `timer::cntfrq()`, the generic timer's architectural rate. It is
+///     readable from reset and never uncalibrated, so the `0` arm is unreachable on the Pi rather
+///     than merely unusual — it stays because the DEGRADED answer (drain immediately, never
+///     coalesce) is the correct one for a rate we cannot trust, on either arch. `now_cycles` is
+///     CNTVCT_EL0 and `cntfrq` is CNTVCT's own rate, so the pair is exact here exactly as
+///     rdtsc/`tsc_hz` is on x86 — ~54 MHz on the Pi 4, ~62.5 MHz under QEMU, i.e. ~900k/~1.04M
+///     cycles per 60 Hz frame. Not the ms clock: `arch::ms()` is derived and coarser than a frame.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 #[inline]
 fn pace_frame_cycles() -> u64 {
-    crate::arch::apic::tsc_hz() / 60
+    #[cfg(target_arch = "x86_64")]
+    let hz = crate::arch::apic::tsc_hz();
+    #[cfg(target_arch = "aarch64")]
+    let hz = crate::arch::timer::cntfrq();
+    hz / 60
 }
 
 /// WPACE-PANEL — the decision, taken after the damage mark and before [`composite`]. Returns `true`
@@ -1270,7 +1287,7 @@ fn pace_frame_cycles() -> u64 {
 /// presents of the same window composites per frame edge; the losers coalesce onto the winner's
 /// pass, which is the correct outcome (their damage is already in the row the winner is about to
 /// snapshot — over-coalescing here loses nothing, and [`pace_service`] backstops the frame bound).
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 fn pace_admit(id: WinId, exempt: bool) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     if exempt {
@@ -1320,13 +1337,25 @@ fn pace_admit(id: WinId, exempt: bool) -> bool {
 /// rides `Screen::flush`, whose idle cadence is the status strip's ~1/s — visibly late). This is
 /// the same liveness structure the deferred-erase queue has (WC-L), with the same class of taker.
 ///
-/// Called from `wcx::desktop_app_service` — the `wc`-gated body on `x86_usb_pump`'s ~1 kHz
-/// device-service pass — so a deferred present reaches glass within one frame plus one service
-/// tick. Main-loop context, never IRQ, unmasked: exactly the context `composite` already runs in
+/// Called from the device-service pass on both arches, so a deferred present reaches glass within
+/// one frame plus one service tick:
+///
+///   * x86_64 — `wcx::desktop_app_service`, the `wc`-gated body on `x86_usb_pump`'s ~1 kHz pass.
+///   * aarch64 — `usb_pump` directly (VUG-PARITY). The Pi has no `wcx` — that module IS the x86
+///     panel path — so the drain rides the structural twin of the same lane: PIUSB-26's dedicated
+///     pump task, `sleep_ticks(1)` ≈ **4 ms** at the 250 Hz per-core tick. Coarser than x86's ~1 ms
+///     and deliberately still correct: the drain's job is to bound a coalesced frame's wait, and
+///     4 ms is well inside the 16.67 ms frame it is bounding, so the worst case is one frame plus
+///     4 ms rather than one frame plus 1 ms. Not the render service — that task BLOCKS on
+///     `GUI_CHANNEL` and is therefore off the run queue during exactly the input-idle stretch a
+///     stopped present stream leaves behind, which is the case this drain exists for.
+///
+/// Main-loop context, never IRQ, unmasked, on both: exactly the context `composite` already runs in
 /// from `service_damage` and the paygo taker, and the WCSER re-run loop treats it as an unmasked
-/// holder. Idle cost is one relaxed load; pending-but-not-due costs one `tsc_hz` read and a
-/// bounded scan of [`MAX_WINDOWS`] stamps, no locks.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+/// holder. The Pi's pump core is not the render core, so this composite cannot preempt-deadlock
+/// against a raw-spinlock holder the way a co-located taker would. Idle cost is one relaxed load;
+/// pending-but-not-due costs one rate read and a bounded scan of [`MAX_WINDOWS`] stamps, no locks.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub fn pace_service() {
     use core::sync::atomic::Ordering::Relaxed;
     let pend = PACE_PENDING.load(Relaxed);
@@ -1398,13 +1427,13 @@ pub fn pace_service() {
 /// WPACE-PANEL witness — presents that composited in present context under the pacer (frame-edge
 /// admissions of pace-eligible rows). Exempt rows are not counted on either counter: their line is
 /// `[wcn]`'s, unchanged.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
 static WPACE_PACED: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
 
 /// WPACE-PANEL witness — presents absorbed into the frame in flight (returned immediately, damage
 /// accumulated). The storm's measure: Boot A's `win=3` should read `coalesced ≈ 6.5 × paced`.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
 static WPACE_COALESCED: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
 
@@ -1415,7 +1444,7 @@ static WPACE_COALESCED: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
 /// rest); the robust reading is the SUM — `paced + tail ≈ panel rate`. Corollary worth reading off
 /// the capture deliberately: under a storm most composite load migrates off the presenting cores
 /// onto the USB-pump service lane, bounded at the panel rate.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
 static WPACE_TAIL: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
 
@@ -1426,7 +1455,7 @@ static WPACE_TAIL: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
 /// `win=` here is the `[wcn]` namespace and `asid=` is printed so a capture can join the two
 /// without the historical `wcn = wpace + 2` guesswork; `mode=panel` names this emitter against the
 /// (default-off) `vsyncpace` syscall pacer's `mode=` values on the same tag.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
 fn wpace_emit(ident: &[(u64, bool, bool, u32); MAX_WINDOWS]) {
     use core::sync::atomic::Ordering::Relaxed;
     for slot in 0..MAX_WINDOWS {
@@ -9521,7 +9550,7 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // whose `declined=` it is the cure for: `coalesced=` climbing while `declined=` falls is the
     // pacer converting gate contention into absorbed presents. Same identity snapshot as the
     // `[wcn]` lines above, so `asid=` is judged against one table state.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
     wpace_emit(&ident);
     // WCPAR — the per-core stage census rides the same cadence and span, directly under `[wcser]` whose
     // `declined=` it reads against: `cores>1` here while the cross-core `DECL_LOCK` share falls is the

@@ -3719,6 +3719,14 @@ fn input_service(_: usize) {
             // (QEMU raspi4b delivers no USB HID, so this is a cheap no-op there; on metal it consumes
             // the re-armed interrupt-IN completions the enumerate() pump no longer services).
             pump_usb_into_gui();
+            // VUG-PARITY — the WPACE tail drain, on the SAME both-sites rule PIUSB-23 states above:
+            // `usb_pump` is spawned on metal only, so under QEMU raspi4b this cooperative pass is
+            // the only device-service lane that runs, and a pacer whose drain rode the metal task
+            // alone would leave a stopped stream's final frame coalesced in exactly the
+            // configuration the regression suite boots. Cheap when idle (one relaxed load of
+            // `PACE_PENDING`); compiled out entirely without `pidesk`.
+            #[cfg(feature = "pidesk")]
+            unaos_kernel::video::wm::pace_service();
             unaos_kernel::arch::sched::yield_now();
         }
     }
@@ -4087,6 +4095,13 @@ fn usb_pump(_: usize) {
         unaos_kernel::arch::sched::sleep_ticks(1); // ~4 ms at the 250 Hz per-core tick
         let t0 = unaos_kernel::arch::now_cycles();
         pump_usb_into_gui();
+        // VUG-PARITY — the WPACE tail drain rides this pass, the Pi's structural twin of
+        // `wcx::desktop_app_service` on x86 (`wm::pace_service` documents the placement, and why
+        // the BLOCKING render task cannot host it). Inside the `t0`/`dt` bracket deliberately: the
+        // `[piusb26]` cost line is this lane's only cost witness, and a drain that composites is
+        // the expensive pass on it — measuring outside the bracket would make the lane look free.
+        #[cfg(feature = "pidesk")]
+        unaos_kernel::video::wm::pace_service();
         let dt = unaos_kernel::arch::now_cycles().wrapping_sub(t0);
         // Rate-limit the cost line to once every ~5 s (this loop runs ~250×/s).
         let now = unaos_kernel::arch::ms();
