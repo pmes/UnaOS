@@ -12057,8 +12057,18 @@ and `pal.rs` is noted there too — whenever a role does arrive, it has two cons
 
 | leg | result |
 |---|---|
-| `./arroyo check` | see landing report |
-| `UNAOS_WC=1 ./arroyo check` | `wm.rs` was touched — video law |
-| knob-off `./arroyo kernel8` | sha256 vs `42355ca2…` baseline |
-| knob-off `./arroyo kernel8-test 210` | MBENCH |
-| `UNAOS_PIDESK=1 ./arroyo kernel8-test 300` | MBENCH |
+| `./arroyo check` | 12/12 cfg-coverage legs green; userspace x86_64 4/4, aarch64 5/5; `midden_core` 12/12 |
+| `UNAOS_WC=1 ./arroyo check` | 12/12 green (`wm.rs` was touched — video law) |
+| knob-off `./arroyo kernel8` | sha256 `34a9c533bc437f02bbe73a0de9854164e95ab6becb8e7c64b9f8fd6976f4a222` — **byte-identical** to the pre-arc tip `c28ef0d2` |
+| knob-off `./arroyo kernel8-test 210` | MBENCH **PASS 108/108**, 0 forbidden, 18087 lines |
+| `UNAOS_PIDESK=1 ./arroyo kernel8-test 300` | MBENCH **PASS 108/108**, 0 forbidden, 23795 lines |
+
+**How the identity was measured, since PI-DESK's `42355ca2…` baseline is stale.** That hash predates
+the v3d, ERET-SCRUB and owed-tail commits on this tip, all of which move the knob-off image
+legitimately, so it is not a comparand. Nothing was edited back in place; two detached worktrees were
+built instead — one at the arc tip, one at `c28ef0d2`. The arc-tip worktree reproduced this
+worktree's own hash exactly, which is the control: it proves the build is path-independent, so a
+cross-worktree comparison is a valid identity test. The `c28ef0d2` worktree then produced that same
+hash again. `theme.rs` grew five doc lines and did not move the image, which is what its shape
+predicts — it holds `const` items and `const _: ()` assertions only, so no panic `Location` record
+originates there. `wm.rs` was held line-neutral regardless, because that file is full of them.
