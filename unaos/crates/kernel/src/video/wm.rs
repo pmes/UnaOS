@@ -205,14 +205,14 @@ pub struct WindowInfo {
 
 /// One row of the window table. `None`-ness is carried by `used` so the table stays a plain array.
 #[derive(Clone, Copy)]
-struct Window {
-    used: bool,
-    id: WinId,
-    owner_asid: u64,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
+pub(super) struct Window {
+    pub(super) used: bool,
+    pub(super) id: WinId,
+    pub(super) owner_asid: u64,
+    pub(super) x: usize,
+    pub(super) y: usize,
+    pub(super) w: usize,
+    pub(super) h: usize,
     stride: usize,
     /// kernel-visible address of the owner's ARGB8888 surface. Held as a `usize` so the table is `Send`.
     surf: usize,
@@ -222,7 +222,7 @@ struct Window {
     /// read ~400 MB of kernel memory and paint kernel bytes onto the panel (`put_pixel` clips WRITES,
     /// never the source READ).
     surf_len: usize,
-    scale: usize,
+    pub(super) scale: usize,
     z: u32,
     damaged: bool,
     /// FBCON-DMG — the SOURCE-ROW band `[dmg_y0, dmg_y1)` of this window's surface that is known
@@ -242,7 +242,7 @@ struct Window {
     /// Compat shim marker: window created implicitly by [`super::screen::present_surface`]. Such a
     /// window is centered with the legacy scale rule and gets NO chrome, so the pre-WC UVUG present
     /// stays byte-for-byte identical on the panel.
-    compat: bool,
+    pub(super) compat: bool,
     /// Set by [`move_to`]: the caller placed this window explicitly, so the automatic tiling in
     /// [`place`] leaves it where it is.
     pinned: bool,
@@ -4502,7 +4502,7 @@ fn composite_inner() -> CursorTail {
                 .iter()
                 .any(|r| r.used && boxes.iter().any(|b| boxes_overlap(*b, outer_box(r)))),
         };
-        super::wcf::run(&fb, clear);
+        super::wcf::run(&fb, clear); super::wcf::chrome_truth(&fb, &rows, &order, focus_asid());
     }
     let _ = drawn;
     let _ = overlaid;
@@ -9489,7 +9489,7 @@ fn blend_q16(a: u32, b: u32, t: u32) -> u32 {
 /// the middle of the strip and absent below it — which is what "restrained gloss" describes and
 /// what the kit's own sample renders show. The alternative reading (falloff as an exponent) would
 /// need a power function, i.e. float or a table, for no gain the kit asks for.
-fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
+pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
     use super::theme;
     let (top, bot) = if focused {
         (theme::TITLE_ACTIVE_TOP, theme::TITLE_ACTIVE_BOTTOM)
@@ -9662,7 +9662,7 @@ fn outside_top_corner(r: &Window, px: usize, py: usize) -> bool {
 /// F5 — every product and sum here saturates. The kernel builds with overflow checks off, so a
 /// wrapping `w * scale` would silently produce a SMALL box that then fails to damage the region it
 /// actually paints; saturation degrades to "absurdly large box", which the panel clip then bounds.
-fn outer_box(r: &Window) -> (usize, usize, usize, usize) {
+pub(super) fn outer_box(r: &Window) -> (usize, usize, usize, usize) {
     let cw = r.w.saturating_mul(r.scale);
     let ch = r.h.saturating_mul(r.scale);
     if r.compat {

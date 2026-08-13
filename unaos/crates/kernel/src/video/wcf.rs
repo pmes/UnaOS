@@ -529,3 +529,294 @@ fn report_geometry(
         if ok { "PASS" } else { "FAIL" }
     );
 }
+
+// ---------------------------------------------------------------------------
+// CHROME-TRUTH — the glass-readback chrome witness
+// ---------------------------------------------------------------------------
+
+/// CHROME-TRUTH — has the readback spoken yet? Latched only by a pass that actually found chrome.
+static CHROME_TRUTH_DONE: AtomicBool = AtomicBool::new(false);
+
+/// CHROME-TRUTH — read the PANEL back at computed chrome coordinates and print want-vs-got.
+///
+/// ## The gap this closes
+///
+/// The Pi bench desktop already prints a full theme census (`[crispy] theme=us-crispy-modern …
+/// title_h=34 frame=5 face=0xececee desktop=0x2d2b55`), and WC-D already proves each window's
+/// CONTENT reached the scan-out buffer byte for byte. Neither instrument says one word about the
+/// CHROME. `[crispy]` reports the constants the painter was COMPILED with — it fires from
+/// `wm::paint_window` before a single chrome pixel is stored, and would print the identical line if
+/// every chrome write below it were deleted. WC-D verifies the window's CONTENT rectangle against
+/// its source surface, which by construction excludes the frame, the title strip and the discs:
+/// chrome has no source surface to be compared against.
+///
+/// So "the wire says crispy" and "the glass shows crispy" have been, until now, two claims with no
+/// wire between them — which is exactly the gap an operator standing at the bench saying *"I see no
+/// crispy anything"* falls into. This closes it: after the first composite that drew a real window,
+/// read the framebuffer back at coordinates DERIVED from the same geometry `paint_window` used, and
+/// compare each against a colour recomputed by calling the same `theme::` / `ceramic::` /
+/// `wm::title_row_color` the painter called. A `HIT` is the theme on glass. A `MISS` is the theme and
+/// the glass disagreeing, with the coordinate and both colours named so it is diagnosable rather
+/// than merely reported. This witness carries NO second copy of the kit's numbers, so it cannot
+/// drift from the theme and it cannot pass by agreeing with itself.
+///
+/// ## What each probe pins, and why these five
+///
+/// | probe | coordinate | what a MISS would mean |
+/// |---|---|---|
+/// | `keyline_top` | box top edge, mid-width | the outer keyline (`theme::FRAME_LINE`, UNMACHINED — an exact constant) never landed |
+/// | `bevel_light` | one `theme::BEVEL` in | the frame's hairline structure is absent |
+/// | `title_top` | strip row 0, right end | the title gradient's top stop under `ceramic::shade` |
+/// | `title_bot` | strip row `TITLE_H-1` | the gradient's bottom stop — the pair pins the whole ramp |
+/// | `face_left` | left frame, below the strip | the machined `CHROME_FACE` surface itself |
+///
+/// The title probes take the strip's RIGHT end (`bw - BORDER - 2`) rather than its middle, because
+/// the control cluster is LEFT-aligned and the caption follows it: mid-strip is where a glyph lives.
+/// The face probe takes `bx + BORDER - 2`, inside the frame and clear of both the keyline (`kw` =
+/// `theme::BEVEL` wide) and the bevel beside it.
+///
+/// A sixth reading, `content`, carries NO expectation and is reported as `APP`: those pixels belong
+/// to a ring-3 surface and the kernel has no business predicting them. It is printed anyway because
+/// "is there anything in the well at all" is the other half of what an operator is looking at.
+///
+/// ## The desktop reading is REPORTED BUT NOT JUDGED
+///
+/// On x86 the panel-wide `DESKTOP_BG` clear is `wcx`'s DESKTOP-CLEAR; `video::wcx` is
+/// `#[cfg(all(target_arch = "x86_64", feature = "wc"))]` and the Pi has no twin. `wm::erase` paints
+/// `DESKTOP_BG` into window BOXES and `Screen` holds it in the desktop LAYER, but nothing on this
+/// arch ever promises it to a panel pixel outside every box. A witness that called that a `MISS`
+/// would be convicting the chrome for a contract the arch never made. It prints `NOCLEAR` instead —
+/// a distinct token, outside the verdict's arithmetic, naming the gap for whoever writes the aarch64
+/// desktop-clear. The probe point is CHOSEN by testing candidates against every row's outer box,
+/// compat rows included (a compat row can own the whole panel and legitimately paint anything
+/// there); when no candidate is clear it says so rather than asserting a colour it cannot justify.
+///
+/// ## The amplitude numbers — the line that answers the operator, not the gate
+///
+/// `HIT` on all five would still leave *"I see no crispy anything"* unexplained, because the honest
+/// answer is not that the theme is missing but that this theme, on this panel, carries almost no
+/// visible signal. So the verdict states each material's amplitude AS A NUMBER OF 8-BIT LEVELS,
+/// measured rather than asserted:
+///
+/// - `title_grad` — `|title_top - title_bot|` READ FROM GLASS, widest channel. The kit's stops are
+///   `0xEEEEF1`→`0xE3E3E8` focused and `0xF4F4F5`→`0xEFEFF1` not, i.e. ~11 and ~5 levels across the
+///   whole 34-row strip.
+/// - `ceramic_pp` — peak-to-peak of `ceramic::shade(CHROME_FACE, ·)` over the material's whole
+///   128-row tile: the largest difference two chrome rows of one window can EVER show.
+///   `GRAIN_AMP_Q16 + CURVE_AMP_Q16` = 1310/65536 = 2.0 % of a channel.
+/// - `knurl_pp` — the same for the disc milling, `AMP_A + AMP_B` = 1311/65536, also 2.0 %.
+/// - `paper_pp` — the same for the kit's PAPER material, which is a real texture rather than a
+///   modulation, and is the loudest thing the kit has.
+/// - `paper_on` — **can any paper pixel exist in this image at all?** `paper::fill_rect` has exactly
+///   ONE call site in the tree, `video::instgui::repaint`, and `instgui` is `x86_64 + wc + instgui`.
+///   The `paper` module itself is arch-neutral, so its constants and selftest literals ARE in the Pi
+///   image and the census still names it — which is precisely how the wire can say "paper" while no
+///   paper pixel has ever existed on this panel. `cfg!` of the consumer's own gate is the whole
+///   truth of it, so that is what is printed.
+///
+/// Those five numbers are the deliverable. A boot that changes the kit's contrast, or wires paper
+/// onto a Pi content surface, moves them; nobody has to take a claim about the look on trust again.
+///
+/// ## Cost, safety, and why it cannot perturb what it measures
+///
+/// One-shot for the boot, reads 6 pixels per window plus one, and WRITES NOTHING — unlike the twin
+/// probe above it leaves no marks, so it cannot disturb a later photograph or a later WC-D
+/// reference. It is called from the tail of `wm::composite_inner`, inside the same `drawn > 0` block
+/// WC-F runs in and immediately after it, with the table guard already dropped and `rows` a
+/// snapshot — the rule `[wc-c]` and WC-F already print under. Reads go through
+/// `FrameBuffer::read_pixel` (volatile, and the exact inverse of `put_pixel`'s encoding, so the
+/// `Bgr` layout the Pi firmware reports is decoded by the same match that encoded it); the scanlines
+/// are invalidated first, on `wm::verify_window`'s pattern, so a read cannot be answered from a
+/// dirty line the blit left in cache.
+///
+/// It does NOT latch on a pass that found no chrome-bearing row — the desktop takes seconds to reach
+/// its steady population, and a witness that spent its one shot on the first pass to draw anything
+/// would report on a panel nobody is looking at. Such a pass returns silently; a `SKIP` per pass
+/// would be the flood the one-shot exists to avoid.
+pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize], focus: u64) {
+    use super::wm::{outer_box, title_row_color, BORDER, DESKTOP_BG, TITLE_H};
+    if CHROME_TRUTH_DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let info = fb.info();
+    let (pw, ph) = (info.width, info.height);
+    let row_bytes = info.stride * info.bytes_per_pixel;
+    let (mut hits, mut probes, mut wins) = (0usize, 0usize, 0usize);
+    let mut grad_max = 0u32;
+
+    for &i in order.iter() {
+        let Some(r) = rows.get(i) else { continue };
+        // Compat rows have no chrome at all (`paint_window` guards every chrome write with
+        // `!r.compat`), so probing one would report a MISS for a window that is CORRECTLY bare.
+        if !r.used || r.compat || r.w == 0 || r.h == 0 || r.scale == 0 {
+            continue;
+        }
+        let (bx, by, bw, bh) = outer_box(r);
+        // Every probe below indexes at most `BORDER + TITLE_H + 8` rows down and `bw - BORDER - 2`
+        // across; a box that cannot hold them is skipped rather than probed off its own edge.
+        if bw < 2 * BORDER + 4 || bh < BORDER + TITLE_H + 10 || bx + bw > pw || by + bh > ph {
+            continue;
+        }
+        wins += 1;
+        // FOCUS — the same predicate `composite_inner` hands `draw_window`, so the gradient
+        // recomputed here is the one that was painted.
+        let foc = focus != 0 && focus == r.owner_asid;
+
+        // Discard, never clean, over exactly the scanlines about to be read. Without it a read could
+        // be answered from the line the blit left dirty, which would make this witness agree with
+        // the compositor's INTENT instead of with the panel.
+        crate::arch::cache::invalidate_range(fb.base_addr() + by * row_bytes, bh * row_bytes);
+
+        let strip_x = bx + bw - BORDER - 2;
+        let face_row = BORDER + TITLE_H + 8;
+        let want: [(&str, usize, usize, u32); 5] = [
+            ("keyline_top", bx + bw / 2, by, super::theme::FRAME_LINE),
+            (
+                "bevel_light",
+                bx + bw / 2,
+                by + super::theme::BEVEL,
+                super::theme::BEVEL_LIGHT,
+            ),
+            (
+                "title_top",
+                strip_x,
+                by + BORDER,
+                super::ceramic::shade(title_row_color(0, TITLE_H, foc), BORDER),
+            ),
+            (
+                "title_bot",
+                strip_x,
+                by + BORDER + TITLE_H - 1,
+                super::ceramic::shade(
+                    title_row_color(TITLE_H - 1, TITLE_H, foc),
+                    BORDER + TITLE_H - 1,
+                ),
+            ),
+            (
+                "face_left",
+                bx + BORDER - 2,
+                by + face_row,
+                super::ceramic::shade(super::theme::CHROME_FACE, face_row),
+            ),
+        ];
+        let (mut got_top, mut got_bot) = (0u32, 0u32);
+        for (n, (name, x, y, w)) in want.iter().enumerate() {
+            let got = fb.read_pixel(*x, *y);
+            probes += 1;
+            let ok = got == Some(*w);
+            if ok {
+                hits += 1;
+            }
+            if n == 2 {
+                got_top = got.unwrap_or(0);
+            }
+            if n == 3 {
+                got_bot = got.unwrap_or(0);
+            }
+            serial_println!(
+                "[chrome-truth] win={} box=({},{},{}x{}) foc={} pt={} at=({},{}) want={:#08x} got={:#08x} -> {}",
+                r.id, bx, by, bw, bh,
+                if foc { "yes" } else { "no" },
+                name, x, y, w,
+                got.unwrap_or(0),
+                if ok { "HIT" } else { "MISS" }
+            );
+        }
+        // The content well: an EL0 surface, so no expectation is possible and none is invented.
+        let cpt = (bx + BORDER + 4, by + BORDER + TITLE_H + 4);
+        serial_println!(
+            "[chrome-truth] win={} pt=content at=({},{}) want=app got={:#08x} -> APP",
+            r.id,
+            cpt.0,
+            cpt.1,
+            fb.read_pixel(cpt.0, cpt.1).unwrap_or(0)
+        );
+        // The gradient the operator's eye is actually offered, measured off glass rather than
+        // derived from the constants: the widest per-channel difference between the strip's first
+        // and last row.
+        for shift in [16u32, 8, 0] {
+            grad_max = grad_max.max(((got_top >> shift) & 0xFF).abs_diff((got_bot >> shift) & 0xFF));
+        }
+    }
+
+    // Nothing chrome-bearing on the panel yet. DO NOT latch — see the header.
+    if wins == 0 {
+        return;
+    }
+
+    let mut desk: Option<(usize, usize)> = None;
+    if pw > 4 && ph > 4 {
+        for cand in [
+            (pw - 2, ph - 2),
+            (pw - 2, 2),
+            (2, ph - 2),
+            (pw / 2, ph - 2),
+            (pw - 2, ph / 2),
+        ] {
+            let covered = rows.iter().filter(|r| r.used).any(|r| {
+                let (bx, by, bw, bh) = outer_box(r);
+                cand.0 >= bx && cand.0 < bx + bw && cand.1 >= by && cand.1 < by + bh
+            });
+            if !covered {
+                desk = Some(cand);
+                break;
+            }
+        }
+    }
+    match desk {
+        Some((dx, dy)) => {
+            crate::arch::cache::invalidate_range(fb.base_addr() + dy * row_bytes, row_bytes);
+            let got = fb.read_pixel(dx, dy);
+            // NOT counted in `hits`/`probes`, and NOT a `FAIL` — see the header's DESKTOP note.
+            let ok = got == Some(DESKTOP_BG);
+            serial_println!(
+                "[chrome-truth] pt=desktop at=({},{}) want={:#08x} got={:#08x} -> {}",
+                dx, dy, DESKTOP_BG, got.unwrap_or(0),
+                if ok { "HIT" } else { "NOCLEAR (no aarch64 panel-wide DESKTOP_BG clear; wcx is x86+wc)" }
+            );
+        }
+        None => serial_println!(
+            "[chrome-truth] pt=desktop at=none want={:#08x} got=none -> SKIP (every candidate under a window box)",
+            DESKTOP_BG
+        ),
+    }
+
+    let face = super::theme::CHROME_FACE;
+    let ceramic_pp = pp(super::ceramic::TILE_H, |k| super::ceramic::shade(face, k));
+    let knurl_pp = pp(super::knurl::TILE_W * super::knurl::TILE_H, |k| {
+        super::knurl::shade(face, k % super::knurl::TILE_W, k / super::knurl::TILE_W)
+    });
+    let paper_tile = super::paper::tile();
+    let paper_pp = pp(paper_tile.len(), |k| paper_tile[k]);
+    // The ONLY consumer of `paper::fill_rect` is `video::instgui::repaint`, under exactly this gate.
+    let paper_on = cfg!(all(target_arch = "x86_64", feature = "wc", feature = "instgui"));
+    serial_println!(
+        "[chrome-truth] verdict wins={} hits={}/{} title_grad={} ceramic_pp={} knurl_pp={} paper_pp={} paper_on={} panel={}x{} -> {}",
+        wins, hits, probes, grad_max, ceramic_pp, knurl_pp, paper_pp,
+        if paper_on { "yes" } else { "no" },
+        pw, ph,
+        if hits == probes { "PASS" } else { "FAIL" }
+    );
+    // Latched only HERE — after a pass that found chrome to read and said what it read.
+    CHROME_TRUTH_DONE.store(true, Ordering::Relaxed);
+}
+
+/// CHROME-TRUTH — peak-to-peak of `f` over `n` samples, in 8-bit levels, widest channel.
+///
+/// One helper for all three materials so the number means the same thing in each column of the
+/// verdict: the largest difference the material can put between two of its own pixels. `ceramic` is
+/// indexed by row, `knurl` by a flattened tile coordinate, `paper` by tile pixel — the shapes differ,
+/// the question does not.
+fn pp(n: usize, f: impl Fn(usize) -> u32) -> u32 {
+    let mut best = 0u32;
+    for shift in [16u32, 8, 0] {
+        let (mut lo, mut hi) = (255u32, 0u32);
+        for k in 0..n {
+            let c = (f(k) >> shift) & 0xFF;
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
+        best = best.max(hi.saturating_sub(lo));
+    }
+    best
+}

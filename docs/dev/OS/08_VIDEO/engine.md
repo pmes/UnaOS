@@ -12053,6 +12053,138 @@ revision**, not a kernel edit. Recorded in the theme table's own header (`video/
 "Still UN-WIRED" block), where a future arc will actually look. The duplication between `cursor.rs`
 and `pal.rs` is noted there too — whenever a role does arrive, it has two consumers, not one.
 
+## CHROME-TRUTH — the glass-readback chrome witness, and what Peter was looking at (aarch64 `witness`, 2026-08-13)
+
+Peter, at the PA38 bench (Pi 4, `UNAOS_PIDESK=1`, 1920x1200 mailbox framebuffer): **no crispy
+anything** — no crispy chrome, no textures, nothing of the kit look he knows from the x86 bench —
+while the wire printed the full crispy theme census and `wm::draw_window` visibly consumed
+`theme::` / `ceramic::` / `knurl::`. This section convicts the gap between the census and the glass,
+and ships the instrument that keeps it convicted.
+
+### The three candidate mechanisms, and which one held
+
+**1. A legacy paint path — REFUTED.** The Pi's windows reach the themed chrome. `sys_win_create`
+(`arch/aarch64/syscall.rs:12391`, via `wc_shim::create`) is the only aarch64 window creator; the rows
+it mints are non-compat, and `wm::composite_once` → `composite_pass_half` → `composite_inner` →
+`draw_window` (`wm.rs:13288`) → `stage_window` → **`paint_window` (`wm.rs:13621`)** writes every
+border, title row, bevel, keyline, corner, control disc and caption glyph. None of `draw_window`,
+`stage_window` or `paint_window` carries a `cfg` attribute. There is no second window-chrome renderer
+anywhere in `crates/kernel/src` — `fbcon.rs`'s window path is `x86_64 + wc` and dead here, `screen.rs`
+has no chrome code, `pal.rs`'s `SPRITE_OWNS_PAINT` governs the cursor sprite and nothing else, and the
+vug/`SYS_FB_MAP` surfaces are *compat* rows, which correctly get content and no chrome at all.
+
+The geometry says the same thing from the capture alone: a 128x128 EL0 surface at 4x gives
+`box=522x556`, which is `128*4 + 2*FRAME` by `128*4 + TITLE_HEIGHT + 2*FRAME` at `FRAME = 5`,
+`TITLE_HEIGHT = 34`. Those are the kit's metrics, in the box the compositor actually erased.
+
+**2. Chrome compiled out on aarch64 — REFUTED for the chrome, HELD for the one textured surface.**
+Every `cfg` inside `draw_window`/`paint_window` is `witness` instrumentation; not one gates a themed
+branch. `theme`, `paper`, `ceramic` and `knurl` are declared unconditionally in `video/mod.rs`.
+
+But **`paper::fill_rect` has exactly ONE call site in the whole tree** — `video::instgui::repaint`,
+the installer's content well — and `instgui` is
+`#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]`. The kit's rule is that
+paper goes under CONTENT and never under the desktop (white board 2026-08-08), and that well is *the
+only kernel-drawn content surface in the tree*; every other window's pixels belong to a ring-3 app.
+So on the Pi, **not one paper pixel can exist, by construction** — while the `paper` module still
+compiles, its constants and selftest literals are still in the image, and the census still names it.
+That is precisely how the wire could say "paper" while the glass had never carried any.
+
+**3. Scale/format — REFUTED as a mechanism, but it is the amplifier.** The firmware reports `Bgr`, and
+`FrameBuffer`'s `Bgr` encode/decode is the identity on the `0x00RRGGBB` word, so no channel swap is
+possible. What is real is that the kit's own contrast is at or below the threshold of a 1920x1200
+panel at bench distance, and the Pi has no textured surface to break it up:
+
+| material | authored amplitude | measured peak-to-peak on `CHROME_FACE` |
+|---|---|---|
+| `ceramic` (frame + strip) | `GRAIN_AMP + CURVE_AMP` = 1310/65536 = **2.0 %** | **8 levels of 255** |
+| `knurl` (control discs) | `AMP_A + AMP_B` = 1311/65536 = **2.0 %** | **9 levels of 255** |
+| `paper` (content well) | a texture, not a modulation | **8 levels** — and `paper_on=no` on this arch |
+| title gradient | `0xEEEEF1`→`0xE3E3E8` focused, `0xF4F4F5`→`0xEFEFF1` not | **5 levels** unfocused, across the whole 34-row strip |
+
+**The conviction.** The Pi is painting the crispy theme correctly and completely. The theme, minus
+its one textured surface — which is x86-only — is a near-flat off-white whose entire visible signal
+is five to nine 8-bit levels. Peter was looking at the crispy theme; the crispy theme has almost
+nothing for an eye to find on a 1920x1200 panel. This is a TASTE question for the kit, not a defect
+in the compositor, and the numbers above are the terms it should be argued in.
+
+### The instrument — `wcf::chrome_truth`
+
+`[crispy]` reports the constants the painter was COMPILED with: it fires from `paint_window` before
+a single chrome pixel is stored, and would print the identical line if every chrome write below it
+were deleted. WC-D verifies each window's CONTENT rectangle against its source surface, which by
+construction excludes the frame, the strip and the discs — chrome has no source surface to compare
+against. So "the wire says crispy" and "the glass shows crispy" were two claims with no wire between
+them. `chrome_truth` is that wire.
+
+After the first composite that drew a chrome-bearing window, it reads the framebuffer back at
+coordinates derived from the same geometry `paint_window` used, and compares each against a colour
+recomputed by calling the same `theme::` / `ceramic::` / `wm::title_row_color` the painter called —
+no second copy of the kit's numbers, so it cannot drift from the theme and cannot pass by agreeing
+with itself. Reads go through `FrameBuffer::read_pixel` (volatile), over scanlines invalidated first
+on `verify_window`'s pattern, so a read cannot be answered from a line the blit left dirty. It writes
+nothing, so unlike WC-F it cannot disturb a photograph or a later WC-D reference.
+
+```
+[chrome-truth] win=1 box=(12,12,266x300) foc=no pt=keyline_top at=(145,12) want=0xb4b4b9 got=0xb4b4b9 -> HIT
+[chrome-truth] win=1 box=(12,12,266x300) foc=no pt=bevel_light at=(145,13) want=0xffffff got=0xffffff -> HIT
+[chrome-truth] win=1 box=(12,12,266x300) foc=no pt=title_top   at=(271,17) want=0xf4f4f4 got=0xf4f4f4 -> HIT
+[chrome-truth] win=1 box=(12,12,266x300) foc=no pt=title_bot   at=(271,50) want=0xefeff1 got=0xefeff1 -> HIT
+[chrome-truth] win=1 box=(12,12,266x300) foc=no pt=face_left   at=(15,59)  want=0xededef got=0xededef -> HIT
+[chrome-truth] win=1 pt=content at=(21,55) want=app got=0x000000 -> APP
+[chrome-truth] pt=desktop at=(638,478) want=0x2d2b55 got=0x1b1a3a -> NOCLEAR (no aarch64 panel-wide DESKTOP_BG clear; wcx is x86+wc)
+[chrome-truth] verdict wins=1 hits=5/5 title_grad=5 ceramic_pp=8 knurl_pp=9 paper_pp=8 paper_on=no panel=640x480 -> PASS
+```
+
+Five probes per window, chosen so that each one can only be a `HIT` if a specific piece of the kit
+landed: `keyline_top` (the unmachined `FRAME_LINE` — an exact constant), `bevel_light` (the frame's
+hairline structure), `title_top`/`title_bot` (the two ends of the gradient, which together pin the
+whole ramp under `ceramic::shade`), and `face_left` (the machined `CHROME_FACE` surface itself). The
+title probes take the strip's RIGHT end because the control cluster is left-aligned and the caption
+follows it — mid-strip is where a glyph lives. `content` carries no expectation and is labelled
+`APP`: those pixels belong to a ring-3 surface and the kernel has no business predicting them.
+
+It is one-shot for the boot, and it **does not latch on a pass that found no chrome-bearing row** —
+the desktop takes seconds to reach its steady population, and a witness that spent its shot on the
+first pass to draw anything would report on a panel nobody is looking at. The first cut did exactly
+that (`wins=0`) and the fix is the reason the latch sits at the end of the function rather than the
+top.
+
+### The gap the instrument found on its first run: `NOCLEAR`
+
+The desktop probe is **reported but not judged**, and the asymmetry is deliberate. On x86 the
+panel-wide `DESKTOP_BG` clear is `wcx`'s DESKTOP-CLEAR; `video::wcx` is `x86_64 + wc` and **the Pi has
+no twin**. `wm::erase` paints `DESKTOP_BG` into window BOXES and `Screen` holds it in the desktop
+LAYER, but nothing on this arch ever promises it to a panel pixel outside every box. The very first
+run read `0x1b1a3a` where the theme says `0x2d2b55`, at a corner the probe had proven no row covers.
+
+A witness that called that a `MISS` would be convicting the chrome for a contract the arch never
+made, so it prints `NOCLEAR` — outside the verdict's arithmetic, and a distinct token a spec rule can
+be written against **once the aarch64 desktop-clear exists to be required**. That clear is NAMED
+here, not written: it is an aarch64 twin of `wcx::DESKTOP-CLEAR` plus its `screen::adopt_desktop_bg`
+seam, which is a new panel-wide writer on the Pi's compose path and belongs to its own arc with its
+own WC-BBSYNC argument — not to a witness arc.
+
+### Byte-identity, and where the code had to live
+
+The witness lives in **`video/wcf.rs`**, which is
+`#[cfg(all(target_arch = "aarch64", feature = "witness", feature = "baremetal"))]` and therefore is
+not compiled into the knob-off image at all. That was forced, not preferred: the first cut put
+`chrome_truth` in `wm.rs` and helper `amplitude_pp` functions in `ceramic.rs`/`knurl.rs`/`paper.rs`,
+all four of which ARE compiled knob-off — 307 added lines, and panic `Location` records embed file
+line numbers (see PI-DESK's note above). The three material helpers collapsed into one `pp()` in
+`wcf.rs`; the paper *counter* became `paper_on`, a `cfg!` of the consumer's own gate, which is the
+whole truth of the question and costs the knob-off path nothing.
+
+What remains in `wm.rs` is **13 added / 13 removed lines, all in-place**: nine field visibilities and
+the `Window` struct raised to `pub(super)`, `outer_box` and `title_row_color` raised to `pub(super)`,
+and the call appended to the existing `super::wcf::run(&fb, clear);` line inside the block that was
+already `aarch64 + witness + baremetal`. `paper.rs`, `ceramic.rs` and `knurl.rs` are untouched.
+
+Measured, not reasoned: knob-off `kernel8.img` is
+`34a9c533bc437f02bbe73a0de9854164e95ab6becb8e7c64b9f8fd6976f4a222`, **identical** to a build of
+`c28ef0d2` taken from a clean `git archive` extraction.
+
 ### Gates
 
 | leg | result |
@@ -12072,3 +12204,10 @@ cross-worktree comparison is a valid identity test. The `c28ef0d2` worktree then
 hash again. `theme.rs` grew five doc lines and did not move the image, which is what its shape
 predicts — it holds `const` items and `const _: ()` assertions only, so no panic `Location` record
 originates there. `wm.rs` was held line-neutral regardless, because that file is full of them.
+
+| `./arroyo check` | green (both arches) |
+| `UNAOS_WC=1 ./arroyo check` | green (`wm.rs` was touched — video law) |
+| PIDESK-armed `./arroyo kernel8-test 300` | MBENCH **PASS 108/108**, 0 forbidden, 17381 lines |
+| knob-off `./arroyo kernel8-test 210` | MBENCH **PASS 108/108**, 0 forbidden, 15413 lines |
+| knob-off `./arroyo kernel8` | sha256 `34a9c533…` — byte-identical to the `c28ef0d2` baseline |
+| armed `./arroyo kernel8` | sha256 `5c858c93…`; `chrome-truth` x5, `keyline_top`, `bevel_light`, `title_top`, `title_bot`, `face_left`, `title_grad`, `ceramic_pp`, `knurl_pp`, `paper_pp`, `paper_on`, `NOCLEAR` all present; **zero** `chrome-truth` strings in the knob-off image |
