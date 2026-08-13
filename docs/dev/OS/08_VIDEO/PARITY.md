@@ -208,6 +208,17 @@ stranded-focus bug is live there and a `pidesk`-gated fix would leave it unfixed
 users flash. The consequence is stated plainly in §5.3: this arc **does** move the knob-off hash, on
 purpose.
 
+**Honest limit on the evidence: the regression suite does not exercise this fix.** Both gate captures
+(`UNAOS_PIDESK=1 … 300` and knob-off `… 210`, each MBENCH PASS 108/108) contain plenty of `[wm-act]`
+traffic — `park … cause=shell-raise`, `cause=minimise` — and `[wc-fv] focus raise` / `[vugmin] focus`
+lines, but **no `route=self-exit` line**, because `focus_release` prints only when its CAS succeeds,
+i.e. only when a dying ASID actually held focus. Nothing in the current cascade self-exits a *focused*
+vug: the wm fixtures drive synthetic ASIDs (`0xf0a`/`0xf0b`) through explicit close paths, and the
+teardown-heavy fixtures never take focus first. So the 108/108 proves this change **breaks nothing**;
+it does not prove the bug is fixed. **A follow-up should add the missing fixture** — focus a real
+ring-3 vug, let it return from `main`, then assert `[wm-act] … route=self-exit` and that the next
+tenant of the slot comes up unfocused. That is the witness this row deserves and does not yet have.
+
 ### 5.3 Byte-identity, and the line-neutral rule every parity port will hit
 
 The `pidesk` feature's standing promise is that with the knob OFF, none of the desktop-furniture code
