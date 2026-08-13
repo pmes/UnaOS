@@ -3466,6 +3466,18 @@ static PAYGO_SVC_BUSY: core::sync::atomic::AtomicBool =
 static PAYGO_SVC_TRIES: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 
+/// WCG-CHUNK — chunk PROGRESS re-arms the taker's liveness bound, the same rule the wc-d chunking
+/// applies at its own banking site: [`PAYGO_SVC_TRIES`] caps marks WITHOUT progress (its anti-wedge
+/// purpose), and a wc-g sample that now takes the console box in hundreds of chunks would exhaust a
+/// fixed cap of 16 while doing exactly what it was asked to. Called by `wcg::end` when a clean
+/// chunk banks and advances its cursor; the counter lives here beside the taker that reads it.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+pub(super) fn paygo_svc_progress(i: usize) {
+    if i < WCD_IDS {
+        PAYGO_SVC_TRIES[i].store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// PAYGO-TERM — per-id: this tenant's taker has already said it gave up.
 ///
 /// The STOP-NOTE's one-shot, and it is a latch rather than the equality `tries == PAYGO_SVC_MAX + 1`
