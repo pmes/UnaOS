@@ -1530,17 +1530,17 @@ impl Screen {
         }
         spread2_note(self_cpu, &helpers[..nh], &jobs[..nbands]);
 
-        // Dispatch bands 1..nbands to helper APs; run band 0 on this core while they work; then join.
-        // `jobs`/`common` stay on this frame — the joins below keep it alive until every band returns.
+        // VUGJOIN — dispatch bands 1..nbands to helper APs, run band 0 here, then join; `jobs`/`common`
+        // stay on this frame until every band returns. But `JoinHandle::join` BLOCKS, and only a SCHEDULED
+        // task can block — sched.rs's assert is correct and stays, for every caller. So a present issued
+        // OFF-TASK (pi_rast, on the unscheduled boot core) runs every band INLINE: no spawn, no join.
         let mut handles: alloc::vec::Vec<sched::JoinHandle> = alloc::vec::Vec::with_capacity(nh);
         for b in 1..nbands {
             let arg = &jobs[b] as *const BandJob as usize;
-            handles.push(sched::spawn_joinable("vugband", band_worker, arg, helpers[b - 1]));
+            if sched::current_id().is_some() { handles.push(sched::spawn_joinable("vugband", band_worker, arg, helpers[b - 1])) } else { band_run(&jobs[b]) }
         }
         band_run(&jobs[0]);
-        for h in handles {
-            h.join();
-        }
+        for h in handles { h.join(); }
 
         self.last_flush_bytes = flushed;
         self.last_flush_bands = nbands;
