@@ -11213,12 +11213,18 @@ fn v3d94_cm_station(minimal: bool) {
             "the CM enable bit AGREES with the firmware's active bit. Not a null result: it is the first time that report has been audited against the hardware it describes, and the DIVI/DIVF pair is the first direct frequency evidence this driver has ever carried"
         }
     );
-    // The checkable window: every nonzero word in CM[0x0,0x100), in the `[v3d76]` SWEEP line format
+    // The checkable window: every nonzero word in CM[0x0,0x200), in the `[v3d76]` SWEEP line format
     // so it diffs against a piOS capture with no re-formatting. The neighbourhood is what makes the
     // INFERRED offsets falsifiable from the wire.
+    //
+    // WIDENED 0x100 -> 0x200 (§49.18, the piOS settled-sweep diff): the piOS capture covers
+    // CM[0x100,0x200) and found real content there (incl. the 0x0c0/0x0c4 asymmetric pair and the
+    // +0x028 slot we run ENAB=1 BUSY=1 where piOS leaves ENAB=0 — undecoded, direction "we enable
+    // more"). Reading the same window our comparison capture covers is what keeps the diff total.
+    // Still READ-ONLY, one constant changed.
     let mut off = 0usize;
     let mut nonzero = 0u32;
-    while off < 0x100 {
+    while off < 0x200 {
         let v = mmio_read(CM_BASE, off);
         if v != 0 {
             nonzero += 1;
@@ -11230,7 +11236,7 @@ fn v3d94_cm_station(minimal: bool) {
         ":: V3D: [v3d94] cm-window end — {} nonzero words in CM[{:#x},{:#x}); READ-ONLY (no CM write, and no CM password constant exists in this file) ::",
         nonzero,
         CM_BASE,
-        CM_BASE + 0x100
+        CM_BASE + 0x200
     );
 }
 
