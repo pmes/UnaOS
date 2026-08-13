@@ -3658,25 +3658,25 @@ fn composite_pass_half() -> Owed {
     // call is one bounded table scan and an integer compare — charged to `pass_us` below, which is
     // where a cost the composite pays belongs.
     //
-    // A repaint takes the sprite down itself and answers `true`; upgrading the tail to `Repaint` is
-    // what puts it back, and is the same upgrade `take_present_dirty` performs immediately below.
-    // `Adopt` and `Settle` are NOT downgraded — each is the sole closer of a session state whose loss
-    // would strand the overlay mechanism, and each already repaints the sprite from the finished
-    // front, which is over the strip this call just painted.
+    // A repaint takes the sprite DOWN itself (`strip::paint`/`strip::erase_rect` bracket with `cursor::undraw`) and answers `true` — this
+    // pass's obligation to put it back. CURSOR-VANISH (PA38): that obligation now rides CURSOR-7's `dirty`, not a tail upgrade — see there.
     //
     // STRIPFACTOR — one call for EVERY furniture strip, not one per tenant; `strip::compose_all` runs each registered
     // tenant in registry order and ORs the results, so a second strip is a registry entry rather than a second line here
     // and neither can short-circuit the other's damage test (a disabled tenant returns on one relaxed load). PI-DESK — the
-    // aarch64 half of the gate below is the WHOLE of M2: same seam, same position, same `Repaint` upgrade, same layering.
+    // aarch64 half of the gate below is the WHOLE of M2: same seam, same position, same duty, same layering.
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
-    if super::strip::compose_all() && tail == CursorTail::Untouched {
-        tail = CursorTail::Repaint;
-    }
+    let strip_painted = super::strip::compose_all();
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
+    let strip_painted = false;
     #[cfg(feature = "witness")]
     let c2_t1 = crate::arch::now_cycles();
     // CURSOR-7 — read BEFORE the tail runs, so a repaint the tail is already going to do is not
     // duplicated, and a pass that would otherwise have done nothing at all is upgraded.
-    let dirty = super::cursor::take_present_dirty();
+    // CURSOR-VANISH (PA38) — `| strip_painted` is a FIX. `dirty` is the ONE duty ALL FOUR arms honour (`Untouched` upgraded below; `Repaint`
+    // already repaints; `Adopt`/`Settle` APPEND one) and it rides the owed-tail stash's bit 8 free. The old `&& tail == Untouched` upgrade
+    // DROPPED the strip's `true` on the other two arms, and neither redraws an UNDRAWN sprite. See engine.md §CURSOR-VANISH for the proof.
+    let dirty = super::cursor::take_present_dirty() | strip_painted;
     if dirty && tail == CursorTail::Untouched {
         tail = CursorTail::Repaint;
     }

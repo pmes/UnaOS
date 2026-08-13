@@ -11953,3 +11953,112 @@ And the strip paints on the Pi panel path, at QEMU raspi4b's 640x480:
 `paint=27552cyc` over a 62.5 MHz CNTVCT reads as 440 µs, which is the CNTFRQ seam above being right
 — on the old TSC guess the same paint would have been reported as ~22 µs. `presses=0` is QEMU
 having no pointer to drive; the press path's live proof is the bench Pi's mouse.
+
+---
+
+## CURSOR-VANISH — the dock ate the arrow, and no witness owed a thing (aarch64 `pidesk`, 2026-08-12)
+
+PA38, the first metal desktop boot with PI-DESK armed. Peter: *"mouse cursor got lost, tabbing brought
+it back."* Capture: `~/unaos-bench/scratch/pa38-freeze.log`.
+
+### The conviction
+
+**`composite_pass_half` discharged the strip's repaint duty on ONE of the four cursor-tail arms.**
+
+`strip::paint` and `strip::erase_rect` both open a sprite bracket — `cursor::undraw()` before the
+first byte lands — and answer `true`. That `true` is documented in `strip.rs` as *"the caller's
+obligation to upgrade the pass's cursor tail to `Repaint`"*. The caller honoured it like this:
+
+```rust
+if super::strip::compose_all() && tail == CursorTail::Untouched {
+    tail = CursorTail::Repaint;
+}
+```
+
+On an `Adopt` or `Settle` verdict the `true` was simply **dropped**. The comment above it asserted
+that was safe — that those two arms "already repaint the sprite from the finished front" — and that
+assertion is false in both directions:
+
+* `cursor::settle_nosession` opens with `if sp.drawn`. `strip::paint`'s `undraw` → `undraw_locked`
+  sets `sp.drawn = false` (`cursor.rs:1912`). **The entire body is skipped.**
+* `adopt_overlay`'s settle is `pend`-scoped, and `settle_pending_locked` returns immediately on an
+  empty `pend`. The strip sets no `pend` bit: it paints at the pass TAIL, *outside* the window loop's
+  compose-through bracket, so nothing ever deferred one of its pixels.
+
+So a dock repaint landing in a pass whose verdict was compose-through left the arrow off the glass
+with **no duty registered anywhere** — which is exactly what the capture shows, and why it took so
+long to see. Every witness was honestly reporting nothing owed:
+
+```
+[wedge9] sprite-claim scope=live refused=0 masked=0 retried=0 owed=0 serviced=0 -> QUIET
+[cursor8] repair rate scope=live requests=0 repairs=0 suppressed_stale=0 suppressed_rate=0 -> UNWITNESSED
+[cursor6] rollup scope=live present_over=0 masked=13 repaired=0 desktop_over=0 mismatch=0 uncover_lost=0/11 -> INTACT
+[cursor11] compose-through scope=live passes=4 bracketed=2 px_deferred=64 px_installed=32 px_redrawn=0 -> THROUGH
+```
+
+`-> THROUGH` with live passes is the `Settle` arm firing; `requests=0` is the duty that was never
+raised. The arrow stayed down until the next composite that happened to take an `Untouched` tail —
+on an idle desktop, the next focus change. **Tab is a focus change.** That is the whole symptom.
+
+### The fix
+
+Route the strip's `true` through CURSOR-7's `dirty` instead of through a tail upgrade:
+
+```rust
+let strip_painted = super::strip::compose_all();
+...
+let dirty = super::cursor::take_present_dirty() | strip_painted;
+if dirty && tail == CursorTail::Untouched { tail = CursorTail::Repaint; }
+```
+
+`dirty` is the one duty **all four** arms honour: `Untouched` is upgraded, `Repaint` already
+repaints, and `Adopt`/`Settle` each *append* a `repaint()` after their session close — which is what
+those two arms were built to do, and why neither may be downgraded. No arm's session semantics
+change. The duty also rides the aarch64 owed-tail stash in bit 8 for free, so it survives a deferred
+tail without a second encoding. `wm.rs` diff: 10 added / 10 removed, 17751 lines in and out.
+
+### The acquitted candidate — and a live finding it exposed
+
+The other suspect was the aarch64 owed-tail split (`912de713`): a `LOST` epilogue stranding
+`OWED_TAIL` forever, cursor restored only by the next composite. It fits the symptom, and it is
+**not** what happened, for a reason that is itself worth recording:
+
+> **The owed-tail split is currently INERT.** `composite_once` opens with `composite_tail_owed()` (the
+> stale cash), and that function's *first* statement is `OWED_ARM.store(false)`. So every present
+> disarms itself before reaching its own stash test, `OWED_ARM` always reads false at the test, and
+> `cash_tail` always runs inline, masked. `OWED_TAIL` is never non-zero. Nothing can be stranded
+> because nothing is ever stashed.
+
+That means the masked-latency win the split was landed for is not being taken, and the `[comp2]
+max_us=9255978` regression that motivated `composite_arm_owed` was "fixed" by accidentally disabling
+the mechanism rather than by scoping it. **Not touched here** — this arc's conviction licenses the
+cursor fix and nothing else, and re-enabling a deferral is a latency change that wants its own arc
+and its own gate. Flagged for the brief.
+
+### CRISPY CURSOR — the verdict is NO KIT ROLE, so nothing was authored
+
+PA38 also asked for the crispy pointer. There is nothing to lift, and this is a verdict rather than a
+deferral:
+
+* `kits/crispy/theme.json` and `kit.json` (reachable only on `origin/us-crispy`) define **no** cursor,
+  pointer or arrow role — zero hits across the palette and metrics.
+* `libs/quartzite`'s `Palette` (21 colour fields) and `Metrics` (11) carry none either. Its `caret` is
+  an `ab_glyph` pen advance in text layout, not a mouse pointer.
+* The kit's own clean-room line disclaims *"imported bitmaps, icons, cursors"* of any provenance.
+
+So the 8×8 `ARROW` mask and its `FILL`/`SHADOW` — duplicated verbatim in `video/cursor.rs` (98-112)
+and `pal.rs`'s `cursor` module (166-177) — remain **invented**, and no arc may quietly author a shape
+in their place: the pointer is a taste question that belongs to Peter and closes with a **kit
+revision**, not a kernel edit. Recorded in the theme table's own header (`video/theme.rs`, the
+"Still UN-WIRED" block), where a future arc will actually look. The duplication between `cursor.rs`
+and `pal.rs` is noted there too — whenever a role does arrive, it has two consumers, not one.
+
+### Gates
+
+| leg | result |
+|---|---|
+| `./arroyo check` | see landing report |
+| `UNAOS_WC=1 ./arroyo check` | `wm.rs` was touched — video law |
+| knob-off `./arroyo kernel8` | sha256 vs `42355ca2…` baseline |
+| knob-off `./arroyo kernel8-test 210` | MBENCH |
+| `UNAOS_PIDESK=1 ./arroyo kernel8-test 300` | MBENCH |
