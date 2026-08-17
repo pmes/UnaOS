@@ -394,6 +394,36 @@ static H_TORN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// same reason as [`H_TORN`]: a maximum over four startup presents is not a maximum over the boot,
 /// and it was being printed as one.
 static H_MAXPRES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+/// WCH-SPREAD — per-id: the SMALLEST present-phase duration seen, in microseconds. The floor that
+/// makes [`H_MAXPRES`] readable: a maximum with no minimum beside it cannot say whether the window's
+/// presents are uniformly expensive or wildly uneven, and those are different faults. `u64::MAX` until
+/// the window's first present, which [`stage_rollup`] prints as `0`.
+static H_MINPRES: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
+/// WCH-SPREAD — per-id: the extremes of the present phase's INVERSE THROUGHPUT, in nanoseconds per
+/// 4 KiB copied. Their ratio is the rollup's `presspread=`.
+///
+/// **Why a rate and not the raw duration.** A present's honest cost is proportional to the bytes it
+/// copies, and `bytes` is not constant for a window id: a banded present copies a fraction of the box
+/// (x86 only today, but the counter is arch-neutral), and the per-id censuses are never reset, so a
+/// recycled id can mix two different geometries into one window's history. Dividing by the bytes makes
+/// a banded present and a whole-box present of the same window directly comparable, which a ratio of
+/// raw microseconds is not. `4 KiB` is a scale chosen so the integer division keeps three or four
+/// significant figures at every geometry this compositor presents — nothing depends on the unit, only
+/// on the RATIO being taken between two numbers in the same one.
+///
+/// **What the ratio is FOR.** A present that is slow because the copy is slow is slow EVERY time — the
+/// same rows, the same bytes, the same core — so its fastest and slowest presents differ by little and
+/// `presspread` sits near 1. A present that is slow because the machine underneath it stopped running
+/// is slow ONCE, at random, while the window's other presents stay fast, and `presspread` blows out.
+/// That is the shape of a QEMU vCPU losing its host timeslice, and it is the only wire-visible way this
+/// witness can tell "the copy lost the race with the beam" from "the clock ran while nobody did".
+///
+/// **This is a CENSUS, not a verdict.** `torn=`, `-> AT-RISK` and their precedence are untouched by
+/// WCH-SPREAD: the counter is published beside them and the reading is left to whoever consumes the
+/// line. The x86 seat holds the open item of teaching the tear TEST itself a stall guard; when that
+/// lands, this pair is the measurement it can be built on rather than a second, competing opinion.
+static H_MINRATE: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
+static H_MAXRATE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// Per-id: composites that did NOT reach the back layer and ran on the direct (pre-WC-H) path — the
 /// tearing regime. Excludes the deliberate fixture decline, which is counted separately.
 static H_DECLINE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
@@ -704,6 +734,17 @@ pub fn stage_note(
         H_TORN[i].fetch_add(1, Ordering::Relaxed);
     }
     H_MAXPRES[i].fetch_max(present_us, Ordering::Relaxed);
+    // WCH-SPREAD — the floor and the two rate extremes, taken here for exactly the reasons the tear
+    // test and `maxpresent_us` are taken here: they are censuses over EVERY present, and a spread
+    // measured over a window's first four is a spread over its startup burst. The cost is one more
+    // `fetch_min`, one multiply and one divide on values already in registers — the same price the
+    // paragraph above accounts for, and it touches no memory outside three atomics. See [`H_MINRATE`].
+    H_MINPRES[i].fetch_min(present_us, Ordering::Relaxed);
+    if bytes != 0 {
+        let rate_ns_4k = present_us.saturating_mul(4_096_000) / bytes as u64;
+        H_MINRATE[i].fetch_min(rate_ns_4k, Ordering::Relaxed);
+        H_MAXRATE[i].fetch_max(rate_ns_4k, Ordering::Relaxed);
+    }
     // Two budgets, one per class. See [`H_BTAKEN`] for why a shared one made the feature invisible.
     let n = if banded {
         let n = H_BTAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
@@ -996,7 +1037,7 @@ fn emit_sample(id: u32, i: usize) {
 /// | marker | covers | means |
 /// |--------|--------|-------|
 /// | `pop=budgeted` | `samples` `budget` | THIS SCOPE's budget only — at most [`SAMPLES`] events |
-/// | `pop=all-presents` | `torn` … `maxpresent_us` | every present/decline this WINDOW has had |
+/// | `pop=all-presents` | `torn` … `presspread` | every present/decline this WINDOW has had |
 /// | `pop=constant` | `frame_us` | a compile-time constant, not a measurement |
 ///
 /// `pop=` repeats rather than each field carrying its own suffix because the alternative was to
@@ -1025,7 +1066,15 @@ fn emit_sample(id: u32, i: usize) {
 /// four presents:
 ///
 /// - `-> AT-RISK` — `torn > 0`. Now countable past the budget and now printed after the console has
-///   run, so a window that tears only under load says so. The pi4 spec FORBIDs it.
+///   run, so a window that tears only under load says so. The pi4 spec FORBIDs it — but reads
+///   `presspread=` alongside, because `-> AT-RISK` on its own cannot say WHY the present was slow.
+/// - `presspread=` near 1 beside `-> AT-RISK` — the presents are UNIFORMLY expensive, which is what a
+///   copy that genuinely cannot keep up with the beam looks like. This is the reading the tear FORBID
+///   was written for.
+/// - `presspread=` in the tens or hundreds beside `-> AT-RISK` — the window has both very fast and
+///   very slow presents of the same bytes. A copy does not vary by that factor; a machine that stops
+///   running underneath it does. On QEMU without `-icount` that is a host desched being charged to the
+///   present phase, and the `torn` count it produced is a measurement of the host, not of the panel.
 /// - `-> UNSTAGED` — `declines > 0`; a composite reached the panel through the pre-WC-H direct path.
 ///   Also FORBIDden.
 /// - `banded=0` on the latest line of a window the console is known to be routing damage into —
@@ -1065,14 +1114,34 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     let t0 = H_T0[i].load(Ordering::Relaxed);
     let age_ms = if t0 == 0 { 0 } else { cycles_to_us(now_cycles().saturating_sub(t0)) / 1000 };
     let emit = H_EMIT[i].fetch_add(1, Ordering::Relaxed) + 1;
+    // WCH-SPREAD — the present phase's floor and its evenness. `minpresent_us=0` and `presspread=0`
+    // both mean the same thing and only that: this window has recorded no present the counter could
+    // measure, so neither number exists yet. `H_TORN` is incremented three lines above the rate
+    // recorder, so a window that reaches `-> AT-RISK` has recorded a present — the one residual is a
+    // present of ZERO BYTES, which the rate recorder skips and which `stage_window`'s degenerate-
+    // geometry decline is there to make unreachable. Should one ever arrive, `presspread=0` is in the
+    // single-digit class the pi4 spec's FORBID convicts, so the unmeasured case fails SAFE.
+    //
+    // `lo.max(1)` rather than a branch: a present fast enough to round to a rate of zero is a present
+    // faster than one nanosecond per 4 KiB, i.e. below the timer's resolution, and a window holding one
+    // of those alongside a torn present is as uneven as this counter can report. Saturating it to the
+    // largest ratio the numbers allow is the honest reading of that pair, not a special case.
+    let minp = H_MINPRES[i].load(Ordering::Relaxed);
+    let minpresent = if minp == u64::MAX { 0 } else { minp };
+    let lo = H_MINRATE[i].load(Ordering::Relaxed);
+    let presspread =
+        if lo == u64::MAX { 0 } else { H_MAXRATE[i].load(Ordering::Relaxed) / lo.max(1) };
     // KEY ORDER IS LOAD-BEARING ACROSS SEATS. `win=`, `scope=`, `declines=` and the terminal
     // `-> {verdict}` are matched in this order by the pi4 track's regression spec, which also relies
     // on `scope=window ` carrying a TRAILING SPACE so its pattern cannot match `scope=window-band`.
-    // Everything WC-H2 added — `emit=`, `age_ms=`, the `pop=` markers, `budget=`, `lines=` — is an
-    // INSERTION between existing keys. Nothing is renamed, nothing is reordered, and the terminal
-    // stays terminal.
+    // Everything WC-H2 added — `emit=`, `age_ms=`, the `pop=` markers, `budget=`, `lines=` — and
+    // everything WCH-SPREAD added — `minpresent_us=`, `presspread=` — is an INSERTION between existing
+    // keys. Nothing is renamed, nothing is reordered, and the terminal stays terminal. The two new
+    // keys go INSIDE the `pop=all-presents` run, beside `maxpresent_us=` whose population they share;
+    // putting them after `pop=constant` would have filed two measurements under the marker that means
+    // "compile-time constant".
     serial_println!(
-        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} declines={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} pop=constant frame_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} declines={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} pop=constant frame_us={} -> {}",
         id,
         scope,
         emit,
@@ -1088,6 +1157,8 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         minspan,
         minbytes,
         H_MAXPRES[i].load(Ordering::Relaxed),
+        minpresent,
+        presspread,
         FRAME_US,
         verdict
     );
