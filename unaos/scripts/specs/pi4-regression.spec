@@ -188,6 +188,19 @@ REQUIRE U10-create: file create.*-> PASS
 REQUIRE U10-delete: file delete.*-> PASS
 REQUIRE U11: open-file lifecycle.*-> PASS
 REQUIRE U11-defer: cross-process unlink-defers-free.*-> PASS
+# U11FIX (PA41) — the SAME iteration-vs-wall-clock park defect P63 caught in U7, in the three fixture blobs that
+# were copied from the PRE-U7FIX U7 blob (u11defer, u11reap, u6owner). PA41's metal FAIL read
+# `a_w=0x1 b_w=0x0 opened=true unlinked=false read=false done=2 killed=0 cleared=true`: B's unlink-GO park
+# expired while the launcher was still MEASURING the chain head — a first-fit FAT scan out to cluster 28468,
+# hundreds of SD-card sector reads on metal and free under QEMU — so B exited having done nothing at all, and
+# A's read park then expired across the launcher's 5 s wait for a cue that was never coming. Same caveat as
+# u7fix above: SYS_SLEEP_MS degrades to a cooperative yield under QEMU, so QEMU cannot gate the park primitive
+# itself; the bench does. What QEMU DOES gate is the launcher's parked-out assertion — neither fixture may have
+# exited before its GO was released — plus the margins, which shrink before they cliff.
+REQUIRE \[u11fix\] park margin — B parked [0-9]+ms before unlink-GO \(parked_out=0\), A parked [0-9]+ms before read-GO \(parked_out=false\) and [0-9]+ms before close-GO \(parked_out=false\); park primitive=SYS_SLEEP_MS budget=0x8000
+FORBID \[u11fix\] .*B parked [0-9]+ms before unlink-GO \(parked_out=[1-9]
+FORBID \[u11fix\] .*before read-GO \(parked_out=true
+FORBID \[u11fix\] .*before close-GO \(parked_out=true
 REQUIRE U11-reuse: sys_unlink slot-recycle.*-> PASS
 REQUIRE U11-reap: teardown-last-close reaper.*-> PASS
 REQUIRE U6-grants: owner/grants on open.*-> PASS

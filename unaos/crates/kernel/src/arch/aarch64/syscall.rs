@@ -448,10 +448,18 @@ const U11DEFER_EXIT_STATUS: u64 = 0x7F;
 /// AFTER B unlinked returns A's ORIGINAL bytes (the chain is STILL alive — the unlink was deferred); bit2
 /// SYS_CLOSE OK (the LAST close, which runs the deferred free); bit3 double-close → -EBADF. Matches
 /// `add x23, x23, #{1,2,4,8}` in program A. `u11defer_run` PASSes iff A's witness == this.
+///
+/// U11FIX — bits 4/5/6 are DIAGNOSTIC and live ABOVE this mask, so setting one still FAILs the verdict; they
+/// exist only to name the step that died, which PA41's bare `a_w=0x1` could not. bit4 the read-GO park expired,
+/// bit5 the close-GO park expired, bit6 `SYS_OPEN(O_CREAT)` itself failed. A partial-then-parked-out A now
+/// reads `0x11`/`0x23` instead of a `0x1`/`0x3` that has to be traced back through the assembly.
 const U11DEFER_A_WITNESS_ALL: u64 = 0xF;
 /// U11-M2 (defer) demo: process B's witness bitmask — bit0 open DEFER.BIN (A created it) OK; bit1 SYS_UNLINK via
 /// B's handle → 0 (deferred: A still holds it open, so the chain is NOT freed); bit2 a re-open of the unlinked
 /// name → -ENOENT (the name is gone immediately). Matches `add x23, x23, #{1,2,4}` in program B.
+///
+/// U11FIX — bit4 (above the mask, so it still FAILs) says the unlink-GO park expired. PA41's `b_w=0x0` was
+/// indistinguishable from "B woke but its SYS_OPEN failed"; `0x10` vs `0x0` now separates the two on the wire.
 const U11DEFER_B_WITNESS_ALL: u64 = 0x7;
 /// U11-M2 (defer) demo: the launcher-CUE tokens the fixtures SYS_REPORT (all `> 0xF`, so `u11defer_report`
 /// distinguishes them from a final witness). A reports `A_OPENED` after create+write; B reports `B_UNLINKED`
@@ -2637,6 +2645,18 @@ unsafe extern "C" {
 //     0, deferred), and a re-open of the now-gone name → -ENOENT; reports B_UNLINKED.
 // Both build a witness in x23, SYS_REPORT it, and exit with the U11-defer sentinel. Register-only save the read
 // buffer at +0x2000 (the SYS_READ dest); GO words live in page 3 (+0x3000..). ABI: x8=nr, args x0-x2, ret x0.
+//
+// U11FIX — every park below steps on `SYS_SLEEP_MS(1)`, NOT a bare `SYS_YIELD`; see the U7FIX block above for
+// the full argument. This blob was written by copying the U7 two-fixture idiom BEFORE that fix landed, and it
+// inherited the bug: the budgets are HANG GUARDS whose only job is to outlast the LAUNCHER, whose deadlines are
+// all wall clock (`wait_while_secs(5/5/5/2)`), while a bare-yield budget is denominated in ITERATIONS. The two
+// do not convert at a fixed rate — ~1 ms per iteration under QEMU's emulation, a few hundred nanoseconds on a
+// Cortex-A72 — and this fixture is the worst case in the tree, because B's park must outlast A's create +
+// grow-write AND the launcher's U11-MEASURE mount, whose `first_free_cluster` first-fit scan is hundreds of SD
+// sector reads on metal and free under QEMU. That is the whole of the PA41 metal-only U11-defer failure:
+// `b_w=0x0` (B parked out before it ever opened) + `a_w=0x1` (A parked out across the launcher's 5 s wait for
+// a cue B was never going to send) + `done=2 killed=0 cleared=true` — two fixtures that shut down cleanly,
+// having simply given up. The deferred-free path itself was never reached.
 core::arch::global_asm!(
     r#"
     .globl __u11defer_blob_start
@@ -2657,7 +2677,7 @@ __u11defer_prog_a:
     mov  x2, #7                            // O_CREAT | RW | O_PUBLIC
     svc  #0
     mov  x19, x0                           // x19 = hA (>=0) or -errno
-    tbnz x19, #63, 2f                      // create/open failed -> report what we have
+    tbnz x19, #63, 10f                     // create/open failed -> mark bit6 + report what we have
     mov  x8, #1                            // SYS_WRITE 16 bytes (the pattern) -> grow
     mov  x0, x19
     mov  x1, x13
@@ -2678,10 +2698,12 @@ __u11defer_prog_a:
     movz x24, #0x8000                      // bounded poll budget
 3:  ldr  x10, [x9]
     cbnz x10, 4f
-    mov  x8, #4                            // SYS_YIELD — cooperative
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 3b
+    add  x23, x23, #16                     // bit4: the READ-GO park EXPIRED (a_w 0x11 names the park that died)
     b    2f                                // GO never released -> report the partial witness (verdict FAILs)
 
 4:  // (1) seek to 0, then READ 16 -> must STILL return A's original bytes (the chain is alive despite B's unlink)
@@ -2713,13 +2735,15 @@ __u11defer_prog_a:
 
     // park on the close GO word (base + 0x3018; released after the launcher's checkpoint-2)
     add  x9, x9, #0x8                      // x9 = base+0x3010 -> base+0x3018 = A close-GO
-    movz x24, #0x8000
+    movz x24, #0x8000                      // U7FIX budget (~131 s metal / ~32 s QEMU), not an iteration count
 5:  ldr  x10, [x9]
     cbnz x10, 6f
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 5b
+    add  x23, x23, #32                     // bit5: the CLOSE-GO park EXPIRED (a_w 0x23, not a silent 0x3)
     b    2f
 
 6:  // (2) SYS_CLOSE hA -> 0 (the LAST reference: the deferred free runs now, in syscall context)
@@ -2735,6 +2759,8 @@ __u11defer_prog_a:
     cmn  x0, #9                            // x0 == -9 (-EBADF)?
     b.ne 2f
     add  x23, x23, #8                      // bit3: double-close -> -EBADF
+    b    2f
+10: add  x23, x23, #64                     // bit6: SYS_OPEN(O_CREAT) itself failed (a_w 0x40, not a bare 0x0)
 2:
     mov  x0, x23                           // SYS_REPORT(final witness)
     mov  x8, #3
@@ -2757,10 +2783,12 @@ __u11defer_prog_b:
     movz x24, #0x8000
 13: ldr  x10, [x9]
     cbnz x10, 14f
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 13b
+    add  x23, x23, #16                     // bit4: the UNLINK-GO park EXPIRED (b_w 0x10 == B never woke)
     b    12f                               // GO never released -> report the partial witness
 
 14: // (0) open DEFER.BIN RW (no O_CREAT — A created it) -> hB
@@ -2865,7 +2893,8 @@ __u11reap_prog_a:
     movz x24, #0x8000                      // bounded poll budget
 3:  ldr  x10, [x9]
     cbnz x10, 4f
-    mov  x8, #4                            // SYS_YIELD — cooperative
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 3b
@@ -2905,7 +2934,8 @@ __u11reap_prog_a:
     movz x24, #0x8000
 5:  ldr  x10, [x9]
     cbnz x10, 2f                           // exit GO released -> report witness + EXIT (no close)
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 5b
@@ -2931,7 +2961,8 @@ __u11reap_prog_b:
     movz x24, #0x8000
 13: ldr  x10, [x9]
     cbnz x10, 14f
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 13b
@@ -3046,7 +3077,8 @@ __uowner_prog_a:
     movz x24, #0x8000                      // bounded poll budget
 3:  ldr  x10, [x9]
     cbnz x10, 4f
-    mov  x8, #4                            // SYS_YIELD — cooperative
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 3b
@@ -3140,7 +3172,8 @@ __uowner_prog_b:
     movz x24, #0x8000
 22: ldr  x10, [x9]
     cbnz x10, 23f
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 22b
@@ -3710,6 +3743,12 @@ static U11DEFER_A_READ_F: AtomicU32 = AtomicU32::new(0);
 static EL0_U11DEFER_DONE: AtomicU32 = AtomicU32::new(0);
 /// U11-M2 (defer): a killed defer fixture — a real bug (register-only, bar its +0x2000 read buffer).
 static EL0_U11DEFER_KILLED: AtomicU32 = AtomicU32::new(0);
+/// U11FIX: set once `el0-u11defer-a` has run its sentinel exit. The `[u11fix] park margin` assertions must tell
+/// A and B apart: B may LEGITIMATELY have exited by the time A's read/close GOs are released (it exits right
+/// after the B_UNLINKED cue), so the bare `EL0_U11DEFER_DONE` count cannot distinguish "B finished" from "A
+/// parked out". A must still be parked at ALL THREE releases — a set flag there is a parked-out A and nothing
+/// else.
+static EL0_U11DEFER_A_EXITED: AtomicU32 = AtomicU32::new(0);
 
 /// U11-M2b (reap): the two reap fixtures' final witness bitmasks (SYS_REPORT), keyed by name.
 static U11REAP_A_WITNESS: AtomicU64 = AtomicU64::new(0);
@@ -5910,8 +5949,10 @@ fn u11_report(value: u64) {
 }
 
 /// U11-M2 (defer): record the two cross-process fixtures' SYS_REPORTs, keyed by task name. Each fixture reports
-/// mid-run CUE tokens (all `> 0xF`, so they never collide with a witness value) that release the launcher's next
-/// choreography edge, then its final witness bitmask (`<= 0xF`).
+/// mid-run CUE tokens (the three EXACT values `0x60`/`0x61`/`0x62`, matched below, so they never collide with a
+/// witness value) that release the launcher's next choreography edge, then its final witness bitmask. U11FIX: the
+/// witness is no longer confined to `<= 0xF` — the diagnostic bits 4/5/6 (park expired, open failed) live above
+/// the PASS mask, which is why the routing is exact-match on the cue tokens and not a `> 0xF` range test.
 fn u11defer_report(value: u64) {
     match super::sched::current_name() {
         Some("el0-u11defer-a") => match value {
@@ -7081,6 +7122,10 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             } else if a0 == U11DEFER_EXIT_STATUS {
                 // Both defer fixtures (A + B) ride this one sentinel; neither has a planted Proc entry (they use
                 // no sys_xfer), so both fall through the Proc short-circuit to here. Want 2 (both exited).
+                // U11FIX: split A out by name — the park-margin assertions need "A has exited", not "someone has".
+                if super::sched::current_name() == Some("el0-u11defer-a") {
+                    EL0_U11DEFER_A_EXITED.store(1, Ordering::Release);
+                }
                 EL0_U11DEFER_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U11REAP_EXIT_STATUS {
                 // Both reap fixtures (A + B) ride this one sentinel; neither has a planted Proc entry. Want 2.
@@ -20512,8 +20557,15 @@ fn u11defer_build(entry_sym: *const u8) -> Option<U7Fix> {
 ///        or the cluster that was already lower than `f0` while the chain was live)
 ///
 /// PASS iff both witnesses full AND all three cues fired AND both exited AND no kill AND both rows torn down AND
-/// the three on-disk checkpoints hold. Runtime-created file (no arroyo plant); needs a fresh image (DEFER.BIN
-/// absent pre-demo). U11-defer is the last demo — releases no further gate.
+/// the three on-disk checkpoints hold. Runtime-created file (no arroyo plant); needs DEFER.BIN absent pre-demo —
+/// U11FIX: the pre-flight now DELETES a stale copy and runs rather than skipping (see there). U11-defer is the
+/// last demo — releases no further gate.
+///
+/// U11FIX also adds the `:: [u11fix] park margin — … ::` witness: at each of the three GO releases the launcher
+/// asserts the fixture it is about to release is STILL PARKED (it has not run its `SYS_EXIT`) and reports how
+/// long that park had to last. On PA41 both fixtures had parked out before their GOs, and the verdict line
+/// reported only the consequence — an empty `b_w` and a partial `a_w` — leaving the cause to be inferred from a
+/// bitmask. The launcher was holding the fact that names it; now it prints it, every boot, with the margins.
 fn u11defer_run(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -20529,11 +20581,27 @@ fn u11defer_run(demo_cpu: usize) {
     // from the on-disk name after A reports A_OPENED; see the capture below.
     match crate::fs::fat::mount() {
         Ok(fs) => {
-            if fs.find_in_root(U11DEFER_NAME).is_ok() {
-                serial_println!(
-                    ":: U11-defer: DEFER.BIN already present pre-demo (stale image) — defer demo skipped ::"
-                );
-                return;
+            // U11FIX (self-heal): DEFER.BIN is created by THIS demo and by nothing else, and a PASSing run
+            // leaves it unlinked — so a copy found here can only be the residue of a prior run that FAILED
+            // before B's unlink. On a fresh QEMU image that never happens; on the bench Pi the SD card is
+            // persistent, so PA41's leftover would have skipped this demo on every subsequent boot, retiring
+            // the check permanently the first time it failed. A failure must not disable its own detector.
+            // Delete the residue and run the demo from the documented precondition (an absent name); only an
+            // UNREMOVABLE copy still skips. This restores the precondition — it does not relax any check: all
+            // three on-disk checkpoints below run exactly as before, against a freshly created file.
+            if let Ok((de, lba, off)) = fs.find_located(U11DEFER_NAME) {
+                match fs.delete_located(lba, off, de.first_cluster()) {
+                    Ok(_) => serial_println!(
+                        ":: U11-defer: stale DEFER.BIN @cluster {} from a PRIOR FAILED run — deleted; demo runs ::",
+                        de.first_cluster()
+                    ),
+                    Err(_) => {
+                        serial_println!(
+                            ":: U11-defer: DEFER.BIN already present pre-demo and undeletable — defer demo skipped ::"
+                        );
+                        return;
+                    }
+                }
             }
             if fs.first_free_cluster().is_err() {
                 serial_println!(":: U11-defer: no free cluster pre-demo — defer demo skipped ::");
@@ -20556,6 +20624,11 @@ fn u11defer_run(demo_cpu: usize) {
     serial_println!(
         ":: U11-defer: cross-process unlink-defers-free — B unlinks A's open file; chain freed at A's last close ::"
     );
+    // U11FIX: both parks start at spawn. B's runs until the unlink GO below (it spans A's whole create+grow-write
+    // AND this launcher's measure mount, which first-fit-scans the FAT to the head — hundreds of SD sectors on
+    // metal); A's read park runs until CHECKPOINT-1. Both intervals are reported, so a shrinking margin is
+    // visible on the bench BEFORE it is a failure.
+    let t_spawn = super::timer::cntpct();
     super::sched::spawn_user_slot("el0-u11defer-a", a.entry, a.sp, a.ttbr0, demo_cpu);
     super::sched::spawn_user_slot("el0-u11defer-b", b.entry, b.sp, b.ttbr0, demo_cpu);
 
@@ -20609,6 +20682,13 @@ fn u11defer_run(demo_cpu: usize) {
         }
     };
 
+    // U11FIX ASSERTION (the check whose absence made PA41 a puzzle): B must STILL BE PARKED at the moment we
+    // release it. A fixture that gave up mid-park has already run its `SYS_EXIT`, so `EL0_U11DEFER_DONE` counts
+    // it — and NEITHER program can legitimately exit this early, so any non-zero reading here is a parked-out
+    // fixture and nothing else. PA41 reported the *consequence* (`b_w=0x0`, indistinguishable from a failed
+    // SYS_OPEN) and left the *cause* to be inferred; the launcher was holding the fact that names it.
+    let b_wait = super::timer::cntpct().wrapping_sub(t_spawn);
+    let b_parked_out = EL0_U11DEFER_DONE.load(Ordering::Acquire);
     u11defer_release_go(b.slot, 0x3000);
     // Edge 2: wait for B_UNLINKED; CHECKPOINT-1 — the NAME is gone on disk, but the chain is STILL allocated.
     let b_unlinked = wait_flag(&U11DEFER_B_UNLINKED_F, 5);
@@ -20617,11 +20697,31 @@ fn u11defer_run(demo_cpu: usize) {
         Err(_) => false,
     };
     let chain_alive_c1 = chain_allocated();
+    // U11FIX: A's read park spans everything above — B's whole open/unlink/re-open leg AND two fresh mounts.
+    // Same assertion, keyed on A ALONE: B has legitimately exited by now (it exits right after its cue), so the
+    // bare DONE count would false-positive here; `EL0_U11DEFER_A_EXITED` is exact.
+    let a_read_wait = super::timer::cntpct().wrapping_sub(t_spawn);
+    let a_parked_out_r = EL0_U11DEFER_A_EXITED.load(Ordering::Acquire) != 0;
     u11defer_release_go(a.slot, 0x3010);
     // Edge 3: wait for A_READ; CHECKPOINT-2 — the chain is STILL allocated (A read its bytes; nothing was freed).
     let a_read = wait_flag(&U11DEFER_A_READ_F, 5);
     let chain_alive_c2 = chain_allocated();
+    // U11FIX: A's close park — the last one it must survive, spanning CHECKPOINT-2's mount.
+    let a_close_wait = super::timer::cntpct().wrapping_sub(t_spawn);
+    let a_parked_out_c = EL0_U11DEFER_A_EXITED.load(Ordering::Acquire) != 0;
     u11defer_release_go(a.slot, 0x3018);
+    let frq = super::timer::cntfrq().max(1);
+    let ms = |t: u64| t / (frq / 1000).max(1);
+    serial_println!(
+        ":: [u11fix] park margin — B parked {}ms before unlink-GO (parked_out={}), A parked {}ms before read-GO \
+         (parked_out={}) and {}ms before close-GO (parked_out={}); park primitive=SYS_SLEEP_MS budget=0x8000 ::",
+        ms(b_wait),
+        b_parked_out,
+        ms(a_read_wait),
+        a_parked_out_r,
+        ms(a_close_wait),
+        a_parked_out_c
+    );
 
     // Verdict: wait for both sentinel exits, read witnesses + kills, wait teardown-clear, then CHECKPOINT-3.
     let _ = wait_while_secs(5, || EL0_U11DEFER_DONE.load(Ordering::Acquire) < 2);

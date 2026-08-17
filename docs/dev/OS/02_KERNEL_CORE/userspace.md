@@ -1282,6 +1282,69 @@
     `arch/aarch64/syscall.rs` (the U7 fixture blob + `u7_run`) + the spec + this doc. QEMU-green ≠ correct:
     the metal confirmation rides the next attended boot, where the property to watch is simply the U7 line —
     `-> PASS` rather than the `parent=0x3` partial.
+- **U11FIX (this arc)** — **the same defect, three more blobs**: U7FIX repaired the iteration-denominated park
+  in the U7 fixture and nowhere else, but three later fixture blobs had been copied from the *pre-fix* U7 blob
+  and carried the bug forward verbatim. PA41 was an attended Pi 4 boot on a tip QEMU-gated 108/108 green, and
+  U11-defer was the failing line:
+  `:: U11-defer: cross-process unlink-defers-free FAIL — head=28471 ff_busy=28468 measured=true want_ff=28468 a_w=0x1 b_w=0x0 opened=true unlinked=false read=false done=2 killed=0 cleared=true c1(gone=false,alive=true) c2_alive=true c3(freed=false,reuse=true) ::`
+  - **`b_w=0x0` with `done=2` is the whole conviction.** B's witness bits are `b0` open of A's file, `b1`
+    unlink accepted, `b2` re-open of the gone name `-ENOENT`. `0x0` means B set *none* of them — yet `done=2`
+    says B ran its `SYS_EXIT` and `killed=0` says nothing terminated it. The only path through program B that
+    reaches its exit with an empty witness and no fault is the **unlink-GO park falling off the end of its
+    budget**. `a_w=0x1` is the same statement about A one step later: A created and grow-wrote the file
+    (`b0`), reported `A_OPENED`, and then gave up in its read-GO park while the launcher was burning its full
+    5 s waiting for a `B_UNLINKED` cue that could never come. Every remaining field follows mechanically —
+    `unlinked=false`, `read=false`, `c1(gone=false)` because the name was never removed, `c3(freed=false)`
+    because A never reached its last close. `cleared=true` because both fixtures shut down cleanly, having
+    simply given up. **Nothing was wrong with the cross-process unlink-defer path**, which is the verdict
+    worth stating plainly: `sys_unlink`'s deferred free was never reached, let alone implicated.
+  - **The reaper did NOT cover this leak** — worth correcting, because the boot log invites the opposite
+    reading. `U11-defer: reaper freed teardown-orphaned chain @cluster 28474` appears further down PA41's
+    wire, but the defer file's measured head was **28471**. 28474 is the U11-**reap** fixture's chain (the two
+    demos share that one log string). DEFER.BIN's chain was left allocated *with its directory entry intact* —
+    an ordinary file, not an orphan, and therefore not something the reaper is even looking for.
+  - **Why this one lost harder than U7 did.** The currencies mismatch exactly as in P63 — launcher deadlines in
+    wall clock, fixture parks in `SYS_YIELD` iterations — but the interval B must outlast is far longer than
+    U7's. B parks at spawn and is not released until the launcher has (a) let A create DEFER.BIN and grow-write
+    it, which costs an `alloc_cluster` first-fit scan, and (b) run the U11-MEASURE mount, which calls
+    `first_free_cluster` — a linear first-fit scan from cluster 2. On PA41 the free set started at **28468**,
+    so that is ~28k FAT entries ≈ 222 sector reads *per scan*, against a real SD card. The QEMU margins the fix
+    now prints are the measurement: **B parked 83 ms** before its unlink-GO, where U7's child parked 3 ms.
+    Under QEMU an emulated yield round trip costs ~1 ms, so the old `0x8000` budget covered ~30 s and 83 ms fit
+    with three orders of magnitude to spare — 108/108, every run. On a Cortex-A72 the same budget retires in
+    **single-digit milliseconds** while the work it must outlast grows by the SD card's latency. That is not a
+    race PA41 happened to lose; it is one the fixture could not win, which is why the failure was deterministic
+    rather than flaky.
+  - **Fix: the U7FIX park, applied everywhere it was missed.** All seven remaining bounded GO parks — three in
+    the u11defer blob, three in u11reap, two in u6owner — now step on `SYS_SLEEP_MS(1)` instead of a bare
+    `SYS_YIELD`, making `0x8000` ~131 s of real 250 Hz ticks on metal and leaving QEMU's cooperative-yield
+    behaviour unchanged. The budget constant, the launcher deadlines and every on-disk checkpoint are untouched.
+  - **Witness: `:: [u11fix] park margin — … ::`,** `+1` spec REQUIRE and `+3` FORBIDs (108 → 109). Same
+    limitation as u7fix, stated up front: `SYS_SLEEP_MS` degrades to a yield under QEMU, so **QEMU cannot gate
+    the park primitive itself** — that confirmation belongs to the bench. What it does gate is the launcher's
+    **parked-out assertion**: B must still be parked when its unlink-GO is released, and A must still be parked
+    at both of its releases. A fixture that gave up has already run `SYS_EXIT`. B legitimately exits right
+    after its `B_UNLINKED` cue, so the bare `EL0_U11DEFER_DONE` count cannot serve for A's two checks; a
+    name-keyed `EL0_U11DEFER_A_EXITED` flag makes them exact. This is the fact that names the defect directly,
+    and its absence is precisely why `b_w=0x0` was indistinguishable from a failed `SYS_OPEN`.
+  - **Sharper witness words, so the next flight discriminates for free.** The fixtures now mark *which* park
+    died: bit4 on a read-GO/unlink-GO timeout, bit5 on a close-GO timeout, bit6 when `SYS_OPEN(O_CREAT)` itself
+    failed. PA41's line would have read `a_w=0x11 b_w=0x10` — self-describing — instead of a `0x1`/`0x0` pair
+    that had to be traced back through the assembly. The PASS masks stay `0xF`/`0x7` exactly, so every added
+    bit still fails the verdict: the fixture can still fail, and now says why.
+  - **Self-heal: a failure must not disable its own detector.** The pre-flight skipped the whole demo if
+    DEFER.BIN was already present ("stale image"). On a fresh QEMU image that never fires; on the bench the SD
+    card is persistent, so PA41's leftover would have skipped U11-defer on **every subsequent boot** — the fix
+    would have been unverifiable on the very next flight. The pre-flight now deletes the residue (it can only
+    be a prior failed run's — a PASSing run leaves the name unlinked) and proceeds, logging that it did so;
+    only an *undeletable* copy still skips. This restores the documented precondition rather than relaxing any
+    check: all three on-disk checkpoints run exactly as before, against a freshly created file.
+  - Gates: `./arroyo check` green x86_64 + aarch64, `UNAOS_WC=1 ./arroyo check` green; `./arroyo kernel8-test
+    210` → **109/109 required witnesses, 0 forbidden**. Lane: `arch/aarch64/syscall.rs` (the u11defer/u11reap/
+    u6owner fixture blobs + `u11defer_run` + the sentinel-exit hook) + the spec + this doc. QEMU-green ≠
+    correct: the metal confirmation rides the next attended boot, where the properties to watch are the
+    `[u11fix] park margin` line (all three `parked_out` reading `0`/`false`, and the margins themselves — on
+    metal they will be much larger than QEMU's 83/97/101 ms) and the U11-defer line reading `-> PASS`.
 - **BG-SPREAD (this arc)** — the **stacked background parent**: every `bg` launch pinned its parent task to
   the launcher's core, so background programs piled onto one core no matter how idle the rest of the machine
   was. P62 was an attended sitting: four bg vugs, each visibly slower than the last, while
