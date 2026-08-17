@@ -108,11 +108,31 @@ COMPLETE :: BANDY-RT:
 # ---    FLOOR 23 -> 25 (2026-08-04, same day): the ERET-SCRUB pair prints the doubly-framed
 # ---    fixture-verdict form, so the maintenance rule above applies — two new fixtures, floor +2,
 # ---    same landing. Measured on the eret branch gate run: 93/93 with both new lines present.
-COUNT 25 :: (?!ELF1:|EXEC1:|EXEC-UVUG:|SERWIT-2:)[A-Za-z0-9_-]+: .*-> PASS ::
+# ---    FLOOR 25 -> 26 (2026-08-17, BOT-PARK): `:: BOT-PARK: selftest … -> PASS ::` is the same
+# ---    doubly-framed fixture-verdict form, so the maintenance rule applies again — one new
+# ---    fixture, floor +1, same landing.
+COUNT 26 :: (?!ELF1:|EXEC1:|EXEC-UVUG:|SERWIT-2:)[A-Za-z0-9_-]+: .*-> PASS ::
 
 # --- SERWIT-2: mirror-tap conservation (promoted 2026-08-13, see ruling block above) ----------
 REQUIRE :: SERWIT-2: mirror taps .*-> PASS ::
 FORBID :: SERWIT-2: FAIL —
+
+# --- BOT-PARK: the USB retry ladder's global floor (2026-08-17) -------------------------------
+# --- WHAT IT GUARDS. [pi0-b1b2] boot3 caught a wedged 'Generic USB SD Reader' cycling forever on
+# --- Pi 4 metal: the rescue ladder surrendered slot 2, its own hub-port power-cycle rung
+# --- re-enumerated the same device as slot 5, the fresh slot id bought a fresh allowance, and
+# --- surrendering slot 5 released slot 2 again (`bot_surrendered_slot` is one u8). A core sat at
+# --- 99% for the whole sitting at ~8.3 s of pump budget per attempt. The fix keys the verdict to a
+# --- device identity re-enumeration cannot change (root port + route + VID:PID).
+# --- WHY A SELFTEST AND NOT A WEDGE FIXTURE. QEMU models no wedge — `usb-storage` always answers —
+# --- so a fixture needing the real fault would be permanently VACUOUS, which is worse than none.
+# --- This one is not: it exercises the discipline's arithmetic AND its keying (assertion `reenum=`
+# --- is the property the metal cycle violated) on every boot, needs no controller, and therefore
+# --- holds on a `skip_xhci` capture — which every pi4 regression capture is. The transport wedge
+# --- itself is reachable under `UNAOS_BOTWEDGE=1` (default OFF, attended runs only; it makes
+# --- storage unusable by design and would red every fixture downstream of a mounted disk).
+REQUIRE :: BOT-PARK: selftest .*-> PASS ::
+FORBID :: BOT-PARK: selftest .*-> FAIL ::
 
 # --- scheduler capstone: all 6 sync primitives in one boot -------------------------
 COUNT 6 CAPSTONE \w+: PASS

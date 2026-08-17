@@ -971,6 +971,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     //    comes up promptly on real hardware where firmware/SMM may still own the xHCI controller
     //    (no BIOS->OS handoff on this branch) and never reflect our reset writes — which would
     //    otherwise stall boot in the bounded timeout loops before the first GUI frame paints.
+    // BOT-PARK: the USB retry ladder's global-floor arithmetic, checked on every boot of every
+    // arch. Deliberately OUTSIDE the `skip_xhci` split below: it needs no controller, and the Pi
+    // kernel8 battery — the gate that has to hold this line — is a `skip_xhci` build.
+    unaos_kernel::drivers::xhci::bot_park_selftest();
     #[cfg(not(feature = "skip_xhci"))]
     unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
     // BPACE: PCI scan + xHCI controller bring-up returned. This is the SYNCHRONOUS half of USB; the

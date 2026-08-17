@@ -173,6 +173,15 @@ _feats=""
 # proven fix, not an experiment (usb_xhci.md §17). Setting the variable does nothing; the KNOBS line
 # reads `cbw=always-awaited` in every build.
 [ -n "${UNAOS_BOTRING64:-}" ] && _feats="${_feats}botring64,"
+# BOT-PARK: UNAOS_BOTWEDGE=1 injects a SYNTHETIC transport wedge on the storage slot once its first
+# 24 transactions have completed — every later BOT attempt fails `Timeout` with nothing put on the
+# wire. It exists because QEMU's usb-storage cannot wedge (it always answers), so the retry ladder's
+# global floor — escalating back-off, the bounded per-device retry budget, the park — is otherwise
+# walkable only on metal. Under it a QEMU boot reaches `:: BOT: PARKED … ::` and STOPS retrying,
+# which is the arc's whole claim. TEST ONLY, never on media: it makes storage permanently unusable
+# by design, so every fixture downstream of a mounted disk fails on such a run. Default OFF => fully
+# cfg-compiled out and the artifact is byte-identical.
+[ -n "${UNAOS_BOTWEDGE:-}" ] && _feats="${_feats}botwedge,"
 # VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem memory-type
 # readout, display-BAR probe, scripted scroll scenario). x86_64-only module — aarch64 media are
 # byte-identical with this on or off.
@@ -1553,7 +1562,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

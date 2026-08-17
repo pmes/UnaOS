@@ -702,6 +702,11 @@ pub fn log_summary_once() {
             BOT_WAIT_BUCKETS[6].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[7].load(Ordering::Relaxed),
             BOT_WAIT_BUCKETS[8].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[9].load(Ordering::Relaxed),
             BOT_WAIT_BUCKETS[10].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[11].load(Ordering::Relaxed));
+        // BOT-PARK: the per-device ledger census, on its own lines for the same reason — the
+        // SUMMARY above must stay byte-comparable with every capture taken before this arc. On a
+        // clean boot this is one `accounts=0 parked=0 …` rollup; on a wedge it is the self-diagnosis
+        // the 2026-08-17 sitting had to assemble by hand from slot ids that kept changing.
+        x.bot_park_census();
         // MULTIBLK: the transfer-size census, on its own line so the SUMMARY above stays
         // byte-comparable with pre-arc captures. `single=` counts data stages still issued at one
         // sector (partial-sector RMW head/tails, INQUIRY, READ CAPACITY, REQUEST SENSE); `multi=`
@@ -979,6 +984,294 @@ pub static BOT_RESCUE_PORT_CYCLE: AtomicU64 = AtomicU64::new(0);
 /// capture must be able to say which one a boot actually reached.
 pub static BOT_RESCUE_HUB_PORT_CYCLE: AtomicU64 = AtomicU64::new(0);
 pub static BOT_RESCUE_SURRENDER: AtomicU64 = AtomicU64::new(0);
+
+// --- BOT-PARK (2026-08-17): the GLOBAL floor — bounded work per DEVICE, not per slot id ---
+//
+// [pi0-b1b2] `boot3-inputdeath-tail.txt` convicted the one structural hole left in the ladder, on
+// Pi 4 metal. Read the capture as a CYCLE rather than as a list of failures:
+//
+//   BOT: SURRENDER slot=2 …  retracted=yes      <- the per-slot floor DID fire, exactly as designed
+//   HUB slot 1 port 1 disconnect: slot 2 …      <- the ladder's OWN hub-port power-cycle rung (b')
+//   [piusb25] storage enumerated: slot 5 …      <- the same wedged reader, re-enumerated, NEW slot id
+//   BOT: SURRENDER slot=5 …                     <- a whole fresh ladder allowance, spent, surrendered
+//   [piusb25] storage enumerated: slot 2 …      <- and back again. Forever.
+//
+// Nothing in the ladder is wrong there; every rung did what it was built to do. What is missing is a
+// verdict that OUTLIVES A SLOT ID. `bot_surrendered_slot` is one `u8`: it binds the floor to a
+// number the controller recycles, so a device whose prescribed cure is a port cycle escapes its own
+// surrender by being re-enumerated by that very cure — and, because the field holds exactly one
+// slot, parking the new id UNPARKS the old one (slot 5's surrender is literally what let slot 2 back
+// onto the wire). The measured cost was a core at 99% and a desktop frozen for the whole sitting, at
+// ~8.3 s of pump budget per attempt, `timeouts=` still climbing when Peter pulled the device.
+//
+// The ledger below is the missing GLOBAL discipline. It is keyed by a physical identity a
+// re-enumeration cannot change — root port, route string, VID:PID — deliberately excluding the slot
+// id, which is the field the wedge escaped through. The per-slot surrender is untouched: this is a
+// floor UNDER it, not a replacement for it, and no rung's semantics change.
+//
+/// Ladder entries (`bot_rescue_escalate` calls) one device identity may spend across ALL of its
+/// enumerations before it is PARKED. Six = three generations' worth of the two-strike per-generation
+/// allowance (`BOT_RESCUE_N_CONSEC`): enough that a device the port cycle genuinely cures still gets
+/// cured (PA35's replug proved one cold cycle is the cure when there is one), few enough that the
+/// metal cycle above ends in seconds instead of never.
+const BOT_PARK_LADDER_MAX: u32 = 6;
+/// Surrenders one identity may earn before parking. TWO: the first is the ladder's verdict on this
+/// generation; a second one — necessarily after the ladder's own port cycle re-enumerated the device
+/// — is the verdict on the cure itself. There is no evidence anywhere in this campaign of a device
+/// that failed two full ladders across a cold cycle and then worked.
+const BOT_PARK_SURRENDER_MAX: u32 = 2;
+/// Total pump wall-clock, in milliseconds, one identity may burn before parking regardless of how
+/// that time divides into ladders. The bound the metal sitting actually needed: 45 s is ~5 first-
+/// attempt budgets (`hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` ≈ 8.3 s on Pi 4), i.e. a device gets
+/// several honest chances to be merely slow, and the desktop gets its core back inside a minute
+/// instead of losing it for the boot.
+const BOT_PARK_CYCLE_MAX_MS: u64 = 45_000;
+/// Consecutive pump timeouts on one identity with a PROVABLY IDLE ring — zero events drained, zero
+/// foreign events, zero doorbell rings observed during the whole wait — before this identity's pump
+/// budget is cut by `BOT_PARK_DEAD_DIV`. This is the [piusb40] necropsy signature, and it is the one
+/// condition under which waiting longer is known to buy nothing: the event ring was empty, the
+/// interrupter delivered nothing for anyone, and IRQ_COUNT never moved. TWO, not one, so a single
+/// unlucky quiet wait on a slow-but-healthy stick cannot shorten its own budget.
+const BOT_PARK_DEAD_STREAK: u32 = 2;
+/// Divisor applied to `hw_wait_budget()` for an identity past `BOT_PARK_DEAD_STREAK`. The cut is on
+/// the *base* budget, so the resulting cap is independent of `bot_budget_scale` and cannot lengthen
+/// any wait. Eight: ~350 ms on Pi 4, still two orders of magnitude above the microseconds a revived
+/// device answers in, and 24x below the ~8.3 s a dead one used to cost per attempt.
+const BOT_PARK_DEAD_DIV: u64 = 8;
+/// Escalating back-off between LADDER ENTRIES for one identity, doubling per entry. Distinct from
+/// `BOT_RESCUE_BACKOFF_MS`, which is the in-ladder spec-scale settle between RUNGS and stays exactly
+/// as it is (it is metal-earned: a device wedged mid-internal-stall is made worse by hammering).
+/// This one is not spun: it is a DEADLINE the next `service_storage`/block-I/O pass tests and
+/// declines, so the wait is paid in main-loop passes that render frames instead of in `settle_ms`.
+const BOT_PARK_BACKOFF_MS: u64 = 100;
+const BOT_PARK_BACKOFF_MAX_MS: u64 = 4_000;
+/// Ladder entries one main-loop pass may run for a given identity before the driver yields. ONE:
+/// the pump is scheduled cooperatively from the desktop loop (`main.rs` -> `service_storage` /
+/// the block layer's synchronous reads), so "yield" here means "return to the caller and let the
+/// frame paint". A pass therefore costs at most one ladder, not an unbounded chain of them.
+const BOT_PARK_PASS_LADDERS: u32 = 1;
+/// Ledger capacity. Four: this driver brings up ONE storage device at a time, and the entries that
+/// matter are the sick ones. Small enough to scan linearly on the hot path for free.
+const BOT_PARK_SLOTS: usize = 4;
+/// Hard ceiling, in milliseconds, on the BOT time ONE main-loop pass may spend on an identity that
+/// already has an account. The ladder-count cap above is not sufficient on its own and the boot3
+/// measurement is why: the [piusb26] per-pass cost at the four c3=99% windows read 1,498,784,103 /
+/// 1,972,189,353 / 1,060,628,143 / 1,348,032,519 cycles against a normal 119-134, i.e. 20-37 s in a
+/// SINGLE pass — because one ladder legitimately chains several waits (first attempt, the recovery
+/// retry, then a retry per rung), each with its own metal-earned budget.
+///
+/// So this bound is deliberately NOT a shorter wait. It never truncates a wait in flight and never
+/// touches `hw_wait_budget()` or `BOT_BUDGET_SCALE_FIRST` — a real device can legitimately stall
+/// 1-4 s on a write and shortening that would turn a slow-but-healthy stick into a false failure.
+/// It refuses to START another one in the same pass. Ten seconds is chosen against the measurement
+/// it has to make impossible: it is just over one first-attempt budget (~8.3 s on Pi 4), so a pass
+/// can always finish the one expensive thing it began, and it is 2-4x under every window above. And
+/// it applies ONLY to an identity with an account — a device nothing has gone wrong with is never
+/// subject to it, which matters because a healthy boot's ENTIRE BOT time is ~5 s (`sum=304556240`
+/// in the same capture), half this bound.
+const BOT_PARK_PASS_MS: u64 = 10_000;
+
+/// Devices parked this boot. Zero on a clean boot, so any non-zero reading is itself the finding.
+pub static BOT_PARK_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Transfers refused up front by the park gate — the work the ladder did NOT do.
+pub static BOT_PARK_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Transfers declined because the identity was inside its escalating back-off window.
+pub static BOT_PARK_BACKOFF_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Ladders torn down because the slot they were running on was disposed mid-flight (disconnect).
+pub static BOT_PARK_ABORTS: AtomicU64 = AtomicU64::new(0);
+/// Pump waits whose budget was cut by the dead-ring cap.
+pub static BOT_PARK_CAPPED: AtomicU64 = AtomicU64::new(0);
+/// Ladder entries deferred to a later main-loop pass by the per-pass cap (the cooperative yield).
+pub static BOT_PARK_YIELDS: AtomicU64 = AtomicU64::new(0);
+/// Transfers declined because this main-loop pass had already spent `BOT_PARK_PASS_MS` on the
+/// identity. Directly the boot3 core-eater's counter: every hit is a 0.3-8 s wait that did NOT
+/// happen inside a pass that had already run long.
+pub static BOT_PARK_PASS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// The physical identity of a USB device, as far as this driver can name one WITHOUT a slot id.
+///
+/// Root port + route string is the topological address (the xHCI route string does not encode the
+/// root port, so both are needed to separate two hubs on different root ports); VID:PID separates
+/// two devices swapped on the same port. A re-enumeration — including one the rescue ladder's own
+/// port cycle causes — reproduces all four fields exactly. That is the entire point.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BotDevIdent {
+    pub port: u8,
+    pub route: u32,
+    pub vid: u16,
+    pub pid: u16,
+}
+
+/// One device identity's standing account with the retry ladder.
+#[derive(Clone, Copy)]
+pub struct BotDevLedger {
+    pub ident: BotDevIdent,
+    /// Entry in use. A cleared entry is a device this driver has no verdict on.
+    pub used: bool,
+    /// Enumerations of this identity seen since the account was opened.
+    pub gens: u32,
+    /// Ladder entries charged across all of them.
+    pub ladders: u32,
+    /// Surrenders earned across all of them.
+    pub surrenders: u32,
+    /// Pump cycles charged to this identity.
+    pub cycles: u64,
+    /// Consecutive dead-ring timeouts (see `BOT_PARK_DEAD_STREAK`).
+    pub dead_streak: u32,
+    /// PARKED: no transfer, no bring-up, no rung. Cleared only by a real re-enumeration event —
+    /// a disconnect this driver did not itself cause (see `bot_park_note_disconnect`).
+    pub parked: bool,
+    /// `now_cycles()` before which the next ladder entry for this identity is declined.
+    pub backoff_until: u64,
+}
+
+impl BotDevLedger {
+    const EMPTY: BotDevLedger = BotDevLedger {
+        ident: BotDevIdent { port: 0, route: 0, vid: 0, pid: 0 },
+        used: false, gens: 0, ladders: 0, surrenders: 0, cycles: 0,
+        dead_streak: 0, parked: false, backoff_until: 0,
+    };
+
+    /// The park verdict, as a pure function of the account and the timebase. `None` = keep going;
+    /// `Some(why)` = park, and `why` is the clause that fired (it goes on the census line verbatim,
+    /// so a capture says WHICH bound a device hit rather than only that it hit one).
+    ///
+    /// Pure and total: no `self`-mutation, no hardware, no allocation. That is what lets
+    /// `bot_park_selftest` exercise the whole discipline on a QEMU boot where no wedge exists.
+    fn verdict(&self, per_ms: u64) -> Option<&'static str> {
+        if self.surrenders >= BOT_PARK_SURRENDER_MAX { return Some("surrenders"); }
+        if self.ladders >= BOT_PARK_LADDER_MAX { return Some("ladders"); }
+        if self.cycles >= per_ms.saturating_mul(BOT_PARK_CYCLE_MAX_MS) { return Some("cycles"); }
+        None
+    }
+
+    /// The escalating back-off deadline for this identity's NEXT ladder entry, in cycles from `now`.
+    /// Doubles per entry, capped. Not spun — see `BOT_PARK_BACKOFF_MS`.
+    fn backoff_cycles(&self, per_ms: u64) -> u64 {
+        let ms = (BOT_PARK_BACKOFF_MS << self.ladders.min(5)).min(BOT_PARK_BACKOFF_MAX_MS);
+        per_ms.saturating_mul(ms)
+    }
+}
+
+/// Find an identity's account. Slot id is not a key and never has been — that is the bug this whole
+/// section exists to close.
+fn bot_park_find(tab: &[BotDevLedger; BOT_PARK_SLOTS], id: BotDevIdent) -> Option<usize> {
+    tab.iter().position(|e| e.used && e.ident == id)
+}
+
+/// Find-or-open an account. When the table is full, reuse an entry that is NOT parked, preferring
+/// the one with the least history; a PARKED entry is never evicted to make room for a newcomer,
+/// because evicting one is exactly the "and now it may retry forever again" bug in another costume.
+/// Returns `None` only when every entry is parked — in which case the caller keeps its old
+/// behaviour rather than silently losing a verdict.
+fn bot_park_open(tab: &mut [BotDevLedger; BOT_PARK_SLOTS], id: BotDevIdent) -> Option<usize> {
+    if let Some(i) = bot_park_find(tab, id) { return Some(i); }
+    if let Some(i) = tab.iter().position(|e| !e.used) {
+        tab[i] = BotDevLedger { ident: id, used: true, ..BotDevLedger::EMPTY };
+        return Some(i);
+    }
+    let victim = tab.iter().enumerate()
+        .filter(|(_, e)| !e.parked)
+        .min_by_key(|(_, e)| (e.ladders, e.gens))
+        .map(|(i, _)| i)?;
+    tab[victim] = BotDevLedger { ident: id, used: true, ..BotDevLedger::EMPTY };
+    Some(victim)
+}
+
+/// Close an identity's account — the clean slate. Called ONLY for a disconnect this driver did not
+/// itself cause, i.e. an operator replug. See `bot_park_note_disconnect` for why that distinction is
+/// the whole of the unpark rule.
+fn bot_park_forget(tab: &mut [BotDevLedger; BOT_PARK_SLOTS], id: BotDevIdent) -> bool {
+    match bot_park_find(tab, id) {
+        Some(i) => { tab[i] = BotDevLedger::EMPTY; true }
+        None => false,
+    }
+}
+
+/// BOT-PARK's own fixture, and the reason the ledger's decision logic is written as pure functions
+/// of an account rather than as branches sprinkled through the ladder.
+///
+/// **Why a fixture at all, and why this shape.** The condition this arc fixes cannot be produced in
+/// QEMU: `usb-storage` never wedges, never re-manufactures a CSW, never stops answering — the metal
+/// capture is the only place the cycle exists. A fixture that needed the wedge would therefore be
+/// permanently vacuous, which is worse than no fixture. What CAN be exercised on every boot is the
+/// discipline itself: the account arithmetic, and — the part that actually failed on metal — the
+/// keying. Every assertion below is a property the [pi0-b1b2] capture violated.
+///
+/// Runs on every boot of both arches, needs no controller (it is called before/independently of
+/// xHCI bring-up, and passes under `skip_xhci`), allocates nothing, and touches no hardware.
+pub fn bot_park_selftest() {
+    let per_ms: u64 = 1_000; // a nominal timebase; the assertions are about arithmetic, not clocks
+    let a = BotDevIdent { port: 1, route: 0x1, vid: 0x058f, pid: 0x6362 };
+    let b = BotDevIdent { port: 1, route: 0x2, vid: 0x058f, pid: 0x6362 };
+    let mut tab = [BotDevLedger::EMPTY; BOT_PARK_SLOTS];
+
+    // 1. LADDER BUDGET. A fresh identity is open; `BOT_PARK_LADDER_MAX` entries close it.
+    let i = bot_park_open(&mut tab, a).unwrap();
+    let mut ladder_ok = tab[i].verdict(per_ms).is_none();
+    for _ in 0..BOT_PARK_LADDER_MAX {
+        tab[i].ladders += 1;
+    }
+    ladder_ok &= tab[i].verdict(per_ms) == Some("ladders");
+
+    // 2. THE KEYING — the assertion the metal cycle is made of. The same physical device coming
+    //    back as a DIFFERENT slot id must find the SAME account. Slot ids are not in the key, so
+    //    this is really the claim that a re-enumeration reproduces port/route/VID:PID exactly, and
+    //    that `bot_park_open` therefore returns the existing entry rather than a fresh one.
+    tab[i].parked = true;
+    let reenum_ok = bot_park_open(&mut tab, a) == Some(i) && tab[i].parked && tab[i].ladders != 0;
+
+    // 3. SURRENDER BUDGET, on a second identity so 1's state cannot carry.
+    let j = bot_park_open(&mut tab, b).unwrap();
+    tab[j].surrenders = BOT_PARK_SURRENDER_MAX;
+    let surrender_ok = tab[j].verdict(per_ms) == Some("surrenders");
+
+    // 4. CYCLE BUDGET, independent of both counts.
+    let mut e = BotDevLedger { ident: b, used: true, ..BotDevLedger::EMPTY };
+    let cycles_ok = e.verdict(per_ms).is_none() && {
+        e.cycles = per_ms * BOT_PARK_CYCLE_MAX_MS;
+        e.verdict(per_ms) == Some("cycles")
+    };
+
+    // 5. BACK-OFF is escalating and capped — it must grow with the ladder count and must never
+    //    exceed the cap, or "escalating back-off" is a comment rather than a behaviour.
+    let (b0, b1, b9) = (
+        BotDevLedger { ladders: 0, ..BotDevLedger::EMPTY }.backoff_cycles(per_ms),
+        BotDevLedger { ladders: 1, ..BotDevLedger::EMPTY }.backoff_cycles(per_ms),
+        BotDevLedger { ladders: 9, ..BotDevLedger::EMPTY }.backoff_cycles(per_ms));
+    let backoff_ok = b1 > b0 && b9 <= per_ms * BOT_PARK_BACKOFF_MAX_MS && b9 >= b1;
+
+    // 6. THE UNPARK RULE's arithmetic half: closing an account is what restores the allowance, and
+    //    nothing else does. (Which disconnects are allowed to close one is decided by
+    //    `bot_park_note_disconnect`, against the self-cycle window.)
+    let unplug_ok = bot_park_forget(&mut tab, a)
+        && bot_park_find(&tab, a).is_none()
+        && bot_park_open(&mut tab, a).map(|k| !tab[k].parked && tab[k].ladders == 0) == Some(true);
+
+    // 7. TABLE PRESSURE. Fill every entry, park one, then demand a newcomer: the parked verdict
+    //    must survive. An eviction policy that can drop a parked device to make room is the
+    //    original bug wearing a different hat.
+    let mut full = [BotDevLedger::EMPTY; BOT_PARK_SLOTS];
+    for k in 0..BOT_PARK_SLOTS {
+        let id = BotDevIdent { port: 2, route: k as u32, vid: 0x1234, pid: 0x5678 };
+        let idx = bot_park_open(&mut full, id).unwrap();
+        full[idx].ladders = 1 + k as u32;
+    }
+    let victim_id = BotDevIdent { port: 2, route: 3, vid: 0x1234, pid: 0x5678 };
+    let victim = bot_park_find(&full, victim_id).unwrap();
+    full[victim].parked = true;
+    let newcomer = BotDevIdent { port: 9, route: 0, vid: 0xdead, pid: 0xbeef };
+    let _ = bot_park_open(&mut full, newcomer);
+    let pressure_ok = bot_park_find(&full, victim_id).map(|k| full[k].parked) == Some(true);
+
+    let pass = ladder_ok && reenum_ok && surrender_ok && cycles_ok && backoff_ok
+        && unplug_ok && pressure_ok;
+    serial_println!(
+        ":: BOT-PARK: selftest ladder={} reenum={} surrender={} cycles={} backoff={} unplug={} pressure={} ladder_max={} surrender_max={} cycle_max_ms={} slots={} -> {} ::",
+        ladder_ok, reenum_ok, surrender_ok, cycles_ok, backoff_ok, unplug_ok, pressure_ok,
+        BOT_PARK_LADDER_MAX, BOT_PARK_SURRENDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_SLOTS,
+        if pass { "PASS" } else { "FAIL" });
+}
 
 // --- BOT-PHASE (2026-07-29): the phase-desync witnesses ---
 //
@@ -2326,6 +2619,33 @@ pub struct XhciController {
     /// fold; cleared at bring-up start and when the trigger consumes it.
     bot_fold_seen: bool,
 
+    /// BOT-PARK: the per-DEVICE-identity ledger. See the `BOT-PARK` block for the metal capture
+    /// that convicted a slot-id-keyed floor.
+    bot_park: [BotDevLedger; BOT_PARK_SLOTS],
+    /// BOT-PARK: the slot a rescue ladder is currently walking, 0 when none. Read by the disposal
+    /// paths so a disconnect can tear the ladder down instead of letting it finish its rungs
+    /// against a device that has physically left.
+    bot_ladder_slot: u8,
+    /// BOT-PARK: set by a disposal path when it disposes `bot_ladder_slot`. The ladder checks it
+    /// between rungs and before every retry and abandons immediately. Cleared at ladder entry.
+    bot_ladder_abort: bool,
+    /// BOT-PARK: ladder entries charged on the CURRENT main-loop pass. Reset by `service_storage`
+    /// and by the block layer's entry points; compared against `BOT_PARK_PASS_LADDERS`.
+    bot_pass_ladders: u32,
+    /// BOT-PARK: `now_cycles()` at the start of the current main-loop pass. The other half of
+    /// "bounded work per pass" — see `BOT_PARK_PASS_MS` and the boot3 per-pass measurement that
+    /// showed a ladder-count cap alone leaves 20-37 s passes reachable.
+    bot_pass_start: u64,
+    /// BOT-PARK: `now_cycles()` before which a disconnect on `bot_self_cycle_route` is attributed
+    /// to THIS DRIVER'S OWN port power-cycle rung rather than to an operator replug. The unpark
+    /// rule turns on exactly this distinction: the ladder's cure (rung b/b') produces a disconnect
+    /// and a re-enumeration that are otherwise indistinguishable from a physical replug, and
+    /// treating the ladder's own act as "the operator fixed it" is what made the metal cycle
+    /// infinite. Armed by `rescue_port_cycle` / `rescue_hub_port_cycle`.
+    bot_self_cycle_until: u64,
+    bot_self_cycle_port: u8,
+    bot_self_cycle_route: u32,
+
     /// In-flight synchronous EP0 control transfer (hub bring-up). See `Ep0Pending`.
     ep0_pending: Option<Ep0Pending>,
     /// XENUM-3 M1: bytes actually transferred by the most recent `sync_control` IN read (requested
@@ -2501,6 +2821,14 @@ impl XhciController {
             bot_geom_reject: false,
             bot_txn_folded: false,
             bot_fold_seen: false,
+            bot_park: [BotDevLedger::EMPTY; BOT_PARK_SLOTS],
+            bot_ladder_slot: 0,
+            bot_ladder_abort: false,
+            bot_pass_ladders: 0,
+            bot_pass_start: 0,
+            bot_self_cycle_until: 0,
+            bot_self_cycle_port: 0,
+            bot_self_cycle_route: 0,
             ep0_pending: None,
             last_control_len: 0,
             cmd_pending: None,
@@ -2760,6 +3088,12 @@ impl XhciController {
     }
 
     pub fn poll_events(&mut self) -> bool {
+        // BOT-PARK: a new main-loop pass begins here. `poll_events` is the first thing the desktop
+        // loop calls on every iteration, so this is the honest boundary for "one pass" — and it
+        // covers the block layer's synchronous reads as well as the storage bring-up, both of which
+        // reach the ladder. See `BOT_PARK_PASS_LADDERS` and `BOT_PARK_PASS_MS`.
+        self.bot_pass_ladders = 0;
+        self.bot_pass_start = crate::arch::now_cycles();
         let mut any = false;
         while self.drain_event_ring_once() {
             any = true;
@@ -5023,6 +5357,13 @@ impl XhciController {
             // surrendered slot id, once recycled by the controller for the NEXT device, would
             // refuse that innocent device's transfers up front — the surrender must bind to the
             // disk that earned it, not to a number.
+            //
+            // BOT-PARK: and this is where that reasoning stops being enough. `bot_rescue_clear`
+            // resets `bot_fail_streak` and `bot_rescue_stage`, both of which are driver-GLOBAL, so
+            // a disconnect raised while a ladder is mid-flight handed that ladder its allowance
+            // back instead of ending it. Called BEFORE the clear so the ladder is torn down (and
+            // the unpark rule applied) against state the clear has not yet flattened.
+            self.bot_park_note_disconnect(i as u8);
             self.bot_rescue_clear(i as u8);
             if self.ftdi_configuring_slot == i as u8 {
                 self.ftdi_configuring_slot = 0;
@@ -6262,6 +6603,11 @@ impl XhciController {
         if slot_id != 0 && self.bot_surrendered_slot == slot_id {
             return Err(BotError::NoDevice);
         }
+        // BOT-PARK: the floor UNDER that gate. The line above binds to a slot id, which the
+        // controller recycles and a re-enumeration changes; this one binds to the device. See the
+        // `BOT-PARK` block for the [pi0-b1b2] capture of a reader escaping its own surrender by
+        // being re-enumerated (as a new slot id) by the ladder's own port-cycle rung.
+        self.bot_park_gate(slot_id)?;
         let first = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         let cause = match first {
             // PH-2: a `Failed` CSW is a completed transaction the DEVICE rejected — CHECK
@@ -6297,6 +6643,16 @@ impl XhciController {
             // one failed cycle and enters the escalation ladder (which, below `BOT_RESCUE_N_CONSEC`,
             // returns exactly the same `Err(cause)` after a back-off).
             return self.bot_rescue_escalate(slot_id, cdb, data_phys, data_len, dir, cause);
+        }
+        // BOT-PARK: the recovery earned this retry, but a pass that has already run long does not
+        // get to pay another full budget for it. The retry is not cancelled — it is deferred to a
+        // later pass, with the escalating back-off deciding when.
+        if self.bot_pass_exhausted(slot_id) {
+            BOT_PARK_PASS_REFUSED.fetch_add(1, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: park pass-refused slot={} what=post-recovery-retry pass_ms={} — this main-loop pass has already spent its BOT budget; the retry moves to a later pass ::",
+                slot_id, BOT_PARK_PASS_MS);
+            return Err(cause);
         }
         let again = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         match &again {
@@ -7150,6 +7506,29 @@ impl XhciController {
             (cbw, csw, slot.bulk_in_ep, slot.bulk_out_ep)
         };
         if in_addr == 0 || out_addr == 0 { return Err(BotError::NoDevice); }
+        // BOT-PARK (`botwedge`, default OFF): the synthetic transport wedge. Refuses AFTER the
+        // device has had its first `BOT_WEDGE_AFTER` transactions, so enumeration, bring-up and the
+        // geometry publish all succeed exactly as they do today and the wedge lands on a live disk —
+        // which is what the metal capture shows. Nothing is queued and no doorbell is rung, so the
+        // ring stays provably idle and the pump's dead-ring classification sees the real signature.
+        #[cfg(feature = "botwedge")]
+        {
+            /// Transactions allowed through before the synthetic wedge closes. Enough for
+            /// SET_CONFIGURATION, the TUR loop, INQUIRY and READ CAPACITY on QEMU's `usb-storage`.
+            const BOT_WEDGE_AFTER: u64 = 24;
+            static BOT_WEDGE_N: AtomicU64 = AtomicU64::new(0);
+            if slot_id != 0 && slot_id == self.storage_slot {
+                let n = BOT_WEDGE_N.fetch_add(1, Ordering::Relaxed) + 1;
+                if n > BOT_WEDGE_AFTER {
+                    if n == BOT_WEDGE_AFTER + 1 {
+                        serial_println!(
+                            ":: BOT: WEDGE-INJECT slot={} after={} — synthetic transport wedge armed (botwedge); every further BOT attempt on this slot fails Timeout with nothing on the wire ::",
+                            slot_id, BOT_WEDGE_AFTER);
+                    }
+                    return Err(BotError::Timeout);
+                }
+            }
+        }
         let in_dci = ((in_addr & 0x0F) * 2) + 1;
         let out_dci = (out_addr & 0x0F) * 2;
 
@@ -8617,6 +8996,13 @@ impl XhciController {
         BOT_RESCUE_PORT_CYCLE.fetch_add(1, Ordering::Relaxed);
         let port = self.slots[slot_id as usize].port_id;
         let downstream = self.slots[slot_id as usize].is_downstream;
+        // BOT-PARK: this rung is ABOUT to cause a disconnect and a re-enumeration. Say so, so the
+        // unpark rule can tell the driver's own cure apart from an operator replug. Armed before
+        // the hand-off below as well, because the hub twin cycles the same physical device.
+        {
+            let route = self.slots[slot_id as usize].route_string;
+            self.bot_park_arm_self_cycle(port, route);
+        }
         if downstream {
             // A hub-downstream device's power is the HUB's to switch, via a class request on the
             // hub's slot — a different pipe, and PORTSC PP here would cut the whole hub. [piusb41]
@@ -8698,6 +9084,13 @@ impl XhciController {
             let s = &self.slots[slot_id as usize];
             (s.parent_hub_slot, s.parent_hub_port, s.route_string, s.route_depth)
         };
+        // BOT-PARK: as for the root rung — this is the driver's own cure, and the disconnect it
+        // raises must not read as an operator replug. (Idempotent with the arm in `rescue_port_cycle`
+        // when reached through its hand-off; this call covers the direct-entry path.)
+        {
+            let port = self.slots[slot_id as usize].port_id;
+            self.bot_park_arm_self_cycle(port, route);
+        }
         if hub_slot == 0 || hub_port == 0 {
             // Slot 0 is never a device and hub ports are 1-based, so this pair means "not recorded"
             // — a device enumerated before this arc, or a root device that reached here in error.
@@ -9136,11 +9529,265 @@ impl XhciController {
     /// arc's actual guarantee: a sick disk can never again spin the system at ~6 s per attempt
     /// forever. It is cleared when the slot is disposed or re-enumerated, so a physical replug is a
     /// clean slate and needs no operator action beyond the replug.
+    // ==================== BOT-PARK: the global floor ====================
+
+    /// The physical identity behind a slot id, or `None` when the slot cannot name one (slot 0, an
+    /// inactive slot, or a device whose descriptors never arrived). A `None` identity is charged
+    /// nothing and gated on nothing: the ledger only ever acts on devices it can name.
+    fn bot_ident(&self, slot_id: u8) -> Option<BotDevIdent> {
+        let i = slot_id as usize;
+        if i == 0 || i >= self.slots.len() || !self.slots[i].active {
+            return None;
+        }
+        let s = &self.slots[i];
+        if s.vid == 0 && s.pid == 0 {
+            return None;
+        }
+        Some(BotDevIdent { port: s.port_id, route: s.route_string, vid: s.vid, pid: s.pid })
+    }
+
+    /// The park gate, consulted before any transfer is built. Two refusals, both up front and both
+    /// free:
+    ///   * PARKED — this identity has spent its whole account. It gets nothing: no CBW, no pump, no
+    ///     rung. This is the guarantee the arc exists for, and unlike `bot_surrendered_slot` it
+    ///     survives the device being handed a different slot id.
+    ///   * BACKING OFF — this identity's next ladder entry is not due yet. Declining here is what
+    ///     makes the back-off cooperative: the caller returns to the main loop, the frame paints,
+    ///     and the retry happens on a later pass instead of inside a `settle_ms` spin.
+    fn bot_park_gate(&mut self, slot_id: u8) -> Result<(), BotError> {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return Ok(()) };
+        let idx = match bot_park_find(&self.bot_park, id) { Some(i) => i, None => return Ok(()) };
+        if self.bot_park[idx].parked {
+            BOT_PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Err(BotError::NoDevice);
+        }
+        // BOUNDED WORK PER PASS. Reached only for an identity that already has an account, so a
+        // device nothing has gone wrong with never tests this. The wait this declines is the SECOND
+        // (or fourth) multi-second wait of one main-loop pass — the composition the boot3
+        // per-pass measurement caught at 1.0-2.0 BILLION cycles while the same log's normal pass
+        // cost 119-134. Nothing in flight is truncated; the pass simply does not begin another one.
+        if self.bot_pass_exhausted(slot_id) {
+            BOT_PARK_PASS_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Err(BotError::NoDevice);
+        }
+        let until = self.bot_park[idx].backoff_until;
+        if until != 0 {
+            if crate::arch::now_cycles().wrapping_sub(until) as i64 >= 0 {
+                self.bot_park[idx].backoff_until = 0;
+            } else {
+                BOT_PARK_BACKOFF_REFUSED.fetch_add(1, Ordering::Relaxed);
+                return Err(BotError::NoDevice);
+            }
+        }
+        Ok(())
+    }
+
+    /// Has this main-loop pass already spent `BOT_PARK_PASS_MS` on this identity?
+    ///
+    /// True only for an identity that HAS an account — i.e. one something has already gone wrong
+    /// with. A healthy device is never subject to the bound, which is what lets the bound be tight
+    /// enough to matter: the boot3 capture's entire healthy BOT time was ~5 s (`sum=304556240`),
+    /// half of this, while its four pathological PASSES cost 20-37 s each.
+    ///
+    /// Consulted at every point where a further multi-second wait would be STARTED — the park gate,
+    /// the post-recovery retry, and each rung's retry — because those are the composition, not any
+    /// single wait, that the measurement convicted.
+    fn bot_pass_exhausted(&self, slot_id: u8) -> bool {
+        if self.bot_pass_start == 0 {
+            return false;
+        }
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return false };
+        if bot_park_find(&self.bot_park, id).is_none() {
+            return false;
+        }
+        let spent = crate::arch::now_cycles().wrapping_sub(self.bot_pass_start);
+        spent >= Self::cycles_per_ms().max(1).saturating_mul(BOT_PARK_PASS_MS)
+    }
+
+    /// Charge one pump wait to a slot's identity. `dead` = the wait ended in a timeout with a
+    /// PROVABLY idle ring (the [piusb40] necropsy signature); it drives the budget cap, and any
+    /// wait that is not dead clears the streak.
+    ///
+    /// Opens no account on the happy path: a device with no history is charged only once it has a
+    /// ledger entry, so a healthy boot pays one 4-entry scan of `used` flags per stage and nothing
+    /// else.
+    fn bot_park_charge(&mut self, slot_id: u8, used: u64, dead: bool) {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        let idx = if dead {
+            match bot_park_open(&mut self.bot_park, id) { Some(i) => i, None => return }
+        } else {
+            match bot_park_find(&self.bot_park, id) { Some(i) => i, None => return }
+        };
+        self.bot_park[idx].cycles = self.bot_park[idx].cycles.saturating_add(used);
+        if dead {
+            self.bot_park[idx].dead_streak = self.bot_park[idx].dead_streak.saturating_add(1);
+        } else {
+            self.bot_park[idx].dead_streak = 0;
+        }
+    }
+
+    /// The dead-ring budget cap for a slot, or `None` when the identity has not earned one. Applied
+    /// as a `min` against the scaled budget, so it can only ever SHORTEN a wait — a healthy device
+    /// never reaches the streak and never sees this number.
+    fn bot_park_budget_cap(&self, slot_id: u8) -> Option<u64> {
+        let id = self.bot_ident(slot_id)?;
+        let idx = bot_park_find(&self.bot_park, id)?;
+        if self.bot_park[idx].dead_streak >= BOT_PARK_DEAD_STREAK {
+            Some((crate::arch::hw_wait_budget() / BOT_PARK_DEAD_DIV).max(1))
+        } else {
+            None
+        }
+    }
+
+    /// Charge one ladder entry and return the park verdict, arming the escalating back-off for the
+    /// next entry either way. `Some(why)` = this identity is done.
+    fn bot_park_note_ladder(&mut self, slot_id: u8) -> Option<&'static str> {
+        let id = self.bot_ident(slot_id)?;
+        let idx = bot_park_open(&mut self.bot_park, id)?;
+        let per_ms = Self::cycles_per_ms().max(1);
+        self.bot_park[idx].ladders = self.bot_park[idx].ladders.saturating_add(1);
+        let back = self.bot_park[idx].backoff_cycles(per_ms);
+        self.bot_park[idx].backoff_until = crate::arch::now_cycles().wrapping_add(back);
+        self.bot_park[idx].verdict(per_ms)
+    }
+
+    /// Charge one surrender. Separate from the ladder charge because a surrender is the ladder's
+    /// own verdict on a whole generation, and two of them across a cold re-enumeration is the
+    /// signature the metal cycle is made of.
+    fn bot_park_note_surrender(&mut self, slot_id: u8) {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        if let Some(idx) = bot_park_open(&mut self.bot_park, id) {
+            self.bot_park[idx].surrenders = self.bot_park[idx].surrenders.saturating_add(1);
+        }
+    }
+
+    /// Note a fresh enumeration of an identity. It does NOT reset the account and it does NOT
+    /// unpark: a re-enumeration is what the wedge produces, not what cures it. It only counts, so
+    /// the census can say how many times the same reader came back.
+    fn bot_park_note_gen(&mut self, slot_id: u8) {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        if let Some(idx) = bot_park_find(&self.bot_park, id) {
+            self.bot_park[idx].gens = self.bot_park[idx].gens.saturating_add(1);
+        }
+    }
+
+    /// A slot bound to a device has been disposed. Two things happen here, and they are the two
+    /// halves of "a disconnect must end a ladder":
+    ///
+    ///   1. TEARDOWN. If the ladder is currently walking THIS slot, latch the abort so it stops
+    ///      between rungs instead of driving resets, port cycles and retries at a device that has
+    ///      physically left. Before this arc a mid-ladder disconnect ran `bot_rescue_clear`, which
+    ///      reset `bot_fail_streak` and `bot_rescue_stage` — both driver-global, not per-slot — so
+    ///      the in-flight ladder did not merely survive the unplug, it got its allowance BACK.
+    ///
+    ///   2. THE UNPARK RULE. A disconnect this driver did not cause is an operator event: the
+    ///      device was pulled, and whatever comes back deserves a clean slate, so the account is
+    ///      closed. A disconnect inside the window `rescue_port_cycle`/`rescue_hub_port_cycle`
+    ///      armed on this route is OUR OWN act — the cure — and closing the account there is
+    ///      precisely the hole the metal capture fell through. The park therefore survives every
+    ///      re-enumeration the ladder itself causes, and only a real replug clears it.
+    fn bot_park_note_disconnect(&mut self, slot_id: u8) {
+        if self.bot_ladder_slot != 0 && self.bot_ladder_slot == slot_id {
+            self.bot_ladder_abort = true;
+            BOT_PARK_ABORTS.fetch_add(1, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: park ladder-abort slot={} — the slot under the running rescue ladder was disposed; no further rungs, retries or transfers on it ::",
+                slot_id);
+        }
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        let now = crate::arch::now_cycles();
+        let ours = self.bot_self_cycle_until != 0
+            && (now.wrapping_sub(self.bot_self_cycle_until) as i64) < 0
+            && self.bot_self_cycle_port == id.port
+            && self.bot_self_cycle_route == id.route;
+        if ours {
+            serial_println!(
+                ":: BOT: park keep slot={} port={} route={:#x} vid={:04x} pid={:04x} — disconnect attributed to THIS DRIVER'S OWN port cycle; the ledger is NOT cleared ::",
+                slot_id, id.port, id.route, id.vid, id.pid);
+            return;
+        }
+        if bot_park_forget(&mut self.bot_park, id) {
+            serial_println!(
+                ":: BOT: park clear slot={} port={} route={:#x} vid={:04x} pid={:04x} — operator disconnect (outside any self-cycle window); ledger closed, a replug is a clean slate ::",
+                slot_id, id.port, id.route, id.vid, id.pid);
+        }
+    }
+
+    /// Arm the self-cycle attribution window. Called by both power-cycle rungs with the route they
+    /// just cut power to. The window covers the off dwell, the on settle and a full second of
+    /// re-enumeration slack — long enough that the disconnect and reconnect the rung causes both
+    /// land inside it, short enough that an operator replug seconds later does not.
+    fn bot_park_arm_self_cycle(&mut self, port: u8, route: u32) {
+        let per_ms = Self::cycles_per_ms().max(1);
+        let ms = BOT_RESCUE_PORT_OFF_MS + BOT_RESCUE_PORT_ON_MS + 1_000;
+        self.bot_self_cycle_until = crate::arch::now_cycles()
+            .wrapping_add(per_ms.saturating_mul(ms));
+        self.bot_self_cycle_port = port;
+        self.bot_self_cycle_route = route;
+    }
+
+    /// THE census line. One per parked device, naming the identity, the clause that fired, and what
+    /// the ladder spent getting there — so the next metal wedge diagnoses itself off the log instead
+    /// of off a reconstruction. `cycles=`/`ms=` is the number the 2026-08-17 sitting had to measure
+    /// by watching a core sit at 99%.
+    fn bot_park_device(&mut self, slot_id: u8, why: &'static str, cause: BotError) {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        let idx = match bot_park_open(&mut self.bot_park, id) { Some(i) => i, None => return };
+        if self.bot_park[idx].parked {
+            return; // one verdict line per device, not one per caller
+        }
+        self.bot_park[idx].parked = true;
+        BOT_PARK_COUNT.fetch_add(1, Ordering::Relaxed);
+        let e = self.bot_park[idx];
+        let per_ms = Self::cycles_per_ms().max(1);
+        serial_println!(
+            ":: BOT: PARKED slot={} port={} route={:#x} vid={:04x} pid={:04x} why={} cause={:?} ladders={}/{} surrenders={}/{} gens={} cycles={} ms={} max_ms={} dead_streak={} refused={} capped={} yields={} parked_total={} — device account CLOSED: no transfer, no bring-up and no rescue rung on this identity until it is physically replugged (a re-enumeration this driver causes does NOT unpark it) ::",
+            slot_id, id.port, id.route, id.vid, id.pid, why, cause,
+            e.ladders, BOT_PARK_LADDER_MAX, e.surrenders, BOT_PARK_SURRENDER_MAX, e.gens,
+            e.cycles, e.cycles / per_ms, BOT_PARK_CYCLE_MAX_MS, e.dead_streak,
+            BOT_PARK_REFUSED.load(Ordering::Relaxed)
+                + BOT_PARK_PASS_REFUSED.load(Ordering::Relaxed),
+            BOT_PARK_CAPPED.load(Ordering::Relaxed),
+            BOT_PARK_YIELDS.load(Ordering::Relaxed),
+            BOT_PARK_COUNT.load(Ordering::Relaxed));
+    }
+
+    /// The ledger's boot rollup, on its own line so every pre-existing BOT line stays byte-
+    /// comparable with captures taken before this arc. Prints even when empty: "no device ever
+    /// opened an account" is a finding, and an absent line would be indistinguishable from an
+    /// absent instrument.
+    fn bot_park_census(&self) {
+        let per_ms = Self::cycles_per_ms().max(1);
+        let mut n = 0usize;
+        for e in self.bot_park.iter().filter(|e| e.used) {
+            n += 1;
+            serial_println!(
+                ":: BOT: park census port={} route={:#x} vid={:04x} pid={:04x} parked={} ladders={} surrenders={} gens={} cycles={} ms={} dead_streak={} result=CENSUS ::",
+                e.ident.port, e.ident.route, e.ident.vid, e.ident.pid,
+                if e.parked { "yes" } else { "no" },
+                e.ladders, e.surrenders, e.gens, e.cycles, e.cycles / per_ms, e.dead_streak);
+        }
+        serial_println!(
+            ":: BOT: park rollup accounts={} parked={} refused={} backoff_refused={} pass_refused={} aborts={} capped={} yields={} ladder_max={} surrender_max={} cycle_max_ms={} pass_ms={} result=CENSUS ::",
+            n, BOT_PARK_COUNT.load(Ordering::Relaxed),
+            BOT_PARK_REFUSED.load(Ordering::Relaxed),
+            BOT_PARK_BACKOFF_REFUSED.load(Ordering::Relaxed),
+            BOT_PARK_PASS_REFUSED.load(Ordering::Relaxed),
+            BOT_PARK_ABORTS.load(Ordering::Relaxed),
+            BOT_PARK_CAPPED.load(Ordering::Relaxed),
+            BOT_PARK_YIELDS.load(Ordering::Relaxed),
+            BOT_PARK_LADDER_MAX, BOT_PARK_SURRENDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_PASS_MS);
+    }
+
     fn bot_surrender(&mut self, slot_id: u8, cause: BotError, ladder_gen: u64) {
         if self.bot_surrendered_slot == slot_id {
             return; // already surrendered; one verdict line per disk, not one per caller
         }
         BOT_RESCUE_SURRENDER.fetch_add(1, Ordering::Relaxed);
+        // BOT-PARK: charge the surrender to the DEVICE before it is bound to a slot id. A second
+        // surrender on one identity — necessarily across a cold re-enumeration, since that is what
+        // the ladder's last rung causes — is the metal cycle's signature and parks it below.
+        self.bot_park_note_surrender(slot_id);
         self.bot_surrendered_slot = slot_id;
         let retracted = crate::drivers::block::unpublish_usb_geometry(slot_id, ladder_gen);
         if self.storage_slot == slot_id {
@@ -9158,6 +9805,22 @@ impl XhciController {
             BOT_RESCUE_RESET_DEVICE.load(Ordering::Relaxed),
             BOT_RESCUE_PORT_CYCLE.load(Ordering::Relaxed),
             if retracted { "yes" } else { "no-registry-entry" });
+        // BOT-PARK: take the verdict HERE too, not only at the next ladder entry. The whole reason
+        // the surrender was insufficient on metal is that the ladder's last rung re-enumerates the
+        // device, so "the next ladder entry" arrives on a DIFFERENT slot id with a clean per-slot
+        // state — the account is the only thing that remembers, and it must be able to close the
+        // door on the way out rather than one generation later.
+        if let Some(why) = self.bot_park_verdict(slot_id) {
+            self.bot_park_device(slot_id, why, cause);
+        }
+    }
+
+    /// The park verdict for a slot's identity, without charging anything. `None` when the identity
+    /// has no account or the account is still open.
+    fn bot_park_verdict(&self, slot_id: u8) -> Option<&'static str> {
+        let id = self.bot_ident(slot_id)?;
+        let idx = bot_park_find(&self.bot_park, id)?;
+        self.bot_park[idx].verdict(Self::cycles_per_ms().max(1))
     }
 
     /// BOT-RESCUE: clear a slot's escalation state — called when a transaction COMPLETES (the
@@ -9187,6 +9850,25 @@ impl XhciController {
     fn bot_rescue_retry(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32,
         dir: Direction, rung: &'static str) -> Option<Result<BotResult, BotError>>
     {
+        // BOT-PARK: a rung's retry is still a transfer. If the slot went away while the rung was
+        // driving hardware (a port cycle raises a disconnect BY DESIGN), do not put a CBW on a dead
+        // pipe and do not pay another pump budget for it.
+        if self.bot_ladder_abort {
+            serial_println!(
+                ":: BOT: park retry-refused rung={} slot={} — slot disposed mid-ladder; the retry is not issued ::",
+                rung, slot_id);
+            return Some(Err(BotError::NoDevice));
+        }
+        // BOT-PARK: same bound at the rung's own retry. A ladder chains several waits — first
+        // attempt, post-recovery retry, then one per rung — and it is that COMPOSITION the boot3
+        // per-pass measurement caught at 1.0-2.0 billion cycles, not any one wait.
+        if self.bot_pass_exhausted(slot_id) {
+            BOT_PARK_PASS_REFUSED.fetch_add(1, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: park pass-refused slot={} what=rung-retry rung={} pass_ms={} — the rung ran; its retry waits for a later main-loop pass ::",
+                slot_id, rung, BOT_PARK_PASS_MS);
+            return None;
+        }
         self.bot_budget_scale = BOT_BUDGET_SCALE_ESCALATION;
         let r = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         self.bot_budget_scale = BOT_BUDGET_SCALE_FIRST;
@@ -9223,6 +9905,36 @@ impl XhciController {
         // the fresh bring-up PUBLISHES mid-ladder). The surrender at the ladder's end may only
         // retract the publish generation the ladder was earned against — captured HERE, at entry.
         let ladder_gen = crate::drivers::block::usb_publish_gen();
+        // BOT-PARK (1/3): the ladder now has an owner, so a disconnect can tear it down. Latched
+        // here and released on every exit below.
+        self.bot_ladder_slot = slot_id;
+        self.bot_ladder_abort = false;
+        // BOT-PARK (2/3): charge the entry against the DEVICE and take the global verdict BEFORE
+        // any rung runs. Reached only on a failed recovery+retry, so a healthy device never gets
+        // here at all — but a device that keeps arriving here has now spent something it cannot
+        // earn back by being re-enumerated, and when the account is empty the rungs are SKIPPED.
+        // Skipping them is the point: rung (b)/(b') is a port power cycle, and the power cycle is
+        // what re-enumerated the wedged reader into a fresh slot id and a fresh allowance on metal.
+        if let Some(why) = self.bot_park_note_ladder(slot_id) {
+            self.bot_park_device(slot_id, why, cause);
+            self.bot_surrender(slot_id, cause, ladder_gen);
+            self.bot_ladder_slot = 0;
+            return Err(cause);
+        }
+        // BOT-PARK (3/3): bounded work per main-loop pass. The pump is scheduled cooperatively —
+        // `main.rs`'s desktop loop calls `service_storage`, and the block layer's reads run from the
+        // same loop — so yielding means returning to the caller and letting the frame paint. One
+        // ladder per pass, with the escalating back-off armed above deciding when the next pass may
+        // charge another. The wait is therefore paid in rendered frames, not in `settle_ms` spin.
+        self.bot_pass_ladders = self.bot_pass_ladders.saturating_add(1);
+        if self.bot_pass_ladders > BOT_PARK_PASS_LADDERS {
+            BOT_PARK_YIELDS.fetch_add(1, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: park yield slot={} cause={:?} pass_ladders={} max={} — ladder deferred to a later main-loop pass; the core goes back to the desktop ::",
+                slot_id, cause, self.bot_pass_ladders, BOT_PARK_PASS_LADDERS);
+            self.bot_ladder_slot = 0;
+            return Err(cause);
+        }
         self.bot_fail_streak = self.bot_fail_streak.saturating_add(1);
         let streak = self.bot_fail_streak;
         // Exponential back-off: a device wedged mid-internal-stall is made worse by being hammered.
@@ -9234,7 +9946,15 @@ impl XhciController {
         if streak < BOT_RESCUE_N_CONSEC {
             // Not yet enough evidence that the fault is permanent: report the failure as the
             // pre-arc code did, and let the caller decide whether to come back.
+            self.bot_ladder_slot = 0;
             return Err(cause);
+        }
+        // BOT-PARK: the settle above drained the event ring, so a disconnect raised during it has
+        // been seen by now. If it took this ladder's slot with it, stop here — every rung below
+        // drives hardware at a device that is gone.
+        if self.bot_ladder_abort {
+            self.bot_ladder_slot = 0;
+            return Err(BotError::NoDevice);
         }
 
         // (a) Ring rebase — ONSET-2 (M1a) replaced Reset Device + Configure Endpoint here; see
@@ -9243,10 +9963,15 @@ impl XhciController {
             self.bot_rescue_stage = 1;
             if self.rescue_ring_rebase(slot_id) {
                 if let Some(r) = self.bot_rescue_retry(slot_id, cdb, data_phys, data_len, dir, "ring-rebase") {
+                    self.bot_ladder_slot = 0;
                     return r;
                 }
             }
             self.settle_ms(backoff);
+            if self.bot_ladder_abort {
+                self.bot_ladder_slot = 0;
+                return Err(BotError::NoDevice);
+            }
         }
 
         // (b) Port power-cycle + (delegated) re-enumeration.
@@ -9254,6 +9979,7 @@ impl XhciController {
             self.bot_rescue_stage = 2;
             if self.rescue_port_cycle(slot_id) {
                 if let Some(r) = self.bot_rescue_retry(slot_id, cdb, data_phys, data_len, dir, "port-cycle") {
+                    self.bot_ladder_slot = 0;
                     return r;
                 }
             }
@@ -9261,6 +9987,7 @@ impl XhciController {
 
         // (c) Surrender.
         self.bot_surrender(slot_id, cause, ladder_gen);
+        self.bot_ladder_slot = 0;
         Err(cause)
     }
 
@@ -9328,6 +10055,20 @@ impl XhciController {
         // `BOT_BUDGET_SCALE_ESCALATION` and restores it immediately after. A healthy device never
         // reaches an escalation retry, so it never sees anything but the historical budget.
         let budget = crate::arch::hw_wait_budget().saturating_mul(self.bot_budget_scale);
+        // BOT-PARK: bounded work per pass. A device whose ring the [piusb40] necropsy has twice
+        // found PROVABLY idle across a whole wait — no events, no foreign events, no doorbells,
+        // IRQ_COUNT flat — has demonstrated that the remaining seconds of this budget buy no
+        // information; they only hold the core. `min`, never `max`: this can shorten a wait and can
+        // never lengthen one, and a device that has not earned the streak never sees it.
+        let budget = match self.bot_pending.as_ref().map(|p| p.slot_id)
+            .and_then(|s| self.bot_park_budget_cap(s))
+        {
+            Some(cap) if cap < budget => {
+                BOT_PARK_CAPPED.fetch_add(1, Ordering::Relaxed);
+                cap
+            }
+            _ => budget,
+        };
         BOT_PUMP_BUDGET.store(budget, Ordering::Relaxed);
         // IVY: snapshot the waiting slot's topology up front, so the witness (and any timeout line)
         // says whether this transfer rode a root port or a hub route — the one fact the 2026-07-17
@@ -9358,6 +10099,11 @@ impl XhciController {
             match &self.bot_pending {
                 Some(p) if p.done => {
                     Self::note_bot_pump(start, budget, route, depth, slot);
+                    // BOT-PARK: charge the wait to the device and clear its dead-ring streak — a
+                    // completion is proof the ring is alive. Opens no account: a device with no
+                    // history is not given one for succeeding.
+                    let used = crate::arch::now_cycles().wrapping_sub(start);
+                    self.bot_park_charge(slot, used, false);
                     return Ok(());
                 }
                 None => {
@@ -9458,6 +10204,20 @@ impl XhciController {
                 // pending still has an event ring worth reading, and that combination is itself
                 // one of the patterns the verdict clauses distinguish.
                 self.bot_event_necropsy();
+                // BOT-PARK: charge the exhausted budget to the DEVICE, and classify the wait. A
+                // wait is "dead" only when NOTHING moved anywhere for its whole duration — no event
+                // drained here, no foreign event for any other slot, and no doorbell rung. That
+                // conjunction is the [piusb40] necropsy signature and nothing weaker: a boot with a
+                // live FTDI console produces foreign events continuously, so a device on a working
+                // controller cannot accidentally look dead.
+                {
+                    let foreign_d = BOT_FOREIGN_EVENTS.load(Ordering::Relaxed)
+                        .wrapping_sub(foreign_at_entry);
+                    let db_d = BOT_DB_IN.load(Ordering::Relaxed).wrapping_sub(db_in_at_entry)
+                        | BOT_DB_OUT.load(Ordering::Relaxed).wrapping_sub(db_out_at_entry);
+                    let dead = evts == 0 && foreign_d == 0 && db_d == 0;
+                    self.bot_park_charge(slot, elapsed, dead);
+                }
                 return Err(BotError::Timeout);
             }
         }
@@ -9702,6 +10462,22 @@ impl XhciController {
     fn bring_up_storage(&mut self) -> Result<(), BotError> {
         let slot = self.storage_slot;
         if slot == 0 { return Err(BotError::NoDevice); }
+        // BOT-PARK: the gate that closes the metal cycle. Everything below this line — the fresh
+        // clean slate, the two-strike allowance, the whole bring-up chain — is what a parked device
+        // used to get back simply by being re-enumerated by the ladder's own port-cycle rung. The
+        // account is keyed by the device, not the slot, so the reader that came back as slot 5 and
+        // then again as slot 2 is refused here, once, in constant time.
+        self.bot_park_note_gen(slot);
+        if let Err(e) = self.bot_park_gate(slot) {
+            let id = self.bot_ident(slot);
+            serial_println!(
+                ":: BOT: park refuse-bringup slot={} port={} route={:#x} vid={:04x} pid={:04x} — this device is PARKED; the SCSI bring-up is not run and nothing is published ::",
+                slot,
+                id.map(|i| i.port).unwrap_or(0), id.map(|i| i.route).unwrap_or(0),
+                id.map(|i| i.vid).unwrap_or(0), id.map(|i| i.pid).unwrap_or(0));
+            self.storage_note = "storage device PARKED (BOT retry budget exhausted)";
+            return Err(e);
+        }
         // BOT-RESCUE: a freshly enumerated disk inherits no escalation state, even if the
         // controller handed it a slot id a surrendered disk once held.
         self.bot_rescue_clear(slot);
@@ -10047,6 +10823,11 @@ impl XhciController {
         if self.enum_active || !self.ports_to_enumerate.is_empty() { return; }
         self.storage_pending_bringup = false;
         if self.storage_slot == 0 { return; }
+        // BOT-PARK: a new main-loop pass. This is the cooperative half of the retry discipline —
+        // `BOT_PARK_PASS_LADDERS` bounds what one pass may spend, and the counter is what makes
+        // "one pass" mean anything. Reset here, at the single place the desktop loop hands the
+        // driver its synchronous BOT time.
+        self.bot_pass_ladders = 0;
 
         // SPACE: close `wait` — the ladder gap between this bring-up being ARMED (at the
         // Configure-Endpoint completion, inside `poll_events`) and this body being reached. It is
@@ -11571,6 +12352,12 @@ impl XhciController {
             // have every transfer refused up front, and the id would go on reading as "surrendered"
             // to the rescue ladder's liveness tests. The surrender binds to the disk that earned
             // it, not to a number.
+            //
+            // BOT-PARK: the hub-subtree twin of the root-port teardown's call — ladder teardown and
+            // the unpark rule, before `bot_rescue_clear` flattens the global streak/stage. This is
+            // the path the [pi0-b1b2] capture actually took (the reader hung off hub slot 1 port 1),
+            // so it is the one the fix must reach.
+            self.bot_park_note_disconnect(i as u8);
             self.bot_rescue_clear(i as u8);
             if self.configuring_slot == i as u8 { self.configuring_slot = 0; }
             if self.ftdi_configuring_slot == i as u8 { self.ftdi_configuring_slot = 0; }

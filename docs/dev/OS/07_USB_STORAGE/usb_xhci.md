@@ -6992,6 +6992,114 @@ existing `bt_l3_await`, whose `armed` threading is what preserves the invariant 
 
 ---
 
+## 27. BOT-PARK — the retry ladder had no floor a slot id could not walk around (2026-08-17)
+
+### The capture
+
+`~/unaos-bench/scratch/pi0-b1b2/boot3-inputdeath-tail.txt`, Pi 4 metal. A `Generic USB SD Reader`
+(058f:6362) behind hub slot 1 port 1 wedged at the transport level — CBW out, `IRQ_COUNT=0`, event
+ring provably empty per the [piusb40] necropsy. Read the tail as a **cycle**, not as a list of
+failures:
+
+```
+:: BOT: SURRENDER slot=2 … retracted=yes          <- the per-slot floor DID fire, as designed
+xHCI: HUB slot 1 port 1 disconnect: slot 2 …      <- the ladder's OWN hub-port power-cycle rung (b')
+:: PIUSB: [piusb25] storage enumerated: slot 5 …  <- the same reader, re-enumerated, NEW slot id
+:: BOT: SURRENDER slot=5 …                        <- a whole fresh ladder allowance, spent
+:: PIUSB: [piusb25] storage enumerated: slot 2 …  <- and back again. Forever.
+```
+
+Nothing in the ladder was wrong. Every rung did what §17's arcs built it to do. What was missing is
+a verdict that **outlives a slot id**:
+
+* `bot_surrendered_slot` is one `u8`. It binds the floor to a number the controller recycles, so a
+  device whose prescribed cure is a cold re-enumeration escapes its own surrender **by being
+  re-enumerated by that very cure**.
+* Because the field holds exactly one slot, parking a second device releases the first. Slot 5's
+  surrender is literally what put slot 2 back on the wire.
+* `bot_fail_streak` and `bot_rescue_stage` are driver-global, and the disconnect path called
+  `bot_rescue_clear` on them. A disconnect raised *while a ladder was mid-flight* therefore did not
+  end that ladder — it handed it its allowance back.
+
+Measured cost: a core at 99% for the whole sitting, `timeouts=` still climbing when the device was
+pulled, at ~8.3 s of pump budget (`hw_wait_budget() * BOT_BUDGET_SCALE_FIRST`) per attempt.
+
+### The fix: an account keyed to the device, not the slot
+
+`BotDevLedger`, keyed by `BotDevIdent { root port, route string, VID, PID }` — every field of which
+a re-enumeration reproduces exactly, and none of which is a slot id. Four entries; the per-slot
+surrender is untouched underneath it. Four mechanisms, in the order they bite:
+
+1. **Escalating back-off between ladder entries**, doubling `BOT_PARK_BACKOFF_MS` (100 ms) to
+   `BOT_PARK_BACKOFF_MAX_MS` (4 s). It is **not spun**: it is a deadline `bot_park_gate` tests and
+   declines, so the wait is paid in main-loop passes that render frames. (The in-ladder
+   `BOT_RESCUE_BACKOFF_MS` settle between *rungs* is metal-earned and unchanged.)
+2. **A bounded total retry budget per device**: `BOT_PARK_LADDER_MAX` (6 ladder entries),
+   `BOT_PARK_SURRENDER_MAX` (2 surrenders), `BOT_PARK_CYCLE_MAX_MS` (45 s of pump wall clock).
+   Whichever fires first PARKS the identity, and the park **skips the remaining rungs** — rung (b)/
+   (b') is the port power cycle, i.e. the act that re-enumerated the device into a fresh allowance.
+3. **Bounded work per pass, and a dead-ring budget cap.** Three bounds, because the core-eater is a
+   *composition* of waits, not any single one — the boot3 per-pass measurement at the four c3=99%
+   windows read 1,498,784,103 / 1,972,189,353 / 1,060,628,143 / 1,348,032,519 cycles against a
+   normal pass of 119-134, i.e. 20-37 s inside one pass:
+   * `BOT_PARK_PASS_LADDERS` (1) yields to the desktop loop after one ladder;
+   * `BOT_PARK_PASS_MS` (10 s) refuses to *start* another wait in a pass that has already spent it —
+     checked at the park gate, at the post-recovery retry and at each rung's retry, which are the
+     three places a ladder chains a further multi-second wait. It never truncates a wait in flight
+     and never touches `hw_wait_budget()`, and it applies only to an identity that already has an
+     account (a healthy boot's *entire* BOT time is ~5 s, half this bound);
+   * `BOT_PARK_DEAD_STREAK` (2) consecutive timeouts with a *provably idle* ring (no events, no
+     foreign events, no doorbells — the [piusb40] signature) cut this device's pump budget by
+     `BOT_PARK_DEAD_DIV` (8), so the steady state after a proven wedge is ~350 ms per attempt rather
+     than ~8.3 s. Applied with `min`: it can only shorten a wait, and a healthy device never earns
+     it.
+4. **Guaranteed teardown on disconnect, and the unpark rule.** `bot_park_note_disconnect` runs
+   *before* `bot_rescue_clear` on both disposal paths. If the disposed slot is the one under the
+   running ladder it latches `bot_ladder_abort`, which the ladder checks between rungs and before
+   every retry. The account is closed **only** for a disconnect this driver did not itself cause:
+   both power-cycle rungs arm a self-cycle attribution window (`bot_park_arm_self_cycle`), and a
+   disconnect inside it on the same route is the driver's own cure, not an operator replug.
+
+### Witnesses
+
+* `:: BOT: PARKED slot=… port=… route=… vid=… pid=… why=… ladders=…/… surrenders=…/… gens=…
+  cycles=… ms=… dead_streak=… ::` — one per parked device, naming the clause that fired and the
+  total cycles spent. This is the line that makes the next metal wedge self-diagnosing.
+* `:: BOT: park census … result=CENSUS ::` / `park rollup accounts=… parked=… refused=…
+  backoff_refused=… aborts=… capped=… yields=… ::` — printed beside the BOT SUMMARY. Every
+  pre-existing BOT line keeps its bytes; the ledger speaks on its own lines.
+* `park ladder-abort`, `park retry-refused`, `park yield`, `park keep`, `park clear`,
+  `park refuse-bringup` — one line per event, each naming why.
+
+**Clean boot reads `accounts=0 parked=0 refused=0 backoff_refused=0 aborts=0 capped=0 yields=0`**
+(measured, `test-arm`, storage ready, `timeouts=0`), so any non-zero reading is itself the finding.
+
+### Fixtures
+
+QEMU models no wedge — `usb-storage` always answers — so a fixture that needed the real fault would
+be permanently vacuous. Two things exist instead:
+
+* `bot_park_selftest()` (`:: BOT-PARK: selftest … -> PASS ::`, REQUIRE + FORBID in
+  `pi4-regression.spec`) exercises the discipline's arithmetic **and its keying** on every boot of
+  both arches, with no controller — so it holds on a `skip_xhci` capture, which every pi4 regression
+  capture is. Assertion `reenum=` is exactly the property the metal cycle violated: the same
+  identity arriving on a different slot id must find the same, still-parked, account. Assertion
+  `pressure=` forbids an eviction policy that could drop a parked device to make room.
+* `UNAOS_BOTWEDGE=1` (feature `botwedge`, default OFF, **test only**) injects a synthetic transport
+  wedge on the storage slot after its first 24 transactions — `Timeout` with nothing put on the
+  wire, the shape of the metal fault. Measured on `test-arm`: the wedge arms, one ladder is charged,
+  and the escalating back-off then declines 15 further attempts (`backoff_refused=15`) instead of
+  paying a pump budget for any of them. It makes storage unusable by design, so every fixture
+  downstream of a mounted disk fails on such a run — never enable it on media.
+
+### Owed on metal
+
+The park verdict itself (`:: BOT: PARKED … why=cycles ::` on a real wedge, and the core coming back
+to the desktop) is metal-owed: reproducing it needs the wedging reader from the `pi0-b1b2` sitting,
+which is the only known instance of the fault.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).

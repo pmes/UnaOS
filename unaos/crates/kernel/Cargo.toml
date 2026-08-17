@@ -297,6 +297,18 @@ botfaultinject = []
 # METAL EXPERIMENT ONLY. Default OFF => BOT_RING_TRBS is 16 and the artifact is byte-identical.
 # Enable via `UNAOS_BOTRING64=1`.
 botring64 = []
+# BOT-PARK test hook: a synthetic TRANSPORT WEDGE. After the storage device has completed
+# `BOT_WEDGE_AFTER` transactions, every subsequent BOT attempt on that slot returns `Timeout`
+# WITHOUT putting anything on the wire — the exact shape of the [pi0-b1b2] metal wedge, where the
+# CBW went out, IRQ_COUNT stayed 0 and the event ring was provably empty. It exists because QEMU's
+# `usb-storage` cannot wedge: it always answers, so the retry ladder's global floor (escalating
+# back-off, the per-device retry budget, the park) has no other way to be walked end-to-end outside
+# an attended metal sitting. With it, a QEMU boot reaches `:: BOT: PARKED … ::` and stops, which is
+# the whole claim of the arc.
+# ATTENDED/TEST ONLY: never enable on boot media — it makes storage permanently unusable by design.
+# Default OFF => fully cfg-compiled out and the artifact is byte-identical. Enable via
+# `UNAOS_BOTWEDGE=1`.
+botwedge = []
 # (`botcbwioc` lived here. DELETED 2026-07-30: awaiting the CBW as its own stage is now
 # unconditional — see usb_xhci.md §17 and the BOT-CBW block in drivers/xhci/mod.rs. It graduated
 # from experiment to fix on a two-boot metal A/B and there is deliberately no feature left that
