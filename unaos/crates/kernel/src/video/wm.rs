@@ -1607,7 +1607,16 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // paint needs. The barrier stays, with the argument restated rather than inherited — a phase
         // barrier whose justification has quietly stopped matching the code is worse than no barrier,
         // because the next reader will trust it.
-        let barrier = DrainBarrier::drain();
+        //
+        // DRAGWEDGE — and the bound this raise waits against is the INTERACTIVE one. This is the
+        // barrier the hand drives: it is raised once per admitted drag motion, on the task that also
+        // consumes the input channel, and PA41 measured what the teardown bound costs there — several
+        // seconds per report, re-entered on the next one, with the button-up that would have ended
+        // the gesture queued behind the very spin it was waiting to stop. What the barrier BUYS is
+        // unchanged and is bought in full whenever the compositor is healthy; what changed is how
+        // long it is willing to wait for a compositor that is not, and the abandon arm below already
+        // priced that trade. See the DRAGWEDGE ledger above `DRAIN_MOVE_SPINS`.
+        let barrier = DrainBarrier::drain_bounded(DRAIN_MOVE_SPINS, true);
         // DRAGFLICK — **ERASE THE VACATED BOX MINUS THE BOX THE WINDOW NOW OCCUPIES.**
         //
         // ### The defect this closes (Peter, Boot AR, attended: "window drag still flickering a lot")
@@ -7311,6 +7320,125 @@ static DRAIN_ABANDONED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 static DRAIN_ABANDON_REPORTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+// ---- DRAGWEDGE (PA41 metal, boots 1 and 2) — THE INTERACTIVE BOUND -------------------------------
+//
+// **The defect, from the wire and not from a hypothesis.** Two attended freezes on the PA41 image
+// (`hw-pi4@14e54538`), one dragging the console window and one dragging an app window, produced the
+// same token sequence and the same ledger:
+//
+//   boot 2:  `<F4><F5><F6><F7><F8>` `[wm-act] drag-begin win=4 owner=0x1 -> grabbed` `<D2><D!><D?><D3><D2>`
+//            `:: [wedge1] DRAIN STALLED core=3 blit_active=1 pending=1 spins=134217728 ::`
+//            `:: [wedge1] DRAIN ABANDONED core=3 blit_active=1 pending=1 spins=1073741824 ::`
+//            `[wcn] rollup ... passes=0 aborted=37 -> STARVED`, `[comp2] blit_us=0 present_us=0`
+//   boot 1:  `<D2><D?><D3>` REPEATING with nothing else on the wire, `[click2] depth gui_chan=65
+//            (sent=794 recv=729)` pinned for the whole capture, ZERO `[clickroute]` lines, c1 at 99%.
+//
+// Read together those say one thing. `BLIT_ACTIVE` failed to fall; [`DrainBarrier::drain`]'s bound is
+// [`DRAIN_ABANDON_SPINS`] — order 10^9 spin hints, *several seconds* — and [`move_to_inner`] raises
+// that same teardown-grade barrier ON EVERY DRAG MOTION REPORT. So the pointer path, which on this
+// arch is also the task that consumes `GUI_CHANNEL`, spent multi-second stretches inside the spin;
+// the abandon did not disarm anything, so the very next report re-entered it (`<D3><D2>`); and the
+// BUTTON-UP that would have ended the grab is delivered through that same consumer, so it could never
+// be seen. The gesture therefore could not end, and every report it produced re-armed the spin. Boot
+// 2 is that latch caught early (kernel alive, panel dead); boot 1 is the same latch after the input
+// channel has backed up to its capacity and the machine has stopped answering.
+//
+// **What is fixed here, and what is deliberately not.**
+//
+//  1. *The interactive path gets an interactive bound.* [`DRAIN_MOVE_SPINS`] is three orders under the
+//     tripwire and still four orders over the handful of panel-clipped `memcpy`s the barrier is
+//     genuinely bounded against. This WEAKENS NO PROTECTION: the abandon arm already exists on this
+//     path and already trades exactly this — its own ledger prices the cost as "a stale rectangle, one
+//     wrong frame, self-healing at the next present" — so a smaller bound reaches an outcome the code
+//     already sanctions, sooner. The TEARDOWN paths (`close`, `close_owner`, `minimise`, `zoom`) are
+//     untouched and keep the full [`DRAIN_ABANDON_SPINS`] bound, because there the thing being waited
+//     out is a blit from a surface that is about to be unmapped and the WC-B hazard is real.
+//
+//  2. *An abandoned wait LATCHES.* [`BARRIER_UNHEALTHY`] records "this barrier is not converging", and
+//     while it stands the interactive path does not spin at all. Re-entering a wait that has just been
+//     proven not to terminate, once per pointer report, is what turned a transient stall into a dead
+//     machine; a bound alone would only have made it a slower death. The latch is self-clearing —
+//     every drain that observes `BLIT_ACTIVE == 0` drops it — so the system recovers on its own the
+//     moment the compositor does.
+//
+//  3. *A grab is always releasable.* [`drag_motion`] cancels the gesture the first time its move
+//     path reports a stalled barrier, and [`drag_begin`] REFUSES to mint a new one while the latch
+//     stands. A lost release edge can no longer mean a grab that lives forever, because the grab does
+//     not outlive the system's ability to service it. This is the sibling of the furniture-refused
+//     CLOSE guard: the same shape of hole, one verb over.
+//
+// **Arch-neutral on purpose.** All three live in `wm.rs` and are reached by x86's router through the
+// same `drag_begin`/`drag_motion`/`move_to_inner`, so the hole closes on both arches at once. It IS a
+// shared hole: nothing in the mechanism above is aarch64-specific — x86's drag path raises the same
+// barrier from the same mover — and gating the cure on `target_arch` would leave the identical latch
+// armed on the other lane with no stated hardware reason for the asymmetry.
+
+/// DRAGWEDGE — spin iterations past which the INTERACTIVE (drag/move) barrier gives its wait up.
+///
+/// **2^25, and the number is MEASURED at both ends rather than picked.**
+///
+/// The FLOOR is what a legitimate composite costs, because a bound under that would cancel healthy
+/// gestures: PA41's own `[comp2]` rollups read `pass_us=3294` typical with `max_us=82683` on the
+/// 1920x1200 bench panel. The bound must clear the outlier, not the mean — a drag report that lands
+/// mid-pass waits out that pass, and a drag that aborts whenever the compositor has a slow frame is a
+/// worse desktop than the one this arc is fixing.
+///
+/// The CEILING is [`DRAIN_STALL_SPINS`], whose own note calibrates 2^27 as *"comfortably past a
+/// second of real time on the Pi"* — so ~10 ns a spin, and 2^25 is ~340 ms. That is four times the
+/// worst pass this track has ever measured, four times under the tripwire, and thirty-two times under
+/// [`DRAIN_ABANDON_SPINS`], which is the bound PA41 measured in seconds.
+///
+/// So a false give-up costs one gesture the operator repeats, and a true one costs a single ~340 ms
+/// hitch — once, because [`BARRIER_UNHEALTHY`] latches and every later report declines the wait.
+/// Under QEMU TCG the same constant measures ~830 ms, which is what `dragwedge_selftest`'s budget is
+/// sized against.
+const DRAIN_MOVE_SPINS: u64 = 1 << 25;
+
+/// DRAGWEDGE — interactive drains that gave their wait up. Unconditional, on the same argument
+/// [`DRAIN_ABANDONED`] makes. NOT folded into that counter: the two abandon DIFFERENT things (a live
+/// row's stale rectangle here, a soon-to-be-unmapped surface there) and the pi4 spec forbids the
+/// teardown one by name, so conflating them would red a gate on an event it was never written about.
+/// Named `mvgiveup=` on the `[wedge1] dwell` line for that same reason — `move_abandoned=` would be
+/// caught by the spec's `abandoned=[1-9]` forbid.
+static MOVE_DRAIN_GIVEUP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGWEDGE — interactive drains that DECLINED to spin because the latch was standing. This is the
+/// counter that would have been the whole boot-1 capture: one per pointer report, instead of one
+/// multi-second spin per pointer report.
+static MOVE_DRAIN_SKIPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGWEDGE — **the barrier is not converging.** Raised by an interactive drain that reached its
+/// bound with `BLIT_ACTIVE` still standing; dropped by any drain that observes `BLIT_ACTIVE == 0`.
+///
+/// A GAUGE of the compositor's health, read by three places: the interactive drain (which then does
+/// not spin), [`drag_begin`] (which then refuses to mint a grab) and [`drag_motion`] (which then ends
+/// the live one). Relaxed throughout — it gates policy, and orders nothing.
+static BARRIER_UNHEALTHY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DRAGWEDGE — whether the interactive give-up LINE has been printed, once per boot and globally, on
+/// the argument [`DRAIN_ABANDON_REPORTED`] makes. The counters above are not rate-limited.
+static MOVE_DRAIN_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DRAGWEDGE — is the compositor's blit barrier currently believed stuck?
+///
+/// The latch AND the live count, because a latch alone can go stale: nothing forces a drain to run,
+/// so a flag raised by the last drag of a boot would otherwise refuse every grab for the rest of it.
+/// `BLIT_ACTIVE == 0` is proof the stall is over whoever observes it, so this reads both and clears
+/// the flag on the spot.
+fn barrier_stalled() -> bool {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    if !BARRIER_UNHEALTHY.load(Relaxed) {
+        return false;
+    }
+    if BLIT_ACTIVE.load(Acquire) == 0 {
+        BARRIER_UNHEALTHY.store(false, Relaxed);
+        return false;
+    }
+    true
+}
+
 // ---- WEDGE-1r2 — the drain barrier's silence, made readable --------------------------------------
 //
 // **What this arc found, and it is a finding about an INSTRUMENT rather than about a mechanism.**
@@ -7472,6 +7600,21 @@ impl DrainBarrier {
     /// livelock would have been a dead core rather than a slow one. With the barrier up the wait set
     /// is fixed at entry, finite, and every member is running a bounded panel-clipped blit.
     fn drain() -> Self {
+        Self::drain_bounded(DRAIN_ABANDON_SPINS, false)
+    }
+
+    /// DRAGWEDGE — [`DrainBarrier::drain`] with the wait's BOUND named by the caller.
+    ///
+    /// `interactive` says the caller is on the hand-driven path (`move_to_inner`), and it changes two
+    /// things and nothing else: the wait is DECLINED outright while [`BARRIER_UNHEALTHY`] stands, and
+    /// reaching the bound raises that latch instead of charging [`DRAIN_ABANDONED`]. The teardown
+    /// callers pass `false` and get exactly today's behaviour, bound included — see the DRAGWEDGE
+    /// ledger for why the two paths may not share a bound.
+    ///
+    /// The barrier itself is raised on BOTH paths and on every call, including the declined one: a
+    /// composite that takes the table lock from here on must still see `DRAIN_PENDING` and skip, or
+    /// the caller's erase would race a blit it never even looked for.
+    fn drain_bounded(bound: u64, interactive: bool) -> Self {
         use core::sync::atomic::Ordering;
         // WEDGE-1r2 `<D2>` — the caller's `TABLE` critical section is behind us, the barrier is going
         // up, and this core is about to spin IRQ-masked. Raw and lock-free, for the reason the block
@@ -7527,6 +7670,22 @@ impl DrainBarrier {
         // instrument that is quiet and an instrument that cannot speak. The `<D!>` token below takes
         // no lock and is emitted BEFORE the print, so from here on this tripwire's silence means the
         // threshold was not reached rather than the report was eaten.
+        // DRAGWEDGE — **the latch, read once per drain.** The call also CLEARS the flag whenever
+        // `BLIT_ACTIVE` is zero, which is what makes the unhealthy state self-healing: every drain on
+        // every path is an opportunity to observe that the compositor has recovered, and the teardown
+        // paths take that opportunity even though they never honour the latch themselves.
+        let stalled = barrier_stalled();
+        // DRAGWEDGE — the DECLINED wait. Boot 1's capture is a spin re-entered once per pointer
+        // report after it had already been proven not to terminate; the bound alone would have made
+        // that a slower freeze rather than none. The barrier stays RAISED (the `DrainBarrier` this
+        // returns), so a composite that takes the table lock from here on still skips — what is given
+        // up is only the wait, which is the same thing the abandon arm below gives up and at the same
+        // already-priced cost.
+        if interactive && stalled {
+            MOVE_DRAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            crate::wedge2::mark("<D3>");
+            return DrainBarrier;
+        }
         let mut spins: u64 = 0;
         // WEDGE-1r2 — has this drain been charged to `spun`/`in_spin` yet? Set on the FIRST iteration
         // rather than before the loop, so a barrier that found `BLIT_ACTIVE == 0` and never waited is
@@ -7594,19 +7753,40 @@ impl DrainBarrier {
             // every `[wedge1] dwell` line as `abandoned=`, whose verdict goes to `ABANDONED` — a
             // reading the spec battery FORBIDS, so a boot that reaches this arm reds the gate instead
             // of quietly shipping a stale frame.
-            if spins >= DRAIN_ABANDON_SPINS {
+            if spins >= bound {
                 // Lock-free first, exactly as `<D!>` is: the fact that the bound was reached must
                 // survive a serial path that is itself the wedge.
                 crate::wedge2::mark("<D?>");
-                DRAIN_ABANDONED.fetch_add(1, Ordering::Relaxed);
-                if !DRAIN_ABANDON_REPORTED.swap(true, Ordering::Relaxed) {
-                    serial_println!(
-                        ":: [wedge1] DRAIN ABANDONED core={} blit_active={} pending={} spins={} == bounded-wait ::",
-                        crate::arch::sched::meter_current_cpu(),
-                        BLIT_ACTIVE.load(Ordering::Acquire),
-                        DRAIN_PENDING.load(Ordering::Acquire),
-                        spins
-                    );
+                // DRAGWEDGE — the two give-ups are counted and reported SEPARATELY. They abandon
+                // different things at different prices (see the DRAGWEDGE ledger), the pi4 spec
+                // forbids the teardown one by name, and an interactive give-up must be able to
+                // happen on a busy panel without reding a gate that was written about teardown.
+                if interactive {
+                    MOVE_DRAIN_GIVEUP.fetch_add(1, Ordering::Relaxed);
+                    // THE LATCH. Raised here and nowhere else: this is the one place the system has
+                    // just PROVED that waiting does not terminate, which is exactly the fact the
+                    // drag path needs and the fact boot 1 re-discovered several thousand times.
+                    BARRIER_UNHEALTHY.store(true, Ordering::Relaxed);
+                    if !MOVE_DRAIN_REPORTED.swap(true, Ordering::Relaxed) {
+                        serial_println!(
+                            ":: [wedge1] MOVE DRAIN GAVE UP core={} blit_active={} pending={} spins={} == interactive-bound ::",
+                            crate::arch::sched::meter_current_cpu(),
+                            BLIT_ACTIVE.load(Ordering::Acquire),
+                            DRAIN_PENDING.load(Ordering::Acquire),
+                            spins
+                        );
+                    }
+                } else {
+                    DRAIN_ABANDONED.fetch_add(1, Ordering::Relaxed);
+                    if !DRAIN_ABANDON_REPORTED.swap(true, Ordering::Relaxed) {
+                        serial_println!(
+                            ":: [wedge1] DRAIN ABANDONED core={} blit_active={} pending={} spins={} == bounded-wait ::",
+                            crate::arch::sched::meter_current_cpu(),
+                            BLIT_ACTIVE.load(Ordering::Acquire),
+                            DRAIN_PENDING.load(Ordering::Acquire),
+                            spins
+                        );
+                    }
                 }
                 break;
             }
@@ -9036,11 +9216,24 @@ fn wedge1_dwell_emit(span: u64) {
     // fact about this boot (a stale rectangle was allowed onto the panel), not a per-window rate, and
     // draining it would let the very next rollup read clean over it.
     let abandoned = DRAIN_ABANDONED.load(Relaxed);
+    // DRAGWEDGE — the interactive path's two terms, GAUGES for the same reason `abandoned` is: a
+    // give-up is a permanent fact about the boot, and `skipped` is the count of pointer reports the
+    // latch saved from re-entering a wait already proven not to terminate. Named `mvgiveup=`/
+    // `mvskip=` rather than `move_abandoned=` deliberately — see [`MOVE_DRAIN_GIVEUP`].
+    let mvgiveup = MOVE_DRAIN_GIVEUP.load(Relaxed);
+    let mvskip = MOVE_DRAIN_SKIPPED.load(Relaxed);
     // Lens fix (s1u): the quiet-window early-out must also test the spin evidence. The swaps above
     // have already drained `spun`/`spin_max`, so a drain that straddled the previous rollup boundary
     // (counted there as `drains`, its spin published here) would have its DWELL evidence silently
     // dropped by a `drains==0` return — banking QUIET for a window that measured a stall.
-    if drains == 0 && in_spin == 0 && spun == 0 && spin_max == 0 && abandoned == 0 {
+    if drains == 0
+        && in_spin == 0
+        && spun == 0
+        && spin_max == 0
+        && abandoned == 0
+        && mvgiveup == 0
+        && mvskip == 0
+    {
         return;
     }
     // DRAINSTALL — ABOVE `INFLIGHT`, and deliberately. An abandonment is the strongest thing this
@@ -9049,6 +9242,13 @@ fn wedge1_dwell_emit(span: u64) {
     // milder verdict, however healthy the rest of its numbers look.
     let verdict = if abandoned > 0 {
         "ABANDONED"
+    } else if mvgiveup > 0 {
+        // DRAGWEDGE — BELOW `ABANDONED` and above every healthy reading. An interactive give-up says
+        // the compositor stopped retiring blits for at least a millisecond while a hand was on a
+        // window; that is a real finding and may not be described as INFLIGHT or QUIET. It is not
+        // `ABANDONED`, because nothing about to be unmapped was read — the trade this arm makes is a
+        // stale rectangle on a LIVE row, which the next present repairs.
+        "MOVE-GAVE-UP"
     } else if in_spin > 0 {
         "INFLIGHT"
     } else if spin_max >= DRAIN_DWELL_NOTE {
@@ -9073,7 +9273,7 @@ fn wedge1_dwell_emit(span: u64) {
         "QUIET"
     };
     serial_println!(
-        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} bound={} abandoned={} span={}ms -> {}",
+        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} bound={} abandoned={} mvbound={} mvgiveup={} mvskip={} latched={} span={}ms -> {}",
         drains,
         spun,
         spin_max,
@@ -9082,6 +9282,10 @@ fn wedge1_dwell_emit(span: u64) {
         if DRAIN_STALL_REPORTED.load(Relaxed) { "fired" } else { "silent" },
         DRAIN_ABANDON_SPINS,
         abandoned,
+        DRAIN_MOVE_SPINS,
+        mvgiveup,
+        mvskip,
+        BARRIER_UNHEALTHY.load(Relaxed),
         span,
         verdict
     );
@@ -11738,6 +11942,18 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
     if !title_bar_hit(id, x, y) {
         return false;
     }
+    // DRAGWEDGE — **REFUSE to mint a grab the system cannot service.** A drag is the one gesture that
+    // asks the compositor for work on every pointer report, so a stalled blit barrier turns a new
+    // grab into a report-rate storm against a barrier that has already been proven not to converge —
+    // which is the whole of the PA41 freeze. Refusing is not a loss of function: the router's chrome
+    // arm has already raised and focused the window, and it reports `chrome` instead of `drag` on its
+    // `[clickroute]` line, so the press still SELECTS and the wire says exactly why it did not grab.
+    // Self-healing by construction — `barrier_stalled` clears itself the moment `BLIT_ACTIVE` is
+    // zero, so the operator's next press after the compositor recovers drags normally.
+    if barrier_stalled() {
+        wm_act("drag-refused", id, 0, "barrier-stalled", x as i64, y as i64);
+        return false;
+    }
     let (owner, ox, oy) = {
         let t = table();
         match row(&t, id) {
@@ -11962,10 +12178,42 @@ pub fn drag_motion(x: i32, y: i32) -> bool {
     if nx == DRAG_LAST_X.load(Ordering::Relaxed) && ny == DRAG_LAST_Y.load(Ordering::Relaxed) {
         return false; // no pixel would change; skip the lock, the damage and the composite.
     }
+    // DRAGWEDGE — the give-up ledger, sampled ACROSS the mover. `move_to_inner` raises the
+    // interactive barrier and is the only thing in this function that can, so a change in either
+    // counter over this call is this reposition's barrier failing to converge. Sampled either side
+    // rather than merely tested afterwards because the counters are GLOBAL and a give-up is a
+    // permanent fact about the boot: a bare `> 0` test would cancel every gesture for the rest of
+    // the run once any of them had met a stall. The residual imprecision is stated and accepted —
+    // another core giving up inside this window is attributed here — and it is benign in the only
+    // direction that matters, because a barrier that is not converging is not converging for
+    // whoever asks, and the cancellation's cost is one gesture the operator repeats.
+    let stall0 = {
+        use core::sync::atomic::Ordering::Relaxed;
+        MOVE_DRAIN_GIVEUP.load(Relaxed).wrapping_add(MOVE_DRAIN_SKIPPED.load(Relaxed))
+    };
     // `move_to_inner` clamps the origin to the live panel, marks the row PINNED, erases the VACATED
     // box, re-damages what the erase reached and asks the desktop for a full present — the
     // MOVE-VACATE cure, already in that function and deliberately not duplicated here.
-    match move_to_inner(id, Some(want), nx as usize, ny as usize) {
+    let moved = move_to_inner(id, Some(want), nx as usize, ny as usize);
+    // DRAGWEDGE — **THE GRAB DOES NOT OUTLIVE THE SYSTEM'S ABILITY TO SERVICE IT**, and this is the
+    // guard that makes "a lost release edge" stop meaning "a grab forever".
+    //
+    // On this arch the release edge reaches `wm` through the router, which runs on the task that
+    // consumes the GUI channel — the same task the drag's own barrier was spinning on. PA41 boot 2
+    // shows the consequence in two lines: `drag-begin ... -> grabbed` with no `drag-end` anywhere
+    // after it, ever. So the gesture is ended HERE, from the motion path, on the system's own report
+    // that it cannot keep up. `drag_cancel` names the reason on the wire, which is the whole point of
+    // it being a cancel rather than an end: a capture can tell "the operator let go" from "the
+    // compositor stopped answering and the window system let go for them".
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let stall1 = MOVE_DRAIN_GIVEUP.load(Relaxed).wrapping_add(MOVE_DRAIN_SKIPPED.load(Relaxed));
+        if stall1 != stall0 {
+            drag_cancel("barrier-stalled");
+            return false;
+        }
+    }
+    match moved {
         Moved::NoRow => {
             // The owner test FAILED INSIDE THE LOCK: the slot was recycled in the gap above. The
             // window was not moved, and this is the arm that proves the pre-filter is not the guard.
@@ -16201,6 +16449,199 @@ pub fn dragperf_selftest() {
         adm, coal,
         if narrowed && paced { "PASS" } else { "FAIL" }
     );
+    close(w);
+    composite();
+}
+
+/// DRAGWEDGE — **the PA41 freeze, convicted in QEMU.**
+///
+/// Two attended metal freezes on `hw-pi4@14e54538` had one mechanism: a drag grab on a window whose
+/// compositor had stopped retiring blits, driving [`move_to_inner`]'s teardown-grade phase barrier
+/// once per pointer report, on the task that also consumes the input channel — so the button-up that
+/// would have ended the gesture was queued behind the very spin it was waiting to stop. The wire says
+/// it in two readings the fixture reproduces exactly: `blit_active=1 pending=1` in
+/// `:: [wedge1] DRAIN ABANDONED ::`, and a `[wm-act] drag-begin ... -> grabbed` with no `drag-end`
+/// after it anywhere in the capture.
+///
+/// ### What each leg convicts
+///  1. **The furniture press still WORKS.** A kernel-band row is draggable by ruling (see the chrome
+///     arm in `arch/aarch64/syscall.rs`), so this drives the SHIPPED router with a real `Button` edge
+///     on the console row's title strip and requires grab-then-release. It is the control: everything
+///     below refuses a grab, and a fixture that only proved refusal could be satisfied by a build in
+///     which nothing drags at all.
+///  2. **A stalled barrier is BOUNDED.** With one `BlitGuard` held — `blit_active=1`, the metal's own
+///     reading, and a wait that provably cannot terminate — one drag motion must RETURN, inside a
+///     budget measured in milliseconds rather than the seconds [`DRAIN_ABANDON_SPINS`] costs.
+///  3. **...and the grab is RELEASED by it.** The motion that met the stall must leave nothing live.
+///     This is the leg the metal capture fails: on the PA41 image the grab survives the stall and
+///     every subsequent report re-enters it.
+///  4. **...and a new grab is REFUSED while it stands.** The latch, which is what stops the operator's
+///     next press re-arming the storm. Must cost no measurable time — a refusal that spun would be
+///     the defect with a smaller constant.
+///  5. **...and the refusal LIFTS when the compositor recovers.** The guard is dropped and the same
+///     press must grab again. A latch with no exit would be a desktop that stops dragging for the
+///     rest of the boot, which is a worse bug than the one being fixed.
+///
+/// ### The arch gate, stated
+/// `target_arch = "aarch64"` is here for leg 1 and only leg 1: it drives
+/// `arch::aarch64::syscall::wc_click_route`, the shipped Pi router, because a fixture that called
+/// `drag_begin` directly would prove the window layer and leave the press path untested — the exact
+/// shape of witness DRAG-PI M4 was sent to fix. `baremetal`/`pidesk` are the knobs that name the
+/// desktop it presses on. The MECHANISM under test is arch-neutral (`wm.rs`, reached identically by
+/// x86's router), so this gate scopes the fixture's press, not the cure.
+///
+/// FORBID-on-FAIL: the verdict line is `-> PASS` or `-> FAIL`, and a build without the knobs emits
+/// nothing at all, so a knob-off gate stays green by absence rather than by a claim.
+#[cfg(all(
+    feature = "witness",
+    target_arch = "aarch64",
+    feature = "baremetal",
+    feature = "pidesk"
+))]
+pub fn dragwedge_selftest() {
+    use core::sync::atomic::Ordering::Relaxed;
+
+    /// The budget leg 2 asserts against. [`DRAIN_MOVE_SPINS`] measured 26 ms per 2^20 spins under
+    /// QEMU TCG on this gate, so the shipped 2^25 costs ~830 ms here (and ~340 ms on the Pi). The
+    /// budget is ~3x that: this leg's claim is "BOUNDED, and by an interactive amount", not a
+    /// performance figure, so it is sized to survive a loaded gate host while still being two orders
+    /// under the teardown bound the defect actually spent — which PA41 measured in seconds and which
+    /// on this gate would blow the whole 210 s window rather than print a number.
+    const STALL_BUDGET_MS: u64 = 2500;
+    /// Leg 4's budget. A refusal takes two relaxed loads; anything measurable means it spun.
+    const REFUSE_BUDGET_MS: u64 = 50;
+    const ASID_DW: u64 = KERNEL_OWNER_CONSOLE;
+
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[dragwedge] -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let pinfo = fb.info();
+    if pinfo.width < 320 || pinfo.height < 240 {
+        serial_println!(
+            "[dragwedge] -> SKIP (panel {}x{} too small)",
+            pinfo.width, pinfo.height
+        );
+        return;
+    }
+    let surf = &raw const HT_SURF as usize;
+    let len = core::mem::size_of_val(&HT_SURF);
+    let w = create(ASID_DW, surf, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"dwg");
+    if w == WIN_NONE {
+        serial_println!("[dragwedge] -> SKIP (no free row)");
+        return;
+    }
+
+    // ---- Leg 1: the FURNITURE press, through the shipped router --------------------------------
+    //
+    // CLICK-PLAIN discipline, borrowed wholesale from `dragperf_selftest`: move the WINDOW under the
+    // pointer, never the pointer. The placement is VERIFIED with `title_bar_hit` rather than assumed,
+    // because `move_to` clamps and a row that cannot be put under the hand must report SKIP honestly.
+    let (pw, ph) = (pinfo.width as i32, pinfo.height as i32);
+    let (cx, cy) = crate::pal::cursor::pos(pw, ph);
+    let aimed = match (info(w), info_box(w)) {
+        (Some(i), Some((bx, by, bw2, _))) => {
+            let nx = i.x as i64 + (cx as i64 - (bx + bw2 / 2) as i64);
+            let ny = i.y as i64 + (cy as i64 - (by + TITLE_H / 2) as i64);
+            if nx >= BORDER as i64 && ny >= (TITLE_H + BORDER) as i64 {
+                move_to(w, nx as usize, ny as usize);
+                title_bar_hit(w, cx, cy)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    let (chrome_ok, grab_ok, rel_ok) = if aimed {
+        use crate::arch::aarch64::syscall as sc;
+        let saved = sc::user_input_active();
+        let chrome = chrome_hit(w, cx, cy);
+        sc::wc_click_route(crate::pal::Event::Button(1));
+        let grabbed = drag_active() == w;
+        sc::wc_click_route(crate::pal::Event::Button(0));
+        let released = drag_active() == WIN_NONE;
+        sc::user_input_set_active(saved);
+        (chrome, grabbed, released)
+    } else {
+        (false, false, false)
+    };
+
+    // ---- Legs 2-4: the stall, held open by one BlitGuard ----------------------------------------
+    //
+    // `BlitGuard::enter()` raises `BLIT_ACTIVE` to exactly the count the metal capture read, and this
+    // thread holds it, so the barrier's wait set contains a member that cannot retire while the wait
+    // runs. That is not a contrivance — it is the wire's own state, reproduced by the cheapest means
+    // that reaches it, and on the PA41 image every leg below hangs the gate instead of failing it.
+    let (gx, gy) = match info_box(w) {
+        Some((bx, by, bw2, _)) => ((bx + bw2 / 2) as i32, (by + TITLE_H / 2) as i32),
+        None => (0, 0),
+    };
+    let g0 = MOVE_DRAIN_GIVEUP.load(Relaxed);
+    let s0 = MOVE_DRAIN_SKIPPED.load(Relaxed);
+    let (began, stall_ms, gave_up, cancelled, refused, refuse_ms) = {
+        let _hold = BlitGuard::enter();
+        // The grab is minted BEFORE the wait has ever been met, so the latch is down and this must
+        // succeed — leg 4's refusal is only meaningful against a begin that would otherwise work.
+        let began = drag_begin(w, gx, gy);
+        let t0 = crate::arch::ms();
+        // A real delta: `drag_motion` cheap-skips a reposition that would not move a pixel, and a
+        // skipped move never reaches the barrier this leg exists to measure.
+        drag_motion(gx + 24, gy);
+        let stall_ms = crate::arch::ms().wrapping_sub(t0);
+        let gave_up = MOVE_DRAIN_GIVEUP.load(Relaxed) > g0;
+        let cancelled = drag_active() == WIN_NONE;
+        let t1 = crate::arch::ms();
+        let refused = !drag_begin(w, gx, gy);
+        let refuse_ms = crate::arch::ms().wrapping_sub(t1);
+        (began, stall_ms, gave_up, cancelled, refused, refuse_ms)
+        // `_hold` drops HERE, and it must drop before anything below: `close` raises the TEARDOWN
+        // barrier, whose bound is the one this whole arc is about not waiting out.
+    };
+
+    // ---- Leg 5: the latch LIFTS ------------------------------------------------------------------
+    let healthy = !barrier_stalled();
+    let regrab = drag_begin(w, gx, gy);
+    drag_end();
+    let recovered = healthy && regrab && drag_active() == WIN_NONE;
+
+    let ok = aimed
+        && chrome_ok
+        && grab_ok
+        && rel_ok
+        && began
+        && gave_up
+        && cancelled
+        && stall_ms <= STALL_BUDGET_MS
+        && refused
+        && refuse_ms <= REFUSE_BUDGET_MS
+        && recovered;
+    serial_println!(
+        "[dragwedge] furniture aimed={} chrome={} grab={} release={} | stall began={} gave_up={} \
+         cancelled={} ms={}/{} | refuse={} ms={}/{} | recover={} bound={} -> {}",
+        aimed, chrome_ok, grab_ok, rel_ok,
+        began, gave_up, cancelled, stall_ms, STALL_BUDGET_MS,
+        refused, refuse_ms, REFUSE_BUDGET_MS,
+        recovered, DRAIN_MOVE_SPINS,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    // A SKIPPED aim is reported as such on its own line rather than being folded into the verdict
+    // above, so a reader who sees FAIL can tell "the fixture could not build its scene" from "the
+    // mechanism regressed" without re-deriving it from the flags.
+    if !aimed {
+        serial_println!("[dragwedge] furniture -> SKIP (title bar not placeable under cursor)");
+    }
+    // **THE FIXTURE PUTS THE LEDGER BACK**, on this module's standing rule that a fixture restores
+    // what it takes. Its give-up is DELIBERATE, so leaving it standing would make every later
+    // `[wedge1] dwell` line on an armed boot read `MOVE-GAVE-UP` and would burn the once-per-boot
+    // `MOVE DRAIN GAVE UP` print — so a REAL give-up, later in the same boot, would be
+    // indistinguishable from this one and would have no line of its own. The evidence is not lost by
+    // restoring: `gave_up=true` on the verdict line above is where this fixture's give-up is
+    // recorded, and it is the only place it belongs.
+    MOVE_DRAIN_GIVEUP.store(g0, Relaxed);
+    MOVE_DRAIN_SKIPPED.store(s0, Relaxed);
+    MOVE_DRAIN_REPORTED.store(false, Relaxed);
+    BARRIER_UNHEALTHY.store(false, Relaxed);
     close(w);
     composite();
 }

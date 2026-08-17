@@ -439,7 +439,7 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # ---    DWELL/INFLIGHT, and a gate that fails on an honest reading teaches people to ignore it
 # ---    (lens fix, s1u — the verdict pin was a flake in waiting). The gate question is "does the
 # ---    instrument still exist and publish", and that is what the pattern below asserts.
-REQUIRE \[wedge1\] dwell drains=.*spin_max=.*->
+REQUIRE \[wedge1\] dwell drains=.*spin_max=.*mvbound=[0-9]+ mvgiveup=[0-9]+ mvskip=[0-9]+ latched=.*->
 
 # --- STORM-HEADROOM (s1u lens nit): the boot-baseline census is the proof the storm instrument
 # ---    still exists and publishes — the same existence-pin rationale as the dwell REQUIRE above.
@@ -1570,3 +1570,50 @@ FORBID :: WMCTRL: .* :: FAIL ::
 # --- so either half regressing prints FAIL here and reds the armed gate. The REQUIRED count is
 # --- unchanged at 108 on both batteries, which is the point.
 FORBID \[dragperf\] .* -> FAIL
+
+# --- DRAGWEDGE — the PA41 metal freeze (`[dragwedge]`, wm::dragwedge_selftest).
+# ---
+# --- THE DEFECT THIS GATE STANDS OVER. Two attended freezes on `hw-pi4@14e54538`, one dragging the
+# --- console window and one dragging an app window, produced one mechanism: `move_to_inner` raised
+# --- the TEARDOWN-grade phase barrier on every drag motion report, on the task that also consumes
+# --- `GUI_CHANNEL`, and `DRAIN_ABANDON_SPINS` is order 10^9 spin hints — several seconds. With
+# --- `BLIT_ACTIVE` stuck at 1 the pointer path spent those seconds inside the spin; the abandon
+# --- disarmed nothing, so the next report re-entered it (`<D3><D2>` on the wire); and the button-up
+# --- that would have ended the grab was queued behind the very spin it was waiting to stop. Boot 2 is
+# --- that latch caught early (`[wcn] ... passes=0 aborted=37 -> STARVED`, kernel alive, panel dead);
+# --- boot 1 is the same latch after the input channel backed up to capacity
+# --- (`[click2] depth gui_chan=65 (sent=794 recv=729)` pinned, ZERO `[clickroute]` lines, c1 at 99%)
+# --- and the machine stopped answering entirely.
+# ---
+# --- FORBID and not REQUIRE, on exactly the `[dragperf]` argument above: the fixture is `pidesk`-gated,
+# --- so its line is present on the armed battery and absent from the knob-off one, and a REQUIRE would
+# --- red the knob-off gate for doing what it is supposed to do. The REQUIRED count stays 108.
+# ---
+# --- The verdict is a five-way conjunction and each term is falsifiable on its own wire:
+# ---   furniture  — a kernel-band title strip pressed through the SHIPPED router grabs AND releases
+# ---                (the control: a build where nothing drags at all must not be able to pass);
+# ---   stall      — one drag motion against a held `BlitGuard` (`blit_active=1`, the metal's own
+# ---                reading) RETURNS inside a millisecond-scale budget rather than the seconds the
+# ---                teardown bound costs;
+# ---   cancelled  — and that motion RELEASES the grab it could not service. This is the term the PA41
+# ---                image fails: there, the grab survives and every later report re-arms the spin;
+# ---   refuse     — a fresh grab is refused while the stall stands, at no measurable cost;
+# ---   recover    — and the refusal LIFTS when the compositor recovers, so the latch is not a desktop
+# ---                that stops dragging for the rest of the boot.
+# --- On the pre-fix image this fixture does not print FAIL — it HANGS the gate, which is the honest
+# --- signature of the defect and is why the cure had to be the bound rather than a louder witness.
+FORBID \[dragwedge\] .* -> FAIL
+
+# --- DRAGWEDGE — and the two ledger readings the cure adds to `[wedge1] dwell`. `mvgiveup=` counts
+# --- interactive drains that reached the bound; `mvskip=` counts pointer reports the latch saved from
+# --- re-entering a wait already proven not to terminate. Neither is forbidden here: an interactive
+# --- give-up on a busy QEMU host is an honest reading of a slow compositor, not a regression, and a
+# --- gate that reds on it teaches people to ignore it (the same rule §4c states for DWELL/INFLIGHT).
+# --- What IS forbidden is the field disappearing — the counters are the only wire evidence that the
+# --- interactive bound exists at all, and a silent removal would leave the freeze unwitnessed again.
+# --- Note the `abandoned=` forbid three hundred lines up is matched against the TEARDOWN counter and
+# --- must stay that way; that is why these fields are named `mvgiveup=`/`mvskip=` and not
+# --- `move_abandoned=`, which its `abandoned=[1-9]` pattern would have caught.
+# --- The assertion itself EXTENDS §4c's existing `[wedge1] dwell` REQUIRE rather than adding a
+# --- second one, so the required count stays 108 on both batteries and the ledger is gated by the
+# --- one directive that was already reading that line.

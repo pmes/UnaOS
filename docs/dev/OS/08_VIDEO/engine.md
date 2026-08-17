@@ -12807,3 +12807,184 @@ dead bar. On the 640x480 gate surface the same lines read `rect=Some((0, 0, 640,
 window, per the narrowed dock law above.
 
 ---
+
+## DRAGWEDGE — the drag barrier gets an interactive bound (aarch64 + x86 `wm`, 2026-08-17)
+
+**The report.** Two attended freezes on the PA41 image (`hw-pi4@14e54538`), an hour apart. In the
+first, Peter dragged the CONSOLE window's title bar; input died and the wire eventually went silent.
+In the second he pressed near the menu bar and dragged an APP window; the UI froze but the kernel
+stayed alive — witnesses streaming, `[menubar]`/`[dock]` passes advancing.
+
+### What the wire says
+
+Boot 2, at the seam, reads (tokens interleaved with the ordinary lines):
+
+```
+<F4><F5>[wc-fv] focus raise asid=0x1 windows=1 top_win=4 z=17 shell_z=12
+<F6><F7><F8>[wm-act] drag-begin win=4 owner=0x1 at (353,71) -> grabbed
+[clickroute] press chrome win=4 owner=1 at (353,71) -> drag
+<D2>
+:: [wedge1] DRAIN STALLED core=3 blit_active=1 pending=1 spins=134217728 == tripwire ::
+:: [wedge1] DRAIN ABANDONED core=3 blit_active=1 pending=1 spins=1073741824 == bounded-wait ::
+<D?><D3><D2>
+[wcn] rollup scope=live wins=4 att=31 comp=0 passes=0 aborted=37 -> STARVED
+[comp2] rollup passes=37 blit_us=0 compose_us=0 present_us=0
+```
+
+and there is **no `[wm-act] drag-end` anywhere after it, for the rest of the capture.**
+
+Boot 1's tail is the same mechanism further along. Its whole token stream is `<D2><D?><D3>`
+repeating; there is not one `[clickroute]` or `[drag]` line in it; `[click2] depth gui_chan=65
+(sent=794 recv=729)` is pinned for 68-second rollup windows with `sent` and `recv` advancing by ~1
+each; and `SCHED` reads `c1=99%` with the other three cores idle.
+
+### The mechanism
+
+`BLIT_ACTIVE` failed to fall. `DrainBarrier::drain`'s bound is `DRAIN_ABANDON_SPINS` — order 10^9
+spin hints, *several seconds* — and `move_to_inner` raises that same teardown-grade barrier **on
+every drag motion report**. On this arch the pointer path is also the task that consumes
+`GUI_CHANNEL`, so:
+
+1. one admitted motion → one multi-second spin on the input consumer;
+2. the abandon disarmed nothing, so the next report re-entered it (`<D3><D2>`);
+3. the BUTTON-UP that ends the grab is delivered through that same consumer, so it could not be
+   seen — hence `drag-begin` with no `drag-end`;
+4. the live grab meant every further report produced another motion, and the loop closed.
+
+That is the latch. Boot 2 is it caught early: the kernel is fine, every composite takes
+`composite_inner`'s `DRAIN_PENDING` early return (`aborted=37`, `blit_us=0`), and the panel is dead.
+Boot 1 is the same latch after the input channel has backed up to its capacity — 65 events, one
+serviced per abandon cycle — and the machine has stopped answering.
+
+**One defect, two presentations.** The furniture framing in the first report is not what the wire
+shows: boot 1 grabbed a kernel-band row and boot 2 grabbed `asid=0x1`, an ordinary app row, and both
+wedged identically. Refusing furniture drags would have fixed neither boot 2 nor the mechanism, and
+would have reversed the standing ruling that the console's title bar is a grip like any other.
+
+### The cure, in three parts
+
+**1. The interactive path gets an interactive bound.** `DrainBarrier::drain_bounded(bound,
+interactive)`; `move_to_inner` passes `DRAIN_MOVE_SPINS` (2^20, order a millisecond) and `true`. This
+weakens no protection: the abandon arm already existed on this path and already priced its own trade
+as *"a stale rectangle — one wrong frame, self-healing at the next present"*, so a smaller bound
+reaches an outcome the code already sanctions, sooner. `close`, `close_owner`, `minimise` and `zoom`
+are untouched and keep the full bound, because there the wait is against a blit from a surface that
+is about to be unmapped and the WC-B hazard is real.
+
+**2. An abandoned wait LATCHES.** `BARRIER_UNHEALTHY` records "this barrier is not converging"; while
+it stands the interactive path does not spin at all (`mvskip=`). A bound alone would only have made
+boot 1 a slower death — 125 reports a second each paying a millisecond is still a dead desktop. The
+latch self-clears: `barrier_stalled()` drops it the moment any path observes `BLIT_ACTIVE == 0`, so
+the system recovers on its own when the compositor does.
+
+**3. A grab is always releasable.** `drag_motion` samples the give-up ledger across `move_to_inner`
+and `drag_cancel("barrier-stalled")`s the gesture the first time its own reposition met the stall;
+`drag_begin` refuses to mint a new one while the latch stands, reporting `[wm-act] drag-refused ...
+barrier-stalled` and leaving the router's chrome arm to report `chrome` instead of `drag` — the press
+still selects and raises. A lost release edge can no longer mean a grab that lives forever, because
+the grab does not outlive the system's ability to service it. This is the sibling of the
+furniture-refused CLOSE guard: the same hole, one verb over.
+
+**It is a SHARED hole and the cure is shared.** All three live in `wm.rs` and are reached by x86's
+router through the same `drag_begin` / `drag_motion` / `move_to_inner`. Nothing in the mechanism is
+aarch64-specific — x86's drag path raises the same barrier from the same mover — so gating the cure
+on `target_arch` would have left the identical latch armed on the other lane with no hardware reason
+for the asymmetry.
+
+### On the wire
+
+`[wedge1] dwell` gains four fields and one verdict:
+
+```
+[wedge1] dwell drains=.. spun=.. spin_max=.. note=65536 in_spin=.. tripwire=.. bound=1073741824
+         abandoned=0 mvbound=1048576 mvgiveup=0 mvskip=0 latched=false span=..ms -> QUIET
+```
+
+`mvgiveup=` is interactive drains that reached their bound, `mvskip=` is pointer reports the latch
+saved from re-entering a doomed wait, `latched=` is the gauge itself. The verdict `MOVE-GAVE-UP` sits
+below `ABANDONED` and above every healthy reading: it says the compositor stopped retiring blits for
+at least a millisecond while a hand was on a window, which is a real finding, but it is not
+`ABANDONED` — nothing about to be unmapped was read. The fields are named `mvgiveup=`/`mvskip=` and
+NOT `move_abandoned=` on purpose: the pi4 spec's `FORBID \[wedge1\] dwell .*abandoned=[1-9]` is
+matched against the teardown counter and would have caught the other spelling.
+
+A give-up also prints once per boot, lock-free token first:
+
+```
+:: [wedge1] MOVE DRAIN GAVE UP core=3 blit_active=1 pending=1 spins=1048576 == interactive-bound ::
+```
+
+### The gate
+
+`wm::dragwedge_selftest` (`witness` + `pidesk`, hooked from the aarch64 battery after `dragperf`)
+reproduces the metal's exact state — one `BlitGuard` held, `blit_active=1` — and asserts five terms:
+a kernel-band title strip pressed through the SHIPPED router grabs and releases; one drag motion
+against the held guard RETURNS inside a millisecond-scale budget; that motion RELEASES the grab it
+could not service; a fresh grab is REFUSED while the stall stands, at no measurable cost; and the
+refusal LIFTS when the guard drops. `FORBID \[dragwedge\] .* -> FAIL` in
+`scripts/specs/pi4-regression.spec`, on the `[dragperf]` argument — the fixture is knob-gated, so a
+FORBID costs nothing when the line is absent and the required count stays 108. It RESTORES the
+give-up ledger on the way out, because its own give-up is deliberate: leaving it standing would make
+every later `[wedge1] dwell` line on an armed boot read `MOVE-GAVE-UP` and would burn the
+once-per-boot give-up print, so a real one later in the same boot would have no line of its own.
+
+Measured, both gates at 210 s:
+
+```
+./arroyo kernel8-test 210                  108/108, 0 forbidden   (the DONE gate — fixture absent, knob off)
+UNAOS_PIDESK=1 ./arroyo kernel8-test 210   [dragwedge] ... ms=738/2500 ... -> PASS
+```
+
+⚠ **The `UNAOS_PIDESK=1` gate is RED at `14e54538` and was red before this arc** — measured, not
+assumed: a throwaway worktree at the base commit reds the identical
+`FORBID [wc-h] ... torn=N ... -> AT-RISK` on `win=1`, with the first torn present landing hundreds of
+lines ahead of any fixture in the battery. It is owed to whoever owns `[wc-h]`; this arc neither
+caused it nor cleared it.
+
+**On the pre-fix image this fixture does not print FAIL — it HANGS**, which is the honest signature
+of the defect and is exactly why the cure had to be the bound rather than a louder witness.
+
+### BOOT 3 IS A DIFFERENT DEFECT, AND THIS ARC DOES NOT FIX IT
+
+A third capture from the same image arrived mid-arc: glass entirely unresponsive, kernel alive,
+`MOUSE-1` reports still flowing. It is NOT this mechanism, and the wire refuses it on four
+independent counts:
+
+| reading | boot 1 | boot 2 | boot 3 |
+| --- | --- | --- | --- |
+| `[wedge1]` lines in the tail | many | many | **none at all** |
+| `[wcn] aborted=` | — | 34..39 | **0** |
+| `[click2] depth gui_chan=` | **65, pinned** | 0 | **0, `sent == recv`, both climbing** |
+| `[wm-act] drag-begin` | console drag | win=4, no `drag-end` | **none** |
+
+No `[wedge1]` line anywhere means `DrainBarrier::drain` was never *called*; `aborted=0` means no
+composite ever took the `DRAIN_PENDING` early return, so the barrier was never up; and an empty GUI
+channel whose `sent`/`recv` both advance is a consumer that is alive and draining, which is the
+opposite of boot 1's jam.
+
+What boot 3 actually shows is **EL0 death**. `[prio] ... totals el0=2490629` is constant across every
+rollup in the 2660-line tail — no user task ran again — and the consequences follow mechanically:
+`[wcn] rollup wins=3 att=0 comp=0 passes=0 aborted=0 span=545184ms -> IDLE` (nothing presented for
+nine minutes), `[sched6] composites=0/s`, and `[cursor3] planned=571 offers=568 taken=0` with
+`[cursor11] px_installed=0`. The arrow is a *composited* sprite, so with zero passes it cannot move
+however many reports arrive — "the mouse does not respond" is downstream of the compositor here, not
+of the event queue.
+
+The pinned core is attributable too, and it is not this arc's spin. `[piusb26] pump pass` reads
+**1498784103 / 1972189353 / 1060628143 / 1348032519 cycles** at the four points where
+`SCHED ... c3=99%` appears — against a normal pass of 119..134 cycles. That is the xHCI BOT storage
+pump (`pump=spin+hlt`) burning ~1 s per pass while a wedged card reader was retried
+(`SURRENDER slot=2 ... retracted=yes`, then slot-5 stall/resync churn). It stops after line 839 and
+the tail's cores read 0..4% — yet input never returned, which is why unplugging the reader did not
+help and why storage *starvation* is refuted as the standing cause: EL0 was already frozen before the
+captured tail began.
+
+**The common thread is a CLASS, not a site.** All three boots pin a core at 99% inside a masked wait
+whose bound is far past any interactive budget, on a path the desktop depends on. In boots 1 and 2
+that wait is `DrainBarrier::drain`'s 2^30 spin and this arc bounds it. In boot 3 it is the BOT pump's
+`spin+hlt`, which wants exactly the same treatment WEDGE-10 states and this arc applies — a bound
+denominated in something an operator can feel. That is the xHCI lane's, not the video lane's, and the
+EL0-liveness question behind it is the scheduler's; both are named here so the next reader does not
+have to re-derive them from the capture.
+
+---
