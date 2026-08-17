@@ -1617,3 +1617,29 @@ FORBID \[dragwedge\] .* -> FAIL
 # --- The assertion itself EXTENDS §4c's existing `[wedge1] dwell` REQUIRE rather than adding a
 # --- second one, so the required count stays 108 on both batteries and the ledger is gated by the
 # --- one directive that was already reading that line.
+# --- SHARD-PRESS (PA41) — the crystal menu REACHES THE GLASS on the Pi (`crystal::routed_selftest`).
+# --- FORBID and not REQUIRE, on `[dragperf]`'s precedent immediately above and for its reason: the
+# --- fixture is `pidesk`-gated and its line is absent from the knob-off battery this gate runs, so a
+# --- REQUIRE would red a build for not carrying a knob it was never given. A FORBID costs nothing
+# --- when the line is absent (0 hits) and still reds the armed battery on a regression.
+# ---
+# --- What it guards. PA41's metal reading was "the crystal ignores clicks", and the two witness terms
+# --- available said otherwise in ways that could not be told apart: `crystal_press=open` proved the
+# --- STATE changed, while `[menubar] … press=inert` was a stale hardcode from the arc when the bar had
+# --- no press seam at all. The real defect was between them — the press opened the menu and NOTHING
+# --- composited it, because `crystal::compose` runs only from a composite and on a quiet desktop no
+# --- later pass was coming. The fixture drives the LIVE shared furniture router
+# --- (`strip::press_route`, the one both arch routers call) and asserts the whole chain, so any link
+# --- breaking prints FAIL here:
+# ---   * `routed=true(open)`  — the router arm consumed the press and the menu band says what it did;
+# ---   * `painted=true`       — `SLOT` non-empty, i.e. the dropdown reached the PANEL. This is the leg
+# ---                            that reds without MENU-DRIVE, and it is the whole point of the rule;
+# ---   * `dismissed=true(dismiss)` / `erased=true` — the mirrored claim on the way back down.
+FORBID :: SHARD-PRESS: .* :: FAIL ::
+
+# --- …and the stale WITNESS WORD may not come back. `press=inert` on the bar's ledger line is what
+# --- PA41's investigation read as "press routing latched off"; the bar's one press target is the
+# --- crystal and the line now says `press=crystal`. A witness term that stops tracking the code it
+# --- describes costs a whole investigation round, so the retired word is forbidden outright rather
+# --- than left to a REQUIRE that the knob-off battery cannot carry.
+FORBID \[menubar\] .* press=inert

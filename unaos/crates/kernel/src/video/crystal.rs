@@ -269,6 +269,47 @@ static DISMISSES: AtomicU64 = AtomicU64::new(0);
 static PICKS: AtomicU64 = AtomicU64::new(0);
 static LAST_VERB: AtomicU8 = AtomicU8::new(0xFF);
 
+/// CLICK-BAND — **what the LAST consumed press did.** [`press_at`] answers the router `true`, and a
+/// caller that could not say WHAT the menu did with the press could name the band and nothing else —
+/// which is exactly the reading gap PA41's "the crystal ignores clicks" round was built on. Written by
+/// every consuming arm of [`press_at`], read by [`last_press_outcome`] immediately after the call on
+/// the same task; no cross-core reader.
+static PRESS_OUTCOME: AtomicU8 = AtomicU8::new(0);
+const OUT_OPEN: u8 = 1;
+const OUT_PICK: u8 = 2;
+const OUT_KEPT: u8 = 3;
+const OUT_DISMISS: u8 = 4;
+
+/// CLOBBER-REPAIR (PA41) — passes in which a window the compositor painted had intersected the rows
+/// the OPEN dropdown last painted. The bar's and the dock's counter, on the same terms; `clob=` on the
+/// `[crystal]` ledger line is the falsifier for "the menu survives a window blit crossing it".
+static CLOBBERS: AtomicU64 = AtomicU64::new(0);
+
+/// CLICK-BAND — the last consumed press's outcome, as the witness word.
+pub fn last_press_outcome() -> &'static str {
+    match PRESS_OUTCOME.load(Ordering::Relaxed) {
+        OUT_OPEN => "open",
+        OUT_PICK => "pick",
+        OUT_KEPT => "kept-open",
+        OUT_DISMISS => "dismiss",
+        _ => "none",
+    }
+}
+
+/// MENU-DRIVE / CLOBBER-REPAIR — **does the dropdown owe a paint or an erase that only a composite can
+/// discharge?** Two relaxed loads, no lock.
+///
+///  * **OPEN and the slot is EMPTY** — the dropdown is in state but not yet on the panel: a PAINT is
+///    owed.
+///  * **CLOSED and the slot is NON-EMPTY** — it was dismissed but its pixels are still on the panel:
+///    an ERASE is owed.
+///
+/// The condition [`compose`] itself acts on, read the other way round, so [`open`]/[`dismiss`] can
+/// confirm that the composite they drove actually LANDED rather than assume it.
+pub fn paint_owed() -> bool {
+    OPEN.load(Ordering::Relaxed) != (SLOT.packed() != 0)
+}
+
 // ---------------------------------------------------------------------------
 // Geometry — the dropdown rect, and the row layout inside it
 // ---------------------------------------------------------------------------
@@ -381,6 +422,27 @@ fn open(pw: usize, ph: usize) {
         ":: SHARD-MENU: crystal_press=open menu={}x{}+{}+{} items={} ::",
         mw, mh, mx, my, ITEM_COUNT
     );
+    // MENU-DRIVE (x86 trunk 122ed63e, ported; PA41 on the Pi) — **an open menu must DRIVE the pass
+    // that paints it.** [`compose`] runs only from `strip::compose_all` at the tail of
+    // `wm::composite_once`, and every OTHER state-changing gesture (a close, a drag, a zoom, a
+    // minimise, a dock raise) runs a composite itself — this one did not. On the emptied late-boot
+    // desktop nothing else composites (the render lane blocks on its channel, the backdrop's timer
+    // flush carries no damage, `wm::service_damage` returns with no damaged row), so the operator's
+    // presses opened the menu IN STATE while the glass never changed: on x86 that read as
+    // `crystal_press=open` with no `[crystal]` rollup for the next 30 s; on the Pi, where the mouse
+    // itself drives composites, it read as a menu that appeared only if you kept moving the pointer.
+    // Task context only (the click router, `key_escape`, `set_enabled(false)` and the fixtures), so
+    // the composite is taken directly.
+    super::wm::composite();
+    // BELT-AND-BRACES retry, and it is NOT dead weight on aarch64 even though `wm::composite` has no
+    // decline path there (it IS `composite_once`): `strip::paint` can still decline the pass on a
+    // contended SCRATCH or a surface that is not yet `word4`, and then the slot is untouched and the
+    // menu is open with nothing on the glass. [`paint_owed`] is the same test `compose` acts on, so a
+    // retry runs iff the first pass did not land. On x86 this also closes the narrow window where the
+    // pass was declined into a concurrent `COMP_GATE` holder that has since released.
+    if paint_owed() {
+        super::wm::composite();
+    }
 }
 
 /// Dismiss the menu. Idempotent. The next [`compose`] erases whatever rect the dropdown owned — the
@@ -393,6 +455,15 @@ fn dismiss(reason: &str) {
     }
     DISMISSES.fetch_add(1, Ordering::Relaxed);
     serial_println!(":: SHARD-MENU: crystal_press=dismiss reason={} ::", reason);
+    // MENU-DRIVE — the mirrored half of [`open`]'s rule. The erase ([`compose`]'s closed path, which
+    // also hands the vacated rows back to their owners through [`repaint_vacated`]) runs only from a
+    // composite, and on a static desktop no other pass is coming — an on-glass dropdown would outlive
+    // its Escape. A dismiss of a menu that never painted erases nothing (the slot is clear) and the
+    // pass is one bounded walk.
+    super::wm::composite();
+    if paint_owed() {
+        super::wm::composite();
+    }
 }
 
 /// **Public dismissal**, for [`super::menubar::set_enabled`]: turning the bar off must tear the menu
@@ -512,6 +583,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
                     Some(verb) => {
                         PICKS.fetch_add(1, Ordering::Relaxed);
                         LAST_VERB.store(verb.ord(), Ordering::Relaxed);
+                        PRESS_OUTCOME.store(OUT_PICK, Ordering::Relaxed);
                         serial_println!(
                             ":: SHARD-MENU: crystal_pick verb={} action={} ::",
                             verb.name(),
@@ -523,11 +595,15 @@ pub fn press_at(x: i32, y: i32) -> bool {
                     }
                     // Inside the menu but not on an item (separator / border / padding): swallow the
                     // press and keep the menu open, as a real menu does.
-                    None => true,
+                    None => {
+                        PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed);
+                        true
+                    }
                 };
             }
         }
         // A press anywhere outside the open menu dismisses it, and the click is spent doing so.
+        PRESS_OUTCOME.store(OUT_DISMISS, Ordering::Relaxed);
         dismiss("outside");
         return true;
     }
@@ -535,6 +611,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     // Closed: the only press we own is one on the crystal box itself.
     if let Some((cx, cy, cw, ch)) = menubar::crystal_box_abs(pw, ph) {
         if px >= cx && px < cx + cw && py >= cy && py < cy + ch {
+            PRESS_OUTCOME.store(OUT_OPEN, Ordering::Relaxed);
             open(pw, ph);
             return true;
         }
@@ -625,10 +702,11 @@ pub fn compose() -> bool {
     LEDGER.tick(
         "crystal",
         format_args!(
-            "state=open opens={} dismisses={} picks={}",
+            "state=open opens={} dismisses={} picks={} clob={}",
             OPENS.load(Ordering::Relaxed),
             DISMISSES.load(Ordering::Relaxed),
-            PICKS.load(Ordering::Relaxed)
+            PICKS.load(Ordering::Relaxed),
+            CLOBBERS.load(Ordering::Relaxed)
         ),
     );
 
@@ -644,8 +722,20 @@ pub fn compose() -> bool {
         return false;
     };
 
+    // CLOBBER-REPAIR (PA41) — the dropdown's signature is a pure function of its RECT, so a window
+    // that painted over the open menu changes nothing this test can see and the menu would stay
+    // half-overwritten until it was dismissed. `wm::occ_clip` withholds the menu's columns from a
+    // window blit on x86 and is `x86_64`-only, so on the Pi that protection does not exist at all and
+    // this is the only thing standing between an open menu and a window's pixels. The dock's WCK5
+    // condition, asked the dock's way: one bounded table scan, and only while the menu is OPEN — the
+    // closed path returned above without reaching it.
+    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let (_, clobbered) = wm::dock_scan(&mut rows, SLOT.rect());
+    if clobbered {
+        CLOBBERS.fetch_add(1, Ordering::Relaxed);
+    }
     let sig = strip::seal(strip::fnv1a_u64(strip::FNV_BASIS, strip::pack_rect(Some(r))));
-    if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(Some(r)) {
+    if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(Some(r)) && !clobbered {
         return false;
     }
 
@@ -754,10 +844,11 @@ pub fn rollup(scope: &str) {
         "crystal",
         scope,
         format_args!(
-            "opens={} dismisses={} picks={} last_verb={}",
+            "opens={} dismisses={} picks={} clob={} last_verb={}",
             OPENS.load(Ordering::Relaxed),
             DISMISSES.load(Ordering::Relaxed),
             PICKS.load(Ordering::Relaxed),
+            CLOBBERS.load(Ordering::Relaxed),
             LAST_VERB.load(Ordering::Relaxed)
         ),
     );
@@ -926,6 +1017,85 @@ pub fn selftest() {
         if ok { "PASS" } else { "FAIL" }
     );
     rollup("selftest");
+}
+
+/// SHARD-PRESS fixture (PA41) — **a press on the crystal, through the LIVE furniture router, puts the
+/// dropdown ON THE GLASS; the next press takes it off again.**
+///
+/// # Why this exists, and why [`selftest`] could not answer it
+///
+/// [`selftest`] calls [`press_at`] DIRECTLY, so it proves the hit-test and the modal state machine and
+/// nothing about either seam that matters on metal: not the router arm that reaches the menu, and not
+/// the paint. On the Pi, PA41's operator pressed the crystal and saw nothing happen, and the only
+/// witness terms available said `crystal_press=open` (the state DID change) beside a `[menubar]` line
+/// whose `press=` word was a stale hardcode. Both halves of that gap are closed here:
+///
+/// 1. **the press is ROUTED** — driven through [`strip::press_route`], the ONE shared furniture router
+///    both `arch/aarch64/syscall.rs::wc_click_route` and x86's `wc_click_route_at` call ahead of every
+///    window arm. What is not covered is per-arch and named rather than implied: the button-mask edge
+///    detection, the press-target latch and the input rings all sit ABOVE this seam.
+/// 2. **and the menu is PAINTED** — `SLOT` non-empty, i.e. [`compose`] actually ran and landed pixels.
+///    This is the leg that reds without MENU-DRIVE: before [`open`] drove its own composite, the state
+///    flipped and the slot stayed empty, because on a quiet desktop no other pass was coming.
+/// 3. **a press outside DISMISSES, and the ERASE lands** — the mirrored claim, `SLOT` back to empty.
+///    Leg 3 is also what keeps the fixture side-effect-free: while the menu is open the crystal
+///    consumes EVERY point, so the press that would otherwise reach the dock or a window is spent on
+///    the dismissal. It is skipped entirely if leg 1 did not open, so a declined crystal can never
+///    turn this fixture into an unsolicited dock press.
+///
+/// The bar is restored to whatever state it arrived in and the menu is left closed.
+#[cfg(feature = "witness")]
+pub fn routed_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        (fb.width(), fb.height())
+    };
+    let saved_bar = menubar::enabled();
+    dismiss("routed-selftest"); // idempotent: a menu left open by anything above must not skew leg 1
+    menubar::set_enabled(true);
+
+    // Legs 1-2 — the crystal, through the router, and the paint that press owes.
+    let (routed, open_word, opened, painted) = match menubar::crystal_box_abs(pw, ph) {
+        Some((cx, cy, cw, ch)) => {
+            let hit = strip::press_route((cx + cw / 2) as i32, (cy + ch / 2) as i32);
+            (hit, last_press_outcome(), OPEN.load(Ordering::Acquire), SLOT.packed() != 0)
+        }
+        None => (false, "no-crystal", false, false),
+    };
+    let (mw, mh, mx, my) = menu_rect(pw, ph).map(|(x, y, w, h)| (w, h, x, y)).unwrap_or((0, 0, 0, 0));
+
+    // Leg 3 — a press outside the OPEN menu dismisses it, and the erase lands. Only reachable when
+    // leg 1 opened; otherwise this point belongs to the dock and the fixture declines to press it.
+    let (dismissed_hit, dismiss_word, closed, erased) = if opened {
+        let hit = strip::press_route((pw - 1) as i32, (ph - 1) as i32);
+        (hit, last_press_outcome(), !OPEN.load(Ordering::Acquire), SLOT.packed() == 0)
+    } else {
+        (false, "not-open", false, false)
+    };
+
+    dismiss("routed-selftest");
+    menubar::set_enabled(saved_bar);
+
+    let ok = routed
+        && open_word == "open"
+        && opened
+        && painted
+        && dismissed_hit
+        && dismiss_word == "dismiss"
+        && closed
+        && erased;
+    serial_println!(
+        ":: SHARD-PRESS: menu={}x{}+{}+{} panel={}x{} routed={}({}) opened={} painted={} \
+         dismissed={}({}) closed={} erased={} :: {} ::",
+        mw, mh, mx, my, pw, ph,
+        routed, open_word, opened, painted,
+        dismissed_hit, dismiss_word, closed, erased,
+        if ok { "PASS" } else { "FAIL" }
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════════

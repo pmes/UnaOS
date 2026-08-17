@@ -298,6 +298,115 @@ been paced by either mechanism.** Leaving it that way is now the ruling.
 
 ---
 
+## 5.5 The `exec-crystalpi` arc — the SHARD menu on the Pi (PA41)
+
+Two metal defects on `hw-pi4@14e54538`, reported as one symptom: *"the crystal ignores clicks; the bar
+came up incomplete — crystal missing — and filled in only when I moved the mouse."* They are **one root
+cause wearing two faces: furniture state changes did not drive the pass that paints them, and the
+furniture's damage test could not see the one writer that destroys it.**
+
+### 5.5a `press=inert` was a stale WITNESS WORD, not a routing defect
+
+`[menubar] … press=inert` is a hardcoded string from the arc when the bar had no press seam at all. By
+PA41 the crystal *was* routed — `arch/aarch64/syscall.rs::wc_click_route` calls `strip::press_route`
+ahead of every window arm, and `:: SHARD-MENU: crystal_press=open` on the same captures proves the arm
+fired. An operator reading the two lines together could only conclude the routing was latched off.
+
+The line now reads `press=crystal` (x86 trunk `122ed63e` made the identical edit for the identical
+reason). **`FORBID \[menubar\] .* press=inert` is in `pi4-regression.spec`** so the retired word cannot
+come back. The rule this cost a round to learn: *a witness term must track the code it describes, and a
+term describing an absent feature must be retired the day the feature lands.*
+
+### 5.5b MENU-DRIVE — an open menu must drive the pass that paints it
+
+`crystal::compose` runs **only** from `strip::compose_all`, at the tail of `wm::composite_once`. Every
+other state-changing gesture in the window system (a close, a drag, a zoom, a minimise, a dock raise)
+runs a composite itself. `crystal::open`/`dismiss` did not: they flipped `OPEN`, printed, and returned.
+On a quiet desktop nothing else composites — the render lane blocks on its channel, the backdrop's
+timer flush carries no damage, `wm::service_damage` returns without compositing while no row is dirty —
+so the menu opened *in state* and never reached the glass. On the Pi the pointer itself drives
+composites, which is why the menu "appeared on click" for an operator whose hand was moving and never
+appeared for one whose hand was still.
+
+The fix is `122ed63e`'s: `open`/`dismiss` call `wm::composite()`, with one retry gated on `paint_owed()`
+(the same `OPEN != slot-non-empty` test `compose` acts on), so the retry runs iff the first pass did not
+land. **What was deliberately NOT ported is the x86 half.** `122ed63e` also threads a `menu_paint_owed()`
+term through `wm::composite`'s re-run loop and lost-wakeup gate, because on x86 `composite()` can be
+DECLINED into a concurrent `COMP_GATE` holder. On aarch64 `wm::composite()` **is** `composite_once()` —
+no gate, no decline, no re-run loop — so that term would have no consumer on this arch, and adding it
+would cost lines in `wm.rs`, which §5.3 forbids. **`wm.rs` is untouched by this arc.**
+
+### 5.5c CLOBBER-REPAIR — the bar could not see the writer that destroys it
+
+`menubar::Model::read` called `wm::dock_scan(&mut rows, (0,0,0,0))`: it took the caption and threw the
+damage answer away. The bar's signature is a function of the model and the rect, so **a window that
+paints over the bar changes nothing the bar's own damage test can see** — the pixels are destroyed and
+`compose` returns `false` for the rest of the boot, until the focused caption or the clock minute
+happens to change. That is the "came up INCOMPLETE, filled in slowly alongside cursor activity" reading
+exactly, and it is why the crystal — the leftmost 16×22 of a 1920-wide strip — could be missing while
+the strip around it looked fine.
+
+On x86 this is latent because `wm::occ_clip` withholds the bar's columns from every window blit. **On
+aarch64 `occ_clip` is `#[cfg(target_arch = "x86_64")]` and returns `OccClip::none()`** — §6.2, still
+owed — so on the Pi nothing protects the strips *and* nothing repaired them. The bar and the open
+dropdown now both ask `dock_scan`'s clobber question against the rect they last painted and repaint on
+a yes: `dock::compose`'s WCK5 condition, generalised to tenants #2 and #3. `clob=` is on both ledger
+lines as the falsifier.
+
+**This is a repair, not the protection.** §6.2 remains owed and remains the correct fix — a clobber
+repaint still costs one frame with a window's pixels standing in the bar. Recorded here so a later
+session does not read `clob=` as evidence that §6.2 has been closed. **`clob=0` on every QEMU surface
+run this arc**, at 640×480 and at bench geometry: the repair is structural and its firing is
+metal-owed.
+
+### 5.5d BRINGUP-PAINT — read the paint back, do not infer it
+
+`pidesk::activate`'s step 5 printed `menubar PAINTED` from its own control flow — the inference the same
+function already refuses two steps above for `fbcon::console_is_routed`. `strip::paint` declines without
+touching a pixel on a contended `SCRATCH` (the dock is tenant #1 and takes the same scratch in the same
+pass) or on a surface that is not yet `word4`, and the bar is then left ENABLED — so
+`screen::present_background` is already subtracting its rows from every desktop present — with nothing
+on the glass and no damage condition able to notice. The seam now reads `menubar::owns_pixels()` back
+and re-runs once; the line carries `owns_pixels=` and `retried=`.
+
+### 5.5e The Pi's first furniture fixture
+
+`crystal::selftest`, `dock::selftest` and `menubar::selftest` are all invoked from
+`arch/x86_64/syscall.rs`. **No aarch64 boot had ever run one**, so the whole furniture family was
+unwitnessed on the arch it had just been ported to. `crystal::routed_selftest` (`:: SHARD-PRESS:`) is
+invoked from `video/pidesk.rs` — the only Pi point where the bar is known enabled and painted, and a
+file that is *not* compiled knob-off, so §5.3's line-neutral rule does not reach it
+(`arch/aarch64/syscall.rs` is compiled knob-off, which is why the call is not there). It drives
+`strip::press_route`, the live shared router core both arch routers call, and asserts `painted=` — the
+leg that reds without 5.5b. What it does **not** cover is per-arch and named rather than implied: the
+button-mask edge detection, the press-target latch and the input rings all sit above that seam.
+
+**Fault-injected, not assumed.** Commenting out `open`'s `wm::composite()` (and its retry) and re-running
+`UNAOS_PIDESK=1 ./arroyo kernel8-test 210` printed exactly the defect PA41 saw, and the new rule caught
+it:
+
+```
+:: SHARD-PRESS: menu=282x105+12+34 panel=640x480 routed=true(open) opened=true painted=false
+                dismissed=true(dismiss) closed=true erased=true :: FAIL ::
+❌ MBENCH FAIL — 108/108 required witnesses, 2 forbidden hit(s)
+```
+
+`routed=true(open) opened=true painted=false` is the whole diagnosis on one line: the router worked, the
+state changed, and no pixel reached the panel. The pre-arc wire could not say the third thing.
+
+### 5.5f Gate note — `UNAOS_PIDESK=1` at bench geometry reds, and did so before this arc
+
+`UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 210` does **not** reach 108/108 on a
+loaded host, and the baseline at `14e54538` reds identically (104/108, 31 forbidden hits) with the same
+signature: `[wc-g] … slow=yes -> BLIT`/`RACE-*`, `[wc-h] -> AT-RISK`, `[wc-c] windows=2 drawn=1`,
+`[wc-j] vacate -> FAIL`, `[dragperf] -> FAIL`. It is also **not deterministic** — two consecutive runs
+of the same image gave 104/108 / 29 hits and 103/108 / 40 hits. Every one of those witnesses asserts an
+exact pixel or a present duration against a 1920×1200 panel QEMU emulates six times slower than the
+640×480 default, so this is a host-speed artefact of the surface, not a kernel verdict. **Compare
+against a same-host baseline before reading any of it as a regression.**
+
+---
+
 ## 6. OWED — class (b) gaps this arc did not take
 
 Each is scoped to one line so the next session can pick it up without re-deriving it. **Claim a row
@@ -306,7 +415,7 @@ here before starting; strike it when it lands.**
 | # | Gap | Sites | Scope |
 |---|---|---|---|
 | 6.1 | **Desktop backdrop layer (SHELLNOTDESK)** — *trigger half LANDED, PIDESK-CLEAR 2026-08-17* | `main.rs` ×2 (`desktop_owns_backdrop`), `screen.rs:669` (`paint_desktop_scene`) | **Trigger: done.** `pidesk::activate` now carries the panel-wide `DESKTOP_BG` clear (`[pidesk] desktop-clear`) — x86's WC-X DESKTOP-CLEAR on this arch — and `wcf::chrome_truth`'s desktop probe flips `NOCLEAR -> HIT` at bench geometry. **Still owed: the RENDER-SERVICE seam.** The Pi's `render_service` still paints the text shell as the backdrop, so the shell repaints over the clear within a frame; x86 paints the crispy scene and demotes the shell to plumbing. `Screen`/`fill_screen`/`mark_full` are all arch-neutral. **Coordinate with exec-shellport before starting.** |
-| 6.2 | **Windows do not respect menubar / dock / open dropdown** | `wm.rs:12059` (`OccClip::push`), `wm.rs:12281` (`occ_clip`), `wm.rs:12605` (`erase_clip`), `screen.rs:1050`, + 11 witness legs in §3 | On aarch64 the clip is structurally `OccClip::none`, so a window blit paints **over** the menu bar and dock and a deferred erase publishes over them. `pidesk` has already put those strips on the Pi's glass, so **the exposure is live today.** This is the same defect class x86 fixed. Largest owed item; its own arc. |
+| 6.2 | **Windows do not respect menubar / dock / open dropdown** | `wm.rs:12059` (`OccClip::push`), `wm.rs:12281` (`occ_clip`), `wm.rs:12605` (`erase_clip`), `screen.rs:1050`, + 11 witness legs in §3 | On aarch64 the clip is structurally `OccClip::none`, so a window blit paints **over** the menu bar and dock and a deferred erase publishes over them. `pidesk` has already put those strips on the Pi's glass, so **the exposure is live today.** This is the same defect class x86 fixed. Largest owed item; its own arc. **STILL OWED after `exec-crystalpi`** — that arc added the *repair* (§5.5c: the bar and the dropdown now notice a clobber and repaint the same pass) but not the *protection*, so the exposure is bounded to one frame rather than removed. |
 | 6.3 | **Quiet boot screen** | `fbcon.rs` ×9 (`QUIET-PANEL` `_print` suppression, `PANEL_MUTE_TAGS`, `TAG_SNIFF` + impls, `PANIC_MIRROR`) | x86 paints milestone lines only and mutes `[wc-g]/[wc-h]/[wc-d]/[wcn]` telemetry from the glass, with `PANIC_MIRROR` as the panic override; the Pi mirrors the raw serial stream across the boot panel. All arch-neutral policy over `_print`. Self-contained. |
 | 6.4 | **Dock tile count for the blit clip** | `wm.rs` `dock_tiles` | `video::dock` is already on the Pi via `pidesk`, but its tile count feeding `occ_clip` is not. Small; **do it with 6.2**, which is the consumer. |
 | 6.5 | **Fast glyph painting** | `fbcon.rs:154` (`draw_glyph` encode4 path), `framebuffer.rs:268` (`put_raw4`) | x86 hoists the pixel-format decode out of the 8×8 bit loop and pokes pre-encoded words; the Pi runs `put_pixel` with a per-pixel `match` on `pixel_format`. `encode4`/`word4` already exist on both arches (aarch64 uses them in `fill_span4`). Performance parity, felt as console/glyph repaint speed. |

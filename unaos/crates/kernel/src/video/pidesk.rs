@@ -214,7 +214,30 @@ pub fn activate() -> bool {
     // 5. And COMPOSITE, so the rows the enable just took are painted. See the module header: without
     //    this, a quiet boot withholds the strip's rows from the desktop present and never fills them.
     wm::composite();
-    serial_println!("[pidesk] menubar PAINTED (composite at the enable seam)");
+    // BRINGUP-PAINT (PA41) — **read the paint back; do not infer it from having called `composite`.**
+    //
+    // M1's step 5 asserted "menubar PAINTED" from its own control flow, which is the exact inference
+    // this function refuses two steps above for `console_is_routed`. It is not sound here either:
+    // `strip::paint` declines the pass without touching a pixel on a contended `SCRATCH` (the dock is
+    // tenant #1 and takes the same scratch in the same pass) or a surface that is not yet `word4`, and
+    // `menubar::compose` then returns `false` with its slot untouched. The bar is left ENABLED — so
+    // `screen::present_background` is already subtracting its rows from every desktop present — with
+    // nothing on the glass and no damage condition able to notice, which is a bar that is invisible
+    // for the rest of the boot on exactly the quiet desktop this seam exists to serve. One re-run
+    // discharges it, and `owns_pixels` is the same packed load `compose` acts on, so the retry runs
+    // iff the first pass did not land. PA41's metal reading — a bar that "came up INCOMPLETE" and
+    // filled in only under pointer activity — is this hole and the clobber hole below, together.
+    let repainted = if menubar::enabled() && !menubar::owns_pixels() {
+        wm::composite();
+        true
+    } else {
+        false
+    };
+    serial_println!(
+        "[pidesk] menubar PAINTED owns_pixels={} retried={} (composite at the enable seam, read back rather than assumed)",
+        menubar::owns_pixels(),
+        repainted
+    );
 
     // The SHARD menu is reachable from this instant: `crystal::press_at` hit-tests
     // `menubar::crystal_box_abs`, and the aarch64 click router's furniture arm
@@ -224,6 +247,22 @@ pub fn activate() -> bool {
     serial_println!(
         "[pidesk] crystal LIVE — press the crystal for the SHARD menu (About is real on aarch64; Sleep/Restart/Shut Down print their honest unimplemented lines — no PSCI wiring on this track yet)"
     );
+
+    // SHARD-PRESS (PA41) — and that claim is now WITNESSED rather than asserted. This is the Pi's
+    // first furniture fixture: `crystal::selftest`, `dock::selftest` and `menubar::selftest` are all
+    // invoked from `arch/x86_64/syscall.rs` alone, so before this line no aarch64 boot had ever run a
+    // menu-bar or crystal fixture and the whole family was unwitnessed on the arch it had just been
+    // ported to. It is invoked HERE, at the seam, and not from the aarch64 selftest cascade for two
+    // reasons: this is the only point on the Pi where the bar is known to be enabled and painted, and
+    // `arch/aarch64/syscall.rs` is compiled into the knob-off `kernel8.img` whose byte-identity proof
+    // forbids adding a line to it (PARITY.md §5.3) — this file is not.
+    //
+    // It presses the crystal through `strip::press_route` (the live shared router core) and asserts
+    // the dropdown reached the GLASS, which is the leg that reds without MENU-DRIVE. Side-effect-free:
+    // both presses are consumed by the menu band, and it leaves the menu closed and the bar as it
+    // found it.
+    #[cfg(feature = "witness")]
+    super::crystal::routed_selftest();
 
     // ── THE LIVE-CONSOLE DECISION, and the measurement that settled it ──────────────────────────
     //
