@@ -351,6 +351,130 @@ static PRIO_LAST_EL0: AtomicU64 = AtomicU64::new(0);
 static PRIO_LAST_DEFER: AtomicU64 = AtomicU64::new(0);
 static PRIO_LAST_AGED: AtomicU64 = AtomicU64::new(0);
 
+// EL0-LIVE — WHY THE `[prio] el0=` TOTAL STOPS MOVING, ANSWERED ON THE WIRE.
+//
+// The PA41 metal boot-3 capture (`boot3-inputdeath-tail.txt`) is the case this instrument exists for.
+// Across its whole 27.7 s tail: `[prio]` totals `el0=2490629` CONSTANT, `[wcn] passes=0`,
+// `[cursor3] offers=568 taken=0`, `composites=0/s` — the desktop was a still photograph. Every
+// existing instrument agreed that EL0 had stopped and NONE of them could say WHY, because the three
+// candidate causes are indistinguishable in every line the kernel prints:
+//
+//   * STARVED — EL0 tasks are READY and simply never win a dispatch (a priority/affinity defect).
+//   * STRANDED — EL0 tasks exist but every one of them is PARKED and no wake ever arrives (a lost
+//     wakeup: the classic freeze).
+//   * EXTINCT — there are no EL0 tasks left at all. They exited, faulted, or were killed, and the
+//     scheduler is behaving perfectly by running nothing.
+//
+// The three demand OPPOSITE fixes, and reading them apart after the fact is what cost PA41 its
+// diagnosis. The evidence that finally separated them was circumstantial and only available to a
+// reader who knew the source: `[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0` (zero COMMITTED EL0
+// residents on every core) beside `rewake=112 stay=2272 short=40357` (cumulative EL0 wake counters
+// that are large, so EL0 had certainly lived), plus `[spread10] slots 1c=0 2c=0 3c+=0` (no live
+// address-space slot). Residency is released at exactly five sites and every one of them destroys
+// the task, so residents==0 with a large wake history means EXTINCT — the freeze was a REAPING, not
+// a scheduling failure. That reading took a source audit. This line states it outright.
+//
+// What the instrument adds beyond the counters that already exist:
+//
+//   1. A CLOCK. `[prio] el0=` is a per-window delta of a cumulative total; "it stopped" is inferred
+//      by diffing two lines, and only in a capture long enough to hold both. `EL0_LAST_DISPATCH_CYC`
+//      makes "EL0 has not run for N ms" a single field on a single line, readable from ONE line of a
+//      truncated tail — which is the material every metal freeze actually produces.
+//   2. THE RUNNABLE/PARKED SPLIT AT THAT INSTANT, so "not running" is qualified: runnable-and-not-
+//      dispatched is STARVED, all-parked-and-not-woken is STRANDED. Both read lock-free from the
+//      SPREAD-3/SPREAD-4 counters, no run-queue lock on a witness path.
+//   3. A REAP LEDGER. EXTINCT is useless without a cause, and the four EL0 reap sites currently leave
+//      no durable trace: `exit()` and `retire_killed` print nothing, and `dispatch_next`'s `[spin6]`
+//      refusal and `park_blocked`'s dead arm print ONE line each at the moment they fire — lines that
+//      a tail capture, by construction, has already scrolled past. Four counters cost four rare
+//      increments and turn "all the EL0 tasks are gone" into "all the EL0 tasks were KILLED".
+//
+// THE STALL THRESHOLD IS 2 s ON PURPOSE. `syscall::TAKEOVER_STALE_SECS` is 2: after two seconds
+// without a `SYS_INPUT_POLL`, `run_user_image` stops treating the focused app as live-in-takeover,
+// re-arms its deadline, and — if the app stays quiet for the deadline too — issues an ASID-SCOPED
+// `sched::kill` against the whole address space. An EL0 outage longer than 2 s is therefore not just
+// a latency complaint; it is the precondition for the shell to start destroying the fleet. Pinning
+// the verdict to the same number means `[el0live] verdict=STARVED` on the wire is the EARLY WARNING
+// for the `verdict=EXTINCT kill_offcpu=` that can follow it, and the two lines together would have
+// convicted PA41 from the tail alone.
+//
+// Cost: two relaxed stores that reuse CNTPCT reads the dispatch and wake paths already take (no new
+// sysreg read on either hot path), four rare increments, and one line per witness window. Every
+// counter is per-core and cache-line padded for SPIN-3's reason — an A72 has no LSE atomics, so a
+// shared line under a storm is a livelock waiting to be found.
+
+/// EL0-LIVE — CNTPCT at the most recent EL0 dispatch ON THIS CORE. Written by `dispatch_next` from
+/// the `busy_t0` stamp it already takes, so this costs a store and not a second `mrs`. Per-core and
+/// padded (SPIN-3): a shared global would put a store from every core on one line on the context-
+/// switch path, which is the exact shape that starved `make_ready` for 200 s on P96.
+///
+/// The reader takes the MAX across cores: EL0 is "running" if ANY core dispatched an EL0 task, and a
+/// core that has left the dispatch loop must not drag the machine-wide figure backwards.
+/// Zero means "no EL0 task has ever been dispatched on this core", which is the honest QEMU baseline.
+static EL0_LAST_DISPATCH_CYC: [PaddedU64; NUM_CPUS] =
+    [const { PaddedU64(AtomicU64::new(0)) }; NUM_CPUS];
+
+/// EL0-LIVE — CNTPCT at the most recent EL0 WAKE targeting this core, written by `make_ready` from
+/// the `wake_cyc` stamp it already computes. Indexed by the wake's TARGET core (the one that will
+/// dispatch it), not the waker's, so `last_wake` and `last_dispatch` describe the same core's story.
+///
+/// Several cores may store here for one target; the value is a monotonic clock and the reader takes
+/// the max across cores, so a lost race costs at most one slightly-stale reading of a field whose
+/// whole purpose is "was there a wake RECENTLY". No RMW, so no LL/SC reservation to break.
+static EL0_LAST_WAKE_CYC: [PaddedU64; NUM_CPUS] =
+    [const { PaddedU64(AtomicU64::new(0)) }; NUM_CPUS];
+
+/// EL0-LIVE — the REAP LEDGER: how many EL0 tasks left the machine, by cause. One cache line of its
+/// own so four counters that fire a handful of times per boot can never share a line with anything
+/// on a hot path (SPIN-3 again).
+///
+/// The four fields are the four — and, by audit, the only four — sites that call
+/// `el0_resident_leave` without a matching `el0_resident_enter`, i.e. the only ways an EL0 task can
+/// stop existing:
+///
+///   * `exit` — `exit()`, the single funnel for every VOLUNTARY retirement: `sys_exit`,
+///     `SYS_THREAD_EXIT`, the M6b EL0 fault-kill, a `kill_check_current` boundary, and a kernel
+///     entry's return. A desktop that closes a window increments this; so does one whose vug took a
+///     data abort. `kill_oncpu` below splits the deliberate half back out.
+///   * `kill_oncpu` — of those `exit()`s, the ones that had a kill request naming them (counted at
+///     `exit()`'s existing `kill_slot_for` site, so no extra lookup and no reordering of a path whose
+///     ordering is load-bearing). This is `kill_check_current` retiring a task at its own boundary —
+///     the ordinary outcome of `run_user_image`'s Timeout kill when the target is still scheduled.
+///   * `kill_offcpu` — `retire_killed`, the scheduler-context arm: the target never ran again at all.
+///   * `corrupt` — `dispatch_next`'s SPIN-6 refusal: the saved frame pointed outside the task's own
+///     stack, so the switch-in was refused and the task dropped. A nonzero figure here is a memory-
+///     corruption finding, not a scheduling one, and it must never be read as an ordinary exit.
+///   * `nopark` — `park_blocked`'s dead arm: a task switched back BLOCKED carrying no park action, so
+///     nothing would ever have re-readied it. `debug_assert!`-impossible; counted because a release
+///     build would otherwise lose the whole task silently.
+#[repr(align(64))]
+struct El0ReapLedger {
+    exit: AtomicU64,
+    kill_oncpu: AtomicU64,
+    kill_offcpu: AtomicU64,
+    corrupt: AtomicU64,
+    nopark: AtomicU64,
+}
+static EL0_REAPED: El0ReapLedger = El0ReapLedger {
+    exit: AtomicU64::new(0),
+    kill_oncpu: AtomicU64::new(0),
+    kill_offcpu: AtomicU64::new(0),
+    corrupt: AtomicU64::new(0),
+    nopark: AtomicU64::new(0),
+};
+
+/// EL0-LIVE — the outage after which EL0 is no longer merely late. Tied to
+/// `syscall::TAKEOVER_STALE_SECS` (2 s), the point at which `run_user_image` stops believing the
+/// focused app is alive and starts down the road that ends in an ASID-scoped kill; see the block
+/// above. A witness window is ~1 s, so this is two windows — long enough that an ordinary busy
+/// window cannot trip it, short enough to fire well inside any freeze a human would notice.
+const EL0_STALL_MS: u64 = 2_000;
+
+/// EL0-LIVE — `[el0live]`'s change-suppression signature, so a healthy machine adds one line and then
+/// stays quiet. Never suppresses a line whose verdict is not `LIVE`: a freeze must keep saying so
+/// every window, because the reader's capture may start anywhere.
+static EL0LIVE_LAST_SIG: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// SCHED-7 — the CNTPCT busy span `dispatch_next` folded into the load window on the CURRENT pass
 /// (0 when the run queue was empty). `run()` reads+clears it after every pass and folds the REST of
 /// the pass's wall span in as IDLE, so no wall time is left unaccounted. Single-writer (the owning
@@ -1553,6 +1677,24 @@ fn el0_active(cpu: usize) -> usize {
     EL0_RESIDENTS[cpu].0
         .load(Ordering::Acquire)
         .saturating_sub(EL0_PARKED[cpu].0.load(Ordering::Acquire))
+}
+
+/// EL0-LIVE — RAW parked EL0 residents on `cpu`, WITHOUT `el0_active`'s saturation.
+///
+/// `el0_active` deliberately saturates `committed - parked` at zero, and `[spread4]`'s
+/// `live=active/committed` therefore renders the pair `parked=3, committed=0` as `0/0` — pixel-
+/// identical to `parked=0, committed=0`. Those two states are OPPOSITE diagnoses: the first is three
+/// EL0 tasks still parked under a residency count that has been leaked to zero, the second is a fleet
+/// that no longer exists. PA41 boot-3 read `0/0` and the distinction had to be argued from the
+/// cumulative wake counters instead of read off the line. `[el0live]` prints this raw figure so
+/// `parked > committed` — which is not supposed to be observable outside a few cycles mid-wake — is
+/// visible as itself rather than collapsed into the healthy-looking zero.
+#[inline]
+fn el0_parked_raw(cpu: usize) -> usize {
+    if cpu >= NUM_CPUS {
+        return 0;
+    }
+    EL0_PARKED[cpu].0.load(Ordering::Acquire)
 }
 
 /// SPREAD-13 — COMMITTED EL0 residents on `cpu`: `EL0_RESIDENTS` without SPREAD-4's parked
@@ -3315,6 +3457,14 @@ fn make_ready(mut task: Box<Task>) {
         // kernel-worker wake traffic (sleeper drain, semaphores) stays out of both means.
         task.wake_cyc = now_cyc();
     }
+    // EL0-LIVE: the EL0 wake clock, from the stamp just taken (set for every EL0 task by the branch
+    // above, so no extra CNTPCT read). Indexed by TARGET — the core that will dispatch it — so
+    // `last_wake` and `last_disp` on the `[el0live]` line describe one core's story and their
+    // DIFFERENCE is the run-queue wait. A wake with no dispatch after it is the STARVED signature;
+    // no wake at all, with residents still committed, is the STRANDED one.
+    if el0 {
+        EL0_LAST_WAKE_CYC[target].0.store(task.wake_cyc, Ordering::Relaxed);
+    }
     rq(target).push(task);
     // SCHED-PRIO: the wake path is where interactive latency is actually decided — `GUI_CHANNEL.recv`
     // (compositor), `RX_READY.wait` (input router) and `sleep_ticks` (HID pump) all come back through
@@ -3798,6 +3948,10 @@ fn retire_killed(idx: usize, task: Box<Task>) {
         el0_resident_leave(task.cpu as usize);
         // SPREAD-10: and its slot-residency credit — a dead sibling must stop attracting its triple.
         slot_res_leave(task.cpu as usize, task.user_ttbr0);
+        // EL0-LIVE: the OFF-CPU kill arm of the reap ledger. This is the arm that retires a task
+        // which never reached a boundary of its own — the shape a `run_user_image` Timeout kill
+        // takes against a fleet the storm had already stopped scheduling.
+        EL0_REAPED.kill_offcpu.fetch_add(1, Ordering::Relaxed);
     }
     // M6d: the same slot retirement `exit()` performs, executed on the scheduler stack. Legal here for
     // the same reason it is legal there — the kernel half of every root is Global and identical, so
@@ -3867,6 +4021,10 @@ pub fn exit() -> ! {
             // SPREAD-10: release the slot-residency credit on the same funnel, or a retired triple
             // member would keep pulling its siblings toward a core it no longer runs on.
             slot_res_leave((*raw).cpu as usize, (*raw).user_ttbr0);
+            // EL0-LIVE: every voluntary retirement lands here, deliberate or not. The `kill_oncpu`
+            // split below subtracts the ones that were killed, so `exit - kill_oncpu` reads as
+            // "left on its own terms" without this site needing to know which it was.
+            EL0_REAPED.exit.fetch_add(1, Ordering::Relaxed);
         }
         // Settle any kill request naming this task (by tid, or by ASID for a whole-process kill). Placed
         // HERE — after the slot teardown and the joiner post, with only the state store and the final
@@ -3878,6 +4036,14 @@ pub fn exit() -> ! {
         // What IS guaranteed at this point — and all the requester's contract claims — is that the
         // address-space slot is retired, the joiner is released, and this task will never execute again.
         if let Some(idx) = kill_slot_for((*raw).id, (*raw).user_ttbr0) {
+            // EL0-LIVE: the ON-CPU kill arm of the reap ledger, taken at the lookup this path
+            // ALREADY performs. Deliberately not hoisted next to the residency release above: this
+            // read must stay after `asid_thread_leave`, because a kill armed in the window between
+            // the two points has to be seen HERE or its request would never settle. One extra
+            // relaxed increment inside a branch that is already taken is the whole cost.
+            if (*raw).user_entry != 0 {
+                EL0_REAPED.kill_oncpu.fetch_add(1, Ordering::Relaxed);
+            }
             kill_settle(idx, (*raw).id, remaining);
         }
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
@@ -4159,7 +4325,10 @@ fn dispatch_next(cpu: usize) -> bool {
     if svc_band {
         PRIO_SVC_DISPATCH[cpu].fetch_add(1, Ordering::Relaxed);
     }
-    if task.user_entry != 0 {
+    // EL0-LIVE: carried to the `busy_t0` stamp below, where the EL0 dispatch CLOCK is written from a
+    // CNTPCT read this path already takes. Read here because `task` is moved into `raw` before then.
+    let el0_task = task.user_entry != 0;
+    if el0_task {
         PRIO_EL0_DISPATCH[cpu].fetch_add(1, Ordering::Relaxed);
     }
     CUR_PRIO[cpu].store(task.priority, Ordering::Relaxed);
@@ -4203,6 +4372,10 @@ fn dispatch_next(cpu: usize) -> bool {
                 // Same phantom-credit reasoning as park_blocked's dead-arm: it is never coming back.
                 el0_resident_leave(cpu);
                 slot_res_leave(cpu, task.user_ttbr0);
+                // EL0-LIVE: and record WHY one more EL0 task stopped existing. The line above is
+                // printed once, at this instant; a freeze capture taken minutes later has only this
+                // counter to tell it that the fleet was dropped rather than descheduled.
+                EL0_REAPED.corrupt.fetch_add(1, Ordering::Relaxed);
             }
             drop(task);
             return true;
@@ -4241,6 +4414,13 @@ fn dispatch_next(cpu: usize) -> bool {
     // that fired while it ran) — the "busy" time for time-based load accounting. Two sysreg reads per
     // dispatch, off the per-instruction path.
     let busy_t0 = now_cyc();
+    // EL0-LIVE: the EL0 dispatch clock, stamped from the span anchor this path already read — no
+    // extra `mrs`, one relaxed store to this core's own padded slot. `[el0live] last_disp=` is
+    // exactly "how long ago was the last instant any EL0 task held a CPU", which is the one question
+    // `[prio] el0=`'s per-window delta cannot answer from a single line of a truncated tail.
+    if el0_task {
+        EL0_LAST_DISPATCH_CYC[cpu].0.store(busy_t0, Ordering::Relaxed);
+    }
     // PULSE-5: publish that anchor before switching in, so the span is READABLE while it is still
     // running instead of only after it ends. One relaxed store, no sysreg read of its own (it
     // reuses the `busy_t0` this path already took), no ordering constraint on the switch. It is
@@ -4394,6 +4574,9 @@ fn park_blocked(cpu: usize, park: u8, mut task: Box<Task>) {
                 el0_parked_leave(home);
                 el0_resident_leave(home);
                 slot_res_leave(home, task.user_ttbr0); // SPREAD-10: same phantom-credit reasoning
+                // EL0-LIVE: `debug_assert!` below catches this in a debug build; a release build
+                // would lose the task in silence. The ledger is what makes it visible on metal.
+                EL0_REAPED.nopark.fetch_add(1, Ordering::Relaxed);
             }
             debug_assert!(false, "BLOCKED task with no park action");
             drop(task);
@@ -6465,6 +6648,12 @@ fn load_witness_tick() {
     if n % LOAD_WITNESS_INTERVAL != 0 {
         return;
     }
+    // EL0-LIVE: taken BEFORE the change-suppression below, deliberately. Every other line on this
+    // train is suppressed while the LOAD signature is unchanged — and a machine whose EL0 fleet has
+    // just died is precisely a machine whose load has gone flat and stopped changing. Gating the
+    // liveness census on load movement would mute it exactly when it is the only line worth having.
+    // It carries its own (liveness-shaped) suppression instead; see `el0live_tick`.
+    el0live_tick();
     let mut packed = 0u64;
     let mut ctx_now = 0u64;
     for cpu in 0..NUM_CPUS.min(8) {
@@ -6626,6 +6815,166 @@ pub fn prio_witness() {
         "[prio] svc={} el0={} defer={} agedin={} /win (band>={}, totals svc={} el0={})",
         d_svc, d_el0, d_defer, d_aged, PRIO_SERVICE, svc, el0,
     );
+    // EL0-LIVE IS DELIBERATELY *NOT* CHAINED HERE, and the reason is measured rather than assumed.
+    //
+    // Chaining it looked obviously right — this line's `el0=` delta going to zero IS the symptom
+    // `[el0live]` explains, and `prio_witness`'s third caller is `render_service`'s `[sched6]` block,
+    // which ticks on QEMU as well as metal, so the raspi4b battery would get a real `LIVE` reading
+    // instead of only the pre-EL0 `NONE` baseline. It was built that way and it worked: the battery
+    // walked `NONE -> LIVE (2/1/3) -> EXTINCT -> LIVE -> EXTINCT`, both kill arms counted.
+    //
+    // It also put a UART write on the RENDER TASK's path, and the same battery came back
+    // `[wc-h] rollup ... torn=1 -> AT-RISK` / `[wc-k] ... torn=1 -> AT-RISK` twice, having been
+    // 108/108 immediately before. The host was heavily loaded and `maxpresent_us=10583` was inside
+    // the 16.667 ms frame budget, so load is the better explanation and the tear was almost
+    // certainly not this line — but "almost certainly" is the wrong standard for a diagnostic that
+    // buys nothing on metal (`load_witness_tick` covers metal at the same ~1 s cadence). A witness
+    // must not be able to perturb the thing it is watching. The QEMU wiring proof stays with
+    // `load_accounting_witness`'s baseline call, exactly as `[spread4]` documents for itself.
+}
+
+/// EL0-LIVE — the liveness census: one line that names WHICH of the three EL0-death regimes the
+/// machine is in, and — when the answer is EXTINCT — what killed the fleet. See the EL0-LIVE block
+/// above `EL0_LAST_DISPATCH_CYC` for the PA41 capture this exists to have convicted.
+///
+/// The verdict ladder, in the order it is decided:
+///
+///   * `NONE` — no EL0 task has ever been dispatched on this machine. The honest QEMU-battery
+///     baseline (the raspi4b gate spawns no EL0 at all) and the proof that the line is WIRED rather
+///     than merely compiled. A `NONE` on metal after the desktop launched would itself be a finding.
+///   * `LEAKED` — zero committed residents, but tasks are still PARKED under them. The residency
+///     accounting has been driven to zero while the population it counts is alive. Checked before
+///     `EXTINCT` because `[spread4]`'s saturating `live=active/committed` renders both as `0/0`, so
+///     this ordering is the only thing that distinguishes an accounting bug from a dead fleet.
+///   * `EXTINCT` — EL0 ran once and there are now ZERO committed residents and none parked. The
+///     scheduler is not failing; there is nothing left to schedule. `reaped` names the cause. THIS
+///     IS THE PA41 BOOT-3 STATE, and the one no previous line said out loud.
+///   * `LIVE` — an EL0 task was dispatched within `EL0_STALL_MS`. Nothing to report.
+///   * `STARVED` — residents exist, at least one is RUNNABLE (not parked), and none has been
+///     dispatched for `EL0_STALL_MS`. This is the brief's question in one field: EL0 has not run for
+///     N ms WHILE RUNNABLE. A dispatch/priority/affinity defect.
+///   * `STRANDED` — residents exist, every one of them is PARKED, and none has been dispatched for
+///     `EL0_STALL_MS`. A lost wakeup. `last_wake` is the discriminator inside this verdict: a wake
+///     more recent than the dispatch means the wake landed and the dispatch did not (read it beside
+///     `[spread7] wake2disp`), while a wake as old as the dispatch means nothing ever tried.
+///
+/// `last_disp` / `last_wake` are milliseconds AGO, machine-wide (max over cores — EL0 is running if
+/// ANY core ran it, and a core that left the dispatch loop must not drag the figure backwards).
+/// `--` means never. Reads only, lock-free, no run-queue lock, safe from any core — which is what
+/// lets it ride the timer-IRQ witness train that every other line here rides.
+///
+/// Not `pi`-gated, matching its neighbours: the counters exist on every aarch64 build and read the
+/// `NONE` baseline where there is no EL0.
+pub fn el0live_witness() {
+    let now = now_cyc();
+    let mut committed = 0usize;
+    let mut runnable = 0usize;
+    let mut parked = 0usize;
+    let mut last_disp = 0u64;
+    let mut last_wake = 0u64;
+    for cpu in 0..NUM_CPUS {
+        committed += el0_committed(cpu);
+        runnable += el0_active(cpu);
+        parked += el0_parked_raw(cpu);
+        last_disp = last_disp.max(EL0_LAST_DISPATCH_CYC[cpu].0.load(Ordering::Relaxed));
+        last_wake = last_wake.max(EL0_LAST_WAKE_CYC[cpu].0.load(Ordering::Relaxed));
+    }
+    // Age against `now` rather than against each other: CNTPCT is monotonic and machine-wide, and
+    // `saturating_sub` makes a stamp taken microseconds ago on another core read 0 rather than wrap.
+    let disp_ms = cyc_to_ms(now.saturating_sub(last_disp));
+    let wake_ms = cyc_to_ms(now.saturating_sub(last_wake));
+    let stalled = disp_ms >= EL0_STALL_MS;
+    let verdict = if last_disp == 0 {
+        "NONE"
+    } else if committed == 0 && parked > 0 {
+        // The state `[spread4]`'s saturating `live=0/0` cannot express: tasks are still parked, and
+        // the count of who owns them has been driven to zero. Ranked ABOVE `EXTINCT` because the two
+        // render identically on every other line and only this order tells them apart.
+        "LEAKED"
+    } else if committed == 0 {
+        "EXTINCT"
+    } else if !stalled {
+        "LIVE"
+    } else if runnable > 0 {
+        "STARVED"
+    } else {
+        "STRANDED"
+    };
+    let reap_exit = EL0_REAPED.exit.load(Ordering::Relaxed);
+    let reap_kill_on = EL0_REAPED.kill_oncpu.load(Ordering::Relaxed);
+    let reap_kill_off = EL0_REAPED.kill_offcpu.load(Ordering::Relaxed);
+    let reap_corrupt = EL0_REAPED.corrupt.load(Ordering::Relaxed);
+    let reap_nopark = EL0_REAPED.nopark.load(Ordering::Relaxed);
+    let mut el0_disp = 0u64;
+    for cpu in 0..NUM_CPUS {
+        el0_disp += PRIO_EL0_DISPATCH[cpu].load(Ordering::Relaxed);
+    }
+    // `--` for a clock that was never stamped, so a zero-age reading can never be confused with
+    // "never happened" — the same `--`-for-untracked discipline `:: SCHED: load ::` uses.
+    let age = |stamp: u64, ms: u64| {
+        if stamp == 0 {
+            alloc::string::String::from("--")
+        } else {
+            alloc::format!("{}ms", ms)
+        }
+    };
+    serial_println!(
+        "[el0live] verdict={} el0 runnable/parked/committed={}/{}/{} last_disp={} last_wake={} stall>={}ms | reaped exit={} kill_oncpu={} kill_offcpu={} corrupt={} nopark={} | totals el0_disp={}",
+        verdict,
+        runnable, parked, committed,
+        age(last_disp, disp_ms),
+        age(last_wake, wake_ms),
+        EL0_STALL_MS,
+        reap_exit, reap_kill_on, reap_kill_off, reap_corrupt, reap_nopark,
+        el0_disp,
+    );
+}
+
+/// EL0-LIVE — the TIMER-TRAIN arm of [`el0live_witness`]: change-suppressed while healthy, unmuted
+/// the moment it is not.
+///
+/// A liveness census has the opposite chattiness requirement from the load lines it rides beside. It
+/// must be SILENT on a healthy desktop (one line per second forever, saying nothing, is how a wire
+/// gets ignored) and it must be RELENTLESS during an outage — because the reader's capture may begin
+/// anywhere, and PA41's did: the whole 2660-line tail we have is post-mortem, and a witness that had
+/// printed the verdict once, at the moment of death, would have been scrolled away before the
+/// operator ever hit save. So: print on every window whose verdict is not `LIVE`, and otherwise only
+/// when the picture actually changes.
+///
+/// The signature deliberately includes the reap ledger's total: a fleet that loses one vug while the
+/// rest keep running stays `LIVE`, and that transition is exactly the kind of thing that should still
+/// reach the wire.
+fn el0live_tick() {
+    let mut committed = 0u64;
+    let mut parked = 0u64;
+    let mut reaps = 0u64;
+    let mut last_disp = 0u64;
+    for cpu in 0..NUM_CPUS {
+        committed += el0_committed(cpu) as u64;
+        parked += el0_parked_raw(cpu) as u64;
+        last_disp = last_disp.max(EL0_LAST_DISPATCH_CYC[cpu].0.load(Ordering::Relaxed));
+    }
+    reaps += EL0_REAPED.exit.load(Ordering::Relaxed);
+    reaps += EL0_REAPED.kill_offcpu.load(Ordering::Relaxed);
+    reaps += EL0_REAPED.corrupt.load(Ordering::Relaxed);
+    reaps += EL0_REAPED.nopark.load(Ordering::Relaxed);
+    // `last_disp == 0` (no EL0 has EVER run) counts as healthy here on purpose: on metal this window
+    // is every window between boot and the desktop's launch, and a `verdict=NONE` line once a second
+    // through it would be pure noise. The wiring proof for that state is the explicit call in
+    // `load_accounting_witness`, where it is the whole point; here the first real line is the one the
+    // signature change emits when the first resident appears.
+    let healthy = last_disp == 0
+        || cyc_to_ms(now_cyc().saturating_sub(last_disp)) < EL0_STALL_MS;
+    // Saturating field packing: the counts are single digits on any real fleet and the signature
+    // only has to CHANGE, never to be decoded, so clamping a pathological value costs nothing.
+    let sig = (committed.min(0xffff) << 48)
+        | (parked.min(0xffff) << 32)
+        | (reaps.min(0xffff) << 16)
+        | (healthy as u64);
+    if EL0LIVE_LAST_SIG.swap(sig, Ordering::Relaxed) == sig && healthy {
+        return; // unchanged AND healthy — stay quiet
+    }
+    el0live_witness();
 }
 
 /// SPREAD-4 — the proof line for live residents + re-placement, in the `[pulse5]` mould and emitted
@@ -6952,6 +7301,10 @@ pub fn storm_census(phase: &str) {
     storm_probe(phase);
     pulse5_witness();
     spread4_witness(); // chains [spread7] -> [spread9], and [spread10]
+    // EL0-LIVE: unconditional here (not the suppressed `el0live_tick`) for `storm_census`'s standing
+    // reason — a boundary probe re-emits the train at THIS instant, and a census that could choose to
+    // stay quiet would leave a hole in exactly the capture the operator asked for.
+    el0live_witness();
     let mut svc = 0u64;
     let mut el0 = 0u64;
     let mut defer = 0u64;
@@ -7032,6 +7385,11 @@ pub fn load_accounting_witness() {
     // dispatch counters are live on that path (the cooperative loop dispatches through the same
     // `dispatch_next`), so the line carries real numbers, not a wired-and-zero placeholder.
     prio_witness();
+    // EL0-LIVE: same reasoning as `[spread4]`'s baseline call directly above — the raspi4b battery
+    // spawns no EL0 task, so this prints `verdict=NONE ... last_disp=--`, which is the honest reading
+    // AND the proof that the clocks, the residency reads and the reap ledger are all wired and the
+    // line renders. The numbers that matter are the ones `load_witness_tick` prints on metal.
+    el0live_witness();
     // STORM-HEADROOM: the probe's own machinery, exercised by the gate. Every other line here is
     // emitted by SOME path the battery reaches; `storm_probe` is reached only by an operator typing
     // `storm`, so without this call its first execution ever would be on an attended bench, and a

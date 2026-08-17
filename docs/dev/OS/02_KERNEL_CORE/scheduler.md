@@ -2451,6 +2451,111 @@ path (which this tree does not map today) would be the alternative. If a PC
 sample is ever taken, it must be printed beside whatever names the masking
 window — a PC alone dates a symptom without naming a cause.
 
+### Three EL0 deaths that look identical on the wire (aarch64, EL0-LIVE)
+
+PA41's third Pi 4 metal boot froze with the desktop intact and every input dead.
+The 2660-line capture (`boot3-inputdeath-tail.txt`) is unambiguous that EL0 had
+stopped — `[prio]` totals `el0=2490629` **constant** across the whole tail,
+`[wcn] passes=0`, `composites=0/s`, `[cursor3] offers=568 taken=0` (the cursor is
+composited, so zero passes means a frozen arrow whatever the mouse does) — and it
+cannot say **why**, because three completely different failures render the same:
+
+| regime | what is true | the fix it demands |
+| --- | --- | --- |
+| **STARVED** | EL0 tasks are READY and never win a dispatch | priority / affinity |
+| **STRANDED** | EL0 tasks exist, all PARKED, no wake arrives | a lost wakeup |
+| **EXTINCT** | there are no EL0 tasks left | whatever killed them |
+
+The capture is `EXTINCT`, and the evidence that says so was circumstantial and
+only legible to a reader holding the source:
+
+- `[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0` — zero **committed** EL0 residents
+  on every core, beside `rewake=112 stay=2272 short=40357 refresh=389`, cumulative
+  wake counters large enough to prove EL0 had certainly lived earlier in the boot.
+- `[spread10] slots 1c=0 2c=0 3c+=0` — no live address-space slot either.
+- Residency is released at exactly five sites (`exit`, `retire_killed`, SPIN-6's
+  corrupt-switch refusal, `park_blocked`'s dead arm, and the balanced
+  leave/enter of a placement move), and every one of the first four **destroys
+  the task**. Residents `== 0` after a large wake history therefore means the
+  fleet was reaped, not descheduled.
+- Corroborating, and independent: `make_ready` is the sole EL0 wake funnel and
+  unconditionally bumps one of `short` / `stay` / `rewake` for every EL0 wake.
+  All three are byte-frozen for the whole tail — **zero EL0 wakes**. And
+  `[prio] agedin=` falls to 0 once the storm's own tasks retire: the run queues
+  hold no below-band ready task at all.
+
+Contrast boot 2 of the same session, which froze differently:
+`[spread4] live c0=0/1 c2=1/1 c3=1/1` with `[prio]` `el0` totals climbing
+17 899 008 → 20 832 924. EL0 alive, running hard, screen dead. Same symptom to
+the operator; opposite diagnosis.
+
+`[el0live]` states the verdict outright instead of leaving it to be reconstructed:
+
+```
+[el0live] verdict=EXTINCT el0 runnable/parked/committed=0/0/0 last_disp=27756ms last_wake=27801ms stall>=2000ms | reaped exit=3 kill_oncpu=1 kill_offcpu=2 corrupt=0 nopark=0 | totals el0_disp=2490629
+```
+
+What it adds over the counters that already existed:
+
+- **A clock.** `EL0_LAST_DISPATCH_CYC` / `EL0_LAST_WAKE_CYC` are per-core,
+  cache-line padded (SPIN-3), and stamped from CNTPCT reads the dispatch and wake
+  paths already take — no new `mrs` on either hot path. "EL0 has not run for N ms"
+  becomes one field on one line, readable from a **truncated** tail, which is the
+  material every metal freeze actually produces. `[prio] el0=` needs two lines and
+  a subtraction.
+- **The runnable/parked split**, so "not running" is qualified — the difference
+  between `STARVED` and `STRANDED`. Read lock-free from the SPREAD-3/SPREAD-4
+  counters; no run-queue lock on a witness path.
+- **A reap ledger** — `EXTINCT` is useless without a cause. The four reap sites
+  previously left no durable trace: `exit()` and `retire_killed` print nothing,
+  and SPIN-6 / the dead park arm print one line each *at the instant they fire*,
+  which a tail capture has by construction already scrolled past.
+- **A fifth verdict, `LEAKED`.** `el0_active` saturates `committed - parked` at
+  zero, so `[spread4]` renders `parked=3, committed=0` and `parked=0, committed=0`
+  identically as `0/0` — an accounting leak and a dead fleet, pixel for pixel.
+  `[el0live]` prints the raw parked count and ranks `LEAKED` above `EXTINCT`.
+
+**The 2 s threshold is `syscall::TAKEOVER_STALE_SECS`, deliberately.** After two
+seconds without a `SYS_INPUT_POLL`, `run_user_image` stops believing the focused
+app is live-in-takeover, re-arms its deadline, and — if the quiet continues —
+issues an **ASID-scoped `sched::kill`** against the whole address space. An EL0
+outage past 2 s is therefore not a latency complaint; it is the precondition for
+the shell to begin destroying the fleet. So `verdict=STARVED` on the wire is the
+early warning for the `verdict=EXTINCT kill_offcpu=` that can follow it, and the
+pair is what a future capture needs to convict PA41's death **event** itself —
+which this capture, being entirely post-mortem, cannot.
+
+**`EXTINCT` is not by itself a fault.** The shell runs foreground programs one at
+a time, so every gap between two EL0 programs is a genuinely empty machine. What
+convicts a freeze is `EXTINCT` that **persists** while the desktop is supposed to
+be up: `[wcn] wins=` nonzero, the compositor still passing, and `last_disp`
+climbing without bound. PA41 boot 3 held that state for 545 s.
+
+A development build chained the line into `prio_witness`, whose third caller is
+`render_service`'s `[sched6]` block, to get a real reading out of the raspi4b
+battery. It worked — the battery walked `NONE → LIVE (2/1/3) → EXTINCT → LIVE →
+EXTINCT`, ending `exit=68 kill_oncpu=4 kill_offcpu=19` with both kill arms
+exercised, which is the functional proof that the clocks, the runnable/parked
+split and the ledger all read correctly. **It was then removed**, because it put a
+UART write on the render task's path and the next two battery runs came back
+`[wc-h]`/`[wc-k] torn=1 → AT-RISK` after a 108/108 immediately before. Host load
+(59) is the better explanation and `maxpresent_us=10583` was inside the 16.667 ms
+frame budget — but a witness must not be able to perturb the thing it watches, and
+the chain bought nothing on metal, where `load_witness_tick` already covers it at
+the same cadence. The QEMU wiring proof stays with `load_accounting_witness`'s
+`verdict=NONE … last_disp=--` baseline, exactly as `[spread4]` documents for
+itself.
+
+Emitted from the three sites the rest of the train uses. On the metal timer path
+it is taken **before** `load_witness_tick`'s change-suppression, because a machine
+whose EL0 fleet has just died is precisely a machine whose load has gone flat and
+stopped changing; gating the liveness census on load movement would mute it exactly
+when it is the only line worth having. It carries its own suppression instead:
+silent while healthy and unchanged, printed every window while the verdict is not
+`LIVE`. The raspi4b battery spawns no EL0, so the gate reads
+`verdict=NONE … last_disp=--` — the honest baseline, and the proof that the clocks,
+the residency reads and the ledger are wired.
+
 ---
 
 ## 3. Blocking and synchronization primitives
