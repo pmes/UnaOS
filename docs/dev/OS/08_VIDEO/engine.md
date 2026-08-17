@@ -3124,7 +3124,7 @@ format, field for field (`video/wcg.rs`, `emit_sample` and `stage_rollup`):
 ```
 [wc-h] win=<id> box=<bw>x<bh> span=<rows> band=<yes|no> bytes=<n> compose_us=<n> present_us=<n> rectscan_us=<n> torn=<yes|no> -> BUFFERED
 [wc-h] win=<id> staged=no reason=<geom|cap|lock|alloc|fixture> -> DIRECT
-[wc-h] rollup win=<id> scope=<window|window-band> samples=4 torn=<n> declines=<n> fixture=<n> whole=<n> banded=<n> minspan=<n> minspan_bytes=<n> maxpresent_us=<n> frame_us=16667 -> <TEAR-FREE|UNSTAGED|AT-RISK>
+[wc-h] rollup win=<id> scope=<window|window-band> emit=<n> age_ms=<n> pop=budgeted samples=<n> budget=4 pop=all-presents torn=<n> declines=<n> fixture=<n> whole=<n> banded=<n> lines=<n> minspan=<n> minspan_bytes=<n> maxpresent_us=<n> minpresent_us=<n> presspread=<n> pop=constant frame_us=16667 -> <TEAR-FREE|UNSTAGED|AT-RISK>
 ```
 
 `box=` is the whole outer box; `span=` is the rows this present actually WROTE, and `band=yes` is
@@ -13537,5 +13537,130 @@ Left for the integrator, with both options priced: either the +10 is accepted as
 renderer, or `draw_panel_at`/`loads` are replaced by a line-neutral `pub(crate)` widening of
 `row_geometry`/`draw_led_bar`/`PULSE` — which reaches zero, but leaks the instrument's internals into the
 window module and hands the two a `PULSE`-lock ordering footgun the accessor does not have.
+## WCH-SPREAD — telling a slow copy from a stopped machine, on the `[wc-h]` wire (2026-08-17)
+
+`video/wcg.rs`, plus one line of `scripts/specs/pi4-regression.spec`. The armed pi4 gate
+(`UNAOS_PIDESK=1 ./arroyo kernel8-test 210`) was RED AT BASELINE on a loaded host — 108/108 required
+witnesses and six forbidden hits, all of them `[wc-h] … -> AT-RISK`, with no fixture and no arc
+involved. Two independent executors reproduced it on an untouched tree before this one did.
+
+### What the red actually was
+
+`stage_note` calls a present torn when `present_us > rectscan_us`. QEMU raspi4b runs without
+`-icount`, so `CNTVCT_EL0` advances in host wall time: when the host takes the vCPU away mid-present,
+the whole suspension is charged to `present_us` and the counter says the panel tore. The 2026-08-12
+tearhunt captures pin it — 3/3 `torn=0` on a quiet host against 2/2 red under 40 spinners — and the
+same captures show the charge landing in the phase that CANNOT tear, `compose_us=152443` on a 266x300
+box whose quiet-host compose is about 1 000 µs. Compose is off-screen work into cached RAM; no
+scan-out can observe it. A number like that is the host being measured, not the display.
+
+### Why no field already on the line could separate the two
+
+The exclusion has to keep METAL convicting, and on the LEVEL of `maxpresent_us` the two populations
+overlap outright:
+
+| population | `maxpresent_us` |
+|---|---|
+| quiet-host QEMU, `torn=0` | 119 … 1 983 |
+| **real metal tear** (rMBP s69, the strong-UC aperture — §WC-H above) | **24 268** |
+| loaded-host QEMU, `torn>0` | 13 934 … 45 832 |
+
+Any threshold on the level either passes a loaded boot or blinds the gate to the exact defect it was
+written for. `torn=`, `whole=`, `age_ms=` and `emit=` are counts whose honest ranges also overlap, and
+the spec grammar is regex — it has no arithmetic with which to combine them. So a field was added.
+
+### `presspread=`, and why the separation is structural rather than tuned
+
+`presspread=` is the ratio of a window's SLOWEST present to its FASTEST, each normalised by the bytes
+it copied, taken over every present the window has had (`H_MINRATE`/`H_MAXRATE`, in ns per 4 KiB).
+`minpresent_us=` is printed beside `maxpresent_us=` so the raw range is visible too. Both are
+INSERTIONS inside the existing `pop=all-presents` run; no key is renamed, reordered or moved off the
+end, and the sample line is untouched.
+
+* **A copy that is too slow is too slow every time.** s69's pre-fix capture is the measured proof, and
+  it is stronger than any margin this gate could take for itself: its two whole-box samples read
+  24 268 µs / 3 942 000 B and 23 814 µs / 3 868 416 B — a ratio of **1.0002** — and §WC-H's own
+  analysis of that boot finds the same per-byte rate on a 66 px window (158 B/µs) as on a 1314 px one
+  (162 B/µs), with a six-row band tearing too. Across a 200x range of present sizes the real defect's
+  spread is **1**.
+* **A host desched is one present in hundreds.** It cannot make the window's other presents slow, so
+  the fast ones stay fast and the ratio blows out. Measured on the armed gate under 40 spinners:
+
+```
+[wc-h] rollup win=1 scope=window emit=3 age_ms=4523 … torn=68 … whole=113 …
+       maxpresent_us=45832 minpresent_us=714 presspread=64 … frame_us=16667 -> AT-RISK
+```
+
+The FORBID convicts a single-digit spread and excludes 10 and up, which is close to an order of
+magnitude of margin on each side. A ratio of RATES rather than of raw microseconds so a banded present
+and a whole-box one stay comparable: aarch64 never bands, but the per-id censuses are never reset (a
+live defect in the x86 seat's custody) and a recycled id can mix geometries, which the normalisation
+absorbs. A healthy quiet-host boot reads `presspread=1…6` with `torn=0`.
+
+### What this does NOT do
+
+It does not touch `torn=`, the verdict precedence, or `-> AT-RISK`. The counter is published beside
+the verdict and the reading is left to the consumer; teaching the tear TEST itself a stall guard
+remains an open item in the x86 seat's custody, and this pair is the measurement that work can be
+built on rather than a second, competing opinion.
+
+What is given up, plainly: a real tear on a window that ALSO has a wildly uneven present history now
+escapes this gate. On metal that is not the defect's shape, and on a loaded QEMU it is not separable
+at all — which is the whole finding. The trade is a detector that is silent where it cannot tell,
+instead of one that convicts the honest reading. This is the same trade the `[pstrip] srcdelta=0`
+sharpening made, and it is recorded here for the same reason.
+
+### Adjacent finding, recorded not fixed — `[wc-k] rollup scope=fills` has the same physics
+
+Under a DELIBERATE 40-spinner stress (host load ~60 on 20 cores, well past the load at which the
+`[wc-h]` red reproduces) the erase-path witness flips for the identical reason, in 2 of 3 runs:
+
+```
+[wc-k] rollup scope=fills samples=4 rows=1092 torn=1 noncontig=0 declines=0 outside=0 defers=4
+       redefers=0 coalesced=0 rescues=0 maxpresent_us=35439 frame_us=16667 -> AT-RISK
+```
+
+It is one root cause with two spec consequences on one line — `FORBID [wc-k] .*-> AT-RISK` fires AND
+the paired `REQUIRE … -> TEAR-FREE` goes missing, so the suite reads 107/108 with one forbidden hit.
+The same capture's `[wc-h]` rollups carry `presspread=30…407` and are correctly excluded; nothing in
+this arc's change is implicated.
+
+It is a NARROWER instrument than `[wc-h]`: `samples=4` is a hard budget, so it can only flip when one
+of the first four erase fills is the one the host suspends. That is why it stays `TEAR-FREE` at the
+load where the `[wc-h]` red reproduces — `maxpresent_us=792` on the baseline capture, `444` quiet,
+`6706` under 40 spinners in the run that passed — and only converts at the extreme.
+
+**Not fixed here, deliberately.** It is outside this arc's brief, and the repo's rule is to record a
+divergence rather than improvise a second fix into an unrelated witness. The remedy, when someone
+takes it, is the one above: `[wc-k]`'s rollup already prints `maxpresent_us=` and its recorder already
+has the bytes, so the same `presspread=` pair drops straight in.
+
+### Go-red proof
+
+The FORBID is proven able to fire, and proven to be doing the discrimination rather than merely
+passing everything. One rollup in a green capture was rewritten two ways, differing ONLY in
+`presspread=`:
+
+```
+… torn=3 … maxpresent_us=1099 minpresent_us=716 presspread=1   … -> AT-RISK  ⇒ FAIL, 1 forbidden hit
+… torn=3 … maxpresent_us=1099 minpresent_us=716 presspread=760 … -> AT-RISK  ⇒ PASS, 0 forbidden hits
+```
+
+The failing replay names the pattern and the line: `FORBID \[wc-h\] .*presspread=[0-9] .*-> AT-RISK`,
+1 hit. A FORBID that cannot be made to fire is not a gate, and one that fires on everything is not a
+discriminator; this shows it is neither.
+
+### Gate results (WCH-SPREAD, 2026-08-17, worktree `exec-wchgate` off `14e54538`)
+
+* `./arroyo check` — both arches green. `UNAOS_WC=1 ./arroyo check` — green.
+* knob-off `./arroyo kernel8-test 210` — **PASS, 108/108, 0 forbidden**, 11 326 lines.
+* `UNAOS_PIDESK=1 ./arroyo kernel8-test 210` x3 consecutive — **PASS, 108/108, 0 forbidden** on all
+  three (14 651 / 13 493 / 13 553 lines), host load 19–21. Against the SAME command on the SAME tree
+  at baseline: **FAIL, 108/108, 6 forbidden**, all six `[wc-h] … -> AT-RISK`.
+* The three DONE-gate runs happened to land `torn=0` throughout, so they show the change is
+  regression-free but do NOT themselves exercise the exclusion. The run that does is the 40-spinner
+  capture `wchgate/loaded-1.log`: **PASS, 108/108, 0 forbidden** with TEN `-> AT-RISK` rollups in the
+  capture, `torn=` up to 149 and `presspread=` 58…407 — ten lines that would each have been a
+  forbidden hit before this change, every one of them excluded on the field.
 
 ---

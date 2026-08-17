@@ -687,7 +687,63 @@ REQUIRE \[wc-h\] rollup win=.* scope=window .*declines=.* -> TEAR-FREE
 # --- verdict; and on aarch64 the band rollup never fires at all (present_rows' callers are all
 # --- x86_64+wc gated — verified independently by both seats). Ruled no-spec-change; this comment
 # --- is the record so nobody re-derives it.
-FORBID \[wc-h\] .*-> AT-RISK
+# ---
+# --- WCH-SPREAD — the AT-RISK FORBID is SHARPENED BY ONE FIELD, not dropped (2026-08-17).
+# ---    THE FALSE RED, and why it is not arguable. `UNAOS_PIDESK=1 ./arroyo kernel8-test 210` reds at
+# ---    BASELINE on a loaded host — 108/108 required witnesses, 6 forbidden hits, every one of them
+# ---    this line, no fixture and no arc involved. Two independent executors reproduced it on an
+# ---    untouched tree before this one did. The shape, verbatim from `wchgate/base-load-1.log`:
+# ---        [wc-h] rollup win=1 scope=window emit=6 … torn=21 … whole=430 … maxpresent_us=20538
+# ---            … frame_us=16667 -> AT-RISK
+# ---    against three quiet-host captures of the same tree (`base-1/2/3.serial.log`, 2026-08-12) that
+# ---    are 3/3 `torn=0 -> TEAR-FREE` with `maxpresent_us` of 119…1983 µs. The tear tracks the HOST
+# ---    LOAD, not the guest: QEMU raspi4b runs without `-icount`, so CNTVCT_EL0 advances in host wall
+# ---    time and a lost host timeslice is charged in full to whatever guest interval was open. The
+# ---    same captures show it landing in the phase that CANNOT tear — `compose_us=152443` on a 266x300
+# ---    box whose quiet-host compose is ~1000 µs, off-screen work no scan-out can observe — which is
+# ---    the proof that the charge is the host's and not the panel's.
+# ---
+# ---    WHY NO FIELD ALREADY ON THE LINE COULD DO IT. The exclusion has to keep METAL convicting, and
+# ---    on the LEVEL of `maxpresent_us` the two populations OVERLAP: the loaded-QEMU reds run
+# ---    13934…42965 µs while the real metal tear this witness was built to catch (rMBP s69, the
+# ---    strong-UC aperture, quoted under §WC-H in engine.md) sat at 24268 µs. Any threshold on the
+# ---    level either lets a loaded boot through or blinds the gate to the exact defect it was written
+# ---    for. `torn=`, `whole=`, `age_ms=` and `emit=` are counts whose honest ranges also overlap, and
+# ---    this grammar has no arithmetic to combine them with. The line carried no field that separated
+# ---    the two causes, so one was added — `presspread=`, an INSERTION beside `maxpresent_us=` inside
+# ---    the same `pop=all-presents` run. No existing key is renamed, reordered or moved off the end.
+# ---
+# ---    WHAT `presspread=` IS (wcg.rs, `H_MINRATE`/`H_MAXRATE`): the ratio of a window's SLOWEST to its
+# ---    FASTEST present, each normalised by the bytes it copied, over every present the window has had.
+# ---    It is a CENSUS printed beside the verdict — `torn=`, the verdict precedence and `-> AT-RISK`
+# ---    itself are untouched, and the tear TEST's own stall guard remains an open item in the x86
+# ---    seat's custody. THE SEPARATION IS STRUCTURAL, not a tuned threshold:
+# ---      * A COPY THAT IS TOO SLOW IS TOO SLOW EVERY TIME. s69's pre-fix capture is the measured proof
+# ---        and it is stronger than any margin this gate could take for itself — its two whole-box
+# ---        samples read 24268 µs/3942000 B and 23814 µs/3868416 B, a ratio of 1.0002, and engine.md's
+# ---        analysis of the same boot finds the SAME per-byte rate on a 66 px window (158 B/µs) as on a
+# ---        1314 px one (162 B/µs), and a six-row band tearing too. Across a 200x range of present
+# ---        sizes the real defect's spread is 1. That is what `presspread=` reads on a torn panel.
+# ---      * A HOST DESCHED IS ONE PRESENT IN HUNDREDS. It cannot make the window's other presents slow,
+# ---        so the fast ones stay fast and the ratio blows out. The measured armed-gate figures are in
+# ---        this arc's landing report; the pattern below convicts a single digit and excludes 10+.
+# ---    A ratio of RATES rather than of raw microseconds so a banded present and a whole-box one are
+# ---    comparable: on aarch64 nothing bands, but the per-id censuses are never reset (a live defect in
+# ---    the x86 seat's custody) and a recycled id can mix geometries, which the normalisation absorbs.
+# ---
+# ---    WHAT IS GIVEN UP, stated plainly, in the pattern of the `[pstrip] srcdelta=0` sharpening below:
+# ---    a REAL tear on a window that ALSO has a wildly uneven present history now escapes this gate.
+# ---    On metal that combination is not the defect's shape — the s69 evidence is that the fault is
+# ---    per-byte and uniform — and on a loaded QEMU it is not separable at all, which is the whole
+# ---    finding. The trade is a detector that is silent where it cannot tell, instead of one that
+# ---    convicts the honest reading. `presspread=0` means the window has recorded no present at all;
+# ---    it is unreachable on a line carrying `-> AT-RISK` (the tear counter and the rate extremes are
+# ---    written side by side on every present), and the single-digit class convicts it anyway, so the
+# ---    unmeasured case fails SAFE rather than open.
+# ---    THE FORBID IS PROVEN ABLE TO FIRE, per this repo's go-red discipline: replaying a green
+# ---    capture with one rollup rewritten to the metal defect's shape (`torn=3 … presspread=1 ->
+# ---    AT-RISK`) reds the suite. See the landing report.
+FORBID \[wc-h\] .*presspread=[0-9] .*-> AT-RISK
 FORBID \[wc-h\] .*-> UNSTAGED
 
 # --- CURSOR-3 — overlay-present path (printed alongside [wc-i], witness-feature only) ----------
