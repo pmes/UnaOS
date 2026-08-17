@@ -330,3 +330,15 @@ pub fn init_edid(block: &[u8; 128], valid: bool, total_len: u16) {
 // this, so nothing moves. `pidesk` off is a compile-time absence and the image never contains it.
 #[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
 pub mod pidesk;
+
+// ── PULSEWIN ────────────────────────────────────────────────────────────────────────────────────
+// The core-load instrument in a compositor WINDOW, whose menu switches between the Pi's LED lamp
+// face and the x86 app's ten-segment face. Gated like the furniture family — `wc` on x86, `pidesk`
+// on the Pi — and deliberately NOT on an arch: it is experience-layer code with no hardware in it,
+// so it builds once and runs on every chip. Appended below `pidesk` for `pidesk`'s own reason, five
+// lines up: nothing is below this either, so nothing moves.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "pidesk")
+))]
+pub mod pulsewin;

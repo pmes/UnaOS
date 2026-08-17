@@ -263,6 +263,30 @@ pub fn activate() -> bool {
     // found it.
     #[cfg(feature = "witness")]
     super::crystal::routed_selftest();
+    // 6. PULSEWIN — **the core-load instrument gets a window.** Peter, this cycle: *"core load
+    //    distribution — pulse needs a window."*
+    //
+    //    Placed after the bar and after the composite, and both orderings are load-bearing. After the
+    //    BAR, because `pulsewin::open` centres its box in the WORK AREA and the work area's top is
+    //    `ui_status::top_chrome_h` — which is zero until the bar is enabled, so opening first would
+    //    seat the window against a panel that is about to shrink and leave it a bar's height too high.
+    //    After the COMPOSITE, because `wm::create_at` composites the new row itself: doing the bar's
+    //    catch-up pass first means this window's first frame lands on a desktop whose strip rows are
+    //    already painted, rather than one composite before them.
+    //
+    //    Its decline arms are its own and none of them is fatal here — a desktop without a pulse
+    //    window is a desktop, exactly as this function argues for the console window. Nothing about
+    //    the DESKTOP band changes: `ui_status` still draws it, the tiler still reserves its rows, and
+    //    the window is a SECOND seat for the same instrument reading the same envelope.
+    //    ARMED here and OPENED by the render pass, which is not a deferral for its own sake: see
+    //    `pulsewin::service`'s open arm for the readback that convicted the direct call (a window
+    //    minted from this path is minted by a core that is not the one driving the compositor, and
+    //    `[chrome-truth]` read its chrome off the glass between the create and the blit).
+    super::pulsewin::arm();
+    serial_println!(
+        "[pidesk] pulse-window ARMED view={} (the render pass opens it on its first live instrument sample; menu: click `View` in the window's own strip — first option is the Pi LED face, second is the x86 segment face; the desktop LED band is unchanged)",
+        super::pulsewin::view().label()
+    );
 
     // ── THE LIVE-CONSOLE DECISION, and the measurement that settled it ──────────────────────────
     //

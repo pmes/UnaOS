@@ -13558,7 +13558,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
     if mask & !prev != 0 {
         // PRESS edge.
         let (x, y) = click_pointer_pos();
-        #[cfg(feature = "pidesk")] if crate::video::strip::press_route(x, y) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // PI-DESK: furniture before every window arm — see this fn's header
+        #[cfg(feature = "pidesk")] if crate::video::strip::press_route(x, y) || crate::video::pulsewin::press_route(x, y) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // PI-DESK: furniture before every window arm — see this fn's header. PULSEWIN is the second term (short-circuit: the strip is still asked first) and it claims ONLY its own window's close disc and its own in-window `View` menu, re-asking `wm::hit_test` itself so an occluding window keeps every press; everything else it declines and the arms below judge it. ⚠ extended IN PLACE, not added below: this file's knob-off line numbers are load-bearing — PARITY.md §5.3.
         match crate::video::wm::hit_test(x, y) {
             // CLOSE-BOX (P79) — checked FIRST, so the close box beats select. This is the ONE
             // point in the click grammar where a click ACTS: the box is explicit window FURNITURE

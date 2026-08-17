@@ -392,7 +392,7 @@ pub fn draw<P: GneissPal>(pal: &mut P) {
     // that shared this line are superseded by the instrument panel above it.
     let text_y = band_y + (m.line_h.saturating_sub(m.cell_h)) / 2;
     pal.draw_text(m.margin, text_y, &compose(), STRIP_FG);
-    draw_panel(pal);
+    draw_panel_at(pal, None);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -940,15 +940,25 @@ fn attack_decay(prev: u32, new: u32, dt_ms: u64) -> u32 {
     prev - step.min(prev - new)
 }
 
-/// Draw the instrument panel from the last sampled loads: clear the band, then one labelled LED row
-/// per core. Nothing here samples — [`tick`] owns the telemetry cadence.
-fn draw_panel<P: GneissPal>(pal: &mut P) {
+/// PULSEWIN — the last sampled per-core DISPLAY loads (per-mille, or [`PARKED`]) and the live core count; `0`
+/// before the instrument arms. `video::pulsewin`'s second face reads THIS envelope rather than sampling for
+/// itself, so one sampler ([`tick`]) stays on the telemetry and two faces of a machine cannot disagree.
+#[allow(dead_code)] pub(crate) fn loads(out: &mut [u32; PSTRIP_MAX_CPUS]) -> usize { // dead knob-off: its one caller is the window
+    let st = PULSE.lock();
+    if st.armed { *out = st.load; st.ncpu } else { 0 }
+}
+
+/// Draw the instrument panel from the last sampled loads: clear the band, then one labelled LED row per core.
+/// Nothing here samples — [`tick`] owns the telemetry cadence. PULSEWIN — `at` names the RECT: `None` is
+/// [`panel_geometry`]'s reserved band (the desktop instrument, unchanged), `Some` is any other rect, which is
+/// how `video::pulsewin`'s window draws this same face. **One LED renderer, two seams**, never two copies.
+pub(crate) fn draw_panel_at<P: GneissPal>(pal: &mut P, at: Option<(usize, usize, usize, usize)>) {
     let st = PULSE.lock();
     if !st.armed || st.ncpu == 0 {
         return;
     }
     let m = pal.metrics();
-    let (px, py, pw, ph_band) = panel_geometry(pal.width() as usize, pal.height() as usize);
+    let (px, py, pw, ph_band) = at.unwrap_or_else(|| panel_geometry(pal.width() as usize, pal.height() as usize));
     if pw == 0 || ph_band == 0 {
         return;
     }

@@ -4081,7 +4081,7 @@ fn render_service(_: usize) {
             // PULSE-STRIP: the paced path. `tick` samples the per-core meters at most once a second
             // and returns whether it actually drew; an unchanged strip on an unchanged panel adds no
             // present at all, which is what keeps the always-running pulse off the render core's back.
-            dirty |= unaos_kernel::ui_status::tick(&mut pal);
+            dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "pidesk")] unaos_kernel::video::pulsewin::service(); // PULSEWIN — the pulse WINDOW is a second VIEW of the numbers `tick` has just published, so it repaints on the same cadence from the same envelope and never takes a second sample. It presents through its own `wm` row, not through `pal`, so it neither reads nor sets `dirty`. ⚠ FOLDED onto this line rather than added below it: `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof and panic `Location` records embed line numbers — PARITY.md §5.3.
         }
         // SHELLWIN-PI — MINT THE SHELL WINDOW, once, on the first pass after the desktop is armed.
         //

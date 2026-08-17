@@ -13292,5 +13292,250 @@ so no chrome-bearing row exists until the u11/uvug cascade lands, by which point
 repainted the whole panel and `(638,478)` belongs to the SHELL BACKDROP, not to the bring-up clear.
 That is PARITY §6.1 (SHELLNOTDESK), a different owed item in a different lane. Named here because a
 prior arc died chasing this exact reading.
+## PULSEWIN — the core-load instrument gets a window, and a menu that switches its two faces (aarch64 `pidesk` / x86 `wc`, 2026-08-17)
+
+Peter, this cycle: *"core load distribution — pulse needs a window. x86 has it in one but had redone
+the app. Pi's is cool so do not throw it out; we can have pulse have the first menu option to switch
+between the 2 views."*
+
+Four claims in one sentence, and the arc is easiest to read as an answer to each in turn.
+
+### The two faces, and where each one actually lived
+
+**"x86 has it in one."** `crates/user-pulse` is a 128x128 ARGB **ring-3 ELF**. It asks the kernel for a
+compositor window (`SYS_WIN_CREATE`), paints a ten-segment bar per core into the surface the kernel maps
+into it and presents it (`SYS_WIN_PRESENT`); the kernel draws the frame, the title strip and the control
+discs and never writes a content pixel. It is staged as `PULSE.ELF` and launched by the shell
+(`pulse` at the prompt on x86 resolves to the program, because `pulse` is registered as an
+aarch64-only VERB and so is not a verb there) or by the `PULSE-W` boot witness.
+
+**"had redone the app"** is that ten-segment face: dim track, proportional fill with the leading segment
+blended, a swept `METER_BREATH` block for an idle-but-scheduled core, alternating `METER_PARKED`
+segments for a parked one, and a four-character `park` / ` run` / `NN%` verdict cell.
+
+**It cannot run on the Pi, and not for want of trying.** The sample it draws comes through
+`SYS_CPUPULSE` (49), and the `una-abi` divergence ledger records this as **D2**: the call is defined and
+dispatched only by the x86 kernel. On aarch64 `PULSE.ELF` gets `-ENOSYS` on its first sample, prints
+`:: PULSE-A: SYS_CPUPULSE refused - no honest sample, exiting ::` and exits — which is the honest
+behaviour and exactly why the windowed pulse has been an x86 fact for as long as it has existed.
+
+**"Pi's is cool."** The Pi's instrument is `ui_status`'s **LED lamp band**, and it is not a window and
+never was one: `draw_panel` → `draw_led_bar` → `draw_led` paints one row per core of individually-lit
+lamps, each with its own eight-band vertical lens gradient, hued green→amber→red **by position on the
+scale** (so a lamp's colour is stable and only the meter's length moves), with the fill measured as a
+lit LENGTH in pixels and the one lamp the boundary falls inside lit in proportion — a meter that scales
+continuously instead of clicking between whole segments. It draws straight into the desktop back buffer
+in the rows `ui_status::chrome_h` reserves from the tiler, is fed by `ui_status::tick` at
+`PSTRIP_PERIOD_MS` = 250 ms through the PULSE-4 attack/decay envelope, and is 140-odd lamps wide per
+core on the bench panel because Peter asked the width to buy sensitivity.
+
+So the machine had two instruments that had never met: one windowed and unreachable on this arch, one
+reachable and unwindowed.
+
+### What landed
+
+`video/pulsewin.rs` — **one kernel-owned compositor window with both faces in it.**
+
+* **It is an ordinary window.** A row in `wm`'s table under its own kernel owner
+  (`KERNEL_OWNER_BASE + 0x60` — deliberately neither `KERNEL_OWNER_CONSOLE` nor `KERNEL_OWNER_DESKTOP`,
+  so a `close_owner` sweep on either of those cannot take it, while `is_kernel_owner` still holds and
+  the keyboard still goes to the shell). It drags by its title bar through DRAG-PI's existing chrome
+  arm, minimises to the dock and zooms through WMCTRL's discs, and is created by `create_at` with
+  `spawn_geometry` so no pixel of it is ever presented at a position it will not occupy.
+
+* **The LED face is not a copy.** `ui_status::draw_panel` became
+  `ui_status::draw_panel_at(pal, at: Option<Rect>)`: `None` is `panel_geometry`'s reserved band — the
+  desktop instrument, unchanged, same call, same rows — and `Some(rect)` is the window. **One LED
+  renderer, two seams.** A second copy of those rows in the window module is precisely the drift the
+  registry rule exists to prevent.
+
+* **Neither face samples.** `ui_status::tick` remains the ONE sampler on this machine; the window reads
+  the published envelope through `ui_status::loads`. The two faces of one machine therefore cannot
+  disagree about a number, and the telemetry read rate is unchanged by the window existing.
+
+* **The segment face is a port of the face, not of the syscall.** Porting `SYS_CPUPULSE` to aarch64
+  would be an ABI arc and would still leave the two views unable to switch (a ring-3 program cannot draw
+  the kernel's LED band). The ten segments, the blended boundary segment, the breath sweep and the
+  dashed parked track are re-expressed in ring 0 against the same feed. The three shared colours are
+  imported from `ui_status`, which owns them; `METER_PURPLE` and `METER_LABEL` are copied with
+  attribution, exactly as `user-pulse` copies them, because `vug` declares them privately and is
+  aarch64-only.
+
+* **Nothing was thrown out.** The desktop LED band is untouched: same renderer, same reservation, same
+  render pass, same cadence. The window is a SECOND seat for it.
+
+### The menu, and what "menu" honestly means here
+
+This kernel has exactly one menu framework — `crystal`'s SHARD dropdown — and it is not a per-window
+menu: it owns a `const` tree of power verbs, anchors itself under `menubar::crystal_box_abs` and paints
+through the `strip` primitive onto the PANEL. Generalising it into an app-menu framework is a different
+arc, and the brief for this one says not to invent one.
+
+So the pulse window carries **its own menu strip as the first row of its own content** — drawn into its
+own surface, hit-tested in its own coordinates, invisible and unreachable from anywhere else, which is
+what a windowed app's menu is. One title, `View`; clicking it drops a two-row menu; the **first option
+is the Pi LED face** (which is also the face the window opens on, so option one is always what you are
+looking at and option two is always the switch), the second is the x86 segment face, and the live one
+carries a `>` mark. `<Esc>` dismisses it, and a press anywhere else dismisses it without being consumed
+— `crystal`'s own distinction.
+
+### The press arm reads as an `||`, and why that is safe
+
+`arch/aarch64/syscall.rs`'s PI-DESK furniture line now reads
+`strip::press_route(x, y) || pulsewin::press_route(x, y)`. Three properties make that position safe, and
+all three are checked in `press_route` rather than assumed by the caller:
+
+1. It re-asks `wm::hit_test` and **declines unless the topmost window at that point is this one**, so a
+   window stacked over the pulse window keeps every press inside its own box.
+2. It claims exactly two regions — this window's close disc and this window's menu — and answers `false`
+   everywhere else, so chrome drags, minimise, zoom, focus and every other window's everything reach the
+   arms below untouched.
+3. A content press with the menu closed is NOT consumed, so clicking the instrument raises the window
+   exactly as clicking any other window's content does.
+
+The close disc is claimed here for a reason worth recording: `wm::close_owner` **refuses kernel owners**
+(an ASID sweep must never be able to reap furniture), so a kernel row that wants to be closable has to
+close itself, by id. That is the only place this window closes, and it is reached from the close disc
+the compositor already draws — no second control and no second rule.
+
+### The press does not paint, and that is CONSWIN-PI's ledger applied before the fact
+
+A press flips one atomic and returns. The repaint is `service`'s, called once per pulse period from the
+Pi render pass immediately after `ui_status::tick`, and only when the frame signature (view, menu state,
+core count, every displayed load) has moved.
+
+CONSWIN-PI measured what the alternative costs. Its live routed console presented from arbitrary print
+context and turned a 108/108 bench-geometry run into **97/108 with 37 forbidden hits and a synchronous
+exception**, and the diagnosis was not "who writes the panel" but *who drives the COMPOSITOR* — a
+surface that presents from arbitrary call context is an unsynchronised compositor client. A menu that
+painted from the input task would be exactly that, for a picture whose entire content changes four times
+a second anyway. The cost is that a pick appears on the next tick rather than instantly: bounded by
+`PSTRIP_PERIOD_MS`, 250 ms, and not perceptible against a meter that updates at that rate.
+
+### Gating — a knob, never an arch
+
+`video/pulsewin.rs` is gated `any(all(x86_64, wc), all(aarch64, pidesk))` — the furniture family's gate,
+for the furniture family's reason: this is EXPERIENCE-layer code with no hardware in it, so it builds
+once and runs on every chip. `./arroyo check`'s `x86-all` leg carries `wc` and its `arm-pi` leg carries
+`pidesk`, so both compilations are covered by the standing gate rather than by assertion. Only
+`pidesk::activate` opens the window today; on x86 the module compiles and is unreferenced, which is what
+keeps the port from rotting.
+
+### The window is ARMED by the desktop seam and OPENED by the render pass
+
+`pidesk::activate` calls `pulsewin::arm()`; `pulsewin::service()` performs the open, on the first render
+pass where `ui_status::loads` reports a live instrument. That split was not a design preference — the
+gate convicted the direct call, and the readback is worth keeping:
+
+```
+[chrome-truth] win=1 box=(10,230,436x164) foc=no pt=keyline_top at=(228,230) want=0xb4b4b9 got=0x000000 -> MISS
+[chrome-truth] win=1 box=(10,230,436x164) foc=no pt=bevel_light at=(228,231) want=0xffffff got=0x000000 -> MISS
+[chrome-truth] verdict wins=1 hits=0/5 title_grad=0 … panel=640x480 -> FAIL
+[pulsewin] open win=1 panel=640x480 surf=426x120 box=436x164 at (10,230) view=Pi LED lamps
+```
+
+Five chrome probes, five misses, all reading black — and the verdict printed **three lines before**
+`open`'s own witness finished. `create_at` composites the new row before it returns, so a window minted
+from the bringup path is minted by a core that is not the one driving the compositor, and CHROME-TRUTH
+read the row's chrome off the glass in the gap between the create and the blit. That is CONSWIN-PI's
+unsynchronised-compositor-client shape arriving from a third direction. Opened from the render pass
+there is no second core to race, and the FAIL is gone: with the split in place `[pulsewin] open` lands
+at serial line 312 and `chrome-truth` passes ahead of it.
+
+The second half of the rule is its own justification: **no instrument window before the instrument has a
+reading.** `ui_status::loads` answers `0` until `tick` arms, and a monitor that opens as an empty box
+has told the operator nothing about the machine and something false about itself.
+
+### Gates
+
+| gate | result |
+| --- | --- |
+| `./arroyo check` (12 cfg legs, both arches) | **green** — `x86-all` carries `wc`, `arm-pi` carries `pidesk`, so both compilations of `pulsewin` are covered |
+| `UNAOS_WC=1 ./arroyo check` | **green** |
+| `./arroyo kernel8-test 210` (knob-off, the DONE gate) | **PASS 108/108, 0 forbidden, 15960 lines** |
+| `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 300` (bench geometry, knob-off) | **PASS 108/108, 0 forbidden, 13893 lines** |
+| `UNAOS_PIDESK=1 ./arroyo kernel8-test 300` (armed) | **104/108**, and every delta is the furniture-vs-fixture conflict below |
+
+The bench-geometry run was taken because this arc touches a paint path (`ui_status`'s panel renderer now
+takes its rect as a parameter); at 1920x1200 the desktop band is 92 px and its LED geometry is a
+different layout from the 640x480 gate's, so a rect regression would land there and not here. It did
+not. Both knob-off runs were taken with `pgrep -c qemu` = 2 on a shared host; an earlier knob-off run on
+a busier host produced one `[wc-h] … maxpresent_us=24176 … -> AT-RISK` against a 16667 µs frame — a host
+scheduling artifact, and it did not recur on the quieter re-run.
+
+### The armed run's four deltas, and why every one of them is occlusion
+
+The Pi video witness battery reads back exact panel pixels and was written against a Pi desktop with no
+furniture windows on it. CONSWIN-PI recorded this conflict when the console window arrived (104/108 at
+bench geometry, diagnosed down to one pixel: *"the console's chrome read where the fixture expected its
+own window's face — occlusion, with the surface itself intact"*). A second furniture window reaches it
+at the 640x480 gate geometry too, in the same words:
+
+```
+[wc-d] verify win=2 … first=(160,230) got=0xb4b4b9 want=0xff2020 -> FAIL
+[wc-j] vacate close_painted=true close_desktop=false (4/5) owner_painted=true owner_desktop=false (4/5) -> FAIL
+[wc-j] move-once … old_desktop=false (2/3) … flash_px=0 exact=true -> FAIL
+[wc-f] twin -> DEFER (a live window overlaps the probe strip; retrying every composite until it clears)
+[clickroute] hit-test … hidden=true shell=skip bare=false … -> FAIL
+```
+
+* `0xb4b4b9` is `theme::FRAME_LINE`. `wc-d` read the pulse window's own keyline where it expected its
+  fixture surface, at `y=230` — the pulse window's top edge exactly. `bad_cache=0 ram_indep=yes`: the
+  surface is intact, the glass is occluded. `wc-j`'s two legs are the same fact seen through a vacated
+  box that reads window pixels instead of `DESKTOP_BG`.
+* **`wc-f` is the interesting one, and it is not a race.** Its verdict is `DEFER` — *"a live window
+  overlaps the probe strip; retrying every composite until it clears"*. It is built to wait out a
+  TRANSIENT window; a permanent furniture window never clears, so the `PASS` it is REQUIREd to print
+  never arrives. That is a structural conflict between a probe that assumes an empty strip and a desktop
+  that has furniture on it, not a defect in either.
+* `clickroute`'s `bare=false` is `clickshell_windowless_leg`: it drives a press from a focus that owns
+  nothing at wherever the pointer is, and requires a MISS.
+
+**No placement resolves this, and that was established rather than assumed.** The window was run centred
+in the work area (105/108: `hidden=false`, `bare=false` — a kernel row is hittable and is not pushed
+below the shell, so it sat on `hittest_selftest`'s upper-middle probe) and bottom-left (104/108:
+`hidden` recovered, `wc-j move-once` lost). At 640x480 a 436-px-wide box spans the centre column from
+any x, so the pointer's rest position is inside it wherever it goes; and the two probe regions —
+upper-middle at `(width/3, height/4 + TITLE_H + BORDER)` and the pointer's rest point — cannot both be
+cleared by a 436x164 box inside a 640x370 work area. The placement that shipped is the one with the
+better reason rather than the better score: **bottom-left, flush above the reserved rows**, so the
+window sits directly above the desktop LED band it is a second seat for, and the two faces of one number
+are in the same glance.
+
+The reconciliation — a spec that knows a Pi desktop has furniture rows on it, as x86's already records
+"win=1 is the console window on this bench" — is the integrator's, exactly as CONSWIN-PI left it. **No
+REQUIRE or FORBID was touched, re-worded, or gated off.**
+
+### Byte-identity: NOT clean, and the number is here rather than in a claim
+
+PARITY.md §5.3's line-neutral rule was honoured where it could be. `arch/aarch64/syscall.rs` and
+`main.rs` are **line-neutral** — the click arm was extended in place and `service()` was folded onto the
+`ui_status::tick` line, both exactly as §5.3 prescribes. `video/mod.rs` gained its `mod` at the FILE
+TAIL, below `pidesk`'s, so nothing in that file moves.
+
+`ui_status.rs` could not be. The arc's central claim — one LED renderer reached from two seams — needs a
+rect parameter and a loads accessor in a file that IS compiled knob-off, and the residual after
+compacting both to their minimum is **+10 lines**. Rewrapping neighbouring prose to reclaim them was
+measured and recovers about one line: the file's comment blocks already run to 100-118 columns, so the
+only way to reach zero would have been to delete documentation, which §5.3 explicitly forbids.
+
+So the knob-off image MOVES, and §5.3's own instruction is *"re-measure, never reason"*. Measured, both
+sides built from a clean worktree:
+
+```
+baseline 14e54538   c3000ff5bd87ed0eb210a45e84fb73c5543078ed6d2a432e4c9d21d738e7a4a2  1121728 bytes
+this arc            4bcb4b510b54e84f2f9a759df35f66bda91dca13ae0b647eea2e0cd6517502cb  1121728 bytes
+cmp -l              9 differing bytes, identical length
+```
+
+**Nine bytes out of 1,121,728, and the length is unchanged** — no code was added to the knob-off image,
+which is the property the discipline exists to protect. Two of the nine are single bytes at offsets
+994353 and 994713, and the second reads `0x5C -> 0x66`: **102 − 92 = 10**, the `ui_status.rs` line shift
+itself, recorded in a panic `Location`. The remaining seven sit in one cluster at 2857-2864.
+
+Left for the integrator, with both options priced: either the +10 is accepted as the cost of the shared
+renderer, or `draw_panel_at`/`loads` are replaced by a line-neutral `pub(crate)` widening of
+`row_geometry`/`draw_led_bar`/`PULSE` — which reaches zero, but leaks the instrument's internals into the
+window module and hands the two a `PULSE`-lock ordering footgun the accessor does not have.
 
 ---
