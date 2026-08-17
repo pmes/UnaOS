@@ -209,10 +209,16 @@ use una_abi::SYS_INPUT_WAIT;
 ///   SYS_WIN_CLOSE(win) -> 0 / -errno
 ///     Unmap the surface (leaves revert to the reserved EL1-only identity descriptors) and free the
 ///     window. Same ownership gate. Teardown (`clear_handle_row`) closes every window an ASID still owns.
+///   SYS_WIN_PRESENT_ROWS(win, y0, y1) -> 0 / -errno   [FBCON-DMG-PI]
+///     The DAMAGE-CARRYING present: composite the window declaring only SOURCE rows `[y0, y1)` of its
+///     OWN surface changed, so the compositor repaints only those. Gating is 30's, verbatim and in the
+///     same order, plus `-EINVAL` for an empty, inverted or over-tall band. Additive at its own number
+///     (33) — 30 is untouched and keeps its exact one-argument shape, so an old binary cannot reach it.
 use una_abi::SYS_WIN_CREATE;
 use una_abi::SYS_WIN_PRESENT;
 use una_abi::SYS_WIN_MOVE;
 use una_abi::SYS_WIN_CLOSE;
+use una_abi::SYS_WIN_PRESENT_ROWS;
 
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
@@ -6820,6 +6826,9 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_WIN_PRESENT => sys_win_present(a0),
         SYS_WIN_MOVE => sys_win_move(a0, a1, a2),
         SYS_WIN_CLOSE => sys_win_close(a0),
+        // FBCON-DMG-PI: the banded present. Sits beside 30 rather than replacing it — a client that
+        // gets `-ENOSYS` here (an older kernel) falls back to 30 and still draws a correct picture.
+        SYS_WIN_PRESENT_ROWS => sys_win_present_rows(a0, a1, a2),
         SYS_EXIT => {
             // SPINHUNT — PROCESS exit terminates the ADDRESS SPACE, not just this task. Placed at the
             // very top of the arm, before every name-routed short-circuit below (each of which ends in
@@ -11848,6 +11857,7 @@ fn sys_fb_present() -> i64 {
         super::boot::FB_SURFACE_SIZE,
         crate::video::wm::WIN_NONE,
         sum,
+        None,
     );
     drop(t);
     drop(_irq);
@@ -11856,13 +11866,20 @@ fn sys_fb_present() -> i64 {
     0
 }
 
-/// WC-B: the ONE present body both `SYS_FB_PRESENT` and `SYS_WIN_PRESENT` run — witness accounting, the
-/// UVUG-8r2 focus-scoped counter bump, the compositor damage mark, and the blit. Factored so the two
+/// WC-B: the ONE present body `SYS_FB_PRESENT`, `SYS_WIN_PRESENT` and `SYS_WIN_PRESENT_ROWS` run —
+/// witness accounting, the
+/// UVUG-8r2 focus-scoped counter bump, the compositor damage mark, and the blit. Factored so the
 /// verbs cannot drift; every ELF-3/UVUG-8 invariant below is unchanged from the single-surface version.
 /// M3 (span shrink): `sum` is the caller's `fb_checksum` over the SAME surface, computed OUTSIDE
 /// the IRQ mask — the checksum reads the caller's own surface while the caller is parked in the
 /// syscall, so it needs the ownership verdict, not the mask (~65 K masked volatile reads leave the
 /// span). The store-then-count ordering below is unchanged; both callers keep it by construction.
+///
+/// FBCON-DMG-PI: `band` is the SOURCE-ROW range `[y0, y1)` the caller declared damaged, or `None` for
+/// the whole box — which is what BOTH pre-existing verbs pass, so their behaviour here is unchanged
+/// by construction. The band reaches the compositor only on the `wm` arm below; the COMPAT arm
+/// (`wm_id == WIN_NONE`) ignores it and forwards the whole surface, which is the fail-safe direction
+/// (over-paint, never a stale row) and the only one the ELF-3 hook's signature can express.
 fn present_surface_common(
     asid: u64,
     surf: *mut u8,
@@ -11872,6 +11889,7 @@ fn present_surface_common(
     size: usize,
     wm_id: crate::video::wm::WinId,
     sum: u64,
+    band: Option<(usize, usize)>,
 ) {
     let _ = size;
     // M3 shrink 2 — ARM THE OWED-TAIL DEFERRAL. This body is the one place both present verbs go
@@ -11909,7 +11927,15 @@ fn present_surface_common(
     // checksum witness above, so the UVUG-8 suspension cap and the ELF-3 fb-test `present == 1` verdict are
     // driven by the single accounting block regardless of which path renders.
     if wm_id != crate::video::wm::WIN_NONE {
-        wc_shim::present(wm_id);
+        // FBCON-DMG-PI: one arm, two extents. `None` is `wm::present` verbatim — the pre-arc call — so
+        // `SYS_FB_PRESENT`/`SYS_WIN_PRESENT` reach the compositor through the exact same line they did
+        // before. `Some` is `wm::present_rows`, which is the SAME pass with a narrower repaint extent
+        // (occlusion closure, staged-present discipline, cursor bracket, VUGMIN-B suppression and every
+        // witness are shared code on a shared path — see `video::wm::present_banded`).
+        match band {
+            None => wc_shim::present(wm_id),
+            Some((sy0, sy1)) => wc_shim::present_rows(wm_id, sy0, sy1),
+        }
     } else {
         wc_shim::present_compat(surf as *const u8, w, h, stride);
     }
@@ -12254,6 +12280,104 @@ fn sys_win_present(win: u64) -> i64 {
         e.pages as usize * 0x1000,
         e.wm_id,
         sum,
+        None,
+    );
+    drop(t);
+    drop(_irq);
+    // M3 shrink 2: cash the sprite tail composite_pass stashed — unmasked, lock-free epilogue.
+    crate::video::wm::composite_tail_owed();
+    0
+}
+
+/// FBCON-DMG-PI: `SYS_WIN_PRESENT_ROWS(win, y0, y1)` -> 0, or a negative errno. The DAMAGE-CARRYING
+/// present: composite the caller's window declaring only SOURCE rows `[y0, y1)` of its own surface
+/// changed. Rows are the SURFACE's, not the panel's, and the half-open interval is the C convention
+/// `y1 == y0 + count`. The aarch64 twin of x86's `sys_win_present_rows`; same number, same argument
+/// shape, same errnos in the same order — `una_abi` is the contract both sides implement.
+///
+/// ADDITIVE, at its own number (33). `SYS_WIN_PRESENT` (30) is untouched on both arches and keeps its
+/// exact one-argument shape — see the number's declaration in `una_abi` for why widening 30 in place
+/// could not be made safe. A kernel without this verb answers `-ENOSYS` from the dispatcher's default
+/// arm, having done nothing else, which is why every client carries a whole-box fallback.
+///
+/// GATING IS `sys_win_present`'S, VERBATIM, AND IN THE SAME ORDER: `win_caller_slot()` first, then
+/// `-EBADF` on an out-of-range id, `-EBADF` on a free row, `-EACCES` on another ASID's live window. A
+/// damage hint is not a weaker capability than a present, so it does not get a weaker check.
+///
+/// A BAD RANGE IS `-EINVAL`, NOT A SILENT WHOLE-BOX — the x86 arm's argument, which holds here
+/// unchanged. `video::wm::present_rows` does degrade an empty, inverted or over-tall band to the whole
+/// box internally, and that degrade is right for the KERNEL callers it was written for: fail-safe,
+/// never leaving a pixel stale. At the ABI it would be fail-SILENT in the sense that matters: a ring-3
+/// program with an off-by-one in its damage arithmetic would repaint correctly, at full cost, forever,
+/// and the syscall would answer 0 every time — the bug invisible in exactly the place this verb exists
+/// to make visible. Refusing tells the caller on its first frame, and the mandatory whole-box fallback
+/// every client already carries for the `-ENOSYS` case catches this one too, so the refusal costs a
+/// correct picture nothing and buys a debuggable one. `y0` needs no separate bound: `y0 < y1 <= h`.
+///
+/// LOCK SPAN and LOCK ORDER are `sys_win_present`'s, including its M3 snapshot–checksum–revalidate:
+/// hold #1 resolves ownership, RANGE-CHECKS THE BAND AGAINST THE SAME ROW'S `h` and snapshots the row;
+/// the 64 KiB checksum then runs unmasked over the caller's own surface (the caller is parked in this
+/// syscall, so its surface cannot change); hold #2 re-validates before a pixel moves. The band is
+/// judged against the `h` read under the hold that validated the ownership — so it is provably the `h`
+/// of the window being presented — and hold #2 re-checks `w`/`h` as well as `owner`/`rslot`/`wm_id`,
+/// one check STRONGER than the whole-box verb needs: a close+create pair that recycled this row back
+/// to the same ASID with the same region slot, the same wm id and a SMALLER surface would otherwise
+/// carry a band validated against the old height into the new window. That is refused `-EBADF`,
+/// fail-closed, rather than clamped.
+///
+/// The checksum is deliberately NOT skipped for a banded present. `FB_PRESENT_CHECKSUM` is the ELF-3
+/// witness of what was last presented, and a verb that composited without refreshing it would leave
+/// the witness describing a frame that is no longer on the panel. Cheapness here is bought from the
+/// COMPOSITOR (a narrower repaint of an upscaled box), not from the accounting.
+fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
+    let asid = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if win >= WIN_MAX as u64 {
+        return EBADF;
+    }
+    let id = win as usize;
+    let slot = (asid - 1) as usize;
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    if t[id].owner == 0 {
+        return EBADF;
+    }
+    if t[id].owner != asid {
+        return EACCES;
+    }
+    // The range check runs against THIS row's surface height, read under the same hold that validated
+    // the ownership. Order matters and matches x86: ownership is proved BEFORE the band is judged, so a
+    // caller cannot probe another ASID's window geometry by watching `-EINVAL` and `-EACCES` diverge.
+    if y1 <= y0 || y1 > t[id].h as u64 {
+        return EINVAL;
+    }
+    let e = t[id];
+    drop(t);
+    drop(_irq);
+    let surf = super::boot::slot_fb_win_surface_ptr(slot, e.rslot as usize);
+    let sum = fb_checksum(surf, e.pages as usize * 0x1000);
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    if t[id].owner != asid
+        || t[id].rslot != e.rslot
+        || t[id].wm_id != e.wm_id
+        || t[id].w != e.w
+        || t[id].h != e.h
+    {
+        return EBADF;
+    }
+    present_surface_common(
+        asid,
+        surf,
+        e.w as u32,
+        e.h as u32,
+        e.w as u32 * 4,
+        e.pages as usize * 0x1000,
+        e.wm_id,
+        sum,
+        Some((y0 as usize, y1 as usize)),
     );
     drop(t);
     drop(_irq);
@@ -12399,6 +12523,22 @@ mod wc_shim {
     pub fn present(id: WinId) {
         if id != WIN_NONE {
             wm::present(id);
+        }
+    }
+
+    /// FBCON-DMG-PI: `video::wm::present_rows` — the same pass as [`present`], damage-marking only
+    /// SOURCE rows `[sy0, sy1)` of the window's surface. Called with `WINDOWS` held, for [`present`]'s
+    /// reason (WC-B (F2): the id handed to `wm` is provably still the id the verb validated).
+    ///
+    /// The band is already range-checked against THIS window's `h` by `sys_win_present_rows`, under the
+    /// same hold that proved ownership, so `wm`'s own degrade-to-whole-box for a nonsense band is
+    /// unreachable from the syscall path — a ring-3 caller is told `-EINVAL` instead of being silently
+    /// widened. The `bool` return says only whether `id` named a live row; `sys_win_present` discards
+    /// the same information (`wm::present` returns it too) and this verb keeps that behaviour, so a
+    /// present into a headless/refused compositor row answers 0 on both verbs alike.
+    pub fn present_rows(id: WinId, sy0: usize, sy1: usize) {
+        if id != WIN_NONE {
+            let _ = wm::present_rows(id, sy0, sy1);
         }
     }
 
@@ -14201,7 +14341,7 @@ fn fb_launcher(_demo_cpu: usize) {
 // self-verifies. Single-threaded and register-only apart from its own surface, so it can never perturb
 // the ELF-2/ELF-3 accounting (it runs AFTER those verdicts print).
 //
-// Bit ledger (all thirteen must be set):
+// Bit ledger (all eighteen must be set):
 //   b0  create(128,128) -> id >= 0           b6  create(0,0)        -> -EINVAL
 //   b1  the per-window info entry reads back b7  create(129,10)     -> -EINVAL (over FB_WIN_MAX_W)
 //       magic/128/128 for region slot 0      b8  close(A)           -> 0
@@ -14209,6 +14349,15 @@ fn fb_launcher(_demo_cpu: usize) {
 //   b3  move(A,40,24) -> 0                   b10 create(64,64) -> a SECOND id >= 0
 //   b4  move(A,8192,0) -> -EINVAL            b11 present(B) -> 0 with A STILL LIVE
 //   b5  present(8) -> -EBADF (unknown id)    b12 close(B)           -> 0
+//
+// FBCON-DMG-PI — the BANDED present's own five bits, added when `SYS_WIN_PRESENT_ROWS` (33) landed on
+// this arch. They exist because the verb's only ring-3 client (`user-vug`) reaches it on an idle path
+// that a headless QEMU run never enters, so without them the port would ship unexercised in the gate:
+//   b13 present_rows(A, 0, 11)  -> 0         b16 present_rows(8, 0, 1)  -> -EBADF (unknown id)
+//   b14 present_rows(A, 11, 11) -> -EINVAL   b17 present_rows(A, 0, 11) -> -EBADF on the FREED row
+//   b15 present_rows(A, 0, 129) -> -EINVAL (y1 past the 128-row surface)
+// b13 is placed while A still holds its 0xC3 surface and is followed by the whole-box re-present of A,
+// so `FB_PRESENT_CHECKSUM` at verdict time is exactly what it was before this leg existed.
 // The verdict ALSO checks the kernel-side checksum of the presented surface against the expected FNV-1a
 // of 64 KiB of 0xC3 — so b2 cannot pass on a present that composited the wrong (or a stale) surface,
 // which is the property that actually proves the 16-page negotiated mapping landed.
@@ -14227,8 +14376,9 @@ fn fb_launcher(_demo_cpu: usize) {
 
 static WCB_DONE: AtomicBool = AtomicBool::new(false); // the fixture reached its clean sys_exit(0)
 static WCB_WITNESS: AtomicU64 = AtomicU64::new(0); // its reported bitmask
-/// WC-B: every bit of the ledger above (WC-C widened it from 10 to 13 with the side-by-side leg).
-const WCB_WITNESS_ALL: u64 = 0x1FFF;
+/// WC-B: every bit of the ledger above (WC-C widened it from 10 to 13 with the side-by-side leg;
+/// FBCON-DMG-PI from 13 to 18 with the banded-present leg).
+const WCB_WITNESS_ALL: u64 = 0x3_FFFF;
 /// WC-C: the byte the fixture fills its SECOND (64x64) window with — deliberately different from
 /// `WCB_FILL`, so the two `[wc-c]` per-window checksums cannot coincide and a composite that read the
 /// wrong surface for either window is visible in the witness.
@@ -14387,6 +14537,42 @@ __wcb_prog:
     b.ne 9f
     orr  x23, x23, #(1 << 7)
 9:
+    mov  x0, x22                           // (b13) FBCON-DMG-PI: SYS_WIN_PRESENT_ROWS(A, 0, 11) -> 0.
+    mov  x1, #0                            // The BANDED present: 11 of A's 128 source rows declared
+    mov  x2, #11                           // damaged, the extent `user-vug`'s idle HUD refresh uses.
+    mov  x8, #33
+    svc  #0
+    cmp  x0, #0
+    b.ne 9f
+    orr  x23, x23, #(1 << 13)
+9:
+    mov  x0, x22                           // (b14) an EMPTY band (y1 == y0) -> -EINVAL, never a silent
+    mov  x1, #11                           // whole-box: a caller's damage arithmetic is told it is wrong.
+    mov  x2, #11
+    mov  x8, #33
+    svc  #0
+    cmn  x0, #22
+    b.ne 9f
+    orr  x23, x23, #(1 << 14)
+9:
+    mov  x0, x22                           // (b15) y1 PAST the 128-row surface -> -EINVAL. The bound is
+    mov  x1, #0                            // this row's own `h`, read under the ownership hold.
+    mov  x2, #129
+    mov  x8, #33
+    svc  #0
+    cmn  x0, #22
+    b.ne 9f
+    orr  x23, x23, #(1 << 15)
+9:
+    mov  x0, #8                            // (b16) rows-present off the end of the table -> -EBADF, the
+    mov  x1, #0                            // SAME refusal and the same order as the whole-box verb (b5).
+    mov  x2, #1
+    mov  x8, #33
+    svc  #0
+    cmn  x0, #9
+    b.ne 9f
+    orr  x23, x23, #(1 << 16)
+9:
     mov  x0, x22                           // WC-C: re-present A so the LAST present the kernel checksums
     mov  x8, #30                           // is A's 128x128 0xC3 surface again — the verdict's expected
     svc  #0                                // value is therefore unchanged by the side-by-side leg.
@@ -14410,6 +14596,15 @@ __wcb_prog:
     cmn  x0, #9
     b.ne 9f
     orr  x23, x23, #(1 << 9)
+9:
+    mov  x0, x22                           // (b17) FBCON-DMG-PI: rows-present on the now-FREED row ->
+    mov  x1, #0                            // -EBADF. The free-row gate is 30's, verbatim: a band is not
+    mov  x2, #11                           // a weaker capability than a present and gets no weaker check.
+    mov  x8, #33
+    svc  #0
+    cmn  x0, #9
+    b.ne 9f
+    orr  x23, x23, #(1 << 17)
 9:
     mov  x0, x23                           // SYS_REPORT(witness bitmask)
     mov  x8, #3
@@ -14473,7 +14668,7 @@ fn wcb_launcher(_demo_cpu: usize) {
     let expect = wcb_expected_checksum();
     if done && w == WCB_WITNESS_ALL && checksum == expect {
         serial_println!(
-            ":: EL0: window verbs — create/present/move/close witness={:#x} surface=128x128 checksum={:#x} :: PASS ::",
+            ":: EL0: window verbs — create/present/present_rows/move/close witness={:#x} surface=128x128 checksum={:#x} :: PASS ::",
             w, checksum
         );
     } else {

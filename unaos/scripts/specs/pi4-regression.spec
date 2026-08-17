@@ -355,10 +355,14 @@ REQUIRE USER: input router — routed=2 .*GUI_CHANNEL bypassed :: PASS
 REQUIRE \[inroute\] router window — routed=2 stale_dropped=1 revokes=0
 FORBID USER: input router.*FAIL
 #
-# --- 2. The el0-wcb window-verb ledger, ALL THIRTEEN bits. The literal mask matters: a partial
-# ---    mask still prints `witness=0x...` and the verdict already refuses it, but pinning 0x1fff
+# --- 2. The el0-wcb window-verb ledger, ALL EIGHTEEN bits. The literal mask matters: a partial
+# ---    mask still prints `witness=0x...` and the verdict already refuses it, but pinning 0x3ffff
 # ---    here means a silently NARROWED ledger (bits removed from the fixture) also fails.
-REQUIRE EL0: window verbs.*witness=0x1fff.*PASS
+# ---    FBCON-DMG-PI widened 0x1fff -> 0x3ffff with the five banded-present bits (b13..b17):
+# ---    SYS_WIN_PRESENT_ROWS's happy path plus its four refusals. That leg is the ONLY exercise the
+# ---    banded verb gets in a headless run — its ring-3 client reaches it from an idle path a QEMU
+# ---    boot never enters — so without this pin the aarch64 port would ship unproven in the gate.
+REQUIRE EL0: window verbs.*witness=0x3ffff.*PASS
 #
 # --- 3. The side-by-side composite. This is the arc's actual claim — two windows drawn in ONE
 # ---    compositor pass — and it is the line that gates the per-window checksum lines that follow

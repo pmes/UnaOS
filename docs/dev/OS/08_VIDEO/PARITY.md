@@ -330,7 +330,39 @@ missing the ways to REACH it, and the headroom to run it at full detail.**
 | 6.6a | **`vug` does not launch on the Pi** | `shell.rs:5007` (`bare_exec`, `#[cfg(target_arch = "x86_64")]`), `shell.rs:2509` (`Facts::exec = cfg!(x86_64)`), `shell.rs:2899` (the `Plan::Exec` arm, whose `not(x86_64)` branch prints *"Unknown command."*) | Typing `vug` on the Pi prints **"Unknown command."** — verbatim the failure Peter reported at the bench on x86, still shipping on aarch64. The operator must type `bg /fat/VUG.ELF`. **This is also the gate on the shard itself:** VUGSCENE renders only when `overlay = detached \|\| interactive`, and `detached` is bit 0 of the info-page flags set by `bg` — so the launch path *is* the drawing path. `spawn_user_image_bg` already exists on aarch64 (`arch/aarch64/syscall.rs:8145`); only the resolver/dispatch half is missing, and the `not(x86_64)` arm was left in place precisely so "the compiler points here" when a loader arrives. **Smallest change with the largest visible payoff. Start here.** |
 | 6.6b | **Pi media stages only one vug image** | `arroyo:2344-2359` (`build_user_aarch64` builds one unfeatured `VUG.ELF`), `arroyo:2876` (stages that one file); cf. `arroyo:1034-1079` `build_one_vug_x86` emitting three | x86 media carries `VUG.ELF` (adaptive), `VUGC.ELF` (`pinlo`, classic baseline) and `VUGX.ELF` (`pinhi`, full per-pixel shard). **Pi media has neither `VUGC.ELF` nor `VUGX.ELF`**, so the pinned-detail images — the ones that show the shard at full density and give the A/B baseline — cannot be run on the Pi at all. Build-plumbing only; the crate already builds for aarch64 under both feature pins. |
 | 6.6c | **No scheduler placement/steal repair on the Pi** | all of `arch/x86_64/sched.rs`'s VUGSPREAD work; aarch64 twin absent | The LOD ladder self-tunes off achieved fps, so **less CPU headroom settles the shard at a LOWER detail rung — the Pi literally draws a simpler scene.** This is the deepest link to Peter's "more drawing complexity" direction: the Pi's shard is dimmer because its scheduler is worse, not because its renderer is. Large; its own arc; needs a scheduler-lane owner, not a video-lane one. |
-| 6.6d | **No damage-present on the Pi** | `SYS_WIN_PRESENT_ROWS` (33) dispatched at `arch/x86_64/syscall.rs:2594`; absent from the aarch64 dispatcher (`arch/aarch64/syscall.rs:6814-6820`) | The Pi answers `-ENOSYS` and `user-vug` falls back to a whole-box present every frame — more work per frame for identical output. Feeds 6.6c: cheaper presents mean more headroom, which means a higher LOD rung. Note this is a *drawing-efficiency* port, not pacing — it makes each frame cost less, never makes frames wait. |
+| 6.6d | ~~**No damage-present on the Pi**~~ — **CLOSED**, `exec-presentrows` | `SYS_WIN_PRESENT_ROWS` (33) dispatched at `arch/x86_64/syscall.rs:2594`; now also at `arch/aarch64/syscall.rs` (`sys_win_present_rows`, beside `sys_win_present`) | The Pi answered `-ENOSYS` and `user-vug` fell back to a whole-box present. Ported: same number, same argument shape, same errnos in the same order, band range-checked against the presenting row's own `h` under the hold that proved ownership. See §6.6d-closed below for the correction the port forced on this row's own framing. |
+
+#### 6.6d-closed — what the port delivers, and the claim in the row above that was wrong
+
+`exec-presentrows` landed `SYS_WIN_PRESENT_ROWS` on aarch64 (`arch/aarch64/syscall.rs`), plus five
+banded-present bits in the `el0-wcb` fixture (b13..b17: the happy path and its four refusals) and the
+matching widening of `pi4-regression.spec`'s ledger pin from `0x1fff` to `0x3ffff`. The gate proves the
+verb reaches the compositor rather than degrading: `[wc-h] rollup win=1 … banded=1 minspan=22
+minspan_bytes=23408` — 22 panel rows repainted for an 11-row source band, against a whole box of the
+same window.
+
+**The correction.** The row above said *"`user-vug` falls back to a whole-box present every frame"*, and
+the second half of that is not true — on EITHER arch. `user-vug` calls the banded verb from exactly one
+site (`main.rs:2350`, the idle HUD refresh, `[HUD_Y0, HUD_Y1)` = 11 of 128 source rows, at most once per
+second). Its per-frame render present is `SYS_WIN_PRESENT` at `main.rs:2535`, deliberately and with the
+reason on the line: the two workers between them write every row, so the damaged band IS the whole
+surface and there is nothing to narrow. x86 does the same thing. **So this gap was never the per-frame
+cost, and closing it does not by itself move the Pi's frame rate.** What it removes is a real but small
+waste — a whole 128-row box repainted once a second for 11 changed rows on every idled vug on the
+desktop — and, more importantly, it removes the ARCH ASYMMETRY: a ring-3 program that bands its damage
+is now answered the same way on both chips, so the next client to arrive (a shell window, a console
+window, a partially-updating app) gets the cheap path on the Pi without another port.
+
+The stutter Peter reported at the bench remains owned by **6.6c** (no VUGSPREAD placement/steal repair
+on the Pi) and, for reach, **6.6a**. Neither is touched here.
+
+**Owed elsewhere, not touched by this arc (lane discipline).** Two comment blocks in `video/wm.rs` now
+carry a premise this arc falsified — that no caller of `present_rows` compiles for aarch64, and that the
+`[comp2]` ledger's `dmg_px` and `box_px` are therefore equal on that arch by construction (`wm.rs`
+~8564 and ~13902). The CODE is unaffected — it charges the extent that actually ran, which is what those
+blocks argue for — but the "cannot move" claim is now false on a boot that takes a banded present.
+`una-abi`'s verb table (`lib.rs:131`) and `user-vug`'s import comment (`main.rs:297`) likewise still read
+*x86 only*. All four are doc-only and belong to lanes this arc does not own.
 
 **Not gaps, recorded so they are not mistaken for them:** the `overlay` gate that renders level 0 on a
 foreground `run` behaves identically on x86 — it is shared ring-3 behaviour, not a parity defect (the
