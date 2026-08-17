@@ -3417,6 +3417,17 @@ genuinely fetching. A full-window sweep was added on both sides (`[v3d76]` in th
 The sweep reduced the structural divergences to exactly two UNNAMED words, absent from mainline
 `v3d_regs.h`: core0+0x68 (piOS 0x3, ours 0x10001) and hub+0x68 (piOS 0x2, ours 0).
 
+> **The `0x4040` datum is reconciled in §49.20.4(a), and it is not revived.** §49.19's later piOS
+> mid-bin capture reads `RPIVID_ASB_V3D_M_CTRL` as `0x8060`, not `0x4040` — a different capture,
+> sixteen days and one piOS kernel apart, of the field §46.2's idle-dump row had already classified
+> as **bridge activity status**. Four distinct piOS values are now on record (`0x4040`,
+> `0x4050→0x4060` cycling live, `0x8060`, `0x8050`) against one piOS *idle* value, `0x4` — which is
+> ours in every state we have read. boot4/PA40 (§49.20.2 V6) supplies our side of this window
+> directly for the first time: `0x7` at cold entry, `0x00000004` released. **The low nibble is the
+> configuration and it matches; the upper bits are traffic, and we generate none** — §49.20.2 V4
+> shows the PTB's write never completes as a bus transaction, so the field is an *effect* of the
+> wall, downstream of it, and cannot be its cause.
+
 ### 46.2 The verdicts, in order (each read on metal)
 
 | Rung / boot | Experiment | Verdict |
@@ -4753,6 +4764,17 @@ nothing, and §26's hub-INT and §36's PTB-frame instruments both point at it.
 > the violation pair and its decode in its own columns, so "fix it before citing this rung" names the
 > fault it is refusing on instead of leaving it to a later hygiene line.
 
+> **FLOWN, and PARTLY ANSWERED — see §49.20** (boot4/PA40, 2026-08-17). The rung reproduced boot11
+> exactly: a bin frame closed under the unarmed submit (`BFC 0→1`), the PTB issued a write, the MMU
+> refused it (`PT_INVALID=1 WRITE_VIOLATION=1`, client PTB, `VIO_ADDR=0x0000000e VIO_ID=0x00000020`,
+> `VA 0x00000070` — byte-identical raw words to this section's), and the `[v3d62]` catcher absorbed
+> it (48 of 1024 sentinel words gone). **The lead's own fork did not resolve, and this section's
+> reading of it must not be quoted as settled:** the fork needed a *different* `CT0QMA`/`CT0QMS`/
+> `CT0QTS` residue, and boot4's residue — like boot11's — was **zero**, under which "structural
+> `0x70`" and "base `0` + offset `0x70`" predict the same VA. §49.20.2 V5 shows a second PTB pointer
+> on that boot doing base-plus-offset arithmetic on exactly that zero base (`BPCA = QMA + 0x3000`,
+> `BPCA + BPCS ≡ QMA + QMS` mod 2³²), which favours the base-relative reading. §49.20.6 R1 is the cut.
+
 ---
 
 ### 49.11 The last split — `UNAOS_V3D_FIRSTKICK=rclhead126` (PI-V3D-88)
@@ -5248,6 +5270,14 @@ pool/base registers in the core0 `+0x108..+0x174` window this driver never touch
 **contains** `CT0QTS` (`+0x15c`), `CT0QMA` (`+0x170`) and `CT0QMS` (`+0x174`), the three registers
 this rung reads. The rung states that intersection on its own wire and in this section, and programs
 **none** of it: doing so is the sweep-diff arc's proposal, not this one's.
+
+> **CORRECTION — see §49.20.4(b).** "This driver never touches" was written against §49.16's *ask*.
+> §49.18.2 folded the *answer* and it reads the other way: *"Every pool, base, size and enable
+> register piOS programs, we program"* — `CT0QMA`/`CT0QMS`/`CT0QTS` sit in §49.18.4's fourth class
+> (both populated, different values), not in class (b). The accurate statement is **the armed bin
+> path programs all three; *this rung* deliberately programs none of them**, which is why boot4 read
+> them as zero. The paragraph above is left as written (it records what the arc believed when it
+> built the rung); nothing in the rung's design depended on the wrong half.
 
 | outcome | reading |
 | --- | --- |
@@ -6185,6 +6215,19 @@ is the first thing in this campaign to correlate with the transition we cannot p
 nothing by itself; it is the cheapest way to find out whether our block's ASB state at
 `START_TILE_BINNING` even resembles piOS's.
 
+> **BOTH ROWS MEASURED — see §49.20.2 V6** (boot4/PA40). *Row 2, PM/ASB:* our side is now swept, and
+> four of the five words are **bit-identical** to piOS's mid-bin capture — `PM_GRAFX 0x00001040`,
+> both legacy words `0x00000005`, `RPIVID … S_CTRL 0x00000004`. The fifth, `RPIVID … M_CTRL`, matches
+> in its low nibble (`0x4`) and lacks piOS's upper activity bits, which §46.2 had already classified
+> as bridge activity status and §49.20.4(a) reconciles across all four recorded piOS values. *Row 1,
+> CM widen:* `[v3d94]` now sweeps `CM[0xFE101000, 0xFE101200)` — 86 nonzero words, joined against
+> piOS S1's 87: **84 identical, 4 divergent**, three of them already known (`+0x028`, `+0x0c0`,
+> `+0x0c4`) and one new (`+0x120`, `0x1` on piOS, zero on ours, undecoded). The `+0x1c8`/`+0x1cc`
+> pair §49.18.2 flagged as unread reads `0x000002D4`/`0x00001000` on our side — identical to piOS.
+> **(B)'s premise is also weakened by that boot:** see §49.20.6 R4 and §49.20.7 — at cold handoff the
+> block is held in reset (`PM_GRAFX 0x00001000`, `V3DRSTN = 0`) with both bridges stopped, so there
+> is no surviving firmware-established V3D register state for a disassembly to find.
+
 **(C) Criterion, unchanged, for whatever eventually gets built.** The PI-V3D-91 bin criterion with
 `[v3d93]` and `[v3d56]` poison armed, and the verdict is `BFC` advance plus `FLDONE`, and nothing
 weaker. The t0→t0+1ms pair in this capture is the first time the campaign has seen that exact
@@ -6197,3 +6240,520 @@ value. `BPCA` position as a discriminator moves to **excluded measured**. §49.1
 capture ask is **complete**: settled (S1), mid-render (S2/MS, by accident of labelling) and mid-bin
 (t0). The firmware-side prong closes on the register-comparison question with a negative answer, and
 what remains of it is behavioral.
+
+---
+
+### 49.20 The unarmed close, read on metal — the write exists, the MMU refuses it, and the aim is arithmetic on a zero base (PI-V3D-95 verdict, boot4/PA40, 2026-08-17)
+
+§49.12.1 built `[v3d95]` and §49.10 queued the question it answers: *where do the writes of an
+unarmed frame-close go?* The rung flew. This section folds its verdicts, and it also folds the two
+read-only measurements §49.19.5(B) asked for, which rode the same boot.
+
+**One correction is load-bearing and is stated before the evidence rather than after it.** The
+boot did **not** decide the fork §49.12.1 wrote for it. That fork needed the fault VA read against
+a **different** `CT0QMA`/`CT0QMS`/`CT0QTS` residue; the residue this boot found was **zero**, which
+is the one value under which "structural `0x70`" and "base `0` + offset `0x70`" are
+indistinguishable. Worse for the structural reading, a second PTB pointer on the same boot is
+demonstrably doing base-plus-offset arithmetic on that same zero base (§49.20.2 V5). The honest
+standing is therefore **the write is located, the aim is not**, and §49.20.6 R1 is the rung that
+locates it.
+
+#### 49.20.1 The capture, and what kind of boot it was
+
+`~/unaos-bench/capture/pi4-pi0-b1/ttyACM0.log`, boot 4 of that session — the fourth
+`MESS:…: Loaded 'kernel8.img' to 0x80000 size 0x1d3686` in the file. The operator mark reads
+`2026-08-17T22:37:49Z MARK boot4 pi4 power-cycle — identity from Loaded line`; the arc brief labels
+the image `20260813T0620Z-f51e42be`, which the wire itself does not carry, so that identity is the
+operator's and is cited as such. The verdict slice is banked at
+`~/unaos-bench/scratch/pi0-b1b2/boot4-raw.txt` (extraction: `tr -d '\000'` then `awk`, per
+`CLAUDE.md` — the log carries control bytes and `grep` mis-reads it).
+
+Two independent lines establish this as a **cold** boot, which matters for §49.20.2 V6:
+
+```
+:: PIUSB: PIUSB-16: ENTRY link state — RGR1_SW_INIT_1=0x00000003 PCIE_STATUS=0x00000000
+   (PHYLINKUP=false DL_ACTIVE=false) -> VC left RC in reset — COLD-BUILD pa…
+```
+
+and the events-log mark quoted above. It is a **full** boot — PIUSB, GENET, the K1/K2 batteries and
+the compositor all ran — with the V3D bring-up returning early at the rung's own boundary:
+
+```
+:: V3D: [v3d95] UNARMED-CLOSE BOOT COMPLETE — one CT0 kick taken and nothing else. probe_job, the
+   [v3d48] ladder, M4 and the whole visible battery were NOT run this boot, by design. Re-run
+   without UNAOS_V3D_UNARMCLOSE for a full boot ::
+```
+
+Per §49.12.1's own warning, nothing below may be diffed line-for-line against a deep boot.
+
+The submitted list is the `emptyunarm` shape, decoded on the wire — `NUMBER_OF_LAYERS`,
+`TILE_BINNING_MODE_CFG w=64 h=64`, `FLUSH_VCD_CACHE`, `START_TILE_BINNING`, `FLUSH` — 14 bytes at
+`BA=0x009f3000`, and `[v3d54] submit` audits it `BA OK EA OK span OK — submission SOUND`. Every
+verdict below is entitled to assume the CLE was handed the list we built.
+
+#### 49.20.2 The verdicts, each with its wire line and each with its exclusion
+
+**V1 — an unarmed submit CLOSES a bin frame. `BFC 0 → 1`.**
+
+```
+:: V3D: [v3d41] v3d95 unarmed close frame counters — BFC 0x00000000->0x00000001 (Δ1)
+   RFC 0x00000001->0x00000001 (Δ0) — BIN FRAME COMPLETED ::
+```
+
+*Excludes:* the "no frame closed" row of §49.12.1's outcome table, and with it §49.10's row-B
+re-take instruction. boot11's premise — a frame that closes with no `CT0QMA`/`CT0QMS`/`CT0QTS`, no
+`BPOS=0` and no pre-kick L2T invalidate — is **reproduced on a second boot, two weeks apart, on a
+different image**. *Does not exclude:* anything about the frame's contents; `FRDONE=0` and the
+`[v3d56] int` line's `FLDONE(bit1): latched=1` are the same pairing this campaign has seen
+throughout.
+
+**V2 — the close-time write EXISTS, and the V3D MMU REFUSED it. Client PTB, VA `0x70`.**
+
+```
+:: V3D: [v3d95] unarmed-close verdict — … | MMU_CTL=0x061d1c01 fault=1 (PT_INVALID=1
+   WRITE_VIOLATION=1 CAP_EXCEEDED=0) VIO_ADDR=0x0000000e VIO_ID=0x00000020
+   (client PTB @ VA 0x00000070) | … wrote-any=0 ::
+```
+
+`VIO_ID 0x20 >> 5 = 1 = PTB` on the `v3d_irq.c` client table this file banked at §26;
+`VIO_ADDR 0xe << 3 = 0x70` on the `DEBUG_INFO=0x00000550` → va_width 35 → shift 3 decode banked in
+the same place. Both raw words are **byte-identical to boot11's** (§49.10: `VIO_ADDR=0x0000000e
+VIO_ID=0x00000020 (client PTB @ VA 0x00000070)`).
+
+*Excludes:* the "no fault, poison intact" row — an unarmed close is **not** a silent no-op; it
+issues a memory write. It also excludes any remaining reading in which the PTB never attempts a
+write at all: §48's CLE-side and §49.11's class-side results said the *walk* was fine, and this says
+the *write* is attempted and rejected at translation.
+
+*Does not exclude — and this is the correction:* the two boots that produced `VA 0x70` had
+**identical** preconditions in the one column that discriminates. boot11's residue was zero
+(nothing was programmed), boot4's residue is printed and is zero:
+
+```
+:: V3D: [v3d95] tile-memory PRE (virgin — no CT0 kick and no CT0QMA/QMS/QTS write of ours in front
+   of this read) — CT0QMA=0x00000000 CT0QMS=0x00000000 CT0QTS=0x00000000 (ENABLE=0) ::
+```
+
+Both boots also submitted a **14-byte** list (boot11 `QBA=0x0097c000 QEA=0x0097c00e`; boot4
+`BA=0x009f3000 EA=0x009f300e`), and `0xe` is that length. The reproduction is real and valuable, but
+it holds three things fixed at once — zero bases, zero-based aim, 14-byte list — and `VA 0x70` is
+consistent with all three. §49.20.6 R1 and R3 are the two cuts.
+
+**V2a — an instrument fact the next rung must carry: the violation pair is NOT sticky.**
+
+Three reads of `VIO_ADDR`/`VIO_ID` were taken across one latched window, in this order, with no W1C
+between them. The first (the `[v3d95]` verdict station, read immediately after the wait) got
+`0x0000000e`/`0x00000020`. The second (`[v3d62] fault`, printed earlier in the log because the
+verdict line is assembled later) got zero:
+
+```
+:: V3D: [v3d62] fault (v3d95 unarmed close) — MMU_CTL=0x061d1c01 fault-latched=0x00101000
+   (PT_INVALID=1 WRITE_VIOLATION=1 CAP_EXCEEDED=0) VIO_ADDR=0x00000000 VIO_ID=0x00000000
+   DEBUG_INFO=0x00000550 | HUB_INT_STS=0x00000030 MMU-int bits=0x00000030 (PTI=1 WRV=1 CAP=0) ::
+```
+
+and the third (the post-kick hygiene clear) got zero and therefore **decoded zero as a client**:
+
+```
+:: V3D: MMU fault-latch CLEARED (v3d95 post-kick) — was CTL=0x061d1c01 (PT_INVALID=1
+   WRITE_VIOLATION=1 CAP_EXCEEDED=0) VIO_ADDR=0x00000000 VIO_ID=0x00000000
+   (client L2T @ VA 0x00000000) -> CTL=0x060d0c01 ::
+```
+
+**No reader may cite that `L2T`.** It is `CLIENTS[0]` applied to a zero `VIO_ID`, not an
+attribution. Two explanations fit the sequence — read-to-clear on the pair, or a clobber during the
+serial output between the reads — and this boot cannot separate them. The operational rule is the
+same under both, and it is now a standing instrument law for this file: **read the violation pair
+once, first, before any other MMU read or any print, and treat every later read of it as void.**
+`MMU_CTL`'s latch and `HUB_INT_STS`'s `PTI|WRV` bits *are* sticky and corroborate the refusal
+independently; only the *client* and the *address* rest on the single early read.
+
+**V3 — the refused write LANDED. The `[v3d62]` catcher absorbed 48 words.**
+
+From the `[v3d62] fault` line above:
+
+```
+   … | scratch page 0x9ac000: dirty words=48/1024 first-dirty off=0x0 val=0x00000000 — AN ACCESS
+   WAS REDIRECTED TO THE ILLEGAL-ADDRESS SCRATCH PAGE DURING THIS FRAME …
+```
+
+The page was seeded immediately before the kick — `scratch page 0x9ac000 seeded with 0x5ca7c411
+x1024 words` — on a page the `[v3d62] mmufix` line proves belongs to nothing:
+`PA=0x9ac000 (pfn=0x9ac) PTE=0x00000000 unmapped=1 in-arena=0`.
+
+This **confirms the mechanism V3D-60 named and §26 has been chasing since**: a write the MMU refuses
+does not simply vanish; the `MMU_ILLEGAL_ADDR` redirect carries it to the catch page. It is the
+first direct observation of "the refused write lands somewhere unaccounted", and it explains
+"`BPCA` advances, pool stays empty" without any further hypothesis.
+
+Two facts about the payload, and one non-fact. The first dirty word is at **offset `0x0`**, not at
+`0x70` — the redirect does not preserve the low offset of the refused VA, so the catcher page tells
+us *how much* was written, not *where it was aimed*. And the value written is **`0x00000000`**: the
+payload is zeros, not primitive-list bytes. The non-fact: the instrument prints a count and a first
+offset, **not a span**, so "48 contiguous words / 192 bytes" is **not** established by this line —
+only "48 of 1024 words no longer hold the sentinel".
+
+*Excludes:* every reading in which the close path issues no store. *Does not exclude:* it does not
+identify the store's semantic — 48 zero words is equally consistent with a tile-state clear, a
+primitive-list header zero-fill, and a burst the fabric split.
+
+**V4 — nothing GPU-reachable was written. Poison 64/64 and 8192/8192 INTACT, arena `STRAY=0`.**
+
+```
+:: V3D: [v3d56] poison (v3d95 unarmed close) tile-state iova=0x009cf000 words=64 — INTACT=64
+   ZEROED=0 OVERWRITTEN=0 touched=0 … L2T write-back completed=1 — POISON FULLY INTACT after a
+   completed write-back: the PTB wrote NOTHING here ::
+:: V3D: [v3d56] poison (v3d95 unarmed close) tile-alloc pool iova=0x009d0000 words=8192 —
+   INTACT=8192 ZEROED=0 OVERWRITTEN=0 touched=0 … ::
+:: V3D: [v3d56] landing (v3d95 unarmed close) — arena 64 pages (0x40000 B @ 0x009be000, the ENTIRE
+   address space the V3D MMU grants this job) | changed=0 expected=0 STRAY=0 … ::
+```
+
+*Excludes:* §49.12.1's "no fault, arena bytes moved" row, and any theory in which the close path
+reaches the tile-state array or the pool through some path other than the bases. The `[v3d68]`
+poison discipline is what makes this citable: a pre-zeroed region could not have distinguished
+"never written" from "written with zeros", and V3 shows the write's payload **is** zeros — so on a
+zeroed region this verdict would have been unreachable.
+
+**V5 — the pool arithmetic ran, on a zero base. This is the new finding, and it is the one that
+moves the campaign.**
+
+```
+:: V3D: [v3d41] v3d95 unarmed close CLE feed + PTB pointer — CT0LC=0x00010000 CT0PC=0x00000000
+   PCS=0x00000000 (raw) | BPCA 0x00000000->0x00003000 (out-of-span) (pool base 0x009d0000)
+   BPCS=0xffffd000 BPOA=0x00000000 BPOS=0x00000000 ::
+```
+
+Read the numbers against §49.18.4's two banked invariants, both established there on a settled piOS
+and on our own settled sweep:
+
+1. **`BPCA − QMA` = the Mesa reservation offset.** §49.18.4 item 2 banks
+   `V3D56_EXPECTED_EMPTY_BPCA_ADVANCE = 0x3000` for a one-tile bin. Here `QMA = 0` and
+   `BPCA = 0x00003000`. **`BPCA − QMA = 0x3000` — exact.**
+2. **`BPCA + BPCS = QMA + QMS`.** Here `0x00003000 + 0xffffd000 = 0x1_00000000 ≡ 0` (mod 2³²), and
+   `QMA + QMS = 0`. **The invariant holds exactly, modulo the register width.** `BPCS = 0xffffd000`
+   is `−0x3000`: the PTB computed "space remaining = (base + size) − cursor" with base and size both
+   zero, and stored the negative.
+
+The PTB therefore **ran its normal reservation stage, reading `CT0QMA` and `CT0QMS`, and got the
+right answer for the pool it was told about** — a pool at address 0 of size 0. It is not ignoring
+those registers; it is obeying them. `(out-of-span)` in the instrument's own text is measured
+against `pool base 0x009d0000`, the base an *armed* rung would have written and this rung
+deliberately did not — a correct label for the armed case and a misleading one here. In the pool the
+PTB actually holds, `BPCA` is exactly where the formula puts it.
+
+*Excludes:* "the PTB does not follow `CT0QMA`/`CT0QMS`" — refuted, on this boot, by the arithmetic.
+*Bears directly on V2:* with one PTB pointer demonstrably computed as `base + offset` on a zero
+base, `VA 0x70` under a zero base is most parsimoniously read as **`base 0 + 0x70`**, not as a fixed
+structural address. Parsimony is not proof; R1 is the proof.
+
+**V6 — the PM/ASB window, swept on our side for the first time, and the CM window widened. Both of
+§49.19.5(B)'s asks are discharged in one boot.**
+
+*Row 2 of that table — PM/ASB.* Our values, at the `[v3d94]`/sweep station (after the mailbox
+domain-on and clock enable, **before** the `[v3d50]` reset cycle):
+
+```
+SWEEP phys=0xfe10010c val=0x00001000 pmasb=PM_GRAFX
+SWEEP phys=0xfe00a008 val=0x00000005 pmasb=LEGACY_ASB_V3D_S_CTRL
+SWEEP phys=0xfe00a00c val=0x00000005 pmasb=LEGACY_ASB_V3D_M_CTRL
+SWEEP phys=0xfec11008 val=0x00000007 pmasb=RPIVID_ASB_V3D_S_CTRL
+SWEEP phys=0xfec1100c val=0x00000007 pmasb=RPIVID_ASB_V3D_M_CTRL
+```
+
+and after the `[v3d50]` ON half:
+
+```
+:: V3D: PM_GRAFX readback 0x00001040 ::
+:: V3D: PM/ASB V3D master (ASB_V3D_M_CTRL) readback 0x00000004 — ACK clear (bridge released) ::
+:: V3D: PM/ASB V3D slave  (ASB_V3D_S_CTRL) readback 0x00000004 — ACK clear (bridge released) ::
+```
+
+piOS's mid-bin values, re-read from the artifact rather than from the doc
+(`~/unaos-bench/capture/v3d-dump-pios-ct0run-20260812.txt`): `PM_GRAFX 0x00001040`,
+`LEGACY … S/M_CTRL 0x00000005`/`0x00000005`, `RPIVID … S_CTRL 0x00000004`,
+`RPIVID … M_CTRL 0x00008060` at t0 and `0x00008050` at settle.
+
+| word | piOS mid-bin | ours, released | verdict |
+|---|---|---|---|
+| `PM_GRAFX` | `0x00001040` | `0x00001040` | **identical** |
+| `LEGACY_ASB_V3D_S_CTRL` | `0x00000005` | `0x00000005` | **identical** |
+| `LEGACY_ASB_V3D_M_CTRL` | `0x00000005` | `0x00000005` | **identical** |
+| `RPIVID_ASB_V3D_S_CTRL` | `0x00000004` | `0x00000004` | **identical** |
+| `RPIVID_ASB_V3D_M_CTRL` | `0x00008060` / `0x00008050` | `0x00000004` | low nibble identical; piOS carries upper activity bits |
+
+**The window §49.19.5 called "the only window in the mid-bin file that our instrument cannot compare
+at all" is now compared, and four of five words are bit-identical.** The fifth is the `M_CTRL`
+activity field, and §49.20.4 reconciles it against the `0x4040` record.
+
+*Row 1 of that table — the CM widen.* `[v3d94]` now sweeps `CM[0xFE101000, 0xFE101200)`:
+`86 nonzero words in CM[0xfe101000,0xfe101200); READ-ONLY (no CM write, and no CM password constant
+exists in this file)`. Joined on physical address against piOS S1's 87 nonzero CM words (union 88):
+**84 identical, 4 divergent.**
+
+| offset | ours | piOS S1 | standing |
+|---|---|---|---|
+| `+0x028` | `0x000002D4` | `0x00000244` | §49.18.3's asymmetry, **third confirmation**; ours enables, piOS does not; undecoded |
+| `+0x0c0` | zero | `0x00000040` | §49.18.2's second class-(b) row, re-confirmed |
+| `+0x0c4` | `0x00001388` | zero | §49.18.3, re-confirmed |
+| `+0x120` | zero | `0x00000001` | **new** — the only divergence the widened half exposed |
+
+And the pair §49.18.2 flagged as unread — `CM +0x1c8`/`+0x1cc`, "a CTL/DIV-shaped pair carrying
+`0x000002D4`/`0x00001000`, the same values as the V3D slot" — reads on our side
+`SWEEP phys=0xfe1011c8 val=0x000002d4` and `SWEEP phys=0xfe1011cc val=0x00001000`: **identical to
+piOS.** The previously-unread CM half contributes exactly one new word, `+0x120 = 0x1`, undecoded,
+in a block (`+0x110…+0x128`) whose neighbours are `0x636D`-signature and divisor words. It is
+recorded, and nothing rests on it.
+
+**V7 — the `[v3d50]` OFF→ON reset cycle ran clean end to end**, and it carries a handoff fact.
+
+```
+:: V3D: [v3d50] reset OFF — ASB V3D master (ASB_V3D_M_CTRL) readback 0x00000007 — ACK set (bridge stopped) ::
+:: V3D: [v3d50] reset OFF — ASB V3D slave  (ASB_V3D_S_CTRL) readback 0x00000007 — ACK set (bridge stopped) ::
+:: V3D: [v3d50] reset OFF — PM_GRAFX assert V3DRSTN(clear bit6): pre=0x00001000 post=0x00001000 (PM_V3DRSTN now 0) ::
+…
+:: V3D: probe verdict BLOCK-UP — hub IDENT0 = 0x42554856 (live V3D identity) ::
+:: V3D: PRESENT — tech version 4.2 (ver=42, expect V3D 4.2 = 42 on Pi 4); cores=1 ::
+```
+
+**The reset-assert was a no-op because the bit was already clear** (`pre == post`, both `0x1000`),
+and the block was dark before the cycle:
+
+```
+:: V3D: [v3d60] residue (pre-reset) — SKIPPED: hub IDENT0 reads 0xdeadbeef (open-bus/firmware
+   poison) before our reset cycle, so no core register may be read here. The warm-handoff question
+   is UNANSWERED this boot ::
+```
+
+§46.2's `P89-KMSCOND` row already banked *"entry bridges still 0x7 … start4.elf does not establish
+the condition, overlay or not"*. This boot **corroborates that on a cold power-cycle and adds the
+`PM_GRAFX` half**: at handoff, and even after our own ACKed `SET_DOMAIN_STATE(10, ON)` (`:: V3D:
+power domain 10 ON ::`), `V3DRSTN` is **0** — the block is not merely bridge-isolated, it is **held
+in reset**. That is why the hub reads poison, and it is the single most consequential fact for the
+bunker prong (§49.20.7).
+
+#### 49.20.3 What these verdicts retire, and the one they do not
+
+| standing item | status after boot4 |
+|---|---|
+| §49.12.1 outcome row "no frame closed" | **excluded measured** (V1) |
+| §49.12.1 outcome row "no fault, poison intact" | **excluded measured** (V2 + V4) |
+| §49.12.1 outcome row "no fault, arena bytes moved" | **excluded measured** (V4) |
+| §49.10 row-B re-take instruction | **discharged** — the pair agrees; row B never fired |
+| V3D-60's "a refused write lands somewhere unaccounted" | **CONFIRMED as mechanism** (V3) — no longer a hypothesis |
+| "the PTB does not follow `CT0QMA`/`CT0QMS`" | **refuted** (V5 arithmetic) |
+| §49.19.5(B) row 1 (CM widen) | **measured** (V6): 84/88 identical, one new word `+0x120` |
+| §49.19.5(B) row 2 (PM/ASB sweep) | **measured** (V6): 4 of 5 words bit-identical to piOS mid-bin |
+| §49.12.1's "the aim is structural" branch | **NOT established** — see below |
+
+**The branch that did not fire.** §49.12.1 wrote the fork precisely: *"a VA derived from the residue
+means the close path follows the never-programmed registers, a fixed `0x70` under a **different**
+residue means the aim is structural."* The residue was zero on both boots that produced `0x70`.
+Under a zero residue the two arms of the fork make the **same** prediction for a base-relative aim
+with offset `0x70`, so the observation separates nothing. Any summary that reports "VA `0x70` with
+zero residue ⇒ the address is structural" is reading the fork backwards, and V5 supplies a positive
+reason to expect the opposite: on this very boot a PTB pointer was computed as base-plus-offset with
+that base equal to zero.
+
+The section records this as a **contradiction against the arc's own framing, not as a smoothing**.
+`VA 0x70` is located; the aim is undetermined; §49.20.6 R1 determines it in one boot.
+
+#### 49.20.4 Reconciliations against earlier sections
+
+**(a) `RPIVID_ASB_V3D_M_CTRL` — the `0x4040` datum, and what today's sweep does to it.** The
+record, in the order the file made it:
+
+| where | capture | `M_CTRL` |
+|---|---|---|
+| §46.1 | piOS mid-bin dump (2026-07-30) | `0x4040` — named as a divergence "against every wedged UnaOS reading" |
+| §46.2 idle-dump recheck | V3D-71-era `v3d-dump-idle.txt` | `0x4` — **our value**; the row's own conclusion: *"The high bits are bridge ACTIVITY STATUS (an effect of AXI traffic), not an enabling condition"* |
+| §46.2 `[v3d75b]` | `M_CTRL = pw\|0x4040` transplant | did not hold; mid-bin2 later showed the bits cycling `0x4050 → 0x4060` **live** |
+| §49.14 boot20 | our domain cycle | `0x00000004` at all four stations |
+| §49.19 | piOS mid-bin `ct0run` (2026-08-12) | `0x8060` at t0, `0x8050` after settle |
+| **§49.20, this boot** | ours, cold entry → released | `0x7` → `0x00000004` |
+
+There is a surface tension in the file — §46.1 says "piOS mid-bin `0x4040`" and §49.19 says "piOS
+mid-bin `0x8060`" — and it is **not** a contradiction: they are two different captures, taken
+sixteen days apart on two piOS kernels, of a field §46.2 had already classified as live activity
+status and had already watched **cycle** within one capture. Four distinct piOS values now exist
+(`0x4040`, `0x4050→0x4060`, `0x8060`, `0x8050`) against one piOS idle value (`0x4`) — and `0x4` is
+ours, in every state we have ever read, including `[v3d71f]`'s 500 in-flight samples across an open
+frame (§42, §49.1's fabric row).
+
+The reconciliation, stated so a later reader does not re-open it: **the low nibble is the
+configuration and it matches; the upper bits are traffic and they do not, because we generate no
+traffic.** V4 is the reason — the PTB's write never reaches the fabric as a completed bus
+transaction on our side, so a bridge-activity field has nothing to report. The upper bits are
+therefore an **effect of the wall**, downstream of it, and they cannot be its cause. `0x4040` stays
+where §46.2 put it and where §49.14 closed it: not revived, not a knob, and now with our-side values
+under it for the first time.
+
+**(b) §49.12.1's "the window this driver never touches" — corrected.** §49.12.1's *"The §49.16
+intersection, named and not acted on"* paragraph says the settled piOS sweep found piOS programming
+pool/base registers in core0 `+0x108..+0x174` *"this driver never touches"*. That sentence was
+written against §49.16's **ask**; §49.18.2 then folded the **answer** and it reads the other way —
+*"Every pool, base, size and enable register piOS programs, we program"*, with `CT0QMA`/`CT0QMS`/
+`CT0QTS` sitting in §49.18.4's fourth class (both populated, different values), not in class (b).
+
+The correct statement, which today's boot makes precise: **the driver's armed bin path programs all
+three; the `[v3d95]` rung deliberately programs none of them, which is why they read zero here.**
+The §49.12.1 paragraph is left standing as written — it is a record of what the arc believed when it
+built the rung — and this is the appended correction. Nothing in the rung's design depended on the
+wrong half: the rung's job was to read the residue, and it read it.
+
+#### 49.20.5 The wall statement
+
+Before this boot: *"the PTB advances `BPCA` but writes nothing — why does the PTB write nothing?"*
+
+After it, that question is **answered and retired**. The PTB does not write nothing. It runs its
+reservation arithmetic correctly on the bases it is given (V5), it issues a write at frame close
+(V2), and the write is refused by the V3D MMU as page-table-invalid plus write-violation and
+redirected into the illegal-address catcher (V3), which is why no byte the GPU can reach ever
+changes (V4).
+
+**The new wall:** *why are the PTB's close-time writes aimed at addresses the V3D MMU does not
+map?* Concretely, on the two boots we have: why `VA 0x70`, and is `0x70` an absolute address or an
+offset from a base that happened to be zero?
+
+This is a **page-table / address-programming question**, and it is a materially better one than its
+predecessor for three reasons. It is *local* — one address, one client, one instant. It is
+*instrumented* — the catcher already proves landing, the poison already proves non-landing, and the
+violation pair already names client and VA. And it is *cheap to cut*: the whole fork turns on
+changing one input and re-reading one register, which is R1 below.
+
+#### 49.20.6 The next rung, on paper — candidates, cost, discriminating power, order
+
+All four candidates ride the existing `[v3d95]` scaffolding: one kick, `[v3d62]` catcher armed,
+`[v3d56]` poison as negative controls, the boot returns. None requires a new instrument family.
+All must carry the **V2a instrument law** — violation pair read once, first, before any other MMU
+read or print.
+
+**R1 — `basedaim`: distinct nonzero bases, then the same bare unarmed close. RECOMMENDED FIRST.**
+
+Program **only** `CT0QMA`, `CT0QMS` and `CT0QTS`, to three **mutually distinguishable, arena-mapped**
+values — the point of distinctness is that the fault VA must be attributable to exactly one of them.
+Program nothing else: no `BPOS=0`, no pre-kick L2T invalidate, no `CT0QTS.ENABLE` beyond what the
+base word carries, and the same 14-byte `emptyunarm` list at the same address. Then read `VIO_ADDR`.
+
+Outcomes, pre-written:
+
+| `VA` reads | conclusion |
+|---|---|
+| `QMA + 0x70` | the close-time write is the **pool** write, base-relative. The pool base is load-bearing at *close* time. The wall becomes "why is `QMA` not honoured / why is the pool page not mapped at that instant" — and since we *do* map the pool, it becomes "why did the MMU refuse a mapped address", a translation question with a small answer space |
+| `QTS + 0x70` | it is the **tile-state** write. §49.18.4 item 4's structural divergence (piOS puts tile-state at the pool end, we put it one page below the pool base) becomes a live suspect for the first time |
+| `0x70`, unmoved | the aim is genuinely **absolute**, and R2 is licensed. Only *this* outcome establishes "structural", and only against nonzero bases |
+| anything else | read it; the arithmetic will name its own base |
+
+*Cost:* three register writes inside a rung that already exists; one metal boot; no new knob if it
+rides `UNAOS_V3D_UNARMCLOSE` as a variant (e.g. `=bases`). *Discriminating power:* **maximal** — it
+is the single cut that separates the two live hypotheses, and it is the cut §49.12.1 designed for
+and could not take because it needed a residue it did not have. *Risk:* none beyond an experiment
+boot; the rung already fails closed on `arena_contains`.
+
+**R2 — `mapzero`: map the low V3D VA page, re-run, and read the payload. RECOMMENDED SECOND, and
+first if R1 returns `0x70` unmoved.**
+
+Add one PTE to the V3D page table mapping the page containing `VA 0x70` to a dedicated, poisoned
+scratch PA outside the arena, then run the same close. The refusal becomes a completed write and
+the write becomes **readable**.
+
+*What it buys:* V3 established that ~48 words of zeros landed *somewhere*, but the catcher redirect
+discards the offset (first-dirty `off=0x0`, not `0x70`). A real mapping preserves the offset and the
+ordering, so the rung reads *what the PTB writes at frame close* — the first time this campaign
+would see the close-time payload rather than its absence. That is the deepest single information
+gain available, and it is what turns "the write is refused" into "here is the structure the write
+was building".
+
+*Cost:* one PTE, one scratch page, one poison/scan pass — all mechanisms this file already has
+(`[v3d62]` mmufix builds an unmapped page; this builds a mapped one). One boot; can share a boot
+with R1 as a second leg, since the rung returns immediately. *Discriminating power:* high but
+**not** on the aim question — it explains the payload, not the address. *Risk:* it deliberately
+grants the GPU a page it was previously denied; the page is outside the arena and outside every
+region any other rung reads, and the `[v3d56]` landing digest already proves the arena unchanged, so
+the blast radius is one page. Do **not** compose it with R1's legs in a way that leaves the mapping
+in place for the rest of the boot.
+
+**R3 — `lenvary`: the same unarmed close with a different list length. CHEAP CONTROL, ride-along.**
+
+Both boots that produced `VA 0x70` submitted a **14-byte** list, and `VIO_ADDR`'s raw value is
+`0xe` — the same 14. That is very likely a coincidence (the shift-3 decode is `DEBUG_INFO`-derived
+and banked), but it is an uncontrolled one, and this file's own standard is that a number appearing
+twice in two roles gets controlled rather than argued about. Re-run the close with a list of a
+different length (pad `emptyunarm` with a second `NUMBER_OF_LAYERS` or an extra `FLUSH_VCD_CACHE`,
+keeping the packet set otherwise identical) and read `VIO_ADDR`.
+
+*Cost:* one extra leg on the same boot; no new machinery. *Discriminating power:* narrow but
+absolute — if `VIO_ADDR` tracks the list length, the entire `VA 0x70` reading is an instrument
+artifact and R1/R2 must be re-planned before anything is concluded from them. It costs almost
+nothing to be certain, and it is expensive to be wrong here.
+
+**R4 — the bunker (`start4.elf`) analysis. THIRD, and materially DE-PRIORITISED by this boot.**
+
+§49.19.5(B) placed the campaign's remaining probability mass here, on the reasoning that if the
+difference is invisible in every ARM-readable register at the instant it matters, it must live in
+what the VPU firmware does to the block. V7 weakens that premise substantially, and V2–V5 replace
+it: there is now a **specific, ARM-visible, reproducible** defect — a PTB write aimed at an unmapped
+address — that no firmware theory is needed to explain and that R1 can localise in one boot. The
+bunker line stays open, and §49.20.7 says what it should look for, but it should not be briefed
+before R1 returns.
+
+**Recommended order: R1 + R3 as two legs of one boot; R2 as the third leg or the next boot,
+depending on R1; R4 after R1 reports.**
+
+The composition matters and is stated explicitly. Run R3's leg **first** (it validates the
+instrument), then R1's leg (it answers the question), then R2's leg if the boot budget allows and
+the mapping is torn down before the boot continues. Each leg re-arms `[v3d62]`, re-seeds the
+catcher, clears the fault latch, and reads the violation pair once and first. Three legs, one kick
+each, one boot — the same shape §49.12.1 already validated, and the same "short capture, never
+diffed against a deep boot" label applies.
+
+#### 49.20.7 What the bunker brief should look for, concretely
+
+The bunker analysis has been named in this file since §46.3 without ever being given a target list.
+V7 lets one be written, and it also tells the brief what it will probably *not* find, which is worth
+as much.
+
+**The framing fact the brief must start from.** At cold handoff on PA40, after firmware init and
+after our own ACKed `SET_DOMAIN_STATE(10, ON)`, `PM_GRAFX` reads `0x00001000` — `V3DRSTN = 0` — and
+both `RPIVID` ASB words read `0x7` (stopped/ACKed), and the hub reads `0xdeadbeef`. §46.2's
+`P89-KMSCOND` row recorded the `0x7` half a boot-generation earlier and concluded *"start4.elf does
+not establish the condition"*. Today adds the reset bit, and the two together say something
+stronger: **there is no firmware-established V3D register state to discover, because the block is
+held in reset at handoff and reset destroys it.** A hunt for "what start4.elf programs into V3D and
+leaves there" is therefore looking for something that provably cannot survive to our first read.
+
+**What the brief should look for instead, in priority order:**
+
+1. **Any store into the V3D MMIO aperture at all.** Disassemble for writes to the `0x7EC0_0000` /
+   `0xFEC0_0000` V3D window (hub `+0x0000..0x1240`, core0 `+0x4000..0x4A00`). The expected result is
+   **none outside a reset/power path**, and that expected result is the *point*: a clean negative
+   converts §49.19.5(B)'s "the probability mass sits in the firmware" into a measured exclusion and
+   closes the prong. A positive — any V3D register the firmware writes that we do not — is a
+   first-class finding and should stop the analysis for immediate transcription.
+2. **The `SET_DOMAIN_STATE(10, …)` handler.** We now have a hard behavioural datum for it to
+   explain: an ACKed domain-ON that leaves `V3DRSTN = 0` and both bridges at `0x7`. Determine
+   whether the handler is a no-op when the domain is already marked on, whether it touches
+   `PM_GRAFX` bit 6 at all, and whether an OFF→ON pair takes a different path. §49.14's boot20 ran
+   that pair on metal and read `0x4` at all four stations, so the disassembly is being asked to
+   *explain a known result*, not to generate a hypothesis.
+3. **The `SET_CLOCK_RATE(5)` / gate path, against the `CM +0x028` asymmetry.** §49.18.3 and V6 now
+   have this word at `0x2D4` on our side and `0x244` on piOS's, stable across three captures and two
+   piOS kernels. It is the only word in the whole comparison pointing at something *we* (or the
+   firmware on our behalf) enable that piOS does not. The brief should identify which clock slot
+   `CM +0x028` is and which mailbox path sets its `ENAB` bit. Cheap, bounded, and it retires an
+   asymmetry that has now survived three folds unexplained.
+4. **Whether the firmware ever establishes a V3D MMU page table.** `MMU_PT_PA_BASE` and `MMU_CTL`
+   are unreadable before our reset on this boot (hub dark), and after it they are at POR by
+   construction — so the question cannot be settled from the wire, and disassembly is the only
+   route. It matters directly to the new wall: if the firmware maps a low aperture in the V3D VA
+   space, `VA 0x70` may be an address that is *valid under the firmware's page table and invalid
+   under ours*, which would explain the refusal without any PTB defect at all. **This is the bunker
+   item with real discriminating power for the current wall, and the brief should lead with it if
+   R1 returns `0x70` unmoved.**
+
+**What the bunker brief should explicitly NOT re-open:** the mailbox family (§49.14 closed it with
+four boots), `M_CTRL`'s upper bits (§46.2 and §49.20.4(a) — activity, not configuration), the KMS
+overlay (§49.14 boot19), and `ENABLE_QPU` (§46.2 boots 17/19). Those are excluded measured, and a
+disassembly that rediscovers them has spent its budget on the answer sheet.
+
+---
