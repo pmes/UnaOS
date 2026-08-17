@@ -234,6 +234,18 @@ wedge2 = []
 # timing stalls boot for minutes on real hardware (uncalibrated APIC timer). Off => scheduler still
 # inits, boot doesn't pause.
 sched_demo = []
+# DECRUD-1: the in-kernel `vug` / `pulse` / `vug bebox` shell demos (aarch64 only) — the fixed-point
+# 3D crystal sculptor, the BeOS-Pulse-homage full-screen monitor and the BeBox tribute screen. Opt-in
+# via `UNAOS_VUGDEMO=1`. Default OFF because the demos have SHIPPED EL0 REPLACEMENTS that the Pi
+# actually runs: `VUG.ELF` (crates/user-vug) and `PULSE.ELF` (crates/user-pulse) are staged into the
+# FAT root of every kernel8 image and are what the bench exercises (`UVUG:` streams while the
+# in-kernel `[vugfps]` counter reads 0). Nothing on any boot path calls into `vug` — the three verbs
+# are reached only by an operator typing them at the console — so OFF removes ~1.3 kloc of Ring-0
+# software renderer from the image and changes no witness on any boot. The one part of `vug` that was
+# never a demo, the VUG-HONESTY classifier entry point and its `parked_display_witness`, moved to
+# `ui_status` (ungated, both arches), so the witness survives with this feature off.
+# See docs/dev/OS/kernel-decrud.md §3.1.
+vugdemo = []
 # USB bring-up debug view for serial-less hardware: run the full main-loop USB path (enumeration +
 # storage + hubs) but KEEP the boot log on the framebuffer (no GUI takeover, no fbcon detach) and
 # print each input event, so external USB storage/keyboard/mouse enumeration AND live keypresses /

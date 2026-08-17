@@ -18,10 +18,11 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use crate::console::Console;
 use crate::fs::fat::{DirEntry, FatError, FatFs};
-// The in-kernel `vug` demo (the `vug` and `pulse` verbs) is an aarch64 module — see the `pub mod vug`
-// note in `lib.rs`. The verbs that drive it are gated to match, so on x86 they are not registered at
-// all and fall through to the normal unknown-command reply.
-#[cfg(target_arch = "aarch64")]
+// The in-kernel `vug` demo (the `vug` and `pulse` verbs) is an aarch64 module, and since DECRUD-1 a
+// knob-gated one — see the `pub mod vug` note in `lib.rs`. The verbs that drive it carry the identical
+// gate, so wherever the module is not compiled they are not registered at all and the words fall
+// through to the normal unknown-command reply: on x86 always, and on the Pi unless `UNAOS_VUGDEMO=1`.
+#[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]
 use crate::vug;
 use crate::pal::TargetPal;
 
@@ -2923,10 +2924,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     // x86 neither `vug` nor `pulse` is registered (the demo module is aarch64-only), so nothing here
     // takes the screen: claiming otherwise would suppress the console repaint that carries the
     // "Unknown command" reply, and typing `vug` would present as a hang instead of a refusal.
+    // DECRUD-1 adds the `vugdemo` half of exactly that rule: knob-off the two arms below are not
+    // registered on aarch64 either, so the words must stop claiming the screen there too.
     #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
-    let took_screen = command == "vug" || command == "pulse" || command == "v3d";
+    let took_screen = (cfg!(feature = "vugdemo") && (command == "vug" || command == "pulse")) || command == "v3d";
     #[cfg(all(target_arch = "aarch64", not(feature = "v3d")))]
-    let took_screen = command == "vug" || command == "pulse";
+    let took_screen = cfg!(feature = "vugdemo") && (command == "vug" || command == "pulse");
     #[cfg(not(target_arch = "aarch64"))]
     let took_screen = false;
 
@@ -3816,8 +3819,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         // The in-kernel 3D sculptor. Aarch64 only, matching `crate::vug`: the whole arm vanishes on
-        // x86, where the verb is therefore an ordinary unrecognised word.
-        #[cfg(target_arch = "aarch64")]
+        // x86, where the verb is therefore an ordinary unrecognised word. DECRUD-1: and on the
+        // `vugdemo` knob, DEFAULT OFF — knob-off the verb is that same unrecognised word on the Pi,
+        // and `VUG.ELF` (`run vug`) is the program that does this for real, in ring 3.
+        #[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]
         "vug" => {
              match args.first().copied() {
                  Some("bebox") => {
@@ -3857,9 +3862,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // On a real replay `took_screen` keeps the console off the freshly-blitted tiles.
         },
         // UI1-M3's full-screen monitor draws through the same `vug` module, so it is gated the same
-        // way. x86 keeps the per-core instrument it always had — the `ui_status` strip and `sched` —
-        // and this verb is an unrecognised word there.
-        #[cfg(target_arch = "aarch64")]
+        // way — arch AND (DECRUD-1) the `vugdemo` knob. x86 keeps the per-core instrument it always
+        // had — the `ui_status` strip and `sched` — and this verb is an unrecognised word there;
+        // knob-off the Pi is in the same position, with `PULSE.ELF` (`run pulse`) as the real one.
+        #[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]
         "pulse" => {
             // UI1-M3: the full-screen system monitor (BeOS Pulse homage). Any key exits; the
             // console repaints over it on the way out (same contract as the vug crystal).

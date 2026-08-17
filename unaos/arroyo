@@ -2794,6 +2794,24 @@ kernel8() {
         K8_FEATS="${K8_FEATS},pirast"
         echo -e "${COLOR_YELLOW}  • UNAOS_PIRAST: software-rasterizer spinning cube on the BCM2711 panel (first 3D pixels on the Pi; 90 paced frames, then the shell repaints)${COLOR_RESET}"
     fi
+    # DECRUD-1: UNAOS_VUGDEMO=1 adds the `vugdemo` feature — the IN-KERNEL `vug` / `vug wire` /
+    # `vug bebox` / `pulse` shell demos (crates/kernel/src/vug.rs, ~1.3 kloc of fixed-point software
+    # renderer, BeOS-Pulse-homage monitor and BeBox tribute screen). DEFAULT OFF, and this is the
+    # DEFAULT-QUIET law applied to a demo rather than to a witness family: the three verbs have shipped
+    # EL0 replacements that this very image already stages into its FAT root — VUG.ELF (crates/user-vug)
+    # and PULSE.ELF (crates/user-pulse) — and the bench runs those (`UVUG:` streams while the in-kernel
+    # `[vugfps]` counter reads 0). No boot path on either arch calls into the module; the only way in is
+    # an operator typing at the console. So OFF unlinks the whole demo and every default kernel8.img
+    # stops carrying a Ring-0 3D renderer that nothing on the machine can reach. NOT a witness gate:
+    # `parked_display_witness` (VUG-HONESTY) moved to `ui_status` first, precisely so this knob cannot
+    # take a metal-earned falsifier off a boot. K8_FEATS is CURATED (like UNAOS_PIRAST above), so the arm
+    # must be here or the feature never reaches the Pi image; `builder/src/main.rs` is deliberately NOT
+    # touched — builder makes the x86/virt ESP media, and vug.rs is aarch64-only.
+    # See docs/dev/OS/kernel-decrud.md §3.1.
+    if [ -n "${UNAOS_VUGDEMO:-}" ]; then
+        K8_FEATS="${K8_FEATS},vugdemo"
+        echo -e "${COLOR_YELLOW}  • UNAOS_VUGDEMO: the in-kernel vug/pulse/bebox shell demos (default OFF — VUG.ELF/PULSE.ELF in ring 3 are the real ones)${COLOR_RESET}"
+    fi
     # PI-DESK: UNAOS_PIDESK=1 adds the `pidesk` feature — the desktop FURNITURE family on the Pi panel.
     # Compiles `video::strip` (the furniture-strip primitive), `video::dock` (the window switcher),
     # `video::menubar` (the top strip, DEFAULT OFF at runtime) and `video::crystal` (the SHARD system

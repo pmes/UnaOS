@@ -7506,7 +7506,9 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     // VUG-HONESTY: witness the parked-core display rule on this virt boot (deterministic, no framebuffer)
     // — a frozen non-demo core reads PARKED, never the demo core's fabricated load. The GICv3/test-arm
     // capture proves the display-honesty fix that completes the merged idle/busy-heartbeat counters.
-    let _ = crate::vug::parked_display_witness();
+    // DECRUD-1: `crate::ui_status`, not `crate::vug` — the witness moved out of the demo module so
+    // that gating the demo off (the default now) cannot take this falsifier off the boot.
+    let _ = crate::ui_status::parked_display_witness();
     // AARCH64-PRIO M3: prove fixed-priority + anti-starvation aging before the CAPSTONE. Self-contained
     // and bounded (stages its own tasks, drains them, leaves the queue empty), so it never perturbs the
     // CAPSTONE that follows — it just adds the `priority+aging PASS` line to this cooperative boot.

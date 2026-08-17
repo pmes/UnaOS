@@ -135,9 +135,9 @@
 //! disagree about the same core. `meter_cpu_ticks` stays as the FALLBACK, and it keeps its whole
 //! VUG-HONESTY meaning: `core_load` reports `tracked=false` for a core that is not inside `run()`, and
 //! for such a core the tick deltas are consulted exactly as before — a frozen non-demo core still reads
-//! [`PARKED`] rather than a fabricated bar, and `crate::vug::parked_display_witness` still covers that
-//! branch (the witness stays with the demo — and so is aarch64-only, since `vug` is; the rule it
-//! witnesses lives here and is compiled on both arches).
+//! [`PARKED`] rather than a fabricated bar, and [`parked_display_witness`] still covers that branch.
+//! (DECRUD-1: the witness used to live in `vug` and was therefore hostage to that demo module's gate.
+//! It lives here now, beside the rule it witnesses, and is compiled on both arches unconditionally.)
 //! On x86 (no `core_load`) the source is unchanged in every particular.
 //!
 //! **Pacing is unchanged and stays.** 1 Hz is not the defect — skipping a window whose values moved is.
@@ -259,10 +259,11 @@ pub(crate) const PARKED: u32 = u32::MAX;
 ///                      PARKED instead.
 ///
 /// The honesty rule is stated ONCE, here, and this is the definition BOTH arches compile —
-/// deliberately, since the strip is the rule's permanent consumer. `vug::classify_load` is this
-/// function at `full = 100`, and the VUG-HONESTY witness that runs beside it covers every branch of
-/// the rule through that entry point; `vug` is aarch64-only, so on x86 the rule is exercised by the
-/// strip alone. The instrument panel calls it at
+/// deliberately, since the strip is the rule's permanent consumer. [`classify_load`] is this
+/// function at `full = 100`, and [`parked_display_witness`] covers every branch of the rule through
+/// that entry point. DECRUD-1 moved both of them here from `vug`: the witness is metal-earned and
+/// must not depend on a demo module's gate, and the rule it witnesses was already defined here.
+/// The instrument panel calls it at
 /// `full = 1000` (per-mille): its LED bar is ~1400 px wide on the bench panel, so a 1% quantum would
 /// be a 14 px jump — the display would step where the machine is smooth, which is exactly the
 /// "sensitivity" Peter asked the full width to buy. `own_load` is a percent by contract and is scaled
@@ -275,6 +276,40 @@ pub(crate) fn classify_load_scaled(db: u64, di: u64, is_demo: bool, own_load: u3
     } else {
         PARKED
     }
+}
+
+/// VUG-HONESTY — the pure per-core display decision at percent scale: [`classify_load_scaled`] at
+/// `full = 100`. The rule itself, and the [`PARKED`] sentinel it returns for a frozen non-demo core,
+/// are stated once above; this is the ten-segment view of the same decision, and
+/// [`parked_display_witness`] covers every branch of it through this entry point.
+///
+/// DECRUD-1 — moved here from `vug` with its witness. `pub(crate)` rather than private because the
+/// `vugdemo` build's per-core meter still reads the rule at percent scale through this one entry
+/// point, so the two views of the decision keep exactly one definition.
+pub(crate) fn classify_load(db: u64, di: u64, is_demo: bool, own_load: u32) -> u32 {
+    classify_load_scaled(db, di, is_demo, own_load, 100)
+}
+
+/// VUG-HONESTY witness — deterministic, arch-neutral, framebuffer-free. Exercises [`classify_load`]
+/// over the cases the honesty rule must separate and emits one PASS/FAIL serial line. Wired into the
+/// `virt` CAPSTONE boot (`arch::sched::run_capstone_boot_core`), so `test-arm` and the GICv3 suite
+/// witness a parked core reading PARKED rather than a fabricated pinned bar. Returns true on PASS.
+///
+/// DECRUD-1 — this witness used to live in `vug.rs`. It never was a demo: it is a metal-earned
+/// falsifier for the display-honesty rule that `classify_load_scaled` above states, and it has to
+/// keep firing on a build that carries no demo at all. It moved with the entry point it exercises.
+pub fn parked_display_witness() -> bool {
+    let busy = classify_load(8, 0, false, 99) == 100; // scheduled + fully busy
+    let idle = classify_load(0, 2, false, 99) == 0; // scheduled + idle → honest 0%, NOT own_load
+    let half = classify_load(1, 1, false, 0) == 50; // scheduled + half busy
+    let demo = classify_load(0, 0, true, 42) == 42; // frozen demo core → its own render load
+    let park = classify_load(0, 0, false, 99) == PARKED; // frozen non-demo core → PARKED, not fabricated
+    let pass = busy && idle && half && demo && park;
+    serial_println!(
+        ":: VUG-HONESTY: parked-core display witness {} — a frozen non-demo core reads PARKED (never the demo core's load); scheduled cores read their busy fraction, the demo core its render load ::",
+        if pass { "PASS" } else { "FAIL" }
+    );
+    pass
 }
 
 /// The mDNS / DNS-SD host name the Pi answers on the share segment (net11/net17). A fixed literal —
