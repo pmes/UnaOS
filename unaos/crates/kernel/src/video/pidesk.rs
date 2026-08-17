@@ -29,6 +29,13 @@
 //! 1. **The panel must exist.** Geometry off `video::WRITER`, live, never assumed: QEMU raspi4b is
 //!    640x480 and the bench Pi is 1920x1200, and every floor below is evaluated against whichever
 //!    one this boot actually has.
+//! 1b. **The panel is CLEARED to the desktop colour** — `wcx`'s WC-X DESKTOP-CLEAR, on this arch for
+//!    the first time. Everything painted before the desktop existed (`video::init_panel`'s
+//!    `PANEL_BG` fill, the direct-painted fbcon boot log) sits outside every damage box the
+//!    compositor has, so nothing else in the system will ever repaint it. It goes above step 2
+//!    because it is the last instant at which the window table is empty and a direct front-buffer
+//!    write therefore collides with no compositor-owned pixel. See the call site for the full
+//!    argument, and for why the WC-BBSYNC half of x86's pairing is deliberately not armed here.
 //! 2. **The dock must be able to host a full strip** — `wcx`'s CONSOLEWIN law, unchanged and for the
 //!    unchanged reason. The console window carries a minimise disc, the only route back from that
 //!    park is the dock, and `dock::Layout::for_panel` returns `None` when the strip will not fit at
@@ -89,6 +96,54 @@ pub fn activate() -> bool {
         serial_println!("[pidesk] activate DECLINE reason=no-panel");
         return false;
     }
+
+    // 1b. PIDESK DESKTOP-CLEAR — **paint the whole panel to the desktop colour ONCE, here.** The
+    //    aarch64 counterpart of `wcx`'s WC-X DESKTOP-CLEAR, and the gap `wcf::chrome_truth` was
+    //    built to name: its desktop probe read `(pw-2, ph-2)` on the bench panel and printed
+    //    `want=0x2d2b55 got=0x1e1e1e -> NOCLEAR` — `video::PANEL_BG`, the fill `video::init_panel`
+    //    puts down at FB attach, still on the glass at desktop-ready.
+    //
+    //    Why the compositor cannot do this from inside a pass, on either arch: `composite` paints
+    //    its windows' boxes and `erase` paints boxes windows have VACATED (that half is already
+    //    arch-neutral — `wm::erase` is ungated, so close/move exposure on the Pi has always been
+    //    repainted `DESKTOP_BG`). Neither has any claim on panel pixels the window layer has never
+    //    owned, so everything painted before the desktop existed — `init_panel`'s `PANEL_BG`, the
+    //    direct-painted fbcon boot log, whatever a demo left — is outside every damage box there is
+    //    and stays on glass for the rest of the boot.
+    //
+    //    Why a DIRECT front-buffer write is sound HERE and nowhere else, restated for this arch
+    //    rather than inherited: `wm` exposes no full-panel erase verb, and the no-direct-writes law
+    //    protects COMPOSITOR-OWNED pixels from a second writer — at this line there are none. The
+    //    window table is empty (the boot capture proves it rather than assuming it: `[wc-a] create
+    //    win=1` is the console window minted by `panel_console_window_open` twenty lines below, and
+    //    it is the first create of the boot), `STAGE` has no pass to collide with, and the GUI
+    //    handoff has not yet spawned the render or input tasks. It is also the LAST moment that is
+    //    true, which is why the clear goes above the console window rather than beside the bar.
+    //
+    //    CURSOR-1's bracket applies for `erase`'s reason: a sprite on the panel would be painted
+    //    over and its save-under would later restore pre-clear pixels as a stale patch. Take it off
+    //    first; the composite at step 5 puts it back.
+    //
+    //    WC-BBSYNC is deliberately NOT armed here. x86 pairs its clear with
+    //    `screen::adopt_desktop_bg` so a `Screen` built later is born agreeing with the glass; on
+    //    the Pi that latch would also be read by `video::witness::run`, which builds a `Screen` over
+    //    a HEAP buffer and asserts "baseline flush left non-zero front" — seeding it would fail a
+    //    passing gate for a surface that is not the panel. The Pi does not need it either way: its
+    //    `render_service` calls `console.draw` (a whole-panel `clear_screen` at `Console::BG`, which
+    //    is the same number as `wm::DESKTOP_BG`) before its first `pal.render`, so no zeroed back
+    //    buffer ever reaches the glass. Named rather than silently skipped.
+    {
+        super::cursor::undraw();
+        let fb = *super::WRITER.lock();
+        fb.fill_screen(wm::DESKTOP_BG);
+        fb.flush_all();
+    }
+    serial_println!(
+        "[pidesk] desktop-clear panel={}x{} bg={:08X} (pre-desktop residue off the glass; the window table is empty at this line)",
+        pw,
+        ph,
+        wm::DESKTOP_BG
+    );
 
     // 2-3. CONSOLEWIN — the dock must be able to host the worst-case strip, or the console gets no
     //    window (and therefore no minimise disc, and therefore nothing to strand). `wcx`'s law,

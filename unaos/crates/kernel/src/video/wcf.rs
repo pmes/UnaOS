@@ -581,13 +581,18 @@ static CHROME_TRUTH_DONE: AtomicBool = AtomicBool::new(false);
 ///
 /// ## The desktop reading is REPORTED BUT NOT JUDGED
 ///
-/// On x86 the panel-wide `DESKTOP_BG` clear is `wcx`'s DESKTOP-CLEAR; `video::wcx` is
-/// `#[cfg(all(target_arch = "x86_64", feature = "wc"))]` and the Pi has no twin. `wm::erase` paints
-/// `DESKTOP_BG` into window BOXES and `Screen` holds it in the desktop LAYER, but nothing on this
-/// arch ever promises it to a panel pixel outside every box. A witness that called that a `MISS`
-/// would be convicting the chrome for a contract the arch never made. It prints `NOCLEAR` instead —
-/// a distinct token, outside the verdict's arithmetic, naming the gap for whoever writes the aarch64
-/// desktop-clear. The probe point is CHOSEN by testing candidates against every row's outer box,
+/// On x86 the panel-wide `DESKTOP_BG` clear is `wcx`'s DESKTOP-CLEAR. **The Pi now has its twin —
+/// `pidesk::activate`'s PIDESK DESKTOP-CLEAR, written because this probe named the gap** (bench
+/// capture PA41 boot2: `want=0x2d2b55 got=0x1e1e1e -> NOCLEAR`, i.e. `video::PANEL_BG` still on the
+/// glass at desktop-ready). It is `feature = "pidesk"` and one-shot at bring-up, so the promise is
+/// conditional in two ways this witness must not paper over: knob-off there is still no clear, and
+/// a clear at bring-up is not a claim about a pixel some LATER writer repaints — the Pi's
+/// `render_service` still owns the backdrop (PARITY §6.1), so a probe that latches late reads
+/// whatever the shell left. `wm::erase` paints `DESKTOP_BG` into window BOXES and `Screen` holds it
+/// in the desktop LAYER, but neither promises a panel pixel outside every box. A witness that
+/// called any of that a `MISS` would be convicting the chrome for a contract it never made. It
+/// prints `NOCLEAR` instead — a distinct token, outside the verdict's arithmetic, naming which of
+/// the three the boot is in. The probe point is CHOSEN by testing candidates against every row's outer box,
 /// compat rows included (a compat row can own the whole panel and legitimately paint anything
 /// there); when no candidate is clear it says so rather than asserting a colour it cannot justify.
 ///
@@ -772,7 +777,11 @@ pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize
             serial_println!(
                 "[chrome-truth] pt=desktop at=({},{}) want={:#08x} got={:#08x} -> {}",
                 dx, dy, DESKTOP_BG, got.unwrap_or(0),
-                if ok { "HIT" } else { "NOCLEAR (no aarch64 panel-wide DESKTOP_BG clear; wcx is x86+wc)" }
+                if ok { "HIT" } else if cfg!(feature = "pidesk") {
+                    "NOCLEAR (pidesk cleared the panel at bring-up; a later writer owns this pixel — PARITY 6.1)"
+                } else {
+                    "NOCLEAR (no panel-wide DESKTOP_BG clear in this build; it is pidesk-gated on aarch64)"
+                }
             );
         }
         None => serial_println!(

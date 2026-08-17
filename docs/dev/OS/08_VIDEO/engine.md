@@ -12986,5 +12986,87 @@ that wait is `DrainBarrier::drain`'s 2^30 spin and this arc bounds it. In boot 3
 denominated in something an operator can feel. That is the xHCI lane's, not the video lane's, and the
 EL0-liveness question behind it is the scheduler's; both are named here so the next reader does not
 have to re-derive them from the capture.
+## PIDESK-CLEAR — the panel-wide desktop clear crosses to the Pi (aarch64 `pidesk`, 2026-08-17)
+
+### The defect, named by an instrument rather than by an eye
+
+`wcf::chrome_truth`'s desktop probe was written to REPORT a reading it could not judge, precisely so
+that whoever eventually wrote the aarch64 desktop-clear would find the gap already measured. It did
+its job. From the PA41 bench boot (Pi 4, `UNAOS_PIDESK=1`, 1920x1200 mailbox framebuffer):
+
+```
+[chrome-truth] pt=desktop at=(1918,1198) want=0x2d2b55 got=0x1e1e1e -> NOCLEAR
+```
+
+`0x1E1E1E` is `video::PANEL_BG` — the fill `video::init_panel` puts down the instant the framebuffer
+is attached, hundreds of milliseconds before any desktop exists. It was still on the glass at
+desktop-ready, and would have stayed there for the rest of the boot.
+
+**Why nothing in the system was ever going to repaint it.** `wm::composite` paints its windows'
+boxes; `wm::erase` paints boxes windows have VACATED (that half has always been arch-neutral — `erase`
+is ungated, so close/move exposure on the Pi was already repainted `DESKTOP_BG`, and this arc found
+nothing owed there). Neither has any claim on panel pixels the window layer has never owned. Every
+pre-desktop pixel — `init_panel`'s fill, the direct-painted fbcon boot log, whatever a demo left — is
+outside every damage box in the system. x86 solved this in 2026-07 with `wcx::activate`'s WC-X
+DESKTOP-CLEAR; the Pi had no such point until `pidesk::activate` existed, and then had the point but
+not the step.
+
+### The change
+
+One block, in `video/pidesk.rs`, between step 1 (panel geometry) and step 2-3 (the console window):
+`cursor::undraw()`, a direct `WRITER` `fill_screen(wm::DESKTOP_BG)` + `flush_all()`, and a witness
+line. Fifty-five added lines in one file, forty-eight of them the argument.
+
+**Why a direct front-buffer write is sound here, PROVEN on this arch rather than inherited.** The
+no-direct-writes law protects COMPOSITOR-OWNED pixels from a second writer. x86 argues there are none
+at `wcx::activate` because it runs from inside PCI enumeration. That argument does not transfer — the
+Pi's seam runs from the GUI handoff, with the whole M6b..U7 fixture cascade already spawned on the APs
+— so it was checked against the capture instead of asserted: in the armed bench log the FIRST
+`[wc-a] create` of the boot is `win=1`, the console window minted by `panel_console_window_open`
+twenty lines BELOW the clear. The table is empty at that line, `STAGE` has no pass to collide with,
+and the render/input tasks are not yet spawned. It is also the LAST instant that holds, which is why
+the clear goes above the console window rather than beside the menu bar.
+
+**WC-BBSYNC is deliberately NOT armed, and that is a finding, not an omission.** x86 pairs its clear
+with `screen::adopt_desktop_bg` so a `Screen` built later is born agreeing with the glass. Arming the
+same latch on the Pi would also be read by `video::witness::run`, which builds a `Screen` over a HEAP
+buffer and asserts *"baseline flush left non-zero front"* — a passing gate would have failed for a
+surface that is not the panel. The Pi does not need it either way: `render_service` calls
+`console.draw` (a whole-panel `clear_screen` at `Console::BG`, which is the same number as
+`wm::DESKTOP_BG`) before its first `pal.render`, so no zeroed back buffer ever reaches the glass. The
+seed's own doc comment already warned that this coincidence is not a guarantee; on aarch64 it is now
+the load-bearing reason, stated at the call site.
+
+### The proof
+
+| gate | result |
+|---|---|
+| `./arroyo check` | x86_64 OK, aarch64 OK, 12/12 cfg-coverage legs, userspace both arches |
+| `UNAOS_WC=1 ./arroyo check` | same, all green |
+| `UNAOS_PIDESK=1 ./arroyo kernel8-test 210` | MBENCH **PASS 108/108**, 0 forbidden |
+| knob-off `./arroyo kernel8-test 210` | MBENCH **PASS 108/108**, 0 forbidden; zero `[pidesk]` lines |
+| `UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 210` | the witness flip, below |
+
+**The flip, at bench geometry, same command before and after:**
+
+```
+before: [chrome-truth] pt=desktop at=(1918,1198) want=0x2d2b55 got=0x1e1e1e -> NOCLEAR
+after:  [pidesk] desktop-clear panel=1920x1200 bg=002D2B55 (pre-desktop residue off the glass; …)
+        [chrome-truth] pt=desktop at=(1918,1198) want=0x2d2b55 got=0x2d2b55 -> HIT
+```
+
+Both bench-geometry runs are otherwise equally red (104/108, 22 vs 23 forbidden) — the known
+`[wc-g]`/`[wc-h]` 1920x1200-under-QEMU race family the `pidesk` module header already documents, not
+a delta of this arc. The DONE-gate surface is the default geometry, and it is 108/108 armed and off.
+
+### The 640x480 reading is NOT the same defect, and was measured so
+
+At default gate geometry the probe still prints `NOCLEAR`, at `got=0x1b1a3a`. That is **unchanged by
+this arc** — a baseline run at the same geometry (patch reverted with `git apply -R`, rebuilt, rerun)
+prints the identical value. The reason is timing: at 640x480 the dock law declines the console window,
+so no chrome-bearing row exists until the u11/uvug cascade lands, by which point `render_service` has
+repainted the whole panel and `(638,478)` belongs to the SHELL BACKDROP, not to the bring-up clear.
+That is PARITY §6.1 (SHELLNOTDESK), a different owed item in a different lane. Named here because a
+prior arc died chasing this exact reading.
 
 ---
