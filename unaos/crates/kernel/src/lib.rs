@@ -201,6 +201,13 @@ pub mod rtwit;
 #[cfg(feature = "rtpi")]
 pub mod rtpi;
 
+// VUGSPREAD (PARITY.md §6.6c) — the arch-neutral POLICY of the work-stealing repair: the per-victim
+// steal floor and the escalating per-task cooldown brake. It was `const`s and `fn`s inside
+// `arch/x86_64/sched.rs`, which is exactly why the Pi never got the repair; lifted here so both
+// schedulers call ONE definition instead of drifting copies. Declared unconditionally and carrying
+// no state — it is `const fn` arithmetic over its arguments, so nothing is linked that is not used.
+pub mod sched_spread;
+
 pub fn init() {
     arch::init();
 }

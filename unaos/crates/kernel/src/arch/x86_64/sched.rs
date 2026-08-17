@@ -5088,7 +5088,10 @@ fn input_wait_backstop() {
 /// SMPBAL-X86: minimum victim queue depth to steal from. `2` leaves the last ready task at its home
 /// core (a core with one task is not "loaded"), which is what stops two idle cores ping-ponging a
 /// lone task between them.
-const STEAL_MIN_DEPTH: usize = 2;
+///
+/// PARITY §6.6c LIFTED THE VALUE, not the meaning: it now re-exports `sched_spread::STEAL_MIN_DEPTH`
+/// so the Pi's `try_steal` and this one cannot drift. Nothing about x86's behaviour changes here.
+const STEAL_MIN_DEPTH: usize = crate::sched_spread::STEAL_MIN_DEPTH;
 
 // ── VUGSPREAD: THE FLOOR WAS COUNTING THE WRONG POPULATION ──────────────────────────────────────
 //
@@ -5124,13 +5127,13 @@ const STEAL_MIN_DEPTH: usize = 2;
 /// that the `current_prio` load it needs for the floor is the same one review F15's `PACK_SEEN`
 /// observation reads — one load answering both questions instead of two loads that could disagree
 /// with each other within a single iteration. Keep the two in step if either changes.
+///
+/// PARITY §6.6c: the RULE now lives in `sched_spread::steal_floor` and is shared with aarch64; what
+/// stays here is the arch-bound half — reading whether THIS arch's victim is running something.
 #[inline]
 fn steal_floor(victim: usize) -> usize {
-    if SCHED[victim].current_prio.load(Ordering::Acquire) == PRIO_IDLE {
-        STEAL_MIN_DEPTH
-    } else {
-        1
-    }
+    let running = SCHED[victim].current_prio.load(Ordering::Acquire) != PRIO_IDLE;
+    crate::sched_spread::steal_floor(running)
 }
 
 // ── VUGSPREAD: WHY A STEAL DID NOT HAPPEN ───────────────────────────────────────────────────────
@@ -5279,21 +5282,26 @@ static STEAL_REMIGS: AtomicU64 = AtomicU64::new(0);
 // enough to break the ~0.5 ms re-steal cadence Boot C measured, short enough that a one-time
 // post-close rebalance is delayed imperceptibly. It is deliberately NOT a rate cap on the renderer —
 // the vug still presents unbounded; only the SCHEDULER's re-placement of its task is damped.
-const STEAL_COOLDOWN_MS: u64 = 16;
+/// PARITY §6.6c: value and escalation both LIFTED to `sched_spread`, which is where the Pi reads
+/// them from. The Boot B/C evidence for the shape stays written up here, where it was measured.
+const STEAL_COOLDOWN_MS: u64 = crate::sched_spread::STEAL_COOLDOWN_MS;
 
 /// VUGSPREAD-COOL: escalation cap for [`steal_cooldown_ms`] — `16 << 4 = 256` ms is the terminal
 /// window. Chosen so the worst case stays imperceptible (a quarter-second residency floor, paid only
 /// by a task already re-stolen four times) while being far beyond the wake/block cadence that drives
 /// the ping-pong (~0.5–16 ms), so escalation terminates the cycle rather than stretching it.
-const STEAL_COOLDOWN_ESC_CAP: u32 = 4;
+#[allow(dead_code)] // the arithmetic moved to `sched_spread`; kept as the documented name of the cap
+const STEAL_COOLDOWN_ESC_CAP: u32 = crate::sched_spread::STEAL_COOLDOWN_ESC_CAP;
 
 /// VUGSPREAD-COOL: the per-task ESCALATING cooldown window — how long a task with `migrations` past
 /// moves must sit on its current home before `steal_one` may take it again. See the doc block on
 /// [`STEAL_COOLDOWN_MS`] for the Boot B evidence that a flat window merely stretches the ping-pong,
 /// and for why `migrations` never decays (the recency gate bounds the whole mechanism at 256 ms).
+///
+/// PARITY §6.6c: delegates to `sched_spread::steal_cooldown_ms` — one definition, both arches.
 #[inline]
 fn steal_cooldown_ms(migrations: u32) -> u64 {
-    STEAL_COOLDOWN_MS << migrations.min(STEAL_COOLDOWN_ESC_CAP)
+    crate::sched_spread::steal_cooldown_ms(migrations)
 }
 
 /// VUGSPREAD-COOL: per-task steal candidates SKIPPED because they migrated within their ESCALATED

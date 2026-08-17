@@ -1182,6 +1182,29 @@ FORBID SPINHUNT: .*-> FAIL
 REQUIRE BGSPREAD: 3 bg launches over [0-9]+ online cores -> cores [0-9]+,[0-9]+,[0-9]+ distinct=[2-9] \(want >= 2\) PASS
 FORBID BGSPREAD: .*-> FAIL
 
+# --- VUGSPREAD (PARITY.md §6.6c/§6.7) — the steal floor must SEE two-on-one packing.
+# ---
+# ---    `SMPBAL: spread test` beside this one piles FOUR movable tasks on one core; that is real
+# ---    work stealing but not this arc's case. With four staged, the home core's READY queue is 3
+# ---    deep the moment it dispatches the first, and the pre-arc constant floor of 2 already saw it.
+# ---    The packing that actually starved vug is TWO runnable tasks on one core: the instant home
+# ---    dispatches one, its ready queue holds exactly ONE — because the RUNNING task lives in
+# ---    `current`, not in the queue — and every idle sibling read depth 1 < 2 and walked away. The
+# ---    corrector did not miss it; it was below the corrector's floor BY CONSTRUCTION.
+# ---
+# ---    The floor is per-victim now (`sched_spread::steal_floor`): 1 if the victim is running
+# ---    something, 2 if it is between tasks (that second case IS the ping-pong the constant was
+# ---    reaching for, and it keeps the constant). This leg stages exactly two steal-eligible tasks on
+# ---    one core with the others idle in `run` and PASSes iff they RAN on >= 2 distinct cores, which
+# ---    with a single-core spawn can only happen through `try_steal`.
+# ---
+# ---    A/B is decisive rather than statistical: on the pre-arc floor the leg reports `cores-used=1`
+# ---    on EVERY boot, not occasionally. `depth=1` is carried in the line because it names the victim
+# ---    depth the move had to clear — the same population `[spread4] d1=` counts cumulatively on
+# ---    metal. See docs/dev/OS/02_KERNEL_CORE/scheduler.md (aarch64, VUGSPREAD-PI).
+REQUIRE VUGSPREAD: floor test — tasks=2 cores-used=[2-9] depth=1 :: PASS
+FORBID VUGSPREAD: floor test .*:: FAIL
+
 # SPREAD-2 — VUG-PAR band distribution. The `[spread2]` rollup only exists when the image carries the
 # `vugpar` feature (UNAOS_VUGPAR=1), which the default suite does not set, so these are FORBIDs rather
 # than a REQUIRE: zero hits on a default log, real assertions on a UNAOS_VUGPAR=1 log. Under vugpar the

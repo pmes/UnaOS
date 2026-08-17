@@ -431,14 +431,14 @@ missing the ways to REACH it, and the headroom to run it at full detail.**
 |---|---|---|---|
 | **VUGSCENE** `a5bd93ee` | The real drawing-complexity arc. Replaces the trivial wireframe with a solid faceted **SHARD** — an 18-half-space convex-intersection ray tracer (exact HSR, no z-buffer), orbiting light, per-facet flat shading with a specular kick, palette read from the menu bar's crystal. Plus a **ray-density LOD ladder** (lvl 0 wireframe → 3 = one ray per pixel, cost 1:4:16) that self-tunes off its own fps meter. Commit body: *"Peter: make the drawing complex, not the pacing (999fps was a trivial pattern), and the scene IS the crystal."* | **Arch-neutral.** `crates/user-vug/src/main.rs` carries no `#[cfg(target_arch)]` outside the syscall stubs; it compiles and links for aarch64. | Renderer needs no port. **The reach does** — 6.6a/6.6b/6.6c below. |
 | **VUGTRUTH** `51b66a2c` | Failed presents no longer count as frames or clock the exit budget; fps on the wire as `[vugfps]`; spin budget 4096→64. The *measurement* the VUGSCENE ladder later reads. | **Arch-neutral**, gates were run green on both arches. | **AT PARITY. Not a gap.** Added no rendered content. Recorded so it is not re-opened. |
-| **VUGSPREAD** `b30d81f3` | Scheduler repair for vug's 19 fps: unstealable spawned threads, load-blind sibling pick, a steal floor that could not see 2-on-1 packing. Adds per-task `migrations`, a placement hint, per-victim `steal_floor`, `cr3_live` shadow, `[spread]` witness, and an escalating steal cooldown. Renders no pixels. | **x86-only by directory** — every line is in `arch/x86_64/sched.rs` (~50 `VUGSPREAD` tags). `arch/aarch64/sched.rs` has none of it. | **OWED — 6.6c.** The Pi gets none of the placement/steal repair. |
+| **VUGSPREAD** `b30d81f3` | Scheduler repair for vug's 19 fps: unstealable spawned threads, load-blind sibling pick, a steal floor that could not see 2-on-1 packing. Adds per-task `migrations`, a placement hint, per-victim `steal_floor`, `cr3_live` shadow, `[spread]` witness, and an escalating steal cooldown. Renders no pixels. | **x86-only by directory** — every line was in `arch/x86_64/sched.rs` (~50 `VUGSPREAD` tags). | **LANDED — §6.7.** The policy is now `crates/kernel/src/sched_spread.rs`, shared; the Pi has the steal half. |
 | **LAUNCHVUG** `fa439109` | Bare `vug` at the shell resolves `VUG.ELF` on the volume executables live on and launches it **detached**. Fixed Peter's bench report *"still no way to launch vug"*. | **x86-only, explicitly.** `shell.rs:5007` `#[cfg(target_arch = "x86_64")] fn bare_exec`, and `shell.rs:2509` `exec: cfg!(target_arch = "x86_64")`. | **OWED — 6.6a. Highest priority.** |
 
 | # | Gap | Sites | Scope |
 |---|---|---|---|
 | 6.6a | **`vug` does not launch on the Pi** | `shell.rs:5007` (`bare_exec`, `#[cfg(target_arch = "x86_64")]`), `shell.rs:2509` (`Facts::exec = cfg!(x86_64)`), `shell.rs:2899` (the `Plan::Exec` arm, whose `not(x86_64)` branch prints *"Unknown command."*) | Typing `vug` on the Pi prints **"Unknown command."** — verbatim the failure Peter reported at the bench on x86, still shipping on aarch64. The operator must type `bg /fat/VUG.ELF`. **This is also the gate on the shard itself:** VUGSCENE renders only when `overlay = detached \|\| interactive`, and `detached` is bit 0 of the info-page flags set by `bg` — so the launch path *is* the drawing path. `spawn_user_image_bg` already exists on aarch64 (`arch/aarch64/syscall.rs:8145`); only the resolver/dispatch half is missing, and the `not(x86_64)` arm was left in place precisely so "the compiler points here" when a loader arrives. **Smallest change with the largest visible payoff. Start here.** |
 | 6.6b | **Pi media stages only one vug image** | `arroyo:2344-2359` (`build_user_aarch64` builds one unfeatured `VUG.ELF`), `arroyo:2876` (stages that one file); cf. `arroyo:1034-1079` `build_one_vug_x86` emitting three | x86 media carries `VUG.ELF` (adaptive), `VUGC.ELF` (`pinlo`, classic baseline) and `VUGX.ELF` (`pinhi`, full per-pixel shard). **Pi media has neither `VUGC.ELF` nor `VUGX.ELF`**, so the pinned-detail images — the ones that show the shard at full density and give the A/B baseline — cannot be run on the Pi at all. Build-plumbing only; the crate already builds for aarch64 under both feature pins. |
-| 6.6c | **No scheduler placement/steal repair on the Pi** | all of `arch/x86_64/sched.rs`'s VUGSPREAD work; aarch64 twin absent | The LOD ladder self-tunes off achieved fps, so **less CPU headroom settles the shard at a LOWER detail rung — the Pi literally draws a simpler scene.** This is the deepest link to Peter's "more drawing complexity" direction: the Pi's shard is dimmer because its scheduler is worse, not because its renderer is. Large; its own arc; needs a scheduler-lane owner, not a video-lane one. |
+| 6.6c | ~~**No scheduler placement/steal repair on the Pi**~~ **LANDED — `exec-vugspread`, see §6.7** | `sched_spread.rs` (new, shared); `arch/aarch64/sched.rs`; `arch/x86_64/sched.rs` (delegation only) | The LOD ladder self-tunes off achieved fps, so **less CPU headroom settles the shard at a LOWER detail rung — the Pi literally draws a simpler scene.** The row was written as "placement AND steal"; §6.7 shows the Pi already had a deeper PLACEMENT lattice than x86 (SPREAD-3..14), and what it lacked was the STEAL half — the only correction that can reach a thread which never parks. That half is now ported. |
 | 6.6d | ~~**No damage-present on the Pi**~~ — **CLOSED**, `exec-presentrows` | `SYS_WIN_PRESENT_ROWS` (33) dispatched at `arch/x86_64/syscall.rs:2594`; now also at `arch/aarch64/syscall.rs` (`sys_win_present_rows`, beside `sys_win_present`) | The Pi answered `-ENOSYS` and `user-vug` fell back to a whole-box present. Ported: same number, same argument shape, same errnos in the same order, band range-checked against the presenting row's own `h` under the hold that proved ownership. See §6.6d-closed below for the correction the port forced on this row's own framing. |
 
 #### 6.6d-closed — what the port delivers, and the claim in the row above that was wrong
@@ -477,6 +477,102 @@ blocks argue for — but the "cannot move" claim is now false on a boot that tak
 foreground `run` behaves identically on x86 — it is shared ring-3 behaviour, not a parity defect (the
 Pi feels it more only because 6.6a denies it the easy `bg` path). `user-pulse` is fully at parity: its
 drawing is common code and `arroyo:2885` already stages `PULSE.ELF` on Pi media.
+
+### 6.7 The `exec-vugspread` arc — what VUGSPREAD actually is, and what the Pi was missing
+
+**The row above named the gap as "placement/steal repair". Only half of that was true, and the half
+that was false is the more interesting one.** Reading `arch/aarch64/sched.rs` against
+`arch/x86_64/sched.rs`: the Pi does not have a *worse* scheduler than x86 in general — for PLACEMENT
+it has a considerably more elaborate one. The `SPREAD-3` … `SPREAD-14` lineage (committed EL0
+residents, parked-vs-runnable load, a per-address-space co-residency bias so a vug's triple lands
+together, an idle-core recruit lane, a spare-core predicate, a split/repack pair) has no x86 twin at
+all. What it has instead of x86's `try_steal` correction is `make_ready` → `rewake_place`: an EL0
+task's placement is re-asked **when it wakes**.
+
+**And that is the hole, stated exactly.** A wake-time corrector can only correct a task that
+*sleeps*. `SPREAD-6`'s escapement already saw part of this and rate-limited a re-ask onto a 250 ms
+clock for tasks that micro-park; but a thread that is genuinely CPU-bound between presents — a vug
+worker ray-tracing its share of the shard — does not park at all, never reaches `make_ready`, and so
+**its spawn-time core is permanent.** On x86 that same thread is corrected by an idle core pulling it
+over. On the Pi nothing could, because every EL0 task was `steal_ok = false`.
+
+**The stated reason for that flag was stale, and had been since SPREAD-4.** The doc comment read
+"EVERY EL0/slot task (which carry per-core TTBR0/ASID state) are pinned". Nothing about an EL0 task is
+per-core: `user_ttbr0` is a *value* the task carries and `dispatch_next` installs on whichever core
+runs it. SPREAD-4's own soundness block says so in as many words while *moving* parked EL0 tasks
+between cores — the address space follows the task, the old core's residual TTBR0 is benign (slot L1s
+are a static array; teardown broadcasts `tlbi aside1is`), and `spawn_user_thread`'s "Multi-core
+soundness" note already contemplates one ASID live on two cores. So the pin was not protecting a
+hardware invariant; it was a sentence that stopped being true and never got re-read.
+
+#### What x86's VUGSPREAD repair is, piece by piece — and the aarch64 verdict on each
+
+| # | x86 piece | aarch64 before | Ported? |
+|---|---|---|---|
+| 1 | **Ring-3 threads are steal-eligible.** `spawn_user_thread` was `steal_ok = target_cpu == CPU_AUTO`, and `SYS_THREAD_SPAWN` always names a core, so it was always `false`. A ring-3 `place` is a HINT; marking it a pin promoted a user-space hint into a kernel guarantee. | `steal_ok: false` on **both** EL0 slots and EL0 threads. | **YES**, for THREADS only. Slots stay pinned — a windowed app parks on input every frame, so the rewake lane genuinely serves it, and releasing it would have been a second change with no evidence behind it. |
+| 2 | **Load-aware sibling pick.** `sibling_online_cpu` returned the first index-order match, so every `place=1` thread on the machine landed on the same low core. | **Already correct.** `other_online_cpu` picks the shallowest ready queue. (It lacks x86's busy-pct tie-break, rotating cursor and render/service deprioritisation — a smaller, separate question, not this gap.) | **NOT A GAP.** |
+| 3 | **Per-victim steal floor.** A run queue holds only READY tasks — the task a core is *executing* is in `current`. So a flat floor of 2 needs THREE runnable tasks before a core looks loaded, and 2-on-1 packing sits at depth ONE, invisible by construction. Floor is asked of the victim: 1 if it is running something, 2 if it is between tasks. | `const STEAL_MIN_DEPTH: usize = 2`, flat. Same defect, same shape. | **YES**, via the shared `steal_floor`. |
+| 4 | **VUGSPREAD-COOL, the escalating brake.** Per-task `migrations` + `migrate_ms`; a task may not be re-stolen for `16 ms << min(migrations, 4)`. A *flat* window does not stop a ping-pong, it stretches its period. | Nothing — no migration history at all. | **YES.** It is not optional: it is what makes piece 3 safe. |
+| 5 | `cr3_live` shadow, `hint_placed` attribution, the `[spread]` census. | n/a (`cr3_live` is an x86 TLB-generation concern with no aarch64 analogue — TLBI is IS-broadcast here). | **Census yes, `cr3_live` no** — legit arch-specific. |
+
+#### What moved, and where
+
+The brief's rule was *arch-neutral, gated on a feature knob, never `target_arch`*. Both schedulers are
+irreducibly arch files (`SCHED`/`RUN_QUEUES` + APIC-ms on one side, `rq()`/`CUR_PRIO` + CNTPCT on the
+other) and nothing here tries to merge them. What **is** arch-neutral is the *policy* — three
+constants and two predicates — and that is exactly what was trapped inside `arch/x86_64/sched.rs`,
+which is *why* the Pi never got it. It now lives in **`crates/kernel/src/sched_spread.rs`**:
+`STEAL_MIN_DEPTH`, `STEAL_COOLDOWN_MS`, `STEAL_COOLDOWN_ESC_CAP`, `steal_floor(victim_running)`,
+`steal_cooldown_ms(migrations)`, `steal_cooled(migrations, migrate_ms, now_ms)`. No `cfg(target_arch)`
+appears in the file. Both arches call in; each keeps only the plumbing that is genuinely arch-bound
+(*how* you ask "is this core running something", *where* milliseconds come from). x86's behaviour is
+byte-for-byte unchanged — its constants and functions became re-exports and one-line delegations.
+
+There is deliberately **no feature knob.** The repair is a correctness fix on the shipped image, the
+same disposition §5.2 took for `focus_release`: a knob-gated fix would leave the Pi Peter actually
+flashes unrepaired. Per §5.3 this **moves the knob-off `kernel8.img` hash on purpose**, and line
+neutrality does not apply — this is not `pidesk` furniture.
+
+#### The accounting transfer, which a naive port would have dropped
+
+`try_steal` retargets `task.cpu`. On x86 that is the whole re-home. On aarch64 it is not: SPREAD-3's
+`EL0_RESIDENTS` and SPREAD-10's `SLOT_CORE_RES` are per-(core) and per-(core, ASID slot) commitments
+released at exit **against `task.cpu`**. A stolen EL0 thread whose credit stayed behind would grow the
+old core's count without bound and saturate the new core's at zero — and every later `pick_cpu_slot`
+and `rewake_place` decision would then steer around load that is not there, *permanently*. The port
+therefore transfers both credits at re-home, in `make_ready`'s exact order (resident, then slot), and
+re-stamps `place_cyc` because a steal **is** a placement decision — without that, the task's very next
+wake would find a stale refresh clock and re-ask immediately, fighting the move just made.
+`EL0_PARKED` needs no transfer: a task in a run queue is READY by construction.
+
+#### The witness
+
+`[spread4]` gains five fields: `steal= d1= remig= cool= pack=`. They sit on the placement line
+deliberately — `rewake` and `steal` are two lanes of ONE question, and a vug worker spinning through a
+frame can only ever appear in the second. Read as a set: `pack` = idle passes that SAW a packed
+neighbour; `steal` = moves taken; `d1` = moves from a victim at locked depth 1, i.e. the ones the old
+constant floor would have refused (**the floor repair's own attribution — a Pi that speeds up with
+`d1=0` was not sped up by the floor**); `remig` = moves of a task that had already moved; `cool` =
+candidates the escalating brake passed over. Health is `steal` stepping at convergence edges with
+`remig` near zero. The revert criterion is `remig` tracking `steal` while `cool` also climbs — the
+brake refusing and serving the same oscillation, which is the flat-window failure the escalation
+exists to end.
+
+#### One correction to the metal reading this arc was opened on
+
+The brief cited `[spread10] spare=3 sparepct=0 recruit=0` beside a core pinned at 99% while
+`[vugfps] wf=1..2`. Convicting that against the logs rather than the code: in
+`boot3-inputdeath-tail.txt` every spread counter is **frozen** and `[spread4] live` reads `0/0` on all
+four cores — there is no EL0 resident left to place, so that capture is downstream of the failure, not
+a picture of it. The capture that *does* carry the vug is `boot2-freeze-tail.txt`, and it says
+something different: for most of its length the vug runs at **30–60 fps** with
+`[spread4] live c0=0/1 c2=1/1 c3=1/1` and `SCHED: load c0=57% c2=45% c3=44%` — **the triple is spread
+across three cores and the Pi's placement lattice is doing its job.** `wf` then falls off a cliff to a
+hard-locked `1,2,1,2,…` with `c3=99%` and every other core at 0%, and it never recovers. **That is a
+freeze, not a starvation**, and this arc does not claim it. Stated plainly so the next session does not
+credit a scheduler port with a fix it did not make: **VUGSPREAD raises the Pi's ceiling; it is not the
+`wf=1..2` bug.** The `wf=1..2` tail wants its own arc, and the honest first question there is what on
+c3 is at 99% while `[spread4] live` shows no EL0 resident on it.
 
 ### Class (b) rows owned by arcs already in flight — do not duplicate
 

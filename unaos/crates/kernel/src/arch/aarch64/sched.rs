@@ -224,11 +224,33 @@ pub struct Task {
     /// SMP-BAL — the no-migrate flag. `true` = this task has NO hard core affinity and an idle core may
     /// STEAL it from its current run queue (`try_steal`); `false` = it is PINNED and never migrates. Set
     /// once at spawn: a `CPU_AUTO` (load-balanced) kernel task is steal-eligible; a task spawned with an
-    /// explicit core index (render/input/pump/backstop/capstone) and EVERY EL0/slot task (which carry
-    /// per-core TTBR0/ASID state) are pinned. Read ONLY under the owning run-queue lock (in `steal_one`),
+    /// explicit core index (render/input/pump/backstop/capstone) is pinned. Read ONLY under the owning
+    /// run-queue lock (in `steal_one`),
     /// mutated ONLY by the stealer while it exclusively owns the popped `Box` (retargeting `cpu`), so it
     /// never races the owning core's dispatch. Honors the brief's "pinned tasks stay pinned" contract.
+    ///
+    /// VUGSPREAD (PARITY §6.6c) — THE EL0 CLAUSE THAT USED TO BE HERE WAS FALSE, and had been false
+    /// since SPREAD-4. It read "EVERY EL0/slot task (which carry per-core TTBR0/ASID state) are
+    /// pinned", but nothing about an EL0 task is per-core: `user_ttbr0` is a VALUE the task carries
+    /// and `dispatch_next` installs on whichever core runs it, and `make_ready`'s SPREAD-4 rewake
+    /// already MOVES parked EL0 tasks between cores on exactly that reasoning (see its soundness
+    /// block — the address space follows the task; the old core's residual TTBR0 is benign because
+    /// the slot L1s are a static array and teardown broadcasts `tlbi aside1is`). So the flag is
+    /// still `false` for EL0 SLOT tasks — a `bg` parent's placement is decided once and corrected by
+    /// rewake — and `true` for EL0 THREADS (`spawn_user_thread`), whose core came from ring 3's
+    /// `place` HINT and where the rewake path structurally cannot help: a vug worker that spins
+    /// flat out never parks, so it never reaches `make_ready` and its packing latches forever.
     steal_ok: bool,
+    /// VUGSPREAD — how many times [`try_steal`] has MIGRATED this task since it was spawned. Written
+    /// only by the stealer while it exclusively owns the popped `Box`, same discipline as `cpu` and
+    /// `steal_ok`. Feeds the ESCALATING cooldown (`sched_spread::steal_cooldown_ms`): `m=1` on every
+    /// witness line is a fleet settling, the same task returning with `m=2,3,4…` is churn, and that
+    /// is the reading the relaxed floor has to be judged against.
+    migrations: u32,
+    /// VUGSPREAD-COOL — millisecond timestamp of this task's LAST migration (`0` = never migrated),
+    /// on the CNTPCT-derived global clock `try_steal` reads once per attempt. Milliseconds rather
+    /// than raw CNTPCT so the shared `sched_spread` predicate is the same arithmetic on both arches.
+    migrate_ms: u64,
     /// SPREAD-5 — CNTPCT timestamp at which this task was last PARKED, or 0 if it has never parked.
     /// Written by `park_blocked` (the sole park funnel) while it exclusively owns the Box; read by
     /// `make_ready` (the sole wake funnel) while it exclusively owns the Box. No other code touches
@@ -1045,14 +1067,36 @@ impl RunQueue {
     }
     /// SMP-BAL — remove and return the first STEAL-ELIGIBLE (`steal_ok`) ready task, scanning LOW→HIGH
     /// priority (take a core's BACKGROUND work first, never rob it of its most-urgent task) and front-
-    /// first within a level (oldest waiter). Pinned tasks (render/input/pump/capstone/EL0) are skipped
+    /// first within a level (oldest waiter). Pinned tasks (render/input/pump/capstone/EL0 slots) are
+    /// skipped
     /// and left in place. Returns `None` if the queue holds only pinned work. Runs on the STEALER's core
     /// under the VICTIM's run-queue lock; every task here is `STATE_READY` (a running task is out of the
     /// queue in `current`, a blocked one is in a wait/sleeper list), so a stolen task is always safe to
     /// re-home. O(ready tasks) worst case, off the switch hot path (only an idle core with an empty queue).
-    fn steal_one(&mut self) -> Option<Box<Task>> {
+    ///
+    /// VUGSPREAD-COOL — SECOND FILTER: a task that migrated within its ESCALATING cooldown window
+    /// (`sched_spread::steal_cooled`) is left where it is, so it actually RUNS on its new home before
+    /// another idle core yanks it back — longer each time it is re-stolen, until the window outlasts
+    /// the wake/block cadence driving the oscillation and it settles. This is the brake the relaxed
+    /// per-victim floor is paired with, and it is the half that has to hold on an IDLE machine: with
+    /// the floor down at 1 there is always something to take, so without the brake two empty cores
+    /// would trade one task forever. `migrate_ms == 0` (never migrated) always clears, so the FIRST
+    /// corrective steal — the repair itself — is never delayed. Each skip bumps [`SPREAD15_COOL`].
+    ///
+    /// `now_ms` is read ONCE by `try_steal` and threaded in, so every candidate in one walk is judged
+    /// against one instant, and it is the same reading used to stamp the migration at re-home.
+    fn steal_one(&mut self, now_ms: u64) -> Option<Box<Task>> {
         for level in self.levels.iter_mut() {
-            if let Some(pos) = level.iter().position(|t| t.steal_ok) {
+            if let Some(pos) = level.iter().position(|t| {
+                if !t.steal_ok {
+                    return false;
+                }
+                if crate::sched_spread::steal_cooled(t.migrations, t.migrate_ms, now_ms) {
+                    SPREAD15_COOL.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                true
+            }) {
                 return level.remove(pos);
             }
         }
@@ -2896,6 +2940,8 @@ fn spawn_inner(
         // SMP-BAL: a load-balanced (CPU_AUTO) kernel task has no core affinity → steal-eligible. A task
         // spawned onto an explicit core is pinned there (no-migrate), so stealing never touches it.
         steal_ok: requested_cpu == CPU_AUTO,
+        migrations: 0,  // VUGSPREAD: never migrated; `try_steal` bumps it
+        migrate_ms: 0,  // VUGSPREAD-COOL: never migrated => the first corrective steal is never delayed
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
         place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
         wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it
@@ -3015,8 +3061,12 @@ fn spawn_user_inner(
         user_entry,
         user_sp,
         user_ttbr0,
-        // SMP-BAL: EL0/slot tasks carry per-core TTBR0/ASID state — always pinned, never stolen.
+        // SMP-BAL: an EL0 SLOT task's placement is decided once and corrected by SPREAD-4's rewake,
+        // which is the lane a windowed app actually travels (it parks on input every frame). Left
+        // pinned deliberately — VUGSPREAD (PARITY §6.6c) releases THREADS, not slots; see `steal_ok`.
         steal_ok: false,
+        migrations: 0,  // VUGSPREAD: never migrated (and, being pinned, never will be)
+        migrate_ms: 0,  // VUGSPREAD-COOL: unused while `steal_ok` is false
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
         place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
         wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it
@@ -3098,8 +3148,21 @@ pub fn spawn_user_thread(
         user_entry,
         user_sp,
         user_ttbr0,
-        // SMP-BAL: shared-ASID EL0 thread — per-core address-space state, always pinned.
-        steal_ok: false,
+        // VUGSPREAD (PARITY §6.6c) — A RING-3 CORE IS A HINT, NOT A PIN. This is the one population
+        // the x86 arc released and the reasoning transfers verbatim: `SYS_THREAD_SPAWN` passes
+        // `place` ∈ {0 = my core, 1 = a sibling}, a locality HINT in the only vocabulary the syscall
+        // has, and marking the result a pin promoted that hint into a kernel guarantee. The placement
+        // is still honoured — the thread starts exactly where `pick_cpu_slot` put it — and an idle
+        // core may correct it later. The migration itself is the SAME move `make_ready`'s SPREAD-4
+        // rewake already performs on EL0 tasks: `dispatch_next` installs `user_ttbr0` on whichever
+        // core dispatches, nG user leaves are ASID-tagged, and TLB maintenance is Inner-Shareable
+        // broadcast (see this function's "Multi-core soundness" note, which already contemplates the
+        // shared ASID being live on two cores at once). What is NEW is only that the correction can
+        // now reach a thread that never parks — the vug worker case, where rewake structurally
+        // cannot help. `try_steal` carries the SPREAD-3/10 resident accounting across the move.
+        steal_ok: true,
+        migrations: 0,  // VUGSPREAD: never migrated; `try_steal` bumps it
+        migrate_ms: 0,  // VUGSPREAD-COOL: never migrated => the first corrective steal is never delayed
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
         place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
         wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it
@@ -3114,7 +3177,7 @@ pub fn spawn_user_thread(
     rq(cpu).push(task);
     #[cfg(feature = "pi")]
     serial_println!(
-        ":: SCHED: thread '{}' -> core {} (ELF-2 shared-ASID EL0 thread residents={}, no-migrate) ::",
+        ":: SCHED: thread '{}' -> core {} (ELF-2 shared-ASID EL0 thread residents={}, hint-placed) ::",
         name,
         cpu,
         residents
@@ -4697,9 +4760,34 @@ pub fn run_until_empty(cpu: usize) {
 // the steal can never race the victim's own `dispatch_next`/`push` or observe a half-built task. Only an
 // idle core steals, and it steals at most one task per empty pass, so it self-limits.
 
-/// Minimum victim run-queue depth to steal from. `2` leaves the last ready task at its home core (a core
-/// with one task is not "loaded"), which prevents two idle cores from ping-ponging a lone task.
-const STEAL_MIN_DEPTH: usize = 2;
+// ── VUGSPREAD (PARITY §6.6c) — THE FLOOR WAS COUNTING THE WRONG POPULATION ─────────────────────
+//
+// The x86 arc's finding, and it is a property of run queues rather than of x86: `STEAL_MIN_DEPTH`'s
+// justification — "a core with one task is not loaded" — is a true sentence attached to the wrong
+// quantity. A run queue holds only READY tasks; the task a core is EXECUTING lives in `current`, not
+// in `levels`. So a flat floor of 2 ON THE QUEUE means a core needs THREE runnable tasks before an
+// idle core judges it loaded, and the packing this arc was opened on — a vug's parent and one of its
+// workers time-sharing one core while other cores read 0% — sits at queue depth ONE. It was not
+// missed by the corrector; it was BELOW the corrector's floor by construction.
+//
+// The floor is therefore asked of the VICTIM (`sched_spread::steal_floor`) rather than read off a
+// constant: a victim that is RUNNING something carries that task PLUS its queue, so depth 1 already
+// means two runnable tasks; a victim at `PRIO_NONE` is between tasks and is about to dispatch the
+// very task we would take, so it keeps the floor of 2 — that case IS the ping-pong the constant was
+// reaching for.
+//
+// This does not widen the steal in the direction that hurt this arch before. The rate is still
+// bounded by the idle-pass rate at one task per pass, the thief still must have nothing of its own,
+// the pin contract is untouched, and VUGSPREAD-COOL's escalating brake (in `steal_one`) is what
+// keeps the relaxed floor from oscillating on an IDLE machine — see the design-twin note in
+// `sched_spread`. What changes is only WHICH victims are visible: cores genuinely running one task
+// while another waits behind it.
+
+/// Minimum victim run-queue depth to steal from when the victim is BETWEEN tasks. `2` leaves the last
+/// ready task at its home core, which prevents two idle cores from ping-ponging a lone task. Shared
+/// with x86 via `sched_spread` so the two schedulers cannot drift; the per-victim relaxation lives in
+/// [`sched_spread::steal_floor`].
+const STEAL_MIN_DEPTH: usize = crate::sched_spread::STEAL_MIN_DEPTH;
 
 /// SMP-BAL — rate limit for the `[smpbal] steal` witness: emit the first `STEAL_LOG_MAX` steals then go
 /// quiet, so a steady rebalancing workload cannot flood the serial log. Introspection only.
@@ -4708,36 +4796,90 @@ const STEAL_LOG_MAX: u32 = 12;
 #[cfg(feature = "pi")]
 static STEAL_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// VUGSPREAD — tasks MOVED by stealing, machine-wide. Printed on `[spread4]` beside the placement
+/// counters because they are two lanes of ONE question: `rewake` corrects a task that parks, `steal`
+/// corrects one that does not. A vug worker spinning flat out can only ever appear in this column.
+static SPREAD15_MOVES: AtomicU64 = AtomicU64::new(0);
+
+/// VUGSPREAD — steals whose task had ALREADY migrated at least once. The churn reading: `moves`
+/// climbing with `remig` near zero is a fleet settling; `remig` tracking `moves` is a ping-pong the
+/// cooldown is failing to damp, and is the revert criterion for the relaxed floor.
+static SPREAD15_REMIG: AtomicU64 = AtomicU64::new(0);
+
+/// VUGSPREAD-COOL — per-task steal candidates SKIPPED inside `steal_one` because they migrated within
+/// their escalated window. Read WITH `remig`: `cool` climbing while `remig` also climbs means the
+/// brake is refusing and serving the same oscillation (the flat-window failure the escalation
+/// exists to end); `cool` near-flat after a settle transient with `remig` collapsed is health.
+static SPREAD15_COOL: AtomicU64 = AtomicU64::new(0);
+
+/// VUGSPREAD — moves taken from a victim whose LOCKED depth was 1, i.e. moves the old constant floor
+/// would have refused. This is the attribution field for the floor repair specifically: if the Pi's
+/// vug speeds up and this counter is zero, the floor was not what did it.
+static SPREAD15_D1: AtomicU64 = AtomicU64::new(0);
+
+/// VUGSPREAD — steal passes that saw at least one other core RUNNING a task with more ready behind
+/// it (a packed core), whether or not a move followed. `pack` climbing with `moves` flat is the
+/// corrector being looked at and declining; both flat means there was never any packing to repair,
+/// which is the reading an idle QEMU battery is expected to produce.
+static SPREAD15_PACK: AtomicU64 = AtomicU64::new(0);
+
 /// SMP-BAL — an idle `cpu` (empty local queue) tries to steal ONE steal-eligible ready task from the
 /// most-loaded online core. Returns `true` if a task was moved onto `cpu`'s queue (the caller then loops
 /// and dispatches it), `false` if there was nothing worth stealing. IRQ-masked throughout (matching the
 /// run-queue lock contract); acquires at most one run-queue lock at a time.
 fn try_steal(cpu: usize) -> bool {
     mask_irq();
-    // 1. Peek for the deepest OTHER online queue at/above the floor (lock-free length reads).
+    // 1. Peek for the deepest OTHER online queue at/above ITS OWN floor (lock-free length reads).
+    //    VUGSPREAD: the floor is per-victim now. `running` — the victim has a task dispatched, so its
+    //    queue depth understates its runnable count by one — is the whole of the repair, and it
+    //    doubles as the packing observation `pack` reports.
     let mut victim: Option<usize> = None;
-    let mut best_depth = STEAL_MIN_DEPTH - 1;
+    let mut best_depth = 0usize;
+    let mut saw_pack = false;
     for c in 0..NUM_CPUS {
         if c == cpu || !ONLINE_MASK[c].load(Ordering::Acquire) {
             continue;
         }
         let depth = rq(c).len();
-        if depth > best_depth {
+        if depth == 0 {
+            continue;
+        }
+        let running = CUR_PRIO[c].load(Ordering::Acquire) != PRIO_NONE;
+        if running {
+            saw_pack = true;
+        }
+        if depth >= crate::sched_spread::steal_floor(running) && depth > best_depth {
             best_depth = depth;
             victim = Some(c);
         }
+    }
+    if saw_pack {
+        SPREAD15_PACK.fetch_add(1, Ordering::Relaxed);
     }
     let Some(v) = victim else {
         unmask_irq();
         return false;
     };
+    // VUGSPREAD-COOL — ONE coherent millisecond reading for both the cooldown test inside `steal_one`
+    // and the migration stamp at step 3, so the task this pass takes is judged and stamped at one
+    // instant. CNTPCT is system-global and fixed-frequency, so the elapsed it yields is sound across
+    // cores — the same property SPREAD-5's park durations rely on. Taken AFTER victim selection on
+    // purpose: an idle pass that finds nothing to steal is by far the common case (millions per
+    // capture) and must not pay a system-register read for a number it will not use.
+    let now_ms = cyc_to_ms(now_cyc());
     // 2. Steal under the victim's lock only (re-check depth — it may have drained since the peek).
+    //    VUGSPREAD: the floor is re-ASKED here rather than carried from the peek — the victim may
+    //    have gone idle in between, in which case the STRICTER idle floor is the one that applies.
+    let victim_depth;
     let stolen = {
         let mut vq = rq(v);
-        if vq.len() < STEAL_MIN_DEPTH {
+        let len = vq.len();
+        victim_depth = len;
+        let running = CUR_PRIO[v].load(Ordering::Acquire) != PRIO_NONE;
+        if len < crate::sched_spread::steal_floor(running) {
             None
         } else {
-            vq.steal_one()
+            vq.steal_one(now_ms)
         }
     };
     let Some(mut task) = stolen else {
@@ -4746,15 +4888,45 @@ fn try_steal(cpu: usize) -> bool {
     };
     // 3. Re-home onto this core and enqueue (we exclusively own the Box here).
     let name = task.name;
+    let home = task.cpu as usize;
     task.cpu = cpu as u32;
+    // VUGSPREAD — the per-task migration count and stamp, written where the Box is exclusively owned
+    // (the same discipline `cpu` itself is written under). The stamp arms the escalating cooldown for
+    // the NEXT idle core that looks at this task.
+    task.migrations = task.migrations.saturating_add(1);
+    let mig = task.migrations;
+    if mig > 1 {
+        SPREAD15_REMIG.fetch_add(1, Ordering::Relaxed);
+    }
+    task.migrate_ms = now_ms;
+    if victim_depth == 1 {
+        SPREAD15_D1.fetch_add(1, Ordering::Relaxed); // the old constant floor would have refused this
+    }
+    // VUGSPREAD — CARRY THE SPREAD-3/4/10 ACCOUNTING ACROSS THE MOVE. This is the piece a naive port
+    // would drop and it would poison placement permanently: `el0_resident_leave` at exit releases
+    // against `task.cpu`, so a stolen EL0 task whose credit stayed behind would grow the old core's
+    // count without bound and saturate the new core's at zero — every later `pick_cpu_slot` and
+    // `rewake_place` decision steering around load that is not there. Same order `make_ready`'s
+    // rewake uses (resident then slot), so a concurrent sibling's placement ask never double-counts.
+    // `EL0_PARKED` needs no transfer: a task in a run queue is READY by construction, never parked.
+    // `place_cyc` is re-stamped because this IS a placement decision — without it the very next wake
+    // would see a stale refresh clock and re-ask immediately, fighting the move we just made.
+    if task.user_entry != 0 && home != cpu {
+        el0_resident_leave(home);
+        el0_resident_enter(cpu);
+        slot_res_leave(home, task.user_ttbr0);
+        slot_res_enter(cpu, task.user_ttbr0);
+        task.place_cyc = now_cyc();
+    }
     rq(cpu).push(task);
+    SPREAD15_MOVES.fetch_add(1, Ordering::Relaxed);
     // Rate-limited steal witness (pi-gated: fires on the target + kernel8-test, byte-identical elsewhere).
     #[cfg(feature = "pi")]
     if STEAL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEAL_LOG_MAX {
-        serial_println!(":: [smpbal] steal '{}' c{}->c{} ::", name, v, cpu);
+        serial_println!(":: [smpbal] steal '{}' c{}->c{} (m={}) ::", name, v, cpu, mig);
     }
     #[cfg(not(feature = "pi"))]
-    let _ = name;
+    let _ = (name, mig);
     unmask_irq();
     true
 }
@@ -6999,13 +7171,26 @@ fn el0live_tick() {
 ///     `rewake`/`stay`, so `refresh` climbing with `rewake` flat is a fleet already in place.
 ///   * `margin` / `minpark` — the two thresholds those decisions were made against (runnable-resident
 ///     gap, and minimum park duration), so a reading is interpretable without the source.
+///   * VUGSPREAD (PARITY §6.6c) — `steal` / `d1` / `remig` / `cool` / `pack`: the OTHER correction
+///     lane, on the same line because `rewake` and `steal` answer one question between them.
+///     `rewake` can only correct a task that PARKS; `steal` is the only lane that can reach a task
+///     that never does, which is precisely the vug worker spinning through a frame. Read them as a
+///     set: `pack` is how often an idle core SAW a packed neighbour, `steal` how often it took one,
+///     `d1` how many of those the pre-arc constant floor would have refused (the floor repair's own
+///     attribution — a Pi that speeds up with `d1=0` was not sped up by the floor), `remig` how many
+///     went to a task that had already moved, and `cool` how many candidates the escalating brake
+///     passed over. HEALTH: `steal` stepping at convergence edges with `remig` near zero. CHURN, and
+///     the revert criterion for the relaxed floor: `remig` tracking `steal` while `cool` also
+///     climbs — brake refusing and serving the same oscillation. An idle battery with no EL0 and no
+///     backlog reads all five at or near zero, which is the wiring proof, exactly as the `live`
+///     columns' zero baseline is.
 ///
 /// Reads only, lock-free, safe from any core. Not `pi`-gated, matching `pulse5_witness` beside it: it
 /// is one introspection line on a path that already prints one, and the counters it reads exist on
 /// every aarch64 build (they simply stay zero where there is no EL0).
 fn spread4_witness() {
     serial_println!(
-        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms",
+        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms steal={} d1={} remig={} cool={} pack={}",
         el0_active(0),
         EL0_RESIDENTS[0].0.load(Ordering::Relaxed),
         el0_active(1),
@@ -7020,6 +7205,11 @@ fn spread4_witness() {
         SPREAD6_REFRESH.load(Ordering::Relaxed),
         REWAKE_MARGIN,
         REWAKE_MIN_PARK_MS,
+        SPREAD15_MOVES.load(Ordering::Relaxed),
+        SPREAD15_D1.load(Ordering::Relaxed),
+        SPREAD15_REMIG.load(Ordering::Relaxed),
+        SPREAD15_COOL.load(Ordering::Relaxed),
+        SPREAD15_PACK.load(Ordering::Relaxed),
     );
     spread7_witness();
     spread10_witness();
@@ -7464,6 +7654,89 @@ pub fn start_aps(online: &[usize]) {
     // WORK STEALING end to end — pile movable tasks on one core and prove idle siblings pull them over.
     #[cfg(all(feature = "pi", feature = "witness"))]
     smpbal_steal_witness();
+    // VUGSPREAD (PARITY §6.6c): the same machinery at the packing the OLD floor could not see. Runs
+    // immediately after, on the same drained fleet, for the same reason.
+    #[cfg(all(feature = "pi", feature = "witness"))]
+    vugspread_floor_witness();
+}
+
+// ---------------------------------------------------------------------------------------------
+// VUGSPREAD — the FLOOR leg of the steal witness (QEMU-testable, default-quiet)
+// ---------------------------------------------------------------------------------------------
+//
+// `smpbal_steal_witness` above piles FOUR movable tasks on one core. That is real work stealing, but
+// it is not this arc's case: with four staged, the home core's ready-queue depth is 3 the moment it
+// dispatches the first, and a flat floor of 2 already saw it. The packing VUGSPREAD exists for is
+// TWO runnable tasks on one core — a vug's parent and one worker, or any pair — where the moment the
+// home core dispatches one, its READY queue holds exactly ONE and every idle sibling reads that as
+// "not loaded" and walks away. That is the whole defect, and it is invisible to the old floor BY
+// CONSTRUCTION, which is why it survived ten minutes of a visibly lopsided machine on x86.
+//
+// So this leg stages exactly two. PASS iff the pair RAN on >= 2 distinct cores, which with a
+// single-core spawn can only happen through `try_steal`. A/B is decisive rather than statistical: on
+// the pre-arc constant floor the sibling's peek reads depth 1 < 2, declines, and the leg reports
+// `cores-used=1` on every boot.
+
+#[cfg(all(feature = "pi", feature = "witness"))]
+const VUGSPREAD_FLOOR_N: usize = 2;
+#[cfg(all(feature = "pi", feature = "witness"))]
+static VUGSPREAD_FLOOR_MASK: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(all(feature = "pi", feature = "witness"))]
+fn vugspread_floor_worker(_: usize) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    VUGSPREAD_FLOOR_MASK.fetch_or(1u32 << (cpu & 31), Ordering::Relaxed);
+    // Long enough that the home core is still RUNNING this one — the `CUR_PRIO != PRIO_NONE` the
+    // per-victim floor reads — while a sibling makes its idle pass and looks at the other.
+    busy_delay_ms(5);
+}
+
+/// VUGSPREAD — the floor-repair proof. Stage `VUGSPREAD_FLOOR_N` (2) steal-eligible tasks on ONE
+/// online core with the others idle in `run`, wait a bounded window, and PASS iff they ran on >= 2
+/// distinct cores. Emits `:: VUGSPREAD: floor test — tasks=N cores-used=M depth=1 :: PASS ::`.
+///
+/// The `depth=1` in the line is the point of the leg and not decoration: it names the victim depth
+/// the move had to clear, which is the number `[spread4] d1=` counts cumulatively on metal.
+#[cfg(all(feature = "pi", feature = "witness"))]
+pub fn vugspread_floor_witness() {
+    let online: alloc::vec::Vec<usize> = (0..NUM_CPUS)
+        .filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire))
+        .collect();
+    if online.len() < 2 {
+        serial_println!(
+            ":: VUGSPREAD: floor test SKIP (needs >= 2 online cores, have {}) ::",
+            online.len()
+        );
+        return;
+    }
+    let home = online[0];
+    VUGSPREAD_FLOOR_MASK.store(0, Ordering::Relaxed);
+    // STAGED, NOT BURST, and that is what makes the leg an A/B instead of a coin flip. Pushing both
+    // at once leaves a window in which `home` has not dispatched either and its queue reads depth 2
+    // — which the OLD constant floor also cleared, so a pass could come from the pre-arc path. Let
+    // the first one get PICKED UP first: from the instant the second is queued, `home` is running
+    // task one (`CUR_PRIO != PRIO_NONE`) with exactly ONE ready behind it, which is the state the
+    // constant floor refuses and the per-victim floor admits. The 2 ms gap is bounded well inside
+    // the worker's 5 ms spin, so task one is still on-core when task two lands.
+    spawn_stealable_on("vugfloor", vugspread_floor_worker, 0, home);
+    busy_delay_ms(2);
+    for _ in 1..VUGSPREAD_FLOOR_N {
+        spawn_stealable_on("vugfloor", vugspread_floor_worker, 0, home);
+    }
+    busy_delay_ms(60);
+    let mask = VUGSPREAD_FLOOR_MASK.load(Ordering::Relaxed);
+    let used = mask.count_ones() as usize;
+    if used >= 2 {
+        serial_println!(
+            ":: VUGSPREAD: floor test — tasks={} cores-used={} depth=1 :: PASS ::",
+            VUGSPREAD_FLOOR_N, used
+        );
+    } else {
+        serial_println!(
+            ":: VUGSPREAD: floor test — tasks={} cores-used={} depth=1 :: FAIL ::",
+            VUGSPREAD_FLOOR_N, used
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -7584,6 +7857,8 @@ fn spawn_stealable_on(name: &'static str, entry: fn(usize), arg: usize, cpu: usi
         user_sp: 0,
         user_ttbr0: 0,
         steal_ok: true, // the point of the fixture: movable, but staged on one core
+        migrations: 0,  // VUGSPREAD: never migrated; `try_steal` bumps it
+        migrate_ms: 0,  // VUGSPREAD-COOL: never migrated => this fixture's first steal is never delayed
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
         place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
         wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it

@@ -2322,6 +2322,76 @@ all. The x86 legs prove the code type-checks and the witness is bounded; the pla
 behaviour itself is metal-only, and is stated so rather than dressed in a gate that cannot
 fail.
 
+### The steal half, ported to the Pi (aarch64, VUGSPREAD-PI)
+
+`exec-vugspread`, closing PARITY.md §6.6c. The full write-up — including the piece-by-piece verdict
+on each half of x86's VUGSPREAD and the corrected reading of the metal capture the arc was opened on
+— is [PARITY.md §6.7](../08_VIDEO/PARITY.md). What belongs here is the scheduler mechanics.
+
+**The gap was not "the Pi has a worse scheduler".** For PLACEMENT the Pi has a considerably more
+elaborate one: SPREAD-3…SPREAD-14 above have no x86 twin. What it lacked is the correction x86 does
+with `try_steal`, and the reason the two are not interchangeable is one sentence: **`make_ready` →
+`rewake_place` can only correct a task that SLEEPS.** SPREAD-6's escapement already saw part of this
+and put micro-park wakes on a 250 ms re-ask clock, but a thread that is genuinely CPU-bound between
+presents — a vug worker ray-tracing its share of the shard — does not park at all, never reaches
+`make_ready`, and its spawn-time core was therefore permanent.
+
+**Three changes, and the third is the one a port would drop.**
+
+1. **`spawn_user_thread` is `steal_ok = true`.** A ring-3 `place` argument is a locality HINT in the
+   only vocabulary `SYS_THREAD_SPAWN` has; marking the resulting core a PIN promoted it into a kernel
+   guarantee. The old justification — "EL0/slot tasks carry per-core TTBR0/ASID state" — had been
+   false since SPREAD-4, which MOVES parked EL0 tasks between cores and writes out why that is sound
+   (`user_ttbr0` is a value the task carries, `dispatch_next` installs it on whichever core runs the
+   task, the old core's residual root is benign because slot L1s are a static array and teardown
+   broadcasts `tlbi aside1is`). EL0 **slots** stay pinned deliberately: a windowed app parks on input
+   every frame, so the rewake lane genuinely serves it.
+
+2. **The floor is per-victim** (`sched_spread::steal_floor`), not the constant `STEAL_MIN_DEPTH = 2`.
+   A run queue holds only READY tasks — the running task is in `current` — so a flat floor of 2 needs
+   THREE runnable tasks before a core reads as loaded, and two-on-one packing sits at depth ONE.
+   Victim running ⇒ floor 1; victim between tasks ⇒ floor 2, which is the ping-pong case the constant
+   was actually reaching for. The floor is re-asked under the victim's own lock, not carried from the
+   peek: the victim may have gone idle in between, and then the stricter floor is the right one.
+
+3. **The SPREAD accounting is carried across the move.** `try_steal` retargets `task.cpu`; on x86
+   that is the whole re-home. Here it is not. SPREAD-3's `EL0_RESIDENTS` and SPREAD-10's
+   `SLOT_CORE_RES` are commitments released at exit **against `task.cpu`**, so a stolen EL0 thread
+   whose credit stayed behind would grow the old core's count without bound and saturate the new
+   core's at zero — and every subsequent `pick_cpu_slot` and `rewake_place` decision would steer
+   around load that is not there, permanently. Both credits transfer at re-home in `make_ready`'s
+   order (resident, then slot), and `place_cyc` is re-stamped because a steal IS a placement decision
+   — without that, the task's next wake finds a stale refresh clock and re-asks immediately, fighting
+   the move just made. `EL0_PARKED` needs no transfer: a task in a run queue is READY by construction.
+
+**The brake is not optional.** VUGSPREAD-COOL (per-task `migrations` + `migrate_ms`, window
+`16 ms << min(migrations, 4)`) is what makes the relaxed floor safe, and it is the half that matters
+on an IDLE machine: with the floor at 1 there is almost always something to take, so without the
+brake two empty cores trade one task forever. `migrate_ms == 0` always clears, so the FIRST corrective
+steal — the repair itself — is never delayed; only re-steals are damped.
+
+**What moved to shared code.** The policy above was `const`s and `fn`s inside `arch/x86_64/sched.rs`,
+which is precisely why the Pi never had it. It is now `crates/kernel/src/sched_spread.rs`
+(`STEAL_MIN_DEPTH`, `STEAL_COOLDOWN_MS`, `STEAL_COOLDOWN_ESC_CAP`, `steal_floor`, `steal_cooldown_ms`,
+`steal_cooled`), with no `cfg(target_arch)` in the file. Both schedulers call in; each keeps only what
+is genuinely arch-bound (how you ask "is this core running something", where milliseconds come from).
+x86 behaviour is unchanged — its constants became re-exports and its functions one-line delegations.
+
+**Witness.** `[spread4]` gains `steal= d1= remig= cool= pack=` on the same line as `rewake=`/`stay=`,
+because `rewake` and `steal` are two lanes of one question and a spinning worker can only appear in
+the second. `d1` is the floor repair's own attribution — moves taken from a victim at locked depth 1,
+i.e. the ones the constant would have refused. Health is `steal` stepping at convergence edges with
+`remig` near zero; the revert criterion is `remig` tracking `steal` while `cool` also climbs, which
+is a brake refusing and serving the same oscillation. Per-move lines read
+`:: [smpbal] steal 'name' cX->cY (m=N) ::`.
+
+**QEMU gates this one, and decisively.** `VUGSPREAD: floor test` stages exactly TWO steal-eligible
+tasks on one core with the rest idle and requires them to run on >= 2 distinct cores. On the pre-arc
+floor that reads `cores-used=1` on every boot, not occasionally — the leg is an A/B, not a sample.
+(The `[spread4]` census itself still reads all-zero in the battery, for the reason its own comment
+gives: the only site that emits it on raspi4b runs before any EL0 task exists. The numbers that matter
+are metal.)
+
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
 **SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.
