@@ -16653,6 +16653,8 @@ fn closeiso_selftest() {
     // The app whose window the operator closes, and the ordinary-owner control row.
     const ASID_APP: u64 = 0xE2A;
     const ASID_FORCED: u64 = 0xE2F;
+    /// DECRUD-4's overlapper: an ordinary owner, so the teardown sweep can reap it.
+    const ASID_OVER: u64 = 0xE2C;
 
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
@@ -16674,7 +16676,6 @@ fn closeiso_selftest() {
     let sf = &raw const FV_SURF_B as usize;
     let len = core::mem::size_of_val(&FV_SURF_A);
     let (k_col, a_col, f_col) = (HT_SURF[0], FV_SURF_A[0], FV_SURF_B[0]);
-    let _ = a_col;
 
     // Tiled, not pinned: the tiler lays these out without overlap by construction, and a close
     // re-tiles the survivors — which is the real shape (no ring-3 program moves its own window) and
@@ -16776,6 +16777,85 @@ fn closeiso_selftest() {
     let back_px = sample(wk);
     let back_ok = back_visible && back_px == k_col;
 
+    // ── DECRUD-4: UNCOVER-REPAINT — **does closing a window over a FURNITURE row give the furniture
+    // its pixels back, or leave a HOLE in it?** ──────────────────────────────────────────────────
+    //
+    // Peter, on metal, this boot: a fixture window opened and closed over the console window and left
+    // an UNPAINTED HOLE in the console beneath it, which clicking did not repair. Every close witness
+    // in this file asks the WC-J question — "did the closed window's own box come back as DESKTOP?" —
+    // and that question cannot see this defect at all. It is the exact complement: the box a close
+    // vacates is only desktop-coloured where nothing was UNDER it, and where something WAS, the
+    // vacated box has to come back as THAT WINDOW. `reclaim` does `erase` (paint desktop) and then
+    // `damage_intersecting`, and the repaint of the uncovered row rides entirely on that second half:
+    // if the damage flag is set and then eaten by a composite that runs before the window is redrawn,
+    // the erase has already happened and the hole is permanent. Clicking does not repair it because a
+    // click marks no damage on a row it does not move.
+    //
+    // The leg is stated against a KERNEL-BAND row deliberately — `wk` is furniture, the same class as
+    // the console window Peter saw the hole in — and it is three reads:
+    //   1. `base`     — `wk`'s content origin reads `wk`'s colour, with nothing over it.
+    //   2. `occluded` — the overlapper is really on top (a leg that could not occlude would pass 3
+    //                   trivially, which is the way this witness could otherwise convict nothing).
+    //   3. `restored` — after `close(wo)`, that same pixel is `wk`'s colour AGAIN. NOT `DESKTOP_BG`:
+    //                   desktop there IS the hole, and is the failure this leg exists to name.
+    //
+    // `wk` is pinned for the duration and unpinned after. Without that, `close(wo)` re-tiles the
+    // unpinned survivors, `wk` MOVES out from under the hole, and read 3 passes on a broken tree —
+    // the vacuity this fixture's siblings have been convicted for before.
+    let occ_ok = {
+        let kb0 = info_box(wk);
+        let wo = create(ASID_OVER, sa, len, 8, 8, 32, b"ci-o");
+        match (kb0, wo) {
+            (Some(kb), w) if w != WIN_NONE => {
+                {
+                    let mut t = table();
+                    if let Some(r) = row_mut(&mut t, wk) {
+                        r.pinned = true;
+                    }
+                }
+                // Origin-on-origin: whatever the panel's scale, the overlapper's box then contains
+                // `wk`'s content origin, so the sampled pixel is one the overlapper genuinely covers.
+                let _ = move_to(w, kb.0, kb.1);
+                present(w);
+                let occluded = sample(wk) != k_col;
+                let reaped_o = close(w);
+                let restored = sample(wk) == k_col;
+                {
+                    let mut t = table();
+                    if let Some(r) = row_mut(&mut t, wk) {
+                        r.pinned = false;
+                    }
+                }
+                if !(occluded && restored) {
+                    serial_println!(
+                        "[wc-iso] uncover-repaint occluded={} restored={} px={:#08x} want={:#08x} desktop={:#08x} reaped={} -> FAIL",
+                        occluded, restored, sample(wk), k_col, DESKTOP_BG, reaped_o
+                    );
+                }
+                occluded && restored && reaped_o
+            }
+            _ => {
+                serial_println!("[wc-iso] uncover-repaint -> SKIP (no row)");
+                close(wo);
+                true
+            }
+        }
+    };
+
+    // DECRUD-3 — **the FURNITURE row this fixture minted is REAPED, and the reap is ASSERTED.**
+    //
+    // `wk` is a `KERNEL_OWNER_CONSOLE`-band row, and the CLOSEISO contract this very fixture proves
+    // (leg 3, `refuse_ok` above) is that `close_owner` REFUSES the kernel band. So the owner-scoped
+    // sweep below is structurally blind to `wk` — exactly the vacuity `ctrldecline_selftest`'s
+    // CTRLWIT-REVIEW convicted in its own teardown — and `close` by id, which has no such refusal, is
+    // the only thing that can reap it. That call used to be an unchecked statement at this file's
+    // tail: on a desktop boot the panel would then be carrying a second kernel-band row that no
+    // gesture can remove (`close_owner` refuses it, and the operator's close disc routes through
+    // `close_owner`), for the rest of the boot, and NOTHING on the wire would have said so. It is
+    // asserted now, on the same terms as `ctrldecline` leg 6: the return AND the row's absence,
+    // because a `true` from a function that also composites is weaker evidence than the table itself.
+    let reaped_k = close(wk) && info_box(wk).is_none();
+
     let ok = base_k
         && base_f
         && iso_ok
@@ -16785,19 +16865,39 @@ fn closeiso_selftest() {
         && refuse_ok
         && ctrls_ok
         && park_ok
-        && back_ok;
+        && back_ok
+        && occ_ok
+        && reaped_k;
     serial_println!(
-        "[wc-iso] close-iso base_k={} base_f={} closed={}/{} isolate={:#08x}/{} forced={:#08x}/{} table_visible={} refuse={}/{} ctrls min={} zoom={} close={} park={}/{:#08x}/{} restore={}/{:#08x}/{} -> {}",
+        "[wc-iso] close-iso base_k={} base_f={} closed={}/{} isolate={:#08x}/{} forced={:#08x}/{} table_visible={} refuse={}/{} ctrls min={} zoom={} close={} park={}/{:#08x}/{} restore={}/{:#08x}/{} uncover={} reaped={} -> {}",
         base_k, base_f, closed, closed_ok, got_k, iso_ok, got_f, forced_ok, table_ok,
         refused, refuse_ok,
         ctrl_min, ctrl_zoom, ctrl_close,
         park, parked_px, park_ok,
         back_visible, back_px, back_ok,
+        occ_ok,
+        reaped_k,
         if ok { "PASS" } else { "FAIL" }
     );
 
-    close(wk);
     close(wf);
+    // DECRUD-3 — the teardown guard `hittest_selftest` established and this fixture never had: no
+    // synthetic row may outlive the battery, and a leak may not be SILENT. `wa` is deliberately not
+    // closed anywhere above — it is reaped by the very `close_owner(ASID_APP)` gesture under test at
+    // leg 2 — so if that leg ever regressed to freeing zero rows, `ci-a` would survive to the desktop
+    // and only `closed_ok` (a verdict bit, not a reap) would have noticed. The sweep costs two calls
+    // and turns that into a named FAIL. `KERNEL_OWNER_CONSOLE` is NOT swept: it is the live console's
+    // own owner on a desktop boot, and CLOSEISO refuses the band anyway — `reaped_k` above owns `wk`.
+    let mut leaked = 0usize;
+    for a in [ASID_APP, ASID_FORCED, ASID_OVER] {
+        leaked += close_owner(a);
+    }
+    if leaked > 0 {
+        serial_println!(
+            "[wc-iso] close-iso teardown LEAK — {} synthetic row(s) reaped :: FAIL ::",
+            leaked
+        );
+    }
     // Same restore its neighbours make: the shell back at the bottom, focus back to the shell, and the
     // live set repainted — this leg's `focus_changed(0)` pushed every OTHER live window under the
     // shell too, and `composite_inner` has already eaten their damage flags.
