@@ -414,6 +414,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // ownership is structural rather than hoped for. See `input_router_selftest` for the race this
         // placement closes.
         input_router_selftest();
+        // SERIAL-FOCUS: the source-split fixture, immediately after the router selftest and for the
+        // same structural reason — it fakes GUI focus onto an ASID and must be the only owner of the
+        // global focus while it measures. It runs SECOND because `input_router_selftest` asserts a
+        // `GUI_SENT` delta of its own, and this one must not perturb that window.
+        #[cfg(feature = "witness")]
+        serial_focus_selftest();
 
         unaos_kernel::arch::sched::start_aps(&online);
 
@@ -2613,9 +2619,19 @@ fn jd2_console_pump(_arg: usize) {
 /// The input thread `send`s Key events; the render thread `recv`s them — a cross-core handoff (the two
 /// run on different APs), dogfooding the M4 `Channel`. Capacity 64 matches the old event ring; a full
 /// channel applies backpressure to the input thread rather than dropping keystrokes.
+///
+/// SERIAL-FOCUS — "backpressure to the input thread" is the right policy for a HID producer that can
+/// be made to wait, and it was the wrong one for the SERIAL CONSOLE, whose consumer parks for the
+/// whole life of a foreground command. Serial no longer rides this channel as payload at all; see
+/// `serial_to_shell`. The capacity is unchanged and the HID path is untouched.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static GUI_CHANNEL: unaos_kernel::arch::sched::Channel<unaos_kernel::pal::Event> =
-    unaos_kernel::arch::sched::Channel::new(64);
+    unaos_kernel::arch::sched::Channel::new(GUI_CHANNEL_CAP as usize);
+
+/// SERIAL-FOCUS — `GUI_CHANNEL`'s capacity, named so the wake-headroom test in `serial_to_shell` is
+/// derived from the channel rather than from a repeated literal that a later resize would desync.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const GUI_CHANNEL_CAP: u64 = 64;
 
 /// SCHED-X86: the x86 twin of `GUI_CHANNEL` — the input service `send`s, the render service `recv`s,
 /// across two different application processors. Same capacity (64) and the same backpressure
@@ -2759,6 +2775,69 @@ static CLICK2_LEFT_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::
 fn gui_send(ev: unaos_kernel::pal::Event) {
     GUI_SENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     GUI_CHANNEL.send(ev);
+}
+
+/// SERIAL-FOCUS — at most ONE wake token from the serial console is outstanding in `GUI_CHANNEL` at
+/// any instant. Set when `serial_to_shell` posts one, cleared by the render task's drain.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static SERIAL_WAKE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// SERIAL-FOCUS — how much of the 64-slot `GUI_CHANNEL` must be free before the serial console is
+/// allowed to post its wake token. 16 slots of headroom against a producer set of exactly three
+/// (`usb_pump`'s forward, `status-tick`'s 1 Hz pulse, and this one token) makes the `send` below
+/// non-blocking by measurement rather than by hope — and when the headroom is not there the token is
+/// simply not sent, which costs latency and never a wait.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const SERIAL_WAKE_HEADROOM: u64 = 16;
+
+/// SERIAL-FOCUS — **THE PRODUCER SIDE OF THE SOURCE SPLIT.** One byte off the PL011, on its way to
+/// the shell and to nowhere else.
+///
+/// This replaces `gui_send(Event::Key(byte))`, which was the whole blocker (see the module header on
+/// `arch::aarch64::serial::shell_inbox` for the two-part failure it produced). The byte goes into
+/// the shell's own bounded inbox, which is not focus-routed and has no blocking edge; `GUI_CHANNEL`
+/// now carries no serial PAYLOAD at all, only — at most, and only when it provably cannot block — a
+/// single coalesced WAKE token to unpark the render task from `recv`.
+///
+/// THE THREE REASONS A TOKEN IS WITHHELD, and why each one is safe rather than a dropped keystroke:
+///
+///   * ALREADY PENDING. A token is in flight; the drain it will trigger takes the whole ring, not
+///     one byte. This is what makes a storm cost the channel ONE slot no matter how many bytes
+///     arrive — the property the brief asks for, and the reason a serial storm cannot jam the GUI
+///     channel: the storm never travels on that channel.
+///   * `SCREEN_APP_ACTIVE`. The render task is parked inside `dispatch_command` and cannot `recv` at
+///     all; a token would sit in the channel unread. The drain in `render_service` is placed AFTER
+///     the `match`, so the pass that returns from `dispatch_command` drains the backlog before it
+///     parks again — delivery is immediate on the app's exit without any token.
+///   * NO HEADROOM. The channel is fuller than `SERIAL_WAKE_HEADROOM` allows. A `send` here is the
+///     only blocking call on this path and this is the check that refuses it. The bytes wait; the
+///     next event of any kind (a pointer report, a USB key, the ~1 Hz strip `Timer`) runs the drain.
+///
+/// In every withheld case the bytes are already SAFE in the ring, in order, and the flag is left
+/// false so the next byte re-tries the wake. Nothing is lost by withholding; only latency is spent.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn serial_to_shell(byte: u8) {
+    use core::sync::atomic::Ordering;
+    if !unaos_kernel::arch::serial::shell_inbox::offer(byte) {
+        return; // ring full — dropped and counted; the `[serfocus]` census says so on the wire
+    }
+    if SCREEN_APP_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    let depth = GUI_SENT
+        .load(Ordering::Relaxed)
+        .wrapping_sub(GUI_RECV.load(Ordering::Relaxed));
+    if depth + SERIAL_WAKE_HEADROOM >= GUI_CHANNEL_CAP {
+        return;
+    }
+    if !SERIAL_WAKE_PENDING.swap(true, Ordering::AcqRel) {
+        // `Event::Timer` deliberately, rather than a new variant: the render task already handles it
+        // as "recompose the strip if its content changed", `ui_status::tick` paces that to 1 Hz
+        // internally so a burst costs nothing, and the shared `pal::Event` enum — which every arch
+        // and both routers read — gains not one line for this arc.
+        gui_send(unaos_kernel::pal::Event::Timer);
+    }
 }
 
 /// FOCUS-VIS — panel dimensions for the router's cursor keep-alive, read straight from the scan-out
@@ -3001,6 +3080,148 @@ fn input_router_selftest() {
             "[uvug8] takeover deadline — push_no_engage={} stale_dropped={} live_suspends={} suspend_holds={} hung_releases={} other={} unlatched={} rearm_fresh={} rearm_fires={} cleared={} :: FAIL ::",
             push_does_not_engage, stale_dropped, live_suspends, suspend_holds, hung_releases,
             other_asid_ignored, unlatched_ignored, rearm_fresh, rearm_fires, takeover_cleared
+        );
+    }
+}
+
+/// SERIAL-FOCUS QEMU witness — **prove the source split with a focused EL0 window holding the
+/// keyboard**, which is the exact state the blocker names.
+///
+/// HONEST QEMU NOTE, in the shape `input_router_selftest` established for the same reason: the real
+/// edge this arc is about — a byte arriving on the PL011 RX FIFO — cannot be produced under
+/// `raspi4b`, whose `-serial file:` chardev is write-only. There is nothing to type with. So this
+/// drives the pipeline from the seam `input_service` calls (`shell_inbox::offer`, the first line of
+/// `serial_to_shell`) rather than from the wire, exactly as the router selftest drives the router
+/// from `push_event` rather than from a USB keypress. Everything downstream of that seam — the
+/// routing, the bound, the ordering, the accounting — is the production code, unmodified.
+///
+/// The four legs, and what each one would have shown before this arc:
+///
+///   (A) FOCUS DOES NOT DIVERT. With `user_input_active()` set to a live-looking ASID — a focused
+///       EL0 window owning the keyboard — offer a run of bytes, then run the REAL router drain
+///       (`route_input_to_active_el0`, the same call `pump_usb_into_gui` makes). It must route
+///       ZERO: serial bytes are not in `EVENT_QUEUE`, so the focus ruling cannot reach them. Before
+///       the arc a serial byte that came through `pump_and_poll` WAS in `EVENT_QUEUE` and this
+///       would have routed every one of them into the window's ring.
+///
+///   (B) ORDER, EXACTLY. Drain the inbox and compare against the sequence that was offered, byte
+///       for byte. "Ordering within the serial stream is preserved" is a claim about a ring with a
+///       wrapping head, so it is checked across a wrap (the run is offered twice, with a drain
+///       between, at an offset that puts the second run across the CAP boundary).
+///
+///   (C) THE STORM IS BOUNDED AND CANNOT JAM THE GUI CHANNEL. Offer `CAP + OVER` bytes with no
+///       consumer running. `offer` must return without ever blocking (it returns at all, which is
+///       the assertion — the pre-arc `Channel::send` would have parked this task forever at byte
+///       65 with no consumer), it must accept exactly `CAP` and refuse exactly `OVER`, the refusals
+///       must be accounted in `dropped`, and — the property the brief names — `GUI_SENT` must be
+///       UNCHANGED across the whole storm. Not "bounded"; ZERO. The storm does not travel on
+///       `GUI_CHANNEL` at all.
+///
+///   (D) WHAT SURVIVES A STORM IS A PREFIX. Drain the storm-filled ring and confirm the bytes are
+///       the FIRST `CAP` offered, in order — the drop-newest policy stated in the `shell_inbox`
+///       header. A drop-oldest ring would pass (C) and fail here, and would submit mangled command
+///       lines to the shell on a real overflow.
+///
+/// Runs once on the BSP from the `start_aps` block, before the secondaries exist — the same
+/// placement, and for the same ownership reason, as `input_router_selftest` (see INROUTE there).
+/// Restores focus 0 and resets the ring's counters on the way out, so the boot's own `[serfocus]`
+/// census starts from zero and never inherits this window.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+fn serial_focus_selftest() {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::arch::aarch64::syscall as sc;
+    use unaos_kernel::arch::serial::shell_inbox as inbox;
+
+    const RUN: usize = 24;
+    const OVER: usize = 37; // deliberately not a divisor of CAP — a wrong bound cannot alias to right
+    let sent0 = GUI_SENT.load(Ordering::Relaxed);
+    inbox::test_reset();
+
+    // (A) A focused EL0 window owns the keyboard for the whole of this test.
+    sc::user_input_set_active(1);
+    for i in 0..RUN {
+        inbox::offer(b'a'.wrapping_add(i as u8));
+    }
+    let focus_live = sc::user_input_active() != 0;
+    let routed_away = route_input_to_active_el0();
+    let held_after_router = inbox::held();
+
+    // (B) Order across a wrap. Drain the first run, then offer a second run positioned so it
+    // straddles the CAP boundary, and drain that too.
+    let mut order_ok = true;
+    for i in 0..RUN {
+        order_ok &= inbox::take() == Some(b'a'.wrapping_add(i as u8));
+    }
+    let drained_clean = inbox::take().is_none();
+    // Advance the head to CAP-8 so the next run wraps: offer and drain (CAP - 8 - RUN) bytes.
+    let advance = inbox::CAP - 8 - RUN;
+    for _ in 0..advance {
+        inbox::offer(0);
+    }
+    for _ in 0..advance {
+        inbox::take();
+    }
+    for i in 0..RUN {
+        inbox::offer(b'A'.wrapping_add(i as u8));
+    }
+    let mut wrap_ok = true;
+    for i in 0..RUN {
+        wrap_ok &= inbox::take() == Some(b'A'.wrapping_add(i as u8));
+    }
+
+    // (C) The storm. No consumer; `offer` must stay total.
+    inbox::test_reset();
+    let sent_before_storm = GUI_SENT.load(Ordering::Relaxed);
+    let mut took = 0usize;
+    let mut refused = 0usize;
+    for i in 0..(inbox::CAP + OVER) {
+        if inbox::offer((i % 251) as u8) {
+            took += 1;
+        } else {
+            refused += 1;
+        }
+    }
+    let storm_gui_delta = GUI_SENT.load(Ordering::Relaxed).wrapping_sub(sent_before_storm);
+    let (_, _, dropped, high) = inbox::census();
+    let storm_bounded = took == inbox::CAP && refused == OVER && dropped == OVER as u64
+        && high == inbox::CAP as u64 && storm_gui_delta == 0;
+
+    // (D) What survived is the FIRST CAP bytes, in order.
+    let mut prefix_ok = true;
+    for i in 0..inbox::CAP {
+        prefix_ok &= inbox::take() == Some((i % 251) as u8);
+    }
+    let storm_drained_clean = inbox::take().is_none();
+
+    // Restore: no user focus for the real boot, counters zeroed for the live census.
+    sc::user_input_set_active(0);
+    inbox::test_reset();
+    let gui_delta = GUI_SENT.load(Ordering::Relaxed).wrapping_sub(sent0);
+
+    serial_println!(
+        "[serfocus] split window — focus_live={} routed_away={} held_after_router={} order={} wrap={} took={} refused={} dropped={} high={} storm_gui_delta={} gui_delta={} cap={}",
+        focus_live as u8, routed_away, held_after_router, order_ok as u8, wrap_ok as u8,
+        took, refused, dropped, high, storm_gui_delta, gui_delta, inbox::CAP
+    );
+    if focus_live
+        && routed_away == 0
+        && held_after_router == RUN
+        && order_ok
+        && drained_clean
+        && wrap_ok
+        && storm_bounded
+        && prefix_ok
+        && storm_drained_clean
+        && gui_delta == 0
+    {
+        serial_println!(
+            "[serfocus] split — serial reaches the shell with an EL0 window focused (router routed 0), order preserved across a wrap, storm bounded at cap with GUI_CHANNEL untouched :: PASS ::"
+        );
+    } else {
+        serial_println!(
+            "[serfocus] split — focus_live={} routed_away={} held={} order={} clean={} wrap={} storm={} prefix={} storm_clean={} gui_delta={} :: FAIL ::",
+            focus_live as u8, routed_away, held_after_router, order_ok as u8, drained_clean as u8,
+            wrap_ok as u8, storm_bounded as u8, prefix_ok as u8, storm_drained_clean as u8, gui_delta
         );
     }
 }
@@ -3508,6 +3729,14 @@ fn piusb24_pointer_witness(dx: i32, dy: i32, buttons: Option<u8>) {
 ///     the endpoint that generates by far the most traffic. That file is outside this arc's lane, so this arc
 ///     instruments the question rather than changing the driver; P55's reading of these two counters decides it.
 /// Rate-limited to ~2 s and printed only when something actually arrived, so an idle shell stays silent.
+///
+/// SERIAL-FOCUS — SCOPE NOTE, so a capture is never over-read. This line speaks for the FOCUS-ROUTED
+/// carrier and for nothing else: `EVENT_QUEUE -> GUI_CHANNEL` is the USB HID path, and its `key=`
+/// counter has never included, and now structurally cannot include, a byte from the serial console.
+/// Serial is consumed ahead of the routing decision this drain implements and delivered on its own
+/// carrier; `[serfocus]` is its census. A boot where the operator drives the box over the wire will
+/// therefore show `[serfocus] delivered=` climbing with this line's `key=` flat, and that pairing is
+/// the arc working, not a keyboard that stopped.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn uvug9_shell_input_witness(is_key: bool) {
     use core::sync::atomic::Ordering;
@@ -3525,6 +3754,74 @@ fn uvug9_shell_input_witness(is_key: bool) {
             "[uvug9] shell-path input key={} ptr={} (EVENT_QUEUE -> GUI_CHANNEL)",
             UVUG9_SHELL_KEYS.load(Ordering::Relaxed),
             UVUG9_SHELL_PTRS.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// SERIAL-FOCUS — ms() of the last `[serfocus]` census line, rate-limiting it to ~2 Hz. 0 = never.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static SERFOCUS_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SERIAL-FOCUS — latched once the FIRST serial byte has been delivered to the shell, so the boot
+/// states the fact once, with the focus that was live at that instant, rather than only in a rollup.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static SERFOCUS_FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// SERIAL-FOCUS — **THE CENSUS, and the line the next bench sitting reads.**
+///
+/// `[uvug9] shell-path input … (EVENT_QUEUE -> GUI_CHANNEL)` above is the witness that NAMED this
+/// blocker, and it can only ever speak for the focus-routed carrier. It has no vocabulary for the
+/// serial console, because before this arc the serial console had no carrier of its own — its bytes
+/// were `Event::Key`s indistinguishable from HID by the time anything counted them. This is that
+/// missing half: the same question ("did input reach the shell, and how much") asked of the SOURCE
+/// the `[uvug9]` line cannot see.
+///
+/// `accepted` is what the ring took off the wire, `delivered` is what the shell's key path actually
+/// consumed, `dropped` is what a full ring refused, and `high` is the ring's watermark. The
+/// invariant a capture can check without any other line: `accepted == delivered + held`, always. A
+/// non-zero `dropped` is a capacity reading and not a fault — it says the shell was parked for more
+/// than `CAP` bytes of traffic — but it is never silent, which is the entire point of counting it.
+/// `focus` is `user_input_active()` AT THE MOMENT OF DELIVERY, and it is the field that proves the
+/// arc: a line reading `focus=<non-zero>` with `delivered` climbing IS the claim "a focused EL0
+/// window holds the keyboard and the serial wire still drives the shell", stated on the wire.
+///
+/// DEFAULT-QUIET, and why this family is NOT `witness`-gated when so many are. The law's concern is
+/// instruments people learn to ignore, and the test it applies is whether a family speaks on boots
+/// that are not asking it anything. This one is silent on every such boot BY CONSTRUCTION: it prints
+/// only when a serial byte is actually delivered to the shell, so it emits exactly zero lines on
+/// every gate in the battery (QEMU raspi4b's `-serial file:` chardev is write-only — nothing can be
+/// typed) and zero lines on any metal boot nobody is typing on. Gating it on `witness` would instead
+/// mean the ONE configuration that can never produce it is the only one that carries the strings,
+/// and the flashable `./arroyo kernel8` image an attended bench actually boots would be mute for the
+/// arc written to unblock that bench. The QEMU verdict for this arc is carried by `[serfocus] split`
+/// (the fixture), which IS `witness`-gated in the ordinary way.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn serfocus_witness() {
+    use core::sync::atomic::Ordering;
+    let (accepted, delivered, dropped, high) =
+        unaos_kernel::arch::serial::shell_inbox::census();
+    let focus = unaos_kernel::arch::aarch64::syscall::user_input_active();
+    if !SERFOCUS_FIRST.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            "[serfocus] first serial byte delivered to the shell — focus={} app={} (SERIAL -> SHELL INBOX, focus not consulted) == witness ::",
+            focus,
+            SCREEN_APP_ACTIVE.load(Ordering::Relaxed) as u8
+        );
+    }
+    let now = unaos_kernel::arch::ms();
+    let last = SERFOCUS_LAST_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= 500 || last == 0 {
+        SERFOCUS_LAST_MS.store(now.max(1), Ordering::Relaxed);
+        serial_println!(
+            "[serfocus] serial-in accepted={} delivered={} dropped={} held={} high={} cap={} focus={} app={}",
+            accepted,
+            delivered,
+            dropped,
+            unaos_kernel::arch::serial::shell_inbox::held(),
+            high,
+            unaos_kernel::arch::serial::shell_inbox::CAP,
+            focus,
+            SCREEN_APP_ACTIVE.load(Ordering::Relaxed) as u8
         );
     }
 }
@@ -3681,8 +3978,15 @@ fn input_service(_: usize) {
             {
                 serial_println!(":: INPUT: PL011 RX interrupt live — keyboard is interrupt-driven ::");
             }
+            // SERIAL-FOCUS — THE SITE. This loop used to be `gui_send(Event::Key(byte))`, which is
+            // where the serial wire lost every argument with GUI focus: a blocking `send` into a
+            // channel whose consumer parks for the whole life of a foreground command. Now the byte
+            // goes to the shell's own inbox and the send, if it happens at all, is one coalesced
+            // wake token. Draining the FIFO to completion is unchanged and is now unconditionally
+            // safe — `serial_to_shell` has no blocking edge, so this loop can never stall holding a
+            // re-arm that the ISR is waiting on.
             while let Some(byte) = unaos_kernel::arch::poll_input() {
-                gui_send(unaos_kernel::pal::Event::Key(byte));
+                serial_to_shell(byte);
             }
             serial::rearm_rx_interrupt(); // re-enable IMSC (no ICR — keeps a straggler's timeout)
             // Close the drain/re-arm gap: if a byte landed meanwhile, wake ourselves to drain it
@@ -3709,8 +4013,13 @@ fn input_service(_: usize) {
         // GUI_CHANNEL, so an ungated 1 Hz post would slowly fill the 64-slot channel.
         let mut strip_pulse_ms = unaos_kernel::arch::ms();
         loop {
+            // SERIAL-FOCUS — the poll-nap twin of the interrupt branch's site above, same seam and
+            // same reasoning. (QEMU raspi4b's `-serial file:` chardev is write-only, so `poll_input`
+            // returns `None` on every pass here and this loop is inert for the whole gate battery —
+            // which is why the QEMU proof of this arc is the `[serfocus]` fixture, driven through
+            // the same `shell_inbox` seam, and not the wire.)
             while let Some(byte) = unaos_kernel::arch::poll_input() {
-                gui_send(unaos_kernel::pal::Event::Key(byte));
+                serial_to_shell(byte);
             }
             let now = unaos_kernel::arch::ms();
             if now.wrapping_sub(strip_pulse_ms) >= unaos_kernel::ui_status::PSTRIP_PERIOD_MS {
@@ -4063,6 +4372,50 @@ fn render_service(_: usize) {
                 strip_tick = true;
             }
             _ => {}
+        }
+        // SERIAL-FOCUS — **THE CONSUMER SIDE OF THE SOURCE SPLIT.** The shell's serial inbox is
+        // drained here, on every pass, unconditionally, and the bytes are dispatched through the
+        // SAME `handle_key` the USB keyboard reaches — into whichever surface `windowed` says the
+        // shell is on, so a serial keystroke and a USB keystroke can never disagree about where the
+        // shell lives. This is the "always reaches the shell" half of the arc: nothing here consults
+        // `user_input_active()`, because a byte that got this far was never in the focus-routed
+        // pipeline to begin with.
+        //
+        // POSITION IS THE DESIGN, and it is AFTER the `match`, not before it. The `Event::Key` arm
+        // above can enter `dispatch_command` and stay there for the whole life of a foreground
+        // command — the state in which `render_service` cannot `recv` and in which the pre-arc code
+        // deadlocked its own input task. Draining HERE means the very pass that returns from that
+        // command takes the entire backlog that accumulated during it, before parking again: a
+        // command typed over the wire while an app owned the panel executes the instant the app
+        // exits, with no wake token needed and no ~1 Hz strip pulse to wait for. Draining before the
+        // `match` would have missed exactly that case, which is the case the blocker is about.
+        //
+        // The flag is cleared BEFORE the drain, never after: a byte arriving mid-drain must be able
+        // to arm a fresh wake, or it could be the one that sits in the ring until the next unrelated
+        // event. Clearing after would swallow that arming.
+        //
+        // BOUNDED ON THIS SIDE TOO, at one ring-full per pass. `offer` can keep running on the input
+        // core while this drains, so an unbounded `while let` is a loop whose exit condition another
+        // task controls — the shape of every freeze this campaign has had to unpick. `CAP` is the
+        // most that can be owed at the top of any pass; anything offered after that is this pass's
+        // successor's work, and the ring still holds it in order.
+        SERIAL_WAKE_PENDING.store(false, core::sync::atomic::Ordering::Release);
+        let mut serial_budget = unaos_kernel::arch::serial::shell_inbox::CAP;
+        while serial_budget > 0 {
+            let Some(b) = unaos_kernel::arch::serial::shell_inbox::take() else { break };
+            serial_budget -= 1;
+            if windowed {
+                #[cfg(feature = "pidesk")]
+                {
+                    handle_key(b, &mut shell_console, &mut shell_pal);
+                    shell_dirty = true;
+                }
+            } else {
+                handle_key(b, &mut console, &mut pal);
+                dirty = true;
+                strip_dirty = true;
+            }
+            serfocus_witness();
         }
         // CURSOR-HIDE: take the sprite off the panel once when the auto-hide delay expires
         // (reappearance is instant — the move_rel/set_abs arms above stamp the activity clock before

@@ -1755,3 +1755,20 @@ FORBID :: SHARD-PRESS: .* :: FAIL ::
 # --- describes costs a whole investigation round, so the retired word is forbidden outright rather
 # --- than left to a REQUIRE that the knob-off battery cannot carry.
 FORBID \[menubar\] .* press=inert
+# --- SERIAL-FOCUS — the serial/USB SOURCE SPLIT (`[serfocus] split`, main::serial_focus_selftest).
+# --- FORBID and not REQUIRE, following the DRAG-PI precedent immediately above and for the same
+# --- arithmetic reason: the REQUIRED count stays 108 on both batteries, so this arc is a pure
+# --- addition to what the gate CATCHES and not a change to what it COUNTS. The fixture is
+# --- `witness`-gated and therefore present on both `kernel8-test` batteries (knob-off and
+# --- UNAOS_PIDESK=1 alike), so promoting this to a REQUIRE is a one-line change the integrator can
+# --- make at merge if a positive assertion is wanted; it is deliberately not made here, where it
+# --- would move the count the arc's DONE gate is stated against.
+# --- The verdict is a CONJUNCTION of four legs — with a focused EL0 window owning the keyboard the
+# --- real router (`route_input_to_active_el0`) must route ZERO serial bytes, order must survive a
+# --- ring wrap, a `CAP + 37` storm must be refused exactly at the bound with a `GUI_SENT` delta of
+# --- zero, and what survives that storm must be the first `CAP` bytes in order. Any one of them
+# --- regressing prints FAIL here and reds both batteries. In particular, re-routing serial back
+# --- through `EVENT_QUEUE` (the pre-arc shape) fails leg (A), and restoring the blocking
+# --- `Channel::send` fails leg (C) by hanging the fixture before it can print at all — which the
+# --- TRUNCATED verdict then reports honestly rather than as a pass.
+FORBID \[serfocus\] split .* :: FAIL ::

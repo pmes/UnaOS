@@ -365,3 +365,157 @@ pub fn on_rx_interrupt() {
     RX_IRQ_SEEN.store(true, core::sync::atomic::Ordering::Relaxed);
     RX_READY.post();
 }
+
+// ---- SERIAL-FOCUS: the shell's SERIAL INBOX (bare-metal Pi only) ---------------------------------
+//
+// THE BLOCKER THIS EXISTS TO REMOVE. Before this module the Pi's serial RX had exactly one
+// destination: `main::input_service` read a byte with `poll_input()` and posted it as an
+// `Event::Key` straight into `GUI_CHANNEL`. That is the SHELL's channel, which sounds right and is
+// not, for two reasons that compound:
+//
+//   (1) `GUI_CHANNEL`'s only consumer is `render_service`, and `render_service` PARKS inside
+//       `handle_key -> shell::dispatch_command` for the entire life of a foreground command — which
+//       includes `run <elf>`, the call that registers an EL0 window's ASID through
+//       `user_input_set_active` and thereby gives that window the keyboard. So in exactly the state
+//       the campaign cares about — a focused EL0 window — the channel's consumer is asleep. The
+//       first 64 serial bytes queue where nothing will read them; the 65th blocks the input task
+//       inside `Channel::send` (a `Semaphore::wait` with NO deadline). The serial wire is then dead
+//       for the rest of the program's run, and the input task with it. That unbounded wait on a
+//       parked consumer is the freeze family, reached from the UART instead of from the compositor.
+//
+//   (2) A byte that reaches `pal::EVENT_QUEUE` at all — `pal::pump_and_poll`'s aarch64 arm used to
+//       put it there — is INDISTINGUISHABLE from a decoded USB HID key by the time it meets the
+//       `[uvug9]` routing decision in `main::pump_usb_into_gui`. With `user_input_active() != 0`
+//       that decision hands the event to `route_input_to_active_el0()`, i.e. to the focused
+//       window's per-process ring. The ruling that a focused EL0 window owns the keyboard is
+//       CORRECT and stands untouched — but it was silently annexing the serial console with it.
+//
+// THE SPLIT IS BY SOURCE, AND IT IS MADE BY CONSTRUCTION RATHER THAN BY A PREDICATE. There is no
+// `source` tag threaded through `pal::Event`, and deliberately so: a tag is a field every future
+// router has to remember to test, and the one that forgets is a regression nobody sees until the
+// bench. Instead the serial byte NEVER ENTERS the focus-routed pipeline at all. It is consumed
+// BEFORE the focus decision, into this ring, whose only consumer is the shell's key path in
+// `render_service`. USB HID keeps `EVENT_QUEUE` and every line of its focus routing exactly as it
+// is — this module adds zero lines inside `pump_usb_into_gui`'s routing branches — so "the focused
+// EL0 window owns the USB keyboard" and "serial always reaches the shell" are now two statements
+// about two disjoint carriers, and neither can be broken by editing the other.
+//
+// BOUNDED, AND THE PRODUCER NEVER WAITS. `offer` is total: it takes the byte or refuses it and says
+// so, in O(1), under a spin lock held across a single array store. It has no blocking edge anywhere,
+// which is the property (1) above was missing. A storm of serial input therefore cannot jam
+// `GUI_CHANNEL` — the storm does not travel on `GUI_CHANNEL` at all; at most ONE coalesced wake
+// token does (see `main::serial_to_shell`).
+//
+// CAPACITY, with the arithmetic. 512 bytes. The shell's line editor consumes a byte per keystroke
+// and a command line is ~80 columns, so this holds ~6 full command lines pasted back to back, or
+// ~44 ms of continuous 115200 8N1 traffic (11520 B/s) with the consumer completely asleep. The
+// consumer is only ever asleep for the duration of one foreground command, and the paste case is
+// what a storm test actually does, so six lines is the honest working set and 512 is a round
+// number above it. This is a NEW ring and is NOT `serial_ring::SLOT_LEN` (1536): that one is the
+// SERWIT-2 output staging slot whose size is a measured worst case and is not to be grown casually.
+// The two share nothing but the word "serial" and travel in opposite directions.
+//
+// OVERFLOW POLICY: DROP THE NEWEST, and count it. The alternative (evict the oldest) keeps the ring
+// full of the most recent bytes but silently deletes the FRONT of whatever line was being typed,
+// which the line editor then submits as a mangled command. Dropping the newest leaves what has been
+// accepted as an exact, contiguous, in-order PREFIX of the arrival stream, so ordering within the
+// serial stream is preserved for everything that is delivered, and the loss is at the tail where
+// the operator can see it did not echo. `dropped` is on the census line for the same reason.
+#[cfg(feature = "baremetal")]
+pub mod shell_inbox {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use spin::Mutex;
+
+    /// Ring capacity in bytes. See the module header for the arithmetic behind 512.
+    pub const CAP: usize = 512;
+
+    struct Inbox {
+        buf: [u8; CAP],
+        head: usize, // next byte to hand the shell
+        len: usize,  // bytes held
+    }
+
+    static INBOX: Mutex<Inbox> = Mutex::new(Inbox { buf: [0; CAP], head: 0, len: 0 });
+
+    /// Bytes this ring took off the wire on the serial console's behalf.
+    static ACCEPTED: AtomicU64 = AtomicU64::new(0);
+    /// Bytes handed to the shell's key path (`render_service`'s drain). `accepted - delivered - held`
+    /// is always 0 on a healthy boot — a gap means a consumer took bytes by some other door.
+    static DELIVERED: AtomicU64 = AtomicU64::new(0);
+    /// Bytes refused because the ring was full. Non-zero means the shell was parked longer than 512
+    /// bytes of traffic; it is a capacity reading, not a fault, and it is never silent.
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+    /// High-water mark of `len`, so a boot that never dropped still reports how close it came.
+    static HIGH: AtomicU64 = AtomicU64::new(0);
+
+    /// PRODUCER. Take one serial byte for the shell. Never blocks, never allocates, returns `false`
+    /// when the ring is full (the byte is dropped and counted). Callable from any context that may
+    /// take a spin lock — it is held across a single array store and two `usize` updates.
+    pub fn offer(byte: u8) -> bool {
+        crate::arch::without_interrupts(|| {
+            let mut q = INBOX.lock();
+            if q.len == CAP {
+                drop(q);
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            let tail = (q.head + q.len) % CAP;
+            q.buf[tail] = byte;
+            q.len += 1;
+            let len = q.len as u64;
+            drop(q);
+            ACCEPTED.fetch_add(1, Ordering::Relaxed);
+            HIGH.fetch_max(len, Ordering::Relaxed);
+            true
+        })
+    }
+
+    /// CONSUMER. The next serial byte for the shell, in arrival order, or `None`. The shell's key
+    /// path in `render_service` is the sole production consumer; the QEMU fixture is the other.
+    pub fn take() -> Option<u8> {
+        let b = crate::arch::without_interrupts(|| {
+            let mut q = INBOX.lock();
+            if q.len == 0 {
+                return None;
+            }
+            let b = q.buf[q.head];
+            q.head = (q.head + 1) % CAP;
+            q.len -= 1;
+            Some(b)
+        });
+        if b.is_some() {
+            DELIVERED.fetch_add(1, Ordering::Relaxed);
+        }
+        b
+    }
+
+    /// Bytes currently held (the shell has not drained them yet).
+    pub fn held() -> usize {
+        crate::arch::without_interrupts(|| INBOX.lock().len)
+    }
+
+    /// Census for the `[serfocus]` witness: `(accepted, delivered, dropped, high_water)`.
+    pub fn census() -> (u64, u64, u64, u64) {
+        (
+            ACCEPTED.load(Ordering::Relaxed),
+            DELIVERED.load(Ordering::Relaxed),
+            DROPPED.load(Ordering::Relaxed),
+            HIGH.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Fixture aid — empty the ring and zero the counters so the QEMU witness measures its own
+    /// window rather than inheriting whatever the boot has already carried. Not on any boot path.
+    #[cfg(feature = "witness")]
+    pub fn test_reset() {
+        crate::arch::without_interrupts(|| {
+            let mut q = INBOX.lock();
+            q.head = 0;
+            q.len = 0;
+        });
+        ACCEPTED.store(0, Ordering::Relaxed);
+        DELIVERED.store(0, Ordering::Relaxed);
+        DROPPED.store(0, Ordering::Relaxed);
+        HIGH.store(0, Ordering::Relaxed);
+    }
+}

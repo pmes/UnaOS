@@ -1710,7 +1710,39 @@ pub fn pump_and_poll() -> Option<Event> {
     // armed the service returns immediately. Same feature gate as the main-loop call sites.
     #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
     crate::drivers::ehci::service_ehci_hid();
-    #[cfg(target_arch = "aarch64")]
+    // SERIAL-FOCUS — the UART drain splits BY SOURCE here, and this is the second of the two doors a
+    // serial byte could previously walk through into the focus-routed pipeline.
+    //
+    // On the bare-metal Pi this arm was a genuine SECOND READER of the one PL011 RX FIFO: the
+    // scheduled `input_service` task drains that FIFO continuously on another core, so a full-screen
+    // kernel app calling `pump_and_poll` RACED it for every byte — the doc comment above this
+    // function claimed "the bare-metal Pi routes keys through a separate scheduled input service /
+    // channel rather than this queue, so that path is unaffected here", and the `cfg` never actually
+    // excluded it. Whichever reader won, the byte's destination was wrong: through THIS door it
+    // landed in `EVENT_QUEUE`, where it is indistinguishable from a decoded USB HID key, and the
+    // `[uvug9]` routing decision in `main::pump_usb_into_gui` then hands it to
+    // `route_input_to_active_el0()` whenever a focused EL0 window owns input. That is the ruling
+    // working exactly as designed, on a carrier it was never meant to govern.
+    //
+    // So on that platform the byte still leaves the FIFO (the hardware read is unchanged, and the
+    // FIFO must be drained either way) but it goes to the SHELL's serial inbox instead of into
+    // `EVENT_QUEUE`. Consumed before the focus decision, it can never be routed away from the shell.
+    // The cost is named rather than hidden: a full-screen KERNEL app (`vug`, `pulse`) on the Pi no
+    // longer sees serial keystrokes in its own drain. It only ever saw the ones it won off
+    // `input_service` in a coin toss; no QEMU gate can type (raspi4b's `-serial file:` is
+    // write-only, so this arm returns nothing there and the change is inert for every gate); and the
+    // exit gestures those apps document are the USB key and the click. What is gained is the thing
+    // the blocker was about: a command typed over the wire while an app owns the panel lands in the
+    // shell the moment that app returns, instead of being raced away or stranded.
+    //
+    // Every other aarch64 build (QEMU `virt` via UEFI, the Orin's tegra console) keeps `push_event`
+    // untouched: there is no `input_service` on those paths, so this really is their only reader and
+    // `EVENT_QUEUE` really is their shell path.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    while let Some(byte) = crate::arch::poll_input() {
+        crate::arch::serial::shell_inbox::offer(byte);
+    }
+    #[cfg(all(target_arch = "aarch64", not(feature = "baremetal")))]
     while let Some(byte) = crate::arch::poll_input() {
         push_event(Event::Key(byte));
     }
