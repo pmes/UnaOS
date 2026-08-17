@@ -2643,8 +2643,9 @@ shell window declines to add a second one.
 | `UNAOS_WC=1 ./arroyo check` | green, 12 legs, 0 ❌ |
 | `UNAOS_PIDESK=1 ./arroyo kernel8-test 210` (640x480) | **PASS 108/108**, 0 forbidden, 8447 lines |
 | `./arroyo kernel8-test 210` knob-off (640x480) | **PASS 108/108**, 0 forbidden, 10700 lines |
-| `UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 210` | FAIL 104/108, 32 forbidden |
-| **↳ CONTROL, same command at `14e54538`** | FAIL 104/108, 22 forbidden |
+| `UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 210` | FAIL 104/108, 32 forbidden, 8969 lines |
+| **↳ CONTROL, same command at `14e54538`** | FAIL 104/108, 22 forbidden, 15222 lines |
+| ↳ same command, re-run on a calmer host | FAIL 104/108, 30 forbidden, 15535 lines |
 | knob-off `./arroyo kernel8` vs control build at `14e54538` | **byte-identical** |
 
 **The bench-geometry delta is zero, and it was measured rather than argued.** The control is a throwaway
@@ -2656,11 +2657,20 @@ and `[clickroute]`'s CLICK-SHELL leg reports `shell=skip` because `clickshell_le
 the parked cursor is over a window, which at 1920x1200 it is. The shell window adds nothing to that
 list — it is minted after `pidesk::armed()`, which is the whole point of the latch.
 
-The only numeric difference is `[wc-h] … -> AT-RISK`, 20 hits against the control's 9, and it is host
-load rather than code: the branch run drew `maxpresent_us=48785` against the control's `17090` (frame
-budget 16667) and scanned 8969 lines in 210 s against the control's 15222 — the same wall clock, roughly
-half the progress, on a host carrying 4 concurrent QEMUs at load ~27-30. `[wc-h]` is a present-timing
-rollup, so it counts slowness. **Not run on a quiet host; the A/B pairing is what carries the claim.**
+The numeric differences are confined to the present-TIMING counters — `[wc-h] … -> AT-RISK` (20 / 9 / 14
+across the three runs) and `[wc-g]`'s `slow=yes` classification — and they track host load rather than
+code: the first branch run drew `maxpresent_us=48785` against the control's `17090` (frame budget 16667)
+and scanned 8969 lines in 210 s against the control's 15222; the re-run, on a calmer host, scanned 15535
+and matched the control's progress. **None of these runs was on a quiet host** (3-4 concurrent QEMUs,
+load ~16-30), so the A/B pairing is what carries the claim rather than any single count — and the pairing
+is the stronger evidence anyway, being two runs minutes apart on one machine rather than two quiet runs
+taken at different times.
+
+The re-run, having got further, also produced M2's pixel **verbatim**:
+`[wc-d] verify win=2 … first=(307,158) got=0x2d2b55 want=0xc3c3c3 … bad_cache=0 ram_indep=yes -> FAIL` —
+the console window's chrome read where the fixture expected its own window's face, at the console box's
+exact top-left. That is the same occlusion M2 diagnosed, on a run of this branch, which is the clearest
+statement available that the bench-geometry deltas belong to CONSWIN-PI's standing conflict and not here.
 
 **Knob-off byte-identity.** `kernel8.img` built with no `UNAOS_PIDESK` is **byte-identical** to the
 pre-arc baseline, `sha256 c3000ff5bd87ed0eb210a45e84fb73c5543078ed6d2a432e4c9d21d738e7a4a2` on both
