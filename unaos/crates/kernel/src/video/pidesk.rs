@@ -318,3 +318,73 @@ pub fn activate() -> bool {
     let _ = routed;
     false
 }
+
+// ── SHELLWIN-PI — the CASCADE latch, and why it is a SECOND question ────────────────────────────
+//
+// [`activate`] above answers *"is the Pi a desktop yet?"* — the bar is on, the console has a window,
+// the compositor owns the glass. That is the question `wcx::activate` answers on x86, and it is asked
+// at the SAME place: the GUI handoff in `kernel_main`.
+//
+// It is not the question the shell window has to ask. The boot WITNESS CASCADE is still running when
+// the handoff returns — `kernel_main`'s own comment at that line says so ("the whole M6b..U7 fixture
+// cascade is already spawned and running on the APs") — and those fixtures OWN the panel: they create
+// windows, close them, and read the vacated boxes back expecting `DESKTOP_BG` byte-for-byte, `[wc-f]`
+// needs a clear probe strip, `[clickroute]` needs to know which row is topmost. Furniture that is on
+// the glass while they read is furniture INSIDE THEIR ANSWER.
+//
+// The first cut of SHELLWIN-PI argued the Pi needs no such latch at all — `pidesk` is compile-time, so
+// `desktop_owns_backdrop()` returned a constant `true` and the window was minted at the head of the
+// render service. `UNAOS_PIDESK=1 ./arroyo kernel8-test` refuted it, in the fixtures' own words:
+//
+//   [wc-j] vacate close_painted=true close_desktop=false (2/5) owner_desktop=false (2/5) -> FAIL
+//   [wc-j] move-once ... old_desktop=false (2/3) ... overlap_px=30336 ...                -> FAIL
+//   [wc-f] twin -> DEFER (a live window overlaps the probe strip)
+//   [clickroute] hit-test ... shell=skip ...                                             -> FAIL
+//
+// `MBENCH FAIL — 104/108`, and not one of the four misses was about the shell. `overlap_px=30336` is
+// the fixture naming the collision outright. x86 never met this because its latch happens to encode
+// the ordering: the Kepler takeover fires AFTER the cascade, so on that arch "is the desktop up?" and
+// "has the cascade released the panel?" are accidentally the same question. On the Pi they are two,
+// and this is the second one, asked in its own right and in the terms this arch actually has.
+//
+// **The standing rule, stated once.** *A desktop that appears before the boot witness cascade has
+// released the panel is not early, it is wrong.* Any future Pi furniture takes [`armed`] for the same
+// reason the shell window does. `activate`'s own console window is the counter-example that proves
+// the rule rather than an exception to it: it is minted at the handoff, ahead of the cascade, and
+// CONSWIN-PI M2 measured exactly what that costs — at bench geometry the console box occludes the
+// `wc-c`/`wc-d`/`wc-j` fixtures (`first=(307,158) got=0x2d2b55 want=0xc3c3c3`, `bad_cache=0`), a
+// standing conflict left for the integrator. The shell window declines to repeat it.
+//
+// Deliberately NOT a `wcx` twin: there is no origin to record, no panel to re-describe and nothing to
+// deactivate. A boolean is the whole of what is known, so a boolean is the whole of what is stored.
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// `false` until the boot witness cascade has released the panel. Never cleared: the cascade is
+/// one-shot and boot-time, and a desktop that could un-arm would be a second state nothing reads.
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+/// The boot witness cascade has finished with the panel — the desktop may place furniture on it.
+///
+/// Called once, from the CALLER of the last panel-reading fixture (`arch::aarch64::syscall`'s
+/// `u7_launcher`, right after `wcb_launcher` returns) — at the caller and not inside that fn's tail,
+/// because it has three early SKIP returns and arming from inside would let a skipped fixture leave
+/// the Pi desktop with no shell window at all and no line saying why. Idempotent by construction (a
+/// second call stores the same value), so a future second call site is a no-op rather than a hazard.
+pub fn arm() {
+    ARMED.store(true, Ordering::Release);
+    serial_println!(
+        ":: PI-DESK: desktop armed — the witness cascade released the panel, furniture may land ::"
+    );
+}
+
+/// Has the desktop been armed? Polled once per render pass; `Acquire` pairs with [`arm`]'s `Release`
+/// so a reader that sees `true` also sees every panel write the cascade made before it.
+///
+/// The poll is one load and the WAKE is free: the strip pulse already posts an `Event::Timer` every
+/// `ui_status::PSTRIP_PERIOD_MS` from a cooperative `yield_now` loop that needs no timer IRQ, so the
+/// render service sees the arming within ~250 ms of the cascade ending, on metal and in QEMU raspi4b
+/// alike. No polling task, no new event variant.
+pub fn armed() -> bool {
+    ARMED.load(Ordering::Acquire)
+}

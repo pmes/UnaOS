@@ -2466,6 +2466,220 @@ green both arches; `UNAOS_WC=1 ./arroyo esp-x86` then
 (reachable, not merely compiled). aarch64 / wc-off fold away: `dock.rs` is not compiled there and
 the reopen arm is `#[cfg(feature = "wc")]` inside the x86-only render service.
 
+#### SHELLWIN-PI — the same shell window, on the other chip (2026-08-13, landed 2026-08-17 on the CONSWIN-PI tip)
+
+**The ruling this closes.** *"THIS IS ONE OS. THE X86 PART IS NOT SEPARATE, IT JUST RUNS ON A
+DIFFERENT CHIP."* SHELLWIN/SHELLNOTDESK shipped `x86_64 + wc` and folded to nothing on aarch64 — so
+on the Pi the live text shell was still the wallpaper. This arc is the aarch64 arm of the SAME
+design, gated on `pidesk`. It is a PORT, not a redesign: `open_shell_window` is reused with its gate
+widened and **not one line of its body changed**, and `Screen::direct`, `Console::mark_in_window`,
+`present_outcome_owned` and `KERNEL_OWNER_DESKTOP` were already ungated and compiling on aarch64.
+
+* **The backdrop, and WHEN it is claimed (`main.rs::render_service`).** On this arch the hand-off is
+  a bigger statement than on x86: `wcf`'s chrome-truth probe had already reported **NOCLEAR** — *"no
+  aarch64 panel-wide `DESKTOP_BG` clear; `wcx` is x86+wc"* — and the only reason Pi desktop pixels
+  ever read `DESKTOP_BG` was that the shell's whole-panel `clear_screen` painted `Console::BG`, which
+  is the same number by coincidence. The Pi now makes that write deliberately.
+
+  It is claimed **in the same pass that mints the window**, not at task start. Until then the shell
+  draws the panel exactly as it did before this arc — which is the honest pre-facade state, and the
+  same one x86 shows before its takeover. Claiming the glass at task start was tried and is wrong
+  twice over: the backdrop then goes stale across the whole cascade, and the first keystroke to
+  arrive before the arming splashes a whole-panel `console.draw` across a scene nothing repaints.
+  `screen.rs` is therefore **untouched** by this arc — `paint_desktop_scene` stays `x86_64`-only,
+  because the aarch64 claim happens where `pal` already holds the `&mut Screen` for the task's life.
+  `TargetPal::clear_screen(DESKTOP_BG)` is that method's body reached through the borrow
+  (`back.fill_screen` + `mark_full`, identically); when the lake scene replaces the flat fill the seam
+  is one `TargetPal` passthrough and the call site changes by one word.
+* **The window.** A `KERNEL_OWNER_DESKTOP` row over a fallible cached-RAM store, `Screen::direct`.
+  The OOM lesson is sharper here, and it is why the revert history is read first: the merge was
+  reverted eleven minutes after it landed (`aed383b1` 20:06 → `c46a1844` 20:17) because the feature
+  OOM-panicked the machine at desktop-ready — **QEMU green, metal dead** — and was reapplied only
+  once `Screen::direct` removed the second surface-sized buffer. The Pi heap is **48 MiB against
+  x86's 256 MiB**, already carrying a ~9.2 MiB panel back buffer at 1920x1200, and this window's own
+  surface there is 960x580x4 = 2.2 MB. `try_reserve_exact` + `direct` are not belt-and-braces on
+  this arch; they are the whole margin. Never crash the machine to deliver a feature.
+* **The CASCADE latch — the one place the arches differ in kind, and the one claim this arc got
+  wrong before the gate corrected it (`video/pidesk.rs`).** The first cut argued the Pi needs no
+  runtime latch: x86 has `wcx::is_active()` only because its desktop arrives with a Kepler TAKEOVER,
+  while `pidesk` is compile-time and the furniture composites the moment the panel is up — so
+  `desktop_owns_backdrop()` returned a constant `true` and the window was minted at the head of the
+  render service. **`UNAOS_PIDESK=1 ./arroyo kernel8-test` answered `MBENCH FAIL — 104/108`,** and
+  the four misses were not about the shell:
+
+  ```text
+  [wc-j] vacate    close_desktop=false (2/5) owner_desktop=false (2/5)  -> FAIL
+  [wc-j] move-once old_desktop=false (2/3) ... overlap_px=30336         -> FAIL
+  [wc-f] twin      DEFER (a live window overlaps the probe strip)
+  [clickroute] hit-test ... shell=skip                                  -> FAIL
+  ```
+
+  The boot WITNESS CASCADE owns the panel: its fixtures create windows, close them, and read the
+  vacated boxes back expecting `DESKTOP_BG` byte-for-byte; `[wc-f]` needs a clear probe strip;
+  `[clickroute]` needs to know which row is topmost. A half-panel shell window present from boot-log
+  line 251 sat across all of it, and `overlap_px=30336` is the fixture naming the collision outright.
+  x86 never met this because its latch already encodes the ordering — the takeover happens after the
+  cascade, so there *"is the desktop up?"* and *"has the cascade released the panel?"* are
+  accidentally the same question. **On the Pi they are two questions, and the second one needed
+  asking.** `video::pidesk::arm()` is called from the CALLER of the last panel-reading fixture —
+  `arch::aarch64::syscall::u7_launcher`, on the line after `wcb_launcher` returns — and at the caller
+  rather than inside that fn's tail on purpose: it has three early SKIP returns, and arming from
+  inside would let a skipped fixture leave the Pi with no shell window and no line saying why. The
+  render service polls `armed()` and mints the window on the first pass that sees it up. The wake is
+  free — the strip pulse already posts an `Event::Timer` every `PSTRIP_PERIOD_MS` from a cooperative
+  `yield_now` loop needing no timer IRQ, so it resolves within ~250 ms on metal and in QEMU raspi4b
+  alike. All four legs came back PASS, in the designed order.
+
+  It is deliberately NOT a `wcx` twin (no origin, no panel re-description, nothing to deactivate — a
+  boolean is the whole of what is known). **It also is not a second question about the same thing as
+  `pidesk::activate`, and the merge with CONSWIN-PI is where that becomes visible.** `activate` — the
+  Pi's DESKTOP-READY seam, called from the GUI handoff — answers *"is the Pi a desktop yet?"*: the bar
+  is on, the console has a window, the compositor owns the glass. `arm` answers *"has the boot witness
+  cascade let go of the panel?"*, and when `activate` returns, the answer is still no — `kernel_main`'s
+  own comment at that line says the M6b..U7 cascade is already spawned and running on the APs. The two
+  latches therefore live in the same module and share nothing but the file, which is also why `arm`
+  costs `video/mod.rs` **zero** lines on this arc: CONSWIN-PI already paid the one line that declares
+  `pidesk`. The runtime decline x86 gets from its latch, the Pi still gets from `open_shell_window`'s
+  fallible path — `shell_id == WIN_NONE`, scene keeps the glass, decline on the wire, and one decline
+  is final rather than retried into a serial flood.
+* **Typeable — and the arm that makes it so (`arch/aarch64/syscall.rs`).** `wc_click_route`'s answer
+  for a press on kernel furniture is TWO arms on x86, and the Pi now has both. DRAG-PI landed the
+  first — the `chrome_hit` arm, which raises the row, calls `user_input_set_active(0)` for a kernel
+  owner and grabs the title bar. That covers the title strip and the border, and `chrome_hit` is
+  defined as `outer_box` MINUS `content_box`, so it covers **nothing of the shell's text**. This arc
+  adds the second, the `is_kernel_owner` arm in the `hit_test` match, in exactly the position x86 puts
+  it (below the chrome block, above every app arm): raise, `user_input_set_active(0)`, consume. Without
+  it a press on the shell's own TEXT falls into the `owner != cur` arm and calls
+  `user_input_set_active(KERNEL_OWNER_DESKTOP)` — an "ASID" with no ring — so clicking into your own
+  shell to type in it would take the keyboard AWAY from it: the SHELLWIN defect re-entered through the
+  pointer. Placed BELOW the close/minimise/zoom arms rather than above them as on x86, deliberately, so
+  PA38's refused-close ruling keeps owning that path and this window rides it rather than diverting it.
+
+  **This is not a predicted defect, it is a measured one, and it was already live before this arc's own
+  window existed.** The paired bench-geometry runs — the same fixture, the same press, the tip and this
+  branch, minutes apart — differ by exactly one line:
+
+  ```text
+  tip 14e54538:  [clickroute] press hit asid=4294967041 win=1 (was 3084) delivered
+  this arc:      [clickroute] press hit furniture asid=4294967041 win=1 (was 3084) consume -> shell focus
+  ```
+
+  `4294967041` is `0xFFFFFF01`, `KERNEL_OWNER_CONSOLE` — CONSWIN-PI's boot-log window, not the shell's.
+  So on the tip a press into the console window's content `delivered` the keyboard to a pseudo-ASID with
+  no input ring, and the operator got it back only by cycling TAB. The arm fixes that row too, for free,
+  because it asks about kernel ownership rather than about which window this arc happens to have minted.
+* **The pointer's other half (`click1_dispatch`).** Its console-activation redraw writes the prompt at
+  PANEL coordinates. On the desktop that would paint shell glyphs straight back onto the scene —
+  SHELLNOTDESK re-entered through the pointer — so the caller passes `backdrop_console`. That argument
+  is **`!windowed`, not `!desktop`**, and the distinction is the same one the backdrop hand-off makes:
+  `desktop` says this BUILD runs a desktop, `windowed` says the hand-off has actually happened. Before
+  the arming the shell IS still the panel, so its click activation must keep working exactly as it did
+  before this arc; `!desktop` would have switched it off from the first pass and left a dead spot for
+  the whole cascade. The same predicate is sampled once per pass and drives the keystroke route too, so
+  key and click can never disagree about which surface the shell is on. Only the backdrop write is
+  withheld — the hit-test and the `[click1]` witness still run.
+* **What comes for free from the arcs that landed first.** DRAG: the shell window is a kernel-band row
+  and DRAG-PI's chrome arm already grabs those, so it is draggable by its title bar the day it exists,
+  with no line written here. The MENU BAR: MENUBAR-PI widened `ui_status::top_chrome_h` and `screen.rs`'s
+  strip subtraction to aarch64, which is what `open_shell_window` reads to keep its outer box inside the
+  work area — the shell window is under the bar rather than through it, by reusing the same reservation.
+* **What is NOT ported, and why.** The dock's SHELLPIN reopen arm. `dock.rs` compiles under `pidesk`
+  so `take_shell_reopen` exists on the Pi, but at this tip kernel furniture is **not closable**
+  (`wc_close_click` → `furniture-refused`; `FURNITURE_HAS_CONTROLS == false`), so the shell cannot be
+  lost and the arm would service a request that can never be raised. Flagged for the lead rather than
+  half-wired.
+
+**Two kernel rows, and which one is the shell.** After this arc a Pi desktop can carry TWO
+kernel-owned windows, and they are not the same window. `fbcon`'s `KERNEL_OWNER_CONSOLE` row
+(CONSWIN-PI) is the BOOT-LOG pane: minted at the GUI handoff, frozen by the detach that follows,
+centred. `main.rs`'s `KERNEL_OWNER_DESKTOP` row (this arc) is the LIVE SHELL: minted after the
+cascade, typeable, pinned low in the work area precisely so it does not sit over the centred console.
+x86 has carried both since SHELLWIN; the Pi now matches, which is what "one OS, two chips" was
+supposed to mean.
+
+**What the LIVE console still needs — named, not attempted.** CONSWIN-PI's ledger deferred the fix to
+"a line in the Pi render service", which is this arc's file, so it is worth being exact about why it is
+still not one line. Three things, in order:
+
+1. **`pidesk::activate` must return `routed` instead of `false`** — the handoff then skips
+   `fbcon::detach()` and the window stays live. One word, and it is the word that was measured at
+   `97/108` with 37 forbidden hits, `wc-g -> RACE-BLIT`, `wc-d -> FAIL` and a synchronous exception.
+2. **`_print` must stop presenting.** The measured failure is not pacing — it is that
+   `route_present_banded` runs on whatever core printed, so the console is an unsynchronised
+   compositor client at line cadence. The glyph WRITE is already serialised by `fbcon`'s own lock; it
+   is the composite that is not. So print context must only mark the band OWED, and the render service
+   must call the already-compiled `fbcon::console_service()` (`any(x86+wc, aarch64+pidesk)` — it exists
+   on this arch today) exactly once per pass, which makes it one client at frame cadence.
+3. **The synchronous exception must be explained, not out-run.** A fault is not a pacing symptom and
+   step 2 is not entitled to be assumed to fix it. Until it has a diagnosis the live console is not
+   shippable, whatever the witness count says.
+
+Step 2's call is deliberately NOT wired here: while `activate` returns `false` the detach still runs,
+`_print` returns at its first test, `pend_take` answers `Owed::Nothing`, and the call would be dead
+code that a later reader would mistake for a live hook.
+
+**Witness:** `[shellwin-pi] backdrop=crispy-scene shell=window win=<id> surf=<w>x<h> panel=<w>x<h> ==
+witness ::` at bring-up, or `[shellwin-pi] … shell=none (window declined) ::` beside
+`open_shell_window`'s own `[shellwin] DECLINE reason=…`; `[clickroute] press hit furniture … consume
+-> shell focus` on a click that focuses it; and `:: PI-DESK: desktop armed — the witness cascade
+released the panel, furniture may land ::` at the hand-off.
+
+**The standing rule this arc adds, stated once.** *A desktop that appears before the boot witness
+cascade has released the panel is not early, it is wrong.* Any future Pi furniture — dock, menu bar,
+a second window — takes `video::pidesk::armed()` for the same reason the shell window does. The
+fixtures read the panel back; furniture that is on the glass while they read is furniture inside
+their answer. **CONSWIN-PI's console window is the counter-example that proves the rule rather than an
+exception to it**: it is minted at the GUI handoff, ahead of the cascade, and M2 measured exactly what
+that costs — at bench geometry its box (1306x780 at (307,158)) occludes `wc-c`/`wc-d`/`wc-j`,
+`first=(307,158) got=0x2d2b55 want=0xc3c3c3` with `bad_cache=0 ram_indep=yes`, i.e. occlusion with the
+surface intact. That is a standing conflict left for the integrator to reconcile in the spec. The
+shell window declines to add a second one.
+
+**Gate results (2026-08-17, base `14e54538`).**
+
+| gate | result |
+| --- | --- |
+| `./arroyo check` | green, 12 legs, 0 ❌ |
+| `UNAOS_WC=1 ./arroyo check` | green, 12 legs, 0 ❌ |
+| `UNAOS_PIDESK=1 ./arroyo kernel8-test 210` (640x480) | **PASS 108/108**, 0 forbidden, 8447 lines |
+| `./arroyo kernel8-test 210` knob-off (640x480) | **PASS 108/108**, 0 forbidden, 10700 lines |
+| `UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 210` | FAIL 104/108, 32 forbidden |
+| **↳ CONTROL, same command at `14e54538`** | FAIL 104/108, 22 forbidden |
+| knob-off `./arroyo kernel8` vs control build at `14e54538` | **byte-identical** |
+
+**The bench-geometry delta is zero, and it was measured rather than argued.** The control is a throwaway
+worktree at the arc's own base commit, run minutes apart from the branch on the same host. Both runs
+name the **same four missing REQUIREs** — `[wc-c] side-by-side … drawn=2`, `[wc-j] vacate … PASS`,
+`[wc-j] move-once … PASS`, `[clickroute] hit-test … PASS` — and the **same FORBID categories**. Those
+four are CONSWIN-PI M2's standing conflict, unchanged: the console window's box occludes the fixtures,
+and `[clickroute]`'s CLICK-SHELL leg reports `shell=skip` because `clickshell_leg` returns `None` when
+the parked cursor is over a window, which at 1920x1200 it is. The shell window adds nothing to that
+list — it is minted after `pidesk::armed()`, which is the whole point of the latch.
+
+The only numeric difference is `[wc-h] … -> AT-RISK`, 20 hits against the control's 9, and it is host
+load rather than code: the branch run drew `maxpresent_us=48785` against the control's `17090` (frame
+budget 16667) and scanned 8969 lines in 210 s against the control's 15222 — the same wall clock, roughly
+half the progress, on a host carrying 4 concurrent QEMUs at load ~27-30. `[wc-h]` is a present-timing
+rollup, so it counts slowness. **Not run on a quiet host; the A/B pairing is what carries the claim.**
+
+**Knob-off byte-identity.** `kernel8.img` built with no `UNAOS_PIDESK` is **byte-identical** to the
+pre-arc baseline, `sha256 c3000ff5bd87ed0eb210a45e84fb73c5543078ed6d2a432e4c9d21d738e7a4a2` on both
+sides — measured against a control `./arroyo kernel8` in a throwaway worktree at the same base commit,
+not against a remembered number. (The `27d782b5…` recorded by the two arcs before this one is stale:
+VUG-PARITY, ONECARD-PI and DRAG-PI all changed knob-off code between then and now. The baseline is the
+CURRENT tip's image, always built, never quoted.) This arc touches exactly ONE file that is compiled
+knob-off — `arch/aarch64/syscall.rs`,
+edited **line-NEUTRALLY 4/4**: the furniture arm and the `pidesk::arm()` call are one dense line each,
+each paid for by one comment line merged nearby (panic `Location` records embed line numbers, so an
+added line anywhere in that file renumbers every record below it). The other three are free by
+construction: `video/mod.rs` is **not touched** (CONSWIN-PI already declares `pidesk`, so the cascade
+latch costs its parent zero lines — the earlier cut's "a new module costs one line" argument is now
+moot, and the module lands for nothing); `screen.rs` is **not touched** either, because the backdrop
+claim goes through `TargetPal::clear_screen` rather than widening `paint_desktop_scene`'s gate; and
+`pidesk.rs` itself only exists under the knob. `main.rs` was **measured** rather than assumed — a probe
+line inserted mid-`render_service`, rebuilt, left the image byte-identical — so its additions are
+written for legibility instead of packed.
+
 #### Three smaller defects the same arc closes
 
 * **`create` now composites.** A window's kernel chrome reaches the panel when the row exists, not at the

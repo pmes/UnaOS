@@ -3826,11 +3826,21 @@ fn click1_witness(x: i32, y: i32, mask: u8, hit: Option<Click1Hit>) {
 /// mirroring vug's "a click is a keystroke-equivalent activation of the focused view"); a click on
 /// the status strip only witnesses (it draws nothing interactive). Returns whether a repaint of the
 /// console is owed. Never touches the key or motion paths.
+///
+/// SHELLWIN-PI — `backdrop_console` is the caller's answer to "is the shell still the desktop layer?".
+/// The console-activation redraw below writes the prompt at PANEL coordinates, so once the shell is a
+/// compositor window that redraw would paint shell glyphs straight back onto the scene the arc just
+/// took them off — the SHELLNOTDESK regression, re-entered through the pointer instead of the keyboard.
+/// On the desktop the hit-test and the `[click1]` witness still run (the wire keeps saying where the
+/// click landed); only the backdrop write is withheld, and it is withheld because there is nothing
+/// there to activate: a press that lands ON the shell window never reaches this function at all, being
+/// consumed upstream by `wc_click_route`'s kernel-furniture arm.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn click1_dispatch(
     mask: u8,
     console: &unaos_kernel::console::Console,
     pal: &mut unaos_kernel::pal::TargetPal<'_>,
+    backdrop_console: bool,
 ) {
     use core::sync::atomic::Ordering;
     use unaos_kernel::pal::GneissPal;
@@ -3844,7 +3854,7 @@ fn click1_dispatch(
     let (x, y) = unaos_kernel::pal::cursor::pos(pal.width() as i32, pal.height() as i32);
     let hit = click1_hit_test(y, pal);
     click1_witness(x, y, mask, hit);
-    if let Some(Click1Hit::Console) = hit {
+    if let (Some(Click1Hit::Console), true) = (hit, backdrop_console) {
         // Focus/activate the console: reassert its prompt + current input at the caret. Non-
         // destructive (submits nothing, mutates no shell state); makes the click visibly land.
         console.draw_input_line(pal);
@@ -3859,9 +3869,60 @@ fn render_service(_: usize) {
     // the (non-snooping) VideoCore scan-out sees it.
     let front_fb = *unaos_kernel::video::WRITER.lock();
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
+
+    // SHELLWIN-PI — does the Pi desktop own the backdrop on this build? Captured ONCE, exactly as the
+    // x86 service captures `wcx::is_active()`, so every arm below reads one stable answer.
+    //
+    // When it is true the SCENE owns the glass and the live text shell comes off it. That sentence is
+    // a bigger change on this arch than on x86, because on the Pi the shell's whole-panel
+    // `clear_screen` was the ONLY writer that ever made a non-window panel pixel read `DESKTOP_BG` —
+    // `wcf`'s chrome-truth probe reported exactly that as NOCLEAR ("no aarch64 panel-wide DESKTOP_BG
+    // clear; wcx is x86+wc"), and it read as a desktop only because `console::Console::BG` and
+    // `wm::DESKTOP_BG` are the same number by coincidence. The desktop write is deliberate and NAMED
+    // on this arch now, which is the arc the NOCLEAR note asked for.
+    //
+    // NOTE the backdrop is NOT claimed here. `desktop` says this BUILD runs a desktop; the pass that
+    // CLAIMS the glass is the mint arm in the drain loop, once `pidesk::armed()` reports the witness
+    // cascade done. Claiming it at task start would leave a backdrop going stale across the whole
+    // cascade, and the first keystroke arriving before the arming would splash a whole-panel
+    // `console.draw` across a scene nothing would repaint.
+    #[cfg(feature = "pidesk")]
+    let desktop = desktop_owns_backdrop();
+    #[cfg(not(feature = "pidesk"))]
+    let desktop = false;
+
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
     let mut console = unaos_kernel::console::Console::new();
 
+    // SHELLWIN-PI — the live shell's OWN compositor window. Flat locals for the service's life, for
+    // the reason the x86 twin gives: a persistent `TargetPal` borrows its `Screen`, and a per-keystroke
+    // `TargetPal::new` would also spam the once-per-surface `:: UI1:` line. `_shell_store` is bound and
+    // never read again ON PURPOSE — the `wm` row holds a raw pointer into its heap buffer, and this
+    // task never returns, so the binding IS the lifetime. Knob-off (`pidesk` off) not one of these
+    // bindings exists and the shell keeps painting the panel exactly as it always did.
+    // They start EMPTY and cost nothing: the window is minted LATER, by the lazy arm in the drain
+    // loop, once `video::pidesk::armed()` says the boot witness cascade has released the panel. See
+    // that arm — the ordering is not a nicety, it is 4 of the 108 regression witnesses.
+    #[cfg(feature = "pidesk")]
+    let (mut _shell_store, mut shell_screen, mut shell_console, mut shell_id) = (
+        alloc::vec::Vec::new(),
+        unaos_kernel::video::Screen::direct(unaos_kernel::video::FrameBuffer::new()),
+        unaos_kernel::console::Console::new(),
+        unaos_kernel::video::wm::WIN_NONE,
+    );
+    #[cfg(feature = "pidesk")]
+    let mut shell_pal = unaos_kernel::pal::TargetPal::new(&mut shell_screen);
+    #[cfg(feature = "pidesk")]
+    let mut shell_dirty = false;
+    // One decline is final. `open_shell_window` already named the reason on the wire; retrying it
+    // every pass would turn a full heap into a serial flood.
+    #[cfg(feature = "pidesk")]
+    let mut shell_declined = false;
+
+    // SHELLWIN-PI — UNCHANGED, and deliberately so. At boot the shell still draws the panel on every
+    // build: the whole-panel `console.draw` that made the shell the Pi's wallpaper stops being the
+    // desktop at the ARMING pass, not here, because until the witness cascade has released the panel
+    // there is no desktop for it to be off of. This is the same pre-takeover state x86 shows.
     console.draw(&mut pal);
     // PI-UI-2: the always-on GUI status strip (hostname / lease IP / UTC wall clock). Drawn AFTER the
     // console each frame so it sits on top; refreshed at ~1 Hz by the `status_tick` task, which pings
@@ -3912,12 +3973,43 @@ fn render_service(_: usize) {
         // line or a quantized per-core load changed. This is the dirty-pacing split.
         let mut strip_dirty = false;
         let mut strip_tick = false;
+        // SHELLWIN-PI — **is the shell a WINDOW as of this pass?** ONE predicate, read by both input
+        // arms below, and it is deliberately NOT `desktop`. `desktop` says this BUILD runs a desktop;
+        // this says the hand-off has actually HAPPENED. Between task start and the arming pass the
+        // shell still owns the panel — the honest pre-facade state — so until then the keystroke and
+        // the click must both go on behaving exactly as they did before this arc. Sampled HERE, ahead
+        // of the mint arm further down that can flip `shell_id` within this same pass, so every arm in
+        // one pass agrees about which surface it is talking to.
+        #[cfg(feature = "pidesk")]
+        let windowed = desktop && shell_id != unaos_kernel::video::wm::WIN_NONE;
+        #[cfg(not(feature = "pidesk"))]
+        let windowed = false;
         match ev {
             unaos_kernel::pal::Event::Key(c) => {
-                handle_key(c, &mut console, &mut pal);
-                // The console may repaint into the strip's bottom band — redraw the strip on top.
-                dirty = true;
-                strip_dirty = true;
+                // SHELLWIN-PI — route the keystroke to its home. A key reaches this task only when
+                // `pump_usb_into_gui` found `user_input_active() == 0`, i.e. the keyboard belongs to
+                // the SHELL. On the Pi desktop the shell is a WINDOW, so it is dispatched into that
+                // window's own `Console`/`TargetPal` and the backdrop scene is never typed on; the
+                // window's surface is flushed and composited once per drained burst at the tail. Off
+                // the desktop (`pidesk` off, or the window declined) the shell is still the panel and
+                // this is the pre-arc line unchanged, `dirty`/`strip_dirty` and all.
+                //
+                // Note which flags do NOT get set on the window path: the PANEL was not drawn on, so
+                // there is nothing for `pal.render()` to flush and no strip band to repair. Setting
+                // `dirty` there would present the whole backdrop on every keystroke — the exact
+                // per-key full-panel cost SCHED-6's dirty pacing exists to refuse.
+                if windowed {
+                    #[cfg(feature = "pidesk")]
+                    {
+                        handle_key(c, &mut shell_console, &mut shell_pal);
+                        shell_dirty = true;
+                    }
+                } else {
+                    handle_key(c, &mut console, &mut pal);
+                    // The console may repaint into the strip's bottom band — redraw the strip on top.
+                    dirty = true;
+                    strip_dirty = true;
+                }
             }
             // CURSOR-1: pointer motion moves the SHARED pointer state (`pal::cursor`, which
             // `click1_dispatch` and the compositor both read) and repaints the system cursor into
@@ -3956,7 +4048,7 @@ fn render_service(_: usize) {
             // edges only; the console's activation is a non-destructive focus/redraw of its input
             // line. Emits the rate-limited `[click1]` witness. Key/motion paths are untouched.
             unaos_kernel::pal::Event::Button(mask) => {
-                click1_dispatch(mask, &console, &mut pal);
+                click1_dispatch(mask, &console, &mut pal, !windowed);
                 dirty = true;
                 // A click may activate/redraw a view under the strip band — keep the strip on top.
                 strip_dirty = true;
@@ -3987,6 +4079,90 @@ fn render_service(_: usize) {
             // present at all, which is what keeps the always-running pulse off the render core's back.
             dirty |= unaos_kernel::ui_status::tick(&mut pal);
         }
+        // SHELLWIN-PI — MINT THE SHELL WINDOW, once, on the first pass after the desktop is armed.
+        //
+        // This lateness is the whole correctness of the arc on this arch, and it was MEASURED, not
+        // designed: the first cut minted the window at the head of this task and
+        // `UNAOS_PIDESK=1 ./arroyo kernel8-test` answered `MBENCH FAIL — 104/108`. The four misses
+        // were the boot WITNESS CASCADE, not the shell — `[wc-j] vacate` and `[wc-j] move-once` read
+        // vacated boxes back expecting `DESKTOP_BG` and found window (`overlap_px=30336`), `[wc-f]
+        // twin` never cleared its probe strip, and `[clickroute]`'s hit-test lost its topmost row.
+        // A half-panel row that exists from line 251 of the boot log sits across all of it.
+        //
+        // x86 never had to think about this because its latch already encodes the ordering: the
+        // Kepler takeover happens after the cascade, so there "is the desktop up?" and "has the
+        // cascade released the panel?" are accidentally the same question. On the Pi they are not,
+        // and `video::pidesk::armed()` is the second question asked in its own right.
+        //
+        // The wake is free: the strip pulse posts an `Event::Timer` every `PSTRIP_PERIOD_MS` from a
+        // cooperative `yield_now` loop that needs no timer IRQ, so this fires within ~250 ms of the
+        // cascade ending on metal and in QEMU raspi4b alike — no polling task, no new event variant.
+        #[cfg(feature = "pidesk")]
+        if desktop
+            && shell_id == unaos_kernel::video::wm::WIN_NONE
+            && !shell_declined
+            && unaos_kernel::video::pidesk::armed()
+        {
+            let info = front_fb.info();
+            match open_shell_window(info.width, info.height) {
+                Some((store, fb, id)) => {
+                    // SHELLWIN-PI — the BACKDROP hand-off, in the SAME PASS as the window. Until this
+                    // moment the shell owned the panel exactly as it did before this arc (pre-arm is
+                    // the Pi's honest "plumbing, not facade" state, and it is what x86 shows before
+                    // its own takeover); from this moment the SCENE owns it. Claiming it HERE rather
+                    // than at task start is what keeps the two coherent: a backdrop claimed at start
+                    // goes stale across the whole cascade, and the first keystroke to arrive before
+                    // the arming splashes a whole-panel `console.draw` over a scene nothing repaints.
+                    //
+                    // `clear_screen(DESKTOP_BG)` through the pal IS `Screen::paint_desktop_scene`:
+                    // that method is `back.fill_screen(DESKTOP_BG)` + `mark_full()`, and
+                    // `TargetPal::clear_screen` is `surface.fill_screen`, which is the same pair. The
+                    // named method cannot be reached from here because `pal` holds the `&mut Screen`
+                    // for this task's life — which is also why `screen.rs` needs no edit on this arc.
+                    // When the lake scene replaces the flat fill the seam is one `TargetPal`
+                    // passthrough, and this call site changes by one word.
+                    pal.clear_screen(unaos_kernel::video::wm::DESKTOP_BG);
+                    dirty = true;
+                    // Rebind the whole tuple, the shape the x86 reopen arm established: the store
+                    // must outlive the row (which holds a raw pointer into it), the `Screen` is
+                    // `direct` — NEVER `Screen::new`, whose infallible second surface-sized buffer is
+                    // the allocation that OOM-panicked GR26's metal boot, and which on this arch
+                    // would ask a 48 MiB heap for 2.2 MB it does not need — and the `TargetPal`
+                    // re-borrows the new `Screen` (one `:: UI1:` line, the once-per-surface rule).
+                    _shell_store = store;
+                    shell_console = unaos_kernel::console::Console::new();
+                    shell_console.mark_in_window();
+                    shell_screen = unaos_kernel::video::Screen::direct(fb);
+                    shell_pal = unaos_kernel::pal::TargetPal::new(&mut shell_screen);
+                    shell_id = id;
+                    // First frame: the prompt into the window's own surface, flushed and composited
+                    // once through the owner-fenced present, so the operator has a live shell to
+                    // click and type into from the moment the desktop appears.
+                    shell_console.draw(&mut shell_pal);
+                    shell_pal.render();
+                    let _ = unaos_kernel::video::wm::present_outcome_owned(
+                        id,
+                        unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
+                    );
+                    shell_dirty = false;
+                    serial_println!(
+                        "[shellwin-pi] backdrop=crispy-scene shell=window win={} surf={}x{} panel={}x{} == witness ::",
+                        id,
+                        shell_pal.width(),
+                        shell_pal.height(),
+                        pal.width(),
+                        pal.height()
+                    );
+                }
+                None => {
+                    // The REASON is already on the wire from `open_shell_window`; this is the
+                    // CONSEQUENCE, so a capture never has to infer "and therefore the keyboard has
+                    // nowhere to land". The scene keeps the glass; nothing is torn down.
+                    shell_declined = true;
+                    serial_println!("[shellwin-pi] backdrop=crispy-scene shell=none (window declined) ::");
+                }
+            }
+        }
         // Present at most once per pass, and only when something was actually drawn — a no-op report
         // costs a bounded match + a couple of cycle reads, not a composite.
         if dirty {
@@ -4007,6 +4183,30 @@ fn render_service(_: usize) {
             // the desktop bracket without having to remember it.
             pal.render();
             s6_composites += 1;
+        }
+        // SHELLWIN-PI — flush the shell window's surface and composite it once per pass, AFTER the
+        // backdrop present above so the window lands on top of the scene rather than under it. Same
+        // drain-then-present-once discipline the backdrop follows.
+        //
+        // The verb is `present_outcome_owned`, never bare `wm::present`, and the reason is the
+        // recycled-slot hazard the x86 review convicted: `shell_id` is a slot alias with no
+        // generation, so a fence-free present would composite whatever row later takes the slot. The
+        // fence answers `NoRow` when the row was reaped and `Suppressed` when it is parked, and is
+        // identical to a plain present while the shell is live. On this arch that fence has a second
+        // duty: kernel furniture is NOT closable (`wc_close_click` returns `furniture-refused`), and
+        // PA38 is the ruling that a REFUSED close must leave no orphaned state behind it — a present
+        // that answers honestly about a row it does not own is the same discipline one layer down.
+        //
+        // Deliberately NOT counted into `s6_composites`: that witness measures PANEL composites, and
+        // folding a window present into it would report the backdrop presenting when it did not.
+        #[cfg(feature = "pidesk")]
+        if shell_dirty {
+            shell_pal.render();
+            let _ = unaos_kernel::video::wm::present_outcome_owned(
+                shell_id,
+                unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
+            );
+            shell_dirty = false;
         }
         s6_cyc += unaos_kernel::arch::now_cycles().wrapping_sub(t0);
         // Rate-limited [sched6] witness: incoming pass rate vs presented-composite rate + mean pass
@@ -4371,6 +4571,25 @@ fn desktop_owns_backdrop() -> bool {
 fn desktop_owns_backdrop() -> bool {
     false
 }
+/// SHELLWIN-PI — the aarch64 twin, and the one place the two arches genuinely differ in KIND.
+///
+/// x86 has a runtime latch because the crispy desktop arrives with a TAKEOVER: `wcx::activate` runs
+/// off the Kepler display path during PCI enumeration, so "is the desktop up?" is a question with a
+/// boot-time answer. The Pi has no takeover. `pidesk` is a compile-time family (Cargo.toml: it
+/// "declares no module of its own"), and the furniture composites from `wm::composite_once` the
+/// moment the panel is up — which, by the time this task is dispatched, it is. So the honest answer
+/// on this arch is the feature itself, and inventing an `AtomicBool` to launder a constant into a
+/// latch would be ceremony, not information.
+///
+/// What x86 gets from `wcx::is_active` returning `false` — a boot that comes up with the shell still
+/// on the backdrop — the Pi gets from [`open_shell_window`]'s FALLIBLE path instead: a declined
+/// surface leaves `shell_id == WIN_NONE`, the scene still owns the glass, and the decline is on the
+/// wire. That is the GR26 lesson applied to the arch with a 48 MiB heap (x86 has 256 MiB): the
+/// window is allowed to not exist, and it is never allowed to panic the machine into existing.
+#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+fn desktop_owns_backdrop() -> bool {
+    true
+}
 
 /// SHELLWIN — allocate the live SHELL's compositor-window surface and register its `wm` row.
 ///
@@ -4391,7 +4610,16 @@ fn desktop_owns_backdrop() -> bool {
 /// raw pointer into it — the `FrameBuffer` over that store, and the window id. `None` when the panel is
 /// unusably small or the allocation fails; the desktop then comes up with no shell window and the
 /// keystroke path stays inert (the caller logs it).
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+///
+/// SHELLWIN-PI — the gate is now `x86_64 + wc` OR `aarch64 + pidesk`, and NOT ONE LINE OF THE BODY
+/// CHANGED to make that true. Every verb it calls (`wm::spawn_geometry`, `wm::create_at`,
+/// `ui_status::top_chrome_h`) is ungated and already compiled on aarch64, and the surface it mints is
+/// its OWN heap store, so the `Bgr`/4-byte choice is a statement about the word `wm::draw_window`
+/// reads (`0x00RRGGBB` little-endian) and not about the Pi panel's own pixel format. The one thing
+/// that IS different is the budget: at the bench panel (1920x1200) this asks for 960x580x4 = 2.2 MB
+/// of a 48 MiB heap that already carries a ~9.2 MiB panel back buffer, so `try_reserve_exact` is
+/// load-bearing here in a way it never was on x86's 256 MiB.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 fn open_shell_window(
     pw: usize,
     ph: usize,
