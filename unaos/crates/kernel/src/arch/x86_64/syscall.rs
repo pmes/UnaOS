@@ -17526,7 +17526,13 @@ const DMG_MAGIC: u64 = 0x444D_4752; // 'DMGR'
 /// clear of the stack which starts at +0x4000-16 and never descends 4 KiB).
 ///   `+0x00` magic  ·  `+0x08` the owner's window id  ·  `+0x10` a provably-FREE window id
 ///   `+0x18` (written BACK by the prober) its first window id  ·  `+0x20` its second window id
+///   `+0x28` (written BACK by the prober) SWEPT — "all 19 probes fired, my two windows are STILL live
+///           and I am parked": the launcher's ground-truth re-read happens strictly inside this park
+///   `+0x30` the prober's release word, written by the launcher once that re-read is taken
 const DMG_PARAM_OFF: usize = 0x3000;
+/// DMG-REFUSE: the prober's SWEPT flag and its release word, as offsets from `DMG_PARAM_OFF`.
+const DMG_SWEPT_OFF: usize = 0x28;
+const DMG_PROBE_GO_OFF: usize = 0x30;
 /// DMG-REFUSE: the owner's release word, at ITS data page +0x3000. The owner exits only when this goes
 /// nonzero, which the launcher does strictly AFTER the prober has finished — so the owner's window is
 /// provably live for the whole probe sweep.
@@ -17737,6 +17743,23 @@ unaos_user_dmg_probe:
     jmp  70b
 
 78: add  rsp, 48
+    // (5) SWEPT + PARK. `SYS_EXIT` below tears this slot down synchronously — `sched::exit` ->
+    //     `user_space_release` -> `free_user_space_by_cr3` -> `win_close_slot` — so our two window
+    //     rows vanish microseconds after the exit status is published. The launcher's ground-truth
+    //     re-read must happen while they are still in the table, so we publish SWEPT and park here
+    //     until it releases us. Bounded: 3000 * 20 ms = 60 s, far past the launcher's own deadline.
+    //     Only the FULL-sweep path parks; every early abort still jumps straight to 79 and exits with
+    //     a witness the launcher grades as FAIL, so a broken prober cannot hide inside this park.
+    mov  qword ptr [rbx + 40], 1              // +0x28 = SWEPT
+    mov  r13, 3000
+80: mov  rax, [rbx + 48]                      // +0x30 = the launcher's release word
+    test rax, rax
+    jnz  79f
+    mov  rax, 5                               // SYS_SLEEP_MS
+    mov  rdi, 20
+    syscall
+    dec  r13
+    jnz  80b
 79: mov  rax, 2                               // SYS_EXIT(witness)
     mov  rdi, r12
     syscall
@@ -17948,42 +17971,91 @@ fn dmg_refuse_witness(demo_cpu: usize) {
     }
     crate::arch::sched::spawn_user_in_space("dmg-probe", probe.entry, probe.sp, demo_cpu, probe.cr3);
 
+    // 3b. Wait for SWEPT — the prober's "19 probes fired, both my windows are still live, I am
+    //     parked". This handshake is what makes step 4 a measurement rather than a race: the prober's
+    //     `SYS_EXIT` retires its window rows SYNCHRONOUSLY (`sched::exit` -> `user_space_release` ->
+    //     `free_user_space_by_cr3` -> `win_close_slot`), and `DMG_DONE` is published by the SYS_EXIT
+    //     arm BEFORE that teardown runs — so a re-read gated on `DMG_DONE` alone is a footrace between
+    //     this launcher's next `yield_now` round and the prober's teardown on another core. Under host
+    //     load that round is a whole quantum and the race is lost roughly 2 runs in 5, which printed
+    //     `recheck=0x01` and NOT RUN with nothing actually wrong.
+    //     `DMG_DONE` still terminates the wait: a prober that aborted early (no magic, no window) never
+    //     writes SWEPT and must be graded, not waited on.
+    let sdeadline = crate::arch::ticks() + 10_000;
+    while dmg_probe_swept(probe.slot) == 0
+        && DMG_DONE.load(Ordering::Acquire) < 1
+        && crate::arch::ticks() < sdeadline
+    {
+        crate::arch::sched::yield_now();
+    }
+    if dmg_probe_swept(probe.slot) == 0 {
+        // Distinct from "the table moved": the prober never reached its post-sweep park at all. That is
+        // a fixture failure with a witness to show for it, so it grades FAIL rather than NOT RUN.
+        serial_println!(
+            ":: DMG-REFUSE FAIL — the prober never published SWEPT within 10000ms (probes={:#018x} done={} killed={} id_a={} id_free={} entry={:#04x}) ::",
+            DMG_PROBE_WITNESS.load(Ordering::Acquire),
+            DMG_DONE.load(Ordering::Acquire),
+            DMG_KILLED.load(Ordering::Acquire),
+            id_a,
+            id_free,
+            occ_a
+        );
+        dmg_release_probe_go(probe.slot);
+        dmg_release_go(owner.slot);
+        return;
+    }
+
+    // The ids the prober says it was given, read back out of its own param block — while it is parked,
+    // so this reads a LIVE slot rather than one that may already have been freed and recycled.
+    let (rep_b0, rep_b1) = unsafe {
+        let p = crate::arch::memory::slot_backing_ptr(probe.slot).add(DMG_PARAM_OFF) as *const u64;
+        (core::ptr::read_volatile(p.add(3)), core::ptr::read_volatile(p.add(4)))
+    };
+
+    // 4. GROUND TRUTH RE-READ, with the prober parked and every window — owner's and prober's — live.
+    let (occ_re, own_re) = dmg_win_masks(owner.slot);
+    let (_, own_probe) = dmg_win_masks(probe.slot);
+    // The two ids below are RING 3's report, so they are bound-checked BEFORE they reach a shift — a
+    // fixture bug must not become a kernel shift-overflow panic in the launcher that grades it.
+    let ids_ok = rep_b0 < WIN_MAX as u64
+        && rep_b1 < WIN_MAX as u64
+        && rep_b0 != id_a
+        && rep_b1 != id_a
+        && rep_b0 != rep_b1;
+    // THE PROBER'S OWN ROWS, reported by ring 3 and confirmed kernel-side against the slot that owns
+    // them. Separate from the "moved" test below: this is about the prober's report agreeing with the
+    // table, not about the ground truth the probes were graded against shifting.
+    let rows_ok = ids_ok && own_probe == ((1 << rep_b0) | (1 << rep_b1));
+    // THE GROUND TRUTH the expectations were built from: the owner still owns exactly `id_a`, and
+    // `id_free` is still free. This is the only condition that means "the table moved under the probe".
+    let table_ok = own_re == (1 << id_a) && occ_re & (1 << id_free) == 0;
+    if !ids_ok || !rows_ok {
+        serial_println!(
+            ":: DMG-REFUSE: the prober's own window rows do not match the table (id_a={} id_free={} b0={} b1={} entry={:#04x} recheck={:#04x} probe_owned={:#04x}) — refusal witness NOT RUN ::",
+            id_a, id_free, rep_b0, rep_b1, occ_a, occ_re, own_probe
+        );
+        dmg_release_probe_go(probe.slot);
+        dmg_release_go(owner.slot);
+        return;
+    }
+    if !table_ok {
+        serial_println!(
+            ":: DMG-REFUSE: the window table moved under the probe (id_a={} id_free={} b0={} b1={} entry={:#04x} recheck={:#04x} owned={:#04x}) — refusal witness NOT RUN ::",
+            id_a, id_free, rep_b0, rep_b1, occ_a, occ_re, own_re
+        );
+        dmg_release_probe_go(probe.slot);
+        dmg_release_go(owner.slot);
+        return;
+    }
+
+    // 5. Release the prober's park, then the owner, and collect both exits + the teardown proof.
+    dmg_release_probe_go(probe.slot);
     let pdeadline = crate::arch::ticks() + 10_000;
     while DMG_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < pdeadline {
         crate::arch::sched::yield_now();
     }
     let witness = DMG_PROBE_WITNESS.load(Ordering::Acquire);
     let presents = fb_present_count() - presents_before;
-
-    // The ids the prober says it was given, read back out of its own param block.
-    let (rep_b0, rep_b1) = unsafe {
-        let p = crate::arch::memory::slot_backing_ptr(probe.slot).add(DMG_PARAM_OFF) as *const u64;
-        (core::ptr::read_volatile(p.add(3)), core::ptr::read_volatile(p.add(4)))
-    };
-
-    // 4. GROUND TRUTH RE-READ, before the owner is released and while every window is still live.
-    let (occ_re, own_re) = dmg_win_masks(owner.slot);
-    // The two ids below are RING 3's report, so they are bound-checked BEFORE they reach a shift — a
-    // fixture bug must not become a kernel shift-overflow panic in the launcher that grades it.
-    let ground_ok = rep_b0 < WIN_MAX as u64
-        && rep_b1 < WIN_MAX as u64
-        && own_re == (1 << id_a)
-        && occ_re & (1 << id_free) == 0
-        && occ_re & (1 << rep_b0) != 0
-        && occ_re & (1 << rep_b1) != 0
-        && rep_b0 != id_a
-        && rep_b1 != id_a
-        && rep_b0 != rep_b1;
-    if !ground_ok {
-        serial_println!(
-            ":: DMG-REFUSE: the window table moved under the probe (id_a={} id_free={} b0={} b1={} entry={:#04x} recheck={:#04x} owned={:#04x}) — refusal witness NOT RUN ::",
-            id_a, id_free, rep_b0, rep_b1, occ_a, occ_re, own_re
-        );
-        dmg_release_go(owner.slot);
-        return;
-    }
-
-    // 5. Release the owner and collect both exits + the teardown proof.
     dmg_release_go(owner.slot);
     let vdeadline = crate::arch::ticks() + 8000;
     while DMG_DONE.load(Ordering::Acquire) < 2 && crate::arch::ticks() < vdeadline {
@@ -18056,6 +18128,27 @@ fn dmg_refuse_witness(demo_cpu: usize) {
             occ_a,
             occ_re
         );
+    }
+}
+
+/// DMG-REFUSE: the prober's SWEPT flag, read through its slot's identity backing. Nonzero means the
+/// prober fired all 19 probes and is parked with BOTH its windows still in the table.
+fn dmg_probe_swept(slot: usize) -> u64 {
+    unsafe {
+        let p = crate::arch::memory::slot_backing_ptr(slot).add(DMG_PARAM_OFF + DMG_SWEPT_OFF)
+            as *const u64;
+        core::ptr::read_volatile(p)
+    }
+}
+
+/// DMG-REFUSE: release the prober's post-sweep park — the `dmg_release_go` idiom, sound for the same
+/// reason (x86-TSO: the parked fixture's next aliased load after its 20 ms sleep observes the store).
+/// Called on EVERY path that has spawned the prober, so it can never be left parked holding a slot.
+fn dmg_release_probe_go(slot: usize) {
+    unsafe {
+        let go = crate::arch::memory::slot_backing_ptr(slot).add(DMG_PARAM_OFF + DMG_PROBE_GO_OFF)
+            as *mut u64;
+        core::ptr::write_volatile(go, 1);
     }
 }
 
