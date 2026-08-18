@@ -1195,6 +1195,88 @@ const DRAG_DIV: i32 = 8; // px → brad divisor (full-panel drag ≈ one revolut
 const DRAG_CLAMP: i32 = 64; // max |brad| a single frame's drag may contribute per axis
 
 // ---------------------------------------------------------------------------------------------
+// WHEELZOOM M1 — the zoom axis, and the two input sources that now share it.
+// ---------------------------------------------------------------------------------------------
+//
+// Peter's ask: "scroll should zoom the crystal in and out when over the top of vug". The WHEEL arc
+// landed the sensory channel (`INPUT_EV_WHEEL`, routed to the FOCUSED EL0 window's ring); this is
+// its first consumer.
+//
+// WHAT "ZOOM" IS IN THIS PROGRAM. There is no separate scale factor to multiply: the crystal's
+// screen-space scale is `FOCAL * dist / zc` in [`project`] and `FOCAL * SCENE_ZOOM * dist` in
+// [`scene_setup`], and BOTH are functions of one number — `dist`, the eye's distance from the
+// origin. Moving `dist` is therefore the whole zoom, for the wireframe and the shard alike, with no
+// second parameter to keep in step. The keyboard's `+`/`-` (and `e`/`q`) have moved exactly this
+// number since the program was written; the wheel now moves the same one, through the same
+// function, so the two sources cannot drift apart and the KEYBOARD path is what the QEMU suite
+// exercises on a machine that can deliver no wheel report at all.
+//
+// THE STEP AND THE CLAMPS ARE THE KEYBOARD'S, UNCHANGED. `ZOOM_STEP` is the `ONE/16` the held-key
+// arms already applied per frame, and `DIST_NEAR`/`DIST_FAR` are the `2.5`/`8` those arms already
+// clamped to. Widening either bound would change an EXISTING control's behaviour for a reason this
+// arc does not have, and the near bound in particular is load-bearing: `project` guards depth with
+// `(z2 + dist).max(ONE/4)`, and a `dist` inside the crystal's own radius drives that guard rather
+// than the projection. In on-glass terms the range is 0.5x (at `dist = 8`) to 1.6x (at `dist =
+// 2.5`) of the default framing at `dist = 4`.
+//
+// PER DETENT: `WHEEL_ZOOM_STEPS` keyboard-steps, positive HID delta (away from the operator) =
+// zoom IN = `dist` DOWN, which is the platform-conventional direction. Four steps is `ONE/4` of
+// distance, i.e. ~22 detents across the whole 5.5-unit range and a 3-10 % change in on-screen scale
+// per detent depending where in the range the operator is — one detent is visible, and no plausible
+// flick crosses the range by accident.
+const ZOOM_STEP: Fx = ONE / 16; // one keyboard-frame / one quarter-detent of eye distance
+const DIST_NEAR: Fx = 2 * ONE + ONE / 2; // closest eye distance (≈1.6x) — the keyboard's own bound
+const DIST_FAR: Fx = 8 * ONE; // furthest eye distance (0.5x) — likewise
+const WHEEL_ZOOM_STEPS: i32 = 4; // [`ZOOM_STEP`]s per wheel detent
+/// WHEELZOOM M1 — apply `steps` zoom steps to the eye distance and clamp. **The single zoom
+/// implementation**: the held-key arms and the wheel arm both call it, so the suite's keyboard path
+/// and the bench's wheel path exercise identical arithmetic, and the QEMU gate — which can be
+/// delivered no wheel report at all — still covers it.
+///
+/// Positive `steps` = zoom IN. Returns the new distance; the caller compares it against the old one
+/// to learn whether the clamp bit.
+///
+/// OVERFLOW IS BOUNDED BY THE DRAIN, and no runtime guard is owed. `FrameInput::wheel` accumulates at
+/// most [`MAX_DRAIN_PER_FRAME`] (64) events of at most ±127 detents each, so `|steps|` here cannot
+/// exceed `64 * 127 * WHEEL_ZOOM_STEPS` = 32 512 and `steps * ZOOM_STEP` cannot exceed 133 M — two
+/// orders inside an `i32`. Stated rather than clamped: a guard nothing can reach is bytes this program
+/// does not have (see the SIZE note), and the bound is a property of the drain's own cap.
+#[inline(never)]
+fn zoom_apply(dist: Fx, steps: i32) -> Fx {
+    (dist - steps * ZOOM_STEP).clamp(DIST_NEAR, DIST_FAR)
+}
+
+/// WHEELZOOM M1 — the wheel's whole zoom arm, and the `[vugzoom]` census with it.
+///
+/// `#[inline(never)]` AND IT IS LOAD-BEARING, exactly as it is on `put_slow`: the frame loop is a
+/// 3.8 KiB `_start` and this block is reached on the frames a hand is turning a wheel, i.e. never on
+/// any automated run. Inlined, it costs `_start` register pressure and spills for a path that is cold
+/// by construction; outlined it is one call. Measured against the `0x2000` `.text` line on x86 (see
+/// [`emit`]'s SIZE note), which is where this program's headroom actually is.
+///
+/// `next == dist` is the exact test for "this detent could not move the picture" — the operator is
+/// already at a bound — so the two counters separate the two facts a bench needs told apart: the
+/// detent ARRIVED and was decoded (`applied`), versus it arrived and the range is spent (`clamped`).
+/// ONE emit site with a chosen tag and a chosen counter, rather than two blocks, for the same SIZE
+/// reason the pause/hidden witness gives.
+///
+/// The KEYBOARD's zoom is deliberately not counted here: a held key already witnesses itself by
+/// moving the picture, and a line per frame a key is down is not a witness, it is a flood.
+#[inline(never)]
+fn wheel_zoom(dist: Fx, wheel: i32, applied: &mut u32, clamped: &mut u32) -> Fx {
+    let next = zoom_apply(dist, wheel * WHEEL_ZOOM_STEPS);
+    let (tag, n): (&[u8], u32) = if next != dist {
+        *applied = applied.wrapping_add(1);
+        (b"[vugzoom] applied=", *applied)
+    } else {
+        *clamped = clamped.wrapping_add(1);
+        (b"[vugzoom] clamped=", *clamped)
+    };
+    sayn(tag, n);
+    next
+}
+
+// ---------------------------------------------------------------------------------------------
 // Rasterisation (worker side).
 // ---------------------------------------------------------------------------------------------
 #[inline(always)]
@@ -1357,7 +1439,7 @@ extern "C" fn uvug_worker(arg: usize) -> ! {
 // ABIFREEZE: the packed-event type tags, imported from the crate the kernels pack them with.
 use una_abi::{
     INPUT_EV_BUTTON as EV_BUTTON, INPUT_EV_KEY_DOWN as EV_KEYDOWN, INPUT_EV_KEY_UP as EV_KEYUP,
-    INPUT_EV_MOUSE_REL as EV_MOUSE_REL,
+    INPUT_EV_MOUSE_REL as EV_MOUSE_REL, INPUT_EV_WHEEL as EV_WHEEL,
 };
 
 // Held-state bits.
@@ -1468,6 +1550,11 @@ struct FrameInput {
     clicks: u32,
     mdx: i32, // summed relative mouse dx while dragging
     mdy: i32, // summed relative mouse dy while dragging
+    /// WHEELZOOM M1: wheel DETENTS accumulated this frame, signed (positive = away from the operator
+    /// = zoom in). Summed rather than latched for the same reason `mdx`/`mdy` are: a fast flick puts
+    /// several detents in one drain, and taking only the last one would throw the gesture away.
+    /// Unconditioned on `drag` — a scroll is not a drag and needs no button held.
+    wheel: i32,
     /// UVUG-9: the drain hit `MAX_DRAIN_PER_FRAME` with the ring still non-empty — the freeze signature.
     saturated: bool,
 }
@@ -1583,6 +1670,13 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
                     fi.mdx += dx;
                     fi.mdy += dy;
                 }
+            }
+            // WHEELZOOM M1 — one scroll detent. `una-abi` publishes the payload's low byte as the HID
+            // boot-mouse wheel byte, a SIGNED `i8`, so the sign-extension is the ABI's stated decode
+            // (`input_ev_payload(ev) as u8 as i8`) and not a guess. The kernel only ever emits a
+            // NONZERO delta, so no filtering is owed here.
+            EV_WHEEL => {
+                fi.wheel += (lo & 0xFF) as u8 as i8 as i32;
             }
             _ => {}
         }
@@ -2085,12 +2179,12 @@ fn surface_checksum(surf: *const u8) -> u64 {
 // Tiny formatting into a byte buffer (no core::fmt — keep the text segment small).
 // ---------------------------------------------------------------------------------------------
 struct Buf {
-    b: [u8; 96],
+    b: [u8; 64],
     n: usize,
 }
 impl Buf {
     fn new() -> Self {
-        Buf { b: [0; 96], n: 0 }
+        Buf { b: [0; 64], n: 0 }
     }
     fn put(&mut self, s: &[u8]) {
         let mut i = 0;
@@ -2266,6 +2360,12 @@ pub extern "C" fn _start() -> ! {
     // this layer: unmissable proof that the router addressed the click to the window under the cursor,
     // with zero coupling to run state.
     let mut clicks: u32 = 0;
+    // WHEELZOOM M1: the `[vugzoom]` census — frames in which a WHEEL detent reached the zoom axis, and
+    // how many of those landed on a clamp. Two counters rather than one because they answer different
+    // questions at a bench: `applied` says the event arrived and was decoded, `clamped` says the
+    // operator is already at the end of the range and the picture is right to stop moving.
+    let mut zoom_applied: u32 = 0;
+    let mut zoom_clamped: u32 = 0;
     // VUGLIFE: one-shot latch for the waived-budget witness (detached/interactive only).
     let mut budget_waived = false;
 
@@ -2365,7 +2465,13 @@ pub extern "C" fn _start() -> ! {
         let frozen = paused || hidden;
 
         // --- fold input into rotation/zoom ---
-        let manual = interactive && (held & H_MOTION != 0 || (drag != 0 && (fi.mdx != 0 || fi.mdy != 0)));
+        // WHEELZOOM M1: a wheel detent is manual control in its own right — it needs no held key and no
+        // button down, which is exactly what distinguishes a scroll from the drag-rotate beside it. Note
+        // the disjunct is `fi.wheel`, this FRAME's detents, so the wheel arms manual mode for the frames
+        // it is actually turning and the idle tumble resumes when the hand stops (the held-key disjunct
+        // is a LEVEL and behaves differently on purpose: a key stays down).
+        let manual = interactive
+            && (held & H_MOTION != 0 || fi.wheel != 0 || (drag != 0 && (fi.mdx != 0 || fi.mdy != 0)));
         if frozen {
             // CLICK-ONE/CLICK-PLAIN: paused (by SPACE, or by a click under LAYER 2) — hold the
             // current orientation. VUGPAUSE: holding it is now
@@ -2388,11 +2494,28 @@ pub extern "C" fn _start() -> ! {
             if held & H_PIT_D != 0 {
                 pit += 4;
             }
-            if held & H_ZOOM_IN != 0 {
-                dist = (dist - ONE / 16).max(2 * ONE + ONE / 2);
+            // WHEELZOOM M1 — the ONE zoom axis, fed by BOTH sources through [`zoom_apply`]. The two
+            // held-key arms used to inline their own step and clamp; they now call the shared function
+            // with `+1`/`-1`, which is what makes the wheel arm below suite-covered on a machine that
+            // can deliver no wheel report at all (raspi4b attaches no USB): `+`/`-` exercise the
+            // identical arithmetic, and only the event source differs.
+            let ksteps = (held & H_ZOOM_IN != 0) as i32 - (held & H_ZOOM_OUT != 0) as i32;
+            if ksteps != 0 {
+                dist = zoom_apply(dist, ksteps);
             }
-            if held & H_ZOOM_OUT != 0 {
-                dist = (dist + ONE / 16).min(8 * ONE);
+            // The wheel's own arm. Applied AFTER the keys and clamped independently, which is the
+            // honest composition: a frame carrying both sources gets both, in order, and each is
+            // stopped by the same bound.
+            //
+            // WHEELZOOM M1 census — see `[vugzoom]`. `next == dist` is the exact test for "this detent
+            // could not move the picture", i.e. the operator is already at a bound, so the two counters
+            // separate the two things a bench operator needs told apart: the detent ARRIVED and was
+            // decoded (`applied`), versus the detent arrived and the range is spent (`clamped`). One
+            // line per wheel frame, so it is human-rate the way `:: UVUG: click n=` is; the keyboard
+            // path is deliberately NOT counted here, because a held key already witnesses itself by
+            // moving the picture and would put a line on the wire every frame.
+            if fi.wheel != 0 {
+                dist = wheel_zoom(dist, fi.wheel, &mut zoom_applied, &mut zoom_clamped);
             }
             if drag != 0 {
                 // Pointer motion → rotation, scaled + per-frame clamped (see DRAG_DIV/DRAG_CLAMP).
