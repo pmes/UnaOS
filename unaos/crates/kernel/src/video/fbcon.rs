@@ -642,7 +642,7 @@ pub fn _print(args: core::fmt::Arguments) {
     let tap = &crate::serial_ring::TAP_FBCON;
     tap.submit();
     // Once the GUI owns the screen, don't mirror to the framebuffer (serial still gets it).
-    if GUI_ACTIVE.load(Ordering::Relaxed) {
+    if GUI_ACTIVE.load(Ordering::Relaxed) || panel_mirror_held() { // DESKHOLD — the second half is the Pi's counterpart of x86's QUIET-PANEL gate: once `pidesk::activate` has cleared the glass to `DESKTOP_BG` the compositor owns those pixels and the panel mirror is a SECOND writer on them. Serial is untouched, the panic mirror overrides, and the test is a compile-time `false` off aarch64+pidesk. See `panel_mirror_held` at the file tail. LINE-NEUTRAL fold, PARITY §5.3 — this file is compiled into the knob-off image and a line added here renumbers every panic `Location` below it.
         tap.suppress();
         return;
     }
@@ -2214,4 +2214,78 @@ pub fn panel_console_face_arm() -> Option<(usize, usize)> {
         }
     });
     armed
+}
+
+/// DESKHOLD — **is the panel mirror being held off the glass right now?**
+///
+/// ### The defect this closes, and why it is a ONE OS one
+///
+/// On x86 the panel console mirror is OFF by default: `_print`'s QUIET-PANEL gate returns at its
+/// first test unless `bootlog` or `PANEL_CONSOLE` (the Kepler takeover's own seam) says otherwise,
+/// so a `wc` desktop NEVER has fbcon as a second writer on compositor-owned pixels. aarch64 has no
+/// such gate — `_print` mirrors the whole serial stream onto the panel, from every core, until
+/// `GUI_ACTIVE`. That was harmless while the Pi's glass WAS the console. It stopped being harmless
+/// the moment `pidesk::activate` cleared the panel to `DESKTOP_BG` and started compositing windows
+/// onto it, because from that line until [`panel_console_window_open`] installs the glyph route
+/// there are two writers on the same pixels, and the compositor is not the loud one:
+///
+///   * every newline plans two FULL-PANEL-WIDTH `Op::Fill` bands one cell tall (`plan_newline`), so
+///     a printing core repaints `2 * cell_h` rows of the glass, edge to edge, per line;
+///   * FONT-PI took that cell from 8x8 to 7x16, doubling the rows blacked per line and halving the
+///     lines needed to sweep the whole panel (60 -> 30) — and it arms the face at the TOP of
+///     `activate`, i.e. INSIDE the two-writer window;
+///   * with the anti-aliased face every glyph also paints its full opaque cell rather than ~22 set
+///     bits, so the sweep now leaves alpha-blended `FG_DEFAULT` on the glass as well as black.
+///
+/// Measured consequences on the armed gate, all three of them the same second writer:
+/// `[wc-d] verify win=1 band=0..80 … got=0x1b1b1b want=0x000000` (an anti-aliased `0xc0c0c0` edge
+/// over `BG_DEFAULT`, a value the pre-FONT-PI 1-bit face could not produce — the tree's own record of
+/// this class reads `got=0xc0c0c0`); `[wc-f] twin … comp_bad=4096 direct_bad=4096 got=0x000000`, both
+/// probe blocks wholly `BG_DEFAULT` between the probe's paint and its read-back; and
+/// `[wc-x] console-window DECLINE reason=install-contended`, which is `FBCON.try_lock()` losing to a
+/// printing core in the same window.
+///
+/// ### What the hold does, and what it deliberately does not
+///
+/// Held, `_print` charges the tap `suppressed` and returns before it touches the console lock at all.
+/// SERIAL IS UNTOUCHED — every line is on the wire, which is where this kernel's evidence lives; what
+/// stops is the second writer on pixels the compositor owns. It is armed once, by `pidesk::activate`
+/// at the DESKTOP-CLEAR that takes the glass, and it covers exactly the gap between that line and the
+/// route install below it: from the route onwards the console's way to glass is its WINDOW, exactly
+/// as on x86. On the decline path there is no window, so the hold stands for the boot and the log is
+/// serial-only — also exactly as on x86, and the honest reading of "the desktop owns the glass"
+/// rather than a second class of Pi-only desktop.
+///
+/// THE PANIC OVERRIDE IS EXPLICIT: a held mirror is ignored while `PANIC_MIRROR` is set, so
+/// `panic_screen`'s red backdrop and its text reach the panel whatever the desktop had claimed. That
+/// is the same belt-and-braces `_print`'s x86 mute gate keeps, for the same reason.
+#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+static PANEL_MIRROR_HOLD: AtomicBool = AtomicBool::new(false);
+
+/// DESKHOLD — arm the hold described above. Called by `pidesk::activate`'s DESKTOP-CLEAR.
+#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+pub fn panel_mirror_hold(on: bool) {
+    PANEL_MIRROR_HOLD.store(on, Ordering::Relaxed);
+}
+
+/// DESKHOLD — the test `_print` folds into its `GUI_ACTIVE` gate. Compile-time `false` everywhere the
+/// hold does not exist, so x86 and every knob-off Pi build reach that gate exactly as before.
+///
+/// THREE terms, and the third is what keeps this a PANEL hold rather than a console mute. Once the
+/// glyph route is installed `draw_fb()` is the window's surface and `_print` writes no panel pixel at
+/// all, so there is nothing left for the hold to protect — and holding on would leave the console
+/// WINDOW blank for the rest of the boot, which is the one outcome worse than the defect. The hold
+/// therefore lifts exactly when the route makes it redundant, and stays armed forever on the decline
+/// path, where there is no window and the panel is the only thing a print could reach.
+#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+fn panel_mirror_held() -> bool {
+    PANEL_MIRROR_HOLD.load(Ordering::Relaxed)
+        && !PANIC_MIRROR.load(Ordering::Relaxed)
+        && CONSOLE_WIN.load(Ordering::Relaxed) == wm::WIN_NONE
+}
+
+/// DESKHOLD — the absent-feature arm. See the sibling above.
+#[cfg(not(all(target_arch = "aarch64", feature = "pidesk")))]
+fn panel_mirror_held() -> bool {
+    false
 }

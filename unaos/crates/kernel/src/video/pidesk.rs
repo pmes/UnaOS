@@ -132,14 +132,41 @@ pub fn activate() -> bool {
     //    `render_service` calls `console.draw` (a whole-panel `clear_screen` at `Console::BG`, which
     //    is the same number as `wm::DESKTOP_BG`) before its first `pal.render`, so no zeroed back
     //    buffer ever reaches the glass. Named rather than silently skipped.
+    //    DESKHOLD — **and the panel mirror goes off with the same statement that takes the glass.**
+    //
+    //    The clear above is the line after which the compositor owns every panel pixel. Until this
+    //    arc, fbcon went on painting those same pixels: aarch64's `_print` has no counterpart of
+    //    x86's QUIET-PANEL gate, so the whole serial stream kept mirroring onto the glass, from
+    //    every core, all the way until the GUI handoff's `detach()`. That is a SECOND WRITER on
+    //    compositor-owned pixels — precisely what the paragraph above calls the no-direct-writes
+    //    law's whole subject — and it is loud: `plan_newline` bands are FULL PANEL WIDTH and one
+    //    cell tall, so a printing core repaints `2 * cell_h` rows edge to edge per line, which
+    //    FONT-PI's 8x8 -> 7x16 cell doubled while also making every glyph paint an opaque cell.
+    //
+    //    It convicted three witnesses at once on the armed gate, all of them reading a panel this
+    //    writer had just been over: `[wc-d] verify win=1 band=0..80 … got=0x1b1b1b want=0x000000`
+    //    (an anti-aliased `FG_DEFAULT` edge over `BG_DEFAULT` — a value the pre-FONT-PI 1-bit face
+    //    could not produce), `[wc-f] twin … comp_bad=4096 direct_bad=4096 got=0x000000` (both probe
+    //    blocks wholly `BG_DEFAULT` between the probe's paint and its read-back), and
+    //    `[wc-x] console-window DECLINE reason=install-contended` (a printing core holding
+    //    `FBCON` at the instant the route is installed).
+    //
+    //    x86 has had the right behaviour all along — `wcx`'s desktop never mirrors — so this is a
+    //    ONE OS defect on the same reading REALDESK gave the two retired bands, and the fix is the
+    //    same shape: the Pi stops doing the aarch64-only thing. Nothing is lost that this kernel
+    //    keeps evidence in — every line is still on the serial wire, and from the route install
+    //    thirty lines below the console's way to glass is its WINDOW, which is why the hold lifts
+    //    there by construction rather than by a second call. See `fbcon::panel_mirror_held` for that
+    //    term, for the panic override, and for what the decline path gets.
     {
         super::cursor::undraw();
+        fbcon::panel_mirror_hold(true);
         let fb = *super::WRITER.lock();
         fb.fill_screen(wm::DESKTOP_BG);
         fb.flush_all();
     }
     serial_println!(
-        "[pidesk] desktop-clear panel={}x{} bg={:08X} (pre-desktop residue off the glass; the window table is empty at this line)",
+        "[pidesk] desktop-clear panel={}x{} bg={:08X} (pre-desktop residue off the glass; the window table is empty at this line; the panel mirror is held from this line — DESKHOLD)",
         pw,
         ph,
         wm::DESKTOP_BG
@@ -155,8 +182,15 @@ pub fn activate() -> bool {
     //      * by NECESSITY, because `panel_console_window_open` sizes the console's surface in whole
     //        CELLS and must therefore see the face's cell, not the bitmap's;
     //      * on PURPOSE above the dock check, because the face is a legibility decision and the dock
-    //        check is a routing one. On the decline path the boot log stays on the glass — that is
-    //        the path where legible glass text is worth MORE, not less.
+    //        check is a routing one.
+    //
+    //    DESKHOLD retired the third reason this line used to give — "on the decline path the boot log
+    //    stays on the glass, and that is where legible glass text is worth MORE". It does not stay:
+    //    the mirror is held from the DESKTOP-CLEAR above, so from here the face decides how the
+    //    console looks IN ITS WINDOW and nothing else. The arming stays where it is for the two
+    //    reasons above, both of which are unaffected — and it now also has the property the old
+    //    ordering did not: the bigger cell can no longer be painted onto the glass in the window
+    //    between this line and the route install, because nothing is painted onto the glass there.
     let face_cell = fbcon::panel_console_face_arm();
     if face_cell.is_none() {
         serial_println!("[pidesk] console-face DECLINE reason=console-not-ready (the console keeps font8x8)");
@@ -205,7 +239,7 @@ pub fn activate() -> bool {
     let routed = fbcon::console_is_routed();
     if cwin == wm::WIN_NONE {
         serial_println!(
-            "[pidesk] console-window ABSENT — continuing to the bar (the boot log stays on the panel and the handoff will detach exactly as before)"
+            "[pidesk] console-window ABSENT — continuing to the bar (DESKHOLD: the boot log is serial-only from the desktop-clear, exactly as on an x86 `wc` desktop, and the handoff will detach as before)"
         );
     } else {
         // `routed=true` states that the glyph ROUTE is installed — every console line from here lands

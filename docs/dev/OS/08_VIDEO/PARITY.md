@@ -1051,6 +1051,90 @@ this track actually gates on is 111/111.
 
 ---
 
+## 6.9 The `exec-armedfix` arc — DESKHOLD, and the one writer three witnesses were reading
+
+CHROMESPEC (`508ca35d`), REALDESK (`96cc0c0d`) and FONTWIRE (`cb787847`) are each green on their own
+branch. Assembled, the armed gate (`UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8-test 300`) is red
+on two hard FAILs neither arc has alone. Both are the SAME second writer, and it is not one any of the
+three introduced — all three did was make it visible, louder, and unavoidable.
+
+### 6.9a The writer: aarch64 has never had x86's QUIET-PANEL gate
+
+`fbcon::_print` on x86 returns at its FIRST test unless `bootlog` or `PANEL_CONSOLE` is set, so a `wc`
+desktop is **never** mirrored to. aarch64 has no such gate: the whole serial stream paints the panel,
+from every core, until `GUI_ACTIVE`. Harmless while the Pi's glass *was* the console. Not harmless
+from the line `pidesk::activate` clears the panel to `DESKTOP_BG` and starts compositing onto it —
+from there until `panel_console_window_open` installs the glyph route there are **two writers on the
+same pixels**, and the compositor is the quiet one:
+
+* `FbCon::plan_newline` emits two `Op::Fill` bands per newline, and `paint_ops` renders them with
+  `fill_rows` — **full panel width**, one cell tall. A printing core therefore repaints `2 * cell_h`
+  rows of the glass edge to edge, per line, at `fbcon::BG_DEFAULT` — which is `0x000000`.
+* FONTWIRE took that cell from `8x8` to `7x16`: **twice the rows blacked per line**, and the cursor
+  now sweeps the whole 480-row panel in 30 lines instead of 60. It also arms the face at the TOP of
+  `activate`, i.e. inside the two-writer window, and the anti-aliased path paints each glyph's **full
+  opaque cell** rather than ~22 set bits.
+* CHROMESPEC judged `wcf::reserved`'s two boxes separately, which is correct and is what made
+  `[wc-f] twin` RUN on the armed desktop at all. Its one shot lands on the first composite pass with
+  `drawn > 0` — which is `wm::create_at` **inside** `panel_console_window_open`, i.e. squarely inside
+  the two-writer window.
+
+### 6.9b The two convictions, by colour
+
+**`[wc-f] twin … checked=8192/8192 comp_bad=4096 direct_bad=4096 first=(480,400) got=0x000000
+want=0x1010f0 -> FAIL`.** 100% of *both* blocks, at `0x000000`. The probe paints, cleans, invalidates
+and reads back inside one function; nothing in the compositor writes black there. `0x000000` is
+`fbcon::BG_DEFAULT` and nothing else on this panel is (`video::PANEL_BG` is `0x1e1e1e`,
+`wm::DESKTOP_BG` `0x2d2b55`). The same capture corroborates it 14 px away, on a pixel WC-F never
+touches: `[chrome-truth] pt=desktop at=(638,478) want=0x2d2b55 got=0x000000 -> NOCLEAR`. With the hold
+in place that same probe reads `got=0x2d2b55 -> HIT`, which is the conviction closed from the other
+end.
+
+**`[wc-d] verify win=1 surf=560x352 band=0..80 … bad_cache=1183 bad_ram=1183 first=(183,93)
+got=0x1b1b1b want=0x000000 -> FAIL`.** The panel carries an anti-aliased `fbcon::FG_DEFAULT`
+(`0xc0c0c0`) edge over `BG_DEFAULT` where the window's surface is black — i.e. console glyphs painted
+straight onto the glass on top of the window's blit. **`0x1b1b1b` is FONTWIRE's fingerprint**: the
+1-bit `font8x8` face could only ever put `0xc0c0c0` or nothing on the glass, and the tree's own record
+of this class (pi4-regression.spec, THE RESIDUE) reads `got=0xc0c0c0`.
+
+### 6.9c DESKHOLD — the fix, and where it is *not*
+
+`fbcon::panel_mirror_hold(true)` is armed by `pidesk::activate` in the same block as the DESKTOP-CLEAR
+that takes the glass. Held, `_print` charges the tap `suppressed` and returns **before it touches the
+console lock at all**; serial is untouched. It lifts by construction the moment `CONSOLE_WIN` is
+installed — from there `draw_fb()` is the window's surface and there is no panel write left to hold —
+and stands for the boot on the decline path, where there is no window. `PANIC_MIRROR` overrides it, so
+the red backdrop still reaches the glass. One line changed in `_print` (line-neutral, §5.3), the rest
+appended at `fbcon.rs`'s existing APPEND-ONLY TAIL.
+
+Two things this deliberately does **not** do. It does not touch a witness: `wcf.rs` and `wm.rs` are
+byte-identical to the merge tip, so every go-red path is the one CHROMESPEC proved. And it does not
+reach the residue class `pidesk.rs` already names and assigns — *"a console that presents from
+arbitrary print context is an unsynchronised compositor client"*. After the route install fbcon writes
+the console window's **surface** from print context while the compositor blits and checksums it, which
+is what still produces the odd `[wc-g] win=1 … -> COHER` and, less often, a `[wc-d] verify win=1`
+whose panel lags an unpresented band. That is `exec-shellport`'s pacing lane, unchanged by this arc
+and now the only cause left rather than one of two.
+
+### 6.9d Two OWED items this arc measured and did not take
+
+1. **The dock paints over WC-F's twin box.** `wcf::reserved` seats the twins at `ph-MARGIN-SIDE` —
+   rows `400..464` at 640x480 — and `dock::Layout` seats the strip at `ph-PAD-STRIP_H`, rows
+   `416..468`, roughly `x 49..591`. The marks the bench operator is asked to photograph are therefore
+   overpainted across 48 of their 64 rows. `ui_status::free_span` already yields the corners to WC-F;
+   the dock has no equivalent deference and no witness says so.
+2. **The twin's retry path is closed once the desktop fills.** `wcf::clearance` is each box's
+   FULL-WIDTH row span (correct — the cache maintenance is per-scanline), so any window reaching rows
+   `400..464` vetoes the twins. REALDESK's `bottom_reserved=76->64` widens the unreserved slice above
+   the dock from 4 rows to 16, and every armed capture on this tip duly ends with a late
+   `[wc-f] twin -> DEFER`. The verdict therefore rests entirely on winning the FIRST composite pass.
+   The derived fix is for the bottom reservation to cover what the bottom strip actually holds —
+   `dock_reserve_h()` maxed against WC-F's own published `MARGIN + SIDE` (80 rows) — but that moves
+   `wm::place`'s work area and with it every pinned geometry the spec reads, so it wants its own arc
+   and its own gate, not a late edit in this one.
+
+---
+
 ## 7. Accounting check
 
 501 sites. 10 already ported (family 1) + 67 `wc` gates (family 2) + 165 plain (family 3) + 162
