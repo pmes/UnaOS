@@ -1202,10 +1202,15 @@ FORBID \[wc-k\] .*outside=[1-9]
 # --- > STALL_SPREAD (8) x this window's own floor (video/wcg.rs, H_STALL). The [wc-h] family
 # --- stays the pi4 gate's subject (see the bullet above); what belongs HERE is the guard's
 # --- internal consistency, because a conviction REQUIRES a spread: a present convicted as a stall
-# --- implies maxrate/minrate > 8, so `stalls=` nonzero beside `presspread=` in single digits 0-7
-# --- is arithmetic the emitter cannot honestly produce — it means the guard convicted without the
-# --- evidence, and the verdict diversion (a torn count silently suppressed) is live. Both scopes.
-FORBID \[wc-h\] rollup .*stalls=[1-9][0-9]* .*presspread=[0-7] pop=constant
+# --- implies an earned floor >= 1 and rate > 8x it, so maxrate/minrate >= 8 and `presspread=` in
+# --- single digits 0-7 beside a counted stall is arithmetic the emitter cannot honestly produce.
+# --- THE BOUND IS >= 2, not >= 1 (review, 2026-08-18): a window-id recycle racing an in-flight
+# --- composite of the dead tenant can land ONE stray stall count after wch_recycle reset the rate
+# --- extrema — the same bounded one-fold exposure paygo_recycle accepts — and that lone stray
+# --- beside a fresh tenant's honest presspread=1 must not wedge this gate red for the rest of the
+# --- boot. One stray cannot reach 2 (every recycle resets the counter first), while a live guard
+# --- defect convicts repeatedly, so the >= 2 form keeps the falsifier and sheds the false red.
+FORBID \[wc-h\] rollup .*stalls=([2-9]|[1-9][0-9]+) .*presspread=[0-7] pop=constant
 
 # --- WCK4: THE ERASE-DISCIPLINE VERDICTS, FORBIDDEN ------------------------------------------
 # --- The [drag-occ] witness measures pixels PUBLISHED into the dragged window's live box by

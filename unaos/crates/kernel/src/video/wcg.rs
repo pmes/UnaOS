@@ -431,9 +431,10 @@ static H_MAXRATE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// slow copy a genuine tear risk is. This is the stall guard that doc names as the x86 seat's open
 /// item, built on the measurement it asked for.
 ///
-/// The precedence is deliberate and conservative: a window's FIRST slow present can never be
-/// convicted (its own rate seeds the floor, ratio 1), and a window whose every present is slow
-/// keeps counting `torn=` exactly as before — the guard only diverts the outliers. `stalls=` is
+/// The precedence is deliberate and conservative: a window's first present OVERALL can never be
+/// convicted (no earned floor exists yet — its own rate seeds it), and a window whose every
+/// present is slow keeps counting `torn=` exactly as before (each rate sits near the floor its
+/// siblings set) — the guard only diverts outliers against a floor the window itself earned. `stalls=` is
 /// printed beside `torn=` so the diverted population stays on the wire; the verdict reads `torn=`
 /// alone, so a stall can never manufacture `-> AT-RISK` and metal FORBIDs keep their teeth.
 static H_STALL: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
@@ -759,7 +760,11 @@ pub fn stage_note(
         let stalled = bytes != 0 && {
             let rate_ns_4k = present_us.saturating_mul(4_096_000) / bytes as u64;
             let lo = H_MINRATE[i].load(Ordering::Relaxed);
-            lo != u64::MAX && rate_ns_4k > lo.saturating_mul(STALL_SPREAD)
+            // `lo != 0` is load-bearing (review finding, 2026-08-18): a present that measures 0 µs
+            // folds a floor of ZERO, and `rate > 0 * 8` would then convict EVERY subsequent slow
+            // present — torn= suppressed for the window's whole life, the pi4 AT-RISK FORBID
+            // permanently disarmed. A zero floor is "no floor", same as MAX: decline and count torn.
+            lo != u64::MAX && lo != 0 && rate_ns_4k > lo.saturating_mul(STALL_SPREAD)
         };
         if stalled {
             H_STALL[i].fetch_add(1, Ordering::Relaxed);
@@ -2386,9 +2391,15 @@ static APP_OFF: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
 /// `H_ROLLED` (the rollup latch rides the budget it latches on).
 ///
 /// Racing composites: a pass that snapshotted the DEAD tenant's row can still fold one sample in
-/// after this reset — one stray sample misattributed to the new tenant, the same bounded exposure
-/// [`paygo_recycle`] already accepts, and strictly smaller than the whole-life inheritance this
-/// function removes.
+/// after this reset — the same one-fold exposure [`paygo_recycle`] already accepts, and strictly
+/// smaller than the whole-life inheritance this function removes. Stated honestly per cell class
+/// (review, 2026-08-18): for the COUNTERS the stray is one misattributed count; for the EXTREMA
+/// (`H_MAXPRES`/`H_MINPRES`/`H_MINRATE`/`H_MAXRATE`/`H_MINSPAN`, all `fetch_min`/`fetch_max`) a
+/// stray fold PERSISTS until the next recycle — including a foreign fast rate seeding
+/// [`H_STALL`]'s floor low. Accepted because the race needs a destroy+create of the same slot
+/// while a composite is mid-flight on the dead row; the structural fix (a per-row generation
+/// plumbed into `stage_note`) is recorded as owed, not taken here. The stall-guard FORBID in
+/// x86-witness.spec is bounded at >= 2 for exactly this stray (see the spec's WCH-STALL block).
 pub(super) fn wch_recycle(i: usize) {
     if i >= IDS {
         return;

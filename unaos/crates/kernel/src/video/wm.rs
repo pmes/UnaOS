@@ -4041,6 +4041,12 @@ fn composite_inner() -> CursorTail {
         let shell = shell_z();
         let mut paint: [(usize, usize, usize, usize); MAX_WINDOWS] = [(0, 0, 0, 0); MAX_WINDOWS];
         let mut npaint = 0usize;
+        // MENU-UNDER/DOCK — the dock's tile count, snapshotted under the SAME table acquisition the
+        // paint set uses, so the arming block below can price the dock's rect without a second
+        // `TABLE` lock (occ_clip's "no second table lock" rule is per-window in the blit loop; this
+        // is once per pass, and here it is free).
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        let mut sprite_dock_tiles = 0usize;
         #[allow(unused_mut)]
         let mut hit = {
             let t = table();
@@ -4049,6 +4055,10 @@ fn composite_inner() -> CursorTail {
                     paint[npaint] = outer_box(r);
                     npaint += 1;
                 }
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+            {
+                sprite_dock_tiles = dock_tiles(&t.rows);
             }
             npaint > 0
         };
@@ -4086,20 +4096,36 @@ fn composite_inner() -> CursorTail {
         // whole-sprite bracket instead: the tail's draw re-saves from the FRONT, which is the
         // dropdown, and the restore hands the menu back its own pixels.
         //
-        // Not folded into `hit`: the menu is static — with no window under the sprite nothing
+        // Not folded into `hit`: the furniture is static — with no window under the sprite nothing
         // presents there, the front-sourced sprite draw is already correct, and a bracket would be
-        // pure duty cycle. The dock and bar need no arm at all because `wm::place` keeps every
-        // window out of their rows — no window under them, no overlay session to poison; the
-        // dropdown is the one piece of furniture that hangs over the work area.
+        // pure duty cycle.
         //
-        // `open_rect` is one relaxed load on every boot with the menu closed, so the closed-menu
-        // cost of this block is the `WRITER` read it shares with the arm above's shape.
+        // THE ARMING SET IS THE `occ_clip` FURNITURE SET, and it has to be (review finding,
+        // 2026-08-18): the first cut tested only the dropdown, claiming `wm::place` keeps windows
+        // out of the dock's rows — false for a DRAGGED window. `place` tiles only non-pinned rows,
+        // and `move_to_inner`'s clamp deliberately omits the bottom reservation ("the operator's
+        // business"), so a drag can park a window under the dock, where WCK5 withholds the dock's
+        // columns from its blits — the identical layer-save poison, one strip along. So: the open
+        // dropdown AND the dock, both tested here. The menu BAR genuinely needs no arm — the
+        // `min_y = work_top + TITLE_H + BORDER` clamp holds for `move_to` and `create_at` alike,
+        // so no window box can reach its rows.
+        //
+        // `open_rect` is one relaxed load on every boot with the menu closed; the dock rect is
+        // `for_panel` over the tile count snapshotted under the paint set's own table acquisition
+        // (`sprite_dock_tiles` above) — no second table lock, same source `occ_clip` prices.
         #[cfg(all(target_arch = "x86_64", feature = "wc"))]
         {
             let fb = *super::WRITER.lock();
             if fb.is_ready() {
                 let info = fb.info();
                 if let Some(b) = super::crystal::open_rect(info.width, info.height) {
+                    if b.2 != 0 && b.3 != 0 && boxes_overlap(sbox, b) {
+                        reserved_hit = true;
+                    }
+                }
+                if let Some(b) = super::dock::Layout::for_panel(sprite_dock_tiles, info.width, info.height)
+                    .map(|l| l.rect())
+                {
                     if b.2 != 0 && b.3 != 0 && boxes_overlap(sbox, b) {
                         reserved_hit = true;
                     }
