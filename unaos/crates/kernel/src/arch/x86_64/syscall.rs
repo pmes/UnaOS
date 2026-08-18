@@ -3865,6 +3865,17 @@ fn present_backpressure(slot: usize, outcome: crate::video::wm::Presented) -> i6
             // input→glass tail by up to a frame plus a service tick. Everything else is
             // `Composited`'s: same return, same hidden-counter reset — the window is visible and
             // presenting.
+            //
+            // CRYSTAL-HD, on the return that STAYS 0. The held CRYSTAL-PACE half answered a third
+            // status here (`WIN_PRESENT_COALESCED` = 2) so `user-vug` could park until the frame
+            // edge admitted a present. Dropped on landing, for two independent reasons: it is a
+            // pacer on the render path, which Peter ruled out on 2026-08-13 (`9d12e7e0`, PARITY.md
+            // §5.1 — a vug renders unpaced on every chip); and it is the one arm that could make
+            // `SYS_WIN_PRESENT`'s SUCCESS contract differ between x86 and aarch64, which the Pi's
+            // present-rows port depends on staying identical. Coalescing remains a COMPOSITOR-side
+            // decision, invisible to ring 3 by design: the damage is committed and a pass inside
+            // this frame is guaranteed, so from the caller's side the present succeeded exactly as
+            // `Composited` did.
             SLOT_HIDDEN_PRESENTS[slot].store(0, Ordering::Relaxed);
             0
         }

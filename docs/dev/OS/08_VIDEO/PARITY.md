@@ -588,6 +588,89 @@ foreground `run` behaves identically on x86 — it is shared ring-3 behaviour, n
 Pi feels it more only because 6.6a denies it the easy `bg` path). `user-pulse` is fully at parity: its
 drawing is common code and `arroyo:2885` already stages `PULSE.ELF` on Pi media.
 
+#### 6.6e — the `exec-crystalhd` arc: CRYSTAL-HD/AA land on both chips, CRYSTAL-PACE does not
+
+The held `crystal-graphics-hold` commit (`e65d5d9b`) was three coupled halves. Two landed on both
+arches; the third is refused by a ruling already in this document.
+
+**CRYSTAL-HD + CRYSTAL-AA — landed, arch-neutral.** The window surface cap rises 128 → 288 in BOTH
+`arch/x86_64/memory.rs` and `arch/aarch64/boot.rs` (Peter's sign-off, 2026-08-18, verbatim option
+"1": `FB_WIN_MAX` 128 → 288, window slots 8 → 4, +15 MiB `.bss`), and `user-vug` renders a 288×288
+shard on both chips with antialiased facet edges and silhouette at the top LOD rung. The held commit
+kept aarch64 at 128 for two reasons that were retired rather than overruled: the aarch64 FB hole was
+"another session's lane" (this arc raises it, with the Pi's `.bss`-to-heap margin measured at
+15.31 MiB), and the Pi gate's 300-frame checksum was called "a 128 fact" when it is a fact about the
+render, restated at 288 in `pi4-regression.spec`. A bare `target_arch` gate in the experience layer
+with no hardware reason is what §"ARCH-NEUTRAL BY DEFAULT" fails at review. Full seam-by-seam record:
+`02_KERNEL_CORE/userspace.md`, "CRYSTAL-HD".
+
+**CRYSTAL-PACE — NOT landed; §5.1 already decided it.** The third half added a `SYS_WIN_PRESENT`
+status (`WIN_PRESENT_COALESCED = 2`) telling ring 3 its present had been absorbed into the panel
+frame in flight, and a `pace_edge` loop in `user-vug` that parked one kernel tick at a time,
+re-presenting until the frame edge admitted one — locking the render loop to the composite cadence.
+Three findings, each sufficient on its own:
+
+1. **It is the pacer §5.1 removed, one layer out.** Peter's ruling of 2026-08-13 (`9d12e7e0`) is that
+   a vug renders unpaced on every chip, and that the direction is *more drawing complexity, never
+   artificial pacing*. A render loop that sleeps until the compositor lets it through is `vsyncpace`'s
+   sleep moved across the syscall boundary into the program — and GR25's quoted argument (§5.4) is
+   that the machine's answer to a present is how long the work takes, not a sleep chosen on the
+   program's behalf. HD and AA land precisely because they are the ruling's other side: 2.25× the
+   source density and resolved edges, on the same free-running loop.
+2. **It was the only arm that could split verb 30's success contract between the arches.** aarch64
+   has no coalescing pacer and could never answer a third status, so a ring-3 program written against
+   a 3-valued x86 contract would silently mean something else on the Pi — the divergence the
+   present-rows port (§6.6d-closed) was careful not to open. `SYS_WIN_PRESENT` keeps `0` for every
+   success on both chips; coalescing stays a compositor-side decision ring 3 cannot see.
+3. **Its LOD-ladder change was downstream of the pace loop and dies with it.** CRYSTAL-PACE replaced
+   `LOD_UP` with a render-time utilisation license (`busy * 16 < TICK_HZ * 3`) on the premise that
+   "with presents locked to the panel a healthy window reads ~60 whether the raster took 2 ms or 15".
+   That premise is `pace_edge`'s: without it the vug's meter counts the frames it RENDERS and nothing
+   throttles that loop, so the achieved rate is still the honest signal `LOD_UP` was written against.
+   The Pi's reading of these constants was fixed at the source instead (§6.8a/§6.8b, `abi_ticks`),
+   and that fix deliberately retuned no ladder constant. This arc retunes none either.
+
+**FINDING, and a decision for Peter — at 288 the shard's ON-GLASS box gets SMALLER, on both chips.**
+The held commit justified the number 288 as "the largest edge whose window still tiles at an integer
+scale >= 3" on the 2880×1800 panel, from `min(2880/2/288, 1800/2/288) = 3`. That arithmetic used the
+raw panel height; `wm::place_scale` divides the WORK AREA (`work_h` = panel − `top_chrome_h` −
+`chrome_h`). Measured on the bench-geometry gate (`UNAOS_FBW=1920 UNAOS_FBH=1200`, armed):
+
+```
+[wc-a] create win=4 asid=0x1 surf=288x288 stride=1152 scale=1x at (17,85)   <- this arc
+[wc-a] create win=4 asid=0x1 surf=128x128 stride=512  scale=4x at (17,85)   <- base d99bec68
+```
+
+Pi bench, 1920×1200: `top_chrome_h` = 34 (menu bar) and `chrome_h` = `dock_reserve_h` = 64, so
+`work_h` = 1102 and `work_h/2/288` = **1**. The shard's content box goes 512 px → 288 px — 44 %
+smaller on glass, while gaining 2.25× the source density. The same arithmetic on the rMBP 2880×1800
+gives `work_h` = 1702 and `work_h/2/288` = **2**, i.e. 576 px against the 128×128 window's 768 px at
+6×: smaller there too. **288 is the first edge that falls off the 2× step on a 1200-row work area**
+(2× needs `work_h >= 1152`; there are 1102).
+
+This is reported rather than acted on, because every resolution is someone else's call:
+
+* **(a) Ship 288 as landed** — sharpest possible shard, visibly smaller window. What is committed.
+* **(b) Have `user-vug` request 256 rather than the cap.** One line in `main.rs`, entirely in this
+  lane, no ABI or cap change: `work_h/2/256` = 2 on the Pi bench → a 512 px content box, **the exact
+  on-glass size the 128×128 shard has today, at 2× the source density**; 3 on the rMBP → 768 px, also
+  today's size. 256 divides every LOD cell (1/2/4) and every band boundary as cleanly as 288.
+* **(c) Change `place_scale`'s fit rule.** `wm.rs`, shared, moves x86 layout for every window — not a
+  lane this arc may take, and a desktop-wide design change rather than a vug one.
+
+The 288 CAP is Peter's signed number and is what costs the `.bss`; the vug's REQUESTED edge is a
+separate number and (b) is available without re-litigating the cap.
+
+**Gates (this arc).** `./arroyo check` and `UNAOS_WC=1 ./arroyo check` green, both arches. Knob-off
+`kernel8-test` **117/117, 0 forbidden**. Armed (`UNAOS_PIDESK=1 UNAOS_QUARRY=1`) and bench-geometry
+armed are red on this tree and **equally red on the base**, A/B'd two runs each: 117/117 required on
+every run of both trees, the forbidden set drawn from the same nondeterministic
+`[wc-d]`/`[wc-g]`/`[dragperf]` families, and at bench geometry this tree shows FEWER distinct failing
+families than the base (6 vs 8). `[dragperf]` fails on the base too — its fixture issues one drag
+report per 8 ms of wall clock and needs them inside `DRAG_MOTION_MS` = 16 to observe a coalesce; a
+loaded host stretches the iteration past 16 ms and `coalesced` reads 0. `[wc-g] rollup win=4 … ->
+CLEAN` for the 288 surface at bench geometry: the wider blit is coherent.
+
 ### 6.7 The `exec-vugspread` arc — what VUGSPREAD actually is, and what the Pi was missing
 
 **The row above named the gap as "placement/steal repair". Only half of that was true, and the half

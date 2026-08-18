@@ -196,9 +196,9 @@ use una_abi::SYS_INPUT_WAIT;
 ///
 ///   SYS_WIN_CREATE(w, h) -> win id (0..WIN_MAX) / -errno
 ///     Allocate a window owned by the CALLER's ASID and map its surface into the caller's EL0 window.
-///     `w`/`h` are pixels, 1..=128 each (`boot::FB_WIN_MAX_W/H`); the surface is ARGB8888 with
+///     `w`/`h` are pixels, 1..=288 each (`boot::FB_WIN_MAX_W/H`); the surface is ARGB8888 with
 ///     `stride = w * 4`, and the mapping is negotiated PAGE-MULTIPLE (`ceil(w*4*h / 4096)` pages of the
-///     window's 64 KiB VA slot). The surface VA is published in the RO info page (see `fb_info_write`);
+///     window's 0x51000 VA slot). The surface VA is published in the RO info page (see `fb_info_write`);
 ///     `SYS_FB_MAP` remains the way to get it back as a return value for the compat window.
 ///   SYS_WIN_PRESENT(win) -> 0 / -errno
 ///     Damage-mark + composite the window. Fail-closed on a free id (`-EBADF`) or a window owned by
@@ -12004,7 +12004,7 @@ fn present_surface_common(
 // A fixed table of WIN_MAX windows, each owned by exactly one ASID. Two indices, deliberately distinct:
 //   * the WINDOW ID (0..WIN_MAX) — GLOBAL, what EL0 passes to the WIN verbs and what the compositor
 //     names a window by;
-//   * the REGION SLOT (0..FB_WIN_SLOTS) — PER-ADDRESS-SPACE, which 64 KiB surface slot of the owner's
+//   * the REGION SLOT (0..FB_WIN_SLOTS) — PER-ADDRESS-SPACE, which surface slot of the owner's
 //     own FB region backs it. Region slots are allocated lowest-first per ASID, so a process's FIRST
 //     window always lands on region slot 0 — the VA the single ELF-3 surface occupied, which is what
 //     makes `SYS_FB_MAP`'s returned VA byte-identical for the existing VUG.ELF binary.
@@ -12019,11 +12019,20 @@ fn present_surface_common(
 // Keeping the check on this side means the seam to WC-A carries no security weight.
 // =============================================================================================
 
-/// WC-B: the fixed window count. Matches `boot::FB_WIN_SLOTS` (asserted below) and the compositor's
-/// fixed table. STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not raise it for a demo.
+/// WC-B: the fixed GLOBAL window count. STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not
+/// raise it for a demo.
+///
+/// CRYSTAL-HD: this used to be `WIN_MAX == boot::FB_WIN_SLOTS`, and that equality was never the
+/// requirement — it was two caps that happened to be equal. The two count different things (see the
+/// header above): `WIN_MAX` is how many windows the SYSTEM may have live, `FB_WIN_SLOTS` how many
+/// surface slots ONE address space reserves. When the surface cap rose to 288×288 the per-process
+/// count came down 8 → 4 to keep the region inside one L3; the global table did not, and must not,
+/// follow it. What is load-bearing is the SAFE direction, asserted here exactly as the x86 twin
+/// asserts it: a region slot is indexed per address space and a window id is global, so a region
+/// slot index must never be able to exceed the global table.
 const WIN_MAX: usize = 8;
-const _: () = assert!(WIN_MAX == super::boot::FB_WIN_SLOTS);
-/// WC-B: a 128×128 ARGB8888 surface must fit a window's 64 KiB VA slot exactly.
+const _: () = assert!(super::boot::FB_WIN_SLOTS <= WIN_MAX);
+/// WC-B: a `FB_WIN_MAX_W` × `FB_WIN_MAX_H` ARGB8888 surface must fit a window's VA slot exactly.
 const _: () = assert!(
     (super::boot::FB_WIN_MAX_W * super::boot::FB_WIN_MAX_H * 4) as usize
         == super::boot::FB_WIN_SLOT_SIZE
@@ -12209,7 +12218,16 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     let _irq = IrqGuard::mask_save();
     let mut t = WINDOWS.lock();
     // Lowest-free REGION slot for this ASID (so a process's first window is region slot 0 — the compat VA).
-    let rslot = match (0..WIN_MAX)
+    //
+    // CRYSTAL-HD — THE TWO RANGES ARE NOT THE SAME RANGE, and this is where that stopped being
+    // harmless. The CANDIDATE range is `FB_WIN_SLOTS` (how many surface slots this address space's FB
+    // region actually reserves); the SCAN range is `WIN_MAX` (any global row could belong to this
+    // ASID). Both were `WIN_MAX` while the two caps were equal; with `FB_WIN_SLOTS` at 4 and
+    // `WIN_MAX` still 8, a `WIN_MAX` candidate range would hand out region slot 4..7 and
+    // `map_slot_fb_win` would map 81 pages past the end of the FB region, into the NEXT slot's
+    // backing store. The x86 twin took the same correction when its caps diverged; the fifth window
+    // now gets the honest `-EMFILE` this verb already documents.
+    let rslot = match (0..super::boot::FB_WIN_SLOTS)
         .find(|&r| !(0..WIN_MAX).any(|i| t[i].owner == asid && t[i].rslot as usize == r))
     {
         Some(r) => r,
@@ -14400,7 +14418,7 @@ fn fb_launcher(_demo_cpu: usize) {
 //
 // Bit ledger (all eighteen must be set):
 //   b0  create(128,128) -> id >= 0           b6  create(0,0)        -> -EINVAL
-//   b1  the per-window info entry reads back b7  create(129,10)     -> -EINVAL (over FB_WIN_MAX_W)
+//   b1  the per-window info entry reads back b7  create(289,10)     -> -EINVAL (over FB_WIN_MAX_W)
 //       magic/128/128 for region slot 0      b8  close(A)           -> 0
 //   b2  present(A) -> 0                      b9  close(A) again     -> -EBADF (row already free)
 //   b3  move(A,40,24) -> 0                   b10 create(64,64) -> a SECOND id >= 0
@@ -14440,7 +14458,7 @@ const WCB_WITNESS_ALL: u64 = 0x3_FFFF;
 /// `WCB_FILL`, so the two `[wc-c]` per-window checksums cannot coincide and a composite that read the
 /// wrong surface for either window is visible in the witness.
 const WCB_FILL_B: u8 = 0x5A;
-/// WC-C: the second window's edge, in pixels. 64x64x4 = 16 KiB = 4 pages of its 64 KiB slot.
+/// WC-C: the second window's edge, in pixels. 64x64x4 = 16 KiB = 4 pages of its 0x51000 slot.
 const WCB_W_B: usize = 64;
 /// WC-B: the byte the fixture fills its whole 128×128 surface with.
 const WCB_FILL: u8 = 0xC3;
@@ -14452,10 +14470,18 @@ fn wcb_report(value: u64) {
     }
 }
 
+/// WC-B: the fixture's OWN window edge, in pixels — window A is 128×128 and its blob fills exactly
+/// 64 KiB. CRYSTAL-HD: this used to be spelled `FB_WIN_MAX_W`, which was only ever a coincidence —
+/// the fixture asks for the then-maximum edge, it does not ask for "the maximum". With the cap at 288
+/// the two parted company, and the fixture's asm still stores 65 536 bytes, so the expected checksum
+/// has to be a fact about the FIXTURE, not about the cap. (The over-max REFUSAL leg, b7, is the one
+/// check that must track the cap, and it does — see the blob's `#289`.)
+const WCB_W: usize = 128;
+
 /// WC-B: the kernel-computed expected checksum of the presented surface — FNV-1a over a full
 /// 128×128 ARGB8888 surface (16 pages) of `WCB_FILL`. Mirrors `fb_expected_checksum`.
 fn wcb_expected_checksum() -> u64 {
-    let n = (super::boot::FB_WIN_MAX_W * super::boot::FB_WIN_MAX_H * 4) as usize;
+    let n = WCB_W * WCB_W * 4;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0usize;
     while i < n {
@@ -14535,7 +14561,8 @@ __wcb_prog:
 9:
     cmp  x21, #0                           // (b11) fill B with a DIFFERENT byte, then present it
     b.lt 9f                                // no B -> nothing to fill; leave the bit clear
-    add  x12, x9, #0x15, lsl #12           // region slot 1's surface: base + 0x5000 + 0x10000
+    add  x12, x9, #0x56, lsl #12           // region slot 1's surface: base + 0x5000 + FB_WIN_SLOT_SIZE
+                                           // (CRYSTAL-HD: 0x51000, so 0x56000 — was 0x15000 at 64 KiB)
     mov  w14, #0x5A
     orr  w14, w14, w14, lsl #8
     orr  w14, w14, w14, lsl #16
@@ -14586,7 +14613,9 @@ __wcb_prog:
     b.ne 9f
     orr  x23, x23, #(1 << 6)
 9:
-    mov  x0, #129                          // (b7) SYS_WIN_CREATE(129, 10) -> -EINVAL (over the max edge)
+    mov  x0, #289                          // (b7) SYS_WIN_CREATE(289, 10) -> -EINVAL (over the max edge:
+                                           // CRYSTAL-HD raised FB_WIN_MAX_W 128 -> 288, so 129 is now a
+                                           // LEGAL request and this leg had to move with the cap)
     mov  x1, #10
     mov  x8, #29
     svc  #0

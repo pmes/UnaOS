@@ -231,8 +231,24 @@ pub const SYS_INPUT_WAIT: u64 = 28;
 /// map its ARGB8888 surface (`stride = w * 4`) into the caller's window. The surface VA is published
 /// in the read-only info page.
 pub const SYS_WIN_CREATE: u64 = 29;
-/// `SYS_WIN_PRESENT(win) -> 0 / -errno` — damage-mark + composite the WHOLE window. Fail-closed on a
-/// free id (`-EBADF`) or another owner's window (`-EACCES`).
+/// `SYS_WIN_PRESENT(win) -> status / -errno` — damage-mark + composite the WHOLE window. Fail-closed
+/// on a free id (`-EBADF`) or another owner's window (`-EACCES`). The non-error statuses (bit 63
+/// clear, so every `rc >> 63` failure test keeps working unchanged): `0` = the surface reached the
+/// compositor — composited, headless, or coalesced into the panel frame in flight, three cases ring 3
+/// deliberately CANNOT distinguish; `1` = declined, every window the caller owns is hidden
+/// (PRESSURE-1 — a good citizen stops rendering).
+///
+/// CRYSTAL-HD, on the status that is deliberately NOT here. The held CRYSTAL-PACE half added a third
+/// non-error status (`WIN_PRESENT_COALESCED = 2`) so a renderer could lock its render loop to the x86
+/// compositor's frame edge. It is dropped, for two reasons that stand independently:
+///
+/// * Peter's ruling of 2026-08-13 (`9d12e7e0`, `docs/dev/OS/08_VIDEO/PARITY.md` §5.1) — a vug renders
+///   UNPACED on every chip, "more drawing complexity, never artificial pacing". A status whose only
+///   consumer is a self-pacing render loop is that pacer with the sleep moved one syscall outward.
+/// * `0` for every success keeps this verb's contract IDENTICAL on both arches. aarch64 has no
+///   coalescing pacer and could never answer a third status, so a ring-3 program written against a
+///   3-valued x86 contract would silently mean something else on the Pi — exactly the divergence the
+///   present-rows port was careful not to open.
 pub const SYS_WIN_PRESENT: u64 = 30;
 /// `SYS_WIN_MOVE(win, x, y) -> 0 / -errno`. aarch64 only today.
 pub const SYS_WIN_MOVE: u64 = 31;

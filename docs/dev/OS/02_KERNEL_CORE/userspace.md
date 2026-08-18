@@ -3259,6 +3259,67 @@
   check (signatures / allowlist — U2 loads unverified bytes today, safe only
   because ring-3 isolation contains them).
 
+## CRYSTAL-HD — the window surface cap rises to 288, on both arches (2026-08-18)
+
+Peter's sign-off, 2026-08-18, verbatim option "1": **`FB_WIN_MAX` 128 → 288, window slots 8 → 4,
++15 MiB `.bss`.** The held `crystal-graphics-hold` commit (`e65d5d9b`) proposed it for x86 only; this
+landing applies it to **both** arches, because a `target_arch` gate in the experience layer with no
+hardware reason behind it is what the ONE-OS ruling (2026-08-13) fails at review.
+
+**The constants, both arches.** `arch/x86_64/memory.rs` and `arch/aarch64/boot.rs` now carry the same
+cluster: `FB_WIN_MAX_W/H = 288`, `FB_WIN_SLOT_SIZE = 0x51000` (81 pages — exactly 288×288 ARGB8888),
+`FB_WIN_SLOTS = 8 → 4`, `USER_STATIC_SIZE = 0x149000`. The slot count comes down because the slot
+size went up 5×: the whole per-slot FB region must still fit the ONE page table each arch's
+`build_slot` wires (512 × 4 KiB = 2 MiB; 0x149000 is 329 of those pages), and four windows per
+address space is still 4× what any shipped program opens. On aarch64 the `USER_REGION` VA anchor's
+alignment moves 0x100000 → 0x200000 with it — the old alignment guaranteed "cannot straddle a 2 MiB
+L3 block" only because the size was ≤ 0x100000, and 0x149000 is not.
+
+**What it costs the Pi, measured.** The aarch64 kernel heap is hand-placed at 32 MiB
+(`boot::MEM_REGIONS`), so `.bss` has a hard ceiling there. `readelf -S` on the `kernel8` build:
+`.bss` at `0x200000`, size `0x68fb88` → `0xeafb88`, i.e. **end 8.56 MiB → 16.69 MiB, margin to the
+heap floor 15.31 MiB**. The SD image does not grow by a byte — `.bss` is NOBITS and `kernel8.img` is
+an objcopy of the loaded sections only. No memory-gated cap was needed.
+
+**Two seams the cap divergence opened, both closed here.**
+
+* `WIN_MAX == FB_WIN_SLOTS` on aarch64 became `FB_WIN_SLOTS <= WIN_MAX`, matching the x86 twin. The
+  two count different things: `WIN_MAX` (8) is how many windows the SYSTEM may have live,
+  `FB_WIN_SLOTS` (4) how many surface slots ONE address space reserves.
+* `sys_win_create`'s region-slot search on aarch64 ranged over `WIN_MAX`, which was harmless only
+  while the caps were equal. With 4 slots and 8 ids it would have handed out region slot 4..7 and
+  `map_slot_fb_win` would have mapped 81 pages past the end of the FB region, into the next slot's
+  backing. The CANDIDATE range is now `FB_WIN_SLOTS`; the SCAN range stays `WIN_MAX` (any global row
+  could belong to this ASID). The fifth window gets the `-EMFILE` the verb already documents.
+
+**The `el0-wcb` fixture, updated honestly, ledger unchanged.** The witness mask stays `0x3ffff` —
+all eighteen bits, go-red preserved — but three facts inside it had to move with the cap: b7's
+over-max create is `create(289, 10)` (129 is now legal), region slot 1's surface in the blob is
+`base + 0x56000` (was `base + 0x15000`, the 64 KiB stride), and `wcb_expected_checksum` is over the
+fixture's OWN 128×128 window (new `WCB_W`) rather than over `FB_WIN_MAX_W/H`, which was only ever a
+coincidence. QEMU-verified: `:: EL0: window verbs — create/present/present_rows/move/close
+witness=0x3ffff surface=128x128 checksum=0xfabe809492cf2325 :: PASS ::`.
+
+**SPEC UPDATE, deliberate — the 300-frame auto checksum changes again.** `user-vug`'s surface is
+288×288 on both arches now (`FOCAL` 24 → 54, so the framing is identical and the change is
+resolution), and the checksum is a pure function of the render:
+`:: UVUG: frames=300 threads=2 checksum=0xf18f983557b87a55 ::`, **superseding
+`0xe68285b85121ac7c`** (which itself superseded `0x48221e4101db3924`). Re-pinned in
+`scripts/specs/pi4-regression.spec`, both the `REQUIRE` and the negative-lookahead `FORBID`.
+Reproduced identically across separate `kernel8-test` runs.
+
+**CRYSTAL-PACE is NOT landed, and the ABI records why.** The held commit's third half made
+`SYS_WIN_PRESENT` answer a new status (`WIN_PRESENT_COALESCED = 2`) so `user-vug` could park until
+the x86 compositor's frame edge admitted a present. Both the status and the ring-3 pace loop are
+dropped. Peter's ruling of 2026-08-13 (`9d12e7e0`, `08_VIDEO/PARITY.md` §5.1) is that a vug renders
+**unpaced on every chip** — "more drawing complexity, never artificial pacing" — and a status whose
+only consumer is a self-pacing render loop is that pacer with the sleep moved one syscall outward.
+Independently, keeping `0` for every success is what keeps verb 30's contract **identical on both
+arches**: aarch64 has no coalescing pacer and could never answer a third status. The LOD ladder's
+`LOD_UP` climb threshold is likewise unchanged — the held commit replaced it with a render-time
+utilisation license on the premise that a paced meter reads ~60 regardless of headroom, and that
+premise was the pace loop's.
+
 ## The chain
 
 | Arc | x86_64 (lead) | aarch64 (port) |
@@ -3340,7 +3401,7 @@ Conventions shared across arches:
   | 26 | `SYS_FUTEX` | Y | Y | uaddr, op, val → op-specific. `FUTEX_WAIT`=0, `FUTEX_WAKE`=1 |
   | 27 | `SYS_INPUT_POLL` | Y | Y | — → packed event / `-EAGAIN`. `[55:48]` = type, low 32 = payload, bit 63 always clear |
   | 28 | `SYS_INPUT_WAIT` | Y | Y | — → 0 / `-EINVAL`. Blocks; dequeues nothing, so it composes with 27 |
-  | 29 | `SYS_WIN_CREATE` | Y | Y | w, h → win id / `-errno`. ARGB8888, `stride = w*4`, 1..=128 each |
+  | 29 | `SYS_WIN_CREATE` | Y | Y | w, h → win id / `-errno`. ARGB8888, `stride = w*4`, 1..=288 each (CRYSTAL-HD; was 1..=128) |
   | 30 | `SYS_WIN_PRESENT` | Y | Y | win → 0 / `-errno`. Whole-window damage |
   | 31 | `SYS_WIN_MOVE` | - | Y | win, x, y → 0 / `-errno` |
   | 32 | `SYS_WIN_CLOSE` | - | Y | win → 0 / `-errno` |

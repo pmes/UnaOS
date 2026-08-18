@@ -455,10 +455,15 @@ FORBID BANDY-GRANT:.*FAIL
 # --- regression is a spec miss rather than an eyeball miss.
 #
 # --- 1. UVUG's 300-frame auto checksum. It is a pure function of the final surface, so it is the
-# ---    tightest available assertion that the WINDOWED 128x128 render still produces the exact
-# ---    pixels it did when the arc landed. WC-C deliberately superseded the pre-WC-C 32x32 value
-# ---    0x48221e4101db3924 (see userspace.md); this is the current one.
-REQUIRE UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c
+# ---    tightest available assertion that the WINDOWED render still produces the exact pixels it
+# ---    did when the arc landed. Two deliberate supersessions so far, both recorded rather than
+# ---    silently re-pinned: WC-C replaced the pre-WC-C 32x32 value 0x48221e4101db3924 (see
+# ---    userspace.md), and CRYSTAL-HD replaces WC-C's 128x128 value 0xe68285b85121ac7c — the
+# ---    surface edge is now 288 on BOTH arches, so the auto path's level-0 wireframe covers a
+# ---    288x288 surface at FOCAL 54 and necessarily produces a new number. The checksum is still a
+# ---    pure function of the render (the 3-way band split moves no pixel, only which thread writes
+# ---    it), so it stays the sharp assertion it was; this is the current value.
+REQUIRE UVUG: frames=300 threads=2 checksum=0xf18f983557b87a55
 #
 # --- 1b. INROUTE: the HID->EL0 router witness. The FAIL half was already covered by the default
 # ---     `FAIL ::` FORBID, but nothing REQUIRED the PASS — a selftest that stopped running, or one
@@ -1657,7 +1662,7 @@ FORBID K3-revoke:.*durable-first FAIL
 FORBID K3-mount:.*byte-verified FAIL
 FORBID K3-mount: located but mount FAILED
 FORBID K4-ready:.*prefix\) FAIL
-FORBID :: UVUG: frames=[0-9]+ threads=[0-9]+ checksum=(?!0xe68285b85121ac7c)
+FORBID :: UVUG: frames=[0-9]+ threads=[0-9]+ checksum=(?!0xf18f983557b87a55)
 FORBID \[inroute\] router window — (?!routed=2 stale_dropped=1 revokes=0)
 FORBID \[wc-c\] side-by-side (?!windows=2 drawn=2)
 FORBID BGRUN-ST: process table capacity = (?!6 rows)
