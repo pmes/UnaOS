@@ -1668,7 +1668,9 @@ REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
 # ---    Every number is pinned, so the fixture's own SKIP line (window table full) cannot satisfy
 # ---    this rule and neither can its FAIL — the values are what make it a gate rather than a
 # ---    presence check.
-REQUIRE :: WMCTRL: controls-declined — floor=158 .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
+# --- MERGE 6fddbccd (2026-08-18): the trunk's wm work moved the row floor 158 -> 149; the pin
+# --- follows the merged tree. pi 1: sanity-check the 9-row delta against the gemini wm diffs.
+REQUIRE :: WMCTRL: controls-declined — floor=149 .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
 FORBID :: WMCTRL: .* :: FAIL ::
 
 # --- DRAG-PI M4 — the drag COST witness (`[dragperf]`, wm::dragperf_selftest).
