@@ -12242,7 +12242,7 @@ static DO_BURIED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// WC-K3 — THE SECOND VERDICT TERM: `DESKTOP_BG` pixels the drain's staged fill published inside the
 /// dragged window's box. The coalesced erase reaching under its own occluder, which is the mechanism
 /// the arc convicted and the one no existing counter could see. See the ledger in [`stage_fill`].
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK4 — the dragged window's box as the DRAIN sees it, published by [`erase_clip`] from the same
 /// table read that builds the erase clip.
@@ -12313,7 +12313,7 @@ static DO_FILL_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// microseconds later. The failure mode a stale clip cannot produce is the one the arc is about —
 /// publishing desktop over pixels the pass will NOT repaint — because a box that left the clip did so
 /// by moving, and a window that moved is a window this pass repaints.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_BOX: [core::sync::atomic::AtomicUsize; 4] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
 /// WCK4 — `DESKTOP_BG` pixels the drain's fills actually PUT ON THE PANEL during this gesture.
@@ -12321,12 +12321,12 @@ static DO_FILL_BOX: [core::sync::atomic::AtomicUsize; 4] =
 /// The population every other fill term is a fraction of, and the answer to "is `fill_px=0` a clean
 /// drag or a drain that never ran". A gesture with `fillpub_px=0` has published no desktop at all and
 /// its zeros assert nothing.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_PUB_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK4 — pixels the erase clip WITHHELD from publication during this gesture. The mechanism's own
 /// denominator, `clip_px`'s opposite number: a gesture over a panel full of windows whose
 /// `fillclip_px` is 0 has a clip that never ran, and its `fill_px=0` proves nothing.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_CLIP_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK4 — THE PANEL-WIDE VERDICT TERM: published desktop pixels that landed inside SOME box of the
 /// erase clip, whichever it was.
@@ -12350,7 +12350,7 @@ static DO_FILL_CLIP_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// already notes for the banded present), and moving the audit outside the bracket would mean
 /// measuring pixels the bracket did not cover. A tear reported by a witness build is a lead, not a
 /// number.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_OVER_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK4 REVIEW (D1) — **how many boxes the last drain's clip actually held.**
 ///
@@ -12363,7 +12363,7 @@ static DO_FILL_OVER_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// there a clip at all, and did it have about the right number of boxes", and a running total over
 /// drains would answer neither. `0` on a gesture with `fillpub_px > 0` is the loud case — desktop
 /// published with nothing on the glass to withhold it from.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_CLIP_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// WCK4 REVIEW (D1) — **the dock strip as the last drain's clip held it**: `x`, `y`, `w`, `h`, with
 /// `w == 0` meaning the strip was not in the clip at all.
@@ -12377,7 +12377,7 @@ static DO_CLIP_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 /// So the geometry goes on the wire, as `dock=WxH+X+Y` or `dock=absent`. A reader comparing it
 /// against `[dock]`'s own painted rect can see the two agree; a `dock=absent` beside a live strip is
 /// the defect, stated, in the one place a capture can catch it.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_DOCK_BOX: [core::sync::atomic::AtomicUsize; 4] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
 /// STRIPFACTOR — **how many furniture strips were PRESENT in the last drain's clip**, of
@@ -12388,7 +12388,7 @@ static DO_DOCK_BOX: [core::sync::atomic::AtomicUsize; 4] =
 /// checks only `dock=` would read a healthy line while the OTHER strip was being erased with
 /// `fillover_px` at zero — the same blind spot `dock=` itself was added to close, one tenant along.
 /// So the COUNT goes on the wire beside it, as `bars=present/total`.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_STRIP_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// STRIPFACTOR — the MENU BAR's width in the last drain's clip; `0` for absent.
 ///
@@ -12409,7 +12409,7 @@ static DO_STRIP_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicU
 /// tenant's own accessor is the single source. If the drag battery is ever made concurrent, latch the
 /// pair behind one store (pack both into a single `AtomicU64`, as `PAINTED_RECT` packs a rect) rather
 /// than trusting the sequential ordering this note documents.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_BAR_W: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// WCK4 REVIEW (D1) — pixels withheld **specifically because of the dock strip** during this gesture.
 ///
@@ -12423,7 +12423,7 @@ static DO_BAR_W: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsi
 /// Zero is legitimate and common (no fill met the strip this gesture). It is a denominator, not a
 /// FORBID: read it WITH `dock=` — `dock=absent` is the finding, `dock=<box> fillclip_dock_px=0` just
 /// means the drag stayed away from the foot of the panel.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_CLIP_DOCK_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK4 REVIEW (D2) — **`blit` calls the drain's fills actually made** during this gesture.
 ///
@@ -12432,7 +12432,7 @@ static DO_FILL_CLIP_DOCK_PX: core::sync::atomic::AtomicU64 = core::sync::atomic:
 /// this arc's lane, so the true number is carried here — see the D2 ledger at the `erase_note` call
 /// in [`stage_fill`]. A gesture whose `fillruns` exceeds its row count had fragmented fills, which is
 /// the clip working; equality means every published row was whole.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK5 — **the dock strip as [`occ_clip`] last built it**: `x`, `y`, `w`, `h`, with `w == 0`
 /// meaning `dock::Layout::for_panel` answered `None` and there is no strip to protect.
@@ -12535,7 +12535,7 @@ impl core::fmt::Display for OccDockBox {
 /// Called from [`erase_clip`] with the rows it just read, so the box and the clip describe the same
 /// instant. `w == 0` (no drag, or its row has gone) leaves every fill uncharged, exactly as
 /// [`dragocc_target`]'s zero does.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 fn dragfill_box(rows: &[Window; MAX_WINDOWS]) {
     use core::sync::atomic::Ordering::{Acquire, Relaxed};
     let id = DRAG_WIN.load(Acquire);
@@ -12617,7 +12617,7 @@ fn dragocc_target(r: &Window) -> Option<(usize, usize, usize, usize)> {
 /// The verdict term's kernel, and the whole of its independence: it is asked of the bytes a `blit`
 /// just published, against the dragged window's box, with no reference to the [`OccClip`] that chose
 /// the run. Zero when no drag is live.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 fn span_occ(d: Option<(usize, usize, usize, usize)>, y: usize, x0: usize, x1: usize) -> u64 {
     let Some((dx, dy, dw, dh)) = d else {
         return 0;
@@ -12835,6 +12835,70 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
                 barw,
                 fdock,
                 OccDockBox(oddockw), odn, odpx, obn, obpx,
+                if clean { "CLEAN" } else { "BLEED" }
+            );
+        }
+    }
+    // ERASECLIP M2 — **THE aarch64 ERASE WIRE, and why it is a SEPARATE LINE rather than `[drag-occ]`
+    // with holes in it.**
+    //
+    // `[drag-occ]` above reports a gesture's WHOLE paint budget: the neighbour mask, the window
+    // blit's own bleed (`occ_px`, `clip_px`, `buried`, `direct`) and OCC62's `occclip_*` pairs, all
+    // fed by statics this arc did not port and does not own — that is the drag/blit instrument
+    // §6.10 item 2 assigns to another arc. What ERASECLIP ports is the ERASE half, and only the
+    // erase half.
+    //
+    // Printing that half under the `[drag-occ]` tag with the other fields zeroed or missing is the
+    // exact defect GR13 convicted three instruments for: a field that means one thing on x86 and
+    // another on aarch64, where a reader cannot tell "the term measured zero" from "the term is not
+    // compiled". So the Pi gets its own tag, carrying ONLY terms that are live on it, and every
+    // field on it means precisely what the identically-named field on `[drag-occ]` means.
+    //
+    // §6.10's instruction was "make the aarch64 wire honest — fire the legs, or document the
+    // silence." This fires them. `fillover_px` in particular is the FORBID the erase path owes: it
+    // audits the span walk by asking whether a published pixel landed inside a box the clip HOLDS,
+    // and until this arc it could not be nonzero on aarch64 because the clip was structurally empty.
+    // `clipn=` and `dock=` are beside it for the reason [`DO_FILL_OVER_PX`] gives — a zero
+    // `fillover_px` over an EMPTY clip is a pass by vacancy, and the reader must be able to see that.
+    //
+    // Read `load`-not-`swap` for the shape terms and `swap` for the totals, identically to the x86
+    // arm, so the two lines are comparable field by field across a bench A/B.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let fpx = DO_FILL_PX.swap(0, Relaxed);
+        let fpub = DO_FILL_PUB_PX.swap(0, Relaxed);
+        let fclip = DO_FILL_CLIP_PX.swap(0, Relaxed);
+        let fovr = DO_FILL_OVER_PX.swap(0, Relaxed);
+        let fruns = DO_FILL_RUNS.swap(0, Relaxed);
+        let fdock = DO_FILL_CLIP_DOCK_PX.swap(0, Relaxed);
+        let clipn = DO_CLIP_N.load(Relaxed);
+        let dockw = DO_DOCK_BOX[2].load(Relaxed);
+        let barsn = DO_STRIP_N.load(Relaxed);
+        let barw = DO_BAR_W.load(Relaxed);
+        // Retired with the gesture, on the x86 arm's argument exactly: between two gestures no drain
+        // need run, so a box left standing charges the next gesture's opening fills against geometry
+        // that belonged to the last one.
+        DO_FILL_BOX[2].store(0, Relaxed);
+        // The verdict carries the two FORBIDs the ERASE owns and no others. `fill_px` is the erase
+        // publishing into the dragged window's live box; `fillover_px` is the span walk emitting a
+        // column the clip covered. `occ_px`/`direct` are the window blit's and are not measured here.
+        let clean = fpx == 0 && fovr == 0;
+        if dockw == 0 {
+            serial_println!(
+                "[erase-occ] win={} owner={:#x} moves={} fill_px={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock=absent bars={}/{} bar={} fillclip_dock_px={} -> {}",
+                id, owner, moves, fpx, fpub, fclip, fovr, fruns, clipn,
+                barsn, FURNITURE_MAX, barw, fdock,
+                if clean { "CLEAN" } else { "BLEED" }
+            );
+        } else {
+            serial_println!(
+                "[erase-occ] win={} owner={:#x} moves={} fill_px={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock={}x{}+{}+{} bars={}/{} bar={} fillclip_dock_px={} -> {}",
+                id, owner, moves, fpx, fpub, fclip, fovr, fruns, clipn,
+                dockw,
+                DO_DOCK_BOX[3].load(Relaxed),
+                DO_DOCK_BOX[0].load(Relaxed),
+                DO_DOCK_BOX[1].load(Relaxed),
+                barsn, FURNITURE_MAX, barw, fdock,
                 if clean { "CLEAN" } else { "BLEED" }
             );
         }
@@ -13446,11 +13510,17 @@ impl OccClip {
     /// DROPPED for want of capacity, which [`erase_clip`] reports rather than swallows: a dropped
     /// occluder is a region the erase will publish over.
     ///
-    /// Both of its callers' populated arms: [`erase_clip`] (x86) and `occ_clip`'s FURNITURE arm,
-    /// which OCC62 M2 put on the furniture family's dual gate — so this rides the union. The WINDOW
-    /// loop does not use it: that population is bounded by [`OCC_CLIP_MAX`] and writes `boxes[n]`
-    /// directly.
-    #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "pidesk")))]
+    /// Both of its callers' populated arms: [`erase_clip`] and `occ_clip`'s FURNITURE arm, which
+    /// OCC62 M2 put on the furniture family's dual gate. `occ_clip`'s WINDOW loop does not use it:
+    /// that population is bounded by [`OCC_CLIP_MAX`] and writes `boxes[n]` directly.
+    ///
+    /// ERASECLIP M1 — **UNGATED**, and the reason is the erase's WINDOW loop. That loop is now
+    /// unconditional on both arches (see [`erase_clip`]) and, unlike `occ_clip`'s, it admits through
+    /// `push` rather than by direct write — because it has no `boxes_overlap` pre-filter to bound it
+    /// and must REPORT the drop rather than write past the end. So `push` is reachable on the
+    /// knob-off aarch64 build, where the old `any(x86_64, all(aarch64, pidesk))` gate did not compile
+    /// it. Widening the gate compiles one more small function into that build and moves no pixel on
+    /// any other.
     fn push(&mut self, b: (usize, usize, usize, usize)) -> bool {
         if b.2 == 0 || b.3 == 0 {
             return true;
@@ -13473,7 +13543,7 @@ impl OccClip {
     /// `self.boxes` directly, so it shares no arithmetic with [`OccClip::prepare`] or
     /// [`OccRows::spans`] — neither the sort, nor the column pre-clip, nor the gap cursor — which is
     /// what lets it catch a bug in any of them.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     fn covered_len(&self, y: usize, x0: usize, x1: usize) -> u64 {
         let mut n = 0u64;
         for &(ox, oy, ow, oh) in self.boxes[..self.n].iter() {
@@ -13677,17 +13747,24 @@ impl OccRows {
 /// [`dock_tiles`] moved to the same gate with it (PARITY §6.4, which that row says to land here,
 /// "with 6.2, which is the consumer"), as did [`OccClip::push`], the arm's admission primitive.
 ///
-/// **The SHELLPIN residual travels too, and is still not fixed here (carried from `dock.rs`'s
-/// integrator note).** `dock_tiles` counts dock-addressable ROWS and cannot see the synthetic tile
+/// **The SHELLPIN residual — CLOSED, and this paragraph is the correction of a disclosure that
+/// outlived its defect.** What stood here (and in `dock.rs`'s module ledger, and in PARITY §6.10
+/// item 3) said: `dock_tiles` counts dock-addressable ROWS and cannot see the synthetic tile
 /// `dock::pin_shell` appends while no live row carries `KERNEL_OWNER_DESKTOP`, so with the shell
-/// closed this clip protects a strip ONE TILE narrower than the one painted. A window dragged
-/// across the pinned tile's columns overwrites them for one pass and `dock::compose`'s clobber test
-/// repaints them — the bounded, self-healing pre-WCK5 behaviour, now reaching the Pi on the same
-/// terms it already had on x86. The erase clip and the desktop present are unaffected (both read
-/// `strip_rect`, which pins). The complete fix is one `+ 1` term in `dock_tiles`; it is NOT taken
-/// here because `dock_tiles` also feeds the x86 clip, so the term would move x86 pixels — and this
-/// arc's standing constraint is that it must not. It stays disclosed, and it is now disclosed on
-/// the consumer as well as on `dock.rs`.
+/// closed this clip protects a strip ONE TILE narrower than the one painted; the complete fix is one
+/// `+ 1` term in `dock_tiles`, NOT taken because the term would move x86 pixels.
+///
+/// **The term is in the tree.** The integrator landed it as `4c6ca42d` ("SHELLPIN integrator fix —
+/// occ_clip's dock width counts the pinned tile"), on BOTH arches, taking the x86 pixel delta
+/// deliberately — which is the route `exec-occ62` was right to decline for itself and wrong to leave
+/// described as open afterwards. See [`dock_tiles`] for the term and for its cap (`n < MAX_WINDOWS`,
+/// mirroring `pin_shell`, so a full table pins nothing and the clip is never made one tile WIDER
+/// than the painted strip — the inverse defect).
+///
+/// `exec-eraseclip` therefore had nothing to take here and one thing to fix: three disclosures that
+/// told a reader to expect a residual the code no longer has. A stale disclosure is worse than none,
+/// because it is read as current. The ERASE side was never affected either way — [`erase_clip`]
+/// reaches the strip through `strip::rects`, i.e. `dock::strip_rect`, which pins.
 #[allow(unused_variables, unused_mut)]
 fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: usize) -> OccClip {
     let mut c = OccClip::none();
@@ -13979,9 +14056,19 @@ pub(crate) fn occ_menu_probe(
 // `occclip_dock=0` or `occclip_dock_px=0` under the same condition. Two paths, two pairs, and neither
 // zero can stand in for the other.
 //
-// **x86 only**, on [`OccClip`]'s wire-boundary argument: aarch64 gets [`OccClip::none`], `occ.n` is
-// 0, and every fill takes the whole-row branch — the pre-arc loop, publishing the SAME PIXELS at the
-// same offsets from the same buffer.
+// **ERASECLIP M1 — NOT x86 ONLY ANY MORE, and the retired claim is quoted rather than deleted
+// because it is precisely what the Pi's defect was.** It read: *"x86 only, on `OccClip`'s
+// wire-boundary argument: aarch64 gets `OccClip::none`, `occ.n` is 0, and every fill takes the
+// whole-row branch — the pre-arc loop, publishing the SAME PIXELS at the same offsets from the same
+// buffer."* "The same pixels" was the reassurance and also the fault: the pixels an unclipped erase
+// publishes are exactly the ones standing on a live window or a furniture strip. `exec-occ62` closed
+// that hole for the WINDOW BLIT (§6.2's first half, [`occ_clip`]); this closes it for the DEFERRED
+// ERASE. The WINDOW half-space is now unconditional on both arches, the FURNITURE arm carries the
+// furniture family's dual gate, and on aarch64 `occ.n` is no longer structurally 0.
+//
+// What survives of that paragraph is its COST accounting, which was always arch-neutral and is
+// restated below: `stage_fill` zero-initialises `OccRows` + span buffer on every fill on every arch.
+// What ERASECLIP changes on aarch64 is that those bytes now do work.
 //
 // **"Same pixels", NOT "same bytes", and the review (D7) was right to hold this arc to the
 // correction WC-K3's own review already made.** `stage_fill` receives the 456-byte `OccClip` by
@@ -14018,13 +14105,21 @@ pub(crate) fn occ_menu_probe(
 /// drain — not once per queued box — and only on a drain that has boxes to publish.
 #[allow(unused_variables)]
 fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
-    // Both `mut`s belong to the x86 arm below; on aarch64 this returns the empty clip and a zero
-    // count, which is [`OccClip`]'s arch boundary restated for the erase.
+    // ERASECLIP M1 — THE WINDOW HALF-SPACE IS UNCONDITIONAL, on [`occ_clip`]'s own precedent.
+    //
+    // These `mut`s used to belong to an x86-only arm; the arm is gone. A deferred desktop erase that
+    // publishes over a live window is the same defect on aarch64 that it is on x86, and `exec-occ62`
+    // already settled the question for the WINDOW BLIT: its half-space is behaviour, not a knob. The
+    // erase is the other half of §6.2 and takes the same shape — the `TABLE` read, the `compat`
+    // exclusion, the [`above_shell`] predicate and the [`OccClip::push`] admission are byte-identical
+    // to what x86 has run since WCK4.
+    //
+    // The `allow`s stay because the FURNITURE arm below is still gated: an off-knob build reaches
+    // neither its `push` nor its `dropped += 1`, and a build with no window rows never pushes at all.
     #[allow(unused_mut)]
     let mut c = OccClip::none();
     #[allow(unused_mut)]
     let mut dropped = 0usize;
-    #[cfg(target_arch = "x86_64")]
     {
         let shell = shell_z();
         let rows = {
@@ -14047,7 +14142,17 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
         // `fill_px` stops being charged for the sliver the gesture just vacated. See `DO_FILL_BOX`.
         #[cfg(feature = "witness")]
         dragfill_box(&rows);
-        #[cfg(feature = "wc")]
+        // ERASECLIP M1 — the FURNITURE arm takes the FURNITURE FAMILY'S OWN dual gate, which is the
+        // identical move `occ_clip`'s arm made under OCC62 M2 and for the identical reason: `dock`,
+        // `strip`, `menubar` and `crystal` are declared in `video/mod.rs` under
+        // `any(all(x86_64, wc), all(aarch64, pidesk))`, so admitting their rects here on exactly that
+        // gate means the erase withholds strip columns on precisely the boots that composite strips
+        // onto the glass. Off both knobs the arm is STRUCTURALLY absent — `super::strip` is never
+        // named — and `pw`/`ph` are two arguments the build pays and cannot use.
+        #[cfg(any(
+            all(target_arch = "x86_64", feature = "wc"),
+            all(target_arch = "aarch64", feature = "pidesk")
+        ))]
         {
             // STRIPFACTOR — EVERY registered furniture strip, from the registry, in one walk.
             //
@@ -16399,7 +16504,7 @@ fn stage_fill(
     // distinguishable on the wire: `occ_px` is a window publishing over its occluder, `fill_px` is
     // the desktop fill doing it. They have different cures and a reader must not have to guess which
     // one a nonzero verdict names.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     let fbox = {
         // No painter to compare against here — the fill belongs to no window — so the test is simply
         // "did this desktop row land inside the dragged window's box". `dragocc_target` needs a row;
@@ -16426,16 +16531,16 @@ fn stage_fill(
             ))
         }
     };
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     let (mut fill_px, mut pub_px, mut clip_px, mut over_px) = (0u64, 0u64, 0u64, 0u64);
     // REVIEW (D1) — the strip's own withheld total, and (D2) the number of `blit` calls this fill
     // actually made, which is no longer `h`.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     let (mut dock_px, mut runs) = (0u64, 0u64);
     // REVIEW (D1) — the dock strip as THIS drain's clip holds it, read once. `w == 0` means the
     // strip is not in the clip, and then `dock_px` stays 0 — which is the honest answer, and the
     // reason `dock=absent` is on the wire beside it.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     let dockb = {
         use core::sync::atomic::Ordering::Relaxed;
         let dw = DO_DOCK_BOX[2].load(Relaxed);
@@ -16469,7 +16574,7 @@ fn stage_fill(
         if occ.n == 0 {
             fb.blit(off, &stage[..row_bytes]);
             blit_calls += 1;
-            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
             {
                 pub_px += w as u64;
                 runs += 1;
@@ -16487,9 +16592,9 @@ fn stage_fill(
         // of it is the right source for a span of any length: no `src` offset arithmetic is needed
         // here, unlike `draw_window`'s, where each column carries a different pixel.
         let ns = occ.spans(py, x, x + w, &mut spans);
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
         let (mut row_pub, mut row_dock_pub) = (0u64, 0u64);
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
         {
             runs += ns as u64;
         }
@@ -16497,7 +16602,7 @@ fn stage_fill(
             let len = (sx1 - sx0) * bpp;
             fb.blit(py * fb_row + sx0 * bpp, &stage[..len]);
             blit_calls += 1;
-            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
             {
                 row_pub += (sx1 - sx0) as u64;
                 fill_px += span_occ(fbox, py, sx0, sx1);
@@ -16512,14 +16617,14 @@ fn stage_fill(
                 over_px += clip.covered_len(py, sx0, sx1);
             }
         }
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
         {
             pub_px += row_pub;
             clip_px += w as u64 - row_pub;
             dock_px += span_occ(dockb, py, x, x + w).saturating_sub(row_dock_pub);
         }
     }
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     {
         use core::sync::atomic::Ordering::Relaxed;
         // Folded unconditionally rather than behind `> 0`: `fillpub_px` is the population that says

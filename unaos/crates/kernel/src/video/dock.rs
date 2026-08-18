@@ -159,15 +159,23 @@
 //! model is unchanged (its real tile raises through the ordinary kernel-owner press arm), so the
 //! dock is byte-identical to the pre-SHELLPIN dock on every boot until the operator closes the shell.
 //!
-//! ⚠ **A bounded occlusion residual, disclosed (integrator note).** `wm::occ_clip`'s per-window-blit
-//! dock term is fed by `wm::dock_tiles` — a lock-free count of dock-addressable ROWS, which cannot
-//! see the pinned tile — so while the shell is closed the blit clip protects a strip one tile
-//! NARROWER than the one painted. A window dragged across the pinned tile's columns overwrites them
-//! for one pass; the dock's own clobber condition (`dock_scan` against `SLOT.rect()`, the painted
-//! rect) detects it and repaints — the pre-WCK5 self-heal, bounded to the closed-shell state. The
-//! erase clip and the desktop present are NOT affected (both read [`strip_rect`], which pins). The
-//! complete fix is one term in `wm::dock_tiles` (`+1` when no row is `KERNEL_OWNER_DESKTOP`); `wm.rs`
-//! is outside this arc's lane, so it is flagged rather than taken.
+//! ✔ **The bounded occlusion residual this note used to disclose is CLOSED — `4c6ca42d`.** The note
+//! read: `wm::occ_clip`'s per-window-blit dock term is fed by `wm::dock_tiles`, a lock-free count of
+//! dock-addressable ROWS which cannot see the pinned tile, so while the shell is closed the blit clip
+//! protects a strip one tile NARROWER than the one painted; a window dragged across the pinned tile's
+//! columns overwrites them for one pass and the dock's own clobber condition (`dock_scan` against
+//! `SLOT.rect()`) repaints them; the complete fix is one `+1` term in `wm::dock_tiles`, flagged
+//! rather than taken because `wm.rs` was outside that arc's lane.
+//!
+//! The integrator took it. `wm::dock_tiles` now adds the pinned tile when no live row carries
+//! `KERNEL_OWNER_DESKTOP`, capped at `MAX_WINDOWS` exactly as [`pin_shell`] is — so the count the
+//! blit clip sizes the strip from and the count this module paints agree in the closed-shell state
+//! as well as the open one. The ERASE clip and the desktop present were never affected either way
+//! (both read [`strip_rect`], which pins), and that remains true.
+//!
+//! Kept as a corrected paragraph rather than deleted (`exec-eraseclip`, PARITY §6.10): this text was
+//! quoted forward into two other ledgers while the defect was live, and a reader who meets one of
+//! those copies needs this one to say plainly that it no longer holds.
 
 use super::{ceramic, strip, theme, wm};
 
