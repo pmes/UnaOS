@@ -20,24 +20,36 @@ several sessions can work in parallel without stepping on each other.
 
 ## Worktrees & lanes
 
-- `main` is the integration trunk. Platform tracks: `hw-rmbp`
-  (`../UnaOS-rmbp`, x86 2012 rMBP), `hw-pi4` (`../UnaOS-pi4`, Pi 4 bare-metal),
-  `hw-jetson` (`../UnaOS-jetson`, Jetson Orin Nano).
-- Track sessions commit **only to their own track branch**. Never merge or
-  push to `main` — the integrator session does that after review.
+- The trunk is the integration branch (`UnaOS-gemini` today; `main` historically).
+  Platform tracks: `hw-rmbp` (`../UnaOS-rmbp`, x86 2012 rMBP), `hw-pi4`
+  (`../UnaOS-hw-pi4`, Pi 4 bare-metal), `hw-jetson` (`../UnaOS-orin`,
+  Jetson Orin Nano).
+- **Integrator-less coordination (Peter, 2026-08-18): there is no integrator
+  seat.** The three track sessions coordinate their own integration over ccd
+  session messages. Duties that belonged to the seat are reassigned, not
+  dropped:
+  - **Landing an arc to trunk**: the landing track runs the independent
+    adversarial review itself (agent panel — the COI guard: the author seat
+    never reviews alone), obtains a **peer ack from at least one other track
+    seat over ccd** (the second pair of eyes the seat used to be), then merges
+    its own reviewed arc to trunk with `--no-ff` and runs the trunk battery.
+  - **Sync**: each track picks up trunk at its own arc boundaries by MERGING
+    trunk into its branch (never rebase a pushed tip; never force-push).
+  - **Doc/`arroyo` conflicts** are reconciled by the landing seat (union: keep
+    both tracks' additions) instead of deferred to a seat.
+- Track sessions still commit **only to their own track branch** mid-arc; trunk
+  is touched only in the landing step above, after review + peer ack. Nobody
+  pushes — Peter pushes; hand him the full push line at every landing.
 - **Tracks run independently, at their own pace.** No track waits for another.
-  When a track's arc lands and passes review, the integrator merges *that* arc
-  to `main` and rebases *that* track for its next arc; the other tracks keep
-  running on their current base and rebase at their own next landing. The only
-  standing cap: **one unmerged arc per track** — a fresh session per arc; don't
-  stack a second arc on an unreviewed one within the same track.
+  Standing cap unchanged: **one unmerged arc per track** — a fresh session per
+  arc; don't stack a second arc on an unreviewed one within the same track.
 - While parallel arcs are in flight: the rmbp session owns shared kernel-core
   files; the pi and jetson sessions touch only the files their brief names
   (pi: its `arch/aarch64` arc files; jetson: GIC/timer + `tegra`-feature
-  files). If your arc needs a file outside your lane: **stop and report** —
-  the integrator updates the briefs. (Lanes are why independent merges stay
-  conflict-free: x86 vs aarch64 rarely collide; docs/`arroyo` the integrator
-  reconciles at merge.)
+  files). If your arc needs a file outside your lane: **negotiate it over ccd
+  with the owning seat before touching it** (and record the grant in both
+  sessions); no agreement → stop and report to Peter. (Lanes are why
+  independent merges stay conflict-free: x86 vs aarch64 rarely collide.)
 
 ## Arc discipline
 
@@ -55,7 +67,9 @@ several sessions can work in parallel without stepping on each other.
   - a fix would require touching a file outside your lane;
   - a workaround would disable or weaken a protection (SMEP, NXE, WXN,
     page permissions, checksums);
-  - you are about to reach for a force-push, history rewrite, or merge.
+  - you are about to reach for a force-push, a history rewrite, or a merge
+    outside the two sanctioned kinds (trunk→track sync; reviewed+peer-acked
+    arc→trunk landing).
 
 ## Committing & handoff
 
