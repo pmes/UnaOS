@@ -1038,6 +1038,35 @@ const BOT_PARK_DEAD_STREAK: u32 = 2;
 /// any wait. Eight: ~350 ms on Pi 4, still two orders of magnitude above the microseconds a revived
 /// device answers in, and 24x below the ~8.3 s a dead one used to cost per attempt.
 const BOT_PARK_DEAD_DIV: u64 = 8;
+/// BOTLATCH (R24 boot5). Dead-ring pump timeouts — CUMULATIVE, not consecutive — one identity may be
+/// charged before it is PARKED. This is the clause the [pi0-b1b2] boot5 window is missing, and the
+/// defect it closes is a loop the ledger made with itself:
+///
+///   * `BOT_PARK_DEAD_STREAK` says a twice-dead ring has PROVEN that waiting longer buys nothing —
+///     the strongest verdict this driver can reach without a replug. Its only consequence was to
+///     CUT THE BUDGET by `BOT_PARK_DEAD_DIV`.
+///   * `verdict()` could park on wall-clock (`BOT_PARK_CYCLE_MAX_MS`), and wall-clock is exactly
+///     what the cut removes. Past the streak an identity accrues its park budget 8x — 24x against
+///     `BOT_BUDGET_SCALE_FIRST` — more slowly. **The device the driver is most certain about is the
+///     device it parks last.** That is the budget cut engaging and the identity-park never latching.
+///
+/// So the criterion now counts the same failures the budget cut counts. CUMULATIVE is the load-
+/// bearing word: `dead_streak` is reset by any single live wait, and boot5's capture shows why that
+/// is fatal to a verdict — its 41 timeouts on the reader arrive in dead runs of 6, 6 and 13 broken
+/// up by waits where `foreign=` is non-zero (the FTDI console's own traffic, on a shared event
+/// ring — nothing to do with the reader). A consecutive counter is right for arming a cheap,
+/// reversible budget cut; it cannot carry a permanent verdict, because the thing that resets it is
+/// unrelated to the device being judged.
+///
+/// EIGHT. Two arm the cut at the full budget (~7.2 s each on Pi 4 at `BOT_BUDGET_SCALE_FIRST`),
+/// then six more at the cut (~0.3 s each) — i.e. the device is given six further chances to answer
+/// AFTER it has proven itself idle twice, and the whole verdict costs ~16 s instead of the ≥45 s
+/// the wall-clock clause needs (and never reaches once the cut is on). A healthy device is charged
+/// none of these: a completion is `dead=false`, and a live ring posts events, foreign events or
+/// doorbells, any one of which disqualifies the wait. Against boot5's own trace the account crosses
+/// 8 at pump timeout #19 of 41 — the last 22 timeouts, and the ~2.5 minutes of 99%-core they cost,
+/// never happen.
+const BOT_PARK_DEAD_MAX: u32 = 8;
 /// Escalating back-off between LADDER ENTRIES for one identity, doubling per entry. Distinct from
 /// `BOT_RESCUE_BACKOFF_MS`, which is the in-ladder spec-scale settle between RUNGS and stays exactly
 /// as it is (it is metal-earned: a device wedged mid-internal-stall is made worse by hammering).
@@ -1171,8 +1200,14 @@ pub struct BotDevLedger {
     pub surrenders: u32,
     /// Pump cycles charged to this identity.
     pub cycles: u64,
-    /// Consecutive dead-ring timeouts (see `BOT_PARK_DEAD_STREAK`).
+    /// Consecutive dead-ring timeouts (see `BOT_PARK_DEAD_STREAK`). Arms the BUDGET CUT, and is
+    /// reset by any live wait — including one made live by another device's traffic on the shared
+    /// event ring.
     pub dead_streak: u32,
+    /// BOTLATCH: dead-ring timeouts charged to this identity across its whole life, never reset.
+    /// Carries the PARK verdict (see `BOT_PARK_DEAD_MAX`); `dead_streak` cannot, because what
+    /// resets it is not a fact about this device.
+    pub dead_total: u32,
     /// PARKED: no transfer, no bring-up, no rung. Cleared only by a real re-enumeration event —
     /// a disconnect this driver did not itself cause (see `bot_park_note_disconnect`).
     pub parked: bool,
@@ -1184,7 +1219,7 @@ impl BotDevLedger {
     const EMPTY: BotDevLedger = BotDevLedger {
         ident: BotDevIdent { port: 0, route: 0, vid: 0, pid: 0 },
         used: false, gens: 0, ladders: 0, surrenders: 0, cycles: 0,
-        dead_streak: 0, parked: false, backoff_until: 0,
+        dead_streak: 0, dead_total: 0, parked: false, backoff_until: 0,
     };
 
     /// The park verdict, as a pure function of the account and the timebase. `None` = keep going;
@@ -1197,6 +1232,11 @@ impl BotDevLedger {
         if self.surrenders >= BOT_PARK_SURRENDER_MAX { return Some("surrenders"); }
         if self.ladders >= BOT_PARK_LADDER_MAX { return Some("ladders"); }
         if self.cycles >= per_ms.saturating_mul(BOT_PARK_CYCLE_MAX_MS) { return Some("cycles"); }
+        // BOTLATCH: the clause that counts what the BUDGET CUT counts. Placed last because the
+        // three above are the ladder's own verdicts and should be named first when several are
+        // true at once; reachable in practice precisely when they are not, because the cut this
+        // signature arms is what makes the wall-clock clause above recede.
+        if self.dead_total >= BOT_PARK_DEAD_MAX { return Some("dead-ring"); }
         None
     }
 
@@ -1320,6 +1360,21 @@ pub fn bot_park_selftest() {
         e.verdict(per_ms) == Some("cycles")
     };
 
+    // 4b. THE BOTLATCH CLAUSE. Dead-ring timeouts must park an identity on their own, and must do
+    //     so CUMULATIVELY — the property boot5's trace needs, where the reader's dead runs are
+    //     broken up by waits another device's traffic made live. So: charge `BOT_PARK_DEAD_MAX`
+    //     dead waits with the consecutive streak reset in the middle, and require the verdict
+    //     anyway. Also assert the clause is not vacuous (one short of the bound is not a park) and
+    //     that the budget cut — the thing that used to be the streak's ONLY consequence — is armed
+    //     by the streak and not by the total, so neither counter has quietly become the other.
+    let mut d = BotDevLedger { ident: b, used: true, ..BotDevLedger::EMPTY };
+    d.dead_total = BOT_PARK_DEAD_MAX - 1;
+    let dead_ok = d.verdict(per_ms).is_none() && {
+        d.dead_total += 1;
+        d.dead_streak = 0; // a live wait just refunded the streak; the verdict must not be refunded
+        d.verdict(per_ms) == Some("dead-ring")
+    } && BOT_PARK_DEAD_MAX > BOT_PARK_DEAD_STREAK;
+
     // 5. BACK-OFF is escalating and capped — it must grow with the ladder count and must never
     //    exceed the cap, or "escalating back-off" is a comment rather than a behaviour.
     let (b0, b1, b9) = (
@@ -1378,12 +1433,14 @@ pub fn bot_park_selftest() {
         && bot_park_find(&plc, elsewhere).is_none();
 
     BOT_PARK_QUIET.store(false, Ordering::Relaxed);
-    let pass = ladder_ok && reenum_ok && surrender_ok && cycles_ok && backoff_ok
+    let pass = ladder_ok && reenum_ok && surrender_ok && cycles_ok && dead_ok && backoff_ok
         && unplug_ok && pressure_ok && place_ok;
     serial_println!(
-        ":: BOT-PARK: selftest ladder={} reenum={} surrender={} cycles={} backoff={} unplug={} pressure={} place={} ladder_max={} surrender_max={} cycle_max_ms={} pass_pump_ms={} slots={} -> {} ::",
-        ladder_ok, reenum_ok, surrender_ok, cycles_ok, backoff_ok, unplug_ok, pressure_ok, place_ok,
-        BOT_PARK_LADDER_MAX, BOT_PARK_SURRENDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_PASS_PUMP_MS,
+        ":: BOT-PARK: selftest ladder={} reenum={} surrender={} cycles={} dead={} backoff={} unplug={} pressure={} place={} ladder_max={} surrender_max={} cycle_max_ms={} dead_max={} pass_pump_ms={} slots={} -> {} ::",
+        ladder_ok, reenum_ok, surrender_ok, cycles_ok, dead_ok, backoff_ok, unplug_ok, pressure_ok,
+        place_ok,
+        BOT_PARK_LADDER_MAX, BOT_PARK_SURRENDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_DEAD_MAX,
+        BOT_PARK_PASS_PUMP_MS,
         BOT_PARK_SLOTS,
         if pass { "PASS" } else { "FAIL" });
 }
@@ -6788,6 +6845,21 @@ impl XhciController {
         // pass has already burned `BOT_PARK_PASS_PUMP_MS` in timed-out waits. Declining is free and
         // returns to the desktop loop — the retry happens on a later pass, in a later frame.
         self.bot_pass_roll();
+        // BOT-PARK: the floor UNDER the surrender gate. That one binds to a slot id, which the
+        // controller recycles and a re-enumeration changes; this one binds to the device. See the
+        // `BOT-PARK` block for the [pi0-b1b2] capture of a reader escaping its own surrender by
+        // being re-enumerated (as a new slot id) by the ladder's own port-cycle rung.
+        //
+        // BOTLATCH (R24 boot5) — WHY THE GATE IS AHEAD OF THE THROTTLE. It used to sit after it.
+        // The throttle's refusal returns from this function, so on a pass that had already spent
+        // `BOT_PARK_PASS_PUMP_MS` in timed-out waits — i.e. on exactly the wedged device the ledger
+        // is for — `verdict()` was never read, and the identity-park could not latch on the passes
+        // where it mattered most. That is the same inversion the dead-ring clause fixes one level
+        // down: a BUDGET CUT was being allowed to run ahead of the VERDICT it exists to serve.
+        // Order is now: park (permanent, free, constant-time) THEN throttle (per-pass, deferring).
+        // A parked device is refused here and never reaches the throttle at all, which is strictly
+        // cheaper — the throttle's whole purpose is to defer work the park has already cancelled.
+        self.bot_park_gate(slot_id)?;
         if self.bot_pump_throttled() {
             BOT_PARK_PUMP_REFUSED.fetch_add(1, Ordering::Relaxed);
             serial_println!(
@@ -6797,11 +6869,6 @@ impl XhciController {
                 BOT_PARK_PUMP_REFUSED.load(Ordering::Relaxed));
             return Err(BotError::NoDevice);
         }
-        // BOT-PARK: the floor UNDER that gate. The line above binds to a slot id, which the
-        // controller recycles and a re-enumeration changes; this one binds to the device. See the
-        // `BOT-PARK` block for the [pi0-b1b2] capture of a reader escaping its own surrender by
-        // being re-enumerated (as a new slot id) by the ladder's own port-cycle rung.
-        self.bot_park_gate(slot_id)?;
         let first = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         let cause = match first {
             // PH-2: a `Failed` CSW is a completed transaction the DEVICE rejected — CHECK
@@ -9942,6 +10009,10 @@ impl XhciController {
         self.bot_park[idx].cycles = self.bot_park[idx].cycles.saturating_add(used);
         if dead {
             self.bot_park[idx].dead_streak = self.bot_park[idx].dead_streak.saturating_add(1);
+            // BOTLATCH: the same event, charged to the counter the PARK verdict reads. The streak
+            // above is reset by any live wait and so can only ever arm a budget cut; this one is
+            // the identity's standing record of how many times its ring has been proven idle.
+            self.bot_park[idx].dead_total = self.bot_park[idx].dead_total.saturating_add(1);
         } else {
             self.bot_park[idx].dead_streak = 0;
         }
@@ -10090,10 +10161,11 @@ impl XhciController {
         let e = self.bot_park[idx];
         let per_ms = Self::cycles_per_ms().max(1);
         serial_println!(
-            ":: BOT: PARKED slot={} port={} route={:#x} vid={:04x} pid={:04x} why={} cause={:?} ladders={}/{} surrenders={}/{} gens={} cycles={} ms={} max_ms={} dead_streak={} refused={} capped={} yields={} parked_total={} — device account CLOSED: no transfer, no bring-up and no rescue rung on this identity until it is physically replugged (a re-enumeration this driver causes does NOT unpark it) ::",
+            ":: BOT: PARKED slot={} port={} route={:#x} vid={:04x} pid={:04x} why={} cause={:?} ladders={}/{} surrenders={}/{} gens={} cycles={} ms={} max_ms={} dead={}/{} dead_streak={} refused={} capped={} yields={} parked_total={} — device account CLOSED: no transfer, no bring-up and no rescue rung on this identity until it is physically replugged (a re-enumeration this driver causes does NOT unpark it) ::",
             slot_id, id.port, id.route, id.vid, id.pid, why, cause,
             e.ladders, BOT_PARK_LADDER_MAX, e.surrenders, BOT_PARK_SURRENDER_MAX, e.gens,
-            e.cycles, e.cycles / per_ms, BOT_PARK_CYCLE_MAX_MS, e.dead_streak,
+            e.cycles, e.cycles / per_ms, BOT_PARK_CYCLE_MAX_MS,
+            e.dead_total, BOT_PARK_DEAD_MAX, e.dead_streak,
             BOT_PARK_REFUSED.load(Ordering::Relaxed)
                 + BOT_PARK_PASS_REFUSED.load(Ordering::Relaxed),
             BOT_PARK_CAPPED.load(Ordering::Relaxed),
@@ -10115,16 +10187,42 @@ impl XhciController {
     fn bot_park_census(&self) {
         let per_ms = Self::cycles_per_ms().max(1);
         let mut n = 0usize;
+        // BOTLATCH: the reading key, printed once ahead of the accounts. The R24 boot5 sitting had
+        // to be reconstructed from what the log did NOT contain; the next one should be readable
+        // off the wire without a source tree. Four clauses, any one of which closes an account —
+        // stated with their bounds so a capture's numbers can be compared to them directly.
+        serial_println!(
+            ":: PIUSB: [botpark] key — an identity is (root port + route string); it survives re-enumeration and slot-id reuse, which is what the per-slot surrender could not. Four PARK clauses, first to reach its bound closes the account: surrenders>={} (the ladder's verdict on two whole generations) | ladders>={} (retry entries across all generations) | ms>={} (pump wall-clock charged to the identity) | dead>={} (pump timeouts on a PROVABLY IDLE ring — no event, no foreign event, no doorbell for the whole wait; CUMULATIVE, so a live wait does not refund it). dead_streak>={} additionally CUTS the pump budget to 1/{} of base — read dead= not dead_streak= when asking why a device did or did not park. named=no means hub-downstream (no VID:PID banner) and is normal ::",
+            BOT_PARK_SURRENDER_MAX, BOT_PARK_LADDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_DEAD_MAX,
+            BOT_PARK_DEAD_STREAK, BOT_PARK_DEAD_DIV);
         for e in self.bot_park.iter().filter(|e| e.used) {
             n += 1;
             serial_println!(
-                ":: BOT: park census port={} route={:#x} vid={:04x} pid={:04x} parked={} ladders={} surrenders={} gens={} cycles={} ms={} dead_streak={} result=CENSUS ::",
+                ":: BOT: park census port={} route={:#x} vid={:04x} pid={:04x} parked={} ladders={} surrenders={} gens={} cycles={} ms={} dead={} dead_streak={} result=CENSUS ::",
                 e.ident.port, e.ident.route, e.ident.vid, e.ident.pid,
                 if e.parked { "yes" } else { "no" },
-                e.ladders, e.surrenders, e.gens, e.cycles, e.cycles / per_ms, e.dead_streak);
+                e.ladders, e.surrenders, e.gens, e.cycles, e.cycles / per_ms,
+                e.dead_total, e.dead_streak);
+            // BOTLATCH: the same account read as DISTANCE TO EACH BOUND, tagged `[botpark]` so one
+            // awk family pulls the whole ledger out of a metal capture. `why=` is what `verdict()`
+            // says about this account RIGHT NOW — `none` on a live account is the ledger stating
+            // that it has seen the device and is not yet done with it, which is exactly the fact
+            // boot5's log could not distinguish from "the ledger is switched off".
+            serial_println!(
+                ":: PIUSB: [botpark] account port={} route={:#x} vid={:04x} pid={:04x} named={} parked={} why={} surrenders={}/{} ladders={}/{} ms={}/{} dead={}/{} dead_streak={}/{} budget_cut={} gens={} ::",
+                e.ident.port, e.ident.route, e.ident.vid, e.ident.pid,
+                if e.ident.anonymous() { "no" } else { "yes" },
+                if e.parked { "yes" } else { "no" },
+                e.verdict(per_ms).unwrap_or("none"),
+                e.surrenders, BOT_PARK_SURRENDER_MAX, e.ladders, BOT_PARK_LADDER_MAX,
+                e.cycles / per_ms, BOT_PARK_CYCLE_MAX_MS,
+                e.dead_total, BOT_PARK_DEAD_MAX,
+                e.dead_streak, BOT_PARK_DEAD_STREAK,
+                if e.dead_streak >= BOT_PARK_DEAD_STREAK { "on" } else { "off" },
+                e.gens);
         }
         serial_println!(
-            ":: BOT: park rollup accounts={} parked={} refused={} backoff_refused={} pass_refused={} aborts={} capped={} yields={} pump_refused={} anon={} ladder_max={} surrender_max={} cycle_max_ms={} pass_ms={} pass_pump_ms={} result=CENSUS ::",
+            ":: BOT: park rollup accounts={} parked={} refused={} backoff_refused={} pass_refused={} aborts={} capped={} yields={} pump_refused={} anon={} ladder_max={} surrender_max={} cycle_max_ms={} dead_max={} pass_ms={} pass_pump_ms={} result=CENSUS ::",
             n, BOT_PARK_COUNT.load(Ordering::Relaxed),
             BOT_PARK_REFUSED.load(Ordering::Relaxed),
             BOT_PARK_BACKOFF_REFUSED.load(Ordering::Relaxed),
@@ -10134,8 +10232,8 @@ impl XhciController {
             BOT_PARK_YIELDS.load(Ordering::Relaxed),
             BOT_PARK_PUMP_REFUSED.load(Ordering::Relaxed),
             BOT_PARK_ANON.load(Ordering::Relaxed),
-            BOT_PARK_LADDER_MAX, BOT_PARK_SURRENDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_PASS_MS,
-            BOT_PARK_PASS_PUMP_MS);
+            BOT_PARK_LADDER_MAX, BOT_PARK_SURRENDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_DEAD_MAX,
+            BOT_PARK_PASS_MS, BOT_PARK_PASS_PUMP_MS);
     }
 
     fn bot_surrender(&mut self, slot_id: u8, cause: BotError, ladder_gen: u64) {
