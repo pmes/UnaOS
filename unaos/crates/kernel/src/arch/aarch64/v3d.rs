@@ -15440,6 +15440,13 @@ fn v3d95_unarmed_close_rung() {
     serial_println!(
         ":: V3D: [v3d99] CORRECTION TO ALL THREE LINES ABOVE — UNAOS_V3D_ARMEDCLOSE=1 is armed on top of them, so this boot takes FIVE CT0 kicks. Legs A/B/C/D are exactly as the two lines above describe them and are UNCHANGED; [v3d99] then takes LEG E (v3d.md §49.23 R-next-3 `armedclose` — the PRODUCTION close: CT0QMA/CT0QMS/CT0QTS at the REAL tile-alloc pool base, the real 0x8000 size and the REAL tile-state array WITH ENABLE, plus BPOS=0 and the pre-kick L2T invalidate, in v3d_bin_job_run's own order). LEG E IS THE ONE LEG OF THE FIVE THAT IS NOT UNARMED: the [v3d95] header's 'NO CT0QMA, NO CT0QMS, NO CT0QTS, NO BPOS=0, NO pre-kick L2T invalidate' describes legs A-D and is FALSE of leg E, by design. Everything else all three headers say still holds, including the boot RETURNING before probe_job ::"
     );
+    // PI-V3D-100: and one line further still, because `UNAOS_V3D_BINCONTENT=1` makes it EIGHT — and
+    // the last three are the first legs of this rung that submit a list carrying CONTENT, so the
+    // header's "the `emptyunarm` shape byte for byte" sentence has to be corrected for them too.
+    #[cfg(feature = "v3d_bincontent")]
+    serial_println!(
+        ":: V3D: [v3d100] CORRECTION TO ALL FOUR LINES ABOVE — UNAOS_V3D_BINCONTENT=1 is armed on top of them, so this boot takes EIGHT CT0 kicks. Legs A/B/C/D/E are exactly as the three lines above describe them and are UNCHANGED; [v3d100] then takes LEGS F, G and H (v3d.md §49.24 R-next-4 `bincontent`) with leg E's PRODUCTION bases and leg E's armed prologue, varying ONE thing — the LIST. F = full fixed-function state + GL_SHADER_STATE, no primitives; G = F plus VERTEX_ARRAY_PRIMS with the NULL coord shader; H = the m4-class MINIMUM, one tile config and one flat triangle over the real coordinate shader. THE [v3d95] HEADER'S 'the `emptyunarm` shape byte for byte' DESCRIBES LEGS A-E AND IS FALSE OF F/G/H, BY DESIGN, as is its 'NO CT0QMA, NO CT0QMS, NO CT0QTS, NO BPOS=0, NO pre-kick L2T invalidate' (those three legs take leg E's prologue in full). F/G/H are also the first legs of this rung whose lists REFERENCE DRAM — eleven regions, each named on the wire by a [v3d100] ref line before its kick. Everything else all four headers say still holds, including the boot RETURNING before probe_job ::"
+    );
     match probe_hub_ident0() {
         V3dPresence::Up(_) => {}
         V3dPresence::Down => {
@@ -15996,15 +16003,353 @@ fn v3d99_armedclose_verdict(
     "OUTCOME E4 — NO FAULT AND NOTHING LANDED ANYWHERE THIS INSTRUMENT LOOKS. The production close wrote neither its pool nor its tile-state array and the MMU did not object, which contradicts §49.8 boot6 on the very path boot6 measured. Check the [v3d62] catcher line on this leg FIRST — a catcher that absorbed words means the writes happened and were refused without latching — and check the [v3d56] landing digest for any changed arena page. If both are clean, the difference between this leg and boot6 is the LIST (14-byte empty vs boot6's), and that is where the next cut goes"
 }
 
+// ── PI-V3D-100 — `bincontent`, v3d.md §49.24's content rung. ──────────────────────────────────────
+//
+// WHY THIS RUNG EXISTS. Boot9/PA47's leg E returned `OUTCOME E1`: the PRODUCTION close is healthy and
+// it is §49.8 boot6's shape to the word — no fault, the `[v3d62]` catcher pristine, 20 pool words at
+// `CT0QMA` and 48 tile-state words at `CT0QTS`, with both decoys (leg E's negative controls) intact
+// and the landing digest reading `changed=2 expected=2 STRAY=0`. §49.22.3's conditional reconciliation
+// is DISCHARGED and the close stage is closed end to end, unarmed (leg D) and armed (leg E).
+//
+// §49.8's bracket already localised what is left, and it is not the close stage. Two OTHER stations:
+// the `m4` class consumed its whole 76-byte list, OPENED a frame and never closed it (`BFC` Δ0,
+// `BMACTIVE=1`, `CT0PC=3`, both output regions INTACT); the `rcl` class froze at its first fetch.
+// This rung goes after the FIRST of the two, because it is the one that shares a submit path with the
+// leg that just came back healthy — so exactly ONE variable separates leg E from this rung's legs:
+// THE LIST.
+//
+// WHAT THE SMALLEST CONTENT-CARRYING LIST IS, AND WHY IT IS NOT SMALLER. The `m4`-class minimum is one
+// tile config plus one flat triangle: `TILE_BINNING_MODE_CFG` (the tile config leg E already carries)
+// plus `VERTEX_ARRAY_PRIMS(TRIANGLES, 3)`. It cannot honestly be cut below that, and the reason is in
+// this file: PI-V3D-17's verdict is that WITHOUT the fixed-function clip/viewport/clipper state the
+// hardware clipper runs at power-on-reset zeros, a zero viewport scale collapses every primitive to a
+// point, and the binner writes "an empty-but-legal bin (tile-alloc pool never touched)". A content
+// list stripped of that state would therefore produce a null result INDISTINGUISHABLE from the empty
+// close — it would destroy the very discrimination the rung exists for. So `BinContent::Full` at
+// `TARGET_W`×`TARGET_H` (64×64 = exactly one tile) IS the minimum, and the two lighter legs in front
+// of it are §49.8's own class decomposition, not padding.
+//
+// THE NEW SURFACE, STATED BEFORE THE INSTRUMENTS. Every leg A–E submitted a list that references NO
+// DRAM at all: fourteen bytes of self-contained packets. A content list does not. `GL_SHADER_STATE`
+// embeds the shader record's address; the record embeds the CS/VS/FS code addresses, three uniform
+// stream addresses, the default-attribute block and — through the attribute record — the vertex
+// buffer. Eleven regions the GPU must READ. That is the surface this rung adds, and it is instrumented
+// two ways, because POISON IS THE WRONG INSTRUMENT FOR A REGION THE GPU MUST READ: poison is a
+// write-detector on a region whose correct content is nothing, and a shader page filled with
+// `0xA5A5A5A5` is not a shader. The honest analogues:
+//   (1) a CONTENT WITNESS — an FNV-1a digest of each referenced region's live bytes taken after
+//       publish and again after the post-kick L2T write-back + CPU invalidate. Any change means the
+//       GPU wrote into a region the list only references;
+//   (2) POISON COLLARS — the unused remainder of the two pages whose live payload is tiny (the shader
+//       record page and the vertex-data page) IS poisoned and IS scanned, exactly like the four
+//       windows leg E carries. A collar hit is a write that landed near a referenced address but not
+//       on it, which no digest could name;
+// and on top of both, the arena landing digest already covers all 64 pages at page granularity, so a
+// write anywhere in the address space the V3D MMU grants this job is reported regardless.
+//
+// FAIL-CLOSED. Every referenced region is bounds-checked against the arena before the kick; if any one
+// escapes, the leg refuses to kick and says so, and no verdict is implied.
+//
+// CT0 HYGIENE, WHICH IS THE REASON THE LEGS ARE ORDERED AS THEY ARE. §49.3 is this campaign's founding
+// lesson: `probe_job`'s unclosed bin frame poisoned every CT0 kick behind it for three arcs. A content
+// leg that STALLS mid-frame is precisely that hazard reproduced on purpose. So the three legs run in
+// strictly increasing order of stall risk — state, then prims-with-a-null-shader, then the real draw —
+// and after each one the ladder checks that the frame CLOSED and `CTRUN` cleared. If it did not, every
+// later leg is STOOD DOWN with its own wire line rather than measured on a dirty CT0.
+
+/// The eleven DRAM regions an `m4`-class bin list reaches, through `GL_SHADER_STATE` → the shader
+/// record → the attribute record. Named on the wire before the kick, bounds-checked, and digested.
+#[cfg(feature = "v3d_bincontent")]
+const V3D100_REFS: usize = 11;
+
+/// One referenced region: what it is, where it is, and how many bytes of it are LIVE (the rest of the
+/// page, where there is a rest, is a poison collar).
+#[cfg(feature = "v3d_bincontent")]
+#[derive(Clone, Copy)]
+struct V3d100Ref {
+    name: &'static str,
+    off: usize,
+    live: usize,
+}
+
+/// The shader-record page's poison collar: everything past the 36-byte record + 16-byte attribute
+/// record, rounded up to 64. A hit here is a write that landed on the record's PAGE but not on the
+/// record — which the content digest, by construction, cannot see.
+#[cfg(feature = "v3d_bincontent")]
+const OFF_V3D100_SHADREC_COLLAR: usize = OFF_SHADREC + 0x40;
+#[cfg(feature = "v3d_bincontent")]
+const V3D100_SHADREC_COLLAR_BYTES: usize = 0x1000 - 0x40;
+/// The vertex-data page's collar: everything past the three 16-byte vec4 positions, rounded up to 64.
+#[cfg(feature = "v3d_bincontent")]
+const OFF_V3D100_VTX_COLLAR: usize = OFF_VTXDATA + 0x40;
+#[cfg(feature = "v3d_bincontent")]
+const V3D100_VTX_COLLAR_BYTES: usize = 0x1000 - 0x40;
+
+#[cfg(feature = "v3d_bincontent")]
+const _: () = assert!(36 + 16 <= 0x40); // the record + attribute record fit below the collar
+#[cfg(feature = "v3d_bincontent")]
+const _: () = assert!(3 * 16 <= 0x40); // the three vec4 positions fit below the collar
+#[cfg(feature = "v3d_bincontent")]
+const _: () = assert!(OFF_V3D100_SHADREC_COLLAR + V3D100_SHADREC_COLLAR_BYTES <= OFF_VTXDATA);
+#[cfg(feature = "v3d_bincontent")]
+const _: () = assert!(OFF_V3D100_VTX_COLLAR + V3D100_VTX_COLLAR_BYTES <= OFF_CS_CODE);
+/// The frame this rung bins is ONE tile — the discriminating experiment is a single tile's list, and
+/// the counts it is read against (20 pool words, 48 tile-state words) are one tile's.
+#[cfg(feature = "v3d_bincontent")]
+const _: () = assert!(TILE_STATE_TILES == 1);
+
+/// PI-V3D-100 — publish everything an `m4`-class list reads, and return the reference table plus the
+/// attribute-array count `GL_SHADER_STATE` needs.
+///
+/// This is `triangle_job`'s step (0) and step (1) shader-record emit, verbatim and idempotent, hoisted
+/// so the content rung can run where it must run — after M3 and BEFORE `probe_job`, on a CT0 that is
+/// still virgin. Nothing here touches a register or a control list; it is arena writes and cache
+/// maintenance only. Re-run at the head of every content leg so each leg starts from identical DRAM.
+#[cfg(feature = "v3d_bincontent")]
+fn v3d100_publish() -> ([V3d100Ref; V3D100_REFS], u32) {
+    let cs_len = write_shader_words(OFF_CS_CODE, &CS_VS_WORDS);
+    let vs_len = write_shader_words(OFF_VS_CODE, &CS_VS_WORDS);
+    let fs_len = write_shader_words(OFF_FS_CODE, &FS_WORDS);
+    let fs_unif_len = write_fs_uniforms(OFF_FS_UNIF);
+    let cs_unif_len = write_geo_uniforms(OFF_CS_UNIF);
+    let vs_unif_len = write_geo_uniforms(OFF_VS_UNIF);
+    for (i, v) in TRI_VERTS.iter().enumerate() {
+        for (j, comp) in v.iter().enumerate() {
+            arena_write_u32(OFF_VTXDATA + i * 16 + j * 4, comp.to_bits());
+        }
+    }
+    fill_region(OFF_DEFAULT_ATTRS, 16, 0);
+    let num_attrs = build_shader_record();
+
+    // Leg G's ONLY difference from leg H: the NULL coord shader (the exonerated 4-word Mesa thread-end
+    // tail, `CS_VS_WORDS[23..27]` — vpmwt → nop;thrsw → nop → nop, which writes NOTHING to VPM) and a
+    // record whose CS/VS/FS slots all select it. Same VPM segment sizes, same clip enable, same one
+    // attribute array, same vertex buffer — `build_bisect_null_shader_record`'s own contract.
+    const V3D100_NULL_CS_WORDS: [u64; 4] =
+        [CS_VS_WORDS[23], CS_VS_WORDS[24], CS_VS_WORDS[25], CS_VS_WORDS[26]];
+    let null_len = write_shader_words(OFF_BISECT_NULL_CODE, &V3D100_NULL_CS_WORDS);
+    build_bisect_null_shader_record();
+
+    cache::clean_range(arena_phys() + OFF_CS_CODE, cs_len);
+    cache::clean_range(arena_phys() + OFF_VS_CODE, vs_len);
+    cache::clean_range(arena_phys() + OFF_FS_CODE, fs_len);
+    cache::clean_range(arena_phys() + OFF_FS_UNIF, fs_unif_len);
+    cache::clean_range(arena_phys() + OFF_CS_UNIF, cs_unif_len);
+    cache::clean_range(arena_phys() + OFF_VS_UNIF, vs_unif_len);
+    cache::clean_range(arena_phys() + OFF_VTXDATA, TRI_VERTS.len() * 16);
+    cache::clean_range(arena_phys() + OFF_DEFAULT_ATTRS, 16);
+    cache::clean_range(arena_phys() + OFF_SHADREC, 36 + 16);
+    cache::clean_range(arena_phys() + OFF_BISECT_NULL_CODE, null_len);
+    cache::clean_range(arena_phys() + OFF_BISECT_NULL_SHADREC, 36 + 16);
+
+    (
+        [
+            V3d100Ref { name: "M4 shader record + attribute record", off: OFF_SHADREC, live: 36 + 16 },
+            V3d100Ref { name: "vertex buffer (3 x vec4 clip position)", off: OFF_VTXDATA, live: TRI_VERTS.len() * 16 },
+            V3d100Ref { name: "coordinate-shader QPU code", off: OFF_CS_CODE, live: cs_len },
+            V3d100Ref { name: "vertex-shader QPU code", off: OFF_VS_CODE, live: vs_len },
+            V3d100Ref { name: "fragment-shader QPU code", off: OFF_FS_CODE, live: fs_len },
+            V3d100Ref { name: "default attribute values", off: OFF_DEFAULT_ATTRS, live: 16 },
+            V3d100Ref { name: "FS uniform stream", off: OFF_FS_UNIF, live: fs_unif_len },
+            V3d100Ref { name: "CS uniform stream", off: OFF_CS_UNIF, live: cs_unif_len },
+            V3d100Ref { name: "VS uniform stream", off: OFF_VS_UNIF, live: vs_unif_len },
+            V3d100Ref { name: "NULL coord-shader QPU code (leg G)", off: OFF_BISECT_NULL_CODE, live: null_len },
+            V3d100Ref { name: "NULL shader record (leg G)", off: OFF_BISECT_NULL_SHADREC, live: 36 + 16 },
+        ],
+        num_attrs,
+    )
+}
+
+/// PI-V3D-100 — an FNV-1a/32 digest of `len` arena bytes at `off`. The CONTENT witness: a referenced
+/// region the GPU only reads must digest identically before and after the kick.
+#[cfg(feature = "v3d_bincontent")]
+fn v3d100_digest(off: usize, len: usize) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for i in 0..len {
+        h ^= arena_byte(off + i) as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// PI-V3D-100 — name every DRAM address the content list embeds, on the wire, before the kick, with
+/// its arena page so the reader can check it against the `[v3d56] landing` digest. Returns `false` if
+/// ANY referenced region escapes the arena, in which case the caller must refuse the kick.
+#[cfg(feature = "v3d_bincontent")]
+fn v3d100_emit_refs(tag: &str, refs: &[V3d100Ref; V3D100_REFS], num_attrs: u32) -> bool {
+    let mut ok = true;
+    for r in refs.iter() {
+        let inside = arena_contains(arena_phys() + r.off, r.live);
+        if !inside {
+            ok = false;
+        }
+        serial_println!(
+            "::   [v3d100] ref ({}) {} — iova={:#010x} live={} B arena_page={} arena_mapped={} ::",
+            tag,
+            r.name,
+            (arena_phys() + r.off) as u32,
+            r.live,
+            r.off / PAGE,
+            inside as u32
+        );
+    }
+    serial_println!(
+        ":: V3D: [v3d100] refs ({}) — {} DRAM regions this list reaches through GL_SHADER_STATE (num_attrs={}) -> the shader record -> the attribute record. Legs A-E referenced NONE of them: their 14-byte list is self-contained, so every address above is surface this rung adds. ALL-ARENA-MAPPED={}. Poison is the WRONG instrument on a region the GPU must READ — these are witnessed by an FNV-1a content digest over their live bytes (pre-kick vs post-write-back) plus poison COLLARS on the unused remainder of the record and vertex pages, and the [v3d56] landing digest covers every arena page underneath both ::",
+        tag,
+        V3D100_REFS,
+        num_attrs,
+        ok as u32
+    );
+    ok
+}
+
+/// PI-V3D-100 — the content legs read their OWN pre-written outcomes, ahead of leg E's, leg D's and
+/// §49.21.4's. They must: a content leg carries leg E's production bases and `CT0QTS.ENABLE`, so all
+/// three earlier selectors would otherwise claim it and report it against a question it is not asking.
+///
+/// The question, stated once: does bin CONTENT flow, or does it stall the PTB? The close stage is
+/// closed (leg E). §49.8 measured the `m4` class opening a frame and never closing it, with both
+/// output regions INTACT — but it measured that with no poison on the decoys, no illegal-address
+/// catcher, no read-once violation pair and no landing digest. This rung re-asks the same question
+/// with all of them, and the criterion below distinguishes the three endings §49.8 could not:
+/// STALLED-MID-CONTENT, CLOSED-EMPTY, and CLOSED-WITH-OUTPUT.
+#[cfg(feature = "v3d_bincontent")]
+#[allow(clippy::too_many_arguments)]
+fn v3d100_content_verdict(
+    fault: u32,
+    client: &str,
+    va: u64,
+    qma: u32,
+    qms: u32,
+    qts: u32,
+    pool_words: u32,
+    ts_words: u32,
+    decoy_words: u32,
+    refs_changed: u32,
+    collar_words: u32,
+    frame_closed: bool,
+    ca_at_ea: bool,
+    ca_at_ba: bool,
+    bmactive: bool,
+    bmoom: bool,
+) -> &'static str {
+    let ts_base = (qts & !V3D_CLE_CT0QTS_ENABLE) as u64;
+    if fault != 0 && client != "PTB" {
+        return "A FAULT LATCHED ON A CONTENT LEG BUT THE CLIENT IS NOT THE PTB — and on a content list that is a DIFFERENT statement than it was on legs A-E, because this list reaches eleven DRAM regions and the CLE, the VCD and the TMU can all issue for it. Read VIO_ID against the client table and the [v3d100] ref lines above: if the client is the CLE or the VCD, the refused address is a READ of one of the referenced regions and the finding is an address finding, not a close-stage one. No close-stage verdict from this line";
+    }
+    if fault != 0 {
+        if va == 0 {
+            return "OUTCOME C7 — A CONTENT LEG IS REFUSED AT VA 0x0, ON BASES THE EMPTY CLOSE (LEG E) COMPLETED ON. Leg E programmed these same three registers, took the same prologue and drew no fault at all, so the variable is THE LIST. Read the [v3d62] catcher and the pool scan on this leg: a zero base reappearing under a content list means some second aim this frame derives from a register the empty frame never used";
+        }
+        if va >= qma as u64 && va < qma as u64 + qms as u64 {
+            return "OUTCOME C7b — REFUSED INSIDE THE TILE-ALLOC POOL, on a content leg. The VA falls in [CT0QMA, CT0QMA+CT0QMS), a span the V3D MMU maps, and leg E wrote 20 words into that same span without objection — so this is not a translation defect the empty close would have shown. Subtract CT0QMA on the line: an offset at or past the pool's END with no BPOA/BPOS programmed is POOL EXHAUSTION presenting as a refusal, and OUTCOME C5's remedy applies (give the PTB an overflow block and re-take)";
+        }
+        if va >= ts_base && va < ts_base + (TILE_STATE_BYTES as u64) {
+            return "OUTCOME C7c — REFUSED INSIDE THE TILE-STATE ARRAY, on a content leg. The base is honoured (the VA moved with CT0QTS) and the refusal is at an offset within the 256-byte array. Leg E's tile-state write occupied words 0..47 of 64 and stopped; a content frame's tile state is LARGER than an empty frame's, so an offset at or past the array's end is the GEOMETRY finding leg E could not have produced — the array is sized for an empty tile and not for a tile with a list. That is a driver fix and it needs no MMU theory";
+        }
+        return "OUTCOME C7d — A FAULT ON A CONTENT LEG AT A VA NONE OF THESE ROWS PREDICTS: not zero, not inside the pool span, not inside the tile-state array. Before anything else, subtract against the eleven [v3d100] ref iovas printed above this line as well as against CT0QMA, CT0QMA+CT0QMS and CT0QTS — a content list reaches addresses no earlier leg ever named, and the arithmetic will name its own base";
+    }
+    if refs_changed != 0 || collar_words != 0 {
+        return "OUTCOME C6 — A REFERENCED REGION MOVED. The GPU wrote into memory this list only READS (a changed content digest) or into a poison collar beside one (bytes on the record or vertex page outside the live payload). This is the surface a content list adds and no leg before this rung could have seen it. Read the per-ref digest lines and the two collar scans, then the landing digest: until it is explained, the C1/C2 readings on this leg are VOID, because a shader record or vertex buffer the GPU overwrote is not the input this leg believes it submitted";
+    }
+    if decoy_words > 0 {
+        return "OUTCOME C1b — NO FAULT, BUT A DECOY WINDOW MOVED. As on leg E the decoys are the NEGATIVE controls, so bytes in one under production bases mean the write is not aimed by the registers this leg programmed. Leg E cleared this same control on this same boot with the same bases, so a decoy hit HERE and not THERE is a statement about the list, not about the registers. Voids the C1/C2/C3 readings";
+    }
+    if !frame_closed {
+        if bmoom {
+            return "OUTCOME C5 — THE FRAME DID NOT CLOSE AND THE PTB IS OUT OF MEMORY (PCS.BMOOM). The binner exhausted its tile-alloc pool. This rung writes BPOS=0 and NO BPOA by design (leg E's prologue, v3d_bin_job_run's own first write), so the PTB has no overflow block to take: with real geometry the initial 128-byte block plus CT0QMS is all it has. This is a DRIVER-GEOMETRY finding and not a hardware one, it is the cleanest possible failure, and its remedy is one rung away — program BPOA/BPOS at the arena's overspill pool and re-take this exact leg. Read CT0QMS and the pool scan's word count on this line for how much was consumed before the wall";
+        }
+        if ca_at_ba {
+            return "OUTCOME C4 — THE FRAME DID NOT CLOSE AND CT0CA NEVER LEFT BA. That is the `rcl` class's signature (§49.8 boot7: the CLE sat on QBA for 500 samples) appearing on a BIN list, which §49.8's bracket says should not happen — both bin lists it measured walked QBA->EA. If it happens here the variable is this leg's list against leg E's, the fetch never began, and nothing downstream of fetch may be read from this leg at all";
+        }
+        if !ca_at_ea {
+            return "OUTCOME C4b — THE FRAME DID NOT CLOSE AND CT0CA STOPPED PART-WAY THROUGH THE LIST: off BA, short of EA. No leg in this campaign has produced this — §49.8's two bin lists walked BA->EA and its render list never left BA, so a MID-LIST stop is a fetch/decode station neither of those named. Read CT0CA on the [v3d54] trace line against BA, subtract, and count packets forward through the [v3d36] decode to name the exact packet the CLE stopped on. That packet, not the class, is the finding";
+        }
+        if pool_words > 0 || ts_words > 0 {
+            return "OUTCOME C3a — STALLED MID-CONTENT, WITH BYTES ALREADY ON THE GROUND. The list was consumed, the frame OPENED, output bytes LANDED in the pool and/or the tile-state array, and the frame never closed. This is §49.8 boot8's `m4` station — but boot8 read both output regions INTACT and this leg does not, so the two are NOT the same measurement and the difference is the first thing to state. The wall is between 'the binner emitted list bytes' and 'the frame closed': read the pool word count against leg E's 20 (more than 20 means real per-tile primitive-list bytes beyond the empty tile's RETURN_FROM_SUB_LIST), then BPCA's advance against CT0QMS, then PCS.BMACTIVE and CT0PC on this line for how many primitives were fed";
+        }
+        if bmactive {
+            return "OUTCOME C3b — STALLED MID-CONTENT, WITH NOTHING ON THE GROUND AND THE BINNER STILL ACTIVE. The CLE walked the whole list, PCS.BMACTIVE is set, the frame is OPEN and closed nothing, and neither output region took a byte — §49.8 boot8's `m4` reading reproduced EXACTLY (list consumed, frame opened and left open, both regions INTACT), now under the poison, the catcher, the read-once pair and the landing digest boot8 did not have. Read them in this order: the [v3d62] catcher first (words there mean the writes happened and were refused without latching, which would be a wholly new finding), then the landing digest for any changed arena page, then CT0PC on this line — a nonzero primitive count with no output bytes localises the wall to the PTB's primitive-to-list-bytes stage, and a ZERO primitive count localises it upstream at the VCD/vertex path, which is PI-V3D-17's empty-but-legal-bin mechanism arriving without a close";
+        }
+        return "OUTCOME C3c — THE FRAME NEITHER CLOSED NOR STAYED OPEN: no BFC delta, PCS.BMACTIVE CLEAR, the list fully consumed and nothing written. The binner is IDLE with no frame retired, which is not §49.8 boot8's `m4` reading (that one left BMACTIVE set) and not leg E's close either. Read PCS in full on this line, then the [v3d56] int line's FLDONE bit: a frame that was never opened and a frame that opened and collapsed are different findings, and CT0PC is what separates them";
+    }
+    // ── The frame CLOSED. Now the three-way that §49.8 could not make. ──────────────────────────
+    if pool_words > V3D99_BOOT6_POOL_WORDS {
+        return "OUTCOME C1 — CONTENT FLOWS. The frame CLOSED (BFC delta 1) with no fault, the catcher pristine, and the tile-alloc pool carries MORE than the empty close's 20 words — per-tile primitive-list bytes beyond the empty tile's lone RETURN_FROM_SUB_LIST. The binner accepted geometry, emitted a real tile list and closed its frame. This is the outcome that ends the bin-stage campaign: §49.8's `m4` station is not reproducible under the production submit, the whole bin path is whole, and the campaign's next and last named room is the RENDER list — the `rcl` class, which froze at its FIRST FETCH and which this rung deliberately does not touch. Read the [v3d99] head dump of the pool against leg E's to see the difference the triangle made";
+    }
+    if pool_words == V3D99_BOOT6_POOL_WORDS && ts_words == V3D99_BOOT6_TS_WORDS {
+        return "OUTCOME C2 — CLOSED-EMPTY. The frame closed cleanly and wrote EXACTLY what leg E's empty frame wrote: 20 pool words and 48 tile-state words, the same counts, and the head dumps will say whether they are the same bytes. The content list therefore behaved as an EMPTY list — the primitives were consumed and binned to nothing. That is PI-V3D-17's 'empty-but-legal bin' signature and it is a VERTEX-PATH statement, not a close-stage one: the candidates are the VCD's attribute DMA, the coord shader's VPM output, and the clipper state, in that order. Compare this leg against the leg below it — if prims-with-a-null-shader and the real draw give the SAME counts, the shader is not the variable and the VCD is";
+    }
+    if pool_words == 0 && ts_words == 0 {
+        return "OUTCOME C2b — THE FRAME CLOSED AND WROTE NOTHING ANYWHERE. Leg E closed the same registers with the same prologue on this same boot and wrote 20 and 48, so a content list that closes and writes NOTHING wrote less than an empty one. Check the [v3d62] catcher and the landing digest first; if both are clean, this is a close-stage regression introduced by the LIST and it contradicts leg E on the same image, which makes it the single most interesting line in the capture";
+    }
+    "OUTCOME C2c — THE FRAME CLOSED AT COUNTS THAT ARE NEITHER THE EMPTY SHAPE NOR MORE THAN IT. Read the two counts on this line against 20 (pool) and 48 (tile-state): FEWER pool words than the empty close means a truncated tile list, and a larger tile-state count against a 64-word array is the geometry finding OUTCOME C7c would have caught as a fault had the array been smaller. Then read the byte spans on the [v3d56] scan lines and both [v3d99] head dumps against leg E's before drawing anything"
+}
+
 /// PI-V3D-97 — one leg. `pad` selects the list (0 = the 14-byte `emptyunarm` shape, `V3D97_PAD_FLUSHES`
 /// = the 46-byte R3 list); `bases` is `None` for R3 (nothing programmed, bases stay at leg A's zero) and
 /// `Some` for R1. `armed` is PI-V3D-99's leg E and it is the one leg that is not unarmed: it adds
 /// `v3d_bin_job_run`'s `BPOS = 0` and pre-kick L2T invalidate in front of the register latch, and its
 /// bases are the production ones. Everything else — the catcher, the poison, the submit, the wait, the
 /// scans, the digest — is leg A's, verbatim, on every leg.
+/// PI-V3D-100 — what one leg leaves behind, so the content LADDER can gate on CT0 hygiene rather than
+/// stacking a second content leg on a CT0 whose frame never closed (§49.3's founding lesson).
 #[cfg(feature = "v3d_basedaim")]
-fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>, armed: bool) {
-    let cl_len = build_bin_cl_emptyunarm_padded(OFF_PROBE_BIN_CL, pad);
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // read only by the PI-V3D-100 ladder's CT0-hygiene gate
+struct V3d97LegOutcome {
+    submit_sound: bool,
+    frame_closed: bool,
+    idled: bool,
+}
+
+#[cfg(feature = "v3d_basedaim")]
+#[allow(dead_code)] // ditto
+impl V3d97LegOutcome {
+    /// CT0 is fit for another leg only if this one audited sound, closed its frame and left `CTRUN`
+    /// clear. Anything else and every later leg would be measured behind an unclosed frame.
+    fn ct0_clean(&self) -> bool {
+        self.submit_sound && self.frame_closed && self.idled
+    }
+    const STOOD_DOWN: Self =
+        Self { submit_sound: false, frame_closed: false, idled: false };
+}
+
+#[cfg(feature = "v3d_basedaim")]
+fn v3d97_leg(
+    leg: &str,
+    tag: &str,
+    pad: usize,
+    bases: Option<V3d96Bases>,
+    armed: bool,
+    content: Option<(BinContent, usize)>,
+) -> V3d97LegOutcome {
+    // PI-V3D-100 — a content leg publishes the eleven DRAM regions its list reaches BEFORE it builds
+    // the list, names every one of them on the wire, and refuses to kick if any escapes the arena.
+    // Legs A-E pass `None` and take none of this: their list references nothing.
+    #[cfg(feature = "v3d_bincontent")]
+    let content_refs = if content.is_some() {
+        let (refs, num_attrs) = v3d100_publish();
+        if !v3d100_emit_refs(tag, &refs, num_attrs) {
+            serial_println!(
+                ":: V3D: [v3d100] LEG {} — a referenced region escapes the arena; refusing the kick (fail-closed). NOTHING was kicked and NO verdict is implied ::",
+                leg
+            );
+            return V3d97LegOutcome::STOOD_DOWN;
+        }
+        Some(refs)
+    } else {
+        None
+    };
+    let cl_len = match content {
+        None => build_bin_cl_emptyunarm_padded(OFF_PROBE_BIN_CL, pad),
+        #[cfg(feature = "v3d_bincontent")]
+        Some((c, shadrec)) => {
+            build_bin_cl_content_geom(OFF_PROBE_BIN_CL, shadrec, 1, c, TARGET_W, TARGET_H)
+        }
+        #[cfg(not(feature = "v3d_bincontent"))]
+        Some(_) => build_bin_cl_emptyunarm_padded(OFF_PROBE_BIN_CL, pad),
+    };
     cache::clean_range(arena_phys() + OFF_PROBE_BIN_CL, cl_len);
     let ba = (arena_phys() + OFF_PROBE_BIN_CL) as u32;
     let ea = ba + cl_len as u32;
@@ -16034,7 +16379,7 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>, armed:
             ":: V3D: [v3d97] LEG {} — a range escapes the arena; refusing the kick (fail-closed). NOTHING was kicked and NO verdict is implied ::",
             leg
         );
-        return;
+        return V3d97LegOutcome::STOOD_DOWN;
     }
     decode_cl_packets(tag, OFF_PROBE_BIN_CL, cl_len);
 
@@ -16045,6 +16390,20 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>, armed:
     v3d56_poison_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
     v3d56_poison_region(OFF_V3D97_POOL, V3D97_POOL_BYTES);
     v3d56_poison_region(OFF_V3D97_TS, V3D97_TS_BYTES);
+
+    // PI-V3D-100 — the two POISON COLLARS and the pre-kick CONTENT digests, and in that order: the
+    // collars are poisoned first so the digests, taken after, describe the exact DRAM the kick sees.
+    // Both are the content legs' only additions to the region set; legs A-E leave them untaken.
+    #[cfg(feature = "v3d_bincontent")]
+    let content_pre = content_refs.map(|refs| {
+        v3d56_poison_region(OFF_V3D100_SHADREC_COLLAR, V3D100_SHADREC_COLLAR_BYTES);
+        v3d56_poison_region(OFF_V3D100_VTX_COLLAR, V3D100_VTX_COLLAR_BYTES);
+        let mut d = [0u32; V3D100_REFS];
+        for (i, r) in refs.iter().enumerate() {
+            d[i] = v3d100_digest(r.off, r.live);
+        }
+        (refs, d)
+    });
 
     // ── PI-V3D-99 — the PRODUCTION prologue, and ONLY on leg E. Kernel order, per `v3d_bin_job_run`
     // (v3d_sched.c) as `[v3d57]` transcribed it: `BPOS = 0` is the FIRST write of a bin job, then the
@@ -16117,6 +16476,19 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>, armed:
         (fault & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32
     );
 
+    // PI-V3D-100 — the CLE's own walk position and primitive counter, read AFTER the V2a pair (the law
+    // reserves the FIRST read after the wait for MMU_VIO_ADDR/VIO_ID and these are CLE registers).
+    // Only a content leg takes them, so legs A-E's register traffic is unchanged byte for byte.
+    let (ct0ca_post, ct0pc_post) = if content.is_some() {
+        (
+            mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA),
+            mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC),
+        )
+    } else {
+        (0, 0)
+    };
+    let _ = (ct0ca_post, ct0pc_post);
+
     let qma_post = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMA);
     let qms_post = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMS);
     let qts_post = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QTS);
@@ -16160,6 +16532,58 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>, armed:
             v3d99_dump_head(tag, "REAL tile-state array (leg E's CT0QTS)", ts, 8);
         }
     }
+    // PI-V3D-100 — the referenced-region witnesses, read on the SAME coherent snapshot as the four
+    // poison scans above (the L2T write-back and the CPU invalidate have already run). Two channels:
+    // the collars (poison, so a write near a referenced address is visible) and the content digests
+    // (so a write ON one is). Both are zero on a healthy leg, and both are printed either way.
+    #[cfg(feature = "v3d_bincontent")]
+    let (refs_changed, collar_words) = match content_pre {
+        None => (0u32, 0u32),
+        Some((refs, pre)) => {
+            let shad_collar =
+                v3d56_scan((arena_phys() + OFF_V3D100_SHADREC_COLLAR) as u32, V3D100_SHADREC_COLLAR_BYTES);
+            let vtx_collar =
+                v3d56_scan((arena_phys() + OFF_V3D100_VTX_COLLAR) as u32, V3D100_VTX_COLLAR_BYTES);
+            v3d56_emit_scan(
+                tag,
+                "[v3d100] COLLAR — shader-record page, past the record (referenced, read-only)",
+                (arena_phys() + OFF_V3D100_SHADREC_COLLAR) as u32,
+                &shad_collar,
+                flush_done,
+            );
+            v3d56_emit_scan(
+                tag,
+                "[v3d100] COLLAR — vertex-data page, past the three vec4 positions (referenced, read-only)",
+                (arena_phys() + OFF_V3D100_VTX_COLLAR) as u32,
+                &vtx_collar,
+                flush_done,
+            );
+            let mut changed = 0u32;
+            for (i, r) in refs.iter().enumerate() {
+                let post = v3d100_digest(r.off, r.live);
+                if post != pre[i] {
+                    changed += 1;
+                }
+                serial_println!(
+                    "::   [v3d100] ref-digest ({}) {} — iova={:#010x} live={} B pre={:#010x} post={:#010x} changed={} ::",
+                    tag, r.name, (arena_phys() + r.off) as u32, r.live, pre[i], post,
+                    (post != pre[i]) as u32
+                );
+            }
+            let cw = shad_collar.zeroed
+                + shad_collar.overwritten
+                + vtx_collar.zeroed
+                + vtx_collar.overwritten;
+            serial_println!(
+                ":: V3D: [v3d100] ref-witness ({}) — {} of {} referenced regions CHANGED across the kick, and the two poison collars took {} words. A referenced region is one the list only READS: any nonzero here is the GPU writing into its own input, which is OUTCOME C6 and which voids this leg's content reading until it is explained. Zero on both channels is the control that entitles the C1/C2/C3 rows to be believed ::",
+                tag, changed, V3D100_REFS, cw
+            );
+            (changed, cw)
+        }
+    };
+    #[cfg(not(feature = "v3d_bincontent"))]
+    let (refs_changed, collar_words) = (0u32, 0u32);
+    let _ = (refs_changed, collar_words);
     v3d56_emit_landing(tag, &arena_pre, &v3d56_arena_digest());
     ptb_frame_witness(tag, bfc_pre, rfc_pre, bpca_pre, if bases.is_some() { qma_pre } else { tile_alloc });
 
@@ -16209,11 +16633,64 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>, armed:
     #[cfg(not(feature = "v3d_armedclose"))]
     let armed_row: Option<&str> = None;
 
+    // ── PI-V3D-100: the content legs' own rows, which take precedence over ALL THREE sets above.
+    // They must: a content leg carries leg E's production bases and `CT0QTS.ENABLE`, so leg E's
+    // selector, leg D's and §49.21.4's would each claim it and answer a question it is not asking.
+    #[cfg(feature = "v3d_bincontent")]
+    let content_row: Option<&str> = content.map(|_| {
+        v3d100_content_verdict(
+            fault,
+            client,
+            va,
+            qma_pre,
+            qms_pre,
+            qts_pre,
+            pool_scan.zeroed + pool_scan.overwritten,
+            ts_scan.zeroed + ts_scan.overwritten,
+            decoy_touched,
+            refs_changed,
+            collar_words,
+            frame_closed,
+            ct0ca_post == ea,
+            ct0ca_post == ba,
+            pcs & V3D_PCS_BMACTIVE != 0,
+            pcs & V3D_PCS_BMOOM != 0,
+        )
+    });
+    #[cfg(not(feature = "v3d_bincontent"))]
+    let content_row: Option<&str> = None;
+
+    // PI-V3D-100 — the content leg's own arithmetic line, printed BEFORE the verdict so the verdict's
+    // instructions ("read CT0PC on this line", "read BPCA's advance against CT0QMS") have somewhere to
+    // point. Content legs only; legs A-E print nothing here.
+    #[cfg(feature = "v3d_bincontent")]
+    if content.is_some() {
+        let bpca_post = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
+        serial_println!(
+            ":: V3D: [v3d100] LEG {} CONTENT ARITHMETIC ({}) — list len={} ({:#x}) BA={:#010x} EA={:#010x} | CT0CA={:#010x} (at_BA={} at_EA={}) CT0PC={:#010x} | PCS={:#010x} (BMACTIVE={} BMBUSY={} BMOOM={}) | BPCA {:#010x}->{:#010x} advance-off-QMA={:#x} vs the empty close's {:#x} (V3D56_EXPECTED_EMPTY_BPCA_ADVANCE) and CT0QMS={:#x} | pool words {} vs the empty close's {} · tile-state words {} vs {} | refs changed={}/{} collar words={} — this line CARRIES NO VERDICT; the VERDICT line below reads it ::",
+            leg, tag, cl_len, cl_len, ba, ea,
+            ct0ca_post, (ct0ca_post == ba) as u32, (ct0ca_post == ea) as u32, ct0pc_post,
+            pcs,
+            (pcs & V3D_PCS_BMACTIVE != 0) as u32,
+            (pcs & V3D_PCS_BMBUSY != 0) as u32,
+            (pcs & V3D_PCS_BMOOM != 0) as u32,
+            bpca_pre, bpca_post, bpca_post.wrapping_sub(qma_pre),
+            V3D56_EXPECTED_EMPTY_BPCA_ADVANCE, qms_pre,
+            pool_scan.zeroed + pool_scan.overwritten, V3D99_BOOT6_POOL_WORDS,
+            ts_scan.zeroed + ts_scan.overwritten, V3D99_BOOT6_TS_WORDS,
+            refs_changed, V3D100_REFS, collar_words
+        );
+    }
+
     // ── The verdict. §49.20.6's four rows, pre-written, plus the branches that void them. ────────
     let verdict: &str = if !submit_sound {
         "THE SUBMIT DID NOT AUDIT SOUND — [v3d54] says the latched [BA,EA) is not the one intended, so nothing on this leg is about the list it names. Re-take; no verdict"
     } else if !frame_closed {
         "NO FRAME CLOSED ON THIS LEG, so the question was never put. §49.20's V1 established that an unarmed submit closes a bin frame (BFC Δ1); this leg did not close one, so there is no close whose write could be aimed anywhere. NOT a verdict on the aim — read leg A's BFC above: if leg A closed and this leg did not, the ONE variable this leg changed is what stopped it, and THAT is the finding"
+    } else if let Some(row) = content_row {
+        // Legs F/G/H (PI-V3D-100) — the content legs' own rows, ahead of leg E's, leg D's and the
+        // generic ones, because a content leg carries leg E's bases and would otherwise be claimed.
+        row
     } else if let Some(row) = armed_row {
         // Leg E (PI-V3D-99) — the production leg's own rows, ahead of leg D's for the reason above.
         row
@@ -16276,6 +16753,7 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>, armed:
     mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
     dsb();
     clear_mmu_fault_latch("v3d97 post-leg (VOID for the violation pair — see this leg's VIOLATION line)");
+    V3d97LegOutcome { submit_sound, frame_closed, idled }
 }
 
 /// PI-V3D-97 — the two `basedaim` legs, in §49.20.6's composition order: R3 (the control) then R1
@@ -16295,7 +16773,7 @@ fn v3d97_basedaim_legs() {
 
     // LEG B first — §49.20.6: "Run R3's leg FIRST (it validates the instrument), then R1's leg (it
     // answers the question)". Bases are untouched, so this leg still sits on leg A's zero residue.
-    v3d97_leg("B", "v3d97 R3 lenvary (zero bases, 46-byte list)", V3D97_PAD_FLUSHES, None, false);
+    let _ = v3d97_leg("B", "v3d97 R3 lenvary (zero bases, 46-byte list)", V3D97_PAD_FLUSHES, None, false, None);
 
     // LEG C — the cut.
     let bases = V3d96Bases {
@@ -16303,7 +16781,7 @@ fn v3d97_basedaim_legs() {
         qms: V3D97_QMS,
         qts: (arena_phys() + OFF_V3D97_TS) as u32, // bare base: ENABLE (bit1) stays 0 by design
     };
-    v3d97_leg("C", "v3d97 R1 basedaim (nonzero mapped bases, 14-byte list)", 0, Some(bases), false);
+    let _ = v3d97_leg("C", "v3d97 R1 basedaim (nonzero mapped bases, 14-byte list)", 0, Some(bases), false, None);
 
     // ── PI-V3D-98 — LEG D (`tsaim`). v3d.md §49.22.5's R-next-1: leg C's three values with EXACTLY
     // one bit changed, `CT0QTS.ENABLE`. Runs AFTER leg C so leg C stays the in-boot anchor and the
@@ -16319,7 +16797,7 @@ fn v3d97_basedaim_legs() {
             // THE ONLY DIFFERENCE FROM LEG C, and it is one bit.
             qts: (arena_phys() + OFF_V3D97_TS) as u32 | V3D_CLE_CT0QTS_ENABLE,
         };
-        v3d97_leg("D", "v3d98 R-next-1 tsaim (mapped bases, CT0QTS.ENABLE=1, 14-byte list)", 0, Some(tsaim), false);
+        let _ = v3d97_leg("D", "v3d98 R-next-1 tsaim (mapped bases, CT0QTS.ENABLE=1, 14-byte list)", 0, Some(tsaim), false, None);
         serial_println!(
             ":: V3D: [v3d98] TSAIM COMPLETE — leg D taken and nothing else. Read leg C's VERDICT before it: leg D's whole question is leg C's residual, and a leg C that did not reproduce boot7's shape (pool decoy touched, fault at VA 0x0) leaves leg D with no residual to explain. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at leg D's values, ENABLE included, for the same reason leg C left its own: nothing runs after this rung ::"
         );
@@ -16339,16 +16817,73 @@ fn v3d97_basedaim_legs() {
             qms: BIN_TILEALLOC_BYTES as u32,
             qts: (arena_phys() + OFF_TILESTATE) as u32 | V3D_CLE_CT0QTS_ENABLE,
         };
-        v3d97_leg(
+        let leg_e = v3d97_leg(
             "E",
             "v3d99 R-next-3 armedclose (PRODUCTION bases, BPOS=0 + pre-kick L2T invalidate, 14-byte list)",
             0,
             Some(production),
             true,
+            None,
         );
         serial_println!(
             ":: V3D: [v3d99] ARMEDCLOSE COMPLETE — leg E taken and nothing else. Read legs C and D BEFORE it: leg E's whole value is the COMPARISON, and a boot whose leg D did not return OUTCOME D1 leaves leg E without the unarmed baseline it is being read against. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at leg E's PRODUCTION values, which is the safest of the five endings — they are exactly what a later armed kick would program anyway — and nothing runs after this rung in any case: the boot returns before probe_job ::"
         );
+            let _ = leg_e;
+
+        // ── PI-V3D-100 — LEGS F, G, H (`bincontent`). v3d.md §49.24's content rung: the first bin
+        // lists in this rung's history that carry CONTENT, each submitted with LEG E's production
+        // bases and LEG E's prologue, so the only variable between leg E and any of them is THE LIST.
+        //
+        // ORDER IS THE SAFETY PROPERTY, NOT A PREFERENCE. Each leg is a strict superset of the one
+        // before it and each is likelier to stall than the one before it, so a stall lands as late as
+        // possible; and after every leg the ladder re-checks CT0 hygiene (frame closed, CTRUN clear)
+        // and STANDS DOWN the rest rather than measuring them behind an unclosed frame — §49.3's
+        // founding lesson, applied to the one rung most likely to reproduce it.
+        #[cfg(feature = "v3d_bincontent")]
+        {
+            serial_println!(
+                ":: V3D: [v3d100] BINCONTENT LADDER — READ THIS SIXTH, AND LAST. UNAOS_V3D_BINCONTENT=1 adds THREE more CT0 kicks after leg E, so this capture carries EIGHT closes: A (zero bases, 14 B), B (zero bases, 46 B), C (mapped decoy bases, ENABLE=0, 14 B), D (leg C's bases with CT0QTS.ENABLE=1, 14 B), E (PRODUCTION bases + BPOS=0 + pre-kick L2T invalidate, the 14-byte EMPTY list) and then F/G/H — the same production bases and the same prologue as leg E, with a list that carries CONTENT. WHY: boot9/PA47's leg E returned OUTCOME E1, so the close stage is CLOSED end to end and §49.8's bracket leaves exactly two stations — the m4 class (consumed its list, OPENED a frame, never closed it) and the rcl class (froze at first fetch). This ladder goes after the first. LEG F = full fixed-function state + GL_SHADER_STATE and NO primitives; LEG G = F plus VERTEX_ARRAY_PRIMS with a NULL coord shader (a real dispatching thread that writes NOTHING to VPM); LEG H = the m4-class MINIMUM, one tile config and one flat triangle over the real coordinate shader. It cannot honestly be cut below H's shape: PI-V3D-17 established that WITHOUT the clip/viewport/clipper state the clipper runs at POR zeros and collapses every primitive to a point, which would make a null result indistinguishable from the empty close. NEW SURFACE: these lists reach ELEVEN DRAM regions the 14-byte list never named, so each leg names every one on the wire ([v3d100] ref), bounds-checks it fail-closed, digests its live bytes pre and post, and poisons COLLARS on the unused remainder of the record and vertex pages. Outcomes are pre-written on each content leg's own VERDICT line (C1 content FLOWS; C2/C2b/C2c a close that binned nothing; C3a/C3b/C3c a stall mid-content; C4/C4b a fetch that stopped; C5 pool exhaustion; C6 a referenced region moved; C7* a refusal; C1b a decoy hit). §49.20.2's V2a law rides unchanged, and the CT0-hygiene gate stands each leg down if the one before it left a frame open ::"
+            );
+            let mut clean = leg_e.ct0_clean();
+            if !clean {
+                serial_println!(
+                    ":: V3D: [v3d100] LADDER STOOD DOWN BEFORE LEG F — leg E did not leave CT0 clean (submit_sound, frame-closed and CTRUN-clear all have to hold). A content leg measured behind an unclosed frame is §49.3's defect reproduced on purpose, so NO content kick was issued and NO content verdict is implied. Read leg E's VERDICT: whatever it says is the finding of this boot ::"
+                );
+            }
+            for (leg, class, shadrec, what) in [
+                (
+                    "F",
+                    BinContent::StateNoPrims,
+                    OFF_SHADREC,
+                    "v3d100 R-next-4 bincontent leg F (PRODUCTION bases + armed prologue, STATE and NO PRIMS)",
+                ),
+                (
+                    "G",
+                    BinContent::PrimsNullShader,
+                    OFF_BISECT_NULL_SHADREC,
+                    "v3d100 R-next-4 bincontent leg G (PRODUCTION bases + armed prologue, PRIMS with the NULL coord shader)",
+                ),
+                (
+                    "H",
+                    BinContent::Full,
+                    OFF_SHADREC,
+                    "v3d100 R-next-4 bincontent leg H (PRODUCTION bases + armed prologue, the m4-class MINIMUM: one tile config + one flat triangle)",
+                ),
+            ] {
+                if !clean {
+                    serial_println!(
+                        ":: V3D: [v3d100] LEG {} STOOD DOWN — the leg before it did not close its frame or did not leave CTRUN clear, so this leg would be measured on a dirty CT0 and its result would carry no information (v3d.md §49.3). NO kick was issued and NO verdict is implied ::",
+                        leg
+                    );
+                    continue;
+                }
+                let out = v3d97_leg(leg, what, 0, Some(production), true, Some((class, shadrec)));
+                clean = out.ct0_clean();
+            }
+            serial_println!(
+                ":: V3D: [v3d100] BINCONTENT COMPLETE — the ladder is taken and nothing else runs; the boot returns before probe_job. Read leg E's VERDICT BEFORE any of F/G/H: leg E is the EMPTY control for all three, taken on the same boot, the same image, the same bases and the same prologue, and a boot whose leg E did not return OUTCOME E1 leaves the content legs with no baseline. Then read F, G and H in that order — each is a strict superset of the one before it, so the FIRST leg whose verdict changes is where content enters. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at the production values, as leg E left them ::"
+            );
+        }
     }
 
     serial_println!(

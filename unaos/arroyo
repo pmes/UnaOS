@@ -105,6 +105,13 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # (E) and therefore implies `v3d_tsaim` (declared in Cargo.toml and armed here), so
 # `UNAOS_V3D_ARMEDCLOSE=1` alone is sufficient. Leg E is the ONE leg of the five that is NOT unarmed.
 # See the kernel8 knob block below and v3d.md §49.23.
+#
+# PI-V3D-100: UNAOS_V3D_BINCONTENT=1 is a plain arming knob (no value) for the `v3d_bincontent` feature
+# — the `[v3d100]` content ladder, v3d.md §49.24's R-next-4. It rides the `[v3d97]` rung as THREE more
+# legs (F, G, H) and therefore implies `v3d_armedclose` (declared in Cargo.toml and armed here), so
+# `UNAOS_V3D_BINCONTENT=1` alone is sufficient. F/G/H are the first legs of the rung whose lists carry
+# CONTENT and the first whose lists reference DRAM at all.
+# See the kernel8 knob block below and v3d.md §49.24.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1592,7 +1599,7 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -2871,6 +2878,43 @@ kernel8() {
     if [ -n "${UNAOS_V3D_ARMEDCLOSE:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_ARMEDCLOSE: the [v3d99] armedclose leg — ONE more CT0 kick after [v3d98]'s leg D, the PRODUCTION submit (real pool/size/tile-state|ENABLE + BPOS=0 + pre-kick L2T invalidate) under tonight's full instrument set, to read whether the ARMED close also completes (⚠ implies UNAOS_V3D_TSAIM; the only non-unarmed leg; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-100: UNAOS_V3D_BINCONTENT=1 adds the `v3d_bincontent` feature — v3d.md §49.24's R-next-4
+    # (`bincontent`), built as THREE MORE legs (F, G, H) on the [v3d97] rung. It therefore IMPLIES
+    # UNAOS_V3D_ARMEDCLOSE (and UNAOS_V3D_TSAIM, UNAOS_V3D_BASEDAIM, UNAOS_V3D_UNARMCLOSE, UNAOS_V3D):
+    # the cargo feature declares `v3d_bincontent = ["v3d_armedclose"]` so the implication cannot be
+    # forgotten, and this block arms the whole chain itself.
+    # WHY: boot9/PA47 flew legs A-E. Legs A-D reproduced boot8 exactly (pad self-check identical=1,
+    # leg B VIO_ADDR=0xe on a 46-byte list, leg C decoy pool 20/4096 with the residual PTB refusal at
+    # VA 0x0, leg D OUTCOME D1 with the catcher pristine), and LEG E returned OUTCOME E1: fault=0, the
+    # [v3d62] catcher at 0/1024, real-ts=48/64, real-pool=20/8192, both decoys 0/0, BFC delta 1, and a
+    # landing digest reading changed=2 expected=2 STRAY=0. The ARMED close is healthy and it is §49.8
+    # boot6's shape to the word, so §49.22.3's conditional reconciliation is DISCHARGED, the close
+    # stage is CLOSED end to end, and the remaining surface is bin CONTENT — §49.8's m4/rcl classes.
+    # THIS LADDER GOES AFTER THE m4 CLASS. Leg F = leg E's production bases and armed prologue with the
+    # full fixed-function state + GL_SHADER_STATE and NO primitives; leg G = F plus VERTEX_ARRAY_PRIMS
+    # with the NULL coord shader; leg H = the m4-class MINIMUM, one tile config + one flat triangle over
+    # the real coordinate shader. H cannot be cut smaller honestly: PI-V3D-17 established that without
+    # the clip/viewport/clipper state every primitive collapses to a point and the binner writes an
+    # empty-but-legal bin, which would be indistinguishable from the empty close.
+    # NEW SURFACE: F/G/H are the first legs whose lists reference DRAM — eleven regions, each named on
+    # the wire ([v3d100] ref), bounds-checked fail-closed, digested pre/post, and collared with poison
+    # on the unused remainder of the record and vertex pages.
+    # CT0 HYGIENE: the legs run in increasing order of stall risk and each later leg is STOOD DOWN if
+    # the one before it did not close its frame or left CTRUN set (v3d.md §49.3).
+    # Wire outcomes are pre-written on each content leg's own VERDICT line: C1 = content FLOWS (closed,
+    # more than 20 pool words); C2/C2b/C2c = closed but binned nothing or other counts (a vertex-path
+    # statement); C3a/C3b/C3c = stalled mid-content (§49.8 boot8's m4 station, re-read under tonight's
+    # instruments); C4/C4b = fetch never started / stopped mid-list; C5 = PCS.BMOOM pool exhaustion;
+    # C6 = a referenced region moved; C7/C7b/C7c/C7d = a refusal; C1b = a decoy moved.
+    # No page table is edited, no mailbox tag is sent, no BPOA is written.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D, so [v3d95]
+    # prints its hub-absent SKIPPED line and returns before any of these legs is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_BINCONTENT:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_BINCONTENT: the [v3d100] content ladder — THREE more CT0 kicks after [v3d99]'s leg E, all on leg E's PRODUCTION bases and armed prologue, varying only the LIST (F = state, no prims; G = prims with the NULL coord shader; H = the m4-class minimum, one tile config + one flat triangle), with eleven referenced DRAM regions named/bounds-checked/digested and two poison collars, and a CT0-hygiene gate that stands later legs down (⚠ implies UNAOS_V3D_ARMEDCLOSE; short capture — do not diff against a deep boot)${COLOR_RESET}"
     fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::

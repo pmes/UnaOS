@@ -1171,6 +1171,46 @@ v3d_tsaim = ["v3d_basedaim"]
 # a full deep boot. See docs/dev/OS/08_VIDEO/v3d.md §49.23.
 v3d_armedclose = ["v3d_tsaim"]
 
+# PI-V3D-100: the BINCONTENT ladder — v3d.md §49.24's R-next-4, built as THREE MORE legs (F, G, H) on
+# the `[v3d97]` scaffolding (hence the feature IMPLIES `v3d_armedclose`, and through it `v3d_tsaim`,
+# `v3d_basedaim` and `v3d_unarmclose`; it cannot be armed alone). WHY: boot9/PA47's leg E returned
+# `OUTCOME E1` — the PRODUCTION close is healthy and it is §49.8 boot6's shape to the word (no fault,
+# the `[v3d62]` catcher pristine, 20 pool words at `CT0QMA`, 48 tile-state words at `CT0QTS`, both
+# decoys intact, landing digest `changed=2 expected=2 STRAY=0`). §49.22.3's conditional reconciliation
+# is DISCHARGED and the close stage is closed end to end, unarmed and armed. §49.8's bracket leaves
+# exactly two stations, and NEITHER is the close: the `m4` class consumed its list, OPENED a frame and
+# never closed it; the `rcl` class froze at its first fetch. This ladder goes after the FIRST of them.
+#   LEG F = leg E's production bases and leg E's armed prologue with the full fixed-function state and
+#   `GL_SHADER_STATE` but NO `VERTEX_ARRAY_PRIMS`. LEG G = F plus the primitives, with a shader record
+#   selecting the NULL coord shader (a real dispatching thread that writes NOTHING to VPM). LEG H = the
+#   `m4`-class MINIMUM — one tile config and one flat triangle over the real coordinate shader. H's
+#   shape cannot honestly be cut smaller: PI-V3D-17 established that without the clip/viewport/clipper
+#   state the clipper runs at power-on-reset zeros and collapses every primitive to a point, so a
+#   stripped list would return a null INDISTINGUISHABLE from the empty close.
+#   NEW SURFACE, AND ITS INSTRUMENTS: these are the first lists in the rung that reference DRAM —
+#   eleven regions through `GL_SHADER_STATE` -> the shader record -> the attribute record. Each is
+#   named on the wire before the kick (`[v3d100] ref`), bounds-checked fail-closed, and witnessed two
+#   ways: an FNV-1a CONTENT DIGEST over its live bytes pre-kick vs post-write-back, and POISON COLLARS
+#   over the unused remainder of the shader-record and vertex pages. Poison is deliberately NOT used on
+#   the live bytes: a region the GPU must READ cannot carry poison and still be its own input.
+#   CT0 HYGIENE: the three legs run in increasing order of stall risk and the ladder STANDS DOWN every
+#   later leg if one fails to close its frame or leaves `CTRUN` set — v3d.md §49.3's founding lesson.
+#   Wire outcomes are pre-written on each content leg's own VERDICT line: C1 = content FLOWS (frame
+#   closed and MORE than the empty close's 20 pool words, so the bin path is whole and the last named
+#   room is the render list); C2/C2b/C2c = a close that binned nothing or binned other counts (a
+#   VERTEX-PATH statement, PI-V3D-17's empty-but-legal bin); C3a/C3b/C3c = a stall mid-content, which
+#   is §49.8 boot8's `m4` station re-read under instruments boot8 did not have; C4/C4b = a fetch that
+#   never started or stopped mid-list; C5 = `PCS.BMOOM`, pool exhaustion with no `BPOA` (a driver
+#   geometry finding); C6 = a referenced region moved, which voids the leg's content reading; C7/C7b/
+#   C7c/C7d = a refusal, read against the eleven ref iovas as well as the three bases; C1b = a decoy
+#   moved. No page table is edited, no mailbox tag is sent, no `BPOA` is written, and the arena
+#   geometry is untouched. Default OFF and fully uncompiled when off. Enable via `UNAOS_V3D=1
+# `UNAOS_V3D_UNARMCLOSE=1 UNAOS_V3D_BASEDAIM=1 UNAOS_V3D_TSAIM=1 UNAOS_V3D_ARMEDCLOSE=1
+# `UNAOS_V3D_BINCONTENT=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately produces a SHORT
+# capture missing every banked witness; it must never be diffed line-for-line against a full deep boot.
+# See docs/dev/OS/08_VIDEO/v3d.md §49.24.
+v3d_bincontent = ["v3d_armedclose"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding
