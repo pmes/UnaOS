@@ -112,6 +112,14 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # `UNAOS_V3D_BINCONTENT=1` alone is sufficient. F/G/H are the first legs of the rung whose lists carry
 # CONTENT and the first whose lists reference DRAM at all.
 # See the kernel8 knob block below and v3d.md §49.24.
+#
+# PI-V3D-101: UNAOS_V3D_DISPATCHDISC=1 is a plain arming knob (no value) for the `v3d_dispatchdisc`
+# feature — the `[v3d101]` dispatch-discriminator rung, v3d.md §49.25.4. It adds NO leg and NO kick: it
+# INSTRUMENTS the `[v3d100]` ladder's own legs E/F/G/H with a V3D performance-counter bank and a
+# bit-by-bit INT_STS decode, and therefore implies `v3d_bincontent` (declared in Cargo.toml and armed
+# here), so `UNAOS_V3D_DISPATCHDISC=1` alone is sufficient. The only registers it writes are the PCTR
+# counter-file config registers mainline's v3d_perfmon.c writes on every perfmon start.
+# See the kernel8 knob block below and v3d.md §49.25.4.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1599,7 +1607,7 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -2915,6 +2923,51 @@ kernel8() {
     if [ -n "${UNAOS_V3D_BINCONTENT:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_BINCONTENT: the [v3d100] content ladder — THREE more CT0 kicks after [v3d99]'s leg E, all on leg E's PRODUCTION bases and armed prologue, varying only the LIST (F = state, no prims; G = prims with the NULL coord shader; H = the m4-class minimum, one tile config + one flat triangle), with eleven referenced DRAM regions named/bounds-checked/digested and two poison collars, and a CT0-hygiene gate that stands later legs down (⚠ implies UNAOS_V3D_ARMEDCLOSE; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-101: UNAOS_V3D_DISPATCHDISC=1 adds the `v3d_dispatchdisc` feature — v3d.md §49.25.4's
+    # `dispatchdisc` rung. It therefore IMPLIES UNAOS_V3D_BINCONTENT (and UNAOS_V3D_ARMEDCLOSE,
+    # UNAOS_V3D_TSAIM, UNAOS_V3D_BASEDAIM, UNAOS_V3D_UNARMCLOSE, UNAOS_V3D): the cargo feature declares
+    # `v3d_dispatchdisc = ["v3d_bincontent"]` so the implication cannot be forgotten, and this block
+    # arms the whole chain itself.
+    # IT ADDS NO LEG AND NO KICK. The boot still takes EIGHT CT0 closes and legs A..H are byte-for-byte
+    # what UNAOS_V3D_BINCONTENT submits; what this knob adds is INSTRUMENTATION on the four legs that
+    # carry leg E's production bases.
+    # WHY: boot11/PA48's leg G returned the wall at its narrowest ever — the bin frame stops closing the
+    # INSTANT a primitive dispatches, and BEFORE shader output can matter (leg G's coord shader is the
+    # NULL shader). The list was consumed to EA, CT0PC counted all three primitives, PCS.BMACTIVE held
+    # for the whole 500 ms backstop, ZERO pool words and ZERO tile-state words were written where legs
+    # E and F both wrote 20 and 48, no MMU fault latched, and not one of the eleven referenced regions
+    # moved. Memory refusal is excluded, the close stage is exonerated end to end, and exactly one span
+    # of pipeline is left dark: VCD attribute DMA -> coord-thread launch -> VPM write-back -> PTB intake.
+    # WHAT IT ARMS: eight PCTR slots, programmed ONCE immediately before leg E's kick and left RUNNING
+    # across E/F/G/H so every leg's delta is a difference against IN-BOOT baselines and not across a boot
+    # boundary — src1 FEP_VALID_PRIMS, src14 QPU_ACTIVE_CYCLES_VERTEX_COORD_USER, src32 CYCLE_COUNT
+    # (slot 2, the RESERVED V3D63_CTRL_SLOT / [v3d55] clkliv slot and this bank's own control), src16
+    # QPU_CYCLES_VALID_INSTR, src58 L2T_VCD_READS, src26 VPM_VDW_STALL, src27 VPM_VCD_STALL and src35
+    # PTB_PRIMS_BINNED. Every id is transcribed from include/uapi/drm/v3d_drm.h with its line cited in
+    # code, and the six ids the tree already carried land on their existing names (§38's six-for-six
+    # index cross-check, re-run on a newer copy). §38's caveat rides with them: id<->mux validity on this
+    # silicon is PARTIAL AND PER ID, so a nonzero slot is strong and a zero slot is weak — which is why
+    # legs E and F are read on the same bank as baselines. Plus a bit-by-bit INT_STS decode on each armed
+    # leg: boot11's leg G read 0x00010000 and no line named it (per PI-V3D-45 that is bit16, "QPU 0
+    # raised a host interrupt" — an independent instrument saying a thread ran and ended).
+    # Wire outcomes are pre-written on LEG G's own [v3d101] VERDICT line, one per station of the dark
+    # span: D1 = QPU delta 0, the coord thread NEVER LAUNCHES; D2 = QPU moved but VPM/PTB flat, the
+    # thread runs and delivers nothing — which on the NULL-shader leg is CORRECT thread behaviour, so D2
+    # is explicitly NOT a wall verdict and must be re-run against leg H's real shader; D3 = VPM/PTB moved
+    # with ZERO pool words, the PTB receives and discards; D4 = every counter flat including FEP, so
+    # CT0PC's own meaning is the finding. Two INCONCLUSIVE guards sit in front of all four.
+    # The ONLY registers written are the PCTR counter-file config registers mainline's v3d_perfmon.c
+    # writes on every perfmon start, in that file's own start/stop idiom. No page table is edited, no
+    # mailbox tag is sent, no BPOA is written, and §49.20.2's V2a law is strengthened in code: every
+    # counter read on every leg happens strictly AFTER that leg's read-once violation pair.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D and no PCTR block,
+    # so [v3d95] prints its hub-absent SKIPPED line and returns before any leg is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_DISPATCHDISC:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_DISPATCHDISC: the [v3d101] dispatch-discriminator rung — NO new leg and NO new kick, an eight-slot PCTR bank armed ONCE before leg E and read across legs E/F/G/H (FEP prims · QPU coord/instr cycles · src32 CYCLE_COUNT control · L2T VCD reads · both VPM stalls · PTB prims-binned) plus a bit-by-bit INT_STS decode, with §49.25.4's D1/D2/D3/D4 outcomes pre-written on leg G's verdict line (⚠ implies UNAOS_V3D_BINCONTENT; short capture — do not diff against a deep boot)${COLOR_RESET}"
     fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::

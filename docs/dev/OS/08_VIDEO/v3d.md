@@ -8446,6 +8446,117 @@ default OFF, same family law (the boot returns before `probe_job`; never beside 
 sends). Image = **PA49**. Leg H remains stood down until G closes; the discriminator is measured on
 the leg that fails, not the leg that would.
 
+##### 49.25.4a `dispatchdisc`, built — the bank, the two corrections, and the gates (PI-V3D-101)
+
+This records the rung as **built**, on the terms §49.21/§49.22.6/§49.23.7/§49.24.6 recorded theirs:
+a **design note, not a verdict**. QEMU raspi4b models no V3D and no `PCTR` block, so nothing below has
+been observed; the gates are compile, presence-in-artifact and knob-off byte-identity, and the reading
+belongs to the next metal sitting.
+
+**What was built — no leg and no kick.** The boot still takes **eight** CT0 closes and legs A…H are
+byte-for-byte what `v3d_bincontent` submits. What this rung adds is instrumentation on the four legs
+that carry leg E's production bases: an eight-slot `PCTR` bank **armed once**, immediately before leg E's
+kick, and left **running** across E/F/G/H, plus a bit-by-bit `INT_STS` decode on each of those legs. The
+bank is never re-armed between legs — a re-arm clears the counter file, and a clear between two legs that
+are supposed to differ only in their list is a second variable. Each leg prints its **raw** cumulative
+words beside the **delta** this code subtracted, per the instrument law.
+
+| slot | src | `enum v3d_perfcnt` member | what it watches |
+|---|---|---|---|
+| 0 | 1 | `FEP_VALID_PRIMS` | front-end primitive intake |
+| 1 | 14 | `QPU_ACTIVE_CYCLES_VERTEX_COORD_USER` | the coord thread executing |
+| **2** | **32** | `CYCLE_COUNT` | **RESERVED** — `V3D63_CTRL_SLOT`, the `[v3d55]` clkliv slot, and this bank's own control |
+| 3 | 16 | `QPU_CYCLES_VALID_INSTR` | any QPU instruction issue |
+| 4 | 58 | `L2T_VCD_READS` | the VCD's attribute fetches, through L2T |
+| 5 | 26 | `VPM_VDW_STALL` | VPM write-side stall |
+| 6 | 27 | `VPM_VCD_STALL` | VPM VCD-side stall |
+| 7 | 35 | `PTB_PRIMS_BINNED` | PTB intake — the first thing downstream of VPM that can move |
+
+**Sourcing, under §38's rail.** Every id is transcribed from `include/uapi/drm/v3d_drm.h` on the build
+host (`/run/host/usr/src/kernels/7.1.8-200.fc44.x86_64/…`), the anonymous `enum { V3D_PERFCNT_* }` whose
+first member `V3D_PERFCNT_FEP_VALID_PRIMTS_NO_PIXELS` is index 0 and whose comment scopes these indices
+to V3D 4.2 — this hardware. The enumerator list is **contiguous** from `v3d_drm.h:623` to `:709`, so
+index `== line − 623`, and each id's line is cited in code beside its constant. §38's six-for-six index
+cross-check was **re-run against this newer copy and is still six for six** (14, 16, 17, 24, 25, 32 all
+land on their existing names). §38's standing caveat rides with them unchanged: on this silicon the 7-bit
+`SRC` field does not select the enum's source for every id, so **`id↔mux` validity is partial and per
+id** — a nonzero slot is strong, a zero slot is weak. That is exactly why legs E and F are read on the
+same bank: a slot flat on E/F and moving on G moved *because of* `VERTEX_ARRAY_PRIMS`, and a slot moving
+on E is not measuring what its name says here.
+
+**Two corrections this arc records rather than absorbs.**
+
+1. §49.25.4 asks for a **"VPM writes"** source. **There is no `V3D_PERFCNT_VPM_*_WRITES` member in this
+   header.** `grep VPM` over the enum returns exactly two members, 26 `VPM_VDW_STALL` and 27
+   `VPM_VCD_STALL`, both *stall* counters. They are armed as the VPM-side channel and named for what
+   they are; the delivery-arrival question is carried by 35 `PTB_PRIMS_BINNED` instead. Same treatment
+   §39 gave the brief's non-existent `PTB_BLOCKED_CYCLES`.
+2. §38's prose cites `CLE_ACTIVE` at index **57**. Counted against this copy it is **55**
+   (`v3d_drm.h:678`). Nothing in the tree arms it, so nothing is affected; the number is corrected here
+   so the next arc does not inherit it.
+
+**`INT_STS`, owed since boot11 and paid.** Leg G read `0x00010000` and no line named it. The decode is
+not new knowledge — `V3D_INT_QPU_MASK`/`SHIFT` have been in the file since PI-V3D-45 — it is a line that
+*says* it, bit by bit, off the word `wait_fldone` already returned. `0x00010000` is **bit16: QPU 0 raised
+a host interrupt**, the QPU's own `sig.int` / program-end-interrupt path. That is a **positive**
+statement that a thread ran and ended, from an instrument the counter file cannot influence, and it is
+not an error bit — so leg G's freeze is not a latched fault. It also sets up the sharpest reading in the
+rung: if `INT_STS` bit16 is set while the QPU cycle slots read delta 0, the two instruments **disagree**,
+and the disagreement is the finding.
+
+**The outcomes, pre-written verbatim on leg G's own `[v3d101] DISPATCHDISC VERDICT` line.** Two
+INCONCLUSIVE guards are taken first — the bank lost its enable mask inside the window, or slot 2's
+control never moved — and neither yields a D row.
+
+| the leg reads | verdict | conclusion |
+|---|---|---|
+| every counter flat, FEP included, on a leg whose `CT0PC` counted 3 | `OUTCOME D4` | the CLE counted primitives it **never forwarded**. `CT0PC`'s own meaning is the finding: a list-parse counter, not a dispatch counter, and every reading that treated "CT0PC advanced" as "the primitive dispatched" must be re-read. Weakest of the four rows under §38's caveat — check E/F first |
+| QPU cycles delta 0, something upstream moved | `OUTCOME D1` | **the coord thread never launches.** The wall is thread dispatch itself — shader-record fetch or the thread-start/TSDA path — upstream of anything the shader could do wrong, which retires shader content as a suspect. Cross-read against the `INT_STS` QPU vector |
+| QPU moved, VPM and PTB flat | `OUTCOME D2` | the thread runs and delivers nothing — and on the NULL-shader leg **that is correct behaviour**, so **D2 is explicitly not a wall verdict**; it must be re-run against leg H's real shader. What it does buy is large: dispatch reaches the QPU, D1 is dead, and the dark span shrinks to VPM write-back and PTB intake |
+| VPM and/or PTB moved, **pool words 0** | `OUTCOME D3` | **the PTB receives and discards** — the wall is PTB intake. Slot 7 against slots 5/6 splits it further: prims-binned moving with a zero pool is the narrowest form; prims-binned flat with only the VPM stalls moving puts the wall one station earlier, at the PTB's acceptance of the hand-off |
+| counters moved **and** the pool took words, frame still open | — | no §49.25.4 row fits. A new station; name it from the raw words before reusing any earlier row |
+
+**Scope and family law.** The only registers written are the `PCTR` counter-file config registers
+mainline's `v3d_perfmon.c` writes on every perfmon start, in that file's own start/stop idiom (EN=0 →
+SRC → PI-V3D-39 read-back → CLR while stopped → OVERFLOW clear → EN last; stop is EN=0). No CLE, PTB,
+VCD, MMU or fabric state is touched, no page table is edited, no mailbox tag is sent, no `BPOA` is
+written, and the arena geometry is unchanged. The boot returns before `probe_job`, so the knob can never
+sit beside `[v3d75]`'s `ENABLE_QPU` or `[v3d80]`/`[v3d81d]`'s `DISPLAY_DONE` sends. **§49.20.2's V2a law
+is strengthened in code:** every counter read on every leg happens strictly *after* that leg's read-once
+violation pair, and the sample is taken before the leg's own L2T flush so the counters describe the kick
+and not our cache maintenance. A `[v3d101] CORRECTION TO ALL FIVE LINES ABOVE` rides in front, and it
+says the one thing a reader could get wrong: this knob adds **no leg**.
+
+**Measured, this arc** (worktree `unaos-wt-exec-v3d101`, baseline `b9ae9112`):
+
+| gate | result |
+|---|---|
+| `./arroyo check` | green, both arches; `arm-pi` green with `v3d_dispatchdisc` appended to its feature list, `kernel cfg coverage OK (12 legs)` |
+| `UNAOS_WC=1 ./arroyo check` | green, both arches |
+| knob-off `./arroyo kernel8-test 210` | **MBENCH PASS — 117/117 required witnesses, 0 forbidden hit(s), 20766 lines scanned**, first run, quiet host |
+| knob-off byte-identity, `UNAOS_PI=1 ./arroyo kernel8` | arc-applied `3a280f9dcbb32145…` **==** baseline `3a280f9dcbb32145…` (baseline built in this worktree at `b9ae9112` before any edit; no stash, per `CLAUDE.md`) |
+| armed build banner | all **seven** knobs echo: `UNAOS_V3D`, `UNAOS_V3D_UNARMCLOSE`, `UNAOS_V3D_BASEDAIM`, `UNAOS_V3D_TSAIM`, `UNAOS_V3D_ARMEDCLOSE`, `UNAOS_V3D_BINCONTENT`, `UNAOS_V3D_DISPATCHDISC` |
+| implication proved by image | `UNAOS_V3D_DISPATCHDISC=1` **alone** builds `e880ae8366466c8f…` — the same digest as the full seven-knob line, so the chain is armed by the feature and not by the operator |
+| strings-proof, armed image `e880ae8366466c8f…` | `v3d101] CORRECTION TO ALL FIVE` 1 · `v3d101] PCTRARM` 1 · `v3d101] PCTRSTOP` 1 · `v3d101] DISPATCHDISC (` 1 · `v3d101] DISPATCHDISC VERDICT` 1 · `v3d101] INT_STS DECODE` 1 · `v3d101] BASELINE` 1 · `THE COORD THREAD NEVER LAUNCHES` 1 · `THE THREAD RUNS AND DELIVERS NOTHING` 1 · `THE PTB RECEIVES AND DISCARDS` 1 · `EVERY COUNTER delta 0` 1 · `THE BANK WAS NOT FULLY ARMED` 1 · `SLOT 2 (src32 CYCLE_COUNT) IS FLAT` 1 · `ROW FITS` 1 · `FEP_VALID_PRIMS` 1 · `L2T_VCD_READS` 1 · `VPM_VDW_STALL` 1 · `VPM_VCD_STALL` 1 · `PTB_PRIMS_BINNED` 2 · `per-QPU host-interrupt vector` 2 |
+
+*Scope of the byte-identity claim.* A `UNAOS_V3D_BINCONTENT=1` build is **not** claimed byte-identical
+across this arc — the shared leg gained a cfg-gated sample and two emit calls. What is claimed and gated
+is that **every build that does not arm `v3d_dispatchdisc` is byte-identical to the pre-arc build**,
+which covers every boot that is not this experiment.
+
+**What the sitting needs.** One image, image name **PA49**:
+
+```
+UNAOS_V3D=1 UNAOS_V3D_UNARMCLOSE=1 UNAOS_V3D_BASEDAIM=1 UNAOS_V3D_TSAIM=1 UNAOS_V3D_ARMEDCLOSE=1 UNAOS_V3D_BINCONTENT=1 UNAOS_V3D_DISPATCHDISC=1 UNAOS_PI=1 ./arroyo kernel8
+```
+
+A **cold** power-cycle, as boot4/7/8/9/11 were. One short capture, labelled, never diffed line-for-line
+against a deep boot. **Read in this order:** the five `CORRECTION` lines, `[v3d101] PCTRARM` (which slot
+carries which source), then for each of legs E, F, G, H in turn its `[v3d101] INT_STS DECODE` and its
+`[v3d101] DISPATCHDISC` delta line — E and F are the **baselines** and carry no outcome row — and finally
+leg G's `[v3d101] DISPATCHDISC VERDICT`. Leg H remains stood down until G closes; the discriminator is
+measured on the leg that fails, not the leg that would.
+
 *Fold discipline note:* boot11 flew and was read the same sitting; this fold was written by the
 successor session (pi 1) from the capture per the baton's explicit no-folds-at-close order — the
 capture, not this prose, is the evidence of record.

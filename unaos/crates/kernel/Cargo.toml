@@ -1211,6 +1211,51 @@ v3d_armedclose = ["v3d_tsaim"]
 # See docs/dev/OS/08_VIDEO/v3d.md §49.24.
 v3d_bincontent = ["v3d_armedclose"]
 
+# PI-V3D-101: the DISPATCHDISC rung — v3d.md §49.25.4, built as INSTRUMENTATION on the `[v3d100]`
+# ladder's own legs (hence the feature IMPLIES `v3d_bincontent`, and through it `v3d_armedclose`,
+# `v3d_tsaim`, `v3d_basedaim` and `v3d_unarmclose`; it cannot be armed alone). IT ADDS NO LEG AND NO
+# KICK — the boot still takes EIGHT closes and legs A..H are byte-for-byte what `v3d_bincontent`
+# submits. WHY: boot11/PA48's leg G returned the wall at its narrowest — the bin frame stops closing the
+# INSTANT a primitive dispatches. The list was consumed to `EA`, `CT0PC` counted all three primitives,
+# `PCS.BMACTIVE` held for the whole 500 ms backstop, ZERO pool and ZERO tile-state words were written,
+# no MMU fault latched and not one of the eleven referenced regions moved. That leaves exactly one span
+# of pipeline dark — VCD attribute DMA, coord-thread launch, VPM write-back, PTB intake — and the two
+# questions the baton names (does the coord thread START? does the close wait on a VPM delivery the VCD
+# never makes?) are both answerable from the V3D performance-counter block, which is ARM-readable and
+# needs no new memory surface.
+#   WHAT IT ARMS: eight `PCTR` slots, programmed ONCE immediately before leg E's kick and left RUNNING
+#   across legs E/F/G/H so each leg's delta is a difference against in-boot baselines rather than across
+#   a boot boundary — 1 `FEP_VALID_PRIMS`, 14 `QPU_ACTIVE_CYCLES_VERTEX_COORD_USER`, 32 `CYCLE_COUNT`
+#   (slot 2, the RESERVED `V3D63_CTRL_SLOT`/`[v3d55]` clkliv slot and this bank's own control), 16
+#   `QPU_CYCLES_VALID_INSTR`, 58 `L2T_VCD_READS`, 26 `VPM_VDW_STALL`, 27 `VPM_VCD_STALL` and 35
+#   `PTB_PRIMS_BINNED`. Every id is transcribed from `include/uapi/drm/v3d_drm.h` with its line cited in
+#   code, and the six ids the tree already carried land on their existing names — §38's six-for-six
+#   index cross-check, re-run against a newer copy of the same header. §38's standing caveat rides with
+#   them: `id<->mux` validity on this silicon is PARTIAL AND PER ID, so a nonzero slot is strong and a
+#   zero slot is weak, which is exactly why legs E and F are read on the same bank as baselines.
+#   Plus a bit-by-bit `INT_STS` decode on each armed leg — boot11's leg G read `0x00010000` and no line
+#   named it; per PI-V3D-45 that is bit16, "QPU 0 raised a host interrupt", an independent instrument
+#   saying a thread ran and ended.
+#   Wire outcomes are pre-written on LEG G's own `[v3d101]` VERDICT line, one per station of the dark
+#   span: D1 = QPU delta 0, the coord thread NEVER LAUNCHES (the wall is thread dispatch itself);
+#   D2 = QPU moved, VPM/PTB flat, the thread runs and delivers nothing — and on the NULL-shader leg that
+#   is CORRECT thread behaviour, so D2 is explicitly NOT a wall verdict and must be re-run against leg
+#   H's real shader; D3 = VPM/PTB moved with ZERO pool words, the PTB receives and discards; D4 = every
+#   counter flat including FEP, so `CT0PC`'s own meaning is the finding. Two INCONCLUSIVE guards sit in
+#   front of all four (the bank lost its enable mask; the src32 control never moved).
+#   The ONLY registers written are the `PCTR` counter-file config registers mainline's `v3d_perfmon.c`
+#   writes on every perfmon start, in that file's own start/stop idiom; no CLE, PTB, VCD, MMU or fabric
+#   state is touched, no page table is edited, no mailbox tag is sent, no `BPOA` is written, and the
+#   arena geometry is untouched. §49.20.2's V2a law is strengthened in code: every counter read on every
+#   leg happens strictly AFTER that leg's read-once violation pair. Default OFF and fully uncompiled
+#   when off (knob-off `kernel8.img` is byte-identical to baseline). Enable via `UNAOS_V3D=1
+#   UNAOS_V3D_UNARMCLOSE=1 UNAOS_V3D_BASEDAIM=1 UNAOS_V3D_TSAIM=1 UNAOS_V3D_ARMEDCLOSE=1
+#   UNAOS_V3D_BINCONTENT=1 UNAOS_V3D_DISPATCHDISC=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot
+#   deliberately produces a SHORT capture missing every banked witness; it must never be diffed
+#   line-for-line against a full deep boot. QEMU raspi4b models no V3D PCTR block at all, so this never
+#   runs there. See docs/dev/OS/08_VIDEO/v3d.md §49.25.4.
+v3d_dispatchdisc = ["v3d_bincontent"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding

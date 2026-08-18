@@ -15447,6 +15447,12 @@ fn v3d95_unarmed_close_rung() {
     serial_println!(
         ":: V3D: [v3d100] CORRECTION TO ALL FOUR LINES ABOVE — UNAOS_V3D_BINCONTENT=1 is armed on top of them, so this boot takes EIGHT CT0 kicks. Legs A/B/C/D/E are exactly as the three lines above describe them and are UNCHANGED; [v3d100] then takes LEGS F, G and H (v3d.md §49.24 R-next-4 `bincontent`) with leg E's PRODUCTION bases and leg E's armed prologue, varying ONE thing — the LIST. F = full fixed-function state + GL_SHADER_STATE, no primitives; G = F plus VERTEX_ARRAY_PRIMS with the NULL coord shader; H = the m4-class MINIMUM, one tile config and one flat triangle over the real coordinate shader. THE [v3d95] HEADER'S 'the `emptyunarm` shape byte for byte' DESCRIBES LEGS A-E AND IS FALSE OF F/G/H, BY DESIGN, as is its 'NO CT0QMA, NO CT0QMS, NO CT0QTS, NO BPOS=0, NO pre-kick L2T invalidate' (those three legs take leg E's prologue in full). F/G/H are also the first legs of this rung whose lists REFERENCE DRAM — eleven regions, each named on the wire by a [v3d100] ref line before its kick. Everything else all four headers say still holds, including the boot RETURNING before probe_job ::"
     );
+    // PI-V3D-101: and one line further still. `UNAOS_V3D_DISPATCHDISC=1` adds NO leg and NO kick — the
+    // leg count stays EIGHT — so the correction it owes is about the INSTRUMENTS, not the shape.
+    #[cfg(feature = "v3d_dispatchdisc")]
+    serial_println!(
+        ":: V3D: [v3d101] CORRECTION TO ALL FIVE LINES ABOVE — UNAOS_V3D_DISPATCHDISC=1 is armed on top of them. IT ADDS NO LEG AND NO KICK: this boot still takes EIGHT CT0 kicks and legs A..H are exactly as the four lines above describe them, byte for byte. What it adds is INSTRUMENTATION on the four legs that carry leg E's production bases — a V3D performance-counter bank (v3d.md §49.25.4 `dispatchdisc`), armed ONCE immediately before leg E's kick and left running across E/F/G/H, plus a bit-by-bit INT_STS decode on each of those legs. Eight counter slots: FEP valid primitives, the two QPU cycle sources, the reserved src32 CYCLE_COUNT control, VCD attribute reads through L2T, both VPM stall sources and PTB primitives-binned. The ONLY registers it writes are the PCTR counter-file config registers mainline's v3d_perfmon.c writes on every perfmon start; no CLE, PTB, VCD, MMU or fabric state is touched, no page table is edited, no mailbox tag is sent. §49.20.2's V2a law rides UNCHANGED and is strengthened in code: every counter read on every leg happens strictly AFTER that leg's read-once violation pair. Everything else all five headers say still holds, including the boot RETURNING before probe_job ::"
+    );
     match probe_hub_ident0() {
         V3dPresence::Up(_) => {}
         V3dPresence::Down => {
@@ -16286,6 +16292,326 @@ fn v3d100_content_verdict(
     "OUTCOME C2c — THE FRAME CLOSED AT COUNTS THAT ARE NEITHER THE EMPTY SHAPE NOR MORE THAN IT. Read the two counts on this line against 20 (pool) and 48 (tile-state): FEWER pool words than the empty close means a truncated tile list, and a larger tile-state count against a 64-word array is the geometry finding OUTCOME C7c would have caught as a fault had the array been smaller. Then read the byte spans on the [v3d56] scan lines and both [v3d99] head dumps against leg E's before drawing anything"
 }
 
+// ─── PI-V3D-101 (`dispatchdisc`) — where between VCD and PTB does dispatch die? ───────────────────────
+//
+// v3d.md §49.25.4. Boot11 left exactly one span of pipeline dark: `VERTEX_ARRAY_PRIMS` accepted
+// (`CT0PC=3`, list consumed to `EA`) → …nothing… → no pool word, no tile-state word, frame open,
+// `BMACTIVE` held, no fault, zero referenced regions moved. The stations inside that span are VCD
+// attribute DMA, coord-thread launch on a QPU, VPM write-back and PTB intake. `PCTR` is the one
+// instrument inside the core that can see any of them, it is ARM-readable, it needs no new memory
+// surface, and it rides the proven leg G shape unchanged.
+//
+// SOURCING — under §38's rail, and it is stricter than §39's. Every id below is transcribed from the
+// build host's `include/uapi/drm/v3d_drm.h` (Fedora `kernel-devel`, read from
+// `/run/host/usr/src/kernels/7.1.8-200.fc44.x86_64/include/uapi/drm/v3d_drm.h`), the anonymous
+// `enum { V3D_PERFCNT_* }` whose first member `V3D_PERFCNT_FEP_VALID_PRIMTS_NO_PIXELS` is index 0 and
+// whose own comment scopes these indices to V3D 4.2 — this hardware. The enumerator list is CONTIGUOUS
+// from `v3d_drm.h:623` to `:709` (no comment or gap between members), so index == line − 623, and the
+// six ids this file already carries (14, 16, 17, 24, 25, 32) all land on their existing names — §38's
+// six-for-six cross-check, re-run against a NEWER copy of the same header and still six for six.
+//
+// TWO CORRECTIONS THIS ARC RECORDS RATHER THAN ABSORBS:
+//   (a) §49.25.4 asks for a "VPM writes" source. **There is no `V3D_PERFCNT_VPM_*_WRITES` member in
+//       this header.** `grep VPM` over the enum returns exactly two members — 26 `VPM_VDW_STALL` and
+//       27 `VPM_VCD_STALL`, both STALL counters. They are armed as the VPM-side channel and they are
+//       named for what they are; the delivery-arrival question is carried instead by 35
+//       `PTB_PRIMS_BINNED`, which is the first thing downstream of VPM that can move. Same treatment
+//       §39 gave the brief's non-existent `PTB_BLOCKED_CYCLES`.
+//   (b) §38's prose cites `CLE_ACTIVE` at index 57. Counted against this copy it is **55**
+//       (`v3d_drm.h:678`). Nothing in the tree arms it, so nothing is affected; the number is corrected
+//       here so the next arc does not inherit it.
+//
+// STANDING CAVEAT, from §38's REJECTED verdict: on this silicon the 7-bit `SRC` field does not select
+// the enum's source for every id — `id↔mux` validity is PARTIAL AND PER ID. So a NONZERO reading on a
+// named slot is strong (that mux moved, on a leg where the name predicts movement) and a ZERO reading
+// is weak (the source may be right and silent, or the mux may not be wired). The in-boot baselines are
+// what make the zeros readable at all: legs E (empty) and F (state, no prims) are read on the SAME bank
+// as leg G, so a slot that is zero on E/F and nonzero on G moved BECAUSE of the primitives, and a slot
+// that is nonzero on E is not measuring what its name says on this silicon.
+#[cfg(feature = "v3d_dispatchdisc")]
+const PCTR_SRC_FEP_VALID_PRIMS: u32 = 1; // v3d_drm.h:624 V3D_PERFCNT_FEP_VALID_PRIMS
+#[cfg(feature = "v3d_dispatchdisc")]
+const PCTR_SRC_VPM_VDW_STALL: u32 = 26; // v3d_drm.h:649 V3D_PERFCNT_VPM_VDW_STALL
+#[cfg(feature = "v3d_dispatchdisc")]
+const PCTR_SRC_VPM_VCD_STALL: u32 = 27; // v3d_drm.h:650 V3D_PERFCNT_VPM_VCD_STALL
+#[cfg(feature = "v3d_dispatchdisc")]
+const PCTR_SRC_PTB_PRIMS_BINNED: u32 = 35; // v3d_drm.h:658 V3D_PERFCNT_PTB_PRIMS_BINNED
+#[cfg(feature = "v3d_dispatchdisc")]
+const PCTR_SRC_L2T_VCD_READS: u32 = 58; // v3d_drm.h:681 V3D_PERFCNT_L2T_VCD_READS
+
+/// PI-V3D-101 — the eight-slot bank, in `SRC_0_3`/`SRC_4_7` field order. Slot 2 is `src32 CYCLE_COUNT`
+/// and it may not be anything else: `V3D63_CTRL_SLOT` is file law (`wait_fldone` samples PCTR counter 2
+/// on every bin wait and `emit_v3d55_clock_liveness` prints a hard clock verdict off it), and it is
+/// also this bank's own control — if slot 2 reads flat the bank never counted and every other slot is
+/// INCONCLUSIVE rather than clean.
+#[cfg(feature = "v3d_dispatchdisc")]
+const V3D101_SRC: [u32; 8] = [
+    PCTR_SRC_FEP_VALID_PRIMS,                     // 0 — FEP valid primitives (front-end intake)
+    PCTR_SRC_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER, // 1 — coord/vertex USER-shader cycles
+    PCTR_SRC_CYCLE_COUNT,                         // 2 — RESERVED control (V3D63_CTRL_SLOT)
+    PCTR_SRC_QPU_CYCLES_VALID_INSTR,              // 3 — any QPU instruction issue
+    PCTR_SRC_L2T_VCD_READS,                       // 4 — VCD attribute-fetch reads through L2T
+    PCTR_SRC_VPM_VDW_STALL,                       // 5 — VPM write-side stall
+    PCTR_SRC_VPM_VCD_STALL,                       // 6 — VPM VCD-side stall
+    PCTR_SRC_PTB_PRIMS_BINNED,                    // 7 — PTB intake: primitives binned
+];
+#[cfg(feature = "v3d_dispatchdisc")]
+const V3D101_SRC_NAME: [&str; 8] = [
+    "FEP_VALID_PRIMS",
+    "QPU_ACTIVE_CYCLES_VERTEX_COORD_USER",
+    "CYCLE_COUNT (control)",
+    "QPU_CYCLES_VALID_INSTR",
+    "L2T_VCD_READS",
+    "VPM_VDW_STALL",
+    "VPM_VCD_STALL",
+    "PTB_PRIMS_BINNED",
+];
+#[cfg(feature = "v3d_dispatchdisc")]
+const V3D101_PCTR_MASK: u32 = 0xFF; // all eight counters
+#[cfg(feature = "v3d_dispatchdisc")]
+const V3D101_CTRL: usize = V3D63_CTRL_SLOT; // 2 — and the packing below must keep it there
+#[cfg(feature = "v3d_dispatchdisc")]
+const _: () = assert!(V3D101_SRC[V3D101_CTRL] == PCTR_SRC_CYCLE_COUNT);
+
+/// PI-V3D-101 — the previous leg's raw counter words, so every leg can print its own Δ without the
+/// bank ever being re-armed between legs. Re-arming would clear the counters, and a clear is a write
+/// into the counter file between two legs that are supposed to differ ONLY in their list; the bank is
+/// therefore armed ONCE, before leg E, and left running across E/F/G/H. Raw beside derived on every
+/// line, per the instrument law: the raw word is what the register held, the Δ is arithmetic this code
+/// did.
+#[cfg(feature = "v3d_dispatchdisc")]
+static V3D101_PREV: [core::sync::atomic::AtomicU32; 8] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+#[cfg(feature = "v3d_dispatchdisc")]
+static V3D101_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// PI-V3D-101 — one leg's sample of the bank: the eight raw words, the latched overflow mask, and the
+/// enable mask AT READ (a bank that lost its mask inside the window measured nothing).
+#[cfg(feature = "v3d_dispatchdisc")]
+#[derive(Clone, Copy, Default)]
+struct V3d101Sample {
+    raw: [u32; 8],
+    d: [u32; 8],
+    ovf: u32,
+    en: u32,
+}
+
+#[cfg(feature = "v3d_dispatchdisc")]
+impl V3d101Sample {
+    /// Overflow counts as movement — a counter that wrapped exactly back to zero across a leg must not
+    /// read "never moved" (`V3d63Ctr::moved`'s guard, applied per slot).
+    fn moved(&self, slot: usize) -> bool {
+        self.d[slot] != 0 || self.ovf & (1 << slot) != 0
+    }
+    fn armed_ok(&self) -> bool {
+        self.en & V3D101_PCTR_MASK == V3D101_PCTR_MASK
+    }
+    fn ctrl_moved(&self) -> bool {
+        self.moved(V3D101_CTRL)
+    }
+}
+
+/// PI-V3D-101 — arm the bank ONCE, immediately before leg E's kick. Exact Linux
+/// `v3d_perfmon.c::v3d_perfmon_start` idiom, byte-for-byte the `v3d63_pctr_arm`/`v3d72_pctr_arm`
+/// sequence this file already uses: EN=0 → SRC selects → PI-V3D-39 read-back so the posted selects
+/// RETIRE → CLR while stopped → clear latched OVERFLOW → EN LAST, from a clean zero. Writes counter-file
+/// config registers and nothing else; no CLE, PTB, VCD or fabric state is touched.
+#[cfg(feature = "v3d_dispatchdisc")]
+fn v3d101_pctr_arm() {
+    let src_0_3 = (V3D101_SRC[0] & 0x7f)
+        | ((V3D101_SRC[1] & 0x7f) << 8)
+        | ((V3D101_SRC[2] & 0x7f) << 16)
+        | ((V3D101_SRC[3] & 0x7f) << 24);
+    let src_4_7 = (V3D101_SRC[4] & 0x7f)
+        | ((V3D101_SRC[5] & 0x7f) << 8)
+        | ((V3D101_SRC[6] & 0x7f) << 16)
+        | ((V3D101_SRC[7] & 0x7f) << 24);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // stop any prior arming before reprogramming
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3, src_0_3);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7, src_4_7);
+    dsb();
+    // PI-V3D-39: read the selects back so the posted stores RETIRE and the mux is provably latched.
+    let lat_0_3 = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3);
+    let lat_4_7 = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_CLR, V3D101_PCTR_MASK); // zero WHILE stopped
+    mmio_write(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW, V3D101_PCTR_MASK); // clear latched overflow
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, V3D101_PCTR_MASK); // enable LAST, from a clean zero
+    dsb();
+    for p in V3D101_PREV.iter() {
+        p.store(0, Ordering::Relaxed);
+    }
+    V3D101_ARMED.store(true, Ordering::Relaxed);
+    serial_println!(
+        ":: V3D: [v3d101] PCTRARM — the dispatch-discriminator bank armed ONCE, here, immediately before LEG E's kick, and left RUNNING across legs E/F/G/H (v3d.md §49.25.4). EN={:#010x} SRC_0_3={:#010x} (read back {:#010x}) SRC_4_7={:#010x} (read back {:#010x}). Slots: 0=src{} {} · 1=src{} {} · 2=src{} {} [RESERVED control, V3D63_CTRL_SLOT — the [v3d55] clkliv slot; arming it here gives that witness a REAL verdict on every one of these waits] · 3=src{} {} · 4=src{} {} · 5=src{} {} · 6=src{} {} · 7=src{} {}. Every id transcribed from include/uapi/drm/v3d_drm.h (enum index == line-623, contiguous 623..709, V3D 4.2 scoping comment), and the six ids this file already carried land on their existing names — §38's cross-check re-run, still six for six. STANDING CAVEAT (§38's REJECTED verdict): id<->mux validity on this silicon is PARTIAL AND PER ID, so a NONZERO slot is strong and a ZERO slot is weak; legs E and F are the in-boot baselines that make the zeros readable. The bank is NOT re-armed between legs — the counters run cumulatively and each leg prints RAW words beside the delta this code subtracted ::",
+        V3D101_PCTR_MASK, src_0_3, lat_0_3, src_4_7, lat_4_7,
+        V3D101_SRC[0], V3D101_SRC_NAME[0],
+        V3D101_SRC[1], V3D101_SRC_NAME[1],
+        V3D101_SRC[2], V3D101_SRC_NAME[2],
+        V3D101_SRC[3], V3D101_SRC_NAME[3],
+        V3D101_SRC[4], V3D101_SRC_NAME[4],
+        V3D101_SRC[5], V3D101_SRC_NAME[5],
+        V3D101_SRC[6], V3D101_SRC_NAME[6],
+        V3D101_SRC[7], V3D101_SRC_NAME[7],
+    );
+}
+
+/// PI-V3D-101 — sample the bank at a leg's wait-exit. Reads only; the bank is NOT stopped and NOT
+/// cleared, so the next leg continues on the same arming. Δ is computed against the previous leg's raw
+/// words and the previous words are then replaced, which makes each leg's Δ exactly "what this leg's
+/// kick added". Called AFTER the §49.20.2 V2a violation pair on every leg — the pair keeps its
+/// read-once-and-first law and these counter reads sit strictly behind it.
+#[cfg(feature = "v3d_dispatchdisc")]
+fn v3d101_sample() -> V3d101Sample {
+    dsb();
+    let mut s = V3d101Sample::default();
+    for i in 0..8 {
+        s.raw[i] = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 4 * i);
+    }
+    s.ovf = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW);
+    s.en = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN);
+    dsb();
+    for i in 0..8 {
+        let prev = V3D101_PREV[i].swap(s.raw[i], Ordering::Relaxed);
+        s.d[i] = s.raw[i].wrapping_sub(prev);
+    }
+    s
+}
+
+/// PI-V3D-101 — `INT_STS`, bit by bit, on the leg that owns it. Boot11's leg G read `0x00010000` and no
+/// line named it. The decode is not new knowledge — the constants are already in this file, transcribed
+/// from `v3d_regs.h` at PI-V3D-44/45 — it is a line that SAYS them, so a reader never has to hold the
+/// bit table in their head. The word is the one `wait_fldone` already returned; this is arithmetic on a
+/// value the leg has, not a new register read.
+#[cfg(feature = "v3d_dispatchdisc")]
+fn v3d101_emit_intsts(leg: &str, tag: &str, sts: u32) {
+    let qpu_vec = (sts & V3D_INT_QPU_MASK) >> V3D_INT_QPU_SHIFT;
+    let named = V3D_INT_FRDONE
+        | V3D_INT_FLDONE
+        | V3D_INT_OUTOMEM
+        | V3D_INT_SPILLUSE
+        | V3D_INT_TRFB
+        | V3D_INT_GMPV
+        | V3D_INT_CSDDONE_LT71
+        | V3D_INT_QPU_MASK;
+    let reading = if sts == 0 {
+        "INT_STS is EMPTY — no interrupt of any family latched across this leg's whole wait. Nothing finished and nothing complained"
+    } else if sts & V3D_INT_FLDONE != 0 {
+        "FLDONE (bit1) is SET — the binning flush completed and this leg's frame retired through the same signal mainline waits on"
+    } else if qpu_vec != 0 && sts & !V3D_INT_QPU_MASK == 0 {
+        "THE ONLY THING THAT LATCHED IS THE PER-QPU HOST-INTERRUPT VECTOR [31:16], and NOTHING in the frame-done or error families did. Per PI-V3D-45 (v3d_regs.h V3D_INT_QPU_MASK/SHIFT), bit(16+n) means QPU n raised a host interrupt — the QPU's own sig.int / program-end-interrupt path. That is a POSITIVE statement that a QPU thread RAN AND ENDED on this leg, and it is independent of every PCTR slot on the line below: it is the CLE/QPU hardware saying so in a register the counter file cannot influence. It is NOT an error bit, so this leg's freeze is not a latched fault"
+    } else if sts & (V3D_INT_OUTOMEM | V3D_INT_GMPV) != 0 {
+        "AN ERROR-FAMILY BIT LATCHED — OUTOMEM (bit2, binner out of tile-alloc memory with no overflow block) and/or GMPV (bit5, memory-protection violation). Read that bit BEFORE any counter on the line below: it names the failure directly"
+    } else {
+        "BITS LATCHED THAT ARE NEITHER FLDONE NOR THE QPU VECTOR ALONE — read the per-bit breakdown on this line against v3d_regs.h's INT table before drawing anything"
+    };
+    serial_println!(
+        ":: V3D: [v3d101] INT_STS DECODE ({}) LEG {} — raw={:#010x} | bit0 FRDONE(render frame done)={} · bit1 FLDONE(binning flush done)={} · bit2 OUTOMEM(binner out of tile-alloc memory)={} · bit3 SPILLUSE(QPU spill memory used)={} · bit4 TRFB(transform-feedback block done)={} · bit5 GMPV(GMP protection violation)={} · bit7 CSDDONE(compute-shader dispatch done, ver<71)={} | [31:16] per-QPU host-interrupt vector={:#06x} (bit16+n = QPU n raised a host interrupt; QPU0={}) | unnamed bits still set={:#010x} — {} ::",
+        tag, leg, sts,
+        (sts & V3D_INT_FRDONE != 0) as u32,
+        (sts & V3D_INT_FLDONE != 0) as u32,
+        (sts & V3D_INT_OUTOMEM != 0) as u32,
+        (sts & V3D_INT_SPILLUSE != 0) as u32,
+        (sts & V3D_INT_TRFB != 0) as u32,
+        (sts & V3D_INT_GMPV != 0) as u32,
+        (sts & V3D_INT_CSDDONE_LT71 != 0) as u32,
+        qpu_vec,
+        (qpu_vec & 1) as u32,
+        sts & !named,
+        reading
+    );
+}
+
+/// PI-V3D-101 — one leg's counter line, and on leg G the four pre-written outcomes of v3d.md §49.25.4.
+///
+/// `pool_words` is the leg's measured tile-alloc-pool word count (the same number the `[v3d100]` content
+/// arithmetic prints), because `D3` is stated against it: VPM/PTB movement WITH a zero pool is a PTB
+/// intake finding, and the same movement WITH a nonzero pool is not.
+#[cfg(feature = "v3d_dispatchdisc")]
+fn v3d101_emit_leg(leg: &str, tag: &str, s: &V3d101Sample, pool_words: u32, ts_words: u32) {
+    let fep = s.moved(0);
+    let qpu = s.moved(1) || s.moved(3);
+    let vcd = s.moved(4);
+    let vpm = s.moved(5) || s.moved(6);
+    let ptb = s.moved(7);
+    serial_println!(
+        ":: V3D: [v3d101] DISPATCHDISC ({}) LEG {} — PCTR_EN(at read)={:#010x} OVERFLOW={:#010x} | RAW words (cumulative since the arm before leg E) beside the delta THIS LEG added: slot0 src{} {} raw={} d={} · slot1 src{} {} raw={} d={} · slot2 src{} {} raw={} d={} · slot3 src{} {} raw={} d={} · slot4 src{} {} raw={} d={} · slot5 src{} {} raw={} d={} · slot6 src{} {} raw={} d={} · slot7 src{} {} raw={} d={} | derived: FEP-moved={} QPU-moved={} VCD-moved={} VPM-moved={} PTB-moved={} · pool words={} tile-state words={} — this line CARRIES NO VERDICT; the raw words are the register file and every 'moved' flag is arithmetic this code did (delta nonzero OR that slot's overflow bit) ::",
+        tag, leg, s.en, s.ovf,
+        V3D101_SRC[0], V3D101_SRC_NAME[0], s.raw[0], s.d[0],
+        V3D101_SRC[1], V3D101_SRC_NAME[1], s.raw[1], s.d[1],
+        V3D101_SRC[2], V3D101_SRC_NAME[2], s.raw[2], s.d[2],
+        V3D101_SRC[3], V3D101_SRC_NAME[3], s.raw[3], s.d[3],
+        V3D101_SRC[4], V3D101_SRC_NAME[4], s.raw[4], s.d[4],
+        V3D101_SRC[5], V3D101_SRC_NAME[5], s.raw[5], s.d[5],
+        V3D101_SRC[6], V3D101_SRC_NAME[6], s.raw[6], s.d[6],
+        V3D101_SRC[7], V3D101_SRC_NAME[7], s.raw[7], s.d[7],
+        fep as u32, qpu as u32, vcd as u32, vpm as u32, ptb as u32,
+        pool_words, ts_words,
+    );
+    if leg != "G" {
+        // Legs E and F are the in-boot BASELINES and leg H is the follow-on; none of them carries the
+        // §49.25.4 outcome table, which is written about the leg that FAILS. Their value is exactly
+        // that they were read on the same bank, on the same boot, with no re-arm in between.
+        serial_println!(
+            "::   [v3d101] BASELINE ({}) LEG {} — read on the SAME bank as leg G with NO re-arm between them, so leg G's delta is a difference against THIS leg and not against a boot boundary. A slot that moves HERE is not measuring what its name says on this silicon (§38's partial id<->mux caveat), and a slot that is flat here and moves on G moved BECAUSE of VERTEX_ARRAY_PRIMS. No outcome row is taken on a baseline leg ::",
+            tag, leg
+        );
+        return;
+    }
+    // ── LEG G. v3d.md §49.25.4's four pre-written outcomes, one per station of the dark span. ────────
+    let row: &str = if !s.armed_ok() {
+        "INCONCLUSIVE — THE BANK WAS NOT FULLY ARMED AT READ. PCTR_EN lost the mask somewhere inside the window, so every delta on the line above is INCONCLUSIVE and not zero. Find what reprogrammed the counter file between the arm before leg E and this read before citing any D row; none is taken"
+    } else if !s.ctrl_moved() {
+        "INCONCLUSIVE — SLOT 2 (src32 CYCLE_COUNT) IS FLAT ACROSS THIS LEG. The bank's own control never counted, so every other slot on the line above is INCONCLUSIVE rather than clean, and no D row may be taken off it. Note what this WOULD mean if it reproduces: a frozen core cycle counter across a wait the wall held open is [v3d72]'s own WALL-FOUND branch, and it would be the finding of this boot on its own"
+    } else if !fep && !qpu && !vcd && !vpm && !ptb {
+        "OUTCOME D4 — EVERY COUNTER delta 0, FEP INCLUDED, ON A LEG WHOSE CT0PC COUNTED THREE PRIMITIVES. The CLE counted primitives it never forwarded: nothing downstream of the list parser registered a single event — no front-end primitive, no QPU cycle, no VCD read, no VPM stall, no binned primitive — while CT0PC advanced to 3. CT0PC's MEANING IS THEN THE FINDING: it is a list-parse counter, not a dispatch counter, and every reading in this file that treated 'CT0PC advanced' as 'the primitive was dispatched' must be re-read. Caveat first, though: §38's partial id<->mux rule makes an all-zero bank the WEAKEST of the four rows, so check legs E and F above — if a slot moved there and is flat here, the mux is live and the zero is real; if NO slot ever moved on any leg, the bank may not be wired to these ids at all and this row is not earned"
+    } else if !qpu {
+        "OUTCOME D1 — THE COORD THREAD NEVER LAUNCHES. QPU cycles are delta 0 across a leg that fed three primitives, while something upstream did move. The wall is THREAD DISPATCH ITSELF — the shader-record fetch or the thread-start/TSDA path between the PTB's dispatch and the QPU's first instruction — and it is UPSTREAM of everything the shader could do wrong, which retires shader content as a suspect for good. Read the INT_STS decode line directly above: if the per-QPU host-interrupt vector is ALSO empty, two independent instruments agree no thread ran; if bit16 is SET while QPU cycles are delta 0, they DISAGREE and the disagreement is the finding — the interrupt path saw a thread the counter file did not"
+    } else if !vpm && !ptb {
+        "OUTCOME D2 — THE THREAD RUNS AND DELIVERS NOTHING. QPU cycles moved, so a coord thread launched and executed; no VPM-side event and no binned primitive followed it. ON THIS LEG THAT READS AS CORRECT THREAD BEHAVIOUR AND MUST BE SAID SO: leg G's coord shader is the NULL shader, a real dispatching thread that writes NOTHING to VPM by construction, so D2 is exactly what a HEALTHY pipeline produces here. D2 IS THEREFORE NOT A WALL VERDICT. It must be re-run against leg H's REAL coordinate shader before anything is concluded — the same delta on H, where the shader does write VPM, is the finding this row is looking for. What D2 DOES buy on this leg is large: dispatch reaches the QPU, so D1 is dead and the dark span shrinks to VPM write-back and PTB intake"
+    } else if pool_words == 0 {
+        "OUTCOME D3 — THE PTB RECEIVES AND DISCARDS. VPM-side and/or PTB-side counters moved on a leg that wrote ZERO pool words: delivery happened and the tile-alloc pool still took nothing. The wall is PTB INTAKE — between the VPM hand-off and the per-tile primitive-list bytes — and it is downstream of every station this rung's earlier legs exonerated. Read slot7 (PTB_PRIMS_BINNED) against slot5/slot6 (the two VPM stalls) on the line above: prims-binned moving with a zero pool is the narrowest form of this row, and prims-binned FLAT while only the VPM stalls moved puts the wall one station earlier, at the PTB's acceptance of the VPM hand-off rather than at its write"
+    } else {
+        "NO §49.25.4 ROW FITS — the counters registered activity AND the pool took words on a leg whose frame did not close, which none of D1..D4 predicts. Read the pool word count on the line above against leg E's 20 and against the [v3d100] CONTENT ARITHMETIC line: a leg that binned SOMETHING and still never closed is a new station and it must be named from the raw words before any earlier row is reused"
+    };
+    serial_println!(
+        ":: V3D: [v3d101] DISPATCHDISC VERDICT ({}) LEG G — v3d.md §49.25.4's pre-written outcomes, taken against the delta line and the INT_STS decode above | bank control: PCTR_EN-intact={} src32-moved={} | FEP={} QPU={} VCD={} VPM={} PTB={} pool_words={} — {} ::",
+        tag,
+        s.armed_ok() as u32, s.ctrl_moved() as u32,
+        fep as u32, qpu as u32, vcd as u32, vpm as u32, ptb as u32,
+        pool_words,
+        row
+    );
+}
+
+/// PI-V3D-101 — stop the bank at the end of the ladder (`v3d_perfmon_stop`: EN=0), so the counter file
+/// is left exactly as every rung outside this arming window has always seen it. Nothing runs after the
+/// ladder in any case — the boot returns before `probe_job` — but the file's law is that a bank is
+/// stopped by whoever armed it.
+#[cfg(feature = "v3d_dispatchdisc")]
+fn v3d101_pctr_stop() {
+    if !V3D101_ARMED.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let en = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0);
+    dsb();
+    serial_println!(
+        ":: V3D: [v3d101] PCTRSTOP — the dispatch-discriminator bank is stopped (perfmon-stop, EN=0; EN read {:#010x} immediately before). The counter file is left as every rung outside this window has always seen it, and no CLE/PTB/VCD/fabric state was touched by this rung at any point ::",
+        en
+    );
+}
+
 /// PI-V3D-97 — one leg. `pad` selects the list (0 = the 14-byte `emptyunarm` shape, `V3D97_PAD_FLUSHES`
 /// = the 46-byte R3 list); `bases` is `None` for R3 (nothing programmed, bases stay at leg A's zero) and
 /// `Some` for R1. `armed` is PI-V3D-99's leg E and it is the one leg that is not unarmed: it adds
@@ -16475,6 +16801,14 @@ fn v3d97_leg(
         (fault & V3D_MMU_CTL_WRITE_VIOLATION != 0) as u32,
         (fault & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32
     );
+
+    // PI-V3D-101 — the dispatch-discriminator bank, sampled HERE: strictly AFTER the §49.20.2 V2a pair
+    // (which keeps its read-once-and-first law untouched above) and BEFORE the L2T flush the poison
+    // scans issue, so the counters describe the kick and not this code's own cache maintenance. Only
+    // the armed legs (E/F/G/H) sample; legs A-D take none of it and their register traffic is unchanged
+    // byte for byte. The LINE is emitted later, once the pool/tile-state word counts exist for D3.
+    #[cfg(feature = "v3d_dispatchdisc")]
+    let dd_sample = if armed { Some(v3d101_sample()) } else { None };
 
     // PI-V3D-100 — the CLE's own walk position and primitive counter, read AFTER the V2a pair (the law
     // reserves the FIRST read after the wait for MMU_VIO_ADDR/VIO_ID and these are CLE registers).
@@ -16682,6 +17016,23 @@ fn v3d97_leg(
         );
     }
 
+    // PI-V3D-101 — the discriminator's two lines, emitted here because D3 is stated against the pool
+    // word count and the scans above are where that number is first known. The counters themselves were
+    // SAMPLED right after the V2a pair, long before any of this leg's cache maintenance ran; only the
+    // printing is deferred. `sts` is the INT_STS word `wait_fldone` already returned — the decode is
+    // arithmetic on a value this leg holds, not a second register read.
+    #[cfg(feature = "v3d_dispatchdisc")]
+    if let Some(s) = dd_sample.as_ref() {
+        v3d101_emit_intsts(leg, tag, sts);
+        v3d101_emit_leg(
+            leg,
+            tag,
+            s,
+            pool_scan.zeroed + pool_scan.overwritten,
+            ts_scan.zeroed + ts_scan.overwritten,
+        );
+    }
+
     // ── The verdict. §49.20.6's four rows, pre-written, plus the branches that void them. ────────
     let verdict: &str = if !submit_sound {
         "THE SUBMIT DID NOT AUDIT SOUND — [v3d54] says the latched [BA,EA) is not the one intended, so nothing on this leg is about the list it names. Re-take; no verdict"
@@ -16817,6 +17168,13 @@ fn v3d97_basedaim_legs() {
             qms: BIN_TILEALLOC_BYTES as u32,
             qts: (arena_phys() + OFF_TILESTATE) as u32 | V3D_CLE_CT0QTS_ENABLE,
         };
+        // ── PI-V3D-101 — arm the dispatch-discriminator bank ONCE, HERE. v3d.md §49.25.4: the
+        // programming happens before leg E and nowhere else, so legs E/F/G/H are all measured on one
+        // arming and leg G's delta is a difference against in-boot baselines rather than against a boot
+        // boundary. This is the ONLY register traffic this arc adds, it is counter-file config only,
+        // and it sits before leg E's kick where it cannot perturb the list the leg submits.
+        #[cfg(feature = "v3d_dispatchdisc")]
+        v3d101_pctr_arm();
         let leg_e = v3d97_leg(
             "E",
             "v3d99 R-next-3 armedclose (PRODUCTION bases, BPOS=0 + pre-kick L2T invalidate, 14-byte list)",
@@ -16883,6 +17241,10 @@ fn v3d97_basedaim_legs() {
             serial_println!(
                 ":: V3D: [v3d100] BINCONTENT COMPLETE — the ladder is taken and nothing else runs; the boot returns before probe_job. Read leg E's VERDICT BEFORE any of F/G/H: leg E is the EMPTY control for all three, taken on the same boot, the same image, the same bases and the same prologue, and a boot whose leg E did not return OUTCOME E1 leaves the content legs with no baseline. Then read F, G and H in that order — each is a strict superset of the one before it, so the FIRST leg whose verdict changes is where content enters. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at the production values, as leg E left them ::"
             );
+            // PI-V3D-101 — the bank is stopped by whoever armed it, on every path out of the ladder
+            // (stood down or run to leg H). Nothing runs after this in any case.
+            #[cfg(feature = "v3d_dispatchdisc")]
+            v3d101_pctr_stop();
         }
     }
 
