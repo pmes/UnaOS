@@ -2260,6 +2260,64 @@ static APP_OFF: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
 /// per-slot by design, the second because `emit=` has to stay monotone per id across a recycle.
 /// The banked sums (`WCG_ACC_*`) need no reset here — the first chunk of each sample clears them,
 /// and a recycle puts the cursor at 0, which IS that condition.
+/// WCH-CUSTODY — a new tenant landed on this slot: the MEASUREMENTS travel with the tenant, the
+/// budgets and the monotone wires stay with the slot. Called from `wm::create_inner` beside
+/// [`paygo_recycle`], under the same table lock.
+///
+/// What resets is everything the `[wc-g]`/`[wc-h]` rollups REPORT about a window: verdict censuses
+/// (`W_*`), present-phase measurements (`H_TORN`, `H_MAXPRES`, `H_MINSPAN`, `H_BANDED`, `H_WHOLE`,
+/// `H_DECLINE`, `H_FIXTURE`), the pending sample slot (`H_PEND` and its fields), the app-checksum
+/// seam (`APP_CKS`/`APP_SEQ`/`SEEN_SEQ` — a predecessor's published checksum must not fabricate a
+/// RACE verdict against a successor's surface), the refresh pacing pair (`H_LASTROLL`/
+/// `H_LASTCENSUS`), and above all `H_T0`: `age_ms=` measured a SLOT's age before this function
+/// existed, so the seventh tenant of a busy slot reported an age the boot's first tenant earned
+/// (verified defect, Fox 2026-08-13).
+///
+/// What deliberately does NOT reset, each per its own documented rule: `TAKEN`/`H_TAKEN`/`H_BTAKEN`
+/// (sample budgets are per boot — resetting them would unbound the serial spend), `H_EMIT`/`H_LINES`
+/// (the reader's "greatest `emit=` supersedes" rule needs monotonicity across recycle), and
+/// `H_ROLLED` (the rollup latch rides the budget it latches on).
+///
+/// Racing composites: a pass that snapshotted the DEAD tenant's row can still fold one sample in
+/// after this reset — one stray sample misattributed to the new tenant, the same bounded exposure
+/// [`paygo_recycle`] already accepts, and strictly smaller than the whole-life inheritance this
+/// function removes.
+pub(super) fn wch_recycle(i: usize) {
+    if i >= IDS {
+        return;
+    }
+    APP_CKS[i].store(FNV_BASIS, Ordering::Relaxed);
+    APP_SEQ[i].store(0, Ordering::Relaxed);
+    SEEN_SEQ[i].store(0, Ordering::Relaxed);
+    W_SAMPLES[i].store(0, Ordering::Relaxed);
+    W_COHER[i].store(0, Ordering::Relaxed);
+    W_RACE[i].store(0, Ordering::Relaxed);
+    W_BLIT[i].store(0, Ordering::Relaxed);
+    W_CLEAN[i].store(0, Ordering::Relaxed);
+    W_SLOW[i].store(0, Ordering::Relaxed);
+    W_MAXUS[i].store(0, Ordering::Relaxed);
+    W_WITUS[i].store(0, Ordering::Relaxed);
+    H_TORN[i].store(0, Ordering::Relaxed);
+    H_MAXPRES[i].store(0, Ordering::Relaxed);
+    H_DECLINE[i].store(0, Ordering::Relaxed);
+    H_FIXTURE[i].store(0, Ordering::Relaxed);
+    H_PEND[i].store(0, Ordering::Relaxed);
+    H_KIND[i].store(0, Ordering::Relaxed);
+    H_BAND[i].store(0, Ordering::Relaxed);
+    H_SPAN[i].store(0, Ordering::Relaxed);
+    H_BOX[i].store(0, Ordering::Relaxed);
+    H_BYTES[i].store(0, Ordering::Relaxed);
+    H_COMPOSE[i].store(0, Ordering::Relaxed);
+    H_PRESENT[i].store(0, Ordering::Relaxed);
+    H_RECTSCAN[i].store(0, Ordering::Relaxed);
+    H_BANDED[i].store(0, Ordering::Relaxed);
+    H_WHOLE[i].store(0, Ordering::Relaxed);
+    H_MINSPAN[i].store(u64::MAX, Ordering::Relaxed);
+    H_T0[i].store(0, Ordering::Relaxed);
+    H_LASTROLL[i].store(0, Ordering::Relaxed);
+    H_LASTCENSUS[i].store(0, Ordering::Relaxed);
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 pub(super) fn paygo_recycle(i: usize) {
     if i < IDS {

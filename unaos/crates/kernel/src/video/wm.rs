@@ -16130,6 +16130,13 @@ fn create_inner(
         // breaks across a recycle.
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
         WCD_SAID[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
+        // WCH-CUSTODY — the wc-g/wc-h MEASUREMENTS travel with the tenant (age_ms= measured the
+        // SLOT's age before this, so a recycled id inherited its predecessor's torn/maxpres/whole
+        // and an inflated age — verified defect, Fox 2026-08-13). Budgets and monotone wires stay;
+        // see `wcg::wch_recycle` for the full ledger. Witness-gated only — the wcg module and its
+        // statics exist on both arches under `witness`.
+        #[cfg(feature = "witness")]
+        super::wcg::wch_recycle(id as usize);
         // PAYGO-TERM — and the TERMINAL latches travel with them, on both wires. `PAYGO_CLOSE_SAID`
         // and `wcg::PAYGO_CLOSED` mean "this window has spoken its closing line", which is a fact
         // about the WINDOW and not about the slot: the batteries the terminal reports on re-arm two
