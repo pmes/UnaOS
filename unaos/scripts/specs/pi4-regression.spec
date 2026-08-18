@@ -1435,9 +1435,18 @@ FORBID SPINHUNT: .*-> FAIL
 # ---    times, so there is nothing to REQUIRE. It costs nothing at 0 hits, and it reds ANY boot that
 # ---    drops ANY task — this is not scoped to `u7-launch`, because losing any kernel task to a
 # ---    corrupt parked frame is the same defect wearing a different name.
-# ---    GO-RED, per this repo's discipline: replaying the green kernel8-test capture with the
-# ---    verbatim metal line above spliced in reds the suite (FORBID hit, exit 1). See the landing
-# ---    report. This directive adds NO REQUIRE, so the witness floor is unchanged at 117.
+# ---    GO-RED, per this repo's discipline — and the evidence is kept HERE rather than deferred to
+# ---    a landing report nobody will have to hand in six months. One capture, replayed twice; the
+# ---    verbatim metal line above is the ONLY difference between the two runs:
+# ---
+# ---      control (unmodified)   MBENCH PASS — 117/117 required, 0 forbidden hit(s)   rc=0
+# ---      + the line spliced in  MBENCH FAIL — 117/117 required, 1 forbidden hit(s)   rc=1
+# ---                             FORBID hit @ line 693: [spin6] cpu=2 REFUSING corrupt
+# ---                             switch-in: task=70:u7-launch ctx_sp=0x20c9e70 ...
+# ---
+# ---    One line is the entire delta, and it is the difference between pass and fail — which is
+# ---    exactly the property this spec lacked while three arcs gated green on boots that had lost
+# ---    a kernel task. This directive adds NO REQUIRE, so the witness floor is unchanged at 117.
 FORBID REFUSING corrupt switch-in: task=
 
 # --- BG-SPREAD: `bg` parents must be PLACED by load, not stacked on the launcher's core.
