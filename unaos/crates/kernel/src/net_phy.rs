@@ -45,7 +45,7 @@
 #![cfg(any(feature = "net4", feature = "vnet", feature = "smolnet", feature = "genet"))]
 
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
@@ -257,6 +257,47 @@ pub struct NetConfig {
     pub prefix_len: u8,
     /// The default gateway / router.
     pub gw: [u8; 4],
+    /// The first DHCP-provided DNS server, if the lease carried one. `None` on the static-fallback
+    /// path (no DHCP), or when a lease offered no DNS option. Callers that need a resolver use this
+    /// when present and fall back to querying the gateway (`gw`) when it is `None`. Populated from
+    /// smoltcp's `dhcpv4::Config::dns_servers` (first entry) where the lease is processed.
+    pub dns: Option<[u8; 4]>,
+}
+
+// ── PI-UI-2: the settled-address snapshot ─────────────────────────────────────────────────────────
+//
+// A read-only, lock-free snapshot of the interface IPv4 the bring-up settled on, so a consumer that has
+// no business reaching into a driver's private `NetService`/socket state — the GUI status strip — can
+// display the address. `dhcp_or_static` (the single chokepoint EVERY arch's bring-up funnels through)
+// records the settled config here; `settled_ipv4()` reads it. Plain atomics: written once per bring-up
+// from the net core, read from the render core, so the strip never takes a net lock in the render path.
+
+/// True once a bring-up has settled and recorded an address (before that the strip shows "no lease").
+static NET_IP_PRESENT: AtomicBool = AtomicBool::new(false);
+/// The settled IPv4, octets packed big-endian (`a<<24 | b<<16 | c<<8 | d`).
+static NET_IP: AtomicU32 = AtomicU32::new(0);
+/// Whether the settled address came from a DHCP lease (`true`) or the static fallback (`false`).
+static NET_LEASED: AtomicBool = AtomicBool::new(false);
+
+/// Record the settled interface config for the read-only snapshot. Called from `dhcp_or_static` on
+/// each bring-up (both the lease and the static-fallback paths).
+fn record_settled(cfg: &NetConfig) {
+    NET_IP.store(u32::from_be_bytes(cfg.ip), Ordering::Relaxed);
+    NET_LEASED.store(cfg.leased, Ordering::Relaxed);
+    NET_IP_PRESENT.store(true, Ordering::Release); // publishes the two fields above
+}
+
+/// PI-UI-2: the settled interface IPv4 and whether it was DHCP-leased (`true`) or the static fallback
+/// (`false`), or `None` before any bring-up has completed. A lock-free snapshot for read-only
+/// consumers such as the GUI status strip.
+pub fn settled_ipv4() -> Option<([u8; 4], bool)> {
+    if !NET_IP_PRESENT.load(Ordering::Acquire) {
+        return None;
+    }
+    Some((
+        NET_IP.load(Ordering::Relaxed).to_be_bytes(),
+        NET_LEASED.load(Ordering::Relaxed),
+    ))
 }
 
 /// Apply an IPv4 address + default route to `iface` in place (replacing any prior config). Shared by
@@ -318,6 +359,9 @@ pub fn dhcp_or_static<D: Device>(
                 // the static gateway if the server offered none (rare, but keeps the route sane).
                 let gw = cfg.router.map(|r| r.octets()).unwrap_or(static_gw);
                 let srv = cfg.server.address.octets();
+                // Surface the first DHCP-provided DNS server (if any) so a resolver can use the real
+                // nameserver instead of falling back to the gateway (NET-14/NET-16 fold).
+                let dns = cfg.dns_servers.first().map(|a| a.octets());
                 apply_ipv4(iface, ip, prefix_len, gw);
                 serial_println!(
                     "{} NET: DHCP lease ip={}.{}.{}.{}/{} gw={}.{}.{}.{} (server {}.{}.{}.{}) after {} polls => PASS ::",
@@ -327,7 +371,9 @@ pub fn dhcp_or_static<D: Device>(
                     srv[0], srv[1], srv[2], srv[3],
                     polls,
                 );
-                return NetConfig { leased: true, ip, prefix_len, gw };
+                let cfg = NetConfig { leased: true, ip, prefix_len, gw, dns };
+                record_settled(&cfg); // PI-UI-2: publish the settled address for the GUI status strip
+                return cfg;
             }
             Some(dhcpv4::Event::Deconfigured) => {}
             None => {}
@@ -341,12 +387,15 @@ pub fn dhcp_or_static<D: Device>(
                 static_ip[0], static_ip[1], static_ip[2], static_ip[3], static_prefix,
                 static_gw[0], static_gw[1], static_gw[2], static_gw[3],
             );
-            return NetConfig {
+            let cfg = NetConfig {
                 leased: false,
                 ip: static_ip,
                 prefix_len: static_prefix,
                 gw: static_gw,
+                dns: None,
             };
+            record_settled(&cfg); // PI-UI-2: publish the static-fallback address for the GUI status strip
+            return cfg;
         }
     }
 }

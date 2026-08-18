@@ -78,6 +78,42 @@ pub extern "C" fn __rust_boot(dtb: u64) -> ! {
 // below unreachable in those builds.
 #[cfg_attr(any(feature = "bootlog", feature = "usbdebug", feature = "baremetal", feature = "tegra"), allow(unreachable_code))]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    // BPACE origin. The FIRST instruction of the kernel proper, before any subsystem exists, so the
+    // ledger's `t=0` is as close to "the kernel got control" as this function can get. On x86 the
+    // rdtsc value read here is the counter since RESET, so it is also — approximately — the cost of
+    // firmware + bootloader, the one boot phase this kernel can never instrument from the inside.
+    // Approximately: the TSC's zero is the last processor reset, which on a warm boot need not be
+    // the moment power was applied. Read the number as an upper bound on pre-kernel time, not as a
+    // measurement of firmware. Heap-free and lock-light, so it is safe this early.
+    unaos_kernel::bootpace::record("entry");
+
+    // 0-WC. VPERF-WC HOIST (bootpace.md §11). Retype the framebuffer's identity-map leaves to
+    //     Write-Combining BEFORE the console's first paint instead of after it.
+    //
+    //     `fbcon::init` ends by calling `memory::set_framebuffer_wc` — but it BEGINS with
+    //     `fill_screen(BG_DEFAULT)`, a full-surface clear of every visible pixel (2880x1800x4 =
+    //     20.7 MB on the bench panel) written one dword at a time. Ordered as it was, that clear
+    //     paid the UNCACHEABLE rate the retype exists to escape (~160 MB/s vs ~1.47 GB/s measured,
+    //     §10d), and it is the largest term inside `BPACE: heap d=253ms`. Nothing in the retype
+    //     depends on fbcon: it needs only the base/length pair, which BootInfo already carries
+    //     here, and it already ran at exactly this point in boot — inside a call three lines below.
+    //
+    //     `set_framebuffer_wc` is self-latching (`FB_WC_DONE`) and no-ops on a zero base/length, so
+    //     the call left in place at the end of `fbcon::init` becomes an idempotent second call and
+    //     the retype still happens exactly once. The two BPACE stamps (`fb-wc`, `fb-wc-done`) sit
+    //     inside the latch and therefore MOVE with the retype — which is how the ledger says on its
+    //     own wire which of the two orderings a build has.
+    //
+    //     Watched side effect: the `:: x86 fb-wc: retyped N leaf(s) ... ::` line is now emitted
+    //     before fbcon is ready, so it reaches serial/FTDI but is no longer painted on the panel.
+    //     It was never durable on glass anyway — under the old ordering the clear preceded it, and
+    //     under this one the clear follows it.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::memory::set_framebuffer_wc(
+        boot_info.framebuffer_addr,
+        boot_info.framebuffer_size as u64,
+    );
+
     // 0. Framebuffer log sink FIRST — mirror every serial_println! (and panics) to the screen,
     //    so boot diagnostics are visible on real hardware that has no serial port. No-op if the
     //    firmware gave us no framebuffer. The GUI repaints over it later on a successful boot.
@@ -85,6 +121,58 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         boot_info.framebuffer_addr,
         boot_info.framebuffer_size,
         boot_info.framebuffer_info,
+    );
+
+    // 0a. WRITER-SEED (x86). `video::WRITER` and fbcon are two handles to the SAME physical
+    //     framebuffer, and `WRITER` is the one every panel-geometry consumer reads (`wm`'s
+    //     composite path, `cursor`, `screen`, `wcx::activate`). Until this seam existed, x86
+    //     seeded it only far down `kernel_main` (step 3's `framebuffer_addr != 0` block), which is
+    //     AFTER the Kepler takeover runs — so `wcx::activate` found `is_ready() == false` and
+    //     declined the console window on metal (`[wc-x] activate DECLINE reason=fb-not-ready`)
+    //     while fbcon was fully live on the very same surface. A `WRITER` that lies about the
+    //     panel is a general defect, not a compositor one, so this is UNCONDITIONAL — not gated on
+    //     `wc`. It takes the identical BootInfo triple fbcon just took, so the two handles cannot
+    //     disagree by construction; `FrameBufferInfo.stride` is in PIXELS on both sides (the byte
+    //     pitch fbcon witnesses is `stride * bytes_per_pixel`, derived at print time), so there is
+    //     no unit conversion to get wrong. Precedent: the aarch64 tegra path already pairs
+    //     `fbcon::init` with the same `WRITER.lock().init` on the same triple (JD2, below); the
+    //     later step-3 seeding stays exactly as it is and is now an idempotent re-init.
+    #[cfg(target_arch = "x86_64")]
+    if boot_info.framebuffer_addr != 0 && boot_info.framebuffer_size != 0 {
+        unaos_kernel::video::WRITER.lock().init(
+            boot_info.framebuffer_addr as usize,
+            boot_info.framebuffer_size,
+            boot_info.framebuffer_info,
+        );
+        let i = boot_info.framebuffer_info;
+        serial_println!(
+            ":: video: WRITER seeded base={:08X} len={} panel={}x{} stride={}px pitch={}B bpp={} ::",
+            boot_info.framebuffer_addr,
+            boot_info.framebuffer_size,
+            i.width,
+            i.height,
+            i.stride,
+            i.stride * i.bytes_per_pixel,
+            i.bytes_per_pixel,
+        );
+    }
+
+    // 0a2. EDID-CARRY. The UEFI bootloader reads the panel's EDID (ACTIVE protocol, then
+    //      DISCOVERED) to pick the display mode, and until now kept only the native width and
+    //      height out of it — the pixel clock and the h/v blanking and sync numbers, which is what
+    //      programming a display pipe actually needs, were read and dropped inside the bootloader.
+    //      `BootInfo::edid_block` now carries the 128-byte base block, and this is where it is
+    //      published (`video::edid_block()`) and witnessed.
+    //
+    //      UNCONDITIONAL, on both arches and every build, for the same reason the WRITER seed above
+    //      is: a panel descriptor that exists only under one feature flag cannot be read from a
+    //      metal capture of the build that is actually flown. It must also be able to say NO — on
+    //      QEMU and on the Pi's bare-metal path there is no EDID protocol at all, and the line
+    //      prints `present=0` there. Runs before `arch::memory::init` consumes `boot_info`.
+    unaos_kernel::video::init_edid(
+        &boot_info.edid_block,
+        boot_info.edid_block_valid,
+        boot_info.edid_total_len,
     );
 
     // 0b. Jetson Orin Nano (tegra): install the kernel's own MMU (JM3), bring up the GIC + timer on the
@@ -100,6 +188,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     //     the regression logs are byte-identical.
     #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
     tegra_early_stop(boot_info);
+
+    // Gated on intel-ivb + x86_64 too, not just unaos_ivb: drivers::gpu does not exist on
+    // aarch64 (this exact gate was dropped once before and broke the aarch64 check — keep it).
+    #[cfg(all(feature = "unaos_ivb", feature = "intel-ivb", target_arch = "x86_64"))]
+    if boot_info.igpu_trace_valid {
+        unaos_kernel::drivers::gpu::igpu::set_boot_traces(
+            boot_info.igpu_trace_0,
+            boot_info.igpu_trace_1, 
+            boot_info.igpu_trace_2,
+            boot_info.gmux_trace_0
+        );
+    }
 
     // 1. Core Hardware Init (GDT, IDT, local APIC for x86_64, GIC for aarch64)
     unaos_kernel::init();
@@ -143,6 +243,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         boot_info.mode_action,
     );
 
+    // INSTALL-SELF: publish the boot volume's FAT serial into the installer's boot-device guard BEFORE
+    // memory::init consumes boot_info. This is the whole handoff — the bootloader read the serial off
+    // the ESP it loaded this kernel from, and from here on the installer can recognize (and refuse to
+    // erase) the device the system is running from. Gated exactly like `crate::install` itself, so a
+    // build without an installer is byte-identical to baseline. 0 (aarch64, or an unidentifiable boot
+    // volume) disarms the guard with a witness line; it never blocks a boot.
+    #[cfg(any(feature = "installdemo", feature = "install_target", feature = "piinstall"))]
+    unaos_kernel::install::selfguard::set_boot_volume_serial(boot_info.boot_volume_serial);
+
+    // FRGUARD (GR21): the SAME field, published a second time — into the block layer's Default-write
+    // substitution guard. Deliberately not sharing INSTALL-SELF's copy above: that one is gated on the
+    // installer features, which no bench or boot build carries, and that is exactly why its
+    // `:: install: boot volume serial …` witness appears ZERO times across the 30-boot capture at
+    // capture/rmbp-gr16-s73. A guard whose own input is invisible on the wire can be neither trusted
+    // nor falsified, so this arm carries its own publication and its own witness. Gated to the builds
+    // that compile the guard, so every other target is untouched.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    unaos_kernel::drivers::block::set_boot_volume_serial(boot_info.boot_volume_serial);
+
     // JC3 (virt/UEFI, GICv3 only): capture the firmware RAM-GiB map from boot_info BEFORE memory::init
     // consumes it (it takes the `&'static mut`), so the EL2->EL1 drop below can build the boot core's EL1
     // identity map. Runtime-gated on `is_v3()` so the GICv2 virt run computes nothing beyond the cheap GIC
@@ -157,6 +276,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 4. Global Heap Allocation (Phase 3 Memory Translation)
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
+    unaos_kernel::bootpace::record("heap");
 
     // VPERF M3 EARLY-ATTACH (bench QoL, Peter's word 2026-07-16): usbdebug builds attach the
     // fbcon cached-RAM shadow the moment the heap exists, so the ENTIRE boot log scrolls in
@@ -287,6 +407,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     {
         let online = unaos_kernel::arch::smp::online_secondaries();
+
+        // INROUTE: the router selftest runs HERE — before `start_aps`, and therefore before the first user
+        // slot in this boot exists. Its correctness depends on OWNING the global input focus and
+        // `pal::EVENT_QUEUE` for the length of the test, and this is the only point in the boot where that
+        // ownership is structural rather than hoped for. See `input_router_selftest` for the race this
+        // placement closes.
+        input_router_selftest();
+
         unaos_kernel::arch::sched::start_aps(&online);
 
         // M6g Part B: probe the microSD (EMMC2 first, legacy SDHCI fallback) and register it as the block
@@ -296,6 +424,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
         unaos_kernel::drivers::emmc2::probe();
 
+        // PI-SHELL-LS (witness battery): prove the Pi shell's `ls` lists the native unafs volume — the
+        // same store PI-NET-15 serves at `/fs/`. The verb is panel-only on the bench, so this exercises
+        // the exact `pi_ls_collect` listing headlessly and emits the `:: ls1: /: ... ::` witness a
+        // `UNAOS_PI=1 ./arroyo kernel8-test` capture can verify. Quiet default boots compile none of it.
+        #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+        unaos_kernel::shell::pi_ls_witness();
+
+        // MIDDEN-M1 (witness battery): the shell's interpreter is now `unaos/libs/sys/midden_core`,
+        // shared with the Ring 3 `midden` handler. The live `:: [midden] ... ::` line needs a
+        // keystroke and the headless gates type nothing, so this drives the SAME `plan()` the
+        // prompt drives — core-answer, host-routing, `.elf`-elided resolution, and verb-beats-
+        // program precedence — over a synthetic volume, in the uniform `:: TSTE: ... ::` shape.
+        // Arch-neutral by construction (the core carries no `cfg`), so the identical four lines
+        // land on the x86 battery below.
+        #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+        unaos_kernel::shell::midden_witness();
+
         // INSTALL-PI: the installer engine's first LIVE end-to-end execution — GPT → FAT32 → payload copy
         // → sha extent-verify onto the emmc2 microSD just censused above. Three-gate escalation (census /
         // scratch-ladder / destructive-confirm), all `piinstall*`-gated, so a default build compiles NONE
@@ -304,13 +449,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(feature = "piinstall")]
         unaos_kernel::install::pi::run();
 
-        // PI-USB-2: the DMA-side xHCI bring-up + device enumeration on the VL805, post-heap on the BSP.
-        // `piusb::bringup` (pre-heap, in build_boot_info) already reached the honesty line (RC link +
-        // VL805 found + BAR sized + xHCI decoding + ports powered); this reads its handoff, programs
-        // rings/interrupter (needs the heap), RS=1, and walks whatever is plugged. QEMU raspi4b models
-        // no PCIe RC/VL805, so the honesty line was never reached and this returns after one skip line.
+        // PIUSB-33: the SPLIT USB bring-up. The RC + xHCI HARDWARE bring-up (brcmstb RC reset/PERST/CNR
+        // settle → controller halted-but-decoding + ports powered) already ran EARLY, inside
+        // `piusb::bringup` in build_boot_info — the P38-proven single-threaded pre-V3D/pre-GENET/pre-panel
+        // context. Metal P39/P40/P41 proved the first RC APB read HARD-STALLS on ANY core in the deferred
+        // post-panel context; P43 exonerated firmware power/clock; so the RC read must live in the early
+        // context. `piusb::bringup_task(0)` now runs the DEFERRED half ONLY: the heap-backed DMA-side walk
+        // (`enumerate` — rings/interrupter, RS=1, port/HID/storage enumeration), which touches the xHCI BAR
+        // MMIO (not the stalling RC APB) and needs the heap. It runs on the BSP AFTER the GUI/input/render
+        // tasks are spawned (see the call just before the BSP idles), so the panel is live while it walks.
+        // HERE we handle only the no-AP / serial-only fallback that never spawns those GUI tasks: enumerate
+        // synchronously before the shared BSP loop below polls the controller. QEMU raspi4b census-skips.
         #[cfg(feature = "piusb")]
-        unaos_kernel::arch::piusb::enumerate();
+        if online.is_empty() {
+            unaos_kernel::arch::piusb::bringup_task(0);
+        }
 
         // PI-GENET: the BCM2711 on-board Gigabit Ethernet (GENET v5) + smoltcp bind — the Pi's FIRST
         // network path. DTB-resolves the register base, poison-honest probes SYS_REV_CTRL to classify
@@ -321,7 +474,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         unaos_kernel::arch::genet::genet_bringup(dtb_addr, dtb_size);
 
         // M6b: EL0 fault isolation + per-page user permissions. Four EL0 programs on one AP (never
-        // the unscheduled BSP): hello (must still work — the code page is EL0-RX), then three that
+        // the unscheduled BSP): hello (must still work — the code page is user-RX), then three that
         // each provoke a specific fault the kernel must answer by KILLING THE TASK, not halting —
         // a write to kernel RAM, a write to the now-read-only code page, a jump into the UXN stack
         // page. A verdict task on a DIFFERENT core (a wedged demo core must still produce a FAIL
@@ -375,7 +528,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
             // M6e: preemptible EL0. `spawn_user` now starts the task with IRQ UNMASKED (SPSR 0x240)
             // and `__vec_irq` banks SP_EL0, so the generic timer can preempt a running EL0 task. The
-            // spinner is a long, register-only, syscall-free EL0 loop on the demo core; on metal the
+            // spinner is a long, register-only, syscall-free user loop on the demo core; on metal the
             // timer preempts it mid-loop — it interleaves with the co-located capstone/kernel tasks
             // and `aarch64_irq_handler` counts each EL0 IRQ; the m6e-verdict on the sibling core
             // reports the count. Metal-only: QEMU raspi4b delivers no Group-1 timer IRQ, so the
@@ -393,7 +546,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
             // M6d: per-task address spaces (ASIDs) + per-task user stacks. Allocate four PRIVATE
             // address-space slots (own translation-table branch + own 16 KiB backing at the SAME VAs,
-            // ASID-tagged) and drop four EL0 tasks onto them via `spawn_user_slot`: two read distinct
+            // ASID-tagged) and drop four user tasks onto them via `spawn_user_slot`: two read distinct
             // slot-private sentinels at the identical VA (same-VA isolation), one WRITES and reads back
             // its own stack (the capability this arc unlocks — impossible on the shared window), one
             // spins-then-reads through SP (SP_EL0 fidelity across preemption on metal). Unlike M6b/M6e,
@@ -424,7 +577,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
 
             // M6f: validated user pointers (copy_from_user/copy_to_user) + a wider syscall surface
-            // (YIELD/SLEEP_MS/GETPID/GETINFO). Four EL0 fixtures on PRIVATE slots (the getinfo fixture
+            // (YIELD/SLEEP_MS/GETPID/GETINFO). Four user fixtures on PRIVATE slots (the getinfo fixture
             // writes its stack via copy_to_user, forbidden on the shared window): a well-behaved getinfo
             // round-trip (copy_to_user then read-back matches SYS_GETPID), a hostile-pointer fixture whose
             // four bad pointers must each ERROR-RETURN -EFAULT (never a kill), and a yield/sleep pair that
@@ -472,7 +625,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // (reaps by handle). A gated kernel task on `vcpu` (the m6g-loader idiom), with the demo core
             // `cpu` passed as its arg: it waits for the M6g loader to finish (so its lines print first AND the
             // M6d/M6f/M6g slots have freed), builds the PARENT's and ORPHAN's slots, and spawns both on `cpu`.
-            // The parent's two sys_spawns load HELLO.BIN off the SD card into fresh slots and run them at EL0
+            // The parent's two sys_spawns load HELLO.BIN off the SD card into fresh slots and run them in user mode
             // as CHILDREN co-located on `cpu`, each installed as a handle in the parent's table; sys_wait
             // reaps each by handle (a scheduler wake — QEMU-testable). The orphan's sys_wait on an unheld
             // handle returns -ECHILD (structural ownership). The launcher folds the verdict. (Deferred to
@@ -488,7 +641,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // U5: handles as CAPABILITIES — the enforcement layer on top of U4's handle STRUCTURE. A gated
             // kernel task on `vcpu` (the u4-launch idiom), demo core `cpu` as its arg: it waits for the U4
             // verdict (U4_LAUNCH_DONE), builds + pre-endows a single fixture slot, and runs `el0-u5cap` on
-            // `cpu`. That fixture proves, against its own per-process table, the four EL0-observable
+            // `cpu`. That fixture proves, against its own per-process table, the four user-observable
             // capability semantics — a console cap writes; a write-LESS cap gets -EACCES; a grant cannot
             // exceed the granter's rights (attenuation) while a subset grant works; a revoked handle is
             // -EACCES — and the launcher then proves the fifth kernel-side: the fixture's handle row is
@@ -569,6 +722,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::acpi::pm_timer_report(rsdp_addr);
 
+    // BPACE: the whole ACPI phase — MADT topology discovery, the DMAR/IOMMU report and the PM-timer
+    // liveness probe. Stamped HERE rather than immediately after `acpi::init` so the next stamp's
+    // `d=` is the calibration alone and nothing else. x86-only, like the three calls it closes.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::bootpace::record("acpi");
+
     // 4b'''. Calibrate the TSC and the local-APIC timer against the PM timer, so tick-based timing
     // (scheduler sleeps, net RTO) and cycle-based busy-wait budgets become real wall-clock on this
     // machine's unknown Ivy Bridge crystal. Must precede SMP/scheduler bring-up so the APs inherit
@@ -578,12 +737,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         unaos_kernel::arch::apic::calibrate(&pm);
     }
 
+    // BPACE: calibration done — and, more importantly, the moment `counter_hz()` stops returning 0.
+    // Every stamp BEFORE this one was still taken in raw counter ticks; they only become
+    // milliseconds because the conversion happens at print time, downstream of this call.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::bootpace::record("calib");
+
     // 4c. SMP: start the application processors (INIT-SIPI-SIPI). Each AP brings up its own
     // per-CPU GDT/TSS + local APIC, then waits to enter its scheduler loop; the BSP continues to
     // drive everything below. `start_aps` also runs the post-bring-up SMP smoke test while the
     // APs are still idle.
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::smp::start_aps();
+
+    // BPACE: application processors up (INIT-SIPI-SIPI + the post-bring-up smoke test).
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::bootpace::record("smp");
 
     // 4d. Scheduler: now that SMP verification has run against idle APs, initialise the per-CPU
     // run queues, turn scheduling on, and spawn a small demo workload across the APs to exercise
@@ -615,9 +784,46 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             unaos_kernel::arch::syscall::canonical_guard_selftest();
         }
 
-        // CLOCK-X1 (M3): the x86 wall-clock timebase witness. Runs after `apic::calibrate` (step
-        // 4b''') so the invariant TSC is calibrated; silent if this machine has no invariant TSC.
+        // MIDDEN-M1 (witness battery): the x86 half of the shell-core fixture — see the aarch64
+        // call site for what it proves. It needs no hardware at all (a synthetic volume), so it
+        // sits with the other kernel-side boundary fixtures rather than with the storage probes.
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
+        unaos_kernel::shell::midden_witness();
+
+        // CLOCK-X1 (M3): the x86 wall-clock timebase witness — the SAMPLE half. Runs after
+        // `apic::calibrate` (step 4b''') so the invariant TSC is calibrated; silent if this machine
+        // has no invariant TSC. GR18 made it pay-as-you-go: it used to block here until it saw the
+        // uptime second advance, which cost a uniform draw over the 1 Hz edge (18–976 ms measured
+        // across eight metal boots) and WAS the whole `BPACE: sched d=` delta. It now samples and
+        // returns; the verdict is delivered by `clock_x1_poll()` from the first service pass, which
+        // is already seconds past the edge. See bootpace.md §8e.
         unaos_kernel::arch::syscall::clock_x1_witness();
+
+        // LOGWIT-1 (witness + logts): the CLOCK-2b tap prefix's own fixture. Every other timestamped
+        // line on a bench capture is only as trustworthy as the claim that the prefix reaches the FTDI
+        // ring — the rMBP has no 16550, so the cable's ring IS the evidence, and the only thing that
+        // ever attested to the tap was that it compiled. This emits a nonce marker, reads the capture
+        // ring back through `ftdi::peek_recent`, and asserts the marker returned wearing a well-formed
+        // 12-column prefix; it rejects an unprefixed and a malformed copy of its own marker first, so a
+        // vacuous matcher reports FORBID rather than a green PASS. Runs HERE because the prefix's
+        // monotonic form needs `calib` (step 4b''') behind it — earlier and the honest reading would
+        // be the `?ms` form, which passes but proves less.
+        #[cfg(all(feature = "witness", feature = "logts"))]
+        unaos_kernel::logts::logwit1();
+
+        // SNTP-X86 GATE (witness battery): the deterministic x86 SNTP client battery — canned datagrams
+        // through the shared parser + the `crate::clock` anchor path, no NIC/network required. Proves x86
+        // SNTP correctness under `./arroyo test` in any environment (the live boot sync in `service_net`
+        // stays honest-but-INCOMPLETE under hermetic slirp). Prints `:: SNTP-X86-GATE: ... PASS [w=0x1f] ::`.
+        #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "smolnet"))]
+        unaos_kernel::smolnet::sntp_x86_gate();
+
+        // SOCK-8 GATE (witness battery): the deterministic x86 DNS client battery — canned datagrams
+        // through the shared `crate::net_dns` parser, no NIC/network required. Proves x86 DNS parsing
+        // (well-formed A / truncated / compression-loop / rcode) under `./arroyo test` in any environment
+        // (the live boot resolve in `service_net` stays a bonus). Prints `:: DNS-X86-GATE: ... PASS [w=0xf] ::`.
+        #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "smolnet"))]
+        unaos_kernel::smolnet::dns_x86_gate();
 
         // U1a: x86 ring-3 round-trip (the aarch64 M6a equivalent). Turn scheduling on (the default
         // test build never enables the feature-gated demo below, so the APs would otherwise idle in
@@ -635,7 +841,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(feature = "witness")]
         {
             let online = unaos_kernel::arch::smp::online_aps();
-            if let Some(&cpu) = online.first() {
+            // WITCORE: ask the placement module, not `.first()`. This block runs BEFORE the SCHED-X86
+            // handoff publishes a split, so `worker_cpu(0)` resolves to `online_aps()[0]` — identical
+            // to the old `.first()` — but the rule is now stated in exactly one place, and a later
+            // reordering that moved this block after the handoff would stop aiming at the render core
+            // instead of silently landing on it.
+            if let Some(cpu) = unaos_kernel::arch::smp::worker_cpu(0) {
                 unaos_kernel::arch::sched::enable();
                 let demo = unaos_kernel::arch::syscall::setup();
                 serial_println!(":: U1a: ring-3 demo — user task on core {} ::", cpu);
@@ -681,6 +892,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // CR3-at-dispatch path). A watchdog reaps the spinner via the scheduler. Runs LAST so
                 // the preemptible task can't perturb the cooperative U1a/U1b/U2/U3 ordering above.
                 unaos_kernel::arch::syscall::u3_5_run_fixture(cpu);
+
+                // SERWIT-1: the serial transport's own fixture — the one gate that is about the
+                // INSTRUMENT rather than the thing being instrumented. Every other `PASS` on this wire
+                // is only as trustworthy as the wire, and the wire used to drop lines silently under
+                // contention (`_print`'s `try_lock` failure branch discarded the line, with no counter
+                // anywhere in the tree to notice). One worker per online AP, all released together so
+                // their bursts genuinely overlap, then the BSP asserts the conservation law
+                // `submitted == emitted + dropped + in_flight` with `dropped == 0`. The `[serwit]`
+                // lines are sequence-numbered so the assertion can be falsified from the log itself
+                // (`awk '/\[serwit\]/' target/serial.log | wc -l` == cores x burst) — a counter that
+                // only ever agreed with itself would prove nothing.
+                serwit1_run(&online);
             } else {
                 serial_println!(":: U1a: no application processors online — ring-3 demo SKIPPED ::");
             }
@@ -698,6 +921,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // BPACE (M4): scheduler bring-up returned — per-CPU run queues, `sched::enable()`, the
+    // CLOCK-X1 witness, and (on a `witness` build only) the whole ring-3 fixture flow. On the quiet
+    // build that reaches metal this is init+enable+clock witness and nothing else, so `d=` here is
+    // expected to be small; it exists so that "small" is a MEASUREMENT rather than an assumption.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::bootpace::record("sched");
+
     // 4e. Prove the global ms-clock is real: with every core now online and ticking at 1 kHz, the
     // shared `ticks()` clock must still advance at ~1000 Hz (only the BSP drives it). This is the
     // wall-clock assertion the calibration hinges on — a reading of ~N×1000 would betray an SMP
@@ -714,6 +944,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     //    otherwise stall boot in the bounded timeout loops before the first GUI frame paints.
     #[cfg(not(feature = "skip_xhci"))]
     unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
+    // BPACE: PCI scan + xHCI controller bring-up returned. This is the SYNCHRONOUS half of USB; the
+    // per-port enumeration that follows is asynchronous and stamps itself from the main loop. On a
+    // `skip_xhci` build this tag is absent — the asymmetry the doc's "did not run (b)" reading uses.
+    #[cfg(not(feature = "skip_xhci"))]
+    unaos_kernel::bootpace::record("pci-usb");
     #[cfg(feature = "skip_xhci")]
     {
         let _ = (dtb_addr, dtb_size);
@@ -805,12 +1040,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!(":: Enumerating USB. Plug in a stick / keyboard / mouse, then type or move the mouse. ::");
         serial_println!(":: Watch for: 'MISSION SUCCESS' (storage), 'POINTER ... ABSOLUTE/RELATIVE', 'KEY', and the USB-DEBUG lines below. ::");
         loop {
-            if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+            // WEDGE-8 (F3): a claimed LOAN — the synchronous BOT work below runs with no lock
+            // held, so nothing that spins on the controller can ever wait out a preempted holder.
+            // Busy (another context has the loan) skips this pass; the next one is milliseconds out.
+            if let Ok(mut xhci) = unaos_kernel::drivers::xhci::claim() {
                 xhci.poll_events();
+                // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` runs AHEAD of `service_storage`, so on
+                // the pass that finally releases the deferred SCSI bring-up the console has already
+                // armed and every line of that multi-second chain rides the live wire instead of the
+                // FTDI capture ring's drop-oldest replay. Ordering only; both hooks are idempotent
+                // no-ops when their work is not pending.
+                xhci.service_ftdi();
                 xhci.service_storage();
                 xhci.service_hubs();
                 xhci.service_hid_setproto();
-                xhci.service_ftdi();
                 xhci.service_slot_disposal();
                 xhci.service_enum();
             }
@@ -818,6 +1061,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // rMBP keyboard/trackpad path. Same polled-service spot as the xHCI hooks above.
             #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
             unaos_kernel::drivers::ehci::service_ehci_hid();
+            // KEYREPEAT-X86: synthesise a held key's repeat before this pass's drain below.
+            #[cfg(target_arch = "x86_64")]
+            x86_typematic_pump();
             // BATMON-1 (x86, smc knob): refresh the battery snapshot (throttled internally to ~1 s)
             // and emit the `:: SMC-BATT: ... ::` witness. This is the serial-less metal-sitting view
             // (fbcon mirrors serial to the screen), so the battery readout is on-screen here too.
@@ -833,10 +1079,55 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             // Once storage is up, mount + log the FAT volume geometry (one-shot).
             unaos_kernel::fs::fat::probe_once();
+            // SELFHOST-2 (x86, selfhost knob): verify the medium's own SRC.TGZ against SRC.SHA and
+            // walk the tar, one-shot. It belongs beside `probe_once` for the same reason that one
+            // does: it needs storage up and the volume lock free. Read-only throughout. Like the
+            // FATVERB witness below, it sits at ALL THREE storage-ready passes — which one a given
+            // x86 build reaches depends on its knobs, and this pass is the usbdebug one — with the
+            // latch inside making it speak exactly once.
+            #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
+            unaos_kernel::selfhost::verify_source_once();
+            // SDHC-4b (x86, sdhcblk knob): once `sdhc::bring_up` has registered the INTERNAL SD card
+            // under its own block handle, mount it READ-ONLY and emit the witness (one-shot). Runs
+            // here rather than in the bring-up so the card lock is released — the same reason
+            // `probe_once` and `piusb27_service` run from the loop. Reads only: it is not a FAT writer.
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            unaos_kernel::fs::fat::sdhc_probe_once();
+            // FATVERB: the shell's storage witness — the read verbs, the exec probe and the write
+            // gate must all name the same handle, and a write verb must consult the gate before it
+            // mutates. One-shot. It MUST run here and not with the other shell fixtures at step 5:
+            // the adoption review's capture showed those legs firing before `pci::init` and before
+            // the USB publish, so they read `handles=global=absent sdhc=absent` and passed on
+            // all-false inputs. Placed after the two probes above, the census names real handles
+            // and the legs have something to be wrong about. It drives real verbs against a
+            // throwaway console and mutates nothing (its write leg targets an unresolvable name).
+            #[cfg(all(target_arch = "x86_64", feature = "witness"))]
+            unaos_kernel::shell::fatverb_storage_witness();
+            // WIFI-1 (wifi knob): the Broadcom/bcma firmware-load path — see the note at the second
+            // loop site. Sits at all THREE storage-ready passes, like `fatverb_storage_witness`,
+            // because which pass a given x86 build reaches depends on its knobs; the forward-only
+            // state machine inside makes it speak exactly once. Read-only in arc 1.
+            #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
+            unaos_kernel::wifi::service();
+            // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under
+            // /fs/usb and emit the witness (aarch64 Pi path; runs with the xHCI lock released).
+            #[cfg(target_arch = "aarch64")]
+            unaos_kernel::fs::fat::piusb27_service();
             // GUI-WITNESS M3: re-dump the boot-milestone ring to serial on growth. A usbdebug-class
             // run surfaces the exact recorder ring via serial (M3 proof path), including the FTDI/block
             // milestones recorded from inside this loop. Serial-only + bounded.
             unaos_kernel::bootlog::service_serial_dump();
+            // BPACE: re-emit the boot-phase timing ledger whenever it grows. Ungated, deliberately —
+            // see `bootpace::service_dump`. Cheap when idle (one snapshot + one length compare).
+            unaos_kernel::bootpace::service_dump();
+            // FBCON-PACE: retire any console damage the pacing gate is holding. THIS LANE NEVER
+            // DETACHES (see the U2 note below — the usbdebug view keeps fbcon attached on purpose),
+            // so `fbcon::detach`'s sync flush is unreachable here and a burst that stops mid-frame
+            // would otherwise leave its last band owed until the next print — after boot, until the
+            // operator types. The call is PACED, not forced: it can only move a present earlier
+            // within the frame it was already going to happen in, never add one. Free on a clean
+            // ledger, and a no-op on every build where the console is not routed into a window.
+            unaos_kernel::video::fbcon::console_service();
             // FLIGHT-RECORDER (x86): flush the captured serial boot log to UNAOS.LOG (usbdebug metal
             // boot benefits from an on-disk log too). Gated on storage; throttled; never blocks boot.
             #[cfg(target_arch = "x86_64")]
@@ -870,6 +1161,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             #[cfg(all(target_arch = "x86_64", feature = "witness"))]
             unaos_kernel::arch::syscall::u6bx_probe_once();
             unaos_kernel::drivers::xhci::log_summary_once();
+            // FBCON-PACE: the console's present census, once, HERE — beside the xHCI summary, i.e.
+            // after enumeration and after the boot burst the pacing gate reshapes, so the numbers
+            // cover the burst. This is the only place it is emitted on the bench lane: the census
+            // used to ride `fbcon::console_flush`, which this lane never calls (no detach), and a
+            // flush that now runs once per service pass must not print once per service pass.
+            unaos_kernel::video::fbcon::console_pace_census_once();
             // VPERF (videobench knob, x86 only): the deterministic scripted scroll scenario —
             // one-shot, fires after the one-shot fixtures above have gone quiet, so the screen
             // settles on the scenario tail (what the DONE-gate screendump compares).
@@ -901,7 +1198,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .lock()
             .init(framebuffer_addr as usize, framebuffer_size, info);
 
-        unaos_kernel::vug::init(framebuffer_addr as usize, framebuffer_size, info);
+        unaos_kernel::video::init_panel(framebuffer_addr as usize, framebuffer_size, info);
+
+        // WMRETILE — the READINESS RE-TILE. `wm::place` early-returns on `!is_ready()` and has only
+        // window-lifecycle call sites (create/close/close_owner), so a window created before this
+        // point is published unpositioned and at WMMINW's fit-UNBOUNDED birth scale, and nothing
+        // ever revisits it. This is the missing fourth event: it gives every such row a real
+        // `place_scale` and a real origin, then reclaims the boxes the re-tile abandoned.
+        //
+        // Placed AFTER `init_panel` so the whole video surface is published before the layout reads
+        // it, and unconditional/un-gated for the same reason the WRITER seed at step 0a is: a row
+        // laid out against no panel is a general defect, not a compositor one.
+        //
+        // A no-op on every boot with no pre-ready rows — one WRITER read and one table scan, then
+        // return — which on x86 is EVERY boot, since step 0a seeds `WRITER` before anything can
+        // mint a window. It is silent there too: the witness sits behind the same early return.
+        unaos_kernel::video::wm::retile_on_ready();
+
+        // UVUG-2: wire the SYS_FB_PRESENT seam to the real scan-out now that WRITER is initialized.
+        // One registration call site; the hook centers a user program's presented off-screen surface
+        // on the panel (see `video::screen::present_surface`). Same code on the baremetal and QEMU
+        // kernel8 paths (both reach here with a live framebuffer). aarch64-only — the seam lives in
+        // arch/aarch64/syscall.
+        #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+        unaos_kernel::arch::aarch64::syscall::register_fb_present_hook(
+            unaos_kernel::video::screen::present_surface,
+        );
     } else {
         serial_println!(":: WARNING: No framebuffer detected ::");
     }
@@ -921,6 +1243,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let online = unaos_kernel::arch::smp::online_secondaries();
         if let (Some(&render_cpu), Some(&input_cpu)) = (online.first(), online.last()) {
             GUI_CHANNEL.init(); // reserve waiter capacity on the BSP before the tasks block on it
+            // INROUTE: `input_router_selftest` used to run HERE. It does not any more — see its own doc
+            // comment and the call site up in the `start_aps` block. The claim this comment used to make
+            // ("EVENT_QUEUE is empty and no user slot is live") was false at this point in the boot: the
+            // whole M6b..U7 fixture cascade is already spawned and running on the APs, holding ASIDs 1-8.
+            typematic_selftest(); // UVUG-6: prove the dropped-KeyUp wedge is closed (report-level + guards)
             unaos_kernel::arch::serial::RX_READY.init(); // M5c: the RX-wake semaphore's waiter list
             unaos_kernel::video::fbcon::detach();
             // M5c: on metal, route + enable the PL011 RX interrupt (SPI 153) to the input core so the
@@ -934,30 +1261,178 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     input_cpu,
                 );
                 unaos_kernel::arch::sched::spawn("rx-backstop", rx_backstop, 0, input_cpu);
+                // PI-UI-2: the 1 Hz status-strip refresh pulse. Co-located on the input core (a
+                // once-a-second wake, off the render core's frame-pacing critical path). Timer-gated
+                // like rx-backstop: its sleep_ticks nap needs the live timer IRQ to wake.
+                unaos_kernel::arch::sched::spawn("status-tick", status_tick, 0, input_cpu);
+                // PIUSB-26: the xHCI event pump on its own ~4 ms cadence (see `usb_pump`). Co-located
+                // on the input core; timer-gated like the neighbours (its `sleep_ticks` nap needs the
+                // live timer IRQ). In QEMU raspi4b (not spawned) the input task's poll-nap still pumps.
+                // SCHED-PRIO: the HID-report path runs in the interactive SERVICE band. Its passes are
+                // micro (see `[piusb26]` — a `poll_events` on an empty ring), it naps between them,
+                // and it is the whole latency budget of a moving mouse: a pump pass that queues behind
+                // a spinning vug is a pointer report that arrives late, which is the P73 symptom.
+                unaos_kernel::arch::sched::spawn_prio(
+                    "usb-pump",
+                    usb_pump,
+                    0,
+                    input_cpu,
+                    unaos_kernel::arch::sched::PRIO_SERVICE,
+                );
             }
-            unaos_kernel::arch::sched::spawn("input", input_service, 0, input_cpu);
-            unaos_kernel::arch::sched::spawn("render", render_service, 0, render_cpu);
+            // SCHED-PRIO — the two panel service tasks join the band (see `sched::PRIO_SERVICE` for
+            // the policy, the non-starvation argument and the lock/inversion accounting).
+            //
+            //   * `input`  — the input ROUTER: drains the UART/HID source and posts into GUI_CHANNEL.
+            //     Everything downstream of a keystroke or a pointer report is gated on this task
+            //     getting the core.
+            //   * `render` — the COMPOSITOR PASS OWNER: `Screen::flush` → `wm::service_damage`, the
+            //     cursor bracket, and the deferred-erase queue's liveness guarantee. The triage
+            //     measured its composites collapsing 0.99→0.43/s under a six-vug fleet and its
+            //     WM-lock erase defers going 29%→76%; it was a round-robin peer of every one of those
+            //     fleets, on a core they are also placed on.
+            //
+            // `rx-backstop`, `status-tick` and `orphan-reaper` deliberately STAY at PRIO_NORMAL: the
+            // first two are coarse periodic pokes with no latency requirement (a late 4 Hz strip
+            // sample is invisible), and the reaper is background block I/O. Elevating them would put
+            // the strip's `format!` + full-width band fill ahead of the fleet for no panel benefit.
+            unaos_kernel::arch::sched::spawn_prio(
+                "input",
+                input_service,
+                0,
+                input_cpu,
+                unaos_kernel::arch::sched::PRIO_SERVICE,
+            );
+            unaos_kernel::arch::sched::spawn_prio(
+                "render",
+                render_service,
+                0,
+                render_cpu,
+                unaos_kernel::arch::sched::PRIO_SERVICE,
+            );
             // U11-M2b: the deferred-free REAPER — a forever kernel service task that frees a cluster chain
             // orphaned when a program EXITS holding the last cross-process open of an unlinked file (teardown
             // is the last close, but block I/O is illegal there, so `clear_files_row` queues the chain head and
             // the reaper frees it in this block-I/O-legal context). Spawned at BOOT — never lazily from the
-            // teardown push (which cannot allocate a `Box<Task>` or take `RUN_QUEUES`). Co-located with the
-            // demo VERDICT core (`online.get(1)`), so the U11-reap launcher's bounded `yield_now` poll cedes it
-            // the CPU to drain deterministically under QEMU's cooperative scheduler; falls back to the input
-            // core if only one AP came up (still off the demo core). Additive + aarch64-baremetal-scoped.
-            let reaper_cpu = online.get(1).copied().unwrap_or(input_cpu);
-            unaos_kernel::arch::sched::spawn(
+            // teardown push (which cannot allocate a `Box<Task>` or take `RUN_QUEUES`). SCHED-3b: now adopts
+            // load-balanced placement (spawn_auto) instead of pinned core. The old deterministic placement
+            // onto `online.get(1)` (or `input_cpu` fallback) caused c2=100% while c1=0%; load-balanced spreads
+            // it across least-loaded cores. Additive + aarch64-baremetal-scoped.
+            unaos_kernel::arch::sched::spawn_auto(
                 "orphan-reaper",
                 unaos_kernel::arch::syscall::orphan_reaper,
                 0,
-                reaper_cpu,
             );
             serial_println!(
-                ":: INPUT on core {} + RENDER on core {} + orphan-reaper on core {} scheduled (OS on its own scheduler; BSP idle) ::",
-                input_cpu, render_cpu, reaper_cpu
+                ":: INPUT on core {} + RENDER on core {} + orphan-reaper load-balanced scheduled (OS on its own scheduler; BSP idle) ::",
+                input_cpu, render_cpu
             );
-            unaos_kernel::arch::hlt_loop();
+            // PIUSB-33: NOW run the DEFERRED half of the split — enumeration only, on the BOOT CORE, past
+            // the GUI-task spawn above. The RC + xHCI hardware bring-up already ran EARLY in build_boot_info
+            // (the P38-proven context; the RC APB read that P39/P40/P41 proved hard-stalls in this deferred
+            // context is long done, `XHCI_READY` set). The input/render tasks are already live on the APs
+            // (the panel is unblocked and painting), so `enumerate`'s heap-backed DMA-side walk (rings, RS=1,
+            // port/HID/storage) runs here without freezing the panel — and it touches the xHCI BAR MMIO, not
+            // the stalling RC APB, so the deferred context is safe for it. Runs once, publishes the xHCI
+            // controller, and hands steady-state servicing to `usb_pump` (spawned above). QEMU census-skips.
+            #[cfg(feature = "piusb")]
+            unaos_kernel::arch::piusb::bringup_task(0);
+            // SMP-BAL: after its boot duties the BSP joins the scheduler (steal-eligible kernel
+            // tasks only land here; user/pinned never do) instead of parking in hlt_loop forever.
+            unaos_kernel::arch::sched::run_bsp(0);
         }
+    }
+
+    // SCHED-X86 (x86_64): the same handoff, on this arch, for the same reason. The BSP hands the
+    // panel to scheduled kernel services and then JOINS THE SCHEDULER instead of falling into the
+    // inline GUI loop below — the loop that made `bg`/`run` place ring-3 tasks on a core which never
+    // popped its run queue (metal: 2 BGRUN spawns, zero `SYS_WIN_CREATE`, zero `:: SYSCALL:`, both
+    // kills burning the full KILL_CONFIRM_MS, `c0:0/0` beside `0/263` everywhere else).
+    //
+    // It must diverge HERE, before `let mut console` / `Screen::new` below: `x86_render_service`
+    // builds its own ~28 MiB cached-RAM back buffer, and a second one on the BSP would OOM the 48 MiB
+    // metal heap. Same placement, and the same reason, as the Pi's block above.
+    //
+    // Gated off under `rast`: the RAST-1 demo below drives the BSP's local `screen`, which does not
+    // exist on this path. That knob keeps the inline loop.
+    #[cfg(all(target_arch = "x86_64", not(feature = "rast")))]
+    if framebuffer_addr != 0 {
+        let online = unaos_kernel::arch::smp::online_aps();
+        // Two DISTINCT cores or nothing. `XHCI_CONTROLLER` is a raw `spin::Mutex` and both the
+        // service task and the render/shell task take it (the latter through `fat` block reads,
+        // `pal::pump_and_poll` inside a full-screen app, and `usbinfo`). Kernel tasks are preempted
+        // like any other, so two preemptible takers of a raw spinlock on ONE core deadlock it: the
+        // spinner cannot yield, so the holder it displaced can never be redispatched. Cross-core the
+        // same contention is bounded spin and progresses. Declining the handoff is the honest
+        // fallback — the inline loop below still works, it is only unscheduled.
+        let split = match (online.first(), online.last()) {
+            (Some(&render_cpu), Some(&svc_cpu)) if render_cpu != svc_cpu => {
+                Some((render_cpu, svc_cpu))
+            }
+            _ => None,
+        };
+        if let Some((render_cpu, svc_cpu)) = split {
+            // WITCORE: publish the split BEFORE anything is spawned, and emit the placement witness.
+            // Every other site that needs a core (`smp::worker_cpu` for the cooperative ring-3 fixture
+            // ladder, `smp::xhci_worker_cpu` for preemptible `XHCI_CONTROLLER` takers) asks that module
+            // rather than re-deriving `online_aps().first()` — which, since SCHED-X86, silently named
+            // the RENDER core. This call is what makes those answers correct: it must precede the
+            // spawns, and it precedes `fbcon::detach()` so the `:: SCHED-X86 PLACE: ... ::` line also
+            // lands on the panel of the serial-less metal boot.
+            unaos_kernel::arch::smp::publish_sched_split(render_cpu, svc_cpu);
+
+            // Reserve the channel's waiter capacity on the BSP, before any task can block on it —
+            // otherwise the first park would grow a `VecDeque` (and take the heap lock) inside the
+            // path that is proven not to allocate. Must precede the spawns.
+            GUI_CHANNEL_X86.init();
+
+            // The handoff milestones, replicated from below in their existing order and fired BEFORE
+            // any task can paint. HANDOFF-CLEAN: record + detach strictly before the first console
+            // frame, so the milestone's on-panel leg draws on the PRE-GUI panel and nothing paints
+            // behind the GUI afterwards.
+            unaos_kernel::bootlog::record("gui:handoff");
+            // BPACE: the desktop-up number — the one every boot-pace trim is measured against. It
+            // must keep landing on this path or the ledger silently loses its terminal stamp.
+            unaos_kernel::bootpace::record("gui");
+            // The GUI now owns the screen — stop fbcon mirroring serial onto the framebuffer, so
+            // exactly one core writes the panel (a panic re-attaches).
+            unaos_kernel::video::fbcon::detach();
+
+            // The Pi's order: device service, then input, then render. `arg` carries the core index
+            // so each task's own dispatch witness names the core it actually woke up on rather than
+            // the one we intended.
+            unaos_kernel::arch::sched::spawn(
+                "usb-pump",
+                x86_usb_pump,
+                svc_cpu,
+                svc_cpu,
+                unaos_kernel::arch::sched::PRIO_NORMAL,
+            );
+            unaos_kernel::arch::sched::spawn(
+                "input",
+                x86_input_service,
+                svc_cpu,
+                svc_cpu,
+                unaos_kernel::arch::sched::PRIO_NORMAL,
+            );
+            unaos_kernel::arch::sched::spawn(
+                "render",
+                x86_render_service,
+                render_cpu,
+                render_cpu,
+                unaos_kernel::arch::sched::PRIO_NORMAL,
+            );
+            serial_println!(
+                ":: SCHED-X86: RENDER on core {} + INPUT/usb-pump on core {} ({} AP(s) dispatching) — OS on its own scheduler ::",
+                render_cpu, svc_cpu, online.len()
+            );
+            // The BSP joins the scheduler. Diverges — nothing below this line runs on this path.
+            unaos_kernel::arch::sched::run_bsp(0);
+        }
+        serial_println!(
+            ":: SCHED-X86: {} AP(s) dispatching — the render/service split needs 2 distinct cores; GUI stays inline on the BSP ::",
+            online.len()
+        );
     }
 
     let mut console = unaos_kernel::console::Console::new();
@@ -991,6 +1466,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // paints on the pre-GUI panel, detach flips GUI_ACTIVE, and NOTHING may paint behind the GUI
     // after this point (a panic still re-attaches).
     unaos_kernel::bootlog::record("gui:handoff");
+    // BPACE: the desktop-up number — the one the operator's stopwatch has been approximating. Every
+    // trim this arc's successor considers is measured against `gui=` on the total line.
+    unaos_kernel::bootpace::record("gui");
 
     // The GUI now owns the screen — stop fbcon mirroring serial output onto the framebuffer
     // (a panic re-enables it). Boot diagnostics up to this point stay on screen until the first
@@ -1009,12 +1487,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     loop {
         // Poll xHCI Controller, then run any deferred storage work (synchronous BOT
         // transactions run here, in a safe non-event context).
-        if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+        // WEDGE-8 (F3): a claimed LOAN — the BOT work runs with no lock held; a Busy claim
+        // (another context has the loan) skips this pass and the next frame retries.
+        if let Ok(mut xhci) = unaos_kernel::drivers::xhci::claim() {
             xhci.poll_events();
+            // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` ahead of `service_storage`, so the console
+            // is armed before the deferred SCSI bring-up (which `service_storage` now holds until the
+            // enumeration queue drains) puts its multi-second chain on the wire. Ordering only.
+            xhci.service_ftdi();
             xhci.service_storage();
             xhci.service_hubs();
             xhci.service_hid_setproto();
-            xhci.service_ftdi();
             xhci.service_slot_disposal();
             xhci.service_enum();
         }
@@ -1022,6 +1505,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // keyboard/trackpad). Same polled-service spot as the xHCI hooks above.
         #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
         unaos_kernel::drivers::ehci::service_ehci_hid();
+        // KEYREPEAT-X86: synthesise a held key's repeat before this pass's drain below.
+        #[cfg(target_arch = "x86_64")]
+        x86_typematic_pump();
 
         // STOR-1 (x86, irqstorage knob): bring up the interrupt-driven storage service task once a
         // block device is present (before the storage fixtures submit through it), then run the
@@ -1034,6 +1520,34 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
         // lock released; read_block re-locks it briefly, so there is no nested-lock hazard.
         unaos_kernel::fs::fat::probe_once();
+        // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
+        // the first loop site. This is the pass a headless `test`/`test-fat` boot reaches.
+        #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
+        unaos_kernel::selfhost::verify_source_once();
+        // SDHC-4b (x86, sdhcblk knob): mount the INTERNAL SD card READ-ONLY once it has registered
+        // under its own block handle, and emit the witness (one-shot). See the note at the other loop
+        // site: it reads only and never becomes a second x86 FAT mutator.
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        unaos_kernel::fs::fat::sdhc_probe_once();
+        // FATVERB: the shell's storage witness (one-shot) — see the note at the first loop site.
+        // This file carries THREE storage-ready passes and which one a given x86 build reaches
+        // depends on its knobs, so the call sits at all three and the latch inside makes it speak
+        // exactly once. Mutates nothing.
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
+        unaos_kernel::shell::fatverb_storage_witness();
+        // WIFI-1 (wifi knob): the Broadcom/bcma firmware-load path. Runs the PCI-config census once,
+        // then — because the blob lives on the FAT volume the USB-storage device serves, which
+        // enumerates asynchronously above — waits here for that device and stages the blob exactly
+        // once. Forward-only and terminal: after one attempt it parks, so this costs a relaxed atomic
+        // load per iteration for the rest of the boot. Read-only in arc 1 (no MMIO, no device write).
+        // Like `fatverb_storage_witness` above, it sits at all THREE storage-ready passes this file
+        // carries, because which pass a given x86 build reaches depends on its knobs.
+        #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
+        unaos_kernel::wifi::service();
+        // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under /fs/usb
+        // and emit the witness (aarch64 Pi path; runs here with the xHCI lock released, like probe_once).
+        #[cfg(target_arch = "aarch64")]
+        unaos_kernel::fs::fat::piusb27_service();
         // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial whenever it grows.
         // On QEMU (serial live) this makes the recorded ring — including the FTDI/block milestones that
         // land from inside this loop — verifiable in serial.log without keyboard input, the M3 proof
@@ -1041,11 +1555,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // the same ring on-panel. Serial-only + bounded (one print per new milestone).
         #[cfg(feature = "witness")]
         unaos_kernel::bootlog::service_serial_dump();
+        // BPACE: re-emit the boot-phase timing ledger whenever it grows. NOT under the `witness`
+        // gate above, and that difference is the point: the media `./arroyo esp-x86` writes carries
+        // neither `witness` nor `usbdebug`, so a gated ledger would be absent from the only build
+        // that ever reaches the bench. The GUI loop is where the late tags (`stor-*`, `fat-mount`,
+        // `fr-flush`, `ftdi-up`) land, and where the last full block is emitted onto the live wire.
+        unaos_kernel::bootpace::service_dump();
         // FLIGHT-RECORDER (x86): flush the captured serial boot log to UNAOS.LOG on the FAT volume so
         // a consumer who booted the vm-image (no serial capture) can copy the log off afterward.
         // Gated on storage internally; re-flushes on growth, throttled; never blocks boot.
         #[cfg(target_arch = "x86_64")]
         unaos_kernel::flight_recorder::service();
+        // WITSWEEP (SERWIT-2 reachability): on x86 the mirror-tap announcement + one-shot verdict ride
+        // `flight_recorder::service()` (its first statement). That function is x86-only, so on aarch64
+        // the whole `[mirror]`/`:: SERWIT-2 ::` block never reached the wire and the TSTE tap-drop
+        // counters were write-only. Mirror the x86 placement here: this loop iteration is an IRQs-
+        // unmasked, no-locks-held, non-print context, exactly the contract `mirror_service` states.
+        // Always-on — SERWIT is law, not a knob. (The aarch64 BAREMETAL builds never reach this loop —
+        // the scheduler path owns them; their call rides `pump_usb_into_gui`, see there.)
+        #[cfg(target_arch = "aarch64")]
+        unaos_kernel::serial_ring::mirror_service();
         // U2 (x86): once a block device is present, load HELLO.BIN off the FAT volume and run it in
         // ring 3 (one-shot, gated like probe_once). Must live HERE, in the main loop — not with the
         // pre-xHCI U1a/U1b demo — because `fat::mount()` needs the usb-storage block device that
@@ -1081,8 +1610,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // (1-byte-corruption-caught) test, and the post-write refusal guard — emitting the
         // `:: INSTALL: gpt+fat32+copy verify => PASS ::` witness. One-shot + gated on storage. No-op
         // (module absent) without the feature; never touches the boot ESP (a separate ide-hd).
-        #[cfg(all(target_arch = "x86_64", feature = "installdemo"))]
+        // INSTGUI supersedes the auto-probe: when the graphical installer is armed, the attended
+        // Enter on its warning screen is the ONLY trigger — the engine must not fire on its own.
+        #[cfg(all(target_arch = "x86_64", feature = "installdemo", not(feature = "instgui")))]
         unaos_kernel::install::install_probe_once();
+        // INSTGUI: pick up disks that enumerate after the dialog opened (repaints only on change).
+        #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]
+        unaos_kernel::video::instgui::service();
         // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
         unaos_kernel::drivers::xhci::log_summary_once();
 
@@ -1106,10 +1640,61 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // late). Apply every pending event to the back buffer here; `render()` coalesces them.
         let mut had_event = false;
         loop {
-            match pal.poll_event() {
+            // WINX-7 — offer each event to the focused user app's input ring before the shell sees it.
+            // `user_input_route` returns the event UNCHANGED when no app took it, and `Unknown` (never
+            // `None`) when a ring consumed it: `None` is this loop's end-of-queue sentinel, so
+            // returning it for a routed keystroke would truncate the drain at the first one.
+            //
+            // This GUI loop is shared, but the router is x86-only — aarch64 routes EL0 input from its
+            // own path in `arch/aarch64` and has no `arch::x86_64` module to name, so the call is
+            // split rather than gated inside the callee.
+            //
+            // CLICK-X86 — and a pointer BUTTON is ADDRESSED before it is DELIVERED. `user_input_route`
+            // routes by FOCUS: whatever it is handed goes to whoever holds the keyboard. That is right
+            // for a keystroke and wrong for a click, which belongs to the window UNDER THE CURSOR, so
+            // `wc_click_route` runs first and hit-tests the press. It answers `true` only when it has
+            // CONSUMED the event (a press on kernel furniture or on the bare desktop, and the release
+            // that follows one); otherwise the ordinary path continues underneath it, addressed to
+            // whatever focus the router just left in place — which on a raise is the newly focused
+            // window, so `user_input_route` pushes the press into the ring of the window that was
+            // clicked. Non-`Button` events are returned untouched, so keys and motion are unaffected.
+            //
+            // `Event::Unknown` for a consumed click, and never `Event::None`: `None` is this loop's
+            // end-of-queue sentinel, so returning it would truncate the drain at the first click.
+            //
+            // WC-TAB/x86 — and TAB is judged BEFORE either router, because it is addressed to neither.
+            // It belongs to the window system itself: `wc_focus_key` is the one keystroke that moves
+            // focus rather than being delivered under it, and it must be intercepted ahead of
+            // `user_input_route` or the focused app swallows the only exit from its own window (Boot
+            // AH: 165 focus grants, 164 revokes, `kill <pid>` unreachable for the rest of the boot).
+            // Ahead of `wc_click_route` too — that call reads the cursor and hit-tests, work a key
+            // event has no business paying for; it returns `false` for any non-`Button` regardless.
+            //
+            // ONE interception covers BOTH directions on this arch, which is the divergence from
+            // aarch64 worth naming. This pair runs on every event whatever holds focus (the focus test
+            // is inside `user_input_enqueue`), so app -> shell and shell -> window pass through the
+            // same line; the Pi needs a second entry point on its shell drain only because its router
+            // is reached solely while an app has focus.
+            // WMDIRECT — `raw` is hoisted out of this block because a live title-bar DRAG has to be
+            // steered by the report the HARDWARE sent, not by what routing left of it. See the drag
+            // tick after the match below for the whole argument.
+            #[cfg(target_arch = "x86_64")]
+            let (raw, ev) = {
+                let raw = pal.poll_event();
+                (raw, unaos_kernel::arch::x86_64::syscall::wc_route_event(raw))
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let ev = pal.poll_event();
+            match ev {
                 unaos_kernel::pal::Event::None => break,
                 unaos_kernel::pal::Event::Key(c) => {
                     had_event = true;
+                    // INSTGUI — while the installer dialog is open it owns the keyboard;
+                    // the console resumes the moment it closes.
+                    #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]
+                    if unaos_kernel::video::instgui::consume_key(c) {
+                        continue;
+                    }
                     // `handle_key` returns true if the command took over the whole screen (e.g.
                     // `vug`); stop draining this frame so a keystroke already queued behind Enter
                     // can't paint the console back over the full-screen output — present it alone,
@@ -1125,6 +1710,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     // position. The console repaints nothing per frame, so the sprite must be
                     // fully self-undoing — the old flat-color erase punched grey boxes through
                     // text and missed the drop shadow's overhang, smearing motion.
+                    //
+                    // CURSOR-X86: on this target these three verbs now drive the COMPOSITOR SPRITE
+                    // (`video::cursor`, front buffer, above the window layer) rather than a
+                    // back-buffer sprite — `pal::cursor::SPRITE_OWNS_PAINT` carries the whole
+                    // argument. The sequence is unchanged and still correct: `move_rel` repaints the
+                    // arrow at the new position on the report itself, and `draw_over` is the
+                    // idempotent tail. What changed is that the arrow no longer needs the
+                    // `pal.render()` below to reach the glass, and no longer disappears under a
+                    // window.
+                    //
+                    // CURSOR-WCR — and the leading `restore` is gone WHERE THE SPRITE OWNS THE PAINT,
+                    // because there it was `video::cursor::undraw()` immediately in front of a
+                    // `repaint` whose own `undraw_locked` performs the same restore. Two restores,
+                    // one of them wasted, is the cheap half of the cost; the expensive halves are
+                    // that the standalone `undraw` cleans WHOLE SCANLINES (`flush_box`) where the
+                    // repaint's union cleans only the sprite's columns, that it publishes the panel
+                    // with the arrow taken down and not yet put back — the intermediate publication
+                    // CURSOR-10 exists to remove — and that it issues a second
+                    // `damage_intersecting` per report. Kept unconditionally on the back-buffer
+                    // targets, where `restore` really is the only thing that takes the sprite off
+                    // and `move_rel` paints nothing.
+                    #[cfg(not(target_arch = "x86_64"))]
                     unaos_kernel::pal::cursor::restore(&mut pal);
                     unaos_kernel::pal::cursor::move_rel(
                         x, y,
@@ -1136,6 +1743,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
                     had_event = true;
                     // CURSOR-SAVE-UNDER: absolute report (0..=32767 HID space), same sprite.
+                    // CURSOR-WCR: leading restore dropped where the sprite owns the paint — see the
+                    // relative arm above for the whole argument.
+                    #[cfg(not(target_arch = "x86_64"))]
                     unaos_kernel::pal::cursor::restore(&mut pal);
                     unaos_kernel::pal::cursor::set_abs(
                         x, y,
@@ -1144,9 +1754,58 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     );
                     unaos_kernel::pal::cursor::draw_over(&mut pal);
                 }
+                // CLICK-X86 — the PRESS arm. Before this arc the drain's `match` ended `_ => {}` with
+                // no `Event::Button` arm at all: HID pushed presses onto the queue and this loop
+                // popped and DISCARDED them, which is the whole of the "clicks get eaten" complaint on
+                // this arch and the reason the "out-of-focus click stops my app" complaint could never
+                // have had a mechanism either.
+                //
+                // Reaching this arm now means the press was NOT consumed by `wc_click_route` above and
+                // NOT taken by a user ring — i.e. it is the SHELL's click. The shell on x86 has no
+                // click model of its own yet (aarch64's `click1_dispatch` is that arch's scheduled
+                // render service, which does not run here), so there is nothing to dispatch it to and
+                // the arm is deliberately empty of policy. What it must do is count as activity, so
+                // the loop presents this pass and does not `hlt` on a click; and the press is already
+                // on the wire from the router's `[clickroute]` line, which is where the disposition is
+                // recorded. When x86 grows a shell click model this is the one place it attaches.
+                //
+                // x86-gated: this loop is shared, and on aarch64 a Button still falls through the
+                // catch-all exactly as it did (that arch routes clicks from its own drains), so this
+                // arc leaves that target's behaviour untouched.
+                #[cfg(target_arch = "x86_64")]
+                unaos_kernel::pal::Event::Button(_mask) => {
+                    had_event = true;
+                }
                 // Timer / Unknown: nothing to do.
                 _ => {}
             }
+            // WMDIRECT — **STEER A LIVE TITLE-BAR DRAG, OFF `raw`, AFTER THE ARMS ABOVE.**
+            //
+            // The predicate is the RAW report and NOT `ev`, and that distinction is the whole of this
+            // line's correctness. `Event::Mouse`/`Event::MouseAbsolute` are PACKABLE, so whenever a
+            // ring-3 app holds focus and its ring is not full, `user_input_route` consumes the report
+            // and hands back `Event::Unknown` — it never reaches the pointer arms at all. A title-bar
+            // grab GUARANTEES exactly that state, because the chrome arm of `wc_click_route_at` calls
+            // `user_input_set_active(owner)` with the dragged window's own owner. Keyed on `ev`, the
+            // drag would therefore be dead for every app window and alive only for the console and
+            // the focus-exempt desktop row (whose arms take `set_active(0)`) — app-dependent,
+            // nondeterministic (an app that stops draining fills its ring, the push fails, and the
+            // drag springs to life mid-gesture), and with the release edge's unthrottled final
+            // reposition TELEPORTING the window to wherever the hand let go.
+            //
+            // Placed after the `match` rather than beside the routers so that the cursor is FRESH on
+            // both branches, which is the other half of it — `wc_drag_motion` reads the shared
+            // `pal::cursor` position rather than the report's delta:
+            //   * CONSUMED — `user_input_route` -> `pal::cursor::track_routed` has already applied it
+            //     (CURSOR-VUG). Without that arc this line would steer to a stale position.
+            //   * DECLINED — the `Mouse`/`MouseAbsolute` arms above have just applied it.
+            // Exactly ONE tick per pointer report either way, so a relative report is never applied
+            // twice and the 16 ms throttle measures real time rather than a doubled rate.
+            //
+            // Costs one `matches!` on non-pointer events and one atomic load when no drag is live,
+            // which is every report on a boot where nobody grabbed a title bar.
+            #[cfg(target_arch = "x86_64")]
+            unaos_kernel::arch::x86_64::syscall::wc_route_tail(raw);
         }
 
         // CURSOR-HIDE: restore the pixels under the sprite once when the auto-hide delay
@@ -1299,6 +1958,16 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // the same physical framebuffer (the x86/pi pattern); until the console takes over,
             // only fbcon draws.
             unaos_kernel::video::WRITER.lock().init(fb.base as usize, fb.len, fb.info);
+            // WMRETILE — the tegra twin of the readiness re-tile at step 3, and DEFENSIVE rather
+            // than required. `tegra_early_stop` diverges before `kernel_main` step 3 ever runs, so
+            // this is the only `WRITER` attachment the Orin boot reaches and the step-3 hook
+            // cannot stand in for it — but nothing can mint a pre-ready row here TODAY either: the
+            // heap and the scheduler both come up after this point, so the table is empty and the
+            // call returns 0 on every current Orin boot. It is here so that the Orin path does not
+            // silently regain the hole the moment window creation moves earlier than JD2, which is
+            // exactly the direction that path is growing. Same no-op-when-empty terms; see
+            // `wm::retile_on_ready`.
+            unaos_kernel::video::wm::retile_on_ready();
             serial_println!(
                 ":: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::"
             );
@@ -1804,7 +2473,27 @@ fn handle_key(
     if c == b'\n' || c == b'\r' {
         let cmd = console.current_input.clone();
         console.current_input.clear();
+        // GUI-CLICK-2: mark the screen app-owned across the (possibly long-running, full-screen)
+        // command so the Pi USB pump leaves input in EVENT_QUEUE for the command's own pump_and_poll
+        // (vug/pulse) instead of forwarding it into a GUI_CHANNEL that render_service — blocked HERE
+        // inside dispatch_command — cannot drain. Cleared unconditionally on return (a took_screen
+        // command has already restored the console by the time it returns).
+        SCREEN_APP_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
+        unaos_kernel::gui_watchdog::on_app_enter();
         let took_screen = unaos_kernel::shell::dispatch_command(&cmd, console, pal);
+        unaos_kernel::gui_watchdog::on_app_exit();
+        SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+        // TERM_RING (MIDDEN_CONVERGENCE §3, M2): THE DRAIN SITE. `dispatch_command` has returned, so
+        // the render task owns the view again — the exclusive-drainer contract `termring::drain`
+        // requires — and this is the first moment a record staged by a producer that is NOT this task
+        // (an IRQ-masked context, a future second consumer's peer) can be moved into the scrollback.
+        // Runs before the repaint below so anything drained is on screen this frame, and
+        // unconditionally (a took_screen command has restored the console by the time it returns, and
+        // its next repaint would otherwise be the first to show the backlog). `service` announces any
+        // transport loss on the wire, on change only; both are no-ops on an empty, lossless ring, which
+        // is what keeps the aarch64 path byte-identical.
+        console.drain_output();
+        unaos_kernel::termring::service();
         if !took_screen {
             console.draw(pal);
         }
@@ -1902,7 +2591,7 @@ fn jd2_console_pump(_arg: usize) {
 
     let phase1_start = cntpct();
     let first_key: Option<u8> = loop {
-        if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+        if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
             x.poll_events();
         }
         match unaos_kernel::pal::next_event() {
@@ -1963,7 +2652,7 @@ fn jd2_console_pump(_arg: usize) {
     use unaos_kernel::pal::cursor;
     let mut announced = false;
     loop {
-        if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+        if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
             x.poll_events();
         }
         let cursor_was_visible = cursor::visible();
@@ -2079,9 +2768,1045 @@ fn jd2_console_pump(_arg: usize) {
 static GUI_CHANNEL: unaos_kernel::arch::sched::Channel<unaos_kernel::pal::Event> =
     unaos_kernel::arch::sched::Channel::new(64);
 
+/// SCHED-X86: the x86 twin of `GUI_CHANNEL` — the input service `send`s, the render service `recv`s,
+/// across two different application processors. Same capacity (64) and the same backpressure
+/// contract: a full channel blocks the producer rather than dropping a keystroke. Separate from the
+/// aarch64 static (rather than one ungated channel) because the two arches' handoffs are gated on
+/// different feature sets and neither build should carry the other's 64-slot `VecDeque`.
+#[cfg(target_arch = "x86_64")]
+static GUI_CHANNEL_X86: unaos_kernel::arch::sched::Channel<unaos_kernel::pal::Event> =
+    unaos_kernel::arch::sched::Channel::new(64);
+
+/// SCHED-X86 (depth witness): events forwarded INTO / taken OUT OF `GUI_CHANNEL_X86`. `sent - recv`
+/// is the live queue depth, which is the one number that distinguishes "the render task is keeping
+/// up" from "the render task is wedged and the input task is about to block in `send`". Both sites
+/// live in this file, so the pair cannot drift.
+#[cfg(target_arch = "x86_64")]
+static GUI_SENT_X86: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
+static GUI_RECV_X86: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SCHED-X86: ms() of the last `[schedx86] depth` line, rate-limiting it to once every ~5 s. The
+/// render task passes at least four times a second (the pulse), so this is a real clock gate and not
+/// a pass counter standing in for one.
+#[cfg(target_arch = "x86_64")]
+static GUI_DEPTH_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SCHED-X86: cadence of the render task's periodic wake, posted as an `Event::Timer` by the input
+/// service. The render loop BLOCKS on `recv`, so without a pulse two things that are not driven by
+/// input would never happen: the CURSOR-HIDE auto-hide erase (which fires ~1.5 s after the last
+/// pointer report) and the `instgui` disk rescan. The Pi solves this with a dedicated `status-tick`
+/// task; here it rides the input service's existing nap — a wall-clock compare per pass, no extra
+/// task, no extra timer. 250 ms keeps the auto-hide crisp at four channel sends per second.
+#[cfg(target_arch = "x86_64")]
+const X86_GUI_PULSE_MS: u64 = 250;
+
+/// SCHED-X86: forward one event into `GUI_CHANNEL_X86` and bump the sent counter — the single choke
+/// point, so `GUI_SENT_X86` can never disagree with the real send count.
+#[cfg(target_arch = "x86_64")]
+fn gui_send_x86(ev: unaos_kernel::pal::Event) {
+    GUI_SENT_X86.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    GUI_CHANNEL_X86.send(ev);
+}
+
 /// One-shot guard: log "RX interrupt live" exactly once, from the input task (never the ISR).
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static RX_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// PIUSB-24: ms() timestamp of the last `[piusb24]` pointer witness line, to rate-limit it to ~4 Hz
+/// (a moving mouse emits reports far faster than serial should mirror). 0 = never logged.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static PIUSB24_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PIUSB-26: ms() timestamp of the last `[piusb26]` pump idle-cost witness, to rate-limit it to once
+/// every ~5 s (the pump runs ~250×/s — no point mirroring every pass). 0 = never logged.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static PIUSB26_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// UVUG-5: ms() timestamp of the last `[el0in]` router-delivery witness. The metal `no interactive takeover`
+/// question (P47) is un-reproducible in QEMU (no HID), so this line PROVES on the next sitting whether real
+/// HID edges actually reached the active user app's input ring — `route_input_to_active_el0` returning >0 is
+/// the router delivering keys/mouse the user app's SYS_INPUT_POLL then drains. Rate-limited to ~2 Hz so a
+/// held key or a moving mouse never floods serial. 0 = never logged.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static EL0IN_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// UVUG-5 / typematic — host-side key repeat. A USB HID boot keyboard under SET_IDLE(0) (which we arm, so a
+// held key sends ONE press report and NO further reports until release — the GAME-MODE held-state contract
+// depends on it) never auto-repeats. So a held key produced exactly one `Event::Key` everywhere in the stack:
+// the shell line editor advanced one char and stopped, and Peter noticed the dead repeat at the bench. Key
+// repeat is therefore the HOST's job. We synthesise it in the USB pump (the one periodic seam that already
+// runs ~250×/s and owns `EVENT_QUEUE`): track the most-recently-pressed key from the Key/KeyUp EDGES the HID
+// decode already emits, and once it has been held past an initial delay, push a fresh `Event::Key` into
+// `pal::EVENT_QUEUE` at the pump's repeat rate. Injecting into EVENT_QUEUE means the repeat rides the SAME
+// routing every real key takes — the shell path (GUI_CHANNEL), a kernel full-screen app's own pump_and_poll
+// drain, AND a user app's per-process ring — with no per-path code. Newest key wins (standard typematic);
+// releasing the repeating key stops it; a different key's release is ignored. QEMU raspi4b delivers no HID, so
+// no key is ever held and no repeat is ever synthesised — the deterministic auto paths stay byte-identical.
+//
+// UVUG-6 moved the tracker STATE and logic into `pal` (the kernel lib) and re-rooted its observation at the
+// HID REPORT level: `drivers::xhci` calls `pal::typematic_note_report` before any EVENT_QUEUE push, and this
+// pump calls `pal::typematic_tick`. See `pal.rs` for the root-cause writeup (a `KeyUp` dropped by the full
+// 64-slot ring used to strand a held key forever) and the three-layer disarm + backpressure guard that fix it.
+// The former drain-fed `typematic_observe` is gone — observing the queue drain was the hole.
+
+/// PIUSB-28: latched once the first Pi pump pass has armed the FAT mount trigger, so the
+/// `:: piusb28: mount-trigger armed (pi pump path) ::` witness prints exactly once per boot. This
+/// makes the wiring itself visible on serial — proving the mount edge is now polled from a path that
+/// actually runs on Pi baremetal+fb (`usb_pump`/`input_service` poll-fallback), unlike the dead
+/// main/GUI loop where PIUSB-27's original call sites live.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static PIUSB28_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// GUI-CLICK-1: previous pointer-button bitmask, so the render task acts on PRESS edges only (a new
+/// bit going 0→1) and ignores the matching release. A raw HID button report carries the full set of
+/// currently-held buttons, so without edge detection a press+release would dispatch twice (or a held
+/// drag would re-fire every report). 0 = no button held.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static CLICK1_PREV_MASK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// GUI-CLICK-1: ms() timestamp of the last `[click1]` witness line, to rate-limit it to ~10 Hz. A
+/// press edge is rare compared to motion, but a chattering switch or a fast double-click should not
+/// flood serial; genuine distinct clicks are far enough apart to survive the throttle. 0 = never.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static CLICK1_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// GUI-CLICK-2: true while a full-screen app owns the screen — set around `dispatch_command` in
+/// `handle_key`. While true, `pump_usb_into_gui` STOPS forwarding pointer/key events into
+/// GUI_CHANNEL and leaves them in `pal::EVENT_QUEUE` for the app's own `pump_and_poll` drain (vug,
+/// pulse, …). This both delivers input (incl. the exit click) to the app AND stops the pump from
+/// saturating the 64-slot GUI_CHANNEL while render_service is blocked inside the app — the P-metal
+/// fps-decay-under-vug mechanism. Ungated (shared `handle_key` sets it on every arch); only the Pi
+/// pump reads it. `[click1]` stays the no-app fallback dispatch.
+static SCREEN_APP_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// GUI-CLICK-2 (depth witness): running count of events forwarded INTO GUI_CHANNEL and RECEIVED out
+/// of it. `sent - recv` is the live channel queue-depth (the coordinator's saturation suspect). Both
+/// send and recv sites live in this file's aarch64+baremetal service tasks, so the pair is exact
+/// without touching the `Channel` type in sched.rs (another lane). Printed by the `[click2] depth`
+/// line every ~5 s, always (so the degradation curve is on serial regardless of app-active state).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static GUI_SENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static GUI_RECV: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// GUI-CLICK-2: `[click2] depth` is rate-limited by a PASS COUNTER, not wall-clock: the pump runs
+/// from the raspi4b poll-nap fallback where `arch::ms()` is stuck at 0 (Group-1 timer not live), so
+/// an ms() rate-limit never holds there and floods serial. A pass counter is monotonic regardless of
+/// timer state — one line every `CLICK2_DEPTH_EVERY` passes (~5 s at the metal ~250 Hz pump cadence).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static CLICK2_DEPTH_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const CLICK2_DEPTH_EVERY: u64 = 1250;
+/// GUI-CLICK-2: ms() of the last `[click2] input left for app` witness (rate-limit ~5 s so a held/
+/// chattering click during an app does not flood serial). Edge-triggered on a real press, which only
+/// occurs on metal (QEMU raspi4b has no USB HID) where ms() advances — so ms gating is safe here.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static CLICK2_LEFT_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// GUI-CLICK-2: forward one event into GUI_CHANNEL and bump the sent counter (depth accounting). The
+/// single choke point for every producer in this file, so `GUI_SENT` can never drift from real sends.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn gui_send(ev: unaos_kernel::pal::Event) {
+    GUI_SENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    GUI_CHANNEL.send(ev);
+}
+
+/// FOCUS-VIS — panel dimensions for the router's cursor keep-alive, read straight from the scan-out
+/// framebuffer. The router has no `TargetPal` (that lives in the render task), and `pal::cursor` needs
+/// bounds to clamp the hot spot against; `video::WRITER` is the same surface the sprite is drawn into,
+/// so the two can never disagree. Zero while the framebuffer is unset, which clamps to (0,0) — harmless,
+/// and unreachable in practice since a pointer report implies a booted display.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn pal_width_hint() -> i32 {
+    unaos_kernel::video::WRITER.lock().info().width as i32
+}
+
+/// FOCUS-VIS — see [`pal_width_hint`].
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn pal_height_hint() -> i32 {
+    unaos_kernel::video::WRITER.lock().info().height as i32
+}
+
+/// EL0IN-FOCUS: true only while `input_router_selftest` is inside `route_input_to_active_el0`. That test
+/// pushes SYNTHETIC pointer events through the real router, and on a QEMU gate with no HID they would
+/// otherwise be the first "pointer report" of the boot — arming the system cursor, painting a sprite and
+/// printing `[cursor] armed` on a panel that has no pointer. The router's cursor keep-alive skips its work
+/// while this is set, which is the narrowest possible form of the guard: every REAL report (there can be
+/// none while the BSP is inside the selftest — the HID pump task is not spawned yet) moves the cursor.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static ROUTER_SELFTEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// INPUT-WIRE (ELF-5 router fold): drain every pending pal event into the ACTIVE user program's per-process
+/// input ring via the `user_input_enqueue` seam. The single choke point for router->ring delivery — called by
+/// `pump_usb_into_gui` when a user app holds input focus, and exercised directly by `input_router_selftest`.
+/// Returns the count actually queued (a deliverable event on a non-full ring); Timer/None/Unknown and a full
+/// ring are dropped by the seam (returns `false`). Never forwards into GUI_CHANNEL — that is the whole point.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn route_input_to_active_el0() -> usize {
+    let mut routed = 0usize;
+    while let Some(ev) = unaos_kernel::pal::next_event() {
+        // UVUG-6: no drain-fed typematic observe here — the tracker is fed at the HID report level
+        // (drivers::xhci -> pal::typematic_note_report), which a dropped queue event cannot defeat.
+        //
+        // FOCUS-VIS — the SYSTEM CURSOR IS SYSTEM-WIDE, so it must survive this branch. Everything
+        // below routes the event onward to the focused app's ring and returns; the shell loop's
+        // `Mouse`/`MouseAbsolute` arms — the ONLY code that moved the shared pointer state and repainted
+        // `video::cursor` — are not reached at all while an app holds focus. The sprite therefore froze
+        // where it was and auto-hid 1.5 s later, and no amount of mouse movement brought it back: the
+        // reports were all going to the app. That is a system cursor disappearing because of who owns
+        // the KEYBOARD, which is not a relationship that should exist.
+        //
+        // Delivery is unchanged — the event still goes to the app, which is what focus means; this only
+        // keeps the kernel's own pointer state and its top-most sprite current alongside it.
+        //
+        // EL0IN-FOCUS — WHY THIS GATE IS NO LONGER `has_reported()`. FOCUS-VIS gated the keep-alive on
+        // `pal::cursor::has_reported()` to keep the boot-time `input_router_selftest` — which drives this
+        // exact function with a SYNTHETIC `Event::Mouse` against a fake focus — from arming a cursor and
+        // printing `[cursor] armed` on a QEMU gate that has no pointer at all. The stated premise was that
+        // "a machine with a real pointer has always armed it through the shell loop first (focus is the
+        // shell at boot)". That premise is false whenever a user app takes focus BEFORE the first pointer
+        // report of the boot — `run`/`bg` a windowed app, then touch the mouse — which is the ordinary
+        // desktop bring-up. In that state `has_reported()` is still false, so this block is skipped; the
+        // shell arms (`render_service`'s `Mouse` arm, the only OTHER `move_rel` caller on this arch) are
+        // unreachable because `pump_usb_into_gui` took the `user_input_active() != 0` branch; and nothing
+        // else in the kernel can ever set the latch. So the predicate could only become true through a
+        // path the predicate itself had disabled: the pointer stayed dead — no motion, no sprite — until
+        // the operator TAB'd focus back to the shell, at which point the shell drain armed it and the
+        // cursor came alive for the rest of the boot (P67v2, bench).
+        //
+        // The gate is therefore scoped to the thing it was actually protecting: the selftest's own call.
+        // `ROUTER_SELFTEST` is true only for the few instructions that test spends inside this function,
+        // so its synthetic events still arm nothing and the QEMU gate output is unchanged — while a REAL
+        // pointer report moves the system cursor from the first report of the boot, whoever holds focus.
+        if !ROUTER_SELFTEST.load(core::sync::atomic::Ordering::Relaxed) {
+            match ev {
+                unaos_kernel::pal::Event::Mouse { x, y } if x != 0 || y != 0 => {
+                    unaos_kernel::pal::cursor::move_rel(
+                        x,
+                        y,
+                        pal_width_hint(),
+                        pal_height_hint(),
+                    );
+                    unaos_kernel::video::cursor::repaint();
+                }
+                unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                    unaos_kernel::pal::cursor::set_abs(x, y, pal_width_hint(), pal_height_hint());
+                    unaos_kernel::video::cursor::repaint();
+                }
+                _ => {}
+            }
+        }
+        if unaos_kernel::arch::aarch64::syscall::user_input_enqueue(ev) {
+            routed += 1;
+        }
+    }
+    // UVUG-5: prove router->ring delivery on metal. The `no interactive takeover` P47 symptom left it open
+    // whether HID edges reached the user ring at all (QEMU can't test the HID edge). A rate-limited `[el0in]`
+    // line here fires the instant the router hands the active user app real input, so the next sitting reads
+    // delivery directly instead of inferring it. Silent when nothing routed (the common empty-pass case).
+    if routed > 0 {
+        use core::sync::atomic::Ordering;
+        let now = unaos_kernel::arch::ms();
+        let last = EL0IN_LAST_LOG_MS.load(Ordering::Relaxed);
+        if now.wrapping_sub(last) >= 500 || last == 0 {
+            EL0IN_LAST_LOG_MS.store(now.max(1), Ordering::Relaxed);
+            serial_println!("[el0in] routed {} event(s) to active EL0 ring", routed);
+        }
+    }
+    routed
+}
+
+/// INPUT-WIRE QEMU witness: prove the ROUTER path (EVENT_QUEUE -> the active-focus user ring) that the ELF-5
+/// in-RAM `input_launcher` test cannot — it injects straight into `user_input_enqueue`, bypassing the router.
+/// This runs the REAL router drain (`route_input_to_active_el0`, the exact code `pump_usb_into_gui` calls)
+/// against a FAKE active focus and asserts: (1) a Key and a Mouse event pushed into EVENT_QUEUE are routed
+/// to the focused ring (routed == 2), (2) a non-deliverable Timer is dropped (not routed), and (3) GUI_CHANNEL
+/// is BYPASSED (GUI_SENT unchanged — the events did NOT leak into the render channel). The ring -> user drain
+/// half is proven by the ELF-5 `:: EL0: input test … ::` witness; together they cover the full HID->user path.
+/// HONEST QEMU NOTE: the real HID *edge* (a USB keypress landing in EVENT_QUEUE) is metal-only — QEMU raspi4b
+/// delivers no HID — so this drives the router with a synthetically pushed event.
+///
+/// INROUTE — WHERE THIS RUNS, AND WHY IT MOVED. Called ONCE on the BSP from the `start_aps` block, BEFORE the
+/// secondaries are started. That placement is load-bearing, not cosmetic.
+///
+/// The test borrows the two pieces of GLOBAL input state — `USER_INPUT_ACTIVE` (it fakes focus onto ASID 1)
+/// and `pal::EVENT_QUEUE` (it pushes synthetic events and expects to be the one who drains them) — and then
+/// COUNTS deliveries. Any concurrent owner of either one makes the count wrong. Its old home was next to the
+/// input/render task spawn, under a comment claiming "EVENT_QUEUE is empty and no user slot is live". That was
+/// simply untrue by then: the M6b..U7 fixture cascade is spawned far earlier and is running on the APs, and
+/// `M6d` alone holds all eight slots — ASIDs 1 through 8. So the fake target ASID 1 was a REAL, LIVE slot
+/// belonging to a fixture, and when that fixture exited mid-test its teardown ran
+/// `clear_handle_row(1)` -> `USER_INPUT_ACTIVE.compare_exchange(1, 0)`, revoking the focus this test had just
+/// set. A router pass that had already enqueued the Key then found no active target for the Mouse and
+/// returned `routed=1`: the observed `:: USER: input router — routed=1|0 … :: FAIL ::`, ~1 boot in 7 under
+/// contention. Nothing was dropped by the queue (`[uvug10] evq drop` stayed 0) and nothing leaked to
+/// GUI_CHANNEL — the events were simply routed to a focus that no longer existed.
+///
+/// The revocation itself is CORRECT and is deliberately left alone: a torn-down slot must stop receiving
+/// input, and the pre-launch discard in `user_input_set_active` is likewise correct for real input (an event
+/// queued before an app existed was never meant for it — UVUG-8r2). The bug was the test's precondition, so
+/// the fix is to make the precondition TRUE by construction: run before any user slot in this boot exists.
+/// Serialising structurally beats the alternatives — giving the test a private sink would stop exercising
+/// the real global seam, which is the entire point of the witness, and any "retry on mismatch" would just
+/// launder a real race into a slower green.
+///
+/// The `[inroute]` line below is the standing evidence that the window stayed clean: it reports the focus
+/// revocation count across the measurement window (`revokes=0` is the healthy reading) alongside the drained
+/// counts, so a future regression that re-introduces a concurrent owner is diagnosable from the log alone
+/// rather than by re-deriving the race.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn input_router_selftest() {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::arch::aarch64::syscall as sc;
+    let sent0 = GUI_SENT.load(Ordering::Relaxed);
+    // EL0IN-FOCUS: mark the whole measurement window as the selftest's, so the router's cursor keep-alive
+    // ignores the synthetic pointer events below (no `[cursor] armed` on a panel with no pointer). Cleared
+    // unconditionally before the verdict is printed; nothing here can early-return between the two.
+    ROUTER_SELFTEST.store(true, Ordering::Relaxed);
+    // INROUTE: bracket the measurement window with the focus-revocation counter (see `el0_focus_revokes`).
+    let revokes0 = sc::el0_focus_revokes();
+    // Fake focus: ASID 1 is a valid ring index (the per-ASID rings exist independent of slot liveness), and
+    // at THIS call site no user slot has been allocated yet in this boot — the secondaries that run the fixture
+    // cascade are not started until the line after this call returns, so nothing else can target ASID 1 or
+    // revoke our focus (INROUTE; the `revokes=0` line below is the running proof). Setting focus resets the ring.
+    sc::user_input_set_active(1);
+    unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(b'R'));
+    unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Mouse { x: 3, y: -4 });
+    unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Timer); // non-deliverable — must be dropped
+    let routed = route_input_to_active_el0();
+    let sent1 = GUI_SENT.load(Ordering::Relaxed);
+    // UVUG-8r2 (a): DELIVERY IS NOT TAKEOVER. Two real events just landed in ASID 1's ring, and the latch must
+    // still be 0 — takeover is engaged by the app CONSUMING an event via SYS_INPUT_POLL, not by the router
+    // pushing one. Pre-r2 this latched here, which is exactly how the stale launch keystroke handed every
+    // keyboard-started run a suspended deadline at t≈0. (The consume edge itself needs a live user task, so it
+    // is metal-only; this asserts the half QEMU can see.)
+    let push_does_not_engage = sc::el0_takeover_active() == 0;
+    // UVUG-8r2 (b): STALE PRE-LAUNCH EVENTS ARE DISCARDED ON FOCUS. This is the metal `run /fat/VUG.ELF`
+    // scenario in miniature: an event sits in EVENT_QUEUE from before the app existed (the Enter KeyUp that
+    // launched it), then focus is granted. `user_input_set_active` must drain it, so the very next router pass
+    // finds nothing to deliver — the app cannot mistake its own launch keystroke for in-app interaction.
+    unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(b'\n')); // the "launch" keystroke
+    sc::user_input_set_active(1); // fresh focus — must discard it
+    let stale_dropped = route_input_to_active_el0() == 0;
+    // UVUG-8r2 (c): the pure decisions the wait loop uses, over a suspend -> WEDGE -> re-arm cycle. QEMU
+    // raspi4b delivers no HID, so the live path cannot be driven here; these prove the logic instead.
+    let deadline: u64 = 1_000;
+    let stale: u64 = 200; // heartbeat staleness bound, in the same synthetic tick unit
+    //   (S) latched on this asid with a FRESH heartbeat -> suspended, so even far past the deadline: no timeout.
+    let live_suspends = sc::takeover_suspends(1, 1, 10_000, 9_900, stale);
+    let suspend_holds = !sc::run_deadline_timed_out(live_suspends, 10_000, 0, deadline);
+    //   (W) THE r2 FIX: same latch, but the app stopped polling — heartbeat older than `stale`. Takeover must
+    //       no longer suspend, or a hung app strands the shell forever (the wedge the first cut introduced).
+    let hung_releases = !sc::takeover_suspends(1, 1, 10_000, 9_000, stale);
+    //   (X) a latch naming a DIFFERENT asid never suspends this run; an empty latch never suspends.
+    let other_asid_ignored = !sc::takeover_suspends(2, 1, 10_000, 9_990, stale);
+    let unlatched_ignored = !sc::takeover_suspends(0, 1, 10_000, 9_990, stale);
+    //   (R) once released, the budget re-arms to `now`: not timed out at that instant, timed out a full
+    //       deadline later — the liveness bound is genuinely restored, not merely deferred.
+    let rearm_start: u64 = 10_000;
+    let rearm_fresh = !sc::run_deadline_timed_out(false, rearm_start, rearm_start, deadline); // 0 elapsed
+    let rearm_fires = sc::run_deadline_timed_out(false, rearm_start + deadline + 1, rearm_start, deadline);
+    // A focus change clears the latch — a fresh `run` always starts disengaged (deadline fully armed).
+    sc::user_input_set_active(0); // restore: no active user focus for the real boot
+    // EL0IN-FOCUS: last router call is done — hand the cursor keep-alive back to real input.
+    ROUTER_SELFTEST.store(false, Ordering::Relaxed);
+    let takeover_cleared = sc::el0_takeover_active() == 0;
+    // INROUTE: the race window's own witness, printed BEFORE the verdict so a FAIL is always accompanied by
+    // its diagnosis. `revokes` counts slot teardowns that revoked the live focus while this test was
+    // measuring — the exact event that produced the historical `routed=1` flake. A healthy boot reads
+    // `revokes=0` here, because this runs before any user slot exists; anything else means a concurrent owner
+    // of the global focus has been reintroduced ahead of this call site and the count below cannot be trusted.
+    serial_println!(
+        "[inroute] router window — routed={} stale_dropped={} revokes={} gui_sent_delta={}",
+        routed,
+        stale_dropped as u8,
+        sc::el0_focus_revokes().wrapping_sub(revokes0),
+        sent1.wrapping_sub(sent0)
+    );
+    if routed == 2 && sent1 == sent0 {
+        serial_println!(
+            ":: USER: input router — routed=2 (key+mouse) to active-focus ring, Timer dropped, GUI_CHANNEL bypassed :: PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: USER: input router — routed={} gui_sent_delta={} :: FAIL ::",
+            routed,
+            sent1.wrapping_sub(sent0)
+        );
+    }
+    if push_does_not_engage
+        && stale_dropped
+        && live_suspends
+        && suspend_holds
+        && hung_releases
+        && other_asid_ignored
+        && unlatched_ignored
+        && rearm_fresh
+        && rearm_fires
+        && takeover_cleared
+    {
+        serial_println!(
+            "[uvug8] takeover deadline — push-does-not-engage, stale-launch-event-dropped, live-suspends, hung-app-releases (liveness bound restored), foreign/empty-latch-ignored, re-arm-fires, clear-on-focus-change :: PASS ::"
+        );
+    } else {
+        serial_println!(
+            "[uvug8] takeover deadline — push_no_engage={} stale_dropped={} live_suspends={} suspend_holds={} hung_releases={} other={} unlatched={} rearm_fresh={} rearm_fires={} cleared={} :: FAIL ::",
+            push_does_not_engage, stale_dropped, live_suspends, suspend_holds, hung_releases,
+            other_asid_ignored, unlatched_ignored, rearm_fresh, rearm_fires, takeover_cleared
+        );
+    }
+}
+
+/// UVUG-6 QEMU witness: prove a held key whose release was DROPPED by a full EVENT_QUEUE can never repeat
+/// forever. QEMU raspi4b delivers no HID, so the tracker is driven directly through its public `pal` seams:
+///   (A) baseline — a report-level press then a due tick injects the repeat (repeat works at all);
+///   (B) backpressure — with EVENT_QUEUE past half full, a due tick REFUSES to inject (the guard that keeps a
+///       stuck repeat from saturating the ring and starving real input);
+///   (C) dropped-KeyUp — the release NEVER rides the queue; only a report-level release (empty held set) is
+///       fed. The tracker disarms, and no repeat is EVER produced across many due ticks — the P51 wedge shut.
+/// UVUG-9 adds the fix-DURABILITY legs for the evidence gate that decides which liveness window applies. The
+/// gate must latch on a genuine idle re-report and on nothing else, because one false latch re-imposes the 1 s
+/// window for the whole boot and brings the ~10-repeat stop straight back:
+///   (D) two-key ROLLOVER RELEASE (press a, press b, release a) — no press edge and the armed key still held,
+///       which is exactly the shape of an idle re-report except that the held SET shrank. Must NOT latch.
+///   (E) NON-ASCII TAP while holding (an F-key maps to ascii 0, so both its press and its release reach the
+///       tracker as unchanged-held reports and the byte-identical test alone cannot see them). Must NOT latch,
+///       which is what the `IDLE_RUN_TO_LATCH` run threshold buys.
+///   (F) genuine idle re-reports — an unchanged held set repeated past the threshold. MUST latch, so the P51
+///       wedge guard still arms on the hardware it was written for.
+/// PAL-TYPEMATIC adds the CHAIN B legs — the defect KEYSTAT traced and specified but could not fix in its lane
+/// (a liveness lapse never re-armed, and the streaming verdict was boot-wide, so a hold could stop dead with
+/// the key still down and nothing on the wire):
+///   (G) LAPSE THEN STILL-HELD — the lapse disarms, then a report whose held set still contains the key must
+///       RE-ARM it and repeat again, with no release and no re-press anywhere in the sequence.
+///   (H) LAPSE THEN RELEASED — the same lapse, but the next report's held set is empty. The release outranks
+///       the parked key absolutely: nothing re-arms and no repeat is ever produced. This is the leg that
+///       proves the re-arm did not reopen the P51 stuck-repeat hole it sits next to.
+///   (I) VERDICT SCOPED TO ITS HOLD — latch the streaming verdict legitimately, then end the hold; the verdict
+///       must be gone, so the NEXT hold is judged on its own evidence rather than inheriting this one's.
+/// Runs once on the BSP before any input/render service task, when EVENT_QUEUE is empty; drains what it pushes.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn typematic_selftest() {
+    use unaos_kernel::pal;
+    while pal::next_event().is_some() {} // start from an empty ring
+    // (A) baseline: press 'x' at the report level, force the repeat due, expect one synthesised 'x'.
+    pal::typematic_note_report(b'x', &[b'x']);
+    pal::typematic_test_force_due();
+    let baseline = pal::typematic_tick() == Some(b'x');
+    while pal::next_event().is_some() {}
+    // (B) backpressure: still "held"; fill the ring past half full; a due tick must now suppress the inject.
+    pal::typematic_note_report(b'x', &[b'x']); // re-arm (baseline's tick advanced NEXT past due)
+    for _ in 0..(unaos_kernel::pal::QUEUE_SIZE_PUB / 2 + 4) {
+        pal::push_event(pal::Event::Key(b'z'));
+    }
+    pal::typematic_test_force_due();
+    let suppressed = pal::typematic_tick().is_none();
+    while pal::next_event().is_some() {}
+    // (C) dropped-KeyUp: feed ONLY a report-level release (empty held set) — no KeyUp ever touched the queue.
+    pal::typematic_note_report(0, &[]);
+    let mut repeated = false;
+    for _ in 0..64 {
+        pal::typematic_test_force_due();
+        if pal::typematic_tick().is_some() {
+            repeated = true;
+            break;
+        }
+    }
+    while pal::next_event().is_some() {}
+
+    // --- UVUG-9: evidence-gate durability. Each leg starts from a clean tracker. ---
+    // (D) rollover release: 'a' down, 'b' down, 'a' released. The final report has no press edge and the armed
+    //     key ('b') is still held — an idle re-report's shape — but the held set changed, so it must not latch.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'a', &[b'a']);
+    pal::typematic_note_report(b'b', &[b'a', b'b']);
+    pal::typematic_note_report(0, &[b'b']); // 'a' released; no press edge; 'b' still armed + held
+    let rollover_clean = !pal::typematic_test_streams_latched();
+
+    // (E) non-ascii tap while holding: an F-key contributes no ascii, so its press and release both arrive as
+    //     unchanged-held reports. Two of them must stay under the run threshold and must not latch.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'b', &[b'b']);
+    pal::typematic_note_report(0, &[b'b']); // F-key down  — invisible in the ascii projection
+    pal::typematic_note_report(0, &[b'b']); // F-key up    — likewise
+    let nonascii_clean = !pal::typematic_test_streams_latched();
+
+    // (F) genuine idle re-reports: the same held set, repeated past the threshold, MUST latch — otherwise the
+    //     P51 wedge guard would never arm on the streaming hardware it exists for.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'b', &[b'b']);
+    for _ in 0..(pal::TYPEMATIC_IDLE_RUN_TO_LATCH + 1) {
+        pal::typematic_note_report(0, &[b'b']);
+    }
+    let idle_latches = pal::typematic_test_streams_latched();
+    pal::typematic_test_reset();
+    while pal::next_event().is_some() {}
+
+    // --- PAL-TYPEMATIC: chain B. The lapse must RE-ARM on evidence, and the verdict must expire with its hold.
+    // (G) LAPSE THEN STILL-HELD: a liveness lapse disarms 'g', but the next report still carries 'g' in its
+    //     held set. That report is proof the lapse's inference was wrong, so the repeat must resume — WITHOUT
+    //     a release and re-press, which is exactly what KEYSTAT recorded as the missing behaviour.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'g', &[b'g']);
+    pal::typematic_test_force_lapse();
+    let lapse_disarms = pal::typematic_test_armed().is_none();
+    pal::typematic_note_report(0, &[b'g']); // no press edge — only "still held"
+    let lapse_rearms = pal::typematic_test_armed() == Some(b'g');
+    pal::typematic_test_force_due();
+    let rearm_repeats = pal::typematic_tick() == Some(b'g');
+    while pal::next_event().is_some() {}
+
+    // (H) LAPSE THEN RELEASED: the same lapse, but the next report's held set is EMPTY. A release outranks the
+    //     parked key absolutely — nothing may re-arm, and no repeat may EVER be produced afterwards. This is
+    //     the leg that keeps the re-arm from reopening the P51 stuck-repeat hole.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'h', &[b'h']);
+    pal::typematic_test_force_lapse();
+    pal::typematic_note_report(0, &[]); // released
+    let release_beats_lapse = pal::typematic_test_armed().is_none();
+    let mut ghost_repeat = false;
+    for _ in 0..64 {
+        pal::typematic_test_force_due();
+        if pal::typematic_tick().is_some() {
+            ghost_repeat = true;
+            break;
+        }
+    }
+    while pal::next_event().is_some() {}
+
+    // (I) VERDICT SCOPED TO ITS HOLD: latch the streaming verdict the legitimate way (leg F's shape), then end
+    //     the hold. The verdict must be GONE — boot-wide stickiness is the half of chain B that made a later
+    //     silent hold stop after ~15 repeats with nothing on the wire.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'i', &[b'i']);
+    for _ in 0..(pal::TYPEMATIC_IDLE_RUN_TO_LATCH + 1) {
+        pal::typematic_note_report(0, &[b'i']);
+    }
+    let hold_latches = pal::typematic_test_streams_latched();
+    pal::typematic_note_report(0, &[]); // the hold ends
+    let verdict_expires = !pal::typematic_test_streams_latched();
+    pal::typematic_test_reset();
+    while pal::next_event().is_some() {}
+
+    let chain_b = lapse_disarms
+        && lapse_rearms
+        && rearm_repeats
+        && release_beats_lapse
+        && !ghost_repeat
+        && hold_latches
+        && verdict_expires;
+
+    if baseline && suppressed && !repeated && rollover_clean && nonascii_clean && idle_latches && chain_b {
+        serial_println!(
+            ":: uvug6: typematic — baseline repeat OK, backpressure suppressed inject, report-level release disarmed dropped-KeyUp hold; UVUG-9 evidence gate: rollover-release + non-ascii-tap did NOT latch, genuine idle re-reports DID; PAL-TYPEMATIC chain B: a liveness lapse RE-ARMS on a still-held report and repeats again, a release outranks it with no ghost repeat, and the streaming verdict expires with its hold :: PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: uvug6: typematic — baseline={} suppressed={} repeated={} rollover_clean={} nonascii_clean={} idle_latches={} lapse_disarms={} lapse_rearms={} rearm_repeats={} release_beats_lapse={} ghost_repeat={} hold_latches={} verdict_expires={} :: FAIL ::",
+            baseline,
+            suppressed,
+            repeated,
+            rollover_clean,
+            nonascii_clean,
+            idle_latches,
+            lapse_disarms,
+            lapse_rearms,
+            rearm_repeats,
+            release_beats_lapse,
+            ghost_repeat,
+            hold_latches,
+            verdict_expires
+        );
+    }
+}
+
+/// PIUSB-23 (bare-metal aarch64): pump the xHCI controller from the scheduled input service and bridge
+/// decoded HID keys into the GUI channel. THE keyboard-goes-silent structural fix.
+///
+/// On the Pi baremetal+fb path, `kernel_main` spawns input/render then `hlt_loop`s the BSP, so the
+/// x86/virt GUI loop's xHCI hooks (poll_events + service_*) are never reached. After `piusb::enumerate`'s
+/// bounded pump returns, nothing consumes re-armed interrupt-IN transfer completions — so `xHCI: KEY`
+/// lines stop and USB keystrokes never move. This restores the pump on the input core:
+///   (1) `poll_events` drains transfer events; its HID decode (drivers/xhci/mod.rs) prints the
+///       `xHCI: KEY` serial witness and pushes each decoded key into `pal::EVENT_QUEUE`;
+///   (2) the deferred services run (same set the x86/virt loop runs), keeping enum/hub/HID-setproto work
+///       alive; then
+///   (3) queued keys are forwarded into `GUI_CHANNEL` in the SAME `Event::Key` shape UART bytes take
+///       (see `input_service`), so a USB keystroke reaches the shell/panel exactly like a serial byte.
+///
+/// The xHCI loan (WEDGE-8) is returned before the drain (its scope ends) so a backpressured
+/// `GUI_CHANNEL.send` never blocks while holding the controller. Same global handle `enumerate` seeded.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn pump_usb_into_gui() {
+    // WITSWEEP (SERWIT-2 reachability, baremetal leg): the aarch64 baremetal builds never reach the
+    // shared BSP loop below (the scheduler path owns them), so the mirror-tap announcement + one-shot
+    // verdict ride this pass instead — it runs from `usb_pump` (~4 ms cadence, metal) and from the
+    // `input_service` poll-nap branch (every cooperative pass, QEMU raspi4b), i.e. on every baremetal
+    // variant. Placed BEFORE the XHCI_CONTROLLER lock: `mirror_service` prints, and its contract is
+    // IRQs unmasked, no locks held, non-print context — all true at the top of a scheduled-task pass.
+    // A few relaxed atomic loads when quiet; prints only on un-announced loss + the one-shot verdict.
+    unaos_kernel::serial_ring::mirror_service();
+    // WEDGE-8 (F3): THE F3 HOLDER SITE. This claim is a LOAN, not a lock hold — the services below
+    // (service_storage's bring-up matrices reach `pump_until_bot_done`, budget hw_wait_budget()*3
+    // ≈ 8.3 s on a failing transfer) run with NO lock held, so a mid-service preemption of this
+    // task parks the CONTROLLER, not a lock every masked FS writer spins on. A Busy claim means a
+    // block-layer transaction is in flight; skip the pass — the next one is ~4 ms out.
+    if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
+        x.poll_events();
+        x.service_storage();
+        x.service_hubs();
+        x.service_hid_setproto();
+        x.service_ftdi();
+        x.service_slot_disposal();
+        x.service_enum();
+    }
+    // BOT-CENSUS-PI: the one-shot BOT phase-desync census (`:: BOT: phase … result=SUMMARY ::`) plus
+    // the USB topology dump. Its other two call sites ride the shared x86/virt BSP loop, which a Pi
+    // bare-metal boot NEVER reaches (the scheduler path owns those boots), so on the platform whose
+    // VL805 the counters were written to interrogate the counters incremented and the REPORT never
+    // fired — tag_mismatch/bad_sig/undrained/cbw_fault with no denominator. This pass is the Pi's
+    // equivalent site: it runs from `usb_pump` (~4 ms cadence, metal) and from the `input_service`
+    // poll-nap branch (every cooperative pass, QEMU raspi4b), i.e. on every bare-metal variant.
+    //
+    // PLACEMENT IS THE WHOLE TRICK: this call sits OUTSIDE the `claim()` loan scope above, after the
+    // `if let` block's closing brace has dropped the loan. Since WEDGE-8 `log_summary_once` claims its
+    // OWN loan internally, so calling it from inside the block would self-deny with `Busy` — and
+    // because the one-shot's N counter advances on EVERY call regardless of whether the claim
+    // succeeds, that would burn the single firing and suppress the census for the whole boot,
+    // permanently. Nothing between here and the loan's drop may re-claim the controller.
+    //
+    // Threshold unchanged (N == 2000, deliberately not retuned): at this pass's ~4 ms cadence that is
+    // ~8 s after the pump comes up, versus the x86 loop's frame cadence — late enough that boot
+    // enumeration has finished or visibly stalled, which is what the one-shot wants either way.
+    unaos_kernel::drivers::xhci::log_summary_once();
+    // UVUG-5 typematic: BEFORE the drain, synthesise a held key's repeat into EVENT_QUEUE so it rides this
+    // pass's routing exactly like a real key edge (`poll_events()` above already re-armed the HID rings and
+    // pushed any genuine edges). No key held / not yet due -> no-op; QEMU has no HID so this never fires.
+    if let Some(k) = unaos_kernel::pal::typematic_tick() {
+        unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(k));
+    }
+    // UVUG-10: producer/consumer accounting for EVENT_QUEUE itself. Placed BEFORE the routing branches so it
+    // reports on every pass regardless of which sink owns input this instant — the question it answers ("was
+    // a pointer event ever produced at all?") is independent of where events are being routed.
+    uvug10_evq_witness();
+    // PIUSB-24: bridge decoded KEYS **and** POINTER events (Mouse/MouseAbsolute/Button) into the GUI
+    // channel — the render task now moves the shared `pal::cursor` sprite from them (mirroring the x86
+    // console loop). The MOUSE-1 witness confirmed relative boot-mouse reports arrive on metal; before
+    // this arc the drain forwarded Key alone and silently dropped every pointer report. Timer/None/
+    // Unknown are still dropped here (Timer is the render task's own status pulse; None/Unknown carry
+    // nothing) so EVENT_QUEUE never accretes on the Pi's channel-based path.
+    //
+    // GUI-CLICK-2: when a full-screen app owns the screen (SCREEN_APP_ACTIVE — set around
+    // dispatch_command in handle_key), do NOT drain EVENT_QUEUE into GUI_CHANNEL. render_service is
+    // blocked inside that command and cannot recv, so every forward here would (a) steal the app's
+    // input (the app polls the SAME EVENT_QUEUE via pump_and_poll — incl. the exit click) and
+    // (b) fill the 64-slot GUI_CHANNEL until `send` blocks this pump task, the metal fps-decay
+    // mechanism. Leaving the events untouched hands them to the app's own drain and keeps the
+    // channel empty. Normal forwarding resumes the instant the command returns (flag cleared).
+    // poll_events() above still ran (it re-arms the HID rings + fills EVENT_QUEUE) — only the
+    // forward is suppressed, and the app's pump_and_poll is the sole consumer meanwhile.
+    // INPUT-WIRE (ELF-5 router fold): when a user program holds input focus (its ASID registered via
+    // `user_input_set_active` in `run_user_image`), route the drained pal events into ITS per-process ring
+    // through the `user_input_enqueue` seam — keyboard AND mouse — instead of GUI_CHANNEL. The user app is
+    // the SOLE consumer of that ring (it polls via SYS_INPUT_POLL); it cannot reach EVENT_QUEUE, so — unlike
+    // the SCREEN_APP_ACTIVE kernel-app gate below, which LEAVES events in EVENT_QUEUE for the app's own
+    // `pump_and_poll` drain — we DRAIN here (a left event would never be consumed and would just age out of
+    // the 64-slot queue). This check takes PRECEDENCE over SCREEN_APP_ACTIVE: the `run` shell command
+    // dispatches through `dispatch_command` (which sets SCREEN_APP_ACTIVE), so both flags are live during an
+    // user `run`, and the user ring is the real sink. `poll_events()` above already re-armed the HID rings and
+    // filled EVENT_QUEUE; only the destination changes.
+    //
+    // Watchdog / escape hatch (UVUG-5 correction): the `run` command sets SCREEN_APP_ACTIVE and calls
+    // `gui_watchdog::on_app_enter`, arming the 5 s wedge watchdog for the user program too. But a user app
+    // drains input through SYS_INPUT_POLL, NOT the kernel `pump_and_poll` that feeds `note_progress` — so the
+    // watchdog saw no heartbeat and FALSELY reclaimed a healthy, polling UVUG at 5 s (P47's `[gui] watchdog
+    // app wedged 5s`). `sys_input_poll` now calls `note_progress` on every poll (the user twin of the kernel
+    // app's per-drain heartbeat), so a live user app is never falsely wedged; a genuinely dead one still loses
+    // the screen at the timeout. `run_user_image` clears the focus on return, so the router reverts to the
+    // GUI_CHANNEL / SCREEN_APP_ACTIVE paths the instant the program exits — the shell regains the keyboard.
+    if unaos_kernel::arch::aarch64::syscall::user_input_active() != 0 {
+        route_input_to_active_el0();
+        click2_depth_witness();
+        return;
+    }
+    if SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+        // Non-destructively witness a pending press for the `[click2] input left for app` line, then
+        // hand every event back to the app untouched. Drain into a fixed buffer (queue is bounded to
+        // 64), scan for a Button, re-push in original order. No heap; the queue is empty for only the
+        // few instructions between drain and re-push (the app's next pump_and_poll pass re-reads it).
+        //
+        // UVUG-10: this peek runs through the UNCOUNTED re-circulation seam
+        // (`peek_event_uncounted` / `requeue_event`). Nothing is produced or consumed here — the same
+        // events go round again every pass, ~250×/s for as long as a kernel app owns the panel — so
+        // counting them would inflate `[uvug10] evq`'s push/pop (and, on a deep ring, drop) precisely in
+        // the state where a stalled drain is the hypothesis under test.
+        // WC-TAB: the TAB interception lives INSIDE this scan, not below the branch. This gate — not the
+        // `user_input_active() != 0` one above — is the gate that actually holds while focus sits in the
+        // ring's shell slot, and getting that backwards is what made the first cut of this fix a no-op.
+        // `handle_key` sets SCREEN_APP_ACTIVE around `dispatch_command` and it stays set for the WHOLE user
+        // run: `run_user_image` parks the shell task in its wait loop until the program returns. So with
+        // apps live and focus TAB'd out to the shell, BOTH flags were live, this branch returned first,
+        // and the TAB was requeued forever — the exit stayed one-way. (The complement, focus 0 with
+        // SCREEN_APP_ACTIVE clear, could not hold two ring entries BEFORE BGRUN-1: a live app implied a
+        // parked shell. BGRUN-1 falsifies that — `bg` apps live across the prompt, so focus 0 + flag
+        // clear + a full ring is now the NORMAL state; it is handled because this drain calls
+        // `wc_shell_focus_key` too, not because the state cannot arise.)
+        //
+        // It has to be done HERE and not by forwarding the remainder onward: `render_service` is blocked
+        // inside the same `dispatch_command`, so anything pushed into the 64-slot GUI_CHANNEL would sit
+        // there until `send` blocks this pump task. That saturation is precisely what this branch exists
+        // to prevent, so the fix stays within its discipline — peek, consume, requeue — and never sends.
+        //
+        // A consumed TAB DISCARDS the whole buffer rather than requeuing it. That is not a new policy: it
+        // is exactly what `user_input_set_active` would have done to these same events itself, since it
+        // drains `pal::EVENT_QUEUE` on every real focus change. They are outside the queue for a few
+        // instructions only because this uncounted peek is holding them, and a fresh focus starts clean.
+        let mut buf: [unaos_kernel::pal::Event; 64] =
+            [unaos_kernel::pal::Event::None; 64];
+        let mut n = 0usize;
+        let mut saw_button = false;
+        let mut cycled = false;
+        while n < buf.len() {
+            match unaos_kernel::pal::peek_event_uncounted() {
+                Some(ev) => {
+                    // WC-TAB: `true` from `wc_shell_focus_key` means CONSUMED, which is not the same as
+                    // FOCUS MOVED. Its swallow arm also returns true for the RELEASE edge of a Tab whose
+                    // press was consumed — no `user_input_set_active`, hence no focus change and no
+                    // compensating EVENT_QUEUE drain. That edge arrives on a LATER poll than the press
+                    // and can be batched behind real input: TAB out of the ring, then a click, and the
+                    // queue is [Button, Mouse, KeyUp(9)]. Treating the swallow as a cycle would drop the
+                    // held buffer and suppress the click witness — destroying a mouse click on every TAB
+                    // out of the ring, since every such TAB produces this release edge.
+                    //
+                    // So gate on an ACTUAL transition: snapshot the active ASID and compare. This is the
+                    // same test the bare-shell drain below makes before it breaks, which is the symmetry
+                    // that was the point of having one shared body.
+                    let before = unaos_kernel::arch::aarch64::syscall::user_input_active();
+                    if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) {
+                        if unaos_kernel::arch::aarch64::syscall::user_input_active() != before {
+                            cycled = true;
+                            break; // focus moved; the next pass routes to the newly-focused app
+                        }
+                        // Swallow-only: the event is gone (never requeued, so account it), but the
+                        // buffer is still the app's and the scan carries on exactly as before.
+                        unaos_kernel::pal::note_uncounted_discard(1);
+                        continue;
+                    }
+                    // UVUG-6: typematic is fed at the HID report level, not from this drain.
+                    if matches!(ev, unaos_kernel::pal::Event::Button(_)) {
+                        saw_button = true;
+                    }
+                    buf[n] = ev;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        if cycled {
+            // The buffered events and the consumed TAB leave the pipeline here and are never requeued.
+            // They were counted on the way in by `push_event`, so count them out too — otherwise
+            // `[uvug10] evq`'s `push - drop - pop` occupancy reads permanently high by `n + 1` per cycle.
+            unaos_kernel::pal::note_uncounted_discard(n + 1);
+        } else {
+            for ev in buf.iter().take(n) {
+                unaos_kernel::pal::requeue_event(*ev);
+            }
+        }
+        if saw_button && !cycled {
+            click2_left_witness();
+        }
+        click2_depth_witness();
+        return;
+    }
+    while let Some(ev) = unaos_kernel::pal::next_event() {
+        // WC-TAB: the same interception on the bare-shell drain — no user focus AND no screen app. The
+        // SCREEN_APP_ACTIVE branch above carries the case that matters for a live ring; this one keeps
+        // the two shell paths behaving identically rather than leaving a second, subtly different TAB.
+        // `wc_shell_focus_key` shares the in-ring predicate, so TAB is consumed ONLY when there are at
+        // least two windows to rotate through; otherwise it falls through untouched and reaches the
+        // console exactly as before (`handle_key` ignores byte 9 — there is no completion or other shell
+        // binding on TAB to clobber).
+        //
+        // BREAK, not continue: a consumed TAB has just moved focus, so every remaining event in this
+        // drain now belongs to the newly-focused app, not to GUI_CHANNEL. The in-ring path is
+        // self-correcting — it re-reads the active ASID per event — but this loop's destination is fixed
+        // at `gui_send`, so it would keep posting the new focus's keystrokes to the console. Re-read the
+        // active ASID and leave the loop; the next pump pass takes the routing branch.
+        // Same transition test as the branch above, written the same way: a consumed TAB may be the
+        // swallowed release edge rather than a cycle, and only a real move invalidates this loop's
+        // destination. (Events here come off the COUNTED `next_event`, so no discard accounting is owed —
+        // unlike the uncounted peek above.)
+        let before = unaos_kernel::arch::aarch64::syscall::user_input_active();
+        if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) {
+            if unaos_kernel::arch::aarch64::syscall::user_input_active() != before {
+                break;
+            }
+            continue;
+        }
+        // UVUG-6: typematic is fed at the HID report level (see pal::typematic_note_report), not this drain.
+        match ev {
+            unaos_kernel::pal::Event::Key(_) => {
+                uvug9_shell_input_witness(true);
+                gui_send(ev)
+            }
+            unaos_kernel::pal::Event::Mouse { x, y } => {
+                uvug9_shell_input_witness(false);
+                piusb24_pointer_witness(x, y, None);
+                gui_send(ev);
+            }
+            unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                uvug9_shell_input_witness(false);
+                piusb24_pointer_witness(x, y, None);
+                gui_send(ev);
+            }
+            unaos_kernel::pal::Event::Button(mask) => {
+                uvug9_shell_input_witness(false);
+                piusb24_pointer_witness(0, 0, Some(mask));
+                // CLICK-ROUTE — click-to-focus from the SHELL slot. Focus is 0 here, so today every
+                // button goes to `gui_send` -> `click1_dispatch`, whose only hit-test is console vs
+                // status strip: a click on a live window (a `bg` app's, say) does nothing at all.
+                // `wc_click_route` hit-tests the pointer against the window layer; on a hit it raises
+                // that window through the ordinary focus primitive, and the press then belongs to the
+                // app, not the console. On a MISS it consumes nothing and the console keeps the click.
+                //
+                // BREAK on a raise, exactly as the TAB interception above breaks and for the same
+                // reason: this loop's destination is fixed at `gui_send`, but focus has just moved, so
+                // every remaining event belongs to the newly-focused app. The next pump pass takes the
+                // `user_input_active() != 0` routing branch and re-reads the target per event.
+                //
+                // The press itself is delivered HERE rather than left for that next pass because
+                // `user_input_set_active` DRAINS `pal::EVENT_QUEUE` as part of granting focus (a fresh
+                // focus starts clean — the UVUG-8r2 contract), so an event left behind would not
+                // survive the raise. `user_input_enqueue` funnels back through `wc_click_route`, which
+                // sees no edge the second time (the mask tracker already advanced) and delivers.
+                //
+                // POSITION FRESHNESS, stated: on this path the shared cursor is moved by
+                // `render_service`'s Mouse arms, one GUI_CHANNEL hop downstream, so the hit-test reads
+                // the position as of the last motion report the render task has already consumed. A
+                // click is preceded by the pointer coming to rest, so the lag is nil in practice; the
+                // user-focus path has no such gap (the router moves the cursor itself — FOCUS-VIS).
+                let before = unaos_kernel::arch::aarch64::syscall::user_input_active();
+                if unaos_kernel::arch::aarch64::syscall::wc_click_route(ev) {
+                    continue;
+                }
+                if unaos_kernel::arch::aarch64::syscall::user_input_active() != before {
+                    unaos_kernel::arch::aarch64::syscall::user_input_enqueue(ev);
+                    break;
+                }
+                gui_send(ev);
+            }
+            _ => {}
+        }
+    }
+    click2_depth_witness();
+    // PIUSB-28: fire the FAT mount from the path that ACTUALLY runs on Pi baremetal+fb. PIUSB-27
+    // wired `piusb27_service()` beside `probe_once` in the main/GUI loop — but that loop never runs
+    // on Pi metal (kernel_main spawns services and hlt_loops; the PIUSB-22 structural finding, which
+    // is why `usb_pump` exists), so the mount never fired on hardware (zero `piusb27` lines, P35).
+    // This pump path runs on metal (the `usb_pump` ~4 ms task) and in QEMU raspi4b (the input
+    // service's poll-nap fallback), so the storage-ready edge is finally polled where it matters.
+    //
+    // LOAN DISCIPLINE (was DEADLOCK): the mount re-claims the xHCI loan via `read_block_usb`, so it
+    // MUST run outside any scope holding the loan — a claim while we still held it would return
+    // Busy and the mount would fail for the pass. The loan above is returned at the end of its
+    // `if let` scope (before the event-drain loop), so we are loan-free here. The edge is one-shot
+    // per raise (`take_usb_ready`), so calling it every ~4 ms pass is a cheap no-op until a stick's
+    // bring-up raises it, then it mounts + witnesses once (and again on every hot-plug re-enum).
+    if !PIUSB28_ARMED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(":: piusb28: mount-trigger armed (pi pump path) ::");
+    }
+    unaos_kernel::fs::fat::piusb27_service();
+}
+
+/// PIUSB-24: rate-limited (~4 Hz) `[piusb24]` serial witness of a pointer report reaching the GUI
+/// bridge — dx/dy for motion (relative or absolute payload) or the button bitmask for a click edge.
+/// A moving mouse emits reports far faster than serial should mirror, so log at most every ~250 ms;
+/// button edges are rare and always logged (they bypass the throttle via the `buttons` arm).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn piusb24_pointer_witness(dx: i32, dy: i32, buttons: Option<u8>) {
+    use core::sync::atomic::Ordering;
+    if let Some(mask) = buttons {
+        serial_println!("[piusb24] pointer buttons=0b{:08b}", mask);
+        return;
+    }
+    let now = unaos_kernel::arch::ms();
+    let last = PIUSB24_LAST_LOG_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= 250 || last == 0 {
+        PIUSB24_LAST_LOG_MS.store(now.max(1), Ordering::Relaxed);
+        serial_println!("[piusb24] pointer dx={} dy={}", dx, dy);
+    }
+}
+
+/// UVUG-9 — the SHELL-PATH input bisect for the dead-mouse-after-timeout symptom (P54b metal fact 2: once a
+/// UVUG run timed out, arrow keys still reached the shell but the mouse produced no cursor and no effect, for
+/// the rest of the boot).
+///
+/// The pointer's journey to the shell has four stages: xHCI decodes the interrupt-IN report and pushes a
+/// `pal::Event`; the router drains `EVENT_QUEUE`; `gui_send` forwards into `GUI_CHANNEL`; `render_service`
+/// moves the cursor sprite. Existing witnesses bracket the ends — `MOUSE-1` counts reports at the xHCI decode,
+/// `[click2] depth` counts `GUI_CHANNEL` traffic — but neither separates "the pointer stopped being decoded"
+/// from "the pointer is decoded but no longer reaches the shell path", and those two have completely different
+/// owners. This line closes that gap by counting keys and pointer events SEPARATELY at the shell-destined
+/// drain, which is precisely the branch that resumes when `run_user_image` drops focus.
+///
+/// Reading it at P55, with the mouse dead at the shell:
+///   * `MOUSE-1` still counting while `ptr=` here is frozen -> the loss is between the decode and this drain
+///     (the user ring / router / EVENT_QUEUE seam) — this lane.
+///   * `MOUSE-1` ALSO frozen while `key=` here keeps advancing -> the pointer interrupt-IN endpoint stopped
+///     completing or stopped being re-armed, and the loss is upstream of every input path in this file. Note
+///     that `drivers::xhci`'s dup-Success guard (`mouse_expect_phys`) returns from the transfer dispatch
+///     WITHOUT calling `queue_mouse_read`, so a single mismatched completion retires the pointer read forever
+///     while the keyboard's independently-armed endpoint carries on — the exact asymmetry P54b describes, on
+///     the endpoint that generates by far the most traffic. That file is outside this arc's lane, so this arc
+///     instruments the question rather than changing the driver; P55's reading of these two counters decides it.
+/// Rate-limited to ~2 s and printed only when something actually arrived, so an idle shell stays silent.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn uvug9_shell_input_witness(is_key: bool) {
+    use core::sync::atomic::Ordering;
+    let n = if is_key {
+        UVUG9_SHELL_KEYS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        UVUG9_SHELL_PTRS.fetch_add(1, Ordering::Relaxed) + 1
+    };
+    let _ = n;
+    let now = unaos_kernel::arch::ms();
+    let last = UVUG9_SHELL_LAST_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= 2000 || last == 0 {
+        UVUG9_SHELL_LAST_MS.store(now.max(1), Ordering::Relaxed);
+        serial_println!(
+            "[uvug9] shell-path input key={} ptr={} (EVENT_QUEUE -> GUI_CHANNEL)",
+            UVUG9_SHELL_KEYS.load(Ordering::Relaxed),
+            UVUG9_SHELL_PTRS.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// UVUG-10 — the PRODUCER-side half of the pointer bisect, and the line that decides ownership of the P55b
+/// dead-mouse symptom in a single boot.
+///
+/// `[uvug9] shell-path` (below) counts pointer events at the router DRAIN and read `ptr=0` on metal forever,
+/// from boot, while the xHCI `MOUSE-1` witness reported a live pointer WITH REAL DELTAS. Those two witnesses
+/// bracket `pal::EVENT_QUEUE` without measuring it. The upstream half is now settled: the driver's
+/// `push_event(Event::Mouse)` precedes the `MOUSE-1` print in straight-line code with no fork between them,
+/// so `last dx=3 dy=5` proves the pointer events were pushed — **the loss is at or after the queue**.
+///
+/// The leading theory is the one this arc's fixture gate already kills: the boot `input_launcher` orphan
+/// held `user_input_active()` for the whole boot, so `route_input_to_active_el0` (above) swallowed the queue
+/// into a ring nothing would read, while keys still reached the shell through `input_service`'s direct
+/// `gui_send` — a path that bypasses EVENT_QUEUE entirely. This witness is what proves or refutes that on
+/// the wire instead of by argument.
+///
+/// Rate-limited by a PASS COUNTER, not wall-clock, for the same reason `[click2] depth` is: this pump also
+/// runs from the raspi4b poll-nap fallback where `arch::ms()` is pinned at 0 and a wall-clock throttle never
+/// holds. Printed only when a counter actually MOVED since the last line, so an idle machine (and the QEMU
+/// battery, where the only producers are the one-shot selftests) stays quiet after the first report instead
+/// of adding a periodic line to every log.
+///
+/// BASELINE: the boot selftests produce events too — `input_router_selftest` alone pushes a synthetic
+/// `Mouse{3,-4}`. "Never produced" therefore reads `push ptr=1`, not `push ptr=0` (QEMU's own line is
+/// `push ptr=1 key=38 / drop ptr=0 key=0 / pop=40`). Re-circulated events from the `SCREEN_APP_ACTIVE` peek
+/// are excluded at the source (`pal::requeue_event`), so these totals never inflate while an app owns the
+/// panel.
+///
+/// P56 verdict table, read against the `[uvug9]` line (fixture now gated off metal, so no orphan should
+/// exist and `user_input_active()` should be 0 all boot):
+///   * EXPECTED: `[uvug9] ptr` climbs with a moving mouse, `push ptr` climbs with it -> the orphan theory
+///     held and the fixture gate was also the mouse fix.
+///   * `[uvug9] ptr=0` STILL, no orphan alive -> orphan theory refuted, hunt resumes at/after the queue:
+///       - `push ptr>1`, `drop ptr≈push ptr` -> saturated ring behind a stalled drain (cross-read `depth`
+///         and `[click2] depth`).
+///       - `push ptr>1`, `drop ptr=0` -> a SECOND consumer takes them before the shell drain; `pop` far
+///         above the router's own `[uvug9]` totals names it (a user focus ring, or the focus-change
+///         pre-launch discard).
+///       - `push ptr=1` (selftest floor, unmoved) -> should be unreachable given the settled xHCI finding;
+///         if seen, the pointer endpoint stopped completing and the question returns to the driver lane.
+///         Confirm against `MOUSE-1`'s report count before concluding that.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn uvug10_evq_witness() {
+    use core::sync::atomic::Ordering;
+    let pass = UVUG10_EVQ_PASSES.fetch_add(1, Ordering::Relaxed);
+    if pass % UVUG10_EVQ_EVERY != 0 {
+        return;
+    }
+    let (push_ptr, push_key, drop_ptr, drop_key, pop) = unaos_kernel::pal::event_queue_stats();
+    // Fold the five totals into one value purely to detect "nothing moved" cheaply; the sum can alias in
+    // principle, but only across a window in which the counters changed by exactly offsetting amounts —
+    // impossible here, since every counter is monotonically increasing.
+    let fold = push_ptr
+        .wrapping_add(push_key)
+        .wrapping_add(drop_ptr)
+        .wrapping_add(drop_key)
+        .wrapping_add(pop);
+    if fold == UVUG10_EVQ_LAST_FOLD.swap(fold, Ordering::Relaxed) {
+        return; // nothing was produced or consumed since the last line — stay silent
+    }
+    serial_println!(
+        "[uvug10] evq push ptr={} key={} / drop ptr={} key={} / pop={} depth={}",
+        push_ptr,
+        push_key,
+        drop_ptr,
+        drop_key,
+        pop,
+        unaos_kernel::pal::event_queue_depth()
+    );
+}
+
+/// UVUG-10 `[uvug10] evq` pass throttle (~5 s at the metal ~250 Hz pump cadence) + the last-reported fold,
+/// so an unchanged snapshot is not reprinted.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static UVUG10_EVQ_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const UVUG10_EVQ_EVERY: u64 = 1250;
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static UVUG10_EVQ_LAST_FOLD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// UVUG-9 shell-path input counters + throttle (see `uvug9_shell_input_witness`).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static UVUG9_SHELL_KEYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static UVUG9_SHELL_PTRS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static UVUG9_SHELL_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// GUI-CLICK-2: rate-limited (~5 s) `[click2] input left for app` witness — proves a press edge
+/// arrived while a full-screen app owned the screen and was LEFT in EVENT_QUEUE for the app's own
+/// pump_and_poll (rather than forwarded into the render task's channel). The click that exits vug
+/// rides this path; the throttle keeps a held/chattering button from flooding serial.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn click2_left_witness() {
+    use core::sync::atomic::Ordering;
+    let now = unaos_kernel::arch::ms();
+    let last = CLICK2_LEFT_LAST_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= 5000 || last == 0 {
+        CLICK2_LEFT_LAST_MS.store(now.max(1), Ordering::Relaxed);
+        serial_println!("[click2] input left for app");
+    }
+}
+
+/// GUI-CLICK-2 (scope addition): rate-limited (~5 s) `[click2] depth` witness — the live GUI_CHANNEL
+/// queue depth (`GUI_SENT - GUI_RECV`) plus lifetime forwarded/received totals, so the metal serial
+/// carries the channel-saturation curve directly. Printed ALWAYS (both app-active and idle passes),
+/// so the fps-decay-under-vug mechanism is proven rather than inferred: depth spiking toward the
+/// 64-slot cap while an app runs is the backlog the SCREEN_APP_ACTIVE gate now prevents. (Exact
+/// `pal::EVENT_QUEUE` depth and heap-free would need accessors in pal.rs / allocator.rs — outside
+/// this arc's lane — so they are omitted here; GUI_CHANNEL depth is the direct suspect.)
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn click2_depth_witness() {
+    use core::sync::atomic::Ordering;
+    // Fire on pass 0, then once per CLICK2_DEPTH_EVERY passes — timer-independent (see the static's
+    // doc: raspi4b's stuck ms() would defeat a wall-clock throttle).
+    let pass = CLICK2_DEPTH_PASSES.fetch_add(1, Ordering::Relaxed);
+    if pass % CLICK2_DEPTH_EVERY == 0 {
+        let sent = GUI_SENT.load(Ordering::Relaxed);
+        let recv = GUI_RECV.load(Ordering::Relaxed);
+        let app = SCREEN_APP_ACTIVE.load(Ordering::Relaxed);
+        serial_println!(
+            "[click2] depth gui_chan={} (sent={} recv={}) app_active={}",
+            sent.wrapping_sub(recv), sent, recv, app
+        );
+    }
+}
 
 /// M5 (bare-metal aarch64): keyboard input as a scheduled kernel service. The OS runs its own input
 /// on the scheduler: instead of the BSP polling the PL011 inline, this kernel thread on a secondary
@@ -2110,7 +3835,7 @@ fn input_service(_: usize) {
                 serial_println!(":: INPUT: PL011 RX interrupt live — keyboard is interrupt-driven ::");
             }
             while let Some(byte) = unaos_kernel::arch::poll_input() {
-                GUI_CHANNEL.send(unaos_kernel::pal::Event::Key(byte));
+                gui_send(unaos_kernel::pal::Event::Key(byte));
             }
             serial::rearm_rx_interrupt(); // re-enable IMSC (no ICR — keeps a straggler's timeout)
             // Close the drain/re-arm gap: if a byte landed meanwhile, wake ourselves to drain it
@@ -2118,14 +3843,39 @@ fn input_service(_: usize) {
             if serial::rx_pending() {
                 serial::RX_READY.post();
             }
+            // PIUSB-26: the xHCI pump no longer rides this UART wake. PIUSB-23 pumped here, but the
+            // metal wake cadence is the RX ISR (keystrokes) or the ~5 Hz rx-backstop poke — so pointer
+            // reports batched to ~5 fps ("very very slow", P33). The dedicated `usb_pump` task now
+            // drains the controller at ~4 ms, leaving this keyboard/UART interrupt path untouched.
         }
     } else {
         // Poll-nap fallback (QEMU raspi4b: the RX ISR never fires). Cooperative — the AP's run() keeps
         // re-dispatching us; sleep_ticks would park forever with no timer IRQ to wake it.
+        //
+        // PULSE-STRIP: this branch also carries the strip's 1 Hz refresh pulse. On metal that pulse is
+        // the `status-tick` task, which is timer-gated and therefore NOT spawned here — so before this
+        // arc the status strip only ever refreshed in QEMU when a key arrived, and an always-running
+        // pulse would have been a frozen picture under the gate. Riding the existing poll-nap costs no
+        // task (KILLBOUND bounds the table at 8) and no timer: a wall-clock compare per cooperative
+        // pass. Gated on SCREEN_APP_ACTIVE for the same reason `status_tick` is — while a full-screen
+        // app owns the panel the render task is blocked inside dispatch_command and cannot drain
+        // GUI_CHANNEL, so an ungated 1 Hz post would slowly fill the 64-slot channel.
+        let mut strip_pulse_ms = unaos_kernel::arch::ms();
         loop {
             while let Some(byte) = unaos_kernel::arch::poll_input() {
-                GUI_CHANNEL.send(unaos_kernel::pal::Event::Key(byte));
+                gui_send(unaos_kernel::pal::Event::Key(byte));
             }
+            let now = unaos_kernel::arch::ms();
+            if now.wrapping_sub(strip_pulse_ms) >= unaos_kernel::ui_status::PSTRIP_PERIOD_MS {
+                strip_pulse_ms = now;
+                if !SCREEN_APP_ACTIVE.load(Ordering::Relaxed) {
+                    gui_send(unaos_kernel::pal::Event::Timer);
+                }
+            }
+            // PIUSB-23: pump xHCI + bridge decoded HID keys into GUI_CHANNEL each cooperative pass
+            // (QEMU raspi4b delivers no USB HID, so this is a cheap no-op there; on metal it consumes
+            // the re-armed interrupt-IN completions the enumerate() pump no longer services).
+            pump_usb_into_gui();
             unaos_kernel::arch::sched::yield_now();
         }
     }
@@ -2137,9 +3887,18 @@ fn input_service(_: usize) {
 /// redundantly pokes an empty FIFO (cheap). Never returns.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn rx_backstop(_: usize) {
+    // SPIN-4: phase markers — every prior theory about WHERE this task stalls (semaphore lock,
+    // run-queue lock, LL/SC false sharing) died with clean witnesses while the stall persisted.
+    // The task now states its own position: [spin1] prints phase+loops, so the stalled call names
+    // itself. 1 = about to sleep, 2 = returned from sleep / entering post.
+    use unaos_kernel::arch::sched::{RX_BS_LOOPS, RX_BS_PHASE};
+    use core::sync::atomic::Ordering;
     loop {
+        RX_BS_PHASE.store(1, Ordering::Relaxed);
         unaos_kernel::arch::sched::sleep_ticks(50); // ~200 ms at the 250 Hz per-core tick
+        RX_BS_PHASE.store(2, Ordering::Relaxed);
         unaos_kernel::arch::serial::RX_READY.post();
+        RX_BS_LOOPS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2154,6 +3913,101 @@ fn rx_backstop(_: usize) {
 ///
 /// Blocking on `recv` (vs a poll-nap) means whenever there is no input this task is off the run queue
 /// entirely and its core WFI-idles; it wakes only when the input service sends, via the reschedule SGI.
+/// GUI-CLICK-1: the view a screen point falls in, in the *shared* GUI model. The Pi/x86 panel is a
+/// full-screen text console with the always-on status strip (`ui_status`) pinned to the bottom
+/// line-pitch band — there are no windows/buttons/close-boxes in the shared model, so those are the
+/// only two hit regions. `None` is impossible for an in-bounds point today (the two regions tile the
+/// panel) but is kept so the witness can name a miss if the model later grows insets.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[derive(Clone, Copy)]
+enum Click1Hit {
+    /// The bottom status strip (host / lease IP / wall clock) — `ui_status`'s one-line band.
+    Status,
+    /// The console / shell text area — the focused interactive view.
+    Console,
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+impl Click1Hit {
+    fn name(self) -> &'static str {
+        match self {
+            Click1Hit::Status => "status",
+            Click1Hit::Console => "console",
+        }
+    }
+}
+
+/// GUI-CLICK-1: hit-test a cursor position against the shared GUI model. Mirrors `ui_status::draw`'s
+/// geometry exactly (`band_y = height - line_h`) so the strip's drawn band and its click target can
+/// never disagree. A point on or below `band_y` hits the status strip; everything above it is the
+/// console. Read-only — takes the same public `metrics()`/`height()` the strip draw uses.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn click1_hit_test(y: i32, pal: &unaos_kernel::pal::TargetPal<'_>) -> Option<Click1Hit> {
+    use unaos_kernel::pal::GneissPal;
+    let h = pal.height() as i32;
+    let line_h = pal.metrics().line_h as i32;
+    let band_y = h.saturating_sub(line_h);
+    if y < 0 || y >= h {
+        None
+    } else if y >= band_y {
+        Some(Click1Hit::Status)
+    } else {
+        Some(Click1Hit::Console)
+    }
+}
+
+/// GUI-CLICK-1: rate-limited (~10 Hz) `[click1]` serial witness of a click reaching GUI dispatch —
+/// the cursor position, the button bitmask that produced the press edge, and the hit target's name
+/// (or `none` for a miss). Rare vs motion, but throttled so a chattering switch can't flood serial.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn click1_witness(x: i32, y: i32, mask: u8, hit: Option<Click1Hit>) {
+    use core::sync::atomic::Ordering;
+    let now = unaos_kernel::arch::ms();
+    let last = CLICK1_LAST_LOG_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= 100 || last == 0 {
+        CLICK1_LAST_LOG_MS.store(now.max(1), Ordering::Relaxed);
+        let target = hit.map(Click1Hit::name).unwrap_or("none");
+        serial_println!(
+            "[click1] x={} y={} btn=0b{:08b} hit={}",
+            x, y, mask, target
+        );
+    }
+}
+
+/// GUI-CLICK-1: dispatch a pointer-button report to the shared GUI model. Called from the render
+/// task's `Button` arm with the current sprite position (`pal::cursor::pos`). Acts on a PRESS edge
+/// only — a bit that went 0→1 since the last report (`CLICK1_PREV_MASK`) — so a press+release fires
+/// once and a held drag doesn't re-fire. On a press it hit-tests the cursor and delivers a click to
+/// the hit view: the console is the focused interactive view, so a click on it reasserts the shell's
+/// input line (focus/redraw — the same non-destructive activation the shared model already exposes,
+/// mirroring vug's "a click is a keystroke-equivalent activation of the focused view"); a click on
+/// the status strip only witnesses (it draws nothing interactive). Returns whether a repaint of the
+/// console is owed. Never touches the key or motion paths.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn click1_dispatch(
+    mask: u8,
+    console: &unaos_kernel::console::Console,
+    pal: &mut unaos_kernel::pal::TargetPal<'_>,
+) {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::pal::GneissPal;
+    let prev = CLICK1_PREV_MASK.swap(mask, Ordering::Relaxed);
+    // Newly-pressed bits: set now, clear before. No new press → nothing to dispatch (this is the
+    // release edge, or an unchanged held state).
+    let pressed = mask & !prev;
+    if pressed == 0 {
+        return;
+    }
+    let (x, y) = unaos_kernel::pal::cursor::pos(pal.width() as i32, pal.height() as i32);
+    let hit = click1_hit_test(y, pal);
+    click1_witness(x, y, mask, hit);
+    if let Some(Click1Hit::Console) = hit {
+        // Focus/activate the console: reassert its prompt + current input at the caret. Non-
+        // destructive (submits nothing, mutates no shell state); makes the click visibly land.
+        console.draw_input_line(pal);
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn render_service(_: usize) {
     use unaos_kernel::pal::GneissPal; // for pal.render()
@@ -2166,18 +4020,1065 @@ fn render_service(_: usize) {
     let mut console = unaos_kernel::console::Console::new();
 
     console.draw(&mut pal);
+    // PI-UI-2: the always-on GUI status strip (hostname / lease IP / UTC wall clock). Drawn AFTER the
+    // console each frame so it sits on top; refreshed at ~1 Hz by the `status_tick` task, which pings
+    // GUI_CHANNEL with an Event::Timer so this loop re-renders even with no keyboard input. Reads only
+    // public snapshot accessors (clock::now / net_phy::settled_ipv4) — no net/clock lock in this path.
+    unaos_kernel::ui_status::draw(&mut pal);
     pal.render();
+    serial_println!(":: UI2: status strip armed (host+ip+time, 1 Hz) ::");
+
+    // PIUSB-24: whether the cursor was drawn last pass, so the auto-hide transition erases the sprite
+    // exactly once when the ~1.5 s idle expires (mirrors the x86 console loop's CURSOR-HIDE). The
+    // status_tick Timer pulse (~1 Hz) provides the periodic wake this check rides on.
+    let mut cursor_was_visible = false;
+
+    // SCHED-6 — dirty-flag frame pacing. The pre-SCHED-6 loop recomposed the status strip
+    // (`ui_status::draw`: a heap `format!` of host/ip/clock + a full-width band fill + a glyph run)
+    // AND presented (`pal.render`) on EVERY inbound event. A USB mouse re-emits an interrupt-IN
+    // report every 8-10 ms whether or not it moved (and some send a null Mouse{0,0} at rest), so at
+    // idle the render core recomposed the strip ~100-125×/s for no visible change — c0 pegged at
+    // ~96-100% (P33). Now: pointer/button events move only the (cheap) cursor sprite and present;
+    // the strip is recomposed ONLY when its content can have changed — the 1 Hz status-tick Timer
+    // pulse — or when a Key redrew the console beneath it (so it stays on top). No-op pointer reports
+    // (null relative motion / an unchanged absolute position) draw nothing and do not present. A pass
+    // presents at most once, and only if something was actually drawn. Cursor latency is preserved:
+    // a real pointer report still redraws the sprite and presents in the same pass.
+    let mut last_abs: Option<(i32, i32)> = None;
+    // [sched6] witness accumulators (this task is the sole owner of the render core — plain locals,
+    // no atomics). Bracket each pass; report passes/s, presented composites/s, and the mean cycle
+    // cost of a presented pass, rate-limited to once every ~5 s.
+    let mut s6_passes: u64 = 0;
+    let mut s6_composites: u64 = 0;
+    let mut s6_cyc: u64 = 0;
+    let mut s6_last_ms = unaos_kernel::arch::ms();
 
     loop {
-        if let unaos_kernel::pal::Event::Key(c) = GUI_CHANNEL.recv() {
-            handle_key(c, &mut console, &mut pal);
+        // Block until an event arrives (recv parks the task — an idle render core burns nothing).
+        let ev = GUI_CHANNEL.recv();
+        GUI_RECV.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // GUI-CLICK-2 depth accounting
+        let t0 = unaos_kernel::arch::now_cycles();
+        s6_passes += 1;
+        // `dirty` — did this pass draw anything that must be presented? `strip_dirty` — must the
+        // status strip be (re)composed on top this pass?
+        let mut dirty = false;
+        // PULSE-STRIP: the strip has two redraw reasons and they are NOT the same reason.
+        // `strip_force` — something repainted the band underneath it (a console redraw on Key, a view
+        // redraw on Button); the strip owes an unconditional redraw on top, from cached loads.
+        // `strip_tick`  — the 1 Hz refresh pulse; sample the meters and redraw ONLY if the composed
+        // line or a quantized per-core load changed. This is the dirty-pacing split.
+        let mut strip_dirty = false;
+        let mut strip_tick = false;
+        match ev {
+            unaos_kernel::pal::Event::Key(c) => {
+                handle_key(c, &mut console, &mut pal);
+                // The console may repaint into the strip's bottom band — redraw the strip on top.
+                dirty = true;
+                strip_dirty = true;
+            }
+            // CURSOR-1: pointer motion moves the SHARED pointer state (`pal::cursor`, which
+            // `click1_dispatch` and the compositor both read) and repaints the system cursor into
+            // the FRONT framebuffer via `video::cursor` — save-under, one glyph cell, on top of the
+            // console and every window. It deliberately does NOT set `dirty`: the sprite bypasses
+            // the `Screen` back buffer entirely, so a pointer report costs a save + a few small
+            // fills over one cell, not a `Screen::flush` of the sprite's damage box. The pre-CURSOR-1
+            // code drew into the back buffer and erased with a hard-coded 0x1E1E1E, which is neither
+            // the desktop colour nor on top of a window.
+            unaos_kernel::pal::Event::Mouse { x, y } => {
+                // Relative motion (boot-mouse proto). A null report (no delta) is the idle-mouse
+                // keep-alive — draw nothing, do not present.
+                if x != 0 || y != 0 {
+                    unaos_kernel::pal::cursor::move_rel(
+                        x,
+                        y,
+                        pal.width() as i32,
+                        pal.height() as i32,
+                    );
+                    unaos_kernel::video::cursor::repaint();
+                }
+            }
+            unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                // Absolute report (0..=32767 HID space), same shared sprite. An unchanged position
+                // is an idle keep-alive — skip it (no motion, no repaint).
+                if last_abs != Some((x, y)) {
+                    last_abs = Some((x, y));
+                    unaos_kernel::pal::cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
+                    unaos_kernel::video::cursor::repaint();
+                }
+            }
+            // GUI-CLICK-1: a Button report carries no cursor motion — dispatch it against the shared
+            // GUI model at the current sprite position (hit-test → deliver to the hit view). Press
+            // edges only; the console's activation is a non-destructive focus/redraw of its input
+            // line. Emits the rate-limited `[click1]` witness. Key/motion paths are untouched.
+            unaos_kernel::pal::Event::Button(mask) => {
+                click1_dispatch(mask, &console, &mut pal);
+                dirty = true;
+                // A click may activate/redraw a view under the strip band — keep the strip on top.
+                strip_dirty = true;
+            }
+            // Timer (the 1 Hz status-tick pulse) is the strip's own refresh cadence: recompose it so
+            // the clock/lease advance even with no input. Other events carry nothing to draw.
+            unaos_kernel::pal::Event::Timer => {
+                strip_tick = true;
+            }
+            _ => {}
         }
-        pal.render();
+        // CURSOR-HIDE: take the sprite off the panel once when the auto-hide delay expires
+        // (reappearance is instant — the move_rel/set_abs arms above stamp the activity clock before
+        // drawing). CURSOR-1: `undraw` restores exactly the pixels the sprite covered, so the hide
+        // needs no present of its own — hence no `dirty`.
+        let cursor_vis = unaos_kernel::pal::cursor::visible();
+        if cursor_was_visible && !cursor_vis {
+            unaos_kernel::video::cursor::undraw();
+        }
+        cursor_was_visible = cursor_vis;
+        // Recompose the strip only when it was overdrawn (Key/Button) — unconditional, cached loads.
+        if strip_dirty {
+            unaos_kernel::ui_status::draw(&mut pal);
+            dirty = true;
+        } else if strip_tick {
+            // PULSE-STRIP: the paced path. `tick` samples the per-core meters at most once a second
+            // and returns whether it actually drew; an unchanged strip on an unchanged panel adds no
+            // present at all, which is what keeps the always-running pulse off the render core's back.
+            dirty |= unaos_kernel::ui_status::tick(&mut pal);
+        }
+        // Present at most once per pass, and only when something was actually drawn — a no-op report
+        // costs a bounded match + a couple of cycle reads, not a composite.
+        if dirty {
+            // CURSOR-1: `Screen::flush` copies back-buffer pixels over the front framebuffer's
+            // damaged rects, which would both clobber the sprite and invalidate its save-under. Take
+            // it off first, present, put it back on top.
+            //
+            // CURSOR-13: that bracket now lives INSIDE `Screen::flush`, around the desktop blit
+            // alone, and it is deliberately not restated here. `flush` is `present_background` (a raw
+            // desktop blit, which still needs the bracket) FOLLOWED BY the window composite (which
+            // must NOT be inside one). Wrapping the pair from out here put every flush-reached
+            // composite between an `undraw` and a `repaint`, so `cursor::sprite_plan()` returned
+            // `None` on 100% of those passes and compose-through could never engage — P74's
+            // `[cursor12] -> nosprite`, on both arches, for structural reasons. See `Screen::flush`
+            // for the full single-owner argument. The cost is unchanged (one restore/save/draw per
+            // present, just scoped to the half that needs it), and every other flush site on this
+            // arch — the boot present above, `rast_demo`, the `video::witness` fixtures — now gets
+            // the desktop bracket without having to remember it.
+            pal.render();
+            s6_composites += 1;
+        }
+        s6_cyc += unaos_kernel::arch::now_cycles().wrapping_sub(t0);
+        // Rate-limited [sched6] witness: incoming pass rate vs presented-composite rate + mean pass
+        // cost over the window (proves the pacing — presents track real activity, not the event rate).
+        let now = unaos_kernel::arch::ms();
+        let span = now.wrapping_sub(s6_last_ms);
+        if span >= 5000 {
+            let passes_per_s = s6_passes.saturating_mul(1000) / span.max(1);
+            let comps_per_s = s6_composites.saturating_mul(1000) / span.max(1);
+            let mean_cyc = s6_cyc / s6_passes.max(1);
+            serial_println!(
+                // PULSE-4: the strip's cadence moved to 4 Hz; this witness's own 5 s span is
+                // deliberately UNCHANGED (wire volume). The label names the strip's rate, not this
+                // line's, so it tracks `PSTRIP_PERIOD_MS` rather than restating a stale literal.
+                "[sched6] passes={}/s composites={}/s mean={} cyc/pass (dirty-paced strip@{}ms)",
+                passes_per_s,
+                comps_per_s,
+                mean_cyc,
+                unaos_kernel::ui_status::PSTRIP_PERIOD_MS
+            );
+            // SCHED-PRIO: the dispatch-share line, emitted on `[sched6]`'s cadence and immediately
+            // after it, so a capture reads "composites=N/s" and "who won the dispatches that produced
+            // them" as one pair. This is the only site that fires while a fleet is actually live —
+            // the scheduler's own two emitters are metal-only and boot-once respectively.
+            unaos_kernel::arch::sched::prio_witness();
+            s6_passes = 0;
+            s6_composites = 0;
+            s6_cyc = 0;
+            s6_last_ms = now;
+        }
     }
+}
+
+/// PI-UI-2 status-strip refresh pulse (metal only): once per `ui_status::PSTRIP_PERIOD_MS` (PULSE-4:
+/// 250 ms, was a hard-coded second — see that module's latency-budget note), post an `Event::Timer` to
+/// GUI_CHANNEL so the render task re-draws the status strip (lease IP / wall clock advance) even when
+/// no keystroke is arriving. Mirrors the `rx_backstop` shape — a tiny periodic wake, off the render
+/// core's critical path. Gated on `timer::is_live()` at spawn (a `sleep_ticks` nap needs the timer
+/// IRQ to wake); in QEMU raspi4b (no Group-1 IRQ) it is not spawned and the strip refreshes on input.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn status_tick(_: usize) {
+    loop {
+        // PULSE-4: the wake cadence is DERIVED from the strip's own sample period, not hard-coded
+        // beside it. This was `sleep_ticks(250)` — a literal second — and it is the OUTER term of the
+        // strip's latency budget: raising `PSTRIP_PERIOD_MS` alone would have left metal sampling at
+        // 1 Hz regardless, i.e. PULSE-4 doing nothing on the only machine whose panel Peter watches.
+        unaos_kernel::arch::sched::sleep_ticks(unaos_kernel::ui_status::PSTRIP_PERIOD_TICKS);
+        // GUI-CLICK-2: suppress the status-strip pulse while a full-screen app owns the screen.
+        // render_service is blocked inside dispatch_command and cannot drain GUI_CHANNEL, so an
+        // ungated Timer would fill the 64-slot channel in ~16 s at PULSE-4's 4 Hz — a re-run of the exact
+        // saturation the pointer-path gate prevents (and the strip is not visible under the app
+        // anyway). The pulse resumes the instant the command returns.
+        // GUI-WIRE: the watchdog escape hatch. If the active full-screen app has stopped making
+        // drain progress (poll() latches its own wedge witness), return input to the shell so the
+        // keyboard is never trapped inside a dead app. No-op when no app owns the screen.
+        if unaos_kernel::gui_watchdog::poll() {
+            SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+        if !SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+            gui_send(unaos_kernel::pal::Event::Timer);
+        }
+    }
+}
+
+/// PIUSB-26 (metal only): the xHCI event pump on its own cadence. PIUSB-23 wired `pump_usb_into_gui`
+/// into the input service's UART wake, so pointer/key events only drained on an RX interrupt or the
+/// ~5 Hz rx-backstop poke — batching a moving mouse to ~5 fps ("very very slow" on metal, P33). This
+/// dedicated task pumps at ~4 ms (`sleep_ticks(1)` at the 250 Hz per-core tick, matching interrupt-EP
+/// intervals of 8-10 ms), so ~60+ pointer reports/s reach the render task while the UART/keyboard
+/// interrupt path stays untouched. No busy-spin — it naps between passes. Gated on `timer::is_live()`
+/// at spawn like `rx_backstop`/`status_tick`; in QEMU raspi4b the input task's poll-nap fallback still
+/// pumps each cooperative pass. A rate-limited `[piusb26]` witness proves the idle-controller cost of a
+/// pass is micro (a `poll_events` on an empty event ring is cheap MMIO). Never returns.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn usb_pump(_: usize) {
+    use core::sync::atomic::Ordering;
+    loop {
+        unaos_kernel::arch::sched::sleep_ticks(1); // ~4 ms at the 250 Hz per-core tick
+        let t0 = unaos_kernel::arch::now_cycles();
+        pump_usb_into_gui();
+        let dt = unaos_kernel::arch::now_cycles().wrapping_sub(t0);
+        // Rate-limit the cost line to once every ~5 s (this loop runs ~250×/s).
+        let now = unaos_kernel::arch::ms();
+        let last = PIUSB26_LAST_LOG_MS.load(Ordering::Relaxed);
+        if now.wrapping_sub(last) >= 5000 || last == 0 {
+            PIUSB26_LAST_LOG_MS.store(now.max(1), Ordering::Relaxed);
+            serial_println!("[piusb26] pump pass {} cyc (~4 ms cadence, idle controller)", dt);
+        }
+    }
+}
+
+// ── SCHED-X86 ───────────────────────────────────────────────────────────────────────────────────
+// The x86 GUI handoff, mirroring the Pi's M5/M5b/PIUSB-26 split (`usb_pump` / `input_service` /
+// `render_service` above). Until this arc the x86 BSP fell into an inline GUI loop at the end of
+// `kernel_main` and NEVER entered the scheduler, which had two consequences the metal capture named:
+// every `bg`/`run` placed its ring-3 task on the calling core (core 0, `bg_place_cpu` =
+// `meter_current_cpu`), where nothing ever popped the run queue — 2 BGRUN spawns, zero
+// `wc-x86: SYS_WIN_CREATE`, zero `:: SYSCALL:` witnesses, both kills burning the full
+// `KILL_CONFIRM_MS` — and the pulse meter read `c0:0/0` while every other core read `0/263`.
+//
+// The three tasks below dismantle that loop into scheduled kernel services and the BSP joins the
+// scheduler via `sched::run_bsp(0)`. Two placement rules are LOAD-BEARING and are asserted at the
+// spawn site rather than left to comments:
+//
+//  1. `x86_usb_pump` and `x86_render_service` MUST be on DIFFERENT cores. `XHCI_CONTROLLER` is a raw
+//     `spin::Mutex`, not the scheduler's sleeping `Mutex`, and both tasks take it (the pump directly;
+//     the render side transitively, through `fat` block reads, `pal::pump_and_poll` inside a
+//     full-screen app, and the `usbinfo` verb). Kernel tasks ARE preempted (`timer_preempt` acts on
+//     any `current`, not just ring 3), so co-locating two preemptible takers of a raw spinlock on one
+//     core is a hard deadlock: preempt the holder and the spinner — which cannot yield — owns the
+//     core forever. Cross-core it is bounded spin, which progresses. No future task that touches xHCI
+//     may be added to the render core.
+//
+//     WITCORE: "asserted at the spawn site" held for these three tasks and NOWHERE ELSE, which is how
+//     the rule was already being broken by tasks spawned later: `irqstorage`'s `storage-svc` (a
+//     preemptible `XHCI_CONTROLLER` taker) placed itself on `online_aps().first()` — i.e. the render
+//     core — and the whole cooperative ring-3 fixture ladder did the same. The rule now lives in
+//     `arch::smp` (`worker_cpu` / `xhci_worker_cpu`), the split is published to it by
+//     `smp::publish_sched_split` below, and the resulting map is printed once as
+//     `:: SCHED-X86 PLACE: ... ::`. Ask that module for a core; do not re-derive one from
+//     `online_aps()`.
+//  2. `x86_input_service` PAINTS NOTHING. On x86 `pal::cursor::SPRITE_OWNS_PAINT` is true, so the
+//     cursor verbs drive the compositor sprite straight into the FRONT buffer; running them on the
+//     input core would put two cores on the panel. The routers (`wc_click_route`, `user_input_route`)
+//     move with the pixels for the same reason — `wc_click_route` mutates window-manager focus and
+//     repaints through `wm::focus_changed`, so it belongs on the render side. The input task is a
+//     pure forwarder, exactly like the Pi's.
+
+/// KEYREPEAT-X86 (Boot AL) — the x86 twin of the aarch64 pump's typematic call: synthesise a held
+/// key's repeat into `EVENT_QUEUE` once per device-service pass.
+///
+/// WHY IT IS A FUNCTION AND NOT AN INLINE CALL. x86 has THREE mutually-exclusive per-pass service
+/// loops that poll `ehci::service_ehci_hid` — the `usbdebug` terminal loop, the inline BSP console
+/// loop (taken when fewer than two APs came online, so the render/service split cannot be made), and
+/// `x86_usb_pump` (the SCHED-X86 device-service task, the normal desktop path). A repeat that only
+/// fired on one of them would be a boot-configuration-dependent keyboard, which is precisely the
+/// class of divergence GR21 spent two arcs removing from this driver. One body, three call sites.
+///
+/// PLACEMENT WITHIN A PASS mirrors aarch64 exactly: AFTER the HID service call that pushes this
+/// pass's genuine edges, so the tracker has already seen this pass's reports, and BEFORE any drain,
+/// so the injected `Event::Key` rides the identical routing a real press takes — `x86_input_service`
+/// forwards it over `GUI_CHANNEL_X86` to the render task, `wc_click_route`/`user_input_route` apply
+/// the same asid focus rules, and a focused ring-3 app receives it in its own per-process ring. No
+/// per-path code, no second routing policy, and `typematic_tick`'s own backpressure guard refuses to
+/// inject at all while `EVENT_QUEUE` is past half full, so a stuck repeat can never starve real HID.
+///
+/// A no-op without `ehcihid`: the tracker is compiled on x86 only alongside the decoder that feeds
+/// it (`pal.rs` §KEYREPEAT-X86), so a build without the EHCI HID path has no keyboard to repeat for.
+#[cfg(target_arch = "x86_64")]
+fn x86_typematic_pump() {
+    #[cfg(feature = "ehcihid")]
+    if let Some(k) = unaos_kernel::pal::typematic_tick() {
+        // WITNESS, once per boot. The `[keystat] typematic hold end` rollup already reports per-hold
+        // and per-boot repeat counts from shared code, but it only prints when a hold ENDS — so a
+        // capture taken mid-hold, or a boot where the operator never lifted the key, would show
+        // nothing at all and be indistinguishable from the tracker never having been reached. This
+        // line answers "did x86 synthesise a repeat, ever" at the first repeat, which is the single
+        // fact this arc must be falsifiable on.
+        static FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !FIRST.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            serial_println!(
+                ":: KEYREPEAT-X86: first synthesised repeat — key={:#04x} '{}' (host typematic armed on the EHCI keyboard) == witness ::",
+                k,
+                if (32..127).contains(&k) { k as char } else { '.' }
+            );
+        }
+        unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(k));
+    }
+}
+
+/// SCHED-X86: the DEVICE-SERVICE task — every per-pass call the dismantled BSP GUI loop made that
+/// touches hardware and no pixel. Owns the xHCI service family, the FAT/flight-recorder/boot-ledger
+/// pumps, the one-shot witness probes and the NIC drain. Pinned to the service core; never returns.
+///
+/// Cadence: `sleep_ticks(1)` ≈ 1 ms at the calibrated 1 kHz local-APIC tick. That is deliberately the
+/// SAME floor the old loop had — it ended each pass in `hlt()`, which the periodic timer broke once
+/// per tick — so this is a faithful translation of the service rate and not a boot-pace regression.
+#[cfg(target_arch = "x86_64")]
+fn x86_usb_pump(cpu: usize) {
+    serial_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu);
+    loop {
+        // Nap first: `spawn` puts us on the run queue immediately, and the framebuffer handoff on the
+        // BSP is still finishing. One tick costs nothing and keeps the first pass off that seam.
+        unaos_kernel::arch::sched::sleep_ticks(1);
+        // Poll xHCI, then run any deferred storage work (synchronous BOT transactions run here, in a
+        // safe non-event context).
+        //
+        // WEDGE-8: this is a LOAN, not a lock. The controller is taken out of the shared slot under
+        // a masked O(1) hold and handed back when `loan` drops at the end of this block, so the
+        // multi-second BOT chain that `service_storage` can start runs with NO driver lock held —
+        // which is what stops a preempted holder from deadlocking a masked FS waiter (the F3
+        // family). A failed `claim()` means another context holds the loan, or the controller is not
+        // installed yet; either way this pass skips, exactly as the old `if let Some` did on an
+        // empty slot.
+        if let Ok(mut loan) = unaos_kernel::drivers::xhci::claim() {
+            let xhci = &mut *loan;
+            xhci.poll_events();
+            // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` ahead of `service_storage`, so the console
+            // is armed before the deferred SCSI bring-up puts its multi-second chain on the wire.
+            xhci.service_ftdi();
+            xhci.service_storage();
+            xhci.service_hubs();
+            xhci.service_hid_setproto();
+            xhci.service_slot_disposal();
+            xhci.service_enum();
+        }
+        // EHCI-3 (ehcihid knob): poll the EHCI HID interrupt endpoints (internal rMBP
+        // keyboard/trackpad). Same polled-service spot as the xHCI hooks above.
+        #[cfg(feature = "ehcihid")]
+        unaos_kernel::drivers::ehci::service_ehci_hid();
+        // KEYREPEAT-X86: synthesise a held key's repeat into EVENT_QUEUE, which `x86_input_service`
+        // drains and forwards over GUI_CHANNEL_X86 exactly as it does a real press.
+        x86_typematic_pump();
+        // BATMON-1 — the SMC accumulator, restored to a path a normal GUI boot actually reaches.
+        //
+        // This call existed at main.rs:972, but that site sits inside `#[cfg(feature = "usbdebug")]`
+        // whose loop is TERMINAL (`hlt()`, no break), so on a stock GUI boot it never ran. The only
+        // other site is `pci::init` — one shot at boot, never repeated. The in-kernel vug demo had
+        // the third, and ee6bfd97 deleted it. Net effect on metal: an idle desktop produced ZERO
+        // `:: PWR: ::` lines for its entire uptime, while a boot with a render loop running produced
+        // one every ~10 s. The rollup needs `samples > 0` and nothing was accruing them.
+        //
+        // `refresh_if_due` throttles itself to ~1 s of real SMC port I/O, so calling it from the
+        // device-service pass costs a timestamp compare on the other passes. When the igpu lane's
+        // `ui_tick_service()` lands this moves there; the call belongs on a per-pass service body
+        // either way, and this task is that body.
+        #[cfg(all(target_arch = "x86_64", feature = "smc"))]
+        unaos_kernel::drivers::smc::battery::refresh_if_due();
+        // STOR-1 (irqstorage knob): bring up the interrupt-driven storage service task once a block
+        // device is present, then run the `bx-blockreq` self-test once. Both one-shot + gated.
+        #[cfg(feature = "irqstorage")]
+        {
+            unaos_kernel::drivers::xhci::irqstorage::start_service_once();
+            unaos_kernel::drivers::xhci::irqstorage::selftest_once();
+        }
+        // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI lock
+        // released; `read_block` re-locks it briefly.
+        unaos_kernel::fs::fat::probe_once();
+        // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
+        // the first loop site. This is the pass the GUI/desktop boot reaches, i.e. the metal boot.
+        #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
+        unaos_kernel::selfhost::verify_source_once();
+        // DESKTOP-APP (wc knob): the deferred half of kernel-apps eviction move #1. `wcx::activate`
+        // used to open a kernel-drawn demo window at the Kepler takeover seam; it now ARMS a launch
+        // there and this pass performs it, putting `STAT.ELF` on the desktop as a real ring-3 process
+        // with a real ASID instead of ~110 lines of ring-0 furniture.
+        //
+        // HERE and nowhere else, for three reasons the function's own doc spells out: the launch
+        // reads the FAT volume (an `XHCI_CONTROLLER` taker, which the placement rule above forbids on
+        // the render core), it spawns onto `bg_place_cpu()` = the CALLER's core, so the caller must
+        // be a core that actually dispatches (the BSP's inline GUI loop is not — that is the whole
+        // SCHED-X86 finding), and it must WAIT for xHCI to enumerate storage, which only a repeating
+        // service pass can do. One-shot inside; two atomic loads on every pass but one.
+        #[cfg(feature = "wc")]
+        unaos_kernel::video::wcx::desktop_app_service();
+        // SDHC-4b (x86, sdhcblk knob): mount the INTERNAL SD card READ-ONLY once registered (one-shot).
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        unaos_kernel::fs::fat::sdhc_probe_once();
+        // FATVERB: the shell's storage witness (one-shot) — see the note at the first loop site.
+        // This file carries THREE storage-ready passes and which one a given x86 build reaches
+        // depends on its knobs, so the call sits at all three and the latch inside makes it speak
+        // exactly once. Mutates nothing.
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
+        unaos_kernel::shell::fatverb_storage_witness();
+        // WIFI-1 (wifi knob): the Broadcom/bcma firmware-load path — see the note at the second loop
+        // site. Third of the three storage-ready passes; the forward-only state machine inside makes
+        // it speak exactly once whichever pass a given build reaches. Read-only in arc 1.
+        #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
+        unaos_kernel::wifi::service();
+        // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial on growth.
+        #[cfg(feature = "witness")]
+        unaos_kernel::bootlog::service_serial_dump();
+        // BPACE: re-emit the boot-phase timing ledger whenever it grows. Deliberately NOT under the
+        // witness gate — the media `./arroyo esp-x86` writes carries neither `witness` nor
+        // `usbdebug`, and this is the only build that reaches the bench.
+        unaos_kernel::bootpace::service_dump();
+        // FBCON-PACE: retire held console damage on THIS lane too. The usbdebug loop got this call
+        // first, but the bench media carries `wc` without `usbdebug` — the console routes and THIS
+        // pump is its only always-running service loop, so without the paced hook here a burst's
+        // trailing band waits for the next print. Paced, not forced; free on a clean ledger.
+        unaos_kernel::video::fbcon::console_service();
+        // FLIGHT-RECORDER: flush the captured serial boot log to UNAOS.LOG on the FAT volume.
+        unaos_kernel::flight_recorder::service();
+        // U2/U4x/U5x/U6x/U6bx (witness knob): the ring-3 fixture ladder, each one-shot and gated on
+        // storage. These used to run on the BSP; they now run inside a kernel task, which is strictly
+        // better for them — `spawn_user`'s target-core choice and the bounded `ticks()` waits are
+        // unchanged, and core 0's ms-clock keeps advancing underneath.
+        #[cfg(feature = "witness")]
+        {
+            unaos_kernel::arch::syscall::u2_probe_once();
+            unaos_kernel::arch::syscall::u4x_probe_once();
+            unaos_kernel::arch::syscall::u5x_probe_once();
+            unaos_kernel::arch::syscall::u6x_probe_once();
+            unaos_kernel::arch::syscall::u6bx_probe_once();
+        }
+        // INSTALL-CORE (installdemo knob): run the installer engine end-to-end once a blank scratch
+        // disk is present. INSTGUI supersedes it — there the attended Enter is the only trigger.
+        #[cfg(all(feature = "installdemo", not(feature = "instgui")))]
+        unaos_kernel::install::install_probe_once();
+        // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
+        unaos_kernel::drivers::xhci::log_summary_once();
+        // FBCON-PACE: the console's present census, once, beside the xHCI summary — same placement
+        // and reasoning as the usbdebug loop's copy, because THIS is the loop the bench media runs.
+        unaos_kernel::video::fbcon::console_pace_census_once();
+        // Drain any frames the NIC has received into the network stack (no-op with no NIC).
+        unaos_kernel::drivers::e1000::service_net();
+    }
+}
+
+/// SCHED-X86: the INPUT service — drain `pal::EVENT_QUEUE` (filled by the HID decode inside
+/// `x86_usb_pump`'s `poll_events`) and forward every event over `GUI_CHANNEL_X86` to the render task.
+/// Paints nothing and routes nothing; never returns.
+///
+/// Two behaviours it carries that are not "forward an event":
+///
+///  * **The `SCREEN_APP_ACTIVE` gate**, taken straight from the Pi's `pump_usb_into_gui`. While a
+///    full-screen command owns the panel the render task is blocked inside `dispatch_command` and
+///    cannot drain the channel, so forwarding would (a) starve the app, which reads `EVENT_QUEUE`
+///    itself through `pal::pump_and_poll`, and (b) fill the 64 slots and block this task in `send`.
+///    While the flag is set we leave the queue alone — that IS the delivery path for those apps.
+///  * **The `X86_GUI_PULSE_MS` heartbeat.** The render loop blocks on `recv`, so a periodic
+///    `Event::Timer` is what lets it run the CURSOR-HIDE auto-hide erase and the `instgui` rescan
+///    with no input arriving. `Event::Timer` is inert everywhere else on the path: `wc_click_route`
+///    ignores non-`Button` events, and `pack_input` returns `None` for it so `user_input_route` hands
+///    it straight back rather than pushing it into a focused app's ring.
+#[cfg(target_arch = "x86_64")]
+fn x86_input_service(cpu: usize) {
+    use core::sync::atomic::Ordering;
+    serial_println!(":: SCHED-X86: input task dispatched on core {} ::", cpu);
+    let mut pulse_ms = unaos_kernel::arch::ms();
+    loop {
+        if SCREEN_APP_ACTIVE.load(Ordering::Relaxed) {
+            // A full-screen app owns the panel and the queue. Re-base the pulse clock so the first
+            // pass after it exits does not fire a stale backlog of one Timer.
+            pulse_ms = unaos_kernel::arch::ms();
+        } else {
+            while let Some(ev) = unaos_kernel::pal::next_event() {
+                gui_send_x86(ev);
+            }
+            let now = unaos_kernel::arch::ms();
+            if now.wrapping_sub(pulse_ms) >= X86_GUI_PULSE_MS {
+                pulse_ms = now;
+                gui_send_x86(unaos_kernel::pal::Event::Timer);
+            }
+        }
+        unaos_kernel::arch::sched::sleep_ticks(1); // ~1 ms at the calibrated 1 kHz tick
+    }
+}
+
+/// SHELLNOTDESK — does the crispy desktop compositor own the backdrop on this build/boot?
+///
+/// True only on x86-`wc` once [`unaos_kernel::video::wcx::activate`] has taken the panel. When it is
+/// true the render service paints the CRISPY SCENE as the desktop layer and keeps the live text shell
+/// off the glass — the shell is not the desktop, it is plumbing behind the facade. On a `wc`-off x86
+/// build (and, by the caller's own `cfg`, aarch64 never reaches here) it is a compile-time `false`,
+/// so the shell keeps painting the desktop exactly as before — the whole change folds away.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn desktop_owns_backdrop() -> bool {
+    unaos_kernel::video::wcx::is_active()
+}
+#[cfg(all(target_arch = "x86_64", not(feature = "wc")))]
+fn desktop_owns_backdrop() -> bool {
+    false
+}
+
+/// SHELLWIN — allocate the live SHELL's compositor-window surface and register its `wm` row.
+///
+/// SHELLNOTDESK took the interactive shell off the desktop backdrop so the crispy scene owns the glass,
+/// but that left the operator with no shell to type `bg /fat/VUG.ELF` into — the keystroke path had no
+/// backdrop console to reach. This gives the shell a WINDOW of its own: a kernel-owned managed row, the
+/// same machinery [`unaos_kernel::video::fbcon::panel_console_window_open`] mints for the frozen
+/// boot-log console, over a cached-RAM surface the render service drives a `Screen`/`Console` on.
+///
+/// The row's owner is [`unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP`] — kernel furniture: hittable so
+/// a click reaches it, out of `focus_ring`/`close_owner` so it is not a teardown victim, and routed by
+/// the click router's kernel-owner arm (`wc_click_route_at`) to RAISE the row and hand the keyboard
+/// back to the shell (`user_input_set_active(0)`). Focus at the shell is exactly the state in which a
+/// keystroke reaches the render service's `Event::Key` arm, which is where it is routed into this
+/// window's console.
+///
+/// Returns the surface store — the caller MUST keep it alive for the row's life, since the row holds a
+/// raw pointer into it — the `FrameBuffer` over that store, and the window id. `None` when the panel is
+/// unusably small or the allocation fails; the desktop then comes up with no shell window and the
+/// keystroke path stays inert (the caller logs it).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn open_shell_window(
+    pw: usize,
+    ph: usize,
+) -> Option<(
+    alloc::vec::Vec<u8>,
+    unaos_kernel::video::FrameBuffer,
+    unaos_kernel::video::wm::WinId,
+)> {
+    use unaos_kernel::video::wm;
+    // A terminal-sized window: roughly half the panel, floored so a small gate surface still yields a
+    // usable box and clamped so the outer box (surface + chrome) fits the work area under the menu bar.
+    let wtop = unaos_kernel::ui_status::top_chrome_h(pw, ph);
+    let workh = ph.saturating_sub(wtop);
+    let cw = (pw / 2).clamp(320, pw.max(320));
+    let ch = (workh / 2).clamp(200, workh.max(200));
+    let stride = cw * 4;
+    let len = ch.checked_mul(stride)?;
+    if cw == 0 || ch == 0 || len == 0 {
+        return None;
+    }
+    let mut store: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if store.try_reserve_exact(len).is_err() {
+        serial_println!("[shellwin] DECLINE reason=alloc len={}", len);
+        return None;
+    }
+    store.resize(len, 0);
+    let mut surf_fb = unaos_kernel::video::FrameBuffer::new();
+    // `Bgr` + 4 bytes, matching the console window: `put_pixel` stores b,g,r at bytes 0,1,2 and leaves
+    // byte 3 zero — the little-endian `0x00RRGGBB` word `wm::draw_window` reads. Same bytes, no convert.
+    surf_fb.init(
+        store.as_mut_ptr() as usize,
+        len,
+        unaos_boot_info::FrameBufferInfo {
+            width: cw,
+            height: ch,
+            stride: cw,
+            bytes_per_pixel: 4,
+            pixel_format: unaos_boot_info::PixelFormat::Bgr,
+        },
+    );
+    surf_fb.fill_screen(wm::DESKTOP_BG);
+
+    // SPAWN-PLACE — size the outer box before any row exists, then pin the row low in the work area so
+    // it does not sit exactly over the centred boot-log console. `create_at` composites the row before
+    // it returns (no first-frame jump), reading the `DESKTOP_BG` fill above until the caller renders the
+    // prompt into it.
+    let (_scale, ow, oh) = wm::spawn_geometry(cw, ch)?;
+    let ox = pw.saturating_sub(ow) / 2;
+    let oy = wtop + workh.saturating_sub(oh) * 3 / 4;
+    let id = wm::create_at(
+        wm::KERNEL_OWNER_DESKTOP,
+        surf_fb.base(),
+        len,
+        cw as u32,
+        ch as u32,
+        stride as u32,
+        b"shell",
+        ox + wm::BORDER,
+        oy + wm::TITLE_H + wm::BORDER,
+    );
+    if id == wm::WIN_NONE {
+        serial_println!("[shellwin] DECLINE reason=create-failed");
+        return None;
+    }
+    Some((store, surf_fb, id))
+}
+
+/// SCHED-X86: the RENDER service — the interactive OS as a scheduled kernel task, and the sole owner
+/// of every pixel. Builds its own `Screen`/`TargetPal`/`Console` over the framebuffer the BSP left in
+/// `WRITER` (and detached fbcon from), paints the first frame, then blocks on `GUI_CHANNEL_X86` and
+/// dispatches each event through the same routing and the same shared `handle_key` the dismantled BSP
+/// loop used. Never returns.
+///
+/// It owns the ~28 MiB cached-RAM back buffer, which is why the handoff block in `kernel_main` must
+/// diverge into `run_bsp` BEFORE the BSP builds one of its own: a second shadow OOMs the 48 MiB metal
+/// heap (the same budget `fbcon::attach_shadow` is kept off the GUI path for).
+///
+/// Presentation is one `pal.render()` per received event. That is strictly FEWER presents than the
+/// loop it replaces, which rendered on every pass — i.e. ~1 kHz, since it ended each idle pass in
+/// `hlt()` and the periodic timer broke it every tick. Blocking on `recv` means an idle render core
+/// is off the run queue entirely and `hlt`s.
+#[cfg(target_arch = "x86_64")]
+fn x86_render_service(cpu: usize) {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::pal::GneissPal; // for pal.width()/height()/render()
+
+    // FrameBuffer is Copy: take a handle and release the WRITER lock immediately. All GUI drawing
+    // goes to a cached-RAM back buffer; render() flushes only the damaged region.
+    let front_fb = *unaos_kernel::video::WRITER.lock();
+    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+
+    // SHELLNOTDESK — is the crispy desktop up? Captured ONCE: `wcx::activate` runs during PCI
+    // enumeration, long before this task is spawned, and never releases the latch on the success
+    // path, so the answer is stable for the life of the render service.
+    //
+    // On the crispy desktop the SCENE owns the backdrop — painted into the desktop layer here, before
+    // the first present — and the live text shell is kept off the glass (it survives in serial and
+    // `TERM_RING` for the Console app, per the facade law). Off the crispy desktop (a pre-takeover
+    // boot, a `wc`-off x86 build) the shell is still the desktop and draws exactly as it always did.
+    let desktop = desktop_owns_backdrop();
+    if desktop {
+        screen.paint_desktop_scene();
+    }
+
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
+    let mut console = unaos_kernel::console::Console::new();
+
+    // SHELLWIN — the live shell's OWN compositor window (crispy desktop only). Built here so its
+    // `Screen`/`TargetPal`/`Console` live for the service's life alongside the panel's `pal`, and for
+    // the same reason: a persistent `TargetPal` borrows its `Screen`, so both are flat locals (a per-
+    // keystroke `TargetPal::new` would also spam the once-per-surface `:: UI1:` line). Off the crispy
+    // desktop (pre-takeover, or `open_shell_window` declining) `shell_id` stays `WIN_NONE` and the
+    // dummy surface is never drawn — the keystroke path falls to the backdrop `console` exactly as
+    // before. Folded to nothing on `wc`-off x86 and (via the enclosing fn's `cfg`) on aarch64.
+    // `_shell_store` is bound but never read ON PURPOSE: the `wm` row holds a raw pointer into
+    // its heap buffer, and keeping it as a live local (the render service never returns) keeps that
+    // allocation from being freed for the row's life. Underscore-prefixed so it raises no unused
+    // warning; the empty `Vec` on the non-window paths costs nothing. Every binding is `mut` since
+    // SHELLPIN: the dock's pinned shell tile can ask this service to REOPEN a closed shell window,
+    // which rebinds the whole tuple (see the reopen arm below the drain loop).
+    #[cfg(feature = "wc")]
+    let (mut _shell_store, mut shell_screen, mut shell_console, mut shell_id) = {
+        let empty = || {
+            (
+                alloc::vec::Vec::new(),
+                unaos_kernel::video::Screen::direct(unaos_kernel::video::FrameBuffer::new()),
+                unaos_kernel::console::Console::new(),
+                unaos_kernel::video::wm::WIN_NONE,
+            )
+        };
+        if desktop {
+            let info = front_fb.info();
+            match open_shell_window(info.width, info.height) {
+                Some((store, fb, id)) => {
+                    let mut con = unaos_kernel::console::Console::new();
+                    con.mark_in_window();
+                    // SHELLWIN-OOM — `direct`, NOT `new`: `Screen::new` double-buffers, and its
+                    // infallible `vec![0u8; len]` of a second surface-sized (~5 MB) back buffer is
+                    // the exact allocation that OOM-panicked GR26's metal boot at desktop-ready,
+                    // 14 ms after this window's first present. The surface store above is the one
+                    // buffer this window needs; `direct` adds zero.
+                    (store, unaos_kernel::video::Screen::direct(fb), con, id)
+                }
+                None => empty(),
+            }
+        } else {
+            empty()
+        }
+    };
+    #[cfg(feature = "wc")]
+    let mut shell_pal = unaos_kernel::pal::TargetPal::new(&mut shell_screen);
+    #[cfg(feature = "wc")]
+    let mut shell_dirty = false;
+
+    if desktop {
+        serial_println!(
+            "[shelldesk] backdrop=crispy-scene shell=off-glass bg={:08X} core={}",
+            unaos_kernel::video::wm::DESKTOP_BG,
+            cpu
+        );
+        // SHELLWIN — paint the first prompt into the shell window's surface and composite it, so the
+        // operator sees a live, focusable shell on the crispy desktop from the first frame.
+        #[cfg(feature = "wc")]
+        if shell_id != unaos_kernel::video::wm::WIN_NONE {
+            shell_console.draw(&mut shell_pal);
+            shell_pal.render();
+            // SHELLWIN — owner-fenced for consistency with the drain-loop present below (the shell
+            // window is a closable `KERNEL_OWNER_DESKTOP` row); harmless here since the row was just
+            // created, but it keeps every present of this id on the one recycled-id-safe verb.
+            let _ = unaos_kernel::video::wm::present_outcome_owned(
+                shell_id,
+                unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
+            );
+            serial_println!(
+                "[shellwin] backdrop=crispy-scene shell=window win={} surf={}x{} core={} == witness ::",
+                shell_id,
+                shell_pal.width(),
+                shell_pal.height(),
+                cpu
+            );
+        }
+    } else {
+        console.draw(&mut pal);
+    }
+    pal.render();
+    // The falsifiable pair to the spawn-site line: this one is printed by the task ITSELF, after it
+    // has built the panel surface and presented a frame. Spawned is not dispatched (the WINX-2/WINX-3
+    // lesson); a spawn line with no dispatch line means the task is sitting in a run queue nobody
+    // pops, which is the exact failure this whole arc exists to remove.
+    serial_println!(
+        ":: SCHED-X86: render task dispatched on core {} — panel owned by the scheduler ::",
+        cpu
+    );
+    // WITCORE: the placement VERDICT, and the reason it lives here rather than at the publish site.
+    // `cpu` above is what the spawn site ASKED for; this call additionally reads the core the
+    // hardware says it is running on and the split read back out of `smp::SPLIT`, and cross-checks
+    // both against the pool `worker_cpu`/`xhci_worker_cpu` will hand out. Three producers, so the
+    // PASS/FAIL can actually fail — unlike a check made at publish time against the publisher's own
+    // arguments, which is a tautology dressed as evidence.
+    unaos_kernel::arch::smp::confirm_render_core(cpu);
+
+    // CURSOR-HIDE: whether the last pass drew the cursor, so the auto-hide transition erases the
+    // sprite exactly once. Driven by the input service's `Event::Timer` pulse when nothing is typed.
+    let mut cursor_was_visible = false;
+
+    loop {
+        // Block until an event arrives — an idle render core burns nothing.
+        let mut raw = GUI_CHANNEL_X86.recv();
+        GUI_RECV_X86.fetch_add(1, Ordering::Relaxed);
+
+        // SCHED-X86 DRAIN: dispatch EVERY queued event, then present ONCE below — the dismantled
+        // BSP loop's semantic, kept deliberately. Presenting per event is the regression this file
+        // already documents (see the CURSOR-10 note on the old loop): a native-resolution flush is
+        // slow, so one present per event made "the cursor never catch up; typed text appeared
+        // seconds late". A keystroke burst or one trackpad sweep queues dozens of events into the
+        // 64-slot channel, and each would otherwise cost its own full present.
+        loop {
+            // WINX-7 / CLICK-X86 — the router pair, in the dismantled loop's exact order. A pointer
+            // BUTTON is ADDRESSED before it is DELIVERED: `user_input_route` routes by FOCUS, which is
+            // right for a keystroke and wrong for a click (that belongs to the window under the cursor),
+            // so `wc_click_route` hit-tests the press first and answers `true` only when it CONSUMED the
+            // event. Both return `Event::Unknown` (never `Event::None`) for a consumed event.
+            //
+            // WC-TAB/x86 — and TAB is judged ahead of both, for the reason the dismantled loop's copy
+            // of this block states: it is addressed to the window system rather than to any app, and
+            // intercepting it after `user_input_route` would mean the focused app swallows the only
+            // exit from its own window. This is the seam the bench media actually runs, so it is the
+            // one Boot AH's trap was sprung on.
+            let ev = unaos_kernel::arch::x86_64::syscall::wc_route_event(raw);
+
+            match ev {
+                unaos_kernel::pal::Event::Key(c) => {
+                    // INSTGUI — while the installer dialog is open it owns the keyboard; the console
+                    // resumes the moment it closes.
+                    #[cfg(all(feature = "wc", feature = "instgui"))]
+                    let consumed = unaos_kernel::video::instgui::consume_key(c);
+                    #[cfg(not(all(feature = "wc", feature = "instgui")))]
+                    let consumed = false;
+                    // SHELLWIN — route the keystroke to its home. A key reaches this arm only when
+                    // `wc_route_event` did NOT hand it to a focused ring-3 window (that app has no key
+                    // here) and the installer dialog did not consume it — i.e. the keyboard belongs to
+                    // the SHELL (`user_input_active() == 0`). On the crispy desktop the shell is now a
+                    // compositor WINDOW, so the key is dispatched into that window's own console and
+                    // surface; the backdrop scene is never typed on. Off the crispy desktop (pre-
+                    // takeover, wc-off, aarch64) the shell is still the desktop layer and `handle_key`
+                    // drives the backdrop `console` exactly as before. `handle_key` answers `true` when
+                    // the command took the whole screen — the BSP loop used that to stop DRAINING, and
+                    // so do we, so the rest of the burst is not painted over it before it is presented.
+                    if !consumed {
+                        #[cfg(feature = "wc")]
+                        {
+                            if desktop {
+                                // On the crispy desktop the key never falls to the backdrop console
+                                // (the shell is off the glass); it goes to the shell WINDOW, or is
+                                // dropped if the window failed to open (logged at bring-up).
+                                if shell_id != unaos_kernel::video::wm::WIN_NONE {
+                                    let took = handle_key(c, &mut shell_console, &mut shell_pal);
+                                    shell_dirty = true;
+                                    if took {
+                                        break;
+                                    }
+                                }
+                            } else if handle_key(c, &mut console, &mut pal) {
+                                break;
+                            }
+                        }
+                        #[cfg(not(feature = "wc"))]
+                        {
+                            if handle_key(c, &mut console, &mut pal) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                unaos_kernel::pal::Event::Mouse { x, y } => {
+                    // CURSOR-X86/CURSOR-WCR: on this target these verbs drive the COMPOSITOR SPRITE in
+                    // the front buffer, so `move_rel` repaints the arrow on the report itself and
+                    // `draw_over` is the idempotent tail; the leading `restore` the back-buffer targets
+                    // need is deliberately absent (it was a duplicated undraw with a wasted publish).
+                    unaos_kernel::pal::cursor::move_rel(x, y, pal.width() as i32, pal.height() as i32);
+                    unaos_kernel::pal::cursor::draw_over(&mut pal);
+                }
+                unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                    unaos_kernel::pal::cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
+                    unaos_kernel::pal::cursor::draw_over(&mut pal);
+                }
+                // CLICK-X86 — the PRESS arm. Reaching it means the press was NOT consumed by the click
+                // router and NOT taken by a user ring, i.e. it is the SHELL's click, and the x86 shell has
+                // no click model yet. Deliberately empty of policy (the disposition is already on the wire
+                // from the router's `[clickroute]` line); this is where one attaches when it grows one.
+                unaos_kernel::pal::Event::Button(_mask) => {}
+                // Timer (the pulse) / KeyUp / Unknown: nothing to dispatch — the tail below still runs.
+                _ => {}
+            }
+
+            // WMDIRECT — **STEER A LIVE TITLE-BAR DRAG, OFF `raw`, AFTER THE ARMS ABOVE.**
+            //
+            // The predicate is the RAW report and NOT `ev`, and that distinction is the whole of this
+            // line's correctness. `Event::Mouse`/`Event::MouseAbsolute` are PACKABLE, so whenever a
+            // ring-3 app holds focus and its ring is not full, `user_input_route` consumes the report
+            // and hands back `Event::Unknown` — it never reaches the pointer arms at all. A title-bar
+            // grab GUARANTEES exactly that state, because the chrome arm of `wc_click_route_at` calls
+            // `user_input_set_active(owner)` with the dragged window's own owner. Keyed on `ev`, the
+            // drag would therefore be dead for every app window and alive only for the console and
+            // the focus-exempt desktop row (whose arms take `set_active(0)`) — app-dependent,
+            // nondeterministic (an app that stops draining fills its ring, the push fails, and the
+            // drag springs to life mid-gesture), and with the release edge's unthrottled final
+            // reposition TELEPORTING the window to wherever the hand let go.
+            //
+            // Placed after the `match` rather than beside the routers so that the cursor is FRESH on
+            // both branches, which is the other half of it — `wc_drag_motion` reads the shared
+            // `pal::cursor` position rather than the report's delta:
+            //   * CONSUMED — `user_input_route` -> `pal::cursor::track_routed` has already applied it
+            //     (CURSOR-VUG). Without that arc this line would steer to a stale position.
+            //   * DECLINED — the `Mouse`/`MouseAbsolute` arms above have just applied it.
+            // Exactly ONE tick per pointer report either way, so a relative report is never applied
+            // twice and the 16 ms throttle measures real time rather than a doubled rate.
+            //
+            // Costs one `matches!` on non-pointer events and one atomic load when no drag is live,
+            // which is every report on a boot where nobody grabbed a title bar.
+            unaos_kernel::arch::x86_64::syscall::wc_route_tail(raw);
+
+            // Take the next queued event if one is already waiting; otherwise the burst is drained
+            // and we fall through to the single present. Never parks, so an empty channel costs one
+            // failed semaphore try rather than a deschedule.
+            match GUI_CHANNEL_X86.try_recv() {
+                Some(next) => {
+                    GUI_RECV_X86.fetch_add(1, Ordering::Relaxed);
+                    raw = next;
+                }
+                None => break,
+            }
+        }
+
+        // SHELLWIN-REOPEN — service the dock's pinned shell tile (SHELLPIN, `video/dock.rs`). The
+        // press that latched the request was routed INSIDE the drain above (`wc_route_event` ->
+        // `wc_click_route_at` -> `dock::press_at`), so by this line the flag is set and the reopen
+        // lands in the same burst — no extra wakeup, no new event variant, the channel untouched.
+        //
+        // Two arms, one live shell window max:
+        //  * the row is still alive under its owner (the scan-to-press race, or a parked shell) —
+        //    RAISE it through the same pair the click router's furniture arm uses, never a second
+        //    window. `focus_changed` also un-parks (fresh top-of-stack z), so a minimised shell
+        //    comes back through this arm too.
+        //  * the row is gone (the operator closed their only shell) — rebuild it through the SAME
+        //    fallible path bring-up used: `open_shell_window` (`try_reserve_exact` decline ->
+        //    `[shellwin] DECLINE`) and `Screen::direct` (NEVER `Screen::new` for a window surface —
+        //    its infallible second back buffer is the exact allocation that OOM-panicked GR26's
+        //    metal boot). The whole tuple is rebound: the old store's Vec is freed by the
+        //    assignment (its row is already reaped, so no raw pointer outlives it), the new
+        //    `TargetPal` re-borrows the new `Screen` (one fresh `:: UI1:` line per reopen, the
+        //    once-per-surface rule kept), and `shell_id` now routes keystrokes to the NEW window.
+        //    `user_input_set_active(0)` hands the keyboard back so the first keystroke after the
+        //    reopen lands in the reopened shell.
+        // A DECLINE leaves the old (dead) id in place: presents stay fenced off by
+        // `present_outcome_owned` and the pinned tile stays on the dock for another try.
+        #[cfg(feature = "wc")]
+        if desktop && unaos_kernel::video::dock::take_shell_reopen() {
+            use unaos_kernel::video::wm;
+            if shell_id != wm::WIN_NONE && wm::owner_of(shell_id) == Some(wm::KERNEL_OWNER_DESKTOP) {
+                unaos_kernel::arch::x86_64::syscall::user_input_set_active(0);
+                wm::focus_changed(wm::KERNEL_OWNER_DESKTOP);
+                serial_println!("[shellwin] reopen route=dock already-live win={} raised", shell_id);
+            } else {
+                let info = front_fb.info();
+                match open_shell_window(info.width, info.height) {
+                    Some((store, fb, id)) => {
+                        _shell_store = store;
+                        shell_console = unaos_kernel::console::Console::new();
+                        shell_console.mark_in_window();
+                        shell_screen = unaos_kernel::video::Screen::direct(fb);
+                        shell_pal = unaos_kernel::pal::TargetPal::new(&mut shell_screen);
+                        shell_id = id;
+                        // First frame, exactly as bring-up: prompt into the surface, flush, one
+                        // owner-fenced present so the reopened shell is on glass before the next
+                        // event arrives.
+                        shell_console.draw(&mut shell_pal);
+                        shell_pal.render();
+                        let _ = unaos_kernel::video::wm::present_outcome_owned(
+                            id,
+                            unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
+                        );
+                        unaos_kernel::arch::x86_64::syscall::user_input_set_active(0);
+                        shell_dirty = false;
+                        serial_println!("[shellwin] reopen win={} route=dock == witness ::", id);
+                    }
+                    // The decline reason (`alloc`/`create-failed`) is already on the wire from
+                    // `open_shell_window`; nothing was torn down, nothing to roll back.
+                    None => {}
+                }
+            }
+        }
+
+        // CURSOR-HIDE: restore the pixels under the sprite once when the auto-hide delay expires
+        // (reappearance is instant — the pointer arms above stamp the activity clock before drawing).
+        let cursor_vis = unaos_kernel::pal::cursor::visible();
+        if cursor_was_visible && !cursor_vis {
+            unaos_kernel::pal::cursor::restore(&mut pal);
+        }
+        cursor_was_visible = cursor_vis;
+
+        // INSTGUI: pick up disks that enumerate after the dialog opened (repaints only on change).
+        // Rides the pulse, which is why the pulse exists.
+        #[cfg(all(feature = "wc", feature = "instgui"))]
+        unaos_kernel::video::instgui::service();
+
+        // Present: flush the damaged region of the back buffer to the framebuffer. A no-op when
+        // nothing was drawn, so a pure cursor pass (front-buffer sprite) costs almost nothing.
+        pal.render();
+
+        // SHELLWIN — flush the shell window's surface and composite it ONCE per drained burst, the same
+        // drain-then-present-once discipline the backdrop above follows: `handle_key` drew into the
+        // shell's cached-RAM back buffer as keys arrived, `render()` copies the damaged rows into the
+        // window surface, and `wm::present` composites that surface over the crispy backdrop (the panel
+        // flush above already subtracted the window's box from its own damage, so nothing painted over
+        // it). After the backdrop present, so the shell window lands on top of the scene.
+        #[cfg(feature = "wc")]
+        if shell_dirty {
+            shell_pal.render();
+            // SHELLWIN — the OWNER-FENCED present, not the fence-free `present`. The shell window is
+            // `KERNEL_OWNER_DESKTOP`, and `wm::controls`/`ctrls_for` give every non-compat, non-owner-0
+            // row a live close/minimise/zoom cluster — so an operator CAN close it (the kernel-furniture
+            // close arm reaps the row by id) or minimise it (parked below `SHELL_Z`). `shell_id` is a
+            // recycled slot alias with no generation, so a fence-free `present(shell_id)` after a close
+            // would composite whatever row later took the slot. `present_outcome_owned` declines a slot
+            // whose owner is no longer `KERNEL_OWNER_DESKTOP` (`NoRow`) and suppresses a parked one
+            // (`Suppressed`) — the same recycled-id fence `fbcon` uses for the closable console window
+            // (NORMALWIN). The close is no longer a one-way trip: the dock PINS a permanent shell
+            // tile (SHELLPIN, `video/dock.rs`) whose press latches a reopen request this loop
+            // services below — the reopen route the GR27 review note asked for, per the standing
+            // rule ("closeable means build the reopen route, not withhold the button").
+            let _ = unaos_kernel::video::wm::present_outcome_owned(
+                shell_id,
+                unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
+            );
+            shell_dirty = false;
+        }
+
+        // SCHED-X86 depth witness. `sent - recv` is the LIVE occupancy of the 64-slot channel, and it
+        // is the number that separates "the render task is keeping up" from "the render task is
+        // wedged and the input task is one burst away from blocking in `send`". Both counters are
+        // read HERE, from the consumer side, after the present — so the line is a measurement of the
+        // steady state, not of this task's own start-up. Rate-limited to ~5 s.
+        let now_ms = unaos_kernel::arch::ms();
+        let last = GUI_DEPTH_LAST_MS.load(Ordering::Relaxed);
+        if now_ms.wrapping_sub(last) >= 5000 || last == 0 {
+            GUI_DEPTH_LAST_MS.store(now_ms.max(1), Ordering::Relaxed);
+            let sent = GUI_SENT_X86.load(Ordering::Relaxed);
+            let recv = GUI_RECV_X86.load(Ordering::Relaxed);
+            serial_println!(
+                "[schedx86] depth sent={} recv={} inflight={} (render core {})",
+                sent,
+                recv,
+                sent.wrapping_sub(recv),
+                cpu
+            );
+            // SCHEDLOAD-X86 load witness, riding the depth line's clock gate — the two are the answer
+            // halves of one question and are worth reading as a pair: `depth` says whether the GUI
+            // pipe is backed up, `load` says what the other seven cores were doing while it was not.
+            // Every boot emits this without an operator launching anything, which is the whole point:
+            // until now the only per-core load feed on x86 was `SYS_CPUPULSE`, i.e. a ring-3 app
+            // somebody had to start, so no unattended capture has ever contained a load number.
+            //
+            // Emitted from HERE — after `pal.render()`, inside the existing rate limit — deliberately.
+            // The event-routing block above (`wc_click_route` -> `user_input_route` -> `handle_key`)
+            // is the seam of the open focus-trap defect and is not to be perturbed by an instrument.
+            unaos_kernel::arch::sched::emit_load_witness("");
+            // R0 / rtwit: the WORST-CASE RULER's rollup, riding the same ~5 s gate. Emits the
+            // `[rtwit]` line (input→present max/p99, per-lock max holds, max interrupt-mask span,
+            // ruler overhead) and resets every per-span slot. A no-op inline shim when `rtwit` is off.
+            unaos_kernel::rtwit::rollup();
+            // R1 / rtpi: the PRIORITY-INHERITANCE witness rollup, riding the same ~5 s gate. Emits
+            // `[rtpi] inherits=<n> max_jump=<lvl> chain_max=<d> active=<gauge>` (0 / `--` honestly
+            // when no inversion occurred) plus the span's rate-limited `[rtpi] inherit …` traces.
+            // `#[cfg]`-gated (not a shim call) so a knob-off kernel carries none of its symbols and
+            // stays bit-identical.
+            #[cfg(feature = "rtpi")]
+            unaos_kernel::rtpi::rollup();
+        }
+    }
+}
+
+// ── SERWIT-1 ────────────────────────────────────────────────────────────────────────────────────
+// Drive the serial-transport stress fixture: one kernel worker per online AP, all parked on a gate so
+// their bursts overlap instead of trickling one core at a time (a trickle would never contend, and a
+// fixture that cannot reproduce the defect it guards is decoration). This runs on the boot path,
+// before the BSP joins the scheduler, so it waits the same bounded-on-`ticks()` way `await_verdict`
+// does rather than joining, then prints the verdict itself. Bounded on both ends: the wait gives up on
+// the ms-clock, and the verdict prints the real numbers either way — a timeout shows up as a short
+// `sent` count and reads FAIL, never as silence, which would be an ironic way for this particular
+// fixture to fail.
+// ── SERWIT-1 ────────────────────────────────────────────────────────────────────────────────────
+// Drive the serial-transport stress fixture: one kernel worker per online AP, all parked on a gate so
+// their bursts overlap instead of trickling one core at a time (a trickle would never contend, and a
+// fixture that cannot reproduce the defect it guards is decoration). The BSP is not scheduled, so it
+// waits the same bounded-on-`ticks()` way `await_verdict` does rather than joining, then prints the
+// verdict itself. Bounded on both ends: the wait gives up on the ms-clock, and the verdict prints the
+// real numbers either way — a timeout shows up as a short `sent` count and reads FAIL, never as
+// silence, which would be an ironic way for this particular fixture to fail.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn serwit1_run(online: &[usize]) {
+    let workers = unaos_kernel::serial_ring::serwit_worker_count(online.len());
+    let (b_sub, b_emit, b_drop) = unaos_kernel::serial_ring::serwit_snapshot();
+    for (i, &cpu) in online.iter().take(workers).enumerate() {
+        let _ = i;
+        unaos_kernel::arch::sched::spawn("serwit-burst", serwit_entry, cpu, cpu, 1);
+    }
+    unaos_kernel::serial_ring::serwit_release();
+    let deadline = unaos_kernel::arch::ticks() + 4000; // ~4 s at the calibrated 1 kHz
+    while !unaos_kernel::serial_ring::serwit_all_done(workers)
+        && unaos_kernel::arch::ticks() < deadline
+    {
+        core::hint::spin_loop();
+    }
+    unaos_kernel::serial_ring::serwit_verdict(workers, b_sub, b_emit, b_drop);
+}
+
+/// `spawn` entry thunk: the scheduler hands the task its `arg`, which here is the core index the
+/// worker stamps into every line it prints.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn serwit_entry(cpu: usize) {
+    unaos_kernel::serial_ring::serwit_worker(cpu);
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // SERWIT-1: switch the serial transport to its raw, lock-free, synchronous mode BEFORE the first
+    // print below. From here on `_print` does not touch the UART Mutex at all — which is what makes
+    // these two lines reach the wire even when this very core died holding it (the old shape lost the
+    // `try_lock` to itself and dropped the whole panic message: red screen, no words). It also flushes
+    // anything other cores had staged just before the fault. Takes no lock, so it cannot deadlock.
+    unaos_kernel::serial_ring::enter_panic_mode();
     // Paint a red panic backdrop on the framebuffer (visible on hardware with no serial), then
     // print the message — serial_println! mirrors it onto that backdrop via fbcon.
     unaos_kernel::video::fbcon::panic_screen();

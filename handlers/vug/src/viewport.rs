@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use euclase::cortex::Cortex;
+use euclase::cortex::{Cortex, PresentError};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -97,8 +97,8 @@ impl VugViewport {
         }
     }
 
-    pub fn render(&self, cortex: &Cortex) -> Result<(), wgpu::SurfaceError> {
-        let output = cortex.surface.get_current_texture()?;
+    pub fn render(&self, cortex: &Cortex) -> Result<(), PresentError> {
+        let output = cortex.acquire()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = cortex.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -127,7 +127,7 @@ impl VugViewport {
         }
 
         cortex.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        cortex.queue.present(output);
 
         Ok(())
     }

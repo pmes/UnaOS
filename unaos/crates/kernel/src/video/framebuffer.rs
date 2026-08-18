@@ -148,6 +148,9 @@ impl FrameBuffer {
     /// fbcon shadow). Never call this on a handle over real VRAM: on the rMBP every read of the
     /// WC/uncached GOP surface is a PCIe round trip, the exact cost the back buffers exist to
     /// remove. The one caller (`Screen::read_back_pixel`) reads only its heap store.
+    /// For the deliberate, witness-gated VRAM read-back the pi compositor's verify path needs,
+    /// see [`read_pixel`](Self::read_pixel) — the two exist separately ON PURPOSE (wc-op1 merge):
+    /// this one stays cheap and cached; that one is volatile and paid for knowingly.
     #[inline]
     pub fn get_pixel(&self, x: usize, y: usize) -> Option<u32> {
         if self.base == 0 || x >= self.info.width || y >= self.info.height {
@@ -179,12 +182,72 @@ impl FrameBuffer {
         }
     }
 
-    /// VPERF M4 (x86 only): encode `color` as the little-endian 4-byte pixel this surface
-    /// stores, when the layout is a full 4-byte pixel (bpp 4, Rgb/Bgr). Lets callers hoist the
-    /// per-pixel format decode out of their inner loops (`put_raw4` / the `fill_rows` fast
-    /// path). The X byte is encoded 0: `put_pixel` leaves it untouched, but every store this
-    /// kernel allocates starts zeroed and scan-out ignores it, so the visible bytes agree.
-    #[cfg(target_arch = "x86_64")]
+    /// WC-D: the mapped base address of this surface. Needed by callers that must run cache maintenance
+    /// over a sub-range they computed themselves (the compositor's scan-out verification), which
+    /// [`flush_range`](Self::flush_range) cannot express — it only cleans, and the verification needs an
+    /// invalidate so its reads come from RAM.
+    #[inline]
+    pub fn base_addr(&self) -> usize {
+        self.base
+    }
+
+    /// WC-D: read one panel pixel back as `0x00RRGGBB` — the exact inverse of [`put_pixel`](Self::put_pixel)'s
+    /// encoding, so `read_pixel(x, y) == color` for any `color` a `put_pixel(x, y, color)` landed.
+    /// `None` when the coordinate is off-panel, past the mapped length, or the layout has no colour
+    /// inverse (`U8` is lossy — averaging is not invertible, so it refuses rather than inventing one).
+    ///
+    /// This exists so the compositor can VERIFY its own blit against the source surface instead of
+    /// asserting it (see `wm::verify_window`). A checksum of what we intended to draw proves nothing
+    /// about the panel; a read-back of what is actually in the scan-out buffer does.
+    /// ⚠ VOLATILE VRAM READ-BACK — the documented ban on reading uncached surfaces (see
+    /// [`get_pixel`](Self::get_pixel)) is LIFTED here alone, deliberately, for witness/verify use
+    /// only: the verification's whole point is to pay for a real read of the scan-out memory.
+    #[inline]
+    pub fn read_pixel(&self, x: usize, y: usize) -> Option<u32> {
+        if self.base == 0 || x >= self.info.width || y >= self.info.height {
+            return None;
+        }
+        let offset = (y * self.info.stride + x) * self.info.bytes_per_pixel;
+        if offset + 3 > self.len {
+            return None;
+        }
+        let p = (self.base + offset) as *const u8;
+        // One 32-bit transaction instead of three 8-bit ones, where the pixel allows it. On
+        // cacheable RAM the cache made the three byte reads free, so nobody noticed; on a WC-mapped
+        // PCIe aperture every volatile u8 read is its own non-posted round trip (~976 ns measured,
+        // GR17 cost model), so every verify probe paid 3× for the same three bytes. Same bytes,
+        // same decode, same Some/None decisions: the wide path additionally requires 4-alignment
+        // and the fourth byte in-bounds, and falls back to the byte path at exactly those edges
+        // (unaligned base, truncated tail pixel) rather than ever changing an answer.
+        let (a, b, c) = if (self.base + offset) & 3 == 0 && offset + 4 <= self.len {
+            // SAFETY: 4-aligned and bounds-checked above; volatile for the same reason as the
+            // byte path.
+            let v = unsafe { core::ptr::read_volatile((self.base + offset) as *const u32) };
+            ((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8)
+        } else {
+            // SAFETY: bounds-checked against `self.len` above; volatile so the read is not hoisted
+            // or folded with the stores the blit just performed.
+            unsafe {
+                (
+                    core::ptr::read_volatile(p),
+                    core::ptr::read_volatile(p.add(1)),
+                    core::ptr::read_volatile(p.add(2)),
+                )
+            }
+        };
+        match self.info.pixel_format {
+            PixelFormat::Rgb => Some(((a as u32) << 16) | ((b as u32) << 8) | c as u32),
+            PixelFormat::Bgr => Some(((c as u32) << 16) | ((b as u32) << 8) | a as u32),
+            _ => None,
+        }
+    }
+
+    /// VPERF M4: encode `color` as the little-endian 4-byte pixel this surface stores, when the
+    /// layout is a full 4-byte pixel (bpp 4, Rgb/Bgr). Lets callers hoist the per-pixel format
+    /// decode out of their inner loops (`put_raw4` / the `fill_rows` fast path / COMPOSITE-2's
+    /// span writer). The X byte is encoded 0: `put_pixel` leaves it untouched, but every store
+    /// this kernel allocates starts zeroed and scan-out ignores it, so the visible bytes agree.
+    /// (x86-only until COMPOSITE-2; the aarch64 compositor's bulk paths now hoist through it too.)
     #[inline]
     pub fn encode4(&self, color: u32) -> Option<u32> {
         if self.info.bytes_per_pixel != 4 {
@@ -219,9 +282,86 @@ impl FrameBuffer {
         unsafe { core::ptr::write_unaligned((self.base + offset) as *mut u32, raw) };
     }
 
+    /// COMPOSITE-2 — whether the WORD fast paths may run on this surface: a full 4-byte pixel
+    /// layout AND a word-aligned base, so every pixel offset `(y * stride + x) * 4` is 4-aligned
+    /// (the build is `+strict-align`; a misaligned `str` is not merely slow, it traps). Both real
+    /// framebuffers are page-aligned and the staged back layer is heap-allocated (16-aligned), so
+    /// this is true everywhere it matters — the check exists so a surface it is NOT true of falls
+    /// back to `put_pixel` instead of faulting.
+    #[inline]
+    pub fn word4(&self) -> bool {
+        self.info.bytes_per_pixel == 4 && self.base & 3 == 0
+    }
+
+    /// COMPOSITE-2 — fill a horizontal span of `w` pixels at `(x, y)` with one pre-encoded 4-byte
+    /// pixel (from [`encode4`](Self::encode4) of this surface). The compositor's inner-loop
+    /// primitive: the bounds checks and the format decode happen ONCE per span instead of once per
+    /// pixel, and the body is a word-wide fill (64-bit pairs where alignment allows) instead of
+    /// three byte stores per pixel. Clips exactly as a `put_pixel` loop over the same span would:
+    /// to the visible width and to the mapped length.
+    ///
+    /// Caller contract: only meaningful when [`word4`](Self::word4) is true (callers gate on it;
+    /// the checks here make a violation a no-op, never a fault). Writes the pad byte as 0 where
+    /// `put_pixel` leaves it untouched — no reader of these surfaces decodes the pad (scan-out
+    /// ignores it, `read_pixel` reads 3 bytes), and the staged back layer's pads are already 0.
+    #[inline]
+    pub fn fill_span4(&self, x: usize, y: usize, w: usize, raw: u32) {
+        if self.base == 0 || self.base & 3 != 0 || x >= self.info.width || y >= self.info.height {
+            return;
+        }
+        let w = w.min(self.info.width - x);
+        let off = (y * self.info.stride + x) * 4;
+        if off + 4 > self.len {
+            return;
+        }
+        let n = w.min((self.len - off) / 4);
+        if n == 0 {
+            return;
+        }
+        unsafe {
+            let mut p = (self.base + off) as *mut u32;
+            let end = p.add(n);
+            // Head: one 32-bit store to reach 8-byte alignment for the pair loop.
+            if (p as usize) & 7 != 0 && p < end {
+                p.write(raw);
+                p = p.add(1);
+            }
+            let raw2 = ((raw as u64) << 32) | raw as u64;
+            let mut q = p as *mut u64;
+            while (q as usize) + 8 <= end as usize {
+                q.write(raw2);
+                q = q.add(1);
+            }
+            let mut p = q as *mut u32;
+            while p < end {
+                p.write(raw);
+                p = p.add(1);
+            }
+        }
+    }
+
     /// Fill pixel rows `[y0, y1)` (clamped to the frame) with a colour.
     pub fn fill_rows(&self, y0: usize, y1: usize, color: u32) {
         let y_end = y1.min(self.info.height);
+        
+        #[cfg(all(target_arch = "x86_64", feature = "intel-ivb"))]
+        {
+            let gtt = crate::drivers::gpu::igpu::ACTIVE_SURF.load(core::sync::atomic::Ordering::Relaxed);
+            if gtt != 0 {
+                if crate::drivers::gpu::igpu::blitter_fill_rect(
+                    gtt,
+                    0,
+                    y0 as u16,
+                    self.info.width as u16,
+                    (y_end - y0) as u16,
+                    color,
+                    (self.info.stride * self.info.bytes_per_pixel) as u32
+                ) {
+                    return;
+                }
+            }
+        }
+
         // VPERF M4 (x86 only): word-wide band fill for full-4-byte-pixel formats — the format
         // decode and bounds checks hoisted to once per row instead of once per pixel. Writes
         // only the visible width (the stride gap stays untouched, like `put_pixel`).
@@ -249,6 +389,18 @@ impl FrameBuffer {
             }
             return;
         }
+        // COMPOSITE-2 (aarch64): the same hoist, through the span writer, with the same
+        // firmware-short-buffer semantics — a row past the mapped length writes nothing and every
+        // partial row writes its prefix.
+        #[cfg(target_arch = "aarch64")]
+        if self.word4() {
+            if let Some(raw) = self.encode4(color) {
+                for y in y0..y_end {
+                    self.fill_span4(0, y, self.info.width, raw);
+                }
+                return;
+            }
+        }
         for y in y0..y_end {
             for x in 0..self.info.width {
                 self.put_pixel(x, y, color);
@@ -262,7 +414,22 @@ impl FrameBuffer {
     }
 
     /// Fill an axis-aligned rectangle (clipped by `put_pixel`'s bounds checks).
+    ///
+    /// COMPOSITE-2 (aarch64): word-wide row spans when the surface supports them — this is the
+    /// compositor's dense chrome/border fill (the whole outer box, every pass) and was the single
+    /// largest per-pixel population in the measured ~13 ms blit term. x86 keeps the per-pixel loop
+    /// so `videobench`'s poke counters keep their meaning.
     pub fn fill_rect(&self, x: usize, y: usize, w: usize, h: usize, color: u32) {
+        #[cfg(target_arch = "aarch64")]
+        if self.word4() {
+            if let Some(raw) = self.encode4(color) {
+                let y1 = y.saturating_add(h).min(self.info.height);
+                for row in y..y1 {
+                    self.fill_span4(x, row, w, raw);
+                }
+                return;
+            }
+        }
         for row in 0..h {
             for col in 0..w {
                 self.put_pixel(x + col, y + row, color);
@@ -338,6 +505,43 @@ impl FrameBuffer {
         crate::arch::flush_framebuffer_range(self.base + byte_offset, end - byte_offset);
     }
 
+    /// COMPOSITE-2 — make CPU writes to the pixel RECT `[x, x+w) x [y, y+h)` visible to a
+    /// non-coherent display controller, cleaning only the rect's own bytes per row instead of the
+    /// full-width scanlines [`flush_range`](Self::flush_range) forces. One `DSB` for the whole
+    /// rect (see `arch::flush_framebuffer_rows`), so the cost scales with the bytes the caller
+    /// actually wrote: a 514-wide box on a 1920-wide panel cleans 3.7x less than the scanline
+    /// sweep did. Clips like the writers it covers: to the visible width/height and to the mapped
+    /// length. No-op on cache-coherent targets, exactly as `flush_range` is.
+    pub fn flush_rect(&self, x: usize, y: usize, w: usize, h: usize) {
+        if self.base == 0 || self.info.bytes_per_pixel == 0 || self.info.stride == 0 || x >= self.info.width {
+            return;
+        }
+        let bpp = self.info.bytes_per_pixel;
+        let stride_b = self.info.stride * bpp;
+        let w = w.min(self.info.width - x);
+        let y1 = y.saturating_add(h).min(self.info.height);
+        if w == 0 || y >= y1 {
+            return;
+        }
+        let off = y * stride_b + x * bpp;
+        let row_len = w * bpp;
+        if off + row_len > self.len {
+            return;
+        }
+        // Rows whose full span fits the mapped length (a firmware-short buffer trims the tail,
+        // the same clamp `flush_range` applies at its end).
+        let rows = (((self.len - off - row_len) / stride_b) + 1).min(y1 - y);
+        // aarch64: the strided clean with ONE trailing `DSB` (see cache::clean_rows). Elsewhere the
+        // drain is range-independent (x86's SFENCE), so the rect collapses to the range call.
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::aarch64::cache::clean_rows(self.base + off, row_len, rows, stride_b);
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = rows;
+            crate::arch::flush_framebuffer_range(self.base + off, row_len);
+        }
+    }
+
     /// Flush the whole framebuffer to RAM. Used by the boot console (`fbcon`), which pokes scattered
     /// glyph pixels rather than going through `blit`, so a single whole-surface clean after each
     /// update is the simplest way to keep the on-screen boot log coherent on the Pi.
@@ -356,6 +560,29 @@ impl FrameBuffer {
         let total = (self.info.height * row_bytes).min(self.len);
         if shift >= total {
             return;
+        }
+        
+        let cleared_from = self.info.height.saturating_sub(dy);
+        
+        #[cfg(all(target_arch = "x86_64", feature = "intel-ivb"))]
+        {
+            let gtt = crate::drivers::gpu::igpu::ACTIVE_SURF.load(core::sync::atomic::Ordering::Relaxed);
+            if gtt != 0 {
+                if crate::drivers::gpu::igpu::blitter_copy_rect(
+                    gtt,
+                    gtt,
+                    0,
+                    0,
+                    0,
+                    dy as u16,
+                    self.info.width as u16,
+                    cleared_from as u16,
+                    row_bytes as u32
+                ) {
+                    self.fill_rows(cleared_from, self.info.height, fill);
+                    return;
+                }
+            }
         }
         // VPERF (bench builds only): count the memmove payload, attributing the source read to
         // VRAM when this surface IS the real framebuffer (the uncached-PCIe read being measured).

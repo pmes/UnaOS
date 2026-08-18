@@ -61,6 +61,82 @@ impl PciScanner {
         None
     }
 
+    /// SDHC-1 — STORAGE CENSUS (read-only). `enumerate_buses` above matches EXACTLY ONE class
+    /// triple (0x0C/0x03/0x30 = xHCI) and returns on the first hit, so until now the x86 kernel
+    /// never saw a storage-class function at all: the only block device it could reach was a USB
+    /// mass-storage LUN behind that one controller. This walk is a SEPARATE pass — it does not
+    /// touch `enumerate_buses`, so the xHCI discovery path stays byte-identical in behavior — and
+    /// it prints one `[PCI-STOR]` inventory line per storage-class function it finds:
+    ///
+    ///   * class 0x08 / subclass 0x05 — SD Host Controller (SDHCI). The 2012 rMBP's built-in
+    ///     card reader is expected here; QEMU's `sdhci-pci` reports the same triple.
+    ///   * class 0x01 (any subclass) — Mass Storage Controller (SCSI/IDE/RAID/ATA/SATA/SAS/NVMe).
+    ///     Inventoried for the record only; there is no driver for any of them on this arch.
+    ///
+    /// Returns the class-0x08/0x05 functions (bus, slot, func) in discovery order, for the SDHC
+    /// driver's read-only version/capability probe. NO config-space WRITE is issued anywhere in
+    /// this function: BAR0 is read as the firmware left it (never sized, which would need the
+    /// write-all-ones/restore dance), and no COMMAND bit is touched.
+    pub fn storage_inventory() -> alloc::vec::Vec<(u8, u8, u8)> {
+        let mut sdhci = alloc::vec::Vec::new();
+        serial_println!("[PCI-STOR] storage-class census (class 0x01 mass-storage, class 0x08/0x05 SDHCI)...");
+
+        for bus in 0u16..256 {
+            for slot in 0u8..32 {
+                let vendor_id = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, 0, 0x00) };
+                if vendor_id == 0xFFFF {
+                    continue;
+                }
+                let header_type_reg = unsafe { crate::arch::pci::read_config_32(bus as u8, slot, 0, 0x0C) };
+                let is_multi_function = (((header_type_reg >> 16) & 0x80) as u8) != 0;
+                let max_func = if is_multi_function { 7 } else { 0 };
+
+                for func in 0..=max_func {
+                    if func != 0 {
+                        let v = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, func, 0x00) };
+                        if v == 0xFFFF {
+                            continue;
+                        }
+                    }
+                    let class_reg = unsafe { crate::arch::pci::read_config_32(bus as u8, slot, func, 0x08) };
+                    let class_code = ((class_reg >> 24) & 0xFF) as u8;
+                    let subclass = ((class_reg >> 16) & 0xFF) as u8;
+                    let prog_if = ((class_reg >> 8) & 0xFF) as u8;
+
+                    let kind = match (class_code, subclass) {
+                        (0x08, 0x05) => "sdhci",
+                        (0x01, 0x00) => "scsi",
+                        (0x01, 0x01) => "ide",
+                        (0x01, 0x04) => "raid",
+                        (0x01, 0x05) => "ata",
+                        (0x01, 0x06) => "sata",
+                        (0x01, 0x07) => "sas",
+                        (0x01, 0x08) => "nvm",
+                        (0x01, _) => "mass-storage",
+                        _ => continue,
+                    };
+
+                    let vend = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, func, 0x00) };
+                    let dev = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, func, 0x02) };
+                    serial_println!(
+                        "[PCI-STOR] bdf {}:{}.{} {:04x}:{:04x} class={:02x} sub={:02x} progif={:02x} ({}) bar0={:#x}",
+                        bus, slot, func, vend, dev, class_code, subclass, prog_if, kind,
+                        Self::get_bar_address(bus as u8, slot, func)
+                    );
+
+                    if class_code == 0x08 && subclass == 0x05 {
+                        sdhci.push((bus as u8, slot, func));
+                    }
+                }
+            }
+        }
+
+        if sdhci.is_empty() {
+            serial_println!("[PCI-STOR] no SD host controller (class 0x08/0x05) on this machine");
+        }
+        sdhci
+    }
+
     pub fn find_device(target_class: u8, target_subclass: u8) -> Option<(u8, u8, u8)> {
         for bus in 0u16..256 {
             for slot in 0u8..32 {

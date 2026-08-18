@@ -1,0 +1,1755 @@
+=== SQUAWK MARK 2026-07-20T03:48:27Z MARK R23s1 boot20 ORIN â€” NET-4p iATU-alias (LEASE?) + XCARVE clean, hw-jetson 4d8f2a54 ===
+
+[0000.066] I> MB1 (version: 1.0.1.17-t234-54845784-9b0d5809)
+[0000.071] I> t234-A01-1-Silicon (0x12347) Prod
+[0000.075] I> Boot-mode : Coldboot
+[0000.079] I> Entry timestamp: 0x00000000
+[0000.082] I> last_boot_error: 0x0
+[0000.086] I> BR-BCT: preprod_dev_sign: 0
+[0000.089] C> rst_source: 0x0, rst_level: 0x0
+[0000.093] I> Total boot-chains: 2   Active-chain: 0|A  -  BR-BCT based selection
+[0000.101] I> Default chain: 0|A
+[0000.104] I> Task: SE error check
+[0000.107] I> Task: Bootchain select WAR set
+[0000.111] I> Task: Update Boot chain markers
+[0000.115] I> Task: Send error information to MCU
+[0000.119] I> Task: Enable SLCG
+[0000.122] I> Task: CRC check
+[0000.125] I> Task: Initialize MB2 params
+[0000.129] I> MB2-params @ 0x40060000
+[0000.133] I> Task: Crypto init
+[0000.135] I> Task: Perform MB1 KAT tests
+[0000.139] I> Task: NVRNG health check
+[0000.143] I> NVRNG: Health check success
+[0000.147] I> Task: Check ECID against ECID in fuses
+[0000.151] I> Task: MSS Bandwidth limiter settings for iGPU clients
+[0000.157] I> Task: Enabling and initialization of Bandwidth limiter
+[0000.164] I> No request to configure MBWT settings for any PC!
+[0000.169] I> Task: Secure debug controls
+[0000.173] I> Task: strap war set
+[0000.176] I> Task: Initialize SOC Therm
+[0000.180] I> Task: Program NV master stream id
+[0000.184] I> Task: Verify boot mode
+[0000.190] I> Task: Alias fuses
+[0000.193] W> FUSE_ALIAS: Fuse alias on production fused part is not supported.
+[0000.200] I> Task: Print SKU type
+[0000.203] I> FUSE_OPT_CCPLEX_CLUSTER_DISABLE = 0x000001c8
+[0000.208] I> FUSE_OPT_GPC_DISABLE = 0x00000002
+[0000.213] I> FUSE_OPT_TPC_DISABLE = 0x000000f0
+[0000.217] I> FUSE_OPT_DLA_DISABLE = 0x00000003
+[0000.221] I> FUSE_OPT_PVA_DISABLE = 0x00000001
+[0000.226] I> FUSE_OPT_NVENC_DISABLE = 0x00000001
+[0000.230] I> FUSE_OPT_NVDEC_DISABLE = 0x00000000
+[0000.234] I> FUSE_OPT_FSI_DISABLE = 0x00000001
+[0000.239] I> FUSE_OPT_EMC_DISABLE = 0x0000000c
+[0000.243] I> FUSE_BOOTROM_PATCH_VERSION = 0x7
+[0000.247] I> FUSE_PSCROM_PATCH_VERSION = 0x7
+[0000.251] I> FUSE_OPT_ADC_CAL_FUSE_REV = 0x2
+[0000.255] I> FUSE_SKU_INFO_0 = 0xd5
+[0000.259] I> FUSE_OPT_SAMPLE_TYPE_0 = 0x3 PS 
+[0000.263] I> FUSE_PACKAGE_INFO_0 = 0x2
+[0000.267] I> SKU: Prod
+[0000.269] I> Task: Boost clocks
+[0000.272] I> Initializing NAFLL for BPMP_CPU_NIC.
+[0000.277] I> BPMP NAFLL: fll_lock = 1, dvco_min_reached = 0
+[0000.282] I> BPMP NAFLL lock success.
+[0000.286] I> BPMP_CPU_NIC : src = 42, divisor = 0
+[0000.290] I> Initializing PLLC2 for AXI_CBB.
+[0000.294] I> AXI_CBB : src = 35, divisor = 0
+[0000.299] I> Task: Voltage monitor
+[0000.302] I> VMON: Vmon re-calibration and fine tuning done
+[0000.307] I> Task: UPHY init
+[0000.312] I> HSIO UPHY init done
+[0000.315] W> Skipping GBE UPHY config
+[0000.319] I> Task: Boot device init
+[0000.322] I> Boot_device: QSPI_FLASH instance: 0
+[0000.327] I> Qspi clock source : pllc_out0
+[0000.331] I> QSPI Flash: Macronix 64MB
+[0000.334] I> QSPI-0l initialized successfully
+[0000.339] I> Task: TSC init
+[0000.342] I> Task: Load membct
+[0000.344] I> RAM_CODE 0x4000421
+[0000.347] I> Loading MEMBCT 
+[0000.350] I> Chain: 0
+[0000.352] I> Binary[0] block-3840 (partition size: 0x40000)
+[0000.358] I> Binary name: MEM-BCT-0
+[0000.361] I> Size of crypto header is 8192
+[0000.365] I> Size of crypto header is 8192
+[0000.369] I> BCH of MEM-BCT-0 read from storage
+[0000.374] I> BCH address is : 0x40050000
+[0000.377] I> component binary type is 0
+[0000.381] I> MEM-BCT-0 header integrity check is success
+[0000.386] I> Binary magic in BCH component 0 is MEM0
+[0000.391] I> component binary type is 0
+[0000.395] I> component binary type is 0
+[0000.399] I> MEM-BCT-0 binary is read from storage
+[0000.404] I> MEM-BCT-0 binary integrity check is success
+[0000.409] I> Binary MEM-BCT-0 loaded successfully at 0x40040000 (0xe580)
+[0000.416] I> RAM_CODE 0x4000421
+[0000.421] I> RAM_CODE 0x4000421
+[0000.424] I> Task: Load Page retirement list
+[0000.428] I> Task: SDRAM params override
+[0000.432] I> Task: Save mem-bct info
+[0000.436] E> GPCDMA: TZ to non-TZ or vice versa memcpy using DMA is not supported.
+[0000.444] E> GPCDMA: Failed DMA xfer.
+[0000.448] E> GPCDMA: TZ to non-TZ or vice versa memcpy using DMA is not supported.
+[0000.456] E> GPCDMA: Failed DMA xfer.
+[0000.459] I> Task: Carveout allocate
+[0000.463] I> RCM blob carveout will not be allocated
+[0000.467] I> Update CCPLEX IST carveout from MB1-BCT
+[0000.472] I> ECC region[0]: Start:0x0, End:0x0
+[0000.476] I> ECC region[1]: Start:0x0, End:0x0
+[0000.481] I> ECC region[2]: Start:0x0, End:0x0
+[0000.485] I> ECC region[3]: Start:0x0, End:0x0
+[0000.489] I> ECC region[4]: Start:0x0, End:0x0
+[0000.494] I> Non-ECC region[0]: Start:0x80000000, End:0x280000000
+[0000.499] I> Non-ECC region[1]: Start:0x0, End:0x0
+[0000.504] I> Non-ECC region[2]: Start:0x0, End:0x0
+[0000.509] I> Non-ECC region[3]: Start:0x0, End:0x0
+[0000.513] I> Non-ECC region[4]: Start:0x0, End:0x0
+[0000.524] I> allocated(CO:28) base:0x27c000000 size:0x4000000 align: 0x2000000
+[0000.531] I> allocated(CO:43) base:0xbe000000 size:0x4000000 align: 0x200000
+[0000.538] I> allocated(CO:39) base:0x279e00000 size:0x2200000 align: 0x10000
+[0000.545] I> allocated(CO:15) base:0x277e00000 size:0x2000000 align: 0x100000
+[0000.552] I> allocated(CO:20) base:0x274000000 size:0x2000000 align: 0x2000000
+[0000.559] I> allocated(CO:21) base:0x272000000 size:0x2000000 align: 0x2000000
+[0000.566] I> allocated(CO:24) base:0x270000000 size:0x2000000 align: 0x2000000
+[0000.573] I> allocated(CO:35) base:0x26e000000 size:0x2000000 align: 0x100000
+[0000.581] I> allocated(CO:22) base:0x276000000 size:0x1000000 align: 0x1000000
+[0000.588] I> allocated(CO:02) base:0x277000000 size:0x800000 align: 0x800000
+[0000.595] I> allocated(CO:03) base:0x26d800000 size:0x800000 align: 0x800000
+[0000.602] I> allocated(CO:06) base:0x26d000000 size:0x800000 align: 0x800000
+[0000.608] I> allocated(CO:56) base:0x26c800000 size:0x800000 align: 0x200000
+[0000.615] I> allocated(CO:07) base:0x277800000 size:0x400000 align: 0x400000
+[0000.622] I> allocated(CO:33) base:0x26c400000 size:0x400000 align: 0x200000
+[0000.629] I> allocated(CO:19) base:0x26c180000 size:0x280000 align: 0x10000
+[0000.636] I> allocated(CO:17) base:0x277c00000 size:0x200000 align: 0x200000
+[0000.643] I> allocated(CO:23) base:0x26be00000 size:0x200000 align: 0x200000
+[0000.650] I> allocated(CO:01) base:0x26c000000 size:0x100000 align: 0x100000
+[0000.657] I> allocated(CO:05) base:0x26bd00000 size:0x100000 align: 0x100000
+[0000.664] I> allocated(CO:08) base:0x26bc00000 size:0x100000 align: 0x100000
+[0000.671] I> allocated(CO:09) base:0x26bb00000 size:0x100000 align: 0x100000
+[0000.678] I> allocated(CO:12) base:0x26ba00000 size:0x100000 align: 0x100000
+[0000.685] I> allocated(CO:27) base:0x26b900000 size:0x100000 align: 0x100000
+[0000.692] I> allocated(CO:42) base:0x26b800000 size:0x100000 align: 0x100000
+[0000.699] I> allocated(CO:54) base:0x26c100000 size:0x80000 align: 0x80000
+[0000.705] I> allocated(CO:34) base:0x26b7f0000 size:0x10000 align: 0x10000
+[0000.712] I> allocated(CO:72) base:0x26b5f0000 size:0x200000 align: 0x10000
+[0000.719] I> allocated(CO:47) base:0x267400000 size:0x4000000 align: 0x200000
+[0000.726] I> allocated(CO:50) base:0x267200000 size:0x200000 align: 0x100000
+[0000.733] I> allocated(CO:48) base:0x26b5d0000 size:0x20000 align: 0x10000
+[0000.740] I> allocated(CO:69) base:0x26b5b0000 size:0x20000 align: 0x10000
+[0000.746] I> allocated(CO:49) base:0x26b5a0000 size:0x10000 align: 0x10000
+[0000.753] I> NSDRAM base: 0x80000000, end: 0x26b5f0000, size: 0x1eb5f0000
+[0000.760] I> Task: Thermal check
+[0000.763] I> (MB1 SKU-specific) max_chip_limit = 105
+[0000.768] I> (MB1 SKU-specific) min_chip_limit = -28
+[0000.773] I> (MB1 BCT) max_chip_limit = 105
+[0000.777] I> (MB1 BCT) min_chip_limit = -28
+[0000.781] I> max temp read = 22
+[0000.784] I> min temp read = 21
+[0000.787] I> Task: Update FSI SCR with thermal fuse data
+[0000.792] I> Task: Enable WDT 5th expiry
+[0000.795] I> Task: I2C register
+[0000.798] I> Task: Set I2C bus freq
+[0000.802] I> Task: Reset FSI
+[0000.805] I> Task: Pad voltage init
+[0000.808] I> Task: Pinmux init
+[0000.811] I> skipped mmio_addr = 0x9240008
+[0000.815] I> skipped mmio_addr = 0x9240000
+[0000.819] I> skipped mmio_addr = 0x9240010
+[0000.823] I> skipped mmio_addr = 0x9240018
+[0000.827] I> skipped mmio_addr = 0x9240020
+[0000.831] I> skipped mmio_addr = 0x9240030
+[0000.835] I> skipped mmio_addr = 0x9240028
+[0000.839] I> skipped mmio_addr = 0x9240038
+[0000.843] I> skipped mmio_addr = 0x9240040
+[0000.847] I> skipped mmio_addr = 0x9240048
+[0000.850] I> skipped mmio_addr = 0x9241000
+[0000.854] I> skipped mmio_addr = 0x9241008
+[0000.858] I> skipped mmio_addr = 0x9241010
+[0000.862] I> skipped mmio_addr = 0x9241018
+[0000.866] I> skipped mmio_addr = 0x9241020
+[0000.870] I> skipped mmio_addr = 0x9241028
+[0000.874] I> skipped mmio_addr = 0x9241030
+[0000.878] I> skipped mmio_addr = 0x9241038
+[0000.882] I> skipped mmio_addr = 0x9241040
+[0000.886] I> skipped mmio_addr = 0x9242000
+[0000.890] I> skipped mmio_addr = 0x9242008
+[0000.894] I> Task: Prod config init
+[0000.897] I> Task: Prod init
+[0000.900] I> Task: Program rst req config reg
+[0000.904] I> Task: Common rail init
+[0000.908] I> DONE: Thermal config
+[0000.911] W> DEVICE_PROD: module = 13, instance = 4 not found in device prod.
+[0000.920] I> DONE: SOC rail config
+[0000.923] W> PMIC_CONFIG: Rail: MEMIO rail config not found in MB1 BCT.
+[0000.930] I> DONE: MEMIO rail config
+[0000.934] W> PMIC_CONFIG: Rail: GPU rail info not found in MB1 BCT.
+[0000.940] I> DONE: GPU rail info
+[0000.943] W> PMIC_CONFIG: Rail: CV rail info not found in MB1 BCT.
+[0000.949] I> DONE: CV rail info
+[0000.952] I> Task: Mem clock src
+[0000.955] I> Task: Misc. board config
+[0000.959] I> PMIC_CONFIG: Platform config not found in MB1 BCT.
+[0000.965] I> Task: SDRAM init
+[0000.968] I> MemoryType: 4 MemBctRevision: 1
+[0000.975] I> MSS CAR: PLLM/HUB programming for MemoryType: 4 and MemBctRevision: 1
+[0000.982] I> MSS CAR: Init PLLM
+[0000.985] I> MSS CAR: Init PLLHUB
+[0000.990] I> Encryption:   MTS: en, TX: en, VPR: en, GSC: en
+[0001.001] I> SDRAM initialized!
+[0001.004] I> SDRAM Size in Total 0x200000000
+[0001.008] I> Task: Dram Ecc scrub
+[0001.011] I> Task: DRAM alias check
+[0001.017] I> Task: Program NSDRAM carveout
+[0001.021] I> NSDRAM carveout encryption is enabled
+[0001.025] I> Program NSDRAM carveout
+[0001.029] I> Task: Check MSS settings
+[0001.033] I> Task: MSS Encrypt status check
+[0001.037] I> Task: Register checker
+[0001.040] I> Task: Enable clock-mon
+[0001.044] I> FMON: Fmon re-programming done
+[0001.048] I> Task: Mapper init
+[0001.051] I> Task: SC7 Context Init
+[0001.055] E> FUSE: Failed to verify ECID.
+[0001.059] I> Task: CCPLEX IST init
+[0001.063] I> Task: CPU WP0
+[0001.065] I> Loading MCE
+[0001.068] I> Chain: 0
+[0001.070] I> Binary[8] block-22784 (partition size: 0x80000)
+[0001.075] I> Binary name: MCE
+[0001.078] I> Size of crypto header is 8192
+[0001.082] I> Size of crypto header is 8192
+[0001.086] I> BCH of MCE read from storage
+[0001.090] I> BCH address is : 0x4003e000
+[0001.094] I> component binary type is 8
+[0001.098] I> MCE header integrity check is success
+[0001.102] I> Binary magic in BCH component 0 is MTSM
+[0001.107] I> component binary type is 8
+[0001.111] I> Size of crypto header is 8192
+[0001.115] I> component binary type is 8
+[0001.120] I> MCE binary is read from storage
+[0001.125] I> MCE binary integrity check is success
+[0001.129] I> Binary MCE loaded successfully at 0x40000000 (0x2bbc0)
+[0001.135] I> Size of crypto header is 8192
+[0001.140] I> Size of crypto header is 8192
+[0001.144] I> Sending WP0 mailbox command to PSC
+[0001.153] I> Task: XUSB Powergate
+[0001.156] I> Skipping powergate XUSB.
+[0001.160] I> Task: MB1 fixed firewalls
+[0001.165] I> Task: Load bpmp-fw
+[0001.168] I> Chain: 0
+[0001.170] I> Binary[15] block-9984 (partition size: 0x180000)
+[0001.176] I> Binary name: BPMP_FW
+[0001.179] I> Size of crypto header is 8192
+[0001.183] I> Size of crypto header is 8192
+[0001.187] I> BCH of BPMP_FW read from storage
+[0001.191] I> BCH address is : 0x807fe000
+[0001.195] I> component binary type is 15
+[0001.199] I> BPMP_FW header integrity check is success
+[0001.204] I> Binary magic in BCH component 0 is BPMF
+[0001.208] I> component binary type is 15
+[0001.212] I> Size of crypto header is 8192
+[0001.216] I> component binary type is 15
+[0001.230] I> BPMP_FW binary is read from storage
+[0001.237] I> BPMP_FW binary integrity check is success
+[0001.242] I> Binary BPMP_FW loaded successfully at 0x80000000 (0xf8c00)
+[0001.248] I> Chain: 0
+[0001.250] I> Binary[16] block-13056 (partition size: 0x400000)
+[0001.256] I> Binary name: BPMP_FW_DTB
+[0001.259] I> Size of crypto header is 8192
+[0001.263] I> Size of crypto header is 8192
+[0001.267] I> BCH of BPMP_FW_DTB read from storage
+[0001.272] I> BCH address is : 0x807fc000
+[0001.276] I> component binary type is 16
+[0001.280] I> BPMP_FW_DTB header integrity check is success
+[0001.285] I> Binary magic in BCH component 0 is BPMD
+[0001.290] I> component binary type is 16
+[0001.293] I> Size of crypto header is 8192
+[0001.297] I> component binary type is 16
+[0001.304] I> BPMP_FW_DTB binary is read from storage
+[0001.309] I> BPMP_FW_DTB binary integrity check is success
+[0001.315] I> Binary BPMP_FW_DTB loaded successfully at 0x807b5ff0 (0x45fc0)
+[0001.322] I> Task: Load psc-fw
+[0001.325] I> Chain: 0
+[0001.327] I> Binary[17] block-21248 (partition size: 0xc0000)
+[0001.332] I> Binary name: PSC_FW
+[0001.335] I> Size of crypto header is 8192
+[0001.339] I> Size of crypto header is 8192
+[0001.344] I> BCH of PSC_FW read from storage
+[0001.348] I> BCH address is : 0x80ffe000
+[0001.351] I> component binary type is 17
+[0001.355] I> PSC_FW header integrity check is success
+[0001.360] I> Binary magic in BCH component 0 is PFWP
+[0001.365] I> component binary type is 17
+[0001.369] I> Size of crypto header is 8192
+[0001.373] I> component binary type is 17
+[0001.380] I> PSC_FW binary is read from storage
+[0001.385] I> PSC_FW binary integrity check is success
+[0001.390] I> Binary PSC_FW loaded successfully at 0x80fac600 (0x51940)
+[0001.396] I> SCRATCH_PSC_FW_LOADADDR: 0x80fac600
+[0001.401] I> Task: Load nvdec-fw
+[0001.404] I> Chain: 0
+[0001.406] I> Binary[7] block-6400 (partition size: 0x100000)
+[0001.411] I> Binary name: NVDEC
+[0001.414] I> Size of crypto header is 8192
+[0001.418] I> Size of crypto header is 8192
+[0001.422] I> BCH of NVDEC read from storage
+[0001.426] I> BCH address is : 0x800fe000
+[0001.430] I> component binary type is 7
+[0001.434] I> NVDEC header integrity check is success
+[0001.439] I> Binary magic in BCH component 0 is NDEC
+[0001.444] I> component binary type is 7
+[0001.447] I> Size of crypto header is 8192
+[0001.451] I> component binary type is 7
+[0001.458] I> NVDEC binary is read from storage
+[0001.463] I> NVDEC binary integrity check is success
+[0001.468] I> Binary NVDEC loaded successfully at 0x80000000 (0x46000)
+[0001.474] I> Size of crypto header is 8192
+[0001.481] I> Task: Load tsec-fw
+[0001.483] I> TSEC-FW load support not enabled
+[0001.488] I> Task: GPIO interrupt map
+[0001.491] I> Task: SC7 context save
+[0001.495] I> Chain: 0
+[0001.497] I> Binary[27] block-0 (partition size: 0x100000)
+[0001.502] I> Binary name: BR_BCT
+[0001.505] I> Size of crypto header is 8192
+[0001.509] I> Size of crypto header is 8192
+[0001.513] I> Size of crypto header is 8192
+[0001.517] I> BR_BCT binary is read from storage
+[0001.522] I> BR_BCT binary integrity check is success
+[0001.527] I> Binary BR_BCT loaded successfully at 0xa0000000 (0x2000)
+[0001.533] I> Chain: 0
+[0001.535] I> Binary[13] block-23808 (partition size: 0x30000)
+[0001.541] I> Binary name: SC7-FW
+[0001.544] I> Size of crypto header is 8192
+[0001.548] I> Size of crypto header is 8192
+[0001.551] I> Size of crypto header is 8192
+[0001.555] I> Size of crypto header is 8192
+[0001.560] I> BCH of SC7-FW read from storage
+[0001.564] I> BCH address is : 0xa0002000
+[0001.567] I> component binary type is 13
+[0001.571] I> SC7-FW header integrity check is success
+[0001.576] I> Binary magic in BCH component 0 is WB0B
+[0001.581] I> component binary type is 13
+[0001.585] I> Size of crypto header is 8192
+[0001.589] I> component binary type is 13
+[0001.594] I> SC7-FW binary is read from storage
+[0001.599] I> SC7-FW binary integrity check is success
+[0001.604] I> Binary SC7-FW loaded successfully at 0xa0004000 (0x2d260)
+[0001.610] I> Chain: 0
+[0001.612] I> Binary[22] block-24192 (partition size: 0x30000)
+[0001.618] I> Binary name: PSC_RF
+[0001.621] I> Size of crypto header is 8192
+[0001.625] I> Size of crypto header is 8192
+[0001.629] I> Size of crypto header is 8192
+[0001.633] I> Size of crypto header is 8192
+[0001.637] I> BCH of PSC_RF read from storage
+[0001.641] I> BCH address is : 0xa0031260
+[0001.645] I> component binary type is 22
+[0001.649] I> PSC_RF header integrity check is success
+[0001.654] I> Binary magic in BCH component 0 is PSCR
+[0001.658] I> component binary type is 22
+[0001.662] I> Size of crypto header is 8192
+[0001.666] I> component binary type is 22
+[0001.671] I> PSC_RF binary is read from storage
+[0001.676] I> PSC_RF binary integrity check is success
+[0001.681] I> Binary PSC_RF loaded successfully at 0xa0033260 (0x20000)
+[0001.690] I> Task: Save WP0 payload to SC7 ctx
+[0001.695] I> Task: Load MB2rf binary to SC7 ctx
+[0001.699] I> Chain: 0
+[0001.701] I> Binary[14] block-24576 (partition size: 0x20000)
+[0001.707] I> Binary name: MB2_RF
+[0001.710] I> Size of crypto header is 8192
+[0001.714] I> Size of crypto header is 8192
+[0001.718] I> Size of crypto header is 8192
+[0001.722] I> Size of crypto header is 8192
+[0001.726] I> BCH of MB2_RF read from storage
+[0001.730] I> BCH address is : 0xa00d5e00
+[0001.734] I> component binary type is 14
+[0001.737] I> MB2_RF header integrity check is success
+[0001.742] I> Binary magic in BCH component 0 is MB2R
+[0001.747] I> component binary type is 14
+[0001.751] I> Size of crypto header is 8192
+[0001.755] I> component binary type is 14
+[0001.760] I> MB2_RF binary is read from storage
+[0001.764] I> MB2_RF binary integrity check is success
+[0001.769] I> Binary MB2_RF loaded successfully at 0xa00d7e00 (0x1ac20)
+[0001.776] I> Task: Save fuse alias data to SC7 ctx
+[0001.780] I> Task: Save PMIC data to SC7 ctx
+[0001.784] I> Task: Save Pinmux data to SC7 ctx
+[0001.789] I> Task: Save Pad Voltage data to SC7 ctx
+[0001.793] I> Task: Save controller prod data to SC7 ctx
+[0001.799] I> Task: Save prod cfg data to SC7 ctx
+[0001.803] I> Task: Save I2C bus freq data to SC7 ctx
+[0001.808] I> Task: Save SOCTherm data to SC7 ctx
+[0001.812] I> Task: Save FMON data to SC7 ctx
+[0001.816] I> Task: Save VMON data to SC7 ctx
+[0001.821] I> Task: Save TZDRAM data to SC7 ctx
+[0001.825] I> Task: Save GPIO int data to SC7 ctx
+[0001.829] I> Task: Save clock data to SC7 ctx
+[0001.833] I> Task: Save debug data to SC7 ctx
+[0001.838] I> Task: Save MBWT data to SC7 ctx
+[0001.846] I> SC7 context save done
+[0001.849] I> Task: Load MB2/Applet/FSKP
+[0001.853] I> Loading MB2
+[0001.855] I> Chain: 0
+[0001.857] I> Binary[6] block-8448 (partition size: 0x80000)
+[0001.863] I> Binary name: MB2
+[0001.865] I> Size of crypto header is 8192
+[0001.869] I> Size of crypto header is 8192
+[0001.873] I> BCH of MB2 read from storage
+[0001.877] I> BCH address is : 0x8007e000
+[0001.881] I> component binary type is 6
+[0001.885] I> MB2 header integrity check is success
+[0001.889] I> Binary magic in BCH component 0 is MB2B
+[0001.894] I> component binary type is 6
+[0001.898] I> Size of crypto header is 8192
+[0001.902] I> component binary type is 6
+[0001.910] I> MB2 binary is read from storage
+[0001.915] I> MB2 binary integrity check is success
+[0001.920] I> Binary MB2 loaded successfully at 0x80000000 (0x69410)
+[0001.926] I> Task: Map CCPLEX SHARED carveout
+[0001.930] I> Task: Prepare MB2 params
+[0001.934] I> Task: Dram ecc test
+[0001.937] I> Task: Misc NV security settings
+[0001.941] I> NVDEC sticky bits programming done
+[0001.946] I> Successfully powergated NVDEC
+[0001.950] I> Task: Disable/Reload WDT
+[0001.953] I> Task: Program misc carveouts
+[0001.957] I> Task: Disable SCPM/POD reset
+[0001.961] I> SLCG Global override status := 0x0
+[0001.966] I> MB1: MSS reconfig completed
+I> MB2 (version: 0.0.0.0-t234-54845784-5b8edbc4-01Jun26-131747-0700)
+I> t234-A01-1-Silicon (0x12347) Prod
+I> Boot-mode : Coldboot
+I> Entry timestamp: 0x001e5a6e
+I> Regular heap: [base:0x40040000, size:0x10000]
+I> DMA heap: [base:0x26c800000, size:0x800000]
+I> Task: Crypto init
+I> Task: MB2 Params integrity check
+I> Task: Enable CCPLEX WDT 5th expiry
+I> Task: ARI update carveout TZDRAM
+I> Task: Check MC errors
+I> Task: SMMU external bypass disable
+I> Task: Enable hot-plug capability
+I> Task: TZDRAM heap init
+I> Task: PSC mailbox init
+I> Task: Enable clock for external modules
+I> Task: Measured Boot init
+I> Task: fTPM silicon identity init
+I> fTPM not enabled
+I> Task: OEM SC7 context save init
+I> Task: I2C register
+I> Task: Map CCPLEX_INTERWORLD_SHMEM carveout
+I> Task: Program CBB PCIE AMAP regions
+I> Task: Boot device init
+I> Boot_device: QSPI_FLASH instance: 0
+I> Qspi clock source : pllc_out0
+I> QSPI Flash: Macronix 64MB at index: 5
+I> QSPI-0l initialized successfully
+I> Secondary storage device: QSPI_FLASH instance: 0
+I> Task: Partition Manager Init
+I> Found 60 partitions in QSPI_FLASH (instance 0)
+I> Task: Pass DRAM ECC PRL Flag to FSI
+I> Task: Load and authenticate registered FWs
+I> Task: Initialize CPUBL Params
+I> CPUBL-params @ 0x27c000000
+I> Task: Load Misc-Config
+I> Skip loading MISC-Config
+I> Task: Configure OEM set LA/PTSA values
+I> LA/PTSA updates are done from mb2-bct
+I> Task: Validity check on SPE UART instance
+I> Task: Load AUXP FWs
+I> Unpowergating APE
+I> Unpowergate done
+I> Skipping FSI FW load
+I> Partition name: A_spe-fw
+I> Size of partition: 589824
+I> Bin@ dev:3/0 blk-55040 sz:0x90000 A_spe-fw
+I> Ratchet[A_spe-fw] sw=0 hw=0
+I> spe ratchet check pass
+I> Partition name: A_rce-fw
+I> Size of partition: 1048576
+I> Bin@ dev:3/0 blk-56192 sz:0x100000 A_rce-fw
+I> Ratchet[A_rce-fw] sw=0 hw=0
+I> rce ratchet check pass
+I> spe: Authentication Finalize Done
+I> Binary spe loaded successfully at 0x26bc00000
+I> Partition name: A_dce-fw
+I> Size of partition: 5242880
+I> Bin@ dev:3/0 blk-44800 sz:0x500000 A_dce-fw
+I> Ratchet[A_dce-fw] sw=0 hw=0
+I> dce ratchet check pass
+I> rce: Authentication Finalize Done
+I> Binary rce loaded successfully at 0x277c00000
+I> dce : oem authentication of header done
+I> dce: meta-blob integ OK
+I> dce : will be decompressed at 0x274000000
+I> version 1 Bin 1 BCheckSum 0 content_size 0 Content ChkSum 1 reserved_00  0
+I> Reserved10 0 BlockMaxSize 5 Reserved11 0
+I> dce : decompressed to 12419616 bytes
+I> dce: plain bin integ OK
+I> Partition name: A_adsp-fw
+I> Size of partition: 2097152
+I> Bin@ dev:3/0 blk-58240 sz:0x200000 A_adsp-fw
+I> Ratchet[A_adsp-fw] sw=0 hw=0
+I> ape ratchet check pass
+I> dce: Authentication Finalize Done
+I> Binary dce loaded successfully at 0x274000000
+I> Partition name: A_xusb-fw
+I> Size of partition: 262144
+I> Bin@ dev:3/0 blk-9472 sz:0x40000 A_xusb-fw
+I> Ratchet[A_xusb-fw] sw=0 hw=0
+I> xusb ratchet check pass
+I> ape: Authentication Finalize Done
+I> Binary ape loaded successfully at 0x277800000
+I> Partition name: A_pva-fw
+I> Size of partition: 262144
+I> Bin@ dev:3/0 blk-62336 sz:0x40000 A_pva-fw
+I> Ratchet[A_pva-fw] sw=0 hw=0
+I> pva-fw ratchet check pass
+I> xusb: Authentication Finalize Done
+I> Binary xusb loaded successfully at 0x26bd00000
+I> pva-fw : oem authentication of header done
+I> pva-fw: meta-blob integ OK
+I> pva-fw : will be decompressed at 0x26c180000
+I> version 1 Bin 1 BCheckSum 0 content_size 0 Content ChkSum 1 reserved_00  0
+I> Reserved10 0 BlockMaxSize 5 Reserved11 0
+I> pva-fw : decompressed to 2152896 bytes
+I> pva-fw: plain bin integ OK
+I> pva-fw: Authentication Finalize Done
+I> Binary pva-fw loaded successfully at 0x26c180000
+I> Task: Check MC errors
+I> Task: Carveout setup
+I> Program remaining OEM carveouts
+I> Task: Enable FSI VMON
+I> Task: Enable FSI SE clock
+I> Task: Initialize SBSA UART CAR
+I> Task: Ratchet update
+W> Skip ratchet update - OPTIN fuse not set
+I> Ratchet: [BR-BCT      ]: active: 0, MIN(in-active): 0, hw: 0
+I> Ratchet: [MB1         ]: active: 0, MIN(in-active): 0, hw: 0
+I> Ratchet: [NVDEC-UCODE1]: active: 0, MIN(in-active): 0, hw: 0
+I> Ratchet: [NVDEC-UCODE2]: active: 0, MIN(in-active): 0, hw: 0
+I> Ratchet: [MB1-BCT     ]: active: 0, MIN(in-active): 0, hw: 0
+I> Ratchet: [MCE         ]: active: 0, MIN(in-active): 0, hw: 0
+I> Ratchet: [PSC-BL1     ]: active: 0, MIN(in-active): 0, hw: 0
+I> Ratchet: [BPMP-FW     ]: active: 0, MIN(in-active): 0, hw: 0
+I> Ratchet: [PSC-FW      ]: active: 0, MIN(in-active): 0, hw: 0
+I> Ratchet: [TSEC        ]: active: 0, MIN(in-active): 0, hw: 0
+I> Ratchet: [CCPLEX-IST UCODE    ]: active: 0, MIN(in-active): 0, hw: 0
+I> Ratchet: [KEY-ON-OFF IST UCODE]: active: 0, MIN(in-active): 0, hw: 0
+I> 
+I> Task: Prepare eeprom data
+I> Task: FSI padctl context save
+W> Skip FSI padctl save: FSI off
+I> Task: Unpowergate APE
+W> mb2_unpowergate_ape: skip! APE is in unpowergated state
+I> Task: Memctrl reconfig pending clients
+I> Task: OEM firewalls
+I> OEM firewalls configured
+I> Task: Powergate APE
+I> Powergating APE
+I> Powergate done
+I> Task: OEM firewall restore saved settings
+I> Task: Restore OEM firewalls to restrict Flush control
+I> Task: Unhalt AUXPs
+I> Unhalting SPE..
+I> Enabling combined UART 
+
+ÿ¸ÿàvic initialized
+ÿ¸ÿàtsc initialized
+ÿ¸ÿàaon lic initialized
+ÿ¸ÿàspe: tag is aba4fbe46f5cf77a32ef5977211b71e5
+ÿ¸ÿàspe: SafeRTOS v8.4
+ÿ¸ÿàspe: init
+ÿ¸ÿàscheduler initialized
+ÿ¸ÿàaon hsp initialized
+ÿ¸ÿàtag initialized
+ÿ¸ÿàtcu initialized
+ÿ¸ÿàbpmp ipc initialized
+ÿ¸ÿàspe: late init
+ÿ¸ÿàcpu_nic clock initialized
+ÿ¸ÿàapb clock initialized
+ÿ¸ÿàpm initialized
+ÿ¸ÿàbpmp hsp initialized
+ÿ¸ÿàtop1 hsp initialized
+ÿ¸ÿàccplex ipc initialized
+ÿ¸ÿàspe: start scheduler
+ÿ¸ÿá
+I> Task: Trigger mailbox for PSC-BL1 exit
+I> Task: Unhalt AUXPs
+I> Unhalting RCE
+I> RCE unhalt successful
+I> Unhalting DCE
+I> DCE unhalt successful
+I> APE unhalt skipped
+I> Task: Load HV/CPUBL
+I> Task: Load TOS
+I> Task: Load and authenticate registered FWs
+I> Partition name: A_cpu-bootloader
+I> Size of partition: 3670016
+I> Bin@ dev:3/0 blk-24832 sz:0x380000 A_cpu-bootloader
+I> Ratchet[A_cpu-bootloader] sÿâ
+hwwdt_init: WDT boot cfg 0x710010 sts 0x10
+bpmp: socket 0
+bpmp: base binary md5 is bfff9e30f72531a69d7e98af55204154
+bpmp: combined binary md5 is 25124d2c239300e0a924d5ce8ff1c158
+bpmp: firmware tag is 25124d2c239300e0a924-bfff9e30f72
+initialized vwdt
+initialized mail_early
+initialized fuse
+initialized vfrel
+initialized adc
+fmon_populate_monitors: found 199 monitors
+initialized fmon
+initialized mc
+initialized reset
+initialized uphy_early
+initialized emc_early
+initialized pm
+465 clocks registered
+initialized clk_mach
+initialized clk_cal_early
+initialized clk_mach_early_config
+initialized io_dpd
+initialized soctherm
+initialized regime
+initialized i2c
+vrmon_dt_init: vrmon node not found
+vrmon_chk_boot_state: found 0 rail monitors
+initialized vrmon
+initialized regulator
+ÿå[     2.392556] Camera-FW on t234-rce-safe (FuSa) started
+ÿáw=0 hwÿåTCU early console enabled.
+ÿá=0
+I> cpubl ratchet check pass
+ÿè
+[TS:314561072591798272]DCE Started
+[TS:316518722980282368]DCE_R5_Init
+[TS:318614203164262400]MPU enabled
+[TS:320576805650038784]DCE_SW_Init
+ÿáI> cpubl : oem autÿâinitialized avfs_clk_platform
+initialized powergate
+ÿè[TS:320932635100577792][dce_mem_init_from_gsc] Failÿâinitialized dvs
+ÿèed to getÿâinitialized clk_mach_config
+initialized suspend
+initialized strap
+initialized mce_dbell
+ÿè ast region 2 mapping rc=:0x184549380
+[TS:321710174505009152]Using fdt from dce_fw
+ÿáhentication of header done
+I> cpubl: meta-blob integ OK
+I> cpubl : will be decompressed at 0x267400000
+I> version 1 Bin 1ÿâinitialized emc
+initialized emc_mrq
+ÿá BCheckSum 0 content_size 0 Content ÿâinitialized clk_cal
+initialized uphy_dt
+initialized uphy_mrq
+HSIO UPHY reset has been de-asserted 0x0
+initialized uphy
+initialized pg_late
+initialized pg_mrq_init
+swdtimer_init: reg polling start w period 47 ms
+initialized swdtimer
+initialized hwwdt_late
+initialized bwmgr
+initialized thermal_host_trip
+initialized thermal_mrq
+initialized oc_mrq
+initialized reset_mrq
+initialized mail_mrq
+initialized fmon_mrq
+initialized clk_mrq
+initialized avfs_mrq
+initialized i2c_mrq
+initialized tag_mrq
+initialized bwmgr_mrq
+initialized console_mrq
+missing prod DT calibration data for 199 fmons
+initialized clk_sync_fmon_post
+ÿáChkSum 1 reserved_00  0
+I> Reserved10 0 Blockÿâinitialized clk_cal_late
+initialized noc_late
+initialized cvc
+ÿáMaxSize 5 Reserved11 0
+ÿâinitialized avfs_clk_mach_post
+initialized avfs_clk_platform_post
+initialized cvc_late
+initialized rm
+initialized console_late
+handling unreferenced clks
+enable can1_core
+enable can1_host
+enable can2_core
+enable can2_host
+enable pwm3
+enable sdmmc4_axicif
+enable maud
+enable pllg_ref
+enable dsi_core
+enable aza_2xbit
+enable xusb_ss
+enable xusb_fs
+enable xusb_falcon
+enable xusb_core_mux
+enable dsi_lp
+clk_check_max_rate: pex1_c6_core rate 500000000 > max 250000000
+clk_check_max_rate: pex2_c7_core rate 500000000 > max 250000000
+clk_check_max_rate: pex2_c8_core rate 500000000 > max 250000000
+clk_check_max_rate: pex2_c9_core rate 500000000 > max 250000000
+clk_check_max_rate: pex2_c10_core rate 500000000 > max 250000000
+clk_check_max_rate: pex0_c0_core rate 500000000 > max 250000000
+clk_check_max_rate:ÿå[     2.602153] Camera-FW on t234-rce-safe ready (crt 12.990 ms, total boot 28ÿâ pex0_c1_core rate 500000000 > max 250000000
+clk_check_max_rate: pex0_c2_coreÿå7.333 ms)
+ÿâ rate 500000000 > max 250000000
+clk_check_max_rate: pex0_c3_core rate 500000000 > max 250000000
+clk_check_max_rate: pex0_c4_core rate 500000000 > max 250000000
+clk_check_max_rate: pex1_c5_core rate 500000000 > max 250000000
+initialized clk_mach_post
+initialized pg_post
+initialized regulator_post
+initialized profile
+initialized mrq
+initialized patrol_scrubber
+initialized cactmon
+initialized extras_post
+bpmp: init complete
+ÿáI> cpubl : decompressed to 3313792 bytes
+ÿè[TS:343821241670434816]Admin Task Init
+[TS:343862357392359424]Admin Task Init complete
+[TS:343904405122187264]Print Task Init
+[TS:34394487ÿáI> cpubl: plain bin integ OK
+ÿè6599017472]RM Task Init
+[TS:34398031437417676ÿáI> Partition name: A_secure-os
+I> Size of partition: 4194304
+I> Bin@ dev:3/0ÿè8]SHA Task Init
+[TS:344011302563217408]SHA INIT
+[TS:80105308]Admin Task Started
+[TS:80113676]DCE SC7 SHA Disabled
+[TS:80135895]RM Task Started
+[TS:80142515]RM Task Running [id:2]
+[TS:81101044]Print Task Started [id:4]
+[TS:81109638]Print Task Running
+[TS:81114246]SHA Task Started
+[TS:81115292]SHA Task Running [id:3]
+[TS:81116157]SHA Read-Only complete
+[TS:81198465]Posting event
+[TS:81ÿá blk-32000 sz:0x400000 A_secure-os
+ÿè200309]DCE: FW Boot Complete
+[TS:81236621]Admin Task Running [id:1]
+ÿáI> Ratchet[A_secure-os] sw=0 hw=0
+I> tos ratchet check pass
+I> MB2-params @ 0x40060000
+I> NSDRAM co base 0x80000000 size 0x1eb5f0000
+I> cpubl nsdram co=1 encryption=1
+I> cpubl: Authentication Finalize Done
+I> Binary cpubl loaded successfully at 0x267400000
+I> tos: Authentication Finalize Done
+I> Binary tos loaded successfully at 0xc1d32000
+I> OPTEE dtb: 0xc1efee40->0xbe040020 sz 0x3068
+I> [0] 0x80000000 sz 0x1eb5f0000
+I> [1] 0x27c000000 sz 0x4000000
+I> NS mem ranges set
+I> Partition name: A_eks
+I> Size of partition: 262144
+I> Bin@ dev:3/0 blk-44288 sz:0x40000 A_eks
+I> Ratchet[A_eks] sw=0 hw=0
+I> eks ratchet check pass
+I> eks: Authentication Finalize Done
+I> Binary eks loaded successfully at 0xbe020000
+I> EKB detected (length: 0x410) @ VA:0xbe020000
+I> Task: Compute cpubl params hash
+I> Added cpubl params hash.
+I> Task: SE error check
+I> Task: Unhalt FSI
+I> FSI unhalt skipped
+I> Task: Trigger load TSEC leyblob
+I> Task: Load and authenticate registered FWs
+I> Task: Prepare TOS params
+I> EKB blob set in OPTEE dtb
+I> OPTEE arg3: 0xbe040020
+I> NVRNG: Health check success
+I> NVRNG: Health check success
+I> Task: OEM SC7 context save
+I> OEM_SC7 ctx saved
+I> Task: Cleanup MISC config loader handler
+I> Task: Disable MSS perf stats
+I> Task: Program display sticky bits
+I> Task: Storage device deinit
+I> Task: SMMU init
+I> Task: Program GICv3 registers
+I> Task: Audit firewall settings
+I> Task: Bootchain failure check
+I> Current Boot-Chain Slot: 0
+I> BR-BCT chain=0 sts=0 UPDATE=0
+I> Task: Burn RESERVED_ODM0 fuse
+I> Task: Lock fusing
+I> Task: Clear dec source key
+I> MB2 finished
+
+ÿäNOTICE:  BL31: v2.13.0(release):d65e852
+NOTICE:  BL31: Built : 13:14:59, Jun  1 2026
+I/TC: 
+I/TC: Non-seÿåRCE FW sha: dfa4cae1
+ÿäcure external DT found
+I/TC: Switching console to device: /serial@0c198000
+I/TC: OP-TEE version: 4.6 (gcc version 13.2.0 (crosstool-NG 1.26.0)) #2 Mon Jun  1 20:22:40 UTC 2026 aarch64
+I/TC: WARNING: This OP-TEE configuration might be insecure!
+I/TC: WARNING: Please check https://optee.readthedocs.io/en/latest/architecture/porting_guidelines.html
+I/TC: Primary CPU initializing
+I/TC: Test OEM keys are being used. This is insecure for shipping products!
+I/TC: fTPM ID is not enabled.
+I/TC: ftpm-helper PTA: fTPM DT or EKB is not available. fTPM provisioning is not supported.
+I/TC: Primary CPU switching to normal world boot
+ÿá
+t23x_general UEFI firmware (version 39.2.0-gcid-45755727 built on 2026-06-01T20:15:56+00:00)
+
+
+
+ÿäI/TC: Reserved shared memory is disabled
+I/TC: Dynamic shared memory is enabled
+I/TC: Normal World virtualization support is disabled
+I/TC: Asynchronous notifications are disabled
+
+MmDispatchFvs: BfvHob - 0x406F3048
+MmDispatchFvs: BFV address - 0x40004000
+MmDispatchFvs: BFV size    - 0xCED87
+MmDispatchFvs: Dispatching...
+UpdatePeCoffPermissions: Mapping section 1 of image at 0x406EC000 with RW-XN permissions and size 0x1000
+MmInstallProtocolInterface: 5B1B31A1-9562-11D2-8E3F-00A0C969723B 406F2E90
+
+GetDeviceTypeRegions: 1 qspi0 regions present
+MmInstallProtocolInterface: 01458542-64B6-42D9-808C-544254D88FC6 406F1B20
+MmInstallProtocolInterface: 40930D29-595C-4588-B692-16E74A5B3C75 406F1990
+UpdatePeCoffPermissions: Mapping section 1 of image at 0x406E4000 with RW-XN permissions and size 0x1000
+MmInstallProtocolInterface: 5B1B31A1-9562-11D2-8E3F-00A0C969723B 406F2C90
+
+NorFlashInitialise: Using ChipSelect 0
+MmInstallProtocolInterface: C3FF8100-150D-4744-A68B-19A5435D5DAD 406F1430
+MmInstallProtocolInterface: 40930D29-595C-4588-B692-16E74A5B3C75 406F1710
+UpdatePeCoffPermissions: Mapping section 1 of image at 0x406DB000 with RW-XN permissions and size 0x1000
+MmInstallProtocolInterface: 5B1B31A1-9562-11D2-8E3F-00A0C969723B 406F2A90
+
+GetDeviceTypeRegions: 1 scratch-t234 regions present
+FVBNORInitialize:Using Reserved Partition 66781184 65536 for VarStore Integrity
+FVBNORInitialize: VariableOffset 65536000 VariableSize 262144FTW Offset 65798144 FTW Size 524288VarIntInit: Partition Start 0x3FB0000 66781184 Size 65536
+MmInstallProtocolInterface: 49DAE0B5-7994-4A9F-A129-3D19898EE913 406F1010
+MmInstallProtocolInterface: D326D041-BD31-4C01-B5A8-628BE87F0653 406CEE60
+MmInstallProtocolInterface: D326D041-BD31-4C01-B5A8-628BE87F0653 406CEEF8
+MmInstallProtocolInterface: D326D041-BD31-4C01-B5A8-628BE87F0653 406CEF90
+MmInstallProtocolInterface: D1A86E3F-0707-4C35-83CD-DC2C29C891A3 0
+UpdatePeCoffPermissions: Mapping section 1 of image at 0x405F9000 with RW-XN permissions and size 0x1000
+MmInstallProtocolInterface: 5B1B31A1-9562-11D2-8E3F-00A0C969723B 406F2890
+UpdatePeCoffPermissions: Mapping section 1 of image at 0x405F1000 with RW-XN permissions and size 0x1000
+MmInstallProtocolInterface: 5B1B31A1-9562-11D2-8E3F-00A0C969723B 406F2690
+MmInstallProtocolInterface: 3868FC3B-7E45-43A7-906C-4BA47DE1754D 405A8020
+UpdatePeCoffPermissions: Mapping section 1 of image at 0x405A5000 with RW-XN permissions and size 0x1000
+MmInstallProtocolInterface: 5B1B31A1-9562-11D2-8E3F-00A0C969723B 406F2490
+UpdatePeCoffPermissions: Mapping section 1 of image at 0x4059A000 with RW-XN permissions and size 0x1000
+MmInstallProtocolInterface: 5B1B31A1-9562-11D2-8E3F-00A0C969723B 406F2290
+
+GetDeviceTypeRegions: 1 qspi0 regions present
+GetDeviceTypeRegions: 1 scratch-t234 regions present
+UpdatePeCoffPermissions: Mapping section 1 of image at 0x4058F000 with RW-XN permissions and size 0x1000
+MmInstallProtocolInterface: 5B1B31A1-9562-11D2-8E3F-00A0C969723B 406F2090
+MmInstallProtocolInterface: 26EEB3DE-B689-492E-80F0-BE8BD7DA4BA7 4058F0A0
+UpdatePeCoffPermissions: Mapping section 1 of image at 0x4055C000 with RW-XN permissions and size 0x29000
+MmInstallProtocolInterface: 5B1B31A1-9562-11D2-8E3F-00A0C969723B 406F1E90
+MmInstallProtocolInterface: ED32D533-99E6-4209-9CC0-2D72CDD998A7 4055C998
+I/TC: WARNING: Test UEFI variable auth key is being used !
+I/TC: WARNING: UEFI variable protection is not fully enabled !
+MmFvbSmmVarReady: VarStore validation Succesful
+MmInstallProtocolInterface: B0D8F3C1-B7DE-4C11-BC89-2FB562C8C411 4055C970
+MmInstallProtocolInterface: 93BA1826-DFFB-45DD-82A7-E7DCAA3BBDF3 0
+UpdatePeCoffPermissions: Mapping section 1 of image at 0x4042B000 with RW-XN permissions and size 0x1E000
+MmInstallProtocolInterface: 5B1B31A1-9562-11D2-8E3F-00A0C969723B 406F1C90
+StandaloneMmOptee (version 39.2.0-gcid-45755727)
+StandaloneMmOptee (built on 2026-06-01T20:15:59+00:00)
+
+GetDeviceTypeRegions: 1 scratch-t234 regions present
+GetDeviceTypeRegions: 1 scratch-t234 regions present
+ÿá
+[2J[004D[=3h[2J[009D
+ÿäMmInstallProtocolInterface: 24E70042-D5C5-4260-8C39-0AD3AA32E93D 0
+ÿá[2J[004D[8;056;240t[2J[016D[105Ct23x_general System firmware
+[105Cversion 39.2.0-gcid-45755727
+[104Cdate 2026-06-01T20:15:56+00:00
+[005;001HESC   to enter Setup.
+F11   to enter Boot Manager Menu.
+s     to enter Shell.
+Enter to continue boot.
+ÿäMmInstallProtocolInterface: 7CE88FB3-4BD7-4679-87A8-A8D8DEE50D2B 0
+ÿá[ INFO]: crates/bootloader/src/main.rs@280: UnaOS UEFI Bootloader Started
+[ INFO]: crates/bootloader/src/main.rs@360: GOP: 5 modes (firmware current 1920x1200):
+[ INFO]: crates/bootloader/src/main.rs@364:   GOP mode: 1920x1200 stride=2048 fmt=BltOnly
+[ INFO]: crates/bootloader/src/main.rs@364:   GOP mode: 640x480 stride=1024 fmt=BltOnly
+[ INFO]: crates/bootloader/src/main.rs@364:   GOP mode: 800x600 stride=1024 fmt=BltOnly
+[ INFO]: crates/bootloader/src/main.rs@364:   GOP mode: 1024x768 stride=1024 fmt=BltOnly
+[ INFO]: crates/bootloader/src/main.rs@364:   GOP mode: 1920x1200 stride=2048 fmt=BltOnly
+[ INFO]: crates/bootloader/src/main.rs@375: EDID: monitor native resolution 1920x1200 (source 1)
+[ INFO]: crates/bootloader/src/main.rs@431: GOP: keeping firmware current mode 1920x1200
+[ WARN]: crates/bootloader/src/main.rs@450: GOP: active mode has no linear framebuffer; booting without a display
+[ INFO]: crates/bootloader/src/main.rs@552: Kernel ELF: min_vaddr=0x0, max_vaddr=0x17d170, pages=382
+[ INFO]: crates/bootloader/src/main.rs@565: Allocated kernel at 0x25add7000
+[ INFO]: crates/bootloader/src/main.rs@685: Found DTB at 0x25f501000, size: 837900 bytes
+[ INFO]: crates/bootloader/src/main.rs@926: JB8[pre-EBS]: FPCI CFG_0=0x01200020 CFG_1=0x08000524 (mem=0 busmaster=1) CFG_4=0x0180ff05 CFG_7=0x000001ff
+[ INFO]: crates/bootloader/src/main.rs@953: JB8[pre-EBS]: FALCON CPUCTL=0xffffffff (halted=1 stopped=1) BOOTVEC=0xffffffff fw codetag=0x00000000 codesize=0x0000c85f
+[ INFO]: crates/bootloader/src/main.rs@966: JB8[pre-EBS]: xHC cap=0x01200020 USBSTS=0x00000010 CNR=0
+[ INFO]: crates/bootloader/src/main.rs@1008: JB9d[pre-EBS]: MBOX MSG_ENABLED SILENT (owner pre=0x0 now=0x0 data_out=0x00000000, attempts=3)
+[ INFO]: crates/bootloader/src/main.rs@883: JB6: dummy ACPI 2.0 table installed (RSDP @0x25e084000, XSDT @0x25e084040) ? XUSB Falcon teardown will self-skip
+ÿäMmInstallProtocolInterface: 27ABF055-B1B8-4C26-80:4:8 -t7e4g8rFa3:7 BmAmAu2 DlFi v0e 
+(EL2) â€” RAM Normal-WB + Tegra Device-nGnRE mapped ::
+:: tegra: mmu regs â€” SCTLR 0x30c5183d->0x30c5183d TCR=0x80823519 MAIR=0x4ff TTBR0=0x25aed1000 RAM-GiB-mask=0x3fc ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ae75000) ::
+:: tegra: JM7 â€” GOP fb addr=0x0 size=0x0 1920x1200 stride=2048 bpp=4 ::
+:: tegra: JD1 â€” simple-fb /chosen/framebuffer: 1920x1200 stride=8192 fmt='x8r8g8b8' memory-region[0x1d1] reg[] ::
+:: tegra: JD1 â€” resv /reserved-memory/framebuffer@2,79E00000 reg[0x2 0x79e00000 0x0 0x960000] ::
+:: tegra: JD1 â€” scanout: base=0x279e00000 size=0x960000 1920x1200 stride=8192B fmt=x8r8g8b8 (Bgr) src=memory-region sane=true ::
+:: tegra: JD1 â€” panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::
+:: tegra: JB1d â€” MIDR=0x410fd421 (r0p1) â€” reading CPUECTLR_EL1 (IMPDEF) next ::
+:: tegra: JB1d â€” CPUECTLR_EL1=0xa000400b40543000 (erratum-1941500 bit8=0) ::
+:: tegra: JB1a â€” DTB @0x25f501000 size=0xcc90c ::
+:: tegra: JB1a â€” /bpmp mboxes[0x125 0x0 0x13] shmem[0x126 0x127] memory-region[] ::
+:: tegra: JB1a â€” ph 0x126 = /sram@40000000/sram@70000 reg[0x70000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a â€” ph 0x127 = /sram@40000000/sram@71000 reg[0x71000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a â€” no bpmp/shmem reserved-memory children ::
+:: tegra: JB1b â€” geom: shmem_tx=0x40070000 shmem_rx=0x40071000 hsp=0x3c00000 db_master=19 DAIF=0b1111 ::
+:: tegra: JB1b â€” touching HSP @0x3c00000 (dimensioning) ::
+:: tegra: JB1b â€” HSP dim=0x8a228 (nSM=8 nSS=2 nAS=2) db_base=0x3c90000 bpmp_db=0x3c90300 enable=0xc0060002 ::
+:: tegra: JB1b â€” touching SYSRAM: txq=0x40070300 rxq=0x40071300 pre-sync counts/state tx=[0x0 0x0 0x0] rx=[0x0 0x1 0x0] ::
+:: tegra: JB1b â€” IVC channel ESTABLISHED ::
+:: tegra: JB1b â€” MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
+:: tegra: JB5 â€” PG 12 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 â€” PG 10 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 â€” FPCI CFG first touch @0x03600000 (raw handoff) ::
+:: tegra: JB5 â€” handoff FPCI: CFG_0=0x229810de CFG_1=0x00b00006 (io=0 mem=1 busmaster=1) CFG_4=0x0360000c CFG_7=0x0365000c ::
+:: tegra: JB5 â€” minimal BAR2 route: CFG_1 rb=0x00b00006 CFG_4 rb=0x0360000c CFG_7 rb=0x0365000c ::
+:: tegra: JB5 â€” witness[raw-handoff]: cap0=0x01200020 USBSTS=0x00000011 (CNR=0 HCH=1) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB6 â€” CSB page-sel 0x9c: pre=0x00000000 wrote=0x1234 rb=0x00001234 STICKS=true ::
+:: tegra: JB6 â€” BAR2[0x000] = 0x00140009 ::
+:: tegra: JB6 â€” BAR2[0x004] = 0x80000000 ::
+:: tegra: JB6 â€” BAR2[0x008] = 0x05000000 ::
+:: tegra: JB6 â€” BAR2[0x00c] = 0x00000000 ::
+:: tegra: JB6 â€” BAR2[0x010] = 0x00000000 ::
+:: tegra: JB6 â€” BAR2[0x09c] = 0x00000000 ::
+:: tegra: JB6 â€” BAR2[0x0e0] = 0x00000000 ::
+:: tegra: JB6 â€” BAR2[0x0e4] = 0x00000000 ::
+:: tegra: JB6 â€” BAR2[0x0e8] = 0x00000000 ::
+:: tegra: JB6 â€” BAR2[0x100] = 0x00000000 ::
+:: tegra: JB6 â€” BAR2[0x104] = 0x00000000 ::
+:: tegra: JB6 â€” BAR2[0x110] = 0x00000000 ::
+:: tegra: JB6 â€” CSB[0x00000] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 â€” CSB[0x00100] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 â€” CSB[0x00104] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 â€” CSB[0x00110] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 â€” CSB[0x00f00] page_want=0x7 page_rb=0x00000007 val=0xffffffff ::
+:: tegra: JB6 â€” CSB[0x01000] page_want=0x8 page_rb=0x00000008 val=0xffffffff ::
+:: tegra: JB6 â€” CSB[0x40000] page_want=0x200 page_rb=0x00000200 val=0xffffffff ::
+:: tegra: JB7 â€” Falcon clock census (read-only MRQ_CLK IS_ENABLED): 9 DTB + 4 leaf ::
+:: tegra: JB7 â€” CLK 267 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 â€” CLK 269 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 â€” CLK 268 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 â€” CLK 275 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 â€” CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 â€” CLK 272 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 â€” CLK 103 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 â€” CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 â€” CLK 100 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 â€” CLK 267 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 â€” CLK 269 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 â€” CLK 270 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB7 â€” CLK 271 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB0 â€” fan PWM3 clk 107 enable -> err=0 ::
+:: tegra: JB0 â€” fan PWM3 reset 70 deassert -> err=0 ::
+:: tegra: JB0 â€” touching fan PWM3 CSR @0x32a0000 (always-on, not PG-gated) ::
+:: tegra: JB0 â€” fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::
+:: tegra: JB1c â€” XUSB ids from DTB: 9 clocks, 0 resets, 2 power-domains ::
+:: tegra: JB1c â€” PG 12 ON -> err=0 ::
+:: tegra: JB1c â€” PG 10 ON -> err=0 ::
+:: tegra: JB1c â€” CLK 267 enable -> err=0 ::
+:: tegra: JB1c â€” CLK 269 enable -> err=0 ::
+:: tegra: JB1c â€” CLK 268 enable -> err=0 ::
+:: tegra: JB1c â€” CLK 275 enable -> err=0 ::
+:: tegra: JB1c â€” CLK 14 enable -> err=0 ::
+:: tegra: JB1c â€” CLK 272 enable -> err=0 ::
+:: tegra: JB1c â€” CLK 103 enable -> err=0 ::
+:: tegra: JB1c â€” CLK 14 enable -> err=0 ::
+:: tegra: JB1c â€” CLK 100 enable -> err=0 ::
+:: tegra: JB1c â€” probing XUSB host @0x3610000 (was EL3-fatal in JX1) ::
+:: tegra: JB1c â€” XUSB ALIVE: xHCI v1.20 CAPLENGTH=0x20 HCSPARAMS1=0x08000524 HCCPARAMS1=0x0180ff05 USBCMD=0x00000000 USBSTS=0x00000011 -> PASS ::
+:: tegra: JB2a â€” port 1 CONNECTED: PORTSC=0x00081603 (PLS=0 speed=5) ::
+:: tegra: JB2a â€” port 6 CONNECTED: PORTSC=0x00040ee1 (PLS=7 speed=3) ::
+:: tegra: JB2a â€” port 7 CONNECTED: PORTSC=0x00000603 (PLS=0 speed=1) ::
+:: tegra: JB2a â€” port survey done (8 ports scanned) ::
+:: UnaOS aarch64 kernel â€” Jetson Orin Nano (Tegra234), headless serial console ::
+:: AARCH64 boot diag: EL=2  CNTFRQ=31250000 Hz  MMU=on  DAIF(DAIF)=0b1111 ::
+:: tegra: JM4 â€” bringing up Tegra234 GIC-600 + generic timer (boot core) ::
+:: AARCH64 GICv3 init (GICD=0xf400000, GICR=0xf440000, 992 INTIDs) ::
+:: GIC self-SGI delivered (v3) ::
+:: AARCH64 generic timer armed (CNTFRQ=31250000 Hz, 250 Hz tick, INTID 30) ::
+:: AARCH64 timer diag: CNTP_CTL=0x5 (ISTATUS=1)  GICD PPI30 pending=true ::
+AARCH64: timer heartbeat live (first tick).
+:: AARCH64 timer LIVE: IRQ delivery confirmed; idle = WFI ::
+:: AARCH64 Memory Init ::
+:: tegra: HEAP-GUARD â€” kernel heap [0x2683ca000, 0x26b3ca000) (48 MiB), highest clean window (RAS-2 heuristic â€” NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of 96 carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::
+:: KERNEL HEAP ALLOCATED ::
+:: PCIE2: ORIN-NET-2 controller-0 link + device recon (DTB @0x25f501000 size=0xcc90c) ::
+:: PCIE2: controller 0: /bus@0/pcie@140a0000 ::
+:: PCIE: compatible = "nvidia,tegra234-pcie"
+:: PCIE: device_type = "pci"
+:: PCIE: linux,pci-domain = [1 cells, 4 bytes]
+:: PCIE:   [0] 0x00000008
+:: PCIE: status = "okay"
+:: PCIE: reg-names = "appl|config|atu_dma|dbi|ecam"
+:: PCIE: reg = [20 cells, 80 bytes]
+:: PCIE:   [0] 0x00000000
+:: PCIE:   [1] 0x140a0000
+:: PCIE:   [2] 0x00000000
+:: PCIE:   [3] 0x00020000
+:: PCIE:   [4] 0x00000000
+:: PCIE:   [5] 0x2a000000
+:: PCIE:   [6] 0x00000000
+:: PCIE:   [7] 0x00040000
+:: PCIE:   [8] 0x00000000
+:: PCIE:   [9] 0x2a040000
+:: PCIE:   [10] 0x00000000
+:: PCIE:   [11] 0x00040000
+:: PCIE:   [12] 0x00000000
+:: PCIE:   [13] 0x2a080000
+:: PCIE:   [14] 0x00000000
+:: PCIE:   [15] 0x00040000
+:: PCIE:   â€¦(+4 more cells)
+:: PCIE: ranges = [21 cells, 84 bytes]
+:: PCIE:   [0] 0x43000000
+:: PCIE:   [1] 0x00000032
+:: PCIE:   [2] 0x40000000
+:: PCIE:   [3] 0x00000032
+:: PCIE:   [4] 0x40000000
+:: PCIE:   [5] 0x00000002
+:: PCIE:   [6] 0xe8000000
+:: PCIE:   [7] 0x02000000
+:: PCIE:   [8] 0x00000000
+:: PCIE:   [9] 0x40000000
+:: PCIE:   [10] 0x00000035
+:: PCIE:   [11] 0x28000000
+:: PCIE:   [12] 0x00000000
+:: PCIE:   [13] 0x08000000
+:: PCIE:   [14] 0x01000000
+:: PCIE:   [15] 0x00000000
+:: PCIE:   â€¦(+5 more cells)
+:: PCIE: num-lanes = [1 cells, 4 bytes]
+:: PCIE:   [0] 0x00000002
+:: PCIE: phy-names = "p2u-0|p2u-1"
+:: PCIE: power-domains = [2 cells, 8 bytes]
+:: PCIE:   [0] 0x00000003
+:: PCIE:   [1] 0x0000000d
+:: PCIE: interrupts = [6 cells, 24 bytes]
+:: PCIE:   [0] 0x00000000
+:: PCIE:   [1] 0x00000164
+:: PCIE:   [2] 0x00000004
+:: PCIE:   [3] 0x00000000
+:: PCIE:   [4] 0x00000165
+:: PCIE:   [5] 0x00000004
+:: PCIE2:   interrupt-map = present (32 bytes) ::
+:: PCIE2:   enabled(firmware)=true tegra-RC=true ::
+:: PCIE2:   region appl   = 0x140a0000 (+0x20000) ::
+:: PCIE2:   region dbi    = 0x2a080000 (+0x40000) ::
+:: PCIE2:   region config = 0x2a000000 (+0x40000) ::
+:: PCIE2:   region ecam   = 0x3530000000 (+0x10000000) ::
+:: PCIE2:   map appl 0x140a0000 (+0x20000): ALREADY MAPPED (GiB-0/1 device window) â€” readable ::
+:: PCIE2:   map dbi 0x2a080000 (+0x40000): ALREADY MAPPED (GiB-0/1 device window) â€” readable ::
+:: PCIE2:   map config 0x2a000000 (+0x40000): ALREADY MAPPED (GiB-0/1 device window) â€” readable ::
+:: PCIE2:   map ecam 0x3530000000 (+0x10000000): MAPPED Device-nGnRE (new page-table block) â€” readable ::
+:: PCIE2:   RP dbi[0x00] = 0x229c10de ::
+:: PCIE2:   RP LIVE: vendor=0x10de device=0x229c ::
+:: PCIE2:   RP class=0x06 subclass=0x04 progif=0x00 rev=0xa1 ::
+:: PCIE2:   RP header-type=0x01 (bit7=multifn; low7: 1=bridge) ::
+:: PCIE2:   PCIe cap @ 0x70: LinkCap max(gen3,x2) LinkStatus cur(gen1,x1) DLL-active=1 => LINK UP ::
+:: PCIE3:   M3 enumerate downstream device via ECAM bus1:dev0:fn0 @ 0x3530100000 ::
+:: PCIE3:   device config[0x00] = 0x816810ec ::
+:: PCIE3:   DEVICE FOUND: vendor=0x10ec device=0x8168 ::
+:: PCIE3:   class=0x02 subclass=0x00 progif=0x00 rev=0x15 ::
+:: PCIE3:   header-type=0x00 ::
+:: PCIE3:   M3 BAR sizing (all-ones/readback, restore-immediate; per-BAR fabric writes) ::
+:: PCIE3:   >>> FABRIC WRITE (M3): BAR0[0x10] all-ones probe (orig=0x2a100001) â€” write 0xffffffff, read size, RESTORE ::
+:: PCIE3:   BAR0 restored to 0x2a100001 (readback was 0xffffff01) ::
+:: PCIE3:   BAR0 = I/O space, size=0x100 ::
+:: PCIE3:   >>> FABRIC WRITE (M3): BAR1[0x14] all-ones probe (orig=0x00000000) â€” write 0xffffffff, read size, RESTORE ::
+:: PCIE3:   BAR1 restored to 0x00000000 (readback was 0x00000000) ::
+:: PCIE3:   BAR1 unimplemented (readback 0) ::
+:: PCIE3:   >>> FABRIC WRITE (M3): BAR2[0x18] all-ones probe (orig=0x40004004) â€” write 0xffffffff, read size, RESTORE ::
+:: PCIE3:   BAR2 restored to 0x40004004 (readback was 0xfffff004) ::
+:: PCIE3:   >>> FABRIC WRITE (M3): BAR3[0x1c] (64-bit high half, orig=0x00000000) â€” write 0xffffffff, read size, RESTORE ::
+:: PCIE3:   BAR3 (high) restored to 0x00000000 (readback 0xffffffff) ::
+:: PCIE3:   BAR2/3 = 64-bit mem (prefetch=0), size=0x1000 ::
+:: PCIE3:   >>> FABRIC WRITE (M3): BAR4[0x20] all-ones probe (orig=0x40000004) â€” write 0xffffffff, read size, RESTORE ::
+:: PCIE3:   BAR4 restored to 0x40000004 (readback was 0xffffc004) ::
+:: PCIE3:   >>> FABRIC WRITE (M3): BAR5[0x24] (64-bit high half, orig=0x00000000) â€” write 0xffffffff, read size, RESTORE ::
+:: PCIE3:   BAR5 (high) restored to 0x00000000 (readback 0xffffffff) ::
+:: PCIE3:   BAR4/5 = 64-bit mem (prefetch=0), size=0x4000 ::
+:: PCIE3:   M3 DONE â€” device identified + BARs sized (originals restored); no decode-enable / no driver bind (NIC driver arc is next). ::
+:: PCIE2: ORIN-NET-2 controller-0 recon DONE (read-only; page-table mappings the only writes) ::
+:: PCIE4: ORIN-NET-4 RTL8168/8111 GbE bring-up (DTB @0x25f501000 size=0xcc90c) ::
+:: PCIE4:   ecam 0x3530000000 mapped Device-nGnRE (via the PS-widened regime) ::
+:: PCIE4:   bus1:dev0:fn0 vendor=0x10ec device=0x8168 ::
+:: PCIE4:   >>> CONFIG WRITE (M1): COMMAND[0x4] 0x0007 -> 0x0007 (set MEM-space + bus-master) â€” issuing ::
+:: PCIE4:   register BAR2 = 0x40004000 (64-bit mem) â€” this is a PCIe BUS address (needs outbound iATU translation) ::
+:: PCIE4:   M1-fix: BAR2 0x40004000 in ranges MEM window PCIe [0x40000000..0x48000000) -> CPU base 0x3528000000; ATU base 0x2a040000 ::
+:: PCIE4:   M1-fix: outbound iATU region 0 @ 0x2a040000 â€” CPU [0x3528000000..0x352fffffff] -> PCIe 0x40000000 (type MEM) ::
+:: PCIE4:   >>> ATU WRITE (M1-fix): BASE lo/hi = 0x28000000/0x00000035 ::
+:: PCIE4:   >>> ATU WRITE (M1-fix): LIMIT lo/hi = 0x2fffffff/0x00000035 ::
+:: PCIE4:   >>> ATU WRITE (M1-fix): TARGET lo/hi = 0x40000000/0x00000000 ::
+:: PCIE4:   >>> ATU WRITE (M1-fix): REGION_CTRL1 = TYPE_MEM ::
+:: PCIE4:   >>> ATU WRITE (M1-fix): REGION_CTRL2 = ENABLE|INCREASE_REGION_SIZE â€” arming region ::
+:: PCIE4:   [net4h] inbound DMA window from ram_gib_mask 0x3fc: DRAM [0x80000000..0x280000000) (8 GiB) â€” programming inbound iATU so the NIC can DMA into any heap buffer ::
+:: PCIE4:   [net4h] inbound iATU region 0 @ 0x2a040100 â€” PCIe DMA [0x80000000..0x27fffffff] -> DRAM 0x80000000 (identity, type MEM) ::
+:: PCIE4:   >>> ATU WRITE (net4h): BASE lo/hi = 0x80000000/0x00000000 ::
+:: PCIE4:   >>> ATU WRITE (net4h): LIMIT lo/hi = 0x7fffffff/0x00000002 ::
+:: PCIE4:   >>> ATU WRITE (net4h): TARGET lo/hi = 0x80000000/0x00000000 (identity) ::
+:: PCIE4:   >>> ATU WRITE (net4h): REGION_CTRL1 = TYPE_MEM ::
+:: PCIE4:   >>> ATU WRITE (net4h): REGION_CTRL2 = ENABLE|INCREASE_REGION_SIZE (bit30=0 address-match) â€” arming inbound region ::
+:: PCIE4:   [dmawin] no PCIe dma-ranges derivable from DTB â€” inbound window is UNVERIFIED against firmware; iATU armed from ram_gib_mask identity only ::
+:: PCIE4:   [dmawin] inbound iATU region0 @ 0x2a040100 readback: BASE=0x80000000 LIMIT=0x27fffffff TARGET=0x80000000 CTRL2=0x80002000 (enabled=1) ::
+:: PCIE4:   [dmawin] programmed identity DRAM window [0x80000000, 0x280000000) UNVERIFIED against the 0 derived dma-ranges window(s); readback BASE/TARGET MATCH the programmed base ::
+:: tegra: [net4i] DTB: /bus@0/pcie@140a0000 sid=0x9 (via iommu-map) -> /bus@0/iommu@8000000 reg0=0x08000000 reg1=0x07000000 (2 inst) compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: [net4i] pre-fix â€” PCIe-C0 SMMU stream 0x9 binding across 2 instance(s) ::
+:: tegra: [net4i] pre-fix â€” inst0 @ 0x08000000: sCR0=0x002f0001 (CLIENTPD=1 USFCFG=0) NUMSMRG=128 ::
+:: tegra: [net4i] pre-fix â€” inst0: NO valid SMR matches sid 0x9 (unmatched-stream BYPASS (USFCFG=0) governs) ::
+:: tegra: JB3 â€” inst0 pre-fix faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x173d4_0ddda8af SYNR0=0x00000002 SYNR1=0x0000410a (sid=0x410a) ::
+:: tegra: [net4i] pre-fix â€” inst1 @ 0x07000000: sCR0=0x00240001 (CLIENTPD=1 USFCFG=0) NUMSMRG=128 ::
+:: tegra: [net4i] pre-fix â€” inst1: NO valid SMR matches sid 0x9 (unmatched-stream BYPASS (USFCFG=0) governs) ::
+:: tegra: JB3 â€” inst1 pre-fix faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x267d_b7501fda SYNR0=0x0000000a SYNR1=0x00001fe3 (sid=0x1fe3) ::
+:: tegra: [net4i] FIX â€” arming per-stream BYPASS for PCIe-C0 sid 0x9 across 2 instance(s) ::
+:: tegra: [net4i] FIX â€” inst0: CLIENTPD=1 (SMMU globally bypassing) â€” stream already untranslated; nothing to arm ::
+:: tegra: [net4i] FIX â€” inst1: CLIENTPD=1 (SMMU globally bypassing) â€” stream already untranslated; nothing to arm ::
+:: tegra: [net4i] FIX â€” done: 0 instance(s) armed to bypass ::
+:: tegra: [net4i] post-fix â€” PCIe-C0 SMMU stream 0x9 binding across 2 instance(s) ::
+:: tegra: [net4i] post-fix â€” inst0 @ 0x08000000: sCR0=0x002f0001 (CLIENTPD=1 USFCFG=0) NUMSMRG=128 ::
+:: tegra: [net4i] post-fix â€” inst0: NO valid SMR matches sid 0x9 (unmatched-stream BYPASS (USFCFG=0) governs) ::
+:: tegra: JB3 â€” inst0 post-fix faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x173d4_0ddda8af SYNR0=0x00000002 SYNR1=0x0000410a (sid=0x410a) ::
+:: tegra: [net4i] post-fix â€” inst1 @ 0x07000000: sCR0=0x00240001 (CLIENTPD=1 USFCFG=0) NUMSMRG=128 ::
+:: tegra: [net4i] post-fix â€” inst1: NO valid SMR matches sid 0x9 (unmatched-stream BYPASS (USFCFG=0) governs) ::
+:: tegra: JB3 â€” inst1 post-fix faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x267d_b7501fda SYNR0=0x0000000a SYNR1=0x00001fe3 (sid=0x1fe3) ::
+:: PCIE4:   BAR2 CPU aperture 0x3528004000 (+0x1000) mapped Device-nGnRE â€” registers reachable via iATU ::
+:: PCIE4:   M1-fix readback: TCR = 0x57100f80 (live, non-poison) â€” register window confirmed; first write is now safe ::
+:: PCIE4:   >>> REG WRITE (M1): CR[0x37] |= RST (soft reset) â€” issuing ::
+:: PCIE4:   CR.RST cleared after 0 spins â€” reset complete ::
+:: PCIE4:   station MAC = 4c:bb:47:25:49:c8 ::
+:: PCIE4:   M2 ring bring-up (C+ mode; RTL8168 programming-guide order) ::
+:: PCIE4:   >>> REG WRITE (M2): CFG9346[0x50] = 0xc0 (unlock config) ::
+:: PCIE4:   CPlusCmd[0xe0] = 0x2021 (C+ engine) ::
+:: PCIE4:   >>> REG WRITE (NET-4n): CPlusCmd[0xe0] 0x2021 -> 0x2031 (set PCIDAC â€” enable 64-bit >4GiB buffer DMA; initial, pre-ring) ::
+:: PCIE4:   [net4p] rx-buffers alias check CLEAR: [0x683cb000..0x683db000) below DRAM base 0x80000000, clear of PCIe MEM/BAR [0x40000000..0x48000000) â€” arming ::
+:: PCIE4:   [net4p] inbound iATU ALIAS region 1 @ 0x2a040300 (rx-buffers) â€” truncated PCIe DMA [0x683cb000..0x683dafff] -> real DRAM 0x2683cb000 (up-translate, type MEM) ::
+:: PCIE4:   >>> ATU WRITE (net4p): BASE lo/hi = 0x683cb000/0x00000000 ::
+:: PCIE4:   >>> ATU WRITE (net4p): LIMIT lo/hi = 0x683dafff/0x00000000 ::
+:: PCIE4:   >>> ATU WRITE (net4p): TARGET lo/hi = 0x683cb000/0x00000002 (the real high buffer PA) ::
+:: PCIE4:   >>> ATU WRITE (net4p): REGION_CTRL1 = TYPE_MEM ::
+:: PCIE4:   >>> ATU WRITE (net4p): REGION_CTRL2 = ENABLE|INCREASE_REGION_SIZE (bit30=0 address-match) â€” arming alias region ::
+:: PCIE4:   [net4p] alias region 1 (rx-buffers) readback: BASE=0x683c0000 LIMIT=0x683dffff TARGET=0x2683c0000 CTRL2=0x80002000 (enabled=1) ::
+:: PCIE4:   [net4p] tx-buffers alias check CLEAR: [0x683db000..0x683df000) below DRAM base 0x80000000, clear of PCIe MEM/BAR [0x40000000..0x48000000) â€” arming ::
+:: PCIE4:   [net4p] inbound iATU ALIAS region 2 @ 0x2a040500 (tx-buffers) â€” truncated PCIe DMA [0x683db000..0x683defff] -> real DRAM 0x2683db000 (up-translate, type MEM) ::
+:: PCIE4:   >>> ATU WRITE (net4p): BASE lo/hi = 0x683db000/0x00000000 ::
+:: PCIE4:   >>> ATU WRITE (net4p): LIMIT lo/hi = 0x683defff/0x00000000 ::
+:: PCIE4:   >>> ATU WRITE (net4p): TARGET lo/hi = 0x683db000/0x00000002 (the real high buffer PA) ::
+:: PCIE4:   >>> ATU WRITE (net4p): REGION_CTRL1 = TYPE_MEM ::
+:: PCIE4:   >>> ATU WRITE (net4p): REGION_CTRL2 = ENABLE|INCREASE_REGION_SIZE (bit30=0 address-match) â€” arming alias region ::
+:: PCIE4:   [net4p] alias region 2 (tx-buffers) readback: BASE=0x0 LIMIT=0x0 TARGET=0x0 CTRL2=0x00000000 (enabled=0) ::
+:: PCIE4:   >>> REG WRITE (M2): RDSAR[0xe4] = 0x2683ca000 (RX ring, 32 desc) ::
+:: PCIE4:   >>> REG WRITE (M2): TNPDS[0x20] = 0x2683ca200 (TX ring, 8 desc) ::
+:: PCIE4:   >>> REG WRITE (M2): RMS[0xda] = 0x0800; MTPS[0xec] = 0x3b ::
+:: PCIE4:   >>> REG WRITE (M2): TCR[0x40] = 0x03000700 ::
+:: PCIE4:   >>> REG WRITE (M2): CR[0x37] = 0x0c (RxEnb | TxEnb) ::
+:: PCIE4:   >>> REG WRITE (M2): RCR[0x44] = 0x0000e70f (promiscuous bring-up) ::
+:: PCIE4:   >>> REG WRITE (NET-4n2): CPlusCmd[0xe0] 0x2021 -> 0x2031 (re-apply PCIDAC â€” final C+CR write, post-RCR; attempt 0) ::
+:: PCIE4:   CPlusCmd readback after final write = 0x2021 PCIDAC=0 (still clear â€” retrying) ::
+:: PCIE4:   >>> REG WRITE (NET-4n2): CPlusCmd[0xe0] 0x2021 -> 0x2031 (re-apply PCIDAC â€” final C+CR write, post-RCR; attempt 1) ::
+:: PCIE4:   CPlusCmd readback after final write = 0x2021 PCIDAC=0 (still clear â€” retrying) ::
+:: PCIE4:   >>> REG WRITE (NET-4n2): CPlusCmd[0xe0] 0x2021 -> 0x2031 (re-apply PCIDAC â€” final C+CR write, post-RCR; attempt 2) ::
+:: PCIE4:   CPlusCmd readback after final write = 0x2021 PCIDAC=0 (still clear â€” retrying) ::
+:: PCIE4:   !! NET-4n2: PCIDAC WILL NOT LATCH (CPlusCmd stays 0x2021 after the final write under 9346 unlock) â€” C+ 64-bit-DAC path unusable on this silicon; EXPECTED â€” NET-4p's inbound-iATU alias makes 32-bit payload DMA sufficient ::
+:: PCIE4:   rings up: RX @ 0x2683ca000 (32 desc) TX @ 0x2683ca200 (8 desc); TCR readback 0x57100f00 (live); CPlusCmd 0x2021 PCIDAC=0 (64-bit DMA NOT latched) ::
+:: PCIE4:   RTL8168 @ BAR2 PCIe 0x40004000 (CPU aperture 0x3528004000), MAC read, C+ rings up + RX/TX enabled; PHY link UP ::
+:: PCIE4:   [net4l ring-dump pre-window] ring @ 0x2683ca000 buffers @ 0x2683cb000 stride 2048 B rx_cur=0 popped=0 ::
+:: PCIE4:   [net4l] rx-desc[0] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb000 programmed=0x2683cb000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[1] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb800 programmed=0x2683cb800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[2] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc000 programmed=0x2683cc000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[3] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc800 programmed=0x2683cc800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[4] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd000 programmed=0x2683cd000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[5] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd800 programmed=0x2683cd800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[6] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce000 programmed=0x2683ce000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[7] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce800 programmed=0x2683ce800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[8] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf000 programmed=0x2683cf000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[9] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf800 programmed=0x2683cf800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[10] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0000 programmed=0x2683d0000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[11] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0800 programmed=0x2683d0800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[12] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1000 programmed=0x2683d1000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[13] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1800 programmed=0x2683d1800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[14] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2000 programmed=0x2683d2000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[15] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2800 programmed=0x2683d2800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[16] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3000 programmed=0x2683d3000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[17] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3800 programmed=0x2683d3800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[18] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4000 programmed=0x2683d4000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[19] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4800 programmed=0x2683d4800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[20] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5000 programmed=0x2683d5000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[21] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5800 programmed=0x2683d5800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[22] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6000 programmed=0x2683d6000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[23] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6800 programmed=0x2683d6800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[24] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7000 programmed=0x2683d7000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[25] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7800 programmed=0x2683d7800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[26] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8000 programmed=0x2683d8000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[27] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8800 programmed=0x2683d8800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[28] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9000 programmed=0x2683d9000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[29] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9800 programmed=0x2683d9800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[30] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683da000 programmed=0x2683da000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[31] opts1=0xc0000800 (OWN=1 EOR=1 len=2048) opts2=0x00000000 addr=0x2683da800 programmed=0x2683da800 [MATCH] ::
+:: PCIE4: NET: DHCP discover (timeout 5000 ms) ::
+:: PCIE4:   [net4f] first RX pop len=531 â€” non-coherent DMA: dc ivac invalidate-before-read (+ dsb ld) between OWN-check and buffer copy (PER-POP; this print is the one-shot, not the invalidate) ::
+:: PCIE4:   [net4d] rx[1] len=531 dst=01:00:5e:00:00:fb src=8a:66:5a:72:49:64 et=0x0800 class=udp-other ::
+:: PCIE4:   [net4m] rx[0] slot=0 len=531 post-ivac(fenced) buf[0..16]=01005e0000fb8a665a72496408004500 nonzero=true â€” DRAM holds NIC payload -> copy's zero was cache/speculation (non-cacheable-arena, MMU arc) ::
+:: PCIE4:   [net4l ring-dump after-rx] ring @ 0x2683ca000 buffers @ 0x2683cb000 stride 2048 B rx_cur=0 popped=1 ::
+:: PCIE4:   [net4l] rx-desc[0] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb000 programmed=0x2683cb000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[1] opts1=0x38054227 (OWN=0 EOR=0 len=551) opts2=0x80000000 addr=0x2683cb800 programmed=0x2683cb800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[2] opts1=0x38054227 (OWN=0 EOR=0 len=551) opts2=0x80000000 addr=0x2683cc000 programmed=0x2683cc000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[3] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc800 programmed=0x2683cc800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[4] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd000 programmed=0x2683cd000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[5] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd800 programmed=0x2683cd800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[6] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce000 programmed=0x2683ce000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[7] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce800 programmed=0x2683ce800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[8] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf000 programmed=0x2683cf000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[9] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf800 programmed=0x2683cf800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[10] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0000 programmed=0x2683d0000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[11] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0800 programmed=0x2683d0800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[12] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1000 programmed=0x2683d1000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[13] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1800 programmed=0x2683d1800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[14] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2000 programmed=0x2683d2000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[15] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2800 programmed=0x2683d2800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[16] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3000 programmed=0x2683d3000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[17] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3800 programmed=0x2683d3800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[18] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4000 programmed=0x2683d4000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[19] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4800 programmed=0x2683d4800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[20] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5000 programmed=0x2683d5000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[21] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5800 programmed=0x2683d5800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[22] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6000 programmed=0x2683d6000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[23] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6800 programmed=0x2683d6800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[24] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7000 programmed=0x2683d7000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[25] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7800 programmed=0x2683d7800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[26] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8000 programmed=0x2683d8000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[27] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8800 programmed=0x2683d8800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[28] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9000 programmed=0x2683d9000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[29] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9800 programmed=0x2683d9800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[30] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683da000 programmed=0x2683da000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[31] opts1=0xc0000800 (OWN=1 EOR=1 len=2048) opts2=0x00000000 addr=0x2683da800 programmed=0x2683da800 [MATCH] ::
+:: PCIE4:   [net4d] rx[2] len=551 dst=00:00:00:00:00:00 src=00:00:00:00:00:00 et=0x0000 class=other ::
+:: PCIE4:   [net4m] rx[1] slot=1 len=551 post-ivac(fenced) buf[0..16]=00000000000000000000000000000000 nonzero=false â€” DRAM ZERO w/ real desc len -> writes-to-nowhere (inbound SMMU/iATU, below driver) ::
+:: PCIE4:   [net4l ring-dump after-rx] ring @ 0x2683ca000 buffers @ 0x2683cb000 stride 2048 B rx_cur=1 popped=2 ::
+:: PCIE4:   [net4l] rx-desc[0] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb000 programmed=0x2683cb000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[1] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb800 programmed=0x2683cb800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[2] opts1=0x38054227 (OWN=0 EOR=0 len=551) opts2=0x80000000 addr=0x2683cc000 programmed=0x2683cc000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[3] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc800 programmed=0x2683cc800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[4] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd000 programmed=0x2683cd000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[5] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd800 programmed=0x2683cd800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[6] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce000 programmed=0x2683ce000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[7] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce800 programmed=0x2683ce800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[8] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf000 programmed=0x2683cf000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[9] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf800 programmed=0x2683cf800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[10] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0000 programmed=0x2683d0000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[11] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0800 programmed=0x2683d0800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[12] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1000 programmed=0x2683d1000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[13] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1800 programmed=0x2683d1800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[14] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2000 programmed=0x2683d2000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[15] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2800 programmed=0x2683d2800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[16] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3000 programmed=0x2683d3000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[17] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3800 programmed=0x2683d3800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[18] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4000 programmed=0x2683d4000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[19] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4800 programmed=0x2683d4800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[20] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5000 programmed=0x2683d5000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[21] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5800 programmed=0x2683d5800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[22] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6000 programmed=0x2683d6000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[23] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6800 programmed=0x2683d6800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[24] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7000 programmed=0x2683d7000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[25] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7800 programmed=0x2683d7800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[26] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8000 programmed=0x2683d8000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[27] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8800 programmed=0x2683d8800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[28] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9000 programmed=0x2683d9000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[29] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9800 programmed=0x2683d9800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[30] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683da000 programmed=0x2683da000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[31] opts1=0xc0000800 (OWN=1 EOR=1 len=2048) opts2=0x00000000 addr=0x2683da800 programmed=0x2683da800 [MATCH] ::
+:: PCIE4:   [net4d] rx[3] len=551 dst=00:00:00:00:00:00 src=00:00:00:00:00:00 et=0x0000 class=other ::
+:: PCIE4:   [net4m] rx[2] slot=2 len=551 post-ivac(fenced) buf[0..16]=00000000000000000000000000000000 nonzero=false â€” DRAM ZERO w/ real desc len -> writes-to-nowhere (inbound SMMU/iATU, below driver) ::
+:: PCIE4:   [net4l ring-dump after-rx] ring @ 0x2683ca000 buffers @ 0x2683cb000 stride 2048 B rx_cur=2 popped=3 ::
+:: PCIE4:   [net4l] rx-desc[0] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb000 programmed=0x2683cb000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[1] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb800 programmed=0x2683cb800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[2] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc000 programmed=0x2683cc000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[3] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc800 programmed=0x2683cc800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[4] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd000 programmed=0x2683cd000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[5] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd800 programmed=0x2683cd800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[6] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce000 programmed=0x2683ce000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[7] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce800 programmed=0x2683ce800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[8] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf000 programmed=0x2683cf000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[9] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf800 programmed=0x2683cf800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[10] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0000 programmed=0x2683d0000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[11] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0800 programmed=0x2683d0800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[12] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1000 programmed=0x2683d1000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[13] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1800 programmed=0x2683d1800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[14] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2000 programmed=0x2683d2000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[15] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2800 programmed=0x2683d2800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[16] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3000 programmed=0x2683d3000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[17] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3800 programmed=0x2683d3800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[18] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4000 programmed=0x2683d4000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[19] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4800 programmed=0x2683d4800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[20] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5000 programmed=0x2683d5000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[21] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5800 programmed=0x2683d5800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[22] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6000 programmed=0x2683d6000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[23] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6800 programmed=0x2683d6800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[24] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7000 programmed=0x2683d7000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[25] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7800 programmed=0x2683d7800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[26] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8000 programmed=0x2683d8000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[27] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8800 programmed=0x2683d8800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[28] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9000 programmed=0x2683d9000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[29] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9800 programmed=0x2683d9800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[30] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683da000 programmed=0x2683da000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[31] opts1=0xc0000800 (OWN=1 EOR=1 len=2048) opts2=0x00000000 addr=0x2683da800 programmed=0x2683da800 [MATCH] ::
+:: PCIE4:   [net4k] TX DHCP 1(DISCOVER) xid=0x51fb1e94 (udp 68->67, 304 bytes) tx#1 ::
+:: PCIE4:   [net4c] first TX frame (304 bytes) CONSUMED: OWN handed back, ISR=0x0085 (TOK=1 TER=0) ::
+:: PCIE4:   [net4d] rx[4] len=346 dst=00:00:00:00:00:00 src=00:00:00:00:00:00 et=0x0000 class=other ::
+:: PCIE4:   [net4m] rx[3] slot=3 len=346 post-ivac(fenced) buf[0..16]=00000000000000000000000000000000 nonzero=false â€” DRAM ZERO w/ real desc len -> writes-to-nowhere (inbound SMMU/iATU, below driver) ::
+:: PCIE4:   [net4l ring-dump after-rx] ring @ 0x2683ca000 buffers @ 0x2683cb000 stride 2048 B rx_cur=3 popped=4 ::
+:: PCIE4:   [net4l] rx-desc[0] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb000 programmed=0x2683cb000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[1] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb800 programmed=0x2683cb800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[2] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc000 programmed=0x2683cc000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[3] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc800 programmed=0x2683cc800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[4] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd000 programmed=0x2683cd000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[5] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd800 programmed=0x2683cd800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[6] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce000 programmed=0x2683ce000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[7] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce800 programmed=0x2683ce800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[8] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf000 programmed=0x2683cf000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[9] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf800 programmed=0x2683cf800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[10] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0000 programmed=0x2683d0000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[11] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0800 programmed=0x2683d0800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[12] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1000 programmed=0x2683d1000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[13] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1800 programmed=0x2683d1800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[14] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2000 programmed=0x2683d2000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[15] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2800 programmed=0x2683d2800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[16] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3000 programmed=0x2683d3000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[17] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3800 programmed=0x2683d3800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[18] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4000 programmed=0x2683d4000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[19] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4800 programmed=0x2683d4800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[20] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5000 programmed=0x2683d5000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[21] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5800 programmed=0x2683d5800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[22] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6000 programmed=0x2683d6000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[23] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6800 programmed=0x2683d6800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[24] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7000 programmed=0x2683d7000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[25] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7800 programmed=0x2683d7800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[26] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8000 programmed=0x2683d8000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[27] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8800 programmed=0x2683d8800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[28] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9000 programmed=0x2683d9000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[29] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9800 programmed=0x2683d9800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[30] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683da000 programmed=0x2683da000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[31] opts1=0xc0000800 (OWN=1 EOR=1 len=2048) opts2=0x00000000 addr=0x2683da800 programmed=0x2683da800 [MATCH] ::
+:: PCIE4:   [net4d] rx[5] len=346 dst=00:00:00:00:00:00 src=00:00:00:00:00:00 et=0x0000 class=other ::
+:: PCIE4:   [net4m] rx[4] slot=4 len=346 post-ivac(fenced) buf[0..16]=00000000000000000000000000000000 nonzero=false â€” DRAM ZERO w/ real desc len -> writes-to-nowhere (inbound SMMU/iATU, below driver) ::
+:: PCIE4:   [net4l ring-dump after-rx] ring @ 0x2683ca000 buffers @ 0x2683cb000 stride 2048 B rx_cur=4 popped=5 ::
+:: PCIE4:   [net4l] rx-desc[0] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb000 programmed=0x2683cb000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[1] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb800 programmed=0x2683cb800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[2] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc000 programmed=0x2683cc000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[3] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc800 programmed=0x2683cc800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[4] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd000 programmed=0x2683cd000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[5] opts1=0x3201c040 (OWN=0 EOR=0 len=64) opts2=0x00000000 addr=0x2683cd800 programmed=0x2683cd800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[6] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce000 programmed=0x2683ce000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[7] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce800 programmed=0x2683ce800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[8] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf000 programmed=0x2683cf000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[9] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf800 programmed=0x2683cf800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[10] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0000 programmed=0x2683d0000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[11] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0800 programmed=0x2683d0800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[12] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1000 programmed=0x2683d1000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[13] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1800 programmed=0x2683d1800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[14] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2000 programmed=0x2683d2000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[15] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2800 programmed=0x2683d2800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[16] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3000 programmed=0x2683d3000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[17] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3800 programmed=0x2683d3800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[18] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4000 programmed=0x2683d4000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[19] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4800 programmed=0x2683d4800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[20] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5000 programmed=0x2683d5000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[21] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5800 programmed=0x2683d5800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[22] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6000 programmed=0x2683d6000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[23] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6800 programmed=0x2683d6800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[24] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7000 programmed=0x2683d7000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[25] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7800 programmed=0x2683d7800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[26] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8000 programmed=0x2683d8000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[27] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8800 programmed=0x2683d8800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[28] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9000 programmed=0x2683d9000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[29] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9800 programmed=0x2683d9800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[30] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683da000 programmed=0x2683da000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[31] opts1=0xc0000800 (OWN=1 EOR=1 len=2048) opts2=0x00000000 addr=0x2683da800 programmed=0x2683da800 [MATCH] ::
+:: PCIE4:   [net4d] rx[6] len=64 dst=00:00:00:00:00:00 src=00:00:00:00:00:00 et=0x0000 class=other ::
+:: PCIE4:   [net4m] rx[5] slot=5 len=64 post-ivac(fenced) buf[0..16]=00000000000000000000000000000000 nonzero=false â€” DRAM ZERO w/ real desc len -> writes-to-nowhere (inbound SMMU/iATU, below driver) ::
+:: PCIE4:   [net4l ring-dump after-rx] ring @ 0x2683ca000 buffers @ 0x2683cb000 stride 2048 B rx_cur=5 popped=6 ::
+:: PCIE4:   [net4l] rx-desc[0] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb000 programmed=0x2683cb000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[1] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb800 programmed=0x2683cb800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[2] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc000 programmed=0x2683cc000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[3] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc800 programmed=0x2683cc800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[4] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd000 programmed=0x2683cd000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[5] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd800 programmed=0x2683cd800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[6] opts1=0x3201c040 (OWN=0 EOR=0 len=64) opts2=0x00000000 addr=0x2683ce000 programmed=0x2683ce000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[7] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce800 programmed=0x2683ce800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[8] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf000 programmed=0x2683cf000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[9] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf800 programmed=0x2683cf800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[10] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0000 programmed=0x2683d0000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[11] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0800 programmed=0x2683d0800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[12] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1000 programmed=0x2683d1000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[13] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1800 programmed=0x2683d1800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[14] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2000 programmed=0x2683d2000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[15] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2800 programmed=0x2683d2800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[16] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3000 programmed=0x2683d3000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[17] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3800 programmed=0x2683d3800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[18] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4000 programmed=0x2683d4000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[19] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4800 programmed=0x2683d4800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[20] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5000 programmed=0x2683d5000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[21] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5800 programmed=0x2683d5800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[22] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6000 programmed=0x2683d6000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[23] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6800 programmed=0x2683d6800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[24] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7000 programmed=0x2683d7000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[25] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7800 programmed=0x2683d7800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[26] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8000 programmed=0x2683d8000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[27] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8800 programmed=0x2683d8800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[28] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9000 programmed=0x2683d9000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[29] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9800 programmed=0x2683d9800 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[30] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683da000 programmed=0x2683da000 [MATCH] ::
+:: PCIE4:   [net4l] rx-desc[31] opts1=0xc0000800 (OWN=1 EOR=1 len=2048) opts2=0x00000000 addr=0x2683da800 programmed=0x2683da800 [MATCH] ::
+:: PCIE4:   [net4d] rx[7] len=64 dst=00:00:00:00:00:00 src=00:00:00:00:00:00 et=0x0000 class=other ::
+:: PCIE4:   [net4d] rx[8] len=64 dst=00:00:00:00:00:00 src=00:00:00:00:00:00 et=0x0000 class=other ::
+:: PCIE4: NET: no lease within 5000 ms (41899769 polls) â€” falling back to static 192.168.1.2/24 gw 192.168.1.1 ::
+:: PCIE4:   [net4c post-discover-window] TX consumed=1 stalled=0 last-desc[0] opts1=0x380541db (OWN=0) | ISR=0x0085 (ROK=1 RER=0 TOK=1 TER=0) | RX popped=32 filled-unread=0/32 ::
+:: PCIE4:   [net4d window-close] RX by category: arp=0 dhcp=0 udp-other=2 ipv4-other=0 ipv6=0 other=30 (total popped=32); DISCOVER xid=0x51fb1e94 (sent) ::
+:: PCIE4:   [net4g] RX descriptor dump (post-window): ring @ 0x2683ca000, buffers @ 0x2683cb000, stride 2048 B, 32 slots â€” addr is NIC-preserved across RX completion ::
+:: PCIE4:   [net4g] rx-desc[0] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb000 programmed=0x2683cb000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[1] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cb800 programmed=0x2683cb800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[2] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc000 programmed=0x2683cc000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[3] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cc800 programmed=0x2683cc800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[4] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd000 programmed=0x2683cd000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[5] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cd800 programmed=0x2683cd800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[6] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce000 programmed=0x2683ce000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[7] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683ce800 programmed=0x2683ce800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[8] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf000 programmed=0x2683cf000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[9] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683cf800 programmed=0x2683cf800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[10] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0000 programmed=0x2683d0000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[11] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d0800 programmed=0x2683d0800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[12] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1000 programmed=0x2683d1000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[13] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d1800 programmed=0x2683d1800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[14] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2000 programmed=0x2683d2000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[15] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d2800 programmed=0x2683d2800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[16] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3000 programmed=0x2683d3000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[17] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d3800 programmed=0x2683d3800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[18] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4000 programmed=0x2683d4000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[19] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d4800 programmed=0x2683d4800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[20] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5000 programmed=0x2683d5000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[21] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d5800 programmed=0x2683d5800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[22] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6000 programmed=0x2683d6000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[23] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d6800 programmed=0x2683d6800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[24] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7000 programmed=0x2683d7000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[25] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d7800 programmed=0x2683d7800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[26] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8000 programmed=0x2683d8000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[27] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d8800 programmed=0x2683d8800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[28] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9000 programmed=0x2683d9000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[29] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683d9800 programmed=0x2683d9800 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[30] opts1=0x80000800 (OWN=1 EOR=0 len=2048) opts2=0x00000000 addr=0x2683da000 programmed=0x2683da000 [MATCH] ::
+:: PCIE4:   [net4g] rx-desc[31] opts1=0xc0000800 (OWN=1 EOR=1 len=2048) opts2=0x00000000 addr=0x2683da800 programmed=0x2683da800 [MATCH] ::
+:: PCIE4:   smoltcp 0.13 Interface BOUND over RTL8168: MAC set, 192.168.1.2/24 + default gw 192.168.1.1 [static], medium=ethernet, polled OK; link UP â€” live ICMP/ARP is attended-metal ::
+:: PCIE4: ORIN-NET-4 DONE â€” RTL8168 driver up + smoltcp bound (live traffic = attended metal) ::
+:: tegra: JB3 â€” DTB: /bus@0/usb@3610000 sid=0xe -> /bus@0/iommu@8000000 reg0=0x08000000 reg1=0x07000000 (2 inst) compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB9h â€” inherit path (JB3 fabric chain retired; fabric untouched) ::
+:: tegra: JB3 â€” census /bus@0/iommu@8000000: reg0=0x08000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 â€” census /bus@0/iommu@10000000: reg0=0x10000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 â€” census /bus@0/iommu@12000000: reg0=0x12000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 â€” MC pre-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JB2b â€” usb@3610000 dma-coherent: YES (Normal-WB rings, no cache maintenance) ::
+:: tegra: JB2b â€” attaching the shared xHCI driver @0x3610000 (platform, polled, no PCIe) ::
+:: tegra: JB9g â€” no-HCRST takeover: halted (USBSTS=0x00000011), inherited FW state preserved ::
+xHCI: CapBase=0x3610000, OpBase=0x3610020, Version=0x120
+xHCI: MaxSlots=36, MaxPorts=8
+xHCI: Supported Protocol: USB 3.1 ports 1..4
+xHCI: Supported Protocol: USB 2.0 ports 5..8
+:: tegra: JB2b â€” programming interrupter + rings (runtime regs) ::
+xHCI: RuntimeBase=0x3630000, IR0 Base=0x3630020
+xHCI: Interrupter 0 enabled (IMAN.IE set, interrupt-driven).
+xHCI: DCBAAP set to 0x2683ce800
+xHCI: scratchpad: 3 buffer(s) x 4096 bytes; DCBAA[0]=0x2683cf000
+xHCI: CRCR set to 0x2683cc7c1
+xHCI: CONFIG register set to 36 (MaxSlotsEn).
+xHCI: Controller Started!
+xHCI: Max Ports = 8
+xHCI: Port 1 already powered. Status: 0x81603
+xHCI: Port 2 already powered. Status: 0x2a0
+xHCI: Powering on Port 3
+xHCI: Powering on Port 4
+xHCI: Port 5 already powered. Status: 0x2a0
+xHCI: Port 6 already powered. Status: 0x40ee1
+xHCI: Port 7 already powered. Status: 0x603
+xHCI: Port 8 already powered. Status: 0x2a0
+xHCI: port settle complete before CCS scan
+xHCI: Port 7 connected (Status: 0x603); queued for enumeration.
+xHCI: Port 6 connected (Status: 0xee1); queued for enumeration.
+xHCI: Port 1 connected (Status: 0x1603); queued for enumeration.
+xHCI: === Enumerating Port 1 (PORTSC=0x1603) ===
+xHCI: [enum port 1] stage -> debounce
+xHCI: [Event] Port Status Change. Port=6
+xHCI: JB9i eviction completion: slot 1 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 2 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 3 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 4 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 5 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 6 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 7 code 11 (was not enabled â€” fine).
+xHCI: JB9i eviction completion: slot 8 code 11 (was not enabled â€” fine).
+:: tegra: JB9i â€” inherited-slot eviction: DISABLE_SLOT 1..8 issued + drained ::
+xHCI: [enum port 1] stage -> await-reset
+xHCI: [enum port 1] issuing hot reset (attempt 1).
+xHCI: [enum port 1] reset change latched but no event was delivered; polling fallback.
+xHCI: [Port 1] reset complete (PED=1); settling before enable.
+xHCI: [enum port 1] stage -> reset-settle
+xHCI: [Event] Port Status Change. Port=1
+xHCI: [enum port 1] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 1...
+xHCI: [enum port 1] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc840, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: Proceeding to Address Device (Slot 1, Port 1)...
+xHCI: Addressing Device (Slot 1, Port 1)...
+xHCI: DCBAAP[1] linked to 0x2683d2000
+xHCI: Port 1 speed 5 -> EP0 MPS 512
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683cf040
+xHCI: [enum port 1] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc850, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: >>> SLOT 1 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 1...
+xHCI: [enum port 1] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 1
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [0489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x3
+xHCI: >>> HUB DETECTED (slot 1) <<<
+xHCI: === Enumerating Port 6 (PORTSC=0xee1) ===
+xHCI: [enum port 6] stage -> debounce
+xHCI: === HUB BRING-UP (slot 1) ===
+xHCI: HUB slot 1 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 1 speed 5 (SS) desc-type 0x2a: 4 downstream ports (characteristics 0x0009)
+xHCI: HUB slot 1 SET_HUB_DEPTH(0) -> code 1 (OK)
+xHCI: HUB slot 1 configure-input: route 0x0 speed 5 (SS) ports 4 hub-bit 1 ttt 0 add-flags 0x1
+xHCI: HUB slot 1 marked as hub (4 ports)
+xHCI: HUB slot 1 port 1: device connected; enumerating...
+xHCI: HUB port 1 SS link trained (status 0x300203 PLS=0 U0, 1 polls, 2625357 cyc, attempt 0)
+xHCI: HUB port 1 reset OK (status 0x300203, warm reset, xHCI speed 4)
+xHCI: HUB slot 1 port 1 is a SuperSpeed port (speed forced to SS).
+xHCI: HUB downstream slot 2 device class=0x0 vid=0bda pid=0326 (route 0x1 tier 1)
+xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot 2, bulk in 0x82/1024 out 0x1/1024) <<<
+xHCI: Configuring Bulk Endpoints for Slot 2 (IN 0x82 dci5 mps1024, OUT 0x1 dci2 mps1024)...
+xHCI: Input Context Configured for Bulk Transport.
+xHCI: Endpoints Configured (Slot 2). Storage ready.
+xHCI: HUB slot 1 status-change Configure-Endpoint code 17
+xHCI: === HUB slot 1 bring-up complete ===
+xHCI: [enum port 6] stage -> await-reset
+xHCI: [enum port 6] issuing hot reset (attempt 1).
+xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===
+xHCI: storage SET_CONFIGURATION(1) OK (slot 2)
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Port 6] reset complete (PED=1); settling before enable.
+xHCI: [enum port 6] stage -> reset-settle
+xHCI: Disk 'Generic-' 'USB3.0 CRW   -SD' block_size=512 num_blocks=63404032 (30959 MiB)
+xHCI: storage ready.
+xHCI: READ(10) LBA0 CSW status=Passed residue=0
+xHCI: SECTOR 0 SIGNATURE: 
+xHCI: [IRQ] xHCI interrupts taken so far: 0
+xHCI: [enum port 6] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 6...
+xHCI: [enum port 6] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc8b0, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: Proceeding to Address Device (Slot 3, Port 6)...
+xHCI: Addressing Device (Slot 3, Port 6)...
+xHCI: DCBAAP[3] linked to 0x2683de880
+xHCI: Port 6 speed 3 -> EP0 MPS 64
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683de040
+xHCI: [enum port 6] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc8c0, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: >>> SLOT 3 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 3...
+xHCI: [enum port 6] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 3
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [5489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x2
+xHCI: >>> HUB DETECTED (slot 3) <<<
+xHCI: === Enumerating Port 7 (PORTSC=0x603) ===
+xHCI: [enum port 7] stage -> debounce
+xHCI: === HUB BRING-UP (slot 3) ===
+xHCI: HUB slot 3 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 3 speed 3 (HS/FS) desc-type 0x29: 4 downstream ports (characteristics 0x00a9)
+xHCI: HUB slot 3 configure-input: route 0x0 speed 3 (HS/FS) ports 4 hub-bit 1 ttt 1 add-flags 0x1
+xHCI: HUB slot 3 marked as hub (4 ports)
+xHCI: HUB slot 3 port 2: device connected; enumerating...
+xHCI: HUB port 2 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 4 device class=0x0 vid=1a2c pid=0b2a (route 0x2 tier 1)
+xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: 0x81, MPS: 8, Interval: 10 <<<
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x82, MPS: 8, Interval: 10, ABSOLUTE tablet (proto 0) <<<
+xHCI: Configuring HID Endpoints for Slot 4 (keyboard+pointer(abs)) in one Configure-Endpoint (max DCI 5).
+xHCI: [Event] Command Completion. Ptr=0x2683cc900, Slot=4, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 4
+xHCI: HID Endpoints Configured (Slot 4). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 4
+xHCI: HUB slot 3 port 4: device connected; enumerating...
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=0 absolute ep=0x82 mps=8 interval=10 == witness ::
+xHCI: HUB port 4 reset OK (status 0x100103, hot reset, xHCI speed 1)
+xHCI: downstream slot 5 MPS0 learned 8 (programmed 64); Evaluate Context.
+xHCI: downstream slot 5 EP0 MPS updated via Evaluate Context (8).
+xHCI: HUB downstream slot 5 device class=0x0 vid=046d pid=c534 (route 0x4 tier 1)
+xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: 0x81, MPS: 8, Interval: 8 <<<
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x82, MPS: 20, Interval: 2, RELATIVE boot-mouse (proto 2) <<<
+xHCI: Configuring HID Endpoints for Slot 5 (keyboard+mouse(rel)) in one Configure-Endpoint (max DCI 5).
+xHCI: [Event] Command Completion. Ptr=0x2683cc940, Slot=5, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 5
+xHCI: HID Endpoints Configured (Slot 5). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 5
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=2 relative ep=0x82 mps=20 interval=2 == witness ::
+xHCI: HUB slot 3 status-change Configure-Endpoint code 8
+xHCI: === HUB slot 3 bring-up complete ===
+xHCI: SET_PROTOCOL(boot) OK for boot-mouse (slot 5, iface 1).
+xHCI: SET_PROTOCOL(boot) OK for keyboard (slot 5, iface 0).
+xHCI: SET_IDLE(0) OK for keyboard (slot 5, iface 0).
+xHCI: SET_PROTOCOL(boot) OK for keyboard (slot 4, iface 0).
+xHCI: SET_IDLE(0) OK for keyboard (slot 4, iface 0).
+xHCI: [enum port 7] stage -> await-reset
+xHCI: [enum port 7] issuing hot reset (attempt 1).
+:: tegra: JB2b â€” keyboard ARMED (slot 4, root port 6) -> PASS ::
+:: tegra: JB2b â€” keyboard ARMED (slot 5, root port 6) -> PASS ::
+:: tegra: JB2b â€” HID: 2 keyboard(s), 2 pointer(s) armed ::
+:: tegra: JD3 â€” mass storage ready (slot 2); panel shell ls/cat live ::
+:: tegra: JB5 â€” witness[post-attach]: cap0=0x01200020 USBSTS=0x00000010 (CNR=0 HCH=0) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB3 â€” inst0 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x173d4_0ddda8af SYNR0=0x00000002 SYNR1=0x0000410a (sid=0x410a) ::
+:: tegra: JB3 â€” inst0 CB0: SCTLR=0x0bb9c706 FSR=0x00000000 FAR=0xefbf_ded3d47e ::
+:: tegra: JB3 â€” inst1 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x267d_b7501fda SYNR0=0x0000000a SYNR1=0x00001fe3 (sid=0x1fe3) ::
+:: tegra: JB3 â€” inst1 CB0: SCTLR=0x29bfe70a FSR=0x00000000 FAR=0x1f9c9_36bff9bc ::
+:: tegra: JB3 â€” MC post-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: VUGRAS: boot witness â€” RAS candidate PA table (bit-63-stripped decode) ::
+:: VUGRAS: heap span [0x2683ca000,0x26b3ca000) 48 MiB; tegra DRAM top 0x280000000 ::
+:: VUGRAS: above-heap sweep span B [0x26b3ca000,0x280000000) 340184 KiB â€” carveout-clipped (never DC-cleans firewall fabric) ::
+:: VUGRAS: framebuffer/scanout base 0x279e00000 len 0x960000 ::
+:: VUGRAS: cursor save-under stash [0x25aece3a0,0x25aed0344) ::
+:: VUGRAS: witness sweep cost â€” span heap [0x2683ca000,0x26b3ca000) 48 MiB in 39648 cycles (~0 ms) ::
+:: VUGRAS: xHCI DCBAA=0x2683ce800 event_ring_base=0x2683cd7c0 erst_base=0x2683ce7c0 enum_cmd_trb=0x0 enumerating_port=7 stage=await-reset ::
+:: VUGRAS: xHCI command-ring [0x2683cc7c0,0x2683cd7c0) ::
+:: VUGRAS: xHCI slot 1 port 1 in_ctx=0x2683cf040 out_ctx=0x2683d2000 desc_buf=0x2683cacc0 data_buf=0x0 mouse_buf=0x0 ::
+:: VUGRAS: xHCI slot 1 port 1 expect ep0=0x0 mouse=0x0 kbd=0x0 hub_int=0x0 ::
+:: VUGRAS: xHCI slot 1 port 1 ep0-ring [0x2683ce940,0x2683cea40) ::
+:: VUGRAS: xHCI slot 1 port 1 hub_int-ring [0x2683cf880,0x2683cf980) ::
+:: VUGRAS: xHCI slot 1 port 1 hub_change_buf=0x2683cefc0 ::
+:: VUGRAS: xHCI slot 2 port 1 in_ctx=0x2683dd000 out_ctx=0x2683dd840 desc_buf=0x2683cadc0 data_buf=0x0 mouse_buf=0x0 ::
+:: VUGRAS: xHCI slot 2 port 1 expect ep0=0x0 mouse=0x0 kbd=0x0 hub_int=0x0 ::
+:: VUGRAS: xHCI slot 2 port 1 ep0-ring [0x2683cea40,0x2683ceb40) ::
+:: VUGRAS: xHCI slot 2 port 1 bulk_in-ring [0x2683ceb40,0x2683cec40) ::
+:: VUGRAS: xHCI slot 2 port 1 bulk_out-ring [0x2683cec40,0x2683ced40) ::
+:: VUGRAS: xHCI slot 3 port 6 in_ctx=0x2683de040 out_ctx=0x2683de880 desc_buf=0x2683caec0 data_buf=0x0 mouse_buf=0x0 ::
+:: VUGRAS: xHCI slot 3 port 6 expect ep0=0x0 mouse=0x0 kbd=0x0 hub_int=0x0 ::
+:: VUGRAS: xHCI slot 3 port 6 ep0-ring [0x2683cf980,0x2683cfa80) ::
+:: VUGRAS: xHCI slot 3 port 6 hub_int-ring [0x2683e1300,0x2683e1400) ::
+:: VUGRAS: xHCI slot 3 port 6 hub_change_buf=0x2683cff80 ::
+:: VUGRAS: xHCI slot 4 port 6 in_ctx=0x2683df080 out_ctx=0x2683df8c0 desc_buf=0x2683cafc0 data_buf=0x2683cfc80 mouse_buf=0x2683d2800 ::
+:: VUGRAS: xHCI slot 4 port 6 expect ep0=0x0 mouse=0x2683cfe80 kbd=0x2683cfb80 hub_int=0x0 ::
+:: VUGRAS: xHCI slot 4 port 6 ep0-ring [0x2683cfa80,0x2683cfb80) ::
+:: VUGRAS: xHCI slot 4 port 6 mouse-ring [0x2683cfe80,0x2683cff80) ::
+:: VUGRAS: xHCI slot 4 port 6 kbd-ring [0x2683cfb80,0x2683cfc80) ::
+:: VUGRAS: xHCI slot 5 port 6 in_ctx=0x2683e00c0 out_ctx=0x2683e0900 desc_buf=0x2683ca3c0 data_buf=0x2683d2c00 mouse_buf=0x2683e1100 ::
+:: VUGRAS: xHCI slot 5 port 6 expect ep0=0x0 mouse=0x2683dbec0 kbd=0x2683d2b00 hub_int=0x0 ::
+:: VUGRAS: xHCI slot 5 port 6 ep0-ring [0x2683d2a00,0x2683d2b00) ::
+:: VUGRAS: xHCI slot 5 port 6 mouse-ring [0x2683dbec0,0x2683dbfc0) ::
+:: VUGRAS: xHCI slot 5 port 6 kbd-ring [0x2683d2b00,0x2683d2c00) ::
+:: VUGRAS: xHCI slot 33 port 192 in_ctx=0x3241342d43423435 out_ctx=0x312d414244422d31 desc_buf=0x6333666436313264 data_buf=0x0 mouse_buf=0x0 ::
+:: VUGRAS: xHCI slot 33 port 192 expect ep0=0x3331363533626135 mouse=0x4539463646384541 kbd=0x373d6b7043313636 hub_int=0x3034613862626266 ::
+:: VUGRAS: xHCI slot 33 port 192 ep0-ring [0x110000018010001d,0xd1034c018020095d) ::
+:: VUGRAS: xHCI slot 33 port 192 mouse-ring [0x37413478303d7365,0xba43f7cc74a1a7c5) ::
+:: VUGRAS: xHCI slot 33 port 192 kbd-ring [0x433242412d304645,0xd77576658083b915) ::
+:: VUGRAS: xHCI slot 33 port 192 hub_int-ring [0x313d737265766f74,0x87a14a0967e98254) ::
+:: VUGRAS: xHCI slot 33 port 192 bulk_in-ring [0x22c0656b614c2d65,0x22c07d6d714cf965) ::
+:: VUGRAS: xHCI slot 33 port 192 bulk_out-ring [0x3d6c636105323d74,0x93a2fac75b73e074) ::
+:: tegra: JD2 â€” EL1 console pump task spawned (boot core) ::
+:: AARCH64 SMP: ORIN-SMP-3 kick-off â€” PRECONDITION UEFI t23x_general 39.2.0-gcid-45755727 (or newer); CPU_ON known-good on this firmware per the SMP-2 bench ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 0 aff=0x00000000 (BSP) (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 1 aff=0x00000100 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 2 aff=0x00000200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 3 aff=0x00000300 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 4 aff=0x00010200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 5 aff=0x00010300 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 1 (aff=0x00000100) -> SUCCESS (entry=0x25ae75bec) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ae75000) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ae75000) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 2 (aff=0x00000200) -> SUCCESS (entry=0x25ae75bec) ::
+:: AARCH64 SMP: AP 2 online (aff=0x00000200) ::
+:: AARCH64 SMP: AP 1 online (aff=0x00000100) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 3 (aff=0x00000300) -> SUCCESS (entry=0x25ae75bec) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ae75000) ::
+:: AARCH64 SMP: c2 timer PPI live (tick 1) ::
+:: AARCH64 SMP: c1 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 4 (aff=0x00010200) -> SUCCESS (entry=0x25ae75bec) ::
+:: AARCH64 SMP: AP 3 online (aff=0x00000300) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 5 (aff=0x00010300) -> SUCCESS (entry=0x25ae75bec) ::
+:: AARCH64 SMP: c3 timer PPI live (tick 1) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ae75000) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ae75000) ::
+:: AARCH64 SMP: AP 5 online (aff=0x00010300) ::
+:: AARCH64 SMP: AP 4 online (aff=0x00010200) ::
+:: AARCH64 SMP: c5 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 1 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: c4 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 2 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 3 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 4 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 5 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 AP -> BSP SGI OK (5 online APs pinged, 4 delivered; BSP ipi 1 -> 5) ::
+:: AARCH64 SMP: ORIN-SMP-3 5/5 secondaries online via PSCI CPU_ON (DTB /cpus oracle); AP timer PPI stretch deferred (JC3) ::
+:: tegra: JM6 â€” dropping the Orin boot core EL2 -> EL1 for the scheduler + CAPSTONE ::
+:: tegra: JM6b pre-drop â€” HCR_EL2=0x88000038 MMFR1.VH=1 TTBR0_EL1=0x25aed2000 L1_EL1[0]=0x60000000000405 L1_EL1[9]=0x240000701 ::
+:: tegra: JM6b â€” EL1 landing: CurrentEL=1 SCTLR_EL1=0x30d01805 ::
+:: AARCH64 exception vectors installed (VBAR_EL1 = 0x25ae75000) ::
+:: AARCH64 SCHED (virt): boot core 0 at EL1 â€” running the full M4 CAPSTONE cooperatively ::
+:: VUG-HONESTY: parked-core display witness PASS â€” a frozen non-demo core reads PARKED (never the demo core's load); scheduled cores read their busy fraction, the demo core its render load ::
+:: VUGRAS: heap span [0x2683ca000,0x26b3ca000) 48 MiB; tegra DRAM top 0x280000000 ::
+:: VUGRAS: above-heap sweep span B [0x26b3ca000,0x280000000) 340184 KiB â€” carveout-clipped (never DC-cleans firewall fabric) ::
+:: VUGRAS: framebuffer/scanout base 0x279e00000 len 0x960000 ::
+:: VUGRAS: cursor save-under stash [0x25aece3a0,0x25aed0344) ::
+:: AARCH64 SCHED: priority+aging witness â€” 2 PRIO_HIGH loaders vs 1 PRIO_LOW candidate on cpu 0 ::
+:: tegra: JD2 â€” EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::
+xHCI: [Event] Port Status Change. Port=7
+xHCI: [Port 7] reset complete (PED=1); settling before enable.
+xHCI: [enum port 7] stage -> reset-settle
+:: VUGRAS: idle tick 0 swept ::
+ERROR:   **************************************
+ERROR:   RAS Uncorrectable Error in SNOC, base=0xe011000:
+ERROR:   	Status = 0xec00030d
+ERROR:   SERR = Illegal address (software fault): 0xd
+ERROR:   	IERR = Carveout Uncorrectable Error: 0x3
+ERROR:   	Overflow (there may be more errors) - Uncorrectable
+ERROR:   	MISC0 = 0x2400
+ERROR:   	MISC1 = 0xc50842000000000
+ERROR:   	MISC2 = 0x0
+ERROR:   	MISC3 = 0x8000000
+ERROR:   	ADDR = 0x800000026b900000
+ERROR:   **************************************
+ERROR:   sdei_dispatch_event returned -1
+ERROR:   Powering off core

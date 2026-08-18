@@ -3,7 +3,9 @@
 Status: QEMU-proven on a scratch block device (x86_64), 2026-07-18. Arc INSTALL-CORE.
 Wired to the Orin microSD (metal-pending) by **INSTALL-1**, made a real self-clone by **INSTALL-2**, and given
 multi-block SD transfers + multi-cluster directories by **ORIN-SDMMC-3**
-(§INSTALL-1 / §INSTALL-2 / §ORIN-SDMMC-3 below; `UNAOS_INSTALL_TARGET_SD=1`).
+(§INSTALL-1 / §INSTALL-2 / §ORIN-SDMMC-3 below; `UNAOS_INSTALL_TARGET_SD=1`). Wired to the Pi 4 `emmc2` (the
+first LIVE, benchless install) by **INSTALL-PI**, and made a real self-clone there by **INSTALL-PI-2**
+(§INSTALL-PI / §INSTALL-PI-2 below; `UNAOS_PIINSTALL_CONFIRM=1`).
 Knob: `UNAOS_INSTALLDEMO=1` (feature `installdemo`), default OFF. Module: `crates/kernel/src/install/`.
 
 ## What it is
@@ -289,26 +291,216 @@ invocation with a **dedicated BLANK scratch image** in the slot — never the `k
 boot-sector `FAT32` fs-type + `UNAOS` volume label + 0x55AA at the ESP's first LBA) — the installer's claim
 verified from OUTSIDE the kernel. Both the in-kernel PASS line and the host-side `HOST-VERIFY: PASS` are green.
 
-**Payload (M2 adjudication).** A Pi "install" payload is ultimately the boot volume's FAT files (kernel8.img /
-start4.elf / config.txt — what the GPU ROM loads). At the pre-shell BSP call site those are not reachable as a
-readable clone source, so v1 writes a generated `UNAOS.IMG` marker (the honest-and-sufficient choice for the
-QEMU witness) and the **self-clone of the boot FAT files is the named metal follow-up** (the Pi analogue of
-INSTALL-2). **Metal note:** on real hardware the seated card IS the running system's card — the three gates +
-about-to-destroy announcement are exactly the guard for that; a metal install leg wants a dedicated erasable
-card, never the boot card.
+**Payload (INSTALL-PI v1 → self-clone).** INSTALL-PI v1 wrote a generated `UNAOS.IMG` marker, because at the
+pre-shell BSP call site a readable clone source was thought unavailable; the real self-clone was flagged as the
+named follow-up. **§INSTALL-PI-2 below replaces the marker with the real self-clone.** **Metal note:** on real
+hardware the seated card IS the running system's card — the three gates + about-to-destroy announcement are
+exactly the guard for that; a metal install leg wants a dedicated erasable card, never the boot card.
 
-**Knob-off identity.** `piinstall*` default OFF ⇒ the `install/pi` module, the `main.rs` call site, and the
-arch-neutral engine all compile out; all machine code + data are unchanged and the `kernel8-test` battery is
-0 FAIL. As with PI-USB, the only possible delta from baseline is embedded panic-`Location.line` u32s shifted
-by the 8-line gated insertion in `kernel_main` — a source-line number, never code or behavior.
+**Knob-off identity.** `piinstall*` default OFF ⇒ the `install/pi` + `install/clone` modules, the `main.rs`
+call site, and the arch-neutral engine all compile out; all machine code + data are unchanged and the
+`kernel8-test` battery is 0 FAIL. As with PI-USB, the only possible delta from baseline is embedded
+panic-`Location.line` u32s shifted by the gated insertion in `kernel_main` — a source-line number, never code
+or behavior.
+
+## §INSTALL-PI-2 — the Pi self-clone: the booted system reproduces its own boot media
+
+**Landed 2026-07-20** (aarch64/Pi bare-metal; QEMU-live). Same `UNAOS_PIINSTALL_CONFIRM=1` gate. Glue:
+`install/pi.rs` (the rewritten Gate-3 `install_flow`); engine: a new `install/clone.rs` (the buffered
+self-clone primitive). Replaces INSTALL-PI's synthetic `UNAOS.IMG` marker with the **real thing** — the
+Pi analogue of §INSTALL-2, cloning the running system's own boot media (`kernel8.img` + `config.txt` + the
+GPU firmware files) onto a fresh GPT + FAT32 layout, every file sha-extent-verified.
+
+**Same-device clone (the Pi's defining constraint).** §INSTALL-2's Orin clones a SEPARATE USB stick onto the
+microSD, so it can stream read-source→write-target. The Pi has **one** block device: the seated `emmc2` card
+is BOTH the source boot media AND the install target (Pi USB is a honesty stub — no second readable backend).
+A streaming copy would read the source AFTER the GPT write had destroyed it. So the Pi clone is **two phases**,
+the new engine seam in `install/clone.rs`:
+1. **SNAPSHOT** — `clone::snapshot` reads the WHOLE source boot tree into the kernel heap through the in-tree
+   FAT reader (`fs::fat::mount` on the seated card's own boot partition), BEFORE any destructive write.
+   Bounded on every axis (per-file 32 MiB, total 40 MiB, depth 8); a short read is a malformed source, refused.
+2. **WRITE** — after the GPT + zero-ESP + FAT32 pass, `clone::write_snapshot` mirrors the buffered tree onto
+   the fresh ESP via the engine's `TreeWriter` (multi-cluster directories, multi-FAT-sector chains — the same
+   writer §INSTALL-2/§ORIN-SDMMC-3 added), recording each file's extents.
+Both phases are engine-level and target-agnostic (any `InstallTarget`, any `fs::fat` source) — the payload
+seam, **not** a Pi-only fork; the Orin's streaming clone could adopt the buffered path later unchanged.
+
+**Byte-clone vs fresh-format ruling (the partition question).** The boot FAT tree is cloned **BY CONTENT** —
+a fresh FAT32 ESP, files re-written and per-file sha-verified — **never a raw byte-clone**. A source data /
+`unafs` partition is **NOT** byte-copied: `write_gpt` lays a fresh, empty data partition. This follows §INSTALL-2
+and the engine's verify discipline: every cloned byte must be file-sha-verifiable, which a raw partition image
+is not, and the boot media the GPU ROM needs is the FAT tree, not the data volume. A fresh install's data
+volume is empty by design.
+
+**Verify (unchanged discipline, now over real files).** Every cloned file is re-read off the card and
+SHA-checked through `verify_extents`; the flow prints a per-file `sha256=… VERIFIED` manifest, then
+`:: INSTALL: pi emmc2 gpt+zero+fat32+clone(N files) verify => PASS ::`.
+
+**QEMU witness.** `./arroyo kernel8-install [secs]` now stages the scratch card as a throwaway COPY of the
+running system's own boot media (`scripts/make-pi-install-src.sh`: an MBR/FAT32 boot partition carrying the
+freshly-built `KERNEL8.IMG` + `CONFIG.TXT` + `START4.ELF` + `FIXUP4.DAT` + an `OVERLAYS/` subdir, all 8.3-clean
+so the clone round-trips exactly) — never the `kernel8-test` battery fixture. The installer mounts it,
+snapshots, repartitions the same card, clones the tree back. **HOST-VERIFY is extended to the payload:** a
+minimal FAT32 reader walks the resulting ESP root (and `OVERLAYS/`), reads each cloned file's cluster chain,
+and byte-compares its SHA against the `KERNEL8_DIR` source — the clone proven from OUTSIDE the kernel, not just
+the GPT/FAT32 structures. Both the in-kernel PASS line and host-side `HOST-VERIFY: PASS` are green.
+
+**Metal-owed (flagged, not this arc's job).**
+- **Cloned-card bootability** — whether a real Pi GPU ROM actually BOOTS from the cloned card. The QEMU witness
+  boots via `-kernel`, so bootability of the written FAT tree is unverified here.
+- **Long-name (LFN) preservation** — the QEMU source stages 8.3-clean names for an exact round-trip; a real Pi
+  card carries long names (`bcm2711-rpi-4-b.dtb`, `overlays/miniuart-bt.dtbo`) the GPU ROM needs verbatim. The
+  8.3 `TreeWriter` clones via mangled short names; LFN write-back is the follow-up that bootability depends on.
+- **Dedicated target card** — on metal the seated card is the boot card; a real install leg wants a separate
+  erasable target (the single-block-device constraint the same-device snapshot works around in QEMU).
 
 ## What later rungs still owe
 
-- **INSTALL-2 (self-clone):** copy the running system's own boot volume as the payload (needs the boot media
-  readable as a block device at the install site — a post-takeover install position or a second block backend).
-  The Pi analogue: clone the boot FAT files (kernel8.img/start4.elf/config.txt) rather than a marker.
-- **Cross-platform:** the same `InstallTarget` generalizes to the x86 USB stick (installer_engine
-  line seed rung 4); the Pi `emmc2` rung landed as §INSTALL-PI.
-- **Throughput:** multi-block CMD25/CMD18 on the SD path (single-block is correct but slower on the zero pass).
+- **Cross-platform:** the same `InstallTarget`/`TreeWriter`/`clone` seam generalizes to the x86 USB stick
+  (installer_engine line seed rung 4); the Pi `emmc2` rung landed as §INSTALL-PI / §INSTALL-PI-2.
+- **Throughput:** multi-block CMD25/CMD18 on the SD path (single-block is correct but slower on the zero pass
+  and the per-cluster clone writes).
 - **Metal SD throughput:** the multi-block CMD18/CMD25 path is compiled + verified off-metal (QEMU models no
   Tegra234 SDMMC); its first metal exercise is the attended Orin sitting.
+
+## §INSTALL-SELF — the installer never offers, selects, or erases the device it booted from
+
+**Observed at the bench** (rMBP 2012, 2026-07-29): the machine booted from an SD card in a USB
+reader, and the graphical installer listed *that same card* as a target and offered to erase it.
+
+§INSTALL-SEL had already made target selection real — the engine binds the disk the operator chose,
+not "whatever disk is present" — so the offer was truthful about *which* disk it would destroy. It was
+still an offer to destroy the running system. **Selection correctness and target eligibility are two
+different properties**; this section supplies the second one.
+
+### The identity, and why it is a FAT volume serial
+
+Nothing in this tree carries a block-device identity across the boot handoff. The UEFI bootloader
+knows a firmware handle; the kernel knows an xHCI slot; no mapping exists between them. (The builder's
+own comment said as much: `BootInfo` carried no boot-device handle, "so the kernel cannot learn what
+it booted from".)
+
+What *does* cross the handoff is a byte written on the medium itself — the FAT `BS_VolID` the
+formatter stamped into the boot sector:
+
+| Stage | Where | What happens |
+|-------|-------|--------------|
+| Read | `crates/bootloader` → `read_boot_volume_serial` | Opens `LoadedImage` on the image handle, takes its **device** handle — the same one `get_image_file_system` resolves `kernel.elf` through — opens `BlockIO` on it **non-exclusively** (`GetProtocol`), reads LBA 0, and lifts `BS_VolID` out of the extended BPB. On a partition handle LBA 0 *is* the volume's boot sector. |
+| Carry | `crates/boot-info` → `BootInfo::boot_volume_serial: u32` | New field. **0 is the absent sentinel.** aarch64's `build_boot_info` fills 0 (it does not boot through this bootloader). |
+| Publish | `crates/kernel/src/main.rs` | One call to `install::selfguard::set_boot_volume_serial`, before `memory::init` consumes `boot_info`. Gated exactly like `crate::install`, so a build without an installer is byte-identical to baseline. |
+| Match | `install::selfguard` + `fs::fat::volume_serials` | Reads every FAT volume serial off each candidate disk and compares. |
+
+The `BlockIO` open is deliberately non-exclusive: the firmware's FAT driver holds `BlockIO` on that
+handle `BY_DRIVER`, and an `Exclusive` open would call its `Stop` — tearing down the filesystem the
+bootloader is about to read `kernel.elf` from. Every failure path returns 0. This code exists to stop
+an *erase*; it must never be able to stop a *boot*.
+
+It is a **volume** serial, not a device serial, and the difference is load-bearing in both directions:
+
+- A **byte clone** of the boot media carries the same serial. Our own installer clones boot media
+  (§INSTALL-2, §INSTALL-PI-2), so the collision is real, not theoretical.
+- A **reformat** changes it, so a disk that once held our boot volume and has since been reformatted
+  is a legitimate target again.
+
+### The two layers
+
+1. **UI — shown, marked, not selectable.** `video/instgui.rs` rows carry the verdict, resolved through
+   the same `selfguard::classify` the engine consults (cached per block-registry signature, so the
+   per-frame repaint costs nothing). A matching row is **kept on screen** and tagged ` BOOT` in dimmed
+   text, with a legend (`BOOT = the disk this system booted from. Not installable.`). Excluding it
+   from the list was the alternative; showing it was chosen because an installer that silently hides
+   the operator's own disk sends them hunting for a disk that is not there. Selection *steps over*
+   marked rows (`step_selectable`), the dialog opens on the first selectable row, the shrink-clamp in
+   `service` lands on a selectable row, and `Enter` on a marked row refuses to advance with a witness.
+   When every attached disk is marked, the `Continue` affordance is withdrawn and the screen says to
+   attach another disk.
+2. **Engine — the actual guard.** `install::run_engine` calls `selfguard::refuses` on the target it
+   **bound**, before its first write and *before* the blank-check: "this is the disk you are running
+   from" outranks "this disk is not blank" as a reason to stop, because a blank boot device is still a
+   boot device. Refusal is `InstallError::BootDevice`; nothing is written. The UI filter is not the
+   guard — this is. The unattended witness path has no UI at all and is covered by the same check.
+
+### Matching reads ALL volumes, not the first
+
+`fs::fat::mount_source` is first-match-wins: it returns the first volume that parses and stops. Right
+rule for "mount the boot media", wrong rule for "is this the disk we booted from" — a device whose
+*second* partition is the ESP we booted would go unrecognized and be offered as a target. So
+`fs::fat::volume_serials` enumerates all of them, in the same superfloppy → GPT → MBR order, through
+the same `parse_bpb` gates. The partition-table walks were extracted into `gpt_volume_starts` /
+`mbr_volume_starts` and are shared with the mount path, so the guard can never see a partition the
+mount would not, or miss one it would. The direction of the difference is the safe one: a superset of
+serials can only cause *more* candidates to be refused, never fewer.
+
+### Edge cases, all handled
+
+| Case | Behavior |
+|------|----------|
+| Serial absent / 0 (pre-guard bootloader, non-FAT boot path, aarch64) | Guard **DISARMS** with `:: install: boot volume serial ABSENT (0) — INSTALL-SELF boot-device guard DISARMED ::`. Every candidate stays eligible. Bricking the installer is not a safe failure mode; announcing that the guard protects nothing is. |
+| Two attached volumes with the SAME serial (clones) | **Both refused**, plus a distinct witness naming the collision. The rule is per-candidate, so refusing both is the *absence* of a special case. If two disks both claim to be the volume we are running from, we cannot tell which we would erase, and the safe direction is to erase neither. |
+| Candidate carries no FAT at all | Cannot match; stays a valid target (witnessed as such). |
+| Candidate's `BS_VolID` is 0 | Never excluded. 0 is the absent sentinel on both sides, so an *unstamped* volume is not evidence of anything. |
+| Candidate not in the live registry | Not judged here — the engine's own `bind_id` already refuses it as `TargetGone`. |
+
+### Witness formats
+
+At disk-list build (one line per candidate, emitted once per block-registry signature):
+
+```
+:: install: boot volume serial=0xfabe1afd — INSTALL-SELF boot-device guard ARMED ::
+:: install: boot device global/slot1 (262144 sectors) serial=0xfabe1afd EXCLUDED ::
+:: install: candidate global/slot1 (262144 sectors) 1 FAT volume(s), first serial=0x554e4153 != boot 0xfabe1afd, ELIGIBLE ::
+:: install: candidate global/slot1 (262144 sectors) — no FAT volume, cannot be the boot device, ELIGIBLE ::
+:: install: boot serial=0x… matches N attached volumes (CLONES) — ALL EXCLUDED, refusing to guess which one we booted ::
+```
+
+Engine refusal (defense in depth; should be unreachable through the UI):
+
+```
+:: INSTALL: refusal — target '<vendor>' '<product>' slot=N carries the BOOT volume serial 0x…; refusing to erase the device we booted from => guard OK ::
+```
+
+The bootloader also states its own result, including *why* a disarmed guard is disarmed, so that is a
+diagnosable fact at the bench rather than a mystery:
+
+```
+[ INFO]: boot volume FAT serial 0xfabe1afd (extended BPB BS_VolID)
+[ INFO]: boot volume FAT serial unavailable: <reason> — installer boot-device guard will disarm
+```
+
+### QEMU coverage, and what it cannot cover
+
+`UNAOS_INSTALLDEMO=1 ./arroyo test` runs `selfguard::selftest` before the engine and
+`selfguard::live_media_leg` after it.
+
+- **Decision table (synthetic, substantive).** The rule is pinned over synthetic serial sets: disarmed,
+  match, multi-volume match, no match, no FAT, 0-sentinel, clone collision. Verdict:
+  `:: INSTALL-SELF: guard decision table (…) => PASS ::`
+- **Live media.** The harness boots from an `ide-hd` ESP the kernel has no driver for, and the only
+  disk it enumerates is the installer's own **blank** scratch — so at list-build time there is no FAT
+  volume to match and the live leg **SKIPs** with that reason recorded. *After* the engine formats the
+  scratch, that disk carries a real FAT32 volume, and `live_media_leg` reads its serial off the wire
+  (`0x554e4153`, the formatter's `VOL_ID`) and confirms the guard's answer against the real boot
+  serial (`0xfabe1afd`, QEMU's vvfat constant).
+- **Exclusion on live media, role-swapped.** The harness *cannot attach* a disk whose serial matches
+  the boot volume, so the exclusion path has no live fixture. The leg therefore asks the real
+  comparison with the roles swapped: take a serial actually read off live media and ask whether a boot
+  volume carrying *that* serial excludes this disk. Real bytes, real comparison, and the answer must be
+  `BootDevice` — if it is ever anything else, the guard cannot exclude a boot device no matter what the
+  bootloader reports. Verdict:
+  `:: INSTALL-SELF: live-media exclusion (role-swapped: boot serial := 0x… read off …) => EXCLUDED, PASS ::`
+
+### Known limitations
+
+- **The FAT32 formatter stamps a constant.** `install::fat32::VOL_ID` is `0x554E_4153` ("UNAS") for
+  every volume it writes. So a machine booted from UnaOS-installed media reports that serial, and every
+  *other* UnaOS-installed disk attached to it is excluded as a clone. That is the safe direction and
+  the documented clone behavior, but it is over-broad; giving the formatter a per-install serial (and a
+  matching write-back to the media it clones) is the follow-up.
+- **`parse_bpb` does not gate on `BS_BootSig`.** The kernel's BPB parser reads `BS_VolID` at
+  0x27/0x43 unconditionally, so an unstamped volume yields whatever bytes live there. The bootloader
+  side *does* gate on `BS_BootSig == 0x29` (the byte immediately before `BS_VolID`, at 0x26/0x42). The
+  asymmetry only ever over-matches on the kernel side, and over-matching in a guard costs an excluded
+  target, not an erased one.
+- **Metal is the only place the exclusion path runs end-to-end.** Everything above is QEMU- and
+  synthetic-verified; the bench case that motivated the arc (boot from a USB SD reader, confirm the
+  card is listed, marked, unselectable, and refused by the engine) is an arc-boundary hardware check.

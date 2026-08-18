@@ -18,7 +18,12 @@
 >   as every announce/ack (stale reachability claims are never relayed), then
 >   merges its own reviewed+acked arc `--no-ff`, runs the trunk battery
 >   (step 3 below), and reports results in its landing report. The
->   one-unmerged-arc-per-track cap stands.
+>   one-unmerged-arc-per-track cap stands. **Dispute path**: no ack, or an
+>   objection the seats cannot resolve over ccd → the merge does not happen
+>   and the disagreement goes to Peter with both positions. Silence is never
+>   consent; a 1-1 split never deadlocks unrecorded. ("Trunk" throughout is
+>   name-agnostic — one trunk branch; `main` per Peter's 2026-08-18 ruling
+>   retiring the `UnaOS-gemini` staging name.)
 > - **Track sync ("rebase the tracks")** → each track MERGES trunk into its
 >   branch at its own arc boundaries. Never rebase a pushed tip; never
 >   force-push. (The step-4 `--ff-only` flow applies only to a track with no

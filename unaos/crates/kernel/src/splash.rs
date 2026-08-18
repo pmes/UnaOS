@@ -434,4 +434,209 @@ pub fn boot_splash(base: usize, len: usize, info: FrameBufferInfo) {
     SPLASH_UP.store(true, Ordering::Relaxed);
 
     serial_println!(":: SPLASH: crystal cluster traced — 3 shards, {} spectrum rays ::", NRAYS);
+
+    // SPLASH-ALIVE: publish the framebuffer handle and arm the animation, as the LAST act of the
+    // paint so no baseline statement above it shifts line. From here each boot milestone
+    // (`bootpace::record`) drives one `advance()` frame until the `gui` stamp latches it off just
+    // before the desktop's first paint. Gated off usbdebug/bootlog/witness — see the SPLASH-ALIVE
+    // block at the foot of this file for why every addition is placed and gated the way it is.
+    #[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+    {
+        *SPLASH_FB.lock() = Some(fb);
+        ANIM.store(true, Ordering::Relaxed);
+    }
+}
+
+// =================================================================================================
+// SPLASH-ALIVE — the crystal breathes during the boot wait.
+//
+// The base frame (fans + shards) is painted ONCE by `boot_splash`; from then on `advance()` is
+// called from the boot-milestone seam (`bootpace::record`) and does a CHEAP per-frame partial
+// redraw: a moving light source (`COS_Q8` LUT, one 11.25° step per milestone) sweeps specular
+// GLINTS along the crystal's facet edges, and the beam-entry facet throbs. The milestone stamps are
+// densest exactly where the boot waits (the M4 xHCI subdivision — a dozen stamps through
+// `pci::init`), so the crystal is liveliest during the longest bring-up wait.
+//
+// FRAME-DRIVER CHOICE (the load-bearing question): milestone-driven, NOT a TSC frame loop or an
+// APIC-timer callback. The pre-heap bring-up runs single-threaded on the BSP with no yield point, so
+// a frame loop cannot let bring-up proceed, and a periodic timer callback would touch the
+// interrupt/APIC path (outside this lane) and race the TSC calibration. Driving one cheap frame off
+// each `bootpace::record` advances the crystal WITHOUT adding any wall clock of its own — the stamp
+// already happened; we borrow it. Each frame touches only a few thousand facet-edge pixels
+// (kilopixels), far below the one-time `fill_screen` the base paint already pays, so `gui=` on the
+// BPACE total line does not move.
+//
+// SEAMLESSNESS: every moving highlight rides ON a facet-edge locus, and each frame's FIRST act per
+// edge is to repaint that whole edge in `SPLASH_EDGE` (the eraser) — so last frame's glint is
+// overwritten exactly, with no cached backbuffer (there is no heap yet) and no ghosting. Animation
+// LATCHES OFF at the `gui` stamp, which both handoff paths record BEFORE the desktop's first paint,
+// so no glint frame ever lands over the GUI and the SPLASH-SEAMLESS contract holds. A panic still
+// repaints its own screen (it never consults this module).
+//
+// BYTE-IDENTITY: every item below is gated OFF for usbdebug/bootlog/witness, uses fully-qualified
+// paths (no new `use` line), and lives at the FOOT of the file after `boot_splash`. So for those
+// three builds this file's post-cfg token stream — and every baseline line number — is unchanged,
+// and the kernel the test/bench media carries is byte-identical to baseline (verified: `.text`,
+// `.rodata` and the stripped image all hash-match).
+
+/// The initialised front-framebuffer handle captured by `boot_splash`, so `advance()` can repaint
+/// without re-deriving it. `FrameBuffer` is `Copy`; the `Mutex` only guards the one-time publish and
+/// gives `advance()` a `try_lock` bail against any (theoretical) re-entrant milestone.
+#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+static SPLASH_FB: spin::Mutex<Option<FrameBuffer>> = spin::Mutex::new(None);
+
+/// Set once the base frame is up; cleared at the `gui` handoff stamp. While true, milestone stamps
+/// drive one animation frame each. Never armed on usbdebug/bootlog/witness (`boot_splash` is gated
+/// off there, so this stays false and `advance()` is a single-load no-op).
+#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+static ANIM: AtomicBool = AtomicBool::new(false);
+
+/// Monotonic frame counter — the animation's whole time base. Deterministic (no TSC read needed):
+/// the light angle is `PHASE` LUT steps and each glint's crawl offset is a function of `PHASE`.
+#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+static PHASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// cos(2π·i/32) · 256, i in 0..32 — the fixed-point light-direction table (no float, pre-heap).
+/// `sin(i) = COS_Q8[(i + 24) & 31]`.
+#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+const COS_Q8: [i32; 32] = [
+    256, 251, 237, 213, 181, 142, 98, 50, 0, -50, -98, -142, -181, -213, -237, -251, -256, -251,
+    -237, -213, -181, -142, -98, -50, 0, 50, 98, 142, 181, 213, 237, 251,
+];
+
+/// Pixel length of a facet edge (Q16.16 endpoints → whole pixels).
+#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+#[inline]
+fn edge_steps(a: (i64, i64), b: (i64, i64)) -> i64 {
+    ((b.0 - a.0).abs().max((b.1 - a.1).abs())) >> 16
+}
+
+/// Paint the sub-run `[i0, i1]` (in whole-pixel parameter, clamped to `[0, steps]`) of the facet
+/// edge `a → b`, in `color`. A DETERMINISTIC parametric sampler: the pixel at parameter `i` is the
+/// exact lerp of the two Q16.16 endpoints, so a sub-run traces a strict subset of the full edge's
+/// pixels. That is the seamlessness guarantee — repainting the WHOLE edge in `SPLASH_EDGE` erases
+/// any previous glint exactly, because both used this same locus. `put_pixel` clips to the panel.
+#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+fn edge_run(fb: &FrameBuffer, a: (i64, i64), b: (i64, i64), i0: i64, i1: i64, color: u32) {
+    let steps = edge_steps(a, b);
+    if steps <= 0 {
+        let (x, y) = (a.0 >> 16, a.1 >> 16);
+        if x >= 0 && y >= 0 {
+            fb.put_pixel(x as usize, y as usize, color);
+        }
+        return;
+    }
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let hi = i1.clamp(0, steps);
+    let mut i = i0.clamp(0, steps);
+    while i <= hi {
+        let x = (a.0 + dx * i / steps) >> 16;
+        let y = (a.1 + dy * i / steps) >> 16;
+        if x >= 0 && y >= 0 {
+            fb.put_pixel(x as usize, y as usize, color);
+        }
+        i += 1;
+    }
+}
+
+/// Resolve one shard's vertices to Q16.16 pixel space for the panel `(w, h, s)` — the same mapping
+/// `boot_splash` uses, factored out so `advance()` can re-derive the facet edges each frame without
+/// caching a `Poly` (the earliest frames predate the heap).
+#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+fn resolve_verts(sh: &Shard, w: i64, h: i64, s: i64) -> [(i64, i64); MAX_VERTS] {
+    let cx = (w * sh.c.0 / 1000) << 16;
+    let cy = (h * sh.c.1 / 1000) << 16;
+    let mut v = [(0i64, 0i64); MAX_VERTS];
+    for i in 0..sh.n {
+        v[i] = (cx + ((s * sh.v[i].0 / 1000) << 16), cy + ((s * sh.v[i].1 / 1000) << 16));
+    }
+    v
+}
+
+/// SPLASH-ALIVE — advance the living crystal by one frame, driven from a boot milestone.
+///
+/// Called from `bootpace::record` (gated OFF for usbdebug/bootlog/witness). A no-op unless the base
+/// frame is up, and it LATCHES OFF permanently at the `gui` handoff stamp so nothing ever paints
+/// over the desktop. Cheap by construction: per facet edge it repaints the edge (the eraser) and
+/// lays one short bright glint whose position crawls with `PHASE` and whose brightness is the
+/// specular alignment of that facet with the sweeping light — the beam-entry facet also throbs.
+#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+pub fn advance(tag: &str) {
+    if !ANIM.load(Ordering::Relaxed) {
+        return;
+    }
+    if tag == "gui" {
+        // The GUI is taking the panel (recorded before its first paint on both handoff paths).
+        ANIM.store(false, Ordering::Relaxed);
+        return;
+    }
+    let fb = match SPLASH_FB.try_lock() {
+        Some(g) => match *g {
+            Some(fb) => fb,
+            None => return,
+        },
+        None => return, // a re-entrant milestone owns the frame; skip this one.
+    };
+
+    let p = PHASE.fetch_add(1, Ordering::Relaxed) as i64;
+    // Light direction: one 11.25° LUT step per milestone — a slow sweep across the whole bring-up.
+    let lx = COS_Q8[(p & 31) as usize] as i64;
+    let ly = COS_Q8[((p + 24) & 31) as usize] as i64;
+
+    let w = fb.width() as i64;
+    let h = fb.height() as i64;
+    let s = w.min(h);
+
+    for (pi, sh) in SHARDS.iter().enumerate() {
+        let v = resolve_verts(sh, w, h, s);
+        // The beam enters the main shard on its left face — the edge with the leftmost midpoint.
+        // That facet gets the entry pulse ("the beam pulsing as it enters", Peter's word).
+        let entry_edge = if pi == 0 {
+            let mut best = 0usize;
+            let mut bx = i64::MAX;
+            for i in 0..sh.n {
+                let mx = (v[i].0 + v[(i + 1) % sh.n].0) / 2;
+                if mx < bx {
+                    bx = mx;
+                    best = i;
+                }
+            }
+            best
+        } else {
+            usize::MAX
+        };
+
+        for i in 0..sh.n {
+            let a = v[i];
+            let b = v[(i + 1) % sh.n];
+            // Eraser + crystal line: repaint the whole facet edge first (overwrites last glint).
+            edge_run(&fb, a, b, 0, i64::MAX, SPLASH_EDGE);
+
+            // Specular alignment of this facet with the light (sharpened to a glint).
+            let (nx, ny) = norm2(b.1 - a.1, -(b.0 - a.0));
+            let dot = ((nx >> 8) * lx + (ny >> 8) * ly) >> 8; // Q8, ~[-256, 256]
+            let d = dot.max(0);
+            let mut inten = (d * d) >> 8; // 0..256
+            inten = (inten * d) >> 8; // cubic → a tight, sparkly highlight
+            if pi == 0 && i == entry_edge {
+                // Triangle throb on the entry facet, independent of the sweep.
+                let tri = p & 15;
+                let pulse = if tri < 8 { tri } else { 15 - tri }; // 0..7
+                inten = (inten + pulse * 28).min(255);
+            }
+            if inten <= 10 {
+                continue; // this facet is edge-on to the light this frame — no glint.
+            }
+            let steps = edge_steps(a, b);
+            if steps <= 2 {
+                continue;
+            }
+            // The glint crawls along the facet as PHASE advances; each edge is offset so the
+            // sparkles do not march in lockstep.
+            let seed = (pi as i64 * 5 + i as i64) * 17;
+            let g = (((p * 3 + seed) % steps) + steps) % steps;
+            let gl = (steps / 6).max(4);
+            edge_run(&fb, a, b, g - gl / 2, g + gl / 2, dim(0x00FF_FFFF, inten as u32));
+        }
+    }
 }

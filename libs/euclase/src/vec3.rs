@@ -255,6 +255,18 @@ impl Neg for Vec3 {
 mod tests {
     use super::*;
 
+    const EPSILON: f32 = 1e-5;
+
+    fn assert_f32_eq(a: f32, b: f32) {
+        assert!((a - b).abs() < EPSILON, "{} != {}", a, b);
+    }
+
+    fn assert_vec3_eq(a: Vec3, b: Vec3) {
+        assert_f32_eq(a.x, b.x);
+        assert_f32_eq(a.y, b.y);
+        assert_f32_eq(a.z, b.z);
+    }
+
     #[test]
     fn test_vec3_dot() {
         let a = Vec3::new(1.0, 2.0, 3.0);
@@ -279,5 +291,39 @@ mod tests {
         let a = Vec3::new(3.0, 0.0, 0.0);
         let n = a.normalize();
         assert_eq!(n, Vec3::new(1.0, 0.0, 0.0));
+        
+        let b = Vec3::new(0.0, 0.0, 0.0);
+        assert_eq!(b.normalize(), Vec3::new(0.0, 0.0, 0.0));
+    }
+    
+    #[test]
+    fn test_vec3_mag() {
+        let a = Vec3::new(2.0, 3.0, 6.0);
+        assert_f32_eq(a.magnitude(), 7.0);
+        assert_f32_eq(a.mag_sq(), 49.0);
+    }
+
+    #[test]
+    fn test_vec3_ops() {
+        let a = Vec3::new(1.0, 2.0, 3.0);
+        let b = Vec3::new(4.0, 5.0, 6.0);
+        
+        assert_vec3_eq(a + b, Vec3::new(5.0, 7.0, 9.0));
+        assert_vec3_eq(b - a, Vec3::new(3.0, 3.0, 3.0));
+        assert_vec3_eq(a * 2.0, Vec3::new(2.0, 4.0, 6.0));
+        assert_vec3_eq(a / 2.0, Vec3::new(0.5, 1.0, 1.5));
+        assert_vec3_eq(-a, Vec3::new(-1.0, -2.0, -3.0));
+        
+        let mut c = a;
+        c += b;
+        assert_vec3_eq(c, Vec3::new(5.0, 7.0, 9.0));
+    }
+
+    #[test]
+    fn test_vec3_lerp() {
+        let a = Vec3::new(0.0, 0.0, 0.0);
+        let b = Vec3::new(10.0, 20.0, 30.0);
+        let c = a.lerp(b, 0.5);
+        assert_vec3_eq(c, Vec3::new(5.0, 10.0, 15.0));
     }
 }

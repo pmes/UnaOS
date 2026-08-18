@@ -1,0 +1,32 @@
+[package]
+name = "aether"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+[dependencies]
+boa_engine = "0.21"
+boa_gc = "0.21"
+html5ever = "0.39"
+kuchiki = "0.8"
+taffy = "0.12"
+reqwest = { version = "0.12", features = ["json", "stream", "blocking", "cookies"] }
+tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+bandy = { path = "../../libs/bandy" }
+gneiss_pal = { path = "../../libs/gneiss_pal" }
+anyhow = "1.0"
+thiserror = "2.0"
+clap = { version = "4.6", features = ["derive"] }
+image = "0.25"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+cssparser = "0.37"
+selectors = "0.39"
+url = "2.5"
+font-kit = "0.14"
+pathfinder_geometry = "0.5"
+base64 = "0.22"
+resvg = "0.47"
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+directories = "6.0.0"

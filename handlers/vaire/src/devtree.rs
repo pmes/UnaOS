@@ -137,9 +137,19 @@ impl ExcludeRules {
         .collect()
     }
 
+    /// Is this path credential-shaped under the floor? The audit predicate for
+    /// unit kinds that cannot *skip* a match (a repo Bolt's mirror carries
+    /// whatever was committed) and must therefore report it — see
+    /// [`crate::repo::audit_credentials`](crate::repo).
+    pub fn is_credential(&self, rel: &Path) -> bool {
+        Self::any_match(&self.credentials, rel)
+    }
+
     /// Merge the always-on credential floor into whatever the manifest declared
-    /// so Rider 2 holds even if the config forgets a pattern.
-    fn with_credential_floor(mut self) -> Self {
+    /// so Rider 2 holds even if the config forgets a pattern. Public because
+    /// every manifest kind that carries [`ExcludeRules`] — not just the
+    /// dev-tree's — must go through the floor.
+    pub fn with_credential_floor(mut self) -> Self {
         for p in Self::credential_defaults() {
             if !self.credentials.iter().any(|c| c == &p) {
                 self.credentials.push(p);

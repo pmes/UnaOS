@@ -41,9 +41,24 @@ path = "src/imp.rs"
 name = "midden-blob"
 path = "src/midden.rs"
 
-# opt-level "s" (size) per the M6c brief: a tiny flat blob. panic=abort (no unwinder in a no_std EL0
-# program); lto folds the single routine. No dependencies.
+# Size-optimised per the M6c brief: these are tiny flat blobs and every one of them must fit a SINGLE
+# 4 KiB EL0 code page (`boot::USER_CODE_SIZE`), which `arroyo kernel8` asserts per blob.
+#
+# WC-C moved this from "s" to "z". midden's bus-stats window took it to 4236 B under "s" — over the page
+# — and the overage was not in the new code (~370 B of it) but in what LLVM chose to unroll and inline
+# around it; hand-golfing the render bought tens of bytes at a time while making it worse to read. "z"
+# is the honest lever: it asks the compiler for the size the page budget actually requires (midden lands
+# at 3792 B, ~300 B of headroom) instead of paying for speed no status readout needs. The other blobs
+# shrink or stay identical in behaviour; each is re-asserted against the page budget at build time.
+# panic=abort (no unwinder in a no_std EL0 program); lto folds the single routine. No dependencies.
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 panic = "abort"
 lto = true
+
+# ABIFREEZE: the syscall ABI, imported rather than re-typed. This crate used to declare its own copy
+# of the numbers it happened to use; `una-abi` is now the single declaration, shared with both
+# kernels. It is `no_std`, has no dependencies of its own, and contains nothing but `const` — so it
+# contributes ZERO bytes to this image and the page/size budgets are unchanged.
+[dependencies]
+una-abi = { path = "../una-abi" }

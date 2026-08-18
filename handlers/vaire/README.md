@@ -268,6 +268,224 @@ below, the prediction for the raw two-flip tree write, and the per-flip cost
 the bare harness is vaire's snapshot-per-sync + measured-from-birth design, both
 carried verbatim.
 
+## The repo Bolt (BOLT-2) — a git repository as a managed unit
+
+Everything above manages *one* dev tree. **BOLT-2** is the repo-manager unit
+kind: it turns an arbitrary git repository into a managed object, with the
+Bolt-1 invariants carried verbatim.
+
+- **The mirror** — `<bolt_root>/mirrors/<name>.git`, a bare `--mirror` clone.
+  Committed history only: a repo Bolt never reads the source's working tree, so
+  an untracked file cannot enter the bolt by construction.
+- **The ledger** — `<bolt_root>/ledger/<name>.ledger`, an **append-only,
+  hash-chained** record. Each entry carries the run stamp, every ref and its
+  object id, the credential findings, and its predecessor's hash; its own hash
+  covers all of that (collision-detecting SHA-1, via the `gix` the crate
+  already carries for reading repositories). There is no rewrite path in the
+  code — `BoltRoot` can only append. **Graded honestly:** the bare chain
+  (`repo-verify`) is tamper-evident against an *editor*; the chain head is now
+  also **anchored** in a UnaFS image's retained CoW root (`repo-uweave --apply`
+  writes it, `repo-verify <image>` checks it), which closes the whole-tail
+  rewrite and truncation holes — down to trusting the image artifact. See "What
+  the chain is worth" below.
+- **The credential floor** — the *same* default-deny patterns, honestly
+  re-scoped. A mirror carries whatever was committed, so a filter cannot
+  un-commit a key; what the floor does here is **audit and report, never
+  silently**. Every credential-shaped path in a mirrored head tree becomes a
+  finding, is written into the ledger entry, is covered by the entry hash
+  (scrubbing one breaks verification), and turns the bolt **Amber**.
+- **The one write surface** — every mutation goes through `BoltRoot`, built
+  solely from the manifest's `bolt_root`. There is no constructor accepting a
+  managed repository as a write destination, and both git invocations pull
+  *from* the source with the mirror as the target, so no command in the module
+  can write into a managed repo (pinned by a `0o555`-source test).
+
+### Verbs
+
+| Verb | What it does |
+| --- | --- |
+| `repo-plan` | The would-do plan. **Dry-run is the default** — `repo-weave` without `--apply` prints this. |
+| `repo-weave --apply` | Mirror each repo (clone or `fetch --prune`) and append one ledger entry per repo. |
+| `repo-verify [--deep]` | Pure-read integrity. `--deep` adds `git fsck --connectivity-only`. |
+| `repo-status` | The God view: Crystal Color per repo, plus source-vs-ledger drift. |
+| `repo-layout` | The host→UnaFS mapping, as data. |
+| `repo-ufit` | Check the bolt against the measured UnaFS v3 limits before any weave. |
+| `repo-uweave [<image>] [--apply]` | Weave the mirrors into a UnaFS v3 image as native objects, and (on `--apply`) **anchor each ledger head** in the image's retained root. |
+| `repo-verify [<image>] [--deep]` | With an image, also check the ledger head against its retained anchor (the tamper-evident path). |
+
+These verbs take a **repo-bolt** manifest, so `--manifest <path>` is required —
+silently reading the dev-tree manifest would point a weave at the wrong tree,
+so it is refused by name.
+
+`verify` falsifies four distinct claims, each with a test that performs the
+real tamper: an **edited entry** (recorded hash no longer matches its
+contents), a **dropped entry** (a successor's `prev` points at nothing), a
+**missing object** (an oid the ledger recorded is absent from the mirror), and
+**ref drift** in either direction. A fifth check refuses any stored hash that
+is not a well-formed 40-hex SHA-1 (the collision detector's marker is
+self-consistent under recompute, so shape is what catches it). Crystal:
+**Red** on any breach, **Amber** when intact but carrying unresolved credential
+findings or a source that has moved past the ledger, **Green** when intact and
+current.
+
+### What the chain is worth
+
+A hash chain is tamper-evident only against a party who cannot recompute it.
+There are two grades, and the second is now wired.
+
+**`repo-verify` (bare chain, chain-internal).** Catches — each falsified by a
+test — an entry edited in place; an entry dropped or reordered mid-chain; a
+`cred` line scrubbed; a hash that is not a SHA-1; a recorded object missing from
+the mirror; ref drift either way. It does **not** catch a **whole-tail rewrite**
+(`LedgerEntry::new` is deterministic and public, so a writer can edit entry *k*
+and re-chain *k..n* into a self-consistent chain) or a **truncation to a valid
+prefix** (the survivors still chain, and dropping the newest entries is
+invisible whenever the mirror's refs did not move between them — the common case
+for a scheduled weave).
+
+**`repo-verify <image>` (anchored).** `repo-uweave --apply` pins the ledger head
+`(count, head_hash)` into the UnaFS image's retained CoW root as
+`vaire.repo.head.<name>`; `repo-verify <image>` reads it back through
+`open_snapshot` and rejects a ledger that no longer agrees. A whole-tail rewrite
+changes the head hash, a truncation changes the count, a full reorder changes
+the head hash — **all three are now caught**, each pinned by a test, and a
+*missing* anchor is itself a breach (`AnchorMissing`) so an unanchored chain
+never passes silently.
+
+**The residual trust is the image artifact.** The CoW machinery makes an
+in-place edit of a retained root infeasible (it would break the retained tree's
+refcounts, which `fsck` flags), so an attacker cannot surgically re-stamp one
+generation's anchor. But a party who *also* owns the image file can discard it
+and format a fresh image whose sole retained root matches a forged ledger. So
+this is a genuine **anchor**, not a tamper-*proof* log: tamper-evidence reduces
+to the image's integrity as an artifact — keep it out of the ledger writer's
+reach (a separate host, or read-only/off-box media) and the two classes above
+are caught. Making it tamper-*proof* against an adversary who owns everything
+needs a countersignature whose key never touches the bolt — a larger change than
+this seam.
+
+### UnaFS alignment — executable, not asserted
+
+`repo::unafs_view` projects a repo manifest into the `DevManifest` the VAIRE-3
+`usync` engine already consumes, so `repo-uweave` weaves a bolt's mirrors into
+a UnaFS v3 image **today**, with no new filesystem code: native objects, one
+root flip, one retained snapshot per weave, the same four `vaire.*` typed attrs
+per file, the same default-deny floor on the walk. `repo::unafs_layout` returns
+the mapping as data so it is test-pinned rather than prose:
+
+| repo-Bolt host artifact | UnaFS-native form |
+| --- | --- |
+| `mirrors/<name>.git/**` | a directory tree: `mkdir` per dir, one `create_files_batch` per parent dir |
+| each file's size/mtime/source | the four `vaire.size` / `vaire.mtime` / `vaire.src` / `vaire.sync` K6 attrs, folded into the creation inode |
+| one ledger entry `<stamp>` | *(planned)* a `vaire.repo.ledger.<stamp>` String attr on the unit root (the `vaire.summary.<stamp>` pattern) |
+| the ledger head | **wired**: `vaire.repo.head.<name>` = `"<count> <head_hash>"` on the image root, CoW-retained by the weave's snapshot; `verify_anchored` reads it back via `open_snapshot` and rejects a rewritten/truncated ledger |
+| a credential finding | *(planned)* a `vaire.repo.cred.<n>` String attr — reported in the image itself |
+| `.vaire-repo-bolt` (layout v1) | *(planned)* a `vaire.repo.layout` Int attr on the image root |
+| one weave | one `snapshot_create(<stamp>, "vaire")` — a retained CoW root, which now retains the **head anchor** as well as the mirrors, so the live head is checked against a real retained root via `open_snapshot` rather than against a file the same writer can rewrite |
+| Crystal Color | computed, never stored |
+
+Rows marked *(planned)* are design targets with **no code behind them yet**;
+the **wired** head-anchor row is written by `repo-uweave --apply`
+(`repo::weave_into_image`) and checked by `repo-verify <image>`
+(`repo::verify_anchored`). `repo::unafs_layout` returns the mapping as
+inspectable data, which pins the table's shape, not its implementation status.
+What `repo-uweave --apply` writes today is the mirror tree, the four per-file
+typed attrs, the head anchor on the image root, and one retained snapshot per
+run.
+
+**The honest boundary.** Host-native vaire cannot mount a *kernel* UnaFS
+volume: there is no host↔kernel bridge, and the crate's only host device is a
+file (`FileDevice`). "Utilizing UnaFS" here means the **image file** and the
+**format** — the same v3 on-disk layout, the same typed-attr and retained-root
+vocabulary a kernel mount reads. The bytes are the same bytes.
+
+### Feasibility: can UnaFS hold a git-shaped workload at scale?
+
+Measured, not argued. Harness:
+[`examples/unafs_repo_feasibility.rs`](examples/unafs_repo_feasibility.rs)
+(tempdir image, re-runnable, scale knobs `OBJECTS` / `STREAM_MB` / `REFS` /
+`IMAGE_MB`). The workload's *shape* is this monorepo, measured with
+`git cat-file --batch-all-objects`: **45,987 objects, 1.196 GB uncompressed**
+(9,971 blobs / 30,989 trees / 5,027 commits), **p50 = 559 B** with 70 % under
+1 KiB, **493 refs**, **33 packfiles / 51.81 MiB**.
+
+| Axis | Measured |
+| --- | --- |
+| 10,000 blobs, 422 MiB, 256-way fan-out | stage 5.03 s (0.503 ms/object), **ONE commit 20.7 ms**, 83.5 MiB/s, write amplification **1.42×** |
+| 52 MB packfile-shaped stream | write 49.3 MiB/s, read-back **1458 MiB/s** (page-cache warm — the extent path, not device bandwidth), 105 extents |
+| 493 refs rewritten, batched | 0.67 ms/ref in one flip |
+| one ref per flip | **25 ms/ref, 412 blocks/ref — 37× the batched cost** |
+| recursive walk, 10,494 files | 13.6 ms (1.29 ms per 1,000 entries) |
+| name lookup vs directory width | 0.005 ms @ 64 · 0.028 @ 512 · **0.214 @ 4096** — linear |
+| `fsck` over 150,292 blocks in use | 66.3 ms, clean, **0 leaked / 0 orphans**; `snapshot_create` 37.1 ms |
+
+**Verdict — feasible now for repository-sized bolts; the single-file ceiling is
+lifted, leaving the 2 GiB volume cap as the one named extension before UnaFS can
+hold a large repo's object store outright.** VAIRE-3's batch path already removed
+the commit-count problem (commit is 20.7 ms of a 5 s run), so the remaining cost
+is per-object staging, not the transaction. What binds:
+
+1. **~80 MiB single-file ceiling — LIFTED (v4, extent-list indirection).** The
+   old wall: an `Inode` — extent list included — had to serialize inside ONE
+   4 KiB block (bisected: 75 MiB → 151 extents fine; 85 MiB →
+   `InodeTooLarge(4100, 4096)`; the inline limit is ~168 extents). The v4 format
+   removes it: when the extent list overflows the inode block, the leading
+   extents stay inline (byte-identical fast path) and the remainder SPILLS to
+   indirect blocks (`unafs::inode::IndirectTrailer`), validated by `fsck` for
+   reachability and leak-freedom. A file of 4,000+ extents round-trips
+   byte-identically today (`tests/extent_indirection.rs`); because the indirect
+   INDEX is itself extent-coalesced, a contiguously-allocated overflow imposes no
+   practical extent cap, so **the binding limit for a single file is now the
+   2 GiB volume cap (point 2), not the inode.** The v4 bump is an incompat marker
+   — a v3-only reader rejects a spill-capable volume rather than silently
+   truncating a spilled inode; v3 volumes stay inline-only and mount unchanged.
+2. **2 GiB volume cap — LIFTED (v5, second refmap level).** The old wall: the
+   refcount-map index was ONE 4 KiB block of leaf pointers (512 leaves ×
+   1024 refs = 524,288 blocks = 2 GiB, refused cleanly past it). The v5 format
+   adds a second index level — the root's refmap block becomes an
+   index-of-indexes of mid blocks, each carrying 512 leaf pointers — raising
+   `MAX_BLOCK_COUNT` to 268,435,456 blocks = **1 TiB**. The level is a pure
+   function of the geometry: a volume of ≤ 2 GiB keeps the single-level layout
+   (a fresh small v5 image differs from v4 only in the version stamp), v3/v4
+   volumes mount and read bit-perfect, and a boundary test writes and remounts
+   real data across the old 2 GiB line (`tests/refmap_two_level.rs`). The bump
+   is an incompat marker like v4's: a pre-v5 reader refuses two-level geometry
+   rather than misreading mid pointers as leaves. Two honest caveats remain
+   PERF walls, not format walls: the mounted refmap lives whole in RAM
+   (8 B/block over its two views) and is rewritten whole each commit, so a
+   1 TiB image costs ~2 GiB of mount RAM and ~1 GiB of map rewrite per commit
+   — a repo-sized store (tens of GiB) is comfortable; a third level should
+   arrive with an incremental map. **In-kernel** the wall is the 256 MiB
+   kernel heap: at 8 B/block the refmap alone consumes it at 32 GiB of
+   volume, so the practical in-kernel mountable ceiling is on the order of
+   ~16 GiB (leaving heap for everything else) — a bigger card is refused
+   with a clean `AllocRefused`, never an OOM panic (the RefMap constructors
+   and fsck's rebuild vec allocate fallibly). Hardening follow-up (v4-parity
+   gap, pre-existing): mount validates refmap mid/leaf pointer BOUNDS but
+   not uniqueness or overlap with blocks 0/1 — a hostile volume with
+   duplicate pointers deserves its own refusal arc.
+3. **No path index** (a shape constraint, not a defect) — lookup is a full `ls`
+   plus a linear scan, so git's 256-way fan-out is mandatory; a flat object
+   store would be quadratic.
+4. **Ref churn must be batched** — 412 blocks to write 41 bytes when each ref
+   gets its own flip.
+
+**What UnaFS gives that FAT or ext cannot:** per-object **typed attributes**
+(the ledger can live *in* the store rather than beside it), **CoW retained
+roots** (a snapshot per weave is structural, not a copy), and a **mark-and-sweep
+`fsck` with reachability** (0 leaked across 150,292 blocks in 66 ms) —
+repository integrity as a *filesystem property* instead of a convention. That
+is the case for the direction, and it is why the Destiny below is worth
+building toward.
+
+**The verdict shaped the code.** BOLT-2 keeps packfile handling on the host
+git/`gix` side, and `repo-ufit` / `repo-uweave` check the measured limits
+**before** touching an image, so a bolt that cannot fit is refused with a reason
+and a true no-op, rather than failing halfway through a weave from three layers
+down. (The single-file `InodeTooLarge` wall that first motivated those guards is
+lifted as of the v4 format — extent-list indirection above; the guards now bind
+on the 2 GiB volume cap.)
+
 ## What is implemented today (STATUS / Crystal)
 
 - **The Bolt manifest** — `Manifest` registers managed units declaratively

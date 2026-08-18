@@ -1,0 +1,1241 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+//! PI-UI-2 — the always-on GUI status strip.
+//!
+//! A single line pinned to the bottom of the panel that surfaces the network / time state a bench
+//! user would otherwise only see on the serial console: the mDNS hostname, the settled interface IP
+//! (or a `no lease` placeholder), and the wall-clock (or `unsynced` before SNTP has seeded the
+//! clock). It is drawn by the render task every frame — after the console repaint, so it always sits
+//! on top — and refreshed at ~1 Hz by a periodic wake (see `status_tick` in `main.rs`).
+//!
+//! **Read-only by construction.** It consumes only public snapshot accessors: [`crate::clock::now`]
+//! for the wall clock and [`crate::net_phy::settled_ipv4`] for the interface address. Both are plain
+//! atomic / short-lock reads safe to call from the render core while the net + clock state is owned
+//! by other cores — no IRQ-masked hold is taken in the render path.
+//!
+//! All geometry derives from [`crate::ui::Metrics`] (THE METRICS RULE — no absolute pixel sizes), so
+//! the strip reads correctly on every panel from the 640×480 QEMU surface to a Retina panel.
+
+//! ## PULSE-2 — the always-running per-core CPU pulse, as an instrument panel
+//!
+//! PULSE-STRIP put the pulse INSIDE this one-line band as right-aligned per-core bars. On the bench
+//! panel `ui::Metrics::for_height(1200)` yields `scale=1`, so the band is 12 px and each bar came out
+//! ~30x4 px — about a millimetre tall. Peter's correction at the bench, verbatim: *"i meant for pulse
+//! to be in the ~20mm high gap at the bottom of the screen below the other windows not in your fake
+//! bar at the bottom like 1mm tall and 4mm long. don't try to fake a desktop just build test tools."*
+//!
+//! Two things in that are binding and general, and they are why this module now grows a SECOND band:
+//!
+//! 1. **This panel is a test-tool surface, not a desktop imitation.** There is no taskbar to dock
+//!    into and no chrome to imitate; an instrument gets the room it needs to be read at arm's length.
+//!    Sizing an instrument to fit inside existing chrome is how it became unreadable.
+//! 2. **The bottom gap is real estate, and it was standing empty.** The window tiler packs boxes from
+//!    the top; below the lowest window row there is a permanently unused strip of panel above this
+//!    status band. That is where the pulse belongs.
+//!
+//! So the pulse now lives in [`panel_geometry`]'s band — a full-width instrument seated directly above
+//! the status line, ~1/13 of the panel tall (92 px on the 1920x1200 bench panel, and never less than
+//! three line-pitches), carrying ONE ROW PER CORE: a `c<N>` label, an LED bar tens of pixels tall, and
+//! the percent. THE METRICS RULE still holds — every dimension is a function of the panel height or of
+//! [`crate::ui::Metrics`], and the band scales from the 640x480 QEMU surface up.
+//!
+//! ### The LED bar — sensitivity from width, smoothness from gradient
+//!
+//! Peter again, once the band existed: *"if pulse spans the entire bottom width of the screen there
+//! will be more leds to show sensitivity. with the better graphics can you have a gradient inside each
+//! led so it scales super smooth."* Both halves are design requirements and they pull on different
+//! parts of the meter:
+//!
+//! * **Sensitivity is LED COUNT, and LED count is width.** [`row_geometry`] stacks the cores as
+//!   full-width rows rather than side-by-side quarters precisely so every core gets the whole bar —
+//!   ~140 LEDs each on the bench panel instead of ~37. That is the resolution a load change has to
+//!   clear before it is visible at all.
+//! * **Smoothness is the FILL LENGTH, and the gradient is what makes a length out of lamps.**
+//!   [`draw_led_bar`] computes the load's fill as a continuous pixel length; whole LEDs inside it burn
+//!   full, the one LED the boundary lands inside is lit in proportion to its coverage, and every LED
+//!   carries its own vertical lens gradient. A rising load brightens the next lamp continuously
+//!   instead of clicking it on. The stored load went to per-mille for the same reason (a 1% quantum is
+//!   a 14 px jump on a 1400 px bar) — see [`classify_load_scaled`], which states the VUG-HONESTY
+//!   rule once for both scales.
+//! * The scale runs green → amber → red across the bar (colour by POSITION, so a given lamp's colour
+//!   is stable and only the length moves). Test instrument, not chrome.
+//!
+//! The status band itself goes back to what it was before PULSE-STRIP: **text only**, host / ip /
+//! clock. The miniature bars are superseded. What PULSE-STRIP got right is kept verbatim and is the
+//! substrate here: the same `sched::meter_cpu_*` relaxed reads, the same widget shape the `vug` demo
+//! used and the same palette (now owned here — see [`METER_DIM`]), the same dirty pacing, the same
+//! zero-new-threads plumbing.
+//!
+//! ### Reserving the band honestly
+//!
+//! An instrument the tiler can park a window on top of is not an instrument. [`chrome_h`] is the
+//! reservation: `wm::place` subtracts it from the panel's vertical budget, so no tiled window box is
+//! ever laid out into the pulse band or the status band. This is a tiler bottom-margin rather than a
+//! `wcf::reserved`-style box list because the two mechanisms answer different questions — WC-F's list
+//! exists so the compositor can *refuse to paint a probe* over a window that is already there, while
+//! this must stop the window from being placed in the first place. It also stays clear of
+//! `wm::occluders`/WC-I entirely: those govern who wins where regions DO overlap, and after the
+//! reservation they no longer overlap. (Occlusion is still inherited for free — this band draws into
+//! the `Screen` back buffer and `Screen::present_background` subtracts `wm::occluders()` from every
+//! damaged row — so an explicitly `move_to`-pinned window is still handled correctly.)
+//!
+//! WC-F's own reserved boxes DO sit in these rows (its ramp is 256 px tall against the bottom-left
+//! corner, its twins 64 px against the bottom-right) and it paints them straight to the framebuffer at
+//! the tail of every composite. So [`panel_geometry`] narrows the pulse band to the horizontal span
+//! WC-F leaves free rather than fighting it — 1480 px of the 1920 on the bench panel, which is more
+//! width than four cores need.
+//!
+//! Focus is untouched: nothing here is a view, so nothing here can take TAB or a click.
+//!
+//! Dirty pacing keeps PULSE-STRIP's contract and only recalibrates its threshold for the finer
+//! display. [`tick`] samples at most once per [`PSTRIP_PERIOD_MS`] and draws only when the composed
+//! status line changed OR a core's **lit length moved by at least one pixel** — the finest difference
+//! this meter can actually show. An idle panel with an unsynced clock still presents nothing at all
+//! (an idle core's per-mille load is a hard 0 and its length does not move), so the idle redraw rate is
+//! unchanged at ~0/s; the ceiling stays one redraw per sample, i.e. 1 Hz, well under the spec's 5.0/s
+//! busy-loop FORBID. The `[pstrip]` rollup reports samples and redraws so the pacing stays checkable.
+
+//! ## PULSE-3 — the strip must read the LIVE load source, not the dispatch-pass meter
+//!
+//! Peter's attended P64 verdict on the finished gradient instrument: *"gradient good but pulse not
+//! real-time"*. The capture (`pi4-r23s1o`) says the same thing in numbers — while three vugs held the
+//! cores at a sustained 99% and the vugband workers churned ~1M context switches a window, the strip
+//! printed `rollup samples=10 redraws=0 skipped=10`. Ten consecutive seconds in which the meter decided
+//! nothing on the panel had moved, against a machine that was visibly moving.
+//!
+//! The dirty test was not the defect. **The load source was.** PULSE-STRIP inherited `vug`'s VUG-1 M3b
+//! feed — `sched::meter_cpu_ticks`, the cumulative `CPU_BUSY`/`CPU_IDLE` counters that `dispatch_next`
+//! bumps once per dispatch PASS — and PULSE-2 carried it forward verbatim. Those are pass COUNTS, and
+//! the scheduler itself retired that metric two arcs earlier: SCHED-5's standing note, in
+//! `arch::aarch64::sched`, is *"TIME, NOT PASSES … it counts scheduler activity, not CPU time"*, and it
+//! moved `busy_pct_recent` onto a CNTPCT time base for exactly the reason that bit here. A core running
+//! CPU-bound tasks back to back dispatches at a near-constant rate and never reaches the empty-queue
+//! branch, so `db/(db+di)` pins at full scale and STAYS there: the ratio is flat while the utilization
+//! underneath it wanders. That is why the LEDs did not track, and why the `[spinhunt]` fixture's
+//! `load settled c2=53` and SCHED's `c2=99%` in the same window were never reconcilable — they are two
+//! different sources, and the strip was reading the wrong one.
+//!
+//! So [`live_permille`] takes the live SCHED-5/SCHED-7 feed (`sched::core_load(c).busy_pct_recent`, a
+//! busy-TIME fraction over a rolling ~250 ms window) as the strip's primary source. It is the same
+//! number `top` and the `SCHED: load` witness print, so the instrument and the console can no longer
+//! disagree about the same core. `meter_cpu_ticks` stays as the FALLBACK, and it keeps its whole
+//! VUG-HONESTY meaning: `core_load` reports `tracked=false` for a core that is not inside `run()`, and
+//! for such a core the tick deltas are consulted exactly as before — a frozen non-demo core still reads
+//! [`PARKED`] rather than a fabricated bar, and `crate::vug::parked_display_witness` still covers that
+//! branch (the witness stays with the demo — and so is aarch64-only, since `vug` is; the rule it
+//! witnesses lives here and is compiled on both arches).
+//! On x86 (no `core_load`) the source is unchanged in every particular.
+//!
+//! **Pacing is unchanged and stays.** 1 Hz is not the defect — skipping a window whose values moved is.
+//! An idle desktop still reads a hard 0 on every core and still redraws nothing (default-quiet), and the
+//! rollup now carries `srcdelta=`: the count of windows in which the SOURCE moved, printed beside the
+//! count of windows actually drawn. A stale-source regression is then a plain reading — `srcdelta=0`
+//! across a busy window — instead of something only a bench operator with the panel in front of him can
+//! see. [`src_witness`] closes the other half at arm time, headless: it reports how many cores return a
+//! live number and whether the source's own quantum (1% → 10‰) clears one pixel of lit length on THIS
+//! panel, so "the meter cannot show what the source can say" is caught in the gate.
+
+//! ## PULSE-4 — the latency budget, and why a mechanically-correct meter still read dead
+//!
+//! PULSE-3's fix works, and the P65 capture proves it mechanically: `src live=4/4 stepres=13px PASS`,
+//! rollups at `redraws=6-8/10 srcdelta=6-8`. The source is live, the meter can resolve it, and the
+//! strip redraws in most windows. Peter watching that same panel: *"well off live tracking"*.
+//!
+//! Both are true, because "the strip redraws" and "the strip tracks" are different claims. Adding up
+//! what stood between a load changing and a pixel moving:
+//!
+//! | term | before | worst case |
+//! |---|---|---|
+//! | source window (`busy_pct_recent`, rolling) | ~250 ms | 250 ms |
+//! | wake + sample cadence (`PSTRIP_PERIOD_MS`) | 1000 ms | 1000 ms |
+//! | dirty threshold (1 px of lit length) | 13 px per source quantum | 0 ms |
+//! | display filter | none | 0 ms |
+//! | **step → pixels** | | **~1.25 s** |
+//!
+//! **The cadence was the whole of it, and it was worse than a lag.** A second is already past the
+//! ~250–300 ms at which a human stops reading a meter as attached to the machine. But the sharper
+//! failure is the one an average latency hides: a burst SHORTER than the sample period could begin and
+//! end entirely between two samples and leave no mark on the panel whatsoever. Vugs churning in
+//! sub-second bursts were not being drawn late — they were not being drawn. Ten redraws a rollup, every
+//! one of them of a load the operator had already stopped seeing.
+//!
+//! The other two terms were not the defect and PULSE-4 does not touch them:
+//!
+//! * **The dirty threshold is already at the panel's floor.** It fires on one pixel of lit length, and
+//!   the P65 witness measured one source quantum at 13 px — thirteen times more movement than the test
+//!   needs. It cannot be the reason anything went unseen. (Sub-1% wander IS invisible, but that is the
+//!   SOURCE's quantum, not the threshold's: `busy_pct_recent` is a percent.)
+//! * **The ~250 ms source window is sched-lane and is left alone.** It now sets the floor of this
+//!   budget, so it is the next thing worth questioning if 250 ms cadence still does not satisfy the
+//!   eye — but narrowing it changes what `top` and `SCHED: load` report, and that is a scheduler
+//!   decision, not a display one. Flagged, not touched.
+//!
+//! So PULSE-4 is two changes, and they are a pair:
+//!
+//! 1. **[`PSTRIP_PERIOD_MS`] 1000 → 250** — one sample per source window, the fastest cadence at which
+//!    consecutive samples carry independent evidence. Worst-case step→pixels falls from ~1.25 s to
+//!    ~500 ms, and a 250 ms burst can no longer fall between samples. [`PSTRIP_PERIOD_TICKS`] carries
+//!    the same number to the metal `status-tick` wake, which is the outer term and would otherwise have
+//!    pinned the real cadence at 1 Hz no matter what this module asked for.
+//! 2. **Instant attack, ~1 s decay ([`attack_decay`])** — cadence alone makes a burst *drawn*; the
+//!    envelope makes it *seen*. A 250 ms spike at 4 Hz is a single frame; with the decay it is a peak
+//!    that falls away over about a second. The attack side has no filter at all, so nothing is traded
+//!    for the calm, and the fall is a bounded RATE rather than a geometric approach — it converges
+//!    exactly, within one decay constant, instead of creeping through the last few per-mille and
+//!    taxing the idle panel with seconds of decay repaints.
+//!
+//! **Dirty pacing is unchanged and the default-quiet law stands.** Cadence raises the ceiling on how
+//! fast the strip CAN respond; it repaints nothing that has not moved. An idle core still reads a hard
+//! 0, its lit length still does not move, and the idle panel's redraw rate is still set by the status
+//! text's seconds field at ~1/s — the same as at 1 Hz, four times the samples notwithstanding. The
+//! decay converges to an exact 0 rather than asymptoting, so a machine that goes quiet stops redrawing
+//! instead of creeping forever.
+//!
+//! The rollup carries the budget as a reading: `srate=` (achieved sample rate), `gapmax=` (its worst
+//! excursion) and `lat_max_ms=` (worst source-moved → pixels-on-panel, measured in-kernel). A wake that
+//! silently stays at 1 Hz shows up as `srate=1.0/s` however this module is configured, which is exactly
+//! the failure that would otherwise present as "PULSE-4 did nothing" on the bench and nowhere in a log.
+
+use crate::pal::GneissPal;
+use alloc::format;
+use alloc::string::String;
+use spin::Mutex;
+
+// ---------------------------------------------------------------------------------------------
+// The meter palette and the VUG-HONESTY display rule.
+//
+// These are the pulse's own primitives. They were carried by the in-kernel `vug` demo module while
+// the strip borrowed them, which left `vug` pinned cross-arch for no reason but this import: the
+// strip is the rule's permanent consumer and is compiled on both arches, the demo is a shell verb
+// that need not be. They live here now, and `vug` reads them back. The rationale comments below are
+// the originals, carried across with only their cross-references repointed.
+// ---------------------------------------------------------------------------------------------
+
+/// Meter palette — an unfilled segment: alive-but-empty, never blank.
+pub(crate) const METER_DIM: u32 = 0x00_2A2432;
+/// PULSE-ALIVE breath colour — clearly brighter than `METER_DIM`, dimmer than a load fill: the one
+/// sweeping segment an idle-but-scheduled core lights so "alive and idle" reads at a glance.
+pub(crate) const METER_BREATH: u32 = 0x00_5F4E86;
+/// Parked dash colour — cooler/dimmer than `METER_DIM` so a broken track reads as "not participating".
+pub(crate) const METER_PARKED: u32 = 0x00_3A3550;
+
+/// VUG-HONESTY parked-core marker (a load-array sentinel, disjoint from the 0..=100 percent range). A
+/// core whose pulse counters are frozen this window AND that is NOT the demo core is parked /
+/// never-scheduled: the display must not fabricate load for it. `load[c] == PARKED` selects a distinct
+/// DASHED bar (see [`draw_led_bar`]) — visually separable from an idle 0% bar (a solid dim track) so
+/// "idle" and "never woken" never read alike, and the percent column prints `park` instead of a number.
+pub(crate) const PARKED: u32 = u32::MAX;
+
+/// PULSE-2 — the VUG-HONESTY per-core display decision at an arbitrary full-scale, so a display with
+/// more resolution than "one bar in ten" can have more resolution than one percent.
+///
+/// Given one core's per-window busy/idle tick deltas (`db`/`di`), whether it is the *demo core* (the
+/// core executing the render loop), and that loop's own measured render busy% (`own_load`), return the
+/// load to display (`0..=full`) or [`PARKED`]:
+///   * `db + di > 0`  → the scheduler accounted this core this window: honest busy fraction.
+///   * frozen + demo  → the demo core runs OUTSIDE the scheduler, so its own counters freeze; credit its
+///                      measured render load — the honest number for the core doing the drawing.
+///   * frozen + other → a core with no scheduling activity this window that is NOT drawing: parked /
+///                      never-woken. NEVER fabricate load. (The pre-fix code credited `own_load` to
+///                      EVERY frozen core, so a parked AP mirrored the busy demo core and read PINNED —
+///                      the display-honesty defect that arc closed. The merged idle/busy-heartbeats made
+///                      the *counters* honest and passed the one-shot boot witness, but the LIVE meter
+///                      samples per-window deltas: a parked EL2 secondary gets no periodic wake, so its
+///                      counters are frozen between windows and this fallback still fabricated.) Report
+///                      PARKED instead.
+///
+/// The honesty rule is stated ONCE, here, and this is the definition BOTH arches compile —
+/// deliberately, since the strip is the rule's permanent consumer. `vug::classify_load` is this
+/// function at `full = 100`, and the VUG-HONESTY witness that runs beside it covers every branch of
+/// the rule through that entry point; `vug` is aarch64-only, so on x86 the rule is exercised by the
+/// strip alone. The instrument panel calls it at
+/// `full = 1000` (per-mille): its LED bar is ~1400 px wide on the bench panel, so a 1% quantum would
+/// be a 14 px jump — the display would step where the machine is smooth, which is exactly the
+/// "sensitivity" Peter asked the full width to buy. `own_load` is a percent by contract and is scaled
+/// to match. [`PARKED`] is `u32::MAX` and stays disjoint from `0..=full` at any sane scale.
+pub(crate) fn classify_load_scaled(db: u64, di: u64, is_demo: bool, own_load: u32, full: u32) -> u32 {
+    if db + di > 0 {
+        ((db * full as u64) / (db + di)) as u32
+    } else if is_demo {
+        (own_load as u64 * full as u64 / 100) as u32
+    } else {
+        PARKED
+    }
+}
+
+/// The mDNS / DNS-SD host name the Pi answers on the share segment (net11/net17). A fixed literal —
+/// the strip names it for the operator; it is not derived from any driver's private state.
+const HOSTNAME: &str = "unaos.local";
+
+/// Strip background (a shade darker than the Moonstone console background, so the bar reads as a
+/// distinct chrome band rather than more terminal).
+const STRIP_BG: u32 = 0x1B1A3A;
+/// Strip foreground text (Aqua — legible on the dark band, distinct from the grey history text).
+const STRIP_FG: u32 = 0x7BD0E0;
+
+/// PULSE-2 instrument-panel background — darker than the status band, so the two bottom bands read as
+/// two distinct instruments rather than one thick smear of chrome.
+const PANEL_BG: u32 = 0x0E0D22;
+/// PULSE-2 label / percent text.
+const PANEL_FG: u32 = 0x9FB4C8;
+
+/// The settled interface IPv4 (leased or static-fallback), or `None` before any bring-up completed.
+/// Wrapped so the strip compiles on a net-less kernel (the `net_phy` module is gated on the net
+/// features): with no net stack it simply reports "no lease".
+fn settled_ip() -> Option<[u8; 4]> {
+    #[cfg(any(
+        feature = "net4",
+        feature = "vnet",
+        feature = "smolnet",
+        feature = "genet"
+    ))]
+    {
+        crate::net_phy::settled_ipv4().map(|(ip, _leased)| ip)
+    }
+    #[cfg(not(any(
+        feature = "net4",
+        feature = "vnet",
+        feature = "smolnet",
+        feature = "genet"
+    )))]
+    {
+        None
+    }
+}
+
+/// Compose the strip's single line: `unaos.local   ip <a.b.c.d>|no lease   <YYYY-MM-DD HH:MM:SS UTC>|unsynced`.
+fn compose() -> String {
+    let ip = match settled_ip() {
+        Some(ip) => format!("ip {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+        None => String::from("no lease"),
+    };
+    let time = match crate::clock::now() {
+        Some(t) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+            t.year, t.month, t.day, t.hour, t.min, t.sec
+        ),
+        None => String::from("unsynced"),
+    };
+    format!("{}   {}   {}", HOSTNAME, ip, time)
+}
+
+/// Draw the status strip along the bottom line of `pal`. Clears its own band to the strip background
+/// first (so it always renders cleanly over whatever the console left there), then draws the text
+/// vertically centred within the band. Marks only its one-line band as damage — a ~1-line flush per
+/// frame, negligible at the 1 Hz refresh cadence.
+///
+/// PULSE-2: unconditional, and it draws BOTH bottom bands — the status line and the pulse panel above
+/// it. This is the path a Key/Button pass takes, where the console has just repainted over both and
+/// they owe an unconditional redraw on top whether or not anything they display changed. The pulse
+/// bars are drawn from the LAST SAMPLED loads — no resample, so a keystroke storm cannot turn into a
+/// telemetry-read storm. [`tick`] is the paced entry point.
+pub fn draw<P: GneissPal>(pal: &mut P) {
+    let m = pal.metrics();
+    let w = pal.width() as usize;
+    let h = pal.height() as usize;
+    // Pin to the last line-pitch band. `saturating_sub` keeps a degenerate/tiny panel in-bounds.
+    let band_y = h.saturating_sub(m.line_h);
+
+    pal.draw_rect(0, band_y, w, m.line_h, STRIP_BG);
+
+    // Vertically centre the glyph cell within the line-pitch band (the band is `line_h`, the glyph
+    // is `cell_h`; the half-cell leading splits above/below). PULSE-2: text only — the miniature bars
+    // that shared this line are superseded by the instrument panel above it.
+    let text_y = band_y + (m.line_h.saturating_sub(m.cell_h)) / 2;
+    pal.draw_text(m.margin, text_y, &compose(), STRIP_FG);
+    draw_panel(pal);
+}
+
+// ---------------------------------------------------------------------------------------------
+// PULSE-STRIP — per-core CPU bars docked in the strip's right-hand end.
+// ---------------------------------------------------------------------------------------------
+
+/// Upper bound on the rows the instrument will draw. The band is a fixed fraction of the panel and
+/// splits into one row per core, so past this the rows stop being tall enough to read: a wider machine
+/// simply shows its first `PSTRIP_MAX_CPUS` cores. (Kept below vug's `MAX_METER_CPUS` for that reason,
+/// not for want of counters.)
+pub const PSTRIP_MAX_CPUS: usize = 8;
+
+/// The pulse sample period — PULSE-4's headline change: **250 ms, not 1000**.
+///
+/// PULSE-2 set this to a second with the reasoning that "sampling faster would only add telemetry
+/// reads the 1 Hz redraw could never show". That reasoning was circular — the redraw could not show
+/// them *because the sample was the redraw's own cadence*. What it actually bought was the latency
+/// budget PULSE-4 exists to close (see the module note): a load step waited up to a full second to be
+/// sampled, and a burst shorter than the period could begin and end entirely between two samples and
+/// leave no mark on the panel at all.
+///
+/// 250 ms is chosen against the source rather than against a round number: `busy_pct_recent` is a
+/// rolling ~250 ms window, so one sample per window is the fastest cadence at which consecutive
+/// samples carry independent information. Sampling faster than the source's own window would re-read
+/// overlapping evidence — motion in the log with no new fact behind it.
+///
+/// Pacing is untouched by this: [`tick`] still draws only on a pixel of movement, so the idle panel's
+/// redraw rate is set by the status text's seconds field (~1/s) exactly as it was at 1 Hz. Cadence
+/// raises the CEILING on how fast the strip *can* respond; it does not repaint anything that has not
+/// moved. THE DEFAULT-QUIET LAW STANDS.
+pub const PSTRIP_PERIOD_MS: u64 = 250;
+
+/// Per-core display decay constant. PULSE-4: the meter attacks INSTANTLY (a rising load is displayed
+/// the sample it is read — a burst must never be averaged into invisibility) and falls back toward the
+/// live value over about this long.
+///
+/// Asymmetry is the whole point and it is not cosmetic smoothing. A symmetric filter would trade the
+/// burst away to buy the calm; instant attack keeps every peak the source reports, and the decay is
+/// what gives that peak enough dwell time on the panel for an eye to catch it. Without it a 250 ms
+/// spike is one 250 ms frame — technically drawn, humanly invisible. It also costs nothing in honesty:
+/// the displayed value is never HIGHER than something the source actually reported, and it converges
+/// to the live number exactly (see [`attack_decay`]'s 1‰ floor), so a decaying bar cannot park above a
+/// load that has genuinely gone away. It is also a BOUND, not a half-life: the fall is a rate of full
+/// scale per this interval, so a peak's dwell is exactly this long and then the panel is still again.
+const PSTRIP_DECAY_MS: u64 = 1000;
+
+/// The number of scheduler ticks (at the 250 Hz per-core tick) that make one [`PSTRIP_PERIOD_MS`].
+/// Exported so the metal `status-tick` wake and this module's own pacing are the SAME number by
+/// construction — a hard-coded `sleep_ticks(250)` beside a 250 ms period is how the wake and the
+/// sample silently drift apart, and the wake is the outer term of the latency budget.
+pub const PSTRIP_PERIOD_TICKS: u64 = {
+    let t = PSTRIP_PERIOD_MS * 250 / 1000;
+    if t == 0 {
+        1
+    } else {
+        t
+    }
+};
+
+/// Rollup period for the `[pstrip]` witness.
+const PSTRIP_ROLLUP_MS: u64 = 10_000;
+
+/// The strip's pulse state. Owned by the render task (the only caller) but held behind a lock so the
+/// module has no `static mut`: one uncontended acquire per second. The *telemetry* reads it feeds on
+/// (`sched::meter_cpu_ticks`) are lock-free relaxed loads taken outside any scheduler path — the
+/// introspection-only contract `pulse`/`top` already work under.
+struct PulseState {
+    /// Whether `prev` has been seeded (the first window has no delta to report).
+    armed: bool,
+    ncpu: usize,
+    /// Previous `(busy, idle)` tick snapshot per core.
+    prev: [(u64, u64); PSTRIP_MAX_CPUS],
+    /// Last window's DISPLAYED load per core, in per-mille (or [`PARKED`]) — the value the bars are
+    /// drawn from and the value the dirty test measures. PULSE-4: this is the attack/decay envelope of
+    /// `raw`, not `raw` itself.
+    load: [u32; PSTRIP_MAX_CPUS],
+    /// PULSE-4 — last window's RAW source reading per core, before the envelope. Kept separately so
+    /// `srcdelta` still counts movement of the SOURCE (its original meaning) rather than movement of
+    /// the display, which the decay would otherwise keep non-zero for a second after the machine went
+    /// quiet and quietly turn the stale-source alarm into a tautology.
+    raw: [u32; PSTRIP_MAX_CPUS],
+    /// `ms()` of the last sample.
+    last_ms: u64,
+    /// FNV-1a of the last composed text line — the cheap "did the text change" test that avoids
+    /// keeping a `String` alive across frames.
+    text_hash: u64,
+    /// Rollup accumulators.
+    samples: u64,
+    redraws: u64,
+    /// PULSE-3 — windows in which the SOURCE load moved on at least one core, whether or not that
+    /// movement cleared a pixel of lit length. Printed beside `redraws` so a window that was skipped
+    /// while the machine was changing is a reading in the log rather than a bench observation.
+    srcdelta: u64,
+    /// PULSE-4 — the widest gap actually observed between two samples in this rollup, in ms. The
+    /// ACHIEVED cadence, as opposed to the requested one: the strip samples on a wake it does not own
+    /// (`status-tick` on metal, the input task's poll-nap under QEMU), so `PSTRIP_PERIOD_MS` is a floor
+    /// and this is what the machine really delivered.
+    gap_max_ms: u64,
+    /// PULSE-4 — open step-to-paint measurement: the earliest wall-clock ms at which the source change
+    /// now awaiting paint could have occurred (`sample_time - gap`, the conservative end of the window
+    /// it was detected in). `0` = nothing pending. Cleared by the paint that shows it.
+    pend_ms: u64,
+    /// PULSE-4 — worst step-to-paint latency in this rollup, in ms: source-moved → pixels-on-panel,
+    /// measured in-kernel. This is the number the arc is actually about.
+    lat_max_ms: u64,
+    rollup_ms: u64,
+    /// PULSE-3 — has the source witness been re-emitted at a rollup boundary yet? It fires once at
+    /// arm time, which is the earliest moment the panel exists and therefore the moment MOST likely to
+    /// catch a core that has not yet entered `run()` and to read a transient `live=0`. Re-emitting it
+    /// once at the first rollup — ten seconds of settled boot later — means an early fire can never
+    /// leave a permanent unexplained `live=0` as the log's only word on the subject.
+    src_reemitted: bool,
+}
+
+static PULSE: Mutex<PulseState> = Mutex::new(PulseState {
+    armed: false,
+    ncpu: 0,
+    prev: [(0, 0); PSTRIP_MAX_CPUS],
+    load: [0; PSTRIP_MAX_CPUS],
+    raw: [0; PSTRIP_MAX_CPUS],
+    last_ms: 0,
+    text_hash: 0,
+    samples: 0,
+    redraws: 0,
+    srcdelta: 0,
+    gap_max_ms: 0,
+    pend_ms: 0,
+    lat_max_ms: 0,
+    rollup_ms: 0,
+    src_reemitted: false,
+});
+
+/// PULSE-3 — the strip's PRIMARY load source: this core's live busy-TIME fraction, in per-mille.
+///
+/// `sched::core_load(c).busy_pct_recent` is SCHED-5/SCHED-7's rolling ~250 ms CNTPCT accounting — the
+/// number `top` and the `SCHED: load` heartbeat report — so the instrument and the console are reading
+/// one feed. `None` means "no live number for this core": either this arch's arm is not wired to a
+/// busy-time feed, or SCHED-8's `tracked` flag says the core is not currently inside `run()` and its
+/// slot is a frozen snapshot. `None` sends the caller to the `meter_cpu_ticks` fallback, which is
+/// where VUG-HONESTY's PARKED decision lives — so this function never has to invent a load, and never
+/// gets the chance to.
+///
+/// SCHEDLOAD-X86 — "the arch has no such accounting (x86)" is no longer why the x86 arm returns
+/// `None`. `arch::x86_64::sched::core_load` now exists, with the same `busy_pct_recent`/`tracked`
+/// contract (spans in TSC, freshness in ms — see that module for why the two clocks differ), and it
+/// backs the always-on `[schedx86] load` serial witness. What is missing is only the WIRE: adopting
+/// it here so the panel strip and the console read one feed, which is the aarch64 lesson recorded at
+/// the top of this module and is a deliberate follow-up rather than part of that arc.
+///
+/// Resolution note: the source is a percent, so its quantum is 10‰. That is coarser than the meter's
+/// 1‰ storage and deliberately not smoothed or interpolated here — a fabricated intermediate value is
+/// exactly the dishonesty VUG-HONESTY closed. [`src_witness`] reports what one quantum is worth in
+/// pixels on the live panel so the trade is checkable rather than assumed.
+#[allow(unused_variables)]
+fn live_permille(cpu: usize) -> Option<u32> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let ld = crate::arch::sched::core_load(cpu);
+        if ld.tracked {
+            return Some((ld.busy_pct_recent * 10).min(PERMILLE_FULL));
+        }
+        None
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        None
+    }
+}
+
+/// FNV-1a over the composed line. Only used to detect change, never stored as content.
+fn hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// Full scale of the stored per-core load. Per-mille, not percent: the bar is ~1400 px wide on the
+/// bench panel, so a 1% quantum would move the fill 14 px at a time and the "super smooth" scaling the
+/// gradient LEDs exist for would be stepping under the gradient. See [`classify_load_scaled`].
+pub const PERMILLE_FULL: u32 = 1000;
+
+// ---------------------------------------------------------------------------------------------
+// PULSE-2 — the instrument panel's geometry.
+// ---------------------------------------------------------------------------------------------
+
+/// The pulse band's height for a panel `ph` pixels tall: a **thirteenth of the panel**, floored at
+/// eight glyph cells so a small surface still gets a band it can seat one row per core in, and capped
+/// at a quarter of the panel so a degenerate surface cannot be all instrument.
+///
+/// THE METRICS RULE, applied to an instrument rather than to type. A cell-derived height is what put
+/// PULSE-STRIP's bars at 4 px on the bench panel: `Metrics::for_height(1200)` is `scale=1` (the scale
+/// step is 900 rows and 1200 does not reach 2x), so *everything* derived from `cell_h` is 8 px there
+/// however the panel grows. An instrument that must be read across a room is a function of the PANEL,
+/// not of the type size — so this is a panel fraction, and it yields 92 px at 1200 rows (Peter's
+/// "~20mm" on the bench panel) and 36 px on the 640x480 QEMU surface.
+pub fn band_h(ph: usize) -> usize {
+    let m = crate::ui::Metrics::for_height(ph);
+    // The `cell_h * 8` floor is what makes the 640x480 gate surface work: a thirteenth of 480 is 36 px,
+    // which splits four ways into 9 px rows that cannot hold a glyph. Eight cells (64 px there) gives
+    // every core a row taller than the type beside it. On the bench panel the fraction is the larger
+    // term (92 px vs 64), so the floor never binds where it would cost real estate.
+    (ph / 13).max(m.cell_h * 8).min(ph / 4)
+}
+
+/// **The reservation.** Total panel rows the bottom chrome owns: the pulse band plus the status band.
+/// `wm::place` subtracts this from its vertical budget, so no tiled window is ever laid out over the
+/// instrument. Public because the tiler is the only caller that matters and the number must be
+/// computed in exactly one place — a second copy of this arithmetic is how a reserved region and the
+/// thing reserving it drift apart.
+pub fn chrome_h(ph: usize) -> usize {
+    let m = crate::ui::Metrics::for_height(ph);
+    band_h(ph).saturating_add(m.line_h)
+}
+
+/// SHELLDESK — **the TOP reservation: panel rows the desktop scene's furniture owns, which a
+/// screen-owning view must lay out below.**
+///
+/// The bottom counterpart is [`chrome_h`] and this is deliberately its twin: one function, no second
+/// copy of the arithmetic, and the number is READ FROM THE OWNER rather than restated — it is
+/// `video::menubar::strip_rect`'s own height, so a bar that is disabled, or that declines the panel
+/// on its floors, reserves nothing at all and the shell gets the whole glass back.
+///
+/// Why the shell has to know. The x86 render service draws `console::Console` into the desktop
+/// layer, and `Console::draw` opens with a whole-panel `clear_screen`: the shell's first act on every
+/// repaint is to claim every row on the panel. With the desktop present now withholding the strips'
+/// rows (`Screen::present_background`), text the shell laid out under the bar would be composed into
+/// the back buffer and never reach the glass — the shell would be writing lines into a region it
+/// cannot show. Reserving the rows is what makes "the desktop scene owns the top of the glass, the
+/// shell is a tenant below it" true for the LAYOUT as well as for the pixels.
+///
+/// `0` on aarch64 and on any x86 build without `wc` — `video::menubar` is not compiled there — so
+/// every non-x86-wc surface lays out exactly as it did before this arc.
+pub fn top_chrome_h(pw: usize, ph: usize) -> usize {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        if let Some((_x, y, _w, h)) = crate::video::menubar::strip_rect(pw, ph) {
+            // The bar is flush to the top edge, so the rows it costs a view below it are `y + h`.
+            // Written as the sum rather than as `h` so an inset strip (a future tenant, or a bar the
+            // geometry chose to float) reserves what it actually occupies.
+            return y.saturating_add(h);
+        }
+        0
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        let _ = (pw, ph);
+        0
+    }
+}
+
+/// The horizontal span `[x0, x1)` of the pulse band that is free of WC-F's reserved probe boxes.
+///
+/// WC-F paints scan-out ground truth straight into the framebuffer at the tail of every composite, and
+/// its two marks hug the BOTTOM edge — the ramp against the left corner (264x256 px), the twins against
+/// the right (144x64). Those rows are exactly the rows this band wants. Neither can move: WC-F's marks
+/// are photographed by the bench operator and its geometry is a witnessed constant. So the instrument
+/// yields the corners and takes the middle, which on the 1920x1200 bench panel is still 1480 px —
+/// far more width than four cores need — and 200 px on the 640x480 gate surface.
+///
+/// Cut on which half of the panel a box sits in: a left-hand box pushes `x0` past its right edge, a
+/// right-hand box pulls `x1` back to its left edge. Boxes that do not overlap the band's rows are
+/// ignored. Outside the WC-F build (x86, non-baremetal, no `witness`) nothing paints here and the band
+/// is the full panel width.
+#[allow(unused_variables)]
+fn free_span(pw: usize, ph: usize, y0: usize, y1: usize) -> (usize, usize) {
+    // `mut` is live only in the WC-F build below; on x86 / non-baremetal the span is returned whole.
+    #[allow(unused_mut)]
+    let (mut x0, mut x1) = (0usize, pw);
+    #[cfg(all(target_arch = "aarch64", feature = "witness", feature = "baremetal"))]
+    if let Some(boxes) = crate::video::wcf::reserved(pw, ph) {
+        for (bx, by, bw, bh) in boxes {
+            if by >= y1 || by.saturating_add(bh) <= y0 {
+                continue; // clear of the band's rows
+            }
+            if bx.saturating_add(bw / 2) < pw / 2 {
+                x0 = x0.max(bx.saturating_add(bw));
+            } else {
+                x1 = x1.min(bx);
+            }
+        }
+    }
+    if x1 <= x0 {
+        (0, 0)
+    } else {
+        (x0, x1)
+    }
+}
+
+/// The pulse instrument's box on a `pw` x `ph` panel: `(x, y, w, h)`, seated directly above the status
+/// band and horizontally clear of WC-F. `w == 0` means the panel cannot seat the instrument at all.
+pub fn panel_geometry(pw: usize, ph: usize) -> (usize, usize, usize, usize) {
+    let m = crate::ui::Metrics::for_height(ph);
+    let bh = band_h(ph);
+    let y = ph.saturating_sub(m.line_h).saturating_sub(bh);
+    let (x0, x1) = free_span(pw, ph, y, y + bh);
+    (x0, y, x1.saturating_sub(x0), bh)
+}
+
+/// One core's row inside the instrument, as `RowGeom`. `None` when the band cannot seat a legible row.
+///
+/// **Stacked full-width rows, not side-by-side quarters.** Both fit the ~92 px band, and the choice is
+/// decided by what Peter asked the width to buy: *"if pulse spans the entire bottom width of the screen
+/// there will be more leds to show sensitivity."* Quarters would give each core ~370 px and ~37 LEDs;
+/// stacked rows give each core the WHOLE 1400 px and ~140 — four times the resolution, which is the
+/// entire point. The cost is row height (20 px instead of 92), and 20 px is still five times the bar
+/// PULSE-STRIP drew and comfortably taller than the 8 px label beside it. Sensitivity wins.
+///
+/// Layout of a row, left to right: `c<N>` label, the LED bar taking every pixel between, then the
+/// percent right-aligned to one decimal. The bar is the instrument; the text is the annotation.
+#[derive(Clone, Copy)]
+struct RowGeom {
+    /// Lit width of one LED (the pitch less the dark gutter).
+    led_w: usize,
+    /// LED height — the bar's track height.
+    led_h: usize,
+    /// Dark gutter between LEDs.
+    gap: usize,
+    /// Number of LEDs across the bar. The sensitivity number.
+    nled: usize,
+    bar_x: usize,
+    bar_w: usize,
+    row_h: usize,
+}
+
+/// Target LED pitch as a fraction of the row height. A pitch of about half the row height gives a
+/// clearly-articulated LED (a wide-ish block, not a hairline) while still putting ~140 of them across
+/// the bench panel's bar. Derived from the row, so a small panel gets fewer, fatter LEDs rather than an
+/// unreadable comb.
+fn led_pitch_for(row_h: usize) -> usize {
+    (row_h / 2).max(3)
+}
+
+fn row_geometry(
+    m: &crate::ui::Metrics,
+    px: usize,
+    pw: usize,
+    ph_band: usize,
+    ncpu: usize,
+) -> Option<RowGeom> {
+    if ncpu == 0 {
+        return None;
+    }
+    let pad = (m.line_h / 2).max(2);
+    let row_h = ph_band.saturating_sub(2 * pad) / ncpu;
+    // A row must be tall enough to hold a glyph cell AND a bar worth calling a bar.
+    if row_h < m.cell_h.max(6) {
+        return None;
+    }
+    let led_h = row_h.saturating_sub((row_h / 4).max(1)).max(4);
+    // `c0` + a space; ` 62.4%` right-aligned. Both in cells, so they track the type.
+    let label_w = m.cell_w * 3;
+    let val_w = m.cell_w * 7;
+    let bar_x = px + pad + label_w;
+    let avail = pw
+        .saturating_sub(2 * pad)
+        .saturating_sub(label_w)
+        .saturating_sub(val_w);
+    let pitch = led_pitch_for(row_h);
+    let nled = avail / pitch;
+    if nled < 8 {
+        return None; // fewer LEDs than the old ten-segment bar had: not an instrument
+    }
+    let gap = (pitch / 4).max(1);
+    Some(RowGeom {
+        led_w: pitch.saturating_sub(gap),
+        led_h,
+        gap,
+        nled,
+        bar_x,
+        bar_w: nled * pitch,
+        row_h,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// PULSE-2 — the LED bar. Gradient-filled segments over a continuous lit length.
+// ---------------------------------------------------------------------------------------------
+
+/// Scale a packed `0x00RRGGBB` colour by `num/den`, per channel, saturating-free (the product of a
+/// byte and a small numerator cannot overflow `u32`).
+fn shade(c: u32, num: u32, den: u32) -> u32 {
+    let den = den.max(1);
+    let ch = |sh: u32| (((c >> sh) & 0xFF) * num / den).min(255) << sh;
+    ch(16) | ch(8) | ch(0)
+}
+
+/// Linear blend `a`→`b` by `num/den`, per channel.
+fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
+    let den = den.max(1);
+    let num = num.min(den);
+    let ch = |sh: u32| {
+        let (x, y) = ((a >> sh) & 0xFF, (b >> sh) & 0xFF);
+        ((x * (den - num) + y * num) / den) << sh
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
+// The instrument scale: green through amber to red across the bar. A VU-meter ramp, not chrome — the
+// level reads before any digit does, which is the whole job of a bench instrument.
+const LED_GREEN: u32 = 0x00_2ECC71;
+const LED_AMBER: u32 = 0x00_F1C40F;
+const LED_RED: u32 = 0x00_E74C3C;
+
+/// The base colour of LED `s` of `n`: green below 60% of full scale, ramping through amber to red at
+/// the top. Position on the SCALE, not on the load — so a given LED is always the same colour and the
+/// meter's shape is stable while its length moves.
+fn led_hue(s: usize, n: usize) -> u32 {
+    let n = n.max(1);
+    let pos = s * 1000 / n;
+    if pos < 600 {
+        LED_GREEN
+    } else if pos < 850 {
+        mix(LED_GREEN, LED_AMBER, (pos - 600) as u32, 250)
+    } else {
+        mix(LED_AMBER, LED_RED, (pos - 850) as u32, 150)
+    }
+}
+
+/// Vertical gradient bands per LED. The lens look: bright through the middle, falling off top and
+/// bottom. 8 bands is smooth at 15 px and costs 8 rects per LED rather than one per row.
+const LED_BANDS: usize = 8;
+
+/// Draw one LED at `(x, y)` with intensity `num/den` of its base colour — `0` draws the dark track, a
+/// partial value draws the fractional tail of the fill. Each LED carries its own vertical gradient, so
+/// the block reads as a lit lamp rather than as a flat rectangle.
+fn draw_led<P: GneissPal>(pal: &mut P, x: usize, y: usize, w: usize, h: usize, c: u32, lit: u32) {
+    let bands = LED_BANDS.min(h.max(1));
+    let base = mix(METER_DIM, c, lit, 255);
+    for b in 0..bands {
+        let y0 = y + b * h / bands;
+        let y1 = y + (b + 1) * h / bands;
+        // Triangular profile across the band index: 0 at the edges, 1 in the middle. Kept in
+        // 0..=255 fixed point, floored at 60% so an LED's rim is dimmer but never black.
+        let t = if bands <= 1 {
+            255
+        } else {
+            let d = (2 * b as i32 - (bands as i32 - 1)).unsigned_abs();
+            255 - (255 * d / (bands as u32 - 1)).min(255)
+        };
+        let f = 154 + 101 * t / 255;
+        pal.draw_rect(x, y0, w, y1.saturating_sub(y0), shade(base, f, 255));
+    }
+}
+
+/// Draw one core's LED bar for a per-mille load (or [`PARKED`]).
+///
+/// **Smoothness is the lit LENGTH, not the lit COUNT.** `lit_px` is the load's fraction of the whole
+/// bar in pixels; every LED fully inside it burns at full intensity, every LED fully outside draws the
+/// dark track, and the ONE LED the boundary falls inside is lit in proportion to how much of it the
+/// length covers. So a load creeping upward brightens the next lamp continuously and then hands over
+/// to the one after it — a meter that scales smoothly instead of clicking between whole segments.
+///
+/// PARKED and idle keep their PULSE-STRIP/VUG-HONESTY meanings verbatim: a parked core draws a cool
+/// dashed track (never confusable with 0%), and an idle-but-scheduled core breathes a sweeping block
+/// (PULSE-ALIVE — Peter's "pulse shows 1 CPU" defect). Both scale to the new LED count.
+fn draw_led_bar<P: GneissPal>(pal: &mut P, g: &RowGeom, y: usize, permille: u32) -> usize {
+    let pitch = g.led_w + g.gap;
+    if permille == PARKED {
+        // Dashes in groups, not alternating LEDs: at ~140 LEDs a 1-on-1-off dash is a grey haze.
+        let group = (g.nled / 16).max(1);
+        for s in 0..g.nled {
+            if (s / group) % 2 == 0 {
+                draw_led(pal, g.bar_x + s * pitch, y, g.led_w, g.led_h, METER_PARKED, 255);
+            } else {
+                pal.draw_rect(g.bar_x + s * pitch, y, g.led_w, g.led_h, PANEL_BG);
+            }
+        }
+        return g.bar_x + g.bar_w;
+    }
+    if permille == 0 {
+        let block = (g.nled / 10).max(1);
+        let phase = ((crate::arch::ms() / 300) as usize) % g.nled;
+        for s in 0..g.nled {
+            let on = (s + g.nled - phase) % g.nled < block;
+            let c = if on { METER_BREATH } else { METER_DIM };
+            draw_led(pal, g.bar_x + s * pitch, y, g.led_w, g.led_h, c, 255);
+        }
+        return g.bar_x + g.bar_w;
+    }
+    let lit_px = lit_px(g, permille);
+    for s in 0..g.nled {
+        let x = s * pitch;
+        // Coverage of THIS lamp's lit area by the fill length, in 0..=255.
+        let covered = lit_px.saturating_sub(x).min(g.led_w);
+        let lit = (covered * 255 / g.led_w.max(1)) as u32;
+        draw_led(
+            pal,
+            g.bar_x + x,
+            y,
+            g.led_w,
+            g.led_h,
+            led_hue(s, g.nled),
+            lit,
+        );
+    }
+    g.bar_x + g.bar_w
+}
+
+/// The fill length in pixels for a per-mille load — the single source of truth for both the draw and
+/// the dirty test, so "the picture changed" and "we redrew" can never disagree.
+fn lit_px(g: &RowGeom, permille: u32) -> usize {
+    if permille == PARKED {
+        return usize::MAX;
+    }
+    g.bar_w * (permille as usize).min(PERMILLE_FULL as usize) / PERMILLE_FULL as usize
+}
+
+/// PULSE-4 — one sample of the per-core display envelope: **instant attack, ~[`PSTRIP_DECAY_MS`] decay**.
+///
+/// * `new >= prev` (or either side is [`PARKED`]): take `new` outright. A rising edge, and the
+///   park/unpark transition, are displayed the sample they are read. There is no rise-time filter
+///   anywhere in this path — the burst the operator is watching for is never averaged away.
+/// * `new < prev`: fall at a bounded RATE — full scale per [`PSTRIP_DECAY_MS`], i.e. 250‰ per sample at
+///   the 250 ms cadence. So a fall of any size completes within one decay constant, and a drop from
+///   pinned to idle dwells for exactly that second and no longer.
+///
+/// **A rate, deliberately, and not a geometric approach to the target.** The obvious filter closes a
+/// `dt/tau` fraction of the gap per sample, which is smoother-looking and wrong here for two reasons.
+/// It asymptotes — it would spend seconds creeping through the last few per-mille, and those are
+/// precisely the values whose lit length still moves a pixel, so the strip would keep redrawing long
+/// after the machine went quiet. That is a direct tax on the default-quiet law: a busy second would buy
+/// five or six seconds of decay repaints. A bounded rate converges EXACTLY, in at most
+/// `PSTRIP_DECAY_MS`, and then the panel is genuinely still. It also makes the dwell a number one can
+/// state rather than a half-life one has to reason about.
+///
+/// A consequence worth naming: a small fall (less than one step) is passed through untouched, so
+/// ordinary downward tracking is not smoothed at all — only a fall large enough to be a burst ending
+/// gets the dwell. That is the intended shape. The filter exists to hold PEAKS on the panel long enough
+/// to be seen, not to slow the meter down in general.
+///
+/// **This never invents a value the source did not report.** The output is always between the previous
+/// display and the current reading, both of which the source produced; it can lag a fall, never lead a
+/// rise, and never exceed the highest number the feed has actually said. VUG-HONESTY is intact —
+/// what would breach it is a smoothed value filling a GAP in the feed, and there is no gap: every
+/// sample has a live reading behind it.
+fn attack_decay(prev: u32, new: u32, dt_ms: u64) -> u32 {
+    if prev == PARKED || new == PARKED || new >= prev {
+        return new;
+    }
+    let dt = dt_ms.min(PSTRIP_DECAY_MS);
+    let step = ((PERMILLE_FULL as u64 * dt) / PSTRIP_DECAY_MS).max(1) as u32;
+    prev - step.min(prev - new)
+}
+
+/// Draw the instrument panel from the last sampled loads: clear the band, then one labelled LED row
+/// per core. Nothing here samples — [`tick`] owns the telemetry cadence.
+fn draw_panel<P: GneissPal>(pal: &mut P) {
+    let st = PULSE.lock();
+    if !st.armed || st.ncpu == 0 {
+        return;
+    }
+    let m = pal.metrics();
+    let (px, py, pw, ph_band) = panel_geometry(pal.width() as usize, pal.height() as usize);
+    if pw == 0 || ph_band == 0 {
+        return;
+    }
+    pal.draw_rect(px, py, pw, ph_band, PANEL_BG);
+    let g = match row_geometry(&m, px, pw, ph_band, st.ncpu) {
+        Some(g) => g,
+        // Too small to seat rows: the band is painted (the reserved region is still visibly the
+        // instrument's) and nothing false is said about the cores.
+        None => return,
+    };
+    let pad = (m.line_h / 2).max(2);
+    for c in 0..st.ncpu {
+        let ry = py + pad + c * g.row_h;
+        // Centre the glyph cell against the bar's track.
+        let ty = ry + (g.led_h.saturating_sub(m.cell_h)) / 2;
+        pal.draw_text(px + pad, ty, &format!("c{}", c), PANEL_FG);
+        let end = draw_led_bar(pal, &g, ry, st.load[c]);
+        let val = if st.load[c] == PARKED {
+            String::from("  park")
+        } else {
+            format!("{:>3}.{}%", st.load[c] / 10, st.load[c] % 10)
+        };
+        pal.draw_text(end + g.gap, ty, &val, PANEL_FG);
+    }
+}
+
+/// The source quantum, in per-mille: [`live_permille`] is derived from a PERCENT, so the smallest step
+/// the live feed can express is 10‰. The meter stores per-mille; this is what the source can actually
+/// deliver into it.
+const SRC_QUANTUM_PERMILLE: u32 = 10;
+
+/// The bar width, in pixels, below which ONE source quantum cannot resolve to a whole pixel. The
+/// quantum is 1/100 of full scale, so a bar narrower than 100 px cannot render a 1% step however honest
+/// the feed is. See [`src_witness`] for why this bound has to exist *inside* the witness rather than in
+/// the spec: it separates a geometry fact from a source fact, and only the spec's `armed`-line FORBIDs
+/// can speak about geometry.
+const SRC_RESOLVABLE_BAR_PX: usize = 100;
+
+/// PULSE-3 — the arm-time source witness. Headless, deterministic, one line, no framebuffer read.
+///
+/// Two questions a replay could not previously answer about a panel nobody can see, and the two halves
+/// of the P64 defect:
+///
+/// * **Is the strip on the live feed?** `live=k/n` counts the cores for which [`live_permille`] returns
+///   a number this boot. `k=0` is the PULSE-3 regression exactly — every core back on the dispatch-pass
+///   fallback, which is where "not real-time" came from. (A core legitimately outside `run()` reports
+///   `tracked=false` and is not counted; that is why the assertion is `k>0`, not `k==n`.)
+/// * **Can the meter show what the source can say?** `stepres=` is the lit-length movement, in pixels,
+///   of ONE source quantum on THIS panel's bar geometry. Zero means the display quantizes the feed away
+///   — a real-time source feeding a meter too coarse to render its steps, which would present as the
+///   same frozen bars for a different reason. `mono=` checks the fill is strictly increasing across the
+///   scale, so a geometry that has collapsed to a constant is caught rather than read as "steady load".
+///
+/// **A red here must name the right subsystem.** `stepres` is `bar_w / 100`, so on any panel whose bar
+/// is narrower than [`SRC_RESOLVABLE_BAR_PX`] it is zero *for a geometry reason* — a shrunken
+/// `UNAOS_FBW`, a WC-F reservation that grew, a layout regression. Letting the spec FORBID `stepres=0px`
+/// unconditionally would report every one of those as a SOURCE regression, which is the opposite of
+/// what this arc is about. So the witness refuses to state a pixel resolution it cannot honestly
+/// attribute: below the bound it prints `stepres=coarse` and verdicts `SKIP-GEOM`, and the geometry
+/// FORBIDs on the `armed` line (`panel=…0x…`, `row_h=0`, single-digit `leds=`) are what go red instead.
+/// `stepres=0px` is then only ever printed by a panel wide enough to have resolved the step — where it
+/// genuinely does mean the display is quantizing a live feed away.
+///
+/// **x86 has no `core_load`** and is deliberately unchanged by PULSE-3, so there is no live feed to be
+/// on or off there and `live=0/n FAIL` would be a standing untruth in every x86 log. The witness reports
+/// `live=n/a` and verdicts `SKIP-ARCH` instead; the x86 log carries no FAIL and the "unchanged in every
+/// particular" claim stays true.
+fn src_witness(g: &RowGeom, ncpu: usize) {
+    let mono = lit_px(g, 250) < lit_px(g, 500) && lit_px(g, 500) < lit_px(g, PERMILLE_FULL);
+    let resolvable = g.bar_w >= SRC_RESOLVABLE_BAR_PX;
+    let stepres = lit_px(g, SRC_QUANTUM_PERMILLE).saturating_sub(lit_px(g, 0));
+    let step = if resolvable {
+        format!("{}px", stepres)
+    } else {
+        String::from("coarse")
+    };
+    #[cfg(target_arch = "aarch64")]
+    {
+        let live = (0..ncpu).filter(|c| live_permille(*c).is_some()).count();
+        let verdict = if live == 0 || !mono {
+            "FAIL"
+        } else if !resolvable {
+            "SKIP-GEOM"
+        } else if stepres == 0 {
+            "FAIL"
+        } else {
+            "PASS"
+        };
+        serial_println!(
+            "[pstrip] src live={}/{} quantum={} stepres={} mono={} {}",
+            live,
+            ncpu,
+            SRC_QUANTUM_PERMILLE,
+            step,
+            if mono { "yes" } else { "no" },
+            verdict
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = ncpu;
+        serial_println!(
+            "[pstrip] src live=n/a quantum={} stepres={} mono={} SKIP-ARCH",
+            SRC_QUANTUM_PERMILLE,
+            step,
+            if mono { "yes" } else { "no" }
+        );
+    }
+}
+
+/// PULSE-STRIP — the PACED entry point, called on the strip's own ~1 Hz refresh pulse (an
+/// `Event::Timer`). Samples the per-core meters at most once per [`PSTRIP_PERIOD_MS`], then redraws
+/// the band **only if** the composed text line or a quantized per-core load actually changed.
+/// Returns whether it drew — the caller presents only on `true`, so an idle panel whose clock has not
+/// been seeded costs a sample and nothing else.
+pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
+    let now = crate::arch::ms();
+    let mut changed = false;
+    // PULSE-3: did the SOURCE move this window, independently of whether the picture did?
+    let mut srcmoved = false;
+    {
+        let mut st = PULSE.lock();
+        if st.rollup_ms == 0 {
+            st.rollup_ms = now;
+        }
+        if !st.armed {
+            st.ncpu = PSTRIP_MAX_CPUS.min(crate::arch::sched::meter_cpu_count());
+            for c in 0..st.ncpu {
+                st.prev[c] = crate::arch::sched::meter_cpu_ticks(c);
+            }
+            st.armed = true;
+            st.last_ms = now;
+            let m = pal.metrics();
+            let (pw, ph) = (pal.width() as usize, pal.height() as usize);
+            let (px, py, bw, bh) = panel_geometry(pw, ph);
+            let g = row_geometry(&m, px, bw, bh, st.ncpu).unwrap_or(RowGeom {
+                led_w: 0,
+                led_h: 0,
+                gap: 0,
+                nled: 0,
+                bar_x: 0,
+                bar_w: 0,
+                row_h: 0,
+            });
+            // The LOOK of a panel nobody can see headless: the reserved band's box, the per-core row
+            // pitch, and the LED metrics. All derived from the panel height and `ui::Metrics`, so a
+            // hard-coded pixel would show up here as a constant that does not track `UNAOS_FB*`.
+            // `leds=` is the SENSITIVITY number — LEDs per core bar, i.e. how fine a load change the
+            // meter can articulate before the gradient takes over inside a single lamp.
+            serial_println!(
+                "[pstrip] armed cores={} panel=({},{},{}x{}) row_h={} bar=(x={},w={}) leds={} led={}x{} gap={} bands={} full={} strip_h={} reserved={} period={}ms attack=instant decay={}ms",
+                st.ncpu,
+                px,
+                py,
+                bw,
+                bh,
+                g.row_h,
+                g.bar_x,
+                g.bar_w,
+                g.nled,
+                g.led_w,
+                g.led_h,
+                g.gap,
+                LED_BANDS,
+                PERMILLE_FULL,
+                m.line_h,
+                chrome_h(ph),
+                PSTRIP_PERIOD_MS,
+                PSTRIP_DECAY_MS
+            );
+            src_witness(&g, st.ncpu);
+            changed = true; // first frame must paint the bars
+        } else if now.wrapping_sub(st.last_ms) >= PSTRIP_PERIOD_MS {
+            // PULSE-4 — the ACHIEVED gap, before it is overwritten. The strip samples on somebody
+            // else's wake, so the requested period is a floor and this is the real one; it is also the
+            // conservative window a detected source change must have happened inside, which is what
+            // makes the step-to-paint number below an upper bound rather than an estimate.
+            let gap = now.wrapping_sub(st.last_ms);
+            if gap > st.gap_max_ms {
+                st.gap_max_ms = gap;
+            }
+            st.last_ms = now;
+            st.samples += 1;
+            let demo = crate::arch::sched::meter_current_cpu();
+            // The dirty test is the DRAWN LENGTH, in pixels, of this panel's actual bar — not the
+            // number behind it. PULSE-STRIP quantized to whole bar segments because whole segments
+            // were all it could draw; the gradient LEDs render a continuous fill, so the finest
+            // visible difference is one pixel of lit length and that is exactly the threshold:
+            // redraw when any core's `lit_px` moves by >= 1. Finer than that is invisible, coarser
+            // than that would step under a gradient built to be smooth. Idle cost is unchanged and
+            // still ~zero: an idle core's per-mille load is a hard 0 and its length does not move, so
+            // an idle panel redraws only when the STATUS TEXT changes (once SNTP seeds the clock),
+            // and not at all before that.
+            let m = pal.metrics();
+            let (px, py, bw, bh) = panel_geometry(pal.width() as usize, pal.height() as usize);
+            let _ = py;
+            let geo = row_geometry(&m, px, bw, bh, st.ncpu);
+            for c in 0..st.ncpu {
+                let (b, i) = crate::arch::sched::meter_cpu_ticks(c);
+                let db = b.wrapping_sub(st.prev[c].0);
+                let di = i.wrapping_sub(st.prev[c].1);
+                st.prev[c] = (b, i);
+                // `own_load` is 0: the strip is drawn by a SCHEDULED task, so its core's counters
+                // tick like every other core's and the demo-core fallback never fires here. Passing a
+                // fabricated render load would be exactly the dishonesty VUG-HONESTY closed.
+                // PULSE-3 — the LIVE busy-time fraction first; the dispatch-pass deltas only where
+                // there is no live number. The deltas are still consumed unconditionally above (the
+                // `prev` snapshot has to advance every window either way, or a core that later falls
+                // back would classify against a window minutes wide).
+                let new = live_permille(c)
+                    .unwrap_or_else(|| classify_load_scaled(db, di, c == demo, 0, PERMILLE_FULL));
+                // `srcdelta` keeps its PULSE-3 meaning exactly: movement of the SOURCE, measured
+                // against the previous RAW reading, upstream of the envelope.
+                if new != st.raw[c] {
+                    srcmoved = true;
+                }
+                st.raw[c] = new;
+                // PULSE-4 — the displayed value is the envelope of the source, not the source.
+                let disp = attack_decay(st.load[c], new, gap);
+                changed |= match &geo {
+                    Some(g) => lit_px(g, disp) != lit_px(g, st.load[c]),
+                    // No seatable geometry: fall back to the number itself, so a panel too small to
+                    // draw still never claims "unchanged" about a load that moved.
+                    None => disp != st.load[c],
+                };
+                // PULSE-ALIVE's breath sweep is deliberately NOT a dirty source, exactly as it was
+                // not one in PULSE-STRIP. It is wall-clock animation on a core reading a hard 0, so
+                // making it dirty would redraw the whole panel every single sample and turn the
+                // pacing proof (`skipped=` in the rollup) into a constant zero — a 1 Hz repaint
+                // wearing a flag, which is the thing the spec's FORBID exists to catch. The breath
+                // advances on the frames the panel draws for other reasons, which once the clock is
+                // seeded is every second anyway.
+                st.load[c] = disp;
+            }
+            // PULSE-4 — open the step-to-paint stopwatch on the first sample that saw the source move
+            // and has not yet been shown. `now - gap` is the earliest instant the change could have
+            // happened, so the latency this yields is the worst case, not the flattering one. An
+            // already-open measurement is NOT restarted: a run of sub-pixel moves that only becomes
+            // visible on the fifth sample is a five-sample latency, and reporting it as one would hide
+            // precisely the "value wandered for a second before the bar admitted it" case.
+            if srcmoved && st.pend_ms == 0 {
+                st.pend_ms = now.wrapping_sub(gap).max(1);
+            }
+        }
+        // The text line changes on its own clock (lease settling, SNTP seeding, the seconds field).
+        let h = hash(&compose());
+        if h != st.text_hash {
+            st.text_hash = h;
+            changed = true;
+        }
+        if changed {
+            st.redraws += 1;
+            // PULSE-4 — close the stopwatch. `changed` is decided here and `draw` runs unconditionally
+            // on it at the bottom of this function, so this instant IS pixels-on-panel to within one
+            // band blit; there is no later point that would be more honest to measure at.
+            if st.pend_ms != 0 {
+                let lat = now.wrapping_sub(st.pend_ms);
+                if lat > st.lat_max_ms {
+                    st.lat_max_ms = lat;
+                }
+                st.pend_ms = 0;
+            }
+        }
+        if srcmoved {
+            st.srcdelta += 1;
+        }
+        // Rate-limited rollup: samples taken vs frames actually drawn. `redraws` well below `samples`
+        // is the dirty-pacing proof; the per-second rate is what the spec's busy-loop FORBID reads.
+        let span = now.wrapping_sub(st.rollup_ms);
+        if span >= PSTRIP_ROLLUP_MS {
+            // Fixed-point tenths: at a 10 s rollup an integer /s would truncate every honest rate
+            // to 0 and the spec's busy-loop FORBID would have nothing to bite on.
+            let rate_x10 = st.redraws.saturating_mul(10_000) / span.max(1);
+            // PULSE-4 — the ACHIEVED sample rate beside the requested period, and the worst
+            // source-moved → pixels-on-panel latency measured over the window. Together they are the
+            // whole latency budget as a reading: `srate` is the cadence the wake actually delivered
+            // (a metal `status-tick` that quietly stayed at 1 Hz would show as 1.0 here however this
+            // module is configured), `gapmax` is its worst excursion, and `lat_max_ms` is the number
+            // the operator's "laggy" verdict is about. `lat_max_ms=0` means no source movement was
+            // ever left waiting for a paint in this window.
+            let srate_x10 = st.samples.saturating_mul(10_000) / span.max(1);
+            serial_println!(
+                "[pstrip] rollup samples={} redraws={} skipped={} srcdelta={} rate={}.{}/s srate={}.{}/s gapmax={}ms lat_max_ms={} period={}ms decay={}ms",
+                st.samples,
+                st.redraws,
+                st.samples.saturating_sub(st.redraws),
+                st.srcdelta,
+                rate_x10 / 10,
+                rate_x10 % 10,
+                srate_x10 / 10,
+                srate_x10 % 10,
+                st.gap_max_ms,
+                st.lat_max_ms,
+                PSTRIP_PERIOD_MS,
+                PSTRIP_DECAY_MS
+            );
+            // PULSE-3 — re-state the source witness ONCE, at the first rollup. The arm-time fire is
+            // taken the instant the panel exists, before every core has necessarily entered `run()`,
+            // so a transient `live=0` there is possible and would otherwise stand as the log's only
+            // word on the feed. Ten seconds of settled boot later the answer is not transient. Once
+            // only: this is insurance against an early fire, not a second periodic witness.
+            if !st.src_reemitted {
+                st.src_reemitted = true;
+                let m = pal.metrics();
+                let (px, _py, bw, bh) = panel_geometry(pal.width() as usize, pal.height() as usize);
+                if let Some(g) = row_geometry(&m, px, bw, bh, st.ncpu) {
+                    src_witness(&g, st.ncpu);
+                }
+            }
+            st.samples = 0;
+            st.redraws = 0;
+            st.srcdelta = 0;
+            // `gap_max_ms` / `lat_max_ms` are per-window maxima, so they reset with the window.
+            // `pend_ms` deliberately does NOT: an open measurement spanning a rollup boundary is a
+            // real latency and gets reported in the window it finally lands in.
+            st.gap_max_ms = 0;
+            st.lat_max_ms = 0;
+            st.rollup_ms = now;
+        }
+    }
+    if changed {
+        draw(pal);
+    }
+    changed
+}

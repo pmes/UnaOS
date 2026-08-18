@@ -129,19 +129,14 @@ fn non_reserved_catalog_inode_id_refused() {
 
 #[test]
 fn oversized_volume_fails_format_cleanly_not_panic() {
-    // Lens-A fix (2026-07-16): a volume past the one-indirect-level map
-    // structure (> MAX_BLOCK_COUNT blocks = 2 GiB) used to slice-panic in
-    // the FORMAT commit's refmap-index fill; it must be a clean Err at both
-    // seams. (`migrate` sizes its target from the source, so format must
-    // fail clean on any size.)
-    use unafs::superblock::MAX_BLOCK_COUNT;
-
-    // format(): sized purely by size_mb (empty device) — 4 GiB request.
-    let empty = MemDevice::new();
-    assert!(
-        UnaFS::format(empty, 4096).is_err(),
-        "format(4096 MB) must fail cleanly, not panic"
-    );
+    // Lens-A fix (2026-07-16): a volume past the map structure used to
+    // slice-panic in the FORMAT commit's refmap-index fill; it must be a
+    // clean Err at both seams. (`migrate` sizes its target from the source,
+    // so format must fail clean on any size.) The v5 second refmap level
+    // moved the wall from 2 GiB to MAX_BLOCK_COUNT (1 TiB) — a 4 GiB format
+    // now succeeds (see refmap_two_level.rs); past the NEW wall the old
+    // clean-refusal contract still holds.
+    use unafs::superblock::{MAX_BLOCK_COUNT, MAX_BLOCK_COUNT_ONE_LEVEL};
 
     // The boundary itself is representable arithmetic: exactly MAX is valid
     // geometry per validate(); one past it is refused.
@@ -152,6 +147,20 @@ fn oversized_volume_fails_format_cleanly_not_panic() {
     let dev = valid_volume();
     let hostile = with_corrupt_sb(&dev, |sb| sb.block_count = MAX_BLOCK_COUNT + 1);
     assert!(UnaFS::mount(hostile).is_err());
+
+    // A PRE-v5 volume's format has only one refmap level: two-level geometry
+    // stamped v4 (or v3) describes a volume that code never wrote — refused,
+    // never misread. The identical geometry stamped v5 passes validate()
+    // (it is the two-level shape).
+    let two_level_v4 = with_corrupt_sb(&dev, |sb| {
+        sb.version = 4;
+        sb.block_count = MAX_BLOCK_COUNT_ONE_LEVEL + 1;
+    });
+    assert!(UnaFS::mount(two_level_v4).is_err());
+    assert!(Superblock::new(MAX_BLOCK_COUNT_ONE_LEVEL + 1).validate().is_ok());
+    let mut v4_sb = Superblock::new(MAX_BLOCK_COUNT_ONE_LEVEL + 1);
+    v4_sb.version = 4;
+    assert!(v4_sb.validate().is_err());
 }
 
 #[test]

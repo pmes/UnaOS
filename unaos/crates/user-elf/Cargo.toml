@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# ELF-1: the minimal static ELF64 EL0 "hello" user program. Unlike the flat `user-blob` (objcopy'd to
+# raw bytes), this crate's link product is kept AS AN ELF — the kernel's aarch64 loader validates the
+# ident, walks the PT_LOAD program headers, and maps each segment into a slot with per-segment
+# permissions (R/X code page, R/W data page). `arroyo kernel8` builds this for the bare aarch64 target
+# with its own linker script (crates/user-elf/user-elf.ld, which declares two PT_LOAD segments via a
+# PHDRS clause) and stages the ELF onto the FAT media as ELFHELLO.ELF.
+#
+# The empty [workspace] table makes this crate its OWN workspace root, so the parent UnaOS workspace
+# never tries to build this no_std/no_main EL0 blob for the host toolchain during `./arroyo check`.
+[workspace]
+
+[package]
+name = "user-elf"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-elf"
+path = "src/main.rs"
+
+# Tiny freestanding blob: size-optimised, panic=abort (no unwinder in a no_std EL0 program), lto folds
+# the single routine. No dependencies.
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+
+# ABIFREEZE: the syscall ABI, imported rather than re-typed. This crate used to declare its own copy
+# of the numbers it happened to use; `una-abi` is now the single declaration, shared with both
+# kernels. It is `no_std`, has no dependencies of its own, and contains nothing but `const` — so it
+# contributes ZERO bytes to this image and the page/size budgets are unchanged.
+[dependencies]
+una-abi = { path = "../una-abi" }

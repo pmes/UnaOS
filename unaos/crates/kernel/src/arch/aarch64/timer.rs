@@ -29,7 +29,13 @@ static LIVE: AtomicBool = AtomicBool::new(false);
 
 /// Target tick rate. 250 Hz gives a 4 ms heartbeat — frequent enough to be a responsive wake
 /// source, coarse enough that the per-tick handler cost is negligible.
-const TICK_HZ: u64 = 250;
+///
+/// PUBLIC because `SYS_GETINFO` hands this tick count to ring 3 raw, so the rate is ABI: the
+/// `const _: () = assert!(una_abi::GETINFO_TICK_HZ == super::timer::TICK_HZ)` beside `sys_getinfo`
+/// in `syscall.rs` is what stops a retune here from silently re-introducing the 4x unit bug in
+/// `user-vug`/`user-pulse` (una-abi's divergence ledger, D1). Retuning it is fine — retuning it
+/// WITHOUT moving `GETINFO_TICK_HZ` is now a compile error, which is the whole point.
+pub const TICK_HZ: u64 = 250;
 
 /// Monotonic timer ticks since the heartbeat started. Read via `arch::ticks()` — and, through `ms()`
 /// (= `ticks() * 4`), the wall-clock budget arch-neutral code times against. So EXACTLY ONE core may
@@ -78,6 +84,15 @@ pub fn init() {
     serial_println!(
         ":: AARCH64 generic timer armed (CNTFRQ={} Hz, {} Hz tick, INTID {}) ::",
         freq, TICK_HZ, TIMER_INTID
+    );
+    // UVUG-7 (P52): `arch::ms()` is derived directly from CNTVCT/CNTFRQ, NOT `ticks()*4`. The global
+    // tick counter is summed across every core's timer IRQ, so on 4-core BCM2711 metal `ticks()*4`
+    // ran ms ~4x fast and typematic repeated ~4x too fast. CNTFRQ is the true, frequency-independent
+    // tick rate the clock now uses: 1 CNTVCT tick = 1/CNTFRQ s, so ms = CNTVCT/(CNTFRQ/1000).
+    #[cfg(feature = "witness")]
+    serial_println!(
+        "[uvug7] ms clock: CNTFRQ={} Hz (={} kHz per ms); ms=CNTVCT/(CNTFRQ/1000), core-count-independent",
+        freq, freq / 1000
     );
 }
 

@@ -214,7 +214,7 @@ fn main() {
     //    readout alongside the packed sRGB.
     let (w, h) = (image.width, image.height);
     let rgba = pack_srgba(&image);
-    let linear = image.pixels;
+    let _linear = image.pixels;
 
     // 5. The Window (macOS AppKit via quartzite; further backends follow
     //    quartzite maturity).

@@ -21,12 +21,24 @@ use spin::Mutex;
 use crate::arch;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-// 48 MiB. The video back buffer (double-buffering) is heap-allocated and sized to the chosen
-// framebuffer mode, so the heap must hold it plus the xHCI/console/block allocations. The
-// bootloader drives the panel at its native (EDID) resolution: a Retina panel is 2880x1800x4 ~=
-// 20 MiB, and Apple GOP often pads the stride, so the back buffer can approach ~30 MiB. 48 MiB
-// covers that with margin. The bootloader caps mode selection so the back buffer can never exceed
-// what this heap can hold (see MAX_BACKBUF_BYTES in crates/bootloader).
+// x86_64: 256 MiB. The 48 MiB the heap held through GR26 was sized for the video back buffer
+// (~28 MiB at Retina 2880x1800 stride 4096) "plus margin" — and the desktop consumed the margin:
+// 8 per-core WCPAR STAGE pools grow lazily toward MAX_STAGE_BYTES each, the shell window holds a
+// ~5 MiB surface, wc-d wants a surface-sized verify snapshot. GR27 Boot A showed the end state of
+// 48 MiB on metal: the heap pinned at zero (`[wc-d] verify win=2 -> SKIP (no memory ...)`), every
+// stage `try_reserve` declining (`DECL_ALLOC`, 7k+ per boot), every present falling to the
+// UNCLIPPED direct path — windows visibly bleeding through their occluders. The machine has GiBs;
+// the heap was the artificial famine. 256 MiB restores the designed regime (staged presents,
+// declines rare) with ~5x headroom over today's peak consumers, and stays comfortably inside the
+// QEMU test configs' -m 1G. The x86 heap is carved from the first >=16 MiB Usable region that can
+// hold it (arch/x86_64/memory.rs) on the identity map — no page-table cost to the raise.
+//
+// aarch64 keeps 48 MiB: its heap region is HAND-PLACED at 32 MiB, 64 MiB long
+// (arch/aarch64/boot.rs), so a shared raise past 64 MiB would leave the Pi with NO heap at all.
+// Widening that region belongs to the aarch64 lane; this split keeps its build byte-identical.
+#[cfg(target_arch = "x86_64")]
+pub const HEAP_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
+#[cfg(not(target_arch = "x86_64"))]
 pub const HEAP_SIZE: usize = 48 * 1024 * 1024; // 48 MiB
 
 pub struct Locked<A> {
@@ -74,6 +86,8 @@ static ALLOCATOR: Locked<Heap> = Locked::new(Heap::empty());
 // VUGRAS: record the heap's identity-mapped span at init so the RAS localizer can name
 // [heap_lo, heap_hi) as a candidate range for a decoded fault ADDR (and bound its DC CIVAC
 // sweep) without reaching into the allocator internals. Read-only diagnostic surface.
+// XCARVE-4 diagnostic surface (mirrors hw-jetson): expose the heap's [lo, hi) so shared
+// consumers (xhci scratchpad bounds guard) can sanity-check placements. (0, 0) pre-init.
 use core::sync::atomic::{AtomicUsize, Ordering};
 static HEAP_LO: AtomicUsize = AtomicUsize::new(0);
 static HEAP_HI: AtomicUsize = AtomicUsize::new(0);

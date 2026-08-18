@@ -145,13 +145,94 @@ lazy_static! {
     pub static ref SERIAL_PORT: Mutex<SerialPort> = Mutex::new(SerialPort::new());
 }
 
+/// WEDGE-2 — the aarch64 half of the breadcrumb seam: one byte at the UART, **taking no lock**.
+///
+/// `SerialPort::write_byte` is already exactly that — a bounded volatile poll of the PL011 `FR`
+/// TX-full bit (or the Tegra NS16550 `LSR`) followed by one volatile store to the data register. It
+/// is a method on a unit struct, so calling it does NOT require `SERIAL_PORT`, and nothing in
+/// `crate::wedge2`'s call chain acquires `SERIAL_PORT`, `FBCON`, `WRITER`, `TABLE`, `SPRITE` or the
+/// allocator. That is the whole property WEDGE-2 needs: every one of those locks is reachable from
+/// the focus chain being instrumented, so a breadcrumb that could block on one would be missing in
+/// precisely the runs it exists for. The cost is that a token may interleave with another core's
+/// in-progress `serial_println!` line; see `crate::wedge2` for why that is the right trade for a
+/// last-words instrument.
+///
+/// The x86 tree inherits WEDGE-2 by porting this one function (`arch/x86_64/serial.rs`) — everything
+/// above it is arch-neutral.
+#[cfg(feature = "wedge2")]
+#[inline(never)]
+pub fn wedge2_raw_byte(byte: u8) {
+    SerialPort.write_byte(byte);
+}
+
+/// Free-function raw writer for `serial_ring::drain`'s sink — the PL011/Tegra counterpart of the x86
+/// `raw_write_str`. `SerialPort::write_byte` is a method on a unit struct, so this acquires NOTHING
+/// (not `SERIAL_PORT`, not `FBCON`, not the allocator) and its TX wait is bounded.
+pub fn raw_write_str(s: &str) {
+    for b in s.bytes() {
+        SerialPort.write_byte(b);
+    }
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
+    crate::serial_ring::note_submitted();
+
+    // PANIC ESCAPE HATCH — the aarch64 half, identical in shape to x86. This path is the reason the
+    // blocking `.lock()` below had to go: this arch did NOT share x86's silent-drop defect (a blocking
+    // acquire loses nothing), but it carried the complementary one — a panic or abort that struck
+    // mid-print, on the core already holding `SERIAL_PORT`, would spin on that lock FOREVER and the
+    // machine would die with no message at all. Silence either way, and the same cure: past
+    // `enter_panic_mode` no lock is touched, the staged backlog and then the panic text go straight
+    // at the UART through the bounded lock-free primitive, synchronously.
+    if crate::serial_ring::in_panic_mode() {
+        crate::serial_ring::drain(raw_write_str);
+        let mut raw = SerialPort;
+        let _ = raw.write_fmt(args);
+        crate::serial_ring::note_emitted();
+        crate::video::fbcon::_print(args);
+        crate::selftest::capture(args);
+        return;
+    }
+
     // Guard the serial lock with interrupts masked (matching x86) so an interrupt handler that
     // logs can't deadlock against an in-progress print holding the same lock.
     crate::arch::without_interrupts(|| {
-        // Best-effort, never panic (write_byte is a no-op on the `pi` build).
-        let _ = SERIAL_PORT.lock().write_fmt(args);
+        // Best-effort, never panic (write_byte is a no-op on the `pi` build). `try_lock` + defer
+        // rather than the old blocking `lock()`: same shared discipline as x86 so there is ONE serial
+        // transport to reason about across both arches, and — the part that matters on this arch — a
+        // fault handler or an exception-level print can no longer stall behind another core's line.
+        // Nothing is dropped: a contended line goes into the lock-free staging ring and the next
+        // holder emits it intact, in order. See `crate::serial_ring`.
+        if let Some(mut guard) = SERIAL_PORT.try_lock() {
+            {
+                let mut sink = |s: &str| {
+                    #[cfg(feature = "logts")]
+                    {
+                        let _ = crate::logts::PrefixWriter { inner: &mut *guard }.write_str(s);
+                    }
+                    #[cfg(not(feature = "logts"))]
+                    {
+                        let _ = guard.write_str(s);
+                    }
+                };
+                crate::serial_ring::drain(&mut sink);
+            }
+            // CLOCK-2: with `logts`, prefix each serial LINE with a compact timestamp (monotonic ms →
+            // UTC after a civil anchor exists). Only the UART byte-stream is touched; the fbcon +
+            // capture-ring mirrors below still receive the raw `args`. Feature OFF => byte-identical.
+            #[cfg(feature = "logts")]
+            {
+                let _ = crate::logts::PrefixWriter { inner: &mut *guard }.write_fmt(args);
+            }
+            #[cfg(not(feature = "logts"))]
+            {
+                let _ = guard.write_fmt(args);
+            }
+            crate::serial_ring::note_emitted();
+        } else {
+            crate::serial_ring::stage(args);
+        }
     });
     // Mirror to the framebuffer console (visible without a serial port). fbcon self-guards.
     crate::video::fbcon::_print(args);

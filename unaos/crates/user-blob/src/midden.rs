@@ -33,6 +33,11 @@
 //         bus, byte-same as a direct SYS_OPEN(RW) of it (-EACCES) — owner authority holds both ways
 // then SYS_EXIT(0xB5) — the midden sentinel, routed to EL0_MIDDEN_DONE.
 //
+// WC-C: midden also owns a COMPOSITOR WINDOW — a 24x16 surface via SYS_WIN_CREATE into which it renders
+// its own bus stats as hex digits (see the window section below). The kernel draws the border and the
+// title strip; midden draws the content. A refused create makes every repaint a no-op, so the witness
+// bits above never depend on the compositor.
+//
 // Build discipline (the K2OWN build-lane idiom): an extra `[[bin]]` of crates/user-blob, flat
 // blob <= one 4 KiB code page, fully position-independent, .text+.rodata only (NO .data/.bss —
 // no mutable statics), and NO panic paths: every buffer access below goes through raw-pointer
@@ -68,32 +73,31 @@ fn svc(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     ret
 }
 
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
-const SYS_REPORT: u64 = 3;
-const SYS_OPEN: u64 = 11;
-const SYS_CLOSE: u64 = 17;
-const SYS_MSEND: u64 = 19;
-const SYS_MRECV: u64 = 20;
+// ABIFREEZE: imported from `una_abi`, the one declaration of the table (shared with both kernels).
+// WC-C: the window verbs. midden is the first NON-fixture program to own a compositor window.
+use una_abi::{
+    SYS_CLOSE, SYS_EXIT, SYS_MRECV, SYS_MSEND, SYS_OPEN, SYS_REPORT, SYS_WIN_CREATE,
+    SYS_WIN_PRESENT, SYS_WRITE,
+};
 
-const MIDDEN_EXIT_STATUS: u64 = 0xB5;
+use una_abi::EXIT_STATUS_MIDDEN as MIDDEN_EXIT_STATUS;
 
 #[inline(always)]
 fn con_write(buf: &[u8]) {
     let _ = svc(SYS_WRITE, 1, buf.as_ptr() as u64, buf.len() as u64);
 }
 
-// --- the native v1 wire (mirrors arch/aarch64/bus.rs byte-for-byte) ----------------------------
-
-const HDR: usize = 52;
-const FRAME_MAX: usize = HDR + 4096;
-const VERB_LS: u8 = 1;
-const VERB_CAT: u8 = 2;
-const VERB_CP: u8 = 3;
-// BANDY-2 write-side verbs (mirror arch/aarch64/bus.rs).
-const VERB_WRITE: u8 = 4;
-const VERB_RM: u8 = 5;
-const VERB_MV: u8 = 6;
+// --- the native v1 wire ------------------------------------------------------------------------
+//
+// ABIFREEZE (divergence D3): this block used to be a hand-kept copy of `arch/aarch64/bus.rs`, whose
+// only guarantee was the comment "mirrors arch/aarch64/bus.rs byte-for-byte". The wire constants now
+// live in `una_abi` and BOTH sides import them, so the mirror is structural rather than promised.
+use una_abi::{BUS_KIND_REPLY, BUS_KIND_REQUEST, BUS_MAGIC, BUS_VERSION};
+use una_abi::{
+    BUS_FRAME_MAX as FRAME_MAX, BUS_HDR_LEN as HDR, BUS_VERB_CAT as VERB_CAT,
+    BUS_VERB_CP as VERB_CP, BUS_VERB_LS as VERB_LS, BUS_VERB_MV as VERB_MV,
+    BUS_VERB_RM as VERB_RM, BUS_VERB_WRITE as VERB_WRITE,
+};
 
 #[inline(always)]
 unsafe fn put(p: *mut u8, i: usize, b: u8) {
@@ -114,12 +118,12 @@ fn build_req(buf: &mut [u8; 96], verb: u8, corr: u32, body: &[u8]) -> usize {
             put(p, i, 0);
             i += 1;
         }
-        put(p, 0, b'U');
-        put(p, 1, b'B');
-        put(p, 2, b'S');
-        put(p, 3, b'1');
-        put(p, 4, 1); // version
-        put(p, 5, 1); // kind REQUEST
+        put(p, 0, BUS_MAGIC[0]);
+        put(p, 1, BUS_MAGIC[1]);
+        put(p, 2, BUS_MAGIC[2]);
+        put(p, 3, BUS_MAGIC[3]);
+        put(p, 4, BUS_VERSION);
+        put(p, 5, BUS_KIND_REQUEST);
         put(p, 6, verb);
         put(p, 8, corr as u8);
         put(p, 9, (corr >> 8) as u8);
@@ -145,12 +149,12 @@ fn check_reply(rep: &[u8; FRAME_MAX], n: usize, verb: u8, corr: u32) -> (i64, us
         return (i64::MIN, 0);
     }
     unsafe {
-        if get(p, 0) != b'U'
-            || get(p, 1) != b'B'
-            || get(p, 2) != b'S'
-            || get(p, 3) != b'1'
-            || get(p, 4) != 1
-            || get(p, 5) != 2 // kind REPLY
+        if get(p, 0) != BUS_MAGIC[0]
+            || get(p, 1) != BUS_MAGIC[1]
+            || get(p, 2) != BUS_MAGIC[2]
+            || get(p, 3) != BUS_MAGIC[3]
+            || get(p, 4) != BUS_VERSION
+            || get(p, 5) != BUS_KIND_REPLY
             || get(p, 6) != verb
             || get(p, 8) != corr as u8
             || get(p, 9) != (corr >> 8) as u8
@@ -164,6 +168,44 @@ fn check_reply(rep: &[u8; FRAME_MAX], n: usize, verb: u8, corr: u32) -> (i64, us
         }
         (status, bl)
     }
+}
+
+/// Build a TWO-NAME request (`cp SRC DST`, `mv SRC DST`) into `req`: body is `[src_len u8][src][dst]`,
+/// the space dropped. Returns the frame length, or 0 when the argument tail is not a valid pair
+/// (missing separator, either name empty or over the 12-byte 8.3 bound).
+///
+/// `cp` and `mv` had byte-identical builders; the flat blob has a hard 4 KiB code-page budget and paid
+/// for both copies, so they share one here. Verb-parameterised, not verb-aware — the kernel decides what
+/// the verb MEANS; this only shapes the frame.
+#[inline(never)]
+fn build_pair(req: &mut [u8; 96], verb: u8, corr: u32, rest: &[u8]) -> usize {
+    let mut sp2 = rest.len();
+    let mut j = 0;
+    while j < rest.len() {
+        if unsafe { get(rest.as_ptr(), j) } == b' ' {
+            sp2 = j;
+            break;
+        }
+        j += 1;
+    }
+    if sp2 == 0 || sp2 > 12 || sp2 + 1 >= rest.len() || rest.len() - sp2 - 1 > 12 {
+        return 0;
+    }
+    let mut body = [0u8; 26];
+    let bp = body.as_mut_ptr();
+    unsafe {
+        put(bp, 0, sp2 as u8);
+        let mut k = 0;
+        while k < rest.len() && k < 25 {
+            if k != sp2 {
+                // src bytes land at 1..=sp2, dst bytes at sp2+1.. (the space is dropped)
+                let dst_i = if k < sp2 { 1 + k } else { k };
+                put(bp, dst_i, get(rest.as_ptr(), k));
+            }
+            k += 1;
+        }
+    }
+    build_req(req, verb, corr, &body[..rest.len()])
 }
 
 /// PARSE one command line (the E verdict's text->typed seam): split on ' ', map the verb token
@@ -192,34 +234,10 @@ fn run_command(line: &[u8], corr: u32, rep: &mut [u8; FRAME_MAX]) -> (i64, usize
         }
         build_req(&mut req, VERB_CAT, corr, rest)
     } else if eq(verb_tok, b"cp") {
-        // cp SRC DST -> body [src_len u8][src][dst]
-        let mut sp2 = rest.len();
-        let mut j = 0;
-        while j < rest.len() {
-            if unsafe { get(rest.as_ptr(), j) } == b' ' {
-                sp2 = j;
-                break;
-            }
-            j += 1;
+        match build_pair(&mut req, VERB_CP, corr, rest) {
+            0 => return (i64::MIN, 0),
+            n => n,
         }
-        if sp2 == 0 || sp2 > 12 || sp2 + 1 >= rest.len() || rest.len() - sp2 - 1 > 12 {
-            return (i64::MIN, 0);
-        }
-        let mut body = [0u8; 26];
-        let bp = body.as_mut_ptr();
-        unsafe {
-            put(bp, 0, sp2 as u8);
-            let mut k = 0;
-            while k < rest.len() && k < 25 {
-                if k != sp2 {
-                    // src bytes land at 1..=sp2, dst bytes at sp2+1.. (the space is dropped)
-                    let dst_i = if k < sp2 { 1 + k } else { k };
-                    put(bp, dst_i, get(rest.as_ptr(), k));
-                }
-                k += 1;
-            }
-        }
-        build_req(&mut req, VERB_CP, corr, &body[..rest.len()])
     } else if eq(verb_tok, b"rm") {
         // rm NAME -> bare 8.3 name (same shape as cat)
         if rest.is_empty() || rest.len() > 12 {
@@ -227,33 +245,10 @@ fn run_command(line: &[u8], corr: u32, rep: &mut [u8; FRAME_MAX]) -> (i64, usize
         }
         build_req(&mut req, VERB_RM, corr, rest)
     } else if eq(verb_tok, b"mv") {
-        // mv SRC DST -> body [src_len u8][src][dst] (same shape as cp)
-        let mut sp2 = rest.len();
-        let mut j = 0;
-        while j < rest.len() {
-            if unsafe { get(rest.as_ptr(), j) } == b' ' {
-                sp2 = j;
-                break;
-            }
-            j += 1;
+        match build_pair(&mut req, VERB_MV, corr, rest) {
+            0 => return (i64::MIN, 0),
+            n => n,
         }
-        if sp2 == 0 || sp2 > 12 || sp2 + 1 >= rest.len() || rest.len() - sp2 - 1 > 12 {
-            return (i64::MIN, 0);
-        }
-        let mut body = [0u8; 26];
-        let bp = body.as_mut_ptr();
-        unsafe {
-            put(bp, 0, sp2 as u8);
-            let mut k = 0;
-            while k < rest.len() && k < 25 {
-                if k != sp2 {
-                    let dst_i = if k < sp2 { 1 + k } else { k };
-                    put(bp, dst_i, get(rest.as_ptr(), k));
-                }
-                k += 1;
-            }
-        }
-        build_req(&mut req, VERB_MV, corr, &body[..rest.len()])
     } else if eq(verb_tok, b"write") {
         // write NAME CONTENT -> body [name_len u8][name][content]. Split the argument tail on the
         // FIRST space: name = up to it, content = the remainder (may itself contain spaces).
@@ -324,8 +319,8 @@ fn eq(a: &[u8], b: &[u8]) -> bool {
 
 /// The fixture text the launcher stages in MIDTXT.TXT — bit1 byte-verifies the cat body.
 const MIDTXT_CONTENT: &[u8] = b"midden bus fixture\n";
-const EACCES: i64 = -13;
-const ENOENT: i64 = -2;
+// ABIFREEZE: the errno values a ring-3 program compares a raw syscall return against.
+use una_abi::{EACCES, ENOENT};
 /// BANDY-2: the content midden WRITES (no spaces — the write parser splits name/content on the
 /// first space); the cat readback byte-verifies it. Also the mv round-trip's payload.
 const WR_CONTENT: &[u8] = b"middenwrote";
@@ -333,10 +328,133 @@ const WR_CONTENT: &[u8] = b"middenwrote";
 /// (not the old longer content) confirms a genuine truncate, not a stale-tail overwrite-in-place.
 const WR2_CONTENT: &[u8] = b"again";
 
+// --- WC-C: midden's bus-stats WINDOW ------------------------------------------------------------
+//
+// midden owns a real compositor window and renders its OWN content into it — the kernel draws the
+// border and the title strip and NOTHING else. That is the whole point of the WC seam: app content is
+// app-drawn, chrome is kernel-drawn, and neither can forge the other. So the digits below are blitted
+// here, at EL0, from a bitmap font this program carries in its own .rodata.
+//
+// It shows two rows of four hex digits: the live witness bitmask (row 0) and the number of witness legs
+// passed (row 1) — the same numbers the serial verdict prints, so panel and log cross-check by eye.
+//
+// Geometry: 24x16 ARGB8888 = 1536 B, which `SYS_WIN_CREATE` negotiates down to a SINGLE page of the
+// 64 KiB window slot. Tiny on purpose — a status readout, not a canvas, drawn 1:1 — and the compositor's
+// integer upscale (~30x on a 1920-wide panel) is what makes it legible, so this program never needs to
+// learn the panel geometry. EL0 sees only its own surface; it always has.
+//
+// SIZE DISCIPLINE. This whole feature had ~230 bytes of the 4 KiB code page left to live in, so every
+// choice here is the cheap one: the font is packed 3x5 bits into ONE u16 per glyph (32 B of .rodata, not
+// 80), the two rows are one loop over eight nibbles of a packed u32 rather than two calls, the glyphs are
+// blitted 1:1 (no upscale loops — the compositor upscales), and the blit writes without a per-pixel bound
+// test because the call-site geometry is a compile-time constant that keeps every glyph box inside the
+// surface.
+const WIN_W: usize = 24;
+const WIN_H: usize = 16;
+const WIN_STRIDE: usize = WIN_W * 4;
+/// Surface offset from this program's own window base: `USER_REGION_SIZE + FB_INFO_SIZE` (boot.rs) —
+/// window region slot 0, the same VA the compat `SYS_FB_MAP` used to return. Part of the window ABI.
+const WIN_SURF_OFF: u64 = 0x5000;
+/// Window interior — a shade off the desktop so the kernel's frame reads. All four bytes are EQUAL on
+/// purpose: it makes the background clear a single `write_bytes`, i.e. one call to the `memset` this blob
+/// already links (the `rep` frame buffer needs it), instead of a 2048-iteration store loop LLVM unrolls
+/// into a few hundred bytes we do not have.
+const WIN_BG: u8 = 0x1A;
+const WIN_FG: u32 = 0xFFC9_A6E8; // the UnaOS lilac the vug seams use
+
+/// The 16 hex digits as 3x5 bitmaps, packed row-major into one u16 each: bit `row * 3 + col`, col 0
+/// leftmost, row 0 top. Bit 15 is unused.
+static HEX_GLYPHS: [u16; 16] = [
+    0b0_111_101_101_101_111, // 0
+    0b0_111_010_010_110_010, // 1
+    0b0_111_001_111_100_111, // 2
+    0b0_111_100_111_100_111, // 3
+    0b0_100_100_111_101_101, // 4
+    0b0_111_100_111_001_111, // 5
+    0b0_111_101_111_001_111, // 6
+    0b0_100_100_100_100_111, // 7
+    0b0_111_101_111_101_111, // 8
+    0b0_111_100_111_101_111, // 9
+    0b0_101_101_111_101_111, // A
+    0b0_011_101_011_101_011, // b
+    0b0_111_001_001_001_111, // C
+    0b0_011_101_101_101_011, // d
+    0b0_111_001_111_001_111, // E
+    0b0_001_001_111_001_111, // F
+];
+
+/// This program's own window base VA. `adr` is PC-relative and byte-granular, so it is correct at
+/// whatever address the kernel copied the flat blob to — the blob begins exactly at `_start`, which the
+/// linker script forces to offset 0 of the EL0 window.
+#[inline(always)]
+fn window_base() -> u64 {
+    let v: u64;
+    unsafe {
+        core::arch::asm!("adr {0}, _start", out(reg) v, options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// Blit one 3x5 glyph 1:1 at `(x0, y0)`. `#[inline(never)]` is load-bearing, not a style choice: inlined,
+/// LLVM unrolls the eight-digit caller around this 15-bit nest and `win_paint` triples — which this blob's
+/// 4 KiB code page cannot pay for. Emitted once, called eight times.
+///
+/// Nested row/col rather than one loop over the 15 bits: `b % 3` / `b / 3` would each compile to a
+/// multiply-shift sequence. 1:1 pixels for the same reason — the compositor's integer upscale is what
+/// makes the glyphs big on the panel, not this loop.
+#[inline(never)]
+unsafe fn draw_glyph(surf: *mut u8, x0: usize, y0: usize, bits: u16) {
+    let mut ry = 0usize;
+    while ry < 5 {
+        let mut rx = 0usize;
+        while rx < 3 {
+            if bits >> (ry * 3 + rx) & 1 != 0 {
+                let off = (y0 + ry) * WIN_STRIDE + (x0 + rx) * 4;
+                unsafe { (surf.add(off) as *mut u32).write_volatile(WIN_FG) };
+            }
+            rx += 1;
+        }
+        ry += 1;
+    }
+}
+
+/// Repaint the surface and present it. `stats` is the two rows packed as `(top << 16) | bottom`; a
+/// negative `id` (create refused) makes this a no-op, so midden's bus witnesses never depend on the
+/// compositor being able to give it a window.
+#[inline(never)]
+fn win_paint(id: i64, surf: *mut u8, stats: u32) {
+    if id < 0 {
+        return;
+    }
+    // Non-volatile on purpose (see WIN_BG): `svc` clobbers memory, so these stores cannot be sunk past
+    // the present below, which is the only ordering this needs.
+    unsafe { core::ptr::write_bytes(surf, WIN_BG, WIN_W * WIN_H * 4) };
+    // Eight nibbles, most-significant first: n 0..4 -> row 0 (top), n 4..8 -> row 1 (bottom).
+    let mut n = 0usize;
+    while n < 8 {
+        let nib = ((stats >> (28 - 4 * n)) & 0xF) as usize;
+        // `get` rather than indexing: a bounds-checked index compiles a `core::panicking` call into a
+        // blob that must contain no panic path at all. `nib` is masked, so the None arm is unreachable.
+        let Some(&bits) = HEX_GLYPHS.get(nib) else {
+            return;
+        };
+        let x0 = 1 + (n & 3) * 6;
+        let y0 = 1 + (n >> 2) * 7;
+        unsafe { draw_glyph(surf, x0, y0, bits) };
+        n += 1;
+    }
+    let _ = svc(SYS_WIN_PRESENT, id as u64, 0, 0);
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn midden_main() -> ! {
     let mut w: u64 = 0;
     let mut rep = [0u8; FRAME_MAX];
+    // WC-C: open midden's window FIRST, so the panel shows the stats readout for the whole run rather
+    // than only at the end. Every `paint` below is a no-op if the create failed — the bus witnesses this
+    // program exists to produce never depend on the compositor.
+    let win = svc(SYS_WIN_CREATE, WIN_W as u64, WIN_H as u64, 0);
+    let wsurf = (window_base() + WIN_SURF_OFF) as *mut u8;
 
     // (0) "ls" — parse, send, print the listing
     let (st, bl) = run_command(b"ls", 1, &mut rep);
@@ -385,6 +503,8 @@ extern "C" fn midden_main() -> ! {
         w |= 1 << 5;
     }
 
+    win_paint(win, wsurf, (w as u32) << 16 | w.count_ones());
+
     // ===== BANDY-2 write-side legs =====================================================
 
     // (6) WRITE round-trip: CREATE WRT.TXT, cat it back byte-exact, then TRUNCATE-overwrite it with
@@ -431,8 +551,7 @@ extern "C" fn midden_main() -> ! {
     // direct: opening the foreign file for WRITE (delete/truncate would need such a handle) -> EACCES.
     // mode bit0 = RW (CAP_READ|CAP_WRITE); no O_CREAT (the file exists).
     let bp = b"BUSPRIV.BIN";
-    const O_RW: u64 = 1;
-    let st_direct_rw = svc(SYS_OPEN, bp.as_ptr() as u64, bp.len() as u64, O_RW);
+    let st_direct_rw = svc(SYS_OPEN, bp.as_ptr() as u64, bp.len() as u64, una_abi::O_RW);
     if st_rm_denied == EACCES
         && st_mv_denied == EACCES
         && st_wr_denied == EACCES
@@ -440,6 +559,10 @@ extern "C" fn midden_main() -> ! {
     {
         w |= 1 << 9;
     }
+
+    // WC-C: final repaint — the panel readout ends on the SAME bitmask the serial verdict reports, so
+    // the two witnesses are cross-checkable by eye (row 0 = the bitmask in hex, row 1 = legs passed).
+    win_paint(win, wsurf, (w as u32) << 16 | w.count_ones());
 
     let _ = svc(SYS_REPORT, w, 0, 0);
     let _ = svc(SYS_EXIT, MIDDEN_EXIT_STATUS, 0, 0);

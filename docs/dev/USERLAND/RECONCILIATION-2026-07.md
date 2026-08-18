@@ -183,6 +183,41 @@ and wrapped with host I/O by the userspace `libs/fs/unafs`.
   cold sync's `commit` phase from ~10.95 s across 242 root flips to ~93 ms across
   3, and the cold wall ~11.3 s → ~0.213 s (≈ 53×), with all invariants and the
   whole-transaction-unwind honesty carried verbatim. After-table in the README.
+
+  **vaire becomes a repo manager (BOLT-2, 2026-08-11).** The first managed-unit
+  kind that is not the dev tree: a git repository as a Bolt — an
+  integrity-verified bare mirror plus an append-only, hash-chained ledger of
+  every ref per weave, under the same default-deny credential floor (re-scoped
+  honestly: a mirror carries what was committed, so the floor **audits and
+  reports**, and a finding is covered by the entry hash). The chain is graded
+  honestly: with no anchor outside the ledger file it is tamper-*evident*
+  against an editor, not tamper-*proof* — a whole-tail rewrite and a truncation
+  to a valid prefix both verify Green, and both are pinned by tests until an
+  anchor (a retained CoW root holding the ledger, or an off-bolt countersigned
+  head) lands. All Bolt-1 invariants
+  carry verbatim — one write surface, sources read-only, dry-run default.
+  `repo::unafs_view` projects a repo Bolt into the `DevManifest` the VAIRE-3
+  `usync` engine consumes, so the native weave is executable today rather than
+  aspirational, with no new filesystem code.
+
+  **Feasibility verdict for the Destiny (measured, 2026-08-11).** Asked directly
+  whether UnaFS can be the repo store: **feasible now for repository-sized
+  bolts, with two named crate extensions before it can hold a large repo's
+  object store outright.** Against this monorepo's real shape (45,987 objects,
+  1.196 GB, p50 559 B, 493 refs, 33 packs), measured in
+  `handlers/vaire/examples/unafs_repo_feasibility.rs`: 10,000 blobs / 422 MiB
+  stage in 5.03 s with **one 20.7 ms commit** and 1.42× write amplification, a
+  full walk of 10,494 files takes 13.6 ms, and `fsck` over 150,292 blocks in use
+  is clean in 66 ms. The binding limits are (1) a **~80 MiB single-file ceiling**
+  — an `Inode`'s extent list must serialize inside one 4 KiB block; bisected at
+  75 MiB OK / 85 MiB `InodeTooLarge(4100, 4096)` — needing extent-list
+  indirection, and (2) the **2 GiB volume cap** (one indirect refmap level),
+  needing a second level. Ref churn must be batched (412 blocks/ref when each
+  ref gets its own flip, 37× the batched cost), and the absence of a path index
+  makes git's 256-way fan-out mandatory. What justifies the direction: typed
+  attributes, CoW retained roots, and a reachability `fsck` make repository
+  integrity a *filesystem property* rather than a convention — which FAT/ext
+  cannot offer. Full tables in the README and `docs/MILESTONES.md`.
 - **stria's video half** — deferred by design (the audio-only slice was the Architect's own
   first slice), not drift.
 - The kit→vessel compiler and the elessar snapshot format — future arcs; `aule` is expected

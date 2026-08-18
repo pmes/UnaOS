@@ -20,35 +20,28 @@
 //! crystal-lined cavity in rock. So the demo shows what the name promises: a real-time,
 //! software-rendered rotating quartz crystal on the panel, drawn through the Gneiss PAL.
 //!
-//! Everything here is arch-neutral (compiled on x86_64 and aarch64, reachable from the Orin
-//! panel shell) and float-free: geometry and the rotation/projection maths run in Q16.16
-//! fixed point. The renderer is the engine's proving ground — each engine primitive
-//! (`draw_line`, `fill_triangle`, `pump_and_poll`) lands with a visible artifact here.
-
-use unaos_boot_info::FrameBufferInfo;
+//! The code here is arch-NEUTRAL — it names no register and no arch module, and drives everything
+//! through the Gneiss PAL — but the module is COMPILED only for aarch64 (`#[cfg]` on the `pub mod
+//! vug` declaration in `lib.rs`, which carries the reasoning). Its callers are the aarch64 `vug` and
+//! `pulse` shell verbs and the Pi/Orin panel shell; nothing on x86 launches it. Arch-neutral source
+//! is what makes the gate a one-line decision rather than a port.
+//!
+//! It is also float-free: geometry and the rotation/projection maths run in Q16.16 fixed point. The
+//! renderer is the engine's proving ground — each engine primitive (`draw_line`, `fill_triangle`,
+//! `pump_and_poll`) lands with a visible artifact here.
 
 use crate::pal::{Event, GneissPal, TargetPal};
-use crate::video::FrameBuffer;
+// The meter palette and the VUG-HONESTY classifier live in `ui_status` — the instrument strip is the
+// rule's permanent, both-arches consumer, while this demo is a shell verb. Reading them back keeps a
+// single definition of each and leaves this module free to be gated to the arches that launch it.
+use crate::ui_status::{classify_load_scaled, METER_BREATH, METER_DIM, METER_PARKED, PARKED};
 
-// ---------------------------------------------------------------------------------------------
-// Background painter (called once at boot from main.rs — signature is load-bearing, out of lane).
-// ---------------------------------------------------------------------------------------------
-
-pub fn init(base: usize, len: usize, info: FrameBufferInfo) {
-    serial_println!(":: VUG Init ::");
-    serial_println!(":: FB Size: {}x{} (stride {}) ::", info.width, info.height, info.stride);
-    serial_println!(":: FB Format: {:?} ::", info.pixel_format);
-
-    // Paint the background through the shared surface (format/bounds handled in one place).
-    // Can-Am dark grey: #1E1E1E.
-    let mut surface = FrameBuffer::new();
-    surface.init(base, len, info);
-    surface.fill_screen(BG);
-
-    serial_println!(":: Framebuffer painted #1E1E1E ::");
-}
-
-// SPLASH-2: the boot splash lives in `crate::splash` (its own module, own tracer).
+// SPLASH-2: the boot splash lives in `crate::splash` (its own module, own tracer). A `vug::init`
+// background painter used to sit here, commented "called once at boot from main.rs — signature is
+// load-bearing". It had no callers anywhere in the tree (main.rs never mentions `vug`), and the boot
+// paint it described belongs to `splash`; it is removed rather than carried as a `pub` entry point
+// that nothing enters. `crate::video::FrameBuffer` and `unaos_boot_info::FrameBufferInfo` were
+// imported for it alone and go with it.
 
 // ---------------------------------------------------------------------------------------------
 // Fixed-point maths (Q16.16). No float in the kernel.
@@ -220,46 +213,19 @@ const MAX_METER_CPUS: usize = 16;
 /// EMPTY segments draw dim — an idle core reads alive-but-empty, never blank.
 const PULSE_SEGS: usize = 10;
 
-// Meter palette (shared by the vug corner meters and the `pulse` full-screen monitor).
-const METER_DIM: u32 = 0x00_2A2432;
+// The rest of the meter palette. `METER_DIM` / `METER_BREATH` / `METER_PARKED` — the three the
+// instrument strip also draws with — are owned by `ui_status` and imported above; only the colours
+// this demo alone uses are declared here, so no constant has two definitions.
 const METER_LILAC: u32 = 0x00_B36BFF;
 const METER_PURPLE: u32 = 0x00_9B59B6;
 const METER_LABEL: u32 = 0x00_8A8296;
-/// PULSE-ALIVE breath colour — clearly brighter than `METER_DIM`, dimmer than a load fill: the one
-/// sweeping segment an idle-but-scheduled core lights so "alive and idle" reads at a glance.
-const METER_BREATH: u32 = 0x00_5F4E86;
-/// Parked dash colour — cooler/dimmer than `METER_DIM` so a broken track reads as "not participating".
-const METER_PARKED: u32 = 0x00_3A3550;
 
-/// VUG-HONESTY parked-core marker (a load-array sentinel, disjoint from the 0..=100 percent range). A
-/// core whose pulse counters are frozen this window AND that is NOT the demo core is parked /
-/// never-scheduled: the display must not fabricate load for it. `load[c] == PARKED` selects a distinct
-/// DASHED bar (see [`draw_pulse_bar`]) — visually separable from an idle 0% bar (a solid dim track) so
-/// "idle" and "never woken" never read alike, and `run_pulse` prints `park` instead of a percent.
-const PARKED: u32 = u32::MAX;
-
-/// VUG-HONESTY — the pure per-core display decision. Given one core's per-window busy/idle tick deltas
-/// (`db`/`di`), whether it is the *demo core* (the core executing this render loop), and that loop's own
-/// measured render busy% (`own_load`), return the load to display (0..=100) or [`PARKED`]:
-///   * `db + di > 0`  → the scheduler accounted this core this window: honest busy fraction.
-///   * frozen + demo  → the demo core runs OUTSIDE the scheduler, so its own counters freeze; credit its
-///                      measured render load — the honest number for the core doing the drawing.
-///   * frozen + other → a core with no scheduling activity this window that is NOT drawing: parked /
-///                      never-woken. NEVER fabricate load. (The pre-fix code credited `own_load` to
-///                      EVERY frozen core, so a parked AP mirrored the busy demo core and read PINNED —
-///                      the display-honesty defect this arc closes. The merged idle/busy-heartbeats made
-///                      the *counters* honest and passed the one-shot boot witness, but the LIVE meter
-///                      samples per-window deltas: a parked EL2 secondary gets no periodic wake, so its
-///                      counters are frozen between windows and this fallback still fabricated.) Report
-///                      PARKED instead.
+/// VUG-HONESTY — the pure per-core display decision at percent scale: [`classify_load_scaled`] at
+/// `full = 100`. The rule itself, and the [`PARKED`] sentinel it returns for a frozen non-demo core,
+/// are stated once in `ui_status`; this is the demo's ten-segment view of the same decision, and
+/// [`parked_display_witness`] below covers every branch of it through this entry point.
 fn classify_load(db: u64, di: u64, is_demo: bool, own_load: u32) -> u32 {
-    if db + di > 0 {
-        ((db * 100) / (db + di)) as u32
-    } else if is_demo {
-        own_load
-    } else {
-        PARKED
-    }
+    classify_load_scaled(db, di, is_demo, own_load, 100)
 }
 
 /// VUG-HONESTY witness — deterministic, arch-neutral, framebuffer-free. Exercises [`classify_load`]
@@ -355,10 +321,13 @@ impl CpuPulse {
 
 /// UI1-M2 — one segmented pulse bar: `PULSE_SEGS` fixed segments at `(x, y)`, filled ∝ `load`
 /// (rounded; any nonzero load lights at least one), the rest drawn `METER_DIM` so an idle bar
-/// reads alive-but-empty. `seg_w`/`seg_h`/`gap` come from the caller's metrics (the corner meter
-/// and the full-screen `pulse` reuse this at two sizes). Returns the x just past the bar.
-fn draw_pulse_bar(
-    pal: &mut TargetPal,
+/// reads alive-but-empty. `seg_w`/`seg_h`/`gap` come from the caller's metrics — the corner meter and
+/// the full-screen `pulse` reuse this at two sizes, which is why it is generic over the PAL rather
+/// than tied to `TargetPal`. (The bottom status strip drew through it under PULSE-STRIP; PULSE-2 gave
+/// the strip its own gradient `ui_status::draw_led_bar`, so this is demo-private again.) Returns the x
+/// just past the bar.
+fn draw_pulse_bar<P: crate::pal::GneissPal>(
+    pal: &mut P,
     x: usize,
     y: usize,
     seg_w: usize,
@@ -431,6 +400,21 @@ fn drain_input(pal: &mut TargetPal) -> bool {
             // CLICK-1 (metal verdict): a trackpad/mouse click closes the full-screen demo through
             // the SAME exit path a keystroke takes — the on-metal click observable for the next
             // sitting (press the pad while vug runs; the demo exits to the console).
+            // DRAGREL — on x86 the PRESSED bit, not "any Button". The EHCI pointer paths now emit
+            // an event on the release edge too (a drag has to be able to end), and an unqualified
+            // match here would make the release of the very click that exited this demo count as a
+            // second exit for whatever ran next. The press is still the exit, unchanged.
+            //
+            // The split is ARCH-SHAPED because the release edge is: only the EHCI paths
+            // (`drivers/ehci/mod.rs`, reached exclusively through `arch/x86_64/pci.rs::ehci::init`)
+            // emit one. aarch64's pointer producer is xHCI, which still emits the DOWN edge only,
+            // so there is no release event on that arch for the guard to filter — and qualifying
+            // anyway would silently change aarch64 behaviour for a non-primary button report
+            // (0x02/0x04 exits the demo today) with no release-edge producer to justify it. So
+            // aarch64 keeps the original predicate, bit for bit.
+            #[cfg(target_arch = "x86_64")]
+            Event::Button(mask) if mask & 0x01 != 0 => return true,
+            #[cfg(not(target_arch = "x86_64"))]
             Event::Button(_) => return true,
             Event::Mouse { x, y } => crate::pal::cursor::move_rel(x, y, w, h),
             Event::MouseAbsolute { x, y } => crate::pal::cursor::set_abs(x, y, w, h),
@@ -438,6 +422,116 @@ fn drain_input(pal: &mut TargetPal) -> bool {
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------------------------
+// GAME-MODE — held-key stepping + drag-rotate for the crystal ("UnaOS-native, like a game").
+//
+// WHAT THE INPUT STREAM DELIVERS (xHCI HID boot protocol — see drivers/xhci/mod.rs; since HID-KEYS):
+//   * Keyboard: `Event::Key(ascii)` on the PRESS edge and `Event::KeyUp(ascii)` on the RELEASE edge
+//     of a mapped key (the HID decoder edge-detects both against the previous boot report). SET_IDLE(0)
+//     is armed, so the device reports only on change — a held key sends ONE press and no repeats until
+//     its release. Arrow keys decode to the C0 control codes below (Right 0x1C, Left 0x1D, Down 0x1E,
+//     Up 0x1F) and join WASD as movement controls.
+//   * Pointer: `Event::Mouse{dx,dy}` on any relative motion (independent of buttons);
+//     `Event::MouseAbsolute{x,y}` for tablet/absolute pointers; `Event::Button(mask)` on BOTH the
+//     press edge (mask != 0) and the release edge (mask == 0) — the GUI-CLICK-2b gap is closed.
+//
+// MODEL (GAME-MODE-2b, TRUE held state): a Key press sets a movement key's held bit; its KeyUp clears
+// it — the crystal steps continuously exactly while the key is down. KeyUp is reliable, so it is
+// TRUSTED: there is NO time-based drop (SET_IDLE(0) sends one press and no further reports until
+// release, so any keyboard-idle timeout would false-drop a long hold). The one orphan — a keyboard
+// hot-unplugged mid-hold, whose KeyUp never arrives — is caught by clearing the whole held mask on
+// ANY Button event: the pointer is independent and a click is always reachable, so it both stops a
+// stuck spin and (when clean) exits. A pointer button press starts a DRAG (motion rotates the crystal
+// only while dragging); the release ends it. A press+release with no motion past a small pixel
+// threshold is a CLICK → exit (drag and click-to-exit coexist). Any non-mapped key also exits.
+// ---------------------------------------------------------------------------------------------
+
+const G_YAW_L: u8 = 1 << 0; // 'a' — yaw left
+const G_YAW_R: u8 = 1 << 1; // 'd' — yaw right
+const G_PIT_U: u8 = 1 << 2; // 'w' — pitch up
+const G_PIT_D: u8 = 1 << 3; // 's' — pitch down
+const G_ZOOM_IN: u8 = 1 << 4; // 'e' / '+' / '=' — zoom in (camera nearer)
+const G_ZOOM_OUT: u8 = 1 << 5; // 'q' / '-' / '_' — zoom out (camera farther)
+const G_BITS: usize = 6;
+
+// HID-KEYS arrow C0 codes (see the module notes) — arrows join WASD as movement controls.
+const K_RIGHT: u8 = 0x1C;
+const K_LEFT: u8 = 0x1D;
+const K_DOWN: u8 = 0x1E;
+const K_UP: u8 = 0x1F;
+
+/// Map an ASCII/C0 key to its movement bit, or `None` if it is not a game-mode control. A `None`
+/// key takes the shell exit path (any non-mapped key exits), so the exit contract is preserved.
+/// Arrow keys (their C0 codes) mirror WASD: Left/Right yaw, Up/Down pitch.
+fn game_key_bit(k: u8) -> Option<u8> {
+    match k.to_ascii_lowercase() {
+        b'a' | K_LEFT => Some(G_YAW_L),
+        b'd' | K_RIGHT => Some(G_YAW_R),
+        b'w' | K_UP => Some(G_PIT_U),
+        b's' | K_DOWN => Some(G_PIT_D),
+        b'e' | b'+' | b'=' => Some(G_ZOOM_IN),
+        b'q' | b'-' | b'_' => Some(G_ZOOM_OUT),
+        _ => None,
+    }
+}
+
+/// GAME-MODE per-frame input, accumulated over one full drain of the event queue.
+#[derive(Default, Clone, Copy)]
+struct GameInput {
+    exit: bool,     // a non-mapped key asked to exit (shell exit contract)
+    pressed: u8,    // movement-key bits whose PRESS edge landed this drain
+    released: u8,   // movement-key bits whose RELEASE edge (KeyUp) landed this drain
+    btn_down: bool, // a pointer button PRESS edge (mask != 0) this drain — starts a drag
+    btn_up: bool,   // a pointer button RELEASE edge (mask == 0) this drain — ends a drag
+    mdx: i32,       // summed relative pointer dx this drain (drag-rotate)
+    mdy: i32,       // summed relative pointer dy this drain
+}
+
+/// GAME-MODE input drain — the crystal's frame-paced pump. Drains EVERY queued event this frame
+/// (`pump_and_poll` until empty, so a burst never backs up one-per-frame AND `note_progress` fires
+/// on each pass, keeping the app-input watchdog fed). Movement-key PRESS edges arm the held bit and
+/// KeyUp RELEASE edges clear it (TRUE held state); a non-mapped key requests exit (shell exit path
+/// preserved). Pointer button press/release edges bracket a drag; pointer motion drives the cursor
+/// sprite (CURSOR-VIS) and accumulates the drag-rotate delta the loop applies while dragging.
+fn drain_game_input(pal: &mut TargetPal) -> GameInput {
+    let (w, h) = (pal.width() as i32, pal.height() as i32);
+    let mut gi = GameInput::default();
+    while let Some(e) = crate::pal::pump_and_poll() {
+        match e {
+            Event::Key(k) => match game_key_bit(k) {
+                Some(bit) => gi.pressed |= bit,
+                None => gi.exit = true, // any non-mapped key exits
+            },
+            // A movement key's release clears its held bit; a non-mapped KeyUp is ignored (only the
+            // PRESS of a non-mapped key exits — a release must never trigger the exit path).
+            Event::KeyUp(k) => {
+                if let Some(bit) = game_key_bit(k) {
+                    gi.released |= bit;
+                }
+            }
+            // Button now fires on both edges: mask != 0 is a press (start drag), mask == 0 a release
+            // (end drag; the loop decides click-vs-drag from the motion accumulated in between).
+            Event::Button(mask) => {
+                if mask != 0 {
+                    gi.btn_down = true;
+                } else {
+                    gi.btn_up = true;
+                }
+            }
+            Event::Mouse { x, y } => {
+                crate::pal::cursor::move_rel(x, y, w, h);
+                gi.mdx += x;
+                gi.mdy += y;
+            }
+            Event::MouseAbsolute { x, y } => {
+                crate::pal::cursor::set_abs(x, y, w, h);
+            }
+            _ => {}
+        }
+    }
+    gi
 }
 
 /// Run the rotating crystal until any key is pressed. `mode` selects solid facets or wireframe.
@@ -450,7 +544,7 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     let cx = w / 2;
     let cy = h / 2;
     let focal = (w.min(h) * 40) / 100; // pixels-per-unit at the crystal's centre depth
-    let dist: Fx = 4 * ONE; // camera distance along -z
+    let mut dist: Fx = 4 * ONE; // camera distance along -z (GAME-MODE zoom adjusts it)
 
     let base = crystal_vertices();
     let solid = mode == Mode::Solid;
@@ -469,6 +563,12 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     let mut py = [0i32; 14];
     let mut rot = [Vec3 { x: 0, y: 0, z: 0 }; 14];
 
+    // VUG-FPS dirty-rect state: the crystal's footprint last frame (so its vacated pixels get
+    // repainted to background) and the cursor's last footprint (dirty-rect no longer clears the
+    // whole panel, so the moving sprite must erase its own trail). Bboxes are `(x, y, w, h)`.
+    let mut prev_crystal: Option<(usize, usize, usize, usize)> = None;
+    let mut prev_cursor: Option<(usize, usize, usize, usize)> = None;
+
     // --- M3b: the two corner load meters --------------------------------------------------
     // Render-load meter (the honest "GPU monitor" — we render in software): each frame we clock
     // the render span (`now_cycles`) against the whole frame span to get a busy fraction, and time
@@ -484,14 +584,171 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     let mut win_frames: u32 = 0;
     let mut win_ms = crate::arch::ms();
 
+    // VUG-FPS serial witness: frames and flushed bytes accumulated over ~1 s windows, printed as
+    // `[vugfps]` so a metal serial capture reads the fps and the per-frame flush bandwidth the
+    // dirty-rect path moves (the whole point of the arc).
+    let mut wit_ms = crate::arch::ms();
+    let mut wit_frames: u32 = 0;
+    let mut wit_bytes: u64 = 0;
+    // VUG-PAR: the max parallel band count seen in the window — reads the parallel flush win directly.
+    let mut wit_bands: usize = 1;
+    // VUG-FPS-2: where the frame's cycles actually go. `wit_raster_cyc` sums the draw span (input
+    // drain + all back-buffer rasterisation), `wit_flush_cyc` sums the present span (`pal.render()`),
+    // measured with `now_cycles()` per frame; the witness reports each as avg µs/frame so P46 can name
+    // whether the ~120 ms/frame is raster-bound or flush(bandwidth)-bound — QEMU can't, but the split
+    // rides the same serial line the metal capture reads. `wit_rects`/`wit_uw`/`wit_uh` carry the
+    // merged damage-rect count and the union bbox, testing the "one screen-spanning box" hypothesis.
+    let mut wit_raster_cyc: u64 = 0;
+    let mut wit_flush_cyc: u64 = 0;
+    let mut wit_rects: usize = 0;
+    let mut wit_uw: usize = 0;
+    let mut wit_uh: usize = 0;
+    // VUG-FPS-4: the end-to-end per-frame budget. P46/P47 showed raster+flush explained only ~45 ms of a
+    // ~172 ms frame — the bigger half was OUTSIDE the raster+flush bracket the `[vugfps]` witness timed.
+    // Split the frame into four DISJOINT phases so a metal capture NAMES where every microsecond goes:
+    //   * `drain` — input drain (`drain_game_input`: the pump of the event queue this frame),
+    //   * `draw`  — all back-buffer rasterisation after the drain (erase + triangles + HUD + meters + cursor),
+    //   * `flush` — the present span (`pal.render()`, the bandwidth path; same value `[vugfps]` reports),
+    //   * `tail`  — from `pal.render()` returning to the NEXT frame's loop head: the witness/meter accounting
+    //               AND the `yield_now()` reschedule gap. On metal that gap — the cooperative scheduler
+    //               round-trip between frames — is the ~130 ms `[vugfps]` never bracketed; it accrues real
+    //               wall-clock (CNTVCT free-runs) while the crystal task is DE-SCHEDULED between frames.
+    // `tail` is measured across the loop boundary (`prev_flush_end` → this frame's `top`); the other three
+    // come from in-frame `now_cycles()` reads. Together they sum to the whole frame period, so the four
+    // µs/frame numbers add up to 1000000/fps — the missing time has nowhere left to hide.
+    let mut wit_drain_cyc: u64 = 0;
+    let mut wit_draw_cyc: u64 = 0;
+    let mut wit_tail_cyc: u64 = 0;
+    let mut prev_flush_end = crate::arch::now_cycles();
+
+    // GAME-MODE TRUE held-key model (GAME-MODE-2b). Since HID-KEYS the HID path delivers a Key on the
+    // PRESS edge and a KeyUp on the RELEASE edge, so a key's held bit is set on press and cleared on
+    // release — continuous stepping exactly while down. KeyUp is reliable, so we TRUST it: there is no
+    // time-based drop (a genuine hold under SET_IDLE(0) sends one press and NO further reports until
+    // release, so any keyboard-idle timeout would false-drop a long hold — the GAME-MODE-2 mistake).
+    // The only orphan is a keyboard hot-unplugged mid-hold (its KeyUp never arrives): we clear the
+    // whole held mask on ANY Button event, since the pointer is independent and a click is always
+    // reachable — that both stops a stuck spin and, on a clean click, exits.
+    let mut held: u8 = 0;
+    // Drag-rotate: a button press starts a drag, its release ends it; motion rotates only while
+    // dragging. `drag_motion` sums |pointer delta| from press to release — a release under
+    // `CLICK_THRESH` px is a CLICK (exit); more is a genuine drag (no exit).
+    let mut dragging = false;
+    let mut drag_motion: i32 = 0;
+    const CLICK_THRESH: i32 = 6; // total px of motion below which a press+release reads as a click
+    let mut game_wit_ms = crate::arch::ms(); // GAME-MODE ~1 Hz witness cadence
+
     loop {
         let top = crate::arch::now_cycles();
-        // --- input: exit on any key; track the mouse (CURSOR-VIS) ------------------------
-        // Drain ALL pending events this frame (a burst of trackpad reports must not back up
-        // one-per-frame), routing mouse motion into the shared cursor so the sprite drawn below
-        // tracks it — the metal defect was this loop consuming MOUSE events with no sprite.
-        if drain_input(pal) {
+        // VUG-FPS-4: the frame boundary. `top - prev_flush_end` is the `tail` phase of the PRIOR frame —
+        // the accounting + `yield_now()` reschedule gap between the last present and this loop head, the
+        // span outside the raster+flush bracket where the metal capture's missing ~130 ms lives.
+        wit_tail_cyc += top.wrapping_sub(prev_flush_end);
+        // --- GAME-MODE input: held-key stepping + drag-rotate, frame-paced -----------------
+        // Drain ALL pending events this frame (a burst never backs up one-per-frame; each drain
+        // pass feeds the app-input watchdog via note_progress). A non-mapped key or a click exits.
+        let gi = drain_game_input(pal);
+        let after_drain = crate::arch::now_cycles(); // VUG-FPS-4: end of the `drain` phase
+        if gi.exit {
+            serial_println!(":: [game] exit=key ::");
             break;
+        }
+        let now = crate::arch::ms();
+        // TRUE held state: a press sets the bit, a KeyUp clears it. Continuous stepping runs exactly
+        // while the key is down — KeyUp is trusted, so there is no time-based drop.
+        for b in 0..G_BITS {
+            if gi.pressed & (1 << b) != 0 {
+                held |= 1 << b;
+            }
+            if gi.released & (1 << b) != 0 {
+                held &= !(1 << b);
+            }
+        }
+        // Hot-unplug net: any Button event clears the whole held mask. If a keyboard is unplugged
+        // mid-hold its KeyUp never arrives, but the pointer is independent — a click (always
+        // reachable) both stops the orphaned spin and, when clean, exits. No keyboard-idle timeout,
+        // which would false-drop a legitimately long hold (SET_IDLE(0) sends no reports while down).
+        if gi.btn_down || gi.btn_up {
+            held = 0;
+        }
+        // Drag session bracketed by the button press/release edges. Press starts a drag and resets
+        // the motion accumulator; while dragging, pointer motion both rotates and accrues; release
+        // ends it — a release under the click threshold is a click-to-exit (drag and exit coexist).
+        if gi.btn_down {
+            dragging = true;
+            drag_motion = 0;
+        }
+        if dragging {
+            drag_motion += gi.mdx.abs() + gi.mdy.abs();
+        }
+        let drag = dragging; // rotate from pointer motion only while a drag is live
+        if gi.btn_up {
+            if drag_motion < CLICK_THRESH {
+                serial_println!(":: [game] exit=click ::");
+                break;
+            }
+            dragging = false;
+        }
+
+        // Frame-paced stepping: fold held keys + pointer motion into per-frame yaw/pitch/zoom.
+        const KEY_YAW: i32 = 4; // brad/frame while a yaw key is held
+        const KEY_PITCH: i32 = 4; // brad/frame while a pitch key is held
+        let mut yaw_step = 0i32;
+        let mut pit_step = 0i32;
+        if held & G_YAW_L != 0 {
+            yaw_step -= KEY_YAW;
+        }
+        if held & G_YAW_R != 0 {
+            yaw_step += KEY_YAW;
+        }
+        if held & G_PIT_U != 0 {
+            pit_step -= KEY_PITCH;
+        }
+        if held & G_PIT_D != 0 {
+            pit_step += KEY_PITCH;
+        }
+        // Zoom adjusts camera distance (nearer = larger crystal), clamped so |z| < dist keeps zc > 0.
+        const ZOOM_STEP: Fx = ONE / 16;
+        const DIST_MIN: Fx = 2 * ONE + ONE / 2;
+        const DIST_MAX: Fx = 8 * ONE;
+        if held & G_ZOOM_IN != 0 {
+            dist = (dist - ZOOM_STEP).max(DIST_MIN);
+        }
+        if held & G_ZOOM_OUT != 0 {
+            dist = (dist + ZOOM_STEP).min(DIST_MAX);
+        }
+        // Pointer motion → rotation, but ONLY while dragging (a button is held). Free pointer motion
+        // just moves the cursor; the crystal rotates only when the user drags it.
+        //
+        // DRAG-FEEL (P46 metal, Peter: "drag works awkwardly, arrows work well"): the raw fold below
+        // applied one pointer pixel as one brad — a full panel-width drag spun the crystal ~w/256 ≈
+        // 7 revolutions, so any real drag jerked past control. Map travel to rotation so a full
+        // panel-width horizontal drag ≈ ONE revolution (256 brad) and a full-height vertical drag
+        // likewise (metrics-derived, no magic constant): horizontal spins (yaw), vertical tilts
+        // (pitch, sign unchanged — drag down tilts the top toward you, matching the idle tumble).
+        // Clamp the per-frame step so a single big accumulated burst can't jolt.
+        const DRAG_MAX_STEP: i32 = 12; // brad/frame cap (~1/21 rev) — smooths a fast flick
+        if drag {
+            let yaw_d = (gi.mdx * 256 / w.max(1)).clamp(-DRAG_MAX_STEP, DRAG_MAX_STEP);
+            let pit_d = (gi.mdy * 256 / h.max(1)).clamp(-DRAG_MAX_STEP, DRAG_MAX_STEP);
+            yaw_step += yaw_d;
+            pit_step += pit_d;
+        }
+
+        // Manual input this frame steps by the user; an idle frame keeps the auto-tumble.
+        let manual = held != 0 || drag;
+        if manual {
+            ay = (ay + yaw_step) & 0xFF;
+            ax = (ax + pit_step) & 0xFF;
+        } else {
+            ay = (ay + 3) & 0xFF; // idle yaw ~3 brad/frame
+            ax = (ax + 1) & 0xFF; // idle pitch ~1 brad/frame — a tumble reads as two axes
+        }
+
+        // GAME-MODE witness ~1 Hz while active: the held mask + drag state the panel steps by.
+        if manual && now.wrapping_sub(game_wit_ms) >= 1000 {
+            serial_println!(":: [game] mode=step keys={:#04x} drag={} ::", held, drag);
+            game_wit_ms = now;
         }
 
         // --- transform: rotate every vertex, then project to pixels ----------------------
@@ -504,8 +761,57 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
             py[i] = cy - (((v.y as i64) * ppu) >> 16) as i32;
         }
 
-        // --- clear to the dark-grey backdrop ---------------------------------------------
-        pal.clear_screen(BG);
+        // --- VUG-FPS dirty-rect: erase only what changed, not the whole panel -------------
+        // The flush is bandwidth-bound (a full clear reflushes the entire ~8 MB framebuffer every
+        // frame — the metal 8–9 fps). Instead, background-fill only the crystal's footprint (union
+        // of this frame's projected-vertex bbox with last frame's, so vacated pixels repaint) and
+        // the cursor's old footprint. The HUD and corner meters clear their own small blocks in
+        // `draw_stats`/`draw_meters`. `flush` then copies a few tight rectangles.
+        if frame == 0 {
+            pal.clear_screen(BG); // first frame only: establish a clean backdrop over the console
+        }
+        let mut bx0 = i32::MAX;
+        let mut by0 = i32::MAX;
+        let mut bx1 = i32::MIN;
+        let mut by1 = i32::MIN;
+        for i in 0..14 {
+            bx0 = bx0.min(px[i]);
+            by0 = by0.min(py[i]);
+            bx1 = bx1.max(px[i]);
+            by1 = by1.max(py[i]);
+        }
+        const PAD: i32 = 2; // cover the seam lines drawn a pixel outside the fill
+        let cx0 = (bx0 - PAD).clamp(0, w) as usize;
+        let cy0 = (by0 - PAD).clamp(0, h) as usize;
+        let cx1 = (bx1 + PAD).clamp(0, w) as usize;
+        let cy1 = (by1 + PAD).clamp(0, h) as usize;
+        let cur_crystal = (cx0, cy0, cx1.saturating_sub(cx0), cy1.saturating_sub(cy0));
+        // VUG-FPS-3: erase the crystal's VACATED footprint (previous bbox) and background-fill the
+        // CURRENT footprint as SEPARATE damage rects — not one prev∪curr union rect. This is the
+        // P46 union-growth / rects=16 fix: unioning prev+curr into a single box means a drag or zoom
+        // that jumps the crystal (or the auto-tumble's wide/tall extremes) presents ONE box spanning
+        // the empty space BETWEEN the two positions, and that whole box is background-filled AND
+        // flushed every frame — the union that "grows and never shrinks", ballooning both the raster
+        // fill and the flush bytes. As two rects the DamageSet still MERGES them while they overlap
+        // (the steady auto-tumble, where prev≈curr — byte-identical to the old single-union erase),
+        // but keeps them tight and disjoint when the crystal jumps, so the dead gap between an old
+        // and new position is never filled or flushed. Frame 0's full clear_screen seeds the first
+        // backdrop, so the per-frame fills only run from frame 1.
+        if frame != 0 {
+            if let Some((px0, py0, pw, ph)) = prev_crystal {
+                pal.draw_rect(px0, py0, pw, ph, BG); // erase where the crystal was
+            }
+            // Erase the cursor's previous footprint BEFORE redraw (so the crystal/HUD painted below
+            // can cover it) — the dirty-rect path no longer wipes the whole panel each frame.
+            if let Some((qx, qy, qw, qh)) = prev_cursor {
+                pal.draw_rect(qx, qy, qw, qh, BG);
+            }
+            // Background behind the crystal's current position (the triangles paint over it).
+            if cur_crystal.2 > 0 && cur_crystal.3 > 0 {
+                pal.draw_rect(cx0, cy0, cur_crystal.2, cur_crystal.3, BG);
+            }
+        }
+        prev_crystal = Some(cur_crystal);
 
         // --- draw the front-facing faces, painter-sorted back-to-front -------------------
         // Collect visible faces with their average camera-depth, then insertion-sort farthest
@@ -590,11 +896,112 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
         m.px = est_px;
         draw_stats(pal, frame, n as u32, solid, w, h);
         draw_meters(pal, &m, &cpu, h);
-        // CURSOR-VIS: the cursor draws LAST, over everything, every frame (the frame was cleared
-        // above, so no erase pass is needed).
+        // CURSOR-VIS: the cursor draws LAST, over everything, every frame. VUG-FPS: its previous
+        // footprint was erased in the dirty-rect phase above; record the new one for next frame.
         crate::pal::cursor::draw(pal);
+        prev_cursor = if crate::pal::cursor::visible() {
+            let (curx, cury) = crate::pal::cursor::pos(w, h);
+            let e = crate::pal::cursor::extent(pal);
+            let pad = e / 8 + 1; // cover the one-block drop shadow offset
+            Some((curx as usize, cury as usize, e + pad, e + pad))
+        } else {
+            None
+        };
 
+        // VUG-FPS-2: bracket the present so the witness can split flush cycles from raster cycles.
+        // `top` (loop head) → `flush_t0` is the raster span (input drain + all drawing this frame);
+        // `flush_t0` → after render is the present span (blit + cache-clean, the bandwidth path).
+        let flush_t0 = crate::arch::now_cycles();
         pal.render(); // present ONCE per frame
+        let flush_end = crate::arch::now_cycles();
+        wit_flush_cyc += flush_end.wrapping_sub(flush_t0);
+        wit_raster_cyc += flush_t0.wrapping_sub(top);
+        // VUG-FPS-4: the fine-grained split. `drain` = drain span; `draw` = raster after the drain; the
+        // `tail` of THIS frame is folded in at the next loop head (`top - prev_flush_end`), so record the
+        // present-end timestamp for that boundary measurement.
+        wit_drain_cyc += after_drain.wrapping_sub(top);
+        wit_draw_cyc += flush_t0.wrapping_sub(after_drain);
+        prev_flush_end = flush_end;
+
+        // VUG-FPS witness: accumulate this frame's flushed bytes and print a `[vugfps]` line ~1x/s.
+        wit_bytes += pal.last_flush_bytes();
+        wit_bands = wit_bands.max(pal.last_flush_bands());
+        wit_rects = wit_rects.max(pal.surface.last_flush_rects());
+        {
+            let (uw, uh) = pal.surface.last_union_dims();
+            wit_uw = wit_uw.max(uw);
+            wit_uh = wit_uh.max(uh);
+        }
+        wit_frames += 1;
+        {
+            let wnow = crate::arch::ms();
+            let wdt = wnow.wrapping_sub(wit_ms);
+            if wdt >= 1000 && wit_frames > 0 {
+                let fps_x10 = (wit_frames as u64 * 10_000) / wdt.max(1);
+                let bpf = wit_bytes / wit_frames as u64;
+                // Cycles→µs uses the known generic-timer rate on aarch64 (the metal Pi timebase, ~54
+                // MHz; ~62.5 MHz under QEMU virt/raspi). On x86 the timebase is rdtsc GHz with no
+                // arch-neutral rate here, so we report raw cycles (÷1) — this witness is a Pi tool.
+                let cyc_per_us: u64 = {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        (crate::arch::aarch64::timer::cntfrq() / 1_000_000).max(1)
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        1
+                    }
+                };
+                let raster_us = wit_raster_cyc / wit_frames as u64 / cyc_per_us;
+                let flush_us = wit_flush_cyc / wit_frames as u64 / cyc_per_us;
+                serial_println!(
+                    ":: [vugfps] {}.{} fps  {} bytes/frame flushed  bands={}  rects={} union={}x{}  \
+                     raster={}us flush={}us ({} frames / {} ms) ::",
+                    fps_x10 / 10,
+                    fps_x10 % 10,
+                    bpf,
+                    wit_bands,
+                    wit_rects,
+                    wit_uw,
+                    wit_uh,
+                    raster_us,
+                    flush_us,
+                    wit_frames,
+                    wdt
+                );
+                // VUG-FPS-4: the end-to-end phase breakdown. drain + draw + flush + tail sum to the whole
+                // frame period, so `sum` should track 1000000/fps to within rounding — if it does, the four
+                // numbers account for 100% of the frame and the "missing ~130 ms" is named, not inferred.
+                // `tail` is the accounting + `yield_now()` reschedule gap between present and the next frame.
+                let drain_us = wit_drain_cyc / wit_frames as u64 / cyc_per_us;
+                let draw_us = wit_draw_cyc / wit_frames as u64 / cyc_per_us;
+                let tail_us = wit_tail_cyc / wit_frames as u64 / cyc_per_us;
+                let sum_us = drain_us + draw_us + flush_us + tail_us;
+                serial_println!(
+                    ":: [vugfps4] drain={}us draw={}us flush={}us tail={}us  sum={}us (=1e6/fps) \
+                     — tail is the post-present yield/reschedule gap ({} frames / {} ms) ::",
+                    drain_us,
+                    draw_us,
+                    flush_us,
+                    tail_us,
+                    sum_us,
+                    wit_frames,
+                    wdt
+                );
+                wit_ms = wnow;
+                wit_frames = 0;
+                wit_bytes = 0;
+                wit_bands = 1;
+                wit_rects = 0;
+                wit_uw = 0;
+                wit_uh = 0;
+                wit_raster_cyc = 0;
+                wit_flush_cyc = 0;
+                wit_drain_cyc = 0;
+                wit_draw_cyc = 0;
+                wit_tail_cyc = 0;
+            }
+        }
 
         // --- M3b render-load accounting: work span vs whole-frame span -------------------
         let end = crate::arch::now_cycles();
@@ -631,8 +1038,8 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
         // knob off (default-quiet). Deliberately makes the fault fire earlier — that is its purpose.
         crate::vugras::frame_sweep(frame);
 
-        ay = (ay + 3) & 0xFF; // yaw ~3 brad/frame
-        ax = (ax + 1) & 0xFF; // pitch ~1 brad/frame — different rate => a tumble
+        // (Rotation angles ay/ax are advanced at the top of the loop — held-key / drag stepping
+        // when the user is driving, the idle auto-tumble otherwise.)
         frame += 1;
         crate::arch::sched::yield_now();
     }
@@ -650,6 +1057,10 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
 fn draw_stats(pal: &mut TargetPal, frame: u64, faces: u32, solid: bool, _w: i32, _h: i32) {
     // Title + live stat line. UI-1: all positions derive from the panel metrics.
     let m = pal.metrics();
+    // VUG-FPS: erase this HUD block's own footprint (the crystal-region clear does not reach the
+    // top-left corner) so the changing frame counter doesn't ghost. Three text lines wide enough
+    // for the longest ("mode solid  faces 24  frame NNNNN").
+    pal.draw_rect(m.margin, m.margin, m.text_w(34), 3 * m.line_h, BG);
     pal.draw_text(m.margin, m.margin, "VUG // quartz", 0x00FFFFFF);
     let mode = if solid { "solid" } else { "wire " };
     let line = alloc::format!("mode {}  faces {:>2}  frame {}", mode, faces, frame);
@@ -669,6 +1080,20 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu: &CpuPulse, h: i32) {
     let x0 = mt.margin;
     // The block is three text pitches (label / bar / readout) + one pitch of air + the CPU row.
     let base = (h as usize).saturating_sub(mt.margin + 4 * mt.line_h + mt.cell_h);
+
+    // VUG-FPS: erase this widget's own footprint (the crystal-region clear does not reach the
+    // bottom-left corner). Opaque bars over-paint themselves, but the changing text readouts and
+    // the swept "breath" segment would ghost without a background clear first. Two blocks: the
+    // RENDER label/bar/readout stack, and the CPU pulse row (sized to the per-core bars).
+    pal.draw_rect(x0, base, mt.text_w(28), 3 * mt.line_h + mt.cell_h, BG);
+    {
+        let seg_w = mt.cell_w / 2;
+        let gap = mt.scale;
+        let bar_w = PULSE_SEGS * (seg_w + gap);
+        let per_core = mt.text_w(2) + 2 * gap + bar_w + mt.cell_w;
+        let row_w = mt.text_w(4) + cpu.ncpu * per_core;
+        pal.draw_rect(x0, base + 4 * mt.line_h, row_w, mt.cell_h, BG);
+    }
 
     // --- RENDER meter --------------------------------------------------------------------
     pal.draw_text(x0, base, "RENDER", METER_LABEL);
@@ -725,6 +1150,8 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu: &CpuPulse, h: i32) {
         const STALE_MS: u64 = 3000;
         let stale = snap.present && age_ms >= STALE_MS;
         let by = base.saturating_sub(2 * mt.line_h);
+        // VUG-FPS: erase the battery block's footprint (two text lines) before repaint.
+        pal.draw_rect(x0, by, mt.text_w(30), 2 * mt.line_h, BG);
         pal.draw_text(x0, by, "BATT", METER_LABEL);
         let bx = x0 + mt.text_w(5);
         let bw = mt.text_w(10);

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Make the bare aarch64 build self-contained: build-std (no prebuilt core for a custom target) and a
+# default target, so `cargo +nightly build` in this crate needs no extra -Z flags. Mirrors
+# crates/kernel/.cargo/config.toml. arroyo passes the linker script via RUSTFLAGS.
+[build]
+target = "../../aarch64-base.json"
+
+[unstable]
+build-std = ["core", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]

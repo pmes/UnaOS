@@ -179,6 +179,9 @@ static REQ_READY: Semaphore = Semaphore::new(0);
 
 /// One-shot spawn guard for the service task.
 static SERVICE_STARTED: AtomicBool = AtomicBool::new(false);
+/// WITCORE: one-shot guard for the "no lock-safe core" decline line. `start_service_once` is called
+/// once per device-service pass, so the decline must announce itself exactly once, not per pass.
+static SERVICE_DECLINED: AtomicBool = AtomicBool::new(false);
 /// One-shot guard for the `bx-blockreq` self-test.
 static SELFTEST_DONE: AtomicBool = AtomicBool::new(false);
 /// The self-test's verdict, recorded in memory as well as printed — so the witness is deterministic
@@ -495,9 +498,20 @@ pub fn start_service_once() -> bool {
     if block::info().is_none() {
         return false; // retry next loop iteration until storage enumerates
     }
-    let online = crate::arch::smp::online_aps();
-    let Some(&cpu) = online.first() else {
-        return false; // no AP to host the service task yet
+    // WITCORE: `xhci_worker_cpu`, NOT `online_aps().first()`. `service_one` -> `block::read_block`
+    // takes the raw `XHCI_CONTROLLER` spin lock, and this task is PREEMPTIBLE — so it is exactly the
+    // class SCHED-X86's rule 1 forbids co-locating with another preemptible taker. `.first()` named
+    // the RENDER core (which takes the lock through FAT reads / `pal::pump_and_poll` / `usbinfo`),
+    // and `.last()` is the pump's core, which takes it directly. `None` means no core is free of
+    // both: DECLINE rather than start into a deadlock — the syscall layer's staged fallback covers a
+    // missing service task (`service_ready()` gates every live route).
+    let Some(cpu) = crate::arch::smp::xhci_worker_cpu(0) else {
+        if !SERVICE_DECLINED.swap(true, Ordering::AcqRel) {
+            serial_println!(
+                ":: STOR-1: no core free of the render + service cores — storage service DECLINED (XHCI_CONTROLLER rule) ::"
+            );
+        }
+        return false; // no lock-safe AP to host the service task
     };
     if SERVICE_STARTED.swap(true, Ordering::AcqRel) {
         return true; // lost the race — another pass already spawned it
@@ -537,11 +551,24 @@ pub fn selftest_once() {
     if !SERVICE_STARTED.load(Ordering::Acquire) || block::info().is_none() {
         return; // service not up yet — retry next pass
     }
-    let online = crate::arch::smp::online_aps();
-    // Host the self-test on a DIFFERENT AP than the service task when possible, so the submit crosses
-    // cores (the metal wake path); with one AP they coincide and cooperate on that core.
-    let cpu = online.get(1).or_else(|| online.first()).copied();
-    let Some(cpu) = cpu else { return };
+    // Host the self-test on a DIFFERENT AP than the service task, so the submit crosses cores (the
+    // metal wake path).
+    //
+    // WITCORE: from the xHCI-safe pool, not `online_aps()`, and STRICTLY the second entry.
+    // `selftest_task` reads the sector BOTH through the service task AND directly via the polled
+    // `block::read_block` — so it, too, is a preemptible `XHCI_CONTROLLER` taker, bound by the same
+    // rule as the service task above. The old `.get(1).or(first())` fallback ("with one AP they
+    // coincide and cooperate on that core") predates SCHED-X86 pinning the pool's head to the render
+    // service; co-locating the two takers is now the rule-1 deadlock, not a degradation. Skip loudly
+    // instead — `selftest_verdict()` stays 0 ("not run"), which is what a skipped witness must read.
+    let Some(cpu) = crate::arch::smp::xhci_worker_cpu(1) else {
+        if !SELFTEST_DONE.swap(true, Ordering::AcqRel) {
+            serial_println!(
+                ":: STOR-1: bx-blockreq SKIPPED — no second core free of render + service (XHCI_CONTROLLER rule) ::"
+            );
+        }
+        return;
+    };
     if SELFTEST_DONE.swap(true, Ordering::AcqRel) {
         return;
     }

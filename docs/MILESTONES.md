@@ -10,6 +10,131 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## vaire track — 2026-08-11 (BOLT-2 — the repo Bolt, and the UnaFS repo-store feasibility verdict) 🔬
+
+### BOLT-2 anchor — the ledger head is now pinned in a retained CoW root 🔬 host-native (+5 vaire tests), zero kernel surface
+
+**What it does.** Closes the MAJOR the BOLT-2 review graded but left open: the
+hash-chained ledger's head was **unanchored**, so a writer who owns
+`<bolt_root>/ledger/<name>.ledger` could rewrite entry *k*, re-chain *k..n*, and
+`verify` still returned Green (or truncate to a valid prefix — invisible when the
+mirror's refs did not move). `repo-uweave --apply` (`repo::weave_into_image`) now
+pins the ledger head `(count, head_hash)` into the UnaFS image's retained CoW
+root as `vaire.repo.head.<name>`, riding the same one snapshot the mirror weave
+takes; `repo-verify <image>` (`repo::verify_anchored`) reads it back through
+`open_snapshot` and rejects a ledger that no longer agrees. A **whole-tail
+rewrite** trips the head-hash, a **truncation** trips the count, a **full
+reorder** trips the head-hash — all three now caught, and a *missing* anchor is
+itself a breach (`AnchorMissing`) so an unanchored chain never passes the
+anchored path silently. The write seam is `usync::usync_with_root_attrs` (an
+image-root-attr set folded before the run's single flip); the read seam is
+`usync::read_retained_root_attr` (newest snapshot, as-of the retained root).
+
+**The residual trust, stated precisely.** The anchor is only as trustworthy as
+the **image artifact**. The CoW machinery makes an in-place edit of a retained
+root infeasible (it breaks the retained tree's refcounts, which `fsck` flags), so
+a surgical single-generation re-stamp is out; but a party who *also* owns the
+image file can discard it and format a fresh image whose sole retained root
+matches a forged ledger. So this is a genuine **anchor**, not a tamper-*proof*
+log — keep the image out of the ledger writer's reach (a separate host, or
+read-only/off-box media) and the two tamper classes are caught. Tamper-*proof*
+against an adversary who owns everything needs a countersignature whose key never
+touches the bolt, which is a larger change than this seam.
+
+**How it was tested.** `cargo test -p vaire` green; the two failing-by-design
+limit tests (`a_whole_tail_rewrite_is_not_detected…`,
+`…caught_only_by_ref_drift`) are rewritten as passing detection tests
+(`…caught_by_the_image_anchor`), plus a full-reorder test, a clean-anchor Green
+test, and a missing-anchor breach test. All fixtures are tempdirs (the RIDER
+stands). Lane: `handlers/vaire/**` + its docs.
+
+### BOLT-2 — a git repository as a managed unit: verified mirror + hash-chained ledger 🔬 host-native (36 → 58 vaire tests), zero kernel surface
+
+**What it does.** vaire's second managed-unit kind, and its first genuinely *repo-manager* work
+(everything before BOLT-2 managed one dev tree). A **repo Bolt** turns a git repository into a
+managed object: an integrity-verified bare `--mirror` under `<bolt_root>/mirrors/<name>.git`, plus
+an **append-only, hash-chained ledger** at `<bolt_root>/ledger/<name>.ledger` recording every ref
+and object id per weave, chained with the collision-detecting SHA-1 `gix` already carries. Verbs:
+`repo-plan` (the dry-run default), `repo-weave --apply`, `repo-verify [--deep]`, `repo-status`,
+`repo-layout`, `repo-ufit`, `repo-uweave`. `verify` falsifies four distinct claims — an edited
+entry, a dropped entry (chain break), a recorded object missing from the mirror, and ref drift in
+either direction — and is pure-read: a verb that could rewrite what it audits would not be a
+verification. The Bolt-1 invariants carry verbatim: the **only** write surface is `BoltRoot`, built
+solely from `bolt_root`, and both git invocations pull *from* the source with the mirror as the
+target, so no path can write into a managed repository (test-pinned against a `0o555` source).
+**The chain is graded, not oversold.** As BOLT-2 first shipped, the head was not
+anchored outside the ledger file, so the bare chain was a tamper-evident
+*journal* against an editor, not a tamper-proof *log* against a writer who owns
+the bolt root: a whole-tail rewrite (edit entry *k*, re-chain *k..n*) and a
+truncation to a valid prefix both verified Green, each pinned by its own test.
+**Those two holes are now closed** by the follow-on anchor (see the *BOLT-2
+anchor* entry above): `repo-uweave --apply` pins the head in a retained CoW root
+(`vaire.repo.head.<name>`) and `repo-verify <image>` checks it, so both tamper
+classes are caught — down to trusting the image artifact. The `vaire.repo.head`
+row of the UnaFS mapping is now wired; `vaire.repo.ledger.<stamp>` remains a
+named design target.
+The default-deny credential floor is reused but honestly re-scoped: a mirror carries whatever was
+committed, so the floor **audits and reports** rather than skipping — every credential-shaped path
+in a mirrored head tree lands in the ledger entry, is covered by the entry hash (scrubbing one
+breaks verification), and turns the bolt Amber.
+
+**UnaFS alignment is executable, not asserted.** `repo::unafs_view` projects a repo manifest into
+the `DevManifest` the VAIRE-3 `usync` engine already consumes, so `repo-uweave` weaves a bolt's
+mirrors into a UnaFS v3 image today — native objects, one root flip, one retained snapshot per
+weave, the four `vaire.*` typed attrs per file — with **no new filesystem code**. `repo::unafs_layout`
+returns the host→native mapping as data so the claim is test-pinned rather than prose.
+
+**How it was tested.** `cargo test -p vaire` → **58 passed** (36 existing + 22 new), `cargo clippy
+-p vaire --all-targets` clean. All fixtures are tempdirs (the RIDER stands — no test reads
+`bolt.manifest.toml` or any real tree). Also fixes a **pre-existing baseline break**: `handlers/vaire`
+opted out of `gix`'s default features without re-adding `sha1`, leaving `gix_hash::Kind` variant-less
+— the crate did not compile at all before this arc.
+
+### The UnaFS repo-store feasibility study — measured, with a verdict 🔬
+
+**Question.** Can UnaFS hold a git-shaped workload at scale? Harness:
+`handlers/vaire/examples/unafs_repo_feasibility.rs` (tempdir image, re-runnable). Fixture shape is
+**this monorepo, measured**: 45,987 objects, 1.196 GB uncompressed (9,971 blobs / 30,989 trees /
+5,027 commits), p50 = 559 B with 70 % under 1 KiB, 493 refs, 33 packfiles / 51.81 MiB.
+
+| Axis | Measured |
+| --- | --- |
+| (a) 10,000 blobs, 422 MiB, 256-way fan-out | stage 5.03 s (0.503 ms/object), **ONE commit 20.7 ms**, 83.5 MiB/s, write amplification **1.42×** |
+| (a2) 52 MB packfile-shaped stream | write 49.3 MiB/s, read-back **1458 MiB/s** (page-cache warm — the extent path, not device bandwidth), 105 extents |
+| (b) 493 refs rewritten, batched | 0.67 ms/ref in one flip |
+| (b) one ref per flip | **25 ms/ref, 412 blocks/ref — 37× the batched cost** |
+| (c) recursive walk, 10,494 files | 13.6 ms (1.29 ms per 1,000 entries) |
+| (c) name lookup vs directory width | 0.005 ms @ 64 · 0.028 @ 512 · **0.214 @ 4096** — linear, no path index |
+| (d) `fsck` over 150,292 blocks in use | 66.3 ms, clean, **0 leaked / 0 orphans**; `snapshot_create` 37.1 ms |
+
+**Verdict: feasible now for repository-sized bolts, with two named UnaFS extensions before it can
+hold a large repo's object store outright.** The VAIRE-3 batch path already removed the commit-count
+problem — commit is 20.7 ms of a 5 s run, so the cost is per-object staging, not the transaction.
+What binds:
+
+1. **~80 MiB single-file ceiling (hard).** An `Inode` — extent list included — must serialize inside
+   ONE 4 KiB block. Bisected: 75 MiB → 151 extents fine; 85 MiB → `InodeTooLarge(4100, 4096)`. A
+   repacked monorepo is a *single* ~52 MiB packfile today and growing, so this is the nearest wall.
+   Needs extent-list indirection or variable-length extents.
+2. **2 GiB volume cap (hard).** `MAX_BLOCK_COUNT` (524,288) × 4 KiB, one indirect refmap level.
+   With 1.42× amplification and snapshots that diverge, this monorepo is inside it but not by much.
+   Needs a second refmap level.
+3. **No path index (shape constraint, not a defect).** Lookup is a full `ls` + linear scan, so git's
+   256-way fan-out is mandatory; a flat object store would be quadratic.
+4. **Ref churn must be batched** — 412 blocks to write 41 bytes when each ref gets its own flip.
+
+**What UnaFS gives that FAT/ext cannot**, and why the direction is right: per-object **typed
+attributes** (the ledger can live *in* the store rather than beside it), **CoW retained roots** (a
+snapshot per weave is structural, not a copy), and a **mark-and-sweep `fsck` with reachability**
+(0 leaked over 150,292 blocks in 66 ms) — repository integrity as a filesystem property instead of a
+convention. The verdict shaped the code: BOLT-2 keeps packfile handling on the host git/`gix` side —
+exactly where UnaFS hits its ceiling — and `repo-ufit` / `repo-uweave` check the measured limits
+**before** touching an image — against the volume the run will actually create (`--size-mb`,
+default 256 MiB), not merely the 2 GiB format cap — so an over-ceiling bolt is refused with a
+reason rather than failing halfway through a weave with an `InodeTooLarge` from three layers down.
+
+---
+
 ## R21 merge window — 2026-07-18 (post-sitting follow-ups + the metal verdicts of record)
 
 ### ORIN-NET-2 — controller-0 link + device recon via the DBI aperture (`UNAOS_PCIE2`) 🔬
@@ -2446,8 +2571,8 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ### SOCK-3 — `sys_connect`/`sys_send`/`sys_sock_recv` (TCP client) over the persistent smoltcp stack 🔬 `net-sock1`
 - **What:** the third [§1b](ROADMAP.md) arc — TCP **client** sockets (numbers **23–25**), ring 3's first
-  byte stream. `sys_socket` gains `SOCK_STREAM(1)` → TCP; `sys_connect`(23) active-opens to a peer,
-  `sys_send`(24) streams bytes, `sys_sock_recv`(25) reads them (named so — `SYS_RECV = 14` is the
+  byte stream. `sys_socket` gains `SOCK_STREAM(1)` → TCP; `sys_connect`(44) active-opens to a peer,
+  `sys_send`(45) streams bytes, `sys_sock_recv`(46) reads them (named so — `SYS_RECV = 14` is the
   capability-transfer inbox recv). Same `UNAOS_SMOLNET` knob, x86-only, byte-identical knob-off / aarch64.
 - **On the SOCK-2 stack:** a TCP socket rides the existing `STACK` singleton + `reg` registry; a slot now
   carries a `SockKind` tag and, for TCP, its own static stream ring buffers (`TCP_RX/TX_DATA`, 2 KiB each,
@@ -2487,9 +2612,16 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 ## net-sock1 track — 2026-07-12 (SOCK-2 — the UDP socket syscall family: ring 3 reaches the network)
 
 ### SOCK-2 — `sys_socket`/`bind`/`sendto`/`recvfrom` over a persistent smoltcp `SocketSet` 🔬 `net-sock1`
-- **What:** the second [§1b](ROADMAP.md) arc — the UDP socket syscall family (numbers **19–22**), the
-  first time ring 3 reaches the network. `sys_socket`(19) mints a UDP socket, `sys_bind`(20) names a
-  local port, `sys_sendto`(21)/`sys_recvfrom`(22) move datagrams. Same `UNAOS_SMOLNET` knob, x86-only,
+- **SOCKNUM (WINX-1, 2026-07-29):** the whole socket family moved from **19–27** to **40–48** (relative
+  order preserved). 19–27 collided with aarch64's `MSEND`/`MRECV`/`THREAD_SPAWN`/`THREAD_EXIT`/
+  `THREAD_JOIN`/`FB_MAP`/`FB_PRESENT`/`FUTEX`/`INPUT_POLL`, violating the cross-arch shared-number law
+  (a syscall number names the same verb on every arch). It went unnoticed because x86 compiled no
+  window/thread verbs and aarch64 compiles no socket verbs; bringing the x86 WINDOW verbs up made it
+  load-bearing. The numbers quoted below are the CURRENT ones. See
+  [`08_NET/networking.md`](../unaos/docs/dev/OS/08_NET/networking.md) § SOCKNUM.
+- **What:** the second [§1b](ROADMAP.md) arc — the UDP socket syscall family (numbers **40–43**, landed as 19–22), the
+  first time ring 3 reaches the network. `sys_socket`(40) mints a UDP socket, `sys_bind`(41) names a
+  local port, `sys_sendto`(42)/`sys_recvfrom`(43) move datagrams. Same `UNAOS_SMOLNET` knob, x86-only,
   byte-identical knob-off / aarch64.
 - **Persistent stack:** `smolnet.rs` gains a persistent `Interface` + `SocketSet` singleton (`STACK`,
   a `spin::Mutex<Option<SmolStack>>` mirroring `NET_DEVICE`) that outlives individual syscalls (a UDP

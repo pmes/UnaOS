@@ -32,6 +32,18 @@ struct EdidDiscoveredProtocol {
     edid: *const u8,
 }
 
+/// EDID 1.x fixed header pattern — the first eight bytes of every base block.
+const EDID_HEADER: [u8; 8] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+
+/// EDID-CARRY: one firmware EDID read — the 128-byte base block copied out of the firmware's buffer,
+/// which protocol produced it, and the size the firmware reported for the WHOLE EDID (greater than
+/// 128 means extension blocks exist; only the base block is carried to the kernel).
+struct EdidRead {
+    block: [u8; 128],
+    source: u32,
+    total_len: u32,
+}
+
 /// Parse the monitor's native (preferred) resolution from a raw EDID block: the first Detailed
 /// Timing Descriptor (offset 54). `None` if the block is too short/malformed or that descriptor is
 /// actually a monitor descriptor (zero pixel clock) rather than a timing.
@@ -39,8 +51,7 @@ fn parse_edid_native(bytes: &[u8]) -> Option<(usize, usize)> {
     if bytes.len() < 128 {
         return None;
     }
-    // EDID 1.x fixed header pattern.
-    if bytes[0..8] != [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00] {
+    if bytes[0..8] != EDID_HEADER {
         return None;
     }
     let d = &bytes[54..72];
@@ -56,29 +67,183 @@ fn parse_edid_native(bytes: &[u8]) -> Option<(usize, usize)> {
     Some((w, h))
 }
 
-/// Read the monitor's native resolution from EDID on `handle`, trying the ACTIVE then DISCOVERED
-/// protocol. `None` if no EDID is exposed — callers then fall back to the firmware's current mode.
-/// Returns `(width, height, source)` where source is 1 = ACTIVE protocol, 2 = DISCOVERED protocol.
-fn edid_native_resolution(handle: uefi::Handle) -> Option<(usize, usize, u32)> {
-    // Safety: the firmware owns the EDID buffer; it's valid while boot services are live (we read
-    // it now, before exit_boot_services). `size_of_edid` is the firmware-reported length.
+/// EDID-CARRY: copy the 128-byte base block out of a firmware EDID buffer. `None` unless the
+/// pointer is non-null and the firmware reports at least one full base block — the same two
+/// preconditions the native-resolution read has always applied. Nothing here judges the CONTENT;
+/// the header and checksum are the kernel's witness to report (`video::init_edid`).
+///
+/// # Safety
+/// `ptr`/`size` must be a firmware EDID buffer from a live EDID protocol instance. The firmware
+/// owns the memory and it is valid only while boot services are live, so this must run before
+/// `exit_boot_services` — which is where the one call site sits.
+unsafe fn edid_copy_base(ptr: *const u8, size: u32, source: u32) -> Option<EdidRead> {
+    if ptr.is_null() || size < 128 {
+        return None;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, 128) };
+    let mut block = [0u8; 128];
+    block.copy_from_slice(bytes);
+    Some(EdidRead { block, source, total_len: size })
+}
+
+/// How good a candidate block is: 2 = header valid AND the first Detailed Timing Descriptor decodes
+/// (exactly what the mode-selection path has always demanded of an EDID), 1 = header valid only,
+/// 0 = the firmware handed us 128 bytes that are not an EDID base block.
+fn edid_rank(block: &[u8; 128]) -> u8 {
+    if parse_edid_native(block).is_some() {
+        2
+    } else if block[0..8] == EDID_HEADER {
+        1
+    } else {
+        0
+    }
+}
+
+/// Read the panel's EDID base block on `handle`, trying ACTIVE then DISCOVERED and keeping the
+/// higher-ranked block (ACTIVE wins a tie — the pre-existing preference: the EDID the firmware is
+/// actually using, before the one it merely discovered).
+///
+/// `None` if neither protocol is present — callers then fall back to the firmware's current mode.
+/// Mode selection is unchanged by construction: a rank-2 block is returned in preference to
+/// everything else and is the only kind `parse_edid_native` accepts, so the native resolution this
+/// still yields is byte-for-byte the one the old `edid_native_resolution` yielded. What is new is
+/// that a rank-1/rank-0 block is now CARRIED instead of dropped, so the kernel can say on the wire
+/// that the firmware published something that is not a usable EDID.
+fn read_edid(handle: uefi::Handle) -> Option<EdidRead> {
+    let mut best: Option<EdidRead> = None;
+    let mut best_rank: u8 = 0;
+
+    // Safety (both blocks): `size_of_edid`/`edid` are the firmware's own buffer descriptor, read
+    // here while boot services are live (this runs before exit_boot_services).
     if let Ok(p) = boot::open_protocol_exclusive::<EdidActiveProtocol>(handle) {
-        if !p.edid.is_null() && p.size_of_edid >= 128 {
-            let bytes = unsafe { core::slice::from_raw_parts(p.edid, p.size_of_edid as usize) };
-            if let Some((w, h)) = parse_edid_native(bytes) {
-                return Some((w, h, 1));
+        if let Some(r) = unsafe { edid_copy_base(p.edid, p.size_of_edid, 1) } {
+            let rank = edid_rank(&r.block);
+            if rank == 2 {
+                return Some(r); // nothing DISCOVERED can beat a fully-decoding ACTIVE block
             }
+            best_rank = rank;
+            best = Some(r);
         }
     }
     if let Ok(p) = boot::open_protocol_exclusive::<EdidDiscoveredProtocol>(handle) {
-        if !p.edid.is_null() && p.size_of_edid >= 128 {
-            let bytes = unsafe { core::slice::from_raw_parts(p.edid, p.size_of_edid as usize) };
-            if let Some((w, h)) = parse_edid_native(bytes) {
-                return Some((w, h, 2));
+        if let Some(r) = unsafe { edid_copy_base(p.edid, p.size_of_edid, 2) } {
+            if best.is_none() || edid_rank(&r.block) > best_rank {
+                best = Some(r);
             }
         }
     }
-    None
+    best
+}
+
+/// INSTALL-SELF: parse a FAT `BS_VolID` (volume serial) out of a candidate boot sector.
+///
+/// Gated the same way the kernel's own `fs::fat::parse_bpb` gates a VBR — jump instruction, 0x55AA
+/// signature, 512-byte logical sectors — plus the extended-BPB signature (`BS_BootSig` == 0x29) that
+/// says the `BS_VolID` field is actually present. FAT32 keeps the serial at offset 0x43 and FAT16 at
+/// 0x27; the FAT32 discriminator here is the structural one (`BPB_FATSz16 == 0` and
+/// `BPB_RootEntCnt == 0`), not the cosmetic FS-type string. Returns 0 for "no serial readable", which
+/// is the absent sentinel the kernel's guard disarms on.
+fn parse_fat_volume_serial(sec: &[u8]) -> u32 {
+    if sec.len() < 512 {
+        return 0;
+    }
+    if !(sec[0] == 0xEB || sec[0] == 0xE9) {
+        return 0;
+    }
+    if sec[510] != 0x55 || sec[511] != 0xAA {
+        return 0;
+    }
+    let u16le = |o: usize| (sec[o] as u16) | ((sec[o + 1] as u16) << 8);
+    if u16le(11) != 512 {
+        return 0;
+    }
+    let fat32 = u16le(22) == 0 && u16le(17) == 0;
+    let off = if fat32 { 0x43 } else { 0x27 };
+    // BS_BootSig is the byte immediately BEFORE BS_VolID in both extended BPBs (0x26 → 0x27 on
+    // FAT12/16, 0x42 → 0x43 on FAT32); 0x29 means VolID + VolLab + FSType are present. Without it the
+    // bytes at `off` are not a serial and must not be read as one.
+    if sec[off - 1] != 0x29 {
+        return 0;
+    }
+    (sec[off] as u32)
+        | ((sec[off + 1] as u32) << 8)
+        | ((sec[off + 2] as u32) << 16)
+        | ((sec[off + 3] as u32) << 24)
+}
+
+/// INSTALL-SELF: the FAT volume serial of the volume this bootloader image was loaded from.
+///
+/// The bootloader is the ONLY component that knows this first-hand — the firmware handed it a
+/// loaded-image device handle, and `kernel.elf` came off that handle's filesystem (see the
+/// `get_image_file_system` call below and the comment on why it is not `get_handle_for_protocol`).
+/// So we read LBA 0 of that same handle's `BlockIO` — on a partition handle that IS the volume's boot
+/// sector — and lift `BS_VolID` out of it. The kernel receives it in `BootInfo::boot_volume_serial`
+/// and the installer refuses to erase any candidate disk carrying a FAT volume with that serial.
+///
+/// Non-fatal by construction: every failure path returns 0 (the absent sentinel). This must never be
+/// able to stop a boot — it exists to stop an *erase*.
+///
+/// The `BlockIO` open is deliberately **non-exclusive** (`GetProtocol`). The firmware's FAT driver
+/// holds `BlockIO` on this handle `BY_DRIVER`; an exclusive open would call that driver's `Stop` and
+/// tear down the very filesystem we are about to read `kernel.elf` from. We only read, and we read
+/// nothing the driver is writing.
+/// Returns `(serial, reason)`. `reason` names the branch taken, so a disarmed guard at the bench is a
+/// diagnosable fact rather than a mystery: "no LoadedImage device", "no BlockIO", "read failed" and
+/// "not a stamped FAT volume" are four different things to do about it.
+fn read_boot_volume_serial() -> (u32, &'static str) {
+    use uefi::boot::{OpenProtocolAttributes, OpenProtocolParams};
+    use uefi::proto::loaded_image::LoadedImage;
+    use uefi::proto::media::block::BlockIO;
+
+    // UEFI requires the read buffer to satisfy the media's IoAlign; 4 KiB alignment satisfies every
+    // real value and covers any block size up to 4096.
+    #[repr(align(4096))]
+    struct Buf([u8; 4096]);
+
+    let image = boot::image_handle();
+    let device = match boot::open_protocol_exclusive::<LoadedImage>(image) {
+        Ok(li) => match li.device() {
+            Some(d) => d,
+            None => return (0, "LoadedImage has no device handle"),
+        },
+        Err(_) => return (0, "LoadedImage protocol unavailable"),
+    };
+    let bio = match unsafe {
+        boot::open_protocol::<BlockIO>(
+            OpenProtocolParams { handle: device, agent: image, controller: None },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    } {
+        Ok(p) => p,
+        Err(_) => return (0, "no BlockIO on the loaded-image device"),
+    };
+    let media = bio.media();
+    let bs = media.block_size() as usize;
+    if !media.is_media_present() {
+        return (0, "no media present");
+    }
+    if bs < 512 || bs > 4096 {
+        return (0, "unsupported block size");
+    }
+    let mut buf = Buf([0u8; 4096]);
+    if bio.read_blocks(media.media_id(), 0, &mut buf.0[..bs]).is_err() {
+        return (0, "LBA 0 read failed");
+    }
+    let sec = &buf.0[..bs];
+    match parse_fat_volume_serial(sec) {
+        0 => (
+            0,
+            // The three gates that fail on a real volume, distinguished by the bytes themselves.
+            if !(sec[0] == 0xEB || sec[0] == 0xE9) {
+                "LBA 0 is not a FAT VBR (no jump instruction)"
+            } else if sec[510] != 0x55 || sec[511] != 0xAA {
+                "LBA 0 has no 0x55AA signature"
+            } else {
+                "FAT VBR carries no extended BPB / BS_VolID is 0"
+            },
+        ),
+        s => (s, "extended BPB BS_VolID"),
+    }
 }
 
 /// Surface a fatal boot error on a serial-less machine. A returned error Status just bounces the
@@ -276,6 +441,9 @@ fn bootdiag_dtb() {
 
 #[entry]
 fn main() -> Status {
+    #[cfg(feature = "unaos_ivb")]
+    let (t0, g0) = unsafe { (read_igpu_trace(), read_gmux_trace()) };
+
     uefi::helpers::init().unwrap();
     log::info!("UnaOS UEFI Bootloader Started");
 
@@ -295,6 +463,10 @@ fn main() -> Status {
     let mut edid_native_h: u32 = 0;
     let mut edid_source: u32 = 0;
     let mut mode_action: u32 = 0;
+    // EDID-CARRY: the raw base block itself, on its way to the kernel (see BootInfo::edid_block).
+    let mut edid_block: [u8; 128] = [0; 128];
+    let mut edid_block_valid: bool = false;
+    let mut edid_total_len: u16 = 0;
 
     'gop: {
         // Acquire the GraphicsOutput protocol. On firmware that publishes no GOP at all — a headless
@@ -364,15 +536,34 @@ fn main() -> Status {
             log::info!("  GOP mode: {}x{} stride={} fmt={:?}", w, h, mi.stride(), mi.pixel_format());
         }
 
-        // The monitor's native resolution from EDID, if the firmware exposes it.
-        let edid = edid_native_resolution(gop_handle);
-        let native = edid.map(|(w, h, _)| (w, h));
-        match edid {
-            Some((w, h, s)) => {
-                edid_native_w = w as u32;
-                edid_native_h = h as u32;
-                edid_source = s;
-                log::info!("EDID: monitor native resolution {}x{} (source {})", w, h, s);
+        // The panel's EDID, if the firmware exposes it: the raw base block goes to the kernel via
+        // BootInfo (EDID-CARRY), and the native resolution parsed out of it drives mode selection
+        // below exactly as before.
+        let edid = read_edid(gop_handle);
+        let native = edid.as_ref().and_then(|r| parse_edid_native(&r.block));
+        match &edid {
+            Some(r) => {
+                edid_block = r.block;
+                edid_block_valid = true;
+                edid_total_len = r.total_len.min(u16::MAX as u32) as u16;
+                edid_source = r.source;
+                match native {
+                    Some((w, h)) => {
+                        edid_native_w = w as u32;
+                        edid_native_h = h as u32;
+                        log::info!(
+                            "EDID: {} bytes from source {}; monitor native resolution {}x{}",
+                            r.total_len, r.source, w, h
+                        );
+                    }
+                    // Carried anyway: the kernel's witness names what is wrong with it, which is
+                    // strictly more than the silence this used to produce.
+                    None => log::info!(
+                        "EDID: {} bytes from source {} but no usable preferred timing; \
+                         carrying the raw block, using the firmware's current mode",
+                        r.total_len, r.source
+                    ),
+                }
             }
             None => log::info!("EDID: not available; using the firmware's current mode"),
         }
@@ -714,6 +905,18 @@ fn main() -> Status {
         log::info!("ACPI RSDP at {:#x}", rsdp_addr);
     }
 
+    // INSTALL-SELF: identify the volume we booted FROM, at the only place in the system that knows it
+    // first-hand. Read while boot services are still live (this must precede exit_boot_services).
+    let (boot_volume_serial, bvs_reason) = read_boot_volume_serial();
+    if boot_volume_serial != 0 {
+        log::info!("boot volume FAT serial {:#010x} ({})", boot_volume_serial, bvs_reason);
+    } else {
+        log::info!(
+            "boot volume FAT serial unavailable: {} — installer boot-device guard will disarm",
+            bvs_reason
+        );
+    }
+
     let boot_info = alloc::boxed::Box::new(BootInfo {
         framebuffer_addr: fb_addr,
         framebuffer_size: fb_size,
@@ -728,6 +931,24 @@ fn main() -> Status {
         edid_native_height: edid_native_h,
         edid_source,
         mode_action,
+        edid_block,
+        edid_block_valid,
+        edid_total_len,
+        boot_volume_serial,
+        #[cfg(feature = "unaos_ivb")]
+        igpu_trace_0: t0,
+        #[cfg(feature = "unaos_ivb")]
+        gmux_trace_0: g0,
+        #[cfg(feature = "unaos_ivb")]
+        igpu_trace_1: [0; 11],
+        #[cfg(feature = "unaos_ivb")]
+        igpu_trace_2: [0; 11],
+        #[cfg(feature = "unaos_ivb")]
+        igpu_trace_valid: false,
+        #[cfg(feature = "unaos_ivb")]
+        kdisp_trace_0: [0; 7],
+        #[cfg(feature = "unaos_ivb")]
+        kdisp_trace_valid: false,
     });
     let boot_info_static = alloc::boxed::Box::leak(boot_info);
 
@@ -776,7 +997,19 @@ fn main() -> Status {
         }
     }
 
+    #[cfg(feature = "unaos_ivb")]
+    {
+        boot_info_static.igpu_trace_1 = unsafe { read_igpu_trace() };
+        log::info!("iGPU trace 1 (pre-EBS) collected.");
+    }
+
     let memory_map = unsafe { boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
+
+    #[cfg(feature = "unaos_ivb")]
+    {
+        boot_info_static.igpu_trace_2 = unsafe { read_igpu_trace() };
+        boot_info_static.igpu_trace_valid = true;
+    }
     
     let mut regions_len = 0;
     for desc in memory_map.entries() {
@@ -1068,4 +1301,128 @@ fn jb8_disconnect_lever() {
 fn acpi_checksum(bytes: &[u8]) -> u8 {
     let sum = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
     0u8.wrapping_sub(sum)
+}
+
+#[cfg(feature = "unaos_ivb")]
+unsafe fn read_igpu_trace() -> [u32; 11] {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::asm;
+        
+        let outl = |port: u16, val: u32| {
+            unsafe { asm!("out dx, eax", in("dx") port, in("eax") val, options(nomem, nostack, preserves_flags)); }
+        };
+        let inl = |port: u16| -> u32 {
+            let mut val: u32;
+            unsafe { asm!("in eax, dx", out("eax") val, in("dx") port, options(nomem, nostack, preserves_flags)); }
+            val
+        };
+        
+        // 0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | offset
+        // Bus 0, Dev 2, Func 0. 0x80001000.
+        outl(0xCF8, 0x80001010);
+        let bar0 = inl(0xCFC) & 0xFFFFFFF0;
+        if bar0 == 0 || bar0 == 0xFFFFFFF0 {
+            // Sentinel, NOT zeros: an all-zero trace is also a legitimate all-dark reading,
+            // so a failed BAR0 read must be unmistakable in the serial table.
+            return [0xBAD0BA20; 11];
+        }
+        
+        let read_mmio = |offset: u32| -> u32 {
+            unsafe { core::ptr::read_volatile((bar0 as usize + offset as usize) as *const u32) }
+        };
+        
+        [
+            read_mmio(0x70008), // PIPEACONF
+            read_mmio(0x71008), // PIPEBCONF
+            read_mmio(0x72008), // PIPECCONF
+            read_mmio(0x70180), // DSPACNTR
+            read_mmio(0x71180), // DSPBCNTR
+            read_mmio(0x72180), // DSPCCNTR
+            read_mmio(0x7019C), // DSPASURF
+            read_mmio(0x64000), // DP_A
+            read_mmio(0x61200), // PP_STATUS
+            read_mmio(0x61204), // PP_CONTROL
+            read_mmio(0x06014), // DPLL_A_CTRL
+        ]
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        [0; 11]
+    }
+}
+
+#[cfg(feature = "unaos_ivb")]
+unsafe fn read_gmux_trace() -> [u32; 7] {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::asm;
+        
+        let outb = |port: u16, val: u8| {
+            unsafe { asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags)); }
+        };
+        let inb = |port: u16| -> u8 {
+            let mut val: u8;
+            unsafe { asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags)); }
+            val
+        };
+
+        let wait_ready = || {
+            let mut i = 200;
+            let mut gwr = inb(0x7D4);
+            while i > 0 && (gwr & 0x01) != 0 {
+                inb(0x7D0);
+                gwr = inb(0x7D4);
+                // Simple delay loop
+                for _ in 0..1000 { unsafe { asm!("pause", options(nomem, nostack, preserves_flags)); } }
+                i -= 1;
+            }
+        };
+
+        let wait_complete = || {
+            let mut i = 200;
+            let mut gwr = inb(0x7D4);
+            while i > 0 && (gwr & 0x01) == 0 {
+                gwr = inb(0x7D4);
+                for _ in 0..1000 { unsafe { asm!("pause", options(nomem, nostack, preserves_flags)); } }
+                i -= 1;
+            }
+            if (gwr & 0x01) != 0 {
+                inb(0x7D0);
+            }
+        };
+
+        let index_read = |reg: u8| -> u32 {
+            wait_ready();
+            outb(0x7D0, reg);
+            wait_complete();
+            let val = inb(0x7C2);
+            val as u32
+        };
+
+        let index_read32 = |reg: u8| -> u32 {
+            wait_ready();
+            outb(0x7D0, reg);
+            wait_complete();
+            let mut val: u32;
+            unsafe { asm!("in eax, dx", out("eax") val, in("dx") 0x7C2u16, options(nomem, nostack, preserves_flags)); }
+            val
+        };
+
+        let version32 = index_read32(0x04);
+
+        [
+            (version32 >> 24) & 0xFF, // VERSION_MAJOR
+            (version32 >> 16) & 0xFF, // VERSION_MINOR
+            (version32 >> 8) & 0xFF,  // VERSION_RELEASE
+            index_read(0x10),         // SWITCH_DISPLAY
+            index_read(0x28),         // SWITCH_DDC
+            index_read(0x50),         // DISCRETE_POWER
+            index_read32(0x70),       // MAX_BRIGHTNESS
+        ]
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        [0; 7]
+    }
 }

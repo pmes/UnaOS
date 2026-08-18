@@ -1205,6 +1205,18 @@ pub fn service_net() {
     // hermetic slirp never connects in, so it prints an honest PENDING note and keeps listening cheaply.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
     crate::smolnet::witness_tick6();
+    // SOCK-8 (knob-on): the smoltcp DNS client — one-shot, resolves `pool.ntp.org` via the DHCP-provided
+    // DNS server (gateway fallback). Runs before the SNTP witness (which reuses the resolver). Same
+    // post-guard discipline (its UDP pump short-locks NET_DEVICE per ring op). Under slirp the resolve may
+    // succeed (10.0.2.3 forwards to the host); otherwise it prints the honest `no answer` note.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    crate::smolnet::witness_tick_dns();
+    // SNTP-X86 (knob-on): the smoltcp SNTP client — one-shot, syncs the shared `crate::clock` from a
+    // resolved `pool.ntp.org` (SOCK-8) or the live gateway over SNTP. Same post-guard discipline (its UDP
+    // pump short-locks NET_DEVICE per ring op). Hermetically the target is silent for NTP, so it prints the
+    // honest `no reply` note; on real hardware with an NTP-answering server it anchors `time` for real.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    crate::smolnet::witness_tick_sntp();
 }
 
 /// Outcome of a blocking [`ping`] (rendered by the `ping` shell command).

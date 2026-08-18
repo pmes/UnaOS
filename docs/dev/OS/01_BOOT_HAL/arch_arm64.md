@@ -262,6 +262,193 @@ again (second consecutive full-core >1 MiB boot), the whole created-file family 
 riders re-captured.** Serial: `~/unaos-bench/pi-serial-2026-07-15-core3fix-32of32.log`.
 Core-3-down on >1 MiB images is no longer an expected signature.
 
+#### SMP-7 — the P53 "only 2 of 4 cores" report: bring-up audit + per-core evidence
+
+**Trigger (metal, 2026-07-24, P53 on a real Pi 4):** *"smp needs serious work. only procs 2 & 4
+running regularly."* That is worse than the previously documented intermittent 3/4 (an AP missing
+the spin-table release, usually recovered by a power-cycle) and worse than the CORE3-SMP regression
+above, which was metal-confirmed fixed. Null hypothesis, as always: **our code**.
+
+**Audit of the release path (`smp.rs`, `boot.rs::_start`/`drop_to_el1`/`enable_mmu`, `cache.rs`,
+`gic.rs`).** Read end-to-end against the P53 build. What was checked and what it showed:
+
+*Refuted / clean (no defect found):*
+
+* **Release slots + cache maintenance.** `RELEASE_ADDR = 0xD8/0xE0/0xE8/0xF0` matches the BCM2711
+  DTB `cpu-release-addr`; all four lie in the single 64-byte line at `0xC0`, so the one
+  `clean_range(0xE0, 0x18)` + `DSB` before `SEV` genuinely publishes all three slots. Order is
+  correct (write → clean → DSB → SEV), and the event register is sticky, so an AP that is not yet
+  in `WFE` when the `SEV` lands still wakes on its next `WFE`.
+* **Low-RAM overlap.** Nothing the kernel places can land on the spin-table page: the image loads at
+  `0x80000` with `__bss_end = 0x21B140` (~2.2 MiB) and `__stack_top = 0x29C000`, and the bare-metal
+  heap region is fixed at `0x0200_0000` (32 MiB) + 64 MiB. The parked cores execute armstub code in
+  page 0 undisturbed, and the P47→P53 growth is nowhere near either boundary.
+* **Secondary stack arithmetic.** `_secondary_start` sets `SP = &SECONDARY_STACKS + (Aff0+1)*64 KiB`;
+  slot 0 is unused, cores 1-3 take disjoint slots 1-3, core 3's top is the array end. No overlap,
+  no off-by-one, and the array is `align(16)` so `SP` stays 16-aligned as AArch64 requires.
+* **Per-core GIC init is not a cross-core race.** `enable_banked` does an RMW of `GICD_IGROUPR` on
+  the Pi path, which looks like an unsynchronised distributor RMW across four cores — but for
+  INTID < 32 `IGROUPR0`/`ISENABLER0`/`IPRIORITYR0-7` are **banked per CPU interface** on GICv2, so
+  each core is reading and writing its own copy. Not a defect.
+* **The CORE3-SMP hazard is not live in this build.** Disassembling `<__secondary_rust>` from the
+  P53 kernel: the id is still re-derived by `mrs x8, MPIDR_EL1` *after* the `SCTLR_EL1` write, and
+  nothing stored with the MMU off is reloaded afterwards. The 2026-07-15 fix is intact.
+
+*Confirmed weakness (fixed here) — the MMU-off stack window still exists:*
+
+The AP's prologue runs before `drop_to_el1`/`enable_mmu` and **does** write the stack with the MMU
+and caches off: `sub sp,sp,#0x30; str x30,[sp,#0x10]; stp x20,x19,[sp,#0x20]`. Those stores go
+straight to DRAM while every later access to the same lines is Normal-cacheable — the exact
+mismatched-attributes window that produced the phantom "core 0", and the BSP, which has run
+cacheable over all of RAM for the whole boot, can hold stale lines covering `SECONDARY_STACKS` in
+the cluster-shared 1 MiB L2. Today no MMU-off spill happens to be reloaded, so this is **latent, not
+live** — but that property is pure codegen luck, and codegen shifts every time the image does, which
+is precisely the layout-dependence the original regression showed. **Fix (always on, no knob, it is
+cache maintenance rather than a behaviour change):** the BSP `clean_invalidate_range`s the whole
+256 KiB `SECONDARY_STACKS` array to the PoC immediately before the release, so no stale line for any
+AP stack can survive into its MMU-off window. `DC CIVAC` is inner-shareable-broadcast, it runs once
+at boot, and the BSP never touches those stacks again.
+
+*Suspect, deliberately NOT changed (read-only until metal says otherwise):*
+
+* **`CPUECTLR_EL1.SMPEN` (A72 bit 6) is never set or checked by us** — we inherit whatever the
+  VideoCore firmware/armstub left. On Cortex-A72 SMPEN must be set before caches/MMU are enabled for
+  the core to participate in coherency, and a non-coherent AP would hang on its first lock or
+  atomic — a plausible shape for "core arrives, never reports". It is not instrumented here because
+  the register is IMPDEF: an EL1 read can trap to EL2 (we never program `ACTLR_EL2`), and taking an
+  exception on a secondary is the failure being investigated. The sound probe is a read/set in the
+  asm stub while still at EL2, no stack involved — proposed, not shipped.
+* **Nothing distinguishes "never left the spin-table" from "arrived and died".** That is what the
+  telemetry below now settles, and it is the prerequisite for any further fix.
+
+**Telemetry (`smp7`, `UNAOS_SMP7=1`; DEFAULT OFF).** Per AP the kernel records the release-write
+timestamp (per core, re-stamped by any retry — a core re-released at +500 ms reports +500 ms, not the
+first release's instant), the check-in time and the MPIDR the core derived **for itself**, the
+bring-up stage reached (`rust → vectors → percpu → gic → timer → ready`), and any re-release count;
+the BSP then prints one detail line per core plus the summary, after bring-up settles and before the
+IPI smoke test. Every stamp is taken with the MMU already on — instrumenting the MMU-off window with
+cacheable stores would re-open the very hazard being hardened; the pre-MMU window is still the
+`core3probe` raw-PL011 stub's job. Knob-off removes every `[smp7]` line and the retry, but **not** the
+arc's always-on `DC CIVAC` above — knob-off is byte-identical to the rest of SMP-7, not to the
+pre-arc image.
+
+```
+[smp7] core 1 released=+0ms checkin=+1ms ready=+6ms mpidr=0x80000001 stage=ready retries=0
+[smp7] core 3 released=+312ms checkin=-  ready=-   mpidr=0x0        stage=none  retries=3
+[smp7] cores online=0xf missed=0x0 at +12ms core1 ok +6ms; core2 ok +9ms; core3 ok +8ms
+```
+
+A missing core now reads directly: `stage=none` = never arrived (release/wake path), any other stage
+= arrived and died at that step, and the derived `mpidr` catches an id-confusion recurrence. The
+summary line is a **snapshot, not a verdict** — an AP can publish `CORE_READY` just after it prints
+and then be IPI'd and scheduled by the following lines — so it carries the `at +Nms` instant its
+masks describe, and those masks are read as late as possible before the line is formatted.
+
+**Known residual (pre-existing, NOT closed by this arc).** An AP arriving with `MPIDR_EL1 & 0xff >= 4`
+computes `SP` past the end of `SECONDARY_STACKS` in `_secondary_start` and writes its MMU-off
+prologue there, before `__secondary_rust`'s bounds check can park it — the new stack maintenance
+covers only the four legitimate slots, so it does not harden that case. It cannot arise on a
+four-core BCM2711 with correct affinity delivery, which is why it stays a noted residual rather than
+an arc item; hardening it means bounds-checking Aff0 in the asm stub (no stack, EL2, before the first
+store) and parking out-of-range cores there.
+
+**Retry (`smp7_retry`, `UNAOS_SMP7_RETRY=1`; DEFAULT OFF, implies `smp7`).** For an AP that has
+**not checked in at all** after its first wait, re-issue the identical write + `DC CVAC` + `DSB` +
+`SEV`, up to 3× at ~100 ms. Never applied to a core that arrived and then stopped — that core has
+already left the spin-table and re-releasing it would be actively wrong. It is as much an instrument
+as a recovery: a core that a re-release recovers indicts the release/wake path; one that never
+recovers is losing itself after arrival, and `stage` says where.
+
+**Gates:** `./arroyo check` green both arches; `./arroyo kernel8` builds clean; `kernel8-test 45`
+**46/46 required witnesses, 0 forbidden** both knob-off and with `UNAOS_SMP7_RETRY=1`, CAPSTONE 6/6,
+and QEMU raspi4b still brings up 4/4 (`online=0xf missed=0x0`). QEMU has never reproduced any of
+this — the verdict is metal, on the next attended Pi sitting, with `UNAOS_SMP7=1` (observation) or
+`UNAOS_SMP7_RETRY=1` (observation + recovery experiment).
+#### SMP-8 — CPUECTLR_EL1.SMPEN: required A72 configuration we never set, and its witness
+
+**Where this comes from.** The SMP-7 audit refuted the release path (slot addresses, the single-line
+`DC CVAC`, `DSB`-before-`SEV` ordering, low-RAM overlap, secondary-stack arithmetic, the GICv2
+`IGROUPR` "race") and hardened the MMU-off stack window, but named one lead it deliberately did not
+ship: **`CPUECTLR_EL1.SMPEN` (Cortex-A72 IMPDEF, bit 6) is never set or checked by us.** SMP-8 both
+sets it and instruments it.
+
+**Why it is required configuration, not a workaround.** The A72 TRM makes SMPEN mandatory for any
+code that owns a core: it must be set *before* the caches or the MMU are enabled, and while it is
+clear the core does not participate in cluster coherency — its lines are not snooped and its
+exclusive monitor does not work across the cluster, so the **first `ldaxr`/`stlxr` pair it executes
+can spin forever**. Every Linux boot/PSCI stub sets it for exactly this reason. A core handed to us
+with SMPEN clear therefore *arrives and never reports* — precisely the P53 shape ("only procs 2 & 4
+running regularly"). The set is consequently **always on, no knob**: it weakens nothing and it is
+what the hardware documentation requires. Only the *witness* is gated (default-quiet).
+
+**Where the probe lives, and why: `drop_to_el1`, at EL2, before the `eret`** (`arch/aarch64/boot.rs`).
+Three reasons, all load-bearing:
+
+* **EL2, not EL1.** `CPUECTLR_EL1` is IMPLEMENTATION DEFINED and an EL1 access can be trapped to EL2
+  by `ACTLR_EL2`, which we never program (it resets UNKNOWN). Taking an unexpected exception on a
+  secondary is the very failure under investigation, so the access must happen where it cannot trap.
+  One residual dependency remains and is worth naming: an EL2 access to `CPUECTLR_EL1` still requires
+  that EL3 has not trapped it, i.e. that the armstub left the IMPDEF-register grant in `ACTLR_EL3`
+  open — the standard convention for a stub that hands the machine to an OS at EL2, but not something
+  QEMU can verify (it models neither the register nor the trap). If the grant were absent the very
+  first core would take an EL3 exception in `drop_to_el1` at power-on, before serial is up: the
+  failure is deterministic and fail-fast, so **read a totally silent boot with no serial output at all
+  as this**, not as an SMP symptom.
+* **One insertion covers all four cores.** The BSP reaches `drop_to_el1` from `__rust_boot`; every AP
+  reaches it from `__secondary_rust`. Identical code, identical point in each core's life.
+* **MMU and caches still off**, which is where the TRM wants the bit set.
+
+The probe is spliced in via a `#[cfg(feature = "pi")]` macro that expands to nothing otherwise. Note
+what that cfg is and is not about: `boot::drop_to_el1` is the **Pi/A72** drop and is called only by
+`__rust_boot` and `__secondary_rust` — `virt` uses `boot_virt::drop_to_el1`, the Jetson uses
+`boot_tegra::drop_to_el1`. But `mod boot` is declared unconditionally in `arch/aarch64/mod.rs`, so
+this asm is *assembled into* `virt` and `tegra` images even though nothing there calls it, and
+`CPUECTLR_EL1` is IMPDEF with a per-core encoding (`S3_0_C15_C1_4` on the A78AE, not the A72's
+`S3_1_C15_C2_1`). The cfg keeps an A72-specific encoding out of every non-A72 image; it is about what
+gets assembled, not about who calls it.
+
+**Register and index discipline.** The probe uses **x1–x5 only**; x0 (the stub's own scratch) and x30
+(the `eret` target) are untouched, and `drop_to_el1` is a no-argument `extern "C"` fn so x1–x5 are
+dead on entry. The Aff0 mask admits 0–255 while the record is 4 slots, so the index is **bounds-checked
+before it indexes anything** (`cmp x1,#4 / b.hs`) rather than resting on the platform fact that the Pi
+4 is one cluster of four — an out-of-range core skips the *record* only and still gets SMPEN set, which
+must never be conditional. Both verified in the disassembly of the shipped `kernel8` image.
+
+**Recording the pre-fix value across the MMU-off boundary.** Each core stores its **raw, pre-fix**
+`CPUECTLR_EL1` into `boot::SMP8_CPUECTLR[Aff0]`, plus a magic word into `[4 + Aff0]` — because a
+genuinely all-zero reading (SMPEN clear, everything else clear) is the single most interesting result
+and must not be indistinguishable from an untouched BSS slot. These stores are MMU-off and
+DRAM-direct while every later read is Normal-cacheable, the mismatched-attributes hazard of
+§CORE3-SMP. Two properties make the read sound: the object is **exactly one dedicated 64-byte cache
+line** (aligned, nothing else ever shares it, so invalidating it can discard nothing), and the reader
+clean+invalidates that line to the PoC before loading it.
+
+**The witness (feature `smp8`, `UNAOS_SMP8=1`; DEFAULT OFF).** After bring-up settles,
+`smp::report_smp8` prints one line per core plus a verdict:
+
+```
+[smp8] core N cpuectlr(pre-fix)=0x… smpen=0|1
+[smp8] core N raw=- (not recorded — never reached drop_to_el1)
+[smp8] verdict: SMPEN was CLEAR on cores <mask> (recorded <mask>) — …
+[smp8] verdict: SMPEN was ALREADY SET on every core recorded (<mask>) — … REFUTED …
+[smp8] verdict: every core read 0x0 INCLUDING the BSP … RAZ/WI here …
+```
+
+**Core 0 is the control.** The BSP has been taking locks and running atomics for the whole boot, so
+it *is* coherent; a reading of `smpen=0` on core 0 cannot be true of the hardware and brands the
+whole set as a model artefact. That is what QEMU produces (below). Only when core 0 reads back a
+plausible value do the AP readings carry evidence — and then `pre-clear=<mask>` answers the P53
+question directly: any AP with SMPEN clear is the smoking gun for 2/4, and the always-on set is the
+fix; every core already set refutes the lead and sends the search elsewhere.
+
+**Gates.** `./arroyo check` green both arches; `./arroyo kernel8` clean; `kernel8-test 45` **0
+forbidden, CAPSTONE 6/6, 4/4 cores online** both knob-off and with `UNAOS_SMP8=1` — the always-on
+SMPEN set does not regress QEMU bring-up. **QEMU raspi4b does not model this IMPDEF register:** all
+four cores read `0x0` (RAZ/WI), the write is silently dropped, and the reporter says so rather than
+claiming firmware left the cores non-coherent. The whole probe path is nonetheless exercised there —
+all four magic words land, so the MMU-off record + invalidating read are proven end-to-end. **The
+reading itself is metal-only**, on the next attended Pi sitting with `UNAOS_SMP8=1`.
+
 **Scheduler on the `virt` path — the boot core, since JC3.** The aarch64 scheduler
 was `#[cfg(feature = "baremetal")]`-gated and coupled to EL1 (`ELR_EL1`/`SPSR_EL1`
 eret paths), while the `virt` kernel runs at EL2. **Arc JC3** un-gates it: after the
@@ -6582,12 +6769,412 @@ The new QEMU chain (verbatim), between the gate-enable and the probe:
 :: V3D: probe verdict BLOCK-DOWN — hub IDENT0 = 0x00000000 (block absent/unpowered; expected in QEMU raspi4b) ...
 ```
 
+### PI-V3D-4 — the M2 MMU program that read back zero (fabricated register constants)
+
+**The V3D-3 metal verdict (2026-07-18, LC-metal R22 sitting-2, non-relitigable ground truth).** The
+PM/ASB step landed: the probe now reaches **BLOCK-UP** on silicon with a live V3D identity, and the
+hub + core IDENT windows all read real values:
+```
+:: V3D: probe verdict BLOCK-UP — hub IDENT0 = 0x42554856 (live V3D identity) ::
+:: V3D: HUB_IDENT1..3 = 0x000e1124 0x00000100 0x00000e00 ::
+:: V3D: CTL_IDENT0..2 = 0x04443356 0x81001422 0x40078121 ::
+:: V3D: MMU CTL=0x00000000 VIO_ADDR=0x00000000 DEBUG=0x00000000 (mapped 64 arena pages @ 0x154000) ::
+:: V3D: M2 MMU program FAILED — halting bring-up (fail-closed) ::
+```
+So the block is powered, clocked, out of reset, bridged, and decoding — every IDENT is live — yet the
+MMU register window at hub `+0x1200` reads all-zero after programming, and the enable-verify fails
+closed.
+
+**Root cause: the `V3D_MMU_CTL_*` bit constants and two MMU offsets in `v3d.rs` were fabricated, not
+transcribed from `v3d_regs.h`.** The old constants placed the control bits at the *top* of the word
+(`ENABLE=1<<31`, `PT_INVALID_ENABLE=1<<30`, `PT_INVALID_ABORT=1<<29`, `WRITE_VIOLATION_ABORT=1<<21`,
+`TLB_CLEAR=1<<3`, `TLB_CLEARING=1<<2`). The real hardware layout is at the *bottom*:
+`ENABLE=BIT(0)`, `PT_INVALID_ENABLE=BIT(16)`, `PT_INVALID_ABORT=BIT(19)`,
+`WRITE_VIOLATION_ABORT=BIT(11)`, `TLB_CLEAR=BIT(2)`, `TLB_CLEARING=BIT(7)`. Consequences, exactly
+matching the capture:
+  1. The "enable" write (`0xE0200000`) set only **reserved** bits — real `ENABLE` (bit 0) stayed
+     clear, so the MMU was **never enabled**.
+  2. Reserved/undefined bits do not latch, so the `V3D_MMU_CTL` readback returns `0x00000000`.
+  3. The verify `ctl & ENABLE(=1<<31)` reads zero → `program_mmu` fail-closes and halts M2. This is the
+     verbatim `MMU CTL=0x00000000 … M2 MMU program FAILED` line — a pure software constants bug, not a
+     silicon or bring-up defect.
+
+Two register **offsets** were also off by a slot: `VIO_ADDR` pointed at `V3D_MMU_HIT` (`0x1208`) and
+`DEBUG_INFO` at `V3D_MMU_VIO_ADDR` (`0x1234`). Corrected to the `v3d_regs.h` map
+(`0x1230 ILLEGAL_ADDR · 0x1234 VIO_ADDR · 0x1238 DEBUG_INFO`). (The PTE bits `VALID=BIT(28)` /
+`WRITEABLE=BIT(29)`, the `MMUC_CONTROL` bits, and `ILLEGAL_ADDR_ENABLE=BIT(31)` were already correct
+and are unchanged.)
+
+**Fix (`v3d.rs`).** The constants are now transcribed verbatim from `torvalds/linux`
+`drivers/gpu/drm/v3d/v3d_regs.h` (with a comment recording the corrected slot map). `program_mmu` now
+(a) prints the values it is about to program (`PT_PA_BASE`, `CTL`, `ILLEGAL_ADDR`), (b) issues a
+`dsb sy` between the programming writes and the readback so the program→verify handoff across the async
+AXI bridge is explicit, and (c) prints a single richer readback line — `CTL`, decoded `ENABLE=`,
+`PT_PA_BASE`, `VIO_ADDR`, `DEBUG` — so the next metal verdict is one line. Fail-closed posture is
+unchanged: if `CTL.ENABLE` still does not latch, M2 halts exactly as before and the SError-drain runs.
+
+New witness lines (metal — QEMU stays BLOCK-DOWN and never reaches M2):
+```
+:: V3D: MMU program — PT_PA_BASE<=0x000000NN (pt@0xNNNNN) CTL<=0x00090801 ILLEGAL_ADDR<=0x800000NN ::
+:: V3D: MMU readback CTL=0x000NNNNN (ENABLE=1) PT_PA_BASE=0x000000NN VIO_ADDR=0x00000000 DEBUG=0x00NNNNNN (mapped 64 arena pages @ 0x154000) ::
+```
+The programmed `CTL` value is now `0x00090801` = `ENABLE(0) | WRITE_VIOLATION_ABORT(11) |
+PT_INVALID_ENABLE(16) | PT_INVALID_ABORT(19)`. **Metal-owed:** confirm `ENABLE=1` on the readback and
+that `DEBUG_INFO` decodes a plausible VA/PA width + MMU version (M2 PASS), then M3.
+
+### PI-V3D-5 — the M3 clear-job wrote nothing (two-class instrumentation)
+
+**The V3D-4 metal verdict (boot-P1, 2026-07-20, LC-metal R23s1).** With PI-V3D-4's corrected MMU
+constants the block now programs its MMU and M2 passes; M3 then fails:
+```
+:: V3D: verify mismatch at word 0 — got 0xdeadbeef expect 0x00a68cff ::
+:: V3D: M3 clear-job did not verify ::
+```
+`0xdeadbeef` is the CPU-side sentinel `fill_target` pre-seeds before the kick, so the verify proves
+the **GPU wrote nothing to the target** (or wrote elsewhere and DRAM at the target still holds the
+sentinel). Two failure classes fit that single symptom and cannot be told apart off-metal:
+  - **Class A — job never ran.** The CLE never accepted/executed the render list (a `CT1QBA/QEA`
+    kick that the engine ignored, or `CTRUN` that never latched). The store never issued.
+  - **Class B — job ran but the store landed off-target.** Either the store address faulted in the
+    V3D MMU (wrote nowhere), or the placeholder RCL packet encoding stored to the wrong address (the
+    packet field layout in `build_rcl` is an admitted attended-metal refinement, the *next* arc), or
+    a stale CPU cache line masked a real GPU write on the verify read.
+
+**Off-metal audit of the PI-V3D-4 MMU constants (no provable defect found).** Against BCM2711 V3D 4.2
+(`v3d_regs.h` / `v3d_mmu.c`): the `PT_PA_BASE` load is `pt_paddr >> V3D_MMU_PAGE_SHIFT(12)` ✓; the
+PTE encoding is `VALID(28) | WRITEABLE(29) | (phys>>12)` with an identity map (iova==phys) ✓; the
+programmed `CTL` (`ENABLE(0) | PT_INVALID_ENABLE(16) | PT_INVALID_ABORT(19) | WRITE_VIOLATION_ABORT(11)`)
+matches the register's bottom-of-word layout ✓; the CL/job addresses are V3D **IOVAs** that, under the
+identity map, equal the ARM PA the arena lives at, and the arena's PTEs are the ones marked valid ✓;
+the verify's `clean_invalidate_range` is safe because the target line was published *clean* by the
+pre-kick `clean_range` (the clean half writes nothing back, the invalidate forces a DRAM re-load) ✓.
+**No load-bearing MMU constant is provably wrong** — so this arc adds the discriminating
+instrumentation rather than a speculative constant change. (The witness-only offsets `VIO_ADDR`/
+`VIO_ID`/`DEBUG_INFO` are as PI-V3D-4 transcribed; they gate nothing.)
+
+**Instrumentation (`v3d.rs::clear_job`, all reads — programs nothing new).** Around the CT1 kick:
+  1. **Class-A discriminator.** Snapshot `CT1CS` immediately *before* the kick (`pre`), *after*
+     writing `CT1QBA/QEA` with a `dsb` (`kicked`), and after the poll (`done`); read `CT1CA` (the
+     CLE's current execution address). `CTRUN` latched-then-cleared **or** `CT1CA != BA` ⇒ the CLE
+     executed; `CTRUN` never latched **and** `CT1CA == BA` ⇒ **CLASS-A JOB-NEVER-RAN**.
+  2. **Class-B discriminator.** Read `V3D_MMU_CTL` and decode its hardware-set fault bits
+     `PT_INVALID(20)`, `WRITE_VIOLATION(12)`, `CAP_EXCEEDED(27)`, plus `VIO_ADDR`/`VIO_ID`. Any fault
+     bit ⇒ **CLASS-B MMU-FAULT** (the store faulted, wrote nowhere) and `VIO_ADDR` names where. No
+     fault but the CLE ran and the target is still the sentinel ⇒ **CLASS-B RAN-NO-FAULT** (store
+     landed off-target — the RCL-encoding case, the next arc). The cache sub-case is already defeated
+     by the invalidated verify read.
+  3. **SError-drain correlation.** A faulting V3D store can leave a latent async external abort that
+     the global SError-drain would otherwise consume unlabelled at bring-up exit (or fire at the
+     first timer tick). A `serror_drain_request("v3d: M3 clear-job kick window")` is issued right
+     after the poll, so a `consumed N latent async abort(s) … [v3d: M3 clear-job kick window]` line —
+     if any — is unambiguously correlated with the M3 store, not with M1/M2. Zero drained ⇒ the store
+     raised no bus fault.
+
+QEMU `raspi4b` models no V3D, so it stays on **BLOCK-DOWN** and never reaches M3 — the new lines are
+metal-only by construction (the module is entirely `v3d`-feature-gated, so knob-off images are
+byte-identical to baseline).
+
+**Expected boot-P2 witness lines (metal).** Between the `M2 MMU PASS` line and the verify result:
+```
+:: V3D: M3 clue — CT1CS pre=0x……… kicked=0x……… done=0x……… CT0CS=0x……… CT1CA=0x……… (BA=0x……… EA=0x………) — <CLASS-A JOB-NEVER-RAN | CLASS-B MMU-FAULT | CLASS-B RAN-NO-FAULT | INDETERMINATE> ::
+:: V3D: M3 clue — MMU_CTL=0x……… (PT_INVALID=n WRITE_VIOLATION=n CAP_EXCEEDED=n) VIO_ADDR=0x……… VIO_ID=0x……… ::
+```
+plus, iff the store faulted, one `:: SERROR-DRAIN: consumed N latent async abort(s) … [v3d: M3 clear-job kick window] … ::`. The class label + `VIO_ADDR`/drain trio route the next arc: Class A → CLE kick/ring shape; Class-B MMU-FAULT → the store address vs the arena map; Class-B RAN-NO-FAULT → the `build_rcl` packet encoding.
+
+### PI-V3D-6 — the real render control list (the placeholder `build_rcl` convicted at boot-P2)
+
+**The boot-P2 verdict (2026-07-20, LC-metal R23s1).** PI-V3D-5's discriminator returned **CLASS-B
+RAN-NO-FAULT**: `CT1CS pre=0 kicked=0 done=0 CT0CS=0 CT1CA=0 (BA=…, EA=BA+0x1a)`, `MMU_CTL=0x00090801`
+with every fault bit `0`. The CLE consumed the `0x1a`-byte list to completion with no MMU fault, but
+the store never targeted the buffer. PI-V3D-4's MMU constants are exonerated (audited + metal-clean);
+the admitted-placeholder `build_rcl` was the convicted culprit.
+
+**What the placeholder got wrong, at the packet level.** It wrote a stream of bare opcode *bytes* with
+**no field bit-packing at all**, plus several wrong opcodes and a structurally impossible render:
+- **No field packing.** Each packet was `w.u8(opcode)` followed by a couple of raw `u16`/`u32`s. V3D
+  packets pack named fields at specific bit offsets after the opcode byte; a bare stream sets none of
+  them (sub-ids, BPP, format, stride, buffer-select all read as 0/garbage).
+- **Wrong opcodes.** `114` was used for "clear colors" — `114` is *Blend Enables*; the clear color is
+  sub-id 3 of `TILE_RENDERING_MODE_CFG` (`121`). `125` was used for "end-of-tile marker" — `125` is
+  *Tile Coordinates Implicit*; the real End-of-Tile Marker is `27`.
+- **Malformed STORE.** `STORE_TILE_BUFFER_GENERAL` (`29`, correct opcode) had the target address at
+  the wrong byte offset (the address field is a full 32-bit slot at packet byte 9, XML `start=64`) and
+  none of the Output-Image-Format / Memory-Format / stride / Buffer-to-Store fields — so even had a
+  tile been rendered, the store had no valid destination format.
+- **No supertile execution.** There was no `MULTICORE_RENDERING_SUPERTILE_CFG` and, fatally, no
+  `SUPERTILE_COORDINATES` — nothing ever triggered a tile to render/store. The `0x1a` bytes ran to
+  the `Halt` and wrote nowhere: exactly CLASS-B RAN-NO-FAULT.
+
+**The fix — a correct V3D 4.2 two-level render list.** `build_rcl` now emits the real render-only
+clear+store as Mesa builds it (`v3dX(emit_rcl)` + `emit_render_layer` +
+`v3d_rcl_emit_generic_per_tile_list`), for a single 64×64 tile = single supertile, no binned geometry:
+- **Main list** (`OFF_RCL`, what CT1 executes): `TILE_RENDERING_MODE_CFG` **Common** (64×64, 1 RT,
+  32-bit BPP) → **Clear Colors Part1** (RT0 low-32 = `0x00A68CFF`) → **Color** (RT0 32-bit BPP,
+  internal type `8` = rgba8 unorm, clamp none) → **ZS Clear Values** (ends config) →
+  `TILE_LIST_INITIAL_BLOCK_SIZE` → `MULTICORE_RENDERING_TILE_LIST_SET_BASE` →
+  `MULTICORE_RENDERING_SUPERTILE_CFG` (1×1) → the initial tile-buffer clear (the GFXH-1742 double
+  dummy-store + `CLEAR_TILE_BUFFERS`) → `FLUSH_VCD_CACHE` → `START_ADDRESS_OF_GENERIC_TILE_LIST`
+  (pointing at the sub-list) → `SUPERTILE_COORDINATES(0,0)` → `END_OF_RENDERING` (Halt).
+- **Generic per-tile sub-list** (`OFF_SUBLIST`, branched to per supertile): `TILE_COORDINATES_IMPLICIT`
+  → `END_OF_LOADS` → `PRIM_LIST_FORMAT` (triangles) → `SET_INSTANCEID(0)` → **`STORE_TILE_BUFFER_GENERAL`
+  (RT0 → target, raster, rgba8, 256-byte stride, address at byte 9)** → `CLEAR_TILE_BUFFERS` →
+  `END_OF_TILE_MARKER` → `RETURN_FROM_SUB_LIST`. `BRANCH_TO_IMPLICIT_TILE_LIST` is deliberately omitted
+  (no binned geometry, so the tile-alloc base is never dereferenced).
+
+Every opcode, field bit-offset, size, enum value and packet length is transcribed verbatim from Mesa
+`src/broadcom/cle/v3d_packet_v33.xml` (`gen="3.3" max_ver="42"`); the packing convention (opcode byte
+0, XML `start` bits relative to the bit after the opcode, length = `max(field_end)/8 + 1`) is from
+Mesa `gen_pack_header.py`; the packet ordering is from `src/gallium/drivers/v3d/v3dx_rcl.c`. **Mesa is
+MIT-licensed — verbatim-liftable with attribution** (contrast the Linux-kernel `v3d` GPL-2.0-only
+sources, which remain facts-only; none are used here). The sub-list is `cache::clean_range`d for the
+non-coherent GPU alongside the main list + target.
+
+**CT1CA-reads-0 nuance (carried forward).** boot-P2 showed `CT1CA=0` *after* the malformed run. The
+PI-V3D-5 clue decode treats `CT1CA != BA` as one "ran" witness; if `CT1CA` still latches `0` after this
+*correct* list executes on metal, extend the clue-line decode (CT1CA may latch differently than
+assumed) rather than reading it as job-never-ran — the CLASS label and `SUPERTILE`/store evidence lead.
+
+**Expected boot-P3 lines (metal).** With the block **BLOCK-UP** on silicon: the M3 clue line should now
+report **CLASS-B RAN-NO-FAULT retired** — `CTRUN` latched-then-cleared, no MMU fault — and the verify:
+```
+:: V3D: M3 clear-job PASS (GPU cleared buffer; CPU byte-verified) ::
+```
+i.e. every 32-bit word of the target reads `0x00A68CFF` (the first correct V3D-rendered pixels on the
+Pi), with the panel blit as the visible witness. QEMU `raspi4b` still stops at BLOCK-DOWN (no V3D
+modelled), so this list is correct-by-construction against the cited Mesa sources and refined at the
+attended sitting.
+
+### PI-V3D-7 — CT1CA never left zero: the kick went to fabricated queue-register offsets
+
+**The boot-P3 verdict (2026-07-20, LC-metal R23s1).** With the correct Mesa-shaped RCL aboard
+(`EA=BA+0x16006a`), the M3 clue still read `CT1CS pre=0 kicked=0 done=0 CT0CS=0 CT1CA=0` with
+`MMU_CTL=0x00090801` and every fault bit `0`. PI-V3D-6's RCL is exonerated; the clue's **CLASS-B
+RAN-NO-FAULT** label was **wrong**. `CT1CA` stuck at `0` (never advanced, never `== BA`) together with
+`CTRUN` never observed in any snapshot means the render CLE **never started** — a CLASS-A "job never
+ran", not a job that ran and stored off-target.
+
+**Root cause of the kick failure — fabricated CT1 queue-register offsets.** Submitting a V3D render job
+is: write the list's begin address to `CT1QBA`, then write its end address to `CT1QEA`; the **`CT1QEA`
+write is the CLE's GO trigger** (kernel `v3d_gem`/`v3d_regs.h` submit path). The code had
+`CT1QBA = 0x324` and `CT1QEA = 0x334` — **neither is inside the CLE register block** (which runs
+`0x100`–`0x178`, ending at `CT1QCFG`). The verbatim `v3d_regs.h` slots are `CT0QBA 0x160` / `CT1QBA
+0x164` and `CT0QEA 0x168` / `CT1QEA 0x16c`. The GO write therefore landed on an undefined address; the
+real `CT1QEA` (`0x16c`) never fired, so CT1 never fetched — `CT1CA` stayed `0`, `CTRUN` never latched.
+Same **fabricated-register-offset** class as the PI-V3D-4 MMU-constant bug; `CT1CS 0x104` and `CT1CA
+0x114` were already correct. Fix: correct both queue offsets to the transcribed values (register
+offsets are hardware facts — safe to lift from the GPL-2.0-only header).
+
+**The discriminator fix (the mislabel).** The old "ran" test was `(cs_kicked & CTRUN) || CT1CA != BA`.
+A never-started CLE **also** satisfies `CT1CA != BA`, because its `CT1CA` reads `0` (≠ the non-zero
+`BA`) — a false positive that convicted PI-V3D-6's innocent RCL. Corrected truth table: the CLE ran
+**only** if `CTRUN` was ever observed set (in any of pre/kicked/done) **OR** `CT1CA` actually advanced
+*into* the list range `(BA, EA]` (not sitting at `0` or `BA`). CLASS-A (job never ran) = `CTRUN` never
+observed **AND** `CT1CA` never advanced from `0`/`BA`. CLASS-A is now tested before the `!idled`
+backstop (a never-started CLE also hits the backstop, but "never ran" is the more specific verdict).
+
+**Tighter kick witness.** The kick now samples `CT1CA` (not just `CT1CS`) at three points — before the
+kick (`ca_pre`), immediately after the GO write (`ca_kicked`), and after the poll (`ct1ca`) — with a
+`dsb` between the `QBA` and `QEA` writes so BA is latched before the GO fires. The clue line prints the
+full `CT1CS`/`CT1CA` pre/kicked/done triples plus a decoded `ran=` flag, so boot-P4 is decisive either
+way.
+
+**Expected boot-P4 lines (metal, BLOCK-UP).** With the GO write now reaching the real `CT1QEA`, the M3
+clue should show `CTRUN` latch in `kicked` and `CT1CA` advance off `0` into `(BA, EA]`, then either the
+verify passes or a *new* CLASS (MMU-FAULT / RAN-NO-FAULT) is reported against a CLE that actually ran:
+```
+:: V3D: M3 clue — CT1CS pre=0x… kicked=0x…20 done=0x… CT1CA pre=0x00000000 kicked=0x…(in (BA,EA]) done=0x… CT0CS=0x… (BA=…, EA=…) ran=1 — CLASS-… ::
+:: V3D: M3 clear-job PASS (GPU cleared buffer; CPU byte-verified) ::   (on success)
+```
+A repeat of `CT1CA=0 … ran=0 … CLASS-A` after this fix would mean the block is up but the queue-submit
+path itself is refused on this part (the "does V3D 4.2 need a non-CTnQ submit path" hypothesis) — but
+the submit path here matches exactly what the kernel v3d driver writes for render, so the corrected
+offsets are the expected resolution. QEMU `raspi4b` still stops at BLOCK-DOWN (no V3D modelled).
+
+### PI-V3D-8 — M4: the first triangle (bin on CT0 → render on CT1 → CPU sample-verify)
+
+M1–M3 proved the non-graphics chain and the render side (RCL + tile stores). **M4 adds the binning
+side (CT0)** — the coordinate shader + PTB path that turns vertices into per-tile primitive lists —
+and a render pass that **consumes** those lists via `BRANCH_TO_IMPLICIT_TILE_LIST`. Shape: a single
+64×64 tile / one supertile / one triangle. The M3 clear-job runs first and unchanged as the
+**regression witness**; M4 lives in its own arena regions (all `≥ 0xC000`, all inside the identity MMU
+map) and never touches M3's buffers.
+
+**The pipeline (two kicks).** (1) A **BIN** job on CT0: `NUMBER_OF_LAYERS` → `TILE_BINNING_MODE_CFG`
+(v42) → `FLUSH_VCD_CACHE` → `START_TILE_BINNING` → `VCM_CACHE_SIZE` → `GL_SHADER_STATE` (points at the
+shader-state record) → `VERTEX_ARRAY_PRIMS` (3 verts, mode `TRIANGLES`) → `FLUSH`. Submitted by
+writing the tile-state array to `CT0QMA`/`CT0QMS`, then `CT0QBA` (begin) and `CT0QEA` (**GO**). (2) A
+**RENDER** job on CT1: the M3 RCL structure, but its generic per-tile sub-list now runs
+`BRANCH_TO_IMPLICIT_TILE_LIST` (set 0) so the render executes the binner's geometry before the tile
+store. Clear colour = `CLEAR_RGBA`, so pixels **outside** the triangle read clear and **inside** read
+the fragment-shader colour `TRI_RGBA`. The CPU then samples ≥3 interior points (expect `TRI_RGBA`) and
+≥3 exterior points (expect `CLEAR_RGBA`) and prints the full sample table.
+
+**The CT0 register offsets (the fabricated-offset trap — verified).** `CT0CS 0x100 · CT0CA 0x110 ·
+CT0QBA 0x160 · CT0QEA 0x168 · CT0QMA 0x170 · CT0QMS 0x174`, transcribed VERBATIM from
+`drivers/gpu/drm/v3d/v3d_regs.h` (register offsets are hardware facts). The CT1 side the file already
+trusts (`CT1QBA 0x164`/`CT1QEA 0x16c`) is exactly CT0+4 in every case — the same table.
+
+**The CT0 run/never-ran discriminator.** The PI-V3D-7 idiom is extended to CT0 (`ct0_ran`): the BIN CLE
+RAN iff `CTRUN` was ever observed (pre/kicked/done) **OR** `CT0CA` advanced INTO `(BA, EA]`; a
+never-started CLE has `CTRUN` never seen AND `CT0CA` at `0`/`BA`. Both kicks print a clue line with the
+CS/CA triples + `ran=`/`idled=`/`MMU_fault=`, so the attended sitting is decisive per queue.
+
+**The cosmetic mislabel fix (PI-V3D-5 nit).** The M3 clue's `RAN-NO-FAULT` else-branch asserted "store
+landed off-target" *unconditionally* — so a **successful** run was still clued as class-B. The verify
+now runs before the clue and its result picks the label: a byte-verified store prints **`RAN-OK`**, an
+unverified one keeps the genuine `CLASS-B RAN-NO-FAULT`.
+
+**The QPU shaders — the one metal-refinement seam (honestly flagged).** A binned+rendered triangle
+needs three QPU programs (coordinate, vertex, fragment). Mesa **compiles** these through its VIR→QPU
+backend; it ships no pre-assembled blobs, and QEMU models no V3D, so none of it can be byte-checked
+off-metal. Rather than **fabricate** QPU words (the exact class that convicted the PI-V3D-4 MMU
+constants and the PI-V3D-7 queue offsets — twice), the programs are built through a packer whose
+bit-layout is transcribed from Mesa `src/broadcom/qpu/qpu_pack.c` and **self-checked** against Mesa's
+canonical NOP word `0x3c003186bb800000`. The functional bodies are documented NOP skeletons; producing
+the verified transform/colour instructions is a real V3D-shader-compile step at the attended sitting.
+Everything **around** the shaders — the binning CL, the GL Shader State Record (v42, 36 B) + attribute
+record, the vertex data, the CT0/CT1 kicks and discriminators, the implicit-tile-list render, and the
+sample-verify — is complete and cited. This is M4's code-complete-prior-to-metal standing.
+
+**Expected boot-P5 lines (metal, BLOCK-UP).** M3 still PASSes; the M4 bin clue shows `CTRUN` latch and
+`CT0CA` advance into `(BA,EA]` (`ran=1`); the render clue likewise on CT1; then the sample table. Until
+a real shader is aboard the interior samples will read `CLEAR_RGBA` (`MISS`) — that is the expected
+partial witness that isolates the shader as the remaining work, not a regression:
+```
+:: V3D: M4 bin clue — CT0CS pre=0x… kicked=0x…20 done=0x… CT0CA … (in (BA,EA]) … ran=1 idled=1 MMU_fault=0x0 ::
+:: V3D: M4 render clue — CT1CS … ran=1 idled=1 MMU_fault=0x0 ::
+:: V3D: M4 sample IN  (32,34) = 0x… expect 0x00ffb000 OK|MISS ::
+:: V3D: M4 triangle — PASS (…)   (once a verified shader lands)
+```
+QEMU `raspi4b` still stops at BLOCK-DOWN before any M4 code runs. Packet/register facts: Mesa
+`src/broadcom/cle/v3d_packet.xml` (gen 4.2, `min_ver=42`) + `qpu_pack.c` (MIT, lifted with attribution);
+kernel `v3d_regs.h` register offsets (hardware facts); ordering per `v3dx_draw.c` / `v3dx_rcl.c`.
+
+### PI-V3D-9 — verified QPU shader bodies + the boot-P5 bin-address / render-refusal fix
+
+Boot-P5 ran PI-V3D-8's M4 scaffolding on metal and produced two clues that reshaped this arc:
+
+```
+:: V3D: M4 bin clue    — … CT0CA done=0x200017 (BA=0x200000 EA=0x20001e) ran=1 idled=1 MMU_fault=0x100000 ::
+:: V3D: M4 render clue — … CT1CA done=0x1f806a (BA=0x20a000 EA=0x20a06a) ran=0 idled=1 MMU_fault=0x101000 ::  (all 6 samples = 0x55555555 arena poison)
+```
+
+Two defects, both fixed here (M3 clear-job stayed **RAN-OK** throughout — the MMU/arena base machinery
+was never in doubt):
+
+1. **Bin PT_INVALID (the address fault).** The base wrote the 192-byte tile-**state** region into
+   `CT0QMA/CT0QMS` as if it were the tile-**allocation** pool, and never programmed `CT0QTS`. Per Linux
+   `v3d_sched.c::v3d_bin_job_run` the three are distinct: `CT0QMA/QMS` = the tile-allocation memory the
+   binner grows per-tile lists into, `CT0QTS` (ENABLE = BIT(1), offset `0x15c`) = the tile-state array.
+   A 192-byte "pool" overflowed on the first triangle and the binner walked off into an unmapped page →
+   `PT_INVALID` (bit 20), `CT0CA` halted mid-list. Fixed: `CT0QMA/QMS` ← `OFF_BIN_TILEALLOC`/32 KiB,
+   `CT0QTS` ← tile-state `| ENABLE`; all three bounds-checked into the arena.
+2. **Render refused to start.** `CT1` never latched `CTRUN` (ran=0, `CT1CA` parked at M3's end) while the
+   MMU still carried the latched bin fault (`0x101000` = PT_INVALID + WRITE_VIOLATION) — the abort policy
+   holds it sticky and wedges further submissions. Fixed by clearing the MMU fault latch between bin and
+   render with the exact Linux `v3d_irq.c` idiom (read `V3D_MMU_CTL`, write it back — the fault bits are
+   write-1-to-clear, config bits preserved), plus a `CTRUN` decode on the render clue so a future refusal
+   is unambiguous. With defect 1 fixed no fault is latched, so this is belt-and-suspenders.
+
+**The shader bodies — from NOP skeletons to verified QPU (the arc's named mission).** The three programs
+(coordinate/vertex passthrough, solid-colour fragment) are now real QPU words. Provenance is absolute:
+every 64-bit word is emitted by **Mesa's own packer** `v3d_qpu_instr_pack` (ver 42) from an explicit
+`struct v3d_qpu_instr`, round-tripped through Mesa's unpacker, and the generator
+(`scratchpad/mesa/qpu_gen.c`, links Mesa 26.3.0-devel `qpu_instr.c` + `qpu_pack.c`, MIT) reproduces four
+canonical `qpu_disasm.c` vectors bit-exactly as a self-test. No hand-authored bit patterns — the trap
+that convicted PI-V3D-4 and PI-V3D-7 is structurally avoided.
+
+Shader-provenance table (every word is Mesa-packer output; disasm is Mesa's own):
+
+| Shader | # words | Program (Mesa emit path) | Word encoding verified by |
+|---|---|---|---|
+| Fragment (solid colour → TLB) | 10 | `emit_frag_end` + `vir_emit_tlb_color_write`: 4× `ldunifrf` (rgba→rf0..3), `mov tlbu` passthrough-Z, `vfpack tlbu`/`vfpack tlb` (rgba→f16→TLB), `thrsw`+2 nop | Mesa pack↔unpack round-trip |
+| Coordinate (bin) | 13 | `ntq_emit_vpm_read`+`emit_store_output_vs`+`emit_vert_end`: 4× `ldvpmv_in` (attr→rf0..3), `vpmsetup`, 4× `mov vpm` (pos), `vpmwt`, `thrsw`+2 nop | Mesa pack↔unpack round-trip |
+| Vertex (render) | 13 | same passthrough body as the coordinate variant | Mesa pack↔unpack round-trip |
+
+Self-test vectors reproduced bit-exactly by the generator: `nop` `0x3c003186bb800000`,
+`or rf0,r3,r3;mov vpm,r3` `0x3c002380b6edb000`, `vfpack tlb,r0,r1` `0x3c00318735808000`,
+`fadd r1,r1,r5;thrsw` `0x3c20318105829000`.
+
+**Verification level (honest).** Every word's *encoding* is Mesa-verified. What stays the
+attended-metal-refinement surface — silicon-tuned quantities QEMU cannot exercise, **not** fabrication —
+is: the coordinate viewport transform + exact VPM output layout/segment sizes, the VPM read-offset and
+`vpmsetup` values, and the FS colour-channel order + f16 rounding that lands the stored word exactly on
+`TRI_RGBA` (`0x00ffb000`). Each such quantity is flagged at its uniform/word in `v3d.rs`. Uniform streams
+are wired: FS record uniforms → `[r,g,b,a, Z-config 0xffffff84, colour-config 0xffffff3f]`; CS/VS record
+uniforms → the four VPM read-offsets.
+
+**Expected metal flip (attended sitting).** With the bin/render fixes the render now runs and stores;
+with the shader bodies aboard the samples flip from `0x55555555` poison to: interior `0x00ffb000` (`OK`)
+×3, exterior `CLEAR_RGBA` (`OK`) ×3, and `:: V3D: M4 triangle — PASS ::`. Any residual `MISS` on the
+interior isolates the shader geometry/colour-tuning as the remaining metal-refinement, not a regression.
+
+### PI-V3D-10 — the truncated GL_SHADER_STATE packet + the Halt-instead-of-End-of-Rendering render gate
+
+Boot-P6 (capture `pi4-r23s1/cu.usbmodem141402.log`, 2026-07-21) confirmed the PI-V3D-9 fixes held
+(M3 RAN-OK; CT0 kicked and ran; latch-clear worked; `MMU DEBUG=0x00000550`) but left two new clues:
+
+```
+:: V3D: M4 bin clue — … CT0CA done=0x00200017 (BA=0x00200000 EA=0x0020001e) ran=1 idled=1 MMU_fault=0x100000 ::
+:: V3D: MMU fault-latch CLEARED (post-bin) — … VIO_ADDR=0x04841800 VIO_ID=0x00000081 -> CTL=0x00090801 ::
+:: V3D: M4 render clue — CT1CS … kicked=0x00000050 (CTRUN=0) … CT1CA done=0x001f806a (BA=0x0020a000 …) ran=0 idled=1 MMU_fault=0x0 ::
+```
+
+**Defect 1 — the out-of-arena bin fault was our own next opcode byte.** Decode (facts from Linux
+`v3d_irq.c` + `v3d_drv.c`): the violating client is `VIO_ID >> 5` = `0x81 >> 5` = **4 = CLE**
+(`{L2T, PTB, PSE, TLB, CLE, TFU, MMU, GMP}` on V3D 4.1+), and `VIO_ADDR` holds the VA right-shifted by
+`va_width − 32`, where `va_width = 30 + DEBUG_INFO[7:4]` — boot-P6's `DEBUG=0x550` gives va_width 35,
+shift 3, so the true faulting VA = `0x04841800 << 3` = **`0x2420C000`** = `0x24 << 24 | 0x20C000`. The
+low bits are exactly the GL Shader State Record (arena+0x1C000 = `0x20C000`); the `0x24` on top is the
+opcode of the *following* packet, `VERTEX_ARRAY_PRIMS` (36 = 0x24). Root cause: the `GL_SHADER_STATE`
+packet (code 64) was emitted with length **4** — opcode + three payload bytes — but its address field
+spans XML bits [5, 31], making the packet **5 bytes**. The CLE consumed `0x24` as the record address's
+top byte and fetched the shader record at `0x2420C000` → `PT_INVALID`. (The "POR-shaped garbage" the
+brief suspected was our own byte stream.) Fixed: packet length 4 → 5.
+
+**Defect 2 — the render-kick gate was the M3 list's terminator.** `P_END_OF_RENDERING` was defined as
+**0 — the Halt opcode** — mislabeled "Mesa END_OF_RENDERING". In `v3d_packet.xml` they are distinct:
+code 0 = `Halt`, code **13** = `End of rendering` (`end_render`), and both Mesa drivers
+(`v3dx_rcl.c:944`, `v3dvx_cmd_buffer.c:1297`) terminate every RCL with END_OF_RENDERING, never Halt.
+END_OF_RENDERING completes the *frame* — the CLE returns to idle and the next queued CT1 job may
+dispatch; Halt merely stops the CLE with the frame still open. M3's Halt-terminated list therefore
+byte-verified (its store had already landed) but left CT1 wedged: M4's `CT1QEA` write was accepted
+(CS `0x50`) yet `CTRUN` never set and `CT1CA` stayed parked at M3's end `0x001f806a`. The P5
+"must ack the MMU latch" hypothesis stays refuted — the latch was clear and the refusal persisted.
+Fixed: `P_END_OF_RENDERING` 0 → 13 (both the M3 and M4 lists pick it up). Same fabricated-value class
+as PI-V3D-4/-7.
+
+Witness upgrade: the fault-latch clear line now self-decodes `VIO_ID`/`VIO_ADDR` into
+`(client NAME @ VA 0xXXXX)` using the live `DEBUG_INFO` va-width, so the next sitting reads the true
+faulting address directly. Quiet-boot unchanged — the decode prints only inside the existing
+fault-latched path. Expected metal flip: bin completes with `MMU_fault=0x0` and `CT0CA=EA`; render
+latches `CTRUN` and walks `[BA, EA)`; samples flip from `0x55555555` poison toward the PI-V3D-9
+expectations (any residual interior `MISS` isolates shader geometry/colour tuning, per V3D-9).
+
 ### References of record
 
 - Register layout: Linux `drivers/gpu/drm/v3d/v3d_regs.h` (hub + core + MMU offsets, field bits).
+- Bin-job register programming (PI-V3D-9): Linux `drivers/gpu/drm/v3d/v3d_sched.c` (`v3d_bin_job_run`:
+  `CT0QMA/QMS` = tile-alloc pool, `CT0QTS` `| ENABLE` = tile-state) + `v3d_irq.c` (MMU fault clear =
+  echo `V3D_MMU_CTL`). Register OFFSETS/bits are hardware facts (GPL-2.0-only header, facts-only).
+- QPU shader words (PI-V3D-9): generated by Mesa's own `v3d_qpu_instr_pack` (ver 42) via
+  `scratchpad/mesa/qpu_gen.c`; round-tripped + cross-checked against `src/broadcom/qpu/tests/qpu_disasm.c`.
+  Emit paths: `src/broadcom/compiler/nir_to_vir.c` (`emit_frag_end`, `vir_emit_tlb_color_write`,
+  `ntq_emit_vpm_read`, `emit_store_output_vs`, `emit_vert_end`). **MIT — used with attribution.**
 - V3D MMU: Linux `drivers/gpu/drm/v3d/v3d_mmu.c` (flat page table, PTE bits, flush sequence).
 - Render-control-list packets: Mesa `src/broadcom/cle/v3d_packet_v33.xml` (4.2 encodings — the
-  VC4-era packet numbers/sizes do **not** transfer).
+  VC4-era packet numbers/sizes do **not** transfer) + `gen_pack_header.py` (the opcode-byte / bit-offset
+  packing convention). **MIT — liftable with attribution** (PI-V3D-6).
+- Render-control-list ordering: Mesa `src/gallium/drivers/v3d/v3dx_rcl.c` (`v3dX(emit_rcl)`,
+  `emit_render_layer`, `v3d_rcl_emit_generic_per_tile_list`) — the packet sequence PI-V3D-6 follows.
+- Binning-list packets + shader/attribute records (PI-V3D-8): Mesa `src/broadcom/cle/v3d_packet.xml`
+  (gen 4.2, `min_ver=42` — `TILE_BINNING_MODE_CFG` 120, `START_TILE_BINNING` 6, `VERTEX_ARRAY_PRIMS` 36,
+  `GL_SHADER_STATE` 64, `VCM_CACHE_SIZE` 71, `BRANCH_TO_IMPLICIT_TILE_LIST` 21; structs "GL Shader State
+  Record" v42 + "GL Shader State Attribute Record"). Ordering per `v3dx_draw.c` (`v3dX(start_binning)`,
+  `v3dX(draw_vbo)`). **MIT — liftable with attribution.**
+- QPU instruction encoding (PI-V3D-8): Mesa `src/broadcom/qpu/qpu_pack.c` (the `V3D_QPU_*_SHIFT/_MASK`
+  field layout; canonical NOP `0x3c003186bb800000`, the packer self-check). **MIT — liftable with
+  attribution.** Kernel v3d (GPL-2.0-only) used for register OFFSETS only (hardware facts).
 - Structure reference: librerpi/lk-overlay `v3d.c`.
 - PM / ASB power sequence (PI-V3D-3): Linux `drivers/soc/bcm/bcm2835-power.c` (`bcm2835_asb_power_on`,
   `bcm2835_asb_control`; `PM_GRAFX`/`PM_V3DRSTN`/`PM_PASSWORD`, `ASB_V3D_{S,M}_CTRL`/`ASB_REQ_STOP`/
@@ -6600,6 +7187,46 @@ The new QEMU chain (verbatim), between the gate-enable and the probe:
 `./arroyo kernel8-test 43` = 46/46; **knob-off `kernel8.img` byte-identical to baseline `03105f0`**
 (sha256 recorded in the landing report). Positive V3D verification (power/clock/IDENT live, MMU
 program, GPU clear, panel blit) is the **attended Pi sitting** — see `scripts/pi-v3d-bench.md`.
+
+### PI-V3D-11 — the visible graphics battery (M5 gradient → M6 animate → M7 multiprim → M8 blit)
+
+The first triangle is a witness; PI-V3D-11 makes the GPU visibly **work** on glass. Four short stages,
+each with a one-line gated serial verdict (`:: V3D: M<stage> PASS/FAIL <counters> ::`) plus an eyeball
+verdict at the attended sitting. Everything is **additive** on the M4 scaffold — new arena regions
+(`0x21000..0x34000`, above the M4 regions, inside the identity MMU map), new parameterised builders
+(`build_shader_record_at`, `build_bin_cl_at`, `build_battery_rcl`) and a shared `kick_bin_render`
+that **mirrors** (not modifies) the M4 CT0→CT1 kick idiom, and one call in `bringup` after
+`triangle_job`. The M3 clear + M4 triangle stay byte-identical as the head-of-battery regressions.
+ATTENDED-METAL-UNVERIFIED throughout (QEMU raspi4b returns at BLOCK-DOWN).
+
+- **M5 gradient triangle** — per-vertex colour varyings (red/green/blue corners) through the QPU
+  varying path: interleaved pos+colour vertex data (stride 32), a two-attribute shader record with
+  4 FS varyings, a widened 8-word VPM passthrough VS, and an `ldvary`-based FS. New QPU words are
+  derived from the PI-V3D-9 Mesa-verified vectors by **single-field surgery only** where the field's
+  encoding is corroborated by multiple in-file verified words (SIG values 1/12 corroborate the sig
+  map that gives ldvary=8; the ldunifrf.rf0..rf3/rf5 words corroborate the sig-dest addr field; the
+  ldvpmv/mov-vpm sequences corroborate WADDR_A/RADDR_A) — the thrice-convicted fabrication class is
+  avoided. Honest seam: the raw ldvary A-coefficients are written to the TLB without the
+  fmul/fadd(W, C) interpolation evaluation, so the M5 verdict requires three **pairwise-distinct,
+  non-clear** interior samples (not colour-exact values); the interpolation math is the flagged
+  metal refinement.
+- **M6 animated triangle** — 144 rotation frames (24-step precomputed cos/sin table, 6 revolutions)
+  + a final identity-pose frame, re-recording the vertex data and re-kicking bin+render per frame at
+  ~30 ms (~5 s on glass, blitted live below the M3 slot). Uses the **verified** M4 solid-colour
+  shaders untouched. Verdict counts clean frames and ORs per-frame MMU fault bits (a quiet
+  `clear_mmu_fault_latch_quiet` keeps the 145-frame loop off the serial log — quiet-boot law), then
+  sample-verifies the identity frame (centroid = `TRI_RGBA`, corner = `CLEAR_RGBA`).
+- **M7 multi-primitive frame** — a 12-wedge pinwheel (R=0.8) in four colours via **four draws in one
+  binning list** (per-draw `GL_SHADER_STATE` + `VERTEX_ARRAY_PRIMS` with first-vertex offsets), each
+  draw's shader record pointing at its own FS uniform stream — multi-colour with zero new QPU words.
+  Verdict: four mid-wedge samples live (≠ clear, ≠ sentinel; exact colour↔quadrant mapping rides the
+  viewport seam) + two rim corners = clear.
+- **M8 blit to scanout** — composites the battery target onto the live framebuffer console (bounded
+  64×64 slot; the GUI stays usable) and volatile-reads three probe pixels back **from panel memory**,
+  comparing against the source — the end-to-end GPU→glass witness.
+
+Stage independence: a FAIL prints its verdict and the battery continues (every stage is a witness the
+sitting wants). SError drains bracket each stage's kick window, same as M3/M4.
 
 ## PI-USB — BCM2711 PCIe root complex + VL805 xHCI attach on the Pi 4 (Arc PI-USB-1)
 
@@ -6635,26 +7262,190 @@ the RC.
   program the **inbound DMA BAR** (`RC_BAR2` → RAM base 0, 4 GiB) and the **outbound MEM window**
   (`CPU_2_PCIE_MEM_WIN0_*`: CPU `0x6_0000_0000` decodes PCIe `0xC000_0000`, 1 GiB — the canonical Pi 4
   `ranges`), deassert PERST, and **poll link-up** (`PCIE_MISC_PCIE_STATUS` PHYLINKUP|DL_ACTIVE) with a
-  finite ~100 ms backstop. An honest link-DOWN says so and returns — never a hang. Reads the root-port
+  finite ~100 ms backstop. *(PIUSB-3, boot-P1 fix)* The two outbound-window register groups map **opposite**
+  address spaces and must not be crossed: `WIN0_LO`/`WIN0_HI` hold the **PCIe-side** target address the
+  window translates TO (`0xC000_0000`), while `BASE_LIMIT` + `BASE_HI` + `LIMIT_HI` hold the **CPU-side**
+  address range the RC MATCHES against (`0x6_0000_0000 .. 0x6_3FFF_FFFF`, in 1 MiB units — `0x6000` MiB, so
+  the high MiB-bits carry bit 34 into `BASE_HI`/`LIMIT_HI`, shifted right 12). boot-P1 had these swapped
+  (CPU base in `WIN0_LO/HI`, PCIe range in `BASE_LIMIT`), so the RC never claimed `0x6_0000_0000` and the
+  CAP read returned the master-abort fill `0xdeaddead`. Every window register (outbound five + `RC_BAR2`
+  pair) is now **read back and witnessed** in the boot log (the ORIN readback ritual) with a `WIN0 armed:
+  YES/NO` verdict line.
+  An honest link-DOWN says so and returns — never a hang. Reads the root-port
   identity (expect Broadcom `0x14e4`) from RC config space.
 - **M2 — VL805 enumeration.** Child config via the brcmstb `EXT_CFG_INDEX`/`EXT_CFG_DATA` window (bus 1,
-  dev 0, fn 0): verify identity `1106:3483` (poison-rejecting), read class (expect `0c/03/30` USB xHCI),
-  run the **BAR-sizing ritual** on BAR0 (all-ones probe + **immediate restore** — the ORIN-NET-3 pattern),
-  assign BAR0 to the outbound window's PCIe base, enable MEM decode + bus-master, and issue the
-  **`NOTIFY_XHCI_RESET`** mailbox (tag `0x00030058`, `dev_addr = 0x0010_0000`) so the VideoCore firmware
-  (re)loads the VL805 firmware — the RPi bootloader normally does this from SPI EEPROM at power-on; an OS
-  bringing the controller up itself re-issues it.
+  dev 0, fn 0): verify identity `1106:3483` (poison-rejecting), read class (expect `0c/03/30` USB xHCI).
+  *(PIUSB-4, boot-P2 — superseded by PIUSB-15 below; the notify-first order was reversed after boot-P25)*
+  PIUSB-4 issued the **`NOTIFY_XHCI_RESET`** mailbox (tag `0x00030058`,
+  `dev_addr = 0x0010_0000` = `(bus1<<20)|(dev0<<15)|(fn0<<12)`) **FIRST**, then sized + assigned BAR0 +
+  enabled decode — on the theory the reload wipes config space. **PIUSB-15 reverses this:** BAR0 is now
+  assigned + MMIO-verified BEFORE the notify (boot-P25 showed the fw push needs a live BAR); see the
+  PIUSB-15 entry. The historical PIUSB-4 rationale is retained below for the record. The notify makes the VideoCore firmware (re)load the VL805 firmware,
+  which **resets the VL805's PCI config space** — BAR0 and COMMAND revert to power-on defaults. boot-P2 had
+  the arm CPU-side window correct (`WIN0 armed: YES`) yet still read `0xdeaddead`, because the old order
+  assigned BAR0 + enabled COMMAND and only *then* issued the notify, so the firmware reload wiped both and
+  the VL805 decoded at BAR=0 (not PCIe `0xC000_0000`) → master-abort fill device-side. Linux avoids this by
+  running the VL805 firmware load as a `DECLARE_PCI_FIXUP_HEADER` — *before* PCI-core resource assignment;
+  we mirror that order. After the notify (+settle) the device identity is **re-read** (mailbox SUCCESS ≠
+  firmware running — the config re-read is the proof), then the **BAR-sizing ritual** on BAR0 (all-ones
+  probe + **immediate restore** — the ORIN-NET-3 pattern), BAR0 assigned to the outbound window's PCIe base
+  with **`[0x14]` written explicitly (=0)** and **both dwords read back + witnessed**, MEM decode +
+  bus-master enabled with **COMMAND read back + witnessed**. Three witness layers (BAR dwords / post-notify
+  survival / COMMAND) name the failing layer if the wall persists.
 - **M3 — xHCI attach.** Map the outbound window Device-nGnRnE via `boot::map_device_1gib` (one L1 block
   for CPU `0x6_0000_0000`; the **only** new page-table write this arc makes — outside `build_l1`'s fixed
   0–4 GiB map, reachable under the 36-bit IPS / 39-bit VA). Read `CAPLENGTH`/`HCIVERSION`/`HCSPARAMS1`
   (poison-rejecting), attach the shared `drivers/xhci` in **polled** mode (`xhci::init` = halt + HCRST +
   CNR wait — heap-free, no ring allocation), set `PORTSC.PP` on each root port, and **stop** at the
   honesty line. This is the JB2b platform-attach pattern (`xusb_tegra.rs`) adapted to a PCIe-BAR base.
+  *(PIUSB-4)* The first CAP read is a **bounded settle+retry** (up to 8 tries, 5 ms apart — the ORIN
+  readback-ritual idiom) so a just-enabled decode path that answers a few cycles late is not misread as
+  poison; a still-poisoned read after the budget is an honest fail-closed, never a hang.
+
+### PIUSB-5 — pre-reset reference dump (the boot-P3 wall)
+
+boot-P3 **refuted all three PIUSB-4 hypotheses by their own witnesses**: notify-first ordering held
+(`post-NOTIFY cfg[0x00]` live — device survived), `BAR0 [0x10]=0xc0000004 → LATCHED`, `COMMAND=0x0146 →
+DECODE ENABLED`, `WIN0 armed: YES` — and the CAP read at CPU `0x6_0000_0000` was **still `0xdeaddead`
+after 8 tries**. Config cycles reach the device; memory cycles vanish. Yet the ROM boot spew shows the
+**VideoCore firmware itself reading this xHC** (`xHC ver: 256 HCS: 05000420`) moments before we run — a
+working configuration provably exists on this silicon. The one state we never inspected is the one the
+firmware **left**, because M1's first act (`RGR1_SW_INIT_1 |= INIT_GENERIC|PERST`) destroys it.
+
+- **Reference dump FIRST, reset SECOND** (`dump_firmware_state`, read-only, after the DTB census and
+  before M1). Dumps the as-left RC bridge/window state (`RGR1_SW_INIT_1`, `PCIE_STATUS`, bus window,
+  `WIN0 LO/HI/BASE_LIMIT/BASE_HI/LIMIT_HI`, `RC_BAR2`). **No register is written.**
+
+### PIUSB-6 — the firmware left the RC in reset: link-down MMIO gate; adopt retired; SCB/RC_BAR2 order fixed (boot-P4)
+
+**boot-P4 delivered the verdict.** The pre-reset dump ran and answered: the VideoCore firmware leaves the
+RC **fully in reset** — `RGR1_SW_INIT_1=0x00000003 PCIE_STATUS=0x00000000 (PHYLINKUP=false
+DL_ACTIVE=false)`, `WIN0` all-zero, `RC_BAR2` zero, and `fw VL805 cfg: id=0x00000000 — no live child
+config`. There is **no firmware-left working decode to adopt** on this platform: the VideoCore tears PCIe
+down before handoff; its working config exists only during firmware runtime. Three PIUSB-6 changes follow.
+
+- **Adopt-don't-reset is RETIRED.** The adopt branch, its `UNAOS_PIUSB_ADOPT` knob, `adopt_ensure_decode`,
+  and the `decode_fw_win0_cpu_base` WIN0 decode are removed. The dump is kept **only** as a one-boot-proven
+  read-only record; the bring-up always takes the reset path.
+- **Never MMIO a link-down RC (the boot-P4 hazard).** The original dump went on to CAP-read the outbound
+  window even with the link down. An MMIO into a link-down RC does **not** fault — it **stalls the CPU on
+  the bus** for a pathologically long time (boot-P4 looked frozen; a power-cycled rerun eventually returned
+  `0x0`). `dump_firmware_state` now **hard-gates on `PHYLINKUP && DL_ACTIVE`**: it reads only the RC's own
+  register block, and if the link is down it witnesses the RC claim regs and returns with
+  `fw left RC in reset — nothing to adopt/probe …` — **no** child-config or CAP MMIO. The post-bring-up CAP
+  path (`m3_attach_xhci`) carries the same belt gate (refuses the probe if the link dropped since M1).
+- **SCB0_SIZE / RC_BAR2 ordering — FIXED (now the live wall hypothesis).** `witness_rc_cpu_claim` flagged
+  that M1 wrote `RC_BAR2` (a 4 GiB inbound window, size-code `0x11`) with `SCB0_SIZE` left at the
+  firmware/reset default — the inbound window sized **ahead of** the SCB (system-cache-bus) window that
+  backs it, and the RC will not claim an inbound region larger than its programmed SCB size. M1 step **(d)**
+  now sizes `PCIE_MISC_MISC_CTRL.SCB0_SIZE` (bits `[31:27]`) to `0x11` (same `log2(size)-15` encode as the
+  ibar size-code — 4 GiB ⇒ `0x11` in **both** fields) **before** programming `RC_BAR2` in step **(e)**,
+  read-modify-write preserving every other `MISC_CTRL` bit, with a `MISC_CTRL readback … → SIZED` witness.
+  This matches the documented BCM2711 order (facts-only; `pcie-brcmstb.c` is GPL-2.0-only).
+
+**Unclaimed vs master-abort breadcrumb.** A **pre**-bring-up read at `0x6_0000_0000` returns `0x00000000`
+(the RC does not yet **claim** that CPU address — unclaimed), whereas a **post**-bring-up read returns
+`0xdeaddead` (the RC claims it but **master-aborts** forwarding it downstream). The difference localises
+the wall: pre-reset it is the RC's address claim; post-reset it is downstream of the RC (the BAR).
 
 **Write discipline (the review lens).** The arc's writes are confined to the BCM2711 RC register block
-and the VL805's own config/BAR; every BAR-sizing probe restores its original immediately; no other
-device is touched. Every liveness read rejects both `0xffffffff` (PCIe master-abort / open-bus) and
-`0xdeadbeef` (firmware fill) as ABSENT DECODE — the **PI-V3D-1 poison-rejection rule**.
+(now including the scoped `MISC_CTRL.SCB0_SIZE` RMW) and the VL805's own config/BAR; every BAR-sizing
+probe restores its original immediately; the dump is **read-only**; no other device is touched. Every
+liveness read rejects both `0xffffffff` (PCIe master-abort / open-bus) and `0xdeadbeef` (firmware fill) as
+ABSENT DECODE — the **PI-V3D-1 poison-rejection rule**.
+
+### PIUSB-7 — the wall was memory FORWARDING, not the outbound window (boot-P5/P6)
+
+**boot-P5/P6 handed over a fully green config path and a still-dead memory path.** Every layer the prior
+arcs armed reads back correct on metal: `M1: LINK UP (PCIE_STATUS=0x000000b0)`, root port `14e4:2711`,
+RP bus window latched, `MISC_CTRL … SCB0_SIZE=0x11 → SIZED`, `WIN0 armed: YES`, `VL805 FOUND
+1106:3483` (class `0c/03/30`), `NOTIFY_XHCI_RESET SUCCESS`, `post-NOTIFY cfg[0x00]` live, `BAR0
+[0x10]=0xc0000004 → LATCHED`, `COMMAND=0x0146 → DECODE ENABLED` — yet the CAP read at CPU
+`0x6_0000_0000` is **still `0xdeaddead` after 8 tries**.
+
+**Hypothesis ranking (PIUSB-7).**
+- **(a) Outbound window misprogramming — REFUTED.** The `CPU_2_PCIE_MEM_WIN0` math was re-audited
+  register-for-register against Linux `pcie-brcmstb.c brcm_pcie_set_outbound_win`. The masks are
+  `BASE_LIMIT_BASE_MASK=0xfff0` (base in `[15:4]`), `BASE_LIMIT_LIMIT_MASK=0xfff00000` (limit in
+  `[31:20]`), `high_addr_shift = hweight32(0xfff0) = 12`. Our code writes `(limit_mb<<20)|(base_mb<<4)`
+  with `BASE_HI/LIMIT_HI = mb>>12` — **exactly** Linux. The metal readbacks confirm it latched
+  (`BASE_LIMIT=0x3ff00000 BASE_HI=0x6 LIMIT_HI=0x6` ⇒ the RC claims CPU `0x6_0000_0000..0x6_3fff_ffff`).
+  The outbound window is correct; it is **not** the wall.
+- **(b) NOTIFY/PERST ordering — weak.** The device answers config *after* the notify (`post-NOTIFY
+  cfg[0x00]` live), so the firmware is loaded enough to respond; a pure *memory*-only abort while config
+  works is not explained by firmware-not-running.
+- **(c) SSC / L1-substate — weakest.** The link is up and stable and config is clean; not an electrical
+  or link-state fault.
+- **(d) Root-port bridge MEMORY-forwarding window unprogrammed — CONFIRMED (the fix).** Config and memory
+  reach the VL805 by **different gates** in the root-port PCI-to-PCI bridge. Config forwarding is governed
+  by the **bus-number** window (config `0x18` — fixed in the R22 sitting-2 arc, which is *why config works*).
+  Memory forwarding is governed by the type-1 **Memory Base/Limit** window (config `0x20`) **and** the
+  bridge's own **COMMAND Memory-Space-Enable**. Both were still at power-on defaults: Memory Base/Limit
+  `0/0` (a base>limit "forward nothing" window for our `0xc0000000` target), RP COMMAND MEM=0. So the
+  CPU→PCIe memory TLP is translated by `WIN0` onto bus 0, reaches the root port, and is **dropped** (not
+  forwarded to bus 1) → master-abort fill `0xdeaddead`. This is the **exact memory-forwarding analogue**
+  of the `0x18` bus-window fix. Linux never hits it because `pci_setup_bridge()` programs the bridge memory
+  window from the child bus's assigned resources; we ARE the enumerator, so we program it ourselves.
+
+**The fix (M2, before the M3 memory access).** Right after the `0x18` bus-window write:
+- **RP Memory Base/Limit (config `0x20`)** := cover `[0xc0000000, 0xffffffff]` — base A[31:20]=`0xc00`
+  in `[15:4]`, limit A[31:20]=`0xfff` in `[31:20]` ⇒ dword `0xfff0c000`, read back + witnessed.
+- **Prefetchable-memory window (`0x24`)** := disabled (base>limit; our BAR0 is non-prefetchable MMIO so it
+  must ride the `0x20` window), upper-32 base/limit (`0x28`/`0x2c`) := 0.
+- **RP COMMAND (config `0x04`)** := MEM + Bus-Master enable (RMW), read back + witnessed — a bridge forwards
+  downstream memory only while its own Memory-Space-Enable is set.
+
+All writes stay within the BCM2711 RC register block (RP config is type-1 at `RC_BASE` directly, no
+`EXT_CFG` indirection) and the VL805's own config/BAR — no protection weakened, poison-rejection intact.
+
+**The witnesses one metal boot must decide.** Look for, in order: `RP mem window readback [0x20] =
+0xfff0c000 → LATCHED`, `RP COMMAND readback = 0x0146 (MEM=1 BusMaster=1) → RP MEM-FORWARDING ENABLED`,
+then the CAP first-dword at `0x6_0000_0000`. If PIUSB-7 is right, that CAP read now returns a **live**
+xHCI cap dword (`xHCI DECODING: CAPLENGTH=… HCIVERSION=0x0100 …`) instead of `0xdeaddead`, and the
+honesty line is reached. If it is still `0xdeaddead` with the two new witnesses green, the wall is
+downstream of the bridge (the VL805's own decode / firmware) — hypothesis (b) is re-opened.
+
+**HID follow-on (NOT this arc).** Once CAP decodes, `piusb::enumerate()` (post-heap) already builds
+rings + RS=1 and runs the polled pump; the keyboard/mouse **HID report parsing** rides the shared
+`drivers/xhci` HID FSM (the JB2b `keyboard_state==3` armed predicate). The follow-on arc needs: a live CAP
+(this arc), then a connected device on a powered port to drive `service_enum`/`service_hid_setproto`
+through ADDRESS_DEVICE to armed — an attended metal sitting with a real keyboard + mouse plugged in.
+
+### PIUSB-11 — reload the VL805 firmware immediately before every HCRST (boot-P18..P21)
+
+**The wall.** boot-P18..P21 (metal) showed the VL805 hardware alive — CAP regs read real values
+(`CAPLENGTH=32 HCIVERSION=0x0100`), `PORTSC` reports real connect status, config space answers — yet
+**every operational-register write is dropped**: `USBSTS.CNR` (Controller Not Ready) stays 1 forever
+(P20: `USBSTS=0x811`), so CRCR/DCBAAP/ERST/RS never latch and PIUSB-10's spec-mandated CNR wait times
+out (~2.5 s budget). The controller is alive but its **internal firmware never booted**.
+
+**Board.** boardrev `d03115` decodes to a **Pi 4B, BCM2711, Sony UK, 8 GB, rev 1.5** (mem nibble
+`d`=8 GB; type `0x11`=4B; proc `3`=BCM2711; PCB rev `5`). Rev **≥ 1.4** ⇒ the VL805 has **no dedicated
+SPI EEPROM**; its firmware is loaded from the main bootloader EEPROM by the VideoCore, and the mailbox
+`NOTIFY_XHCI_RESET` is the **only** way to (re)load it. M1's PERST cycle (a PCIe fundamental reset) is
+exactly the "PCI reset [that] resets the VL805 requiring the firmware to be reloaded" that Linux's
+`drivers/reset/reset-raspberrypi.c` documents — so after M1 the fw is DOWN.
+
+**The Linux sequence (authoritative).** `drivers/usb/host/xhci-pci.c` `xhci_pci_common_probe()` calls
+`reset_control_reset(reset)` as the **first act of probe** — on the Pi 4 that lands in
+`rpi_reset_reset()` (`drivers/reset/reset-raspberrypi.c`), which issues `RPI_FIRMWARE_NOTIFY_XHCI_RESET`
+with a hardwired `dev_addr = 0x100000` (`PCI_BUS<<20|PCI_SLOT<<15|PCI_FUNC<<12`), checks only the return
+code (no fw-already-loaded probe, no dev_addr echo check), then `usleep_range(200,1000)`. **Immediately
+after**, `usb_hcd_pci_probe()` → `xhci_gen_setup()` runs the xHCI HCRST. So Linux **reloads the VL805
+firmware on every probe, right before every HCRST**.
+
+**Our bug vs Linux.** We issued a single early NOTIFY (M2, pre-heap) then HCRST'd the controller
+**twice with no intervening NOTIFY** — M3 (pre-heap) and `enumerate()` (post-heap, **seconds** later
+after heap/AP/eMMC bring-up). A controller whose firmware is not running when HCRST completes wedges
+`CNR=1`. Fix: `notify_before_reset()` re-issues the mailbox NOTIFY immediately before each halt+HCRST
+(M3 + enumerate), settles (≥ Linux's 200 µs–1 ms), then **re-asserts the VL805 decode path**
+(`BAR0 = OUTBOUND_PCIE_BASE` + MEM/BM) because the fw reload resets config space (PIUSB-4). PIUSB-10's
+CNR wait stays the verdict gate; `mailbox::notify_xhci_reset` now returns `(ok, echo)` so each boot
+logs `NOTIFY (pre-reset, …) rc=… echo=…`. In-lane: `piusb.rs` + `mailbox.rs`; `drivers/xhci` untouched.
+
+**Metal expectation.** CNR clears after the re-timed NOTIFY → real op-register readbacks → enable-slot →
+keyboard. QEMU raspi4b models no PCIe RC, so both new paths sit behind the DTB-census honesty-line gate
+(clean skip, byte-identity preserved).
 
 ### Byte-identity call sites
 
@@ -6679,6 +7470,127 @@ byte-identical to baseline** (sha256 in the landing report); knob-on `UNAOS_PIUS
 `UNAOS_GICV3=1 ./arroyo test-arm 40`, `./arroyo test 22` all unregressed. Positive verification (RC link
 up, VL805 `1106:3483` found, BAR sized, xHCI decoding, ports powered) is the **attended Pi sitting** —
 see `scripts/pi-usb1-bench.md`.
+
+### PIUSB-15 — assign + MMIO-verify BAR0 BEFORE NOTIFY; the PIUSB-4 order is reversed (boot-P25)
+
+**The confounder.** PIUSB-4 ruled "NOTIFY first, BAR after — the fw reload wipes config space, so
+assigning before is pointless." boot-P25 (PIUSB-14's real boundary capture) refutes that ruling, and
+since it predates the PIUSB-7 RP mem window + this boundary data it is **not binding**:
+
+- At NOTIFY time the VL805 `BAR0 = [0x00000004 0x00000000]` — **UNASSIGNED** (the prior code deferred BAR
+  assignment until after the notify).
+- The VC nonetheless **reached the device and set VL805 `COMMAND` MEM+BM itself** (`0x0000 → 0x0146`), so
+  the config-forwarding path was live at notify time — yet BAR0 stayed unassigned and `USBSTS.CNR` stayed
+  1 through the full wait. The controller was **never loaded**.
+- M3-MMIO `CAP[0]=0x01000020 USBSTS=0x00000801` unchanged across the notify — the load never touched the
+  controller.
+
+**Derived conclusion (acted on).** The VC's fw-load path writes the VL805 firmware image **through the
+device's BAR0** (an MMIO push). With BAR0 unassigned there is no address to push through, so the handler
+enables `COMMAND` and exits **without loading**. In Linux, PCI enumeration assigns the VL805's BAR0
+**before** `rpi_firmware_init_vl805`'s NOTIFY fires. We are the enumerator, so M2 now mirrors that order:
+**size + assign BAR0** into the RP mem window, **enable MEM+BM**, **verify an MMIO `CAP[0]` read decodes**
+through the new BAR (the xHCI capability registers are hardware-fixed and decode as soon as BAR0+MEM are
+set — CNR tracks fw readiness separately), and **only then** issue `NOTIFY_XHCI_RESET`. After the notify a
+**BAR0-retention witness** compares the assigned value against the post-notify read; if the load reverted
+config space, `reassert_vl805_decode()` re-programs BAR0+COMMAND (the PIUSB-4 concern kept as a witness,
+not a reason to defer). The M3 pre-HCRST NOTIFY re-issue already runs with BAR0 assigned (M2) and after
+its own CAP verify, so it needs no reorder. One authoritative BAR-assignment path; PIUSB-10's CNR wait
+stays the verdict gate. In-lane: `piusb.rs` only; `drivers/xhci` + `mailbox.rs` untouched.
+
+**Metal discrimination (next boot).** (a) `CAP[0]` LIVE pre-NOTIFY + CNR clears → the load ran through
+the BAR; PIUSB-13's `[enum]` walks the keyboard. (b) BAR0 changed across NOTIFY + re-program + CNR clears
+→ same, load reverts config space (retention witness names it). (c) BAR0 assigned + `CAP[0]` MMIO-verified
+at notify time + CNR still 1 → the load path is **not** BAR-MMIO (next theory: the VC uses its own
+translation/DMA for the push) — report, do not flail. QEMU raspi4b models no PCIe RC, so the whole path
+sits behind the DTB-census honesty-line gate (clean skip, byte-identity preserved).
+
+### PIUSB-17 — align the M1 PERST reset to Linux `brcm_pcie_start_link` (the device-ready window)
+
+**What the P21–P27 metal set closed, and what it left.** By P27, PIUSB-15's discrimination outcome **(c)**
+had fired on silicon: BAR0 assigned, `COMMAND` MEM+BM set, an MMIO `CAP[0]=0x01000020` read LIVE through the
+BAR *before* NOTIFY, the `NOTIFY_XHCI_RESET` tag **honoured** (`tag_code` bit31 set, echo 0) — yet
+`USBSTS.CNR` never clears and `USBCMD.HCRST` never completes. The controller accepts every MMIO read (PCIe
+core alive) but its firmware state machine never runs (8051 dead). Every mailbox/BAR/firmware-blob theory is
+refuted: stock RPi OS on this same board makes USB work, Linux cold-builds the same RC (VideoCore leaves it
+in reset there too) and Linux's NOTIFY load works. So the delta is strictly between our cold-build+NOTIFY
+sequence and Linux's — a **null-hypothesis, our-sequence** search.
+
+**The verified Linux ordering (facts of record).**
+- The VL805 firmware load is `rpi_firmware_init_vl805(pdev)`, called from `quirk_usb_early_handoff` in
+  `drivers/usb/host/pci-quirks.c`, registered `DECLARE_PCI_FIXUP_CLASS_FINAL(…, PCI_CLASS_SERIAL_USB, 8, …)`.
+  A **FINAL** class fixup runs at `pci_bus_add_device`, i.e. **after** PCI resource/BAR assignment. So Linux
+  issues NOTIFY with the VL805's BAR0 **already assigned** — **PIUSB-15's central assumption survives**
+  (BAR-assigned-then-NOTIFY is Linux's order, not an inversion). `dev_addr = (bus<<20)|(slot<<15)|(func<<12)`
+  = `0x100000` for bus1/dev0/fn0 — our `VL805_DEV_ADDR` matches exactly.
+- The delta is in **M1's PERST reset timing**. Linux `pcie-brcmstb.c` does, in `brcm_pcie_setup`:
+  `bridge_sw_init_set(1)` → `perst_set(1)` → `usleep_range(100,200)` → `bridge_sw_init_set(0)` → clear
+  `HARD_DEBUG.SERDES_IDDQ` + `usleep_range(100,200)` → configure windows; then in `brcm_pcie_start_link`:
+  `perst_set(0)` → **`msleep(PCIE_RESET_CONFIG_WAIT_MS)` = 100 ms unconditionally** → only THEN poll
+  PHYLINKUP/DL_ACTIVE (every 5 ms, up to ~500 ms). Our prior M1 deasserted PERST and **polled link-up
+  immediately**, then pressed straight into M2 (config → NOTIFY) the instant `DL_ACTIVE` flipped. The PCIe
+  CEM `T_PVPERL` / device-ready window is exactly this 100 ms: the VL805 PCIe core trains the link in a few
+  ms, but its 8051 firmware engine needs the full fundamental-reset recovery before it can be reset/loaded
+  and clear CNR. **link-trained ≠ device-ready** — we were touching the controller while the 8051 was still
+  in reset, which is precisely the "MMIO live, state machine dead" signature.
+
+**The change (M1 only, in-lane `piusb.rs`).** (1) Split the assert into Linux's two-step order —
+`RGR1_SW_INIT_1 |= INIT_GENERIC` then `|= PERST` as distinct writes (was one combined write). (2) After
+deasserting PERST, a **mandatory fixed `settle_ms(100)` before any link poll or downstream access**
+(`PERST_DEASSERT_SETTLE_MS`, = Linux `PCIE_RESET_CONFIG_WAIT_MS`), then poll link-up on our existing bounded
+budget on top of it. Every existing witness is preserved; M2's `settle_ms(100)` pre-config-read is unchanged
+(now stacked after the M1 window, giving the 8051 a Linux-comparable total before NOTIFY). No protection
+weakened, no file outside the lane touched.
+
+**Expected witnesses + one-boot discrimination.**
+- New: `PIUSB-17: waited 100 ms post-PERST-deassert BEFORE link poll …` and, on link-up,
+  `M1: LINK UP … N ms after PERST-deassert (fixed settle 100 ms + M ms of polling)`.
+- **(d) delta was the premature access** → after the fixed settle, HCRST completes / CNR clears (PIUSB-10
+  gate), PIUSB-13's `[enum]` observer walks the keyboard. The `N ms after PERST-deassert` line shows the
+  link was already up when the settle expired (M≈0), i.e. the wall was device-readiness timing, not link
+  training.
+- **CNR still 1 after the aligned reset** → M1 timing is not the delta either; the remaining candidates are
+  link speed/width training state at NOTIFY (candidate 3) and the VC-side push mechanism (outcome (c)'s
+  "the VC uses its own translation/DMA, not our BAR"). Report, do not flail.
+
+QEMU raspi4b models no PCIe RC, so this whole M1 path sits behind the DTB-census honesty-line gate — the
+QEMU regression is byte-behaviour-identical (census-skip, graceful degradation, full U-arc PASS chain);
+the change is exercised only at an attended metal sitting.
+
+### PIUSB-18 — the RC inbound (SCB) master was disabled: firmware fetch had no SDRAM path (boot-P28)
+
+**The P27–P28 transition: PERST settle refuted, true wall found.** P27 landed PIUSB-17 (the 100 ms PERST-deassert settle) on metal. P28 boot showed **LINK UP 115 ms post-deassert** (the M1 settle worked; link was not the wall), yet the root issue persisted: **`USBSTS.CNR` never cleared, `NOTIFY_XHCI_RESET` honoured but the VL805 8051 state machine never ran** — the same "MMIO live, firmware dead" signature as P27. This refutes the PERST-deassert timing as the sole cause; the delta must lie elsewhere in the cold-build → NOTIFY sequence.
+
+**The metal divergence from Linux `pcie-brcmstb`.** Every PIUSB-17 hypothesis target (M1 PERST order, deassertion settle, link training state at NOTIFY) survives P28. A register audit of `MISC_CTRL` (the RC bridge's inbound and outbound window controls) between cold-build and M2 (pre-NOTIFY readback) found a critical divergence: our MISC_CTRL readback yields `0x88000000`, which decodes as:
+
+- Bits [31:24] = `0x88` → **SCB0 inbound window is SIZED** (not disabled)
+- Bit 12 (`SCB_ACCESS_EN`) = **CLEAR** → **the RC inbound master is disabled**
+
+The **inbound window (SCB path) is the VideoCore firmware's DMA path to system SDRAM** — it fetches the VL805 firmware blob from SDRAM at cold-build time via the RC's inbound-master interface. With `SCB_ACCESS_EN` clear, that DMA path is gated; the VC firmware load attempt stalls waiting for the fetch to complete, the NOTIFY response does not propagate back through the firmware state machine, and the VL805 8051 never starts. This is consistent with every P28 witness: the notify is honoured (mailbox core acknowledges), MMIO succeeds (PCIe core is live), but the controller state machine never runs (firmware fetch hit the closed gate).
+
+**Root-cause candidate (untested on metal; P29 decides).** The Linux `pcie-brcmstb` driver (`drivers/pci/controller/pcie-brcmstb.c`, `brcm_pcie_setup`) sets `MISC_CTRL.SCB_ACCESS_EN` and two related fields during the RC power-on sequence; our cold-build omits these. The fix candidate sets:
+
+- **`SCB_ACCESS_EN` (bit 12)** — enable the RC inbound master
+- **`CFG_READ_UR_MODE` (bits 1:0 = 0x2)** — configuration reads return completion status per PCIe spec (mirrors Linux)
+- **`MISC_CTRL` byte-order / burst fields** — Linux sets inbound burst to 128 B
+
+Refutation chain (facts of record): NOTIFY echo (P24, mailbox core alive) → BAR-MMIO load (P26, RC PCIe core alive) → stale pftf firmware (P27, recovered via Linux blob) → **PERST settle (P28, link-trained 115 ms post-deassert, NOTIFY still honoured, 8051 still dead)** → surviving: inbound SCB path (P29 test gate). The VC's firmware fetch from SDRAM rides the RC inbound window; the window gate is the last untested link in the cold-build → firmware-load chain.
+
+### PIUSB-19 — link Gen2 x1 trained on both sides at LNKCAP max (boot-P29)
+
+**The P28–P29 transition: SCB_ACCESS_EN refuted; CNR wall stands.** P29 landed PIUSB-18's fix (enable RC inbound master via `SCB_ACCESS_EN=1` in `MISC_CTRL`), and the VL805 firmware **booted for the FIRST TIME on UnaOS**. Metal confirms: `MISC_CTRL` readback `0x88003000` with `SCB_ACCESS_EN=1` active. The boot progressed past firmware init and into xHCI decoding — `USBSTS` reads `0x11` (halted-but-decoding), and the Max Ports field decodes correctly (5 ports from the VL805 device). However, the wall persists: port-1 walks to enable-slot, but the command never completes. The firmware loaded, the controller is parsing commands, yet command execution stalls.
+
+**Link training on both sides.** The xHCI controller began decoding and issued device notifications. A link trained to **Gen2 x1 on both sides at LNKCAP maximum** — the RC reports the capability, and the device negotiated the trained width. No link-geometry divergence; the speed/width are consistent and optimal.
+
+### PIUSB-20 — enable-slot command fetched (CRR=1) but no completion event posts (boot-P30)
+
+**The P29–P30 transition: CNR wall re-scoped.** P30 probes deeper into the command-execution stall with serial capture + xHCI register read-outs. The `USBCMD.HCRST` bit-write followed by the typical `USBSTS.CNR` poll reached completion only **after the HCRST driver issued the second reset** (watchdog ×3 before timing out). However, the real blocker re-emerges in the ring walk: after enable-slot is posted to the command ring, `CRR` (Command Ring Running, USBCMD bit 3) **readback is 1** — the hardware fetched the command — but the completion event **never posts to the event ring**. The `ERDP` (Event Ring Dequeue Pointer) stays unchanged and the interrupter status (`USBSTS[3] = EINT`) never fires. The command was fetched but its result never populated the ring.
+
+**Wall re-scoped to shared xhci interrupter/event path.** The enable-slot command executing (CRR=1 proves fetch) yet no completion-event emission refutes the ring architecture itself and points to a shared xhci block: event-ring buffer write-back, interrupter configuration (IMOD, ring base, size), or the completion-event generation logic tied to the interrupter. `RC_BAR2` 4 GiB @ address 0 is programmed and readback-verified; the CPU can read MMIO through it. **This is not a region-mapping defect.** The surviving candidate is the event ring's interrupt delivery or the command's write-back coherence (GPU cache or PCIe write-merge behavior on the inbound path).
+
+### PIUSB-21 — in flight in shared drivers/xhci (x86 MISSION gate mandatory)
+
+The interrupter/event path shares code with the x86 xHCI driver (`drivers/xhci/mod.rs`). Fixing the event-ring or interrupter setup in this shared block must pass **both** the x86 MISSION gate *and* the Pi 4 metal (P31 sitting) to unblock forward motion. The defect signature — command fetched, no completion-event delivery — indicates a coherency or write-ordering issue in shared xhci logic rather than Pi-side initialization. PIUSB-21 is deferred to a shared-driver fix arc with full x86 coverage.
 
 ## PI-USB-2 — from the honesty line to device enumeration on the VL805 (Arc PI-USB-2)
 
@@ -6768,6 +7680,115 @@ QEMU exactly as rung 1 does); `./arroyo test-arm 22`, `UNAOS_GICV3=1 ./arroyo te
 22` all unregressed. Positive verification (rings/RS=1, live device enumeration, keyboard armed) is the
 attended Pi sitting — see the rung-2 runbook in `scripts/pi-usb1-bench.md`.
 
+### PIUSB-29 → PIUSB-30 — off the panel-critical path, but ON the boot core
+
+**PIUSB-29** moved the whole bring-up (`bringup_inner`'s brcmstb RC reset/PERST/CNR settle **plus**
+`enumerate`) out of the boot-critical path into `piusb::bringup_task`, spawned via `spawn_auto` onto a
+**secondary core** so `kernel_main` reached the GUI/panel without freezing at the square for seconds.
+
+**Metal P39 (hw-pi4@3329bcfd) regression:** on real BCM2711 silicon the async task **stalled right
+after the DTB census line** — it printed the async-start, `PI-USB-1 bring-up starting`, and `DTB census:
+… proceeding to RC bring-up` witnesses, then produced nothing more; the controller was never published,
+`usb_pump` idled forever (`[piusb26] pump pass … idle controller` repeating), and keyboard/mouse never
+armed. Boot was otherwise healthy. The prior synchronous boot (P38, `45c…`) had working USB. Root cause:
+the RC/VL805 attach + the **VideoCore mailbox singleton** it drives (M2's `NOTIFY_XHCI_RESET`) plus
+`boot::map_device_1gib` are all metal-proven **only in the boot core's single-threaded, pre-GUI context**
+(`map_device_1gib` is even documented "single-threaded boot-time use, pre-SMP, no cross-core BBM
+concern"). Running that sequence on an AP, concurrently with the live GUI/render/input tasks, is not the
+proven context and wedges. QEMU cannot reproduce it (raspi4b models no PCIe RC → the census-skip fires,
+so no real bring-up runs).
+
+**PIUSB-30 fix:** keep the deferral (the panel still unblocks) but retire the AP placement. The
+`spawn_auto`-onto-a-secondary-core call is gone; `bringup_task(0)` now runs **synchronously on the BSP**,
+deferred to just **after** the GUI/input/render tasks are spawned onto the APs and just **before** the BSP
+idles (`hlt_loop`). The APs paint the panel while the boot core does the RC bring-up + enumerate in the
+exact P38 single-threaded context. The no-AP / serial-only fallback still brings USB up synchronously at
+the original site (it never spawns the GUI tasks and falls through to the shared BSP loop). Witnesses
+renamed `piusb30: boot-core bring-up start/done`. Positive verification (rings/RS=1, live enumeration,
+keyboard armed) remains the attended Pi sitting; QEMU proves only non-regression (census-skip both ways).
+
+### PIUSB-32 — the deferred-RC-APB-stall diagnostic (power/clock census)
+
+**Metal wall (P39/P40/P41):** with V3D + GENET + the panel live, the FIRST RC APB register read in the
+deferred bring-up — `RGR1_SW_INIT_1 @ 0xfd509210` — **hard-stalls the CPU**: the `piusb31` enter line
+prints, the exit line never does, with no fault and no timeout (an unbounded bus stall, not the
+timeout-guarded mailbox). The SAME read is fine in P38's early (pre-V3D / pre-SMP / pre-panel)
+single-threaded context. Mailbox is exonerated (bounded; the wedge precedes any USB mailbox call).
+
+**Order-of-operations differential (what changed between P38 and P40/41, before the RC read):** the ONLY
+new mailbox power/clock activity is **V3D bring-up** (`v3d::bringup`, called from `init_framebuffer`):
+`set_power_domain(V3D=10, on)` → `set_clock_rate(V3D=5)` → `set_clock_state(V3D=5, on)`. **GENET and the
+framebuffer allocation issue NO `SET_POWER`/`SET_CLOCK`** (GENET clocks itself via its own registers). So
+V3D's power/clock is the single differential candidate for a shared-PLL-parent perturbation.
+
+**Authoritative DTB fact (refutes the firmware-gating theory):** `bcm2711.dtsi` `pcie@7d500000` carries
+**no** `clocks` / `power-domains` / `resets` / `reset-names` property (GENET `@7d580000` likewise). In the
+Linux/firmware model the RC's APB register block is **not** behind a firmware-managed power/clock/reset
+domain the OS claims — it is expected to be always-clocked. That makes "firmware gated the RC APB clock"
+and "V3D toggled a PLL feeding the RC register clock" **unsupported by the device tree**; the null
+hypothesis shifts to *our* deferred execution context.
+
+**Instrumentation landed (`power_clock_census`, mailbox-only, timeout-bounded):** read-only
+`get_domain_state`/`get_clock_state`/`get_power_state` witnesses (RPi firmware tags `0x00030030` /
+`0x00030001` / `0x00020001`) for the candidate ids — V3D power domain **10**, V3D clock **5**, USB-HCD
+device **3** (control). Printed as `[piusb32] census(<ctx>): ...` in **both** the early P38-equivalent
+context (`bringup`, tail of `build_boot_info`) **and** the deferred stall context (`bringup_inner`, right
+before the first RC MMIO). Per brief step 4, a candidate reported **present-but-off** is enabled and
+re-witnessed (a no-op on metal where V3D is freshly up — it fires only on a genuine off-when-on). Both
+census calls are gated on `dtb_has_pcie`, so QEMU raspi4b (no `pcie@` node) prints nothing — verified.
+
+**P42 decision tree (diff the two `[piusb32]` lines):**
+- a candidate whose power/clock **differs** early-vs-deferred ⇒ firmware-owned; the conditional enable
+  re-arms it and the following RC read should return (root cause = a domain V3D/runtime-PM perturbed);
+- all three **identical and ON** in both lines ⇒ the RC registers are **not** power/clock gated (matches
+  the DTB) — the stall is owned by the deferred execution *context*, and the fix is the **split** (run the
+  RC + xHCI hardware bring-up in the earlier single-threaded context, defer only enumeration).
+
+**P43 verdict (metal):** the census was **identical early-vs-deferred** — firmware power/clock exonerated,
+exactly as the DTB predicted. The stall is owned by the **deferred execution context**, not power/clock.
+That is the split signal → **PIUSB-33** below. (No `boot.rs` reorder ahead of `init_framebuffer` was
+needed: P38's working bring-up already ran at the *end* of `build_boot_info` with V3D up — so the P38
+context is "pre-SMP / pre-heap / pre-panel / single-threaded," not "pre-V3D." The current `piusb::bringup`
+call site already sits there.)
+
+Gates: `./arroyo check` both arches; `UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`
+(clean boot, census-skip); `./arroyo test-arm` (virt xHCI KB/mouse/storage enumerate).
+
+### PIUSB-33 — the SPLIT: early hardware bring-up + deferred enumeration
+
+**The evidence-owned fix for the deferred-RC-APB stall.** P43 settled the P42 tree at the "identical
+census ⇒ deferred *context* owns the stall" branch. So the RC + xHCI **hardware** bring-up is moved back
+into the P38-proven early context, and **only** the enumeration/HID/mass-storage walk stays deferred:
+
+- **Early phase — `piusb::bringup` (tail of `build_boot_info`, `boot.rs`).** Now runs the full
+  `bringup_inner` (the census, `dump_firmware_state`'s RC reads, M1 RC reset + link train, M2 VL805
+  enumeration + fw load, M3 outbound-window map + xHCI init + **root ports powered**) — up to the
+  "controller halted-but-decoding + ports-powered honesty line," **excluding** the device walk. This is
+  the exact single-threaded pre-SMP / pre-heap / pre-panel context P38 proved (heap-free — the attach
+  allocates no rings; V3D is already up here, and P43 exonerated it). Witness:
+  `:: piusb33: early hw bring-up done (<ms>ms) ::` (printed only when `dtb_has_pcie`, so QEMU stays
+  silent). The cost is measured so the panel-delay impact of the early placement is honest and
+  serial-visible.
+- **Deferred phase — `piusb::bringup_task(0)` (BSP, after the GUI/input/render tasks spawn).**
+  `enumerate` **only**: it self-gates on `XHCI_READY` (set by the early M3), re-confirms the BAR still
+  decodes, then does the heap-backed DMA-side walk — rings/DCBAA/interrupter, `RS=1`, port-connect pump,
+  `ADDRESS_DEVICE`, HID/storage enumeration. This touches the **xHCI BAR MMIO** (not the stalling RC APB),
+  needs the heap, and runs with the panel already live. Witness:
+  `:: piusb33: deferred enumerate done (<ms>ms) ::` plus the existing HID/storage attach lines.
+
+The `piusb31` enter/exit bracket around the (now-early) first RC read is **kept** — harmless and its
+witness dump is still useful; it simply no longer straddles a stall. The `power_clock_census` call is
+kept (relabeled `early/bringup_inner`) as steady-state instrumentation.
+
+**QEMU:** the census-skip path is unchanged — no `pcie@` node ⇒ `bringup_inner` returns before any RC
+MMIO (no early witness), and the deferred `enumerate` reports "honesty line not reached" and returns.
+Batteries stay green.
+
+Gates: `./arroyo check` both arches ✅; `UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`
+✅ (clean boot, census-skip both halves, all PASS); `./arroyo test-arm` ✅ (virt xHCI MISSION SUCCESS —
+KB/mouse/storage). Positive metal verification (early bring-up reaches the honesty line, deferred
+enumerate arms the keyboard) is the **P44** attended sitting — the boot that returns the keyboard.
+
 ## PI-GENET — BCM2711 on-board Gigabit Ethernet (Broadcom GENET v5) + smoltcp bind (Arc PI-GENET)
 
 The Pi's **first network path.** The BCM2711 integrates a Broadcom "GENET" v5 unimac Ethernet
@@ -6813,11 +7834,66 @@ TX, exactly as `bcmgenet_init_dma`. The datapath is a **producer/consumer-index*
 per-descriptor OWN handoff): the driver advances the TX producer index after posting and the RX
 consumer index after draining; hardware advances the mirror index. Bring-up order follows
 `bcmgenet_open` / `init_umac` / `init_dma`: SYS port mode → UMAC soft reset + RBUF/TBUF flush → MAC +
-max-frame-len → MIB reset → RBUF 64B/align → RGMII OOB → RX/TX rings → `UMAC_CMD` TX/RX enable at
-gigabit + promiscuous bring-up filter. Interrupts masked (polled). Every register write is announced on
-serial before issue. The GENET register window lands in the `0xC000_0000..0xFFFF_FFFF` Device GiB
-`boot::build_l1` already maps, so — unlike piusb's outbound window / NET-4's iATU — no new page-table
-write is needed once resolved.
+max-frame-len → MIB reset → RBUF 64B/align → RGMII OOB (mode-enable only) → RX/TX rings → `UMAC_CMD`
+TX/RX enable + promiscuous bring-up filter. Interrupts masked (polled). Every register write is
+announced on serial before issue. The GENET register window lands in the `0xC000_0000..0xFFFF_FFFF`
+Device GiB `boot::build_l1` already maps, so — unlike piusb's outbound window / NET-4's iATU — no new
+page-table write is needed once resolved.
+
+### Autoneg-honest link (PI-GENET-2) — speed/duplex/link taken FROM the PHY, never forced
+
+The M2 bring-up **does not** hand-assert `SPEED_1000` in `UMAC_CMD` or `RGMII_LINK` in
+`EXT_RGMII_OOB_CTRL`. Instead, after `find_phy`, `phy_resolve` reads the external BCM54213PE's
+negotiated result over MDIO — all IEEE 802.3 Clause-22 standard registers: `BMSR` (link + autoneg-
+complete), then the highest-common-denominator technology from our advertisement (`ANAR` 0x04 /
+1000BASE-T control 0x09) intersected with the link partner's ability (`ANLPAR` 0x05 / 1000BASE-T
+status 0x0a). `mac_set_from_link` then programs the `UMAC_CMD` speed bits + `CMD_HD_EN` from that
+resolution and sets `RGMII_LINK` **only** when the PHY reports link (the Linux `bcmgenet_mii_setup`
+discipline). Rationale: forcing `SPEED_1000` while the PHY negotiated 100M mis-clocks the RGMII pins,
+so every TX frame is garbage on the wire — the MAC transmits but no peer parses a valid frame (the
+observed "no DHCP OFFER, solid-yellow transport LED, steady beat on the Mac end" signature). Until the
+PHY resolves, `UMAC_CMD` speed is left at the 10M floor rather than a fast lie.
+
+### TX evidence (storm / LED-red-herring classes)
+
+After the DHCP + ping exchange, `tx_evidence` logs the software frames-enqueued count against the
+hardware TDMA producer/consumer indices (`RING_TDMA_PROD_INDEX` / `RING_TDMA_CONS_INDEX`, hardware-
+advanced as it drains descriptors). `cons == prod` with a small count means the ring fully drained
+with no runaway re-post — a steady activity LED under those readings is a benign gigabit-link
+indication, not a TX storm. The driver's `transmit` bumps the producer index exactly once per frame
+(no retransmit loop); DHCP retransmits originate in smoltcp and are bounded by the 5 s lease timeout.
+
+### The ring-wrap fix (PI-GENET-3) — START/END_ADDR are in WORDS, not bytes
+
+Boot-P3's TX evidence caught the concrete defect: `HW TDMA prod_index=201 cons_index=32` — the consumer
+frozen at **exactly** the ring depth (32). The MAC drained one full ring pass and never wrapped;
+everything after frame 32 sat unconsumed (the solid transport LED; DISCOVER retries past the first ~32
+frames never reached the wire). Root cause: the per-ring `DMA_START_ADDR` / `DMA_END_ADDR` registers
+count in **32-bit words** (Linux `end_ptr * words_per_bd - 1`, `words_per_bd = 3` for the 40-bit v5
+descriptor), but `init_tx` / `init_rx` programmed `END_ADDR = RING_DEPTH × DMA_DESC_SIZE − 1` using the
+**byte** stride (12/desc) instead of the word stride (3/desc). That sized the hardware ring region 4×
+too large, so the engine's read/write pointer never wrapped at the last valid descriptor — it walked
+off into the uninitialised tail of the shared 256-descriptor array and stalled on a null descriptor.
+The fix programs `END_ADDR = RING_DEPTH × (DMA_DESC_SIZE/4) − 1 = 95`, consistent with the 32-descriptor
+`RING_BUF_SIZE`. The spurious per-descriptor `DMA_WRAP` bit (0x1000) was also removed from every
+`length_status` write: the GENET ring path wraps via `END_ADDR`, not a status bit (Linux never sets it
+in `bcmgenet_xmit_single` / the ring descriptors), and the bench proved hardware ignores it (it was set
+on descriptor 31 yet the ring still failed to wrap).
+
+The **RX** ring carried the identical byte/word bug and is an equal-priority co-suspect: valid DISCOVERs
+left at the correct speed this boot yet no OFFER was ever popped, because the RDMA write pointer likewise
+never wrapped past descriptor 32 — an OFFER arriving after the first pass landed in a slot the driver
+(reading `mod RING_DEPTH`) never revisited. The same word-unit `END_ADDR` fix corrects both rings.
+
+New witnesses (behind the `genet` knob, post-DHCP+ping): `rx_evidence` logs the software popped-frame
+count + `rx_c_index` against the hardware RDMA producer index (free-running — the authoritative count of
+frames HW delivered; GENET exposes no single simple rx-frames MIB register, so the producer index stands
+in rather than fabricate a swept-counter offset under the facts-only rule); `flow_evidence` witnesses the
+per-ring flow registers (TDMA `FLOW_PERIOD` / RDMA `XON_XOFF_THRESH`) and the `DMA_CTRL`/`RING_CFG`
+readbacks once, ruling out XOFF back-pressure as the stall cause. Both TX and RX evidence lines now tag
+`[ring WRAPPED past depth]` vs `[STALLED at ring depth — no wrap]` so the fix is visible on the
+transcript. Expected boot-P4: `cons_index` follows `prod_index` past 32 (TX wraps), the RDMA producer
+advances past 32 (RX wraps + delivers), and the DHCP LEASE lands.
 
 ### DMA / identity-map + coherency
 
@@ -6840,9 +7916,37 @@ of the index protocol.
 ::   SYS_REV_CTRL = 0x.......6 — LIVE GENET v5 ...; this build MODELS the block ::
 ::   station MAC = <mac> (source: dtb local-mac-address | umac-reg readback) ::
 ::   M2 bring-up ... rings up: RX/TX ring 16 (32 desc each); UMAC_CMD readback ... (live) ::
-::   external PHY (MDIO addr 1) link UP ::
+::   PHY autoneg resolved (MDIO addr 1): link UP · aneg COMPLETE · speed 1000M · full-duplex ::
+::   >>> REG WRITE (M2): UMAC_CMD speed<-1000M full-duplex (from PHY autoneg) ::
+::   >>> REG WRITE (M2): EXT_RGMII_OOB_CTRL RGMII_LINK SET (honoring PHY link) ::
 :: PI-GENET ping <gw> (4/4 sent, N/4 replies) [dhcp] link UP => PASS ::
+::   TX evidence [post-DHCP+ping]: sw frames-enqueued=N (tx_prod=N) | HW TDMA prod_index=N cons_index=N (drained; no storm) ::
 ```
+
+If the PHY instead resolves `speed 100M`, the witness makes the previous forced-1000 mismatch visible
+directly, and the MAC is programmed for 100M so the DISCOVER goes out valid — the class-1 fix. A
+`link DOWN` resolution clears `RGMII_LINK` and the bring-up is an honest bounded no-op.
+
+### Persistent net service + the first TCP service (PI-NET-9, PI-NET-10)
+
+`bind_smoltcp`'s DHCP+ping window is bounded — it returns, and the interface stops being polled, so
+nothing could answer the gateway's later ARP who-has / ICMP echo. **PI-NET-9** gives the
+DHCP-configured `Interface` + `Device` a home beyond that window (the static `NET_SERVICE`) and a
+scheduled kernel task (`net9`, hosted on a secondary core) that polls it every ~4 ms; smoltcp's
+`iface.poll` answers ARP + ICMP echo by itself. The `[net9]` witness is rate-limited/change-only.
+
+**PI-NET-10** grows the persistent `SocketSet` to hold one passive TCP socket (static leaked ring
+buffers, `2048` RX / `4096` TX) listening on **:80**, and takes one bounded HTTP service step per poll
+(`NetService::http_step`): re-arm `listen(:80)` from any non-open state (so the service survives
+repeated requests, RST mid-handshake, and half-open closes — a smoltcp socket needs an explicit
+re-listen after RST/close), drain the request (path ignored), then once the request is in and TX is
+writable, emit a small static **HTTP/1.0 200** page (OS name, hw-pi4 tip sha via `option_env!(
+"UNAOS_GIT_SHA")` else the branch label, uptime ms/ticks, the `[net9]` ARP/ICMP reply counters, the
+served count, the configured IPv4) and `close`. Point a browser on the bench LAN at
+`http://192.168.2.3/` (the Mac-bootpd lease) to see UnaOS answer. Witnesses:
+`:: PI-GENET: [net10] http listening :80 ::` once at arm; `:: PI-GENET: [net10] served N requests ::`
+rate-limited/change-only. In QEMU (no GENET) the whole service no-ops under the existing DTB-gated
+SKIP — `genet_bringup` returns before `bind_smoltcp`/`arm_net_service` ever run.
 
 ### Gates green
 
@@ -7358,3 +8462,226 @@ XCARVE-4 scratchpad PAGESIZE clamp remains as hardening (real garbage-readback h
 is no longer claimed as "the writer." With the hole enforced, the no-software-writer verdict
 (boot-21) stands: FillWrite/fault activity at this window is any cache traffic into
 firewalled DRAM our map must simply never cover.
+### XCARVE-4 (shared xhci, landed via hw-jetson f81124c3) — scratchpad PAGESIZE clamp
+The shared `xhci::init_pointers` scratchpad block derived `page_bytes` from the raw PAGESIZE
+lowest-set-bit; a garbage readback (Tegra234 no-HCRST takeover) demanded an 8 MiB-aligned
+allocation that overshot the heap into firewalled DRAM. Fix: clamp to the spec-sane 4–32 KiB
+bits (xHCI 5.4.3 mandatory 4 KiB fallback), null/heap-bounds guard, heap-PA witness. No
+behavior change on healthy controllers (Pi VL805 reads bit 0 set → 4 KiB, unchanged).
+
+## PH-3 — is the aarch64 block-write path "fully polled emmc2"? (verdict: **premise FALSE**)
+
+An answer owed to the pi4 lane, which was deciding on the `fs/fat.rs` `FAT_MUTATION` span
+justification. **This section changes no behavior** — it records the traced facts. Any change to
+aarch64 storage dispatch belongs to the pi4 lane.
+
+### The claim under test
+
+`fs/fat.rs:581-585` (the `FAT_MUTATION` doc comment) justified holding an IRQ-masked lock across
+block I/O with: *"the aarch64 storage path is fully POLLED (an emmc2 busy-poll on metal; a spin-loop
+under the QEMU raspi4b/virt models, which deliver no timer IRQ so `hlt` degrades to a spin)"*, and
+`fs/fat.rs:600-601` restated it as *"the aarch64 I/O is polled … a couple of bounded polled sector
+transfers"*. Both halves are false as written.
+
+### Citation chain (traced 2026-07-27)
+
+1. `fs/fat.rs:602-610` — `with_fat_lock` is `#[cfg(target_arch = "aarch64")]`: **no `baremetal`
+   gate**. It wraps `f()` in `arch::without_interrupts`.
+2. `arch/aarch64/mod.rs:313-331` — `without_interrupts` does `msr daifset, #2` (mask I) around the
+   closure and restores DAIF. So the lock hold is IRQ-masked on **every** aarch64 build.
+3. `fs/fat.rs:568-573` — `write_sector(BlockSource::Default, ..)` calls
+   `drivers::block::write_block`.
+4. `drivers/block.rs:210-232` — `write_block` routes to `emmc2::write_block_512` **only** under
+   `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]` **and** only when the runtime
+   `BACKEND` atomic reads `BACKEND_SD`. Otherwise it falls through to the xHCI BOT `WRITE(10)` body.
+5. `drivers/block.rs:22-25` — `BACKEND` initializes to `BACKEND_XHCI`; `drivers/block.rs:175-178`
+   `register_sd` is the **only** writer that flips it to SD.
+6. `drivers/emmc2.rs:400-427` — `register_sd` fires only from `finish()`, i.e. only after a
+   successful `try_init` on one of the two bases. No card / failed init → the driver prints
+   *":: M6g: no SD card on either base — no block device registered ::"* and `BACKEND` stays xHCI.
+7. `drivers/mod.rs:1-2` — `pub mod pci;` and `pub mod xhci;` are declared with **no arch cfg**.
+8. `arch/aarch64/pci.rs:37,94-125` — the aarch64 `pci::init` scans for xHCI and installs
+   `XHCI_CONTROLLER`; `main.rs:764-765` calls it under `#[cfg(not(feature = "skip_xhci"))]` only —
+   no arch gate.
+9. `drivers/xhci/mod.rs:5596` → `drivers/block.rs:150-160` — a USB stick's enumeration calls
+   `publish_usb_geometry`, which claims the global `BLOCK_DEVICE` whenever `BACKEND != BACKEND_SD`.
+
+**Therefore, two live aarch64 configurations put the xHCI BOT pump inside the IRQ-masked
+`FAT_MUTATION` span:**
+
+- **aarch64 non-`baremetal`** (QEMU `virt`): `emmc2` is not even compiled (`drivers/mod.rs:16-18`),
+  `write_block` has no SD branch at all, so BOT is the **only** path — while `with_fat_lock` is
+  still a real IRQ-masked lock.
+- **aarch64 `baremetal` with no usable microSD**: `main.rs:316-317` runs `emmc2::probe()` before
+  `arch::pci::init` (`main.rs:765`), so a *successful* card init does win the race — but a failed
+  one leaves `BACKEND_XHCI`, and a later-enumerated USB stick then owns `BLOCK_DEVICE`.
+
+### The second false half — "no timer IRQ, `hlt` degrades to a spin"
+
+- `arch/aarch64/mod.rs:236-243` — `hlt()` issues a real `wfi` whenever `timer::is_live()`; it
+  poll-spins **only** when timer liveness was never confirmed.
+- `drivers/xhci/mod.rs:5348-5350` — the BOT pump's own doc says *"On x86 / Pi / aarch64-virt … `hlt()`
+  waits for an interrupt (HLT / WFI with a live timer)"*. That is the direct contradiction.
+
+### Why the *conclusion* nevertheless survives (for a different reason)
+
+The span is still safe on aarch64, but not because the I/O is polled:
+
+- `wfi` **wakes on a pending physical interrupt even with PSTATE.I set** (stated at
+  `arch/aarch64/mod.rs:237-239`), unlike x86 `hlt` under `IF=0`, which is exactly why x86 is
+  excluded. So masking does not deadlock the pump.
+- `drivers/xhci/mod.rs:5355-5400` — `pump_until_bot_done` drains the event ring by **polling**
+  (`drain_event_ring_once`), not from an IRQ handler, and is bounded by a `now_cycles`/
+  `hw_wait_budget` **wall-clock deadline**, not an iteration count. `now_cycles` (CNTVCT) advances
+  with the timer masked.
+- The pump calls `crate::hlt()`, never a scheduler yield — so the "no scheduler yield" half of the
+  original justification does hold.
+
+### Verdict
+
+**FALSE.** The stated premise ("the aarch64 storage path is fully polled emmc2") is not an
+invariant of any aarch64 build; the xHCI BOT path is reachable under the IRQ-masked lock on
+aarch64-virt always, and on Pi metal whenever the microSD does not register. The safety conclusion
+is still correct, resting instead on (a) `wfi` waking with PSTATE.I set, (b) a polled event-ring
+drain, and (c) a wall-clock-bounded pump. `fs/fat.rs`'s comment has been corrected to state that
+real invariant. **No dispatch behavior was changed** — the pi4 lane owns any decision about whether
+a `baremetal` build should refuse the BOT fallback for `BLOCK_DEVICE`.
+## SOURCE-ALONG — the pi4 boot media carries its own source (`SRC.TGZ` / `SRC.SHA`)
+
+The first rung of the self-hosting ladder: **every UnaOS pi4 boot image carries the exact source tree
+that built it**, so a running system — and the ledger — can always answer *"what code is this"* without
+reference to an external checkout.
+
+### The FAT32 root contract
+
+`unaos/scripts/make-pi-img.sh` writes two files into the boot partition's FAT32 root, alongside
+`kernel8.img` / `start4.elf` / `fixup4.dat` / `bcm2711-rpi-4-b.dtb` / `config.txt` and the EL0 fixtures
+(`HELLO.BIN`, `K2OWN.BIN`, `K2IMP.BIN`, `MIDDEN.BIN`, `SCRATCH.BIN`, `GROW.BIN`, `ELFHELLO.ELF`,
+`VUG.ELF`, `STAT.ELF`):
+
+| File | Contents |
+|---|---|
+| `SRC.TGZ` | gzip'd tar of the repository source — **excluding** `target/`, `.git/`, and everything `.gitignore`'d. Paths are repo-root-relative (`unaos/…`, `libs/…`), no leading `./` and no wrapper prefix directory. |
+| `SRC.SHA` | Exactly one line: `<sha256>  SRC.TGZ` — the `sha256sum -c` / `shasum -a 256 -c` format, checkable in place from the FAT root. |
+
+Both names are 8.3-clean, so the kernel's read-only FAT reader can name them without long-filename
+support, and neither collides with any existing fixture. They ride MBR partition 1 (type `0x0C`); the
+unafs volume on partition 2 (type `0x7f`) is unaffected.
+
+### Determinism contract
+
+**Same source tree in ⇒ same `SRC.TGZ` bytes out**, on any host, from any branch, at any clock time.
+This is what makes `SRC.SHA` a usable ledger identity rather than a build nonce. The mechanism:
+
+- **Content set comes from git**, not from an exclude list — so `target/`, `.git/` and every
+  `.gitignore`'d path are excluded by construction and cannot drift out of sync with the ignore rules.
+- **Dirty worktrees are archived as they are, without stashing and without touching the real index.**
+  `git read-tree HEAD` + `git add -A` against a throwaway `GIT_INDEX_FILE`, then `git write-tree`, names
+  a tree object built from the *working tree* (uncommitted edits and untracked-but-not-ignored files
+  included). On a clean worktree that tree is bit-identical to `HEAD^{tree}`, so clean and dirty take one
+  code path with one set of guarantees.
+- **`git archive` of a TREE, never a commit-ish.** Archiving a commit injects a `pax_global_header`
+  carrying the commit sha, which would make the same source hash differently from two branches. Entries
+  come out sorted, uid/gid 0, mode-normalized.
+- **`--mtime=@315532800`** (1980-01-01 UTC, the FAT epoch) pins entry timestamps. Note the sharp edge
+  found here: git's approxidate does **not** parse `@0` and silently falls back to *now*, which makes the
+  archive look deterministic only within a single second. Any pinned mtime must be verified, not assumed.
+- **`gzip -n`** (no name, no timestamp in the gzip header), applied to the tar **as a file**. Streaming
+  `git archive | gzip` was measured to emit different deflate block boundaries run to run.
+- **Non-git source trees** — e.g. an image rebuilt from an unpacked `SRC.TGZ`, the next rung of the
+  ladder — fall back to GNU tar's `--sort=name --mtime --owner=0 --group=0 --numeric-owner` over an
+  explicitly-built, `LC_ALL=C`-sorted member list (`--no-recursion`), which reproduces both the
+  determinism and the `./`-free entry naming of the git path. The one honest gap: with no repository
+  there is no `.gitignore` to consult, so that branch prunes `.git/` and `target/` by name only. If
+  neither git nor a GNU tar is available the build **fails loudly** rather than shipping an image whose
+  `SRC.SHA` would be a lie; `UNAOS_NOSRC=1` is the acknowledgement.
+
+### Capacity — checked, never truncated
+
+The image is **64 MiB**: 56 MiB FAT32 boot partition (54.1 MiB usable after 2 FATs + reserved at 512-byte
+clusters) plus the 8 MiB unafs tail. Measured payload is ~10.6 MiB — ~5.3 MiB of boot set and fixtures
+plus ~5.3 MiB of `SRC.TGZ` from a 19 MiB working tree — so **this arc did not need to grow the image**.
+Before formatting anything, `make-pi-img.sh` sums the staged payload plus `SRC.TGZ`/`SRC.SHA` against the
+FAT partition size less a 4 MiB metadata slack, and on overflow aborts with a message naming the
+`size_mb` argument in `arroyo`'s `make-pi-img.sh` call. A too-small volume is a build failure, never a
+silent `mcopy`/`ditto` truncation.
+
+The check is backed by a **readback**: once the volume is written, `SRC.TGZ` is read back *out* of it
+(`mcopy ::/SRC.TGZ` on Linux, off the mountpoint on Darwin) and re-hashed against `SRC.SHA`. A FAT that
+dropped or truncated the payload fails the build with a `SOURCE-ALONG readback MISMATCH` line naming both
+hashes — it can never reach a flashed card. This is also the `./arroyo kernel8` gate's assertion, made
+self-checking rather than left to a manual `mdir`.
+
+### Default ON, including for tests
+
+`kernel8` and `kernel8-test` both carry the source. A test image whose FAT contents differ from a flashed
+image is exactly the drift this arc removes, so the knob is negative: **`UNAOS_NOSRC=1`** skips the block
+(printing a "image will NOT carry its source" warning to stderr) and is the only way to get an image
+without it. Measured cost on this tree: **+1.3 s wall** and
+**5.24 MiB** (1.83 s vs 0.49 s, readback included), against a 5 s/cycle bar that would have justified making it opt-in for tests — it does not
+come close, so the default stands.
+
+### Host portability
+
+Both host branches of `make-pi-img.sh` carry the pair: Darwin `cp`s it into the private mountpoint after
+`ditto`, Linux `mcopy -o`s it into the FAT image after the staging tree. In both cases the files are held
+in a scratch dir and copied in explicitly — `make-pi-img.sh` never mutates the staging directory it is
+handed. `UNAOS_SRC_ROOT` overrides the source tree, which otherwise resolves to the repo root two levels
+above the script.
+
+## PI-NOBM — the `pi`-without-`baremetal` feature combo is unsupported (verdict: **unreachable**)
+
+An open question carried over from the x86 seat: `UNAOS_PI=1 ./arroyo check` fails the aarch64 leg with
+18 errors, all variations of "cannot find `sched` in `arch`". This section records the investigation and
+the decision **not** to change the gate.
+
+### What the gate actually says
+
+`crates/kernel/src/arch/aarch64/mod.rs` compiles the kernel-thread scheduler under:
+
+```rust
+#[cfg(any(
+    feature = "baremetal",
+    all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")),
+    all(target_arch = "aarch64", feature = "tegra")
+))]
+pub mod sched;
+```
+
+Three aarch64 configurations get `sched`: anything `baremetal` (the Pi 4 metal path), the QEMU `virt`
+path (neither `pi` nor `tegra`), and the Orin `tegra` path. The fourth — `pi` **without** `baremetal` —
+is the one combination the `not(feature = "pi")` arm deliberately excludes. Its unconditional consumers
+(`selftest.rs`, `shell.rs`, and the aarch64 `mod.rs` re-export) then fail to resolve, which is the whole
+of the 18-error cascade. Nothing is subtly broken: `sched` is simply not compiled, and `rustc` says so
+with an explicit "found an item that was configured out" note pointing at the gate.
+
+### Is the combo reachable?
+
+**No.** `arroyo` composes the two features from disjoint places:
+
+- The general `_feats` accumulator adds `pi` from `UNAOS_PI=1`, and **never** adds `baremetal`.
+- `baremetal` is set only inside `kernel8()`, whose `K8_FEATS` is **curated** — it starts at
+  `baremetal,skip_xhci` and takes no input from `_feats`, so it never carries `pi` either.
+
+So the two features are produced by mutually exclusive code paths, and on the `kernel8`/`kernel8-test`
+path `UNAOS_PI=1` contributes no cargo feature at all (`baremetal` already implies the Pi target). Every
+documented `UNAOS_PI=1` invocation in `docs/env-knobs.md` pairs it with `kernel8` or `kernel8-test`; a
+sweep of `docs/`, `scripts/`, `CLAUDE.md` and `HARDWARE-BRINGUP.md` found **no** documented or scripted
+invocation that puts `pi` in front of a non-`kernel8` target. The failing combo is reachable only by
+typing `UNAOS_PI=1` at `check`/`arm`/`test-arm`/`esp-arm` by hand, and no such build has a Pi boot path
+to run — `pi` alone selects the aarch64 UART policy, not a platform.
+
+### Provenance
+
+Not a merge regression. The identical 18-error failure reproduces at `e860181a` (the pre-merge `hw-pi4`
+tip) with the same error sites and the same gate text; the gate has read this way since `1ffaf6cf`
+(SMP M3a), widened only by `c82ddf9b` (JC3, `virt`) and `1e010597` (JM6, `tegra`). `UNAOS_WITNESS=1` is
+incidental: `pi` alone already fails with 16 of the 18, and the `witness` feature only adds the last two.
+
+### Decision
+
+**The gate stands and the code is unchanged.** Adding `feature = "pi"` to the `any(...)` list would
+compile a scheduler into a configuration that has no boot path to run it, trading a loud, accurate
+compile error for a silently-buildable artifact nobody flashes. `pi` without `baremetal` is an
+**unsupported combination**; the honest compile failure is the intended behaviour. Treat
+`./arroyo kernel8` / `kernel8-test` as the only supported carriers of `UNAOS_PI=1`.

@@ -773,10 +773,26 @@ extern "C" fn aarch64_el0_fault_handler() -> ! {
         aarch64_fault_handler(4);
         crate::arch::hlt_loop();
     };
+    // KEYSTAT: name the PID as well as the task name. The name alone is not an identity — every
+    // program launched with `bg` runs under the single literal `"bg-user"` (`spawn_user_image_bg`),
+    // so with two `STAT.ELF` instances on the panel a fault line said only "one of them died" and
+    // the operator's `kill <pid>` (answered "already exited") was the first and only evidence of
+    // WHICH. The pid is the number `jobs` prints, the number `kill` takes, and the number the app
+    // itself draws in its window, so it is the one token that closes the attribution.
+    //
+    // `current_id()` is the same task id `SYS_GETPID`/`SYS_GETINFO` return and the same value
+    // `spawn_user_slot` handed the `Proc` row, so no translation is involved. It is also LOCK-FREE
+    // — one `percpu` read, one `Acquire` load of `SCHED[cpu].current`, one field read — which is
+    // the binding constraint here: this handler runs at EL1 with DAIF masked on the faulting task's
+    // own kernel stack, and it must not reach for anything the interrupted context could have been
+    // holding. (0 is unreachable in practice: `current_name()` above already established a current
+    // task, and both read the same slot.)
+    let pid = super::sched::current_id().unwrap_or(0);
     if far_valid {
         serial_println!(
-            ":: EL0 FAULT: task '{}' KILLED — EC={:#04x} ISS={:#x} ELR={:#x} FAR={:#x} ::",
+            ":: EL0 FAULT: task '{}' pid={} KILLED — EC={:#04x} ISS={:#x} ELR={:#x} FAR={:#x} ::",
             name,
+            pid,
             ec,
             iss,
             elr,
@@ -784,8 +800,9 @@ extern "C" fn aarch64_el0_fault_handler() -> ! {
         );
     } else {
         serial_println!(
-            ":: EL0 FAULT: task '{}' KILLED — EC={:#04x} ISS={:#x} ELR={:#x} FAR=-- ::",
+            ":: EL0 FAULT: task '{}' pid={} KILLED — EC={:#04x} ISS={:#x} ELR={:#x} FAR=-- ::",
             name,
+            pid,
             ec,
             iss,
             elr

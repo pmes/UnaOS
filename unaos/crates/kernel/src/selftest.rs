@@ -22,7 +22,7 @@
 //!
 //!   * `[boot-time]` — verdicts of the boot-sequenced fixtures (U-arc / M-arc), REPLAYED from a
 //!     kernel-side ring (`BOOT_RING`) that captures every `-> PASS`/`-> FAIL` line as it is emitted
-//!     during boot. These cannot be re-run on demand (they need an EL0 launcher refactor — TSTE-2),
+//!     during boot. These cannot be re-run on demand (they need a user launcher refactor — TSTE-2),
 //!     so `tste` replays the captured verdict rather than pretending to re-execute it.
 //!   * `[live]` — checks that HONESTLY re-run post-boot: scheduler introspection, heap round-trip,
 //!     the video geometry primitives (offscreen), and a fresh-task re-verification of the six sync
@@ -44,10 +44,10 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use spin::Mutex;
 
 use crate::arch::sched;
 use crate::console::Console;
@@ -60,10 +60,10 @@ use crate::pal::{GneissPal, TargetPal};
 // Every boot-sequenced fixture funnels its verdict through the serial print path as a uniform
 // `:: … -> PASS ::` / `:: … -> FAIL ::` line. `capture()` (called additively from each arch's
 // serial `_print`, the single seam) scans each formatted line and, on a match, records a truncated
-// label + verdict here. The ring is a fixed static (no alloc) guarded by a `try_lock` spin mutex; it
-// is called from IRQ-masked print contexts, so it never blocks, never allocates, and drops on lock
-// contention or overflow (counting drops). This is what lets `tste` REPLAY the boot fixtures it
-// cannot itself re-run.
+// label + verdict here. The ring is a fixed static (no alloc) and, since SERWIT-2, entirely LOCK-FREE:
+// it is called from IRQ-masked print contexts on every core at once, so it never blocks, never
+// allocates, and has no contention-loss path left at all — only the ring genuinely filling up, which is
+// counted and reported. This is what lets `tste` REPLAY the boot fixtures it cannot itself re-run.
 
 const RING_CAP: usize = 64;
 const NAME_MAX: usize = 40;
@@ -84,40 +84,140 @@ impl BootVerdict {
     }
 }
 
-struct BootRing {
-    entries: [BootVerdict; RING_CAP],
-    count: usize,
-    dropped: usize,
+/// SERWIT-2 — THE VERDICT RING IS A LEDGER, SO IT DOES NOT GET TO BE LOSSY.
+///
+/// This ring used to be a `Mutex<BootRing>` taken with `try_lock` from the print seam, and a failed
+/// `try_lock` discarded the verdict record with no counter. That is worse here than at the other three
+/// taps, because this is not a mirror of the wire — it is the ONLY record `tste` can replay from, and
+/// the lines it captures are exactly the `-> PASS` / `-> FAIL` lines the whole verification culture is
+/// built on. A `tste` table that is silently short reads as "that fixture never ran".
+///
+/// The tap also runs OUTSIDE the serial lock and outside the mask, so "contention is rare because
+/// prints are serialised" — the old comment's reasoning — was simply not true: every core reaches it at
+/// once. Under a multi-core burst the ring lost records routinely.
+///
+/// The fix is not to count the loss, it is to remove the lock. A fixed array of fixed-size records
+/// needs no mutual exclusion at all: a writer claims its index with one `fetch_add` and publishes the
+/// slot with one release store, exactly like the serial staging ring. So there is nothing left to
+/// contend for, nothing to `try_lock`, and NO loss path except the ring genuinely filling up — which
+/// was already counted and is already reported by `run()`. As a bonus this deletes a lock that was
+/// reachable from every print context on both arches.
+struct BootSlots {
+    entries: [UnsafeCell<BootVerdict>; RING_CAP],
+    ready: [AtomicBool; RING_CAP],
 }
 
-static BOOT_RING: Mutex<BootRing> = Mutex::new(BootRing {
-    entries: [BootVerdict::empty(); RING_CAP],
-    count: 0,
-    dropped: 0,
-});
+// SAFETY: each `entries[i]` is written by exactly one core — the one that won `BOOT_CLAIMED`'s
+// `fetch_add` for index `i`, which no other core can ever obtain — and is read only after that core's
+// `ready[i]` release store is observed with `Acquire`. The claim counter is what serialises the two, so
+// no two accesses to a slot ever overlap.
+unsafe impl Sync for BootSlots {}
 
-/// A tiny alloc-free `fmt::Write` sink: format `Arguments` into a fixed stack buffer so `capture`
-/// can substring-scan the line without touching the heap (safe from any print context).
-struct StackBuf {
-    buf: [u8; 200],
-    len: usize,
+static BOOT_SLOTS: BootSlots = BootSlots {
+    entries: [const { UnsafeCell::new(BootVerdict::empty()) }; RING_CAP],
+    ready: [const { AtomicBool::new(false) }; RING_CAP],
+};
+
+/// Verdict lines claimed so far, INCLUDING the ones that did not fit. Monotonic, so
+/// `count.saturating_sub(RING_CAP)` is the ring-full drop count with no separate counter to skew.
+static BOOT_CLAIMED: AtomicUsize = AtomicUsize::new(0);
+
+/// How much of a line's HEAD is kept for the label. The label is clipped to [`NAME_MAX`] (40) anyway,
+/// so this only has to be comfortably wider than that.
+const HEAD_MAX: usize = 200;
+
+/// SERWIT-2W — A STREAMING VERDICT SCANNER, BECAUSE THE OLD ONE LOST WHOLE VERDICTS.
+///
+/// `capture` used to format the line into a 200-byte stack buffer and then `find("-> PASS")` in it,
+/// with the comment "truncate silently; the verdict marker is early in the line". **The marker is not
+/// early in the line — it is at the END of it**, by the tree's own convention (`:: LABEL — detail …
+/// -> PASS ::`). So any verdict line longer than 200 bytes had its marker chopped off before the
+/// search ever ran, and the fixture was simply never recorded: not dropped-and-counted, not truncated,
+/// just absent from `tste`'s table as if it had never executed. 264 of the tree's format strings are
+/// wider than 240 bytes, and the widest verdict lines are exactly the detailed ones.
+///
+/// This scanner has no width limit at all. It keeps the first [`HEAD_MAX`] bytes (all the label can
+/// ever need) and matches the three needles incrementally against the stream, so a marker at byte 1200
+/// is found exactly as reliably as one at byte 12. Still alloc-free, still one fixed stack frame,
+/// still safe from an IRQ-masked print context.
+struct VerdictScan {
+    head: [u8; HEAD_MAX],
+    head_len: usize,
+    /// Bytes seen, whole line.
+    total: usize,
+    /// Incremental match positions for the three needles.
+    m_pass: usize,
+    m_fail: usize,
+    m_tste: usize,
+    /// Byte offset of the first verdict marker found, and which one.
+    hit: Option<(usize, bool)>,
+    /// Did the line mention TSTE anywhere (the suite's own output — never captured).
+    saw_tste: bool,
 }
-impl StackBuf {
+
+const N_PASS: &[u8] = b"-> PASS";
+const N_FAIL: &[u8] = b"-> FAIL";
+const N_TSTE: &[u8] = b"TSTE";
+
+/// Advance one needle by one byte; returns true when the needle completes here.
+#[inline]
+fn needle_step(state: &mut usize, needle: &[u8], b: u8) -> bool {
+    if b == needle[*state] {
+        *state += 1;
+        if *state == needle.len() {
+            *state = 0;
+            return true;
+        }
+    } else {
+        // Restart, but re-test this byte against the needle's first character — otherwise a needle
+        // whose first char immediately follows a failed partial match would be missed.
+        *state = usize::from(b == needle[0]);
+    }
+    false
+}
+
+impl VerdictScan {
     fn new() -> Self {
-        StackBuf { buf: [0u8; 200], len: 0 }
+        VerdictScan {
+            head: [0u8; HEAD_MAX],
+            head_len: 0,
+            total: 0,
+            m_pass: 0,
+            m_fail: 0,
+            m_tste: 0,
+            hit: None,
+            saw_tste: false,
+        }
     }
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    /// The kept head of the line, as `str`. The head can end mid-char (the cut is at a fixed byte
+    /// count), so take the longest valid prefix rather than throwing the whole label away.
+    fn head_str(&self) -> &str {
+        let bytes = &self.head[..self.head_len];
+        match core::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => core::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or(""),
+        }
     }
 }
-impl fmt::Write for StackBuf {
+
+impl fmt::Write for VerdictScan {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for &b in s.as_bytes() {
-            if self.len >= self.buf.len() {
-                break; // truncate silently; the verdict marker is early in the line
+            if self.head_len < HEAD_MAX {
+                self.head[self.head_len] = b;
+                self.head_len += 1;
             }
-            self.buf[self.len] = b;
-            self.len += 1;
+            self.total += 1;
+            if needle_step(&mut self.m_tste, N_TSTE, b) {
+                self.saw_tste = true;
+            }
+            if self.hit.is_none() {
+                if needle_step(&mut self.m_pass, N_PASS, b) {
+                    self.hit = Some((self.total - N_PASS.len(), true));
+                } else if needle_step(&mut self.m_fail, N_FAIL, b) {
+                    self.hit = Some((self.total - N_FAIL.len(), false));
+                }
+            }
         }
         Ok(())
     }
@@ -128,23 +228,29 @@ impl fmt::Write for StackBuf {
 /// alloc-free; `try_lock` only (drops on contention) so it is safe from IRQ-masked print contexts.
 /// Our OWN live `:: TSTE:` lines are excluded so replaying can't feed back on itself.
 pub fn capture(args: fmt::Arguments) {
-    let mut sb = StackBuf::new();
-    let _ = fmt::write(&mut sb, args);
-    let s = sb.as_str();
+    let tap = &crate::serial_ring::TAP_TSTE;
+    tap.submit();
+    let mut sc = VerdictScan::new();
+    let _ = fmt::write(&mut sc, args);
 
-    let (idx, pass) = if let Some(i) = s.find("-> PASS") {
-        (i, true)
-    } else if let Some(i) = s.find("-> FAIL") {
-        (i, false)
-    } else {
+    let Some((idx, pass)) = sc.hit else {
+        tap.suppress(); // not a verdict line — declined by policy, not lost
         return;
     };
-    if s.contains("TSTE") {
-        return; // never capture the suite's own live output
+    if sc.saw_tste {
+        tap.suppress(); // never capture the suite's own live output
+        return;
     }
 
-    // Clean the label: text before the verdict marker, minus a leading ":: " frame, trimmed.
-    let mut label = s[..idx].trim();
+    // Clean the label: text before the verdict marker, minus a leading ":: " frame, trimmed. The
+    // marker can sit past `HEAD_MAX` on a very wide line; the label is clipped to `NAME_MAX` (40)
+    // regardless, so the kept head is always enough.
+    let s = sc.head_str();
+    let mut cut = idx.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut label = s[..cut].trim();
     if let Some(rest) = label.strip_prefix(":: ") {
         label = rest;
     }
@@ -158,19 +264,24 @@ pub fn capture(args: fmt::Arguments) {
     let mut name = [0u8; NAME_MAX];
     let nlen = fit_label(label, &mut name);
 
-    if let Some(mut ring) = BOOT_RING.try_lock() {
-        if ring.count >= RING_CAP {
-            ring.dropped += 1;
-            return;
-        }
-        let slot = ring.count;
-        ring.entries[slot].name[..nlen].copy_from_slice(&name[..nlen]);
-        ring.entries[slot].len = nlen as u8;
-        ring.entries[slot].pass = pass;
-        ring.count += 1;
+    // SERWIT-2: claim a slot with one atomic increment. Wait-free, lock-free, and — unlike the
+    // `try_lock` this replaced — it cannot fail for any reason except the ring being genuinely full,
+    // which `BOOT_CLAIMED` records by construction (it keeps counting past `RING_CAP`).
+    let idx = BOOT_CLAIMED.fetch_add(1, Ordering::AcqRel);
+    if idx >= RING_CAP {
+        crate::serial_ring::TAP_TSTE.drop_line();
+        return;
     }
-    // Lock contended -> drop the record silently (a diagnostic ring, not a ledger). Rare: prints are
-    // serialised by the serial lock the caller already holds.
+    // SAFETY: this core exclusively owns slot `idx` — no other core can win the same `fetch_add` value
+    // — and no reader may touch it until the release store below.
+    unsafe {
+        let slot = &mut *BOOT_SLOTS.entries[idx].get();
+        slot.name[..nlen].copy_from_slice(&name[..nlen]);
+        slot.len = nlen as u8;
+        slot.pass = pass;
+    }
+    BOOT_SLOTS.ready[idx].store(true, Ordering::Release);
+    crate::serial_ring::TAP_TSTE.absorb();
 }
 
 /// Fit `label` into `out` (capacity `NAME_MAX`), returning the byte length written. Whole label if it
@@ -372,7 +483,7 @@ pub fn run(console: &mut Console, pal: &mut TargetPal) {
     );
     pager.line(console, pal, "----");
     pager.line(console, pal, &summary);
-    pager.line(console, pal, "footer: boot-sequenced EL0 fixtures re-run needs TSTE-2 (launcher refactor).");
+    pager.line(console, pal, "footer: boot-sequenced user fixtures re-run needs TSTE-2 (launcher refactor).");
     serial_println!(
         ":: TSTE: {} pass {} fail {} skip (+{} boot) ::",
         tally.pass, tally.fail, tally.skip, tally.boot
@@ -381,12 +492,24 @@ pub fn run(console: &mut Console, pal: &mut TargetPal) {
 }
 
 fn snapshot_boot_ring() -> (Vec<(String, bool)>, usize) {
-    let ring = BOOT_RING.lock();
-    let mut out = Vec::with_capacity(ring.count);
-    for e in ring.entries.iter().take(ring.count) {
+    let claimed = BOOT_CLAIMED.load(Ordering::Acquire);
+    let filled = claimed.min(RING_CAP);
+    let mut out = Vec::with_capacity(filled);
+    for i in 0..filled {
+        // A claimed-but-not-yet-published slot belongs to a core that is a handful of instructions from
+        // finishing; skip it rather than read a half-written record. It is not lost — it is simply not
+        // in THIS snapshot, and `tste` is read after boot, when no such slot exists in practice.
+        if !BOOT_SLOTS.ready[i].load(Ordering::Acquire) {
+            continue;
+        }
+        // SAFETY: `ready[i]` was published with `Release` by the slot's one and only writer, so the
+        // record is complete and no further write to it can occur.
+        let e = unsafe { &*BOOT_SLOTS.entries[i].get() };
         out.push((String::from(e.label()), e.pass));
     }
-    (out, ring.dropped)
+    // Ring-full loss, derived from the monotonic claim counter rather than a separate tally that could
+    // itself be lost. This is the ring's own channel, and it is the ONLY loss path left here.
+    (out, claimed.saturating_sub(RING_CAP))
 }
 
 // =================================================================================================

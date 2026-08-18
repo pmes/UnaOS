@@ -83,6 +83,19 @@ says so explicitly.
 
 ## 5. Native midden M1 — the framebuffer console is the x86 interactive shell
 
+> **2026-08-09 — the claim is now true, and here is what made it true.** Until this arc the
+> framebuffer console was a *second interpreter*: `shell.rs::dispatch_command` decided what a word
+> meant, wrote its own help, and invented "Unknown command" in a fallthrough arm, sharing no code
+> with `handlers/midden`. The command table, the parser, the bare-name resolver and the help text
+> now live once, `no_std`, in `unaos/libs/sys/midden_core`, and the kernel calls THROUGH it — the
+> kernel's `match` performs verbs but no longer decides them. The assessment behind the split (what
+> the kernel shell does today, the in-kernel stand-in for the Synapse, whether userspace needs
+> `std`, and the BeOS/BeFS `.elf` scheme), plus what M1 defers, is
+> [`docs/dev/USERLAND/MIDDEN_CONVERGENCE.md`](../../USERLAND/MIDDEN_CONVERGENCE.md).
+> A bare name now launches a program without its extension (`vug` starts `VUG.ELF`) while `ls`
+> still shows `VUG.ELF` — elision is a resolution rule, never a storage or display one.
+
+
 **The default x86 GUI build is the interactive path.** Historically the media flashed to the 2012
 rMBP was the `usbdebug` build (`UNAOS_USBDEBUG=1`), which attaches the framebuffer console to the
 serial log and then **loops forever** — it never reaches the interactive `Console` loop. Native

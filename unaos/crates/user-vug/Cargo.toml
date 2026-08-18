@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# UVUG-1: the first real EL0 graphics program — a userspace mini-vug. Like `user-elf` (ELFHELLO), this
+# crate's link product is kept AS AN ELF64 and handed to the kernel's aarch64 loader (validate + walk the
+# PT_LOAD program headers + map each segment with per-segment permissions). Unlike the single-routine
+# ELFHELLO, this program maps an off-screen surface (SYS_FB_MAP), spawns two EL0 worker threads
+# (SYS_THREAD_SPAWN) that render halves of an animated pattern under a FUTEX frame barrier, presents each
+# frame (SYS_FB_PRESENT), and after a bounded number of frames joins both workers, computes a deterministic
+# surface checksum, prints the `:: UVUG: … ::` witness, and exits 0. `arroyo kernel8` builds it for the
+# bare aarch64 target with its own linker script (crates/user-vug/user-vug.ld — two PT_LOAD segments via
+# a PHDRS clause) and stages the ELF onto the FAT media as VUG.ELF.
+#
+# The empty [workspace] table makes this crate its OWN workspace root, so the parent UnaOS workspace never
+# tries to build this no_std/no_main EL0 program for the host toolchain during `./arroyo check`.
+[workspace]
+
+[package]
+name = "user-vug"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-vug"
+path = "src/main.rs"
+
+# Tiny freestanding program: size-optimised, panic=abort (no unwinder in a no_std EL0 program), lto folds
+# the routines. No dependencies.
+# VUGSCENE: `opt-level = "z"` rather than `"s"`, and it is a REQUIREMENT rather than a preference. This
+# program links into a 4-page EL0 window whose `.text` may not pass 0x2000 — one byte over and `.bss` moves
+# a page, the image grows 4096 bytes in one step and `arroyo` refuses it (see the SIZE note in main.rs).
+# The solid-shard renderer measures 9534 bytes of `.text` at `"s"` and 8023 at `"z"`; only one of those
+# builds. Nothing in the frame loop is vectorisable here anyway — every surface write is volatile and the
+# ray loop is branch-bound — so what `"z"` costs in speed is small, and what it costs is in any case
+# reported honestly by the fps meter rather than hidden by it.
+[profile.release]
+opt-level = "z"
+panic = "abort"
+lto = true
+
+# ABIFREEZE: the syscall ABI, imported rather than re-typed. This crate used to declare its own copy
+# of the numbers it happened to use; `una-abi` is now the single declaration, shared with both
+# kernels. It is `no_std`, has no dependencies of its own, and contains nothing but `const` — so it
+# contributes ZERO bytes to this image and the page/size budgets are unchanged.
+[dependencies]
+una-abi = { path = "../una-abi" }
+
+# VUGSCENE: the MANUAL PIN for the adaptive detail ladder. `bg`/`run` carry a path and no argv (shell.rs:
+# `match args.first()`), so there is no runtime channel into an EL0 program — the pin is a build feature and
+# `arroyo` links the same source three times. Default (no feature) = the adaptive ladder = VUG.ELF;
+# `pinlo` = level 0 forever, the classic pattern = VUGC.ELF; `pinhi` = LOD_MAX forever = VUGX.ELF.
+# Mutually exclusive by convention; `pinlo` wins if both are somehow set (cfg order in main.rs).
+[features]
+pinlo = []
+pinhi = []

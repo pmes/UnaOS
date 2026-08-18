@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use super::trb::Trb;
+use super::dma_coherency;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
@@ -54,6 +55,10 @@ pub struct EventRing {
     trbs: *mut Trb,
     pub dequeue_index: usize,
     pub cycle_bit: bool, // What we expect the hardware to write
+    /// PIUSB-43: total TRBs ever consumed from this ring (monotonic, wrap-proof — `dequeue_index`
+    /// alone is mod-256 and cannot distinguish "no events" from "exactly 256k events"). Read-only
+    /// telemetry for the enum-portsc witness; costs one integer increment per pop.
+    pub popped: u64,
 }
 
 unsafe impl Send for EventRing {}
@@ -69,6 +74,7 @@ impl EventRing {
             trbs,
             dequeue_index: 0,
             cycle_bit: true, // xHCI starts writing 1s
+            popped: 0,
         }
     }
 
@@ -77,6 +83,18 @@ impl EventRing {
     // read with a volatile load — a plain read can be hoisted/cached by the compiler,
     // making a tight poll loop spin forever on a stale value.
     pub fn has_event(&self) -> bool {
+        // XHCI-COHERENCE (consumer boundary): the controller DMA-writes event TRBs into this ring.
+        // On a non-coherent bus (Pi 4 PCIe, Tegra XUSB post-EBS) the CPU's cached line for the
+        // current dequeue slot can be stale — the freshly-DMA'd cycle bit never observed — so a
+        // tight poll spins forever. Invalidate the dequeue TRB's line(s) before the volatile read so
+        // the CPU sees DRAM. This is the general aarch64 seam that SUPERSEDES the old tegra-only
+        // `has_event_after_invalidate` (identical `dc civac` + `dsb`, now covering the Pi too). The
+        // ring is CPU-read-only, so clean+invalidate loses nothing; on x86_64 this is a no-op and the
+        // read below is unchanged.
+        dma_coherency::clean_inval(
+            unsafe { self.trbs.add(self.dequeue_index) } as usize,
+            core::mem::size_of::<Trb>(),
+        );
         // Read the whole (aligned) TRB volatile — Trb is `packed`, so taking a reference
         // to an individual field is unaligned/illegal; copy it out, then read the field.
         let trb = unsafe { core::ptr::read_volatile(self.trbs.add(self.dequeue_index)) };
@@ -84,26 +102,9 @@ impl EventRing {
         cycle_state == self.cycle_bit
     }
 
-    /// JB3 boot-8 experiment (Tegra-only): invalidate the CPU's cached copy of the whole
-    /// ring (`dc civac` per line — clean+invalidate, safe for a ring the CPU only reads),
-    /// then re-run the freshness check. If an event MATERIALIZES that the cached read
-    /// missed, the controller's DMA writes are landing in DRAM and the failure is CPU-side
-    /// cache snooping (the `dma-coherent` fabric handoff died with ExitBootServices) — not
-    /// an SMMU/fabric drop.
-    #[cfg(feature = "tegra")]
-    pub fn has_event_after_invalidate(&self) -> bool {
-        let base = self.trbs as usize;
-        let end = base + EVENT_RING_SIZE * core::mem::size_of::<Trb>();
-        let mut p = base & !63;
-        while p < end {
-            unsafe {
-                core::arch::asm!("dc civac, {}", in(reg) p, options(nostack, preserves_flags))
-            };
-            p += 64;
-        }
-        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
-        self.has_event()
-    }
+    // (The tegra-only `has_event_after_invalidate` JB3 experiment was retired at the 2026-08-18
+    // sync: the general per-dequeue-TRB clean_inval inside `has_event` above supersedes it,
+    // covering the Pi too. No callers remained.)
 
     pub fn pop(&mut self) -> Option<Trb> {
         if !self.has_event() {
@@ -122,6 +123,7 @@ impl EventRing {
         let trb = unsafe { core::ptr::read_volatile(self.trbs.add(self.dequeue_index)) };
 
         // Advance
+        self.popped = self.popped.wrapping_add(1); // PIUSB-43 consumed-count witness
         self.dequeue_index += 1;
         if self.dequeue_index >= EVENT_RING_SIZE {
             self.dequeue_index = 0;
@@ -138,9 +140,35 @@ impl EventRing {
         self.trbs as u64
     }
 
+    /// BOT-RESCUE M2: return the event ring to its post-`new()` state — every TRB zeroed AND the
+    /// consumer position/colour reset to the xHCI initial expectation (index 0, expecting cycle 1).
+    ///
+    /// Two latent bugs fixed here. `write_bytes(ptr, 0, EVENT_RING_SIZE)` zeroed 256 **bytes**, not
+    /// 256 **TRBs** — 16 of the 256 slots, leaving 240 stale entries whose cycle bits still read as
+    /// the colour the consumer expects, so the next `has_event()` would report a fresh event that is
+    /// a replay of an old one. And it reset neither `dequeue_index` nor `cycle_bit`, so even a fully
+    /// zeroed ring would be consumed from the middle with the wrong expected colour.
+    ///
+    /// Currently UNCALLED: nothing in the driver clears the event ring after bring-up (the ring is
+    /// created once by `EventRing::new` and consumed for the life of the boot). It is fixed anyway
+    /// because a two-line "clear the ring" helper that silently corrupts the consumer handshake is
+    /// exactly the trap a future controller-reset path would step in, and it costs nothing to close.
+    /// The ERDP is NOT written here: the caller owns re-publishing the dequeue pointer to hardware
+    /// (`advance_erdp`), and a helper that touched MMIO would not be safe to call before the
+    /// interrupter exists.
     pub fn clear(&mut self) {
         unsafe {
             core::ptr::write_bytes(self.trbs, 0, EVENT_RING_SIZE);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            // XHCI-COHERENCE: the controller DMA-writes this ring; push the zeros out to DRAM so a
+            // non-snooping master does not later fetch our dirty lines over its own events. No-op x86.
+            dma_coherency::clean(
+                self.trbs as usize,
+                EVENT_RING_SIZE * core::mem::size_of::<Trb>(),
+            );
         }
+        self.dequeue_index = 0;
+        self.cycle_bit = true;
+        self.popped = 0;
     }
 }

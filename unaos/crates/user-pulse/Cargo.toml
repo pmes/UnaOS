@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# PULSE-1: the WINDOWED PULSE app — a tiny EL0 program that opens a compositor window and draws one
+# segmented load bar per core, in the visual language of the kernel's full-screen BeOS-Pulse homage (the
+# `pulse` shell verb). Like `user-stat` (STAT.ELF) and `user-vug` (VUG.ELF), this crate's link product is
+# kept AS AN ELF64 and handed to the kernel's ELF loader (validate + walk the PT_LOAD program headers +
+# map each segment with per-segment permissions).
+#
+# WHY IT EXISTS. The kernel's `pulse` monitor takes the WHOLE screen and runs inside the shell command, so
+# it cannot sit on the desktop next to anything else, and every pixel of it is drawn in ring 0. PULSE.ELF
+# is the same instrument as a ring-3 window: it reads the per-core counters through `SYS_CPUPULSE(49)` and
+# does its own delta math, so the kernel keeps exactly one sampler and gains no second drawing loop.
+#
+# It carries the display-honesty rule across the privilege boundary rather than leaving it behind: a core
+# whose counters are FROZEN over the refresh window and that is not the observer's own core draws a DASHED
+# bar and prints `park` — never a fabricated percent, and never a 0% that would read like "idle".
+#
+# The empty [workspace] table makes this crate its OWN workspace root, so the parent UnaOS workspace never
+# tries to build this no_std/no_main EL0 program for the host toolchain during `./arroyo check`.
+[workspace]
+
+[package]
+name = "user-pulse"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-pulse"
+path = "src/main.rs"
+
+# Tiny freestanding program: size-optimised, panic=abort (no unwinder in a no_std EL0 program), lto folds
+# the routines. No dependencies. The image must fit the kernel's 16 KiB EL0 window (arroyo asserts it).
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+
+# ABIFREEZE: the syscall ABI, imported rather than re-typed. This crate used to declare its own copy
+# of the numbers it happened to use; `una-abi` is now the single declaration, shared with both
+# kernels. It is `no_std`, has no dependencies of its own, and contains nothing but `const` — so it
+# contributes ZERO bytes to this image and the page/size budgets are unchanged.
+[dependencies]
+una-abi = { path = "../una-abi" }
