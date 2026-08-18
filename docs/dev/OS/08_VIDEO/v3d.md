@@ -6757,3 +6757,176 @@ overlay (§49.14 boot19), and `ENABLE_QPU` (§46.2 boots 17/19). Those are exclu
 disassembly that rediscovers them has spent its budget on the answer sheet.
 
 ---
+
+### 49.21 `basedaim` — the base-aim cut, built (PI-V3D-97, design note; flies on the next V3D sitting)
+
+§49.20.6 recommended "R1 + R3 as two legs of one boot". This section records that rung as built. It is
+a **design note, not a verdict**: QEMU raspi4b models no V3D, so nothing below has been observed. The
+gates it carries are compile, presence-in-artifact and knob-off byte-identity; the reading is the next
+metal sitting's, and §49.21.4 states, verbatim, the wire line each of the four pre-written outcomes
+produces so that sitting reads itself.
+
+#### 49.21.1 What was built, and where it rides
+
+The rung is **two extra legs on the `[v3d95]` scaffolding**, not a new rung — the `[v3d95]` kick becomes
+leg A of three, and legs B and C follow it inside the same function before the boot returns. That
+composition is the point: the boot4 reproduction and both variants come from **one image, one boot, one
+CT0 that was virgin at leg A**, so every comparison below is within-capture and none of it rests on
+diffing two boots.
+
+| leg | list | `CT0QMA`/`CT0QMS`/`CT0QTS` | what it is |
+|---|---|---|---|
+| **A** | 14 B `emptyunarm` | untouched (bring-up residue; boot4 read zero) | the `[v3d95]` kick, **unchanged and byte-identical** — the in-boot anchor |
+| **B** | 46 B (`emptyunarm` + 32 `FLUSH_VCD_CACHE`) | untouched | §49.20.6 **R3 `lenvary`** — the instrument control |
+| **C** | 14 B `emptyunarm` | **programmed**, and nothing else is | §49.20.6 **R1 `basedaim`** — the cut |
+
+Order is §49.20.6's own: *"Run R3's leg first (it validates the instrument), then R1's leg (it answers
+the question)"*. Each leg re-arms the `[v3d62]` catcher, re-seeds it, clears the fault latch, re-poisons
+every scanned region, and reads the violation pair once and first.
+
+Knob: **`UNAOS_V3D_BASEDAIM=1`**, cargo feature `v3d_basedaim`, which **implies `v3d_unarmclose`** (the
+Cargo.toml dependency and the `arroyo` block both arm it, so the operator cannot forget the half the
+legs ride on). Default OFF and fully uncompiled when off. The family law holds structurally, as it does
+for `[v3d95]`: the boot returns long before `[v3d75]`'s `ENABLE_QPU` and `[v3d80]`/`[v3d81d]`'s
+`DISPLAY_DONE` sends, so this knob can never sit beside them.
+
+#### 49.21.2 Leg C's three values, and why they are these
+
+Program **only** the three registers, to values the V3D MMU **actually maps** — the arena is identity-
+mapped in the V3D page table, so the whole arena qualifies — chosen so that no two arithmetic readings
+of the fault VA can collide at `VIO_ADDR`'s 8-byte quantum:
+
+| register | value | offset in the arena |
+|---|---|---|
+| `CT0QMA` | `arena + 0x4000` | the free 16 KiB gap between the clear target and `OFF_RCL` |
+| `CT0QMS` | `0x3000` | `V3D56_EXPECTED_EMPTY_BPCA_ADVANCE` — §49.18.4 item 2's one-tile reservation |
+| `CT0QTS` | `arena + 0x3A000` | the top of the arena, `0x36000` clear of the pool window |
+
+`CT0QTS` is written as the **bare base**: `ENABLE` (bit 1) is 0, because §49.20.6 R1 says *"no
+`CT0QTS.ENABLE` beyond what the base word carries"* and a page-aligned base carries none. A `QTS + 0x70`
+hit under `ENABLE = 0` would therefore be a finding in its own right, and the wire says so.
+
+Both targets are **decoys**, deliberately not the real pool (`OFF_BIN_TILEALLOC`) and not the real
+tile-state (`OFF_TILESTATE`). Two reasons. First, the real regions stay pristine as leg A's negative
+controls, so V4's shape is preserved across all three legs. Second, a decoy separates *"the aim derives
+from `CT0QMA`"* from *"the aim happens to be where the pool already is"* — with the armed values those
+two are the same number. Both decoy windows are poisoned with the `[v3d68]` index-encoding sentinel and
+scanned after the close, which is what makes §49.20.6's **fourth** outcome — no fault, because the write
+finally landed on a page the MMU maps — readable rather than merely inferred.
+
+Compile-time assertions carry the geometry: both windows inside the arena, `[QMA, QMA+QMS)` inside the
+poisoned pool window, `CT0QTS` 32-byte aligned, and the tile-state candidate a full page clear of the
+pool window's far end.
+
+#### 49.21.3 Leg B's control, and the self-check it needs
+
+The 46-byte list is `emptyunarm` with 32 extra 1-byte `FLUSH_VCD_CACHE` packets spliced into the
+prologue after the one the shape already carries — §49.20.6's suggested pad, placed where a VCD flush is
+legal and inert. 14 → 46 is `0xe` → `0x2e` raw, and `0x70` → `0x170` decoded: neither can be confused
+with the other, nor with any of leg C's candidates.
+
+The leg would be worthless if the padded encoder differed from the `emptyunarm` encoder in any way other
+than length, because then it would vary two things. So a **run-time self-check** runs first: it builds
+`BinContent::Empty` into the list address, copies the bytes, rebuilds with the padded encoder at
+`pad = 0`, and compares. The result is on the wire, and a failure **stands the whole rung down** — no
+kick is issued by either leg:
+
+```
+:: V3D: [v3d97] pad-selfcheck — build_bin_cl_content_geom(Empty) len=14 vs
+   build_bin_cl_emptyunarm_padded(pad=0) len=14 first_diff=[-1] identical=1 — the R3 encoder
+   reproduces the `emptyunarm` shape BYTE FOR BYTE at zero pad, so the padded leg varies EXACTLY ONE
+   thing: list length. R3's control value stands ::
+```
+
+#### 49.21.4 The wire, pre-written — what the sitting reads
+
+Every leg prints a `VIOLATION` line (the V2a read) and a `VERDICT` line. The `VIOLATION` line is the one
+that carries the evidence, because it is emitted from the **first and only** read of the pair:
+
+```
+:: V3D: [v3d97] LEG <B|C> VIOLATION (read ONCE, FIRST — §49.20.2 V2a; every later read of this pair on
+   this leg is VOID) — VIO_ADDR=0x……… VIO_ID=0x……… RAW, decoded client <C> @ VA 0x……… |
+   MMU_CTL=0x……… fault=<0|1> (PT_INVALID=… WRITE_VIOLATION=… CAP_EXCEEDED=…) ::
+```
+
+**Leg B — read this one FIRST. If R3 fires, leg C is void whatever it says.**
+
+| `VIO_ADDR` reads | the leg's verdict text begins | what it means |
+|---|---|---|
+| `0x0000002e` | `R3 FIRES: VIO_ADDR TRACKS THE LIST LENGTH` | the raw word is the byte count, not an address. §49.20 V2's *"client PTB @ VA 0x70"*, §49.20.5's wall statement and leg C are **all void**. Stop; re-plan R1/R2 against a corrected decode |
+| `0x0000000e` | `R3 CLEARS THE INSTRUMENT` | the word did not move with a list that did. The 14/`0xe` coincidence is retired and §49.20's reading survives its own control |
+| no fault at all | `NO FAULT ON THE PADDED LEG AT ALL` | neither confirms nor refutes; read the poison scans and the `[v3d62]` catcher on this leg before reading leg C |
+| anything else | `VIO_ADDR IS NEITHER 0xe NOR THIS LEG'S LENGTH` | a third variable moved it; name it before reading leg C |
+
+**Leg C — §49.20.6's four rows, with the arithmetic printed on the same line so no reader has to do it.**
+Write `A` for the arena base (`[v3d55] pte` publishes it; on boot4 it was `0x009be000`).
+
+| `VA` reads | the leg's verdict text begins | conclusion |
+|---|---|---|
+| `A + 0x4070` | `OUTCOME 1 — QMA + 0x70` | the close-time write is the **pool** write and it is base-relative. "Structural `0x70`" is refuted; the wall becomes *why did the MMU refuse a mapped address* |
+| `A + 0x7070` | `OUTCOME 1b — QMA + QMS + 0x70` | pool-**END**-relative — the same formula V5 saw from the other side (`BPCA + BPCS = QMA + QMS`). Also refutes "structural" |
+| `A + 0x3A070` | `OUTCOME 2 — QTS + 0x70` | the **tile-state** write, and it fired with `ENABLE = 0`. §49.18.4 item 4's placement divergence goes live; the next cut moves the tile-state to piOS's placement |
+| `0x00000070` | `OUTCOME 3 — 0x70, UNMOVED` | the aim is **genuinely absolute**; "structural" is finally earned. Licenses **R2 `mapzero`**, and promotes §49.20.7 item 4 (does the firmware map a low aperture?) to the head of the bunker brief |
+| no fault | `OUTCOME 4, THE INTERESTING ONE` | the write **landed**. The four `[v3d56]` scan lines say where: decoy pool ⇒ pool write off `CT0QMA`; decoy tile-state ⇒ tile-state write off `CT0QTS`; a real region ⇒ the aim is not derived from these registers at all. First completed close-time write this campaign would ever read |
+| anything else | `A FAULT LATCHED AT A VA NONE OF THE FOUR PRE-WRITTEN ROWS PREDICTS` | §49.20.6's own last row — do the subtraction against the three bases printed on the same line |
+
+Two further lines are worth naming before the sitting. The header is corrected **at line two**, so no
+reader ever holds the wrong shape for the capture (`[v3d95]`'s own header says "exactly one CT0 kick",
+which is false on a `basedaim` boot):
+
+```
+:: V3D: [v3d97] CORRECTION TO THE LINE ABOVE — UNAOS_V3D_BASEDAIM=1 is armed, so this boot takes THREE
+   CT0 kicks, not one. …
+```
+
+and leg C's `[v3d41]` PTB pointer line is now read against a **nonzero** pool base, so V5's two
+invariants (`BPCA − QMA = 0x3000` and `BPCA + BPCS ≡ QMA + QMS`) become checkable a second time on a base
+where they can fail. If they hold on `A + 0x4000` as they held on `0`, V5's "the PTB obeys `CT0QMA`"
+finding is confirmed on a residue that could have refuted it.
+
+#### 49.21.5 What this rung deliberately does NOT do
+
+**R2 (`mapzero`) is not built.** §49.20.6 orders it second, and first only if R1 returns `0x70` unmoved.
+It is the one candidate that grants the GPU a page it was previously denied, and building it beside R1
+would have left the aim question and the payload question entangled in one boot. The page table is
+untouched by this arc.
+
+No new mailbox tag is sent (the reply-less-mailbox hazard law). Nothing outside `drivers/gpu` / the v3d
+rung files, `arroyo` and `Cargo.toml` is edited. `CT0QMA`/`CT0QMS`/`CT0QTS` are **left programmed** at
+leg C's values when the rung returns — nothing runs after it, and a restore would be one more register
+write between the verdict and the wire; the closing line says so.
+
+#### 49.21.6 Gates
+
+`./arroyo check` and `UNAOS_WC=1 ./arroyo check` green (12 cfg legs; `v3d_basedaim` appended to the
+`arm-pi` leg, so both polarities of every new `#[cfg]` are compiled). `./arroyo kernel8-test` green at
+its banked standing on a quiet host. Presence in the builder-path artifact, per the full-knob law:
+
+```
+strings target/pi_baremetal/kernel8.img | grep -c 'v3d97] BASEDAIM BOOT'      → 1
+strings target/pi_baremetal/kernel8.img | grep -c 'VIOLATION (read ONCE, FIRST' → 1
+strings target/pi_baremetal/kernel8.img | grep -c 'OUTCOME 1' … 'OUTCOME 4'    → all present
+```
+
+Knob-off byte-identity is proven twice over, on `target/pi_baremetal/kernel8.img`: a plain build with
+the arc applied hashes **identically to the pre-arc plain build**, and — the stronger statement — a
+`UNAOS_V3D_UNARMCLOSE=1` build with the arc applied hashes **identically to a `UNAOS_V3D_UNARMCLOSE=1`
+build with the arc reverse-applied**. The `[v3d95]` rung is therefore unchanged as a binary, not merely
+as source, on every boot that does not arm `UNAOS_V3D_BASEDAIM`.
+
+#### 49.21.7 What the sitting needs
+
+One image, built with:
+
+```
+UNAOS_V3D=1 UNAOS_V3D_UNARMCLOSE=1 UNAOS_V3D_BASEDAIM=1 UNAOS_PI=1 ./arroyo kernel8
+```
+
+(`UNAOS_V3D_BASEDAIM=1` alone would suffice — the feature implies the other two — but the full line is
+what the capture should record.) A **cold power-cycle**, as boot4 was: §49.20.2 V6/V7 both turn on the
+entry state, and a warm re-boot puts a different block in front of leg A. One capture, short by design,
+labelled and **never** diffed line-for-line against a deep boot. Read in this order: the
+`[v3d97] pad-selfcheck` line, then leg B's `VIOLATION` and `VERDICT`, then — only if R3 did not fire —
+leg C's.
+
+---

@@ -89,6 +89,11 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # feature — the `[v3d95]` unarmed-close-writes rung, which takes one `emptyunarm`-shaped CT0 kick
 # before probe_job and reads CT0QMA/CT0QMS/CT0QTS and the PTB fault address across the close without
 # programming any of them. See the kernel8 knob block below and v3d.md §49.12.1.
+#
+# PI-V3D-97: UNAOS_V3D_BASEDAIM=1 is a plain arming knob (no value) for the `v3d_basedaim` feature —
+# the `[v3d97]` basedaim rung, v3d.md §49.20.6's R1 with R3 in front. It rides the `[v3d95]` rung as
+# two EXTRA legs and therefore implies `v3d_unarmclose` (declared in Cargo.toml and armed here), so
+# `UNAOS_V3D_BASEDAIM=1` alone is sufficient. See the kernel8 knob block below and v3d.md §49.21.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1570,7 +1575,7 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -2693,6 +2698,40 @@ kernel8() {
     if [ -n "${UNAOS_V3D_UNARMCLOSE:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d_unarmclose,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_UNARMCLOSE: the [v3d95] unarmed-close-writes rung — ONE unarmed CT0 kick before probe_job, tile-memory registers READ (never programmed) either side, [v3d62] catcher armed, then bringup returns (⚠ short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-97: UNAOS_V3D_BASEDAIM=1 adds the `v3d_basedaim` feature — v3d.md §49.20.6's R1 (`basedaim`)
+    # with R3 (`lenvary`) riding in front, built as TWO EXTRA LEGS on the [v3d95] rung. It therefore
+    # IMPLIES UNAOS_V3D_UNARMCLOSE (and UNAOS_V3D): the cargo feature declares
+    # `v3d_basedaim = ["v3d_unarmclose"]` so the implication cannot be forgotten, and this block arms
+    # both features itself so the env side matches the cargo side without the operator remembering.
+    # WHY: §49.20 settled that the unarmed close DOES write, that the V3D MMU refuses it (PT_INVALID +
+    # WRITE_VIOLATION, client PTB, VA 0x70, raw VIO_ADDR=0xe VIO_ID=0x20), that the [v3d62] catcher
+    # absorbs it and that nothing GPU-reachable moves — and, in V5, that the PTB OBEYS CT0QMA/CT0QMS,
+    # its reservation arithmetic coming out exact (BPCA−QMA=0x3000, BPCA+BPCS ≡ QMA+QMS mod 2^32) on a
+    # base of ZERO. A zero base is the one residue under which "absolute 0x70" and "base 0 + 0x70" are
+    # indistinguishable, so the write is LOCATED and the aim is NOT. This knob moves the base.
+    # LEG B (R3) runs first and is the instrument control: the identical bare submit on the same zero
+    # bases with the list padded 14 -> 46 bytes (32 extra FLUSH_VCD_CACHE packets; a run-time
+    # self-check proves the padded encoder is byte-identical at zero pad, so exactly ONE thing varies).
+    # VIO_ADDR=0x2e ⇒ the raw word tracks LIST LENGTH and the entire VA-0x70 reading is an artifact,
+    # voiding leg C; VIO_ADDR=0xe ⇒ the reading survives its own control.
+    # LEG C (R1) is the cut: CT0QMA/CT0QMS/CT0QTS and NOTHING else programmed (no BPOS=0, no pre-kick
+    # L2T invalidate, no QTS.ENABLE), to three mutually distinguishable ARENA-MAPPED values, then the
+    # byte-identical 14-byte submit. Wire outcomes are pre-written: QMA+0x70 = the pool write is
+    # base-relative; QMA+QMS+0x70 = pool-end-relative; QTS+0x70 = the tile-state write (§49.18.4 item 4
+    # goes live); 0x70 unmoved = the aim is genuinely absolute and R2 is licensed; NO FAULT = the write
+    # LANDED on a page the MMU maps, which the two poisoned decoy windows plus the [v3d56] landing
+    # digest then locate.
+    # §49.20.2's V2a law is carried in code: every leg reads MMU_VIO_ADDR/MMU_VIO_ID ONCE and FIRST
+    # after its wait, and both RAW words ride every line. No page table is edited (that is R2
+    # `mapzero`, deliberately not built) and no mailbox tag is sent.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D, so [v3d95]
+    # prints its hub-absent SKIPPED line and returns before these legs are reached — kernel8-test green
+    # means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_BASEDAIM:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_BASEDAIM: the [v3d97] basedaim rung — TWO extra CT0 kicks on the [v3d95] leg (B = R3 lenvary, 46-byte list on zero bases; C = R1 basedaim, CT0QMA/QMS/QTS programmed to arena-mapped values), violation pair read ONCE and FIRST per leg (⚠ implies UNAOS_V3D_UNARMCLOSE; short capture — do not diff against a deep boot)${COLOR_RESET}"
     fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::

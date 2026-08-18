@@ -1072,6 +1072,39 @@ v3d_firstkick = ["v3d"]
 # See docs/dev/OS/08_VIDEO/v3d.md §49.12.1.
 v3d_unarmclose = ["v3d"]
 
+# PI-V3D-97: the BASEDAIM rung — v3d.md §49.20.6's R1 with R3 riding in front, built as two extra legs
+# on the `[v3d95]` scaffolding (hence the feature IMPLIES `v3d_unarmclose`; it cannot be armed alone).
+# §49.20 settled where the unarmed close's write goes (the MMU refuses it: PT_INVALID+WRITE_VIOLATION,
+# client PTB, VA 0x70; the `[v3d62]` catcher absorbs it; nothing GPU-reachable moves) and, in V5, that
+# the PTB OBEYS CT0QMA/CT0QMS — its reservation arithmetic was exact (BPCA−QMA=0x3000,
+# BPCA+BPCS ≡ QMA+QMS) on a base of ZERO. Zero is the one residue under which "absolute 0x70" and
+# "base 0 + 0x70" are the same number, so §49.20's honest standing is "the write is located, the aim is
+# not". This rung moves the base and reads the fault VA again.
+#   LEG B (R3 `lenvary`) runs FIRST — the instrument control. Both VA-0x70 boots submitted a 14-byte
+#   list and the raw VIO_ADDR word is 0xe = 14. This leg re-runs the identical bare submit on the same
+#   zero bases with the list padded to 46 bytes (32 extra 1-byte FLUSH_VCD_CACHE packets in the
+#   prologue; a run-time self-check proves the padded encoder is byte-identical to the `emptyunarm`
+#   shape at zero pad, so exactly ONE thing varies). VIO_ADDR = 0x2e ⇒ the raw word tracks list length,
+#   the whole VA-0x70 reading is an artifact, and leg C is VOID. VIO_ADDR = 0xe ⇒ the reading survives.
+#   LEG C (R1 `basedaim`) is the cut — CT0QMA/CT0QMS/CT0QTS and NOTHING ELSE programmed (no BPOS=0, no
+#   pre-kick L2T invalidate, no QTS.ENABLE), to three mutually distinguishable ARENA-MAPPED values, then
+#   the byte-identical 14-byte submit. Four outcomes are pre-written on the wire: QMA+0x70 (pool write,
+#   base-relative), QMA+QMS+0x70 (pool-end-relative), QTS+0x70 (tile-state write — §49.18.4 item 4's
+#   placement divergence goes live), 0x70 unmoved (genuinely absolute; "structural" earned, and R2
+#   licensed), and "no fault" — the most interesting one, meaning the write LANDED on a page the MMU
+#   maps, which the two poisoned decoy windows and the `[v3d56]` landing digest then locate.
+# §49.20.2's V2a instrument law is carried IN CODE: each leg reads MMU_VIO_ADDR/MMU_VIO_ID once and
+# first after its wait (the pair is NOT sticky — on boot4 the second and third reads returned zero and
+# the third decoded zero as client `L2T`, which is not an attribution), and both raw words ride every
+# line. The `[v3d62]` catcher is re-armed per leg and the real tile-state/pool poison rides as leg A's
+# negative control. No page table is edited (that is R2 `mapzero`, deliberately not built here) and no
+# mailbox tag is sent. Default OFF and fully uncompiled when off, so a `v3d_unarmclose`-only image is
+# byte-identical to the pre-arc one. Enable via `UNAOS_V3D=1 UNAOS_V3D_UNARMCLOSE=1
+# UNAOS_V3D_BASEDAIM=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately produces a SHORT
+# capture missing every banked witness; it must never be diffed line-for-line against a full deep boot.
+# See docs/dev/OS/08_VIDEO/v3d.md §49.21.
+v3d_basedaim = ["v3d_unarmclose"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding

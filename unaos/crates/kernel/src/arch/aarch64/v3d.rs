@@ -15422,6 +15422,12 @@ fn v3d95_unarmed_close_rung() {
     serial_println!(
         ":: V3D: [v3d95] UNARMED-CLOSE-WRITES BOOT — READ THIS FIRST. UNAOS_V3D_UNARMCLOSE=1 arms exactly one CT0 kick, placed after M3 and BEFORE probe_job, and the boot then RETURNS: no [v3d48] ladder, no M4, no visible battery, no [v3d75]/[v3d80]/[v3d81] tails (which is also why this knob can never sit beside the QPU or DISPLAY_DONE sends). The kick is the `emptyunarm` shape byte for byte — the [v3d48] Empty BIN list through the rcl-class submit: NO CT0QMA, NO CT0QMS, NO CT0QTS, NO BPOS=0, NO pre-kick L2T invalidate, bare CT0QBA->CT0QEA with a CPU clean_range publish only. The question is v3d.md §49.10's: boot11 closed a frame under exactly this submit and latched a PTB WRITE_VIOLATION+PT_INVALID at VA 0x70, so WHERE DO THE WRITES OF AN UNARMED FRAME-CLOSE GO? This rung PROGRAMS NOTHING by design and READS the three tile-memory registers pre and post, with the [v3d62] fault catcher armed across the kick. The capture is deliberately short and MUST NOT be diffed line-for-line against a deep boot ::"
     );
+    // PI-V3D-97: correct the header ABOVE at line two, so no reader ever holds a wrong shape for this
+    // capture. `UNAOS_V3D_BASEDAIM=1` makes the [v3d95] kick leg A of THREE.
+    #[cfg(feature = "v3d_basedaim")]
+    serial_println!(
+        ":: V3D: [v3d97] CORRECTION TO THE LINE ABOVE — UNAOS_V3D_BASEDAIM=1 is armed, so this boot takes THREE CT0 kicks, not one. The [v3d95] kick below is LEG A (the zero-base, 14-byte boot4 reproduction, unchanged); [v3d97] then takes LEG B (v3d.md §49.20.6 R3 `lenvary` — zero bases, 46-byte list) and LEG C (R1 `basedaim` — CT0QMA/CT0QMS/CT0QTS programmed to arena-mapped values, 14-byte list). Everything else the header says still holds: no probe_job, no [v3d48] ladder, no M4, no visible battery, no [v3d75]/[v3d80]/[v3d81] tails, and the boot RETURNS ::"
+    );
     match probe_hub_ident0() {
         V3dPresence::Up(_) => {}
         V3dPresence::Down => {
@@ -15576,7 +15582,442 @@ fn v3d95_unarmed_close_rung() {
     mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
     dsb();
     clear_mmu_fault_latch("v3d95 post-kick");
+
+    // PI-V3D-97 — the `basedaim` legs (v3d.md §49.20.6 R3 then R1) ride HERE, after leg A has closed
+    // its frame and the latch is clear. Leg A above is untouched by them: with `v3d_basedaim` off the
+    // call and everything it reaches are uncompiled, so a `UNAOS_V3D_UNARMCLOSE=1`-only image is byte
+    // for byte the pre-arc one.
+    #[cfg(feature = "v3d_basedaim")]
+    v3d97_basedaim_legs();
+
+    #[cfg(not(feature = "v3d_basedaim"))]
     serial_println!(
         ":: V3D: [v3d95] UNARMED-CLOSE BOOT COMPLETE — one CT0 kick taken and nothing else. probe_job, the [v3d48] ladder, M4 and the whole visible battery were NOT run this boot, by design. Re-run without UNAOS_V3D_UNARMCLOSE for a full boot ::"
+    );
+    // PI-V3D-97: on a `basedaim` boot the sentence above would be FALSE — three CT0 kicks were taken,
+    // not one — and this file does not print a false line to keep a string stable. The rest of the
+    // exclusion is unchanged and is restated here.
+    #[cfg(feature = "v3d_basedaim")]
+    serial_println!(
+        ":: V3D: [v3d95] UNARMED-CLOSE BOOT COMPLETE — THREE CT0 kicks taken (legs A/B/C, [v3d97] BASEDAIM above) and nothing else. probe_job, the [v3d48] ladder, M4 and the whole visible battery were NOT run this boot, by design. Re-run without UNAOS_V3D_UNARMCLOSE for a full boot ::"
+    );
+}
+
+// ═══ PI-V3D-97 — `basedaim`: the base-aim cut. v3d.md §49.20.6 R1, with R3 riding in front. ═══════
+//
+// THE QUESTION, from §49.20.5's wall statement. §49.20 settled that an unarmed frame-close DOES issue
+// a write (V2), that the V3D MMU refuses it as PT_INVALID + WRITE_VIOLATION from the PTB client at
+// `VA 0x70` (V2), that the `[v3d62]` catcher absorbs it (V3), that nothing GPU-reachable moves (V4)
+// and — the finding that forced this rung — that the PTB OBEYS `CT0QMA`/`CT0QMS`: on boot4 its own
+// reservation arithmetic came out exact (`BPCA − QMA = 0x3000`, `BPCA + BPCS ≡ QMA + QMS` mod 2³²) on
+// a base of ZERO (V5). A zero base is the one residue under which "absolute `0x70`" and
+// "base 0 + `0x70`" are the same number, so the aim is UNLOCATED. This rung moves the base.
+//
+// THE TWO LEGS, in §49.20.6's own order — the control first, the cut second.
+//
+//   LEG B (R3, `lenvary`) — THE INSTRUMENT CONTROL, and it runs FIRST because everything downstream
+//   depends on it. Both boots that produced `VA 0x70` submitted a FOURTEEN-byte list, and the raw
+//   `VIO_ADDR` word both boots latched is `0xe` — fourteen. That is very probably a coincidence of the
+//   `DEBUG_INFO`-derived shift-3 decode (§26), but it is an UNCONTROLLED one, and a number appearing
+//   twice in two roles gets controlled rather than argued about. This leg re-runs the identical bare
+//   submit with the identical bases (still zero — leg A programmed nothing and neither does this one)
+//   and changes EXACTLY ONE thing: the list is padded to 46 bytes with 32 extra `FLUSH_VCD_CACHE`
+//   packets spliced into the prologue, the pad §49.20.6 names. If `VIO_ADDR` reads `0x2e` the raw word
+//   tracks list length, the whole `VA 0x70` reading is an instrument artifact, and leg C's verdict is
+//   VOID whatever it says. If it reads `0xe` again the reading survives and leg C is entitled to run.
+//
+//   LEG C (R1, `basedaim`) — THE CUT. Program ONLY `CT0QMA`, `CT0QMS` and `CT0QTS`, to mutually
+//   distinguishable ARENA-MAPPED values, and re-run the byte-identical 14-byte submit. Nothing else:
+//   no `BPOS=0`, no pre-kick L2T invalidate, no `CT0QTS.ENABLE` beyond what the base word carries
+//   (our base word is page-aligned, so ENABLE reads 0 — stated on the wire, because a `QTS+0x70` hit
+//   under ENABLE=0 would itself be a finding). Then read the fault VA and do the arithmetic.
+//
+// WHY THESE THREE VALUES. The arena is identity-mapped in the V3D page table, so every address below
+// is one the V3D MMU ACTUALLY MAPS — which is what makes the "no fault" outcome informative rather
+// than merely negative. They are chosen so the four candidate VAs are pairwise separated by far more
+// than the 8-byte `VIO_ADDR` quantum, and so that no two arithmetic readings can collide:
+//
+//   QMA + 0x70          = arena + 0x04070      (base-relative pool write)
+//   QMA + QMS + 0x70    = arena + 0x07070      (pool END-relative — the other base+size reading)
+//   QTS + 0x70          = arena + 0x3A070      (tile-state write; §49.18.4 item 4 goes live)
+//   0x70                = 0x00000070           (genuinely absolute — "structural" finally earned)
+//
+// and the R3 artifact readings (`VIO_ADDR` = 0xe or 0x2e → VA 0x70 or 0x170) collide with none of them.
+// Both windows are POISONED with the `[v3d68]` index-encoding sentinel and SCANNED after the close, so
+// the most interesting outcome — no fault at all, because the write finally landed on a page the MMU
+// maps — is read directly off the poison rather than inferred.
+//
+// THE INSTRUMENT LAW THIS RUNG CARRIES (§49.20.2 V2a, promoted to a standing law by that section).
+// The violation pair is NOT sticky: on boot4 three reads across one latched window returned `0xe`/`0x20`
+// then zero then zero, and the third decoded its zero as client `L2T`, which is not an attribution.
+// So each leg reads `MMU_VIO_ADDR` and `MMU_VIO_ID` ONCE, FIRST, before any other MMU read and before
+// any print — `v3d97_violation_once` is that read and it is the first statement after the wait — and
+// every later read of the pair (the `[v3d62]` witness's, the post-kick latch clear's) is VOID by
+// construction. Both raw words ride every line, so no reader has to trust a decode.
+//
+// SAFETY / BLAST RADIUS. Two extra CT0 kicks in the shape leg A already took; the `[v3d62]` catcher is
+// re-armed and the latch re-cleared per leg, so each leg's report belongs to its own frame. Every
+// address handed to the block is `arena_contains`-checked and the leg fails closed if not. No new
+// mailbox tag is sent (the reply-less-mailbox hazard law). No page table is edited — R2 (`mapzero`) is
+// the rung that grants the GPU a page it was denied, and it is deliberately NOT built here.
+
+/// PI-V3D-97 — the R1 decoy POOL window: the free 16 KiB gap between `OFF_TARGET`'s clear target and
+/// `OFF_RCL`. Deliberately NOT the real pool (`OFF_BIN_TILEALLOC`) — the real pool and the real
+/// tile-state stay pristine as leg A's negative controls, and a decoy separates "the aim derives from
+/// `CT0QMA`" from "the aim happens to be where the pool already is".
+#[cfg(feature = "v3d_basedaim")]
+const OFF_V3D97_POOL: usize = 0x04000;
+#[cfg(feature = "v3d_basedaim")]
+const V3D97_POOL_BYTES: usize = 0x4000; // 16 KiB — holds QMA+0x70 AND QMA+QMS+0x70 inside the poison
+/// The size word. `[QMA, QMA+QMS)` lies wholly inside the poisoned window, and `QMS` is the exact
+/// one-tile reservation §49.18.4 item 2 banks (`V3D56_EXPECTED_EMPTY_BPCA_ADVANCE`), so `BPCA`'s
+/// arithmetic on a NONZERO base is checkable against the same invariant V5 checked on zero.
+#[cfg(feature = "v3d_basedaim")]
+const V3D97_QMS: u32 = V3D56_EXPECTED_EMPTY_BPCA_ADVANCE; // 0x3000
+/// The R1 decoy TILE-STATE page — the top of the arena, `0x36000` away from the pool decoy. It shares
+/// its address with `OFF_V3D68_TSDA`, the `[v3d68]` geometry ladder's tile-state array, and that is
+/// safe by construction: this rung returns before `probe_job`, so the `[v3d68]` battery cannot run on
+/// a boot that reaches here, and the window is poisoned by this leg immediately before use.
+#[cfg(feature = "v3d_basedaim")]
+const OFF_V3D97_TS: usize = OFF_V3D68_TSDA; // 0x3A000
+#[cfg(feature = "v3d_basedaim")]
+const V3D97_TS_BYTES: usize = 0x1000;
+/// R3's pad: 32 extra 1-byte `FLUSH_VCD_CACHE` packets take the `emptyunarm` list from 14 (`0xe`) to
+/// 46 (`0x2e`) bytes — a length whose raw word cannot be confused with `0xe` and whose shift-3 decode
+/// (`0x170`) cannot be confused with `0x70`.
+#[cfg(feature = "v3d_basedaim")]
+const V3D97_PAD_FLUSHES: usize = 32;
+
+#[cfg(feature = "v3d_basedaim")]
+const _: () = assert!(OFF_V3D97_POOL >= TARGET_BYTES); // below the gap: the clear target
+#[cfg(feature = "v3d_basedaim")]
+const _: () = assert!(OFF_V3D97_POOL + V3D97_POOL_BYTES <= OFF_RCL); // above it: the M1 RCL
+#[cfg(feature = "v3d_basedaim")]
+const _: () = assert!((V3D97_QMS as usize) + 0x1000 <= V3D97_POOL_BYTES); // QMA+QMS+0x70 stays poisoned
+#[cfg(feature = "v3d_basedaim")]
+const _: () = assert!(OFF_V3D97_TS + V3D97_TS_BYTES <= ARENA_BYTES);
+#[cfg(feature = "v3d_basedaim")]
+const _: () = assert!(OFF_V3D97_TS % 32 == 0); // CT0QTS carries the base in its upper bits (ENABLE=bit1)
+/// Mutual distinguishability, checked at compile time rather than asserted in prose: the tile-state
+/// candidate sits a full page clear of the pool window's far end, so no `VIO_ADDR` (8-byte quantum)
+/// can be read as both.
+#[cfg(feature = "v3d_basedaim")]
+const _: () = assert!(OFF_V3D97_TS >= OFF_V3D97_POOL + V3D97_POOL_BYTES + PAGE);
+
+/// The three words leg C programs, and nothing else.
+#[cfg(feature = "v3d_basedaim")]
+#[derive(Clone, Copy)]
+struct V3d96Bases {
+    qma: u32,
+    qms: u32,
+    qts: u32,
+}
+
+/// PI-V3D-97 §49.20.2 V2a — read the violation pair ONCE and FIRST. Returns the two RAW words and
+/// nothing derived: the caller decodes afterwards (`vio_decode` itself reads `MMU_DEBUG_INFO`, which
+/// is exactly the "other MMU read" the law puts behind this one).
+#[cfg(feature = "v3d_basedaim")]
+#[inline]
+fn v3d97_violation_once() -> (u32, u32) {
+    let vio_addr = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ADDR);
+    let vio_id = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ID);
+    (vio_addr, vio_id)
+}
+
+/// PI-V3D-97 R3 — the `emptyunarm` list with `pad` extra `FLUSH_VCD_CACHE` packets spliced into the
+/// prologue, immediately after the one the shape already carries. Packet SET, ORDER, geometry and
+/// encoding are otherwise `BinContent::Empty`'s exactly; `pad == 0` reproduces it byte for byte, and
+/// `v3d97_pad_selfcheck` PROVES that on the wire rather than asserting it in this comment.
+#[cfg(feature = "v3d_basedaim")]
+fn build_bin_cl_emptyunarm_padded(cl_off: usize, pad: usize) -> usize {
+    let mut w = RclWriter::new(cl_off);
+    w.pkt(Pkt::new(P_NUMBER_OF_LAYERS, 2).f(0, 8, 0).done());
+    w.pkt(
+        Pkt::new(P_TILE_BINNING_MODE_CFG, 9)
+            .f(2, 2, TILE_ALLOC_BLOCK_SIZE_128B)
+            .f(4, 2, TILE_ALLOC_BLOCK_SIZE_64B)
+            .f(8, 4, 0)
+            .f(12, 2, INTERNAL_BPP_32)
+            .f(32, 16, (TARGET_W - 1) as u64)
+            .f(48, 16, (TARGET_H - 1) as u64)
+            .done(),
+    );
+    w.pkt(Pkt::new(P_FLUSH_VCD_CACHE, 1).done());
+    // R3's ONLY variable. Placed before START_TILE_BINNING, where a VCD flush is legal and inert.
+    for _ in 0..pad {
+        w.pkt(Pkt::new(P_FLUSH_VCD_CACHE, 1).done());
+    }
+    w.pkt(Pkt::new(P_START_TILE_BINNING, 1).done());
+    w.pkt(Pkt::new(P_FLUSH, 1).done());
+    w.len()
+}
+
+#[cfg(feature = "v3d_basedaim")]
+#[inline]
+fn v3d97_arena_byte(off: usize) -> u8 {
+    unsafe { core::ptr::read_volatile((arena_phys() + off) as *const u8) }
+}
+
+/// Prove — on the wire, at run time, on the metal that matters — that `build_bin_cl_emptyunarm_padded`
+/// with zero pad is byte-identical to the `emptyunarm` shape leg A submitted. Without this, R3 varies
+/// TWO things (length and encoder) and its control value is worthless. Builds both into the same
+/// address in turn, so the comparison is of bytes the block would actually have fetched.
+#[cfg(feature = "v3d_basedaim")]
+fn v3d97_pad_selfcheck() -> bool {
+    let base_len = build_bin_cl_content_geom(
+        OFF_PROBE_BIN_CL, OFF_SHADREC, 1, BinContent::Empty, TARGET_W, TARGET_H,
+    );
+    let mut ref_bytes = [0u8; 32];
+    let n = if base_len < 32 { base_len } else { 32 };
+    for i in 0..n {
+        ref_bytes[i] = v3d97_arena_byte(OFF_PROBE_BIN_CL + i);
+    }
+    let pad0_len = build_bin_cl_emptyunarm_padded(OFF_PROBE_BIN_CL, 0);
+    let mut same = pad0_len == base_len;
+    let mut first_diff: i32 = -1;
+    for i in 0..n {
+        if v3d97_arena_byte(OFF_PROBE_BIN_CL + i) != ref_bytes[i] {
+            same = false;
+            if first_diff < 0 {
+                first_diff = i as i32;
+            }
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d97] pad-selfcheck — build_bin_cl_content_geom(Empty) len={} vs build_bin_cl_emptyunarm_padded(pad=0) len={} first_diff=[{}] identical={} — {} ::",
+        base_len, pad0_len, first_diff, same as u32,
+        if same {
+            "the R3 encoder reproduces the `emptyunarm` shape BYTE FOR BYTE at zero pad, so the padded leg varies EXACTLY ONE thing: list length. R3's control value stands"
+        } else {
+            "THE R3 ENCODER DIVERGES FROM THE `emptyunarm` SHAPE AT ZERO PAD — the padded leg would vary TWO things and its verdict would be VOID. Do not read leg B; fix the encoder and re-take"
+        }
+    );
+    same
+}
+
+/// PI-V3D-97 — one leg. `pad` selects the list (0 = the 14-byte `emptyunarm` shape, `V3D97_PAD_FLUSHES`
+/// = the 46-byte R3 list); `bases` is `None` for R3 (nothing programmed, bases stay at leg A's zero) and
+/// `Some` for R1. Everything else — the catcher, the poison, the submit, the wait — is leg A's, verbatim.
+#[cfg(feature = "v3d_basedaim")]
+fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>) {
+    let cl_len = build_bin_cl_emptyunarm_padded(OFF_PROBE_BIN_CL, pad);
+    cache::clean_range(arena_phys() + OFF_PROBE_BIN_CL, cl_len);
+    let ba = (arena_phys() + OFF_PROBE_BIN_CL) as u32;
+    let ea = ba + cl_len as u32;
+    let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    let ts = (arena_phys() + OFF_TILESTATE) as u32;
+    let decoy_pool = (arena_phys() + OFF_V3D97_POOL) as u32;
+    let decoy_ts = (arena_phys() + OFF_V3D97_TS) as u32;
+    serial_println!(
+        ":: V3D: [v3d97] LEG {} ({}) — list [{:#010x},{:#010x}) len={} ({:#x}) bytes, pad={} extra FLUSH_VCD_CACHE | bases programmed: {} — v3d.md §49.20.6 ::",
+        leg, tag, ba, ea, cl_len, cl_len, pad,
+        match bases {
+            None => "NONE (leg A's zero residue is left standing; this leg varies list length ONLY)",
+            Some(_) => "CT0QMA/CT0QMS/CT0QTS ONLY (no BPOS=0, no pre-kick L2T invalidate, no QTS.ENABLE)",
+        }
+    );
+    if !arena_contains(ba as usize, cl_len)
+        || !arena_contains(tile_alloc as usize, BIN_TILEALLOC_BYTES)
+        || !arena_contains(ts as usize, TILE_STATE_BYTES)
+        || !arena_contains(decoy_pool as usize, V3D97_POOL_BYTES)
+        || !arena_contains(decoy_ts as usize, V3D97_TS_BYTES)
+    {
+        serial_println!(
+            ":: V3D: [v3d97] LEG {} — a range escapes the arena; refusing the kick (fail-closed). NOTHING was kicked and NO verdict is implied ::",
+            leg
+        );
+        return;
+    }
+    decode_cl_packets(tag, OFF_PROBE_BIN_CL, cl_len);
+
+    // Four poisoned regions. The two real ones are leg A's negative controls, re-seeded; the two decoy
+    // windows are the ones leg C AIMS at, and they are what makes the "no fault, the write landed"
+    // outcome readable instead of merely inferred.
+    v3d56_poison_region(OFF_TILESTATE, TILE_STATE_BYTES);
+    v3d56_poison_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    v3d56_poison_region(OFF_V3D97_POOL, V3D97_POOL_BYTES);
+    v3d56_poison_region(OFF_V3D97_TS, V3D97_TS_BYTES);
+
+    // ── The ONLY registers this rung ever programs, and only on the R1 leg. ────────────────────
+    if let Some(b) = bases {
+        mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, b.qma);
+        mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, b.qms);
+        mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, b.qts); // bare base — ENABLE deliberately NOT set
+        dsb();
+    }
+    let qma_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMA);
+    let qms_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMS);
+    let qts_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QTS);
+    serial_println!(
+        ":: V3D: [v3d97] LEG {} tile-memory PRE (READBACK, after this leg's writes) — CT0QMA={:#010x} CT0QMS={:#010x} CT0QTS={:#010x} (ENABLE={}) | wrote-this-leg={} | candidate VAs if the close-time write is base-relative: QMA+0x70={:#010x} QMA+QMS+0x70={:#010x} QTS+0x70={:#010x}; absolute would be 0x00000070 ::",
+        leg, qma_pre, qms_pre, qts_pre,
+        (qts_pre & V3D_CLE_CT0QTS_ENABLE != 0) as u32,
+        bases.is_some() as u32,
+        qma_pre.wrapping_add(0x70),
+        qma_pre.wrapping_add(qms_pre).wrapping_add(0x70),
+        qts_pre.wrapping_add(0x70)
+    );
+
+    v3d62_arm(tag);
+    clear_mmu_fault_latch(tag);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let rfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
+    let bpca_pre = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
+    let arena_pre = v3d56_arena_digest();
+
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, ba);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, ea); // GO — the same bare submit leg A took
+    dsb();
+    let submit_sound = v3d54_submit_audit(tag, ba, ea, cl_len);
+    let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CTNCS_CTRUN, tag);
+    let (sts, us, retired) = wait_fldone(tag, ba, ea);
+
+    // ── §49.20.2 V2a: THE FIRST READ AFTER THE WAIT, and the pair is read before anything else. ──
+    let (vio_addr, vio_id) = v3d97_violation_once();
+    let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let fault =
+        mmu_ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    let (client, va) = vio_decode(vio_id, vio_addr);
+    serial_println!(
+        ":: V3D: [v3d97] LEG {} VIOLATION (read ONCE, FIRST — §49.20.2 V2a; every later read of this pair on this leg is VOID) — VIO_ADDR={:#010x} VIO_ID={:#010x} RAW, decoded client {} @ VA {:#010x} | MMU_CTL={:#010x} fault={} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) ::",
+        leg, vio_addr, vio_id, client, va, mmu_ctl, (fault != 0) as u32,
+        (fault & V3D_MMU_CTL_PT_INVALID != 0) as u32,
+        (fault & V3D_MMU_CTL_WRITE_VIOLATION != 0) as u32,
+        (fault & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32
+    );
+
+    let qma_post = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMA);
+    let qms_post = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMS);
+    let qts_post = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QTS);
+    let tm_moved = qma_post != qma_pre || qms_post != qms_pre || qts_post != qts_pre;
+    serial_println!(
+        ":: V3D: [v3d97] LEG {} tile-memory POST — CT0QMA {:#010x}->{:#010x} CT0QMS {:#010x}->{:#010x} CT0QTS {:#010x}->{:#010x} moved={} ::",
+        leg, qma_pre, qma_post, qms_pre, qms_post, qts_pre, qts_post, tm_moved as u32
+    );
+    v3d62_frame_witness(tag);
+
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
+    let flush_done = wait_bit_clear(
+        V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS, "L2T write-back (v3d97 scan)",
+    );
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+    dsb();
+    cache::invalidate_range(arena_phys(), ARENA_BYTES);
+    dsb();
+    let ts_scan = v3d56_scan(ts, TILE_STATE_BYTES);
+    let pool_scan = v3d56_scan(tile_alloc, BIN_TILEALLOC_BYTES);
+    let dpool_scan = v3d56_scan(decoy_pool, V3D97_POOL_BYTES);
+    let dts_scan = v3d56_scan(decoy_ts, V3D97_TS_BYTES);
+    v3d56_emit_scan(tag, "tile-state (real, negative control)", ts, &ts_scan, flush_done);
+    v3d56_emit_scan(tag, "tile-alloc pool (real, negative control)", tile_alloc, &pool_scan, flush_done);
+    v3d56_emit_scan(tag, "R1 decoy POOL window (CT0QMA target)", decoy_pool, &dpool_scan, flush_done);
+    v3d56_emit_scan(tag, "R1 decoy TILE-STATE page (CT0QTS target)", decoy_ts, &dts_scan, flush_done);
+    v3d56_emit_landing(tag, &arena_pre, &v3d56_arena_digest());
+    ptb_frame_witness(tag, bfc_pre, rfc_pre, bpca_pre, if bases.is_some() { qma_pre } else { tile_alloc });
+
+    let bfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
+    let frdone = sts & V3D_INT_FRDONE != 0;
+    let bfc_delta = bfc_after.wrapping_sub(bfc_pre);
+    let frame_closed = frdone || retired || bfc_delta != 0;
+    let decoy_touched =
+        dpool_scan.zeroed + dpool_scan.overwritten + dts_scan.zeroed + dts_scan.overwritten;
+    let real_touched = ts_scan.zeroed + ts_scan.overwritten + pool_scan.zeroed + pool_scan.overwritten;
+
+    // ── The verdict. §49.20.6's four rows, pre-written, plus the branches that void them. ────────
+    let verdict: &str = if !submit_sound {
+        "THE SUBMIT DID NOT AUDIT SOUND — [v3d54] says the latched [BA,EA) is not the one intended, so nothing on this leg is about the list it names. Re-take; no verdict"
+    } else if !frame_closed {
+        "NO FRAME CLOSED ON THIS LEG, so the question was never put. §49.20's V1 established that an unarmed submit closes a bin frame (BFC Δ1); this leg did not close one, so there is no close whose write could be aimed anywhere. NOT a verdict on the aim — read leg A's BFC above: if leg A closed and this leg did not, the ONE variable this leg changed is what stopped it, and THAT is the finding"
+    } else if bases.is_none() {
+        // Leg B (R3) — the instrument control. Its verdict is about the RAW word, not the VA.
+        if vio_addr == cl_len as u32 {
+            "R3 FIRES: VIO_ADDR TRACKS THE LIST LENGTH. The raw word equals this leg's byte count exactly, as it equalled 14 on the two 14-byte boots. VA 0x70 was therefore an INSTRUMENT ARTIFACT the whole time — the shift-3 decode is being applied to something that is not an address — and §49.20's V2 'client PTB @ VA 0x70' reading, §49.20.5's wall statement and leg C below are ALL VOID. Stop here; re-plan R1/R2 against a corrected decode"
+        } else if vio_addr == 0xe {
+            "R3 CLEARS THE INSTRUMENT: VIO_ADDR is 0xe again on a list of a DIFFERENT length. The raw word does not track list length, the 14/0xe coincidence is retired, and §49.20's VA-0x70 reading survives its own control. Leg C is entitled to run and its arithmetic is entitled to be believed"
+        } else if fault == 0 {
+            "NO FAULT ON THE PADDED LEG AT ALL — the longer list closed its frame without the MMU objecting, which neither confirms nor refutes the length hypothesis. Read the poison scans and the [v3d62] catcher on this leg: if the write LANDED, the padded list changed the outcome and that is itself the finding; if nothing landed, the close-time write is not unconditional and leg C's null result would be uninterpretable"
+        } else {
+            "VIO_ADDR IS NEITHER 0xe NOR THIS LEG'S LENGTH — read the raw word. It moved, so it is not a fixed constant, and it did not track length, so R3's artifact hypothesis is not what moved it. Whatever the padded list changed is a third variable and must be named before leg C is read"
+        }
+    } else if fault == 0 && decoy_touched == 0 && real_touched == 0 {
+        "OUTCOME 4 — NO FAULT, AND NOTHING LANDED WHERE THIS INSTRUMENT LOOKS. With nonzero mapped bases the MMU stopped objecting, so the refusal was a function of the bases; but neither decoy window nor either real region moved. Read the [v3d56] landing digest for ANY changed arena page and the [v3d62] catcher line for the redirect count: the write went somewhere, and those two channels are where it is"
+    } else if fault == 0 {
+        "OUTCOME 4, THE INTERESTING ONE — NO FAULT, AND THE WRITE LANDED. Programming the bases to mapped addresses turned §49.20's refused write into a COMPLETED one, and the poison says WHERE: read the four [v3d56] scan lines above, in order. A touched decoy POOL window means the close-time write is the pool write and CT0QMA is its base; a touched decoy TILE-STATE page means it is the tile-state write and CT0QTS is its base (under ENABLE=0, which would be a finding of its own); a touched REAL region under decoy bases would mean the aim is not derived from these registers at all. This is the first completed close-time write this campaign has ever read"
+    } else if client != "PTB" {
+        "A FAULT LATCHED BUT THE CLIENT IS NOT THE PTB — attribution belongs to whichever unit VIO_ID names, and §49.20's PTB reading is not what this leg reproduced. Read the raw pair; no aim verdict from this line"
+    } else if va == qma_pre.wrapping_add(0x70) as u64 {
+        "OUTCOME 1 — QMA + 0x70. The close-time write is the POOL write and it is BASE-RELATIVE: the PTB adds 0x70 to CT0QMA at frame close, which is why a zero base produced 'VA 0x70' twice. 'Structural 0x70' is REFUTED. The pool base is load-bearing at CLOSE time, not merely at bin time — and since this base is one the V3D MMU MAPS, the wall becomes a translation question with a small answer space: why did the MMU refuse a mapped address? (candidates: the PTE is not visible to the MMU's own walk at that instant, L2T/TLB staleness against a page table written before MMU enable, or a permission/cap field this driver leaves at POR)"
+    } else if va == qma_pre.wrapping_add(qms_pre).wrapping_add(0x70) as u64 {
+        "OUTCOME 1b — QMA + QMS + 0x70. The write is POOL-END-relative, not pool-base-relative: the PTB is aiming past the end of the pool it was given, which is what a reservation stage that has already consumed the whole pool would do. V5's arithmetic (BPCA+BPCS = QMA+QMS) is the same formula seen from the other side. 'Structural 0x70' is REFUTED; the aim derives from BOTH base and size, and the immediate question is why the close-time write targets the pool's end rather than a position inside it"
+    } else if va == qts_pre.wrapping_add(0x70) as u64 {
+        "OUTCOME 2 — QTS + 0x70. The close-time write is the TILE-STATE write, aimed from CT0QTS — and it fired with ENABLE=0, which is a finding in its own right. §49.18.4 item 4's structural divergence (piOS places the tile-state array at the POOL END; we place it one page below the pool base) becomes a LIVE suspect for the first time, and the next cut is to move the tile-state to piOS's placement and re-read this same VA"
+    } else if va == 0x70 {
+        "OUTCOME 3 — 0x70, UNMOVED against three distinct nonzero mapped bases. The aim is GENUINELY ABSOLUTE and 'structural' is finally EARNED rather than assumed: the PTB's close-time write does not derive its address from CT0QMA, CT0QMS or CT0QTS. This is the outcome that licenses R2 (`mapzero`) — map the page containing VA 0x70 to a poisoned scratch PA and read the payload — and it promotes §49.20.7 item 4 (does the firmware establish a V3D MMU page table with a low aperture?) to the head of the bunker brief"
+    } else {
+        "A FAULT LATCHED AT A VA NONE OF THE FOUR PRE-WRITTEN ROWS PREDICTS — read the raw VIO_ADDR against the three bases printed on this same line; §49.20.6's table ends 'anything else — read it; the arithmetic will name its own base', and this is that row. Do the subtraction against QMA, QMA+QMS and QTS before concluding anything"
+    };
+    serial_println!(
+        ":: V3D: [v3d97] LEG {} VERDICT ({}) — list len={} ({:#x}) | frame-closed={} (retired={} FRDONE={} BFC {:#010x}->{:#010x} Δ{}) submit_sound={} idled={} INT_STS={:#010x} waited={}us PCS={:#010x} (BMACTIVE={} BMBUSY={} BMOOM={}) | bases QMA={:#010x} QMS={:#010x} QTS={:#010x} (ENABLE={}) POST-moved={} | VIO_ADDR={:#010x} VIO_ID={:#010x} RAW -> client {} @ VA {:#010x} fault={} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) | arithmetic: QMA+0x70={:#010x} QMA+QMS+0x70={:#010x} QTS+0x70={:#010x} absolute=0x00000070 | poison touched: decoy-pool={}/{} decoy-ts={}/{} real-ts={}/{} real-pool={}/{} (drain completed={}) — {} ::",
+        leg, tag, cl_len, cl_len,
+        frame_closed as u32, retired as u32, frdone as u32, bfc_pre, bfc_after, bfc_delta,
+        submit_sound as u32, idled as u32, sts, us, pcs,
+        (pcs & V3D_PCS_BMACTIVE != 0) as u32,
+        (pcs & V3D_PCS_BMBUSY != 0) as u32,
+        (pcs & V3D_PCS_BMOOM != 0) as u32,
+        qma_pre, qms_pre, qts_pre,
+        (qts_pre & V3D_CLE_CT0QTS_ENABLE != 0) as u32, tm_moved as u32,
+        vio_addr, vio_id, client, va, (fault != 0) as u32,
+        (fault & V3D_MMU_CTL_PT_INVALID != 0) as u32,
+        (fault & V3D_MMU_CTL_WRITE_VIOLATION != 0) as u32,
+        (fault & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32,
+        qma_pre.wrapping_add(0x70),
+        qma_pre.wrapping_add(qms_pre).wrapping_add(0x70),
+        qts_pre.wrapping_add(0x70),
+        dpool_scan.zeroed + dpool_scan.overwritten, dpool_scan.words,
+        dts_scan.zeroed + dts_scan.overwritten, dts_scan.words,
+        ts_scan.zeroed + ts_scan.overwritten, ts_scan.words,
+        pool_scan.zeroed + pool_scan.overwritten, pool_scan.words,
+        flush_done as u32,
+        verdict
+    );
+
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    clear_mmu_fault_latch("v3d97 post-leg (VOID for the violation pair — see this leg's VIOLATION line)");
+}
+
+/// PI-V3D-97 — the two `basedaim` legs, in §49.20.6's composition order: R3 (the control) then R1
+/// (the cut). Called from the tail of `[v3d95]`, so leg A above is the in-boot zero-base anchor both
+/// legs are read against — the reproduction and the two variants come from ONE image on ONE boot.
+#[cfg(feature = "v3d_basedaim")]
+fn v3d97_basedaim_legs() {
+    serial_println!(
+        ":: V3D: [v3d97] BASEDAIM BOOT — READ THIS SECOND (leg A, the [v3d95] lines above, is the anchor). UNAOS_V3D_BASEDAIM=1 adds TWO more CT0 kicks to the [v3d95] rung, v3d.md §49.20.6's R3 then R1, so this capture carries THREE closes, not one: LEG A = the 14-byte `emptyunarm` list on the zero-base residue (the boot4 reproduction, unchanged and byte-identical to a UNARMED-CLOSE-only boot); LEG B = R3 `lenvary`, the same bare submit on the same zero bases with the list padded to 46 bytes — the control that decides whether the raw VIO_ADDR word tracks LIST LENGTH (0xe = 14 on both prior boots) and therefore whether the whole VA-0x70 reading is an artifact; LEG C = R1 `basedaim`, the CUT — CT0QMA/CT0QMS/CT0QTS and NOTHING else programmed, to three mutually distinguishable ARENA-MAPPED values, then the byte-identical 14-byte submit. §49.20.2's V2a law is carried in code: each leg reads MMU_VIO_ADDR/MMU_VIO_ID ONCE and FIRST after its wait, and every later read of that pair is VOID. The capture is deliberately short and MUST NOT be diffed line-for-line against a deep boot ::"
+    );
+    if !v3d97_pad_selfcheck() {
+        serial_println!(
+            ":: V3D: [v3d97] STOOD DOWN — the pad self-check failed, so the R3 leg would vary two things at once and the R1 leg would be read against a control that never held. NO kick was issued by either leg and NO verdict is implied ::"
+        );
+        return;
+    }
+
+    // LEG B first — §49.20.6: "Run R3's leg FIRST (it validates the instrument), then R1's leg (it
+    // answers the question)". Bases are untouched, so this leg still sits on leg A's zero residue.
+    v3d97_leg("B", "v3d97 R3 lenvary (zero bases, 46-byte list)", V3D97_PAD_FLUSHES, None);
+
+    // LEG C — the cut.
+    let bases = V3d96Bases {
+        qma: (arena_phys() + OFF_V3D97_POOL) as u32,
+        qms: V3D97_QMS,
+        qts: (arena_phys() + OFF_V3D97_TS) as u32, // bare base: ENABLE (bit1) stays 0 by design
+    };
+    v3d97_leg("C", "v3d97 R1 basedaim (nonzero mapped bases, 14-byte list)", 0, Some(bases));
+
+    serial_println!(
+        ":: V3D: [v3d97] BASEDAIM COMPLETE — three closes taken (A zero-base/14B, B zero-base/46B, C mapped-bases/14B) and nothing else. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at leg C's values on purpose: nothing runs after this rung, and a restore would be one more write between the verdict and the wire. Read leg B's verdict BEFORE leg C's — if R3 fired, leg C is void ::"
     );
 }
