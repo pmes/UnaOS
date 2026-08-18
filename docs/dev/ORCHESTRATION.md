@@ -13,9 +13,12 @@
 >   **plus a peer ack from at least one other track seat over ccd** before the
 >   trunk merge. A confirmed must-fix is fixed in-arc and re-gated before the
 >   merge proceeds.
-> - **Merge to trunk** → the landing track merges its own reviewed+acked arc,
->   `--no-ff`, then runs the trunk battery (step 3 below) and reports results
->   in its landing report. The one-unmerged-arc-per-track cap stands.
+> - **Merge to trunk** → the landing track ANNOUNCES the merge over ccd,
+>   cross-verifies with a fresh `git ls-remote` on both seats in the same turn
+>   as every announce/ack (stale reachability claims are never relayed), then
+>   merges its own reviewed+acked arc `--no-ff`, runs the trunk battery
+>   (step 3 below), and reports results in its landing report. The
+>   one-unmerged-arc-per-track cap stands.
 > - **Track sync ("rebase the tracks")** → each track MERGES trunk into its
 >   branch at its own arc boundaries. Never rebase a pushed tip; never
 >   force-push. (The step-4 `--ff-only` flow applies only to a track with no

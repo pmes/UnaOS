@@ -30,9 +30,13 @@ several sessions can work in parallel without stepping on each other.
   dropped:
   - **Landing an arc to trunk**: the landing track runs the independent
     adversarial review itself (agent panel — the COI guard: the author seat
-    never reviews alone), obtains a **peer ack from at least one other track
-    seat over ccd** (the second pair of eyes the seat used to be), then merges
-    its own reviewed arc to trunk with `--no-ff` and runs the trunk battery.
+    never reviews alone), **announces the merge over ccd and obtains a peer
+    ack from at least one other track seat** (the second pair of eyes the seat
+    used to be), then merges its own reviewed arc to trunk with `--no-ff` and
+    runs the trunk battery. Every merge announce, ack, and repeat of an ask
+    carries a **fresh `git ls-remote` check run that same turn, both seats** —
+    reachability claims are never relayed stale (the 2026-08-03 mirror
+    failure).
   - **Sync**: each track picks up trunk at its own arc boundaries by MERGING
     trunk into its branch (never rebase a pushed tip; never force-push).
   - **Doc/`arroyo` conflicts** are reconciled by the landing seat (union: keep
